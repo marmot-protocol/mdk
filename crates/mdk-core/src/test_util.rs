@@ -3,7 +3,7 @@
 //! This module provides shared test utilities used across multiple test modules
 //! to avoid code duplication and ensure consistency in test setup.
 
-use crate::GroupId;
+use mdk_storage_traits::GroupId;
 use mdk_storage_traits::MdkStorageProvider;
 use nostr::{Event, EventBuilder, Keys, Kind, PublicKey, RelayUrl};
 
