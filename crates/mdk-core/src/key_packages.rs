@@ -196,7 +196,24 @@ where
         // Get encoding format from event tags (defaults to Hex for legacy events)
         let encoding = ContentEncoding::from_tags(event.tags.iter());
 
-        self.parse_serialized_key_package(&event.content, encoding)
+        let key_package = self.parse_serialized_key_package(&event.content, encoding)?;
+
+        // SECURITY: Verify identity binding between the event signer and the credential identity.
+        // This prevents an attacker from publishing a kind-443 event with a KeyPackage whose
+        // BasicCredential.identity claims a victim's Nostr public key while signing with their own key.
+        // Without this check, the attacker could join groups appearing as the victim and potentially
+        // gain admin privileges if the victim is an admin.
+        let credential = BasicCredential::try_from(key_package.leaf_node().credential().clone())?;
+        let credential_identity = self.parse_credential_identity(credential.identity())?;
+
+        if credential_identity != event.pubkey {
+            return Err(Error::KeyPackageIdentityMismatch {
+                credential_identity: credential_identity.to_hex(),
+                event_signer: event.pubkey.to_hex(),
+            });
+        }
+
+        Ok(key_package)
     }
 
     /// Validates that key package event tags match MIP-00 specification.
@@ -1319,13 +1336,11 @@ mod tests {
             result
         );
 
-        // Also verify we can parse the full key package
-        let parse_result = mdk.parse_key_package(&event);
-        assert!(
-            parse_result.is_ok(),
-            "Should parse real-world key package, got error: {:?}",
-            parse_result
-        );
+        // NOTE: We intentionally do NOT call parse_key_package here because this test
+        // uses a hardcoded key package from production. The parse_key_package function
+        // now verifies identity binding (credential identity must match event signer),
+        // and we don't have the private key for the embedded credential.
+        // Tag validation is sufficient for testing legacy format compatibility.
     }
 
     /// Test that missing required tags are rejected
@@ -1861,19 +1876,18 @@ mod tests {
     #[test]
     fn test_parse_key_package_with_valid_tags() {
         let mdk = create_test_mdk();
-        let test_pubkey =
-            PublicKey::from_hex("884704bd421671e01c13f854d2ce23ce2a5bfe9562f4f297ad2bc921ba30c3a6")
-                .unwrap();
+        // Use generated keys so credential identity matches event signer
+        let keys = nostr::Keys::generate();
         let relays = vec![RelayUrl::parse("wss://relay.example.com").unwrap()];
 
         let (key_package_hex, tags) = mdk
-            .create_key_package_for_event(&test_pubkey, relays)
+            .create_key_package_for_event(&keys.public_key(), relays)
             .expect("Failed to create key package");
 
-        // Create an event with correct MIP-00 tags
+        // Create an event signed by the same keys used in the credential
         let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex)
             .tags(tags.to_vec())
-            .sign_with_keys(&nostr::Keys::generate())
+            .sign_with_keys(&keys)
             .unwrap();
 
         // Parse key package - should succeed
@@ -1890,12 +1904,11 @@ mod tests {
     #[test]
     fn test_parse_key_package_with_legacy_tags() {
         let mdk = create_test_mdk();
-        let test_pubkey =
-            PublicKey::from_hex("884704bd421671e01c13f854d2ce23ce2a5bfe9562f4f297ad2bc921ba30c3a6")
-                .unwrap();
+        // Use generated keys so credential identity matches event signer
+        let keys = nostr::Keys::generate();
 
         let (key_package_hex, _) = mdk
-            .create_key_package_for_event(&test_pubkey, vec![])
+            .create_key_package_for_event(&keys.public_key(), vec![])
             .expect("Failed to create key package");
 
         // Create event with legacy tag format (without mls_ prefix for ciphersuite/extensions, string values)
@@ -1917,9 +1930,10 @@ mod tests {
             ),
         ];
 
+        // Sign with the same keys used in the credential
         let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex)
             .tags(legacy_tags)
-            .sign_with_keys(&nostr::Keys::generate())
+            .sign_with_keys(&keys)
             .unwrap();
 
         // Parse key package - should succeed with legacy format
@@ -2208,6 +2222,110 @@ mod tests {
                 .parse_serialized_key_package(&base64_key_package, ContentEncoding::Base64)
                 .is_ok(),
             "Base64 MDK should parse base64 key package with Base64 encoding"
+        );
+    }
+
+    /// Security test: Identity binding prevents impersonation attacks
+    ///
+    /// This test verifies that parse_key_package rejects key packages where the
+    /// BasicCredential.identity (Nostr public key) doesn't match the event signer.
+    ///
+    /// Attack scenario being tested:
+    /// 1. Attacker creates a KeyPackage with victim's Nostr public key in the credential
+    /// 2. Attacker signs the kind-443 event with their own key
+    /// 3. If a group admin processes this, the attacker could join appearing as the victim
+    ///
+    /// This test ensures such attacks are prevented by the identity binding check.
+    #[test]
+    fn test_parse_key_package_rejects_identity_mismatch() {
+        let mdk = create_test_mdk();
+        let victim_keys = nostr::Keys::generate();
+        let attacker_keys = nostr::Keys::generate();
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").unwrap()];
+
+        // Create a key package with the victim's public key in the credential
+        let (key_package_hex, tags) = mdk
+            .create_key_package_for_event(&victim_keys.public_key(), relays)
+            .expect("Failed to create key package");
+
+        // Attacker signs the event with their own keys (NOT the victim's keys)
+        let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex)
+            .tags(tags.to_vec())
+            .sign_with_keys(&attacker_keys)
+            .unwrap();
+
+        // Parse should fail because credential identity (victim) != event signer (attacker)
+        let result = mdk.parse_key_package(&event);
+        assert!(
+            result.is_err(),
+            "Should reject key package with identity mismatch"
+        );
+
+        // Verify we get the correct error type
+        let error = result.unwrap_err();
+        match error {
+            Error::KeyPackageIdentityMismatch {
+                credential_identity,
+                event_signer,
+            } => {
+                assert_eq!(
+                    credential_identity,
+                    victim_keys.public_key().to_hex(),
+                    "credential_identity should be victim's public key"
+                );
+                assert_eq!(
+                    event_signer,
+                    attacker_keys.public_key().to_hex(),
+                    "event_signer should be attacker's public key"
+                );
+            }
+            _ => panic!(
+                "Expected KeyPackageIdentityMismatch error, got: {:?}",
+                error
+            ),
+        }
+    }
+
+    /// Security test: Valid identity binding is accepted
+    ///
+    /// This test verifies that parse_key_package accepts key packages where the
+    /// BasicCredential.identity matches the event signer (the legitimate case).
+    #[test]
+    fn test_parse_key_package_accepts_matching_identity() {
+        let mdk = create_test_mdk();
+        let keys = nostr::Keys::generate();
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").unwrap()];
+
+        // Create a key package with the user's public key
+        let (key_package_hex, tags) = mdk
+            .create_key_package_for_event(&keys.public_key(), relays)
+            .expect("Failed to create key package");
+
+        // Sign the event with the same keys (legitimate scenario)
+        let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex)
+            .tags(tags.to_vec())
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        // Parse should succeed because credential identity == event signer
+        let result = mdk.parse_key_package(&event);
+        assert!(
+            result.is_ok(),
+            "Should accept key package with matching identity, got error: {:?}",
+            result
+        );
+
+        // Verify the parsed key package has the correct identity
+        let key_package = result.unwrap();
+        let credential =
+            BasicCredential::try_from(key_package.leaf_node().credential().clone()).unwrap();
+        let parsed_pubkey = mdk
+            .parse_credential_identity(credential.identity())
+            .unwrap();
+        assert_eq!(
+            parsed_pubkey,
+            keys.public_key(),
+            "Parsed key package should have the correct identity"
         );
     }
 }
