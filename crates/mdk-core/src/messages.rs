@@ -3596,8 +3596,7 @@ mod tests {
         let bob_keys = Keys::generate();
 
         // Create a credential for Alice (the authenticated MLS sender)
-        let alice_credential =
-            BasicCredential::new(alice_keys.public_key().to_bytes().to_vec());
+        let alice_credential = BasicCredential::new(alice_keys.public_key().to_bytes().to_vec());
         let credential: openmls::credentials::Credential = alice_credential.into();
 
         // Test 1: Mismatched pubkeys should return AuthorMismatch
