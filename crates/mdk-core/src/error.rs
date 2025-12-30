@@ -184,6 +184,14 @@ pub enum Error {
     /// Invalid extension version
     #[error("invalid extension version: {0}")]
     InvalidExtensionVersion(u16),
+    /// Key package identity binding mismatch - credential identity doesn't match event signer
+    #[error("key package identity mismatch: credential identity {credential_identity} doesn't match event signer {event_signer}")]
+    KeyPackageIdentityMismatch {
+        /// The identity claimed in the BasicCredential
+        credential_identity: String,
+        /// The public key that signed the event
+        event_signer: String,
+    },
 }
 
 impl From<FromUtf8Error> for Error {

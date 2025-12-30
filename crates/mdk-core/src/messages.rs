@@ -24,9 +24,11 @@ use openmls_basic_credential::SignatureKeyPair;
 use openmls_traits::OpenMlsProvider;
 use tls_codec::{Deserialize as TlsDeserialize, Serialize as TlsSerialize};
 
+use mdk_storage_traits::GroupId;
+
 use crate::error::Error;
 use crate::groups::UpdateGroupResult;
-use crate::{GroupId, MDK, util};
+use crate::{MDK, util};
 
 // Internal Result type alias for this module
 type Result<T> = std::result::Result<T, Error>;
@@ -987,6 +989,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use mdk_storage_traits::GroupId;
     use nostr::{EventBuilder, Keys, Kind, PublicKey, Tag, TagKind, Tags};
 
     use super::*;
