@@ -288,7 +288,7 @@ where
     /// # Arguments
     ///
     /// * `rumor_pubkey` - The public key from the rumor (inner Nostr event)
-    /// * `sender_credential` - The MLS credential of the authenticated sender
+    /// * `sender_credential` - The MLS credential of the authenticated sender (consumed)
     ///
     /// # Returns
     ///
@@ -298,9 +298,9 @@ where
     pub(crate) fn verify_rumor_author(
         &self,
         rumor_pubkey: &nostr::PublicKey,
-        sender_credential: &openmls::credentials::Credential,
+        sender_credential: openmls::credentials::Credential,
     ) -> Result<()> {
-        let basic_credential = BasicCredential::try_from(sender_credential.clone())?;
+        let basic_credential = BasicCredential::try_from(sender_credential)?;
         let mls_sender_pubkey = self.parse_credential_identity(basic_credential.identity())?;
         if *rumor_pubkey != mls_sender_pubkey {
             tracing::warn!(
@@ -340,7 +340,7 @@ where
         mut group: group_types::Group,
         event: &Event,
         application_message: ApplicationMessage,
-        sender_credential: &openmls::credentials::Credential,
+        sender_credential: openmls::credentials::Credential,
     ) -> Result<message_types::Message> {
         // This is a message from a group member
         let bytes = application_message.into_bytes();
@@ -670,7 +670,7 @@ where
                                 group,
                                 event,
                                 application_message,
-                                &sender_credential,
+                                sender_credential,
                             )?,
                         ))
                     }
@@ -3602,14 +3602,14 @@ mod tests {
         // Test 1: Mismatched pubkeys should return AuthorMismatch
         // This simulates an attacker (Bob) trying to claim a message was from them
         // when the MLS credential proves it was sent by Alice
-        let result = mdk.verify_rumor_author(&bob_keys.public_key(), &credential);
+        let result = mdk.verify_rumor_author(&bob_keys.public_key(), credential.clone());
         assert!(
             matches!(result, Err(Error::AuthorMismatch)),
             "Expected AuthorMismatch error when rumor pubkey doesn't match credential"
         );
 
         // Test 2: Matching pubkeys should succeed
-        let result = mdk.verify_rumor_author(&alice_keys.public_key(), &credential);
+        let result = mdk.verify_rumor_author(&alice_keys.public_key(), credential);
         assert!(
             result.is_ok(),
             "Expected success when rumor pubkey matches credential"
