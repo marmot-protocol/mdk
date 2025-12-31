@@ -11,6 +11,10 @@ use nostr::{PublicKey, RelayUrl};
 use rusqlite::{OptionalExtension, params};
 
 use crate::db::{Hash32, Nonce12};
+use crate::validation::{
+    MAX_ADMIN_PUBKEYS_JSON_SIZE, MAX_GROUP_DESCRIPTION_LENGTH, MAX_GROUP_NAME_LENGTH,
+    validate_size, validate_string_length,
+};
 use crate::{MdkSqliteStorage, db};
 
 #[inline]
@@ -75,12 +79,31 @@ impl GroupStorage for MdkSqliteStorage {
     }
 
     fn save_group(&self, group: Group) -> Result<(), GroupError> {
+        // Validate group name and description lengths
+        validate_string_length(&group.name, MAX_GROUP_NAME_LENGTH, "Group name")
+            .map_err(GroupError::InvalidParameters)?;
+
+        validate_string_length(
+            &group.description,
+            MAX_GROUP_DESCRIPTION_LENGTH,
+            "Group description",
+        )
+        .map_err(GroupError::InvalidParameters)?;
+
         let conn_guard = self.db_connection.lock().map_err(into_group_err)?;
 
         let admin_pubkeys_json: String =
             serde_json::to_string(&group.admin_pubkeys).map_err(|e| {
                 GroupError::DatabaseError(format!("Failed to serialize admin pubkeys: {}", e))
             })?;
+
+        // Validate admin pubkeys JSON size
+        validate_size(
+            admin_pubkeys_json.as_bytes(),
+            MAX_ADMIN_PUBKEYS_JSON_SIZE,
+            "Admin pubkeys JSON",
+        )
+        .map_err(GroupError::InvalidParameters)?;
 
         let last_message_id: Option<&[u8; 32]> =
             group.last_message_id.as_ref().map(|id| id.as_bytes());
@@ -340,6 +363,74 @@ mod tests {
         // Get all groups
         let all_groups = storage.all_groups().unwrap();
         assert_eq!(all_groups.len(), 1);
+    }
+
+    #[test]
+    fn test_group_name_length_validation() {
+        let storage = MdkSqliteStorage::new_in_memory().unwrap();
+
+        // Create a group with name exceeding the limit (255 characters)
+        let oversized_name = "x".repeat(256);
+
+        let mls_group_id = GroupId::from_slice(&[1, 2, 3, 4]);
+        let group = Group {
+            mls_group_id: mls_group_id.clone(),
+            nostr_group_id: [0u8; 32],
+            name: oversized_name,
+            description: "Test".to_string(),
+            admin_pubkeys: BTreeSet::new(),
+            last_message_id: None,
+            last_message_at: None,
+            epoch: 0,
+            state: GroupState::Active,
+            image_hash: None,
+            image_key: None,
+            image_nonce: None,
+        };
+
+        // Should fail due to name length
+        let result = storage.save_group(group);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Group name exceeds maximum length")
+        );
+    }
+
+    #[test]
+    fn test_group_description_length_validation() {
+        let storage = MdkSqliteStorage::new_in_memory().unwrap();
+
+        // Create a group with description exceeding the limit (2000 characters)
+        let oversized_description = "x".repeat(2001);
+
+        let mls_group_id = GroupId::from_slice(&[1, 2, 3, 4]);
+        let group = Group {
+            mls_group_id: mls_group_id.clone(),
+            nostr_group_id: [0u8; 32],
+            name: "Test Group".to_string(),
+            description: oversized_description,
+            admin_pubkeys: BTreeSet::new(),
+            last_message_id: None,
+            last_message_at: None,
+            epoch: 0,
+            state: GroupState::Active,
+            image_hash: None,
+            image_key: None,
+            image_nonce: None,
+        };
+
+        // Should fail due to description length
+        let result = storage.save_group(group);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Group description exceeds maximum length")
+        );
     }
 
     // Note: Comprehensive storage functionality tests are now in mdk-storage-traits/tests/

@@ -7,6 +7,10 @@ use nostr::{EventId, JsonUtil};
 use rusqlite::{OptionalExtension, params};
 
 use crate::db::{Hash32, Nonce12};
+use crate::validation::{
+    MAX_ADMIN_PUBKEYS_JSON_SIZE, MAX_EVENT_JSON_SIZE, MAX_GROUP_DESCRIPTION_LENGTH,
+    MAX_GROUP_NAME_LENGTH, MAX_GROUP_RELAYS_JSON_SIZE, validate_size, validate_string_length,
+};
 use crate::{MdkSqliteStorage, db};
 
 #[inline]
@@ -19,6 +23,17 @@ where
 
 impl WelcomeStorage for MdkSqliteStorage {
     fn save_welcome(&self, welcome: Welcome) -> Result<(), WelcomeError> {
+        // Validate group name and description lengths
+        validate_string_length(&welcome.group_name, MAX_GROUP_NAME_LENGTH, "Group name")
+            .map_err(WelcomeError::InvalidParameters)?;
+
+        validate_string_length(
+            &welcome.group_description,
+            MAX_GROUP_DESCRIPTION_LENGTH,
+            "Group description",
+        )
+        .map_err(WelcomeError::InvalidParameters)?;
+
         let conn_guard = self.db_connection.lock().map_err(into_welcome_err)?;
 
         // Serialize complex types to JSON
@@ -27,10 +42,33 @@ impl WelcomeStorage for MdkSqliteStorage {
                 WelcomeError::DatabaseError(format!("Failed to serialize admin pubkeys: {}", e))
             })?;
 
+        // Validate admin pubkeys JSON size
+        validate_size(
+            group_admin_pubkeys_json.as_bytes(),
+            MAX_ADMIN_PUBKEYS_JSON_SIZE,
+            "Admin pubkeys JSON",
+        )
+        .map_err(WelcomeError::InvalidParameters)?;
+
         let group_relays_json: String =
             serde_json::to_string(&welcome.group_relays).map_err(|e| {
                 WelcomeError::DatabaseError(format!("Failed to serialize group relays: {}", e))
             })?;
+
+        // Validate group relays JSON size
+        validate_size(
+            group_relays_json.as_bytes(),
+            MAX_GROUP_RELAYS_JSON_SIZE,
+            "Group relays JSON",
+        )
+        .map_err(WelcomeError::InvalidParameters)?;
+
+        // Serialize event to JSON
+        let event_json = welcome.event.as_json();
+
+        // Validate event JSON size
+        validate_size(event_json.as_bytes(), MAX_EVENT_JSON_SIZE, "Event JSON")
+            .map_err(WelcomeError::InvalidParameters)?;
 
         conn_guard
             .execute(
@@ -40,7 +78,7 @@ impl WelcomeStorage for MdkSqliteStorage {
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 params![
                     welcome.id.as_bytes(),
-                    welcome.event.as_json(),
+                    event_json,
                     welcome.mls_group_id.as_slice(),
                     welcome.nostr_group_id,
                     welcome.group_name,
@@ -145,13 +183,15 @@ impl WelcomeStorage for MdkSqliteStorage {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use mdk_storage_traits::GroupId;
     use mdk_storage_traits::groups::GroupStorage;
     use mdk_storage_traits::test_utils::cross_storage::{
         create_test_group, create_test_processed_welcome, create_test_welcome,
     };
-    use mdk_storage_traits::welcomes::types::ProcessedWelcomeState;
-    use nostr::EventId;
+    use mdk_storage_traits::welcomes::types::{ProcessedWelcomeState, Welcome, WelcomeState};
+    use nostr::{EventId, Kind, PublicKey, Timestamp, UnsignedEvent};
 
     use super::*;
 
@@ -221,6 +261,59 @@ mod tests {
         assert_eq!(
             found_processed_welcome.state,
             ProcessedWelcomeState::Processed
+        );
+    }
+
+    #[test]
+    fn test_welcome_group_name_length_validation() {
+        let storage = MdkSqliteStorage::new_in_memory().unwrap();
+
+        // Create a group first
+        let mls_group_id = GroupId::from_slice(&[1, 2, 3, 4]);
+        let group = create_test_group(mls_group_id.clone());
+        storage.save_group(group).unwrap();
+
+        // Create a welcome with oversized group name
+        let oversized_name = "x".repeat(256);
+
+        let event_id = EventId::all_zeros();
+        let pubkey = PublicKey::from_slice(&[1u8; 32]).unwrap();
+        let wrapper_event_id =
+            EventId::from_hex("1111111111111111111111111111111111111111111111111111111111111111")
+                .unwrap();
+
+        let welcome = Welcome {
+            id: event_id,
+            event: UnsignedEvent::new(
+                pubkey,
+                Timestamp::now(),
+                Kind::from(444u16),
+                vec![],
+                "content".to_string(),
+            ),
+            mls_group_id: mls_group_id.clone(),
+            nostr_group_id: [0u8; 32],
+            group_name: oversized_name,
+            group_description: "Test".to_string(),
+            group_image_hash: None,
+            group_image_key: None,
+            group_image_nonce: None,
+            group_admin_pubkeys: BTreeSet::new(),
+            group_relays: BTreeSet::new(),
+            welcomer: pubkey,
+            member_count: 1,
+            state: WelcomeState::Pending,
+            wrapper_event_id,
+        };
+
+        // Should fail due to group name length
+        let result = storage.save_welcome(welcome);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Group name exceeds maximum length")
         );
     }
 }

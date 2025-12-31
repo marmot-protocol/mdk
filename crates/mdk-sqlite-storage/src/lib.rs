@@ -24,6 +24,7 @@ pub mod error;
 mod groups;
 mod messages;
 mod migrations;
+mod validation;
 mod welcomes;
 
 use self::error::Error;
