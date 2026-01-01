@@ -33,6 +33,8 @@
 
 ### Fixed
 
+#58 - Issue O: Missing Hash Verification in decrypt_group_image Allows Storage-Level Blob Substitution
+
 ### Removed
 
 ### Deprecated
