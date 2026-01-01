@@ -280,8 +280,8 @@ where
         .unwrap();
     assert_eq!(found.name, "");
 
-    // Test saving group with very long name
-    let long_name = "a".repeat(1000);
+    // Test saving group with long name (within limits)
+    let long_name = "a".repeat(250); // Within 255 byte limit
     group.name = long_name.clone();
     storage.save_group(group).unwrap();
     let found = storage
