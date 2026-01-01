@@ -41,26 +41,12 @@ pub use mdk_storage_traits::GroupId;
 
 /// Configuration for MDK behavior
 #[derive(Debug, Clone, Default)]
-pub struct MdkConfig {
-    /// Use base64 encoding for key packages and welcomes (new format)
-    /// Set to false for backward compatibility (hex encoding)
-    /// Default: false
-    pub use_base64_encoding: bool,
-}
+pub struct MdkConfig {}
 
 impl MdkConfig {
     /// Create a new configuration with default settings
     pub fn new() -> Self {
         Self::default()
-    }
-
-    /// Create configuration with base64 encoding enabled
-    ///
-    /// This reduces payload size by approximately 33% compared to hex encoding.
-    pub fn with_base64() -> Self {
-        Self {
-            use_base64_encoding: true,
-        }
     }
 }
 
@@ -78,9 +64,9 @@ impl MdkConfig {
 /// // Simple usage with defaults
 /// let mdk = MDK::new(MdkMemoryStorage::default());
 ///
-/// // With base64 encoding enabled
+/// // With custom configuration
 /// let mdk = MDK::builder(MdkMemoryStorage::default())
-///     .with_base64_encoding(true)
+///     .with_config(MdkConfig::new())
 ///     .build();
 /// ```
 #[derive(Debug)]
@@ -101,29 +87,6 @@ where
         }
     }
 
-    /// Enable or disable base64 encoding for key packages and welcomes
-    ///
-    /// When enabled, reduces payload size by approximately 33% compared to hex encoding.
-    /// Both formats can be read regardless of this setting.
-    ///
-    /// # Arguments
-    ///
-    /// * `enabled` - true to use base64 encoding, false to use hex encoding
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// # use mdk_core::MDK;
-    /// # use mdk_memory_storage::MdkMemoryStorage;
-    /// let mdk = MDK::builder(MdkMemoryStorage::default())
-    ///     .with_base64_encoding(true)
-    ///     .build();
-    /// ```
-    pub fn with_base64_encoding(mut self, enabled: bool) -> Self {
-        self.config.use_base64_encoding = enabled;
-        self
-    }
-
     /// Set a custom configuration
     ///
     /// # Example
@@ -131,7 +94,7 @@ where
     /// ```no_run
     /// # use mdk_core::{MDK, MdkConfig};
     /// # use mdk_memory_storage::MdkMemoryStorage;
-    /// let config = MdkConfig::with_base64();
+    /// let config = MdkConfig::new();
     /// let mdk = MDK::builder(MdkMemoryStorage::default())
     ///     .with_config(config)
     ///     .build();
@@ -230,7 +193,6 @@ where
     /// # use mdk_core::MDK;
     /// # use mdk_memory_storage::MdkMemoryStorage;
     /// let mdk = MDK::builder(MdkMemoryStorage::default())
-    ///     .with_base64_encoding(true)
     ///     .build();
     /// ```
     pub fn builder(storage: Storage) -> MdkBuilder<Storage> {
@@ -239,20 +201,17 @@ where
 
     /// Construct a new MDK instance with default configuration
     ///
-    /// Uses hex encoding for backward compatibility. To enable base64 encoding,
-    /// use the builder pattern.
     ///
     /// # Example
     ///
     /// ```no_run
     /// # use mdk_core::MDK;
     /// # use mdk_memory_storage::MdkMemoryStorage;
-    /// // Default configuration (hex encoding)
+    /// # use mdk_core::MdkConfig;
     /// let mdk = MDK::new(MdkMemoryStorage::default());
     ///
-    /// // With base64 encoding (recommended)
     /// let mdk = MDK::builder(MdkMemoryStorage::default())
-    ///     .with_base64_encoding(true)
+    ///     .with_config(MdkConfig::new())
     ///     .build();
     /// ```
     pub fn new(storage: Storage) -> Self {
