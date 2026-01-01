@@ -2127,42 +2127,6 @@ mod tests {
         assert_eq!(parsed.ciphersuite(), DEFAULT_CIPHERSUITE);
     }
 
-    #[test]
-    fn test_key_package_always_base64_encoding() {
-        let config = crate::MdkConfig::default();
-
-        let mdk = crate::tests::create_test_mdk_with_config(config);
-        let test_pubkey =
-            PublicKey::from_hex("884704bd421671e01c13f854d2ce23ce2a5bfe9562f4f297ad2bc921ba30c3a6")
-                .unwrap();
-        let relays = vec![RelayUrl::parse("wss://relay.example.com").unwrap()];
-
-        let (key_package_str, tags) = mdk
-            .create_key_package_for_event(&test_pubkey, relays)
-            .expect("Failed to create key package");
-
-        assert!(
-            BASE64.decode(&key_package_str).is_ok(),
-            "Content should always be valid base64, got: {}",
-            key_package_str
-        );
-
-        let encoding_tag = tags
-            .iter()
-            .find(|t| t.as_slice().first() == Some(&"encoding".to_string()));
-        assert!(encoding_tag.is_some(), "Should have encoding tag");
-        assert_eq!(
-            encoding_tag.unwrap().as_slice().get(1).map(|s| s.as_str()),
-            Some("base64"),
-            "Encoding tag should always be 'base64'"
-        );
-
-        let parsed = mdk
-            .parse_serialized_key_package(&key_package_str, ContentEncoding::Base64)
-            .expect("Failed to parse base64 key package");
-        assert_eq!(parsed.ciphersuite(), DEFAULT_CIPHERSUITE);
-    }
-
     /// Test that key packages are always created with base64, but parsing supports both formats
     /// (for backward compatibility with existing hex-encoded events)
     #[test]
