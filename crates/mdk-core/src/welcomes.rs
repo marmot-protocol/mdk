@@ -288,8 +288,10 @@ where
         wrapper_event_id: &EventId,
         welcome_event: &UnsignedEvent,
     ) -> Result<WelcomePreview, Error> {
-        // Get encoding format from event tags (defaults to Hex for legacy events)
-        let encoding = ContentEncoding::from_tags(welcome_event.tags.iter());
+        // SECURITY: Require explicit encoding tag to prevent downgrade attacks and parsing ambiguity.
+        // Per MIP-00/MIP-02, encoding tag must be present.
+        let encoding = ContentEncoding::from_tags(welcome_event.tags.iter())
+            .ok_or_else(|| Error::Welcome("Missing required encoding tag".to_string()))?;
 
         let decoded_content = match decode_content(&welcome_event.content, encoding, "welcome") {
             Ok((content, format)) => {
@@ -407,15 +409,18 @@ mod tests {
                 "Welcome event must have kind 444 (MlsWelcome)"
             );
 
-            // 2. Verify content is hex-encoded (valid hex)
+            // 2. Verify content is base64-encoded (always base64 per MIP-00/MIP-02)
+            use nostr::base64::Engine;
+            use nostr::base64::engine::general_purpose::STANDARD as BASE64;
             assert!(
-                hex::decode(&welcome_rumor.content).is_ok(),
-                "Welcome content must be valid hex-encoded data"
+                BASE64.decode(&welcome_rumor.content).is_ok(),
+                "Welcome content must be valid base64-encoded data"
             );
 
             // Verify decoded content is substantial (MLS Welcome messages are typically > 50 bytes)
-            let decoded_content =
-                hex::decode(&welcome_rumor.content).expect("Failed to decode welcome content");
+            let decoded_content = BASE64
+                .decode(&welcome_rumor.content)
+                .expect("Failed to decode welcome content");
             assert!(
                 decoded_content.len() > 50,
                 "Welcome content should be substantial (typically > 50 bytes), got {} bytes",
@@ -498,9 +503,12 @@ mod tests {
 
         let welcome_rumor = &create_result.welcome_rumors[0];
 
-        // Decode hex content
-        let decoded_content =
-            hex::decode(&welcome_rumor.content).expect("Welcome content should be valid hex");
+        // Decode base64 content (always base64 per MIP-00/MIP-02)
+        use nostr::base64::Engine;
+        use nostr::base64::engine::general_purpose::STANDARD as BASE64;
+        let decoded_content = BASE64
+            .decode(&welcome_rumor.content)
+            .expect("Welcome content should be valid base64");
 
         // Verify it's valid TLS-serialized MLS message
         // We can't fully deserialize without processing, but we can check basic structure
@@ -597,10 +605,15 @@ mod tests {
         );
 
         // Verify all welcomes have the same structure
+        use nostr::base64::Engine;
+        use nostr::base64::engine::general_purpose::STANDARD as BASE64;
         for welcome_rumor in &create_result.welcome_rumors {
             assert_eq!(welcome_rumor.kind, Kind::MlsWelcome);
             assert_eq!(welcome_rumor.tags.len(), 4);
-            assert!(hex::decode(&welcome_rumor.content).is_ok());
+            assert!(
+                BASE64.decode(&welcome_rumor.content).is_ok(),
+                "Welcome content should be valid base64"
+            );
         }
     }
 
@@ -737,9 +750,17 @@ mod tests {
         assert_eq!(first_tags[0].kind(), second_tags[0].kind());
         assert_eq!(first_tags[1].kind(), second_tags[1].kind());
 
-        // Both should be valid hex
-        assert!(hex::decode(&first_welcome.content).is_ok());
-        assert!(hex::decode(&second_welcome.content).is_ok());
+        // Both should be valid base64 (always base64 per MIP-00/MIP-02)
+        use nostr::base64::Engine;
+        use nostr::base64::engine::general_purpose::STANDARD as BASE64;
+        assert!(
+            BASE64.decode(&first_welcome.content).is_ok(),
+            "First welcome should be valid base64"
+        );
+        assert!(
+            BASE64.decode(&second_welcome.content).is_ok(),
+            "Second welcome should be valid base64"
+        );
     }
 
     /// Test welcome processing error recovery (MIP-02)
@@ -919,10 +940,12 @@ mod tests {
                 group_size, binary_size, size_kb
             );
 
-            // Verify welcome is valid hex
+            // Verify welcome is valid base64 (always base64 per MIP-00/MIP-02)
+            use nostr::base64::Engine;
+            use nostr::base64::engine::general_purpose::STANDARD as BASE64;
             assert!(
-                hex::decode(&welcome.content).is_ok(),
-                "Welcome content should be valid hex"
+                BASE64.decode(&welcome.content).is_ok(),
+                "Welcome content should be valid base64"
             );
 
             // For small groups, welcome should be well under 100KB

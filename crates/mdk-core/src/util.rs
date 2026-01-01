@@ -80,7 +80,7 @@ impl ContentEncoding {
     /// Looks for an `["encoding", "..."]` tag.
     /// - `["encoding", "base64"]` → Base64 encoding
     /// - `["encoding", "hex"]` → Hex encoding
-    /// - No encoding tag → Hex encoding (legacy default)
+    /// - No encoding tag → None
     ///
     /// # Arguments
     ///
@@ -88,19 +88,20 @@ impl ContentEncoding {
     ///
     /// # Returns
     ///
-    /// The ContentEncoding specified by the tag, or Hex if no tag present.
-    pub fn from_tags<'a>(tags: impl Iterator<Item = &'a nostr::Tag>) -> Self {
+    /// The ContentEncoding specified by the tag, or None if no tag present.
+    /// Callers must handle None and reject events without encoding tags.
+    pub fn from_tags<'a>(tags: impl Iterator<Item = &'a nostr::Tag>) -> Option<Self> {
         for tag in tags {
             let slice = tag.as_slice();
             if slice.len() >= 2
                 && slice[0] == "encoding"
                 && let Some(encoding) = Self::from_tag_value(&slice[1])
             {
-                return encoding;
+                return Some(encoding);
             }
         }
-        // Default to hex for backward compatibility
-        ContentEncoding::Hex
+        // SECURITY: No default - encoding tag must be present per MIP-00/MIP-02
+        None
     }
 }
 
@@ -123,9 +124,12 @@ pub(crate) fn encode_content(bytes: &[u8], encoding: ContentEncoding) -> String 
 
 /// Decodes content using the specified encoding format
 ///
-/// The encoding format is determined by the `["encoding", "..."]` tag on the event:
+/// The encoding format must be determined from the `["encoding", "..."]` tag on the event:
 /// - `["encoding", "base64"]` → base64 decoding
-/// - `["encoding", "hex"]` or no encoding tag → hex decoding (legacy default)
+/// - `["encoding", "hex"]` → hex decoding (for backward compatibility with existing events)
+///
+/// Per MIP-00/MIP-02, the encoding tag is required. Callers must extract the encoding
+/// using `ContentEncoding::from_tags()` and handle the None case by rejecting the event.
 ///
 /// This tag-based approach eliminates ambiguity for strings like `deadbeef` that are valid
 /// in both hex and base64 formats but decode to completely different bytes.
@@ -133,7 +137,7 @@ pub(crate) fn encode_content(bytes: &[u8], encoding: ContentEncoding) -> String 
 /// # Arguments
 ///
 /// * `content` - The encoded string
-/// * `encoding` - The encoding format (from the event's encoding tag, or Hex if absent)
+/// * `encoding` - The encoding format (from the event's encoding tag, must be present)
 /// * `label` - A label for the content type (e.g., "key package", "welcome") used in error messages
 ///
 /// # Returns
@@ -218,7 +222,7 @@ mod tests {
         )];
         assert_eq!(
             ContentEncoding::from_tags(tags_base64.iter()),
-            ContentEncoding::Base64
+            Some(ContentEncoding::Base64)
         );
 
         let tags_hex = [Tag::custom(
@@ -227,13 +231,10 @@ mod tests {
         )];
         assert_eq!(
             ContentEncoding::from_tags(tags_hex.iter()),
-            ContentEncoding::Hex
+            Some(ContentEncoding::Hex)
         );
 
         let empty: [Tag; 0] = [];
-        assert_eq!(
-            ContentEncoding::from_tags(empty.iter()),
-            ContentEncoding::Hex
-        );
+        assert_eq!(ContentEncoding::from_tags(empty.iter()), None);
     }
 }

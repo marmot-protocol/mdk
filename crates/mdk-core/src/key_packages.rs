@@ -20,9 +20,8 @@ where
     /// Creates a key package for a Nostr event.
     ///
     /// This function generates an encoded key package that is used as the content field of a kind:443 Nostr event.
-    /// The encoding format is determined by `MdkConfig::use_base64_encoding`:
-    /// - When `false` (default): uses hex encoding with `["encoding", "hex"]` tag
-    /// - When `true`: uses base64 encoding with `["encoding", "base64"]` tag (~33% smaller)
+    /// The encoding format is always base64 with an explicit `["encoding", "base64"]` tag per MIP-00/MIP-02.
+    /// This prevents downgrade attacks and parsing ambiguity across clients.
     ///
     /// The key package contains the user's credential and capabilities required for MLS operations.
     ///
@@ -69,11 +68,9 @@ where
 
         let key_package_serialized = key_package_bundle.key_package().tls_serialize_detached()?;
 
-        let encoding = if self.config.use_base64_encoding {
-            ContentEncoding::Base64
-        } else {
-            ContentEncoding::Hex
-        };
+        // SECURITY: Always use base64 encoding with explicit encoding tag per MIP-00/MIP-02.
+        // This prevents downgrade attacks and parsing ambiguity across clients.
+        let encoding = ContentEncoding::Base64;
 
         let encoded_content = encode_content(&key_package_serialized, encoding);
 
@@ -161,12 +158,6 @@ where
     /// * `Err(Error::KeyPackage)` - Tag validation failed (missing tags, invalid format, or unsupported values)
     /// * `Err(Error)` - Deserialization failed (malformed TLS data)
     ///
-    /// # Backward Compatibility
-    ///
-    /// This method accepts both MIP-00 compliant tags and legacy formats:
-    /// - Legacy tag names without `mls_` prefix (for `ciphersuite` and `extensions` only)
-    /// - Legacy ciphersuite values: "1" or "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519"
-    /// - Legacy extension values: string names like "RequiredCapabilities" or comma-separated format
     ///
     /// # Example
     ///
@@ -193,8 +184,10 @@ where
         // Validate tags before parsing the key package
         self.validate_key_package_tags(event)?;
 
-        // Get encoding format from event tags (defaults to Hex for legacy events)
-        let encoding = ContentEncoding::from_tags(event.tags.iter());
+        // SECURITY: Require explicit encoding tag to prevent downgrade attacks and parsing ambiguity.
+        // Per MIP-00/MIP-02, encoding tag must be present.
+        let encoding = ContentEncoding::from_tags(event.tags.iter())
+            .ok_or_else(|| Error::KeyPackage("Missing required encoding tag".to_string()))?;
 
         let key_package = self.parse_serialized_key_package(&event.content, encoding)?;
 
@@ -221,7 +214,6 @@ where
     /// This function checks that:
     /// - The event has the required tags (mls_protocol_version, mls_ciphersuite, mls_extensions)
     /// - Tag values are in the correct format and contain valid values
-    /// - Supports backward compatibility with legacy formats
     ///
     /// # Arguments
     ///
@@ -673,7 +665,7 @@ mod tests {
 
         // Parse and validate the key package
         let key_package = parsing_mls
-            .parse_serialized_key_package(&key_package_hex, ContentEncoding::Hex)
+            .parse_serialized_key_package(&key_package_hex, ContentEncoding::Base64)
             .expect("Failed to parse key package");
 
         // Verify the key package has the expected properties
@@ -955,7 +947,7 @@ mod tests {
         // Create new instance for parsing and deletion
         let deletion_mls = create_test_mdk();
         let key_package = deletion_mls
-            .parse_serialized_key_package(&key_package_hex, ContentEncoding::Hex)
+            .parse_serialized_key_package(&key_package_hex, ContentEncoding::Base64)
             .expect("Failed to parse key package");
 
         // Delete the key package
@@ -1928,6 +1920,7 @@ mod tests {
                     "Unknown(62190)",
                 ],
             ),
+            Tag::custom(TagKind::Custom("encoding".into()), ["base64"]),
         ];
 
         // Sign with the same keys used in the credential
@@ -2100,9 +2093,7 @@ mod tests {
 
     #[test]
     fn test_key_package_base64_encoding() {
-        let config = crate::MdkConfig {
-            use_base64_encoding: true,
-        };
+        let config = crate::MdkConfig::default();
 
         let mdk = crate::tests::create_test_mdk_with_config(config);
         let test_pubkey =
@@ -2137,10 +2128,8 @@ mod tests {
     }
 
     #[test]
-    fn test_key_package_hex_encoding() {
-        let config = crate::MdkConfig {
-            use_base64_encoding: false,
-        };
+    fn test_key_package_always_base64_encoding() {
+        let config = crate::MdkConfig::default();
 
         let mdk = crate::tests::create_test_mdk_with_config(config);
         let test_pubkey =
@@ -2152,7 +2141,11 @@ mod tests {
             .create_key_package_for_event(&test_pubkey, relays)
             .expect("Failed to create key package");
 
-        assert!(hex::decode(&key_package_str).is_ok(), "Should be valid hex");
+        assert!(
+            BASE64.decode(&key_package_str).is_ok(),
+            "Content should always be valid base64, got: {}",
+            key_package_str
+        );
 
         let encoding_tag = tags
             .iter()
@@ -2160,68 +2153,47 @@ mod tests {
         assert!(encoding_tag.is_some(), "Should have encoding tag");
         assert_eq!(
             encoding_tag.unwrap().as_slice().get(1).map(|s| s.as_str()),
-            Some("hex"),
-            "Encoding tag should be 'hex'"
+            Some("base64"),
+            "Encoding tag should always be 'base64'"
         );
 
         let parsed = mdk
-            .parse_serialized_key_package(&key_package_str, ContentEncoding::Hex)
-            .expect("Failed to parse hex key package");
+            .parse_serialized_key_package(&key_package_str, ContentEncoding::Base64)
+            .expect("Failed to parse base64 key package");
         assert_eq!(parsed.ciphersuite(), DEFAULT_CIPHERSUITE);
     }
 
+    /// Test that key packages are always created with base64, but parsing supports both formats
+    /// (for backward compatibility with existing hex-encoded events)
     #[test]
-    fn test_key_package_cross_format_compatibility() {
-        // Create with hex
-        let hex_config = crate::MdkConfig {
-            use_base64_encoding: false,
-        };
-        let hex_mdk = crate::tests::create_test_mdk_with_config(hex_config);
-
+    fn test_key_package_parsing_supports_both_formats() {
+        let mdk = create_test_mdk();
         let test_pubkey =
             PublicKey::from_hex("884704bd421671e01c13f854d2ce23ce2a5bfe9562f4f297ad2bc921ba30c3a6")
                 .unwrap();
         let relays = vec![RelayUrl::parse("wss://relay.example.com").unwrap()];
 
-        let (hex_key_package, _) = hex_mdk
-            .create_key_package_for_event(&test_pubkey, relays.clone())
-            .expect("Failed to create hex key package");
-
-        // Create with base64
-        let base64_config = crate::MdkConfig {
-            use_base64_encoding: true,
-        };
-        let base64_mdk = crate::tests::create_test_mdk_with_config(base64_config);
-
-        let (base64_key_package, _) = base64_mdk
+        let (base64_key_package, _) = mdk
             .create_key_package_for_event(&test_pubkey, relays)
             .expect("Failed to create base64 key package");
 
-        // Both MDK instances should be able to parse both formats when given correct encoding
-        // (In real usage, encoding comes from the event's tags)
         assert!(
-            hex_mdk
-                .parse_serialized_key_package(&hex_key_package, ContentEncoding::Hex)
-                .is_ok(),
-            "Hex MDK should parse hex key package with Hex encoding"
+            BASE64.decode(&base64_key_package).is_ok(),
+            "Created key package should be base64"
         );
+
         assert!(
-            hex_mdk
-                .parse_serialized_key_package(&base64_key_package, ContentEncoding::Base64)
+            mdk.parse_serialized_key_package(&base64_key_package, ContentEncoding::Base64)
                 .is_ok(),
-            "Hex MDK should parse base64 key package with Base64 encoding"
+            "Should parse base64 key package"
         );
+
+        // For backward compatibility, parsing should still support hex if explicitly tagged
+        let hex_key_package = hex::encode(BASE64.decode(&base64_key_package).unwrap());
         assert!(
-            base64_mdk
-                .parse_serialized_key_package(&hex_key_package, ContentEncoding::Hex)
+            mdk.parse_serialized_key_package(&hex_key_package, ContentEncoding::Hex)
                 .is_ok(),
-            "Base64 MDK should parse hex key package with Hex encoding"
-        );
-        assert!(
-            base64_mdk
-                .parse_serialized_key_package(&base64_key_package, ContentEncoding::Base64)
-                .is_ok(),
-            "Base64 MDK should parse base64 key package with Base64 encoding"
+            "Should still parse hex key package for backward compatibility"
         );
     }
 
