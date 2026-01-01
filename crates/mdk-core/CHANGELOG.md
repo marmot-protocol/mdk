@@ -33,6 +33,9 @@
 
 ### Fixed
 
+- **MIME Type Canonicalization (Issue #63)**: Fixed incomplete MIME type canonicalization in `validate_mime_type`
+- **MIME Type Spoofing and Allowlist (Issue #66)**: Added MIME type validation and allowlist enforcement
+
 ### Removed
 
 ### Deprecated
