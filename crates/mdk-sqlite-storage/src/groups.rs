@@ -13,6 +13,10 @@ use rusqlite::{OptionalExtension, params};
 use crate::db::{Hash32, Nonce12};
 use crate::{MdkSqliteStorage, db};
 
+/// Default maximum number of messages to retrieve when using unpaginated messages()
+/// This prevents memory exhaustion from loading millions of messages at once
+const DEFAULT_MESSAGE_LIMIT: usize = 1000;
+
 #[inline]
 fn into_group_err<T>(e: T) -> GroupError
 where
@@ -125,6 +129,16 @@ impl GroupStorage for MdkSqliteStorage {
     }
 
     fn messages(&self, mls_group_id: &GroupId) -> Result<Vec<Message>, GroupError> {
+        // Use paginated version with default limit for backward compatibility
+        self.messages_paginated(mls_group_id, DEFAULT_MESSAGE_LIMIT, 0)
+    }
+
+    fn messages_paginated(
+        &self,
+        mls_group_id: &GroupId,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<Message>, GroupError> {
         // First verify the group exists
         if self.find_group_by_mls_group_id(mls_group_id)?.is_none() {
             return Err(GroupError::InvalidParameters(format!(
@@ -136,11 +150,16 @@ impl GroupStorage for MdkSqliteStorage {
         let conn_guard = self.db_connection.lock().map_err(into_group_err)?;
 
         let mut stmt = conn_guard
-            .prepare("SELECT * FROM messages WHERE mls_group_id = ? ORDER BY created_at DESC")
+            .prepare(
+                "SELECT * FROM messages WHERE mls_group_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?",
+            )
             .map_err(into_group_err)?;
 
         let messages_iter = stmt
-            .query_map(params![mls_group_id.as_slice()], db::row_to_message)
+            .query_map(
+                params![mls_group_id.as_slice(), limit as i64, offset as i64],
+                db::row_to_message,
+            )
             .map_err(into_group_err)?;
 
         let mut messages: Vec<Message> = Vec::new();
@@ -344,6 +363,82 @@ mod tests {
 
     // Note: Comprehensive storage functionality tests are now in mdk-storage-traits/tests/
     // using shared test functions to ensure consistency between storage implementations
+
+    #[test]
+    fn test_messages_pagination() {
+        use mdk_storage_traits::messages::MessageStorage;
+        use mdk_storage_traits::messages::types::{Message, MessageState};
+        use nostr::{EventId, Kind, PublicKey, Tags, Timestamp, UnsignedEvent};
+
+        let storage = MdkSqliteStorage::new_in_memory().unwrap();
+
+        // Create a test group
+        let mls_group_id = GroupId::from_slice(&[1, 2, 3, 4]);
+        let nostr_group_id = generate_random_bytes(32).try_into().unwrap();
+
+        let group = Group {
+            mls_group_id: mls_group_id.clone(),
+            nostr_group_id,
+            name: "Test Group".to_string(),
+            description: "A test group".to_string(),
+            admin_pubkeys: BTreeSet::new(),
+            last_message_id: None,
+            last_message_at: None,
+            epoch: 0,
+            state: GroupState::Active,
+            image_hash: None,
+            image_key: None,
+            image_nonce: None,
+        };
+
+        storage.save_group(group).unwrap();
+
+        // Create 25 test messages
+        let pubkey = PublicKey::from_slice(&[1u8; 32]).unwrap();
+        for i in 0..25 {
+            let event_id = EventId::from_slice(&[i as u8; 32]).unwrap();
+            let wrapper_event_id = EventId::from_slice(&[100 + i as u8; 32]).unwrap();
+
+            let message = Message {
+                id: event_id,
+                pubkey,
+                kind: Kind::from(1u16),
+                mls_group_id: mls_group_id.clone(),
+                created_at: Timestamp::from((1000 + i) as u64),
+                content: format!("Message {}", i),
+                tags: Tags::new(),
+                event: UnsignedEvent::new(
+                    pubkey,
+                    Timestamp::from((1000 + i) as u64),
+                    Kind::from(9u16),
+                    vec![],
+                    format!("content {}", i),
+                ),
+                wrapper_event_id,
+                state: MessageState::Created,
+            };
+
+            storage.save_message(message).unwrap();
+        }
+
+        // Test pagination
+        let page1 = storage.messages_paginated(&mls_group_id, 10, 0).unwrap();
+        assert_eq!(page1.len(), 10);
+        // Should be newest first (highest timestamp)
+        assert_eq!(page1[0].content, "Message 24");
+
+        let page2 = storage.messages_paginated(&mls_group_id, 10, 10).unwrap();
+        assert_eq!(page2.len(), 10);
+        assert_eq!(page2[0].content, "Message 14");
+
+        let page3 = storage.messages_paginated(&mls_group_id, 10, 20).unwrap();
+        assert_eq!(page3.len(), 5); // Only 5 messages left
+        assert_eq!(page3[0].content, "Message 4");
+
+        // Test default messages() uses limit
+        let default_messages = storage.messages(&mls_group_id).unwrap();
+        assert_eq!(default_messages.len(), 25); // All messages since < 1000
+    }
 
     #[test]
     fn test_group_exporter_secret() {

@@ -52,6 +52,16 @@ impl GroupStorage for MdkMemoryStorage {
     }
 
     fn messages(&self, mls_group_id: &GroupId) -> Result<Vec<Message>, GroupError> {
+        // Use paginated version with large limit for backward compatibility
+        self.messages_paginated(mls_group_id, 1000, 0)
+    }
+
+    fn messages_paginated(
+        &self,
+        mls_group_id: &GroupId,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<Message>, GroupError> {
         // Check if the group exists first
         if self.find_group_by_mls_group_id(mls_group_id)?.is_none() {
             return Err(GroupError::InvalidParameters(format!(
@@ -62,7 +72,16 @@ impl GroupStorage for MdkMemoryStorage {
 
         let cache = self.messages_by_group_cache.read();
         match cache.peek(mls_group_id).cloned() {
-            Some(messages) => Ok(messages),
+            Some(mut messages) => {
+                // Sort by created_at DESC (newest first)
+                messages.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+
+                // Apply pagination
+                let start = offset.min(messages.len());
+                let end = (offset + limit).min(messages.len());
+
+                Ok(messages[start..end].to_vec())
+            }
             // If not in cache but group exists, return empty vector
             None => Ok(Vec::new()),
         }

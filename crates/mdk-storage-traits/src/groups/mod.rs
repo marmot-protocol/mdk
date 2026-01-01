@@ -37,7 +37,35 @@ pub trait GroupStorage {
     fn save_group(&self, group: Group) -> Result<(), GroupError>;
 
     /// Get all messages for a group
+    ///
+    /// **Warning**: This method loads all messages into memory and may cause
+    /// memory exhaustion for groups with many messages. Consider using
+    /// `messages_paginated()` for better performance and memory safety.
     fn messages(&self, group_id: &GroupId) -> Result<Vec<Message>, GroupError>;
+
+    /// Get messages for a group with pagination
+    ///
+    /// Returns messages ordered by `created_at DESC` (newest first).
+    ///
+    /// # Arguments
+    /// * `group_id` - The group ID to fetch messages for
+    /// * `limit` - Maximum number of messages to return (enforced server-side)
+    /// * `offset` - Number of messages to skip (for pagination)
+    ///
+    /// # Example
+    /// ```ignore
+    /// // Get first 100 messages
+    /// let page1 = storage.messages_paginated(&group_id, 100, 0)?;
+    ///
+    /// // Get next 100 messages
+    /// let page2 = storage.messages_paginated(&group_id, 100, 100)?;
+    /// ```
+    fn messages_paginated(
+        &self,
+        group_id: &GroupId,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<Message>, GroupError>;
 
     /// Get all admins for a group
     fn admins(&self, group_id: &GroupId) -> Result<BTreeSet<PublicKey>, GroupError>;
