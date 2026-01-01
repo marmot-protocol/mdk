@@ -25,14 +25,14 @@ impl WelcomeStorage for MdkSqliteStorage {
     fn save_welcome(&self, welcome: Welcome) -> Result<(), WelcomeError> {
         // Validate group name and description lengths
         validate_string_length(&welcome.group_name, MAX_GROUP_NAME_LENGTH, "Group name")
-            .map_err(WelcomeError::InvalidParameters)?;
+            .map_err(|e| WelcomeError::InvalidParameters(e.to_string()))?;
 
         validate_string_length(
             &welcome.group_description,
             MAX_GROUP_DESCRIPTION_LENGTH,
             "Group description",
         )
-        .map_err(WelcomeError::InvalidParameters)?;
+        .map_err(|e| WelcomeError::InvalidParameters(e.to_string()))?;
 
         let conn_guard = self.db_connection.lock().map_err(into_welcome_err)?;
 
@@ -48,7 +48,7 @@ impl WelcomeStorage for MdkSqliteStorage {
             MAX_ADMIN_PUBKEYS_JSON_SIZE,
             "Admin pubkeys JSON",
         )
-        .map_err(WelcomeError::InvalidParameters)?;
+        .map_err(|e| WelcomeError::InvalidParameters(e.to_string()))?;
 
         let group_relays_json: String =
             serde_json::to_string(&welcome.group_relays).map_err(|e| {
@@ -61,14 +61,14 @@ impl WelcomeStorage for MdkSqliteStorage {
             MAX_GROUP_RELAYS_JSON_SIZE,
             "Group relays JSON",
         )
-        .map_err(WelcomeError::InvalidParameters)?;
+        .map_err(|e| WelcomeError::InvalidParameters(e.to_string()))?;
 
         // Serialize event to JSON
         let event_json = welcome.event.as_json();
 
         // Validate event JSON size
         validate_size(event_json.as_bytes(), MAX_EVENT_JSON_SIZE, "Event JSON")
-            .map_err(WelcomeError::InvalidParameters)?;
+            .map_err(|e| WelcomeError::InvalidParameters(e.to_string()))?;
 
         conn_guard
             .execute(

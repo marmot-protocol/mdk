@@ -23,16 +23,34 @@ pub const MAX_ADMIN_PUBKEYS_JSON_SIZE: usize = 50 * 1024;
 /// Maximum size for serialized group relays JSON (50 KB)
 pub const MAX_GROUP_RELAYS_JSON_SIZE: usize = 50 * 1024;
 
+/// Validation errors for input size/length checks
+#[derive(Debug, thiserror::Error)]
+pub enum ValidationError {
+    /// Field exceeds maximum allowed size
+    #[error("{field_name} exceeds maximum length of {max_size} bytes (got {actual_size} bytes)")]
+    SizeExceeded {
+        /// Name of the field that failed validation
+        field_name: String,
+        /// Maximum allowed size/length in bytes
+        max_size: usize,
+        /// Actual size/length in bytes
+        actual_size: usize,
+    },
+}
+
 /// Validate that a byte slice does not exceed the specified maximum size.
 #[inline]
-pub fn validate_size(data: &[u8], max_size: usize, field_name: &str) -> Result<(), String> {
+pub fn validate_size(
+    data: &[u8],
+    max_size: usize,
+    field_name: &str,
+) -> Result<(), ValidationError> {
     if data.len() > max_size {
-        return Err(format!(
-            "{} exceeds maximum size of {} bytes (got {} bytes)",
-            field_name,
+        return Err(ValidationError::SizeExceeded {
+            field_name: field_name.to_string(),
             max_size,
-            data.len()
-        ));
+            actual_size: data.len(),
+        });
     }
     Ok(())
 }
@@ -42,14 +60,17 @@ pub fn validate_size(data: &[u8], max_size: usize, field_name: &str) -> Result<(
 /// Note: This validates UTF-8 byte length, not Unicode character count.
 /// Multi-byte characters (e.g., emoji) will count as multiple bytes.
 #[inline]
-pub fn validate_string_length(s: &str, max_length: usize, field_name: &str) -> Result<(), String> {
+pub fn validate_string_length(
+    s: &str,
+    max_length: usize,
+    field_name: &str,
+) -> Result<(), ValidationError> {
     if s.len() > max_length {
-        return Err(format!(
-            "{} exceeds maximum length of {} bytes (got {} bytes)",
-            field_name,
-            max_length,
-            s.len()
-        ));
+        return Err(ValidationError::SizeExceeded {
+            field_name: field_name.to_string(),
+            max_size: max_length,
+            actual_size: s.len(),
+        });
     }
     Ok(())
 }

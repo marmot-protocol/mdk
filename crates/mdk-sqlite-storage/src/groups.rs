@@ -81,14 +81,14 @@ impl GroupStorage for MdkSqliteStorage {
     fn save_group(&self, group: Group) -> Result<(), GroupError> {
         // Validate group name and description lengths
         validate_string_length(&group.name, MAX_GROUP_NAME_LENGTH, "Group name")
-            .map_err(GroupError::InvalidParameters)?;
+            .map_err(|e| GroupError::InvalidParameters(e.to_string()))?;
 
         validate_string_length(
             &group.description,
             MAX_GROUP_DESCRIPTION_LENGTH,
             "Group description",
         )
-        .map_err(GroupError::InvalidParameters)?;
+        .map_err(|e| GroupError::InvalidParameters(e.to_string()))?;
 
         let conn_guard = self.db_connection.lock().map_err(into_group_err)?;
 
@@ -103,7 +103,7 @@ impl GroupStorage for MdkSqliteStorage {
             MAX_ADMIN_PUBKEYS_JSON_SIZE,
             "Admin pubkeys JSON",
         )
-        .map_err(GroupError::InvalidParameters)?;
+        .map_err(|e| GroupError::InvalidParameters(e.to_string()))?;
 
         let last_message_id: Option<&[u8; 32]> =
             group.last_message_id.as_ref().map(|id| id.as_bytes());

@@ -28,7 +28,7 @@ impl MessageStorage for MdkSqliteStorage {
             MAX_MESSAGE_CONTENT_SIZE,
             "Message content",
         )
-        .map_err(MessageError::InvalidParameters)?;
+        .map_err(|e| MessageError::InvalidParameters(e.to_string()))?;
 
         let conn_guard = self.db_connection.lock().map_err(into_message_err)?;
 
@@ -38,14 +38,14 @@ impl MessageStorage for MdkSqliteStorage {
 
         // Validate tags JSON size
         validate_size(tags_json.as_bytes(), MAX_TAGS_JSON_SIZE, "Tags JSON")
-            .map_err(MessageError::InvalidParameters)?;
+            .map_err(|e| MessageError::InvalidParameters(e.to_string()))?;
 
         // Serialize event to JSON
         let event_json = message.event.as_json();
 
         // Validate event JSON size
         validate_size(event_json.as_bytes(), MAX_EVENT_JSON_SIZE, "Event JSON")
-            .map_err(MessageError::InvalidParameters)?;
+            .map_err(|e| MessageError::InvalidParameters(e.to_string()))?;
 
         conn_guard
             .execute(
