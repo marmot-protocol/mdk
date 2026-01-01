@@ -102,7 +102,8 @@ where
         if tags[1].kind() != TagKind::e() {
             return Err(Error::InvalidWelcomeMessage);
         }
-        if tags[1].content().is_none() {
+        // Check that e tag has non-empty content
+        if tags[1].content().is_none() || tags[1].content() == Some("") {
             return Err(Error::InvalidWelcomeMessage);
         }
 
@@ -110,7 +111,8 @@ where
         if tags[2].kind() != TagKind::Client {
             return Err(Error::InvalidWelcomeMessage);
         }
-        if tags[2].content().is_none() {
+        // Check that client tag has non-empty content
+        if tags[2].content().is_none() || tags[2].content() == Some("") {
             return Err(Error::InvalidWelcomeMessage);
         }
 
@@ -646,6 +648,67 @@ mod tests {
         };
         let result = mdk.process_welcome(&wrapper_event_id, &empty_relays_event);
         assert!(result.is_err(), "Should reject empty relays tag");
+        assert!(matches!(result.unwrap_err(), Error::InvalidWelcomeMessage));
+
+        // Test 5: Empty e tag content
+        let mut tags5 = nostr::Tags::new();
+        tags5.push(nostr::Tag::relays(vec![
+            RelayUrl::parse("wss://relay.example.com").unwrap(),
+        ]));
+        tags5.push(nostr::Tag::parse(&["e".to_string(), "".to_string()]).unwrap()); // Empty event ID
+        tags5.push(nostr::Tag::client("mdk".to_string()));
+
+        let empty_e_tag_event = UnsignedEvent {
+            id: None,
+            pubkey: Keys::generate().public_key(),
+            created_at: Timestamp::now(),
+            kind: Kind::MlsWelcome,
+            tags: tags5,
+            content: "test".to_string(),
+        };
+        let result = mdk.process_welcome(&wrapper_event_id, &empty_e_tag_event);
+        assert!(result.is_err(), "Should reject empty e tag content");
+        assert!(matches!(result.unwrap_err(), Error::InvalidWelcomeMessage));
+
+        // Test 6: Empty client tag content
+        let mut tags6 = nostr::Tags::new();
+        tags6.push(nostr::Tag::relays(vec![
+            RelayUrl::parse("wss://relay.example.com").unwrap(),
+        ]));
+        tags6.push(nostr::Tag::event(EventId::all_zeros()));
+        tags6.push(nostr::Tag::parse(&["client".to_string(), "".to_string()]).unwrap()); // Empty client
+
+        let empty_client_tag_event = UnsignedEvent {
+            id: None,
+            pubkey: Keys::generate().public_key(),
+            created_at: Timestamp::now(),
+            kind: Kind::MlsWelcome,
+            tags: tags6,
+            content: "test".to_string(),
+        };
+        let result = mdk.process_welcome(&wrapper_event_id, &empty_client_tag_event);
+        assert!(result.is_err(), "Should reject empty client tag content");
+        assert!(matches!(result.unwrap_err(), Error::InvalidWelcomeMessage));
+
+        // Test 7: Invalid encoding value
+        let mut tags7 = nostr::Tags::new();
+        tags7.push(nostr::Tag::relays(vec![
+            RelayUrl::parse("wss://relay.example.com").unwrap(),
+        ]));
+        tags7.push(nostr::Tag::event(EventId::all_zeros()));
+        tags7.push(nostr::Tag::client("mdk".to_string()));
+        tags7.push(nostr::Tag::parse(&["encoding".to_string(), "invalid".to_string()]).unwrap()); // Invalid encoding
+
+        let invalid_encoding_event = UnsignedEvent {
+            id: None,
+            pubkey: Keys::generate().public_key(),
+            created_at: Timestamp::now(),
+            kind: Kind::MlsWelcome,
+            tags: tags7,
+            content: "test".to_string(),
+        };
+        let result = mdk.process_welcome(&wrapper_event_id, &invalid_encoding_event);
+        assert!(result.is_err(), "Should reject invalid encoding value");
         assert!(matches!(result.unwrap_err(), Error::InvalidWelcomeMessage));
     }
 
