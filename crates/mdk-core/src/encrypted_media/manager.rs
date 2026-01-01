@@ -71,7 +71,13 @@ where
         options: &MediaProcessingOptions,
     ) -> Result<EncryptedMediaUpload, EncryptedMediaError> {
         validation::validate_file_size(data, options)?;
+        // Validate MIME type: canonicalize, check allowlist, and validate against file bytes (for images)
+        // This prevents spoofing and ensures only supported types are encrypted
         let canonical_mime_type = validation::validate_mime_type(mime_type)?;
+        // For image types, validate against file bytes to prevent spoofing
+        if canonical_mime_type.starts_with("image/") {
+            validation::validate_mime_type_matches_data(data, &canonical_mime_type)?;
+        }
         validation::validate_filename(filename)?;
 
         // Extract metadata and optionally sanitize the file
@@ -346,7 +352,10 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::media_processing::types::MediaProcessingError;
+    use image::{ImageBuffer, Rgb};
     use mdk_memory_storage::MdkMemoryStorage;
+    use std::io::Cursor;
 
     fn create_test_mdk() -> MDK<MdkMemoryStorage> {
         MDK::new(MdkMemoryStorage::default())
@@ -493,7 +502,7 @@ mod tests {
     }
 
     #[test]
-    fn test_encrypt_for_upload_accepts_any_mime_type() {
+    fn test_encrypt_for_upload_supported_mime_types() {
         let mdk = create_test_mdk();
         let group_id = GroupId::from_slice(&[1, 2, 3, 4]);
         let manager = mdk.media_manager(group_id);
@@ -509,13 +518,12 @@ mod tests {
             max_filename_length: None,
         };
 
-        // Test with various non-image MIME types - all should pass validation
+        // Test with various supported non-image MIME types - all should pass validation
         let test_cases = vec![
             ("application/pdf", "document.pdf"),
             ("video/quicktime", "video.mov"),
             ("audio/mpeg", "song.mp3"),
             ("text/plain", "note.txt"),
-            ("application/octet-stream", "file.bin"),
         ];
 
         for (mime_type, filename) in test_cases {
@@ -534,6 +542,130 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_encrypt_for_upload_rejects_unsupported_mime_types() {
+        let mdk = create_test_mdk();
+        let group_id = GroupId::from_slice(&[1, 2, 3, 4]);
+        let manager = mdk.media_manager(group_id);
+
+        let test_data = vec![0u8; 1000];
+        let options = MediaProcessingOptions {
+            sanitize_exif: true,
+            generate_blurhash: false,
+            max_dimension: None,
+            max_file_size: None,
+            max_filename_length: None,
+        };
+
+        // Test with unsupported MIME types - all should be rejected
+        let unsupported_cases = vec![
+            ("application/x-executable", "malware.exe"),
+            ("text/html", "page.html"),
+            ("application/javascript", "script.js"),
+            ("image/svg+xml", "image.svg"),
+            ("application/x-sh", "script.sh"),
+        ];
+
+        for (mime_type, filename) in unsupported_cases {
+            let result =
+                manager.encrypt_for_upload_with_options(&test_data, mime_type, filename, &options);
+
+            // Should fail with InvalidMimeType error
+            assert!(result.is_err());
+            assert!(
+                matches!(
+                    result,
+                    Err(EncryptedMediaError::MediaProcessing(
+                        MediaProcessingError::InvalidMimeType { .. }
+                    ))
+                ),
+                "Expected InvalidMimeType error for unsupported MIME type {}, got: {:?}",
+                mime_type,
+                result
+            );
+        }
+    }
+
+    #[test]
+    fn test_issue_66_encrypt_prevents_spoofing() {
+        let mdk = create_test_mdk();
+        let group_id = GroupId::from_slice(&[1, 2, 3, 4]);
+        let manager = mdk.media_manager(group_id);
+
+        // Create a PNG image
+        let img = ImageBuffer::from_fn(8, 8, |x, y| {
+            Rgb([(x * 32) as u8, (y * 32) as u8, ((x + y) * 16) as u8])
+        });
+        let mut png_data = Vec::new();
+        img.write_to(&mut Cursor::new(&mut png_data), image::ImageFormat::Png)
+            .unwrap();
+
+        let options = MediaProcessingOptions {
+            sanitize_exif: true,
+            generate_blurhash: false,
+            max_dimension: None,
+            max_file_size: None,
+            max_filename_length: None,
+        };
+
+        // Test 1: Spoofed image type (claiming JPEG but file is PNG) should fail
+        // This verifies that validate_mime_type_matches_data is called for images
+        let result =
+            manager.encrypt_for_upload_with_options(&png_data, "image/jpeg", "photo.jpg", &options);
+        assert!(result.is_err(), "Spoofed MIME type should be rejected");
+        assert!(
+            matches!(
+                result,
+                Err(EncryptedMediaError::MediaProcessing(
+                    MediaProcessingError::MimeTypeMismatch { .. }
+                ))
+            ),
+            "Expected MimeTypeMismatch error for spoofed image type, got: {:?}",
+            result
+        );
+
+        // Test 2: Unsupported image type should be rejected (allowlist check)
+        let result = manager.encrypt_for_upload_with_options(
+            &png_data,
+            "image/svg+xml",
+            "image.svg",
+            &options,
+        );
+        assert!(
+            result.is_err(),
+            "Unsupported image MIME type should be rejected"
+        );
+        assert!(
+            matches!(
+                result,
+                Err(EncryptedMediaError::MediaProcessing(
+                    MediaProcessingError::InvalidMimeType { .. }
+                ))
+            ),
+            "Expected InvalidMimeType error for unsupported image type, got: {:?}",
+            result
+        );
+
+        // Test 3: Valid matching image type should pass (if we had a real group)
+        // Note: This will fail with GroupNotFound, but that's expected - the validation passed
+        let result =
+            manager.encrypt_for_upload_with_options(&png_data, "image/png", "photo.png", &options);
+        assert!(result.is_err()); // Will fail due to missing group, not validation
+        // But we can verify it's not a validation error
+        assert!(
+            !matches!(
+                result,
+                Err(EncryptedMediaError::MediaProcessing(
+                    MediaProcessingError::InvalidMimeType { .. }
+                )) | Err(EncryptedMediaError::MediaProcessing(
+                    MediaProcessingError::MimeTypeMismatch { .. }
+                ))
+            ),
+            "Should not fail with validation error for valid matching MIME type, got: {:?}",
+            result
+        );
     }
 
     #[test]
