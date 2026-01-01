@@ -11,10 +11,10 @@ pub const MAX_TAGS_JSON_SIZE: usize = 100 * 1024;
 /// Maximum size for serialized event JSON (100 KB)
 pub const MAX_EVENT_JSON_SIZE: usize = 100 * 1024;
 
-/// Maximum length for group name (255 characters)
+/// Maximum length for group name (255 bytes, UTF-8 encoded)
 pub const MAX_GROUP_NAME_LENGTH: usize = 255;
 
-/// Maximum length for group description (2000 characters)
+/// Maximum length for group description (2000 bytes, UTF-8 encoded)
 pub const MAX_GROUP_DESCRIPTION_LENGTH: usize = 2000;
 
 /// Maximum size for serialized admin pubkeys JSON (50 KB)
@@ -37,12 +37,15 @@ pub fn validate_size(data: &[u8], max_size: usize, field_name: &str) -> Result<(
     Ok(())
 }
 
-/// Validate that a string does not exceed the specified maximum length.
+/// Validate that a string does not exceed the specified maximum length in bytes.
+///
+/// Note: This validates UTF-8 byte length, not Unicode character count.
+/// Multi-byte characters (e.g., emoji) will count as multiple bytes.
 #[inline]
 pub fn validate_string_length(s: &str, max_length: usize, field_name: &str) -> Result<(), String> {
     if s.len() > max_length {
         return Err(format!(
-            "{} exceeds maximum length of {} characters (got {} characters)",
+            "{} exceeds maximum length of {} bytes (got {} bytes)",
             field_name,
             max_length,
             s.len()
