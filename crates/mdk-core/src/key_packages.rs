@@ -656,7 +656,7 @@ mod tests {
         let relays = vec![RelayUrl::parse("wss://relay.example.com").unwrap()];
 
         // Create key package
-        let (key_package_hex, tags) = mdk
+        let (key_package_str, tags) = mdk
             .create_key_package_for_event(&test_pubkey, relays.clone())
             .expect("Failed to create key package");
 
@@ -665,7 +665,7 @@ mod tests {
 
         // Parse and validate the key package
         let key_package = parsing_mls
-            .parse_serialized_key_package(&key_package_hex, ContentEncoding::Base64)
+            .parse_serialized_key_package(&key_package_str, ContentEncoding::Base64)
             .expect("Failed to parse key package");
 
         // Verify the key package has the expected properties
@@ -940,14 +940,14 @@ mod tests {
         let relays = vec![RelayUrl::parse("wss://relay.example.com").unwrap()];
 
         // Create and parse key package
-        let (key_package_hex, _) = mdk
+        let (key_package_str, _) = mdk
             .create_key_package_for_event(&test_pubkey, relays.clone())
             .expect("Failed to create key package");
 
         // Create new instance for parsing and deletion
         let deletion_mls = create_test_mdk();
         let key_package = deletion_mls
-            .parse_serialized_key_package(&key_package_hex, ContentEncoding::Base64)
+            .parse_serialized_key_package(&key_package_str, ContentEncoding::Base64)
             .expect("Failed to parse key package");
 
         // Delete the key package
@@ -1850,7 +1850,7 @@ mod tests {
                 ),
             ];
 
-            let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex)
+            let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_str)
                 .tags(tags)
                 .sign_with_keys(&nostr::Keys::generate())
                 .unwrap();
@@ -1872,12 +1872,12 @@ mod tests {
         let keys = nostr::Keys::generate();
         let relays = vec![RelayUrl::parse("wss://relay.example.com").unwrap()];
 
-        let (key_package_hex, tags) = mdk
+        let (key_package_str, tags) = mdk
             .create_key_package_for_event(&keys.public_key(), relays)
             .expect("Failed to create key package");
 
         // Create an event signed by the same keys used in the credential
-        let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex)
+        let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_str)
             .tags(tags.to_vec())
             .sign_with_keys(&keys)
             .unwrap();
@@ -2195,6 +2195,47 @@ mod tests {
                 .is_ok(),
             "Should still parse hex key package for backward compatibility"
         );
+    }
+
+    /// Test that parse_key_package correctly handles hex-encoded events with explicit encoding tag
+    #[test]
+    fn test_parse_key_package_with_hex_encoding_tag() {
+        let mdk = create_test_mdk();
+        let keys = nostr::Keys::generate();
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").unwrap()];
+
+        // Create a base64 key package
+        let (base64_key_package, tags) = mdk
+            .create_key_package_for_event(&keys.public_key(), relays)
+            .expect("Failed to create key package");
+
+        // Convert to hex for the test
+        let hex_key_package = hex::encode(BASE64.decode(&base64_key_package).unwrap());
+
+        // Replace the encoding tag to indicate hex encoding
+        let hex_tags: Vec<Tag> = tags
+            .iter()
+            .map(|tag| {
+                if tag.as_slice().first() == Some(&"encoding".to_string()) {
+                    Tag::custom(TagKind::Custom("encoding".into()), ["hex"])
+                } else {
+                    tag.clone()
+                }
+            })
+            .collect();
+
+        // Create an event with hex content and hex encoding tag
+        let event = EventBuilder::new(Kind::MlsKeyPackage, hex_key_package)
+            .tags(hex_tags)
+            .sign_with_keys(&keys)
+            .expect("Failed to sign event");
+
+        // Parse should succeed with hex encoding tag
+        let parsed_key_package = mdk
+            .parse_key_package(&event)
+            .expect("Should parse hex-encoded key package with encoding tag");
+
+        assert_eq!(parsed_key_package.ciphersuite(), DEFAULT_CIPHERSUITE);
     }
 
     /// Security test: Identity binding prevents impersonation attacks

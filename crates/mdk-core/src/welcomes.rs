@@ -290,8 +290,31 @@ where
     ) -> Result<WelcomePreview, Error> {
         // SECURITY: Require explicit encoding tag to prevent downgrade attacks and parsing ambiguity.
         // Per MIP-00/MIP-02, encoding tag must be present.
-        let encoding = ContentEncoding::from_tags(welcome_event.tags.iter())
-            .ok_or_else(|| Error::Welcome("Missing required encoding tag".to_string()))?;
+        let encoding = match ContentEncoding::from_tags(welcome_event.tags.iter()) {
+            Some(enc) => enc,
+            None => {
+                let error_string = "Missing required encoding tag".to_string();
+                let processed_welcome = welcome_types::ProcessedWelcome {
+                    wrapper_event_id: *wrapper_event_id,
+                    welcome_event_id: welcome_event.id,
+                    processed_at: Timestamp::now(),
+                    state: welcome_types::ProcessedWelcomeState::Failed,
+                    failure_reason: Some(error_string.clone()),
+                };
+
+                self.storage()
+                    .save_processed_welcome(processed_welcome)
+                    .map_err(|e| Error::Welcome(e.to_string()))?;
+
+                tracing::error!(
+                    target: "mdk_core::welcomes::process_welcome",
+                    "Error processing welcome: {}",
+                    error_string
+                );
+
+                return Err(Error::Welcome(error_string));
+            }
+        };
 
         let decoded_content = match decode_content(&welcome_event.content, encoding, "welcome") {
             Ok((content, format)) => {
@@ -831,6 +854,11 @@ mod tests {
             nostr::RelayUrl::parse("wss://test.relay").unwrap(),
         ]));
         new_tags.push(nostr::Tag::event(fake_event_id));
+        // Preserve the encoding tag to avoid triggering the missing encoding tag error path
+        new_tags.push(nostr::Tag::custom(
+            nostr::TagKind::Custom("encoding".into()),
+            ["base64"],
+        ));
         modified_welcome.tags = new_tags;
 
         let result = bob_device_a.process_welcome(&nostr::EventId::all_zeros(), &modified_welcome);
