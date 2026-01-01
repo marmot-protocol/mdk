@@ -69,6 +69,13 @@ where
     /// - Must have at least 3 required tags: relays, e (event reference), and client
     /// - Tags must be in the correct order
     /// - Tag values must be non-empty
+    /// - Optional 4th tag (encoding) is validated if present
+    ///
+    /// # Note on Tag Count
+    ///
+    /// This validation requires a minimum of 3 tags for backward compatibility with legacy
+    /// events that may not include the encoding tag (which defaults to hex per MIP-02).
+    /// Modern implementations should include exactly 4 tags (relays, e, client, encoding).
     fn validate_welcome_event(event: &UnsignedEvent) -> Result<(), Error> {
         // 1. Validate kind is 444 (MlsWelcome)
         if event.kind != Kind::MlsWelcome {
@@ -76,6 +83,7 @@ where
         }
 
         // 2. Validate minimum number of tags (at least 3: relays, e, client)
+        // Note: 4th tag (encoding) is optional for backward compatibility
         let tags: Vec<&Tag> = event.tags.iter().collect();
         if tags.len() < 3 {
             return Err(Error::InvalidWelcomeMessage);
