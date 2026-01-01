@@ -28,7 +28,7 @@ where
     /// # Returns
     ///
     /// A tuple containing:
-    /// * An encoded string (hex or base64) containing the serialized key package
+    /// * A base64-encoded string containing the serialized key package
     /// * A fixed array of 7 tags for the Nostr event, in order:
     ///   - `mls_protocol_version` - MLS protocol version (e.g., "1.0")
     ///   - `mls_ciphersuite` - Ciphersuite identifier (e.g., "0x0001")
@@ -36,7 +36,7 @@ where
     ///   - `relays` - Relay URLs for distribution
     ///   - `protected` - Marks the event as protected
     ///   - `client` - Client identifier and version
-    ///   - `encoding` - The encoding format tag ("hex" or "base64")
+    ///   - `encoding` - The encoding format tag ("base64")
     ///
     /// # Errors
     ///
@@ -96,15 +96,12 @@ where
         Ok((encoded_content, tags))
     }
 
-    /// Parses and validates a key package using the specified encoding format.
-    ///
-    /// This function supports both base64 and hex encodings. The format is determined
-    /// by the `["encoding", "..."]` tag on the event.
+    /// Parses and validates a key package using base64 encoding.
     ///
     /// # Arguments
     ///
-    /// * `key_package_str` - An encoded string containing the serialized key package
-    /// * `encoding` - The encoding format (from the event's encoding tag)
+    /// * `key_package_str` - A base64-encoded string containing the serialized key package
+    /// * `encoding` - The encoding format (must be Base64)
     ///
     /// # Returns
     ///
@@ -960,13 +957,6 @@ mod tests {
     fn test_invalid_key_package_parsing() {
         let mdk = create_test_mdk();
 
-        // Try to parse invalid hex encoding
-        let result = mdk.parse_serialized_key_package("invalid!@#$%", ContentEncoding::Hex);
-        assert!(
-            matches!(result, Err(Error::KeyPackage(_))),
-            "Should return KeyPackage error for invalid hex encoding"
-        );
-
         // Try to parse invalid base64 encoding
         let result = mdk.parse_serialized_key_package("invalid!@#$%", ContentEncoding::Base64);
         assert!(
@@ -974,8 +964,8 @@ mod tests {
             "Should return KeyPackage error for invalid base64 encoding"
         );
 
-        // Try to parse valid hex but invalid key package
-        let result = mdk.parse_serialized_key_package("deadbeef", ContentEncoding::Hex);
+        // Try to parse valid base64 but invalid key package
+        let result = mdk.parse_serialized_key_package("YWJjZGVm", ContentEncoding::Base64);
         assert!(matches!(result, Err(Error::Tls(..))));
     }
 
@@ -2127,10 +2117,9 @@ mod tests {
         assert_eq!(parsed.ciphersuite(), DEFAULT_CIPHERSUITE);
     }
 
-    /// Test that key packages are always created with base64, but parsing supports both formats
-    /// (for backward compatibility with existing hex-encoded events)
+    /// Test that key packages are always created with base64
     #[test]
-    fn test_key_package_parsing_supports_both_formats() {
+    fn test_key_package_parsing_base64() {
         let mdk = create_test_mdk();
         let test_pubkey =
             PublicKey::from_hex("884704bd421671e01c13f854d2ce23ce2a5bfe9562f4f297ad2bc921ba30c3a6")
@@ -2151,55 +2140,6 @@ mod tests {
                 .is_ok(),
             "Should parse base64 key package"
         );
-
-        // For backward compatibility, parsing should still support hex if explicitly tagged
-        let hex_key_package = hex::encode(BASE64.decode(&base64_key_package).unwrap());
-        assert!(
-            mdk.parse_serialized_key_package(&hex_key_package, ContentEncoding::Hex)
-                .is_ok(),
-            "Should still parse hex key package for backward compatibility"
-        );
-    }
-
-    /// Test that parse_key_package correctly handles hex-encoded events with explicit encoding tag
-    #[test]
-    fn test_parse_key_package_with_hex_encoding_tag() {
-        let mdk = create_test_mdk();
-        let keys = nostr::Keys::generate();
-        let relays = vec![RelayUrl::parse("wss://relay.example.com").unwrap()];
-
-        // Create a base64 key package
-        let (base64_key_package, tags) = mdk
-            .create_key_package_for_event(&keys.public_key(), relays)
-            .expect("Failed to create key package");
-
-        // Convert to hex for the test
-        let hex_key_package = hex::encode(BASE64.decode(&base64_key_package).unwrap());
-
-        // Replace the encoding tag to indicate hex encoding
-        let hex_tags: Vec<Tag> = tags
-            .iter()
-            .map(|tag| {
-                if tag.as_slice().first() == Some(&"encoding".to_string()) {
-                    Tag::custom(TagKind::Custom("encoding".into()), ["hex"])
-                } else {
-                    tag.clone()
-                }
-            })
-            .collect();
-
-        // Create an event with hex content and hex encoding tag
-        let event = EventBuilder::new(Kind::MlsKeyPackage, hex_key_package)
-            .tags(hex_tags)
-            .sign_with_keys(&keys)
-            .expect("Failed to sign event");
-
-        // Parse should succeed with hex encoding tag
-        let parsed_key_package = mdk
-            .parse_key_package(&event)
-            .expect("Should parse hex-encoded key package with encoding tag");
-
-        assert_eq!(parsed_key_package.ciphersuite(), DEFAULT_CIPHERSUITE);
     }
 
     /// Security test: Identity binding prevents impersonation attacks

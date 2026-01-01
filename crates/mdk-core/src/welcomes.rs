@@ -959,8 +959,8 @@ mod tests {
             // Check the size of the first welcome message
             let welcome = &group_result.welcome_rumors[0];
             let welcome_content_bytes = welcome.content.as_bytes();
-            let hex_size = welcome_content_bytes.len();
-            let binary_size = hex_size / 2; // Hex encoding doubles the size
+            let encoded_size = welcome_content_bytes.len();
+            let binary_size = (encoded_size * 3) / 4; // Base64 encoding is ~33% larger
             let size_kb = binary_size as f64 / 1024.0;
 
             println!(
