@@ -1800,7 +1800,7 @@ mod tests {
             PublicKey::from_hex("884704bd421671e01c13f854d2ce23ce2a5bfe9562f4f297ad2bc921ba30c3a6")
                 .unwrap();
 
-        let (key_package_hex, _) = mdk
+        let (key_package_str, _) = mdk
             .create_key_package_for_event(&test_pubkey, vec![])
             .expect("Failed to create key package");
 
@@ -1818,7 +1818,7 @@ mod tests {
                 ),
             ];
 
-            let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex.clone())
+            let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_str.clone())
                 .tags(tags)
                 .sign_with_keys(&nostr::Keys::generate())
                 .unwrap();
