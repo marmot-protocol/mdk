@@ -53,8 +53,8 @@
 - Library split from rust-nostr into independent MDK (Marmot Development Kit) project
 - Wrapped `GroupId` type to avoid leaking OpenMLS types
 - Remove group type from groups
-- Remove `save_group_relay` method (https://github.com/rust-nostr/nostr/pull/1056)
-- `image_hash` instead of `image_url` (https://github.com/rust-nostr/nostr/pull/1059)
+- Remove `save_group_relay` method ([#1056](https://github.com/rust-nostr/nostr/pull/1056))
+- `image_hash` instead of `image_url` ([#1059](https://github.com/rust-nostr/nostr/pull/1059))
 
 ### Changed
 
@@ -62,8 +62,8 @@
 
 ### Added
 
-- Added `replace_group_relays` to make relay replace for groups an atomic operation (https://github.com/rust-nostr/nostr/pull/1056)
-- Comprehensive consistency testing framework for testing all mdk-storage-traits implementations for correctness and consistency (https://github.com/rust-nostr/nostr/pull/1056)
+- Added `replace_group_relays` to make relay replace for groups an atomic operation ([#1056](https://github.com/rust-nostr/nostr/pull/1056))
+- Comprehensive consistency testing framework for testing all mdk-storage-traits implementations for correctness and consistency ([#1056](https://github.com/rust-nostr/nostr/pull/1056))
 - Added Serde support for GroupId
 
 ## v0.43.0 - 2025/07/28
@@ -72,4 +72,4 @@ No notable changes in this release.
 
 ## v0.42.0 - 2025/05/20
 
-First release (https://github.com/rust-nostr/nostr/pull/836)
+First release ([#836](https://github.com/rust-nostr/nostr/pull/836))

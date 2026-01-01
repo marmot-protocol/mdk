@@ -158,6 +158,17 @@ We follow [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format:
 
 Always add entries under the `## Unreleased` section of the appropriate crate's changelog.
 
+### Markdown URL Format
+
+**CRITICAL**: Never use bare URLs in markdown files. All URLs must be properly formatted:
+
+- Use `[link text](url)` for inline links with descriptive text
+- Use `<url>` for standalone URLs (angle bracket autolinks)
+- For PR/issue references: `([#123](https://github.com/marmot-protocol/mdk/pull/123))`
+- For commit references: `([abc1234](https://github.com/.../commit/abc1234...))`
+
+This ensures compliance with markdownlint MD034 (no-bare-urls) and improves readability.
+
 ## Code Style
 
 All Rust code must follow the project's coding style (see `STYLE.md`):
@@ -204,20 +215,20 @@ use self::x::Y;
 
 ### Marmot Protocol
 
-- Specification: https://github.com/marmot-protocol/marmot
+- Specification: <https://github.com/marmot-protocol/marmot>
 - Local specs in `/marmot` workspace folder
 - Ensure all code follows the specification exactly
 - Ask clarifying questions if any part of the spec is unclear
 
 ### MLS Protocol
 
-- RFC 9420: https://www.rfc-editor.org/rfc/rfc9420.html (local: `docs/mls/rfc9420.txt`)
-- RFC 9750 (Architecture): https://www.rfc-editor.org/rfc/rfc9750.html (local: `docs/mls/rfc9750.txt`)
+- RFC 9420: <https://www.rfc-editor.org/rfc/rfc9420.html> (local: `docs/mls/rfc9420.txt`)
+- RFC 9750 (Architecture): <https://www.rfc-editor.org/rfc/rfc9750.html> (local: `docs/mls/rfc9750.txt`)
 - MLS Extensions: `docs/mls/draft-ietf-mls-extensions-08.txt`
 
 ### Nostr Protocol
 
-- NIPs repository: https://github.com/nostr-protocol/nips
+- NIPs repository: <https://github.com/nostr-protocol/nips>
 - Use the Nostrbook MCP server for structured NIP queries if available
 
 ## Security
