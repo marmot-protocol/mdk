@@ -3,7 +3,7 @@
 use mdk_storage_traits::MdkStorageProvider;
 use mdk_storage_traits::groups::types as group_types;
 use mdk_storage_traits::welcomes::types as welcome_types;
-use nostr::{EventId, Timestamp, UnsignedEvent};
+use nostr::{EventId, Kind, Tag, TagKind, Timestamp, UnsignedEvent};
 use openmls::prelude::*;
 use tls_codec::Deserialize as TlsDeserialize;
 
@@ -53,12 +53,86 @@ where
         Ok(welcomes)
     }
 
+    /// Validates that a welcome event conforms to MIP-02 structure
+    ///
+    /// # Arguments
+    ///
+    /// * `event` - The unsigned event to validate
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ok(())` if the event is valid, or an `Error` describing the validation failure
+    ///
+    /// # Validation Rules
+    ///
+    /// - Event kind must be 444 (MlsWelcome)
+    /// - Must have at least 3 required tags: relays, e (event reference), and client
+    /// - Tags must be in the correct order
+    /// - Tag values must be non-empty
+    fn validate_welcome_event(event: &UnsignedEvent) -> Result<(), Error> {
+        // 1. Validate kind is 444 (MlsWelcome)
+        if event.kind != Kind::MlsWelcome {
+            return Err(Error::InvalidWelcomeMessage);
+        }
+
+        // 2. Validate minimum number of tags (at least 3: relays, e, client)
+        let tags: Vec<&Tag> = event.tags.iter().collect();
+        if tags.len() < 3 {
+            return Err(Error::InvalidWelcomeMessage);
+        }
+
+        // 3. Validate first tag is relays
+        if tags[0].kind() != TagKind::Relays {
+            return Err(Error::InvalidWelcomeMessage);
+        }
+        // Check that relays tag has at least one relay URL (tag slice should have more than just the tag name)
+        if tags[0].as_slice().len() <= 1 {
+            return Err(Error::InvalidWelcomeMessage);
+        }
+
+        // 4. Validate second tag is e (event reference)
+        if tags[1].kind() != TagKind::e() {
+            return Err(Error::InvalidWelcomeMessage);
+        }
+        if tags[1].content().is_none() {
+            return Err(Error::InvalidWelcomeMessage);
+        }
+
+        // 5. Validate third tag is client
+        if tags[2].kind() != TagKind::Client {
+            return Err(Error::InvalidWelcomeMessage);
+        }
+        if tags[2].content().is_none() {
+            return Err(Error::InvalidWelcomeMessage);
+        }
+
+        // 6. If there's a 4th tag, validate it's a valid encoding tag
+        if tags.len() >= 4 {
+            let encoding_tag = tags[3];
+            if encoding_tag.kind() == TagKind::Custom("encoding".into()) {
+                if let Some(encoding_value) = encoding_tag.content() {
+                    // Validate encoding value is either "hex" or "base64"
+                    if encoding_value != "hex" && encoding_value != "base64" {
+                        return Err(Error::InvalidWelcomeMessage);
+                    }
+                } else {
+                    return Err(Error::InvalidWelcomeMessage);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Processes a welcome and stores it in the database
     pub fn process_welcome(
         &self,
         wrapper_event_id: &EventId,
         rumor_event: &UnsignedEvent,
     ) -> Result<welcome_types::Welcome, Error> {
+        // Validate welcome event structure per MIP-02
+        Self::validate_welcome_event(rumor_event)?;
+
         if self.is_welcome_processed(wrapper_event_id)? {
             let processed_welcome = self
                 .storage()
@@ -480,6 +554,91 @@ mod tests {
                 "Welcome rumor should have ID computed"
             );
         }
+    }
+
+    /// Test that invalid welcome events are rejected by validation
+    #[test]
+    fn test_welcome_validation_rejects_invalid_events() {
+        use nostr::RelayUrl;
+
+        let mdk = create_test_mdk();
+        let wrapper_event_id = EventId::all_zeros();
+
+        // Test 1: Wrong kind (should be 444)
+        let mut tags1 = nostr::Tags::new();
+        tags1.push(nostr::Tag::relays(vec![
+            RelayUrl::parse("wss://relay.example.com").unwrap(),
+        ]));
+        tags1.push(nostr::Tag::event(EventId::all_zeros()));
+        tags1.push(nostr::Tag::client("mdk".to_string()));
+
+        let wrong_kind_event = UnsignedEvent {
+            id: None,
+            pubkey: Keys::generate().public_key(),
+            created_at: Timestamp::now(),
+            kind: Kind::TextNote, // Wrong kind
+            tags: tags1,
+            content: "test".to_string(),
+        };
+        let result = mdk.process_welcome(&wrapper_event_id, &wrong_kind_event);
+        assert!(result.is_err(), "Should reject wrong kind");
+        assert!(matches!(result.unwrap_err(), Error::InvalidWelcomeMessage));
+
+        // Test 2: Missing required tags
+        let mut tags2 = nostr::Tags::new();
+        tags2.push(nostr::Tag::relays(vec![
+            RelayUrl::parse("wss://relay.example.com").unwrap(),
+        ]));
+
+        let missing_tags_event = UnsignedEvent {
+            id: None,
+            pubkey: Keys::generate().public_key(),
+            created_at: Timestamp::now(),
+            kind: Kind::MlsWelcome,
+            tags: tags2, // Only 1 tag
+            content: "test".to_string(),
+        };
+        let result = mdk.process_welcome(&wrapper_event_id, &missing_tags_event);
+        assert!(result.is_err(), "Should reject missing tags");
+        assert!(matches!(result.unwrap_err(), Error::InvalidWelcomeMessage));
+
+        // Test 3: Wrong tag order (e tag before relays)
+        let mut tags3 = nostr::Tags::new();
+        tags3.push(nostr::Tag::event(EventId::all_zeros())); // Wrong: e tag first
+        tags3.push(nostr::Tag::relays(vec![
+            RelayUrl::parse("wss://relay.example.com").unwrap(),
+        ]));
+        tags3.push(nostr::Tag::client("mdk".to_string()));
+
+        let wrong_order_event = UnsignedEvent {
+            id: None,
+            pubkey: Keys::generate().public_key(),
+            created_at: Timestamp::now(),
+            kind: Kind::MlsWelcome,
+            tags: tags3,
+            content: "test".to_string(),
+        };
+        let result = mdk.process_welcome(&wrapper_event_id, &wrong_order_event);
+        assert!(result.is_err(), "Should reject wrong tag order");
+        assert!(matches!(result.unwrap_err(), Error::InvalidWelcomeMessage));
+
+        // Test 4: Empty relays tag
+        let mut tags4 = nostr::Tags::new();
+        tags4.push(nostr::Tag::relays(vec![])); // Empty relays
+        tags4.push(nostr::Tag::event(EventId::all_zeros()));
+        tags4.push(nostr::Tag::client("mdk".to_string()));
+
+        let empty_relays_event = UnsignedEvent {
+            id: None,
+            pubkey: Keys::generate().public_key(),
+            created_at: Timestamp::now(),
+            kind: Kind::MlsWelcome,
+            tags: tags4,
+            content: "test".to_string(),
+        };
+        let result = mdk.process_welcome(&wrapper_event_id, &empty_relays_event);
+        assert!(result.is_err(), "Should reject empty relays tag");
+        assert!(matches!(result.unwrap_err(), Error::InvalidWelcomeMessage));
     }
 
     /// Test that Welcome content is valid MLS Welcome structure
