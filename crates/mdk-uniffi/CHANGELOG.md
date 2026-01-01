@@ -39,4 +39,4 @@
 
 ## [0.5.3] - 2025-12-09
 
-First bindings release (https://github.com/marmot-protocol/mdk/commit/8d05c9b499564277bdd1d1fe27fcc702eadf4d54)
+First bindings release ([commit](https://github.com/marmot-protocol/mdk/commit/8d05c9b499564277bdd1d1fe27fcc702eadf4d54))
