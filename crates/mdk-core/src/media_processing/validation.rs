@@ -100,7 +100,7 @@ pub(crate) fn validate_mime_type(mime_type: &str) -> Result<String, MediaProcess
     // Enforce allowlist
     if !SUPPORTED_MIME_TYPES.contains(&canonical) {
         return Err(MediaProcessingError::InvalidMimeType {
-            mime_type: format!("Unsupported MIME type: {}", canonical),
+            mime_type: canonical.to_string(),
         });
     }
 

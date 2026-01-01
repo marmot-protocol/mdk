@@ -352,10 +352,12 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::media_processing::types::MediaProcessingError;
+    use std::io::Cursor;
+
     use image::{ImageBuffer, Rgb};
     use mdk_memory_storage::MdkMemoryStorage;
-    use std::io::Cursor;
+
+    use crate::media_processing::types::MediaProcessingError;
 
     fn create_test_mdk() -> MDK<MdkMemoryStorage> {
         MDK::new(MdkMemoryStorage::default())
