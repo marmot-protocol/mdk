@@ -192,7 +192,7 @@ fn encrypt_group_image(image_data: &[u8]) -> Result<GroupImageEncrypted, GroupIm
 ///
 /// **SECURITY**: Verifies that the encrypted blob hash matches the expected hash before
 /// decryption to prevent storage-level blob substitution attacks. If `expected_hash` is `None`,
-/// hash verification is skipped (for backward compatibility with old extensions), but this is depracated and MUST be avoided at all costs.
+/// hash verification is skipped (for backward compatibility with old extensions), but this is deprecated and MUST be avoided at all costs.
 ///
 /// Supports both v1 (image_key is the encryption key directly) and v2 (image_key is a seed
 /// that needs to be derived using HKDF) formats for backward compatibility.
