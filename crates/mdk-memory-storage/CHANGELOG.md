@@ -31,11 +31,11 @@
 
 ### Added
 
-- Implemented `pending_welcomes_paginated(limit, offset)` for paginated retrieval of pending welcomes
+- Implemented `pending_welcomes_paginated(limit, offset)` for paginated retrieval of pending welcomes ([#110](https://github.com/marmot-protocol/mdk/pull/110))
 
 ### Fixed
 
-- **Security (Audit Issue AA)**: Added pagination to prevent memory exhaustion from unbounded loading of pending welcomes
+- **Security (Audit Issue AA)**: Added pagination to prevent memory exhaustion from unbounded loading of pending welcomes ([#110](https://github.com/marmot-protocol/mdk/pull/110))
 
 ### Removed
 

@@ -18,6 +18,9 @@ use self::types::*;
 /// Default limit for pending welcomes queries to prevent unbounded memory usage
 pub const DEFAULT_PENDING_WELCOMES_LIMIT: usize = 1000;
 
+/// Maximum allowed limit for pending welcomes queries to prevent resource exhaustion
+pub const MAX_PENDING_WELCOMES_LIMIT: usize = 10000;
+
 /// Storage traits for the welcomes module
 pub trait WelcomeStorage {
     /// Save a welcome
@@ -39,12 +42,24 @@ pub trait WelcomeStorage {
     ///
     /// # Arguments
     ///
-    /// * `limit` - Maximum number of welcomes to return
+    /// * `limit` - Maximum number of welcomes to return. Must be between 1 and [`MAX_PENDING_WELCOMES_LIMIT`].
+    ///   Values exceeding the maximum will return an error.
     /// * `offset` - Number of welcomes to skip
     ///
     /// # Returns
     ///
     /// Returns a vector of pending welcomes ordered by ID (descending)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WelcomeError::InvalidParameters`] if:
+    /// - `limit` is 0
+    /// - `limit` exceeds [`MAX_PENDING_WELCOMES_LIMIT`]
+    ///
+    /// # Recommended Usage
+    ///
+    /// For most use cases, use the default limit via [`pending_welcomes`](Self::pending_welcomes).
+    /// Only use custom limits when you have specific pagination requirements.
     fn pending_welcomes_paginated(
         &self,
         limit: usize,

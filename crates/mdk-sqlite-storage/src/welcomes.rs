@@ -119,6 +119,15 @@ impl WelcomeStorage for MdkSqliteStorage {
         limit: usize,
         offset: usize,
     ) -> Result<Vec<Welcome>, WelcomeError> {
+        // Validate limit is within allowed range
+        if !(1..=mdk_storage_traits::welcomes::MAX_PENDING_WELCOMES_LIMIT).contains(&limit) {
+            return Err(WelcomeError::InvalidParameters(format!(
+                "Limit must be between 1 and {}, got {}",
+                mdk_storage_traits::welcomes::MAX_PENDING_WELCOMES_LIMIT,
+                limit
+            )));
+        }
+
         let conn_guard = self.db_connection.lock().map_err(into_welcome_err)?;
 
         let mut stmt = conn_guard
@@ -369,5 +378,25 @@ mod tests {
         let first_id = first_10[0].id;
         let second_page_ids: Vec<EventId> = next_10.iter().map(|w| w.id).collect();
         assert!(!second_page_ids.contains(&first_id));
+
+        // Test: Limit of 0 should return error
+        let result = storage.pending_welcomes_paginated(0, 0);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("must be between 1 and")
+        );
+
+        // Test: Limit exceeding MAX should return error
+        let result = storage.pending_welcomes_paginated(20000, 0);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("must be between 1 and")
+        );
     }
 }
