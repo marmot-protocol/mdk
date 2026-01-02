@@ -33,6 +33,8 @@
 
 ### Fixed
 
+- Propagate `last_message_id` parse errors in `row_to_group` instead of silently converting to `None` ([#88](https://github.com/marmot-protocol/mdk/issues/88))
+
 ### Removed
 
 ### Deprecated
