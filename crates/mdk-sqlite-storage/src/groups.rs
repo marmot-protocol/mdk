@@ -13,10 +13,6 @@ use rusqlite::{OptionalExtension, params};
 use crate::db::{Hash32, Nonce12};
 use crate::{MdkSqliteStorage, db};
 
-/// Default maximum number of messages to retrieve when using unpaginated messages()
-/// This prevents memory exhaustion from loading millions of messages at once
-const DEFAULT_MESSAGE_LIMIT: usize = 1000;
-
 #[inline]
 fn into_group_err<T>(e: T) -> GroupError
 where
@@ -130,7 +126,11 @@ impl GroupStorage for MdkSqliteStorage {
 
     fn messages(&self, mls_group_id: &GroupId) -> Result<Vec<Message>, GroupError> {
         // Use paginated version with default limit for backward compatibility
-        self.messages_paginated(mls_group_id, DEFAULT_MESSAGE_LIMIT, 0)
+        self.messages_paginated(
+            mls_group_id,
+            mdk_storage_traits::groups::DEFAULT_MESSAGE_LIMIT,
+            0,
+        )
     }
 
     fn messages_paginated(
@@ -139,6 +139,15 @@ impl GroupStorage for MdkSqliteStorage {
         limit: usize,
         offset: usize,
     ) -> Result<Vec<Message>, GroupError> {
+        // Validate limit is within allowed range
+        if !(1..=mdk_storage_traits::groups::MAX_MESSAGE_LIMIT).contains(&limit) {
+            return Err(GroupError::InvalidParameters(format!(
+                "Limit must be between 1 and {}, got {}",
+                mdk_storage_traits::groups::MAX_MESSAGE_LIMIT,
+                limit
+            )));
+        }
+
         // First verify the group exists
         if self.find_group_by_mls_group_id(mls_group_id)?.is_none() {
             return Err(GroupError::InvalidParameters(format!(
@@ -438,6 +447,44 @@ mod tests {
         // Test default messages() uses limit
         let default_messages = storage.messages(&mls_group_id).unwrap();
         assert_eq!(default_messages.len(), 25); // All messages since < 1000
+
+        // Test: Verify no overlap between pages
+        let first_id = page1[0].id;
+        let second_page_ids: Vec<EventId> = page2.iter().map(|m| m.id).collect();
+        assert!(
+            !second_page_ids.contains(&first_id),
+            "Pages should not overlap"
+        );
+
+        // Test: Offset beyond available messages returns empty
+        let beyond = storage.messages_paginated(&mls_group_id, 10, 30).unwrap();
+        assert_eq!(beyond.len(), 0);
+
+        // Test: Limit of 0 should return error
+        let result = storage.messages_paginated(&mls_group_id, 0, 0);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("must be between 1 and")
+        );
+
+        // Test: Limit exceeding MAX should return error
+        let result = storage.messages_paginated(&mls_group_id, 20000, 0);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("must be between 1 and")
+        );
+
+        // Test: Non-existent group returns error
+        let fake_group_id = GroupId::from_slice(&[99, 99, 99, 99]);
+        let result = storage.messages_paginated(&fake_group_id, 10, 0);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("not found"));
     }
 
     #[test]

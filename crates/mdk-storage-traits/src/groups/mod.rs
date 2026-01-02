@@ -19,6 +19,12 @@ use self::error::GroupError;
 use self::types::*;
 use crate::messages::types::Message;
 
+/// Default limit for messages queries to prevent unbounded memory usage
+pub const DEFAULT_MESSAGE_LIMIT: usize = 1000;
+
+/// Maximum allowed limit for messages queries to prevent resource exhaustion
+pub const MAX_MESSAGE_LIMIT: usize = 10000;
+
 /// Storage traits for the groups module
 pub trait GroupStorage {
     /// Get all groups
@@ -49,8 +55,25 @@ pub trait GroupStorage {
     ///
     /// # Arguments
     /// * `group_id` - The group ID to fetch messages for
-    /// * `limit` - Maximum number of messages to return (enforced server-side)
+    /// * `limit` - Maximum number of messages to return. Must be between 1 and [`MAX_MESSAGE_LIMIT`].
+    ///   Values exceeding the maximum will return an error.
     /// * `offset` - Number of messages to skip (for pagination)
+    ///
+    /// # Returns
+    ///
+    /// Returns a vector of messages ordered by created_at (descending)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GroupError::InvalidParameters`] if:
+    /// - `limit` is 0
+    /// - `limit` exceeds [`MAX_MESSAGE_LIMIT`]
+    /// - Group with the specified ID does not exist
+    ///
+    /// # Recommended Usage
+    ///
+    /// For most use cases, use the default limit via [`messages`](Self::messages).
+    /// Only use custom limits when you have specific pagination requirements.
     ///
     /// # Example
     /// ```ignore
