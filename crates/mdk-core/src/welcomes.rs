@@ -1000,7 +1000,7 @@ mod tests {
         // - Welcome messages can be created for small-medium groups (5-20 members)
         // - Welcome sizes are measured and reported correctly
         // - Welcome messages are valid base64-encoded MLS messages
-        // - Welcome structure matches MIP-02 requirements (kind 444, 2 tags)
+        // - Welcome structure matches MIP-02 requirements (kind 444, 4 tags)
         // - Size validation logic is in place
 
         // Note: (warning for groups approaching 150 members) would be

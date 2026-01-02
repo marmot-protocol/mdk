@@ -40,11 +40,11 @@
 
 ### Fixed
 
-#61 - Issue R: Refactor encoding handling to enforce base64 usage for key packages and welcome
+#61 - Issue R: Refactor encoding handling to enforce base64 usage for key packages and welcome ([#98](https://github.com/marmot-protocol/mdk/pull/98))
 
 ### Removed
 
-- Removed all traces of hex encoding support for content fields in key packages and welcome events
+- Removed all traces of hex encoding support for content fields in key packages and welcome events ([#98](https://github.com/marmot-protocol/mdk/pull/98))
 
 ### Deprecated
 
