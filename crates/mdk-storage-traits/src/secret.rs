@@ -164,6 +164,24 @@ mod tests {
     }
 
     #[test]
+    fn test_secret_zeroizes_on_drop() {
+        let ptr: *const u8;
+        let len = 32;
+
+        {
+            let secret = Secret::new([0xFFu8; 32]);
+            ptr = secret.as_ref().as_ptr(); // get raw pointer before drop
+        } // secret drops here
+
+        // This is technically UB, but it's a test and the stack
+        // memory is still there—we're just reading it "illegally"
+        unsafe {
+            let slice = std::slice::from_raw_parts(ptr, len);
+            assert!(slice.iter().all(|&b| b == 0), "Memory was not zeroized!");
+        }
+    }
+
+    #[test]
     fn test_secret_creation_and_access() {
         let secret = Secret::new([42u8; 32]);
         assert_eq!(secret.as_ref()[0], 42);
