@@ -6,7 +6,7 @@ use mdk_storage_traits::GroupId;
 use mdk_storage_traits::groups::GroupStorage;
 use mdk_storage_traits::groups::error::GroupError;
 use mdk_storage_traits::groups::types::GroupExporterSecret;
-use nostr::RelayUrl;
+use nostr::{PublicKey, RelayUrl};
 
 use super::create_test_group;
 
@@ -347,8 +347,6 @@ pub fn test_admins<S>(storage: S)
 where
     S: GroupStorage,
 {
-    use nostr::PublicKey;
-
     let mls_group_id = GroupId::from_slice(&[1, 2, 3, 16]);
     let mut group = create_test_group(mls_group_id.clone());
 
