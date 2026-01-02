@@ -29,8 +29,6 @@
 
 ### Changed
 
-- **Encrypted Media Security**: Updated encrypted media operations to use `Secret<T>` wrapper for keys and nonces, ensuring automatic memory zeroization ([#109](https://github.com/marmot-protocol/mdk/pull/109))
-
 ### Added
 
 - New error variant `AuthorMismatch` for message author verification failures ([#40](https://github.com/marmot-protocol/mdk/pull/40))

@@ -7,7 +7,10 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Secret<T: Zeroize>(T);
 
-impl<T: Zeroize> Secret<T> {
+impl<T> Secret<T>
+where
+    T: Zeroize,
+{
     /// Create a new secret wrapper
     pub fn new(value: T) -> Self {
         Self(value)
@@ -26,38 +29,56 @@ impl<T: Zeroize> Secret<T> {
     }
 }
 
-impl<T: Zeroize> AsMut<T> for Secret<T> {
+impl<T> AsMut<T> for Secret<T>
+where
+    T: Zeroize,
+{
     fn as_mut(&mut self) -> &mut T {
         &mut self.0
     }
 }
 
-impl<T: Zeroize> AsRef<T> for Secret<T> {
+impl<T> AsRef<T> for Secret<T>
+where
+    T: Zeroize,
+{
     fn as_ref(&self) -> &T {
         &self.0
     }
 }
 
-impl<T: Zeroize> Drop for Secret<T> {
+impl<T> Drop for Secret<T>
+where
+    T: Zeroize,
+{
     fn drop(&mut self) {
         self.0.zeroize();
     }
 }
 
-impl<T: Zeroize> Deref for Secret<T> {
+impl<T> Deref for Secret<T>
+where
+    T: Zeroize,
+{
     type Target = T;
     fn deref(&self) -> &T {
         &self.0
     }
 }
 
-impl<T: Zeroize> DerefMut for Secret<T> {
+impl<T> DerefMut for Secret<T>
+where
+    T: Zeroize,
+{
     fn deref_mut(&mut self) -> &mut T {
         &mut self.0
     }
 }
 
-impl<T: Zeroize + fmt::Debug> fmt::Debug for Secret<T> {
+impl<T> fmt::Debug for Secret<T>
+where
+    T: Zeroize + fmt::Debug,
+{
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Don't leak secret in debug output
         write!(f, "Secret(***)")
@@ -65,7 +86,10 @@ impl<T: Zeroize + fmt::Debug> fmt::Debug for Secret<T> {
 }
 
 // Serialization support
-impl<T: Zeroize + Serialize> Serialize for Secret<T> {
+impl<T> Serialize for Secret<T>
+where
+    T: Zeroize + Serialize,
+{
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
@@ -74,7 +98,10 @@ impl<T: Zeroize + Serialize> Serialize for Secret<T> {
     }
 }
 
-impl<'de, T: Zeroize + Deserialize<'de>> Deserialize<'de> for Secret<T> {
+impl<'de, T> Deserialize<'de> for Secret<T>
+where
+    T: Zeroize + Deserialize<'de>,
+{
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
