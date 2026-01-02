@@ -29,6 +29,15 @@ impl WelcomeStorage for MdkMemoryStorage {
             )));
         }
 
+        // Validate offset is reasonable
+        if offset > mdk_storage_traits::welcomes::MAX_PENDING_WELCOMES_OFFSET {
+            return Err(WelcomeError::InvalidParameters(format!(
+                "Offset {} exceeds maximum allowed offset of {}",
+                offset,
+                mdk_storage_traits::welcomes::MAX_PENDING_WELCOMES_OFFSET
+            )));
+        }
+
         let cache = self.welcomes_cache.read();
         let mut welcomes: Vec<Welcome> = cache
             .iter()
@@ -149,7 +158,17 @@ mod tests {
                 .contains("must be between 1 and")
         );
 
-        // Test 10: Empty results when no pending entries
+        // Test 10: Offset exceeding MAX should return error
+        let result = storage.pending_welcomes_paginated(10, 2_000_000);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("exceeds maximum allowed offset")
+        );
+
+        // Test 11: Empty results when no pending entries
         let storage2 = MdkMemoryStorage::new(MemoryStorage::default());
         let empty = storage2.pending_welcomes_paginated(10, 0).unwrap();
         assert_eq!(empty.len(), 0);

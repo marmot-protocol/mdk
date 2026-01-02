@@ -21,6 +21,9 @@ pub const DEFAULT_PENDING_WELCOMES_LIMIT: usize = 1000;
 /// Maximum allowed limit for pending welcomes queries to prevent resource exhaustion
 pub const MAX_PENDING_WELCOMES_LIMIT: usize = 10000;
 
+/// Maximum allowed offset for pending welcomes queries to prevent unreasonable values
+pub const MAX_PENDING_WELCOMES_OFFSET: usize = 1_000_000;
+
 /// Storage traits for the welcomes module
 pub trait WelcomeStorage {
     /// Save a welcome
@@ -55,6 +58,7 @@ pub trait WelcomeStorage {
     /// Returns [`WelcomeError::InvalidParameters`] if:
     /// - `limit` is 0
     /// - `limit` exceeds [`MAX_PENDING_WELCOMES_LIMIT`]
+    /// - `offset` exceeds [`MAX_PENDING_WELCOMES_OFFSET`]
     ///
     /// # Recommended Usage
     ///

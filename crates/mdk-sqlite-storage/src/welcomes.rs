@@ -128,6 +128,15 @@ impl WelcomeStorage for MdkSqliteStorage {
             )));
         }
 
+        // Validate offset is reasonable
+        if offset > mdk_storage_traits::welcomes::MAX_PENDING_WELCOMES_OFFSET {
+            return Err(WelcomeError::InvalidParameters(format!(
+                "Offset {} exceeds maximum allowed offset of {}",
+                offset,
+                mdk_storage_traits::welcomes::MAX_PENDING_WELCOMES_OFFSET
+            )));
+        }
+
         let conn_guard = self.db_connection.lock().map_err(into_welcome_err)?;
 
         let mut stmt = conn_guard
@@ -397,6 +406,16 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("must be between 1 and")
+        );
+
+        // Test: Offset exceeding MAX should return error
+        let result = storage.pending_welcomes_paginated(10, 2_000_000);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("exceeds maximum allowed offset")
         );
     }
 }
