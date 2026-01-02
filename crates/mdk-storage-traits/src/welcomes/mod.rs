@@ -15,6 +15,9 @@ pub mod types;
 use self::error::WelcomeError;
 use self::types::*;
 
+/// Default limit for pending welcomes queries to prevent unbounded memory usage
+pub const DEFAULT_PENDING_WELCOMES_LIMIT: usize = 1000;
+
 /// Storage traits for the welcomes module
 pub trait WelcomeStorage {
     /// Save a welcome
@@ -25,7 +28,28 @@ pub trait WelcomeStorage {
     -> Result<Option<Welcome>, WelcomeError>;
 
     /// Get all pending welcomes
-    fn pending_welcomes(&self) -> Result<Vec<Welcome>, WelcomeError>;
+    ///
+    /// This method uses a default limit to prevent unbounded memory usage.
+    /// For custom pagination, use [`pending_welcomes_paginated`](Self::pending_welcomes_paginated).
+    fn pending_welcomes(&self) -> Result<Vec<Welcome>, WelcomeError> {
+        self.pending_welcomes_paginated(DEFAULT_PENDING_WELCOMES_LIMIT, 0)
+    }
+
+    /// Get pending welcomes with pagination
+    ///
+    /// # Arguments
+    ///
+    /// * `limit` - Maximum number of welcomes to return
+    /// * `offset` - Number of welcomes to skip
+    ///
+    /// # Returns
+    ///
+    /// Returns a vector of pending welcomes ordered by ID (descending)
+    fn pending_welcomes_paginated(
+        &self,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<Welcome>, WelcomeError>;
 
     /// Save a processed welcome
     fn save_processed_welcome(

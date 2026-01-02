@@ -15,13 +15,23 @@ impl WelcomeStorage for MdkMemoryStorage {
         Ok(())
     }
 
-    fn pending_welcomes(&self) -> Result<Vec<Welcome>, WelcomeError> {
+    fn pending_welcomes_paginated(
+        &self,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<Welcome>, WelcomeError> {
         let cache = self.welcomes_cache.read();
-        let welcomes: Vec<Welcome> = cache
+        let mut welcomes: Vec<Welcome> = cache
             .iter()
             .map(|(_, v)| v.clone())
             .filter(|welcome| welcome.state == WelcomeState::Pending)
             .collect();
+
+        // Sort by ID (descending) for consistent ordering
+        welcomes.sort_by(|a, b| b.id.cmp(&a.id));
+
+        // Apply pagination
+        let welcomes: Vec<Welcome> = welcomes.into_iter().skip(offset).take(limit).collect();
 
         Ok(welcomes)
     }

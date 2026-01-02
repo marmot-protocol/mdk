@@ -31,7 +31,11 @@
 
 ### Added
 
+- Implemented `pending_welcomes_paginated(limit, offset)` for paginated retrieval of pending welcomes
+
 ### Fixed
+
+- **Security (Audit Issue AA)**: Added pagination to prevent memory exhaustion from unbounded loading of pending welcomes
 
 ### Removed
 

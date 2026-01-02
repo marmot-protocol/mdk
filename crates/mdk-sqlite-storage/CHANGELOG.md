@@ -37,10 +37,12 @@
   - Group descriptions limited to 2000 bytes
   - JSON fields limited to 50-100KB
   - New `Validation` error variant for validation failures
+- Implemented `pending_welcomes_paginated(limit, offset)` for paginated retrieval of pending welcomes
 
 ### Fixed
 
 - **Security (Audit Issue AB)**: Added size limits to prevent disk and CPU exhaustion from unbounded user input ([#94](https://github.com/marmot-protocol/mdk/pull/94))
+- **Security (Audit Issue AA)**: Added pagination to prevent memory exhaustion from unbounded loading of pending welcomes
 
 ### Removed
 
