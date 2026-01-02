@@ -33,6 +33,8 @@
 
 ### Fixed
 
+- Fix `admins()` to return `InvalidParameters` error when group not found, instead of incorrectly returning `NoAdmins` ([#104](https://github.com/marmot-protocol/mdk/pull/104))
+
 ### Removed
 
 ### Deprecated
