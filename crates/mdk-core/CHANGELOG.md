@@ -27,15 +27,12 @@
 
 ### Breaking changes
 
-- **Removed Hex Encoding Support**: Hex encoding for key packages and welcome messages has been completely removed
-  - `ContentEncoding` enum now only supports `Base64` variant (removed `Hex` variant)
-  - `create_key_package_for_event()` always uses base64 encoding with an explicit `["encoding", "base64"]` tag
-  - `build_welcome_rumors_for_key_packages()` always uses base64 encoding
-  - `parse_key_package()` and `parse_serialized_key_package()` now only accept base64-encoded content
-  - `ContentEncoding::from_tags()` and `from_tag_value()` now reject "hex" encoding tags
-  - This change prevents downgrade attacks and parsing ambiguity across clients
-  - All key packages and welcomes must use base64 encoding per MIP-00/MIP-02
-  - Legacy hex-encoded events will no longer be parseable
+- **Content Encoding**: Removed support for hex encoding in key package and welcome event content
+  - Key packages and welcome events now require explicit `["encoding", "base64"]` tag
+  - Events without encoding tags or with hex encoding are rejected
+  - This change addresses security concerns about encoding ambiguity and downgrade attacks
+  - Older key packages published without encoding tags are no longer supported
+  - Clients should republish key packages with proper encoding tags when upgrading
 
 ### Changed
 
@@ -47,10 +44,7 @@
 
 ### Removed
 
-- Hex encoding support for key package and welcome message content
-  - Removed `ContentEncoding::Hex` variant
-  - Removed hex encoding/decoding logic from `encode_content()` and `decode_content()`
-  - Removed hex-related tests and backward compatibility code
+- Removed all traces of hex encoding support for content fields in key packages and welcome events
 
 ### Deprecated
 

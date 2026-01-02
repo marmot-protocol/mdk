@@ -396,7 +396,7 @@ mod tests {
     /// Test that Welcome event structure matches Marmot spec (MIP-02)
     /// Spec requires:
     /// - Kind: 444 (MlsWelcome)
-    /// - Content: hex or base64 encoded serialized MLSMessage
+    /// - Content: base64 encoded serialized MLSMessage
     /// - Tags: exactly 4 tags (relays + event reference + client + encoding)
     /// - Must be unsigned (UnsignedEvent for NIP-59 gift wrapping)
     #[test]
@@ -435,15 +435,11 @@ mod tests {
             // 2. Verify content is base64-encoded (always base64 per MIP-00/MIP-02)
             use nostr::base64::Engine;
             use nostr::base64::engine::general_purpose::STANDARD as BASE64;
-            assert!(
-                BASE64.decode(&welcome_rumor.content).is_ok(),
-                "Welcome content must be valid base64-encoded data"
-            );
-
-            // Verify decoded content is substantial (MLS Welcome messages are typically > 50 bytes)
             let decoded_content = BASE64
                 .decode(&welcome_rumor.content)
-                .expect("Failed to decode welcome content");
+                .expect("Welcome content must be valid base64-encoded data");
+
+            // Verify decoded content is substantial (MLS Welcome messages are typically > 50 bytes)
             assert!(
                 decoded_content.len() > 50,
                 "Welcome content should be substantial (typically > 50 bytes), got {} bytes",
@@ -1003,7 +999,7 @@ mod tests {
         // The test confirms that:
         // - Welcome messages can be created for small-medium groups (5-20 members)
         // - Welcome sizes are measured and reported correctly
-        // - Welcome messages are valid hex-encoded MLS messages
+        // - Welcome messages are valid base64-encoded MLS messages
         // - Welcome structure matches MIP-02 requirements (kind 444, 2 tags)
         // - Size validation logic is in place
 
@@ -1024,15 +1020,15 @@ mod tests {
             created_at: nostr::Timestamp::now(),
             kind: Kind::MlsWelcome,
             tags: nostr::Tags::new(),
-            content: "invalid_hex_content".to_string(), // Invalid hex
+            content: "invalid_base64_content!!!".to_string(), // Invalid base64
         };
 
         let result = mdk.process_welcome(&nostr::EventId::all_zeros(), &invalid_welcome);
 
-        // Should fail due to invalid hex content
+        // Should fail due to invalid base64 content
         assert!(
             result.is_err(),
-            "Should fail when welcome content is invalid hex"
+            "Should fail when welcome content is invalid base64"
         );
     }
 
