@@ -77,6 +77,16 @@ just coverage
 just coverage-html
 ```
 
+**CRITICAL**: CI enforces that test coverage must not decrease. If your PR reduces coverage (even by 0.01%), the coverage check will fail.
+
+To maintain or improve coverage:
+
+1. Add tests for any new code paths you introduce
+2. Add tests for error handling branches
+3. If your change touches existing code without adding tests, consider adding tests for related untested code paths to offset any coverage loss
+
+The coverage workflow compares the PR's coverage against the `master` branch baseline. Coverage must stay the same or improve for the PR to pass CI.
+
 ## Code Quality Checks
 
 ### Quick Checks (Stable Rust)
@@ -245,9 +255,10 @@ Before submitting a PR:
 1. ✅ Run `just precommit` - all checks must pass
 2. ✅ Update CHANGELOG(s) for affected crate(s)
 3. ✅ Add tests for new functionality
-4. ✅ Ensure code follows STYLE.md conventions
-5. ✅ Update documentation if adding public APIs
-6. ✅ Verify compatibility with MSRV (1.90.0)
+4. ✅ Ensure test coverage does not decrease (CI will fail if coverage drops)
+5. ✅ Ensure code follows STYLE.md conventions
+6. ✅ Update documentation if adding public APIs
+7. ✅ Verify compatibility with MSRV (1.90.0)
 
 ## Examples
 
