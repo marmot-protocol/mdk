@@ -31,7 +31,16 @@
 
 ### Added
 
+- Input validation for storage operations to prevent unbounded writes ([#94](https://github.com/marmot-protocol/mdk/pull/94))
+  - Message content limited to 1MB
+  - Group names limited to 255 bytes
+  - Group descriptions limited to 2000 bytes
+  - JSON fields limited to 50-100KB
+  - New `Validation` error variant for validation failures
+
 ### Fixed
+
+- **Security (Audit Issue AB)**: Added size limits to prevent disk and CPU exhaustion from unbounded user input ([#94](https://github.com/marmot-protocol/mdk/pull/94))
 
 ### Removed
 
