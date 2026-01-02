@@ -29,9 +29,13 @@
 
 ### Changed
 
+- **Storage Security**: Updated to use `Secret<T>` wrapper for secret values from storage traits, ensuring automatic memory zeroization ([#109](https://github.com/marmot-protocol/mdk/pull/109))
+
 ### Added
 
 ### Fixed
+
+- **Security**: Secret values stored in memory are now wrapped in `Secret<T>` type, ensuring automatic memory zeroization and preventing sensitive cryptographic material from persisting in memory ([#109](https://github.com/marmot-protocol/mdk/pull/109))
 
 ### Removed
 

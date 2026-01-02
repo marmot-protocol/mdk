@@ -173,8 +173,10 @@ mod tests {
             ptr = secret.as_ref().as_ptr(); // get raw pointer before drop
         } // secret drops here
 
-        // This is technically UB, but it's a test and the stack
-        // memory is still there—we're just reading it "illegally"
+        // This is intentional UB for testing purposes only. After team discussion,
+        // this direct memory inspection was determined to be the most reliable way
+        // to verify zeroization behavior. The stack memory remains accessible in
+        // practice, even though reading it is technically undefined behavior.
         unsafe {
             let slice = std::slice::from_raw_parts(ptr, len);
             assert!(slice.iter().all(|&b| b == 0), "Memory was not zeroized!");
