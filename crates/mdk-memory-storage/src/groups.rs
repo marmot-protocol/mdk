@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 
 use mdk_storage_traits::GroupId;
 use mdk_storage_traits::groups::GroupStorage;
-use mdk_storage_traits::groups::error::{GroupError, InvalidGroupState};
+use mdk_storage_traits::groups::error::GroupError;
 use mdk_storage_traits::groups::types::*;
 use mdk_storage_traits::messages::types::Message;
 use nostr::{PublicKey, RelayUrl};
@@ -71,7 +71,10 @@ impl GroupStorage for MdkMemoryStorage {
     fn admins(&self, mls_group_id: &GroupId) -> Result<BTreeSet<PublicKey>, GroupError> {
         match self.find_group_by_mls_group_id(mls_group_id)? {
             Some(group) => Ok(group.admin_pubkeys),
-            None => Err(GroupError::InvalidState(InvalidGroupState::NoAdmins)),
+            None => Err(GroupError::InvalidParameters(format!(
+                "Group with MLS ID {:?} not found",
+                mls_group_id
+            ))),
         }
     }
 
