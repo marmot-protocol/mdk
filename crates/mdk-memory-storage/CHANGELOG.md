@@ -31,7 +31,11 @@
 
 ### Added
 
+- Implemented `messages_paginated(group_id, limit, offset)` for paginated retrieval of group messages ([#111](https://github.com/marmot-protocol/mdk/pull/111))
+
 ### Fixed
+
+- **Security (Audit Issue AC)**: Added pagination to prevent memory exhaustion from unbounded loading of group messages ([#111](https://github.com/marmot-protocol/mdk/pull/111))
 
 ### Removed
 
