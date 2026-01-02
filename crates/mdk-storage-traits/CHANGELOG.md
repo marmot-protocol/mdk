@@ -31,8 +31,6 @@
 
 ### Added
 
-- Add tests for `admins()`, `messages()`, and `group_relays()` error cases when group not found ([#104](https://github.com/marmot-protocol/mdk/pull/104))
-
 ### Fixed
 
 ### Removed
