@@ -591,7 +591,7 @@ mod tests {
     }
 
     #[test]
-    fn test_issue_66_encrypt_prevents_spoofing() {
+    fn test_encrypt_prevents_spoofing() {
         let mdk = create_test_mdk();
         let group_id = GroupId::from_slice(&[1, 2, 3, 4]);
         let manager = mdk.media_manager(group_id);
