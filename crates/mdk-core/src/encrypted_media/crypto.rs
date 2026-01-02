@@ -13,7 +13,7 @@ use sha2::Sha256;
 
 use crate::encrypted_media::types::EncryptedMediaError;
 use crate::{GroupId, MDK};
-use mdk_storage_traits::MdkStorageProvider;
+use mdk_storage_traits::{MdkStorageProvider, Secret};
 
 /// Scheme label for MIP-04 version 1 encryption to provide domain separation
 /// and prevent cross-version collisions
@@ -62,7 +62,7 @@ pub fn derive_encryption_key<Storage>(
     original_hash: &[u8; 32],
     mime_type: &str,
     filename: &str,
-) -> Result<[u8; 32], EncryptedMediaError>
+) -> Result<Secret<[u8; 32]>, EncryptedMediaError>
 where
     Storage: MdkStorageProvider,
 {
@@ -76,7 +76,7 @@ where
     let context = build_hkdf_context(original_hash, mime_type, filename, b"key");
 
     // Use HKDF to derive encryption key with context
-    let hk = Hkdf::<Sha256>::new(None, &exporter_secret.secret);
+    let hk = Hkdf::<Sha256>::new(None, exporter_secret.secret.as_ref());
 
     let mut key = [0u8; 32];
     hk.expand(&context, &mut key)
@@ -84,7 +84,7 @@ where
             reason: format!("Key derivation failed: {}", e),
         })?;
 
-    Ok(key)
+    Ok(Secret::new(key))
 }
 
 /// Derive encryption nonce from context according to Marmot protocol specification
@@ -100,7 +100,7 @@ pub fn derive_encryption_nonce<Storage>(
     original_hash: &[u8; 32],
     mime_type: &str,
     filename: &str,
-) -> Result<[u8; 12], EncryptedMediaError>
+) -> Result<Secret<[u8; 12]>, EncryptedMediaError>
 where
     Storage: MdkStorageProvider,
 {
@@ -114,7 +114,7 @@ where
     let context = build_hkdf_context(original_hash, mime_type, filename, b"nonce");
 
     // Use HKDF to derive nonce with context
-    let hk = Hkdf::<Sha256>::new(None, &exporter_secret.secret);
+    let hk = Hkdf::<Sha256>::new(None, exporter_secret.secret.as_ref());
 
     let mut nonce = [0u8; 12];
     hk.expand(&context, &mut nonce)
@@ -122,7 +122,7 @@ where
             reason: format!("Nonce derivation failed: {}", e),
         })?;
 
-    Ok(nonce)
+    Ok(Secret::new(nonce))
 }
 
 /// Encrypt data using ChaCha20-Poly1305 AEAD with Associated Authenticated Data
@@ -131,19 +131,19 @@ where
 /// aad = SCHEME_LABEL || 0x00 || file_hash_bytes || 0x00 || mime_type_bytes || 0x00 || filename_bytes
 pub fn encrypt_data_with_aad(
     data: &[u8],
-    key: &[u8; 32],
-    nonce: &[u8; 12],
+    key: &Secret<[u8; 32]>,
+    nonce: &Secret<[u8; 12]>,
     file_hash: &[u8; 32],
     mime_type: &str,
     filename: &str,
 ) -> Result<Vec<u8>, EncryptedMediaError> {
-    let cipher = ChaCha20Poly1305::new_from_slice(key).map_err(|e| {
+    let cipher = ChaCha20Poly1305::new_from_slice(key.as_ref()).map_err(|e| {
         EncryptedMediaError::EncryptionFailed {
             reason: format!("Failed to create cipher: {}", e),
         }
     })?;
 
-    let nonce = Nonce::from_slice(nonce);
+    let nonce = Nonce::from_slice(nonce.as_ref());
 
     let aad = build_aad(file_hash, mime_type, filename);
 
@@ -166,19 +166,19 @@ pub fn encrypt_data_with_aad(
 /// aad = SCHEME_LABEL || 0x00 || file_hash_bytes || 0x00 || mime_type_bytes || 0x00 || filename_bytes
 pub fn decrypt_data_with_aad(
     encrypted_data: &[u8],
-    key: &[u8; 32],
-    nonce: &[u8; 12],
+    key: &Secret<[u8; 32]>,
+    nonce: &Secret<[u8; 12]>,
     file_hash: &[u8; 32],
     mime_type: &str,
     filename: &str,
 ) -> Result<Vec<u8>, EncryptedMediaError> {
-    let cipher = ChaCha20Poly1305::new_from_slice(key).map_err(|e| {
+    let cipher = ChaCha20Poly1305::new_from_slice(key.as_ref()).map_err(|e| {
         EncryptedMediaError::DecryptionFailed {
             reason: format!("Failed to create cipher: {}", e),
         }
     })?;
 
-    let nonce = Nonce::from_slice(nonce);
+    let nonce = Nonce::from_slice(nonce.as_ref());
 
     let aad = build_aad(file_hash, mime_type, filename);
 
@@ -238,8 +238,8 @@ mod tests {
     #[test]
     fn test_encrypt_decrypt_with_known_key() {
         // Test encryption/decryption with a known key and nonce
-        let key = [0x42u8; 32];
-        let nonce = [0x24u8; 12];
+        let key = Secret::new([0x42u8; 32]);
+        let nonce = Secret::new([0x24u8; 12]);
         let original_data = b"Hello, encrypted world!";
         let file_hash = [0x01u8; 32];
         let mime_type = "image/jpeg";
@@ -274,8 +274,8 @@ mod tests {
     #[test]
     fn test_encrypt_decrypt_with_different_aad() {
         // Test that changing AAD components causes decryption to fail
-        let key = [0x42u8; 32];
-        let nonce = [0x24u8; 12];
+        let key = Secret::new([0x42u8; 32]);
+        let nonce = Secret::new([0x24u8; 12]);
         let original_data = b"Hello, encrypted world!";
         let file_hash = [0x01u8; 32];
         let mime_type = "image/jpeg";
@@ -336,9 +336,9 @@ mod tests {
     #[test]
     fn test_encrypt_decrypt_with_wrong_key() {
         // Test that using wrong key causes decryption to fail
-        let key = [0x42u8; 32];
-        let wrong_key = [0x43u8; 32];
-        let nonce = [0x24u8; 12];
+        let key = Secret::new([0x42u8; 32]);
+        let wrong_key = Secret::new([0x43u8; 32]);
+        let nonce = Secret::new([0x24u8; 12]);
         let original_data = b"Hello, encrypted world!";
         let file_hash = [0x01u8; 32];
         let mime_type = "image/jpeg";
@@ -368,9 +368,9 @@ mod tests {
     #[test]
     fn test_encrypt_decrypt_with_wrong_nonce() {
         // Test that using wrong nonce causes decryption to fail
-        let key = [0x42u8; 32];
-        let nonce = [0x24u8; 12];
-        let wrong_nonce = [0x25u8; 12];
+        let key = Secret::new([0x42u8; 32]);
+        let nonce = Secret::new([0x24u8; 12]);
+        let wrong_nonce = Secret::new([0x25u8; 12]);
         let original_data = b"Hello, encrypted world!";
         let file_hash = [0x01u8; 32];
         let mime_type = "image/jpeg";
@@ -400,8 +400,8 @@ mod tests {
     #[test]
     fn test_encrypt_empty_data() {
         // Test encryption of empty data
-        let key = [0x42u8; 32];
-        let nonce = [0x24u8; 12];
+        let key = Secret::new([0x42u8; 32]);
+        let nonce = Secret::new([0x24u8; 12]);
         let empty_data = b"";
         let file_hash = [0x01u8; 32];
         let mime_type = "image/jpeg";
@@ -433,8 +433,8 @@ mod tests {
     fn test_aad_construction() {
         // Test that AAD is constructed correctly by verifying different components
         // cause different encrypted outputs
-        let key = [0x42u8; 32];
-        let nonce = [0x24u8; 12];
+        let key = Secret::new([0x42u8; 32]);
+        let nonce = Secret::new([0x24u8; 12]);
         let data = b"test data";
         let file_hash = [0x01u8; 32];
 

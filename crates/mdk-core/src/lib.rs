@@ -4,7 +4,7 @@
 //! It handles group creation, member management, message encryption/decryption, key management, and storage of groups and messages.
 //! The implementation follows the MLS specification while integrating with Nostr's event system.
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 #![warn(missing_docs)]
 #![warn(rustdoc::bare_urls)]
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
