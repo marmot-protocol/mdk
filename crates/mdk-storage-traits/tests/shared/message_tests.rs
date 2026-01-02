@@ -8,7 +8,6 @@ use nostr::EventId;
 use super::{create_test_group, create_test_message, create_test_processed_message};
 
 /// Test message storage functionality
-#[allow(dead_code)]
 pub fn test_save_and_find_message<S>(storage: S)
 where
     S: MessageStorage + GroupStorage,
@@ -42,7 +41,6 @@ where
 }
 
 /// Test processed message functionality
-#[allow(dead_code)]
 pub fn test_processed_message<S>(storage: S)
 where
     S: MessageStorage,

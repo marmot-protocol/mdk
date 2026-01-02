@@ -11,7 +11,6 @@ use nostr::RelayUrl;
 use super::create_test_group;
 
 /// Test basic group save and find functionality
-#[allow(dead_code)]
 pub fn test_save_and_find_group<S>(storage: S)
 where
     S: GroupStorage,
@@ -48,7 +47,6 @@ where
 }
 
 /// Test all groups functionality
-#[allow(dead_code)]
 pub fn test_all_groups<S>(storage: S)
 where
     S: GroupStorage,
@@ -77,7 +75,6 @@ where
 }
 
 /// Test group exporter secret functionality
-#[allow(dead_code)]
 pub fn test_group_exporter_secret<S>(storage: S)
 where
     S: GroupStorage,
@@ -117,7 +114,6 @@ where
 }
 
 /// Test basic group relay functionality (not the comprehensive replace tests)
-#[allow(dead_code)]
 pub fn test_basic_group_relays<S>(storage: S)
 where
     S: GroupStorage,
@@ -144,7 +140,6 @@ where
 }
 
 /// Test comprehensive relay replacement functionality
-#[allow(dead_code)]
 pub fn test_replace_group_relays_comprehensive<S>(storage: S)
 where
     S: GroupStorage,
@@ -215,7 +210,6 @@ where
 }
 
 /// Test error cases for relay replacement
-#[allow(dead_code)]
 pub fn test_replace_group_relays_error_cases<S>(storage: S)
 where
     S: GroupStorage,
@@ -234,7 +228,6 @@ where
 }
 
 /// Test duplicate handling for replace_group_relays
-#[allow(dead_code)]
 pub fn test_replace_group_relays_duplicate_handling<S>(storage: S)
 where
     S: GroupStorage,
@@ -262,7 +255,6 @@ where
 }
 
 /// Test edge cases and error conditions for group operations
-#[allow(dead_code)]
 pub fn test_group_edge_cases<S>(storage: S)
 where
     S: GroupStorage,
@@ -302,7 +294,6 @@ where
 }
 
 /// Test concurrent relay operations and edge cases
-#[allow(dead_code)]
 pub fn test_replace_relays_edge_cases<S>(storage: S)
 where
     S: GroupStorage,
@@ -338,7 +329,6 @@ where
 }
 
 /// Test message storage functionality with group queries
-#[allow(dead_code)]
 pub fn test_messages_for_group<S>(storage: S)
 where
     S: GroupStorage,
@@ -353,7 +343,6 @@ where
 }
 
 /// Test admins() functionality
-#[allow(dead_code)]
 pub fn test_admins<S>(storage: S)
 where
     S: GroupStorage,
@@ -389,7 +378,6 @@ where
 }
 
 /// Test admins() returns error for non-existent group
-#[allow(dead_code)]
 pub fn test_admins_error_for_nonexistent_group<S>(storage: S)
 where
     S: GroupStorage,
@@ -405,7 +393,6 @@ where
 }
 
 /// Test messages() returns error for non-existent group
-#[allow(dead_code)]
 pub fn test_messages_error_for_nonexistent_group<S>(storage: S)
 where
     S: GroupStorage,
@@ -421,7 +408,6 @@ where
 }
 
 /// Test group_relays() returns error for non-existent group
-#[allow(dead_code)]
 pub fn test_group_relays_error_for_nonexistent_group<S>(storage: S)
 where
     S: GroupStorage,
