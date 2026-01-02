@@ -40,7 +40,7 @@
 
 ### Fixed
 
-#61 - Issue R: Refactor encoding handling to enforce base64 usage for key packages and welcome ([#98](https://github.com/marmot-protocol/mdk/pull/98))
+- Issue #61 - Issue R: Refactor encoding handling to enforce base64 usage for key packages and welcome ([#98](https://github.com/marmot-protocol/mdk/pull/98))
 
 ### Removed
 

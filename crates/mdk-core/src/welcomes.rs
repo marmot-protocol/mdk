@@ -391,6 +391,8 @@ mod tests {
     use super::*;
     use crate::test_util::*;
     use crate::tests::create_test_mdk;
+    use nostr::base64::Engine;
+    use nostr::base64::engine::general_purpose::STANDARD as BASE64;
     use nostr::{Keys, Kind, TagKind};
 
     /// Test that Welcome event structure matches Marmot spec (MIP-02)
@@ -433,8 +435,6 @@ mod tests {
             );
 
             // 2. Verify content is base64-encoded (always base64 per MIP-00/MIP-02)
-            use nostr::base64::Engine;
-            use nostr::base64::engine::general_purpose::STANDARD as BASE64;
             let decoded_content = BASE64
                 .decode(&welcome_rumor.content)
                 .expect("Welcome content must be valid base64-encoded data");
@@ -523,8 +523,6 @@ mod tests {
         let welcome_rumor = &create_result.welcome_rumors[0];
 
         // Decode base64 content (always base64 per MIP-00/MIP-02)
-        use nostr::base64::Engine;
-        use nostr::base64::engine::general_purpose::STANDARD as BASE64;
         let decoded_content = BASE64
             .decode(&welcome_rumor.content)
             .expect("Welcome content should be valid base64");
@@ -624,8 +622,6 @@ mod tests {
         );
 
         // Verify all welcomes have the same structure
-        use nostr::base64::Engine;
-        use nostr::base64::engine::general_purpose::STANDARD as BASE64;
         for welcome_rumor in &create_result.welcome_rumors {
             assert_eq!(welcome_rumor.kind, Kind::MlsWelcome);
             assert_eq!(welcome_rumor.tags.len(), 4);
@@ -770,8 +766,6 @@ mod tests {
         assert_eq!(first_tags[1].kind(), second_tags[1].kind());
 
         // Both should be valid base64 (always base64 per MIP-00/MIP-02)
-        use nostr::base64::Engine;
-        use nostr::base64::engine::general_purpose::STANDARD as BASE64;
         assert!(
             BASE64.decode(&first_welcome.content).is_ok(),
             "First welcome should be valid base64"
@@ -954,9 +948,10 @@ mod tests {
 
             // Check the size of the first welcome message
             let welcome = &group_result.welcome_rumors[0];
-            let welcome_content_bytes = welcome.content.as_bytes();
-            let encoded_size = welcome_content_bytes.len();
-            let binary_size = (encoded_size * 3) / 4; // Base64 encoding is ~33% larger
+            let decoded_bytes: Vec<u8> = BASE64
+                .decode(&welcome.content)
+                .expect("Welcome content should be valid base64");
+            let binary_size = decoded_bytes.len();
             let size_kb = binary_size as f64 / 1024.0;
 
             println!(
@@ -965,8 +960,6 @@ mod tests {
             );
 
             // Verify welcome is valid base64 (always base64 per MIP-00/MIP-02)
-            use nostr::base64::Engine;
-            use nostr::base64::engine::general_purpose::STANDARD as BASE64;
             assert!(
                 BASE64.decode(&welcome.content).is_ok(),
                 "Welcome content should be valid base64"
