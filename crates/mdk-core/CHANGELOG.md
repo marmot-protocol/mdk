@@ -27,18 +27,31 @@
 
 ### Breaking changes
 
+- **MIP-02 Welcome Event Validation**: Encoding tag is now required for all welcome events ([#96](https://github.com/marmot-protocol/mdk/pull/96))
+  - Welcome events must now include exactly 4 tags: `relays`, `e`, `client`, and `encoding`
+  - The `encoding` tag must have a value of either "hex" or "base64"
+  - Relay URLs are now validated to ensure they start with `wss://` or `ws://`
+  - Events missing the encoding tag or with invalid relay URLs will be rejected
+
 ### Changed
 
 ### Added
 
 - New error variant `AuthorMismatch` for message author verification failures ([#40](https://github.com/marmot-protocol/mdk/pull/40))
 - New error variant `KeyPackageIdentityMismatch` for KeyPackage credential identity validation failures ([#41](https://github.com/marmot-protocol/mdk/pull/41))
+- **MIP-02 Welcome Event Validation**: Added comprehensive validation for welcome events ([#96](https://github.com/marmot-protocol/mdk/pull/96))
+  - Validates event kind is 444 (MlsWelcome)
+  - Validates presence of all required tags (order-independent for interoperability)
+  - Validates relay URL format (must start with `wss://` or `ws://`)
+  - Validates non-empty content for `e` and `client` tags
+  - Validates encoding tag value is either "hex" or "base64"
 
 ### Fixed
 
 - **Security (Audit Issue B)**: Added author verification to message processing to prevent impersonation attacks. The rumor pubkey is now validated against the MLS sender's credential before processing application messages. ([#40](https://github.com/marmot-protocol/mdk/pull/40))
 - **Security (Audit Issue C)**: Added validation for admin updates to prevent invalid configurations. Admin updates now reject empty admin sets and non-member public keys. ([#42](https://github.com/marmot-protocol/mdk/pull/42))
 - **Security (Audit Issue D)**: Added identity binding verification for KeyPackage events. The credential identity is now validated against the event signer to prevent impersonation attacks. ([#41](https://github.com/marmot-protocol/mdk/pull/41))
+- **Security (Audit Issue H)**: Added MIP-02 validation to prevent malformed welcome events from causing storage pollution and resource exhaustion ([#96](https://github.com/marmot-protocol/mdk/pull/96))
 
 ### Removed
 
