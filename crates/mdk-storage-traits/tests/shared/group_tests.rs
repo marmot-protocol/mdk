@@ -351,3 +351,87 @@ where
     let messages = storage.messages(&mls_group_id).unwrap();
     assert_eq!(messages.len(), 0);
 }
+
+/// Test admins() functionality
+#[allow(dead_code)]
+pub fn test_admins<S>(storage: S)
+where
+    S: GroupStorage,
+{
+    use nostr::PublicKey;
+
+    let mls_group_id = GroupId::from_slice(&[1, 2, 3, 16]);
+    let mut group = create_test_group(mls_group_id.clone());
+
+    // Add some admins to the group using from_slice with valid 32-byte arrays
+    let admin1 = PublicKey::from_slice(&[
+        0x79, 0xbe, 0x66, 0x7e, 0xf9, 0xdc, 0xbb, 0xac, 0x55, 0xa0, 0x62, 0x95, 0xce, 0x87, 0x0b,
+        0x07, 0x02, 0x9b, 0xfc, 0xdb, 0x2d, 0xce, 0x28, 0xd9, 0x59, 0xf2, 0x81, 0x5b, 0x16, 0xf8,
+        0x17, 0x98,
+    ])
+    .unwrap();
+    let admin2 = PublicKey::from_slice(&[
+        0x8a, 0x9d, 0xe5, 0x62, 0xcb, 0xbe, 0xd2, 0x25, 0xb6, 0xea, 0x01, 0x18, 0xdd, 0x39, 0x97,
+        0xa0, 0x2d, 0xf9, 0x2c, 0x0b, 0xff, 0xd2, 0x22, 0x4f, 0x71, 0x08, 0x1a, 0x74, 0x50, 0xc3,
+        0xe5, 0x49,
+    ])
+    .unwrap();
+    group.admin_pubkeys.insert(admin1);
+    group.admin_pubkeys.insert(admin2);
+
+    storage.save_group(group).unwrap();
+
+    // Test getting admins for existing group
+    let admins = storage.admins(&mls_group_id).unwrap();
+    assert_eq!(admins.len(), 2);
+    assert!(admins.contains(&admin1));
+    assert!(admins.contains(&admin2));
+}
+
+/// Test admins() returns error for non-existent group
+#[allow(dead_code)]
+pub fn test_admins_error_for_nonexistent_group<S>(storage: S)
+where
+    S: GroupStorage,
+{
+    let non_existent_id = GroupId::from_slice(&[99, 99, 99, 17]);
+
+    let result = storage.admins(&non_existent_id);
+    assert!(result.is_err());
+    assert!(matches!(
+        result.unwrap_err(),
+        GroupError::InvalidParameters(_)
+    ));
+}
+
+/// Test messages() returns error for non-existent group
+#[allow(dead_code)]
+pub fn test_messages_error_for_nonexistent_group<S>(storage: S)
+where
+    S: GroupStorage,
+{
+    let non_existent_id = GroupId::from_slice(&[99, 99, 99, 18]);
+
+    let result = storage.messages(&non_existent_id);
+    assert!(result.is_err());
+    assert!(matches!(
+        result.unwrap_err(),
+        GroupError::InvalidParameters(_)
+    ));
+}
+
+/// Test group_relays() returns error for non-existent group
+#[allow(dead_code)]
+pub fn test_group_relays_error_for_nonexistent_group<S>(storage: S)
+where
+    S: GroupStorage,
+{
+    let non_existent_id = GroupId::from_slice(&[99, 99, 99, 19]);
+
+    let result = storage.group_relays(&non_existent_id);
+    assert!(result.is_err());
+    assert!(matches!(
+        result.unwrap_err(),
+        GroupError::InvalidParameters(_)
+    ));
+}
