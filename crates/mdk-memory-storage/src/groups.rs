@@ -75,6 +75,15 @@ impl GroupStorage for MdkMemoryStorage {
             )));
         }
 
+        // Validate offset is reasonable
+        if offset > mdk_storage_traits::groups::MAX_MESSAGE_OFFSET {
+            return Err(GroupError::InvalidParameters(format!(
+                "Offset {} exceeds maximum allowed offset of {}",
+                offset,
+                mdk_storage_traits::groups::MAX_MESSAGE_OFFSET
+            )));
+        }
+
         // Check if the group exists first
         if self.find_group_by_mls_group_id(mls_group_id)?.is_none() {
             return Err(GroupError::InvalidParameters(format!(
@@ -334,5 +343,15 @@ mod tests {
 
         let empty = storage.messages_paginated(&empty_group_id, 10, 0).unwrap();
         assert_eq!(empty.len(), 0);
+
+        // Test 12: Offset exceeding MAX should return error
+        let result = storage.messages_paginated(&mls_group_id, 10, 2_000_000);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("exceeds maximum allowed offset")
+        );
     }
 }

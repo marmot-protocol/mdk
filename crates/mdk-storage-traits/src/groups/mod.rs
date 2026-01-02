@@ -25,6 +25,9 @@ pub const DEFAULT_MESSAGE_LIMIT: usize = 1000;
 /// Maximum allowed limit for messages queries to prevent resource exhaustion
 pub const MAX_MESSAGE_LIMIT: usize = 10000;
 
+/// Maximum allowed offset for messages queries to prevent unreasonable values
+pub const MAX_MESSAGE_OFFSET: usize = 1_000_000;
+
 /// Storage traits for the groups module
 pub trait GroupStorage {
     /// Get all groups
@@ -68,6 +71,7 @@ pub trait GroupStorage {
     /// Returns [`GroupError::InvalidParameters`] if:
     /// - `limit` is 0
     /// - `limit` exceeds [`MAX_MESSAGE_LIMIT`]
+    /// - `offset` exceeds [`MAX_MESSAGE_OFFSET`]
     /// - Group with the specified ID does not exist
     ///
     /// # Recommended Usage

@@ -10,6 +10,13 @@ use mdk_storage_traits::messages::types::Message;
 use nostr::{PublicKey, RelayUrl};
 use rusqlite::{OptionalExtension, params};
 
+#[cfg(test)]
+use mdk_storage_traits::messages::MessageStorage;
+#[cfg(test)]
+use mdk_storage_traits::messages::types::MessageState;
+#[cfg(test)]
+use nostr::{EventId, Kind, Tags, Timestamp, UnsignedEvent};
+
 use crate::db::{Hash32, Nonce12};
 use crate::validation::{
     MAX_ADMIN_PUBKEYS_JSON_SIZE, MAX_GROUP_DESCRIPTION_LENGTH, MAX_GROUP_NAME_LENGTH,
@@ -168,6 +175,15 @@ impl GroupStorage for MdkSqliteStorage {
                 "Limit must be between 1 and {}, got {}",
                 mdk_storage_traits::groups::MAX_MESSAGE_LIMIT,
                 limit
+            )));
+        }
+
+        // Validate offset is reasonable
+        if offset > mdk_storage_traits::groups::MAX_MESSAGE_OFFSET {
+            return Err(GroupError::InvalidParameters(format!(
+                "Offset {} exceeds maximum allowed offset of {}",
+                offset,
+                mdk_storage_traits::groups::MAX_MESSAGE_OFFSET
             )));
         }
 
@@ -466,10 +482,6 @@ mod tests {
 
     #[test]
     fn test_messages_pagination() {
-        use mdk_storage_traits::messages::MessageStorage;
-        use mdk_storage_traits::messages::types::{Message, MessageState};
-        use nostr::{EventId, Kind, PublicKey, Tags, Timestamp, UnsignedEvent};
-
         let storage = MdkSqliteStorage::new_in_memory().unwrap();
 
         // Create a test group
@@ -576,6 +588,16 @@ mod tests {
         let result = storage.messages_paginated(&fake_group_id, 10, 0);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("not found"));
+
+        // Test: Offset exceeding MAX should return error
+        let result = storage.messages_paginated(&mls_group_id, 10, 2_000_000);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("exceeds maximum allowed offset")
+        );
     }
 
     #[test]

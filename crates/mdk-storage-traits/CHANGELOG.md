@@ -32,7 +32,7 @@
 ### Added
 
 - Added `messages_paginated(group_id, limit, offset)` method to `GroupStorage` trait for paginated retrieval of group messages ([#111](https://github.com/marmot-protocol/mdk/pull/111))
-- Added `DEFAULT_MESSAGE_LIMIT` and `MAX_MESSAGE_LIMIT` constants to prevent unbounded queries
+- Added `DEFAULT_MESSAGE_LIMIT` and `MAX_MESSAGE_LIMIT` constants to prevent unbounded queries ([#111](https://github.com/marmot-protocol/mdk/pull/111))
 
 ### Fixed
 
