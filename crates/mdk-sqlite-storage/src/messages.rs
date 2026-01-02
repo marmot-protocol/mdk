@@ -6,6 +6,10 @@ use mdk_storage_traits::messages::types::{Message, ProcessedMessage};
 use nostr::{EventId, JsonUtil};
 use rusqlite::{OptionalExtension, params};
 
+use crate::validation::{
+    MAX_EVENT_JSON_SIZE, MAX_MESSAGE_CONTENT_SIZE, MAX_TAGS_JSON_SIZE, validate_size,
+    validate_string_length,
+};
 use crate::{MdkSqliteStorage, db};
 
 #[inline]
@@ -18,11 +22,30 @@ where
 
 impl MessageStorage for MdkSqliteStorage {
     fn save_message(&self, message: Message) -> Result<(), MessageError> {
+        // Validate content size
+        validate_string_length(
+            &message.content,
+            MAX_MESSAGE_CONTENT_SIZE,
+            "Message content",
+        )
+        .map_err(|e| MessageError::InvalidParameters(e.to_string()))?;
+
         let conn_guard = self.db_connection.lock().map_err(into_message_err)?;
 
         // Serialize complex types to JSON
         let tags_json: String = serde_json::to_string(&message.tags)
             .map_err(|e| MessageError::DatabaseError(format!("Failed to serialize tags: {}", e)))?;
+
+        // Validate tags JSON size
+        validate_size(tags_json.as_bytes(), MAX_TAGS_JSON_SIZE, "Tags JSON")
+            .map_err(|e| MessageError::InvalidParameters(e.to_string()))?;
+
+        // Serialize event to JSON
+        let event_json = message.event.as_json();
+
+        // Validate event JSON size
+        validate_size(event_json.as_bytes(), MAX_EVENT_JSON_SIZE, "Event JSON")
+            .map_err(|e| MessageError::InvalidParameters(e.to_string()))?;
 
         conn_guard
             .execute(
@@ -37,7 +60,7 @@ impl MessageStorage for MdkSqliteStorage {
                     message.created_at.as_u64(),
                     message.content,
                     tags_json,
-                    message.event.as_json(),
+                    event_json,
                     message.wrapper_event_id.as_bytes(),
                     message.state.as_str(),
                 ],
@@ -230,5 +253,65 @@ mod tests {
             found_processed_message.state,
             ProcessedMessageState::Processed
         );
+    }
+
+    #[test]
+    fn test_message_content_size_validation() {
+        let storage = MdkSqliteStorage::new_in_memory().unwrap();
+
+        // Create a group first
+        let mls_group_id = GroupId::from_slice(&[1, 2, 3, 4]);
+        let mut nostr_group_id = [0u8; 32];
+        nostr_group_id[0..13].copy_from_slice(b"test_group_12");
+
+        let group = Group {
+            mls_group_id: mls_group_id.clone(),
+            nostr_group_id,
+            name: "Test Group".to_string(),
+            description: "Test".to_string(),
+            admin_pubkeys: BTreeSet::new(),
+            last_message_id: None,
+            last_message_at: None,
+            epoch: 0,
+            state: GroupState::Active,
+            image_hash: None,
+            image_key: None,
+            image_nonce: None,
+        };
+        storage.save_group(group).unwrap();
+
+        // Create a message with content exceeding the limit (1 MB)
+        let oversized_content = "x".repeat(1024 * 1024 + 1);
+
+        let event_id = EventId::all_zeros();
+        let pubkey = PublicKey::from_slice(&[1u8; 32]).unwrap();
+        let wrapper_event_id =
+            EventId::from_hex("1111111111111111111111111111111111111111111111111111111111111111")
+                .unwrap();
+
+        let message = Message {
+            id: event_id,
+            pubkey,
+            kind: Kind::from(1u16),
+            mls_group_id: mls_group_id.clone(),
+            created_at: Timestamp::now(),
+            content: oversized_content,
+            tags: Tags::new(),
+            event: UnsignedEvent::new(
+                pubkey,
+                Timestamp::now(),
+                Kind::from(9u16),
+                vec![],
+                "content".to_string(),
+            ),
+            wrapper_event_id,
+            state: MessageState::Created,
+        };
+
+        // Should fail due to content size
+        let result = storage.save_message(message);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("Message content exceeds maximum"));
     }
 }

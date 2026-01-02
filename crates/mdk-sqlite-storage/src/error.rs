@@ -1,43 +1,30 @@
 //! Error types for the SQLite storage implementation.
 
-use std::fmt;
-
 /// Error type for SQLite storage operations.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// SQLite database error
+    #[error("Database error: {0}")]
     Database(String),
     /// Error from rusqlite
-    Rusqlite(rusqlite::Error),
+    #[error("SQLite error: {0}")]
+    Rusqlite(#[from] rusqlite::Error),
     /// Error during database migration
-    Refinery(refinery::Error),
+    #[error("Migration error: {0}")]
+    Refinery(#[from] refinery::Error),
     /// Error from OpenMLS
+    #[error("OpenMLS error: {0}")]
     OpenMls(String),
-}
-
-impl std::error::Error for Error {}
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Database(msg) => write!(f, "Database error: {}", msg),
-            Self::Rusqlite(err) => write!(f, "SQLite error: {}", err),
-            Self::Refinery(msg) => write!(f, "Migration error: {}", msg),
-            Self::OpenMls(msg) => write!(f, "OpenMLS error: {}", msg),
-        }
-    }
-}
-
-impl From<rusqlite::Error> for Error {
-    fn from(e: rusqlite::Error) -> Self {
-        Self::Rusqlite(e)
-    }
-}
-
-impl From<refinery::Error> for Error {
-    fn from(e: refinery::Error) -> Self {
-        Self::Refinery(e)
-    }
+    /// Input validation error
+    #[error("{field_name} exceeds maximum length of {max_size} bytes (got {actual_size} bytes)")]
+    Validation {
+        /// Name of the field that failed validation
+        field_name: String,
+        /// Maximum allowed size/length in bytes
+        max_size: usize,
+        /// Actual size/length in bytes
+        actual_size: usize,
+    },
 }
 
 impl From<std::io::Error> for Error {

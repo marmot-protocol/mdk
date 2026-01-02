@@ -52,8 +52,8 @@
 
 - Library split from rust-nostr into independent MDK (Marmot Development Kit) project
 - Remove group type from groups
-- Replaced `save_group_relay` with `replace_group_relays` trait method (https://github.com/rust-nostr/nostr/pull/1056)
-- `image_hash` instead of `image_url` (https://github.com/rust-nostr/nostr/pull/1059)
+- Replaced `save_group_relay` with `replace_group_relays` trait method ([#1056](https://github.com/rust-nostr/nostr/pull/1056))
+- `image_hash` instead of `image_url` ([#1059](https://github.com/rust-nostr/nostr/pull/1059))
 
 ### Changed
 
@@ -67,4 +67,4 @@
 
 ## v0.42.0 - 2025/05/20
 
-- First release (https://github.com/rust-nostr/nostr/pull/839)
+- First release ([#839](https://github.com/rust-nostr/nostr/pull/839))
