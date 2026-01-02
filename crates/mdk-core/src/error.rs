@@ -184,6 +184,9 @@ pub enum Error {
     /// Invalid extension version
     #[error("invalid extension version: {0}")]
     InvalidExtensionVersion(u16),
+    /// Rumor pubkey does not match MLS sender credential
+    #[error("author mismatch: rumor pubkey does not match MLS sender")]
+    AuthorMismatch,
     /// Key package identity binding mismatch - credential identity doesn't match event signer
     #[error(
         "key package identity mismatch: credential identity {credential_identity} doesn't match event signer {event_signer}"
