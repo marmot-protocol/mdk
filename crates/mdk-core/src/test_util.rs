@@ -126,7 +126,7 @@ where
         )
         .expect("Failed to create group");
 
-    let group_id = create_result.group.mls_group_id;
+    let group_id = create_result.group.mls_group_id.clone();
 
     // Merge the pending commit to apply the member additions
     mdk.merge_pending_commit(&group_id.clone())

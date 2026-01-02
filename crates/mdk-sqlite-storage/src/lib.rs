@@ -283,6 +283,7 @@ mod tests {
 
     #[test]
     fn test_group_exporter_secrets() {
+        use mdk_storage_traits::Secret;
         use mdk_storage_traits::groups::GroupStorage;
         use mdk_storage_traits::groups::types::{Group, GroupExporterSecret, GroupState};
 
@@ -313,13 +314,13 @@ mod tests {
         let secret_epoch_0 = GroupExporterSecret {
             mls_group_id: mls_group_id.clone(),
             epoch: 0,
-            secret: [0u8; 32],
+            secret: Secret::new([0u8; 32]),
         };
 
         let secret_epoch_1 = GroupExporterSecret {
             mls_group_id: mls_group_id.clone(),
             epoch: 1,
-            secret: [0u8; 32],
+            secret: Secret::new([0u8; 32]),
         };
 
         // Save the exporter secrets
@@ -356,7 +357,7 @@ mod tests {
         let updated_secret_0 = GroupExporterSecret {
             mls_group_id: mls_group_id.clone(),
             epoch: 0,
-            secret: [0u8; 32],
+            secret: Secret::new([0u8; 32]),
         };
         storage
             .save_group_exporter_secret(updated_secret_0.clone())
@@ -372,7 +373,7 @@ mod tests {
         let invalid_secret = GroupExporterSecret {
             mls_group_id: non_existent_group_id.clone(),
             epoch: 0,
-            secret: [0u8; 32],
+            secret: Secret::new([0u8; 32]),
         };
         let result = storage.save_group_exporter_secret(invalid_secret);
         assert!(result.is_err());

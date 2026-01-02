@@ -133,8 +133,8 @@ impl GroupStorage for MdkSqliteStorage {
                     &group.name,
                     &group.description,
                     &group.image_hash.map(Hash32::from),
-                    &group.image_key.map(Hash32::from),
-                    &group.image_nonce.map(Nonce12::from),
+                    &group.image_key.as_ref().map(|k| Hash32::from(**k)),
+                    &group.image_nonce.as_ref().map(|n| Nonce12::from(**n)),
                     &admin_pubkeys_json,
                     last_message_id,
                     &last_message_at,
@@ -179,7 +179,7 @@ impl GroupStorage for MdkSqliteStorage {
     fn admins(&self, mls_group_id: &GroupId) -> Result<BTreeSet<PublicKey>, GroupError> {
         // Get the group which contains the admin_pubkeys
         match self.find_group_by_mls_group_id(mls_group_id)? {
-            Some(group) => Ok(group.admin_pubkeys),
+            Some(group) => Ok(group.admin_pubkeys.clone()),
             None => Err(GroupError::InvalidParameters(format!(
                 "Group with MLS ID {:?} not found",
                 mls_group_id
@@ -301,7 +301,7 @@ impl GroupStorage for MdkSqliteStorage {
 
         conn_guard.execute(
             "INSERT OR REPLACE INTO group_exporter_secrets (mls_group_id, epoch, secret) VALUES (?, ?, ?)",
-            params![&group_exporter_secret.mls_group_id.as_slice(), &group_exporter_secret.epoch, &group_exporter_secret.secret],
+            params![&group_exporter_secret.mls_group_id.as_slice(), &group_exporter_secret.epoch, group_exporter_secret.secret.as_ref()],
         )
         .map_err(into_group_err)?;
 
@@ -311,6 +311,7 @@ impl GroupStorage for MdkSqliteStorage {
 
 #[cfg(test)]
 mod tests {
+    use mdk_storage_traits::Secret;
     use mdk_storage_traits::groups::types::GroupState;
     use mdk_storage_traits::test_utils::crypto_utils::generate_random_bytes;
 
@@ -324,8 +325,8 @@ mod tests {
         let mls_group_id = GroupId::from_slice(&[1, 2, 3, 4]);
         let nostr_group_id = generate_random_bytes(32).try_into().unwrap();
         let image_hash = Some(generate_random_bytes(32).try_into().unwrap());
-        let image_key = Some(generate_random_bytes(32).try_into().unwrap());
-        let image_nonce = Some(generate_random_bytes(12).try_into().unwrap());
+        let image_key = Some(Secret::new(generate_random_bytes(32).try_into().unwrap()));
+        let image_nonce = Some(Secret::new(generate_random_bytes(12).try_into().unwrap()));
 
         let group = Group {
             mls_group_id: mls_group_id.clone(),
@@ -466,7 +467,7 @@ mod tests {
         let secret1 = GroupExporterSecret {
             mls_group_id: mls_group_id.clone(),
             epoch: 1,
-            secret: [0u8; 32],
+            secret: Secret::new([0u8; 32]),
         };
 
         // Save the secret
@@ -477,13 +478,13 @@ mod tests {
             .get_group_exporter_secret(&mls_group_id, 1)
             .unwrap()
             .unwrap();
-        assert_eq!(retrieved_secret.secret, [0u8; 32]);
+        assert_eq!(*retrieved_secret.secret, [0u8; 32]);
 
         // Create a second secret with same group_id and epoch but different secret value
         let secret2 = GroupExporterSecret {
             mls_group_id: mls_group_id.clone(),
             epoch: 1,
-            secret: [0u8; 32],
+            secret: Secret::new([0u8; 32]),
         };
 
         // Save the second secret - this should replace the first one due to the "OR REPLACE" in the SQL
@@ -494,13 +495,13 @@ mod tests {
             .get_group_exporter_secret(&mls_group_id, 1)
             .unwrap()
             .unwrap();
-        assert_eq!(retrieved_secret.secret, [0u8; 32]);
+        assert_eq!(*retrieved_secret.secret, [0u8; 32]);
 
         // Verify we can still save a different epoch
         let secret3 = GroupExporterSecret {
             mls_group_id: mls_group_id.clone(),
             epoch: 2,
-            secret: [0u8; 32],
+            secret: Secret::new([0u8; 32]),
         };
 
         storage.save_group_exporter_secret(secret3).unwrap();
@@ -515,7 +516,7 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        assert_eq!(retrieved_secret1.secret, [0u8; 32]);
-        assert_eq!(retrieved_secret2.secret, [0u8; 32]);
+        assert_eq!(*retrieved_secret1.secret, [0u8; 32]);
+        assert_eq!(*retrieved_secret2.secret, [0u8; 32]);
     }
 }

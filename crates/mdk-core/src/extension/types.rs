@@ -634,9 +634,9 @@ impl NostrGroupDataExtension {
                 Some(crate::extension::group_image::GroupImageEncryptionInfo {
                     version: self.version,
                     image_hash: hash,
-                    image_key: key,
-                    image_nonce: nonce,
-                    image_upload_key: self.image_upload_key,
+                    image_key: mdk_storage_traits::Secret::new(key),
+                    image_nonce: mdk_storage_traits::Secret::new(nonce),
+                    image_upload_key: self.image_upload_key.map(mdk_storage_traits::Secret::new),
                 })
             }
             _ => None,

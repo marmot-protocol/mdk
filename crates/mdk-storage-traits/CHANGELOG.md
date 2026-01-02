@@ -27,11 +27,29 @@
 
 ### Breaking changes
 
+- **Secret Type Wrapper**: Secret values now use `Secret<T>` wrapper for automatic zeroization ([#109](https://github.com/marmot-protocol/mdk/pull/109))
+  - `Group.image_key` changed from `Option<[u8; 32]>` to `Option<Secret<[u8; 32]>>`
+  - `Group.image_nonce` changed from `Option<[u8; 12]>` to `Option<Secret<[u8; 12]>>`
+  - `GroupExporterSecret.secret` changed from `[u8; 32]` to `Secret<[u8; 32]>`
+  - `Welcome.group_image_key` changed from `Option<[u8; 32]>` to `Option<Secret<[u8; 32]>>`
+  - `Welcome.group_image_nonce` changed from `Option<[u8; 12]>` to `Option<Secret<[u8; 12]>>`
+  - Code accessing these fields must use `Secret::new()` to wrap values or `.into_inner()` to unwrap ([#109](https://github.com/marmot-protocol/mdk/pull/109))
+
 ### Changed
 
 ### Added
 
+- **Secret Type and Zeroization**: Added `Secret<T>` wrapper type that automatically zeroizes memory on drop ([#109](https://github.com/marmot-protocol/mdk/pull/109))
+
+  - Implements `Zeroize` trait for `[u8; 32]`, `[u8; 12]`, and `Vec<u8>`
+  - Provides `Deref` and `DerefMut` for transparent access to wrapped values
+  - Includes serde serialization support
+  - Debug formatting hides secret values to prevent leaks
+  - Comprehensive test suite including memory zeroization verification ([#109](https://github.com/marmot-protocol/mdk/pull/109))
+
 ### Fixed
+
+- **Security**: Secret values (encryption keys, nonces, exporter secrets) are now automatically zeroized when dropped, preventing memory leaks of sensitive cryptographic material ([#109](https://github.com/marmot-protocol/mdk/pull/109))
 
 ### Removed
 

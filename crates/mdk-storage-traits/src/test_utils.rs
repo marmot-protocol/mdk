@@ -293,7 +293,7 @@ pub mod cross_storage {
         let exporter_secret = GroupExporterSecret {
             mls_group_id: mls_group_id.clone(),
             epoch,
-            secret,
+            secret: crate::Secret::new(secret),
         };
 
         // Test save
@@ -309,7 +309,7 @@ pub mod cross_storage {
         let retrieved = retrieved.unwrap();
         assert_eq!(retrieved.mls_group_id, mls_group_id);
         assert_eq!(retrieved.epoch, epoch);
-        assert_eq!(retrieved.secret, secret);
+        assert_eq!(*retrieved.secret, secret);
 
         // Test get non-existent
         let result = storage
