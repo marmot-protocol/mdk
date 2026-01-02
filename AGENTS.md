@@ -156,6 +156,8 @@ We follow [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format:
 
 **Important**: Always include a link to the PR at the end of each changelog entry using the format `([#123](https://github.com/marmot-protocol/mdk/pull/123))`.
 
+**Note**: Always reference the PR number, not the issue number, in changelog entries. This means you may need to push the branch and create a PR before updating the changelog, so that you have a PR number to reference.
+
 Always add entries under the `## Unreleased` section of the appropriate crate's changelog.
 
 ### Markdown URL Format

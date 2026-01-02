@@ -6,3 +6,6 @@
 coverage/
 *.profraw
 *.profdata
+
+# Audit related files
+/docs/audits
