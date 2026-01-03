@@ -669,6 +669,23 @@ mod tests {
         let tag = NostrTag::custom(TagKind::Custom("imeta".into()), tag_values);
         let result = manager.parse_imeta_tag(&tag);
         assert!(result.is_ok());
+
+        // Test that mip04-v1 is explicitly rejected (breaking change)
+        let test_nonce = [0xAB; 12];
+        let tag_values = vec![
+            "url https://example.com/test.jpg".to_string(),
+            "m image/jpeg".to_string(),
+            "filename photo.jpg".to_string(),
+            format!("x {}", hex::encode([0x42; 32])),
+            format!("n {}", hex::encode(test_nonce)),
+            "v mip04-v1".to_string(), // Legacy version
+        ];
+        let tag = NostrTag::custom(TagKind::Custom("imeta".into()), tag_values);
+        let result = manager.parse_imeta_tag(&tag);
+        assert!(
+            matches!(result, Err(EncryptedMediaError::DecryptionFailed { .. })),
+            "mip04-v1 should be rejected to prevent nonce reuse vulnerability"
+        );
     }
 
     #[test]
