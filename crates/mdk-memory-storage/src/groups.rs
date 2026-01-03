@@ -54,10 +54,7 @@ impl GroupStorage for MdkMemoryStorage {
     fn messages(&self, mls_group_id: &GroupId) -> Result<Vec<Message>, GroupError> {
         // Check if the group exists first
         if self.find_group_by_mls_group_id(mls_group_id)?.is_none() {
-            return Err(GroupError::InvalidParameters(format!(
-                "Group with MLS ID {:?} not found",
-                mls_group_id
-            )));
+            return Err(GroupError::InvalidParameters("Group not found".to_string()));
         }
 
         let cache = self.messages_by_group_cache.read();
@@ -78,10 +75,7 @@ impl GroupStorage for MdkMemoryStorage {
     fn group_relays(&self, mls_group_id: &GroupId) -> Result<BTreeSet<GroupRelay>, GroupError> {
         // Check if the group exists first
         if self.find_group_by_mls_group_id(mls_group_id)?.is_none() {
-            return Err(GroupError::InvalidParameters(format!(
-                "Group with MLS ID {:?} not found",
-                mls_group_id
-            )));
+            return Err(GroupError::InvalidParameters("Group not found".to_string()));
         }
 
         let cache = self.group_relays_cache.read();
@@ -99,10 +93,7 @@ impl GroupStorage for MdkMemoryStorage {
     ) -> Result<(), GroupError> {
         // Check if the group exists first
         if self.find_group_by_mls_group_id(group_id)?.is_none() {
-            return Err(GroupError::InvalidParameters(format!(
-                "Group with MLS ID {:?} not found",
-                group_id
-            )));
+            return Err(GroupError::InvalidParameters("Group not found".to_string()));
         }
 
         let mut cache = self.group_relays_cache.write();
@@ -128,7 +119,9 @@ impl GroupStorage for MdkMemoryStorage {
         epoch: u64,
     ) -> Result<Option<GroupExporterSecret>, GroupError> {
         // Check if the group exists first
-        self.find_group_by_mls_group_id(mls_group_id)?;
+        if self.find_group_by_mls_group_id(mls_group_id)?.is_none() {
+            return Err(GroupError::InvalidParameters("Group not found".to_string()));
+        }
 
         let cache = self.group_exporter_secrets_cache.read();
         // Use tuple (GroupId, epoch) as key
@@ -140,7 +133,12 @@ impl GroupStorage for MdkMemoryStorage {
         group_exporter_secret: GroupExporterSecret,
     ) -> Result<(), GroupError> {
         // Check if the group exists first
-        self.find_group_by_mls_group_id(&group_exporter_secret.mls_group_id)?;
+        if self
+            .find_group_by_mls_group_id(&group_exporter_secret.mls_group_id)?
+            .is_none()
+        {
+            return Err(GroupError::InvalidParameters("Group not found".to_string()));
+        }
 
         let mut cache = self.group_exporter_secrets_cache.write();
         // Use tuple (GroupId, epoch) as key
