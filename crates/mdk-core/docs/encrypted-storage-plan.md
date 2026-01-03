@@ -25,7 +25,7 @@ This document is split into two parts:
 ### Goals
 
 1. **Encrypt MLS state at rest** in `mdk-sqlite-storage` using SQLCipher.
-2. **Keep MDK platform-agnostic**: core Rust + callback-based secure storage integration for all mobile platforms.
+2. **Keep MDK platform-agnostic**: use the `keyring-core` ecosystem for cross-platform secure credential storage.
 3. **Minimize footguns**: explicit keying procedure, clear failure modes, and safe defaults for file placement/permissions.
 
 ### Non-goals (for this workstream)
@@ -50,20 +50,31 @@ This document is split into two parts:
 
 - A compromised host application (malicious integration).
 - A compromised device / OS (root/jailbreak) or malware that can call secure storage APIs or read process memory.
-- Side-channel attacks, hardware attacks, and “evil maid” runtime tampering.
+- Side-channel attacks, hardware attacks, and "evil maid" runtime tampering.
 
 **Trust boundaries**
 
-- MDK **trusts the host-provided secure storage callbacks** to keep secrets confidential and to avoid logging/exfiltrating key material. This is a major security boundary; see “FFI / callback boundary risks” below.
+- MDK trusts the credential store implementations from `keyring-core` to keep secrets confidential.
 
 ### Solution Overview (MDK-generic)
 
 1. **Database Encryption**: Use SQLCipher via `rusqlite` `bundled-sqlcipher`.
-2. **Secure Storage Abstraction**: Create `mdk-secure-storage` crate:
-   - `SecureStorageProvider` trait for secret storage
-   - Desktop provider implementation (optional) using `keyring`
-   - Callback-based provider for iOS/Android and any other platforms (host provides implementation)
+2. **Secure Storage via `keyring-core`**: Use the [`keyring-core`](https://crates.io/crates/keyring-core) ecosystem instead of a custom abstraction:
+   - `keyring-core` provides a unified cross-platform API for credential storage
+   - Platform-native stores are provided as separate crates (see table below)
+   - No custom traits needed—MDK uses `keyring-core::Entry` directly
 3. **File Permissions**: Restrict database directories (mode `0700`) and files (mode `0600`) on Unix-like platforms, and apply ACL hardening on Windows to restrict access to the current user.
+
+### Why `keyring-core`?
+
+The [`keyring-core`](https://github.com/open-source-cooperative/keyring-core) ecosystem (v0.7+) provides:
+
+- **Unified API**: Single `Entry` type for all platforms with `set_secret()`, `get_secret()`, `delete_credential()`
+- **Native platform stores**: Each platform has a dedicated crate that implements the `CredentialStoreApi` trait
+- **Thread-safe by design**: All credentials are `Send + Sync`
+- **Android support**: The [`android-native-keyring-store`](https://crates.io/crates/android-native-keyring-store) crate provides native Android Keystore integration
+- **Active maintenance**: Maintained by the [Open Source Cooperative](https://github.com/open-source-cooperative)
+
 
 ---
 
@@ -74,26 +85,45 @@ This document is split into two parts:
 │                               Host Application                               │
 │     (Swift/Kotlin/Flutter/React Native/Desktop/etc.)                         │
 │                                   │                                          │
-│                                   ▼ (FFI/UniFFI callbacks)                   │
+│            (Optional: platform-specific store initialization)                │
+│                                   │                                          │
 │  ┌───────────────────────────────────────────────────────────────────────┐  │
 │  │                               MDK (Rust)                               │  │
 │  │                                                                       │  │
 │  │  ┌─────────────────────────────────────────────────────────────────┐  │  │
-│  │  │                        mdk-secure-storage                        │  │  │
-│  │  │  - SecureStorageProvider trait                                   │  │  │
-│  │  │  - CallbackProvider (required for iOS/Android + generic)         │  │  │
-│  │  │  - KeyringProvider (optional, desktop convenience)               │  │  │
+│  │  │                         keyring-core                             │  │  │
+│  │  │  - Entry::new(service, user)                                     │  │  │
+│  │  │  - entry.set_secret() / get_secret() / delete_credential()       │  │  │
 │  │  └─────────────────────────────────────────────────────────────────┘  │  │
 │  │                                   │                                    │  │
-│  │                                   ▼                                    │  │
+│  │         ┌─────────────────────────┼─────────────────────────┐         │  │
+│  │         │                         │                         │         │  │
+│  │         ▼                         ▼                         ▼         │  │
+│  │  ┌─────────────┐         ┌─────────────────┐       ┌─────────────────┐│  │
+│  │  │ Apple Store │         │ Android Store   │       │ Windows/Linux   ││  │
+│  │  │(macOS+iOS)  │         │(native keystore)│       │ stores          ││  │
+│  │  └─────────────┘         └─────────────────┘       └─────────────────┘│  │
+│  │                                                                       │  │
 │  │  ┌─────────────────────────────────────────────────────────────────┐  │  │
 │  │  │                       mdk-sqlite-storage                         │  │  │
 │  │  │  - SQLCipher-encrypted SQLite                                    │  │  │
-│  │  │  - Uses SecureStorageProvider to obtain DB key                   │  │  │
+│  │  │  - Uses keyring-core Entry to obtain/store DB key                │  │  │
 │  │  └─────────────────────────────────────────────────────────────────┘  │  │
 │  └───────────────────────────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
+
+### Credential Store Crates by Platform
+
+| Platform | Crate | Backend | Initialization |
+|----------|-------|---------|----------------|
+| macOS | [`apple-native-keyring-store`](https://crates.io/crates/apple-native-keyring-store) | Keychain Services | Automatic |
+| iOS | [`apple-native-keyring-store`](https://crates.io/crates/apple-native-keyring-store) | Keychain Services | Automatic |
+| Windows | [`windows-native-keyring-store`](https://crates.io/crates/windows-native-keyring-store) | Credential Manager | Automatic |
+| Linux | [`linux-keyutils-keyring-store`](https://crates.io/crates/linux-keyutils-keyring-store) | Kernel keyutils | Automatic |
+| Linux | [`dbus-secret-service-keyring-store`](https://crates.io/crates/dbus-secret-service-keyring-store) | D-Bus Secret Service | Automatic |
+| Linux | [`zbus-secret-service-keyring-store`](https://crates.io/crates/zbus-secret-service-keyring-store) | D-Bus (async zbus) | Automatic |
+| Android | [`android-native-keyring-store`](https://crates.io/crates/android-native-keyring-store) | Android Keystore | **Requires init** (see below) |
 
 ---
 
@@ -117,20 +147,19 @@ This document is split into two parts:
 # Workspace Cargo.toml
 [workspace.dependencies]
 rusqlite = { version = "0.32", default-features = false }
-mdk-secure-storage = { version = "0.1.0", path = "./crates/mdk-secure-storage" }
 
 # mdk-sqlite-storage/Cargo.toml
-[features]
-default = []
-encryption = []
-
 [dependencies]
 rusqlite = { workspace = true, features = ["bundled-sqlcipher"] }
 ```
 
+**Windows note:** SQLCipher builds typically require OpenSSL headers/libs to be available at build time (or a vendored OpenSSL build strategy).
+
 #### Keying Procedure (precise `PRAGMA key` format)
 
-MDK will use a **random 32-byte (256-bit) key** generated once and stored in secure storage (see `mdk-secure-storage`). When opening a database connection:
+MDK will use a **random 32-byte (256-bit) key** generated once and stored via `keyring-core` (platform secure credential storage). When opening a database connection:
+
+- `mdk-sqlite-storage` uses multiple SQLite connections to the same database file (e.g., OpenMLS storage and MDK tables). The keying procedure must run **on each connection**.
 
 1. **Call `PRAGMA key` as the first operation** on the database connection.
 2. Use **raw key data** (not a passphrase) so we do not depend on passphrase KDF settings:
@@ -140,7 +169,16 @@ MDK will use a **random 32-byte (256-bit) key** generated once and stored in sec
 PRAGMA key = "x'2DD29CA851E7B56E4697B0E1F08507293D761A05CE4D1B628663F411A8086D99'";
 ```
 
-3. **Validate the key immediately**: SQLCipher will not always error on `PRAGMA key` alone if the key is wrong. A simple schema read is the recommended check:
+3. **Immediately after setting the key**, pin SQLCipher defaults and prevent temp spill:
+
+```sql
+PRAGMA cipher_compatibility = 4;
+PRAGMA temp_store = MEMORY;
+```
+
+`PRAGMA cipher_compatibility` is applied through the SQLCipher codec context, so it must run **after** `PRAGMA key` (key first still applies).
+
+4. **Validate the key immediately**: SQLCipher will not always error on `PRAGMA key` alone if the key is wrong. A simple schema read is the recommended check:
 
 ```sql
 SELECT count(*) FROM sqlite_master;
@@ -148,12 +186,15 @@ SELECT count(*) FROM sqlite_master;
 
 **Alternative:** SQLCipher also exposes `sqlite3_key()` / `sqlite3_key_v2()` as programmatic equivalents to `PRAGMA key`. (The `PRAGMA` interface calls these internally.)
 
+5. Only after the above succeeds should the connection execute other pragmas (e.g., `PRAGMA foreign_keys = ON;`) and run migrations / normal queries.
+
 #### Cipher Parameters (defaults, but pinned intentionally)
 
 SQLCipher’s **major versions have different default settings**, and existing databases can require migration when defaults change. This plan will:
 
 - **Stick to SQLCipher defaults** for the selected compatibility baseline.
-- Use `PRAGMA cipher_compatibility` to force defaults consistent with a specific major version for the current connection (e.g., 3 or 4), so that future SQLCipher upgrades do not silently change defaults.
+- Use `PRAGMA cipher_compatibility = 4;` on **every connection** to pin SQLCipher 4.x defaults so that future SQLCipher upgrades do not silently change parameters.
+  - The default Rust SQLCipher bundle used by `rusqlite`/`libsqlite3-sys` is currently SQLCipher **4.5.7 (community)**.
 - If we ever need to open databases created under older defaults, use SQLCipher’s supported migration mechanisms (e.g., `PRAGMA cipher_migrate` or `sqlcipher_export`) rather than guessing parameters.
 
 #### SQLite Sidecar Files and Temporary Files
@@ -169,280 +210,152 @@ SQLCipher encrypts more than just the `*.db` file, but there are important nuanc
 Operational guidance:
 
 - Treat `*.db`, `*-wal`, `*-shm`, and `*-journal` as sensitive and ensure they live in a private directory with restrictive permissions.
-- **Compile-time**: Configure the bundled SQLCipher build to disable file-based temp stores (e.g., `SQLITE_TEMP_STORE=2` or `=3` to force memory-only temp storage).
-- **Runtime**: Always set `PRAGMA temp_store = MEMORY;` as an additional safeguard, even if compile-time settings should prevent file-based temp storage.
+- **Compile-time**: Prefer building SQLCipher with `SQLITE_TEMP_STORE=3` (“always use memory for temporary storage”) when feasible.
+  - The common Rust SQLCipher bundle uses `SQLITE_TEMP_STORE=2` (temp is in-memory unless `temp_store` is explicitly forced to file), and Android builds commonly use `SQLITE_TEMP_STORE=3`.
+- **Runtime**: Always set `PRAGMA temp_store = MEMORY;` on **each connection** as an additional safeguard, even if compile-time settings should prevent file-based temp storage.
 
-### 2. The `mdk-secure-storage` Crate
+### 2. Secure Storage via `keyring-core`
 
-This new crate provides a unified interface for secure secret storage across all platforms.
+Instead of creating a custom secure-storage abstraction, MDK uses the [`keyring-core`](https://crates.io/crates/keyring-core) ecosystem directly. This provides:
 
-#### Crate Structure
+- A well-maintained, community-supported cross-platform credential storage API
+- Native platform stores for all major platforms (including Android and iOS)
+- Thread-safe `Send + Sync` credentials by design
+- Built-in mock store for testing
 
-```
-crates/mdk-secure-storage/
-├── Cargo.toml
-├── src/
-│   ├── lib.rs              # Trait definition + re-exports
-│   ├── error.rs            # SecureStorageError enum
-│   ├── keyring.rs          # KeyringProvider (optional desktop convenience: macOS/Linux/Windows)
-│   └── callback.rs         # CallbackProvider (host-provided; recommended for iOS/Android and generic use)
-```
+#### `keyring-core` API Overview
 
-#### Cargo.toml
-
-```toml
-[package]
-name = "mdk-secure-storage"
-version = "0.1.0"
-edition = "2024"
-description = "Secure storage abstraction for MDK - supports keychain, keyring, and callbacks"
-
-[features]
-default = []
-keyring-provider = ["keyring"]
-callback-provider = []  # No deps, but still explicitly enabled
-
-[dependencies]
-thiserror.workspace = true
-getrandom = "0.2"  # For secure random key generation
-
-# Optional providers
-keyring = { version = "3", optional = true }
-```
-
-**Provider Selection by Platform:**
-
-| Platform | Provider | Backend |
-|----------|----------|---------|
-| iOS (native) | `CallbackProvider` | Keychain Services (host implemented) |
-| macOS | `KeyringProvider` | Keychain Services |
-| Linux | `KeyringProvider` | Secret Service (libsecret) |
-| Windows | `KeyringProvider` | Credential Manager |
-| Android (native) | `CallbackProvider` | Keystore-backed secure storage (host implemented) |
-
-**Note:** MDK recommends **callback-based secure storage on all mobile platforms** (iOS and Android) for maximum portability and to avoid relying on Rust-side platform bindings.
-
-#### The Trait
+The `keyring-core` crate provides a simple API for credential storage:
 
 ```rust
-// src/lib.rs
+use keyring_core::{Entry, set_default_store, get_default_store, Result};
 
-use crate::error::SecureStorageError;
+// Set the default credential store (platform-specific)
+set_default_store(my_platform_store);
 
-/// A provider for secure secret storage.
-///
-/// Implementations store secrets in platform-native secure storage:
-/// - iOS/macOS: Keychain
-/// - Android: EncryptedSharedPreferences (via callback)
-/// - Linux: Secret Service (libsecret)
-/// - Windows: Credential Manager
-pub trait SecureStorageProvider: Send + Sync {
-    /// Retrieve a secret by key.
-    ///
-    /// Returns `Ok(None)` if the key doesn't exist.
-    fn get(&self, key: &str) -> Result<Option<Vec<u8>>, SecureStorageError>;
-
-    /// Store a secret with the given key.
-    ///
-    /// Overwrites any existing value for this key.
-    fn set(&self, key: &str, value: &[u8]) -> Result<(), SecureStorageError>;
-
-    /// Delete a secret by key.
-    ///
-    /// Returns `Ok(())` even if the key didn't exist.
-    fn delete(&self, key: &str) -> Result<(), SecureStorageError>;
-
-    /// Check if a key exists.
-    fn contains(&self, key: &str) -> Result<bool, SecureStorageError> {
-        Ok(self.get(key)?.is_some())
-    }
-}
-
-/// Extension trait for common key generation patterns
-pub trait SecureStorageProviderExt: SecureStorageProvider {
-    /// Get an existing key or generate and store a new one.
-    ///
-    /// Uses platform-secure random number generation.
-    ///
-    /// **Concurrency:** This operation must be atomic (at least within the current process).
-    /// Otherwise, concurrent callers can generate *different* keys and overwrite each other,
-    /// which can permanently brick encrypted data.
-    fn get_or_create_key(&self, key: &str, length: usize) -> Result<Vec<u8>, SecureStorageError> {
-        use std::sync::{Mutex, OnceLock};
-
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        let _guard = LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
-
-        if let Some(existing) = self.get(key)? {
-            return Ok(existing);
-        }
-
-        let new_key = generate_random_bytes(length)?;
-        self.set(key, &new_key)?;
-        Ok(new_key)
-    }
-}
-
-impl<T: SecureStorageProvider> SecureStorageProviderExt for T {}
-
-fn generate_random_bytes(length: usize) -> Result<Vec<u8>, SecureStorageError> {
-    let mut bytes = vec![0u8; length];
-    getrandom::getrandom(&mut bytes)
-        .map_err(|e| SecureStorageError::KeyGeneration(e.to_string()))?;
-    Ok(bytes)
-}
+// Create an entry and manage secrets
+// Use a host-provided service identifier (recommend: reverse-DNS / bundle id) to avoid collisions.
+let entry = Entry::new("com.example.app", "mdk.db.key.default")?;
+entry.set_secret(b"32-byte-encryption-key-here...")?;
+let secret: Vec<u8> = entry.get_secret()?;
+entry.delete_credential()?;
 ```
 
-#### Keyring Provider (optional desktop convenience: macOS, Linux, Windows)
+#### Key `keyring-core` Types
+
+| Type | Description |
+|------|-------------|
+| `Entry` | A named credential in a store (identified by service + user) |
+| `CredentialStore` | `Box<dyn CredentialStoreApi + Send + Sync>` — thread-safe store |
+| `Credential` | `Box<dyn CredentialApi + Send + Sync>` — thread-safe credential |
+| `Error` | Error enum including `NoEntry`, `NoStorageAccess`, etc. |
+
+#### Platform Store Initialization
+
+Each platform has a dedicated store crate. Most initialize automatically, but some (Android, Flutter) require explicit setup:
+
+**Desktop platforms (macOS, Windows, Linux):**
 
 ```rust
-// src/keyring.rs
+// macOS / iOS
+use apple_native_keyring_store::AppleStore;
+keyring_core::set_default_store(AppleStore::new());
 
-use crate::{SecureStorageError, SecureStorageProvider};
+// Windows
+use windows_native_keyring_store::WindowsStore;
+keyring_core::set_default_store(WindowsStore::new());
 
-/// Secure storage provider using the system keyring/keychain.
-///
-/// Works on:
-/// - macOS: Keychain Services
-/// - Linux: Secret Service (libsecret/GNOME Keyring)
-/// - Windows: Credential Manager
-///
-/// Note: Mobile platforms should use CallbackProvider (host implemented) instead of relying on `keyring`.
-pub struct KeyringProvider {
-    service_name: String,
-}
-
-impl KeyringProvider {
-    pub fn new(service_name: impl Into<String>) -> Self {
-        Self {
-            service_name: service_name.into(),
-        }
-    }
-}
-
-impl SecureStorageProvider for KeyringProvider {
-    fn get(&self, key: &str) -> Result<Option<Vec<u8>>, SecureStorageError> {
-        let entry = keyring::Entry::new(&self.service_name, key)
-            .map_err(|e| SecureStorageError::Backend(e.to_string()))?;
-
-        match entry.get_secret() {
-            Ok(secret) => Ok(Some(secret)),
-            Err(keyring::Error::NoEntry) => Ok(None),
-            Err(e) => Err(SecureStorageError::Retrieval(e.to_string())),
-        }
-    }
-
-    fn set(&self, key: &str, value: &[u8]) -> Result<(), SecureStorageError> {
-        let entry = keyring::Entry::new(&self.service_name, key)
-            .map_err(|e| SecureStorageError::Backend(e.to_string()))?;
-
-        entry
-            .set_secret(value)
-            .map_err(|e| SecureStorageError::Storage(e.to_string()))
-    }
-
-    fn delete(&self, key: &str) -> Result<(), SecureStorageError> {
-        let entry = keyring::Entry::new(&self.service_name, key)
-            .map_err(|e| SecureStorageError::Backend(e.to_string()))?;
-
-        match entry.delete_credential() {
-            Ok(()) => Ok(()),
-            Err(keyring::Error::NoEntry) => Ok(()), // Already deleted
-            Err(e) => Err(SecureStorageError::Deletion(e.to_string())),
-        }
-    }
-}
+// Linux (kernel keyutils)
+use linux_keyutils_keyring_store::KeyutilsStore;
+keyring_core::set_default_store(KeyutilsStore::new());
 ```
 
-#### Callback Provider (host-provided; iOS/Android + generic)
+**Android (requires initialization):**
+
+The `android-native-keyring-store` crate uses JNI to interact with Android Keystore. It requires initialization from the Android runtime.
+
+**Option 1: With `ndk-context` feature** (for Dioxus Mobile, Tauri Mobile, android-activity):
 
 ```rust
-// src/callback.rs
+use android_native_keyring_store::AndroidStore;
+use keyring_core::set_default_store;
 
-use crate::{SecureStorageError, SecureStorageProvider};
+// Call at app startup
+set_default_store(AndroidStore::from_ndk_context().unwrap());
+```
 
-/// Callback interface that host applications implement.
-///
-/// This is the recommended integration for:
-/// - **iOS**: implement using Keychain Services
-/// - **Android**: implement using Keystore-backed secure storage (e.g. EncryptedSharedPreferences)
-/// - Any other host environment where MDK should not directly depend on platform-specific bindings
-pub trait SecureStorageCallbacks: Send + Sync {
-    fn get(&self, key: String) -> Result<Option<Vec<u8>>, String>;
-    fn set(&self, key: String, value: Vec<u8>) -> Result<(), String>;
-    fn delete(&self, key: String) -> Result<(), String>;
-}
+**Option 2: Manual initialization via Kotlin** (for Flutter/FRB and other frameworks):
 
-/// Secure storage provider that delegates to host-provided callbacks.
-///
-/// Use this when the host application is responsible for integrating with platform secure storage.
-pub struct CallbackProvider {
-    callbacks: Box<dyn SecureStorageCallbacks>,
-}
+Add this Kotlin code to your Android project:
 
-impl CallbackProvider {
-    pub fn new(callbacks: Box<dyn SecureStorageCallbacks>) -> Self {
-        Self { callbacks }
-    }
-}
+```kotlin
+package io.crates.keyring
 
-impl SecureStorageProvider for CallbackProvider {
-    fn get(&self, key: &str) -> Result<Option<Vec<u8>>, SecureStorageError> {
-        self.callbacks
-            .get(key.to_string())
-            .map_err(SecureStorageError::Callback)
-    }
+import android.content.Context
 
-    fn set(&self, key: &str, value: &[u8]) -> Result<(), SecureStorageError> {
-        self.callbacks
-            .set(key.to_string(), value.to_vec())
-            .map_err(SecureStorageError::Callback)
-    }
+class Keyring {
+    companion object {
+        init {
+            // Load the native library containing android-native-keyring-store
+            System.loadLibrary("your_rust_lib")
+        }
 
-    fn delete(&self, key: &str) -> Result<(), SecureStorageError> {
-        self.callbacks
-            .delete(key.to_string())
-            .map_err(SecureStorageError::Callback)
+        external fun setAndroidKeyringCredentialBuilder(context: Context)
     }
 }
 ```
 
-### 3. Project-Specific Integration Packages (see Part B)
+Then call from MainActivity:
 
-MDK remains Rust-first and platform-agnostic. Companion packages (e.g., Flutter/Dart helpers) are
-documented in **Part B** as non-normative examples and are not required for MDK itself.
+```kotlin
+class MainActivity : ComponentActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        Keyring.setAndroidKeyringCredentialBuilder(this)
+        // Now keyring-core can be used from Rust
+    }
+}
+```
 
-### 4. Integration with MDK
+**Flutter:**
 
-#### How MDK Uses the Storage Provider
+Flutter apps can use `android-native-keyring-store` on Android with the same Kotlin initialization approach shown above. On iOS, `apple-native-keyring-store` works automatically. Add the Kotlin initialization code to your Flutter project's `MainActivity.kt`.
+
+### 3. Integration with MDK
+
+#### How MDK Uses `keyring-core`
 
 **Key identifiers (important):**
 
-- The database encryption key must be stored under a **stable, host-defined key identifier** (e.g., `mdk.db.key.default` or `mdk.db.key.<profile_id>`).
+- MDK uses `Entry::new(service_id, db_key_id)` to store the database encryption key.
+- `service_id` should be a **stable, host-defined application identifier** (recommend: reverse-DNS / bundle id like `"com.example.app"`). This prevents collisions between multiple apps on the same OS user account.
+- The `db_key_id` should be a **stable, host-defined identifier** (e.g., `"mdk.db.key.default"` or `"mdk.db.key.<profile_id>"`).
 - **Do not derive the key identifier from an absolute `db_path`** (hashing paths is fragile across reinstalls, sandbox path changes, migrations, and renames).
-- The key identifier is **not secret**; it is an index into secure storage. Treat changes to it as a breaking migration (the DB becomes unreadable without the old key).
+- Neither identifier is secret; they are indexes into secure storage.
+
+**Failure modes (expected and user-actionable):**
+
+- If the database file exists but the keyring entry is missing, MDK must return a clear error (do **not** generate a new key and silently “brick” the existing database).
+- Distinguish wrong key vs missing key vs plaintext database encountered when encryption is required vs corrupted database vs “secure storage unavailable / not initialized”.
 
 ```rust
 // mdk-sqlite-storage/src/lib.rs
 
-use mdk_secure_storage::{SecureStorageProvider, SecureStorageProviderExt};
+use keyring_core::{Entry, Error as KeyringError};
 
 impl MdkSqliteStorage {
-    /// Creates encrypted storage using a secure storage provider.
+    /// Creates encrypted storage using the default keyring store.
     ///
-    /// This is the primary constructor for production use. The provider is used
-    /// to get or create the database encryption key.
-    pub fn new<P>(
-        file_path: P,
-        db_key_id: &str,
-        storage_provider: &dyn SecureStorageProvider,
-    ) -> Result<Self, Error>
+    /// This is the primary constructor for production use. The keyring store
+    /// must be initialized before calling this (see platform-specific setup).
+    pub fn new<P>(file_path: P, service_id: &str, db_key_id: &str) -> Result<Self, Error>
     where
         P: AsRef<Path>,
     {
         // Get or create the 32-byte encryption key
-        let key = storage_provider.get_or_create_key(db_key_id, 32)?;
-        let key_array: [u8; 32] = key.try_into()
+        let key = get_or_create_db_key(service_id, db_key_id)?;
+        let key_array: [u8; 32] = key
+            .try_into()
             .map_err(|_| Error::InvalidKeyLength)?;
 
         let config = EncryptionConfig { key: key_array };
@@ -468,203 +381,77 @@ impl MdkSqliteStorage {
         // Implementation details...
     }
 }
-```
 
-#### UniFFI Bindings
-
-```rust
-// mdk-uniffi/src/lib.rs
-
-/// Callback interface for secure storage.
+/// Get an existing DB encryption key or generate and store a new one.
 ///
-/// Implement this in your host application (Kotlin, Swift, etc.)
-#[uniffi::export(callback_interface)]
-pub trait SecureStorageCallbacks: Send + Sync {
-    fn get(&self, key: String) -> Result<Option<Vec<u8>>, String>;
-    fn set(&self, key: String, value: Vec<u8>) -> Result<(), String>;
-    fn delete(&self, key: String) -> Result<(), String>;
-}
+/// **Concurrency:** This operation must be atomic (at least within the current process).
+fn get_or_create_db_key(service_id: &str, db_key_id: &str) -> Result<Vec<u8>, Error> {
+    use std::sync::{Mutex, OnceLock};
 
-/// Create MDK with encrypted storage using host-provided secure storage.
-///
-/// This is the primary constructor for production use. Encrypted storage is the default.
-#[uniffi::export]
-pub fn new_mdk(
-    db_path: String,
-    db_key_id: String,
-    storage_callbacks: Box<dyn SecureStorageCallbacks>,
-) -> Result<Mdk, MdkUniffiError> {
-    let provider = CallbackProvider::new(storage_callbacks);
-    let storage = MdkSqliteStorage::new_with_provider(
-        PathBuf::from(db_path),
-        &db_key_id,
-        &provider,
-    )?;
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    let _guard = LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
 
-    let mdk = MDK::new(storage);
-    Ok(Mdk { mdk: Mutex::new(mdk) })
-}
+    let entry = Entry::new(service_id, db_key_id)?;
 
-/// Create MDK with unencrypted storage.
-///
-/// ⚠️ **WARNING**: This creates an unencrypted database. Only use for testing
-/// or development. Production applications should use `new_mdk()` with
-/// encrypted storage.
-#[uniffi::export]
-pub fn new_unencrypted_mdk(
-    db_path: String,
-) -> Result<Mdk, MdkUniffiError> {
-    let storage = MdkSqliteStorage::new_unencrypted(PathBuf::from(db_path))?;
-    let mdk = MDK::new(storage);
-    Ok(Mdk { mdk: Mutex::new(mdk) })
+    // Try to get existing key
+    match entry.get_secret() {
+        Ok(secret) => return Ok(secret),
+        Err(KeyringError::NoEntry) => {
+            // Key doesn't exist, generate a new one
+        }
+        Err(e) => return Err(e.into()),
+    }
+
+    // Generate a new 32-byte key
+    let mut new_key = vec![0u8; 32];
+    getrandom::getrandom(&mut new_key)
+        .map_err(|e| Error::KeyGeneration(e.to_string()))?;
+
+    // Store it
+    entry.set_secret(&new_key)?;
+
+    Ok(new_key)
 }
 ```
 
-### 5. Project-Specific Usage Examples (see Part B)
+**Note on concurrency:** the in-process mutex only coordinates within a single process. If a host can start multiple processes that open the same profile concurrently, the host should provide higher-level coordination.
+
+#### Cargo.toml Changes
+
+```toml
+# Workspace Cargo.toml
+[workspace.dependencies]
+keyring-core = "0.7"
+apple-native-keyring-store = "0.2"
+android-native-keyring-store = "0.3"
+windows-native-keyring-store = "0.2"
+linux-keyutils-keyring-store = "0.2"
+getrandom = "0.2"
+
+# mdk-sqlite-storage/Cargo.toml
+[features]
+default = []
+encryption = ["keyring-core", "getrandom"]
+
+# Platform-specific store features (user enables one)
+apple-keyring = ["encryption", "apple-native-keyring-store"]
+android-keyring = ["encryption", "android-native-keyring-store"]
+windows-keyring = ["encryption", "windows-native-keyring-store"]
+linux-keyring = ["encryption", "linux-keyutils-keyring-store"]
+
+[dependencies]
+keyring-core = { workspace = true, optional = true }
+apple-native-keyring-store = { workspace = true, optional = true }
+android-native-keyring-store = { workspace = true, optional = true }
+windows-native-keyring-store = { workspace = true, optional = true }
+linux-keyutils-keyring-store = { workspace = true, optional = true }
+getrandom = { workspace = true, optional = true }
+rusqlite = { workspace = true, features = ["bundled-sqlcipher"] }
+```
+
+### 4. Project-Specific Usage Examples (see Part B)
 
 Downstream integrations (including `whitenoise-rs`) are documented in **Part B** as non-normative examples.
-
-### 6. Platform Integration Examples (Native Apps)
-
-The following are reference implementations for host applications implementing secure storage (e.g., to back `SecureStorageCallbacks`).
-
-#### iOS (Swift)
-
-```swift
-import Security
-
-class MdkKeyManager {
-    private let serviceName = "dev.mdk.database"
-
-    func getOrCreateKey(dbKeyId: String) throws -> Data {
-        let keyIdentifier = dbKeyId
-
-        // Try to retrieve existing key
-        if let existingKey = try? retrieveKey(identifier: keyIdentifier) {
-            return existingKey
-        }
-
-        // Generate new key
-        var key = Data(count: 32)
-        let result = key.withUnsafeMutableBytes {
-            SecRandomCopyBytes(kSecRandomDefault, 32, $0.baseAddress!)
-        }
-        guard result == errSecSuccess else {
-            throw KeychainError.randomGenerationFailed
-        }
-
-        // Store in keychain
-        try storeKey(key, identifier: keyIdentifier)
-        return key
-    }
-
-    private func storeKey(_ key: Data, identifier: String) throws {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: serviceName,
-            kSecAttrAccount as String: identifier,
-            kSecValueData as String: key,
-            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
-        ]
-
-        let status = SecItemAdd(query as CFDictionary, nil)
-        guard status == errSecSuccess else {
-            throw KeychainError.unableToStore
-        }
-    }
-
-    private func retrieveKey(identifier: String) throws -> Data? {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: serviceName,
-            kSecAttrAccount as String: identifier,
-            kSecReturnData as String: true
-        ]
-
-        var result: AnyObject?
-        let status = SecItemCopyMatching(query as CFDictionary, &result)
-
-        if status == errSecSuccess {
-            return result as? Data
-        } else if status == errSecItemNotFound {
-            return nil
-        } else {
-            throw KeychainError.unableToRetrieve
-        }
-    }
-}
-```
-
-#### Android (Kotlin) - Using EncryptedSharedPreferences
-
-**Note**: Android Keystore doesn't allow direct export of raw key bytes for keys it generates.
-For SQLCipher, we need the raw key bytes, so we use EncryptedSharedPreferences which is
-backed by Android Keystore but allows storing arbitrary secrets.
-
-```kotlin
-import android.content.Context
-import androidx.security.crypto.EncryptedSharedPreferences
-import androidx.security.crypto.MasterKey
-import java.security.SecureRandom
-import android.util.Base64
-
-class MdkKeyManager(private val context: Context) {
-
-    private val masterKey = MasterKey.Builder(context)
-        .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
-        .build()
-
-    private val securePrefs = EncryptedSharedPreferences.create(
-        context,
-        "mdk_secure_keys",
-        masterKey,
-        EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
-        EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
-    )
-
-    fun getOrCreateKey(dbKeyId: String): ByteArray {
-        val keyAlias = dbKeyId
-
-        // Try to retrieve existing key
-        val existingKeyBase64 = securePrefs.getString(keyAlias, null)
-        if (existingKeyBase64 != null) {
-            return Base64.decode(existingKeyBase64, Base64.NO_WRAP)
-        }
-
-        // Generate new 256-bit key
-        val random = SecureRandom()
-        val key = ByteArray(32)
-        random.nextBytes(key)
-
-        // Store in encrypted preferences
-        securePrefs.edit()
-            .putString(keyAlias, Base64.encodeToString(key, Base64.NO_WRAP))
-            .apply()
-
-        return key
-    }
-
-    fun deleteKey(dbKeyId: String) {
-        val keyAlias = dbKeyId
-        securePrefs.edit().remove(keyAlias).apply()
-    }
-}
-
-// Usage with UniFFI bindings:
-// Implement `SecureStorageCallbacks` in the host (backed by this EncryptedSharedPreferences logic),
-// then call `newMdkWithSecureStorage(dbPath, dbKeyId, callbacks)` (name varies by language binding).
-```
-
-**Gradle Dependencies** (add to app's build.gradle):
-```groovy
-dependencies {
-    implementation "androidx.security:security-crypto:1.1.0-alpha06"
-}
-```
-
-#### Flutter / FRB Integration (see Part B)
-
-Flutter-specific examples and helper packages are documented in **Part B** as non-normative integration notes.
 
 ### 7. File Permission Hardening
 
@@ -673,6 +460,12 @@ Flutter-specific examples and helper packages are documented in **Part B** as no
 #### Unix-like (macOS/Linux/etc.)
 
 Create the database directory with mode `0700` (owner read/write/execute only) and database files with mode `0600` (owner read/write only). Execute permission is not needed for files.
+
+**Footgun avoidance (recommended):**
+
+- Only apply restrictive permissions to directories/files created for the MDK database (or a dedicated MDK subdirectory). Do not `chmod` arbitrary existing parent directories provided by the host.
+- To avoid a short window where SQLite creates a new database file with default permissions (umask-dependent), prefer **pre-creating** the database file with mode `0600` before opening it.
+- Policy recommendation: if an existing database directory or file is too-permissive, **fail closed** (return an error) rather than silently continuing.
 
 #### iOS/Android
 
@@ -862,49 +655,51 @@ fn set_secure_file_permissions(_path: &Path) -> std::io::Result<()> {
 
 ## Implementation Tasks
 
-### Phase 1: Create `mdk-secure-storage` Crate
+### Phase 1: Validate `keyring-core` Ecosystem
 
-- [ ] Create new crate `crates/mdk-secure-storage`
-- [ ] Define `SecureStorageProvider` trait
-- [ ] Define `SecureStorageProviderExt` trait with `get_or_create_key()`
-- [ ] Define `SecureStorageError` enum
-- [ ] Ensure **no provider is enabled by default** (providers behind explicit crate features)
-- [ ] Implement `KeyringProvider` using `keyring` crate (optional desktop convenience: macOS, Linux, Windows)
-- [ ] Implement `CallbackProvider` for host-provided callbacks (recommended for iOS/Android and generic use)
-- [ ] Add `SecureStorageCallbacks` trait for FFI callbacks
-- [ ] Add unit tests for all providers
-- [ ] Smoke test `KeyringProvider` on at least one desktop platform
+- [ ] Verify MSRV compatibility (MDK requires Rust 1.90.0)
+- [ ] Test `keyring-core` + `apple-native-keyring-store` on macOS
+- [ ] Test `keyring-core` + `android-native-keyring-store` on Android emulator
+- [ ] Document any initialization quirks or platform-specific requirements
+- [ ] Evaluate `keyring-core` error handling for our use cases
 
 ### Phase 2: SQLCipher Integration in `mdk-sqlite-storage`
 
 - [ ] Update `Cargo.toml` to use `bundled-sqlcipher` feature
-- [ ] Add dependency on `mdk-secure-storage`
+- [ ] Add `keyring-core` dependency and platform store feature flags
 - [ ] Add `EncryptionConfig` struct
+- [ ] Implement `get_or_create_db_key(service_id, db_key_id)` helper using `keyring_core::Entry`
 - [ ] Rename existing unencrypted constructor to `MdkSqliteStorage::new_unencrypted()`
-- [ ] Add `MdkSqliteStorage::new()` (encrypted) as the primary constructor using `SecureStorageProvider`
-- [ ] Apply `PRAGMA key` **as the first operation** on a new connection (use raw key data blob literal)
-- [ ] Validate the key with a read (e.g., `SELECT count(*) FROM sqlite_master;`) to distinguish "wrong key" from other failures
-- [ ] **Compile-time**: Configure bundled SQLCipher with `SQLITE_TEMP_STORE=3` to force memory-only temp storage
-- [ ] **Runtime**: Always set `PRAGMA temp_store = MEMORY;` as defense-in-depth
-- [ ] Set `PRAGMA cipher_compatibility` to pin defaults for forward compatibility
-- [ ] Add file permission hardening for Unix platforms (0700 for directories, 0600 for files)
+- [ ] Add `MdkSqliteStorage::new(file_path, service_id, db_key_id)` (encrypted) as the primary constructor
+- [ ] Apply SQLCipher pragmas on **each** new connection before any migrations / foreign key pragmas:
+  - [ ] `PRAGMA key = "x'...'"` (**must be the first operation**)
+  - [ ] `PRAGMA cipher_compatibility = 4;`
+  - [ ] `PRAGMA temp_store = MEMORY;`
+  - [ ] Validate with a read (e.g., `SELECT count(*) FROM sqlite_master;`) to distinguish wrong key from other failures
+- [ ] **Compile-time**: Investigate temp-store hardening (`SQLITE_TEMP_STORE=3` where feasible; default Rust SQLCipher builds use `=2`, Android commonly uses `=3`)
+- [ ] Add explicit errors for missing key for an existing DB, wrong key, plaintext DB when encryption is required, corrupted DB, and secure-storage-unavailable/uninitialized
+- [ ] Add file permission hardening for Unix platforms (0700 for directories, 0600 for files; avoid `chmod` on arbitrary existing directories; pre-create DB file with 0600 to avoid permission races)
 - [ ] Add file permission hardening for Windows (ACL-based, current user only)
-- [ ] Add unit tests for encrypted storage
+- [ ] Add unit tests for encrypted storage (using `keyring-core` mock store)
 - [ ] Test cross-platform compilation (iOS, Android, macOS, Linux, Windows)
 
-### Phase 3: UniFFI Binding Updates
+### Phase 3: Android Integration Testing
 
-- [ ] Export `SecureStorageCallbacks` as callback interface
-- [ ] Add `new_mdk(db_path, db_key_id, callbacks)` as the primary constructor (encrypted by default)
+- [ ] Set up test project with `android-native-keyring-store`
+- [ ] Test manual Kotlin initialization path (for Flutter compatibility)
+- [ ] Test `ndk-context` initialization path (for native Android apps)
+- [ ] Document Android-specific setup in README
+- [ ] Verify credential persistence across app restarts
+
+### Phase 4: UniFFI Binding Updates
+
+- [ ] Add `new_mdk(db_path, service_id, db_key_id)` as the primary constructor (encrypted by default)
 - [ ] Add `new_unencrypted_mdk(db_path)` for testing/development use with clear warnings
+- [ ] Export keyring store initialization functions if needed
 - [ ] Update generated bindings for Swift, Kotlin, Python, Ruby
-- [ ] Add documentation for storage provider responsibilities
+- [ ] Add documentation for platform-specific store setup
 
-### Phase 4: Project-Specific Integrations (see Part B)
-
-- [ ] Downstream work (e.g., `whitenoise-rs`, Flutter/FRB helper packages) is tracked in **Part B**
-
-### Phase 7: Migration Support
+### Phase 5: Migration Support
 
 - [ ] Add utility to migrate unencrypted database to encrypted
 - [ ] Add utility to re-key encrypted database
@@ -921,6 +716,7 @@ fn set_secure_file_permissions(_path: &Path) -> std::io::Result<()> {
 2. **Use platform-specific secure storage** - Don't store keys in SharedPreferences, UserDefaults, or files
 3. **Use device-bound keys where possible** - Prefer `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly` on iOS
 4. **Consider biometric protection** - For high-security use cases, require biometric auth to access the key
+5. **Use an app-unique `service_id`** (reverse-DNS / bundle id) when storing credentials to avoid cross-application collisions on shared OS key stores
 
 ### Android-Specific Security Notes
 
@@ -933,8 +729,8 @@ fn set_secure_file_permissions(_path: &Path) -> std::io::Result<()> {
 ### Database Security
 
 1. **SQLCipher security design** - SQLCipher encrypts pages with 256-bit AES-CBC and authenticates page writes with HMAC-SHA512 (see SQLCipher design docs).
-2. **Keying is explicit** - Use `PRAGMA key = "x'...'"` (raw 32-byte key data) and validate with a read (e.g., `SELECT count(*) FROM sqlite_master;`).
-3. **Defaults, but pinned** - Use `PRAGMA cipher_compatibility` to avoid unexpected default changes across SQLCipher major versions.
+2. **Keying is explicit** - Use `PRAGMA key = "x'...'"` (raw 32-byte key data), then `PRAGMA cipher_compatibility = 4;` and `PRAGMA temp_store = MEMORY;`, and validate with a read (e.g., `SELECT count(*) FROM sqlite_master;`).
+3. **Defaults, but pinned** - Use `PRAGMA cipher_compatibility = 4;` on each connection to avoid unexpected default changes across SQLCipher major versions.
 4. **Sidecar + temp files** - WAL/journal page data is encrypted, but other transient files are not; ensure in-memory temp store and strict directory permissions.
 5. **Optional hardening** - Consider `PRAGMA cipher_memory_security = ON` if the performance impact is acceptable.
 
@@ -950,19 +746,12 @@ As part of the security audit work, MDK is making breaking changes to establish 
 - **Unencrypted storage is explicitly opt-in**: Use `new_unencrypted()` / `new_unencrypted_mdk()` with clear warnings.
 - **No backwards compatibility shims**: We are not maintaining deprecated APIs for unencrypted storage. Existing users must migrate to encrypted storage.
 
-### FFI / Callback Boundary Risks (Critical)
+### Trust Boundaries with `keyring-core`
 
-Using host callbacks for secure storage is what keeps MDK platform-agnostic, but it is also the most important trust boundary in this design:
+MDK trusts the `keyring-core` ecosystem and its platform-native credential stores. Key trust boundaries:
 
-1. **Key material crosses language/runtime boundaries** (often multiple times). Many hosts will need to serialize as base64 or byte arrays, which increases the risk of accidental logging, caching, or analytics ingestion.
-2. **A compromised or misconfigured host can exfiltrate secrets**. MDK cannot enforce correct handling once the host receives key bytes.
-3. **“Key identifier” input is untrusted**: callbacks must treat the key name/identifier as potentially attacker-controlled input and must not allow arbitrary reads/writes outside the app’s intended namespace.
-
-Minimum required host behaviors:
-
-- Never log secrets or include them in crash reports/telemetry.
-- Store secrets only in platform secure storage, not in plaintext files or preferences.
-- Keep callback implementations small, deterministic, and well-tested (failure modes should be explicit and actionable).
+1. **Native stores are trusted**: We rely on Apple Keychain, Windows Credential Manager, Linux Secret Service, and Android Keystore to protect secrets appropriately.
+2. **Store initialization**: On Android, the app must call `setAndroidKeyringCredentialBuilder(context)` before MDK can store secrets. Failure to initialize results in clear errors.
 
 ---
 
@@ -1028,13 +817,37 @@ fn test_unencrypted_cannot_read_encrypted() {
 
 ## References
 
+### SQLCipher
+
 - [SQLCipher Design](https://www.zetetic.net/sqlcipher/design/)
 - [SQLCipher Documentation](https://www.zetetic.net/sqlcipher/sqlcipher-api/)
 - [rusqlite SQLCipher feature](https://github.com/rusqlite/rusqlite#optional-features)
+
+### keyring-core Ecosystem
+
+- [keyring-core crate](https://crates.io/crates/keyring-core)
+- [keyring-core documentation](https://docs.rs/keyring-core/)
+- [keyring-core GitHub](https://github.com/open-source-cooperative/keyring-core)
+- [Keyring ecosystem wiki](https://github.com/open-source-cooperative/keyring-rs/wiki/Keyring)
+
+### Platform Credential Stores
+
+- [apple-native-keyring-store](https://crates.io/crates/apple-native-keyring-store)
+- [android-native-keyring-store](https://crates.io/crates/android-native-keyring-store) — [GitHub](https://github.com/open-source-cooperative/android-native-keyring-store)
+- [windows-native-keyring-store](https://crates.io/crates/windows-native-keyring-store)
+- [linux-keyutils-keyring-store](https://crates.io/crates/linux-keyutils-keyring-store)
+- [dbus-secret-service-keyring-store](https://crates.io/crates/dbus-secret-service-keyring-store)
+- [zbus-secret-service-keyring-store](https://crates.io/crates/zbus-secret-service-keyring-store)
+
+### Platform Documentation
+
 - [iOS Keychain Services](https://developer.apple.com/documentation/security/keychain_services)
 - [Android Keystore](https://developer.android.com/training/articles/keystore)
 - [Android EncryptedSharedPreferences](https://developer.android.com/reference/androidx/security/crypto/EncryptedSharedPreferences)
 - [AndroidX Security Crypto Library](https://developer.android.com/jetpack/androidx/releases/security)
+
+### UniFFI
+
 - [UniFFI Callback Interfaces](https://mozilla.github.io/uniffi-rs/latest/udl/callback_interfaces.html)
 
 ---
@@ -1047,82 +860,72 @@ This section captures downstream work that is useful for `whitenoise-rs`, but is
 
 `whitenoise-rs` (which depends on MDK) currently handles Nostr key storage using:
 
-- `keyring` crate for most platforms
+- `keyring` crate (v3) for most platforms
 - Android: file-based obfuscation (not secure)
 
-This plan enables `whitenoise-rs` to reuse the same `mdk-secure-storage` abstraction for:
+With `keyring-core`, `whitenoise-rs` can use the same credential storage for:
 
 - The SQLCipher DB encryption key (MDK storage)
 - Nostr secret keys (whitenoise-rs)
 
 ### Strategy (Downstream)
 
-- **Mobile (iOS + Android)**: use `CallbackProvider` via FFI (host implements secure storage callbacks).
-- **Desktop**: optionally use `KeyringProvider` (enabled explicitly) for convenience.
+With `keyring-core`, the strategy is simpler:
 
-### Companion Flutter/Dart Package (Optional)
-
-Downstream Flutter apps can implement the callback interface using [`flutter_secure_storage`](https://pub.dev/packages/flutter_secure_storage). The Dart layer must treat secrets as **bytes** and encode them for storage (base64 is common).
-
-Example sketch (non-normative):
-
-```dart
-import 'dart:convert';
-import 'dart:typed_data';
-import 'package:flutter_secure_storage/flutter_secure_storage.dart';
-
-class FlutterSecureStorageCallbacks {
-  final FlutterSecureStorage _storage;
-
-  FlutterSecureStorageCallbacks({
-    FlutterSecureStorage? storage,
-  }) : _storage = storage ?? const FlutterSecureStorage(
-          aOptions: AndroidOptions(encryptedSharedPreferences: true),
-          iOptions: IOSOptions(
-            accessibility: KeychainAccessibility.first_unlock_this_device,
-            synchronizable: false,
-          ),
-        );
-
-  Future<Uint8List?> get(String key) async {
-    final encoded = await _storage.read(key: key);
-    if (encoded == null) return null;
-    return base64Decode(encoded);
-  }
-
-  Future<void> set(String key, Uint8List value) async {
-    await _storage.write(key: key, value: base64Encode(value));
-  }
-
-  Future<void> delete(String key) async {
-    await _storage.delete(key: key);
-  }
-}
-```
+| Platform | Store | Initialization |
+|----------|-------|----------------|
+| macOS | `apple-native-keyring-store` | Automatic |
+| iOS | `apple-native-keyring-store` | Automatic |
+| Windows | `windows-native-keyring-store` | Automatic |
+| Linux | `linux-keyutils-keyring-store` | Automatic |
+| Android (native) | `android-native-keyring-store` | Kotlin init required |
+| Flutter (Android) | `android-native-keyring-store` | Kotlin init required |
+| Flutter (iOS) | `apple-native-keyring-store` | Automatic |
 
 ### `whitenoise-rs` Usage (Sketch)
-
-Use a stable `db_key_id` (not derived from a file path), and reuse the same provider for other secrets (e.g., Nostr keys):
 
 ```rust
 // In whitenoise-rs (sketch)
 
-use mdk_secure_storage::{SecureStorageProvider, SecureStorageProviderExt};
+use keyring_core::Entry;
 
-fn open_mdk(db_path: &Path, storage: &dyn SecureStorageProvider) -> Result<MDK<MdkSqliteStorage>, Error> {
-    let db_key_id = "mdk.db.key.whitenoise.default";
-    let mdk_storage = MdkSqliteStorage::new(db_path, db_key_id, storage)?;
+fn open_mdk(db_path: &Path) -> Result<MDK<MdkSqliteStorage>, Error> {
+    // keyring-core store must be initialized before this call
+    let service_id = "com.whitenoise.app";
+    let mdk_storage = MdkSqliteStorage::new(db_path, service_id, "mdk.db.key.default")?;
     Ok(MDK::new(mdk_storage))
 }
 
-fn get_or_create_nostr_key(storage: &dyn SecureStorageProvider) -> Result<Vec<u8>, Error> {
-    Ok(storage.get_or_create_key("nostr.secret_key.default", 32)?)
+fn get_or_create_nostr_key() -> Result<Vec<u8>, Error> {
+    let service_id = "com.whitenoise.app";
+    let entry = Entry::new(service_id, "nostr.secret_key.default")?;
+
+    match entry.get_secret() {
+        Ok(secret) => return Ok(secret),
+        Err(keyring_core::Error::NoEntry) => {
+            // Generate new key
+            let mut key = vec![0u8; 32];
+            getrandom::getrandom(&mut key)?;
+            entry.set_secret(&key)?;
+            Ok(key)
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 ```
 
+### Flutter Integration
+
+Flutter apps use the native keyring stores directly:
+
+- **iOS**: `apple-native-keyring-store` works automatically
+- **Android**: `android-native-keyring-store` with Kotlin initialization in `MainActivity.kt`
+
+This is simpler than a callback-based approach and uses the same secure storage mechanisms.
+
 ### Downstream Tasks (whitenoise / Flutter)
 
-- [ ] Implement `SecureStorageCallbacks` in the host layer for iOS and Android
-- [ ] Provide a Dart/Flutter callback implementation using `flutter_secure_storage` (if needed)
-- [ ] Replace any Android file-obfuscation key storage with secure storage callbacks
-- [ ] Update `whitenoise-rs` to pass a stable `db_key_id` to MDK
+- [ ] Update `whitenoise-rs` to use `keyring-core` instead of `keyring` v3
+- [ ] Add platform-specific store initialization for Android (including Flutter)
+- [ ] Test on all platforms (macOS, iOS, Windows, Linux, Android)
+- [ ] Replace any Android file-obfuscation key storage with `android-native-keyring-store`
