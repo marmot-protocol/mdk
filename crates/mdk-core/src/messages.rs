@@ -715,6 +715,43 @@ where
         }
     }
 
+    /// Saves a failed processed message record to prevent reprocessing
+    ///
+    /// This private helper method persists a `ProcessedMessage` with `Failed` state
+    /// to the storage, allowing the system to skip reprocessing of invalid events.
+    ///
+    /// # Arguments
+    ///
+    /// * `event_id` - The ID of the wrapper event that failed
+    /// * `failure_reason` - A description of why processing failed
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(())` - If the failed record was saved successfully
+    /// * `Err(Error)` - If saving the record fails
+    fn save_failed_processed_message(&self, event_id: EventId, failure_reason: &str) -> Result<()> {
+        let processed_message = message_types::ProcessedMessage {
+            wrapper_event_id: event_id,
+            message_event_id: None,
+            processed_at: Timestamp::now(),
+            state: message_types::ProcessedMessageState::Failed,
+            failure_reason: Some(failure_reason.to_string()),
+        };
+
+        self.storage()
+            .save_processed_message(processed_message)
+            .map_err(|e| Error::Message(e.to_string()))?;
+
+        tracing::debug!(
+            target: "mdk_core::messages::save_failed_processed_message",
+            "Saved failed processing record for event {}: {}",
+            event_id,
+            failure_reason
+        );
+
+        Ok(())
+    }
+
     /// Handles message processing errors with specific error recovery logic
     ///
     /// This private method handles complex error scenarios when message processing fails,
@@ -1013,10 +1050,14 @@ where
     ///
     /// This is the main entry point for processing received messages. The function orchestrates
     /// the message processing workflow by delegating to specialized private methods:
+    /// 0. Checks if the message was already processed (deduplication)
     /// 1. Validates the event and extracts group ID
     /// 2. Loads the group and decrypts the message content
     /// 3. Processes the decrypted message based on its type
     /// 4. Handles errors with specialized recovery logic
+    ///
+    /// Early validation and decryption failures are persisted to prevent expensive reprocessing
+    /// of the same invalid events.
     ///
     /// # Arguments
     ///
@@ -1027,12 +1068,52 @@ where
     /// * `Ok(MessageProcessingResult)` - Result indicating the type of message processed
     /// * `Err(Error)` - If message processing fails
     pub fn process_message(&self, event: &Event) -> Result<MessageProcessingResult> {
+        // Step 0: Check if already processed (deduplication)
+        if let Some(processed) = self
+            .storage()
+            .find_processed_message_by_event_id(&event.id)
+            .map_err(|e| Error::Message(e.to_string()))?
+        {
+            tracing::debug!(
+                target: "mdk_core::messages::process_message",
+                "Message already processed with state: {:?}",
+                processed.state
+            );
+
+            // Only block reprocessing for Failed state
+            // Other states (Created, Processed, ProcessedCommit) should continue
+            // to allow normal message flow (e.g., processing own messages from relay)
+            if processed.state == message_types::ProcessedMessageState::Failed {
+                return Err(Error::Message(format!(
+                    "Message previously failed: {}",
+                    processed
+                        .failure_reason
+                        .unwrap_or_else(|| "Unknown reason".to_string())
+                )));
+            }
+        }
+
         // Step 1: Validate event and extract group ID
-        let nostr_group_id = self.validate_event_and_extract_group_id(event)?;
+        let nostr_group_id = match self.validate_event_and_extract_group_id(event) {
+            Ok(id) => id,
+            Err(e) => {
+                // Save failed processing record to prevent reprocessing
+                self.save_failed_processed_message(event.id, &format!("Validation failed: {}", e))?;
+                return Err(e);
+            }
+        };
 
         // Step 2: Load group and decrypt message
-        let (group, mut mls_group, message_bytes) =
-            self.load_group_and_decrypt_message(nostr_group_id, event)?;
+        let (group, mut mls_group, message_bytes) = match self
+            .load_group_and_decrypt_message(nostr_group_id, event)
+        {
+            Ok(result) => result,
+            Err(e) => {
+                // Save failed processing record to prevent reprocessing
+                self.save_failed_processed_message(event.id, &format!("Decryption failed: {}", e))?;
+                return Err(e);
+            }
+        };
 
         // Step 3: Process the decrypted message
         match self.process_decrypted_message(group.clone(), &mut mls_group, &message_bytes, event) {
