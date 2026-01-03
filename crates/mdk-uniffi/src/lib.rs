@@ -253,7 +253,7 @@ impl Mdk {
         let group_id = parse_group_id(&mls_group_id)?;
         Ok(self
             .lock()?
-            .get_messages(&group_id)?
+            .get_messages(&group_id, None)?
             .into_iter()
             .map(Message::from)
             .collect())

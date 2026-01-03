@@ -27,13 +27,16 @@
 
 ### Breaking changes
 
+- **BREAKING**: Changed `get_messages()` signature to accept `Option<Pagination>` parameter. Callers must now pass `None` for default pagination or `Some(Pagination::new(...))` for custom pagination ([#111](https://github.com/marmot-protocol/mdk/pull/111))
+
 ### Changed
 
 ### Added
 
 - New error variant `AuthorMismatch` for message author verification failures ([#40](https://github.com/marmot-protocol/mdk/pull/40))
 - New error variant `KeyPackageIdentityMismatch` for KeyPackage credential identity validation failures ([#41](https://github.com/marmot-protocol/mdk/pull/41))
-- Added `get_messages_paginated()` public API method for paginated retrieval of group messages ([#111](https://github.com/marmot-protocol/mdk/pull/111))
+- Added pagination support to `get_messages()` public API - accepts `Option<Pagination>` to control limit and offset for message retrieval ([#111](https://github.com/marmot-protocol/mdk/pull/111))
+- Exposed `Pagination` struct (from `mdk_storage_traits::groups`) in public API for paginated message queries ([#111](https://github.com/marmot-protocol/mdk/pull/111))
 
 ### Fixed
 
