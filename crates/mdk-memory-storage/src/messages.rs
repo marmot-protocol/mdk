@@ -1,5 +1,6 @@
 //! Memory-based storage implementation of the MdkStorageProvider trait for Nostr MLS messages
 
+use mdk_storage_traits::groups::GroupStorage;
 use mdk_storage_traits::messages::MessageStorage;
 use mdk_storage_traits::messages::error::MessageError;
 use mdk_storage_traits::messages::types::*;
@@ -9,6 +10,25 @@ use crate::MdkMemoryStorage;
 
 impl MessageStorage for MdkMemoryStorage {
     fn save_message(&self, message: Message) -> Result<(), MessageError> {
+        // Verify that the group exists before saving the message
+        match self.find_group_by_mls_group_id(&message.mls_group_id) {
+            Ok(Some(_)) => {
+                // Group exists, proceed with saving
+            }
+            Ok(None) => {
+                return Err(MessageError::InvalidParameters(format!(
+                    "Group with MLS ID {:?} not found",
+                    message.mls_group_id
+                )));
+            }
+            Err(e) => {
+                return Err(MessageError::InvalidParameters(format!(
+                    "Failed to verify group existence: {}",
+                    e
+                )));
+            }
+        }
+
         // Save in the messages cache
         let mut cache = self.messages_cache.write();
         cache.put(message.id, message.clone());
@@ -29,7 +49,7 @@ impl MessageStorage for MdkMemoryStorage {
                     }
                 }
             }
-            // Not found, insert new
+            // Not found, insert new (group exists, verified above)
             None => {
                 group_cache.put(message.mls_group_id.clone(), vec![message]);
             }
