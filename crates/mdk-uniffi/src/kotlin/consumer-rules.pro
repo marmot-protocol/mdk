@@ -6,8 +6,3 @@
 -keep class com.sun.jna.** { *; }
 -keep class * extends com.sun.jna.** { *; }
 -keep class build.marmot.mdk.** { *; }
-
-# Ensure JNA native libraries are kept if minified
--keepresourcexmlelements **
--keepresources string/**
-

@@ -40,7 +40,8 @@
 
 ### Fixed
 
-- **Security (Audit Issue AB)**: Added size limits to prevent disk and CPU exhaustion from unbounded user input ([#94](https://github.com/marmot-protocol/mdk/pull/94))
+- Propagate `last_message_id` parse errors in `row_to_group` instead of silently converting to `None` ([#105](https://github.com/marmot-protocol/mdk/pull/105))
+- Added size limits to prevent disk and CPU exhaustion from unbounded user input ([#94](https://github.com/marmot-protocol/mdk/pull/94))
 
 ### Removed
 

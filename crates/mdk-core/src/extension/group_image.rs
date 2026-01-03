@@ -190,11 +190,16 @@ fn encrypt_group_image(image_data: &[u8]) -> Result<GroupImageEncrypted, GroupIm
 /// Decrypts the encrypted blob using ChaCha20-Poly1305 AEAD. The auth tag
 /// automatically verifies integrity - if tampering occurred, decryption will fail.
 ///
+/// **SECURITY**: Verifies that the encrypted blob hash matches the expected hash before
+/// decryption to prevent storage-level blob substitution attacks. If `expected_hash` is `None`,
+/// hash verification is skipped (for backward compatibility with old extensions), but this is deprecated and MUST be avoided at all costs.
+///
 /// Supports both v1 (image_key is the encryption key directly) and v2 (image_key is a seed
 /// that needs to be derived using HKDF) formats for backward compatibility.
 ///
 /// # Arguments
 /// * `encrypted_data` - Encrypted blob downloaded from Blossom
+/// * `expected_hash` - SHA256 hash of the encrypted data (from group extension), or `None` for legacy images
 /// * `image_key` - Encryption key (v1) or seed (v2) from group extension
 /// * `image_nonce` - Encryption nonce from group extension
 ///
@@ -202,6 +207,7 @@ fn encrypt_group_image(image_data: &[u8]) -> Result<GroupImageEncrypted, GroupIm
 /// * Decrypted image bytes
 ///
 /// # Errors
+/// * `HashVerificationFailed` - If the encrypted blob hash doesn't match the expected hash
 /// * `DecryptionFailed` - If auth tag verification fails (tampering detected)
 ///
 /// # Example
@@ -209,14 +215,41 @@ fn encrypt_group_image(image_data: &[u8]) -> Result<GroupImageEncrypted, GroupIm
 /// let extension = mdk.get_group_extension(&group_id)?;
 /// if let Some(info) = extension.group_image_encryption_data() {
 ///     let encrypted_blob = download_from_blossom(&info.image_hash).await?;
-///     let image = decrypt_group_image(&encrypted_blob, &info.image_key, &info.image_nonce)?;
+///     let image = decrypt_group_image(
+///         &encrypted_blob,
+///         Some(&info.image_hash),
+///         &info.image_key,
+///         &info.image_nonce
+///     )?;
 /// }
 /// ```
 pub fn decrypt_group_image(
     encrypted_data: &[u8],
+    expected_hash: Option<&[u8; 32]>,
     image_key: &[u8; 32],
     image_nonce: &[u8; 12],
 ) -> Result<Vec<u8>, GroupImageError> {
+    // Verify hash of encrypted data before decryption to prevent storage-level substitution
+    match expected_hash {
+        Some(expected_hash) => {
+            let calculated_hash: [u8; 32] = Sha256::digest(encrypted_data).into();
+            if calculated_hash != *expected_hash {
+                return Err(GroupImageError::HashVerificationFailed {
+                    expected: hex::encode(expected_hash),
+                    actual: hex::encode(calculated_hash),
+                });
+            }
+        }
+        None => {
+            // Legacy support: skip hash verification for old extensions without hash
+            // This is deprecated - all new images should have hash verification
+            tracing::warn!(
+                target: "mdk_core::extension::group_image",
+                "Decrypting group image without hash verification (legacy mode). This is deprecated and insecure. Please update the extension to include image_hash."
+            );
+        }
+    }
+
     // Try v2 first: treat image_key as seed and derive encryption key
     let hk = Hkdf::<Sha256>::new(None, image_key);
     let mut derived_key = [0u8; 32];
@@ -504,6 +537,7 @@ pub fn prepare_group_image_for_upload_with_options(
 ///
 /// # Arguments
 /// * `encrypted_v1_data` - The encrypted image data from Blossom (v1 format)
+/// * `v1_image_hash` - SHA256 hash of the v1 encrypted data (from v1 extension), or `None` for legacy images
 /// * `v1_image_key` - The v1 encryption key (32 bytes, used directly)
 /// * `v1_image_nonce` - The v1 encryption nonce (12 bytes)
 /// * `mime_type` - MIME type of the image (e.g., "image/jpeg", "image/png")
@@ -512,6 +546,7 @@ pub fn prepare_group_image_for_upload_with_options(
 /// * `GroupImageUpload` with v2 format encryption (seed stored in image_key field)
 ///
 /// # Errors
+/// * `HashVerificationFailed` - If the v1 encrypted blob hash doesn't match the expected hash
 /// * `DecryptionFailed` - If v1 decryption fails
 /// * `EncryptionFailed` - If v2 encryption fails
 /// * `KeypairDerivationFailed` - If upload keypair derivation fails
@@ -519,11 +554,12 @@ pub fn prepare_group_image_for_upload_with_options(
 /// # Example
 /// ```ignore
 /// // Download encrypted v1 image from Blossom
-/// let encrypted_v1 = download_from_blossom(&v1_extension.image_hash).await?;
+/// let encrypted_v1 = download_from_blossom(&v1_extension.image_hash.unwrap()).await?;
 ///
-/// // Migrate to v2 format
+/// // Migrate to v2 format (with hash if available)
 /// let v2_prepared = migrate_group_image_v1_to_v2(
 ///     &encrypted_v1,
+///     v1_extension.image_hash.as_ref(),
 ///     &v1_extension.image_key.unwrap(),
 ///     &v1_extension.image_nonce.unwrap(),
 ///     "image/jpeg"
@@ -552,11 +588,17 @@ pub fn prepare_group_image_for_upload_with_options(
 /// ```
 pub fn migrate_group_image_v1_to_v2(
     encrypted_v1_data: &[u8],
+    v1_image_hash: Option<&[u8; 32]>,
     v1_image_key: &[u8; 32],
     v1_image_nonce: &[u8; 12],
     mime_type: &str,
 ) -> Result<GroupImageUpload, GroupImageError> {
-    let decrypted_data = decrypt_group_image(encrypted_v1_data, v1_image_key, v1_image_nonce)?;
+    let decrypted_data = decrypt_group_image(
+        encrypted_v1_data,
+        v1_image_hash,
+        v1_image_key,
+        v1_image_nonce,
+    )?;
 
     // Re-encrypt using v2 format (which generates a seed and derives the encryption key)
     prepare_group_image_for_upload(&decrypted_data, mime_type)
@@ -578,6 +620,7 @@ mod tests {
         // Decrypt
         let decrypted = decrypt_group_image(
             &encrypted.encrypted_data,
+            Some(&encrypted.encrypted_hash),
             &encrypted.image_key,
             &encrypted.image_nonce,
         )
@@ -594,6 +637,7 @@ mod tests {
         let wrong_key = [0x42u8; 32];
         let result = decrypt_group_image(
             &encrypted.encrypted_data,
+            Some(&encrypted.encrypted_hash),
             &wrong_key,
             &encrypted.image_nonce,
         );
@@ -613,6 +657,7 @@ mod tests {
         let wrong_nonce = [0x24u8; 12];
         let result = decrypt_group_image(
             &encrypted.encrypted_data,
+            Some(&encrypted.encrypted_hash),
             &encrypted.image_key,
             &wrong_nonce,
         );
@@ -697,6 +742,7 @@ mod tests {
         // Verify we can decrypt
         let decrypted = decrypt_group_image(
             &prepared.encrypted_data,
+            Some(&prepared.encrypted_hash),
             &prepared.image_key,
             &prepared.image_nonce,
         )
@@ -731,13 +777,105 @@ mod tests {
         let mut tampered = encrypted.encrypted_data.clone();
         tampered[0] ^= 0xFF;
 
-        // Decryption should fail
-        let result = decrypt_group_image(&tampered, &encrypted.image_key, &encrypted.image_nonce);
+        // Decryption should fail due to hash mismatch (hash verification happens before decryption)
+        let result = decrypt_group_image(
+            &tampered,
+            Some(&encrypted.encrypted_hash),
+            &encrypted.image_key,
+            &encrypted.image_nonce,
+        );
         assert!(result.is_err());
         assert!(matches!(
             result,
-            Err(GroupImageError::DecryptionFailed { .. })
+            Err(GroupImageError::HashVerificationFailed { .. })
         ));
+    }
+
+    #[test]
+    fn test_hash_verification_success() {
+        let original_data = b"Test hash verification";
+        let encrypted = encrypt_group_image(original_data).unwrap();
+
+        // Decryption should succeed with correct hash
+        let result = decrypt_group_image(
+            &encrypted.encrypted_data,
+            Some(&encrypted.encrypted_hash),
+            &encrypted.image_key,
+            &encrypted.image_nonce,
+        );
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().as_slice(), original_data);
+    }
+
+    #[test]
+    fn test_hash_verification_failure_wrong_hash() {
+        let original_data = b"Test hash verification failure";
+        let encrypted = encrypt_group_image(original_data).unwrap();
+
+        // Use wrong hash
+        let wrong_hash = [0xFFu8; 32];
+
+        // Decryption should fail due to hash mismatch
+        let result = decrypt_group_image(
+            &encrypted.encrypted_data,
+            Some(&wrong_hash),
+            &encrypted.image_key,
+            &encrypted.image_nonce,
+        );
+
+        assert!(result.is_err());
+        assert!(matches!(
+            result,
+            Err(GroupImageError::HashVerificationFailed { .. })
+        ));
+    }
+
+    #[test]
+    fn test_hash_verification_failure_wrong_blob() {
+        let original_data = b"Test hash verification with wrong blob";
+        let encrypted = encrypt_group_image(original_data).unwrap();
+
+        // Create a different encrypted blob (encrypted with different key)
+        let mut rng = OsRng;
+        let mut different_key = [0u8; 32];
+        rng.fill_bytes(&mut different_key);
+        let different_nonce = [0x42u8; 12];
+        let cipher = ChaCha20Poly1305::new_from_slice(&different_key).unwrap();
+        let nonce = Nonce::from_slice(&different_nonce);
+        let different_blob = cipher.encrypt(nonce, b"Different data".as_ref()).unwrap();
+
+        // Try to decrypt different blob with original hash - should fail hash verification
+        let result = decrypt_group_image(
+            &different_blob,
+            Some(&encrypted.encrypted_hash),
+            &encrypted.image_key,
+            &encrypted.image_nonce,
+        );
+
+        assert!(result.is_err());
+        assert!(matches!(
+            result,
+            Err(GroupImageError::HashVerificationFailed { .. })
+        ));
+    }
+
+    #[test]
+    fn test_hash_verification_backward_compatibility_none() {
+        let original_data = b"Test backward compatibility without hash";
+        let encrypted = encrypt_group_image(original_data).unwrap();
+
+        // Decryption should succeed without hash verification (legacy mode)
+        // This tests backward compatibility for old extensions without image_hash
+        let result = decrypt_group_image(
+            &encrypted.encrypted_data,
+            None,
+            &encrypted.image_key,
+            &encrypted.image_nonce,
+        );
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().as_slice(), original_data);
     }
 
     #[test]
@@ -895,6 +1033,7 @@ mod tests {
         // Verify we can decrypt using v2 (seed derivation)
         let decrypted = decrypt_group_image(
             &encrypted.encrypted_data,
+            Some(&encrypted.encrypted_hash),
             &encrypted.image_key,
             &encrypted.image_nonce,
         )
@@ -935,8 +1074,17 @@ mod tests {
         let nonce = Nonce::from_slice(&image_nonce);
         let encrypted_data = cipher.encrypt(nonce, original_data.as_ref()).unwrap();
 
+        // Calculate hash of encrypted data for verification
+        let encrypted_hash: [u8; 32] = Sha256::digest(&encrypted_data).into();
+
         // Verify we can decrypt using v1 format (fallback)
-        let decrypted = decrypt_group_image(&encrypted_data, &image_key_v1, &image_nonce).unwrap();
+        let decrypted = decrypt_group_image(
+            &encrypted_data,
+            Some(&encrypted_hash),
+            &image_key_v1,
+            &image_nonce,
+        )
+        .unwrap();
         assert_eq!(decrypted.as_slice(), original_data);
     }
 
@@ -1096,9 +1244,13 @@ mod tests {
         let nonce = Nonce::from_slice(&v1_image_nonce);
         let encrypted_v1_data = cipher.encrypt(nonce, original_data.as_ref()).unwrap();
 
+        // Calculate hash of v1 encrypted data
+        let v1_image_hash: [u8; 32] = Sha256::digest(&encrypted_v1_data).into();
+
         // Migrate to v2 format
         let v2_prepared = migrate_group_image_v1_to_v2(
             &encrypted_v1_data,
+            Some(&v1_image_hash),
             &v1_image_key,
             &v1_image_nonce,
             "image/png",
@@ -1111,6 +1263,7 @@ mod tests {
         // Verify we can decrypt v2 data using the seed
         let decrypted_v2 = decrypt_group_image(
             &v2_prepared.encrypted_data,
+            Some(&v2_prepared.encrypted_hash),
             &v2_prepared.image_key, // This is the seed in v2
             &v2_prepared.image_nonce,
         )
@@ -1158,9 +1311,18 @@ mod tests {
         let nonce = Nonce::from_slice(&v1_nonce);
         let encrypted = cipher.encrypt(nonce, original_data.as_ref()).unwrap();
 
+        // Calculate hash of encrypted data
+        let encrypted_hash: [u8; 32] = Sha256::digest(&encrypted).into();
+
         // Try to migrate with wrong key
         let wrong_key = [0xFFu8; 32];
-        let result = migrate_group_image_v1_to_v2(&encrypted, &wrong_key, &v1_nonce, "image/png");
+        let result = migrate_group_image_v1_to_v2(
+            &encrypted,
+            Some(&encrypted_hash),
+            &wrong_key,
+            &v1_nonce,
+            "image/png",
+        );
 
         assert!(result.is_err());
         assert!(matches!(
@@ -1180,8 +1342,16 @@ mod tests {
 
         // Corrupted encrypted data
         let corrupted_data = vec![0xFFu8; 100];
+        // Calculate hash of corrupted data (will fail hash verification)
+        let corrupted_hash: [u8; 32] = Sha256::digest(&corrupted_data).into();
 
-        let result = migrate_group_image_v1_to_v2(&corrupted_data, &v1_key, &v1_nonce, "image/png");
+        let result = migrate_group_image_v1_to_v2(
+            &corrupted_data,
+            Some(&corrupted_hash),
+            &v1_key,
+            &v1_nonce,
+            "image/png",
+        );
 
         assert!(result.is_err());
         assert!(matches!(
@@ -1216,9 +1386,18 @@ mod tests {
         let nonce_v1 = Nonce::from_slice(&v1_nonce);
         let encrypted_v1 = cipher_v1.encrypt(nonce_v1, image_data.as_ref()).unwrap();
 
+        // Calculate hash of v1 encrypted data
+        let v1_hash: [u8; 32] = Sha256::digest(&encrypted_v1).into();
+
         // Migrate to v2
-        let v2_prepared =
-            migrate_group_image_v1_to_v2(&encrypted_v1, &v1_key, &v1_nonce, "image/png").unwrap();
+        let v2_prepared = migrate_group_image_v1_to_v2(
+            &encrypted_v1,
+            Some(&v1_hash),
+            &v1_key,
+            &v1_nonce,
+            "image/png",
+        )
+        .unwrap();
 
         // Verify encrypted data is different (even though source is same)
         assert_ne!(encrypted_v1, v2_prepared.encrypted_data);
@@ -1254,9 +1433,18 @@ mod tests {
         let nonce = Nonce::from_slice(&v1_nonce);
         let encrypted_v1 = cipher.encrypt(nonce, image_data.as_ref()).unwrap();
 
+        // Calculate hash of v1 encrypted data
+        let v1_hash: [u8; 32] = Sha256::digest(&encrypted_v1).into();
+
         // Migrate to v2
-        let v2_prepared =
-            migrate_group_image_v1_to_v2(&encrypted_v1, &v1_key, &v1_nonce, "image/png").unwrap();
+        let v2_prepared = migrate_group_image_v1_to_v2(
+            &encrypted_v1,
+            Some(&v1_hash),
+            &v1_key,
+            &v1_nonce,
+            "image/png",
+        )
+        .unwrap();
 
         // Verify metadata is preserved
         assert_eq!(v2_prepared.mime_type, "image/png");
@@ -1323,18 +1511,29 @@ mod tests {
         let nonce = Nonce::from_slice(&v1_nonce);
         let encrypted_v1 = cipher.encrypt(nonce, image_data.as_ref()).unwrap();
 
+        // Calculate hash of v1 encrypted data
+        let v1_hash: [u8; 32] = Sha256::digest(&encrypted_v1).into();
+
         // Migrate to v2
-        let v2_prepared =
-            migrate_group_image_v1_to_v2(&encrypted_v1, &v1_key, &v1_nonce, "image/png").unwrap();
+        let v2_prepared = migrate_group_image_v1_to_v2(
+            &encrypted_v1,
+            Some(&v1_hash),
+            &v1_key,
+            &v1_nonce,
+            "image/png",
+        )
+        .unwrap();
 
         // Verify we can still decrypt original v1 data
-        let decrypted_v1 = decrypt_group_image(&encrypted_v1, &v1_key, &v1_nonce).unwrap();
+        let decrypted_v1 =
+            decrypt_group_image(&encrypted_v1, Some(&v1_hash), &v1_key, &v1_nonce).unwrap();
 
         assert_eq!(decrypted_v1, image_data);
 
         // Verify v2 data decrypts correctly too
         let decrypted_v2 = decrypt_group_image(
             &v2_prepared.encrypted_data,
+            Some(&v2_prepared.encrypted_hash),
             &v2_prepared.image_key,
             &v2_prepared.image_nonce,
         )
