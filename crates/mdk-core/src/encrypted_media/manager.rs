@@ -133,13 +133,6 @@ where
             &reference.mime_type,
             &reference.filename,
         )?;
-        let nonce = derive_encryption_nonce(
-            self.mdk,
-            &self.group_id,
-            &reference.original_hash,
-            &reference.mime_type,
-            &reference.filename,
-        )?;
         let decrypted_data = decrypt_data_with_aad(
             encrypted_data,
             &encryption_key,
