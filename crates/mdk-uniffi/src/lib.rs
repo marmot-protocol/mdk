@@ -271,7 +271,7 @@ impl Mdk {
     pub fn get_pending_welcomes(&self) -> Result<Vec<Welcome>, MdkUniffiError> {
         Ok(self
             .lock()?
-            .get_pending_welcomes()?
+            .get_pending_welcomes(None)?
             .into_iter()
             .map(Welcome::from)
             .collect())
@@ -295,7 +295,7 @@ impl Mdk {
         let pagination = Pagination::new(limit.map(|l| l as usize), offset.map(|o| o as usize));
         Ok(self
             .lock()?
-            .get_pending_welcomes_paginated(Some(pagination))?
+            .get_pending_welcomes(Some(pagination))?
             .into_iter()
             .map(Welcome::from)
             .collect())

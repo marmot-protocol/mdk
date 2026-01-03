@@ -2056,7 +2056,7 @@ mod tests {
             .process_welcome(&nostr::EventId::all_zeros(), welcome)
             .expect("Failed to process welcome");
         let pending_welcomes = bob_mdk
-            .get_pending_welcomes()
+            .get_pending_welcomes(None)
             .expect("Failed to get pending welcomes");
         assert!(
             !pending_welcomes.is_empty(),

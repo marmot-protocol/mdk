@@ -27,13 +27,16 @@
 
 ### Breaking changes
 
+- **BREAKING**: Changed `get_pending_welcomes()` to accept `Option<Pagination>` parameter for pagination support. Existing calls should pass `None` for default pagination. ([#110](https://github.com/marmot-protocol/mdk/pull/110))
+
 ### Changed
 
 ### Added
 
 - New error variant `AuthorMismatch` for message author verification failures ([#40](https://github.com/marmot-protocol/mdk/pull/40))
 - New error variant `KeyPackageIdentityMismatch` for KeyPackage credential identity validation failures ([#41](https://github.com/marmot-protocol/mdk/pull/41))
-- Added `get_pending_welcomes_paginated()` public API method for paginated retrieval of pending welcomes ([#110](https://github.com/marmot-protocol/mdk/pull/110))
+- Added pagination support to `get_pending_welcomes()` public API - accepts `Option<Pagination>` to control limit and offset for welcome retrieval ([#110](https://github.com/marmot-protocol/mdk/pull/110))
+- Exposed `Pagination` struct (from `mdk_storage_traits::welcomes`) in public API for paginated welcome queries ([#110](https://github.com/marmot-protocol/mdk/pull/110))
 
 ### Fixed
 
