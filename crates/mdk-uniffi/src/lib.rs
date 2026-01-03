@@ -1053,9 +1053,18 @@ pub fn prepare_group_image_for_upload(
 #[uniffi::export]
 pub fn decrypt_group_image(
     encrypted_data: Vec<u8>,
+    expected_hash: Option<Vec<u8>>,
     image_key: Vec<u8>,
     image_nonce: Vec<u8>,
 ) -> Result<Vec<u8>, MdkUniffiError> {
+    let hash_arr_opt: Option<[u8; 32]> = expected_hash
+        .map(|hash| {
+            hash.try_into().map_err(|_| {
+                MdkUniffiError::InvalidInput("Expected hash must be 32 bytes".to_string())
+            })
+        })
+        .transpose()?;
+
     let key_arr: [u8; 32] = image_key
         .try_into()
         .map_err(|_| MdkUniffiError::InvalidInput("Image key must be 32 bytes".to_string()))?;
@@ -1064,7 +1073,7 @@ pub fn decrypt_group_image(
         .try_into()
         .map_err(|_| MdkUniffiError::InvalidInput("Image nonce must be 12 bytes".to_string()))?;
 
-    core_decrypt_group_image(&encrypted_data, &key_arr, &nonce_arr)
+    core_decrypt_group_image(&encrypted_data, hash_arr_opt.as_ref(), &key_arr, &nonce_arr)
         .map_err(|e| MdkUniffiError::Mdk(e.to_string()))
 }
 
