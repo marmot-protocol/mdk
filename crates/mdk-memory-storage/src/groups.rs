@@ -3,9 +3,9 @@
 use std::collections::BTreeSet;
 
 use mdk_storage_traits::GroupId;
-use mdk_storage_traits::groups::GroupStorage;
 use mdk_storage_traits::groups::error::{GroupError, InvalidGroupState};
 use mdk_storage_traits::groups::types::*;
+use mdk_storage_traits::groups::{GroupStorage, MAX_MESSAGE_LIMIT, Pagination};
 use mdk_storage_traits::messages::types::Message;
 use nostr::{PublicKey, RelayUrl};
 
@@ -51,36 +51,20 @@ impl GroupStorage for MdkMemoryStorage {
         Ok(cache.peek(nostr_group_id).cloned())
     }
 
-    fn messages(&self, mls_group_id: &GroupId) -> Result<Vec<Message>, GroupError> {
-        // Use paginated version with default limit for backward compatibility
-        self.messages_paginated(
-            mls_group_id,
-            mdk_storage_traits::groups::DEFAULT_MESSAGE_LIMIT,
-            0,
-        )
-    }
-
-    fn messages_paginated(
+    fn messages(
         &self,
         mls_group_id: &GroupId,
-        limit: usize,
-        offset: usize,
+        pagination: Option<Pagination>,
     ) -> Result<Vec<Message>, GroupError> {
+        let pagination = pagination.unwrap_or_default();
+        let limit = pagination.limit();
+        let offset = pagination.offset();
+
         // Validate limit is within allowed range
-        if !(1..=mdk_storage_traits::groups::MAX_MESSAGE_LIMIT).contains(&limit) {
+        if !(1..=MAX_MESSAGE_LIMIT).contains(&limit) {
             return Err(GroupError::InvalidParameters(format!(
                 "Limit must be between 1 and {}, got {}",
-                mdk_storage_traits::groups::MAX_MESSAGE_LIMIT,
-                limit
-            )));
-        }
-
-        // Validate offset is reasonable
-        if offset > mdk_storage_traits::groups::MAX_MESSAGE_OFFSET {
-            return Err(GroupError::InvalidParameters(format!(
-                "Offset {} exceeds maximum allowed offset of {}",
-                offset,
-                mdk_storage_traits::groups::MAX_MESSAGE_OFFSET
+                MAX_MESSAGE_LIMIT, limit
             )));
         }
 
@@ -258,27 +242,35 @@ mod tests {
         }
 
         // Test 1: Get all messages with default limit
-        let all_messages = storage.messages(&mls_group_id).unwrap();
+        let all_messages = storage.messages(&mls_group_id, None).unwrap();
         assert_eq!(all_messages.len(), 25);
 
         // Test 2: Get first 10 messages
-        let page1 = storage.messages_paginated(&mls_group_id, 10, 0).unwrap();
+        let page1 = storage
+            .messages(&mls_group_id, Some(Pagination::new(Some(10), Some(0))))
+            .unwrap();
         assert_eq!(page1.len(), 10);
         // Should be newest first (highest timestamp)
         assert_eq!(page1[0].content, "Message 24");
 
         // Test 3: Get next 10 messages (offset 10)
-        let page2 = storage.messages_paginated(&mls_group_id, 10, 10).unwrap();
+        let page2 = storage
+            .messages(&mls_group_id, Some(Pagination::new(Some(10), Some(10))))
+            .unwrap();
         assert_eq!(page2.len(), 10);
         assert_eq!(page2[0].content, "Message 14");
 
         // Test 4: Get last 5 messages (offset 20)
-        let page3 = storage.messages_paginated(&mls_group_id, 10, 20).unwrap();
+        let page3 = storage
+            .messages(&mls_group_id, Some(Pagination::new(Some(10), Some(20))))
+            .unwrap();
         assert_eq!(page3.len(), 5);
         assert_eq!(page3[0].content, "Message 4");
 
         // Test 5: Offset beyond available messages returns empty
-        let beyond = storage.messages_paginated(&mls_group_id, 10, 30).unwrap();
+        let beyond = storage
+            .messages(&mls_group_id, Some(Pagination::new(Some(10), Some(30))))
+            .unwrap();
         assert_eq!(beyond.len(), 0);
 
         // Test 6: Verify no overlap between pages
@@ -298,7 +290,7 @@ mod tests {
         }
 
         // Test 8: Limit of 0 should return error
-        let result = storage.messages_paginated(&mls_group_id, 0, 0);
+        let result = storage.messages(&mls_group_id, Some(Pagination::new(Some(0), Some(0))));
         assert!(result.is_err());
         assert!(
             result
@@ -308,7 +300,7 @@ mod tests {
         );
 
         // Test 9: Limit exceeding MAX should return error
-        let result = storage.messages_paginated(&mls_group_id, 20000, 0);
+        let result = storage.messages(&mls_group_id, Some(Pagination::new(Some(20000), Some(0))));
         assert!(result.is_err());
         assert!(
             result
@@ -319,7 +311,7 @@ mod tests {
 
         // Test 10: Non-existent group returns error
         let fake_group_id = GroupId::from_slice(&[99, 99, 99, 99]);
-        let result = storage.messages_paginated(&fake_group_id, 10, 0);
+        let result = storage.messages(&fake_group_id, Some(Pagination::new(Some(10), Some(0))));
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("not found"));
 
@@ -341,17 +333,17 @@ mod tests {
         };
         storage.save_group(empty_group).unwrap();
 
-        let empty = storage.messages_paginated(&empty_group_id, 10, 0).unwrap();
+        let empty = storage
+            .messages(&empty_group_id, Some(Pagination::new(Some(10), Some(0))))
+            .unwrap();
         assert_eq!(empty.len(), 0);
 
-        // Test 12: Offset exceeding MAX should return error
-        let result = storage.messages_paginated(&mls_group_id, 10, 2_000_000);
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("exceeds maximum allowed offset")
+        // Test 12: Large offset should work (no MAX_OFFSET validation)
+        let result = storage.messages(
+            &mls_group_id,
+            Some(Pagination::new(Some(10), Some(2_000_000))),
         );
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().len(), 0); // No results at that offset
     }
 }

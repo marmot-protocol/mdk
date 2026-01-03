@@ -27,7 +27,11 @@
 
 ### Breaking changes
 
+- **BREAKING**: Updated `messages()` implementation to accept `Option<Pagination>` parameter ([#111](https://github.com/marmot-protocol/mdk/pull/111))
+
 ### Changed
+
+- Simplified validation logic to use range contains pattern for better readability ([#111](https://github.com/marmot-protocol/mdk/pull/111))
 
 ### Added
 
@@ -37,14 +41,16 @@
   - Group descriptions limited to 2000 bytes
   - JSON fields limited to 50-100KB
   - New `Validation` error variant for validation failures
-- Implemented `messages_paginated(group_id, limit, offset)` for paginated retrieval of group messages ([#111](https://github.com/marmot-protocol/mdk/pull/111))
+- Implemented pagination support using `Pagination` struct for group messages ([#111](https://github.com/marmot-protocol/mdk/pull/111))
 
 ### Fixed
 
 - **Security (Audit Issue AB)**: Added size limits to prevent disk and CPU exhaustion from unbounded user input ([#94](https://github.com/marmot-protocol/mdk/pull/94))
-- **Security (Audit Issue AC)**: Added pagination to prevent memory exhaustion from unbounded loading of group messages ([#111](https://github.com/marmot-protocol/mdk/pull/111))
+- **Security (Audit Issue Z)**: Added pagination to prevent memory exhaustion from unbounded loading of group messages ([#111](https://github.com/marmot-protocol/mdk/pull/111))
 
 ### Removed
+
+- Removed offset validation (MAX_MESSAGE_OFFSET) to allow legitimate large-scale use cases ([#111](https://github.com/marmot-protocol/mdk/pull/111))
 
 ### Deprecated
 

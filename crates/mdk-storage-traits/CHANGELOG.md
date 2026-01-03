@@ -27,18 +27,23 @@
 
 ### Breaking changes
 
+- **BREAKING**: Changed `GroupStorage::messages()` to accept `Option<Pagination>` parameter instead of having separate `messages()` and `messages_paginated()` methods ([#111](https://github.com/marmot-protocol/mdk/pull/111))
+- **BREAKING**: Removed `MAX_MESSAGE_OFFSET` constant - offset validation removed to allow legitimate large-scale use cases ([#111](https://github.com/marmot-protocol/mdk/pull/111))
+
 ### Changed
 
 ### Added
 
-- Added `messages_paginated(group_id, limit, offset)` method to `GroupStorage` trait for paginated retrieval of group messages ([#111](https://github.com/marmot-protocol/mdk/pull/111))
-- Added `DEFAULT_MESSAGE_LIMIT` and `MAX_MESSAGE_LIMIT` constants to prevent unbounded queries ([#111](https://github.com/marmot-protocol/mdk/pull/111))
+- Added `Pagination` struct with `limit` and `offset` fields for cleaner pagination API ([#111](https://github.com/marmot-protocol/mdk/pull/111))
+- Added `DEFAULT_MESSAGE_LIMIT` (1000) and `MAX_MESSAGE_LIMIT` (10,000) constants ([#111](https://github.com/marmot-protocol/mdk/pull/111))
 
 ### Fixed
 
-- **Security (Audit Issue AC)**: Added pagination to prevent memory exhaustion from unbounded loading of group messages ([#111](https://github.com/marmot-protocol/mdk/pull/111))
+- **Security (Audit Issue Z)**: Added pagination to prevent memory exhaustion from unbounded loading of group messages ([#111](https://github.com/marmot-protocol/mdk/pull/111))
 
 ### Removed
+
+- Removed `MAX_MESSAGE_OFFSET` constant ([#111](https://github.com/marmot-protocol/mdk/pull/111))
 
 ### Deprecated
 

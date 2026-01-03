@@ -12,6 +12,7 @@
 //! Message state is tracked to handle processing status and failure scenarios.
 
 use mdk_storage_traits::MdkStorageProvider;
+use mdk_storage_traits::groups::Pagination;
 use mdk_storage_traits::groups::types as group_types;
 use mdk_storage_traits::messages::types as message_types;
 use nostr::{Event, EventId, JsonUtil, Kind, TagKind, Timestamp, UnsignedEvent};
@@ -98,8 +99,40 @@ where
     /// * `Ok(Vec<Message>)` - List of all messages for the group
     /// * `Err(Error)` - If there is an error accessing storage
     pub fn get_messages(&self, mls_group_id: &GroupId) -> Result<Vec<message_types::Message>> {
+        self.get_messages_paginated(mls_group_id, None)
+    }
+
+    /// Gets messages for a group with pagination
+    ///
+    /// # Arguments
+    ///
+    /// * `mls_group_id` - The MLS group ID
+    /// * `pagination` - Optional pagination parameters. If `None`, uses default limit and offset.
+    ///
+    /// # Returns
+    ///
+    /// Returns a vector of messages ordered by created_at (descending)
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// // Get messages with default pagination
+    /// let messages = mdk.get_messages_paginated(&group_id, None)?;
+    ///
+    /// // Get first 100 messages
+    /// use mdk_storage_traits::groups::Pagination;
+    /// let messages = mdk.get_messages_paginated(&group_id, Some(Pagination::new(Some(100), Some(0))))?;
+    ///
+    /// // Get next 100 messages
+    /// let messages = mdk.get_messages_paginated(&group_id, Some(Pagination::new(Some(100), Some(100))))?;
+    /// ```
+    pub fn get_messages_paginated(
+        &self,
+        mls_group_id: &GroupId,
+        pagination: Option<Pagination>,
+    ) -> Result<Vec<message_types::Message>> {
         self.storage()
-            .messages(mls_group_id)
+            .messages(mls_group_id, pagination)
             .map_err(|e| Error::Message(e.to_string()))
     }
 
