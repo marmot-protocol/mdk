@@ -754,7 +754,7 @@ mod tests {
         assert_eq!(media_ref.mime_type, "image/png"); // Should be trimmed and lowercase
 
         // Test with various supported MIME types and case combinations
-        let test_cases = vec![
+        let test_cases = [
             ("video/MP4", "video/mp4"),
             ("Audio/MPEG", "audio/mpeg"),
             ("IMAGE/webp", "image/webp"),
@@ -777,7 +777,7 @@ mod tests {
 
             let media_ref = result.unwrap();
             assert_eq!(
-                media_ref.mime_type, expected_mime,
+                media_ref.mime_type, *expected_mime,
                 "MIME type canonicalization failed for input: {}",
                 input_mime
             );
