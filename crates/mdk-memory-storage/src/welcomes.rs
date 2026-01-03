@@ -1,8 +1,8 @@
 //! Memory-based storage implementation of the MdkStorageProvider trait for Nostr MLS welcomes
 
-use mdk_storage_traits::welcomes::WelcomeStorage;
 use mdk_storage_traits::welcomes::error::WelcomeError;
 use mdk_storage_traits::welcomes::types::*;
+use mdk_storage_traits::welcomes::{MAX_PENDING_WELCOMES_LIMIT, Pagination, WelcomeStorage};
 use nostr::EventId;
 
 use crate::MdkMemoryStorage;
@@ -15,26 +15,19 @@ impl WelcomeStorage for MdkMemoryStorage {
         Ok(())
     }
 
-    fn pending_welcomes_paginated(
+    fn pending_welcomes(
         &self,
-        limit: usize,
-        offset: usize,
+        pagination: Option<Pagination>,
     ) -> Result<Vec<Welcome>, WelcomeError> {
+        let pagination = pagination.unwrap_or_default();
+        let limit = pagination.limit();
+        let offset = pagination.offset();
+
         // Validate limit is within allowed range
-        if !(1..=mdk_storage_traits::welcomes::MAX_PENDING_WELCOMES_LIMIT).contains(&limit) {
+        if !(1..=MAX_PENDING_WELCOMES_LIMIT).contains(&limit) {
             return Err(WelcomeError::InvalidParameters(format!(
                 "Limit must be between 1 and {}, got {}",
-                mdk_storage_traits::welcomes::MAX_PENDING_WELCOMES_LIMIT,
-                limit
-            )));
-        }
-
-        // Validate offset is reasonable
-        if offset > mdk_storage_traits::welcomes::MAX_PENDING_WELCOMES_OFFSET {
-            return Err(WelcomeError::InvalidParameters(format!(
-                "Offset {} exceeds maximum allowed offset of {}",
-                offset,
-                mdk_storage_traits::welcomes::MAX_PENDING_WELCOMES_OFFSET
+                MAX_PENDING_WELCOMES_LIMIT, limit
             )));
         }
 
@@ -103,23 +96,31 @@ mod tests {
         }
 
         // Test 1: Get all pending welcomes (should use default limit)
-        let all_welcomes = storage.pending_welcomes().unwrap();
+        let all_welcomes = storage.pending_welcomes(None).unwrap();
         assert_eq!(all_welcomes.len(), 25);
 
         // Test 2: Get first 10 welcomes
-        let first_10 = storage.pending_welcomes_paginated(10, 0).unwrap();
+        let first_10 = storage
+            .pending_welcomes(Some(Pagination::new(Some(10), Some(0))))
+            .unwrap();
         assert_eq!(first_10.len(), 10);
 
         // Test 3: Get next 10 welcomes (offset 10)
-        let next_10 = storage.pending_welcomes_paginated(10, 10).unwrap();
+        let next_10 = storage
+            .pending_welcomes(Some(Pagination::new(Some(10), Some(10))))
+            .unwrap();
         assert_eq!(next_10.len(), 10);
 
         // Test 4: Get last 5 welcomes (offset 20)
-        let last_5 = storage.pending_welcomes_paginated(10, 20).unwrap();
+        let last_5 = storage
+            .pending_welcomes(Some(Pagination::new(Some(10), Some(20))))
+            .unwrap();
         assert_eq!(last_5.len(), 5);
 
         // Test 5: Offset beyond available welcomes returns empty
-        let beyond = storage.pending_welcomes_paginated(10, 30).unwrap();
+        let beyond = storage
+            .pending_welcomes(Some(Pagination::new(Some(10), Some(30))))
+            .unwrap();
         assert_eq!(beyond.len(), 0);
 
         // Test 6: Verify no overlap between pages
@@ -139,7 +140,7 @@ mod tests {
         }
 
         // Test 8: Limit of 0 should return error
-        let result = storage.pending_welcomes_paginated(0, 0);
+        let result = storage.pending_welcomes(Some(Pagination::new(Some(0), Some(0))));
         assert!(result.is_err());
         assert!(
             result
@@ -149,7 +150,7 @@ mod tests {
         );
 
         // Test 9: Limit exceeding MAX should return error
-        let result = storage.pending_welcomes_paginated(20000, 0);
+        let result = storage.pending_welcomes(Some(Pagination::new(Some(20000), Some(0))));
         assert!(result.is_err());
         assert!(
             result
@@ -158,19 +159,16 @@ mod tests {
                 .contains("must be between 1 and")
         );
 
-        // Test 10: Offset exceeding MAX should return error
-        let result = storage.pending_welcomes_paginated(10, 2_000_000);
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("exceeds maximum allowed offset")
-        );
+        // Test 10: Large offset should work (no MAX_OFFSET validation)
+        let result = storage.pending_welcomes(Some(Pagination::new(Some(10), Some(2_000_000))));
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().len(), 0); // No results at that offset
 
         // Test 11: Empty results when no pending entries
         let storage2 = MdkMemoryStorage::new(MemoryStorage::default());
-        let empty = storage2.pending_welcomes_paginated(10, 0).unwrap();
+        let empty = storage2
+            .pending_welcomes(Some(Pagination::new(Some(10), Some(0))))
+            .unwrap();
         assert_eq!(empty.len(), 0);
     }
 }

@@ -27,17 +27,23 @@
 
 ### Breaking changes
 
+- **BREAKING**: Changed `WelcomeStorage::pending_welcomes()` to accept `Option<Pagination>` parameter instead of having separate `pending_welcomes()` and `pending_welcomes_paginated()` methods ([#110](https://github.com/marmot-protocol/mdk/pull/110))
+- **BREAKING**: Removed `MAX_PENDING_WELCOMES_OFFSET` constant - offset validation removed to allow legitimate large-scale use cases ([#110](https://github.com/marmot-protocol/mdk/pull/110))
+
 ### Changed
 
 ### Added
 
-- Added `pending_welcomes_paginated(limit, offset)` method to `WelcomeStorage` trait for paginated retrieval of pending welcomes ([#110](https://github.com/marmot-protocol/mdk/pull/110))
+- Added `Pagination` struct with `limit` and `offset` fields for cleaner pagination API ([#110](https://github.com/marmot-protocol/mdk/pull/110))
+- Added `DEFAULT_PENDING_WELCOMES_LIMIT` (1000) and `MAX_PENDING_WELCOMES_LIMIT` (10,000) constants ([#110](https://github.com/marmot-protocol/mdk/pull/110))
 
 ### Fixed
 
 - **Security (Audit Issue AA)**: Added pagination to prevent memory exhaustion from unbounded loading of pending welcomes ([#110](https://github.com/marmot-protocol/mdk/pull/110))
 
 ### Removed
+
+- Removed `MAX_PENDING_WELCOMES_OFFSET` constant ([#110](https://github.com/marmot-protocol/mdk/pull/110))
 
 ### Deprecated
 

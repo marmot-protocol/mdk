@@ -41,7 +41,7 @@ where
     assert!(result.is_none());
 
     // Test pending welcomes
-    let pending = storage.pending_welcomes().unwrap();
+    let pending = storage.pending_welcomes(None).unwrap();
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].id, event_id);
 }

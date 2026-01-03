@@ -2,6 +2,7 @@
 
 use mdk_storage_traits::MdkStorageProvider;
 use mdk_storage_traits::groups::types as group_types;
+use mdk_storage_traits::welcomes::Pagination;
 use mdk_storage_traits::welcomes::types as welcome_types;
 use nostr::{EventId, Timestamp, UnsignedEvent};
 use openmls::prelude::*;
@@ -46,9 +47,39 @@ where
 
     /// Gets pending welcomes
     pub fn get_pending_welcomes(&self) -> Result<Vec<welcome_types::Welcome>, Error> {
+        self.get_pending_welcomes_paginated(None)
+    }
+
+    /// Gets pending welcomes with pagination
+    ///
+    /// # Arguments
+    ///
+    /// * `pagination` - Optional pagination parameters. If `None`, uses default limit and offset.
+    ///
+    /// # Returns
+    ///
+    /// Returns a vector of pending welcomes ordered by ID (descending)
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// // Get pending welcomes with default pagination
+    /// let welcomes = mdk.get_pending_welcomes_paginated(None)?;
+    ///
+    /// // Get first 10 pending welcomes
+    /// use mdk_storage_traits::welcomes::Pagination;
+    /// let welcomes = mdk.get_pending_welcomes_paginated(Some(Pagination::new(Some(10), Some(0))))?;
+    ///
+    /// // Get next 10 pending welcomes
+    /// let welcomes = mdk.get_pending_welcomes_paginated(Some(Pagination::new(Some(10), Some(10))))?;
+    /// ```
+    pub fn get_pending_welcomes_paginated(
+        &self,
+        pagination: Option<Pagination>,
+    ) -> Result<Vec<welcome_types::Welcome>, Error> {
         let welcomes = self
             .storage()
-            .pending_welcomes()
+            .pending_welcomes(pagination)
             .map_err(|e| Error::Welcome(e.to_string()))?;
         Ok(welcomes)
     }
