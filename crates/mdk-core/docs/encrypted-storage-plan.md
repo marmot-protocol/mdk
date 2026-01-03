@@ -63,7 +63,7 @@ This document is split into two parts:
    - `SecureStorageProvider` trait for secret storage
    - Desktop provider implementation (optional) using `keyring`
    - Callback-based provider for iOS/Android and any other platforms (host provides implementation)
-3. **File Permissions**: Restrict database directories/files on Unix-like platforms (0600/0700), and apply best-effort ACL hardening guidance for Windows.
+3. **File Permissions**: Restrict database directories (mode `0700`) and files (mode `0600`) on Unix-like platforms, and apply ACL hardening on Windows to restrict access to the current user.
 
 ---
 
@@ -164,12 +164,13 @@ SQLCipher encrypts more than just the `*.db` file, but there are important nuanc
 - **WAL (`*-wal`)**: page data stored in the WAL file is encrypted using the database key.
 - **Statement journals**: encrypted; when file-based temp is disabled, these remain in memory.
 - **Master journal**: does not contain data (it contains pathnames for rollback journals).
-- **Other transient files are not encrypted**: SQLite can write temporary files for sorts, indexes, etc. To avoid plaintext transient spill to disk, we must disable file-based temporary storage (compile-time) and/or enforce in-memory temp storage (runtime).
+- **Other transient files are not encrypted**: SQLite can write temporary files for sorts, indexes, etc. To avoid plaintext transient spill to disk, we must disable file-based temporary storage at compile-time **and** enforce in-memory temp storage at runtime as a defense-in-depth measure.
 
 Operational guidance:
 
 - Treat `*.db`, `*-wal`, `*-shm`, and `*-journal` as sensitive and ensure they live in a private directory with restrictive permissions.
-- Prefer in-memory temp store (`PRAGMA temp_store = MEMORY;`) and ensure the bundled SQLCipher build is configured to avoid file-based temp stores.
+- **Compile-time**: Configure the bundled SQLCipher build to disable file-based temp stores (e.g., `SQLITE_TEMP_STORE=2` or `=3` to force memory-only temp storage).
+- **Runtime**: Always set `PRAGMA temp_store = MEMORY;` as an additional safeguard, even if compile-time settings should prevent file-based temp storage.
 
 ### 2. The `mdk-secure-storage` Crate
 
@@ -429,8 +430,9 @@ use mdk_secure_storage::{SecureStorageProvider, SecureStorageProviderExt};
 impl MdkSqliteStorage {
     /// Creates encrypted storage using a secure storage provider.
     ///
-    /// The provider is used to get or create the database encryption key.
-    pub fn new_with_provider<P>(
+    /// This is the primary constructor for production use. The provider is used
+    /// to get or create the database encryption key.
+    pub fn new<P>(
         file_path: P,
         db_key_id: &str,
         storage_provider: &dyn SecureStorageProvider,
@@ -444,7 +446,26 @@ impl MdkSqliteStorage {
             .map_err(|_| Error::InvalidKeyLength)?;
 
         let config = EncryptionConfig { key: key_array };
-        Self::new(file_path, Some(config))
+        Self::new_internal(file_path, Some(config))
+    }
+
+    /// Creates unencrypted storage.
+    ///
+    /// ⚠️ **WARNING**: This creates an unencrypted database. Only use for testing
+    /// or development. Production applications should use `new()` with encrypted
+    /// storage.
+    pub fn new_unencrypted<P>(file_path: P) -> Result<Self, Error>
+    where
+        P: AsRef<Path>,
+    {
+        Self::new_internal(file_path, None)
+    }
+
+    fn new_internal<P>(file_path: P, config: Option<EncryptionConfig>) -> Result<Self, Error>
+    where
+        P: AsRef<Path>,
+    {
+        // Implementation details...
     }
 }
 ```
@@ -465,8 +486,10 @@ pub trait SecureStorageCallbacks: Send + Sync {
 }
 
 /// Create MDK with encrypted storage using host-provided secure storage.
+///
+/// This is the primary constructor for production use. Encrypted storage is the default.
 #[uniffi::export]
-pub fn new_mdk_with_secure_storage(
+pub fn new_mdk(
     db_path: String,
     db_key_id: String,
     storage_callbacks: Box<dyn SecureStorageCallbacks>,
@@ -478,6 +501,20 @@ pub fn new_mdk_with_secure_storage(
         &provider,
     )?;
 
+    let mdk = MDK::new(storage);
+    Ok(Mdk { mdk: Mutex::new(mdk) })
+}
+
+/// Create MDK with unencrypted storage.
+///
+/// ⚠️ **WARNING**: This creates an unencrypted database. Only use for testing
+/// or development. Production applications should use `new_mdk()` with
+/// encrypted storage.
+#[uniffi::export]
+pub fn new_unencrypted_mdk(
+    db_path: String,
+) -> Result<Mdk, MdkUniffiError> {
+    let storage = MdkSqliteStorage::new_unencrypted(PathBuf::from(db_path))?;
     let mdk = MDK::new(storage);
     Ok(Mdk { mdk: Mutex::new(mdk) })
 }
@@ -633,9 +670,140 @@ Flutter-specific examples and helper packages are documented in **Part B** as no
 
 **Goal:** prevent other local users/processes from reading the encrypted database files.
 
-- **Unix-like (macOS/Linux/etc.)**: create the database directory with `0700` and database files with `0600`.
-- **iOS/Android**: rely on the application sandbox, but still store databases in app-private directories.
-- **Windows (not currently a supported target)**: there is no portable chmod-equivalent; the right long-term approach is to store under per-user app data directories and apply best-effort ACL restrictions to the current user.
+#### Unix-like (macOS/Linux/etc.)
+
+Create the database directory with mode `0700` (owner read/write/execute only) and database files with mode `0600` (owner read/write only). Execute permission is not needed for files.
+
+#### iOS/Android
+
+Rely on the application sandbox, but still store databases in app-private directories.
+
+#### Windows
+
+Windows does not have Unix-style chmod permissions. Instead, Windows uses Access Control Lists (ACLs) within security descriptors:
+
+- **DACL (Discretionary Access Control List)**: Specifies which users/groups can access the file and what operations they can perform.
+- **SACL (System Access Control List)**: Used for auditing (not required for our use case).
+
+**Implementation approach for Windows:**
+
+1. **Store in per-user locations**: Always store database files in the user's private app data directory (e.g., `%LOCALAPPDATA%\<app_name>\`). This provides baseline isolation since other non-admin users cannot access these directories by default.
+
+2. **Apply explicit ACL restrictions**: Use Windows APIs to set a DACL that grants access only to the current user:
+   - Use `SetNamedSecurityInfoW` or `SetSecurityInfo` to modify the file's security descriptor.
+   - Create a DACL with a single ACE (Access Control Entry) granting `GENERIC_ALL` to the current user's SID.
+   - Disable inheritance from parent directories to prevent inherited permissions from granting broader access.
+
+3. **Rust implementation options**:
+   - Use the [`windows`](https://crates.io/crates/windows) crate (official Microsoft bindings) for direct API access.
+   - Alternatively, use [`windows-acl`](https://crates.io/crates/windows-acl) for a higher-level ACL API (though less actively maintained).
+
+**Reference implementation sketch (conceptual):**
+
+```rust
+#[cfg(windows)]
+fn set_secure_file_permissions_windows(path: &Path) -> std::io::Result<()> {
+    use windows::Win32::Security::{
+        SetNamedSecurityInfoW, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
+        PROTECTED_DACL_SECURITY_INFORMATION,
+    };
+    use windows::Win32::Security::Authorization::{
+        SetEntriesInAclW, EXPLICIT_ACCESS_W, SET_ACCESS, NO_INHERITANCE,
+        TRUSTEE_IS_SID, TRUSTEE_W,
+    };
+    use windows::Win32::System::Threading::GetCurrentProcess;
+    use windows::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_USER};
+
+    // 1. Get current user's SID from process token
+    // 2. Build an EXPLICIT_ACCESS entry granting GENERIC_ALL to current user
+    // 3. Create a new ACL with SetEntriesInAclW
+    // 4. Apply it with SetNamedSecurityInfoW, using:
+    //    - DACL_SECURITY_INFORMATION to set the DACL
+    //    - PROTECTED_DACL_SECURITY_INFORMATION to disable inheritance
+
+    // Implementation details TBD during development phase
+    Ok(())
+}
+```
+
+**Full implementation example (for reference):**
+
+```rust
+#[cfg(windows)]
+mod windows_permissions {
+    use std::path::Path;
+    use std::ptr;
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{CloseHandle, HANDLE, PSID};
+    use windows::Win32::Security::Authorization::{
+        SetEntriesInAclW, EXPLICIT_ACCESS_W, SET_ACCESS, NO_INHERITANCE,
+        TRUSTEE_IS_SID, TRUSTEE_W, TRUSTEE_FORM, TRUSTEE_TYPE,
+    };
+    use windows::Win32::Security::{
+        GetTokenInformation, SetNamedSecurityInfoW, TokenUser,
+        DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+        SE_FILE_OBJECT, TOKEN_QUERY, TOKEN_USER, ACL,
+    };
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    use windows::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
+
+    pub fn set_owner_only_permissions(path: &Path) -> std::io::Result<()> {
+        // Get current user SID
+        let sid = get_current_user_sid()?;
+
+        // Build explicit access for current user only
+        let mut explicit_access = EXPLICIT_ACCESS_W {
+            grfAccessPermissions: FILE_ALL_ACCESS.0,
+            grfAccessMode: SET_ACCESS,
+            grfInheritance: NO_INHERITANCE,
+            Trustee: TRUSTEE_W {
+                TrusteeForm: TRUSTEE_IS_SID,
+                TrusteeType: TRUSTEE_TYPE::default(),
+                ptstrName: PCWSTR(sid.0 as *const u16),
+                ..Default::default()
+            },
+        };
+
+        // Create new ACL with only this entry
+        let mut new_acl: *mut ACL = ptr::null_mut();
+        unsafe {
+            SetEntriesInAclW(
+                Some(&[explicit_access]),
+                None,
+                &mut new_acl,
+            )?;
+        }
+
+        // Apply to file (with protected DACL to disable inheritance)
+        let path_wide: Vec<u16> = path.as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+
+        unsafe {
+            SetNamedSecurityInfoW(
+                PCWSTR(path_wide.as_ptr()),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                None,
+                None,
+                Some(new_acl),
+                None,
+            )?;
+        }
+
+        Ok(())
+    }
+
+    fn get_current_user_sid() -> std::io::Result<PSID> {
+        // Implementation: OpenProcessToken, GetTokenInformation(TokenUser), extract SID
+        // ...
+        todo!("Implement SID retrieval")
+    }
+}
+```
+
+#### Combined implementation
 
 ```rust
 // mdk-sqlite-storage/src/lib.rs
@@ -661,20 +829,31 @@ fn set_secure_file_permissions(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn create_secure_directory(path: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(path)?;
+    // Apply owner-only ACL to directory
+    windows_permissions::set_owner_only_permissions(path)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn set_secure_file_permissions(path: &Path) -> std::io::Result<()> {
+    if path.exists() {
+        windows_permissions::set_owner_only_permissions(path)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
 fn create_secure_directory(path: &Path) -> std::io::Result<()> {
     // On iOS/Android, the app sandbox generally restricts filesystem access.
-    //
-    // On Windows, Unix permissions don't apply. We should prefer per-user app data locations and
-    // (in the future) apply best-effort ACL hardening to restrict access to the current user.
     std::fs::create_dir_all(path)
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn set_secure_file_permissions(_path: &Path) -> std::io::Result<()> {
-    // On non-Unix platforms there is no portable chmod-equivalent.
-    // We currently rely on sandboxing (mobile) and per-user locations (Windows).
-    // A future Windows implementation can apply best-effort ACL restrictions.
+    // On mobile platforms, we rely on app sandboxing.
     Ok(())
 }
 ```
@@ -701,22 +880,24 @@ fn set_secure_file_permissions(_path: &Path) -> std::io::Result<()> {
 - [ ] Update `Cargo.toml` to use `bundled-sqlcipher` feature
 - [ ] Add dependency on `mdk-secure-storage`
 - [ ] Add `EncryptionConfig` struct
-- [ ] Modify `MdkSqliteStorage::new()` to accept optional encryption config
-- [ ] Add `MdkSqliteStorage::new_with_provider()` that uses `SecureStorageProvider`
+- [ ] Rename existing unencrypted constructor to `MdkSqliteStorage::new_unencrypted()`
+- [ ] Add `MdkSqliteStorage::new()` (encrypted) as the primary constructor using `SecureStorageProvider`
 - [ ] Apply `PRAGMA key` **as the first operation** on a new connection (use raw key data blob literal)
-- [ ] Validate the key with a read (e.g., `SELECT count(*) FROM sqlite_master;`) to distinguish “wrong key” from other failures
-- [ ] Ensure in-memory temporary storage (e.g., `PRAGMA temp_store = MEMORY;`) and avoid file-based temp spill
-- [ ] Consider `PRAGMA cipher_compatibility` to pin defaults for forward compatibility
-- [ ] Add file permission hardening for Unix platforms
+- [ ] Validate the key with a read (e.g., `SELECT count(*) FROM sqlite_master;`) to distinguish "wrong key" from other failures
+- [ ] **Compile-time**: Configure bundled SQLCipher with `SQLITE_TEMP_STORE=3` to force memory-only temp storage
+- [ ] **Runtime**: Always set `PRAGMA temp_store = MEMORY;` as defense-in-depth
+- [ ] Set `PRAGMA cipher_compatibility` to pin defaults for forward compatibility
+- [ ] Add file permission hardening for Unix platforms (0700 for directories, 0600 for files)
+- [ ] Add file permission hardening for Windows (ACL-based, current user only)
 - [ ] Add unit tests for encrypted storage
-- [ ] Test cross-platform compilation (iOS, Android, macOS, Linux)
+- [ ] Test cross-platform compilation (iOS, Android, macOS, Linux, Windows)
 
 ### Phase 3: UniFFI Binding Updates
 
 - [ ] Export `SecureStorageCallbacks` as callback interface
-- [ ] Add `new_mdk_with_secure_storage(db_path, db_key_id, callbacks)` function
+- [ ] Add `new_mdk(db_path, db_key_id, callbacks)` as the primary constructor (encrypted by default)
+- [ ] Add `new_unencrypted_mdk(db_path)` for testing/development use with clear warnings
 - [ ] Update generated bindings for Swift, Kotlin, Python, Ruby
-- [ ] Keep unencrypted `new_mdk()` for backward compatibility (mark as deprecated)
 - [ ] Add documentation for storage provider responsibilities
 
 ### Phase 4: Project-Specific Integrations (see Part B)
@@ -760,6 +941,14 @@ fn set_secure_file_permissions(_path: &Path) -> std::io::Result<()> {
 ### Backup / Restore (Not Supported Yet)
 
 MDK does not currently provide backup/restore/export tooling. Hosts should assume that copying the database file(s) alone is insufficient without a compatible key management strategy.
+
+### Breaking Changes and API Design
+
+As part of the security audit work, MDK is making breaking changes to establish secure defaults:
+
+- **Encrypted storage is the default**: The primary constructor (`new()`, `new_mdk()`) creates encrypted storage.
+- **Unencrypted storage is explicitly opt-in**: Use `new_unencrypted()` / `new_unencrypted_mdk()` with clear warnings.
+- **No backwards compatibility shims**: We are not maintaining deprecated APIs for unencrypted storage. Existing users must migrate to encrypted storage.
 
 ### FFI / Callback Boundary Risks (Critical)
 
@@ -922,7 +1111,7 @@ use mdk_secure_storage::{SecureStorageProvider, SecureStorageProviderExt};
 
 fn open_mdk(db_path: &Path, storage: &dyn SecureStorageProvider) -> Result<MDK<MdkSqliteStorage>, Error> {
     let db_key_id = "mdk.db.key.whitenoise.default";
-    let mdk_storage = MdkSqliteStorage::new_with_provider(db_path, db_key_id, storage)?;
+    let mdk_storage = MdkSqliteStorage::new(db_path, db_key_id, storage)?;
     Ok(MDK::new(mdk_storage))
 }
 
