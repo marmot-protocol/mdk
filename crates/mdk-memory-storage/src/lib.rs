@@ -175,6 +175,7 @@ mod tests {
     use mdk_storage_traits::groups::GroupStorage;
     use mdk_storage_traits::groups::types::{Group, GroupExporterSecret, GroupState};
     use mdk_storage_traits::messages::MessageStorage;
+    use mdk_storage_traits::messages::error::MessageError;
     use mdk_storage_traits::messages::types::{Message, MessageState, ProcessedMessageState};
     use mdk_storage_traits::test_utils::crypto_utils::generate_random_bytes;
     use mdk_storage_traits::welcomes::WelcomeStorage;
@@ -559,6 +560,52 @@ mod tests {
         {
             let cache = nostr_storage.processed_messages_cache.read();
             assert!(cache.contains(&wrapper_id));
+        }
+    }
+
+    #[test]
+    fn test_save_message_for_nonexistent_group() {
+        let storage = MemoryStorage::default();
+        let nostr_storage = MdkMemoryStorage::new(storage);
+        let nonexistent_group_id = create_test_group_id();
+        let event_id = EventId::all_zeros();
+        let wrapper_id = EventId::all_zeros();
+        let pubkey =
+            PublicKey::from_hex("aabbccddeeffaabbccddeeffaabbccddeeffaabbccddeeffaabbccddeeffaabb")
+                .unwrap();
+        let message = Message {
+            id: event_id,
+            pubkey,
+            kind: Kind::MlsGroupMessage,
+            mls_group_id: nonexistent_group_id.clone(),
+            created_at: Timestamp::now(),
+            content: "Hello, world!".to_string(),
+            tags: Tags::new(),
+            event: UnsignedEvent::new(
+                pubkey,
+                Timestamp::now(),
+                Kind::MlsGroupMessage,
+                Tags::new(),
+                "Hello, world!".to_string(),
+            ),
+            wrapper_event_id: wrapper_id,
+            state: MessageState::Created,
+        };
+
+        // Attempting to save a message for a non-existent group should return an error
+        let result = nostr_storage.save_message(message);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            MessageError::InvalidParameters(msg) => {
+                assert!(msg.contains("not found"));
+            }
+            _ => panic!("Expected InvalidParameters error"),
+        }
+
+        // Verify the message was not added to the cache
+        {
+            let cache = nostr_storage.messages_by_group_cache.read();
+            assert!(!cache.contains(&nonexistent_group_id));
         }
     }
 

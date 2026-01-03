@@ -33,6 +33,9 @@
 
 ### Fixed
 
+- **Security (Audit Issue AN)**: Fixed security issue where `save_message` would accept messages for non-existent groups, allowing cache pollution. Now verifies group existence before inserting messages into the cache. ([#113](https://github.com/marmot-protocol/mdk/pull/113))
+
+
 ### Removed
 
 ### Deprecated
