@@ -1101,6 +1101,68 @@ mod tests {
     }
 
     #[test]
+    fn test_get_messages_with_pagination() {
+        use std::collections::HashSet;
+        use mdk_storage_traits::groups::Pagination;
+
+        let mdk = create_test_mdk();
+        let (creator, members, admins) = create_test_group_members();
+        let group_id = create_test_group(&mdk, &creator, &members, &admins);
+
+        // Create 15 messages
+        for i in 0..15 {
+            let rumor = create_test_rumor(&creator, &format!("Message {}", i));
+            mdk.create_message(&group_id, rumor)
+                .expect("Failed to create message");
+        }
+
+        // Test 1: Get first page (10 messages)
+        let page1 = mdk
+            .get_messages(&group_id, Some(Pagination::new(Some(10), Some(0))))
+            .expect("Failed to get first page");
+        assert_eq!(page1.len(), 10, "First page should have 10 messages");
+
+        // Test 2: Get second page (5 messages)
+        let page2 = mdk
+            .get_messages(&group_id, Some(Pagination::new(Some(10), Some(10))))
+            .expect("Failed to get second page");
+        assert_eq!(page2.len(), 5, "Second page should have 5 messages");
+
+        // Test 3: Verify no duplicates between pages
+        let page1_ids: HashSet<_> = page1.iter().map(|m| m.id).collect();
+        let page2_ids: HashSet<_> = page2.iter().map(|m| m.id).collect();
+        assert!(
+            page1_ids.is_disjoint(&page2_ids),
+            "Pages should not have duplicate messages"
+        );
+
+        // Test 4: Get all messages with default pagination
+        let all_messages = mdk
+            .get_messages(&group_id, None)
+            .expect("Failed to get all messages");
+        assert_eq!(
+            all_messages.len(),
+            15,
+            "Should get all 15 messages with default pagination"
+        );
+
+        // Test 5: Request beyond available messages
+        let page3 = mdk
+            .get_messages(&group_id, Some(Pagination::new(Some(10), Some(20))))
+            .expect("Failed to get third page");
+        assert!(
+            page3.is_empty(),
+            "Should return empty when offset exceeds message count"
+        );
+
+        // Test 6: Small page size
+        let small_page = mdk
+            .get_messages(&group_id, Some(Pagination::new(Some(3), Some(0))))
+            .expect("Failed to get small page");
+        assert_eq!(small_page.len(), 3, "Should respect small page size");
+    }
+
+    #[test]
     fn test_create_message_success() {
         let mdk = create_test_mdk();
         let (creator, members, admins) = create_test_group_members();
