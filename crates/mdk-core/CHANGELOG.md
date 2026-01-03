@@ -27,6 +27,8 @@
 
 ### Breaking changes
 
+- **Encrypted Media (MIP-04)**: The `derive_encryption_nonce()` function has been removed. All encrypted media must now include a random nonce in the IMETA tag (`n` field). Legacy media encrypted with deterministic nonces can no longer be decrypted. This is a breaking change to fix the security issue (Audit Issue U) where deterministic nonce derivation caused nonce reuse. ([#TBD](https://github.com/marmot-protocol/mdk/pull/TBD))
+
 ### Changed
 
 ### Added
@@ -40,6 +42,7 @@
 - **Security (Audit Issue C)**: Added validation for admin updates to prevent invalid configurations. Admin updates now reject empty admin sets and non-member public keys. ([#42](https://github.com/marmot-protocol/mdk/pull/42))
 - **Security (Audit Issue D)**: Added identity binding verification for KeyPackage events. The credential identity is now validated against the event signer to prevent impersonation attacks. ([#41](https://github.com/marmot-protocol/mdk/pull/41))
 - **Security (Audit Issue O)**: Missing Hash Verification in decrypt_group_image Allows Storage-Level Blob Substitution ([#97](https://github.com/marmot-protocol/mdk/pull/97))
+- **Security (Audit Issue U)**: Fixed deterministic nonce derivation that caused nonce reuse and message linkability. Encryption now uses random nonces per encryption operation, stored in the IMETA tag. The nonce field (`n`) is now required in IMETA tags. ([#114](https://github.com/marmot-protocol/mdk/pull/114))
 
 ### Removed
 
