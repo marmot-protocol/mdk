@@ -1068,7 +1068,10 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use mdk_storage_traits::GroupId;
+    use mdk_storage_traits::groups::Pagination;
     use nostr::{EventBuilder, Keys, Kind, PublicKey, Tag, TagKind, Tags};
 
     use super::*;
@@ -1102,9 +1105,6 @@ mod tests {
 
     #[test]
     fn test_get_messages_with_pagination() {
-        use mdk_storage_traits::groups::Pagination;
-        use std::collections::HashSet;
-
         let mdk = create_test_mdk();
         let (creator, members, admins) = create_test_group_members();
         let group_id = create_test_group(&mdk, &creator, &members, &admins);
