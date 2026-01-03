@@ -60,6 +60,14 @@ test_memory_storage!(
     shared::group_tests::test_replace_group_relays_duplicate_handling
 );
 
+// Admin functionality tests
+test_memory_storage!(test_admins_memory, shared::group_tests::test_admins);
+
+test_memory_storage!(
+    test_admins_error_for_nonexistent_group_memory,
+    shared::group_tests::test_admins_error_for_nonexistent_group
+);
+
 // Message functionality tests
 test_memory_storage!(
     test_save_and_find_message_memory,
@@ -74,6 +82,16 @@ test_memory_storage!(
 test_memory_storage!(
     test_messages_for_group_memory,
     shared::group_tests::test_messages_for_group
+);
+
+test_memory_storage!(
+    test_messages_error_for_nonexistent_group_memory,
+    shared::group_tests::test_messages_error_for_nonexistent_group
+);
+
+test_memory_storage!(
+    test_group_relays_error_for_nonexistent_group_memory,
+    shared::group_tests::test_group_relays_error_for_nonexistent_group
 );
 
 // Welcome functionality tests
