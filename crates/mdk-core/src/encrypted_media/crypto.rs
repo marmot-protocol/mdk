@@ -9,15 +9,16 @@ use chacha20poly1305::{
     aead::{Aead, KeyInit},
 };
 use hkdf::Hkdf;
+use nostr::secp256k1::rand::{RngCore, rngs::OsRng};
 use sha2::Sha256;
 
 use crate::encrypted_media::types::EncryptedMediaError;
 use crate::{GroupId, MDK};
 use mdk_storage_traits::MdkStorageProvider;
 
-/// Scheme label for MIP-04 version 1 encryption to provide domain separation
+/// Scheme label for MIP-04 version 2 encryption to provide domain separation
 /// and prevent cross-version collisions
-const SCHEME_LABEL: &[u8] = b"mip04-v1";
+const SCHEME_LABEL: &[u8] = b"mip04-v2";
 
 /// Build HKDF context for key/nonce derivation with scheme label for domain separation
 fn build_hkdf_context(
@@ -87,42 +88,18 @@ where
     Ok(key)
 }
 
-/// Derive encryption nonce from context according to Marmot protocol specification
+/// Generate a random encryption nonce
 ///
-/// As specified in Marmot protocol 04.md, the encryption nonce is derived using:
-/// nonce = HKDF-Expand(exporter_secret, SCHEME_LABEL || 0x00 || file_hash_bytes || 0x00 || mime_type_bytes || 0x00 || filename_bytes || 0x00 || "nonce", 12)
+/// This function generates a cryptographically secure random 96-bit (12-byte) nonce
+/// for ChaCha20-Poly1305 encryption. Each encryption operation should use a unique
+/// nonce to prevent nonce reuse attacks.
 ///
-/// This ensures the nonce is deterministic and can be reproduced for decryption
-/// without needing to store it separately.
-pub fn derive_encryption_nonce<Storage>(
-    mdk: &MDK<Storage>,
-    group_id: &GroupId,
-    original_hash: &[u8; 32],
-    mime_type: &str,
-    filename: &str,
-) -> Result<[u8; 12], EncryptedMediaError>
-where
-    Storage: MdkStorageProvider,
-{
-    // Get the group's exporter secret
-    let exporter_secret = mdk
-        .exporter_secret(group_id)
-        .map_err(|_| EncryptedMediaError::GroupNotFound)?;
-
-    // Create context as specified in Marmot protocol 04.md:
-    // SCHEME_LABEL || 0x00 || file_hash_bytes || 0x00 || mime_type_bytes || 0x00 || filename_bytes || 0x00 || "nonce"
-    let context = build_hkdf_context(original_hash, mime_type, filename, b"nonce");
-
-    // Use HKDF to derive nonce with context
-    let hk = Hkdf::<Sha256>::new(None, &exporter_secret.secret);
-
+/// The nonce must be stored with the encrypted data (e.g., in the IMETA tag) and provided during decryption.
+pub fn generate_encryption_nonce() -> [u8; 12] {
     let mut nonce = [0u8; 12];
-    hk.expand(&context, &mut nonce)
-        .map_err(|e| EncryptedMediaError::EncryptionFailed {
-            reason: format!("Nonce derivation failed: {}", e),
-        })?;
-
-    Ok(nonce)
+    let mut rng = OsRng;
+    rng.fill_bytes(&mut nonce);
+    nonce
 }
 
 /// Encrypt data using ChaCha20-Poly1305 AEAD with Associated Authenticated Data
@@ -217,15 +194,12 @@ mod tests {
 
         let original_hash: [u8; 32] = Sha256::digest(original_data).into();
 
-        // Test key and nonce derivation (these will fail without a proper group, but we can test the logic)
+        // Test key derivation (will fail without a proper group, but we can test the logic)
         let key_result =
             derive_encryption_key(&mdk, &group_id, &original_hash, mime_type, filename);
-        let nonce_result =
-            derive_encryption_nonce(&mdk, &group_id, &original_hash, mime_type, filename);
 
-        // These should fail gracefully since we don't have a real MLS group
+        // Should fail gracefully since we don't have a real MLS group
         assert!(key_result.is_err());
-        assert!(nonce_result.is_err());
 
         // Verify the error is the expected "GroupNotFound" error
         if let Err(EncryptedMediaError::GroupNotFound) = key_result {
