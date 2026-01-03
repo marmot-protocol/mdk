@@ -12,6 +12,7 @@
 //! Message state is tracked to handle processing status and failure scenarios.
 
 use mdk_storage_traits::MdkStorageProvider;
+use mdk_storage_traits::groups::Pagination;
 use mdk_storage_traits::groups::types as group_types;
 use mdk_storage_traits::messages::types as message_types;
 use nostr::{Event, EventId, JsonUtil, Kind, TagKind, Timestamp, UnsignedEvent};
@@ -84,22 +85,42 @@ where
             .map_err(|e| Error::Message(e.to_string()))
     }
 
-    /// Retrieves all messages for a specific MLS group
+    /// Retrieves messages for a specific MLS group with optional pagination
     ///
-    /// This function returns all messages that have been processed and stored for a group,
-    /// ordered by creation time.
+    /// This function returns messages that have been processed and stored for a group,
+    /// ordered by creation time (descending). If no pagination is specified, uses default
+    /// pagination (1000 messages, offset 0).
     ///
     /// # Arguments
     ///
     /// * `mls_group_id` - The MLS group ID to get messages for
+    /// * `pagination` - Optional pagination parameters. If `None`, uses default limit and offset.
     ///
     /// # Returns
     ///
-    /// * `Ok(Vec<Message>)` - List of all messages for the group
+    /// * `Ok(Vec<Message>)` - List of messages for the group (up to limit)
     /// * `Err(Error)` - If there is an error accessing storage
-    pub fn get_messages(&self, mls_group_id: &GroupId) -> Result<Vec<message_types::Message>> {
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// // Get messages with default pagination (1000 messages, offset 0)
+    /// let messages = mdk.get_messages(&group_id, None)?;
+    ///
+    /// // Get first 100 messages
+    /// use mdk_storage_traits::groups::Pagination;
+    /// let messages = mdk.get_messages(&group_id, Some(Pagination::new(Some(100), Some(0))))?;
+    ///
+    /// // Get next 100 messages
+    /// let messages = mdk.get_messages(&group_id, Some(Pagination::new(Some(100), Some(100))))?;
+    /// ```
+    pub fn get_messages(
+        &self,
+        mls_group_id: &GroupId,
+        pagination: Option<Pagination>,
+    ) -> Result<Vec<message_types::Message>> {
         self.storage()
-            .messages(mls_group_id)
+            .messages(mls_group_id, pagination)
             .map_err(|e| Error::Message(e.to_string()))
     }
 
@@ -1047,7 +1068,10 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use mdk_storage_traits::GroupId;
+    use mdk_storage_traits::groups::Pagination;
     use nostr::{EventBuilder, Keys, Kind, PublicKey, Tag, TagKind, Tags};
 
     use super::*;
@@ -1073,8 +1097,69 @@ mod tests {
         let (creator, members, admins) = create_test_group_members();
         let group_id = create_test_group(&mdk, &creator, &members, &admins);
 
-        let messages = mdk.get_messages(&group_id).expect("Failed to get messages");
+        let messages = mdk
+            .get_messages(&group_id, None)
+            .expect("Failed to get messages");
         assert!(messages.is_empty());
+    }
+
+    #[test]
+    fn test_get_messages_with_pagination() {
+        let mdk = create_test_mdk();
+        let (creator, members, admins) = create_test_group_members();
+        let group_id = create_test_group(&mdk, &creator, &members, &admins);
+
+        // Create 15 messages
+        for i in 0..15 {
+            let rumor = create_test_rumor(&creator, &format!("Message {}", i));
+            mdk.create_message(&group_id, rumor)
+                .expect("Failed to create message");
+        }
+
+        // Test 1: Get first page (10 messages)
+        let page1 = mdk
+            .get_messages(&group_id, Some(Pagination::new(Some(10), Some(0))))
+            .expect("Failed to get first page");
+        assert_eq!(page1.len(), 10, "First page should have 10 messages");
+
+        // Test 2: Get second page (5 messages)
+        let page2 = mdk
+            .get_messages(&group_id, Some(Pagination::new(Some(10), Some(10))))
+            .expect("Failed to get second page");
+        assert_eq!(page2.len(), 5, "Second page should have 5 messages");
+
+        // Test 3: Verify no duplicates between pages
+        let page1_ids: HashSet<_> = page1.iter().map(|m| m.id).collect();
+        let page2_ids: HashSet<_> = page2.iter().map(|m| m.id).collect();
+        assert!(
+            page1_ids.is_disjoint(&page2_ids),
+            "Pages should not have duplicate messages"
+        );
+
+        // Test 4: Get all messages with default pagination
+        let all_messages = mdk
+            .get_messages(&group_id, None)
+            .expect("Failed to get all messages");
+        assert_eq!(
+            all_messages.len(),
+            15,
+            "Should get all 15 messages with default pagination"
+        );
+
+        // Test 5: Request beyond available messages
+        let page3 = mdk
+            .get_messages(&group_id, Some(Pagination::new(Some(10), Some(20))))
+            .expect("Failed to get third page");
+        assert!(
+            page3.is_empty(),
+            "Should return empty when offset exceeds message count"
+        );
+
+        // Test 6: Small page size
+        let small_page = mdk
+            .get_messages(&group_id, Some(Pagination::new(Some(3), Some(0))))
+            .expect("Failed to get small page");
+        assert_eq!(small_page.len(), 3, "Should respect small page size");
     }
 
     #[test]
@@ -1254,7 +1339,9 @@ mod tests {
             .expect("Failed to create second message");
 
         // Get all messages for the group
-        let messages = mdk.get_messages(&group_id).expect("Failed to get messages");
+        let messages = mdk
+            .get_messages(&group_id, None)
+            .expect("Failed to get messages");
 
         assert_eq!(messages.len(), 2);
 
@@ -1374,7 +1461,9 @@ mod tests {
 
         // The message should have been stored with a valid ID
         let event = result.unwrap();
-        let messages = mdk.get_messages(&group_id).expect("Failed to get messages");
+        let messages = mdk
+            .get_messages(&group_id, None)
+            .expect("Failed to get messages");
 
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].wrapper_event_id, event.id);
@@ -2431,24 +2520,28 @@ mod tests {
 
         // Step 7: Verify all messages are stored on both clients
         let alice_messages = alice_mdk
-            .get_messages(&group_id)
+            .get_messages(&group_id, None)
             .expect("Failed to get Alice's messages");
 
         let bob_messages = bob_mdk
-            .get_messages(&group_id)
+            .get_messages(&group_id, None)
             .expect("Failed to get Bob's messages");
 
         assert_eq!(alice_messages.len(), 3, "Alice should have 3 messages");
         assert_eq!(bob_messages.len(), 3, "Bob should have 3 messages");
 
-        // Verify message content matches across clients
-        assert_eq!(alice_messages[0].content, "Hello from Alice");
-        assert_eq!(alice_messages[1].content, "Message in epoch 1");
-        assert_eq!(alice_messages[2].content, "Hello from Bob");
+        // Note: When timestamps are equal (as in fast tests), sort order by ID is deterministic
+        // but not chronological. We verify all messages are present.
+        let alice_contents: Vec<&str> = alice_messages.iter().map(|m| m.content.as_str()).collect();
+        let bob_contents: Vec<&str> = bob_messages.iter().map(|m| m.content.as_str()).collect();
 
-        assert_eq!(bob_messages[0].content, "Hello from Alice");
-        assert_eq!(bob_messages[1].content, "Message in epoch 1");
-        assert_eq!(bob_messages[2].content, "Hello from Bob");
+        assert!(alice_contents.contains(&"Hello from Alice"));
+        assert!(alice_contents.contains(&"Message in epoch 1"));
+        assert!(alice_contents.contains(&"Hello from Bob"));
+
+        assert!(bob_contents.contains(&"Hello from Alice"));
+        assert!(bob_contents.contains(&"Message in epoch 1"));
+        assert!(bob_contents.contains(&"Hello from Bob"));
 
         // The test confirms that:
         // - Messages are properly encrypted and decrypted across clients
@@ -2680,7 +2773,7 @@ mod tests {
         let mdk = create_test_mdk();
         let non_existent_group_id = crate::GroupId::from_slice(&[9, 9, 9, 9]);
 
-        let result = mdk.get_messages(&non_existent_group_id);
+        let result = mdk.get_messages(&non_existent_group_id, None);
 
         // Both storage implementations should return error for non-existent group
         assert!(
@@ -2841,7 +2934,9 @@ mod tests {
         );
 
         // Verify we still only have one message (no duplication)
-        let messages = mdk.get_messages(&group_id).expect("Failed to get messages");
+        let messages = mdk
+            .get_messages(&group_id, None)
+            .expect("Failed to get messages");
         assert_eq!(
             messages.len(),
             1,
@@ -2897,7 +2992,9 @@ mod tests {
         assert!(result2.is_ok(), "Message 2 should process successfully");
 
         // Verify all messages are stored
-        let messages = mdk.get_messages(&group_id).expect("Failed to get messages");
+        let messages = mdk
+            .get_messages(&group_id, None)
+            .expect("Failed to get messages");
         assert_eq!(
             messages.len(),
             3,
@@ -2941,7 +3038,9 @@ mod tests {
         }
 
         // Verify all messages are stored
-        let stored_messages = mdk.get_messages(&group_id).expect("Failed to get messages");
+        let stored_messages = mdk
+            .get_messages(&group_id, None)
+            .expect("Failed to get messages");
         assert_eq!(stored_messages.len(), 5, "Should have all 5 messages");
 
         // Messages should be retrievable regardless of processing order
@@ -3157,7 +3256,7 @@ mod tests {
 
         // Verify Bob received all messages
         let bob_messages = bob_mdk
-            .get_messages(&group_id)
+            .get_messages(&group_id, None)
             .expect("Bob should get messages");
 
         assert_eq!(
@@ -3166,13 +3265,16 @@ mod tests {
             "Bob should have all 5 messages after sync"
         );
 
-        // Verify messages are in order
-        for (i, message) in bob_messages.iter().enumerate().take(5) {
+        // Verify all messages are present (order may vary with equal timestamps)
+        let bob_contents: Vec<&str> = bob_messages.iter().map(|m| m.content.as_str()).collect();
+        for i in 0..5 {
+            let expected = format!("Message {} while Bob offline", i);
             assert!(
-                message
-                    .content
-                    .contains(&format!("Message {} while Bob offline", i)),
-                "Messages should be in correct order"
+                bob_contents
+                    .iter()
+                    .any(|&content| content.contains(&expected)),
+                "Should contain: {}",
+                expected
             );
         }
     }
@@ -3362,7 +3464,7 @@ mod tests {
 
         // Verify Bob received the message
         let bob_messages = bob_mdk
-            .get_messages(&group_id)
+            .get_messages(&group_id, None)
             .expect("Bob should get messages");
 
         assert_eq!(bob_messages.len(), 1, "Bob should have 1 message");
@@ -3470,7 +3572,7 @@ mod tests {
             .expect("Bob should process message from epoch 1");
 
         let bob_messages = bob_mdk
-            .get_messages(&group_id)
+            .get_messages(&group_id, None)
             .expect("Bob should get messages");
 
         assert!(

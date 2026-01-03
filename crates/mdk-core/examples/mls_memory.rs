@@ -177,7 +177,7 @@ async fn main() -> Result<(), Error> {
 
     tracing::info!("Bob processed message");
     let messages = bob_mdk
-        .get_messages(bob_mls_group_id)
+        .get_messages(bob_mls_group_id, None)
         .map_err(|e| Error::Message(e.to_string()))?;
     tracing::info!("Bob got messages: {:?}", messages);
     let message = messages.first().unwrap();
@@ -206,7 +206,7 @@ async fn main() -> Result<(), Error> {
 
     assert_eq!(
         alice_mdk
-            .get_messages(&alice_group.mls_group_id)
+            .get_messages(&alice_group.mls_group_id, None)
             .unwrap()
             .len(),
         1,
@@ -220,7 +220,7 @@ async fn main() -> Result<(), Error> {
     );
 
     assert_eq!(
-        bob_mdk.get_messages(bob_mls_group_id).unwrap().len(),
+        bob_mdk.get_messages(bob_mls_group_id, None).unwrap().len(),
         1,
         "Bob should have 1 message"
     );
@@ -228,7 +228,9 @@ async fn main() -> Result<(), Error> {
     tracing::info!("Alice about to process message");
     alice_mdk.process_message(&message_event)?;
 
-    let messages = alice_mdk.get_messages(&alice_group.mls_group_id).unwrap();
+    let messages = alice_mdk
+        .get_messages(&alice_group.mls_group_id, None)
+        .unwrap();
     let message = messages.first().unwrap();
     tracing::info!("Alice processed message: {:?}", message);
 

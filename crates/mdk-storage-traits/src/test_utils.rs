@@ -465,7 +465,7 @@ pub mod cross_storage {
         storage.save_group(group).unwrap();
 
         // Test messages for group (initially empty)
-        let messages = storage.messages(&mls_group_id).unwrap();
+        let messages = storage.messages(&mls_group_id, None).unwrap();
         assert_eq!(messages.len(), 0);
     }
 
