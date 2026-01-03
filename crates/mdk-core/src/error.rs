@@ -197,6 +197,9 @@ pub enum Error {
         /// The public key that signed the event
         event_signer: String,
     },
+    /// Rumor event is missing its ID
+    #[error("rumor event is missing its ID")]
+    MissingRumorEventId,
 }
 
 impl From<FromUtf8Error> for Error {

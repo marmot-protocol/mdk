@@ -173,10 +173,7 @@ impl GroupStorage for MdkSqliteStorage {
 
         // First verify the group exists
         if self.find_group_by_mls_group_id(mls_group_id)?.is_none() {
-            return Err(GroupError::InvalidParameters(format!(
-                "Group with MLS ID {:?} not found",
-                mls_group_id
-            )));
+            return Err(GroupError::InvalidParameters("Group not found".to_string()));
         }
 
         let conn_guard = self.db_connection.lock().map_err(into_group_err)?;
@@ -208,20 +205,14 @@ impl GroupStorage for MdkSqliteStorage {
         // Get the group which contains the admin_pubkeys
         match self.find_group_by_mls_group_id(mls_group_id)? {
             Some(group) => Ok(group.admin_pubkeys),
-            None => Err(GroupError::InvalidParameters(format!(
-                "Group with MLS ID {:?} not found",
-                mls_group_id
-            ))),
+            None => Err(GroupError::InvalidParameters("Group not found".to_string())),
         }
     }
 
     fn group_relays(&self, mls_group_id: &GroupId) -> Result<BTreeSet<GroupRelay>, GroupError> {
         // First verify the group exists
         if self.find_group_by_mls_group_id(mls_group_id)?.is_none() {
-            return Err(GroupError::InvalidParameters(format!(
-                "Group with MLS ID {:?} not found",
-                mls_group_id
-            )));
+            return Err(GroupError::InvalidParameters("Group not found".to_string()));
         }
 
         let conn_guard = self.db_connection.lock().map_err(into_group_err)?;
@@ -251,10 +242,7 @@ impl GroupStorage for MdkSqliteStorage {
     ) -> Result<(), GroupError> {
         // First verify the group exists
         if self.find_group_by_mls_group_id(group_id)?.is_none() {
-            return Err(GroupError::InvalidParameters(format!(
-                "Group with MLS ID {:?} not found",
-                group_id
-            )));
+            return Err(GroupError::InvalidParameters("Group not found".to_string()));
         }
 
         let conn_guard = self.db_connection.lock().map_err(into_group_err)?;
@@ -291,10 +279,7 @@ impl GroupStorage for MdkSqliteStorage {
     ) -> Result<Option<GroupExporterSecret>, GroupError> {
         // First verify the group exists
         if self.find_group_by_mls_group_id(mls_group_id)?.is_none() {
-            return Err(GroupError::InvalidParameters(format!(
-                "Group with MLS ID {:?} not found",
-                mls_group_id
-            )));
+            return Err(GroupError::InvalidParameters("Group not found".to_string()));
         }
 
         let conn_guard = self.db_connection.lock().map_err(into_group_err)?;
@@ -319,10 +304,7 @@ impl GroupStorage for MdkSqliteStorage {
             .find_group_by_mls_group_id(&group_exporter_secret.mls_group_id)?
             .is_none()
         {
-            return Err(GroupError::InvalidParameters(format!(
-                "Group with MLS ID {:?} not found",
-                group_exporter_secret.mls_group_id
-            )));
+            return Err(GroupError::InvalidParameters("Group not found".to_string()));
         }
 
         let conn_guard = self.db_connection.lock().map_err(into_group_err)?;

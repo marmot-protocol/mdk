@@ -129,8 +129,10 @@ where
             failure_reason: None,
         };
 
+        let rumor_event_id = rumor_event.id.ok_or(Error::MissingRumorEventId)?;
+
         let welcome = welcome_types::Welcome {
-            id: rumor_event.id.unwrap(),
+            id: rumor_event_id,
             event: rumor_event.clone(),
             mls_group_id: welcome_preview
                 .staged_welcome
@@ -982,6 +984,47 @@ mod tests {
         assert!(
             result.is_err(),
             "Should fail when welcome content is invalid hex"
+        );
+    }
+
+    /// Test that process_welcome returns error when rumor event ID is missing (not panic)
+    ///
+    /// This test verifies the fix for audit issue "Suggestion 5: Prevent Panic Risk in
+    /// process_welcome". A malformed or non-NIP-59-compliant rumor (ID omitted) should
+    /// return an error gracefully instead of panicking.
+    #[test]
+    fn test_process_welcome_missing_rumor_id() {
+        let mdk = create_test_mdk();
+        let (creator, members, admins) = create_test_group_members();
+
+        // Create a valid group and welcome
+        let member_kp_event = create_key_package_event(&mdk, &members[0]);
+        let create_result = mdk
+            .create_group(
+                &creator.public_key(),
+                vec![member_kp_event],
+                create_nostr_group_config_data(admins),
+            )
+            .expect("Failed to create group");
+
+        // Get the valid welcome and modify it to have no ID (simulating malformed input)
+        let mut welcome_without_id = create_result.welcome_rumors[0].clone();
+        welcome_without_id.id = None; // Remove the ID to simulate malformed rumor
+
+        // Should return an error, not panic
+        let result = mdk.process_welcome(&nostr::EventId::all_zeros(), &welcome_without_id);
+
+        assert!(
+            result.is_err(),
+            "Should return error when rumor event ID is missing"
+        );
+
+        // Verify we get the correct error type
+        let error = result.unwrap_err();
+        assert_eq!(
+            error,
+            crate::error::Error::MissingRumorEventId,
+            "Error should be MissingRumorEventId"
         );
     }
 
