@@ -105,14 +105,14 @@ where
     ///
     /// ```ignore
     /// // Get messages with default pagination (1000 messages, offset 0)
-    /// let messages = mdk.get_messages(&group_id, None, None)?;
+    /// let messages = mdk.get_messages(&group_id, None)?;
     ///
     /// // Get first 100 messages
     /// use mdk_storage_traits::groups::Pagination;
-    /// let messages = mdk.get_messages(&group_id, Some(Pagination::new(Some(100, None), Some(0))))?;
+    /// let messages = mdk.get_messages(&group_id, Some(Pagination::new(Some(100), Some(0))))?;
     ///
     /// // Get next 100 messages
-    /// let messages = mdk.get_messages(&group_id, Some(Pagination::new(Some(100, None), Some(100))))?;
+    /// let messages = mdk.get_messages(&group_id, Some(Pagination::new(Some(100), Some(100))))?;
     /// ```
     pub fn get_messages(
         &self,
