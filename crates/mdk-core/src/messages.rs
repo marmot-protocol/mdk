@@ -1102,8 +1102,8 @@ mod tests {
 
     #[test]
     fn test_get_messages_with_pagination() {
-        use std::collections::HashSet;
         use mdk_storage_traits::groups::Pagination;
+        use std::collections::HashSet;
 
         let mdk = create_test_mdk();
         let (creator, members, admins) = create_test_group_members();
