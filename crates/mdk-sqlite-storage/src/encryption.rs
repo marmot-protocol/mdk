@@ -4,6 +4,9 @@
 //! SQLite databases. All databases created with [`crate::MdkSqliteStorage::new`] or
 //! [`crate::MdkSqliteStorage::new_with_key`] are encrypted using SQLCipher with a 256-bit AES key.
 
+use std::fmt;
+use std::io::Read;
+
 use rusqlite::Connection;
 
 use crate::error::Error;
@@ -91,8 +94,8 @@ impl EncryptionConfig {
 }
 
 // Implement Debug without exposing the key
-impl std::fmt::Debug for EncryptionConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for EncryptionConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("EncryptionConfig")
             .field("key", &"[REDACTED]")
             .finish()
@@ -176,8 +179,6 @@ pub fn is_database_encrypted<P>(path: P) -> Result<bool, Error>
 where
     P: AsRef<std::path::Path>,
 {
-    use std::io::Read;
-
     let path = path.as_ref();
 
     if !path.exists() {
