@@ -1,8 +1,8 @@
 //! SQLCipher encryption support for SQLite storage.
 //!
 //! This module provides encryption configuration and utilities for SQLCipher-encrypted
-//! SQLite databases. All databases created with [`MdkSqliteStorage::new`] or
-//! [`MdkSqliteStorage::new_with_key`] are encrypted using SQLCipher with a 256-bit AES key.
+//! SQLite databases. All databases created with [`crate::MdkSqliteStorage::new`] or
+//! [`crate::MdkSqliteStorage::new_with_key`] are encrypted using SQLCipher with a 256-bit AES key.
 
 use rusqlite::Connection;
 

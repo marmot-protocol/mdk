@@ -213,7 +213,11 @@ impl Mdk {
 /// - The keyring is unavailable or inaccessible
 /// - The database cannot be opened or created
 #[uniffi::export]
-pub fn new_mdk(db_path: String, service_id: String, db_key_id: String) -> Result<Mdk, MdkUniffiError> {
+pub fn new_mdk(
+    db_path: String,
+    service_id: String,
+    db_key_id: String,
+) -> Result<Mdk, MdkUniffiError> {
     let storage = MdkSqliteStorage::new(PathBuf::from(db_path), &service_id, &db_key_id)?;
     let mdk = MDK::new(storage);
     Ok(Mdk {
@@ -237,9 +241,8 @@ pub fn new_mdk(db_path: String, service_id: String, db_key_id: String) -> Result
 /// Returns an error if the key is not 32 bytes or if the database cannot be opened.
 #[uniffi::export]
 pub fn new_mdk_with_key(db_path: String, encryption_key: Vec<u8>) -> Result<Mdk, MdkUniffiError> {
-    let config = EncryptionConfig::from_slice(&encryption_key).map_err(|e| {
-        MdkUniffiError::InvalidInput(format!("Invalid encryption key: {}", e))
-    })?;
+    let config = EncryptionConfig::from_slice(&encryption_key)
+        .map_err(|e| MdkUniffiError::InvalidInput(format!("Invalid encryption key: {}", e)))?;
     let storage = MdkSqliteStorage::new_with_key(PathBuf::from(db_path), config)?;
     let mdk = MDK::new(storage);
     Ok(Mdk {

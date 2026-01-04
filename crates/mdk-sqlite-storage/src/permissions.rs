@@ -125,7 +125,10 @@ fn set_unix_file_permissions(path: &Path) -> Result<(), Error> {
 
     let perms = std::fs::Permissions::from_mode(0o600);
     std::fs::set_permissions(path, perms).map_err(|e| {
-        Error::FilePermission(format!("Failed to set file permissions on {:?}: {}", path, e))
+        Error::FilePermission(format!(
+            "Failed to set file permissions on {:?}: {}",
+            path, e
+        ))
     })
 }
 
@@ -290,4 +293,3 @@ mod tests {
         assert!(result.is_err());
     }
 }
-

@@ -37,8 +37,8 @@ use std::sync::{Mutex, OnceLock};
 
 use keyring_core::{Entry, Error as KeyringError};
 
-use crate::error::Error;
 use crate::encryption::EncryptionConfig;
+use crate::error::Error;
 
 /// Lock to coordinate key generation within a single process.
 ///
@@ -83,9 +83,9 @@ static KEY_GENERATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 pub fn get_or_create_db_key(service_id: &str, db_key_id: &str) -> Result<EncryptionConfig, Error> {
     // Acquire lock to prevent race conditions during key generation
     let lock = KEY_GENERATION_LOCK.get_or_init(|| Mutex::new(()));
-    let _guard = lock.lock().map_err(|e| {
-        Error::Keyring(format!("Failed to acquire key generation lock: {}", e))
-    })?;
+    let _guard = lock
+        .lock()
+        .map_err(|e| Error::Keyring(format!("Failed to acquire key generation lock: {}", e)))?;
 
     let entry = Entry::new(service_id, db_key_id).map_err(|e| {
         Error::Keyring(format!(
@@ -117,10 +117,7 @@ pub fn get_or_create_db_key(service_id: &str, db_key_id: &str) -> Result<Encrypt
 
             // Store the new key
             entry.set_secret(config.key()).map_err(|e| {
-                Error::Keyring(format!(
-                    "Failed to store encryption key in keyring: {}",
-                    e
-                ))
+                Error::Keyring(format!("Failed to store encryption key in keyring: {}", e))
             })?;
 
             Ok(config)
@@ -128,12 +125,10 @@ pub fn get_or_create_db_key(service_id: &str, db_key_id: &str) -> Result<Encrypt
         Err(KeyringError::NoStorageAccess(err)) => {
             Err(Error::KeyringNotInitialized(err.to_string()))
         }
-        Err(e) => {
-            Err(Error::Keyring(format!(
-                "Failed to retrieve encryption key from keyring: {}",
-                e
-            )))
-        }
+        Err(e) => Err(Error::Keyring(format!(
+            "Failed to retrieve encryption key from keyring: {}",
+            e
+        ))),
     }
 }
 
@@ -237,4 +232,3 @@ mod tests {
         assert!(result.is_ok());
     }
 }
-

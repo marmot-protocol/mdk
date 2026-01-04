@@ -47,7 +47,7 @@
 //! If you need to manage encryption keys yourself:
 //!
 //! ```no_run
-//! use mdk_sqlite_storage::{MdkSqliteStorage, EncryptionConfig};
+//! use mdk_sqlite_storage::{EncryptionConfig, MdkSqliteStorage};
 //!
 //! let key = [0u8; 32]; // Your securely stored key
 //! let config = EncryptionConfig::new(key);
@@ -225,7 +225,7 @@ impl MdkSqliteStorage {
     /// # Example
     ///
     /// ```no_run
-    /// use mdk_sqlite_storage::{MdkSqliteStorage, EncryptionConfig};
+    /// use mdk_sqlite_storage::{EncryptionConfig, MdkSqliteStorage};
     ///
     /// let key = [0u8; 32]; // Your securely stored key
     /// let config = EncryptionConfig::new(key);
@@ -275,7 +275,10 @@ impl MdkSqliteStorage {
     }
 
     /// Internal constructor that handles both encrypted and unencrypted database creation.
-    fn new_internal<P>(file_path: P, encryption_config: Option<EncryptionConfig>) -> Result<Self, Error>
+    fn new_internal<P>(
+        file_path: P,
+        encryption_config: Option<EncryptionConfig>,
+    ) -> Result<Self, Error>
     where
         P: AsRef<Path>,
     {
@@ -669,7 +672,10 @@ mod tests {
             // Reopen with the same key
             let config2 = EncryptionConfig::new(key);
             let storage2 = MdkSqliteStorage::new_with_key(&db_path, config2);
-            assert!(storage2.is_ok(), "Should be able to reopen with correct key");
+            assert!(
+                storage2.is_ok(),
+                "Should be able to reopen with correct key"
+            );
         }
 
         #[test]
@@ -688,10 +694,7 @@ mod tests {
             let config2 = EncryptionConfig::generate().unwrap();
             let result = MdkSqliteStorage::new_with_key(&db_path, config2);
 
-            assert!(
-                result.is_err(),
-                "Opening with wrong key should fail"
-            );
+            assert!(result.is_err(), "Opening with wrong key should fail");
 
             // Verify it's the correct error type
             match result {
@@ -761,9 +764,7 @@ mod tests {
             let config2 = EncryptionConfig::new(key);
             let storage2 = MdkSqliteStorage::new_with_key(&db_path, config2).unwrap();
 
-            let found_group = storage2
-                .find_group_by_mls_group_id(&mls_group_id)
-                .unwrap();
+            let found_group = storage2.find_group_by_mls_group_id(&mls_group_id).unwrap();
             assert!(found_group.is_some());
             assert_eq!(found_group.unwrap().name, "Encrypted Group");
         }
@@ -785,7 +786,8 @@ mod tests {
 
                 // Check that group and world permissions are not set
                 assert_eq!(
-                    mode & 0o077, 0,
+                    mode & 0o077,
+                    0,
                     "Database file should have owner-only permissions, got {:o}",
                     mode & 0o777
                 );

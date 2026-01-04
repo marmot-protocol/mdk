@@ -27,7 +27,6 @@ pub enum Error {
     },
 
     // Encryption-related errors
-
     /// Database encryption key has invalid length (expected 32 bytes)
     #[error("Invalid encryption key length: expected 32 bytes, got {0} bytes")]
     InvalidKeyLength(usize),
@@ -41,7 +40,9 @@ pub enum Error {
     EncryptedDatabaseRequiresKey,
 
     /// Attempted to open an unencrypted database with encryption enabled
-    #[error("Cannot open unencrypted database with encryption: database was created without encryption")]
+    #[error(
+        "Cannot open unencrypted database with encryption: database was created without encryption"
+    )]
     UnencryptedDatabaseWithEncryption,
 
     /// Failed to generate random key
@@ -53,7 +54,6 @@ pub enum Error {
     FilePermission(String),
 
     // Keyring-related errors
-
     /// Keyring operation failed
     #[error("Keyring error: {0}")]
     Keyring(String),
@@ -63,7 +63,9 @@ pub enum Error {
     /// The host application must initialize a platform-specific keyring store
     /// before using encrypted storage. See the MDK documentation for platform-specific
     /// setup instructions.
-    #[error("Keyring store not initialized. The host application must call keyring_core::set_default_store() with a platform-specific store before using encrypted storage. Details: {0}")]
+    #[error(
+        "Keyring store not initialized. The host application must call keyring_core::set_default_store() with a platform-specific store before using encrypted storage. Details: {0}"
+    )]
     KeyringNotInitialized(String),
 }
 
