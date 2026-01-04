@@ -5,7 +5,9 @@
 //! [`crate::MdkSqliteStorage::new_with_key`] are encrypted using SQLCipher with a 256-bit AES key.
 
 use std::fmt;
-use std::io::Read;
+use std::fs::File;
+use std::io::{ErrorKind, Read};
+use std::path::Path;
 
 use rusqlite::Connection;
 
@@ -177,7 +179,7 @@ fn validate_encryption_key(conn: &Connection) -> Result<(), Error> {
 /// - `Err` if there's an I/O error reading the file
 pub fn is_database_encrypted<P>(path: P) -> Result<bool, Error>
 where
-    P: AsRef<std::path::Path>,
+    P: AsRef<Path>,
 {
     let path = path.as_ref();
 
@@ -186,7 +188,7 @@ where
         return Ok(false);
     }
 
-    let mut file = std::fs::File::open(path)?;
+    let mut file = File::open(path)?;
     let mut header = [0u8; 16];
 
     match file.read_exact(&mut header) {
@@ -195,7 +197,7 @@ where
             const SQLITE_HEADER: &[u8; 16] = b"SQLite format 3\0";
             Ok(header != *SQLITE_HEADER)
         }
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+        Err(e) if e.kind() == ErrorKind::UnexpectedEof => {
             // File is too small to have a valid header - treat as unencrypted/new
             Ok(false)
         }
@@ -233,6 +235,13 @@ mod tests {
     }
 
     #[test]
+    fn test_encryption_config_from_slice_empty() {
+        let empty_key: Vec<u8> = vec![];
+        let result = EncryptionConfig::from_slice(&empty_key);
+        assert!(matches!(result, Err(Error::InvalidKeyLength(0))));
+    }
+
+    #[test]
     fn test_encryption_config_debug_redacts_key() {
         let key = [0x42u8; 32];
         let config = EncryptionConfig::new(key);
@@ -254,6 +263,14 @@ mod tests {
     }
 
     #[test]
+    fn test_encryption_config_clone() {
+        let key = [0x42u8; 32];
+        let config1 = EncryptionConfig::new(key);
+        let config2 = config1.clone();
+        assert_eq!(config1.key(), config2.key());
+    }
+
+    #[test]
     fn test_to_sqlcipher_key_format() {
         let key = [0x00u8; 32];
         let config = EncryptionConfig::new(key);
@@ -266,8 +283,277 @@ mod tests {
     }
 
     #[test]
+    fn test_to_sqlcipher_key_format_nonzero() {
+        // Test with a known non-zero key to verify hex encoding
+        let mut key = [0u8; 32];
+        key[0] = 0xAB;
+        key[31] = 0xCD;
+        let config = EncryptionConfig::new(key);
+        let sqlcipher_key = config.to_sqlcipher_key();
+
+        // Verify the hex encoding is correct
+        assert!(sqlcipher_key.starts_with("x'ab"));
+        assert!(sqlcipher_key.ends_with("cd'"));
+    }
+
+    #[test]
     fn test_is_database_encrypted_nonexistent() {
         let result = is_database_encrypted("/nonexistent/path/db.sqlite");
         assert!(matches!(result, Ok(false)));
+    }
+
+    #[test]
+    fn test_is_database_encrypted_empty_file() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("empty.db");
+
+        // Create an empty file
+        std::fs::File::create(&db_path).unwrap();
+
+        // Empty file should be treated as unencrypted/new
+        let result = is_database_encrypted(&db_path);
+        assert!(matches!(result, Ok(false)));
+    }
+
+    #[test]
+    fn test_is_database_encrypted_small_file() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("small.db");
+
+        // Create a file smaller than the SQLite header (16 bytes)
+        std::fs::write(&db_path, b"too small").unwrap();
+
+        // File too small to have a valid header should be treated as unencrypted/new
+        let result = is_database_encrypted(&db_path);
+        assert!(matches!(result, Ok(false)));
+    }
+
+    #[test]
+    fn test_is_database_encrypted_unencrypted_sqlite() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("plain.db");
+
+        // Create an unencrypted SQLite database
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch("CREATE TABLE test (id INTEGER);")
+            .unwrap();
+        drop(conn);
+
+        // Plain SQLite database should not be detected as encrypted
+        let result = is_database_encrypted(&db_path);
+        assert!(matches!(result, Ok(false)));
+    }
+
+    #[test]
+    fn test_is_database_encrypted_encrypted_sqlite() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("encrypted.db");
+
+        // Create an encrypted SQLite database
+        let config = EncryptionConfig::generate().unwrap();
+        let conn = Connection::open(&db_path).unwrap();
+        apply_encryption(&conn, &config).unwrap();
+        conn.execute_batch("CREATE TABLE test (id INTEGER);")
+            .unwrap();
+        drop(conn);
+
+        // Encrypted database should be detected as encrypted
+        let result = is_database_encrypted(&db_path);
+        assert!(matches!(result, Ok(true)));
+    }
+
+    #[test]
+    fn test_apply_encryption_new_database() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("new_encrypted.db");
+
+        let config = EncryptionConfig::generate().unwrap();
+        let conn = Connection::open(&db_path).unwrap();
+
+        // Apply encryption should succeed on new database
+        let result = apply_encryption(&conn, &config);
+        assert!(result.is_ok());
+
+        // Should be able to create tables and use the database
+        conn.execute_batch("CREATE TABLE test (id INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO test VALUES (42)", []).unwrap();
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM test", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_apply_encryption_reopen_correct_key() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("reopen.db");
+
+        let config = EncryptionConfig::generate().unwrap();
+        let key = *config.key();
+
+        // Create and populate the database
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            apply_encryption(&conn, &config).unwrap();
+            conn.execute_batch("CREATE TABLE test (id INTEGER);")
+                .unwrap();
+            conn.execute("INSERT INTO test VALUES (123)", []).unwrap();
+        }
+
+        // Reopen with the same key
+        let config2 = EncryptionConfig::new(key);
+        let conn2 = Connection::open(&db_path).unwrap();
+        let result = apply_encryption(&conn2, &config2);
+        assert!(result.is_ok());
+
+        // Verify data is still there
+        let value: i64 = conn2
+            .query_row("SELECT id FROM test", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(value, 123);
+    }
+
+    #[test]
+    fn test_apply_encryption_wrong_key() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("wrong_key.db");
+
+        // Create with key1
+        let config1 = EncryptionConfig::generate().unwrap();
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            apply_encryption(&conn, &config1).unwrap();
+            conn.execute_batch("CREATE TABLE test (id INTEGER);")
+                .unwrap();
+        }
+
+        // Try to open with key2
+        let config2 = EncryptionConfig::generate().unwrap();
+        let conn2 = Connection::open(&db_path).unwrap();
+        let result = apply_encryption(&conn2, &config2);
+
+        assert!(result.is_err());
+        assert!(matches!(result, Err(Error::WrongEncryptionKey)));
+    }
+
+    #[test]
+    fn test_apply_encryption_on_plain_database_fails() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("plain_then_encrypt.db");
+
+        // Create an unencrypted database with data
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch("CREATE TABLE test (id INTEGER);")
+                .unwrap();
+            conn.execute("INSERT INTO test VALUES (1)", []).unwrap();
+        }
+
+        // Try to open with encryption
+        let config = EncryptionConfig::generate().unwrap();
+        let conn2 = Connection::open(&db_path).unwrap();
+        let result = apply_encryption(&conn2, &config);
+
+        // Should fail because database is not encrypted
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_encryption_key_success() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("validate.db");
+
+        let config = EncryptionConfig::generate().unwrap();
+        let conn = Connection::open(&db_path).unwrap();
+        apply_encryption(&conn, &config).unwrap();
+
+        // Create a table so we have something to validate against
+        conn.execute_batch("CREATE TABLE test (id INTEGER);")
+            .unwrap();
+
+        // Key validation should succeed
+        let result = validate_encryption_key(&conn);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_encryption_persists_across_connections() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("persist.db");
+
+        let config = EncryptionConfig::generate().unwrap();
+        let key = *config.key();
+
+        // Create database and add data through multiple operations
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            apply_encryption(&conn, &config).unwrap();
+            conn.execute_batch("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);")
+                .unwrap();
+            conn.execute("INSERT INTO users (name) VALUES ('Alice')", [])
+                .unwrap();
+        }
+
+        // Open again and add more data
+        {
+            let config2 = EncryptionConfig::new(key);
+            let conn = Connection::open(&db_path).unwrap();
+            apply_encryption(&conn, &config2).unwrap();
+            conn.execute("INSERT INTO users (name) VALUES ('Bob')", [])
+                .unwrap();
+        }
+
+        // Final verification
+        let config3 = EncryptionConfig::new(key);
+        let conn = Connection::open(&db_path).unwrap();
+        apply_encryption(&conn, &config3).unwrap();
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM users", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 2);
+
+        // Verify specific names
+        let names: Vec<String> = conn
+            .prepare("SELECT name FROM users ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(names, vec!["Alice", "Bob"]);
+    }
+
+    #[test]
+    fn test_encrypted_database_binary_data() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("binary.db");
+
+        let config = EncryptionConfig::generate().unwrap();
+        let key = *config.key();
+
+        // Store binary data
+        let binary_data: Vec<u8> = (0..=255).collect();
+
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            apply_encryption(&conn, &config).unwrap();
+            conn.execute_batch("CREATE TABLE blobs (data BLOB);")
+                .unwrap();
+            conn.execute("INSERT INTO blobs VALUES (?)", [&binary_data])
+                .unwrap();
+        }
+
+        // Retrieve and verify
+        let config2 = EncryptionConfig::new(key);
+        let conn = Connection::open(&db_path).unwrap();
+        apply_encryption(&conn, &config2).unwrap();
+
+        let retrieved: Vec<u8> = conn
+            .query_row("SELECT data FROM blobs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(retrieved, binary_data);
     }
 }

@@ -292,4 +292,125 @@ mod tests {
         let result = verify_permissions(&test_file);
         assert!(result.is_err());
     }
+
+    #[test]
+    fn test_precreate_skips_memory_database() {
+        // In-memory databases should be skipped without error
+        let result = precreate_secure_database_file(":memory:");
+        assert!(result.is_ok());
+
+        // Other special SQLite paths
+        let result = precreate_secure_database_file(":temp:");
+        assert!(result.is_ok());
+
+        // Empty path
+        let result = precreate_secure_database_file("");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_precreate_skips_existing_file() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("existing.db");
+
+        // Create a file first
+        std::fs::write(&db_path, b"existing content").unwrap();
+
+        // precreate should skip it (not overwrite)
+        precreate_secure_database_file(&db_path).unwrap();
+
+        // Verify content is unchanged
+        let content = std::fs::read(&db_path).unwrap();
+        assert_eq!(content, b"existing content");
+    }
+
+    #[test]
+    fn test_set_secure_file_permissions_nonexistent() {
+        // Setting permissions on a non-existent file should succeed (no-op)
+        let result = set_secure_file_permissions("/nonexistent/path/file.db");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_create_nested_secure_directory() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let nested_dir = temp_dir.path().join("a").join("b").join("c").join("d");
+
+        create_secure_directory(&nested_dir).unwrap();
+        assert!(nested_dir.exists());
+        assert!(nested_dir.is_dir());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            // All directories in the chain should exist
+            assert!(temp_dir.path().join("a").exists());
+            assert!(temp_dir.path().join("a").join("b").exists());
+            assert!(temp_dir.path().join("a").join("b").join("c").exists());
+
+            // The deepest directory should have secure permissions
+            let perms = std::fs::metadata(&nested_dir).unwrap().permissions();
+            assert_eq!(perms.mode() & 0o777, 0o700);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_verify_permissions_nonexistent() {
+        // Verifying permissions on non-existent file should succeed
+        let result = verify_permissions("/nonexistent/path/file.db");
+        assert!(result.is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_verify_permissions_group_readable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let test_file = temp_dir.path().join("group_readable.db");
+
+        std::fs::File::create(&test_file).unwrap();
+
+        // Set group-readable permissions
+        let perms = std::fs::Permissions::from_mode(0o640);
+        std::fs::set_permissions(&test_file, perms).unwrap();
+
+        // Should fail verification
+        let result = verify_permissions(&test_file);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("insecure"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_verify_permissions_world_writable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let test_file = temp_dir.path().join("world_writable.db");
+
+        std::fs::File::create(&test_file).unwrap();
+
+        // Set world-writable permissions
+        let perms = std::fs::Permissions::from_mode(0o666);
+        std::fs::set_permissions(&test_file, perms).unwrap();
+
+        // Should fail verification
+        let result = verify_permissions(&test_file);
+        assert!(result.is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_secure_permissions_on_directory() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let secure_dir = temp_dir.path().join("secure_test");
+
+        create_secure_directory(&secure_dir).unwrap();
+
+        // Verify permissions
+        verify_permissions(&secure_dir).unwrap();
+    }
 }

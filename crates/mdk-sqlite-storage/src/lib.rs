@@ -199,7 +199,35 @@ impl MdkSqliteStorage {
     where
         P: AsRef<Path>,
     {
-        let config = keyring::get_or_create_db_key(service_id, db_key_id)?;
+        let file_path = file_path.as_ref();
+        let db_exists = file_path.exists();
+
+        let config = if db_exists {
+            // Database exists - check if it's encrypted before looking up the keyring.
+            // This provides accurate error messages when someone tries to open an
+            // unencrypted database with the encrypted constructor.
+            if !encryption::is_database_encrypted(file_path)? {
+                return Err(Error::UnencryptedDatabaseWithEncryption);
+            }
+
+            // Database is encrypted - only retrieve the key, don't create a new one.
+            // If the key is missing, we must fail to prevent generating a new key
+            // that won't decrypt the existing database.
+            match keyring::get_db_key(service_id, db_key_id)? {
+                Some(config) => config,
+                None => {
+                    return Err(Error::KeyringEntryMissingForExistingDatabase {
+                        db_path: file_path.display().to_string(),
+                        service_id: service_id.to_string(),
+                        db_key_id: db_key_id.to_string(),
+                    });
+                }
+            }
+        } else {
+            // Database doesn't exist - safe to generate a new key
+            keyring::get_or_create_db_key(service_id, db_key_id)?
+        };
+
         Self::new_internal(file_path, Some(config))
     }
 
@@ -219,6 +247,7 @@ impl MdkSqliteStorage {
     /// Returns an error if:
     /// - The encryption key is invalid
     /// - An existing database cannot be decrypted with the provided key
+    /// - An existing database was created without encryption
     /// - The database file cannot be created or opened
     /// - File permissions cannot be set
     ///
@@ -236,6 +265,14 @@ impl MdkSqliteStorage {
     where
         P: AsRef<Path>,
     {
+        let file_path = file_path.as_ref();
+
+        // If the database exists, verify it's encrypted before trying to use the key.
+        // This provides a clearer error than letting apply_encryption fail.
+        if file_path.exists() && !encryption::is_database_encrypted(file_path)? {
+            return Err(Error::UnencryptedDatabaseWithEncryption);
+        }
+
         Self::new_internal(file_path, Some(config))
     }
 
@@ -792,6 +829,732 @@ mod tests {
                     mode & 0o777
                 );
             }
+        }
+
+        #[test]
+        fn test_encrypted_storage_multiple_groups() {
+            use mdk_storage_traits::groups::GroupStorage;
+            use mdk_storage_traits::test_utils::cross_storage::create_test_group;
+
+            let temp_dir = tempdir().unwrap();
+            let db_path = temp_dir.path().join("multi_groups.db");
+
+            let config = EncryptionConfig::generate().unwrap();
+            let key = *config.key();
+
+            // Create storage and save multiple groups
+            {
+                let storage = MdkSqliteStorage::new_with_key(&db_path, config).unwrap();
+
+                for i in 0..5 {
+                    let mls_group_id = GroupId::from_slice(&[i; 8]);
+                    let mut group = create_test_group(mls_group_id);
+                    group.name = format!("Group {}", i);
+                    group.description = format!("Description {}", i);
+                    storage.save_group(group).unwrap();
+                }
+            }
+
+            // Reopen and verify all groups
+            let config2 = EncryptionConfig::new(key);
+            let storage2 = MdkSqliteStorage::new_with_key(&db_path, config2).unwrap();
+
+            let groups = storage2.all_groups().unwrap();
+            assert_eq!(groups.len(), 5);
+
+            for i in 0..5u8 {
+                let mls_group_id = GroupId::from_slice(&[i; 8]);
+                let group = storage2
+                    .find_group_by_mls_group_id(&mls_group_id)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(group.name, format!("Group {}", i));
+            }
+        }
+
+        #[test]
+        fn test_encrypted_storage_messages() {
+            use mdk_storage_traits::groups::GroupStorage;
+            use mdk_storage_traits::messages::MessageStorage;
+            use mdk_storage_traits::test_utils::cross_storage::{
+                create_test_group, create_test_message,
+            };
+            use nostr::EventId;
+
+            let temp_dir = tempdir().unwrap();
+            let db_path = temp_dir.path().join("messages.db");
+
+            let config = EncryptionConfig::generate().unwrap();
+            let key = *config.key();
+
+            let mls_group_id = GroupId::from_slice(&[1, 2, 3, 4]);
+
+            // Create storage, group, and messages
+            {
+                let storage = MdkSqliteStorage::new_with_key(&db_path, config).unwrap();
+
+                let group = create_test_group(mls_group_id.clone());
+                storage.save_group(group).unwrap();
+
+                // Save a message
+                let event_id = EventId::all_zeros();
+                let mut message = create_test_message(mls_group_id.clone(), event_id);
+                message.content = "Test message content".to_string();
+                storage.save_message(message).unwrap();
+            }
+
+            // Reopen and verify messages
+            let config2 = EncryptionConfig::new(key);
+            let storage2 = MdkSqliteStorage::new_with_key(&db_path, config2).unwrap();
+
+            let messages = storage2.messages(&mls_group_id).unwrap();
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0].content, "Test message content");
+        }
+
+        #[test]
+        fn test_encrypted_storage_welcomes() {
+            use mdk_storage_traits::groups::GroupStorage;
+            use mdk_storage_traits::test_utils::cross_storage::{
+                create_test_group, create_test_welcome,
+            };
+            use mdk_storage_traits::welcomes::WelcomeStorage;
+            use nostr::EventId;
+
+            let temp_dir = tempdir().unwrap();
+            let db_path = temp_dir.path().join("welcomes.db");
+
+            let config = EncryptionConfig::generate().unwrap();
+            let key = *config.key();
+
+            let mls_group_id = GroupId::from_slice(&[5, 6, 7, 8]);
+
+            // Create storage, group, and welcome
+            {
+                let storage = MdkSqliteStorage::new_with_key(&db_path, config).unwrap();
+
+                let group = create_test_group(mls_group_id.clone());
+                storage.save_group(group).unwrap();
+
+                let event_id = EventId::all_zeros();
+                let welcome = create_test_welcome(mls_group_id.clone(), event_id);
+                storage.save_welcome(welcome).unwrap();
+            }
+
+            // Reopen and verify
+            let config2 = EncryptionConfig::new(key);
+            let storage2 = MdkSqliteStorage::new_with_key(&db_path, config2).unwrap();
+
+            let welcomes = storage2.pending_welcomes().unwrap();
+            assert_eq!(welcomes.len(), 1);
+        }
+
+        #[test]
+        fn test_encrypted_storage_exporter_secrets() {
+            use mdk_storage_traits::groups::GroupStorage;
+            use mdk_storage_traits::groups::types::{Group, GroupExporterSecret, GroupState};
+
+            let temp_dir = tempdir().unwrap();
+            let db_path = temp_dir.path().join("exporter_secrets.db");
+
+            let config = EncryptionConfig::generate().unwrap();
+            let key = *config.key();
+
+            let mls_group_id = GroupId::from_slice(&[10, 20, 30, 40]);
+
+            // Create storage, group, and exporter secrets for multiple epochs
+            {
+                let storage = MdkSqliteStorage::new_with_key(&db_path, config).unwrap();
+
+                let group = Group {
+                    mls_group_id: mls_group_id.clone(),
+                    nostr_group_id: [0u8; 32],
+                    name: "Exporter Secret Test".to_string(),
+                    description: "Testing exporter secrets".to_string(),
+                    admin_pubkeys: BTreeSet::new(),
+                    last_message_id: None,
+                    last_message_at: None,
+                    epoch: 5,
+                    state: GroupState::Active,
+                    image_hash: None,
+                    image_key: None,
+                    image_nonce: None,
+                };
+                storage.save_group(group).unwrap();
+
+                // Save secrets for epochs 0-5
+                for epoch in 0..=5u64 {
+                    let secret = GroupExporterSecret {
+                        mls_group_id: mls_group_id.clone(),
+                        epoch,
+                        secret: [epoch as u8; 32],
+                    };
+                    storage.save_group_exporter_secret(secret).unwrap();
+                }
+            }
+
+            // Reopen and verify all secrets
+            let config2 = EncryptionConfig::new(key);
+            let storage2 = MdkSqliteStorage::new_with_key(&db_path, config2).unwrap();
+
+            for epoch in 0..=5u64 {
+                let secret = storage2
+                    .get_group_exporter_secret(&mls_group_id, epoch)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(secret.epoch, epoch);
+                assert_eq!(secret.secret[0], epoch as u8);
+            }
+
+            // Non-existent epoch should return None
+            let missing = storage2
+                .get_group_exporter_secret(&mls_group_id, 999)
+                .unwrap();
+            assert!(missing.is_none());
+        }
+
+        #[test]
+        fn test_encrypted_storage_with_nested_directory() {
+            let temp_dir = tempdir().unwrap();
+            let db_path = temp_dir
+                .path()
+                .join("deep")
+                .join("nested")
+                .join("path")
+                .join("db.sqlite");
+
+            let config = EncryptionConfig::generate().unwrap();
+            let storage = MdkSqliteStorage::new_with_key(&db_path, config);
+            assert!(storage.is_ok());
+
+            // Verify the nested directories were created
+            assert!(db_path.parent().unwrap().exists());
+            assert!(db_path.exists());
+
+            // Verify the database is encrypted
+            assert!(encryption::is_database_encrypted(&db_path).unwrap());
+        }
+
+        #[test]
+        fn test_encrypted_unencrypted_incompatibility() {
+            let temp_dir = tempdir().unwrap();
+            let db_path = temp_dir.path().join("compat_test.db");
+
+            // First create an unencrypted database
+            {
+                let _storage = MdkSqliteStorage::new_unencrypted(&db_path).unwrap();
+            }
+
+            // The database should NOT be encrypted
+            assert!(!encryption::is_database_encrypted(&db_path).unwrap());
+
+            // Now create an encrypted database at a different path
+            let encrypted_path = temp_dir.path().join("compat_encrypted.db");
+            {
+                let config = EncryptionConfig::generate().unwrap();
+                let _storage = MdkSqliteStorage::new_with_key(&encrypted_path, config).unwrap();
+            }
+
+            // The encrypted database SHOULD be encrypted
+            assert!(encryption::is_database_encrypted(&encrypted_path).unwrap());
+        }
+
+        #[test]
+        fn test_new_on_unencrypted_database_returns_correct_error() {
+            // This test verifies that when MdkSqliteStorage::new() is called on an
+            // existing unencrypted database (created with new_unencrypted()), the code
+            // returns UnencryptedDatabaseWithEncryption rather than the misleading
+            // KeyringEntryMissingForExistingDatabase error.
+
+            // Initialize the mock keyring store for this test
+            keyring_core::set_default_store(keyring_core::mock::Store::new().unwrap());
+
+            let temp_dir = tempdir().unwrap();
+            let db_path = temp_dir.path().join("unencrypted_then_new.db");
+
+            // Create an unencrypted database first
+            {
+                let _storage = MdkSqliteStorage::new_unencrypted(&db_path).unwrap();
+            }
+
+            // Verify the database is unencrypted
+            assert!(!encryption::is_database_encrypted(&db_path).unwrap());
+
+            // Now try to open it with new() - should fail with UnencryptedDatabaseWithEncryption
+            let result = MdkSqliteStorage::new(&db_path, "com.test.app", "test.key.id");
+
+            assert!(result.is_err());
+            match result {
+                Err(Error::UnencryptedDatabaseWithEncryption) => {
+                    // This is the expected error - the database was created unencrypted
+                    // and we're trying to open it with the encrypted constructor
+                }
+                Err(Error::KeyringEntryMissingForExistingDatabase { .. }) => {
+                    panic!(
+                        "Got KeyringEntryMissingForExistingDatabase but should have gotten \
+                         UnencryptedDatabaseWithEncryption. The database is unencrypted, not \
+                         encrypted with a missing key."
+                    );
+                }
+                Err(other) => {
+                    panic!("Unexpected error: {:?}", other);
+                }
+                Ok(_) => {
+                    panic!("Expected an error but got Ok");
+                }
+            }
+        }
+
+        #[test]
+        fn test_new_with_key_on_unencrypted_database_returns_correct_error() {
+            // This test verifies that when MdkSqliteStorage::new_with_key() is called on an
+            // existing unencrypted database, the code returns UnencryptedDatabaseWithEncryption
+            // rather than WrongEncryptionKey (which would be misleading).
+
+            let temp_dir = tempdir().unwrap();
+            let db_path = temp_dir.path().join("unencrypted_then_new_with_key.db");
+
+            // Create an unencrypted database first
+            {
+                let _storage = MdkSqliteStorage::new_unencrypted(&db_path).unwrap();
+            }
+
+            // Verify the database is unencrypted
+            assert!(!encryption::is_database_encrypted(&db_path).unwrap());
+
+            // Now try to open it with new_with_key() - should fail with
+            // UnencryptedDatabaseWithEncryption
+            let config = EncryptionConfig::generate().unwrap();
+            let result = MdkSqliteStorage::new_with_key(&db_path, config);
+
+            assert!(result.is_err());
+            match result {
+                Err(Error::UnencryptedDatabaseWithEncryption) => {
+                    // This is the expected error - the database was created unencrypted
+                    // and we're trying to open it with an encryption key
+                }
+                Err(Error::WrongEncryptionKey) => {
+                    panic!(
+                        "Got WrongEncryptionKey but should have gotten \
+                         UnencryptedDatabaseWithEncryption. The database is unencrypted, not \
+                         encrypted with a different key."
+                    );
+                }
+                Err(other) => {
+                    panic!("Unexpected error: {:?}", other);
+                }
+                Ok(_) => {
+                    panic!("Expected an error but got Ok");
+                }
+            }
+        }
+
+        #[test]
+        fn test_encrypted_storage_large_data() {
+            use mdk_storage_traits::groups::GroupStorage;
+            use mdk_storage_traits::messages::MessageStorage;
+            use mdk_storage_traits::test_utils::cross_storage::{
+                create_test_group, create_test_message,
+            };
+            use nostr::EventId;
+
+            let temp_dir = tempdir().unwrap();
+            let db_path = temp_dir.path().join("large_data.db");
+
+            let config = EncryptionConfig::generate().unwrap();
+            let key = *config.key();
+
+            let mls_group_id = GroupId::from_slice(&[99; 8]);
+
+            // Create storage with a large message
+            let large_content = "x".repeat(10_000);
+            {
+                let storage = MdkSqliteStorage::new_with_key(&db_path, config).unwrap();
+
+                let mut group = create_test_group(mls_group_id.clone());
+                group.name = "Large Data Test".to_string();
+                group.description = "Testing large data".to_string();
+                storage.save_group(group).unwrap();
+
+                let event_id = EventId::all_zeros();
+                let mut message = create_test_message(mls_group_id.clone(), event_id);
+                message.content = large_content.clone();
+                storage.save_message(message).unwrap();
+            }
+
+            // Reopen and verify
+            let config2 = EncryptionConfig::new(key);
+            let storage2 = MdkSqliteStorage::new_with_key(&db_path, config2).unwrap();
+
+            let messages = storage2.messages(&mls_group_id).unwrap();
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0].content, large_content);
+        }
+
+        #[test]
+        fn test_encrypted_storage_concurrent_reads() {
+            use mdk_storage_traits::groups::GroupStorage;
+            use mdk_storage_traits::test_utils::cross_storage::create_test_group;
+
+            let temp_dir = tempdir().unwrap();
+            let db_path = temp_dir.path().join("concurrent.db");
+
+            let config = EncryptionConfig::generate().unwrap();
+            let key = *config.key();
+
+            let mls_group_id = GroupId::from_slice(&[77; 8]);
+
+            // Create and populate the database
+            {
+                let storage = MdkSqliteStorage::new_with_key(&db_path, config).unwrap();
+
+                let mut group = create_test_group(mls_group_id.clone());
+                group.name = "Concurrent Test".to_string();
+                group.description = "Testing concurrent access".to_string();
+                storage.save_group(group).unwrap();
+            }
+
+            // Open two connections simultaneously
+            let config1 = EncryptionConfig::new(key);
+            let config2 = EncryptionConfig::new(key);
+
+            let storage1 = MdkSqliteStorage::new_with_key(&db_path, config1).unwrap();
+            let storage2 = MdkSqliteStorage::new_with_key(&db_path, config2).unwrap();
+
+            // Both should be able to read
+            let group1 = storage1
+                .find_group_by_mls_group_id(&mls_group_id)
+                .unwrap()
+                .unwrap();
+            let group2 = storage2
+                .find_group_by_mls_group_id(&mls_group_id)
+                .unwrap()
+                .unwrap();
+
+            assert_eq!(group1.name, group2.name);
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn test_encrypted_storage_sidecar_file_permissions() {
+            use std::os::unix::fs::PermissionsExt;
+
+            use mdk_storage_traits::groups::GroupStorage;
+            use mdk_storage_traits::test_utils::cross_storage::create_test_group;
+
+            let temp_dir = tempdir().unwrap();
+            let db_path = temp_dir.path().join("sidecar_test.db");
+
+            let config = EncryptionConfig::generate().unwrap();
+            let key = *config.key();
+
+            // Create and use the database to trigger WAL file creation
+            {
+                let storage = MdkSqliteStorage::new_with_key(&db_path, config).unwrap();
+
+                // Create multiple groups to generate some WAL activity
+                for i in 0..10 {
+                    let mls_group_id = GroupId::from_slice(&[i; 8]);
+                    let mut group = create_test_group(mls_group_id);
+                    group.name = format!("Group {}", i);
+                    group.description = format!("Description {}", i);
+                    storage.save_group(group).unwrap();
+                }
+            }
+
+            // Reopen to ensure any sidecar files exist
+            let config2 = EncryptionConfig::new(key);
+            let _storage2 = MdkSqliteStorage::new_with_key(&db_path, config2).unwrap();
+
+            // Check main database file permissions
+            let db_metadata = std::fs::metadata(&db_path).unwrap();
+            let db_mode = db_metadata.permissions().mode();
+            assert_eq!(
+                db_mode & 0o077,
+                0,
+                "Database file should have owner-only permissions, got {:o}",
+                db_mode & 0o777
+            );
+
+            // Check sidecar file permissions if they exist
+            let sidecar_suffixes = ["-wal", "-shm", "-journal"];
+            for suffix in &sidecar_suffixes {
+                let sidecar_path = temp_dir.path().join(format!("sidecar_test.db{}", suffix));
+                if sidecar_path.exists() {
+                    let metadata = std::fs::metadata(&sidecar_path).unwrap();
+                    let mode = metadata.permissions().mode();
+                    assert_eq!(
+                        mode & 0o077,
+                        0,
+                        "Sidecar file {} should have owner-only permissions, got {:o}",
+                        suffix,
+                        mode & 0o777
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn test_encryption_config_key_is_accessible() {
+            let key = [0xDE; 32];
+            let config = EncryptionConfig::new(key);
+
+            // Verify we can access the key
+            assert_eq!(config.key().len(), 32);
+            assert_eq!(config.key()[0], 0xDE);
+            assert_eq!(config.key()[31], 0xDE);
+        }
+
+        #[test]
+        fn test_encrypted_storage_empty_group_name() {
+            use mdk_storage_traits::groups::GroupStorage;
+            use mdk_storage_traits::test_utils::cross_storage::create_test_group;
+
+            let temp_dir = tempdir().unwrap();
+            let db_path = temp_dir.path().join("empty_name.db");
+
+            let config = EncryptionConfig::generate().unwrap();
+            let key = *config.key();
+
+            let mls_group_id = GroupId::from_slice(&[0xAB; 8]);
+
+            // Create storage with empty name
+            {
+                let storage = MdkSqliteStorage::new_with_key(&db_path, config).unwrap();
+
+                let mut group = create_test_group(mls_group_id.clone());
+                group.name = String::new();
+                group.description = String::new();
+                storage.save_group(group).unwrap();
+            }
+
+            // Reopen and verify
+            let config2 = EncryptionConfig::new(key);
+            let storage2 = MdkSqliteStorage::new_with_key(&db_path, config2).unwrap();
+
+            let group = storage2
+                .find_group_by_mls_group_id(&mls_group_id)
+                .unwrap()
+                .unwrap();
+            assert!(group.name.is_empty());
+            assert!(group.description.is_empty());
+        }
+
+        #[test]
+        fn test_encrypted_storage_unicode_content() {
+            use mdk_storage_traits::groups::GroupStorage;
+            use mdk_storage_traits::messages::MessageStorage;
+            use mdk_storage_traits::test_utils::cross_storage::{
+                create_test_group, create_test_message,
+            };
+            use nostr::EventId;
+
+            let temp_dir = tempdir().unwrap();
+            let db_path = temp_dir.path().join("unicode.db");
+
+            let config = EncryptionConfig::generate().unwrap();
+            let key = *config.key();
+
+            let mls_group_id = GroupId::from_slice(&[0xCD; 8]);
+            let unicode_content = "Hello 世界! 🎉 Ñoño مرحبا Привет 日本語 한국어 ελληνικά";
+
+            // Create storage with unicode content
+            {
+                let storage = MdkSqliteStorage::new_with_key(&db_path, config).unwrap();
+
+                let mut group = create_test_group(mls_group_id.clone());
+                group.name = "Тест группа 测试组".to_string();
+                group.description = "描述 описание".to_string();
+                storage.save_group(group).unwrap();
+
+                let event_id = EventId::all_zeros();
+                let mut message = create_test_message(mls_group_id.clone(), event_id);
+                message.content = unicode_content.to_string();
+                storage.save_message(message).unwrap();
+            }
+
+            // Reopen and verify
+            let config2 = EncryptionConfig::new(key);
+            let storage2 = MdkSqliteStorage::new_with_key(&db_path, config2).unwrap();
+
+            let group = storage2
+                .find_group_by_mls_group_id(&mls_group_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(group.name, "Тест группа 测试组");
+            assert_eq!(group.description, "描述 описание");
+
+            let messages = storage2.messages(&mls_group_id).unwrap();
+            assert_eq!(messages[0].content, unicode_content);
+        }
+
+        /// Test that opening an existing database fails when keyring entry is missing.
+        ///
+        /// This verifies the fix for the issue where a missing keyring entry would
+        /// cause a new key to be generated instead of failing immediately.
+        #[test]
+        fn test_existing_db_with_missing_keyring_entry_fails() {
+            use keyring_core::Entry;
+
+            // Check if keyring is available
+            if Entry::new("test.mdk.lib", "test.availability").is_err() {
+                eprintln!("Skipping test: no keyring store available");
+                return;
+            }
+
+            let temp_dir = tempdir().unwrap();
+            let db_path = temp_dir.path().join("missing_key_test.db");
+
+            let service_id = "test.mdk.storage.missingkey";
+            let db_key_id = "test.key.missingkeytest";
+
+            // Clean up any existing key
+            let _ = keyring::delete_db_key(service_id, db_key_id);
+
+            // First, create an encrypted database using automatic key management
+            {
+                let storage = MdkSqliteStorage::new(&db_path, service_id, db_key_id);
+                assert!(storage.is_ok(), "Should create database successfully");
+            }
+
+            // Verify database exists
+            assert!(db_path.exists(), "Database file should exist");
+
+            // Delete the keyring entry to simulate key loss
+            keyring::delete_db_key(service_id, db_key_id).unwrap();
+
+            // Verify keyring entry is gone
+            let key_check = keyring::get_db_key(service_id, db_key_id).unwrap();
+            assert!(key_check.is_none(), "Key should be deleted");
+
+            // Now try to open the existing database - this should fail with a clear error
+            // instead of generating a new key
+            let result = MdkSqliteStorage::new(&db_path, service_id, db_key_id);
+
+            assert!(result.is_err(), "Should fail when keyring entry is missing");
+
+            match result {
+                Err(error::Error::KeyringEntryMissingForExistingDatabase {
+                    db_path: err_path,
+                    service_id: err_service,
+                    db_key_id: err_key,
+                }) => {
+                    assert!(
+                        err_path.contains("missing_key_test.db"),
+                        "Error should contain database path"
+                    );
+                    assert_eq!(err_service, service_id);
+                    assert_eq!(err_key, db_key_id);
+                }
+                Err(e) => panic!(
+                    "Expected KeyringEntryMissingForExistingDatabase error, got: {:?}",
+                    e
+                ),
+                Ok(_) => panic!("Expected error but got success"),
+            }
+
+            // Verify that no new key was stored in the keyring
+            let key_after = keyring::get_db_key(service_id, db_key_id).unwrap();
+            assert!(
+                key_after.is_none(),
+                "No new key should have been stored in keyring"
+            );
+        }
+
+        /// Test that creating a new database with automatic key management works.
+        #[test]
+        fn test_new_db_with_keyring_creates_key() {
+            use keyring_core::Entry;
+
+            // Check if keyring is available
+            if Entry::new("test.mdk.lib", "test.availability").is_err() {
+                eprintln!("Skipping test: no keyring store available");
+                return;
+            }
+
+            let temp_dir = tempdir().unwrap();
+            let db_path = temp_dir.path().join("new_db_keyring.db");
+
+            let service_id = "test.mdk.storage.newdb";
+            let db_key_id = "test.key.newdbtest";
+
+            // Clean up any existing key
+            let _ = keyring::delete_db_key(service_id, db_key_id);
+
+            // Verify database doesn't exist
+            assert!(!db_path.exists(), "Database should not exist yet");
+
+            // Create a new database - should succeed and create a key
+            let storage = MdkSqliteStorage::new(&db_path, service_id, db_key_id);
+            assert!(storage.is_ok(), "Should create database successfully");
+
+            // Verify database exists
+            assert!(db_path.exists(), "Database file should exist");
+
+            // Verify key was stored
+            let key = keyring::get_db_key(service_id, db_key_id).unwrap();
+            assert!(key.is_some(), "Key should be stored in keyring");
+
+            // Verify database is encrypted
+            assert!(
+                encryption::is_database_encrypted(&db_path).unwrap(),
+                "Database should be encrypted"
+            );
+
+            // Clean up
+            drop(storage);
+            keyring::delete_db_key(service_id, db_key_id).unwrap();
+        }
+
+        /// Test that reopening a database with keyring works when the key is present.
+        #[test]
+        fn test_reopen_db_with_keyring_succeeds() {
+            use mdk_storage_traits::groups::GroupStorage;
+            use mdk_storage_traits::test_utils::cross_storage::create_test_group;
+
+            use keyring_core::Entry;
+
+            // Check if keyring is available
+            if Entry::new("test.mdk.lib", "test.availability").is_err() {
+                eprintln!("Skipping test: no keyring store available");
+                return;
+            }
+
+            let temp_dir = tempdir().unwrap();
+            let db_path = temp_dir.path().join("reopen_keyring.db");
+
+            let service_id = "test.mdk.storage.reopen";
+            let db_key_id = "test.key.reopentest";
+
+            // Clean up any existing key
+            let _ = keyring::delete_db_key(service_id, db_key_id);
+
+            let mls_group_id = GroupId::from_slice(&[0xAA; 8]);
+
+            // Create database and save a group
+            {
+                let storage = MdkSqliteStorage::new(&db_path, service_id, db_key_id).unwrap();
+
+                let mut group = create_test_group(mls_group_id.clone());
+                group.name = "Keyring Reopen Test".to_string();
+                storage.save_group(group).unwrap();
+            }
+
+            // Reopen with the same keyring entry - should succeed
+            let storage2 = MdkSqliteStorage::new(&db_path, service_id, db_key_id);
+            assert!(storage2.is_ok(), "Should reopen database successfully");
+
+            // Verify data persisted
+            let storage2 = storage2.unwrap();
+            let group = storage2
+                .find_group_by_mls_group_id(&mls_group_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(group.name, "Keyring Reopen Test");
+
+            // Clean up
+            drop(storage2);
+            keyring::delete_db_key(service_id, db_key_id).unwrap();
         }
     }
 }
