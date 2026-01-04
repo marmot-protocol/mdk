@@ -25,6 +25,46 @@ pub enum Error {
         /// Actual size/length in bytes
         actual_size: usize,
     },
+
+    // Encryption-related errors
+
+    /// Database encryption key has invalid length (expected 32 bytes)
+    #[error("Invalid encryption key length: expected 32 bytes, got {0} bytes")]
+    InvalidKeyLength(usize),
+
+    /// Wrong encryption key provided for existing database
+    #[error("Wrong encryption key: database cannot be decrypted with the provided key")]
+    WrongEncryptionKey,
+
+    /// Attempted to open an encrypted database without providing a key
+    #[error("Encrypted database requires an encryption key")]
+    EncryptedDatabaseRequiresKey,
+
+    /// Attempted to open an unencrypted database with encryption enabled
+    #[error("Cannot open unencrypted database with encryption: database was created without encryption")]
+    UnencryptedDatabaseWithEncryption,
+
+    /// Failed to generate random key
+    #[error("Failed to generate encryption key: {0}")]
+    KeyGeneration(String),
+
+    /// File permission error
+    #[error("File permission error: {0}")]
+    FilePermission(String),
+
+    // Keyring-related errors
+
+    /// Keyring operation failed
+    #[error("Keyring error: {0}")]
+    Keyring(String),
+
+    /// Keyring store not initialized
+    ///
+    /// The host application must initialize a platform-specific keyring store
+    /// before using encrypted storage. See the MDK documentation for platform-specific
+    /// setup instructions.
+    #[error("Keyring store not initialized. The host application must call keyring_core::set_default_store() with a platform-specific store before using encrypted storage. Details: {0}")]
+    KeyringNotInitialized(String),
 }
 
 impl From<std::io::Error> for Error {

@@ -418,36 +418,30 @@ fn get_or_create_db_key(service_id: &str, db_key_id: &str) -> Result<Vec<u8>, Er
 
 #### Cargo.toml Changes
 
+**Implemented configuration** (encryption is always enabled, platform stores are host responsibility):
+
 ```toml
 # Workspace Cargo.toml
 [workspace.dependencies]
-keyring-core = "0.7"
-apple-native-keyring-store = "0.2"
-android-native-keyring-store = "0.3"
-windows-native-keyring-store = "0.2"
-linux-keyutils-keyring-store = "0.2"
-getrandom = "0.2"
+keyring-core = "0.7"  # v4 architecture - see https://github.com/open-source-cooperative/keyring-rs/issues/259
+getrandom = "0.3"
+hex = "0.4"
 
 # mdk-sqlite-storage/Cargo.toml
-[features]
-default = []
-encryption = ["keyring-core", "getrandom"]
-
-# Platform-specific store features (user enables one)
-apple-keyring = ["encryption", "apple-native-keyring-store"]
-android-keyring = ["encryption", "android-native-keyring-store"]
-windows-keyring = ["encryption", "windows-native-keyring-store"]
-linux-keyring = ["encryption", "linux-keyutils-keyring-store"]
-
 [dependencies]
-keyring-core = { workspace = true, optional = true }
-apple-native-keyring-store = { workspace = true, optional = true }
-android-native-keyring-store = { workspace = true, optional = true }
-windows-native-keyring-store = { workspace = true, optional = true }
-linux-keyutils-keyring-store = { workspace = true, optional = true }
-getrandom = { workspace = true, optional = true }
+keyring-core.workspace = true
+getrandom.workspace = true
+hex = { workspace = true, features = ["std"] }
 rusqlite = { workspace = true, features = ["bundled-sqlcipher"] }
 ```
+
+**Note:** Platform-specific store crates (`apple-native-keyring-store`, `android-native-keyring-store`, etc.) are **not bundled** with MDK. The host application is responsible for:
+
+1. Adding the appropriate platform store crate to their dependencies
+2. Initializing the store at app startup via `keyring_core::set_default_store(...)`
+3. Calling `MdkSqliteStorage::new(path, service_id, db_key_id)`
+
+This design keeps MDK platform-agnostic and avoids pulling in unnecessary platform-specific dependencies.
 
 ### 4. Project-Specific Usage Examples (see Part B)
 
@@ -657,30 +651,31 @@ fn set_secure_file_permissions(_path: &Path) -> std::io::Result<()> {
 
 ### Phase 1: Validate `keyring-core` Ecosystem
 
-- [ ] Verify MSRV compatibility (MDK requires Rust 1.90.0)
+- [x] Verify MSRV compatibility (MDK requires Rust 1.90.0) — `keyring-core` 0.7.x compiles with Rust 1.90.0
 - [ ] Test `keyring-core` + `apple-native-keyring-store` on macOS
 - [ ] Test `keyring-core` + `android-native-keyring-store` on Android emulator
-- [ ] Document any initialization quirks or platform-specific requirements
-- [ ] Evaluate `keyring-core` error handling for our use cases
+- [x] Document any initialization quirks or platform-specific requirements — documented in `keyring` module and lib.rs docs
+- [x] Evaluate `keyring-core` error handling for our use cases — added `Error::Keyring` and `Error::KeyringNotInitialized` variants
 
 ### Phase 2: SQLCipher Integration in `mdk-sqlite-storage`
 
-- [ ] Update `Cargo.toml` to use `bundled-sqlcipher` feature
-- [ ] Add `keyring-core` dependency and platform store feature flags
-- [ ] Add `EncryptionConfig` struct
-- [ ] Implement `get_or_create_db_key(service_id, db_key_id)` helper using `keyring_core::Entry`
-- [ ] Rename existing unencrypted constructor to `MdkSqliteStorage::new_unencrypted()`
-- [ ] Add `MdkSqliteStorage::new(file_path, service_id, db_key_id)` (encrypted) as the primary constructor
-- [ ] Apply SQLCipher pragmas on **each** new connection before any migrations / foreign key pragmas:
-  - [ ] `PRAGMA key = "x'...'"` (**must be the first operation**)
-  - [ ] `PRAGMA cipher_compatibility = 4;`
-  - [ ] `PRAGMA temp_store = MEMORY;`
-  - [ ] Validate with a read (e.g., `SELECT count(*) FROM sqlite_master;`) to distinguish wrong key from other failures
+- [x] Update `Cargo.toml` to use `bundled-sqlcipher` feature
+- [x] Add `keyring-core` dependency (platform stores are host responsibility, not bundled)
+- [x] Add `EncryptionConfig` struct
+- [x] Implement `get_or_create_db_key(service_id, db_key_id)` helper using `keyring_core::Entry`
+- [x] Rename existing unencrypted constructor to `MdkSqliteStorage::new_unencrypted()`
+- [x] Add `MdkSqliteStorage::new(file_path, service_id, db_key_id)` (encrypted) as the primary constructor
+- [x] Also added `MdkSqliteStorage::new_with_key(file_path, config)` for direct key injection
+- [x] Apply SQLCipher pragmas on **each** new connection before any migrations / foreign key pragmas:
+  - [x] `PRAGMA key = "x'...'"` (**must be the first operation**)
+  - [x] `PRAGMA cipher_compatibility = 4;`
+  - [x] `PRAGMA temp_store = MEMORY;`
+  - [x] Validate with a read (e.g., `SELECT count(*) FROM sqlite_master;`) to distinguish wrong key from other failures
 - [ ] **Compile-time**: Investigate temp-store hardening (`SQLITE_TEMP_STORE=3` where feasible; default Rust SQLCipher builds use `=2`, Android commonly uses `=3`)
-- [ ] Add explicit errors for missing key for an existing DB, wrong key, plaintext DB when encryption is required, corrupted DB, and secure-storage-unavailable/uninitialized
-- [ ] Add file permission hardening for Unix platforms (0700 for directories, 0600 for files; avoid `chmod` on arbitrary existing directories; pre-create DB file with 0600 to avoid permission races)
-- [ ] Add file permission hardening for Windows (ACL-based, current user only)
-- [ ] Add unit tests for encrypted storage (using `keyring-core` mock store)
+- [x] Add explicit errors for missing key for an existing DB, wrong key, plaintext DB when encryption is required, corrupted DB, and secure-storage-unavailable/uninitialized
+- [x] Add file permission hardening for Unix platforms (0700 for directories, 0600 for files; avoid `chmod` on arbitrary existing directories; pre-create DB file with 0600 to avoid permission races)
+- [ ] Add file permission hardening for Windows (ACL-based, current user only) — placeholder exists, full implementation pending
+- [x] Add unit tests for encrypted storage
 - [ ] Test cross-platform compilation (iOS, Android, macOS, Linux, Windows)
 
 ### Phase 3: Android Integration Testing
@@ -693,11 +688,12 @@ fn set_secure_file_permissions(_path: &Path) -> std::io::Result<()> {
 
 ### Phase 4: UniFFI Binding Updates
 
-- [ ] Add `new_mdk(db_path, service_id, db_key_id)` as the primary constructor (encrypted by default)
-- [ ] Add `new_unencrypted_mdk(db_path)` for testing/development use with clear warnings
+- [x] Add `new_mdk(db_path, service_id, db_key_id)` as the primary constructor (encrypted by default)
+- [x] Add `new_mdk_unencrypted(db_path)` for testing/development use with clear warnings
+- [x] Add `new_mdk_with_key(db_path, encryption_key)` for direct key injection
 - [ ] Export keyring store initialization functions if needed
-- [ ] Update generated bindings for Swift, Kotlin, Python, Ruby
-- [ ] Add documentation for platform-specific store setup
+- [x] Update documentation for Swift, Kotlin, Python, Ruby (updated README.md and language-specific docs)
+- [x] Add documentation for platform-specific store setup
 
 ### Phase 5: Migration Support
 

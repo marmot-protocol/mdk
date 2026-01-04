@@ -198,10 +198,42 @@ let mdk = MDK::new(MdkMemoryStorage::default());
 
 ### SQLite Storage (Production)
 
+For production use, the recommended approach uses automatic key management with `keyring-core`.
+First, initialize your platform's keyring store, then create the MDK instance:
+
+```rust,ignore
+use mdk_sqlite_storage::MdkSqliteStorage;
+
+// First, initialize platform keyring (once at app startup)
+// e.g., keyring_core::set_default_store(AppleStore::new());
+
+// MDK handles key generation and secure storage automatically
+let storage = MdkSqliteStorage::new(
+    "path/to/database.db",
+    "com.example.myapp",      // Service identifier
+    "mdk.db.key.default"      // Key identifier
+)?;
+let mdk = MDK::new(storage);
+```
+
+If you need to manage encryption keys yourself:
+
+```rust
+use mdk_sqlite_storage::{MdkSqliteStorage, EncryptionConfig};
+
+let key = [0u8; 32]; // Your securely stored 32-byte key
+let config = EncryptionConfig::new(key);
+let storage = MdkSqliteStorage::new_with_key("path/to/database.db", config)?;
+let mdk = MDK::new(storage);
+```
+
+For development/testing only (unencrypted):
+
 ```rust
 use mdk_sqlite_storage::MdkSqliteStorage;
 
-let storage = MdkSqliteStorage::new("path/to/database.db").await?;
+// ⚠️ WARNING: Unencrypted - for development only
+let storage = MdkSqliteStorage::new_unencrypted("path/to/database.db")?;
 let mdk = MDK::new(storage);
 ```
 

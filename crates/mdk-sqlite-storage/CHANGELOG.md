@@ -32,6 +32,9 @@
 ### Changed
 
 - Simplified validation logic to use range contains pattern for better readability ([#110](https://github.com/marmot-protocol/mdk/pull/110))
+- SQLite is now built with SQLCipher support (`bundled-sqlcipher`) instead of plain SQLite
+  (`bundled`). This enables transparent AES-256 encryption of the database at rest. Encryption is now always enabled (no feature flag required). SQLCipher dependencies are
+  always included. ([#102](https://github.com/marmot-protocol/mdk/pull/102))
 
 ### Added
 
@@ -42,6 +45,33 @@
   - JSON fields limited to 50-100KB
   - New `Validation` error variant for validation failures
 - Implemented pagination support using `Pagination` struct for pending welcomes ([#110](https://github.com/marmot-protocol/mdk/pull/110))
+- **Automatic key management with `keyring-core`**: The primary constructor `new()` now handles
+  encryption key generation and secure storage automatically. Keys are stored in the platform's
+  native credential store. ([#102](https://github.com/marmot-protocol/mdk/pull/102))
+- New `keyring` module with secure key storage utilities: ([#102](https://github.com/marmot-protocol/mdk/pull/102))
+  - `get_or_create_db_key()` - Retrieve or generate encryption key from keyring
+  - `delete_db_key()` - Remove key from keyring (for re-keying or cleanup)
+- **SQLCipher encryption support**: All databases are encrypted using SQLCipher with AES-256. ([#102](https://github.com/marmot-protocol/mdk/pull/102))
+- New `EncryptionConfig` struct for direct key management: ([#102](https://github.com/marmot-protocol/mdk/pull/102))
+  - `EncryptionConfig::new(key)` - Create config from a 32-byte key
+  - `EncryptionConfig::from_slice(key)` - Create config from a byte slice
+  - `EncryptionConfig::generate()` - Generate a random key
+- New `encryption` module with SQLCipher utilities: ([#102](https://github.com/marmot-protocol/mdk/pull/102))
+  - `apply_encryption()` - Apply encryption to a connection
+  - `is_database_encrypted()` - Check if a database file is encrypted
+- New error variants: ([#102](https://github.com/marmot-protocol/mdk/pull/102))
+  - `Error::InvalidKeyLength` - Key is not 32 bytes
+  - `Error::WrongEncryptionKey` - Database cannot be decrypted with the provided key
+  - `Error::EncryptedDatabaseRequiresKey` - Encrypted database opened without a key
+  - `Error::UnencryptedDatabaseWithEncryption` - Unencrypted database opened with a key
+  - `Error::KeyGeneration` - Failed to generate random key
+  - `Error::FilePermission` - File permission error
+  - `Error::Keyring` - Keyring operation failed
+  - `Error::KeyringNotInitialized` - No keyring store has been set up
+- File permission hardening on Unix platforms: ([#102](https://github.com/marmot-protocol/mdk/pull/102))
+  - Database directories are created with mode 0700 (owner-only access)
+  - Database files are set to mode 0600 (owner read/write only)
+  - SQLite sidecar files (-wal, -shm, -journal) also receive secure permissions
 
 ### Fixed
 
