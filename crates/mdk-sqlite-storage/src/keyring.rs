@@ -117,9 +117,7 @@ pub fn get_or_create_db_key(service_id: &str, db_key_id: &str) -> Result<Encrypt
 
             // Store the new key
             entry.set_secret(config.key()).map_err(|e| match e {
-                KeyringError::NoStorageAccess(err) => {
-                    Error::KeyringNotInitialized(err.to_string())
-                }
+                KeyringError::NoStorageAccess(err) => Error::KeyringNotInitialized(err.to_string()),
                 other => Error::Keyring(format!(
                     "Failed to store encryption key in keyring: {}",
                     other
