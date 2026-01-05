@@ -44,8 +44,6 @@
 
 ### Removed
 
-- Removed `MAX_PENDING_WELCOMES_OFFSET` constant ([#110](https://github.com/marmot-protocol/mdk/pull/110))
-
 ### Deprecated
 
 ## [0.5.1] - 2025-10-01
