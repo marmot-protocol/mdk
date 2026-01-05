@@ -3716,4 +3716,228 @@ mod tests {
             "Expected success when rumor pubkey matches credential"
         );
     }
+
+    /// Test that validation failures persist failed processing state
+    ///
+    /// This test verifies that when message validation fails (e.g., wrong event kind),
+    /// a failed processing record is saved to prevent expensive reprocessing.
+    #[test]
+    fn test_validation_failure_persists_failed_state() {
+        let mdk = create_test_mdk();
+        let keys = Keys::generate();
+
+        // Create an event with wrong kind (should be 445, but we use 1)
+        let event = EventBuilder::new(Kind::Metadata, "")
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        // First attempt should fail validation
+        let result = mdk.process_message(&event);
+        assert!(result.is_err(), "Expected validation error");
+
+        // Check that a failed processing record was saved
+        let processed = mdk
+            .storage()
+            .find_processed_message_by_event_id(&event.id)
+            .unwrap();
+        assert!(processed.is_some(), "Failed record should be saved");
+        let processed = processed.unwrap();
+        assert_eq!(
+            processed.state,
+            message_types::ProcessedMessageState::Failed,
+            "State should be Failed"
+        );
+        assert!(
+            processed.failure_reason.is_some(),
+            "Failure reason should be set"
+        );
+        assert!(
+            processed
+                .failure_reason
+                .unwrap()
+                .contains("Validation failed"),
+            "Failure reason should mention validation"
+        );
+    }
+
+    /// Test that repeated validation failures are rejected immediately
+    ///
+    /// This test verifies the deduplication mechanism prevents reprocessing
+    /// of previously failed events, mitigating DoS attacks.
+    #[test]
+    fn test_repeated_validation_failure_rejected_immediately() {
+        let mdk = create_test_mdk();
+        let keys = Keys::generate();
+
+        // Create an event with wrong kind
+        let event = EventBuilder::new(Kind::Metadata, "")
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        // First attempt - full validation
+        let result1 = mdk.process_message(&event);
+        assert!(result1.is_err(), "First attempt should fail validation");
+
+        // Second attempt - should be rejected immediately via deduplication
+        let result2 = mdk.process_message(&event);
+        assert!(result2.is_err(), "Second attempt should also fail");
+        assert!(
+            result2
+                .unwrap_err()
+                .to_string()
+                .contains("Message previously failed"),
+            "Error should indicate previous failure"
+        );
+    }
+
+    /// Test that decryption failures persist failed processing state
+    ///
+    /// This test verifies that when message decryption fails (e.g., group not found),
+    /// a failed processing record is saved to prevent expensive reprocessing.
+    #[test]
+    fn test_decryption_failure_persists_failed_state() {
+        let mdk = create_test_mdk();
+        let keys = Keys::generate();
+
+        // Create a valid-looking event but for a non-existent group
+        let fake_group_id = hex::encode([42u8; 32]);
+        let tag = Tag::custom(TagKind::h(), [fake_group_id]);
+        let event = EventBuilder::new(Kind::MlsGroupMessage, "encrypted_content")
+            .tag(tag)
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        // First attempt should fail decryption (group not found)
+        let result = mdk.process_message(&event);
+        assert!(result.is_err(), "Expected decryption error");
+
+        // Check that a failed processing record was saved
+        let processed = mdk
+            .storage()
+            .find_processed_message_by_event_id(&event.id)
+            .unwrap();
+        assert!(processed.is_some(), "Failed record should be saved");
+        let processed = processed.unwrap();
+        assert_eq!(
+            processed.state,
+            message_types::ProcessedMessageState::Failed,
+            "State should be Failed"
+        );
+        assert!(
+            processed.failure_reason.is_some(),
+            "Failure reason should be set"
+        );
+        assert!(
+            processed
+                .failure_reason
+                .unwrap()
+                .contains("Decryption failed"),
+            "Failure reason should mention decryption"
+        );
+    }
+
+    /// Test that repeated decryption failures are rejected immediately
+    ///
+    /// This test verifies the deduplication mechanism works for decryption failures,
+    /// preventing expensive repeated decryption attempts.
+    #[test]
+    fn test_repeated_decryption_failure_rejected_immediately() {
+        let mdk = create_test_mdk();
+        let keys = Keys::generate();
+
+        // Create a valid-looking event but for a non-existent group
+        let fake_group_id = hex::encode([42u8; 32]);
+        let tag = Tag::custom(TagKind::h(), [fake_group_id]);
+        let event = EventBuilder::new(Kind::MlsGroupMessage, "encrypted_content")
+            .tag(tag)
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        // First attempt - full decryption attempt
+        let result1 = mdk.process_message(&event);
+        assert!(result1.is_err(), "First attempt should fail decryption");
+
+        // Second attempt - should be rejected immediately via deduplication
+        let result2 = mdk.process_message(&event);
+        assert!(result2.is_err(), "Second attempt should also fail");
+        assert!(
+            result2
+                .unwrap_err()
+                .to_string()
+                .contains("Message previously failed"),
+            "Error should indicate previous failure"
+        );
+    }
+
+    /// Test that missing group ID tag persists failed state
+    ///
+    /// This test verifies that validation failures for missing required tags
+    /// are properly persisted to prevent reprocessing.
+    #[test]
+    fn test_missing_group_id_tag_persists_failed_state() {
+        let mdk = create_test_mdk();
+        let keys = Keys::generate();
+
+        // Create an event with correct kind but missing group ID tag
+        let event = EventBuilder::new(Kind::MlsGroupMessage, "encrypted_content")
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        // First attempt should fail validation
+        let result = mdk.process_message(&event);
+        assert!(result.is_err(), "Expected validation error");
+
+        // Check that a failed processing record was saved
+        let processed = mdk
+            .storage()
+            .find_processed_message_by_event_id(&event.id)
+            .unwrap();
+        assert!(processed.is_some(), "Failed record should be saved");
+        let processed = processed.unwrap();
+        assert_eq!(
+            processed.state,
+            message_types::ProcessedMessageState::Failed,
+            "State should be Failed"
+        );
+    }
+
+    /// Test that deduplication only blocks Failed state
+    ///
+    /// This test verifies that the deduplication check only prevents reprocessing
+    /// of Failed messages, allowing normal message flow for other states.
+    #[test]
+    fn test_deduplication_only_blocks_failed_state() {
+        let mdk = create_test_mdk();
+        let keys = Keys::generate();
+
+        // Create a test event
+        let event = EventBuilder::new(Kind::Metadata, "")
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        // Manually save a Processed state (simulating a successfully processed message)
+        let processed_message = message_types::ProcessedMessage {
+            wrapper_event_id: event.id,
+            message_event_id: None,
+            processed_at: nostr::Timestamp::now(),
+            state: message_types::ProcessedMessageState::Processed,
+            failure_reason: None,
+        };
+        mdk.storage()
+            .save_processed_message(processed_message)
+            .unwrap();
+
+        // Attempting to process again should not be blocked by deduplication
+        // (it will fail for other reasons like wrong kind, but not due to deduplication)
+        let result = mdk.process_message(&event);
+        assert!(result.is_err());
+        // The error should NOT be about "previously failed"
+        assert!(
+            !result
+                .unwrap_err()
+                .to_string()
+                .contains("Message previously failed"),
+            "Should not be blocked by deduplication for non-Failed state"
+        );
+    }
 }
