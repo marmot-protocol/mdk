@@ -1098,7 +1098,17 @@ where
             Ok(id) => id,
             Err(e) => {
                 // Save failed processing record to prevent reprocessing
-                self.save_failed_processed_message(event.id, &format!("Validation failed: {}", e))?;
+                // Don't fail if we can't save the failure record - log and continue
+                if let Err(save_err) = self
+                    .save_failed_processed_message(event.id, &format!("Validation failed: {}", e))
+                {
+                    tracing::warn!(
+                        target: "mdk_core::messages::process_message",
+                        "Failed to persist failure record: {}. Original error: {}",
+                        save_err,
+                        e
+                    );
+                }
                 return Err(e);
             }
         };
@@ -1110,7 +1120,17 @@ where
             Ok(result) => result,
             Err(e) => {
                 // Save failed processing record to prevent reprocessing
-                self.save_failed_processed_message(event.id, &format!("Decryption failed: {}", e))?;
+                // Don't fail if we can't save the failure record - log and continue
+                if let Err(save_err) = self
+                    .save_failed_processed_message(event.id, &format!("Decryption failed: {}", e))
+                {
+                    tracing::warn!(
+                        target: "mdk_core::messages::process_message",
+                        "Failed to persist failure record: {}. Original error: {}",
+                        save_err,
+                        e
+                    );
+                }
                 return Err(e);
             }
         };
