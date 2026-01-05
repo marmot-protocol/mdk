@@ -556,4 +556,52 @@ mod tests {
             .unwrap();
         assert_eq!(retrieved, binary_data);
     }
+
+    #[test]
+    fn test_apply_encryption_on_corrupted_database() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("corrupted.db");
+
+        // Create a file that looks like a database but is corrupted
+        std::fs::write(&db_path, b"corrupted database content").unwrap();
+
+        let config = EncryptionConfig::generate().unwrap();
+        let conn = Connection::open(&db_path).unwrap();
+        let result = apply_encryption(&conn, &config);
+
+        // Should fail because the file is corrupted
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_is_database_encrypted_with_partial_write() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("partial.db");
+
+        // Create a file that's partially written (less than 16 bytes)
+        std::fs::write(&db_path, b"partial").unwrap();
+
+        // Should not be detected as encrypted (too small)
+        let result = is_database_encrypted(&db_path).unwrap();
+        assert!(!result);
+    }
+
+    #[test]
+    fn test_encryption_config_generate_produces_unique_keys() {
+        // Generate many keys and verify they're all different
+        let keys: Vec<_> = (0..100)
+            .map(|_| *EncryptionConfig::generate().unwrap().key())
+            .collect();
+
+        // Check that all keys are unique
+        for i in 0..keys.len() {
+            for j in (i + 1)..keys.len() {
+                assert_ne!(
+                    keys[i], keys[j],
+                    "Generated keys should be unique (with overwhelming probability)"
+                );
+            }
+        }
+    }
+
 }

@@ -670,7 +670,21 @@ mod tests {
     // ========================================
 
     mod encryption_tests {
+        use std::sync::OnceLock;
+
         use super::*;
+
+        /// Ensures the mock keyring store is initialized exactly once for all tests.
+        ///
+        /// `keyring_core::set_default_store` can only be called once per process,
+        /// so we use `OnceLock` to ensure it's only initialized on the first call.
+        fn ensure_mock_store() {
+            static MOCK_STORE_INIT: OnceLock<()> = OnceLock::new();
+            MOCK_STORE_INIT.get_or_init(|| {
+                // Initialize the mock store for testing
+                keyring_core::set_default_store(keyring_core::mock::Store::new().unwrap());
+            });
+        }
 
         #[test]
         fn test_encrypted_storage_creation() {
@@ -1067,7 +1081,7 @@ mod tests {
             // KeyringEntryMissingForExistingDatabase error.
 
             // Initialize the mock keyring store for this test
-            keyring_core::set_default_store(keyring_core::mock::Store::new().unwrap());
+            ensure_mock_store();
 
             let temp_dir = tempdir().unwrap();
             let db_path = temp_dir.path().join("unencrypted_then_new.db");
@@ -1394,13 +1408,7 @@ mod tests {
         /// cause a new key to be generated instead of failing immediately.
         #[test]
         fn test_existing_db_with_missing_keyring_entry_fails() {
-            use keyring_core::Entry;
-
-            // Check if keyring is available
-            if Entry::new("test.mdk.lib", "test.availability").is_err() {
-                eprintln!("Skipping test: no keyring store available");
-                return;
-            }
+            ensure_mock_store();
 
             let temp_dir = tempdir().unwrap();
             let db_path = temp_dir.path().join("missing_key_test.db");
@@ -1464,13 +1472,7 @@ mod tests {
         /// Test that creating a new database with automatic key management works.
         #[test]
         fn test_new_db_with_keyring_creates_key() {
-            use keyring_core::Entry;
-
-            // Check if keyring is available
-            if Entry::new("test.mdk.lib", "test.availability").is_err() {
-                eprintln!("Skipping test: no keyring store available");
-                return;
-            }
+            ensure_mock_store();
 
             let temp_dir = tempdir().unwrap();
             let db_path = temp_dir.path().join("new_db_keyring.db");
@@ -1512,13 +1514,7 @@ mod tests {
             use mdk_storage_traits::groups::GroupStorage;
             use mdk_storage_traits::test_utils::cross_storage::create_test_group;
 
-            use keyring_core::Entry;
-
-            // Check if keyring is available
-            if Entry::new("test.mdk.lib", "test.availability").is_err() {
-                eprintln!("Skipping test: no keyring store available");
-                return;
-            }
+            ensure_mock_store();
 
             let temp_dir = tempdir().unwrap();
             let db_path = temp_dir.path().join("reopen_keyring.db");
@@ -1555,6 +1551,121 @@ mod tests {
             // Clean up
             drop(storage2);
             keyring::delete_db_key(service_id, db_key_id).unwrap();
+        }
+
+        /// Test concurrent access to encrypted database with same key.
+        #[test]
+        fn test_concurrent_encrypted_access_same_key() {
+            use mdk_storage_traits::groups::GroupStorage;
+            use mdk_storage_traits::test_utils::cross_storage::create_test_group;
+            use std::thread;
+
+            let temp_dir = tempdir().unwrap();
+            let db_path = temp_dir.path().join("concurrent_encrypted.db");
+
+            let config = EncryptionConfig::generate().unwrap();
+            let key = *config.key();
+
+            // Create database with initial data
+            {
+                let storage = MdkSqliteStorage::new_with_key(&db_path, config).unwrap();
+                let group = create_test_group(GroupId::from_slice(&[1, 2, 3, 4]));
+                storage.save_group(group).unwrap();
+            }
+
+            // Spawn multiple threads that all read from the database
+            let num_threads = 5;
+            let handles: Vec<_> = (0..num_threads)
+                .map(|_| {
+                    let db_path = db_path.clone();
+                    thread::spawn(move || {
+                        let config = EncryptionConfig::new(key);
+                        let storage = MdkSqliteStorage::new_with_key(&db_path, config).unwrap();
+                        let groups = storage.all_groups().unwrap();
+                        assert_eq!(groups.len(), 1);
+                        groups
+                    })
+                })
+                .collect();
+
+            // All threads should succeed
+            for handle in handles {
+                let groups = handle.join().unwrap();
+                assert_eq!(groups.len(), 1);
+            }
+        }
+
+        /// Test multiple databases with different keys in same directory.
+        #[test]
+        fn test_multiple_encrypted_databases_different_keys() {
+            use mdk_storage_traits::groups::GroupStorage;
+            use mdk_storage_traits::test_utils::cross_storage::create_test_group;
+
+            let temp_dir = tempdir().unwrap();
+
+            // Create multiple databases with different keys
+            let db1_path = temp_dir.path().join("db1.db");
+            let db2_path = temp_dir.path().join("db2.db");
+            let db3_path = temp_dir.path().join("db3.db");
+
+            let config1 = EncryptionConfig::generate().unwrap();
+            let config2 = EncryptionConfig::generate().unwrap();
+            let config3 = EncryptionConfig::generate().unwrap();
+
+            let key1 = *config1.key();
+            let key2 = *config2.key();
+            let key3 = *config3.key();
+
+            // Create and populate each database
+            {
+                let storage1 = MdkSqliteStorage::new_with_key(&db1_path, config1).unwrap();
+                let mut group1 = create_test_group(GroupId::from_slice(&[1]));
+                group1.name = "Database 1".to_string();
+                storage1.save_group(group1).unwrap();
+
+                let storage2 = MdkSqliteStorage::new_with_key(&db2_path, config2).unwrap();
+                let mut group2 = create_test_group(GroupId::from_slice(&[2]));
+                group2.name = "Database 2".to_string();
+                storage2.save_group(group2).unwrap();
+
+                let storage3 = MdkSqliteStorage::new_with_key(&db3_path, config3).unwrap();
+                let mut group3 = create_test_group(GroupId::from_slice(&[3]));
+                group3.name = "Database 3".to_string();
+                storage3.save_group(group3).unwrap();
+            }
+
+            // Reopen each with correct key
+            let config1_reopen = EncryptionConfig::new(key1);
+            let config2_reopen = EncryptionConfig::new(key2);
+            let config3_reopen = EncryptionConfig::new(key3);
+
+            let storage1 = MdkSqliteStorage::new_with_key(&db1_path, config1_reopen).unwrap();
+            let storage2 = MdkSqliteStorage::new_with_key(&db2_path, config2_reopen).unwrap();
+            let storage3 = MdkSqliteStorage::new_with_key(&db3_path, config3_reopen).unwrap();
+
+            // Verify each database has correct data
+            let group1 = storage1
+                .find_group_by_mls_group_id(&GroupId::from_slice(&[1]))
+                .unwrap()
+                .unwrap();
+            assert_eq!(group1.name, "Database 1");
+
+            let group2 = storage2
+                .find_group_by_mls_group_id(&GroupId::from_slice(&[2]))
+                .unwrap()
+                .unwrap();
+            assert_eq!(group2.name, "Database 2");
+
+            let group3 = storage3
+                .find_group_by_mls_group_id(&GroupId::from_slice(&[3]))
+                .unwrap()
+                .unwrap();
+            assert_eq!(group3.name, "Database 3");
+
+            // Verify wrong keys don't work
+            let wrong_config = EncryptionConfig::new(key1);
+            let result = MdkSqliteStorage::new_with_key(&db2_path, wrong_config);
+            assert!(result.is_err());
         }
     }
 }

@@ -231,28 +231,25 @@ pub fn delete_db_key(service_id: &str, db_key_id: &str) -> Result<(), Error> {
 
 #[cfg(test)]
 mod tests {
-    // Note: These tests require a keyring store to be initialized.
-    // In CI/testing environments, use keyring-core's mock store:
-    //
-    // use keyring_core::mock::MockCredentialStore;
-    // keyring_core::set_default_store(MockCredentialStore::new());
-    //
-    // For now, we skip these tests if no store is available.
+    use std::sync::OnceLock;
 
     use super::*;
 
-    /// Helper to check if a keyring store is available
-    fn keyring_available() -> bool {
-        // Try to create an entry - this will fail if no store is set
-        Entry::new("test.mdk.keyring", "test.availability").is_ok()
+    /// Ensures the mock keyring store is initialized exactly once for all tests.
+    ///
+    /// `keyring_core::set_default_store` can only be called once per process,
+    /// so we use `OnceLock` to ensure it's only initialized on the first call.
+    fn ensure_mock_store() {
+        static MOCK_STORE_INIT: OnceLock<()> = OnceLock::new();
+        MOCK_STORE_INIT.get_or_init(|| {
+            // Initialize the mock store for testing
+            keyring_core::set_default_store(keyring_core::mock::Store::new().unwrap());
+        });
     }
 
     #[test]
     fn test_get_or_create_generates_key_if_missing() {
-        if !keyring_available() {
-            eprintln!("Skipping test: no keyring store available");
-            return;
-        }
+        ensure_mock_store();
 
         let service_id = "test.mdk.storage";
         let db_key_id = "test.key.generate";
@@ -274,10 +271,7 @@ mod tests {
 
     #[test]
     fn test_delete_nonexistent_key_succeeds() {
-        if !keyring_available() {
-            eprintln!("Skipping test: no keyring store available");
-            return;
-        }
+        ensure_mock_store();
 
         // Deleting a key that doesn't exist should succeed
         let result = delete_db_key("test.mdk.storage", "test.nonexistent.key");
@@ -286,10 +280,7 @@ mod tests {
 
     #[test]
     fn test_get_or_create_returns_same_key_on_repeated_calls() {
-        if !keyring_available() {
-            eprintln!("Skipping test: no keyring store available");
-            return;
-        }
+        ensure_mock_store();
 
         let service_id = "test.mdk.storage.repeated";
         let db_key_id = "test.key.repeated.calls";
@@ -313,10 +304,7 @@ mod tests {
 
     #[test]
     fn test_delete_and_recreate_generates_new_key() {
-        if !keyring_available() {
-            eprintln!("Skipping test: no keyring store available");
-            return;
-        }
+        ensure_mock_store();
 
         let service_id = "test.mdk.storage.recreate";
         let db_key_id = "test.key.recreate";
@@ -347,10 +335,7 @@ mod tests {
 
     #[test]
     fn test_different_service_ids_have_different_keys() {
-        if !keyring_available() {
-            eprintln!("Skipping test: no keyring store available");
-            return;
-        }
+        ensure_mock_store();
 
         let service_id_1 = "test.mdk.storage.service1";
         let service_id_2 = "test.mdk.storage.service2";
@@ -378,10 +363,7 @@ mod tests {
 
     #[test]
     fn test_different_key_ids_have_different_keys() {
-        if !keyring_available() {
-            eprintln!("Skipping test: no keyring store available");
-            return;
-        }
+        ensure_mock_store();
 
         let service_id = "test.mdk.storage.keyids";
         let db_key_id_1 = "test.key.id1";
@@ -409,10 +391,7 @@ mod tests {
 
     #[test]
     fn test_get_db_key_returns_none_when_missing() {
-        if !keyring_available() {
-            eprintln!("Skipping test: no keyring store available");
-            return;
-        }
+        ensure_mock_store();
 
         let service_id = "test.mdk.storage.getkey";
         let db_key_id = "test.key.nonexistent";
@@ -427,10 +406,7 @@ mod tests {
 
     #[test]
     fn test_get_db_key_returns_existing_key() {
-        if !keyring_available() {
-            eprintln!("Skipping test: no keyring store available");
-            return;
-        }
+        ensure_mock_store();
 
         let service_id = "test.mdk.storage.getexisting";
         let db_key_id = "test.key.existing";
@@ -449,6 +425,96 @@ mod tests {
             created_config.key(),
             "Retrieved key should match created key"
         );
+
+        // Clean up
+        delete_db_key(service_id, db_key_id).unwrap();
+    }
+
+    #[test]
+    fn test_get_or_create_with_invalid_key_in_keyring_returns_error() {
+        ensure_mock_store();
+
+        let service_id = "test.mdk.storage.invalidkey";
+        let db_key_id = "test.key.invalid";
+
+        // Clean up any existing key
+        let _ = delete_db_key(service_id, db_key_id);
+
+        // Manually store an invalid key (wrong length) in the keyring
+        let entry = Entry::new(service_id, db_key_id).unwrap();
+        entry.set_secret(b"short_key").unwrap(); // Only 9 bytes, not 32
+
+        // get_or_create should fail because the stored key is invalid
+        let result = get_or_create_db_key(service_id, db_key_id);
+        assert!(result.is_err(), "Should fail when keyring contains invalid key");
+        assert!(result.unwrap_err().to_string().contains("invalid length"));
+
+        // Clean up
+        let _ = delete_db_key(service_id, db_key_id);
+    }
+
+    #[test]
+    fn test_get_db_key_with_invalid_key_in_keyring_returns_error() {
+        ensure_mock_store();
+
+        let service_id = "test.mdk.storage.invalidget";
+        let db_key_id = "test.key.invalidget";
+
+        // Clean up any existing key
+        let _ = delete_db_key(service_id, db_key_id);
+
+        // Manually store an invalid key (wrong length) in the keyring
+        let entry = Entry::new(service_id, db_key_id).unwrap();
+        entry.set_secret(b"this_is_too_long_a_key_for_our_32_byte_requirement").unwrap();
+
+        // get_db_key should fail because the stored key is invalid
+        let result = get_db_key(service_id, db_key_id);
+        assert!(result.is_err(), "Should fail when keyring contains invalid key");
+        assert!(result.unwrap_err().to_string().contains("invalid length"));
+
+        // Clean up
+        let _ = delete_db_key(service_id, db_key_id);
+    }
+
+    #[test]
+    fn test_concurrent_get_or_create_same_key() {
+        ensure_mock_store();
+
+        use std::thread;
+
+        let service_id = "test.mdk.storage.concurrent";
+        let db_key_id = "test.key.concurrent";
+
+        // Clean up any existing key
+        let _ = delete_db_key(service_id, db_key_id);
+
+        // Spawn multiple threads that all try to get_or_create the same key
+        let num_threads = 10;
+        let handles: Vec<_> = (0..num_threads)
+            .map(|_| {
+                let service_id = service_id.to_string();
+                let db_key_id = db_key_id.to_string();
+                thread::spawn(move || {
+                    get_or_create_db_key(&service_id, &db_key_id).unwrap()
+                })
+            })
+            .collect();
+
+        // Collect all results
+        let configs: Vec<_> = handles
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .collect();
+
+        // All keys should be identical (only one should have been generated)
+        let first_key = configs[0].key();
+        for config in &configs[1..] {
+            assert_eq!(
+                config.key(),
+                first_key,
+                "All concurrent calls should return the same key"
+            );
+        }
 
         // Clean up
         delete_db_key(service_id, db_key_id).unwrap();
