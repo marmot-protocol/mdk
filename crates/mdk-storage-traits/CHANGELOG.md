@@ -33,7 +33,7 @@
   - `GroupExporterSecret.secret` changed from `[u8; 32]` to `Secret<[u8; 32]>`
   - `Welcome.group_image_key` changed from `Option<[u8; 32]>` to `Option<Secret<[u8; 32]>>`
   - `Welcome.group_image_nonce` changed from `Option<[u8; 12]>` to `Option<Secret<[u8; 12]>>`
-  - Code accessing these fields must use `Secret::new()` to wrap values or `.into_inner()` to unwrap ([#109](https://github.com/marmot-protocol/mdk/pull/109))
+  - Code accessing these fields must use `Secret::new()` to wrap values or dereference/clone to access inner values ([#109](https://github.com/marmot-protocol/mdk/pull/109))
 
 ### Changed
 

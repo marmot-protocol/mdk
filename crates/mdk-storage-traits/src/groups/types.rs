@@ -229,7 +229,7 @@ mod tests {
         // Test deserialization
         let deserialized: GroupExporterSecret = serde_json::from_value(serialized).unwrap();
         assert_eq!(deserialized.epoch, 42);
-        assert_eq!(deserialized.secret.into_inner(), [0u8; 32]);
+        assert_eq!(*deserialized.secret, [0u8; 32]);
     }
 
     #[test]

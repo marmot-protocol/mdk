@@ -16,18 +16,6 @@ where
     pub fn new(value: T) -> Self {
         Self(value)
     }
-
-    /// Consumes the wrapper and returns the inner value.
-    /// Warning: Returned value will NOT be zeroized on drop unless re-wrapped.
-    /// Unused mut is because we want to move the value out without zeroizing it
-    pub fn into_inner(#[allow(unused_mut)] mut self) -> T {
-        #[allow(unsafe_code)]
-        unsafe {
-            let inner = std::ptr::read(&self.0);
-            std::mem::forget(self);
-            inner
-        }
-    }
 }
 
 impl<T> AsMut<T> for Secret<T>
