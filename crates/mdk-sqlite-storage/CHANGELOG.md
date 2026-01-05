@@ -41,6 +41,7 @@
 ### Fixed
 
 - **Security (Audit Issue AB)**: Added size limits to prevent disk and CPU exhaustion from unbounded user input ([#94](https://github.com/marmot-protocol/mdk/pull/94))
+- `all_groups` now skips corrupted rows instead of failing on the first deserialization error, improving availability when database contains malformed data
 
 ### Removed
 
