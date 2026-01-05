@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use zeroize::ZeroizeOnDrop;
 
 /// A wrapper that zeroizes its contents on drop
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, ZeroizeOnDrop)]
+#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord, ZeroizeOnDrop)]
 pub struct Secret<T: zeroize::Zeroize>(#[zeroize(drop)] T);
 
 impl<T> Secret<T>
@@ -57,7 +57,7 @@ where
 
 impl<T> fmt::Debug for Secret<T>
 where
-    T: zeroize::Zeroize + fmt::Debug,
+    T: zeroize::Zeroize,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Don't leak secret in debug output
