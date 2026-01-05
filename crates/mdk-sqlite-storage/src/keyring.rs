@@ -446,7 +446,10 @@ mod tests {
 
         // get_or_create should fail because the stored key is invalid
         let result = get_or_create_db_key(service_id, db_key_id);
-        assert!(result.is_err(), "Should fail when keyring contains invalid key");
+        assert!(
+            result.is_err(),
+            "Should fail when keyring contains invalid key"
+        );
         assert!(result.unwrap_err().to_string().contains("invalid length"));
 
         // Clean up
@@ -465,11 +468,16 @@ mod tests {
 
         // Manually store an invalid key (wrong length) in the keyring
         let entry = Entry::new(service_id, db_key_id).unwrap();
-        entry.set_secret(b"this_is_too_long_a_key_for_our_32_byte_requirement").unwrap();
+        entry
+            .set_secret(b"this_is_too_long_a_key_for_our_32_byte_requirement")
+            .unwrap();
 
         // get_db_key should fail because the stored key is invalid
         let result = get_db_key(service_id, db_key_id);
-        assert!(result.is_err(), "Should fail when keyring contains invalid key");
+        assert!(
+            result.is_err(),
+            "Should fail when keyring contains invalid key"
+        );
         assert!(result.unwrap_err().to_string().contains("invalid length"));
 
         // Clean up
@@ -494,17 +502,12 @@ mod tests {
             .map(|_| {
                 let service_id = service_id.to_string();
                 let db_key_id = db_key_id.to_string();
-                thread::spawn(move || {
-                    get_or_create_db_key(&service_id, &db_key_id).unwrap()
-                })
+                thread::spawn(move || get_or_create_db_key(&service_id, &db_key_id).unwrap())
             })
             .collect();
 
         // Collect all results
-        let configs: Vec<_> = handles
-            .into_iter()
-            .map(|h| h.join().unwrap())
-            .collect();
+        let configs: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
 
         // All keys should be identical (only one should have been generated)
         let first_key = configs[0].key();
