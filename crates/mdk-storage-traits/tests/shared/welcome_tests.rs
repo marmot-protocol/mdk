@@ -8,7 +8,6 @@ use nostr::EventId;
 use super::{create_test_group, create_test_processed_welcome, create_test_welcome};
 
 /// Test welcome storage functionality
-#[allow(dead_code)]
 pub fn test_save_and_find_welcome<S>(storage: S)
 where
     S: WelcomeStorage + GroupStorage,
@@ -47,7 +46,6 @@ where
 }
 
 /// Test processed welcome functionality
-#[allow(dead_code)]
 pub fn test_processed_welcome<S>(storage: S)
 where
     S: WelcomeStorage,
