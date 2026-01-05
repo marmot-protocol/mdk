@@ -715,27 +715,65 @@ where
         }
     }
 
+    /// Classifies an error into a sanitized public failure reason
+    ///
+    /// This function maps internal errors to generic, safe-to-expose failure categories
+    /// that don't leak implementation details or sensitive information.
+    ///
+    /// # Arguments
+    ///
+    /// * `error` - The internal error to classify
+    ///
+    /// # Returns
+    ///
+    /// A sanitized string suitable for external exposure
+    fn classify_failure_reason(error: &Error) -> &'static str {
+        match error {
+            Error::UnexpectedEvent { .. } => "invalid_event_type",
+            Error::Message(msg) if msg.contains("Group ID Tag") => "invalid_event_format",
+            Error::Message(msg) if msg.contains("Failed to convert") => "invalid_event_format",
+            Error::GroupNotFound => "group_not_found",
+            Error::CannotDecryptOwnMessage => "own_message",
+            Error::AuthorMismatch => "authentication_failed",
+            _ => "processing_failed",
+        }
+    }
+
     /// Saves a failed processed message record to prevent reprocessing
     ///
     /// This private helper method persists a `ProcessedMessage` with `Failed` state
     /// to the storage, allowing the system to skip reprocessing of invalid events.
+    /// The failure reason is sanitized to prevent leaking internal error details,
+    /// while the full error is logged internally for debugging.
     ///
     /// # Arguments
     ///
     /// * `event_id` - The ID of the wrapper event that failed
-    /// * `failure_reason` - A description of why processing failed
+    /// * `error` - The internal error that occurred
     ///
     /// # Returns
     ///
     /// * `Ok(())` - If the failed record was saved successfully
     /// * `Err(Error)` - If saving the record fails
-    fn save_failed_processed_message(&self, event_id: EventId, failure_reason: &str) -> Result<()> {
+    fn save_failed_processed_message(&self, event_id: EventId, error: &Error) -> Result<()> {
+        // Classify error into sanitized public reason
+        let sanitized_reason = Self::classify_failure_reason(error);
+
+        // Log full error details internally for debugging
+        tracing::warn!(
+            target: "mdk_core::messages::save_failed_processed_message",
+            "Message processing failed for event {}: {} (classified as: {})",
+            event_id,
+            error,
+            sanitized_reason
+        );
+
         let processed_message = message_types::ProcessedMessage {
             wrapper_event_id: event_id,
             message_event_id: None,
             processed_at: Timestamp::now(),
             state: message_types::ProcessedMessageState::Failed,
-            failure_reason: Some(failure_reason.to_string()),
+            failure_reason: Some(sanitized_reason.to_string()),
         };
 
         self.storage()
@@ -744,9 +782,9 @@ where
 
         tracing::debug!(
             target: "mdk_core::messages::save_failed_processed_message",
-            "Saved failed processing record for event {}: {}",
+            "Saved failed processing record for event {} with reason: {}",
             event_id,
-            failure_reason
+            sanitized_reason
         );
 
         Ok(())
@@ -1084,12 +1122,17 @@ where
             // Other states (Created, Processed, ProcessedCommit) should continue
             // to allow normal message flow (e.g., processing own messages from relay)
             if processed.state == message_types::ProcessedMessageState::Failed {
-                return Err(Error::Message(format!(
-                    "Message previously failed: {}",
-                    processed
-                        .failure_reason
-                        .unwrap_or_else(|| "Unknown reason".to_string())
-                )));
+                // Log the stored failure reason internally for debugging
+                tracing::debug!(
+                    target: "mdk_core::messages::process_message",
+                    "Rejecting previously failed message with reason: {}",
+                    processed.failure_reason.as_deref().unwrap_or("unknown")
+                );
+
+                // Return generic error to avoid leaking internal details
+                return Err(Error::Message(
+                    "Message processing previously failed".to_string(),
+                ));
             }
         }
 
@@ -1099,9 +1142,7 @@ where
             Err(e) => {
                 // Save failed processing record to prevent reprocessing
                 // Don't fail if we can't save the failure record - log and continue
-                if let Err(save_err) = self
-                    .save_failed_processed_message(event.id, &format!("Validation failed: {}", e))
-                {
+                if let Err(save_err) = self.save_failed_processed_message(event.id, &e) {
                     tracing::warn!(
                         target: "mdk_core::messages::process_message",
                         "Failed to persist failure record: {}. Original error: {}",
@@ -1114,26 +1155,23 @@ where
         };
 
         // Step 2: Load group and decrypt message
-        let (group, mut mls_group, message_bytes) = match self
-            .load_group_and_decrypt_message(nostr_group_id, event)
-        {
-            Ok(result) => result,
-            Err(e) => {
-                // Save failed processing record to prevent reprocessing
-                // Don't fail if we can't save the failure record - log and continue
-                if let Err(save_err) = self
-                    .save_failed_processed_message(event.id, &format!("Decryption failed: {}", e))
-                {
-                    tracing::warn!(
-                        target: "mdk_core::messages::process_message",
-                        "Failed to persist failure record: {}. Original error: {}",
-                        save_err,
-                        e
-                    );
+        let (group, mut mls_group, message_bytes) =
+            match self.load_group_and_decrypt_message(nostr_group_id, event) {
+                Ok(result) => result,
+                Err(e) => {
+                    // Save failed processing record to prevent reprocessing
+                    // Don't fail if we can't save the failure record - log and continue
+                    if let Err(save_err) = self.save_failed_processed_message(event.id, &e) {
+                        tracing::warn!(
+                            target: "mdk_core::messages::process_message",
+                            "Failed to persist failure record: {}. Original error: {}",
+                            save_err,
+                            e
+                        );
+                    }
+                    return Err(e);
                 }
-                return Err(e);
-            }
-        };
+            };
 
         // Step 3: Process the decrypted message
         match self.process_decrypted_message(group.clone(), &mut mls_group, &message_bytes, event) {
@@ -3751,12 +3789,11 @@ mod tests {
             processed.failure_reason.is_some(),
             "Failure reason should be set"
         );
-        assert!(
-            processed
-                .failure_reason
-                .unwrap()
-                .contains("Validation failed"),
-            "Failure reason should mention validation"
+        // Check for sanitized failure reason (not internal error details)
+        assert_eq!(
+            processed.failure_reason.unwrap(),
+            "invalid_event_type",
+            "Failure reason should be sanitized classification"
         );
     }
 
@@ -3785,7 +3822,7 @@ mod tests {
             result2
                 .unwrap_err()
                 .to_string()
-                .contains("Message previously failed"),
+                .contains("Message processing previously failed"),
             "Error should indicate previous failure"
         );
     }
@@ -3827,12 +3864,11 @@ mod tests {
             processed.failure_reason.is_some(),
             "Failure reason should be set"
         );
-        assert!(
-            processed
-                .failure_reason
-                .unwrap()
-                .contains("Decryption failed"),
-            "Failure reason should mention decryption"
+        // Check for sanitized failure reason (not internal error details)
+        assert_eq!(
+            processed.failure_reason.unwrap(),
+            "group_not_found",
+            "Failure reason should be sanitized classification"
         );
     }
 
@@ -3864,7 +3900,7 @@ mod tests {
             result2
                 .unwrap_err()
                 .to_string()
-                .contains("Message previously failed"),
+                .contains("Message processing previously failed"),
             "Error should indicate previous failure"
         );
     }
@@ -3936,7 +3972,7 @@ mod tests {
             !result
                 .unwrap_err()
                 .to_string()
-                .contains("Message previously failed"),
+                .contains("Message processing previously failed"),
             "Should not be blocked by deduplication for non-Failed state"
         );
     }
