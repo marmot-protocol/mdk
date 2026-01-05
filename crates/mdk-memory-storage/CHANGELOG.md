@@ -45,8 +45,6 @@
 
 ### Removed
 
-- Removed offset validation (MAX_MESSAGE_OFFSET) to allow legitimate large-scale use cases ([#111](https://github.com/marmot-protocol/mdk/pull/111))
-
 ### Deprecated
 
 ## [0.5.1] - 2025-10-01
