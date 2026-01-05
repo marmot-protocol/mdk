@@ -68,7 +68,7 @@ impl GroupStorage for MdkMemoryStorage {
     fn admins(&self, mls_group_id: &GroupId) -> Result<BTreeSet<PublicKey>, GroupError> {
         match self.find_group_by_mls_group_id(mls_group_id)? {
             Some(group) => Ok(group.admin_pubkeys.clone()),
-            None => GroupError::InvalidParameters("Group not found".to_string()),
+            None => Err(GroupError::InvalidParameters("Group not found".to_string())),
         }
     }
 
