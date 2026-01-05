@@ -211,8 +211,9 @@ where
         leaf_node: &LeafNode,
     ) -> Result<bool, Error> {
         let pubkey = self.pubkey_for_leaf_node(leaf_node)?;
-        let stored_group = self.get_group(group_id)?.ok_or(Error::GroupNotFound)?;
-        Ok(stored_group.admin_pubkeys.contains(&pubkey))
+        let mls_group = self.load_mls_group(group_id)?.ok_or(Error::GroupNotFound)?;
+        let group_data = NostrGroupDataExtension::from_group(&mls_group)?;
+        Ok(group_data.admins.contains(&pubkey))
     }
 
     /// Checks if the Member is an admin of an MLS group
@@ -233,8 +234,9 @@ where
         member: &Member,
     ) -> Result<bool, Error> {
         let pubkey = self.pubkey_for_member(member)?;
-        let stored_group = self.get_group(group_id)?.ok_or(Error::GroupNotFound)?;
-        Ok(stored_group.admin_pubkeys.contains(&pubkey))
+        let mls_group = self.load_mls_group(group_id)?.ok_or(Error::GroupNotFound)?;
+        let group_data = NostrGroupDataExtension::from_group(&mls_group)?;
+        Ok(group_data.admins.contains(&pubkey))
     }
 
     /// Extracts the public key from a leaf node
@@ -1386,6 +1388,7 @@ mod tests {
     use std::collections::BTreeSet;
 
     use mdk_memory_storage::MdkMemoryStorage;
+    use mdk_storage_traits::groups::GroupStorage;
     use mdk_storage_traits::messages::{MessageStorage, types as message_types};
     use nostr::{Keys, PublicKey};
     use openmls::prelude::BasicCredential;
@@ -1737,6 +1740,132 @@ mod tests {
         // Note: Testing non-admin permissions would require the non-admin user to actually
         // be part of the MLS group, which would require processing the welcome message.
         // For now, we've verified that admin permissions work correctly.
+    }
+
+    /// Test that admin authorization reads from the current MLS group state (NostrGroupDataExtension)
+    /// rather than from potentially stale stored metadata.
+    ///
+    /// This test addresses issue #50: Admin Authorization Uses Stale Stored Metadata Instead of MLS State
+    /// See: <https://github.com/marmot-protocol/mdk/issues/50>
+    #[test]
+    fn test_admin_check_uses_mls_state_not_stale_storage() {
+        let creator_mdk = create_test_mdk();
+
+        // Generate keys
+        let alice_keys = Keys::generate();
+        let bob_keys = Keys::generate();
+        let charlie_keys = Keys::generate();
+
+        let alice_pk = alice_keys.public_key();
+        let bob_pk = bob_keys.public_key();
+        let _charlie_pk = charlie_keys.public_key();
+
+        // Create key package events for members
+        let bob_event = create_key_package_event(&creator_mdk, &bob_keys);
+        let charlie_event = create_key_package_event(&creator_mdk, &charlie_keys);
+
+        // Create group with Alice as the ONLY admin
+        let create_result = creator_mdk
+            .create_group(
+                &alice_pk,
+                vec![bob_event, charlie_event],
+                create_nostr_group_config_data(vec![alice_pk]), // Only Alice is admin
+            )
+            .expect("Failed to create group");
+
+        let group_id = &create_result.group.mls_group_id;
+
+        // Merge the pending commit
+        creator_mdk
+            .merge_pending_commit(group_id)
+            .expect("Failed to merge pending commit");
+
+        // Get the MLS group to access members
+        let mls_group = creator_mdk
+            .load_mls_group(group_id)
+            .expect("Failed to load MLS group")
+            .expect("MLS group should exist");
+
+        // Find Alice's and Bob's members
+        let members: Vec<_> = mls_group.members().collect();
+        let alice_member = members
+            .iter()
+            .find(|m| creator_mdk.pubkey_for_member(m).unwrap() == alice_pk)
+            .expect("Alice should be a member");
+        let bob_member = members
+            .iter()
+            .find(|m| creator_mdk.pubkey_for_member(m).unwrap() == bob_pk)
+            .expect("Bob should be a member");
+
+        // Verify initial state: Alice is admin, Bob is not
+        assert!(
+            creator_mdk
+                .is_member_admin(&group_id.clone(), alice_member)
+                .unwrap(),
+            "Alice should be admin in MLS state"
+        );
+        assert!(
+            !creator_mdk
+                .is_member_admin(&group_id.clone(), bob_member)
+                .unwrap(),
+            "Bob should NOT be admin in MLS state"
+        );
+
+        // Now simulate stale storage by directly modifying stored_group.admin_pubkeys
+        // to include Bob as an admin (even though MLS state doesn't have him as admin)
+        let mut stored_group = creator_mdk
+            .get_group(group_id)
+            .expect("Failed to get group")
+            .expect("Group should exist");
+
+        // Add Bob to the stored admin list (simulating stale/incorrect storage)
+        stored_group.admin_pubkeys.insert(bob_pk);
+        // Remove Alice from stored admin list (simulating stale storage)
+        stored_group.admin_pubkeys.remove(&alice_pk);
+
+        // Save the modified (now stale) storage
+        creator_mdk
+            .storage()
+            .save_group(stored_group.clone())
+            .expect("Failed to save modified group");
+
+        // Verify storage is now "stale" (has incorrect admin set)
+        let stale_stored_group = creator_mdk
+            .get_group(group_id)
+            .expect("Failed to get group")
+            .expect("Group should exist");
+        assert!(
+            stale_stored_group.admin_pubkeys.contains(&bob_pk),
+            "Stale storage should have Bob as admin"
+        );
+        assert!(
+            !stale_stored_group.admin_pubkeys.contains(&alice_pk),
+            "Stale storage should NOT have Alice as admin"
+        );
+
+        // The critical test: is_member_admin should read from MLS state, NOT stale storage
+        // So Alice should still be admin (per MLS state) and Bob should not be admin (per MLS state)
+        assert!(
+            creator_mdk
+                .is_member_admin(&group_id.clone(), alice_member)
+                .unwrap(),
+            "Alice should be admin per MLS state, even though stale storage says otherwise"
+        );
+        assert!(
+            !creator_mdk
+                .is_member_admin(&group_id.clone(), bob_member)
+                .unwrap(),
+            "Bob should NOT be admin per MLS state, even though stale storage says he is"
+        );
+
+        // Also test with leaf nodes directly
+        let alice_leaf = mls_group.own_leaf().expect("Group should have own leaf");
+        assert!(
+            creator_mdk
+                .is_leaf_node_admin(&group_id.clone(), alice_leaf)
+                .unwrap(),
+            "is_leaf_node_admin should use MLS state, not stale storage"
+        );
     }
 
     #[test]

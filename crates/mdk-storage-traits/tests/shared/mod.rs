@@ -1,4 +1,9 @@
 //! Shared test utilities and functions for storage testing
+//!
+//! These functions are used by multiple integration test binaries.
+//! Not all test binaries use all functions, so we allow unused here.
+
+#![allow(unused)]
 
 use std::collections::BTreeSet;
 
@@ -17,7 +22,6 @@ pub mod message_tests;
 pub mod welcome_tests;
 
 /// Creates a test group with the given ID for testing purposes
-#[allow(dead_code)]
 pub fn create_test_group(mls_group_id: GroupId) -> Group {
     let mut nostr_group_id = [0u8; 32];
     // Use first 4 bytes of mls_group_id to make nostr_group_id somewhat unique
@@ -42,7 +46,6 @@ pub fn create_test_group(mls_group_id: GroupId) -> Group {
 }
 
 /// Creates a test message for testing purposes
-#[allow(dead_code)]
 pub fn create_test_message(mls_group_id: GroupId, event_id: EventId) -> Message {
     use nostr::{Kind, Tags, UnsignedEvent};
 
@@ -77,7 +80,6 @@ pub fn create_test_message(mls_group_id: GroupId, event_id: EventId) -> Message 
 }
 
 /// Creates a test processed message for testing purposes
-#[allow(dead_code)]
 pub fn create_test_processed_message(
     wrapper_event_id: EventId,
     message_event_id: Option<EventId>,
@@ -92,7 +94,6 @@ pub fn create_test_processed_message(
 }
 
 /// Creates a test welcome for testing purposes
-#[allow(dead_code)]
 pub fn create_test_welcome(mls_group_id: GroupId, event_id: EventId) -> Welcome {
     use nostr::{Kind, Tags, UnsignedEvent};
 
@@ -132,7 +133,6 @@ pub fn create_test_welcome(mls_group_id: GroupId, event_id: EventId) -> Welcome 
 }
 
 /// Creates a test processed welcome for testing purposes
-#[allow(dead_code)]
 pub fn create_test_processed_welcome(
     wrapper_event_id: EventId,
     welcome_event_id: Option<EventId>,
