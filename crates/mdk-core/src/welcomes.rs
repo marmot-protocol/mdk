@@ -97,9 +97,7 @@ where
                     if relay_slice.len() > 1 {
                         // Validate that relay URLs are properly formatted
                         for relay_url in relay_slice.iter().skip(1) {
-                            let has_wss = relay_url.starts_with("wss://") && relay_url.len() > 6;
-                            let has_ws = relay_url.starts_with("ws://") && relay_url.len() > 5;
-                            if !has_wss && !has_ws {
+                            if nostr::RelayUrl::parse(relay_url).is_err() {
                                 return Err(Error::InvalidWelcomeMessage);
                             }
                         }
