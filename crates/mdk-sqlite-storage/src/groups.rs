@@ -303,6 +303,8 @@ impl GroupStorage for MdkSqliteStorage {
 mod tests {
     use mdk_storage_traits::groups::types::GroupState;
     use mdk_storage_traits::test_utils::crypto_utils::generate_random_bytes;
+    use rusqlite::Connection;
+    use tempfile::tempdir;
 
     use super::*;
 
@@ -511,9 +513,6 @@ mod tests {
 
     #[test]
     fn test_all_groups_skips_corrupted_rows() {
-        use rusqlite::Connection;
-        use tempfile::tempdir;
-
         // Use a file-based database so we can access it from multiple connections
         let temp_dir = tempdir().unwrap();
         let db_path = temp_dir.path().join("test.db");
