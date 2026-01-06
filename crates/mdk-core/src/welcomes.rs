@@ -1,11 +1,13 @@
 //! Nostr MLS Welcomes
 
-use mdk_storage_traits::MdkStorageProvider;
-use mdk_storage_traits::groups::types as group_types;
-use mdk_storage_traits::welcomes::types as welcome_types;
-use nostr::{EventId, Timestamp, UnsignedEvent};
+use nostr::{EventId, Kind, Tag, TagKind, Timestamp, UnsignedEvent};
 use openmls::prelude::*;
 use tls_codec::Deserialize as TlsDeserialize;
+
+use mdk_storage_traits::MdkStorageProvider;
+use mdk_storage_traits::groups::types as group_types;
+use mdk_storage_traits::welcomes::Pagination;
+use mdk_storage_traits::welcomes::types as welcome_types;
 
 use crate::MDK;
 use crate::error::Error;
@@ -44,13 +46,133 @@ where
         Ok(welcome)
     }
 
-    /// Gets pending welcomes
-    pub fn get_pending_welcomes(&self) -> Result<Vec<welcome_types::Welcome>, Error> {
+    /// Gets pending welcomes with optional pagination
+    ///
+    /// # Arguments
+    ///
+    /// * `pagination` - Optional pagination parameters. If `None`, uses default limit and offset.
+    ///
+    /// # Returns
+    ///
+    /// Returns a vector of pending welcomes ordered by ID (descending)
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// // Get pending welcomes with default pagination
+    /// let welcomes = mdk.get_pending_welcomes(None)?;
+    ///
+    /// // Get first 10 pending welcomes
+    /// use mdk_storage_traits::welcomes::Pagination;
+    /// let welcomes = mdk.get_pending_welcomes(Some(Pagination::new(Some(10), Some(0))))?;
+    ///
+    /// // Get next 10 pending welcomes
+    /// let welcomes = mdk.get_pending_welcomes(Some(Pagination::new(Some(10), Some(10))))?;
+    /// ```
+    pub fn get_pending_welcomes(
+        &self,
+        pagination: Option<Pagination>,
+    ) -> Result<Vec<welcome_types::Welcome>, Error> {
         let welcomes = self
             .storage()
-            .pending_welcomes()
+            .pending_welcomes(pagination)
             .map_err(|e| Error::Welcome(e.to_string()))?;
         Ok(welcomes)
+    }
+
+    /// Validates that a welcome event conforms to MIP-02 structure
+    ///
+    /// # Arguments
+    ///
+    /// * `event` - The unsigned event to validate
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ok(())` if the event is valid, or an `Error` describing the validation failure
+    ///
+    /// # Validation Rules
+    ///
+    /// - Event kind must be 444 (MlsWelcome)
+    /// - Must have exactly 4 required tags: relays, e (event reference), client, and encoding
+    /// - Tag order is not enforced (for interoperability with other implementations)
+    /// - Tag values must be non-empty
+    /// - Encoding tag must be either "hex" or "base64"
+    fn validate_welcome_event(event: &UnsignedEvent) -> Result<(), Error> {
+        // 1. Validate kind is 444 (MlsWelcome)
+        if event.kind != Kind::MlsWelcome {
+            return Err(Error::InvalidWelcomeMessage);
+        }
+
+        // 2. Validate minimum number of tags (at least 4: relays, e, client, encoding)
+        let tags: Vec<&Tag> = event.tags.iter().collect();
+        if tags.len() < 4 {
+            return Err(Error::InvalidWelcomeMessage);
+        }
+
+        // 3. Validate presence of required tags (order doesn't matter for interoperability)
+        let mut has_relays = false;
+        let mut has_event_ref = false;
+        let mut has_client = false;
+        let mut has_encoding = false;
+
+        for tag in &tags {
+            match tag.kind() {
+                TagKind::Relays => {
+                    // Check that relays tag has at least one relay URL
+                    let relay_slice = tag.as_slice();
+                    if relay_slice.len() > 1 {
+                        // Validate that relay URLs are properly formatted
+                        for relay_url in relay_slice.iter().skip(1) {
+                            if nostr::RelayUrl::parse(relay_url).is_err() {
+                                return Err(Error::InvalidWelcomeMessage);
+                            }
+                        }
+                        has_relays = true;
+                    }
+                }
+                kind if kind == TagKind::e() => {
+                    // Check that e tag has non-empty content
+                    if tag.content().is_some() && tag.content() != Some("") {
+                        has_event_ref = true;
+                    }
+                }
+                TagKind::Client => {
+                    // Check that client tag has non-empty content
+                    if tag.content().is_some() && tag.content() != Some("") {
+                        has_client = true;
+                    }
+                }
+                TagKind::Custom(name) if name.as_ref() == "encoding" => {
+                    // Validate encoding value is "base64"
+                    if let Some(encoding_value) = tag.content() {
+                        if encoding_value == "base64" {
+                            has_encoding = true;
+                        } else {
+                            return Err(Error::InvalidWelcomeMessage);
+                        }
+                    } else {
+                        return Err(Error::InvalidWelcomeMessage);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Ensure all required tags are present
+        if !has_relays {
+            return Err(Error::InvalidWelcomeMessage);
+        }
+        if !has_event_ref {
+            return Err(Error::InvalidWelcomeMessage);
+        }
+        if !has_client {
+            return Err(Error::InvalidWelcomeMessage);
+        }
+        if !has_encoding {
+            return Err(Error::InvalidWelcomeMessage);
+        }
+
+        Ok(())
     }
 
     /// Processes a welcome and stores it in the database
@@ -59,6 +181,9 @@ where
         wrapper_event_id: &EventId,
         rumor_event: &UnsignedEvent,
     ) -> Result<welcome_types::Welcome, Error> {
+        // Validate welcome event structure per MIP-02
+        Self::validate_welcome_event(rumor_event)?;
+
         if self.is_welcome_processed(wrapper_event_id)? {
             let processed_welcome = self
                 .storage()
@@ -290,8 +415,33 @@ where
         wrapper_event_id: &EventId,
         welcome_event: &UnsignedEvent,
     ) -> Result<WelcomePreview, Error> {
-        // Get encoding format from event tags (defaults to Hex for legacy events)
-        let encoding = ContentEncoding::from_tags(welcome_event.tags.iter());
+        // SECURITY: Require explicit encoding tag to prevent downgrade attacks and parsing ambiguity.
+        // Per MIP-00/MIP-02, encoding tag must be present.
+        let encoding = match ContentEncoding::from_tags(welcome_event.tags.iter()) {
+            Some(enc) => enc,
+            None => {
+                let error_string = "Missing required encoding tag".to_string();
+                let processed_welcome = welcome_types::ProcessedWelcome {
+                    wrapper_event_id: *wrapper_event_id,
+                    welcome_event_id: welcome_event.id,
+                    processed_at: Timestamp::now(),
+                    state: welcome_types::ProcessedWelcomeState::Failed,
+                    failure_reason: Some(error_string.clone()),
+                };
+
+                self.storage()
+                    .save_processed_welcome(processed_welcome)
+                    .map_err(|e| Error::Welcome(e.to_string()))?;
+
+                tracing::error!(
+                    target: "mdk_core::welcomes::process_welcome",
+                    "Error processing welcome: {}",
+                    error_string
+                );
+
+                return Err(Error::Welcome(error_string));
+            }
+        };
 
         let decoded_content = match decode_content(&welcome_event.content, encoding, "welcome") {
             Ok((content, format)) => {
@@ -368,12 +518,14 @@ mod tests {
     use super::*;
     use crate::test_util::*;
     use crate::tests::create_test_mdk;
+    use nostr::base64::Engine;
+    use nostr::base64::engine::general_purpose::STANDARD as BASE64;
     use nostr::{Keys, Kind, TagKind};
 
     /// Test that Welcome event structure matches Marmot spec (MIP-02)
     /// Spec requires:
     /// - Kind: 444 (MlsWelcome)
-    /// - Content: hex or base64 encoded serialized MLSMessage
+    /// - Content: base64 encoded serialized MLSMessage
     /// - Tags: exactly 4 tags (relays + event reference + client + encoding)
     /// - Must be unsigned (UnsignedEvent for NIP-59 gift wrapping)
     #[test]
@@ -409,15 +561,12 @@ mod tests {
                 "Welcome event must have kind 444 (MlsWelcome)"
             );
 
-            // 2. Verify content is hex-encoded (valid hex)
-            assert!(
-                hex::decode(&welcome_rumor.content).is_ok(),
-                "Welcome content must be valid hex-encoded data"
-            );
+            // 2. Verify content is base64-encoded (always base64 per MIP-00/MIP-02)
+            let decoded_content = BASE64
+                .decode(&welcome_rumor.content)
+                .expect("Welcome content must be valid base64-encoded data");
 
             // Verify decoded content is substantial (MLS Welcome messages are typically > 50 bytes)
-            let decoded_content =
-                hex::decode(&welcome_rumor.content).expect("Failed to decode welcome content");
             assert!(
                 decoded_content.len() > 50,
                 "Welcome content should be substantial (typically > 50 bytes), got {} bytes",
@@ -484,6 +633,196 @@ mod tests {
         }
     }
 
+    /// Test that invalid welcome events are rejected by validation
+    #[test]
+    fn test_welcome_validation_rejects_invalid_events() {
+        use nostr::RelayUrl;
+
+        let mdk = create_test_mdk();
+        let wrapper_event_id = EventId::all_zeros();
+
+        // Test 1: Wrong kind (should be 444)
+        let mut tags1 = nostr::Tags::new();
+        tags1.push(nostr::Tag::relays(vec![
+            RelayUrl::parse("wss://relay.example.com").unwrap(),
+        ]));
+        tags1.push(nostr::Tag::event(EventId::all_zeros()));
+        tags1.push(nostr::Tag::client("mdk".to_string()));
+
+        let wrong_kind_event = UnsignedEvent {
+            id: None,
+            pubkey: Keys::generate().public_key(),
+            created_at: Timestamp::now(),
+            kind: Kind::TextNote, // Wrong kind
+            tags: tags1,
+            content: "test".to_string(),
+        };
+        let result = mdk.process_welcome(&wrapper_event_id, &wrong_kind_event);
+        assert!(result.is_err(), "Should reject wrong kind");
+        assert!(matches!(result.unwrap_err(), Error::InvalidWelcomeMessage));
+
+        // Test 2: Missing required tags
+        let mut tags2 = nostr::Tags::new();
+        tags2.push(nostr::Tag::relays(vec![
+            RelayUrl::parse("wss://relay.example.com").unwrap(),
+        ]));
+
+        let missing_tags_event = UnsignedEvent {
+            id: None,
+            pubkey: Keys::generate().public_key(),
+            created_at: Timestamp::now(),
+            kind: Kind::MlsWelcome,
+            tags: tags2, // Only 1 tag
+            content: "test".to_string(),
+        };
+        let result = mdk.process_welcome(&wrapper_event_id, &missing_tags_event);
+        assert!(result.is_err(), "Should reject missing tags");
+        assert!(matches!(result.unwrap_err(), Error::InvalidWelcomeMessage));
+
+        // Test 3: Missing encoding tag
+        let mut tags3 = nostr::Tags::new();
+        tags3.push(nostr::Tag::relays(vec![
+            RelayUrl::parse("wss://relay.example.com").unwrap(),
+        ]));
+        tags3.push(nostr::Tag::event(EventId::all_zeros()));
+        tags3.push(nostr::Tag::client("mdk".to_string()));
+        // Missing encoding tag
+
+        let missing_encoding_event = UnsignedEvent {
+            id: None,
+            pubkey: Keys::generate().public_key(),
+            created_at: Timestamp::now(),
+            kind: Kind::MlsWelcome,
+            tags: tags3,
+            content: "test".to_string(),
+        };
+        let result = mdk.process_welcome(&wrapper_event_id, &missing_encoding_event);
+        assert!(result.is_err(), "Should reject missing encoding tag");
+        assert!(matches!(result.unwrap_err(), Error::InvalidWelcomeMessage));
+
+        // Test 4: Empty relays tag
+        let mut tags4 = nostr::Tags::new();
+        tags4.push(nostr::Tag::relays(vec![])); // Empty relays
+        tags4.push(nostr::Tag::event(EventId::all_zeros()));
+        tags4.push(nostr::Tag::client("mdk".to_string()));
+        tags4.push(nostr::Tag::parse(&["encoding".to_string(), "hex".to_string()]).unwrap());
+
+        let empty_relays_event = UnsignedEvent {
+            id: None,
+            pubkey: Keys::generate().public_key(),
+            created_at: Timestamp::now(),
+            kind: Kind::MlsWelcome,
+            tags: tags4,
+            content: "test".to_string(),
+        };
+        let result = mdk.process_welcome(&wrapper_event_id, &empty_relays_event);
+        assert!(result.is_err(), "Should reject empty relays tag");
+        assert!(matches!(result.unwrap_err(), Error::InvalidWelcomeMessage));
+
+        // Test 5: Invalid relay URL format
+        let mut tags5 = nostr::Tags::new();
+        tags5.push(
+            nostr::Tag::parse(&["relays".to_string(), "http://invalid.com".to_string()]).unwrap(),
+        ); // Invalid protocol
+        tags5.push(nostr::Tag::event(EventId::all_zeros()));
+        tags5.push(nostr::Tag::client("mdk".to_string()));
+        tags5.push(nostr::Tag::parse(&["encoding".to_string(), "hex".to_string()]).unwrap());
+
+        let invalid_relay_url_event = UnsignedEvent {
+            id: None,
+            pubkey: Keys::generate().public_key(),
+            created_at: Timestamp::now(),
+            kind: Kind::MlsWelcome,
+            tags: tags5,
+            content: "test".to_string(),
+        };
+        let result = mdk.process_welcome(&wrapper_event_id, &invalid_relay_url_event);
+        assert!(result.is_err(), "Should reject invalid relay URL format");
+        assert!(matches!(result.unwrap_err(), Error::InvalidWelcomeMessage));
+
+        // Test 6: Incomplete relay URL (no host)
+        let mut tags6 = nostr::Tags::new();
+        tags6.push(nostr::Tag::parse(&["relays".to_string(), "wss://".to_string()]).unwrap()); // No host after protocol
+        tags6.push(nostr::Tag::event(EventId::all_zeros()));
+        tags6.push(nostr::Tag::client("mdk".to_string()));
+        tags6.push(nostr::Tag::parse(&["encoding".to_string(), "hex".to_string()]).unwrap());
+
+        let incomplete_relay_url_event = UnsignedEvent {
+            id: None,
+            pubkey: Keys::generate().public_key(),
+            created_at: Timestamp::now(),
+            kind: Kind::MlsWelcome,
+            tags: tags6,
+            content: "test".to_string(),
+        };
+        let result = mdk.process_welcome(&wrapper_event_id, &incomplete_relay_url_event);
+        assert!(result.is_err(), "Should reject incomplete relay URL");
+        assert!(matches!(result.unwrap_err(), Error::InvalidWelcomeMessage));
+
+        // Test 7: Empty e tag content
+        let mut tags7 = nostr::Tags::new();
+        tags7.push(nostr::Tag::relays(vec![
+            RelayUrl::parse("wss://relay.example.com").unwrap(),
+        ]));
+        tags7.push(nostr::Tag::parse(&["e".to_string(), "".to_string()]).unwrap()); // Empty event ID
+        tags7.push(nostr::Tag::client("mdk".to_string()));
+        tags7.push(nostr::Tag::parse(&["encoding".to_string(), "hex".to_string()]).unwrap());
+
+        let empty_e_tag_event = UnsignedEvent {
+            id: None,
+            pubkey: Keys::generate().public_key(),
+            created_at: Timestamp::now(),
+            kind: Kind::MlsWelcome,
+            tags: tags7,
+            content: "test".to_string(),
+        };
+        let result = mdk.process_welcome(&wrapper_event_id, &empty_e_tag_event);
+        assert!(result.is_err(), "Should reject empty e tag content");
+        assert!(matches!(result.unwrap_err(), Error::InvalidWelcomeMessage));
+
+        // Test 8: Empty client tag content
+        let mut tags8 = nostr::Tags::new();
+        tags8.push(nostr::Tag::relays(vec![
+            RelayUrl::parse("wss://relay.example.com").unwrap(),
+        ]));
+        tags8.push(nostr::Tag::event(EventId::all_zeros()));
+        tags8.push(nostr::Tag::parse(&["client".to_string(), "".to_string()]).unwrap()); // Empty client
+        tags8.push(nostr::Tag::parse(&["encoding".to_string(), "hex".to_string()]).unwrap());
+
+        let empty_client_tag_event = UnsignedEvent {
+            id: None,
+            pubkey: Keys::generate().public_key(),
+            created_at: Timestamp::now(),
+            kind: Kind::MlsWelcome,
+            tags: tags8,
+            content: "test".to_string(),
+        };
+        let result = mdk.process_welcome(&wrapper_event_id, &empty_client_tag_event);
+        assert!(result.is_err(), "Should reject empty client tag content");
+        assert!(matches!(result.unwrap_err(), Error::InvalidWelcomeMessage));
+
+        // Test 9: Invalid encoding value
+        let mut tags9 = nostr::Tags::new();
+        tags9.push(nostr::Tag::relays(vec![
+            RelayUrl::parse("wss://relay.example.com").unwrap(),
+        ]));
+        tags9.push(nostr::Tag::event(EventId::all_zeros()));
+        tags9.push(nostr::Tag::client("mdk".to_string()));
+        tags9.push(nostr::Tag::parse(&["encoding".to_string(), "invalid".to_string()]).unwrap()); // Invalid encoding
+
+        let invalid_encoding_event = UnsignedEvent {
+            id: None,
+            pubkey: Keys::generate().public_key(),
+            created_at: Timestamp::now(),
+            kind: Kind::MlsWelcome,
+            tags: tags9,
+            content: "test".to_string(),
+        };
+        let result = mdk.process_welcome(&wrapper_event_id, &invalid_encoding_event);
+        assert!(result.is_err(), "Should reject invalid encoding value");
+        assert!(matches!(result.unwrap_err(), Error::InvalidWelcomeMessage));
+    }
+
     /// Test that Welcome content is valid MLS Welcome structure
     #[test]
     fn test_welcome_content_validation_mip02() {
@@ -500,9 +839,10 @@ mod tests {
 
         let welcome_rumor = &create_result.welcome_rumors[0];
 
-        // Decode hex content
-        let decoded_content =
-            hex::decode(&welcome_rumor.content).expect("Welcome content should be valid hex");
+        // Decode base64 content (always base64 per MIP-00/MIP-02)
+        let decoded_content = BASE64
+            .decode(&welcome_rumor.content)
+            .expect("Welcome content should be valid base64");
 
         // Verify it's valid TLS-serialized MLS message
         // We can't fully deserialize without processing, but we can check basic structure
@@ -602,7 +942,10 @@ mod tests {
         for welcome_rumor in &create_result.welcome_rumors {
             assert_eq!(welcome_rumor.kind, Kind::MlsWelcome);
             assert_eq!(welcome_rumor.tags.len(), 4);
-            assert!(hex::decode(&welcome_rumor.content).is_ok());
+            assert!(
+                BASE64.decode(&welcome_rumor.content).is_ok(),
+                "Welcome content should be valid base64"
+            );
         }
     }
 
@@ -739,9 +1082,15 @@ mod tests {
         assert_eq!(first_tags[0].kind(), second_tags[0].kind());
         assert_eq!(first_tags[1].kind(), second_tags[1].kind());
 
-        // Both should be valid hex
-        assert!(hex::decode(&first_welcome.content).is_ok());
-        assert!(hex::decode(&second_welcome.content).is_ok());
+        // Both should be valid base64 (always base64 per MIP-00/MIP-02)
+        assert!(
+            BASE64.decode(&first_welcome.content).is_ok(),
+            "First welcome should be valid base64"
+        );
+        assert!(
+            BASE64.decode(&second_welcome.content).is_ok(),
+            "Second welcome should be valid base64"
+        );
     }
 
     /// Test welcome processing error recovery (MIP-02)
@@ -812,6 +1161,11 @@ mod tests {
             nostr::RelayUrl::parse("wss://test.relay").unwrap(),
         ]));
         new_tags.push(nostr::Tag::event(fake_event_id));
+        // Preserve the encoding tag to avoid triggering the missing encoding tag error path
+        new_tags.push(nostr::Tag::custom(
+            nostr::TagKind::Custom("encoding".into()),
+            ["base64"],
+        ));
         modified_welcome.tags = new_tags;
 
         let result = bob_device_a.process_welcome(&nostr::EventId::all_zeros(), &modified_welcome);
@@ -834,7 +1188,7 @@ mod tests {
 
         // Verify the welcome is now pending
         let pending_welcomes = bob_device_a
-            .get_pending_welcomes()
+            .get_pending_welcomes(None)
             .expect("Failed to get pending welcomes");
         assert!(
             !pending_welcomes.is_empty(),
@@ -911,9 +1265,10 @@ mod tests {
 
             // Check the size of the first welcome message
             let welcome = &group_result.welcome_rumors[0];
-            let welcome_content_bytes = welcome.content.as_bytes();
-            let hex_size = welcome_content_bytes.len();
-            let binary_size = hex_size / 2; // Hex encoding doubles the size
+            let decoded_bytes: Vec<u8> = BASE64
+                .decode(&welcome.content)
+                .expect("Welcome content should be valid base64");
+            let binary_size = decoded_bytes.len();
             let size_kb = binary_size as f64 / 1024.0;
 
             println!(
@@ -921,10 +1276,10 @@ mod tests {
                 group_size, binary_size, size_kb
             );
 
-            // Verify welcome is valid hex
+            // Verify welcome is valid base64 (always base64 per MIP-00/MIP-02)
             assert!(
-                hex::decode(&welcome.content).is_ok(),
-                "Welcome content should be valid hex"
+                BASE64.decode(&welcome.content).is_ok(),
+                "Welcome content should be valid base64"
             );
 
             // For small groups, welcome should be well under 100KB
@@ -954,8 +1309,8 @@ mod tests {
         // The test confirms that:
         // - Welcome messages can be created for small-medium groups (5-20 members)
         // - Welcome sizes are measured and reported correctly
-        // - Welcome messages are valid hex-encoded MLS messages
-        // - Welcome structure matches MIP-02 requirements (kind 444, 2 tags)
+        // - Welcome messages are valid base64-encoded MLS messages
+        // - Welcome structure matches MIP-02 requirements (kind 444, 4 tags)
         // - Size validation logic is in place
 
         // Note: (warning for groups approaching 150 members) would be
@@ -975,15 +1330,15 @@ mod tests {
             created_at: nostr::Timestamp::now(),
             kind: Kind::MlsWelcome,
             tags: nostr::Tags::new(),
-            content: "invalid_hex_content".to_string(), // Invalid hex
+            content: "invalid_base64_content!!!".to_string(), // Invalid base64
         };
 
         let result = mdk.process_welcome(&nostr::EventId::all_zeros(), &invalid_welcome);
 
-        // Should fail due to invalid hex content
+        // Should fail due to invalid base64 content
         assert!(
             result.is_err(),
-            "Should fail when welcome content is invalid hex"
+            "Should fail when welcome content is invalid base64"
         );
     }
 
@@ -1033,7 +1388,7 @@ mod tests {
     fn test_get_pending_welcomes_empty() {
         let mdk = create_test_mdk();
 
-        let welcomes = mdk.get_pending_welcomes().expect("Should succeed");
+        let welcomes = mdk.get_pending_welcomes(None).expect("Should succeed");
 
         assert_eq!(
             welcomes.len(),
@@ -1102,6 +1457,70 @@ mod tests {
         assert!(
             result.is_err(),
             "Should fail when leaving a group you haven't joined"
+        );
+    }
+
+    /// Test comprehensive pagination for get_pending_welcomes public API
+    #[test]
+    fn test_get_pending_welcomes_with_pagination() {
+        use crate::test_util::{create_key_package_event, create_nostr_group_config_data};
+        use nostr::Keys;
+
+        // Use the same MDK instance to share key store
+        let mdk = create_test_mdk();
+        let alice_keys = Keys::generate();
+        let bob_keys = Keys::generate();
+
+        // Create a group with Bob as a member
+        let bob_kp = create_key_package_event(&mdk, &bob_keys);
+        let group_config = create_nostr_group_config_data(vec![alice_keys.public_key()]);
+
+        let result = mdk
+            .create_group(&alice_keys.public_key(), vec![bob_kp], group_config)
+            .expect("Failed to create group");
+
+        mdk.merge_pending_commit(&result.group.mls_group_id)
+            .expect("Failed to merge pending commit");
+
+        // Process the welcome for Bob
+        let welcome_rumor = &result.welcome_rumors[0];
+        mdk.process_welcome(&nostr::EventId::all_zeros(), welcome_rumor)
+            .expect("Failed to process welcome");
+
+        // Test 1: Get welcomes with default pagination (None)
+        let default_welcomes = mdk
+            .get_pending_welcomes(None)
+            .expect("Failed to get welcomes");
+        assert_eq!(default_welcomes.len(), 1, "Should have 1 pending welcome");
+
+        // Test 2: Get with explicit pagination (limit 10, offset 0)
+        let paginated_welcomes = mdk
+            .get_pending_welcomes(Some(Pagination::new(Some(10), Some(0))))
+            .expect("Failed to get paginated welcomes");
+        assert_eq!(
+            paginated_welcomes.len(),
+            1,
+            "Should have 1 welcome with pagination"
+        );
+
+        // Test 3: Get with offset beyond available welcomes
+        let empty_page = mdk
+            .get_pending_welcomes(Some(Pagination::new(Some(10), Some(100))))
+            .expect("Failed to get empty page");
+        assert_eq!(
+            empty_page.len(),
+            0,
+            "Should return empty when offset is beyond available welcomes"
+        );
+
+        // Test 4: Get with limit 1
+        let limited = mdk
+            .get_pending_welcomes(Some(Pagination::new(Some(1), Some(0))))
+            .expect("Failed to get limited welcomes");
+        assert_eq!(
+            limited.len(),
+            1,
+            "Should return exactly 1 welcome with limit 1"
         );
     }
 }

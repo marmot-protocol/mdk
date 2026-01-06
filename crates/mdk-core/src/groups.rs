@@ -1343,12 +1343,9 @@ where
         let mut welcome_rumors_vec = Vec::new();
 
         for event in key_package_events {
-            // Determine encoding format based on configuration
-            let encoding = if self.config.use_base64_encoding {
-                ContentEncoding::Base64
-            } else {
-                ContentEncoding::Hex
-            };
+            // SECURITY: Always use base64 encoding with explicit encoding tag per MIP-00/MIP-02.
+            // This prevents downgrade attacks and parsing ambiguity across clients.
+            let encoding = ContentEncoding::Base64;
 
             let encoded_welcome = encode_content(&serialized_welcome, encoding);
 

@@ -28,6 +28,18 @@
 ### Breaking changes
 
 - **BREAKING**: Changed `get_messages()` signature to accept `Option<Pagination>` parameter. Callers must now pass `None` for default pagination or `Some(Pagination::new(...))` for custom pagination ([#111](https://github.com/marmot-protocol/mdk/pull/111))
+- **Content Encoding**: Removed support for hex encoding in key package and welcome event content ([#98](https://github.com/marmot-protocol/mdk/pull/98))
+  - Key packages and welcome events now require explicit `["encoding", "base64"]` tag
+  - Events without encoding tags or with hex encoding are rejected
+  - This change addresses security concerns about encoding ambiguity and downgrade attacks
+  - Older key packages published without encoding tags are no longer supported
+  - Clients should republish key packages with proper encoding tags when upgrading
+- **BREAKING**: Changed `get_pending_welcomes()` to accept `Option<Pagination>` parameter for pagination support. Existing calls should pass `None` for default pagination. ([#110](https://github.com/marmot-protocol/mdk/pull/110))
+- **MIP-02 Welcome Event Validation**: Encoding tag is now required for all welcome events ([#96](https://github.com/marmot-protocol/mdk/pull/96))
+  - Welcome events must now include exactly 4 tags: `relays`, `e`, `client`, and `encoding`
+  - The `encoding` tag must have a value of either "hex" or "base64"
+  - Relay URLs are now validated to ensure they start with `wss://` or `ws://`
+  - Events missing the encoding tag or with invalid relay URLs will be rejected
 
 ### Changed
 
@@ -38,6 +50,14 @@
 - New error variant `MissingRumorEventId` for when a rumor event is missing its ID ([#107](https://github.com/marmot-protocol/mdk/pull/107))
 - Added pagination support to `get_messages()` public API - accepts `Option<Pagination>` to control limit and offset for message retrieval ([#111](https://github.com/marmot-protocol/mdk/pull/111))
 - Exposed `Pagination` struct (from `mdk_storage_traits::groups`) in public API for paginated message queries ([#111](https://github.com/marmot-protocol/mdk/pull/111))
+- Added pagination support to `get_pending_welcomes()` public API - accepts `Option<Pagination>` to control limit and offset for welcome retrieval ([#110](https://github.com/marmot-protocol/mdk/pull/110))
+- Exposed `Pagination` struct (from `mdk_storage_traits::welcomes`) in public API for paginated welcome queries ([#110](https://github.com/marmot-protocol/mdk/pull/110))
+- **MIP-02 Welcome Event Validation**: Added comprehensive validation for welcome events ([#96](https://github.com/marmot-protocol/mdk/pull/96))
+  - Validates event kind is 444 (MlsWelcome)
+  - Validates presence of all required tags (order-independent for interoperability)
+  - Validates relay URL format using `RelayUrl::parse()` for thorough validation
+  - Validates non-empty content for `e` and `client` tags
+  - Validates encoding tag value is either "hex" or "base64"
 
 ### Fixed
 
@@ -46,10 +66,15 @@
 - **Security (Audit Issue C)**: Added validation for admin updates to prevent invalid configurations. Admin updates now reject empty admin sets and non-member public keys. ([#42](https://github.com/marmot-protocol/mdk/pull/42))
 - **Security (Audit Issue D)**: Added identity binding verification for KeyPackage events. The credential identity is now validated against the event signer to prevent impersonation attacks. ([#41](https://github.com/marmot-protocol/mdk/pull/41))
 - **Security (Audit Issue G)**: Fixed admin authorization to read from current MLS group state instead of potentially stale stored metadata. The `is_leaf_node_admin` and `is_member_admin` functions now derive admin status from the `NostrGroupDataExtension` in the MLS group context, preventing a race window where a recently demoted admin could still perform privileged operations. ([#108](https://github.com/marmot-protocol/mdk/pull/108))
+- **Security (Audit Issue H)**: Added MIP-02 validation to prevent malformed welcome events from causing storage pollution and resource exhaustion ([#96](https://github.com/marmot-protocol/mdk/pull/96))
 - **Security (Audit Issue O)**: Missing Hash Verification in decrypt_group_image Allows Storage-Level Blob Substitution ([#97](https://github.com/marmot-protocol/mdk/pull/97))
 - **Security (Audit Issue Z)**: Added pagination to prevent memory exhaustion from unbounded loading of group messages ([#111](https://github.com/marmot-protocol/mdk/pull/111))
+- **Security (Audit Issue R)**: Refactor encoding handling to enforce base64 usage for key packages and welcome ([#98](https://github.com/marmot-protocol/mdk/pull/98))
+- **Security (Audit Issue AA)**: Added pagination to prevent memory exhaustion from unbounded loading of pending welcomes ([#110](https://github.com/marmot-protocol/mdk/pull/110))
 
 ### Removed
+
+- Removed all traces of hex encoding support for content fields in key packages and welcome events ([#98](https://github.com/marmot-protocol/mdk/pull/98))
 
 ### Deprecated
 

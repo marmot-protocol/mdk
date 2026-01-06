@@ -100,7 +100,7 @@ async fn main() -> Result<(), Error> {
     bob_mdk.process_welcome(&EventId::all_zeros(), welcome_rumor)?;
     // Bob can now preview the welcome message to see what group he might be joining
     let welcomes = bob_mdk
-        .get_pending_welcomes()
+        .get_pending_welcomes(None)
         .expect("Error getting pending welcomes");
     let welcome = welcomes.first().unwrap();
 
@@ -275,7 +275,7 @@ async fn main() -> Result<(), Error> {
         charlie_mdk.process_welcome(&EventId::all_zeros(), charlie_welcome_rumor)?;
 
         let charlie_welcomes = charlie_mdk
-            .get_pending_welcomes()
+            .get_pending_welcomes(None)
             .expect("Error getting Charlie's pending welcomes");
         let charlie_welcome = charlie_welcomes.first().unwrap();
         charlie_mdk.accept_welcome(charlie_welcome)?;
