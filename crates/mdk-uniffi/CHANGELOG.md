@@ -31,6 +31,8 @@
 
 ### Added
 
+- Added `get_pending_welcomes_paginated()` method to expose pagination to foreign language bindings ([#110](https://github.com/marmot-protocol/mdk/pull/110))
+
 ### Fixed
 
 ### Removed

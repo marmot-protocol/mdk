@@ -6,6 +6,7 @@ use tls_codec::Deserialize as TlsDeserialize;
 
 use mdk_storage_traits::MdkStorageProvider;
 use mdk_storage_traits::groups::types as group_types;
+use mdk_storage_traits::welcomes::Pagination;
 use mdk_storage_traits::welcomes::types as welcome_types;
 
 use crate::MDK;
@@ -45,11 +46,36 @@ where
         Ok(welcome)
     }
 
-    /// Gets pending welcomes
-    pub fn get_pending_welcomes(&self) -> Result<Vec<welcome_types::Welcome>, Error> {
+    /// Gets pending welcomes with optional pagination
+    ///
+    /// # Arguments
+    ///
+    /// * `pagination` - Optional pagination parameters. If `None`, uses default limit and offset.
+    ///
+    /// # Returns
+    ///
+    /// Returns a vector of pending welcomes ordered by ID (descending)
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// // Get pending welcomes with default pagination
+    /// let welcomes = mdk.get_pending_welcomes(None)?;
+    ///
+    /// // Get first 10 pending welcomes
+    /// use mdk_storage_traits::welcomes::Pagination;
+    /// let welcomes = mdk.get_pending_welcomes(Some(Pagination::new(Some(10), Some(0))))?;
+    ///
+    /// // Get next 10 pending welcomes
+    /// let welcomes = mdk.get_pending_welcomes(Some(Pagination::new(Some(10), Some(10))))?;
+    /// ```
+    pub fn get_pending_welcomes(
+        &self,
+        pagination: Option<Pagination>,
+    ) -> Result<Vec<welcome_types::Welcome>, Error> {
         let welcomes = self
             .storage()
-            .pending_welcomes()
+            .pending_welcomes(pagination)
             .map_err(|e| Error::Welcome(e.to_string()))?;
         Ok(welcomes)
     }
@@ -1162,7 +1188,7 @@ mod tests {
 
         // Verify the welcome is now pending
         let pending_welcomes = bob_device_a
-            .get_pending_welcomes()
+            .get_pending_welcomes(None)
             .expect("Failed to get pending welcomes");
         assert!(
             !pending_welcomes.is_empty(),
@@ -1362,7 +1388,7 @@ mod tests {
     fn test_get_pending_welcomes_empty() {
         let mdk = create_test_mdk();
 
-        let welcomes = mdk.get_pending_welcomes().expect("Should succeed");
+        let welcomes = mdk.get_pending_welcomes(None).expect("Should succeed");
 
         assert_eq!(
             welcomes.len(),
@@ -1431,6 +1457,70 @@ mod tests {
         assert!(
             result.is_err(),
             "Should fail when leaving a group you haven't joined"
+        );
+    }
+
+    /// Test comprehensive pagination for get_pending_welcomes public API
+    #[test]
+    fn test_get_pending_welcomes_with_pagination() {
+        use crate::test_util::{create_key_package_event, create_nostr_group_config_data};
+        use nostr::Keys;
+
+        // Use the same MDK instance to share key store
+        let mdk = create_test_mdk();
+        let alice_keys = Keys::generate();
+        let bob_keys = Keys::generate();
+
+        // Create a group with Bob as a member
+        let bob_kp = create_key_package_event(&mdk, &bob_keys);
+        let group_config = create_nostr_group_config_data(vec![alice_keys.public_key()]);
+
+        let result = mdk
+            .create_group(&alice_keys.public_key(), vec![bob_kp], group_config)
+            .expect("Failed to create group");
+
+        mdk.merge_pending_commit(&result.group.mls_group_id)
+            .expect("Failed to merge pending commit");
+
+        // Process the welcome for Bob
+        let welcome_rumor = &result.welcome_rumors[0];
+        mdk.process_welcome(&nostr::EventId::all_zeros(), welcome_rumor)
+            .expect("Failed to process welcome");
+
+        // Test 1: Get welcomes with default pagination (None)
+        let default_welcomes = mdk
+            .get_pending_welcomes(None)
+            .expect("Failed to get welcomes");
+        assert_eq!(default_welcomes.len(), 1, "Should have 1 pending welcome");
+
+        // Test 2: Get with explicit pagination (limit 10, offset 0)
+        let paginated_welcomes = mdk
+            .get_pending_welcomes(Some(Pagination::new(Some(10), Some(0))))
+            .expect("Failed to get paginated welcomes");
+        assert_eq!(
+            paginated_welcomes.len(),
+            1,
+            "Should have 1 welcome with pagination"
+        );
+
+        // Test 3: Get with offset beyond available welcomes
+        let empty_page = mdk
+            .get_pending_welcomes(Some(Pagination::new(Some(10), Some(100))))
+            .expect("Failed to get empty page");
+        assert_eq!(
+            empty_page.len(),
+            0,
+            "Should return empty when offset is beyond available welcomes"
+        );
+
+        // Test 4: Get with limit 1
+        let limited = mdk
+            .get_pending_welcomes(Some(Pagination::new(Some(1), Some(0))))
+            .expect("Failed to get limited welcomes");
+        assert_eq!(
+            limited.len(),
+            1,
+            "Should return exactly 1 welcome with limit 1"
         );
     }
 }

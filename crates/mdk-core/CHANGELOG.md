@@ -33,6 +33,7 @@
   - This change addresses security concerns about encoding ambiguity and downgrade attacks
   - Older key packages published without encoding tags are no longer supported
   - Clients should republish key packages with proper encoding tags when upgrading
+- **BREAKING**: Changed `get_pending_welcomes()` to accept `Option<Pagination>` parameter for pagination support. Existing calls should pass `None` for default pagination. ([#110](https://github.com/marmot-protocol/mdk/pull/110))
 - **MIP-02 Welcome Event Validation**: Encoding tag is now required for all welcome events ([#96](https://github.com/marmot-protocol/mdk/pull/96))
   - Welcome events must now include exactly 4 tags: `relays`, `e`, `client`, and `encoding`
   - The `encoding` tag must have a value of either "hex" or "base64"
@@ -46,6 +47,8 @@
 - New error variant `AuthorMismatch` for message author verification failures ([#40](https://github.com/marmot-protocol/mdk/pull/40))
 - New error variant `KeyPackageIdentityMismatch` for KeyPackage credential identity validation failures ([#41](https://github.com/marmot-protocol/mdk/pull/41))
 - New error variant `MissingRumorEventId` for when a rumor event is missing its ID ([#107](https://github.com/marmot-protocol/mdk/pull/107))
+- Added pagination support to `get_pending_welcomes()` public API - accepts `Option<Pagination>` to control limit and offset for welcome retrieval ([#110](https://github.com/marmot-protocol/mdk/pull/110))
+- Exposed `Pagination` struct (from `mdk_storage_traits::welcomes`) in public API for paginated welcome queries ([#110](https://github.com/marmot-protocol/mdk/pull/110))
 - **MIP-02 Welcome Event Validation**: Added comprehensive validation for welcome events ([#96](https://github.com/marmot-protocol/mdk/pull/96))
   - Validates event kind is 444 (MlsWelcome)
   - Validates presence of all required tags (order-independent for interoperability)
@@ -63,6 +66,7 @@
 - **Security (Audit Issue H)**: Added MIP-02 validation to prevent malformed welcome events from causing storage pollution and resource exhaustion ([#96](https://github.com/marmot-protocol/mdk/pull/96))
 - **Security (Audit Issue O)**: Missing Hash Verification in decrypt_group_image Allows Storage-Level Blob Substitution ([#97](https://github.com/marmot-protocol/mdk/pull/97))
 - **Security (Audit Issue R)**: Refactor encoding handling to enforce base64 usage for key packages and welcome ([#98](https://github.com/marmot-protocol/mdk/pull/98))
+- **Security (Audit Issue AA)**: Added pagination to prevent memory exhaustion from unbounded loading of pending welcomes ([#110](https://github.com/marmot-protocol/mdk/pull/110))
 
 ### Removed
 
