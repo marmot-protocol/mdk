@@ -117,9 +117,9 @@ where
                     }
                 }
                 TagKind::Custom(name) if name.as_ref() == "encoding" => {
-                    // Validate encoding value is either "hex" or "base64"
+                    // Validate encoding value is "base64"
                     if let Some(encoding_value) = tag.content() {
-                        if encoding_value == "hex" || encoding_value == "base64" {
+                        if encoding_value == "base64" {
                             has_encoding = true;
                         } else {
                             return Err(Error::InvalidWelcomeMessage);

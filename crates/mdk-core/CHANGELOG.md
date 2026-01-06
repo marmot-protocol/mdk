@@ -27,7 +27,7 @@
 
 ### Breaking changes
 
-- **Content Encoding**: Removed support for hex encoding in key package and welcome event content
+- **Content Encoding**: Removed support for hex encoding in key package and welcome event content ([#98](https://github.com/marmot-protocol/mdk/pull/98))
   - Key packages and welcome events now require explicit `["encoding", "base64"]` tag
   - Events without encoding tags or with hex encoding are rejected
   - This change addresses security concerns about encoding ambiguity and downgrade attacks
