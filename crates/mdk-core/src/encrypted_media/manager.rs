@@ -653,6 +653,9 @@ mod tests {
 
     #[test]
     fn missing_nonce_results_in_invalid_imeta() {
+        let mdk = create_test_mdk();
+        let group_id = GroupId::from_slice(&[1, 2, 3, 4]);
+        let manager = mdk.media_manager(group_id);
         let tag_values = vec![
             "url https://example.com/test.jpg".to_string(),
             "m image/jpeg".to_string(),
