@@ -87,6 +87,21 @@ pub fn get_or_create_db_key(service_id: &str, db_key_id: &str) -> Result<Encrypt
         .lock()
         .map_err(|e| Error::Keyring(format!("Failed to acquire key generation lock: {}", e)))?;
 
+    // Try to get existing key
+    if let Some(config) = get_db_key(service_id, db_key_id)? {
+        return Ok(config);
+    }
+
+    // Key doesn't exist, generate a new one
+    tracing::info!(
+        service_id = service_id,
+        db_key_id = db_key_id,
+        "Generating new database encryption key"
+    );
+
+    let config = EncryptionConfig::generate()?;
+
+    // Store the new key
     let entry = Entry::new(service_id, db_key_id).map_err(|e| {
         Error::Keyring(format!(
             "Failed to create keyring entry for service='{}', key='{}': {}",
@@ -94,46 +109,15 @@ pub fn get_or_create_db_key(service_id: &str, db_key_id: &str) -> Result<Encrypt
         ))
     })?;
 
-    // Try to get existing key
-    match entry.get_secret() {
-        Ok(secret) => {
-            // Key exists, validate and return it
-            EncryptionConfig::from_slice(&secret).map_err(|e| {
-                Error::Keyring(format!(
-                    "Stored key has invalid length (expected 32 bytes): {}",
-                    e
-                ))
-            })
-        }
-        Err(KeyringError::NoEntry) => {
-            // Key doesn't exist, generate a new one
-            tracing::info!(
-                service_id = service_id,
-                db_key_id = db_key_id,
-                "Generating new database encryption key"
-            );
+    entry.set_secret(config.key()).map_err(|e| match e {
+        KeyringError::NoStorageAccess(err) => Error::KeyringNotInitialized(err.to_string()),
+        other => Error::Keyring(format!(
+            "Failed to store encryption key in keyring: {}",
+            other
+        )),
+    })?;
 
-            let config = EncryptionConfig::generate()?;
-
-            // Store the new key
-            entry.set_secret(config.key()).map_err(|e| match e {
-                KeyringError::NoStorageAccess(err) => Error::KeyringNotInitialized(err.to_string()),
-                other => Error::Keyring(format!(
-                    "Failed to store encryption key in keyring: {}",
-                    other
-                )),
-            })?;
-
-            Ok(config)
-        }
-        Err(KeyringError::NoStorageAccess(err)) => {
-            Err(Error::KeyringNotInitialized(err.to_string()))
-        }
-        Err(e) => Err(Error::Keyring(format!(
-            "Failed to retrieve encryption key from keyring: {}",
-            e
-        ))),
-    }
+    Ok(config)
 }
 
 /// Gets an existing database encryption key from the keyring.

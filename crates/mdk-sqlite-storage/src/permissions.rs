@@ -10,9 +10,25 @@
 //! - **Mobile (iOS/Android)**: The application sandbox provides the primary security
 //!   boundary. File permissions are applied as defense-in-depth.
 
+use std::fs::OpenOptions;
+use std::io::ErrorKind;
 use std::path::Path;
 
 use crate::error::Error;
+
+/// Result of atomic file creation.
+///
+/// Used to communicate whether a file was newly created or already existed,
+/// which is important for determining key management strategy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileCreationOutcome {
+    /// The file was created by this call.
+    Created,
+    /// The file already existed (not modified).
+    AlreadyExisted,
+    /// The path is a special SQLite path (e.g., `:memory:`) that doesn't need pre-creation.
+    Skipped,
+}
 
 /// Creates a directory with secure permissions (owner-only access).
 ///
@@ -69,7 +85,11 @@ where
     Ok(())
 }
 
-/// Pre-creates a database file with secure permissions before opening.
+/// Atomically pre-creates a database file with secure permissions before opening.
+///
+/// Uses `O_CREAT | O_EXCL` (via `create_new`) to atomically create the file only
+/// if it doesn't already exist. This prevents TOCTOU race conditions where
+/// multiple processes might try to create the same database simultaneously.
 ///
 /// This avoids a short window where SQLite might create the file with default
 /// (umask-dependent) permissions. We create an empty file with secure permissions
@@ -79,6 +99,12 @@ where
 ///
 /// * `path` - Path to the database file
 ///
+/// # Returns
+///
+/// - `Ok(FileCreationOutcome::Created)` if the file was created by this call
+/// - `Ok(FileCreationOutcome::AlreadyExisted)` if the file already existed
+/// - `Ok(FileCreationOutcome::Skipped)` for special paths like `:memory:`
+///
 /// # Errors
 ///
 /// Returns an error if the file cannot be created or permissions cannot be set.
@@ -87,7 +113,7 @@ where
 ///
 /// - In-memory databases (":memory:") are skipped
 /// - Empty paths are skipped
-pub fn precreate_secure_database_file<P>(path: P) -> Result<(), Error>
+pub fn precreate_secure_database_file<P>(path: P) -> Result<FileCreationOutcome, Error>
 where
     P: AsRef<Path>,
 {
@@ -96,12 +122,7 @@ where
     // Skip special SQLite paths (in-memory databases, empty paths)
     let path_str = path.to_string_lossy();
     if path_str.is_empty() || path_str == ":memory:" || path_str.starts_with(':') {
-        return Ok(());
-    }
-
-    // Skip if file already exists
-    if path.exists() {
-        return Ok(());
+        return Ok(FileCreationOutcome::Skipped);
     }
 
     // Ensure parent directory exists with secure permissions
@@ -112,13 +133,20 @@ where
         }
     }
 
-    // Create empty file
-    std::fs::File::create(path)?;
-
-    // Set secure permissions
-    set_secure_file_permissions(path)?;
-
-    Ok(())
+    // Atomically create the file only if it doesn't exist.
+    // This uses O_CREAT | O_EXCL on Unix, which is atomic.
+    match OpenOptions::new().write(true).create_new(true).open(path) {
+        Ok(_file) => {
+            // File was created by us - set secure permissions
+            set_secure_file_permissions(path)?;
+            Ok(FileCreationOutcome::Created)
+        }
+        Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+            // File already exists - another process created it first
+            Ok(FileCreationOutcome::AlreadyExisted)
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Sets Unix file permissions to 0600 (owner read/write only).
@@ -162,7 +190,6 @@ fn set_unix_directory_permissions(path: &Path) -> Result<(), Error> {
 ///
 /// Returns an error if permissions are too permissive or if the check fails.
 #[cfg(unix)]
-#[allow(dead_code)] // Reserved for future use by callers who want to verify permissions at startup
 pub fn verify_permissions<P>(path: P) -> Result<(), Error>
 where
     P: AsRef<Path>,
@@ -193,7 +220,6 @@ where
 
 /// Verifies permissions (no-op on platforms without specific support).
 #[cfg(not(unix))]
-#[allow(dead_code)] // Reserved for future use by callers who want to verify permissions at startup
 pub fn verify_permissions<P>(_path: P) -> Result<(), Error>
 where
     P: AsRef<Path>,
@@ -246,7 +272,8 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let db_path = temp_dir.path().join("subdir").join("database.db");
 
-        precreate_secure_database_file(&db_path).unwrap();
+        let outcome = precreate_secure_database_file(&db_path).unwrap();
+        assert_eq!(outcome, FileCreationOutcome::Created);
 
         assert!(db_path.exists());
         assert!(db_path.parent().unwrap().exists());
@@ -300,27 +327,28 @@ mod tests {
     fn test_precreate_skips_memory_database() {
         // In-memory databases should be skipped without error
         let result = precreate_secure_database_file(":memory:");
-        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), FileCreationOutcome::Skipped);
 
         // Other special SQLite paths
         let result = precreate_secure_database_file(":temp:");
-        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), FileCreationOutcome::Skipped);
 
         // Empty path
         let result = precreate_secure_database_file("");
-        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), FileCreationOutcome::Skipped);
     }
 
     #[test]
-    fn test_precreate_skips_existing_file() {
+    fn test_precreate_returns_already_existed_for_existing_file() {
         let temp_dir = tempfile::tempdir().unwrap();
         let db_path = temp_dir.path().join("existing.db");
 
         // Create a file first
         std::fs::write(&db_path, b"existing content").unwrap();
 
-        // precreate should skip it (not overwrite)
-        precreate_secure_database_file(&db_path).unwrap();
+        // precreate should return AlreadyExisted and not overwrite
+        let outcome = precreate_secure_database_file(&db_path).unwrap();
+        assert_eq!(outcome, FileCreationOutcome::AlreadyExisted);
 
         // Verify content is unchanged
         let content = std::fs::read(&db_path).unwrap();
@@ -415,6 +443,66 @@ mod tests {
 
         // Verify permissions
         verify_permissions(&secure_dir).unwrap();
+    }
+
+    #[test]
+    fn test_precreate_atomic_prevents_race() {
+        // Test that atomic creation prevents races by calling precreate twice.
+        // The first call should create, the second should return AlreadyExisted.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("race_test.db");
+
+        // First call creates the file
+        let outcome1 = precreate_secure_database_file(&db_path).unwrap();
+        assert_eq!(outcome1, FileCreationOutcome::Created);
+        assert!(db_path.exists());
+
+        // Second call should detect existing file atomically
+        let outcome2 = precreate_secure_database_file(&db_path).unwrap();
+        assert_eq!(outcome2, FileCreationOutcome::AlreadyExisted);
+    }
+
+    #[test]
+    fn test_precreate_concurrent_threads() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = Arc::new(temp_dir.path().join("concurrent_test.db"));
+
+        // Spawn multiple threads trying to create the same file
+        let handles: Vec<_> = (0..10)
+            .map(|_| {
+                let path = Arc::clone(&db_path);
+                thread::spawn(move || precreate_secure_database_file(path.as_ref()))
+            })
+            .collect();
+
+        // Collect all results
+        let outcomes: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        // All should succeed
+        assert!(outcomes.iter().all(|r| r.is_ok()));
+
+        // Extract successful outcomes
+        let outcomes: Vec<_> = outcomes.into_iter().map(|r| r.unwrap()).collect();
+
+        // Exactly one thread should have created the file
+        let created_count = outcomes
+            .iter()
+            .filter(|o| **o == FileCreationOutcome::Created)
+            .count();
+        assert_eq!(created_count, 1, "Expected exactly one Created outcome");
+
+        // The rest should have seen AlreadyExisted
+        let existed_count = outcomes
+            .iter()
+            .filter(|o| **o == FileCreationOutcome::AlreadyExisted)
+            .count();
+        assert_eq!(existed_count, 9, "Expected 9 AlreadyExisted outcomes");
+
+        // File should exist
+        assert!(db_path.exists());
     }
 
     // Windows-specific permission verification is intentionally not implemented.

@@ -65,7 +65,7 @@
 #![warn(missing_docs)]
 #![warn(rustdoc::bare_urls)]
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use mdk_storage_traits::{Backend, MdkStorageProvider};
@@ -87,7 +87,9 @@ mod welcomes;
 
 pub use self::encryption::EncryptionConfig;
 use self::error::Error;
-use self::permissions::{precreate_secure_database_file, set_secure_file_permissions};
+use self::permissions::{
+    precreate_secure_database_file, set_secure_file_permissions, FileCreationOutcome,
+};
 
 // Define a type alias for the specific SqliteStorageProvider we're using
 type MlsStorage = SqliteStorageProvider<JsonCodec, Connection>;
@@ -141,9 +143,6 @@ pub struct MdkSqliteStorage {
     openmls_storage: MlsStorage,
     /// The SQLite connection
     db_connection: Arc<Mutex<Connection>>,
-    /// Path to the database file (None for in-memory databases)
-    #[allow(dead_code)]
-    db_path: Option<PathBuf>,
 }
 
 impl MdkSqliteStorage {
@@ -200,35 +199,53 @@ impl MdkSqliteStorage {
         P: AsRef<Path>,
     {
         let file_path = file_path.as_ref();
-        let db_exists = file_path.exists();
 
-        let config = if db_exists {
-            // Database exists - check if it's encrypted before looking up the keyring.
-            // This provides accurate error messages when someone tries to open an
-            // unencrypted database with the encrypted constructor.
-            if !encryption::is_database_encrypted(file_path)? {
-                return Err(Error::UnencryptedDatabaseWithEncryption);
+        // Atomically create the database file first, BEFORE making key decisions.
+        // This prevents TOCTOU races where another process could create the file
+        // between our existence check and key generation.
+        let creation_outcome = precreate_secure_database_file(file_path)?;
+
+        let config = match creation_outcome {
+            FileCreationOutcome::Created | FileCreationOutcome::Skipped => {
+                // We created the file (or it's a special path like :memory:).
+                // Safe to generate a new key since we own this database.
+                keyring::get_or_create_db_key(service_id, db_key_id)?
             }
+            FileCreationOutcome::AlreadyExisted => {
+                // File already existed - another thread/process may have created it.
+                // We must retrieve the existing key, not generate a new one.
+                //
+                // IMPORTANT: Check the keyring FIRST, before checking if the file is encrypted.
+                // This handles the race condition where another thread has created the file
+                // and stored the key in the keyring, but hasn't yet written the encrypted
+                // header to the database file. If we checked the file first, we'd see an
+                // empty file and incorrectly return UnencryptedDatabaseWithEncryption.
+                match keyring::get_db_key(service_id, db_key_id)? {
+                    Some(config) => {
+                        // Key exists in keyring - another thread/process is initializing
+                        // (or has initialized) this database with encryption. Use that key.
+                        config
+                    }
+                    None => {
+                        // No key in keyring. Check if the database file appears unencrypted.
+                        // This catches the case where someone tries to use new() on a
+                        // database that was created with new_unencrypted().
+                        if !encryption::is_database_encrypted(file_path)? {
+                            return Err(Error::UnencryptedDatabaseWithEncryption);
+                        }
 
-            // Database is encrypted - only retrieve the key, don't create a new one.
-            // If the key is missing, we must fail to prevent generating a new key
-            // that won't decrypt the existing database.
-            match keyring::get_db_key(service_id, db_key_id)? {
-                Some(config) => config,
-                None => {
-                    return Err(Error::KeyringEntryMissingForExistingDatabase {
-                        db_path: file_path.display().to_string(),
-                        service_id: service_id.to_string(),
-                        db_key_id: db_key_id.to_string(),
-                    });
+                        // Database appears encrypted but no key in keyring - unrecoverable.
+                        return Err(Error::KeyringEntryMissingForExistingDatabase {
+                            db_path: file_path.display().to_string(),
+                            service_id: service_id.to_string(),
+                            db_key_id: db_key_id.to_string(),
+                        });
+                    }
                 }
             }
-        } else {
-            // Database doesn't exist - safe to generate a new key
-            keyring::get_or_create_db_key(service_id, db_key_id)?
         };
 
-        Self::new_internal(file_path, Some(config))
+        Self::new_internal_skip_precreate(file_path, Some(config))
     }
 
     /// Creates a new encrypted [`MdkSqliteStorage`] with a directly provided encryption key.
@@ -312,6 +329,8 @@ impl MdkSqliteStorage {
     }
 
     /// Internal constructor that handles both encrypted and unencrypted database creation.
+    ///
+    /// This is used by constructors that haven't already pre-created the file.
     fn new_internal<P>(
         file_path: P,
         encryption_config: Option<EncryptionConfig>,
@@ -320,11 +339,21 @@ impl MdkSqliteStorage {
         P: AsRef<Path>,
     {
         let file_path = file_path.as_ref();
-        let db_path = file_path.to_path_buf();
 
         // Pre-create database file with secure permissions to avoid permission race
         precreate_secure_database_file(file_path)?;
 
+        Self::new_internal_skip_precreate(file_path, encryption_config)
+    }
+
+    /// Internal constructor that skips file pre-creation.
+    ///
+    /// Used when the caller has already atomically pre-created the file
+    /// (e.g., in `new()` which uses atomic creation for TOCTOU prevention).
+    fn new_internal_skip_precreate(
+        file_path: &Path,
+        encryption_config: Option<EncryptionConfig>,
+    ) -> Result<Self, Error> {
         // Create or open the SQLite database for OpenMLS
         let mls_connection = Self::open_connection(file_path, encryption_config.as_ref())?;
 
@@ -346,7 +375,6 @@ impl MdkSqliteStorage {
         Ok(Self {
             openmls_storage,
             db_connection: Arc::new(Mutex::new(mdk_connection)),
-            db_path: Some(db_path),
         })
     }
 
@@ -430,7 +458,6 @@ impl MdkSqliteStorage {
         Ok(Self {
             openmls_storage,
             db_connection: Arc::new(Mutex::new(mdk_connection)),
-            db_path: None,
         })
     }
 }
