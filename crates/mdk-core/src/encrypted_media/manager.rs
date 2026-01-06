@@ -591,6 +591,55 @@ mod tests {
     }
 
     #[test]
+    fn test_encrypt_for_upload_allows_escape_hatch() {
+        let mdk = create_test_mdk();
+        let group_id = GroupId::from_slice(&[1, 2, 3, 4]);
+        let manager = mdk.media_manager(group_id);
+
+        // Test data (can be anything - escape hatch bypasses validation)
+        let test_data = vec![0x42u8; 1000];
+        let options = MediaProcessingOptions {
+            sanitize_exif: true,
+            generate_blurhash: false,
+            max_dimension: None,
+            max_file_size: None,
+            max_filename_length: None,
+        };
+
+        // Test escape hatch MIME type - should pass validation
+        // (will fail later due to missing group, but validation should pass)
+        let result = manager.encrypt_for_upload_with_options(
+            &test_data,
+            "application/octet-stream",
+            "custom_file.bin",
+            &options,
+        );
+
+        // Validation should pass (escape hatch bypasses allowlist check)
+        // The error should be about missing group, not invalid MIME type
+        assert!(result.is_err());
+        assert!(
+            matches!(result, Err(EncryptedMediaError::GroupNotFound)),
+            "Escape hatch should pass validation, got: {:?}",
+            result
+        );
+
+        // Test escape hatch with parameters (should be canonicalized)
+        let result = manager.encrypt_for_upload_with_options(
+            &test_data,
+            "application/octet-stream; charset=binary",
+            "custom_file.bin",
+            &options,
+        );
+
+        assert!(result.is_err());
+        assert!(
+            matches!(result, Err(EncryptedMediaError::GroupNotFound)),
+            "Escape hatch with parameters should pass validation"
+        );
+    }
+
+    #[test]
     fn test_encrypt_prevents_spoofing() {
         let mdk = create_test_mdk();
         let group_id = GroupId::from_slice(&[1, 2, 3, 4]);
