@@ -16,10 +16,9 @@ impl MessageStorage for MdkMemoryStorage {
                 // Group exists, proceed with saving
             }
             Ok(None) => {
-                return Err(MessageError::InvalidParameters(format!(
-                    "Group with MLS ID {:?} not found",
-                    message.mls_group_id
-                )));
+                return Err(MessageError::InvalidParameters(
+                    "Group not found".to_string(),
+                ));
             }
             Err(e) => {
                 return Err(MessageError::InvalidParameters(format!(
