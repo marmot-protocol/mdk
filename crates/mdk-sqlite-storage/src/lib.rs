@@ -960,7 +960,7 @@ mod tests {
             let config2 = EncryptionConfig::new(key);
             let storage2 = MdkSqliteStorage::new_with_key(&db_path, config2).unwrap();
 
-            let welcomes = storage2.pending_welcomes().unwrap();
+            let welcomes = storage2.pending_welcomes(None).unwrap();
             assert_eq!(welcomes.len(), 1);
         }
 
