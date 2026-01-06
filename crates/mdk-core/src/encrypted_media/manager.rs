@@ -212,8 +212,8 @@ where
         }
 
         let tag_values = imeta_tag.clone().to_vec();
-        // Minimum required fields: url, m (MIME type), filename, x (hash), n (nonce), v (version) = 6 fields
-        if tag_values.len() < 6 {
+        // Minimum required fields: url, m (MIME type), filename, x (hash), n (nonce), v (version) = 6 fields + "imeta" tag = 7
+        if tag_values.len() < 7 {
             return Err(EncryptedMediaError::InvalidImetaTag {
                 reason: "IMETA tag has insufficient fields (minimum: url, m, filename, x, n, v)"
                     .to_string(),
@@ -635,6 +635,41 @@ mod tests {
     }
 
     #[test]
+    fn test_generate_encryption_nonce_uniqueness() {
+        // Generate multiple nonces and verify they are unique
+        let nonces: Vec<[u8; 12]> = (0..100).map(|_| generate_encryption_nonce()).collect();
+
+        for i in 0..nonces.len() {
+            for j in (i + 1)..nonces.len() {
+                assert_ne!(nonces[i], nonces[j], "Nonces should be unique");
+            }
+        }
+
+        // Verify nonces are not all zeros
+        for nonce in &nonces {
+            assert_ne!(nonce, &[0u8; 12], "Nonce should not be all zeros");
+        }
+    }
+
+    #[test]
+    fn missing_nonce_results_in_invalid_imeta() {
+        let tag_values = vec![
+            "url https://example.com/test.jpg".to_string(),
+            "m image/jpeg".to_string(),
+            "filename photo.jpg".to_string(),
+            format!("x {}", hex::encode([0x42; 32])),
+            "v mip04-v2".to_string(),
+            // Missing 'n' (nonce) field
+        ];
+        let tag = NostrTag::custom(TagKind::Custom("imeta".into()), tag_values);
+        let result = manager.parse_imeta_tag(&tag);
+        assert!(matches!(
+            result,
+            Err(EncryptedMediaError::InvalidImetaTag { .. })
+        ));
+    }
+
+    #[test]
     fn test_parse_imeta_tag_version_validation() {
         let mdk = create_test_mdk();
         let group_id = GroupId::from_slice(&[1, 2, 3, 4]);
@@ -655,6 +690,23 @@ mod tests {
             result,
             Err(EncryptedMediaError::DecryptionFailed { .. })
         ));
+
+        // Test that mip04-v1 is explicitly rejected (breaking change)
+        let test_nonce = [0xAB; 12];
+        let tag_values = vec![
+            "url https://example.com/test.jpg".to_string(),
+            "m image/jpeg".to_string(),
+            "filename photo.jpg".to_string(),
+            format!("x {}", hex::encode([0x42; 32])),
+            format!("n {}", hex::encode(test_nonce)),
+            "v mip04-v1".to_string(), // Legacy version
+        ];
+        let tag = NostrTag::custom(TagKind::Custom("imeta".into()), tag_values);
+        let result = manager.parse_imeta_tag(&tag);
+        assert!(
+            matches!(result, Err(EncryptedMediaError::DecryptionFailed { .. })),
+            "mip04-v1 should be rejected to prevent nonce reuse vulnerability"
+        );
 
         // Test supported version
         let test_nonce = [0xDD; 12];
@@ -1236,5 +1288,40 @@ mod tests {
             let decrypted = decrypt_result.unwrap();
             assert_eq!(decrypted, data, "Decrypted {} data should match", mime_type);
         }
+    }
+
+    #[test]
+    fn test_encryption_nonce_uniqueness() {
+        use nostr::Keys;
+        use std::collections::HashSet;
+
+        let alice_keys = Keys::generate();
+        let bob_keys = Keys::generate();
+        let alice_mdk = create_test_mdk();
+        let bob_mdk = create_test_mdk();
+
+        let admin_pubkeys = vec![alice_keys.public_key()];
+        let config = crate::test_util::create_nostr_group_config_data(admin_pubkeys);
+        let bob_key_package = crate::test_util::create_key_package_event(&bob_mdk, &bob_keys);
+        let create_result = alice_mdk
+            .create_group(&alice_keys.public_key(), vec![bob_key_package], config)
+            .expect("Alice should create group");
+        let group_id = create_result.group.mls_group_id.clone();
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("Merge commit");
+
+        let manager = alice_mdk.media_manager(group_id.clone());
+        let test_data = b"Test data";
+
+        // Encrypt same data multiple times
+        let mut nonces = HashSet::new();
+        for _ in 0..100 {
+            let upload = manager
+                .encrypt_for_upload(test_data, "text/plain", "test.txt")
+                .expect("Should encrypt");
+            assert!(nonces.insert(upload.nonce), "Nonce should be unique");
+        }
+        assert_eq!(nonces.len(), 100, "All 100 nonces should be unique");
     }
 }
