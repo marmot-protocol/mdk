@@ -87,8 +87,9 @@ mod welcomes;
 
 pub use self::encryption::EncryptionConfig;
 use self::error::Error;
+pub use self::permissions::verify_permissions;
 use self::permissions::{
-    precreate_secure_database_file, set_secure_file_permissions, FileCreationOutcome,
+    FileCreationOutcome, precreate_secure_database_file, set_secure_file_permissions,
 };
 
 // Define a type alias for the specific SqliteStorageProvider we're using
