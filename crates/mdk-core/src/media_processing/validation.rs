@@ -16,6 +16,73 @@ use crate::media_processing::types::{
 #[cfg(feature = "mip04")]
 use crate::media_processing::types::MAX_FILENAME_LENGTH;
 
+/// Supported MIME types for encrypted media upload
+///
+/// This allowlist restricts the types of media that can be encrypted and uploaded,
+/// preventing spoofing and ensuring only supported formats are processed.
+#[cfg(feature = "mip04")]
+pub(crate) const SUPPORTED_MIME_TYPES: &[&str] = &[
+    // Image types
+    "image/png",
+    "image/jpeg",
+    "image/gif",
+    "image/webp",
+    "image/bmp",
+    "image/x-icon",
+    "image/tiff",
+    "image/x-farbfeld",
+    "image/avif",
+    "image/qoi",
+    // Video types
+    "video/mp4",
+    "video/quicktime",
+    "video/x-matroska",
+    "video/webm",
+    "video/x-msvideo",
+    "video/ogg",
+    // Audio types
+    "audio/ogg",
+    "audio/flac",
+    "audio/x-flac",
+    "audio/aac",
+    "audio/mp4",
+    "audio/webm",
+    "audio/mpeg",
+    "audio/wav",
+    "audio/x-matroska",
+    // Document types
+    "application/pdf",
+    "text/plain",
+];
+
+/// Escape hatch MIME type that allows applications to skip validation
+///
+/// When an application uses this MIME type, MDK will not validate the file type,
+/// allowing the application to handle validation themselves. This is useful for
+/// applications that need to support file types not in the allowlist.
+///
+/// **Warning**: Using this type means MDK provides no validation - the application
+/// is responsible for ensuring the file is safe to process.
+#[cfg(feature = "mip04")]
+pub(crate) const ESCAPE_HATCH_MIME_TYPE: &str = "application/octet-stream";
+
+/// Supported MIME types for group images (protocol-level avatars/icons)
+///
+/// Group images are stored in the group data extension and are protocol-level,
+/// so they must be strictly validated. Only safe image formats are allowed.
+pub(crate) const GROUP_IMAGE_MIME_TYPES: &[&str] = &[
+    "image/png",
+    "image/jpeg",
+    "image/gif",
+    "image/webp",
+    "image/bmp",
+    "image/x-icon",
+    "image/tiff",
+    "image/x-farbfeld",
+    "image/avif",
+    "image/qoi",
+];
+
 /// Validate file size against limits
 pub(crate) fn validate_file_size(
     data: &[u8],
@@ -31,29 +98,84 @@ pub(crate) fn validate_file_size(
     Ok(())
 }
 
-/// Validate MIME type format
+/// Validate MIME type format and allowlist
 ///
-/// Returns the canonical (trimmed and lowercase) MIME type for consistent use
-/// in cryptographic operations and comparisons.
+/// Returns the canonical (trimmed, lowercase, and parameter-stripped) MIME type
+/// for consistent use in cryptographic operations and comparisons.
 ///
 /// This is the centralized function for MIME type canonicalization used throughout
 /// the image processing system. All MIME type processing should use this function
 /// to ensure consistency in encryption keys, AAD construction, and metadata.
 ///
-/// Note: This accepts any valid MIME type format - there is no whitelist of
-/// supported types, allowing maximum flexibility for different media types.
+/// Per MIP-04, this function strips all parameters after the semicolon, returning
+/// only the type/subtype portion (e.g., "image/png; charset=utf-8" -> "image/png").
+///
+/// This function enforces the supported MIME types allowlist, but allows
+/// `application/octet-stream` as an escape hatch for applications that need
+/// to handle validation themselves.
+#[cfg(feature = "mip04")]
 pub(crate) fn validate_mime_type(mime_type: &str) -> Result<String, MediaProcessingError> {
     // Normalize the MIME type: trim whitespace and convert to lowercase
     let normalized = mime_type.trim().to_ascii_lowercase();
 
-    // Validate MIME type format using normalized version
-    if !normalized.contains('/') || normalized.len() > 100 {
+    // Strip parameters after semicolon per MIP-04 canonicalization requirements
+    // Split on ';' and take only the first part (type/subtype)
+    let canonical = normalized.split(';').next().unwrap_or(&normalized).trim();
+
+    // Validate MIME type format using canonical version
+    if !canonical.contains('/') || canonical.len() > 100 {
         return Err(MediaProcessingError::InvalidMimeType {
             mime_type: mime_type.to_string(),
         });
     }
 
-    Ok(normalized)
+    // Allow escape hatch for applications that want to handle validation themselves
+    if canonical == ESCAPE_HATCH_MIME_TYPE {
+        return Ok(canonical.to_string());
+    }
+
+    // Enforce allowlist
+    if !SUPPORTED_MIME_TYPES.contains(&canonical) {
+        return Err(MediaProcessingError::InvalidMimeType {
+            mime_type: canonical.to_string(),
+        });
+    }
+
+    Ok(canonical.to_string())
+}
+
+/// Validate MIME type for group images (strict validation, no escape hatch)
+///
+/// This function validates MIME types for group images stored in the group data extension.
+/// Group images are protocol-level avatars/icons and must be strictly validated - only
+/// safe image formats are allowed. The escape hatch is not available for group images.
+///
+/// Returns the canonical (trimmed, lowercase, and parameter-stripped) MIME type.
+pub(crate) fn validate_group_image_mime_type(
+    mime_type: &str,
+) -> Result<String, MediaProcessingError> {
+    // Normalize the MIME type: trim whitespace and convert to lowercase
+    let normalized = mime_type.trim().to_ascii_lowercase();
+
+    // Strip parameters after semicolon per MIP-04 canonicalization requirements
+    // Split on ';' and take only the first part (type/subtype)
+    let canonical = normalized.split(';').next().unwrap_or(&normalized).trim();
+
+    // Validate MIME type format using canonical version
+    if !canonical.contains('/') || canonical.len() > 100 {
+        return Err(MediaProcessingError::InvalidMimeType {
+            mime_type: mime_type.to_string(),
+        });
+    }
+
+    // Enforce strict allowlist for group images (no escape hatch)
+    if !GROUP_IMAGE_MIME_TYPES.contains(&canonical) {
+        return Err(MediaProcessingError::InvalidMimeType {
+            mime_type: canonical.to_string(),
+        });
+    }
+
+    Ok(canonical.to_string())
 }
 
 /// Detect the actual MIME type from image file data
@@ -130,12 +252,57 @@ fn detect_mime_type_from_data(data: &[u8]) -> Result<String, MediaProcessingErro
 /// This function protects against MIME type confusion attacks by verifying that the
 /// claimed MIME type matches the actual file content. Applications cannot lie about
 /// the file type.
+///
+/// Note: If the claimed MIME type is the escape hatch (`application/octet-stream`),
+/// this function will skip byte validation and return the escape hatch type.
+#[cfg(feature = "mip04")]
 pub(crate) fn validate_mime_type_matches_data(
     data: &[u8],
     claimed_mime_type: &str,
 ) -> Result<String, MediaProcessingError> {
     // First, validate and canonicalize the claimed MIME type
     let canonical_claimed = validate_mime_type(claimed_mime_type)?;
+
+    // If escape hatch is used, skip byte validation (application handles it)
+    if canonical_claimed == ESCAPE_HATCH_MIME_TYPE {
+        return Ok(canonical_claimed);
+    }
+
+    // Detect the actual MIME type from the file data
+    let detected_mime_type = detect_mime_type_from_data(data)?;
+
+    // Compare the claimed type with the detected type
+    if canonical_claimed != detected_mime_type {
+        return Err(MediaProcessingError::MimeTypeMismatch {
+            claimed: canonical_claimed,
+            detected: detected_mime_type,
+        });
+    }
+
+    Ok(canonical_claimed)
+}
+
+/// Validate that the provided MIME type matches the actual file data for group images
+///
+/// This function validates group image MIME types with strict validation (no escape hatch).
+/// Group images are protocol-level and must be strictly validated.
+///
+/// # Arguments
+/// * `data` - The image file data
+/// * `claimed_mime_type` - The MIME type claimed by the application
+///
+/// # Returns
+/// * The canonical MIME type (validated and normalized)
+///
+/// # Errors
+/// * `InvalidMimeType` - If the MIME type format is invalid or not in the group image allowlist
+/// * `MimeTypeMismatch` - If the claimed MIME type doesn't match the detected format
+pub(crate) fn validate_group_image_mime_type_matches_data(
+    data: &[u8],
+    claimed_mime_type: &str,
+) -> Result<String, MediaProcessingError> {
+    // First, validate and canonicalize the claimed MIME type (strict validation)
+    let canonical_claimed = validate_group_image_mime_type(claimed_mime_type)?;
 
     // Detect the actual MIME type from the file data
     let detected_mime_type = detect_mime_type_from_data(data)?;
@@ -261,6 +428,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "mip04")]
     fn test_validate_mime_type() {
         // Test valid MIME types return canonical (lowercase) form
         assert_eq!(validate_mime_type("image/jpeg").unwrap(), "image/jpeg");
@@ -277,6 +445,24 @@ mod tests {
 
         // Test combined normalization
         assert_eq!(validate_mime_type("  Image/WEBP  ").unwrap(), "image/webp");
+
+        // Test parameter stripping (MIP-04 canonicalization)
+        assert_eq!(
+            validate_mime_type("image/png; charset=utf-8").unwrap(),
+            "image/png"
+        );
+        assert_eq!(
+            validate_mime_type("image/jpeg; charset=utf-8; quality=90").unwrap(),
+            "image/jpeg"
+        );
+        assert_eq!(
+            validate_mime_type("  image/png ; charset=utf-8  ").unwrap(),
+            "image/png"
+        );
+        assert_eq!(
+            validate_mime_type("video/mp4; codecs=\"avc1.42E01E\"").unwrap(),
+            "video/mp4"
+        );
 
         // Test invalid format (no slash)
         let result = validate_mime_type("invalid");
@@ -411,6 +597,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "mip04")]
     fn test_validate_mime_type_matches_data() {
         // Create a simple PNG image
         let img = ImageBuffer::from_fn(8, 8, |x, y| {
@@ -509,5 +696,232 @@ mod tests {
         let invalid_data = vec![0u8; 100];
         let result = detect_mime_type_from_data(&invalid_data);
         assert!(result.is_err());
+    }
+
+    #[test]
+    #[cfg(feature = "mip04")]
+    fn test_validate_mime_type_parameter_stripping() {
+        // Test that parameters are stripped per MIP-04
+        assert_eq!(
+            validate_mime_type("image/png; charset=utf-8").unwrap(),
+            "image/png"
+        );
+        assert_eq!(
+            validate_mime_type("image/jpeg; charset=utf-8; quality=90").unwrap(),
+            "image/jpeg"
+        );
+        assert_eq!(
+            validate_mime_type("video/mp4; codecs=\"avc1.42E01E\"").unwrap(),
+            "video/mp4"
+        );
+        assert_eq!(
+            validate_mime_type("  image/png ; charset=utf-8  ").unwrap(),
+            "image/png"
+        );
+
+        // Test that validate_mime_type_matches_data works with parameterized inputs
+        let img = ImageBuffer::from_fn(8, 8, |x, y| {
+            Rgb([(x * 32) as u8, (y * 32) as u8, ((x + y) * 16) as u8])
+        });
+        let mut png_data = Vec::new();
+        img.write_to(
+            &mut std::io::Cursor::new(&mut png_data),
+            image::ImageFormat::Png,
+        )
+        .unwrap();
+
+        // Should work with parameterized MIME type
+        let result = validate_mime_type_matches_data(&png_data, "image/png; charset=utf-8");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "image/png");
+    }
+
+    #[test]
+    #[cfg(feature = "mip04")]
+    fn test_validate_mime_type_allowlist_enforcement() {
+        // Test supported types
+        assert!(validate_mime_type("image/png").is_ok());
+        assert!(validate_mime_type("image/jpeg").is_ok());
+        assert!(validate_mime_type("video/mp4").is_ok());
+        assert!(validate_mime_type("audio/mpeg").is_ok());
+        assert!(validate_mime_type("application/pdf").is_ok());
+        assert!(validate_mime_type("text/plain").is_ok());
+
+        // Test unsupported types
+        assert!(validate_mime_type("application/x-executable").is_err());
+        assert!(validate_mime_type("text/html").is_err());
+        assert!(validate_mime_type("application/javascript").is_err());
+        assert!(validate_mime_type("image/svg+xml").is_err());
+
+        // Test escape hatch (application/octet-stream) - should be allowed
+        assert_eq!(
+            validate_mime_type("application/octet-stream").unwrap(),
+            "application/octet-stream"
+        );
+        // Test escape hatch with parameters
+        assert_eq!(
+            validate_mime_type("application/octet-stream; charset=binary").unwrap(),
+            "application/octet-stream"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "mip04")]
+    fn test_validate_mime_type_escape_hatch_bypasses_byte_validation() {
+        // Create a PNG image
+        let img = ImageBuffer::from_fn(8, 8, |x, y| {
+            Rgb([(x * 32) as u8, (y * 32) as u8, ((x + y) * 16) as u8])
+        });
+        let mut png_data = Vec::new();
+        img.write_to(
+            &mut std::io::Cursor::new(&mut png_data),
+            image::ImageFormat::Png,
+        )
+        .unwrap();
+
+        // Escape hatch should bypass byte validation (application handles it)
+        let result = validate_mime_type_matches_data(&png_data, "application/octet-stream");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "application/octet-stream");
+
+        // Regular image types should still validate bytes
+        let result = validate_mime_type_matches_data(&png_data, "image/png");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "image/png");
+
+        // Mismatch should still fail for regular types
+        let result = validate_mime_type_matches_data(&png_data, "image/jpeg");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_group_image_mime_type_strict() {
+        // Test supported group image types
+        assert_eq!(
+            validate_group_image_mime_type("image/png").unwrap(),
+            "image/png"
+        );
+        assert_eq!(
+            validate_group_image_mime_type("image/jpeg").unwrap(),
+            "image/jpeg"
+        );
+        assert_eq!(
+            validate_group_image_mime_type("image/webp").unwrap(),
+            "image/webp"
+        );
+
+        // Test that non-image types are rejected
+        assert!(validate_group_image_mime_type("video/mp4").is_err());
+        assert!(validate_group_image_mime_type("audio/mpeg").is_err());
+        assert!(validate_group_image_mime_type("application/pdf").is_err());
+        assert!(validate_group_image_mime_type("text/plain").is_err());
+
+        // Test that escape hatch is NOT allowed for group images
+        assert!(validate_group_image_mime_type("application/octet-stream").is_err());
+
+        // Test that unsupported image types are rejected
+        assert!(validate_group_image_mime_type("image/svg+xml").is_err());
+    }
+
+    #[test]
+    fn test_validate_group_image_mime_type_matches_data() {
+        // Create a PNG image
+        let img = ImageBuffer::from_fn(8, 8, |x, y| {
+            Rgb([(x * 32) as u8, (y * 32) as u8, ((x + y) * 16) as u8])
+        });
+        let mut png_data = Vec::new();
+        img.write_to(
+            &mut std::io::Cursor::new(&mut png_data),
+            image::ImageFormat::Png,
+        )
+        .unwrap();
+
+        // Test matching MIME type
+        let result = validate_group_image_mime_type_matches_data(&png_data, "image/png");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "image/png");
+
+        // Test mismatched MIME type (claiming JPEG but file is PNG)
+        let result = validate_group_image_mime_type_matches_data(&png_data, "image/jpeg");
+        assert!(result.is_err());
+        assert!(matches!(
+            result,
+            Err(MediaProcessingError::MimeTypeMismatch { .. })
+        ));
+
+        // Test that non-image types are rejected
+        let result = validate_group_image_mime_type_matches_data(&png_data, "video/mp4");
+        assert!(result.is_err());
+        assert!(matches!(
+            result,
+            Err(MediaProcessingError::InvalidMimeType { .. })
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "mip04")]
+    fn test_validate_mime_type_with_byte_validation() {
+        // Test the combination of validate_mime_type and validate_mime_type_matches_data
+        // as used in encrypt_for_upload_with_options
+
+        // Test with image type - should validate against file bytes
+        let img = ImageBuffer::from_fn(8, 8, |x, y| {
+            Rgb([(x * 32) as u8, (y * 32) as u8, ((x + y) * 16) as u8])
+        });
+        let mut png_data = Vec::new();
+        img.write_to(
+            &mut std::io::Cursor::new(&mut png_data),
+            image::ImageFormat::Png,
+        )
+        .unwrap();
+
+        // Valid image type matching file bytes
+        let canonical = validate_mime_type("image/png").unwrap();
+        assert_eq!(canonical, "image/png");
+        let result = validate_mime_type_matches_data(&png_data, &canonical);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "image/png");
+
+        // Image type with parameters should work (parameters stripped)
+        let canonical = validate_mime_type("image/png; charset=utf-8").unwrap();
+        assert_eq!(canonical, "image/png");
+        let result = validate_mime_type_matches_data(&png_data, &canonical);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "image/png");
+
+        // Spoofed image type should fail at byte validation
+        let canonical = validate_mime_type("image/jpeg").unwrap();
+        assert_eq!(canonical, "image/jpeg");
+        let result = validate_mime_type_matches_data(&png_data, &canonical);
+        assert!(result.is_err());
+        assert!(matches!(
+            result,
+            Err(MediaProcessingError::MimeTypeMismatch { .. })
+        ));
+
+        // Unsupported image type should fail at allowlist check
+        let result = validate_mime_type("image/svg+xml");
+        assert!(result.is_err());
+        assert!(matches!(
+            result,
+            Err(MediaProcessingError::InvalidMimeType { .. })
+        ));
+
+        // Test with non-image type - should only check allowlist (no byte validation)
+        let canonical = validate_mime_type("video/mp4").unwrap();
+        assert_eq!(canonical, "video/mp4");
+        // For non-image types, validate_mime_type is sufficient (no byte validation available)
+
+        // Non-image type with parameters should work
+        let canonical = validate_mime_type("video/mp4; codecs=\"avc1\"").unwrap();
+        assert_eq!(canonical, "video/mp4");
+
+        // Unsupported non-image type should fail
+        let result = validate_mime_type("application/x-executable");
+        assert!(result.is_err());
+        assert!(matches!(
+            result,
+            Err(MediaProcessingError::InvalidMimeType { .. })
+        ));
     }
 }

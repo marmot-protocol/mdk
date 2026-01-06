@@ -8,7 +8,8 @@ use nostr::{Tag as NostrTag, TagKind};
 use sha2::{Digest, Sha256};
 
 use crate::encrypted_media::crypto::{
-    decrypt_data_with_aad, derive_encryption_key, derive_encryption_nonce, encrypt_data_with_aad,
+    DEFAULT_SCHEME_VERSION, decrypt_data_with_aad, derive_encryption_key, derive_encryption_nonce,
+    encrypt_data_with_aad,
 };
 use crate::encrypted_media::metadata::extract_and_process_metadata;
 use crate::encrypted_media::types::{
@@ -71,7 +72,13 @@ where
         options: &MediaProcessingOptions,
     ) -> Result<EncryptedMediaUpload, EncryptedMediaError> {
         validation::validate_file_size(data, options)?;
+        // Validate MIME type: canonicalize, check allowlist, and validate against file bytes (for images)
+        // This prevents spoofing and ensures only supported types are encrypted
         let canonical_mime_type = validation::validate_mime_type(mime_type)?;
+        // For image types, validate against file bytes to prevent spoofing
+        if canonical_mime_type.starts_with("image/") {
+            validation::validate_mime_type_matches_data(data, &canonical_mime_type)?;
+        }
         validation::validate_filename(filename)?;
 
         // Extract metadata and optionally sanitize the file
@@ -83,9 +90,11 @@ where
         // Calculate hash of the PROCESSED (potentially sanitized) data
         // This ensures the hash is of the clean file, not the original with EXIF
         let original_hash: [u8; 32] = Sha256::digest(&processed_data).into();
+        let scheme_version = DEFAULT_SCHEME_VERSION;
         let encryption_key = derive_encryption_key(
             self.mdk,
             &self.group_id,
+            scheme_version,
             &original_hash,
             &metadata.mime_type,
             filename,
@@ -93,6 +102,7 @@ where
         let nonce = derive_encryption_nonce(
             self.mdk,
             &self.group_id,
+            scheme_version,
             &original_hash,
             &metadata.mime_type,
             filename,
@@ -103,6 +113,7 @@ where
             &processed_data,
             &encryption_key,
             &nonce,
+            scheme_version,
             &original_hash,
             &metadata.mime_type,
             filename,
@@ -126,6 +137,7 @@ where
     /// Decrypt downloaded media
     ///
     /// The filename for AAD is taken from the MediaReference, which was parsed from the imeta tag.
+    /// The scheme_version from MediaReference is used to select the correct encryption scheme.
     pub fn decrypt_from_download(
         &self,
         encrypted_data: &[u8],
@@ -134,6 +146,7 @@ where
         let encryption_key = derive_encryption_key(
             self.mdk,
             &self.group_id,
+            &reference.scheme_version,
             &reference.original_hash,
             &reference.mime_type,
             &reference.filename,
@@ -141,6 +154,7 @@ where
         let nonce = derive_encryption_nonce(
             self.mdk,
             &self.group_id,
+            &reference.scheme_version,
             &reference.original_hash,
             &reference.mime_type,
             &reference.filename,
@@ -149,6 +163,7 @@ where
             encrypted_data,
             &encryption_key,
             &nonce,
+            &reference.scheme_version,
             &reference.original_hash,
             &reference.mime_type,
             &reference.filename,
@@ -185,7 +200,7 @@ where
         tag_values.push(format!("x {}", hex::encode(upload.original_hash)));
 
         // v field contains encryption version number (currently "mip04-v1")
-        tag_values.push("v mip04-v1".to_string());
+        tag_values.push(format!("v {}", DEFAULT_SCHEME_VERSION));
 
         NostrTag::custom(TagKind::Custom("imeta".into()), tag_values)
     }
@@ -202,6 +217,7 @@ where
             mime_type: upload.mime_type.clone(),
             filename: upload.filename.clone(),
             dimensions: upload.dimensions,
+            scheme_version: DEFAULT_SCHEME_VERSION.to_string(),
         }
     }
 
@@ -313,13 +329,16 @@ where
             reason: "Missing required 'filename' field".to_string(),
         })?;
 
-        // Validate version (required field, currently only support mip04-v1)
-        let version = version.ok_or(EncryptedMediaError::InvalidImetaTag {
+        // Validate version (required field)
+        let scheme_version = version.ok_or(EncryptedMediaError::InvalidImetaTag {
             reason: "Missing required 'v' (version) field".to_string(),
         })?;
-        if version != "mip04-v1" {
+
+        // Validate that the version is supported
+        // Currently only "mip04-v1" is supported, but we store it for future extensibility
+        if scheme_version != "mip04-v1" {
             return Err(EncryptedMediaError::DecryptionFailed {
-                reason: format!("Unsupported MIP-04 encryption version: {}", version),
+                reason: format!("Unsupported MIP-04 encryption version: {}", scheme_version),
             });
         }
 
@@ -329,6 +348,7 @@ where
             mime_type,
             filename,
             dimensions,
+            scheme_version,
         })
     }
 }
@@ -346,7 +366,12 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
+
+    use image::{ImageBuffer, Rgb};
     use mdk_memory_storage::MdkMemoryStorage;
+
+    use crate::media_processing::types::MediaProcessingError;
 
     fn create_test_mdk() -> MDK<MdkMemoryStorage> {
         MDK::new(MdkMemoryStorage::default())
@@ -426,6 +451,7 @@ mod tests {
         assert_eq!(media_ref.original_hash, [0x42; 32]);
         assert_eq!(media_ref.filename, "photo.jpg");
         assert_eq!(media_ref.dimensions, Some((1920, 1080)));
+        assert_eq!(media_ref.scheme_version, "mip04-v1");
     }
 
     #[test]
@@ -490,10 +516,11 @@ mod tests {
         assert_eq!(media_ref.mime_type, "image/png");
         assert_eq!(media_ref.filename, "test.png");
         assert_eq!(media_ref.dimensions, Some((800, 600)));
+        assert_eq!(media_ref.scheme_version, DEFAULT_SCHEME_VERSION);
     }
 
     #[test]
-    fn test_encrypt_for_upload_accepts_any_mime_type() {
+    fn test_encrypt_for_upload_supported_mime_types() {
         let mdk = create_test_mdk();
         let group_id = GroupId::from_slice(&[1, 2, 3, 4]);
         let manager = mdk.media_manager(group_id);
@@ -509,13 +536,12 @@ mod tests {
             max_filename_length: None,
         };
 
-        // Test with various non-image MIME types - all should pass validation
+        // Test with various supported non-image MIME types - all should pass validation
         let test_cases = vec![
             ("application/pdf", "document.pdf"),
             ("video/quicktime", "video.mov"),
             ("audio/mpeg", "song.mp3"),
             ("text/plain", "note.txt"),
-            ("application/octet-stream", "file.bin"),
         ];
 
         for (mime_type, filename) in test_cases {
@@ -534,6 +560,179 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_encrypt_for_upload_rejects_unsupported_mime_types() {
+        let mdk = create_test_mdk();
+        let group_id = GroupId::from_slice(&[1, 2, 3, 4]);
+        let manager = mdk.media_manager(group_id);
+
+        let test_data = vec![0u8; 1000];
+        let options = MediaProcessingOptions {
+            sanitize_exif: true,
+            generate_blurhash: false,
+            max_dimension: None,
+            max_file_size: None,
+            max_filename_length: None,
+        };
+
+        // Test with unsupported MIME types - all should be rejected
+        let unsupported_cases = vec![
+            ("application/x-executable", "malware.exe"),
+            ("text/html", "page.html"),
+            ("application/javascript", "script.js"),
+            ("image/svg+xml", "image.svg"),
+            ("application/x-sh", "script.sh"),
+        ];
+
+        for (mime_type, filename) in unsupported_cases {
+            let result =
+                manager.encrypt_for_upload_with_options(&test_data, mime_type, filename, &options);
+
+            // Should fail with InvalidMimeType error
+            assert!(result.is_err());
+            assert!(
+                matches!(
+                    result,
+                    Err(EncryptedMediaError::MediaProcessing(
+                        MediaProcessingError::InvalidMimeType { .. }
+                    ))
+                ),
+                "Expected InvalidMimeType error for unsupported MIME type {}, got: {:?}",
+                mime_type,
+                result
+            );
+        }
+    }
+
+    #[test]
+    fn test_encrypt_for_upload_allows_escape_hatch() {
+        let mdk = create_test_mdk();
+        let group_id = GroupId::from_slice(&[1, 2, 3, 4]);
+        let manager = mdk.media_manager(group_id);
+
+        // Test data (can be anything - escape hatch bypasses validation)
+        let test_data = vec![0x42u8; 1000];
+        let options = MediaProcessingOptions {
+            sanitize_exif: true,
+            generate_blurhash: false,
+            max_dimension: None,
+            max_file_size: None,
+            max_filename_length: None,
+        };
+
+        // Test escape hatch MIME type - should pass validation
+        // (will fail later due to missing group, but validation should pass)
+        let result = manager.encrypt_for_upload_with_options(
+            &test_data,
+            "application/octet-stream",
+            "custom_file.bin",
+            &options,
+        );
+
+        // Validation should pass (escape hatch bypasses allowlist check)
+        // The error should be about missing group, not invalid MIME type
+        assert!(result.is_err());
+        assert!(
+            matches!(result, Err(EncryptedMediaError::GroupNotFound)),
+            "Escape hatch should pass validation, got: {:?}",
+            result
+        );
+
+        // Test escape hatch with parameters (should be canonicalized)
+        let result = manager.encrypt_for_upload_with_options(
+            &test_data,
+            "application/octet-stream; charset=binary",
+            "custom_file.bin",
+            &options,
+        );
+
+        assert!(result.is_err());
+        assert!(
+            matches!(result, Err(EncryptedMediaError::GroupNotFound)),
+            "Escape hatch with parameters should pass validation"
+        );
+    }
+
+    #[test]
+    fn test_encrypt_prevents_spoofing() {
+        let mdk = create_test_mdk();
+        let group_id = GroupId::from_slice(&[1, 2, 3, 4]);
+        let manager = mdk.media_manager(group_id);
+
+        // Create a PNG image
+        let img = ImageBuffer::from_fn(8, 8, |x, y| {
+            Rgb([(x * 32) as u8, (y * 32) as u8, ((x + y) * 16) as u8])
+        });
+        let mut png_data = Vec::new();
+        img.write_to(&mut Cursor::new(&mut png_data), image::ImageFormat::Png)
+            .unwrap();
+
+        let options = MediaProcessingOptions {
+            sanitize_exif: true,
+            generate_blurhash: false,
+            max_dimension: None,
+            max_file_size: None,
+            max_filename_length: None,
+        };
+
+        // Test 1: Spoofed image type (claiming JPEG but file is PNG) should fail
+        // This verifies that validate_mime_type_matches_data is called for images
+        let result =
+            manager.encrypt_for_upload_with_options(&png_data, "image/jpeg", "photo.jpg", &options);
+        assert!(result.is_err(), "Spoofed MIME type should be rejected");
+        assert!(
+            matches!(
+                result,
+                Err(EncryptedMediaError::MediaProcessing(
+                    MediaProcessingError::MimeTypeMismatch { .. }
+                ))
+            ),
+            "Expected MimeTypeMismatch error for spoofed image type, got: {:?}",
+            result
+        );
+
+        // Test 2: Unsupported image type should be rejected (allowlist check)
+        let result = manager.encrypt_for_upload_with_options(
+            &png_data,
+            "image/svg+xml",
+            "image.svg",
+            &options,
+        );
+        assert!(
+            result.is_err(),
+            "Unsupported image MIME type should be rejected"
+        );
+        assert!(
+            matches!(
+                result,
+                Err(EncryptedMediaError::MediaProcessing(
+                    MediaProcessingError::InvalidMimeType { .. }
+                ))
+            ),
+            "Expected InvalidMimeType error for unsupported image type, got: {:?}",
+            result
+        );
+
+        // Test 3: Valid matching image type should pass (if we had a real group)
+        // Note: This will fail with GroupNotFound, but that's expected - the validation passed
+        let result =
+            manager.encrypt_for_upload_with_options(&png_data, "image/png", "photo.png", &options);
+        assert!(result.is_err()); // Will fail due to missing group, not validation
+        // But we can verify it's not a validation error
+        assert!(
+            !matches!(
+                result,
+                Err(EncryptedMediaError::MediaProcessing(
+                    MediaProcessingError::InvalidMimeType { .. }
+                )) | Err(EncryptedMediaError::MediaProcessing(
+                    MediaProcessingError::MimeTypeMismatch { .. }
+                ))
+            ),
+            "Should not fail with validation error for valid matching MIME type, got: {:?}",
+            result
+        );
     }
 
     #[test]
@@ -663,6 +862,7 @@ mod tests {
 
         let media_ref = result.unwrap();
         assert_eq!(media_ref.dimensions, None); // Optional field should be None
+        assert_eq!(media_ref.scheme_version, "mip04-v1"); // Version should be stored
 
         // Test with dimensions
         let tag_values = vec![
@@ -679,6 +879,7 @@ mod tests {
 
         let media_ref = result.unwrap();
         assert_eq!(media_ref.dimensions, Some((1920, 1080)));
+        assert_eq!(media_ref.scheme_version, "mip04-v1"); // Version should be stored
     }
 
     #[test]
@@ -773,6 +974,7 @@ mod tests {
         assert_eq!(media_ref.url, "https://example.com/encrypted.jpg");
         assert_eq!(media_ref.filename, "photo.jpg");
         assert_eq!(media_ref.original_hash, [0x42; 32]);
+        assert_eq!(media_ref.scheme_version, "mip04-v1");
 
         // The canonicalized MIME type should now work correctly for key derivation
         // and decryption operations (even though we can't test the full flow without

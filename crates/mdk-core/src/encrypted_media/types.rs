@@ -57,6 +57,8 @@ pub struct MediaReference {
     pub filename: String,
     /// Dimensions if applicable
     pub dimensions: Option<(u32, u32)>,
+    /// Encryption scheme version (e.g., "mip04-v1")
+    pub scheme_version: String,
 }
 
 /// Errors that can occur during encrypted media operations
@@ -177,6 +179,7 @@ mod tests {
             mime_type: "video/mp4".to_string(),
             filename: "test.mp4".to_string(),
             dimensions: Some((1920, 1080)),
+            scheme_version: "mip04-v1".to_string(),
         };
 
         // Verify all fields are accessible
@@ -185,6 +188,7 @@ mod tests {
         assert_eq!(media_ref.mime_type, "video/mp4");
         assert_eq!(media_ref.filename, "test.mp4");
         assert_eq!(media_ref.dimensions, Some((1920, 1080)));
+        assert_eq!(media_ref.scheme_version, "mip04-v1");
     }
 
     #[test]
