@@ -20,6 +20,7 @@ use crate::media_processing::types::MAX_FILENAME_LENGTH;
 ///
 /// This allowlist restricts the types of media that can be encrypted and uploaded,
 /// preventing spoofing and ensuring only supported formats are processed.
+#[cfg(feature = "mip04")]
 pub(crate) const SUPPORTED_MIME_TYPES: &[&str] = &[
     // Image types
     "image/png",
@@ -62,6 +63,7 @@ pub(crate) const SUPPORTED_MIME_TYPES: &[&str] = &[
 ///
 /// **Warning**: Using this type means MDK provides no validation - the application
 /// is responsible for ensuring the file is safe to process.
+#[cfg(feature = "mip04")]
 pub(crate) const ESCAPE_HATCH_MIME_TYPE: &str = "application/octet-stream";
 
 /// Supported MIME types for group images (protocol-level avatars/icons)
@@ -111,6 +113,7 @@ pub(crate) fn validate_file_size(
 /// This function enforces the supported MIME types allowlist, but allows
 /// `application/octet-stream` as an escape hatch for applications that need
 /// to handle validation themselves.
+#[cfg(feature = "mip04")]
 pub(crate) fn validate_mime_type(mime_type: &str) -> Result<String, MediaProcessingError> {
     // Normalize the MIME type: trim whitespace and convert to lowercase
     let normalized = mime_type.trim().to_ascii_lowercase();
@@ -252,6 +255,7 @@ fn detect_mime_type_from_data(data: &[u8]) -> Result<String, MediaProcessingErro
 ///
 /// Note: If the claimed MIME type is the escape hatch (`application/octet-stream`),
 /// this function will skip byte validation and return the escape hatch type.
+#[cfg(feature = "mip04")]
 pub(crate) fn validate_mime_type_matches_data(
     data: &[u8],
     claimed_mime_type: &str,
@@ -424,6 +428,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "mip04")]
     fn test_validate_mime_type() {
         // Test valid MIME types return canonical (lowercase) form
         assert_eq!(validate_mime_type("image/jpeg").unwrap(), "image/jpeg");
@@ -592,6 +597,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "mip04")]
     fn test_validate_mime_type_matches_data() {
         // Create a simple PNG image
         let img = ImageBuffer::from_fn(8, 8, |x, y| {
@@ -693,6 +699,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "mip04")]
     fn test_validate_mime_type_parameter_stripping() {
         // Test that parameters are stripped per MIP-04
         assert_eq!(
@@ -730,6 +737,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "mip04")]
     fn test_validate_mime_type_allowlist_enforcement() {
         // Test supported types
         assert!(validate_mime_type("image/png").is_ok());
@@ -758,6 +766,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "mip04")]
     fn test_validate_mime_type_escape_hatch_bypasses_byte_validation() {
         // Create a PNG image
         let img = ImageBuffer::from_fn(8, 8, |x, y| {
@@ -850,6 +859,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "mip04")]
     fn test_validate_mime_type_with_byte_validation() {
         // Test the combination of validate_mime_type and validate_mime_type_matches_data
         // as used in encrypt_for_upload_with_options
