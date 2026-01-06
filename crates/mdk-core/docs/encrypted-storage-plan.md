@@ -472,7 +472,7 @@ Windows does not have Unix-style chmod permissions. Instead, Windows uses Access
 - **DACL (Discretionary Access Control List)**: Specifies which users/groups can access the file and what operations they can perform.
 - **SACL (System Access Control List)**: Used for auditing (not required for our use case).
 
-**Implementation approach for Windows:**
+**Implementation approach for Windows (host responsibility):**
 
 1. **Store in per-user locations**: Always store database files in the user's private app data directory (e.g., `%LOCALAPPDATA%\<app_name>\`). This provides baseline isolation since other non-admin users cannot access these directories by default.
 
@@ -481,9 +481,7 @@ Windows does not have Unix-style chmod permissions. Instead, Windows uses Access
    - Create a DACL with a single ACE (Access Control Entry) granting `GENERIC_ALL` to the current user's SID.
    - Disable inheritance from parent directories to prevent inherited permissions from granting broader access.
 
-3. **Rust implementation options**:
-   - Use the [`windows`](https://crates.io/crates/windows) crate (official Microsoft bindings) for direct API access.
-   - Alternatively, use [`windows-acl`](https://crates.io/crates/windows-acl) for a higher-level ACL API (though less actively maintained).
+MDK does not currently implement Windows ACL hardening internally. This is intentionally left to host applications because correct ACL handling is subtle and requires Windows-specific testing (inheritance, effective permissions, and principal selection).
 
 **Reference implementation sketch (conceptual):**
 
@@ -616,29 +614,13 @@ fn set_secure_file_permissions(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-#[cfg(windows)]
-fn create_secure_directory(path: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(path)?;
-    // Apply owner-only ACL to directory
-    windows_permissions::set_owner_only_permissions(path)?;
-    Ok(())
-}
-
-#[cfg(windows)]
-fn set_secure_file_permissions(path: &Path) -> std::io::Result<()> {
-    if path.exists() {
-        windows_permissions::set_owner_only_permissions(path)?;
-    }
-    Ok(())
-}
-
-#[cfg(not(any(unix, windows)))]
+#[cfg(not(unix))]
 fn create_secure_directory(path: &Path) -> std::io::Result<()> {
     // On iOS/Android, the app sandbox generally restricts filesystem access.
     std::fs::create_dir_all(path)
 }
 
-#[cfg(not(any(unix, windows)))]
+#[cfg(not(unix))]
 fn set_secure_file_permissions(_path: &Path) -> std::io::Result<()> {
     // On mobile platforms, we rely on app sandboxing.
     Ok(())
@@ -671,10 +653,10 @@ fn set_secure_file_permissions(_path: &Path) -> std::io::Result<()> {
   - [x] `PRAGMA cipher_compatibility = 4;`
   - [x] `PRAGMA temp_store = MEMORY;`
   - [x] Validate with a read (e.g., `SELECT count(*) FROM sqlite_master;`) to distinguish wrong key from other failures
-- [ ] **Compile-time**: Investigate temp-store hardening (`SQLITE_TEMP_STORE=3` where feasible; default Rust SQLCipher builds use `=2`, Android commonly uses `=3`)
+- [x] **Compile-time**: Investigate temp-store hardening — **Findings**: Default `SQLITE_TEMP_STORE=2` + runtime `PRAGMA temp_store = MEMORY` is sufficient; Android already uses `=3`. Users can optionally set `LIBSQLITE3_FLAGS="SQLITE_TEMP_STORE=3"` for maximum hardening. See `SECURITY.md` for details.
 - [x] Add explicit errors for missing key for an existing DB, wrong key, plaintext DB when encryption is required, corrupted DB, and secure-storage-unavailable/uninitialized
 - [x] Add file permission hardening for Unix platforms (0700 for directories, 0600 for files; avoid `chmod` on arbitrary existing directories; pre-create DB file with 0600 to avoid permission races)
-- [ ] Add file permission hardening for Windows (ACL-based, current user only) — placeholder exists, full implementation pending
+- [X] Windows filesystem hardening (ACLs) is left to host applications (see `SECURITY.md`)
 - [x] Add unit tests for encrypted storage
 - [ ] Test cross-platform compilation (iOS, Android, macOS, Linux, Windows)
 

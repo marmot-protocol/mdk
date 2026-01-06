@@ -1,9 +1,14 @@
 //! File permission hardening utilities.
 //!
 //! This module provides platform-specific utilities for setting secure file permissions
-//! on database directories and files. On Unix-like systems, this restricts access to
-//! owner-only. On mobile platforms (iOS/Android), the application sandbox provides
-//! the primary security boundary.
+//! on database directories and files.
+//!
+//! ## Platform Support
+//!
+//! - **Unix (macOS, Linux, iOS, Android)**: Uses file mode permissions (`chmod 0600`/`0700`)
+//!   to restrict access to owner-only.
+//! - **Mobile (iOS/Android)**: The application sandbox provides the primary security
+//!   boundary. File permissions are applied as defense-in-depth.
 
 use std::path::Path;
 
@@ -11,9 +16,7 @@ use crate::error::Error;
 
 /// Creates a directory with secure permissions (owner-only access).
 ///
-/// On Unix-like systems (macOS, Linux), this creates the directory with mode 0700
-/// (owner read/write/execute only). On other platforms, this creates the directory
-/// with default permissions.
+/// - **Unix**: Creates the directory with mode 0700 (owner read/write/execute only).
 ///
 /// # Arguments
 ///
@@ -40,8 +43,8 @@ where
 
 /// Sets secure permissions on an existing file (owner-only access).
 ///
-/// On Unix-like systems, this sets mode 0600 (owner read/write only).
-/// On other platforms, this is a no-op as we rely on app sandboxing.
+/// - **Unix**: Sets mode 0600 (owner read/write only).
+/// - **Other platforms**: No-op (hosts should store databases in app-private locations).
 ///
 /// # Arguments
 ///
@@ -188,14 +191,14 @@ where
     Ok(())
 }
 
-/// Verifies permissions (no-op on non-Unix platforms).
+/// Verifies permissions (no-op on platforms without specific support).
 #[cfg(not(unix))]
 #[allow(dead_code)] // Reserved for future use by callers who want to verify permissions at startup
 pub fn verify_permissions<P>(_path: P) -> Result<(), Error>
 where
     P: AsRef<Path>,
 {
-    // On non-Unix platforms, we rely on app sandboxing
+    // On non-Unix platforms, we rely on app sandboxing and host configuration.
     Ok(())
 }
 
@@ -413,4 +416,6 @@ mod tests {
         // Verify permissions
         verify_permissions(&secure_dir).unwrap();
     }
+
+    // Windows-specific permission verification is intentionally not implemented.
 }
