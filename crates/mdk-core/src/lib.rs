@@ -192,8 +192,7 @@ where
     /// ```no_run
     /// # use mdk_core::MDK;
     /// # use mdk_memory_storage::MdkMemoryStorage;
-    /// let mdk = MDK::builder(MdkMemoryStorage::default())
-    ///     .build();
+    /// let mdk = MDK::builder(MdkMemoryStorage::default()).build();
     /// ```
     pub fn builder(storage: Storage) -> MdkBuilder<Storage> {
         MdkBuilder::new(storage)

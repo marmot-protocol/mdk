@@ -67,6 +67,7 @@
 - **Security (Audit Issue O)**: Missing Hash Verification in decrypt_group_image Allows Storage-Level Blob Substitution ([#97](https://github.com/marmot-protocol/mdk/pull/97))
 - **Security (Audit Issue R)**: Refactor encoding handling to enforce base64 usage for key packages and welcome ([#98](https://github.com/marmot-protocol/mdk/pull/98))
 - **Security (Audit Issue AA)**: Added pagination to prevent memory exhaustion from unbounded loading of pending welcomes ([#110](https://github.com/marmot-protocol/mdk/pull/110))
+- **Security (Audit Issue Q)**: Fixed `remove_members` to use actual leaf indices from the ratchet tree instead of enumeration indices. Previously, using `enumerate()` to derive `LeafNodeIndex` caused removal of incorrect members when the tree had holes from prior removals. Now uses `member.index` directly. ([#120](https://github.com/marmot-protocol/mdk/pull/120))
 
 ### Removed
 
