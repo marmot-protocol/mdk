@@ -671,6 +671,7 @@ mod tests {
 
     mod encryption_tests {
         use std::sync::OnceLock;
+        use std::thread;
 
         use super::*;
 
@@ -1558,7 +1559,6 @@ mod tests {
         fn test_concurrent_encrypted_access_same_key() {
             use mdk_storage_traits::groups::GroupStorage;
             use mdk_storage_traits::test_utils::cross_storage::create_test_group;
-            use std::thread;
 
             let temp_dir = tempdir().unwrap();
             let db_path = temp_dir.path().join("concurrent_encrypted.db");

@@ -72,6 +72,14 @@
   - Database directories are created with mode 0700 (owner-only access)
   - Database files are set to mode 0600 (owner read/write only)
   - SQLite sidecar files (-wal, -shm, -journal) also receive secure permissions
+- SQLCipher encryption support, including config/errors and hardened Unix file permissions. ([#102](https://github.com/marmot-protocol/mdk/pull/102))
+- Input validation for storage operations to prevent unbounded writes ([#94](https://github.com/marmot-protocol/mdk/pull/94))
+  - Message content limited to 1MB
+  - Group names limited to 255 bytes
+  - Group descriptions limited to 2000 bytes
+  - JSON fields limited to 50-100KB
+  - New `Validation` error variant for validation failures
+- Implemented pagination support using `Pagination` struct for pending welcomes ([#110](https://github.com/marmot-protocol/mdk/pull/110))
 
 ### Fixed
 
