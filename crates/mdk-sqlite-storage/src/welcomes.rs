@@ -1,8 +1,8 @@
 //! Implementation of WelcomeStorage trait for SQLite storage.
 
-use mdk_storage_traits::welcomes::WelcomeStorage;
 use mdk_storage_traits::welcomes::error::WelcomeError;
 use mdk_storage_traits::welcomes::types::{ProcessedWelcome, Welcome};
+use mdk_storage_traits::welcomes::{MAX_PENDING_WELCOMES_LIMIT, Pagination, WelcomeStorage};
 use nostr::{EventId, JsonUtil};
 use rusqlite::{OptionalExtension, params};
 
@@ -114,15 +114,34 @@ impl WelcomeStorage for MdkSqliteStorage {
             .map_err(into_welcome_err)
     }
 
-    fn pending_welcomes(&self) -> Result<Vec<Welcome>, WelcomeError> {
+    fn pending_welcomes(
+        &self,
+        pagination: Option<Pagination>,
+    ) -> Result<Vec<Welcome>, WelcomeError> {
+        let pagination = pagination.unwrap_or_default();
+        let limit = pagination.limit();
+        let offset = pagination.offset();
+
+        // Validate limit is within allowed range
+        if !(1..=MAX_PENDING_WELCOMES_LIMIT).contains(&limit) {
+            return Err(WelcomeError::InvalidParameters(format!(
+                "Limit must be between 1 and {}, got {}",
+                MAX_PENDING_WELCOMES_LIMIT, limit
+            )));
+        }
+
         let conn_guard = self.db_connection.lock().map_err(into_welcome_err)?;
 
         let mut stmt = conn_guard
-            .prepare("SELECT * FROM welcomes WHERE state = 'pending'")
+            .prepare(
+                "SELECT * FROM welcomes WHERE state = 'pending' 
+                 ORDER BY id DESC 
+                 LIMIT ? OFFSET ?",
+            )
             .map_err(into_welcome_err)?;
 
         let welcomes_iter = stmt
-            .query_map([], db::row_to_welcome)
+            .query_map(params![limit as i64, offset as i64], db::row_to_welcome)
             .map_err(into_welcome_err)?;
 
         let mut welcomes: Vec<Welcome> = Vec::new();
@@ -225,7 +244,7 @@ mod tests {
         assert_eq!(found_welcome.state, welcome.state);
 
         // Test pending welcomes
-        let pending_welcomes = storage.pending_welcomes().unwrap();
+        let pending_welcomes = storage.pending_welcomes(None).unwrap();
         assert_eq!(pending_welcomes.len(), 1);
         assert_eq!(pending_welcomes[0].id, event_id);
     }
@@ -315,5 +334,84 @@ mod tests {
                 .to_string()
                 .contains("Group name exceeds maximum length")
         );
+    }
+
+    #[test]
+    fn test_pending_welcomes_pagination() {
+        let storage = MdkSqliteStorage::new_in_memory().unwrap();
+
+        // Create a group first
+        let mls_group_id = GroupId::from_slice(&[1, 2, 3, 4]);
+        let group = create_test_group(mls_group_id.clone());
+        storage.save_group(group).unwrap();
+
+        // Create 25 pending welcomes
+        for i in 0..25 {
+            let event_id = EventId::from_hex(&format!(
+                "{:064x}",
+                i + 1 // Start from 1 to avoid all_zeros
+            ))
+            .unwrap();
+            let welcome = create_test_welcome(mls_group_id.clone(), event_id);
+            storage.save_welcome(welcome).unwrap();
+        }
+
+        // Test: Get all pending welcomes (should use default limit of 1000)
+        let all_welcomes = storage.pending_welcomes(None).unwrap();
+        assert_eq!(all_welcomes.len(), 25);
+
+        // Test: Get first 10 welcomes
+        let first_10 = storage
+            .pending_welcomes(Some(Pagination::new(Some(10), Some(0))))
+            .unwrap();
+        assert_eq!(first_10.len(), 10);
+
+        // Test: Get next 10 welcomes (offset 10)
+        let next_10 = storage
+            .pending_welcomes(Some(Pagination::new(Some(10), Some(10))))
+            .unwrap();
+        assert_eq!(next_10.len(), 10);
+
+        // Test: Get last 5 welcomes (offset 20)
+        let last_5 = storage
+            .pending_welcomes(Some(Pagination::new(Some(10), Some(20))))
+            .unwrap();
+        assert_eq!(last_5.len(), 5);
+
+        // Test: Offset beyond available welcomes
+        let beyond = storage
+            .pending_welcomes(Some(Pagination::new(Some(10), Some(30))))
+            .unwrap();
+        assert_eq!(beyond.len(), 0);
+
+        // Test: Verify no overlap between pages
+        let first_id = first_10[0].id;
+        let second_page_ids: Vec<EventId> = next_10.iter().map(|w| w.id).collect();
+        assert!(!second_page_ids.contains(&first_id));
+
+        // Test: Limit of 0 should return error
+        let result = storage.pending_welcomes(Some(Pagination::new(Some(0), Some(0))));
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("must be between 1 and")
+        );
+
+        // Test: Limit exceeding MAX should return error
+        let result = storage.pending_welcomes(Some(Pagination::new(Some(20000), Some(0))));
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("must be between 1 and")
+        );
+
+        // Test: Large offset should work (no MAX_OFFSET validation)
+        let result = storage.pending_welcomes(Some(Pagination::new(Some(10), Some(2_000_000))));
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().len(), 0); // No results at that offset
     }
 }
