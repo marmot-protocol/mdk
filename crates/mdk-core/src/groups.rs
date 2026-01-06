@@ -1000,13 +1000,7 @@ where
     pub fn self_update(&self, group_id: &GroupId) -> Result<UpdateGroupResult, Error> {
         let mut mls_group = self.load_mls_group(group_id)?.ok_or(Error::GroupNotFound)?;
 
-        let current_secret: group_types::GroupExporterSecret = self
-            .storage()
-            .get_group_exporter_secret(group_id, mls_group.epoch().as_u64())
-            .map_err(|e| Error::Group(e.to_string()))?
-            .ok_or(Error::GroupExporterSecretNotFound)?;
-
-        tracing::debug!(target: "nostr_openmls::groups::self_update", "Current epoch: {:?}", current_secret.epoch);
+        tracing::debug!(target: "mdk_core::groups::self_update", "Current epoch: {:?}", mls_group.epoch().as_u64());
 
         // Load current signer
         let current_signer: SignatureKeyPair = self.load_mls_signer(&mls_group)?;
@@ -2102,11 +2096,6 @@ mod tests {
             .expect("MLS group should exist");
         let initial_epoch = initial_mls_group.epoch().as_u64();
 
-        // Ensure the exporter secret exists before self update (this creates it if it doesn't exist)
-        let _initial_secret = creator_mdk
-            .exporter_secret(group_id)
-            .expect("Failed to get initial exporter secret");
-
         // Perform self update
         let update_result = creator_mdk
             .self_update(group_id)
@@ -2212,11 +2201,6 @@ mod tests {
             .own_leaf()
             .expect("Failed to get initial own leaf");
         let initial_signature_key = initial_own_leaf.signature_key().as_slice().to_vec();
-
-        // Ensure the exporter secret exists before self update (this creates it if it doesn't exist)
-        let _initial_secret = creator_mdk
-            .exporter_secret(group_id)
-            .expect("Failed to get initial exporter secret");
 
         // Perform self update (this should rotate the signing key)
         let _update_result = creator_mdk
@@ -2729,11 +2713,6 @@ mod tests {
         verify_epoch_sync();
 
         // Test 3: After self update
-        // Ensure the exporter secret exists before self update (this creates it if it doesn't exist)
-        let _initial_secret = creator_mdk
-            .exporter_secret(group_id)
-            .expect("Failed to get initial exporter secret");
-
         let _self_update_result = creator_mdk
             .self_update(group_id)
             .expect("Failed to perform self update");
@@ -3546,6 +3525,40 @@ mod tests {
         let groups = mdk.get_groups().expect("Should succeed");
 
         assert_eq!(groups.len(), 0, "Should have no groups initially");
+    }
+
+    /// Test getting all groups returns created groups
+    #[test]
+    fn test_get_groups_with_data() {
+        let creator_mdk = create_test_mdk();
+        let (creator, members, admins) = create_test_group_members();
+
+        // Create a group
+        let group_id = create_test_group(&creator_mdk, &creator, &members, &admins);
+
+        // Get all groups
+        let groups = creator_mdk.get_groups().expect("Should succeed");
+
+        assert_eq!(groups.len(), 1, "Should have 1 group");
+        assert_eq!(groups[0].mls_group_id, group_id, "Group ID should match");
+    }
+
+    /// Test getting relays for a group
+    #[test]
+    fn test_get_relays() {
+        let creator_mdk = create_test_mdk();
+        let (creator, members, admins) = create_test_group_members();
+
+        // Create a group (create_nostr_group_config_data includes test relays)
+        let group_id = create_test_group(&creator_mdk, &creator, &members, &admins);
+
+        // Get relays for the group
+        let relays = creator_mdk
+            .get_relays(&group_id)
+            .expect("Should get relays");
+
+        // Verify relays were stored (test config includes relays)
+        assert!(!relays.is_empty(), "Group should have relays");
     }
 
     /// Test getting members for non-existent group

@@ -74,6 +74,7 @@
 - **Security (Audit Issue U)**: Fixed deterministic nonce derivation that caused nonce reuse and message linkability. Encryption now uses random nonces per encryption operation, stored in the IMETA tag. The nonce field (`n`) is now required in IMETA tags. ([#114](https://github.com/marmot-protocol/mdk/pull/114))
 - **Security (Audit Issue Z)**: Added pagination to prevent memory exhaustion from unbounded loading of group messages ([#111](https://github.com/marmot-protocol/mdk/pull/111))
 - **Security (Audit Issue AA)**: Added pagination to prevent memory exhaustion from unbounded loading of pending welcomes ([#110](https://github.com/marmot-protocol/mdk/pull/110))
+- **Security (Audit Issue N)**: Fixed `self_update` to not require a cached exporter secret. Previously, the function would abort with `GroupExporterSecretNotFound` when the current epoch's exporter secret was missing from storage, even though the secret was only used for debug logging. This blocked key rotation for new members or after cache loss, degrading post-compromise security. ([#121](https://github.com/marmot-protocol/mdk/pull/121))
 
 ### Removed
 
