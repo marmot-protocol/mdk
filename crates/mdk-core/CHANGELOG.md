@@ -41,6 +41,8 @@
 - New error variant `AuthorMismatch` for message author verification failures ([#40](https://github.com/marmot-protocol/mdk/pull/40))
 - New error variant `KeyPackageIdentityMismatch` for KeyPackage credential identity validation failures ([#41](https://github.com/marmot-protocol/mdk/pull/41))
 - New error variant `MissingRumorEventId` for when a rumor event is missing its ID ([#107](https://github.com/marmot-protocol/mdk/pull/107))
+- New error variant `MissingGroupIdTag` for events missing the required group ID tag ([#116](https://github.com/marmot-protocol/mdk/pull/116))
+- New error variant `InvalidGroupIdFormat` for malformed group ID values ([#116](https://github.com/marmot-protocol/mdk/pull/116))
 - Added pagination support to `get_pending_welcomes()` public API - accepts `Option<Pagination>` to control limit and offset for welcome retrieval ([#110](https://github.com/marmot-protocol/mdk/pull/110))
 - Exposed `Pagination` struct (from `mdk_storage_traits::welcomes`) in public API for paginated welcome queries ([#110](https://github.com/marmot-protocol/mdk/pull/110))
 - **MIP-02 Welcome Event Validation**: Added comprehensive validation for welcome events ([#96](https://github.com/marmot-protocol/mdk/pull/96))
