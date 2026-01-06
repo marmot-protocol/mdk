@@ -219,8 +219,9 @@ where
     /// Validates that key package event tags match MIP-00 specification.
     ///
     /// This function checks that:
-    /// - The event has the required tags (mls_protocol_version, mls_ciphersuite, mls_extensions)
+    /// - The event has the required tags (mls_protocol_version, mls_ciphersuite, mls_extensions, relays)
     /// - Tag values are in the correct format and contain valid values
+    /// - The relays tag contains at least one valid relay URL (mandatory per MIP-00)
     /// - Supports backward compatibility with legacy formats
     ///
     /// # Arguments
@@ -242,10 +243,12 @@ where
         let pv = require(Self::is_protocol_version_tag, "mls_protocol_version")?;
         let cs = require(Self::is_ciphersuite_tag, "mls_ciphersuite")?;
         let ext = require(Self::is_extensions_tag, "mls_extensions")?;
+        let relays = require(Self::is_relays_tag, "relays")?;
 
         self.validate_protocol_version_tag(pv)?;
         self.validate_ciphersuite_tag(cs)?;
         self.validate_extensions_tag(ext)?;
+        self.validate_relays_tag(relays)?;
 
         Ok(())
     }
@@ -277,6 +280,13 @@ where
         // Legacy format without mls_ prefix
         // TODO: Remove legacy check after migration period (target: EOY 2025)
         (tag.as_slice().first().map(|s| s.as_str()) == Some("extensions"))
+    }
+
+    /// Checks if a tag is a relays tag (MIP-00).
+    ///
+    /// **SPEC-COMPLIANT**: "relays"
+    fn is_relays_tag(&self, tag: &Tag) -> bool {
+        matches!(tag.kind(), TagKind::Relays)
     }
 
     /// Validates protocol version tag format and value.
@@ -535,6 +545,33 @@ where
                     )));
                 }
             }
+        }
+
+        Ok(())
+    }
+
+    /// Validates relays tag format and values.
+    ///
+    /// **SPEC-COMPLIANT**: Per MIP-00, the relays tag is mandatory and must contain
+    /// at least one valid relay URL. This ensures key packages are routable.
+    fn validate_relays_tag(&self, tag: &Tag) -> Result<(), Error> {
+        let relay_slice = tag.as_slice();
+
+        // Check that relays tag has at least one relay URL (first element is tag name)
+        if relay_slice.len() <= 1 {
+            return Err(Error::KeyPackage(
+                "Relays tag must have at least one relay URL".to_string(),
+            ));
+        }
+
+        // Validate that each relay URL is properly formatted and parses as a RelayUrl
+        for (idx, relay_url_str) in relay_slice.iter().skip(1).enumerate() {
+            RelayUrl::parse(relay_url_str).map_err(|e| {
+                Error::KeyPackage(format!(
+                    "Invalid relay URL at index {}: {} ({})",
+                    idx, relay_url_str, e
+                ))
+            })?;
         }
 
         Ok(())
@@ -1135,6 +1172,7 @@ mod tests {
                 TagKind::custom("extensions"),
                 ["0x0003", "0x000a", "0x0002", "0xf2ee"],
             ),
+            Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
         ];
 
         let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex)
@@ -1180,6 +1218,7 @@ mod tests {
                     "Unknown(62190)",
                 ],
             ),
+            Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
         ];
 
         let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex)
@@ -1220,6 +1259,7 @@ mod tests {
                 TagKind::MlsExtensions,
                 ["RequiredCapabilities,LastResort,RatchetTree,Unknown(62190)"], // Single string with commas
             ),
+            Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
         ];
 
         let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex)
@@ -1258,6 +1298,7 @@ mod tests {
                     TagKind::MlsExtensions,
                     ["0x0003", "0x000a", "0x0002", "0xf2ee"],
                 ),
+                Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
             ];
 
             let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex.clone())
@@ -1282,6 +1323,7 @@ mod tests {
                     TagKind::MlsExtensions,
                     ["0x0003", "0x000a", "0x0002", "0xf2ee"],
                 ),
+                Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
             ];
 
             let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex)
@@ -1313,6 +1355,7 @@ mod tests {
         let key_package_hex = "0001000120bb8f754cb3b10edfaeb3853591ec45c44e6aee11b81f37dd0ea6a7184d300153201d1507624d5e3ab2a8df6019236e454ae42fb71a0f991373412f5a2ae541c150200e9ccae869886055bdfbfce5b2d2f5eef41cd5294ba6f903c1bb657503509f090001404035353262313062313831643537653063663162633333333532636637643137646564353861383135623234343230316437646263393338633661336566343063020001020001080003000a0002f2ee0002000101000000006909bca700000000697888b7004040a8c295c3f04e7f5212ea7f3265064acb28f3220e7634137c120f96916efa6623b8661f34611cfe82f7ea6176cb07b45b8b346f65a084a5013a9f92587fdeea0203000a004040f123560da089ae702d3cb311659a22a67dc038141eea235483f90a7cf62aa3233d4983074418d5dba1e4351d4a18d7174bab543e3dea8bd9c8bda23c28876b03";
 
         // Real tags from production: numeric ciphersuite "1" and comma-separated extensions
+        // Note: Production had empty relays tag, but we now require at least one valid relay URL
         let production_tags = vec![
             Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
             Tag::custom(TagKind::MlsCiphersuite, ["1"]), // Numeric format from production
@@ -1320,7 +1363,7 @@ mod tests {
                 TagKind::MlsExtensions,
                 ["RequiredCapabilities,LastResort,RatchetTree,Unknown(62190)"], // Comma-separated from production
             ),
-            Tag::relays(vec![]), // Empty relays tag from production
+            Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]), // Valid relay URL required
         ];
 
         let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex)
@@ -1360,6 +1403,7 @@ mod tests {
             let tags = vec![
                 Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
                 Tag::custom(TagKind::MlsExtensions, ["0x0003", "0x000a"]),
+                Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
             ];
 
             let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex.clone())
@@ -1439,6 +1483,7 @@ mod tests {
                 Tag::custom(TagKind::MlsProtocolVersion, ["2.0"]),
                 Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
                 Tag::custom(TagKind::MlsExtensions, ["0x0003", "0x000a"]),
+                Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
             ];
 
             let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex.clone())
@@ -1462,6 +1507,7 @@ mod tests {
                 Tag::custom(TagKind::MlsProtocolVersion, ["0.9"]),
                 Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
                 Tag::custom(TagKind::MlsExtensions, ["0x0003", "0x000a"]),
+                Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
             ];
 
             let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex.clone())
@@ -1485,6 +1531,7 @@ mod tests {
                 Tag::custom(TagKind::MlsProtocolVersion, Vec::<&str>::new()), // No value
                 Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
                 Tag::custom(TagKind::MlsExtensions, ["0x0003", "0x000a"]),
+                Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
             ];
 
             let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex)
@@ -1524,6 +1571,7 @@ mod tests {
                 Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
                 Tag::custom(TagKind::MlsCiphersuite, ["0x01"]), // Too short
                 Tag::custom(TagKind::MlsExtensions, ["0x0003"]),
+                Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
             ];
 
             let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex.clone())
@@ -1545,6 +1593,7 @@ mod tests {
                 Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
                 Tag::custom(TagKind::MlsCiphersuite, ["0xGGGG"]), // Invalid hex
                 Tag::custom(TagKind::MlsExtensions, ["0x0003"]),
+                Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
             ];
 
             let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex.clone())
@@ -1566,6 +1615,7 @@ mod tests {
                 Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
                 Tag::custom(TagKind::MlsCiphersuite, [""]), // Empty value
                 Tag::custom(TagKind::MlsExtensions, ["0x0003"]),
+                Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
             ];
 
             let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex)
@@ -1597,6 +1647,7 @@ mod tests {
                 Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
                 Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
                 Tag::custom(TagKind::MlsExtensions, ["0x03", "0x000a"]), // First one too short
+                Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
             ];
 
             let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex.clone())
@@ -1618,6 +1669,7 @@ mod tests {
                 Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
                 Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
                 Tag::custom(TagKind::MlsExtensions, ["0x0003", "0xZZZZ"]), // Invalid hex
+                Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
             ];
 
             let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex.clone())
@@ -1639,6 +1691,7 @@ mod tests {
                 Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
                 Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
                 Tag::custom(TagKind::MlsExtensions, ["0x0003", ""]), // Empty value
+                Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
             ];
 
             let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex)
@@ -1673,6 +1726,7 @@ mod tests {
                     TagKind::MlsExtensions,
                     ["0x0003", "0x000a", "0x0002", "0xf2ee"],
                 ),
+                Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
             ];
 
             let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex.clone())
@@ -1710,6 +1764,7 @@ mod tests {
                         "Unknown(62190)",
                     ],
                 ),
+                Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
             ];
 
             let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex)
@@ -1750,6 +1805,7 @@ mod tests {
                 Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
                 Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
                 Tag::custom(TagKind::MlsExtensions, ["0xf2ee"]), // Missing 0x000a (LastResort)
+                Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
             ];
 
             let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex.clone())
@@ -1776,6 +1832,7 @@ mod tests {
                 Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
                 Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
                 Tag::custom(TagKind::MlsExtensions, ["0x000a"]), // Missing 0xf2ee (NostrGroupData)
+                Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
             ];
 
             let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex)
@@ -1824,6 +1881,7 @@ mod tests {
                     TagKind::MlsExtensions,
                     ["LastResort", "RatchetTree", "Unknown(62190)"], // Missing RequiredCapabilities
                 ),
+                Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
             ];
 
             let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex.clone())
@@ -1856,6 +1914,7 @@ mod tests {
                     TagKind::MlsExtensions,
                     ["RequiredCapabilities,LastResort,RatchetTree"], // Missing Unknown(62190)
                 ),
+                Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
             ];
 
             let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex)
@@ -1928,6 +1987,7 @@ mod tests {
                     "Unknown(62190)",
                 ],
             ),
+            Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
         ];
 
         // Sign with the same keys used in the credential

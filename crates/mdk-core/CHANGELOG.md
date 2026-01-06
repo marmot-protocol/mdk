@@ -59,6 +59,7 @@
 - **Security (Audit Issue G)**: Fixed admin authorization to read from current MLS group state instead of potentially stale stored metadata. The `is_leaf_node_admin` and `is_member_admin` functions now derive admin status from the `NostrGroupDataExtension` in the MLS group context, preventing a race window where a recently demoted admin could still perform privileged operations. ([#108](https://github.com/marmot-protocol/mdk/pull/108))
 - **Security (Audit Issue H)**: Added MIP-02 validation to prevent malformed welcome events from causing storage pollution and resource exhaustion ([#96](https://github.com/marmot-protocol/mdk/pull/96))
 - **Security (Audit Issue O)**: Missing Hash Verification in decrypt_group_image Allows Storage-Level Blob Substitution ([#97](https://github.com/marmot-protocol/mdk/pull/97))
+- **Security (Audit Issue S)**: Added validation for mandatory `relays` tag in MLS KeyPackage events. The `validate_key_package_tags` function now requires a `relays` tag with at least one valid relay URL, preventing acceptance of unroutable key packages that could cause delivery failures or enable denial-of-service attacks. ([#TBD](https://github.com/marmot-protocol/mdk/pull/TBD))
 - **Security (Audit Issue AA)**: Added pagination to prevent memory exhaustion from unbounded loading of pending welcomes ([#110](https://github.com/marmot-protocol/mdk/pull/110))
 
 ### Removed
