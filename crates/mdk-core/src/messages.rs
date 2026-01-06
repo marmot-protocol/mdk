@@ -1320,6 +1320,25 @@ mod tests {
     }
 
     #[test]
+    fn test_process_message_invalid_group_id_format() {
+        let mdk = create_test_mdk();
+        let creator = Keys::generate();
+
+        // Create an event with invalid group ID format (not valid hex)
+        let invalid_group_id = "not-valid-hex-zzz";
+        let tag = Tag::custom(TagKind::h(), [invalid_group_id]);
+
+        let event = EventBuilder::new(Kind::MlsGroupMessage, "encrypted_content")
+            .tag(tag)
+            .sign_with_keys(&creator)
+            .expect("Failed to sign event");
+
+        let result = mdk.process_message(&event);
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), Error::InvalidGroupIdFormat));
+    }
+
+    #[test]
     fn test_process_message_group_not_found() {
         let mdk = create_test_mdk();
         let creator = Keys::generate();
