@@ -34,6 +34,8 @@
   - `Welcome.group_image_key` changed from `Option<[u8; 32]>` to `Option<Secret<[u8; 32]>>`
   - `Welcome.group_image_nonce` changed from `Option<[u8; 12]>` to `Option<Secret<[u8; 12]>>`
   - Code accessing these fields must use `Secret::new()` to wrap values or dereference/clone to access inner values ([#109](https://github.com/marmot-protocol/mdk/pull/109))
+- **BREAKING**: Changed `WelcomeStorage::pending_welcomes()` to accept `Option<Pagination>` parameter instead of having separate `pending_welcomes()` and `pending_welcomes_paginated()` methods ([#110](https://github.com/marmot-protocol/mdk/pull/110))
+- **BREAKING**: Removed `MAX_PENDING_WELCOMES_OFFSET` constant - offset validation removed to allow legitimate large-scale use cases ([#110](https://github.com/marmot-protocol/mdk/pull/110))
 
 ### Changed
 
@@ -46,11 +48,14 @@
   - Includes serde serialization support
   - Debug formatting hides secret values to prevent leaks
   - Comprehensive test suite including memory zeroization verification ([#109](https://github.com/marmot-protocol/mdk/pull/109))
+- Added `Pagination` struct with `limit` and `offset` fields for cleaner pagination API - now part of public API for external consumers ([#110](https://github.com/marmot-protocol/mdk/pull/110))
+- Added `DEFAULT_PENDING_WELCOMES_LIMIT` (1000) and `MAX_PENDING_WELCOMES_LIMIT` (10,000) constants for pagination validation ([#110](https://github.com/marmot-protocol/mdk/pull/110))
 - Add tests for `admins()`, `messages()`, and `group_relays()` error cases when group not found ([#104](https://github.com/marmot-protocol/mdk/pull/104))
 
 ### Fixed
 
-- **Security**: Secret values (encryption keys, nonces, exporter secrets) are now automatically zeroized when dropped, preventing memory leaks of sensitive cryptographic material ([#109](https://github.com/marmot-protocol/mdk/pull/109))
+- **Security (Audit Issue Y)**: Secret values (encryption keys, nonces, exporter secrets) are now automatically zeroized when dropped, preventing memory leaks of sensitive cryptographic material ([#109](https://github.com/marmot-protocol/mdk/pull/109))
+- **Security (Audit Issue AA)**: Added pagination to prevent memory exhaustion from unbounded loading of pending welcomes ([#110](https://github.com/marmot-protocol/mdk/pull/110))
 
 ### Removed
 

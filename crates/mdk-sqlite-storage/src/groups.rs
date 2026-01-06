@@ -40,9 +40,17 @@ impl GroupStorage for MdkSqliteStorage {
         let mut groups: Vec<Group> = Vec::new();
 
         for group_result in groups_iter {
-            // TODO: simply skip parsing errors? Or log them? Instead of block the whole request
-            let group: Group = group_result.map_err(into_group_err)?;
-            groups.push(group);
+            match group_result {
+                Ok(group) => {
+                    groups.push(group);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "Failed to deserialize group row, skipping"
+                    );
+                }
+            }
         }
 
         Ok(groups)
@@ -296,6 +304,8 @@ mod tests {
     use mdk_storage_traits::Secret;
     use mdk_storage_traits::groups::types::GroupState;
     use mdk_storage_traits::test_utils::crypto_utils::generate_random_bytes;
+    use rusqlite::Connection;
+    use tempfile::tempdir;
 
     use super::*;
 
@@ -500,5 +510,74 @@ mod tests {
 
         assert_eq!(*retrieved_secret1.secret, [0u8; 32]);
         assert_eq!(*retrieved_secret2.secret, [0u8; 32]);
+    }
+
+    #[test]
+    fn test_all_groups_skips_corrupted_rows() {
+        // Use a file-based database so we can access it from multiple connections
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+        let storage = MdkSqliteStorage::new(&db_path).unwrap();
+
+        // Create and save two valid groups
+        let mls_group_id1 = GroupId::from_slice(&[1, 2, 3, 4]);
+        let nostr_group_id1 = generate_random_bytes(32).try_into().unwrap();
+        let group1 = Group {
+            mls_group_id: mls_group_id1.clone(),
+            nostr_group_id: nostr_group_id1,
+            name: "Group 1".to_string(),
+            description: "First group".to_string(),
+            admin_pubkeys: BTreeSet::new(),
+            last_message_id: None,
+            last_message_at: None,
+            epoch: 0,
+            state: GroupState::Active,
+            image_hash: None,
+            image_key: None,
+            image_nonce: None,
+        };
+        storage.save_group(group1).unwrap();
+
+        let mls_group_id2 = GroupId::from_slice(&[5, 6, 7, 8]);
+        let nostr_group_id2 = generate_random_bytes(32).try_into().unwrap();
+        let group2 = Group {
+            mls_group_id: mls_group_id2.clone(),
+            nostr_group_id: nostr_group_id2,
+            name: "Group 2".to_string(),
+            description: "Second group".to_string(),
+            admin_pubkeys: BTreeSet::new(),
+            last_message_id: None,
+            last_message_at: None,
+            epoch: 0,
+            state: GroupState::Active,
+            image_hash: None,
+            image_key: None,
+            image_nonce: None,
+        };
+        storage.save_group(group2).unwrap();
+
+        let corrupt_conn = Connection::open(&db_path).unwrap();
+        let corrupted_nostr_id_bytes = generate_random_bytes(32);
+        let corrupted_nostr_id: [u8; 32] = corrupted_nostr_id_bytes.try_into().unwrap();
+        corrupt_conn
+            .execute(
+                "INSERT INTO groups (mls_group_id, nostr_group_id, name, description, admin_pubkeys, epoch, state) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                params![
+                    &[9u8; 16], // Valid mls_group_id
+                    &corrupted_nostr_id,
+                    "Corrupted Group",
+                    "This group has invalid state",
+                    "[]", // Valid JSON for admin_pubkeys
+                    0,
+                    "invalid_state" // Invalid state that will fail deserialization
+                ],
+            )
+            .unwrap();
+
+        // all_groups should return the two valid groups and skip the corrupted one
+        let all_groups = storage.all_groups().unwrap();
+        assert_eq!(all_groups.len(), 2);
+        assert_eq!(all_groups[0].mls_group_id, mls_group_id1);
+        assert_eq!(all_groups[1].mls_group_id, mls_group_id2);
     }
 }

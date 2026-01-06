@@ -22,8 +22,10 @@ use mdk_core::{
 };
 use mdk_sqlite_storage::MdkSqliteStorage;
 use mdk_storage_traits::{
-    GroupId, groups::types as group_types, messages::types as message_types,
-    welcomes::types as welcome_types,
+    GroupId,
+    groups::types as group_types,
+    messages::types as message_types,
+    welcomes::{Pagination, types as welcome_types},
 };
 use nostr::{Event, EventBuilder, EventId, Kind, PublicKey, RelayUrl, Tag, TagKind, UnsignedEvent};
 
@@ -271,7 +273,31 @@ impl Mdk {
     pub fn get_pending_welcomes(&self) -> Result<Vec<Welcome>, MdkUniffiError> {
         Ok(self
             .lock()?
-            .get_pending_welcomes()?
+            .get_pending_welcomes(None)?
+            .into_iter()
+            .map(Welcome::from)
+            .collect())
+    }
+
+    /// Get pending welcomes with pagination
+    ///
+    /// # Arguments
+    ///
+    /// * `limit` - Optional maximum number of welcomes to return (defaults to 1000)
+    /// * `offset` - Optional number of welcomes to skip (defaults to 0)
+    ///
+    /// # Returns
+    ///
+    /// Returns a vector of pending welcomes ordered by ID (descending)
+    pub fn get_pending_welcomes_paginated(
+        &self,
+        limit: Option<u32>,
+        offset: Option<u32>,
+    ) -> Result<Vec<Welcome>, MdkUniffiError> {
+        let pagination = Pagination::new(limit.map(|l| l as usize), offset.map(|o| o as usize));
+        Ok(self
+            .lock()?
+            .get_pending_welcomes(Some(pagination))?
             .into_iter()
             .map(Welcome::from)
             .collect())
