@@ -27,11 +27,30 @@
 
 ### Breaking changes
 
+- **BREAKING**: Updated `pending_welcomes()` implementation to accept `Option<Pagination>` parameter ([#110](https://github.com/marmot-protocol/mdk/pull/110))
+
 ### Changed
+
+- Simplified validation logic to use range contains pattern for better readability ([#110](https://github.com/marmot-protocol/mdk/pull/110))
 
 ### Added
 
+- Input validation for storage operations to prevent unbounded writes ([#94](https://github.com/marmot-protocol/mdk/pull/94))
+  - Message content limited to 1MB
+  - Group names limited to 255 bytes
+  - Group descriptions limited to 2000 bytes
+  - JSON fields limited to 50-100KB
+  - New `Validation` error variant for validation failures
+- Implemented pagination support using `Pagination` struct for pending welcomes ([#110](https://github.com/marmot-protocol/mdk/pull/110))
+
 ### Fixed
+
+- **Security (Audit Issue AA)**: Added pagination to prevent memory exhaustion from unbounded loading of pending welcomes ([#110](https://github.com/marmot-protocol/mdk/pull/110))
+- **Security (Audit Issue AB)**: Added size limits to prevent disk and CPU exhaustion from unbounded user input ([#94](https://github.com/marmot-protocol/mdk/pull/94))
+- **Security (Audit Issue AG)**: `all_groups` now skips corrupted rows instead of failing on the first deserialization error, improving availability when database contains malformed data ([#115](https://github.com/marmot-protocol/mdk/pull/115))
+- **Security (Audit Issue AO)**: Removed MLS group identifiers from error messages to prevent metadata leakage in logs and telemetry. Error messages now use generic "Group not found" instead of including the sensitive 32-byte MLS group ID. ([#112](https://github.com/marmot-protocol/mdk/pull/112))
+  - Propagate `last_message_id` parse errors in `row_to_group` instead of silently converting to `None` ([#105](https://github.com/marmot-protocol/mdk/pull/105))
+  - Added size limits to prevent disk and CPU exhaustion from unbounded user input ([#94](https://github.com/marmot-protocol/mdk/pull/94))
 
 ### Removed
 
@@ -52,8 +71,8 @@
 
 - Library split from rust-nostr into independent MDK (Marmot Development Kit) project
 - Remove group type from groups
-- Replaced `save_group_relay` with `replace_group_relays` trait method (https://github.com/rust-nostr/nostr/pull/1056)
-- `image_hash` instead of `image_url` (https://github.com/rust-nostr/nostr/pull/1059)
+- Replaced `save_group_relay` with `replace_group_relays` trait method ([#1056](https://github.com/rust-nostr/nostr/pull/1056))
+- `image_hash` instead of `image_url` ([#1059](https://github.com/rust-nostr/nostr/pull/1059))
 
 ### Changed
 
@@ -65,4 +84,4 @@ No notable changes in this release.
 
 ## v0.42.0 - 2025/05/20
 
-First release (https://github.com/rust-nostr/nostr/pull/842)
+First release ([#842](https://github.com/rust-nostr/nostr/pull/842))

@@ -1,0 +1,100 @@
+name: Changelog Check
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+jobs:
+  check-changelog:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get PR information
+        id: pr_info
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const pr = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number,
+            });
+            
+            const labels = pr.data.labels.map(l => l.name);
+            const hasSkipLabel = labels.some(l => 
+              l.toLowerCase().includes('skip-changelog') || 
+              l.toLowerCase().includes('no-changelog')
+            );
+            
+            const title = pr.data.title;
+            const hasSkipInTitle = /\[skip-changelog\]|\[no-changelog\]/i.test(title);
+            
+            core.setOutput('skip', hasSkipLabel || hasSkipInTitle ? 'true' : 'false');
+            core.setOutput('title', title);
+            core.setOutput('labels', JSON.stringify(labels));
+
+      - name: Check for CHANGELOG.md changes
+        id: check_changelog
+        if: steps.pr_info.outputs.skip != 'true'
+        run: |
+          BASE_BRANCH="${{ github.base_ref }}"
+          CHANGED_FILES=$(git diff --name-only origin/$BASE_BRANCH...HEAD)
+          CHANGELOG_CHANGED=$(echo "$CHANGED_FILES" | grep -i "CHANGELOG.md" || echo "")
+          
+          if [ -z "$CHANGELOG_CHANGED" ]; then
+            echo "❌ No CHANGELOG.md files were modified in this PR"
+            echo ""
+            echo "Please add an entry to the relevant CHANGELOG.md file(s):"
+            echo ""
+            echo "Available CHANGELOG.md files:"
+            find . -name "CHANGELOG.md" -not -path "./target/*" | sed 's/^/  - /'
+            echo ""
+            echo "To skip this check, add the 'skip-changelog' label or include '[skip-changelog]' in the PR title."
+            echo "changed=false" >> $GITHUB_OUTPUT
+            exit 1
+          else
+            echo "✅ CHANGELOG.md file(s) modified:"
+            echo "$CHANGELOG_CHANGED" | sed 's/^/  - /'
+            echo "changed=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Skip notification
+        if: steps.pr_info.outputs.skip == 'true'
+        run: |
+          echo "⚠️  Skipping changelog check"
+          echo "Reason: PR has skip label or title contains [skip-changelog]"
+
+      - name: Comment on PR if changelog is missing
+        if: steps.check_changelog.outputs.changed == 'false' && steps.pr_info.outputs.skip != 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const comment = `## ❌ Changelog Check Failed
+
+            This PR does not include changes to any CHANGELOG.md file(s).
+
+            Please add an entry to the relevant CHANGELOG.md file(s) documenting your changes.
+
+            Available CHANGELOG.md files:
+            - \`crates/mdk-core/CHANGELOG.md\`
+            - \`crates/mdk-memory-storage/CHANGELOG.md\`
+            - \`crates/mdk-sqlite-storage/CHANGELOG.md\`
+            - \`crates/mdk-storage-traits/CHANGELOG.md\`
+
+            To skip this check, add the \`skip-changelog\` label or include \`[skip-changelog]\` in the PR title.`;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: comment
+            });
+

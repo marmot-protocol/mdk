@@ -8,7 +8,6 @@ use nostr::EventId;
 use super::{create_test_group, create_test_processed_welcome, create_test_welcome};
 
 /// Test welcome storage functionality
-#[allow(dead_code)]
 pub fn test_save_and_find_welcome<S>(storage: S)
 where
     S: WelcomeStorage + GroupStorage,
@@ -41,13 +40,12 @@ where
     assert!(result.is_none());
 
     // Test pending welcomes
-    let pending = storage.pending_welcomes().unwrap();
+    let pending = storage.pending_welcomes(None).unwrap();
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].id, event_id);
 }
 
 /// Test processed welcome functionality
-#[allow(dead_code)]
 pub fn test_processed_welcome<S>(storage: S)
 where
     S: WelcomeStorage,

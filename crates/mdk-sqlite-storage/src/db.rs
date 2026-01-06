@@ -145,10 +145,15 @@ pub fn row_to_group(row: &Row) -> SqliteResult<Group> {
     let admin_pubkeys: BTreeSet<PublicKey> =
         serde_json::from_str(admin_pubkeys_json).map_err(map_to_text_boxed_error)?;
 
-    let last_message_id: Option<&[u8]> = row.get_ref("last_message_id")?.as_blob_or_null()?;
+    let last_message_id_blob: Option<&[u8]> = row.get_ref("last_message_id")?.as_blob_or_null()?;
     let last_message_at: Option<u64> = row.get("last_message_at")?;
-    let last_message_id: Option<EventId> =
-        last_message_id.and_then(|id| EventId::from_slice(id).ok());
+    let last_message_id: Option<EventId> = match last_message_id_blob {
+        Some(id_blob) => Some(
+            EventId::from_slice(id_blob)
+                .map_err(|_| map_invalid_blob_data("Invalid last message ID"))?,
+        ),
+        None => None,
+    };
     let last_message_at: Option<Timestamp> = last_message_at.map(Timestamp::from_secs);
 
     let state: &str = row.get_ref("state")?.as_str()?;
@@ -380,4 +385,160 @@ pub fn row_to_processed_welcome(row: &Row) -> SqliteResult<ProcessedWelcome> {
         state,
         failure_reason,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use rusqlite::Connection;
+
+    use super::*;
+
+    /// Helper to create a test database with the groups table schema
+    fn create_test_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE groups (
+                mls_group_id BLOB PRIMARY KEY,
+                nostr_group_id BLOB NOT NULL,
+                name TEXT NOT NULL,
+                description TEXT NOT NULL,
+                image_hash BLOB,
+                image_key BLOB,
+                image_nonce BLOB,
+                admin_pubkeys TEXT NOT NULL,
+                last_message_id BLOB,
+                last_message_at INTEGER,
+                epoch INTEGER NOT NULL,
+                state TEXT NOT NULL
+            )",
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn test_row_to_group_with_valid_last_message_id() {
+        let conn = create_test_db();
+
+        // A valid EventId is 32 bytes
+        let valid_event_id = [0xabu8; 32];
+
+        conn.execute(
+            "INSERT INTO groups VALUES (?, ?, ?, ?, NULL, NULL, NULL, ?, ?, NULL, ?, ?)",
+            rusqlite::params![
+                &[1u8, 2, 3, 4][..], // mls_group_id
+                &[0u8; 32][..],      // nostr_group_id
+                "Test Group",        // name
+                "Description",       // description
+                "[]",                // admin_pubkeys (empty JSON array)
+                &valid_event_id[..], // last_message_id (valid 32-byte blob)
+                0i64,                // epoch
+                "active",            // state
+            ],
+        )
+        .unwrap();
+
+        let mut stmt = conn.prepare("SELECT * FROM groups").unwrap();
+        let result = stmt.query_row([], row_to_group);
+
+        assert!(result.is_ok());
+        let group = result.unwrap();
+        assert!(group.last_message_id.is_some());
+    }
+
+    #[test]
+    fn test_row_to_group_with_null_last_message_id() {
+        let conn = create_test_db();
+
+        conn.execute(
+            "INSERT INTO groups VALUES (?, ?, ?, ?, NULL, NULL, NULL, ?, NULL, NULL, ?, ?)",
+            rusqlite::params![
+                &[1u8, 2, 3, 4][..], // mls_group_id
+                &[0u8; 32][..],      // nostr_group_id
+                "Test Group",        // name
+                "Description",       // description
+                "[]",                // admin_pubkeys (empty JSON array)
+                0i64,                // epoch
+                "active",            // state
+            ],
+        )
+        .unwrap();
+
+        let mut stmt = conn.prepare("SELECT * FROM groups").unwrap();
+        let result = stmt.query_row([], row_to_group);
+
+        assert!(result.is_ok());
+        let group = result.unwrap();
+        assert!(group.last_message_id.is_none());
+    }
+
+    #[test]
+    fn test_row_to_group_with_invalid_last_message_id_length() {
+        let conn = create_test_db();
+
+        // An invalid EventId - wrong length (16 bytes instead of 32)
+        let invalid_event_id = [0xabu8; 16];
+
+        conn.execute(
+            "INSERT INTO groups VALUES (?, ?, ?, ?, NULL, NULL, NULL, ?, ?, NULL, ?, ?)",
+            rusqlite::params![
+                &[1u8, 2, 3, 4][..],   // mls_group_id
+                &[0u8; 32][..],        // nostr_group_id
+                "Test Group",          // name
+                "Description",         // description
+                "[]",                  // admin_pubkeys (empty JSON array)
+                &invalid_event_id[..], // last_message_id (invalid 16-byte blob)
+                0i64,                  // epoch
+                "active",              // state
+            ],
+        )
+        .unwrap();
+
+        let mut stmt = conn.prepare("SELECT * FROM groups").unwrap();
+        let result = stmt.query_row([], row_to_group);
+
+        // Should fail with an error, not silently return None
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("Invalid last message ID"),
+            "Expected error message to contain 'Invalid last message ID', got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_row_to_group_with_empty_last_message_id_blob() {
+        let conn = create_test_db();
+
+        // An empty blob is also invalid for EventId
+        let empty_blob: [u8; 0] = [];
+
+        conn.execute(
+            "INSERT INTO groups VALUES (?, ?, ?, ?, NULL, NULL, NULL, ?, ?, NULL, ?, ?)",
+            rusqlite::params![
+                &[1u8, 2, 3, 4][..], // mls_group_id
+                &[0u8; 32][..],      // nostr_group_id
+                "Test Group",        // name
+                "Description",       // description
+                "[]",                // admin_pubkeys (empty JSON array)
+                &empty_blob[..],     // last_message_id (empty blob)
+                0i64,                // epoch
+                "active",            // state
+            ],
+        )
+        .unwrap();
+
+        let mut stmt = conn.prepare("SELECT * FROM groups").unwrap();
+        let result = stmt.query_row([], row_to_group);
+
+        // Should fail with an error, not silently return None
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("Invalid last message ID"),
+            "Expected error message to contain 'Invalid last message ID', got: {}",
+            err
+        );
+    }
 }

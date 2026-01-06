@@ -27,11 +27,21 @@
 
 ### Breaking changes
 
+- **BREAKING**: Updated `pending_welcomes()` implementation to accept `Option<Pagination>` parameter ([#110](https://github.com/marmot-protocol/mdk/pull/110))
+
 ### Changed
+
+- Simplified validation logic to use range contains pattern for better readability ([#110](https://github.com/marmot-protocol/mdk/pull/110))
 
 ### Added
 
+- Implemented pagination support using `Pagination` struct for pending welcomes ([#110](https://github.com/marmot-protocol/mdk/pull/110))
+
 ### Fixed
+
+- **Security (Audit Issue AA)**: Added pagination to prevent memory exhaustion from unbounded loading of pending welcomes ([#110](https://github.com/marmot-protocol/mdk/pull/110))
+- **Security (Audit Issue AO)**: Removed MLS group identifiers from error messages to prevent metadata leakage in logs and telemetry. Error messages now use generic "Group not found" instead of including the sensitive 32-byte MLS group ID. ([#112](https://github.com/marmot-protocol/mdk/pull/112))
+- Fix `admins()` to return `InvalidParameters` error when group not found, instead of incorrectly returning `NoAdmins` ([#104](https://github.com/marmot-protocol/mdk/pull/104))
 
 ### Removed
 
@@ -52,8 +62,8 @@
 
 - Library split from rust-nostr into independent MDK (Marmot Development Kit) project
 - Remove group type from groups
-- Replaced `save_group_relay` with `replace_group_relays` trait method (https://github.com/rust-nostr/nostr/pull/1056)
-- `image_hash` instead of `image_url` (https://github.com/rust-nostr/nostr/pull/1059)
+- Replaced `save_group_relay` with `replace_group_relays` trait method ([#1056](https://github.com/rust-nostr/nostr/pull/1056))
+- `image_hash` instead of `image_url` ([#1059](https://github.com/rust-nostr/nostr/pull/1059))
 
 ### Changed
 
@@ -67,4 +77,4 @@
 
 ## v0.42.0 - 2025/05/20
 
-- First release (https://github.com/rust-nostr/nostr/pull/839)
+- First release ([#839](https://github.com/rust-nostr/nostr/pull/839))

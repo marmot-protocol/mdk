@@ -615,6 +615,7 @@ impl NostrGroupDataExtension {
     ///     let encrypted_blob = download_from_blossom(&info.image_hash).await?;
     ///     let image = group_image::decrypt_group_image(
     ///         &encrypted_blob,
+    ///         Some(&info.image_hash),
     ///         &info.image_key,
     ///         &info.image_nonce
     ///     )?;

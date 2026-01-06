@@ -27,14 +27,41 @@
 
 ### Breaking changes
 
+- **BREAKING**: Changed `get_pending_welcomes()` to accept `Option<Pagination>` parameter for pagination support. Existing calls should pass `None` for default pagination. ([#110](https://github.com/marmot-protocol/mdk/pull/110))
+- **MIP-02 Welcome Event Validation**: Encoding tag is now required for all welcome events ([#96](https://github.com/marmot-protocol/mdk/pull/96))
+  - Welcome events must now include exactly 4 tags: `relays`, `e`, `client`, and `encoding`
+  - The `encoding` tag must have a value of either "hex" or "base64"
+  - Relay URLs are now validated to ensure they start with `wss://` or `ws://`
+  - Events missing the encoding tag or with invalid relay URLs will be rejected
+
 ### Changed
 
 ### Added
 
+- New error variant `AuthorMismatch` for message author verification failures ([#40](https://github.com/marmot-protocol/mdk/pull/40))
+- New error variant `KeyPackageIdentityMismatch` for KeyPackage credential identity validation failures ([#41](https://github.com/marmot-protocol/mdk/pull/41))
+- New error variant `MissingRumorEventId` for when a rumor event is missing its ID ([#107](https://github.com/marmot-protocol/mdk/pull/107))
+- Added pagination support to `get_pending_welcomes()` public API - accepts `Option<Pagination>` to control limit and offset for welcome retrieval ([#110](https://github.com/marmot-protocol/mdk/pull/110))
+- Exposed `Pagination` struct (from `mdk_storage_traits::welcomes`) in public API for paginated welcome queries ([#110](https://github.com/marmot-protocol/mdk/pull/110))
+- **MIP-02 Welcome Event Validation**: Added comprehensive validation for welcome events ([#96](https://github.com/marmot-protocol/mdk/pull/96))
+  - Validates event kind is 444 (MlsWelcome)
+  - Validates presence of all required tags (order-independent for interoperability)
+  - Validates relay URL format using `RelayUrl::parse()` for thorough validation
+  - Validates non-empty content for `e` and `client` tags
+  - Validates encoding tag value is either "hex" or "base64"
+
 ### Fixed
 
-- **MIME Type Canonicalization (Issue #63)**: Fixed incomplete MIME type canonicalization in `validate_mime_type`
-- **MIME Type Spoofing and Allowlist (Issue #66)**: Added MIME type validation and allowlist enforcement
+- **Security (Audit Suggestion 5)**: Prevent panic in `process_welcome` when rumor event ID is missing. A malformed or non-NIP-59-compliant rumor now returns a `MissingRumorEventId` error instead of panicking. ([#107](https://github.com/marmot-protocol/mdk/pull/107))
+- **Security (Audit Issue B)**: Added author verification to message processing to prevent impersonation attacks. The rumor pubkey is now validated against the MLS sender's credential before processing application messages. ([#40](https://github.com/marmot-protocol/mdk/pull/40))
+- **Security (Audit Issue C)**: Added validation for admin updates to prevent invalid configurations. Admin updates now reject empty admin sets and non-member public keys. ([#42](https://github.com/marmot-protocol/mdk/pull/42))
+- **Security (Audit Issue D)**: Added identity binding verification for KeyPackage events. The credential identity is now validated against the event signer to prevent impersonation attacks. ([#41](https://github.com/marmot-protocol/mdk/pull/41))
+- **Security (Audit Issue G)**: Fixed admin authorization to read from current MLS group state instead of potentially stale stored metadata. The `is_leaf_node_admin` and `is_member_admin` functions now derive admin status from the `NostrGroupDataExtension` in the MLS group context, preventing a race window where a recently demoted admin could still perform privileged operations. ([#108](https://github.com/marmot-protocol/mdk/pull/108))
+- **Security (Audit Issue H)**: Added MIP-02 validation to prevent malformed welcome events from causing storage pollution and resource exhaustion ([#96](https://github.com/marmot-protocol/mdk/pull/96))
+- **Security (Audit Issue O)**: Missing Hash Verification in decrypt_group_image Allows Storage-Level Blob Substitution ([#97](https://github.com/marmot-protocol/mdk/pull/97))
+- **Security (Audit Issue T)**: Fixed incomplete MIME type canonicalization in `validate_mime_type` ([#95](https://github.com/marmot-protocol/mdk/pull/110))
+- **Security (Audit Issue W)**: Added MIME type validation and allowlist enforcement ([#95](https://github.com/marmot-protocol/mdk/pull/110))
+- **Security (Audit Issue AA)**: Added pagination to prevent memory exhaustion from unbounded loading of pending welcomes ([#110](https://github.com/marmot-protocol/mdk/pull/110))
 
 ### Removed
 
@@ -136,14 +163,14 @@
 - Removed aggressive re-exports, use types directly
 - Removed public `Result` type
 - Smaller prelude focusing on essential exports
-- Remove group type from groups (https://github.com/rust-nostr/nostr/commit/1deb718cf0a70c110537b505bdbad881d43d15cf)
+- Remove group type from groups ([1deb718](https://github.com/rust-nostr/nostr/commit/1deb718cf0a70c110537b505bdbad881d43d15cf))
 - Removed `MDK::update_group_name`, `MDK::update_group_description`, `MDK::update_group_image` in favor of a single method for updating all group data
-- Added `admins` member to the `NostrGroupConfigData` (https://github.com/rust-nostr/nostr/pull/1050)
-- Changed method signature of `MDK::create_group`. Removed the admins param. Admins are specified in the `NostrGroupConfigData`. (https://github.com/rust-nostr/nostr/pull/1050)
+- Added `admins` member to the `NostrGroupConfigData` ([#1050](https://github.com/rust-nostr/nostr/pull/1050))
+- Changed method signature of `MDK::create_group`. Removed the admins param. Admins are specified in the `NostrGroupConfigData`. ([#1050](https://github.com/rust-nostr/nostr/pull/1050))
 
 ### Changed
 
-- Upgrade openmls to v0.7.0 (https://github.com/rust-nostr/nostr/commit/b0616f4dca544b4076678255062b1133510f2813)
+- Upgrade openmls to v0.7.0 ([b0616f4](https://github.com/rust-nostr/nostr/commit/b0616f4dca544b4076678255062b1133510f2813))
 
 ### Added
 
@@ -157,34 +184,34 @@
 - Group image encryption and management (MIP-01)
 - GitHub CI workflow with comprehensive test matrix
 - LLM context documentation and development guides
-- Improved synchronization between MLSGroup and stored Group state on all commits (https://github.com/rust-nostr/nostr/pull/1050)
-- Added `MDK::update_group_data` method to handle updates of any of the fields of the `NostrGroupDataExtension` (https://github.com/rust-nostr/nostr/pull/1050)
+- Improved synchronization between MLSGroup and stored Group state on all commits ([#1050](https://github.com/rust-nostr/nostr/pull/1050))
+- Added `MDK::update_group_data` method to handle updates of any of the fields of the `NostrGroupDataExtension` ([#1050](https://github.com/rust-nostr/nostr/pull/1050))
 - Added Serde support for GroupId
 
 ### Fixed
 
-- Bug where group relays weren't being persisted properly on change in NostrGroupDataExtension (https://github.com/rust-nostr/nostr/pull/1056)
+- Bug where group relays weren't being persisted properly on change in NostrGroupDataExtension ([#1056](https://github.com/rust-nostr/nostr/pull/1056))
 
 ## v0.43.0 - 2025/07/28
 
 ### Breaking changes
 
-- Changed return type of `MDK::add_members` and `MDK::self_update` (https://github.com/rust-nostr/nostr/pull/934)
-- Changed return type of all group and message methods to return Events instead of serialized MLS objects. (https://github.com/rust-nostr/nostr/pull/940)
-- Changed the input params of `MDK::create_group`, and additional fields for `NostrGroupDataExtension` (https://github.com/rust-nostr/nostr/pull/965)
-- `NostrGroupDataExtension` requires additional `image_nonce` field (https://github.com/rust-nostr/nostr/pull/1054)
-- `image_hash` instead of `image_url` (https://github.com/rust-nostr/nostr/pull/1059)
+- Changed return type of `MDK::add_members` and `MDK::self_update` ([#934](https://github.com/rust-nostr/nostr/pull/934))
+- Changed return type of all group and message methods to return Events instead of serialized MLS objects. ([#940](https://github.com/rust-nostr/nostr/pull/940))
+- Changed the input params of `MDK::create_group`, and additional fields for `NostrGroupDataExtension` ([#965](https://github.com/rust-nostr/nostr/pull/965))
+- `NostrGroupDataExtension` requires additional `image_nonce` field ([#1054](https://github.com/rust-nostr/nostr/pull/1054))
+- `image_hash` instead of `image_url` ([#1059](https://github.com/rust-nostr/nostr/pull/1059))
 
 ### Added
 
-- Add `MDK::add_members` method for adding members to an existing group (https://github.com/rust-nostr/nostr/pull/931)
-- Add `MDK::remove_members` method for removing members from an existing group (https://github.com/rust-nostr/nostr/pull/934)
-- Add `MDK::leave_group` method for creating a proposal to leave the group (https://github.com/rust-nostr/nostr/pull/940)
-- Add processing of commit messages and basic processing of proposals. (https://github.com/rust-nostr/nostr/pull/940)
-- Add `ProcessedMessageState` for processed commits (https://github.com/rust-nostr/nostr/pull/954)
-- Add method to check previous exporter_secrets when NIP-44 decrypting kind 445 messages (https://github.com/rust-nostr/nostr/pull/954)
-- Add methods to update group name, description and image (https://github.com/rust-nostr/nostr/pull/978)
+- Add `MDK::add_members` method for adding members to an existing group ([#931](https://github.com/rust-nostr/nostr/pull/931))
+- Add `MDK::remove_members` method for removing members from an existing group ([#934](https://github.com/rust-nostr/nostr/pull/934))
+- Add `MDK::leave_group` method for creating a proposal to leave the group ([#940](https://github.com/rust-nostr/nostr/pull/940))
+- Add processing of commit messages and basic processing of proposals. ([#940](https://github.com/rust-nostr/nostr/pull/940))
+- Add `ProcessedMessageState` for processed commits ([#954](https://github.com/rust-nostr/nostr/pull/954))
+- Add method to check previous exporter_secrets when NIP-44 decrypting kind 445 messages ([#954](https://github.com/rust-nostr/nostr/pull/954))
+- Add methods to update group name, description and image ([#978](https://github.com/rust-nostr/nostr/pull/978))
 
 ## v0.42.0 - 2025/05/20
 
-First release (https://github.com/rust-nostr/nostr/pull/843)
+First release ([#843](https://github.com/rust-nostr/nostr/pull/843))
