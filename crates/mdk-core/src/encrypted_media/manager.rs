@@ -8,7 +8,8 @@ use nostr::{Tag as NostrTag, TagKind};
 use sha2::{Digest, Sha256};
 
 use crate::encrypted_media::crypto::{
-    decrypt_data_with_aad, derive_encryption_key, derive_encryption_nonce, encrypt_data_with_aad,
+    DEFAULT_SCHEME_VERSION, decrypt_data_with_aad, derive_encryption_key, derive_encryption_nonce,
+    encrypt_data_with_aad,
 };
 use crate::encrypted_media::metadata::extract_and_process_metadata;
 use crate::encrypted_media::types::{
@@ -89,9 +90,11 @@ where
         // Calculate hash of the PROCESSED (potentially sanitized) data
         // This ensures the hash is of the clean file, not the original with EXIF
         let original_hash: [u8; 32] = Sha256::digest(&processed_data).into();
+        let scheme_version = DEFAULT_SCHEME_VERSION;
         let encryption_key = derive_encryption_key(
             self.mdk,
             &self.group_id,
+            scheme_version,
             &original_hash,
             &metadata.mime_type,
             filename,
@@ -99,6 +102,7 @@ where
         let nonce = derive_encryption_nonce(
             self.mdk,
             &self.group_id,
+            scheme_version,
             &original_hash,
             &metadata.mime_type,
             filename,
@@ -109,6 +113,7 @@ where
             &processed_data,
             &encryption_key,
             &nonce,
+            scheme_version,
             &original_hash,
             &metadata.mime_type,
             filename,
@@ -132,6 +137,7 @@ where
     /// Decrypt downloaded media
     ///
     /// The filename for AAD is taken from the MediaReference, which was parsed from the imeta tag.
+    /// The scheme_version from MediaReference is used to select the correct encryption scheme.
     pub fn decrypt_from_download(
         &self,
         encrypted_data: &[u8],
@@ -140,6 +146,7 @@ where
         let encryption_key = derive_encryption_key(
             self.mdk,
             &self.group_id,
+            &reference.scheme_version,
             &reference.original_hash,
             &reference.mime_type,
             &reference.filename,
@@ -147,6 +154,7 @@ where
         let nonce = derive_encryption_nonce(
             self.mdk,
             &self.group_id,
+            &reference.scheme_version,
             &reference.original_hash,
             &reference.mime_type,
             &reference.filename,
@@ -155,6 +163,7 @@ where
             encrypted_data,
             &encryption_key,
             &nonce,
+            &reference.scheme_version,
             &reference.original_hash,
             &reference.mime_type,
             &reference.filename,
@@ -191,7 +200,7 @@ where
         tag_values.push(format!("x {}", hex::encode(upload.original_hash)));
 
         // v field contains encryption version number (currently "mip04-v1")
-        tag_values.push("v mip04-v1".to_string());
+        tag_values.push(format!("v {}", DEFAULT_SCHEME_VERSION));
 
         NostrTag::custom(TagKind::Custom("imeta".into()), tag_values)
     }
@@ -208,6 +217,7 @@ where
             mime_type: upload.mime_type.clone(),
             filename: upload.filename.clone(),
             dimensions: upload.dimensions,
+            scheme_version: DEFAULT_SCHEME_VERSION.to_string(),
         }
     }
 
@@ -319,13 +329,16 @@ where
             reason: "Missing required 'filename' field".to_string(),
         })?;
 
-        // Validate version (required field, currently only support mip04-v1)
-        let version = version.ok_or(EncryptedMediaError::InvalidImetaTag {
+        // Validate version (required field)
+        let scheme_version = version.ok_or(EncryptedMediaError::InvalidImetaTag {
             reason: "Missing required 'v' (version) field".to_string(),
         })?;
-        if version != "mip04-v1" {
+
+        // Validate that the version is supported
+        // Currently only "mip04-v1" is supported, but we store it for future extensibility
+        if scheme_version != "mip04-v1" {
             return Err(EncryptedMediaError::DecryptionFailed {
-                reason: format!("Unsupported MIP-04 encryption version: {}", version),
+                reason: format!("Unsupported MIP-04 encryption version: {}", scheme_version),
             });
         }
 
@@ -335,6 +348,7 @@ where
             mime_type,
             filename,
             dimensions,
+            scheme_version,
         })
     }
 }
@@ -437,6 +451,7 @@ mod tests {
         assert_eq!(media_ref.original_hash, [0x42; 32]);
         assert_eq!(media_ref.filename, "photo.jpg");
         assert_eq!(media_ref.dimensions, Some((1920, 1080)));
+        assert_eq!(media_ref.scheme_version, "mip04-v1");
     }
 
     #[test]
@@ -501,6 +516,7 @@ mod tests {
         assert_eq!(media_ref.mime_type, "image/png");
         assert_eq!(media_ref.filename, "test.png");
         assert_eq!(media_ref.dimensions, Some((800, 600)));
+        assert_eq!(media_ref.scheme_version, DEFAULT_SCHEME_VERSION);
     }
 
     #[test]
@@ -846,6 +862,7 @@ mod tests {
 
         let media_ref = result.unwrap();
         assert_eq!(media_ref.dimensions, None); // Optional field should be None
+        assert_eq!(media_ref.scheme_version, "mip04-v1"); // Version should be stored
 
         // Test with dimensions
         let tag_values = vec![
@@ -862,6 +879,7 @@ mod tests {
 
         let media_ref = result.unwrap();
         assert_eq!(media_ref.dimensions, Some((1920, 1080)));
+        assert_eq!(media_ref.scheme_version, "mip04-v1"); // Version should be stored
     }
 
     #[test]
@@ -956,6 +974,7 @@ mod tests {
         assert_eq!(media_ref.url, "https://example.com/encrypted.jpg");
         assert_eq!(media_ref.filename, "photo.jpg");
         assert_eq!(media_ref.original_hash, [0x42; 32]);
+        assert_eq!(media_ref.scheme_version, "mip04-v1");
 
         // The canonicalized MIME type should now work correctly for key derivation
         // and decryption operations (even though we can't test the full flow without
