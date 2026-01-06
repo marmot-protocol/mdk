@@ -200,6 +200,12 @@ pub enum Error {
     /// Rumor event is missing its ID
     #[error("rumor event is missing its ID")]
     MissingRumorEventId,
+    /// Missing group ID tag in event
+    #[error("missing group ID tag in event")]
+    MissingGroupIdTag,
+    /// Invalid group ID format
+    #[error("invalid group ID format")]
+    InvalidGroupIdFormat,
 }
 
 impl From<FromUtf8Error> for Error {

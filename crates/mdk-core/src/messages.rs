@@ -582,16 +582,16 @@ where
             .tags
             .iter()
             .find(|tag| tag.kind() == TagKind::h())
-            .ok_or(Error::Message("Group ID Tag not found".to_string()))?;
+            .ok_or(Error::MissingGroupIdTag)?;
 
         let nostr_group_id: [u8; 32] = hex::decode(
             nostr_group_id_tag
                 .content()
-                .ok_or(Error::Message("Group ID Tag content not found".to_string()))?,
+                .ok_or(Error::MissingGroupIdTag)?,
         )
-        .map_err(|e| Error::Message(e.to_string()))?
+        .map_err(|_| Error::InvalidGroupIdFormat)?
         .try_into()
-        .map_err(|_e| Error::Message("Failed to convert nostr group id to [u8; 32]".to_string()))?;
+        .map_err(|_| Error::InvalidGroupIdFormat)?;
 
         Ok(nostr_group_id)
     }
@@ -730,8 +730,8 @@ where
     fn classify_failure_reason(error: &Error) -> &'static str {
         match error {
             Error::UnexpectedEvent { .. } => "invalid_event_type",
-            Error::Message(msg) if msg.contains("Group ID Tag") => "invalid_event_format",
-            Error::Message(msg) if msg.contains("Failed to convert") => "invalid_event_format",
+            Error::MissingGroupIdTag => "invalid_event_format",
+            Error::InvalidGroupIdFormat => "invalid_event_format",
             Error::GroupNotFound => "group_not_found",
             Error::CannotDecryptOwnMessage => "own_message",
             Error::AuthorMismatch => "authentication_failed",
@@ -1316,7 +1316,7 @@ mod tests {
 
         let result = mdk.process_message(&event);
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), Error::Message(_)));
+        assert!(matches!(result.unwrap_err(), Error::MissingGroupIdTag));
     }
 
     #[test]
