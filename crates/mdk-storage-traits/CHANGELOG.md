@@ -48,8 +48,7 @@
   - Includes serde serialization support
   - Debug formatting hides secret values to prevent leaks
   - Comprehensive test suite including memory zeroization verification ([#109](https://github.com/marmot-protocol/mdk/pull/109))
-- Added `Pagination` struct with `limit` and `offset` fields for cleaner pagination API - now part of public API for external consumers ([#110](https://github.com/marmot-protocol/mdk/pull/110))
-- Added `Pagination` struct with `limit` and `offset` fields for cleaner pagination API - now part of public API for external consumers ([#111](https://github.com/marmot-protocol/mdk/pull/111))
+- Added `Pagination` struct with `limit` and `offset` fields for cleaner pagination API - now part of public API for external consumers ([#110](https://github.com/marmot-protocol/mdk/pull/110), [#111](https://github.com/marmot-protocol/mdk/pull/111))
 - Added `DEFAULT_MESSAGE_LIMIT` (1000) and `MAX_MESSAGE_LIMIT` (10,000) constants for pagination validation ([#111](https://github.com/marmot-protocol/mdk/pull/111))
 - Added `DEFAULT_PENDING_WELCOMES_LIMIT` (1000) and `MAX_PENDING_WELCOMES_LIMIT` (10,000) constants for pagination validation ([#110](https://github.com/marmot-protocol/mdk/pull/110))
 - Add tests for `admins()`, `messages()`, and `group_relays()` error cases when group not found ([#104](https://github.com/marmot-protocol/mdk/pull/104))
