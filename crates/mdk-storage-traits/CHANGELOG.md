@@ -27,8 +27,8 @@
 
 ### Breaking changes
 
-- **BREAKING**: Changed `GroupStorage::messages()` to accept `Option<Pagination>` parameter instead of having separate `messages()` and `messages_paginated()` methods ([#111](https://github.com/marmot-protocol/mdk/pull/111))
-- **BREAKING**: Changed `WelcomeStorage::pending_welcomes()` to accept `Option<Pagination>` parameter for pagination control ([#110](https://github.com/marmot-protocol/mdk/pull/110))
+- Changed `GroupStorage::messages()` to accept `Option<Pagination>` parameter instead of having separate `messages()` and `messages_paginated()` methods ([#111](https://github.com/marmot-protocol/mdk/pull/111))
+- Changed `WelcomeStorage::pending_welcomes()` to accept `Option<Pagination>` parameter for pagination control ([#110](https://github.com/marmot-protocol/mdk/pull/110))
 
 ### Changed
 

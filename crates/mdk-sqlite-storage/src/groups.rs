@@ -10,13 +10,6 @@ use mdk_storage_traits::messages::types::Message;
 use nostr::{PublicKey, RelayUrl};
 use rusqlite::{OptionalExtension, params};
 
-#[cfg(test)]
-use mdk_storage_traits::messages::MessageStorage;
-#[cfg(test)]
-use mdk_storage_traits::messages::types::MessageState;
-#[cfg(test)]
-use nostr::{EventId, Kind, Tags, Timestamp, UnsignedEvent};
-
 use crate::db::{Hash32, Nonce12};
 use crate::validation::{
     MAX_ADMIN_PUBKEYS_JSON_SIZE, MAX_GROUP_DESCRIPTION_LENGTH, MAX_GROUP_NAME_LENGTH,
@@ -330,7 +323,10 @@ impl GroupStorage for MdkSqliteStorage {
 #[cfg(test)]
 mod tests {
     use mdk_storage_traits::groups::types::GroupState;
+    use mdk_storage_traits::messages::MessageStorage;
+    use mdk_storage_traits::messages::types::MessageState;
     use mdk_storage_traits::test_utils::crypto_utils::generate_random_bytes;
+    use nostr::{EventId, Kind, Tags, Timestamp, UnsignedEvent};
     use rusqlite::Connection;
     use tempfile::tempdir;
 
