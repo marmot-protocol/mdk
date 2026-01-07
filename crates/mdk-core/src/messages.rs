@@ -417,12 +417,14 @@ where
     ///
     /// This function checks all Update proposals within a staged commit to ensure
     /// none of them attempt to change the BasicCredential.identity of a member.
-    /// It also validates the update path leaf node if present.
+    /// It also validates the update path leaf node if present (which represents
+    /// the committer's own leaf update).
     ///
     /// # Arguments
     ///
     /// * `mls_group` - The MLS group to validate against
     /// * `staged_commit` - The staged commit to validate
+    /// * `commit_sender` - The sender of the commit message
     ///
     /// # Returns
     ///
@@ -432,6 +434,7 @@ where
         &self,
         mls_group: &MlsGroup,
         staged_commit: &StagedCommit,
+        commit_sender: &Sender,
     ) -> Result<()> {
         // Validate all Update proposals in the staged commit
         for update_proposal in staged_commit.update_proposals() {
@@ -441,38 +444,33 @@ where
         }
 
         // Validate the update path leaf node if present
-        // The update path is used when the committer updates their own leaf
+        // The update path is used when the committer updates their own leaf as part of the commit
         if let Some(update_path_leaf_node) = staged_commit.update_path_leaf_node() {
             // The committer is updating their own leaf via the commit path
-            // We need to find the committer from the queued proposals or infer from context
-            // For now, we check all queued proposals to find who is making the commit
-            for queued_proposal in staged_commit.queued_proposals() {
-                if let Sender::Member(leaf_index) = queued_proposal.sender() {
-                    // Check if this member's identity matches the update path leaf node
-                    if let Some(member) = mls_group.member_at(*leaf_index) {
-                        let current_credential =
-                            BasicCredential::try_from(member.credential.clone())?;
-                        let current_identity =
-                            self.parse_credential_identity(current_credential.identity())?;
+            // Get the committer's leaf index from the sender and validate their identity
+            if let Sender::Member(committer_leaf_index) = commit_sender
+                && let Some(committer_member) = mls_group.member_at(*committer_leaf_index)
+            {
+                let current_credential =
+                    BasicCredential::try_from(committer_member.credential.clone())?;
+                let current_identity =
+                    self.parse_credential_identity(current_credential.identity())?;
 
-                        let new_credential =
-                            BasicCredential::try_from(update_path_leaf_node.credential().clone())?;
-                        let new_identity =
-                            self.parse_credential_identity(new_credential.identity())?;
+                let new_credential =
+                    BasicCredential::try_from(update_path_leaf_node.credential().clone())?;
+                let new_identity = self.parse_credential_identity(new_credential.identity())?;
 
-                        if current_identity != new_identity {
-                            tracing::warn!(
-                                target: "mdk_core::messages::validate_staged_commit_identities",
-                                "Identity change not allowed in update path: {} to {}",
-                                current_identity,
-                                new_identity
-                            );
-                            return Err(Error::IdentityChangeNotAllowed {
-                                original_identity: current_identity.to_hex(),
-                                new_identity: new_identity.to_hex(),
-                            });
-                        }
-                    }
+                if current_identity != new_identity {
+                    tracing::warn!(
+                        target: "mdk_core::messages::validate_staged_commit_identities",
+                        "Identity change not allowed in commit update path: committer {} attempted to change identity to {}",
+                        current_identity,
+                        new_identity
+                    );
+                    return Err(Error::IdentityChangeNotAllowed {
+                        original_identity: current_identity.to_hex(),
+                        new_identity: new_identity.to_hex(),
+                    });
                 }
             }
         }
@@ -704,10 +702,11 @@ where
         mls_group: &mut MlsGroup,
         event: &Event,
         staged_commit: StagedCommit,
+        commit_sender: &Sender,
     ) -> Result<()> {
         // Validate that no proposals in the commit attempt to change identity
         // MIP-00 mandates immutable identity fields
-        self.validate_staged_commit_identities(mls_group, &staged_commit)?;
+        self.validate_staged_commit_identities(mls_group, &staged_commit, commit_sender)?;
 
         mls_group
             .merge_staged_commit(&self.provider, staged_commit)
@@ -838,8 +837,9 @@ where
     ) -> Result<MessageProcessingResult> {
         match self.process_message_for_group(mls_group, message_bytes) {
             Ok(processed_mls_message) => {
-                // Clone the sender's credential for author verification before consuming
+                // Clone the sender's credential and sender for validation before consuming
                 let sender_credential = processed_mls_message.credential().clone();
+                let message_sender = processed_mls_message.sender().clone();
 
                 match processed_mls_message.into_content() {
                     ProcessedMessageContent::ApplicationMessage(application_message) => {
@@ -862,7 +862,12 @@ where
                         ))
                     }
                     ProcessedMessageContent::StagedCommitMessage(staged_commit) => {
-                        self.process_commit_message_for_group(mls_group, event, *staged_commit)?;
+                        self.process_commit_message_for_group(
+                            mls_group,
+                            event,
+                            *staged_commit,
+                            &message_sender,
+                        )?;
                         Ok(MessageProcessingResult::Commit {
                             mls_group_id: group.mls_group_id.clone(),
                         })
@@ -3961,13 +3966,12 @@ mod tests {
         );
     }
 
-    /// Test that validate_proposal_identity correctly rejects identity changes
+    /// Test that identity parsing works correctly for validation
     ///
-    /// This test directly tests the identity validation logic by creating
-    /// an Update proposal scenario and verifying the validation catches
-    /// identity mismatches.
+    /// This test verifies the components used in identity validation work correctly:
+    /// parsing identities from credentials and comparing them.
     #[test]
-    fn test_validate_proposal_identity_rejects_identity_change() {
+    fn test_identity_parsing_for_validation() {
         let mdk = create_test_mdk();
         let (creator, members, admins) = create_test_group_members();
         let group_id = create_test_group(&mdk, &creator, &members, &admins);
@@ -4000,11 +4004,135 @@ mod tests {
                 "Attacker identity should be different from member identity"
             );
 
-            // The actual validation is done internally during message processing,
-            // but we've verified the components work correctly:
-            // 1. We can parse identities from credentials
-            // 2. We can compare identities
-            // 3. We've added validation that rejects identity changes
+            // Verify identity matches creator's public key
+            assert_eq!(
+                current_identity,
+                creator.public_key(),
+                "Member identity should match creator public key"
+            );
         }
+    }
+
+    /// Test that commit processing validates identity in a multi-member scenario
+    ///
+    /// This test creates a multi-member group and verifies that when one member
+    /// processes another member's commit, the identity validation passes for
+    /// legitimate commits.
+    #[test]
+    fn test_commit_processing_validates_identity_multi_member() {
+        let alice_keys = Keys::generate();
+        let bob_keys = Keys::generate();
+
+        let alice_mdk = create_test_mdk();
+        let bob_mdk = create_test_mdk();
+
+        // Create key packages
+        let bob_key_package = create_key_package_event(&bob_mdk, &bob_keys);
+
+        // Alice creates group with Bob as admin
+        let admin_pubkeys = vec![alice_keys.public_key(), bob_keys.public_key()];
+        let config = create_nostr_group_config_data(admin_pubkeys);
+
+        let create_result = alice_mdk
+            .create_group(&alice_keys.public_key(), vec![bob_key_package], config)
+            .expect("Alice should create group");
+
+        let group_id = create_result.group.mls_group_id.clone();
+
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("Alice should merge commit");
+
+        // Bob joins the group
+        let bob_welcome_rumor = &create_result.welcome_rumors[0];
+        let bob_welcome = bob_mdk
+            .process_welcome(&nostr::EventId::all_zeros(), bob_welcome_rumor)
+            .expect("Bob should process welcome");
+
+        bob_mdk
+            .accept_welcome(&bob_welcome)
+            .expect("Bob should accept welcome");
+
+        // Verify both see 2 members
+        let alice_members = alice_mdk.get_members(&group_id).expect("Alice get members");
+        let bob_members = bob_mdk.get_members(&group_id).expect("Bob get members");
+        assert_eq!(alice_members.len(), 2, "Alice should see 2 members");
+        assert_eq!(bob_members.len(), 2, "Bob should see 2 members");
+
+        // Alice performs a self_update (creates a commit with update_path)
+        // This exercises the update_path_leaf_node validation
+        let alice_update_result = alice_mdk
+            .self_update(&group_id)
+            .expect("Alice self_update should succeed");
+
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("Alice should merge self_update commit");
+
+        // Bob processes Alice's commit - this triggers identity validation
+        // The validation should pass because Alice's identity is preserved
+        let bob_process_result = bob_mdk.process_message(&alice_update_result.evolution_event);
+
+        assert!(
+            bob_process_result.is_ok(),
+            "Bob should successfully process Alice's commit with identity validation"
+        );
+
+        // Verify identities are still correct after the update
+        let alice_mls_group = alice_mdk
+            .load_mls_group(&group_id)
+            .expect("Load Alice MLS group")
+            .expect("Alice MLS group exists");
+
+        let alice_own_leaf = alice_mls_group
+            .own_leaf()
+            .expect("Alice should have own leaf");
+        let alice_credential =
+            BasicCredential::try_from(alice_own_leaf.credential().clone()).unwrap();
+        let alice_identity = alice_mdk
+            .parse_credential_identity(alice_credential.identity())
+            .expect("Parse Alice identity");
+
+        assert_eq!(
+            alice_identity,
+            alice_keys.public_key(),
+            "Alice's identity should be preserved after self_update"
+        );
+    }
+
+    /// Test that the IdentityChangeNotAllowed error contains useful information
+    ///
+    /// This test verifies that when an identity change is detected, the error
+    /// contains both the original and new identity for debugging purposes.
+    #[test]
+    fn test_identity_change_error_contains_identities() {
+        let alice_keys = Keys::generate();
+        let bob_keys = Keys::generate();
+
+        let error = Error::IdentityChangeNotAllowed {
+            original_identity: alice_keys.public_key().to_hex(),
+            new_identity: bob_keys.public_key().to_hex(),
+        };
+
+        // Verify error can be displayed
+        let error_string = error.to_string();
+        assert!(
+            error_string.contains("identity change not allowed"),
+            "Error should mention identity change"
+        );
+        assert!(
+            error_string.contains(&alice_keys.public_key().to_hex()),
+            "Error should contain original identity"
+        );
+        assert!(
+            error_string.contains(&bob_keys.public_key().to_hex()),
+            "Error should contain new identity"
+        );
+
+        // Verify error type matches
+        assert!(
+            matches!(error, Error::IdentityChangeNotAllowed { .. }),
+            "Error should be IdentityChangeNotAllowed variant"
+        );
     }
 }
