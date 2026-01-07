@@ -27,18 +27,22 @@
 
 ### Breaking changes
 
-- **BREAKING**: Updated `pending_welcomes()` implementation to accept `Option<Pagination>` parameter ([#110](https://github.com/marmot-protocol/mdk/pull/110))
+- Updated `messages()` implementation to accept `Option<Pagination>` parameter ([#111](https://github.com/marmot-protocol/mdk/pull/111))
+- Updated `pending_welcomes()` implementation to accept `Option<Pagination>` parameter ([#110](https://github.com/marmot-protocol/mdk/pull/110))
 
 ### Changed
 
+- Simplified validation logic to use range contains pattern for better readability ([#111](https://github.com/marmot-protocol/mdk/pull/111))
 - Simplified validation logic to use range contains pattern for better readability ([#110](https://github.com/marmot-protocol/mdk/pull/110))
 
 ### Added
 
+- Implemented pagination support using `Pagination` struct for group messages ([#111](https://github.com/marmot-protocol/mdk/pull/111))
 - Implemented pagination support using `Pagination` struct for pending welcomes ([#110](https://github.com/marmot-protocol/mdk/pull/110))
 
 ### Fixed
 
+- **Security (Audit Issue Z)**: Added pagination to prevent memory exhaustion from unbounded loading of group messages ([#111](https://github.com/marmot-protocol/mdk/pull/111))
 - **Security (Audit Issue AA)**: Added pagination to prevent memory exhaustion from unbounded loading of pending welcomes ([#110](https://github.com/marmot-protocol/mdk/pull/110))
 - **Security (Audit Issue AO)**: Removed MLS group identifiers from error messages to prevent metadata leakage in logs and telemetry. Error messages now use generic "Group not found" instead of including the sensitive 32-byte MLS group ID. ([#112](https://github.com/marmot-protocol/mdk/pull/112))
 - Fix `admins()` to return `InvalidParameters` error when group not found, instead of incorrectly returning `NoAdmins` ([#104](https://github.com/marmot-protocol/mdk/pull/104))

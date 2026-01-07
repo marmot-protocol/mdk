@@ -27,19 +27,21 @@
 
 ### Breaking changes
 
-- **BREAKING**: Changed `WelcomeStorage::pending_welcomes()` to accept `Option<Pagination>` parameter instead of having separate `pending_welcomes()` and `pending_welcomes_paginated()` methods ([#110](https://github.com/marmot-protocol/mdk/pull/110))
-- **BREAKING**: Removed `MAX_PENDING_WELCOMES_OFFSET` constant - offset validation removed to allow legitimate large-scale use cases ([#110](https://github.com/marmot-protocol/mdk/pull/110))
+- Changed `GroupStorage::messages()` to accept `Option<Pagination>` parameter instead of having separate `messages()` and `messages_paginated()` methods ([#111](https://github.com/marmot-protocol/mdk/pull/111))
+- Changed `WelcomeStorage::pending_welcomes()` to accept `Option<Pagination>` parameter for pagination control ([#110](https://github.com/marmot-protocol/mdk/pull/110))
 
 ### Changed
 
 ### Added
 
-- Added `Pagination` struct with `limit` and `offset` fields for cleaner pagination API - now part of public API for external consumers ([#110](https://github.com/marmot-protocol/mdk/pull/110))
+- Added `Pagination` struct with `limit` and `offset` fields for cleaner pagination API - now part of public API for external consumers ([#111](https://github.com/marmot-protocol/mdk/pull/111))
+- Added `DEFAULT_MESSAGE_LIMIT` (1000) and `MAX_MESSAGE_LIMIT` (10,000) constants for pagination validation ([#111](https://github.com/marmot-protocol/mdk/pull/111))
 - Added `DEFAULT_PENDING_WELCOMES_LIMIT` (1000) and `MAX_PENDING_WELCOMES_LIMIT` (10,000) constants for pagination validation ([#110](https://github.com/marmot-protocol/mdk/pull/110))
 - Add tests for `admins()`, `messages()`, and `group_relays()` error cases when group not found ([#104](https://github.com/marmot-protocol/mdk/pull/104))
 
 ### Fixed
 
+- **Security (Audit Issue Z)**: Added pagination to prevent memory exhaustion from unbounded loading of group messages ([#111](https://github.com/marmot-protocol/mdk/pull/111))
 - **Security (Audit Issue AA)**: Added pagination to prevent memory exhaustion from unbounded loading of pending welcomes ([#110](https://github.com/marmot-protocol/mdk/pull/110))
 
 ### Removed
