@@ -9,3 +9,6 @@ coverage/
 
 # Audit related files
 /docs/audits
+
+# Editor specific files
+.vscode/
