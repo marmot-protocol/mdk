@@ -1,0 +1,11 @@
+default_job = "check"
+env.CARGO_TERM_COLOR = "always"
+
+[jobs.coverage]
+command = ["bash", "scripts/get-coverage.sh"]
+watch = ["Cargo.toml", "Cargo.lock", "**/*.rs"]
+ignore = ["target/**", "coverage/**", ".git/**"]
+need_stdout = true
+
+[keybindings]
+v = "job:coverage"
