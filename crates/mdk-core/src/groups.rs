@@ -85,6 +85,8 @@ pub struct NostrGroupDataUpdate {
     pub relays: Option<Vec<RelayUrl>>,
     /// Group admins (optional)
     pub admins: Option<Vec<PublicKey>>,
+    /// Nostr group ID for message routing (optional, for rotation per MIP-01)
+    pub nostr_group_id: Option<[u8; 32]>,
 }
 
 impl NostrGroupConfigData {
@@ -167,6 +169,12 @@ impl NostrGroupDataUpdate {
     /// Sets the admins to be updated
     pub fn admins(mut self, admins: Vec<PublicKey>) -> Self {
         self.admins = Some(admins);
+        self
+    }
+
+    /// Sets the nostr_group_id to be updated (for ID rotation per MIP-01)
+    pub fn nostr_group_id(mut self, nostr_group_id: [u8; 32]) -> Self {
+        self.nostr_group_id = Some(nostr_group_id);
         self
     }
 }
@@ -754,6 +762,11 @@ where
     /// // Note: Setting image_hash to None automatically clears image_key, image_nonce, and image_upload_key
     /// let update = NostrGroupDataUpdate::new().image_hash(None);
     /// mls.update_group_data(&group_id, update)?;
+    ///
+    /// // Rotate the nostr_group_id for message routing (per MIP-01)
+    /// let new_id = [0u8; 32]; // Generate a new random ID
+    /// let update = NostrGroupDataUpdate::new().nostr_group_id(new_id);
+    /// mls.update_group_data(&group_id, update)?;
     /// ```
     pub fn update_group_data(
         &self,
@@ -803,6 +816,10 @@ where
             // Validate admin update against current membership before applying
             self.validate_admin_update(group_id, admins)?;
             group_data.admins = admins.iter().copied().collect();
+        }
+
+        if let Some(nostr_group_id) = update.nostr_group_id {
+            group_data.nostr_group_id = nostr_group_id;
         }
 
         self.update_group_data_extension(&mut mls_group, group_id, &group_data)
@@ -3641,6 +3658,63 @@ mod tests {
         creator_mdk
             .merge_pending_commit(&group_id)
             .expect("Failed to merge commit");
+    }
+
+    /// Test that nostr_group_id can be rotated via update_group_data
+    ///
+    /// MIP-01 allows nostr_group_id rotation via proposals. This test verifies
+    /// that the update API supports rotating the nostr_group_id for message routing.
+    #[test]
+    fn test_update_nostr_group_id() {
+        let creator_mdk = create_test_mdk();
+        let (creator, members, admins) = create_test_group_members();
+        let group_id = create_test_group(&creator_mdk, &creator, &members, &admins);
+
+        // Get the initial nostr_group_id
+        let initial_mls_group = creator_mdk
+            .load_mls_group(&group_id)
+            .expect("Failed to load MLS group")
+            .expect("MLS group should exist");
+        let initial_group_data = NostrGroupDataExtension::from_group(&initial_mls_group).unwrap();
+        let initial_nostr_group_id = initial_group_data.nostr_group_id;
+
+        // Create a new nostr_group_id
+        let new_nostr_group_id: [u8; 32] = [42u8; 32];
+
+        // Update the nostr_group_id via the update API
+        let update = NostrGroupDataUpdate::new().nostr_group_id(new_nostr_group_id);
+        let result = creator_mdk.update_group_data(&group_id, update);
+        assert!(result.is_ok(), "Should be able to update nostr_group_id");
+
+        creator_mdk
+            .merge_pending_commit(&group_id)
+            .expect("Failed to merge commit");
+
+        // Verify the nostr_group_id was updated in the MLS extension
+        let final_mls_group = creator_mdk
+            .load_mls_group(&group_id)
+            .expect("Failed to load MLS group")
+            .expect("MLS group should exist");
+        let final_group_data = NostrGroupDataExtension::from_group(&final_mls_group).unwrap();
+
+        assert_ne!(
+            final_group_data.nostr_group_id, initial_nostr_group_id,
+            "nostr_group_id should have changed"
+        );
+        assert_eq!(
+            final_group_data.nostr_group_id, new_nostr_group_id,
+            "nostr_group_id should match the new value"
+        );
+
+        // Verify the stored group metadata was synced
+        let stored_group = creator_mdk
+            .get_group(&group_id)
+            .expect("Failed to get group")
+            .expect("Group should exist");
+        assert_eq!(
+            stored_group.nostr_group_id, new_nostr_group_id,
+            "Stored group nostr_group_id should be synced"
+        );
     }
 
     // ============================================================================
