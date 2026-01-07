@@ -48,12 +48,12 @@ pub(crate) fn decrypt_with_exporter_secret(
 }
 
 /// Encoding format for content fields
+///
+/// Only base64 encoding is supported per MIP-00/MIP-02.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ContentEncoding {
-    /// Legacy hex encoding (default for backward compatibility)
+    /// Base64 encoding
     #[default]
-    Hex,
-    /// Base64 encoding (~33% smaller than hex)
     Base64,
 }
 
@@ -61,7 +61,6 @@ impl ContentEncoding {
     /// Returns the tag value for this encoding format
     pub fn as_tag_value(&self) -> &'static str {
         match self {
-            ContentEncoding::Hex => "hex",
             ContentEncoding::Base64 => "base64",
         }
     }
@@ -70,17 +69,13 @@ impl ContentEncoding {
     pub fn from_tag_value(value: &str) -> Option<Self> {
         match value.to_lowercase().as_str() {
             "base64" => Some(ContentEncoding::Base64),
-            "hex" => Some(ContentEncoding::Hex),
             _ => None,
         }
     }
 
     /// Extracts the encoding format from an iterator of tags.
     ///
-    /// Looks for an `["encoding", "..."]` tag.
-    /// - `["encoding", "base64"]` → Base64 encoding
-    /// - `["encoding", "hex"]` → Hex encoding
-    /// - No encoding tag → Hex encoding (legacy default)
+    /// Looks for an `["encoding", "base64"]` tag.
     ///
     /// # Arguments
     ///
@@ -88,52 +83,50 @@ impl ContentEncoding {
     ///
     /// # Returns
     ///
-    /// The ContentEncoding specified by the tag, or Hex if no tag present.
-    pub fn from_tags<'a>(tags: impl Iterator<Item = &'a nostr::Tag>) -> Self {
+    /// The ContentEncoding specified by the tag, or None if no tag present or invalid encoding.
+    /// Callers must handle None and reject events without valid encoding tags.
+    pub fn from_tags<'a>(tags: impl Iterator<Item = &'a nostr::Tag>) -> Option<Self> {
         for tag in tags {
             let slice = tag.as_slice();
             if slice.len() >= 2
                 && slice[0] == "encoding"
                 && let Some(encoding) = Self::from_tag_value(&slice[1])
             {
-                return encoding;
+                return Some(encoding);
             }
         }
-        // Default to hex for backward compatibility
-        ContentEncoding::Hex
+        // SECURITY: No default - encoding tag must be present per MIP-00/MIP-02
+        None
     }
 }
 
-/// Encodes content using the specified encoding format
+/// Encodes content using base64 encoding
 ///
 /// # Arguments
 ///
 /// * `bytes` - The bytes to encode
-/// * `encoding` - The encoding format to use
+/// * `encoding` - The encoding format (must be Base64)
 ///
 /// # Returns
 ///
-/// The encoded string (pure base64 or hex, no prefix)
+/// The base64-encoded string
 pub(crate) fn encode_content(bytes: &[u8], encoding: ContentEncoding) -> String {
     match encoding {
         ContentEncoding::Base64 => BASE64.encode(bytes),
-        ContentEncoding::Hex => hex::encode(bytes),
     }
 }
 
-/// Decodes content using the specified encoding format
+/// Decodes content using base64 encoding
 ///
-/// The encoding format is determined by the `["encoding", "..."]` tag on the event:
-/// - `["encoding", "base64"]` → base64 decoding
-/// - `["encoding", "hex"]` or no encoding tag → hex decoding (legacy default)
+/// The encoding format must be determined from the `["encoding", "base64"]` tag on the event.
 ///
-/// This tag-based approach eliminates ambiguity for strings like `deadbeef` that are valid
-/// in both hex and base64 formats but decode to completely different bytes.
+/// Per MIP-00/MIP-02, the encoding tag is required. Callers must extract the encoding
+/// using `ContentEncoding::from_tags()` and handle the None case by rejecting the event.
 ///
 /// # Arguments
 ///
-/// * `content` - The encoded string
-/// * `encoding` - The encoding format (from the event's encoding tag, or Hex if absent)
+/// * `content` - The base64-encoded string
+/// * `encoding` - The encoding format (must be Base64)
 /// * `label` - A label for the content type (e.g., "key package", "welcome") used in error messages
 ///
 /// # Returns
@@ -149,9 +142,6 @@ pub(crate) fn decode_content(
             .decode(content)
             .map(|bytes| (bytes, "base64"))
             .map_err(|e| format!("Failed to decode {} as base64: {}", label, e)),
-        ContentEncoding::Hex => hex::decode(content)
-            .map(|bytes| (bytes, "hex"))
-            .map_err(|e| format!("Failed to decode {} as hex: {}", label, e)),
     }
 }
 
@@ -164,13 +154,6 @@ mod tests {
     fn test_encode_decode_roundtrip() {
         let original = vec![0xde, 0xad, 0xbe, 0xef];
 
-        // Hex roundtrip
-        let hex_encoded = encode_content(&original, ContentEncoding::Hex);
-        let (hex_decoded, hex_fmt) =
-            decode_content(&hex_encoded, ContentEncoding::Hex, "test").unwrap();
-        assert_eq!(original, hex_decoded);
-        assert_eq!(hex_fmt, "hex");
-
         // Base64 roundtrip
         let b64_encoded = encode_content(&original, ContentEncoding::Base64);
         let (b64_decoded, b64_fmt) =
@@ -181,33 +164,17 @@ mod tests {
 
     #[test]
     fn test_decode_invalid_content() {
-        assert!(decode_content("!!!", ContentEncoding::Hex, "test").is_err());
         assert!(decode_content("!!!", ContentEncoding::Base64, "test").is_err());
-    }
-
-    #[test]
-    fn test_ambiguous_string_decodes_differently() {
-        let ambiguous = "deadbeef";
-        let hex_bytes = decode_content(ambiguous, ContentEncoding::Hex, "test")
-            .unwrap()
-            .0;
-        let b64_bytes = decode_content(ambiguous, ContentEncoding::Base64, "test")
-            .unwrap()
-            .0;
-        assert_ne!(hex_bytes, b64_bytes);
     }
 
     #[test]
     fn test_content_encoding_tag_value_roundtrip() {
         assert_eq!(
-            ContentEncoding::from_tag_value(ContentEncoding::Hex.as_tag_value()),
-            Some(ContentEncoding::Hex)
-        );
-        assert_eq!(
             ContentEncoding::from_tag_value(ContentEncoding::Base64.as_tag_value()),
             Some(ContentEncoding::Base64)
         );
         assert_eq!(ContentEncoding::from_tag_value("invalid"), None);
+        assert_eq!(ContentEncoding::from_tag_value("hex"), None);
     }
 
     #[test]
@@ -218,22 +185,16 @@ mod tests {
         )];
         assert_eq!(
             ContentEncoding::from_tags(tags_base64.iter()),
-            ContentEncoding::Base64
+            Some(ContentEncoding::Base64)
         );
 
         let tags_hex = [Tag::custom(
             nostr::TagKind::Custom("encoding".into()),
             ["hex"],
         )];
-        assert_eq!(
-            ContentEncoding::from_tags(tags_hex.iter()),
-            ContentEncoding::Hex
-        );
+        assert_eq!(ContentEncoding::from_tags(tags_hex.iter()), None);
 
         let empty: [Tag; 0] = [];
-        assert_eq!(
-            ContentEncoding::from_tags(empty.iter()),
-            ContentEncoding::Hex
-        );
+        assert_eq!(ContentEncoding::from_tags(empty.iter()), None);
     }
 }

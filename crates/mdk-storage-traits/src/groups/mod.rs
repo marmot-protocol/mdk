@@ -19,6 +19,47 @@ use self::error::GroupError;
 use self::types::*;
 use crate::messages::types::Message;
 
+/// Default limit for messages queries to prevent unbounded memory usage
+pub const DEFAULT_MESSAGE_LIMIT: usize = 1000;
+
+/// Maximum allowed limit for messages queries to prevent resource exhaustion
+pub const MAX_MESSAGE_LIMIT: usize = 10000;
+
+/// Pagination parameters for querying messages
+#[derive(Debug, Clone, Copy)]
+pub struct Pagination {
+    /// Maximum number of messages to return
+    pub limit: Option<usize>,
+    /// Number of messages to skip
+    pub offset: Option<usize>,
+}
+
+impl Pagination {
+    /// Create a new Pagination with specified limit and offset
+    pub fn new(limit: Option<usize>, offset: Option<usize>) -> Self {
+        Self { limit, offset }
+    }
+
+    /// Get the limit value, using default if not specified
+    pub fn limit(&self) -> usize {
+        self.limit.unwrap_or(DEFAULT_MESSAGE_LIMIT)
+    }
+
+    /// Get the offset value, using 0 if not specified
+    pub fn offset(&self) -> usize {
+        self.offset.unwrap_or(0)
+    }
+}
+
+impl Default for Pagination {
+    fn default() -> Self {
+        Self {
+            limit: Some(DEFAULT_MESSAGE_LIMIT),
+            offset: Some(0),
+        }
+    }
+}
+
 /// Storage traits for the groups module
 pub trait GroupStorage {
     /// Get all groups
@@ -36,8 +77,41 @@ pub trait GroupStorage {
     /// Save a group
     fn save_group(&self, group: Group) -> Result<(), GroupError>;
 
-    /// Get all messages for a group
-    fn messages(&self, group_id: &GroupId) -> Result<Vec<Message>, GroupError>;
+    /// Get messages for a group with optional pagination
+    ///
+    /// Returns messages ordered by `created_at DESC` (newest first).
+    ///
+    /// # Arguments
+    /// * `group_id` - The group ID to fetch messages for
+    /// * `pagination` - Optional pagination parameters. If `None`, uses default limit and offset.
+    ///
+    /// # Returns
+    ///
+    /// Returns a vector of messages ordered by created_at (descending)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GroupError::InvalidParameters`] if:
+    /// - `limit` is 0
+    /// - `limit` exceeds [`MAX_MESSAGE_LIMIT`]
+    /// - Group with the specified ID does not exist
+    ///
+    /// # Examples
+    /// ```ignore
+    /// // Get messages with default pagination
+    /// let messages = storage.messages(&group_id, None)?;
+    ///
+    /// // Get first 100 messages
+    /// let messages = storage.messages(&group_id, Some(Pagination::new(Some(100), Some(0))))?;
+    ///
+    /// // Get next 100 messages
+    /// let messages = storage.messages(&group_id, Some(Pagination::new(Some(100), Some(100))))?;
+    /// ```
+    fn messages(
+        &self,
+        group_id: &GroupId,
+        pagination: Option<Pagination>,
+    ) -> Result<Vec<Message>, GroupError>;
 
     /// Get all admins for a group
     fn admins(&self, group_id: &GroupId) -> Result<BTreeSet<PublicKey>, GroupError>;
