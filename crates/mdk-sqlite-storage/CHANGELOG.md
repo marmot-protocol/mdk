@@ -48,7 +48,6 @@
 - New `encryption` module with `EncryptionConfig` struct and SQLCipher utilities ([#102](https://github.com/marmot-protocol/mdk/pull/102))
 - New encryption-related error variants: `InvalidKeyLength`, `WrongEncryptionKey`, `EncryptedDatabaseRequiresKey`, `UnencryptedDatabaseWithEncryption`, `KeyGeneration`, `FilePermission`, `Keyring`, `KeyringNotInitialized`, `KeyringEntryMissingForExistingDatabase` ([#102](https://github.com/marmot-protocol/mdk/pull/102))
 - File permission hardening on Unix: database directories (0700) and files (0600) are created with owner-only access ([#102](https://github.com/marmot-protocol/mdk/pull/102))
-- Pagination support using `Pagination` struct for pending welcomes ([#110](https://github.com/marmot-protocol/mdk/pull/110))
 - Implemented pagination support using `Pagination` struct for group messages ([#111](https://github.com/marmot-protocol/mdk/pull/111))
 - Implemented pagination support using `Pagination` struct for pending welcomes ([#110](https://github.com/marmot-protocol/mdk/pull/110))
 
