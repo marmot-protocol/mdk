@@ -531,9 +531,9 @@ impl MdkStorageProvider for MdkSqliteStorage {
 mod tests {
     use std::collections::BTreeSet;
 
-    use mdk_storage_traits::groups::types::{Group, GroupExporterSecret, GroupState};
-    use mdk_storage_traits::groups::GroupStorage;
     use mdk_storage_traits::GroupId;
+    use mdk_storage_traits::groups::GroupStorage;
+    use mdk_storage_traits::groups::types::{Group, GroupExporterSecret, GroupState};
     use tempfile::tempdir;
 
     use super::*;
@@ -728,8 +728,8 @@ mod tests {
         use std::sync::OnceLock;
         use std::thread;
 
-        use mdk_storage_traits::groups::types::{Group, GroupExporterSecret, GroupState};
         use mdk_storage_traits::groups::GroupStorage;
+        use mdk_storage_traits::groups::types::{Group, GroupExporterSecret, GroupState};
         use mdk_storage_traits::messages::MessageStorage;
         use mdk_storage_traits::test_utils::cross_storage::{
             create_test_group, create_test_message, create_test_welcome,
