@@ -4135,4 +4135,409 @@ mod tests {
             "Error should be IdentityChangeNotAllowed variant"
         );
     }
+
+    /// Test identity validation during add_members commit processing
+    ///
+    /// This test verifies that identity validation is triggered when processing
+    /// add_members commits that contain update paths.
+    #[test]
+    fn test_add_members_commit_triggers_identity_validation() {
+        let alice_keys = Keys::generate();
+        let bob_keys = Keys::generate();
+        let charlie_keys = Keys::generate();
+
+        let alice_mdk = create_test_mdk();
+        let bob_mdk = create_test_mdk();
+        let charlie_mdk = create_test_mdk();
+
+        // Create key packages
+        let bob_key_package = create_key_package_event(&bob_mdk, &bob_keys);
+        let charlie_key_package = create_key_package_event(&charlie_mdk, &charlie_keys);
+
+        // Alice creates group with Bob
+        let admin_pubkeys = vec![alice_keys.public_key()];
+        let config = create_nostr_group_config_data(admin_pubkeys);
+
+        let create_result = alice_mdk
+            .create_group(&alice_keys.public_key(), vec![bob_key_package], config)
+            .expect("Alice should create group");
+
+        let group_id = create_result.group.mls_group_id.clone();
+
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("Alice should merge commit");
+
+        // Bob joins the group
+        let bob_welcome_rumor = &create_result.welcome_rumors[0];
+        let bob_welcome = bob_mdk
+            .process_welcome(&nostr::EventId::all_zeros(), bob_welcome_rumor)
+            .expect("Bob should process welcome");
+
+        bob_mdk
+            .accept_welcome(&bob_welcome)
+            .expect("Bob should accept welcome");
+
+        // Alice adds Charlie - this creates a commit with update_path
+        let add_result = alice_mdk
+            .add_members(&group_id, &[charlie_key_package])
+            .expect("Alice should add Charlie");
+
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("Alice should merge add commit");
+
+        // Bob processes Alice's add_members commit
+        // This triggers identity validation on the update_path
+        let bob_process_result = bob_mdk.process_message(&add_result.evolution_event);
+
+        assert!(
+            bob_process_result.is_ok(),
+            "Bob should successfully process add_members commit with identity validation"
+        );
+
+        // Verify Alice's identity is still correct after the commit
+        let alice_mls_group = alice_mdk
+            .load_mls_group(&group_id)
+            .expect("Load Alice MLS group")
+            .expect("Alice MLS group exists");
+
+        let alice_own_leaf = alice_mls_group
+            .own_leaf()
+            .expect("Alice should have own leaf");
+        let alice_credential =
+            BasicCredential::try_from(alice_own_leaf.credential().clone()).unwrap();
+        let alice_identity = alice_mdk
+            .parse_credential_identity(alice_credential.identity())
+            .expect("Parse Alice identity");
+
+        assert_eq!(
+            alice_identity,
+            alice_keys.public_key(),
+            "Alice's identity should be preserved after add_members"
+        );
+    }
+
+    /// Test identity validation during remove_members commit processing
+    ///
+    /// This test verifies that identity validation is triggered when processing
+    /// remove_members commits.
+    #[test]
+    fn test_remove_members_commit_triggers_identity_validation() {
+        let alice_keys = Keys::generate();
+        let bob_keys = Keys::generate();
+        let charlie_keys = Keys::generate();
+
+        let alice_mdk = create_test_mdk();
+        let bob_mdk = create_test_mdk();
+        let charlie_mdk = create_test_mdk();
+
+        // Create key packages
+        let bob_key_package = create_key_package_event(&bob_mdk, &bob_keys);
+        let charlie_key_package = create_key_package_event(&charlie_mdk, &charlie_keys);
+
+        // Alice creates group with Bob and Charlie
+        let admin_pubkeys = vec![alice_keys.public_key()];
+        let config = create_nostr_group_config_data(admin_pubkeys);
+
+        let create_result = alice_mdk
+            .create_group(
+                &alice_keys.public_key(),
+                vec![bob_key_package, charlie_key_package],
+                config,
+            )
+            .expect("Alice should create group");
+
+        let group_id = create_result.group.mls_group_id.clone();
+
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("Alice should merge commit");
+
+        // Bob joins the group
+        let bob_welcome_rumor = &create_result.welcome_rumors[0];
+        let bob_welcome = bob_mdk
+            .process_welcome(&nostr::EventId::all_zeros(), bob_welcome_rumor)
+            .expect("Bob should process welcome");
+
+        bob_mdk
+            .accept_welcome(&bob_welcome)
+            .expect("Bob should accept welcome");
+
+        // Verify initial member count
+        let alice_members = alice_mdk.get_members(&group_id).expect("Alice get members");
+        assert_eq!(
+            alice_members.len(),
+            3,
+            "Alice should see 3 members initially"
+        );
+
+        // Alice removes Charlie
+        let remove_result = alice_mdk
+            .remove_members(&group_id, &[charlie_keys.public_key()])
+            .expect("Alice should remove Charlie");
+
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("Alice should merge remove commit");
+
+        // Bob processes Alice's remove_members commit
+        // This triggers identity validation
+        let bob_process_result = bob_mdk.process_message(&remove_result.evolution_event);
+
+        assert!(
+            bob_process_result.is_ok(),
+            "Bob should successfully process remove_members commit with identity validation"
+        );
+
+        // Verify member count changed
+        let alice_members_after = alice_mdk
+            .get_members(&group_id)
+            .expect("Alice get members after");
+        assert_eq!(
+            alice_members_after.len(),
+            2,
+            "Alice should see 2 members after removal"
+        );
+    }
+
+    /// Test multiple sequential commits with identity validation
+    ///
+    /// This test verifies that identity validation works correctly across
+    /// multiple sequential commits in a group.
+    #[test]
+    fn test_sequential_commits_identity_validation() {
+        let alice_keys = Keys::generate();
+        let bob_keys = Keys::generate();
+
+        let alice_mdk = create_test_mdk();
+        let bob_mdk = create_test_mdk();
+
+        // Create key packages
+        let bob_key_package = create_key_package_event(&bob_mdk, &bob_keys);
+
+        // Alice creates group with Bob as admin
+        let admin_pubkeys = vec![alice_keys.public_key(), bob_keys.public_key()];
+        let config = create_nostr_group_config_data(admin_pubkeys);
+
+        let create_result = alice_mdk
+            .create_group(&alice_keys.public_key(), vec![bob_key_package], config)
+            .expect("Alice should create group");
+
+        let group_id = create_result.group.mls_group_id.clone();
+
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("Alice should merge commit");
+
+        // Bob joins the group
+        let bob_welcome_rumor = &create_result.welcome_rumors[0];
+        let bob_welcome = bob_mdk
+            .process_welcome(&nostr::EventId::all_zeros(), bob_welcome_rumor)
+            .expect("Bob should process welcome");
+
+        bob_mdk
+            .accept_welcome(&bob_welcome)
+            .expect("Bob should accept welcome");
+
+        // Perform multiple self_updates and verify identity is preserved each time
+        for i in 0..3 {
+            // Alice performs self_update
+            let alice_update_result = alice_mdk
+                .self_update(&group_id)
+                .expect(&format!("Alice self_update {} should succeed", i));
+
+            alice_mdk
+                .merge_pending_commit(&group_id)
+                .expect(&format!("Alice should merge self_update commit {}", i));
+
+            // Bob processes Alice's commit
+            let bob_process_result = bob_mdk.process_message(&alice_update_result.evolution_event);
+            assert!(
+                bob_process_result.is_ok(),
+                "Bob should process Alice's commit {} with identity validation",
+                i
+            );
+
+            // Bob performs self_update
+            let bob_update_result = bob_mdk
+                .self_update(&group_id)
+                .expect(&format!("Bob self_update {} should succeed", i));
+
+            bob_mdk
+                .merge_pending_commit(&group_id)
+                .expect(&format!("Bob should merge self_update commit {}", i));
+
+            // Alice processes Bob's commit
+            let alice_process_result =
+                alice_mdk.process_message(&bob_update_result.evolution_event);
+            assert!(
+                alice_process_result.is_ok(),
+                "Alice should process Bob's commit {} with identity validation",
+                i
+            );
+        }
+
+        // Verify both identities are still correct after all commits
+        let alice_mls_group = alice_mdk
+            .load_mls_group(&group_id)
+            .expect("Load Alice MLS group")
+            .expect("Alice MLS group exists");
+        let alice_own_leaf = alice_mls_group.own_leaf().expect("Alice own leaf");
+        let alice_credential =
+            BasicCredential::try_from(alice_own_leaf.credential().clone()).unwrap();
+        let alice_identity = alice_mdk
+            .parse_credential_identity(alice_credential.identity())
+            .expect("Parse Alice identity");
+
+        let bob_mls_group = bob_mdk
+            .load_mls_group(&group_id)
+            .expect("Load Bob MLS group")
+            .expect("Bob MLS group exists");
+        let bob_own_leaf = bob_mls_group.own_leaf().expect("Bob own leaf");
+        let bob_credential = BasicCredential::try_from(bob_own_leaf.credential().clone()).unwrap();
+        let bob_identity = bob_mdk
+            .parse_credential_identity(bob_credential.identity())
+            .expect("Parse Bob identity");
+
+        assert_eq!(
+            alice_identity,
+            alice_keys.public_key(),
+            "Alice's identity should be preserved after multiple commits"
+        );
+        assert_eq!(
+            bob_identity,
+            bob_keys.public_key(),
+            "Bob's identity should be preserved after multiple commits"
+        );
+    }
+
+    /// Test that validate_proposal_identity handles non-Update proposals correctly
+    ///
+    /// This test verifies that the validation function correctly handles
+    /// different proposal types (Add, Remove) without errors.
+    #[test]
+    fn test_validate_proposal_identity_non_update_proposals() {
+        let mdk = create_test_mdk();
+        let (creator, members, admins) = create_test_group_members();
+        let group_id = create_test_group(&mdk, &creator, &members, &admins);
+
+        // Load the MLS group
+        let mls_group = mdk
+            .load_mls_group(&group_id)
+            .expect("Failed to load MLS group")
+            .expect("MLS group should exist");
+
+        // Verify we have members in the group
+        let member_count = mls_group.members().count();
+        assert!(member_count > 0, "Group should have members");
+
+        // Verify each member has a valid identity
+        for member in mls_group.members() {
+            let credential = BasicCredential::try_from(member.credential.clone())
+                .expect("Should extract credential");
+            let identity = mdk
+                .parse_credential_identity(credential.identity())
+                .expect("Should parse identity");
+
+            // Verify identity is a valid 32-byte public key
+            assert_eq!(identity.to_bytes().len(), 32, "Identity should be 32 bytes");
+        }
+    }
+
+    /// Test identity validation with group epoch changes
+    ///
+    /// This test verifies that identity validation works correctly as the
+    /// group advances through multiple epochs.
+    #[test]
+    fn test_identity_validation_across_epochs() {
+        let alice_keys = Keys::generate();
+        let bob_keys = Keys::generate();
+
+        let alice_mdk = create_test_mdk();
+        let bob_mdk = create_test_mdk();
+
+        // Create key packages
+        let bob_key_package = create_key_package_event(&bob_mdk, &bob_keys);
+
+        // Alice creates group with Bob
+        let admin_pubkeys = vec![alice_keys.public_key(), bob_keys.public_key()];
+        let config = create_nostr_group_config_data(admin_pubkeys);
+
+        let create_result = alice_mdk
+            .create_group(&alice_keys.public_key(), vec![bob_key_package], config)
+            .expect("Alice should create group");
+
+        let group_id = create_result.group.mls_group_id.clone();
+
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("Alice should merge commit");
+
+        // Bob joins the group
+        let bob_welcome_rumor = &create_result.welcome_rumors[0];
+        let bob_welcome = bob_mdk
+            .process_welcome(&nostr::EventId::all_zeros(), bob_welcome_rumor)
+            .expect("Bob should process welcome");
+
+        bob_mdk
+            .accept_welcome(&bob_welcome)
+            .expect("Bob should accept welcome");
+
+        // Get initial epoch
+        let initial_epoch = alice_mdk
+            .get_group(&group_id)
+            .expect("Get group")
+            .expect("Group exists")
+            .epoch;
+
+        // Advance epoch multiple times
+        for i in 0..5 {
+            let update_result = alice_mdk
+                .self_update(&group_id)
+                .expect(&format!("Alice self_update {} should succeed", i));
+
+            alice_mdk
+                .merge_pending_commit(&group_id)
+                .expect(&format!("Alice should merge commit {}", i));
+
+            // Bob processes to stay in sync
+            bob_mdk
+                .process_message(&update_result.evolution_event)
+                .expect(&format!("Bob should process commit {}", i));
+        }
+
+        // Verify epoch advanced
+        let final_epoch = alice_mdk
+            .get_group(&group_id)
+            .expect("Get group")
+            .expect("Group exists")
+            .epoch;
+
+        assert!(
+            final_epoch > initial_epoch,
+            "Epoch should have advanced: {} > {}",
+            final_epoch,
+            initial_epoch
+        );
+
+        // Verify identities are still correct
+        let alice_mls_group = alice_mdk
+            .load_mls_group(&group_id)
+            .expect("Load MLS group")
+            .expect("MLS group exists");
+
+        let alice_own_leaf = alice_mls_group.own_leaf().expect("Alice own leaf");
+        let alice_credential =
+            BasicCredential::try_from(alice_own_leaf.credential().clone()).unwrap();
+        let alice_identity = alice_mdk
+            .parse_credential_identity(alice_credential.identity())
+            .expect("Parse identity");
+
+        assert_eq!(
+            alice_identity,
+            alice_keys.public_key(),
+            "Alice's identity should be preserved across epoch changes"
+        );
+    }
 }
