@@ -303,7 +303,7 @@ use self::x::Y;
 
 ## Security
 
-- For security vulnerabilities, email **j@jeffg.me** (do not open public issues)
+- For security vulnerabilities, email **<j@ipf.dev>** (do not open public issues)
 - MDK handles cryptographic operations - be careful with key material
 - All message encryption uses MLS protocol with forward secrecy
 - Review security implications of any changes to cryptographic code

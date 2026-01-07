@@ -411,7 +411,7 @@ just docs      # Check documentation
 
 ### Security
 
-For security issues, please email **j@jeffg.me** instead of opening a public issue.
+For security issues, please email **<j@ipf.dev>** instead of opening a public issue.
 
 ## ⚠️ Status
 

@@ -4,7 +4,7 @@ This document describes MDK's security posture, the measures we've taken to prot
 
 ## Reporting a Vulnerability
 
-To report security issues, send an email to **j@jeffg.me**. Please do not open public issues for security vulnerabilities.
+To report security issues, send an email to **<j@ipf.dev>**. Please do not open public issues for security vulnerabilities.
 
 ## Security Overview
 
