@@ -216,6 +216,7 @@ pub fn delete_db_key(service_id: &str, db_key_id: &str) -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use std::sync::OnceLock;
+    use std::thread;
 
     use super::*;
 
@@ -471,8 +472,6 @@ mod tests {
     #[test]
     fn test_concurrent_get_or_create_same_key() {
         ensure_mock_store();
-
-        use std::thread;
 
         let service_id = "test.mdk.storage.concurrent";
         let db_key_id = "test.key.concurrent";

@@ -104,6 +104,20 @@ MDK applies restrictive file permissions to database files:
 | Database files | `0600` | Owner read/write only |
 | Sidecar files (`-wal`, `-shm`, `-journal`) | `0600` | Owner read/write only |
 
+#### Sidecar File Permissions (Defense in Depth)
+
+SQLite creates sidecar files (`-wal`, `-shm`, `-journal`) dynamically during database operations. MDK applies restrictive permissions to these files if they exist when the storage is initialized, but files created afterward may temporarily have default (umask-dependent) permissions until the next `MdkSqliteStorage` instance is created.
+
+This is acceptable due to MDK's layered security approach:
+
+1. **Directory permissions**: The parent directory has `0700` permissions. Even if sidecar files have more permissive defaults, other users cannot traverse into the directory to access them.
+
+2. **SQLCipher encryption**: All data in sidecar files is encrypted. The `-wal` and `-journal` files contain encrypted page data, unreadable without the encryption key.
+
+3. **Mobile sandboxing**: On iOS/Android, the app sandbox is the primary security boundary.
+
+Alternative approaches like `PRAGMA journal_mode = MEMORY` were rejected because they sacrifice crash durability, which is unacceptable for MLS cryptographic state.
+
 ### Windows
 
 MDK does **not** currently harden Windows filesystem permissions for database paths. Windows uses Access Control Lists (ACLs), and doing this correctly requires careful handling of:

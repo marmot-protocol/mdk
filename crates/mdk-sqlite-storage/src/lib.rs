@@ -398,6 +398,30 @@ impl MdkSqliteStorage {
     }
 
     /// Applies secure file permissions to the database and related files.
+    ///
+    /// # Defense in Depth for Sidecar Files
+    ///
+    /// SQLite creates sidecar files (`-wal`, `-shm`, `-journal`) dynamically during
+    /// database operations. We apply permissions to these files if they exist at
+    /// initialization time, but files created afterward may have default permissions
+    /// until the next `MdkSqliteStorage` instance is created.
+    ///
+    /// This is acceptable because of our layered security approach:
+    ///
+    /// 1. **Directory permissions**: The parent directory is created with 0700 permissions
+    ///    (owner-only access). Even if sidecar files have more permissive default permissions,
+    ///    other users cannot traverse into the directory to access them.
+    ///
+    /// 2. **SQLCipher encryption**: All data written to sidecar files is encrypted.
+    ///    The `-wal` and `-journal` files contain encrypted page data, making them
+    ///    unreadable without the encryption key regardless of file permissions.
+    ///
+    /// 3. **Mobile sandboxing**: On iOS and Android, the application sandbox provides
+    ///    the primary security boundary, making file permissions defense-in-depth.
+    ///
+    /// Alternative approaches (e.g., `PRAGMA journal_mode = MEMORY`) were considered
+    /// but rejected because they sacrifice crash durability, which is unacceptable
+    /// for MLS cryptographic state.
     fn apply_secure_permissions(db_path: &Path) -> Result<(), Error> {
         // Skip special SQLite paths (in-memory databases, etc.)
         let path_str = db_path.to_string_lossy();
@@ -408,7 +432,9 @@ impl MdkSqliteStorage {
         // Apply to main database file
         set_secure_file_permissions(db_path)?;
 
-        // Apply to common SQLite sidecar files if they exist
+        // Apply to common SQLite sidecar files if they exist.
+        // Note: Files created after this point will have default permissions, but are
+        // still protected by directory permissions and SQLCipher encryption (see above).
         let parent = db_path.parent();
         let stem = db_path.file_name().and_then(|n| n.to_str());
 
