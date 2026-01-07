@@ -6,6 +6,7 @@
 //!
 //! Here we also define the storage traits that are used to store and retrieve messages
 
+use crate::GroupId;
 use nostr::EventId;
 
 pub mod error;
@@ -19,9 +20,15 @@ pub trait MessageStorage {
     /// Save a message
     fn save_message(&self, message: Message) -> Result<(), MessageError>;
 
-    /// Find a message by event ID
-    fn find_message_by_event_id(&self, event_id: &EventId)
-    -> Result<Option<Message>, MessageError>;
+    /// Find a message by event ID within a specific group
+    ///
+    /// This method requires both the event ID and the MLS group ID to prevent
+    /// messages from different groups from overwriting each other.
+    fn find_message_by_event_id(
+        &self,
+        mls_group_id: &GroupId,
+        event_id: &EventId,
+    ) -> Result<Option<Message>, MessageError>;
 
     /// Save a processed message
     fn save_processed_message(

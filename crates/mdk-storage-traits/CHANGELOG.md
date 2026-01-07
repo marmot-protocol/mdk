@@ -27,6 +27,7 @@
 
 ### Breaking changes
 
+- **Security (Audit Issue M)**: Changed `MessageStorage::find_message_by_event_id()` to require both `mls_group_id` and `event_id` parameters. This prevents messages from different groups from overwriting each other by scoping lookups to a specific group. ([#124](https://github.com/marmot-protocol/mdk/pull/124))
 - Changed `GroupStorage::messages()` to accept `Option<Pagination>` parameter instead of having separate `messages()` and `messages_paginated()` methods ([#111](https://github.com/marmot-protocol/mdk/pull/111))
 - Changed `WelcomeStorage::pending_welcomes()` to accept `Option<Pagination>` parameter for pagination control ([#110](https://github.com/marmot-protocol/mdk/pull/110))
 
