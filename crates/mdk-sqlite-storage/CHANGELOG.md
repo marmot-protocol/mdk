@@ -27,6 +27,7 @@
 
 ### Breaking changes
 
+- **Security (Audit Issue M)**: Changed `MessageStorage::find_message_by_event_id()` to require both `mls_group_id` and `event_id` parameters. This prevents messages from different groups from overwriting each other. Database migration V105 changes the messages table primary key from `id` to `(mls_group_id, id)`. ([#124](https://github.com/marmot-protocol/mdk/pull/124))
 - Updated `messages()` implementation to accept `Option<Pagination>` parameter ([#111](https://github.com/marmot-protocol/mdk/pull/111))
 - Updated `pending_welcomes()` implementation to accept `Option<Pagination>` parameter ([#110](https://github.com/marmot-protocol/mdk/pull/110))
 
@@ -48,6 +49,7 @@
 
 ### Fixed
 
+- **Security (Audit Issue M)**: Fixed messages being overwritten across groups due to non-scoped primary key. Changed messages table primary key from `id` to `(mls_group_id, id)` and updated `save_message()` to use `INSERT ... ON CONFLICT(mls_group_id, id) DO UPDATE` instead of `INSERT OR REPLACE`. This prevents an attacker or faulty relay from causing message loss and misattribution across groups by reusing deterministic rumor IDs. ([#124](https://github.com/marmot-protocol/mdk/pull/124))
 - **Security (Audit Issue Z)**: Added pagination to prevent memory exhaustion from unbounded loading of group messages ([#111](https://github.com/marmot-protocol/mdk/pull/111))
 - **Security (Audit Issue AA)**: Added pagination to prevent memory exhaustion from unbounded loading of pending welcomes ([#110](https://github.com/marmot-protocol/mdk/pull/110))
 - **Security (Audit Issue AB)**: Added size limits to prevent disk and CPU exhaustion from unbounded user input ([#94](https://github.com/marmot-protocol/mdk/pull/94))
