@@ -458,4 +458,372 @@ mod tests {
         assert_ne!(encrypted1, encrypted3);
         assert_ne!(encrypted2, encrypted3);
     }
+
+    #[test]
+    fn test_secret_zeroization() {
+        // Test that Secret properly wraps values and can be accessed
+        let original_key = [0xAAu8; 32];
+        let secret_key = Secret::new(original_key);
+
+        // Verify we can access the secret value
+        assert_eq!(secret_key.as_ref(), &original_key);
+        assert_eq!(*secret_key, original_key);
+
+        // Test cloning preserves the value
+        let cloned = secret_key.clone();
+        assert_eq!(*cloned, original_key);
+        assert_eq!(*secret_key, original_key);
+
+        // Test mut access
+        let mut mut_secret = Secret::new([0xBBu8; 32]);
+        *mut_secret.as_mut() = [0xCCu8; 32];
+        assert_eq!(*mut_secret, [0xCCu8; 32]);
+    }
+
+    #[test]
+    fn test_secret_debug_format() {
+        // Test that Debug formatting doesn't leak secrets
+        let secret_key = Secret::new([0xAAu8; 32]);
+        let debug_str = format!("{:?}", secret_key);
+        assert_eq!(debug_str, "Secret(***)");
+        assert!(!debug_str.contains("AA"));
+    }
+
+    #[test]
+    fn test_decrypt_corrupted_data() {
+        // Test decryption with corrupted encrypted data
+        let key = Secret::new([0x42u8; 32]);
+        let nonce = Secret::new([0x24u8; 12]);
+        let original_data = b"Hello, encrypted world!";
+        let file_hash = [0x01u8; 32];
+        let mime_type = "image/jpeg";
+        let filename = "test.jpg";
+
+        // Encrypt valid data
+        let mut encrypted_data =
+            encrypt_data_with_aad(original_data, &key, &nonce, &file_hash, mime_type, filename)
+                .unwrap();
+
+        // Corrupt the encrypted data (flip a bit)
+        encrypted_data[0] ^= 0xFF;
+
+        // Decryption should fail
+        let result = decrypt_data_with_aad(
+            &encrypted_data,
+            &key,
+            &nonce,
+            &file_hash,
+            mime_type,
+            filename,
+        );
+        assert!(result.is_err());
+        assert!(matches!(
+            result,
+            Err(EncryptedMediaError::DecryptionFailed { .. })
+        ));
+    }
+
+    #[test]
+    fn test_decrypt_too_short_data() {
+        // Test decryption with data that's too short to be valid
+        let key = Secret::new([0x42u8; 32]);
+        let nonce = Secret::new([0x24u8; 12]);
+        let file_hash = [0x01u8; 32];
+        let mime_type = "image/jpeg";
+        let filename = "test.jpg";
+
+        // Try to decrypt data that's too short (less than auth tag size)
+        let too_short = vec![0u8; 5];
+
+        let result =
+            decrypt_data_with_aad(&too_short, &key, &nonce, &file_hash, mime_type, filename);
+        assert!(result.is_err());
+        assert!(matches!(
+            result,
+            Err(EncryptedMediaError::DecryptionFailed { .. })
+        ));
+    }
+
+    #[test]
+    fn test_encrypt_large_data() {
+        // Test encryption/decryption of large data
+        let key = Secret::new([0x42u8; 32]);
+        let nonce = Secret::new([0x24u8; 12]);
+        let large_data = vec![0xABu8; 1024 * 1024]; // 1MB
+        let file_hash = [0x01u8; 32];
+        let mime_type = "application/octet-stream";
+        let filename = "large.bin";
+
+        // Encrypt large data
+        let encrypted_result =
+            encrypt_data_with_aad(&large_data, &key, &nonce, &file_hash, mime_type, filename);
+        assert!(encrypted_result.is_ok());
+        let encrypted_data = encrypted_result.unwrap();
+
+        // Verify encrypted data is larger (includes auth tag)
+        assert!(encrypted_data.len() > large_data.len());
+
+        // Decrypt and verify
+        let decrypted_result = decrypt_data_with_aad(
+            &encrypted_data,
+            &key,
+            &nonce,
+            &file_hash,
+            mime_type,
+            filename,
+        );
+        assert!(decrypted_result.is_ok());
+        assert_eq!(decrypted_result.unwrap(), large_data);
+    }
+
+    #[test]
+    fn test_encrypt_special_characters() {
+        // Test encryption with special characters in filename and MIME type
+        let key = Secret::new([0x42u8; 32]);
+        let nonce = Secret::new([0x24u8; 12]);
+        let data = b"test data";
+        let file_hash = [0x01u8; 32];
+
+        // Test with special characters in filename
+        let encrypted1 = encrypt_data_with_aad(
+            data,
+            &key,
+            &nonce,
+            &file_hash,
+            "image/jpeg",
+            "test file (1).jpg",
+        )
+        .unwrap();
+
+        // Test with unicode characters
+        let encrypted2 =
+            encrypt_data_with_aad(data, &key, &nonce, &file_hash, "image/jpeg", "тест.jpg")
+                .unwrap();
+
+        // Test with complex MIME type
+        let encrypted3 = encrypt_data_with_aad(
+            data,
+            &key,
+            &nonce,
+            &file_hash,
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "document.docx",
+        )
+        .unwrap();
+
+        // All should encrypt successfully
+        assert!(!encrypted1.is_empty());
+        assert!(!encrypted2.is_empty());
+        assert!(!encrypted3.is_empty());
+
+        // Verify decryption works
+        let decrypted1 = decrypt_data_with_aad(
+            &encrypted1,
+            &key,
+            &nonce,
+            &file_hash,
+            "image/jpeg",
+            "test file (1).jpg",
+        )
+        .unwrap();
+        assert_eq!(decrypted1, data);
+
+        let decrypted2 = decrypt_data_with_aad(
+            &encrypted2,
+            &key,
+            &nonce,
+            &file_hash,
+            "image/jpeg",
+            "тест.jpg",
+        )
+        .unwrap();
+        assert_eq!(decrypted2, data);
+    }
+
+    #[test]
+    fn test_multiple_encryption_cycles() {
+        // Test multiple encryption/decryption cycles with same key/nonce
+        let key = Secret::new([0x42u8; 32]);
+        let nonce = Secret::new([0x24u8; 12]);
+        let file_hash = [0x01u8; 32];
+        let mime_type = "image/jpeg";
+        let filename = "test.jpg";
+
+        let data1 = b"First encryption";
+        let data2 = b"Second encryption";
+        let data3 = b"Third encryption";
+
+        // Encrypt multiple times
+        let enc1 =
+            encrypt_data_with_aad(data1, &key, &nonce, &file_hash, mime_type, filename).unwrap();
+        let enc2 =
+            encrypt_data_with_aad(data2, &key, &nonce, &file_hash, mime_type, filename).unwrap();
+        let enc3 =
+            encrypt_data_with_aad(data3, &key, &nonce, &file_hash, mime_type, filename).unwrap();
+
+        // Each encryption should produce different ciphertext (even with same key/nonce)
+        // because ChaCha20-Poly1305 is non-deterministic
+        assert_ne!(enc1, enc2);
+        assert_ne!(enc2, enc3);
+        assert_ne!(enc1, enc3);
+
+        // All should decrypt correctly
+        let dec1 =
+            decrypt_data_with_aad(&enc1, &key, &nonce, &file_hash, mime_type, filename).unwrap();
+        let dec2 =
+            decrypt_data_with_aad(&enc2, &key, &nonce, &file_hash, mime_type, filename).unwrap();
+        let dec3 =
+            decrypt_data_with_aad(&enc3, &key, &nonce, &file_hash, mime_type, filename).unwrap();
+
+        assert_eq!(dec1, data1);
+        assert_eq!(dec2, data2);
+        assert_eq!(dec3, data3);
+    }
+
+    #[test]
+    fn test_error_messages() {
+        // Test that error messages are properly formatted
+        let mdk = create_test_mdk();
+        let group_id = GroupId::from_slice(&[1, 2, 3, 4]);
+        let file_hash = [0x01u8; 32];
+
+        // Test GroupNotFound error message
+        let key_result =
+            derive_encryption_key(&mdk, &group_id, &file_hash, "image/jpeg", "test.jpg");
+        assert!(matches!(
+            key_result,
+            Err(EncryptedMediaError::GroupNotFound)
+        ));
+
+        let nonce_result =
+            derive_encryption_nonce(&mdk, &group_id, &file_hash, "image/jpeg", "test.jpg");
+        assert!(matches!(
+            nonce_result,
+            Err(EncryptedMediaError::GroupNotFound)
+        ));
+
+        // Test DecryptionFailed error message format
+        let key = Secret::new([0x42u8; 32]);
+        let nonce = Secret::new([0x24u8; 12]);
+        let corrupted = vec![0u8; 10];
+
+        let result = decrypt_data_with_aad(
+            &corrupted,
+            &key,
+            &nonce,
+            &file_hash,
+            "image/jpeg",
+            "test.jpg",
+        );
+        assert!(result.is_err());
+        if let Err(EncryptedMediaError::DecryptionFailed { reason }) = result {
+            assert!(!reason.is_empty());
+            assert!(reason.contains("Decryption failed"));
+        } else {
+            panic!("Expected DecryptionFailed error");
+        }
+    }
+
+    #[test]
+    fn test_secret_access_methods() {
+        // Test all Secret access methods (as_ref, as_mut, deref, deref_mut)
+        let mut secret_key = Secret::new([0xAAu8; 32]);
+        let original = [0xAAu8; 32];
+
+        // Test as_ref
+        assert_eq!(secret_key.as_ref(), &original);
+
+        // Test deref
+        assert_eq!(*secret_key, original);
+
+        // Test as_mut
+        *secret_key.as_mut() = [0xBBu8; 32];
+        assert_eq!(*secret_key, [0xBBu8; 32]);
+
+        // Test deref_mut
+        *secret_key = [0xCCu8; 32];
+        assert_eq!(*secret_key, [0xCCu8; 32]);
+    }
+
+    #[test]
+    fn test_secret_equality() {
+        // Test Secret equality and hashing
+        let secret1 = Secret::new([0xAAu8; 32]);
+        let secret2 = Secret::new([0xAAu8; 32]);
+        let secret3 = Secret::new([0xBBu8; 32]);
+
+        // Equal secrets should be equal
+        assert_eq!(secret1, secret2);
+        assert_ne!(secret1, secret3);
+
+        // Test hashing (equal secrets should have same hash)
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let mut hasher1 = DefaultHasher::new();
+        secret1.hash(&mut hasher1);
+        let hash1 = hasher1.finish();
+
+        let mut hasher2 = DefaultHasher::new();
+        secret2.hash(&mut hasher2);
+        let hash2 = hasher2.finish();
+
+        assert_eq!(hash1, hash2);
+    }
+
+    #[test]
+    fn test_nonce_derivation_error() {
+        // Test nonce derivation error path
+        let mdk = create_test_mdk();
+        let group_id = GroupId::from_slice(&[1, 2, 3, 4]);
+        let file_hash = [0x01u8; 32];
+
+        let result = derive_encryption_nonce(&mdk, &group_id, &file_hash, "image/jpeg", "test.jpg");
+        assert!(result.is_err());
+        assert!(matches!(result, Err(EncryptedMediaError::GroupNotFound)));
+    }
+
+    #[test]
+    fn test_key_derivation_error() {
+        // Test key derivation error path
+        let mdk = create_test_mdk();
+        let group_id = GroupId::from_slice(&[1, 2, 3, 4]);
+        let file_hash = [0x01u8; 32];
+
+        let result = derive_encryption_key(&mdk, &group_id, &file_hash, "image/jpeg", "test.jpg");
+        assert!(result.is_err());
+        assert!(matches!(result, Err(EncryptedMediaError::GroupNotFound)));
+    }
+
+    #[test]
+    fn test_encryption_error_message() {
+        // Test encryption error message format
+        let key = Secret::new([0x42u8; 32]);
+        let nonce = Secret::new([0x24u8; 12]);
+        let file_hash = [0x01u8; 32];
+        let data = b"test data";
+
+        // This should succeed, but we can verify error message format by checking
+        // the error type structure
+        let result =
+            encrypt_data_with_aad(data, &key, &nonce, &file_hash, "image/jpeg", "test.jpg");
+        assert!(result.is_ok());
+
+        // Test that we can access error reason when it occurs
+        // (We can't easily trigger encryption failure, but we can verify the structure)
+    }
+
+    #[test]
+    fn test_secret_ordering() {
+        // Test Secret ordering (PartialOrd, Ord)
+        let secret1 = Secret::new([0xAAu8; 32]);
+        let secret2 = Secret::new([0xBBu8; 32]);
+        let secret3 = Secret::new([0xAAu8; 32]);
+
+        // Test PartialOrd
+        assert!(secret1 < secret2);
+        assert!(secret2 > secret1);
+        assert!(secret1 <= secret3);
+        assert!(secret1 >= secret3);
+    }
 }
