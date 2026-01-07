@@ -972,7 +972,7 @@ mod tests {
             let config2 = EncryptionConfig::new(key);
             let storage2 = MdkSqliteStorage::new_with_key(&db_path, config2).unwrap();
 
-            let messages = storage2.messages(&mls_group_id).unwrap();
+            let messages = storage2.messages(&mls_group_id, None).unwrap();
             assert_eq!(messages.len(), 1);
             assert_eq!(messages[0].content, "Test message content");
         }
@@ -1234,7 +1234,7 @@ mod tests {
             let config2 = EncryptionConfig::new(key);
             let storage2 = MdkSqliteStorage::new_with_key(&db_path, config2).unwrap();
 
-            let messages = storage2.messages(&mls_group_id).unwrap();
+            let messages = storage2.messages(&mls_group_id, None).unwrap();
             assert_eq!(messages.len(), 1);
             assert_eq!(messages[0].content, large_content);
         }
@@ -1414,7 +1414,7 @@ mod tests {
             assert_eq!(group.name, "Тест группа 测试组");
             assert_eq!(group.description, "描述 описание");
 
-            let messages = storage2.messages(&mls_group_id).unwrap();
+            let messages = storage2.messages(&mls_group_id, None).unwrap();
             assert_eq!(messages[0].content, unicode_content);
         }
 
