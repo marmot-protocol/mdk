@@ -4193,4 +4193,259 @@ mod tests {
             .expect("Should get members");
         assert_eq!(members.len(), 2, "Member count should not change");
     }
+
+    /// Tests that pending_added_members_pubkeys returns empty when there are no pending proposals.
+    /// Note: pending_proposals() in MLS only contains proposals received via process_message,
+    /// not commits created locally. This test verifies the method works for empty groups.
+    #[test]
+    fn test_pending_added_members_pubkeys_empty() {
+        use crate::test_util::create_key_package_event;
+
+        let alice_keys = Keys::generate();
+        let bob_keys = Keys::generate();
+
+        let alice_mdk = create_test_mdk();
+        let bob_mdk = create_test_mdk();
+
+        let admins = vec![alice_keys.public_key()];
+
+        // Create key package for Bob
+        let bob_key_package = create_key_package_event(&bob_mdk, &bob_keys);
+
+        // Alice creates the group with Bob
+        let create_result = alice_mdk
+            .create_group(
+                &alice_keys.public_key(),
+                vec![bob_key_package],
+                create_nostr_group_config_data(admins),
+            )
+            .expect("Alice should create group");
+
+        let group_id = create_result.group.mls_group_id.clone();
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("Alice should merge commit");
+
+        // There should be no pending added members (proposals are from process_message)
+        let pending = alice_mdk
+            .pending_added_members_pubkeys(&group_id)
+            .expect("Should get pending added members");
+        assert!(
+            pending.is_empty(),
+            "No pending additions when no proposals have been received"
+        );
+    }
+
+    /// Tests that pending_removed_members_pubkeys shows members pending removal
+    /// when a self-leave proposal is received by a non-admin member.
+    #[test]
+    fn test_pending_removed_members_from_self_leave_proposal() {
+        use crate::test_util::create_key_package_event;
+
+        // Setup: Alice (admin), Bob (non-admin), Charlie (non-admin)
+        let alice_keys = Keys::generate();
+        let bob_keys = Keys::generate();
+        let charlie_keys = Keys::generate();
+
+        let alice_mdk = create_test_mdk();
+        let bob_mdk = create_test_mdk();
+        let charlie_mdk = create_test_mdk();
+
+        // Only Alice is admin
+        let admins = vec![alice_keys.public_key()];
+
+        // Create key packages
+        let bob_key_package = create_key_package_event(&bob_mdk, &bob_keys);
+        let charlie_key_package = create_key_package_event(&charlie_mdk, &charlie_keys);
+
+        // Alice creates the group with Bob and Charlie
+        let create_result = alice_mdk
+            .create_group(
+                &alice_keys.public_key(),
+                vec![bob_key_package, charlie_key_package],
+                create_nostr_group_config_data(admins),
+            )
+            .expect("Alice should create group");
+
+        let group_id = create_result.group.mls_group_id.clone();
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("Alice should merge commit");
+
+        // Bob and Charlie join the group
+        let bob_welcome = &create_result.welcome_rumors[0];
+        let charlie_welcome = &create_result.welcome_rumors[1];
+
+        let bob_welcome_preview = bob_mdk
+            .process_welcome(&nostr::EventId::all_zeros(), bob_welcome)
+            .expect("Bob should process welcome");
+        bob_mdk
+            .accept_welcome(&bob_welcome_preview)
+            .expect("Bob should accept welcome");
+
+        let charlie_welcome_preview = charlie_mdk
+            .process_welcome(&nostr::EventId::all_zeros(), charlie_welcome)
+            .expect("Charlie should process welcome");
+        charlie_mdk
+            .accept_welcome(&charlie_welcome_preview)
+            .expect("Charlie should accept welcome");
+
+        // Initially, Charlie has no pending removals
+        let pending_before = charlie_mdk
+            .pending_removed_members_pubkeys(&group_id)
+            .expect("Should get pending removed members");
+        assert!(pending_before.is_empty(), "No pending removals initially");
+
+        // Bob leaves the group (creates a leave proposal)
+        let bob_leave_result = bob_mdk
+            .leave_group(&group_id)
+            .expect("Bob should be able to leave");
+
+        // Charlie (non-admin) processes Bob's leave proposal
+        // This should store the proposal as pending (not auto-commit since Charlie is not admin)
+        let process_result = charlie_mdk.process_message(&bob_leave_result.evolution_event);
+        assert!(
+            process_result.is_ok(),
+            "Charlie should be able to process Bob's leave: {:?}",
+            process_result.err()
+        );
+
+        // Now Charlie should have Bob in pending removals
+        let pending_after = charlie_mdk
+            .pending_removed_members_pubkeys(&group_id)
+            .expect("Should get pending removed members");
+        assert_eq!(
+            pending_after.len(),
+            1,
+            "Should have one pending removal (Bob)"
+        );
+        assert_eq!(
+            pending_after[0],
+            bob_keys.public_key(),
+            "Pending removal should be Bob"
+        );
+    }
+
+    /// Tests that pending_member_changes returns empty when there are no pending proposals.
+    #[test]
+    fn test_pending_member_changes_empty() {
+        use crate::test_util::create_key_package_event;
+
+        let alice_keys = Keys::generate();
+        let bob_keys = Keys::generate();
+
+        let alice_mdk = create_test_mdk();
+        let bob_mdk = create_test_mdk();
+
+        // Create group with Alice as admin and Bob as member
+        let admins = vec![alice_keys.public_key()];
+        let bob_key_package = create_key_package_event(&bob_mdk, &bob_keys);
+
+        let create_result = alice_mdk
+            .create_group(
+                &alice_keys.public_key(),
+                vec![bob_key_package],
+                create_nostr_group_config_data(admins),
+            )
+            .expect("Alice should create group");
+
+        let group_id = create_result.group.mls_group_id.clone();
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("Alice should merge commit");
+
+        // There should be no pending changes
+        let changes = alice_mdk
+            .pending_member_changes(&group_id)
+            .expect("Should get pending member changes");
+        assert!(changes.additions.is_empty(), "No pending additions");
+        assert!(changes.removals.is_empty(), "No pending removals");
+    }
+
+    /// Tests that pending_member_changes shows pending removal from leave proposal.
+    #[test]
+    fn test_pending_member_changes_with_leave_proposal() {
+        use crate::test_util::create_key_package_event;
+
+        // Setup: Alice (admin), Bob (non-admin), Charlie (non-admin)
+        let alice_keys = Keys::generate();
+        let bob_keys = Keys::generate();
+        let charlie_keys = Keys::generate();
+
+        let alice_mdk = create_test_mdk();
+        let bob_mdk = create_test_mdk();
+        let charlie_mdk = create_test_mdk();
+
+        let admins = vec![alice_keys.public_key()];
+
+        let bob_key_package = create_key_package_event(&bob_mdk, &bob_keys);
+        let charlie_key_package = create_key_package_event(&charlie_mdk, &charlie_keys);
+
+        let create_result = alice_mdk
+            .create_group(
+                &alice_keys.public_key(),
+                vec![bob_key_package, charlie_key_package],
+                create_nostr_group_config_data(admins),
+            )
+            .expect("Alice should create group");
+
+        let group_id = create_result.group.mls_group_id.clone();
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("Alice should merge commit");
+
+        // Bob and Charlie join
+        let bob_welcome = &create_result.welcome_rumors[0];
+        let charlie_welcome = &create_result.welcome_rumors[1];
+
+        let bob_welcome_preview = bob_mdk
+            .process_welcome(&nostr::EventId::all_zeros(), bob_welcome)
+            .expect("Bob should process welcome");
+        bob_mdk
+            .accept_welcome(&bob_welcome_preview)
+            .expect("Bob should accept welcome");
+
+        let charlie_welcome_preview = charlie_mdk
+            .process_welcome(&nostr::EventId::all_zeros(), charlie_welcome)
+            .expect("Charlie should process welcome");
+        charlie_mdk
+            .accept_welcome(&charlie_welcome_preview)
+            .expect("Charlie should accept welcome");
+
+        // Bob leaves (creates proposal)
+        let bob_leave_result = bob_mdk.leave_group(&group_id).expect("Bob should leave");
+
+        // Charlie (non-admin) processes the leave proposal
+        charlie_mdk
+            .process_message(&bob_leave_result.evolution_event)
+            .expect("Charlie should process leave");
+
+        // Charlie should see Bob in pending removals
+        let changes = charlie_mdk
+            .pending_member_changes(&group_id)
+            .expect("Should get pending member changes");
+        assert!(changes.additions.is_empty(), "No pending additions");
+        assert_eq!(changes.removals.len(), 1, "Should have one pending removal");
+        assert_eq!(
+            changes.removals[0],
+            bob_keys.public_key(),
+            "Pending removal should be Bob"
+        );
+    }
+
+    /// Tests that pending member methods return error for non-existent group.
+    #[test]
+    fn test_pending_member_methods_group_not_found() {
+        let alice_mdk = create_test_mdk();
+        let fake_group_id = mdk_storage_traits::GroupId::from_slice(&[0u8; 16]);
+
+        let result = alice_mdk.pending_added_members_pubkeys(&fake_group_id);
+        assert!(result.is_err(), "Should error for non-existent group");
+
+        let result = alice_mdk.pending_removed_members_pubkeys(&fake_group_id);
+        assert!(result.is_err(), "Should error for non-existent group");
+
+        let result = alice_mdk.pending_member_changes(&fake_group_id);
+        assert!(result.is_err(), "Should error for non-existent group");
+    }
 }

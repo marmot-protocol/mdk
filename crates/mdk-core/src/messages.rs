@@ -3875,4 +3875,171 @@ mod tests {
             "Expected success when rumor pubkey matches credential"
         );
     }
+
+    /// Tests that self-leave proposals are auto-committed when processed by an admin.
+    /// Per the Marmot protocol, admins should auto-commit self-leave proposals.
+    #[test]
+    fn test_self_leave_proposal_auto_committed_by_admin() {
+        use crate::test_util::create_key_package_event;
+
+        // Setup: Alice (admin), Bob (non-admin member)
+        let alice_keys = Keys::generate();
+        let bob_keys = Keys::generate();
+
+        let alice_mdk = create_test_mdk();
+        let bob_mdk = create_test_mdk();
+
+        // Only Alice is admin
+        let admins = vec![alice_keys.public_key()];
+
+        let bob_key_package = create_key_package_event(&bob_mdk, &bob_keys);
+
+        let create_result = alice_mdk
+            .create_group(
+                &alice_keys.public_key(),
+                vec![bob_key_package],
+                create_nostr_group_config_data(admins),
+            )
+            .expect("Alice should create group");
+
+        let group_id = create_result.group.mls_group_id.clone();
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("Alice should merge commit");
+
+        // Bob joins the group
+        let bob_welcome = &create_result.welcome_rumors[0];
+        let bob_welcome_preview = bob_mdk
+            .process_welcome(&nostr::EventId::all_zeros(), bob_welcome)
+            .expect("Bob should process welcome");
+        bob_mdk
+            .accept_welcome(&bob_welcome_preview)
+            .expect("Bob should accept welcome");
+
+        // Bob leaves the group (creates a leave proposal)
+        let bob_leave_result = bob_mdk
+            .leave_group(&group_id)
+            .expect("Bob should be able to leave");
+
+        // Alice (admin) processes Bob's leave proposal
+        // This should auto-commit and return Proposal variant
+        let process_result = alice_mdk
+            .process_message(&bob_leave_result.evolution_event)
+            .expect("Alice should process Bob's leave");
+
+        // Verify it returns Proposal (indicating auto-commit happened)
+        assert!(
+            matches!(process_result, MessageProcessingResult::Proposal(_)),
+            "Admin processing self-leave should return Proposal (auto-committed), got: {:?}",
+            process_result
+        );
+
+        // Extract the commit event from the result
+        let commit_event = match process_result {
+            MessageProcessingResult::Proposal(update_result) => update_result.evolution_event,
+            _ => panic!("Expected Proposal variant"),
+        };
+
+        // The pending proposal is cleared after merge_pending_commit is called
+        // (which happens after the commit is published to relays)
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("Should merge pending commit");
+
+        // Verify no pending proposals remain after merge
+        let pending = alice_mdk
+            .pending_removed_members_pubkeys(&group_id)
+            .expect("Should get pending");
+        assert!(pending.is_empty(), "No pending removals after merge");
+
+        // Verify the commit event has the correct structure
+        assert_eq!(
+            commit_event.kind,
+            nostr::Kind::MlsGroupMessage,
+            "Commit event should be MLS group message"
+        );
+    }
+
+    /// Tests that self-leave proposals are stored as pending when processed by a non-admin.
+    /// Non-admin members cannot commit, so they store the proposal for later admin approval.
+    #[test]
+    fn test_self_leave_proposal_stored_pending_by_non_admin() {
+        use crate::test_util::create_key_package_event;
+
+        // Setup: Alice (admin), Bob (non-admin), Charlie (non-admin)
+        let alice_keys = Keys::generate();
+        let bob_keys = Keys::generate();
+        let charlie_keys = Keys::generate();
+
+        let alice_mdk = create_test_mdk();
+        let bob_mdk = create_test_mdk();
+        let charlie_mdk = create_test_mdk();
+
+        // Only Alice is admin
+        let admins = vec![alice_keys.public_key()];
+
+        let bob_key_package = create_key_package_event(&bob_mdk, &bob_keys);
+        let charlie_key_package = create_key_package_event(&charlie_mdk, &charlie_keys);
+
+        let create_result = alice_mdk
+            .create_group(
+                &alice_keys.public_key(),
+                vec![bob_key_package, charlie_key_package],
+                create_nostr_group_config_data(admins),
+            )
+            .expect("Alice should create group");
+
+        let group_id = create_result.group.mls_group_id.clone();
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("Alice should merge commit");
+
+        // Bob and Charlie join
+        let bob_welcome = &create_result.welcome_rumors[0];
+        let charlie_welcome = &create_result.welcome_rumors[1];
+
+        let bob_welcome_preview = bob_mdk
+            .process_welcome(&nostr::EventId::all_zeros(), bob_welcome)
+            .expect("Bob should process welcome");
+        bob_mdk
+            .accept_welcome(&bob_welcome_preview)
+            .expect("Bob should accept welcome");
+
+        let charlie_welcome_preview = charlie_mdk
+            .process_welcome(&nostr::EventId::all_zeros(), charlie_welcome)
+            .expect("Charlie should process welcome");
+        charlie_mdk
+            .accept_welcome(&charlie_welcome_preview)
+            .expect("Charlie should accept welcome");
+
+        // Bob leaves (creates proposal)
+        let bob_leave_result = bob_mdk.leave_group(&group_id).expect("Bob should leave");
+
+        // Charlie (non-admin) processes the leave proposal
+        // This should store as pending and return PendingProposal variant
+        let process_result = charlie_mdk
+            .process_message(&bob_leave_result.evolution_event)
+            .expect("Charlie should process leave");
+
+        // Verify it returns PendingProposal (indicating it was stored, not committed)
+        assert!(
+            matches!(
+                process_result,
+                MessageProcessingResult::PendingProposal { .. }
+            ),
+            "Non-admin processing self-leave should return PendingProposal, got: {:?}",
+            process_result
+        );
+
+        // Verify the proposal is now pending
+        let pending = charlie_mdk
+            .pending_removed_members_pubkeys(&group_id)
+            .expect("Should get pending");
+        assert_eq!(pending.len(), 1, "Bob should be in pending removals");
+        assert_eq!(
+            pending[0],
+            bob_keys.public_key(),
+            "Pending removal should be Bob"
+        );
+    }
 }
