@@ -18,18 +18,22 @@ CREATE TABLE IF NOT EXISTS messages_new (
     FOREIGN KEY (mls_group_id) REFERENCES groups(mls_group_id) ON DELETE CASCADE
 );
 
--- Step 2: Copy data from old table to new table
+-- Step 2: Clean up orphaned messages (those referencing nonexistent groups)
+-- This prevents migration failure when PRAGMA foreign_keys=ON
+DELETE FROM messages WHERE mls_group_id NOT IN (SELECT mls_group_id FROM groups);
+
+-- Step 3: Copy data from old table to new table
 INSERT INTO messages_new
 SELECT id, pubkey, kind, mls_group_id, created_at, content, tags, event, wrapper_event_id, state
 FROM messages;
 
--- Step 3: Drop old table
+-- Step 4: Drop old table
 DROP TABLE messages;
 
--- Step 4: Rename new table to original name
+-- Step 5: Rename new table to original name
 ALTER TABLE messages_new RENAME TO messages;
 
--- Step 5: Recreate indexes (they were dropped with the old table)
+-- Step 6: Recreate indexes (they were dropped with the old table)
 CREATE INDEX IF NOT EXISTS idx_messages_mls_group_id ON messages(mls_group_id);
 CREATE INDEX IF NOT EXISTS idx_messages_wrapper_event_id ON messages(wrapper_event_id);
 CREATE INDEX IF NOT EXISTS idx_messages_created_at ON messages(created_at);
