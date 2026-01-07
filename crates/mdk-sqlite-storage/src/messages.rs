@@ -390,14 +390,14 @@ mod tests {
 
         let message_1 = Message {
             id: same_event_id,
-            pubkey: pubkey.clone(),
+            pubkey,
             kind: Kind::from(1u16),
             mls_group_id: mls_group_id_1.clone(),
             created_at: Timestamp::now(),
             content: "Message in group 1".to_string(),
             tags: Tags::new(),
             event: UnsignedEvent::new(
-                pubkey.clone(),
+                pubkey,
                 Timestamp::now(),
                 Kind::from(9u16),
                 vec![],
@@ -409,14 +409,14 @@ mod tests {
 
         let message_2 = Message {
             id: same_event_id,
-            pubkey: pubkey.clone(),
+            pubkey,
             kind: Kind::from(1u16),
             mls_group_id: mls_group_id_2.clone(),
             created_at: Timestamp::now(),
             content: "Message in group 2".to_string(),
             tags: Tags::new(),
             event: UnsignedEvent::new(
-                pubkey.clone(),
+                pubkey,
                 Timestamp::now(),
                 Kind::from(9u16),
                 vec![],
