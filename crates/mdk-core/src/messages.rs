@@ -42,8 +42,16 @@ const DEFAULT_EPOCH_LOOKBACK: u64 = 5;
 pub enum MessageProcessingResult {
     /// An application message (this is usually a message in a chat)
     ApplicationMessage(message_types::Message),
-    /// Proposal message
+    /// Proposal message that was auto-committed by an admin receiver
     Proposal(UpdateGroupResult),
+    /// Pending proposal message stored but not committed (receiver is not admin)
+    ///
+    /// When a non-admin member receives a proposal, it is stored as pending but not
+    /// auto-committed. An admin must later commit the pending proposals.
+    PendingProposal {
+        /// The MLS group ID this pending proposal belongs to
+        mls_group_id: GroupId,
+    },
     /// External Join Proposal
     ExternalJoinProposal {
         /// The MLS group ID this proposal belongs to
@@ -415,11 +423,12 @@ where
     /// Processes a proposal message from a group member
     ///
     /// This internal function handles MLS proposal messages (add/remove member proposals).
-    /// Only admin members are allowed to submit proposals. The function:
-    /// 1. Validates the sender is a group member and has admin privileges
+    /// Any group member can submit proposals (per Marmot protocol specification), but only
+    /// admins can commit them. The function:
+    /// 1. Validates the sender is a group member
     /// 2. Stores the pending proposal in the MLS group state
-    /// 3. Automatically commits the proposal to the group
-    /// 4. Creates a new encrypted event for the commit message
+    /// 3. If the receiver (self) is an admin, automatically commits the proposal
+    /// 4. If the receiver is not an admin, stores the proposal as pending
     /// 5. Updates processing state to prevent reprocessing
     ///
     /// # Arguments
@@ -430,29 +439,34 @@ where
     ///
     /// # Returns
     ///
-    /// * `Ok(UpdateGroupResult)` - Contains the commit event and any welcome messages
-    /// * `Err(Error)` - If proposal processing fails or sender lacks permissions
+    /// * `Ok(MessageProcessingResult::Proposal)` - If admin, contains the commit event
+    /// * `Ok(MessageProcessingResult::PendingProposal)` - If not admin, proposal stored as pending
+    /// * `Err(Error)` - If proposal processing fails or sender is not a member
     fn process_proposal_message_for_group(
         &self,
         mls_group: &mut MlsGroup,
         event: &Event,
         staged_proposal: QueuedProposal,
-    ) -> Result<UpdateGroupResult> {
+    ) -> Result<MessageProcessingResult> {
         match staged_proposal.sender() {
             Sender::Member(leaf_index) => {
                 let member = mls_group.member_at(*leaf_index);
 
                 match member {
-                    Some(member) => {
-                        // Only process proposals from admins for now
-                        if self.is_member_admin(&mls_group.group_id().into(), &member)? {
-                            mls_group
-                                .store_pending_proposal(self.provider.storage(), staged_proposal)
-                                .map_err(|e| Error::Message(e.to_string()))?;
+                    Some(_member) => {
+                        // Any member can submit proposals - store it first
+                        mls_group
+                            .store_pending_proposal(self.provider.storage(), staged_proposal)
+                            .map_err(|e| Error::Message(e.to_string()))?;
 
-                            let _added_members =
-                                self.pending_added_members_pubkeys(&mls_group.group_id().into())?;
+                        let group_id: GroupId = mls_group.group_id().into();
 
+                        // Check if the receiver (self) is an admin - only admins can commit
+                        let own_leaf = mls_group.own_leaf().ok_or(Error::OwnLeafNotFound)?;
+                        let receiver_is_admin = self.is_leaf_node_admin(&group_id, own_leaf)?;
+
+                        if receiver_is_admin {
+                            // Admin receiver: auto-commit the proposal
                             let mls_signer = self.load_mls_signer(mls_group)?;
 
                             let (commit_message, welcomes_option, _group_info) = mls_group
@@ -463,7 +477,7 @@ where
                                 .map_err(|e| Error::Group(e.to_string()))?;
 
                             let commit_event = self.build_encrypted_message_event(
-                                &mls_group.group_id().into(),
+                                &group_id,
                                 serialized_commit_message,
                             )?;
 
@@ -491,13 +505,35 @@ where
                                 .save_processed_message(processed_message)
                                 .map_err(|e| Error::Message(e.to_string()))?;
 
-                            Ok(UpdateGroupResult {
+                            Ok(MessageProcessingResult::Proposal(UpdateGroupResult {
                                 evolution_event: commit_event,
                                 welcome_rumors,
-                                mls_group_id: mls_group.group_id().into(),
-                            })
+                                mls_group_id: group_id,
+                            }))
                         } else {
-                            Err(Error::ProposalFromNonAdmin)
+                            // Non-admin receiver: store proposal as pending, don't commit
+                            tracing::debug!(
+                                target: "mdk_core::messages::process_proposal_message_for_group",
+                                "Non-admin receiver stored proposal as pending for group {:?}",
+                                group_id
+                            );
+
+                            // Save a processed message so we don't reprocess
+                            let processed_message = message_types::ProcessedMessage {
+                                wrapper_event_id: event.id,
+                                message_event_id: None,
+                                processed_at: Timestamp::now(),
+                                state: message_types::ProcessedMessageState::Processed,
+                                failure_reason: None,
+                            };
+
+                            self.storage()
+                                .save_processed_message(processed_message)
+                                .map_err(|e| Error::Message(e.to_string()))?;
+
+                            Ok(MessageProcessingResult::PendingProposal {
+                                mls_group_id: group_id,
+                            })
                         }
                     }
                     None => {
@@ -696,13 +732,7 @@ where
                         ))
                     }
                     ProcessedMessageContent::ProposalMessage(staged_proposal) => {
-                        Ok(MessageProcessingResult::Proposal(
-                            self.process_proposal_message_for_group(
-                                mls_group,
-                                event,
-                                *staged_proposal,
-                            )?,
-                        ))
+                        self.process_proposal_message_for_group(mls_group, event, *staged_proposal)
                     }
                     ProcessedMessageContent::StagedCommitMessage(staged_commit) => {
                         self.process_commit_message_for_group(mls_group, event, *staged_commit)?;
@@ -1391,6 +1421,10 @@ mod tests {
         let unprocessable_result = MessageProcessingResult::Unprocessable {
             mls_group_id: test_group_id.clone(),
         };
+        // PendingProposal: for when a non-admin receiver stores a proposal without committing
+        let pending_proposal_result = MessageProcessingResult::PendingProposal {
+            mls_group_id: test_group_id.clone(),
+        };
 
         // Test that we can match on variants
         match app_result {
@@ -1411,6 +1445,11 @@ mod tests {
         match unprocessable_result {
             MessageProcessingResult::Unprocessable { .. } => {}
             _ => panic!("Expected Unprocessable variant"),
+        }
+
+        match pending_proposal_result {
+            MessageProcessingResult::PendingProposal { .. } => {}
+            _ => panic!("Expected PendingProposal variant"),
         }
     }
 

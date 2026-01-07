@@ -215,30 +215,6 @@ where
         let group_data = NostrGroupDataExtension::from_group(&mls_group)?;
         Ok(group_data.admins.contains(&pubkey))
     }
-
-    /// Checks if the Member is an admin of an MLS group
-    ///
-    /// # Arguments
-    ///
-    /// * `group_id` - The MLS group ID
-    /// * `member` - The member to check as an admin
-    ///
-    /// # Returns
-    ///
-    /// * `Ok(true)` - The member is an admin
-    /// * `Ok(false)` - The member is not an admin
-    /// * `Err(Error)` - If the public key cannot be extracted or the group is not found
-    pub(crate) fn is_member_admin(
-        &self,
-        group_id: &GroupId,
-        member: &Member,
-    ) -> Result<bool, Error> {
-        let pubkey = self.pubkey_for_member(member)?;
-        let mls_group = self.load_mls_group(group_id)?.ok_or(Error::GroupNotFound)?;
-        let group_data = NostrGroupDataExtension::from_group(&mls_group)?;
-        Ok(group_data.admins.contains(&pubkey))
-    }
-
     /// Extracts the public key from a leaf node
     ///
     /// # Arguments
@@ -437,45 +413,6 @@ where
             acc.insert(public_key);
             Ok(acc)
         })
-    }
-
-    /// Gets the public keys of members that will be added from pending proposals in an MLS group
-    ///
-    /// This helper method loads an MLS group and examines its pending proposals to identify
-    /// any Add proposals that would add new members to the group. For each new member,
-    /// it extracts their public key from their LeafNode.
-    ///
-    /// # Arguments
-    ///
-    /// * `group_id` - The MLS group ID to examine for pending proposals
-    ///
-    /// # Returns
-    ///
-    /// * `Ok(Vec<PublicKey>)` - List of public keys for newly added members in pending proposals
-    /// * `Err(Error)` - If there's an error loading the group or extracting member information
-    pub(crate) fn pending_added_members_pubkeys(
-        &self,
-        group_id: &GroupId,
-    ) -> Result<Vec<PublicKey>, Error> {
-        // Load the MLS group
-        let mls_group = self.load_mls_group(group_id)?.ok_or(Error::GroupNotFound)?;
-
-        let mut added_pubkeys = Vec::new();
-
-        // Get pending proposals from the group
-        let pending_proposals = mls_group.pending_proposals();
-
-        // Extract public keys from Add proposals
-        for proposal in pending_proposals {
-            if let Proposal::Add(add_proposal) = proposal.proposal() {
-                // Extract the public key from the LeafNode using the same pattern as other methods
-                let leaf_node = add_proposal.key_package().leaf_node();
-                let pubkey = self.pubkey_for_leaf_node(leaf_node)?;
-                added_pubkeys.push(pubkey);
-            }
-        }
-
-        Ok(added_pubkeys)
     }
 
     /// Add members to a group
@@ -1779,39 +1716,25 @@ mod tests {
             .merge_pending_commit(group_id)
             .expect("Failed to merge pending commit");
 
-        // Get the MLS group to access members
+        // Get the MLS group to access leaf nodes
         let mls_group = creator_mdk
             .load_mls_group(group_id)
             .expect("Failed to load MLS group")
             .expect("MLS group should exist");
 
-        // Find Alice's and Bob's members
-        let members: Vec<_> = mls_group.members().collect();
-        let alice_member = members
-            .iter()
-            .find(|m| creator_mdk.pubkey_for_member(m).unwrap() == alice_pk)
-            .expect("Alice should be a member");
-        let bob_member = members
-            .iter()
-            .find(|m| creator_mdk.pubkey_for_member(m).unwrap() == bob_pk)
-            .expect("Bob should be a member");
+        // Get Alice's leaf node (she's the creator/own leaf)
+        let alice_leaf = mls_group.own_leaf().expect("Group should have own leaf");
 
-        // Verify initial state: Alice is admin, Bob is not
+        // Verify initial state: Alice is admin per MLS state
         assert!(
             creator_mdk
-                .is_member_admin(&group_id.clone(), alice_member)
+                .is_leaf_node_admin(&group_id.clone(), alice_leaf)
                 .unwrap(),
             "Alice should be admin in MLS state"
         );
-        assert!(
-            !creator_mdk
-                .is_member_admin(&group_id.clone(), bob_member)
-                .unwrap(),
-            "Bob should NOT be admin in MLS state"
-        );
 
         // Now simulate stale storage by directly modifying stored_group.admin_pubkeys
-        // to include Bob as an admin (even though MLS state doesn't have him as admin)
+        // to remove Alice as admin (even though MLS state has her as admin)
         let mut stored_group = creator_mdk
             .get_group(group_id)
             .expect("Failed to get group")
@@ -1842,23 +1765,8 @@ mod tests {
             "Stale storage should NOT have Alice as admin"
         );
 
-        // The critical test: is_member_admin should read from MLS state, NOT stale storage
-        // So Alice should still be admin (per MLS state) and Bob should not be admin (per MLS state)
-        assert!(
-            creator_mdk
-                .is_member_admin(&group_id.clone(), alice_member)
-                .unwrap(),
-            "Alice should be admin per MLS state, even though stale storage says otherwise"
-        );
-        assert!(
-            !creator_mdk
-                .is_member_admin(&group_id.clone(), bob_member)
-                .unwrap(),
-            "Bob should NOT be admin per MLS state, even though stale storage says he is"
-        );
-
-        // Also test with leaf nodes directly
-        let alice_leaf = mls_group.own_leaf().expect("Group should have own leaf");
+        // The critical test: is_leaf_node_admin should read from MLS state, NOT stale storage
+        // Alice should still be admin (per MLS state) even though stale storage says otherwise
         assert!(
             creator_mdk
                 .is_leaf_node_admin(&group_id.clone(), alice_leaf)

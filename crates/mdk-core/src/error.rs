@@ -160,9 +160,6 @@ pub enum Error {
     /// Stored message not found
     #[error("stored message not found")]
     MessageNotFound,
-    /// Proposal message received from a non-admin
-    #[error("not processing proposal from non-admin")]
-    ProposalFromNonAdmin,
     /// Commit message received from a non-admin
     #[error("not processing commit from non-admin")]
     CommitFromNonAdmin,

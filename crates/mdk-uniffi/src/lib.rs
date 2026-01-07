@@ -745,6 +745,11 @@ impl Mdk {
                     },
                 }
             }
+            MessageProcessingResult::PendingProposal { mls_group_id } => {
+                ProcessMessageResult::PendingProposal {
+                    mls_group_id: hex::encode(mls_group_id.as_slice()),
+                }
+            }
             MessageProcessingResult::ExternalJoinProposal { mls_group_id } => {
                 ProcessMessageResult::ExternalJoinProposal {
                     mls_group_id: hex::encode(mls_group_id.as_slice()),
@@ -818,10 +823,15 @@ pub enum ProcessMessageResult {
         /// The processed message
         message: Message,
     },
-    /// A proposal message (add/remove member proposal)
+    /// A proposal message that was auto-committed by an admin receiver
     Proposal {
         /// The proposal result containing evolution event and welcome rumors
         result: UpdateGroupResult,
+    },
+    /// A pending proposal stored but not committed (receiver is not admin)
+    PendingProposal {
+        /// Hex-encoded MLS group ID this pending proposal belongs to
+        mls_group_id: String,
     },
     /// External join proposal
     ExternalJoinProposal {
