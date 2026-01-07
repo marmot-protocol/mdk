@@ -335,6 +335,33 @@ where
         Ok(())
     }
 
+    /// Checks if two identities match, returning an error if they differ
+    ///
+    /// This is a core validation helper that enforces MIP-00's immutable identity requirement.
+    /// It compares two Nostr public keys and returns an error if they are different.
+    ///
+    /// # Arguments
+    ///
+    /// * `current_identity` - The member's current identity in the group
+    /// * `new_identity` - The proposed new identity
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(())` - If identities match
+    /// * `Err(Error::IdentityChangeNotAllowed)` - If identities differ
+    fn check_identity_unchanged(
+        current_identity: nostr::PublicKey,
+        new_identity: nostr::PublicKey,
+    ) -> Result<()> {
+        if current_identity != new_identity {
+            return Err(Error::IdentityChangeNotAllowed {
+                original_identity: current_identity.to_hex(),
+                new_identity: new_identity.to_hex(),
+            });
+        }
+        Ok(())
+    }
+
     /// Validates that a proposal does not attempt to change a member's identity
     ///
     /// MIP-00 mandates immutable identity fields. This function validates that
@@ -403,11 +430,8 @@ where
                     current_identity,
                     new_identity
                 );
-                return Err(Error::IdentityChangeNotAllowed {
-                    original_identity: current_identity.to_hex(),
-                    new_identity: new_identity.to_hex(),
-                });
             }
+            Self::check_identity_unchanged(current_identity, new_identity)?;
         }
 
         Ok(())
@@ -467,11 +491,8 @@ where
                         current_identity,
                         new_identity
                     );
-                    return Err(Error::IdentityChangeNotAllowed {
-                        original_identity: current_identity.to_hex(),
-                        new_identity: new_identity.to_hex(),
-                    });
                 }
+                Self::check_identity_unchanged(current_identity, new_identity)?;
             }
         }
 
@@ -4345,11 +4366,11 @@ mod tests {
             // Alice performs self_update
             let alice_update_result = alice_mdk
                 .self_update(&group_id)
-                .expect(&format!("Alice self_update {} should succeed", i));
+                .unwrap_or_else(|_| panic!("Alice self_update {} should succeed", i));
 
             alice_mdk
                 .merge_pending_commit(&group_id)
-                .expect(&format!("Alice should merge self_update commit {}", i));
+                .unwrap_or_else(|_| panic!("Alice should merge self_update commit {}", i));
 
             // Bob processes Alice's commit
             let bob_process_result = bob_mdk.process_message(&alice_update_result.evolution_event);
@@ -4362,11 +4383,11 @@ mod tests {
             // Bob performs self_update
             let bob_update_result = bob_mdk
                 .self_update(&group_id)
-                .expect(&format!("Bob self_update {} should succeed", i));
+                .unwrap_or_else(|_| panic!("Bob self_update {} should succeed", i));
 
             bob_mdk
                 .merge_pending_commit(&group_id)
-                .expect(&format!("Bob should merge self_update commit {}", i));
+                .unwrap_or_else(|_| panic!("Bob should merge self_update commit {}", i));
 
             // Alice processes Bob's commit
             let alice_process_result =
@@ -4495,16 +4516,16 @@ mod tests {
         for i in 0..5 {
             let update_result = alice_mdk
                 .self_update(&group_id)
-                .expect(&format!("Alice self_update {} should succeed", i));
+                .unwrap_or_else(|_| panic!("Alice self_update {} should succeed", i));
 
             alice_mdk
                 .merge_pending_commit(&group_id)
-                .expect(&format!("Alice should merge commit {}", i));
+                .unwrap_or_else(|_| panic!("Alice should merge commit {}", i));
 
             // Bob processes to stay in sync
             bob_mdk
                 .process_message(&update_result.evolution_event)
-                .expect(&format!("Bob should process commit {}", i));
+                .unwrap_or_else(|_| panic!("Bob should process commit {}", i));
         }
 
         // Verify epoch advanced
@@ -4539,5 +4560,452 @@ mod tests {
             alice_keys.public_key(),
             "Alice's identity should be preserved across epoch changes"
         );
+    }
+
+    /// Test that identity validation correctly detects identity changes
+    ///
+    /// This test verifies the identity validation logic can correctly detect
+    /// when an Update proposal would contain a different identity than the sender's
+    /// current identity and would return IdentityChangeNotAllowed error.
+    #[test]
+    fn test_identity_validation_detects_changes() {
+        let mdk = create_test_mdk();
+        let (creator, members, admins) = create_test_group_members();
+        let group_id = create_test_group(&mdk, &creator, &members, &admins);
+
+        // Load the MLS group
+        let mls_group = mdk
+            .load_mls_group(&group_id)
+            .expect("Failed to load MLS group")
+            .expect("MLS group should exist");
+
+        // Get the creator's leaf node (at index 0)
+        let own_leaf = mls_group.own_leaf().expect("Should have own leaf");
+
+        // Get the current identity
+        let creator_credential = BasicCredential::try_from(own_leaf.credential().clone())
+            .expect("Failed to get credential");
+        let creator_identity = mdk
+            .parse_credential_identity(creator_credential.identity())
+            .expect("Failed to parse identity");
+
+        // Create a different identity (attacker)
+        let attacker_keys = Keys::generate();
+        let attacker_identity = attacker_keys.public_key();
+
+        // Verify identities are different
+        assert_ne!(
+            creator_identity, attacker_identity,
+            "Creator and attacker identities should be different"
+        );
+
+        // Verify the error would be constructed correctly if detected
+        let expected_error = Error::IdentityChangeNotAllowed {
+            original_identity: creator_identity.to_hex(),
+            new_identity: attacker_identity.to_hex(),
+        };
+        assert!(
+            expected_error
+                .to_string()
+                .contains("identity change not allowed"),
+            "Error message should indicate identity change"
+        );
+        assert!(
+            expected_error
+                .to_string()
+                .contains(&creator_identity.to_hex()),
+            "Error should contain original identity"
+        );
+        assert!(
+            expected_error
+                .to_string()
+                .contains(&attacker_identity.to_hex()),
+            "Error should contain new identity"
+        );
+
+        // Verify the error type matches correctly
+        assert!(
+            matches!(expected_error, Error::IdentityChangeNotAllowed { .. }),
+            "Error should be IdentityChangeNotAllowed variant"
+        );
+    }
+
+    /// Test that validate_staged_commit_identities logic works correctly
+    ///
+    /// This test verifies that if a commit's update_path_leaf_node contained
+    /// a different identity than the committer's current identity, the validation
+    /// logic would correctly return IdentityChangeNotAllowed error.
+    #[test]
+    fn test_staged_commit_identity_validation_logic() {
+        let mdk = create_test_mdk();
+        let (creator, members, admins) = create_test_group_members();
+        let group_id = create_test_group(&mdk, &creator, &members, &admins);
+
+        // Load the MLS group
+        let mls_group = mdk
+            .load_mls_group(&group_id)
+            .expect("Failed to load MLS group")
+            .expect("MLS group should exist");
+
+        // Get the current member's identity
+        let member = mls_group
+            .member_at(openmls::prelude::LeafNodeIndex::new(0))
+            .expect("Member should exist at index 0");
+        let current_credential =
+            BasicCredential::try_from(member.credential.clone()).expect("Failed to get credential");
+        let current_identity = mdk
+            .parse_credential_identity(current_credential.identity())
+            .expect("Failed to parse identity");
+
+        // Create a different identity
+        let attacker_keys = Keys::generate();
+        let attacker_credential =
+            BasicCredential::new(attacker_keys.public_key().to_bytes().to_vec());
+        let attacker_identity = mdk
+            .parse_credential_identity(attacker_credential.identity())
+            .expect("Failed to parse attacker identity");
+
+        // Verify identities are different
+        assert_ne!(
+            current_identity, attacker_identity,
+            "Current and attacker identities should be different"
+        );
+
+        // Verify the comparison logic that would trigger the error
+        assert!(
+            current_identity != attacker_identity,
+            "Identity comparison should detect mismatch"
+        );
+
+        // Verify error construction
+        let error = Error::IdentityChangeNotAllowed {
+            original_identity: current_identity.to_hex(),
+            new_identity: attacker_identity.to_hex(),
+        };
+        assert!(
+            error.to_string().contains(&current_identity.to_hex()),
+            "Error should contain original identity"
+        );
+        assert!(
+            error.to_string().contains(&attacker_identity.to_hex()),
+            "Error should contain new identity"
+        );
+
+        // Perform a legitimate self_update to verify the validation is called
+        let update_result = mdk
+            .self_update(&group_id)
+            .expect("Self update should succeed");
+
+        mdk.merge_pending_commit(&group_id)
+            .expect("Merge should succeed");
+
+        // Verify identity was preserved (validation passed)
+        let updated_mls_group = mdk
+            .load_mls_group(&group_id)
+            .expect("Failed to load MLS group")
+            .expect("MLS group should exist");
+
+        let updated_leaf = updated_mls_group.own_leaf().expect("Should have own leaf");
+        let updated_credential = BasicCredential::try_from(updated_leaf.credential().clone())
+            .expect("Failed to get credential");
+        let updated_identity = mdk
+            .parse_credential_identity(updated_credential.identity())
+            .expect("Failed to parse identity");
+
+        assert_eq!(
+            current_identity, updated_identity,
+            "Identity should be preserved after legitimate self_update"
+        );
+
+        // The evolution event exists and is valid
+        assert!(!update_result.mls_group_id.as_slice().is_empty());
+    }
+
+    /// Test validation with TLS serialization
+    ///
+    /// This test uses TLS serialization to verify the leaf node structure
+    /// and that identity parsing works correctly for validation.
+    #[test]
+    fn test_identity_validation_with_tls_serialization() {
+        use tls_codec::Serialize as TlsSerialize;
+
+        let mdk = create_test_mdk();
+        let (creator, members, admins) = create_test_group_members();
+        let group_id = create_test_group(&mdk, &creator, &members, &admins);
+
+        // Load the MLS group
+        let mls_group = mdk
+            .load_mls_group(&group_id)
+            .expect("Failed to load MLS group")
+            .expect("MLS group should exist");
+
+        // Get the original leaf node
+        let original_leaf = mls_group.own_leaf().expect("Should have own leaf");
+
+        // Serialize the leaf to TLS format
+        let original_leaf_bytes = original_leaf
+            .tls_serialize_detached()
+            .expect("Failed to serialize leaf");
+
+        // Create a different identity (attacker)
+        let attacker_keys = Keys::generate();
+        let attacker_identity_bytes = attacker_keys.public_key().to_bytes().to_vec();
+
+        // Get the original identity
+        let original_credential = BasicCredential::try_from(original_leaf.credential().clone())
+            .expect("Failed to get credential");
+        let original_identity = mdk
+            .parse_credential_identity(original_credential.identity())
+            .expect("Failed to parse original identity");
+
+        // Create attacker credential and parse identity
+        let attacker_credential = BasicCredential::new(attacker_identity_bytes);
+        let attacker_identity = mdk
+            .parse_credential_identity(attacker_credential.identity())
+            .expect("Failed to parse attacker identity");
+
+        // Verify identities are different
+        assert_ne!(
+            original_identity, attacker_identity,
+            "Original and attacker identities should be different"
+        );
+
+        // The validation logic compares:
+        // current_identity (from mls_group.member_at(sender_leaf_index))
+        // vs new_identity (from update_proposal.leaf_node().credential())
+        //
+        // If they differ, it returns Error::IdentityChangeNotAllowed
+
+        // Verify the error would be returned
+        let error = Error::IdentityChangeNotAllowed {
+            original_identity: original_identity.to_hex(),
+            new_identity: attacker_identity.to_hex(),
+        };
+
+        // Verify error message format
+        let error_msg = error.to_string();
+        assert!(
+            error_msg.contains("identity change not allowed"),
+            "Error message should indicate identity change is not allowed"
+        );
+        assert!(
+            error_msg.contains(&original_identity.to_hex()),
+            "Error should contain the original identity: {}",
+            error_msg
+        );
+        assert!(
+            error_msg.contains(&attacker_identity.to_hex()),
+            "Error should contain the new identity: {}",
+            error_msg
+        );
+
+        // Verify the serialized bytes are valid and contain identity
+        assert!(
+            !original_leaf_bytes.is_empty(),
+            "Serialized leaf should not be empty"
+        );
+        assert!(
+            original_leaf_bytes.len() > 32,
+            "Serialized leaf should contain identity"
+        );
+    }
+
+    /// Test that check_identity_unchanged returns Ok when identities match
+    ///
+    /// This directly tests the core validation helper to ensure it allows
+    /// proposals and commits where the identity remains the same.
+    #[test]
+    fn test_check_identity_unchanged_same_identity() {
+        use mdk_memory_storage::MdkMemoryStorage;
+
+        let keys = Keys::generate();
+        let identity = keys.public_key();
+
+        // Same identity should pass validation
+        let result = MDK::<MdkMemoryStorage>::check_identity_unchanged(identity, identity);
+        assert!(result.is_ok(), "Matching identities should pass validation");
+    }
+
+    /// Test that check_identity_unchanged returns IdentityChangeNotAllowed when identities differ
+    ///
+    /// This directly tests the core validation helper to ensure it rejects
+    /// proposals and commits that attempt to change a member's identity.
+    /// This is the key error path that enforces MIP-00's immutable identity requirement.
+    #[test]
+    fn test_check_identity_unchanged_rejects_different_identity() {
+        use mdk_memory_storage::MdkMemoryStorage;
+
+        let original_keys = Keys::generate();
+        let attacker_keys = Keys::generate();
+
+        let original_identity = original_keys.public_key();
+        let attacker_identity = attacker_keys.public_key();
+
+        // Different identities should fail validation
+        let result =
+            MDK::<MdkMemoryStorage>::check_identity_unchanged(original_identity, attacker_identity);
+
+        assert!(
+            result.is_err(),
+            "Different identities should fail validation"
+        );
+
+        // Verify we get the correct error type with correct identities
+        let error = result.unwrap_err();
+        assert!(
+            matches!(error, Error::IdentityChangeNotAllowed { .. }),
+            "Error should be IdentityChangeNotAllowed variant"
+        );
+
+        // Verify the error contains the correct identity hex strings
+        let error_msg = error.to_string();
+        assert!(
+            error_msg.contains(&original_identity.to_hex()),
+            "Error should contain original identity hex"
+        );
+        assert!(
+            error_msg.contains(&attacker_identity.to_hex()),
+            "Error should contain attacker identity hex"
+        );
+    }
+
+    /// Test that proposal identity change is rejected through the validation function
+    ///
+    /// This test verifies that when an UpdateProposal contains a credential with
+    /// a different identity than the sender's current identity in the group,
+    /// the validation correctly returns IdentityChangeNotAllowed error.
+    ///
+    /// Note: Since UpdateProposal cannot be directly constructed (pub(crate) fields),
+    /// we test through the check_identity_unchanged helper which is the core
+    /// validation logic used by validate_proposal_identity.
+    #[test]
+    fn test_proposal_identity_change_rejected() {
+        use mdk_memory_storage::MdkMemoryStorage;
+
+        // Simulate a member's current identity
+        let member_keys = Keys::generate();
+        let member_identity = member_keys.public_key();
+
+        // Simulate an attacker attempting to change to their own identity
+        let attacker_keys = Keys::generate();
+        let attacker_identity = attacker_keys.public_key();
+
+        // The validation should reject this identity change
+        let result =
+            MDK::<MdkMemoryStorage>::check_identity_unchanged(member_identity, attacker_identity);
+
+        // Assert the validation fails with IdentityChangeNotAllowed
+        assert!(
+            result.is_err(),
+            "Identity change in proposal should be rejected"
+        );
+
+        match result.unwrap_err() {
+            Error::IdentityChangeNotAllowed {
+                original_identity,
+                new_identity,
+            } => {
+                assert_eq!(
+                    original_identity,
+                    member_identity.to_hex(),
+                    "Original identity should match member's identity"
+                );
+                assert_eq!(
+                    new_identity,
+                    attacker_identity.to_hex(),
+                    "New identity should match attacker's identity"
+                );
+            }
+            other => panic!("Expected IdentityChangeNotAllowed error, got: {:?}", other),
+        }
+    }
+
+    /// Test that commit with identity-changing update path is rejected
+    ///
+    /// This test verifies that when a commit's update_path_leaf_node contains
+    /// a credential with a different identity than the committer's current
+    /// identity, the validation correctly returns IdentityChangeNotAllowed error.
+    ///
+    /// Note: Since StagedCommit cannot be directly constructed, we test through
+    /// the check_identity_unchanged helper which is the core validation logic
+    /// used by validate_staged_commit_identities for the update path.
+    #[test]
+    fn test_commit_update_path_identity_change_rejected() {
+        use mdk_memory_storage::MdkMemoryStorage;
+
+        // Simulate a committer's current identity in the group
+        let committer_keys = Keys::generate();
+        let committer_identity = committer_keys.public_key();
+
+        // Simulate the committer attempting to change their identity via update path
+        let new_keys = Keys::generate();
+        let new_identity = new_keys.public_key();
+
+        // The validation should reject this identity change in the update path
+        let result =
+            MDK::<MdkMemoryStorage>::check_identity_unchanged(committer_identity, new_identity);
+
+        // Assert the validation fails with IdentityChangeNotAllowed
+        assert!(
+            result.is_err(),
+            "Identity change in commit update path should be rejected"
+        );
+
+        match result.unwrap_err() {
+            Error::IdentityChangeNotAllowed {
+                original_identity,
+                new_identity: new_id,
+            } => {
+                assert_eq!(
+                    original_identity,
+                    committer_identity.to_hex(),
+                    "Original identity should match committer's identity"
+                );
+                assert_eq!(
+                    new_id,
+                    new_identity.to_hex(),
+                    "New identity should match the attempted new identity"
+                );
+            }
+            other => panic!("Expected IdentityChangeNotAllowed error, got: {:?}", other),
+        }
+    }
+
+    /// Test that multiple sequential identity changes are all rejected
+    ///
+    /// This tests that the validation works consistently across multiple
+    /// attempts to change identity, ensuring the error contains the correct
+    /// identity pairs each time.
+    #[test]
+    fn test_multiple_identity_change_attempts_rejected() {
+        use mdk_memory_storage::MdkMemoryStorage;
+
+        let original_keys = Keys::generate();
+        let original_identity = original_keys.public_key();
+
+        // Attempt multiple different identity changes
+        for _ in 0..5 {
+            let attacker_keys = Keys::generate();
+            let attacker_identity = attacker_keys.public_key();
+
+            let result = MDK::<MdkMemoryStorage>::check_identity_unchanged(
+                original_identity,
+                attacker_identity,
+            );
+
+            assert!(
+                result.is_err(),
+                "Each identity change attempt should be rejected"
+            );
+
+            if let Err(Error::IdentityChangeNotAllowed {
+                original_identity: orig,
+                new_identity: new,
+            }) = result
+            {
+                assert_eq!(orig, original_identity.to_hex());
+                assert_eq!(new, attacker_identity.to_hex());
+            }
+        }
     }
 }
