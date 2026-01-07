@@ -1175,24 +1175,24 @@ where
         let mls_group = self.load_mls_group(group_id)?.ok_or(Error::GroupNotFound)?;
         let mut stored_group = self.get_group(group_id)?.ok_or(Error::GroupNotFound)?;
 
-        // Update epoch from MLS group
+        // Validate the mandatory group-data extension FIRST before making any state changes
+        // This ensures we don't update stored_group if the extension is missing, invalid, or unsupported
+        let group_data = NostrGroupDataExtension::from_group(&mls_group)?;
+
+        // Only after successful validation, update epoch and metadata from MLS group
         stored_group.epoch = mls_group.epoch().as_u64();
+        stored_group.name = group_data.name;
+        stored_group.description = group_data.description;
+        stored_group.image_hash = group_data.image_hash;
+        stored_group.image_key = group_data.image_key;
+        stored_group.image_nonce = group_data.image_nonce;
+        stored_group.admin_pubkeys = group_data.admins;
+        stored_group.nostr_group_id = group_data.nostr_group_id;
 
-        // Update extension data from NostrGroupDataExtension
-        if let Ok(group_data) = NostrGroupDataExtension::from_group(&mls_group) {
-            stored_group.name = group_data.name;
-            stored_group.description = group_data.description;
-            stored_group.image_hash = group_data.image_hash;
-            stored_group.image_key = group_data.image_key;
-            stored_group.image_nonce = group_data.image_nonce;
-            stored_group.admin_pubkeys = group_data.admins;
-            stored_group.nostr_group_id = group_data.nostr_group_id;
-
-            // Sync relays atomically - replace entire relay set with current extension data
-            self.storage()
-                .replace_group_relays(group_id, group_data.relays)
-                .map_err(|e| Error::Group(e.to_string()))?;
-        }
+        // Sync relays atomically - replace entire relay set with current extension data
+        self.storage()
+            .replace_group_relays(group_id, group_data.relays)
+            .map_err(|e| Error::Group(e.to_string()))?;
 
         self.storage()
             .save_group(stored_group)
@@ -1393,6 +1393,7 @@ mod tests {
     use openmls::prelude::BasicCredential;
 
     use super::NostrGroupDataExtension;
+    use crate::constant::NOSTR_GROUP_DATA_EXTENSION_TYPE;
     use crate::groups::NostrGroupDataUpdate;
     use crate::test_util::*;
     use crate::tests::create_test_mdk;
@@ -2776,6 +2777,89 @@ mod tests {
         let non_existent_group_id = crate::GroupId::from_slice(&[1, 2, 3, 4, 5]);
         let result = creator_mdk.sync_group_metadata_from_mls(&non_existent_group_id);
         assert!(matches!(result, Err(crate::Error::GroupNotFound)));
+    }
+
+    #[test]
+    fn test_sync_group_metadata_propagates_extension_parse_failure() {
+        use openmls::prelude::{Extension, UnknownExtension};
+
+        let creator_mdk = create_test_mdk();
+        let (creator, initial_members, admins) = create_test_group_members();
+        let creator_pk = creator.public_key();
+
+        // Create key package events for initial members
+        let mut initial_key_package_events = Vec::new();
+        for member_keys in &initial_members {
+            let key_package_event = create_key_package_event(&creator_mdk, member_keys);
+            initial_key_package_events.push(key_package_event);
+        }
+
+        // Create the group
+        let create_result = creator_mdk
+            .create_group(
+                &creator_pk,
+                initial_key_package_events,
+                create_nostr_group_config_data(admins.clone()),
+            )
+            .expect("Failed to create group");
+
+        let group_id = &create_result.group.mls_group_id;
+
+        // Merge the pending commit
+        creator_mdk
+            .merge_pending_commit(group_id)
+            .expect("Failed to merge pending commit");
+
+        // Load the MLS group and corrupt the group-data extension
+        let mut mls_group = creator_mdk
+            .load_mls_group(group_id)
+            .expect("Failed to load MLS group")
+            .expect("MLS group should exist");
+
+        // Create a corrupted extension with invalid data
+        let corrupted_extension_data = vec![0xFF, 0xFF, 0xFF]; // Invalid TLS-serialized data
+        let corrupted_extension = Extension::Unknown(
+            NOSTR_GROUP_DATA_EXTENSION_TYPE,
+            UnknownExtension(corrupted_extension_data),
+        );
+
+        // Replace the group-data extension with the corrupted one
+        let mut extensions = mls_group.extensions().clone();
+        extensions.add_or_replace(corrupted_extension);
+
+        let signature_keypair = creator_mdk.load_mls_signer(&mls_group).unwrap();
+        let (_message_out, _, _) = mls_group
+            .update_group_context_extensions(&creator_mdk.provider, extensions, &signature_keypair)
+            .unwrap();
+
+        // Merge the pending commit to apply the corrupted extension
+        mls_group
+            .merge_pending_commit(&creator_mdk.provider)
+            .unwrap();
+
+        // Now test that sync_group_metadata_from_mls properly propagates the parse error
+        let result = creator_mdk.sync_group_metadata_from_mls(group_id);
+
+        // The function should return an error, not silently ignore the parse failure
+        assert!(
+            result.is_err(),
+            "sync_group_metadata_from_mls should propagate extension parse errors"
+        );
+
+        // Verify it's a deserialization error (the specific error from deserialize_with_migration)
+        match result {
+            Err(e) => {
+                let error_msg = e.to_string();
+                assert!(
+                    error_msg.contains("TLS")
+                        || error_msg.contains("deserialize")
+                        || error_msg.contains("EndOfStream"),
+                    "Expected deserialization error, got: {}",
+                    error_msg
+                );
+            }
+            Ok(_) => panic!("Expected error but got Ok"),
+        }
     }
 
     /// Test getting group that doesn't exist
