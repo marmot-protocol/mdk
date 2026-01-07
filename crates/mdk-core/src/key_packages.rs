@@ -1451,7 +1451,7 @@ mod tests {
                 Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
             ];
 
-            let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex)
+            let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex.clone())
                 .tags(tags)
                 .sign_with_keys(&nostr::Keys::generate())
                 .unwrap();
@@ -1462,6 +1462,181 @@ mod tests {
                 "Should reject event without extensions tag"
             );
             assert!(result.unwrap_err().to_string().contains("mls_extensions"));
+        }
+
+        // Test missing relays
+        {
+            let tags = vec![
+                Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
+                Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
+                Tag::custom(
+                    TagKind::MlsExtensions,
+                    ["0x0003", "0x000a", "0x0002", "0xf2ee"],
+                ),
+            ];
+
+            let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex)
+                .tags(tags)
+                .sign_with_keys(&nostr::Keys::generate())
+                .unwrap();
+
+            let result = mdk.validate_key_package_tags(&event);
+            assert!(result.is_err(), "Should reject event without relays tag");
+            assert!(result.unwrap_err().to_string().contains("relays"));
+        }
+    }
+
+    /// Test that relays tag validation works correctly
+    #[test]
+    fn test_validate_relays_tag() {
+        let mdk = create_test_mdk();
+        let test_pubkey =
+            PublicKey::from_hex("884704bd421671e01c13f854d2ce23ce2a5bfe9562f4f297ad2bc921ba30c3a6")
+                .unwrap();
+
+        let (key_package_hex, _) = mdk
+            .create_key_package_for_event(&test_pubkey, vec![])
+            .expect("Failed to create key package");
+
+        // Test empty relays tag (should fail)
+        {
+            let tags = vec![
+                Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
+                Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
+                Tag::custom(
+                    TagKind::MlsExtensions,
+                    ["0x0003", "0x000a", "0x0002", "0xf2ee"],
+                ),
+                Tag::relays(vec![]), // Empty relays tag
+            ];
+
+            let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex.clone())
+                .tags(tags)
+                .sign_with_keys(&nostr::Keys::generate())
+                .unwrap();
+
+            let result = mdk.validate_key_package_tags(&event);
+            assert!(result.is_err(), "Should reject event with empty relays tag");
+            let error_msg = result.unwrap_err().to_string();
+            assert!(
+                error_msg.contains("at least one relay URL"),
+                "Error should mention needing at least one relay URL, got: {}",
+                error_msg
+            );
+        }
+
+        // Test invalid relay URL format (should fail)
+        {
+            let invalid_tags = vec![
+                Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
+                Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
+                Tag::custom(
+                    TagKind::MlsExtensions,
+                    ["0x0003", "0x000a", "0x0002", "0xf2ee"],
+                ),
+                Tag::custom(TagKind::Relays, ["not-a-valid-url"]),
+            ];
+
+            let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex.clone())
+                .tags(invalid_tags)
+                .sign_with_keys(&nostr::Keys::generate())
+                .unwrap();
+
+            let result = mdk.validate_key_package_tags(&event);
+            assert!(
+                result.is_err(),
+                "Should reject event with invalid relay URL format"
+            );
+            let error_msg = result.unwrap_err().to_string();
+            assert!(
+                error_msg.contains("Invalid relay URL"),
+                "Error should mention invalid relay URL, got: {}",
+                error_msg
+            );
+        }
+
+        // Test multiple invalid relay URLs (should fail on first invalid one)
+        {
+            let invalid_tags = vec![
+                Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
+                Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
+                Tag::custom(
+                    TagKind::MlsExtensions,
+                    ["0x0003", "0x000a", "0x0002", "0xf2ee"],
+                ),
+                Tag::custom(TagKind::Relays, ["wss://valid.relay.com", "invalid-url"]),
+            ];
+
+            let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex.clone())
+                .tags(invalid_tags)
+                .sign_with_keys(&nostr::Keys::generate())
+                .unwrap();
+
+            let result = mdk.validate_key_package_tags(&event);
+            assert!(
+                result.is_err(),
+                "Should reject event with invalid relay URL in list"
+            );
+            let error_msg = result.unwrap_err().to_string();
+            assert!(
+                error_msg.contains("Invalid relay URL"),
+                "Error should mention invalid relay URL, got: {}",
+                error_msg
+            );
+        }
+
+        // Test single valid relay URL (should pass)
+        {
+            let tags = vec![
+                Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
+                Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
+                Tag::custom(
+                    TagKind::MlsExtensions,
+                    ["0x0003", "0x000a", "0x0002", "0xf2ee"],
+                ),
+                Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
+            ];
+
+            let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex.clone())
+                .tags(tags)
+                .sign_with_keys(&nostr::Keys::generate())
+                .unwrap();
+
+            let result = mdk.validate_key_package_tags(&event);
+            assert!(
+                result.is_ok(),
+                "Should accept event with single valid relay URL, got error: {:?}",
+                result
+            );
+        }
+
+        // Test multiple valid relay URLs (should pass)
+        {
+            let tags = vec![
+                Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
+                Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
+                Tag::custom(
+                    TagKind::MlsExtensions,
+                    ["0x0003", "0x000a", "0x0002", "0xf2ee"],
+                ),
+                Tag::relays(vec![
+                    RelayUrl::parse("wss://relay1.example.com").unwrap(),
+                    RelayUrl::parse("wss://relay2.example.com").unwrap(),
+                    RelayUrl::parse("wss://relay3.example.com").unwrap(),
+                ]),
+            ];
+
+            let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex)
+                .tags(tags)
+                .sign_with_keys(&nostr::Keys::generate())
+                .unwrap();
+
+            let result = mdk.validate_key_package_tags(&event);
+            assert!(
+                result.is_ok(),
+                "Should accept event with multiple valid relay URLs, got error: {:?}",
+                result
+            );
         }
     }
 
