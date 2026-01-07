@@ -1,5 +1,6 @@
 //! Memory-based storage implementation of the MdkStorageProvider trait for Nostr MLS messages
 
+use mdk_storage_traits::GroupId;
 use mdk_storage_traits::messages::MessageStorage;
 use mdk_storage_traits::messages::error::MessageError;
 use mdk_storage_traits::messages::types::*;
@@ -40,10 +41,14 @@ impl MessageStorage for MdkMemoryStorage {
 
     fn find_message_by_event_id(
         &self,
+        mls_group_id: &GroupId,
         event_id: &EventId,
     ) -> Result<Option<Message>, MessageError> {
-        let cache = self.messages_cache.read();
-        Ok(cache.peek(event_id).cloned())
+        let group_cache = self.messages_by_group_cache.read();
+        match group_cache.peek(mls_group_id) {
+            Some(group_messages) => Ok(group_messages.iter().find(|m| m.id == *event_id).cloned()),
+            None => Ok(None),
+        }
     }
 
     fn find_processed_message_by_event_id(

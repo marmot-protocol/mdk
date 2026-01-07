@@ -516,7 +516,7 @@ mod tests {
         };
         nostr_storage.save_message(message.clone()).unwrap();
         let found_message = nostr_storage
-            .find_message_by_event_id(&event_id)
+            .find_message_by_event_id(&mls_group_id, &event_id)
             .unwrap()
             .unwrap();
         assert_eq!(found_message.id, event_id);
