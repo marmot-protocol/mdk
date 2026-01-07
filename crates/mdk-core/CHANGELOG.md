@@ -28,6 +28,10 @@
 ### Breaking changes
 
 - Changed `get_messages()` signature to accept `Option<Pagination>` parameter. Callers must now pass `None` for default pagination or `Some(Pagination::new(...))` for custom pagination ([#111](https://github.com/marmot-protocol/mdk/pull/111))
+
+### Fixed
+
+- **Security (Audit Issue AQ)**: Fixed `sync_group_metadata_from_mls()` to properly propagate errors when the mandatory group-data extension fails to parse, instead of silently ignoring the failure and continuing with stale metadata. This prevents potential data loss and security issues when extension data is corrupted or malformed. ([#125](https://github.com/marmot-protocol/mdk/pull/125))
 - **Content Encoding**: Removed support for hex encoding in key package and welcome event content ([#98](https://github.com/marmot-protocol/mdk/pull/98))
   - Key packages and welcome events now require explicit `["encoding", "base64"]` tag
   - Events without encoding tags or with hex encoding are rejected
