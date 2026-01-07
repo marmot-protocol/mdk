@@ -87,6 +87,15 @@ pub struct NostrGroupDataUpdate {
     pub admins: Option<Vec<PublicKey>>,
 }
 
+/// Pending member changes from proposals that need admin approval
+#[derive(Debug, Clone)]
+pub struct PendingMemberChanges {
+    /// Public keys of members that will be added when proposals are committed
+    pub additions: Vec<PublicKey>,
+    /// Public keys of members that will be removed when proposals are committed
+    pub removals: Vec<PublicKey>,
+}
+
 impl NostrGroupConfigData {
     /// Creates NostrGroupConfigData
     pub fn new(
@@ -412,6 +421,121 @@ where
             let public_key = self.parse_credential_identity(identity_bytes)?;
             acc.insert(public_key);
             Ok(acc)
+        })
+    }
+
+    /// Gets the public keys of members that will be added from pending proposals in an MLS group
+    ///
+    /// This method examines pending Add proposals in the group and extracts the public keys
+    /// of members that would be added if these proposals are committed. This is useful for
+    /// showing admins which member additions are pending approval.
+    ///
+    /// # Arguments
+    ///
+    /// * `group_id` - The MLS group ID to examine for pending proposals
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(Vec<PublicKey>)` - List of public keys for members in pending Add proposals
+    /// * `Err(Error)` - If there's an error loading the group or extracting member information
+    pub fn pending_added_members_pubkeys(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<Vec<PublicKey>, Error> {
+        let mls_group = self.load_mls_group(group_id)?.ok_or(Error::GroupNotFound)?;
+
+        let mut added_pubkeys = Vec::new();
+
+        for proposal in mls_group.pending_proposals() {
+            if let Proposal::Add(add_proposal) = proposal.proposal() {
+                let leaf_node = add_proposal.key_package().leaf_node();
+                let pubkey = self.pubkey_for_leaf_node(leaf_node)?;
+                added_pubkeys.push(pubkey);
+            }
+        }
+
+        Ok(added_pubkeys)
+    }
+
+    /// Gets the public keys of members that will be removed from pending proposals in an MLS group
+    ///
+    /// This method examines pending Remove proposals in the group and extracts the public keys
+    /// of members that would be removed if these proposals are committed. This is useful for
+    /// showing admins which member removals are pending approval.
+    ///
+    /// # Arguments
+    ///
+    /// * `group_id` - The MLS group ID to examine for pending proposals
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(Vec<PublicKey>)` - List of public keys for members in pending Remove proposals
+    /// * `Err(Error)` - If there's an error loading the group or extracting member information
+    pub fn pending_removed_members_pubkeys(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<Vec<PublicKey>, Error> {
+        let mls_group = self.load_mls_group(group_id)?.ok_or(Error::GroupNotFound)?;
+
+        let mut removed_pubkeys = Vec::new();
+
+        for proposal in mls_group.pending_proposals() {
+            if let Proposal::Remove(remove_proposal) = proposal.proposal() {
+                let removed_leaf_index = remove_proposal.removed();
+                if let Some(member) = mls_group.member_at(removed_leaf_index) {
+                    let pubkey = self.pubkey_for_member(&member)?;
+                    removed_pubkeys.push(pubkey);
+                }
+            }
+        }
+
+        Ok(removed_pubkeys)
+    }
+
+    /// Gets all pending member changes (additions and removals) from pending proposals
+    ///
+    /// This method provides a combined view of all pending member changes in a group,
+    /// which is useful for showing admins a complete picture of proposed membership changes
+    /// that need approval.
+    ///
+    /// # Arguments
+    ///
+    /// * `group_id` - The MLS group ID to examine for pending proposals
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(PendingMemberChanges)` - Struct containing lists of pending additions and removals
+    /// * `Err(Error)` - If there's an error loading the group or extracting member information
+    pub fn pending_member_changes(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<PendingMemberChanges, Error> {
+        let mls_group = self.load_mls_group(group_id)?.ok_or(Error::GroupNotFound)?;
+
+        let mut additions = Vec::new();
+        let mut removals = Vec::new();
+
+        for proposal in mls_group.pending_proposals() {
+            match proposal.proposal() {
+                Proposal::Add(add_proposal) => {
+                    let leaf_node = add_proposal.key_package().leaf_node();
+                    let pubkey = self.pubkey_for_leaf_node(leaf_node)?;
+                    additions.push(pubkey);
+                }
+                Proposal::Remove(remove_proposal) => {
+                    let removed_leaf_index = remove_proposal.removed();
+                    if let Some(member) = mls_group.member_at(removed_leaf_index) {
+                        let pubkey = self.pubkey_for_member(&member)?;
+                        removals.push(pubkey);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        Ok(PendingMemberChanges {
+            additions,
+            removals,
         })
     }
 
