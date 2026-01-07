@@ -88,7 +88,7 @@ pub struct NostrGroupDataUpdate {
 }
 
 /// Pending member changes from proposals that need admin approval
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PendingMemberChanges {
     /// Public keys of members that will be added when proposals are committed
     pub additions: Vec<PublicKey>,
