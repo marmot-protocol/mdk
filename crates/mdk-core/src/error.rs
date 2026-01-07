@@ -197,6 +197,16 @@ pub enum Error {
         /// The public key that signed the event
         event_signer: String,
     },
+    /// Identity change attempted in proposal or commit - MIP-00 requires immutable identity
+    #[error(
+        "identity change not allowed: proposal attempts to change identity from {original_identity} to {new_identity}"
+    )]
+    IdentityChangeNotAllowed {
+        /// The original identity of the member
+        original_identity: String,
+        /// The new identity attempted in the proposal
+        new_identity: String,
+    },
     /// Rumor event is missing its ID
     #[error("rumor event is missing its ID")]
     MissingRumorEventId,
