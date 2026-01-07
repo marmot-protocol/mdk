@@ -531,6 +531,8 @@ impl MdkStorageProvider for MdkSqliteStorage {
 mod tests {
     use std::collections::BTreeSet;
 
+    use mdk_storage_traits::groups::types::{Group, GroupExporterSecret, GroupState};
+    use mdk_storage_traits::groups::GroupStorage;
     use mdk_storage_traits::GroupId;
     use tempfile::tempdir;
 
@@ -624,9 +626,6 @@ mod tests {
 
     #[test]
     fn test_group_exporter_secrets() {
-        use mdk_storage_traits::groups::GroupStorage;
-        use mdk_storage_traits::groups::types::{Group, GroupExporterSecret, GroupState};
-
         // Create an in-memory SQLite database
         let storage = MdkSqliteStorage::new_in_memory().unwrap();
 
@@ -724,8 +723,19 @@ mod tests {
     // ========================================
 
     mod encryption_tests {
+        #[cfg(unix)]
+        use std::os::unix::fs::PermissionsExt;
         use std::sync::OnceLock;
         use std::thread;
+
+        use mdk_storage_traits::groups::types::{Group, GroupExporterSecret, GroupState};
+        use mdk_storage_traits::groups::GroupStorage;
+        use mdk_storage_traits::messages::MessageStorage;
+        use mdk_storage_traits::test_utils::cross_storage::{
+            create_test_group, create_test_message, create_test_welcome,
+        };
+        use mdk_storage_traits::welcomes::WelcomeStorage;
+        use nostr::EventId;
 
         use super::*;
 
@@ -834,9 +844,6 @@ mod tests {
 
         #[test]
         fn test_encrypted_storage_data_persistence() {
-            use mdk_storage_traits::groups::GroupStorage;
-            use mdk_storage_traits::groups::types::{Group, GroupState};
-
             let temp_dir = tempdir().unwrap();
             let db_path = temp_dir.path().join("encrypted_persist.db");
 
@@ -886,7 +893,6 @@ mod tests {
             // On Unix, verify permissions are restrictive
             #[cfg(unix)]
             {
-                use std::os::unix::fs::PermissionsExt;
                 let metadata = std::fs::metadata(&db_path).unwrap();
                 let mode = metadata.permissions().mode();
 
@@ -902,9 +908,6 @@ mod tests {
 
         #[test]
         fn test_encrypted_storage_multiple_groups() {
-            use mdk_storage_traits::groups::GroupStorage;
-            use mdk_storage_traits::test_utils::cross_storage::create_test_group;
-
             let temp_dir = tempdir().unwrap();
             let db_path = temp_dir.path().join("multi_groups.db");
 
@@ -943,13 +946,6 @@ mod tests {
 
         #[test]
         fn test_encrypted_storage_messages() {
-            use mdk_storage_traits::groups::GroupStorage;
-            use mdk_storage_traits::messages::MessageStorage;
-            use mdk_storage_traits::test_utils::cross_storage::{
-                create_test_group, create_test_message,
-            };
-            use nostr::EventId;
-
             let temp_dir = tempdir().unwrap();
             let db_path = temp_dir.path().join("messages.db");
 
@@ -983,13 +979,6 @@ mod tests {
 
         #[test]
         fn test_encrypted_storage_welcomes() {
-            use mdk_storage_traits::groups::GroupStorage;
-            use mdk_storage_traits::test_utils::cross_storage::{
-                create_test_group, create_test_welcome,
-            };
-            use mdk_storage_traits::welcomes::WelcomeStorage;
-            use nostr::EventId;
-
             let temp_dir = tempdir().unwrap();
             let db_path = temp_dir.path().join("welcomes.db");
 
@@ -1020,9 +1009,6 @@ mod tests {
 
         #[test]
         fn test_encrypted_storage_exporter_secrets() {
-            use mdk_storage_traits::groups::GroupStorage;
-            use mdk_storage_traits::groups::types::{Group, GroupExporterSecret, GroupState};
-
             let temp_dir = tempdir().unwrap();
             let db_path = temp_dir.path().join("exporter_secrets.db");
 
@@ -1220,13 +1206,6 @@ mod tests {
 
         #[test]
         fn test_encrypted_storage_large_data() {
-            use mdk_storage_traits::groups::GroupStorage;
-            use mdk_storage_traits::messages::MessageStorage;
-            use mdk_storage_traits::test_utils::cross_storage::{
-                create_test_group, create_test_message,
-            };
-            use nostr::EventId;
-
             let temp_dir = tempdir().unwrap();
             let db_path = temp_dir.path().join("large_data.db");
 
@@ -1262,9 +1241,6 @@ mod tests {
 
         #[test]
         fn test_encrypted_storage_concurrent_reads() {
-            use mdk_storage_traits::groups::GroupStorage;
-            use mdk_storage_traits::test_utils::cross_storage::create_test_group;
-
             let temp_dir = tempdir().unwrap();
             let db_path = temp_dir.path().join("concurrent.db");
 
@@ -1306,11 +1282,6 @@ mod tests {
         #[cfg(unix)]
         #[test]
         fn test_encrypted_storage_sidecar_file_permissions() {
-            use std::os::unix::fs::PermissionsExt;
-
-            use mdk_storage_traits::groups::GroupStorage;
-            use mdk_storage_traits::test_utils::cross_storage::create_test_group;
-
             let temp_dir = tempdir().unwrap();
             let db_path = temp_dir.path().join("sidecar_test.db");
 
@@ -1376,9 +1347,6 @@ mod tests {
 
         #[test]
         fn test_encrypted_storage_empty_group_name() {
-            use mdk_storage_traits::groups::GroupStorage;
-            use mdk_storage_traits::test_utils::cross_storage::create_test_group;
-
             let temp_dir = tempdir().unwrap();
             let db_path = temp_dir.path().join("empty_name.db");
 
@@ -1411,13 +1379,6 @@ mod tests {
 
         #[test]
         fn test_encrypted_storage_unicode_content() {
-            use mdk_storage_traits::groups::GroupStorage;
-            use mdk_storage_traits::messages::MessageStorage;
-            use mdk_storage_traits::test_utils::cross_storage::{
-                create_test_group, create_test_message,
-            };
-            use nostr::EventId;
-
             let temp_dir = tempdir().unwrap();
             let db_path = temp_dir.path().join("unicode.db");
 
@@ -1566,9 +1527,6 @@ mod tests {
         /// Test that reopening a database with keyring works when the key is present.
         #[test]
         fn test_reopen_db_with_keyring_succeeds() {
-            use mdk_storage_traits::groups::GroupStorage;
-            use mdk_storage_traits::test_utils::cross_storage::create_test_group;
-
             ensure_mock_store();
 
             let temp_dir = tempdir().unwrap();
@@ -1611,9 +1569,6 @@ mod tests {
         /// Test concurrent access to encrypted database with same key.
         #[test]
         fn test_concurrent_encrypted_access_same_key() {
-            use mdk_storage_traits::groups::GroupStorage;
-            use mdk_storage_traits::test_utils::cross_storage::create_test_group;
-
             let temp_dir = tempdir().unwrap();
             let db_path = temp_dir.path().join("concurrent_encrypted.db");
 
@@ -1652,9 +1607,6 @@ mod tests {
         /// Test multiple databases with different keys in same directory.
         #[test]
         fn test_multiple_encrypted_databases_different_keys() {
-            use mdk_storage_traits::groups::GroupStorage;
-            use mdk_storage_traits::test_utils::cross_storage::create_test_group;
-
             let temp_dir = tempdir().unwrap();
 
             // Create multiple databases with different keys

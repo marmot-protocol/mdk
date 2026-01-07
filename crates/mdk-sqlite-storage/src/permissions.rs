@@ -12,6 +12,8 @@
 
 use std::fs::OpenOptions;
 use std::io::ErrorKind;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 use crate::error::Error;
@@ -152,8 +154,6 @@ where
 /// Sets Unix file permissions to 0600 (owner read/write only).
 #[cfg(unix)]
 fn set_unix_file_permissions(path: &Path) -> Result<(), Error> {
-    use std::os::unix::fs::PermissionsExt;
-
     let perms = std::fs::Permissions::from_mode(0o600);
     std::fs::set_permissions(path, perms).map_err(|e| {
         Error::FilePermission(format!(
@@ -166,8 +166,6 @@ fn set_unix_file_permissions(path: &Path) -> Result<(), Error> {
 /// Sets Unix directory permissions to 0700 (owner read/write/execute only).
 #[cfg(unix)]
 fn set_unix_directory_permissions(path: &Path) -> Result<(), Error> {
-    use std::os::unix::fs::PermissionsExt;
-
     let perms = std::fs::Permissions::from_mode(0o700);
     std::fs::set_permissions(path, perms).map_err(|e| {
         Error::FilePermission(format!(
@@ -194,8 +192,6 @@ pub fn verify_permissions<P>(path: P) -> Result<(), Error>
 where
     P: AsRef<Path>,
 {
-    use std::os::unix::fs::PermissionsExt;
-
     let path = path.as_ref();
 
     if !path.exists() {
@@ -243,7 +239,6 @@ mod tests {
 
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
             let perms = std::fs::metadata(&test_dir).unwrap().permissions();
             assert_eq!(perms.mode() & 0o777, 0o700);
         }
@@ -261,7 +256,6 @@ mod tests {
 
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
             let perms = std::fs::metadata(&test_file).unwrap().permissions();
             assert_eq!(perms.mode() & 0o777, 0o600);
         }
@@ -280,7 +274,6 @@ mod tests {
 
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
             let file_perms = std::fs::metadata(&db_path).unwrap().permissions();
             assert_eq!(file_perms.mode() & 0o777, 0o600);
 
@@ -307,8 +300,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_verify_permissions_insecure() {
-        use std::os::unix::fs::PermissionsExt;
-
         let temp_dir = tempfile::tempdir().unwrap();
         let test_file = temp_dir.path().join("insecure.db");
 
@@ -373,8 +364,6 @@ mod tests {
 
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-
             // All directories in the chain should exist
             assert!(temp_dir.path().join("a").exists());
             assert!(temp_dir.path().join("a").join("b").exists());
@@ -397,8 +386,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_verify_permissions_group_readable() {
-        use std::os::unix::fs::PermissionsExt;
-
         let temp_dir = tempfile::tempdir().unwrap();
         let test_file = temp_dir.path().join("group_readable.db");
 
@@ -417,8 +404,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_verify_permissions_world_writable() {
-        use std::os::unix::fs::PermissionsExt;
-
         let temp_dir = tempfile::tempdir().unwrap();
         let test_file = temp_dir.path().join("world_writable.db");
 
