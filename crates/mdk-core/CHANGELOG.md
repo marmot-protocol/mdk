@@ -46,6 +46,7 @@
 ### Added
 
 - New `MessageProcessingResult::PendingProposal` variant returned when a non-admin member receives a proposal. The proposal is stored as pending and awaits commitment by an admin. ([#122](https://github.com/marmot-protocol/mdk/pull/122))
+- New error variant `IdentityChangeNotAllowed` for rejecting proposals and commits that attempt to change member identity ([#126](https://github.com/marmot-protocol/mdk/pull/126))
 - Added `nostr_group_id` field to `NostrGroupDataUpdate` struct, enabling rotation of the Nostr group ID used for message routing per MIP-01 ([#127](https://github.com/marmot-protocol/mdk/pull/127))
 - New error variant `AuthorMismatch` for message author verification failures ([#40](https://github.com/marmot-protocol/mdk/pull/40))
 - New error variant `KeyPackageIdentityMismatch` for KeyPackage credential identity validation failures ([#41](https://github.com/marmot-protocol/mdk/pull/41))
@@ -66,6 +67,7 @@
 ### Fixed
 
 - **Security (Audit Issue I)**: Fixed proposals being incorrectly restricted to admins. Per the Marmot protocol specification, any member can create proposals (only admins can commit). Non-admin members can now submit legitimate proposals such as self key updates or leave proposals. When an admin receives a proposal, it is auto-committed; when a non-admin receives one, it is stored as pending. Added new `MessageProcessingResult::PendingProposal` variant to indicate proposals stored but not committed. ([#122](https://github.com/marmot-protocol/mdk/pull/122))
+- **Security (Audit Issue L)**: Added identity validation in proposal and commit processing. Proposals and commits that attempt to modify MLS credential identity fields are now rejected, as required by MIP-00. This prevents attackers from changing the binding between a member and their Nostr public key identity. ([#126](https://github.com/marmot-protocol/mdk/pull/126))
 - **Security (Audit Suggestion 5)**: Prevent panic in `process_welcome` when rumor event ID is missing. A malformed or non-NIP-59-compliant rumor now returns a `MissingRumorEventId` error instead of panicking. ([#107](https://github.com/marmot-protocol/mdk/pull/107))
 - **Security (Audit Issue B)**: Added author verification to message processing to prevent impersonation attacks. The rumor pubkey is now validated against the MLS sender's credential before processing application messages. ([#40](https://github.com/marmot-protocol/mdk/pull/40))
 - **Security (Audit Issue C)**: Added validation for admin updates to prevent invalid configurations. Admin updates now reject empty admin sets and non-member public keys. ([#42](https://github.com/marmot-protocol/mdk/pull/42))
