@@ -4192,6 +4192,9 @@ mod tests {
             pending[0],
             bob_keys.public_key(),
             "Pending removal should be Bob"
+        );
+    }
+
     /// Test that validation failures persist failed processing state
     ///
     /// This test verifies that when message validation fails (e.g., wrong event kind),
