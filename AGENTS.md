@@ -1,4 +1,4 @@
-# AGENTS.md
+# MDK Development Guide for AI Agents
 
 This document provides instructions for AI coding agents working on the MDK (Marmot Development Kit) codebase.
 
