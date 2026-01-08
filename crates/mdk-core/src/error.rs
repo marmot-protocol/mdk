@@ -200,6 +200,24 @@ pub enum Error {
     /// Rumor event is missing its ID
     #[error("rumor event is missing its ID")]
     MissingRumorEventId,
+    /// Event signature verification failed
+    #[error("event signature verification failed")]
+    InvalidEventSignature,
+    /// Event ID verification failed
+    #[error("event ID verification failed: computed ID does not match event.id")]
+    InvalidEventId,
+    /// Event timestamp is invalid (too far in future or past)
+    #[error("event timestamp is invalid: {0}")]
+    InvalidTimestamp(String),
+    /// Missing required group ID tag
+    #[error("missing required group ID tag (h tag)")]
+    MissingGroupIdTag,
+    /// Invalid group ID format in tag
+    #[error("invalid group ID format: {0}")]
+    InvalidGroupIdFormat(String),
+    /// Multiple group ID tags found (MIP-03 requires exactly one)
+    #[error("multiple group ID tags found: expected exactly one h tag, found {0}")]
+    MultipleGroupIdTags(usize),
 }
 
 impl From<FromUtf8Error> for Error {
