@@ -649,7 +649,9 @@ where
 
         let mls_signer = self.load_mls_signer(mls_group)?;
 
-        let (commit_message, welcomes_option, _group_info) =
+        // Self-remove proposals never generate welcomes (only Add proposals do),
+        // so we can safely ignore the welcome output here
+        let (commit_message, _welcomes, _group_info) =
             mls_group.commit_to_pending_proposals(&self.provider, &mls_signer)?;
 
         let serialized_commit_message = commit_message
@@ -658,14 +660,6 @@ where
 
         let commit_event =
             self.build_encrypted_message_event(group_id, serialized_commit_message)?;
-
-        // TODO: FUTURE Handle welcome rumors from proposals
-        let welcome_rumors: Option<Vec<UnsignedEvent>> = None;
-        if welcomes_option.is_some() {
-            return Err(Error::NotImplemented(
-                "Processing welcome rumors from proposals is not supported".to_string(),
-            ));
-        }
 
         self.mark_event_processed(event)?;
 
@@ -677,7 +671,7 @@ where
 
         Ok(MessageProcessingResult::Proposal(UpdateGroupResult {
             evolution_event: commit_event,
-            welcome_rumors,
+            welcome_rumors: None,
             mls_group_id: group_id.clone(),
         }))
     }
