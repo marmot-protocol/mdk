@@ -2,6 +2,11 @@
 
 This directory contains custom slash commands for Claude AI in Cursor. These commands help automate common development workflows for the MDK project.
 
+## Related Files
+
+- **`CLAUDE.md`** (in repository root): A symlink to `AGENTS.md` that provides the development guide for AI coding agents. The symlink allows Claude to easily reference the guide while maintaining a single source of truth in `AGENTS.md`.
+- **`AGENTS.md`** (in repository root): The main development guide document for AI coding agents working on the MDK codebase.
+
 ## Usage
 
 In Cursor, you can invoke these commands using the `/` prefix followed by the command name. For example:
