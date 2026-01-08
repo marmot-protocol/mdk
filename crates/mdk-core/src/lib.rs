@@ -40,8 +40,60 @@ use self::util::NostrTagFormat;
 pub use mdk_storage_traits::GroupId;
 
 /// Configuration for MDK behavior
-#[derive(Debug, Clone, Default)]
-pub struct MdkConfig {}
+///
+/// This struct allows customization of various MDK parameters including
+/// message validation settings. All fields have secure defaults.
+///
+/// # Examples
+///
+/// ```rust
+/// use mdk_core::MdkConfig;
+///
+/// // Use defaults (recommended for most cases)
+/// let config = MdkConfig::default();
+///
+/// // Custom configuration
+/// let config = MdkConfig {
+///     max_event_age_secs: 86400, // 1 day instead of 7
+///     ..Default::default()
+/// };
+/// ```
+#[derive(Debug, Clone)]
+pub struct MdkConfig {
+    /// Maximum age for accepted events in seconds.
+    ///
+    /// Events older than this will be rejected during validation to prevent:
+    /// - Replay attacks with old messages
+    /// - Resource exhaustion from processing large message backlogs
+    /// - Synchronization issues with stale group state
+    ///
+    /// Default: 604800 (7 days)
+    ///
+    /// # Security Note
+    /// This value is intentionally conservative. Increasing it may expose
+    /// applications to security risks. The 7-day window is sufficient for
+    /// normal message delivery delays, temporary network outages, and
+    /// client offline periods.
+    pub max_event_age_secs: u64,
+
+    /// Maximum future timestamp skew allowed in seconds.
+    ///
+    /// Events with timestamps too far in the future will be rejected
+    /// to prevent timestamp manipulation attacks. The default 5-minute
+    /// window accounts for reasonable clock skew between clients.
+    ///
+    /// Default: 300 (5 minutes)
+    pub max_future_skew_secs: u64,
+}
+
+impl Default for MdkConfig {
+    fn default() -> Self {
+        Self {
+            max_event_age_secs: 604800, // 7 days
+            max_future_skew_secs: 300,  // 5 minutes
+        }
+    }
+}
 
 impl MdkConfig {
     /// Create a new configuration with default settings

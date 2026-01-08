@@ -601,15 +601,21 @@ where
             });
         }
 
-        // 2. Verify Nostr signature (also validates event ID)
+        // 2. Verify Nostr signature and event ID
+        // Note: While nostr-relay-pool validates events from relays, MDK is a library
+        // that may receive events from other sources (local storage, direct API calls, etc.).
+        // Explicit verification provides defense-in-depth and clear error messages.
         event.verify().map_err(|_| Error::InvalidEventSignature)?;
 
         // 3. Verify timestamp is within acceptable bounds
         let now = Timestamp::now();
 
-        // Reject events from the future (allow small clock skew of 5 minutes)
-        let max_future_skew = 300; // 5 minutes in seconds
-        if event.created_at.as_u64() > now.as_u64().saturating_add(max_future_skew) {
+        // Reject events from the future (allow configurable clock skew)
+        if event.created_at.as_u64()
+            > now
+                .as_u64()
+                .saturating_add(self.config.max_future_skew_secs)
+        {
             return Err(Error::InvalidTimestamp(format!(
                 "event timestamp {} is too far in the future (current time: {})",
                 event.created_at.as_u64(),
@@ -617,9 +623,8 @@ where
             )));
         }
 
-        // Reject events that are too old (configurable, default 7 days)
-        let max_age = 604800; // 7 days in seconds
-        let min_timestamp = now.as_u64().saturating_sub(max_age);
+        // Reject events that are too old (configurable via MdkConfig)
+        let min_timestamp = now.as_u64().saturating_sub(self.config.max_event_age_secs);
         if event.created_at.as_u64() < min_timestamp {
             return Err(Error::InvalidTimestamp(format!(
                 "event timestamp {} is too old (minimum acceptable: {})",
