@@ -203,9 +203,6 @@ pub enum Error {
     /// Event signature verification failed
     #[error("event signature verification failed")]
     InvalidEventSignature,
-    /// Event ID verification failed
-    #[error("event ID verification failed: computed ID does not match event.id")]
-    InvalidEventId,
     /// Event timestamp is invalid (too far in future or past)
     #[error("event timestamp is invalid: {0}")]
     InvalidTimestamp(String),

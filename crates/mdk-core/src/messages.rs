@@ -601,16 +601,10 @@ where
             });
         }
 
-        // 2. Verify Nostr signature
+        // 2. Verify Nostr signature (also validates event ID)
         event.verify().map_err(|_| Error::InvalidEventSignature)?;
 
-        // 3. Verify event ID is correctly computed
-        let computed_id = event.id;
-        if event.id != computed_id {
-            return Err(Error::InvalidEventId);
-        }
-
-        // 4. Verify timestamp is within acceptable bounds
+        // 3. Verify timestamp is within acceptable bounds
         let now = Timestamp::now();
 
         // Reject events from the future (allow small clock skew of 5 minutes)
@@ -634,7 +628,7 @@ where
             )));
         }
 
-        // 5. Extract and validate group ID tag (MIP-03 requires exactly one h tag)
+        // 4. Extract and validate group ID tag (MIP-03 requires exactly one h tag)
         let h_tags: Vec<_> = event
             .tags
             .iter()
