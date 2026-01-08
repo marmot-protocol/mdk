@@ -232,6 +232,7 @@ where
         let group_data = NostrGroupDataExtension::from_group(&mls_group)?;
         Ok(group_data.admins.contains(&pubkey))
     }
+
     /// Extracts the public key from a leaf node
     ///
     /// # Arguments

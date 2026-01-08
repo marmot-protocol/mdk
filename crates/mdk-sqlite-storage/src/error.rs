@@ -114,6 +114,12 @@ mod tests {
     }
 
     #[test]
+    fn test_error_display_openmls() {
+        let err = Error::OpenMls("key generation failed".to_string());
+        assert_eq!(err.to_string(), "OpenMLS error: key generation failed");
+    }
+
+    #[test]
     fn test_error_display_invalid_key_length() {
         let err = Error::InvalidKeyLength(16);
         let msg = err.to_string();
@@ -180,6 +186,14 @@ mod tests {
     }
 
     #[test]
+    fn test_error_debug() {
+        let err = Error::Database("test".to_string());
+        let debug_str = format!("{:?}", err);
+        assert!(debug_str.contains("Database"));
+        assert!(debug_str.contains("test"));
+    }
+
+    #[test]
     fn test_error_from_io_error() {
         let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "file not found");
         let err: Error = io_err.into();
@@ -190,12 +204,34 @@ mod tests {
     }
 
     #[test]
+    fn test_error_from_rusqlite_error() {
+        let rusqlite_err = rusqlite::Error::InvalidQuery;
+        let err: Error = rusqlite_err.into();
+
+        match err {
+            Error::Rusqlite(_) => {}
+            _ => panic!("Expected Rusqlite variant"),
+        }
+    }
+
+    #[test]
     fn test_error_into_rusqlite_error() {
         let err = Error::WrongEncryptionKey;
         let rusqlite_err: rusqlite::Error = err.into();
         // Verify it converts to a rusqlite error (the specific type is less important)
         let msg = rusqlite_err.to_string();
         assert!(!msg.is_empty());
+    }
+
+    #[test]
+    fn test_error_to_rusqlite_error() {
+        let err = Error::Database("test error".to_string());
+        let rusqlite_err: rusqlite::Error = err.into();
+
+        match rusqlite_err {
+            rusqlite::Error::FromSqlConversionFailure(_, _, _) => {}
+            _ => panic!("Expected FromSqlConversionFailure variant"),
+        }
     }
 
     #[test]
@@ -219,5 +255,27 @@ mod tests {
         assert!(msg.contains("mdk.db.key"));
         assert!(msg.contains("no encryption key found"));
         assert!(msg.contains("unrecoverable"));
+    }
+
+    #[test]
+    fn test_validation_error_fields() {
+        let err = Error::Validation {
+            field_name: "description".to_string(),
+            max_size: 1024,
+            actual_size: 2048,
+        };
+
+        if let Error::Validation {
+            field_name,
+            max_size,
+            actual_size,
+        } = err
+        {
+            assert_eq!(field_name, "description");
+            assert_eq!(max_size, 1024);
+            assert_eq!(actual_size, 2048);
+        } else {
+            panic!("Expected Validation variant");
+        }
     }
 }
