@@ -81,13 +81,19 @@ static KEY_GENERATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 /// start multiple processes that access the same database concurrently, you should
 /// provide higher-level coordination.
 pub fn get_or_create_db_key(service_id: &str, db_key_id: &str) -> Result<EncryptionConfig, Error> {
-    // Acquire lock to prevent race conditions during key generation
+    // Fast path: check if key exists before acquiring lock.
+    // This avoids lock contention in the common case where the key already exists.
+    if let Some(config) = get_db_key(service_id, db_key_id)? {
+        return Ok(config);
+    }
+
+    // Key doesn't exist, acquire lock to prevent race conditions during generation
     let lock = KEY_GENERATION_LOCK.get_or_init(|| Mutex::new(()));
     let _guard = lock
         .lock()
         .map_err(|e| Error::Keyring(format!("Failed to acquire key generation lock: {}", e)))?;
 
-    // Try to get existing key
+    // Double-check after acquiring lock (another thread may have created it)
     if let Some(config) = get_db_key(service_id, db_key_id)? {
         return Ok(config);
     }
@@ -215,22 +221,10 @@ pub fn delete_db_key(service_id: &str, db_key_id: &str) -> Result<(), Error> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::OnceLock;
     use std::thread;
 
     use super::*;
-
-    /// Ensures the mock keyring store is initialized exactly once for all tests.
-    ///
-    /// `keyring_core::set_default_store` can only be called once per process,
-    /// so we use `OnceLock` to ensure it's only initialized on the first call.
-    fn ensure_mock_store() {
-        static MOCK_STORE_INIT: OnceLock<()> = OnceLock::new();
-        MOCK_STORE_INIT.get_or_init(|| {
-            // Initialize the mock store for testing
-            keyring_core::set_default_store(keyring_core::mock::Store::new().unwrap());
-        });
-    }
+    use crate::test_utils::ensure_mock_store;
 
     #[test]
     fn test_get_or_create_generates_key_if_missing() {

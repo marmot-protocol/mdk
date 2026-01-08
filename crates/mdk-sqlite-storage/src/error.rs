@@ -35,10 +35,6 @@ pub enum Error {
     #[error("Wrong encryption key: database cannot be decrypted with the provided key")]
     WrongEncryptionKey,
 
-    /// Attempted to open an encrypted database without providing a key
-    #[error("Encrypted database requires an encryption key")]
-    EncryptedDatabaseRequiresKey,
-
     /// Attempted to open an unencrypted database with encryption enabled
     #[error(
         "Cannot open unencrypted database with encryption: database was created without encryption"
@@ -130,13 +126,6 @@ mod tests {
         let err = Error::WrongEncryptionKey;
         let msg = err.to_string();
         assert!(msg.contains("Wrong encryption key"));
-    }
-
-    #[test]
-    fn test_error_display_encrypted_database_requires_key() {
-        let err = Error::EncryptedDatabaseRequiresKey;
-        let msg = err.to_string();
-        assert!(msg.contains("requires an encryption key"));
     }
 
     #[test]

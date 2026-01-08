@@ -28,6 +28,7 @@ use crate::error::Error;
 #[derive(Clone)]
 pub struct EncryptionConfig {
     /// The 32-byte (256-bit) encryption key for SQLCipher.
+    // TODO: Use `Secret` type from mdk-core for secure memory handling once PR #109 is merged.
     key: [u8; 32],
 }
 

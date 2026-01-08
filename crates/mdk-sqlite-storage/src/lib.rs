@@ -82,6 +82,8 @@ pub mod keyring;
 mod messages;
 mod migrations;
 mod permissions;
+#[cfg(test)]
+mod test_utils;
 mod validation;
 mod welcomes;
 
@@ -725,7 +727,6 @@ mod tests {
     mod encryption_tests {
         #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt;
-        use std::sync::OnceLock;
         use std::thread;
 
         use mdk_storage_traits::groups::GroupStorage;
@@ -738,18 +739,7 @@ mod tests {
         use nostr::EventId;
 
         use super::*;
-
-        /// Ensures the mock keyring store is initialized exactly once for all tests.
-        ///
-        /// `keyring_core::set_default_store` can only be called once per process,
-        /// so we use `OnceLock` to ensure it's only initialized on the first call.
-        fn ensure_mock_store() {
-            static MOCK_STORE_INIT: OnceLock<()> = OnceLock::new();
-            MOCK_STORE_INIT.get_or_init(|| {
-                // Initialize the mock store for testing
-                keyring_core::set_default_store(keyring_core::mock::Store::new().unwrap());
-            });
-        }
+        use crate::test_utils::ensure_mock_store;
 
         #[test]
         fn test_encrypted_storage_creation() {

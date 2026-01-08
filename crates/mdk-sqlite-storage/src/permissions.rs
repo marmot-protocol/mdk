@@ -188,6 +188,7 @@ fn set_unix_directory_permissions(path: &Path) -> Result<(), Error> {
 ///
 /// Returns an error if permissions are too permissive or if the check fails.
 #[cfg(unix)]
+#[must_use = "verify_permissions returns a Result that must be checked"]
 pub fn verify_permissions<P>(path: P) -> Result<(), Error>
 where
     P: AsRef<Path>,
@@ -216,6 +217,7 @@ where
 
 /// Verifies permissions (no-op on platforms without specific support).
 #[cfg(not(unix))]
+#[must_use = "verify_permissions returns a Result that must be checked"]
 pub fn verify_permissions<P>(_path: P) -> Result<(), Error>
 where
     P: AsRef<Path>,
