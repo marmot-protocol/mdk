@@ -38,13 +38,13 @@
       "Bash(ls:*)",
       "Bash(rg:*)",
       "Bash(rustfmt:*)",
-      "Edit(*)",
+      "Edit(./**/*)",
       "Read(*)",
       "WebFetch(domain:docs.rs)",
       "WebFetch(domain:github.com)",
       "WebFetch(domain:www.rfc-editor.org)",
       "WebSearch",
-      "Write(*)"
+      "Write(./**/*)"
     ]
   }
 }
