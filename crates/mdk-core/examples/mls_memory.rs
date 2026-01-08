@@ -75,7 +75,16 @@ async fn main() -> Result<(), Error> {
     // The group is created, and the welcome messages are in welcome_rumors.
     // We also have the Nostr group data, which we can use to show info about the group.
     let alice_group = group_create_result.group;
+
+    // The evolution_event (Kind:445) contains the initial commit and MUST be published
+    // to relays BEFORE the welcome messages per MIP-01/02/03.
+    let _evolution_event = group_create_result.evolution_event;
+
     let welcome_rumors = group_create_result.welcome_rumors;
+
+    // After publishing the evolution_event to relays, merge the pending commit
+    // to finalize the group state locally.
+    alice_mdk.merge_pending_commit(&alice_group.mls_group_id)?;
 
     // Welcome rumors are the Kind:444 events that would then be Gift-wrapped to just Bob.
     // If you added multiple users to the group, the welcome rumors vec would contain a kind:444 for each.

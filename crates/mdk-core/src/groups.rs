@@ -32,6 +32,9 @@ use crate::util::{ContentEncoding, encode_content};
 pub struct GroupResult {
     /// The stored group
     pub group: group_types::Group,
+    /// A Kind:445 Event containing the commit message. To be published to the group relays before
+    /// welcome messages.
+    pub evolution_event: Event,
     /// A vec of Kind:444 Welcome Events to be published for members added during creation.
     pub welcome_rumors: Vec<UnsignedEvent>,
 }
@@ -875,7 +878,11 @@ where
     ///
     /// A `GroupResult` containing:
     /// - The created MLS group
+    /// - A Kind:445 Event (evolution_event) containing the initial commit to be published to relays
     /// - A Vec of UnsignedEvents representing the welcomes to be sent to new users
+    ///
+    /// Per MIP-01, MIP-02, and MIP-03, the commit event must be published to relays BEFORE
+    /// the welcome messages. After publishing, call `merge_pending_commit` to finalize the state.
     ///
     /// # Errors
     ///
@@ -939,25 +946,11 @@ where
         }
 
         // Add members to the group
-        let (_, welcome_out, _group_info) =
+        let (commit_message, welcome_out, _group_info) =
             mls_group.add_members(&self.provider, &signer, &key_packages_vec)?;
 
-        // Merge the pending commit to finalize the group state - we do this during creation because we don't have a commit event to fan out to the group relays
-        mls_group.merge_pending_commit(&self.provider)?;
-
-        // Serialize the welcome message and send it to the members
-        let serialized_welcome_message = welcome_out.tls_serialize_detached()?;
-
-        let welcome_rumors = self
-            .build_welcome_rumors_for_key_packages(
-                &mls_group,
-                serialized_welcome_message,
-                member_key_package_events,
-                &config.relays,
-            )?
-            .ok_or(Error::Welcome("Error creating welcome rumors".to_string()))?;
-
-        // Save the NostrMLS Group
+        // Save the NostrMLS Group before building the commit event
+        // (build_encrypted_message_event requires the group to exist in storage)
         let group = group_types::Group {
             mls_group_id: mls_group.group_id().clone().into(),
             nostr_group_id: group_data.clone().nostr_group_id,
@@ -979,11 +972,47 @@ where
 
         // Save the group relays after saving the group
         self.storage()
-            .replace_group_relays(&group.mls_group_id, config.relays.into_iter().collect())
+            .replace_group_relays(
+                &group.mls_group_id,
+                config.relays.clone().into_iter().collect(),
+            )
             .map_err(|e| Error::Group(e.to_string()))?;
+
+        // Build the commit event (Kind:445) to publish before welcomes per MIP-01, MIP-02, MIP-03
+        let serialized_commit_message = commit_message.tls_serialize_detached()?;
+        let evolution_event = self.build_encrypted_message_event(
+            &mls_group.group_id().into(),
+            serialized_commit_message,
+        )?;
+
+        // Create processed_message to track state of message
+        let processed_message: message_types::ProcessedMessage = message_types::ProcessedMessage {
+            wrapper_event_id: evolution_event.id,
+            message_event_id: None,
+            processed_at: Timestamp::now(),
+            state: message_types::ProcessedMessageState::ProcessedCommit,
+            failure_reason: None,
+        };
+
+        self.storage()
+            .save_processed_message(processed_message)
+            .map_err(|e| Error::Message(e.to_string()))?;
+
+        // Serialize the welcome message and send it to the members
+        let serialized_welcome_message = welcome_out.tls_serialize_detached()?;
+
+        let welcome_rumors = self
+            .build_welcome_rumors_for_key_packages(
+                &mls_group,
+                serialized_welcome_message,
+                member_key_package_events,
+                &config.relays,
+            )?
+            .ok_or(Error::Welcome("Error creating welcome rumors".to_string()))?;
 
         Ok(GroupResult {
             group,
+            evolution_event,
             welcome_rumors,
         })
     }
@@ -2704,6 +2733,11 @@ mod tests {
 
         let group_id = &create_result.group.mls_group_id;
 
+        // Merge the pending commit from group creation
+        creator_mdk
+            .merge_pending_commit(group_id)
+            .expect("Failed to merge pending commit from group creation");
+
         // Helper function to verify stored group epoch matches MLS group epoch
         let verify_epoch_sync = || {
             let mls_group = creator_mdk.load_mls_group(group_id).unwrap().unwrap();
@@ -2715,7 +2749,7 @@ mod tests {
             );
         };
 
-        // Test 1: After group creation (should already be synced)
+        // Test 1: After group creation (should already be synced after merge)
         verify_epoch_sync();
 
         // Test 2: After adding members

@@ -27,6 +27,7 @@
 
 ### Breaking changes
 
+- **MIP-01/02/03 Compliance**: `create_group()` now returns the initial commit as a Kind:445 event in `GroupResult.evolution_event`. Callers must publish this event to relays BEFORE publishing welcome messages, then call `merge_pending_commit()` to finalize the group state. This fixes [#77](https://github.com/marmot-protocol/mdk/issues/77) where the initial commit was discarded and never published. ([#131](https://github.com/marmot-protocol/mdk/pull/131))
 - Changed `get_messages()` signature to accept `Option<Pagination>` parameter. Callers must now pass `None` for default pagination or `Some(Pagination::new(...))` for custom pagination ([#111](https://github.com/marmot-protocol/mdk/pull/111))
 - **Content Encoding**: Removed support for hex encoding in key package and welcome event content ([#98](https://github.com/marmot-protocol/mdk/pull/98))
   - Key packages and welcome events now require explicit `["encoding", "base64"]` tag
