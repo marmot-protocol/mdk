@@ -1,6 +1,6 @@
-# AGENTS.md
+# MDK Development Guide for AI Agents
 
-This document provides instructions for AI coding agents working on the MDK (Marmot Development Kit) codebase.
+This document provides instructions for AI coding agents working on the MDK (Marmot Development Kit) codebase. This will work for most major AI harnesses. The `CLAUDE.md` file in this repo is a symlink to this doc.
 
 ## Project Overview
 

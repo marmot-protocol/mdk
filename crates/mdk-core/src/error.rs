@@ -160,9 +160,6 @@ pub enum Error {
     /// Stored message not found
     #[error("stored message not found")]
     MessageNotFound,
-    /// Proposal message received from a non-admin
-    #[error("not processing proposal from non-admin")]
-    ProposalFromNonAdmin,
     /// Commit message received from a non-admin
     #[error("not processing commit from non-admin")]
     CommitFromNonAdmin,
@@ -197,12 +194,19 @@ pub enum Error {
         /// The public key that signed the event
         event_signer: String,
     },
+    /// Identity change attempted in proposal or commit - MIP-00 requires immutable identity
+    #[error(
+        "identity change not allowed: proposal attempts to change identity from {original_identity} to {new_identity}"
+    )]
+    IdentityChangeNotAllowed {
+        /// The original identity of the member
+        original_identity: String,
+        /// The new identity attempted in the proposal
+        new_identity: String,
+    },
     /// Rumor event is missing its ID
     #[error("rumor event is missing its ID")]
     MissingRumorEventId,
-    /// Event signature verification failed
-    #[error("event signature verification failed")]
-    InvalidEventSignature,
     /// Event timestamp is invalid (too far in future or past)
     #[error("event timestamp is invalid: {0}")]
     InvalidTimestamp(String),
@@ -323,5 +327,222 @@ where
             },
             _ => Self::ProcessMessageOther(e.to_string()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nostr::Kind;
+
+    /// Test that all error variants can be constructed and display correctly
+    #[test]
+    fn test_error_display_messages() {
+        // Test simple message errors
+        let error = Error::ProcessMessageWrongEpoch;
+        assert_eq!(
+            error.to_string(),
+            "Message epoch differs from the group's epoch"
+        );
+
+        let error = Error::ProcessMessageWrongGroupId;
+        assert_eq!(error.to_string(), "Wrong group ID");
+
+        let error = Error::ProcessMessageUseAfterEviction;
+        assert_eq!(error.to_string(), "Use after eviction");
+
+        let error = Error::ProcessMessageOther("custom error".to_string());
+        assert_eq!(error.to_string(), "custom error");
+
+        let error = Error::ProtocolMessage("protocol error".to_string());
+        assert_eq!(error.to_string(), "protocol error");
+
+        let error = Error::KeyPackage("key package error".to_string());
+        assert_eq!(error.to_string(), "key package error");
+
+        let error = Error::Group("group error".to_string());
+        assert_eq!(error.to_string(), "group error");
+
+        let error = Error::GroupExporterSecretNotFound;
+        assert_eq!(error.to_string(), "group exporter secret not found");
+
+        let error = Error::Message("message error".to_string());
+        assert_eq!(error.to_string(), "message error");
+
+        let error = Error::CannotDecryptOwnMessage;
+        assert_eq!(error.to_string(), "cannot decrypt own message");
+
+        let error = Error::MergePendingCommit("merge error".to_string());
+        assert_eq!(error.to_string(), "merge error");
+
+        let error = Error::CommitToPendingProposalsError;
+        assert_eq!(error.to_string(), "unable to commit to pending proposal");
+
+        let error = Error::SelfUpdate("self update error".to_string());
+        assert_eq!(error.to_string(), "self update error");
+
+        let error = Error::Welcome("welcome error".to_string());
+        assert_eq!(error.to_string(), "welcome error");
+
+        let error = Error::MissingWelcomeForProcessedWelcome;
+        assert_eq!(error.to_string(), "missing welcome for processed welcome");
+
+        let error = Error::ProcessedWelcomeNotFound;
+        assert_eq!(error.to_string(), "processed welcome not found");
+
+        let error = Error::Provider("provider error".to_string());
+        assert_eq!(error.to_string(), "provider error");
+
+        let error = Error::GroupNotFound;
+        assert_eq!(error.to_string(), "group not found");
+
+        let error = Error::ProtocolGroupIdMismatch;
+        assert_eq!(
+            error.to_string(),
+            "protocol message group ID doesn't match the current group ID"
+        );
+
+        let error = Error::OwnLeafNotFound;
+        assert_eq!(error.to_string(), "own leaf not found");
+
+        let error = Error::CantLoadSigner;
+        assert_eq!(error.to_string(), "can't load signer");
+
+        let error = Error::InvalidWelcomeMessage;
+        assert_eq!(error.to_string(), "invalid welcome message");
+
+        let error = Error::UnexpectedExtensionType;
+        assert_eq!(error.to_string(), "Unexpected extension type");
+
+        let error = Error::NostrGroupDataExtensionNotFound;
+        assert_eq!(error.to_string(), "Nostr group data extension not found");
+
+        let error = Error::MessageFromNonMember;
+        assert_eq!(error.to_string(), "Message received from non-member");
+
+        let error = Error::NotImplemented("feature X".to_string());
+        assert_eq!(error.to_string(), "feature X");
+
+        let error = Error::MessageNotFound;
+        assert_eq!(error.to_string(), "stored message not found");
+
+        let error = Error::CommitFromNonAdmin;
+        assert_eq!(error.to_string(), "not processing commit from non-admin");
+
+        let error = Error::UpdateGroupContextExts("context error".to_string());
+        assert_eq!(
+            error.to_string(),
+            "Error when updating group context extensions context error"
+        );
+
+        let error = Error::InvalidImageHashLength;
+        assert_eq!(error.to_string(), "invalid image hash length");
+
+        let error = Error::InvalidImageKeyLength;
+        assert_eq!(error.to_string(), "invalid image key length");
+
+        let error = Error::InvalidImageNonceLength;
+        assert_eq!(error.to_string(), "invalid image nonce length");
+
+        let error = Error::InvalidImageUploadKeyLength;
+        assert_eq!(error.to_string(), "invalid image upload key length");
+
+        let error = Error::InvalidExtensionVersion(99);
+        assert_eq!(error.to_string(), "invalid extension version: 99");
+
+        let error = Error::AuthorMismatch;
+        assert_eq!(
+            error.to_string(),
+            "author mismatch: rumor pubkey does not match MLS sender"
+        );
+
+        let error = Error::MissingRumorEventId;
+        assert_eq!(error.to_string(), "rumor event is missing its ID");
+    }
+
+    /// Test UnexpectedEvent error variant with Kind values
+    #[test]
+    fn test_unexpected_event_error() {
+        let error = Error::UnexpectedEvent {
+            expected: Kind::MlsGroupMessage,
+            received: Kind::TextNote,
+        };
+
+        let msg = error.to_string();
+        assert!(msg.contains("unexpected event kind"));
+        assert!(msg.contains("expected="));
+        assert!(msg.contains("received="));
+    }
+
+    /// Test KeyPackageIdentityMismatch error variant
+    #[test]
+    fn test_key_package_identity_mismatch_error() {
+        let error = Error::KeyPackageIdentityMismatch {
+            credential_identity: "abc123".to_string(),
+            event_signer: "def456".to_string(),
+        };
+
+        let msg = error.to_string();
+        assert!(msg.contains("key package identity mismatch"));
+        assert!(msg.contains("abc123"));
+        assert!(msg.contains("def456"));
+    }
+
+    /// Test IdentityChangeNotAllowed error variant
+    #[test]
+    fn test_identity_change_not_allowed_error() {
+        let error = Error::IdentityChangeNotAllowed {
+            original_identity: "original_id".to_string(),
+            new_identity: "new_id".to_string(),
+        };
+
+        let msg = error.to_string();
+        assert!(msg.contains("identity change not allowed"));
+        assert!(msg.contains("original_id"));
+        assert!(msg.contains("new_id"));
+    }
+
+    /// Test error equality (PartialEq implementation)
+    #[test]
+    fn test_error_equality() {
+        let error1 = Error::GroupNotFound;
+        let error2 = Error::GroupNotFound;
+        let error3 = Error::OwnLeafNotFound;
+
+        assert_eq!(error1, error2);
+        assert_ne!(error1, error3);
+
+        let error1 = Error::Message("test".to_string());
+        let error2 = Error::Message("test".to_string());
+        let error3 = Error::Message("different".to_string());
+
+        assert_eq!(error1, error2);
+        assert_ne!(error1, error3);
+    }
+
+    /// Test From<FromUtf8Error> conversion
+    #[test]
+    fn test_from_utf8_error_conversion() {
+        let invalid_bytes = vec![0xff, 0xfe];
+        let utf8_result = String::from_utf8(invalid_bytes);
+        assert!(utf8_result.is_err());
+
+        let error: Error = utf8_result.unwrap_err().into();
+        assert!(matches!(error, Error::Utf8(_)));
+    }
+
+    /// Test Debug implementation
+    #[test]
+    fn test_error_debug() {
+        let error = Error::GroupNotFound;
+        let debug_str = format!("{:?}", error);
+        assert!(debug_str.contains("GroupNotFound"));
+
+        let error = Error::UnexpectedEvent {
+            expected: Kind::MlsGroupMessage,
+            received: Kind::TextNote,
+        };
+        let debug_str = format!("{:?}", error);
+        assert!(debug_str.contains("UnexpectedEvent"));
     }
 }
