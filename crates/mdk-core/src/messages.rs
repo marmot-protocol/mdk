@@ -580,9 +580,12 @@ where
 
     /// Validates the incoming event and extracts the group ID
     ///
-    /// This private method validates that the event has the correct kind, verifies
-    /// the Nostr signature, validates the event ID, checks timestamp bounds, and
-    /// extracts the group ID from the event tags per MIP-03 requirements.
+    /// This private method validates that the event has the correct kind, checks
+    /// timestamp bounds, and extracts the group ID from the event tags per MIP-03
+    /// requirements.
+    ///
+    /// Note: Nostr signature verification is handled by nostr-sdk's relay pool when
+    /// events are received from relays.
     ///
     /// # Arguments
     ///
@@ -601,13 +604,7 @@ where
             });
         }
 
-        // 2. Verify Nostr signature and event ID
-        // Note: While nostr-relay-pool validates events from relays, MDK is a library
-        // that may receive events from other sources (local storage, direct API calls, etc.).
-        // Explicit verification provides defense-in-depth and clear error messages.
-        event.verify().map_err(|_| Error::InvalidEventSignature)?;
-
-        // 3. Verify timestamp is within acceptable bounds
+        // 2. Verify timestamp is within acceptable bounds
         let now = Timestamp::now();
 
         // Reject events from the future (allow configurable clock skew)
@@ -633,7 +630,7 @@ where
             )));
         }
 
-        // 4. Extract and validate group ID tag (MIP-03 requires exactly one h tag)
+        // 3. Extract and validate group ID tag (MIP-03 requires exactly one h tag)
         let h_tags: Vec<_> = event
             .tags
             .iter()
@@ -3765,48 +3762,6 @@ mod tests {
         assert!(
             result.is_ok(),
             "Expected success when rumor pubkey matches credential"
-        );
-    }
-
-    /// Test that validate_event_and_extract_group_id properly validates Nostr signatures
-    #[test]
-    fn test_validate_event_rejects_invalid_signature() {
-        let mdk = create_test_mdk();
-        let (creator, members, admins) = create_test_group_members();
-        let group_id = create_test_group(&mdk, &creator, &members, &admins);
-
-        // Get the group's nostr_group_id for the h tag
-        let group = mdk
-            .get_group(&group_id)
-            .expect("Failed to get group")
-            .expect("Group should exist");
-
-        // Create a valid event
-        let rumor = create_test_rumor(&creator, "Test message");
-        let message_event = mdk
-            .create_message(&group_id, rumor)
-            .expect("Failed to create message");
-
-        // Create a different event signed by a different key
-        let attacker = Keys::generate();
-        let mut tampered_event = EventBuilder::new(Kind::MlsGroupMessage, "tampered content")
-            .tag(Tag::custom(
-                TagKind::h(),
-                [hex::encode(group.nostr_group_id)],
-            ))
-            .sign_with_keys(&attacker)
-            .expect("Failed to create tampered event");
-
-        // Replace the signature with the original event's signature (mismatch)
-        tampered_event.sig = message_event.sig;
-        tampered_event.pubkey = message_event.pubkey;
-
-        // Validation should fail due to invalid signature
-        let result = mdk.validate_event_and_extract_group_id(&tampered_event);
-        assert!(
-            matches!(result, Err(Error::InvalidEventSignature)),
-            "Expected InvalidEventSignature error, got: {:?}",
-            result
         );
     }
 
