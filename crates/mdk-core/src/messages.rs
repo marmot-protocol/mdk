@@ -5163,6 +5163,8 @@ mod tests {
                 assert_eq!(new, attacker_identity.to_hex());
             }
         }
+    }
+
     /// Test that validation failures persist failed processing state
     ///
     /// This test verifies that when message validation fails (e.g., wrong event kind),
