@@ -32,8 +32,7 @@
 
 ### Changed
 
-- Simplified validation logic to use range contains pattern for better readability ([#111](https://github.com/marmot-protocol/mdk/pull/111))
-- Simplified validation logic to use range contains pattern for better readability ([#110](https://github.com/marmot-protocol/mdk/pull/110))
+- Simplified validation logic to use range contains pattern for better readability ([#110](https://github.com/marmot-protocol/mdk/pull/110), [#111](https://github.com/marmot-protocol/mdk/pull/111))
 
 ### Added
 
