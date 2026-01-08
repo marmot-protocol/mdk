@@ -85,6 +85,8 @@ pub struct NostrGroupDataUpdate {
     pub relays: Option<Vec<RelayUrl>>,
     /// Group admins (optional)
     pub admins: Option<Vec<PublicKey>>,
+    /// Nostr group ID for message routing (optional, for rotation per MIP-01)
+    pub nostr_group_id: Option<[u8; 32]>,
 }
 
 impl NostrGroupConfigData {
@@ -167,6 +169,12 @@ impl NostrGroupDataUpdate {
     /// Sets the admins to be updated
     pub fn admins(mut self, admins: Vec<PublicKey>) -> Self {
         self.admins = Some(admins);
+        self
+    }
+
+    /// Sets the nostr_group_id to be updated (for ID rotation per MIP-01)
+    pub fn nostr_group_id(mut self, nostr_group_id: [u8; 32]) -> Self {
+        self.nostr_group_id = Some(nostr_group_id);
         self
     }
 }
@@ -754,6 +762,11 @@ where
     /// // Note: Setting image_hash to None automatically clears image_key, image_nonce, and image_upload_key
     /// let update = NostrGroupDataUpdate::new().image_hash(None);
     /// mls.update_group_data(&group_id, update)?;
+    ///
+    /// // Rotate the nostr_group_id for message routing (per MIP-01)
+    /// let new_id = [0u8; 32]; // Generate a new random ID
+    /// let update = NostrGroupDataUpdate::new().nostr_group_id(new_id);
+    /// mls.update_group_data(&group_id, update)?;
     /// ```
     pub fn update_group_data(
         &self,
@@ -803,6 +816,10 @@ where
             // Validate admin update against current membership before applying
             self.validate_admin_update(group_id, admins)?;
             group_data.admins = admins.iter().copied().collect();
+        }
+
+        if let Some(nostr_group_id) = update.nostr_group_id {
+            group_data.nostr_group_id = nostr_group_id;
         }
 
         self.update_group_data_extension(&mut mls_group, group_id, &group_data)
@@ -1000,13 +1017,7 @@ where
     pub fn self_update(&self, group_id: &GroupId) -> Result<UpdateGroupResult, Error> {
         let mut mls_group = self.load_mls_group(group_id)?.ok_or(Error::GroupNotFound)?;
 
-        let current_secret: group_types::GroupExporterSecret = self
-            .storage()
-            .get_group_exporter_secret(group_id, mls_group.epoch().as_u64())
-            .map_err(|e| Error::Group(e.to_string()))?
-            .ok_or(Error::GroupExporterSecretNotFound)?;
-
-        tracing::debug!(target: "nostr_openmls::groups::self_update", "Current epoch: {:?}", current_secret.epoch);
+        tracing::debug!(target: "mdk_core::groups::self_update", "Current epoch: {:?}", mls_group.epoch().as_u64());
 
         // Load current signer
         let current_signer: SignatureKeyPair = self.load_mls_signer(&mls_group)?;
@@ -1175,24 +1186,24 @@ where
         let mls_group = self.load_mls_group(group_id)?.ok_or(Error::GroupNotFound)?;
         let mut stored_group = self.get_group(group_id)?.ok_or(Error::GroupNotFound)?;
 
-        // Update epoch from MLS group
+        // Validate the mandatory group-data extension FIRST before making any state changes
+        // This ensures we don't update stored_group if the extension is missing, invalid, or unsupported
+        let group_data = NostrGroupDataExtension::from_group(&mls_group)?;
+
+        // Only after successful validation, update epoch and metadata from MLS group
         stored_group.epoch = mls_group.epoch().as_u64();
+        stored_group.name = group_data.name;
+        stored_group.description = group_data.description;
+        stored_group.image_hash = group_data.image_hash;
+        stored_group.image_key = group_data.image_key;
+        stored_group.image_nonce = group_data.image_nonce;
+        stored_group.admin_pubkeys = group_data.admins;
+        stored_group.nostr_group_id = group_data.nostr_group_id;
 
-        // Update extension data from NostrGroupDataExtension
-        if let Ok(group_data) = NostrGroupDataExtension::from_group(&mls_group) {
-            stored_group.name = group_data.name;
-            stored_group.description = group_data.description;
-            stored_group.image_hash = group_data.image_hash;
-            stored_group.image_key = group_data.image_key;
-            stored_group.image_nonce = group_data.image_nonce;
-            stored_group.admin_pubkeys = group_data.admins;
-            stored_group.nostr_group_id = group_data.nostr_group_id;
-
-            // Sync relays atomically - replace entire relay set with current extension data
-            self.storage()
-                .replace_group_relays(group_id, group_data.relays)
-                .map_err(|e| Error::Group(e.to_string()))?;
-        }
+        // Sync relays atomically - replace entire relay set with current extension data
+        self.storage()
+            .replace_group_relays(group_id, group_data.relays)
+            .map_err(|e| Error::Group(e.to_string()))?;
 
         self.storage()
             .save_group(stored_group)
@@ -1393,6 +1404,7 @@ mod tests {
     use openmls::prelude::BasicCredential;
 
     use super::NostrGroupDataExtension;
+    use crate::constant::NOSTR_GROUP_DATA_EXTENSION_TYPE;
     use crate::groups::NostrGroupDataUpdate;
     use crate::test_util::*;
     use crate::tests::create_test_mdk;
@@ -2102,11 +2114,6 @@ mod tests {
             .expect("MLS group should exist");
         let initial_epoch = initial_mls_group.epoch().as_u64();
 
-        // Ensure the exporter secret exists before self update (this creates it if it doesn't exist)
-        let _initial_secret = creator_mdk
-            .exporter_secret(group_id)
-            .expect("Failed to get initial exporter secret");
-
         // Perform self update
         let update_result = creator_mdk
             .self_update(group_id)
@@ -2212,11 +2219,6 @@ mod tests {
             .own_leaf()
             .expect("Failed to get initial own leaf");
         let initial_signature_key = initial_own_leaf.signature_key().as_slice().to_vec();
-
-        // Ensure the exporter secret exists before self update (this creates it if it doesn't exist)
-        let _initial_secret = creator_mdk
-            .exporter_secret(group_id)
-            .expect("Failed to get initial exporter secret");
 
         // Perform self update (this should rotate the signing key)
         let _update_result = creator_mdk
@@ -2729,11 +2731,6 @@ mod tests {
         verify_epoch_sync();
 
         // Test 3: After self update
-        // Ensure the exporter secret exists before self update (this creates it if it doesn't exist)
-        let _initial_secret = creator_mdk
-            .exporter_secret(group_id)
-            .expect("Failed to get initial exporter secret");
-
         let _self_update_result = creator_mdk
             .self_update(group_id)
             .expect("Failed to perform self update");
@@ -2776,6 +2773,89 @@ mod tests {
         let non_existent_group_id = crate::GroupId::from_slice(&[1, 2, 3, 4, 5]);
         let result = creator_mdk.sync_group_metadata_from_mls(&non_existent_group_id);
         assert!(matches!(result, Err(crate::Error::GroupNotFound)));
+    }
+
+    #[test]
+    fn test_sync_group_metadata_propagates_extension_parse_failure() {
+        use openmls::prelude::{Extension, UnknownExtension};
+
+        let creator_mdk = create_test_mdk();
+        let (creator, initial_members, admins) = create_test_group_members();
+        let creator_pk = creator.public_key();
+
+        // Create key package events for initial members
+        let mut initial_key_package_events = Vec::new();
+        for member_keys in &initial_members {
+            let key_package_event = create_key_package_event(&creator_mdk, member_keys);
+            initial_key_package_events.push(key_package_event);
+        }
+
+        // Create the group
+        let create_result = creator_mdk
+            .create_group(
+                &creator_pk,
+                initial_key_package_events,
+                create_nostr_group_config_data(admins.clone()),
+            )
+            .expect("Failed to create group");
+
+        let group_id = &create_result.group.mls_group_id;
+
+        // Merge the pending commit
+        creator_mdk
+            .merge_pending_commit(group_id)
+            .expect("Failed to merge pending commit");
+
+        // Load the MLS group and corrupt the group-data extension
+        let mut mls_group = creator_mdk
+            .load_mls_group(group_id)
+            .expect("Failed to load MLS group")
+            .expect("MLS group should exist");
+
+        // Create a corrupted extension with invalid data
+        let corrupted_extension_data = vec![0xFF, 0xFF, 0xFF]; // Invalid TLS-serialized data
+        let corrupted_extension = Extension::Unknown(
+            NOSTR_GROUP_DATA_EXTENSION_TYPE,
+            UnknownExtension(corrupted_extension_data),
+        );
+
+        // Replace the group-data extension with the corrupted one
+        let mut extensions = mls_group.extensions().clone();
+        extensions.add_or_replace(corrupted_extension);
+
+        let signature_keypair = creator_mdk.load_mls_signer(&mls_group).unwrap();
+        let (_message_out, _, _) = mls_group
+            .update_group_context_extensions(&creator_mdk.provider, extensions, &signature_keypair)
+            .unwrap();
+
+        // Merge the pending commit to apply the corrupted extension
+        mls_group
+            .merge_pending_commit(&creator_mdk.provider)
+            .unwrap();
+
+        // Now test that sync_group_metadata_from_mls properly propagates the parse error
+        let result = creator_mdk.sync_group_metadata_from_mls(group_id);
+
+        // The function should return an error, not silently ignore the parse failure
+        assert!(
+            result.is_err(),
+            "sync_group_metadata_from_mls should propagate extension parse errors"
+        );
+
+        // Verify it's a deserialization error (the specific error from deserialize_with_migration)
+        match result {
+            Err(e) => {
+                let error_msg = e.to_string();
+                assert!(
+                    error_msg.contains("TLS")
+                        || error_msg.contains("deserialize")
+                        || error_msg.contains("EndOfStream"),
+                    "Expected deserialization error, got: {}",
+                    error_msg
+                );
+            }
+            Ok(_) => panic!("Expected error but got Ok"),
+        }
     }
 
     /// Test getting group that doesn't exist
@@ -3548,6 +3628,40 @@ mod tests {
         assert_eq!(groups.len(), 0, "Should have no groups initially");
     }
 
+    /// Test getting all groups returns created groups
+    #[test]
+    fn test_get_groups_with_data() {
+        let creator_mdk = create_test_mdk();
+        let (creator, members, admins) = create_test_group_members();
+
+        // Create a group
+        let group_id = create_test_group(&creator_mdk, &creator, &members, &admins);
+
+        // Get all groups
+        let groups = creator_mdk.get_groups().expect("Should succeed");
+
+        assert_eq!(groups.len(), 1, "Should have 1 group");
+        assert_eq!(groups[0].mls_group_id, group_id, "Group ID should match");
+    }
+
+    /// Test getting relays for a group
+    #[test]
+    fn test_get_relays() {
+        let creator_mdk = create_test_mdk();
+        let (creator, members, admins) = create_test_group_members();
+
+        // Create a group (create_nostr_group_config_data includes test relays)
+        let group_id = create_test_group(&creator_mdk, &creator, &members, &admins);
+
+        // Get relays for the group
+        let relays = creator_mdk
+            .get_relays(&group_id)
+            .expect("Should get relays");
+
+        // Verify relays were stored (test config includes relays)
+        assert!(!relays.is_empty(), "Group should have relays");
+    }
+
     /// Test getting members for non-existent group
     #[test]
     fn test_get_members_nonexistent_group() {
@@ -3628,6 +3742,63 @@ mod tests {
         creator_mdk
             .merge_pending_commit(&group_id)
             .expect("Failed to merge commit");
+    }
+
+    /// Test that nostr_group_id can be rotated via update_group_data
+    ///
+    /// MIP-01 allows nostr_group_id rotation via proposals. This test verifies
+    /// that the update API supports rotating the nostr_group_id for message routing.
+    #[test]
+    fn test_update_nostr_group_id() {
+        let creator_mdk = create_test_mdk();
+        let (creator, members, admins) = create_test_group_members();
+        let group_id = create_test_group(&creator_mdk, &creator, &members, &admins);
+
+        // Get the initial nostr_group_id
+        let initial_mls_group = creator_mdk
+            .load_mls_group(&group_id)
+            .expect("Failed to load MLS group")
+            .expect("MLS group should exist");
+        let initial_group_data = NostrGroupDataExtension::from_group(&initial_mls_group).unwrap();
+        let initial_nostr_group_id = initial_group_data.nostr_group_id;
+
+        // Create a new nostr_group_id
+        let new_nostr_group_id: [u8; 32] = [42u8; 32];
+
+        // Update the nostr_group_id via the update API
+        let update = NostrGroupDataUpdate::new().nostr_group_id(new_nostr_group_id);
+        let result = creator_mdk.update_group_data(&group_id, update);
+        assert!(result.is_ok(), "Should be able to update nostr_group_id");
+
+        creator_mdk
+            .merge_pending_commit(&group_id)
+            .expect("Failed to merge commit");
+
+        // Verify the nostr_group_id was updated in the MLS extension
+        let final_mls_group = creator_mdk
+            .load_mls_group(&group_id)
+            .expect("Failed to load MLS group")
+            .expect("MLS group should exist");
+        let final_group_data = NostrGroupDataExtension::from_group(&final_mls_group).unwrap();
+
+        assert_ne!(
+            final_group_data.nostr_group_id, initial_nostr_group_id,
+            "nostr_group_id should have changed"
+        );
+        assert_eq!(
+            final_group_data.nostr_group_id, new_nostr_group_id,
+            "nostr_group_id should match the new value"
+        );
+
+        // Verify the stored group metadata was synced
+        let stored_group = creator_mdk
+            .get_group(&group_id)
+            .expect("Failed to get group")
+            .expect("Group should exist");
+        assert_eq!(
+            stored_group.nostr_group_id, new_nostr_group_id,
+            "Stored group nostr_group_id should be synced"
+        );
     }
 
     // ============================================================================
