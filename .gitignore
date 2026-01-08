@@ -12,3 +12,6 @@ coverage/
 
 # Editor specific files
 .vscode/
+
+# Claude AI settings (local overrides)
+.claude/settings.local.json
