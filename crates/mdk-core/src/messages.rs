@@ -4366,11 +4366,11 @@ mod tests {
             // Alice performs self_update
             let alice_update_result = alice_mdk
                 .self_update(&group_id)
-                .unwrap_or_else(|_| panic!("Alice self_update {} should succeed", i));
+                .unwrap_or_else(|e| panic!("Alice self_update {} should succeed: {:?}", i, e));
 
             alice_mdk
                 .merge_pending_commit(&group_id)
-                .unwrap_or_else(|_| panic!("Alice should merge self_update commit {}", i));
+                .unwrap_or_else(|e| panic!("Alice should merge self_update commit {}: {:?}", i, e));
 
             // Bob processes Alice's commit
             let bob_process_result = bob_mdk.process_message(&alice_update_result.evolution_event);
@@ -4383,11 +4383,11 @@ mod tests {
             // Bob performs self_update
             let bob_update_result = bob_mdk
                 .self_update(&group_id)
-                .unwrap_or_else(|_| panic!("Bob self_update {} should succeed", i));
+                .unwrap_or_else(|e| panic!("Bob self_update {} should succeed: {:?}", i, e));
 
             bob_mdk
                 .merge_pending_commit(&group_id)
-                .unwrap_or_else(|_| panic!("Bob should merge self_update commit {}", i));
+                .unwrap_or_else(|e| panic!("Bob should merge self_update commit {}: {:?}", i, e));
 
             // Alice processes Bob's commit
             let alice_process_result =
@@ -4516,16 +4516,16 @@ mod tests {
         for i in 0..5 {
             let update_result = alice_mdk
                 .self_update(&group_id)
-                .unwrap_or_else(|_| panic!("Alice self_update {} should succeed", i));
+                .unwrap_or_else(|e| panic!("Alice self_update {} should succeed: {:?}", i, e));
 
             alice_mdk
                 .merge_pending_commit(&group_id)
-                .unwrap_or_else(|_| panic!("Alice should merge commit {}", i));
+                .unwrap_or_else(|e| panic!("Alice should merge commit {}: {:?}", i, e));
 
             // Bob processes to stay in sync
             bob_mdk
                 .process_message(&update_result.evolution_event)
-                .unwrap_or_else(|_| panic!("Bob should process commit {}", i));
+                .unwrap_or_else(|e| panic!("Bob should process commit {}: {:?}", i, e));
         }
 
         // Verify epoch advanced
@@ -4727,8 +4727,6 @@ mod tests {
     /// and that identity parsing works correctly for validation.
     #[test]
     fn test_identity_validation_with_tls_serialization() {
-        use tls_codec::Serialize as TlsSerialize;
-
         let mdk = create_test_mdk();
         let (creator, members, admins) = create_test_group_members();
         let group_id = create_test_group(&mdk, &creator, &members, &admins);
