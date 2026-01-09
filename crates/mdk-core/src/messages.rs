@@ -1077,15 +1077,22 @@ where
             .content()
             .ok_or_else(|| Error::InvalidGroupIdFormat("h tag has no content".to_string()))?;
 
-        let nostr_group_id: [u8; 32] = hex::decode(group_id_hex)
-            .map_err(|e| Error::InvalidGroupIdFormat(format!("hex decode failed: {}", e)))?
-            .try_into()
-            .map_err(|_| {
-                Error::InvalidGroupIdFormat(format!(
-                    "expected 32 bytes, got {} bytes",
-                    hex::decode(group_id_hex).unwrap_or_default().len()
-                ))
-            })?;
+        // Validate hex string length before decoding to prevent unbounded memory allocation
+        // A 32-byte value requires exactly 64 hex characters
+        if group_id_hex.len() != 64 {
+            return Err(Error::InvalidGroupIdFormat(format!(
+                "expected 64 hex characters (32 bytes), got {} characters",
+                group_id_hex.len()
+            )));
+        }
+
+        // Decode once and reuse the result
+        let bytes = hex::decode(group_id_hex)
+            .map_err(|e| Error::InvalidGroupIdFormat(format!("hex decode failed: {}", e)))?;
+
+        let nostr_group_id: [u8; 32] = bytes.try_into().map_err(|v: Vec<u8>| {
+            Error::InvalidGroupIdFormat(format!("expected 32 bytes, got {} bytes", v.len()))
+        })?;
 
         Ok(nostr_group_id)
     }
