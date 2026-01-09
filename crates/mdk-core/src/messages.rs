@@ -896,14 +896,10 @@ where
         Ok(())
     }
 
-    /// Validates the incoming event and extracts the group ID
+    /// Validates that an event's timestamp is within acceptable bounds
     ///
-    /// This private method validates that the event has the correct kind, checks
-    /// timestamp bounds, and extracts the group ID from the event tags per MIP-03
-    /// requirements.
-    ///
-    /// Note: Nostr signature verification is handled by nostr-sdk's relay pool when
-    /// events are received from relays.
+    /// This method checks that the event timestamp is not too far in the future
+    /// (beyond configurable clock skew) and not too old (beyond configurable max age).
     ///
     /// # Arguments
     ///
@@ -911,18 +907,9 @@ where
     ///
     /// # Returns
     ///
-    /// * `Ok([u8; 32])` - The extracted Nostr group ID
-    /// * `Err(Error)` - If validation fails or group ID cannot be extracted
-    fn validate_event_and_extract_group_id(&self, event: &Event) -> Result<[u8; 32]> {
-        // 1. Verify event kind
-        if event.kind != Kind::MlsGroupMessage {
-            return Err(Error::UnexpectedEvent {
-                expected: Kind::MlsGroupMessage,
-                received: event.kind,
-            });
-        }
-
-        // 2. Verify timestamp is within acceptable bounds
+    /// * `Ok(())` - If timestamp is valid
+    /// * `Err(Error::InvalidTimestamp)` - If timestamp is outside acceptable bounds
+    fn validate_created_at(&self, event: &Event) -> Result<()> {
         let now = Timestamp::now();
 
         // Reject events from the future (allow configurable clock skew)
@@ -948,7 +935,24 @@ where
             )));
         }
 
-        // 3. Extract and validate group ID tag (MIP-03 requires exactly one h tag)
+        Ok(())
+    }
+
+    /// Validates and extracts the Nostr group ID from event tags
+    ///
+    /// This method validates that the event has exactly one 'h' tag (per MIP-03)
+    /// and extracts the 32-byte group ID from its hex content.
+    ///
+    /// # Arguments
+    ///
+    /// * `event` - The Nostr event to extract group ID from
+    ///
+    /// # Returns
+    ///
+    /// * `Ok([u8; 32])` - The extracted Nostr group ID
+    /// * `Err(Error)` - If validation fails or group ID cannot be extracted
+    fn validate_and_extract_nostr_group_id(&self, event: &Event) -> Result<[u8; 32]> {
+        // Extract and validate group ID tag (MIP-03 requires exactly one h tag)
         let h_tags: Vec<_> = event
             .tags
             .iter()
@@ -980,6 +984,39 @@ where
             })?;
 
         Ok(nostr_group_id)
+    }
+
+    /// Validates the incoming event and extracts the group ID
+    ///
+    /// This private method validates that the event has the correct kind, checks
+    /// timestamp bounds, and extracts the group ID from the event tags per MIP-03
+    /// requirements.
+    ///
+    /// Note: Nostr signature verification is handled by nostr-sdk's relay pool when
+    /// events are received from relays.
+    ///
+    /// # Arguments
+    ///
+    /// * `event` - The Nostr event to validate
+    ///
+    /// # Returns
+    ///
+    /// * `Ok([u8; 32])` - The extracted Nostr group ID
+    /// * `Err(Error)` - If validation fails or group ID cannot be extracted
+    fn validate_event_and_extract_group_id(&self, event: &Event) -> Result<[u8; 32]> {
+        // 1. Verify event kind
+        if event.kind != Kind::MlsGroupMessage {
+            return Err(Error::UnexpectedEvent {
+                expected: Kind::MlsGroupMessage,
+                received: event.kind,
+            });
+        }
+
+        // 2. Verify timestamp is within acceptable bounds
+        self.validate_created_at(event)?;
+
+        // 3. Extract and validate group ID tag
+        self.validate_and_extract_nostr_group_id(event)
     }
 
     /// Loads the group and decrypts the message content
@@ -5790,8 +5827,8 @@ mod tests {
             .expect("Failed to get group")
             .expect("Group should exist");
 
-        // Set timestamp to 8 days ago (beyond 7 day limit)
-        let old_time = nostr::Timestamp::now().as_u64().saturating_sub(8 * 86400);
+        // Set timestamp to 46 days ago (beyond 45 day limit)
+        let old_time = nostr::Timestamp::now().as_u64().saturating_sub(46 * 86400);
 
         // Create an event with old timestamp
         let message_event = EventBuilder::new(Kind::MlsGroupMessage, "test content")

@@ -67,7 +67,7 @@ pub struct MdkConfig {
     /// - Resource exhaustion from processing large message backlogs
     /// - Synchronization issues with stale group state
     ///
-    /// Default: 604800 (7 days)
+    /// Default: 3888000 (45 days)
     ///
     /// # Security Note
     /// This value is intentionally conservative. Increasing it may expose
@@ -89,8 +89,8 @@ pub struct MdkConfig {
 impl Default for MdkConfig {
     fn default() -> Self {
         Self {
-            max_event_age_secs: 604800, // 7 days
-            max_future_skew_secs: 300,  // 5 minutes
+            max_event_age_secs: 3888000, // 45 days
+            max_future_skew_secs: 300,   // 5 minutes
         }
     }
 }

@@ -52,7 +52,7 @@
 - New error variant `KeyPackageIdentityMismatch` for KeyPackage credential identity validation failures ([#41](https://github.com/marmot-protocol/mdk/pull/41))
 - New error variant `MissingRumorEventId` for when a rumor event is missing its ID ([#107](https://github.com/marmot-protocol/mdk/pull/107))
 - New error variants for Nostr event validation: `InvalidTimestamp`, `MissingGroupIdTag`, `InvalidGroupIdFormat`, `MultipleGroupIdTags` ([#128](https://github.com/marmot-protocol/mdk/pull/128))
-- Added `max_event_age_secs` and `max_future_skew_secs` fields to `MdkConfig` for configurable message timestamp validation. Default values are 7 days and 5 minutes respectively. ([#128](https://github.com/marmot-protocol/mdk/pull/128))
+- Added `max_event_age_secs` and `max_future_skew_secs` fields to `MdkConfig` for configurable message timestamp validation. Default values are 45 days and 5 minutes respectively. ([#128](https://github.com/marmot-protocol/mdk/pull/128))
 - Added pagination support to `get_messages()` public API - accepts `Option<Pagination>` to control limit and offset for message retrieval ([#111](https://github.com/marmot-protocol/mdk/pull/111))
 - Exposed `Pagination` struct (from `mdk_storage_traits::groups`) in public API for paginated message queries ([#111](https://github.com/marmot-protocol/mdk/pull/111))
 - Added pagination support to `get_pending_welcomes()` public API - accepts `Option<Pagination>` to control limit and offset for welcome retrieval ([#110](https://github.com/marmot-protocol/mdk/pull/110))
