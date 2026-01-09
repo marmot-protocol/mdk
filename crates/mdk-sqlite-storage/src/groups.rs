@@ -666,7 +666,7 @@ mod tests {
         // Use a file-based database so we can access it from multiple connections
         let temp_dir = tempdir().unwrap();
         let db_path = temp_dir.path().join("test.db");
-        let storage = MdkSqliteStorage::new(&db_path).unwrap();
+        let storage = MdkSqliteStorage::new_unencrypted(&db_path).unwrap();
 
         // Create and save two valid groups
         let mls_group_id1 = GroupId::from_slice(&[1, 2, 3, 4]);

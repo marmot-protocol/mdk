@@ -20,7 +20,7 @@ use mdk_core::{
     groups::{NostrGroupConfigData, NostrGroupDataUpdate},
     messages::MessageProcessingResult,
 };
-use mdk_sqlite_storage::MdkSqliteStorage;
+use mdk_sqlite_storage::{EncryptionConfig, MdkSqliteStorage};
 use mdk_storage_traits::{
     GroupId,
     groups::{Pagination as MessagePagination, types as group_types},
@@ -184,10 +184,82 @@ impl Mdk {
     }
 }
 
-/// Create a new MDK instance with SQLite storage
+/// Create a new MDK instance with encrypted SQLite storage using automatic key management.
+///
+/// This is the recommended constructor for production use. The database encryption key
+/// is automatically retrieved from (or generated and stored in) the platform's native
+/// keyring (Keychain on macOS/iOS, Keystore on Android, etc.).
+///
+/// # Prerequisites
+///
+/// The host application must initialize a platform-specific keyring store before calling
+/// this function:
+///
+/// - **macOS/iOS**: `keyring_core::set_default_store(AppleStore::new())`
+/// - **Android**: Initialize from Kotlin (see Android documentation)
+/// - **Windows**: `keyring_core::set_default_store(WindowsStore::new())`
+/// - **Linux**: `keyring_core::set_default_store(KeyutilsStore::new())`
+///
+/// # Arguments
+///
+/// * `db_path` - Path to the SQLite database file
+/// * `service_id` - A stable, host-defined application identifier (e.g., "com.example.myapp")
+/// * `db_key_id` - A stable identifier for this database's key (e.g., "mdk.db.key.default")
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - No keyring store has been initialized
+/// - The keyring is unavailable or inaccessible
+/// - The database cannot be opened or created
 #[uniffi::export]
-pub fn new_mdk(db_path: String) -> Result<Mdk, MdkUniffiError> {
-    let storage = MdkSqliteStorage::new(PathBuf::from(db_path))?;
+pub fn new_mdk(
+    db_path: String,
+    service_id: String,
+    db_key_id: String,
+) -> Result<Mdk, MdkUniffiError> {
+    let storage = MdkSqliteStorage::new(PathBuf::from(db_path), &service_id, &db_key_id)?;
+    let mdk = MDK::new(storage);
+    Ok(Mdk {
+        mdk: Mutex::new(mdk),
+    })
+}
+
+/// Create a new MDK instance with encrypted SQLite storage using a directly provided key.
+///
+/// Use this when you want to manage encryption keys yourself rather than using the
+/// platform keyring. For most applications, prefer `new_mdk` which handles key
+/// management automatically.
+///
+/// # Arguments
+///
+/// * `db_path` - Path to the SQLite database file
+/// * `encryption_key` - 32-byte encryption key (must be exactly 32 bytes)
+///
+/// # Errors
+///
+/// Returns an error if the key is not 32 bytes or if the database cannot be opened.
+#[uniffi::export]
+pub fn new_mdk_with_key(db_path: String, encryption_key: Vec<u8>) -> Result<Mdk, MdkUniffiError> {
+    let config = EncryptionConfig::from_slice(&encryption_key)
+        .map_err(|e| MdkUniffiError::InvalidInput(format!("Invalid encryption key: {}", e)))?;
+    let storage = MdkSqliteStorage::new_with_key(PathBuf::from(db_path), config)?;
+    let mdk = MDK::new(storage);
+    Ok(Mdk {
+        mdk: Mutex::new(mdk),
+    })
+}
+
+/// Create a new MDK instance with unencrypted SQLite storage.
+///
+/// ⚠️ **WARNING**: This creates an unencrypted database. Sensitive MLS state
+/// including exporter secrets will be stored in plaintext.
+///
+/// Only use this for development or testing. For production use, use `new_mdk`
+/// with an encryption key.
+#[uniffi::export]
+pub fn new_mdk_unencrypted(db_path: String) -> Result<Mdk, MdkUniffiError> {
+    let storage = MdkSqliteStorage::new_unencrypted(PathBuf::from(db_path))?;
     let mdk = MDK::new(storage);
     Ok(Mdk {
         mdk: Mutex::new(mdk),
@@ -1139,14 +1211,47 @@ mod tests {
     use tempfile::TempDir;
 
     fn create_test_mdk() -> Mdk {
-        new_mdk(":memory:".to_string()).unwrap()
+        new_mdk_unencrypted(":memory:".to_string()).unwrap()
     }
 
     #[test]
-    fn test_new_mdk_creates_instance() {
+    fn test_new_mdk_with_key_creates_instance() {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("test.db");
-        let result = new_mdk(db_path.to_string_lossy().to_string());
+
+        // Test encrypted constructor with direct key
+        let key = vec![0u8; 32];
+        let result = new_mdk_with_key(db_path.to_string_lossy().to_string(), key);
+        assert!(result.is_ok());
+        let mdk = result.unwrap();
+        // Should be able to get groups (empty initially)
+        let groups = mdk.get_groups().unwrap();
+        assert_eq!(groups.len(), 0);
+    }
+
+    #[test]
+    fn test_new_mdk_with_key_invalid_key_length() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test_invalid_key.db");
+
+        // Test with wrong key length
+        let short_key = vec![0u8; 16];
+        let result = new_mdk_with_key(db_path.to_string_lossy().to_string(), short_key);
+        assert!(result.is_err());
+
+        match result {
+            Err(MdkUniffiError::InvalidInput(msg)) => {
+                assert!(msg.contains("Invalid encryption key"));
+            }
+            _ => panic!("Expected InvalidInput error"),
+        }
+    }
+
+    #[test]
+    fn test_new_mdk_unencrypted_creates_instance() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test_unencrypted.db");
+        let result = new_mdk_unencrypted(db_path.to_string_lossy().to_string());
         assert!(result.is_ok());
         let mdk = result.unwrap();
         // Should be able to get groups (empty initially)

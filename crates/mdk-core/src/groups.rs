@@ -232,6 +232,7 @@ where
         let group_data = NostrGroupDataExtension::from_group(&mls_group)?;
         Ok(group_data.admins.contains(&pubkey))
     }
+
     /// Extracts the public key from a leaf node
     ///
     /// # Arguments
@@ -241,7 +242,7 @@ where
     /// # Returns
     ///
     /// * `Ok(PublicKey)` - The public key extracted from the leaf node
-    /// * `Err(Error)` - If the public key cannot be extracted or there is an error converting the public key to hex
+    /// * `Err(Error)` - If the credential cannot be converted or the public key cannot be extracted
     pub(crate) fn pubkey_for_leaf_node(&self, leaf_node: &LeafNode) -> Result<PublicKey, Error> {
         let credentials: BasicCredential =
             BasicCredential::try_from(leaf_node.credential().clone())?;
@@ -1003,7 +1004,33 @@ where
         let (_, welcome_out, _group_info) =
             mls_group.add_members(&self.provider, &signer, &key_packages_vec)?;
 
-        // Merge the pending commit to finalize the group state - we do this during creation because we don't have a commit event to fan out to the group relays
+        // IMPORTANT: Privacy-preserving group creation
+        //
+        // We intentionally DO NOT publish the initial commit to relays. Instead, we:
+        // 1. Merge the pending commit locally (immediately below)
+        // 2. Send Welcome messages directly to invited members
+        //
+        // This differs from the MLS specification (RFC 9420), which recommends waiting
+        // for Delivery Service confirmation before applying commits. However, that
+        // guidance assumes a centralized Delivery Service model.
+        //
+        // For initial group creation with Nostr relays, not publishing the commit is
+        // the correct choice for security and privacy reasons:
+        //
+        // - PRIVACY: Publishing the commit would expose additional metadata on relays
+        //   (timing, event patterns, correlation opportunities) with no functional benefit
+        // - SECURITY: Invited members receive complete group state via Welcome messages;
+        //   they do not need the commit to join the group
+        // - NO RACE CONDITIONS: At creation time, only the creator exists in the group,
+        //   so there are no other members who need to process this commit
+        //
+        // This approach minimizes observable events on relays while maintaining full
+        // MLS security properties. The Welcome messages contain all cryptographic
+        // material needed for invitees to participate in the group.
+        //
+        // NOTE: This is specific to initial group creation. For commits in established
+        // groups (adding/removing members, updates), commits MUST be published to relays
+        // so existing members can process them and stay in sync.
         mls_group.merge_pending_commit(&self.provider)?;
 
         // Serialize the welcome message and send it to the members

@@ -19,7 +19,7 @@ fn generate_identity() -> (Keys, MDK<MdkSqliteStorage>, TempDir) {
     let keys = Keys::generate();
     let temp_dir = TempDir::new().expect("Failed to create temp directory");
     let db_path = temp_dir.path().join("mls.db");
-    let mdk = MDK::new(MdkSqliteStorage::new(db_path).unwrap());
+    let mdk = MDK::new(MdkSqliteStorage::new_unencrypted(db_path).unwrap());
     (keys, mdk, temp_dir)
 }
 

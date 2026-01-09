@@ -457,6 +457,57 @@ where
         Ok(())
     }
 
+    /// Checks if a staged commit is a pure self-update commit
+    ///
+    /// A pure self-update commit is one that only updates the sender's own leaf node
+    /// without adding or removing any members or modifying group state. Per the Marmot
+    /// protocol specification, any member (not just admins) can create a self-update
+    /// commit to rotate their own key material.
+    ///
+    /// # Arguments
+    ///
+    /// * `staged_commit` - The staged commit to check
+    /// * `sender_leaf_index` - The leaf index of the commit sender
+    ///
+    /// # Returns
+    ///
+    /// * `true` - If the commit is a pure self-update (no add/remove/extension proposals, only
+    ///   updates to sender's own leaf)
+    /// * `false` - If the commit contains add/remove/extension proposals or updates to other leaves
+    fn is_pure_self_update_commit(
+        &self,
+        staged_commit: &StagedCommit,
+        sender_leaf_index: &openmls::prelude::LeafNodeIndex,
+    ) -> bool {
+        // A self-update commit must contain at least one self-update signal:
+        // either an UpdatePath or an Update proposal. Reject empty commits.
+        if staged_commit.update_path_leaf_node().is_none()
+            && staged_commit.update_proposals().next().is_none()
+        {
+            return false;
+        }
+
+        // Use a whitelist approach: only allow Update proposals that are self-updates.
+        // Any other proposal type (Add, Remove, PreSharedKey, GroupContextExtensions,
+        // ReInit, ExternalInit, AppAck, Custom, or future types) requires admin privileges.
+        //
+        // This is more secure than a blocklist because it automatically rejects any
+        // new proposal types that might be added in future MLS/OpenMLS versions.
+
+        // Check all proposals are Update variants
+        if !staged_commit
+            .queued_proposals()
+            .all(|p| matches!(p.proposal(), Proposal::Update(_)))
+        {
+            return false;
+        }
+
+        // Verify all update proposals are self-updates (sender's own leaf)
+        staged_commit
+            .update_proposals()
+            .all(|p| matches!(p.sender(), Sender::Member(idx) if idx == sender_leaf_index))
+    }
+
     /// Validates that a staged commit does not attempt to change any member's identity
     ///
     /// This function checks all Update proposals within a staged commit to ensure
@@ -844,21 +895,26 @@ where
     ///
     /// This internal function handles MLS commit messages that finalize pending proposals.
     /// The function:
-    /// 1. Merges the staged commit into the group state
-    /// 2. Updates the group to the new epoch with new cryptographic keys
-    /// 3. Saves the new exporter secret for NIP-44 encryption
-    /// 4. Updates processing state to prevent reprocessing
+    /// 1. Validates the sender is authorized (admin, or non-admin for pure self-updates)
+    /// 2. Merges the staged commit into the group state
+    /// 3. Updates the group to the new epoch with new cryptographic keys
+    /// 4. Saves the new exporter secret for NIP-44 encryption
+    /// 5. Updates processing state to prevent reprocessing
+    ///
+    /// Note: Non-admin members are allowed to create commits that only update their own
+    /// leaf node (pure self-updates). All other commit operations require admin privileges.
     ///
     /// # Arguments
     ///
     /// * `mls_group` - The MLS group to merge the commit into
     /// * `event` - The wrapper Nostr event containing the encrypted commit
     /// * `staged_commit` - The validated MLS commit to merge
+    /// * `commit_sender` - The MLS sender of the commit
     ///
     /// # Returns
     ///
     /// * `Ok(())` - If commit processing succeeds
-    /// * `Err(Error)` - If commit merging or storage operations fail
+    /// * `Err(Error)` - If sender is not authorized, commit merging, or storage operations fail
     fn process_commit_message_for_group(
         &self,
         mls_group: &mut MlsGroup,
@@ -866,6 +922,54 @@ where
         staged_commit: StagedCommit,
         commit_sender: &Sender,
     ) -> Result<()> {
+        // Verify authorization before processing the commit
+        // Only members can create commits, so we check for Sender::Member
+        match commit_sender {
+            Sender::Member(leaf_index) => {
+                let member = mls_group
+                    .member_at(*leaf_index)
+                    .ok_or(Error::MessageFromNonMember)?;
+
+                // Check if sender is an admin by extracting their pubkey from credentials
+                let basic_cred = BasicCredential::try_from(member.credential.clone())?;
+                let sender_pubkey = self.parse_credential_identity(basic_cred.identity())?;
+                let group_data = crate::extension::NostrGroupDataExtension::from_group(mls_group)?;
+                let sender_is_admin = group_data.admins.contains(&sender_pubkey);
+
+                // Check if this is a pure self-update commit (allowed from any member)
+                // A pure self-update has no add/remove proposals and only updates the sender's own leaf
+                let is_pure_self_update =
+                    self.is_pure_self_update_commit(&staged_commit, leaf_index);
+
+                match (sender_is_admin, is_pure_self_update) {
+                    (true, _) => {}
+                    (false, true) => {
+                        tracing::debug!(
+                            target: "mdk_core::messages::process_commit_message_for_group",
+                            "Allowing self-update commit from non-admin member at leaf index {:?}",
+                            leaf_index
+                        );
+                    }
+                    (false, false) => {
+                        tracing::warn!(
+                            target: "mdk_core::messages::process_commit_message_for_group",
+                            "Received non-self-update commit from non-admin member at leaf index {:?}",
+                            leaf_index
+                        );
+                        return Err(Error::CommitFromNonAdmin);
+                    }
+                }
+            }
+            _ => {
+                // External senders or other sender types cannot create valid commits
+                tracing::warn!(
+                    target: "mdk_core::messages::process_commit_message_for_group",
+                    "Received commit from non-member sender."
+                );
+                return Err(Error::MessageFromNonMember);
+            }
+        }
+
         // Validate that no proposals in the commit attempt to change identity
         // MIP-00 mandates immutable identity fields
         self.validate_staged_commit_identities(mls_group, &staged_commit, commit_sender)?;
@@ -1160,6 +1264,7 @@ where
             Error::GroupNotFound => "group_not_found",
             Error::CannotDecryptOwnMessage => "own_message",
             Error::AuthorMismatch => "authentication_failed",
+            Error::CommitFromNonAdmin => "authorization_failed",
             _ => "processing_failed",
         }
     }
@@ -1373,6 +1478,19 @@ where
                 Ok(MessageProcessingResult::Unprocessable {
                     mls_group_id: group.mls_group_id.clone(),
                 })
+            }
+            Error::CommitFromNonAdmin => {
+                // Authorization errors should propagate as errors, not be silently swallowed
+                // Save a failed processing record to prevent reprocessing (best-effort)
+                if let Err(save_err) = self.save_failed_processed_message(event.id, &error) {
+                    tracing::warn!(
+                        target: "mdk_core::messages::handle_message_processing_error",
+                        "Failed to persist failure record: {}. Original error: {}",
+                        save_err,
+                        error
+                    );
+                }
+                Err(error)
             }
             _ => {
                 tracing::error!(target: "mdk_core::messages::process_message", "Unexpected error processing message: {:?}", error);
@@ -4418,8 +4536,6 @@ mod tests {
     /// legitimate commits.
     #[test]
     fn test_commit_processing_validates_identity_multi_member() {
-        use crate::test_util::create_key_package_event;
-
         let alice_keys = Keys::generate();
         let bob_keys = Keys::generate();
 
@@ -4504,8 +4620,6 @@ mod tests {
     /// Per the Marmot protocol, admins should auto-commit self-leave proposals.
     #[test]
     fn test_self_leave_proposal_auto_committed_by_admin() {
-        use crate::test_util::create_key_package_event;
-
         // Setup: Alice (admin), Bob (non-admin member)
         let alice_keys = Keys::generate();
         let bob_keys = Keys::generate();
@@ -4589,8 +4703,6 @@ mod tests {
     /// Non-admin members cannot commit, so they store the proposal for later admin approval.
     #[test]
     fn test_self_leave_proposal_stored_pending_by_non_admin() {
-        use crate::test_util::create_key_package_event;
-
         // Setup: Alice (admin), Bob (non-admin), Charlie (non-admin)
         let alice_keys = Keys::generate();
         let bob_keys = Keys::generate();
@@ -4793,8 +4905,6 @@ mod tests {
     /// remove_members commits.
     #[test]
     fn test_remove_members_commit_triggers_identity_validation() {
-        use crate::test_util::create_key_package_event;
-
         let alice_keys = Keys::generate();
         let bob_keys = Keys::generate();
         let charlie_keys = Keys::generate();
@@ -5994,5 +6104,606 @@ mod tests {
             "Expected MissingGroupIdTag error, got: {:?}",
             result
         );
+    }
+
+    /// Test that self-update commits from non-admin members are ALLOWED (Issue #44, #59)
+    ///
+    /// Per the Marmot protocol specification, any member can create a self-update
+    /// commit to rotate their own key material. This is different from add/remove
+    /// commits which require admin privileges.
+    ///
+    /// Scenario:
+    /// 1. Alice (admin) creates a group with Charlie (non-admin member)
+    /// 2. Charlie creates a self-update commit
+    /// 3. Alice processes Charlie's commit successfully
+    #[test]
+    fn test_self_update_commit_from_non_admin_is_allowed() {
+        // Setup: Alice (admin) and Charlie (non-admin member)
+        let alice_keys = Keys::generate();
+        let charlie_keys = Keys::generate();
+
+        let alice_mdk = create_test_mdk();
+        let charlie_mdk = create_test_mdk();
+
+        // Only Alice is admin
+        let admins = vec![alice_keys.public_key()];
+
+        // Create key package for Charlie
+        let charlie_key_package = create_key_package_event(&charlie_mdk, &charlie_keys);
+
+        // Alice creates the group with Charlie as a non-admin member
+        let create_result = alice_mdk
+            .create_group(
+                &alice_keys.public_key(),
+                vec![charlie_key_package],
+                create_nostr_group_config_data(admins.clone()),
+            )
+            .expect("Failed to create group");
+
+        let group_id = create_result.group.mls_group_id.clone();
+
+        // Alice merges her commit
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("Failed to merge pending commit");
+
+        // Charlie joins the group via welcome message
+        let charlie_welcome_rumor = &create_result.welcome_rumors[0];
+        let charlie_welcome = charlie_mdk
+            .process_welcome(&nostr::EventId::all_zeros(), charlie_welcome_rumor)
+            .expect("Charlie should process welcome");
+        charlie_mdk
+            .accept_welcome(&charlie_welcome)
+            .expect("Charlie should accept welcome");
+
+        // Verify: Charlie is NOT an admin
+        let group_state = charlie_mdk
+            .get_group(&group_id)
+            .expect("Failed to get group")
+            .expect("Group should exist");
+        assert!(
+            !group_state
+                .admin_pubkeys
+                .contains(&charlie_keys.public_key()),
+            "Charlie should NOT be an admin"
+        );
+
+        // Charlie creates a self-update commit (allowed for any member)
+        let charlie_update_result = charlie_mdk
+            .self_update(&group_id)
+            .expect("Charlie can create self-update commit");
+
+        // Get the commit event that Charlie would broadcast
+        let charlie_commit_event = charlie_update_result.evolution_event;
+
+        // Alice tries to process Charlie's self-update commit
+        // This should SUCCEED because self-update commits are allowed from any member
+        let result = alice_mdk.process_message(&charlie_commit_event);
+
+        assert!(
+            result.is_ok(),
+            "Self-update commit from non-admin should succeed, got error: {:?}",
+            result.err()
+        );
+
+        // Verify the result is a Commit
+        assert!(
+            matches!(result.unwrap(), MessageProcessingResult::Commit { .. }),
+            "Result should be a Commit"
+        );
+    }
+
+    /// Test that add-member commits from non-admin members are REJECTED (Issue #44)
+    ///
+    /// Only admins can add members to a group. This test verifies that when a
+    /// non-admin tries to create a commit that adds members, it is rejected.
+    ///
+    /// Note: The client-side `add_members` function already checks admin status,
+    /// so in practice non-admins cannot create add commits. This test verifies
+    /// the server-side check as defense in depth.
+    #[test]
+    fn test_add_member_commit_from_non_admin_is_rejected() {
+        // Setup: Alice (admin), Bob (admin initially), and Charlie (non-admin member)
+        let alice_keys = Keys::generate();
+        let bob_keys = Keys::generate();
+        let charlie_keys = Keys::generate();
+        let dave_keys = Keys::generate();
+
+        let alice_mdk = create_test_mdk();
+        let bob_mdk = create_test_mdk();
+        let charlie_mdk = create_test_mdk();
+
+        // Both Alice and Bob are admins initially
+        let admins = vec![alice_keys.public_key(), bob_keys.public_key()];
+
+        // Create key packages
+        let bob_key_package = create_key_package_event(&bob_mdk, &bob_keys);
+        let charlie_key_package = create_key_package_event(&charlie_mdk, &charlie_keys);
+
+        // Alice creates the group with Bob and Charlie
+        let create_result = alice_mdk
+            .create_group(
+                &alice_keys.public_key(),
+                vec![bob_key_package, charlie_key_package],
+                create_nostr_group_config_data(admins.clone()),
+            )
+            .expect("Failed to create group");
+
+        let group_id = create_result.group.mls_group_id.clone();
+
+        // Alice merges her commit
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("Failed to merge pending commit");
+
+        // Bob joins
+        let bob_welcome_rumor = &create_result.welcome_rumors[0];
+        let bob_welcome = bob_mdk
+            .process_welcome(&nostr::EventId::all_zeros(), bob_welcome_rumor)
+            .expect("Bob should process welcome");
+        bob_mdk
+            .accept_welcome(&bob_welcome)
+            .expect("Bob should accept welcome");
+
+        // Charlie joins
+        let charlie_welcome_rumor = &create_result.welcome_rumors[1];
+        let charlie_welcome = charlie_mdk
+            .process_welcome(&nostr::EventId::all_zeros(), charlie_welcome_rumor)
+            .expect("Charlie should process welcome");
+        charlie_mdk
+            .accept_welcome(&charlie_welcome)
+            .expect("Charlie should accept welcome");
+
+        // Bob creates a key package for Dave
+        let dave_key_package = create_key_package_event(&bob_mdk, &dave_keys);
+
+        // Bob (who is admin) creates a commit to add Dave
+        let bob_add_result = bob_mdk
+            .add_members(&group_id, &[dave_key_package])
+            .expect("Bob (admin) can create add commit");
+
+        // Capture the commit event
+        let bob_add_commit_event = bob_add_result.evolution_event;
+
+        // Now Alice demotes Bob to non-admin
+        let update =
+            crate::groups::NostrGroupDataUpdate::new().admins(vec![alice_keys.public_key()]);
+        let alice_demote_result = alice_mdk
+            .update_group_data(&group_id, update)
+            .expect("Alice should demote Bob");
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("Alice should merge demote commit");
+
+        // Charlie processes Alice's demote commit
+        charlie_mdk
+            .process_message(&alice_demote_result.evolution_event)
+            .expect("Charlie should process Alice's demote commit");
+
+        // Now Charlie tries to process Bob's add-member commit
+        // This should be rejected because Bob is no longer an admin.
+        // The rejection may come as:
+        // - CommitFromNonAdmin error (if admin check runs first)
+        // - Unprocessable result (if epoch mismatch due to Alice's demote commit)
+        // Both outcomes are valid - the important thing is the commit doesn't succeed.
+        let result = charlie_mdk.process_message(&bob_add_commit_event);
+
+        match result {
+            Ok(MessageProcessingResult::Unprocessable { .. }) => {
+                // Epoch mismatch caused rejection - this is acceptable because
+                // Alice's demote commit advanced the epoch before Bob's commit could be processed
+            }
+            Err(crate::Error::CommitFromNonAdmin) => {
+                // Admin check caught the non-admin commit - this is the direct rejection path
+            }
+            Ok(MessageProcessingResult::Commit { .. }) => {
+                panic!("Add-member commit from demoted admin should have been rejected");
+            }
+            other => {
+                panic!(
+                    "Unexpected result for add-member commit from demoted admin: {:?}",
+                    other
+                );
+            }
+        }
+    }
+
+    /// Test that admin add-member commits are processed successfully by non-admin members
+    ///
+    /// This verifies that commits from admins with add proposals are accepted,
+    /// exercising the "sender is admin" path in `process_commit_message_for_group`.
+    #[test]
+    fn test_admin_add_member_commit_is_processed_successfully() {
+        let alice_keys = Keys::generate();
+        let bob_keys = Keys::generate();
+        let charlie_keys = Keys::generate();
+
+        let alice_mdk = create_test_mdk();
+        let bob_mdk = create_test_mdk();
+        let charlie_mdk = create_test_mdk();
+
+        // Only Alice is admin
+        let admins = vec![alice_keys.public_key()];
+
+        // Create key packages
+        let bob_key_package = create_key_package_event(&bob_mdk, &bob_keys);
+
+        // Alice creates the group with Bob
+        let create_result = alice_mdk
+            .create_group(
+                &alice_keys.public_key(),
+                vec![bob_key_package],
+                create_nostr_group_config_data(admins.clone()),
+            )
+            .expect("Failed to create group");
+
+        let group_id = create_result.group.mls_group_id.clone();
+
+        // Alice merges her commit
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("Failed to merge pending commit");
+
+        // Bob joins via welcome
+        let bob_welcome_rumor = &create_result.welcome_rumors[0];
+        let bob_welcome = bob_mdk
+            .process_welcome(&nostr::EventId::all_zeros(), bob_welcome_rumor)
+            .expect("Bob should process welcome");
+        bob_mdk
+            .accept_welcome(&bob_welcome)
+            .expect("Bob should accept welcome");
+
+        // Verify Bob is NOT an admin
+        let group_state = bob_mdk
+            .get_group(&group_id)
+            .expect("Failed to get group")
+            .expect("Group should exist");
+        assert!(
+            !group_state.admin_pubkeys.contains(&bob_keys.public_key()),
+            "Bob should NOT be an admin"
+        );
+
+        // Alice (admin) creates a commit to add Charlie
+        let charlie_key_package = create_key_package_event(&charlie_mdk, &charlie_keys);
+        let alice_add_result = alice_mdk
+            .add_members(&group_id, &[charlie_key_package])
+            .expect("Alice (admin) can create add commit");
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("Alice should merge add commit");
+
+        // Bob (non-admin) processes Alice's add-member commit
+        // This should SUCCEED because Alice is an admin
+        let result = bob_mdk.process_message(&alice_add_result.evolution_event);
+
+        assert!(
+            result.is_ok(),
+            "Admin add-member commit should be processed successfully, got error: {:?}",
+            result.err()
+        );
+
+        // Verify the result is a Commit
+        assert!(
+            matches!(result.unwrap(), MessageProcessingResult::Commit { .. }),
+            "Result should be a Commit"
+        );
+
+        // Verify Charlie is now a pending member in Bob's view
+        let members = bob_mdk
+            .get_members(&group_id)
+            .expect("Failed to get members");
+        assert_eq!(members.len(), 3, "Group should have 3 members");
+    }
+
+    /// Test that admin extension update commits are processed successfully
+    ///
+    /// This verifies that commits containing GroupContextExtensions proposals
+    /// from admins are accepted, exercising the admin path in the commit processing.
+    #[test]
+    fn test_admin_extension_update_commit_is_processed_successfully() {
+        let alice_keys = Keys::generate();
+        let bob_keys = Keys::generate();
+
+        let alice_mdk = create_test_mdk();
+        let bob_mdk = create_test_mdk();
+
+        // Only Alice is admin
+        let admins = vec![alice_keys.public_key()];
+
+        // Create key package for Bob
+        let bob_key_package = create_key_package_event(&bob_mdk, &bob_keys);
+
+        // Alice creates the group with Bob
+        let create_result = alice_mdk
+            .create_group(
+                &alice_keys.public_key(),
+                vec![bob_key_package],
+                create_nostr_group_config_data(admins.clone()),
+            )
+            .expect("Failed to create group");
+
+        let group_id = create_result.group.mls_group_id.clone();
+
+        // Alice merges her commit
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("Failed to merge pending commit");
+
+        // Bob joins via welcome
+        let bob_welcome_rumor = &create_result.welcome_rumors[0];
+        let bob_welcome = bob_mdk
+            .process_welcome(&nostr::EventId::all_zeros(), bob_welcome_rumor)
+            .expect("Bob should process welcome");
+        bob_mdk
+            .accept_welcome(&bob_welcome)
+            .expect("Bob should accept welcome");
+
+        // Alice (admin) updates group extensions (name and description)
+        let update = crate::groups::NostrGroupDataUpdate::new()
+            .name("Updated Group Name".to_string())
+            .description("Updated description".to_string());
+        let alice_update_result = alice_mdk
+            .update_group_data(&group_id, update)
+            .expect("Alice (admin) can update group data");
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("Alice should merge update commit");
+
+        // Bob (non-admin) processes Alice's extension update commit
+        // This should SUCCEED because Alice is an admin
+        let result = bob_mdk.process_message(&alice_update_result.evolution_event);
+
+        assert!(
+            result.is_ok(),
+            "Admin extension update commit should be processed successfully, got error: {:?}",
+            result.err()
+        );
+
+        // Verify the result is a Commit
+        assert!(
+            matches!(result.unwrap(), MessageProcessingResult::Commit { .. }),
+            "Result should be a Commit"
+        );
+
+        // Verify the group name was updated in Bob's view
+        let group_state = bob_mdk
+            .get_group(&group_id)
+            .expect("Failed to get group")
+            .expect("Group should exist");
+        assert_eq!(
+            group_state.name, "Updated Group Name",
+            "Group name should be updated"
+        );
+    }
+
+    /// Test that admin remove-member commits are processed successfully
+    ///
+    /// This verifies that commits from admins with remove proposals are accepted.
+    #[test]
+    fn test_admin_remove_member_commit_is_processed_successfully() {
+        let alice_keys = Keys::generate();
+        let bob_keys = Keys::generate();
+        let charlie_keys = Keys::generate();
+
+        let alice_mdk = create_test_mdk();
+        let bob_mdk = create_test_mdk();
+        let charlie_mdk = create_test_mdk();
+
+        // Only Alice is admin
+        let admins = vec![alice_keys.public_key()];
+
+        // Create key packages
+        let bob_key_package = create_key_package_event(&bob_mdk, &bob_keys);
+        let charlie_key_package = create_key_package_event(&charlie_mdk, &charlie_keys);
+
+        // Alice creates the group with Bob and Charlie
+        let create_result = alice_mdk
+            .create_group(
+                &alice_keys.public_key(),
+                vec![bob_key_package, charlie_key_package],
+                create_nostr_group_config_data(admins.clone()),
+            )
+            .expect("Failed to create group");
+
+        let group_id = create_result.group.mls_group_id.clone();
+
+        // Alice merges her commit
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("Failed to merge pending commit");
+
+        // Bob and Charlie join via welcomes
+        let bob_welcome_rumor = &create_result.welcome_rumors[0];
+        let bob_welcome = bob_mdk
+            .process_welcome(&nostr::EventId::all_zeros(), bob_welcome_rumor)
+            .expect("Bob should process welcome");
+        bob_mdk
+            .accept_welcome(&bob_welcome)
+            .expect("Bob should accept welcome");
+
+        let charlie_welcome_rumor = &create_result.welcome_rumors[1];
+        let charlie_welcome = charlie_mdk
+            .process_welcome(&nostr::EventId::all_zeros(), charlie_welcome_rumor)
+            .expect("Charlie should process welcome");
+        charlie_mdk
+            .accept_welcome(&charlie_welcome)
+            .expect("Charlie should accept welcome");
+
+        // Verify initial member count
+        let members = bob_mdk
+            .get_members(&group_id)
+            .expect("Failed to get members");
+        assert_eq!(members.len(), 3, "Group should have 3 members initially");
+
+        // Alice (admin) removes Charlie
+        let alice_remove_result = alice_mdk
+            .remove_members(&group_id, &[charlie_keys.public_key()])
+            .expect("Alice (admin) can remove members");
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("Alice should merge remove commit");
+
+        // Bob (non-admin) processes Alice's remove-member commit
+        // This should SUCCEED because Alice is an admin
+        let result = bob_mdk.process_message(&alice_remove_result.evolution_event);
+
+        assert!(
+            result.is_ok(),
+            "Admin remove-member commit should be processed successfully, got error: {:?}",
+            result.err()
+        );
+
+        // Verify the result is a Commit
+        assert!(
+            matches!(result.unwrap(), MessageProcessingResult::Commit { .. }),
+            "Result should be a Commit"
+        );
+
+        // Verify Charlie was removed in Bob's view
+        let members = bob_mdk
+            .get_members(&group_id)
+            .expect("Failed to get members");
+        assert_eq!(
+            members.len(),
+            2,
+            "Group should have 2 members after removal"
+        );
+        assert!(
+            !members.contains(&charlie_keys.public_key()),
+            "Charlie should be removed"
+        );
+    }
+
+    /// Test that non-admin trying to update group extensions fails at client level
+    ///
+    /// This verifies the client-side check prevents non-admins from creating
+    /// extension update commits. The server-side check in `is_pure_self_update_commit`
+    /// provides defense-in-depth for malformed messages.
+    #[test]
+    fn test_non_admin_extension_update_rejected_at_client() {
+        let alice_keys = Keys::generate();
+        let bob_keys = Keys::generate();
+
+        let alice_mdk = create_test_mdk();
+        let bob_mdk = create_test_mdk();
+
+        // Only Alice is admin
+        let admins = vec![alice_keys.public_key()];
+
+        let bob_key_package = create_key_package_event(&bob_mdk, &bob_keys);
+
+        // Alice creates the group with Bob
+        let create_result = alice_mdk
+            .create_group(
+                &alice_keys.public_key(),
+                vec![bob_key_package],
+                create_nostr_group_config_data(admins),
+            )
+            .expect("Failed to create group");
+
+        let group_id = create_result.group.mls_group_id.clone();
+
+        // Alice merges and Bob joins
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("Failed to merge pending commit");
+
+        let bob_welcome_rumor = &create_result.welcome_rumors[0];
+        let bob_welcome = bob_mdk
+            .process_welcome(&nostr::EventId::all_zeros(), bob_welcome_rumor)
+            .expect("Bob should process welcome");
+        bob_mdk
+            .accept_welcome(&bob_welcome)
+            .expect("Bob should accept welcome");
+
+        // Bob (non-admin) tries to update group extensions
+        let update =
+            crate::groups::NostrGroupDataUpdate::new().name("Hacked Group Name".to_string());
+        let result = bob_mdk.update_group_data(&group_id, update);
+
+        // This should fail at the client level with a permission error
+        assert!(
+            result.is_err(),
+            "Non-admin should not be able to update group data"
+        );
+        // The error is Error::Group with a message about admin permissions
+        assert!(
+            matches!(result.as_ref().unwrap_err(), crate::Error::Group(msg) if msg.contains("Only group admins")),
+            "Error should indicate admin permission required, got: {:?}",
+            result
+        );
+    }
+
+    /// Test that a commit with only the update path (no explicit proposals) from non-admin succeeds
+    ///
+    /// In MLS, a commit can update the sender's leaf via the "update path" without
+    /// including explicit Update proposals. This tests that such commits from
+    /// non-admins are correctly identified as self-updates and allowed.
+    #[test]
+    fn test_non_admin_empty_self_update_commit_succeeds() {
+        let alice_keys = Keys::generate();
+        let bob_keys = Keys::generate();
+
+        let alice_mdk = create_test_mdk();
+        let bob_mdk = create_test_mdk();
+
+        // Only Alice is admin
+        let admins = vec![alice_keys.public_key()];
+
+        let bob_key_package = create_key_package_event(&bob_mdk, &bob_keys);
+
+        // Alice creates the group with Bob
+        let create_result = alice_mdk
+            .create_group(
+                &alice_keys.public_key(),
+                vec![bob_key_package],
+                create_nostr_group_config_data(admins),
+            )
+            .expect("Failed to create group");
+
+        let group_id = create_result.group.mls_group_id.clone();
+
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("Failed to merge pending commit");
+
+        let bob_welcome_rumor = &create_result.welcome_rumors[0];
+        let bob_welcome = bob_mdk
+            .process_welcome(&nostr::EventId::all_zeros(), bob_welcome_rumor)
+            .expect("Bob should process welcome");
+        bob_mdk
+            .accept_welcome(&bob_welcome)
+            .expect("Bob should accept welcome");
+
+        // Verify Bob is not admin
+        let group_state = bob_mdk
+            .get_group(&group_id)
+            .expect("Failed to get group")
+            .expect("Group should exist");
+        assert!(
+            !group_state.admin_pubkeys.contains(&bob_keys.public_key()),
+            "Bob should NOT be an admin"
+        );
+
+        // Bob performs multiple self-updates to verify the pattern is consistently allowed
+        for i in 0..3 {
+            let bob_update_result = bob_mdk
+                .self_update(&group_id)
+                .unwrap_or_else(|e| panic!("Bob self-update {} should succeed: {:?}", i + 1, e));
+
+            // Alice processes Bob's self-update
+            let result = alice_mdk.process_message(&bob_update_result.evolution_event);
+            assert!(
+                result.is_ok(),
+                "Non-admin self-update {} should succeed, got: {:?}",
+                i + 1,
+                result.err()
+            );
+
+            // Bob merges his own commit
+            bob_mdk
+                .merge_pending_commit(&group_id)
+                .unwrap_or_else(|e| panic!("Bob should merge self-update {}: {:?}", i + 1, e));
+        }
     }
 }

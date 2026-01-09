@@ -21,3 +21,35 @@ impl fmt::Display for MessageError {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_message_error_display_invalid_parameters() {
+        let err = MessageError::InvalidParameters("missing field".to_string());
+        assert_eq!(err.to_string(), "Invalid parameters: missing field");
+    }
+
+    #[test]
+    fn test_message_error_display_database_error() {
+        let err = MessageError::DatabaseError("connection lost".to_string());
+        assert_eq!(err.to_string(), "Database error: connection lost");
+    }
+
+    #[test]
+    fn test_message_error_debug() {
+        let err = MessageError::InvalidParameters("test".to_string());
+        let debug_str = format!("{:?}", err);
+        assert!(debug_str.contains("InvalidParameters"));
+        assert!(debug_str.contains("test"));
+    }
+
+    #[test]
+    fn test_message_error_is_error() {
+        let err: Box<dyn std::error::Error> =
+            Box::new(MessageError::DatabaseError("test".to_string()));
+        assert!(err.to_string().contains("Database error"));
+    }
+}
