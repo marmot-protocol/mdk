@@ -242,7 +242,7 @@ where
     /// # Returns
     ///
     /// * `Ok(PublicKey)` - The public key extracted from the leaf node
-    /// * `Err(Error)` - If the public key cannot be extracted or there is an error converting the public key to hex
+    /// * `Err(Error)` - If the credential cannot be converted or the public key cannot be extracted
     pub(crate) fn pubkey_for_leaf_node(&self, leaf_node: &LeafNode) -> Result<PublicKey, Error> {
         let credentials: BasicCredential =
             BasicCredential::try_from(leaf_node.credential().clone())?;
