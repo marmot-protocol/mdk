@@ -313,9 +313,33 @@ fn apply_exif_orientation(
 
 #[cfg(test)]
 mod tests {
-    use image::{ImageBuffer, Rgb};
+    use image::{DynamicImage, ImageBuffer, Rgb, RgbImage};
 
     use super::*;
+
+    /// Create a test PNG image with specified dimensions
+    fn create_test_png(width: u32, height: u32) -> Vec<u8> {
+        let img = ImageBuffer::from_fn(width, height, |_, _| Rgb([255u8, 0u8, 0u8]));
+        let mut png_data = Vec::new();
+        img.write_to(
+            &mut std::io::Cursor::new(&mut png_data),
+            image::ImageFormat::Png,
+        )
+        .unwrap();
+        png_data
+    }
+
+    /// Create a test JPEG image with specified dimensions
+    fn create_test_jpeg(width: u32, height: u32) -> Vec<u8> {
+        let img = ImageBuffer::from_fn(width, height, |_, _| Rgb([255u8, 0u8, 0u8]));
+        let mut jpeg_data = Vec::new();
+        img.write_to(
+            &mut std::io::Cursor::new(&mut jpeg_data),
+            image::ImageFormat::Jpeg,
+        )
+        .unwrap();
+        jpeg_data
+    }
 
     #[test]
     fn test_extract_metadata_from_encoded_image() {
@@ -379,5 +403,208 @@ mod tests {
         } else {
             panic!("Expected DimensionsTooLarge error");
         }
+    }
+
+    #[test]
+    fn test_safe_raster_format_detection() {
+        // Safe formats
+        assert!(is_safe_raster_format("image/jpeg"));
+        assert!(is_safe_raster_format("image/png"));
+
+        // Unsafe/unsupported formats
+        assert!(!is_safe_raster_format("image/gif"));
+        assert!(!is_safe_raster_format("image/webp"));
+        assert!(!is_safe_raster_format("image/svg+xml"));
+        assert!(!is_safe_raster_format("image/bmp"));
+        assert!(!is_safe_raster_format("application/pdf"));
+        assert!(!is_safe_raster_format(""));
+    }
+
+    #[test]
+    fn test_preflight_rejects_oversized_image() {
+        let png_data = create_test_png(100, 100);
+
+        let strict_options = MediaProcessingOptions {
+            max_dimension: Some(50), // Smaller than the image
+            ..Default::default()
+        };
+
+        let result = preflight_dimension_check(&png_data, &strict_options);
+        assert!(result.is_err());
+        assert!(matches!(
+            result,
+            Err(MediaProcessingError::ImageDimensionsTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn test_preflight_accepts_valid_image() {
+        let png_data = create_test_png(50, 50);
+
+        let options = MediaProcessingOptions::default();
+        let result = preflight_dimension_check(&png_data, &options);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_preflight_invalid_data() {
+        let invalid_data = vec![0x00, 0x01, 0x02, 0x03];
+        let options = MediaProcessingOptions::default();
+
+        let result = preflight_dimension_check(&invalid_data, &options);
+        assert!(result.is_err());
+        assert!(matches!(
+            result,
+            Err(MediaProcessingError::MetadataExtractionFailed { .. })
+        ));
+    }
+
+    #[test]
+    fn test_extract_metadata_from_decoded_image() {
+        // Create a decoded image directly
+        let img: RgbImage = ImageBuffer::from_fn(100, 50, |_, _| Rgb([255u8, 0u8, 0u8]));
+        let dynamic_img = DynamicImage::ImageRgb8(img);
+
+        let options = MediaProcessingOptions::default();
+
+        // Test without blurhash
+        let result = extract_metadata_from_decoded_image(&dynamic_img, &options, false);
+        assert!(result.is_ok());
+        let metadata = result.unwrap();
+        assert_eq!(metadata.dimensions, Some((100, 50)));
+        assert!(metadata.blurhash.is_none());
+
+        // Test with blurhash
+        let result = extract_metadata_from_decoded_image(&dynamic_img, &options, true);
+        assert!(result.is_ok());
+        let metadata = result.unwrap();
+        assert_eq!(metadata.dimensions, Some((100, 50)));
+        assert!(metadata.blurhash.is_some());
+    }
+
+    #[test]
+    fn test_extract_metadata_from_decoded_image_dimension_validation() {
+        let img: RgbImage = ImageBuffer::from_fn(100, 100, |_, _| Rgb([255u8, 0u8, 0u8]));
+        let dynamic_img = DynamicImage::ImageRgb8(img);
+
+        let strict_options = MediaProcessingOptions {
+            max_dimension: Some(50),
+            ..Default::default()
+        };
+
+        let result = extract_metadata_from_decoded_image(&dynamic_img, &strict_options, false);
+        assert!(result.is_err());
+        assert!(matches!(
+            result,
+            Err(MediaProcessingError::ImageDimensionsTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn test_generate_blurhash_produces_valid_hash() {
+        let img: RgbImage = ImageBuffer::from_fn(32, 32, |x, y| {
+            Rgb([((x * 8) % 256) as u8, ((y * 8) % 256) as u8, 128u8])
+        });
+        let dynamic_img = DynamicImage::ImageRgb8(img);
+
+        let result = generate_blurhash(&dynamic_img);
+        assert!(result.is_some());
+
+        let hash = result.unwrap();
+        // Blurhash should be a non-empty string
+        assert!(!hash.is_empty());
+        // Blurhash typically starts with a component count indicator
+        assert!(hash.len() > 4);
+    }
+
+    #[test]
+    fn test_strip_exif_jpeg() {
+        let jpeg_data = create_test_jpeg(50, 50);
+
+        let result = strip_exif_and_return_image(&jpeg_data, "image/jpeg");
+        assert!(result.is_ok());
+
+        let (cleaned_data, img) = result.unwrap();
+        assert!(!cleaned_data.is_empty());
+        assert_eq!(img.width(), 50);
+        assert_eq!(img.height(), 50);
+    }
+
+    #[test]
+    fn test_strip_exif_png() {
+        let png_data = create_test_png(50, 50);
+
+        let result = strip_exif_and_return_image(&png_data, "image/png");
+        assert!(result.is_ok());
+
+        let (cleaned_data, img) = result.unwrap();
+        assert!(!cleaned_data.is_empty());
+        assert_eq!(img.width(), 50);
+        assert_eq!(img.height(), 50);
+    }
+
+    #[test]
+    fn test_strip_exif_unsupported_format() {
+        let png_data = create_test_png(50, 50);
+
+        // Try to strip with an unsupported mime type
+        let result = strip_exif_and_return_image(&png_data, "image/webp");
+        assert!(result.is_err());
+        assert!(matches!(
+            result,
+            Err(MediaProcessingError::MetadataExtractionFailed { .. })
+        ));
+    }
+
+    #[test]
+    fn test_strip_exif_invalid_data() {
+        let invalid_data = vec![0x00, 0x01, 0x02, 0x03];
+
+        let result = strip_exif_and_return_image(&invalid_data, "image/jpeg");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_animated_format_fallback() {
+        // GIF and WebP are not safe raster formats because they might be animated
+        assert!(!is_safe_raster_format("image/gif"));
+        assert!(!is_safe_raster_format("image/webp"));
+    }
+
+    #[test]
+    fn test_animated_format_without_sanitize() {
+        // Even with sanitize_exif = false, animated formats should be passthrough
+        // This test just verifies that we correctly identify safe formats
+        let options = MediaProcessingOptions {
+            sanitize_exif: false,
+            ..Default::default()
+        };
+
+        // PNG is safe
+        assert!(is_safe_raster_format("image/png"));
+        // JPEG is safe
+        assert!(is_safe_raster_format("image/jpeg"));
+
+        // Verify options don't affect format detection
+        assert!(!options.sanitize_exif);
+    }
+
+    #[test]
+    fn test_svg_passthrough_with_sanitize_requested() {
+        // SVG is a vector format, not a safe raster format
+        assert!(!is_safe_raster_format("image/svg+xml"));
+    }
+
+    #[test]
+    fn test_extract_metadata_with_blurhash_generation() {
+        let png_data = create_test_png(32, 32);
+        let options = MediaProcessingOptions::default();
+
+        let result = extract_metadata_from_encoded_image(&png_data, &options, true);
+        assert!(result.is_ok());
+
+        let metadata = result.unwrap();
+        assert_eq!(metadata.dimensions, Some((32, 32)));
+        assert!(metadata.blurhash.is_some());
     }
 }

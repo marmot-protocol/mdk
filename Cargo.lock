@@ -1160,6 +1160,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "keyring-core"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c9e072725d9cb9cf27d5ab18ce54e1cc2e2a51e0da2db7f56a493e71c7c6f449"
+dependencies = [
+ "log",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1447,6 +1456,9 @@ dependencies = [
 name = "mdk-sqlite-storage"
 version = "0.5.1"
 dependencies = [
+ "getrandom 0.3.4",
+ "hex",
+ "keyring-core",
  "mdk-storage-traits",
  "nostr",
  "openmls",
