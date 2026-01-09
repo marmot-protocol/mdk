@@ -182,8 +182,9 @@ mod tests {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
 
-    use mdk_memory_storage::MdkMemoryStorage;
     use sha2::Digest;
+
+    use mdk_memory_storage::MdkMemoryStorage;
 
     use super::*;
 
