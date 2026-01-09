@@ -1395,8 +1395,15 @@ where
             }
             Error::CommitFromNonAdmin => {
                 // Authorization errors should propagate as errors, not be silently swallowed
-                // Save a failed processing record to prevent reprocessing
-                self.save_failed_processed_message(event.id, &error)?;
+                // Save a failed processing record to prevent reprocessing (best-effort)
+                if let Err(save_err) = self.save_failed_processed_message(event.id, &error) {
+                    tracing::warn!(
+                        target: "mdk_core::messages::handle_message_processing_error",
+                        "Failed to persist failure record: {}. Original error: {}",
+                        save_err,
+                        error
+                    );
+                }
                 Err(error)
             }
             _ => {
