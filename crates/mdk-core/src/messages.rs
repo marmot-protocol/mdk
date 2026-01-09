@@ -1000,10 +1000,111 @@ where
         Ok(())
     }
 
+    /// Validates that an event's timestamp is within acceptable bounds
+    ///
+    /// This method checks that the event timestamp is not too far in the future
+    /// (beyond configurable clock skew) and not too old (beyond configurable max age).
+    ///
+    /// # Arguments
+    ///
+    /// * `event` - The Nostr event to validate
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(())` - If timestamp is valid
+    /// * `Err(Error::InvalidTimestamp)` - If timestamp is outside acceptable bounds
+    fn validate_created_at(&self, event: &Event) -> Result<()> {
+        let now = Timestamp::now();
+
+        // Reject events from the future (allow configurable clock skew)
+        if event.created_at.as_u64()
+            > now
+                .as_u64()
+                .saturating_add(self.config.max_future_skew_secs)
+        {
+            return Err(Error::InvalidTimestamp(format!(
+                "event timestamp {} is too far in the future (current time: {})",
+                event.created_at.as_u64(),
+                now.as_u64()
+            )));
+        }
+
+        // Reject events that are too old (configurable via MdkConfig)
+        let min_timestamp = now.as_u64().saturating_sub(self.config.max_event_age_secs);
+        if event.created_at.as_u64() < min_timestamp {
+            return Err(Error::InvalidTimestamp(format!(
+                "event timestamp {} is too old (minimum acceptable: {})",
+                event.created_at.as_u64(),
+                min_timestamp
+            )));
+        }
+
+        Ok(())
+    }
+
+    /// Validates and extracts the Nostr group ID from event tags
+    ///
+    /// This method validates that the event has exactly one 'h' tag (per MIP-03)
+    /// and extracts the 32-byte group ID from its hex content.
+    ///
+    /// # Arguments
+    ///
+    /// * `event` - The Nostr event to extract group ID from
+    ///
+    /// # Returns
+    ///
+    /// * `Ok([u8; 32])` - The extracted Nostr group ID
+    /// * `Err(Error)` - If validation fails or group ID cannot be extracted
+    fn validate_and_extract_nostr_group_id(&self, event: &Event) -> Result<[u8; 32]> {
+        // Extract and validate group ID tag (MIP-03 requires exactly one h tag)
+        let h_tags: Vec<_> = event
+            .tags
+            .iter()
+            .filter(|tag| tag.kind() == TagKind::h())
+            .collect();
+
+        if h_tags.is_empty() {
+            return Err(Error::MissingGroupIdTag);
+        }
+
+        if h_tags.len() > 1 {
+            return Err(Error::MultipleGroupIdTags(h_tags.len()));
+        }
+
+        let nostr_group_id_tag = h_tags[0];
+
+        let group_id_hex = nostr_group_id_tag
+            .content()
+            .ok_or_else(|| Error::InvalidGroupIdFormat("h tag has no content".to_string()))?;
+
+        // Validate hex string length before decoding to prevent unbounded memory allocation
+        // A 32-byte value requires exactly 64 hex characters
+        if group_id_hex.len() != 64 {
+            return Err(Error::InvalidGroupIdFormat(format!(
+                "expected 64 hex characters (32 bytes), got {} characters",
+                group_id_hex.len()
+            )));
+        }
+
+        // Decode once and reuse the result
+        let bytes = hex::decode(group_id_hex)
+            .map_err(|e| Error::InvalidGroupIdFormat(format!("hex decode failed: {}", e)))?;
+
+        let nostr_group_id: [u8; 32] = bytes.try_into().map_err(|v: Vec<u8>| {
+            Error::InvalidGroupIdFormat(format!("expected 32 bytes, got {} bytes", v.len()))
+        })?;
+
+        Ok(nostr_group_id)
+    }
+
     /// Validates the incoming event and extracts the group ID
     ///
-    /// This private method validates that the event has the correct kind and extracts
-    /// the group ID from the event tags.
+    /// This private method validates that the event has the correct kind, checks
+    /// timestamp bounds, and extracts the group ID from the event tags per MIP-03
+    /// requirements.
+    ///
+    /// Note: Nostr signature verification is handled by nostr-sdk's relay pool when
+    /// events are received from relays.
     ///
     /// # Arguments
     ///
@@ -1014,6 +1115,7 @@ where
     /// * `Ok([u8; 32])` - The extracted Nostr group ID
     /// * `Err(Error)` - If validation fails or group ID cannot be extracted
     fn validate_event_and_extract_group_id(&self, event: &Event) -> Result<[u8; 32]> {
+        // 1. Verify event kind
         if event.kind != Kind::MlsGroupMessage {
             return Err(Error::UnexpectedEvent {
                 expected: Kind::MlsGroupMessage,
@@ -1021,22 +1123,11 @@ where
             });
         }
 
-        let nostr_group_id_tag = event
-            .tags
-            .iter()
-            .find(|tag| tag.kind() == TagKind::h())
-            .ok_or(Error::MissingGroupIdTag)?;
+        // 2. Verify timestamp is within acceptable bounds
+        self.validate_created_at(event)?;
 
-        let nostr_group_id: [u8; 32] = hex::decode(
-            nostr_group_id_tag
-                .content()
-                .ok_or(Error::MissingGroupIdTag)?,
-        )
-        .map_err(|_| Error::InvalidGroupIdFormat)?
-        .try_into()
-        .map_err(|_| Error::InvalidGroupIdFormat)?;
-
-        Ok(nostr_group_id)
+        // 3. Extract and validate group ID tag
+        self.validate_and_extract_nostr_group_id(event)
     }
 
     /// Loads the group and decrypts the message content
@@ -1174,7 +1265,9 @@ where
         match error {
             Error::UnexpectedEvent { .. } => "invalid_event_type",
             Error::MissingGroupIdTag => "invalid_event_format",
-            Error::InvalidGroupIdFormat => "invalid_event_format",
+            Error::InvalidGroupIdFormat(_) => "invalid_event_format",
+            Error::MultipleGroupIdTags(_) => "invalid_event_format",
+            Error::InvalidTimestamp(_) => "invalid_event_format",
             Error::GroupNotFound => "group_not_found",
             Error::CannotDecryptOwnMessage => "own_message",
             Error::AuthorMismatch => "authentication_failed",
@@ -1856,7 +1949,10 @@ mod tests {
 
         let result = mdk.process_message(&event);
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), Error::InvalidGroupIdFormat));
+        assert!(matches!(
+            result.unwrap_err(),
+            Error::InvalidGroupIdFormat(_)
+        ));
     }
 
     #[test]
@@ -5797,6 +5893,223 @@ mod tests {
                 .to_string()
                 .contains("Message processing previously failed"),
             "Should not be blocked by deduplication for non-Failed state"
+        );
+    }
+
+    /// Test that validate_event_and_extract_group_id rejects events with timestamps too far in the future
+    #[test]
+    fn test_validate_event_rejects_future_timestamp() {
+        let mdk = create_test_mdk();
+        let (creator, members, admins) = create_test_group_members();
+        let group_id = create_test_group(&mdk, &creator, &members, &admins);
+
+        // Get the group's nostr_group_id for the h tag
+        let group = mdk
+            .get_group(&group_id)
+            .expect("Failed to get group")
+            .expect("Group should exist");
+
+        // Set timestamp to far future (1 hour ahead, beyond 5 minute skew allowance)
+        let future_time = nostr::Timestamp::now().as_u64() + 3600;
+
+        // Create an event with future timestamp
+        let message_event = EventBuilder::new(Kind::MlsGroupMessage, "test content")
+            .custom_created_at(nostr::Timestamp::from(future_time))
+            .tag(Tag::custom(
+                TagKind::h(),
+                [hex::encode(group.nostr_group_id)],
+            ))
+            .sign_with_keys(&creator)
+            .expect("Failed to create event");
+
+        // Validation should fail due to future timestamp
+        let result = mdk.validate_event_and_extract_group_id(&message_event);
+        assert!(
+            matches!(result, Err(Error::InvalidTimestamp(_))),
+            "Expected InvalidTimestamp error for future timestamp, got: {:?}",
+            result
+        );
+    }
+
+    /// Test that validate_event_and_extract_group_id rejects events with timestamps too far in the past
+    #[test]
+    fn test_validate_event_rejects_old_timestamp() {
+        let mdk = create_test_mdk();
+        let (creator, members, admins) = create_test_group_members();
+        let group_id = create_test_group(&mdk, &creator, &members, &admins);
+
+        // Get the group's nostr_group_id for the h tag
+        let group = mdk
+            .get_group(&group_id)
+            .expect("Failed to get group")
+            .expect("Group should exist");
+
+        // Set timestamp to 46 days ago (beyond 45 day limit)
+        let old_time = nostr::Timestamp::now().as_u64().saturating_sub(46 * 86400);
+
+        // Create an event with old timestamp
+        let message_event = EventBuilder::new(Kind::MlsGroupMessage, "test content")
+            .custom_created_at(nostr::Timestamp::from(old_time))
+            .tag(Tag::custom(
+                TagKind::h(),
+                [hex::encode(group.nostr_group_id)],
+            ))
+            .sign_with_keys(&creator)
+            .expect("Failed to create event");
+
+        // Validation should fail due to old timestamp
+        let result = mdk.validate_event_and_extract_group_id(&message_event);
+        assert!(
+            matches!(result, Err(Error::InvalidTimestamp(_))),
+            "Expected InvalidTimestamp error for old timestamp, got: {:?}",
+            result
+        );
+    }
+
+    /// Test that validate_event_and_extract_group_id accepts events with valid timestamps
+    #[test]
+    fn test_validate_event_accepts_valid_timestamp() {
+        let mdk = create_test_mdk();
+        let (creator, members, admins) = create_test_group_members();
+        let group_id = create_test_group(&mdk, &creator, &members, &admins);
+
+        // Get the group's nostr_group_id for the h tag
+        let group = mdk
+            .get_group(&group_id)
+            .expect("Failed to get group")
+            .expect("Group should exist");
+
+        // Create an event with current timestamp
+        let message_event = EventBuilder::new(Kind::MlsGroupMessage, "test content")
+            .tag(Tag::custom(
+                TagKind::h(),
+                [hex::encode(group.nostr_group_id)],
+            ))
+            .sign_with_keys(&creator)
+            .expect("Failed to create event");
+
+        // Validation should succeed
+        let result = mdk.validate_event_and_extract_group_id(&message_event);
+        assert!(
+            result.is_ok(),
+            "Expected valid timestamp to be accepted, got: {:?}",
+            result
+        );
+    }
+
+    /// Test that validate_event_and_extract_group_id rejects events with multiple h tags
+    #[test]
+    fn test_validate_event_rejects_multiple_h_tags() {
+        let mdk = create_test_mdk();
+        let creator = Keys::generate();
+
+        // Create an event with multiple h tags
+        let message_event = EventBuilder::new(Kind::MlsGroupMessage, "test content")
+            .tag(Tag::custom(TagKind::h(), [hex::encode([1u8; 32])]))
+            .tag(Tag::custom(TagKind::h(), [hex::encode([2u8; 32])]))
+            .sign_with_keys(&creator)
+            .expect("Failed to create event");
+
+        // Validation should fail due to multiple h tags
+        let result = mdk.validate_event_and_extract_group_id(&message_event);
+        assert!(
+            matches!(result, Err(Error::MultipleGroupIdTags(2))),
+            "Expected MultipleGroupIdTags error, got: {:?}",
+            result
+        );
+    }
+
+    /// Test that validate_event_and_extract_group_id rejects events with invalid hex in h tag
+    #[test]
+    fn test_validate_event_rejects_invalid_hex_group_id() {
+        let mdk = create_test_mdk();
+        let creator = Keys::generate();
+
+        // Create an event with invalid hex in h tag
+        let message_event = EventBuilder::new(Kind::MlsGroupMessage, "test content")
+            .tag(Tag::custom(TagKind::h(), ["not-valid-hex-zzz"]))
+            .sign_with_keys(&creator)
+            .expect("Failed to create event");
+
+        // Validation should fail due to invalid hex
+        let result = mdk.validate_event_and_extract_group_id(&message_event);
+        assert!(
+            matches!(result, Err(Error::InvalidGroupIdFormat(_))),
+            "Expected InvalidGroupIdFormat error, got: {:?}",
+            result
+        );
+    }
+
+    /// Test that validate_event_and_extract_group_id rejects events with wrong length group ID
+    #[test]
+    fn test_validate_event_rejects_wrong_length_group_id() {
+        let mdk = create_test_mdk();
+        let creator = Keys::generate();
+
+        // Create an event with wrong length group ID (16 bytes instead of 32)
+        let message_event = EventBuilder::new(Kind::MlsGroupMessage, "test content")
+            .tag(Tag::custom(TagKind::h(), [hex::encode([1u8; 16])]))
+            .sign_with_keys(&creator)
+            .expect("Failed to create event");
+
+        // Validation should fail due to wrong length
+        let result = mdk.validate_event_and_extract_group_id(&message_event);
+        assert!(
+            matches!(result, Err(Error::InvalidGroupIdFormat(_))),
+            "Expected InvalidGroupIdFormat error for wrong length, got: {:?}",
+            result
+        );
+    }
+
+    /// Test that validate_event_and_extract_group_id extracts valid group ID
+    #[test]
+    fn test_validate_event_extracts_valid_group_id() {
+        let mdk = create_test_mdk();
+        let (creator, members, admins) = create_test_group_members();
+        let group_id = create_test_group(&mdk, &creator, &members, &admins);
+
+        // Get the group's nostr_group_id for the h tag
+        let group = mdk
+            .get_group(&group_id)
+            .expect("Failed to get group")
+            .expect("Group should exist");
+
+        // Create an event with valid group ID
+        let message_event = EventBuilder::new(Kind::MlsGroupMessage, "test content")
+            .tag(Tag::custom(
+                TagKind::h(),
+                [hex::encode(group.nostr_group_id)],
+            ))
+            .sign_with_keys(&creator)
+            .expect("Failed to create event");
+
+        // Validation should succeed and return the correct group ID
+        let result = mdk.validate_event_and_extract_group_id(&message_event);
+        assert!(result.is_ok(), "Expected success, got: {:?}", result);
+        assert_eq!(
+            result.unwrap(),
+            group.nostr_group_id,
+            "Extracted group ID should match"
+        );
+    }
+
+    /// Test that validate_event_and_extract_group_id rejects events missing h tag
+    #[test]
+    fn test_validate_event_rejects_missing_h_tag() {
+        let mdk = create_test_mdk();
+        let creator = Keys::generate();
+
+        // Create an event without h tag
+        let message_event = EventBuilder::new(Kind::MlsGroupMessage, "test content")
+            .sign_with_keys(&creator)
+            .expect("Failed to create event");
+
+        // Validation should fail due to missing h tag
+        let result = mdk.validate_event_and_extract_group_id(&message_event);
+        assert!(
+            matches!(result, Err(Error::MissingGroupIdTag)),
+            "Expected MissingGroupIdTag error, got: {:?}",
+            result
         );
     }
 

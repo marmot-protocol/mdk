@@ -184,23 +184,31 @@ where
         // Validate welcome event structure per MIP-02
         Self::validate_welcome_event(rumor_event)?;
 
-        if self.is_welcome_processed(wrapper_event_id)? {
-            let processed_welcome = self
-                .storage()
-                .find_processed_welcome_by_event_id(wrapper_event_id)
-                .map_err(|e| Error::Welcome(e.to_string()))?;
-            return match processed_welcome {
-                Some(processed_welcome) => {
-                    if let Some(welcome_event_id) = processed_welcome.welcome_event_id {
-                        self.storage()
-                            .find_welcome_by_event_id(&welcome_event_id)
-                            .map_err(|e| Error::Welcome(e.to_string()))?
-                            .ok_or(Error::MissingWelcomeForProcessedWelcome)
-                    } else {
-                        Err(Error::MissingWelcomeForProcessedWelcome)
-                    }
-                }
-                None => Err(Error::ProcessedWelcomeNotFound),
+        if let Some(processed_welcome) = self
+            .storage()
+            .find_processed_welcome_by_event_id(wrapper_event_id)
+            .map_err(|e| Error::Welcome(e.to_string()))?
+        {
+            // Check if this welcome previously failed - retries are not supported
+            if processed_welcome.state == welcome_types::ProcessedWelcomeState::Failed {
+                let reason = processed_welcome
+                    .failure_reason
+                    .unwrap_or_else(|| "unknown reason".to_string());
+                return Err(Error::WelcomePreviouslyFailed(reason));
+            }
+
+            // Welcome was successfully processed before - return the stored welcome
+            return match processed_welcome.welcome_event_id {
+                Some(welcome_event_id) => self
+                    .storage()
+                    .find_welcome_by_event_id(&welcome_event_id)
+                    .map_err(|e| Error::Welcome(e.to_string()))?
+                    .ok_or_else(|| {
+                        Error::Welcome("welcome record missing for processed welcome".to_string())
+                    }),
+                None => Err(Error::Welcome(
+                    "processed welcome missing welcome_event_id".to_string(),
+                )),
             };
         }
 
@@ -513,15 +521,6 @@ where
         };
 
         Ok(welcome_preview)
-    }
-
-    /// Check if a welcome has been processed
-    fn is_welcome_processed(&self, wrapper_event_id: &EventId) -> Result<bool, Error> {
-        let processed_welcome = self
-            .storage()
-            .find_processed_welcome_by_event_id(wrapper_event_id)
-            .map_err(|e| Error::Welcome(e.to_string()))?;
-        Ok(processed_welcome.is_some())
     }
 }
 
@@ -1534,5 +1533,71 @@ mod tests {
             1,
             "Should return exactly 1 welcome with limit 1"
         );
+    }
+
+    /// Test that retrying a failed welcome returns the original failure reason
+    ///
+    /// When a welcome fails to process (e.g., due to decoding errors), it is stored
+    /// with a Failed state and the failure reason. Retrying the same welcome should
+    /// return a clear error with the original failure reason, not a confusing
+    /// "missing welcome" error.
+    #[test]
+    fn test_failed_welcome_retry_returns_original_error() {
+        use nostr::RelayUrl;
+
+        let mdk = create_test_mdk();
+        let wrapper_event_id = EventId::from_slice(&[1u8; 32]).unwrap();
+
+        // Create a welcome with valid structure but invalid (non-base64) content
+        // This will pass validation but fail during preview_welcome when decoding
+        let mut tags = nostr::Tags::new();
+        tags.push(nostr::Tag::relays(vec![
+            RelayUrl::parse("wss://relay.example.com").unwrap(),
+        ]));
+        tags.push(nostr::Tag::event(EventId::all_zeros()));
+        tags.push(nostr::Tag::client("mdk".to_string()));
+        tags.push(nostr::Tag::custom(
+            nostr::TagKind::Custom("encoding".into()),
+            ["base64"],
+        ));
+
+        let invalid_welcome = UnsignedEvent {
+            id: Some(EventId::all_zeros()),
+            pubkey: Keys::generate().public_key(),
+            created_at: Timestamp::now(),
+            kind: Kind::MlsWelcome,
+            tags,
+            content: "not_valid_base64!!!".to_string(),
+        };
+
+        // First attempt should fail with a decoding error
+        let first_result = mdk.process_welcome(&wrapper_event_id, &invalid_welcome);
+        assert!(first_result.is_err(), "First attempt should fail");
+        let first_error = first_result.unwrap_err();
+        // The error should be a Welcome error about decoding
+        assert!(
+            matches!(first_error, Error::Welcome(ref msg) if msg.contains("decoding")),
+            "First error should be about decoding, got: {:?}",
+            first_error
+        );
+
+        // Second attempt (retry) should return WelcomePreviouslyFailed with the original reason
+        let second_result = mdk.process_welcome(&wrapper_event_id, &invalid_welcome);
+        assert!(second_result.is_err(), "Second attempt should also fail");
+        let second_error = second_result.unwrap_err();
+
+        // Verify we get the new error type with the original failure reason
+        match second_error {
+            Error::WelcomePreviouslyFailed(reason) => {
+                assert!(
+                    reason.contains("decoding"),
+                    "Failure reason should contain original error about decoding, got: {}",
+                    reason
+                );
+            }
+            other => {
+                panic!("Expected WelcomePreviouslyFailed error, got: {:?}", other);
+            }
+        }
     }
 }

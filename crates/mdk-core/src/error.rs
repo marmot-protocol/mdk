@@ -113,9 +113,9 @@ pub enum Error {
     /// Welcome error
     #[error("{0}")]
     Welcome(String),
-    /// We're missing a Welcome for an existing ProcessedWelcome
-    #[error("missing welcome for processed welcome")]
-    MissingWelcomeForProcessedWelcome,
+    /// Welcome previously failed to process (retries are not supported)
+    #[error("welcome previously failed to process: {0}")]
+    WelcomePreviouslyFailed(String),
     /// Processed welcome not found
     #[error("processed welcome not found")]
     ProcessedWelcomeNotFound,
@@ -207,12 +207,18 @@ pub enum Error {
     /// Rumor event is missing its ID
     #[error("rumor event is missing its ID")]
     MissingRumorEventId,
-    /// Missing group ID tag in event
-    #[error("missing group ID tag in event")]
+    /// Event timestamp is invalid (too far in future or past)
+    #[error("event timestamp is invalid: {0}")]
+    InvalidTimestamp(String),
+    /// Missing required group ID tag
+    #[error("missing required group ID tag (h tag)")]
     MissingGroupIdTag,
-    /// Invalid group ID format
-    #[error("invalid group ID format")]
-    InvalidGroupIdFormat,
+    /// Invalid group ID format in tag
+    #[error("invalid group ID format: {0}")]
+    InvalidGroupIdFormat(String),
+    /// Multiple group ID tags found (MIP-03 requires exactly one)
+    #[error("multiple group ID tags found: expected exactly one h tag, found {0}")]
+    MultipleGroupIdTags(usize),
 }
 
 impl From<FromUtf8Error> for Error {
@@ -378,8 +384,11 @@ mod tests {
         let error = Error::Welcome("welcome error".to_string());
         assert_eq!(error.to_string(), "welcome error");
 
-        let error = Error::MissingWelcomeForProcessedWelcome;
-        assert_eq!(error.to_string(), "missing welcome for processed welcome");
+        let error = Error::WelcomePreviouslyFailed("original error reason".to_string());
+        assert_eq!(
+            error.to_string(),
+            "welcome previously failed to process: original error reason"
+        );
 
         let error = Error::ProcessedWelcomeNotFound;
         assert_eq!(error.to_string(), "processed welcome not found");
