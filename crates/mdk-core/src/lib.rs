@@ -54,7 +54,7 @@ pub use mdk_storage_traits::GroupId;
 ///
 /// // Custom configuration
 /// let config = MdkConfig {
-///     max_event_age_secs: 86400, // 1 day instead of 7
+///     max_event_age_secs: 86400, // 1 day instead of 45
 ///     ..Default::default()
 /// };
 /// ```
@@ -70,10 +70,10 @@ pub struct MdkConfig {
     /// Default: 3888000 (45 days)
     ///
     /// # Security Note
-    /// This value is intentionally conservative. Increasing it may expose
-    /// applications to security risks. The 7-day window is sufficient for
-    /// normal message delivery delays, temporary network outages, and
-    /// client offline periods.
+    /// This value balances security with usability for offline scenarios.
+    /// The 45-day window accommodates extended offline periods while still
+    /// providing protection against replay attacks. Applications with stricter
+    /// security requirements may reduce this value.
     pub max_event_age_secs: u64,
 
     /// Maximum future timestamp skew allowed in seconds.
