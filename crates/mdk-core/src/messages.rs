@@ -897,12 +897,16 @@ where
     /// The function:
     /// 1. Validates the sender is authorized (admin, or non-admin for pure self-updates)
     /// 2. Merges the staged commit into the group state
-    /// 3. Updates the group to the new epoch with new cryptographic keys
-    /// 4. Saves the new exporter secret for NIP-44 encryption
-    /// 5. Updates processing state to prevent reprocessing
+    /// 3. Checks if the local member was removed by this commit
+    /// 4. If removed: sets group state to Inactive and skips further processing
+    /// 5. If still a member: saves new exporter secret and syncs group metadata
+    /// 6. Updates processing state to prevent reprocessing
     ///
     /// Note: Non-admin members are allowed to create commits that only update their own
     /// leaf node (pure self-updates). All other commit operations require admin privileges.
+    ///
+    /// When the local member is removed by a commit, the group state is set to `Inactive`
+    /// and the exporter secret/metadata sync are skipped to prevent use-after-eviction errors.
     ///
     /// # Arguments
     ///
@@ -974,16 +978,51 @@ where
         // MIP-00 mandates immutable identity fields
         self.validate_staged_commit_identities(mls_group, &staged_commit, commit_sender)?;
 
+        let group_id: GroupId = mls_group.group_id().into();
+
         mls_group
             .merge_staged_commit(&self.provider, staged_commit)
             .map_err(|e| Error::Message(e.to_string()))?;
 
+        // Check if the local member was removed by this commit
+        // After merge, own_leaf() returns None if we were evicted
+        if mls_group.own_leaf().is_none() {
+            tracing::info!(
+                target: "mdk_core::messages::process_commit_message_for_group",
+                "Local member was removed from group, setting group state to Inactive"
+            );
+
+            // Update group state to Inactive
+            if let Some(mut group) = self.get_group(&group_id)? {
+                group.state = group_types::GroupState::Inactive;
+                self.storage()
+                    .save_group(group)
+                    .map_err(|e| Error::Group(e.to_string()))?;
+            }
+
+            // Skip exporter_secret and sync_group_metadata_from_mls since we're evicted
+            // Save processed message and return success
+            let processed_message = message_types::ProcessedMessage {
+                wrapper_event_id: event.id,
+                message_event_id: None,
+                processed_at: Timestamp::now(),
+                state: message_types::ProcessedMessageState::Processed,
+                failure_reason: None,
+            };
+
+            self.storage()
+                .save_processed_message(processed_message)
+                .map_err(|e| Error::Message(e.to_string()))?;
+
+            return Ok(());
+        }
+
         // Save exporter secret for the new epoch
-        self.exporter_secret(&mls_group.group_id().into())?;
+        self.exporter_secret(&group_id)?;
 
         // Sync the stored group metadata with the updated MLS group state
         // This ensures any group context extension changes are reflected in storage
-        self.sync_group_metadata_from_mls(&mls_group.group_id().into())?;
+        self.sync_group_metadata_from_mls(&group_id)?;
 
         // Save a processed message so we don't reprocess
         let processed_message = message_types::ProcessedMessage {
@@ -6265,6 +6304,99 @@ mod tests {
         assert!(
             !members.contains(&charlie_keys.public_key()),
             "Charlie should be removed"
+        );
+    }
+
+    /// Test that a removed member correctly processes their own removal commit
+    ///
+    /// This verifies that when a member is removed from a group and later processes
+    /// the commit that removed them:
+    /// 1. The commit is processed successfully
+    /// 2. The group state is set to Inactive
+    /// 3. No UseAfterEviction error occurs
+    #[test]
+    fn test_removed_member_processes_own_removal_commit() {
+        let alice_keys = Keys::generate();
+        let bob_keys = Keys::generate();
+
+        let alice_mdk = create_test_mdk();
+        let bob_mdk = create_test_mdk();
+
+        // Only Alice is admin
+        let admins = vec![alice_keys.public_key()];
+
+        // Create key package
+        let bob_key_package = create_key_package_event(&bob_mdk, &bob_keys);
+
+        // Alice creates the group with Bob
+        let create_result = alice_mdk
+            .create_group(
+                &alice_keys.public_key(),
+                vec![bob_key_package],
+                create_nostr_group_config_data(admins.clone()),
+            )
+            .expect("Failed to create group");
+
+        let group_id = create_result.group.mls_group_id.clone();
+
+        // Alice merges her commit
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("Failed to merge pending commit");
+
+        // Bob joins via welcome
+        let bob_welcome_rumor = &create_result.welcome_rumors[0];
+        let bob_welcome = bob_mdk
+            .process_welcome(&nostr::EventId::all_zeros(), bob_welcome_rumor)
+            .expect("Bob should process welcome");
+        bob_mdk
+            .accept_welcome(&bob_welcome)
+            .expect("Bob should accept welcome");
+
+        // Verify Bob's group is initially Active
+        let bob_group_before = bob_mdk
+            .get_group(&group_id)
+            .expect("Failed to get group")
+            .expect("Group should exist");
+        assert_eq!(
+            bob_group_before.state,
+            group_types::GroupState::Active,
+            "Bob's group should be Active before removal"
+        );
+
+        // Alice (admin) removes Bob
+        let alice_remove_result = alice_mdk
+            .remove_members(&group_id, &[bob_keys.public_key()])
+            .expect("Alice (admin) can remove members");
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("Alice should merge remove commit");
+
+        // Bob (the removed member) processes his own removal commit
+        // This should succeed and set the group state to Inactive
+        let result = bob_mdk.process_message(&alice_remove_result.evolution_event);
+
+        assert!(
+            result.is_ok(),
+            "Removed member should process their removal commit successfully, got error: {:?}",
+            result.err()
+        );
+
+        // Verify the result is a Commit
+        assert!(
+            matches!(result.unwrap(), MessageProcessingResult::Commit { .. }),
+            "Result should be a Commit"
+        );
+
+        // Verify Bob's group state is now Inactive
+        let bob_group_after = bob_mdk
+            .get_group(&group_id)
+            .expect("Failed to get group")
+            .expect("Group should exist");
+        assert_eq!(
+            bob_group_after.state,
+            group_types::GroupState::Inactive,
+            "Bob's group should be Inactive after being removed"
         );
     }
 
