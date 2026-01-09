@@ -113,9 +113,9 @@ pub enum Error {
     /// Welcome error
     #[error("{0}")]
     Welcome(String),
-    /// We're missing a Welcome for an existing ProcessedWelcome
-    #[error("missing welcome for processed welcome")]
-    MissingWelcomeForProcessedWelcome,
+    /// Welcome previously failed to process (retries are not supported)
+    #[error("welcome previously failed to process: {0}")]
+    WelcomePreviouslyFailed(String),
     /// Processed welcome not found
     #[error("processed welcome not found")]
     ProcessedWelcomeNotFound,
@@ -378,8 +378,11 @@ mod tests {
         let error = Error::Welcome("welcome error".to_string());
         assert_eq!(error.to_string(), "welcome error");
 
-        let error = Error::MissingWelcomeForProcessedWelcome;
-        assert_eq!(error.to_string(), "missing welcome for processed welcome");
+        let error = Error::WelcomePreviouslyFailed("original error reason".to_string());
+        assert_eq!(
+            error.to_string(),
+            "welcome previously failed to process: original error reason"
+        );
 
         let error = Error::ProcessedWelcomeNotFound;
         assert_eq!(error.to_string(), "processed welcome not found");
