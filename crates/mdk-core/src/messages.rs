@@ -1693,6 +1693,7 @@ mod tests {
     use crate::test_util::*;
     use crate::tests::create_test_mdk;
     use mdk_storage_traits::groups::GroupStorage;
+    use mdk_storage_traits::messages::types::ProcessedMessageState;
     use mdk_storage_traits::messages::MessageStorage;
 
     #[test]
@@ -6397,6 +6398,89 @@ mod tests {
             bob_group_after.state,
             group_types::GroupState::Inactive,
             "Bob's group should be Inactive after being removed"
+        );
+    }
+
+    /// Test that a removed member's processed message is saved correctly
+    ///
+    /// This verifies that when an evicted member processes their removal commit:
+    /// 1. A ProcessedMessage record is created
+    /// 2. The state is Processed (not failed)
+    /// 3. No failure reason is recorded
+    #[test]
+    fn test_removed_member_processed_message_saved_correctly() {
+        let alice_keys = Keys::generate();
+        let bob_keys = Keys::generate();
+
+        let alice_mdk = create_test_mdk();
+        let bob_mdk = create_test_mdk();
+
+        // Only Alice is admin
+        let admins = vec![alice_keys.public_key()];
+
+        // Create key package
+        let bob_key_package = create_key_package_event(&bob_mdk, &bob_keys);
+
+        // Alice creates the group with Bob
+        let create_result = alice_mdk
+            .create_group(
+                &alice_keys.public_key(),
+                vec![bob_key_package],
+                create_nostr_group_config_data(admins.clone()),
+            )
+            .expect("Failed to create group");
+
+        let group_id = create_result.group.mls_group_id.clone();
+
+        // Alice merges her commit
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("Failed to merge pending commit");
+
+        // Bob joins via welcome
+        let bob_welcome_rumor = &create_result.welcome_rumors[0];
+        let bob_welcome = bob_mdk
+            .process_welcome(&nostr::EventId::all_zeros(), bob_welcome_rumor)
+            .expect("Bob should process welcome");
+        bob_mdk
+            .accept_welcome(&bob_welcome)
+            .expect("Bob should accept welcome");
+
+        // Alice (admin) removes Bob
+        let alice_remove_result = alice_mdk
+            .remove_members(&group_id, &[bob_keys.public_key()])
+            .expect("Alice (admin) can remove members");
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("Alice should merge remove commit");
+
+        // Get the event ID that Bob will process
+        let removal_event_id = alice_remove_result.evolution_event.id;
+
+        // Bob processes his own removal commit
+        bob_mdk
+            .process_message(&alice_remove_result.evolution_event)
+            .expect("Bob should process removal commit");
+
+        // Verify the processed message was saved correctly
+        let processed_message = bob_mdk
+            .storage()
+            .find_processed_message_by_event_id(&removal_event_id)
+            .expect("Failed to get processed message")
+            .expect("Processed message should exist");
+
+        assert_eq!(
+            processed_message.wrapper_event_id, removal_event_id,
+            "Wrapper event ID should match"
+        );
+        assert_eq!(
+            processed_message.state,
+            ProcessedMessageState::Processed,
+            "Processed message state should be Processed"
+        );
+        assert!(
+            processed_message.failure_reason.is_none(),
+            "There should be no failure reason for successful processing"
         );
     }
 
