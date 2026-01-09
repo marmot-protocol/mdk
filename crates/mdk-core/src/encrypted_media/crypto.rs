@@ -444,7 +444,7 @@ mod tests {
     }
 
     #[test]
-    fn test_secret_zeroization() {
+    fn test_secret_accessors() {
         // Test that Secret properly wraps values and can be accessed
         let original_key = [0xAAu8; 32];
         let secret_key = Secret::new(original_key);
@@ -688,12 +688,12 @@ mod tests {
             "image/jpeg",
             "test.jpg",
         );
-        assert!(result.is_err());
-        if let Err(EncryptedMediaError::DecryptionFailed { reason }) = result {
-            assert!(!reason.is_empty());
-            assert!(reason.contains("Decryption failed"));
-        } else {
-            panic!("Expected DecryptionFailed error");
+        match result {
+            Err(EncryptedMediaError::DecryptionFailed { reason }) => {
+                assert!(!reason.is_empty());
+                assert!(reason.contains("Decryption failed"));
+            }
+            other => panic!("Expected DecryptionFailed, got {:?}", other),
         }
     }
 
@@ -751,24 +751,6 @@ mod tests {
         let result = derive_encryption_key(&mdk, &group_id, &file_hash, "image/jpeg", "test.jpg");
         assert!(result.is_err());
         assert!(matches!(result, Err(EncryptedMediaError::GroupNotFound)));
-    }
-
-    #[test]
-    fn test_encryption_error_message() {
-        // Test encryption error message format
-        let key = Secret::new([0x42u8; 32]);
-        let nonce = Secret::new([0x24u8; 12]);
-        let file_hash = [0x01u8; 32];
-        let data = b"test data";
-
-        // This should succeed, but we can verify error message format by checking
-        // the error type structure
-        let result =
-            encrypt_data_with_aad(data, &key, &nonce, &file_hash, "image/jpeg", "test.jpg");
-        assert!(result.is_ok());
-
-        // Test that we can access error reason when it occurs
-        // (We can't easily trigger encryption failure, but we can verify the structure)
     }
 
     #[test]
