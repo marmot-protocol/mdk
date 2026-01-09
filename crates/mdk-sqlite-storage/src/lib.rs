@@ -534,8 +534,6 @@ mod tests {
     use std::collections::BTreeSet;
 
     use mdk_storage_traits::GroupId;
-    use mdk_storage_traits::groups::GroupStorage;
-    use mdk_storage_traits::groups::types::{Group, GroupExporterSecret, GroupState};
     use tempfile::tempdir;
 
     use super::*;
@@ -734,7 +732,7 @@ mod tests {
         use std::thread;
 
         use mdk_storage_traits::groups::GroupStorage;
-        use mdk_storage_traits::groups::types::{Group, GroupExporterSecret, GroupState};
+        use mdk_storage_traits::groups::types::{Group, GroupState};
         use mdk_storage_traits::messages::MessageStorage;
         use mdk_storage_traits::test_utils::cross_storage::{
             create_test_group, create_test_message, create_test_welcome,
@@ -1003,6 +1001,9 @@ mod tests {
 
         #[test]
         fn test_encrypted_storage_exporter_secrets() {
+            use mdk_storage_traits::Secret;
+            use mdk_storage_traits::groups::types::{Group, GroupExporterSecret, GroupState};
+
             let temp_dir = tempdir().unwrap();
             let db_path = temp_dir.path().join("exporter_secrets.db");
 
@@ -1036,7 +1037,7 @@ mod tests {
                     let secret = GroupExporterSecret {
                         mls_group_id: mls_group_id.clone(),
                         epoch,
-                        secret: [epoch as u8; 32],
+                        secret: Secret::new([epoch as u8; 32]),
                     };
                     storage.save_group_exporter_secret(secret).unwrap();
                 }

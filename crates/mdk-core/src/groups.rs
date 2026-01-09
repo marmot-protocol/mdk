@@ -1281,20 +1281,18 @@ where
         stored_group.epoch = mls_group.epoch().as_u64();
 
         // Update extension data from NostrGroupDataExtension
-        if let Ok(group_data) = NostrGroupDataExtension::from_group(&mls_group) {
-            stored_group.name = group_data.name;
-            stored_group.description = group_data.description;
-            stored_group.image_hash = group_data.image_hash;
-            stored_group.image_key = group_data.image_key.map(mdk_storage_traits::Secret::new);
-            stored_group.image_nonce = group_data.image_nonce.map(mdk_storage_traits::Secret::new);
-            stored_group.admin_pubkeys = group_data.admins;
-            stored_group.nostr_group_id = group_data.nostr_group_id;
+        stored_group.name = group_data.name;
+        stored_group.description = group_data.description;
+        stored_group.image_hash = group_data.image_hash;
+        stored_group.image_key = group_data.image_key.map(mdk_storage_traits::Secret::new);
+        stored_group.image_nonce = group_data.image_nonce.map(mdk_storage_traits::Secret::new);
+        stored_group.admin_pubkeys = group_data.admins;
+        stored_group.nostr_group_id = group_data.nostr_group_id;
 
-            // Sync relays atomically - replace entire relay set with current extension data
-            self.storage()
-                .replace_group_relays(group_id, group_data.relays)
-                .map_err(|e| Error::Group(e.to_string()))?;
-        }
+        // Sync relays atomically - replace entire relay set with current extension data
+        self.storage()
+            .replace_group_relays(group_id, group_data.relays)
+            .map_err(|e| Error::Group(e.to_string()))?;
 
         self.storage()
             .save_group(stored_group)

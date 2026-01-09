@@ -114,7 +114,7 @@ where
             encrypted_size,
             dimensions: metadata.dimensions,
             blurhash: metadata.blurhash,
-            nonce,
+            nonce: *nonce,
         })
     }
 
@@ -136,7 +136,7 @@ where
         let decrypted_data = decrypt_data_with_aad(
             encrypted_data,
             &encryption_key,
-            &reference.nonce,
+            &mdk_storage_traits::Secret::new(reference.nonce),
             &reference.original_hash,
             &reference.mime_type,
             &reference.filename,
