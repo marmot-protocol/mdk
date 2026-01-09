@@ -9,3 +9,9 @@ coverage/
 
 # Audit related files
 /docs/audits
+
+# Editor specific files
+.vscode/
+
+# Claude AI settings (local overrides)
+.claude/settings.local.json

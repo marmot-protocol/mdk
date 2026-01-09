@@ -19,7 +19,7 @@ fn generate_identity() -> (Keys, MDK<MdkSqliteStorage>, TempDir) {
     let keys = Keys::generate();
     let temp_dir = TempDir::new().expect("Failed to create temp directory");
     let db_path = temp_dir.path().join("mls.db");
-    let mdk = MDK::new(MdkSqliteStorage::new(db_path).unwrap());
+    let mdk = MDK::new(MdkSqliteStorage::new_unencrypted(db_path).unwrap());
     (keys, mdk, temp_dir)
 }
 
@@ -356,7 +356,14 @@ async fn main() -> Result<(), Error> {
 
     match leave_proposal_result {
         Ok(MessageProcessingResult::Proposal(_)) => {
-            tracing::info!("Bob's leave proposal was successfully processed by Alice");
+            // Admin receiver auto-committed the proposal
+            tracing::info!(
+                "Bob's leave proposal was successfully processed and committed by Alice (admin)"
+            );
+        }
+        Ok(MessageProcessingResult::PendingProposal { .. }) => {
+            // Non-admin receiver stored proposal as pending
+            tracing::info!("Bob's leave proposal was stored as pending (receiver is not admin)");
         }
         _ => {
             tracing::warn!("Unexpected result from processing Bob's leave proposal");
