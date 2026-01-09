@@ -42,6 +42,7 @@
 
 ### Fixed
 
+- **Security (Audit Issue 6/Suggestion 6)**: Improved `save_message` performance from O(n) to expected/amortized O(1) by replacing `Vec<Message>` with `HashMap<EventId, Message>` for the messages-by-group cache. This addresses potential DoS risk from high message counts per group (threat model T.10.2 and T.10.4). Fixes [#92](https://github.com/marmot-protocol/mdk/issues/92) ([#134](https://github.com/marmot-protocol/mdk/pull/134))
 - **Security (Audit Issue Z)**: Added pagination to prevent memory exhaustion from unbounded loading of group messages ([#111](https://github.com/marmot-protocol/mdk/pull/111))
 - **Security (Audit Issue AA)**: Added pagination to prevent memory exhaustion from unbounded loading of pending welcomes ([#110](https://github.com/marmot-protocol/mdk/pull/110))
 - **Security (Audit Issue AO)**: Removed MLS group identifiers from error messages to prevent metadata leakage in logs and telemetry. Error messages now use generic "Group not found" instead of including the sensitive 32-byte MLS group ID. ([#112](https://github.com/marmot-protocol/mdk/pull/112))

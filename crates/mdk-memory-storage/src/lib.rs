@@ -10,7 +10,7 @@
 #![warn(missing_docs)]
 #![warn(rustdoc::bare_urls)]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::num::NonZeroUsize;
 
 use lru::LruCache;
@@ -67,8 +67,8 @@ pub struct MdkMemoryStorage {
     processed_welcomes_cache: RwLock<LruCache<EventId, ProcessedWelcome>>,
     /// LRU Cache for Message objects, keyed by Event ID
     messages_cache: RwLock<LruCache<EventId, Message>>,
-    /// LRU Cache for Messages by Group ID (GroupId)
-    messages_by_group_cache: RwLock<LruCache<GroupId, Vec<Message>>>,
+    /// LRU Cache for Messages by Group ID, using HashMap for O(1) lookups by EventId
+    messages_by_group_cache: RwLock<LruCache<GroupId, HashMap<EventId, Message>>>,
     /// LRU Cache for ProcessedMessage objects, keyed by Event ID
     processed_messages_cache: RwLock<LruCache<EventId, ProcessedMessage>>,
     /// LRU Cache for GroupExporterSecret objects, keyed by a tuple of (GroupId, epoch)
@@ -528,15 +528,13 @@ mod tests {
             assert!(cache.contains(&event_id));
         }
         {
-            let mut cache = nostr_storage.messages_by_group_cache.write();
-            cache.put(mls_group_id.clone(), vec![message.clone()]); // Manual add for testing
-        }
-        {
+            // Verify save_message populated the messages_by_group_cache correctly
             let cache = nostr_storage.messages_by_group_cache.read();
             assert!(cache.contains(&mls_group_id));
             if let Some(msgs) = cache.peek(&mls_group_id) {
                 assert_eq!(msgs.len(), 1);
-                assert_eq!(msgs[0].id, event_id);
+                assert!(msgs.contains_key(&event_id));
+                assert_eq!(msgs.get(&event_id).unwrap().id, event_id);
             } else {
                 panic!("Messages not found in group cache");
             }
