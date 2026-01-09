@@ -479,6 +479,14 @@ where
         staged_commit: &StagedCommit,
         sender_leaf_index: &openmls::prelude::LeafNodeIndex,
     ) -> bool {
+        // A self-update commit must contain at least one self-update signal:
+        // either an UpdatePath or an Update proposal. Reject empty commits.
+        if staged_commit.update_path_leaf_node().is_none()
+            && staged_commit.update_proposals().next().is_none()
+        {
+            return false;
+        }
+
         // Use a whitelist approach: only allow Update proposals that are self-updates.
         // Any other proposal type (Add, Remove, PreSharedKey, GroupContextExtensions,
         // ReInit, ExternalInit, AppAck, Custom, or future types) requires admin privileges.
@@ -887,11 +895,14 @@ where
     ///
     /// This internal function handles MLS commit messages that finalize pending proposals.
     /// The function:
-    /// 1. Validates the sender is a group admin
+    /// 1. Validates the sender is authorized (admin, or non-admin for pure self-updates)
     /// 2. Merges the staged commit into the group state
     /// 3. Updates the group to the new epoch with new cryptographic keys
     /// 4. Saves the new exporter secret for NIP-44 encryption
     /// 5. Updates processing state to prevent reprocessing
+    ///
+    /// Note: Non-admin members are allowed to create commits that only update their own
+    /// leaf node (pure self-updates). All other commit operations require admin privileges.
     ///
     /// # Arguments
     ///
@@ -903,7 +914,7 @@ where
     /// # Returns
     ///
     /// * `Ok(())` - If commit processing succeeds
-    /// * `Err(Error)` - If sender is not an admin, commit merging, or storage operations fail
+    /// * `Err(Error)` - If sender is not authorized, commit merging, or storage operations fail
     fn process_commit_message_for_group(
         &self,
         mls_group: &mut MlsGroup,
@@ -1167,6 +1178,7 @@ where
             Error::GroupNotFound => "group_not_found",
             Error::CannotDecryptOwnMessage => "own_message",
             Error::AuthorMismatch => "authentication_failed",
+            Error::CommitFromNonAdmin => "authorization_failed",
             _ => "processing_failed",
         }
     }
@@ -1383,18 +1395,15 @@ where
             }
             Error::CommitFromNonAdmin => {
                 // Authorization errors should propagate as errors, not be silently swallowed
-                // Save a failed processing record to prevent reprocessing
-                let processed_message = message_types::ProcessedMessage {
-                    wrapper_event_id: event.id,
-                    message_event_id: None,
-                    processed_at: Timestamp::now(),
-                    state: message_types::ProcessedMessageState::Failed,
-                    failure_reason: Some("authorization_failed".to_string()),
-                };
-                self.storage()
-                    .save_processed_message(processed_message)
-                    .map_err(|e| Error::Message(e.to_string()))?;
-
+                // Save a failed processing record to prevent reprocessing (best-effort)
+                if let Err(save_err) = self.save_failed_processed_message(event.id, &error) {
+                    tracing::warn!(
+                        target: "mdk_core::messages::handle_message_processing_error",
+                        "Failed to persist failure record: {}. Original error: {}",
+                        save_err,
+                        error
+                    );
+                }
                 Err(error)
             }
             _ => {
@@ -4438,8 +4447,6 @@ mod tests {
     /// legitimate commits.
     #[test]
     fn test_commit_processing_validates_identity_multi_member() {
-        use crate::test_util::create_key_package_event;
-
         let alice_keys = Keys::generate();
         let bob_keys = Keys::generate();
 
@@ -4524,8 +4531,6 @@ mod tests {
     /// Per the Marmot protocol, admins should auto-commit self-leave proposals.
     #[test]
     fn test_self_leave_proposal_auto_committed_by_admin() {
-        use crate::test_util::create_key_package_event;
-
         // Setup: Alice (admin), Bob (non-admin member)
         let alice_keys = Keys::generate();
         let bob_keys = Keys::generate();
@@ -4609,8 +4614,6 @@ mod tests {
     /// Non-admin members cannot commit, so they store the proposal for later admin approval.
     #[test]
     fn test_self_leave_proposal_stored_pending_by_non_admin() {
-        use crate::test_util::create_key_package_event;
-
         // Setup: Alice (admin), Bob (non-admin), Charlie (non-admin)
         let alice_keys = Keys::generate();
         let bob_keys = Keys::generate();
@@ -4813,8 +4816,6 @@ mod tests {
     /// remove_members commits.
     #[test]
     fn test_remove_members_commit_triggers_identity_validation() {
-        use crate::test_util::create_key_package_event;
-
         let alice_keys = Keys::generate();
         let bob_keys = Keys::generate();
         let charlie_keys = Keys::generate();
@@ -5811,8 +5812,6 @@ mod tests {
     /// 3. Alice processes Charlie's commit successfully
     #[test]
     fn test_self_update_commit_from_non_admin_is_allowed() {
-        use crate::test_util::{create_key_package_event, create_nostr_group_config_data};
-
         // Setup: Alice (admin) and Charlie (non-admin member)
         let alice_keys = Keys::generate();
         let charlie_keys = Keys::generate();
@@ -5898,8 +5897,6 @@ mod tests {
     /// the server-side check as defense in depth.
     #[test]
     fn test_add_member_commit_from_non_admin_is_rejected() {
-        use crate::test_util::{create_key_package_event, create_nostr_group_config_data};
-
         // Setup: Alice (admin), Bob (admin initially), and Charlie (non-admin member)
         let alice_keys = Keys::generate();
         let bob_keys = Keys::generate();
@@ -6011,8 +6008,6 @@ mod tests {
     /// exercising the "sender is admin" path in `process_commit_message_for_group`.
     #[test]
     fn test_admin_add_member_commit_is_processed_successfully() {
-        use crate::test_util::{create_key_package_event, create_nostr_group_config_data};
-
         let alice_keys = Keys::generate();
         let bob_keys = Keys::generate();
         let charlie_keys = Keys::generate();
@@ -6100,8 +6095,6 @@ mod tests {
     /// from admins are accepted, exercising the admin path in the commit processing.
     #[test]
     fn test_admin_extension_update_commit_is_processed_successfully() {
-        use crate::test_util::{create_key_package_event, create_nostr_group_config_data};
-
         let alice_keys = Keys::generate();
         let bob_keys = Keys::generate();
 
@@ -6182,8 +6175,6 @@ mod tests {
     /// This verifies that commits from admins with remove proposals are accepted.
     #[test]
     fn test_admin_remove_member_commit_is_processed_successfully() {
-        use crate::test_util::{create_key_package_event, create_nostr_group_config_data};
-
         let alice_keys = Keys::generate();
         let bob_keys = Keys::generate();
         let charlie_keys = Keys::generate();
@@ -6284,8 +6275,6 @@ mod tests {
     /// provides defense-in-depth for malformed messages.
     #[test]
     fn test_non_admin_extension_update_rejected_at_client() {
-        use crate::test_util::{create_key_package_event, create_nostr_group_config_data};
-
         let alice_keys = Keys::generate();
         let bob_keys = Keys::generate();
 
@@ -6346,8 +6335,6 @@ mod tests {
     /// non-admins are correctly identified as self-updates and allowed.
     #[test]
     fn test_non_admin_empty_self_update_commit_succeeds() {
-        use crate::test_util::{create_key_package_event, create_nostr_group_config_data};
-
         let alice_keys = Keys::generate();
         let bob_keys = Keys::generate();
 

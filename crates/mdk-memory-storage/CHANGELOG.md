@@ -43,6 +43,7 @@
 
 ### Fixed
 
+- **Security (Audit Issue 6/Suggestion 6)**: Improved `save_message` performance from O(n) to expected/amortized O(1) by replacing `Vec<Message>` with `HashMap<EventId, Message>` for the messages-by-group cache. This addresses potential DoS risk from high message counts per group (threat model T.10.2 and T.10.4). Fixes [#92](https://github.com/marmot-protocol/mdk/issues/92) ([#134](https://github.com/marmot-protocol/mdk/pull/134))
 - **Security (Audit Issue Y)**: Secret values stored in memory are now wrapped in `Secret<T>` type, ensuring automatic memory zeroization and preventing sensitive cryptographic material from persisting in memory ([#109](https://github.com/marmot-protocol/mdk/pull/109))
 - **Security (Audit Issue Z)**: Added pagination to prevent memory exhaustion from unbounded loading of group messages ([#111](https://github.com/marmot-protocol/mdk/pull/111))
 - **Security (Audit Issue AA)**: Added pagination to prevent memory exhaustion from unbounded loading of pending welcomes ([#110](https://github.com/marmot-protocol/mdk/pull/110))

@@ -54,6 +54,8 @@ impl From<&GroupId> for openmls::group::GroupId {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::*;
 
     #[test]
@@ -107,8 +109,6 @@ mod tests {
 
     #[test]
     fn test_group_id_hash() {
-        use std::collections::HashSet;
-
         let bytes1 = [1u8, 2, 3, 4];
         let bytes2 = [5u8, 6, 7, 8];
         let id1 = GroupId::from_slice(&bytes1);
