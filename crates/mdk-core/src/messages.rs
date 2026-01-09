@@ -485,40 +485,19 @@ where
         //
         // This is more secure than a blocklist because it automatically rejects any
         // new proposal types that might be added in future MLS/OpenMLS versions.
-        for queued_proposal in staged_commit.queued_proposals() {
-            match queued_proposal.proposal() {
-                Proposal::Update(_) => {
-                    // Update proposals are allowed, but only if they update the sender's own leaf
-                    // We'll verify this in the detailed check below
-                }
-                _ => {
-                    // Any other proposal type (Add, Remove, PreSharedKey, GroupContextExtensions,
-                    // ReInit, ExternalInit, AppAck, Custom, etc.) is not allowed in a self-update
-                    return false;
-                }
-            }
+
+        // Check all proposals are Update variants
+        if !staged_commit
+            .queued_proposals()
+            .all(|p| matches!(p.proposal(), Proposal::Update(_)))
+        {
+            return false;
         }
 
-        // Verify all update proposals are self-updates (updating the sender's own leaf)
-        for update_proposal in staged_commit.update_proposals() {
-            match update_proposal.sender() {
-                Sender::Member(proposer_leaf_index) => {
-                    if proposer_leaf_index != sender_leaf_index {
-                        // Update proposal is for a different member's leaf - not a self-update
-                        return false;
-                    }
-                }
-                _ => {
-                    // Non-member senders cannot be self-updates
-                    return false;
-                }
-            }
-        }
-
-        // If we get here, the commit contains only Update proposals for the sender's
-        // own leaf (or no proposals at all, using only the update path).
-        // This is a valid self-update.
-        true
+        // Verify all update proposals are self-updates (sender's own leaf)
+        staged_commit
+            .update_proposals()
+            .all(|p| matches!(p.sender(), Sender::Member(idx) if idx == sender_leaf_index))
     }
 
     /// Validates that a staged commit does not attempt to change any member's identity
@@ -951,21 +930,23 @@ where
                 let is_pure_self_update =
                     self.is_pure_self_update_commit(&staged_commit, leaf_index);
 
-                if !sender_is_admin && !is_pure_self_update {
-                    tracing::warn!(
-                        target: "mdk_core::messages::process_commit_message_for_group",
-                        "Received non-self-update commit from non-admin member at leaf index {:?}",
-                        leaf_index
-                    );
-                    return Err(Error::CommitFromNonAdmin);
-                }
-
-                if !sender_is_admin && is_pure_self_update {
-                    tracing::debug!(
-                        target: "mdk_core::messages::process_commit_message_for_group",
-                        "Allowing self-update commit from non-admin member at leaf index {:?}",
-                        leaf_index
-                    );
+                match (sender_is_admin, is_pure_self_update) {
+                    (true, _) => {}
+                    (false, true) => {
+                        tracing::debug!(
+                            target: "mdk_core::messages::process_commit_message_for_group",
+                            "Allowing self-update commit from non-admin member at leaf index {:?}",
+                            leaf_index
+                        );
+                    }
+                    (false, false) => {
+                        tracing::warn!(
+                            target: "mdk_core::messages::process_commit_message_for_group",
+                            "Received non-self-update commit from non-admin member at leaf index {:?}",
+                            leaf_index
+                        );
+                        return Err(Error::CommitFromNonAdmin);
+                    }
                 }
             }
             _ => {
