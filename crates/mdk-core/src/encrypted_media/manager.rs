@@ -637,7 +637,7 @@ mod tests {
     #[test]
     fn test_generate_encryption_nonce_uniqueness() {
         // Generate multiple nonces and verify they are unique
-        let nonces: Vec<[u8; 12]> = (0..100).map(|_| generate_encryption_nonce()).collect();
+        let nonces: Vec<[u8; 12]> = (0..100).map(|_| *generate_encryption_nonce()).collect();
 
         for i in 0..nonces.len() {
             for j in (i + 1)..nonces.len() {

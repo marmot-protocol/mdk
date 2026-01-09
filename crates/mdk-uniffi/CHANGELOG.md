@@ -32,8 +32,6 @@
 
 ### Changed
 
-- **Bindings Security**: Updated bindings to use `Secret<T>` wrapper for secret values, ensuring automatic memory zeroization ([#109](https://github.com/marmot-protocol/mdk/pull/109))
-
 ### Added
 
 - Exposed pagination control for `get_messages()` to foreign language bindings via optional `limit` and `offset` parameters. ([#111](https://github.com/marmot-protocol/mdk/pull/111))

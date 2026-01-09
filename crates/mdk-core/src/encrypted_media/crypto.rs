@@ -12,9 +12,10 @@ use hkdf::Hkdf;
 use nostr::secp256k1::rand::{RngCore, rngs::OsRng};
 use sha2::Sha256;
 
+use mdk_storage_traits::{MdkStorageProvider, Secret};
+
 use crate::encrypted_media::types::EncryptedMediaError;
 use crate::{GroupId, MDK};
-use mdk_storage_traits::{MdkStorageProvider, Secret};
 
 /// Scheme label for MIP-04 version 2 encryption to provide domain separation
 /// and prevent cross-version collisions
@@ -620,9 +621,8 @@ mod tests {
 
     #[test]
     fn test_multiple_encryption_cycles() {
-        // Test multiple encryption/decryption cycles with same key/nonce
+        // Test multiple encryption/decryption cycles (fresh nonce per encryption)
         let key = Secret::new([0x42u8; 32]);
-        let nonce = Secret::new([0x24u8; 12]);
         let file_hash = [0x01u8; 32];
         let mime_type = "image/jpeg";
         let filename = "test.jpg";
@@ -631,27 +631,24 @@ mod tests {
         let data2 = b"Second encryption";
         let data3 = b"Third encryption";
 
-        // Encrypt multiple times
-        let enc1 =
-            encrypt_data_with_aad(data1, &key, &nonce, &file_hash, mime_type, filename).unwrap();
-        let enc2 =
-            encrypt_data_with_aad(data2, &key, &nonce, &file_hash, mime_type, filename).unwrap();
-        let enc3 =
-            encrypt_data_with_aad(data3, &key, &nonce, &file_hash, mime_type, filename).unwrap();
+        let nonce1 = generate_encryption_nonce();
+        let nonce2 = generate_encryption_nonce();
+        let nonce3 = generate_encryption_nonce();
 
-        // Each encryption should produce different ciphertext (even with same key/nonce)
-        // because ChaCha20-Poly1305 is non-deterministic
-        assert_ne!(enc1, enc2);
-        assert_ne!(enc2, enc3);
-        assert_ne!(enc1, enc3);
+        let enc1 =
+            encrypt_data_with_aad(data1, &key, &nonce1, &file_hash, mime_type, filename).unwrap();
+        let enc2 =
+            encrypt_data_with_aad(data2, &key, &nonce2, &file_hash, mime_type, filename).unwrap();
+        let enc3 =
+            encrypt_data_with_aad(data3, &key, &nonce3, &file_hash, mime_type, filename).unwrap();
 
         // All should decrypt correctly
         let dec1 =
-            decrypt_data_with_aad(&enc1, &key, &nonce, &file_hash, mime_type, filename).unwrap();
+            decrypt_data_with_aad(&enc1, &key, &nonce1, &file_hash, mime_type, filename).unwrap();
         let dec2 =
-            decrypt_data_with_aad(&enc2, &key, &nonce, &file_hash, mime_type, filename).unwrap();
+            decrypt_data_with_aad(&enc2, &key, &nonce2, &file_hash, mime_type, filename).unwrap();
         let dec3 =
-            decrypt_data_with_aad(&enc3, &key, &nonce, &file_hash, mime_type, filename).unwrap();
+            decrypt_data_with_aad(&enc3, &key, &nonce3, &file_hash, mime_type, filename).unwrap();
 
         assert_eq!(dec1, data1);
         assert_eq!(dec2, data2);
