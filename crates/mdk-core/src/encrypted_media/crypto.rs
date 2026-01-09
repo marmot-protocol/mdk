@@ -179,9 +179,13 @@ pub fn decrypt_data_with_aad(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
     use mdk_memory_storage::MdkMemoryStorage;
     use sha2::Digest;
+
+    use super::*;
 
     fn create_test_mdk() -> MDK<MdkMemoryStorage> {
         MDK::new(MdkMemoryStorage::default())
