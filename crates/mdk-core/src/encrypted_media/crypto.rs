@@ -725,9 +725,6 @@ mod tests {
         assert_ne!(secret1, secret3);
 
         // Test hashing (equal secrets should have same hash)
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-
         let mut hasher1 = DefaultHasher::new();
         secret1.hash(&mut hasher1);
         let hash1 = hasher1.finish();
