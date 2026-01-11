@@ -45,6 +45,8 @@
 
 ### Changed
 
+- `create_group()` now supports creating single-member groups (groups with only the creator). This enables "message to self" functionality, setting up groups before inviting members, and multi-device scenarios. When no members are provided, the method returns an empty `welcome_rumors` vec. ([#138](https://github.com/marmot-protocol/mdk/pull/138))
+
 ### Added
 
 - New `MessageProcessingResult::PendingProposal` variant returned when a non-admin member receives a proposal. The proposal is stored as pending and awaits commitment by an admin. ([#122](https://github.com/marmot-protocol/mdk/pull/122))
