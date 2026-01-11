@@ -39,6 +39,8 @@
 
 ### Fixed
 
+- **Security**: Secret values in bindings now use `Secret<T>` wrapper for automatic memory zeroization, preventing sensitive cryptographic material from persisting in memory ([#109](https://github.com/marmot-protocol/mdk/pull/109))
+
 ### Removed
 
 ### Deprecated

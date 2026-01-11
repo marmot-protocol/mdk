@@ -203,11 +203,11 @@ async fn main() -> Result<(), Error> {
         println!("  Image Hash: {}", hex::encode(image_hash));
 
         if let Some(image_key) = stored_group.image_key {
-            println!("  Image Key: {}", hex::encode(image_key));
+            println!("  Image Key: {}", hex::encode(*image_key));
         }
 
         if let Some(image_nonce) = stored_group.image_nonce {
-            println!("  Image Nonce: {}", hex::encode(image_nonce));
+            println!("  Image Nonce: {}", hex::encode(*image_nonce));
         }
     } else {
         println!("  No group image configured");

@@ -368,7 +368,7 @@ where
                 let group_exporter_secret = group_types::GroupExporterSecret {
                     mls_group_id: group_id.clone(),
                     epoch: group.epoch().as_u64(),
-                    secret: export_secret,
+                    secret: mdk_storage_traits::Secret::new(export_secret),
                 };
 
                 self.storage()
@@ -1057,8 +1057,8 @@ where
             epoch: mls_group.epoch().as_u64(),
             state: group_types::GroupState::Active,
             image_hash: config.image_hash,
-            image_key: config.image_key,
-            image_nonce: config.image_nonce,
+            image_key: config.image_key.map(mdk_storage_traits::Secret::new),
+            image_nonce: config.image_nonce.map(mdk_storage_traits::Secret::new),
         };
 
         self.storage().save_group(group.clone()).map_err(
@@ -1277,14 +1277,15 @@ where
         // Validate the mandatory group-data extension FIRST before making any state changes
         // This ensures we don't update stored_group if the extension is missing, invalid, or unsupported
         let group_data = NostrGroupDataExtension::from_group(&mls_group)?;
-
         // Only after successful validation, update epoch and metadata from MLS group
         stored_group.epoch = mls_group.epoch().as_u64();
+
+        // Update extension data from NostrGroupDataExtension
         stored_group.name = group_data.name;
         stored_group.description = group_data.description;
         stored_group.image_hash = group_data.image_hash;
-        stored_group.image_key = group_data.image_key;
-        stored_group.image_nonce = group_data.image_nonce;
+        stored_group.image_key = group_data.image_key.map(mdk_storage_traits::Secret::new);
+        stored_group.image_nonce = group_data.image_nonce.map(mdk_storage_traits::Secret::new);
         stored_group.admin_pubkeys = group_data.admins;
         stored_group.nostr_group_id = group_data.nostr_group_id;
 
@@ -1405,7 +1406,7 @@ where
         let secret: group_types::GroupExporterSecret = self.exporter_secret(group_id)?;
 
         // Convert that secret to nostr keys
-        let secret_key: SecretKey = SecretKey::from_slice(&secret.secret)?;
+        let secret_key: SecretKey = SecretKey::from_slice(secret.secret.as_ref())?;
         let export_nostr_keys: Keys = Keys::new(secret_key);
 
         // Encrypt the message content
@@ -1555,7 +1556,7 @@ mod tests {
             )
             .expect("Failed to create group");
 
-        let group_id = &create_result.group.mls_group_id;
+        let group_id = &create_result.group.mls_group_id.clone();
 
         // Merge the pending commit to apply the member additions
         creator_mdk
@@ -1596,7 +1597,7 @@ mod tests {
             )
             .expect("Failed to create group");
 
-        let group_id = &create_result.group.mls_group_id;
+        let group_id = &create_result.group.mls_group_id.clone();
 
         // Merge the pending commit to apply the member additions
         creator_mdk
@@ -1637,7 +1638,7 @@ mod tests {
             )
             .expect("Failed to create group");
 
-        let group_id = &create_result.group.mls_group_id;
+        let group_id = &create_result.group.mls_group_id.clone();
 
         // Merge the pending commit to apply the member additions
         creator_mdk
@@ -1716,7 +1717,7 @@ mod tests {
             )
             .expect("Failed to create group");
 
-        let group_id = &create_result.group.mls_group_id;
+        let group_id = &create_result.group.mls_group_id.clone();
 
         // Merge the pending commit to apply the member additions
         creator_mdk
@@ -1761,7 +1762,7 @@ mod tests {
             )
             .expect("Failed to create group");
 
-        let group_id = &create_result.group.mls_group_id;
+        let group_id = &create_result.group.mls_group_id.clone();
 
         // Merge the pending commit to apply the member additions
         creator_mdk
@@ -1808,7 +1809,7 @@ mod tests {
             )
             .expect("Failed to create group");
 
-        let group_id = &create_result.group.mls_group_id;
+        let group_id = &create_result.group.mls_group_id.clone();
 
         // Merge the pending commit to apply the member additions
         admin_mdk
@@ -1960,7 +1961,7 @@ mod tests {
             )
             .expect("Failed to create group");
 
-        let group_id = &create_result.group.mls_group_id;
+        let group_id = &create_result.group.mls_group_id.clone();
 
         // Merge the pending commit to apply the member additions
         creator_mdk
@@ -2035,7 +2036,7 @@ mod tests {
             )
             .expect("Failed to create group");
 
-        let group_id = &create_result.group.mls_group_id;
+        let group_id = &create_result.group.mls_group_id.clone();
 
         // Merge the pending commit to apply the member additions
         creator_mdk
@@ -2077,7 +2078,7 @@ mod tests {
             )
             .expect("Failed to create group");
 
-        let group_id = &create_result.group.mls_group_id;
+        let group_id = &create_result.group.mls_group_id.clone();
 
         // Merge the pending commit to apply the member additions
         creator_mdk
@@ -2153,7 +2154,7 @@ mod tests {
             )
             .expect("Failed to create group");
 
-        let group_id = &create_result.group.mls_group_id;
+        let group_id = &create_result.group.mls_group_id.clone();
 
         // Merge the pending commit to apply the member additions
         creator_mdk
@@ -2262,7 +2263,7 @@ mod tests {
             )
             .expect("Failed to create group");
 
-        let group_id = &create_result.group.mls_group_id;
+        let group_id = &create_result.group.mls_group_id.clone();
 
         // Merge the pending commit to apply the member additions
         creator_mdk
@@ -2340,7 +2341,7 @@ mod tests {
             )
             .expect("Failed to create group");
 
-        let group_id = &create_result.group.mls_group_id;
+        let group_id = &create_result.group.mls_group_id.clone();
 
         // Merge the pending commit to apply the member additions
         creator_mdk
@@ -2410,7 +2411,7 @@ mod tests {
             )
             .expect("Failed to create group");
 
-        let group_id = &create_result.group.mls_group_id;
+        let group_id = &create_result.group.mls_group_id.clone();
 
         // Merge the pending commit to apply the member additions
         creator_mdk
@@ -2575,7 +2576,7 @@ mod tests {
             )
             .expect("Failed to create group");
 
-        let group_id = &create_result.group.mls_group_id;
+        let group_id = &create_result.group.mls_group_id.clone();
 
         // Merge the pending commit to apply the member additions
         creator_mdk
@@ -2687,7 +2688,7 @@ mod tests {
             )
             .expect("Failed to create group");
 
-        let group_id = &create_result.group.mls_group_id;
+        let group_id = &create_result.group.mls_group_id.clone();
 
         // Merge the pending commit to apply the member additions
         creator_mdk
@@ -2761,7 +2762,7 @@ mod tests {
             )
             .expect("Failed to create group");
 
-        let group_id = &create_result.group.mls_group_id;
+        let group_id = &create_result.group.mls_group_id.clone();
 
         // Helper function to verify stored group epoch matches MLS group epoch
         let verify_epoch_sync = || {
@@ -3481,7 +3482,7 @@ mod tests {
             )
             .expect("Failed to create group");
 
-        let group_id = &create_result.group.mls_group_id;
+        let group_id = &create_result.group.mls_group_id.clone();
 
         // Merge the pending commit to apply the member additions
         creator_mdk
@@ -3523,7 +3524,7 @@ mod tests {
             )
             .expect("Failed to create group");
 
-        let group_id = &create_result.group.mls_group_id;
+        let group_id = &create_result.group.mls_group_id.clone();
 
         // Merge the pending commit to apply the member additions
         creator_mdk
@@ -3566,7 +3567,7 @@ mod tests {
             )
             .expect("Failed to create group");
 
-        let group_id = &create_result.group.mls_group_id;
+        let group_id = &create_result.group.mls_group_id.clone();
 
         // Merge the pending commit to apply the member additions
         creator_mdk
@@ -3638,7 +3639,7 @@ mod tests {
             )
             .expect("Failed to create group");
 
-        let group_id = &create_result.group.mls_group_id;
+        let group_id = &create_result.group.mls_group_id.clone();
 
         // Merge the pending commit to apply the member additions
         creator_mdk

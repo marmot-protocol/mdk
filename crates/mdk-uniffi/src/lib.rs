@@ -134,8 +134,10 @@ fn welcome_from_uniffi(w: Welcome) -> Result<welcome_types::Welcome, MdkUniffiEr
         .map_err(|_| MdkUniffiError::InvalidInput("Nostr group ID must be 32 bytes".to_string()))?;
 
     let group_image_hash = vec_to_array::<32>(w.group_image_hash)?;
-    let group_image_key = vec_to_array::<32>(w.group_image_key)?;
-    let group_image_nonce = vec_to_array::<12>(w.group_image_nonce)?;
+    let group_image_key =
+        vec_to_array::<32>(w.group_image_key)?.map(mdk_storage_traits::Secret::new);
+    let group_image_nonce =
+        vec_to_array::<12>(w.group_image_nonce)?.map(mdk_storage_traits::Secret::new);
 
     let group_admin_pubkeys: Result<BTreeSet<PublicKey>, _> = w
         .group_admin_pubkeys
@@ -970,12 +972,12 @@ impl From<group_types::Group> for Group {
         Self {
             mls_group_id: hex::encode(g.mls_group_id.as_slice()),
             nostr_group_id: hex::encode(g.nostr_group_id),
-            name: g.name,
-            description: g.description,
+            name: g.name.clone(),
+            description: g.description.clone(),
             image_hash: g.image_hash.map(Into::into),
-            image_key: g.image_key.map(Into::into),
-            image_nonce: g.image_nonce.map(Into::into),
-            admin_pubkeys: g.admin_pubkeys.into_iter().map(|pk| pk.to_hex()).collect(),
+            image_key: g.image_key.map(|k| k.as_ref().to_vec()),
+            image_nonce: g.image_nonce.map(|n| n.as_ref().to_vec()),
+            admin_pubkeys: g.admin_pubkeys.iter().map(|pk| pk.to_hex()).collect(),
             last_message_id: g.last_message_id.map(|id| id.to_hex()),
             last_message_at: g.last_message_at.map(|ts| ts.as_u64()),
             epoch: g.epoch,
@@ -1084,17 +1086,13 @@ impl From<welcome_types::Welcome> for Welcome {
             event_json,
             mls_group_id: hex::encode(w.mls_group_id.as_slice()),
             nostr_group_id: hex::encode(w.nostr_group_id),
-            group_name: w.group_name,
-            group_description: w.group_description,
+            group_name: w.group_name.clone(),
+            group_description: w.group_description.clone(),
             group_image_hash: w.group_image_hash.map(Into::into),
-            group_image_key: w.group_image_key.map(Into::into),
-            group_image_nonce: w.group_image_nonce.map(Into::into),
-            group_admin_pubkeys: w
-                .group_admin_pubkeys
-                .into_iter()
-                .map(|pk| pk.to_hex())
-                .collect(),
-            group_relays: w.group_relays.into_iter().map(|r| r.to_string()).collect(),
+            group_image_key: w.group_image_key.map(|k| k.as_ref().to_vec()),
+            group_image_nonce: w.group_image_nonce.map(|n| n.as_ref().to_vec()),
+            group_admin_pubkeys: w.group_admin_pubkeys.iter().map(|pk| pk.to_hex()).collect(),
+            group_relays: w.group_relays.iter().map(|r| r.to_string()).collect(),
             welcomer: w.welcomer.to_hex(),
             member_count: w.member_count,
             state: w.state.as_str().to_string(),
@@ -1147,19 +1145,19 @@ pub fn prepare_group_image_for_upload(
         .map_err(|e| MdkUniffiError::Mdk(e.to_string()))?;
 
     Ok(GroupImageUpload {
-        encrypted_data: prepared.encrypted_data,
+        encrypted_data: prepared.encrypted_data.as_ref().clone(),
         encrypted_hash: prepared.encrypted_hash.to_vec(),
-        image_key: prepared.image_key.to_vec(),
-        image_nonce: prepared.image_nonce.to_vec(),
+        image_key: prepared.image_key.as_ref().to_vec(),
+        image_nonce: prepared.image_nonce.as_ref().to_vec(),
         upload_secret_key: prepared.upload_keypair.secret_key().to_secret_hex(),
         original_size: prepared.original_size as u64,
         encrypted_size: prepared.encrypted_size as u64,
-        mime_type: prepared.mime_type,
+        mime_type: prepared.mime_type.clone(),
         dimensions: prepared.dimensions.map(|(w, h)| ImageDimensions {
             width: w,
             height: h,
         }),
-        blurhash: prepared.blurhash,
+        blurhash: prepared.blurhash.clone(),
     })
 }
 
@@ -1187,8 +1185,13 @@ pub fn decrypt_group_image(
         .try_into()
         .map_err(|_| MdkUniffiError::InvalidInput("Image nonce must be 12 bytes".to_string()))?;
 
-    core_decrypt_group_image(&encrypted_data, hash_arr_opt.as_ref(), &key_arr, &nonce_arr)
-        .map_err(|e| MdkUniffiError::Mdk(e.to_string()))
+    core_decrypt_group_image(
+        &encrypted_data,
+        hash_arr_opt.as_ref(),
+        &mdk_storage_traits::Secret::new(key_arr),
+        &mdk_storage_traits::Secret::new(nonce_arr),
+    )
+    .map_err(|e| MdkUniffiError::Mdk(e.to_string()))
 }
 
 /// Derive upload keypair for group image
@@ -1198,7 +1201,7 @@ pub fn derive_upload_keypair(image_key: Vec<u8>, version: u16) -> Result<String,
         .try_into()
         .map_err(|_| MdkUniffiError::InvalidInput("Image key must be 32 bytes".to_string()))?;
 
-    let keys = core_derive_upload_keypair(&key_arr, version)
+    let keys = core_derive_upload_keypair(&mdk_storage_traits::Secret::new(key_arr), version)
         .map_err(|e| MdkUniffiError::Mdk(e.to_string()))?;
 
     Ok(keys.secret_key().to_secret_hex())

@@ -22,6 +22,7 @@ openmls.workspace = true
 openmls_traits.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true, features = ["std"] }
+zeroize = { workspace = true, features = ["zeroize_derive"] }
 
 [dev-dependencies]
 mdk-sqlite-storage.workspace = true
