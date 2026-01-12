@@ -8,7 +8,7 @@ use nostr::{Tag as NostrTag, TagKind};
 use sha2::{Digest, Sha256};
 
 use crate::encrypted_media::crypto::{
-    decrypt_data_with_aad, derive_encryption_key, derive_encryption_nonce, encrypt_data_with_aad,
+    decrypt_data_with_aad, derive_encryption_key, encrypt_data_with_aad, generate_encryption_nonce,
 };
 use crate::encrypted_media::metadata::extract_and_process_metadata;
 use crate::encrypted_media::types::{
@@ -90,13 +90,7 @@ where
             &metadata.mime_type,
             filename,
         )?;
-        let nonce = derive_encryption_nonce(
-            self.mdk,
-            &self.group_id,
-            &original_hash,
-            &metadata.mime_type,
-            filename,
-        )?;
+        let nonce = generate_encryption_nonce();
 
         // Encrypt the PROCESSED data (which may have EXIF stripped)
         let encrypted_data = encrypt_data_with_aad(
@@ -120,6 +114,7 @@ where
             encrypted_size,
             dimensions: metadata.dimensions,
             blurhash: metadata.blurhash,
+            nonce,
         })
     }
 
@@ -138,17 +133,10 @@ where
             &reference.mime_type,
             &reference.filename,
         )?;
-        let nonce = derive_encryption_nonce(
-            self.mdk,
-            &self.group_id,
-            &reference.original_hash,
-            &reference.mime_type,
-            &reference.filename,
-        )?;
         let decrypted_data = decrypt_data_with_aad(
             encrypted_data,
             &encryption_key,
-            &nonce,
+            &reference.nonce,
             &reference.original_hash,
             &reference.mime_type,
             &reference.filename,
@@ -165,7 +153,7 @@ where
     /// Create an imeta tag for encrypted media (after upload)
     ///
     /// Creates IMETA tag according to Marmot protocol 04.md specification:
-    /// imeta url \<storage_url\> m \<mime_type\> filename \<original_filename\> [dim \<dimensions\>] [blurhash \<blurhash\>] x \<file_hash_hex\> v \<version\>
+    /// imeta url \<storage_url\> m \<mime_type\> filename \<original_filename\> [dim \<dimensions\>] [blurhash \<blurhash\>] x \<file_hash_hex\> n \<nonce_hex\> v \<version\>
     pub fn create_imeta_tag(&self, upload: &EncryptedMediaUpload, uploaded_url: &str) -> NostrTag {
         let mut tag_values = vec![
             format!("url {}", uploaded_url),
@@ -184,8 +172,11 @@ where
         // x field contains SHA256 hash of original file content (hex-encoded)
         tag_values.push(format!("x {}", hex::encode(upload.original_hash)));
 
-        // v field contains encryption version number (currently "mip04-v1")
-        tag_values.push("v mip04-v1".to_string());
+        // n field contains the encryption nonce (hex-encoded, 24 hex chars for 12 bytes)
+        tag_values.push(format!("n {}", hex::encode(upload.nonce)));
+
+        // v field contains encryption version number (currently "mip04-v2")
+        tag_values.push("v mip04-v2".to_string());
 
         NostrTag::custom(TagKind::Custom("imeta".into()), tag_values)
     }
@@ -202,12 +193,13 @@ where
             mime_type: upload.mime_type.clone(),
             filename: upload.filename.clone(),
             dimensions: upload.dimensions,
+            nonce: upload.nonce,
         }
     }
 
     /// Parse an IMETA tag to create a MediaReference for decryption
     ///
-    /// Expected IMETA format: url \<storage_url\> m \<mime_type\> filename \<filename\> x \<file_hash_hex\> v \<version\> [dim \<dimensions\>] [blurhash \<blurhash\>]
+    /// Expected IMETA format: url \<storage_url\> m \<mime_type\> filename \<filename\> x \<file_hash_hex\> n \<nonce_hex\> v \<version\> [dim \<dimensions\>] [blurhash \<blurhash\>]
     pub fn parse_imeta_tag(
         &self,
         imeta_tag: &NostrTag,
@@ -220,10 +212,10 @@ where
         }
 
         let tag_values = imeta_tag.clone().to_vec();
-        // Minimum required fields: url, m (MIME type), filename, x (hash), v (version) = 5 fields
-        if tag_values.len() < 5 {
+        // Minimum required fields: url, m (MIME type), filename, x (hash), n (nonce), v (version) = 6 fields + "imeta" tag = 7
+        if tag_values.len() < 7 {
             return Err(EncryptedMediaError::InvalidImetaTag {
-                reason: "IMETA tag has insufficient fields (minimum: url, m, filename, x, v)"
+                reason: "IMETA tag has insufficient fields (minimum: url, m, filename, x, n, v)"
                     .to_string(),
             });
         }
@@ -232,6 +224,7 @@ where
         let mut mime_type: Option<String> = None;
         let mut filename: Option<String> = None;
         let mut original_hash: Option<[u8; 32]> = None;
+        let mut nonce: Option<[u8; 12]> = None;
         let mut dimensions: Option<(u32, u32)> = None;
         let mut version: Option<String> = None;
 
@@ -267,6 +260,21 @@ where
                         _ => {
                             return Err(EncryptedMediaError::InvalidImetaTag {
                                 reason: "Invalid 'x' (file_hash) field".to_string(),
+                            });
+                        }
+                    }
+                }
+                "n" => {
+                    // Decode hex-encoded encryption nonce (12 bytes = 24 hex chars)
+                    match hex::decode(parts[1]) {
+                        Ok(bytes) if bytes.len() == 12 => {
+                            let mut nonce_bytes = [0u8; 12];
+                            nonce_bytes.copy_from_slice(&bytes);
+                            nonce = Some(nonce_bytes);
+                        }
+                        _ => {
+                            return Err(EncryptedMediaError::InvalidImetaTag {
+                                reason: "Invalid 'n' (nonce) field - must be 24 hex characters (12 bytes)".to_string(),
                             });
                         }
                     }
@@ -313,15 +321,19 @@ where
             reason: "Missing required 'filename' field".to_string(),
         })?;
 
-        // Validate version (required field, currently only support mip04-v1)
+        // Validate version (required field, currently only support mip04-v2)
         let version = version.ok_or(EncryptedMediaError::InvalidImetaTag {
             reason: "Missing required 'v' (version) field".to_string(),
         })?;
-        if version != "mip04-v1" {
+        if version != "mip04-v2" {
             return Err(EncryptedMediaError::DecryptionFailed {
                 reason: format!("Unsupported MIP-04 encryption version: {}", version),
             });
         }
+
+        let nonce = nonce.ok_or(EncryptedMediaError::InvalidImetaTag {
+            reason: "Missing required 'n' (nonce) field".to_string(),
+        })?;
 
         Ok(MediaReference {
             url,
@@ -329,6 +341,7 @@ where
             mime_type,
             filename,
             dimensions,
+            nonce,
         })
     }
 }
@@ -368,6 +381,7 @@ mod tests {
             encrypted_size: 1004,
             dimensions: Some((1920, 1080)),
             blurhash: Some("LKO2?U%2Tw=w]~RBVZRi};RPxuwH".to_string()),
+            nonce: [0xAA; 12],
         };
 
         let tag = manager.create_imeta_tag(&upload, "https://example.com/file.jpg");
@@ -395,7 +409,12 @@ mod tests {
                 .iter()
                 .any(|v| v.starts_with(&format!("x {}", hex::encode([0x42; 32]))))
         );
-        assert!(values.iter().any(|v| v.starts_with("v mip04-v1")));
+        assert!(
+            values
+                .iter()
+                .any(|v| v.starts_with(&format!("n {}", hex::encode([0xAA; 12]))))
+        );
+        assert!(values.iter().any(|v| v.starts_with("v mip04-v2")));
     }
 
     #[test]
@@ -405,6 +424,7 @@ mod tests {
         let manager = mdk.media_manager(group_id);
 
         // Create a valid IMETA tag
+        let test_nonce = [0xBB; 12];
         let tag_values = vec![
             "url https://example.com/encrypted.jpg".to_string(),
             "m image/jpeg".to_string(),
@@ -412,7 +432,8 @@ mod tests {
             "dim 1920x1080".to_string(),
             "blurhash LKO2?U%2Tw=w]~RBVZRi};RPxuwH".to_string(),
             format!("x {}", hex::encode([0x42; 32])),
-            "v mip04-v1".to_string(),
+            format!("n {}", hex::encode(test_nonce)),
+            "v mip04-v2".to_string(),
         ];
 
         let imeta_tag = NostrTag::custom(TagKind::Custom("imeta".into()), tag_values);
@@ -426,6 +447,7 @@ mod tests {
         assert_eq!(media_ref.original_hash, [0x42; 32]);
         assert_eq!(media_ref.filename, "photo.jpg");
         assert_eq!(media_ref.dimensions, Some((1920, 1080)));
+        assert_eq!(media_ref.nonce, test_nonce);
     }
 
     #[test]
@@ -470,6 +492,7 @@ mod tests {
         let group_id = GroupId::from_slice(&[1, 2, 3, 4]);
         let manager = mdk.media_manager(group_id);
 
+        let test_nonce = [0xCC; 12];
         let upload = EncryptedMediaUpload {
             encrypted_data: vec![1, 2, 3, 4],
             original_hash: [0x42; 32],
@@ -480,6 +503,7 @@ mod tests {
             encrypted_size: 2004,
             dimensions: Some((800, 600)),
             blurhash: None,
+            nonce: test_nonce,
         };
 
         let media_ref = manager
@@ -490,6 +514,7 @@ mod tests {
         assert_eq!(media_ref.mime_type, "image/png");
         assert_eq!(media_ref.filename, "test.png");
         assert_eq!(media_ref.dimensions, Some((800, 600)));
+        assert_eq!(media_ref.nonce, test_nonce);
     }
 
     #[test]
@@ -610,6 +635,44 @@ mod tests {
     }
 
     #[test]
+    fn test_generate_encryption_nonce_uniqueness() {
+        // Generate multiple nonces and verify they are unique
+        let nonces: Vec<[u8; 12]> = (0..100).map(|_| generate_encryption_nonce()).collect();
+
+        for i in 0..nonces.len() {
+            for j in (i + 1)..nonces.len() {
+                assert_ne!(nonces[i], nonces[j], "Nonces should be unique");
+            }
+        }
+
+        // Verify nonces are not all zeros
+        for nonce in &nonces {
+            assert_ne!(nonce, &[0u8; 12], "Nonce should not be all zeros");
+        }
+    }
+
+    #[test]
+    fn missing_nonce_results_in_invalid_imeta() {
+        let mdk = create_test_mdk();
+        let group_id = GroupId::from_slice(&[1, 2, 3, 4]);
+        let manager = mdk.media_manager(group_id);
+        let tag_values = vec![
+            "url https://example.com/test.jpg".to_string(),
+            "m image/jpeg".to_string(),
+            "filename photo.jpg".to_string(),
+            format!("x {}", hex::encode([0x42; 32])),
+            "v mip04-v2".to_string(),
+            // Missing 'n' (nonce) field
+        ];
+        let tag = NostrTag::custom(TagKind::Custom("imeta".into()), tag_values);
+        let result = manager.parse_imeta_tag(&tag);
+        assert!(matches!(
+            result,
+            Err(EncryptedMediaError::InvalidImetaTag { .. })
+        ));
+    }
+
+    #[test]
     fn test_parse_imeta_tag_version_validation() {
         let mdk = create_test_mdk();
         let group_id = GroupId::from_slice(&[1, 2, 3, 4]);
@@ -621,7 +684,8 @@ mod tests {
             "m image/jpeg".to_string(),
             "filename photo.jpg".to_string(),
             format!("x {}", hex::encode([0x42; 32])),
-            "v mip04-v2".to_string(), // Unsupported version
+            format!("n {}", hex::encode([0xDD; 12])),
+            "v mip04-v3".to_string(), // Unsupported version
         ];
         let tag = NostrTag::custom(TagKind::Custom("imeta".into()), tag_values);
         let result = manager.parse_imeta_tag(&tag);
@@ -630,17 +694,53 @@ mod tests {
             Err(EncryptedMediaError::DecryptionFailed { .. })
         ));
 
-        // Test supported version
+        // Test that mip04-v1 is explicitly rejected (breaking change)
+        let test_nonce = [0xAB; 12];
         let tag_values = vec![
             "url https://example.com/test.jpg".to_string(),
             "m image/jpeg".to_string(),
             "filename photo.jpg".to_string(),
             format!("x {}", hex::encode([0x42; 32])),
-            "v mip04-v1".to_string(),
+            format!("n {}", hex::encode(test_nonce)),
+            "v mip04-v1".to_string(), // Legacy version
+        ];
+        let tag = NostrTag::custom(TagKind::Custom("imeta".into()), tag_values);
+        let result = manager.parse_imeta_tag(&tag);
+        assert!(
+            matches!(result, Err(EncryptedMediaError::DecryptionFailed { .. })),
+            "mip04-v1 should be rejected to prevent nonce reuse vulnerability"
+        );
+
+        // Test supported version
+        let test_nonce = [0xDD; 12];
+        let tag_values = vec![
+            "url https://example.com/test.jpg".to_string(),
+            "m image/jpeg".to_string(),
+            "filename photo.jpg".to_string(),
+            format!("x {}", hex::encode([0x42; 32])),
+            format!("n {}", hex::encode(test_nonce)),
+            "v mip04-v2".to_string(),
         ];
         let tag = NostrTag::custom(TagKind::Custom("imeta".into()), tag_values);
         let result = manager.parse_imeta_tag(&tag);
         assert!(result.is_ok());
+
+        // Test that mip04-v1 is explicitly rejected (breaking change)
+        let test_nonce = [0xAB; 12];
+        let tag_values = vec![
+            "url https://example.com/test.jpg".to_string(),
+            "m image/jpeg".to_string(),
+            "filename photo.jpg".to_string(),
+            format!("x {}", hex::encode([0x42; 32])),
+            format!("n {}", hex::encode(test_nonce)),
+            "v mip04-v1".to_string(), // Legacy version
+        ];
+        let tag = NostrTag::custom(TagKind::Custom("imeta".into()), tag_values);
+        let result = manager.parse_imeta_tag(&tag);
+        assert!(
+            matches!(result, Err(EncryptedMediaError::DecryptionFailed { .. })),
+            "mip04-v1 should be rejected to prevent nonce reuse vulnerability"
+        );
     }
 
     #[test]
@@ -650,12 +750,14 @@ mod tests {
         let manager = mdk.media_manager(group_id);
 
         // Test with minimal required fields only
+        let test_nonce1 = [0xEE; 12];
         let tag_values = vec![
             "url https://example.com/test.jpg".to_string(),
             "m image/jpeg".to_string(),
             "filename photo.jpg".to_string(),
             format!("x {}", hex::encode([0x42; 32])),
-            "v mip04-v1".to_string(),
+            format!("n {}", hex::encode(test_nonce1)),
+            "v mip04-v2".to_string(),
         ];
         let tag = NostrTag::custom(TagKind::Custom("imeta".into()), tag_values);
         let result = manager.parse_imeta_tag(&tag);
@@ -665,12 +767,14 @@ mod tests {
         assert_eq!(media_ref.dimensions, None); // Optional field should be None
 
         // Test with dimensions
+        let test_nonce2 = [0xFF; 12];
         let tag_values = vec![
             "url https://example.com/test.jpg".to_string(),
             "m image/jpeg".to_string(),
             "filename photo.jpg".to_string(),
             format!("x {}", hex::encode([0x42; 32])),
-            "v mip04-v1".to_string(),
+            format!("n {}", hex::encode(test_nonce2)),
+            "v mip04-v2".to_string(),
             "dim 1920x1080".to_string(),
         ];
         let tag = NostrTag::custom(TagKind::Custom("imeta".into()), tag_values);
@@ -688,12 +792,14 @@ mod tests {
         let manager = mdk.media_manager(group_id);
 
         // Test with mixed-case MIME type
+        let test_nonce1 = [0x11; 12];
         let tag_values = vec![
             "url https://example.com/test.jpg".to_string(),
             "m IMAGE/JPEG".to_string(), // Mixed case
             "filename photo.jpg".to_string(),
             format!("x {}", hex::encode([0x42; 32])),
-            "v mip04-v1".to_string(),
+            format!("n {}", hex::encode(test_nonce1)),
+            "v mip04-v2".to_string(),
         ];
         let tag = NostrTag::custom(TagKind::Custom("imeta".into()), tag_values);
         let result = manager.parse_imeta_tag(&tag);
@@ -703,12 +809,14 @@ mod tests {
         assert_eq!(media_ref.mime_type, "image/jpeg"); // Should be lowercase
 
         // Test with whitespace around MIME type
+        let test_nonce2 = [0x22; 12];
         let tag_values = vec![
             "url https://example.com/test.png".to_string(),
             "m  Image/PNG  ".to_string(), // Whitespace and mixed case
             "filename photo.png".to_string(),
             format!("x {}", hex::encode([0x43; 32])),
-            "v mip04-v1".to_string(),
+            format!("n {}", hex::encode(test_nonce2)),
+            "v mip04-v2".to_string(),
         ];
         let tag = NostrTag::custom(TagKind::Custom("imeta".into()), tag_values);
         let result = manager.parse_imeta_tag(&tag);
@@ -718,20 +826,22 @@ mod tests {
         assert_eq!(media_ref.mime_type, "image/png"); // Should be trimmed and lowercase
 
         // Test with various supported MIME types and case combinations
-        let test_cases = vec![
+        let test_cases = [
             ("video/MP4", "video/mp4"),
             ("Audio/MPEG", "audio/mpeg"),
             ("IMAGE/webp", "image/webp"),
             ("AUDIO/wav", "audio/wav"),
         ];
 
-        for (input_mime, expected_mime) in test_cases {
+        for (idx, (input_mime, expected_mime)) in test_cases.iter().enumerate() {
+            let test_nonce = [0x33 + idx as u8; 12];
             let tag_values = vec![
                 "url https://example.com/test.file".to_string(),
                 format!("m {}", input_mime),
                 "filename test.file".to_string(),
                 format!("x {}", hex::encode([0x44; 32])),
-                "v mip04-v1".to_string(),
+                format!("n {}", hex::encode(test_nonce)),
+                "v mip04-v2".to_string(),
             ];
             let tag = NostrTag::custom(TagKind::Custom("imeta".into()), tag_values);
             let result = manager.parse_imeta_tag(&tag);
@@ -739,7 +849,7 @@ mod tests {
 
             let media_ref = result.unwrap();
             assert_eq!(
-                media_ref.mime_type, expected_mime,
+                media_ref.mime_type, *expected_mime,
                 "MIME type canonicalization failed for input: {}",
                 input_mime
             );
@@ -753,12 +863,14 @@ mod tests {
         let manager = mdk.media_manager(group_id);
 
         // Simulate an IMETA tag created by a producer that uses mixed-case MIME type
+        let test_nonce = [0x55; 12];
         let tag_values = vec![
             "url https://example.com/encrypted.jpg".to_string(),
             "m IMAGE/JPEG".to_string(), // Mixed case from producer
             "filename photo.jpg".to_string(),
             format!("x {}", hex::encode([0x42; 32])),
-            "v mip04-v1".to_string(),
+            format!("n {}", hex::encode(test_nonce)),
+            "v mip04-v2".to_string(),
         ];
         let imeta_tag = NostrTag::custom(TagKind::Custom("imeta".into()), tag_values);
 
@@ -786,12 +898,14 @@ mod tests {
         let manager = mdk.media_manager(group_id);
 
         // Test parsing IMETA tag with any MIME type (all should be accepted)
+        let test_nonce1 = [0x66; 12];
         let tag_values = vec![
             "url https://example.com/test.pdf".to_string(),
             "m application/pdf".to_string(),
             "filename document.pdf".to_string(),
             format!("x {}", hex::encode([0x46; 32])),
-            "v mip04-v1".to_string(),
+            format!("n {}", hex::encode(test_nonce1)),
+            "v mip04-v2".to_string(),
         ];
         let imeta_tag = NostrTag::custom(TagKind::Custom("imeta".into()), tag_values);
 
@@ -801,12 +915,14 @@ mod tests {
         assert_eq!(media_ref.mime_type, "application/pdf");
 
         // Test parsing IMETA tag with invalid MIME type format (no slash)
+        let test_nonce2 = [0x77; 12];
         let tag_values = vec![
             "url https://example.com/test.file".to_string(),
             "m invalid".to_string(), // Invalid format
             "filename test.file".to_string(),
             format!("x {}", hex::encode([0x47; 32])),
-            "v mip04-v1".to_string(),
+            format!("n {}", hex::encode(test_nonce2)),
+            "v mip04-v2".to_string(),
         ];
         let imeta_tag = NostrTag::custom(TagKind::Custom("imeta".into()), tag_values);
 
@@ -1175,5 +1291,40 @@ mod tests {
             let decrypted = decrypt_result.unwrap();
             assert_eq!(decrypted, data, "Decrypted {} data should match", mime_type);
         }
+    }
+
+    #[test]
+    fn test_encryption_nonce_uniqueness() {
+        use nostr::Keys;
+        use std::collections::HashSet;
+
+        let alice_keys = Keys::generate();
+        let bob_keys = Keys::generate();
+        let alice_mdk = create_test_mdk();
+        let bob_mdk = create_test_mdk();
+
+        let admin_pubkeys = vec![alice_keys.public_key()];
+        let config = crate::test_util::create_nostr_group_config_data(admin_pubkeys);
+        let bob_key_package = crate::test_util::create_key_package_event(&bob_mdk, &bob_keys);
+        let create_result = alice_mdk
+            .create_group(&alice_keys.public_key(), vec![bob_key_package], config)
+            .expect("Alice should create group");
+        let group_id = create_result.group.mls_group_id.clone();
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("Merge commit");
+
+        let manager = alice_mdk.media_manager(group_id.clone());
+        let test_data = b"Test data";
+
+        // Encrypt same data multiple times
+        let mut nonces = HashSet::new();
+        for _ in 0..100 {
+            let upload = manager
+                .encrypt_for_upload(test_data, "text/plain", "test.txt")
+                .expect("Should encrypt");
+            assert!(nonces.insert(upload.nonce), "Nonce should be unique");
+        }
+        assert_eq!(nonces.len(), 100, "All 100 nonces should be unique");
     }
 }

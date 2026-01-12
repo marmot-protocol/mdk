@@ -604,12 +604,11 @@ where
 
         // Convert pubkeys to leaf indices
         let mut leaf_indices = Vec::new();
-        let members = mls_group.members();
 
-        for (index, member) in members.enumerate() {
+        for member in mls_group.members() {
             let pubkey = self.pubkey_for_member(&member)?;
             if pubkeys.contains(&pubkey) {
-                leaf_indices.push(LeafNodeIndex::new(index as u32));
+                leaf_indices.push(member.index);
             }
         }
 
@@ -1343,12 +1342,9 @@ where
         let mut welcome_rumors_vec = Vec::new();
 
         for event in key_package_events {
-            // Determine encoding format based on configuration
-            let encoding = if self.config.use_base64_encoding {
-                ContentEncoding::Base64
-            } else {
-                ContentEncoding::Hex
-            };
+            // SECURITY: Always use base64 encoding with explicit encoding tag per MIP-00/MIP-02.
+            // This prevents downgrade attacks and parsing ambiguity across clients.
+            let encoding = ContentEncoding::Base64;
 
             let encoded_welcome = encode_content(&serialized_welcome, encoding);
 
@@ -4006,6 +4002,109 @@ mod tests {
         assert!(
             after_remove_members.contains(&bob_keys.public_key()),
             "Bob should still be in group"
+        );
+    }
+
+    /// Test that remove_members correctly handles ratchet tree holes
+    ///
+    /// This is a regression test for a bug where enumerate() was used to derive
+    /// LeafNodeIndex instead of using member.index. When the ratchet tree has holes
+    /// (from prior removals), the enumeration index diverges from the actual leaf index.
+    ///
+    /// Scenario: Alice creates group with Bob, Charlie, Dave. Remove Charlie (creates hole).
+    /// Then remove Dave - must remove Dave (leaf 3), not the wrong member.
+    #[test]
+    fn test_remove_members_with_tree_holes() {
+        use crate::test_util::create_key_package_event;
+
+        let alice_keys = Keys::generate();
+        let bob_keys = Keys::generate();
+        let charlie_keys = Keys::generate();
+        let dave_keys = Keys::generate();
+
+        let alice_mdk = create_test_mdk();
+        let bob_mdk = create_test_mdk();
+        let charlie_mdk = create_test_mdk();
+        let dave_mdk = create_test_mdk();
+
+        let admin_pubkeys = vec![alice_keys.public_key()];
+        let config = create_nostr_group_config_data(admin_pubkeys);
+
+        // Create key packages for all members
+        let bob_key_package = create_key_package_event(&bob_mdk, &bob_keys);
+        let charlie_key_package = create_key_package_event(&charlie_mdk, &charlie_keys);
+        let dave_key_package = create_key_package_event(&dave_mdk, &dave_keys);
+
+        // Alice creates group with Bob, Charlie, Dave
+        let create_result = alice_mdk
+            .create_group(
+                &alice_keys.public_key(),
+                vec![bob_key_package, charlie_key_package, dave_key_package],
+                config,
+            )
+            .expect("Alice should create group");
+
+        let group_id = create_result.group.mls_group_id.clone();
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("Alice should merge commit");
+
+        // Verify initial state: Alice, Bob, Charlie, Dave
+        let initial_members = alice_mdk
+            .get_members(&group_id)
+            .expect("Should get members");
+        assert_eq!(initial_members.len(), 4, "Should have 4 members initially");
+
+        // Step 1: Remove Charlie (creates a hole in the ratchet tree)
+        alice_mdk
+            .remove_members(&group_id, &[charlie_keys.public_key()])
+            .expect("Should remove Charlie");
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("Should merge commit");
+
+        let after_charlie_removal = alice_mdk
+            .get_members(&group_id)
+            .expect("Should get members");
+        assert_eq!(
+            after_charlie_removal.len(),
+            3,
+            "Should have 3 members after removing Charlie"
+        );
+        assert!(
+            !after_charlie_removal.contains(&charlie_keys.public_key()),
+            "Charlie should be removed"
+        );
+
+        // Step 2: Remove Dave (the bug would cause wrong member removal here)
+        // With the bug: enumerate() would give Dave index 2, but his actual leaf index is 3
+        alice_mdk
+            .remove_members(&group_id, &[dave_keys.public_key()])
+            .expect("Should remove Dave");
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("Should merge commit");
+
+        // Verify final state: only Alice and Bob remain
+        let final_members = alice_mdk
+            .get_members(&group_id)
+            .expect("Should get members");
+        assert_eq!(
+            final_members.len(),
+            2,
+            "Should have 2 members after removals"
+        );
+        assert!(
+            final_members.contains(&alice_keys.public_key()),
+            "Alice should still be in group"
+        );
+        assert!(
+            final_members.contains(&bob_keys.public_key()),
+            "Bob should still be in group"
+        );
+        assert!(
+            !final_members.contains(&dave_keys.public_key()),
+            "Dave should be removed"
         );
     }
 

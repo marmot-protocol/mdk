@@ -23,9 +23,9 @@ use mdk_core::{
 use mdk_sqlite_storage::MdkSqliteStorage;
 use mdk_storage_traits::{
     GroupId,
-    groups::types as group_types,
+    groups::{Pagination as MessagePagination, types as group_types},
     messages::types as message_types,
-    welcomes::{Pagination, types as welcome_types},
+    welcomes::{Pagination as WelcomePagination, types as welcome_types},
 };
 use nostr::{Event, EventBuilder, EventId, Kind, PublicKey, RelayUrl, Tag, TagKind, UnsignedEvent};
 
@@ -250,12 +250,34 @@ impl Mdk {
             .collect())
     }
 
-    /// Get messages for a group
-    pub fn get_messages(&self, mls_group_id: String) -> Result<Vec<Message>, MdkUniffiError> {
+    /// Get messages for a group with optional pagination
+    ///
+    /// # Arguments
+    ///
+    /// * `mls_group_id` - Hex-encoded MLS group ID
+    /// * `limit` - Optional maximum number of messages to return (defaults to 1000 if None)
+    /// * `offset` - Optional number of messages to skip (defaults to 0 if None)
+    ///
+    /// # Returns
+    ///
+    /// Returns a vector of messages ordered by creation time
+    pub fn get_messages(
+        &self,
+        mls_group_id: String,
+        limit: Option<u32>,
+        offset: Option<u32>,
+    ) -> Result<Vec<Message>, MdkUniffiError> {
         let group_id = parse_group_id(&mls_group_id)?;
+        let pagination = match (limit, offset) {
+            (None, None) => None,
+            _ => Some(MessagePagination::new(
+                limit.map(|l| l as usize),
+                offset.map(|o| o as usize),
+            )),
+        };
         Ok(self
             .lock()?
-            .get_messages(&group_id)?
+            .get_messages(&group_id, pagination)?
             .into_iter()
             .map(Message::from)
             .collect())
@@ -267,35 +289,31 @@ impl Mdk {
         Ok(self.lock()?.get_message(&event_id)?.map(Message::from))
     }
 
-    /// Get pending welcomes
-    pub fn get_pending_welcomes(&self) -> Result<Vec<Welcome>, MdkUniffiError> {
-        Ok(self
-            .lock()?
-            .get_pending_welcomes(None)?
-            .into_iter()
-            .map(Welcome::from)
-            .collect())
-    }
-
-    /// Get pending welcomes with pagination
+    /// Get pending welcomes with optional pagination
     ///
     /// # Arguments
     ///
-    /// * `limit` - Optional maximum number of welcomes to return (defaults to 1000)
-    /// * `offset` - Optional number of welcomes to skip (defaults to 0)
+    /// * `limit` - Optional maximum number of welcomes to return (defaults to 1000 if None)
+    /// * `offset` - Optional number of welcomes to skip (defaults to 0 if None)
     ///
     /// # Returns
     ///
     /// Returns a vector of pending welcomes ordered by ID (descending)
-    pub fn get_pending_welcomes_paginated(
+    pub fn get_pending_welcomes(
         &self,
         limit: Option<u32>,
         offset: Option<u32>,
     ) -> Result<Vec<Welcome>, MdkUniffiError> {
-        let pagination = Pagination::new(limit.map(|l| l as usize), offset.map(|o| o as usize));
+        let pagination = match (limit, offset) {
+            (None, None) => None,
+            _ => Some(WelcomePagination::new(
+                limit.map(|l| l as usize),
+                offset.map(|o| o as usize),
+            )),
+        };
         Ok(self
             .lock()?
-            .get_pending_welcomes(Some(pagination))?
+            .get_pending_welcomes(pagination)?
             .into_iter()
             .map(Welcome::from)
             .collect())
@@ -1093,7 +1111,7 @@ pub fn derive_upload_keypair(image_key: Vec<u8>, version: u16) -> Result<String,
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nostr::{EventBuilder, Keys, Kind, Tag, UnsignedEvent};
+    use nostr::{EventBuilder, JsonUtil, Keys, Kind, Tag, UnsignedEvent};
     use tempfile::TempDir;
 
     fn create_test_mdk() -> Mdk {
@@ -1184,9 +1202,96 @@ mod tests {
     fn test_get_messages_empty_group() {
         let mdk = create_test_mdk();
         let fake_group_id = hex::encode([0u8; 32]);
-        let result = mdk.get_messages(fake_group_id);
+        let result = mdk.get_messages(fake_group_id, None, None);
         // Should return error for non-existent group
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_get_messages_with_pagination() {
+        let mdk = create_test_mdk();
+        let creator_keys = Keys::generate();
+        let member_keys = Keys::generate();
+
+        let member_pubkey_hex = member_keys.public_key().to_hex();
+        let relays = vec!["wss://relay.example.com".to_string()];
+
+        // Create key package for member
+        let kp_result = mdk
+            .create_key_package_for_event(member_pubkey_hex.clone(), relays.clone())
+            .unwrap();
+
+        let kp_event = EventBuilder::new(Kind::Custom(443), kp_result.key_package)
+            .tags(
+                kp_result
+                    .tags
+                    .into_iter()
+                    .map(|t| Tag::parse(&t).unwrap())
+                    .collect::<Vec<_>>(),
+            )
+            .sign_with_keys(&member_keys)
+            .unwrap();
+
+        // Create group
+        let create_result = mdk
+            .create_group(
+                creator_keys.public_key().to_hex(),
+                vec![kp_event.as_json()],
+                "Test Group".to_string(),
+                "Test Description".to_string(),
+                relays.clone(),
+                vec![creator_keys.public_key().to_hex()],
+            )
+            .unwrap();
+
+        mdk.merge_pending_commit(create_result.group.mls_group_id.clone())
+            .unwrap();
+
+        // Create a message
+        mdk.create_message(
+            create_result.group.mls_group_id.clone(),
+            creator_keys.public_key().to_hex(),
+            "Test message".to_string(),
+            1,
+            None,
+        )
+        .unwrap();
+
+        // Test 1: Get with default pagination (None, None)
+        let default_messages = mdk
+            .get_messages(create_result.group.mls_group_id.clone(), None, None)
+            .unwrap();
+        assert_eq!(default_messages.len(), 1, "Should have 1 message");
+
+        // Test 2: Get with explicit limit and offset
+        let paginated = mdk
+            .get_messages(create_result.group.mls_group_id.clone(), Some(10), Some(0))
+            .unwrap();
+        assert_eq!(paginated.len(), 1, "Should have 1 message with pagination");
+
+        // Test 3: Get with offset beyond available messages
+        let empty_page = mdk
+            .get_messages(
+                create_result.group.mls_group_id.clone(),
+                Some(10),
+                Some(100),
+            )
+            .unwrap();
+        assert_eq!(
+            empty_page.len(),
+            0,
+            "Should return empty when offset is beyond available"
+        );
+
+        // Test 4: Get with limit 1
+        let limited = mdk
+            .get_messages(create_result.group.mls_group_id.clone(), Some(1), Some(0))
+            .unwrap();
+        assert_eq!(
+            limited.len(),
+            1,
+            "Should return exactly 1 message with limit 1"
+        );
     }
 
     #[test]
@@ -1200,8 +1305,79 @@ mod tests {
     #[test]
     fn test_get_pending_welcomes_empty() {
         let mdk = create_test_mdk();
-        let welcomes = mdk.get_pending_welcomes().unwrap();
+        let welcomes = mdk.get_pending_welcomes(None, None).unwrap();
         assert_eq!(welcomes.len(), 0);
+    }
+
+    #[test]
+    fn test_get_pending_welcomes_with_pagination() {
+        let mdk = create_test_mdk();
+        let creator_keys = Keys::generate();
+        let member_keys = Keys::generate();
+
+        let member_pubkey_hex = member_keys.public_key().to_hex();
+        let relays = vec!["wss://relay.example.com".to_string()];
+
+        // Create key package for member
+        let kp_result = mdk
+            .create_key_package_for_event(member_pubkey_hex.clone(), relays.clone())
+            .unwrap();
+
+        let kp_event = EventBuilder::new(Kind::Custom(443), kp_result.key_package)
+            .tags(
+                kp_result
+                    .tags
+                    .into_iter()
+                    .map(|t| Tag::parse(&t).unwrap())
+                    .collect::<Vec<_>>(),
+            )
+            .sign_with_keys(&member_keys)
+            .unwrap();
+
+        // Create group
+        let create_result = mdk
+            .create_group(
+                creator_keys.public_key().to_hex(),
+                vec![kp_event.as_json()],
+                "Test Group".to_string(),
+                "Test Description".to_string(),
+                relays.clone(),
+                vec![creator_keys.public_key().to_hex()],
+            )
+            .unwrap();
+
+        mdk.merge_pending_commit(create_result.group.mls_group_id.clone())
+            .unwrap();
+
+        // Process welcome for member
+        let welcome_rumor_json = &create_result.welcome_rumors_json[0];
+        let wrapper_event_id = EventId::all_zeros().to_hex();
+        mdk.process_welcome(wrapper_event_id, welcome_rumor_json.clone())
+            .unwrap();
+
+        // Test 1: Get with default pagination (None, None)
+        let default_welcomes = mdk.get_pending_welcomes(None, None).unwrap();
+        assert_eq!(default_welcomes.len(), 1, "Should have 1 pending welcome");
+
+        // Test 2: Get with explicit limit and offset
+        let paginated = mdk.get_pending_welcomes(Some(10), Some(0)).unwrap();
+        assert_eq!(paginated.len(), 1, "Should have 1 welcome with pagination");
+
+        // Test 3: Get with offset beyond available welcomes
+        let empty_page = mdk.get_pending_welcomes(Some(10), Some(100)).unwrap();
+        assert_eq!(
+            empty_page.len(),
+            0,
+            "Should return empty when offset is beyond available"
+        );
+
+        // Test 4: Get with limit 1
+        let limited = mdk.get_pending_welcomes(Some(1), Some(0)).unwrap();
+        assert_eq!(
+            limited.len(),
+            1,
+            "Should return exactly 1 welcome with limit 1"
+        );
     }
 
     #[test]
@@ -1259,7 +1435,7 @@ mod tests {
         assert!(result.is_ok());
 
         // Verify the welcome was accepted by checking pending welcomes
-        let pending_welcomes = mdk.get_pending_welcomes().unwrap();
+        let pending_welcomes = mdk.get_pending_welcomes(None, None).unwrap();
         assert_eq!(pending_welcomes.len(), 0);
     }
 
@@ -1318,7 +1494,7 @@ mod tests {
         assert!(result.is_ok());
 
         // Verify the welcome was declined by checking pending welcomes
-        let pending_welcomes = mdk.get_pending_welcomes().unwrap();
+        let pending_welcomes = mdk.get_pending_welcomes(None, None).unwrap();
         assert_eq!(pending_welcomes.len(), 0);
     }
 
