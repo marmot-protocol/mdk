@@ -171,8 +171,8 @@ MdkMemoryStorage
    }
    ```
 
-4. **Merge migrations** - Add MLS table creation to MDK migrations:
-   - New migration V200 creates: `mls_group_data`, `mls_proposals`, `mls_key_packages`, `mls_psks`, `mls_signature_keys`, `mls_encryption_keys`, `mls_epoch_key_pairs`, `mls_own_leaf_nodes`
+4. **Fresh migration system** - Since this is a breaking change, start with new migration numbering:
+   - `V001__initial_schema.sql` - Creates all tables (both MLS and MDK) in a single migration
 
 5. **Implement all 54 `StorageProvider<1>` methods**:
    - 17 write methods
@@ -195,7 +195,7 @@ MdkMemoryStorage
 - `crates/mdk-sqlite-storage/Cargo.toml`
 - `crates/mdk-sqlite-storage/src/lib.rs`
 - `crates/mdk-sqlite-storage/src/mls_storage/` (new module)
-- `crates/mdk-sqlite-storage/migrations/V200__mls_tables.sql` (new)
+- `crates/mdk-sqlite-storage/migrations/V001__initial_schema.sql` (replaces all existing migrations)
 
 ---
 
@@ -303,7 +303,7 @@ just precommit
 | `crates/mdk-sqlite-storage/Cargo.toml` | Modify | Remove `openmls_sqlite_storage` dep |
 | `crates/mdk-sqlite-storage/src/lib.rs` | Modify | Single connection, new struct |
 | `crates/mdk-sqlite-storage/src/mls_storage/` | Create | New module with 54 method impls |
-| `crates/mdk-sqlite-storage/migrations/V200__mls_tables.sql` | Create | MLS tables migration |
+| `crates/mdk-sqlite-storage/migrations/` | Replace | Fresh migrations starting at V001 |
 | `crates/mdk-memory-storage/Cargo.toml` | Modify | Remove `openmls_memory_storage` dep |
 | `crates/mdk-memory-storage/src/lib.rs` | Modify | Add MLS data structures |
 | `crates/mdk-memory-storage/src/mls_storage.rs` | Create | New module with 54 method impls |
@@ -465,7 +465,7 @@ CREATE TABLE mls_epoch_key_pairs (
 |------|--------|------------|
 | OpenMLS `StorageProvider` trait changes | Medium | Pin to `openmls_traits = 0.4.1`, test against specific version |
 | Serialization compatibility | Low | Keep same JSON codec as `openmls_sqlite_storage` |
-| Migration complexity | Medium | New migration (V200), no data migration needed (breaking change) |
+| Migration complexity | Low | Fresh start with V001, no data migration needed (breaking change) |
 | Test coverage drop | Medium | Port all existing storage tests, add new unified tests |
 | Performance regression | Low | Profile before/after; single connection should be faster |
 
@@ -483,9 +483,9 @@ CREATE TABLE mls_epoch_key_pairs (
 
 To indicate these are our tables that we control, not the upstream `openmls_sqlite_storage` tables. This avoids confusion and makes it clear we own the schema.
 
-### Why start at migration V200?
+### Why start fresh with migration V001?
 
-Leaves room for any pre-unified migrations and provides a clean separation point.
+Since this is a completely breaking change with no migration path from the old dual-connection architecture, we start fresh with `V001__initial_schema.sql`. This creates all tables (both MLS and MDK) in a single clean migration, making the schema easier to understand.
 
 ---
 
