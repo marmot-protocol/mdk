@@ -40,6 +40,7 @@
 
 - Implemented pagination support using `Pagination` struct for group messages ([#111](https://github.com/marmot-protocol/mdk/pull/111))
 - Implemented pagination support using `Pagination` struct for pending welcomes ([#110](https://github.com/marmot-protocol/mdk/pull/110))
+- **Security (Audit Issue AM)**: Added input validation constants and enforcement to prevent memory exhaustion attacks. New public constants: `MAX_RELAYS_PER_GROUP`, `MAX_MESSAGES_PER_GROUP`, `MAX_GROUP_NAME_LENGTH`, `MAX_GROUP_DESCRIPTION_LENGTH`, `MAX_ADMINS_PER_GROUP`, `MAX_RELAYS_PER_WELCOME`, `MAX_ADMINS_PER_WELCOME`, `MAX_RELAY_URL_LENGTH`. Fixes [#82](https://github.com/marmot-protocol/mdk/issues/82) ([#147](https://github.com/marmot-protocol/mdk/pull/147))
 
 ### Fixed
 
@@ -48,6 +49,7 @@
 - **Security (Audit Issue Z)**: Added pagination to prevent memory exhaustion from unbounded loading of group messages ([#111](https://github.com/marmot-protocol/mdk/pull/111))
 - **Security (Audit Issue AA)**: Added pagination to prevent memory exhaustion from unbounded loading of pending welcomes ([#110](https://github.com/marmot-protocol/mdk/pull/110))
 - **Security (Audit Issue AO)**: Removed MLS group identifiers from error messages to prevent metadata leakage in logs and telemetry. Error messages now use generic "Group not found" instead of including the sensitive 32-byte MLS group ID. ([#112](https://github.com/marmot-protocol/mdk/pull/112))
+- **Security (Audit Issue AM)**: Added input validation to prevent memory exhaustion from unbounded per-key values in LRU caches. Validation is enforced in `save_group`, `replace_group_relays`, `save_message`, and `save_welcome` to cap string lengths, collection sizes, and per-group message counts. Fixes [#82](https://github.com/marmot-protocol/mdk/issues/82) ([#147](https://github.com/marmot-protocol/mdk/pull/147))
 - Fix `admins()` to return `InvalidParameters` error when group not found, instead of incorrectly returning `NoAdmins` ([#104](https://github.com/marmot-protocol/mdk/pull/104))
 ### Removed
 

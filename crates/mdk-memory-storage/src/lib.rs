@@ -5,6 +5,20 @@
 //!
 //! Memory-based storage is non-persistent and will be cleared when the application terminates.
 //! It's useful for testing or ephemeral applications where persistence isn't required.
+//!
+//! ## Memory Exhaustion Protection
+//!
+//! This implementation includes input validation to prevent memory exhaustion attacks.
+//! The following limits are enforced:
+//!
+//! - [`MAX_RELAYS_PER_GROUP`]: Maximum number of relays per group
+//! - [`MAX_MESSAGES_PER_GROUP`]: Maximum messages stored per group in the cache
+//! - [`MAX_GROUP_NAME_LENGTH`]: Maximum length of group name in bytes
+//! - [`MAX_GROUP_DESCRIPTION_LENGTH`]: Maximum length of group description in bytes
+//! - [`MAX_ADMINS_PER_GROUP`]: Maximum number of admin pubkeys per group
+//! - [`MAX_RELAYS_PER_WELCOME`]: Maximum number of relays in a welcome message
+//! - [`MAX_ADMINS_PER_WELCOME`]: Maximum number of admin pubkeys in a welcome message
+//! - [`MAX_RELAY_URL_LENGTH`]: Maximum length of a relay URL in bytes
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -29,6 +43,41 @@ mod welcomes;
 
 /// Default cache size for each LRU cache
 const DEFAULT_CACHE_SIZE: NonZeroUsize = NonZeroUsize::new(1000).unwrap();
+
+/// Maximum number of relays allowed per group to prevent memory exhaustion.
+/// This limit prevents attackers from growing a single cache entry unboundedly.
+pub const MAX_RELAYS_PER_GROUP: usize = 100;
+
+/// Maximum number of messages stored per group in the messages_by_group_cache.
+/// When this limit is reached, the oldest messages are evicted from the per-group cache.
+/// This prevents a single hot group from consuming excessive memory.
+pub const MAX_MESSAGES_PER_GROUP: usize = 10000;
+
+/// Maximum length of a group name in bytes (not characters).
+/// Multi-byte UTF-8 characters count as multiple bytes toward this limit.
+/// This prevents oversized group metadata from consuming excessive memory.
+pub const MAX_GROUP_NAME_LENGTH: usize = 256;
+
+/// Maximum length of a group description in bytes (not characters).
+/// Multi-byte UTF-8 characters count as multiple bytes toward this limit.
+/// This prevents oversized group metadata from consuming excessive memory.
+pub const MAX_GROUP_DESCRIPTION_LENGTH: usize = 4096;
+
+/// Maximum number of admin pubkeys allowed per group.
+/// This prevents unbounded growth of the admin set.
+pub const MAX_ADMINS_PER_GROUP: usize = 100;
+
+/// Maximum number of relays allowed in a welcome message.
+/// This prevents oversized welcome messages from consuming excessive memory.
+pub const MAX_RELAYS_PER_WELCOME: usize = 100;
+
+/// Maximum number of admin pubkeys allowed in a welcome message.
+/// This prevents oversized welcome messages from consuming excessive memory.
+pub const MAX_ADMINS_PER_WELCOME: usize = 100;
+
+/// Maximum length of a relay URL in bytes.
+/// This prevents oversized relay URLs from consuming excessive memory.
+pub const MAX_RELAY_URL_LENGTH: usize = 512;
 
 /// A memory-based storage implementation for Nostr MLS.
 ///

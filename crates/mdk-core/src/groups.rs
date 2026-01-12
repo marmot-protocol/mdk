@@ -3850,18 +3850,21 @@ mod tests {
             .expect("Failed to merge commit");
     }
 
-    /// Test group with very long name
+    /// Test group with long name within allowed limits
+    ///
+    /// Security fix (Issue #82): Group names are now limited to prevent memory exhaustion.
+    /// This test verifies that names within the limit work correctly.
     #[test]
     fn test_group_with_long_name() {
         let creator_mdk = create_test_mdk();
         let (creator, members, admins) = create_test_group_members();
         let group_id = create_test_group(&creator_mdk, &creator, &members, &admins);
 
-        // Update to very long name (1000 characters)
-        let long_name = "a".repeat(1000);
+        // Update to a long name within the allowed limit (256 bytes)
+        let long_name = "a".repeat(256);
         let update = NostrGroupDataUpdate::new().name(long_name);
         let result = creator_mdk.update_group_data(&group_id, update);
-        assert!(result.is_ok(), "Long group name should be valid");
+        assert!(result.is_ok(), "Group name at limit should be valid");
         creator_mdk
             .merge_pending_commit(&group_id)
             .expect("Failed to merge commit");
