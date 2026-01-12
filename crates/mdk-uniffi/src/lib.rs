@@ -357,10 +357,27 @@ impl Mdk {
             .collect())
     }
 
-    /// Get a message by event ID
-    pub fn get_message(&self, event_id: String) -> Result<Option<Message>, MdkUniffiError> {
+    /// Get a message by event ID within a specific group
+    ///
+    /// # Arguments
+    ///
+    /// * `mls_group_id` - The MLS group ID the message belongs to (hex-encoded)
+    /// * `event_id` - The Nostr event ID to look up (hex-encoded)
+    ///
+    /// # Returns
+    ///
+    /// Returns the message if found, None otherwise
+    pub fn get_message(
+        &self,
+        mls_group_id: String,
+        event_id: String,
+    ) -> Result<Option<Message>, MdkUniffiError> {
+        let group_id = parse_group_id(&mls_group_id)?;
         let event_id = parse_event_id(&event_id)?;
-        Ok(self.lock()?.get_message(&event_id)?.map(Message::from))
+        Ok(self
+            .lock()?
+            .get_message(&group_id, &event_id)?
+            .map(Message::from))
     }
 
     /// Get pending welcomes with optional pagination
@@ -1429,8 +1446,9 @@ mod tests {
     #[test]
     fn test_get_message_invalid_event_id() {
         let mdk = create_test_mdk();
+        let fake_group_id = hex::encode([0u8; 32]);
         let invalid_event_id = "not_valid_hex".to_string();
-        let result = mdk.get_message(invalid_event_id);
+        let result = mdk.get_message(fake_group_id, invalid_event_id);
         assert!(matches!(result, Err(MdkUniffiError::InvalidInput(_))));
     }
 

@@ -59,6 +59,8 @@ pub struct MediaReference {
     pub filename: String,
     /// Dimensions if applicable
     pub dimensions: Option<(u32, u32)>,
+    /// Encryption scheme version (e.g., "mip04-v2")
+    pub scheme_version: String,
     /// Encryption nonce (96 bits, 12 bytes) - required for decryption
     pub nonce: [u8; 12],
 }
@@ -109,6 +111,10 @@ pub enum EncryptedMediaError {
         /// The reason for the invalid IMETA tag
         reason: String,
     },
+
+    /// Unknown encryption scheme version
+    #[error("Unknown encryption scheme version: {0}")]
+    UnknownSchemeVersion(String),
 }
 
 #[cfg(test)]
@@ -183,6 +189,7 @@ mod tests {
             mime_type: "video/mp4".to_string(),
             filename: "test.mp4".to_string(),
             dimensions: Some((1920, 1080)),
+            scheme_version: "mip04-v2".to_string(),
             nonce: [0xAA; 12],
         };
 
@@ -192,6 +199,7 @@ mod tests {
         assert_eq!(media_ref.mime_type, "video/mp4");
         assert_eq!(media_ref.filename, "test.mp4");
         assert_eq!(media_ref.dimensions, Some((1920, 1080)));
+        assert_eq!(media_ref.scheme_version, "mip04-v2");
         assert_eq!(media_ref.nonce, [0xAA; 12]);
     }
 

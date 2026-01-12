@@ -1,5 +1,6 @@
 //! Memory-based storage implementation of the MdkStorageProvider trait for Nostr MLS messages
 
+use mdk_storage_traits::GroupId;
 use std::collections::HashMap;
 
 use nostr::EventId;
@@ -8,8 +9,7 @@ use nostr::{Kind, PublicKey, Tags, Timestamp, UnsignedEvent};
 #[cfg(test)]
 use openmls_memory_storage::MemoryStorage;
 
-#[cfg(test)]
-use mdk_storage_traits::GroupId;
+use mdk_storage_traits::groups::GroupStorage;
 use mdk_storage_traits::messages::MessageStorage;
 use mdk_storage_traits::messages::error::MessageError;
 use mdk_storage_traits::messages::types::*;
@@ -18,6 +18,24 @@ use crate::MdkMemoryStorage;
 
 impl MessageStorage for MdkMemoryStorage {
     fn save_message(&self, message: Message) -> Result<(), MessageError> {
+        // Verify that the group exists before saving the message
+        match self.find_group_by_mls_group_id(&message.mls_group_id) {
+            Ok(Some(_)) => {
+                // Group exists, proceed with saving
+            }
+            Ok(None) => {
+                return Err(MessageError::InvalidParameters(
+                    "Group not found".to_string(),
+                ));
+            }
+            Err(e) => {
+                return Err(MessageError::InvalidParameters(format!(
+                    "Failed to verify group existence: {}",
+                    e
+                )));
+            }
+        }
+
         // Save in the messages cache
         let mut cache = self.messages_cache.write();
         cache.put(message.id, message.clone());
@@ -43,10 +61,14 @@ impl MessageStorage for MdkMemoryStorage {
 
     fn find_message_by_event_id(
         &self,
+        mls_group_id: &GroupId,
         event_id: &EventId,
     ) -> Result<Option<Message>, MessageError> {
-        let cache = self.messages_cache.read();
-        Ok(cache.peek(event_id).cloned())
+        let group_cache = self.messages_by_group_cache.read();
+        match group_cache.peek(mls_group_id) {
+            Some(group_messages) => Ok(group_messages.get(event_id).cloned()),
+            None => Ok(None),
+        }
     }
 
     fn find_processed_message_by_event_id(
@@ -70,7 +92,29 @@ impl MessageStorage for MdkMemoryStorage {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
+    use mdk_storage_traits::groups::GroupStorage;
+    use mdk_storage_traits::groups::types::{Group, GroupState};
+
     use super::*;
+
+    fn create_test_group(group_id: GroupId) -> Group {
+        Group {
+            mls_group_id: group_id.clone(),
+            nostr_group_id: [0u8; 32],
+            name: "Test Group".to_string(),
+            description: "A test group".to_string(),
+            admin_pubkeys: BTreeSet::new(),
+            last_message_id: None,
+            last_message_at: None,
+            epoch: 0,
+            state: GroupState::Active,
+            image_hash: None,
+            image_key: None,
+            image_nonce: None,
+        }
+    }
 
     fn create_test_message(
         event_id: EventId,
@@ -111,13 +155,17 @@ mod tests {
         let group_id = GroupId::from_slice(&[1, 2, 3, 4]);
         let event_id = EventId::from_slice(&[10u8; 32]).unwrap();
 
+        // Create the group first
+        let group = create_test_group(group_id.clone());
+        storage.save_group(group).unwrap();
+
         // Save initial message
         let message1 = create_test_message(event_id, group_id.clone(), "Original content", 1000);
         storage.save_message(message1).unwrap();
 
         // Verify initial message is saved
         let found = storage
-            .find_message_by_event_id(&event_id)
+            .find_message_by_event_id(&group_id, &event_id)
             .unwrap()
             .unwrap();
         assert_eq!(found.content, "Original content");
@@ -135,7 +183,7 @@ mod tests {
 
         // Verify the message was updated, not duplicated
         let found = storage
-            .find_message_by_event_id(&event_id)
+            .find_message_by_event_id(&group_id, &event_id)
             .unwrap()
             .unwrap();
         assert_eq!(found.content, "Updated content");
@@ -164,6 +212,12 @@ mod tests {
 
         let group1_id = GroupId::from_slice(&[1, 1, 1, 1]);
         let group2_id = GroupId::from_slice(&[2, 2, 2, 2]);
+
+        // Create the groups first
+        let group1 = create_test_group(group1_id.clone());
+        storage.save_group(group1).unwrap();
+        let group2 = create_test_group(group2_id.clone());
+        storage.save_group(group2).unwrap();
 
         // Save messages to group 1
         for i in 0..3 {
@@ -206,7 +260,7 @@ mod tests {
         // Verify messages are correctly associated with their groups
         let event_id_group1 = EventId::from_slice(&[0u8; 32]).unwrap();
         let found = storage
-            .find_message_by_event_id(&event_id_group1)
+            .find_message_by_event_id(&group1_id, &event_id_group1)
             .unwrap()
             .unwrap();
         assert_eq!(found.mls_group_id, group1_id);
@@ -214,7 +268,7 @@ mod tests {
 
         let event_id_group2 = EventId::from_slice(&[100u8; 32]).unwrap();
         let found = storage
-            .find_message_by_event_id(&event_id_group2)
+            .find_message_by_event_id(&group2_id, &event_id_group2)
             .unwrap()
             .unwrap();
         assert_eq!(found.mls_group_id, group2_id);
@@ -229,6 +283,10 @@ mod tests {
         let group_id = GroupId::from_slice(&[1, 2, 3, 4]);
         let event_id = EventId::from_slice(&[50u8; 32]).unwrap();
 
+        // Create the group first
+        let group = create_test_group(group_id.clone());
+        storage.save_group(group).unwrap();
+
         // Perform multiple updates to the same message
         for i in 0..10 {
             let message = create_test_message(
@@ -242,7 +300,7 @@ mod tests {
 
         // Verify only the final version exists
         let found = storage
-            .find_message_by_event_id(&event_id)
+            .find_message_by_event_id(&group_id, &event_id)
             .unwrap()
             .unwrap();
         assert_eq!(found.content, "Version 9");
@@ -267,6 +325,10 @@ mod tests {
         let group_id = GroupId::from_slice(&[1, 2, 3, 4]);
         let event_id = EventId::from_slice(&[75u8; 32]).unwrap();
 
+        // Create the group first
+        let group = create_test_group(group_id.clone());
+        storage.save_group(group).unwrap();
+
         // Save message with Created state
         let mut message = create_test_message(event_id, group_id.clone(), "Test content", 1000);
         message.state = MessageState::Created;
@@ -274,7 +336,7 @@ mod tests {
 
         // Verify initial state
         let found = storage
-            .find_message_by_event_id(&event_id)
+            .find_message_by_event_id(&group_id, &event_id)
             .unwrap()
             .unwrap();
         assert_eq!(found.state, MessageState::Created);
@@ -286,7 +348,7 @@ mod tests {
 
         // Verify state was updated
         let found = storage
-            .find_message_by_event_id(&event_id)
+            .find_message_by_event_id(&group_id, &event_id)
             .unwrap()
             .unwrap();
         assert_eq!(found.state, MessageState::Processed);

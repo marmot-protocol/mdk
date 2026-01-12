@@ -17,19 +17,35 @@ use mdk_storage_traits::{MdkStorageProvider, Secret};
 use crate::encrypted_media::types::EncryptedMediaError;
 use crate::{GroupId, MDK};
 
-/// Scheme label for MIP-04 version 2 encryption to provide domain separation
-/// and prevent cross-version collisions
-const SCHEME_LABEL: &[u8] = b"mip04-v2";
+/// Default scheme version for MIP-04 encryption
+pub const DEFAULT_SCHEME_VERSION: &str = "mip04-v2";
+
+/// Get scheme label bytes from version string
+///
+/// This function maps version strings to their corresponding scheme labels
+/// used in AAD and HKDF contexts. This allows for versioned encryption
+/// schemes while maintaining backward compatibility.
+fn get_scheme_label(version: &str) -> Result<&[u8], EncryptedMediaError> {
+    match version {
+        "mip04-v1" => Ok(b"mip04-v1"),
+        "mip04-v2" => Ok(b"mip04-v2"),
+        // Future versions can be added here
+        _ => Err(EncryptedMediaError::UnknownSchemeVersion(
+            version.to_string(),
+        )),
+    }
+}
 
 /// Build HKDF context for key/nonce derivation with scheme label for domain separation
 fn build_hkdf_context(
+    scheme_label: &[u8],
     file_hash: &[u8; 32],
     mime_type: &str,
     filename: &str,
     suffix: &[u8],
 ) -> Vec<u8> {
     let mut context = Vec::new();
-    context.extend_from_slice(SCHEME_LABEL);
+    context.extend_from_slice(scheme_label);
     context.push(0x00);
     context.extend_from_slice(file_hash);
     context.push(0x00);
@@ -42,9 +58,14 @@ fn build_hkdf_context(
 }
 
 /// Build AAD (Associated Authenticated Data) for AEAD encryption with scheme label
-fn build_aad(file_hash: &[u8; 32], mime_type: &str, filename: &str) -> Vec<u8> {
+fn build_aad(
+    scheme_label: &[u8],
+    file_hash: &[u8; 32],
+    mime_type: &str,
+    filename: &str,
+) -> Vec<u8> {
     let mut aad = Vec::new();
-    aad.extend_from_slice(SCHEME_LABEL);
+    aad.extend_from_slice(scheme_label);
     aad.push(0x00);
     aad.extend_from_slice(file_hash);
     aad.push(0x00);
@@ -61,6 +82,7 @@ fn build_aad(file_hash: &[u8; 32], mime_type: &str, filename: &str) -> Vec<u8> {
 pub fn derive_encryption_key<Storage>(
     mdk: &MDK<Storage>,
     group_id: &GroupId,
+    scheme_version: &str,
     original_hash: &[u8; 32],
     mime_type: &str,
     filename: &str,
@@ -73,9 +95,12 @@ where
         .exporter_secret(group_id)
         .map_err(|_| EncryptedMediaError::GroupNotFound)?;
 
+    // Get scheme label from version
+    let scheme_label = get_scheme_label(scheme_version)?;
+
     // Create context as specified in Marmot protocol 04.md:
     // SCHEME_LABEL || 0x00 || file_hash_bytes || 0x00 || mime_type_bytes || 0x00 || filename_bytes || 0x00 || "key"
-    let context = build_hkdf_context(original_hash, mime_type, filename, b"key");
+    let context = build_hkdf_context(scheme_label, original_hash, mime_type, filename, b"key");
 
     // Use HKDF to derive encryption key with context
     let hk = Hkdf::<Sha256>::new(None, exporter_secret.secret.as_ref());
@@ -89,12 +114,6 @@ where
     Ok(Secret::new(key))
 }
 
-/// Generate a random encryption nonce
-///
-/// This function generates a cryptographically secure random 96-bit (12-byte) nonce
-/// for ChaCha20-Poly1305 encryption. Each encryption operation should use a unique
-/// nonce to prevent nonce reuse attacks.
-///
 /// Generate a random encryption nonce
 ///
 /// This function generates a cryptographically secure random 96-bit (12-byte) nonce
@@ -115,6 +134,7 @@ pub fn encrypt_data_with_aad(
     data: &[u8],
     key: &Secret<[u8; 32]>,
     nonce: &Secret<[u8; 12]>,
+    scheme_version: &str,
     file_hash: &[u8; 32],
     mime_type: &str,
     filename: &str,
@@ -125,13 +145,14 @@ pub fn encrypt_data_with_aad(
         }
     })?;
 
-    let nonce = Nonce::from_slice(nonce.as_ref());
+    let nonce_arr = Nonce::from_slice(nonce.as_ref());
 
-    let aad = build_aad(file_hash, mime_type, filename);
+    let scheme_label = get_scheme_label(scheme_version)?;
+    let aad = build_aad(scheme_label, file_hash, mime_type, filename);
 
     cipher
         .encrypt(
-            nonce,
+            nonce_arr,
             chacha20poly1305::aead::Payload {
                 msg: data,
                 aad: &aad,
@@ -146,10 +167,15 @@ pub fn encrypt_data_with_aad(
 ///
 /// As specified in MIP-04, the AAD includes:
 /// aad = SCHEME_LABEL || 0x00 || file_hash_bytes || 0x00 || mime_type_bytes || 0x00 || filename_bytes
+///
+/// This function attempts decryption with the provided scheme version. If decryption
+/// fails, it may be due to a version mismatch. The caller should ensure the correct
+/// scheme_version is provided from the MediaReference parsed from the IMETA tag.
 pub fn decrypt_data_with_aad(
     encrypted_data: &[u8],
     key: &Secret<[u8; 32]>,
     nonce: &Secret<[u8; 12]>,
+    scheme_version: &str,
     file_hash: &[u8; 32],
     mime_type: &str,
     filename: &str,
@@ -160,13 +186,14 @@ pub fn decrypt_data_with_aad(
         }
     })?;
 
-    let nonce = Nonce::from_slice(nonce.as_ref());
+    let nonce_arr = Nonce::from_slice(nonce.as_ref());
 
-    let aad = build_aad(file_hash, mime_type, filename);
+    let scheme_label = get_scheme_label(scheme_version)?;
+    let aad = build_aad(scheme_label, file_hash, mime_type, filename);
 
     cipher
         .decrypt(
-            nonce,
+            nonce_arr,
             chacha20poly1305::aead::Payload {
                 msg: encrypted_data,
                 aad: &aad,
@@ -205,8 +232,14 @@ mod tests {
         let original_hash: [u8; 32] = Sha256::digest(original_data).into();
 
         // Test key derivation (will fail without a proper group, but we can test the logic)
-        let key_result =
-            derive_encryption_key(&mdk, &group_id, &original_hash, mime_type, filename);
+        let key_result = derive_encryption_key(
+            &mdk,
+            &group_id,
+            DEFAULT_SCHEME_VERSION,
+            &original_hash,
+            mime_type,
+            filename,
+        );
 
         // Should fail gracefully since we don't have a real MLS group
         assert!(key_result.is_err());
@@ -230,8 +263,15 @@ mod tests {
         let filename = "test.jpg";
 
         // Encrypt the data
-        let encrypted_result =
-            encrypt_data_with_aad(original_data, &key, &nonce, &file_hash, mime_type, filename);
+        let encrypted_result = encrypt_data_with_aad(
+            original_data,
+            &key,
+            &nonce,
+            DEFAULT_SCHEME_VERSION,
+            &file_hash,
+            mime_type,
+            filename,
+        );
         assert!(encrypted_result.is_ok());
         let encrypted_data = encrypted_result.unwrap();
 
@@ -244,6 +284,7 @@ mod tests {
             &encrypted_data,
             &key,
             &nonce,
+            DEFAULT_SCHEME_VERSION,
             &file_hash,
             mime_type,
             filename,
@@ -266,9 +307,16 @@ mod tests {
         let filename = "test.jpg";
 
         // Encrypt with original parameters
-        let encrypted_data =
-            encrypt_data_with_aad(original_data, &key, &nonce, &file_hash, mime_type, filename)
-                .unwrap();
+        let encrypted_data = encrypt_data_with_aad(
+            original_data,
+            &key,
+            &nonce,
+            DEFAULT_SCHEME_VERSION,
+            &file_hash,
+            mime_type,
+            filename,
+        )
+        .unwrap();
 
         // Try to decrypt with different file hash (should fail)
         let different_hash = [0x02u8; 32];
@@ -276,6 +324,7 @@ mod tests {
             &encrypted_data,
             &key,
             &nonce,
+            DEFAULT_SCHEME_VERSION,
             &different_hash,
             mime_type,
             filename,
@@ -287,6 +336,7 @@ mod tests {
             &encrypted_data,
             &key,
             &nonce,
+            DEFAULT_SCHEME_VERSION,
             &file_hash,
             "image/png",
             filename,
@@ -298,6 +348,7 @@ mod tests {
             &encrypted_data,
             &key,
             &nonce,
+            DEFAULT_SCHEME_VERSION,
             &file_hash,
             mime_type,
             "different.jpg",
@@ -309,6 +360,7 @@ mod tests {
             &encrypted_data,
             &key,
             &nonce,
+            DEFAULT_SCHEME_VERSION,
             &file_hash,
             mime_type,
             filename,
@@ -329,15 +381,23 @@ mod tests {
         let filename = "test.jpg";
 
         // Encrypt with original key
-        let encrypted_data =
-            encrypt_data_with_aad(original_data, &key, &nonce, &file_hash, mime_type, filename)
-                .unwrap();
+        let encrypted_data = encrypt_data_with_aad(
+            original_data,
+            &key,
+            &nonce,
+            DEFAULT_SCHEME_VERSION,
+            &file_hash,
+            mime_type,
+            filename,
+        )
+        .unwrap();
 
         // Try to decrypt with wrong key (should fail)
         let result = decrypt_data_with_aad(
             &encrypted_data,
             &wrong_key,
             &nonce,
+            DEFAULT_SCHEME_VERSION,
             &file_hash,
             mime_type,
             filename,
@@ -361,15 +421,23 @@ mod tests {
         let filename = "test.jpg";
 
         // Encrypt with original nonce
-        let encrypted_data =
-            encrypt_data_with_aad(original_data, &key, &nonce, &file_hash, mime_type, filename)
-                .unwrap();
+        let encrypted_data = encrypt_data_with_aad(
+            original_data,
+            &key,
+            &nonce,
+            DEFAULT_SCHEME_VERSION,
+            &file_hash,
+            mime_type,
+            filename,
+        )
+        .unwrap();
 
         // Try to decrypt with wrong nonce (should fail)
         let result = decrypt_data_with_aad(
             &encrypted_data,
             &key,
             &wrong_nonce,
+            DEFAULT_SCHEME_VERSION,
             &file_hash,
             mime_type,
             filename,
@@ -392,8 +460,15 @@ mod tests {
         let filename = "empty.jpg";
 
         // Encrypt empty data
-        let encrypted_result =
-            encrypt_data_with_aad(empty_data, &key, &nonce, &file_hash, mime_type, filename);
+        let encrypted_result = encrypt_data_with_aad(
+            empty_data,
+            &key,
+            &nonce,
+            DEFAULT_SCHEME_VERSION,
+            &file_hash,
+            mime_type,
+            filename,
+        );
         assert!(encrypted_result.is_ok());
         let encrypted_data = encrypted_result.unwrap();
 
@@ -405,6 +480,7 @@ mod tests {
             &encrypted_data,
             &key,
             &nonce,
+            DEFAULT_SCHEME_VERSION,
             &file_hash,
             mime_type,
             filename,
@@ -423,19 +499,40 @@ mod tests {
         let file_hash = [0x01u8; 32];
 
         // Encrypt with first set of AAD components
-        let encrypted1 =
-            encrypt_data_with_aad(data, &key, &nonce, &file_hash, "image/jpeg", "photo.jpg")
-                .unwrap();
+        let encrypted1 = encrypt_data_with_aad(
+            data,
+            &key,
+            &nonce,
+            DEFAULT_SCHEME_VERSION,
+            &file_hash,
+            "image/jpeg",
+            "photo.jpg",
+        )
+        .unwrap();
 
         // Encrypt with different MIME type
-        let encrypted2 =
-            encrypt_data_with_aad(data, &key, &nonce, &file_hash, "image/png", "photo.jpg")
-                .unwrap();
+        let encrypted2 = encrypt_data_with_aad(
+            data,
+            &key,
+            &nonce,
+            DEFAULT_SCHEME_VERSION,
+            &file_hash,
+            "image/png",
+            "photo.jpg",
+        )
+        .unwrap();
 
         // Encrypt with different filename
-        let encrypted3 =
-            encrypt_data_with_aad(data, &key, &nonce, &file_hash, "image/jpeg", "image.jpg")
-                .unwrap();
+        let encrypted3 = encrypt_data_with_aad(
+            data,
+            &key,
+            &nonce,
+            DEFAULT_SCHEME_VERSION,
+            &file_hash,
+            "image/jpeg",
+            "image.jpg",
+        )
+        .unwrap();
 
         // All encrypted outputs should be different due to different AAD
         assert_ne!(encrypted1, encrypted2);
@@ -484,9 +581,16 @@ mod tests {
         let filename = "test.jpg";
 
         // Encrypt valid data
-        let mut encrypted_data =
-            encrypt_data_with_aad(original_data, &key, &nonce, &file_hash, mime_type, filename)
-                .unwrap();
+        let mut encrypted_data = encrypt_data_with_aad(
+            original_data,
+            &key,
+            &nonce,
+            DEFAULT_SCHEME_VERSION,
+            &file_hash,
+            mime_type,
+            filename,
+        )
+        .unwrap();
 
         // Corrupt the encrypted data (flip a bit)
         encrypted_data[0] ^= 0xFF;
@@ -496,6 +600,47 @@ mod tests {
             &encrypted_data,
             &key,
             &nonce,
+            DEFAULT_SCHEME_VERSION,
+            &file_hash,
+            mime_type,
+            filename,
+        );
+        assert!(result.is_err());
+        assert!(matches!(
+            result,
+            Err(EncryptedMediaError::DecryptionFailed { .. })
+        ));
+    }
+
+    #[test]
+    fn test_scheme_version_mismatch_causes_decryption_failure() {
+        // Test that encrypting with one scheme version and decrypting with another fails
+        let key = Secret::new([0x42u8; 32]);
+        let nonce = Secret::new([0x24u8; 12]);
+        let original_data = b"Test data for version mismatch";
+        let file_hash = [0x01u8; 32];
+        let mime_type = "image/jpeg";
+        let filename = "test.jpg";
+
+        // Encrypt with default scheme version
+        let encrypted_data = encrypt_data_with_aad(
+            original_data,
+            &key,
+            &nonce,
+            DEFAULT_SCHEME_VERSION,
+            &file_hash,
+            mime_type,
+            filename,
+        )
+        .unwrap();
+
+        // Try to decrypt with a different scheme version ("mip04-v1")
+        // This should produce different AAD and cause decryption failure
+        let result = decrypt_data_with_aad(
+            &encrypted_data,
+            &key,
+            &nonce,
+            "mip04-v1", // Mismatched version
             &file_hash,
             mime_type,
             filename,
@@ -519,8 +664,15 @@ mod tests {
         // Try to decrypt data that's too short (less than auth tag size)
         let too_short = vec![0u8; 5];
 
-        let result =
-            decrypt_data_with_aad(&too_short, &key, &nonce, &file_hash, mime_type, filename);
+        let result = decrypt_data_with_aad(
+            &too_short,
+            &key,
+            &nonce,
+            DEFAULT_SCHEME_VERSION,
+            &file_hash,
+            mime_type,
+            filename,
+        );
         assert!(result.is_err());
         assert!(matches!(
             result,
@@ -539,8 +691,15 @@ mod tests {
         let filename = "large.bin";
 
         // Encrypt large data
-        let encrypted_result =
-            encrypt_data_with_aad(&large_data, &key, &nonce, &file_hash, mime_type, filename);
+        let encrypted_result = encrypt_data_with_aad(
+            &large_data,
+            &key,
+            &nonce,
+            DEFAULT_SCHEME_VERSION,
+            &file_hash,
+            mime_type,
+            filename,
+        );
         assert!(encrypted_result.is_ok());
         let encrypted_data = encrypted_result.unwrap();
 
@@ -552,6 +711,7 @@ mod tests {
             &encrypted_data,
             &key,
             &nonce,
+            DEFAULT_SCHEME_VERSION,
             &file_hash,
             mime_type,
             filename,
@@ -573,6 +733,7 @@ mod tests {
             data,
             &key,
             &nonce,
+            DEFAULT_SCHEME_VERSION,
             &file_hash,
             "image/jpeg",
             "test file (1).jpg",
@@ -580,15 +741,23 @@ mod tests {
         .unwrap();
 
         // Test with unicode characters
-        let encrypted2 =
-            encrypt_data_with_aad(data, &key, &nonce, &file_hash, "image/jpeg", "тест.jpg")
-                .unwrap();
+        let encrypted2 = encrypt_data_with_aad(
+            data,
+            &key,
+            &nonce,
+            DEFAULT_SCHEME_VERSION,
+            &file_hash,
+            "image/jpeg",
+            "тест.jpg",
+        )
+        .unwrap();
 
         // Test with complex MIME type
         let encrypted3 = encrypt_data_with_aad(
             data,
             &key,
             &nonce,
+            DEFAULT_SCHEME_VERSION,
             &file_hash,
             "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             "document.docx",
@@ -605,6 +774,7 @@ mod tests {
             &encrypted1,
             &key,
             &nonce,
+            DEFAULT_SCHEME_VERSION,
             &file_hash,
             "image/jpeg",
             "test file (1).jpg",
@@ -616,6 +786,7 @@ mod tests {
             &encrypted2,
             &key,
             &nonce,
+            DEFAULT_SCHEME_VERSION,
             &file_hash,
             "image/jpeg",
             "тест.jpg",
@@ -640,20 +811,68 @@ mod tests {
         let nonce2 = generate_encryption_nonce();
         let nonce3 = generate_encryption_nonce();
 
-        let enc1 =
-            encrypt_data_with_aad(data1, &key, &nonce1, &file_hash, mime_type, filename).unwrap();
-        let enc2 =
-            encrypt_data_with_aad(data2, &key, &nonce2, &file_hash, mime_type, filename).unwrap();
-        let enc3 =
-            encrypt_data_with_aad(data3, &key, &nonce3, &file_hash, mime_type, filename).unwrap();
+        let enc1 = encrypt_data_with_aad(
+            data1,
+            &key,
+            &nonce1,
+            DEFAULT_SCHEME_VERSION,
+            &file_hash,
+            mime_type,
+            filename,
+        )
+        .unwrap();
+        let enc2 = encrypt_data_with_aad(
+            data2,
+            &key,
+            &nonce2,
+            DEFAULT_SCHEME_VERSION,
+            &file_hash,
+            mime_type,
+            filename,
+        )
+        .unwrap();
+        let enc3 = encrypt_data_with_aad(
+            data3,
+            &key,
+            &nonce3,
+            DEFAULT_SCHEME_VERSION,
+            &file_hash,
+            mime_type,
+            filename,
+        )
+        .unwrap();
 
         // All should decrypt correctly
-        let dec1 =
-            decrypt_data_with_aad(&enc1, &key, &nonce1, &file_hash, mime_type, filename).unwrap();
-        let dec2 =
-            decrypt_data_with_aad(&enc2, &key, &nonce2, &file_hash, mime_type, filename).unwrap();
-        let dec3 =
-            decrypt_data_with_aad(&enc3, &key, &nonce3, &file_hash, mime_type, filename).unwrap();
+        let dec1 = decrypt_data_with_aad(
+            &enc1,
+            &key,
+            &nonce1,
+            DEFAULT_SCHEME_VERSION,
+            &file_hash,
+            mime_type,
+            filename,
+        )
+        .unwrap();
+        let dec2 = decrypt_data_with_aad(
+            &enc2,
+            &key,
+            &nonce2,
+            DEFAULT_SCHEME_VERSION,
+            &file_hash,
+            mime_type,
+            filename,
+        )
+        .unwrap();
+        let dec3 = decrypt_data_with_aad(
+            &enc3,
+            &key,
+            &nonce3,
+            DEFAULT_SCHEME_VERSION,
+            &file_hash,
+            mime_type,
+            filename,
+        )
+        .unwrap();
 
         assert_eq!(dec1, data1);
         assert_eq!(dec2, data2);
@@ -668,8 +887,14 @@ mod tests {
         let file_hash = [0x01u8; 32];
 
         // Test GroupNotFound error message
-        let key_result =
-            derive_encryption_key(&mdk, &group_id, &file_hash, "image/jpeg", "test.jpg");
+        let key_result = derive_encryption_key(
+            &mdk,
+            &group_id,
+            DEFAULT_SCHEME_VERSION,
+            &file_hash,
+            "image/jpeg",
+            "test.jpg",
+        );
         assert!(matches!(
             key_result,
             Err(EncryptedMediaError::GroupNotFound)
@@ -684,6 +909,7 @@ mod tests {
             &corrupted,
             &key,
             &nonce,
+            DEFAULT_SCHEME_VERSION,
             &file_hash,
             "image/jpeg",
             "test.jpg",
@@ -748,7 +974,14 @@ mod tests {
         let group_id = GroupId::from_slice(&[1, 2, 3, 4]);
         let file_hash = [0x01u8; 32];
 
-        let result = derive_encryption_key(&mdk, &group_id, &file_hash, "image/jpeg", "test.jpg");
+        let result = derive_encryption_key(
+            &mdk,
+            &group_id,
+            DEFAULT_SCHEME_VERSION,
+            &file_hash,
+            "image/jpeg",
+            "test.jpg",
+        );
         assert!(result.is_err());
         assert!(matches!(result, Err(EncryptedMediaError::GroupNotFound)));
     }
@@ -765,5 +998,15 @@ mod tests {
         assert!(secret2 > secret1);
         assert!(secret1 <= secret3);
         assert!(secret1 >= secret3);
+    }
+
+    #[test]
+    fn test_unknown_scheme_version() {
+        let result = get_scheme_label("unknown-version");
+        assert!(result.is_err());
+        match result {
+            Err(EncryptedMediaError::UnknownSchemeVersion(v)) => assert_eq!(v, "unknown-version"),
+            _ => panic!("Expected UnknownSchemeVersion error"),
+        }
     }
 }

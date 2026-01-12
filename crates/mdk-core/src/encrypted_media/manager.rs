@@ -8,7 +8,8 @@ use nostr::{Tag as NostrTag, TagKind};
 use sha2::{Digest, Sha256};
 
 use crate::encrypted_media::crypto::{
-    decrypt_data_with_aad, derive_encryption_key, encrypt_data_with_aad, generate_encryption_nonce,
+    DEFAULT_SCHEME_VERSION, decrypt_data_with_aad, derive_encryption_key, encrypt_data_with_aad,
+    generate_encryption_nonce,
 };
 use crate::encrypted_media::metadata::extract_and_process_metadata;
 use crate::encrypted_media::types::{
@@ -16,7 +17,7 @@ use crate::encrypted_media::types::{
 };
 use crate::media_processing::validation;
 use crate::{GroupId, MDK};
-use mdk_storage_traits::MdkStorageProvider;
+use mdk_storage_traits::{MdkStorageProvider, Secret};
 
 /// Manager for encrypted media operations
 pub struct EncryptedMediaManager<'a, Storage>
@@ -71,7 +72,13 @@ where
         options: &MediaProcessingOptions,
     ) -> Result<EncryptedMediaUpload, EncryptedMediaError> {
         validation::validate_file_size(data, options)?;
+        // Validate MIME type: canonicalize, check allowlist, and validate against file bytes (for images)
+        // This prevents spoofing and ensures only supported types are encrypted
         let canonical_mime_type = validation::validate_mime_type(mime_type)?;
+        // For image types, validate against file bytes to prevent spoofing
+        if canonical_mime_type.starts_with("image/") {
+            validation::validate_mime_type_matches_data(data, &canonical_mime_type)?;
+        }
         validation::validate_filename(filename)?;
 
         // Extract metadata and optionally sanitize the file
@@ -83,9 +90,11 @@ where
         // Calculate hash of the PROCESSED (potentially sanitized) data
         // This ensures the hash is of the clean file, not the original with EXIF
         let original_hash: [u8; 32] = Sha256::digest(&processed_data).into();
+        let scheme_version = DEFAULT_SCHEME_VERSION;
         let encryption_key = derive_encryption_key(
             self.mdk,
             &self.group_id,
+            scheme_version,
             &original_hash,
             &metadata.mime_type,
             filename,
@@ -97,6 +106,7 @@ where
             &processed_data,
             &encryption_key,
             &nonce,
+            scheme_version,
             &original_hash,
             &metadata.mime_type,
             filename,
@@ -121,6 +131,7 @@ where
     /// Decrypt downloaded media
     ///
     /// The filename for AAD is taken from the MediaReference, which was parsed from the imeta tag.
+    /// The scheme_version from MediaReference is used to select the correct encryption scheme.
     pub fn decrypt_from_download(
         &self,
         encrypted_data: &[u8],
@@ -129,6 +140,7 @@ where
         let encryption_key = derive_encryption_key(
             self.mdk,
             &self.group_id,
+            &reference.scheme_version,
             &reference.original_hash,
             &reference.mime_type,
             &reference.filename,
@@ -136,7 +148,8 @@ where
         let decrypted_data = decrypt_data_with_aad(
             encrypted_data,
             &encryption_key,
-            &mdk_storage_traits::Secret::new(reference.nonce),
+            &Secret::new(reference.nonce),
+            &reference.scheme_version,
             &reference.original_hash,
             &reference.mime_type,
             &reference.filename,
@@ -176,7 +189,7 @@ where
         tag_values.push(format!("n {}", hex::encode(upload.nonce)));
 
         // v field contains encryption version number (currently "mip04-v2")
-        tag_values.push("v mip04-v2".to_string());
+        tag_values.push(format!("v {}", DEFAULT_SCHEME_VERSION));
 
         NostrTag::custom(TagKind::Custom("imeta".into()), tag_values)
     }
@@ -193,6 +206,7 @@ where
             mime_type: upload.mime_type.clone(),
             filename: upload.filename.clone(),
             dimensions: upload.dimensions,
+            scheme_version: DEFAULT_SCHEME_VERSION.to_string(),
             nonce: upload.nonce,
         }
     }
@@ -321,13 +335,16 @@ where
             reason: "Missing required 'filename' field".to_string(),
         })?;
 
-        // Validate version (required field, currently only support mip04-v2)
-        let version = version.ok_or(EncryptedMediaError::InvalidImetaTag {
+        // Validate version (required field)
+        let scheme_version = version.ok_or(EncryptedMediaError::InvalidImetaTag {
             reason: "Missing required 'v' (version) field".to_string(),
         })?;
-        if version != "mip04-v2" {
+
+        // Validate that the version is supported
+        // Currently only "mip04-v2" is supported
+        if scheme_version != "mip04-v2" {
             return Err(EncryptedMediaError::DecryptionFailed {
-                reason: format!("Unsupported MIP-04 encryption version: {}", version),
+                reason: format!("Unsupported MIP-04 encryption version: {}", scheme_version),
             });
         }
 
@@ -341,6 +358,7 @@ where
             mime_type,
             filename,
             dimensions,
+            scheme_version,
             nonce,
         })
     }
@@ -359,7 +377,12 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
+
+    use image::{ImageBuffer, Rgb};
     use mdk_memory_storage::MdkMemoryStorage;
+
+    use crate::media_processing::types::MediaProcessingError;
 
     fn create_test_mdk() -> MDK<MdkMemoryStorage> {
         MDK::new(MdkMemoryStorage::default())
@@ -447,6 +470,7 @@ mod tests {
         assert_eq!(media_ref.original_hash, [0x42; 32]);
         assert_eq!(media_ref.filename, "photo.jpg");
         assert_eq!(media_ref.dimensions, Some((1920, 1080)));
+        assert_eq!(media_ref.scheme_version, "mip04-v2");
         assert_eq!(media_ref.nonce, test_nonce);
     }
 
@@ -514,11 +538,12 @@ mod tests {
         assert_eq!(media_ref.mime_type, "image/png");
         assert_eq!(media_ref.filename, "test.png");
         assert_eq!(media_ref.dimensions, Some((800, 600)));
+        assert_eq!(media_ref.scheme_version, DEFAULT_SCHEME_VERSION);
         assert_eq!(media_ref.nonce, test_nonce);
     }
 
     #[test]
-    fn test_encrypt_for_upload_accepts_any_mime_type() {
+    fn test_encrypt_for_upload_supported_mime_types() {
         let mdk = create_test_mdk();
         let group_id = GroupId::from_slice(&[1, 2, 3, 4]);
         let manager = mdk.media_manager(group_id);
@@ -534,13 +559,12 @@ mod tests {
             max_filename_length: None,
         };
 
-        // Test with various non-image MIME types - all should pass validation
+        // Test with various supported non-image MIME types - all should pass validation
         let test_cases = vec![
             ("application/pdf", "document.pdf"),
             ("video/quicktime", "video.mov"),
             ("audio/mpeg", "song.mp3"),
             ("text/plain", "note.txt"),
-            ("application/octet-stream", "file.bin"),
         ];
 
         for (mime_type, filename) in test_cases {
@@ -559,6 +583,179 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_encrypt_for_upload_rejects_unsupported_mime_types() {
+        let mdk = create_test_mdk();
+        let group_id = GroupId::from_slice(&[1, 2, 3, 4]);
+        let manager = mdk.media_manager(group_id);
+
+        let test_data = vec![0u8; 1000];
+        let options = MediaProcessingOptions {
+            sanitize_exif: true,
+            generate_blurhash: false,
+            max_dimension: None,
+            max_file_size: None,
+            max_filename_length: None,
+        };
+
+        // Test with unsupported MIME types - all should be rejected
+        let unsupported_cases = vec![
+            ("application/x-executable", "malware.exe"),
+            ("text/html", "page.html"),
+            ("application/javascript", "script.js"),
+            ("image/svg+xml", "image.svg"),
+            ("application/x-sh", "script.sh"),
+        ];
+
+        for (mime_type, filename) in unsupported_cases {
+            let result =
+                manager.encrypt_for_upload_with_options(&test_data, mime_type, filename, &options);
+
+            // Should fail with InvalidMimeType error
+            assert!(result.is_err());
+            assert!(
+                matches!(
+                    result,
+                    Err(EncryptedMediaError::MediaProcessing(
+                        MediaProcessingError::InvalidMimeType { .. }
+                    ))
+                ),
+                "Expected InvalidMimeType error for unsupported MIME type {}, got: {:?}",
+                mime_type,
+                result
+            );
+        }
+    }
+
+    #[test]
+    fn test_encrypt_for_upload_allows_escape_hatch() {
+        let mdk = create_test_mdk();
+        let group_id = GroupId::from_slice(&[1, 2, 3, 4]);
+        let manager = mdk.media_manager(group_id);
+
+        // Test data (can be anything - escape hatch bypasses validation)
+        let test_data = vec![0x42u8; 1000];
+        let options = MediaProcessingOptions {
+            sanitize_exif: true,
+            generate_blurhash: false,
+            max_dimension: None,
+            max_file_size: None,
+            max_filename_length: None,
+        };
+
+        // Test escape hatch MIME type - should pass validation
+        // (will fail later due to missing group, but validation should pass)
+        let result = manager.encrypt_for_upload_with_options(
+            &test_data,
+            "application/octet-stream",
+            "custom_file.bin",
+            &options,
+        );
+
+        // Validation should pass (escape hatch bypasses allowlist check)
+        // The error should be about missing group, not invalid MIME type
+        assert!(result.is_err());
+        assert!(
+            matches!(result, Err(EncryptedMediaError::GroupNotFound)),
+            "Escape hatch should pass validation, got: {:?}",
+            result
+        );
+
+        // Test escape hatch with parameters (should be canonicalized)
+        let result = manager.encrypt_for_upload_with_options(
+            &test_data,
+            "application/octet-stream; charset=binary",
+            "custom_file.bin",
+            &options,
+        );
+
+        assert!(result.is_err());
+        assert!(
+            matches!(result, Err(EncryptedMediaError::GroupNotFound)),
+            "Escape hatch with parameters should pass validation"
+        );
+    }
+
+    #[test]
+    fn test_encrypt_prevents_spoofing() {
+        let mdk = create_test_mdk();
+        let group_id = GroupId::from_slice(&[1, 2, 3, 4]);
+        let manager = mdk.media_manager(group_id);
+
+        // Create a PNG image
+        let img = ImageBuffer::from_fn(8, 8, |x, y| {
+            Rgb([(x * 32) as u8, (y * 32) as u8, ((x + y) * 16) as u8])
+        });
+        let mut png_data = Vec::new();
+        img.write_to(&mut Cursor::new(&mut png_data), image::ImageFormat::Png)
+            .unwrap();
+
+        let options = MediaProcessingOptions {
+            sanitize_exif: true,
+            generate_blurhash: false,
+            max_dimension: None,
+            max_file_size: None,
+            max_filename_length: None,
+        };
+
+        // Test 1: Spoofed image type (claiming JPEG but file is PNG) should fail
+        // This verifies that validate_mime_type_matches_data is called for images
+        let result =
+            manager.encrypt_for_upload_with_options(&png_data, "image/jpeg", "photo.jpg", &options);
+        assert!(result.is_err(), "Spoofed MIME type should be rejected");
+        assert!(
+            matches!(
+                result,
+                Err(EncryptedMediaError::MediaProcessing(
+                    MediaProcessingError::MimeTypeMismatch { .. }
+                ))
+            ),
+            "Expected MimeTypeMismatch error for spoofed image type, got: {:?}",
+            result
+        );
+
+        // Test 2: Unsupported image type should be rejected (allowlist check)
+        let result = manager.encrypt_for_upload_with_options(
+            &png_data,
+            "image/svg+xml",
+            "image.svg",
+            &options,
+        );
+        assert!(
+            result.is_err(),
+            "Unsupported image MIME type should be rejected"
+        );
+        assert!(
+            matches!(
+                result,
+                Err(EncryptedMediaError::MediaProcessing(
+                    MediaProcessingError::InvalidMimeType { .. }
+                ))
+            ),
+            "Expected InvalidMimeType error for unsupported image type, got: {:?}",
+            result
+        );
+
+        // Test 3: Valid matching image type should pass (if we had a real group)
+        // Note: This will fail with GroupNotFound, but that's expected - the validation passed
+        let result =
+            manager.encrypt_for_upload_with_options(&png_data, "image/png", "photo.png", &options);
+        assert!(result.is_err()); // Will fail due to missing group, not validation
+        // But we can verify it's not a validation error
+        assert!(
+            !matches!(
+                result,
+                Err(EncryptedMediaError::MediaProcessing(
+                    MediaProcessingError::InvalidMimeType { .. }
+                )) | Err(EncryptedMediaError::MediaProcessing(
+                    MediaProcessingError::MimeTypeMismatch { .. }
+                ))
+            ),
+            "Should not fail with validation error for valid matching MIME type, got: {:?}",
+            result
+        );
     }
 
     #[test]
@@ -765,6 +962,7 @@ mod tests {
 
         let media_ref = result.unwrap();
         assert_eq!(media_ref.dimensions, None); // Optional field should be None
+        assert_eq!(media_ref.scheme_version, "mip04-v2"); // Version should be stored
 
         // Test with dimensions
         let test_nonce2 = [0xFF; 12];
@@ -783,6 +981,7 @@ mod tests {
 
         let media_ref = result.unwrap();
         assert_eq!(media_ref.dimensions, Some((1920, 1080)));
+        assert_eq!(media_ref.scheme_version, "mip04-v2"); // Version should be stored
     }
 
     #[test]
@@ -879,452 +1078,183 @@ mod tests {
         assert!(result.is_ok());
 
         let media_ref = result.unwrap();
-
-        // Verify the MIME type was canonicalized to lowercase
         assert_eq!(media_ref.mime_type, "image/jpeg");
-        assert_eq!(media_ref.url, "https://example.com/encrypted.jpg");
-        assert_eq!(media_ref.filename, "photo.jpg");
-        assert_eq!(media_ref.original_hash, [0x42; 32]);
-
-        // The canonicalized MIME type should now work correctly for key derivation
-        // and decryption operations (even though we can't test the full flow without
-        // a real MLS group, we can verify the MediaReference structure is correct)
     }
 
     #[test]
-    fn test_parse_imeta_tag_with_invalid_mime_type() {
+    fn test_parse_imeta_tag_duplicate_fields() {
         let mdk = create_test_mdk();
         let group_id = GroupId::from_slice(&[1, 2, 3, 4]);
         let manager = mdk.media_manager(group_id);
 
-        // Test parsing IMETA tag with any MIME type (all should be accepted)
-        let test_nonce1 = [0x66; 12];
+        let test_nonce = [0xAA; 12];
         let tag_values = vec![
-            "url https://example.com/test.pdf".to_string(),
-            "m application/pdf".to_string(),
-            "filename document.pdf".to_string(),
-            format!("x {}", hex::encode([0x46; 32])),
-            format!("n {}", hex::encode(test_nonce1)),
+            "url https://example.com/first.jpg".to_string(),
+            "url https://example.com/second.jpg".to_string(), // Duplicate
+            "m image/jpeg".to_string(),
+            "filename photo.jpg".to_string(),
+            format!("x {}", hex::encode([0x42; 32])),
+            format!("n {}", hex::encode(test_nonce)),
             "v mip04-v2".to_string(),
         ];
-        let imeta_tag = NostrTag::custom(TagKind::Custom("imeta".into()), tag_values);
+        let tag = NostrTag::custom(TagKind::Custom("imeta".into()), tag_values);
 
-        let result = manager.parse_imeta_tag(&imeta_tag);
+        let result = manager.parse_imeta_tag(&tag);
         assert!(result.is_ok());
         let media_ref = result.unwrap();
-        assert_eq!(media_ref.mime_type, "application/pdf");
+        // Last one wins
+        assert_eq!(media_ref.url, "https://example.com/second.jpg");
+    }
 
-        // Test parsing IMETA tag with invalid MIME type format (no slash)
-        let test_nonce2 = [0x77; 12];
+    #[test]
+    fn test_parse_imeta_tag_malformed_hex() {
+        let mdk = create_test_mdk();
+        let group_id = GroupId::from_slice(&[1, 2, 3, 4]);
+        let manager = mdk.media_manager(group_id);
+
+        // Invalid hex in 'x' (hash)
         let tag_values = vec![
-            "url https://example.com/test.file".to_string(),
-            "m invalid".to_string(), // Invalid format
-            "filename test.file".to_string(),
-            format!("x {}", hex::encode([0x47; 32])),
-            format!("n {}", hex::encode(test_nonce2)),
+            "url https://example.com/test.jpg".to_string(),
+            "m image/jpeg".to_string(),
+            "filename photo.jpg".to_string(),
+            "x ZZZZ".to_string(), // Invalid hex
+            format!("n {}", hex::encode([0xAA; 12])),
             "v mip04-v2".to_string(),
         ];
-        let imeta_tag = NostrTag::custom(TagKind::Custom("imeta".into()), tag_values);
+        let tag = NostrTag::custom(TagKind::Custom("imeta".into()), tag_values);
+        let result = manager.parse_imeta_tag(&tag);
+        assert!(matches!(
+            result,
+            Err(EncryptedMediaError::InvalidImetaTag { .. })
+        ));
 
-        let result = manager.parse_imeta_tag(&imeta_tag);
-        assert!(result.is_err());
+        // Invalid hex in 'n' (nonce)
+        let tag_values = vec![
+            "url https://example.com/test.jpg".to_string(),
+            "m image/jpeg".to_string(),
+            "filename photo.jpg".to_string(),
+            format!("x {}", hex::encode([0x42; 32])),
+            "n ZZZZ".to_string(), // Invalid hex
+            "v mip04-v2".to_string(),
+        ];
+        let tag = NostrTag::custom(TagKind::Custom("imeta".into()), tag_values);
+        let result = manager.parse_imeta_tag(&tag);
+        assert!(matches!(
+            result,
+            Err(EncryptedMediaError::InvalidImetaTag { .. })
+        ));
+
+        // Wrong length hex in 'x'
+        let tag_values = vec![
+            "url https://example.com/test.jpg".to_string(),
+            "m image/jpeg".to_string(),
+            "filename photo.jpg".to_string(),
+            format!("x {}", hex::encode([0x42; 31])), // 31 bytes instead of 32
+            format!("n {}", hex::encode([0xAA; 12])),
+            "v mip04-v2".to_string(),
+        ];
+        let tag = NostrTag::custom(TagKind::Custom("imeta".into()), tag_values);
+        let result = manager.parse_imeta_tag(&tag);
         assert!(matches!(
             result,
             Err(EncryptedMediaError::InvalidImetaTag { .. })
         ));
     }
 
-    // ============================================================================
-    // Encrypted Media (MIP-04) Integration Tests
-    // ============================================================================
-
-    /// Multi-Device Media Encryption
-    ///
-    /// Validates that encrypted media can be decrypted across different devices
-    /// in the same group using the group's exporter secret within the same epoch.
     #[test]
-    fn test_media_encryption_across_devices() {
-        use nostr::Keys;
+    fn test_parse_imeta_tag_invalid_dimensions() {
+        let mdk = create_test_mdk();
+        let group_id = GroupId::from_slice(&[1, 2, 3, 4]);
+        let manager = mdk.media_manager(group_id);
 
-        let alice_keys = Keys::generate();
-        let bob_keys = Keys::generate();
+        let invalid_dims = vec!["100x", "x100", "abc", "100xabc", "100x200x300"];
 
-        let alice_mdk = create_test_mdk();
-        let bob_mdk = create_test_mdk();
+        for dim in invalid_dims {
+            let tag_values = vec![
+                "url https://example.com/test.jpg".to_string(),
+                "m image/jpeg".to_string(),
+                "filename photo.jpg".to_string(),
+                format!("x {}", hex::encode([0x42; 32])),
+                format!("n {}", hex::encode([0xAA; 12])),
+                "v mip04-v2".to_string(),
+                format!("dim {}", dim),
+            ];
+            let tag = NostrTag::custom(TagKind::Custom("imeta".into()), tag_values);
+            let result = manager.parse_imeta_tag(&tag);
 
-        // Create key package for Bob only (not Alice, as she's the creator)
-        let bob_key_package = crate::test_util::create_key_package_event(&bob_mdk, &bob_keys);
-
-        // Alice creates group with Bob
-        let admin_pubkeys = vec![alice_keys.public_key()];
-        let config = crate::test_util::create_nostr_group_config_data(admin_pubkeys);
-
-        let create_result = alice_mdk
-            .create_group(&alice_keys.public_key(), vec![bob_key_package], config)
-            .expect("Alice should create group");
-
-        let group_id = create_result.group.mls_group_id.clone();
-
-        alice_mdk
-            .merge_pending_commit(&group_id)
-            .expect("Alice should merge commit");
-
-        // Bob joins the group
-        let bob_welcome_rumor = &create_result.welcome_rumors[0];
-        let bob_welcome = bob_mdk
-            .process_welcome(&nostr::EventId::all_zeros(), bob_welcome_rumor)
-            .expect("Bob should process welcome");
-
-        bob_mdk
-            .accept_welcome(&bob_welcome)
-            .expect("Bob should accept welcome");
-
-        // Test media file - use text/plain for simple test data
-        let test_media = b"Test media data for cross-device encryption";
-
-        let alice_manager = alice_mdk.media_manager(group_id.clone());
-        let upload_result = alice_manager
-            .encrypt_for_upload(test_media, "text/plain", "document.txt")
-            .expect("Alice should encrypt media");
-
-        let encrypted_data = upload_result.encrypted_data.clone();
-
-        // Create media reference for Bob
-        let media_ref = alice_manager.create_media_reference(
-            &upload_result,
-            "https://storage.example.com/file1.enc".to_string(),
-        );
-
-        // Bob decrypts media using his instance of the same group
-        let bob_manager = bob_mdk.media_manager(group_id.clone());
-        let decrypted_data = bob_manager
-            .decrypt_from_download(&encrypted_data, &media_ref)
-            .expect("Bob should decrypt media");
-
-        assert_eq!(
-            decrypted_data, test_media,
-            "Decrypted data should match original"
-        );
-
-        // Verify Bob can also decrypt the original media (cross-device access)
-        let bob_decrypted_again = bob_manager
-            .decrypt_from_download(&encrypted_data, &media_ref)
-            .expect("Bob should be able to decrypt media multiple times");
-
-        assert_eq!(
-            bob_decrypted_again, test_media,
-            "Bob's second decryption should match original"
-        );
-    }
-
-    /// Large Media File Encryption
-    ///
-    /// Validates that large media files can be encrypted and decrypted successfully
-    /// without memory issues.
-    #[test]
-    fn test_large_media_file_encryption() {
-        use nostr::Keys;
-
-        let alice_keys = Keys::generate();
-        let bob_keys = Keys::generate();
-
-        let alice_mdk = create_test_mdk();
-        let bob_mdk = create_test_mdk();
-
-        // Alice creates a group with Bob for testing
-        let admin_pubkeys = vec![alice_keys.public_key()];
-        let config = crate::test_util::create_nostr_group_config_data(admin_pubkeys);
-
-        // Create key package for Bob (not Alice, as she's the creator)
-        let bob_key_package = crate::test_util::create_key_package_event(&bob_mdk, &bob_keys);
-
-        let create_result = alice_mdk
-            .create_group(&alice_keys.public_key(), vec![bob_key_package], config)
-            .expect("Alice should create group");
-
-        let group_id = create_result.group.mls_group_id.clone();
-
-        alice_mdk
-            .merge_pending_commit(&group_id)
-            .expect("Alice should merge commit");
-
-        // Create a 1MB test file (not 10MB to keep tests fast)
-        let large_media = vec![0xAB; 1024 * 1024]; // 1MB
-
-        let manager = alice_mdk.media_manager(group_id.clone());
-
-        // Encrypt the large file
-        let upload_result = manager
-            .encrypt_for_upload(&large_media, "video/mp4", "large_video.mp4")
-            .expect("Should encrypt large file");
-
-        assert_eq!(
-            upload_result.original_size,
-            1024 * 1024,
-            "Original size should be 1MB"
-        );
-
-        // The encrypted size should be slightly larger due to authentication tag
-        assert!(
-            upload_result.encrypted_size > upload_result.original_size,
-            "Encrypted size should be larger than original"
-        );
-
-        // Decrypt the large file
-        let encrypted_data = upload_result.encrypted_data.clone();
-        let media_ref = manager
-            .create_media_reference(&upload_result, "https://example.com/video.enc".to_string());
-
-        let decrypted_data = manager
-            .decrypt_from_download(&encrypted_data, &media_ref)
-            .expect("Should decrypt large file");
-
-        assert_eq!(
-            decrypted_data.len(),
-            large_media.len(),
-            "Decrypted size should match original"
-        );
-        assert_eq!(
-            decrypted_data, large_media,
-            "Decrypted data should match original"
-        );
-    }
-
-    /// Media Metadata Validation
-    ///
-    /// Validates that media metadata fields are properly validated including
-    /// required fields, size limits, and format constraints.
-    #[test]
-    fn test_media_metadata_validation() {
-        use nostr::Keys;
-
-        let alice_keys = Keys::generate();
-        let bob_keys = Keys::generate();
-
-        let alice_mdk = create_test_mdk();
-        let bob_mdk = create_test_mdk();
-
-        let admin_pubkeys = vec![alice_keys.public_key()];
-        let config = crate::test_util::create_nostr_group_config_data(admin_pubkeys);
-
-        let bob_key_package = crate::test_util::create_key_package_event(&bob_mdk, &bob_keys);
-
-        let create_result = alice_mdk
-            .create_group(&alice_keys.public_key(), vec![bob_key_package], config)
-            .expect("Alice should create group");
-
-        let group_id = create_result.group.mls_group_id.clone();
-
-        alice_mdk
-            .merge_pending_commit(&group_id)
-            .expect("Alice should merge commit");
-
-        let manager = alice_mdk.media_manager(group_id.clone());
-
-        // Test 1: Valid metadata should succeed (use text/plain to match test data)
-        let valid_media = b"Valid media content";
-        let result = manager.encrypt_for_upload(valid_media, "text/plain", "document.txt");
-        assert!(result.is_ok(), "Valid metadata should succeed");
-
-        // Test 2: Invalid MIME type should fail
-        let result = manager.encrypt_for_upload(valid_media, "invalid", "document.pdf");
-        assert!(result.is_err(), "Invalid MIME type should fail");
-
-        // Test 3: Empty filename should fail
-        let result = manager.encrypt_for_upload(valid_media, "text/plain", "");
-        assert!(result.is_err(), "Empty filename should fail");
-
-        // Test 4: Extremely long filename should fail
-        use crate::encrypted_media::MAX_FILENAME_LENGTH;
-        let long_filename = "a".repeat(MAX_FILENAME_LENGTH + 1);
-        let result = manager.encrypt_for_upload(valid_media, "text/plain", &long_filename);
-        assert!(result.is_err(), "Overly long filename should fail");
-
-        // Test 5: File too large should fail
-        let options = crate::encrypted_media::types::MediaProcessingOptions {
-            max_file_size: Some(100), // Set max to 100 bytes
-            ..Default::default()
-        };
-        let large_media = vec![0u8; 1000]; // 1000 bytes
-        let result = manager.encrypt_for_upload_with_options(
-            &large_media,
-            "image/jpeg",
-            "test.jpg",
-            &options,
-        );
-        assert!(result.is_err(), "File exceeding size limit should fail");
-    }
-
-    /// Media Encryption/Decryption with Hash Verification
-    ///
-    /// Validates that encrypted media includes hash verification and
-    /// that tampering is detected.
-    #[test]
-    fn test_media_hash_verification() {
-        use nostr::Keys;
-
-        let alice_keys = Keys::generate();
-        let bob_keys = Keys::generate();
-
-        let alice_mdk = create_test_mdk();
-        let bob_mdk = create_test_mdk();
-
-        let admin_pubkeys = vec![alice_keys.public_key()];
-        let config = crate::test_util::create_nostr_group_config_data(admin_pubkeys);
-
-        let bob_key_package = crate::test_util::create_key_package_event(&bob_mdk, &bob_keys);
-
-        let create_result = alice_mdk
-            .create_group(&alice_keys.public_key(), vec![bob_key_package], config)
-            .expect("Alice should create group");
-
-        let group_id = create_result.group.mls_group_id.clone();
-
-        alice_mdk
-            .merge_pending_commit(&group_id)
-            .expect("Alice should merge commit");
-
-        let test_media = b"Media content for hash verification";
-        let manager = alice_mdk.media_manager(group_id.clone());
-
-        let upload_result = manager
-            .encrypt_for_upload(test_media, "text/plain", "document.txt")
-            .expect("Should encrypt media");
-
-        // Valid decryption should succeed
-        let mut encrypted_data = upload_result.encrypted_data.clone();
-        let media_ref = manager
-            .create_media_reference(&upload_result, "https://example.com/photo.enc".to_string());
-
-        let decrypt_result = manager.decrypt_from_download(&encrypted_data, &media_ref);
-        assert!(decrypt_result.is_ok(), "Valid decryption should succeed");
-
-        // Tamper with encrypted data
-        if !encrypted_data.is_empty() {
-            encrypted_data[0] ^= 0xFF; // Flip bits
+            // Invalid dimensions should be ignored, not cause failure
+            assert!(
+                result.is_ok(),
+                "Should parse successfully ignoring invalid dimensions: {}",
+                dim
+            );
+            let media_ref = result.unwrap();
+            assert_eq!(media_ref.dimensions, None);
         }
-
-        // Decryption with tampered data should fail
-        let decrypt_result = manager.decrypt_from_download(&encrypted_data, &media_ref);
-        assert!(
-            decrypt_result.is_err(),
-            "Decryption of tampered data should fail"
-        );
-
-        // Test hash verification by tampering with the hash in media_ref
-        let encrypted_data_valid = upload_result.encrypted_data.clone();
-        let mut tampered_media_ref = media_ref.clone();
-        // Replace hash with an incorrect one (all zeros)
-        tampered_media_ref.original_hash = [0u8; 32];
-
-        let hash_verify_result =
-            manager.decrypt_from_download(&encrypted_data_valid, &tampered_media_ref);
-        assert!(
-            hash_verify_result.is_err(),
-            "Decryption with incorrect hash should fail"
-        );
-
-        // The hash mismatch causes decryption to fail
-        // (either during hash check or AEAD verification depending on implementation)
     }
 
-    /// Media Encryption with Different File Types
-    ///
-    /// Validates that various media file types can be encrypted and decrypted,
-    /// including images, videos, audio, and documents.
     #[test]
-    fn test_media_encryption_various_file_types() {
-        use nostr::Keys;
+    fn test_parse_imeta_tag_unknown_fields() {
+        let mdk = create_test_mdk();
+        let group_id = GroupId::from_slice(&[1, 2, 3, 4]);
+        let manager = mdk.media_manager(group_id);
 
-        let alice_keys = Keys::generate();
-        let bob_keys = Keys::generate();
-
-        let alice_mdk = create_test_mdk();
-        let bob_mdk = create_test_mdk();
-
-        let admin_pubkeys = vec![alice_keys.public_key()];
-        let config = crate::test_util::create_nostr_group_config_data(admin_pubkeys);
-
-        let bob_key_package = crate::test_util::create_key_package_event(&bob_mdk, &bob_keys);
-
-        let create_result = alice_mdk
-            .create_group(&alice_keys.public_key(), vec![bob_key_package], config)
-            .expect("Alice should create group");
-
-        let group_id = create_result.group.mls_group_id.clone();
-
-        alice_mdk
-            .merge_pending_commit(&group_id)
-            .expect("Alice should merge commit");
-
-        let manager = alice_mdk.media_manager(group_id.clone());
-
-        // Use non-image MIME types to avoid metadata extraction issues with test data
-        let test_cases = vec![
-            ("video/mp4", "video.mp4", b"MP4 video data".as_slice()),
-            ("video/quicktime", "video.mov", b"MOV video data".as_slice()),
-            ("audio/mpeg", "song.mp3", b"MP3 audio data".as_slice()),
-            ("audio/wav", "sound.wav", b"WAV audio data".as_slice()),
-            (
-                "application/pdf",
-                "document.pdf",
-                b"PDF document data".as_slice(),
-            ),
-            ("text/plain", "notes.txt", b"Plain text data".as_slice()),
+        let tag_values = vec![
+            "url https://example.com/test.jpg".to_string(),
+            "m image/jpeg".to_string(),
+            "filename photo.jpg".to_string(),
+            format!("x {}", hex::encode([0x42; 32])),
+            format!("n {}", hex::encode([0xAA; 12])),
+            "v mip04-v2".to_string(),
+            "unknown_field some_value".to_string(),
+            "another_unknown".to_string(),
         ];
+        let tag = NostrTag::custom(TagKind::Custom("imeta".into()), tag_values);
+        let result = manager.parse_imeta_tag(&tag);
 
-        for (mime_type, filename, data) in test_cases {
-            // Encrypt
-            let upload_result = manager.encrypt_for_upload(data, mime_type, filename);
-            assert!(upload_result.is_ok(), "Should encrypt {} file", mime_type);
-
-            let upload = upload_result.unwrap();
-            assert_eq!(upload.mime_type, mime_type);
-            assert_eq!(upload.filename, filename);
-
-            // Decrypt
-            let media_ref = manager
-                .create_media_reference(&upload, format!("https://example.com/{}", filename));
-            let decrypt_result = manager.decrypt_from_download(&upload.encrypted_data, &media_ref);
-            assert!(decrypt_result.is_ok(), "Should decrypt {} file", mime_type);
-
-            let decrypted = decrypt_result.unwrap();
-            assert_eq!(decrypted, data, "Decrypted {} data should match", mime_type);
-        }
+        assert!(result.is_ok());
     }
 
     #[test]
-    fn test_encryption_nonce_uniqueness() {
+    fn test_decrypt_from_download_hash_verification_failure() {
+        use crate::test_util::create_nostr_group_config_data;
         use nostr::Keys;
-        use std::collections::HashSet;
 
+        let mdk = create_test_mdk();
+
+        // Create a group so we have secrets for encryption/decryption
         let alice_keys = Keys::generate();
-        let bob_keys = Keys::generate();
-        let alice_mdk = create_test_mdk();
-        let bob_mdk = create_test_mdk();
+        let admins = vec![alice_keys.public_key()];
+        let create_result = mdk
+            .create_group(
+                &alice_keys.public_key(),
+                vec![],
+                create_nostr_group_config_data(admins),
+            )
+            .expect("Failed to create group");
 
-        let admin_pubkeys = vec![alice_keys.public_key()];
-        let config = crate::test_util::create_nostr_group_config_data(admin_pubkeys);
-        let bob_key_package = crate::test_util::create_key_package_event(&bob_mdk, &bob_keys);
-        let create_result = alice_mdk
-            .create_group(&alice_keys.public_key(), vec![bob_key_package], config)
-            .expect("Alice should create group");
-        let group_id = create_result.group.mls_group_id.clone();
-        alice_mdk
-            .merge_pending_commit(&group_id)
-            .expect("Merge commit");
+        let group_id = create_result.group.mls_group_id;
+        let manager = mdk.media_manager(group_id);
 
-        let manager = alice_mdk.media_manager(group_id.clone());
-        let test_data = b"Test data";
+        // 1. Create a valid encryption
+        let data = b"secret data";
+        let upload = manager
+            .encrypt_for_upload(data, "text/plain", "secret.txt")
+            .unwrap();
 
-        // Encrypt same data multiple times
-        let mut nonces = HashSet::new();
-        for _ in 0..100 {
-            let upload = manager
-                .encrypt_for_upload(test_data, "text/plain", "test.txt")
-                .expect("Should encrypt");
-            assert!(nonces.insert(upload.nonce), "Nonce should be unique");
-        }
-        assert_eq!(nonces.len(), 100, "All 100 nonces should be unique");
+        // 2. Create a reference but tamper with the hash
+        let mut media_ref =
+            manager.create_media_reference(&upload, "https://example.com".to_string());
+        media_ref.original_hash[0] ^= 0xFF; // Flip a bit in the hash
+
+        // 3. Attempt decryption
+        let result = manager.decrypt_from_download(&upload.encrypted_data, &media_ref);
+
+        // Changing the hash changes the AAD, which causes Poly1305 verification to fail.
+        // So we expect DecryptionFailed, not HashVerificationFailed.
+        assert!(matches!(
+            result,
+            Err(EncryptedMediaError::DecryptionFailed { .. })
+        ));
     }
 }

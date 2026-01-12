@@ -468,7 +468,9 @@ pub fn prepare_group_image_for_upload_with_options(
 
     // Validate and canonicalize MIME type, ensuring it matches the actual file data
     // This protects against MIME type confusion attacks
-    let canonical_mime_type = validation::validate_mime_type_matches_data(image_data, mime_type)?;
+    // Use strict validation for group images (no escape hatch allowed)
+    let canonical_mime_type =
+        validation::validate_group_image_mime_type_matches_data(image_data, mime_type)?;
 
     let original_size = image_data.len();
     let sanitized_data: Vec<u8>;

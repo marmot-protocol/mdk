@@ -85,23 +85,30 @@ impl<Storage> MDK<Storage>
 where
     Storage: MdkStorageProvider,
 {
-    /// Retrieves a message by its Nostr event ID
+    /// Retrieves a message by its Nostr event ID within a specific group
     ///
-    /// This function looks up a message in storage using its associated Nostr event ID.
-    /// The message must have been previously processed and stored.
+    /// This function looks up a message in storage using its associated Nostr event ID
+    /// and MLS group ID. The message must have been previously processed and stored.
+    /// Requiring both the event ID and group ID prevents messages from different groups
+    /// from overwriting each other.
     ///
     /// # Arguments
     ///
+    /// * `mls_group_id` - The MLS group ID the message belongs to
     /// * `event_id` - The Nostr event ID to look up
     ///
     /// # Returns
     ///
     /// * `Ok(Some(Message))` - The message if found
-    /// * `Ok(None)` - If no message exists with the given event ID
+    /// * `Ok(None)` - If no message exists with the given event ID in the specified group
     /// * `Err(Error)` - If there is an error accessing storage
-    pub fn get_message(&self, event_id: &EventId) -> Result<Option<message_types::Message>> {
+    pub fn get_message(
+        &self,
+        mls_group_id: &GroupId,
+        event_id: &EventId,
+    ) -> Result<Option<message_types::Message>> {
         self.storage()
-            .find_message_by_event_id(event_id)
+            .find_message_by_event_id(mls_group_id, event_id)
             .map_err(|e| Error::Message(e.to_string()))
     }
 
@@ -1447,7 +1454,7 @@ where
                             .ok_or(Error::Message("Message event ID not found".to_string()))?;
 
                         let mut message = self
-                            .get_message(&message_event_id)?
+                            .get_message(&group.mls_group_id, &message_event_id)?
                             .ok_or(Error::Message("Message not found".to_string()))?;
 
                         message.state = message_types::MessageState::Processed;
@@ -1462,7 +1469,7 @@ where
 
                         tracing::debug!(target: "mdk_core::messages::process_message", "Updated state of own cached message");
                         let message = self
-                            .get_message(&message_event_id)?
+                            .get_message(&group.mls_group_id, &message_event_id)?
                             .ok_or(Error::MessageNotFound)?;
                         Ok(MessageProcessingResult::ApplicationMessage(message))
                     }
@@ -1832,9 +1839,11 @@ mod tests {
     #[test]
     fn test_get_message_not_found() {
         let mdk = create_test_mdk();
+        let (creator, members, admins) = create_test_group_members();
+        let group_id = create_test_group(&mdk, &creator, &members, &admins);
         let non_existent_event_id = EventId::all_zeros();
 
-        let result = mdk.get_message(&non_existent_event_id);
+        let result = mdk.get_message(&group_id, &non_existent_event_id);
         assert!(result.is_ok());
         assert!(result.unwrap().is_none());
     }
@@ -1928,7 +1937,7 @@ mod tests {
 
         // Verify the message was stored
         let stored_message = mdk
-            .get_message(&rumor_id)
+            .get_message(&group_id, &rumor_id)
             .expect("Failed to get message")
             .expect("Message should exist");
 
@@ -2070,7 +2079,7 @@ mod tests {
 
         // Verify initial state
         let message = mdk
-            .get_message(&rumor_id)
+            .get_message(&group_id, &rumor_id)
             .expect("Failed to get message")
             .expect("Message should exist");
 
@@ -2217,7 +2226,7 @@ mod tests {
                 .expect("Failed to create message");
 
             let stored_message = mdk
-                .get_message(&rumor_id)
+                .get_message(&group_id, &rumor_id)
                 .expect("Failed to get message")
                 .expect("Message should exist");
 
@@ -3555,9 +3564,11 @@ mod tests {
     #[test]
     fn test_get_nonexistent_message() {
         let mdk = create_test_mdk();
+        let (creator, members, admins) = create_test_group_members();
+        let group_id = create_test_group(&mdk, &creator, &members, &admins);
         let non_existent_id = nostr::EventId::all_zeros();
 
-        let result = mdk.get_message(&non_existent_id);
+        let result = mdk.get_message(&group_id, &non_existent_id);
 
         assert!(result.is_ok(), "Should succeed");
         assert!(
@@ -3582,7 +3593,7 @@ mod tests {
 
         // Check initial state
         let message = mdk
-            .get_message(&rumor_id)
+            .get_message(&group_id, &rumor_id)
             .expect("Failed to get message")
             .expect("Message should exist");
         assert_eq!(
@@ -3773,7 +3784,7 @@ mod tests {
         // Verify messages can be retrieved by their IDs
         for msg in &messages {
             let retrieved = mdk
-                .get_message(&msg.id)
+                .get_message(&msg.mls_group_id, &msg.id)
                 .expect("Failed to get message")
                 .expect("Message should exist");
             assert_eq!(retrieved.id, msg.id, "Retrieved message should match");

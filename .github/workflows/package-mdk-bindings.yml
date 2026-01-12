@@ -121,6 +121,16 @@ jobs:
         rustup target add aarch64-apple-ios
         rustup target add aarch64-apple-ios-sim
 
+    - name: Install OpenSSL (Windows)
+      if: runner.os == 'Windows'
+      shell: powershell
+      run: |
+        echo "Installing OpenSSL via vcpkg..."
+        vcpkg install openssl:x64-windows-static
+        vcpkg integrate install
+        echo "OPENSSL_DIR=C:\vcpkg\packages\openssl_x64-windows-static" >> $env:GITHUB_ENV
+        echo "OPENSSL_STATIC=1" >> $env:GITHUB_ENV
+
     - name: Cache Rust dependencies
       uses: Swatinem/rust-cache@v2
 
@@ -321,6 +331,16 @@ jobs:
       run: |
         rustup target add aarch64-apple-ios
         rustup target add aarch64-apple-ios-sim
+
+    - name: Install OpenSSL (Windows)
+      if: runner.os == 'Windows'
+      shell: powershell
+      run: |
+        echo "Installing OpenSSL via vcpkg..."
+        vcpkg install openssl:x64-windows-static
+        vcpkg integrate install
+        echo "OPENSSL_DIR=C:\vcpkg\packages\openssl_x64-windows-static" >> $env:GITHUB_ENV
+        echo "OPENSSL_STATIC=1" >> $env:GITHUB_ENV
 
     - name: Cache Rust dependencies
       uses: Swatinem/rust-cache@v2
