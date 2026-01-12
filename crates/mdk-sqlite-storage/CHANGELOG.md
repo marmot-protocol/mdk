@@ -32,6 +32,7 @@
 
 ### Changed
 
+- Added `refinery-core` dependency to handle OpenMLS migration errors from newer refinery versions
 - **Storage Security**: Updated storage operations to use `Secret<T>` wrapper for secret values, ensuring automatic memory zeroization when values are dropped ([#109](https://github.com/marmot-protocol/mdk/pull/109))
 - SQLite is now built with SQLCipher support (`bundled-sqlcipher`) instead of plain SQLite (`bundled`), enabling transparent AES-256 encryption at rest ([#102](https://github.com/marmot-protocol/mdk/pull/102))
 - Simplified validation logic to use range contains pattern for better readability ([#111](https://github.com/marmot-protocol/mdk/pull/111))
