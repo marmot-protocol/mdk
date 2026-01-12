@@ -11,6 +11,8 @@ use openmls_memory_storage::MemoryStorage;
 
 #[cfg(test)]
 use mdk_storage_traits::GroupId;
+#[cfg(test)]
+use mdk_storage_traits::groups::types::{Group, GroupState};
 use mdk_storage_traits::messages::MessageStorage;
 use mdk_storage_traits::messages::error::MessageError;
 use mdk_storage_traits::messages::types::*;
@@ -90,7 +92,26 @@ impl MessageStorage for MdkMemoryStorage {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
+
+    fn create_test_group(group_id: GroupId) -> Group {
+        Group {
+            mls_group_id: group_id.clone(),
+            nostr_group_id: [0u8; 32],
+            name: "Test Group".to_string(),
+            description: "A test group".to_string(),
+            admin_pubkeys: BTreeSet::new(),
+            last_message_id: None,
+            last_message_at: None,
+            epoch: 0,
+            state: GroupState::Active,
+            image_hash: None,
+            image_key: None,
+            image_nonce: None,
+        }
+    }
 
     fn create_test_message(
         event_id: EventId,
@@ -130,6 +151,10 @@ mod tests {
 
         let group_id = GroupId::from_slice(&[1, 2, 3, 4]);
         let event_id = EventId::from_slice(&[10u8; 32]).unwrap();
+
+        // Create the group first
+        let group = create_test_group(group_id.clone());
+        storage.save_group(group).unwrap();
 
         // Save initial message
         let message1 = create_test_message(event_id, group_id.clone(), "Original content", 1000);
@@ -184,6 +209,12 @@ mod tests {
 
         let group1_id = GroupId::from_slice(&[1, 1, 1, 1]);
         let group2_id = GroupId::from_slice(&[2, 2, 2, 2]);
+
+        // Create the groups first
+        let group1 = create_test_group(group1_id.clone());
+        storage.save_group(group1).unwrap();
+        let group2 = create_test_group(group2_id.clone());
+        storage.save_group(group2).unwrap();
 
         // Save messages to group 1
         for i in 0..3 {
@@ -249,6 +280,10 @@ mod tests {
         let group_id = GroupId::from_slice(&[1, 2, 3, 4]);
         let event_id = EventId::from_slice(&[50u8; 32]).unwrap();
 
+        // Create the group first
+        let group = create_test_group(group_id.clone());
+        storage.save_group(group).unwrap();
+
         // Perform multiple updates to the same message
         for i in 0..10 {
             let message = create_test_message(
@@ -286,6 +321,10 @@ mod tests {
 
         let group_id = GroupId::from_slice(&[1, 2, 3, 4]);
         let event_id = EventId::from_slice(&[75u8; 32]).unwrap();
+
+        // Create the group first
+        let group = create_test_group(group_id.clone());
+        storage.save_group(group).unwrap();
 
         // Save message with Created state
         let mut message = create_test_message(event_id, group_id.clone(), "Test content", 1000);
