@@ -1578,6 +1578,137 @@ mod tests {
         }
     }
 
+    /// Test that uppercase hex digits are accepted (case-insensitive comparison)
+    #[test]
+    fn test_validate_uppercase_hex_values() {
+        let mdk = create_test_mdk();
+        let test_pubkey =
+            PublicKey::from_hex("884704bd421671e01c13f854d2ce23ce2a5bfe9562f4f297ad2bc921ba30c3a6")
+                .unwrap();
+
+        let (key_package_hex, _) = mdk
+            .create_key_package_for_event(&test_pubkey, vec![])
+            .expect("Failed to create key package");
+
+        // Test uppercase hex digits in extensions (case-insensitive comparison)
+        {
+            let tags = vec![
+                Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
+                Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
+                Tag::custom(TagKind::MlsExtensions, ["0x000A", "0xF2EE"]), // Uppercase hex digits
+                Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
+            ];
+
+            let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex.clone())
+                .tags(tags)
+                .sign_with_keys(&nostr::Keys::generate())
+                .unwrap();
+
+            let result = mdk.validate_key_package_tags(&event);
+            assert!(
+                result.is_ok(),
+                "Should accept uppercase hex digits in extensions, got error: {:?}",
+                result
+            );
+        }
+
+        // Test mixed case hex digits in extensions
+        {
+            let tags = vec![
+                Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
+                Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
+                Tag::custom(TagKind::MlsExtensions, ["0x000a", "0xF2Ee"]), // Mixed case
+                Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
+            ];
+
+            let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex)
+                .tags(tags)
+                .sign_with_keys(&nostr::Keys::generate())
+                .unwrap();
+
+            let result = mdk.validate_key_package_tags(&event);
+            assert!(
+                result.is_ok(),
+                "Should accept mixed case hex digits in extensions, got error: {:?}",
+                result
+            );
+        }
+    }
+
+    /// Test that ciphersuite tag without value is rejected
+    #[test]
+    fn test_validate_ciphersuite_tag_without_value() {
+        let mdk = create_test_mdk();
+        let test_pubkey =
+            PublicKey::from_hex("884704bd421671e01c13f854d2ce23ce2a5bfe9562f4f297ad2bc921ba30c3a6")
+                .unwrap();
+
+        let (key_package_hex, _) = mdk
+            .create_key_package_for_event(&test_pubkey, vec![])
+            .expect("Failed to create key package");
+
+        let tags = vec![
+            Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
+            Tag::custom(TagKind::MlsCiphersuite, Vec::<&str>::new()), // No value
+            Tag::custom(TagKind::MlsExtensions, ["0x000a", "0xf2ee"]),
+            Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
+        ];
+
+        let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex)
+            .tags(tags)
+            .sign_with_keys(&nostr::Keys::generate())
+            .unwrap();
+
+        let result = mdk.validate_key_package_tags(&event);
+        assert!(
+            result.is_err(),
+            "Should reject ciphersuite tag without value"
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("must have a value")
+        );
+    }
+
+    /// Test that extensions tag without values is rejected
+    #[test]
+    fn test_validate_extensions_tag_without_values() {
+        let mdk = create_test_mdk();
+        let test_pubkey =
+            PublicKey::from_hex("884704bd421671e01c13f854d2ce23ce2a5bfe9562f4f297ad2bc921ba30c3a6")
+                .unwrap();
+
+        let (key_package_hex, _) = mdk
+            .create_key_package_for_event(&test_pubkey, vec![])
+            .expect("Failed to create key package");
+
+        let tags = vec![
+            Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
+            Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
+            Tag::custom(TagKind::MlsExtensions, Vec::<&str>::new()), // No values
+            Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
+        ];
+
+        let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex)
+            .tags(tags)
+            .sign_with_keys(&nostr::Keys::generate())
+            .unwrap();
+
+        let result = mdk.validate_key_package_tags(&event);
+        assert!(
+            result.is_err(),
+            "Should reject extensions tag without values"
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("at least one value")
+        );
+    }
+
     /// Test parsing a complete key package event with valid MIP-00 tags
     #[test]
     fn test_parse_key_package_with_valid_tags() {

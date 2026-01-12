@@ -919,6 +919,49 @@ mod tests {
         );
     }
 
+    /// Test that deserialize_bytes correctly deserializes TLS-encoded extension data
+    #[test]
+    fn test_deserialize_bytes() {
+        use tls_codec::Serialize as TlsSerialize;
+
+        let extension = create_test_extension();
+
+        // Serialize to bytes
+        let raw = extension.as_raw();
+        let serialized_bytes = raw.tls_serialize_detached().unwrap();
+
+        // Deserialize using deserialize_bytes
+        let deserialized = NostrGroupDataExtension::deserialize_bytes(&serialized_bytes).unwrap();
+
+        // Verify all fields are preserved
+        assert_eq!(deserialized.version, extension.version);
+        assert_eq!(deserialized.nostr_group_id, extension.nostr_group_id);
+        assert_eq!(deserialized.name, extension.name);
+        assert_eq!(deserialized.description, extension.description);
+        assert_eq!(deserialized.admins, extension.admins);
+        assert_eq!(deserialized.relays, extension.relays);
+        assert_eq!(deserialized.image_hash, extension.image_hash);
+        assert_eq!(deserialized.image_key, extension.image_key);
+        assert_eq!(deserialized.image_nonce, extension.image_nonce);
+        assert_eq!(deserialized.image_upload_key, extension.image_upload_key);
+    }
+
+    /// Test that deserialize_bytes returns an error for invalid data
+    #[test]
+    fn test_deserialize_bytes_invalid_data() {
+        // Empty bytes should fail
+        let result = NostrGroupDataExtension::deserialize_bytes(&[]);
+        assert!(result.is_err(), "Empty bytes should fail to deserialize");
+
+        // Random garbage should fail
+        let result = NostrGroupDataExtension::deserialize_bytes(&[0x00, 0x01, 0x02, 0x03]);
+        assert!(result.is_err(), "Invalid bytes should fail to deserialize");
+
+        // Truncated data should fail
+        let result = NostrGroupDataExtension::deserialize_bytes(&[0x00, 0x02]); // Just version field
+        assert!(result.is_err(), "Truncated data should fail to deserialize");
+    }
+
     /// Test migration to version 2
     #[test]
     fn test_migrate_to_v2() {
