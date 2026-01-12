@@ -156,7 +156,12 @@ impl NostrGroupDataExtension {
     /// * `Ok(NostrGroupDataExtension)` - Successfully deserialized extension
     /// * `Err(Error)` - Failed to deserialize
     fn deserialize_bytes(bytes: &[u8]) -> Result<Self, Error> {
-        let (deserialized, _) = TlsNostrGroupDataExtension::tls_deserialize_bytes(bytes)?;
+        let (deserialized, remainder) = TlsNostrGroupDataExtension::tls_deserialize_bytes(bytes)?;
+        if !remainder.is_empty() {
+            return Err(Error::ExtensionFormatError(
+                "Trailing bytes in NostrGroupDataExtension".to_string(),
+            ));
+        }
         Self::from_raw(deserialized)
     }
 
@@ -960,6 +965,32 @@ mod tests {
         // Truncated data should fail
         let result = NostrGroupDataExtension::deserialize_bytes(&[0x00, 0x02]); // Just version field
         assert!(result.is_err(), "Truncated data should fail to deserialize");
+    }
+
+    /// Test that deserialize_bytes rejects data with trailing bytes
+    #[test]
+    fn test_deserialize_bytes_rejects_trailing_bytes() {
+        use tls_codec::Serialize as TlsSerialize;
+
+        let extension = create_test_extension();
+
+        // Serialize to bytes
+        let raw = extension.as_raw();
+        let mut serialized_bytes = raw.tls_serialize_detached().unwrap();
+
+        // Append trailing garbage bytes
+        serialized_bytes.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+
+        // Deserialize should fail due to trailing bytes
+        let result = NostrGroupDataExtension::deserialize_bytes(&serialized_bytes);
+        assert!(result.is_err(), "Should reject data with trailing bytes");
+
+        let error = result.unwrap_err();
+        assert!(
+            error.to_string().contains("Trailing bytes"),
+            "Error should mention trailing bytes, got: {}",
+            error
+        );
     }
 
     /// Test migration to version 2
