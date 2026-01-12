@@ -293,7 +293,7 @@ pub mod cross_storage {
         let exporter_secret = GroupExporterSecret {
             mls_group_id: mls_group_id.clone(),
             epoch,
-            secret,
+            secret: crate::Secret::new(secret),
         };
 
         // Test save
@@ -309,7 +309,7 @@ pub mod cross_storage {
         let retrieved = retrieved.unwrap();
         assert_eq!(retrieved.mls_group_id, mls_group_id);
         assert_eq!(retrieved.epoch, epoch);
-        assert_eq!(retrieved.secret, secret);
+        assert_eq!(*retrieved.secret, secret);
 
         // Test get non-existent
         let result = storage
@@ -440,7 +440,9 @@ pub mod cross_storage {
         storage.save_message(message.clone()).unwrap();
 
         // Test find
-        let found_message = storage.find_message_by_event_id(&event_id).unwrap();
+        let found_message = storage
+            .find_message_by_event_id(&mls_group_id, &event_id)
+            .unwrap();
         assert!(found_message.is_some());
         let found_message = found_message.unwrap();
         assert_eq!(found_message.id, message.id);
@@ -451,7 +453,9 @@ pub mod cross_storage {
         let non_existent_id =
             EventId::from_hex("abababababababababababababababababababababababababababababababab")
                 .unwrap();
-        let result = storage.find_message_by_event_id(&non_existent_id).unwrap();
+        let result = storage
+            .find_message_by_event_id(&mls_group_id, &non_existent_id)
+            .unwrap();
         assert!(result.is_none());
     }
 
@@ -465,7 +469,7 @@ pub mod cross_storage {
         storage.save_group(group).unwrap();
 
         // Test messages for group (initially empty)
-        let messages = storage.messages(&mls_group_id).unwrap();
+        let messages = storage.messages(&mls_group_id, None).unwrap();
         assert_eq!(messages.len(), 0);
     }
 

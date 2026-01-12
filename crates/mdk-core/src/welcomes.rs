@@ -143,9 +143,9 @@ where
                     }
                 }
                 TagKind::Custom(name) if name.as_ref() == "encoding" => {
-                    // Validate encoding value is either "hex" or "base64"
+                    // Validate encoding value is "base64"
                     if let Some(encoding_value) = tag.content() {
-                        if encoding_value == "hex" || encoding_value == "base64" {
+                        if encoding_value == "base64" {
                             has_encoding = true;
                         } else {
                             return Err(Error::InvalidWelcomeMessage);
@@ -184,23 +184,31 @@ where
         // Validate welcome event structure per MIP-02
         Self::validate_welcome_event(rumor_event)?;
 
-        if self.is_welcome_processed(wrapper_event_id)? {
-            let processed_welcome = self
-                .storage()
-                .find_processed_welcome_by_event_id(wrapper_event_id)
-                .map_err(|e| Error::Welcome(e.to_string()))?;
-            return match processed_welcome {
-                Some(processed_welcome) => {
-                    if let Some(welcome_event_id) = processed_welcome.welcome_event_id {
-                        self.storage()
-                            .find_welcome_by_event_id(&welcome_event_id)
-                            .map_err(|e| Error::Welcome(e.to_string()))?
-                            .ok_or(Error::MissingWelcomeForProcessedWelcome)
-                    } else {
-                        Err(Error::MissingWelcomeForProcessedWelcome)
-                    }
-                }
-                None => Err(Error::ProcessedWelcomeNotFound),
+        if let Some(processed_welcome) = self
+            .storage()
+            .find_processed_welcome_by_event_id(wrapper_event_id)
+            .map_err(|e| Error::Welcome(e.to_string()))?
+        {
+            // Check if this welcome previously failed - retries are not supported
+            if processed_welcome.state == welcome_types::ProcessedWelcomeState::Failed {
+                let reason = processed_welcome
+                    .failure_reason
+                    .unwrap_or_else(|| "unknown reason".to_string());
+                return Err(Error::WelcomePreviouslyFailed(reason));
+            }
+
+            // Welcome was successfully processed before - return the stored welcome
+            return match processed_welcome.welcome_event_id {
+                Some(welcome_event_id) => self
+                    .storage()
+                    .find_welcome_by_event_id(&welcome_event_id)
+                    .map_err(|e| Error::Welcome(e.to_string()))?
+                    .ok_or_else(|| {
+                        Error::Welcome("welcome record missing for processed welcome".to_string())
+                    }),
+                None => Err(Error::Welcome(
+                    "processed welcome missing welcome_event_id".to_string(),
+                )),
             };
         }
 
@@ -218,8 +226,14 @@ where
             name: welcome_preview.nostr_group_data.name.clone(),
             description: welcome_preview.nostr_group_data.description.clone(),
             image_hash: welcome_preview.nostr_group_data.image_hash,
-            image_key: welcome_preview.nostr_group_data.image_key,
-            image_nonce: welcome_preview.nostr_group_data.image_nonce,
+            image_key: welcome_preview
+                .nostr_group_data
+                .image_key
+                .map(mdk_storage_traits::Secret::new),
+            image_nonce: welcome_preview
+                .nostr_group_data
+                .image_nonce
+                .map(mdk_storage_traits::Secret::new),
             admin_pubkeys: welcome_preview.nostr_group_data.admins.clone(),
             last_message_id: None,
             last_message_at: None,
@@ -269,8 +283,14 @@ where
             group_name: welcome_preview.nostr_group_data.name,
             group_description: welcome_preview.nostr_group_data.description,
             group_image_hash: welcome_preview.nostr_group_data.image_hash,
-            group_image_key: welcome_preview.nostr_group_data.image_key,
-            group_image_nonce: welcome_preview.nostr_group_data.image_nonce,
+            group_image_key: welcome_preview
+                .nostr_group_data
+                .image_key
+                .map(mdk_storage_traits::Secret::new),
+            group_image_nonce: welcome_preview
+                .nostr_group_data
+                .image_nonce
+                .map(mdk_storage_traits::Secret::new),
             group_admin_pubkeys: welcome_preview.nostr_group_data.admins,
             group_relays: welcome_preview.nostr_group_data.relays,
             welcomer: rumor_event.pubkey,
@@ -415,8 +435,33 @@ where
         wrapper_event_id: &EventId,
         welcome_event: &UnsignedEvent,
     ) -> Result<WelcomePreview, Error> {
-        // Get encoding format from event tags (defaults to Hex for legacy events)
-        let encoding = ContentEncoding::from_tags(welcome_event.tags.iter());
+        // SECURITY: Require explicit encoding tag to prevent downgrade attacks and parsing ambiguity.
+        // Per MIP-00/MIP-02, encoding tag must be present.
+        let encoding = match ContentEncoding::from_tags(welcome_event.tags.iter()) {
+            Some(enc) => enc,
+            None => {
+                let error_string = "Missing required encoding tag".to_string();
+                let processed_welcome = welcome_types::ProcessedWelcome {
+                    wrapper_event_id: *wrapper_event_id,
+                    welcome_event_id: welcome_event.id,
+                    processed_at: Timestamp::now(),
+                    state: welcome_types::ProcessedWelcomeState::Failed,
+                    failure_reason: Some(error_string.clone()),
+                };
+
+                self.storage()
+                    .save_processed_welcome(processed_welcome)
+                    .map_err(|e| Error::Welcome(e.to_string()))?;
+
+                tracing::error!(
+                    target: "mdk_core::welcomes::process_welcome",
+                    "Error processing welcome: {}",
+                    error_string
+                );
+
+                return Err(Error::Welcome(error_string));
+            }
+        };
 
         let decoded_content = match decode_content(&welcome_event.content, encoding, "welcome") {
             Ok((content, format)) => {
@@ -477,15 +522,6 @@ where
 
         Ok(welcome_preview)
     }
-
-    /// Check if a welcome has been processed
-    fn is_welcome_processed(&self, wrapper_event_id: &EventId) -> Result<bool, Error> {
-        let processed_welcome = self
-            .storage()
-            .find_processed_welcome_by_event_id(wrapper_event_id)
-            .map_err(|e| Error::Welcome(e.to_string()))?;
-        Ok(processed_welcome.is_some())
-    }
 }
 
 #[cfg(test)]
@@ -493,12 +529,14 @@ mod tests {
     use super::*;
     use crate::test_util::*;
     use crate::tests::create_test_mdk;
+    use nostr::base64::Engine;
+    use nostr::base64::engine::general_purpose::STANDARD as BASE64;
     use nostr::{Keys, Kind, TagKind};
 
     /// Test that Welcome event structure matches Marmot spec (MIP-02)
     /// Spec requires:
     /// - Kind: 444 (MlsWelcome)
-    /// - Content: hex or base64 encoded serialized MLSMessage
+    /// - Content: base64 encoded serialized MLSMessage
     /// - Tags: exactly 4 tags (relays + event reference + client + encoding)
     /// - Must be unsigned (UnsignedEvent for NIP-59 gift wrapping)
     #[test]
@@ -534,15 +572,12 @@ mod tests {
                 "Welcome event must have kind 444 (MlsWelcome)"
             );
 
-            // 2. Verify content is hex-encoded (valid hex)
-            assert!(
-                hex::decode(&welcome_rumor.content).is_ok(),
-                "Welcome content must be valid hex-encoded data"
-            );
+            // 2. Verify content is base64-encoded (always base64 per MIP-00/MIP-02)
+            let decoded_content = BASE64
+                .decode(&welcome_rumor.content)
+                .expect("Welcome content must be valid base64-encoded data");
 
             // Verify decoded content is substantial (MLS Welcome messages are typically > 50 bytes)
-            let decoded_content =
-                hex::decode(&welcome_rumor.content).expect("Failed to decode welcome content");
             assert!(
                 decoded_content.len() > 50,
                 "Welcome content should be substantial (typically > 50 bytes), got {} bytes",
@@ -815,9 +850,10 @@ mod tests {
 
         let welcome_rumor = &create_result.welcome_rumors[0];
 
-        // Decode hex content
-        let decoded_content =
-            hex::decode(&welcome_rumor.content).expect("Welcome content should be valid hex");
+        // Decode base64 content (always base64 per MIP-00/MIP-02)
+        let decoded_content = BASE64
+            .decode(&welcome_rumor.content)
+            .expect("Welcome content should be valid base64");
 
         // Verify it's valid TLS-serialized MLS message
         // We can't fully deserialize without processing, but we can check basic structure
@@ -917,7 +953,10 @@ mod tests {
         for welcome_rumor in &create_result.welcome_rumors {
             assert_eq!(welcome_rumor.kind, Kind::MlsWelcome);
             assert_eq!(welcome_rumor.tags.len(), 4);
-            assert!(hex::decode(&welcome_rumor.content).is_ok());
+            assert!(
+                BASE64.decode(&welcome_rumor.content).is_ok(),
+                "Welcome content should be valid base64"
+            );
         }
     }
 
@@ -1027,7 +1066,7 @@ mod tests {
             )
             .expect("Failed to create group");
 
-        let group_id = create_result.group.mls_group_id;
+        let group_id = create_result.group.mls_group_id.clone();
         let first_welcome = &create_result.welcome_rumors[0];
 
         // Merge pending commit to activate group
@@ -1054,9 +1093,15 @@ mod tests {
         assert_eq!(first_tags[0].kind(), second_tags[0].kind());
         assert_eq!(first_tags[1].kind(), second_tags[1].kind());
 
-        // Both should be valid hex
-        assert!(hex::decode(&first_welcome.content).is_ok());
-        assert!(hex::decode(&second_welcome.content).is_ok());
+        // Both should be valid base64 (always base64 per MIP-00/MIP-02)
+        assert!(
+            BASE64.decode(&first_welcome.content).is_ok(),
+            "First welcome should be valid base64"
+        );
+        assert!(
+            BASE64.decode(&second_welcome.content).is_ok(),
+            "Second welcome should be valid base64"
+        );
     }
 
     /// Test welcome processing error recovery (MIP-02)
@@ -1127,6 +1172,11 @@ mod tests {
             nostr::RelayUrl::parse("wss://test.relay").unwrap(),
         ]));
         new_tags.push(nostr::Tag::event(fake_event_id));
+        // Preserve the encoding tag to avoid triggering the missing encoding tag error path
+        new_tags.push(nostr::Tag::custom(
+            nostr::TagKind::Custom("encoding".into()),
+            ["base64"],
+        ));
         modified_welcome.tags = new_tags;
 
         let result = bob_device_a.process_welcome(&nostr::EventId::all_zeros(), &modified_welcome);
@@ -1226,9 +1276,10 @@ mod tests {
 
             // Check the size of the first welcome message
             let welcome = &group_result.welcome_rumors[0];
-            let welcome_content_bytes = welcome.content.as_bytes();
-            let hex_size = welcome_content_bytes.len();
-            let binary_size = hex_size / 2; // Hex encoding doubles the size
+            let decoded_bytes: Vec<u8> = BASE64
+                .decode(&welcome.content)
+                .expect("Welcome content should be valid base64");
+            let binary_size = decoded_bytes.len();
             let size_kb = binary_size as f64 / 1024.0;
 
             println!(
@@ -1236,10 +1287,10 @@ mod tests {
                 group_size, binary_size, size_kb
             );
 
-            // Verify welcome is valid hex
+            // Verify welcome is valid base64 (always base64 per MIP-00/MIP-02)
             assert!(
-                hex::decode(&welcome.content).is_ok(),
-                "Welcome content should be valid hex"
+                BASE64.decode(&welcome.content).is_ok(),
+                "Welcome content should be valid base64"
             );
 
             // For small groups, welcome should be well under 100KB
@@ -1269,8 +1320,8 @@ mod tests {
         // The test confirms that:
         // - Welcome messages can be created for small-medium groups (5-20 members)
         // - Welcome sizes are measured and reported correctly
-        // - Welcome messages are valid hex-encoded MLS messages
-        // - Welcome structure matches MIP-02 requirements (kind 444, 2 tags)
+        // - Welcome messages are valid base64-encoded MLS messages
+        // - Welcome structure matches MIP-02 requirements (kind 444, 4 tags)
         // - Size validation logic is in place
 
         // Note: (warning for groups approaching 150 members) would be
@@ -1290,15 +1341,15 @@ mod tests {
             created_at: nostr::Timestamp::now(),
             kind: Kind::MlsWelcome,
             tags: nostr::Tags::new(),
-            content: "invalid_hex_content".to_string(), // Invalid hex
+            content: "invalid_base64_content!!!".to_string(), // Invalid base64
         };
 
         let result = mdk.process_welcome(&nostr::EventId::all_zeros(), &invalid_welcome);
 
-        // Should fail due to invalid hex content
+        // Should fail due to invalid base64 content
         assert!(
             result.is_err(),
-            "Should fail when welcome content is invalid hex"
+            "Should fail when welcome content is invalid base64"
         );
     }
 
@@ -1482,5 +1533,71 @@ mod tests {
             1,
             "Should return exactly 1 welcome with limit 1"
         );
+    }
+
+    /// Test that retrying a failed welcome returns the original failure reason
+    ///
+    /// When a welcome fails to process (e.g., due to decoding errors), it is stored
+    /// with a Failed state and the failure reason. Retrying the same welcome should
+    /// return a clear error with the original failure reason, not a confusing
+    /// "missing welcome" error.
+    #[test]
+    fn test_failed_welcome_retry_returns_original_error() {
+        use nostr::RelayUrl;
+
+        let mdk = create_test_mdk();
+        let wrapper_event_id = EventId::from_slice(&[1u8; 32]).unwrap();
+
+        // Create a welcome with valid structure but invalid (non-base64) content
+        // This will pass validation but fail during preview_welcome when decoding
+        let mut tags = nostr::Tags::new();
+        tags.push(nostr::Tag::relays(vec![
+            RelayUrl::parse("wss://relay.example.com").unwrap(),
+        ]));
+        tags.push(nostr::Tag::event(EventId::all_zeros()));
+        tags.push(nostr::Tag::client("mdk".to_string()));
+        tags.push(nostr::Tag::custom(
+            nostr::TagKind::Custom("encoding".into()),
+            ["base64"],
+        ));
+
+        let invalid_welcome = UnsignedEvent {
+            id: Some(EventId::all_zeros()),
+            pubkey: Keys::generate().public_key(),
+            created_at: Timestamp::now(),
+            kind: Kind::MlsWelcome,
+            tags,
+            content: "not_valid_base64!!!".to_string(),
+        };
+
+        // First attempt should fail with a decoding error
+        let first_result = mdk.process_welcome(&wrapper_event_id, &invalid_welcome);
+        assert!(first_result.is_err(), "First attempt should fail");
+        let first_error = first_result.unwrap_err();
+        // The error should be a Welcome error about decoding
+        assert!(
+            matches!(first_error, Error::Welcome(ref msg) if msg.contains("decoding")),
+            "First error should be about decoding, got: {:?}",
+            first_error
+        );
+
+        // Second attempt (retry) should return WelcomePreviouslyFailed with the original reason
+        let second_result = mdk.process_welcome(&wrapper_event_id, &invalid_welcome);
+        assert!(second_result.is_err(), "Second attempt should also fail");
+        let second_error = second_result.unwrap_err();
+
+        // Verify we get the new error type with the original failure reason
+        match second_error {
+            Error::WelcomePreviouslyFailed(reason) => {
+                assert!(
+                    reason.contains("decoding"),
+                    "Failure reason should contain original error about decoding, got: {}",
+                    reason
+                );
+            }
+            other => {
+                panic!("Expected WelcomePreviouslyFailed error, got: {:?}", other);
+            }
+        }
     }
 }

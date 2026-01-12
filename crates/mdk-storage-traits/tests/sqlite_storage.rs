@@ -9,7 +9,7 @@ macro_rules! test_sqlite_storage {
     ($test_name:ident, $test_fn:path) => {
         #[test]
         fn $test_name() {
-            let storage = MdkSqliteStorage::new(":memory:").unwrap();
+            let storage = MdkSqliteStorage::new_unencrypted(":memory:").unwrap();
             $test_fn(storage);
         }
     };

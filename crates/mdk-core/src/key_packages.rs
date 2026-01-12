@@ -20,16 +20,15 @@ where
     /// Creates a key package for a Nostr event.
     ///
     /// This function generates an encoded key package that is used as the content field of a kind:443 Nostr event.
-    /// The encoding format is determined by `MdkConfig::use_base64_encoding`:
-    /// - When `false` (default): uses hex encoding with `["encoding", "hex"]` tag
-    /// - When `true`: uses base64 encoding with `["encoding", "base64"]` tag (~33% smaller)
+    /// The encoding format is always base64 with an explicit `["encoding", "base64"]` tag per MIP-00/MIP-02.
+    /// This prevents downgrade attacks and parsing ambiguity across clients.
     ///
     /// The key package contains the user's credential and capabilities required for MLS operations.
     ///
     /// # Returns
     ///
     /// A tuple containing:
-    /// * An encoded string (hex or base64) containing the serialized key package
+    /// * A base64-encoded string containing the serialized key package
     /// * A fixed array of 7 tags for the Nostr event, in order:
     ///   - `mls_protocol_version` - MLS protocol version (e.g., "1.0")
     ///   - `mls_ciphersuite` - Ciphersuite identifier (e.g., "0x0001")
@@ -37,7 +36,7 @@ where
     ///   - `relays` - Relay URLs for distribution
     ///   - `protected` - Marks the event as protected
     ///   - `client` - Client identifier and version
-    ///   - `encoding` - The encoding format tag ("hex" or "base64")
+    ///   - `encoding` - The encoding format tag ("base64")
     ///
     /// # Errors
     ///
@@ -69,11 +68,9 @@ where
 
         let key_package_serialized = key_package_bundle.key_package().tls_serialize_detached()?;
 
-        let encoding = if self.config.use_base64_encoding {
-            ContentEncoding::Base64
-        } else {
-            ContentEncoding::Hex
-        };
+        // SECURITY: Always use base64 encoding with explicit encoding tag per MIP-00/MIP-02.
+        // This prevents downgrade attacks and parsing ambiguity across clients.
+        let encoding = ContentEncoding::Base64;
 
         let encoded_content = encode_content(&key_package_serialized, encoding);
 
@@ -99,15 +96,12 @@ where
         Ok((encoded_content, tags))
     }
 
-    /// Parses and validates a key package using the specified encoding format.
-    ///
-    /// This function supports both base64 and hex encodings. The format is determined
-    /// by the `["encoding", "..."]` tag on the event.
+    /// Parses and validates a key package using base64 encoding.
     ///
     /// # Arguments
     ///
-    /// * `key_package_str` - An encoded string containing the serialized key package
-    /// * `encoding` - The encoding format (from the event's encoding tag)
+    /// * `key_package_str` - A base64-encoded string containing the serialized key package
+    /// * `encoding` - The encoding format (must be Base64)
     ///
     /// # Returns
     ///
@@ -161,12 +155,6 @@ where
     /// * `Err(Error::KeyPackage)` - Tag validation failed (missing tags, invalid format, or unsupported values)
     /// * `Err(Error)` - Deserialization failed (malformed TLS data)
     ///
-    /// # Backward Compatibility
-    ///
-    /// This method accepts both MIP-00 compliant tags and legacy formats:
-    /// - Legacy tag names without `mls_` prefix (for `ciphersuite` and `extensions` only)
-    /// - Legacy ciphersuite values: "1" or "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519"
-    /// - Legacy extension values: string names like "RequiredCapabilities" or comma-separated format
     ///
     /// # Example
     ///
@@ -193,8 +181,10 @@ where
         // Validate tags before parsing the key package
         self.validate_key_package_tags(event)?;
 
-        // Get encoding format from event tags (defaults to Hex for legacy events)
-        let encoding = ContentEncoding::from_tags(event.tags.iter());
+        // SECURITY: Require explicit encoding tag to prevent downgrade attacks and parsing ambiguity.
+        // Per MIP-00/MIP-02, encoding tag must be present.
+        let encoding = ContentEncoding::from_tags(event.tags.iter())
+            .ok_or_else(|| Error::KeyPackage("Missing required encoding tag".to_string()))?;
 
         let key_package = self.parse_serialized_key_package(&event.content, encoding)?;
 
@@ -219,8 +209,9 @@ where
     /// Validates that key package event tags match MIP-00 specification.
     ///
     /// This function checks that:
-    /// - The event has the required tags (mls_protocol_version, mls_ciphersuite, mls_extensions)
+    /// - The event has the required tags (mls_protocol_version, mls_ciphersuite, mls_extensions, relays)
     /// - Tag values are in the correct format and contain valid values
+    /// - The relays tag contains at least one valid relay URL (mandatory per MIP-00)
     /// - Supports backward compatibility with legacy formats
     ///
     /// # Arguments
@@ -242,10 +233,12 @@ where
         let pv = require(Self::is_protocol_version_tag, "mls_protocol_version")?;
         let cs = require(Self::is_ciphersuite_tag, "mls_ciphersuite")?;
         let ext = require(Self::is_extensions_tag, "mls_extensions")?;
+        let relays = require(Self::is_relays_tag, "relays")?;
 
         self.validate_protocol_version_tag(pv)?;
         self.validate_ciphersuite_tag(cs)?;
         self.validate_extensions_tag(ext)?;
+        self.validate_relays_tag(relays)?;
 
         Ok(())
     }
@@ -277,6 +270,13 @@ where
         // Legacy format without mls_ prefix
         // TODO: Remove legacy check after migration period (target: EOY 2025)
         (tag.as_slice().first().map(|s| s.as_str()) == Some("extensions"))
+    }
+
+    /// Checks if a tag is a relays tag (MIP-00).
+    ///
+    /// **SPEC-COMPLIANT**: "relays"
+    fn is_relays_tag(&self, tag: &Tag) -> bool {
+        matches!(tag.kind(), TagKind::Relays)
     }
 
     /// Validates protocol version tag format and value.
@@ -540,6 +540,33 @@ where
         Ok(())
     }
 
+    /// Validates relays tag format and values.
+    ///
+    /// **SPEC-COMPLIANT**: Per MIP-00, the relays tag is mandatory and must contain
+    /// at least one valid relay URL. This ensures key packages are routable.
+    fn validate_relays_tag(&self, tag: &Tag) -> Result<(), Error> {
+        let relay_slice = tag.as_slice();
+
+        // Check that relays tag has at least one relay URL (first element is tag name)
+        if relay_slice.len() <= 1 {
+            return Err(Error::KeyPackage(
+                "Relays tag must have at least one relay URL".to_string(),
+            ));
+        }
+
+        // Validate that each relay URL is properly formatted and parses as a RelayUrl
+        for (idx, relay_url_str) in relay_slice.iter().skip(1).enumerate() {
+            RelayUrl::parse(relay_url_str).map_err(|e| {
+                Error::KeyPackage(format!(
+                    "Invalid relay URL at index {}: {} ({})",
+                    idx, relay_url_str, e
+                ))
+            })?;
+        }
+
+        Ok(())
+    }
+
     /// Deletes a key package from the MLS provider's storage.
     /// TODO: Do we need to delete the encryption keys from the MLS storage provider?
     ///
@@ -600,10 +627,10 @@ where
         ))
     }
 
-    /// Parses a public key from credential identity bytes with backwards compatibility.
+    /// Parses a public key from credential identity bytes.
     ///
-    /// This function supports both the incorrect 64-byte UTF-8 encoded hex string format
-    /// and the correct 32-byte raw format as specified in MIP-00.
+    /// Per MIP-00, the credential identity must be exactly 32 bytes containing
+    /// the raw Nostr public key.
     ///
     /// # Arguments
     ///
@@ -612,36 +639,20 @@ where
     /// # Returns
     ///
     /// * `Ok(PublicKey)` - The parsed public key
-    /// * `Err(Error)` - If the identity bytes cannot be parsed in either format
-    ///
-    /// # Format Support
-    ///
-    /// - **32 bytes**: New format (raw public key bytes) - preferred
-    /// - **64 bytes**: Legacy format (UTF-8 encoded hex string) - deprecated but supported
+    /// * `Err(Error)` - If the identity bytes are not exactly 32 bytes or invalid
     pub(crate) fn parse_credential_identity(
         &self,
         identity_bytes: &[u8],
     ) -> Result<PublicKey, Error> {
-        match identity_bytes.len() {
-            32 => {
-                // Correct format: raw 32 bytes
-                PublicKey::from_slice(identity_bytes)
-                    .map_err(|e| Error::KeyPackage(format!("Invalid 32-byte public key: {}", e)))
-            }
-            64 => {
-                // Incorrect format: 64-byte UTF-8 encoded hex string
-                let hex_str = std::str::from_utf8(identity_bytes).map_err(|e| {
-                    Error::KeyPackage(format!("Invalid UTF-8 in legacy credential: {}", e))
-                })?;
-                PublicKey::from_hex(hex_str).map_err(|e| {
-                    Error::KeyPackage(format!("Invalid hex in legacy credential: {}", e))
-                })
-            }
-            _ => Err(Error::KeyPackage(format!(
-                "Invalid credential identity length: {} (expected 32 or 64)",
+        if identity_bytes.len() != 32 {
+            return Err(Error::KeyPackage(format!(
+                "Invalid credential identity length: {} (expected 32)",
                 identity_bytes.len()
-            ))),
+            )));
         }
+
+        PublicKey::from_slice(identity_bytes)
+            .map_err(|e| Error::KeyPackage(format!("Invalid public key: {}", e)))
     }
 }
 
@@ -664,7 +675,7 @@ mod tests {
         let relays = vec![RelayUrl::parse("wss://relay.example.com").unwrap()];
 
         // Create key package
-        let (key_package_hex, tags) = mdk
+        let (key_package_str, tags) = mdk
             .create_key_package_for_event(&test_pubkey, relays.clone())
             .expect("Failed to create key package");
 
@@ -673,7 +684,7 @@ mod tests {
 
         // Parse and validate the key package
         let key_package = parsing_mls
-            .parse_serialized_key_package(&key_package_hex, ContentEncoding::Hex)
+            .parse_serialized_key_package(&key_package_str, ContentEncoding::Base64)
             .expect("Failed to parse key package");
 
         // Verify the key package has the expected properties
@@ -948,14 +959,14 @@ mod tests {
         let relays = vec![RelayUrl::parse("wss://relay.example.com").unwrap()];
 
         // Create and parse key package
-        let (key_package_hex, _) = mdk
+        let (key_package_str, _) = mdk
             .create_key_package_for_event(&test_pubkey, relays.clone())
             .expect("Failed to create key package");
 
         // Create new instance for parsing and deletion
         let deletion_mls = create_test_mdk();
         let key_package = deletion_mls
-            .parse_serialized_key_package(&key_package_hex, ContentEncoding::Hex)
+            .parse_serialized_key_package(&key_package_str, ContentEncoding::Base64)
             .expect("Failed to parse key package");
 
         // Delete the key package
@@ -968,13 +979,6 @@ mod tests {
     fn test_invalid_key_package_parsing() {
         let mdk = create_test_mdk();
 
-        // Try to parse invalid hex encoding
-        let result = mdk.parse_serialized_key_package("invalid!@#$%", ContentEncoding::Hex);
-        assert!(
-            matches!(result, Err(Error::KeyPackage(_))),
-            "Should return KeyPackage error for invalid hex encoding"
-        );
-
         // Try to parse invalid base64 encoding
         let result = mdk.parse_serialized_key_package("invalid!@#$%", ContentEncoding::Base64);
         assert!(
@@ -982,8 +986,8 @@ mod tests {
             "Should return KeyPackage error for invalid base64 encoding"
         );
 
-        // Try to parse valid hex but invalid key package
-        let result = mdk.parse_serialized_key_package("deadbeef", ContentEncoding::Hex);
+        // Try to parse valid base64 but invalid key package
+        let result = mdk.parse_serialized_key_package("YWJjZGVm", ContentEncoding::Base64);
         assert!(matches!(result, Err(Error::Tls(..))));
     }
 
@@ -999,48 +1003,36 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_credential_identity_backwards_compatibility() {
+    fn test_parse_credential_identity() {
         let mdk = create_test_mdk();
         let test_pubkey =
             PublicKey::from_hex("884704bd421671e01c13f854d2ce23ce2a5bfe9562f4f297ad2bc921ba30c3a6")
                 .unwrap();
 
-        // Test new format: 32-byte raw format (what we now write)
+        // Test correct format: 32-byte raw format per MIP-00
         let raw_bytes = test_pubkey.to_bytes();
         assert_eq!(raw_bytes.len(), 32, "Raw public key should be 32 bytes");
 
-        let parsed_from_raw = mdk
+        let parsed = mdk
             .parse_credential_identity(&raw_bytes)
             .expect("Should parse 32-byte raw format");
         assert_eq!(
-            parsed_from_raw, test_pubkey,
+            parsed, test_pubkey,
             "Parsed public key from raw bytes should match original"
         );
 
-        // Test legacy format: 64-byte UTF-8 encoded hex string (what we used to write)
+        // Test that legacy 64-byte format is now rejected
         let hex_string = test_pubkey.to_hex();
         let utf8_bytes = hex_string.as_bytes();
-        assert_eq!(
-            utf8_bytes.len(),
-            64,
-            "UTF-8 encoded hex string should be 64 bytes"
+        assert_eq!(utf8_bytes.len(), 64);
+
+        let result = mdk.parse_credential_identity(utf8_bytes);
+        assert!(
+            matches!(result, Err(Error::KeyPackage(_))),
+            "Should reject 64-byte legacy format"
         );
 
-        let parsed_from_legacy = mdk
-            .parse_credential_identity(utf8_bytes)
-            .expect("Should parse 64-byte legacy format");
-        assert_eq!(
-            parsed_from_legacy, test_pubkey,
-            "Parsed public key from legacy format should match original"
-        );
-
-        // Verify both formats produce the same result
-        assert_eq!(
-            parsed_from_raw, parsed_from_legacy,
-            "Both formats should parse to the same public key"
-        );
-
-        // Test invalid lengths
+        // Test other invalid lengths
         let invalid_33_bytes = vec![0u8; 33];
         let result = mdk.parse_credential_identity(&invalid_33_bytes);
         assert!(
@@ -1048,28 +1040,11 @@ mod tests {
             "Should reject 33-byte input"
         );
 
-        let invalid_63_bytes = vec![0u8; 63];
-        let result = mdk.parse_credential_identity(&invalid_63_bytes);
+        let invalid_31_bytes = vec![0u8; 31];
+        let result = mdk.parse_credential_identity(&invalid_31_bytes);
         assert!(
             matches!(result, Err(Error::KeyPackage(_))),
-            "Should reject 63-byte input"
-        );
-
-        // Test invalid UTF-8 in legacy format (64 bytes but not valid UTF-8)
-        let invalid_utf8 = vec![0xFFu8; 64];
-        let result = mdk.parse_credential_identity(&invalid_utf8);
-        assert!(
-            matches!(result, Err(Error::KeyPackage(_))),
-            "Should reject invalid UTF-8 in legacy format"
-        );
-
-        // Test valid UTF-8 but invalid hex in legacy format
-        let invalid_hex = b"gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg";
-        assert_eq!(invalid_hex.len(), 64);
-        let result = mdk.parse_credential_identity(invalid_hex);
-        assert!(
-            matches!(result, Err(Error::KeyPackage(_))),
-            "Should reject invalid hex in legacy format"
+            "Should reject 31-byte input"
         );
     }
 
@@ -1135,6 +1110,7 @@ mod tests {
                 TagKind::custom("extensions"),
                 ["0x0003", "0x000a", "0x0002", "0xf2ee"],
             ),
+            Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
         ];
 
         let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex)
@@ -1180,6 +1156,7 @@ mod tests {
                     "Unknown(62190)",
                 ],
             ),
+            Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
         ];
 
         let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex)
@@ -1220,6 +1197,7 @@ mod tests {
                 TagKind::MlsExtensions,
                 ["RequiredCapabilities,LastResort,RatchetTree,Unknown(62190)"], // Single string with commas
             ),
+            Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
         ];
 
         let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex)
@@ -1258,6 +1236,7 @@ mod tests {
                     TagKind::MlsExtensions,
                     ["0x0003", "0x000a", "0x0002", "0xf2ee"],
                 ),
+                Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
             ];
 
             let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex.clone())
@@ -1282,6 +1261,7 @@ mod tests {
                     TagKind::MlsExtensions,
                     ["0x0003", "0x000a", "0x0002", "0xf2ee"],
                 ),
+                Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
             ];
 
             let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex)
@@ -1313,6 +1293,7 @@ mod tests {
         let key_package_hex = "0001000120bb8f754cb3b10edfaeb3853591ec45c44e6aee11b81f37dd0ea6a7184d300153201d1507624d5e3ab2a8df6019236e454ae42fb71a0f991373412f5a2ae541c150200e9ccae869886055bdfbfce5b2d2f5eef41cd5294ba6f903c1bb657503509f090001404035353262313062313831643537653063663162633333333532636637643137646564353861383135623234343230316437646263393338633661336566343063020001020001080003000a0002f2ee0002000101000000006909bca700000000697888b7004040a8c295c3f04e7f5212ea7f3265064acb28f3220e7634137c120f96916efa6623b8661f34611cfe82f7ea6176cb07b45b8b346f65a084a5013a9f92587fdeea0203000a004040f123560da089ae702d3cb311659a22a67dc038141eea235483f90a7cf62aa3233d4983074418d5dba1e4351d4a18d7174bab543e3dea8bd9c8bda23c28876b03";
 
         // Real tags from production: numeric ciphersuite "1" and comma-separated extensions
+        // Note: Production had empty relays tag, but we now require at least one valid relay URL
         let production_tags = vec![
             Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
             Tag::custom(TagKind::MlsCiphersuite, ["1"]), // Numeric format from production
@@ -1320,7 +1301,7 @@ mod tests {
                 TagKind::MlsExtensions,
                 ["RequiredCapabilities,LastResort,RatchetTree,Unknown(62190)"], // Comma-separated from production
             ),
-            Tag::relays(vec![]), // Empty relays tag from production
+            Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]), // Valid relay URL required
         ];
 
         let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex)
@@ -1360,6 +1341,7 @@ mod tests {
             let tags = vec![
                 Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
                 Tag::custom(TagKind::MlsExtensions, ["0x0003", "0x000a"]),
+                Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
             ];
 
             let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex.clone())
@@ -1407,7 +1389,7 @@ mod tests {
                 Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
             ];
 
-            let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex)
+            let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex.clone())
                 .tags(tags)
                 .sign_with_keys(&nostr::Keys::generate())
                 .unwrap();
@@ -1418,6 +1400,181 @@ mod tests {
                 "Should reject event without extensions tag"
             );
             assert!(result.unwrap_err().to_string().contains("mls_extensions"));
+        }
+
+        // Test missing relays
+        {
+            let tags = vec![
+                Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
+                Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
+                Tag::custom(
+                    TagKind::MlsExtensions,
+                    ["0x0003", "0x000a", "0x0002", "0xf2ee"],
+                ),
+            ];
+
+            let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex)
+                .tags(tags)
+                .sign_with_keys(&nostr::Keys::generate())
+                .unwrap();
+
+            let result = mdk.validate_key_package_tags(&event);
+            assert!(result.is_err(), "Should reject event without relays tag");
+            assert!(result.unwrap_err().to_string().contains("relays"));
+        }
+    }
+
+    /// Test that relays tag validation works correctly
+    #[test]
+    fn test_validate_relays_tag() {
+        let mdk = create_test_mdk();
+        let test_pubkey =
+            PublicKey::from_hex("884704bd421671e01c13f854d2ce23ce2a5bfe9562f4f297ad2bc921ba30c3a6")
+                .unwrap();
+
+        let (key_package_hex, _) = mdk
+            .create_key_package_for_event(&test_pubkey, vec![])
+            .expect("Failed to create key package");
+
+        // Test empty relays tag (should fail)
+        {
+            let tags = vec![
+                Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
+                Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
+                Tag::custom(
+                    TagKind::MlsExtensions,
+                    ["0x0003", "0x000a", "0x0002", "0xf2ee"],
+                ),
+                Tag::relays(vec![]), // Empty relays tag
+            ];
+
+            let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex.clone())
+                .tags(tags)
+                .sign_with_keys(&nostr::Keys::generate())
+                .unwrap();
+
+            let result = mdk.validate_key_package_tags(&event);
+            assert!(result.is_err(), "Should reject event with empty relays tag");
+            let error_msg = result.unwrap_err().to_string();
+            assert!(
+                error_msg.contains("at least one relay URL"),
+                "Error should mention needing at least one relay URL, got: {}",
+                error_msg
+            );
+        }
+
+        // Test invalid relay URL format (should fail)
+        {
+            let invalid_tags = vec![
+                Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
+                Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
+                Tag::custom(
+                    TagKind::MlsExtensions,
+                    ["0x0003", "0x000a", "0x0002", "0xf2ee"],
+                ),
+                Tag::custom(TagKind::Relays, ["not-a-valid-url"]),
+            ];
+
+            let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex.clone())
+                .tags(invalid_tags)
+                .sign_with_keys(&nostr::Keys::generate())
+                .unwrap();
+
+            let result = mdk.validate_key_package_tags(&event);
+            assert!(
+                result.is_err(),
+                "Should reject event with invalid relay URL format"
+            );
+            let error_msg = result.unwrap_err().to_string();
+            assert!(
+                error_msg.contains("Invalid relay URL"),
+                "Error should mention invalid relay URL, got: {}",
+                error_msg
+            );
+        }
+
+        // Test multiple invalid relay URLs (should fail on first invalid one)
+        {
+            let invalid_tags = vec![
+                Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
+                Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
+                Tag::custom(
+                    TagKind::MlsExtensions,
+                    ["0x0003", "0x000a", "0x0002", "0xf2ee"],
+                ),
+                Tag::custom(TagKind::Relays, ["wss://valid.relay.com", "invalid-url"]),
+            ];
+
+            let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex.clone())
+                .tags(invalid_tags)
+                .sign_with_keys(&nostr::Keys::generate())
+                .unwrap();
+
+            let result = mdk.validate_key_package_tags(&event);
+            assert!(
+                result.is_err(),
+                "Should reject event with invalid relay URL in list"
+            );
+            let error_msg = result.unwrap_err().to_string();
+            assert!(
+                error_msg.contains("Invalid relay URL"),
+                "Error should mention invalid relay URL, got: {}",
+                error_msg
+            );
+        }
+
+        // Test single valid relay URL (should pass)
+        {
+            let tags = vec![
+                Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
+                Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
+                Tag::custom(
+                    TagKind::MlsExtensions,
+                    ["0x0003", "0x000a", "0x0002", "0xf2ee"],
+                ),
+                Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
+            ];
+
+            let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex.clone())
+                .tags(tags)
+                .sign_with_keys(&nostr::Keys::generate())
+                .unwrap();
+
+            let result = mdk.validate_key_package_tags(&event);
+            assert!(
+                result.is_ok(),
+                "Should accept event with single valid relay URL, got error: {:?}",
+                result
+            );
+        }
+
+        // Test multiple valid relay URLs (should pass)
+        {
+            let tags = vec![
+                Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
+                Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
+                Tag::custom(
+                    TagKind::MlsExtensions,
+                    ["0x0003", "0x000a", "0x0002", "0xf2ee"],
+                ),
+                Tag::relays(vec![
+                    RelayUrl::parse("wss://relay1.example.com").unwrap(),
+                    RelayUrl::parse("wss://relay2.example.com").unwrap(),
+                    RelayUrl::parse("wss://relay3.example.com").unwrap(),
+                ]),
+            ];
+
+            let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex)
+                .tags(tags)
+                .sign_with_keys(&nostr::Keys::generate())
+                .unwrap();
+
+            let result = mdk.validate_key_package_tags(&event);
+            assert!(
+                result.is_ok(),
+                "Should accept event with multiple valid relay URLs, got error: {:?}",
+                result
+            );
         }
     }
 
@@ -1439,6 +1596,7 @@ mod tests {
                 Tag::custom(TagKind::MlsProtocolVersion, ["2.0"]),
                 Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
                 Tag::custom(TagKind::MlsExtensions, ["0x0003", "0x000a"]),
+                Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
             ];
 
             let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex.clone())
@@ -1462,6 +1620,7 @@ mod tests {
                 Tag::custom(TagKind::MlsProtocolVersion, ["0.9"]),
                 Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
                 Tag::custom(TagKind::MlsExtensions, ["0x0003", "0x000a"]),
+                Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
             ];
 
             let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex.clone())
@@ -1485,6 +1644,7 @@ mod tests {
                 Tag::custom(TagKind::MlsProtocolVersion, Vec::<&str>::new()), // No value
                 Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
                 Tag::custom(TagKind::MlsExtensions, ["0x0003", "0x000a"]),
+                Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
             ];
 
             let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex)
@@ -1524,6 +1684,7 @@ mod tests {
                 Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
                 Tag::custom(TagKind::MlsCiphersuite, ["0x01"]), // Too short
                 Tag::custom(TagKind::MlsExtensions, ["0x0003"]),
+                Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
             ];
 
             let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex.clone())
@@ -1545,6 +1706,7 @@ mod tests {
                 Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
                 Tag::custom(TagKind::MlsCiphersuite, ["0xGGGG"]), // Invalid hex
                 Tag::custom(TagKind::MlsExtensions, ["0x0003"]),
+                Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
             ];
 
             let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex.clone())
@@ -1566,6 +1728,7 @@ mod tests {
                 Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
                 Tag::custom(TagKind::MlsCiphersuite, [""]), // Empty value
                 Tag::custom(TagKind::MlsExtensions, ["0x0003"]),
+                Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
             ];
 
             let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex)
@@ -1597,6 +1760,7 @@ mod tests {
                 Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
                 Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
                 Tag::custom(TagKind::MlsExtensions, ["0x03", "0x000a"]), // First one too short
+                Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
             ];
 
             let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex.clone())
@@ -1618,6 +1782,7 @@ mod tests {
                 Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
                 Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
                 Tag::custom(TagKind::MlsExtensions, ["0x0003", "0xZZZZ"]), // Invalid hex
+                Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
             ];
 
             let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex.clone())
@@ -1639,6 +1804,7 @@ mod tests {
                 Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
                 Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
                 Tag::custom(TagKind::MlsExtensions, ["0x0003", ""]), // Empty value
+                Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
             ];
 
             let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex)
@@ -1673,6 +1839,7 @@ mod tests {
                     TagKind::MlsExtensions,
                     ["0x0003", "0x000a", "0x0002", "0xf2ee"],
                 ),
+                Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
             ];
 
             let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex.clone())
@@ -1710,6 +1877,7 @@ mod tests {
                         "Unknown(62190)",
                     ],
                 ),
+                Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
             ];
 
             let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex)
@@ -1750,6 +1918,7 @@ mod tests {
                 Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
                 Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
                 Tag::custom(TagKind::MlsExtensions, ["0xf2ee"]), // Missing 0x000a (LastResort)
+                Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
             ];
 
             let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex.clone())
@@ -1776,6 +1945,7 @@ mod tests {
                 Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
                 Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
                 Tag::custom(TagKind::MlsExtensions, ["0x000a"]), // Missing 0xf2ee (NostrGroupData)
+                Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
             ];
 
             let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex)
@@ -1808,7 +1978,7 @@ mod tests {
             PublicKey::from_hex("884704bd421671e01c13f854d2ce23ce2a5bfe9562f4f297ad2bc921ba30c3a6")
                 .unwrap();
 
-        let (key_package_hex, _) = mdk
+        let (key_package_str, _) = mdk
             .create_key_package_for_event(&test_pubkey, vec![])
             .expect("Failed to create key package");
 
@@ -1824,9 +1994,10 @@ mod tests {
                     TagKind::MlsExtensions,
                     ["LastResort", "RatchetTree", "Unknown(62190)"], // Missing RequiredCapabilities
                 ),
+                Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
             ];
 
-            let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex.clone())
+            let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_str.clone())
                 .tags(tags)
                 .sign_with_keys(&nostr::Keys::generate())
                 .unwrap();
@@ -1856,9 +2027,10 @@ mod tests {
                     TagKind::MlsExtensions,
                     ["RequiredCapabilities,LastResort,RatchetTree"], // Missing Unknown(62190)
                 ),
+                Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
             ];
 
-            let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex)
+            let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_str)
                 .tags(tags)
                 .sign_with_keys(&nostr::Keys::generate())
                 .unwrap();
@@ -1880,12 +2052,12 @@ mod tests {
         let keys = nostr::Keys::generate();
         let relays = vec![RelayUrl::parse("wss://relay.example.com").unwrap()];
 
-        let (key_package_hex, tags) = mdk
+        let (key_package_str, tags) = mdk
             .create_key_package_for_event(&keys.public_key(), relays)
             .expect("Failed to create key package");
 
         // Create an event signed by the same keys used in the credential
-        let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex)
+        let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_str)
             .tags(tags.to_vec())
             .sign_with_keys(&keys)
             .unwrap();
@@ -1928,6 +2100,8 @@ mod tests {
                     "Unknown(62190)",
                 ],
             ),
+            Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
+            Tag::custom(TagKind::Custom("encoding".into()), ["base64"]),
         ];
 
         // Sign with the same keys used in the credential
@@ -2100,9 +2274,7 @@ mod tests {
 
     #[test]
     fn test_key_package_base64_encoding() {
-        let config = crate::MdkConfig {
-            use_base64_encoding: true,
-        };
+        let config = crate::MdkConfig::default();
 
         let mdk = crate::tests::create_test_mdk_with_config(config);
         let test_pubkey =
@@ -2136,92 +2308,28 @@ mod tests {
         assert_eq!(parsed.ciphersuite(), DEFAULT_CIPHERSUITE);
     }
 
+    /// Test that key packages are always created with base64
     #[test]
-    fn test_key_package_hex_encoding() {
-        let config = crate::MdkConfig {
-            use_base64_encoding: false,
-        };
-
-        let mdk = crate::tests::create_test_mdk_with_config(config);
+    fn test_key_package_parsing_base64() {
+        let mdk = create_test_mdk();
         let test_pubkey =
             PublicKey::from_hex("884704bd421671e01c13f854d2ce23ce2a5bfe9562f4f297ad2bc921ba30c3a6")
                 .unwrap();
         let relays = vec![RelayUrl::parse("wss://relay.example.com").unwrap()];
 
-        let (key_package_str, tags) = mdk
-            .create_key_package_for_event(&test_pubkey, relays)
-            .expect("Failed to create key package");
-
-        assert!(hex::decode(&key_package_str).is_ok(), "Should be valid hex");
-
-        let encoding_tag = tags
-            .iter()
-            .find(|t| t.as_slice().first() == Some(&"encoding".to_string()));
-        assert!(encoding_tag.is_some(), "Should have encoding tag");
-        assert_eq!(
-            encoding_tag.unwrap().as_slice().get(1).map(|s| s.as_str()),
-            Some("hex"),
-            "Encoding tag should be 'hex'"
-        );
-
-        let parsed = mdk
-            .parse_serialized_key_package(&key_package_str, ContentEncoding::Hex)
-            .expect("Failed to parse hex key package");
-        assert_eq!(parsed.ciphersuite(), DEFAULT_CIPHERSUITE);
-    }
-
-    #[test]
-    fn test_key_package_cross_format_compatibility() {
-        // Create with hex
-        let hex_config = crate::MdkConfig {
-            use_base64_encoding: false,
-        };
-        let hex_mdk = crate::tests::create_test_mdk_with_config(hex_config);
-
-        let test_pubkey =
-            PublicKey::from_hex("884704bd421671e01c13f854d2ce23ce2a5bfe9562f4f297ad2bc921ba30c3a6")
-                .unwrap();
-        let relays = vec![RelayUrl::parse("wss://relay.example.com").unwrap()];
-
-        let (hex_key_package, _) = hex_mdk
-            .create_key_package_for_event(&test_pubkey, relays.clone())
-            .expect("Failed to create hex key package");
-
-        // Create with base64
-        let base64_config = crate::MdkConfig {
-            use_base64_encoding: true,
-        };
-        let base64_mdk = crate::tests::create_test_mdk_with_config(base64_config);
-
-        let (base64_key_package, _) = base64_mdk
+        let (base64_key_package, _) = mdk
             .create_key_package_for_event(&test_pubkey, relays)
             .expect("Failed to create base64 key package");
 
-        // Both MDK instances should be able to parse both formats when given correct encoding
-        // (In real usage, encoding comes from the event's tags)
         assert!(
-            hex_mdk
-                .parse_serialized_key_package(&hex_key_package, ContentEncoding::Hex)
-                .is_ok(),
-            "Hex MDK should parse hex key package with Hex encoding"
+            BASE64.decode(&base64_key_package).is_ok(),
+            "Created key package should be base64"
         );
+
         assert!(
-            hex_mdk
-                .parse_serialized_key_package(&base64_key_package, ContentEncoding::Base64)
+            mdk.parse_serialized_key_package(&base64_key_package, ContentEncoding::Base64)
                 .is_ok(),
-            "Hex MDK should parse base64 key package with Base64 encoding"
-        );
-        assert!(
-            base64_mdk
-                .parse_serialized_key_package(&hex_key_package, ContentEncoding::Hex)
-                .is_ok(),
-            "Base64 MDK should parse hex key package with Hex encoding"
-        );
-        assert!(
-            base64_mdk
-                .parse_serialized_key_package(&base64_key_package, ContentEncoding::Base64)
-                .is_ok(),
-            "Base64 MDK should parse base64 key package with Base64 encoding"
+            "Should parse base64 key package"
         );
     }
 

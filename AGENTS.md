@@ -1,6 +1,6 @@
-# AGENTS.md
+# MDK Development Guide for AI Agents
 
-This document provides instructions for AI coding agents working on the MDK (Marmot Development Kit) codebase.
+This document provides instructions for AI coding agents working on the MDK (Marmot Development Kit) codebase. This will work for most major AI harnesses. The `CLAUDE.md` file in this repo is a symlink to this doc.
 
 ## Project Overview
 
@@ -192,7 +192,65 @@ All Rust code must follow the project's coding style (see `STYLE.md`):
 - **Derive order**: `Debug`, `Clone`, `Copy`, `PartialEq`, `Eq`, `Hash` (in this order)
 - **Logging**: Always use `tracing::warn!(...)`, never import and use `warn!(...)`
 - **String conversion**: Use `.to_string()` or `.to_owned()`, not `.into()` or `String::from`
-- **Imports**: Place all `use` statements at file top, never inside functions
+- **Imports**: Place all `use` statements at the top of their scope (see Import Placement below)
+
+### Import Placement (CRITICAL)
+
+**All `use` statements must be placed at the TOP of their containing scope.** Never place imports inside functions, methods, or blocks.
+
+This rule applies to:
+
+1. **Regular code**: Imports at the top of the file
+2. **Test modules**: Imports at the top of `mod tests { ... }`, not inside individual test functions
+3. **Nested test modules**: Imports at the top of each nested module
+4. **Conditionally-compiled code** (`#[cfg(unix)]`): Move the import to the top with the same `#[cfg(...)]` attribute
+
+```rust
+// GOOD - conditional import at file/module top
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
+#[cfg(unix)]
+fn set_permissions(path: &Path) -> Result<(), Error> {
+    let perms = std::fs::Permissions::from_mode(0o600);
+    // ...
+}
+
+// BAD - import inside function
+#[cfg(unix)]
+fn set_permissions(path: &Path) -> Result<(), Error> {
+    use std::os::unix::fs::PermissionsExt;  // ❌ WRONG!
+    let perms = std::fs::Permissions::from_mode(0o600);
+    // ...
+}
+```
+
+```rust
+// GOOD - test imports at module top
+#[cfg(test)]
+mod tests {
+    use mdk_storage_traits::groups::GroupStorage;
+    use nostr::EventId;
+
+    use super::*;
+
+    #[test]
+    fn test_something() {
+        // Use GroupStorage here - no import needed
+    }
+}
+
+// BAD - imports inside test functions
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_something() {
+        use mdk_storage_traits::groups::GroupStorage;  // ❌ WRONG!
+    }
+}
+```
 
 ### Import Order
 
@@ -245,7 +303,7 @@ use self::x::Y;
 
 ## Security
 
-- For security vulnerabilities, email **j@jeffg.me** (do not open public issues)
+- For security vulnerabilities, email **<j@ipf.dev>** (do not open public issues)
 - MDK handles cryptographic operations - be careful with key material
 - All message encryption uses MLS protocol with forward secrecy
 - Review security implications of any changes to cryptographic code

@@ -20,12 +20,12 @@ use mdk_core::{
     groups::{NostrGroupConfigData, NostrGroupDataUpdate},
     messages::MessageProcessingResult,
 };
-use mdk_sqlite_storage::MdkSqliteStorage;
+use mdk_sqlite_storage::{EncryptionConfig, MdkSqliteStorage};
 use mdk_storage_traits::{
     GroupId,
-    groups::types as group_types,
+    groups::{Pagination as MessagePagination, types as group_types},
     messages::types as message_types,
-    welcomes::{Pagination, types as welcome_types},
+    welcomes::{Pagination as WelcomePagination, types as welcome_types},
 };
 use nostr::{Event, EventBuilder, EventId, Kind, PublicKey, RelayUrl, Tag, TagKind, UnsignedEvent};
 
@@ -134,8 +134,10 @@ fn welcome_from_uniffi(w: Welcome) -> Result<welcome_types::Welcome, MdkUniffiEr
         .map_err(|_| MdkUniffiError::InvalidInput("Nostr group ID must be 32 bytes".to_string()))?;
 
     let group_image_hash = vec_to_array::<32>(w.group_image_hash)?;
-    let group_image_key = vec_to_array::<32>(w.group_image_key)?;
-    let group_image_nonce = vec_to_array::<12>(w.group_image_nonce)?;
+    let group_image_key =
+        vec_to_array::<32>(w.group_image_key)?.map(mdk_storage_traits::Secret::new);
+    let group_image_nonce =
+        vec_to_array::<12>(w.group_image_nonce)?.map(mdk_storage_traits::Secret::new);
 
     let group_admin_pubkeys: Result<BTreeSet<PublicKey>, _> = w
         .group_admin_pubkeys
@@ -184,10 +186,82 @@ impl Mdk {
     }
 }
 
-/// Create a new MDK instance with SQLite storage
+/// Create a new MDK instance with encrypted SQLite storage using automatic key management.
+///
+/// This is the recommended constructor for production use. The database encryption key
+/// is automatically retrieved from (or generated and stored in) the platform's native
+/// keyring (Keychain on macOS/iOS, Keystore on Android, etc.).
+///
+/// # Prerequisites
+///
+/// The host application must initialize a platform-specific keyring store before calling
+/// this function:
+///
+/// - **macOS/iOS**: `keyring_core::set_default_store(AppleStore::new())`
+/// - **Android**: Initialize from Kotlin (see Android documentation)
+/// - **Windows**: `keyring_core::set_default_store(WindowsStore::new())`
+/// - **Linux**: `keyring_core::set_default_store(KeyutilsStore::new())`
+///
+/// # Arguments
+///
+/// * `db_path` - Path to the SQLite database file
+/// * `service_id` - A stable, host-defined application identifier (e.g., "com.example.myapp")
+/// * `db_key_id` - A stable identifier for this database's key (e.g., "mdk.db.key.default")
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - No keyring store has been initialized
+/// - The keyring is unavailable or inaccessible
+/// - The database cannot be opened or created
 #[uniffi::export]
-pub fn new_mdk(db_path: String) -> Result<Mdk, MdkUniffiError> {
-    let storage = MdkSqliteStorage::new(PathBuf::from(db_path))?;
+pub fn new_mdk(
+    db_path: String,
+    service_id: String,
+    db_key_id: String,
+) -> Result<Mdk, MdkUniffiError> {
+    let storage = MdkSqliteStorage::new(PathBuf::from(db_path), &service_id, &db_key_id)?;
+    let mdk = MDK::new(storage);
+    Ok(Mdk {
+        mdk: Mutex::new(mdk),
+    })
+}
+
+/// Create a new MDK instance with encrypted SQLite storage using a directly provided key.
+///
+/// Use this when you want to manage encryption keys yourself rather than using the
+/// platform keyring. For most applications, prefer `new_mdk` which handles key
+/// management automatically.
+///
+/// # Arguments
+///
+/// * `db_path` - Path to the SQLite database file
+/// * `encryption_key` - 32-byte encryption key (must be exactly 32 bytes)
+///
+/// # Errors
+///
+/// Returns an error if the key is not 32 bytes or if the database cannot be opened.
+#[uniffi::export]
+pub fn new_mdk_with_key(db_path: String, encryption_key: Vec<u8>) -> Result<Mdk, MdkUniffiError> {
+    let config = EncryptionConfig::from_slice(&encryption_key)
+        .map_err(|e| MdkUniffiError::InvalidInput(format!("Invalid encryption key: {}", e)))?;
+    let storage = MdkSqliteStorage::new_with_key(PathBuf::from(db_path), config)?;
+    let mdk = MDK::new(storage);
+    Ok(Mdk {
+        mdk: Mutex::new(mdk),
+    })
+}
+
+/// Create a new MDK instance with unencrypted SQLite storage.
+///
+/// ⚠️ **WARNING**: This creates an unencrypted database. Sensitive MLS state
+/// including exporter secrets will be stored in plaintext.
+///
+/// Only use this for development or testing. For production use, use `new_mdk`
+/// with an encryption key.
+#[uniffi::export]
+pub fn new_mdk_unencrypted(db_path: String) -> Result<Mdk, MdkUniffiError> {
+    let storage = MdkSqliteStorage::new_unencrypted(PathBuf::from(db_path))?;
     let mdk = MDK::new(storage);
     Ok(Mdk {
         mdk: Mutex::new(mdk),
@@ -250,52 +324,87 @@ impl Mdk {
             .collect())
     }
 
-    /// Get messages for a group
-    pub fn get_messages(&self, mls_group_id: String) -> Result<Vec<Message>, MdkUniffiError> {
+    /// Get messages for a group with optional pagination
+    ///
+    /// # Arguments
+    ///
+    /// * `mls_group_id` - Hex-encoded MLS group ID
+    /// * `limit` - Optional maximum number of messages to return (defaults to 1000 if None)
+    /// * `offset` - Optional number of messages to skip (defaults to 0 if None)
+    ///
+    /// # Returns
+    ///
+    /// Returns a vector of messages ordered by creation time
+    pub fn get_messages(
+        &self,
+        mls_group_id: String,
+        limit: Option<u32>,
+        offset: Option<u32>,
+    ) -> Result<Vec<Message>, MdkUniffiError> {
         let group_id = parse_group_id(&mls_group_id)?;
+        let pagination = match (limit, offset) {
+            (None, None) => None,
+            _ => Some(MessagePagination::new(
+                limit.map(|l| l as usize),
+                offset.map(|o| o as usize),
+            )),
+        };
         Ok(self
             .lock()?
-            .get_messages(&group_id)?
+            .get_messages(&group_id, pagination)?
             .into_iter()
             .map(Message::from)
             .collect())
     }
 
-    /// Get a message by event ID
-    pub fn get_message(&self, event_id: String) -> Result<Option<Message>, MdkUniffiError> {
-        let event_id = parse_event_id(&event_id)?;
-        Ok(self.lock()?.get_message(&event_id)?.map(Message::from))
-    }
-
-    /// Get pending welcomes
-    pub fn get_pending_welcomes(&self) -> Result<Vec<Welcome>, MdkUniffiError> {
-        Ok(self
-            .lock()?
-            .get_pending_welcomes(None)?
-            .into_iter()
-            .map(Welcome::from)
-            .collect())
-    }
-
-    /// Get pending welcomes with pagination
+    /// Get a message by event ID within a specific group
     ///
     /// # Arguments
     ///
-    /// * `limit` - Optional maximum number of welcomes to return (defaults to 1000)
-    /// * `offset` - Optional number of welcomes to skip (defaults to 0)
+    /// * `mls_group_id` - The MLS group ID the message belongs to (hex-encoded)
+    /// * `event_id` - The Nostr event ID to look up (hex-encoded)
+    ///
+    /// # Returns
+    ///
+    /// Returns the message if found, None otherwise
+    pub fn get_message(
+        &self,
+        mls_group_id: String,
+        event_id: String,
+    ) -> Result<Option<Message>, MdkUniffiError> {
+        let group_id = parse_group_id(&mls_group_id)?;
+        let event_id = parse_event_id(&event_id)?;
+        Ok(self
+            .lock()?
+            .get_message(&group_id, &event_id)?
+            .map(Message::from))
+    }
+
+    /// Get pending welcomes with optional pagination
+    ///
+    /// # Arguments
+    ///
+    /// * `limit` - Optional maximum number of welcomes to return (defaults to 1000 if None)
+    /// * `offset` - Optional number of welcomes to skip (defaults to 0 if None)
     ///
     /// # Returns
     ///
     /// Returns a vector of pending welcomes ordered by ID (descending)
-    pub fn get_pending_welcomes_paginated(
+    pub fn get_pending_welcomes(
         &self,
         limit: Option<u32>,
         offset: Option<u32>,
     ) -> Result<Vec<Welcome>, MdkUniffiError> {
-        let pagination = Pagination::new(limit.map(|l| l as usize), offset.map(|o| o as usize));
+        let pagination = match (limit, offset) {
+            (None, None) => None,
+            _ => Some(WelcomePagination::new(
+                limit.map(|l| l as usize),
+                offset.map(|o| o as usize),
+            )),
+        };
         Ok(self
             .lock()?
-            .get_pending_welcomes(Some(pagination))?
+            .get_pending_welcomes(pagination)?
             .into_iter()
             .map(Welcome::from)
             .collect())
@@ -727,6 +836,11 @@ impl Mdk {
                     },
                 }
             }
+            MessageProcessingResult::PendingProposal { mls_group_id } => {
+                ProcessMessageResult::PendingProposal {
+                    mls_group_id: hex::encode(mls_group_id.as_slice()),
+                }
+            }
             MessageProcessingResult::ExternalJoinProposal { mls_group_id } => {
                 ProcessMessageResult::ExternalJoinProposal {
                     mls_group_id: hex::encode(mls_group_id.as_slice()),
@@ -740,6 +854,13 @@ impl Mdk {
                     mls_group_id: hex::encode(mls_group_id.as_slice()),
                 }
             }
+            MessageProcessingResult::IgnoredProposal {
+                mls_group_id,
+                reason,
+            } => ProcessMessageResult::IgnoredProposal {
+                mls_group_id: hex::encode(mls_group_id.as_slice()),
+                reason,
+            },
         })
     }
 }
@@ -800,10 +921,15 @@ pub enum ProcessMessageResult {
         /// The processed message
         message: Message,
     },
-    /// A proposal message (add/remove member proposal)
+    /// A proposal message that was auto-committed by an admin receiver
     Proposal {
         /// The proposal result containing evolution event and welcome rumors
         result: UpdateGroupResult,
+    },
+    /// A pending proposal stored but not committed (receiver is not admin)
+    PendingProposal {
+        /// Hex-encoded MLS group ID this pending proposal belongs to
+        mls_group_id: String,
     },
     /// External join proposal
     ExternalJoinProposal {
@@ -819,6 +945,13 @@ pub enum ProcessMessageResult {
     Unprocessable {
         /// Hex-encoded MLS group ID of the message that could not be processed
         mls_group_id: String,
+    },
+    /// Proposal was ignored and not stored
+    IgnoredProposal {
+        /// Hex-encoded MLS group ID this proposal was for
+        mls_group_id: String,
+        /// Reason the proposal was ignored
+        reason: String,
     },
 }
 
@@ -856,12 +989,12 @@ impl From<group_types::Group> for Group {
         Self {
             mls_group_id: hex::encode(g.mls_group_id.as_slice()),
             nostr_group_id: hex::encode(g.nostr_group_id),
-            name: g.name,
-            description: g.description,
+            name: g.name.clone(),
+            description: g.description.clone(),
             image_hash: g.image_hash.map(Into::into),
-            image_key: g.image_key.map(Into::into),
-            image_nonce: g.image_nonce.map(Into::into),
-            admin_pubkeys: g.admin_pubkeys.into_iter().map(|pk| pk.to_hex()).collect(),
+            image_key: g.image_key.map(|k| k.as_ref().to_vec()),
+            image_nonce: g.image_nonce.map(|n| n.as_ref().to_vec()),
+            admin_pubkeys: g.admin_pubkeys.iter().map(|pk| pk.to_hex()).collect(),
             last_message_id: g.last_message_id.map(|id| id.to_hex()),
             last_message_at: g.last_message_at.map(|ts| ts.as_u64()),
             epoch: g.epoch,
@@ -970,17 +1103,13 @@ impl From<welcome_types::Welcome> for Welcome {
             event_json,
             mls_group_id: hex::encode(w.mls_group_id.as_slice()),
             nostr_group_id: hex::encode(w.nostr_group_id),
-            group_name: w.group_name,
-            group_description: w.group_description,
+            group_name: w.group_name.clone(),
+            group_description: w.group_description.clone(),
             group_image_hash: w.group_image_hash.map(Into::into),
-            group_image_key: w.group_image_key.map(Into::into),
-            group_image_nonce: w.group_image_nonce.map(Into::into),
-            group_admin_pubkeys: w
-                .group_admin_pubkeys
-                .into_iter()
-                .map(|pk| pk.to_hex())
-                .collect(),
-            group_relays: w.group_relays.into_iter().map(|r| r.to_string()).collect(),
+            group_image_key: w.group_image_key.map(|k| k.as_ref().to_vec()),
+            group_image_nonce: w.group_image_nonce.map(|n| n.as_ref().to_vec()),
+            group_admin_pubkeys: w.group_admin_pubkeys.iter().map(|pk| pk.to_hex()).collect(),
+            group_relays: w.group_relays.iter().map(|r| r.to_string()).collect(),
             welcomer: w.welcomer.to_hex(),
             member_count: w.member_count,
             state: w.state.as_str().to_string(),
@@ -1033,19 +1162,19 @@ pub fn prepare_group_image_for_upload(
         .map_err(|e| MdkUniffiError::Mdk(e.to_string()))?;
 
     Ok(GroupImageUpload {
-        encrypted_data: prepared.encrypted_data,
+        encrypted_data: prepared.encrypted_data.as_ref().clone(),
         encrypted_hash: prepared.encrypted_hash.to_vec(),
-        image_key: prepared.image_key.to_vec(),
-        image_nonce: prepared.image_nonce.to_vec(),
+        image_key: prepared.image_key.as_ref().to_vec(),
+        image_nonce: prepared.image_nonce.as_ref().to_vec(),
         upload_secret_key: prepared.upload_keypair.secret_key().to_secret_hex(),
         original_size: prepared.original_size as u64,
         encrypted_size: prepared.encrypted_size as u64,
-        mime_type: prepared.mime_type,
+        mime_type: prepared.mime_type.clone(),
         dimensions: prepared.dimensions.map(|(w, h)| ImageDimensions {
             width: w,
             height: h,
         }),
-        blurhash: prepared.blurhash,
+        blurhash: prepared.blurhash.clone(),
     })
 }
 
@@ -1073,8 +1202,13 @@ pub fn decrypt_group_image(
         .try_into()
         .map_err(|_| MdkUniffiError::InvalidInput("Image nonce must be 12 bytes".to_string()))?;
 
-    core_decrypt_group_image(&encrypted_data, hash_arr_opt.as_ref(), &key_arr, &nonce_arr)
-        .map_err(|e| MdkUniffiError::Mdk(e.to_string()))
+    core_decrypt_group_image(
+        &encrypted_data,
+        hash_arr_opt.as_ref(),
+        &mdk_storage_traits::Secret::new(key_arr),
+        &mdk_storage_traits::Secret::new(nonce_arr),
+    )
+    .map_err(|e| MdkUniffiError::Mdk(e.to_string()))
 }
 
 /// Derive upload keypair for group image
@@ -1084,7 +1218,7 @@ pub fn derive_upload_keypair(image_key: Vec<u8>, version: u16) -> Result<String,
         .try_into()
         .map_err(|_| MdkUniffiError::InvalidInput("Image key must be 32 bytes".to_string()))?;
 
-    let keys = core_derive_upload_keypair(&key_arr, version)
+    let keys = core_derive_upload_keypair(&mdk_storage_traits::Secret::new(key_arr), version)
         .map_err(|e| MdkUniffiError::Mdk(e.to_string()))?;
 
     Ok(keys.secret_key().to_secret_hex())
@@ -1093,18 +1227,51 @@ pub fn derive_upload_keypair(image_key: Vec<u8>, version: u16) -> Result<String,
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nostr::{EventBuilder, Keys, Kind, Tag, UnsignedEvent};
+    use nostr::{EventBuilder, JsonUtil, Keys, Kind, Tag, UnsignedEvent};
     use tempfile::TempDir;
 
     fn create_test_mdk() -> Mdk {
-        new_mdk(":memory:".to_string()).unwrap()
+        new_mdk_unencrypted(":memory:".to_string()).unwrap()
     }
 
     #[test]
-    fn test_new_mdk_creates_instance() {
+    fn test_new_mdk_with_key_creates_instance() {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("test.db");
-        let result = new_mdk(db_path.to_string_lossy().to_string());
+
+        // Test encrypted constructor with direct key
+        let key = vec![0u8; 32];
+        let result = new_mdk_with_key(db_path.to_string_lossy().to_string(), key);
+        assert!(result.is_ok());
+        let mdk = result.unwrap();
+        // Should be able to get groups (empty initially)
+        let groups = mdk.get_groups().unwrap();
+        assert_eq!(groups.len(), 0);
+    }
+
+    #[test]
+    fn test_new_mdk_with_key_invalid_key_length() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test_invalid_key.db");
+
+        // Test with wrong key length
+        let short_key = vec![0u8; 16];
+        let result = new_mdk_with_key(db_path.to_string_lossy().to_string(), short_key);
+        assert!(result.is_err());
+
+        match result {
+            Err(MdkUniffiError::InvalidInput(msg)) => {
+                assert!(msg.contains("Invalid encryption key"));
+            }
+            _ => panic!("Expected InvalidInput error"),
+        }
+    }
+
+    #[test]
+    fn test_new_mdk_unencrypted_creates_instance() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test_unencrypted.db");
+        let result = new_mdk_unencrypted(db_path.to_string_lossy().to_string());
         assert!(result.is_ok());
         let mdk = result.unwrap();
         // Should be able to get groups (empty initially)
@@ -1184,24 +1351,183 @@ mod tests {
     fn test_get_messages_empty_group() {
         let mdk = create_test_mdk();
         let fake_group_id = hex::encode([0u8; 32]);
-        let result = mdk.get_messages(fake_group_id);
+        let result = mdk.get_messages(fake_group_id, None, None);
         // Should return error for non-existent group
         assert!(result.is_err());
     }
 
     #[test]
+    fn test_get_messages_with_pagination() {
+        let mdk = create_test_mdk();
+        let creator_keys = Keys::generate();
+        let member_keys = Keys::generate();
+
+        let member_pubkey_hex = member_keys.public_key().to_hex();
+        let relays = vec!["wss://relay.example.com".to_string()];
+
+        // Create key package for member
+        let kp_result = mdk
+            .create_key_package_for_event(member_pubkey_hex.clone(), relays.clone())
+            .unwrap();
+
+        let kp_event = EventBuilder::new(Kind::Custom(443), kp_result.key_package)
+            .tags(
+                kp_result
+                    .tags
+                    .into_iter()
+                    .map(|t| Tag::parse(&t).unwrap())
+                    .collect::<Vec<_>>(),
+            )
+            .sign_with_keys(&member_keys)
+            .unwrap();
+
+        // Create group
+        let create_result = mdk
+            .create_group(
+                creator_keys.public_key().to_hex(),
+                vec![kp_event.as_json()],
+                "Test Group".to_string(),
+                "Test Description".to_string(),
+                relays.clone(),
+                vec![creator_keys.public_key().to_hex()],
+            )
+            .unwrap();
+
+        mdk.merge_pending_commit(create_result.group.mls_group_id.clone())
+            .unwrap();
+
+        // Create a message
+        mdk.create_message(
+            create_result.group.mls_group_id.clone(),
+            creator_keys.public_key().to_hex(),
+            "Test message".to_string(),
+            1,
+            None,
+        )
+        .unwrap();
+
+        // Test 1: Get with default pagination (None, None)
+        let default_messages = mdk
+            .get_messages(create_result.group.mls_group_id.clone(), None, None)
+            .unwrap();
+        assert_eq!(default_messages.len(), 1, "Should have 1 message");
+
+        // Test 2: Get with explicit limit and offset
+        let paginated = mdk
+            .get_messages(create_result.group.mls_group_id.clone(), Some(10), Some(0))
+            .unwrap();
+        assert_eq!(paginated.len(), 1, "Should have 1 message with pagination");
+
+        // Test 3: Get with offset beyond available messages
+        let empty_page = mdk
+            .get_messages(
+                create_result.group.mls_group_id.clone(),
+                Some(10),
+                Some(100),
+            )
+            .unwrap();
+        assert_eq!(
+            empty_page.len(),
+            0,
+            "Should return empty when offset is beyond available"
+        );
+
+        // Test 4: Get with limit 1
+        let limited = mdk
+            .get_messages(create_result.group.mls_group_id.clone(), Some(1), Some(0))
+            .unwrap();
+        assert_eq!(
+            limited.len(),
+            1,
+            "Should return exactly 1 message with limit 1"
+        );
+    }
+
+    #[test]
     fn test_get_message_invalid_event_id() {
         let mdk = create_test_mdk();
+        let fake_group_id = hex::encode([0u8; 32]);
         let invalid_event_id = "not_valid_hex".to_string();
-        let result = mdk.get_message(invalid_event_id);
+        let result = mdk.get_message(fake_group_id, invalid_event_id);
         assert!(matches!(result, Err(MdkUniffiError::InvalidInput(_))));
     }
 
     #[test]
     fn test_get_pending_welcomes_empty() {
         let mdk = create_test_mdk();
-        let welcomes = mdk.get_pending_welcomes().unwrap();
+        let welcomes = mdk.get_pending_welcomes(None, None).unwrap();
         assert_eq!(welcomes.len(), 0);
+    }
+
+    #[test]
+    fn test_get_pending_welcomes_with_pagination() {
+        let mdk = create_test_mdk();
+        let creator_keys = Keys::generate();
+        let member_keys = Keys::generate();
+
+        let member_pubkey_hex = member_keys.public_key().to_hex();
+        let relays = vec!["wss://relay.example.com".to_string()];
+
+        // Create key package for member
+        let kp_result = mdk
+            .create_key_package_for_event(member_pubkey_hex.clone(), relays.clone())
+            .unwrap();
+
+        let kp_event = EventBuilder::new(Kind::Custom(443), kp_result.key_package)
+            .tags(
+                kp_result
+                    .tags
+                    .into_iter()
+                    .map(|t| Tag::parse(&t).unwrap())
+                    .collect::<Vec<_>>(),
+            )
+            .sign_with_keys(&member_keys)
+            .unwrap();
+
+        // Create group
+        let create_result = mdk
+            .create_group(
+                creator_keys.public_key().to_hex(),
+                vec![kp_event.as_json()],
+                "Test Group".to_string(),
+                "Test Description".to_string(),
+                relays.clone(),
+                vec![creator_keys.public_key().to_hex()],
+            )
+            .unwrap();
+
+        mdk.merge_pending_commit(create_result.group.mls_group_id.clone())
+            .unwrap();
+
+        // Process welcome for member
+        let welcome_rumor_json = &create_result.welcome_rumors_json[0];
+        let wrapper_event_id = EventId::all_zeros().to_hex();
+        mdk.process_welcome(wrapper_event_id, welcome_rumor_json.clone())
+            .unwrap();
+
+        // Test 1: Get with default pagination (None, None)
+        let default_welcomes = mdk.get_pending_welcomes(None, None).unwrap();
+        assert_eq!(default_welcomes.len(), 1, "Should have 1 pending welcome");
+
+        // Test 2: Get with explicit limit and offset
+        let paginated = mdk.get_pending_welcomes(Some(10), Some(0)).unwrap();
+        assert_eq!(paginated.len(), 1, "Should have 1 welcome with pagination");
+
+        // Test 3: Get with offset beyond available welcomes
+        let empty_page = mdk.get_pending_welcomes(Some(10), Some(100)).unwrap();
+        assert_eq!(
+            empty_page.len(),
+            0,
+            "Should return empty when offset is beyond available"
+        );
+
+        // Test 4: Get with limit 1
+        let limited = mdk.get_pending_welcomes(Some(1), Some(0)).unwrap();
+        assert_eq!(
+            limited.len(),
+            1,
+            "Should return exactly 1 welcome with limit 1"
+        );
     }
 
     #[test]
@@ -1259,7 +1585,7 @@ mod tests {
         assert!(result.is_ok());
 
         // Verify the welcome was accepted by checking pending welcomes
-        let pending_welcomes = mdk.get_pending_welcomes().unwrap();
+        let pending_welcomes = mdk.get_pending_welcomes(None, None).unwrap();
         assert_eq!(pending_welcomes.len(), 0);
     }
 
@@ -1318,7 +1644,7 @@ mod tests {
         assert!(result.is_ok());
 
         // Verify the welcome was declined by checking pending welcomes
-        let pending_welcomes = mdk.get_pending_welcomes().unwrap();
+        let pending_welcomes = mdk.get_pending_welcomes(None, None).unwrap();
         assert_eq!(pending_welcomes.len(), 0);
     }
 

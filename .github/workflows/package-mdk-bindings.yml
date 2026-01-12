@@ -121,6 +121,16 @@ jobs:
         rustup target add aarch64-apple-ios
         rustup target add aarch64-apple-ios-sim
 
+    - name: Install OpenSSL (Windows)
+      if: runner.os == 'Windows'
+      shell: powershell
+      run: |
+        echo "Installing OpenSSL via vcpkg..."
+        vcpkg install openssl:x64-windows-static
+        vcpkg integrate install
+        echo "OPENSSL_DIR=C:\vcpkg\packages\openssl_x64-windows-static" >> $env:GITHUB_ENV
+        echo "OPENSSL_STATIC=1" >> $env:GITHUB_ENV
+
     - name: Cache Rust dependencies
       uses: Swatinem/rust-cache@v2
 
@@ -322,6 +332,16 @@ jobs:
         rustup target add aarch64-apple-ios
         rustup target add aarch64-apple-ios-sim
 
+    - name: Install OpenSSL (Windows)
+      if: runner.os == 'Windows'
+      shell: powershell
+      run: |
+        echo "Installing OpenSSL via vcpkg..."
+        vcpkg install openssl:x64-windows-static
+        vcpkg integrate install
+        echo "OPENSSL_DIR=C:\vcpkg\packages\openssl_x64-windows-static" >> $env:GITHUB_ENV
+        echo "OPENSSL_STATIC=1" >> $env:GITHUB_ENV
+
     - name: Cache Rust dependencies
       uses: Swatinem/rust-cache@v2
 
@@ -509,10 +529,29 @@ jobs:
         link-to-sdk: true
         local-cache: true
 
+    - name: Setup OpenSSL for Android
+      id: setup-openssl
+      env:
+        NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+      run: |
+        # Build OpenSSL from source for each Android ABI
+        OPENSSL_ANDROID_DIR="${HOME}/openssl-android"
+        mkdir -p "${OPENSSL_ANDROID_DIR}"
+
+        for ABI in arm64-v8a armeabi-v7a x86_64; do
+          echo "Building OpenSSL for ${ABI}..."
+          ./scripts/build-openssl-android.sh "${ABI}" "${OPENSSL_ANDROID_DIR}/${ABI}"
+        done
+
+        echo "openssl-dir=${OPENSSL_ANDROID_DIR}" >> $GITHUB_OUTPUT
+        echo "OpenSSL for Android installed at: ${OPENSSL_ANDROID_DIR}"
+        ls -la "${OPENSSL_ANDROID_DIR}"
+
     - name: Build Android targets
       env:
         ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
         NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        ANDROID_OPENSSL_DIR: ${{ steps.setup-openssl.outputs.openssl-dir }}
       run: |
         rustup target add aarch64-linux-android
         rustup target add armv7-linux-androideabi
@@ -525,6 +564,7 @@ jobs:
       env:
         ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
         NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        ANDROID_OPENSSL_DIR: ${{ steps.setup-openssl.outputs.openssl-dir }}
       run: just gen-binding-kotlin
 
     - name: Configure Android SDK

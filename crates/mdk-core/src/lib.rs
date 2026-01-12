@@ -40,27 +40,65 @@ use self::util::NostrTagFormat;
 pub use mdk_storage_traits::GroupId;
 
 /// Configuration for MDK behavior
-#[derive(Debug, Clone, Default)]
+///
+/// This struct allows customization of various MDK parameters including
+/// message validation settings. All fields have secure defaults.
+///
+/// # Examples
+///
+/// ```rust
+/// use mdk_core::MdkConfig;
+///
+/// // Use defaults (recommended for most cases)
+/// let config = MdkConfig::default();
+///
+/// // Custom configuration
+/// let config = MdkConfig {
+///     max_event_age_secs: 86400, // 1 day instead of 45
+///     ..Default::default()
+/// };
+/// ```
+#[derive(Debug, Clone)]
 pub struct MdkConfig {
-    /// Use base64 encoding for key packages and welcomes (new format)
-    /// Set to false for backward compatibility (hex encoding)
-    /// Default: false
-    pub use_base64_encoding: bool,
+    /// Maximum age for accepted events in seconds.
+    ///
+    /// Events older than this will be rejected during validation to prevent:
+    /// - Replay attacks with old messages
+    /// - Resource exhaustion from processing large message backlogs
+    /// - Synchronization issues with stale group state
+    ///
+    /// Default: 3888000 (45 days)
+    ///
+    /// # Security Note
+    /// This value balances security with usability for offline scenarios.
+    /// The 45-day window accommodates extended offline periods while still
+    /// providing protection against replay attacks. Applications with stricter
+    /// security requirements may reduce this value.
+    pub max_event_age_secs: u64,
+
+    /// Maximum future timestamp skew allowed in seconds.
+    ///
+    /// Events with timestamps too far in the future will be rejected
+    /// to prevent timestamp manipulation attacks. The default 5-minute
+    /// window accounts for reasonable clock skew between clients.
+    ///
+    /// Default: 300 (5 minutes)
+    pub max_future_skew_secs: u64,
+}
+
+impl Default for MdkConfig {
+    fn default() -> Self {
+        Self {
+            max_event_age_secs: 3888000, // 45 days
+            max_future_skew_secs: 300,   // 5 minutes
+        }
+    }
 }
 
 impl MdkConfig {
     /// Create a new configuration with default settings
     pub fn new() -> Self {
         Self::default()
-    }
-
-    /// Create configuration with base64 encoding enabled
-    ///
-    /// This reduces payload size by approximately 33% compared to hex encoding.
-    pub fn with_base64() -> Self {
-        Self {
-            use_base64_encoding: true,
-        }
     }
 }
 
@@ -78,9 +116,9 @@ impl MdkConfig {
 /// // Simple usage with defaults
 /// let mdk = MDK::new(MdkMemoryStorage::default());
 ///
-/// // With base64 encoding enabled
+/// // With custom configuration
 /// let mdk = MDK::builder(MdkMemoryStorage::default())
-///     .with_base64_encoding(true)
+///     .with_config(MdkConfig::new())
 ///     .build();
 /// ```
 #[derive(Debug)]
@@ -101,29 +139,6 @@ where
         }
     }
 
-    /// Enable or disable base64 encoding for key packages and welcomes
-    ///
-    /// When enabled, reduces payload size by approximately 33% compared to hex encoding.
-    /// Both formats can be read regardless of this setting.
-    ///
-    /// # Arguments
-    ///
-    /// * `enabled` - true to use base64 encoding, false to use hex encoding
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// # use mdk_core::MDK;
-    /// # use mdk_memory_storage::MdkMemoryStorage;
-    /// let mdk = MDK::builder(MdkMemoryStorage::default())
-    ///     .with_base64_encoding(true)
-    ///     .build();
-    /// ```
-    pub fn with_base64_encoding(mut self, enabled: bool) -> Self {
-        self.config.use_base64_encoding = enabled;
-        self
-    }
-
     /// Set a custom configuration
     ///
     /// # Example
@@ -131,7 +146,7 @@ where
     /// ```no_run
     /// # use mdk_core::{MDK, MdkConfig};
     /// # use mdk_memory_storage::MdkMemoryStorage;
-    /// let config = MdkConfig::with_base64();
+    /// let config = MdkConfig::new();
     /// let mdk = MDK::builder(MdkMemoryStorage::default())
     ///     .with_config(config)
     ///     .build();
@@ -229,9 +244,7 @@ where
     /// ```no_run
     /// # use mdk_core::MDK;
     /// # use mdk_memory_storage::MdkMemoryStorage;
-    /// let mdk = MDK::builder(MdkMemoryStorage::default())
-    ///     .with_base64_encoding(true)
-    ///     .build();
+    /// let mdk = MDK::builder(MdkMemoryStorage::default()).build();
     /// ```
     pub fn builder(storage: Storage) -> MdkBuilder<Storage> {
         MdkBuilder::new(storage)
@@ -239,20 +252,17 @@ where
 
     /// Construct a new MDK instance with default configuration
     ///
-    /// Uses hex encoding for backward compatibility. To enable base64 encoding,
-    /// use the builder pattern.
     ///
     /// # Example
     ///
     /// ```no_run
     /// # use mdk_core::MDK;
     /// # use mdk_memory_storage::MdkMemoryStorage;
-    /// // Default configuration (hex encoding)
+    /// # use mdk_core::MdkConfig;
     /// let mdk = MDK::new(MdkMemoryStorage::default());
     ///
-    /// // With base64 encoding (recommended)
     /// let mdk = MDK::builder(MdkMemoryStorage::default())
-    ///     .with_base64_encoding(true)
+    ///     .with_config(MdkConfig::new())
     ///     .build();
     /// ```
     pub fn new(storage: Storage) -> Self {

@@ -42,6 +42,8 @@ pub struct EncryptedMediaUpload {
     pub dimensions: Option<(u32, u32)>,
     /// Blurhash for images
     pub blurhash: Option<String>,
+    /// Encryption nonce (96 bits, 12 bytes) - randomly generated per encryption
+    pub nonce: [u8; 12],
 }
 
 /// Reference to encrypted media
@@ -57,8 +59,10 @@ pub struct MediaReference {
     pub filename: String,
     /// Dimensions if applicable
     pub dimensions: Option<(u32, u32)>,
-    /// Encryption scheme version (e.g., "mip04-v1")
+    /// Encryption scheme version (e.g., "mip04-v2")
     pub scheme_version: String,
+    /// Encryption nonce (96 bits, 12 bytes) - required for decryption
+    pub nonce: [u8; 12],
 }
 
 /// Errors that can occur during encrypted media operations
@@ -157,6 +161,7 @@ mod tests {
             encrypted_size: 5016, // Original + ChaCha20-Poly1305 overhead
             dimensions: Some((1024, 768)),
             blurhash: Some("L6PZfSi_.AyE_3t7t7R**0o#DgR4".to_string()),
+            nonce: [0x03; 12],
         };
 
         // Verify all fields are accessible
@@ -169,6 +174,7 @@ mod tests {
         assert_eq!(upload.encrypted_size, 5016);
         assert_eq!(upload.dimensions, Some((1024, 768)));
         assert!(upload.blurhash.is_some());
+        assert_eq!(upload.nonce, [0x03; 12]);
     }
 
     #[test]
@@ -179,7 +185,8 @@ mod tests {
             mime_type: "video/mp4".to_string(),
             filename: "test.mp4".to_string(),
             dimensions: Some((1920, 1080)),
-            scheme_version: "mip04-v1".to_string(),
+            scheme_version: "mip04-v2".to_string(),
+            nonce: [0xAA; 12],
         };
 
         // Verify all fields are accessible
@@ -188,7 +195,8 @@ mod tests {
         assert_eq!(media_ref.mime_type, "video/mp4");
         assert_eq!(media_ref.filename, "test.mp4");
         assert_eq!(media_ref.dimensions, Some((1920, 1080)));
-        assert_eq!(media_ref.scheme_version, "mip04-v1");
+        assert_eq!(media_ref.scheme_version, "mip04-v2");
+        assert_eq!(media_ref.nonce, [0xAA; 12]);
     }
 
     #[test]

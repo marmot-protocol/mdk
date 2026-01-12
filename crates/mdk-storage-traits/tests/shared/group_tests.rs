@@ -88,7 +88,7 @@ where
     let exporter_secret = GroupExporterSecret {
         mls_group_id: mls_group_id.clone(),
         epoch,
-        secret,
+        secret: mdk_storage_traits::Secret::new(secret),
     };
 
     // Test save
@@ -104,7 +104,7 @@ where
     let retrieved = retrieved.unwrap();
     assert_eq!(retrieved.mls_group_id, mls_group_id);
     assert_eq!(retrieved.epoch, epoch);
-    assert_eq!(retrieved.secret, secret);
+    assert_eq!(*retrieved.secret, secret);
 
     // Test get non-existent
     let result = storage
@@ -338,7 +338,7 @@ where
     storage.save_group(group).unwrap();
 
     // Test messages for group (initially empty)
-    let messages = storage.messages(&mls_group_id).unwrap();
+    let messages = storage.messages(&mls_group_id, None).unwrap();
     assert_eq!(messages.len(), 0);
 }
 
@@ -397,7 +397,7 @@ where
 {
     let non_existent_id = GroupId::from_slice(&[99, 99, 99, 18]);
 
-    let result = storage.messages(&non_existent_id);
+    let result = storage.messages(&non_existent_id, None);
     assert!(result.is_err());
     assert!(matches!(
         result.unwrap_err(),
