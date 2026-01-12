@@ -250,26 +250,18 @@ where
         matches!(tag.kind(), TagKind::MlsProtocolVersion)
     }
 
-    /// Checks if a tag is a ciphersuite tag (MIP-00 or legacy format).
+    /// Checks if a tag is a ciphersuite tag (MIP-00).
     ///
     /// **SPEC-COMPLIANT**: "mls_ciphersuite"
-    /// **LEGACY**: "ciphersuite" (TODO: Remove after migration period)
     fn is_ciphersuite_tag(&self, tag: &Tag) -> bool {
-        matches!(tag.kind(), TagKind::MlsCiphersuite) ||
-        // Legacy format without mls_ prefix
-        // TODO: Remove legacy check after migration period (target: EOY 2025)
-        (tag.as_slice().first().map(|s| s.as_str()) == Some("ciphersuite"))
+        matches!(tag.kind(), TagKind::MlsCiphersuite)
     }
 
-    /// Checks if a tag is an extensions tag (MIP-00 or legacy format).
+    /// Checks if a tag is an extensions tag (MIP-00).
     ///
     /// **SPEC-COMPLIANT**: "mls_extensions"
-    /// **LEGACY**: "extensions" (TODO: Remove after migration period)
     fn is_extensions_tag(&self, tag: &Tag) -> bool {
-        matches!(tag.kind(), TagKind::MlsExtensions) ||
-        // Legacy format without mls_ prefix
-        // TODO: Remove legacy check after migration period (target: EOY 2025)
-        (tag.as_slice().first().map(|s| s.as_str()) == Some("extensions"))
+        matches!(tag.kind(), TagKind::MlsExtensions)
     }
 
     /// Checks if a tag is a relays tag (MIP-00).
@@ -301,9 +293,9 @@ where
         Ok(())
     }
 
-    /// Validates ciphersuite tag format and value.
+    /// Validates ciphersuite tag format and value per MIP-00.
     ///
-    /// This delegates to either spec-compliant validation or legacy validation.
+    /// Currently only accepts: "0x0001" (MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519)
     fn validate_ciphersuite_tag(&self, tag: &Tag) -> Result<(), Error> {
         let values: Vec<&str> = tag.as_slice().iter().map(|s| s.as_str()).collect();
 
@@ -312,21 +304,6 @@ where
             .get(1)
             .ok_or_else(|| Error::KeyPackage("Ciphersuite tag must have a value".to_string()))?;
 
-        // Try spec-compliant validation first
-        if ciphersuite_value.starts_with("0x") {
-            return self.validate_ciphersuite_mip00(ciphersuite_value);
-        }
-
-        // Fall back to legacy format validation for backward compatibility
-        // TODO: Remove legacy validation after migration period (target: EOY 2025)
-        self.validate_ciphersuite_legacy(ciphersuite_value)
-    }
-
-    /// Validates MIP-00 spec-compliant ciphersuite format.
-    ///
-    /// **SPEC-COMPLIANT**: This is the correct format per MIP-00.
-    /// Currently only accepts: "0x0001" (MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519)
-    fn validate_ciphersuite_mip00(&self, ciphersuite_value: &str) -> Result<(), Error> {
         // Validate length
         if ciphersuite_value.len() != 6 {
             return Err(Error::KeyPackage(format!(
@@ -358,51 +335,11 @@ where
         Ok(())
     }
 
-    /// Validates legacy ciphersuite formats for backward compatibility.
+    /// Validates extensions tag format and values per MIP-00.
     ///
-    /// **LEGACY**: These formats are deprecated and will be removed.
-    /// TODO: Remove this method after migration period (target: EOY 2025)
-    ///
-    /// Accepts:
-    /// - Numeric string: "1"
-    /// - Name string: "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519"
-    fn validate_ciphersuite_legacy(&self, ciphersuite_value: &str) -> Result<(), Error> {
-        if ciphersuite_value.is_empty() {
-            return Err(Error::KeyPackage(
-                "Ciphersuite value cannot be empty".to_string(),
-            ));
-        }
-
-        // Legacy numeric format: "1"
-        if let Ok(numeric_value) = ciphersuite_value.parse::<u16>() {
-            if numeric_value != 1 {
-                return Err(Error::KeyPackage(format!(
-                    "Unsupported ciphersuite numeric value: {}. Only 1 (MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519) is supported",
-                    numeric_value
-                )));
-            }
-            return Ok(());
-        }
-
-        // Legacy name format: "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519"
-        let accepted_legacy_names = [
-            "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519",
-            "MLS_128_DHKEMX25519_AES128GCM_SHA256_ED25519",
-        ];
-
-        if !accepted_legacy_names.contains(&ciphersuite_value) {
-            return Err(Error::KeyPackage(format!(
-                "Unsupported legacy ciphersuite: {}. Expected '1', '0x0001', or 'MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519'",
-                ciphersuite_value
-            )));
-        }
-
-        Ok(())
-    }
-
-    /// Validates extensions tag format and values.
-    ///
-    /// This delegates to either spec-compliant validation or legacy validation.
+    /// Required extensions (as separate hex values):
+    /// - 0x000a (LastResort)
+    /// - 0xf2ee (NostrGroupData)
     fn validate_extensions_tag(&self, tag: &Tag) -> Result<(), Error> {
         let values: Vec<&str> = tag.as_slice().iter().map(|s| s.as_str()).collect();
 
@@ -415,25 +352,6 @@ where
             ));
         }
 
-        // Check if this is new format (all values start with 0x) or legacy format
-        let is_new_format = extension_values.iter().all(|v| v.starts_with("0x"));
-
-        if is_new_format {
-            return self.validate_extensions_mip00(&extension_values);
-        }
-
-        // Fall back to legacy format validation for backward compatibility
-        // TODO: Remove legacy validation after migration period (target: EOY 2025)
-        self.validate_extensions_legacy(&extension_values)
-    }
-
-    /// Validates MIP-00 spec-compliant extensions format.
-    ///
-    /// **SPEC-COMPLIANT**: This is the correct format per MIP-00.
-    /// Required extensions (as separate hex values):
-    /// - 0x000a (LastResort)
-    /// - 0xf2ee (NostrGroupData)
-    fn validate_extensions_mip00(&self, extension_values: &[&str]) -> Result<(), Error> {
         // Validate format of each hex value
         for (idx, ext_value) in extension_values.iter().enumerate() {
             // Validate length
@@ -457,7 +375,6 @@ where
         }
 
         // Validate that all required extensions are present
-        // Convert our constant ExtensionType array to hex strings for comparison
         // Normalize extension values to lowercase for case-insensitive comparison
         let normalized_extensions: std::collections::HashSet<String> =
             extension_values.iter().map(|s| s.to_lowercase()).collect();
@@ -474,66 +391,6 @@ where
                     "Missing required extension: {} ({})",
                     required_hex, ext_name
                 )));
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Validates legacy extensions formats for backward compatibility.
-    ///
-    /// **LEGACY**: These formats are deprecated and will be removed.
-    /// TODO: Remove this method after migration period (target: EOY 2025)
-    ///
-    /// Accepts two formats:
-    /// - Separate string values: ["RequiredCapabilities", "LastResort", "RatchetTree", "Unknown(62190)"]
-    /// - Single comma-separated string: ["RequiredCapabilities,LastResort,RatchetTree,Unknown(62190)"]
-    fn validate_extensions_legacy(&self, extension_values: &[&str]) -> Result<(), Error> {
-        // Legacy format names
-        const LEGACY_EXTENSION_NAMES: [&str; 4] = [
-            "RequiredCapabilities",
-            "LastResort",
-            "RatchetTree",
-            "Unknown(62190)", // 62190 decimal = 0xF2EE hex
-        ];
-
-        // Verify no empty values
-        for (idx, ext_value) in extension_values.iter().enumerate() {
-            if ext_value.is_empty() {
-                return Err(Error::KeyPackage(format!(
-                    "Extension {} value cannot be empty",
-                    idx
-                )));
-            }
-        }
-
-        // Check format: single comma-separated string OR multiple separate values
-        if extension_values.len() == 1 {
-            // Single string format: split on commas and check exact matches
-            let combined = extension_values[0];
-            let tokens: Vec<&str> = combined
-                .split(',')
-                .map(|s| s.trim())
-                .filter(|s| !s.is_empty())
-                .collect();
-
-            for legacy_name in LEGACY_EXTENSION_NAMES.iter() {
-                if !tokens.iter().any(|token| token == legacy_name) {
-                    return Err(Error::KeyPackage(format!(
-                        "Missing required extension in legacy format: {}",
-                        legacy_name
-                    )));
-                }
-            }
-        } else {
-            // Multiple separate values: each should be a valid legacy name
-            for required_name in LEGACY_EXTENSION_NAMES.iter() {
-                if !extension_values.contains(required_name) {
-                    return Err(Error::KeyPackage(format!(
-                        "Missing required extension in legacy format: {}",
-                        required_name
-                    )));
-                }
             }
         }
 
@@ -1088,242 +945,6 @@ mod tests {
         );
     }
 
-    /// Test that legacy tag format (without mls_ prefix) is still accepted for ciphersuite and extensions
-    /// TODO: Remove this test after legacy format support is removed (target: EOY 2025)
-    #[test]
-    fn test_validate_legacy_tags_without_prefix() {
-        let mdk = create_test_mdk();
-        let test_pubkey =
-            PublicKey::from_hex("884704bd421671e01c13f854d2ce23ce2a5bfe9562f4f297ad2bc921ba30c3a6")
-                .unwrap();
-
-        let (key_package_hex, _) = mdk
-            .create_key_package_for_event(&test_pubkey, vec![])
-            .expect("Failed to create key package");
-
-        // Create event with legacy tag format (without mls_ prefix for ciphersuite and extensions)
-        // Note: protocol_version was always correct in production, no legacy support needed
-        let legacy_tags = vec![
-            Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
-            Tag::custom(TagKind::custom("ciphersuite"), ["0x0001"]),
-            Tag::custom(
-                TagKind::custom("extensions"),
-                ["0x0003", "0x000a", "0x0002", "0xf2ee"],
-            ),
-            Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
-        ];
-
-        let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex)
-            .tags(legacy_tags)
-            .sign_with_keys(&nostr::Keys::generate())
-            .unwrap();
-
-        // Validate tags - should succeed with legacy format
-        let result = mdk.validate_key_package_tags(&event);
-        assert!(
-            result.is_ok(),
-            "Should accept legacy tags without mls_ prefix (ciphersuite, extensions), got error: {:?}",
-            result
-        );
-    }
-
-    /// Test that legacy tag format with string values (not hex) is accepted (separate values)
-    /// TODO: Remove this test after legacy format support is removed (target: EOY 2025)
-    #[test]
-    fn test_validate_legacy_tags_with_string_values() {
-        let mdk = create_test_mdk();
-        let test_pubkey =
-            PublicKey::from_hex("884704bd421671e01c13f854d2ce23ce2a5bfe9562f4f297ad2bc921ba30c3a6")
-                .unwrap();
-
-        let (key_package_hex, _) = mdk
-            .create_key_package_for_event(&test_pubkey, vec![])
-            .expect("Failed to create key package");
-
-        // Create event with legacy string values (not hex format) - separate values
-        let legacy_tags = vec![
-            Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
-            Tag::custom(
-                TagKind::MlsCiphersuite,
-                ["MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519"],
-            ),
-            Tag::custom(
-                TagKind::MlsExtensions,
-                [
-                    "RequiredCapabilities",
-                    "LastResort",
-                    "RatchetTree",
-                    "Unknown(62190)",
-                ],
-            ),
-            Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
-        ];
-
-        let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex)
-            .tags(legacy_tags)
-            .sign_with_keys(&nostr::Keys::generate())
-            .unwrap();
-
-        // Validate tags - should succeed with legacy string format
-        let result = mdk.validate_key_package_tags(&event);
-        assert!(
-            result.is_ok(),
-            "Should accept legacy string format values (separate), got error: {:?}",
-            result
-        );
-    }
-
-    /// Test that legacy tag format with single comma-separated string is accepted
-    /// TODO: Remove this test after legacy format support is removed (target: EOY 2025)
-    #[test]
-    fn test_validate_legacy_tags_with_comma_separated_string() {
-        let mdk = create_test_mdk();
-        let test_pubkey =
-            PublicKey::from_hex("884704bd421671e01c13f854d2ce23ce2a5bfe9562f4f297ad2bc921ba30c3a6")
-                .unwrap();
-
-        let (key_package_hex, _) = mdk
-            .create_key_package_for_event(&test_pubkey, vec![])
-            .expect("Failed to create key package");
-
-        // Create event with legacy single comma-separated string format
-        let legacy_tags = vec![
-            Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
-            Tag::custom(
-                TagKind::MlsCiphersuite,
-                ["MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519"],
-            ),
-            Tag::custom(
-                TagKind::MlsExtensions,
-                ["RequiredCapabilities,LastResort,RatchetTree,Unknown(62190)"], // Single string with commas
-            ),
-            Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
-        ];
-
-        let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex)
-            .tags(legacy_tags)
-            .sign_with_keys(&nostr::Keys::generate())
-            .unwrap();
-
-        // Validate tags - should succeed with legacy comma-separated format
-        let result = mdk.validate_key_package_tags(&event);
-        assert!(
-            result.is_ok(),
-            "Should accept legacy comma-separated string format, got error: {:?}",
-            result
-        );
-    }
-
-    /// Test that numeric ciphersuite format is accepted (e.g., "1" for 0x0001)
-    /// TODO: Remove this test after legacy format support is removed (target: EOY 2025)
-    #[test]
-    fn test_validate_numeric_ciphersuite_format() {
-        let mdk = create_test_mdk();
-        let test_pubkey =
-            PublicKey::from_hex("884704bd421671e01c13f854d2ce23ce2a5bfe9562f4f297ad2bc921ba30c3a6")
-                .unwrap();
-
-        let (key_package_hex, _) = mdk
-            .create_key_package_for_event(&test_pubkey, vec![])
-            .expect("Failed to create key package");
-
-        // Test numeric ciphersuite "1" (should map to 0x0001)
-        {
-            let tags = vec![
-                Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
-                Tag::custom(TagKind::MlsCiphersuite, ["1"]), // Numeric format
-                Tag::custom(
-                    TagKind::MlsExtensions,
-                    ["0x0003", "0x000a", "0x0002", "0xf2ee"],
-                ),
-                Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
-            ];
-
-            let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex.clone())
-                .tags(tags)
-                .sign_with_keys(&nostr::Keys::generate())
-                .unwrap();
-
-            let result = mdk.validate_key_package_tags(&event);
-            assert!(
-                result.is_ok(),
-                "Should accept numeric ciphersuite '1', got error: {:?}",
-                result
-            );
-        }
-
-        // Test invalid numeric ciphersuite "2" (should be rejected)
-        {
-            let tags = vec![
-                Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
-                Tag::custom(TagKind::MlsCiphersuite, ["2"]), // Invalid numeric
-                Tag::custom(
-                    TagKind::MlsExtensions,
-                    ["0x0003", "0x000a", "0x0002", "0xf2ee"],
-                ),
-                Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
-            ];
-
-            let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex)
-                .tags(tags)
-                .sign_with_keys(&nostr::Keys::generate())
-                .unwrap();
-
-            let result = mdk.validate_key_package_tags(&event);
-            assert!(
-                result.is_err(),
-                "Should reject unsupported numeric ciphersuite '2'"
-            );
-            assert!(
-                result
-                    .unwrap_err()
-                    .to_string()
-                    .contains("Unsupported ciphersuite")
-            );
-        }
-    }
-
-    /// Test real-world example from production with numeric ciphersuite and comma-separated extensions
-    /// TODO: Remove this test after legacy format support is removed (target: EOY 2025)
-    #[test]
-    fn test_validate_real_world_example() {
-        let mdk = create_test_mdk();
-
-        // Real key package content from production
-        let key_package_hex = "0001000120bb8f754cb3b10edfaeb3853591ec45c44e6aee11b81f37dd0ea6a7184d300153201d1507624d5e3ab2a8df6019236e454ae42fb71a0f991373412f5a2ae541c150200e9ccae869886055bdfbfce5b2d2f5eef41cd5294ba6f903c1bb657503509f090001404035353262313062313831643537653063663162633333333532636637643137646564353861383135623234343230316437646263393338633661336566343063020001020001080003000a0002f2ee0002000101000000006909bca700000000697888b7004040a8c295c3f04e7f5212ea7f3265064acb28f3220e7634137c120f96916efa6623b8661f34611cfe82f7ea6176cb07b45b8b346f65a084a5013a9f92587fdeea0203000a004040f123560da089ae702d3cb311659a22a67dc038141eea235483f90a7cf62aa3233d4983074418d5dba1e4351d4a18d7174bab543e3dea8bd9c8bda23c28876b03";
-
-        // Real tags from production: numeric ciphersuite "1" and comma-separated extensions
-        // Note: Production had empty relays tag, but we now require at least one valid relay URL
-        let production_tags = vec![
-            Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
-            Tag::custom(TagKind::MlsCiphersuite, ["1"]), // Numeric format from production
-            Tag::custom(
-                TagKind::MlsExtensions,
-                ["RequiredCapabilities,LastResort,RatchetTree,Unknown(62190)"], // Comma-separated from production
-            ),
-            Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]), // Valid relay URL required
-        ];
-
-        let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex)
-            .tags(production_tags)
-            .sign_with_keys(&nostr::Keys::generate())
-            .unwrap();
-
-        // Validate tags - should succeed with production format
-        let result = mdk.validate_key_package_tags(&event);
-        assert!(
-            result.is_ok(),
-            "Should accept real-world production format, got error: {:?}",
-            result
-        );
-
-        // NOTE: We intentionally do NOT call parse_key_package here because this test
-        // uses a hardcoded key package from production. The parse_key_package function
-        // now verifies identity binding (credential identity must match event signer),
-        // and we don't have the private key for the embedded credential.
-        // Tag validation is sufficient for testing legacy format compatibility.
-    }
-
     /// Test that missing required tags are rejected
     #[test]
     fn test_validate_missing_required_tags() {
@@ -1738,7 +1359,8 @@ mod tests {
 
             let result = mdk.validate_key_package_tags(&event);
             assert!(result.is_err(), "Should reject empty ciphersuite value");
-            assert!(result.unwrap_err().to_string().contains("cannot be empty"));
+            // Empty string fails hex format validation (must be 6 characters)
+            assert!(result.unwrap_err().to_string().contains("6 characters"));
         }
     }
 
@@ -1814,7 +1436,8 @@ mod tests {
 
             let result = mdk.validate_key_package_tags(&event);
             assert!(result.is_err(), "Should reject empty extension value");
-            assert!(result.unwrap_err().to_string().contains("cannot be empty"));
+            // Empty string fails hex format validation (must be 6 characters)
+            assert!(result.unwrap_err().to_string().contains("6 characters"));
         }
     }
 
@@ -1860,23 +1483,15 @@ mod tests {
             );
         }
 
-        // Test unsupported ciphersuite in legacy string format
+        // Test invalid ciphersuite format (non-hex string)
         {
             let tags = vec![
                 Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
                 Tag::custom(
                     TagKind::MlsCiphersuite,
                     ["MLS_256_DHKEMX448_CHACHA20POLY1305_SHA512_Ed448"],
-                ), // Unsupported
-                Tag::custom(
-                    TagKind::MlsExtensions,
-                    [
-                        "RequiredCapabilities",
-                        "LastResort",
-                        "RatchetTree",
-                        "Unknown(62190)",
-                    ],
-                ),
+                ), // Invalid format (must be hex like 0x0001)
+                Tag::custom(TagKind::MlsExtensions, ["0x000a", "0xf2ee"]),
                 Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
             ];
 
@@ -1886,16 +1501,9 @@ mod tests {
                 .unwrap();
 
             let result = mdk.validate_key_package_tags(&event);
-            assert!(
-                result.is_err(),
-                "Should reject unsupported legacy ciphersuite"
-            );
-            assert!(
-                result
-                    .unwrap_err()
-                    .to_string()
-                    .contains("Unsupported legacy ciphersuite")
-            );
+            assert!(result.is_err(), "Should reject non-hex ciphersuite format");
+            // Should fail on hex format validation, not legacy validation
+            assert!(result.unwrap_err().to_string().contains("6 characters"));
         }
     }
 
@@ -1970,80 +1578,6 @@ mod tests {
         }
     }
 
-    /// Test that missing required extensions in legacy format are rejected
-    #[test]
-    fn test_validate_missing_legacy_extensions() {
-        let mdk = create_test_mdk();
-        let test_pubkey =
-            PublicKey::from_hex("884704bd421671e01c13f854d2ce23ce2a5bfe9562f4f297ad2bc921ba30c3a6")
-                .unwrap();
-
-        let (key_package_str, _) = mdk
-            .create_key_package_for_event(&test_pubkey, vec![])
-            .expect("Failed to create key package");
-
-        // Test missing RequiredCapabilities in legacy format (separate values)
-        {
-            let tags = vec![
-                Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
-                Tag::custom(
-                    TagKind::MlsCiphersuite,
-                    ["MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519"],
-                ),
-                Tag::custom(
-                    TagKind::MlsExtensions,
-                    ["LastResort", "RatchetTree", "Unknown(62190)"], // Missing RequiredCapabilities
-                ),
-                Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
-            ];
-
-            let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_str.clone())
-                .tags(tags)
-                .sign_with_keys(&nostr::Keys::generate())
-                .unwrap();
-
-            let result = mdk.validate_key_package_tags(&event);
-            assert!(
-                result.is_err(),
-                "Should reject legacy format missing RequiredCapabilities"
-            );
-            assert!(
-                result
-                    .unwrap_err()
-                    .to_string()
-                    .contains("RequiredCapabilities")
-            );
-        }
-
-        // Test missing extension in legacy single-string format
-        {
-            let tags = vec![
-                Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
-                Tag::custom(
-                    TagKind::MlsCiphersuite,
-                    ["MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519"],
-                ),
-                Tag::custom(
-                    TagKind::MlsExtensions,
-                    ["RequiredCapabilities,LastResort,RatchetTree"], // Missing Unknown(62190)
-                ),
-                Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
-            ];
-
-            let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_str)
-                .tags(tags)
-                .sign_with_keys(&nostr::Keys::generate())
-                .unwrap();
-
-            let result = mdk.validate_key_package_tags(&event);
-            assert!(
-                result.is_err(),
-                "Should reject legacy single-string format missing extension"
-            );
-            assert!(result.unwrap_err().to_string().contains("Unknown(62190)"));
-        }
-    }
-
     /// Test parsing a complete key package event with valid MIP-00 tags
     #[test]
     fn test_parse_key_package_with_valid_tags() {
@@ -2067,54 +1601,6 @@ mod tests {
         assert!(
             result.is_ok(),
             "Should parse key package with valid MIP-00 tags, got error: {:?}",
-            result
-        );
-    }
-
-    /// Test parsing a key package event with legacy tags
-    /// TODO: Remove this test after legacy format support is removed (target: EOY 2025)
-    #[test]
-    fn test_parse_key_package_with_legacy_tags() {
-        let mdk = create_test_mdk();
-        // Use generated keys so credential identity matches event signer
-        let keys = nostr::Keys::generate();
-
-        let (key_package_hex, _) = mdk
-            .create_key_package_for_event(&keys.public_key(), vec![])
-            .expect("Failed to create key package");
-
-        // Create event with legacy tag format (without mls_ prefix for ciphersuite/extensions, string values)
-        // Note: protocol_version was always correct, no legacy support needed
-        let legacy_tags = vec![
-            Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
-            Tag::custom(
-                TagKind::custom("ciphersuite"),
-                ["MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519"],
-            ),
-            Tag::custom(
-                TagKind::custom("extensions"),
-                [
-                    "RequiredCapabilities",
-                    "LastResort",
-                    "RatchetTree",
-                    "Unknown(62190)",
-                ],
-            ),
-            Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
-            Tag::custom(TagKind::Custom("encoding".into()), ["base64"]),
-        ];
-
-        // Sign with the same keys used in the credential
-        let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex)
-            .tags(legacy_tags)
-            .sign_with_keys(&keys)
-            .unwrap();
-
-        // Parse key package - should succeed with legacy format
-        let result = mdk.parse_key_package(&event);
-        assert!(
-            result.is_ok(),
-            "Should parse key package with legacy tags, got error: {:?}",
             result
         );
     }

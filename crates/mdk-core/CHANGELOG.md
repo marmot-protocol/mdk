@@ -27,6 +27,13 @@
 
 ### Breaking changes
 
+- **Legacy Format Removal**: Removed support for legacy key package tag formats and extension formats that were deprecated after EOY 2025 migration period ([#146](https://github.com/marmot-protocol/mdk/pull/146))
+  - Key package validation now only accepts MIP-00 compliant formats:
+    - `mls_ciphersuite` tag must use hex format (e.g., `0x0001`), numeric (`1`) and string (`MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519`) formats are no longer accepted
+    - `mls_extensions` tag must use hex format (e.g., `0x000a`, `0xf2ee`), legacy string names (`RequiredCapabilities`, `LastResort`, etc.) and comma-separated strings are no longer accepted
+    - Tag names must use `mls_ciphersuite` and `mls_extensions` prefixes; legacy `ciphersuite` and `extensions` tag names are no longer accepted
+  - Removed `LegacyTlsNostrGroupDataExtension` struct and related migration code for pre-version extension format
+  - Groups created before the version field was added to extensions are no longer supported
 - **Security (Audit Issue M)**: Changed `get_message()` to require both `mls_group_id` and `event_id` parameters. This prevents messages from different groups from overwriting each other by scoping lookups to a specific group. ([#124](https://github.com/marmot-protocol/mdk/pull/124))
 - **Credential Identity Encoding**: Removed support for legacy 64-byte UTF-8 hex-encoded credential identities ([#15](https://github.com/marmot-protocol/mdk/issues/15))
   - Credential identities must now be exactly 32 bytes (raw public key) per MIP-00
