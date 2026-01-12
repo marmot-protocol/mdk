@@ -40,6 +40,9 @@
 ### Fixed
 
 - **Security**: Secret values in bindings now use `Secret<T>` wrapper for automatic memory zeroization, preventing sensitive cryptographic material from persisting in memory ([#109](https://github.com/marmot-protocol/mdk/pull/109))
+- **Build**: Improved Android cross-compilation by requiring `ANDROID_OPENSSL_DIR` environment variable pointing to prebuilt OpenSSL libraries, with clear error messages explaining the required directory structure
+- **Build**: Added `RANLIB` configuration for Android NDK toolchain to fix OpenSSL library installation
+- **Build**: Added Rust target installation checks for both Android and iOS builds with helpful error messages showing how to install missing targets
 
 ### Removed
 

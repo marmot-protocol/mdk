@@ -81,7 +81,6 @@ _build-uniffi needs_android="false" needs_ios="false":
     if [ "{{needs_android}}" = "true" ]; then
         just _build-uniffi-android aarch64-linux-android aarch64-linux-android21-clang
         just _build-uniffi-android armv7-linux-androideabi armv7a-linux-androideabi21-clang
-        just _build-uniffi-android x86_64-linux-android x86_64-linux-android21-clang
     fi
     if [ "{{needs_ios}}" = "true" ] && [ "{{os()}}" = "macos" ]; then
         just _build-uniffi-ios aarch64-apple-ios
@@ -89,11 +88,43 @@ _build-uniffi needs_android="false" needs_ios="false":
     fi
 
 _build-uniffi-ios TARGET:
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    # Check if the iOS target is installed
+    if ! rustup target list --installed | grep -q "{{TARGET}}"; then
+        echo "Error: Rust target '{{TARGET}}' is not installed." >&2
+        echo "" >&2
+        echo "Install it with:" >&2
+        echo "  rustup target add {{TARGET}}" >&2
+        echo "" >&2
+        echo "For iOS development, you typically need:" >&2
+        echo "  rustup target add aarch64-apple-ios        # iOS devices" >&2
+        echo "  rustup target add aarch64-apple-ios-sim    # iOS Simulator (Apple Silicon)" >&2
+        echo "  rustup target add x86_64-apple-ios         # iOS Simulator (Intel)" >&2
+        exit 1
+    fi
+
     cargo build --release --lib -p mdk-uniffi --target {{TARGET}}
 
 _build-uniffi-android TARGET CLANG_PREFIX:
     #!/usr/bin/env bash
     set -euo pipefail
+
+    # Check if the Android target is installed
+    if ! rustup target list --installed | grep -q "{{TARGET}}"; then
+        echo "Error: Rust target '{{TARGET}}' is not installed." >&2
+        echo "" >&2
+        echo "Install it with:" >&2
+        echo "  rustup target add {{TARGET}}" >&2
+        echo "" >&2
+        echo "For Android development, you typically need:" >&2
+        echo "  rustup target add aarch64-linux-android      # ARM64 devices" >&2
+        echo "  rustup target add armv7-linux-androideabi    # ARM32 devices" >&2
+        echo "  rustup target add x86_64-linux-android       # x86_64 emulator" >&2
+        exit 1
+    fi
+
     # Normalize platform detection to match NDK host-tag naming
     OS=$(uname -s | tr '[:upper:]' '[:lower:]')
     ARCH=$(uname -m)
@@ -135,7 +166,81 @@ _build-uniffi-android TARGET CLANG_PREFIX:
 
     export CC_${TARGET_UNDER}="${LLVM_BIN}/{{CLANG_PREFIX}}"
     export AR_${TARGET_UNDER}="${LLVM_BIN}/llvm-ar"
+    export RANLIB_${TARGET_UNDER}="${LLVM_BIN}/llvm-ranlib"
     export CARGO_TARGET_${TARGET_UPPER}_LINKER="${LLVM_BIN}/{{CLANG_PREFIX}}"
+
+    # Map target triple to Android ABI for OpenSSL directory lookup
+    case "{{TARGET}}" in
+        aarch64-linux-android)
+            ANDROID_ABI="arm64-v8a"
+            ;;
+        armv7-linux-androideabi)
+            ANDROID_ABI="armeabi-v7a"
+            ;;
+        x86_64-linux-android)
+            ANDROID_ABI="x86_64"
+            ;;
+        i686-linux-android)
+            ANDROID_ABI="x86"
+            ;;
+        *)
+            echo "Error: Unknown Android target: {{TARGET}}" >&2
+            exit 1
+            ;;
+    esac
+
+    # Check for OpenSSL installation for Android
+    # Look for target-specific dir first, then fall back to base ANDROID_OPENSSL_DIR
+    if [ -n "${ANDROID_OPENSSL_DIR:-}" ]; then
+        # Support both flat structure (ANDROID_OPENSSL_DIR/include, lib) and
+        # per-ABI structure (ANDROID_OPENSSL_DIR/<abi>/include, lib)
+        if [ -d "${ANDROID_OPENSSL_DIR}/${ANDROID_ABI}" ]; then
+            OPENSSL_DIR="${ANDROID_OPENSSL_DIR}/${ANDROID_ABI}"
+        else
+            OPENSSL_DIR="${ANDROID_OPENSSL_DIR}"
+        fi
+    fi
+
+    if [ -z "${OPENSSL_DIR:-}" ]; then
+        echo "Error: OpenSSL for Android not found." >&2
+        echo "" >&2
+        echo "SQLCipher requires OpenSSL headers and libraries for Android builds." >&2
+        echo "Please set ANDROID_OPENSSL_DIR to a directory containing prebuilt OpenSSL" >&2
+        echo "for Android, with the following structure:" >&2
+        echo "" >&2
+        echo "  \$ANDROID_OPENSSL_DIR/" >&2
+        echo "    arm64-v8a/" >&2
+        echo "      include/openssl/*.h" >&2
+        echo "      lib/libcrypto.a" >&2
+        echo "    armeabi-v7a/" >&2
+        echo "      include/openssl/*.h" >&2
+        echo "      lib/libcrypto.a" >&2
+        echo "    x86_64/" >&2
+        echo "      include/openssl/*.h" >&2
+        echo "      lib/libcrypto.a" >&2
+        echo "" >&2
+        echo "You can build OpenSSL for Android using:" >&2
+        echo "  https://github.com/aspect-build/aspect-build-openssl-android" >&2
+        echo "  or https://github.com/aspect-build/aspect-build-prefab" >&2
+        exit 1
+    fi
+
+    if [ ! -d "${OPENSSL_DIR}/include/openssl" ]; then
+        echo "Error: OpenSSL headers not found at ${OPENSSL_DIR}/include/openssl" >&2
+        exit 1
+    fi
+
+    # Set OpenSSL environment variables for the target
+    # The openssl-sys crate looks for these target-prefixed variables
+    export OPENSSL_DIR_${TARGET_UNDER}="${OPENSSL_DIR}"
+    export OPENSSL_INCLUDE_DIR_${TARGET_UNDER}="${OPENSSL_DIR}/include"
+    export OPENSSL_LIB_DIR_${TARGET_UNDER}="${OPENSSL_DIR}/lib"
+    # Also set the non-prefixed versions as fallback
+    export OPENSSL_DIR="${OPENSSL_DIR}"
+    export OPENSSL_INCLUDE_DIR="${OPENSSL_DIR}/include"
+    export OPENSSL_LIB_DIR="${OPENSSL_DIR}/lib"
+    # Tell openssl-sys to use static linking
+    export OPENSSL_STATIC=1
 
     cargo build --release --lib -p mdk-uniffi --target {{TARGET}}
 
