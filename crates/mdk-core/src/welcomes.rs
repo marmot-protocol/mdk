@@ -552,39 +552,27 @@ where
         Ok(welcome_preview)
     }
 
-    /// Cleans up KeyPackages after welcome acceptance per MIP-02.
+    /// Determines if the consumed KeyPackage should be deleted from relays per MIP-02.
     ///
-    /// KeyPackage deletion depends on the `last_resort` extension:
-    /// - Non-last-resort: deleted after joining (prevents stale invitation vectors)
-    /// - Last-resort: kept for reuse until fresh packages are published
+    /// KeyPackage relay deletion depends on the `last_resort` extension:
+    /// - Non-last-resort: SHOULD be deleted from relays after joining (prevents stale invitation vectors)
+    /// - Last-resort: SHOULD NOT be deleted from relays (can be reused until fresh packages are published)
     ///
-    /// Returns `true` if the KeyPackage should be deleted from relays (non-last-resort),
-    /// `false` if it should be kept (last-resort).
-    ///
-    /// Note: MDK always creates KeyPackages with the `last_resort` extension enabled
-    /// (see `key_packages.rs`), so this function currently always returns `false`.
-    /// The `last_resort` extension is a KeyPackage-level marker that is not transferred
-    /// to the LeafNode after joining, so we cannot determine it from the MlsGroup.
-    /// If non-last-resort KeyPackages are supported in the future, this logic will
-    /// need to be updated to check the KeyPackage before `into_group()` is called.
+    /// Note: MDK always creates KeyPackages with the `last_resort` extension (see `key_packages.rs`),
+    /// so this currently always returns `false`. OpenMLS handles local storage deletion internally
+    /// based on the `last_resort` extension. This function determines relay-side deletion behavior.
     fn cleanup_key_packages_after_welcome_acceptance(
         &self,
         _mls_group: &MlsGroup,
     ) -> Result<bool, Error> {
-        // MDK always creates KeyPackages with last_resort extension enabled.
-        // The last_resort extension is a KeyPackage-level marker (not transferred to LeafNode),
-        // so we cannot determine it from the MlsGroup after joining.
+        // MDK always creates KeyPackages with last_resort extension.
+        // Per MIP-02 and threat model T.7.3, last-resort KeyPackages should NOT
+        // be deleted from relays immediately - they should be deleted after
+        // fresh packages are published.
         //
-        // Per MIP-02 and threat model T.7.3:
-        // - Last-resort KeyPackages SHOULD NOT be deleted immediately after use
-        // - They SHOULD be deleted after fresh packages are published
-        //
-        // Since all MDK KeyPackages have last_resort, we always return false.
-        tracing::debug!(
-            target: "mdk_core::welcomes::cleanup_key_packages",
-            "MDK KeyPackages have last_resort extension by default, skipping relay deletion"
-        );
-
+        // If non-last-resort KeyPackages are supported in the future, this logic
+        // would need to check the KeyPackage before into_group() is called,
+        // since the last_resort extension is not transferred to the LeafNode.
         Ok(false)
     }
 }
