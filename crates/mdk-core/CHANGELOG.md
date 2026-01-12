@@ -27,6 +27,7 @@
 
 ### Breaking changes
 
+- Changed `accept_welcome()` return type from `Result<(), Error>` to `Result<AcceptWelcomeResult, Error>`. The new `AcceptWelcomeResult` struct contains `should_delete_key_package_from_relay: bool` to indicate whether the consumed KeyPackage should be deleted from relays per MIP-02. ([#143](https://github.com/marmot-protocol/mdk/pull/143))
 - Replaced `Error::MissingWelcomeForProcessedWelcome` with `Error::WelcomePreviouslyFailed(String)`. When retrying a welcome that previously failed, the new error includes the original failure reason instead of a generic message. ([#136](https://github.com/marmot-protocol/mdk/pull/136))
 - Changed `get_messages()` signature to accept `Option<Pagination>` parameter. Callers must now pass `None` for default pagination or `Some(Pagination::new(...))` for custom pagination ([#111](https://github.com/marmot-protocol/mdk/pull/111))
 - **Content Encoding**: Removed support for hex encoding in key package and welcome event content ([#98](https://github.com/marmot-protocol/mdk/pull/98))
@@ -46,6 +47,7 @@
 
 ### Added
 
+- Implemented KeyPackage deletion path after welcome acceptance per MIP-02 (Issue #89). The `accept_welcome()` method now returns `AcceptWelcomeResult` indicating whether the caller should delete the consumed KeyPackage from relays. Returns `true` for non-last-resort KeyPackages, `false` for last-resort. ([#143](https://github.com/marmot-protocol/mdk/pull/143))
 - New `MessageProcessingResult::PendingProposal` variant returned when a non-admin member receives a proposal. The proposal is stored as pending and awaits commitment by an admin. ([#122](https://github.com/marmot-protocol/mdk/pull/122))
 - New error variant `IdentityChangeNotAllowed` for rejecting proposals and commits that attempt to change member identity ([#126](https://github.com/marmot-protocol/mdk/pull/126))
 - Added `nostr_group_id` field to `NostrGroupDataUpdate` struct, enabling rotation of the Nostr group ID used for message routing per MIP-01 ([#127](https://github.com/marmot-protocol/mdk/pull/127))
