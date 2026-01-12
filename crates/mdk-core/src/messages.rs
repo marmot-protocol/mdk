@@ -926,56 +926,7 @@ where
         staged_commit: StagedCommit,
         commit_sender: &Sender,
     ) -> Result<()> {
-        // Verify authorization before processing the commit
-        // Only members can create commits, so we check for Sender::Member
-        match commit_sender {
-            Sender::Member(leaf_index) => {
-                let member = mls_group
-                    .member_at(*leaf_index)
-                    .ok_or(Error::MessageFromNonMember)?;
-
-                // Check if sender is an admin by extracting their pubkey from credentials
-                let basic_cred = BasicCredential::try_from(member.credential.clone())?;
-                let sender_pubkey = self.parse_credential_identity(basic_cred.identity())?;
-                let group_data = crate::extension::NostrGroupDataExtension::from_group(mls_group)?;
-                let sender_is_admin = group_data.admins.contains(&sender_pubkey);
-
-                // Check if this is a pure self-update commit (allowed from any member)
-                // A pure self-update has no add/remove proposals and only updates the sender's own leaf
-                let is_pure_self_update =
-                    self.is_pure_self_update_commit(&staged_commit, leaf_index);
-
-                match (sender_is_admin, is_pure_self_update) {
-                    (true, _) => {}
-                    (false, true) => {
-                        tracing::debug!(
-                            target: "mdk_core::messages::process_commit_message_for_group",
-                            "Allowing self-update commit from non-admin member at leaf index {:?}",
-                            leaf_index
-                        );
-                    }
-                    (false, false) => {
-                        tracing::warn!(
-                            target: "mdk_core::messages::process_commit_message_for_group",
-                            "Received non-self-update commit from non-admin member at leaf index {:?}",
-                            leaf_index
-                        );
-                        return Err(Error::CommitFromNonAdmin);
-                    }
-                }
-            }
-            _ => {
-                // External senders or other sender types cannot create valid commits
-                tracing::warn!(
-                    target: "mdk_core::messages::process_commit_message_for_group",
-                    "Received commit from non-member sender."
-                );
-                return Err(Error::MessageFromNonMember);
-            }
-        }
-
-        // Validate that no proposals in the commit attempt to change identity
-        // MIP-00 mandates immutable identity fields
+        self.validate_commit_sender_authorization(mls_group, &staged_commit, commit_sender)?;
         self.validate_staged_commit_identities(mls_group, &staged_commit, commit_sender)?;
 
         let group_id: GroupId = mls_group.group_id().into();
@@ -985,43 +936,14 @@ where
             .map_err(|e| Error::Message(e.to_string()))?;
 
         // Check if the local member was removed by this commit
-        // After merge, own_leaf() returns None if we were evicted
         if mls_group.own_leaf().is_none() {
-            tracing::info!(
-                target: "mdk_core::messages::process_commit_message_for_group",
-                "Local member was removed from group, setting group state to Inactive"
-            );
-
-            // Update group state to Inactive
-            if let Some(mut group) = self.get_group(&group_id)? {
-                group.state = group_types::GroupState::Inactive;
-                self.storage()
-                    .save_group(group)
-                    .map_err(|e| Error::Group(e.to_string()))?;
-            }
-
-            // Skip exporter_secret and sync_group_metadata_from_mls since we're evicted
-            // Save processed message and return success
-            let processed_message = message_types::ProcessedMessage {
-                wrapper_event_id: event.id,
-                message_event_id: None,
-                processed_at: Timestamp::now(),
-                state: message_types::ProcessedMessageState::Processed,
-                failure_reason: None,
-            };
-
-            self.storage()
-                .save_processed_message(processed_message)
-                .map_err(|e| Error::Message(e.to_string()))?;
-
-            return Ok(());
+            return self.handle_local_member_eviction(&group_id, event);
         }
 
         // Save exporter secret for the new epoch
         self.exporter_secret(&group_id)?;
 
         // Sync the stored group metadata with the updated MLS group state
-        // This ensures any group context extension changes are reflected in storage
         self.sync_group_metadata_from_mls(&group_id)?;
 
         // Save a processed message so we don't reprocess
@@ -1036,6 +958,124 @@ where
         self.storage()
             .save_processed_message(processed_message)
             .map_err(|e| Error::Message(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Validates that the commit sender is authorized to create this commit.
+    ///
+    /// Admins can create any commit. Non-admins can only create pure self-update commits
+    /// (commits that only update their own leaf node with no add/remove proposals).
+    ///
+    /// # Arguments
+    ///
+    /// * `mls_group` - The MLS group to check authorization against
+    /// * `staged_commit` - The staged commit to validate
+    /// * `commit_sender` - The MLS sender of the commit
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(())` - If the sender is authorized
+    /// * `Err(Error::CommitFromNonAdmin)` - If a non-admin tries to create a non-self-update commit
+    /// * `Err(Error::MessageFromNonMember)` - If the sender is not a member
+    fn validate_commit_sender_authorization(
+        &self,
+        mls_group: &MlsGroup,
+        staged_commit: &StagedCommit,
+        commit_sender: &Sender,
+    ) -> Result<()> {
+        match commit_sender {
+            Sender::Member(leaf_index) => {
+                let member = mls_group
+                    .member_at(*leaf_index)
+                    .ok_or(Error::MessageFromNonMember)?;
+
+                let basic_cred = BasicCredential::try_from(member.credential.clone())?;
+                let sender_pubkey = self.parse_credential_identity(basic_cred.identity())?;
+                let group_data = crate::extension::NostrGroupDataExtension::from_group(mls_group)?;
+                let sender_is_admin = group_data.admins.contains(&sender_pubkey);
+
+                let is_pure_self_update =
+                    self.is_pure_self_update_commit(staged_commit, leaf_index);
+
+                match (sender_is_admin, is_pure_self_update) {
+                    (true, _) => Ok(()),
+                    (false, true) => {
+                        tracing::debug!(
+                            target: "mdk_core::messages::process_commit_message_for_group",
+                            "Allowing self-update commit from non-admin member at leaf index {:?}",
+                            leaf_index
+                        );
+                        Ok(())
+                    }
+                    (false, false) => {
+                        tracing::warn!(
+                            target: "mdk_core::messages::process_commit_message_for_group",
+                            "Received non-self-update commit from non-admin member at leaf index {:?}",
+                            leaf_index
+                        );
+                        Err(Error::CommitFromNonAdmin)
+                    }
+                }
+            }
+            _ => {
+                tracing::warn!(
+                    target: "mdk_core::messages::process_commit_message_for_group",
+                    "Received commit from non-member sender."
+                );
+                Err(Error::MessageFromNonMember)
+            }
+        }
+    }
+
+    /// Handles the case where the local member was removed from a group.
+    ///
+    /// Sets the group state to Inactive and saves a processed message record.
+    /// Called after merge_staged_commit when own_leaf() returns None.
+    ///
+    /// # Arguments
+    ///
+    /// * `group_id` - The ID of the group the member was removed from
+    /// * `event` - The wrapper Nostr event containing the commit
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(())` - If the eviction was handled successfully
+    /// * `Err(Error)` - If storage operations fail
+    fn handle_local_member_eviction(&self, group_id: &GroupId, event: &Event) -> Result<()> {
+        tracing::info!(
+            target: "mdk_core::messages::process_commit_message_for_group",
+            group_id = %hex::encode(group_id.as_slice()),
+            "Local member was removed from group, setting group state to Inactive"
+        );
+
+        match self.get_group(group_id)? {
+            Some(mut group) => {
+                group.state = group_types::GroupState::Inactive;
+                self.storage()
+                    .save_group(group)
+                    .map_err(|e| Error::Group(e.to_string()))?;
+            }
+            None => {
+                tracing::warn!(
+                    target: "mdk_core::messages::process_commit_message_for_group",
+                    group_id = %hex::encode(group_id.as_slice()),
+                    "Group not found in storage while handling eviction"
+                );
+            }
+        }
+
+        let processed_message = message_types::ProcessedMessage {
+            wrapper_event_id: event.id,
+            message_event_id: None,
+            processed_at: Timestamp::now(),
+            state: message_types::ProcessedMessageState::Processed,
+            failure_reason: None,
+        };
+
+        self.storage()
+            .save_processed_message(processed_message)
+            .map_err(|e| Error::Message(e.to_string()))?;
+
         Ok(())
     }
 
@@ -1693,8 +1733,8 @@ mod tests {
     use crate::test_util::*;
     use crate::tests::create_test_mdk;
     use mdk_storage_traits::groups::GroupStorage;
-    use mdk_storage_traits::messages::types::ProcessedMessageState;
     use mdk_storage_traits::messages::MessageStorage;
+    use mdk_storage_traits::messages::types::ProcessedMessageState;
 
     #[test]
     fn test_get_message_not_found() {
