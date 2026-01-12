@@ -489,19 +489,6 @@ Since this is a completely breaking change with no migration path from the old d
 
 ---
 
-## Estimated Effort
-
-| Phase | Effort | Dependencies |
-|-------|--------|--------------|
-| Phase 1: Update traits | 1-2 hours | None |
-| Phase 2: SQLite impl | 4-6 hours | Phase 1 |
-| Phase 3: Memory impl | 2-3 hours | Phase 1 |
-| Phase 4: Update mdk-core | 1 hour | Phases 1-3 |
-| Phase 5: Testing | 2-3 hours | Phases 1-4 |
-| **Total** | **10-15 hours** | |
-
----
-
 ## Future Work
 
 Once this unified storage architecture is in place, we can implement:
