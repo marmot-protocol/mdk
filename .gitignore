@@ -15,3 +15,6 @@ coverage/
 
 # Claude AI settings (local overrides)
 .claude/settings.local.json
+
+# Android build artifacts
+**/jniLibs/
