@@ -549,47 +549,31 @@ where
     /// Returns `true` if the KeyPackage should be deleted from relays (non-last-resort),
     /// `false` if it should be kept (last-resort).
     ///
-    /// Note: OpenMLS automatically consumes the KeyPackage's private key material during
-    /// `StagedWelcome::into_group()`. This function determines whether the caller should
-    /// also delete the KeyPackage from relays.
+    /// Note: MDK always creates KeyPackages with the `last_resort` extension enabled
+    /// (see `key_packages.rs`), so this function currently always returns `false`.
+    /// The `last_resort` extension is a KeyPackage-level marker that is not transferred
+    /// to the LeafNode after joining, so we cannot determine it from the MlsGroup.
+    /// If non-last-resort KeyPackages are supported in the future, this logic will
+    /// need to be updated to check the KeyPackage before `into_group()` is called.
     fn cleanup_key_packages_after_welcome_acceptance(
         &self,
-        mls_group: &MlsGroup,
+        _mls_group: &MlsGroup,
     ) -> Result<bool, Error> {
-        let own_leaf = match mls_group.own_leaf() {
-            Some(leaf) => leaf,
-            None => {
-                tracing::warn!(
-                    target: "mdk_core::welcomes::cleanup_key_packages",
-                    "No own leaf found in group, skipping KeyPackage cleanup"
-                );
-                // Cannot determine last_resort status, default to not deleting
-                return Ok(false);
-            }
-        };
-
-        let has_last_resort = own_leaf
-            .extensions()
-            .iter()
-            .any(|ext| matches!(ext, Extension::LastResort(_)));
-
-        if has_last_resort {
-            tracing::debug!(
-                target: "mdk_core::welcomes::cleanup_key_packages",
-                "KeyPackage has last_resort extension, skipping relay deletion"
-            );
-            return Ok(false);
-        }
-
-        // Non-last-resort path: OpenMLS already consumed the KeyPackage's private key
-        // material during StagedWelcome::into_group(). The caller should delete the
-        // KeyPackage from relays to prevent stale invitation vectors.
+        // MDK always creates KeyPackages with last_resort extension enabled.
+        // The last_resort extension is a KeyPackage-level marker (not transferred to LeafNode),
+        // so we cannot determine it from the MlsGroup after joining.
+        //
+        // Per MIP-02 and threat model T.7.3:
+        // - Last-resort KeyPackages SHOULD NOT be deleted immediately after use
+        // - They SHOULD be deleted after fresh packages are published
+        //
+        // Since all MDK KeyPackages have last_resort, we always return false.
         tracing::debug!(
             target: "mdk_core::welcomes::cleanup_key_packages",
-            "Non-last-resort KeyPackage consumed, relay deletion recommended"
+            "MDK KeyPackages have last_resort extension by default, skipping relay deletion"
         );
 
-        Ok(true)
+        Ok(false)
     }
 }
 
@@ -1709,9 +1693,15 @@ mod tests {
             .expect("Failed to process welcome");
 
         // This triggers cleanup_key_packages_after_welcome_acceptance internally
-        bob_mdk
+        let result = bob_mdk
             .accept_welcome(&welcome)
             .expect("Failed to accept welcome");
+
+        // Verify last_resort KeyPackage behavior: should NOT delete from relay
+        assert!(
+            !result.should_delete_key_package_from_relay,
+            "Last-resort KeyPackage should not be deleted from relay"
+        );
 
         // Verify Bob joined successfully
         let bob_groups = bob_mdk.get_groups().expect("Failed to get groups");
