@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 
 use crate::encrypted_media::crypto::{
     DEFAULT_SCHEME_VERSION, decrypt_data_with_aad, derive_encryption_key, encrypt_data_with_aad,
-    generate_encryption_nonce,
+    generate_encryption_nonce, is_scheme_version_supported,
 };
 use crate::encrypted_media::metadata::extract_and_process_metadata;
 use crate::encrypted_media::types::{
@@ -341,8 +341,7 @@ where
         })?;
 
         // Validate that the version is supported
-        // Currently only "mip04-v2" is supported
-        if scheme_version != "mip04-v2" {
+        if !is_scheme_version_supported(&scheme_version) {
             return Err(EncryptedMediaError::DecryptionFailed {
                 reason: format!("Unsupported MIP-04 encryption version: {}", scheme_version),
             });

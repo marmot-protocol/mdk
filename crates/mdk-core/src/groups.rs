@@ -2965,7 +2965,7 @@ mod tests {
             "sync_group_metadata_from_mls should propagate extension parse errors"
         );
 
-        // Verify it's a deserialization error (the specific error from deserialize_with_migration)
+        // Verify it's a deserialization error (the specific error from deserialize_bytes)
         match result {
             Err(e) => {
                 let error_msg = e.to_string();

@@ -20,6 +20,20 @@ use crate::{GroupId, MDK};
 /// Default scheme version for MIP-04 encryption
 pub const DEFAULT_SCHEME_VERSION: &str = "mip04-v2";
 
+/// Check if a scheme version is supported for decryption
+///
+/// This function determines if the given version string corresponds to a supported
+/// encryption scheme. Currently, "mip04-v2" is the standard supported version.
+/// "mip04-v1" is NOT supported due to security vulnerabilities.
+pub fn is_scheme_version_supported(version: &str) -> bool {
+    match version {
+        "mip04-v2" => true,
+        // mip04-v1 is explicitly unsupported
+        // Future versions can be added here
+        _ => false,
+    }
+}
+
 /// Get scheme label bytes from version string
 ///
 /// This function maps version strings to their corresponding scheme labels
@@ -27,7 +41,6 @@ pub const DEFAULT_SCHEME_VERSION: &str = "mip04-v2";
 /// schemes while maintaining backward compatibility.
 fn get_scheme_label(version: &str) -> Result<&[u8], EncryptedMediaError> {
     match version {
-        "mip04-v1" => Ok(b"mip04-v1"),
         "mip04-v2" => Ok(b"mip04-v2"),
         // Future versions can be added here
         _ => Err(EncryptedMediaError::UnknownSchemeVersion(
@@ -646,10 +659,12 @@ mod tests {
             filename,
         );
         assert!(result.is_err());
-        assert!(matches!(
-            result,
-            Err(EncryptedMediaError::DecryptionFailed { .. })
-        ));
+        // mip04-v1 is no longer supported, so we expect UnknownSchemeVersion
+        match result {
+            Err(EncryptedMediaError::UnknownSchemeVersion(v)) => assert_eq!(v, "mip04-v1"),
+            Err(e) => panic!("Expected UnknownSchemeVersion, got {:?}", e),
+            Ok(_) => panic!("Should have failed"),
+        }
     }
 
     #[test]

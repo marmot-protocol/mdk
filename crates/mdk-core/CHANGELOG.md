@@ -28,6 +28,13 @@
 ### Breaking changes
 
 - **OpenMLS Dependency**: Updated to OpenMLS git main branch (commit b90ca23b) for GREASE support. This may introduce minor API changes from upstream. The dependency will be reverted to crates.io versions once OpenMLS releases a version with GREASE support. ([#142](https://github.com/marmot-protocol/mdk/pull/142))
+- **Legacy Format Removal**: Removed support for legacy key package tag formats and extension formats that were deprecated after EOY 2025 migration period ([#146](https://github.com/marmot-protocol/mdk/pull/146))
+  - Key package validation now only accepts MIP-00 compliant formats:
+    - `mls_ciphersuite` tag must use hex format (e.g., `0x0001`), numeric (`1`) and string (`MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519`) formats are no longer accepted
+    - `mls_extensions` tag must use hex format (e.g., `0x000a`, `0xf2ee`), legacy string names (`RequiredCapabilities`, `LastResort`, etc.) and comma-separated strings are no longer accepted
+    - Tag names must use `mls_ciphersuite` and `mls_extensions` prefixes; legacy `ciphersuite` and `extensions` tag names are no longer accepted
+  - Removed `LegacyTlsNostrGroupDataExtension` struct and related migration code for pre-version extension format
+  - Groups created before the version field was added to extensions are no longer supported
 - **Security (Audit Issue M)**: Changed `get_message()` to require both `mls_group_id` and `event_id` parameters. This prevents messages from different groups from overwriting each other by scoping lookups to a specific group. ([#124](https://github.com/marmot-protocol/mdk/pull/124))
 - **Credential Identity Encoding**: Removed support for legacy 64-byte UTF-8 hex-encoded credential identities ([#15](https://github.com/marmot-protocol/mdk/issues/15))
   - Credential identities must now be exactly 32 bytes (raw public key) per MIP-00
@@ -94,6 +101,7 @@
 - **Security (Audit Issue S)**: Added validation for mandatory `relays` tag in MLS KeyPackage events. The `validate_key_package_tags` function now requires a `relays` tag with at least one valid relay URL, preventing acceptance of unroutable key packages that could cause delivery failures or enable denial-of-service attacks. ([#118](https://github.com/marmot-protocol/mdk/pull/118))
 - **Security (Audit Issue T)**: Fixed incomplete MIME type canonicalization in `validate_mime_type` ([#95](https://github.com/marmot-protocol/mdk/pull/110))
 - **Security (Audit Issue U)**: Fixed deterministic nonce derivation that caused nonce reuse and message linkability. Encryption now uses random nonces per encryption operation, stored in the IMETA tag. The nonce field (`n`) is now required in IMETA tags. ([#114](https://github.com/marmot-protocol/mdk/pull/114))
+- **Security (Audit Issue V)**: Replaced hard-coded MIP-04 version check with dynamic validation. Previously, the media manager explicitly checked for 'mip04-v2', which would require code changes to support future versions. Now, it validates against the supported versions defined in the crypto module, allowing for smoother protocol upgrades while still rejecting insecure legacy versions (v1). ([#145](https://github.com/marmot-protocol/mdk/pull/145))
 - **Security (Audit Issue W)**: Added MIME type validation and allowlist enforcement ([#95](https://github.com/marmot-protocol/mdk/pull/110))
 - **Security (Audit Issue Y)**: Encrypted media keys and nonces now use `Secret<T>` wrapper for automatic memory zeroization, preventing sensitive cryptographic material from persisting in memory ([#109](https://github.com/marmot-protocol/mdk/pull/109))
 - **Security (Audit Issue Z)**: Added pagination to prevent memory exhaustion from unbounded loading of group messages ([#111](https://github.com/marmot-protocol/mdk/pull/111))
