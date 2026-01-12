@@ -36,12 +36,10 @@ impl MessageStorage for MdkMemoryStorage {
             }
         }
 
-        // Save in the messages cache
+        // Acquire both cache write guards to ensure coordinated eviction
         let mut cache = self.messages_cache.write();
-        cache.put(message.id, message.clone());
-
-        // Save in the messages_by_group cache using HashMap for O(1) insert/update
         let mut group_cache = self.messages_by_group_cache.write();
+
         match group_cache.get_mut(&message.mls_group_id) {
             Some(group_messages) => {
                 // Check if this is an update (message already exists) or a new message
@@ -55,21 +53,26 @@ impl MessageStorage for MdkMemoryStorage {
                         .min_by_key(|(_, msg)| msg.created_at)
                         .map(|(id, _)| *id)
                     {
+                        // Remove from both caches to prevent orphaned entries
                         group_messages.remove(&oldest_id);
+                        cache.pop(&oldest_id);
                     }
                 }
 
                 // O(1) insert or update using HashMap
-                group_messages.insert(message.id, message);
+                group_messages.insert(message.id, message.clone());
             }
             None => {
                 // Create new HashMap for this group
                 let mut messages = HashMap::new();
                 let group_id = message.mls_group_id.clone();
-                messages.insert(message.id, message);
+                messages.insert(message.id, message.clone());
                 group_cache.put(group_id, messages);
             }
         }
+
+        // Save in the messages cache
+        cache.put(message.id, message);
 
         Ok(())
     }
@@ -377,15 +380,20 @@ mod tests {
         }
     }
 
-    /// Test that the messages per group limit is enforced and oldest messages are evicted
+    /// Test that the messages per group limit is enforced and oldest messages are evicted.
+    /// This test verifies that:
+    /// 1. When MAX_MESSAGES_PER_GROUP is reached, the oldest message is evicted
+    /// 2. Evicted messages are removed from BOTH caches (messages_cache and messages_by_group_cache)
+    /// 3. Updates to existing messages don't trigger eviction
     #[test]
     fn test_save_message_per_group_limit_eviction() {
+        use crate::MAX_MESSAGES_PER_GROUP;
         use std::num::NonZeroUsize;
 
         // Create storage with a small cache size for testing
         let storage = MdkMemoryStorage::with_cache_size(
             MemoryStorage::default(),
-            NonZeroUsize::new(100).unwrap(),
+            NonZeroUsize::new(20000).unwrap(), // Large enough to hold all messages
         );
 
         let group_id = GroupId::from_slice(&[1, 2, 3, 4]);
@@ -394,21 +402,19 @@ mod tests {
         let group = create_test_group(group_id.clone());
         storage.save_group(group).unwrap();
 
-        // We'll test with a smaller number since MAX_MESSAGES_PER_GROUP is 10000
-        // The test verifies the eviction logic works correctly
-        let test_limit = 50;
-
-        // Save test_limit messages
-        for i in 0..test_limit {
+        // Save exactly MAX_MESSAGES_PER_GROUP messages
+        // Use timestamps 1000..1000+MAX to establish age ordering
+        for i in 0..MAX_MESSAGES_PER_GROUP {
             let mut event_bytes = [0u8; 32];
             event_bytes[0] = (i % 256) as u8;
-            event_bytes[1] = (i / 256) as u8;
+            event_bytes[1] = ((i / 256) % 256) as u8;
+            event_bytes[2] = ((i / 65536) % 256) as u8;
             let event_id = EventId::from_slice(&event_bytes).unwrap();
             let message = create_test_message(
                 event_id,
                 group_id.clone(),
                 &format!("Message {}", i),
-                1000 + i as u64,
+                1000 + i as u64, // Oldest message has timestamp 1000
             );
             storage.save_message(message).unwrap();
         }
@@ -417,28 +423,98 @@ mod tests {
         {
             let cache = storage.messages_by_group_cache.read();
             let group_messages = cache.peek(&group_id).unwrap();
-            assert_eq!(group_messages.len(), test_limit);
+            assert_eq!(group_messages.len(), MAX_MESSAGES_PER_GROUP);
         }
 
-        // Verify updating an existing message doesn't trigger eviction
-        let mut event_bytes = [0u8; 32];
-        event_bytes[0] = 25; // Update message 25
-        let event_id = EventId::from_slice(&event_bytes).unwrap();
-        let message = create_test_message(event_id, group_id.clone(), "Updated Message 25", 2000);
-        storage.save_message(message).unwrap();
+        // The oldest message (index 0, timestamp 1000) should exist
+        let oldest_event_id = EventId::from_slice(&[0u8; 32]).unwrap();
+        {
+            let found = storage
+                .find_message_by_event_id(&group_id, &oldest_event_id)
+                .unwrap();
+            assert!(
+                found.is_some(),
+                "Oldest message should exist before eviction"
+            );
+        }
 
-        // Should still have the same count
+        // Now add one more message to trigger eviction
+        let new_event_bytes = [255u8; 32]; // Unique event ID
+        let new_event_id = EventId::from_slice(&new_event_bytes).unwrap();
+        let new_message = create_test_message(
+            new_event_id,
+            group_id.clone(),
+            "New message triggering eviction",
+            999999, // Much newer timestamp
+        );
+        storage.save_message(new_message).unwrap();
+
+        // Verify the count is still at MAX (eviction occurred)
         {
             let cache = storage.messages_by_group_cache.read();
             let group_messages = cache.peek(&group_id).unwrap();
-            assert_eq!(group_messages.len(), test_limit);
+            assert_eq!(
+                group_messages.len(),
+                MAX_MESSAGES_PER_GROUP,
+                "Should still have MAX_MESSAGES_PER_GROUP after eviction"
+            );
+        }
+
+        // The oldest message should have been evicted from messages_by_group_cache
+        {
+            let found = storage
+                .find_message_by_event_id(&group_id, &oldest_event_id)
+                .unwrap();
+            assert!(
+                found.is_none(),
+                "Oldest message should be evicted from messages_by_group_cache"
+            );
+        }
+
+        // CRITICAL: The oldest message should ALSO be evicted from messages_cache
+        // This verifies the coordinated eviction fix
+        {
+            let cache = storage.messages_cache.read();
+            assert!(
+                !cache.contains(&oldest_event_id),
+                "Oldest message should be evicted from messages_cache too (no orphaned entries)"
+            );
+        }
+
+        // The new message should exist
+        {
+            let found = storage
+                .find_message_by_event_id(&group_id, &new_event_id)
+                .unwrap();
+            assert!(found.is_some(), "New message should exist after eviction");
+            assert_eq!(found.unwrap().content, "New message triggering eviction");
+        }
+
+        // Verify updating an existing message doesn't trigger eviction
+        // Update the second oldest message (index 1)
+        let mut update_event_bytes = [0u8; 32];
+        update_event_bytes[0] = 1;
+        let update_event_id = EventId::from_slice(&update_event_bytes).unwrap();
+        let update_message =
+            create_test_message(update_event_id, group_id.clone(), "Updated Message 1", 2000);
+        storage.save_message(update_message).unwrap();
+
+        // Should still have the same count (no eviction for updates)
+        {
+            let cache = storage.messages_by_group_cache.read();
+            let group_messages = cache.peek(&group_id).unwrap();
+            assert_eq!(
+                group_messages.len(),
+                MAX_MESSAGES_PER_GROUP,
+                "Update should not change message count"
+            );
         }
 
         // Verify the message was updated
         let found = storage
-            .find_message_by_event_id(&group_id, &event_id)
+            .find_message_by_event_id(&group_id, &update_event_id)
             .unwrap()
             .unwrap();
-        assert_eq!(found.content, "Updated Message 25");
+        assert_eq!(found.content, "Updated Message 1");
     }
 }
