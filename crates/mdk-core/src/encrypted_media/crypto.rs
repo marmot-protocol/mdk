@@ -634,21 +634,22 @@ mod tests {
         )
         .unwrap();
 
-        // Verify that changing any AAD component (including scheme label) causes failure
-        // by testing with wrong file hash (simulating different AAD)
-        // Note: Since we don't have another defined version, we rely on build_aad test
-        // to verify that different scheme labels would produce different AAD
-        let wrong_hash = [0x02u8; 32];
+        // Try to decrypt with a different scheme version ("mip04-v1")
+        // This should produce different AAD and cause decryption failure
         let result = decrypt_data_with_aad(
             &encrypted_data,
             &key,
             &nonce,
-            DEFAULT_SCHEME_VERSION,
-            &wrong_hash, // Wrong hash - should fail
+            "mip04-v1", // Mismatched version
+            &file_hash,
             mime_type,
             filename,
         );
         assert!(result.is_err());
+        assert!(matches!(
+            result,
+            Err(EncryptedMediaError::DecryptionFailed { .. })
+        ));
     }
 
     #[test]
