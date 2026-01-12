@@ -172,6 +172,7 @@ mod tests {
     use std::collections::BTreeSet;
 
     use mdk_storage_traits::GroupId;
+    use mdk_storage_traits::Secret;
     use mdk_storage_traits::groups::GroupStorage;
     use mdk_storage_traits::groups::types::{Group, GroupExporterSecret, GroupState};
     use mdk_storage_traits::messages::MessageStorage;
@@ -238,8 +239,8 @@ mod tests {
         let mls_group_id = create_test_group_id();
         let nostr_group_id = generate_random_bytes(32).try_into().unwrap();
         let image_hash = Some(generate_random_bytes(32).try_into().unwrap());
-        let image_key = Some(generate_random_bytes(32).try_into().unwrap());
-        let image_nonce = Some(generate_random_bytes(12).try_into().unwrap());
+        let image_key = Some(Secret::new(generate_random_bytes(32).try_into().unwrap()));
+        let image_nonce = Some(Secret::new(generate_random_bytes(12).try_into().unwrap()));
         let group = Group {
             mls_group_id: mls_group_id.clone(),
             nostr_group_id,
@@ -280,8 +281,8 @@ mod tests {
         let mls_group_id = create_test_group_id();
         let nostr_group_id = generate_random_bytes(32).try_into().unwrap();
         let image_hash = Some(generate_random_bytes(32).try_into().unwrap());
-        let image_key = Some(generate_random_bytes(32).try_into().unwrap());
-        let image_nonce = Some(generate_random_bytes(12).try_into().unwrap());
+        let image_key = Some(Secret::new(generate_random_bytes(32).try_into().unwrap()));
+        let image_nonce = Some(Secret::new(generate_random_bytes(12).try_into().unwrap()));
         let group = Group {
             mls_group_id: mls_group_id.clone(),
             nostr_group_id,
@@ -325,8 +326,8 @@ mod tests {
         let mls_group_id = create_test_group_id();
         let nostr_group_id = generate_random_bytes(32).try_into().unwrap();
         let image_hash = Some(generate_random_bytes(32).try_into().unwrap());
-        let image_key = Some(generate_random_bytes(32).try_into().unwrap());
-        let image_nonce = Some(generate_random_bytes(12).try_into().unwrap());
+        let image_key = Some(Secret::new(generate_random_bytes(32).try_into().unwrap()));
+        let image_nonce = Some(Secret::new(generate_random_bytes(12).try_into().unwrap()));
         let group = Group {
             mls_group_id: mls_group_id.clone(),
             nostr_group_id,
@@ -345,12 +346,12 @@ mod tests {
         let group_exporter_secret_0 = GroupExporterSecret {
             mls_group_id: mls_group_id.clone(),
             epoch: 0,
-            secret: [0u8; 32],
+            secret: Secret::new([0u8; 32]),
         };
         let group_exporter_secret_1 = GroupExporterSecret {
             mls_group_id: mls_group_id.clone(),
             epoch: 1,
-            secret: [0u8; 32],
+            secret: Secret::new([0u8; 32]),
         };
         nostr_storage
             .save_group_exporter_secret(group_exporter_secret_0.clone())
@@ -474,8 +475,8 @@ mod tests {
         let mls_group_id = create_test_group_id();
         let nostr_group_id = generate_random_bytes(32).try_into().unwrap();
         let image_hash = Some(generate_random_bytes(32).try_into().unwrap());
-        let image_key = Some(generate_random_bytes(32).try_into().unwrap());
-        let image_nonce = Some(generate_random_bytes(12).try_into().unwrap());
+        let image_key = Some(Secret::new(generate_random_bytes(32).try_into().unwrap()));
+        let image_nonce = Some(Secret::new(generate_random_bytes(12).try_into().unwrap()));
         let group = Group {
             mls_group_id: mls_group_id.clone(),
             nostr_group_id,
@@ -570,8 +571,8 @@ mod tests {
         let mls_group_id = create_test_group_id();
         let nostr_group_id = generate_random_bytes(32).try_into().unwrap();
         let image_hash = Some(generate_random_bytes(32).try_into().unwrap());
-        let image_key = Some(generate_random_bytes(32).try_into().unwrap());
-        let image_nonce = Some(generate_random_bytes(12).try_into().unwrap());
+        let image_key = Some(Secret::new(generate_random_bytes(32).try_into().unwrap()));
+        let image_nonce = Some(Secret::new(generate_random_bytes(12).try_into().unwrap()));
         let group = Group {
             mls_group_id: mls_group_id.clone(),
             nostr_group_id,
@@ -605,8 +606,8 @@ mod tests {
         let mls_group_id = create_test_group_id();
         let nostr_group_id = generate_random_bytes(32).try_into().unwrap();
         let image_hash = Some(generate_random_bytes(32).try_into().unwrap());
-        let image_key = Some(generate_random_bytes(32).try_into().unwrap());
-        let image_nonce = Some(generate_random_bytes(12).try_into().unwrap());
+        let image_key = Some(Secret::new(generate_random_bytes(32).try_into().unwrap()));
+        let image_nonce = Some(Secret::new(generate_random_bytes(12).try_into().unwrap()));
 
         let group = Group {
             mls_group_id: mls_group_id.clone(),

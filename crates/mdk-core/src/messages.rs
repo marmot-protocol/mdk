@@ -897,12 +897,16 @@ where
     /// The function:
     /// 1. Validates the sender is authorized (admin, or non-admin for pure self-updates)
     /// 2. Merges the staged commit into the group state
-    /// 3. Updates the group to the new epoch with new cryptographic keys
-    /// 4. Saves the new exporter secret for NIP-44 encryption
-    /// 5. Updates processing state to prevent reprocessing
+    /// 3. Checks if the local member was removed by this commit
+    /// 4. If removed: sets group state to Inactive and skips further processing
+    /// 5. If still a member: saves new exporter secret and syncs group metadata
+    /// 6. Updates processing state to prevent reprocessing
     ///
     /// Note: Non-admin members are allowed to create commits that only update their own
     /// leaf node (pure self-updates). All other commit operations require admin privileges.
+    ///
+    /// When the local member is removed by a commit, the group state is set to `Inactive`
+    /// and the exporter secret/metadata sync are skipped to prevent use-after-eviction errors.
     ///
     /// # Arguments
     ///
@@ -922,68 +926,25 @@ where
         staged_commit: StagedCommit,
         commit_sender: &Sender,
     ) -> Result<()> {
-        // Verify authorization before processing the commit
-        // Only members can create commits, so we check for Sender::Member
-        match commit_sender {
-            Sender::Member(leaf_index) => {
-                let member = mls_group
-                    .member_at(*leaf_index)
-                    .ok_or(Error::MessageFromNonMember)?;
-
-                // Check if sender is an admin by extracting their pubkey from credentials
-                let basic_cred = BasicCredential::try_from(member.credential.clone())?;
-                let sender_pubkey = self.parse_credential_identity(basic_cred.identity())?;
-                let group_data = crate::extension::NostrGroupDataExtension::from_group(mls_group)?;
-                let sender_is_admin = group_data.admins.contains(&sender_pubkey);
-
-                // Check if this is a pure self-update commit (allowed from any member)
-                // A pure self-update has no add/remove proposals and only updates the sender's own leaf
-                let is_pure_self_update =
-                    self.is_pure_self_update_commit(&staged_commit, leaf_index);
-
-                match (sender_is_admin, is_pure_self_update) {
-                    (true, _) => {}
-                    (false, true) => {
-                        tracing::debug!(
-                            target: "mdk_core::messages::process_commit_message_for_group",
-                            "Allowing self-update commit from non-admin member at leaf index {:?}",
-                            leaf_index
-                        );
-                    }
-                    (false, false) => {
-                        tracing::warn!(
-                            target: "mdk_core::messages::process_commit_message_for_group",
-                            "Received non-self-update commit from non-admin member at leaf index {:?}",
-                            leaf_index
-                        );
-                        return Err(Error::CommitFromNonAdmin);
-                    }
-                }
-            }
-            _ => {
-                // External senders or other sender types cannot create valid commits
-                tracing::warn!(
-                    target: "mdk_core::messages::process_commit_message_for_group",
-                    "Received commit from non-member sender."
-                );
-                return Err(Error::MessageFromNonMember);
-            }
-        }
-
-        // Validate that no proposals in the commit attempt to change identity
-        // MIP-00 mandates immutable identity fields
+        self.validate_commit_sender_authorization(mls_group, &staged_commit, commit_sender)?;
         self.validate_staged_commit_identities(mls_group, &staged_commit, commit_sender)?;
+
+        let group_id: GroupId = mls_group.group_id().into();
 
         mls_group
             .merge_staged_commit(&self.provider, staged_commit)
             .map_err(|e| Error::Message(e.to_string()))?;
 
+        // Check if the local member was removed by this commit
+        if mls_group.own_leaf().is_none() {
+            return self.handle_local_member_eviction(&group_id, event);
+        }
+
         // Save exporter secret for the new epoch
-        self.exporter_secret(&mls_group.group_id().into())?;
+        self.exporter_secret(&group_id)?;
 
         // Sync the stored group metadata with the updated MLS group state
-        // This ensures any group context extension changes are reflected in storage
-        self.sync_group_metadata_from_mls(&mls_group.group_id().into())?;
+        self.sync_group_metadata_from_mls(&group_id)?;
 
         // Save a processed message so we don't reprocess
         let processed_message = message_types::ProcessedMessage {
@@ -1000,10 +961,229 @@ where
         Ok(())
     }
 
+    /// Validates that the commit sender is authorized to create this commit.
+    ///
+    /// Admins can create any commit. Non-admins can only create pure self-update commits
+    /// (commits that only update their own leaf node with no add/remove proposals).
+    ///
+    /// # Arguments
+    ///
+    /// * `mls_group` - The MLS group to check authorization against
+    /// * `staged_commit` - The staged commit to validate
+    /// * `commit_sender` - The MLS sender of the commit
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(())` - If the sender is authorized
+    /// * `Err(Error::CommitFromNonAdmin)` - If a non-admin tries to create a non-self-update commit
+    /// * `Err(Error::MessageFromNonMember)` - If the sender is not a member
+    fn validate_commit_sender_authorization(
+        &self,
+        mls_group: &MlsGroup,
+        staged_commit: &StagedCommit,
+        commit_sender: &Sender,
+    ) -> Result<()> {
+        match commit_sender {
+            Sender::Member(leaf_index) => {
+                let member = mls_group
+                    .member_at(*leaf_index)
+                    .ok_or(Error::MessageFromNonMember)?;
+
+                let basic_cred = BasicCredential::try_from(member.credential.clone())?;
+                let sender_pubkey = self.parse_credential_identity(basic_cred.identity())?;
+                let group_data = crate::extension::NostrGroupDataExtension::from_group(mls_group)?;
+                let sender_is_admin = group_data.admins.contains(&sender_pubkey);
+
+                let is_pure_self_update =
+                    self.is_pure_self_update_commit(staged_commit, leaf_index);
+
+                match (sender_is_admin, is_pure_self_update) {
+                    (true, _) => Ok(()),
+                    (false, true) => {
+                        tracing::debug!(
+                            target: "mdk_core::messages::process_commit_message_for_group",
+                            "Allowing self-update commit from non-admin member at leaf index {:?}",
+                            leaf_index
+                        );
+                        Ok(())
+                    }
+                    (false, false) => {
+                        tracing::warn!(
+                            target: "mdk_core::messages::process_commit_message_for_group",
+                            "Received non-self-update commit from non-admin member at leaf index {:?}",
+                            leaf_index
+                        );
+                        Err(Error::CommitFromNonAdmin)
+                    }
+                }
+            }
+            _ => {
+                tracing::warn!(
+                    target: "mdk_core::messages::process_commit_message_for_group",
+                    "Received commit from non-member sender."
+                );
+                Err(Error::MessageFromNonMember)
+            }
+        }
+    }
+
+    /// Handles the case where the local member was removed from a group.
+    ///
+    /// Sets the group state to Inactive and saves a processed message record.
+    /// Called after merge_staged_commit when own_leaf() returns None.
+    ///
+    /// # Arguments
+    ///
+    /// * `group_id` - The ID of the group the member was removed from
+    /// * `event` - The wrapper Nostr event containing the commit
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(())` - If the eviction was handled successfully
+    /// * `Err(Error)` - If storage operations fail
+    fn handle_local_member_eviction(&self, group_id: &GroupId, event: &Event) -> Result<()> {
+        tracing::info!(
+            target: "mdk_core::messages::process_commit_message_for_group",
+            group_id = %hex::encode(group_id.as_slice()),
+            "Local member was removed from group, setting group state to Inactive"
+        );
+
+        match self.get_group(group_id)? {
+            Some(mut group) => {
+                group.state = group_types::GroupState::Inactive;
+                self.storage()
+                    .save_group(group)
+                    .map_err(|e| Error::Group(e.to_string()))?;
+            }
+            None => {
+                tracing::warn!(
+                    target: "mdk_core::messages::process_commit_message_for_group",
+                    group_id = %hex::encode(group_id.as_slice()),
+                    "Group not found in storage while handling eviction"
+                );
+            }
+        }
+
+        let processed_message = message_types::ProcessedMessage {
+            wrapper_event_id: event.id,
+            message_event_id: None,
+            processed_at: Timestamp::now(),
+            state: message_types::ProcessedMessageState::Processed,
+            failure_reason: None,
+        };
+
+        self.storage()
+            .save_processed_message(processed_message)
+            .map_err(|e| Error::Message(e.to_string()))?;
+
+        Ok(())
+    }
+
+    /// Validates that an event's timestamp is within acceptable bounds
+    ///
+    /// This method checks that the event timestamp is not too far in the future
+    /// (beyond configurable clock skew) and not too old (beyond configurable max age).
+    ///
+    /// # Arguments
+    ///
+    /// * `event` - The Nostr event to validate
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(())` - If timestamp is valid
+    /// * `Err(Error::InvalidTimestamp)` - If timestamp is outside acceptable bounds
+    fn validate_created_at(&self, event: &Event) -> Result<()> {
+        let now = Timestamp::now();
+
+        // Reject events from the future (allow configurable clock skew)
+        if event.created_at.as_u64()
+            > now
+                .as_u64()
+                .saturating_add(self.config.max_future_skew_secs)
+        {
+            return Err(Error::InvalidTimestamp(format!(
+                "event timestamp {} is too far in the future (current time: {})",
+                event.created_at.as_u64(),
+                now.as_u64()
+            )));
+        }
+
+        // Reject events that are too old (configurable via MdkConfig)
+        let min_timestamp = now.as_u64().saturating_sub(self.config.max_event_age_secs);
+        if event.created_at.as_u64() < min_timestamp {
+            return Err(Error::InvalidTimestamp(format!(
+                "event timestamp {} is too old (minimum acceptable: {})",
+                event.created_at.as_u64(),
+                min_timestamp
+            )));
+        }
+
+        Ok(())
+    }
+
+    /// Validates and extracts the Nostr group ID from event tags
+    ///
+    /// This method validates that the event has exactly one 'h' tag (per MIP-03)
+    /// and extracts the 32-byte group ID from its hex content.
+    ///
+    /// # Arguments
+    ///
+    /// * `event` - The Nostr event to extract group ID from
+    ///
+    /// # Returns
+    ///
+    /// * `Ok([u8; 32])` - The extracted Nostr group ID
+    /// * `Err(Error)` - If validation fails or group ID cannot be extracted
+    fn validate_and_extract_nostr_group_id(&self, event: &Event) -> Result<[u8; 32]> {
+        // Extract and validate group ID tag (MIP-03 requires exactly one h tag)
+        let h_tags: Vec<_> = event
+            .tags
+            .iter()
+            .filter(|tag| tag.kind() == TagKind::h())
+            .collect();
+
+        if h_tags.is_empty() {
+            return Err(Error::MissingGroupIdTag);
+        }
+
+        if h_tags.len() > 1 {
+            return Err(Error::MultipleGroupIdTags(h_tags.len()));
+        }
+
+        let nostr_group_id_tag = h_tags[0];
+
+        let group_id_hex = nostr_group_id_tag
+            .content()
+            .ok_or_else(|| Error::InvalidGroupIdFormat("h tag has no content".to_string()))?;
+
+        // Validate hex string length before decoding to prevent unbounded memory allocation
+        // A 32-byte value requires exactly 64 hex characters
+        if group_id_hex.len() != 64 {
+            return Err(Error::InvalidGroupIdFormat(format!(
+                "expected 64 hex characters (32 bytes), got {} characters",
+                group_id_hex.len()
+            )));
+        }
+
+        // Decode once and reuse the result
+        let bytes = hex::decode(group_id_hex)
+            .map_err(|e| Error::InvalidGroupIdFormat(format!("hex decode failed: {}", e)))?;
+
+        let nostr_group_id: [u8; 32] = bytes.try_into().map_err(|v: Vec<u8>| {
+            Error::InvalidGroupIdFormat(format!("expected 32 bytes, got {} bytes", v.len()))
+        })?;
+
+        Ok(nostr_group_id)
+    }
+
     /// Validates the incoming event and extracts the group ID
     ///
-    /// This private method validates that the event has the correct kind and extracts
-    /// the group ID from the event tags.
+    /// This private method validates that the event has the correct kind, checks
+    /// timestamp bounds, and extracts the group ID from the event tags per MIP-03
+    /// requirements.
+    ///
+    /// Note: Nostr signature verification is handled by nostr-sdk's relay pool when
+    /// events are received from relays.
     ///
     /// # Arguments
     ///
@@ -1014,6 +1194,7 @@ where
     /// * `Ok([u8; 32])` - The extracted Nostr group ID
     /// * `Err(Error)` - If validation fails or group ID cannot be extracted
     fn validate_event_and_extract_group_id(&self, event: &Event) -> Result<[u8; 32]> {
+        // 1. Verify event kind
         if event.kind != Kind::MlsGroupMessage {
             return Err(Error::UnexpectedEvent {
                 expected: Kind::MlsGroupMessage,
@@ -1021,22 +1202,11 @@ where
             });
         }
 
-        let nostr_group_id_tag = event
-            .tags
-            .iter()
-            .find(|tag| tag.kind() == TagKind::h())
-            .ok_or(Error::MissingGroupIdTag)?;
+        // 2. Verify timestamp is within acceptable bounds
+        self.validate_created_at(event)?;
 
-        let nostr_group_id: [u8; 32] = hex::decode(
-            nostr_group_id_tag
-                .content()
-                .ok_or(Error::MissingGroupIdTag)?,
-        )
-        .map_err(|_| Error::InvalidGroupIdFormat)?
-        .try_into()
-        .map_err(|_| Error::InvalidGroupIdFormat)?;
-
-        Ok(nostr_group_id)
+        // 3. Extract and validate group ID tag
+        self.validate_and_extract_nostr_group_id(event)
     }
 
     /// Loads the group and decrypts the message content
@@ -1174,7 +1344,9 @@ where
         match error {
             Error::UnexpectedEvent { .. } => "invalid_event_type",
             Error::MissingGroupIdTag => "invalid_event_format",
-            Error::InvalidGroupIdFormat => "invalid_event_format",
+            Error::InvalidGroupIdFormat(_) => "invalid_event_format",
+            Error::MultipleGroupIdTags(_) => "invalid_event_format",
+            Error::InvalidTimestamp(_) => "invalid_event_format",
             Error::GroupNotFound => "group_not_found",
             Error::CannotDecryptOwnMessage => "own_message",
             Error::AuthorMismatch => "authentication_failed",
@@ -1655,6 +1827,7 @@ mod tests {
     use crate::tests::create_test_mdk;
     use mdk_storage_traits::groups::GroupStorage;
     use mdk_storage_traits::messages::MessageStorage;
+    use mdk_storage_traits::messages::types::ProcessedMessageState;
 
     #[test]
     fn test_get_message_not_found() {
@@ -1856,7 +2029,10 @@ mod tests {
 
         let result = mdk.process_message(&event);
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), Error::InvalidGroupIdFormat));
+        assert!(matches!(
+            result.unwrap_err(),
+            Error::InvalidGroupIdFormat(_)
+        ));
     }
 
     #[test]
@@ -5800,6 +5976,223 @@ mod tests {
         );
     }
 
+    /// Test that validate_event_and_extract_group_id rejects events with timestamps too far in the future
+    #[test]
+    fn test_validate_event_rejects_future_timestamp() {
+        let mdk = create_test_mdk();
+        let (creator, members, admins) = create_test_group_members();
+        let group_id = create_test_group(&mdk, &creator, &members, &admins);
+
+        // Get the group's nostr_group_id for the h tag
+        let group = mdk
+            .get_group(&group_id)
+            .expect("Failed to get group")
+            .expect("Group should exist");
+
+        // Set timestamp to far future (1 hour ahead, beyond 5 minute skew allowance)
+        let future_time = nostr::Timestamp::now().as_u64() + 3600;
+
+        // Create an event with future timestamp
+        let message_event = EventBuilder::new(Kind::MlsGroupMessage, "test content")
+            .custom_created_at(nostr::Timestamp::from(future_time))
+            .tag(Tag::custom(
+                TagKind::h(),
+                [hex::encode(group.nostr_group_id)],
+            ))
+            .sign_with_keys(&creator)
+            .expect("Failed to create event");
+
+        // Validation should fail due to future timestamp
+        let result = mdk.validate_event_and_extract_group_id(&message_event);
+        assert!(
+            matches!(result, Err(Error::InvalidTimestamp(_))),
+            "Expected InvalidTimestamp error for future timestamp, got: {:?}",
+            result
+        );
+    }
+
+    /// Test that validate_event_and_extract_group_id rejects events with timestamps too far in the past
+    #[test]
+    fn test_validate_event_rejects_old_timestamp() {
+        let mdk = create_test_mdk();
+        let (creator, members, admins) = create_test_group_members();
+        let group_id = create_test_group(&mdk, &creator, &members, &admins);
+
+        // Get the group's nostr_group_id for the h tag
+        let group = mdk
+            .get_group(&group_id)
+            .expect("Failed to get group")
+            .expect("Group should exist");
+
+        // Set timestamp to 46 days ago (beyond 45 day limit)
+        let old_time = nostr::Timestamp::now().as_u64().saturating_sub(46 * 86400);
+
+        // Create an event with old timestamp
+        let message_event = EventBuilder::new(Kind::MlsGroupMessage, "test content")
+            .custom_created_at(nostr::Timestamp::from(old_time))
+            .tag(Tag::custom(
+                TagKind::h(),
+                [hex::encode(group.nostr_group_id)],
+            ))
+            .sign_with_keys(&creator)
+            .expect("Failed to create event");
+
+        // Validation should fail due to old timestamp
+        let result = mdk.validate_event_and_extract_group_id(&message_event);
+        assert!(
+            matches!(result, Err(Error::InvalidTimestamp(_))),
+            "Expected InvalidTimestamp error for old timestamp, got: {:?}",
+            result
+        );
+    }
+
+    /// Test that validate_event_and_extract_group_id accepts events with valid timestamps
+    #[test]
+    fn test_validate_event_accepts_valid_timestamp() {
+        let mdk = create_test_mdk();
+        let (creator, members, admins) = create_test_group_members();
+        let group_id = create_test_group(&mdk, &creator, &members, &admins);
+
+        // Get the group's nostr_group_id for the h tag
+        let group = mdk
+            .get_group(&group_id)
+            .expect("Failed to get group")
+            .expect("Group should exist");
+
+        // Create an event with current timestamp
+        let message_event = EventBuilder::new(Kind::MlsGroupMessage, "test content")
+            .tag(Tag::custom(
+                TagKind::h(),
+                [hex::encode(group.nostr_group_id)],
+            ))
+            .sign_with_keys(&creator)
+            .expect("Failed to create event");
+
+        // Validation should succeed
+        let result = mdk.validate_event_and_extract_group_id(&message_event);
+        assert!(
+            result.is_ok(),
+            "Expected valid timestamp to be accepted, got: {:?}",
+            result
+        );
+    }
+
+    /// Test that validate_event_and_extract_group_id rejects events with multiple h tags
+    #[test]
+    fn test_validate_event_rejects_multiple_h_tags() {
+        let mdk = create_test_mdk();
+        let creator = Keys::generate();
+
+        // Create an event with multiple h tags
+        let message_event = EventBuilder::new(Kind::MlsGroupMessage, "test content")
+            .tag(Tag::custom(TagKind::h(), [hex::encode([1u8; 32])]))
+            .tag(Tag::custom(TagKind::h(), [hex::encode([2u8; 32])]))
+            .sign_with_keys(&creator)
+            .expect("Failed to create event");
+
+        // Validation should fail due to multiple h tags
+        let result = mdk.validate_event_and_extract_group_id(&message_event);
+        assert!(
+            matches!(result, Err(Error::MultipleGroupIdTags(2))),
+            "Expected MultipleGroupIdTags error, got: {:?}",
+            result
+        );
+    }
+
+    /// Test that validate_event_and_extract_group_id rejects events with invalid hex in h tag
+    #[test]
+    fn test_validate_event_rejects_invalid_hex_group_id() {
+        let mdk = create_test_mdk();
+        let creator = Keys::generate();
+
+        // Create an event with invalid hex in h tag
+        let message_event = EventBuilder::new(Kind::MlsGroupMessage, "test content")
+            .tag(Tag::custom(TagKind::h(), ["not-valid-hex-zzz"]))
+            .sign_with_keys(&creator)
+            .expect("Failed to create event");
+
+        // Validation should fail due to invalid hex
+        let result = mdk.validate_event_and_extract_group_id(&message_event);
+        assert!(
+            matches!(result, Err(Error::InvalidGroupIdFormat(_))),
+            "Expected InvalidGroupIdFormat error, got: {:?}",
+            result
+        );
+    }
+
+    /// Test that validate_event_and_extract_group_id rejects events with wrong length group ID
+    #[test]
+    fn test_validate_event_rejects_wrong_length_group_id() {
+        let mdk = create_test_mdk();
+        let creator = Keys::generate();
+
+        // Create an event with wrong length group ID (16 bytes instead of 32)
+        let message_event = EventBuilder::new(Kind::MlsGroupMessage, "test content")
+            .tag(Tag::custom(TagKind::h(), [hex::encode([1u8; 16])]))
+            .sign_with_keys(&creator)
+            .expect("Failed to create event");
+
+        // Validation should fail due to wrong length
+        let result = mdk.validate_event_and_extract_group_id(&message_event);
+        assert!(
+            matches!(result, Err(Error::InvalidGroupIdFormat(_))),
+            "Expected InvalidGroupIdFormat error for wrong length, got: {:?}",
+            result
+        );
+    }
+
+    /// Test that validate_event_and_extract_group_id extracts valid group ID
+    #[test]
+    fn test_validate_event_extracts_valid_group_id() {
+        let mdk = create_test_mdk();
+        let (creator, members, admins) = create_test_group_members();
+        let group_id = create_test_group(&mdk, &creator, &members, &admins);
+
+        // Get the group's nostr_group_id for the h tag
+        let group = mdk
+            .get_group(&group_id)
+            .expect("Failed to get group")
+            .expect("Group should exist");
+
+        // Create an event with valid group ID
+        let message_event = EventBuilder::new(Kind::MlsGroupMessage, "test content")
+            .tag(Tag::custom(
+                TagKind::h(),
+                [hex::encode(group.nostr_group_id)],
+            ))
+            .sign_with_keys(&creator)
+            .expect("Failed to create event");
+
+        // Validation should succeed and return the correct group ID
+        let result = mdk.validate_event_and_extract_group_id(&message_event);
+        assert!(result.is_ok(), "Expected success, got: {:?}", result);
+        assert_eq!(
+            result.unwrap(),
+            group.nostr_group_id,
+            "Extracted group ID should match"
+        );
+    }
+
+    /// Test that validate_event_and_extract_group_id rejects events missing h tag
+    #[test]
+    fn test_validate_event_rejects_missing_h_tag() {
+        let mdk = create_test_mdk();
+        let creator = Keys::generate();
+
+        // Create an event without h tag
+        let message_event = EventBuilder::new(Kind::MlsGroupMessage, "test content")
+            .sign_with_keys(&creator)
+            .expect("Failed to create event");
+
+        // Validation should fail due to missing h tag
+        let result = mdk.validate_event_and_extract_group_id(&message_event);
+        assert!(
+            matches!(result, Err(Error::MissingGroupIdTag)),
+            "Expected MissingGroupIdTag error, got: {:?}",
+            result
+        );
+    }
+
     /// Test that self-update commits from non-admin members are ALLOWED (Issue #44, #59)
     ///
     /// Per the Marmot protocol specification, any member can create a self-update
@@ -6265,6 +6658,182 @@ mod tests {
         assert!(
             !members.contains(&charlie_keys.public_key()),
             "Charlie should be removed"
+        );
+    }
+
+    /// Test that a removed member correctly processes their own removal commit
+    ///
+    /// This verifies that when a member is removed from a group and later processes
+    /// the commit that removed them:
+    /// 1. The commit is processed successfully
+    /// 2. The group state is set to Inactive
+    /// 3. No UseAfterEviction error occurs
+    #[test]
+    fn test_removed_member_processes_own_removal_commit() {
+        let alice_keys = Keys::generate();
+        let bob_keys = Keys::generate();
+
+        let alice_mdk = create_test_mdk();
+        let bob_mdk = create_test_mdk();
+
+        // Only Alice is admin
+        let admins = vec![alice_keys.public_key()];
+
+        // Create key package
+        let bob_key_package = create_key_package_event(&bob_mdk, &bob_keys);
+
+        // Alice creates the group with Bob
+        let create_result = alice_mdk
+            .create_group(
+                &alice_keys.public_key(),
+                vec![bob_key_package],
+                create_nostr_group_config_data(admins.clone()),
+            )
+            .expect("Failed to create group");
+
+        let group_id = create_result.group.mls_group_id.clone();
+
+        // Alice merges her commit
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("Failed to merge pending commit");
+
+        // Bob joins via welcome
+        let bob_welcome_rumor = &create_result.welcome_rumors[0];
+        let bob_welcome = bob_mdk
+            .process_welcome(&nostr::EventId::all_zeros(), bob_welcome_rumor)
+            .expect("Bob should process welcome");
+        bob_mdk
+            .accept_welcome(&bob_welcome)
+            .expect("Bob should accept welcome");
+
+        // Verify Bob's group is initially Active
+        let bob_group_before = bob_mdk
+            .get_group(&group_id)
+            .expect("Failed to get group")
+            .expect("Group should exist");
+        assert_eq!(
+            bob_group_before.state,
+            group_types::GroupState::Active,
+            "Bob's group should be Active before removal"
+        );
+
+        // Alice (admin) removes Bob
+        let alice_remove_result = alice_mdk
+            .remove_members(&group_id, &[bob_keys.public_key()])
+            .expect("Alice (admin) can remove members");
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("Alice should merge remove commit");
+
+        // Bob (the removed member) processes his own removal commit
+        // This should succeed and set the group state to Inactive
+        let result = bob_mdk.process_message(&alice_remove_result.evolution_event);
+
+        assert!(
+            result.is_ok(),
+            "Removed member should process their removal commit successfully, got error: {:?}",
+            result.err()
+        );
+
+        // Verify the result is a Commit
+        assert!(
+            matches!(result.unwrap(), MessageProcessingResult::Commit { .. }),
+            "Result should be a Commit"
+        );
+
+        // Verify Bob's group state is now Inactive
+        let bob_group_after = bob_mdk
+            .get_group(&group_id)
+            .expect("Failed to get group")
+            .expect("Group should exist");
+        assert_eq!(
+            bob_group_after.state,
+            group_types::GroupState::Inactive,
+            "Bob's group should be Inactive after being removed"
+        );
+    }
+
+    /// Test that a removed member's processed message is saved correctly
+    ///
+    /// This verifies that when an evicted member processes their removal commit:
+    /// 1. A ProcessedMessage record is created
+    /// 2. The state is Processed (not failed)
+    /// 3. No failure reason is recorded
+    #[test]
+    fn test_removed_member_processed_message_saved_correctly() {
+        let alice_keys = Keys::generate();
+        let bob_keys = Keys::generate();
+
+        let alice_mdk = create_test_mdk();
+        let bob_mdk = create_test_mdk();
+
+        // Only Alice is admin
+        let admins = vec![alice_keys.public_key()];
+
+        // Create key package
+        let bob_key_package = create_key_package_event(&bob_mdk, &bob_keys);
+
+        // Alice creates the group with Bob
+        let create_result = alice_mdk
+            .create_group(
+                &alice_keys.public_key(),
+                vec![bob_key_package],
+                create_nostr_group_config_data(admins.clone()),
+            )
+            .expect("Failed to create group");
+
+        let group_id = create_result.group.mls_group_id.clone();
+
+        // Alice merges her commit
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("Failed to merge pending commit");
+
+        // Bob joins via welcome
+        let bob_welcome_rumor = &create_result.welcome_rumors[0];
+        let bob_welcome = bob_mdk
+            .process_welcome(&nostr::EventId::all_zeros(), bob_welcome_rumor)
+            .expect("Bob should process welcome");
+        bob_mdk
+            .accept_welcome(&bob_welcome)
+            .expect("Bob should accept welcome");
+
+        // Alice (admin) removes Bob
+        let alice_remove_result = alice_mdk
+            .remove_members(&group_id, &[bob_keys.public_key()])
+            .expect("Alice (admin) can remove members");
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("Alice should merge remove commit");
+
+        // Get the event ID that Bob will process
+        let removal_event_id = alice_remove_result.evolution_event.id;
+
+        // Bob processes his own removal commit
+        bob_mdk
+            .process_message(&alice_remove_result.evolution_event)
+            .expect("Bob should process removal commit");
+
+        // Verify the processed message was saved correctly
+        let processed_message = bob_mdk
+            .storage()
+            .find_processed_message_by_event_id(&removal_event_id)
+            .expect("Failed to get processed message")
+            .expect("Processed message should exist");
+
+        assert_eq!(
+            processed_message.wrapper_event_id, removal_event_id,
+            "Wrapper event ID should match"
+        );
+        assert_eq!(
+            processed_message.state,
+            ProcessedMessageState::Processed,
+            "Processed message state should be Processed"
+        );
+        assert!(
+            processed_message.failure_reason.is_none(),
+            "There should be no failure reason for successful processing"
         );
     }
 

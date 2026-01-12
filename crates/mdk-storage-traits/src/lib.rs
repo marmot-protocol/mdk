@@ -1,7 +1,7 @@
 //! Nostr MLS storage - A set of storage provider traits and types for implementing MLS storage
 //! It is designed to be used in conjunction with the `openmls` crate.
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 #![warn(missing_docs)]
 #![warn(rustdoc::bare_urls)]
 
@@ -10,6 +10,8 @@ use openmls_traits::storage::StorageProvider;
 pub mod group_id;
 pub mod groups;
 pub mod messages;
+/// Secret wrapper for zeroization
+pub mod secret;
 #[cfg(feature = "test-utils")]
 pub mod test_utils;
 
@@ -17,6 +19,7 @@ pub mod welcomes;
 
 // Re-export GroupId for convenience
 pub use group_id::GroupId;
+pub use secret::{Secret, Zeroize};
 
 use self::groups::GroupStorage;
 use self::messages::MessageStorage;

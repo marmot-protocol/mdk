@@ -9,6 +9,7 @@ use std::fs::File;
 use std::io::{ErrorKind, Read};
 use std::path::Path;
 
+use mdk_storage_traits::Secret;
 use rusqlite::Connection;
 
 use crate::error::Error;
@@ -28,8 +29,7 @@ use crate::error::Error;
 #[derive(Clone)]
 pub struct EncryptionConfig {
     /// The 32-byte (256-bit) encryption key for SQLCipher.
-    // TODO: Use `Secret` type from mdk-core for secure memory handling once PR #109 is merged.
-    key: [u8; 32],
+    key: Secret<[u8; 32]>,
 }
 
 impl EncryptionConfig {
@@ -49,7 +49,9 @@ impl EncryptionConfig {
     /// ```
     #[must_use]
     pub fn new(key: [u8; 32]) -> Self {
-        Self { key }
+        Self {
+            key: Secret::new(key),
+        }
     }
 
     /// Creates a new encryption configuration from a byte slice.
@@ -65,7 +67,9 @@ impl EncryptionConfig {
         let key: [u8; 32] = key
             .try_into()
             .map_err(|_| Error::InvalidKeyLength(key.len()))?;
-        Ok(Self { key })
+        Ok(Self {
+            key: Secret::new(key),
+        })
     }
 
     /// Generates a new random encryption key.
@@ -79,7 +83,9 @@ impl EncryptionConfig {
     pub fn generate() -> Result<Self, Error> {
         let mut key = [0u8; 32];
         getrandom::fill(&mut key).map_err(|e| Error::KeyGeneration(e.to_string()))?;
-        Ok(Self { key })
+        Ok(Self {
+            key: Secret::new(key),
+        })
     }
 
     /// Returns a reference to the encryption key.
@@ -92,7 +98,7 @@ impl EncryptionConfig {
     ///
     /// SQLCipher expects a raw key in the format: `x'<64-char-hex-string>'`
     fn to_sqlcipher_key(&self) -> String {
-        format!("x'{}'", hex::encode(self.key))
+        format!("x'{}'", hex::encode(self.key.as_ref()))
     }
 }
 
