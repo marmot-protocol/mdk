@@ -220,9 +220,9 @@ _build-uniffi-android TARGET CLANG_PREFIX:
         echo "      include/openssl/*.h" >&2
         echo "      lib/libcrypto.a" >&2
         echo "" >&2
-        echo "You can build OpenSSL for Android using:" >&2
-        echo "  https://github.com/aspect-build/aspect-build-openssl-android" >&2
-        echo "  or https://github.com/aspect-build/aspect-build-prefab" >&2
+        echo "You can build OpenSSL for Android using the OpenSSL build system:" >&2
+        echo "  <https://github.com/ArmynC/ArsLern-OpenSSL-Android>" >&2
+        echo "  or follow the official docs: <https://wiki.openssl.org/index.php/Android>" >&2
         exit 1
     fi
 

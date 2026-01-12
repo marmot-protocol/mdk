@@ -73,7 +73,7 @@ export ANDROID_NDK_ROOT="${NDK_HOME}"
 
 # Create temporary build directory
 BUILD_DIR=$(mktemp -d)
-trap "rm -rf ${BUILD_DIR}" EXIT
+trap 'rm -rf "${BUILD_DIR}"' EXIT
 
 echo "Building OpenSSL ${OPENSSL_VERSION} for ${ABI}..."
 echo "  Target: ${OPENSSL_TARGET}"
@@ -82,7 +82,7 @@ echo "  Output: ${OUTPUT_DIR}"
 
 # Download OpenSSL source
 cd "${BUILD_DIR}"
-curl -sL "https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/openssl-${OPENSSL_VERSION}.tar.gz" \
+curl -fsSL "https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/openssl-${OPENSSL_VERSION}.tar.gz" \
     -o openssl.tar.gz
 tar -xzf openssl.tar.gz
 cd "openssl-${OPENSSL_VERSION}"
