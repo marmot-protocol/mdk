@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::str::FromStr;
 
-use crate::GroupId;
+use crate::{GroupId, Secret};
 use nostr::{EventId, PublicKey, RelayUrl, Timestamp, UnsignedEvent};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -43,9 +43,9 @@ pub struct Welcome {
     /// Group image hash (from NostrGroupDataExtension)
     pub group_image_hash: Option<[u8; 32]>,
     /// Group image key (from NostrGroupDataExtension)
-    pub group_image_key: Option<[u8; 32]>,
+    pub group_image_key: Option<Secret<[u8; 32]>>,
     /// Group image nonce (from NostrGroupDataExtension)
-    pub group_image_nonce: Option<[u8; 12]>,
+    pub group_image_nonce: Option<Secret<[u8; 12]>>,
     /// Group admin pubkeys (from NostrGroupDataExtension)
     pub group_admin_pubkeys: BTreeSet<PublicKey>,
     /// Group relays (from NostrGroupDataExtension)
