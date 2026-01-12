@@ -661,7 +661,7 @@ mod tests {
 
         // Verify the original message is stored
         let found_message = nostr_storage
-            .find_message_by_event_id(&event_id)
+            .find_message_by_event_id(&mls_group_id, &event_id)
             .unwrap()
             .unwrap();
         assert_eq!(found_message.content, "Original message");
@@ -684,7 +684,7 @@ mod tests {
 
         // Verify the message was updated in the messages cache
         let found_message = nostr_storage
-            .find_message_by_event_id(&event_id)
+            .find_message_by_event_id(&mls_group_id, &event_id)
             .unwrap()
             .unwrap();
         assert_eq!(found_message.content, "Updated message");
@@ -778,13 +778,13 @@ mod tests {
 
         // Verify both messages are in the messages cache
         let found_message_1 = nostr_storage
-            .find_message_by_event_id(&event_id_1)
+            .find_message_by_event_id(&mls_group_id, &event_id_1)
             .unwrap()
             .unwrap();
         assert_eq!(found_message_1.content, "First message");
 
         let found_message_2 = nostr_storage
-            .find_message_by_event_id(&event_id_2)
+            .find_message_by_event_id(&mls_group_id, &event_id_2)
             .unwrap()
             .unwrap();
         assert_eq!(found_message_2.content, "Second message");
