@@ -1593,9 +1593,101 @@ mod tests {
         let result = mdk.accept_welcome(welcome);
         assert!(result.is_ok());
 
+        // Verify AcceptWelcomeResult indicates last_resort KeyPackage (should not delete)
+        let accept_result = result.unwrap();
+        assert!(
+            !accept_result.should_delete_key_package_from_relay,
+            "MDK KeyPackages have last_resort by default, should not delete from relay"
+        );
+
         // Verify the welcome was accepted by checking pending welcomes
         let pending_welcomes = mdk.get_pending_welcomes(None, None).unwrap();
         assert_eq!(pending_welcomes.len(), 0);
+    }
+
+    #[test]
+    fn test_accept_welcome_json_returns_result() {
+        let mdk = create_test_mdk();
+        let creator_keys = Keys::generate();
+        let member_keys = Keys::generate();
+
+        let member_pubkey_hex = member_keys.public_key().to_hex();
+        let relays = vec!["wss://relay.example.com".to_string()];
+        let key_package_result = mdk
+            .create_key_package_for_event(member_pubkey_hex.clone(), relays.clone())
+            .unwrap();
+
+        let key_package_event =
+            EventBuilder::new(Kind::MlsKeyPackage, key_package_result.key_package)
+                .tags(
+                    key_package_result
+                        .tags
+                        .iter()
+                        .map(|t| Tag::parse(t.clone()).unwrap())
+                        .collect::<Vec<_>>(),
+                )
+                .sign_with_keys(&member_keys)
+                .unwrap();
+
+        let key_package_event_json = serde_json::to_string(&key_package_event).unwrap();
+
+        let creator_pubkey_hex = creator_keys.public_key().to_hex();
+        let create_result = mdk
+            .create_group(
+                creator_pubkey_hex,
+                vec![key_package_event_json],
+                "Test Group".to_string(),
+                "Test Description".to_string(),
+                relays.clone(),
+                vec![creator_keys.public_key().to_hex()],
+            )
+            .unwrap();
+
+        let welcome_rumor_json = create_result.welcome_rumors_json.first().unwrap();
+        let wrapper_event_id = EventId::all_zeros();
+        let welcome = mdk
+            .process_welcome(wrapper_event_id.to_hex(), welcome_rumor_json.clone())
+            .unwrap();
+
+        // Convert welcome to JSON and accept via JSON method
+        let welcome_json = serde_json::to_string(&welcome_types::Welcome {
+            id: EventId::parse(&welcome.id).unwrap(),
+            event: serde_json::from_str(&welcome.event_json).unwrap(),
+            mls_group_id: GroupId::from_slice(&hex::decode(&welcome.mls_group_id).unwrap()),
+            nostr_group_id: hex::decode(&welcome.nostr_group_id)
+                .unwrap()
+                .try_into()
+                .unwrap(),
+            group_name: welcome.group_name.clone(),
+            group_description: welcome.group_description.clone(),
+            group_image_hash: None,
+            group_image_key: None,
+            group_image_nonce: None,
+            group_admin_pubkeys: welcome
+                .group_admin_pubkeys
+                .iter()
+                .map(|p| PublicKey::parse(p).unwrap())
+                .collect(),
+            group_relays: welcome
+                .group_relays
+                .iter()
+                .map(|r| RelayUrl::parse(r).unwrap())
+                .collect(),
+            welcomer: PublicKey::parse(&welcome.welcomer).unwrap(),
+            member_count: welcome.member_count,
+            state: welcome_types::WelcomeState::Pending,
+            wrapper_event_id: EventId::parse(&welcome.wrapper_event_id).unwrap(),
+        })
+        .unwrap();
+
+        let result = mdk.accept_welcome_json(welcome_json);
+        assert!(result.is_ok());
+
+        let accept_result = result.unwrap();
+        assert!(
+            !accept_result.should_delete_key_package_from_relay,
+            "MDK KeyPackages have last_resort by default, should not delete from relay"
+        );
     }
 
     #[test]
