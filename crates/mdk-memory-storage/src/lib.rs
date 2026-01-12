@@ -10,7 +10,7 @@
 #![warn(missing_docs)]
 #![warn(rustdoc::bare_urls)]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::num::NonZeroUsize;
 
 use lru::LruCache;
@@ -67,8 +67,8 @@ pub struct MdkMemoryStorage {
     processed_welcomes_cache: RwLock<LruCache<EventId, ProcessedWelcome>>,
     /// LRU Cache for Message objects, keyed by Event ID
     messages_cache: RwLock<LruCache<EventId, Message>>,
-    /// LRU Cache for Messages by Group ID (GroupId)
-    messages_by_group_cache: RwLock<LruCache<GroupId, Vec<Message>>>,
+    /// LRU Cache for Messages by Group ID (GroupId), stored as HashMap for O(1) lookups
+    messages_by_group_cache: RwLock<LruCache<GroupId, HashMap<EventId, Message>>>,
     /// LRU Cache for ProcessedMessage objects, keyed by Event ID
     processed_messages_cache: RwLock<LruCache<EventId, ProcessedMessage>>,
     /// LRU Cache for GroupExporterSecret objects, keyed by a tuple of (GroupId, epoch)
@@ -530,14 +530,16 @@ mod tests {
         }
         {
             let mut cache = nostr_storage.messages_by_group_cache.write();
-            cache.put(mls_group_id.clone(), vec![message.clone()]); // Manual add for testing
+            let mut messages_map = HashMap::new();
+            messages_map.insert(message.id, message.clone());
+            cache.put(mls_group_id.clone(), messages_map); // Manual add for testing
         }
         {
             let cache = nostr_storage.messages_by_group_cache.read();
             assert!(cache.contains(&mls_group_id));
             if let Some(msgs) = cache.peek(&mls_group_id) {
                 assert_eq!(msgs.len(), 1);
-                assert_eq!(msgs[0].id, event_id);
+                assert_eq!(msgs.get(&event_id).unwrap().id, event_id);
             } else {
                 panic!("Messages not found in group cache");
             }
@@ -695,8 +697,9 @@ mod tests {
             let cache = nostr_storage.messages_by_group_cache.read();
             let group_messages = cache.peek(&mls_group_id).unwrap();
             assert_eq!(group_messages.len(), 1);
-            assert_eq!(group_messages[0].content, "Updated message");
-            assert_eq!(group_messages[0].id, event_id);
+            let msg = group_messages.get(&event_id).unwrap();
+            assert_eq!(msg.content, "Updated message");
+            assert_eq!(msg.id, event_id);
         }
     }
 
@@ -794,15 +797,13 @@ mod tests {
             let cache = nostr_storage.messages_by_group_cache.read();
             let group_messages = cache.peek(&mls_group_id).unwrap();
             assert_eq!(group_messages.len(), 2);
-            assert!(
-                group_messages
-                    .iter()
-                    .any(|m| m.id == event_id_1 && m.content == "First message")
+            assert_eq!(
+                group_messages.get(&event_id_1).unwrap().content,
+                "First message"
             );
-            assert!(
-                group_messages
-                    .iter()
-                    .any(|m| m.id == event_id_2 && m.content == "Second message")
+            assert_eq!(
+                group_messages.get(&event_id_2).unwrap().content,
+                "Second message"
             );
         }
     }

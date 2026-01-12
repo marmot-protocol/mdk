@@ -74,8 +74,11 @@ impl GroupStorage for MdkMemoryStorage {
         }
 
         let cache = self.messages_by_group_cache.read();
-        match cache.peek(mls_group_id).cloned() {
-            Some(mut messages) => {
+        match cache.peek(mls_group_id) {
+            Some(messages_map) => {
+                // Convert HashMap to Vec for sorting and pagination
+                let mut messages: Vec<_> = messages_map.values().cloned().collect();
+                
                 // Sort by created_at DESC (newest first)
                 messages.sort_by(|a, b| b.created_at.cmp(&a.created_at));
 
