@@ -411,17 +411,32 @@ impl Mdk {
     }
 
     /// Accept a welcome message
-    pub fn accept_welcome(&self, welcome: Welcome) -> Result<(), MdkUniffiError> {
+    ///
+    /// Returns information about KeyPackage cleanup per MIP-02:
+    /// - `should_delete_key_package_from_relay`: `true` if the KeyPackage should be deleted
+    ///   from relays (non-last-resort), `false` if it should be kept (last-resort).
+    pub fn accept_welcome(&self, welcome: Welcome) -> Result<AcceptWelcomeResult, MdkUniffiError> {
         let welcome = welcome_from_uniffi(welcome)?;
-        self.lock()?.accept_welcome(&welcome)?;
-        Ok(())
+        let result = self.lock()?.accept_welcome(&welcome)?;
+        Ok(AcceptWelcomeResult {
+            should_delete_key_package_from_relay: result.should_delete_key_package_from_relay,
+        })
     }
 
     /// Accept a welcome message from JSON
-    pub fn accept_welcome_json(&self, welcome_json: String) -> Result<(), MdkUniffiError> {
+    ///
+    /// Returns information about KeyPackage cleanup per MIP-02:
+    /// - `should_delete_key_package_from_relay`: `true` if the KeyPackage should be deleted
+    ///   from relays (non-last-resort), `false` if it should be kept (last-resort).
+    pub fn accept_welcome_json(
+        &self,
+        welcome_json: String,
+    ) -> Result<AcceptWelcomeResult, MdkUniffiError> {
         let welcome: welcome_types::Welcome = parse_json(&welcome_json, "welcome JSON")?;
-        self.lock()?.accept_welcome(&welcome)?;
-        Ok(())
+        let result = self.lock()?.accept_welcome(&welcome)?;
+        Ok(AcceptWelcomeResult {
+            should_delete_key_package_from_relay: result.should_delete_key_package_from_relay,
+        })
     }
 
     /// Decline a welcome message
@@ -873,6 +888,18 @@ pub struct UpdateGroupResult {
     pub welcome_rumors_json: Option<Vec<String>>,
     /// Hex-encoded MLS group ID
     pub mls_group_id: String,
+}
+
+/// Result of accepting a welcome message per MIP-02
+#[derive(uniffi::Record)]
+pub struct AcceptWelcomeResult {
+    /// Whether the consumed KeyPackage should be deleted from relays.
+    ///
+    /// - `true`: Non-last-resort KeyPackage was consumed; caller SHOULD delete from relays
+    /// - `false`: Last-resort KeyPackage was used; caller SHOULD NOT delete from relays
+    ///
+    /// The KeyPackage event ID can be extracted from the welcome's `e` tag.
+    pub should_delete_key_package_from_relay: bool,
 }
 
 /// Configuration for updating group data with optional fields

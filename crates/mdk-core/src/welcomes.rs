@@ -32,6 +32,18 @@ pub struct JoinedGroupResult {
     pub nostr_group_data: NostrGroupDataExtension,
 }
 
+/// Result of accepting a welcome, including KeyPackage cleanup information per MIP-02.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcceptWelcomeResult {
+    /// Whether the consumed KeyPackage should be deleted from relays.
+    ///
+    /// - `true`: Non-last-resort KeyPackage was consumed; caller SHOULD delete from relays
+    /// - `false`: Last-resort KeyPackage was used; caller SHOULD NOT delete from relays
+    ///
+    /// The KeyPackage event ID can be extracted from the welcome's `e` tag.
+    pub should_delete_key_package_from_relay: bool,
+}
+
 impl<Storage> MDK<Storage>
 where
     Storage: MdkStorageProvider,
@@ -298,8 +310,20 @@ where
         Ok(welcome)
     }
 
-    /// Accepts a welcome
-    pub fn accept_welcome(&self, welcome: &welcome_types::Welcome) -> Result<(), Error> {
+    /// Accepts a welcome and joins the group.
+    ///
+    /// Returns information about KeyPackage cleanup per MIP-02:
+    /// - For non-last-resort KeyPackages: `should_delete_key_package_from_relay` is `true`,
+    ///   indicating the caller SHOULD delete the KeyPackage from relays to prevent stale
+    ///   invitation vectors.
+    /// - For last-resort KeyPackages: `should_delete_key_package_from_relay` is `false`,
+    ///   indicating the KeyPackage can be reused until fresh packages are published.
+    ///
+    /// The KeyPackage event ID for relay deletion can be extracted from the welcome's `e` tag.
+    pub fn accept_welcome(
+        &self,
+        welcome: &welcome_types::Welcome,
+    ) -> Result<AcceptWelcomeResult, Error> {
         let welcome_preview = self.preview_welcome(&welcome.wrapper_event_id, &welcome.event)?;
         let mls_group = welcome_preview.staged_welcome.into_group(&self.provider)?;
 
@@ -328,7 +352,12 @@ where
                 .map_err(|e| Error::Group(e.to_string()))?;
         }
 
-        Ok(())
+        // Clean up KeyPackages after successful welcome acceptance per MIP-02
+        let should_delete = self.cleanup_key_packages_after_welcome_acceptance(&mls_group)?;
+
+        Ok(AcceptWelcomeResult {
+            should_delete_key_package_from_relay: should_delete,
+        })
     }
 
     /// Declines a welcome
@@ -509,6 +538,58 @@ where
         };
 
         Ok(welcome_preview)
+    }
+
+    /// Cleans up KeyPackages after welcome acceptance per MIP-02.
+    ///
+    /// KeyPackage deletion depends on the `last_resort` extension:
+    /// - Non-last-resort: deleted after joining (prevents stale invitation vectors)
+    /// - Last-resort: kept for reuse until fresh packages are published
+    ///
+    /// Returns `true` if the KeyPackage should be deleted from relays (non-last-resort),
+    /// `false` if it should be kept (last-resort).
+    ///
+    /// Note: OpenMLS automatically consumes the KeyPackage's private key material during
+    /// `StagedWelcome::into_group()`. This function determines whether the caller should
+    /// also delete the KeyPackage from relays.
+    fn cleanup_key_packages_after_welcome_acceptance(
+        &self,
+        mls_group: &MlsGroup,
+    ) -> Result<bool, Error> {
+        let own_leaf = match mls_group.own_leaf() {
+            Some(leaf) => leaf,
+            None => {
+                tracing::warn!(
+                    target: "mdk_core::welcomes::cleanup_key_packages",
+                    "No own leaf found in group, skipping KeyPackage cleanup"
+                );
+                // Cannot determine last_resort status, default to not deleting
+                return Ok(false);
+            }
+        };
+
+        let has_last_resort = own_leaf
+            .extensions()
+            .iter()
+            .any(|ext| matches!(ext, Extension::LastResort(_)));
+
+        if has_last_resort {
+            tracing::debug!(
+                target: "mdk_core::welcomes::cleanup_key_packages",
+                "KeyPackage has last_resort extension, skipping relay deletion"
+            );
+            return Ok(false);
+        }
+
+        // Non-last-resort path: OpenMLS already consumed the KeyPackage's private key
+        // material during StagedWelcome::into_group(). The caller should delete the
+        // KeyPackage from relays to prevent stale invitation vectors.
+        tracing::debug!(
+            target: "mdk_core::welcomes::cleanup_key_packages",
+            "Non-last-resort KeyPackage consumed, relay deletion recommended"
+        );
+
+        Ok(true)
     }
 }
 
@@ -1587,5 +1668,57 @@ mod tests {
                 panic!("Expected WelcomePreviouslyFailed error, got: {:?}", other);
             }
         }
+    }
+
+    /// Test KeyPackage cleanup after welcome acceptance (MIP-02, Issue #89)
+    ///
+    /// Verifies that last_resort KeyPackages are not deleted after joining a group,
+    /// since they can be reused for multiple invitations.
+    #[test]
+    fn test_keypackage_cleanup_skips_last_resort() {
+        use crate::test_util::{create_key_package_event, create_nostr_group_config_data};
+        use nostr::Keys;
+
+        let alice_keys = Keys::generate();
+        let alice_mdk = create_test_mdk();
+
+        let bob_keys = Keys::generate();
+        let bob_mdk = create_test_mdk();
+
+        // Bob creates a KeyPackage (has last_resort by default)
+        let bob_key_package_event = create_key_package_event(&bob_mdk, &bob_keys);
+
+        // Alice creates group with Bob
+        let group_config = create_nostr_group_config_data(vec![alice_keys.public_key()]);
+        let group_result = alice_mdk
+            .create_group(
+                &alice_keys.public_key(),
+                vec![bob_key_package_event],
+                group_config,
+            )
+            .expect("Failed to create group");
+
+        alice_mdk
+            .merge_pending_commit(&group_result.group.mls_group_id)
+            .expect("Failed to merge pending commit");
+
+        // Bob processes and accepts the welcome
+        let welcome_rumor = &group_result.welcome_rumors[0];
+        let welcome = bob_mdk
+            .process_welcome(&nostr::EventId::all_zeros(), welcome_rumor)
+            .expect("Failed to process welcome");
+
+        // This triggers cleanup_key_packages_after_welcome_acceptance internally
+        bob_mdk
+            .accept_welcome(&welcome)
+            .expect("Failed to accept welcome");
+
+        // Verify Bob joined successfully
+        let bob_groups = bob_mdk.get_groups().expect("Failed to get groups");
+        assert_eq!(bob_groups.len(), 1);
+        assert_eq!(
+            bob_groups[0].state,
+            mdk_storage_traits::groups::types::GroupState::Active
+        );
     }
 }

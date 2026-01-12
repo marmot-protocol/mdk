@@ -35,7 +35,7 @@ pub use crate::groups::{
 /// Message processing result variants
 pub use crate::messages::MessageProcessingResult;
 /// Welcome operation results
-pub use crate::welcomes::{JoinedGroupResult, WelcomePreview};
+pub use crate::welcomes::{AcceptWelcomeResult, JoinedGroupResult, WelcomePreview};
 
 // === Storage Traits (users need these to provide storage implementations) ===
 pub use mdk_storage_traits::{Backend, MdkStorageProvider};
