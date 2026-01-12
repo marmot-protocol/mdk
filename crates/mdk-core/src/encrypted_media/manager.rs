@@ -1080,4 +1080,181 @@ mod tests {
         let media_ref = result.unwrap();
         assert_eq!(media_ref.mime_type, "image/jpeg");
     }
+
+    #[test]
+    fn test_parse_imeta_tag_duplicate_fields() {
+        let mdk = create_test_mdk();
+        let group_id = GroupId::from_slice(&[1, 2, 3, 4]);
+        let manager = mdk.media_manager(group_id);
+
+        let test_nonce = [0xAA; 12];
+        let tag_values = vec![
+            "url https://example.com/first.jpg".to_string(),
+            "url https://example.com/second.jpg".to_string(), // Duplicate
+            "m image/jpeg".to_string(),
+            "filename photo.jpg".to_string(),
+            format!("x {}", hex::encode([0x42; 32])),
+            format!("n {}", hex::encode(test_nonce)),
+            "v mip04-v2".to_string(),
+        ];
+        let tag = NostrTag::custom(TagKind::Custom("imeta".into()), tag_values);
+
+        let result = manager.parse_imeta_tag(&tag);
+        assert!(result.is_ok());
+        let media_ref = result.unwrap();
+        // Last one wins
+        assert_eq!(media_ref.url, "https://example.com/second.jpg");
+    }
+
+    #[test]
+    fn test_parse_imeta_tag_malformed_hex() {
+        let mdk = create_test_mdk();
+        let group_id = GroupId::from_slice(&[1, 2, 3, 4]);
+        let manager = mdk.media_manager(group_id);
+
+        // Invalid hex in 'x' (hash)
+        let tag_values = vec![
+            "url https://example.com/test.jpg".to_string(),
+            "m image/jpeg".to_string(),
+            "filename photo.jpg".to_string(),
+            "x ZZZZ".to_string(), // Invalid hex
+            format!("n {}", hex::encode([0xAA; 12])),
+            "v mip04-v2".to_string(),
+        ];
+        let tag = NostrTag::custom(TagKind::Custom("imeta".into()), tag_values);
+        let result = manager.parse_imeta_tag(&tag);
+        assert!(matches!(
+            result,
+            Err(EncryptedMediaError::InvalidImetaTag { .. })
+        ));
+
+        // Invalid hex in 'n' (nonce)
+        let tag_values = vec![
+            "url https://example.com/test.jpg".to_string(),
+            "m image/jpeg".to_string(),
+            "filename photo.jpg".to_string(),
+            format!("x {}", hex::encode([0x42; 32])),
+            "n ZZZZ".to_string(), // Invalid hex
+            "v mip04-v2".to_string(),
+        ];
+        let tag = NostrTag::custom(TagKind::Custom("imeta".into()), tag_values);
+        let result = manager.parse_imeta_tag(&tag);
+        assert!(matches!(
+            result,
+            Err(EncryptedMediaError::InvalidImetaTag { .. })
+        ));
+
+        // Wrong length hex in 'x'
+        let tag_values = vec![
+            "url https://example.com/test.jpg".to_string(),
+            "m image/jpeg".to_string(),
+            "filename photo.jpg".to_string(),
+            format!("x {}", hex::encode([0x42; 31])), // 31 bytes instead of 32
+            format!("n {}", hex::encode([0xAA; 12])),
+            "v mip04-v2".to_string(),
+        ];
+        let tag = NostrTag::custom(TagKind::Custom("imeta".into()), tag_values);
+        let result = manager.parse_imeta_tag(&tag);
+        assert!(matches!(
+            result,
+            Err(EncryptedMediaError::InvalidImetaTag { .. })
+        ));
+    }
+
+    #[test]
+    fn test_parse_imeta_tag_invalid_dimensions() {
+        let mdk = create_test_mdk();
+        let group_id = GroupId::from_slice(&[1, 2, 3, 4]);
+        let manager = mdk.media_manager(group_id);
+
+        let invalid_dims = vec!["100x", "x100", "abc", "100xabc", "100x200x300"];
+
+        for dim in invalid_dims {
+            let tag_values = vec![
+                "url https://example.com/test.jpg".to_string(),
+                "m image/jpeg".to_string(),
+                "filename photo.jpg".to_string(),
+                format!("x {}", hex::encode([0x42; 32])),
+                format!("n {}", hex::encode([0xAA; 12])),
+                "v mip04-v2".to_string(),
+                format!("dim {}", dim),
+            ];
+            let tag = NostrTag::custom(TagKind::Custom("imeta".into()), tag_values);
+            let result = manager.parse_imeta_tag(&tag);
+
+            // Invalid dimensions should be ignored, not cause failure
+            assert!(
+                result.is_ok(),
+                "Should parse successfully ignoring invalid dimensions: {}",
+                dim
+            );
+            let media_ref = result.unwrap();
+            assert_eq!(media_ref.dimensions, None);
+        }
+    }
+
+    #[test]
+    fn test_parse_imeta_tag_unknown_fields() {
+        let mdk = create_test_mdk();
+        let group_id = GroupId::from_slice(&[1, 2, 3, 4]);
+        let manager = mdk.media_manager(group_id);
+
+        let tag_values = vec![
+            "url https://example.com/test.jpg".to_string(),
+            "m image/jpeg".to_string(),
+            "filename photo.jpg".to_string(),
+            format!("x {}", hex::encode([0x42; 32])),
+            format!("n {}", hex::encode([0xAA; 12])),
+            "v mip04-v2".to_string(),
+            "unknown_field some_value".to_string(),
+            "another_unknown".to_string(),
+        ];
+        let tag = NostrTag::custom(TagKind::Custom("imeta".into()), tag_values);
+        let result = manager.parse_imeta_tag(&tag);
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_decrypt_from_download_hash_verification_failure() {
+        use crate::test_util::create_nostr_group_config_data;
+        use nostr::Keys;
+
+        let mdk = create_test_mdk();
+
+        // Create a group so we have secrets for encryption/decryption
+        let alice_keys = Keys::generate();
+        let admins = vec![alice_keys.public_key()];
+        let create_result = mdk
+            .create_group(
+                &alice_keys.public_key(),
+                vec![],
+                create_nostr_group_config_data(admins),
+            )
+            .expect("Failed to create group");
+
+        let group_id = create_result.group.mls_group_id;
+        let manager = mdk.media_manager(group_id);
+
+        // 1. Create a valid encryption
+        let data = b"secret data";
+        let upload = manager
+            .encrypt_for_upload(data, "text/plain", "secret.txt")
+            .unwrap();
+
+        // 2. Create a reference but tamper with the hash
+        let mut media_ref =
+            manager.create_media_reference(&upload, "https://example.com".to_string());
+        media_ref.original_hash[0] ^= 0xFF; // Flip a bit in the hash
+
+        // 3. Attempt decryption
+        let result = manager.decrypt_from_download(&upload.encrypted_data, &media_ref);
+
+        // Changing the hash changes the AAD, which causes Poly1305 verification to fail.
+        // So we expect DecryptionFailed, not HashVerificationFailed.
+        assert!(matches!(
+            result,
+            Err(EncryptedMediaError::DecryptionFailed { .. })
+        ));
+    }
 }
