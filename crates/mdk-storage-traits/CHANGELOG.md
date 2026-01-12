@@ -27,20 +27,35 @@
 
 ### Breaking changes
 
+- **Secret Type Wrapper**: Secret values now use `Secret<T>` wrapper for automatic zeroization ([#109](https://github.com/marmot-protocol/mdk/pull/109))
+  - `Group.image_key` changed from `Option<[u8; 32]>` to `Option<Secret<[u8; 32]>>`
+  - `Group.image_nonce` changed from `Option<[u8; 12]>` to `Option<Secret<[u8; 12]>>`
+  - `GroupExporterSecret.secret` changed from `[u8; 32]` to `Secret<[u8; 32]>`
+  - `Welcome.group_image_key` changed from `Option<[u8; 32]>` to `Option<Secret<[u8; 32]>>`
+  - `Welcome.group_image_nonce` changed from `Option<[u8; 12]>` to `Option<Secret<[u8; 12]>>`
+  - Code accessing these fields must use `Secret::new()` to wrap values or dereference/clone to access inner values ([#109](https://github.com/marmot-protocol/mdk/pull/109))
+- **BREAKING**: Changed `WelcomeStorage::pending_welcomes()` to accept `Option<Pagination>` parameter instead of having separate `pending_welcomes()` and `pending_welcomes_paginated()` methods ([#110](https://github.com/marmot-protocol/mdk/pull/110))
+- **BREAKING**: Removed `MAX_PENDING_WELCOMES_OFFSET` constant - offset validation removed to allow legitimate large-scale use cases ([#110](https://github.com/marmot-protocol/mdk/pull/110))
 - Changed `GroupStorage::messages()` to accept `Option<Pagination>` parameter instead of having separate `messages()` and `messages_paginated()` methods ([#111](https://github.com/marmot-protocol/mdk/pull/111))
-- Changed `WelcomeStorage::pending_welcomes()` to accept `Option<Pagination>` parameter for pagination control ([#110](https://github.com/marmot-protocol/mdk/pull/110))
 
 ### Changed
 
 ### Added
 
-- Added `Pagination` struct with `limit` and `offset` fields for cleaner pagination API - now part of public API for external consumers ([#111](https://github.com/marmot-protocol/mdk/pull/111))
+- **Secret Type and Zeroization**: Added `Secret<T>` wrapper type that automatically zeroizes memory on drop ([#109](https://github.com/marmot-protocol/mdk/pull/109))
+  - Implements `Zeroize` trait for `[u8; 32]`, `[u8; 12]`, and `Vec<u8>`
+  - Provides `Deref` and `DerefMut` for transparent access to wrapped values
+  - Includes serde serialization support
+  - Debug formatting hides secret values to prevent leaks
+  - Comprehensive test suite including memory zeroization verification ([#109](https://github.com/marmot-protocol/mdk/pull/109))
+- Added `Pagination` struct with `limit` and `offset` fields for cleaner pagination API - now part of public API for external consumers ([#110](https://github.com/marmot-protocol/mdk/pull/110), [#111](https://github.com/marmot-protocol/mdk/pull/111))
 - Added `DEFAULT_MESSAGE_LIMIT` (1000) and `MAX_MESSAGE_LIMIT` (10,000) constants for pagination validation ([#111](https://github.com/marmot-protocol/mdk/pull/111))
 - Added `DEFAULT_PENDING_WELCOMES_LIMIT` (1000) and `MAX_PENDING_WELCOMES_LIMIT` (10,000) constants for pagination validation ([#110](https://github.com/marmot-protocol/mdk/pull/110))
 - Add tests for `admins()`, `messages()`, and `group_relays()` error cases when group not found ([#104](https://github.com/marmot-protocol/mdk/pull/104))
 
 ### Fixed
 
+- **Security (Audit Issue Y)**: Secret values (encryption keys, nonces, exporter secrets) are now automatically zeroized when dropped, preventing memory leaks of sensitive cryptographic material ([#109](https://github.com/marmot-protocol/mdk/pull/109))
 - **Security (Audit Issue Z)**: Added pagination to prevent memory exhaustion from unbounded loading of group messages ([#111](https://github.com/marmot-protocol/mdk/pull/111))
 - **Security (Audit Issue AA)**: Added pagination to prevent memory exhaustion from unbounded loading of pending welcomes ([#110](https://github.com/marmot-protocol/mdk/pull/110))
 

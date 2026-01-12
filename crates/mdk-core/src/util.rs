@@ -34,7 +34,7 @@ pub(crate) fn decrypt_with_exporter_secret(
     encrypted_content: &str,
 ) -> Result<Vec<u8>, Error> {
     // Convert that secret to nostr keys
-    let secret_key: SecretKey = SecretKey::from_slice(&secret.secret)?;
+    let secret_key: SecretKey = SecretKey::from_slice(secret.secret.as_ref())?;
     let export_nostr_keys = Keys::new(secret_key);
 
     // Decrypt message

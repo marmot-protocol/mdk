@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::str::FromStr;
 
-use crate::GroupId;
+use crate::{GroupId, Secret};
 use nostr::{EventId, PublicKey, RelayUrl, Timestamp};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -89,9 +89,9 @@ pub struct Group {
     /// Hash of the image (same value as the NostrGroupDataExtension)
     pub image_hash: Option<[u8; 32]>,
     /// Secret key of the image
-    pub image_key: Option<[u8; 32]>,
+    pub image_key: Option<Secret<[u8; 32]>>,
     /// Nonce used to encrypt the image
-    pub image_nonce: Option<[u8; 12]>,
+    pub image_nonce: Option<Secret<[u8; 12]>>,
     /// Hex encoded (same value as the NostrGroupDataExtension)
     pub admin_pubkeys: BTreeSet<PublicKey>,
     /// Hex encoded Nostr event ID of the last message in the group
@@ -123,7 +123,7 @@ pub struct GroupExporterSecret {
     /// The epoch
     pub epoch: u64,
     /// The secret
-    pub secret: [u8; 32],
+    pub secret: Secret<[u8; 32]>,
 }
 
 #[cfg(test)]
@@ -212,7 +212,7 @@ mod tests {
         let secret = GroupExporterSecret {
             mls_group_id: GroupId::from_slice(&[1, 2, 3]),
             epoch: 42,
-            secret: [0u8; 32],
+            secret: Secret::new([0u8; 32]),
         };
 
         let serialized = serde_json::to_value(&secret).unwrap();
@@ -229,7 +229,7 @@ mod tests {
         // Test deserialization
         let deserialized: GroupExporterSecret = serde_json::from_value(serialized).unwrap();
         assert_eq!(deserialized.epoch, 42);
-        assert_eq!(deserialized.secret, [0u8; 32]);
+        assert_eq!(*deserialized.secret, [0u8; 32]);
     }
 
     #[test]

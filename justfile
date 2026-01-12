@@ -227,6 +227,9 @@ gen-binding-ruby: (gen-binding "ruby")
 coverage:
     @bash scripts/coverage.sh
 
+coverage-during-dev:
+    @bash scripts/get-coverage.sh
+
 # Generate HTML coverage report
 coverage-html:
     @bash scripts/coverage.sh --html

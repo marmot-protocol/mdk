@@ -58,6 +58,7 @@ hex = { version = "0.4", default-features = false }
 lru = { version = "0.16", default-features = false }
 parking_lot = "0.12"
 thiserror = "2"
+zeroize = { version = "1.8", features = ["zeroize_derive"] }
 
 # Async
 tokio = { version = "1.47", default-features = false }

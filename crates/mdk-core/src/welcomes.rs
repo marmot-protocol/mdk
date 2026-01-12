@@ -226,8 +226,14 @@ where
             name: welcome_preview.nostr_group_data.name.clone(),
             description: welcome_preview.nostr_group_data.description.clone(),
             image_hash: welcome_preview.nostr_group_data.image_hash,
-            image_key: welcome_preview.nostr_group_data.image_key,
-            image_nonce: welcome_preview.nostr_group_data.image_nonce,
+            image_key: welcome_preview
+                .nostr_group_data
+                .image_key
+                .map(mdk_storage_traits::Secret::new),
+            image_nonce: welcome_preview
+                .nostr_group_data
+                .image_nonce
+                .map(mdk_storage_traits::Secret::new),
             admin_pubkeys: welcome_preview.nostr_group_data.admins.clone(),
             last_message_id: None,
             last_message_at: None,
@@ -277,8 +283,14 @@ where
             group_name: welcome_preview.nostr_group_data.name,
             group_description: welcome_preview.nostr_group_data.description,
             group_image_hash: welcome_preview.nostr_group_data.image_hash,
-            group_image_key: welcome_preview.nostr_group_data.image_key,
-            group_image_nonce: welcome_preview.nostr_group_data.image_nonce,
+            group_image_key: welcome_preview
+                .nostr_group_data
+                .image_key
+                .map(mdk_storage_traits::Secret::new),
+            group_image_nonce: welcome_preview
+                .nostr_group_data
+                .image_nonce
+                .map(mdk_storage_traits::Secret::new),
             group_admin_pubkeys: welcome_preview.nostr_group_data.admins,
             group_relays: welcome_preview.nostr_group_data.relays,
             welcomer: rumor_event.pubkey,
@@ -1054,7 +1066,7 @@ mod tests {
             )
             .expect("Failed to create group");
 
-        let group_id = create_result.group.mls_group_id;
+        let group_id = create_result.group.mls_group_id.clone();
         let first_welcome = &create_result.welcome_rumors[0];
 
         // Merge pending commit to activate group

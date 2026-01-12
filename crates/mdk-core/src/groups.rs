@@ -368,7 +368,7 @@ where
                 let group_exporter_secret = group_types::GroupExporterSecret {
                     mls_group_id: group_id.clone(),
                     epoch: group.epoch().as_u64(),
-                    secret: export_secret,
+                    secret: mdk_storage_traits::Secret::new(export_secret),
                 };
 
                 self.storage()
@@ -922,29 +922,34 @@ where
     /// It generates the necessary cryptographic credentials, configures the group with Nostr-specific extensions,
     /// and adds the specified members.
     ///
-    /// NOTE: This function doesn't merge the pending commit. Clients must call this function manually only after successful publish of the commit message to relays.
+    /// # Single-Member Groups
+    ///
+    /// This method supports creating groups with only the creator (no additional members).
+    /// When `member_key_package_events` is empty, the group is created with just the creator,
+    /// and `welcome_rumors` in the result will be empty. This is useful for:
+    /// - "Message to self" functionality
+    /// - Setting up groups before inviting members
     ///
     /// # Arguments
     ///
-    /// * `name` - The name of the group
-    /// * `description` - A description of the group
     /// * `creator_public_key` - The Nostr public key of the group creator
-    /// * `member_key_package_events` - A vector of Nostr events (Kind:443) containing key packages for the initial group members
-    /// * `admins` - A vector of Nostr public keys for group administrators
-    /// * `group_relays` - A vector of relay URLs where group messages will be published
+    /// * `member_key_package_events` - A vector of Nostr events (Kind:443) containing key packages
+    ///   for the initial group members. Can be empty to create a single-member group.
+    /// * `config` - Group configuration including name, description, admins, and relays
     ///
     /// # Returns
     ///
     /// A `GroupResult` containing:
-    /// - The created MLS group
-    /// - A Vec of UnsignedEvents representing the welcomes to be sent to new users
+    /// - The created group
+    /// - A Vec of UnsignedEvents (`welcome_rumors`) representing the welcomes to be sent to new
+    ///   members. Empty if no members were added.
     ///
     /// # Errors
     ///
-    /// Returns a `Error` if:
+    /// Returns an `Error` if:
     /// - Credential generation fails
     /// - Group creation fails
-    /// - Adding members fails
+    /// - Adding members fails (when members are provided)
     /// - Message serialization fails
     pub fn create_group(
         &self,
@@ -1000,50 +1005,57 @@ where
             key_packages_vec.push(key_package);
         }
 
-        // Add members to the group
-        let (_, welcome_out, _group_info) =
-            mls_group.add_members(&self.provider, &signer, &key_packages_vec)?;
+        // Handle member addition and welcome message creation
+        // For single-member groups (no additional members), we skip adding members
+        // and return an empty welcome_rumors vec
+        let welcome_rumors = if key_packages_vec.is_empty() {
+            // Single-member group: no members to add, no welcome messages needed
+            Vec::new()
+        } else {
+            // Add members to the group
+            let (_, welcome_out, _group_info) =
+                mls_group.add_members(&self.provider, &signer, &key_packages_vec)?;
 
-        // IMPORTANT: Privacy-preserving group creation
-        //
-        // We intentionally DO NOT publish the initial commit to relays. Instead, we:
-        // 1. Merge the pending commit locally (immediately below)
-        // 2. Send Welcome messages directly to invited members
-        //
-        // This differs from the MLS specification (RFC 9420), which recommends waiting
-        // for Delivery Service confirmation before applying commits. However, that
-        // guidance assumes a centralized Delivery Service model.
-        //
-        // For initial group creation with Nostr relays, not publishing the commit is
-        // the correct choice for security and privacy reasons:
-        //
-        // - PRIVACY: Publishing the commit would expose additional metadata on relays
-        //   (timing, event patterns, correlation opportunities) with no functional benefit
-        // - SECURITY: Invited members receive complete group state via Welcome messages;
-        //   they do not need the commit to join the group
-        // - NO RACE CONDITIONS: At creation time, only the creator exists in the group,
-        //   so there are no other members who need to process this commit
-        //
-        // This approach minimizes observable events on relays while maintaining full
-        // MLS security properties. The Welcome messages contain all cryptographic
-        // material needed for invitees to participate in the group.
-        //
-        // NOTE: This is specific to initial group creation. For commits in established
-        // groups (adding/removing members, updates), commits MUST be published to relays
-        // so existing members can process them and stay in sync.
-        mls_group.merge_pending_commit(&self.provider)?;
+            // IMPORTANT: Privacy-preserving group creation
+            //
+            // We intentionally DO NOT publish the initial commit to relays. Instead, we:
+            // 1. Merge the pending commit locally (immediately below)
+            // 2. Send Welcome messages directly to invited members
+            //
+            // This differs from the MLS specification (RFC 9420), which recommends waiting
+            // for Delivery Service confirmation before applying commits. However, that
+            // guidance assumes a centralized Delivery Service model.
+            //
+            // For initial group creation with Nostr relays, not publishing the commit is
+            // the correct choice for security and privacy reasons:
+            //
+            // - PRIVACY: Publishing the commit would expose additional metadata on relays
+            //   (timing, event patterns, correlation opportunities) with no functional benefit
+            // - SECURITY: Invited members receive complete group state via Welcome messages;
+            //   they do not need the commit to join the group
+            // - NO RACE CONDITIONS: At creation time, only the creator exists in the group,
+            //   so there are no other members who need to process this commit
+            //
+            // This approach minimizes observable events on relays while maintaining full
+            // MLS security properties. The Welcome messages contain all cryptographic
+            // material needed for invitees to participate in the group.
+            //
+            // NOTE: This is specific to initial group creation. For commits in established
+            // groups (adding/removing members, updates), commits MUST be published to relays
+            // so existing members can process them and stay in sync.
+            mls_group.merge_pending_commit(&self.provider)?;
 
-        // Serialize the welcome message and send it to the members
-        let serialized_welcome_message = welcome_out.tls_serialize_detached()?;
+            // Serialize the welcome message and send it to the members
+            let serialized_welcome_message = welcome_out.tls_serialize_detached()?;
 
-        let welcome_rumors = self
-            .build_welcome_rumors_for_key_packages(
+            self.build_welcome_rumors_for_key_packages(
                 &mls_group,
                 serialized_welcome_message,
                 member_key_package_events,
                 &config.relays,
             )?
-            .ok_or(Error::Welcome("Error creating welcome rumors".to_string()))?;
+            .ok_or(Error::Welcome("Error creating welcome rumors".to_string()))?
+        };
 
         // Save the NostrMLS Group
         let group = group_types::Group {
@@ -1057,8 +1069,8 @@ where
             epoch: mls_group.epoch().as_u64(),
             state: group_types::GroupState::Active,
             image_hash: config.image_hash,
-            image_key: config.image_key,
-            image_nonce: config.image_nonce,
+            image_key: config.image_key.map(mdk_storage_traits::Secret::new),
+            image_nonce: config.image_nonce.map(mdk_storage_traits::Secret::new),
         };
 
         self.storage().save_group(group.clone()).map_err(
@@ -1277,14 +1289,15 @@ where
         // Validate the mandatory group-data extension FIRST before making any state changes
         // This ensures we don't update stored_group if the extension is missing, invalid, or unsupported
         let group_data = NostrGroupDataExtension::from_group(&mls_group)?;
-
         // Only after successful validation, update epoch and metadata from MLS group
         stored_group.epoch = mls_group.epoch().as_u64();
+
+        // Update extension data from NostrGroupDataExtension
         stored_group.name = group_data.name;
         stored_group.description = group_data.description;
         stored_group.image_hash = group_data.image_hash;
-        stored_group.image_key = group_data.image_key;
-        stored_group.image_nonce = group_data.image_nonce;
+        stored_group.image_key = group_data.image_key.map(mdk_storage_traits::Secret::new);
+        stored_group.image_nonce = group_data.image_nonce.map(mdk_storage_traits::Secret::new);
         stored_group.admin_pubkeys = group_data.admins;
         stored_group.nostr_group_id = group_data.nostr_group_id;
 
@@ -1405,7 +1418,7 @@ where
         let secret: group_types::GroupExporterSecret = self.exporter_secret(group_id)?;
 
         // Convert that secret to nostr keys
-        let secret_key: SecretKey = SecretKey::from_slice(&secret.secret)?;
+        let secret_key: SecretKey = SecretKey::from_slice(secret.secret.as_ref())?;
         let export_nostr_keys: Keys = Keys::new(secret_key);
 
         // Encrypt the message content
@@ -1555,7 +1568,7 @@ mod tests {
             )
             .expect("Failed to create group");
 
-        let group_id = &create_result.group.mls_group_id;
+        let group_id = &create_result.group.mls_group_id.clone();
 
         // Merge the pending commit to apply the member additions
         creator_mdk
@@ -1572,6 +1585,57 @@ mod tests {
         for member_keys in &initial_members {
             assert!(members.contains(&member_keys.public_key()));
         }
+    }
+
+    /// Test creating a group with only the creator (no additional members).
+    /// This is useful for "message to self" functionality, setting up groups
+    /// before inviting members, and multi-device scenarios.
+    #[test]
+    fn test_create_single_member_group() {
+        let creator_mdk = create_test_mdk();
+        let creator = Keys::generate();
+        let creator_pk = creator.public_key();
+
+        // Create a group with no additional members - only the creator
+        let create_result = creator_mdk
+            .create_group(
+                &creator_pk,
+                Vec::new(), // No additional members
+                create_nostr_group_config_data(vec![creator_pk]),
+            )
+            .expect("Failed to create single-member group");
+
+        let group_id = &create_result.group.mls_group_id;
+
+        // Verify welcome_rumors is empty (no members to welcome)
+        assert!(
+            create_result.welcome_rumors.is_empty(),
+            "Single-member group should have no welcome rumors"
+        );
+
+        // Verify only the creator is in the group
+        let members = creator_mdk
+            .get_members(group_id)
+            .expect("Failed to get members");
+
+        assert_eq!(
+            members.len(),
+            1,
+            "Single-member group should have exactly 1 member"
+        );
+        assert!(
+            members.contains(&creator_pk),
+            "Creator should be in the group"
+        );
+
+        // Verify group metadata was saved correctly
+        let group = creator_mdk
+            .get_group(group_id)
+            .expect("Failed to get group")
+            .expect("Group should exist");
+
+        assert_eq!(group.name, "Test Group");
+        assert!(group.admin_pubkeys.contains(&creator_pk));
     }
 
     #[test]
@@ -1596,7 +1660,7 @@ mod tests {
             )
             .expect("Failed to create group");
 
-        let group_id = &create_result.group.mls_group_id;
+        let group_id = &create_result.group.mls_group_id.clone();
 
         // Merge the pending commit to apply the member additions
         creator_mdk
@@ -1637,7 +1701,7 @@ mod tests {
             )
             .expect("Failed to create group");
 
-        let group_id = &create_result.group.mls_group_id;
+        let group_id = &create_result.group.mls_group_id.clone();
 
         // Merge the pending commit to apply the member additions
         creator_mdk
@@ -1716,7 +1780,7 @@ mod tests {
             )
             .expect("Failed to create group");
 
-        let group_id = &create_result.group.mls_group_id;
+        let group_id = &create_result.group.mls_group_id.clone();
 
         // Merge the pending commit to apply the member additions
         creator_mdk
@@ -1761,7 +1825,7 @@ mod tests {
             )
             .expect("Failed to create group");
 
-        let group_id = &create_result.group.mls_group_id;
+        let group_id = &create_result.group.mls_group_id.clone();
 
         // Merge the pending commit to apply the member additions
         creator_mdk
@@ -1808,7 +1872,7 @@ mod tests {
             )
             .expect("Failed to create group");
 
-        let group_id = &create_result.group.mls_group_id;
+        let group_id = &create_result.group.mls_group_id.clone();
 
         // Merge the pending commit to apply the member additions
         admin_mdk
@@ -1960,7 +2024,7 @@ mod tests {
             )
             .expect("Failed to create group");
 
-        let group_id = &create_result.group.mls_group_id;
+        let group_id = &create_result.group.mls_group_id.clone();
 
         // Merge the pending commit to apply the member additions
         creator_mdk
@@ -2035,7 +2099,7 @@ mod tests {
             )
             .expect("Failed to create group");
 
-        let group_id = &create_result.group.mls_group_id;
+        let group_id = &create_result.group.mls_group_id.clone();
 
         // Merge the pending commit to apply the member additions
         creator_mdk
@@ -2077,7 +2141,7 @@ mod tests {
             )
             .expect("Failed to create group");
 
-        let group_id = &create_result.group.mls_group_id;
+        let group_id = &create_result.group.mls_group_id.clone();
 
         // Merge the pending commit to apply the member additions
         creator_mdk
@@ -2153,7 +2217,7 @@ mod tests {
             )
             .expect("Failed to create group");
 
-        let group_id = &create_result.group.mls_group_id;
+        let group_id = &create_result.group.mls_group_id.clone();
 
         // Merge the pending commit to apply the member additions
         creator_mdk
@@ -2262,7 +2326,7 @@ mod tests {
             )
             .expect("Failed to create group");
 
-        let group_id = &create_result.group.mls_group_id;
+        let group_id = &create_result.group.mls_group_id.clone();
 
         // Merge the pending commit to apply the member additions
         creator_mdk
@@ -2340,7 +2404,7 @@ mod tests {
             )
             .expect("Failed to create group");
 
-        let group_id = &create_result.group.mls_group_id;
+        let group_id = &create_result.group.mls_group_id.clone();
 
         // Merge the pending commit to apply the member additions
         creator_mdk
@@ -2410,7 +2474,7 @@ mod tests {
             )
             .expect("Failed to create group");
 
-        let group_id = &create_result.group.mls_group_id;
+        let group_id = &create_result.group.mls_group_id.clone();
 
         // Merge the pending commit to apply the member additions
         creator_mdk
@@ -2575,7 +2639,7 @@ mod tests {
             )
             .expect("Failed to create group");
 
-        let group_id = &create_result.group.mls_group_id;
+        let group_id = &create_result.group.mls_group_id.clone();
 
         // Merge the pending commit to apply the member additions
         creator_mdk
@@ -2687,7 +2751,7 @@ mod tests {
             )
             .expect("Failed to create group");
 
-        let group_id = &create_result.group.mls_group_id;
+        let group_id = &create_result.group.mls_group_id.clone();
 
         // Merge the pending commit to apply the member additions
         creator_mdk
@@ -2761,7 +2825,7 @@ mod tests {
             )
             .expect("Failed to create group");
 
-        let group_id = &create_result.group.mls_group_id;
+        let group_id = &create_result.group.mls_group_id.clone();
 
         // Helper function to verify stored group epoch matches MLS group epoch
         let verify_epoch_sync = || {
@@ -3481,7 +3545,7 @@ mod tests {
             )
             .expect("Failed to create group");
 
-        let group_id = &create_result.group.mls_group_id;
+        let group_id = &create_result.group.mls_group_id.clone();
 
         // Merge the pending commit to apply the member additions
         creator_mdk
@@ -3523,7 +3587,7 @@ mod tests {
             )
             .expect("Failed to create group");
 
-        let group_id = &create_result.group.mls_group_id;
+        let group_id = &create_result.group.mls_group_id.clone();
 
         // Merge the pending commit to apply the member additions
         creator_mdk
@@ -3566,7 +3630,7 @@ mod tests {
             )
             .expect("Failed to create group");
 
-        let group_id = &create_result.group.mls_group_id;
+        let group_id = &create_result.group.mls_group_id.clone();
 
         // Merge the pending commit to apply the member additions
         creator_mdk
@@ -3638,7 +3702,7 @@ mod tests {
             )
             .expect("Failed to create group");
 
-        let group_id = &create_result.group.mls_group_id;
+        let group_id = &create_result.group.mls_group_id.clone();
 
         // Merge the pending commit to apply the member additions
         creator_mdk
