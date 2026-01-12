@@ -135,10 +135,12 @@ pub fn row_to_group(row: &Row) -> SqliteResult<Group> {
     let image_hash: Option<[u8; 32]> = row
         .get::<_, Option<Hash32>>("image_hash")?
         .map(|h| h.into());
-    let image_key: Option<[u8; 32]> = row.get::<_, Option<Hash32>>("image_key")?.map(|h| h.into());
-    let image_nonce: Option<[u8; 12]> = row
+    let image_key: Option<mdk_storage_traits::Secret<[u8; 32]>> = row
+        .get::<_, Option<Hash32>>("image_key")?
+        .map(|h| mdk_storage_traits::Secret::new(h.into()));
+    let image_nonce: Option<mdk_storage_traits::Secret<[u8; 12]>> = row
         .get::<_, Option<Nonce12>>("image_nonce")?
-        .map(|n| n.into());
+        .map(|n| mdk_storage_traits::Secret::new(n.into()));
 
     // Parse admin pubkeys from JSON
     let admin_pubkeys_json: &str = row.get_ref("admin_pubkeys")?.as_str()?;
@@ -202,7 +204,7 @@ pub fn row_to_group_exporter_secret(row: &Row) -> SqliteResult<GroupExporterSecr
     Ok(GroupExporterSecret {
         mls_group_id,
         epoch,
-        secret,
+        secret: mdk_storage_traits::Secret::new(secret),
     })
 }
 
@@ -299,12 +301,12 @@ pub fn row_to_welcome(row: &Row) -> SqliteResult<Welcome> {
     let group_image_hash: Option<[u8; 32]> = row
         .get::<_, Option<Hash32>>("group_image_hash")?
         .map(|h| h.into());
-    let group_image_key: Option<[u8; 32]> = row
+    let group_image_key: Option<mdk_storage_traits::Secret<[u8; 32]>> = row
         .get::<_, Option<Hash32>>("group_image_key")?
-        .map(|h| h.into());
-    let group_image_nonce: Option<[u8; 12]> = row
+        .map(|h| mdk_storage_traits::Secret::new(h.into()));
+    let group_image_nonce: Option<mdk_storage_traits::Secret<[u8; 12]>> = row
         .get::<_, Option<Nonce12>>("group_image_nonce")?
-        .map(|n| n.into());
+        .map(|n| mdk_storage_traits::Secret::new(n.into()));
     let group_admin_pubkeys_json: &str = row.get_ref("group_admin_pubkeys")?.as_str()?;
     let group_relays_json: &str = row.get_ref("group_relays")?.as_str()?;
     let welcomer_blob: &[u8] = row.get_ref("welcomer")?.as_blob()?;

@@ -27,9 +27,14 @@
 
 ### Breaking changes
 
+- **Credential Identity Encoding**: Removed support for legacy 64-byte UTF-8 hex-encoded credential identities ([#15](https://github.com/marmot-protocol/mdk/issues/15))
+  - Credential identities must now be exactly 32 bytes (raw public key) per MIP-00
+  - Key packages with 64-byte hex-encoded identities are no longer accepted
+  - This completes the migration period that began in November 2024
 - **Encrypted Media (MIP-04)**: The `derive_encryption_nonce()` function has been removed. All encrypted media must now include a random nonce in the IMETA tag (`n` field). Legacy media encrypted with deterministic nonces can no longer be decrypted. This is a breaking change to fix the security issue (Audit Issue U) where deterministic nonce derivation caused nonce reuse. ([#114](https://github.com/marmot-protocol/mdk/pull/114))
 - **BREAKING**: Changed `get_messages()` signature to accept `Option<Pagination>` parameter. Callers must now pass `None` for default pagination or `Some(Pagination::new(...))` for custom pagination ([#111](https://github.com/marmot-protocol/mdk/pull/111))
 - **BREAKING**: Changed `get_pending_welcomes()` to accept `Option<Pagination>` parameter for pagination support. Existing calls should pass `None` for default pagination. ([#110](https://github.com/marmot-protocol/mdk/pull/110))
+- Replaced `Error::MissingWelcomeForProcessedWelcome` with `Error::WelcomePreviouslyFailed(String)`. When retrying a welcome that previously failed, the new error includes the original failure reason instead of a generic message. ([#136](https://github.com/marmot-protocol/mdk/pull/136))
 - **Content Encoding**: Removed support for hex encoding in key package and welcome event content ([#98](https://github.com/marmot-protocol/mdk/pull/98))
   - Key packages and welcome events now require explicit `["encoding", "base64"]` tag
   - Events without encoding tags or with hex encoding are rejected
@@ -44,11 +49,18 @@
 
 ### Changed
 
+- `create_group()` now supports creating single-member groups (groups with only the creator). This enables "message to self" functionality, setting up groups before inviting members, and multi-device scenarios. When no members are provided, the method returns an empty `welcome_rumors` vec. ([#138](https://github.com/marmot-protocol/mdk/pull/138))
+
 ### Added
 
+- New `MessageProcessingResult::PendingProposal` variant returned when a non-admin member receives a proposal. The proposal is stored as pending and awaits commitment by an admin. ([#122](https://github.com/marmot-protocol/mdk/pull/122))
+- New error variant `IdentityChangeNotAllowed` for rejecting proposals and commits that attempt to change member identity ([#126](https://github.com/marmot-protocol/mdk/pull/126))
+- Added `nostr_group_id` field to `NostrGroupDataUpdate` struct, enabling rotation of the Nostr group ID used for message routing per MIP-01 ([#127](https://github.com/marmot-protocol/mdk/pull/127))
 - New error variant `AuthorMismatch` for message author verification failures ([#40](https://github.com/marmot-protocol/mdk/pull/40))
 - New error variant `KeyPackageIdentityMismatch` for KeyPackage credential identity validation failures ([#41](https://github.com/marmot-protocol/mdk/pull/41))
 - New error variant `MissingRumorEventId` for when a rumor event is missing its ID ([#107](https://github.com/marmot-protocol/mdk/pull/107))
+- New error variants for Nostr event validation: `InvalidTimestamp`, `MissingGroupIdTag`, `InvalidGroupIdFormat`, `MultipleGroupIdTags` ([#128](https://github.com/marmot-protocol/mdk/pull/128))
+- Added `max_event_age_secs` and `max_future_skew_secs` fields to `MdkConfig` for configurable message timestamp validation. Default values are 45 days and 5 minutes respectively. ([#128](https://github.com/marmot-protocol/mdk/pull/128))
 - Added pagination support to `get_messages()` public API - accepts `Option<Pagination>` to control limit and offset for message retrieval ([#111](https://github.com/marmot-protocol/mdk/pull/111))
 - Exposed `Pagination` struct (from `mdk_storage_traits::groups`) in public API for paginated message queries ([#111](https://github.com/marmot-protocol/mdk/pull/111))
 - Added pagination support to `get_pending_welcomes()` public API - accepts `Option<Pagination>` to control limit and offset for welcome retrieval ([#110](https://github.com/marmot-protocol/mdk/pull/110))
@@ -63,20 +75,31 @@
 ### Fixed
 
 - **Security (Audit Suggestion 5)**: Prevent panic in `process_welcome` when rumor event ID is missing. A malformed or non-NIP-59-compliant rumor now returns a `MissingRumorEventId` error instead of panicking. ([#107](https://github.com/marmot-protocol/mdk/pull/107))
+- **Security (Audit Issue A)**: Added admin authorization check for MLS commit messages. Previously, commits were merged without verifying the sender against `admin_pubkeys`, allowing non-admin members to modify group state. Now, `process_commit_message_for_group` validates that the commit sender is an admin before merging. ([#130](https://github.com/marmot-protocol/mdk/pull/130))
 - **Security (Audit Issue B)**: Added author verification to message processing to prevent impersonation attacks. The rumor pubkey is now validated against the MLS sender's credential before processing application messages. ([#40](https://github.com/marmot-protocol/mdk/pull/40))
 - **Security (Audit Issue C)**: Added validation for admin updates to prevent invalid configurations. Admin updates now reject empty admin sets and non-member public keys. ([#42](https://github.com/marmot-protocol/mdk/pull/42))
 - **Security (Audit Issue D)**: Added identity binding verification for KeyPackage events. The credential identity is now validated against the event signer to prevent impersonation attacks. ([#41](https://github.com/marmot-protocol/mdk/pull/41))
 - **Security (Audit Issue G)**: Fixed admin authorization to read from current MLS group state instead of potentially stale stored metadata. The `is_leaf_node_admin` and `is_member_admin` functions now derive admin status from the `NostrGroupDataExtension` in the MLS group context, preventing a race window where a recently demoted admin could still perform privileged operations. ([#108](https://github.com/marmot-protocol/mdk/pull/108))
 - **Security (Audit Issue H)**: Added MIP-02 validation to prevent malformed welcome events from causing storage pollution and resource exhaustion ([#96](https://github.com/marmot-protocol/mdk/pull/96))
+- **Security (Audit Issue I)**: Fixed proposals being incorrectly restricted to admins. Per the Marmot protocol specification, any member can create proposals (only admins can commit). Non-admin members can now submit legitimate proposals such as self key updates or leave proposals. When an admin receives a proposal, it is auto-committed; when a non-admin receives one, it is stored as pending. Added new `MessageProcessingResult::PendingProposal` variant to indicate proposals stored but not committed. ([#122](https://github.com/marmot-protocol/mdk/pull/122))
+- **Security (Audit Issue L)**: Added identity validation in proposal and commit processing. Proposals and commits that attempt to modify MLS credential identity fields are now rejected, as required by MIP-00. This prevents attackers from changing the binding between a member and their Nostr public key identity. ([#126](https://github.com/marmot-protocol/mdk/pull/126))
+- **Security (Audit Issue N)**: Fixed `self_update` to not require a cached exporter secret. Previously, the function would abort with `GroupExporterSecretNotFound` when the current epoch's exporter secret was missing from storage, even though the secret was only used for debug logging. This blocked key rotation for new members or after cache loss, degrading post-compromise security. ([#121](https://github.com/marmot-protocol/mdk/pull/121))
 - **Security (Audit Issue O)**: Missing Hash Verification in decrypt_group_image Allows Storage-Level Blob Substitution ([#97](https://github.com/marmot-protocol/mdk/pull/97))
 - **Security (Audit Issue Q)**: Fixed `remove_members` to use actual leaf indices from the ratchet tree instead of enumeration indices. Previously, using `enumerate()` to derive `LeafNodeIndex` caused removal of incorrect members when the tree had holes from prior removals. Now uses `member.index` directly. ([#120](https://github.com/marmot-protocol/mdk/pull/120))
 - **Security (Audit Issue R)**: Refactor encoding handling to enforce base64 usage for key packages and welcome ([#98](https://github.com/marmot-protocol/mdk/pull/98))
+- **Security (Audit Issue S)**: Added validation for mandatory `relays` tag in MLS KeyPackage events. The `validate_key_package_tags` function now requires a `relays` tag with at least one valid relay URL, preventing acceptance of unroutable key packages that could cause delivery failures or enable denial-of-service attacks. ([#118](https://github.com/marmot-protocol/mdk/pull/118))
 - **Security (Audit Issue U)**: Fixed deterministic nonce derivation that caused nonce reuse and message linkability. Encryption now uses random nonces per encryption operation, stored in the IMETA tag. The nonce field (`n`) is now required in IMETA tags. ([#114](https://github.com/marmot-protocol/mdk/pull/114))
+- **Security (Audit Issue Y)**: Encrypted media keys and nonces now use `Secret<T>` wrapper for automatic memory zeroization, preventing sensitive cryptographic material from persisting in memory ([#109](https://github.com/marmot-protocol/mdk/pull/109))
 - **Security (Audit Issue Z)**: Added pagination to prevent memory exhaustion from unbounded loading of group messages ([#111](https://github.com/marmot-protocol/mdk/pull/111))
 - **Security (Audit Issue AA)**: Added pagination to prevent memory exhaustion from unbounded loading of pending welcomes ([#110](https://github.com/marmot-protocol/mdk/pull/110))
+- **Security (Audit Issue AE)**: Added comprehensive Nostr-based validations when processing messages per MIP-03 requirements. The `validate_event_and_extract_group_id` function now validates timestamp bounds using `MdkConfig` settings (rejects events >5 minutes in future or >45 days old by default), and enforces exactly one `h` tag requirement with proper format validation. Note: MDK-core delegates Nostr signature verification to nostr-sdk's relay pool layer; it does not perform signature verification itself. This prevents misrouting messages via manipulated tags and degrading availability through abnormal timestamps. ([#128](https://github.com/marmot-protocol/mdk/pull/128))
+- **Security (Audit Issue AK)**: Fixed removed member commit processing to handle eviction gracefully. When a member is removed from a group and processes their removal commit, the group state is now set to `Inactive` instead of failing with a `UseAfterEviction` error. (Fixes [#80](https://github.com/marmot-protocol/mdk/issues/80)) ([#137](https://github.com/marmot-protocol/mdk/pull/137))
+- **Security (Audit Issue AP)**: Early validation and decryption failures now persist failed processing state to prevent DoS via repeated expensive reprocessing of invalid events. Added deduplication check to reject previously failed messages immediately. Failure reasons are sanitized to prevent information leakage. ([#116](https://github.com/marmot-protocol/mdk/pull/116))
+
 
 ### Removed
 
+- Removed `Error::ProposalFromNonAdmin` variant as proposals are now accepted from any member per the Marmot protocol specification ([#122](https://github.com/marmot-protocol/mdk/pull/122))
 - Removed all traces of hex encoding support for content fields in key packages and welcome events ([#98](https://github.com/marmot-protocol/mdk/pull/98))
 
 ### Deprecated

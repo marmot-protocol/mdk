@@ -23,7 +23,8 @@ pub struct StorageTestHarness {
 impl Default for StorageTestHarness {
     fn default() -> Self {
         Self {
-            sqlite: MdkSqliteStorage::new(":memory:").expect("Failed to create SQLite storage"),
+            sqlite: MdkSqliteStorage::new_unencrypted(":memory:")
+                .expect("Failed to create SQLite storage"),
             memory: MdkMemoryStorage::new(MemoryStorage::default()),
         }
     }

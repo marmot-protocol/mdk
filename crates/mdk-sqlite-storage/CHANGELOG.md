@@ -32,8 +32,9 @@
 
 ### Changed
 
+- **Storage Security**: Updated storage operations to use `Secret<T>` wrapper for secret values, ensuring automatic memory zeroization when values are dropped ([#109](https://github.com/marmot-protocol/mdk/pull/109))
+- SQLite is now built with SQLCipher support (`bundled-sqlcipher`) instead of plain SQLite (`bundled`), enabling transparent AES-256 encryption at rest ([#102](https://github.com/marmot-protocol/mdk/pull/102))
 - Simplified validation logic to use range contains pattern for better readability ([#111](https://github.com/marmot-protocol/mdk/pull/111))
-- Simplified validation logic to use range contains pattern for better readability ([#110](https://github.com/marmot-protocol/mdk/pull/110))
 
 ### Added
 
@@ -43,18 +44,24 @@
   - Group descriptions limited to 2000 bytes
   - JSON fields limited to 50-100KB
   - New `Validation` error variant for validation failures
+- Automatic key management with `keyring-core`: `new()` constructor handles encryption key generation and secure storage automatically using the platform's native credential store (Keychain, Keystore, etc.) ([#102](https://github.com/marmot-protocol/mdk/pull/102))
+- New `keyring` module with `get_or_create_db_key()` and `delete_db_key()` utilities ([#102](https://github.com/marmot-protocol/mdk/pull/102))
+- New `encryption` module with `EncryptionConfig` struct and SQLCipher utilities ([#102](https://github.com/marmot-protocol/mdk/pull/102))
+- New encryption-related error variants: `InvalidKeyLength`, `WrongEncryptionKey`, `UnencryptedDatabaseWithEncryption`, `KeyGeneration`, `FilePermission`, `Keyring`, `KeyringNotInitialized`, `KeyringEntryMissingForExistingDatabase` ([#102](https://github.com/marmot-protocol/mdk/pull/102))
+- File permission hardening on Unix: database directories (0700) and files (0600) are created with owner-only access ([#102](https://github.com/marmot-protocol/mdk/pull/102))
 - Implemented pagination support using `Pagination` struct for group messages ([#111](https://github.com/marmot-protocol/mdk/pull/111))
 - Implemented pagination support using `Pagination` struct for pending welcomes ([#110](https://github.com/marmot-protocol/mdk/pull/110))
 
 ### Fixed
 
+- **Security (Audit Issue Y)**: Secret values stored in SQLite are now wrapped in `Secret<T>` type, ensuring automatic memory zeroization and preventing sensitive cryptographic material from persisting in memory ([#109](https://github.com/marmot-protocol/mdk/pull/109))
 - **Security (Audit Issue Z)**: Added pagination to prevent memory exhaustion from unbounded loading of group messages ([#111](https://github.com/marmot-protocol/mdk/pull/111))
+- **Security (Audit Issue AO)**: Removed MLS group identifiers from error messages to prevent metadata leakage in logs and telemetry. Error messages now use generic "Group not found" instead of including the sensitive 32-byte MLS group ID. ([#112](https://github.com/marmot-protocol/mdk/pull/112))
 - **Security (Audit Issue AA)**: Added pagination to prevent memory exhaustion from unbounded loading of pending welcomes ([#110](https://github.com/marmot-protocol/mdk/pull/110))
 - **Security (Audit Issue AB)**: Added size limits to prevent disk and CPU exhaustion from unbounded user input ([#94](https://github.com/marmot-protocol/mdk/pull/94))
 - **Security (Audit Issue AG)**: `all_groups` now skips corrupted rows instead of failing on the first deserialization error, improving availability when database contains malformed data ([#115](https://github.com/marmot-protocol/mdk/pull/115))
 - **Security (Audit Issue AO)**: Removed MLS group identifiers from error messages to prevent metadata leakage in logs and telemetry. Error messages now use generic "Group not found" instead of including the sensitive 32-byte MLS group ID. ([#112](https://github.com/marmot-protocol/mdk/pull/112))
 - Propagate `last_message_id` parse errors in `row_to_group` instead of silently converting to `None` ([#105](https://github.com/marmot-protocol/mdk/pull/105))
-  - Added size limits to prevent disk and CPU exhaustion from unbounded user input ([#94](https://github.com/marmot-protocol/mdk/pull/94))
 
 ### Removed
 

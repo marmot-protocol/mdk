@@ -20,7 +20,7 @@ use mdk_core::{
     groups::{NostrGroupConfigData, NostrGroupDataUpdate},
     messages::MessageProcessingResult,
 };
-use mdk_sqlite_storage::MdkSqliteStorage;
+use mdk_sqlite_storage::{EncryptionConfig, MdkSqliteStorage};
 use mdk_storage_traits::{
     GroupId,
     groups::{Pagination as MessagePagination, types as group_types},
@@ -134,8 +134,10 @@ fn welcome_from_uniffi(w: Welcome) -> Result<welcome_types::Welcome, MdkUniffiEr
         .map_err(|_| MdkUniffiError::InvalidInput("Nostr group ID must be 32 bytes".to_string()))?;
 
     let group_image_hash = vec_to_array::<32>(w.group_image_hash)?;
-    let group_image_key = vec_to_array::<32>(w.group_image_key)?;
-    let group_image_nonce = vec_to_array::<12>(w.group_image_nonce)?;
+    let group_image_key =
+        vec_to_array::<32>(w.group_image_key)?.map(mdk_storage_traits::Secret::new);
+    let group_image_nonce =
+        vec_to_array::<12>(w.group_image_nonce)?.map(mdk_storage_traits::Secret::new);
 
     let group_admin_pubkeys: Result<BTreeSet<PublicKey>, _> = w
         .group_admin_pubkeys
@@ -184,10 +186,82 @@ impl Mdk {
     }
 }
 
-/// Create a new MDK instance with SQLite storage
+/// Create a new MDK instance with encrypted SQLite storage using automatic key management.
+///
+/// This is the recommended constructor for production use. The database encryption key
+/// is automatically retrieved from (or generated and stored in) the platform's native
+/// keyring (Keychain on macOS/iOS, Keystore on Android, etc.).
+///
+/// # Prerequisites
+///
+/// The host application must initialize a platform-specific keyring store before calling
+/// this function:
+///
+/// - **macOS/iOS**: `keyring_core::set_default_store(AppleStore::new())`
+/// - **Android**: Initialize from Kotlin (see Android documentation)
+/// - **Windows**: `keyring_core::set_default_store(WindowsStore::new())`
+/// - **Linux**: `keyring_core::set_default_store(KeyutilsStore::new())`
+///
+/// # Arguments
+///
+/// * `db_path` - Path to the SQLite database file
+/// * `service_id` - A stable, host-defined application identifier (e.g., "com.example.myapp")
+/// * `db_key_id` - A stable identifier for this database's key (e.g., "mdk.db.key.default")
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - No keyring store has been initialized
+/// - The keyring is unavailable or inaccessible
+/// - The database cannot be opened or created
 #[uniffi::export]
-pub fn new_mdk(db_path: String) -> Result<Mdk, MdkUniffiError> {
-    let storage = MdkSqliteStorage::new(PathBuf::from(db_path))?;
+pub fn new_mdk(
+    db_path: String,
+    service_id: String,
+    db_key_id: String,
+) -> Result<Mdk, MdkUniffiError> {
+    let storage = MdkSqliteStorage::new(PathBuf::from(db_path), &service_id, &db_key_id)?;
+    let mdk = MDK::new(storage);
+    Ok(Mdk {
+        mdk: Mutex::new(mdk),
+    })
+}
+
+/// Create a new MDK instance with encrypted SQLite storage using a directly provided key.
+///
+/// Use this when you want to manage encryption keys yourself rather than using the
+/// platform keyring. For most applications, prefer `new_mdk` which handles key
+/// management automatically.
+///
+/// # Arguments
+///
+/// * `db_path` - Path to the SQLite database file
+/// * `encryption_key` - 32-byte encryption key (must be exactly 32 bytes)
+///
+/// # Errors
+///
+/// Returns an error if the key is not 32 bytes or if the database cannot be opened.
+#[uniffi::export]
+pub fn new_mdk_with_key(db_path: String, encryption_key: Vec<u8>) -> Result<Mdk, MdkUniffiError> {
+    let config = EncryptionConfig::from_slice(&encryption_key)
+        .map_err(|e| MdkUniffiError::InvalidInput(format!("Invalid encryption key: {}", e)))?;
+    let storage = MdkSqliteStorage::new_with_key(PathBuf::from(db_path), config)?;
+    let mdk = MDK::new(storage);
+    Ok(Mdk {
+        mdk: Mutex::new(mdk),
+    })
+}
+
+/// Create a new MDK instance with unencrypted SQLite storage.
+///
+/// ⚠️ **WARNING**: This creates an unencrypted database. Sensitive MLS state
+/// including exporter secrets will be stored in plaintext.
+///
+/// Only use this for development or testing. For production use, use `new_mdk`
+/// with an encryption key.
+#[uniffi::export]
+pub fn new_mdk_unencrypted(db_path: String) -> Result<Mdk, MdkUniffiError> {
+    let storage = MdkSqliteStorage::new_unencrypted(PathBuf::from(db_path))?;
     let mdk = MDK::new(storage);
     Ok(Mdk {
         mdk: Mutex::new(mdk),
@@ -745,6 +819,11 @@ impl Mdk {
                     },
                 }
             }
+            MessageProcessingResult::PendingProposal { mls_group_id } => {
+                ProcessMessageResult::PendingProposal {
+                    mls_group_id: hex::encode(mls_group_id.as_slice()),
+                }
+            }
             MessageProcessingResult::ExternalJoinProposal { mls_group_id } => {
                 ProcessMessageResult::ExternalJoinProposal {
                     mls_group_id: hex::encode(mls_group_id.as_slice()),
@@ -758,6 +837,13 @@ impl Mdk {
                     mls_group_id: hex::encode(mls_group_id.as_slice()),
                 }
             }
+            MessageProcessingResult::IgnoredProposal {
+                mls_group_id,
+                reason,
+            } => ProcessMessageResult::IgnoredProposal {
+                mls_group_id: hex::encode(mls_group_id.as_slice()),
+                reason,
+            },
         })
     }
 }
@@ -818,10 +904,15 @@ pub enum ProcessMessageResult {
         /// The processed message
         message: Message,
     },
-    /// A proposal message (add/remove member proposal)
+    /// A proposal message that was auto-committed by an admin receiver
     Proposal {
         /// The proposal result containing evolution event and welcome rumors
         result: UpdateGroupResult,
+    },
+    /// A pending proposal stored but not committed (receiver is not admin)
+    PendingProposal {
+        /// Hex-encoded MLS group ID this pending proposal belongs to
+        mls_group_id: String,
     },
     /// External join proposal
     ExternalJoinProposal {
@@ -837,6 +928,13 @@ pub enum ProcessMessageResult {
     Unprocessable {
         /// Hex-encoded MLS group ID of the message that could not be processed
         mls_group_id: String,
+    },
+    /// Proposal was ignored and not stored
+    IgnoredProposal {
+        /// Hex-encoded MLS group ID this proposal was for
+        mls_group_id: String,
+        /// Reason the proposal was ignored
+        reason: String,
     },
 }
 
@@ -874,12 +972,12 @@ impl From<group_types::Group> for Group {
         Self {
             mls_group_id: hex::encode(g.mls_group_id.as_slice()),
             nostr_group_id: hex::encode(g.nostr_group_id),
-            name: g.name,
-            description: g.description,
+            name: g.name.clone(),
+            description: g.description.clone(),
             image_hash: g.image_hash.map(Into::into),
-            image_key: g.image_key.map(Into::into),
-            image_nonce: g.image_nonce.map(Into::into),
-            admin_pubkeys: g.admin_pubkeys.into_iter().map(|pk| pk.to_hex()).collect(),
+            image_key: g.image_key.map(|k| k.as_ref().to_vec()),
+            image_nonce: g.image_nonce.map(|n| n.as_ref().to_vec()),
+            admin_pubkeys: g.admin_pubkeys.iter().map(|pk| pk.to_hex()).collect(),
             last_message_id: g.last_message_id.map(|id| id.to_hex()),
             last_message_at: g.last_message_at.map(|ts| ts.as_u64()),
             epoch: g.epoch,
@@ -988,17 +1086,13 @@ impl From<welcome_types::Welcome> for Welcome {
             event_json,
             mls_group_id: hex::encode(w.mls_group_id.as_slice()),
             nostr_group_id: hex::encode(w.nostr_group_id),
-            group_name: w.group_name,
-            group_description: w.group_description,
+            group_name: w.group_name.clone(),
+            group_description: w.group_description.clone(),
             group_image_hash: w.group_image_hash.map(Into::into),
-            group_image_key: w.group_image_key.map(Into::into),
-            group_image_nonce: w.group_image_nonce.map(Into::into),
-            group_admin_pubkeys: w
-                .group_admin_pubkeys
-                .into_iter()
-                .map(|pk| pk.to_hex())
-                .collect(),
-            group_relays: w.group_relays.into_iter().map(|r| r.to_string()).collect(),
+            group_image_key: w.group_image_key.map(|k| k.as_ref().to_vec()),
+            group_image_nonce: w.group_image_nonce.map(|n| n.as_ref().to_vec()),
+            group_admin_pubkeys: w.group_admin_pubkeys.iter().map(|pk| pk.to_hex()).collect(),
+            group_relays: w.group_relays.iter().map(|r| r.to_string()).collect(),
             welcomer: w.welcomer.to_hex(),
             member_count: w.member_count,
             state: w.state.as_str().to_string(),
@@ -1051,19 +1145,19 @@ pub fn prepare_group_image_for_upload(
         .map_err(|e| MdkUniffiError::Mdk(e.to_string()))?;
 
     Ok(GroupImageUpload {
-        encrypted_data: prepared.encrypted_data,
+        encrypted_data: prepared.encrypted_data.as_ref().clone(),
         encrypted_hash: prepared.encrypted_hash.to_vec(),
-        image_key: prepared.image_key.to_vec(),
-        image_nonce: prepared.image_nonce.to_vec(),
+        image_key: prepared.image_key.as_ref().to_vec(),
+        image_nonce: prepared.image_nonce.as_ref().to_vec(),
         upload_secret_key: prepared.upload_keypair.secret_key().to_secret_hex(),
         original_size: prepared.original_size as u64,
         encrypted_size: prepared.encrypted_size as u64,
-        mime_type: prepared.mime_type,
+        mime_type: prepared.mime_type.clone(),
         dimensions: prepared.dimensions.map(|(w, h)| ImageDimensions {
             width: w,
             height: h,
         }),
-        blurhash: prepared.blurhash,
+        blurhash: prepared.blurhash.clone(),
     })
 }
 
@@ -1091,8 +1185,13 @@ pub fn decrypt_group_image(
         .try_into()
         .map_err(|_| MdkUniffiError::InvalidInput("Image nonce must be 12 bytes".to_string()))?;
 
-    core_decrypt_group_image(&encrypted_data, hash_arr_opt.as_ref(), &key_arr, &nonce_arr)
-        .map_err(|e| MdkUniffiError::Mdk(e.to_string()))
+    core_decrypt_group_image(
+        &encrypted_data,
+        hash_arr_opt.as_ref(),
+        &mdk_storage_traits::Secret::new(key_arr),
+        &mdk_storage_traits::Secret::new(nonce_arr),
+    )
+    .map_err(|e| MdkUniffiError::Mdk(e.to_string()))
 }
 
 /// Derive upload keypair for group image
@@ -1102,7 +1201,7 @@ pub fn derive_upload_keypair(image_key: Vec<u8>, version: u16) -> Result<String,
         .try_into()
         .map_err(|_| MdkUniffiError::InvalidInput("Image key must be 32 bytes".to_string()))?;
 
-    let keys = core_derive_upload_keypair(&key_arr, version)
+    let keys = core_derive_upload_keypair(&mdk_storage_traits::Secret::new(key_arr), version)
         .map_err(|e| MdkUniffiError::Mdk(e.to_string()))?;
 
     Ok(keys.secret_key().to_secret_hex())
@@ -1115,14 +1214,47 @@ mod tests {
     use tempfile::TempDir;
 
     fn create_test_mdk() -> Mdk {
-        new_mdk(":memory:".to_string()).unwrap()
+        new_mdk_unencrypted(":memory:".to_string()).unwrap()
     }
 
     #[test]
-    fn test_new_mdk_creates_instance() {
+    fn test_new_mdk_with_key_creates_instance() {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("test.db");
-        let result = new_mdk(db_path.to_string_lossy().to_string());
+
+        // Test encrypted constructor with direct key
+        let key = vec![0u8; 32];
+        let result = new_mdk_with_key(db_path.to_string_lossy().to_string(), key);
+        assert!(result.is_ok());
+        let mdk = result.unwrap();
+        // Should be able to get groups (empty initially)
+        let groups = mdk.get_groups().unwrap();
+        assert_eq!(groups.len(), 0);
+    }
+
+    #[test]
+    fn test_new_mdk_with_key_invalid_key_length() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test_invalid_key.db");
+
+        // Test with wrong key length
+        let short_key = vec![0u8; 16];
+        let result = new_mdk_with_key(db_path.to_string_lossy().to_string(), short_key);
+        assert!(result.is_err());
+
+        match result {
+            Err(MdkUniffiError::InvalidInput(msg)) => {
+                assert!(msg.contains("Invalid encryption key"));
+            }
+            _ => panic!("Expected InvalidInput error"),
+        }
+    }
+
+    #[test]
+    fn test_new_mdk_unencrypted_creates_instance() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test_unencrypted.db");
+        let result = new_mdk_unencrypted(db_path.to_string_lossy().to_string());
         assert!(result.is_ok());
         let mdk = result.unwrap();
         // Should be able to get groups (empty initially)

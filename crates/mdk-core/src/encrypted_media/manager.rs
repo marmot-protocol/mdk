@@ -114,7 +114,7 @@ where
             encrypted_size,
             dimensions: metadata.dimensions,
             blurhash: metadata.blurhash,
-            nonce,
+            nonce: *nonce,
         })
     }
 
@@ -136,7 +136,7 @@ where
         let decrypted_data = decrypt_data_with_aad(
             encrypted_data,
             &encryption_key,
-            &reference.nonce,
+            &mdk_storage_traits::Secret::new(reference.nonce),
             &reference.original_hash,
             &reference.mime_type,
             &reference.filename,
@@ -637,7 +637,7 @@ mod tests {
     #[test]
     fn test_generate_encryption_nonce_uniqueness() {
         // Generate multiple nonces and verify they are unique
-        let nonces: Vec<[u8; 12]> = (0..100).map(|_| generate_encryption_nonce()).collect();
+        let nonces: Vec<[u8; 12]> = (0..100).map(|_| *generate_encryption_nonce()).collect();
 
         for i in 0..nonces.len() {
             for j in (i + 1)..nonces.len() {

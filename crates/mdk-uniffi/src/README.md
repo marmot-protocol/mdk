@@ -1,13 +1,13 @@
-> [!NOTE]  
+> [!NOTE]
 > This is a generic documentation, [read {{lang}}-specific docs](docs.md).
 
 # MDK Bindings for {{lang}}
 
-Language bindings for the *Marmot Development Kit* - bringing decentralized, encrypted group messaging to your favorite language. 
+Language bindings for the *Marmot Development Kit* - bringing decentralized, encrypted group messaging to your favorite language.
 
 ## What is MDK?
 
-MDK combines [MLS (Messaging Layer Security) Protocol](https://www.rfc-editor.org/rfc/rfc9420.html) (the gold standard for group crypto) with [Nostr](https://github.com/nostr-protocol/nostr). 
+MDK combines [MLS (Messaging Layer Security) Protocol](https://www.rfc-editor.org/rfc/rfc9420.html) (the gold standard for group crypto) with [Nostr](https://github.com/nostr-protocol/nostr).
 
 You get real end-to-end encryption using MLS with forward secrecy and post-compromise security. Since it's built on Nostr's distributed relay network, there's no server needed. The group functionality actually works with proper secure member management and encrypted everything. Keys rotate automatically so you can't mess anything up, and it even protects your metadata so your chatter patterns stay private.
 
@@ -23,7 +23,7 @@ Messages are MLS-encrypted group chatter that get auto-decrypted when you retrie
 
 ## The API You'll Actually Use
 
-Getting started is simple: create your MDK instance with `MDK.new("/path/to/your/database.db")` and you're ready to go. For key packages, you'll want to create one with your preferred relays using `mdk.create_key_package()`, which gives you a hex key package and tags for your Nostr event. When others send you their key package events, parse them with `mdk.parse_key_package()` so you can add them later. Check for invites using `mdk.get_pending_welcomes()` and join groups with `mdk.accept_welcome()`. 
+Getting started is simple: first initialize your platform's keyring store (see platform setup), then create your MDK instance with `new_mdk("/path/to/your/database.db", "com.example.myapp", "mdk.db.key.default")`. MDK automatically handles encryption key generation and secure storage in your platform's keyring (Keychain on iOS/macOS, Keystore on Android, etc.). If you need to manage keys yourself, use `new_mdk_with_key()` with a 32-byte key. For development only, you can use `new_mdk_unencrypted("/path/to/database.db")` but never ship that to production. For key packages, you'll want to create one with your preferred relays using `mdk.create_key_package()`, which gives you a hex key package and tags for your Nostr event. When others send you their key package events, parse them with `mdk.parse_key_package()` so you can add them later. Check for invites using `mdk.get_pending_welcomes()` and join groups with `mdk.accept_welcome()`.
 
 For group management, start your own group with `mdk.create_group()` - you'll need your creator pubkey, initial members, metadata, relays, and admin list. It returns the group object and welcome messages for your initial members. Adding people requires admin privileges and their key package events via `mdk.add_members()`. Remove troublemakers with `mdk.remove_members()` using their pubkeys, or update group metadata like name and description with `mdk.update_group_metadata()`.
 
