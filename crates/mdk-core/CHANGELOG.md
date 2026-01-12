@@ -28,6 +28,10 @@
 ### Breaking changes
 
 - **OpenMLS Dependency**: Updated to OpenMLS git main branch (commit b90ca23b) for GREASE support. This may introduce minor API changes from upstream. The dependency will be reverted to crates.io versions once OpenMLS releases a version with GREASE support. ([#142](https://github.com/marmot-protocol/mdk/pull/142))
+- **Credential Identity Encoding**: Removed support for legacy 64-byte UTF-8 hex-encoded credential identities ([#15](https://github.com/marmot-protocol/mdk/issues/15))
+  - Credential identities must now be exactly 32 bytes (raw public key) per MIP-00
+  - Key packages with 64-byte hex-encoded identities are no longer accepted
+  - This completes the migration period that began in November 2024
 - **Encrypted Media (MIP-04)**: The `derive_encryption_nonce()` function has been removed. All encrypted media must now include a random nonce in the IMETA tag (`n` field). Legacy media encrypted with deterministic nonces can no longer be decrypted. This is a breaking change to fix the security issue (Audit Issue U) where deterministic nonce derivation caused nonce reuse. ([#114](https://github.com/marmot-protocol/mdk/pull/114))
 - **BREAKING**: Changed `get_messages()` signature to accept `Option<Pagination>` parameter. Callers must now pass `None` for default pagination or `Some(Pagination::new(...))` for custom pagination ([#111](https://github.com/marmot-protocol/mdk/pull/111))
 - **BREAKING**: Changed `get_pending_welcomes()` to accept `Option<Pagination>` parameter for pagination support. Existing calls should pass `None` for default pagination. ([#110](https://github.com/marmot-protocol/mdk/pull/110))
@@ -91,6 +95,7 @@
 - **Security (Audit Issue Z)**: Added pagination to prevent memory exhaustion from unbounded loading of group messages ([#111](https://github.com/marmot-protocol/mdk/pull/111))
 - **Security (Audit Issue AA)**: Added pagination to prevent memory exhaustion from unbounded loading of pending welcomes ([#110](https://github.com/marmot-protocol/mdk/pull/110))
 - **Security (Audit Issue AE)**: Added comprehensive Nostr-based validations when processing messages per MIP-03 requirements. The `validate_event_and_extract_group_id` function now validates timestamp bounds using `MdkConfig` settings (rejects events >5 minutes in future or >45 days old by default), and enforces exactly one `h` tag requirement with proper format validation. Note: MDK-core delegates Nostr signature verification to nostr-sdk's relay pool layer; it does not perform signature verification itself. This prevents misrouting messages via manipulated tags and degrading availability through abnormal timestamps. ([#128](https://github.com/marmot-protocol/mdk/pull/128))
+- **Security (Audit Issue AK)**: Fixed removed member commit processing to handle eviction gracefully. When a member is removed from a group and processes their removal commit, the group state is now set to `Inactive` instead of failing with a `UseAfterEviction` error. (Fixes [#80](https://github.com/marmot-protocol/mdk/issues/80)) ([#137](https://github.com/marmot-protocol/mdk/pull/137))
 - **Security (Audit Issue AP)**: Early validation and decryption failures now persist failed processing state to prevent DoS via repeated expensive reprocessing of invalid events. Added deduplication check to reject previously failed messages immediately. Failure reasons are sanitized to prevent information leakage. ([#116](https://github.com/marmot-protocol/mdk/pull/116))
 
 

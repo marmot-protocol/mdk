@@ -897,12 +897,16 @@ where
     /// The function:
     /// 1. Validates the sender is authorized (admin, or non-admin for pure self-updates)
     /// 2. Merges the staged commit into the group state
-    /// 3. Updates the group to the new epoch with new cryptographic keys
-    /// 4. Saves the new exporter secret for NIP-44 encryption
-    /// 5. Updates processing state to prevent reprocessing
+    /// 3. Checks if the local member was removed by this commit
+    /// 4. If removed: sets group state to Inactive and skips further processing
+    /// 5. If still a member: saves new exporter secret and syncs group metadata
+    /// 6. Updates processing state to prevent reprocessing
     ///
     /// Note: Non-admin members are allowed to create commits that only update their own
     /// leaf node (pure self-updates). All other commit operations require admin privileges.
+    ///
+    /// When the local member is removed by a commit, the group state is set to `Inactive`
+    /// and the exporter secret/metadata sync are skipped to prevent use-after-eviction errors.
     ///
     /// # Arguments
     ///
@@ -922,68 +926,25 @@ where
         staged_commit: StagedCommit,
         commit_sender: &Sender,
     ) -> Result<()> {
-        // Verify authorization before processing the commit
-        // Only members can create commits, so we check for Sender::Member
-        match commit_sender {
-            Sender::Member(leaf_index) => {
-                let member = mls_group
-                    .member_at(*leaf_index)
-                    .ok_or(Error::MessageFromNonMember)?;
-
-                // Check if sender is an admin by extracting their pubkey from credentials
-                let basic_cred = BasicCredential::try_from(member.credential.clone())?;
-                let sender_pubkey = self.parse_credential_identity(basic_cred.identity())?;
-                let group_data = crate::extension::NostrGroupDataExtension::from_group(mls_group)?;
-                let sender_is_admin = group_data.admins.contains(&sender_pubkey);
-
-                // Check if this is a pure self-update commit (allowed from any member)
-                // A pure self-update has no add/remove proposals and only updates the sender's own leaf
-                let is_pure_self_update =
-                    self.is_pure_self_update_commit(&staged_commit, leaf_index);
-
-                match (sender_is_admin, is_pure_self_update) {
-                    (true, _) => {}
-                    (false, true) => {
-                        tracing::debug!(
-                            target: "mdk_core::messages::process_commit_message_for_group",
-                            "Allowing self-update commit from non-admin member at leaf index {:?}",
-                            leaf_index
-                        );
-                    }
-                    (false, false) => {
-                        tracing::warn!(
-                            target: "mdk_core::messages::process_commit_message_for_group",
-                            "Received non-self-update commit from non-admin member at leaf index {:?}",
-                            leaf_index
-                        );
-                        return Err(Error::CommitFromNonAdmin);
-                    }
-                }
-            }
-            _ => {
-                // External senders or other sender types cannot create valid commits
-                tracing::warn!(
-                    target: "mdk_core::messages::process_commit_message_for_group",
-                    "Received commit from non-member sender."
-                );
-                return Err(Error::MessageFromNonMember);
-            }
-        }
-
-        // Validate that no proposals in the commit attempt to change identity
-        // MIP-00 mandates immutable identity fields
+        self.validate_commit_sender_authorization(mls_group, &staged_commit, commit_sender)?;
         self.validate_staged_commit_identities(mls_group, &staged_commit, commit_sender)?;
+
+        let group_id: GroupId = mls_group.group_id().into();
 
         mls_group
             .merge_staged_commit(&self.provider, staged_commit)
             .map_err(|e| Error::Message(e.to_string()))?;
 
+        // Check if the local member was removed by this commit
+        if mls_group.own_leaf().is_none() {
+            return self.handle_local_member_eviction(&group_id, event);
+        }
+
         // Save exporter secret for the new epoch
-        self.exporter_secret(&mls_group.group_id().into())?;
+        self.exporter_secret(&group_id)?;
 
         // Sync the stored group metadata with the updated MLS group state
-        // This ensures any group context extension changes are reflected in storage
-        self.sync_group_metadata_from_mls(&mls_group.group_id().into())?;
+        self.sync_group_metadata_from_mls(&group_id)?;
 
         // Save a processed message so we don't reprocess
         let processed_message = message_types::ProcessedMessage {
@@ -997,6 +958,124 @@ where
         self.storage()
             .save_processed_message(processed_message)
             .map_err(|e| Error::Message(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Validates that the commit sender is authorized to create this commit.
+    ///
+    /// Admins can create any commit. Non-admins can only create pure self-update commits
+    /// (commits that only update their own leaf node with no add/remove proposals).
+    ///
+    /// # Arguments
+    ///
+    /// * `mls_group` - The MLS group to check authorization against
+    /// * `staged_commit` - The staged commit to validate
+    /// * `commit_sender` - The MLS sender of the commit
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(())` - If the sender is authorized
+    /// * `Err(Error::CommitFromNonAdmin)` - If a non-admin tries to create a non-self-update commit
+    /// * `Err(Error::MessageFromNonMember)` - If the sender is not a member
+    fn validate_commit_sender_authorization(
+        &self,
+        mls_group: &MlsGroup,
+        staged_commit: &StagedCommit,
+        commit_sender: &Sender,
+    ) -> Result<()> {
+        match commit_sender {
+            Sender::Member(leaf_index) => {
+                let member = mls_group
+                    .member_at(*leaf_index)
+                    .ok_or(Error::MessageFromNonMember)?;
+
+                let basic_cred = BasicCredential::try_from(member.credential.clone())?;
+                let sender_pubkey = self.parse_credential_identity(basic_cred.identity())?;
+                let group_data = crate::extension::NostrGroupDataExtension::from_group(mls_group)?;
+                let sender_is_admin = group_data.admins.contains(&sender_pubkey);
+
+                let is_pure_self_update =
+                    self.is_pure_self_update_commit(staged_commit, leaf_index);
+
+                match (sender_is_admin, is_pure_self_update) {
+                    (true, _) => Ok(()),
+                    (false, true) => {
+                        tracing::debug!(
+                            target: "mdk_core::messages::process_commit_message_for_group",
+                            "Allowing self-update commit from non-admin member at leaf index {:?}",
+                            leaf_index
+                        );
+                        Ok(())
+                    }
+                    (false, false) => {
+                        tracing::warn!(
+                            target: "mdk_core::messages::process_commit_message_for_group",
+                            "Received non-self-update commit from non-admin member at leaf index {:?}",
+                            leaf_index
+                        );
+                        Err(Error::CommitFromNonAdmin)
+                    }
+                }
+            }
+            _ => {
+                tracing::warn!(
+                    target: "mdk_core::messages::process_commit_message_for_group",
+                    "Received commit from non-member sender."
+                );
+                Err(Error::MessageFromNonMember)
+            }
+        }
+    }
+
+    /// Handles the case where the local member was removed from a group.
+    ///
+    /// Sets the group state to Inactive and saves a processed message record.
+    /// Called after merge_staged_commit when own_leaf() returns None.
+    ///
+    /// # Arguments
+    ///
+    /// * `group_id` - The ID of the group the member was removed from
+    /// * `event` - The wrapper Nostr event containing the commit
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(())` - If the eviction was handled successfully
+    /// * `Err(Error)` - If storage operations fail
+    fn handle_local_member_eviction(&self, group_id: &GroupId, event: &Event) -> Result<()> {
+        tracing::info!(
+            target: "mdk_core::messages::process_commit_message_for_group",
+            group_id = %hex::encode(group_id.as_slice()),
+            "Local member was removed from group, setting group state to Inactive"
+        );
+
+        match self.get_group(group_id)? {
+            Some(mut group) => {
+                group.state = group_types::GroupState::Inactive;
+                self.storage()
+                    .save_group(group)
+                    .map_err(|e| Error::Group(e.to_string()))?;
+            }
+            None => {
+                tracing::warn!(
+                    target: "mdk_core::messages::process_commit_message_for_group",
+                    group_id = %hex::encode(group_id.as_slice()),
+                    "Group not found in storage while handling eviction"
+                );
+            }
+        }
+
+        let processed_message = message_types::ProcessedMessage {
+            wrapper_event_id: event.id,
+            message_event_id: None,
+            processed_at: Timestamp::now(),
+            state: message_types::ProcessedMessageState::Processed,
+            failure_reason: None,
+        };
+
+        self.storage()
+            .save_processed_message(processed_message)
+            .map_err(|e| Error::Message(e.to_string()))?;
+
         Ok(())
     }
 
@@ -1748,6 +1827,7 @@ mod tests {
     use crate::tests::create_test_mdk;
     use mdk_storage_traits::groups::GroupStorage;
     use mdk_storage_traits::messages::MessageStorage;
+    use mdk_storage_traits::messages::types::ProcessedMessageState;
 
     #[test]
     fn test_get_message_not_found() {
@@ -6578,6 +6658,182 @@ mod tests {
         assert!(
             !members.contains(&charlie_keys.public_key()),
             "Charlie should be removed"
+        );
+    }
+
+    /// Test that a removed member correctly processes their own removal commit
+    ///
+    /// This verifies that when a member is removed from a group and later processes
+    /// the commit that removed them:
+    /// 1. The commit is processed successfully
+    /// 2. The group state is set to Inactive
+    /// 3. No UseAfterEviction error occurs
+    #[test]
+    fn test_removed_member_processes_own_removal_commit() {
+        let alice_keys = Keys::generate();
+        let bob_keys = Keys::generate();
+
+        let alice_mdk = create_test_mdk();
+        let bob_mdk = create_test_mdk();
+
+        // Only Alice is admin
+        let admins = vec![alice_keys.public_key()];
+
+        // Create key package
+        let bob_key_package = create_key_package_event(&bob_mdk, &bob_keys);
+
+        // Alice creates the group with Bob
+        let create_result = alice_mdk
+            .create_group(
+                &alice_keys.public_key(),
+                vec![bob_key_package],
+                create_nostr_group_config_data(admins.clone()),
+            )
+            .expect("Failed to create group");
+
+        let group_id = create_result.group.mls_group_id.clone();
+
+        // Alice merges her commit
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("Failed to merge pending commit");
+
+        // Bob joins via welcome
+        let bob_welcome_rumor = &create_result.welcome_rumors[0];
+        let bob_welcome = bob_mdk
+            .process_welcome(&nostr::EventId::all_zeros(), bob_welcome_rumor)
+            .expect("Bob should process welcome");
+        bob_mdk
+            .accept_welcome(&bob_welcome)
+            .expect("Bob should accept welcome");
+
+        // Verify Bob's group is initially Active
+        let bob_group_before = bob_mdk
+            .get_group(&group_id)
+            .expect("Failed to get group")
+            .expect("Group should exist");
+        assert_eq!(
+            bob_group_before.state,
+            group_types::GroupState::Active,
+            "Bob's group should be Active before removal"
+        );
+
+        // Alice (admin) removes Bob
+        let alice_remove_result = alice_mdk
+            .remove_members(&group_id, &[bob_keys.public_key()])
+            .expect("Alice (admin) can remove members");
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("Alice should merge remove commit");
+
+        // Bob (the removed member) processes his own removal commit
+        // This should succeed and set the group state to Inactive
+        let result = bob_mdk.process_message(&alice_remove_result.evolution_event);
+
+        assert!(
+            result.is_ok(),
+            "Removed member should process their removal commit successfully, got error: {:?}",
+            result.err()
+        );
+
+        // Verify the result is a Commit
+        assert!(
+            matches!(result.unwrap(), MessageProcessingResult::Commit { .. }),
+            "Result should be a Commit"
+        );
+
+        // Verify Bob's group state is now Inactive
+        let bob_group_after = bob_mdk
+            .get_group(&group_id)
+            .expect("Failed to get group")
+            .expect("Group should exist");
+        assert_eq!(
+            bob_group_after.state,
+            group_types::GroupState::Inactive,
+            "Bob's group should be Inactive after being removed"
+        );
+    }
+
+    /// Test that a removed member's processed message is saved correctly
+    ///
+    /// This verifies that when an evicted member processes their removal commit:
+    /// 1. A ProcessedMessage record is created
+    /// 2. The state is Processed (not failed)
+    /// 3. No failure reason is recorded
+    #[test]
+    fn test_removed_member_processed_message_saved_correctly() {
+        let alice_keys = Keys::generate();
+        let bob_keys = Keys::generate();
+
+        let alice_mdk = create_test_mdk();
+        let bob_mdk = create_test_mdk();
+
+        // Only Alice is admin
+        let admins = vec![alice_keys.public_key()];
+
+        // Create key package
+        let bob_key_package = create_key_package_event(&bob_mdk, &bob_keys);
+
+        // Alice creates the group with Bob
+        let create_result = alice_mdk
+            .create_group(
+                &alice_keys.public_key(),
+                vec![bob_key_package],
+                create_nostr_group_config_data(admins.clone()),
+            )
+            .expect("Failed to create group");
+
+        let group_id = create_result.group.mls_group_id.clone();
+
+        // Alice merges her commit
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("Failed to merge pending commit");
+
+        // Bob joins via welcome
+        let bob_welcome_rumor = &create_result.welcome_rumors[0];
+        let bob_welcome = bob_mdk
+            .process_welcome(&nostr::EventId::all_zeros(), bob_welcome_rumor)
+            .expect("Bob should process welcome");
+        bob_mdk
+            .accept_welcome(&bob_welcome)
+            .expect("Bob should accept welcome");
+
+        // Alice (admin) removes Bob
+        let alice_remove_result = alice_mdk
+            .remove_members(&group_id, &[bob_keys.public_key()])
+            .expect("Alice (admin) can remove members");
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("Alice should merge remove commit");
+
+        // Get the event ID that Bob will process
+        let removal_event_id = alice_remove_result.evolution_event.id;
+
+        // Bob processes his own removal commit
+        bob_mdk
+            .process_message(&alice_remove_result.evolution_event)
+            .expect("Bob should process removal commit");
+
+        // Verify the processed message was saved correctly
+        let processed_message = bob_mdk
+            .storage()
+            .find_processed_message_by_event_id(&removal_event_id)
+            .expect("Failed to get processed message")
+            .expect("Processed message should exist");
+
+        assert_eq!(
+            processed_message.wrapper_event_id, removal_event_id,
+            "Wrapper event ID should match"
+        );
+        assert_eq!(
+            processed_message.state,
+            ProcessedMessageState::Processed,
+            "Processed message state should be Processed"
+        );
+        assert!(
+            processed_message.failure_reason.is_none(),
+            "There should be no failure reason for successful processing"
         );
     }
 
