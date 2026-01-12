@@ -81,6 +81,7 @@ _build-uniffi needs_android="false" needs_ios="false":
     if [ "{{needs_android}}" = "true" ]; then
         just _build-uniffi-android aarch64-linux-android aarch64-linux-android21-clang
         just _build-uniffi-android armv7-linux-androideabi armv7a-linux-androideabi21-clang
+        just _build-uniffi-android x86_64-linux-android x86_64-linux-android21-clang
     fi
     if [ "{{needs_ios}}" = "true" ] && [ "{{os()}}" = "macos" ]; then
         just _build-uniffi-ios aarch64-apple-ios
