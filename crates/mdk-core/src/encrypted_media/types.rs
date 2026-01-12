@@ -111,6 +111,10 @@ pub enum EncryptedMediaError {
         /// The reason for the invalid IMETA tag
         reason: String,
     },
+
+    /// Unknown encryption scheme version
+    #[error("Unknown encryption scheme version: {0}")]
+    UnknownSchemeVersion(String),
 }
 
 #[cfg(test)]

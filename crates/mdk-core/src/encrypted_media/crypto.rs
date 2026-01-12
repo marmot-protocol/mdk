@@ -25,12 +25,14 @@ pub const DEFAULT_SCHEME_VERSION: &str = "mip04-v2";
 /// This function maps version strings to their corresponding scheme labels
 /// used in AAD and HKDF contexts. This allows for versioned encryption
 /// schemes while maintaining backward compatibility.
-fn get_scheme_label(version: &str) -> &[u8] {
+fn get_scheme_label(version: &str) -> Result<&[u8], EncryptedMediaError> {
     match version {
-        "mip04-v1" => b"mip04-v1",
-        "mip04-v2" => b"mip04-v2",
+        "mip04-v1" => Ok(b"mip04-v1"),
+        "mip04-v2" => Ok(b"mip04-v2"),
         // Future versions can be added here
-        _ => b"mip04-v1", // Default to v1 for unknown versions (backward compatibility)
+        _ => Err(EncryptedMediaError::UnknownSchemeVersion(
+            version.to_string(),
+        )),
     }
 }
 
@@ -94,7 +96,7 @@ where
         .map_err(|_| EncryptedMediaError::GroupNotFound)?;
 
     // Get scheme label from version
-    let scheme_label = get_scheme_label(scheme_version);
+    let scheme_label = get_scheme_label(scheme_version)?;
 
     // Create context as specified in Marmot protocol 04.md:
     // SCHEME_LABEL || 0x00 || file_hash_bytes || 0x00 || mime_type_bytes || 0x00 || filename_bytes || 0x00 || "key"
@@ -145,7 +147,7 @@ pub fn encrypt_data_with_aad(
 
     let nonce_arr = Nonce::from_slice(nonce.as_ref());
 
-    let scheme_label = get_scheme_label(scheme_version);
+    let scheme_label = get_scheme_label(scheme_version)?;
     let aad = build_aad(scheme_label, file_hash, mime_type, filename);
 
     cipher
@@ -186,7 +188,7 @@ pub fn decrypt_data_with_aad(
 
     let nonce_arr = Nonce::from_slice(nonce.as_ref());
 
-    let scheme_label = get_scheme_label(scheme_version);
+    let scheme_label = get_scheme_label(scheme_version)?;
     let aad = build_aad(scheme_label, file_hash, mime_type, filename);
 
     cipher
@@ -995,5 +997,15 @@ mod tests {
         assert!(secret2 > secret1);
         assert!(secret1 <= secret3);
         assert!(secret1 >= secret3);
+    }
+
+    #[test]
+    fn test_unknown_scheme_version() {
+        let result = get_scheme_label("unknown-version");
+        assert!(result.is_err());
+        match result {
+            Err(EncryptedMediaError::UnknownSchemeVersion(v)) => assert_eq!(v, "unknown-version"),
+            _ => panic!("Expected UnknownSchemeVersion error"),
+        }
     }
 }
