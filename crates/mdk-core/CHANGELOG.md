@@ -70,7 +70,6 @@
 
 ### Fixed
 
-- **(Fixes [#80](https://github.com/marmot-protocol/mdk/issues/80))**: Fixed removed member commit processing to handle eviction gracefully. When a member is removed from a group and processes their removal commit, the group state is now set to `Inactive` instead of failing with a `UseAfterEviction` error. ([#137](https://github.com/marmot-protocol/mdk/pull/137))
 - **Security (Audit Suggestion 5)**: Prevent panic in `process_welcome` when rumor event ID is missing. A malformed or non-NIP-59-compliant rumor now returns a `MissingRumorEventId` error instead of panicking. ([#107](https://github.com/marmot-protocol/mdk/pull/107))
 - **Security (Audit Issue A)**: Added admin authorization check for MLS commit messages. Previously, commits were merged without verifying the sender against `admin_pubkeys`, allowing non-admin members to modify group state. Now, `process_commit_message_for_group` validates that the commit sender is an admin before merging. ([#130](https://github.com/marmot-protocol/mdk/pull/130))
 - **Security (Audit Issue B)**: Added author verification to message processing to prevent impersonation attacks. The rumor pubkey is now validated against the MLS sender's credential before processing application messages. ([#40](https://github.com/marmot-protocol/mdk/pull/40))
@@ -90,6 +89,7 @@
 - **Security (Audit Issue Z)**: Added pagination to prevent memory exhaustion from unbounded loading of group messages ([#111](https://github.com/marmot-protocol/mdk/pull/111))
 - **Security (Audit Issue AA)**: Added pagination to prevent memory exhaustion from unbounded loading of pending welcomes ([#110](https://github.com/marmot-protocol/mdk/pull/110))
 - **Security (Audit Issue AE)**: Added comprehensive Nostr-based validations when processing messages per MIP-03 requirements. The `validate_event_and_extract_group_id` function now validates timestamp bounds using `MdkConfig` settings (rejects events >5 minutes in future or >45 days old by default), and enforces exactly one `h` tag requirement with proper format validation. Note: MDK-core delegates Nostr signature verification to nostr-sdk's relay pool layer; it does not perform signature verification itself. This prevents misrouting messages via manipulated tags and degrading availability through abnormal timestamps. ([#128](https://github.com/marmot-protocol/mdk/pull/128))
+- **Security (Audit Issue AK)**: Fixed removed member commit processing to handle eviction gracefully. When a member is removed from a group and processes their removal commit, the group state is now set to `Inactive` instead of failing with a `UseAfterEviction` error. (Fixes [#80](https://github.com/marmot-protocol/mdk/issues/80)) ([#137](https://github.com/marmot-protocol/mdk/pull/137))
 - **Security (Audit Issue AP)**: Early validation and decryption failures now persist failed processing state to prevent DoS via repeated expensive reprocessing of invalid events. Added deduplication check to reject previously failed messages immediately. Failure reasons are sanitized to prevent information leakage. ([#116](https://github.com/marmot-protocol/mdk/pull/116))
 
 
