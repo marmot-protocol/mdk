@@ -9,12 +9,9 @@ pub enum Error {
     /// Error from rusqlite
     #[error("SQLite error: {0}")]
     Rusqlite(#[from] rusqlite::Error),
-    /// Error during database migration (MDK migrations)
+    /// Error during database migration
     #[error("Migration error: {0}")]
     Refinery(#[from] refinery::Error),
-    /// Error during database migration (OpenMLS migrations)
-    #[error("OpenMLS migration error: {0}")]
-    RefineryCore(#[from] refinery_core::error::Error),
     /// Error from OpenMLS
     #[error("OpenMLS error: {0}")]
     OpenMls(String),

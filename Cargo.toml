@@ -46,8 +46,7 @@ kamadak-exif = "0.6"
 
 # Storage
 rusqlite = { version = "0.32", default-features = false }
-refinery = "0.8"
-refinery-core = "0.9"  # Required for OpenMLS storage migration error handling
+refinery = "0.9"
 
 # Random number generation
 getrandom = "0.3"
