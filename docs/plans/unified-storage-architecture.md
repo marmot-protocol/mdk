@@ -392,11 +392,11 @@ The trait requires 54 methods plus one associated type:
 
 ## Schema Design
 
-We will keep the polymorphic pattern from OpenMLS for group data, but use our own table names (`mls_*` prefix):
+We will keep the polymorphic pattern from OpenMLS for group data, using the `openmls_` prefix since these tables are tightly coupled to the OpenMLS `StorageProvider` trait:
 
 ```sql
 -- Polymorphic group data storage (11 data types in one table)
-CREATE TABLE mls_group_data (
+CREATE TABLE openmls_group_data (
     group_id BLOB NOT NULL,
     data_type TEXT NOT NULL CHECK (data_type IN (
         'join_group_config', 
@@ -415,40 +415,40 @@ CREATE TABLE mls_group_data (
     PRIMARY KEY (group_id, data_type)
 );
 
-CREATE TABLE mls_proposals (
+CREATE TABLE openmls_proposals (
     group_id BLOB NOT NULL,
     proposal_ref BLOB NOT NULL,
     proposal BLOB NOT NULL,
     PRIMARY KEY (group_id, proposal_ref)
 );
 
-CREATE TABLE mls_own_leaf_nodes (
+CREATE TABLE openmls_own_leaf_nodes (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     group_id BLOB NOT NULL,
     leaf_node BLOB NOT NULL
 );
 
-CREATE TABLE mls_key_packages (
+CREATE TABLE openmls_key_packages (
     key_package_ref BLOB PRIMARY KEY,
     key_package BLOB NOT NULL
 );
 
-CREATE TABLE mls_psks (
+CREATE TABLE openmls_psks (
     psk_id BLOB PRIMARY KEY,
     psk_bundle BLOB NOT NULL
 );
 
-CREATE TABLE mls_signature_keys (
+CREATE TABLE openmls_signature_keys (
     public_key BLOB PRIMARY KEY,
     key_pair BLOB NOT NULL
 );
 
-CREATE TABLE mls_encryption_keys (
+CREATE TABLE openmls_encryption_keys (
     public_key BLOB PRIMARY KEY,
     key_pair BLOB NOT NULL
 );
 
-CREATE TABLE mls_epoch_key_pairs (
+CREATE TABLE openmls_epoch_key_pairs (
     group_id BLOB NOT NULL,
     epoch_id BLOB NOT NULL,
     leaf_index INTEGER NOT NULL,
@@ -479,9 +479,9 @@ CREATE TABLE mls_epoch_key_pairs (
 2. **We don't need to query MLS internals** - MDK loads full group state when needed
 3. **Can normalize later** - if we find we need queryable fields, we can migrate
 
-### Why `mls_*` table prefix instead of `openmls_*`?
+### Why keep the `openmls_*` table prefix?
 
-To indicate these are our tables that we control, not the upstream `openmls_sqlite_storage` tables. This avoids confusion and makes it clear we own the schema.
+Since these tables are tightly coupled to the OpenMLS `StorageProvider` trait, keeping the `openmls_` prefix makes that relationship clear. The tables store OpenMLS data structures in the format expected by the trait, so the naming reflects this dependency.
 
 ### Why start fresh with migration V001?
 
