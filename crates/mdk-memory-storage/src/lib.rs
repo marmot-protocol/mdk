@@ -225,6 +225,7 @@ mod tests {
     use mdk_storage_traits::groups::GroupStorage;
     use mdk_storage_traits::groups::types::{Group, GroupExporterSecret, GroupState};
     use mdk_storage_traits::messages::MessageStorage;
+    use mdk_storage_traits::messages::error::MessageError;
     use mdk_storage_traits::messages::types::{Message, MessageState, ProcessedMessageState};
     use mdk_storage_traits::test_utils::crypto_utils::generate_random_bytes;
     use mdk_storage_traits::welcomes::WelcomeStorage;
@@ -566,7 +567,7 @@ mod tests {
         };
         nostr_storage.save_message(message.clone()).unwrap();
         let found_message = nostr_storage
-            .find_message_by_event_id(&event_id)
+            .find_message_by_event_id(&mls_group_id, &event_id)
             .unwrap()
             .unwrap();
         assert_eq!(found_message.id, event_id);
@@ -607,6 +608,321 @@ mod tests {
         {
             let cache = nostr_storage.processed_messages_cache.read();
             assert!(cache.contains(&wrapper_id));
+        }
+    }
+
+    #[test]
+    fn test_save_message_for_nonexistent_group() {
+        let storage = MemoryStorage::default();
+        let nostr_storage = MdkMemoryStorage::new(storage);
+        let nonexistent_group_id = create_test_group_id();
+        let event_id = EventId::all_zeros();
+        let wrapper_id = EventId::all_zeros();
+        let pubkey =
+            PublicKey::from_hex("aabbccddeeffaabbccddeeffaabbccddeeffaabbccddeeffaabbccddeeffaabb")
+                .unwrap();
+        let message = Message {
+            id: event_id,
+            pubkey,
+            kind: Kind::MlsGroupMessage,
+            mls_group_id: nonexistent_group_id.clone(),
+            created_at: Timestamp::now(),
+            content: "Hello, world!".to_string(),
+            tags: Tags::new(),
+            event: UnsignedEvent::new(
+                pubkey,
+                Timestamp::now(),
+                Kind::MlsGroupMessage,
+                Tags::new(),
+                "Hello, world!".to_string(),
+            ),
+            wrapper_event_id: wrapper_id,
+            state: MessageState::Created,
+        };
+
+        // Attempting to save a message for a non-existent group should return an error
+        let result = nostr_storage.save_message(message);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            MessageError::InvalidParameters(msg) => {
+                assert!(msg.contains("not found"));
+            }
+            _ => panic!("Expected InvalidParameters error"),
+        }
+
+        // Verify the message was not added to the cache
+        {
+            let cache = nostr_storage.messages_by_group_cache.read();
+            assert!(!cache.contains(&nonexistent_group_id));
+        }
+    }
+
+    #[test]
+    fn test_update_existing_message() {
+        let storage = MemoryStorage::default();
+        let nostr_storage = MdkMemoryStorage::new(storage);
+        let mls_group_id = create_test_group_id();
+        let nostr_group_id = generate_random_bytes(32).try_into().unwrap();
+        let group = Group {
+            mls_group_id: mls_group_id.clone(),
+            nostr_group_id,
+            name: "Update Test Group".to_string(),
+            description: "A group for testing message updates".to_string(),
+            admin_pubkeys: BTreeSet::new(),
+            last_message_id: None,
+            last_message_at: None,
+            epoch: 0,
+            state: GroupState::Active,
+            image_hash: None,
+            image_key: None,
+            image_nonce: None,
+        };
+        nostr_storage.save_group(group).unwrap();
+
+        let event_id = EventId::all_zeros();
+        let wrapper_id = EventId::all_zeros();
+        let pubkey =
+            PublicKey::from_hex("aabbccddeeffaabbccddeeffaabbccddeeffaabbccddeeffaabbccddeeffaabb")
+                .unwrap();
+        let original_message = Message {
+            id: event_id,
+            pubkey,
+            kind: Kind::MlsGroupMessage,
+            mls_group_id: mls_group_id.clone(),
+            created_at: Timestamp::now(),
+            content: "Original message".to_string(),
+            tags: Tags::new(),
+            event: UnsignedEvent::new(
+                pubkey,
+                Timestamp::now(),
+                Kind::MlsGroupMessage,
+                Tags::new(),
+                "Original message".to_string(),
+            ),
+            wrapper_event_id: wrapper_id,
+            state: MessageState::Created,
+        };
+
+        // Save the original message
+        nostr_storage
+            .save_message(original_message.clone())
+            .unwrap();
+
+        // Verify the original message is stored
+        let found_message = nostr_storage
+            .find_message_by_event_id(&mls_group_id, &event_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(found_message.content, "Original message");
+
+        // Update the message with new content
+        let updated_message = Message {
+            content: "Updated message".to_string(),
+            event: UnsignedEvent::new(
+                pubkey,
+                Timestamp::now(),
+                Kind::MlsGroupMessage,
+                Tags::new(),
+                "Updated message".to_string(),
+            ),
+            ..original_message.clone()
+        };
+
+        // Save the updated message
+        nostr_storage.save_message(updated_message.clone()).unwrap();
+
+        // Verify the message was updated in the messages cache
+        let found_message = nostr_storage
+            .find_message_by_event_id(&mls_group_id, &event_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(found_message.content, "Updated message");
+
+        // Verify the message was updated in the group cache
+        {
+            let cache = nostr_storage.messages_by_group_cache.read();
+            let group_messages = cache.peek(&mls_group_id).unwrap();
+            assert_eq!(group_messages.len(), 1);
+            let msg = group_messages.get(&event_id).unwrap();
+            assert_eq!(msg.content, "Updated message");
+            assert_eq!(msg.id, event_id);
+        }
+    }
+
+    #[test]
+    fn test_save_multiple_messages_for_same_group() {
+        let storage = MemoryStorage::default();
+        let nostr_storage = MdkMemoryStorage::new(storage);
+        let mls_group_id = create_test_group_id();
+        let nostr_group_id = generate_random_bytes(32).try_into().unwrap();
+        let group = Group {
+            mls_group_id: mls_group_id.clone(),
+            nostr_group_id,
+            name: "Multiple Messages Group".to_string(),
+            description: "A group for testing multiple messages".to_string(),
+            admin_pubkeys: BTreeSet::new(),
+            last_message_id: None,
+            last_message_at: None,
+            epoch: 0,
+            state: GroupState::Active,
+            image_hash: None,
+            image_key: None,
+            image_nonce: None,
+        };
+        nostr_storage.save_group(group).unwrap();
+
+        let pubkey =
+            PublicKey::from_hex("aabbccddeeffaabbccddeeffaabbccddeeffaabbccddeeffaabbccddeeffaabb")
+                .unwrap();
+
+        // Create and save first message
+        let event_id_1 =
+            EventId::from_hex("0000000000000000000000000000000000000000000000000000000000000001")
+                .unwrap();
+        let wrapper_id_1 = EventId::all_zeros();
+        let message_1 = Message {
+            id: event_id_1,
+            pubkey,
+            kind: Kind::MlsGroupMessage,
+            mls_group_id: mls_group_id.clone(),
+            created_at: Timestamp::now(),
+            content: "First message".to_string(),
+            tags: Tags::new(),
+            event: UnsignedEvent::new(
+                pubkey,
+                Timestamp::now(),
+                Kind::MlsGroupMessage,
+                Tags::new(),
+                "First message".to_string(),
+            ),
+            wrapper_event_id: wrapper_id_1,
+            state: MessageState::Created,
+        };
+        nostr_storage.save_message(message_1.clone()).unwrap();
+
+        // Create and save second message
+        let event_id_2 =
+            EventId::from_hex("0000000000000000000000000000000000000000000000000000000000000002")
+                .unwrap();
+        let wrapper_id_2 = EventId::all_zeros();
+        let message_2 = Message {
+            id: event_id_2,
+            pubkey,
+            kind: Kind::MlsGroupMessage,
+            mls_group_id: mls_group_id.clone(),
+            created_at: Timestamp::now(),
+            content: "Second message".to_string(),
+            tags: Tags::new(),
+            event: UnsignedEvent::new(
+                pubkey,
+                Timestamp::now(),
+                Kind::MlsGroupMessage,
+                Tags::new(),
+                "Second message".to_string(),
+            ),
+            wrapper_event_id: wrapper_id_2,
+            state: MessageState::Created,
+        };
+        nostr_storage.save_message(message_2.clone()).unwrap();
+
+        // Verify both messages are in the messages cache
+        let found_message_1 = nostr_storage
+            .find_message_by_event_id(&mls_group_id, &event_id_1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(found_message_1.content, "First message");
+
+        let found_message_2 = nostr_storage
+            .find_message_by_event_id(&mls_group_id, &event_id_2)
+            .unwrap()
+            .unwrap();
+        assert_eq!(found_message_2.content, "Second message");
+
+        // Verify both messages are in the group cache
+        {
+            let cache = nostr_storage.messages_by_group_cache.read();
+            let group_messages = cache.peek(&mls_group_id).unwrap();
+            assert_eq!(group_messages.len(), 2);
+            assert_eq!(
+                group_messages.get(&event_id_1).unwrap().content,
+                "First message"
+            );
+            assert_eq!(
+                group_messages.get(&event_id_2).unwrap().content,
+                "Second message"
+            );
+        }
+    }
+
+    #[test]
+    fn test_save_message_verifies_group_existence_before_cache_insertion() {
+        let storage = MemoryStorage::default();
+        let nostr_storage = MdkMemoryStorage::new(storage);
+        let mls_group_id = create_test_group_id();
+        let nonexistent_group_id = GroupId::from_slice(&[9, 9, 9, 9]);
+        let event_id = EventId::all_zeros();
+        let wrapper_id = EventId::all_zeros();
+        let pubkey =
+            PublicKey::from_hex("aabbccddeeffaabbccddeeffaabbccddeeffaabbccddeeffaabbccddeeffaabb")
+                .unwrap();
+
+        // Create a group
+        let nostr_group_id = generate_random_bytes(32).try_into().unwrap();
+        let group = Group {
+            mls_group_id: mls_group_id.clone(),
+            nostr_group_id,
+            name: "Test Group".to_string(),
+            description: "A test group".to_string(),
+            admin_pubkeys: BTreeSet::new(),
+            last_message_id: None,
+            last_message_at: None,
+            epoch: 0,
+            state: GroupState::Active,
+            image_hash: None,
+            image_key: None,
+            image_nonce: None,
+        };
+        nostr_storage.save_group(group).unwrap();
+
+        // Try to save a message for a non-existent group
+        let message = Message {
+            id: event_id,
+            pubkey,
+            kind: Kind::MlsGroupMessage,
+            mls_group_id: nonexistent_group_id.clone(),
+            created_at: Timestamp::now(),
+            content: "Hello, world!".to_string(),
+            tags: Tags::new(),
+            event: UnsignedEvent::new(
+                pubkey,
+                Timestamp::now(),
+                Kind::MlsGroupMessage,
+                Tags::new(),
+                "Hello, world!".to_string(),
+            ),
+            wrapper_event_id: wrapper_id,
+            state: MessageState::Created,
+        };
+
+        let result = nostr_storage.save_message(message);
+        assert!(result.is_err());
+
+        // Verify the message was not added to either cache
+        {
+            let cache = nostr_storage.messages_cache.read();
+            assert!(!cache.contains(&event_id));
+        }
+        {
+            let cache = nostr_storage.messages_by_group_cache.read();
+            assert!(!cache.contains(&nonexistent_group_id));
+        }
+
+        // Verify the existing group's cache is still empty (no messages were added)
+        {
+            let cache = nostr_storage.messages_by_group_cache.read();
+            if let Some(messages) = cache.peek(&mls_group_id) {
+                assert!(messages.is_empty());
+            }
         }
     }
 

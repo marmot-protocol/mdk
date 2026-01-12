@@ -440,7 +440,9 @@ pub mod cross_storage {
         storage.save_message(message.clone()).unwrap();
 
         // Test find
-        let found_message = storage.find_message_by_event_id(&event_id).unwrap();
+        let found_message = storage
+            .find_message_by_event_id(&mls_group_id, &event_id)
+            .unwrap();
         assert!(found_message.is_some());
         let found_message = found_message.unwrap();
         assert_eq!(found_message.id, message.id);
@@ -451,7 +453,9 @@ pub mod cross_storage {
         let non_existent_id =
             EventId::from_hex("abababababababababababababababababababababababababababababababab")
                 .unwrap();
-        let result = storage.find_message_by_event_id(&non_existent_id).unwrap();
+        let result = storage
+            .find_message_by_event_id(&mls_group_id, &non_existent_id)
+            .unwrap();
         assert!(result.is_none());
     }
 
