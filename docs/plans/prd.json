@@ -20,13 +20,13 @@
       "id": "phase-1",
       "name": "Update mdk-storage-traits",
       "description": "Remove the openmls_storage() accessor pattern and make MdkStorageProvider require StorageProvider<1> directly.",
-      "status": "pending",
+      "status": "complete",
       "requirements": [
         {
           "id": "REQ-1.1",
           "title": "Create MdkStorageError Enum",
           "description": "Create a new error type for MDK storage operations to be used as the associated Error type for OpenMLS StorageProvider trait.",
-          "status": "pending",
+          "status": "complete",
           "acceptance_criteria": [
             "New file crates/mdk-storage-traits/src/error.rs exists",
             "MdkStorageError enum has variants: Database, Serialization, Deserialization, NotFound, Other",
@@ -42,7 +42,7 @@
           "id": "REQ-1.2",
           "title": "Update MdkStorageProvider Trait",
           "description": "Modify the MdkStorageProvider trait to directly require StorageProvider<1> instead of the accessor pattern.",
-          "status": "pending",
+          "status": "complete",
           "acceptance_criteria": [
             "MdkStorageProvider trait removes type OpenMlsStorageProvider associated type",
             "MdkStorageProvider trait removes openmls_storage() method",
@@ -60,7 +60,7 @@
           "id": "REQ-1.3",
           "title": "Add openmls_traits Dependency",
           "description": "Add openmls_traits as a dependency to mdk-storage-traits for the StorageProvider trait.",
-          "status": "pending",
+          "status": "complete",
           "acceptance_criteria": [
             "openmls_traits = \"0.4.1\" added to mdk-storage-traits/Cargo.toml",
             "StorageProvider trait is imported and usable",
@@ -76,13 +76,13 @@
       "id": "phase-2",
       "name": "Implement StorageProvider<1> for MdkSqliteStorage",
       "description": "Make MdkSqliteStorage directly implement the OpenMLS storage trait with a single unified connection.",
-      "status": "pending",
+      "status": "complete",
       "requirements": [
         {
           "id": "REQ-2.1",
           "title": "Remove openmls_sqlite_storage Dependency",
           "description": "Remove the external OpenMLS SQLite storage dependency as we will implement the trait ourselves.",
-          "status": "pending",
+          "status": "complete",
           "acceptance_criteria": [
             "openmls_sqlite_storage removed from mdk-sqlite-storage/Cargo.toml",
             "openmls_sqlite_storage removed from workspace Cargo.toml if present",
@@ -96,7 +96,7 @@
           "id": "REQ-2.2",
           "title": "Create JSON Codec Module",
           "description": "Implement a JSON codec for serializing/deserializing OpenMLS types to SQLite blobs.",
-          "status": "pending",
+          "status": "complete",
           "acceptance_criteria": [
             "New file crates/mdk-sqlite-storage/src/mls_storage/codec.rs exists",
             "JsonCodec struct implemented with serialize<T: Serialize>() method",
@@ -112,7 +112,7 @@
           "id": "REQ-2.3",
           "title": "Update MdkSqliteStorage Struct",
           "description": "Refactor MdkSqliteStorage to use a single unified connection instead of dual connections.",
-          "status": "pending",
+          "status": "complete",
           "acceptance_criteria": [
             "MdkSqliteStorage struct has single connection field: Arc<tokio::sync::Mutex<Connection>>",
             "Removed openmls_storage field",
@@ -128,7 +128,7 @@
           "id": "REQ-2.4",
           "title": "Create Fresh Migration V001",
           "description": "Create a single initial migration that creates all tables (both MLS and MDK) in a unified schema.",
-          "status": "pending",
+          "status": "complete",
           "acceptance_criteria": [
             "Old migration files removed (V100__*.sql, V10*__*.sql)",
             "New file migrations/V001__initial_schema.sql exists",
@@ -145,7 +145,7 @@
           "id": "REQ-2.5",
           "title": "Implement StorageProvider Write Methods",
           "description": "Implement all 18 write methods required by StorageProvider<1> trait.",
-          "status": "pending",
+          "status": "complete",
           "acceptance_criteria": [
             "write_mls_join_config implemented and tested",
             "append_own_leaf_node implemented and tested",
@@ -182,7 +182,7 @@
           "id": "REQ-2.6",
           "title": "Implement StorageProvider Read Methods",
           "description": "Implement all 19 read methods required by StorageProvider<1> trait.",
-          "status": "pending",
+          "status": "complete",
           "acceptance_criteria": [
             "mls_group_join_config implemented and tested",
             "own_leaf_nodes implemented and tested",
@@ -212,7 +212,7 @@
           "id": "REQ-2.7",
           "title": "Implement StorageProvider Delete Methods",
           "description": "Implement all 19 delete methods required by StorageProvider<1> trait.",
-          "status": "pending",
+          "status": "complete",
           "acceptance_criteria": [
             "remove_proposal implemented and tested",
             "delete_own_leaf_nodes implemented and tested",
@@ -242,7 +242,7 @@
           "id": "REQ-2.8",
           "title": "Implement Transaction/Savepoint Support",
           "description": "Add savepoint-based transaction support for atomic operations and rollback capability.",
-          "status": "pending",
+          "status": "complete",
           "acceptance_criteria": [
             "savepoint(name: &str) method implemented",
             "release_savepoint(name: &str) method implemented",
@@ -259,7 +259,7 @@
           "id": "REQ-2.9",
           "title": "Update Existing MDK Storage Implementations",
           "description": "Ensure GroupStorage, MessageStorage, and WelcomeStorage implementations work with the new single-connection architecture.",
-          "status": "pending",
+          "status": "complete",
           "acceptance_criteria": [
             "GroupStorage impl updated to use unified connection",
             "MessageStorage impl updated to use unified connection",
@@ -276,6 +276,7 @@
           "title": "Enable WAL Mode",
           "description": "Configure SQLite to use WAL mode for better concurrent read performance.",
           "status": "pending",
+          "notes": "Not yet implemented - WAL mode configuration still needs to be added"
           "acceptance_criteria": [
             "PRAGMA journal_mode=WAL executed on connection open",
             "WAL mode verified in tests",

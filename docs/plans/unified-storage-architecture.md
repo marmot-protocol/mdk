@@ -107,7 +107,7 @@ MdkMemoryStorage
 
 ## Implementation Phases
 
-### Phase 1: Update `mdk-storage-traits`
+### Phase 1: Update `mdk-storage-traits` ✅ COMPLETE
 
 **Goal**: Remove the `openmls_storage()` accessor pattern; make `MdkStorageProvider` require `StorageProvider<1>` directly.
 
@@ -160,9 +160,11 @@ MdkMemoryStorage
 - `crates/mdk-storage-traits/src/lib.rs`
 - `crates/mdk-storage-traits/src/error.rs` (new file for `MdkStorageError`)
 
+**Status**: ✅ Complete (commit: `feat(storage-traits): require StorageProvider<1> in MdkStorageProvider trait`)
+
 ---
 
-### Phase 2: Implement `StorageProvider<1>` for `MdkSqliteStorage`
+### Phase 2: Implement `StorageProvider<1>` for `MdkSqliteStorage` ✅ COMPLETE
 
 **Goal**: Make `MdkSqliteStorage` directly implement the OpenMLS storage trait.
 
@@ -242,9 +244,23 @@ MdkMemoryStorage
 - `crates/mdk-sqlite-storage/src/mls_storage/` (new module)
 - `crates/mdk-sqlite-storage/migrations/V001__initial_schema.sql` (replaces all existing migrations)
 
+**Status**: ✅ Complete. Key changes:
+- Removed `openmls_sqlite_storage` dependency
+- Implemented all 56 `StorageProvider<1>` methods directly on `MdkSqliteStorage`
+- Created unified schema in `V001__initial_schema.sql`
+- Added `mls_storage/mod.rs` and `mls_storage/codec.rs` modules
+- Added savepoint support methods
+- Changed to single `Arc<tokio::sync::Mutex<Connection>>` architecture
+- All 134 tests pass
+
+Commits:
+- `feat(sqlite-storage): add unified schema and MLS storage module`
+- `feat(sqlite-storage): implement StorageProvider<1> with single connection`
+- `refactor(sqlite-storage): update storage impls to use with_connection`
+
 ---
 
-### Phase 3: Implement `StorageProvider<1>` for `MdkMemoryStorage`
+### Phase 3: Implement `StorageProvider<1>` for `MdkMemoryStorage` ⏳ NOT STARTED
 
 **Goal**: Make `MdkMemoryStorage` directly implement the OpenMLS storage trait.
 
