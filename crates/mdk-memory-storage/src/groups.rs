@@ -362,7 +362,7 @@ mod tests {
 
     #[test]
     fn test_nostr_group_id_collision_rejected() {
-        let storage = MdkMemoryStorage::new(MemoryStorage::default());
+        let storage = MdkMemoryStorage::new();
 
         // Create first group with a specific nostr_group_id
         let mls_group_id_1 = GroupId::from_slice(&[1, 2, 3, 4]);
@@ -424,7 +424,7 @@ mod tests {
 
     #[test]
     fn test_nostr_group_id_update_removes_stale_entry() {
-        let storage = MdkMemoryStorage::new(MemoryStorage::default());
+        let storage = MdkMemoryStorage::new();
 
         let mls_group_id = GroupId::from_slice(&[1, 2, 3, 4]);
         let old_nostr_group_id = [1u8; 32];
@@ -495,7 +495,7 @@ mod tests {
 
     #[test]
     fn test_same_group_update_allowed() {
-        let storage = MdkMemoryStorage::new(MemoryStorage::default());
+        let storage = MdkMemoryStorage::new();
 
         let mls_group_id = GroupId::from_slice(&[1, 2, 3, 4]);
         let nostr_group_id = [1u8; 32];
