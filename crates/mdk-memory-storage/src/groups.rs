@@ -21,17 +21,15 @@ impl GroupStorage for MdkMemoryStorage {
         if let Some(existing_group) = nostr_id_cache.peek(&group.nostr_group_id)
             && existing_group.mls_group_id != group.mls_group_id
         {
-            return Err(GroupError::InvalidParameters(format!(
-                "nostr_group_id already exists for a different group (mls_group_id: {:?})",
-                existing_group.mls_group_id
-            )));
+            return Err(GroupError::InvalidParameters(
+                "nostr_group_id already exists for a different group".to_string(),
+            ));
         }
 
-        // If updating an existing group, check if nostr_group_id changed and remove stale entry
+        // If updating an existing group and nostr_group_id changed, remove stale entry
         if let Some(existing_group) = groups_cache.peek(&group.mls_group_id)
             && existing_group.nostr_group_id != group.nostr_group_id
         {
-            // Remove the old nostr_group_id mapping to prevent stale entries
             nostr_id_cache.pop(&existing_group.nostr_group_id);
         }
 
