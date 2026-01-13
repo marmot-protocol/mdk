@@ -1462,13 +1462,14 @@ dependencies = [
  "mdk-storage-traits",
  "nostr",
  "openmls",
- "openmls_sqlite_storage",
+ "openmls_traits",
  "refinery",
  "rusqlite",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.17",
+ "tokio",
  "tracing",
 ]
 
@@ -1476,14 +1477,12 @@ dependencies = [
 name = "mdk-storage-traits"
 version = "0.5.1"
 dependencies = [
- "mdk-memory-storage",
- "mdk-sqlite-storage",
  "nostr",
  "openmls",
- "openmls_memory_storage",
  "openmls_traits",
  "serde",
  "serde_json",
+ "thiserror 2.0.17",
  "zeroize",
 ]
 
@@ -1697,20 +1696,6 @@ dependencies = [
  "sha2",
  "thiserror 2.0.17",
  "tls_codec",
-]
-
-[[package]]
-name = "openmls_sqlite_storage"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a3e6a68f5cf720fb3827164049d6cba7262dfca2537c23909efbb480f9013731"
-dependencies = [
- "log",
- "openmls_traits",
- "refinery",
- "rusqlite",
- "serde",
- "thiserror 1.0.69",
 ]
 
 [[package]]
