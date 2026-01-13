@@ -1,0 +1,91 @@
+---
+description: Security guidelines for MDK development - CRITICAL rules for handling sensitive data
+globs: *.rs
+alwaysApply: true
+---
+
+# Security Guidelines for MDK Development
+
+MDK handles cryptographic operations and privacy-sensitive data. All contributors MUST follow these security guidelines.
+
+## Sensitive Identifiers - NEVER Log or Expose
+
+**CRITICAL**: The following identifiers are privacy-sensitive and must NEVER appear in:
+
+- Log messages (via `tracing::*` macros)
+- Error messages or error strings
+- Debug output (including `Debug` trait implementations)
+- Panic messages
+- User-facing error descriptions
+
+### Protected Identifiers
+
+| Identifier | Description | Risk if Exposed |
+|------------|-------------|-----------------|
+| Encryption keys | Any key material | Enables unauthorized decryption |
+| Exporter secrets | MLS exporter secrets | Retrospective traffic decryption |
+| `mls_group_id` | MLS group identifier (32 bytes) | Cross-system group linkage and tracking |
+| `nostr_group_id` | Nostr group identifier | Links Nostr events to MLS groups |
+
+### Correct Patterns
+
+```rust
+// GOOD - Generic error without identifier
+GroupError::NotFound("Group not found".to_string())
+
+// GOOD - Use a non-identifying error variant
+GroupError::GroupNotFound
+
+// GOOD - Log without the identifier
+tracing::warn!("Group not found in storage");
+
+// GOOD - If you need to identify which operation failed, use non-sensitive context
+tracing::warn!("Failed to load group during message processing");
+```
+
+### Incorrect Patterns (NEVER DO THIS)
+
+```rust
+// BAD - Leaks the MLS group ID in error message
+GroupError::InvalidParameters(format!("Group with MLS ID {:?} not found", mls_group_id))
+
+// BAD - Leaks group identifier in logs
+tracing::warn!("Group {} not found", mls_group_id);
+
+// BAD - Debug output includes sensitive identifier
+tracing::debug!("Processing group {:?}", nostr_group_id);
+
+// BAD - Panic with identifier
+panic!("Unexpected state for group {}", mls_group_id);
+```
+
+## Key Material Handling
+
+- Keys are never logged or exposed in debug output
+- `EncryptionConfig` and similar types must redact keys in their `Debug` implementations
+- Use `secrecy` crate patterns where appropriate for sensitive values
+- Zeroize sensitive data when no longer needed (where practical)
+
+## Error Message Guidelines
+
+When writing error messages:
+
+1. **Be descriptive about the failure** - explain what operation failed
+2. **Do NOT include identifiers** - never embed group IDs, key material, or secrets
+3. **Use structured error types** - prefer enum variants over formatted strings with embedded data
+4. **Consider the log audience** - error messages may end up in crash reports, analytics, or shared logs
+
+## Cryptographic Code Changes
+
+When modifying cryptographic code:
+
+1. Review security implications before making changes
+2. Ensure forward secrecy properties are maintained
+3. Never weaken security for convenience
+4. For security vulnerabilities, email **j@ipf.dev** (do not open public issues)
+
+## References
+
+- [MIP-01 Group Identity and Privacy](https://github.com/marmot-protocol/marmot)
+- [RFC 9420 - MLS Protocol](https://www.rfc-editor.org/rfc/rfc9420.html)
+- [SECURITY.md](mdc:SECURITY.md) - Full threat model and security considerations

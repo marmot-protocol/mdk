@@ -308,6 +308,45 @@ use self::x::Y;
 - All message encryption uses MLS protocol with forward secrecy
 - Review security implications of any changes to cryptographic code
 
+### Sensitive Identifiers - NEVER Log or Expose
+
+**CRITICAL**: The following identifiers are privacy-sensitive and must NEVER be included in:
+
+- Log messages (via `tracing::*` macros)
+- Error messages or error strings
+- Debug output (including `Debug` trait implementations for types containing these)
+- Panic messages
+- User-facing error descriptions
+
+| Identifier | Description | Why It's Sensitive |
+|------------|-------------|-------------------|
+| Encryption keys | Any key material | Obviously sensitive cryptographic data |
+| Exporter secrets | MLS exporter secrets | Enables retrospective traffic decryption |
+| `mls_group_id` | MLS group identifier (32 bytes) | Enables cross-system group linkage and tracking |
+| `nostr_group_id` | Nostr group identifier | Links Nostr events to MLS groups |
+
+#### What to Do Instead
+
+When writing error messages for "not found" or similar conditions:
+
+```rust
+// GOOD - Generic error without identifier
+GroupError::NotFound("Group not found".to_string())
+
+// GOOD - Use a non-identifying error variant
+GroupError::GroupNotFound
+
+// BAD - Leaks the MLS group ID
+GroupError::InvalidParameters(format!("Group with MLS ID {:?} not found", mls_group_id))
+
+// BAD - Leaks group identifier in logs
+tracing::warn!("Group {} not found", mls_group_id);
+```
+
+This requirement stems from [MIP-01](https://github.com/marmot-protocol/marmot) group identity and privacy guidance. Violations can enable attackers or operators to exfiltrate private identifiers from logs, allowing cross-system linkage of groups and weakening metadata privacy guarantees.
+
+See also: `SECURITY.md` for the full threat model and security considerations.
+
 ## PR Checklist
 
 Before submitting a PR:
