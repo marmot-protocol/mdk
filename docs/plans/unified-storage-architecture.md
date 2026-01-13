@@ -665,18 +665,6 @@ CREATE INDEX idx_processed_welcomes_state ON processed_welcomes(state);
 
 ---
 
-## Open Questions
-
-### Thread Safety / Connection Sharing
-
-The current SQLite storage uses `Arc<Mutex<Connection>>`. Should we consider:
-- A connection pool for better concurrent access?
-- Keeping single connection with mutex (simpler, current approach)?
-
-This needs further investigation based on actual usage patterns and performance requirements.
-
----
-
 ## Risks & Mitigations
 
 | Risk | Impact | Mitigation |
@@ -704,6 +692,20 @@ Since these tables are tightly coupled to the OpenMLS `StorageProvider` trait, k
 ### Why start fresh with migration V001?
 
 Since this is a completely breaking change with no migration path from the old dual-connection architecture, we start fresh with `V001__initial_schema.sql`. This creates all tables (both MLS and MDK) in a single clean migration, making the schema easier to understand.
+
+### Why single connection instead of connection pool?
+
+We use a single SQLite connection wrapped in `Arc<Mutex<Connection>>` rather than a connection pool because:
+
+1. **Savepoint simplicity** - Savepoints are per-connection. With a pool, we'd need to ensure the same connection is used for an entire transaction, adding complexity.
+
+2. **SQLite's nature** - SQLite only allows one writer at a time regardless of connection count. A pool mainly helps concurrent reads, but MDK's workload is write-heavy (storing messages, updating group state).
+
+3. **Start simple** - We can always add pooling later if profiling shows it's a bottleneck.
+
+For async compatibility:
+- Enable **WAL mode** for better concurrent read performance
+- Use `spawn_blocking` or an async-aware mutex for SQLite operations to avoid blocking the async runtime
 
 ---
 
