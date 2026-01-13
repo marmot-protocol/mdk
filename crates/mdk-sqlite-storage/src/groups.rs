@@ -27,63 +27,63 @@ where
 
 impl GroupStorage for MdkSqliteStorage {
     fn all_groups(&self) -> Result<Vec<Group>, GroupError> {
-        let conn_guard = self.db_connection.lock().map_err(into_group_err)?;
+        self.with_connection(|conn| {
+            let mut stmt = conn
+                .prepare("SELECT * FROM groups")
+                .map_err(into_group_err)?;
 
-        let mut stmt = conn_guard
-            .prepare("SELECT * FROM groups")
-            .map_err(into_group_err)?;
+            let groups_iter = stmt
+                .query_map([], db::row_to_group)
+                .map_err(into_group_err)?;
 
-        let groups_iter = stmt
-            .query_map([], db::row_to_group)
-            .map_err(into_group_err)?;
+            let mut groups: Vec<Group> = Vec::new();
 
-        let mut groups: Vec<Group> = Vec::new();
-
-        for group_result in groups_iter {
-            match group_result {
-                Ok(group) => {
-                    groups.push(group);
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        "Failed to deserialize group row, skipping"
-                    );
+            for group_result in groups_iter {
+                match group_result {
+                    Ok(group) => {
+                        groups.push(group);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "Failed to deserialize group row, skipping"
+                        );
+                    }
                 }
             }
-        }
 
-        Ok(groups)
+            Ok(groups)
+        })
     }
 
     fn find_group_by_mls_group_id(
         &self,
         mls_group_id: &GroupId,
     ) -> Result<Option<Group>, GroupError> {
-        let conn_guard = self.db_connection.lock().map_err(into_group_err)?;
+        self.with_connection(|conn| {
+            let mut stmt = conn
+                .prepare("SELECT * FROM groups WHERE mls_group_id = ?")
+                .map_err(into_group_err)?;
 
-        let mut stmt = conn_guard
-            .prepare("SELECT * FROM groups WHERE mls_group_id = ?")
-            .map_err(into_group_err)?;
-
-        stmt.query_row([mls_group_id.as_slice()], db::row_to_group)
-            .optional()
-            .map_err(into_group_err)
+            stmt.query_row([mls_group_id.as_slice()], db::row_to_group)
+                .optional()
+                .map_err(into_group_err)
+        })
     }
 
     fn find_group_by_nostr_group_id(
         &self,
         nostr_group_id: &[u8; 32],
     ) -> Result<Option<Group>, GroupError> {
-        let conn_guard = self.db_connection.lock().map_err(into_group_err)?;
+        self.with_connection(|conn| {
+            let mut stmt = conn
+                .prepare("SELECT * FROM groups WHERE nostr_group_id = ?")
+                .map_err(into_group_err)?;
 
-        let mut stmt = conn_guard
-            .prepare("SELECT * FROM groups WHERE nostr_group_id = ?")
-            .map_err(into_group_err)?;
-
-        stmt.query_row(params![nostr_group_id], db::row_to_group)
-            .optional()
-            .map_err(into_group_err)
+            stmt.query_row(params![nostr_group_id], db::row_to_group)
+                .optional()
+                .map_err(into_group_err)
+        })
     }
 
     fn save_group(&self, group: Group) -> Result<(), GroupError> {
@@ -97,8 +97,6 @@ impl GroupStorage for MdkSqliteStorage {
             "Group description",
         )
         .map_err(|e| GroupError::InvalidParameters(e.to_string()))?;
-
-        let conn_guard = self.db_connection.lock().map_err(into_group_err)?;
 
         let admin_pubkeys_json: String =
             serde_json::to_string(&group.admin_pubkeys).map_err(|e| {
@@ -117,8 +115,8 @@ impl GroupStorage for MdkSqliteStorage {
             group.last_message_id.as_ref().map(|id| id.as_bytes());
         let last_message_at: Option<u64> = group.last_message_at.as_ref().map(|ts| ts.as_u64());
 
-        conn_guard
-            .execute(
+        self.with_connection(|conn| {
+            conn.execute(
                 "INSERT INTO groups
              (mls_group_id, nostr_group_id, name, description, image_hash, image_key, image_nonce, admin_pubkeys, last_message_id,
               last_message_at, epoch, state)
@@ -152,7 +150,8 @@ impl GroupStorage for MdkSqliteStorage {
             )
             .map_err(into_group_err)?;
 
-        Ok(())
+            Ok(())
+        })
     }
 
     fn messages(
@@ -177,29 +176,29 @@ impl GroupStorage for MdkSqliteStorage {
             return Err(GroupError::InvalidParameters("Group not found".to_string()));
         }
 
-        let conn_guard = self.db_connection.lock().map_err(into_group_err)?;
+        self.with_connection(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT * FROM messages WHERE mls_group_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                )
+                .map_err(into_group_err)?;
 
-        let mut stmt = conn_guard
-            .prepare(
-                "SELECT * FROM messages WHERE mls_group_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?",
-            )
-            .map_err(into_group_err)?;
+            let messages_iter = stmt
+                .query_map(
+                    params![mls_group_id.as_slice(), limit as i64, offset as i64],
+                    db::row_to_message,
+                )
+                .map_err(into_group_err)?;
 
-        let messages_iter = stmt
-            .query_map(
-                params![mls_group_id.as_slice(), limit as i64, offset as i64],
-                db::row_to_message,
-            )
-            .map_err(into_group_err)?;
+            let mut messages: Vec<Message> = Vec::new();
 
-        let mut messages: Vec<Message> = Vec::new();
+            for message_result in messages_iter {
+                let message: Message = message_result.map_err(into_group_err)?;
+                messages.push(message);
+            }
 
-        for message_result in messages_iter {
-            let message: Message = message_result.map_err(into_group_err)?;
-            messages.push(message);
-        }
-
-        Ok(messages)
+            Ok(messages)
+        })
     }
 
     fn admins(&self, mls_group_id: &GroupId) -> Result<BTreeSet<PublicKey>, GroupError> {
@@ -216,24 +215,24 @@ impl GroupStorage for MdkSqliteStorage {
             return Err(GroupError::InvalidParameters("Group not found".to_string()));
         }
 
-        let conn_guard = self.db_connection.lock().map_err(into_group_err)?;
+        self.with_connection(|conn| {
+            let mut stmt = conn
+                .prepare("SELECT * FROM group_relays WHERE mls_group_id = ?")
+                .map_err(into_group_err)?;
 
-        let mut stmt = conn_guard
-            .prepare("SELECT * FROM group_relays WHERE mls_group_id = ?")
-            .map_err(into_group_err)?;
+            let relays_iter = stmt
+                .query_map(params![mls_group_id.as_slice()], db::row_to_group_relay)
+                .map_err(into_group_err)?;
 
-        let relays_iter = stmt
-            .query_map(params![mls_group_id.as_slice()], db::row_to_group_relay)
-            .map_err(into_group_err)?;
+            let mut relays: BTreeSet<GroupRelay> = BTreeSet::new();
 
-        let mut relays: BTreeSet<GroupRelay> = BTreeSet::new();
+            for relay_result in relays_iter {
+                let relay: GroupRelay = relay_result.map_err(into_group_err)?;
+                relays.insert(relay);
+            }
 
-        for relay_result in relays_iter {
-            let relay: GroupRelay = relay_result.map_err(into_group_err)?;
-            relays.insert(relay);
-        }
-
-        Ok(relays)
+            Ok(relays)
+        })
     }
 
     fn replace_group_relays(
@@ -246,31 +245,31 @@ impl GroupStorage for MdkSqliteStorage {
             return Err(GroupError::InvalidParameters("Group not found".to_string()));
         }
 
-        let conn_guard = self.db_connection.lock().map_err(into_group_err)?;
+        self.with_connection(|conn| {
+            // Use a transaction for atomicity
+            let tx = conn.unchecked_transaction().map_err(into_group_err)?;
 
-        // Use a transaction for atomicity
-        let tx = conn_guard.unchecked_transaction().map_err(into_group_err)?;
-
-        // Clear existing relays for this group
-        tx.execute(
-            "DELETE FROM group_relays WHERE mls_group_id = ?",
-            params![group_id.as_slice()],
-        )
-        .map_err(into_group_err)?;
-
-        // Insert new relays
-        for relay_url in relays {
+            // Clear existing relays for this group
             tx.execute(
-                "INSERT INTO group_relays (mls_group_id, relay_url) VALUES (?, ?)",
-                params![group_id.as_slice(), relay_url.as_str()],
+                "DELETE FROM group_relays WHERE mls_group_id = ?",
+                params![group_id.as_slice()],
             )
             .map_err(into_group_err)?;
-        }
 
-        // Commit the transaction
-        tx.commit().map_err(into_group_err)?;
+            // Insert new relays
+            for relay_url in &relays {
+                tx.execute(
+                    "INSERT INTO group_relays (mls_group_id, relay_url) VALUES (?, ?)",
+                    params![group_id.as_slice(), relay_url.as_str()],
+                )
+                .map_err(into_group_err)?;
+            }
 
-        Ok(())
+            // Commit the transaction
+            tx.commit().map_err(into_group_err)?;
+
+            Ok(())
+        })
     }
 
     fn get_group_exporter_secret(
@@ -283,18 +282,20 @@ impl GroupStorage for MdkSqliteStorage {
             return Err(GroupError::InvalidParameters("Group not found".to_string()));
         }
 
-        let conn_guard = self.db_connection.lock().map_err(into_group_err)?;
+        self.with_connection(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT * FROM group_exporter_secrets WHERE mls_group_id = ? AND epoch = ?",
+                )
+                .map_err(into_group_err)?;
 
-        let mut stmt = conn_guard
-            .prepare("SELECT * FROM group_exporter_secrets WHERE mls_group_id = ? AND epoch = ?")
-            .map_err(into_group_err)?;
-
-        stmt.query_row(
-            params![mls_group_id.as_slice(), epoch],
-            db::row_to_group_exporter_secret,
-        )
-        .optional()
-        .map_err(into_group_err)
+            stmt.query_row(
+                params![mls_group_id.as_slice(), epoch],
+                db::row_to_group_exporter_secret,
+            )
+            .optional()
+            .map_err(into_group_err)
+        })
     }
 
     fn save_group_exporter_secret(
@@ -308,15 +309,15 @@ impl GroupStorage for MdkSqliteStorage {
             return Err(GroupError::InvalidParameters("Group not found".to_string()));
         }
 
-        let conn_guard = self.db_connection.lock().map_err(into_group_err)?;
+        self.with_connection(|conn| {
+            conn.execute(
+                "INSERT OR REPLACE INTO group_exporter_secrets (mls_group_id, epoch, secret) VALUES (?, ?, ?)",
+                params![&group_exporter_secret.mls_group_id.as_slice(), &group_exporter_secret.epoch, group_exporter_secret.secret.as_ref()],
+            )
+            .map_err(into_group_err)?;
 
-        conn_guard.execute(
-            "INSERT OR REPLACE INTO group_exporter_secrets (mls_group_id, epoch, secret) VALUES (?, ?, ?)",
-            params![&group_exporter_secret.mls_group_id.as_slice(), &group_exporter_secret.epoch, group_exporter_secret.secret.as_ref()],
-        )
-        .map_err(into_group_err)?;
-
-        Ok(())
+            Ok(())
+        })
     }
 }
 

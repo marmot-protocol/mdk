@@ -34,8 +34,6 @@ impl WelcomeStorage for MdkSqliteStorage {
         )
         .map_err(|e| WelcomeError::InvalidParameters(e.to_string()))?;
 
-        let conn_guard = self.db_connection.lock().map_err(into_welcome_err)?;
-
         // Serialize complex types to JSON
         let group_admin_pubkeys_json: String = serde_json::to_string(&welcome.group_admin_pubkeys)
             .map_err(|e| {
@@ -70,24 +68,24 @@ impl WelcomeStorage for MdkSqliteStorage {
         validate_size(event_json.as_bytes(), MAX_EVENT_JSON_SIZE, "Event JSON")
             .map_err(|e| WelcomeError::InvalidParameters(e.to_string()))?;
 
-        conn_guard
-            .execute(
+        self.with_connection(|conn| {
+            conn.execute(
                 "INSERT OR REPLACE INTO welcomes
              (id, event, mls_group_id, nostr_group_id, group_name, group_description, group_image_hash, group_image_key, group_image_nonce,
               group_admin_pubkeys, group_relays, welcomer, member_count, state, wrapper_event_id)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 params![
                     welcome.id.as_bytes(),
-                    event_json,
+                    &event_json,
                     welcome.mls_group_id.as_slice(),
-                    welcome.nostr_group_id,
-                    welcome.group_name,
-                    welcome.group_description,
+                    &welcome.nostr_group_id,
+                    &welcome.group_name,
+                    &welcome.group_description,
                     welcome.group_image_hash.map(Hash32::from),
                     welcome.group_image_key.as_ref().map(|k| Hash32::from(**k)),
                     welcome.group_image_nonce.as_ref().map(|n| Nonce12::from(**n)),
-                    group_admin_pubkeys_json,
-                    group_relays_json,
+                    &group_admin_pubkeys_json,
+                    &group_relays_json,
                     welcome.welcomer.as_bytes(),
                     welcome.member_count as u64,
                     welcome.state.as_str(),
@@ -96,22 +94,23 @@ impl WelcomeStorage for MdkSqliteStorage {
             )
             .map_err(into_welcome_err)?;
 
-        Ok(())
+            Ok(())
+        })
     }
 
     fn find_welcome_by_event_id(
         &self,
         event_id: &EventId,
     ) -> Result<Option<Welcome>, WelcomeError> {
-        let conn_guard = self.db_connection.lock().map_err(into_welcome_err)?;
+        self.with_connection(|conn| {
+            let mut stmt = conn
+                .prepare("SELECT * FROM welcomes WHERE id = ?")
+                .map_err(into_welcome_err)?;
 
-        let mut stmt = conn_guard
-            .prepare("SELECT * FROM welcomes WHERE id = ?")
-            .map_err(into_welcome_err)?;
-
-        stmt.query_row(params![event_id.as_bytes()], db::row_to_welcome)
-            .optional()
-            .map_err(into_welcome_err)
+            stmt.query_row(params![event_id.as_bytes()], db::row_to_welcome)
+                .optional()
+                .map_err(into_welcome_err)
+        })
     }
 
     fn pending_welcomes(
@@ -130,44 +129,42 @@ impl WelcomeStorage for MdkSqliteStorage {
             )));
         }
 
-        let conn_guard = self.db_connection.lock().map_err(into_welcome_err)?;
+        self.with_connection(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT * FROM welcomes WHERE state = 'pending' 
+                     ORDER BY id DESC 
+                     LIMIT ? OFFSET ?",
+                )
+                .map_err(into_welcome_err)?;
 
-        let mut stmt = conn_guard
-            .prepare(
-                "SELECT * FROM welcomes WHERE state = 'pending' 
-                 ORDER BY id DESC 
-                 LIMIT ? OFFSET ?",
-            )
-            .map_err(into_welcome_err)?;
+            let welcomes_iter = stmt
+                .query_map(params![limit as i64, offset as i64], db::row_to_welcome)
+                .map_err(into_welcome_err)?;
 
-        let welcomes_iter = stmt
-            .query_map(params![limit as i64, offset as i64], db::row_to_welcome)
-            .map_err(into_welcome_err)?;
+            let mut welcomes: Vec<Welcome> = Vec::new();
 
-        let mut welcomes: Vec<Welcome> = Vec::new();
+            for welcome_result in welcomes_iter {
+                let welcome: Welcome = welcome_result.map_err(into_welcome_err)?;
+                welcomes.push(welcome);
+            }
 
-        for welcome_result in welcomes_iter {
-            let welcome: Welcome = welcome_result.map_err(into_welcome_err)?;
-            welcomes.push(welcome);
-        }
-
-        Ok(welcomes)
+            Ok(welcomes)
+        })
     }
 
     fn save_processed_welcome(
         &self,
         processed_welcome: ProcessedWelcome,
     ) -> Result<(), WelcomeError> {
-        let conn_guard = self.db_connection.lock().map_err(into_welcome_err)?;
-
         // Convert welcome_event_id to string if it exists
         let welcome_event_id: Option<&[u8; 32]> = processed_welcome
             .welcome_event_id
             .as_ref()
             .map(|id| id.as_bytes());
 
-        conn_guard
-            .execute(
+        self.with_connection(|conn| {
+            conn.execute(
                 "INSERT OR REPLACE INTO processed_welcomes
              (wrapper_event_id, welcome_event_id, processed_at, state, failure_reason)
              VALUES (?, ?, ?, ?, ?)",
@@ -176,27 +173,28 @@ impl WelcomeStorage for MdkSqliteStorage {
                     welcome_event_id,
                     processed_welcome.processed_at.as_u64(),
                     processed_welcome.state.as_str(),
-                    processed_welcome.failure_reason
+                    &processed_welcome.failure_reason
                 ],
             )
             .map_err(into_welcome_err)?;
 
-        Ok(())
+            Ok(())
+        })
     }
 
     fn find_processed_welcome_by_event_id(
         &self,
         event_id: &EventId,
     ) -> Result<Option<ProcessedWelcome>, WelcomeError> {
-        let conn_guard = self.db_connection.lock().map_err(into_welcome_err)?;
+        self.with_connection(|conn| {
+            let mut stmt = conn
+                .prepare("SELECT * FROM processed_welcomes WHERE wrapper_event_id = ?")
+                .map_err(into_welcome_err)?;
 
-        let mut stmt = conn_guard
-            .prepare("SELECT * FROM processed_welcomes WHERE wrapper_event_id = ?")
-            .map_err(into_welcome_err)?;
-
-        stmt.query_row(params![event_id.as_bytes()], db::row_to_processed_welcome)
-            .optional()
-            .map_err(into_welcome_err)
+            stmt.query_row(params![event_id.as_bytes()], db::row_to_processed_welcome)
+                .optional()
+                .map_err(into_welcome_err)
+        })
     }
 }
 

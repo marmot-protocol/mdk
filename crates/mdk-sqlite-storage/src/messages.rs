@@ -30,8 +30,6 @@ impl MessageStorage for MdkSqliteStorage {
         )
         .map_err(|e| MessageError::InvalidParameters(e.to_string()))?;
 
-        let conn_guard = self.db_connection.lock().map_err(into_message_err)?;
-
         // Serialize complex types to JSON
         let tags_json: String = serde_json::to_string(&message.tags)
             .map_err(|e| MessageError::DatabaseError(format!("Failed to serialize tags: {}", e)))?;
@@ -47,8 +45,8 @@ impl MessageStorage for MdkSqliteStorage {
         validate_size(event_json.as_bytes(), MAX_EVENT_JSON_SIZE, "Event JSON")
             .map_err(|e| MessageError::InvalidParameters(e.to_string()))?;
 
-        conn_guard
-            .execute(
+        self.with_connection(|conn| {
+            conn.execute(
                 "INSERT INTO messages
              (id, pubkey, kind, mls_group_id, created_at, content, tags, event, wrapper_event_id, state)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -67,16 +65,17 @@ impl MessageStorage for MdkSqliteStorage {
                     message.kind.as_u16(),
                     message.mls_group_id.as_slice(),
                     message.created_at.as_u64(),
-                    message.content,
-                    tags_json,
-                    event_json,
+                    &message.content,
+                    &tags_json,
+                    &event_json,
                     message.wrapper_event_id.as_bytes(),
                     message.state.as_str(),
                 ],
             )
             .map_err(into_message_err)?;
 
-        Ok(())
+            Ok(())
+        })
     }
 
     fn find_message_by_event_id(
@@ -84,34 +83,32 @@ impl MessageStorage for MdkSqliteStorage {
         mls_group_id: &mdk_storage_traits::GroupId,
         event_id: &EventId,
     ) -> Result<Option<Message>, MessageError> {
-        let conn_guard = self.db_connection.lock().map_err(into_message_err)?;
+        self.with_connection(|conn| {
+            let mut stmt = conn
+                .prepare("SELECT * FROM messages WHERE mls_group_id = ? AND id = ?")
+                .map_err(into_message_err)?;
 
-        let mut stmt = conn_guard
-            .prepare("SELECT * FROM messages WHERE mls_group_id = ? AND id = ?")
-            .map_err(into_message_err)?;
-
-        stmt.query_row(
-            params![mls_group_id.as_slice(), event_id.to_bytes()],
-            db::row_to_message,
-        )
-        .optional()
-        .map_err(into_message_err)
+            stmt.query_row(
+                params![mls_group_id.as_slice(), event_id.to_bytes()],
+                db::row_to_message,
+            )
+            .optional()
+            .map_err(into_message_err)
+        })
     }
 
     fn save_processed_message(
         &self,
         processed_message: ProcessedMessage,
     ) -> Result<(), MessageError> {
-        let conn_guard = self.db_connection.lock().map_err(into_message_err)?;
-
         // Convert message_event_id to string if it exists
         let message_event_id = processed_message
             .message_event_id
             .as_ref()
             .map(|id| id.to_bytes());
 
-        conn_guard
-            .execute(
+        self.with_connection(|conn| {
+            conn.execute(
                 "INSERT OR REPLACE INTO processed_messages
              (wrapper_event_id, message_event_id, processed_at, state, failure_reason)
              VALUES (?, ?, ?, ?, ?)",
@@ -125,22 +122,23 @@ impl MessageStorage for MdkSqliteStorage {
             )
             .map_err(into_message_err)?;
 
-        Ok(())
+            Ok(())
+        })
     }
 
     fn find_processed_message_by_event_id(
         &self,
         event_id: &EventId,
     ) -> Result<Option<ProcessedMessage>, MessageError> {
-        let conn_guard = self.db_connection.lock().map_err(into_message_err)?;
+        self.with_connection(|conn| {
+            let mut stmt = conn
+                .prepare("SELECT * FROM processed_messages WHERE wrapper_event_id = ?")
+                .map_err(into_message_err)?;
 
-        let mut stmt = conn_guard
-            .prepare("SELECT * FROM processed_messages WHERE wrapper_event_id = ?")
-            .map_err(into_message_err)?;
-
-        stmt.query_row(params![event_id.to_bytes()], db::row_to_processed_message)
-            .optional()
-            .map_err(into_message_err)
+            stmt.query_row(params![event_id.to_bytes()], db::row_to_processed_message)
+                .optional()
+                .map_err(into_message_err)
+        })
     }
 }
 
