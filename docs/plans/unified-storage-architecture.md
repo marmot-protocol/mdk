@@ -212,7 +212,7 @@ MdkMemoryStorage
    
    // After
    pub struct MdkSqliteStorage {
-       connection: Arc<Mutex<Connection>>,  // Single unified connection
+       connection: Arc<tokio::sync::Mutex<Connection>>,  // Single unified connection with async-aware mutex
    }
    ```
 
@@ -705,7 +705,7 @@ We use a single SQLite connection wrapped in `Arc<Mutex<Connection>>` rather tha
 
 For async compatibility:
 - Enable **WAL mode** for better concurrent read performance
-- Use `spawn_blocking` or an async-aware mutex for SQLite operations to avoid blocking the async runtime
+- Use an **async-aware mutex** (e.g., `tokio::sync::Mutex`) for SQLite operations to avoid blocking the async runtime
 
 ---
 
