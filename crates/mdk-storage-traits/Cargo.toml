@@ -22,9 +22,12 @@ openmls.workspace = true
 openmls_traits.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true, features = ["std"] }
+thiserror.workspace = true
 zeroize = { workspace = true, features = ["zeroize_derive"] }
 
-[dev-dependencies]
-mdk-sqlite-storage.workspace = true
-mdk-memory-storage.workspace = true
-openmls_memory_storage.workspace = true
+# Dev-dependencies temporarily commented out during Phase 1 of unified storage migration
+# These will be re-enabled once Phase 2 (mdk-sqlite-storage) and Phase 3 (mdk-memory-storage) are complete
+# [dev-dependencies]
+# mdk-sqlite-storage.workspace = true
+# mdk-memory-storage.workspace = true
+# openmls_memory_storage.workspace = true

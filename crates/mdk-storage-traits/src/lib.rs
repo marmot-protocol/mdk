@@ -7,6 +7,7 @@
 
 use openmls_traits::storage::StorageProvider;
 
+pub mod error;
 pub mod group_id;
 pub mod groups;
 pub mod messages;
@@ -18,6 +19,7 @@ pub mod test_utils;
 pub mod welcomes;
 
 // Re-export GroupId for convenience
+pub use error::MdkStorageError;
 pub use group_id::GroupId;
 pub use secret::{Secret, Zeroize};
 
@@ -45,37 +47,26 @@ impl Backend {
     }
 }
 
-/// Storage provider for the Nostr MLS storage
-pub trait MdkStorageProvider: GroupStorage + MessageStorage + WelcomeStorage {
-    /// The OpenMLS storage provider
-    type OpenMlsStorageProvider: StorageProvider<CURRENT_VERSION>;
-
+/// Storage provider for the Nostr MLS storage.
+///
+/// This trait combines all MDK storage requirements with the OpenMLS
+/// `StorageProvider` trait, enabling unified storage implementations
+/// that can atomically manage both MLS state and MDK-specific data.
+///
+/// Implementors must provide:
+/// - Group storage for MLS group metadata and relays
+/// - Message storage for encrypted messages
+/// - Welcome storage for pending welcome messages
+/// - Full OpenMLS `StorageProvider<1>` implementation for MLS cryptographic state
+pub trait MdkStorageProvider:
+    GroupStorage + MessageStorage + WelcomeStorage + StorageProvider<CURRENT_VERSION>
+{
     /// Returns the backend type.
     ///
     /// # Returns
     ///
-    /// [`Backend::Memory`] indicating this is a memory-based storage implementation.
+    /// The storage backend type (e.g., [`Backend::Memory`] or [`Backend::SQLite`]).
     fn backend(&self) -> Backend;
-
-    /// Get a reference to the openmls storage provider.
-    ///
-    /// This method provides access to the underlying OpenMLS storage provider.
-    /// This is primarily useful for internal operations and testing.
-    ///
-    /// # Returns
-    ///
-    /// A reference to the openmls storage implementation.
-    fn openmls_storage(&self) -> &Self::OpenMlsStorageProvider;
-
-    /// Get a mutable reference to the openmls storage provider.
-    ///
-    /// This method provides mutable access to the underlying OpenMLS storage provider.
-    /// This is primarily useful for internal operations and testing.
-    ///
-    /// # Returns
-    ///
-    /// A mutable reference to the openmls storage implementation.
-    fn openmls_storage_mut(&mut self) -> &mut Self::OpenMlsStorageProvider;
 }
 
 #[cfg(test)]
