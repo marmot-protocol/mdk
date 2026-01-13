@@ -2305,4 +2305,619 @@ mod tests {
             assert!(result.is_err());
         }
     }
+
+    // ========================================
+    // Transaction/Savepoint Tests (Phase 5)
+    // ========================================
+
+    mod savepoint_tests {
+        use mdk_storage_traits::groups::GroupStorage;
+        use mdk_storage_traits::test_utils::cross_storage::create_test_group;
+
+        use super::*;
+
+        #[test]
+        fn test_savepoint_creation_succeeds() {
+            let storage = MdkSqliteStorage::new_in_memory().unwrap();
+
+            // Create a savepoint
+            let result = storage.savepoint("test_sp");
+            assert!(result.is_ok());
+
+            // Clean up by releasing
+            let result = storage.release_savepoint("test_sp");
+            assert!(result.is_ok());
+        }
+
+        #[test]
+        fn test_rollback_to_savepoint_restores_state() {
+            let storage = MdkSqliteStorage::new_in_memory().unwrap();
+
+            // Create and save initial group
+            let mls_group_id = GroupId::from_slice(&[1, 2, 3, 4]);
+            let mut group = create_test_group(mls_group_id.clone());
+            group.name = "Original Name".to_string();
+            group.epoch = 1;
+            storage.save_group(group.clone()).unwrap();
+
+            // Verify initial state
+            let initial_group = storage
+                .find_group_by_mls_group_id(&mls_group_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(initial_group.name, "Original Name");
+            assert_eq!(initial_group.epoch, 1);
+
+            // Create a savepoint
+            storage.savepoint("before_modification").unwrap();
+
+            // Modify the group
+            let mut modified_group = group.clone();
+            modified_group.name = "Modified Name".to_string();
+            modified_group.epoch = 5;
+            storage.save_group(modified_group).unwrap();
+
+            // Verify modification
+            let after_mod = storage
+                .find_group_by_mls_group_id(&mls_group_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(after_mod.name, "Modified Name");
+            assert_eq!(after_mod.epoch, 5);
+
+            // Rollback to savepoint
+            storage
+                .rollback_to_savepoint("before_modification")
+                .unwrap();
+
+            // Verify original state is restored
+            let after_rollback = storage
+                .find_group_by_mls_group_id(&mls_group_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(after_rollback.name, "Original Name");
+            assert_eq!(after_rollback.epoch, 1);
+
+            // Release the savepoint
+            storage.release_savepoint("before_modification").unwrap();
+        }
+
+        #[test]
+        fn test_release_savepoint_commits_changes() {
+            let storage = MdkSqliteStorage::new_in_memory().unwrap();
+
+            // Create initial group
+            let mls_group_id = GroupId::from_slice(&[5, 6, 7, 8]);
+            let mut group = create_test_group(mls_group_id.clone());
+            group.name = "Initial".to_string();
+            storage.save_group(group.clone()).unwrap();
+
+            // Create savepoint
+            storage.savepoint("commit_test").unwrap();
+
+            // Modify the group
+            let mut modified = group.clone();
+            modified.name = "Committed Changes".to_string();
+            storage.save_group(modified).unwrap();
+
+            // Release savepoint (commit changes)
+            storage.release_savepoint("commit_test").unwrap();
+
+            // Verify changes are still there after release
+            let result = storage
+                .find_group_by_mls_group_id(&mls_group_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(result.name, "Committed Changes");
+        }
+
+        #[test]
+        fn test_nested_savepoints() {
+            let storage = MdkSqliteStorage::new_in_memory().unwrap();
+
+            // Create a group
+            let mls_group_id = GroupId::from_slice(&[9, 10, 11, 12]);
+            let mut group = create_test_group(mls_group_id.clone());
+            group.name = "Level 0".to_string();
+            storage.save_group(group.clone()).unwrap();
+
+            // First savepoint
+            storage.savepoint("level1").unwrap();
+
+            // Modify to level 1
+            let mut level1_group = group.clone();
+            level1_group.name = "Level 1".to_string();
+            storage.save_group(level1_group.clone()).unwrap();
+
+            // Second nested savepoint
+            storage.savepoint("level2").unwrap();
+
+            // Modify to level 2
+            let mut level2_group = level1_group.clone();
+            level2_group.name = "Level 2".to_string();
+            storage.save_group(level2_group).unwrap();
+
+            // Verify we're at level 2
+            let current = storage
+                .find_group_by_mls_group_id(&mls_group_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(current.name, "Level 2");
+
+            // Rollback to level 2 savepoint (back to level 1)
+            storage.rollback_to_savepoint("level2").unwrap();
+
+            // Verify we're at level 1
+            let after_rollback = storage
+                .find_group_by_mls_group_id(&mls_group_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(after_rollback.name, "Level 1");
+
+            // Release level 2 savepoint
+            storage.release_savepoint("level2").unwrap();
+
+            // Rollback to level 1 savepoint (back to level 0)
+            storage.rollback_to_savepoint("level1").unwrap();
+
+            // Verify we're at level 0
+            let final_state = storage
+                .find_group_by_mls_group_id(&mls_group_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(final_state.name, "Level 0");
+
+            // Clean up
+            storage.release_savepoint("level1").unwrap();
+        }
+
+        #[test]
+        fn test_savepoint_with_new_group_rollback() {
+            let storage = MdkSqliteStorage::new_in_memory().unwrap();
+
+            // Verify group doesn't exist
+            let mls_group_id = GroupId::from_slice(&[13, 14, 15, 16]);
+            let before = storage.find_group_by_mls_group_id(&mls_group_id).unwrap();
+            assert!(before.is_none());
+
+            // Create savepoint
+            storage.savepoint("before_insert").unwrap();
+
+            // Insert a new group
+            let group = create_test_group(mls_group_id.clone());
+            storage.save_group(group).unwrap();
+
+            // Verify group exists
+            let after_insert = storage.find_group_by_mls_group_id(&mls_group_id).unwrap();
+            assert!(after_insert.is_some());
+
+            // Rollback
+            storage.rollback_to_savepoint("before_insert").unwrap();
+
+            // Verify group no longer exists
+            let after_rollback = storage.find_group_by_mls_group_id(&mls_group_id).unwrap();
+            assert!(after_rollback.is_none());
+
+            // Clean up
+            storage.release_savepoint("before_insert").unwrap();
+        }
+
+        #[test]
+        fn test_savepoint_with_multiple_modifications_rollback() {
+            let storage = MdkSqliteStorage::new_in_memory().unwrap();
+
+            // Create and save a group
+            let mls_group_id = GroupId::from_slice(&[17, 18, 19, 20]);
+            let mut group = create_test_group(mls_group_id.clone());
+            group.name = "Original".to_string();
+            group.epoch = 1;
+            storage.save_group(group.clone()).unwrap();
+
+            // Verify group exists with original values
+            let exists = storage
+                .find_group_by_mls_group_id(&mls_group_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(exists.name, "Original");
+            assert_eq!(exists.epoch, 1);
+
+            // Create savepoint
+            storage.savepoint("before_modifications").unwrap();
+
+            // Make multiple modifications
+            let mut modified1 = group.clone();
+            modified1.name = "Modified Once".to_string();
+            modified1.epoch = 10;
+            storage.save_group(modified1).unwrap();
+
+            let mut modified2 = group.clone();
+            modified2.name = "Modified Twice".to_string();
+            modified2.epoch = 20;
+            storage.save_group(modified2).unwrap();
+
+            // Verify final modification
+            let after_mods = storage
+                .find_group_by_mls_group_id(&mls_group_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(after_mods.name, "Modified Twice");
+            assert_eq!(after_mods.epoch, 20);
+
+            // Rollback
+            storage
+                .rollback_to_savepoint("before_modifications")
+                .unwrap();
+
+            // Verify original values are restored
+            let after_rollback = storage
+                .find_group_by_mls_group_id(&mls_group_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(after_rollback.name, "Original");
+            assert_eq!(after_rollback.epoch, 1);
+
+            // Clean up
+            storage.release_savepoint("before_modifications").unwrap();
+        }
+    }
+
+    // ========================================
+    // Migration Tests (Phase 5)
+    // ========================================
+
+    mod migration_tests {
+        use super::*;
+
+        #[test]
+        fn test_fresh_database_has_all_tables() {
+            let storage = MdkSqliteStorage::new_in_memory().unwrap();
+
+            // Expected MDK tables
+            let expected_mdk_tables = [
+                "groups",
+                "group_relays",
+                "group_exporter_secrets",
+                "messages",
+                "processed_messages",
+                "welcomes",
+                "processed_welcomes",
+            ];
+
+            // Expected OpenMLS tables
+            let expected_openmls_tables = [
+                "openmls_group_data",
+                "openmls_proposals",
+                "openmls_own_leaf_nodes",
+                "openmls_key_packages",
+                "openmls_psks",
+                "openmls_signature_keys",
+                "openmls_encryption_keys",
+                "openmls_epoch_key_pairs",
+            ];
+
+            storage.with_connection(|conn| {
+                // Get all table names
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
+                    )
+                    .unwrap();
+                let table_names: Vec<String> = stmt
+                    .query_map([], |row| row.get(0))
+                    .unwrap()
+                    .map(|r| r.unwrap())
+                    .collect();
+
+                // Check MDK tables
+                for table in &expected_mdk_tables {
+                    assert!(
+                        table_names.contains(&table.to_string()),
+                        "Missing MDK table: {}",
+                        table
+                    );
+                }
+
+                // Check OpenMLS tables
+                for table in &expected_openmls_tables {
+                    assert!(
+                        table_names.contains(&table.to_string()),
+                        "Missing OpenMLS table: {}",
+                        table
+                    );
+                }
+            });
+        }
+
+        #[test]
+        fn test_all_indexes_exist() {
+            let storage = MdkSqliteStorage::new_in_memory().unwrap();
+
+            // Expected indexes (actual names from schema)
+            let expected_indexes = [
+                "idx_groups_nostr_group_id",
+                "idx_group_relays_mls_group_id",
+                "idx_group_exporter_secrets_mls_group_id",
+                "idx_messages_mls_group_id",
+                "idx_messages_wrapper_event_id",
+                "idx_messages_created_at",
+                "idx_messages_pubkey",
+                "idx_messages_kind",
+                "idx_messages_state",
+                "idx_processed_messages_message_event_id",
+                "idx_processed_messages_state",
+                "idx_processed_messages_processed_at",
+                "idx_welcomes_mls_group_id",
+                "idx_welcomes_wrapper_event_id",
+                "idx_welcomes_state",
+                "idx_welcomes_nostr_group_id",
+                "idx_processed_welcomes_welcome_event_id",
+                "idx_processed_welcomes_state",
+                "idx_processed_welcomes_processed_at",
+            ];
+
+            storage.with_connection(|conn| {
+                let mut stmt = conn
+                    .prepare("SELECT name FROM sqlite_master WHERE type='index' AND name NOT LIKE 'sqlite_%'")
+                    .unwrap();
+                let index_names: Vec<String> = stmt
+                    .query_map([], |row| row.get(0))
+                    .unwrap()
+                    .map(|r| r.unwrap())
+                    .collect();
+
+                for idx in &expected_indexes {
+                    assert!(
+                        index_names.contains(&idx.to_string()),
+                        "Missing index: {}. Found indexes: {:?}",
+                        idx,
+                        index_names
+                    );
+                }
+            });
+        }
+
+        #[test]
+        fn test_foreign_key_constraints_work() {
+            let storage = MdkSqliteStorage::new_in_memory().unwrap();
+
+            storage.with_connection(|conn| {
+                // Verify foreign keys are enabled
+                let fk_enabled: i32 = conn
+                    .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+                    .unwrap();
+                assert_eq!(fk_enabled, 1, "Foreign keys should be enabled");
+
+                // Try to insert a group_relay without a group (should fail)
+                let result = conn.execute(
+                    "INSERT INTO group_relays (mls_group_id, relay_url) VALUES (?, ?)",
+                    rusqlite::params![vec![1u8, 2u8, 3u8, 4u8], "wss://relay.example.com"],
+                );
+                assert!(result.is_err(), "Should fail due to foreign key constraint");
+            });
+        }
+
+        #[test]
+        fn test_openmls_group_data_check_constraint() {
+            let storage = MdkSqliteStorage::new_in_memory().unwrap();
+
+            storage.with_connection(|conn| {
+                // Valid data_type should succeed
+                let valid_result = conn.execute(
+                    "INSERT INTO openmls_group_data (provider_version, group_id, data_type, group_data) VALUES (?, ?, ?, ?)",
+                    rusqlite::params![1, vec![1u8, 2u8, 3u8], "tree", vec![4u8, 5u8, 6u8]],
+                );
+                assert!(valid_result.is_ok(), "Valid data_type should succeed");
+
+                // Invalid data_type should fail
+                let invalid_result = conn.execute(
+                    "INSERT INTO openmls_group_data (provider_version, group_id, data_type, group_data) VALUES (?, ?, ?, ?)",
+                    rusqlite::params![1, vec![7u8, 8u8, 9u8], "invalid_type", vec![10u8, 11u8]],
+                );
+                assert!(
+                    invalid_result.is_err(),
+                    "Invalid data_type should fail CHECK constraint"
+                );
+            });
+        }
+
+        #[test]
+        fn test_schema_matches_plan_specification() {
+            let storage = MdkSqliteStorage::new_in_memory().unwrap();
+
+            storage.with_connection(|conn| {
+                // Check groups table has all required columns
+                let groups_info: Vec<(String, String)> = conn
+                    .prepare("PRAGMA table_info(groups)")
+                    .unwrap()
+                    .query_map([], |row| Ok((row.get(1)?, row.get(2)?)))
+                    .unwrap()
+                    .map(|r| r.unwrap())
+                    .collect();
+
+                let groups_columns: Vec<&str> =
+                    groups_info.iter().map(|(n, _)| n.as_str()).collect();
+                assert!(groups_columns.contains(&"mls_group_id"));
+                assert!(groups_columns.contains(&"nostr_group_id"));
+                assert!(groups_columns.contains(&"name"));
+                assert!(groups_columns.contains(&"description"));
+                assert!(groups_columns.contains(&"admin_pubkeys"));
+                assert!(groups_columns.contains(&"epoch"));
+                assert!(groups_columns.contains(&"state"));
+
+                // Check messages table has all required columns
+                let messages_info: Vec<String> = conn
+                    .prepare("PRAGMA table_info(messages)")
+                    .unwrap()
+                    .query_map([], |row| row.get(1))
+                    .unwrap()
+                    .map(|r| r.unwrap())
+                    .collect();
+
+                assert!(messages_info.contains(&"mls_group_id".to_string()));
+                assert!(messages_info.contains(&"id".to_string()));
+                assert!(messages_info.contains(&"pubkey".to_string()));
+                assert!(messages_info.contains(&"kind".to_string()));
+                assert!(messages_info.contains(&"created_at".to_string()));
+                assert!(messages_info.contains(&"content".to_string()));
+                assert!(messages_info.contains(&"wrapper_event_id".to_string()));
+            });
+        }
+    }
+
+    // ========================================
+    // Cross-Storage Atomicity Tests (Phase 5)
+    // ========================================
+
+    mod atomicity_tests {
+        use mdk_storage_traits::groups::GroupStorage;
+        use mdk_storage_traits::messages::MessageStorage;
+        use mdk_storage_traits::test_utils::cross_storage::{
+            create_test_group, create_test_message,
+        };
+        use nostr::EventId;
+
+        use super::*;
+
+        #[test]
+        fn test_mdk_operations_in_single_transaction_rollback() {
+            let storage = MdkSqliteStorage::new_in_memory().unwrap();
+
+            // Create a group first
+            let mls_group_id = GroupId::from_slice(&[1, 2, 3, 4]);
+            let group = create_test_group(mls_group_id.clone());
+            storage.save_group(group).unwrap();
+
+            // Create savepoint
+            storage.savepoint("mdk_atomic").unwrap();
+
+            // Save a message
+            let event_id = EventId::all_zeros();
+            let message = create_test_message(mls_group_id.clone(), event_id);
+            storage.save_message(message).unwrap();
+
+            // Verify message exists
+            let messages = storage.messages(&mls_group_id, None).unwrap();
+            assert_eq!(messages.len(), 1);
+
+            // Rollback
+            storage.rollback_to_savepoint("mdk_atomic").unwrap();
+
+            // Verify message is gone
+            let messages_after = storage.messages(&mls_group_id, None).unwrap();
+            assert_eq!(messages_after.len(), 0);
+
+            // Release savepoint
+            storage.release_savepoint("mdk_atomic").unwrap();
+        }
+
+        #[test]
+        fn test_group_atomic_rollback() {
+            let storage = MdkSqliteStorage::new_in_memory().unwrap();
+
+            // Create savepoint before anything
+            storage.savepoint("atomic_group").unwrap();
+
+            // Create group
+            let mls_group_id = GroupId::from_slice(&[5, 6, 7, 8]);
+            let group = create_test_group(mls_group_id.clone());
+            storage.save_group(group).unwrap();
+
+            // Verify group exists
+            let found_group = storage.find_group_by_mls_group_id(&mls_group_id).unwrap();
+            assert!(found_group.is_some());
+
+            // Rollback
+            storage.rollback_to_savepoint("atomic_group").unwrap();
+
+            // Verify group is gone
+            let after_group = storage.find_group_by_mls_group_id(&mls_group_id).unwrap();
+            assert!(after_group.is_none());
+
+            // Release savepoint
+            storage.release_savepoint("atomic_group").unwrap();
+        }
+
+        #[test]
+        fn test_exporter_secrets_atomic_rollback() {
+            let storage = MdkSqliteStorage::new_in_memory().unwrap();
+
+            // Create group first
+            let mls_group_id = GroupId::from_slice(&[6, 7, 8, 9]);
+            let group = create_test_group(mls_group_id.clone());
+            storage.save_group(group).unwrap();
+
+            // Create savepoint
+            storage.savepoint("atomic_secrets").unwrap();
+
+            // Add exporter secrets
+            let secret = mdk_storage_traits::groups::types::GroupExporterSecret {
+                mls_group_id: mls_group_id.clone(),
+                epoch: 1,
+                secret: mdk_storage_traits::Secret::new([1u8; 32]),
+            };
+            storage.save_group_exporter_secret(secret.clone()).unwrap();
+
+            // Verify secret exists
+            let found = storage.get_group_exporter_secret(&mls_group_id, 1).unwrap();
+            assert!(found.is_some());
+
+            // Rollback
+            storage.rollback_to_savepoint("atomic_secrets").unwrap();
+
+            // Verify secret is gone
+            let after = storage.get_group_exporter_secret(&mls_group_id, 1).unwrap();
+            assert!(after.is_none());
+
+            // Release savepoint
+            storage.release_savepoint("atomic_secrets").unwrap();
+        }
+
+        #[test]
+        fn test_partial_failure_rollback() {
+            let storage = MdkSqliteStorage::new_in_memory().unwrap();
+
+            // Create two groups
+            let group_id_1 = GroupId::from_slice(&[1, 1, 1, 1]);
+            let group_id_2 = GroupId::from_slice(&[2, 2, 2, 2]);
+
+            let group1 = create_test_group(group_id_1.clone());
+            storage.save_group(group1).unwrap();
+
+            // Create savepoint
+            storage.savepoint("partial_test").unwrap();
+
+            // Save second group
+            let group2 = create_test_group(group_id_2.clone());
+            storage.save_group(group2).unwrap();
+
+            // Add message to first group
+            let event_id = EventId::all_zeros();
+            let message = create_test_message(group_id_1.clone(), event_id);
+            storage.save_message(message).unwrap();
+
+            // Verify both changes
+            let groups = storage.all_groups().unwrap();
+            assert_eq!(groups.len(), 2);
+            let messages = storage.messages(&group_id_1, None).unwrap();
+            assert_eq!(messages.len(), 1);
+
+            // Rollback - simulating a failure after partial operations
+            storage.rollback_to_savepoint("partial_test").unwrap();
+
+            // Verify only first group remains, no new group, no messages
+            let groups_after = storage.all_groups().unwrap();
+            assert_eq!(groups_after.len(), 1);
+            assert!(
+                storage
+                    .find_group_by_mls_group_id(&group_id_2)
+                    .unwrap()
+                    .is_none()
+            );
+            let messages_after = storage.messages(&group_id_1, None).unwrap();
+            assert_eq!(messages_after.len(), 0);
+
+            // Release savepoint
+            storage.release_savepoint("partial_test").unwrap();
+        }
+    }
 }

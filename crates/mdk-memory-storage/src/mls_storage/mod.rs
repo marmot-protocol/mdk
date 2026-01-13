@@ -4,6 +4,10 @@
 //! directly on `MdkMemoryStorage`, enabling unified storage for both MLS
 //! cryptographic state and MDK-specific data within a single storage structure.
 
+// Allow complex types for MLS storage structures - these maps require compound keys
+// for proper data organization and the complexity is inherent to the domain.
+#![allow(clippy::type_complexity)]
+
 pub mod codec;
 
 use std::collections::HashMap;

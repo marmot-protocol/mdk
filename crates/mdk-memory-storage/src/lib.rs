@@ -241,7 +241,8 @@ impl MdkMemoryStorage {
         self.mls_own_leaf_nodes
             .restore_data(snapshot.mls_own_leaf_nodes);
         self.mls_proposals.restore_data(snapshot.mls_proposals);
-        self.mls_key_packages.restore_data(snapshot.mls_key_packages);
+        self.mls_key_packages
+            .restore_data(snapshot.mls_key_packages);
         self.mls_psks.restore_data(snapshot.mls_psks);
         self.mls_signature_keys
             .restore_data(snapshot.mls_signature_keys);
@@ -251,7 +252,9 @@ impl MdkMemoryStorage {
             .restore_data(snapshot.mls_epoch_key_pairs);
 
         // Restore MDK data
-        snapshot.groups.restore_to_lru(&mut self.groups_cache.write());
+        snapshot
+            .groups
+            .restore_to_lru(&mut self.groups_cache.write());
         snapshot
             .groups_by_nostr_id
             .restore_to_lru(&mut self.groups_by_nostr_id_cache.write());
@@ -768,8 +771,7 @@ impl StorageProvider<STORAGE_PROVIDER_VERSION> for MdkMemoryStorage {
         &self,
         group_id: &GroupId,
     ) -> Result<(), Self::Error> {
-        self.mls_group_data
-            .delete(group_id, GroupDataType::Context)
+        self.mls_group_data.delete(group_id, GroupDataType::Context)
     }
 
     fn delete_interim_transcript_hash<GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>>(
@@ -1781,5 +1783,482 @@ mod tests {
         let messages_after = storage.messages(&mls_group_id, None).unwrap();
         assert_eq!(messages_after.len(), 1);
         assert_eq!(messages_after[0].content, "Original message");
+    }
+
+    // ========================================
+    // Additional Snapshot/Rollback Tests (Phase 5)
+    // ========================================
+
+    #[test]
+    fn test_snapshot_with_new_group_rollback() {
+        let storage = MdkMemoryStorage::default();
+
+        // Verify group doesn't exist
+        let mls_group_id = GroupId::from_slice(&[13, 14, 15, 16]);
+        let before = storage.find_group_by_mls_group_id(&mls_group_id).unwrap();
+        assert!(before.is_none());
+
+        // Create a snapshot
+        let snapshot = storage.create_snapshot();
+
+        // Insert a new group
+        let nostr_group_id = generate_random_bytes(32).try_into().unwrap();
+        let group = Group {
+            mls_group_id: mls_group_id.clone(),
+            nostr_group_id,
+            name: "New Group".to_string(),
+            description: "A new group".to_string(),
+            admin_pubkeys: BTreeSet::new(),
+            last_message_id: None,
+            last_message_at: None,
+            epoch: 0,
+            state: GroupState::Active,
+            image_hash: None,
+            image_key: None,
+            image_nonce: None,
+        };
+        storage.save_group(group).unwrap();
+
+        // Verify group exists
+        let after_insert = storage.find_group_by_mls_group_id(&mls_group_id).unwrap();
+        assert!(after_insert.is_some());
+
+        // Restore snapshot (rollback)
+        storage.restore_snapshot(snapshot);
+
+        // Verify group no longer exists
+        let after_rollback = storage.find_group_by_mls_group_id(&mls_group_id).unwrap();
+        assert!(after_rollback.is_none());
+    }
+
+    #[test]
+    fn test_snapshot_with_multiple_modifications_rollback() {
+        let storage = MdkMemoryStorage::default();
+
+        // Create and save a group
+        let mls_group_id = GroupId::from_slice(&[17, 18, 19, 20]);
+        let nostr_group_id = generate_random_bytes(32).try_into().unwrap();
+        let group = Group {
+            mls_group_id: mls_group_id.clone(),
+            nostr_group_id,
+            name: "Original Name".to_string(),
+            description: "A group for testing modification rollback".to_string(),
+            admin_pubkeys: BTreeSet::new(),
+            last_message_id: None,
+            last_message_at: None,
+            epoch: 1,
+            state: GroupState::Active,
+            image_hash: None,
+            image_key: None,
+            image_nonce: None,
+        };
+        storage.save_group(group.clone()).unwrap();
+
+        // Verify group exists with original values
+        let exists = storage
+            .find_group_by_mls_group_id(&mls_group_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(exists.name, "Original Name");
+        assert_eq!(exists.epoch, 1);
+
+        // Create snapshot
+        let snapshot = storage.create_snapshot();
+
+        // Make multiple modifications
+        let modified1 = Group {
+            name: "Modified Once".to_string(),
+            epoch: 10,
+            ..group.clone()
+        };
+        storage.save_group(modified1).unwrap();
+
+        let modified2 = Group {
+            name: "Modified Twice".to_string(),
+            epoch: 20,
+            ..group.clone()
+        };
+        storage.save_group(modified2).unwrap();
+
+        // Verify final modification
+        let after_mods = storage
+            .find_group_by_mls_group_id(&mls_group_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(after_mods.name, "Modified Twice");
+        assert_eq!(after_mods.epoch, 20);
+
+        // Restore snapshot (rollback)
+        storage.restore_snapshot(snapshot);
+
+        // Verify original values are restored
+        let after_rollback = storage
+            .find_group_by_mls_group_id(&mls_group_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(after_rollback.name, "Original Name");
+        assert_eq!(after_rollback.epoch, 1);
+    }
+
+    #[test]
+    fn test_snapshot_with_relays_rollback() {
+        let storage = MdkMemoryStorage::default();
+
+        // Create a group
+        let mls_group_id = GroupId::from_slice(&[21, 22, 23, 24]);
+        let nostr_group_id = generate_random_bytes(32).try_into().unwrap();
+        let group = Group {
+            mls_group_id: mls_group_id.clone(),
+            nostr_group_id,
+            name: "Relay Test Group".to_string(),
+            description: "A group for testing relay rollback".to_string(),
+            admin_pubkeys: BTreeSet::new(),
+            last_message_id: None,
+            last_message_at: None,
+            epoch: 0,
+            state: GroupState::Active,
+            image_hash: None,
+            image_key: None,
+            image_nonce: None,
+        };
+        storage.save_group(group).unwrap();
+
+        // Add initial relay
+        let relay1 = RelayUrl::parse("wss://relay1.example.com").unwrap();
+        storage
+            .replace_group_relays(&mls_group_id, BTreeSet::from([relay1.clone()]))
+            .unwrap();
+
+        // Create snapshot
+        let snapshot = storage.create_snapshot();
+
+        // Add more relays
+        let relay2 = RelayUrl::parse("wss://relay2.example.com").unwrap();
+        storage
+            .replace_group_relays(&mls_group_id, BTreeSet::from([relay1.clone(), relay2]))
+            .unwrap();
+
+        // Verify two relays
+        let relays_before = storage.group_relays(&mls_group_id).unwrap();
+        assert_eq!(relays_before.len(), 2);
+
+        // Restore snapshot
+        storage.restore_snapshot(snapshot);
+
+        // Verify back to one relay
+        let relays_after = storage.group_relays(&mls_group_id).unwrap();
+        assert_eq!(relays_after.len(), 1);
+    }
+
+    #[test]
+    fn test_snapshot_with_exporter_secrets_rollback() {
+        let storage = MdkMemoryStorage::default();
+
+        // Create a group
+        let mls_group_id = GroupId::from_slice(&[25, 26, 27, 28]);
+        let nostr_group_id = generate_random_bytes(32).try_into().unwrap();
+        let group = Group {
+            mls_group_id: mls_group_id.clone(),
+            nostr_group_id,
+            name: "Secret Test Group".to_string(),
+            description: "A group for testing secret rollback".to_string(),
+            admin_pubkeys: BTreeSet::new(),
+            last_message_id: None,
+            last_message_at: None,
+            epoch: 0,
+            state: GroupState::Active,
+            image_hash: None,
+            image_key: None,
+            image_nonce: None,
+        };
+        storage.save_group(group).unwrap();
+
+        // Add epoch 0 secret
+        let secret_0 = GroupExporterSecret {
+            mls_group_id: mls_group_id.clone(),
+            epoch: 0,
+            secret: Secret::new([1u8; 32]),
+        };
+        storage
+            .save_group_exporter_secret(secret_0.clone())
+            .unwrap();
+
+        // Create snapshot
+        let snapshot = storage.create_snapshot();
+
+        // Add epoch 1 secret
+        let secret_1 = GroupExporterSecret {
+            mls_group_id: mls_group_id.clone(),
+            epoch: 1,
+            secret: Secret::new([2u8; 32]),
+        };
+        storage
+            .save_group_exporter_secret(secret_1.clone())
+            .unwrap();
+
+        // Verify epoch 1 secret exists
+        let found_1 = storage.get_group_exporter_secret(&mls_group_id, 1).unwrap();
+        assert!(found_1.is_some());
+
+        // Restore snapshot
+        storage.restore_snapshot(snapshot);
+
+        // Verify epoch 1 secret is gone
+        let after_rollback = storage.get_group_exporter_secret(&mls_group_id, 1).unwrap();
+        assert!(after_rollback.is_none());
+
+        // Verify epoch 0 secret still exists
+        let epoch_0_exists = storage.get_group_exporter_secret(&mls_group_id, 0).unwrap();
+        assert!(epoch_0_exists.is_some());
+    }
+
+    #[test]
+    fn test_snapshot_with_welcomes_rollback() {
+        let storage = MdkMemoryStorage::default();
+
+        // Create snapshot before any welcomes
+        let snapshot = storage.create_snapshot();
+
+        // Create a welcome
+        let event_id = EventId::all_zeros();
+        let wrapper_id = EventId::all_zeros();
+        let mls_group_id = GroupId::from_slice(&[29, 30, 31, 32]);
+        let nostr_group_id = generate_random_bytes(32).try_into().unwrap();
+        let pubkey =
+            PublicKey::from_hex("aabbccddeeffaabbccddeeffaabbccddeeffaabbccddeeffaabbccddeeffaabb")
+                .unwrap();
+
+        let welcome = Welcome {
+            id: event_id,
+            event: UnsignedEvent::new(
+                pubkey,
+                Timestamp::now(),
+                Kind::MlsWelcome,
+                Tags::new(),
+                "test".to_string(),
+            ),
+            mls_group_id: mls_group_id.clone(),
+            nostr_group_id,
+            group_name: "Welcome Test Group".to_string(),
+            group_description: "A test welcome group".to_string(),
+            group_image_key: None,
+            group_image_hash: None,
+            group_image_nonce: None,
+            group_admin_pubkeys: BTreeSet::from([pubkey]),
+            group_relays: BTreeSet::from([RelayUrl::parse("wss://relay.example.com").unwrap()]),
+            welcomer: pubkey,
+            member_count: 2,
+            state: WelcomeState::Pending,
+            wrapper_event_id: wrapper_id,
+        };
+        storage.save_welcome(welcome).unwrap();
+
+        // Verify welcome exists
+        let found = storage.find_welcome_by_event_id(&event_id).unwrap();
+        assert!(found.is_some());
+
+        // Restore snapshot
+        storage.restore_snapshot(snapshot);
+
+        // Verify welcome is gone
+        let after_rollback = storage.find_welcome_by_event_id(&event_id).unwrap();
+        assert!(after_rollback.is_none());
+    }
+
+    #[test]
+    fn test_snapshot_multiple_operations_rollback() {
+        let storage = MdkMemoryStorage::default();
+
+        // Create initial state with one group
+        let mls_group_id_1 = GroupId::from_slice(&[33, 34, 35, 36]);
+        let nostr_group_id_1 = generate_random_bytes(32).try_into().unwrap();
+        let group1 = Group {
+            mls_group_id: mls_group_id_1.clone(),
+            nostr_group_id: nostr_group_id_1,
+            name: "Group 1".to_string(),
+            description: "First group".to_string(),
+            admin_pubkeys: BTreeSet::new(),
+            last_message_id: None,
+            last_message_at: None,
+            epoch: 0,
+            state: GroupState::Active,
+            image_hash: None,
+            image_key: None,
+            image_nonce: None,
+        };
+        storage.save_group(group1).unwrap();
+
+        // Create snapshot
+        let snapshot = storage.create_snapshot();
+
+        // Perform multiple operations:
+        // 1. Create second group
+        let mls_group_id_2 = GroupId::from_slice(&[37, 38, 39, 40]);
+        let nostr_group_id_2 = generate_random_bytes(32).try_into().unwrap();
+        let group2 = Group {
+            mls_group_id: mls_group_id_2.clone(),
+            nostr_group_id: nostr_group_id_2,
+            name: "Group 2".to_string(),
+            description: "Second group".to_string(),
+            admin_pubkeys: BTreeSet::new(),
+            last_message_id: None,
+            last_message_at: None,
+            epoch: 0,
+            state: GroupState::Active,
+            image_hash: None,
+            image_key: None,
+            image_nonce: None,
+        };
+        storage.save_group(group2).unwrap();
+
+        // 2. Add message to first group
+        let pubkey =
+            PublicKey::from_hex("aabbccddeeffaabbccddeeffaabbccddeeffaabbccddeeffaabbccddeeffaabb")
+                .unwrap();
+        let event_id =
+            EventId::from_hex("0000000000000000000000000000000000000000000000000000000000000099")
+                .unwrap();
+        let message = Message {
+            id: event_id,
+            pubkey,
+            kind: Kind::MlsGroupMessage,
+            mls_group_id: mls_group_id_1.clone(),
+            created_at: Timestamp::now(),
+            content: "Test message".to_string(),
+            tags: Tags::new(),
+            event: UnsignedEvent::new(
+                pubkey,
+                Timestamp::now(),
+                Kind::MlsGroupMessage,
+                Tags::new(),
+                "Test message".to_string(),
+            ),
+            wrapper_event_id: EventId::all_zeros(),
+            state: MessageState::Created,
+        };
+        storage.save_message(message).unwrap();
+
+        // 3. Modify first group
+        let modified_group1 = Group {
+            mls_group_id: mls_group_id_1.clone(),
+            nostr_group_id: nostr_group_id_1,
+            name: "Modified Group 1".to_string(),
+            description: "First group".to_string(),
+            admin_pubkeys: BTreeSet::new(),
+            last_message_id: None,
+            last_message_at: None,
+            epoch: 5,
+            state: GroupState::Active,
+            image_hash: None,
+            image_key: None,
+            image_nonce: None,
+        };
+        storage.save_group(modified_group1).unwrap();
+
+        // Verify all changes
+        let groups = storage.all_groups().unwrap();
+        assert_eq!(groups.len(), 2);
+        let messages = storage.messages(&mls_group_id_1, None).unwrap();
+        assert_eq!(messages.len(), 1);
+        let g1 = storage
+            .find_group_by_mls_group_id(&mls_group_id_1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(g1.name, "Modified Group 1");
+        assert_eq!(g1.epoch, 5);
+
+        // Restore snapshot
+        storage.restore_snapshot(snapshot);
+
+        // Verify all changes are rolled back
+        let groups_after = storage.all_groups().unwrap();
+        assert_eq!(groups_after.len(), 1);
+        let g2_gone = storage.find_group_by_mls_group_id(&mls_group_id_2).unwrap();
+        assert!(g2_gone.is_none());
+        let messages_after = storage.messages(&mls_group_id_1, None).unwrap();
+        assert_eq!(messages_after.len(), 0);
+        let g1_restored = storage
+            .find_group_by_mls_group_id(&mls_group_id_1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(g1_restored.name, "Group 1");
+        assert_eq!(g1_restored.epoch, 0);
+    }
+
+    #[test]
+    fn test_snapshot_preserves_snapshot_independence() {
+        let storage = MdkMemoryStorage::default();
+
+        // Create a group
+        let mls_group_id = GroupId::from_slice(&[41, 42, 43, 44]);
+        let nostr_group_id = generate_random_bytes(32).try_into().unwrap();
+        let group = Group {
+            mls_group_id: mls_group_id.clone(),
+            nostr_group_id,
+            name: "State A".to_string(),
+            description: "Initial state".to_string(),
+            admin_pubkeys: BTreeSet::new(),
+            last_message_id: None,
+            last_message_at: None,
+            epoch: 0,
+            state: GroupState::Active,
+            image_hash: None,
+            image_key: None,
+            image_nonce: None,
+        };
+        storage.save_group(group.clone()).unwrap();
+
+        // Take snapshot A
+        let snapshot_a = storage.create_snapshot();
+
+        // Modify to state B
+        let group_b = Group {
+            name: "State B".to_string(),
+            epoch: 1,
+            ..group.clone()
+        };
+        storage.save_group(group_b.clone()).unwrap();
+
+        // Take snapshot B
+        let snapshot_b = storage.create_snapshot();
+
+        // Modify to state C
+        let group_c = Group {
+            name: "State C".to_string(),
+            epoch: 2,
+            ..group.clone()
+        };
+        storage.save_group(group_c).unwrap();
+
+        // Current state is C
+        let current = storage
+            .find_group_by_mls_group_id(&mls_group_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.name, "State C");
+
+        // Restore to A
+        storage.restore_snapshot(snapshot_a.clone());
+        let after_a = storage
+            .find_group_by_mls_group_id(&mls_group_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(after_a.name, "State A");
+
+        // Restore to B (from A state)
+        storage.restore_snapshot(snapshot_b);
+        let after_b = storage
+            .find_group_by_mls_group_id(&mls_group_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(after_b.name, "State B");
+
+        // Can still restore to A again
+        storage.restore_snapshot(snapshot_a);
+        let final_state = storage
+            .find_group_by_mls_group_id(&mls_group_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(final_state.name, "State A");
     }
 }
