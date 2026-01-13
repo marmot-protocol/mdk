@@ -27,6 +27,7 @@
 
 ### Breaking changes
 
+- **OpenMLS Dependency**: Updated to OpenMLS git main branch (commit b90ca23b) for GREASE support. This may introduce minor API changes from upstream. The dependency will be reverted to crates.io versions once OpenMLS releases a version with GREASE support. ([#142](https://github.com/marmot-protocol/mdk/pull/142))
 - **Legacy Format Removal**: Removed support for legacy key package tag formats and extension formats that were deprecated after EOY 2025 migration period ([#146](https://github.com/marmot-protocol/mdk/pull/146))
   - Key package validation now only accepts MIP-00 compliant formats:
     - `mls_ciphersuite` tag must use hex format (e.g., `0x0001`), numeric (`1`) and string (`MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519`) formats are no longer accepted
@@ -61,6 +62,7 @@
 
 ### Added
 
+- **GREASE Support (RFC 9420 Section 13.5)**: KeyPackage capabilities now automatically include random GREASE values for extensibility testing. GREASE ensures implementations correctly handle unknown values and maintains protocol forward compatibility. Values are injected into ciphersuites, extensions, proposals, and credentials capabilities. ([#142](https://github.com/marmot-protocol/mdk/pull/142))
 - New `MessageProcessingResult::PendingProposal` variant returned when a non-admin member receives a proposal. The proposal is stored as pending and awaits commitment by an admin. ([#122](https://github.com/marmot-protocol/mdk/pull/122))
 - New error variant `IdentityChangeNotAllowed` for rejecting proposals and commits that attempt to change member identity ([#126](https://github.com/marmot-protocol/mdk/pull/126))
 - Added `nostr_group_id` field to `NostrGroupDataUpdate` struct, enabling rotation of the Nostr group ID used for message routing per MIP-01 ([#127](https://github.com/marmot-protocol/mdk/pull/127))

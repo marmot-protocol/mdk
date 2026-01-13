@@ -13,17 +13,29 @@ use crate::MdkMemoryStorage;
 
 impl GroupStorage for MdkMemoryStorage {
     fn save_group(&self, group: Group) -> Result<(), GroupError> {
-        // Store in the MLS group ID cache
+        // Acquire both locks to ensure atomic update
+        let mut groups_cache = self.groups_cache.write();
+        let mut nostr_id_cache = self.groups_by_nostr_id_cache.write();
+
+        // Check if nostr_group_id is already mapped to a different mls_group_id
+        if let Some(existing_group) = nostr_id_cache.peek(&group.nostr_group_id)
+            && existing_group.mls_group_id != group.mls_group_id
         {
-            let mut cache = self.groups_cache.write();
-            cache.put(group.mls_group_id.clone(), group.clone());
+            return Err(GroupError::InvalidParameters(
+                "nostr_group_id already exists for a different group".to_string(),
+            ));
         }
 
-        // Store in the Nostr group ID cache
+        // If updating an existing group and nostr_group_id changed, remove stale entry
+        if let Some(existing_group) = groups_cache.peek(&group.mls_group_id)
+            && existing_group.nostr_group_id != group.nostr_group_id
         {
-            let mut cache = self.groups_by_nostr_id_cache.write();
-            cache.put(group.nostr_group_id, group);
+            nostr_id_cache.pop(&existing_group.nostr_group_id);
         }
+
+        // Store in both caches
+        groups_cache.put(group.mls_group_id.clone(), group.clone());
+        nostr_id_cache.put(group.nostr_group_id, group);
 
         Ok(())
     }
@@ -346,5 +358,192 @@ mod tests {
         );
         assert!(result.is_ok());
         assert_eq!(result.unwrap().len(), 0); // No results at that offset
+    }
+
+    #[test]
+    fn test_nostr_group_id_collision_rejected() {
+        let storage = MdkMemoryStorage::new(MemoryStorage::default());
+
+        // Create first group with a specific nostr_group_id
+        let mls_group_id_1 = GroupId::from_slice(&[1, 2, 3, 4]);
+        let shared_nostr_group_id = [42u8; 32];
+
+        let group1 = Group {
+            mls_group_id: mls_group_id_1.clone(),
+            nostr_group_id: shared_nostr_group_id,
+            name: "Group 1".to_string(),
+            description: "First group".to_string(),
+            admin_pubkeys: BTreeSet::new(),
+            last_message_id: None,
+            last_message_at: None,
+            epoch: 0,
+            state: GroupState::Active,
+            image_hash: None,
+            image_key: None,
+            image_nonce: None,
+        };
+
+        storage.save_group(group1).unwrap();
+
+        // Attempt to create a second group with the same nostr_group_id but different mls_group_id
+        let mls_group_id_2 = GroupId::from_slice(&[5, 6, 7, 8]);
+
+        let group2 = Group {
+            mls_group_id: mls_group_id_2.clone(),
+            nostr_group_id: shared_nostr_group_id, // Same nostr_group_id - collision!
+            name: "Group 2".to_string(),
+            description: "Second group trying to hijack".to_string(),
+            admin_pubkeys: BTreeSet::new(),
+            last_message_id: None,
+            last_message_at: None,
+            epoch: 0,
+            state: GroupState::Active,
+            image_hash: None,
+            image_key: None,
+            image_nonce: None,
+        };
+
+        // This should fail because nostr_group_id is already used by a different group
+        let result = storage.save_group(group2);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("nostr_group_id already exists"),
+            "Expected collision error, got: {}",
+            err
+        );
+
+        // Verify the original group is still intact
+        let found = storage
+            .find_group_by_nostr_group_id(&shared_nostr_group_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.mls_group_id, mls_group_id_1);
+        assert_eq!(found.name, "Group 1");
+    }
+
+    #[test]
+    fn test_nostr_group_id_update_removes_stale_entry() {
+        let storage = MdkMemoryStorage::new(MemoryStorage::default());
+
+        let mls_group_id = GroupId::from_slice(&[1, 2, 3, 4]);
+        let old_nostr_group_id = [1u8; 32];
+        let new_nostr_group_id = [2u8; 32];
+
+        // Create group with initial nostr_group_id
+        let group = Group {
+            mls_group_id: mls_group_id.clone(),
+            nostr_group_id: old_nostr_group_id,
+            name: "Test Group".to_string(),
+            description: "A test group".to_string(),
+            admin_pubkeys: BTreeSet::new(),
+            last_message_id: None,
+            last_message_at: None,
+            epoch: 0,
+            state: GroupState::Active,
+            image_hash: None,
+            image_key: None,
+            image_nonce: None,
+        };
+
+        storage.save_group(group).unwrap();
+
+        // Verify group is findable by old nostr_group_id
+        assert!(
+            storage
+                .find_group_by_nostr_group_id(&old_nostr_group_id)
+                .unwrap()
+                .is_some()
+        );
+
+        // Update the group with a new nostr_group_id
+        let updated_group = Group {
+            mls_group_id: mls_group_id.clone(),
+            nostr_group_id: new_nostr_group_id,
+            name: "Test Group Updated".to_string(),
+            description: "A test group".to_string(),
+            admin_pubkeys: BTreeSet::new(),
+            last_message_id: None,
+            last_message_at: None,
+            epoch: 1,
+            state: GroupState::Active,
+            image_hash: None,
+            image_key: None,
+            image_nonce: None,
+        };
+
+        storage.save_group(updated_group).unwrap();
+
+        // Old nostr_group_id should no longer find the group (stale entry removed)
+        assert!(
+            storage
+                .find_group_by_nostr_group_id(&old_nostr_group_id)
+                .unwrap()
+                .is_none(),
+            "Old nostr_group_id should not find the group after update"
+        );
+
+        // New nostr_group_id should find the updated group
+        let found = storage
+            .find_group_by_nostr_group_id(&new_nostr_group_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.mls_group_id, mls_group_id);
+        assert_eq!(found.name, "Test Group Updated");
+        assert_eq!(found.epoch, 1);
+    }
+
+    #[test]
+    fn test_same_group_update_allowed() {
+        let storage = MdkMemoryStorage::new(MemoryStorage::default());
+
+        let mls_group_id = GroupId::from_slice(&[1, 2, 3, 4]);
+        let nostr_group_id = [1u8; 32];
+
+        // Create initial group
+        let group = Group {
+            mls_group_id: mls_group_id.clone(),
+            nostr_group_id,
+            name: "Test Group".to_string(),
+            description: "A test group".to_string(),
+            admin_pubkeys: BTreeSet::new(),
+            last_message_id: None,
+            last_message_at: None,
+            epoch: 0,
+            state: GroupState::Active,
+            image_hash: None,
+            image_key: None,
+            image_nonce: None,
+        };
+
+        storage.save_group(group).unwrap();
+
+        // Update the same group (same mls_group_id and nostr_group_id)
+        let updated_group = Group {
+            mls_group_id: mls_group_id.clone(),
+            nostr_group_id, // Same nostr_group_id
+            name: "Updated Group Name".to_string(),
+            description: "Updated description".to_string(),
+            admin_pubkeys: BTreeSet::new(),
+            last_message_id: None,
+            last_message_at: None,
+            epoch: 1,
+            state: GroupState::Active,
+            image_hash: None,
+            image_key: None,
+            image_nonce: None,
+        };
+
+        // This should succeed - updating the same group
+        let result = storage.save_group(updated_group);
+        assert!(result.is_ok());
+
+        // Verify the update was applied
+        let found = storage
+            .find_group_by_mls_group_id(&mls_group_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.name, "Updated Group Name");
+        assert_eq!(found.epoch, 1);
     }
 }

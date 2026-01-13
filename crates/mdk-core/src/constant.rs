@@ -40,14 +40,12 @@ pub const GROUP_CONTEXT_REQUIRED_EXTENSIONS: [ExtensionType; 1] = [
 /// This MUST match SUPPORTED_EXTENSIONS to accurately advertise what the
 /// KeyPackage capabilities contain. This allows other clients to validate
 /// compatibility before attempting to add this user to a group.
+///
+/// Note: GREASE values are NOT included here. GREASE is injected dynamically
+/// into Capabilities at runtime (see `MDK::capabilities()`) but should not be
+/// advertised in tags since they are meant for extensibility testing only and
+/// will vary between clients/invocations.
 pub const TAG_EXTENSIONS: [ExtensionType; 2] = [
     ExtensionType::LastResort, // 0x000A - Required in capabilities
     ExtensionType::Unknown(NOSTR_GROUP_DATA_EXTENSION_TYPE), // 0xF2EE - NostrGroupData
 ];
-
-// /// GREASE values for MLS.
-// TODO: Remove this once we've added GREASE support.
-// const GREASE: [u16; 15] = [
-//     0x0A0A, 0x1A1A, 0x2A2A, 0x3A3A, 0x4A4A, 0x5A5A, 0x6A6A, 0x7A7A, 0x8A8A, 0x9A9A, 0xAAAA,
-//     0xBABA, 0xCACA, 0xDADA, 0xEAEA,
-// ];

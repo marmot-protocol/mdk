@@ -98,9 +98,15 @@ mod tests {
     use super::*;
 
     fn create_test_group(group_id: GroupId) -> Group {
+        // Use the group_id bytes to derive a unique nostr_group_id
+        let mut nostr_group_id = [0u8; 32];
+        let group_id_bytes = group_id.as_slice();
+        nostr_group_id[..group_id_bytes.len().min(32)]
+            .copy_from_slice(&group_id_bytes[..group_id_bytes.len().min(32)]);
+
         Group {
             mls_group_id: group_id.clone(),
-            nostr_group_id: [0u8; 32],
+            nostr_group_id,
             name: "Test Group".to_string(),
             description: "A test group".to_string(),
             admin_pubkeys: BTreeSet::new(),
