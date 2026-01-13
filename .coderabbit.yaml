@@ -1,15 +1,109 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
 # CodeRabbit Configuration
 # See: https://docs.coderabbit.ai/getting-started/yaml-configuration
 
 reviews:
-  # Enable high-level summary in PR descriptions
   high_level_summary: true
+  high_level_summary_instructions: |
+    Start with a 2-3 sentence prose summary explaining what this PR accomplishes and why.
+    
+    Then provide bullet points organized by these sections (omit sections that don't apply):
+    
+    **What changed**:
+    - Describe the main changes in plain language
+    - Note which crates are affected (mdk-core, mdk-sqlite-storage, mdk-memory-storage, mdk-storage-traits, mdk-uniffi)
+    
+    **Security impact** (if any):
+    - Cryptographic changes (encryption, key derivation, nonces, HKDF context strings)
+    - Key handling or storage modifications
+    - Identity binding or credential validation changes
+    - Changes to error messages that could leak sensitive identifiers
+    - SQLCipher configuration or file permission changes
+    
+    **Protocol changes** (if any):
+    - MLS protocol implementation changes (cite RFC 9420 sections if relevant)
+    - Nostr integration changes (cite NIPs if relevant)
+    - MIP (Marmot Improvement Proposal) implementation
+    
+    **API surface** (if any):
+    - Breaking changes to public APIs (methods, types, traits)
+    - New public APIs added
+    - Storage schema changes
+    - UniFFI/FFI boundary changes
+    
+    **Testing**:
+    - Note if tests were added, modified, or if coverage-sensitive code paths changed
+    
+    Keep each bullet to one sentence. If the PR touches cryptographic code, key management, SQLCipher, or file permissions, prepend the summary with "⚠️ Security-sensitive changes".
 
-  # Request changes when issues are found
+  # Request changes when security issues are found
   request_changes_workflow: true
 
   # Collapse walkthrough to keep reviews focused
   collapse_walkthrough: true
+
+  # Keep sequence diagrams for understanding MLS flows
+  sequence_diagrams: true
+
+  # Assess how well changes address linked issues
+  assess_linked_issues: true
+
+  # Show related context
+  related_issues: true
+  related_prs: true
+
+  # Disable non-essential elements
+  poem: false
+  in_progress_fortune: false
+
+  # Auto-review configuration
+  auto_review:
+    ignore_title_keywords:
+      - "WIP"
+      - "DO NOT MERGE"
+      - "DRAFT"
+    drafts: false
+
+  # Pre-merge checks for enforcing project standards
+  pre_merge_checks:
+    # Verify PR descriptions are meaningful
+    description:
+      mode: "warning"
+
+    # Verify PRs address linked issues
+    issue_assessment:
+      mode: "warning"
+
+    # Custom checks for MDK-specific requirements
+    custom_checks:
+      - name: "Changelog Updated"
+        mode: "warning"
+        instructions: |
+          Pass if: The PR updates a CHANGELOG.md file in one of the crate directories (crates/mdk-core/, crates/mdk-storage-traits/, crates/mdk-memory-storage/, crates/mdk-sqlite-storage/) with an entry under the "## Unreleased" section.
+          Fail if: The PR modifies Rust source files (.rs) in a crate but does not update that crate's CHANGELOG.md.
+          Exception: PRs that only modify tests, CI configuration, documentation (*.md outside of CHANGELOG), or example code may pass without changelog updates.
+
+      - name: "No Sensitive Identifier Leakage"
+        mode: "error"
+        instructions: |
+          Pass if: No sensitive identifiers (mls_group_id, nostr_group_id, GroupId, encryption keys, exporter secrets) appear in:
+          - tracing::* macro calls (info!, warn!, error!, debug!, trace!)
+          - format!() strings in error messages or Error enum variants
+          - panic!() or unreachable!() messages
+          - Debug trait implementations that expose these fields without redaction
+          Fail if: Any of the above patterns are found with sensitive identifiers interpolated.
+          Note: Redacted forms like "[REDACTED]" or "***" are acceptable.
+
+  # Labels for security-related PRs
+  labeling_instructions:
+    - label: "security"
+      instructions: "Apply when the PR touches cryptographic code, key handling, authentication, or fixes a security issue"
+    - label: "breaking-change"
+      instructions: "Apply when the PR includes breaking API changes that require downstream updates"
+    - label: "mls-protocol"
+      instructions: "Apply when the PR modifies MLS protocol implementation in mdk-core"
+    - label: "storage"
+      instructions: "Apply when the PR modifies storage backends (sqlite or memory)"
 
   # Path-based review instructions
   path_instructions:
@@ -273,8 +367,34 @@ reviews:
         - Version constraints not too loose (avoid `*` or very wide ranges)
         - New dependencies should be clearly mentioned in the summary
 
+  # Tools configuration
   tools:
+    # AST-based pattern matching for security rules
     ast-grep:
       essential_rules: true
+
     clippy:
       enabled: true
+
+    # Secret scanning - critical for this security-focused project
+    gitleaks:
+      enabled: true
+
+    # Markdown linting for documentation
+    markdownlint:
+      enabled: true
+
+    yamllint:
+      enabled: true
+
+    # GitHub Actions workflow linting
+    actionlint:
+      enabled: true
+
+    # Wait for GitHub CI checks before finalizing review
+    github-checks:
+      enabled: true
+      timeout_ms: 600000  # 10 minutes - allow time for Rust compilation and tests
+
+chat:
+  auto_reply: true
