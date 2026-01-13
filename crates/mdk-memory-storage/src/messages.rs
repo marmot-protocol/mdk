@@ -14,7 +14,7 @@ use mdk_storage_traits::messages::MessageStorage;
 use mdk_storage_traits::messages::error::MessageError;
 use mdk_storage_traits::messages::types::*;
 
-use crate::{MAX_MESSAGES_PER_GROUP, MdkMemoryStorage};
+use crate::MdkMemoryStorage;
 
 impl MessageStorage for MdkMemoryStorage {
     fn save_message(&self, message: Message) -> Result<(), MessageError> {
@@ -45,7 +45,7 @@ impl MessageStorage for MdkMemoryStorage {
                 // Check if this is an update (message already exists) or a new message
                 let is_update = group_messages.contains_key(&message.id);
 
-                if !is_update && group_messages.len() >= MAX_MESSAGES_PER_GROUP {
+                if !is_update && group_messages.len() >= self.limits.max_messages_per_group {
                     // Evict the oldest message to make room for the new one
                     // Find the message with the oldest created_at timestamp
                     if let Some(oldest_id) = group_messages
@@ -382,12 +382,12 @@ mod tests {
 
     /// Test that the messages per group limit is enforced and oldest messages are evicted.
     /// This test verifies that:
-    /// 1. When MAX_MESSAGES_PER_GROUP is reached, the oldest message is evicted
+    /// 1. When max_messages_per_group is reached, the oldest message is evicted
     /// 2. Evicted messages are removed from BOTH caches (messages_cache and messages_by_group_cache)
     /// 3. Updates to existing messages don't trigger eviction
     #[test]
     fn test_save_message_per_group_limit_eviction() {
-        use crate::MAX_MESSAGES_PER_GROUP;
+        use crate::DEFAULT_MAX_MESSAGES_PER_GROUP;
         use std::num::NonZeroUsize;
 
         // Create storage with a small cache size for testing
@@ -402,9 +402,9 @@ mod tests {
         let group = create_test_group(group_id.clone());
         storage.save_group(group).unwrap();
 
-        // Save exactly MAX_MESSAGES_PER_GROUP messages
+        // Save exactly DEFAULT_MAX_MESSAGES_PER_GROUP messages
         // Use timestamps 1000..1000+MAX to establish age ordering
-        for i in 0..MAX_MESSAGES_PER_GROUP {
+        for i in 0..DEFAULT_MAX_MESSAGES_PER_GROUP {
             let mut event_bytes = [0u8; 32];
             event_bytes[0] = (i % 256) as u8;
             event_bytes[1] = ((i / 256) % 256) as u8;
@@ -423,7 +423,7 @@ mod tests {
         {
             let cache = storage.messages_by_group_cache.read();
             let group_messages = cache.peek(&group_id).unwrap();
-            assert_eq!(group_messages.len(), MAX_MESSAGES_PER_GROUP);
+            assert_eq!(group_messages.len(), DEFAULT_MAX_MESSAGES_PER_GROUP);
         }
 
         // The oldest message (index 0, timestamp 1000) should exist
@@ -455,8 +455,8 @@ mod tests {
             let group_messages = cache.peek(&group_id).unwrap();
             assert_eq!(
                 group_messages.len(),
-                MAX_MESSAGES_PER_GROUP,
-                "Should still have MAX_MESSAGES_PER_GROUP after eviction"
+                DEFAULT_MAX_MESSAGES_PER_GROUP,
+                "Should still have DEFAULT_MAX_MESSAGES_PER_GROUP after eviction"
             );
         }
 
@@ -505,7 +505,7 @@ mod tests {
             let group_messages = cache.peek(&group_id).unwrap();
             assert_eq!(
                 group_messages.len(),
-                MAX_MESSAGES_PER_GROUP,
+                DEFAULT_MAX_MESSAGES_PER_GROUP,
                 "Update should not change message count"
             );
         }
@@ -516,5 +516,74 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(found.content, "Updated Message 1");
+    }
+
+    /// Test that custom validation limits work correctly
+    #[test]
+    fn test_custom_message_limit() {
+        use crate::ValidationLimits;
+        use std::num::NonZeroUsize;
+
+        // Create storage with a custom small message limit for testing
+        let custom_limit = 5;
+        let limits = ValidationLimits::default().with_max_messages_per_group(custom_limit);
+        let storage = MdkMemoryStorage::with_cache_size_and_limits(
+            MemoryStorage::default(),
+            NonZeroUsize::new(100).unwrap(),
+            limits,
+        );
+
+        let group_id = GroupId::from_slice(&[1, 2, 3, 4]);
+
+        // Create the group first
+        let group = create_test_group(group_id.clone());
+        storage.save_group(group).unwrap();
+
+        // Save exactly custom_limit messages
+        for i in 0..custom_limit {
+            let mut event_bytes = [0u8; 32];
+            event_bytes[0] = i as u8;
+            let event_id = EventId::from_slice(&event_bytes).unwrap();
+            let message = create_test_message(
+                event_id,
+                group_id.clone(),
+                &format!("Message {}", i),
+                1000 + i as u64,
+            );
+            storage.save_message(message).unwrap();
+        }
+
+        // Verify all messages are stored
+        {
+            let cache = storage.messages_by_group_cache.read();
+            let group_messages = cache.peek(&group_id).unwrap();
+            assert_eq!(group_messages.len(), custom_limit);
+        }
+
+        // Add one more message to trigger eviction
+        let new_event_id = EventId::from_slice(&[255u8; 32]).unwrap();
+        let new_message = create_test_message(
+            new_event_id,
+            group_id.clone(),
+            "New message triggering eviction",
+            999999,
+        );
+        storage.save_message(new_message).unwrap();
+
+        // Verify the count is still at custom_limit (eviction occurred)
+        {
+            let cache = storage.messages_by_group_cache.read();
+            let group_messages = cache.peek(&group_id).unwrap();
+            assert_eq!(group_messages.len(), custom_limit);
+        }
+
+        // The oldest message (index 0) should have been evicted
+        let oldest_event_id = EventId::from_slice(&[0u8; 32]).unwrap();
+        {
+            let found = storage
+                .find_message_by_event_id(&group_id, &oldest_event_id)
+                .unwrap();
+            assert!(found.is_none(), "Oldest message should be evicted");
+        }
     }
 }

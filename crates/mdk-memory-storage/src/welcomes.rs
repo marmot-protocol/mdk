@@ -5,36 +5,34 @@ use mdk_storage_traits::welcomes::types::*;
 use mdk_storage_traits::welcomes::{MAX_PENDING_WELCOMES_LIMIT, Pagination, WelcomeStorage};
 use nostr::EventId;
 
-use crate::{
-    MAX_ADMINS_PER_WELCOME, MAX_RELAY_URL_LENGTH, MAX_RELAYS_PER_WELCOME, MdkMemoryStorage,
-};
+use crate::MdkMemoryStorage;
 
 impl WelcomeStorage for MdkMemoryStorage {
     fn save_welcome(&self, welcome: Welcome) -> Result<(), WelcomeError> {
         // Validate relay count to prevent memory exhaustion
-        if welcome.group_relays.len() > MAX_RELAYS_PER_WELCOME {
+        if welcome.group_relays.len() > self.limits.max_relays_per_welcome {
             return Err(WelcomeError::InvalidParameters(format!(
                 "Welcome relay count exceeds maximum of {} (got {})",
-                MAX_RELAYS_PER_WELCOME,
+                self.limits.max_relays_per_welcome,
                 welcome.group_relays.len()
             )));
         }
 
         // Validate individual relay URL lengths
         for relay in &welcome.group_relays {
-            if relay.as_str().len() > MAX_RELAY_URL_LENGTH {
+            if relay.as_str().len() > self.limits.max_relay_url_length {
                 return Err(WelcomeError::InvalidParameters(format!(
                     "Relay URL exceeds maximum length of {} bytes",
-                    MAX_RELAY_URL_LENGTH
+                    self.limits.max_relay_url_length
                 )));
             }
         }
 
         // Validate admin pubkeys count to prevent memory exhaustion
-        if welcome.group_admin_pubkeys.len() > MAX_ADMINS_PER_WELCOME {
+        if welcome.group_admin_pubkeys.len() > self.limits.max_admins_per_welcome {
             return Err(WelcomeError::InvalidParameters(format!(
                 "Welcome admin count exceeds maximum of {} (got {})",
-                MAX_ADMINS_PER_WELCOME,
+                self.limits.max_admins_per_welcome,
                 welcome.group_admin_pubkeys.len()
             )));
         }
@@ -109,7 +107,10 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::*;
-    use crate::{MAX_ADMINS_PER_WELCOME, MAX_RELAY_URL_LENGTH, MAX_RELAYS_PER_WELCOME};
+    use crate::{
+        DEFAULT_MAX_ADMINS_PER_WELCOME, DEFAULT_MAX_RELAY_URL_LENGTH,
+        DEFAULT_MAX_RELAYS_PER_WELCOME,
+    };
     use mdk_storage_traits::GroupId;
     use mdk_storage_traits::test_utils::cross_storage::create_test_welcome;
     use nostr::{EventId, Keys, Kind, PublicKey, RelayUrl, Tags, Timestamp, UnsignedEvent};
@@ -212,14 +213,20 @@ mod tests {
 
         // Test with relay count at exactly the limit (should succeed)
         let event_id = EventId::from_hex(&format!("{:064x}", 1)).unwrap();
-        let welcome =
-            create_welcome_with_relays(mls_group_id.clone(), event_id, MAX_RELAYS_PER_WELCOME);
+        let welcome = create_welcome_with_relays(
+            mls_group_id.clone(),
+            event_id,
+            DEFAULT_MAX_RELAYS_PER_WELCOME,
+        );
         assert!(storage.save_welcome(welcome).is_ok());
 
         // Test with relay count exceeding the limit (should fail)
         let event_id = EventId::from_hex(&format!("{:064x}", 2)).unwrap();
-        let welcome =
-            create_welcome_with_relays(mls_group_id.clone(), event_id, MAX_RELAYS_PER_WELCOME + 1);
+        let welcome = create_welcome_with_relays(
+            mls_group_id.clone(),
+            event_id,
+            DEFAULT_MAX_RELAYS_PER_WELCOME + 1,
+        );
         let result = storage.save_welcome(welcome);
         assert!(result.is_err());
         assert!(
@@ -237,7 +244,7 @@ mod tests {
         let event_id = EventId::from_hex(&format!("{:064x}", 1)).unwrap();
 
         // Test with URL at exactly the limit (should succeed)
-        let domain = "a".repeat(MAX_RELAY_URL_LENGTH - 10);
+        let domain = "a".repeat(DEFAULT_MAX_RELAY_URL_LENGTH - 10);
         let url = format!("wss://{}.com", domain);
         let mut welcome = create_test_welcome(mls_group_id.clone(), event_id);
         welcome.group_relays = BTreeSet::from([RelayUrl::parse(&url).unwrap()]);
@@ -245,7 +252,7 @@ mod tests {
 
         // Test with URL exceeding the limit (should fail)
         let event_id = EventId::from_hex(&format!("{:064x}", 2)).unwrap();
-        let domain = "a".repeat(MAX_RELAY_URL_LENGTH);
+        let domain = "a".repeat(DEFAULT_MAX_RELAY_URL_LENGTH);
         let url = format!("wss://{}.com", domain);
         let mut welcome = create_test_welcome(mls_group_id.clone(), event_id);
         welcome.group_relays = BTreeSet::from([RelayUrl::parse(&url).unwrap()]);
@@ -266,14 +273,20 @@ mod tests {
 
         // Test with admin count at exactly the limit (should succeed)
         let event_id = EventId::from_hex(&format!("{:064x}", 1)).unwrap();
-        let welcome =
-            create_welcome_with_admins(mls_group_id.clone(), event_id, MAX_ADMINS_PER_WELCOME);
+        let welcome = create_welcome_with_admins(
+            mls_group_id.clone(),
+            event_id,
+            DEFAULT_MAX_ADMINS_PER_WELCOME,
+        );
         assert!(storage.save_welcome(welcome).is_ok());
 
         // Test with admin count exceeding the limit (should fail)
         let event_id = EventId::from_hex(&format!("{:064x}", 2)).unwrap();
-        let welcome =
-            create_welcome_with_admins(mls_group_id.clone(), event_id, MAX_ADMINS_PER_WELCOME + 1);
+        let welcome = create_welcome_with_admins(
+            mls_group_id.clone(),
+            event_id,
+            DEFAULT_MAX_ADMINS_PER_WELCOME + 1,
+        );
         let result = storage.save_welcome(welcome);
         assert!(result.is_err());
         assert!(
@@ -372,5 +385,69 @@ mod tests {
             .pending_welcomes(Some(Pagination::new(Some(10), Some(0))))
             .unwrap();
         assert_eq!(empty.len(), 0);
+    }
+
+    /// Test that custom validation limits work correctly for welcomes
+    #[test]
+    fn test_custom_welcome_limits() {
+        use crate::ValidationLimits;
+
+        // Create storage with custom smaller limits
+        let limits = ValidationLimits::default()
+            .with_max_relays_per_welcome(2)
+            .with_max_admins_per_welcome(3)
+            .with_max_relay_url_length(50);
+
+        let storage = MdkMemoryStorage::with_limits(MemoryStorage::default(), limits);
+
+        // Verify limits are accessible
+        assert_eq!(storage.limits().max_relays_per_welcome, 2);
+        assert_eq!(storage.limits().max_admins_per_welcome, 3);
+        assert_eq!(storage.limits().max_relay_url_length, 50);
+
+        let mls_group_id = GroupId::from_slice(&[1, 2, 3, 4]);
+
+        // Test relay count with custom limit (2 relays should succeed)
+        let event_id = EventId::from_hex(&format!("{:064x}", 1)).unwrap();
+        let welcome = create_welcome_with_relays(mls_group_id.clone(), event_id, 2);
+        assert!(storage.save_welcome(welcome).is_ok());
+
+        // Test relay count exceeding custom limit (3 relays should fail)
+        let event_id = EventId::from_hex(&format!("{:064x}", 2)).unwrap();
+        let welcome = create_welcome_with_relays(mls_group_id.clone(), event_id, 3);
+        let result = storage.save_welcome(welcome);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("maximum of 2"));
+
+        // Test admin count with custom limit (3 admins should succeed)
+        let event_id = EventId::from_hex(&format!("{:064x}", 3)).unwrap();
+        let welcome = create_welcome_with_admins(mls_group_id.clone(), event_id, 3);
+        assert!(storage.save_welcome(welcome).is_ok());
+
+        // Test admin count exceeding custom limit (4 admins should fail)
+        let event_id = EventId::from_hex(&format!("{:064x}", 4)).unwrap();
+        let welcome = create_welcome_with_admins(mls_group_id.clone(), event_id, 4);
+        let result = storage.save_welcome(welcome);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("maximum of 3"));
+
+        // Test relay URL length with custom limit (50 bytes)
+        // URL "wss://a{40}.com" = 6 + 40 + 4 = 50 bytes (should succeed)
+        let event_id = EventId::from_hex(&format!("{:064x}", 5)).unwrap();
+        let mut welcome = create_test_welcome(mls_group_id.clone(), event_id);
+        let domain = "a".repeat(40);
+        let url = format!("wss://{}.com", domain);
+        welcome.group_relays = BTreeSet::from([RelayUrl::parse(&url).unwrap()]);
+        assert!(storage.save_welcome(welcome).is_ok());
+
+        // URL exceeding 50 bytes should fail
+        let event_id = EventId::from_hex(&format!("{:064x}", 6)).unwrap();
+        let mut welcome = create_test_welcome(mls_group_id.clone(), event_id);
+        let domain = "a".repeat(45); // 6 + 45 + 4 = 55 bytes
+        let url = format!("wss://{}.com", domain);
+        welcome.group_relays = BTreeSet::from([RelayUrl::parse(&url).unwrap()]);
+        let result = storage.save_welcome(welcome);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("50 bytes"));
     }
 }

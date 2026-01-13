@@ -9,36 +9,33 @@ use mdk_storage_traits::groups::{GroupStorage, MAX_MESSAGE_LIMIT, Pagination};
 use mdk_storage_traits::messages::types::Message;
 use nostr::{PublicKey, RelayUrl};
 
-use crate::{
-    MAX_ADMINS_PER_GROUP, MAX_GROUP_DESCRIPTION_LENGTH, MAX_GROUP_NAME_LENGTH,
-    MAX_RELAY_URL_LENGTH, MAX_RELAYS_PER_GROUP, MdkMemoryStorage,
-};
+use crate::MdkMemoryStorage;
 
 impl GroupStorage for MdkMemoryStorage {
     fn save_group(&self, group: Group) -> Result<(), GroupError> {
         // Validate group name length
-        if group.name.len() > MAX_GROUP_NAME_LENGTH {
+        if group.name.len() > self.limits.max_group_name_length {
             return Err(GroupError::InvalidParameters(format!(
                 "Group name exceeds maximum length of {} bytes (got {} bytes)",
-                MAX_GROUP_NAME_LENGTH,
+                self.limits.max_group_name_length,
                 group.name.len()
             )));
         }
 
         // Validate group description length
-        if group.description.len() > MAX_GROUP_DESCRIPTION_LENGTH {
+        if group.description.len() > self.limits.max_group_description_length {
             return Err(GroupError::InvalidParameters(format!(
                 "Group description exceeds maximum length of {} bytes (got {} bytes)",
-                MAX_GROUP_DESCRIPTION_LENGTH,
+                self.limits.max_group_description_length,
                 group.description.len()
             )));
         }
 
         // Validate admin pubkeys count
-        if group.admin_pubkeys.len() > MAX_ADMINS_PER_GROUP {
+        if group.admin_pubkeys.len() > self.limits.max_admins_per_group {
             return Err(GroupError::InvalidParameters(format!(
                 "Group admin count exceeds maximum of {} (got {})",
-                MAX_ADMINS_PER_GROUP,
+                self.limits.max_admins_per_group,
                 group.admin_pubkeys.len()
             )));
         }
@@ -150,20 +147,20 @@ impl GroupStorage for MdkMemoryStorage {
         relays: BTreeSet<RelayUrl>,
     ) -> Result<(), GroupError> {
         // Validate relay count to prevent memory exhaustion
-        if relays.len() > MAX_RELAYS_PER_GROUP {
+        if relays.len() > self.limits.max_relays_per_group {
             return Err(GroupError::InvalidParameters(format!(
                 "Relay count exceeds maximum of {} (got {})",
-                MAX_RELAYS_PER_GROUP,
+                self.limits.max_relays_per_group,
                 relays.len()
             )));
         }
 
         // Validate individual relay URL lengths
         for relay in &relays {
-            if relay.as_str().len() > MAX_RELAY_URL_LENGTH {
+            if relay.as_str().len() > self.limits.max_relay_url_length {
                 return Err(GroupError::InvalidParameters(format!(
                     "Relay URL exceeds maximum length of {} bytes",
-                    MAX_RELAY_URL_LENGTH
+                    self.limits.max_relay_url_length
                 )));
             }
         }
@@ -233,8 +230,8 @@ impl GroupStorage for MdkMemoryStorage {
 mod tests {
     use super::*;
     use crate::{
-        MAX_ADMINS_PER_GROUP, MAX_GROUP_DESCRIPTION_LENGTH, MAX_GROUP_NAME_LENGTH,
-        MAX_RELAY_URL_LENGTH, MAX_RELAYS_PER_GROUP,
+        DEFAULT_MAX_ADMINS_PER_GROUP, DEFAULT_MAX_GROUP_DESCRIPTION_LENGTH,
+        DEFAULT_MAX_GROUP_NAME_LENGTH, DEFAULT_MAX_RELAY_URL_LENGTH, DEFAULT_MAX_RELAYS_PER_GROUP,
     };
     use mdk_storage_traits::groups::types::GroupState;
     use mdk_storage_traits::messages::MessageStorage;
@@ -266,12 +263,12 @@ mod tests {
 
         // Test with name at exactly the limit (should succeed)
         let mut group = create_test_group(mls_group_id.clone(), [1u8; 32]);
-        group.name = "a".repeat(MAX_GROUP_NAME_LENGTH);
+        group.name = "a".repeat(DEFAULT_MAX_GROUP_NAME_LENGTH);
         assert!(storage.save_group(group).is_ok());
 
         // Test with name exceeding the limit (should fail)
         let mut group = create_test_group(GroupId::from_slice(&[2, 3, 4, 5]), [2u8; 32]);
-        group.name = "a".repeat(MAX_GROUP_NAME_LENGTH + 1);
+        group.name = "a".repeat(DEFAULT_MAX_GROUP_NAME_LENGTH + 1);
         let result = storage.save_group(group);
         assert!(result.is_err());
         assert!(
@@ -289,12 +286,12 @@ mod tests {
 
         // Test with description at exactly the limit (should succeed)
         let mut group = create_test_group(mls_group_id.clone(), [1u8; 32]);
-        group.description = "a".repeat(MAX_GROUP_DESCRIPTION_LENGTH);
+        group.description = "a".repeat(DEFAULT_MAX_GROUP_DESCRIPTION_LENGTH);
         assert!(storage.save_group(group).is_ok());
 
         // Test with description exceeding the limit (should fail)
         let mut group = create_test_group(GroupId::from_slice(&[2, 3, 4, 5]), [2u8; 32]);
-        group.description = "a".repeat(MAX_GROUP_DESCRIPTION_LENGTH + 1);
+        group.description = "a".repeat(DEFAULT_MAX_GROUP_DESCRIPTION_LENGTH + 1);
         let result = storage.save_group(group);
         assert!(result.is_err());
         assert!(
@@ -312,14 +309,14 @@ mod tests {
 
         // Test with admin count at exactly the limit (should succeed)
         let mut group = create_test_group(mls_group_id.clone(), [1u8; 32]);
-        for _ in 0..MAX_ADMINS_PER_GROUP {
+        for _ in 0..DEFAULT_MAX_ADMINS_PER_GROUP {
             group.admin_pubkeys.insert(Keys::generate().public_key());
         }
         assert!(storage.save_group(group).is_ok());
 
         // Test with admin count exceeding the limit (should fail)
         let mut group = create_test_group(GroupId::from_slice(&[2, 3, 4, 5]), [2u8; 32]);
-        for _ in 0..=MAX_ADMINS_PER_GROUP {
+        for _ in 0..=DEFAULT_MAX_ADMINS_PER_GROUP {
             group.admin_pubkeys.insert(Keys::generate().public_key());
         }
         let result = storage.save_group(group);
@@ -343,14 +340,14 @@ mod tests {
 
         // Test with relay count at exactly the limit (should succeed)
         let mut relays = BTreeSet::new();
-        for i in 0..MAX_RELAYS_PER_GROUP {
+        for i in 0..DEFAULT_MAX_RELAYS_PER_GROUP {
             relays.insert(RelayUrl::parse(&format!("wss://relay{}.example.com", i)).unwrap());
         }
         assert!(storage.replace_group_relays(&mls_group_id, relays).is_ok());
 
         // Test with relay count exceeding the limit (should fail)
         let mut relays = BTreeSet::new();
-        for i in 0..=MAX_RELAYS_PER_GROUP {
+        for i in 0..=DEFAULT_MAX_RELAYS_PER_GROUP {
             relays.insert(RelayUrl::parse(&format!("wss://relay{}.example.com", i)).unwrap());
         }
         let result = storage.replace_group_relays(&mls_group_id, relays);
@@ -373,14 +370,14 @@ mod tests {
         storage.save_group(group).unwrap();
 
         // Test with URL at exactly the limit (should succeed)
-        // URL format: wss:// (6) + domain + .com (4) = need domain of MAX_RELAY_URL_LENGTH - 10
-        let domain = "a".repeat(MAX_RELAY_URL_LENGTH - 10);
+        // URL format: wss:// (6) + domain + .com (4) = need domain of DEFAULT_MAX_RELAY_URL_LENGTH - 10
+        let domain = "a".repeat(DEFAULT_MAX_RELAY_URL_LENGTH - 10);
         let url = format!("wss://{}.com", domain);
         let relays = BTreeSet::from([RelayUrl::parse(&url).unwrap()]);
         assert!(storage.replace_group_relays(&mls_group_id, relays).is_ok());
 
         // Test with URL exceeding the limit (should fail)
-        let domain = "a".repeat(MAX_RELAY_URL_LENGTH); // This will exceed the limit
+        let domain = "a".repeat(DEFAULT_MAX_RELAY_URL_LENGTH); // This will exceed the limit
         let url = format!("wss://{}.com", domain);
         let relays = BTreeSet::from([RelayUrl::parse(&url).unwrap()]);
         let result = storage.replace_group_relays(&mls_group_id, relays);
@@ -550,5 +547,82 @@ mod tests {
         );
         assert!(result.is_ok());
         assert_eq!(result.unwrap().len(), 0); // No results at that offset
+    }
+
+    /// Test that custom validation limits work correctly for groups
+    #[test]
+    fn test_custom_group_limits() {
+        use crate::ValidationLimits;
+
+        // Create storage with custom smaller limits
+        let limits = ValidationLimits::default()
+            .with_max_group_name_length(10)
+            .with_max_group_description_length(20)
+            .with_max_admins_per_group(2)
+            .with_max_relays_per_group(3);
+
+        let storage = MdkMemoryStorage::with_limits(MemoryStorage::default(), limits);
+
+        // Verify limits are accessible
+        assert_eq!(storage.limits().max_group_name_length, 10);
+        assert_eq!(storage.limits().max_group_description_length, 20);
+        assert_eq!(storage.limits().max_admins_per_group, 2);
+        assert_eq!(storage.limits().max_relays_per_group, 3);
+
+        let mls_group_id = GroupId::from_slice(&[1, 2, 3, 4]);
+
+        // Test name length with custom limit (10 chars should succeed)
+        let mut group = create_test_group(mls_group_id.clone(), [1u8; 32]);
+        group.name = "a".repeat(10);
+        assert!(storage.save_group(group).is_ok());
+
+        // Test name length exceeding custom limit (11 chars should fail)
+        let mut group = create_test_group(GroupId::from_slice(&[2, 3, 4, 5]), [2u8; 32]);
+        group.name = "a".repeat(11);
+        let result = storage.save_group(group);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("10 bytes"));
+
+        // Test admin count with custom limit (2 admins should succeed)
+        let mut group = create_test_group(GroupId::from_slice(&[3, 4, 5, 6]), [3u8; 32]);
+        group.admin_pubkeys.insert(Keys::generate().public_key());
+        group.admin_pubkeys.insert(Keys::generate().public_key());
+        assert!(storage.save_group(group).is_ok());
+
+        // Test admin count exceeding custom limit (3 admins should fail)
+        let mut group = create_test_group(GroupId::from_slice(&[4, 5, 6, 7]), [4u8; 32]);
+        for _ in 0..3 {
+            group.admin_pubkeys.insert(Keys::generate().public_key());
+        }
+        let result = storage.save_group(group);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("maximum of 2"));
+
+        // Test relay count with custom limit
+        let group = create_test_group(GroupId::from_slice(&[5, 6, 7, 8]), [5u8; 32]);
+        storage.save_group(group).unwrap();
+
+        // 3 relays should succeed
+        let relays = BTreeSet::from([
+            RelayUrl::parse("wss://r1.com").unwrap(),
+            RelayUrl::parse("wss://r2.com").unwrap(),
+            RelayUrl::parse("wss://r3.com").unwrap(),
+        ]);
+        assert!(
+            storage
+                .replace_group_relays(&GroupId::from_slice(&[5, 6, 7, 8]), relays)
+                .is_ok()
+        );
+
+        // 4 relays should fail
+        let relays = BTreeSet::from([
+            RelayUrl::parse("wss://r1.com").unwrap(),
+            RelayUrl::parse("wss://r2.com").unwrap(),
+            RelayUrl::parse("wss://r3.com").unwrap(),
+            RelayUrl::parse("wss://r4.com").unwrap(),
+        ]);
+        let result = storage.replace_group_relays(&GroupId::from_slice(&[5, 6, 7, 8]), relays);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("maximum of 3"));
     }
 }
