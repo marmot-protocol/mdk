@@ -476,6 +476,40 @@ Note: The table name for epoch key pairs is `openmls_epoch_key_pairs` in our sch
 
 ---
 
+## Index Optimizations
+
+When creating the unified schema, we should optimize indexes compared to the current MDK schema:
+
+### Redundant Indexes to Remove
+
+The current schema has indexes on primary key columns, which are redundant since SQLite automatically indexes primary keys:
+
+- `idx_processed_messages_wrapper_event_id` - `wrapper_event_id` is already the PRIMARY KEY
+- `idx_processed_welcomes_wrapper_event_id` - `wrapper_event_id` is already the PRIMARY KEY
+
+### Composite Indexes to Add
+
+The messages pagination query (`WHERE mls_group_id = ? ORDER BY created_at DESC`) would benefit from a composite index instead of separate indexes:
+
+```sql
+-- Replace separate indexes with a composite index for efficient pagination
+CREATE INDEX idx_messages_group_created 
+    ON messages(mls_group_id, created_at DESC);
+```
+
+This allows SQLite to satisfy both the filter and sort from a single index scan.
+
+### OpenMLS Index Addition
+
+The `openmls_own_leaf_nodes` table uses an autoincrement primary key but queries filter by `group_id`. Upstream `openmls_sqlite_storage` does not have an index here, but we add one for better performance:
+
+```sql
+CREATE INDEX idx_openmls_own_leaf_nodes_group_id
+    ON openmls_own_leaf_nodes(group_id);
+```
+
+---
+
 ## Risks & Mitigations
 
 | Risk | Impact | Mitigation |
