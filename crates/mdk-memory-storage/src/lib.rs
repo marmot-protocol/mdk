@@ -29,6 +29,7 @@
 //! use openmls_memory_storage::MemoryStorage;
 //!
 //! let limits = ValidationLimits::default()
+//!     .with_cache_size(2000)
 //!     .with_max_messages_per_group(5000)
 //!     .with_max_relays_per_group(50);
 //!
@@ -56,8 +57,8 @@ mod groups;
 mod messages;
 mod welcomes;
 
-/// Default cache size for each LRU cache
-const DEFAULT_CACHE_SIZE: NonZeroUsize = NonZeroUsize::new(1000).unwrap();
+/// Default cache size for each LRU cache (1000 items)
+pub const DEFAULT_CACHE_SIZE: usize = 1000;
 
 /// Default maximum number of relays allowed per group to prevent memory exhaustion.
 /// This limit prevents attackers from growing a single cache entry unboundedly.
@@ -106,11 +107,14 @@ pub const DEFAULT_MAX_RELAY_URL_LENGTH: usize = 512;
 /// use mdk_memory_storage::ValidationLimits;
 ///
 /// let limits = ValidationLimits::default()
+///     .with_cache_size(2000)
 ///     .with_max_messages_per_group(5000)
 ///     .with_max_relays_per_group(50);
 /// ```
 #[derive(Debug, Clone, Copy)]
 pub struct ValidationLimits {
+    /// Maximum number of items in each LRU cache
+    pub cache_size: usize,
     /// Maximum number of relays allowed per group
     pub max_relays_per_group: usize,
     /// Maximum number of messages stored per group
@@ -132,6 +136,7 @@ pub struct ValidationLimits {
 impl Default for ValidationLimits {
     fn default() -> Self {
         Self {
+            cache_size: DEFAULT_CACHE_SIZE,
             max_relays_per_group: DEFAULT_MAX_RELAYS_PER_GROUP,
             max_messages_per_group: DEFAULT_MAX_MESSAGES_PER_GROUP,
             max_group_name_length: DEFAULT_MAX_GROUP_NAME_LENGTH,
@@ -148,6 +153,17 @@ impl ValidationLimits {
     /// Creates a new `ValidationLimits` with default values.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Sets the maximum number of items in each LRU cache.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `size` is 0.
+    pub fn with_cache_size(mut self, size: usize) -> Self {
+        assert!(size > 0, "cache_size must be greater than 0");
+        self.cache_size = size;
+        self
     }
 
     /// Sets the maximum number of relays allowed per group.
@@ -229,7 +245,9 @@ impl ValidationLimits {
 /// use mdk_memory_storage::{MdkMemoryStorage, ValidationLimits};
 /// use openmls_memory_storage::MemoryStorage;
 ///
-/// let limits = ValidationLimits::default().with_max_messages_per_group(5000);
+/// let limits = ValidationLimits::default()
+///     .with_cache_size(2000)
+///     .with_max_messages_per_group(5000);
 ///
 /// let storage = MdkMemoryStorage::with_limits(MemoryStorage::default(), limits);
 /// ```
@@ -284,27 +302,6 @@ impl MdkMemoryStorage {
         Self::with_limits(storage_implementation, ValidationLimits::default())
     }
 
-    /// Creates a new `MdkMemoryStorage` with the provided storage implementation and cache size.
-    ///
-    /// # Arguments
-    ///
-    /// * `storage_implementation` - An implementation of the OpenMLS `StorageProvider` trait.
-    /// * `cache_size` - The maximum number of items to store in each LRU cache.
-    ///
-    /// # Returns
-    ///
-    /// A new instance of `MdkMemoryStorage` wrapping the provided storage implementation.
-    pub fn with_cache_size(
-        storage_implementation: MemoryStorage,
-        cache_size: NonZeroUsize,
-    ) -> Self {
-        Self::with_cache_size_and_limits(
-            storage_implementation,
-            cache_size,
-            ValidationLimits::default(),
-        )
-    }
-
     /// Creates a new `MdkMemoryStorage` with the provided storage implementation and validation limits.
     ///
     /// # Arguments
@@ -323,31 +320,15 @@ impl MdkMemoryStorage {
     /// use openmls_memory_storage::MemoryStorage;
     ///
     /// let limits = ValidationLimits::default()
+    ///     .with_cache_size(2000)
     ///     .with_max_messages_per_group(5000)
     ///     .with_max_relays_per_group(50);
     ///
     /// let storage = MdkMemoryStorage::with_limits(MemoryStorage::default(), limits);
     /// ```
     pub fn with_limits(storage_implementation: MemoryStorage, limits: ValidationLimits) -> Self {
-        Self::with_cache_size_and_limits(storage_implementation, DEFAULT_CACHE_SIZE, limits)
-    }
-
-    /// Creates a new `MdkMemoryStorage` with the provided storage implementation, cache size, and validation limits.
-    ///
-    /// # Arguments
-    ///
-    /// * `storage_implementation` - An implementation of the OpenMLS `StorageProvider` trait.
-    /// * `cache_size` - The maximum number of items to store in each LRU cache.
-    /// * `limits` - Custom validation limits for memory exhaustion protection.
-    ///
-    /// # Returns
-    ///
-    /// A new instance of `MdkMemoryStorage` wrapping the provided storage implementation.
-    pub fn with_cache_size_and_limits(
-        storage_implementation: MemoryStorage,
-        cache_size: NonZeroUsize,
-        limits: ValidationLimits,
-    ) -> Self {
+        let cache_size =
+            NonZeroUsize::new(limits.cache_size).expect("cache_size must be greater than 0");
         MdkMemoryStorage {
             openmls_storage: storage_implementation,
             limits,
@@ -1120,8 +1101,11 @@ mod tests {
     #[test]
     fn test_with_custom_cache_size() {
         let storage = MemoryStorage::default();
-        let custom_size = NonZeroUsize::new(50).unwrap();
-        let nostr_storage = MdkMemoryStorage::with_cache_size(storage, custom_size);
+        let limits = ValidationLimits::default().with_cache_size(50);
+        let nostr_storage = MdkMemoryStorage::with_limits(storage, limits);
+
+        // Verify the cache size is set correctly
+        assert_eq!(nostr_storage.limits().cache_size, 50);
 
         // Create a test group to verify the cache works
         let mls_group_id = create_test_group_id();

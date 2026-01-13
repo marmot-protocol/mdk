@@ -387,14 +387,11 @@ mod tests {
     /// 3. Updates to existing messages don't trigger eviction
     #[test]
     fn test_save_message_per_group_limit_eviction() {
-        use crate::DEFAULT_MAX_MESSAGES_PER_GROUP;
-        use std::num::NonZeroUsize;
+        use crate::{DEFAULT_MAX_MESSAGES_PER_GROUP, ValidationLimits};
 
-        // Create storage with a small cache size for testing
-        let storage = MdkMemoryStorage::with_cache_size(
-            MemoryStorage::default(),
-            NonZeroUsize::new(20000).unwrap(), // Large enough to hold all messages
-        );
+        // Create storage with a large cache size for testing
+        let limits = ValidationLimits::default().with_cache_size(20000);
+        let storage = MdkMemoryStorage::with_limits(MemoryStorage::default(), limits);
 
         let group_id = GroupId::from_slice(&[1, 2, 3, 4]);
 
@@ -522,16 +519,13 @@ mod tests {
     #[test]
     fn test_custom_message_limit() {
         use crate::ValidationLimits;
-        use std::num::NonZeroUsize;
 
         // Create storage with a custom small message limit for testing
         let custom_limit = 5;
-        let limits = ValidationLimits::default().with_max_messages_per_group(custom_limit);
-        let storage = MdkMemoryStorage::with_cache_size_and_limits(
-            MemoryStorage::default(),
-            NonZeroUsize::new(100).unwrap(),
-            limits,
-        );
+        let limits = ValidationLimits::default()
+            .with_cache_size(100)
+            .with_max_messages_per_group(custom_limit);
+        let storage = MdkMemoryStorage::with_limits(MemoryStorage::default(), limits);
 
         let group_id = GroupId::from_slice(&[1, 2, 3, 4]);
 

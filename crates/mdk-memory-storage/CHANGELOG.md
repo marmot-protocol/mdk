@@ -41,7 +41,7 @@
 - Implemented pagination support using `Pagination` struct for group messages ([#111](https://github.com/marmot-protocol/mdk/pull/111))
 - Implemented pagination support using `Pagination` struct for pending welcomes ([#110](https://github.com/marmot-protocol/mdk/pull/110))
 - **Security (Audit Issue AM)**: Added input validation constants and enforcement to prevent memory exhaustion attacks. New public constants: `DEFAULT_MAX_RELAYS_PER_GROUP`, `DEFAULT_MAX_MESSAGES_PER_GROUP`, `DEFAULT_MAX_GROUP_NAME_LENGTH`, `DEFAULT_MAX_GROUP_DESCRIPTION_LENGTH`, `DEFAULT_MAX_ADMINS_PER_GROUP`, `DEFAULT_MAX_RELAYS_PER_WELCOME`, `DEFAULT_MAX_ADMINS_PER_WELCOME`, `DEFAULT_MAX_RELAY_URL_LENGTH`. Fixes [#82](https://github.com/marmot-protocol/mdk/issues/82) ([#147](https://github.com/marmot-protocol/mdk/pull/147))
-- Added `ValidationLimits` struct for configurable validation limits, allowing users to override default memory exhaustion protection limits via `MdkMemoryStorage::with_limits()` or `MdkMemoryStorage::with_cache_size_and_limits()` ([#147](https://github.com/marmot-protocol/mdk/pull/147))
+- Added `ValidationLimits` struct for configurable validation limits, allowing users to override default memory exhaustion protection limits via `MdkMemoryStorage::with_limits()` ([#147](https://github.com/marmot-protocol/mdk/pull/147))
 
 ### Fixed
 
