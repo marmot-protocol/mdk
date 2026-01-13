@@ -474,38 +474,113 @@ CREATE TABLE openmls_epoch_key_pairs (
 
 Note: The table name for epoch key pairs is `openmls_epoch_key_pairs` in our schema (matching the trait method names), while upstream uses `openmls_epoch_keys_pairs` (with an extra 's'). We'll use the cleaner name.
 
----
-
-## Index Optimizations
-
-When creating the unified schema, we should optimize indexes compared to the current MDK schema:
-
-### Redundant Indexes to Remove
-
-The current schema has indexes on primary key columns, which are redundant since SQLite automatically indexes primary keys:
-
-- `idx_processed_messages_wrapper_event_id` - `wrapper_event_id` is already the PRIMARY KEY
-- `idx_processed_welcomes_wrapper_event_id` - `wrapper_event_id` is already the PRIMARY KEY
-
-### Composite Indexes to Add
-
-The messages pagination query (`WHERE mls_group_id = ? ORDER BY created_at DESC`) would benefit from a composite index instead of separate indexes:
+### MDK Tables
 
 ```sql
--- Replace separate indexes with a composite index for efficient pagination
-CREATE INDEX idx_messages_group_created 
-    ON messages(mls_group_id, created_at DESC);
-```
+-- Groups table
+CREATE TABLE groups (
+    mls_group_id BLOB PRIMARY KEY,
+    nostr_group_id BLOB NOT NULL,
+    name TEXT NOT NULL,
+    description TEXT NOT NULL,
+    admin_pubkeys BLOB NOT NULL,
+    last_message_id BLOB,
+    last_message_at INTEGER,
+    epoch INTEGER NOT NULL,
+    state TEXT NOT NULL,
+    image_hash BLOB,
+    image_key BLOB,
+    image_nonce BLOB
+);
 
-This allows SQLite to satisfy both the filter and sort from a single index scan.
+CREATE UNIQUE INDEX idx_groups_nostr_group_id ON groups(nostr_group_id);
 
-### OpenMLS Index Addition
+-- Group relays table
+CREATE TABLE group_relays (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    mls_group_id BLOB NOT NULL,
+    relay_url TEXT NOT NULL,
+    FOREIGN KEY (mls_group_id) REFERENCES groups(mls_group_id) ON DELETE CASCADE,
+    UNIQUE(mls_group_id, relay_url)
+);
 
-The `openmls_own_leaf_nodes` table uses an autoincrement primary key but queries filter by `group_id`. Upstream `openmls_sqlite_storage` does not have an index here, but we add one for better performance:
+CREATE INDEX idx_group_relays_mls_group_id ON group_relays(mls_group_id);
 
-```sql
-CREATE INDEX idx_openmls_own_leaf_nodes_group_id
-    ON openmls_own_leaf_nodes(group_id);
+-- Group exporter secrets table
+CREATE TABLE group_exporter_secrets (
+    mls_group_id BLOB NOT NULL,
+    epoch INTEGER NOT NULL,
+    secret BLOB NOT NULL,
+    PRIMARY KEY (mls_group_id, epoch)
+);
+
+-- Messages table
+CREATE TABLE messages (
+    mls_group_id BLOB NOT NULL,
+    id BLOB NOT NULL,
+    pubkey BLOB NOT NULL,
+    kind INTEGER NOT NULL,
+    created_at INTEGER NOT NULL,
+    content TEXT NOT NULL,
+    tags BLOB NOT NULL,
+    event BLOB NOT NULL,
+    wrapper_event_id BLOB NOT NULL,
+    state TEXT NOT NULL,
+    PRIMARY KEY (mls_group_id, id),
+    FOREIGN KEY (mls_group_id) REFERENCES groups(mls_group_id) ON DELETE CASCADE
+);
+
+-- Composite index for efficient pagination (WHERE mls_group_id = ? ORDER BY created_at DESC)
+CREATE INDEX idx_messages_group_created ON messages(mls_group_id, created_at DESC);
+CREATE INDEX idx_messages_wrapper_event_id ON messages(wrapper_event_id);
+
+-- Processed messages table
+CREATE TABLE processed_messages (
+    wrapper_event_id BLOB PRIMARY KEY,
+    message_event_id BLOB,
+    processed_at INTEGER NOT NULL,
+    state TEXT NOT NULL,
+    failure_reason TEXT
+);
+
+CREATE INDEX idx_processed_messages_message_event_id ON processed_messages(message_event_id);
+CREATE INDEX idx_processed_messages_state ON processed_messages(state);
+
+-- Welcomes table
+CREATE TABLE welcomes (
+    id BLOB PRIMARY KEY,
+    event BLOB NOT NULL,
+    mls_group_id BLOB NOT NULL,
+    nostr_group_id BLOB NOT NULL,
+    group_name TEXT NOT NULL,
+    group_description TEXT NOT NULL,
+    group_admin_pubkeys BLOB NOT NULL,
+    group_relays BLOB NOT NULL,
+    group_image_hash BLOB,
+    group_image_key BLOB,
+    group_image_nonce BLOB,
+    welcomer BLOB NOT NULL,
+    member_count INTEGER NOT NULL,
+    state TEXT NOT NULL,
+    wrapper_event_id BLOB NOT NULL
+);
+
+CREATE INDEX idx_welcomes_mls_group_id ON welcomes(mls_group_id);
+CREATE INDEX idx_welcomes_wrapper_event_id ON welcomes(wrapper_event_id);
+CREATE INDEX idx_welcomes_state ON welcomes(state);
+CREATE INDEX idx_welcomes_nostr_group_id ON welcomes(nostr_group_id);
+
+-- Processed welcomes table
+CREATE TABLE processed_welcomes (
+    wrapper_event_id BLOB PRIMARY KEY,
+    welcome_event_id BLOB,
+    processed_at INTEGER NOT NULL,
+    state TEXT NOT NULL,
+    failure_reason TEXT
+);
+
+CREATE INDEX idx_processed_welcomes_welcome_event_id ON processed_welcomes(welcome_event_id);
+CREATE INDEX idx_processed_welcomes_state ON processed_welcomes(state);
 ```
 
 ---
