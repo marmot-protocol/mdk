@@ -276,3 +276,5 @@ reviews:
   tools:
     ast-grep:
       essential_rules: true
+    clippy:
+      enabled: true
