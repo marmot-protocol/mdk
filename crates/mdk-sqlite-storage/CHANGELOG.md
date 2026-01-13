@@ -27,6 +27,11 @@
 
 ### Breaking changes
 
+- **Unified Storage Architecture**: `MdkSqliteStorage` now directly implements OpenMLS's `StorageProvider<1>` trait instead of wrapping `openmls_sqlite_storage`. This enables atomic transactions across MLS and MDK state, which is required for proper commit race resolution per MIP-03. ([#148](https://github.com/marmot-protocol/mdk/pull/148))
+  - Removed `openmls_sqlite_storage` dependency
+  - New unified schema in `V001__initial_schema.sql` replaces all previous migrations
+  - All MLS tables (`openmls_*`) are now managed directly by MDK
+  - Single database connection enables transactional consistency
 - **Security (Audit Issue M)**: Changed `MessageStorage::find_message_by_event_id()` to require both `mls_group_id` and `event_id` parameters. This prevents messages from different groups from overwriting each other. Database migration V105 changes the messages table primary key from `id` to `(mls_group_id, id)`. ([#124](https://github.com/marmot-protocol/mdk/pull/124))
 - Updated `messages()` implementation to accept `Option<Pagination>` parameter ([#111](https://github.com/marmot-protocol/mdk/pull/111))
 - Updated `pending_welcomes()` implementation to accept `Option<Pagination>` parameter ([#110](https://github.com/marmot-protocol/mdk/pull/110))
@@ -40,6 +45,10 @@
 
 ### Added
 
+- **MLS Storage Module**: New `mls_storage` module with complete `StorageProvider<1>` implementation for OpenMLS integration ([#148](https://github.com/marmot-protocol/mdk/pull/148))
+  - JSON codec for serializing/deserializing OpenMLS types
+  - Support for all 56 `StorageProvider<1>` methods
+  - Manages 8 OpenMLS tables: `openmls_group_data`, `openmls_proposals`, `openmls_own_leaf_nodes`, `openmls_key_packages`, `openmls_psks`, `openmls_signature_keys`, `openmls_encryption_keys`, `openmls_epoch_key_pairs`
 - Input validation for storage operations to prevent unbounded writes ([#94](https://github.com/marmot-protocol/mdk/pull/94))
   - Message content limited to 1MB
   - Group names limited to 255 bytes
@@ -67,6 +76,9 @@
 - Propagate `last_message_id` parse errors in `row_to_group` instead of silently converting to `None` ([#105](https://github.com/marmot-protocol/mdk/pull/105))
 
 ### Removed
+
+- Removed `openmls_sqlite_storage` dependency in favor of direct `StorageProvider<1>` implementation ([#148](https://github.com/marmot-protocol/mdk/pull/148))
+- Removed legacy migrations V100-V105 in favor of unified V001 schema ([#148](https://github.com/marmot-protocol/mdk/pull/148))
 
 ### Deprecated
 

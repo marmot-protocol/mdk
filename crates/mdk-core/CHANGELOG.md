@@ -27,6 +27,7 @@
 
 ### Breaking changes
 
+- **Unified Storage Architecture**: `MdkProvider` now uses the storage provider directly as the OpenMLS `StorageProvider`, instead of accessing it via `openmls_storage()`. This enables atomic transactions across MLS and MDK state for proper commit race resolution per MIP-03. Storage implementations must now directly implement `StorageProvider<1>`. ([#148](https://github.com/marmot-protocol/mdk/pull/148))
 - **OpenMLS Dependency**: Updated to OpenMLS git main branch (commit b90ca23b) for GREASE support. This may introduce minor API changes from upstream. The dependency will be reverted to crates.io versions once OpenMLS releases a version with GREASE support. ([#142](https://github.com/marmot-protocol/mdk/pull/142))
 - **Legacy Format Removal**: Removed support for legacy key package tag formats and extension formats that were deprecated after EOY 2025 migration period ([#146](https://github.com/marmot-protocol/mdk/pull/146))
   - Key package validation now only accepts MIP-00 compliant formats:

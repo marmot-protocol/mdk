@@ -27,6 +27,10 @@
 
 ### Breaking changes
 
+- **Unified Storage Architecture**: `MdkMemoryStorage` now directly implements OpenMLS's `StorageProvider<1>` trait instead of wrapping `openmls_memory_storage`. This enables unified in-memory storage for both MLS and MDK state, consistent with the SQLite implementation. ([#148](https://github.com/marmot-protocol/mdk/pull/148))
+  - Removed `openmls_memory_storage` dependency
+  - All MLS state is now stored in unified in-memory data structures
+  - Consistent API with `MdkSqliteStorage` for easier testing
 - Updated `messages()` implementation to accept `Option<Pagination>` parameter ([#111](https://github.com/marmot-protocol/mdk/pull/111))
 - Updated `pending_welcomes()` implementation to accept `Option<Pagination>` parameter ([#110](https://github.com/marmot-protocol/mdk/pull/110))
 
@@ -38,6 +42,11 @@
 
 ### Added
 
+- **MLS Storage Module**: New `mls_storage` module with complete `StorageProvider<1>` implementation for OpenMLS integration ([#148](https://github.com/marmot-protocol/mdk/pull/148))
+  - JSON codec for serializing/deserializing OpenMLS types
+  - Support for all 56 `StorageProvider<1>` methods
+  - In-memory storage using `HashMap` for all MLS data types
+- **Snapshot Support**: New `snapshot` module for creating and restoring storage snapshots, useful for testing rollback scenarios ([#148](https://github.com/marmot-protocol/mdk/pull/148))
 - Implemented pagination support using `Pagination` struct for group messages ([#111](https://github.com/marmot-protocol/mdk/pull/111))
 - Implemented pagination support using `Pagination` struct for pending welcomes ([#110](https://github.com/marmot-protocol/mdk/pull/110))
 
@@ -53,7 +62,10 @@
 - **Security (Audit Issue AN)**: Fixed security issue where `save_message` would accept messages for non-existent groups, allowing cache pollution. Now verifies group existence before inserting messages into the cache. ([#113](https://github.com/marmot-protocol/mdk/pull/113))
 - **Security (Audit Issue AO)**: Removed MLS group identifiers from error messages to prevent metadata leakage in logs and telemetry. Error messages now use generic "Group not found" instead of including the sensitive 32-byte MLS group ID. ([#112](https://github.com/marmot-protocol/mdk/pull/112))
 - Fix `admins()` to return `InvalidParameters` error when group not found, instead of incorrectly returning `NoAdmins` ([#104](https://github.com/marmot-protocol/mdk/pull/104))
+
 ### Removed
+
+- Removed `openmls_memory_storage` dependency in favor of direct `StorageProvider<1>` implementation ([#148](https://github.com/marmot-protocol/mdk/pull/148))
 
 ### Deprecated
 

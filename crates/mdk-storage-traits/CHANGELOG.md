@@ -27,6 +27,10 @@
 
 ### Breaking changes
 
+- **Unified Storage Architecture**: The `MdkStorageProvider` trait now requires implementors to directly implement OpenMLS's `StorageProvider<1>` trait, enabling atomic transactions across MLS and MDK state. This is required for proper commit race resolution per MIP-03. ([#148](https://github.com/marmot-protocol/mdk/pull/148))
+  - Removed `OpenMlsStorageProvider` associated type
+  - Removed `openmls_storage()` and `openmls_storage_mut()` accessor methods
+  - Storage implementations must now implement all 56 `StorageProvider<1>` methods directly
 - **Security (Audit Issue M)**: Changed `MessageStorage::find_message_by_event_id()` to require both `mls_group_id` and `event_id` parameters. This prevents messages from different groups from overwriting each other by scoping lookups to a specific group. ([#124](https://github.com/marmot-protocol/mdk/pull/124))
 - **Secret Type Wrapper**: Secret values now use `Secret<T>` wrapper for automatic zeroization ([#109](https://github.com/marmot-protocol/mdk/pull/109))
   - `Group.image_key` changed from `Option<[u8; 32]>` to `Option<Secret<[u8; 32]>>`
@@ -43,6 +47,7 @@
 
 ### Added
 
+- **MdkStorageError**: New error type for OpenMLS `StorageProvider` trait implementations, with variants for database, serialization, deserialization, not found, and other errors. ([#148](https://github.com/marmot-protocol/mdk/pull/148))
 - **Secret Type and Zeroization**: Added `Secret<T>` wrapper type that automatically zeroizes memory on drop ([#109](https://github.com/marmot-protocol/mdk/pull/109))
   - Implements `Zeroize` trait for `[u8; 32]`, `[u8; 12]`, and `Vec<u8>`
   - Provides `Deref` and `DerefMut` for transparent access to wrapped values
