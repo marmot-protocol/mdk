@@ -1,13 +1,11 @@
 //! Memory-based storage implementation of the MdkStorageProvider trait for Nostr MLS messages
 
-use mdk_storage_traits::GroupId;
 use std::collections::HashMap;
 
+use mdk_storage_traits::GroupId;
 use nostr::EventId;
 #[cfg(test)]
 use nostr::{Kind, PublicKey, Tags, Timestamp, UnsignedEvent};
-#[cfg(test)]
-use openmls_memory_storage::MemoryStorage;
 
 use mdk_storage_traits::groups::GroupStorage;
 use mdk_storage_traits::messages::MessageStorage;
@@ -150,7 +148,7 @@ mod tests {
     /// of the HashMap-based implementation.
     #[test]
     fn test_save_message_update_existing() {
-        let storage = MdkMemoryStorage::new(MemoryStorage::default());
+        let storage = MdkMemoryStorage::new();
 
         let group_id = GroupId::from_slice(&[1, 2, 3, 4]);
         let event_id = EventId::from_slice(&[10u8; 32]).unwrap();
@@ -208,7 +206,7 @@ mod tests {
     /// Test that messages are properly isolated between different groups
     #[test]
     fn test_save_message_multiple_groups() {
-        let storage = MdkMemoryStorage::new(MemoryStorage::default());
+        let storage = MdkMemoryStorage::new();
 
         let group1_id = GroupId::from_slice(&[1, 1, 1, 1]);
         let group2_id = GroupId::from_slice(&[2, 2, 2, 2]);
@@ -278,7 +276,7 @@ mod tests {
     /// Test that multiple updates to the same message work correctly
     #[test]
     fn test_save_message_multiple_updates() {
-        let storage = MdkMemoryStorage::new(MemoryStorage::default());
+        let storage = MdkMemoryStorage::new();
 
         let group_id = GroupId::from_slice(&[1, 2, 3, 4]);
         let event_id = EventId::from_slice(&[50u8; 32]).unwrap();
@@ -320,7 +318,7 @@ mod tests {
     /// Test that updating message state works correctly
     #[test]
     fn test_save_message_state_update() {
-        let storage = MdkMemoryStorage::new(MemoryStorage::default());
+        let storage = MdkMemoryStorage::new();
 
         let group_id = GroupId::from_slice(&[1, 2, 3, 4]);
         let event_id = EventId::from_slice(&[75u8; 32]).unwrap();

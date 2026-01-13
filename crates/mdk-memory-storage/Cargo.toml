@@ -16,8 +16,10 @@ lru.workspace = true
 mdk-storage-traits.workspace = true
 nostr = { workspace = true, features = ["std"] }
 openmls.workspace = true
-openmls_memory_storage.workspace = true
+openmls_traits.workspace = true
 parking_lot.workspace = true
+serde = { workspace = true, features = ["std", "derive"] }
+serde_json.workspace = true
 
 [dev-dependencies]
 mdk-storage-traits = { workspace = true, features = ["test-utils"] }

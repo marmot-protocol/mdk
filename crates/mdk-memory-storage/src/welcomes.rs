@@ -76,15 +76,15 @@ impl WelcomeStorage for MdkMemoryStorage {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use mdk_storage_traits::GroupId;
     use mdk_storage_traits::test_utils::cross_storage::create_test_welcome;
     use nostr::EventId;
-    use openmls_memory_storage::MemoryStorage;
+
+    use super::*;
 
     #[test]
     fn test_pending_welcomes_pagination_memory() {
-        let storage = MdkMemoryStorage::new(MemoryStorage::default());
+        let storage = MdkMemoryStorage::new();
 
         let mls_group_id = GroupId::from_slice(&[1, 2, 3, 4]);
 
@@ -165,7 +165,7 @@ mod tests {
         assert_eq!(result.unwrap().len(), 0); // No results at that offset
 
         // Test 11: Empty results when no pending entries
-        let storage2 = MdkMemoryStorage::new(MemoryStorage::default());
+        let storage2 = MdkMemoryStorage::new();
         let empty = storage2
             .pending_welcomes(Some(Pagination::new(Some(10), Some(0))))
             .unwrap();

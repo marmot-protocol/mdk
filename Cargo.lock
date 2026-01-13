@@ -1448,8 +1448,10 @@ dependencies = [
  "mdk-storage-traits",
  "nostr",
  "openmls",
- "openmls_memory_storage",
+ "openmls_traits",
  "parking_lot",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

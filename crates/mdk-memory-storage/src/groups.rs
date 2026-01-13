@@ -182,16 +182,16 @@ impl GroupStorage for MdkMemoryStorage {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use mdk_storage_traits::groups::types::GroupState;
     use mdk_storage_traits::messages::MessageStorage;
     use mdk_storage_traits::messages::types::{Message, MessageState};
     use nostr::{EventId, Kind, PublicKey, Tags, Timestamp, UnsignedEvent};
-    use openmls_memory_storage::MemoryStorage;
+
+    use super::*;
 
     #[test]
     fn test_messages_pagination_memory() {
-        let storage = MdkMemoryStorage::new(MemoryStorage::default());
+        let storage = MdkMemoryStorage::new();
 
         // Create a test group
         let mls_group_id = GroupId::from_slice(&[1, 2, 3, 4]);

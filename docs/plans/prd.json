@@ -276,7 +276,7 @@
           "title": "Enable WAL Mode",
           "description": "Configure SQLite to use WAL mode for better concurrent read performance.",
           "status": "pending",
-          "notes": "Not yet implemented - WAL mode configuration still needs to be added"
+          "notes": "Not yet implemented - WAL mode configuration still needs to be added",
           "acceptance_criteria": [
             "PRAGMA journal_mode=WAL executed on connection open",
             "WAL mode verified in tests",
@@ -292,13 +292,13 @@
       "id": "phase-3",
       "name": "Implement StorageProvider<1> for MdkMemoryStorage",
       "description": "Make MdkMemoryStorage directly implement the OpenMLS storage trait with unified in-memory data structures.",
-      "status": "pending",
+      "status": "complete",
       "requirements": [
         {
           "id": "REQ-3.1",
           "title": "Remove openmls_memory_storage Dependency",
           "description": "Remove the external OpenMLS memory storage dependency.",
-          "status": "pending",
+          "status": "complete",
           "acceptance_criteria": [
             "openmls_memory_storage removed from mdk-memory-storage/Cargo.toml",
             "openmls_memory_storage removed from workspace Cargo.toml if present",
@@ -312,7 +312,7 @@
           "id": "REQ-3.2",
           "title": "Add MLS In-Memory Data Structures",
           "description": "Add HashMap-based storage for all MLS state types.",
-          "status": "pending",
+          "status": "complete",
           "acceptance_criteria": [
             "mls_group_data: RwLock<HashMap<(Vec<u8>, GroupDataType), Vec<u8>>> added",
             "mls_proposals: RwLock<HashMap<(Vec<u8>, Vec<u8>), Vec<u8>>> added",
@@ -326,14 +326,14 @@
           ],
           "deliverables": [
             "Updated crates/mdk-memory-storage/src/lib.rs",
-            "crates/mdk-memory-storage/src/mls_storage.rs"
+            "crates/mdk-memory-storage/src/mls_storage/mod.rs"
           ]
         },
         {
           "id": "REQ-3.3",
           "title": "Implement StorageProvider Methods for Memory",
           "description": "Implement all 56 StorageProvider<1> methods for in-memory storage.",
-          "status": "pending",
+          "status": "complete",
           "acceptance_criteria": [
             "All 18 write methods implemented",
             "All 19 read methods implemented",
@@ -342,14 +342,14 @@
             "All methods tested"
           ],
           "deliverables": [
-            "StorageProvider impl in crates/mdk-memory-storage/src/mls_storage.rs"
+            "StorageProvider impl in crates/mdk-memory-storage/src/lib.rs"
           ]
         },
         {
           "id": "REQ-3.4",
           "title": "Implement Snapshot/Rollback Support",
           "description": "Add snapshot capability for testing parity with SQLite savepoints.",
-          "status": "pending",
+          "status": "complete",
           "acceptance_criteria": [
             "MemoryStorageSnapshot struct defined with cloned state from all HashMaps and LRU caches",
             "create_snapshot() method clones all internal state",
@@ -366,7 +366,7 @@
           "id": "REQ-3.5",
           "title": "Update Existing MDK Storage Implementations",
           "description": "Ensure GroupStorage, MessageStorage, and WelcomeStorage implementations work with unified structure.",
-          "status": "pending",
+          "status": "complete",
           "acceptance_criteria": [
             "GroupStorage impl uses unified data structures",
             "MessageStorage impl uses unified data structures",
