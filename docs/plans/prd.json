@@ -384,13 +384,13 @@
       "id": "phase-4",
       "name": "Update mdk-core",
       "description": "Update MdkProvider to work with the new trait bounds where storage IS the provider.",
-      "status": "pending",
+      "status": "complete",
       "requirements": [
         {
           "id": "REQ-4.1",
           "title": "Update MdkProvider Implementation",
           "description": "Modify OpenMlsProvider impl for MdkProvider to return Storage directly instead of Storage::OpenMlsStorageProvider.",
-          "status": "pending",
+          "status": "complete",
           "acceptance_criteria": [
             "OpenMlsProvider impl updated: type StorageProvider = Storage",
             "storage() method returns &self.storage directly",
@@ -405,7 +405,7 @@
           "id": "REQ-4.2",
           "title": "Update Any Direct Storage Access",
           "description": "Find and update any code that was using openmls_storage() or openmls_storage_mut() accessors.",
-          "status": "pending",
+          "status": "complete",
           "acceptance_criteria": [
             "Grep for openmls_storage returns no results in mdk-core",
             "All direct OpenMLS storage access updated to use storage directly",
@@ -419,7 +419,7 @@
           "id": "REQ-4.3",
           "title": "Remove Unused OpenMLS Storage Dependencies",
           "description": "Clean up workspace-level dependencies that are no longer needed.",
-          "status": "pending",
+          "status": "complete",
           "acceptance_criteria": [
             "openmls_sqlite_storage removed from workspace Cargo.toml",
             "openmls_memory_storage removed from workspace Cargo.toml",

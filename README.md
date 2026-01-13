@@ -60,7 +60,7 @@ pub struct MdkProvider<Storage> {
 impl<Storage> OpenMlsProvider for MdkProvider<Storage> {
     type CryptoProvider = RustCrypto;
     type RandProvider = RustCrypto;
-    type StorageProvider = Storage::OpenMlsStorageProvider;
+    type StorageProvider = Storage;  // Storage directly implements StorageProvider<1>
     // ... implementation details
 }
 ```

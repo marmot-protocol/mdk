@@ -1,7 +1,6 @@
 //! Memory storage implementation tests using shared test functions
 
 use mdk_memory_storage::MdkMemoryStorage;
-use openmls_memory_storage::MemoryStorage;
 
 mod shared;
 
@@ -10,7 +9,7 @@ macro_rules! test_memory_storage {
     ($test_name:ident, $test_fn:path) => {
         #[test]
         fn $test_name() {
-            let storage = MdkMemoryStorage::new(MemoryStorage::default());
+            let storage = MdkMemoryStorage::default();
             $test_fn(storage);
         }
     };

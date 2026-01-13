@@ -10,7 +10,6 @@ use mdk_sqlite_storage::MdkSqliteStorage;
 use mdk_storage_traits::GroupId;
 use mdk_storage_traits::groups::GroupStorage;
 use nostr::RelayUrl;
-use openmls_memory_storage::MemoryStorage;
 
 mod shared;
 
@@ -25,7 +24,7 @@ impl Default for StorageTestHarness {
         Self {
             sqlite: MdkSqliteStorage::new_unencrypted(":memory:")
                 .expect("Failed to create SQLite storage"),
-            memory: MdkMemoryStorage::new(MemoryStorage::default()),
+            memory: MdkMemoryStorage::default(),
         }
     }
 }

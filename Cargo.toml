@@ -22,8 +22,6 @@ openmls = { version = "0.7.1", default-features = false }
 openmls_traits = { version = "0.4.1", default-features = false }
 openmls_basic_credential = { version = "0.4.1", default-features = false }
 openmls_rust_crypto = { version = "0.4.1", default-features = false }
-openmls_memory_storage = { version = "0.4.1", default-features = false }
-openmls_sqlite_storage = { version = "0.1.1", default-features = false }
 
 # Nostr
 nostr = { version = "0.43", default-features = false }

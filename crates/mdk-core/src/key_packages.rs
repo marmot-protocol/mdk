@@ -5,7 +5,6 @@ use nostr::{Event, Kind, PublicKey, RelayUrl, Tag, TagKind};
 use openmls::key_packages::KeyPackage;
 use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
-use openmls_traits::storage::StorageProvider;
 use tls_codec::{Deserialize as TlsDeserialize, Serialize as TlsSerialize};
 
 use crate::MDK;

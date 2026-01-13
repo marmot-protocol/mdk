@@ -215,10 +215,10 @@ where
 {
     type CryptoProvider = RustCrypto;
     type RandProvider = RustCrypto;
-    type StorageProvider = Storage::OpenMlsStorageProvider;
+    type StorageProvider = Storage;
 
     fn storage(&self) -> &Self::StorageProvider {
-        self.storage.openmls_storage()
+        &self.storage
     }
 
     fn crypto(&self) -> &Self::CryptoProvider {
