@@ -76,13 +76,6 @@ reviews:
 
     # Custom checks for MDK-specific requirements
     custom_checks:
-      - name: "Changelog Updated"
-        mode: "warning"
-        instructions: |
-          Pass if: The PR updates a CHANGELOG.md file in one of the crate directories (crates/mdk-core/, crates/mdk-storage-traits/, crates/mdk-memory-storage/, crates/mdk-sqlite-storage/) with an entry under the "## Unreleased" section.
-          Fail if: The PR modifies Rust source files (.rs) in a crate but does not update that crate's CHANGELOG.md.
-          Exception: PRs that only modify tests, CI configuration, documentation (*.md outside of CHANGELOG), or example code may pass without changelog updates.
-
       - name: "No Sensitive Identifier Leakage"
         mode: "error"
         instructions: |
