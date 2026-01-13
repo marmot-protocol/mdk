@@ -113,7 +113,31 @@ MdkMemoryStorage
 
 **Changes**:
 
-1. **Update `MdkStorageProvider` trait** (`crates/mdk-storage-traits/src/lib.rs`):
+1. **Create new `MdkStorageError` enum** for the `StorageProvider` associated error type:
+
+   ```rust
+   /// Error type for MDK storage operations.
+   /// Used as the associated `Error` type for OpenMLS `StorageProvider` trait.
+   #[derive(Debug, Error)]
+   pub enum MdkStorageError {
+       #[error("Database error: {0}")]
+       Database(String),
+       
+       #[error("Serialization error: {0}")]
+       Serialization(String),
+       
+       #[error("Deserialization error: {0}")]
+       Deserialization(String),
+       
+       #[error("Not found: {0}")]
+       NotFound(String),
+       
+       #[error("Storage error: {0}")]
+       Other(String),
+   }
+   ```
+
+2. **Update `MdkStorageProvider` trait** (`crates/mdk-storage-traits/src/lib.rs`):
 
    ```rust
    // Before
@@ -134,6 +158,7 @@ MdkMemoryStorage
 **Files Modified**:
 
 - `crates/mdk-storage-traits/src/lib.rs`
+- `crates/mdk-storage-traits/src/error.rs` (new file for `MdkStorageError`)
 
 ---
 
@@ -145,8 +170,28 @@ MdkMemoryStorage
 
 1. **Remove `openmls_sqlite_storage` dependency** from `Cargo.toml`
 
-2. **Create new MLS storage module** with adapted implementation:
+2. **Implement JSON codec** for serializing/deserializing OpenMLS types to SQLite blobs. Based on the approach used by `openmls_sqlite_storage` but maintained by us:
+
+   ```rust
+   /// Codec for serializing OpenMLS types to JSON for storage.
+   pub struct JsonCodec;
+   
+   impl JsonCodec {
+       pub fn serialize<T: Serialize>(value: &T) -> Result<Vec<u8>, MdkStorageError> {
+           serde_json::to_vec(value)
+               .map_err(|e| MdkStorageError::Serialization(e.to_string()))
+       }
+       
+       pub fn deserialize<T: DeserializeOwned>(data: &[u8]) -> Result<T, MdkStorageError> {
+           serde_json::from_slice(data)
+               .map_err(|e| MdkStorageError::Deserialization(e.to_string()))
+       }
+   }
+   ```
+
+3. **Create new MLS storage module** with adapted implementation:
    - `crates/mdk-sqlite-storage/src/mls_storage/mod.rs` - Main impl
+   - `crates/mdk-sqlite-storage/src/mls_storage/codec.rs` - JSON codec
    - `crates/mdk-sqlite-storage/src/mls_storage/group_data.rs` - Polymorphic group data
    - `crates/mdk-sqlite-storage/src/mls_storage/proposals.rs`
    - `crates/mdk-sqlite-storage/src/mls_storage/key_packages.rs`
@@ -156,7 +201,7 @@ MdkMemoryStorage
    - `crates/mdk-sqlite-storage/src/mls_storage/own_leaf_nodes.rs`
    - `crates/mdk-sqlite-storage/src/mls_storage/psks.rs`
 
-3. **Update struct definition**:
+4. **Update struct definition**:
 
    ```rust
    // Before
@@ -229,11 +274,41 @@ MdkMemoryStorage
 
 3. **Implement all 56 `StorageProvider<1>` methods**
 
+4. **Add snapshot/rollback support** for testing parity with SQLite savepoints:
+
+   ```rust
+   /// A snapshot of all in-memory state that can be restored later.
+   #[derive(Clone)]
+   pub struct MemoryStorageSnapshot {
+       // Cloned state from all HashMaps and LRU caches
+       mls_group_data: HashMap<(Vec<u8>, GroupDataType), Vec<u8>>,
+       mls_proposals: HashMap<(Vec<u8>, Vec<u8>), Vec<u8>>,
+       // ... all other state
+       groups_cache: HashMap<GroupId, Group>,
+       // ... etc
+   }
+   
+   impl MdkMemoryStorage {
+       /// Create a snapshot of the current state.
+       pub fn create_snapshot(&self) -> MemoryStorageSnapshot {
+           // Clone all internal state
+       }
+       
+       /// Restore state from a snapshot, discarding current state.
+       pub fn restore_snapshot(&self, snapshot: MemoryStorageSnapshot) {
+           // Replace all internal state with snapshot
+       }
+   }
+   ```
+
+   This enables the same rollback patterns as SQLite savepoints for testing and ensures memory storage can be used for integration tests that exercise rollback logic.
+
 **Files Modified/Created**:
 
 - `crates/mdk-memory-storage/Cargo.toml`
 - `crates/mdk-memory-storage/src/lib.rs`
 - `crates/mdk-memory-storage/src/mls_storage.rs` (new module)
+- `crates/mdk-memory-storage/src/snapshot.rs` (new module for snapshot support)
 
 ---
 
@@ -300,15 +375,20 @@ just precommit
 | File | Action | Description |
 |------|--------|-------------|
 | `crates/mdk-storage-traits/src/lib.rs` | Modify | Update `MdkStorageProvider` trait |
+| `crates/mdk-storage-traits/src/error.rs` | Create | New `MdkStorageError` enum |
 | `crates/mdk-sqlite-storage/Cargo.toml` | Modify | Remove `openmls_sqlite_storage` dep |
 | `crates/mdk-sqlite-storage/src/lib.rs` | Modify | Single connection, new struct |
 | `crates/mdk-sqlite-storage/src/mls_storage/` | Create | New module with 56 method impls |
+| `crates/mdk-sqlite-storage/src/mls_storage/codec.rs` | Create | JSON codec for serialization |
 | `crates/mdk-sqlite-storage/migrations/` | Replace | Fresh migrations starting at V001 |
 | `crates/mdk-memory-storage/Cargo.toml` | Modify | Remove `openmls_memory_storage` dep |
 | `crates/mdk-memory-storage/src/lib.rs` | Modify | Add MLS data structures |
 | `crates/mdk-memory-storage/src/mls_storage.rs` | Create | New module with 56 method impls |
+| `crates/mdk-memory-storage/src/snapshot.rs` | Create | Snapshot/rollback support |
 | `crates/mdk-core/src/lib.rs` | Modify | Update `MdkProvider` impl |
 | `Cargo.toml` (workspace) | Modify | Remove unused OpenMLS storage deps |
+| `crates/mdk-sqlite-storage/migrations/V100__*.sql` | Delete | Remove old migration files |
+| `crates/mdk-sqlite-storage/migrations/V10*__*.sql` | Delete | Remove old migration files |
 
 ---
 
@@ -582,6 +662,18 @@ CREATE TABLE processed_welcomes (
 CREATE INDEX idx_processed_welcomes_welcome_event_id ON processed_welcomes(welcome_event_id);
 CREATE INDEX idx_processed_welcomes_state ON processed_welcomes(state);
 ```
+
+---
+
+## Open Questions
+
+### Thread Safety / Connection Sharing
+
+The current SQLite storage uses `Arc<Mutex<Connection>>`. Should we consider:
+- A connection pool for better concurrent access?
+- Keeping single connection with mutex (simpler, current approach)?
+
+This needs further investigation based on actual usage patterns and performance requirements.
 
 ---
 
