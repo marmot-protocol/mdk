@@ -167,49 +167,92 @@ impl ValidationLimits {
     }
 
     /// Sets the maximum number of relays allowed per group.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `limit` is 0.
     pub fn with_max_relays_per_group(mut self, limit: usize) -> Self {
+        assert!(limit > 0, "max_relays_per_group must be greater than 0");
         self.max_relays_per_group = limit;
         self
     }
 
     /// Sets the maximum number of messages stored per group.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `limit` is 0.
     pub fn with_max_messages_per_group(mut self, limit: usize) -> Self {
+        assert!(limit > 0, "max_messages_per_group must be greater than 0");
         self.max_messages_per_group = limit;
         self
     }
 
     /// Sets the maximum length of a group name in bytes.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `limit` is 0.
     pub fn with_max_group_name_length(mut self, limit: usize) -> Self {
+        assert!(limit > 0, "max_group_name_length must be greater than 0");
         self.max_group_name_length = limit;
         self
     }
 
     /// Sets the maximum length of a group description in bytes.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `limit` is 0.
     pub fn with_max_group_description_length(mut self, limit: usize) -> Self {
+        assert!(
+            limit > 0,
+            "max_group_description_length must be greater than 0"
+        );
         self.max_group_description_length = limit;
         self
     }
 
     /// Sets the maximum number of admin pubkeys per group.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `limit` is 0.
     pub fn with_max_admins_per_group(mut self, limit: usize) -> Self {
+        assert!(limit > 0, "max_admins_per_group must be greater than 0");
         self.max_admins_per_group = limit;
         self
     }
 
     /// Sets the maximum number of relays in a welcome message.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `limit` is 0.
     pub fn with_max_relays_per_welcome(mut self, limit: usize) -> Self {
+        assert!(limit > 0, "max_relays_per_welcome must be greater than 0");
         self.max_relays_per_welcome = limit;
         self
     }
 
     /// Sets the maximum number of admin pubkeys in a welcome message.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `limit` is 0.
     pub fn with_max_admins_per_welcome(mut self, limit: usize) -> Self {
+        assert!(limit > 0, "max_admins_per_welcome must be greater than 0");
         self.max_admins_per_welcome = limit;
         self
     }
 
     /// Sets the maximum length of a relay URL in bytes.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `limit` is 0.
     pub fn with_max_relay_url_length(mut self, limit: usize) -> Self {
+        assert!(limit > 0, "max_relay_url_length must be greater than 0");
         self.max_relay_url_length = limit;
         self
     }
