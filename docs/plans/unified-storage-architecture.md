@@ -57,14 +57,14 @@ MdkMemoryStorage
 
 **OpenMLS Tables (8 tables, managed by openmls_sqlite_storage):**
 
-- `openmls_group_data` - Polymorphic storage for 11 group data types
+- `openmls_group_data` - Polymorphic storage for 12 group data types (join_group_config, tree, interim_transcript_hash, context, confirmation_tag, group_state, message_secrets, resumption_psk_store, own_leaf_index, use_ratchet_tree_extension, group_epoch_secrets, application_export_tree)
 - `openmls_proposals` - Queued proposals
+- `openmls_own_leaf_nodes` - Own leaf nodes per group
 - `openmls_key_packages` - Key packages
 - `openmls_psks` - Pre-shared keys
 - `openmls_signature_keys` - Signature key pairs
 - `openmls_encryption_keys` - HPKE encryption key pairs
 - `openmls_epoch_keys_pairs` - Epoch HPKE key pairs
-- `openmls_own_leaf_nodes` - Own leaf nodes per group
 
 **MDK Tables (7 tables, managed by mdk-sqlite-storage):**
 
@@ -83,14 +83,14 @@ MdkMemoryStorage
 ```
 MdkSqliteStorage
 └── connection: Arc<Mutex<Connection>>  ← Single connection
-    ├── impl StorageProvider<1>         ← OpenMLS trait (54 methods)
+    ├── impl StorageProvider<1>         ← OpenMLS trait (56 methods)
     ├── impl GroupStorage               ← MDK trait
     ├── impl MessageStorage             ← MDK trait
     └── impl WelcomeStorage             ← MDK trait
 
 MdkMemoryStorage
 └── unified data structures
-    ├── impl StorageProvider<1>         ← OpenMLS trait (54 methods)
+    ├── impl StorageProvider<1>         ← OpenMLS trait (56 methods)
     ├── impl GroupStorage               ← MDK trait
     ├── impl MessageStorage             ← MDK trait
     └── impl WelcomeStorage             ← MDK trait
@@ -174,10 +174,10 @@ MdkMemoryStorage
 4. **Fresh migration system** - Since this is a breaking change, start with new migration numbering:
    - `V001__initial_schema.sql` - Creates all tables (both MLS and MDK) in a single migration
 
-5. **Implement all 54 `StorageProvider<1>` methods**:
-   - 17 write methods
-   - 17 read methods
-   - 18 delete methods
+5. **Implement all 56 `StorageProvider<1>` methods**:
+   - 18 write methods
+   - 19 read methods
+   - 19 delete methods
    - Keep JSON serialization (same codec as before)
 
 6. **Add transaction/savepoint support**:
@@ -227,7 +227,7 @@ MdkMemoryStorage
    }
    ```
 
-3. **Implement all 54 `StorageProvider<1>` methods**
+3. **Implement all 56 `StorageProvider<1>` methods**
 
 **Files Modified/Created**:
 
@@ -302,11 +302,11 @@ just precommit
 | `crates/mdk-storage-traits/src/lib.rs` | Modify | Update `MdkStorageProvider` trait |
 | `crates/mdk-sqlite-storage/Cargo.toml` | Modify | Remove `openmls_sqlite_storage` dep |
 | `crates/mdk-sqlite-storage/src/lib.rs` | Modify | Single connection, new struct |
-| `crates/mdk-sqlite-storage/src/mls_storage/` | Create | New module with 54 method impls |
+| `crates/mdk-sqlite-storage/src/mls_storage/` | Create | New module with 56 method impls |
 | `crates/mdk-sqlite-storage/migrations/` | Replace | Fresh migrations starting at V001 |
 | `crates/mdk-memory-storage/Cargo.toml` | Modify | Remove `openmls_memory_storage` dep |
 | `crates/mdk-memory-storage/src/lib.rs` | Modify | Add MLS data structures |
-| `crates/mdk-memory-storage/src/mls_storage.rs` | Create | New module with 54 method impls |
+| `crates/mdk-memory-storage/src/mls_storage.rs` | Create | New module with 56 method impls |
 | `crates/mdk-core/src/lib.rs` | Modify | Update `MdkProvider` impl |
 | `Cargo.toml` (workspace) | Modify | Remove unused OpenMLS storage deps |
 
@@ -314,13 +314,13 @@ just precommit
 
 ## OpenMLS `StorageProvider<1>` Trait Reference
 
-The trait requires 54 methods plus one associated type:
+The trait requires 56 methods plus one associated type (and 1 provided default method):
 
 ### Associated Type
 
 - `type Error: Debug + Error`
 
-### Write Methods (17)
+### Write Methods (18)
 
 | Method | Description |
 |--------|-------------|
@@ -336,13 +336,14 @@ The trait requires 54 methods plus one associated type:
 | `write_resumption_psk_store` | Write resumption PSK store |
 | `write_own_leaf_index` | Write own leaf index |
 | `write_group_epoch_secrets` | Write group epoch secrets |
+| `write_application_export_tree` | Write application export tree (feature-gated) |
 | `write_signature_key_pair` | Store signature key pair |
 | `write_encryption_key_pair` | Store HPKE encryption key pair |
 | `write_encryption_epoch_key_pairs` | Store list of epoch HPKE key pairs |
 | `write_key_package` | Store key package |
 | `write_psk` | Store PSK |
 
-### Read Methods (17)
+### Read Methods (19)
 
 | Method | Returns |
 |--------|---------|
@@ -364,8 +365,9 @@ The trait requires 54 methods plus one associated type:
 | `encryption_epoch_key_pairs` | `Vec<HpkeKeyPair>` |
 | `key_package` | `Option<KeyPackage>` |
 | `psk` | `Option<PskBundle>` |
+| `application_export_tree` | `Option<ApplicationExportTree>` (feature-gated) |
 
-### Delete Methods (18)
+### Delete Methods (19)
 
 | Method | Description |
 |--------|-------------|
@@ -387,16 +389,18 @@ The trait requires 54 methods plus one associated type:
 | `delete_encryption_epoch_key_pairs` | Delete epoch HPKE key pairs |
 | `delete_key_package` | Delete key package |
 | `delete_psk` | Delete PSK |
+| `delete_application_export_tree` | Delete application export tree (feature-gated) |
 
 ---
 
 ## Schema Design
 
-We will keep the polymorphic pattern from OpenMLS for group data, using the `openmls_` prefix since these tables are tightly coupled to the OpenMLS `StorageProvider` trait:
+We will keep the polymorphic pattern from OpenMLS for group data, using the `openmls_` prefix since these tables are tightly coupled to the OpenMLS `StorageProvider` trait. The schema below matches the upstream `openmls_sqlite_storage` schema exactly:
 
 ```sql
--- Polymorphic group data storage (11 data types in one table)
+-- Polymorphic group data storage (12 data types in one table)
 CREATE TABLE openmls_group_data (
+    provider_version INTEGER NOT NULL,
     group_id BLOB NOT NULL,
     data_type TEXT NOT NULL CHECK (data_type IN (
         'join_group_config', 
@@ -409,13 +413,15 @@ CREATE TABLE openmls_group_data (
         'resumption_psk_store',
         'own_leaf_index',
         'use_ratchet_tree_extension',
-        'group_epoch_secrets'
+        'group_epoch_secrets',
+        'application_export_tree'
     )),
-    data BLOB NOT NULL,
+    group_data BLOB NOT NULL,
     PRIMARY KEY (group_id, data_type)
 );
 
 CREATE TABLE openmls_proposals (
+    provider_version INTEGER NOT NULL,
     group_id BLOB NOT NULL,
     proposal_ref BLOB NOT NULL,
     proposal BLOB NOT NULL,
@@ -423,32 +429,41 @@ CREATE TABLE openmls_proposals (
 );
 
 CREATE TABLE openmls_own_leaf_nodes (
+    provider_version INTEGER NOT NULL,
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     group_id BLOB NOT NULL,
     leaf_node BLOB NOT NULL
 );
 
+CREATE INDEX idx_openmls_own_leaf_nodes_group_id
+    ON openmls_own_leaf_nodes(group_id);
+
 CREATE TABLE openmls_key_packages (
+    provider_version INTEGER NOT NULL,
     key_package_ref BLOB PRIMARY KEY,
     key_package BLOB NOT NULL
 );
 
 CREATE TABLE openmls_psks (
+    provider_version INTEGER NOT NULL,
     psk_id BLOB PRIMARY KEY,
     psk_bundle BLOB NOT NULL
 );
 
 CREATE TABLE openmls_signature_keys (
+    provider_version INTEGER NOT NULL,
     public_key BLOB PRIMARY KEY,
-    key_pair BLOB NOT NULL
+    signature_key BLOB NOT NULL
 );
 
 CREATE TABLE openmls_encryption_keys (
+    provider_version INTEGER NOT NULL,
     public_key BLOB PRIMARY KEY,
     key_pair BLOB NOT NULL
 );
 
 CREATE TABLE openmls_epoch_key_pairs (
+    provider_version INTEGER NOT NULL,
     group_id BLOB NOT NULL,
     epoch_id BLOB NOT NULL,
     leaf_index INTEGER NOT NULL,
@@ -456,6 +471,8 @@ CREATE TABLE openmls_epoch_key_pairs (
     PRIMARY KEY (group_id, epoch_id, leaf_index)
 );
 ```
+
+Note: The table name for epoch key pairs is `openmls_epoch_key_pairs` in our schema (matching the trait method names), while upstream uses `openmls_epoch_keys_pairs` (with an extra 's'). We'll use the cleaner name.
 
 ---
 
