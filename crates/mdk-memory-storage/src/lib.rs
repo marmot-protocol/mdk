@@ -94,35 +94,6 @@ pub const DEFAULT_MAX_ADMINS_PER_WELCOME: usize = 100;
 /// This prevents oversized relay URLs from consuming excessive memory.
 pub const DEFAULT_MAX_RELAY_URL_LENGTH: usize = 512;
 
-// Re-export defaults with shorter names for backward compatibility
-#[doc(hidden)]
-#[deprecated(since = "0.6.0", note = "Use DEFAULT_MAX_RELAYS_PER_GROUP instead")]
-pub const MAX_RELAYS_PER_GROUP: usize = DEFAULT_MAX_RELAYS_PER_GROUP;
-#[doc(hidden)]
-#[deprecated(since = "0.6.0", note = "Use DEFAULT_MAX_MESSAGES_PER_GROUP instead")]
-pub const MAX_MESSAGES_PER_GROUP: usize = DEFAULT_MAX_MESSAGES_PER_GROUP;
-#[doc(hidden)]
-#[deprecated(since = "0.6.0", note = "Use DEFAULT_MAX_GROUP_NAME_LENGTH instead")]
-pub const MAX_GROUP_NAME_LENGTH: usize = DEFAULT_MAX_GROUP_NAME_LENGTH;
-#[doc(hidden)]
-#[deprecated(
-    since = "0.6.0",
-    note = "Use DEFAULT_MAX_GROUP_DESCRIPTION_LENGTH instead"
-)]
-pub const MAX_GROUP_DESCRIPTION_LENGTH: usize = DEFAULT_MAX_GROUP_DESCRIPTION_LENGTH;
-#[doc(hidden)]
-#[deprecated(since = "0.6.0", note = "Use DEFAULT_MAX_ADMINS_PER_GROUP instead")]
-pub const MAX_ADMINS_PER_GROUP: usize = DEFAULT_MAX_ADMINS_PER_GROUP;
-#[doc(hidden)]
-#[deprecated(since = "0.6.0", note = "Use DEFAULT_MAX_RELAYS_PER_WELCOME instead")]
-pub const MAX_RELAYS_PER_WELCOME: usize = DEFAULT_MAX_RELAYS_PER_WELCOME;
-#[doc(hidden)]
-#[deprecated(since = "0.6.0", note = "Use DEFAULT_MAX_ADMINS_PER_WELCOME instead")]
-pub const MAX_ADMINS_PER_WELCOME: usize = DEFAULT_MAX_ADMINS_PER_WELCOME;
-#[doc(hidden)]
-#[deprecated(since = "0.6.0", note = "Use DEFAULT_MAX_RELAY_URL_LENGTH instead")]
-pub const MAX_RELAY_URL_LENGTH: usize = DEFAULT_MAX_RELAY_URL_LENGTH;
-
 /// Configurable validation limits for memory storage.
 ///
 /// This struct allows customization of the various limits used to prevent
