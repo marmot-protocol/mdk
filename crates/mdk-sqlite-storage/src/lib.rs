@@ -452,15 +452,10 @@ impl MdkSqliteStorage {
     // ============================================================================
 
     fn validate_savepoint_name(name: &str) -> Result<(), Error> {
-        let ok = !name.is_empty()
-            && name
-                .bytes()
-                .all(|b| matches!(b, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_'));
-        if ok {
-            Ok(())
-        } else {
-            Err(Error::Database(format!("Invalid savepoint name: {}", name)))
+        if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+            return Err(Error::Database(format!("Invalid savepoint name: {}", name)));
         }
+        Ok(())
     }
 
     /// Creates a savepoint with the given name.
