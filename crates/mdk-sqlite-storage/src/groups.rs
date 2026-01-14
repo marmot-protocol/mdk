@@ -246,29 +246,40 @@ impl GroupStorage for MdkSqliteStorage {
         }
 
         self.with_connection(|conn| {
-            // Use a transaction for atomicity
-            let tx = conn.unchecked_transaction().map_err(into_group_err)?;
+            // Use a savepoint for atomicity (works both inside/outside an existing transaction).
+            conn.execute_batch("SAVEPOINT mdk_replace_group_relays")
+                .map_err(into_group_err)?;
 
-            // Clear existing relays for this group
-            tx.execute(
-                "DELETE FROM group_relays WHERE mls_group_id = ?",
-                params![group_id.as_slice()],
-            )
-            .map_err(into_group_err)?;
-
-            // Insert new relays
-            for relay_url in &relays {
-                tx.execute(
-                    "INSERT INTO group_relays (mls_group_id, relay_url) VALUES (?, ?)",
-                    params![group_id.as_slice(), relay_url.as_str()],
+            let result: Result<(), GroupError> = (|| {
+                conn.execute(
+                    "DELETE FROM group_relays WHERE mls_group_id = ?",
+                    params![group_id.as_slice()],
                 )
                 .map_err(into_group_err)?;
+
+                for relay_url in &relays {
+                    conn.execute(
+                        "INSERT INTO group_relays (mls_group_id, relay_url) VALUES (?, ?)",
+                        params![group_id.as_slice(), relay_url.as_str()],
+                    )
+                    .map_err(into_group_err)?;
+                }
+                Ok(())
+            })();
+
+            match result {
+                Ok(()) => conn
+                    .execute_batch("RELEASE SAVEPOINT mdk_replace_group_relays")
+                    .map_err(into_group_err),
+                Err(e) => {
+                    // Best-effort cleanup to keep connection usable.
+                    let _ = conn.execute_batch(
+                        "ROLLBACK TO SAVEPOINT mdk_replace_group_relays; \
+                         RELEASE SAVEPOINT mdk_replace_group_relays;",
+                    );
+                    Err(e)
+                }
             }
-
-            // Commit the transaction
-            tx.commit().map_err(into_group_err)?;
-
-            Ok(())
         })
     }
 
