@@ -181,6 +181,9 @@ pub enum Error {
     /// Invalid extension version
     #[error("invalid extension version: {0}")]
     InvalidExtensionVersion(u16),
+    /// Extension format error
+    #[error("extension format error: {0}")]
+    ExtensionFormatError(String),
     /// Rumor pubkey does not match MLS sender credential
     #[error("author mismatch: rumor pubkey does not match MLS sender")]
     AuthorMismatch,

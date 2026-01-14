@@ -307,6 +307,82 @@ use self::x::Y;
 - MDK handles cryptographic operations - be careful with key material
 - All message encryption uses MLS protocol with forward secrecy
 - Review security implications of any changes to cryptographic code
+- All crates use `#![forbid(unsafe_code)]` or `#![deny(unsafe_code)]`
+
+### Sensitive Identifiers - NEVER Log or Expose
+
+**CRITICAL**: The following identifiers are privacy-sensitive and must NEVER be included in:
+
+- Log messages (via `tracing::*` macros)
+- Error messages or error strings
+- Debug output (including `Debug` trait implementations for types containing these)
+- Panic messages
+- User-facing error descriptions
+
+| Identifier | Description | Why It's Sensitive |
+|------------|-------------|-------------------|
+| Encryption keys | Any key material | Obviously sensitive cryptographic data |
+| Exporter secrets | MLS exporter secrets | Enables retrospective traffic decryption |
+| `mls_group_id` | MLS group identifier (32 bytes) | Enables cross-system group linkage and tracking |
+| `nostr_group_id` | Nostr group identifier | Links Nostr events to MLS groups |
+
+#### What to Do Instead
+
+When writing error messages for "not found" or similar conditions:
+
+```rust
+// GOOD - Generic error without identifier
+GroupError::NotFound("Group not found".to_string())
+
+// GOOD - Use a non-identifying error variant
+GroupError::GroupNotFound
+
+// BAD - Leaks the MLS group ID
+GroupError::InvalidParameters(format!("Group with MLS ID {:?} not found", mls_group_id))
+
+// BAD - Leaks group identifier in logs
+tracing::warn!("Group {} not found", mls_group_id);
+```
+
+This requirement stems from [MIP-01](https://github.com/marmot-protocol/marmot) group identity and privacy guidance. Violations can enable attackers or operators to exfiltrate private identifiers from logs, allowing cross-system linkage of groups and weakening metadata privacy guarantees.
+
+See also: `SECURITY.md` for the full threat model and security considerations.
+
+### Cryptographic Code Requirements
+
+When writing or modifying cryptographic code:
+
+#### Key Generation
+- MUST use `getrandom` for all key generation (CSPRNG)
+- Never use weak RNGs (`rand::thread_rng()` alone, etc.)
+- Keys should be 256-bit (32 bytes) minimum for symmetric operations
+
+#### Authenticated Encryption
+- Use ChaCha20-Poly1305 or AES-GCM (authenticated modes only)
+- Never use unauthenticated encryption (AES-CBC alone, etc.)
+- Nonces must be randomly generated and never reused with the same key
+
+#### Key Derivation
+- Use HKDF with proper domain separation via unique context strings
+- Context strings should identify protocol and purpose (e.g., `mip01-image-encryption-v2`)
+
+#### Zeroization
+- Use `Secret<T>` wrapper for sensitive values
+- Derive `ZeroizeOnDrop` for types containing key material
+- Don't implement `Copy` for types with sensitive data
+
+### Identity Binding Security
+
+For key packages and credentials, the credential identity MUST match the event signer:
+
+```rust
+// CRITICAL - prevents impersonation attacks
+if credential_identity != event.pubkey {
+    return Err(Error::KeyPackageIdentityMismatch { ... });
+}
+```
+
+Base64 encoding MUST include explicit encoding tags per MIP-00/MIP-02. Reject data without tags to prevent downgrade attacks.
 
 ## PR Checklist
 

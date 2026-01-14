@@ -1149,7 +1149,7 @@ where
         let leaf_node_params = LeafNodeParameters::builder()
             .with_credential_with_key(new_credential_with_key)
             .with_capabilities(own_leaf.capabilities().clone())
-            .with_extensions(own_leaf.extensions().clone())
+            .with_extensions(own_leaf.extensions().clone())?
             .build();
 
         let commit_message_bundle = mls_group.self_update_with_new_signer(
@@ -2965,7 +2965,7 @@ mod tests {
             "sync_group_metadata_from_mls should propagate extension parse errors"
         );
 
-        // Verify it's a deserialization error (the specific error from deserialize_with_migration)
+        // Verify it's a deserialization error (the specific error from deserialize_bytes)
         match result {
             Err(e) => {
                 let error_msg = e.to_string();

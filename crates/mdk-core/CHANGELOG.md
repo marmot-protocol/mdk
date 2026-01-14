@@ -27,6 +27,14 @@
 
 ### Breaking changes
 
+- **OpenMLS Dependency**: Updated to OpenMLS git main branch (commit b90ca23b) for GREASE support. This may introduce minor API changes from upstream. The dependency will be reverted to crates.io versions once OpenMLS releases a version with GREASE support. ([#142](https://github.com/marmot-protocol/mdk/pull/142))
+- **Legacy Format Removal**: Removed support for legacy key package tag formats and extension formats that were deprecated after EOY 2025 migration period ([#146](https://github.com/marmot-protocol/mdk/pull/146))
+  - Key package validation now only accepts MIP-00 compliant formats:
+    - `mls_ciphersuite` tag must use hex format (e.g., `0x0001`), numeric (`1`) and string (`MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519`) formats are no longer accepted
+    - `mls_extensions` tag must use hex format (e.g., `0x000a`, `0xf2ee`), legacy string names (`RequiredCapabilities`, `LastResort`, etc.) and comma-separated strings are no longer accepted
+    - Tag names must use `mls_ciphersuite` and `mls_extensions` prefixes; legacy `ciphersuite` and `extensions` tag names are no longer accepted
+  - Removed `LegacyTlsNostrGroupDataExtension` struct and related migration code for pre-version extension format
+  - Groups created before the version field was added to extensions are no longer supported
 - **Security (Audit Issue M)**: Changed `get_message()` to require both `mls_group_id` and `event_id` parameters. This prevents messages from different groups from overwriting each other by scoping lookups to a specific group. ([#124](https://github.com/marmot-protocol/mdk/pull/124))
 - **Credential Identity Encoding**: Removed support for legacy 64-byte UTF-8 hex-encoded credential identities ([#15](https://github.com/marmot-protocol/mdk/issues/15))
   - Credential identities must now be exactly 32 bytes (raw public key) per MIP-00
@@ -54,6 +62,7 @@
 
 ### Added
 
+- **GREASE Support (RFC 9420 Section 13.5)**: KeyPackage capabilities now automatically include random GREASE values for extensibility testing. GREASE ensures implementations correctly handle unknown values and maintains protocol forward compatibility. Values are injected into ciphersuites, extensions, proposals, and credentials capabilities. ([#142](https://github.com/marmot-protocol/mdk/pull/142))
 - New `MessageProcessingResult::PendingProposal` variant returned when a non-admin member receives a proposal. The proposal is stored as pending and awaits commitment by an admin. ([#122](https://github.com/marmot-protocol/mdk/pull/122))
 - New error variant `IdentityChangeNotAllowed` for rejecting proposals and commits that attempt to change member identity ([#126](https://github.com/marmot-protocol/mdk/pull/126))
 - Added `nostr_group_id` field to `NostrGroupDataUpdate` struct, enabling rotation of the Nostr group ID used for message routing per MIP-01 ([#127](https://github.com/marmot-protocol/mdk/pull/127))

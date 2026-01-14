@@ -269,7 +269,12 @@ where
         Self::builder(storage).build()
     }
 
-    /// Get nostr MLS capabilities
+    /// Get nostr MLS capabilities with GREASE values for extensibility testing.
+    ///
+    /// GREASE (Generate Random Extensions And Sustain Extensibility) values are
+    /// automatically injected into capabilities as per RFC 9420 Section 13.5.
+    /// This ensures implementations correctly handle unknown values and maintains
+    /// protocol extensibility.
     #[inline]
     pub(crate) fn capabilities(&self) -> Capabilities {
         Capabilities::new(
@@ -279,6 +284,7 @@ where
             None,
             None,
         )
+        .with_grease(&self.provider.crypto)
     }
 
     /// Get nostr mls group's required capabilities extension
@@ -324,5 +330,129 @@ pub mod tests {
         MDK::builder(MdkMemoryStorage::default())
             .with_config(config)
             .build()
+    }
+
+    /// Tests for GREASE (Generate Random Extensions And Sustain Extensibility) support.
+    /// GREASE values ensure implementations correctly handle unknown values per RFC 9420 Section 13.5.
+    mod grease_tests {
+        use openmls_traits::types::VerifiableCiphersuite;
+
+        use super::*;
+
+        #[test]
+        fn test_capabilities_include_grease_ciphersuites() {
+            let mdk = create_test_mdk();
+            let caps = mdk.capabilities();
+
+            // Verify at least one GREASE value is present in ciphersuites
+            let has_grease_ciphersuite = caps.ciphersuites().iter().any(|cs| cs.is_grease());
+
+            assert!(
+                has_grease_ciphersuite,
+                "Capabilities should include at least one GREASE ciphersuite"
+            );
+        }
+
+        #[test]
+        fn test_capabilities_include_grease_extensions() {
+            let mdk = create_test_mdk();
+            let caps = mdk.capabilities();
+
+            // Verify at least one GREASE value is present in extensions
+            let has_grease_extension = caps.extensions().iter().any(|ext| ext.is_grease());
+
+            assert!(
+                has_grease_extension,
+                "Capabilities should include at least one GREASE extension"
+            );
+        }
+
+        #[test]
+        fn test_capabilities_include_grease_proposals() {
+            let mdk = create_test_mdk();
+            let caps = mdk.capabilities();
+
+            // Verify at least one GREASE value is present in proposals
+            let has_grease_proposal = caps.proposals().iter().any(|prop| prop.is_grease());
+
+            assert!(
+                has_grease_proposal,
+                "Capabilities should include at least one GREASE proposal type"
+            );
+        }
+
+        #[test]
+        fn test_capabilities_include_grease_credentials() {
+            let mdk = create_test_mdk();
+            let caps = mdk.capabilities();
+
+            // Verify at least one GREASE value is present in credentials
+            let has_grease_credential = caps.credentials().iter().any(|cred| cred.is_grease());
+
+            assert!(
+                has_grease_credential,
+                "Capabilities should include at least one GREASE credential type"
+            );
+        }
+
+        #[test]
+        fn test_capabilities_still_include_real_values() {
+            let mdk = create_test_mdk();
+            let caps = mdk.capabilities();
+
+            // Verify the real ciphersuite is still present
+            let expected_cs: VerifiableCiphersuite = DEFAULT_CIPHERSUITE.into();
+            let has_real_ciphersuite = caps.ciphersuites().contains(&expected_cs);
+
+            assert!(
+                has_real_ciphersuite,
+                "Capabilities should still include the real ciphersuite"
+            );
+
+            // Verify real extensions are still present
+            let has_last_resort = caps.extensions().contains(&ExtensionType::LastResort);
+
+            assert!(
+                has_last_resort,
+                "Capabilities should still include LastResort extension"
+            );
+        }
+
+        #[test]
+        fn test_different_mdk_instances_get_different_grease_values() {
+            // Create two MDK instances and verify they get different GREASE values
+            // (GREASE values should be randomly selected)
+            let mdk1 = create_test_mdk();
+            let mdk2 = create_test_mdk();
+
+            let caps1 = mdk1.capabilities();
+            let caps2 = mdk2.capabilities();
+
+            // Extract GREASE ciphersuites
+            let grease_cs1: Vec<_> = caps1
+                .ciphersuites()
+                .iter()
+                .filter(|cs| cs.is_grease())
+                .collect();
+
+            let grease_cs2: Vec<_> = caps2
+                .ciphersuites()
+                .iter()
+                .filter(|cs| cs.is_grease())
+                .collect();
+
+            // Both should have GREASE values
+            assert!(
+                !grease_cs1.is_empty(),
+                "MDK1 should have GREASE ciphersuites"
+            );
+            assert!(
+                !grease_cs2.is_empty(),
+                "MDK2 should have GREASE ciphersuites"
+            );
+
+            // Note: It's possible (but unlikely) that two random selections could be the same,
+            // so we don't assert inequality. The test mainly verifies GREASE is being injected.
+        }
     }
 }

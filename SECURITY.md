@@ -41,6 +41,21 @@ The following threats are **not** defended by MDK's current implementation:
 - Side-channel attacks or hardware-level attacks
 - "Evil maid" attacks that tamper with the runtime environment
 
+### Metadata Privacy and Group Identifier Protection
+
+MDK follows [MIP-01](https://github.com/marmot-protocol/marmot) group identity and privacy guidance. The following identifiers are considered privacy-sensitive and must not be exposed in logs, error messages, or debug output:
+
+| Identifier | Description | Why It's Sensitive |
+|------------|-------------|-------------------|
+| Encryption keys | Any key material | Cryptographic data enabling decryption |
+| Exporter secrets | MLS exporter secrets | Enable retrospective traffic decryption |
+| `mls_group_id` | MLS group identifier (32 bytes) | Enables cross-system group linkage and tracking |
+| `nostr_group_id` | Nostr group identifier | Links Nostr events to MLS groups |
+
+**Attack Scenario**: An attacker or operator with access to logs could exfiltrate these identifiers, allowing cross-system linkage of groups and weakening metadata privacy guarantees. Even without an active attacker, routine logging may leak identifiers to remote analytics or crash reporting backends.
+
+See also: `AGENTS.md` for contributor guidelines on avoiding identifier leakage
+
 ## Encryption at Rest
 
 MDK uses [SQLCipher](https://www.zetetic.net/sqlcipher/) for transparent encryption of all SQLite databases. This is enabled by default for production use.

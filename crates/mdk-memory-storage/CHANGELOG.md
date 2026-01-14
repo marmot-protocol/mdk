@@ -45,6 +45,7 @@
 
 ### Fixed
 
+- **Security (Audit Issue AC)**: Fixed `nostr_group_id` cache collision vulnerability that allowed lookup hijacking and stale key entries. The `save_group` function now rejects saves when `nostr_group_id` already maps to a different `mls_group_id`, and removes stale entries when a group's identifier changes. ([#149](https://github.com/marmot-protocol/mdk/pull/149))
 - Fixed compilation errors in `mdk-memory-storage` implementation and tests ([#FIXME](https://github.com/marmot-protocol/mdk/pull/FIXME))
 - **Security (Audit Issue 6/Suggestion 6)**: Improved `save_message` performance from O(n) to expected/amortized O(1) by replacing `Vec<Message>` with `HashMap<EventId, Message>` for the messages-by-group cache. This addresses potential DoS risk from high message counts per group (threat model T.10.2 and T.10.4). Fixes [#92](https://github.com/marmot-protocol/mdk/issues/92) ([#134](https://github.com/marmot-protocol/mdk/pull/134))
 - **Security (Audit Issue M)**: Fixed messages being overwritten across groups by updating `find_message_by_event_id()` to use group-scoped cache lookups. This prevents an attacker or faulty relay from causing message loss and misattribution across groups by reusing deterministic rumor IDs. ([#124](https://github.com/marmot-protocol/mdk/pull/124))

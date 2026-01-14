@@ -213,7 +213,7 @@ where
 
     /// Parse an IMETA tag to create a MediaReference for decryption
     ///
-    /// Expected IMETA format: url \<storage_url\> m \<mime_type\> filename \<filename\> x \<file_hash_hex\> n \<nonce_hex\> v \<version\> [dim \<dimensions\>] [blurhash \<blurhash\>]
+    /// Expected IMETA format per MIP-04: url \<storage_url\> m \<mime_type\> filename \<filename\> [dim \<dimensions\>] [blurhash \<blurhash\>] x \<file_hash_hex\> n \<nonce_hex\> v \<version\>
     pub fn parse_imeta_tag(
         &self,
         imeta_tag: &NostrTag,
