@@ -451,6 +451,18 @@ impl MdkSqliteStorage {
     // Transaction and Savepoint Support
     // ============================================================================
 
+    fn validate_savepoint_name(name: &str) -> Result<(), Error> {
+        let ok = !name.is_empty()
+            && name
+                .bytes()
+                .all(|b| matches!(b, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_'));
+        if ok {
+            Ok(())
+        } else {
+            Err(Error::Database(format!("Invalid savepoint name: {}", name)))
+        }
+    }
+
     /// Creates a savepoint with the given name.
     ///
     /// Savepoints allow nested transactions and the ability to rollback to a
@@ -464,6 +476,7 @@ impl MdkSqliteStorage {
     ///
     /// Returns an error if the savepoint cannot be created.
     pub fn savepoint(&self, name: &str) -> Result<(), Error> {
+        Self::validate_savepoint_name(name)?;
         let conn = self.connection.blocking_lock();
         conn.execute(&format!("SAVEPOINT {}", name), [])
             .map_err(|e| Error::Database(e.to_string()))?;
@@ -482,6 +495,7 @@ impl MdkSqliteStorage {
     ///
     /// Returns an error if the savepoint cannot be released.
     pub fn release_savepoint(&self, name: &str) -> Result<(), Error> {
+        Self::validate_savepoint_name(name)?;
         let conn = self.connection.blocking_lock();
         conn.execute(&format!("RELEASE SAVEPOINT {}", name), [])
             .map_err(|e| Error::Database(e.to_string()))?;
@@ -500,6 +514,7 @@ impl MdkSqliteStorage {
     ///
     /// Returns an error if the rollback fails.
     pub fn rollback_to_savepoint(&self, name: &str) -> Result<(), Error> {
+        Self::validate_savepoint_name(name)?;
         let conn = self.connection.blocking_lock();
         conn.execute(&format!("ROLLBACK TO SAVEPOINT {}", name), [])
             .map_err(|e| Error::Database(e.to_string()))?;
