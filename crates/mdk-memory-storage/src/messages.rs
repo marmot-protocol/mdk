@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use mdk_storage_traits::GroupId;
 use nostr::EventId;
 #[cfg(test)]
-use nostr::{Kind, PublicKey, Tags, Timestamp, UnsignedEvent};
+use nostr::{Kind, Tags, Timestamp, UnsignedEvent};
 
 use mdk_storage_traits::groups::GroupStorage;
 use mdk_storage_traits::messages::MessageStorage;

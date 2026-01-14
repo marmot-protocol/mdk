@@ -243,7 +243,7 @@ mod tests {
     use mdk_storage_traits::groups::types::GroupState;
     use mdk_storage_traits::messages::MessageStorage;
     use mdk_storage_traits::messages::types::{Message, MessageState};
-    use nostr::{EventId, Keys, Kind, PublicKey, Tags, Timestamp, UnsignedEvent};
+    use nostr::{EventId, Keys, Kind, Tags, Timestamp, UnsignedEvent};
 
     use super::*;
     use crate::{
