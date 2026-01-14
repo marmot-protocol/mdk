@@ -731,3 +731,575 @@ where
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use serde::{Deserialize, Serialize};
+
+    use super::*;
+    use crate::MdkSqliteStorage;
+
+    /// Test data structure for MLS storage tests.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    struct TestData {
+        id: u32,
+        name: String,
+        bytes: Vec<u8>,
+    }
+
+    /// Helper to create a test storage and return the connection.
+    fn with_test_storage<F, R>(f: F) -> R
+    where
+        F: FnOnce(&Connection) -> R,
+    {
+        let storage = MdkSqliteStorage::new_in_memory().unwrap();
+        storage.with_connection(f)
+    }
+
+    // ========================================
+    // Serialization Helper Tests
+    // ========================================
+
+    #[test]
+    fn test_serialize_key() {
+        let key = vec![1u8, 2, 3, 4];
+        let result = serialize_key(&key);
+        assert!(result.is_ok());
+
+        let bytes = result.unwrap();
+        assert!(!bytes.is_empty());
+    }
+
+    #[test]
+    fn test_serialize_entity() {
+        let entity = TestData {
+            id: 42,
+            name: "test".to_string(),
+            bytes: vec![1, 2, 3],
+        };
+        let result = serialize_entity(&entity);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_deserialize_entity() {
+        let original = TestData {
+            id: 42,
+            name: "test".to_string(),
+            bytes: vec![1, 2, 3],
+        };
+        let serialized = serialize_entity(&original).unwrap();
+
+        let result: TestData = deserialize_entity(&serialized).unwrap();
+        assert_eq!(result, original);
+    }
+
+    #[test]
+    fn test_deserialize_invalid_data() {
+        let invalid = b"not valid json";
+        let result: Result<TestData, _> = deserialize_entity(invalid);
+        assert!(result.is_err());
+    }
+
+    // ========================================
+    // Direct SQL Tests for MLS Tables
+    // These tests verify the schema and SQL operations work correctly
+    // without going through the generic helper functions that have
+    // OpenMLS-specific trait bounds.
+    // ========================================
+
+    #[test]
+    fn test_openmls_group_data_table_operations() {
+        with_test_storage(|conn| {
+            let group_id_bytes = JsonCodec::serialize(&vec![1u8, 2, 3, 4]).unwrap();
+            let data_bytes = JsonCodec::serialize(&"test data".to_string()).unwrap();
+            let data_type = GroupDataType::Tree.as_str();
+
+            // Insert
+            conn.execute(
+                "INSERT OR REPLACE INTO openmls_group_data (group_id, data_type, group_data, provider_version)
+                 VALUES (?, ?, ?, ?)",
+                params![group_id_bytes, data_type, data_bytes, STORAGE_PROVIDER_VERSION],
+            ).unwrap();
+
+            // Read
+            let result: Option<Vec<u8>> = conn
+                .query_row(
+                    "SELECT group_data FROM openmls_group_data
+                     WHERE group_id = ? AND data_type = ? AND provider_version = ?",
+                    params![group_id_bytes, data_type, STORAGE_PROVIDER_VERSION],
+                    |row| row.get(0),
+                )
+                .optional()
+                .unwrap();
+
+            assert!(result.is_some());
+            let retrieved: String = JsonCodec::deserialize(&result.unwrap()).unwrap();
+            assert_eq!(retrieved, "test data");
+
+            // Delete
+            conn.execute(
+                "DELETE FROM openmls_group_data
+                 WHERE group_id = ? AND data_type = ? AND provider_version = ?",
+                params![group_id_bytes, data_type, STORAGE_PROVIDER_VERSION],
+            )
+            .unwrap();
+
+            // Verify deleted
+            let result: Option<Vec<u8>> = conn
+                .query_row(
+                    "SELECT group_data FROM openmls_group_data
+                     WHERE group_id = ? AND data_type = ? AND provider_version = ?",
+                    params![group_id_bytes, data_type, STORAGE_PROVIDER_VERSION],
+                    |row| row.get(0),
+                )
+                .optional()
+                .unwrap();
+
+            assert!(result.is_none());
+        });
+    }
+
+    #[test]
+    fn test_openmls_own_leaf_nodes_table_operations() {
+        with_test_storage(|conn| {
+            let group_id_bytes = JsonCodec::serialize(&vec![1u8, 2, 3, 4]).unwrap();
+
+            // Insert multiple leaf nodes
+            for i in 0..3 {
+                let leaf_bytes = JsonCodec::serialize(&format!("leaf_{}", i)).unwrap();
+                conn.execute(
+                    "INSERT INTO openmls_own_leaf_nodes (group_id, leaf_node, provider_version)
+                     VALUES (?, ?, ?)",
+                    params![group_id_bytes, leaf_bytes, STORAGE_PROVIDER_VERSION],
+                )
+                .unwrap();
+            }
+
+            // Read all leaf nodes
+            let mut stmt = conn
+                .prepare(
+                    "SELECT leaf_node FROM openmls_own_leaf_nodes
+                     WHERE group_id = ? AND provider_version = ?
+                     ORDER BY id ASC",
+                )
+                .unwrap();
+
+            let leaf_nodes: Vec<String> = stmt
+                .query_map(params![group_id_bytes, STORAGE_PROVIDER_VERSION], |row| {
+                    row.get::<_, Vec<u8>>(0)
+                })
+                .unwrap()
+                .map(|r| JsonCodec::deserialize(&r.unwrap()).unwrap())
+                .collect();
+
+            assert_eq!(leaf_nodes, vec!["leaf_0", "leaf_1", "leaf_2"]);
+
+            // Delete all
+            conn.execute(
+                "DELETE FROM openmls_own_leaf_nodes
+                 WHERE group_id = ? AND provider_version = ?",
+                params![group_id_bytes, STORAGE_PROVIDER_VERSION],
+            )
+            .unwrap();
+
+            // Verify deleted
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM openmls_own_leaf_nodes
+                     WHERE group_id = ? AND provider_version = ?",
+                    params![group_id_bytes, STORAGE_PROVIDER_VERSION],
+                    |row| row.get(0),
+                )
+                .unwrap();
+
+            assert_eq!(count, 0);
+        });
+    }
+
+    #[test]
+    fn test_openmls_proposals_table_operations() {
+        with_test_storage(|conn| {
+            let group_id_bytes = JsonCodec::serialize(&vec![1u8, 2, 3, 4]).unwrap();
+            let proposal_ref_bytes = JsonCodec::serialize(&vec![10u8, 20, 30]).unwrap();
+            let proposal_bytes = JsonCodec::serialize(&"test proposal".to_string()).unwrap();
+
+            // Insert proposal
+            conn.execute(
+                "INSERT OR REPLACE INTO openmls_proposals (group_id, proposal_ref, proposal, provider_version)
+                 VALUES (?, ?, ?, ?)",
+                params![group_id_bytes, proposal_ref_bytes, proposal_bytes, STORAGE_PROVIDER_VERSION],
+            ).unwrap();
+
+            // Read proposals
+            let mut stmt = conn
+                .prepare(
+                    "SELECT proposal_ref, proposal FROM openmls_proposals
+                     WHERE group_id = ? AND provider_version = ?",
+                )
+                .unwrap();
+
+            let proposals: Vec<(Vec<u8>, String)> = stmt
+                .query_map(params![group_id_bytes, STORAGE_PROVIDER_VERSION], |row| {
+                    Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+                })
+                .unwrap()
+                .map(|r| {
+                    let (ref_bytes, prop_bytes) = r.unwrap();
+                    let prop: String = JsonCodec::deserialize(&prop_bytes).unwrap();
+                    (ref_bytes, prop)
+                })
+                .collect();
+
+            assert_eq!(proposals.len(), 1);
+            assert_eq!(proposals[0].1, "test proposal");
+
+            // Remove proposal
+            conn.execute(
+                "DELETE FROM openmls_proposals
+                 WHERE group_id = ? AND proposal_ref = ? AND provider_version = ?",
+                params![group_id_bytes, proposal_ref_bytes, STORAGE_PROVIDER_VERSION],
+            )
+            .unwrap();
+
+            // Verify removed
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM openmls_proposals
+                     WHERE group_id = ? AND provider_version = ?",
+                    params![group_id_bytes, STORAGE_PROVIDER_VERSION],
+                    |row| row.get(0),
+                )
+                .unwrap();
+
+            assert_eq!(count, 0);
+        });
+    }
+
+    #[test]
+    fn test_openmls_key_packages_table_operations() {
+        with_test_storage(|conn| {
+            let hash_ref_bytes = JsonCodec::serialize(&vec![1u8, 2, 3, 4]).unwrap();
+            let key_package_bytes = JsonCodec::serialize(&"key package data".to_string()).unwrap();
+
+            // Insert
+            conn.execute(
+                "INSERT OR REPLACE INTO openmls_key_packages (key_package_ref, key_package, provider_version)
+                 VALUES (?, ?, ?)",
+                params![hash_ref_bytes, key_package_bytes, STORAGE_PROVIDER_VERSION],
+            ).unwrap();
+
+            // Read
+            let result: Option<Vec<u8>> = conn
+                .query_row(
+                    "SELECT key_package FROM openmls_key_packages
+                     WHERE key_package_ref = ? AND provider_version = ?",
+                    params![hash_ref_bytes, STORAGE_PROVIDER_VERSION],
+                    |row| row.get(0),
+                )
+                .optional()
+                .unwrap();
+
+            assert!(result.is_some());
+            let retrieved: String = JsonCodec::deserialize(&result.unwrap()).unwrap();
+            assert_eq!(retrieved, "key package data");
+
+            // Delete
+            conn.execute(
+                "DELETE FROM openmls_key_packages
+                 WHERE key_package_ref = ? AND provider_version = ?",
+                params![hash_ref_bytes, STORAGE_PROVIDER_VERSION],
+            )
+            .unwrap();
+
+            // Verify deleted
+            let result: Option<Vec<u8>> = conn
+                .query_row(
+                    "SELECT key_package FROM openmls_key_packages
+                     WHERE key_package_ref = ? AND provider_version = ?",
+                    params![hash_ref_bytes, STORAGE_PROVIDER_VERSION],
+                    |row| row.get(0),
+                )
+                .optional()
+                .unwrap();
+
+            assert!(result.is_none());
+        });
+    }
+
+    #[test]
+    fn test_openmls_signature_keys_table_operations() {
+        with_test_storage(|conn| {
+            let public_key_bytes = JsonCodec::serialize(&vec![1u8, 2, 3, 4]).unwrap();
+            let key_pair_bytes = JsonCodec::serialize(&"signature key pair".to_string()).unwrap();
+
+            // Insert
+            conn.execute(
+                "INSERT OR REPLACE INTO openmls_signature_keys (public_key, signature_key, provider_version)
+                 VALUES (?, ?, ?)",
+                params![public_key_bytes, key_pair_bytes, STORAGE_PROVIDER_VERSION],
+            ).unwrap();
+
+            // Read
+            let result: Option<Vec<u8>> = conn
+                .query_row(
+                    "SELECT signature_key FROM openmls_signature_keys
+                     WHERE public_key = ? AND provider_version = ?",
+                    params![public_key_bytes, STORAGE_PROVIDER_VERSION],
+                    |row| row.get(0),
+                )
+                .optional()
+                .unwrap();
+
+            assert!(result.is_some());
+
+            // Delete
+            conn.execute(
+                "DELETE FROM openmls_signature_keys
+                 WHERE public_key = ? AND provider_version = ?",
+                params![public_key_bytes, STORAGE_PROVIDER_VERSION],
+            )
+            .unwrap();
+
+            let result: Option<Vec<u8>> = conn
+                .query_row(
+                    "SELECT signature_key FROM openmls_signature_keys
+                     WHERE public_key = ? AND provider_version = ?",
+                    params![public_key_bytes, STORAGE_PROVIDER_VERSION],
+                    |row| row.get(0),
+                )
+                .optional()
+                .unwrap();
+
+            assert!(result.is_none());
+        });
+    }
+
+    #[test]
+    fn test_openmls_encryption_keys_table_operations() {
+        with_test_storage(|conn| {
+            let public_key_bytes = JsonCodec::serialize(&vec![1u8, 2, 3, 4]).unwrap();
+            let key_pair_bytes = JsonCodec::serialize(&"encryption key pair".to_string()).unwrap();
+
+            // Insert
+            conn.execute(
+                "INSERT OR REPLACE INTO openmls_encryption_keys (public_key, key_pair, provider_version)
+                 VALUES (?, ?, ?)",
+                params![public_key_bytes, key_pair_bytes, STORAGE_PROVIDER_VERSION],
+            ).unwrap();
+
+            // Read
+            let result: Option<Vec<u8>> = conn
+                .query_row(
+                    "SELECT key_pair FROM openmls_encryption_keys
+                     WHERE public_key = ? AND provider_version = ?",
+                    params![public_key_bytes, STORAGE_PROVIDER_VERSION],
+                    |row| row.get(0),
+                )
+                .optional()
+                .unwrap();
+
+            assert!(result.is_some());
+
+            // Delete
+            conn.execute(
+                "DELETE FROM openmls_encryption_keys
+                 WHERE public_key = ? AND provider_version = ?",
+                params![public_key_bytes, STORAGE_PROVIDER_VERSION],
+            )
+            .unwrap();
+
+            let result: Option<Vec<u8>> = conn
+                .query_row(
+                    "SELECT key_pair FROM openmls_encryption_keys
+                     WHERE public_key = ? AND provider_version = ?",
+                    params![public_key_bytes, STORAGE_PROVIDER_VERSION],
+                    |row| row.get(0),
+                )
+                .optional()
+                .unwrap();
+
+            assert!(result.is_none());
+        });
+    }
+
+    #[test]
+    fn test_openmls_epoch_key_pairs_table_operations() {
+        with_test_storage(|conn| {
+            let group_id_bytes = JsonCodec::serialize(&vec![1u8, 2, 3, 4]).unwrap();
+            let epoch_bytes = JsonCodec::serialize(&5u64).unwrap();
+            let leaf_index = 0u32;
+            let key_pairs_bytes =
+                JsonCodec::serialize(&vec!["key1".to_string(), "key2".to_string()]).unwrap();
+
+            // Insert
+            conn.execute(
+                "INSERT OR REPLACE INTO openmls_epoch_key_pairs (group_id, epoch_id, leaf_index, key_pairs, provider_version)
+                 VALUES (?, ?, ?, ?, ?)",
+                params![group_id_bytes, epoch_bytes, leaf_index, key_pairs_bytes, STORAGE_PROVIDER_VERSION],
+            ).unwrap();
+
+            // Read
+            let result: Option<Vec<u8>> = conn
+                .query_row(
+                    "SELECT key_pairs FROM openmls_epoch_key_pairs
+                     WHERE group_id = ? AND epoch_id = ? AND leaf_index = ? AND provider_version = ?",
+                    params![group_id_bytes, epoch_bytes, leaf_index, STORAGE_PROVIDER_VERSION],
+                    |row| row.get(0),
+                )
+                .optional()
+                .unwrap();
+
+            assert!(result.is_some());
+            let retrieved: Vec<String> = JsonCodec::deserialize(&result.unwrap()).unwrap();
+            assert_eq!(retrieved, vec!["key1", "key2"]);
+
+            // Delete
+            conn.execute(
+                "DELETE FROM openmls_epoch_key_pairs
+                 WHERE group_id = ? AND epoch_id = ? AND leaf_index = ? AND provider_version = ?",
+                params![
+                    group_id_bytes,
+                    epoch_bytes,
+                    leaf_index,
+                    STORAGE_PROVIDER_VERSION
+                ],
+            )
+            .unwrap();
+
+            let result: Option<Vec<u8>> = conn
+                .query_row(
+                    "SELECT key_pairs FROM openmls_epoch_key_pairs
+                     WHERE group_id = ? AND epoch_id = ? AND leaf_index = ? AND provider_version = ?",
+                    params![group_id_bytes, epoch_bytes, leaf_index, STORAGE_PROVIDER_VERSION],
+                    |row| row.get(0),
+                )
+                .optional()
+                .unwrap();
+
+            assert!(result.is_none());
+        });
+    }
+
+    #[test]
+    fn test_openmls_psks_table_operations() {
+        with_test_storage(|conn| {
+            let psk_id_bytes = JsonCodec::serialize(&vec![1u8, 2, 3, 4]).unwrap();
+            let psk_bundle_bytes = JsonCodec::serialize(&"psk bundle data".to_string()).unwrap();
+
+            // Insert
+            conn.execute(
+                "INSERT OR REPLACE INTO openmls_psks (psk_id, psk_bundle, provider_version)
+                 VALUES (?, ?, ?)",
+                params![psk_id_bytes, psk_bundle_bytes, STORAGE_PROVIDER_VERSION],
+            )
+            .unwrap();
+
+            // Read
+            let result: Option<Vec<u8>> = conn
+                .query_row(
+                    "SELECT psk_bundle FROM openmls_psks
+                     WHERE psk_id = ? AND provider_version = ?",
+                    params![psk_id_bytes, STORAGE_PROVIDER_VERSION],
+                    |row| row.get(0),
+                )
+                .optional()
+                .unwrap();
+
+            assert!(result.is_some());
+            let retrieved: String = JsonCodec::deserialize(&result.unwrap()).unwrap();
+            assert_eq!(retrieved, "psk bundle data");
+
+            // Delete
+            conn.execute(
+                "DELETE FROM openmls_psks
+                 WHERE psk_id = ? AND provider_version = ?",
+                params![psk_id_bytes, STORAGE_PROVIDER_VERSION],
+            )
+            .unwrap();
+
+            let result: Option<Vec<u8>> = conn
+                .query_row(
+                    "SELECT psk_bundle FROM openmls_psks
+                     WHERE psk_id = ? AND provider_version = ?",
+                    params![psk_id_bytes, STORAGE_PROVIDER_VERSION],
+                    |row| row.get(0),
+                )
+                .optional()
+                .unwrap();
+
+            assert!(result.is_none());
+        });
+    }
+
+    #[test]
+    fn test_group_data_type_as_str_coverage() {
+        // Cover all GroupDataType variants
+        assert_eq!(GroupDataType::JoinGroupConfig.as_str(), "join_group_config");
+        assert_eq!(GroupDataType::Tree.as_str(), "tree");
+        assert_eq!(
+            GroupDataType::InterimTranscriptHash.as_str(),
+            "interim_transcript_hash"
+        );
+        assert_eq!(GroupDataType::Context.as_str(), "context");
+        assert_eq!(GroupDataType::ConfirmationTag.as_str(), "confirmation_tag");
+        assert_eq!(GroupDataType::GroupState.as_str(), "group_state");
+        assert_eq!(GroupDataType::MessageSecrets.as_str(), "message_secrets");
+        assert_eq!(
+            GroupDataType::ResumptionPskStore.as_str(),
+            "resumption_psk_store"
+        );
+        assert_eq!(GroupDataType::OwnLeafIndex.as_str(), "own_leaf_index");
+        assert_eq!(
+            GroupDataType::GroupEpochSecrets.as_str(),
+            "group_epoch_secrets"
+        );
+    }
+
+    #[test]
+    fn test_insert_or_replace_behavior() {
+        with_test_storage(|conn| {
+            let group_id_bytes = JsonCodec::serialize(&vec![1u8, 2, 3, 4]).unwrap();
+            let data_type = GroupDataType::Tree.as_str();
+
+            // Insert first value
+            let data1 = JsonCodec::serialize(&"first".to_string()).unwrap();
+            conn.execute(
+                "INSERT OR REPLACE INTO openmls_group_data (group_id, data_type, group_data, provider_version)
+                 VALUES (?, ?, ?, ?)",
+                params![group_id_bytes, data_type, data1, STORAGE_PROVIDER_VERSION],
+            ).unwrap();
+
+            // Replace with second value
+            let data2 = JsonCodec::serialize(&"second".to_string()).unwrap();
+            conn.execute(
+                "INSERT OR REPLACE INTO openmls_group_data (group_id, data_type, group_data, provider_version)
+                 VALUES (?, ?, ?, ?)",
+                params![group_id_bytes, data_type, data2, STORAGE_PROVIDER_VERSION],
+            ).unwrap();
+
+            // Verify only one row and it has the second value
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM openmls_group_data
+                     WHERE group_id = ? AND data_type = ? AND provider_version = ?",
+                    params![group_id_bytes, data_type, STORAGE_PROVIDER_VERSION],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1);
+
+            let result: Vec<u8> = conn
+                .query_row(
+                    "SELECT group_data FROM openmls_group_data
+                     WHERE group_id = ? AND data_type = ? AND provider_version = ?",
+                    params![group_id_bytes, data_type, STORAGE_PROVIDER_VERSION],
+                    |row| row.get(0),
+                )
+                .unwrap();
+
+            let retrieved: String = JsonCodec::deserialize(&result).unwrap();
+            assert_eq!(retrieved, "second");
+        });
+    }
+}

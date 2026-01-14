@@ -791,4 +791,477 @@ mod tests {
         let result: Option<String> = store.read(&group_id, GroupDataType::Tree).unwrap();
         assert_eq!(result, Some("original".to_string()));
     }
+
+    // ========================================
+    // MlsProposals Tests
+    // ========================================
+
+    #[test]
+    fn test_proposals_queue_and_read() {
+        let store = MlsProposals::new();
+        let group_id = vec![1u8, 2, 3, 4];
+        let proposal_ref = vec![10u8, 20, 30];
+        let proposal = "test proposal".to_string();
+
+        // Queue proposal
+        store.queue(&group_id, &proposal_ref, &proposal).unwrap();
+
+        // Read proposal refs
+        let refs: Vec<Vec<u8>> = store.read_refs(&group_id).unwrap();
+        assert_eq!(refs, vec![proposal_ref.clone()]);
+
+        // Read proposals
+        let proposals: Vec<(Vec<u8>, String)> = store.read_proposals(&group_id).unwrap();
+        assert_eq!(proposals.len(), 1);
+        assert_eq!(proposals[0].0, proposal_ref);
+        assert_eq!(proposals[0].1, proposal);
+    }
+
+    #[test]
+    fn test_proposals_remove_single() {
+        let store = MlsProposals::new();
+        let group_id = vec![1u8, 2, 3, 4];
+        let proposal_ref = vec![10u8, 20, 30];
+        let proposal = "test proposal".to_string();
+
+        // Queue and remove
+        store.queue(&group_id, &proposal_ref, &proposal).unwrap();
+        store.remove(&group_id, &proposal_ref).unwrap();
+
+        // Verify removed
+        let proposals: Vec<(Vec<u8>, String)> = store.read_proposals(&group_id).unwrap();
+        assert!(proposals.is_empty());
+    }
+
+    #[test]
+    fn test_proposals_clear() {
+        let store = MlsProposals::new();
+        let group_id = vec![1u8, 2, 3, 4];
+
+        // Queue multiple proposals
+        for i in 0..3 {
+            let proposal_ref = vec![i as u8; 4];
+            store
+                .queue(&group_id, &proposal_ref, &format!("proposal_{}", i))
+                .unwrap();
+        }
+
+        // Clear all
+        store.clear(&group_id).unwrap();
+
+        // Verify empty
+        let proposals: Vec<(Vec<u8>, String)> = store.read_proposals(&group_id).unwrap();
+        assert!(proposals.is_empty());
+    }
+
+    #[test]
+    fn test_proposals_read_empty() {
+        let store = MlsProposals::new();
+        let group_id = vec![1u8, 2, 3, 4];
+
+        let refs: Vec<Vec<u8>> = store.read_refs(&group_id).unwrap();
+        assert!(refs.is_empty());
+
+        let proposals: Vec<(Vec<u8>, String)> = store.read_proposals(&group_id).unwrap();
+        assert!(proposals.is_empty());
+    }
+
+    #[test]
+    fn test_proposals_snapshot_restore() {
+        let store = MlsProposals::new();
+        let group_id = vec![1u8, 2, 3, 4];
+        let proposal_ref = vec![10u8, 20, 30];
+
+        // Queue proposal
+        store
+            .queue(&group_id, &proposal_ref, &"original".to_string())
+            .unwrap();
+
+        // Take snapshot
+        let snapshot = store.clone_data();
+
+        // Clear proposals
+        store.clear(&group_id).unwrap();
+
+        // Verify cleared
+        let proposals: Vec<(Vec<u8>, String)> = store.read_proposals(&group_id).unwrap();
+        assert!(proposals.is_empty());
+
+        // Restore snapshot
+        store.restore_data(snapshot);
+
+        // Verify restored
+        let proposals: Vec<(Vec<u8>, String)> = store.read_proposals(&group_id).unwrap();
+        assert_eq!(proposals.len(), 1);
+    }
+
+    // ========================================
+    // MlsPsks Tests
+    // ========================================
+
+    #[test]
+    fn test_psks_write_and_read() {
+        let store = MlsPsks::new();
+        let psk_id = vec![1u8, 2, 3, 4];
+        let psk_bundle = "psk bundle data".to_string();
+
+        // Write PSK
+        store.write(&psk_id, &psk_bundle).unwrap();
+
+        // Read PSK
+        let result: Option<String> = store.read(&psk_id).unwrap();
+        assert_eq!(result, Some(psk_bundle));
+    }
+
+    #[test]
+    fn test_psks_read_nonexistent() {
+        let store = MlsPsks::new();
+        let psk_id = vec![1u8, 2, 3, 4];
+
+        let result: Option<String> = store.read(&psk_id).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_psks_delete() {
+        let store = MlsPsks::new();
+        let psk_id = vec![1u8, 2, 3, 4];
+        let psk_bundle = "psk bundle".to_string();
+
+        // Write and delete
+        store.write(&psk_id, &psk_bundle).unwrap();
+        store.delete(&psk_id).unwrap();
+
+        // Verify deleted
+        let result: Option<String> = store.read(&psk_id).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_psks_overwrite() {
+        let store = MlsPsks::new();
+        let psk_id = vec![1u8, 2, 3, 4];
+
+        // Write first
+        store.write(&psk_id, &"first".to_string()).unwrap();
+
+        // Overwrite
+        store.write(&psk_id, &"second".to_string()).unwrap();
+
+        // Verify second
+        let result: Option<String> = store.read(&psk_id).unwrap();
+        assert_eq!(result, Some("second".to_string()));
+    }
+
+    #[test]
+    fn test_psks_snapshot_restore() {
+        let store = MlsPsks::new();
+        let psk_id = vec![1u8, 2, 3, 4];
+
+        // Write
+        store.write(&psk_id, &"original".to_string()).unwrap();
+
+        // Snapshot
+        let snapshot = store.clone_data();
+
+        // Modify
+        store.write(&psk_id, &"modified".to_string()).unwrap();
+
+        // Restore
+        store.restore_data(snapshot);
+
+        // Verify
+        let result: Option<String> = store.read(&psk_id).unwrap();
+        assert_eq!(result, Some("original".to_string()));
+    }
+
+    // ========================================
+    // MlsSignatureKeys Tests
+    // ========================================
+
+    #[test]
+    fn test_signature_keys_write_and_read() {
+        let store = MlsSignatureKeys::new();
+        let public_key = vec![1u8, 2, 3, 4];
+        let key_pair = "signature key pair".to_string();
+
+        // Write
+        store.write(&public_key, &key_pair).unwrap();
+
+        // Read
+        let result: Option<String> = store.read(&public_key).unwrap();
+        assert_eq!(result, Some(key_pair));
+    }
+
+    #[test]
+    fn test_signature_keys_read_nonexistent() {
+        let store = MlsSignatureKeys::new();
+        let public_key = vec![1u8, 2, 3, 4];
+
+        let result: Option<String> = store.read(&public_key).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_signature_keys_delete() {
+        let store = MlsSignatureKeys::new();
+        let public_key = vec![1u8, 2, 3, 4];
+        let key_pair = "signature key pair".to_string();
+
+        // Write and delete
+        store.write(&public_key, &key_pair).unwrap();
+        store.delete(&public_key).unwrap();
+
+        // Verify deleted
+        let result: Option<String> = store.read(&public_key).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_signature_keys_snapshot_restore() {
+        let store = MlsSignatureKeys::new();
+        let public_key = vec![1u8, 2, 3, 4];
+
+        // Write
+        store.write(&public_key, &"original".to_string()).unwrap();
+
+        // Snapshot
+        let snapshot = store.clone_data();
+
+        // Modify
+        store.write(&public_key, &"modified".to_string()).unwrap();
+
+        // Restore
+        store.restore_data(snapshot);
+
+        // Verify
+        let result: Option<String> = store.read(&public_key).unwrap();
+        assert_eq!(result, Some("original".to_string()));
+    }
+
+    // ========================================
+    // MlsEncryptionKeys Tests
+    // ========================================
+
+    #[test]
+    fn test_encryption_keys_write_and_read() {
+        let store = MlsEncryptionKeys::new();
+        let public_key = vec![1u8, 2, 3, 4];
+        let key_pair = "encryption key pair".to_string();
+
+        // Write
+        store.write(&public_key, &key_pair).unwrap();
+
+        // Read
+        let result: Option<String> = store.read(&public_key).unwrap();
+        assert_eq!(result, Some(key_pair));
+    }
+
+    #[test]
+    fn test_encryption_keys_read_nonexistent() {
+        let store = MlsEncryptionKeys::new();
+        let public_key = vec![1u8, 2, 3, 4];
+
+        let result: Option<String> = store.read(&public_key).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_encryption_keys_delete() {
+        let store = MlsEncryptionKeys::new();
+        let public_key = vec![1u8, 2, 3, 4];
+        let key_pair = "encryption key pair".to_string();
+
+        // Write and delete
+        store.write(&public_key, &key_pair).unwrap();
+        store.delete(&public_key).unwrap();
+
+        // Verify deleted
+        let result: Option<String> = store.read(&public_key).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_encryption_keys_snapshot_restore() {
+        let store = MlsEncryptionKeys::new();
+        let public_key = vec![1u8, 2, 3, 4];
+
+        // Write
+        store.write(&public_key, &"original".to_string()).unwrap();
+
+        // Snapshot
+        let snapshot = store.clone_data();
+
+        // Modify
+        store.write(&public_key, &"modified".to_string()).unwrap();
+
+        // Restore
+        store.restore_data(snapshot);
+
+        // Verify
+        let result: Option<String> = store.read(&public_key).unwrap();
+        assert_eq!(result, Some("original".to_string()));
+    }
+
+    // ========================================
+    // MlsEpochKeyPairs Tests
+    // ========================================
+
+    #[test]
+    fn test_epoch_key_pairs_write_and_read() {
+        let store = MlsEpochKeyPairs::new();
+        let group_id = vec![1u8, 2, 3, 4];
+        let epoch = 5u64;
+        let leaf_index = 0u32;
+        let key_pairs = vec!["key1".to_string(), "key2".to_string()];
+
+        // Write
+        store
+            .write(&group_id, &epoch, leaf_index, &key_pairs)
+            .unwrap();
+
+        // Read
+        let result: Vec<String> = store.read(&group_id, &epoch, leaf_index).unwrap();
+        assert_eq!(result, key_pairs);
+    }
+
+    #[test]
+    fn test_epoch_key_pairs_read_nonexistent() {
+        let store = MlsEpochKeyPairs::new();
+        let group_id = vec![1u8, 2, 3, 4];
+        let epoch = 5u64;
+        let leaf_index = 0u32;
+
+        let result: Vec<String> = store.read(&group_id, &epoch, leaf_index).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_epoch_key_pairs_delete() {
+        let store = MlsEpochKeyPairs::new();
+        let group_id = vec![1u8, 2, 3, 4];
+        let epoch = 5u64;
+        let leaf_index = 0u32;
+        let key_pairs = vec!["key".to_string()];
+
+        // Write and delete
+        store
+            .write(&group_id, &epoch, leaf_index, &key_pairs)
+            .unwrap();
+        store.delete(&group_id, &epoch, leaf_index).unwrap();
+
+        // Verify deleted (returns empty vec)
+        let result: Vec<String> = store.read(&group_id, &epoch, leaf_index).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_epoch_key_pairs_different_epochs() {
+        let store = MlsEpochKeyPairs::new();
+        let group_id = vec![1u8, 2, 3, 4];
+        let leaf_index = 0u32;
+
+        let keys_epoch_1 = ["epoch1".to_string()];
+        let keys_epoch_2 = ["epoch2".to_string()];
+
+        // Write for different epochs
+        store
+            .write(&group_id, &1u64, leaf_index, &keys_epoch_1)
+            .unwrap();
+        store
+            .write(&group_id, &2u64, leaf_index, &keys_epoch_2)
+            .unwrap();
+
+        // Verify each epoch
+        let result1: Vec<String> = store.read(&group_id, &1u64, leaf_index).unwrap();
+        let result2: Vec<String> = store.read(&group_id, &2u64, leaf_index).unwrap();
+
+        assert_eq!(result1, vec!["epoch1".to_string()]);
+        assert_eq!(result2, vec!["epoch2".to_string()]);
+    }
+
+    #[test]
+    fn test_epoch_key_pairs_different_leaf_indices() {
+        let store = MlsEpochKeyPairs::new();
+        let group_id = vec![1u8, 2, 3, 4];
+        let epoch = 1u64;
+
+        let keys_leaf_0 = ["leaf0".to_string()];
+        let keys_leaf_1 = ["leaf1".to_string()];
+
+        // Write for different leaf indices
+        store.write(&group_id, &epoch, 0, &keys_leaf_0).unwrap();
+        store.write(&group_id, &epoch, 1, &keys_leaf_1).unwrap();
+
+        // Verify each leaf index
+        let result0: Vec<String> = store.read(&group_id, &epoch, 0).unwrap();
+        let result1: Vec<String> = store.read(&group_id, &epoch, 1).unwrap();
+
+        assert_eq!(result0, vec!["leaf0".to_string()]);
+        assert_eq!(result1, vec!["leaf1".to_string()]);
+    }
+
+    #[test]
+    fn test_epoch_key_pairs_snapshot_restore() {
+        let store = MlsEpochKeyPairs::new();
+        let group_id = vec![1u8, 2, 3, 4];
+        let epoch = 1u64;
+        let leaf_index = 0u32;
+
+        let original = ["original".to_string()];
+        let modified = ["modified".to_string()];
+
+        // Write
+        store
+            .write(&group_id, &epoch, leaf_index, &original)
+            .unwrap();
+
+        // Snapshot
+        let snapshot = store.clone_data();
+
+        // Modify
+        store
+            .write(&group_id, &epoch, leaf_index, &modified)
+            .unwrap();
+
+        // Restore
+        store.restore_data(snapshot);
+
+        // Verify
+        let result: Vec<String> = store.read(&group_id, &epoch, leaf_index).unwrap();
+        assert_eq!(result, vec!["original".to_string()]);
+    }
+
+    // ========================================
+    // Serialization Tests
+    // ========================================
+
+    #[test]
+    fn test_serialize_key_success() {
+        let key = vec![1u8, 2, 3, 4];
+        let result = serialize_key(&key);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_serialize_entity_success() {
+        let entity = "test entity".to_string();
+        let result = serialize_entity(&entity);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_deserialize_entity_success() {
+        let original = "test entity".to_string();
+        let serialized = serialize_entity(&original).unwrap();
+        let result: String = deserialize_entity(&serialized).unwrap();
+        assert_eq!(result, original);
+    }
+
+    #[test]
+    fn test_deserialize_entity_invalid_json() {
+        let invalid = b"not valid json";
+        let result: Result<String, _> = deserialize_entity(invalid);
+        assert!(result.is_err());
+    }
 }
