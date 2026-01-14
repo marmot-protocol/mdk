@@ -18,7 +18,7 @@ Both connections point to the same SQLite database file, but because they are se
 ### Related Issues
 
 - [Issue #54](https://github.com/marmot-protocol/mdk/issues/54): No Deterministic Commit Race Resolution (LA Audit Finding)
-- [Issue #25](https://github.com/marmot-protocol/mdk/issues/25): Handle out of order Commit messages better
+- [Issue #25](https://github.com/marmot-protocol/mdk/issues/25): Handle out-of-order Commit messages better
 
 ### MIP-03 Requirements
 
@@ -43,7 +43,7 @@ openmls_memory_storage = "0.4.1"  # Memory implementation we'll replace
 
 ### Current Architecture
 
-```
+```text
 MdkSqliteStorage
 ├── openmls_storage: SqliteStorageProvider<JsonCodec, Connection>  ← Connection 1
 └── db_connection: Arc<Mutex<Connection>>                          ← Connection 2
@@ -80,7 +80,7 @@ MdkMemoryStorage
 
 ### New Architecture
 
-```
+```text
 MdkSqliteStorage
 └── connection: Arc<Mutex<Connection>>  ← Single connection
     ├── impl StorageProvider<1>         ← OpenMLS trait (56 methods)
