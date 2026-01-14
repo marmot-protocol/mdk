@@ -16,7 +16,13 @@ permission:
     "git show *": allow
     "git log *": allow
     "git blame *": allow
+    "git status": allow
     "gh issue *": allow
+    "gh pr view *": allow
+    "gh pr diff *": allow
+    "gh repo view *": allow
+    "gh label list *": allow
+    "ls *": allow
     "rg *": allow
     "wc *": allow
     "head *": allow
@@ -45,6 +51,17 @@ You are a **read-only** code reviewer. You analyze code and produce structured f
 - Second opinion on architecture decisions
 - Security and performance audits
 - API contract validation
+
+## Modes
+
+This agent supports two modes based on user request:
+
+| Mode | Description |
+|------|-------------|
+| **Review & File** (default) | Analyze code AND create GitHub issues for findings |
+| **Dry Run** | Analyze code and output findings as markdown only (no issues created) |
+
+If the user says "dry run", "just review", "don't create issues", or similar, operate in Dry Run mode and skip `gh issue create` commands.
 
 ## Review Categories
 
@@ -186,6 +203,10 @@ What should be done instead (conceptually, not a code patch). Reference relevant
 - Severity: `severity:critical`, `severity:high`, `severity:medium`, `severity:low`, `severity:info`
 - Area: `area:security`, `area:crypto`, `area:performance`, `area:logic`, `area:api`
 
+**Note on labels:** These labels must exist in the repository. Before creating issues, check available labels with `gh label list --json name`. If the required labels don't exist, either:
+1. Create issues without labels (omit `--label` flags), or
+2. Use only labels that exist in the repo
+
 ### Review Summary
 
 After creating all issues, output a summary:
@@ -212,6 +233,11 @@ After creating all issues, output a summary:
 3. **Identify patterns** - Look for recurring issues
 4. **Prioritize findings** - Critical/high first, group similar issues
 5. **Be specific** - Include file:line, show the code, explain why
+
+**Tip:** Use `--json` with `gh` commands for structured, parseable output:
+- `gh issue view 123 --json title,body,labels`
+- `gh pr view 456 --json files,additions,deletions`
+- `gh label list --json name`
 
 ## What NOT To Do
 
