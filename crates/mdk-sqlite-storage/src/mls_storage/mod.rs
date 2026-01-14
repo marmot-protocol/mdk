@@ -4,61 +4,15 @@
 //! directly on `MdkSqliteStorage`, enabling unified storage for both MLS
 //! cryptographic state and MDK-specific data within a single database connection.
 
-pub mod codec;
-
 use mdk_storage_traits::MdkStorageError;
+pub use mdk_storage_traits::mls_codec::{GroupDataType, JsonCodec};
 use openmls_traits::storage::{Entity, Key};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use self::codec::JsonCodec;
-
 /// The storage provider version matching OpenMLS's CURRENT_VERSION.
 pub const STORAGE_PROVIDER_VERSION: u16 = 1;
-
-/// Types of group data stored in the openmls_group_data table.
-#[derive(Debug, Clone, Copy)]
-pub enum GroupDataType {
-    /// MLS group join configuration
-    JoinGroupConfig,
-    /// TreeSync tree structure
-    Tree,
-    /// Interim transcript hash
-    InterimTranscriptHash,
-    /// Group context
-    Context,
-    /// Confirmation tag
-    ConfirmationTag,
-    /// Group state (active, inactive, etc.)
-    GroupState,
-    /// Message secrets for decryption
-    MessageSecrets,
-    /// Resumption PSK store
-    ResumptionPskStore,
-    /// Own leaf index in the tree
-    OwnLeafIndex,
-    /// Group epoch secrets
-    GroupEpochSecrets,
-}
-
-impl GroupDataType {
-    /// Convert to string for database storage.
-    fn as_str(&self) -> &'static str {
-        match self {
-            Self::JoinGroupConfig => "join_group_config",
-            Self::Tree => "tree",
-            Self::InterimTranscriptHash => "interim_transcript_hash",
-            Self::Context => "context",
-            Self::ConfirmationTag => "confirmation_tag",
-            Self::GroupState => "group_state",
-            Self::MessageSecrets => "message_secrets",
-            Self::ResumptionPskStore => "resumption_psk_store",
-            Self::OwnLeafIndex => "own_leaf_index",
-            Self::GroupEpochSecrets => "group_epoch_secrets",
-        }
-    }
-}
 
 // ============================================================================
 // Helper functions for serialization

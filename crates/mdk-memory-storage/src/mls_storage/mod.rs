@@ -8,44 +8,16 @@
 // for proper data organization and the complexity is inherent to the domain.
 #![allow(clippy::type_complexity)]
 
-pub mod codec;
-
 use std::collections::HashMap;
 
 use mdk_storage_traits::MdkStorageError;
+pub use mdk_storage_traits::mls_codec::{GroupDataType, JsonCodec};
 use parking_lot::RwLock;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use self::codec::JsonCodec;
-
 /// The storage provider version matching OpenMLS's CURRENT_VERSION.
 pub const STORAGE_PROVIDER_VERSION: u16 = 1;
-
-/// Types of group data stored in the MLS group data map.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum GroupDataType {
-    /// MLS group join configuration
-    JoinGroupConfig,
-    /// TreeSync tree structure
-    Tree,
-    /// Interim transcript hash
-    InterimTranscriptHash,
-    /// Group context
-    Context,
-    /// Confirmation tag
-    ConfirmationTag,
-    /// Group state (active, inactive, etc.)
-    GroupState,
-    /// Message secrets for decryption
-    MessageSecrets,
-    /// Resumption PSK store
-    ResumptionPskStore,
-    /// Own leaf index in the tree
-    OwnLeafIndex,
-    /// Group epoch secrets
-    GroupEpochSecrets,
-}
 
 // ============================================================================
 // In-Memory Data Structures

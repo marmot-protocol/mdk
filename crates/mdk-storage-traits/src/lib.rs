@@ -11,6 +11,7 @@ pub mod error;
 pub mod group_id;
 pub mod groups;
 pub mod messages;
+pub mod mls_codec;
 /// Secret wrapper for zeroization
 pub mod secret;
 #[cfg(feature = "test-utils")]
