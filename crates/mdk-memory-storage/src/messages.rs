@@ -34,25 +34,43 @@ impl MessageStorage for MdkMemoryStorage {
             }
         }
 
-        // Save in the messages cache
+        // Acquire both cache write guards to ensure coordinated eviction
         let mut cache = self.messages_cache.write();
-        cache.put(message.id, message.clone());
-
-        // Save in the messages_by_group cache using HashMap for O(1) insert/update
         let mut group_cache = self.messages_by_group_cache.write();
+
         match group_cache.get_mut(&message.mls_group_id) {
             Some(group_messages) => {
+                // Check if this is an update (message already exists) or a new message
+                let is_update = group_messages.contains_key(&message.id);
+
+                if !is_update && group_messages.len() >= self.limits.max_messages_per_group {
+                    // Evict the oldest message to make room for the new one
+                    // Find the message with the oldest created_at timestamp
+                    if let Some(oldest_id) = group_messages
+                        .iter()
+                        .min_by_key(|(_, msg)| msg.created_at)
+                        .map(|(id, _)| *id)
+                    {
+                        // Remove from both caches to prevent orphaned entries
+                        group_messages.remove(&oldest_id);
+                        cache.pop(&oldest_id);
+                    }
+                }
+
                 // O(1) insert or update using HashMap
-                group_messages.insert(message.id, message);
+                group_messages.insert(message.id, message.clone());
             }
             None => {
                 // Create new HashMap for this group
                 let mut messages = HashMap::new();
                 let group_id = message.mls_group_id.clone();
-                messages.insert(message.id, message);
+                messages.insert(message.id, message.clone());
                 group_cache.put(group_id, messages);
             }
         }
+
+        // Save in the messages cache
+        cache.put(message.id, message);
 
         Ok(())
     }
@@ -94,6 +112,7 @@ mod tests {
 
     use mdk_storage_traits::groups::GroupStorage;
     use mdk_storage_traits::groups::types::{Group, GroupState};
+    use nostr::Keys;
 
     use super::*;
 
@@ -126,7 +145,7 @@ mod tests {
         content: &str,
         timestamp: u64,
     ) -> Message {
-        let pubkey = PublicKey::from_slice(&[1u8; 32]).unwrap();
+        let pubkey = Keys::generate().public_key();
         let wrapper_event_id = EventId::from_slice(&[200u8; 32]).unwrap();
 
         Message {
@@ -362,6 +381,207 @@ mod tests {
             let cache = storage.messages_by_group_cache.read();
             let group_messages = cache.peek(&group_id).unwrap();
             assert_eq!(group_messages.len(), 1);
+        }
+    }
+
+    /// Test that the messages per group limit is enforced and oldest messages are evicted.
+    /// This test verifies that:
+    /// 1. When max_messages_per_group is reached, the oldest message is evicted
+    /// 2. Evicted messages are removed from BOTH caches (messages_cache and messages_by_group_cache)
+    /// 3. Updates to existing messages don't trigger eviction
+    #[test]
+    fn test_save_message_per_group_limit_eviction() {
+        use crate::{DEFAULT_MAX_MESSAGES_PER_GROUP, ValidationLimits};
+
+        // Create storage with a large cache size for testing
+        let limits = ValidationLimits::default().with_cache_size(20000);
+        let storage = MdkMemoryStorage::with_limits(limits);
+
+        let group_id = GroupId::from_slice(&[1, 2, 3, 4]);
+
+        // Create the group first
+        let group = create_test_group(group_id.clone());
+        storage.save_group(group).unwrap();
+
+        // Save exactly DEFAULT_MAX_MESSAGES_PER_GROUP messages
+        // Use timestamps 1000..1000+MAX to establish age ordering
+        for i in 0..DEFAULT_MAX_MESSAGES_PER_GROUP {
+            let mut event_bytes = [0u8; 32];
+            event_bytes[0] = (i % 256) as u8;
+            event_bytes[1] = ((i / 256) % 256) as u8;
+            event_bytes[2] = ((i / 65536) % 256) as u8;
+            let event_id = EventId::from_slice(&event_bytes).unwrap();
+            let message = create_test_message(
+                event_id,
+                group_id.clone(),
+                &format!("Message {}", i),
+                1000 + i as u64, // Oldest message has timestamp 1000
+            );
+            storage.save_message(message).unwrap();
+        }
+
+        // Verify all messages are stored
+        {
+            let cache = storage.messages_by_group_cache.read();
+            let group_messages = cache.peek(&group_id).unwrap();
+            assert_eq!(group_messages.len(), DEFAULT_MAX_MESSAGES_PER_GROUP);
+        }
+
+        // The oldest message (index 0, timestamp 1000) should exist
+        let oldest_event_id = EventId::from_slice(&[0u8; 32]).unwrap();
+        {
+            let found = storage
+                .find_message_by_event_id(&group_id, &oldest_event_id)
+                .unwrap();
+            assert!(
+                found.is_some(),
+                "Oldest message should exist before eviction"
+            );
+        }
+
+        // Now add one more message to trigger eviction
+        let new_event_bytes = [255u8; 32]; // Unique event ID
+        let new_event_id = EventId::from_slice(&new_event_bytes).unwrap();
+        let new_message = create_test_message(
+            new_event_id,
+            group_id.clone(),
+            "New message triggering eviction",
+            999999, // Much newer timestamp
+        );
+        storage.save_message(new_message).unwrap();
+
+        // Verify the count is still at MAX (eviction occurred)
+        {
+            let cache = storage.messages_by_group_cache.read();
+            let group_messages = cache.peek(&group_id).unwrap();
+            assert_eq!(
+                group_messages.len(),
+                DEFAULT_MAX_MESSAGES_PER_GROUP,
+                "Should still have DEFAULT_MAX_MESSAGES_PER_GROUP after eviction"
+            );
+        }
+
+        // The oldest message should have been evicted from messages_by_group_cache
+        {
+            let found = storage
+                .find_message_by_event_id(&group_id, &oldest_event_id)
+                .unwrap();
+            assert!(
+                found.is_none(),
+                "Oldest message should be evicted from messages_by_group_cache"
+            );
+        }
+
+        // CRITICAL: The oldest message should ALSO be evicted from messages_cache
+        // This verifies the coordinated eviction fix
+        {
+            let cache = storage.messages_cache.read();
+            assert!(
+                !cache.contains(&oldest_event_id),
+                "Oldest message should be evicted from messages_cache too (no orphaned entries)"
+            );
+        }
+
+        // The new message should exist
+        {
+            let found = storage
+                .find_message_by_event_id(&group_id, &new_event_id)
+                .unwrap();
+            assert!(found.is_some(), "New message should exist after eviction");
+            assert_eq!(found.unwrap().content, "New message triggering eviction");
+        }
+
+        // Verify updating an existing message doesn't trigger eviction
+        // Update the second oldest message (index 1)
+        let mut update_event_bytes = [0u8; 32];
+        update_event_bytes[0] = 1;
+        let update_event_id = EventId::from_slice(&update_event_bytes).unwrap();
+        let update_message =
+            create_test_message(update_event_id, group_id.clone(), "Updated Message 1", 2000);
+        storage.save_message(update_message).unwrap();
+
+        // Should still have the same count (no eviction for updates)
+        {
+            let cache = storage.messages_by_group_cache.read();
+            let group_messages = cache.peek(&group_id).unwrap();
+            assert_eq!(
+                group_messages.len(),
+                DEFAULT_MAX_MESSAGES_PER_GROUP,
+                "Update should not change message count"
+            );
+        }
+
+        // Verify the message was updated
+        let found = storage
+            .find_message_by_event_id(&group_id, &update_event_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.content, "Updated Message 1");
+    }
+
+    /// Test that custom validation limits work correctly
+    #[test]
+    fn test_custom_message_limit() {
+        use crate::ValidationLimits;
+
+        // Create storage with a custom small message limit for testing
+        let custom_limit = 5;
+        let limits = ValidationLimits::default()
+            .with_cache_size(100)
+            .with_max_messages_per_group(custom_limit);
+        let storage = MdkMemoryStorage::with_limits(limits);
+
+        let group_id = GroupId::from_slice(&[1, 2, 3, 4]);
+
+        // Create the group first
+        let group = create_test_group(group_id.clone());
+        storage.save_group(group).unwrap();
+
+        // Save exactly custom_limit messages
+        for i in 0..custom_limit {
+            let mut event_bytes = [0u8; 32];
+            event_bytes[0] = i as u8;
+            let event_id = EventId::from_slice(&event_bytes).unwrap();
+            let message = create_test_message(
+                event_id,
+                group_id.clone(),
+                &format!("Message {}", i),
+                1000 + i as u64,
+            );
+            storage.save_message(message).unwrap();
+        }
+
+        // Verify all messages are stored
+        {
+            let cache = storage.messages_by_group_cache.read();
+            let group_messages = cache.peek(&group_id).unwrap();
+            assert_eq!(group_messages.len(), custom_limit);
+        }
+
+        // Add one more message to trigger eviction
+        let new_event_id = EventId::from_slice(&[255u8; 32]).unwrap();
+        let new_message = create_test_message(
+            new_event_id,
+            group_id.clone(),
+            "New message triggering eviction",
+            999999,
+        );
+        storage.save_message(new_message).unwrap();
+
+        // Verify the count is still at custom_limit (eviction occurred)
+        {
+            let cache = storage.messages_by_group_cache.read();
+            let group_messages = cache.peek(&group_id).unwrap();
+            assert_eq!(group_messages.len(), custom_limit);
+        }
+
+        // The oldest message (index 0) should have been evicted
+        let oldest_event_id = EventId::from_slice(&[0u8; 32]).unwrap();
+        {
+            let found = storage
+                .find_message_by_event_id(&group_id, &oldest_event_id)
+                .unwrap();
+            assert!(found.is_none(), "Oldest message should be evicted");
         }
     }
 }

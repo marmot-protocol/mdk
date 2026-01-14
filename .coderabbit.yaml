@@ -1,0 +1,393 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+# CodeRabbit Configuration
+# See: https://docs.coderabbit.ai/getting-started/yaml-configuration
+
+reviews:
+  high_level_summary: true
+  high_level_summary_instructions: |
+    Start with a 2-3 sentence prose summary explaining what this PR accomplishes and why.
+    
+    Then provide bullet points organized by these sections (omit sections that don't apply):
+    
+    **What changed**:
+    - Describe the main changes in plain language
+    - Note which crates are affected (mdk-core, mdk-sqlite-storage, mdk-memory-storage, mdk-storage-traits, mdk-uniffi)
+    
+    **Security impact** (if any):
+    - Cryptographic changes (encryption, key derivation, nonces, HKDF context strings)
+    - Key handling or storage modifications
+    - Identity binding or credential validation changes
+    - Changes to error messages that could leak sensitive identifiers
+    - SQLCipher configuration or file permission changes
+    
+    **Protocol changes** (if any):
+    - MLS protocol implementation changes (cite RFC 9420 sections if relevant)
+    - Nostr integration changes (cite NIPs if relevant)
+    - MIP (Marmot Improvement Proposal) implementation
+    
+    **API surface** (if any):
+    - Breaking changes to public APIs (methods, types, traits)
+    - New public APIs added
+    - Storage schema changes
+    - UniFFI/FFI boundary changes
+    
+    **Testing**:
+    - Note if tests were added, modified, or if coverage-sensitive code paths changed
+    
+    Keep each bullet to one sentence. If the PR touches cryptographic code, key management, SQLCipher, or file permissions, prepend the summary with "⚠️ Security-sensitive changes".
+
+  # Request changes when security issues are found
+  request_changes_workflow: true
+
+  # Collapse walkthrough to keep reviews focused
+  collapse_walkthrough: true
+
+  # Keep sequence diagrams for understanding MLS flows
+  sequence_diagrams: true
+
+  # Assess how well changes address linked issues
+  assess_linked_issues: true
+
+  # Show related context
+  related_issues: true
+  related_prs: true
+
+  # Disable non-essential elements
+  poem: false
+  in_progress_fortune: false
+
+  # Auto-review configuration
+  auto_review:
+    ignore_title_keywords:
+      - "WIP"
+      - "DO NOT MERGE"
+      - "DRAFT"
+    drafts: false
+
+  # Pre-merge checks for enforcing project standards
+  pre_merge_checks:
+    # Verify PR descriptions are meaningful
+    description:
+      mode: "warning"
+
+    # Verify PRs address linked issues
+    issue_assessment:
+      mode: "warning"
+
+    # Custom checks for MDK-specific requirements
+    custom_checks:
+      - name: "No Sensitive Identifier Leakage"
+        mode: "error"
+        instructions: |
+          Pass if: No sensitive identifiers (mls_group_id, nostr_group_id, GroupId, encryption keys, exporter secrets) appear in:
+          - tracing::* macro calls (info!, warn!, error!, debug!, trace!)
+          - format!() strings in error messages or Error enum variants
+          - panic!() or unreachable!() messages
+          - Debug trait implementations that expose these fields without redaction
+          Fail if: Any of the above patterns are found with sensitive identifiers interpolated.
+          Note: Redacted forms like "[REDACTED]" or "***" are acceptable.
+
+  # Labels for security-related PRs
+  labeling_instructions:
+    - label: "security"
+      instructions: "Apply when the PR touches cryptographic code, key handling, authentication, or fixes a security issue"
+    - label: "breaking-change"
+      instructions: "Apply when the PR includes breaking API changes that require downstream updates"
+    - label: "mls-protocol"
+      instructions: "Apply when the PR modifies MLS protocol implementation in mdk-core"
+    - label: "storage"
+      instructions: "Apply when the PR modifies storage backends (sqlite or memory)"
+
+  # Path-based review instructions
+  path_instructions:
+    - path: "**/*.rs"
+      instructions: |
+        This project implements the Marmot Protocol (MLS + Nostr) for secure group messaging.
+        All crates use `#![forbid(unsafe_code)]` or `#![deny(unsafe_code)]` - flag any `unsafe` blocks.
+
+        ## CRITICAL SECURITY RULE: Never Log Sensitive Identifiers
+
+        The following identifiers are privacy-sensitive and must NEVER appear in:
+        - Log messages (via `tracing::*` macros)
+        - Error messages or error strings
+        - Debug output (including `Debug` trait implementations)
+        - Panic messages
+
+        **Protected identifiers:**
+        - `mls_group_id` / `GroupId` - MLS group identifier (enables cross-system group linkage)
+        - `nostr_group_id` - Nostr group identifier (links Nostr events to MLS groups)
+        - Encryption keys, signing keys, any key material
+        - Exporter secrets - MLS exporter secrets (enable retrospective decryption)
+        - `Secret<T>` contents - wrapper type for sensitive data
+
+        **Flag as security issue if you see patterns like:**
+        ```rust
+        // BAD - leaks identifier in error
+        format!("Group with MLS ID {:?} not found", mls_group_id)
+
+        // BAD - leaks identifier in logs
+        tracing::warn!("Group {} not found", mls_group_id);
+
+        // BAD - Debug impl that exposes sensitive data
+        #[derive(Debug)]  // on a struct containing mls_group_id without redaction
+        ```
+
+        **Correct patterns:**
+        ```rust
+        // GOOD - generic error without identifier
+        "Group not found".to_string()
+
+        // GOOD - log without identifier
+        tracing::warn!("Group not found in storage");
+
+        // GOOD - manual Debug impl that redacts sensitive fields
+        impl fmt::Debug for MyStruct {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.debug_struct("MyStruct")
+                    .field("mls_group_id", &"[REDACTED]")
+                    .finish()
+            }
+        }
+        ```
+
+        This requirement stems from MIP-01 group identity and privacy guidance.
+        See AGENTS.md and SECURITY.md for full details.
+
+        ## Cryptographic Code Review
+
+        When reviewing crypto-related code:
+        - Verify authenticated encryption (ChaCha20-Poly1305, AES-GCM) is used correctly
+        - Nonces/IVs must be random and never reused
+        - HKDF must have proper domain separation via unique context strings
+        - Sensitive data must use `Secret<T>` wrapper with `ZeroizeOnDrop`
+        - Key generation must use `getrandom`, never weak RNGs
+        - MAC/signature verification should use constant-time comparison
+
+        ## Code Style
+
+        - All trait bounds in `where` clauses, not inline
+        - Use `Self` instead of the type name when possible
+        - Derive order: `Debug`, `Clone`, `Copy`, `PartialEq`, `Eq`, `Hash`
+        - Always use `tracing::warn!(...)`, never import and use `warn!(...)`
+        - Use `.to_string()` or `.to_owned()`, not `.into()` or `String::from`
+        - All `use` statements at the top of their scope, never inside functions
+        - Use `match` instead of `if let ... { } else { }`
+        - Define modules in separate files (`mod x;` with `x.rs`), not inline. tests are the only exception
+
+    - path: "crates/mdk-sqlite-storage/**/*.rs"
+      instructions: |
+        SQLite storage backend using SQLCipher for encryption-at-rest.
+
+        ## SQLCipher Security Requirements
+
+        Verify these pragmas are correctly applied:
+        - `PRAGMA cipher_compatibility = 4` - pins to SQLCipher 4.x
+        - `PRAGMA temp_store = MEMORY` - prevents temp file data spill
+        - Key passed as raw hex: `PRAGMA key = "x'...'"`
+        - Key validation after setting: `SELECT count(*) FROM sqlite_master`
+
+        ## Key Management Security
+
+        - Keys must be 256-bit (32 bytes) from `getrandom` (CSPRNG)
+        - Keys stored in platform keyring (Keychain/Keystore/Credential Manager)
+        - `EncryptionConfig` must redact key in Debug output: `&"[REDACTED]"`
+        - Thread-safe key generation with double-checked locking pattern
+
+        ## File Permission Hardening (Unix)
+
+        - Database directory: `0700` (owner rwx only)
+        - Database files: `0600` (owner rw only)
+        - Atomic file creation with `O_CREAT | O_EXCL` (prevents TOCTOU)
+        - Verify no group/world permissions: `mode & 0o077 == 0`
+
+        ## Data Leakage Prevention
+
+        - No MLS group IDs or Nostr group IDs in error messages
+        - No encryption keys in logs or errors
+        - SQL injection prevention - parameterized queries only
+
+    - path: "crates/mdk-memory-storage/**/*.rs"
+      instructions: |
+        In-memory storage backend for testing.
+
+        Even though this is for testing:
+        - No MLS group IDs or Nostr group IDs in error messages
+        - Patterns here may be copied to production code
+        - Maintain same security discipline as production storage
+
+    - path: "crates/mdk-core/**/*.rs"
+      instructions: |
+        Core MLS implementation with Nostr integration.
+
+        ## MLS Protocol Security
+
+        - Ciphersuite: MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519
+        - Forward secrecy via MLS epoch rotation must be maintained
+        - Post-compromise security guarantees must be preserved
+        - Verify proper use of `export_secret()` for derived keys
+
+        ## Cryptographic Operations
+
+        - ChaCha20-Poly1305 for authenticated encryption
+        - HKDF-SHA256 with proper context strings for domain separation
+        - NIP-44 for message encryption using MLS-derived keys
+        - Nonces must be random and never reused
+        - Zeroization via `Secret<T>` and `ZeroizeOnDrop`
+
+        ## Identity Binding (CRITICAL)
+
+        - BasicCredential contains 32-byte Nostr public key
+        - Credential identity MUST match event signer (prevents impersonation)
+        - Base64 encoding MUST include explicit encoding tags (MIP-00/MIP-02)
+        - Reject data without encoding tags (prevents downgrade attacks)
+
+    - path: "crates/mdk-core/src/key_packages.rs"
+      instructions: |
+        Key package handling - security-critical for MLS group membership.
+
+        ## Identity Binding (CRITICAL)
+
+        This security check MUST exist and not be bypassed:
+        ```rust
+        // Credential identity MUST match event signer
+        if credential_identity != event.pubkey {
+            return Err(Error::KeyPackageIdentityMismatch { ... });
+        }
+        ```
+
+        This prevents impersonation attacks where an adversary:
+        1. Creates KeyPackage with victim's public key in credential
+        2. Signs kind-443 event with their own key
+        3. Attempts to join groups as the victim
+
+        ## Encoding Security
+
+        - Base64 with explicit encoding tag per MIP-00/MIP-02
+        - MUST reject key packages without encoding tags
+        - Look for `// SECURITY:` comments - ensure they're not violated
+
+    - path: "crates/mdk-core/src/extension/group_image.rs"
+      instructions: |
+        Group image encryption using ChaCha20-Poly1305.
+
+        ## Encryption Requirements
+
+        - Nonces: 12 bytes, randomly generated via `getrandom`
+        - Domain separation: context label `mip01-image-encryption-v2`
+        - Hash verification BEFORE decryption (prevents blob substitution)
+
+        Verify this pattern exists:
+        ```rust
+        // MUST verify hash before decryption
+        if computed_hash != expected_hash {
+            return Err(...);
+        }
+        ```
+
+    - path: "crates/mdk-core/src/encrypted_media/**/*.rs"
+      instructions: |
+        MIP-04 encrypted media handling.
+
+        ## Encryption Requirements
+
+        - ChaCha20-Poly1305 with HKDF-derived keys
+        - Domain separation: context label `mip04-v2`
+        - Associated Authenticated Data (AAD) must be used correctly
+        - Hash verification before decryption
+
+        ## Key Derivation Pattern
+
+        ```rust
+        let hk = Hkdf::<Sha256>::new(None, exporter_secret.secret.as_ref());
+        hk.expand(&context, &mut key)
+        ```
+        Verify context strings are unique and provide domain separation.
+
+    - path: "crates/mdk-storage-traits/src/secret.rs"
+      instructions: |
+        `Secret<T>` wrapper for sensitive data - security-critical.
+
+        ## Requirements
+
+        - MUST derive `ZeroizeOnDrop` to clear memory on drop
+        - Debug output MUST be redacted: `"Secret(***)"`
+        - No methods that could inadvertently leak secret contents
+        - Clone should be intentional (secrets shouldn't be freely copied)
+
+    - path: "crates/mdk-storage-traits/src/group_id.rs"
+      instructions: |
+        GroupId wraps MLS group identifiers - privacy-sensitive.
+
+        ## WARNING: Debug Output
+
+        Per SECURITY.md, MLS group IDs must NOT appear in logs or errors.
+        If `GroupId` uses derived `#[derive(Debug)]`, flag as potential issue.
+        Should use manual Debug impl with redaction.
+
+    - path: "crates/mdk-uniffi/**/*.rs"
+      instructions: |
+        UniFFI bindings for cross-platform support (iOS, Android).
+
+        ## FFI Security
+
+        - No sensitive data exposed through FFI unnecessarily
+        - Proper error handling - no panics across FFI boundary
+        - Memory safety at FFI boundaries
+        - No raw pointers to sensitive data
+        - Verify `Secret<T>` contents aren't exposed via FFI
+
+    - path: "**/CHANGELOG.md"
+      instructions: |
+        Changelog entries should:
+        - Be under the `## Unreleased` section
+        - Follow Keep a Changelog format (Added, Changed, Fixed, etc.)
+        - Include a PR link at the end: `([#123](https://github.com/marmot-protocol/mdk/pull/123))`
+        - Reference PR numbers, not issue numbers
+        - Never use bare URLs - always use markdown link syntax
+
+    - path: "**/*.md"
+      instructions: |
+        Markdown files should:
+        - Never use bare URLs - use `[text](url)` or `<url>` format
+        - Use proper heading hierarchy
+        - Include code block language specifiers
+
+    - path: "**/Cargo.toml"
+      instructions: |
+        For dependency changes, verify:
+        - No known security vulnerabilities in dependencies
+        - Crypto crates from reputable sources (RustCrypto, ring, etc.)
+        - Version constraints not too loose (avoid `*` or very wide ranges)
+        - New dependencies should be clearly mentioned in the summary
+
+  # Tools configuration
+  tools:
+    # AST-based pattern matching for security rules
+    ast-grep:
+      essential_rules: true
+
+    clippy:
+      enabled: true
+
+    # Secret scanning - critical for this security-focused project
+    gitleaks:
+      enabled: true
+
+    # Markdown linting for documentation
+    markdownlint:
+      enabled: true
+
+    yamllint:
+      enabled: true
+
+    # GitHub Actions workflow linting
+    actionlint:
+      enabled: true
+
+    # Wait for GitHub CI checks before finalizing review
+    github-checks:
+      enabled: true
+      timeout_ms: 600000  # 10 minutes - allow time for Rust compilation and tests
+
+chat:
+  auto_reply: true

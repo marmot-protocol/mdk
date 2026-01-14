@@ -12,6 +12,35 @@
 //! through in-memory data structures. It supports snapshot and restore operations
 //! for rollback scenarios, analogous to SQLite savepoints.
 
+//! ## Memory Exhaustion Protection
+//!
+//! This implementation includes input validation to prevent memory exhaustion attacks.
+//! The following limits are enforced (with configurable defaults via [`ValidationLimits`]):
+//!
+//! - [`DEFAULT_MAX_RELAYS_PER_GROUP`]: Maximum number of relays per group
+//! - [`DEFAULT_MAX_MESSAGES_PER_GROUP`]: Maximum messages stored per group in the cache
+//! - [`DEFAULT_MAX_GROUP_NAME_LENGTH`]: Maximum length of group name in bytes
+//! - [`DEFAULT_MAX_GROUP_DESCRIPTION_LENGTH`]: Maximum length of group description in bytes
+//! - [`DEFAULT_MAX_ADMINS_PER_GROUP`]: Maximum number of admin pubkeys per group
+//! - [`DEFAULT_MAX_RELAYS_PER_WELCOME`]: Maximum number of relays in a welcome message
+//! - [`DEFAULT_MAX_ADMINS_PER_WELCOME`]: Maximum number of admin pubkeys in a welcome message
+//! - [`DEFAULT_MAX_RELAY_URL_LENGTH`]: Maximum length of a relay URL in bytes
+//!
+//! ## Customizing Limits
+//!
+//! You can customize these limits using [`ValidationLimits`] and the builder pattern:
+//!
+//! ```rust
+//! use mdk_memory_storage::{MdkMemoryStorage, ValidationLimits};
+//!
+//! let limits = ValidationLimits::default()
+//!     .with_cache_size(2000)
+//!     .with_max_messages_per_group(5000)
+//!     .with_max_relays_per_group(50);
+//!
+//! let storage = MdkMemoryStorage::with_limits(limits);
+//! ```
+
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 #![warn(rustdoc::bare_urls)]
@@ -43,7 +72,208 @@ pub use self::snapshot::MemoryStorageSnapshot;
 use self::snapshot::{HashMapToLruExt, LruCacheExt};
 
 /// Default cache size for each LRU cache
-const DEFAULT_CACHE_SIZE: NonZeroUsize = NonZeroUsize::new(1000).unwrap();
+const DEFAULT_CACHE_SIZE: NonZeroUsize = match NonZeroUsize::new(1000) {
+    Some(v) => v,
+    None => panic!("cache size must be non-zero"),
+};
+
+/// Default maximum number of relays allowed per group to prevent memory exhaustion.
+/// This limit prevents attackers from growing a single cache entry unboundedly.
+pub const DEFAULT_MAX_RELAYS_PER_GROUP: usize = 100;
+
+/// Default maximum number of messages stored per group in the messages_by_group_cache.
+/// When this limit is reached, the oldest messages are evicted from the per-group cache.
+/// This prevents a single hot group from consuming excessive memory.
+pub const DEFAULT_MAX_MESSAGES_PER_GROUP: usize = 10000;
+
+/// Default maximum length of a group name in bytes (not characters).
+/// Multi-byte UTF-8 characters count as multiple bytes toward this limit.
+/// This prevents oversized group metadata from consuming excessive memory.
+pub const DEFAULT_MAX_GROUP_NAME_LENGTH: usize = 256;
+
+/// Default maximum length of a group description in bytes (not characters).
+/// Multi-byte UTF-8 characters count as multiple bytes toward this limit.
+/// This prevents oversized group metadata from consuming excessive memory.
+pub const DEFAULT_MAX_GROUP_DESCRIPTION_LENGTH: usize = 4096;
+
+/// Default maximum number of admin pubkeys allowed per group.
+/// This prevents unbounded growth of the admin set.
+pub const DEFAULT_MAX_ADMINS_PER_GROUP: usize = 100;
+
+/// Default maximum number of relays allowed in a welcome message.
+/// This prevents oversized welcome messages from consuming excessive memory.
+pub const DEFAULT_MAX_RELAYS_PER_WELCOME: usize = 100;
+
+/// Default maximum number of admin pubkeys allowed in a welcome message.
+/// This prevents oversized welcome messages from consuming excessive memory.
+pub const DEFAULT_MAX_ADMINS_PER_WELCOME: usize = 100;
+
+/// Default maximum length of a relay URL in bytes.
+/// This prevents oversized relay URLs from consuming excessive memory.
+pub const DEFAULT_MAX_RELAY_URL_LENGTH: usize = 512;
+
+/// Configurable validation limits for memory storage.
+///
+/// This struct allows customization of the various limits used to prevent
+/// memory exhaustion attacks. All limits have sensible defaults that can
+/// be overridden using the builder pattern.
+///
+/// # Example
+///
+/// ```rust
+/// use mdk_memory_storage::ValidationLimits;
+///
+/// let limits = ValidationLimits::default()
+///     .with_cache_size(2000)
+///     .with_max_messages_per_group(5000)
+///     .with_max_relays_per_group(50);
+/// ```
+#[derive(Debug, Clone, Copy)]
+pub struct ValidationLimits {
+    /// Maximum number of items in each LRU cache
+    pub cache_size: usize,
+    /// Maximum number of relays allowed per group
+    pub max_relays_per_group: usize,
+    /// Maximum number of messages stored per group
+    pub max_messages_per_group: usize,
+    /// Maximum length of a group name in bytes
+    pub max_group_name_length: usize,
+    /// Maximum length of a group description in bytes
+    pub max_group_description_length: usize,
+    /// Maximum number of admin pubkeys per group
+    pub max_admins_per_group: usize,
+    /// Maximum number of relays in a welcome message
+    pub max_relays_per_welcome: usize,
+    /// Maximum number of admin pubkeys in a welcome message
+    pub max_admins_per_welcome: usize,
+    /// Maximum length of a relay URL in bytes
+    pub max_relay_url_length: usize,
+}
+
+impl Default for ValidationLimits {
+    fn default() -> Self {
+        Self {
+            cache_size: DEFAULT_CACHE_SIZE.get(),
+            max_relays_per_group: DEFAULT_MAX_RELAYS_PER_GROUP,
+            max_messages_per_group: DEFAULT_MAX_MESSAGES_PER_GROUP,
+            max_group_name_length: DEFAULT_MAX_GROUP_NAME_LENGTH,
+            max_group_description_length: DEFAULT_MAX_GROUP_DESCRIPTION_LENGTH,
+            max_admins_per_group: DEFAULT_MAX_ADMINS_PER_GROUP,
+            max_relays_per_welcome: DEFAULT_MAX_RELAYS_PER_WELCOME,
+            max_admins_per_welcome: DEFAULT_MAX_ADMINS_PER_WELCOME,
+            max_relay_url_length: DEFAULT_MAX_RELAY_URL_LENGTH,
+        }
+    }
+}
+
+impl ValidationLimits {
+    /// Creates a new `ValidationLimits` with default values.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets the maximum number of items in each LRU cache.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `size` is 0.
+    pub fn with_cache_size(mut self, size: usize) -> Self {
+        assert!(size > 0, "cache_size must be greater than 0");
+        self.cache_size = size;
+        self
+    }
+
+    /// Sets the maximum number of relays allowed per group.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `limit` is 0.
+    pub fn with_max_relays_per_group(mut self, limit: usize) -> Self {
+        assert!(limit > 0, "max_relays_per_group must be greater than 0");
+        self.max_relays_per_group = limit;
+        self
+    }
+
+    /// Sets the maximum number of messages stored per group.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `limit` is 0.
+    pub fn with_max_messages_per_group(mut self, limit: usize) -> Self {
+        assert!(limit > 0, "max_messages_per_group must be greater than 0");
+        self.max_messages_per_group = limit;
+        self
+    }
+
+    /// Sets the maximum length of a group name in bytes.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `limit` is 0.
+    pub fn with_max_group_name_length(mut self, limit: usize) -> Self {
+        assert!(limit > 0, "max_group_name_length must be greater than 0");
+        self.max_group_name_length = limit;
+        self
+    }
+
+    /// Sets the maximum length of a group description in bytes.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `limit` is 0.
+    pub fn with_max_group_description_length(mut self, limit: usize) -> Self {
+        assert!(
+            limit > 0,
+            "max_group_description_length must be greater than 0"
+        );
+        self.max_group_description_length = limit;
+        self
+    }
+
+    /// Sets the maximum number of admin pubkeys per group.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `limit` is 0.
+    pub fn with_max_admins_per_group(mut self, limit: usize) -> Self {
+        assert!(limit > 0, "max_admins_per_group must be greater than 0");
+        self.max_admins_per_group = limit;
+        self
+    }
+
+    /// Sets the maximum number of relays in a welcome message.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `limit` is 0.
+    pub fn with_max_relays_per_welcome(mut self, limit: usize) -> Self {
+        assert!(limit > 0, "max_relays_per_welcome must be greater than 0");
+        self.max_relays_per_welcome = limit;
+        self
+    }
+
+    /// Sets the maximum number of admin pubkeys in a welcome message.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `limit` is 0.
+    pub fn with_max_admins_per_welcome(mut self, limit: usize) -> Self {
+        assert!(limit > 0, "max_admins_per_welcome must be greater than 0");
+        self.max_admins_per_welcome = limit;
+        self
+    }
+
+    /// Sets the maximum length of a relay URL in bytes.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `limit` is 0.
+    pub fn with_max_relay_url_length(mut self, limit: usize) -> Self {
+        assert!(limit > 0, "max_relay_url_length must be greater than 0");
+        self.max_relay_url_length = limit;
+        self
+    }
+}
 
 /// A memory-based storage implementation for Nostr MLS.
 ///
@@ -74,6 +304,20 @@ const DEFAULT_CACHE_SIZE: NonZeroUsize = NonZeroUsize::new(1000).unwrap();
 /// - Exclusive writers (for create/save/delete operations)
 ///
 /// This approach optimizes for read-heavy workloads while still ensuring data consistency.
+///
+/// ## Configurable Validation Limits
+///
+/// You can customize validation limits using [`ValidationLimits`]:
+///
+/// ```rust
+/// use mdk_memory_storage::{MdkMemoryStorage, ValidationLimits};
+///
+/// let limits = ValidationLimits::default()
+///     .with_cache_size(2000)
+///     .with_max_messages_per_group(5000);
+///
+/// let storage = MdkMemoryStorage::with_limits(limits);
+/// ```
 #[derive(Debug)]
 pub struct MdkMemoryStorage {
     // ========================================================================
@@ -99,6 +343,9 @@ pub struct MdkMemoryStorage {
     // ========================================================================
     // MDK Storage (groups, messages, welcomes)
     // ========================================================================
+    /// Configurable validation limits
+    limits: ValidationLimits,
+
     /// LRU Cache for Group objects, keyed by MLS group ID (GroupId)
     groups_cache: RwLock<LruCache<GroupId, Group>>,
     /// LRU Cache for Group objects, keyed by Nostr group ID ([u8; 32])
@@ -150,6 +397,21 @@ impl MdkMemoryStorage {
     ///
     /// A new instance of `MdkMemoryStorage` with the specified cache size.
     pub fn with_cache_size(cache_size: NonZeroUsize) -> Self {
+        Self::with_limits(ValidationLimits::default().with_cache_size(cache_size.get()))
+    }
+
+    /// Creates a new `MdkMemoryStorage` with the provided validation limits.
+    ///
+    /// # Arguments
+    ///
+    /// * `limits` - Custom validation limits for memory exhaustion protection.
+    ///
+    /// # Returns
+    ///
+    /// A new instance of `MdkMemoryStorage`.
+    pub fn with_limits(limits: ValidationLimits) -> Self {
+        let cache_size =
+            NonZeroUsize::new(limits.cache_size).expect("cache_size must be greater than 0");
         MdkMemoryStorage {
             // MLS storage
             mls_group_data: MlsGroupData::new(),
@@ -161,6 +423,8 @@ impl MdkMemoryStorage {
             mls_encryption_keys: MlsEncryptionKeys::new(),
             mls_epoch_key_pairs: MlsEpochKeyPairs::new(),
             // MDK storage
+            limits,
+
             groups_cache: RwLock::new(LruCache::new(cache_size)),
             groups_by_nostr_id_cache: RwLock::new(LruCache::new(cache_size)),
             group_relays_cache: RwLock::new(LruCache::new(cache_size)),
@@ -279,6 +543,11 @@ impl MdkMemoryStorage {
         snapshot
             .processed_messages
             .restore_to_lru(&mut self.processed_messages_cache.write());
+    }
+
+    /// Returns the current validation limits.
+    pub fn limits(&self) -> &ValidationLimits {
+        &self.limits
     }
 }
 
@@ -1573,6 +1842,9 @@ mod tests {
     fn test_with_custom_cache_size() {
         let custom_size = NonZeroUsize::new(50).unwrap();
         let nostr_storage = MdkMemoryStorage::with_cache_size(custom_size);
+
+        // Verify the cache size is set correctly
+        assert_eq!(nostr_storage.limits().cache_size, 50);
 
         // Create a test group to verify the cache works
         let mls_group_id = create_test_group_id();

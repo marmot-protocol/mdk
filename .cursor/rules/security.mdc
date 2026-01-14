@@ -1,0 +1,189 @@
+---
+description: Security guidelines for MDK development - CRITICAL rules for handling sensitive data
+globs: *.rs
+alwaysApply: true
+---
+
+# Security Guidelines for MDK Development
+
+MDK handles cryptographic operations and privacy-sensitive data. All contributors MUST follow these security guidelines. All crates use `#![forbid(unsafe_code)]` or `#![deny(unsafe_code)]`.
+
+## Sensitive Identifiers - NEVER Log or Expose
+
+**CRITICAL**: The following identifiers are privacy-sensitive and must NEVER appear in:
+
+- Log messages (via `tracing::*` macros)
+- Error messages or error strings
+- Debug output (including `Debug` trait implementations)
+- Panic messages
+- User-facing error descriptions
+
+### Protected Identifiers
+
+| Identifier | Description | Risk if Exposed |
+|------------|-------------|-----------------|
+| `mls_group_id` / `GroupId` | MLS group identifier (32 bytes) | Cross-system group linkage and tracking |
+| `nostr_group_id` | Nostr group identifier | Links Nostr events to MLS groups |
+| Encryption keys | Any key material | Enables unauthorized decryption |
+| Signing keys | Ed25519/X25519 keys | Identity theft, message forgery |
+| Exporter secrets | MLS exporter secrets | Retrospective traffic decryption |
+| `Secret<T>` contents | Wrapper for sensitive data | Various depending on contents |
+
+### Correct Patterns
+
+```rust
+// GOOD - Generic error without identifier
+GroupError::NotFound("Group not found".to_string())
+
+// GOOD - Use a non-identifying error variant
+GroupError::GroupNotFound
+
+// GOOD - Log without the identifier
+tracing::warn!("Group not found in storage");
+
+// GOOD - Manual Debug impl with redaction
+impl fmt::Debug for MyStruct {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MyStruct")
+            .field("mls_group_id", &"[REDACTED]")
+            .finish()
+    }
+}
+```
+
+### Incorrect Patterns (NEVER DO THIS)
+
+```rust
+// BAD - Leaks the MLS group ID in error message
+GroupError::InvalidParameters(format!("Group with MLS ID {:?} not found", mls_group_id))
+
+// BAD - Leaks group identifier in logs
+tracing::warn!("Group {} not found", mls_group_id);
+
+// BAD - Derived Debug on struct with sensitive fields
+#[derive(Debug)]
+struct MyStruct { mls_group_id: GroupId, secret: Secret<[u8; 32]> }
+
+// BAD - Panic with identifier
+panic!("Unexpected state for group {}", mls_group_id);
+```
+
+## Cryptographic Code Requirements
+
+### Key Generation
+- MUST use `getrandom` for all key generation (CSPRNG)
+- Never use weak RNGs (`rand::thread_rng()` alone, `rand::random()`, etc.)
+- Keys should be 256-bit (32 bytes) minimum for symmetric operations
+
+### Authenticated Encryption
+- Use ChaCha20-Poly1305 or AES-GCM (authenticated modes only)
+- Never use unauthenticated encryption (AES-CBC, ChaCha20 without Poly1305)
+- Nonces must be:
+  - Randomly generated via `getrandom`
+  - 12 bytes for ChaCha20-Poly1305
+  - Never reused with the same key
+
+### Key Derivation (HKDF)
+- Always use domain separation via unique context strings
+- Context strings should identify the protocol and purpose:
+  - `mip01-image-encryption-v2`
+  - `mip04-v2`
+- Include version in context to allow future upgrades
+
+### Zeroization
+- Use `Secret<T>` wrapper for sensitive values
+- Derive `ZeroizeOnDrop` for types containing key material
+- Don't implement `Copy` for types with sensitive data
+
+### Hash-then-Decrypt Pattern
+When decrypting data identified by hash:
+```rust
+// MUST verify hash BEFORE decryption
+let computed_hash = hash(&encrypted_blob);
+if computed_hash != expected_hash {
+    return Err(BlobSubstitutionError);
+}
+// Only then decrypt
+```
+
+## Identity Binding Security
+
+For key packages and credentials:
+
+```rust
+// CRITICAL: Credential identity MUST match event signer
+// Prevents impersonation attacks
+if credential_identity != event.pubkey {
+    return Err(Error::KeyPackageIdentityMismatch { ... });
+}
+```
+
+Attack scenario this prevents:
+1. Adversary creates KeyPackage with victim's public key in credential
+2. Signs the kind-443 event with their own key
+3. Attempts to join groups as the victim
+
+### Encoding Security
+- Base64 encoding MUST include explicit encoding tags per MIP-00/MIP-02
+- MUST reject data without encoding tags (prevents downgrade attacks)
+
+## SQLCipher Security
+
+### Required Pragmas
+```sql
+PRAGMA key = "x'<hex-key>'";           -- Raw 256-bit key
+PRAGMA cipher_compatibility = 4;        -- Pin to SQLCipher 4.x
+PRAGMA temp_store = MEMORY;             -- No temp file spill
+```
+
+### Key Validation
+After setting key, MUST validate:
+```rust
+conn.query_row("SELECT count(*) FROM sqlite_master;", [], |row| row.get::<_, i64>(0))
+```
+
+## File Permission Hardening (Unix)
+
+| Resource | Permissions | Description |
+|----------|-------------|-------------|
+| Database directory | `0700` | Owner rwx only |
+| Database files | `0600` | Owner rw only |
+
+- Use `O_CREAT | O_EXCL` for atomic file creation (prevents TOCTOU)
+- Verify permissions: `mode & 0o077 == 0`
+
+## Error Message Guidelines
+
+When writing error messages:
+
+1. **Be descriptive about the failure** - explain what operation failed
+2. **Do NOT include identifiers** - never embed group IDs, key material, or secrets
+3. **Use structured error types** - prefer enum variants over formatted strings
+4. **Consider the log audience** - errors may end up in crash reports, analytics, shared logs
+
+## FFI Security (UniFFI)
+
+- No sensitive data exposed through FFI unnecessarily
+- No panics across FFI boundary - proper error handling
+- No raw pointers to sensitive data
+- `Secret<T>` contents must not be exposed via FFI
+
+## Security Review Triggers
+
+Flag for security review if changes touch:
+- Key generation or derivation
+- Encryption/decryption operations
+- Credential or identity handling
+- Key package validation
+- SQLCipher configuration
+- File permission handling
+- Error message formatting (potential leaks)
+- `Debug` implementations on sensitive types
+
+## References
+
+- [MIP-01 Group Identity and Privacy](https://github.com/marmot-protocol/marmot)
+- [RFC 9420 - MLS Protocol](https://www.rfc-editor.org/rfc/rfc9420.html)
+- [RFC 9750 - MLS Architecture](https://www.rfc-editor.org/rfc/rfc9750.html)
+- [SQLCipher Design](https://www.zetetic.net/sqlcipher/design/)
+- [SECURITY.md](mdc:SECURITY.md) - Full threat model and security considerations
