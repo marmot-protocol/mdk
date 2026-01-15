@@ -209,7 +209,7 @@ Check History: Did we already apply a commit for Epoch N?
 Callers need to know when the world changes beneath them.
 
 ```rust
-pub trait MdkCallback: Send + Sync {
+pub trait MdkCallback: Send + Sync + Debug {
     /// Notifies that a rollback occurred due to race resolution.
     /// The app should discard any state derived from epochs >= `target_epoch`.
     fn on_rollback(&self, group_id: &GroupId, target_epoch: u64, new_head_event: &EventId);
