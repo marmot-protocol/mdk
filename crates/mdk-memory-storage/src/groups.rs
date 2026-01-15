@@ -80,11 +80,6 @@ impl GroupStorage for MdkMemoryStorage {
         &self,
         mls_group_id: &GroupId,
     ) -> Result<Option<Group>, GroupError> {
-        // We need write lock to update LRU order with peek? No, peek doesn't update LRU order in `lru` crate?
-        // Actually lru::LruCache::peek() requires &mut self usually? No, peek is &self. get is &mut self.
-        // Wait, lru 0.12 peek is &mut self? Let me check Cargo.toml or assume peek is &self or &mut self.
-        // If peek is &self, we can use read lock.
-        // Looking at lru crate docs: peek is &self. get is &mut self.
         let inner = self.inner.read();
         Ok(inner.groups_cache.peek(mls_group_id).cloned())
     }
