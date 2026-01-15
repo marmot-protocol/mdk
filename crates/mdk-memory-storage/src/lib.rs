@@ -46,6 +46,7 @@
 #![warn(rustdoc::bare_urls)]
 
 use std::collections::{BTreeSet, HashMap};
+use std::fmt;
 use std::num::NonZeroUsize;
 
 use lru::LruCache;
@@ -318,7 +319,6 @@ impl ValidationLimits {
 ///
 /// let storage = MdkMemoryStorage::with_limits(limits);
 /// ```
-#[derive(Debug)]
 pub struct MdkMemoryStorage {
     // ========================================================================
     // MLS Storage (replaces openmls_memory_storage)
@@ -364,6 +364,32 @@ pub struct MdkMemoryStorage {
     processed_messages_cache: RwLock<LruCache<EventId, ProcessedMessage>>,
     /// LRU Cache for GroupExporterSecret objects, keyed by a tuple of (GroupId, epoch)
     group_exporter_secrets_cache: RwLock<LruCache<(GroupId, u64), GroupExporterSecret>>,
+}
+
+impl fmt::Debug for MdkMemoryStorage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Redact all caches that contain GroupId keys to prevent sensitive identifier exposure
+        f.debug_struct("MdkMemoryStorage")
+            .field("mls_group_data", &"[REDACTED]")
+            .field("mls_own_leaf_nodes", &"[REDACTED]")
+            .field("mls_proposals", &"[REDACTED]")
+            .field("mls_key_packages", &"[REDACTED]")
+            .field("mls_psks", &"[REDACTED]")
+            .field("mls_signature_keys", &"[REDACTED]")
+            .field("mls_encryption_keys", &"[REDACTED]")
+            .field("mls_epoch_key_pairs", &"[REDACTED]")
+            .field("limits", &self.limits)
+            .field("groups_cache", &"[REDACTED]")
+            .field("groups_by_nostr_id_cache", &"[REDACTED]")
+            .field("group_relays_cache", &"[REDACTED]")
+            .field("welcomes_cache", &"[REDACTED]")
+            .field("processed_welcomes_cache", &"[REDACTED]")
+            .field("messages_cache", &"[REDACTED]")
+            .field("messages_by_group_cache", &"[REDACTED]")
+            .field("processed_messages_cache", &"[REDACTED]")
+            .field("group_exporter_secrets_cache", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl Default for MdkMemoryStorage {

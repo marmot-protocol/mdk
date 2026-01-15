@@ -96,7 +96,7 @@ CREATE TABLE IF NOT EXISTS groups (
     last_message_at INTEGER,
     epoch INTEGER NOT NULL,
     state TEXT NOT NULL,
-    image_hash TEXT,
+    image_hash BLOB,
     image_key BLOB,
     image_nonce BLOB
 );
@@ -175,7 +175,7 @@ CREATE TABLE IF NOT EXISTS welcomes (
     member_count INTEGER NOT NULL,
     state TEXT NOT NULL,
     wrapper_event_id BLOB NOT NULL,
-    group_image_hash TEXT,
+    group_image_hash BLOB,
     group_image_key BLOB,
     group_image_nonce BLOB
 );

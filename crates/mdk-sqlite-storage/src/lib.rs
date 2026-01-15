@@ -453,7 +453,9 @@ impl MdkSqliteStorage {
 
     fn validate_savepoint_name(name: &str) -> Result<(), Error> {
         if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
-            return Err(Error::Database(format!("Invalid savepoint name: {}", name)));
+            return Err(Error::Database(
+                "Invalid savepoint name: must be non-empty and contain only alphanumeric characters and underscores".to_string(),
+            ));
         }
         Ok(())
     }
