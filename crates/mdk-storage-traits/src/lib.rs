@@ -68,6 +68,25 @@ pub trait MdkStorageProvider:
     ///
     /// The storage backend type (e.g., [`Backend::Memory`] or [`Backend::SQLite`]).
     fn backend(&self) -> Backend;
+
+    /// Create a named snapshot/savepoint
+    ///
+    /// This creates a point in time that can be rolled back to later.
+    /// In SQLite, this corresponds to `SAVEPOINT name`.
+    /// In Memory, this captures a snapshot of the current state.
+    fn create_named_snapshot(&self, name: &str) -> Result<(), MdkStorageError>;
+
+    /// Rollback to a previously created snapshot
+    ///
+    /// This restores the state to what it was when the snapshot was created.
+    /// In SQLite, this corresponds to `ROLLBACK TO name`.
+    fn rollback_to_snapshot(&self, name: &str) -> Result<(), MdkStorageError>;
+
+    /// Release/commit a snapshot (no longer needed)
+    ///
+    /// This frees resources associated with the snapshot.
+    /// In SQLite, this corresponds to `RELEASE name`.
+    fn release_snapshot(&self, name: &str) -> Result<(), MdkStorageError>;
 }
 
 #[cfg(test)]

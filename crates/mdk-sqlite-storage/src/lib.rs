@@ -540,6 +540,21 @@ impl MdkStorageProvider for MdkSqliteStorage {
     fn backend(&self) -> Backend {
         Backend::SQLite
     }
+
+    fn create_named_snapshot(&self, name: &str) -> Result<(), MdkStorageError> {
+        self.savepoint(name)
+            .map_err(|e| MdkStorageError::Database(e.to_string()))
+    }
+
+    fn rollback_to_snapshot(&self, name: &str) -> Result<(), MdkStorageError> {
+        self.rollback_to_savepoint(name)
+            .map_err(|e| MdkStorageError::Database(e.to_string()))
+    }
+
+    fn release_snapshot(&self, name: &str) -> Result<(), MdkStorageError> {
+        self.release_savepoint(name)
+            .map_err(|e| MdkStorageError::Database(e.to_string()))
+    }
 }
 
 // ============================================================================
