@@ -44,7 +44,7 @@
 
 - **MLS Storage Module**: New `mls_storage` module with complete `StorageProvider<1>` implementation for OpenMLS integration ([#148](https://github.com/marmot-protocol/mdk/pull/148))
   - JSON codec for serializing/deserializing OpenMLS types
-  - Support for all 56 `StorageProvider<1>` methods
+  - Support for all 53 `StorageProvider<1>` methods
   - In-memory storage using `HashMap` for all MLS data types
 - **Snapshot Support**: New `snapshot` module for creating and restoring storage snapshots, useful for testing rollback scenarios ([#148](https://github.com/marmot-protocol/mdk/pull/148))
 - Implemented pagination support using `Pagination` struct for group messages ([#111](https://github.com/marmot-protocol/mdk/pull/111))

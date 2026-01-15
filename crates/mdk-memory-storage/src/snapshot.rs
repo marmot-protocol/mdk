@@ -41,9 +41,9 @@ use crate::mls_storage::GroupDataType;
 ///
 /// # Concurrency Warning
 ///
-/// See the [module-level documentation](self) for important concurrency
-/// considerations. Snapshot creation and restoration are not atomic with
-/// respect to concurrent operations.
+/// Snapshot creation and restoration are **not atomic** with respect to
+/// concurrent operations. Callers must ensure no concurrent operations are
+/// in progress when creating or restoring snapshots.
 ///
 /// # Example
 ///

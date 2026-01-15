@@ -332,7 +332,7 @@
         {
           "id": "REQ-3.3",
           "title": "Implement StorageProvider Methods for Memory",
-          "description": "Implement all 56 StorageProvider<1> methods for in-memory storage.",
+          "description": "Implement all 53 StorageProvider<1> methods for in-memory storage.",
           "status": "complete",
           "acceptance_criteria": [
             "All 18 write methods implemented",
@@ -578,7 +578,7 @@
     "functionality": [
       "Single transaction can wrap MLS + MDK operations",
       "Savepoint-based rollback works correctly",
-      "All 56 StorageProvider methods implemented and tested"
+      "All 53 StorageProvider methods implemented and tested"
     ],
     "architecture": [
       "Single connection per storage instance",

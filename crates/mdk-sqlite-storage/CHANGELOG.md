@@ -47,7 +47,7 @@
 
 - **MLS Storage Module**: New `mls_storage` module with complete `StorageProvider<1>` implementation for OpenMLS integration ([#148](https://github.com/marmot-protocol/mdk/pull/148))
   - JSON codec for serializing/deserializing OpenMLS types
-  - Support for all 56 `StorageProvider<1>` methods
+  - Support for all 53 `StorageProvider<1>` methods
   - Manages 8 OpenMLS tables: `openmls_group_data`, `openmls_proposals`, `openmls_own_leaf_nodes`, `openmls_key_packages`, `openmls_psks`, `openmls_signature_keys`, `openmls_encryption_keys`, `openmls_epoch_key_pairs`
 - Input validation for storage operations to prevent unbounded writes ([#94](https://github.com/marmot-protocol/mdk/pull/94))
   - Message content limited to 1MB

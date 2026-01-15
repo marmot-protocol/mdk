@@ -83,14 +83,14 @@ MdkMemoryStorage
 ```text
 MdkSqliteStorage
 └── connection: Arc<Mutex<Connection>>  ← Single connection
-    ├── impl StorageProvider<1>         ← OpenMLS trait (56 methods)
+    ├── impl StorageProvider<1>         ← OpenMLS trait (53 methods)
     ├── impl GroupStorage               ← MDK trait
     ├── impl MessageStorage             ← MDK trait
     └── impl WelcomeStorage             ← MDK trait
 
 MdkMemoryStorage
 └── unified data structures
-    ├── impl StorageProvider<1>         ← OpenMLS trait (56 methods)
+    ├── impl StorageProvider<1>         ← OpenMLS trait (53 methods)
     ├── impl GroupStorage               ← MDK trait
     ├── impl MessageStorage             ← MDK trait
     └── impl WelcomeStorage             ← MDK trait
@@ -221,7 +221,7 @@ MdkMemoryStorage
 4. **Fresh migration system** - Since this is a breaking change, start with new migration numbering:
    - `V001__initial_schema.sql` - Creates all tables (both MLS and MDK) in a single migration
 
-5. **Implement all 56 `StorageProvider<1>` methods**:
+5. **Implement all 53 `StorageProvider<1>` methods**:
    - 18 write methods
    - 19 read methods
    - 19 delete methods
@@ -246,7 +246,7 @@ MdkMemoryStorage
 
 **Status**: ✅ Complete. Key changes:
 - Removed `openmls_sqlite_storage` dependency
-- Implemented all 56 `StorageProvider<1>` methods directly on `MdkSqliteStorage`
+- Implemented all 53 `StorageProvider<1>` methods directly on `MdkSqliteStorage`
 - Created unified schema in `V001__initial_schema.sql`
 - Added `mls_storage/mod.rs` and `mls_storage/codec.rs` modules
 - Added savepoint support methods
@@ -288,7 +288,7 @@ Commits:
    }
    ```
 
-3. **Implement all 56 `StorageProvider<1>` methods**
+3. **Implement all 53 `StorageProvider<1>` methods**
 
 4. **Add snapshot/rollback support** for testing parity with SQLite savepoints:
 
@@ -394,12 +394,12 @@ just precommit
 | `crates/mdk-storage-traits/src/error.rs` | Create | New `MdkStorageError` enum |
 | `crates/mdk-sqlite-storage/Cargo.toml` | Modify | Remove `openmls_sqlite_storage` dep |
 | `crates/mdk-sqlite-storage/src/lib.rs` | Modify | Single connection, new struct |
-| `crates/mdk-sqlite-storage/src/mls_storage/` | Create | New module with 56 method impls |
+| `crates/mdk-sqlite-storage/src/mls_storage/` | Create | New module with 53 method impls |
 | `crates/mdk-sqlite-storage/src/mls_storage/codec.rs` | Create | JSON codec for serialization |
 | `crates/mdk-sqlite-storage/migrations/` | Replace | Fresh migrations starting at V001 |
 | `crates/mdk-memory-storage/Cargo.toml` | Modify | Remove `openmls_memory_storage` dep |
 | `crates/mdk-memory-storage/src/lib.rs` | Modify | Add MLS data structures |
-| `crates/mdk-memory-storage/src/mls_storage.rs` | Create | New module with 56 method impls |
+| `crates/mdk-memory-storage/src/mls_storage.rs` | Create | New module with 53 method impls |
 | `crates/mdk-memory-storage/src/snapshot.rs` | Create | Snapshot/rollback support |
 | `crates/mdk-core/src/lib.rs` | Modify | Update `MdkProvider` impl |
 | `Cargo.toml` (workspace) | Modify | Remove unused OpenMLS storage deps |
@@ -410,7 +410,7 @@ just precommit
 
 ## OpenMLS `StorageProvider<1>` Trait Reference
 
-The trait requires 56 methods plus one associated type (and 1 provided default method):
+The trait requires 53 methods plus one associated type (and 1 provided default method):
 
 ### Associated Type
 
@@ -737,4 +737,4 @@ Once this unified storage architecture is in place, we can implement:
 
 ## Changelog
 
-- **2025-01-12**: Initial plan created
+- **2026-01-12**: Initial plan created
