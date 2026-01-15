@@ -21,9 +21,17 @@ pub const STORAGE_PROVIDER_VERSION: u16 = 1;
 // In-memory data structures now expect external locking via MdkMemoryStorage
 // Key: (group_id bytes, data type)
 // Value: serialized data bytes
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct MlsGroupData {
     pub(crate) data: HashMap<(Vec<u8>, GroupDataType), Vec<u8>>,
+}
+
+impl std::fmt::Debug for MlsGroupData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MlsGroupData")
+            .field("data", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl MlsGroupData {
@@ -94,9 +102,17 @@ impl MlsGroupData {
 /// In-memory storage for MLS own leaf nodes.
 /// Key: group_id bytes
 /// Value: list of serialized leaf node bytes (in insertion order)
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct MlsOwnLeafNodes {
     pub(crate) data: HashMap<Vec<u8>, Vec<Vec<u8>>>,
+}
+
+impl std::fmt::Debug for MlsOwnLeafNodes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MlsOwnLeafNodes")
+            .field("data", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl MlsOwnLeafNodes {
@@ -170,9 +186,17 @@ impl MlsOwnLeafNodes {
 /// In-memory storage for MLS proposals.
 /// Key: (group_id bytes, proposal_ref bytes)
 /// Value: serialized proposal bytes
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct MlsProposals {
     pub(crate) data: HashMap<(Vec<u8>, Vec<u8>), Vec<u8>>,
+}
+
+impl std::fmt::Debug for MlsProposals {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MlsProposals")
+            .field("data", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl MlsProposals {
@@ -282,9 +306,17 @@ impl MlsProposals {
 /// In-memory storage for MLS key packages.
 /// Key: hash_ref bytes
 /// Value: serialized key package bytes
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct MlsKeyPackages {
     pub(crate) data: HashMap<Vec<u8>, Vec<u8>>,
+}
+
+impl std::fmt::Debug for MlsKeyPackages {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MlsKeyPackages")
+            .field("data", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl MlsKeyPackages {
@@ -349,9 +381,17 @@ impl MlsKeyPackages {
 /// In-memory storage for MLS PSKs.
 /// Key: psk_id bytes
 /// Value: serialized PSK bundle bytes
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct MlsPsks {
     pub(crate) data: HashMap<Vec<u8>, Vec<u8>>,
+}
+
+impl std::fmt::Debug for MlsPsks {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MlsPsks")
+            .field("data", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl MlsPsks {
@@ -416,9 +456,17 @@ impl MlsPsks {
 /// In-memory storage for MLS signature keys.
 /// Key: public_key bytes
 /// Value: serialized signature key pair bytes
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct MlsSignatureKeys {
     pub(crate) data: HashMap<Vec<u8>, Vec<u8>>,
+}
+
+impl std::fmt::Debug for MlsSignatureKeys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MlsSignatureKeys")
+            .field("data", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl MlsSignatureKeys {
@@ -486,9 +534,17 @@ impl MlsSignatureKeys {
 /// In-memory storage for MLS encryption keys.
 /// Key: public_key bytes
 /// Value: serialized HPKE key pair bytes
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct MlsEncryptionKeys {
     pub(crate) data: HashMap<Vec<u8>, Vec<u8>>,
+}
+
+impl std::fmt::Debug for MlsEncryptionKeys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MlsEncryptionKeys")
+            .field("data", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl MlsEncryptionKeys {
@@ -556,9 +612,17 @@ impl MlsEncryptionKeys {
 /// In-memory storage for MLS epoch key pairs.
 /// Key: (group_id bytes, epoch bytes, leaf_index)
 /// Value: serialized list of HPKE key pairs
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct MlsEpochKeyPairs {
     pub(crate) data: HashMap<(Vec<u8>, Vec<u8>, u32), Vec<u8>>,
+}
+
+impl std::fmt::Debug for MlsEpochKeyPairs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MlsEpochKeyPairs")
+            .field("data", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl MlsEpochKeyPairs {
