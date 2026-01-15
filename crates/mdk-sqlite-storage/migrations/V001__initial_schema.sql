@@ -88,7 +88,7 @@ CREATE TABLE IF NOT EXISTS openmls_epoch_key_pairs (
 -- Groups: MDK group metadata
 CREATE TABLE IF NOT EXISTS groups (
     mls_group_id BLOB PRIMARY KEY,
-    nostr_group_id TEXT NOT NULL,
+    nostr_group_id BLOB NOT NULL,
     name TEXT NOT NULL,
     description TEXT NOT NULL,
     admin_pubkeys JSONB NOT NULL,

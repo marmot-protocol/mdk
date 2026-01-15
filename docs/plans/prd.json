@@ -275,8 +275,8 @@
           "id": "REQ-2.10",
           "title": "Enable WAL Mode",
           "description": "Configure SQLite to use WAL mode for better concurrent read performance.",
-          "status": "pending",
-          "notes": "Not yet implemented - WAL mode configuration still needs to be added",
+          "status": "deferred",
+          "notes": "Deferred to follow-up issue - WAL mode is an optimization that is not required for core unified storage functionality. The architecture supports WAL mode and it can be enabled in a future PR.",
           "acceptance_criteria": [
             "PRAGMA journal_mode=WAL executed on connection open",
             "WAL mode verified in tests",

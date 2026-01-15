@@ -98,6 +98,8 @@ impl JsonCodec {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use serde::{Deserialize, Serialize};
 
     use super::*;
@@ -143,8 +145,6 @@ mod tests {
 
     #[test]
     fn test_group_data_type_hash() {
-        use std::collections::HashSet;
-
         let mut set = HashSet::new();
         set.insert(GroupDataType::Tree);
         set.insert(GroupDataType::Context);

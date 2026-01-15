@@ -600,62 +600,67 @@ impl StorageProvider<STORAGE_PROVIDER_VERSION> for MdkMemoryStorage {
     // Write Methods
     // ========================================================================
 
-    fn write_mls_join_config<
-        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
-        MlsGroupJoinConfig: traits::MlsGroupJoinConfig<STORAGE_PROVIDER_VERSION>,
-    >(
+    fn write_mls_join_config<GroupId, MlsGroupJoinConfig>(
         &self,
         group_id: &GroupId,
         config: &MlsGroupJoinConfig,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), Self::Error>
+    where
+        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
+        MlsGroupJoinConfig: traits::MlsGroupJoinConfig<STORAGE_PROVIDER_VERSION>,
+    {
         self.mls_group_data
             .write(group_id, GroupDataType::JoinGroupConfig, config)
     }
 
-    fn append_own_leaf_node<
-        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
-        LeafNode: traits::LeafNode<STORAGE_PROVIDER_VERSION>,
-    >(
+    fn append_own_leaf_node<GroupId, LeafNode>(
         &self,
         group_id: &GroupId,
         leaf_node: &LeafNode,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), Self::Error>
+    where
+        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
+        LeafNode: traits::LeafNode<STORAGE_PROVIDER_VERSION>,
+    {
         self.mls_own_leaf_nodes.append(group_id, leaf_node)
     }
 
-    fn queue_proposal<
-        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
-        ProposalRef: traits::ProposalRef<STORAGE_PROVIDER_VERSION>,
-        QueuedProposal: traits::QueuedProposal<STORAGE_PROVIDER_VERSION>,
-    >(
+    fn queue_proposal<GroupId, ProposalRef, QueuedProposal>(
         &self,
         group_id: &GroupId,
         proposal_ref: &ProposalRef,
         proposal: &QueuedProposal,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), Self::Error>
+    where
+        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
+        ProposalRef: traits::ProposalRef<STORAGE_PROVIDER_VERSION>,
+        QueuedProposal: traits::QueuedProposal<STORAGE_PROVIDER_VERSION>,
+    {
         self.mls_proposals.queue(group_id, proposal_ref, proposal)
     }
 
-    fn write_tree<
-        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
-        TreeSync: traits::TreeSync<STORAGE_PROVIDER_VERSION>,
-    >(
+    fn write_tree<GroupId, TreeSync>(
         &self,
         group_id: &GroupId,
         tree: &TreeSync,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), Self::Error>
+    where
+        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
+        TreeSync: traits::TreeSync<STORAGE_PROVIDER_VERSION>,
+    {
         self.mls_group_data
             .write(group_id, GroupDataType::Tree, tree)
     }
 
-    fn write_interim_transcript_hash<
-        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
-        InterimTranscriptHash: traits::InterimTranscriptHash<STORAGE_PROVIDER_VERSION>,
-    >(
+    fn write_interim_transcript_hash<GroupId, InterimTranscriptHash>(
         &self,
         group_id: &GroupId,
         interim_transcript_hash: &InterimTranscriptHash,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), Self::Error>
+    where
+        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
+        InterimTranscriptHash: traits::InterimTranscriptHash<STORAGE_PROVIDER_VERSION>,
+    {
         self.mls_group_data.write(
             group_id,
             GroupDataType::InterimTranscriptHash,
@@ -663,62 +668,67 @@ impl StorageProvider<STORAGE_PROVIDER_VERSION> for MdkMemoryStorage {
         )
     }
 
-    fn write_context<
-        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
-        GroupContext: traits::GroupContext<STORAGE_PROVIDER_VERSION>,
-    >(
+    fn write_context<GroupId, GroupContext>(
         &self,
         group_id: &GroupId,
         group_context: &GroupContext,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), Self::Error>
+    where
+        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
+        GroupContext: traits::GroupContext<STORAGE_PROVIDER_VERSION>,
+    {
         self.mls_group_data
             .write(group_id, GroupDataType::Context, group_context)
     }
 
-    fn write_confirmation_tag<
-        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
-        ConfirmationTag: traits::ConfirmationTag<STORAGE_PROVIDER_VERSION>,
-    >(
+    fn write_confirmation_tag<GroupId, ConfirmationTag>(
         &self,
         group_id: &GroupId,
         confirmation_tag: &ConfirmationTag,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), Self::Error>
+    where
+        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
+        ConfirmationTag: traits::ConfirmationTag<STORAGE_PROVIDER_VERSION>,
+    {
         self.mls_group_data
             .write(group_id, GroupDataType::ConfirmationTag, confirmation_tag)
     }
 
-    fn write_group_state<
-        GroupState: traits::GroupState<STORAGE_PROVIDER_VERSION>,
-        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
-    >(
+    fn write_group_state<GroupState, GroupId>(
         &self,
         group_id: &GroupId,
         group_state: &GroupState,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), Self::Error>
+    where
+        GroupState: traits::GroupState<STORAGE_PROVIDER_VERSION>,
+        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
+    {
         self.mls_group_data
             .write(group_id, GroupDataType::GroupState, group_state)
     }
 
-    fn write_message_secrets<
-        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
-        MessageSecrets: traits::MessageSecrets<STORAGE_PROVIDER_VERSION>,
-    >(
+    fn write_message_secrets<GroupId, MessageSecrets>(
         &self,
         group_id: &GroupId,
         message_secrets: &MessageSecrets,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), Self::Error>
+    where
+        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
+        MessageSecrets: traits::MessageSecrets<STORAGE_PROVIDER_VERSION>,
+    {
         self.mls_group_data
             .write(group_id, GroupDataType::MessageSecrets, message_secrets)
     }
 
-    fn write_resumption_psk_store<
-        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
-        ResumptionPskStore: traits::ResumptionPskStore<STORAGE_PROVIDER_VERSION>,
-    >(
+    fn write_resumption_psk_store<GroupId, ResumptionPskStore>(
         &self,
         group_id: &GroupId,
         resumption_psk_store: &ResumptionPskStore,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), Self::Error>
+    where
+        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
+        ResumptionPskStore: traits::ResumptionPskStore<STORAGE_PROVIDER_VERSION>,
+    {
         self.mls_group_data.write(
             group_id,
             GroupDataType::ResumptionPskStore,
@@ -726,26 +736,28 @@ impl StorageProvider<STORAGE_PROVIDER_VERSION> for MdkMemoryStorage {
         )
     }
 
-    fn write_own_leaf_index<
-        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
-        LeafNodeIndex: traits::LeafNodeIndex<STORAGE_PROVIDER_VERSION>,
-    >(
+    fn write_own_leaf_index<GroupId, LeafNodeIndex>(
         &self,
         group_id: &GroupId,
         own_leaf_index: &LeafNodeIndex,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), Self::Error>
+    where
+        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
+        LeafNodeIndex: traits::LeafNodeIndex<STORAGE_PROVIDER_VERSION>,
+    {
         self.mls_group_data
             .write(group_id, GroupDataType::OwnLeafIndex, own_leaf_index)
     }
 
-    fn write_group_epoch_secrets<
-        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
-        GroupEpochSecrets: traits::GroupEpochSecrets<STORAGE_PROVIDER_VERSION>,
-    >(
+    fn write_group_epoch_secrets<GroupId, GroupEpochSecrets>(
         &self,
         group_id: &GroupId,
         group_epoch_secrets: &GroupEpochSecrets,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), Self::Error>
+    where
+        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
+        GroupEpochSecrets: traits::GroupEpochSecrets<STORAGE_PROVIDER_VERSION>,
+    {
         self.mls_group_data.write(
             group_id,
             GroupDataType::GroupEpochSecrets,
@@ -753,63 +765,68 @@ impl StorageProvider<STORAGE_PROVIDER_VERSION> for MdkMemoryStorage {
         )
     }
 
-    fn write_signature_key_pair<
-        SignaturePublicKey: traits::SignaturePublicKey<STORAGE_PROVIDER_VERSION>,
-        SignatureKeyPair: traits::SignatureKeyPair<STORAGE_PROVIDER_VERSION>,
-    >(
+    fn write_signature_key_pair<SignaturePublicKey, SignatureKeyPair>(
         &self,
         public_key: &SignaturePublicKey,
         signature_key_pair: &SignatureKeyPair,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), Self::Error>
+    where
+        SignaturePublicKey: traits::SignaturePublicKey<STORAGE_PROVIDER_VERSION>,
+        SignatureKeyPair: traits::SignatureKeyPair<STORAGE_PROVIDER_VERSION>,
+    {
         self.mls_signature_keys
             .write(public_key, signature_key_pair)
     }
 
-    fn write_encryption_key_pair<
-        EncryptionKey: traits::EncryptionKey<STORAGE_PROVIDER_VERSION>,
-        HpkeKeyPair: traits::HpkeKeyPair<STORAGE_PROVIDER_VERSION>,
-    >(
+    fn write_encryption_key_pair<EncryptionKey, HpkeKeyPair>(
         &self,
         public_key: &EncryptionKey,
         key_pair: &HpkeKeyPair,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), Self::Error>
+    where
+        EncryptionKey: traits::EncryptionKey<STORAGE_PROVIDER_VERSION>,
+        HpkeKeyPair: traits::HpkeKeyPair<STORAGE_PROVIDER_VERSION>,
+    {
         self.mls_encryption_keys.write(public_key, key_pair)
     }
 
-    fn write_encryption_epoch_key_pairs<
-        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
-        EpochKey: traits::EpochKey<STORAGE_PROVIDER_VERSION>,
-        HpkeKeyPair: traits::HpkeKeyPair<STORAGE_PROVIDER_VERSION>,
-    >(
+    fn write_encryption_epoch_key_pairs<GroupId, EpochKey, HpkeKeyPair>(
         &self,
         group_id: &GroupId,
         epoch: &EpochKey,
         leaf_index: u32,
         key_pairs: &[HpkeKeyPair],
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), Self::Error>
+    where
+        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
+        EpochKey: traits::EpochKey<STORAGE_PROVIDER_VERSION>,
+        HpkeKeyPair: traits::HpkeKeyPair<STORAGE_PROVIDER_VERSION>,
+    {
         self.mls_epoch_key_pairs
             .write(group_id, epoch, leaf_index, key_pairs)
     }
 
-    fn write_key_package<
-        HashReference: traits::HashReference<STORAGE_PROVIDER_VERSION>,
-        KeyPackage: traits::KeyPackage<STORAGE_PROVIDER_VERSION>,
-    >(
+    fn write_key_package<HashReference, KeyPackage>(
         &self,
         hash_ref: &HashReference,
         key_package: &KeyPackage,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), Self::Error>
+    where
+        HashReference: traits::HashReference<STORAGE_PROVIDER_VERSION>,
+        KeyPackage: traits::KeyPackage<STORAGE_PROVIDER_VERSION>,
+    {
         self.mls_key_packages.write(hash_ref, key_package)
     }
 
-    fn write_psk<
-        PskId: traits::PskId<STORAGE_PROVIDER_VERSION>,
-        PskBundle: traits::PskBundle<STORAGE_PROVIDER_VERSION>,
-    >(
+    fn write_psk<PskId, PskBundle>(
         &self,
         psk_id: &PskId,
         psk: &PskBundle,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), Self::Error>
+    where
+        PskId: traits::PskId<STORAGE_PROVIDER_VERSION>,
+        PskBundle: traits::PskBundle<STORAGE_PROVIDER_VERSION>,
+    {
         self.mls_psks.write(psk_id, psk)
     }
 
@@ -817,195 +834,207 @@ impl StorageProvider<STORAGE_PROVIDER_VERSION> for MdkMemoryStorage {
     // Read Methods
     // ========================================================================
 
-    fn mls_group_join_config<
-        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
-        MlsGroupJoinConfig: traits::MlsGroupJoinConfig<STORAGE_PROVIDER_VERSION>,
-    >(
+    fn mls_group_join_config<GroupId, MlsGroupJoinConfig>(
         &self,
         group_id: &GroupId,
-    ) -> Result<Option<MlsGroupJoinConfig>, Self::Error> {
+    ) -> Result<Option<MlsGroupJoinConfig>, Self::Error>
+    where
+        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
+        MlsGroupJoinConfig: traits::MlsGroupJoinConfig<STORAGE_PROVIDER_VERSION>,
+    {
         self.mls_group_data
             .read(group_id, GroupDataType::JoinGroupConfig)
     }
 
-    fn own_leaf_nodes<
-        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
-        LeafNode: traits::LeafNode<STORAGE_PROVIDER_VERSION>,
-    >(
+    fn own_leaf_nodes<GroupId, LeafNode>(
         &self,
         group_id: &GroupId,
-    ) -> Result<Vec<LeafNode>, Self::Error> {
+    ) -> Result<Vec<LeafNode>, Self::Error>
+    where
+        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
+        LeafNode: traits::LeafNode<STORAGE_PROVIDER_VERSION>,
+    {
         self.mls_own_leaf_nodes.read(group_id)
     }
 
-    fn queued_proposal_refs<
-        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
-        ProposalRef: traits::ProposalRef<STORAGE_PROVIDER_VERSION>,
-    >(
+    fn queued_proposal_refs<GroupId, ProposalRef>(
         &self,
         group_id: &GroupId,
-    ) -> Result<Vec<ProposalRef>, Self::Error> {
+    ) -> Result<Vec<ProposalRef>, Self::Error>
+    where
+        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
+        ProposalRef: traits::ProposalRef<STORAGE_PROVIDER_VERSION>,
+    {
         self.mls_proposals.read_refs(group_id)
     }
 
-    fn queued_proposals<
+    fn queued_proposals<GroupId, ProposalRef, QueuedProposal>(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<Vec<(ProposalRef, QueuedProposal)>, Self::Error>
+    where
         GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
         ProposalRef: traits::ProposalRef<STORAGE_PROVIDER_VERSION>,
         QueuedProposal: traits::QueuedProposal<STORAGE_PROVIDER_VERSION>,
-    >(
-        &self,
-        group_id: &GroupId,
-    ) -> Result<Vec<(ProposalRef, QueuedProposal)>, Self::Error> {
+    {
         self.mls_proposals.read_proposals(group_id)
     }
 
-    fn tree<
+    fn tree<GroupId, TreeSync>(&self, group_id: &GroupId) -> Result<Option<TreeSync>, Self::Error>
+    where
         GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
         TreeSync: traits::TreeSync<STORAGE_PROVIDER_VERSION>,
-    >(
-        &self,
-        group_id: &GroupId,
-    ) -> Result<Option<TreeSync>, Self::Error> {
+    {
         self.mls_group_data.read(group_id, GroupDataType::Tree)
     }
 
-    fn group_context<
-        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
-        GroupContext: traits::GroupContext<STORAGE_PROVIDER_VERSION>,
-    >(
+    fn group_context<GroupId, GroupContext>(
         &self,
         group_id: &GroupId,
-    ) -> Result<Option<GroupContext>, Self::Error> {
+    ) -> Result<Option<GroupContext>, Self::Error>
+    where
+        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
+        GroupContext: traits::GroupContext<STORAGE_PROVIDER_VERSION>,
+    {
         self.mls_group_data.read(group_id, GroupDataType::Context)
     }
 
-    fn interim_transcript_hash<
-        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
-        InterimTranscriptHash: traits::InterimTranscriptHash<STORAGE_PROVIDER_VERSION>,
-    >(
+    fn interim_transcript_hash<GroupId, InterimTranscriptHash>(
         &self,
         group_id: &GroupId,
-    ) -> Result<Option<InterimTranscriptHash>, Self::Error> {
+    ) -> Result<Option<InterimTranscriptHash>, Self::Error>
+    where
+        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
+        InterimTranscriptHash: traits::InterimTranscriptHash<STORAGE_PROVIDER_VERSION>,
+    {
         self.mls_group_data
             .read(group_id, GroupDataType::InterimTranscriptHash)
     }
 
-    fn confirmation_tag<
-        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
-        ConfirmationTag: traits::ConfirmationTag<STORAGE_PROVIDER_VERSION>,
-    >(
+    fn confirmation_tag<GroupId, ConfirmationTag>(
         &self,
         group_id: &GroupId,
-    ) -> Result<Option<ConfirmationTag>, Self::Error> {
+    ) -> Result<Option<ConfirmationTag>, Self::Error>
+    where
+        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
+        ConfirmationTag: traits::ConfirmationTag<STORAGE_PROVIDER_VERSION>,
+    {
         self.mls_group_data
             .read(group_id, GroupDataType::ConfirmationTag)
     }
 
-    fn group_state<
-        GroupState: traits::GroupState<STORAGE_PROVIDER_VERSION>,
-        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
-    >(
+    fn group_state<GroupState, GroupId>(
         &self,
         group_id: &GroupId,
-    ) -> Result<Option<GroupState>, Self::Error> {
+    ) -> Result<Option<GroupState>, Self::Error>
+    where
+        GroupState: traits::GroupState<STORAGE_PROVIDER_VERSION>,
+        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
+    {
         self.mls_group_data
             .read(group_id, GroupDataType::GroupState)
     }
 
-    fn message_secrets<
-        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
-        MessageSecrets: traits::MessageSecrets<STORAGE_PROVIDER_VERSION>,
-    >(
+    fn message_secrets<GroupId, MessageSecrets>(
         &self,
         group_id: &GroupId,
-    ) -> Result<Option<MessageSecrets>, Self::Error> {
+    ) -> Result<Option<MessageSecrets>, Self::Error>
+    where
+        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
+        MessageSecrets: traits::MessageSecrets<STORAGE_PROVIDER_VERSION>,
+    {
         self.mls_group_data
             .read(group_id, GroupDataType::MessageSecrets)
     }
 
-    fn resumption_psk_store<
-        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
-        ResumptionPskStore: traits::ResumptionPskStore<STORAGE_PROVIDER_VERSION>,
-    >(
+    fn resumption_psk_store<GroupId, ResumptionPskStore>(
         &self,
         group_id: &GroupId,
-    ) -> Result<Option<ResumptionPskStore>, Self::Error> {
+    ) -> Result<Option<ResumptionPskStore>, Self::Error>
+    where
+        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
+        ResumptionPskStore: traits::ResumptionPskStore<STORAGE_PROVIDER_VERSION>,
+    {
         self.mls_group_data
             .read(group_id, GroupDataType::ResumptionPskStore)
     }
 
-    fn own_leaf_index<
-        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
-        LeafNodeIndex: traits::LeafNodeIndex<STORAGE_PROVIDER_VERSION>,
-    >(
+    fn own_leaf_index<GroupId, LeafNodeIndex>(
         &self,
         group_id: &GroupId,
-    ) -> Result<Option<LeafNodeIndex>, Self::Error> {
+    ) -> Result<Option<LeafNodeIndex>, Self::Error>
+    where
+        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
+        LeafNodeIndex: traits::LeafNodeIndex<STORAGE_PROVIDER_VERSION>,
+    {
         self.mls_group_data
             .read(group_id, GroupDataType::OwnLeafIndex)
     }
 
-    fn group_epoch_secrets<
-        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
-        GroupEpochSecrets: traits::GroupEpochSecrets<STORAGE_PROVIDER_VERSION>,
-    >(
+    fn group_epoch_secrets<GroupId, GroupEpochSecrets>(
         &self,
         group_id: &GroupId,
-    ) -> Result<Option<GroupEpochSecrets>, Self::Error> {
+    ) -> Result<Option<GroupEpochSecrets>, Self::Error>
+    where
+        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
+        GroupEpochSecrets: traits::GroupEpochSecrets<STORAGE_PROVIDER_VERSION>,
+    {
         self.mls_group_data
             .read(group_id, GroupDataType::GroupEpochSecrets)
     }
 
-    fn signature_key_pair<
-        SignaturePublicKey: traits::SignaturePublicKey<STORAGE_PROVIDER_VERSION>,
-        SignatureKeyPair: traits::SignatureKeyPair<STORAGE_PROVIDER_VERSION>,
-    >(
+    fn signature_key_pair<SignaturePublicKey, SignatureKeyPair>(
         &self,
         public_key: &SignaturePublicKey,
-    ) -> Result<Option<SignatureKeyPair>, Self::Error> {
+    ) -> Result<Option<SignatureKeyPair>, Self::Error>
+    where
+        SignaturePublicKey: traits::SignaturePublicKey<STORAGE_PROVIDER_VERSION>,
+        SignatureKeyPair: traits::SignatureKeyPair<STORAGE_PROVIDER_VERSION>,
+    {
         self.mls_signature_keys.read(public_key)
     }
 
-    fn encryption_key_pair<
-        HpkeKeyPair: traits::HpkeKeyPair<STORAGE_PROVIDER_VERSION>,
-        EncryptionKey: traits::EncryptionKey<STORAGE_PROVIDER_VERSION>,
-    >(
+    fn encryption_key_pair<HpkeKeyPair, EncryptionKey>(
         &self,
         public_key: &EncryptionKey,
-    ) -> Result<Option<HpkeKeyPair>, Self::Error> {
+    ) -> Result<Option<HpkeKeyPair>, Self::Error>
+    where
+        HpkeKeyPair: traits::HpkeKeyPair<STORAGE_PROVIDER_VERSION>,
+        EncryptionKey: traits::EncryptionKey<STORAGE_PROVIDER_VERSION>,
+    {
         self.mls_encryption_keys.read(public_key)
     }
 
-    fn encryption_epoch_key_pairs<
-        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
-        EpochKey: traits::EpochKey<STORAGE_PROVIDER_VERSION>,
-        HpkeKeyPair: traits::HpkeKeyPair<STORAGE_PROVIDER_VERSION>,
-    >(
+    fn encryption_epoch_key_pairs<GroupId, EpochKey, HpkeKeyPair>(
         &self,
         group_id: &GroupId,
         epoch: &EpochKey,
         leaf_index: u32,
-    ) -> Result<Vec<HpkeKeyPair>, Self::Error> {
+    ) -> Result<Vec<HpkeKeyPair>, Self::Error>
+    where
+        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
+        EpochKey: traits::EpochKey<STORAGE_PROVIDER_VERSION>,
+        HpkeKeyPair: traits::HpkeKeyPair<STORAGE_PROVIDER_VERSION>,
+    {
         self.mls_epoch_key_pairs.read(group_id, epoch, leaf_index)
     }
 
-    fn key_package<
-        HashReference: traits::HashReference<STORAGE_PROVIDER_VERSION>,
-        KeyPackage: traits::KeyPackage<STORAGE_PROVIDER_VERSION>,
-    >(
+    fn key_package<HashReference, KeyPackage>(
         &self,
         hash_ref: &HashReference,
-    ) -> Result<Option<KeyPackage>, Self::Error> {
+    ) -> Result<Option<KeyPackage>, Self::Error>
+    where
+        HashReference: traits::HashReference<STORAGE_PROVIDER_VERSION>,
+        KeyPackage: traits::KeyPackage<STORAGE_PROVIDER_VERSION>,
+    {
         self.mls_key_packages.read(hash_ref)
     }
 
-    fn psk<
+    fn psk<PskBundle, PskId>(&self, psk_id: &PskId) -> Result<Option<PskBundle>, Self::Error>
+    where
         PskBundle: traits::PskBundle<STORAGE_PROVIDER_VERSION>,
         PskId: traits::PskId<STORAGE_PROVIDER_VERSION>,
-    >(
-        &self,
-        psk_id: &PskId,
-    ) -> Result<Option<PskBundle>, Self::Error> {
+    {
         self.mls_psks.read(psk_id)
     }
 
@@ -1013,153 +1042,161 @@ impl StorageProvider<STORAGE_PROVIDER_VERSION> for MdkMemoryStorage {
     // Delete Methods
     // ========================================================================
 
-    fn remove_proposal<
-        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
-        ProposalRef: traits::ProposalRef<STORAGE_PROVIDER_VERSION>,
-    >(
+    fn remove_proposal<GroupId, ProposalRef>(
         &self,
         group_id: &GroupId,
         proposal_ref: &ProposalRef,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), Self::Error>
+    where
+        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
+        ProposalRef: traits::ProposalRef<STORAGE_PROVIDER_VERSION>,
+    {
         self.mls_proposals.remove(group_id, proposal_ref)
     }
 
-    fn delete_own_leaf_nodes<GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>>(
-        &self,
-        group_id: &GroupId,
-    ) -> Result<(), Self::Error> {
+    fn delete_own_leaf_nodes<GroupId>(&self, group_id: &GroupId) -> Result<(), Self::Error>
+    where
+        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
+    {
         self.mls_own_leaf_nodes.delete(group_id)
     }
 
-    fn delete_group_config<GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>>(
-        &self,
-        group_id: &GroupId,
-    ) -> Result<(), Self::Error> {
+    fn delete_group_config<GroupId>(&self, group_id: &GroupId) -> Result<(), Self::Error>
+    where
+        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
+    {
         self.mls_group_data
             .delete(group_id, GroupDataType::JoinGroupConfig)
     }
 
-    fn delete_tree<GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>>(
-        &self,
-        group_id: &GroupId,
-    ) -> Result<(), Self::Error> {
+    fn delete_tree<GroupId>(&self, group_id: &GroupId) -> Result<(), Self::Error>
+    where
+        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
+    {
         self.mls_group_data.delete(group_id, GroupDataType::Tree)
     }
 
-    fn delete_confirmation_tag<GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>>(
-        &self,
-        group_id: &GroupId,
-    ) -> Result<(), Self::Error> {
+    fn delete_confirmation_tag<GroupId>(&self, group_id: &GroupId) -> Result<(), Self::Error>
+    where
+        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
+    {
         self.mls_group_data
             .delete(group_id, GroupDataType::ConfirmationTag)
     }
 
-    fn delete_group_state<GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>>(
-        &self,
-        group_id: &GroupId,
-    ) -> Result<(), Self::Error> {
+    fn delete_group_state<GroupId>(&self, group_id: &GroupId) -> Result<(), Self::Error>
+    where
+        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
+    {
         self.mls_group_data
             .delete(group_id, GroupDataType::GroupState)
     }
 
-    fn delete_context<GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>>(
-        &self,
-        group_id: &GroupId,
-    ) -> Result<(), Self::Error> {
+    fn delete_context<GroupId>(&self, group_id: &GroupId) -> Result<(), Self::Error>
+    where
+        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
+    {
         self.mls_group_data.delete(group_id, GroupDataType::Context)
     }
 
-    fn delete_interim_transcript_hash<GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>>(
-        &self,
-        group_id: &GroupId,
-    ) -> Result<(), Self::Error> {
+    fn delete_interim_transcript_hash<GroupId>(&self, group_id: &GroupId) -> Result<(), Self::Error>
+    where
+        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
+    {
         self.mls_group_data
             .delete(group_id, GroupDataType::InterimTranscriptHash)
     }
 
-    fn delete_message_secrets<GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>>(
-        &self,
-        group_id: &GroupId,
-    ) -> Result<(), Self::Error> {
+    fn delete_message_secrets<GroupId>(&self, group_id: &GroupId) -> Result<(), Self::Error>
+    where
+        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
+    {
         self.mls_group_data
             .delete(group_id, GroupDataType::MessageSecrets)
     }
 
-    fn delete_all_resumption_psk_secrets<GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>>(
+    fn delete_all_resumption_psk_secrets<GroupId>(
         &self,
         group_id: &GroupId,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), Self::Error>
+    where
+        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
+    {
         self.mls_group_data
             .delete(group_id, GroupDataType::ResumptionPskStore)
     }
 
-    fn delete_own_leaf_index<GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>>(
-        &self,
-        group_id: &GroupId,
-    ) -> Result<(), Self::Error> {
+    fn delete_own_leaf_index<GroupId>(&self, group_id: &GroupId) -> Result<(), Self::Error>
+    where
+        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
+    {
         self.mls_group_data
             .delete(group_id, GroupDataType::OwnLeafIndex)
     }
 
-    fn delete_group_epoch_secrets<GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>>(
-        &self,
-        group_id: &GroupId,
-    ) -> Result<(), Self::Error> {
+    fn delete_group_epoch_secrets<GroupId>(&self, group_id: &GroupId) -> Result<(), Self::Error>
+    where
+        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
+    {
         self.mls_group_data
             .delete(group_id, GroupDataType::GroupEpochSecrets)
     }
 
-    fn clear_proposal_queue<
-        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
-        ProposalRef: traits::ProposalRef<STORAGE_PROVIDER_VERSION>,
-    >(
+    fn clear_proposal_queue<GroupId, ProposalRef>(
         &self,
         group_id: &GroupId,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), Self::Error>
+    where
+        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
+        ProposalRef: traits::ProposalRef<STORAGE_PROVIDER_VERSION>,
+    {
         self.mls_proposals.clear(group_id)
     }
 
-    fn delete_signature_key_pair<
-        SignaturePublicKey: traits::SignaturePublicKey<STORAGE_PROVIDER_VERSION>,
-    >(
+    fn delete_signature_key_pair<SignaturePublicKey>(
         &self,
         public_key: &SignaturePublicKey,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), Self::Error>
+    where
+        SignaturePublicKey: traits::SignaturePublicKey<STORAGE_PROVIDER_VERSION>,
+    {
         self.mls_signature_keys.delete(public_key)
     }
 
-    fn delete_encryption_key_pair<
-        EncryptionKey: traits::EncryptionKey<STORAGE_PROVIDER_VERSION>,
-    >(
+    fn delete_encryption_key_pair<EncryptionKey>(
         &self,
         public_key: &EncryptionKey,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), Self::Error>
+    where
+        EncryptionKey: traits::EncryptionKey<STORAGE_PROVIDER_VERSION>,
+    {
         self.mls_encryption_keys.delete(public_key)
     }
 
-    fn delete_encryption_epoch_key_pairs<
-        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
-        EpochKey: traits::EpochKey<STORAGE_PROVIDER_VERSION>,
-    >(
+    fn delete_encryption_epoch_key_pairs<GroupId, EpochKey>(
         &self,
         group_id: &GroupId,
         epoch: &EpochKey,
         leaf_index: u32,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), Self::Error>
+    where
+        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
+        EpochKey: traits::EpochKey<STORAGE_PROVIDER_VERSION>,
+    {
         self.mls_epoch_key_pairs.delete(group_id, epoch, leaf_index)
     }
 
-    fn delete_key_package<HashReference: traits::HashReference<STORAGE_PROVIDER_VERSION>>(
-        &self,
-        hash_ref: &HashReference,
-    ) -> Result<(), Self::Error> {
+    fn delete_key_package<HashReference>(&self, hash_ref: &HashReference) -> Result<(), Self::Error>
+    where
+        HashReference: traits::HashReference<STORAGE_PROVIDER_VERSION>,
+    {
         self.mls_key_packages.delete(hash_ref)
     }
 
-    fn delete_psk<PskId: traits::PskId<STORAGE_PROVIDER_VERSION>>(
-        &self,
-        psk_id: &PskId,
-    ) -> Result<(), Self::Error> {
+    fn delete_psk<PskId>(&self, psk_id: &PskId) -> Result<(), Self::Error>
+    where
+        PskId: traits::PskId<STORAGE_PROVIDER_VERSION>,
+    {
         self.mls_psks.delete(psk_id)
     }
 }

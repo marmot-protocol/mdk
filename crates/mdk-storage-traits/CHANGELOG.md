@@ -30,7 +30,7 @@
 - **Unified Storage Architecture**: The `MdkStorageProvider` trait now requires implementors to directly implement OpenMLS's `StorageProvider<1>` trait, enabling atomic transactions across MLS and MDK state. This is required for proper commit race resolution per MIP-03. ([#148](https://github.com/marmot-protocol/mdk/pull/148))
   - Removed `OpenMlsStorageProvider` associated type
   - Removed `openmls_storage()` and `openmls_storage_mut()` accessor methods
-  - Storage implementations must now implement all 56 `StorageProvider<1>` methods directly
+  - Storage implementations must now implement all required `StorageProvider<1>` methods directly
 - **Security (Audit Issue M)**: Changed `MessageStorage::find_message_by_event_id()` to require both `mls_group_id` and `event_id` parameters. This prevents messages from different groups from overwriting each other by scoping lookups to a specific group. ([#124](https://github.com/marmot-protocol/mdk/pull/124))
 - **Secret Type Wrapper**: Secret values now use `Secret<T>` wrapper for automatic zeroization ([#109](https://github.com/marmot-protocol/mdk/pull/109))
   - `Group.image_key` changed from `Option<[u8; 32]>` to `Option<Secret<[u8; 32]>>`

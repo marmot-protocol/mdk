@@ -260,7 +260,7 @@ Commits:
 
 ---
 
-### Phase 3: Implement `StorageProvider<1>` for `MdkMemoryStorage` ⏳ NOT STARTED
+### Phase 3: Implement `StorageProvider<1>` for `MdkMemoryStorage` ✅ COMPLETE
 
 **Goal**: Make `MdkMemoryStorage` directly implement the OpenMLS storage trait.
 
