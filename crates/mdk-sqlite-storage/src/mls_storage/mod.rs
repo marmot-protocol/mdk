@@ -1302,4 +1302,217 @@ mod tests {
             assert_eq!(retrieved, "second");
         });
     }
+
+    // ========================================
+    // Function Tests
+    // These tests verify the helper functions work correctly.
+    // ========================================
+
+    #[test]
+    fn test_group_data_functions() {
+        use openmls::group::GroupId;
+        with_test_storage(|conn| {
+            let group_id = GroupId::from_slice(&[1u8, 2, 3]);
+            let data = b"test_data".to_vec();
+            let data_type = GroupDataType::Tree;
+
+            // Write
+            write_group_data(conn, &group_id, data_type, &data).unwrap();
+
+            // Read
+            let read = read_group_data::<_, Vec<u8>>(conn, &group_id, data_type).unwrap();
+            assert_eq!(read, Some(data.clone()));
+
+            // Delete
+            delete_group_data(conn, &group_id, data_type).unwrap();
+
+            // Verify
+            let read_after_delete =
+                read_group_data::<_, Vec<u8>>(conn, &group_id, data_type).unwrap();
+            assert_eq!(read_after_delete, None);
+        });
+    }
+
+    #[test]
+    fn test_own_leaf_node_functions() {
+        use openmls::group::GroupId;
+        with_test_storage(|conn| {
+            let group_id = GroupId::from_slice(&[1u8, 2, 3]);
+            let leaf1 = b"leaf1".to_vec();
+            let leaf2 = b"leaf2".to_vec();
+
+            // Append
+            append_own_leaf_node(conn, &group_id, &leaf1).unwrap();
+            append_own_leaf_node(conn, &group_id, &leaf2).unwrap();
+
+            // Read
+            let leaves = read_own_leaf_nodes::<_, Vec<u8>>(conn, &group_id).unwrap();
+            assert_eq!(leaves, vec![leaf1, leaf2]);
+
+            // Delete
+            delete_own_leaf_nodes(conn, &group_id).unwrap();
+
+            // Verify
+            let leaves_after_delete = read_own_leaf_nodes::<_, Vec<u8>>(conn, &group_id).unwrap();
+            assert!(leaves_after_delete.is_empty());
+        });
+    }
+
+    #[test]
+    fn test_proposal_functions() {
+        use openmls::group::GroupId;
+        use openmls_traits::storage::{Entity, Key};
+        use serde::{Deserialize, Serialize};
+
+        #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+        struct TestRef(Vec<u8>);
+        impl Key<STORAGE_PROVIDER_VERSION> for TestRef {}
+        impl Entity<STORAGE_PROVIDER_VERSION> for TestRef {}
+
+        with_test_storage(|conn| {
+            let group_id = GroupId::from_slice(&[1u8, 2, 3]);
+            let ref1 = TestRef(vec![10u8]);
+            let prop1 = b"prop1".to_vec();
+            let ref2 = TestRef(vec![20u8]);
+            let prop2 = b"prop2".to_vec();
+
+            // Queue
+            queue_proposal(conn, &group_id, &ref1, &prop1).unwrap();
+            queue_proposal(conn, &group_id, &ref2, &prop2).unwrap();
+
+            // Read refs
+            let refs = read_queued_proposal_refs::<_, TestRef>(conn, &group_id).unwrap();
+            assert_eq!(refs.len(), 2);
+            assert!(refs.contains(&ref1));
+            assert!(refs.contains(&ref2));
+
+            // Read proposals
+            let props = read_queued_proposals::<_, TestRef, Vec<u8>>(conn, &group_id).unwrap();
+            assert_eq!(props.len(), 2);
+            // Verify content
+            for (r, p) in props {
+                if r == ref1 {
+                    assert_eq!(p, prop1);
+                } else if r == ref2 {
+                    assert_eq!(p, prop2);
+                } else {
+                    panic!("Unexpected ref");
+                }
+            }
+
+            // Remove single
+            remove_proposal(conn, &group_id, &ref1).unwrap();
+            let refs_after_remove =
+                read_queued_proposal_refs::<_, TestRef>(conn, &group_id).unwrap();
+            assert_eq!(refs_after_remove.len(), 1);
+            assert_eq!(refs_after_remove[0], ref2);
+
+            // Clear all
+            queue_proposal(conn, &group_id, &ref1, &prop1).unwrap(); // Re-add
+            clear_proposal_queue(conn, &group_id).unwrap();
+            let refs_after_clear =
+                read_queued_proposal_refs::<_, TestRef>(conn, &group_id).unwrap();
+            assert!(refs_after_clear.is_empty());
+        });
+    }
+
+    #[test]
+    fn test_key_package_functions() {
+        use openmls::group::GroupId;
+        // Using GroupId as KeyPackageRef (needs Key)
+        with_test_storage(|conn| {
+            let hash_ref = GroupId::from_slice(&[1u8, 2, 3]);
+            let kp = b"key_package".to_vec();
+
+            write_key_package(conn, &hash_ref, &kp).unwrap();
+
+            let read = read_key_package::<_, Vec<u8>>(conn, &hash_ref).unwrap();
+            assert_eq!(read, Some(kp));
+
+            delete_key_package(conn, &hash_ref).unwrap();
+            let read_after = read_key_package::<_, Vec<u8>>(conn, &hash_ref).unwrap();
+            assert_eq!(read_after, None);
+        });
+    }
+
+    #[test]
+    fn test_signature_key_functions() {
+        use openmls::group::GroupId;
+        with_test_storage(|conn| {
+            let pub_key = GroupId::from_slice(&[1u8, 2, 3]);
+            let key_pair = b"sig_key_pair".to_vec();
+
+            write_signature_key_pair(conn, &pub_key, &key_pair).unwrap();
+
+            let read = read_signature_key_pair::<_, Vec<u8>>(conn, &pub_key).unwrap();
+            assert_eq!(read, Some(key_pair));
+
+            delete_signature_key_pair(conn, &pub_key).unwrap();
+            let read_after = read_signature_key_pair::<_, Vec<u8>>(conn, &pub_key).unwrap();
+            assert_eq!(read_after, None);
+        });
+    }
+
+    #[test]
+    fn test_encryption_key_functions() {
+        use openmls::group::GroupId;
+        with_test_storage(|conn| {
+            let pub_key = GroupId::from_slice(&[1u8, 2, 3]);
+            let key_pair = b"enc_key_pair".to_vec();
+
+            write_encryption_key_pair(conn, &pub_key, &key_pair).unwrap();
+
+            let read = read_encryption_key_pair::<_, Vec<u8>>(conn, &pub_key).unwrap();
+            assert_eq!(read, Some(key_pair));
+
+            delete_encryption_key_pair(conn, &pub_key).unwrap();
+            let read_after = read_encryption_key_pair::<_, Vec<u8>>(conn, &pub_key).unwrap();
+            assert_eq!(read_after, None);
+        });
+    }
+
+    #[test]
+    fn test_epoch_key_pairs_functions() {
+        use openmls::group::GroupId;
+        // Using GroupId for EpochKey as well (needs Key)
+        with_test_storage(|conn| {
+            let group_id = GroupId::from_slice(&[1u8]);
+            let epoch = GroupId::from_slice(&[10u8]);
+            let leaf_index = 5;
+            let keys = vec![b"k1".to_vec(), b"k2".to_vec()];
+
+            write_encryption_epoch_key_pairs(conn, &group_id, &epoch, leaf_index, &keys).unwrap();
+
+            let read = read_encryption_epoch_key_pairs::<_, _, Vec<u8>>(
+                conn, &group_id, &epoch, leaf_index,
+            )
+            .unwrap();
+            assert_eq!(read, keys);
+
+            delete_encryption_epoch_key_pairs(conn, &group_id, &epoch, leaf_index).unwrap();
+            let read_after = read_encryption_epoch_key_pairs::<_, _, Vec<u8>>(
+                conn, &group_id, &epoch, leaf_index,
+            )
+            .unwrap();
+            assert!(read_after.is_empty());
+        });
+    }
+
+    #[test]
+    fn test_psk_functions() {
+        use openmls::group::GroupId;
+        with_test_storage(|conn| {
+            let psk_id = GroupId::from_slice(&[1u8, 2, 3]);
+            let psk = b"psk_data".to_vec();
+
+            write_psk(conn, &psk_id, &psk).unwrap();
+
+            let read = read_psk::<_, Vec<u8>>(conn, &psk_id).unwrap();
+            assert_eq!(read, Some(psk));
+
+            delete_psk(conn, &psk_id).unwrap();
+            let read_after = read_psk::<_, Vec<u8>>(conn, &psk_id).unwrap();
+            assert_eq!(read_after, None);
+        });
+    }
 }
