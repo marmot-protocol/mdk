@@ -970,9 +970,10 @@ where
                 current_epoch,
                 e
             );
-            // We proceed anyway? MIP-03 requires deterministic ordering.
-            // If we can't snapshot, we can't rollback later if a better commit arrives.
-            // But proceeding is better than stalling.
+            // Without a snapshot we can't guarantee MIP-03 convergence if a better commit arrives.
+            return Err(Error::Message(
+                "Failed to create epoch snapshot".to_string(),
+            ));
         }
 
         mls_group
