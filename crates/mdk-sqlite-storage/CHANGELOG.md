@@ -27,6 +27,18 @@
 
 ### Breaking changes
 
+### Changed
+
+- **Transactional Snapshots**: Implemented snapshot support using SQLite `SAVEPOINT`. `create_named_snapshot`, `rollback_to_snapshot`, and `release_snapshot` map to `SAVEPOINT`, `ROLLBACK TO`, and `RELEASE` respectively. ([#152](https://github.com/marmot-protocol/mdk/pull/152))
+
+### Added
+
+### Fixed
+
+### Removed
+
+### Deprecated
+
 - **Unified Storage Architecture**: `MdkSqliteStorage` now directly implements OpenMLS's `StorageProvider<1>` trait instead of wrapping `openmls_sqlite_storage`. This enables atomic transactions across MLS and MDK state, which is required for proper commit race resolution per MIP-03. ([#148](https://github.com/marmot-protocol/mdk/pull/148))
   - Removed `openmls_sqlite_storage` dependency
   - New unified schema in `V001__initial_schema.sql` replaces all previous migrations

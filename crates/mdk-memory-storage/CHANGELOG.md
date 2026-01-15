@@ -27,6 +27,18 @@
 
 ### Breaking changes
 
+### Changed
+
+- **Thread-Safe Snapshots**: Implemented atomic snapshot support using internal locking. `create_named_snapshot`, `rollback_to_snapshot`, and `release_snapshot` are now supported for testing and race resolution. ([#152](https://github.com/marmot-protocol/mdk/pull/152))
+
+### Added
+
+### Fixed
+
+### Removed
+
+### Deprecated
+
 - **Unified Storage Architecture**: `MdkMemoryStorage` now directly implements OpenMLS's `StorageProvider<1>` trait instead of wrapping `openmls_memory_storage`. This enables unified in-memory storage for both MLS and MDK state, consistent with the SQLite implementation. ([#148](https://github.com/marmot-protocol/mdk/pull/148))
   - Removed `openmls_memory_storage` dependency
   - All MLS state is now stored in unified in-memory data structures
