@@ -162,29 +162,18 @@ impl EpochSnapshotManager {
                     .rollback_to_snapshot(&snapshot.snapshot_name)
                     .map_err(Error::Storage)?;
 
-                // After rollback, drain everything *after* index.
-                let _ = queue.split_off(index + 1);
-
-                // And remove the snapshot at `index` itself (since we used it)
+                // Remove and release all snapshots from index onwards (including the used one)
                 let removed = queue.split_off(index);
-
                 for snap in removed {
-                    if snap.epoch != target_epoch {
-                        let _ = storage.release_snapshot(&snap.snapshot_name);
-                    } else {
-                        // For the target snapshot, we just used it.
-                        let _ = storage.release_snapshot(&snap.snapshot_name);
-                    }
+                    let _ = storage.release_snapshot(&snap.snapshot_name);
                 }
 
                 return Ok(());
             }
         }
 
-        Err(Error::Storage(MdkStorageError::NotFound(format!(
-            "No snapshot found for group {} epoch {}",
-            hex::encode(group_id.as_slice()),
-            target_epoch
-        ))))
+        Err(Error::Storage(MdkStorageError::NotFound(
+            "No snapshot found for target epoch".to_string(),
+        )))
     }
 }
