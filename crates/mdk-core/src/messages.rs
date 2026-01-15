@@ -7656,35 +7656,29 @@ mod tests {
         // Check result - rollback should happen
         let rollback_count = callback.rollback_count();
 
-        if rollback_count > 0 {
-            // Rollback happened - verify it targeted the correct epoch
-            let rollbacks = callback.get_rollbacks();
-            assert_eq!(
-                rollbacks[0].1, initial_epoch,
-                "Rollback should target the epoch before competing commits"
-            );
+        // Check result - rollback should happen
+        let rollback_count = callback.rollback_count();
+        assert!(rollback_count > 0, "Rollback should have happened");
 
-            // After rollback and applying better A', epoch should be at initial + 1
-            let final_epoch = alice_mdk
-                .get_group(&group_id)
-                .expect("Failed to get group")
-                .expect("Group should exist")
-                .epoch;
+        // Rollback happened - verify it targeted the correct epoch
+        let rollbacks = callback.get_rollbacks();
+        assert_eq!(
+            rollbacks[0].1, initial_epoch,
+            "Rollback should target the epoch before competing commits"
+        );
 
-            assert_eq!(
-                final_epoch,
-                initial_epoch + 1,
-                "After rollback and applying better A', epoch should be initial + 1"
-            );
-        } else {
-            // No rollback - this might indicate the snapshot was already pruned
-            // or the implementation doesn't support chain rollback
-            // The result should still be handled gracefully
-            assert!(
-                result_a_prime.is_ok() || result_a_prime.is_err(),
-                "Result should be handled gracefully"
-            );
-        }
+        // After rollback and applying better A', epoch should be at initial + 1
+        let final_epoch = alice_mdk
+            .get_group(&group_id)
+            .expect("Failed to get group")
+            .expect("Group should exist")
+            .epoch;
+
+        assert_eq!(
+            final_epoch,
+            initial_epoch + 1,
+            "After rollback and applying better A', epoch should be initial + 1"
+        );
     }
 
     /// Test that epoch snapshots are properly pruned based on retention count
