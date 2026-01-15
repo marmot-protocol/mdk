@@ -10,14 +10,18 @@
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
 #![doc = include_str!("../README.md")]
 
+use std::sync::Arc;
+
 use mdk_storage_traits::MdkStorageProvider;
 use openmls::prelude::*;
 use openmls_rust_crypto::RustCrypto;
 
+pub mod callback;
 mod constant;
 #[cfg(feature = "mip04")]
 #[cfg_attr(docsrs, doc(cfg(feature = "mip04")))]
 pub mod encrypted_media;
+pub mod epoch_snapshots;
 pub mod error;
 pub mod extension;
 pub mod groups;
@@ -30,9 +34,11 @@ pub mod test_util;
 mod util;
 pub mod welcomes;
 
+use self::callback::MdkCallback;
 use self::constant::{
     DEFAULT_CIPHERSUITE, GROUP_CONTEXT_REQUIRED_EXTENSIONS, SUPPORTED_EXTENSIONS,
 };
+use self::epoch_snapshots::EpochSnapshotManager;
 pub use self::error::Error;
 use self::util::NostrTagFormat;
 
@@ -114,6 +120,14 @@ pub struct MdkConfig {
     /// computation to advance the ratchet when catching up. The default of 1000
     /// handles most message loss scenarios while keeping catch-up costs reasonable.
     pub maximum_forward_distance: u32,
+
+    /// Number of epoch snapshots to retain for rollback support.
+    ///
+    /// Enables recovery when a better commit arrives late by allowing the
+    /// client to rollback to a previous epoch state and re-apply commits.
+    ///
+    /// Default: 5
+    pub epoch_snapshot_retention: usize,
 }
 
 impl Default for MdkConfig {
@@ -123,6 +137,7 @@ impl Default for MdkConfig {
             max_future_skew_secs: 300,      // 5 minutes
             out_of_order_tolerance: 100,    // 100 past messages
             maximum_forward_distance: 1000, // 1000 forward messages
+            epoch_snapshot_retention: 5,
         }
     }
 }
@@ -157,6 +172,7 @@ impl MdkConfig {
 pub struct MdkBuilder<Storage> {
     storage: Storage,
     config: MdkConfig,
+    callback: Option<Arc<dyn MdkCallback>>,
 }
 
 impl<Storage> MdkBuilder<Storage>
@@ -168,6 +184,7 @@ where
         Self {
             storage,
             config: MdkConfig::default(),
+            callback: None,
         }
     }
 
@@ -188,8 +205,18 @@ where
         self
     }
 
+    /// Set a callback for MDK events
+    pub fn with_callback(mut self, callback: Arc<dyn MdkCallback>) -> Self {
+        self.callback = Some(callback);
+        self
+    }
+
     /// Build the MDK instance with the configured settings
     pub fn build(self) -> MDK<Storage> {
+        let epoch_snapshots = Arc::new(EpochSnapshotManager::new(
+            self.config.epoch_snapshot_retention,
+        ));
+
         MDK {
             ciphersuite: DEFAULT_CIPHERSUITE,
             extensions: SUPPORTED_EXTENSIONS.to_vec(),
@@ -198,6 +225,8 @@ where
                 storage: self.storage,
             },
             config: self.config,
+            epoch_snapshots,
+            callback: self.callback,
         }
     }
 }
@@ -224,6 +253,10 @@ where
     pub provider: MdkProvider<Storage>,
     /// Configuration for encoding behavior
     pub config: MdkConfig,
+    /// Snapshot manager for rollback support
+    epoch_snapshots: Arc<EpochSnapshotManager>,
+    /// Optional callback for events
+    callback: Option<Arc<dyn MdkCallback>>,
 }
 
 /// Provider implementation for OpenMLS that integrates with Nostr.

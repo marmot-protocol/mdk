@@ -40,9 +40,11 @@ impl GroupStorage for MdkMemoryStorage {
             )));
         }
 
-        // Acquire both locks to ensure atomic update
-        let mut groups_cache = self.groups_cache.write();
-        let mut nostr_id_cache = self.groups_by_nostr_id_cache.write();
+        // Acquire lock on inner storage
+        let mut guard = self.inner.write();
+        let inner = &mut *guard;
+        let groups_cache = &mut inner.groups_cache;
+        let nostr_id_cache = &mut inner.groups_by_nostr_id_cache;
 
         // Check if nostr_group_id is already mapped to a different mls_group_id
         if let Some(existing_group) = nostr_id_cache.peek(&group.nostr_group_id)
@@ -68,9 +70,9 @@ impl GroupStorage for MdkMemoryStorage {
     }
 
     fn all_groups(&self) -> Result<Vec<Group>, GroupError> {
-        let cache = self.groups_cache.read();
+        let inner = self.inner.read();
         // Convert the values from the cache to a Vec
-        let groups: Vec<Group> = cache.iter().map(|(_, v)| v.clone()).collect();
+        let groups: Vec<Group> = inner.groups_cache.iter().map(|(_, v)| v.clone()).collect();
         Ok(groups)
     }
 
@@ -78,16 +80,21 @@ impl GroupStorage for MdkMemoryStorage {
         &self,
         mls_group_id: &GroupId,
     ) -> Result<Option<Group>, GroupError> {
-        let cache = self.groups_cache.read();
-        Ok(cache.peek(mls_group_id).cloned())
+        // We need write lock to update LRU order with peek? No, peek doesn't update LRU order in `lru` crate?
+        // Actually lru::LruCache::peek() requires &mut self usually? No, peek is &self. get is &mut self.
+        // Wait, lru 0.12 peek is &mut self? Let me check Cargo.toml or assume peek is &self or &mut self.
+        // If peek is &self, we can use read lock.
+        // Looking at lru crate docs: peek is &self. get is &mut self.
+        let inner = self.inner.read();
+        Ok(inner.groups_cache.peek(mls_group_id).cloned())
     }
 
     fn find_group_by_nostr_group_id(
         &self,
         nostr_group_id: &[u8; 32],
     ) -> Result<Option<Group>, GroupError> {
-        let cache = self.groups_by_nostr_id_cache.read();
-        Ok(cache.peek(nostr_group_id).cloned())
+        let inner = self.inner.read();
+        Ok(inner.groups_by_nostr_id_cache.peek(nostr_group_id).cloned())
     }
 
     fn messages(
@@ -112,8 +119,8 @@ impl GroupStorage for MdkMemoryStorage {
             return Err(GroupError::InvalidParameters("Group not found".to_string()));
         }
 
-        let cache = self.messages_by_group_cache.read();
-        match cache.peek(mls_group_id) {
+        let inner = self.inner.read();
+        match inner.messages_by_group_cache.peek(mls_group_id) {
             Some(messages_map) => {
                 // Collect values from HashMap into a Vec for sorting
                 let mut messages: Vec<Message> = messages_map.values().cloned().collect();
@@ -145,8 +152,8 @@ impl GroupStorage for MdkMemoryStorage {
             return Err(GroupError::InvalidParameters("Group not found".to_string()));
         }
 
-        let cache = self.group_relays_cache.read();
-        match cache.peek(mls_group_id).cloned() {
+        let inner = self.inner.read();
+        match inner.group_relays_cache.peek(mls_group_id).cloned() {
             Some(relays) => Ok(relays),
             // If not in cache but group exists, return empty set
             None => Ok(BTreeSet::new()),
@@ -182,7 +189,7 @@ impl GroupStorage for MdkMemoryStorage {
             return Err(GroupError::InvalidParameters("Group not found".to_string()));
         }
 
-        let mut cache = self.group_relays_cache.write();
+        let mut inner = self.inner.write();
 
         // Convert RelayUrl set to GroupRelay set
         let group_relays: BTreeSet<GroupRelay> = relays
@@ -194,7 +201,7 @@ impl GroupStorage for MdkMemoryStorage {
             .collect();
 
         // Replace the entire relay set for this group
-        cache.put(group_id.clone(), group_relays);
+        inner.group_relays_cache.put(group_id.clone(), group_relays);
 
         Ok(())
     }
@@ -209,9 +216,12 @@ impl GroupStorage for MdkMemoryStorage {
             return Err(GroupError::InvalidParameters("Group not found".to_string()));
         }
 
-        let cache = self.group_exporter_secrets_cache.read();
+        let inner = self.inner.read();
         // Use tuple (GroupId, epoch) as key
-        Ok(cache.peek(&(mls_group_id.clone(), epoch)).cloned())
+        Ok(inner
+            .group_exporter_secrets_cache
+            .peek(&(mls_group_id.clone(), epoch))
+            .cloned())
     }
 
     fn save_group_exporter_secret(
@@ -226,13 +236,15 @@ impl GroupStorage for MdkMemoryStorage {
             return Err(GroupError::InvalidParameters("Group not found".to_string()));
         }
 
-        let mut cache = self.group_exporter_secrets_cache.write();
+        let mut inner = self.inner.write();
         // Use tuple (GroupId, epoch) as key
         let key = (
             group_exporter_secret.mls_group_id.clone(),
             group_exporter_secret.epoch,
         );
-        cache.put(key, group_exporter_secret);
+        inner
+            .group_exporter_secrets_cache
+            .put(key, group_exporter_secret);
 
         Ok(())
     }

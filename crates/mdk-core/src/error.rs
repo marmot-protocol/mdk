@@ -56,6 +56,9 @@ pub enum Error {
     /// Crypto error
     #[error(transparent)]
     Crypto(#[from] CryptoError),
+    /// Storage error
+    #[error(transparent)]
+    Storage(#[from] mdk_storage_traits::MdkStorageError),
     /// Generic OpenMLS error
     #[error(transparent)]
     OpenMlsGeneric(#[from] LibraryError),
@@ -74,6 +77,9 @@ pub enum Error {
     /// Process message error - epoch mismatch
     #[error("Message epoch differs from the group's epoch")]
     ProcessMessageWrongEpoch,
+    /// Process message error - epoch mismatch with epoch info
+    #[error("Message epoch {0} differs from the group's epoch")]
+    ProcessMessageWrongEpochWithInfo(u64),
     /// Process message error - wrong group ID
     #[error("Wrong group ID")]
     ProcessMessageWrongGroupId,
@@ -163,6 +169,9 @@ pub enum Error {
     /// Commit message received from a non-admin
     #[error("not processing commit from non-admin")]
     CommitFromNonAdmin,
+    /// Own commit pending merge
+    #[error("own commit pending merge")]
+    OwnCommitPending,
     /// Error when updating group context extensions
     #[error("Error when updating group context extensions {0}")]
     UpdateGroupContextExts(String),

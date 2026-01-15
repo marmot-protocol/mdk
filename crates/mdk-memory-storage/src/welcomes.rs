@@ -37,8 +37,8 @@ impl WelcomeStorage for MdkMemoryStorage {
             )));
         }
 
-        let mut cache = self.welcomes_cache.write();
-        cache.put(welcome.id, welcome);
+        let mut inner = self.inner.write();
+        inner.welcomes_cache.put(welcome.id, welcome);
 
         Ok(())
     }
@@ -59,8 +59,9 @@ impl WelcomeStorage for MdkMemoryStorage {
             )));
         }
 
-        let cache = self.welcomes_cache.read();
-        let mut welcomes: Vec<Welcome> = cache
+        let inner = self.inner.read();
+        let mut welcomes: Vec<Welcome> = inner
+            .welcomes_cache
             .iter()
             .map(|(_, v)| v.clone())
             .filter(|welcome| welcome.state == WelcomeState::Pending)
@@ -79,16 +80,18 @@ impl WelcomeStorage for MdkMemoryStorage {
         &self,
         event_id: &EventId,
     ) -> Result<Option<Welcome>, WelcomeError> {
-        let cache = self.welcomes_cache.read();
-        Ok(cache.peek(event_id).cloned())
+        let inner = self.inner.read();
+        Ok(inner.welcomes_cache.peek(event_id).cloned())
     }
 
     fn save_processed_welcome(
         &self,
         processed_welcome: ProcessedWelcome,
     ) -> Result<(), WelcomeError> {
-        let mut cache = self.processed_welcomes_cache.write();
-        cache.put(processed_welcome.wrapper_event_id, processed_welcome);
+        let mut inner = self.inner.write();
+        inner
+            .processed_welcomes_cache
+            .put(processed_welcome.wrapper_event_id, processed_welcome);
 
         Ok(())
     }
@@ -97,8 +100,8 @@ impl WelcomeStorage for MdkMemoryStorage {
         &self,
         event_id: &EventId,
     ) -> Result<Option<ProcessedWelcome>, WelcomeError> {
-        let cache = self.processed_welcomes_cache.read();
-        Ok(cache.peek(event_id).cloned())
+        let inner = self.inner.read();
+        Ok(inner.processed_welcomes_cache.peek(event_id).cloned())
     }
 }
 
