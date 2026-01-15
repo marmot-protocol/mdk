@@ -3,6 +3,22 @@
 //! This module provides the ability to create snapshots of all in-memory state
 //! and restore them later. This provides functionality analogous to SQLite
 //! savepoints for testing and rollback scenarios.
+//!
+//! # Concurrency Warning
+//!
+//! Snapshot creation and restoration are **not atomic** with respect to concurrent
+//! operations. These operations acquire multiple independent locks sequentially,
+//! which means:
+//!
+//! - During `create_snapshot()`: Concurrent writes may result in an inconsistent
+//!   snapshot (some changes captured, others not).
+//! - During `restore_snapshot()`: Concurrent reads may observe partial state
+//!   (some data restored, some still from before the restore).
+//!
+//! **Callers must ensure no concurrent operations are in progress when creating
+//! or restoring snapshots.** This is typically achieved by using snapshots only
+//! in single-threaded test scenarios or by holding an external synchronization
+//! primitive.
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -23,6 +39,12 @@ use crate::mls_storage::GroupDataType;
 /// 2. Attempt the operation
 /// 3. Restore the snapshot if the operation fails or needs to be undone
 ///
+/// # Concurrency Warning
+///
+/// See the [module-level documentation](self) for important concurrency
+/// considerations. Snapshot creation and restoration are not atomic with
+/// respect to concurrent operations.
+///
 /// # Example
 ///
 /// ```ignore
@@ -31,13 +53,13 @@ use crate::mls_storage::GroupDataType;
 /// // Make some changes
 /// storage.save_group(group)?;
 ///
-/// // Create a snapshot
+/// // Create a snapshot (ensure no concurrent operations)
 /// let snapshot = storage.create_snapshot();
 ///
 /// // Try an operation that might need rollback
 /// storage.save_message(message)?;
 ///
-/// // If we need to undo:
+/// // If we need to undo (ensure no concurrent operations):
 /// storage.restore_snapshot(snapshot);
 /// ```
 #[derive(Clone)]

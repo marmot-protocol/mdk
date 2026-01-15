@@ -8,9 +8,13 @@
 //!
 //! # Unified Storage Architecture
 //!
-//! This implementation provides atomic operations across all MLS and MDK state
-//! through in-memory data structures. It supports snapshot and restore operations
-//! for rollback scenarios, analogous to SQLite savepoints.
+//! This implementation stores all MLS and MDK state in-memory. It supports
+//! snapshot and restore operations for rollback scenarios, analogous to SQLite
+//! savepoints.
+//!
+//! **Note:** Snapshot and restore operations are not atomic with respect to
+//! concurrent access. Callers must ensure no other operations are in progress
+//! when creating or restoring snapshots.
 
 //! ## Memory Exhaustion Protection
 //!
@@ -285,9 +289,13 @@ impl ValidationLimits {
 /// ## Unified Storage Architecture
 ///
 /// This implementation stores all MLS and MDK state in-memory, providing:
-/// - Atomic snapshot/restore operations for rollback scenarios
+/// - Snapshot/restore operations for rollback scenarios
 /// - Thread-safe access through `RwLock` protected data structures
 /// - LRU caching for frequently accessed MDK objects
+///
+/// **Important:** Snapshot and restore operations read/write multiple independent
+/// locks and are not atomic with respect to concurrent operations. Callers must
+/// ensure no other operations are in progress when creating or restoring snapshots.
 ///
 /// ## Caching Strategy
 ///
@@ -475,6 +483,13 @@ impl MdkMemoryStorage {
     /// 2. Attempt the operation
     /// 3. Restore the snapshot if the operation fails or needs to be undone
     ///
+    /// # Concurrency Warning
+    ///
+    /// This method acquires multiple independent locks sequentially. If other
+    /// threads are performing operations concurrently, the snapshot may capture
+    /// an inconsistent state. **Callers must ensure no concurrent operations
+    /// are in progress when creating a snapshot.**
+    ///
     /// # Returns
     ///
     /// A `MemoryStorageSnapshot` containing cloned copies of all state.
@@ -521,6 +536,13 @@ impl MdkMemoryStorage {
     /// Restores state from a previously created snapshot.
     ///
     /// This replaces all current in-memory state with the state from the snapshot.
+    ///
+    /// # Concurrency Warning
+    ///
+    /// This method acquires multiple independent locks sequentially. If other
+    /// threads are performing operations concurrently, they may observe partial
+    /// restore state (some data restored, some not yet). **Callers must ensure
+    /// no concurrent operations are in progress when restoring a snapshot.**
     ///
     /// # Arguments
     ///
