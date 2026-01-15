@@ -7651,10 +7651,7 @@ mod tests {
 
         // Step 4: Now the BETTER commit A' arrives late
         // This should trigger rollback to before A, and apply A'
-        let result_a_prime = alice_mdk.process_message(better_a);
-
-        // Check result - rollback should happen
-        let rollback_count = callback.rollback_count();
+        let _result_a_prime = alice_mdk.process_message(better_a);
 
         // Check result - rollback should happen
         let rollback_count = callback.rollback_count();
