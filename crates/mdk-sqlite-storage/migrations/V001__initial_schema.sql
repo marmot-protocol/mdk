@@ -166,7 +166,7 @@ CREATE TABLE IF NOT EXISTS welcomes (
     id BLOB PRIMARY KEY,
     event JSONB NOT NULL,
     mls_group_id BLOB NOT NULL,
-    nostr_group_id TEXT NOT NULL,
+    nostr_group_id BLOB NOT NULL,
     group_name TEXT NOT NULL,
     group_description TEXT NOT NULL,
     group_admin_pubkeys JSONB NOT NULL,
