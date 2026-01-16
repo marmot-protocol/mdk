@@ -2003,6 +2003,7 @@ where
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
+    use std::fmt;
 
     use mdk_storage_traits::GroupId;
     use mdk_storage_traits::groups::Pagination;
@@ -7192,8 +7193,8 @@ mod tests {
         rollbacks: std::sync::Mutex<Vec<(GroupId, u64, EventId)>>,
     }
 
-    impl std::fmt::Debug for TestCallback {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    impl fmt::Debug for TestCallback {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             let count = self.rollbacks.lock().map(|g| g.len()).unwrap_or(0);
             f.debug_struct("TestCallback")
                 .field("rollback_count", &count)
@@ -7386,7 +7387,10 @@ mod tests {
         );
 
         let rollbacks = callback.get_rollbacks();
-        assert_eq!(rollbacks[0].0, group_id, "Rollback should be for our group");
+        assert!(
+            rollbacks[0].0 == group_id,
+            "Rollback should be for our group"
+        );
         assert_eq!(
             rollbacks[0].1, initial_epoch,
             "Rollback should target the epoch before the competing commits"
