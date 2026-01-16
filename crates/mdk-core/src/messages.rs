@@ -314,7 +314,10 @@ where
         let processed_message = match group.process_message(&self.provider, protocol_message) {
             Ok(processed_message) => processed_message,
             Err(ProcessMessageError::ValidationError(ValidationError::WrongEpoch)) => {
-                return Err(Error::ProcessMessageWrongEpochWithInfo(msg_epoch));
+                if content_type == ContentType::Commit {
+                    return Err(Error::ProcessMessageWrongEpochWithInfo(msg_epoch));
+                }
+                return Err(Error::ProcessMessageWrongEpoch);
             }
             Err(ProcessMessageError::ValidationError(ValidationError::CannotDecryptOwnMessage)) => {
                 // If this is a commit message and we have a pending commit, it might be our own commit
@@ -1376,6 +1379,24 @@ where
                     target: "mdk_core::messages::process_decrypted_message",
                     "Merging pending own commit after rollback/reprocess"
                 );
+
+                // Snapshot current state before applying commit (for rollback support)
+                if let Err(e) = self.epoch_snapshots.create_snapshot(
+                    self.storage(),
+                    &group.mls_group_id,
+                    mls_group.epoch().as_u64(),
+                    &event.id,
+                    event.created_at.as_u64(),
+                ) {
+                    tracing::warn!(
+                        target: "mdk_core::messages::process_decrypted_message",
+                        "Failed to create snapshot for pending commit merge: {}",
+                        e
+                    );
+                    return Err(Error::Message(
+                        "Failed to create epoch snapshot".to_string(),
+                    ));
+                }
 
                 mls_group
                     .merge_pending_commit(&self.provider)
