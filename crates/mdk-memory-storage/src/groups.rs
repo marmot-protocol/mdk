@@ -109,12 +109,13 @@ impl GroupStorage for MdkMemoryStorage {
             )));
         }
 
-        // Check if the group exists first
-        if self.find_group_by_mls_group_id(mls_group_id)?.is_none() {
+        let inner = self.inner.read();
+
+        // Check if the group exists while holding the lock
+        if inner.groups_cache.peek(mls_group_id).is_none() {
             return Err(GroupError::InvalidParameters("Group not found".to_string()));
         }
 
-        let inner = self.inner.read();
         match inner.messages_by_group_cache.peek(mls_group_id) {
             Some(messages_map) => {
                 // Collect values from HashMap into a Vec for sorting
@@ -142,12 +143,13 @@ impl GroupStorage for MdkMemoryStorage {
     }
 
     fn group_relays(&self, mls_group_id: &GroupId) -> Result<BTreeSet<GroupRelay>, GroupError> {
-        // Check if the group exists first
-        if self.find_group_by_mls_group_id(mls_group_id)?.is_none() {
+        let inner = self.inner.read();
+
+        // Check if the group exists while holding the lock
+        if inner.groups_cache.peek(mls_group_id).is_none() {
             return Err(GroupError::InvalidParameters("Group not found".to_string()));
         }
 
-        let inner = self.inner.read();
         match inner.group_relays_cache.peek(mls_group_id).cloned() {
             Some(relays) => Ok(relays),
             // If not in cache but group exists, return empty set
@@ -179,12 +181,12 @@ impl GroupStorage for MdkMemoryStorage {
             }
         }
 
-        // Check if the group exists first
-        if self.find_group_by_mls_group_id(group_id)?.is_none() {
+        let mut inner = self.inner.write();
+
+        // Check if the group exists while holding the lock
+        if inner.groups_cache.peek(group_id).is_none() {
             return Err(GroupError::InvalidParameters("Group not found".to_string()));
         }
-
-        let mut inner = self.inner.write();
 
         // Convert RelayUrl set to GroupRelay set
         let group_relays: BTreeSet<GroupRelay> = relays
@@ -206,12 +208,13 @@ impl GroupStorage for MdkMemoryStorage {
         mls_group_id: &GroupId,
         epoch: u64,
     ) -> Result<Option<GroupExporterSecret>, GroupError> {
-        // Check if the group exists first
-        if self.find_group_by_mls_group_id(mls_group_id)?.is_none() {
+        let inner = self.inner.read();
+
+        // Check if the group exists while holding the lock
+        if inner.groups_cache.peek(mls_group_id).is_none() {
             return Err(GroupError::InvalidParameters("Group not found".to_string()));
         }
 
-        let inner = self.inner.read();
         // Use tuple (GroupId, epoch) as key
         Ok(inner
             .group_exporter_secrets_cache
@@ -223,15 +226,17 @@ impl GroupStorage for MdkMemoryStorage {
         &self,
         group_exporter_secret: GroupExporterSecret,
     ) -> Result<(), GroupError> {
-        // Check if the group exists first
-        if self
-            .find_group_by_mls_group_id(&group_exporter_secret.mls_group_id)?
+        let mut inner = self.inner.write();
+
+        // Check if the group exists while holding the lock
+        if inner
+            .groups_cache
+            .peek(&group_exporter_secret.mls_group_id)
             .is_none()
         {
             return Err(GroupError::InvalidParameters("Group not found".to_string()));
         }
 
-        let mut inner = self.inner.write();
         // Use tuple (GroupId, epoch) as key
         let key = (
             group_exporter_secret.mls_group_id.clone(),
