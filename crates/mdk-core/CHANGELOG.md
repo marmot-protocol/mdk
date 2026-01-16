@@ -44,6 +44,8 @@
 
 ### Fixed
 
+- **Security**: Prevent `GroupId` leakage in `test_commit_race_simple_better_commit_wins` assertion failure messages to avoid exposing sensitive identifiers in logs.
+
 ### Removed
 
 ### Deprecated
