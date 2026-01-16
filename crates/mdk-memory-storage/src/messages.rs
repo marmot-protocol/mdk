@@ -34,9 +34,11 @@ impl MessageStorage for MdkMemoryStorage {
             }
         }
 
-        // Acquire both cache write guards to ensure coordinated eviction
-        let mut cache = self.messages_cache.write();
-        let mut group_cache = self.messages_by_group_cache.write();
+        // Acquire lock on inner storage
+        let mut guard = self.inner.write();
+        let inner = &mut *guard;
+        let cache = &mut inner.messages_cache;
+        let group_cache = &mut inner.messages_by_group_cache;
 
         match group_cache.get_mut(&message.mls_group_id) {
             Some(group_messages) => {
@@ -80,8 +82,8 @@ impl MessageStorage for MdkMemoryStorage {
         mls_group_id: &GroupId,
         event_id: &EventId,
     ) -> Result<Option<Message>, MessageError> {
-        let group_cache = self.messages_by_group_cache.read();
-        match group_cache.peek(mls_group_id) {
+        let inner = self.inner.read();
+        match inner.messages_by_group_cache.peek(mls_group_id) {
             Some(group_messages) => Ok(group_messages.get(event_id).cloned()),
             None => Ok(None),
         }
@@ -91,16 +93,18 @@ impl MessageStorage for MdkMemoryStorage {
         &self,
         event_id: &EventId,
     ) -> Result<Option<ProcessedMessage>, MessageError> {
-        let cache = self.processed_messages_cache.read();
-        Ok(cache.peek(event_id).cloned())
+        let inner = self.inner.read();
+        Ok(inner.processed_messages_cache.peek(event_id).cloned())
     }
 
     fn save_processed_message(
         &self,
         processed_message: ProcessedMessage,
     ) -> Result<(), MessageError> {
-        let mut cache = self.processed_messages_cache.write();
-        cache.put(processed_message.wrapper_event_id, processed_message);
+        let mut inner = self.inner.write();
+        inner
+            .processed_messages_cache
+            .put(processed_message.wrapper_event_id, processed_message);
 
         Ok(())
     }
@@ -195,7 +199,8 @@ mod tests {
 
         // Verify the group cache has exactly 1 message
         {
-            let cache = storage.messages_by_group_cache.read();
+            let inner = storage.inner.read();
+            let cache = &inner.messages_by_group_cache;
             let group_messages = cache.peek(&group_id).unwrap();
             assert_eq!(group_messages.len(), 1);
         }
@@ -214,7 +219,8 @@ mod tests {
 
         // Verify the group cache still has exactly 1 message (no duplicates)
         {
-            let cache = storage.messages_by_group_cache.read();
+            let inner = storage.inner.read();
+            let cache = &inner.messages_by_group_cache;
             let group_messages = cache.peek(&group_id).unwrap();
             assert_eq!(
                 group_messages.len(),
@@ -268,14 +274,16 @@ mod tests {
 
         // Verify group 1 has 3 messages
         {
-            let cache = storage.messages_by_group_cache.read();
+            let inner = storage.inner.read();
+            let cache = &inner.messages_by_group_cache;
             let group1_messages = cache.peek(&group1_id).unwrap();
             assert_eq!(group1_messages.len(), 3);
         }
 
         // Verify group 2 has 5 messages
         {
-            let cache = storage.messages_by_group_cache.read();
+            let inner = storage.inner.read();
+            let cache = &inner.messages_by_group_cache;
             let group2_messages = cache.peek(&group2_id).unwrap();
             assert_eq!(group2_messages.len(), 5);
         }
@@ -330,7 +338,8 @@ mod tests {
 
         // Verify the group cache has exactly 1 message
         {
-            let cache = storage.messages_by_group_cache.read();
+            let inner = storage.inner.read();
+            let cache = &inner.messages_by_group_cache;
             let group_messages = cache.peek(&group_id).unwrap();
             assert_eq!(
                 group_messages.len(),
@@ -378,7 +387,8 @@ mod tests {
 
         // Verify still only 1 message in the group
         {
-            let cache = storage.messages_by_group_cache.read();
+            let inner = storage.inner.read();
+            let cache = &inner.messages_by_group_cache;
             let group_messages = cache.peek(&group_id).unwrap();
             assert_eq!(group_messages.len(), 1);
         }
@@ -422,7 +432,8 @@ mod tests {
 
         // Verify all messages are stored
         {
-            let cache = storage.messages_by_group_cache.read();
+            let inner = storage.inner.read();
+            let cache = &inner.messages_by_group_cache;
             let group_messages = cache.peek(&group_id).unwrap();
             assert_eq!(group_messages.len(), DEFAULT_MAX_MESSAGES_PER_GROUP);
         }
@@ -452,7 +463,8 @@ mod tests {
 
         // Verify the count is still at MAX (eviction occurred)
         {
-            let cache = storage.messages_by_group_cache.read();
+            let inner = storage.inner.read();
+            let cache = &inner.messages_by_group_cache;
             let group_messages = cache.peek(&group_id).unwrap();
             assert_eq!(
                 group_messages.len(),
@@ -475,7 +487,8 @@ mod tests {
         // CRITICAL: The oldest message should ALSO be evicted from messages_cache
         // This verifies the coordinated eviction fix
         {
-            let cache = storage.messages_cache.read();
+            let inner = storage.inner.read();
+            let cache = &inner.messages_cache;
             assert!(
                 !cache.contains(&oldest_event_id),
                 "Oldest message should be evicted from messages_cache too (no orphaned entries)"
@@ -502,7 +515,8 @@ mod tests {
 
         // Should still have the same count (no eviction for updates)
         {
-            let cache = storage.messages_by_group_cache.read();
+            let inner = storage.inner.read();
+            let cache = &inner.messages_by_group_cache;
             let group_messages = cache.peek(&group_id).unwrap();
             assert_eq!(
                 group_messages.len(),
@@ -553,7 +567,8 @@ mod tests {
 
         // Verify all messages are stored
         {
-            let cache = storage.messages_by_group_cache.read();
+            let inner = storage.inner.read();
+            let cache = &inner.messages_by_group_cache;
             let group_messages = cache.peek(&group_id).unwrap();
             assert_eq!(group_messages.len(), custom_limit);
         }
@@ -570,7 +585,8 @@ mod tests {
 
         // Verify the count is still at custom_limit (eviction occurred)
         {
-            let cache = storage.messages_by_group_cache.read();
+            let inner = storage.inner.read();
+            let cache = &inner.messages_by_group_cache;
             let group_messages = cache.peek(&group_id).unwrap();
             assert_eq!(group_messages.len(), custom_limit);
         }
