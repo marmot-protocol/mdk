@@ -10,6 +10,7 @@
 //! 2. Lexicographically smallest event ID breaks ties
 
 use std::collections::{HashMap, VecDeque};
+use std::fmt;
 use std::sync::Mutex;
 use std::time::Instant;
 
@@ -19,7 +20,7 @@ use nostr::EventId;
 use crate::Error;
 
 /// Metadata about a snapshot taken before applying a commit
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct EpochSnapshot {
     /// The group ID
     pub group_id: GroupId,
@@ -36,17 +37,48 @@ pub struct EpochSnapshot {
     pub snapshot_name: String,
 }
 
-#[derive(Debug)]
+impl fmt::Debug for EpochSnapshot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "EpochSnapshot {{ group_id: \"[REDACTED]\", epoch: {:?}, applied_commit_id: {:?}, applied_commit_ts: {:?}, created_at: {:?}, snapshot_name: {:?} }}",
+            self.epoch,
+            self.applied_commit_id,
+            self.applied_commit_ts,
+            self.created_at,
+            self.snapshot_name
+        )
+    }
+}
+
 struct EpochSnapshotManagerInner {
     /// Snapshots per group, ordered by epoch (oldest first)
     snapshots: HashMap<GroupId, VecDeque<EpochSnapshot>>,
 }
 
+impl fmt::Debug for EpochSnapshotManagerInner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "EpochSnapshotManagerInner {{ snapshots: \"[REDACTED]\" }}"
+        )
+    }
+}
+
 /// Manages epoch snapshots for rollback support
-#[derive(Debug)]
 pub struct EpochSnapshotManager {
     inner: Mutex<EpochSnapshotManagerInner>,
     retention_count: usize,
+}
+
+impl fmt::Debug for EpochSnapshotManager {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "EpochSnapshotManager {{ inner: {:?}, retention_count: {:?} }}",
+            self.inner, self.retention_count
+        )
+    }
 }
 
 impl EpochSnapshotManager {

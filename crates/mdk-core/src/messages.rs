@@ -6528,16 +6528,31 @@ mod tests {
             .merge_pending_commit(&group_id)
             .expect("Alice should merge demote commit");
 
-        // Ensure strictly later timestamp for Bob's commit
-        std::thread::sleep(std::time::Duration::from_secs(1));
-
         // Bob (who is admin in his local state) creates a commit to add Dave
         let bob_add_result = bob_mdk
             .add_members(&group_id, &[dave_key_package])
             .expect("Bob (admin) can create add commit");
 
         // Capture the commit event
-        let bob_add_commit_event = bob_add_result.evolution_event;
+        let mut bob_add_commit_event = bob_add_result.evolution_event;
+
+        // Ensure strictly later timestamp for Bob's commit compared to Alice's
+        // This avoids sleeping and ensures deterministic ordering (Alice's commit is "better")
+        if bob_add_commit_event.created_at <= alice_demote_result.evolution_event.created_at {
+            let new_ts = alice_demote_result.evolution_event.created_at + 1;
+
+            // Re-sign event with new timestamp
+            let builder = EventBuilder::new(
+                bob_add_commit_event.kind,
+                bob_add_commit_event.content.clone(),
+            )
+            .tags(bob_add_commit_event.tags.iter().cloned())
+            .custom_created_at(new_ts);
+
+            bob_add_commit_event = builder
+                .sign_with_keys(&bob_keys)
+                .expect("Failed to re-sign Bob's event");
+        }
 
         // Charlie processes Alice's demote commit
         charlie_mdk
@@ -7152,9 +7167,17 @@ mod tests {
     // ============================================================================
 
     /// Test callback implementation for tracking rollback events
-    #[derive(Debug)]
     struct TestCallback {
         rollbacks: std::sync::Mutex<Vec<(GroupId, u64, EventId)>>,
+    }
+
+    impl std::fmt::Debug for TestCallback {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            let count = self.rollbacks.lock().map(|g| g.len()).unwrap_or(0);
+            f.debug_struct("TestCallback")
+                .field("rollback_count", &count)
+                .finish()
+        }
     }
 
     impl TestCallback {
@@ -7530,10 +7553,12 @@ mod tests {
     ///
     /// Scenario: Alice, Bob, Carol, and Dave are in a group. Bob and Carol create competing
     /// commits A and A' for the same epoch. Alice receives the worse commit A first.
-    /// Then Alice receives additional commits B and C (from Bob, advancing epochs).
     /// Finally, the better commit A' arrives late - Alice should rollback to before A.
+    ///
+    /// Note: This test covers simple A vs A' rollback. Chain rollback (A->B->C vs A')
+    /// is not covered here.
     #[test]
-    fn test_commit_race_chain_rollback() {
+    fn test_commit_race_simple_rollback() {
         let alice_keys = Keys::generate();
         let bob_keys = Keys::generate();
         let carol_keys = Keys::generate();
@@ -7815,9 +7840,28 @@ mod tests {
             .add_members(&group_id, std::slice::from_ref(&dave_key_package))
             .expect("Bob should create commit");
 
-        let carol_commit = carol_mdk
+        let mut carol_commit = carol_mdk
             .add_members(&group_id, std::slice::from_ref(&eve_key_package))
             .expect("Carol should create commit");
+
+        // Force timestamps to be equal to ensure deterministic tiebreaker testing
+        // The tiebreaker only applies when timestamps are identical.
+        if carol_commit.evolution_event.created_at != bob_commit.evolution_event.created_at {
+            let target_ts = bob_commit.evolution_event.created_at;
+
+            // Reconstruct Carol's event with Bob's timestamp
+            // We use EventBuilder to properly re-sign the event with the new timestamp
+            let builder = nostr::EventBuilder::new(
+                carol_commit.evolution_event.kind,
+                carol_commit.evolution_event.content.clone(),
+            )
+            .tags(carol_commit.evolution_event.tags.clone())
+            .custom_created_at(target_ts);
+
+            carol_commit.evolution_event = builder
+                .sign_with_keys(&carol_keys)
+                .expect("Failed to re-sign Carol's event");
+        }
 
         // Get both event IDs
         let bob_id = bob_commit.evolution_event.id.to_hex();
