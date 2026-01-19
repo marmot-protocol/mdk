@@ -1810,12 +1810,6 @@ where
             // Other states (Created, Processed, ProcessedCommit) should continue
             // to allow normal message flow (e.g., processing own messages from relay)
             if processed.state == message_types::ProcessedMessageState::Failed {
-                tracing::debug!(
-                    target: "mdk_core::messages::process_message",
-                    "Rejecting previously failed message with reason: {}",
-                    processed.failure_reason.as_deref().unwrap_or("unknown")
-                );
-
                 let mls_group_id = self.extract_group_id_from_failed_message(event);
 
                 return Ok(MessageProcessingResult::Unprocessable { mls_group_id });
