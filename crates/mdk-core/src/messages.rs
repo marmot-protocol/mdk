@@ -1758,41 +1758,29 @@ where
             // Other states (Created, Processed, ProcessedCommit) should continue
             // to allow normal message flow (e.g., processing own messages from relay)
             if processed.state == message_types::ProcessedMessageState::Failed {
-                // Log the stored failure reason internally for debugging
                 tracing::debug!(
                     target: "mdk_core::messages::process_message",
                     "Rejecting previously failed message with reason: {}",
                     processed.failure_reason.as_deref().unwrap_or("unknown")
                 );
 
-                // Extract group_id to return Unprocessable result
-                // This prevents crashes in applications that don't expect errors here
-                // Try to extract h-tag first (lightweight, no validation)
+                // Extract MLS group ID from h-tag, looking up in storage if available
                 let mls_group_id = event
                     .tags
                     .iter()
                     .find(|tag| tag.kind() == TagKind::h())
                     .and_then(|tag| tag.content())
                     .and_then(|hex_str| hex::decode(hex_str).ok())
-                    .and_then(|bytes| {
-                        let nostr_group_id: [u8; 32] = bytes.try_into().ok()?;
-                        // Look up the MLS group ID from storage
-                        // If found, use the stored MLS group ID; otherwise use Nostr group ID
-                        match self
-                            .storage()
+                    .and_then(|bytes| bytes.try_into().ok())
+                    .and_then(|nostr_group_id: [u8; 32]| {
+                        self.storage()
                             .find_group_by_nostr_group_id(&nostr_group_id)
-                        {
-                            Ok(Some(group)) => Some(group.mls_group_id),
-                            _ => Some(GroupId::from_slice(&nostr_group_id)),
-                        }
+                            .ok()
+                            .flatten()
+                            .map(|group| group.mls_group_id)
+                            .or_else(|| Some(GroupId::from_slice(&nostr_group_id)))
                     })
-                    .unwrap_or_else(|| {
-                        tracing::warn!(
-                            target: "mdk_core::messages::process_message",
-                            "Could not extract group ID from previously failed message, using zero GroupId"
-                        );
-                        GroupId::from_slice(&[0u8; 32])
-                    });
+                    .unwrap_or_else(|| GroupId::from_slice(&[0u8; 32]));
 
                 return Ok(MessageProcessingResult::Unprocessable { mls_group_id });
             }
