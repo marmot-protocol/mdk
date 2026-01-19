@@ -1720,6 +1720,39 @@ where
         }
     }
 
+    /// Extracts the MLS group ID from a previously failed message event
+    ///
+    /// This helper attempts to extract the group ID from the event's h-tag and look it up
+    /// in storage. It falls back gracefully if extraction fails.
+    ///
+    /// # Arguments
+    ///
+    /// * `event` - The event to extract the group ID from
+    ///
+    /// # Returns
+    ///
+    /// The MLS group ID, either from storage lookup or derived from the Nostr group ID,
+    /// or a zero GroupId if extraction fails completely.
+    fn extract_group_id_from_failed_message(&self, event: &Event) -> GroupId {
+        event
+            .tags
+            .iter()
+            .find(|tag| tag.kind() == TagKind::h())
+            .and_then(|tag| tag.content())
+            .filter(|hex_str| hex_str.len() == 64)
+            .and_then(|hex_str| hex::decode(hex_str).ok())
+            .and_then(|bytes| bytes.try_into().ok())
+            .and_then(|nostr_group_id: [u8; 32]| {
+                self.storage()
+                    .find_group_by_nostr_group_id(&nostr_group_id)
+                    .ok()
+                    .flatten()
+                    .map(|group| group.mls_group_id)
+                    .or_else(|| Some(GroupId::from_slice(&nostr_group_id)))
+            })
+            .unwrap_or_else(|| GroupId::from_slice(&[0u8; 32]))
+    }
+
     /// Processes an incoming encrypted Nostr event containing an MLS message
     ///
     /// This is the main entry point for processing received messages. The function orchestrates
@@ -1764,24 +1797,7 @@ where
                     processed.failure_reason.as_deref().unwrap_or("unknown")
                 );
 
-                // Extract MLS group ID from h-tag, looking up in storage if available
-                let mls_group_id = event
-                    .tags
-                    .iter()
-                    .find(|tag| tag.kind() == TagKind::h())
-                    .and_then(|tag| tag.content())
-                    .filter(|hex_str| hex_str.len() == 64)
-                    .and_then(|hex_str| hex::decode(hex_str).ok())
-                    .and_then(|bytes| bytes.try_into().ok())
-                    .and_then(|nostr_group_id: [u8; 32]| {
-                        self.storage()
-                            .find_group_by_nostr_group_id(&nostr_group_id)
-                            .ok()
-                            .flatten()
-                            .map(|group| group.mls_group_id)
-                            .or_else(|| Some(GroupId::from_slice(&nostr_group_id)))
-                    })
-                    .unwrap_or_else(|| GroupId::from_slice(&[0u8; 32]));
+                let mls_group_id = self.extract_group_id_from_failed_message(event);
 
                 return Ok(MessageProcessingResult::Unprocessable { mls_group_id });
             }
