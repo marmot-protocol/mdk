@@ -1767,21 +1767,10 @@ where
 
                 // Extract group_id to return Unprocessable result
                 // This prevents crashes in applications that don't expect errors here
-                let group_id = match self.validate_event_and_extract_group_id(event) {
-                    Ok(nostr_group_id) => GroupId::from_slice(&nostr_group_id),
-                    Err(e) => {
-                        // If we can't extract group_id from a previously failed message,
-                        // use a zero group_id as fallback to avoid crashing the app.
-                        // This is extremely rare and indicates the event was malformed
-                        // when it originally failed.
-                        tracing::warn!(
-                            target: "mdk_core::messages::process_message",
-                            "Cannot extract group_id from previously failed message: {}. Using zero group_id.",
-                            e
-                        );
-                        GroupId::from_slice(&[0u8; 32])
-                    }
-                };
+                let group_id = self
+                    .validate_event_and_extract_group_id(event)
+                    .map(|nostr_group_id| GroupId::from_slice(&nostr_group_id))
+                    .unwrap_or_else(|_| GroupId::from_slice(&[0u8; 32]));
 
                 return Ok(MessageProcessingResult::Unprocessable {
                     mls_group_id: group_id,
