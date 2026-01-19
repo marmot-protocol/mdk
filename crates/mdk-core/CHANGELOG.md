@@ -27,7 +27,7 @@
 
 ### Added
 
-- Configurable `out_of_order_tolerance` and `maximum_forward_distance` in `MdkConfig` for MLS sender ratchet settings. Default `out_of_order_tolerance` increased from 5 to 100 for better handling of out-of-order message delivery on Nostr relays.
+- Configurable `out_of_order_tolerance` and `maximum_forward_distance` in `MdkConfig` for MLS sender ratchet settings. Default `out_of_order_tolerance` increased from 5 to 100 for better handling of out-of-order message delivery on Nostr relays. ([`#155`](https://github.com/marmot-protocol/mdk/pull/155))
 
 ### Breaking changes
 

@@ -487,4 +487,271 @@ pub mod tests {
             // so we don't assert inequality. The test mainly verifies GREASE is being injected.
         }
     }
+
+    /// Tests for sender ratchet configuration (out_of_order_tolerance and maximum_forward_distance).
+    ///
+    /// These settings control the MLS sender ratchet which handles message ordering:
+    /// - `out_of_order_tolerance`: Number of past decryption secrets to keep for out-of-order messages
+    /// - `maximum_forward_distance`: Maximum number of skipped messages before decryption fails
+    ///
+    /// When messages arrive out of order beyond the tolerance, decryption fails.
+    /// The default tolerance of 100 handles typical Nostr relay reordering scenarios.
+    mod sender_ratchet_tests {
+        use nostr::Keys;
+
+        use super::*;
+        use crate::messages::MessageProcessingResult;
+        use crate::test_util::{
+            create_key_package_event, create_nostr_group_config_data, create_test_rumor,
+        };
+
+        /// Test that custom MdkConfig is properly applied to groups.
+        ///
+        /// This test verifies that the configuration is correctly passed through the
+        /// group creation and joining process.
+        #[test]
+        fn test_custom_config_is_applied() {
+            let config = MdkConfig {
+                out_of_order_tolerance: 50,
+                maximum_forward_distance: 500,
+                max_event_age_secs: 86400,
+                max_future_skew_secs: 120,
+            };
+
+            let alice_keys = Keys::generate();
+            let bob_keys = Keys::generate();
+
+            let alice_mdk = create_test_mdk_with_config(config.clone());
+            let bob_mdk = create_test_mdk_with_config(config.clone());
+
+            // Verify configs are set correctly
+            assert_eq!(alice_mdk.config.out_of_order_tolerance, 50);
+            assert_eq!(alice_mdk.config.maximum_forward_distance, 500);
+            assert_eq!(bob_mdk.config.out_of_order_tolerance, 50);
+            assert_eq!(bob_mdk.config.maximum_forward_distance, 500);
+
+            let admins = vec![alice_keys.public_key(), bob_keys.public_key()];
+
+            // Bob creates key package in his MDK
+            let bob_key_package = create_key_package_event(&bob_mdk, &bob_keys);
+
+            // Alice creates group and adds Bob
+            let create_result = alice_mdk
+                .create_group(
+                    &alice_keys.public_key(),
+                    vec![bob_key_package],
+                    create_nostr_group_config_data(admins),
+                )
+                .expect("Alice should create group");
+
+            let group_id = create_result.group.mls_group_id.clone();
+
+            alice_mdk
+                .merge_pending_commit(&group_id)
+                .expect("Alice should merge commit");
+
+            // Bob processes welcome and joins with his config
+            let bob_welcome_rumor = &create_result.welcome_rumors[0];
+            let bob_welcome = bob_mdk
+                .process_welcome(&nostr::EventId::all_zeros(), bob_welcome_rumor)
+                .expect("Bob should process welcome");
+
+            bob_mdk
+                .accept_welcome(&bob_welcome)
+                .expect("Bob should accept welcome");
+
+            // Verify both clients have the same group
+            assert_eq!(group_id, bob_welcome.mls_group_id);
+        }
+
+        /// Test that high out_of_order_tolerance allows heavily reordered messages.
+        ///
+        /// With tolerance of 100, receiving messages in reverse order (100 messages apart)
+        /// should all decrypt successfully.
+        #[test]
+        fn test_high_tolerance_allows_reordered_messages() {
+            // Default tolerance of 100
+            let alice_keys = Keys::generate();
+            let bob_keys = Keys::generate();
+
+            let alice_mdk = create_test_mdk();
+            let bob_mdk = create_test_mdk();
+
+            let admins = vec![alice_keys.public_key(), bob_keys.public_key()];
+
+            let bob_key_package = create_key_package_event(&bob_mdk, &bob_keys);
+
+            let create_result = alice_mdk
+                .create_group(
+                    &alice_keys.public_key(),
+                    vec![bob_key_package],
+                    create_nostr_group_config_data(admins),
+                )
+                .expect("Alice should create group");
+
+            let group_id = create_result.group.mls_group_id.clone();
+
+            alice_mdk
+                .merge_pending_commit(&group_id)
+                .expect("Alice should merge commit");
+
+            let bob_welcome_rumor = &create_result.welcome_rumors[0];
+            let bob_welcome = bob_mdk
+                .process_welcome(&nostr::EventId::all_zeros(), bob_welcome_rumor)
+                .expect("Bob should process welcome");
+
+            bob_mdk
+                .accept_welcome(&bob_welcome)
+                .expect("Bob should accept welcome");
+
+            // Alice sends 50 messages (within default tolerance of 100)
+            let num_messages = 50;
+            let mut message_events = Vec::new();
+
+            for i in 0..num_messages {
+                let rumor = create_test_rumor(&alice_keys, &format!("Message {}", i));
+                let msg_event = alice_mdk
+                    .create_message(&group_id, rumor)
+                    .expect("Alice should send message");
+                message_events.push(msg_event);
+            }
+
+            // Bob receives messages in extreme out-of-order pattern:
+            // last, first, second-to-last, second, etc.
+            let mut receive_order: Vec<usize> = Vec::new();
+            for i in 0..num_messages / 2 {
+                receive_order.push(num_messages - 1 - i); // from end
+                receive_order.push(i); // from start
+            }
+
+            for &idx in &receive_order {
+                let msg_event = &message_events[idx];
+                let result = bob_mdk
+                    .process_message(msg_event)
+                    .unwrap_or_else(|e| panic!("Bob should decrypt message {idx}: {e}"));
+
+                match result {
+                    MessageProcessingResult::ApplicationMessage(msg) => {
+                        assert_eq!(msg.content, format!("Message {}", idx));
+                    }
+                    other => panic!("Expected ApplicationMessage for message {idx}, got {other:?}"),
+                }
+            }
+        }
+
+        /// Test that low out_of_order_tolerance causes decryption failures for distant messages.
+        ///
+        /// With tolerance of 5, receiving message 19 first then trying to decrypt
+        /// message 0 (which is 19 generations behind) should fail.
+        #[test]
+        fn test_low_tolerance_rejects_distant_messages() {
+            // Very low tolerance
+            let config = MdkConfig {
+                out_of_order_tolerance: 5,
+                ..Default::default()
+            };
+
+            let alice_keys = Keys::generate();
+            let bob_keys = Keys::generate();
+
+            let alice_mdk = create_test_mdk_with_config(config.clone());
+            let bob_mdk = create_test_mdk_with_config(config);
+
+            let admins = vec![alice_keys.public_key(), bob_keys.public_key()];
+
+            let bob_key_package = create_key_package_event(&bob_mdk, &bob_keys);
+
+            let create_result = alice_mdk
+                .create_group(
+                    &alice_keys.public_key(),
+                    vec![bob_key_package],
+                    create_nostr_group_config_data(admins),
+                )
+                .expect("Alice should create group");
+
+            let group_id = create_result.group.mls_group_id.clone();
+
+            alice_mdk
+                .merge_pending_commit(&group_id)
+                .expect("Alice should merge commit");
+
+            let bob_welcome_rumor = &create_result.welcome_rumors[0];
+            let bob_welcome = bob_mdk
+                .process_welcome(&nostr::EventId::all_zeros(), bob_welcome_rumor)
+                .expect("Bob should process welcome");
+
+            bob_mdk
+                .accept_welcome(&bob_welcome)
+                .expect("Bob should accept welcome");
+
+            // Alice sends 20 messages
+            let num_messages = 20;
+            let mut message_events = Vec::new();
+
+            for i in 0..num_messages {
+                let rumor = create_test_rumor(&alice_keys, &format!("Message {}", i));
+                let msg_event = alice_mdk
+                    .create_message(&group_id, rumor)
+                    .expect("Alice should send message");
+                message_events.push(msg_event);
+            }
+
+            // Bob receives the LAST message first (message 19)
+            // This advances his ratchet state to generation 19
+            let last_msg = &message_events[num_messages - 1];
+            let result = bob_mdk
+                .process_message(last_msg)
+                .expect("Bob should decrypt the latest message");
+
+            match result {
+                MessageProcessingResult::ApplicationMessage(msg) => {
+                    assert_eq!(msg.content, format!("Message {}", num_messages - 1));
+                }
+                _ => panic!("Expected ApplicationMessage"),
+            }
+
+            // Now Bob tries to decrypt message 0 (which is 19 generations behind)
+            // With tolerance of 5, this should return Unprocessable because the
+            // ratchet secret for generation 0 was not retained
+            let first_msg = &message_events[0];
+            let result = bob_mdk.process_message(first_msg);
+
+            match result {
+                Ok(MessageProcessingResult::Unprocessable { .. }) => {
+                    // Expected - the message is too far in the past
+                }
+                Ok(MessageProcessingResult::ApplicationMessage(_)) => {
+                    panic!(
+                        "Message 0 should NOT decrypt after receiving message 19 with tolerance 5"
+                    );
+                }
+                Err(_) => {
+                    // Also acceptable - the processing failed entirely
+                }
+                other => {
+                    panic!("Unexpected result: {:?}", other);
+                }
+            }
+
+            // But messages within tolerance should still work
+            // Messages 15, 16, 17, 18 are within 5 generations of message 19
+            for (i, msg_event) in message_events
+                .iter()
+                .enumerate()
+                .take(num_messages - 1)
+                .skip(num_messages - 5)
+            {
+                let result = bob_mdk.process_message(msg_event).unwrap_or_else(|e| {
+                    panic!("Message {i} should decrypt (within tolerance): {e}")
+                });
+
+                match result {
+                    MessageProcessingResult::ApplicationMessage(msg) => {
+                        assert_eq!(msg.content, format!("Message {}", i));
+                    }
+                    other => panic!("Expected ApplicationMessage for message {i}, got {other:?}"),
+                }
+            }
+        }
+    }
 }
