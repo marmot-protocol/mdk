@@ -1770,6 +1770,7 @@ where
                     .iter()
                     .find(|tag| tag.kind() == TagKind::h())
                     .and_then(|tag| tag.content())
+                    .filter(|hex_str| hex_str.len() == 64)
                     .and_then(|hex_str| hex::decode(hex_str).ok())
                     .and_then(|bytes| bytes.try_into().ok())
                     .and_then(|nostr_group_id: [u8; 32]| {
@@ -5997,6 +5998,59 @@ mod tests {
                     mls_group_id.as_slice(),
                     &group_id_bytes,
                     "Should extract correct group_id from event, not use zero fallback"
+                );
+            }
+            other => panic!("Expected Unprocessable, got: {:?}", other),
+        }
+    }
+
+    /// Test that previously failed message with oversized hex in h-tag uses zero fallback
+    ///
+    /// This test verifies that when a previously failed message has an oversized hex string
+    /// in the h-tag (potential DoS vector), the size check prevents decoding and falls back
+    /// to zero GroupId.
+    #[test]
+    fn test_previously_failed_message_with_oversized_hex() {
+        let mdk = create_test_mdk();
+        let keys = Keys::generate();
+
+        // Create an oversized hex string (128 chars instead of 64)
+        let oversized_hex = "a".repeat(128);
+        let tag = Tag::custom(TagKind::h(), [oversized_hex]);
+        let event = EventBuilder::new(Kind::MlsGroupMessage, "invalid_content")
+            .tag(tag)
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        // First attempt - will fail
+        let result1 = mdk.process_message(&event);
+        assert!(result1.is_err(), "First attempt should fail");
+
+        // Verify failed state was persisted
+        let processed = mdk
+            .storage()
+            .find_processed_message_by_event_id(&event.id)
+            .unwrap()
+            .expect("Failed record should exist");
+        assert_eq!(
+            processed.state,
+            message_types::ProcessedMessageState::Failed
+        );
+
+        // Second attempt - should return Unprocessable with zero fallback
+        let result2 = mdk.process_message(&event);
+        assert!(
+            result2.is_ok(),
+            "Second attempt should return Ok(Unprocessable)"
+        );
+
+        match result2.unwrap() {
+            MessageProcessingResult::Unprocessable { mls_group_id } => {
+                // Verify it used zero fallback due to oversized hex
+                assert_eq!(
+                    mls_group_id.as_slice(),
+                    &[0u8; 32],
+                    "Should use zero fallback for oversized hex"
                 );
             }
             other => panic!("Expected Unprocessable, got: {:?}", other),
