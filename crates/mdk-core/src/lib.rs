@@ -54,7 +54,8 @@ pub use mdk_storage_traits::GroupId;
 ///
 /// // Custom configuration
 /// let config = MdkConfig {
-///     max_event_age_secs: 86400, // 1 day instead of 45
+///     max_event_age_secs: 86400,  // 1 day instead of 45
+///     out_of_order_tolerance: 50, // Stricter forward secrecy
 ///     ..Default::default()
 /// };
 /// ```
@@ -84,13 +85,44 @@ pub struct MdkConfig {
     ///
     /// Default: 300 (5 minutes)
     pub max_future_skew_secs: u64,
+
+    /// Number of past message decryption secrets to retain for out-of-order delivery.
+    ///
+    /// This controls how many past decryption secrets are kept to handle messages
+    /// that arrive out of order. Nostr relays do not guarantee message ordering,
+    /// so a higher value improves reliability when messages are reordered.
+    ///
+    /// Default: 100
+    ///
+    /// # Security Note
+    /// Higher values reduce forward secrecy within an epoch, as more past secrets
+    /// are retained in memory. The default of 100 balances reliability with security
+    /// for typical Nostr relay behavior. Applications with stricter forward secrecy
+    /// requirements may reduce this value.
+    pub out_of_order_tolerance: u32,
+
+    /// Maximum number of messages that can be skipped before decryption fails.
+    ///
+    /// This controls how far ahead the sender ratchet can advance when messages
+    /// are dropped or lost. If more than this many messages are skipped,
+    /// decryption will fail.
+    ///
+    /// Default: 1000
+    ///
+    /// # Security Note
+    /// Higher values improve tolerance for dropped messages but require more
+    /// computation to advance the ratchet when catching up. The default of 1000
+    /// handles most message loss scenarios while keeping catch-up costs reasonable.
+    pub maximum_forward_distance: u32,
 }
 
 impl Default for MdkConfig {
     fn default() -> Self {
         Self {
-            max_event_age_secs: 3888000, // 45 days
-            max_future_skew_secs: 300,   // 5 minutes
+            max_event_age_secs: 3888000,    // 45 days
+            max_future_skew_secs: 300,      // 5 minutes
+            out_of_order_tolerance: 100,    // 100 past messages
+            maximum_forward_distance: 1000, // 1000 forward messages
         }
     }
 }

@@ -11,7 +11,7 @@ use std::str::FromStr;
 use std::sync::Mutex;
 
 use mdk_core::{
-    Error as MdkError, MDK,
+    Error as MdkError, MDK, MdkConfig as CoreMdkConfig,
     extension::group_image::{
         decrypt_group_image as core_decrypt_group_image,
         derive_upload_keypair as core_derive_upload_keypair,
@@ -35,6 +35,51 @@ uniffi::setup_scaffolding!();
 #[derive(uniffi::Object)]
 pub struct Mdk {
     mdk: Mutex<MDK<MdkSqliteStorage>>,
+}
+
+/// Configuration for MDK behavior
+///
+/// This struct allows customization of various MDK parameters including
+/// message validation and MLS sender ratchet settings. All fields are optional
+/// and default to sensible values when not provided.
+#[derive(uniffi::Record)]
+pub struct MdkConfig {
+    /// Maximum age for accepted events in seconds.
+    /// Default: 3888000 (45 days)
+    pub max_event_age_secs: Option<u64>,
+
+    /// Maximum future timestamp skew allowed in seconds.
+    /// Default: 300 (5 minutes)
+    pub max_future_skew_secs: Option<u64>,
+
+    /// Number of past message decryption secrets to retain for out-of-order delivery.
+    /// Higher values improve tolerance for reordered messages but reduce forward secrecy.
+    /// Default: 100
+    pub out_of_order_tolerance: Option<u32>,
+
+    /// Maximum number of messages that can be skipped before decryption fails.
+    /// Default: 1000
+    pub maximum_forward_distance: Option<u32>,
+}
+
+impl From<MdkConfig> for CoreMdkConfig {
+    fn from(config: MdkConfig) -> Self {
+        let defaults = CoreMdkConfig::default();
+        Self {
+            max_event_age_secs: config
+                .max_event_age_secs
+                .unwrap_or(defaults.max_event_age_secs),
+            max_future_skew_secs: config
+                .max_future_skew_secs
+                .unwrap_or(defaults.max_future_skew_secs),
+            out_of_order_tolerance: config
+                .out_of_order_tolerance
+                .unwrap_or(defaults.out_of_order_tolerance),
+            maximum_forward_distance: config
+                .maximum_forward_distance
+                .unwrap_or(defaults.maximum_forward_distance),
+        }
+    }
 }
 
 /// Error type for MDK UniFFI operations
@@ -207,6 +252,7 @@ impl Mdk {
 /// * `db_path` - Path to the SQLite database file
 /// * `service_id` - A stable, host-defined application identifier (e.g., "com.example.myapp")
 /// * `db_key_id` - A stable identifier for this database's key (e.g., "mdk.db.key.default")
+/// * `config` - Optional MDK configuration. If None, uses default configuration.
 ///
 /// # Errors
 ///
@@ -219,9 +265,13 @@ pub fn new_mdk(
     db_path: String,
     service_id: String,
     db_key_id: String,
+    config: Option<MdkConfig>,
 ) -> Result<Mdk, MdkUniffiError> {
     let storage = MdkSqliteStorage::new(PathBuf::from(db_path), &service_id, &db_key_id)?;
-    let mdk = MDK::new(storage);
+    let mdk = match config {
+        Some(c) => MDK::builder(storage).with_config(c.into()).build(),
+        None => MDK::new(storage),
+    };
     Ok(Mdk {
         mdk: Mutex::new(mdk),
     })
@@ -237,16 +287,24 @@ pub fn new_mdk(
 ///
 /// * `db_path` - Path to the SQLite database file
 /// * `encryption_key` - 32-byte encryption key (must be exactly 32 bytes)
+/// * `config` - Optional MDK configuration. If None, uses default configuration.
 ///
 /// # Errors
 ///
 /// Returns an error if the key is not 32 bytes or if the database cannot be opened.
 #[uniffi::export]
-pub fn new_mdk_with_key(db_path: String, encryption_key: Vec<u8>) -> Result<Mdk, MdkUniffiError> {
-    let config = EncryptionConfig::from_slice(&encryption_key)
+pub fn new_mdk_with_key(
+    db_path: String,
+    encryption_key: Vec<u8>,
+    config: Option<MdkConfig>,
+) -> Result<Mdk, MdkUniffiError> {
+    let encryption_config = EncryptionConfig::from_slice(&encryption_key)
         .map_err(|e| MdkUniffiError::InvalidInput(format!("Invalid encryption key: {}", e)))?;
-    let storage = MdkSqliteStorage::new_with_key(PathBuf::from(db_path), config)?;
-    let mdk = MDK::new(storage);
+    let storage = MdkSqliteStorage::new_with_key(PathBuf::from(db_path), encryption_config)?;
+    let mdk = match config {
+        Some(c) => MDK::builder(storage).with_config(c.into()).build(),
+        None => MDK::new(storage),
+    };
     Ok(Mdk {
         mdk: Mutex::new(mdk),
     })
@@ -259,10 +317,21 @@ pub fn new_mdk_with_key(db_path: String, encryption_key: Vec<u8>) -> Result<Mdk,
 ///
 /// Only use this for development or testing. For production use, use `new_mdk`
 /// with an encryption key.
+///
+/// # Arguments
+///
+/// * `db_path` - Path to the SQLite database file
+/// * `config` - Optional MDK configuration. If None, uses default configuration.
 #[uniffi::export]
-pub fn new_mdk_unencrypted(db_path: String) -> Result<Mdk, MdkUniffiError> {
+pub fn new_mdk_unencrypted(
+    db_path: String,
+    config: Option<MdkConfig>,
+) -> Result<Mdk, MdkUniffiError> {
     let storage = MdkSqliteStorage::new_unencrypted(PathBuf::from(db_path))?;
-    let mdk = MDK::new(storage);
+    let mdk = match config {
+        Some(c) => MDK::builder(storage).with_config(c.into()).build(),
+        None => MDK::new(storage),
+    };
     Ok(Mdk {
         mdk: Mutex::new(mdk),
     })
@@ -1231,7 +1300,7 @@ mod tests {
     use tempfile::TempDir;
 
     fn create_test_mdk() -> Mdk {
-        new_mdk_unencrypted(":memory:".to_string()).unwrap()
+        new_mdk_unencrypted(":memory:".to_string(), None).unwrap()
     }
 
     #[test]
@@ -1241,7 +1310,7 @@ mod tests {
 
         // Test encrypted constructor with direct key
         let key = vec![0u8; 32];
-        let result = new_mdk_with_key(db_path.to_string_lossy().to_string(), key);
+        let result = new_mdk_with_key(db_path.to_string_lossy().to_string(), key, None);
         assert!(result.is_ok());
         let mdk = result.unwrap();
         // Should be able to get groups (empty initially)
@@ -1256,7 +1325,7 @@ mod tests {
 
         // Test with wrong key length
         let short_key = vec![0u8; 16];
-        let result = new_mdk_with_key(db_path.to_string_lossy().to_string(), short_key);
+        let result = new_mdk_with_key(db_path.to_string_lossy().to_string(), short_key, None);
         assert!(result.is_err());
 
         match result {
@@ -1271,12 +1340,69 @@ mod tests {
     fn test_new_mdk_unencrypted_creates_instance() {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("test_unencrypted.db");
-        let result = new_mdk_unencrypted(db_path.to_string_lossy().to_string());
+        let result = new_mdk_unencrypted(db_path.to_string_lossy().to_string(), None);
         assert!(result.is_ok());
         let mdk = result.unwrap();
         // Should be able to get groups (empty initially)
         let groups = mdk.get_groups().unwrap();
         assert_eq!(groups.len(), 0);
+    }
+
+    #[test]
+    fn test_new_mdk_with_custom_config() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test_custom_config.db");
+
+        // Test with all fields specified
+        let config = MdkConfig {
+            max_event_age_secs: Some(86400),     // 1 day
+            max_future_skew_secs: Some(60),      // 1 minute
+            out_of_order_tolerance: Some(50),    // 50 past messages
+            maximum_forward_distance: Some(500), // 500 forward messages
+        };
+
+        let result = new_mdk_unencrypted(db_path.to_string_lossy().to_string(), Some(config));
+        assert!(result.is_ok());
+        let mdk = result.unwrap();
+        let groups = mdk.get_groups().unwrap();
+        assert_eq!(groups.len(), 0);
+    }
+
+    #[test]
+    fn test_new_mdk_with_partial_config() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test_partial_config.db");
+
+        // Test with only some fields specified - others should use defaults
+        let config = MdkConfig {
+            max_event_age_secs: None,
+            max_future_skew_secs: None,
+            out_of_order_tolerance: Some(200), // Only override this one
+            maximum_forward_distance: None,
+        };
+
+        let result = new_mdk_unencrypted(db_path.to_string_lossy().to_string(), Some(config));
+        assert!(result.is_ok());
+        let mdk = result.unwrap();
+        let groups = mdk.get_groups().unwrap();
+        assert_eq!(groups.len(), 0);
+    }
+
+    #[test]
+    fn test_mdk_config_defaults() {
+        // Verify that the From implementation uses correct defaults
+        let config = MdkConfig {
+            max_event_age_secs: None,
+            max_future_skew_secs: None,
+            out_of_order_tolerance: None,
+            maximum_forward_distance: None,
+        };
+
+        let core_config: CoreMdkConfig = config.into();
+        assert_eq!(core_config.max_event_age_secs, 3888000);
+        assert_eq!(core_config.max_future_skew_secs, 300);
+        assert_eq!(core_config.out_of_order_tolerance, 100);
+        assert_eq!(core_config.maximum_forward_distance, 1000);
     }
 
     #[test]

@@ -988,11 +988,16 @@ where
 
         // Build the group config
         let capabilities = self.capabilities();
+        let sender_ratchet_config = SenderRatchetConfiguration::new(
+            self.config.out_of_order_tolerance,
+            self.config.maximum_forward_distance,
+        );
         let group_config = MlsGroupCreateConfig::builder()
             .ciphersuite(self.ciphersuite)
             .use_ratchet_tree_extension(true)
             .capabilities(capabilities)
             .with_group_context_extensions(extensions)?
+            .sender_ratchet_configuration(sender_ratchet_config)
             .build();
 
         let mut mls_group =

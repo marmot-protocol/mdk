@@ -25,6 +25,10 @@
 
 ## Unreleased
 
+### Added
+
+- Configurable `out_of_order_tolerance` and `maximum_forward_distance` in `MdkConfig` for MLS sender ratchet settings. Default `out_of_order_tolerance` increased from 5 to 100 for better handling of out-of-order message delivery on Nostr relays.
+
 ### Breaking changes
 
 - **Unified Storage Architecture**: `MdkProvider` now uses the storage provider directly as the OpenMLS `StorageProvider`, instead of accessing it via `openmls_storage()`. This enables atomic transactions across MLS and MDK state for proper commit race resolution per MIP-03. Storage implementations must now directly implement `StorageProvider<1>`. ([#148](https://github.com/marmot-protocol/mdk/pull/148))
