@@ -5950,6 +5950,62 @@ mod tests {
         );
     }
 
+    /// Test that previously failed message with valid group_id returns Unprocessable with correct group_id
+    ///
+    /// This test verifies that when a previously failed message has a valid group_id tag,
+    /// the Unprocessable result contains the correct group_id (not the zero fallback).
+    #[test]
+    fn test_previously_failed_message_with_valid_group_id() {
+        let mdk = create_test_mdk();
+        let keys = Keys::generate();
+
+        // Create a valid group_id
+        let group_id_bytes = [42u8; 32];
+        let group_id_hex = hex::encode(group_id_bytes);
+
+        // Create an event with valid group_id tag but invalid content
+        let tag = Tag::custom(TagKind::h(), [group_id_hex.clone()]);
+        let event = EventBuilder::new(Kind::MlsGroupMessage, "invalid_encrypted_content")
+            .tag(tag)
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        // First attempt - will fail (group doesn't exist)
+        let result1 = mdk.process_message(&event);
+        assert!(result1.is_err(), "First attempt should fail");
+
+        // Verify failed state was persisted
+        let processed = mdk
+            .storage()
+            .find_processed_message_by_event_id(&event.id)
+            .unwrap()
+            .expect("Failed record should exist");
+        assert_eq!(
+            processed.state,
+            message_types::ProcessedMessageState::Failed,
+            "State should be Failed"
+        );
+
+        // Second attempt - should return Unprocessable with the correct group_id
+        let result2 = mdk.process_message(&event);
+        assert!(
+            result2.is_ok(),
+            "Second attempt should return Ok(Unprocessable)"
+        );
+
+        match result2.unwrap() {
+            MessageProcessingResult::Unprocessable { mls_group_id } => {
+                // Verify it extracted the correct group_id (not zero fallback)
+                assert_eq!(
+                    mls_group_id.as_slice(),
+                    &group_id_bytes,
+                    "Should extract correct group_id from event, not use zero fallback"
+                );
+            }
+            other => panic!("Expected Unprocessable, got: {:?}", other),
+        }
+    }
+
     /// Test that missing group ID tag persists failed state
     ///
     /// This test verifies that validation failures for missing required tags
