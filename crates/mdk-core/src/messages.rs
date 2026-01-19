@@ -1765,10 +1765,27 @@ where
                     processed.failure_reason.as_deref().unwrap_or("unknown")
                 );
 
-                // Return generic error to avoid leaking internal details
-                return Err(Error::Message(
-                    "Message processing previously failed".to_string(),
-                ));
+                // Extract group_id to return Unprocessable result
+                // This prevents crashes in applications that don't expect errors here
+                let group_id = match self.validate_event_and_extract_group_id(event) {
+                    Ok(nostr_group_id) => GroupId::from_slice(&nostr_group_id),
+                    Err(e) => {
+                        // If we can't extract group_id from a previously failed message,
+                        // use a zero group_id as fallback to avoid crashing the app.
+                        // This is extremely rare and indicates the event was malformed
+                        // when it originally failed.
+                        tracing::warn!(
+                            target: "mdk_core::messages::process_message",
+                            "Cannot extract group_id from previously failed message: {}. Using zero group_id.",
+                            e
+                        );
+                        GroupId::from_slice(&[0u8; 32])
+                    }
+                };
+
+                return Ok(MessageProcessingResult::Unprocessable {
+                    mls_group_id: group_id,
+                });
             }
         }
 
@@ -5811,12 +5828,16 @@ mod tests {
     ///
     /// This test verifies the deduplication mechanism prevents reprocessing
     /// of previously failed events, mitigating DoS attacks.
+    ///
+    /// With the crash fix, even malformed events that can't provide a group_id
+    /// will return Unprocessable (with a zero group_id fallback) instead of
+    /// throwing an error, preventing app crashes.
     #[test]
     fn test_repeated_validation_failure_rejected_immediately() {
         let mdk = create_test_mdk();
         let keys = Keys::generate();
 
-        // Create an event with wrong kind
+        // Create an event with wrong kind (no group_id tag)
         let event = EventBuilder::new(Kind::Metadata, "")
             .sign_with_keys(&keys)
             .unwrap();
@@ -5826,15 +5847,25 @@ mod tests {
         assert!(result1.is_err(), "First attempt should fail validation");
 
         // Second attempt - should be rejected immediately via deduplication
+        // With the crash fix, this now returns Unprocessable (with zero group_id fallback)
+        // instead of throwing an error, preventing app crashes
         let result2 = mdk.process_message(&event);
-        assert!(result2.is_err(), "Second attempt should also fail");
         assert!(
-            result2
-                .unwrap_err()
-                .to_string()
-                .contains("Message processing previously failed"),
-            "Error should indicate previous failure"
+            result2.is_ok(),
+            "Second attempt should return Unprocessable, not error"
         );
+
+        match result2.unwrap() {
+            MessageProcessingResult::Unprocessable { mls_group_id } => {
+                // Verify it's using the zero group_id fallback for malformed events
+                assert_eq!(
+                    mls_group_id.as_slice(),
+                    &[0u8; 32],
+                    "Should use zero group_id fallback for malformed events"
+                );
+            }
+            other => panic!("Expected Unprocessable, got: {:?}", other),
+        }
     }
 
     /// Test that decryption failures persist failed processing state
@@ -5904,14 +5935,18 @@ mod tests {
         assert!(result1.is_err(), "First attempt should fail decryption");
 
         // Second attempt - should be rejected immediately via deduplication
+        // After fix: Returns Ok(Unprocessable) instead of Err
         let result2 = mdk.process_message(&event);
-        assert!(result2.is_err(), "Second attempt should also fail");
         assert!(
-            result2
-                .unwrap_err()
-                .to_string()
-                .contains("Message processing previously failed"),
-            "Error should indicate previous failure"
+            result2.is_ok(),
+            "Second attempt should return Ok(Unprocessable)"
+        );
+        assert!(
+            matches!(
+                result2.unwrap(),
+                MessageProcessingResult::Unprocessable { .. }
+            ),
+            "Should return Unprocessable for previously failed message"
         );
     }
 
@@ -6978,6 +7013,61 @@ mod tests {
             bob_mdk
                 .merge_pending_commit(&group_id)
                 .unwrap_or_else(|e| panic!("Bob should merge self-update {}: {:?}", i + 1, e));
+        }
+    }
+
+    #[test]
+    fn test_previously_failed_message_returns_unprocessable_not_error() {
+        // Setup: Create MDK and a test group
+        let mdk = create_test_mdk();
+        let (creator, members, admins) = create_test_group_members();
+        let group_id = create_test_group(&mdk, &creator, &members, &admins);
+
+        // Create a test message event
+        let rumor = create_test_rumor(&creator, "Test message");
+        let event = mdk
+            .create_message(&group_id, rumor)
+            .expect("Failed to create message");
+
+        // Manually mark the message as failed in storage
+        // This simulates a message that previously failed processing
+        let processed_message = message_types::ProcessedMessage {
+            wrapper_event_id: event.id,
+            message_event_id: None,
+            processed_at: Timestamp::now(),
+            state: message_types::ProcessedMessageState::Failed,
+            failure_reason: Some("Simulated failure for test".to_string()),
+        };
+
+        mdk.storage()
+            .save_processed_message(processed_message)
+            .expect("Failed to save processed message");
+
+        // Try to process the message again
+        // Before the fix: This would return Err() and crash apps
+        // After the fix: This should return Ok(Unprocessable)
+        let result = mdk.process_message(&event);
+
+        // Assert: Should return Ok with Unprocessable, not Err
+        assert!(
+            result.is_ok(),
+            "Should not throw error for previously failed message, got error: {:?}",
+            result.as_ref().err()
+        );
+
+        // Verify it returns Unprocessable variant
+        match result.unwrap() {
+            MessageProcessingResult::Unprocessable { mls_group_id } => {
+                // Just verify we got a valid group_id (not empty)
+                assert!(
+                    !mls_group_id.as_slice().is_empty(),
+                    "Should return a non-empty group ID"
+                );
+            }
+            other => panic!(
+                "Expected MessageProcessingResult::Unprocessable, got: {:?}",
+                other
+            ),
         }
     }
 }
