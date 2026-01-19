@@ -1767,14 +1767,34 @@ where
 
                 // Extract group_id to return Unprocessable result
                 // This prevents crashes in applications that don't expect errors here
-                let group_id = self
-                    .validate_event_and_extract_group_id(event)
-                    .map(|nostr_group_id| GroupId::from_slice(&nostr_group_id))
-                    .unwrap_or_else(|_| GroupId::from_slice(&[0u8; 32]));
+                // Try to extract h-tag first (lightweight, no validation)
+                let mls_group_id = event
+                    .tags
+                    .iter()
+                    .find(|tag| tag.kind() == TagKind::h())
+                    .and_then(|tag| tag.content())
+                    .and_then(|hex_str| hex::decode(hex_str).ok())
+                    .and_then(|bytes| {
+                        let nostr_group_id: [u8; 32] = bytes.try_into().ok()?;
+                        // Look up the MLS group ID from storage
+                        // If found, use the stored MLS group ID; otherwise use Nostr group ID
+                        match self
+                            .storage()
+                            .find_group_by_nostr_group_id(&nostr_group_id)
+                        {
+                            Ok(Some(group)) => Some(group.mls_group_id),
+                            _ => Some(GroupId::from_slice(&nostr_group_id)),
+                        }
+                    })
+                    .unwrap_or_else(|| {
+                        tracing::warn!(
+                            target: "mdk_core::messages::process_message",
+                            "Could not extract group ID from previously failed message, using zero GroupId"
+                        );
+                        GroupId::from_slice(&[0u8; 32])
+                    });
 
-                return Ok(MessageProcessingResult::Unprocessable {
-                    mls_group_id: group_id,
-                });
+                return Ok(MessageProcessingResult::Unprocessable { mls_group_id });
             }
         }
 
