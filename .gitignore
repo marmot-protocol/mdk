@@ -13,8 +13,14 @@ coverage/
 # Editor specific files
 .vscode/
 
-# Claude AI settings (local overrides)
-.claude/settings.local.json
+# AI Agent files and directories
+.claude/
+.cursor/
+.opencode/
+.aider/
+.cody/
+.continue/
+.github-copilot/
 
 # Android build artifacts
 **/jniLibs/
@@ -22,3 +28,4 @@ coverage/
 # Git worktrees
 /trees/*
 !/trees/.gitkeep
+
