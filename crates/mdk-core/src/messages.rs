@@ -6086,6 +6086,58 @@ mod tests {
         }
     }
 
+    /// Test that previously failed message with undersized hex in h-tag uses zero fallback
+    ///
+    /// This test verifies that when a previously failed message has an undersized hex string
+    /// in the h-tag, the size check prevents decoding and falls back to zero GroupId.
+    #[test]
+    fn test_previously_failed_message_with_undersized_hex() {
+        let mdk = create_test_mdk();
+        let keys = Keys::generate();
+
+        // Create an undersized hex string (32 chars instead of 64)
+        let undersized_hex = "a".repeat(32);
+        let tag = Tag::custom(TagKind::h(), [undersized_hex]);
+        let event = EventBuilder::new(Kind::MlsGroupMessage, "invalid_content")
+            .tag(tag)
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        // First attempt - will fail
+        let result1 = mdk.process_message(&event);
+        assert!(result1.is_err(), "First attempt should fail");
+
+        // Verify failed state was persisted
+        let processed = mdk
+            .storage()
+            .find_processed_message_by_event_id(&event.id)
+            .unwrap()
+            .expect("Failed record should exist");
+        assert_eq!(
+            processed.state,
+            message_types::ProcessedMessageState::Failed
+        );
+
+        // Second attempt - should return Unprocessable with zero fallback
+        let result2 = mdk.process_message(&event);
+        assert!(
+            result2.is_ok(),
+            "Second attempt should return Ok(Unprocessable)"
+        );
+
+        match result2.unwrap() {
+            MessageProcessingResult::Unprocessable { mls_group_id } => {
+                // Verify it used zero fallback due to undersized hex
+                assert_eq!(
+                    mls_group_id.as_slice(),
+                    &[0u8; 32],
+                    "Should use zero fallback for undersized hex"
+                );
+            }
+            other => panic!("Expected Unprocessable, got: {}", other.variant_name()),
+        }
+    }
+
     /// Test that previously failed message with group in storage returns correct MLS group ID
     ///
     /// This test verifies that when a group exists in storage, the code looks up and returns
