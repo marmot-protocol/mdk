@@ -81,25 +81,6 @@ pub enum MessageProcessingResult {
     },
 }
 
-impl MessageProcessingResult {
-    /// Returns the variant name without exposing sensitive data
-    ///
-    /// This method is used in test assertions to avoid leaking GroupId or other
-    /// sensitive information in panic messages.
-    #[cfg(test)]
-    fn variant_name(&self) -> &'static str {
-        match self {
-            Self::ApplicationMessage(_) => "ApplicationMessage",
-            Self::Proposal(_) => "Proposal",
-            Self::PendingProposal { .. } => "PendingProposal",
-            Self::IgnoredProposal { .. } => "IgnoredProposal",
-            Self::ExternalJoinProposal { .. } => "ExternalJoinProposal",
-            Self::Commit { .. } => "Commit",
-            Self::Unprocessable { .. } => "Unprocessable",
-        }
-    }
-}
-
 impl<Storage> MDK<Storage>
 where
     Storage: MdkStorageProvider,
@@ -5891,7 +5872,7 @@ mod tests {
                     "Should use zero group_id fallback for malformed events"
                 );
             }
-            other => panic!("Expected Unprocessable, got: {}", other.variant_name()),
+            other => panic!("Expected Unprocessable, got: {:?}", other),
         }
     }
 
@@ -6029,7 +6010,7 @@ mod tests {
                     "Should extract correct group_id from event, not use zero fallback"
                 );
             }
-            other => panic!("Expected Unprocessable, got: {}", other.variant_name()),
+            other => panic!("Expected Unprocessable, got: {:?}", other),
         }
     }
 
@@ -6082,7 +6063,7 @@ mod tests {
                     "Should use zero fallback for oversized hex"
                 );
             }
-            other => panic!("Expected Unprocessable, got: {}", other.variant_name()),
+            other => panic!("Expected Unprocessable, got: {:?}", other),
         }
     }
 
@@ -6134,7 +6115,7 @@ mod tests {
                     "Should use zero fallback for undersized hex"
                 );
             }
-            other => panic!("Expected Unprocessable, got: {}", other.variant_name()),
+            other => panic!("Expected Unprocessable, got: {:?}", other),
         }
     }
 
@@ -6195,7 +6176,7 @@ mod tests {
                     "Should return MLS group ID from storage, not Nostr group ID"
                 );
             }
-            other => panic!("Expected Unprocessable, got: {}", other.variant_name()),
+            other => panic!("Expected Unprocessable, got: {:?}", other),
         }
     }
 
@@ -6253,7 +6234,7 @@ mod tests {
                     "Should use zero fallback when hex decode fails"
                 );
             }
-            other => panic!("Expected Unprocessable, got: {}", other.variant_name()),
+            other => panic!("Expected Unprocessable, got: {:?}", other),
         }
     }
 
