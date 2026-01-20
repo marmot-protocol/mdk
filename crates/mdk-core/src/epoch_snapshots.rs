@@ -66,10 +66,18 @@ impl fmt::Debug for EpochSnapshotManagerInner {
 }
 
 /// Manages epoch snapshots for rollback support
-#[derive(Debug)]
 pub struct EpochSnapshotManager {
     inner: Mutex<EpochSnapshotManagerInner>,
     retention_count: usize,
+}
+
+impl fmt::Debug for EpochSnapshotManager {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EpochSnapshotManager")
+            .field("inner", &"[REDACTED]")
+            .field("retention_count", &self.retention_count)
+            .finish()
+    }
 }
 
 impl EpochSnapshotManager {

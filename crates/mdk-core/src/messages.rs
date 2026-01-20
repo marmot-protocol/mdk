@@ -958,18 +958,21 @@ where
         // Snapshot current state before applying commit (for rollback support).
         // Fail if snapshot fails - without it we can't guarantee MIP-03 convergence.
         let current_epoch = mls_group.epoch().as_u64();
-        if let Err(e) = self.epoch_snapshots.create_snapshot(
-            self.storage(),
-            &group_id,
-            current_epoch,
-            &event.id,
-            event.created_at.as_u64(),
-        ) {
+        if self
+            .epoch_snapshots
+            .create_snapshot(
+                self.storage(),
+                &group_id,
+                current_epoch,
+                &event.id,
+                event.created_at.as_u64(),
+            )
+            .is_err()
+        {
             tracing::warn!(
                 target: "mdk_core::messages::process_commit_message_for_group",
-                "Failed to create snapshot for epoch {}: {}",
-                current_epoch,
-                e
+                "Failed to create snapshot for epoch {}",
+                current_epoch
             );
             // Without a snapshot we can't guarantee MIP-03 convergence if a better commit arrives.
             return Err(Error::Message(
@@ -1379,17 +1382,20 @@ where
                 );
 
                 // Snapshot current state before applying commit (for rollback support)
-                if let Err(e) = self.epoch_snapshots.create_snapshot(
-                    self.storage(),
-                    &group.mls_group_id,
-                    mls_group.epoch().as_u64(),
-                    &event.id,
-                    event.created_at.as_u64(),
-                ) {
+                if self
+                    .epoch_snapshots
+                    .create_snapshot(
+                        self.storage(),
+                        &group.mls_group_id,
+                        mls_group.epoch().as_u64(),
+                        &event.id,
+                        event.created_at.as_u64(),
+                    )
+                    .is_err()
+                {
                     tracing::warn!(
                         target: "mdk_core::messages::process_decrypted_message",
-                        "Failed to create snapshot for pending commit merge: {}",
-                        e
+                        "Failed to create snapshot for pending commit merge"
                     );
                     return Err(Error::Message(
                         "Failed to create epoch snapshot".to_string(),
@@ -1629,8 +1635,8 @@ where
                             // This will reload the group and apply the new commit.
                             return self.process_message(event);
                         }
-                        Err(e) => {
-                            tracing::error!("Rollback failed: {:?}", e);
+                        Err(_) => {
+                            tracing::error!("Rollback failed");
                             // Fall through to standard error handling
                         }
                     }

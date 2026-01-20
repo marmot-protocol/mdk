@@ -7,7 +7,7 @@ use thiserror::Error;
 /// This error type is used as the associated `Error` type for the OpenMLS
 /// `StorageProvider` trait implementation, enabling unified error handling
 /// across MLS and MDK storage operations.
-#[derive(Debug, Error, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum MdkStorageError {
     /// Database operation failed
     #[error("database error: {0}")]

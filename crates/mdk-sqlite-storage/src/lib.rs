@@ -479,8 +479,13 @@ impl MdkSqliteStorage {
             .map_err(|e| Error::Database(format!("Time error: {}", e)))?
             .as_secs() as i64;
 
-        // Helper to insert snapshot rows
-        let mut insert_stmt = conn
+        // Begin transaction for atomicity
+        conn.execute("BEGIN IMMEDIATE", [])
+            .map_err(|e| Error::Database(e.to_string()))?;
+
+        let result = (|| -> Result<(), Error> {
+            // Helper to insert snapshot rows
+            let mut insert_stmt = conn
             .prepare_cached(
                 "INSERT INTO group_state_snapshots
                  (snapshot_name, group_id, table_name, row_key, row_data, created_at)
@@ -731,7 +736,20 @@ impl MdkSqliteStorage {
             }
         }
 
-        Ok(())
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                conn.execute("COMMIT", [])
+                    .map_err(|e| Error::Database(e.to_string()))?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK", []);
+                Err(e)
+            }
+        }
     }
 
     /// Restores a group's state from a snapshot by deleting current rows
@@ -740,147 +758,123 @@ impl MdkSqliteStorage {
         let conn = self.connection.blocking_lock();
         let group_id_bytes = group_id.as_slice();
 
-        // 1. Delete current rows for this group from all 7 tables
-        conn.execute(
-            "DELETE FROM openmls_group_data WHERE group_id = ?",
-            [group_id_bytes],
-        )
-        .map_err(|e| Error::Database(e.to_string()))?;
+        // Begin transaction for atomicity - critical to prevent data loss on failure
+        conn.execute("BEGIN IMMEDIATE", [])
+            .map_err(|e| Error::Database(e.to_string()))?;
 
-        conn.execute(
-            "DELETE FROM openmls_proposals WHERE group_id = ?",
-            [group_id_bytes],
-        )
-        .map_err(|e| Error::Database(e.to_string()))?;
+        let result = (|| -> Result<(), Error> {
+            // 1. Delete current rows for this group from all 7 tables
+            conn.execute(
+                "DELETE FROM openmls_group_data WHERE group_id = ?",
+                [group_id_bytes],
+            )
+            .map_err(|e| Error::Database(e.to_string()))?;
 
-        conn.execute(
-            "DELETE FROM openmls_own_leaf_nodes WHERE group_id = ?",
-            [group_id_bytes],
-        )
-        .map_err(|e| Error::Database(e.to_string()))?;
+            conn.execute(
+                "DELETE FROM openmls_proposals WHERE group_id = ?",
+                [group_id_bytes],
+            )
+            .map_err(|e| Error::Database(e.to_string()))?;
 
-        conn.execute(
-            "DELETE FROM openmls_epoch_key_pairs WHERE group_id = ?",
-            [group_id_bytes],
-        )
-        .map_err(|e| Error::Database(e.to_string()))?;
+            conn.execute(
+                "DELETE FROM openmls_own_leaf_nodes WHERE group_id = ?",
+                [group_id_bytes],
+            )
+            .map_err(|e| Error::Database(e.to_string()))?;
 
-        // For MDK tables, we need to disable foreign key checks temporarily
-        // or delete in the right order to avoid FK violations
-        conn.execute(
-            "DELETE FROM group_exporter_secrets WHERE mls_group_id = ?",
-            [group_id_bytes],
-        )
-        .map_err(|e| Error::Database(e.to_string()))?;
+            conn.execute(
+                "DELETE FROM openmls_epoch_key_pairs WHERE group_id = ?",
+                [group_id_bytes],
+            )
+            .map_err(|e| Error::Database(e.to_string()))?;
 
-        conn.execute(
-            "DELETE FROM group_relays WHERE mls_group_id = ?",
-            [group_id_bytes],
-        )
-        .map_err(|e| Error::Database(e.to_string()))?;
+            // For MDK tables, we need to disable foreign key checks temporarily
+            // or delete in the right order to avoid FK violations
+            conn.execute(
+                "DELETE FROM group_exporter_secrets WHERE mls_group_id = ?",
+                [group_id_bytes],
+            )
+            .map_err(|e| Error::Database(e.to_string()))?;
 
-        conn.execute(
-            "DELETE FROM groups WHERE mls_group_id = ?",
-            [group_id_bytes],
-        )
-        .map_err(|e| Error::Database(e.to_string()))?;
+            conn.execute(
+                "DELETE FROM group_relays WHERE mls_group_id = ?",
+                [group_id_bytes],
+            )
+            .map_err(|e| Error::Database(e.to_string()))?;
 
-        // 2. Restore from snapshot table
-        let mut stmt = conn
-            .prepare(
+            conn.execute(
+                "DELETE FROM groups WHERE mls_group_id = ?",
+                [group_id_bytes],
+            )
+            .map_err(|e| Error::Database(e.to_string()))?;
+
+            // 2. Restore from snapshot table
+            let mut stmt = conn
+                .prepare(
                 "SELECT table_name, row_key, row_data FROM group_state_snapshots
                  WHERE snapshot_name = ? AND group_id = ?",
             )
             .map_err(|e| Error::Database(e.to_string()))?;
 
-        let mut rows = stmt
-            .query(rusqlite::params![name, group_id_bytes])
-            .map_err(|e| Error::Database(e.to_string()))?;
+            let mut rows = stmt
+                .query(rusqlite::params![name, group_id_bytes])
+                .map_err(|e| Error::Database(e.to_string()))?;
 
-        while let Some(row) = rows.next().map_err(|e| Error::Database(e.to_string()))? {
-            let table_name: String = row.get(0).map_err(|e| Error::Database(e.to_string()))?;
-            let row_key: Vec<u8> = row.get(1).map_err(|e| Error::Database(e.to_string()))?;
-            let row_data: Vec<u8> = row.get(2).map_err(|e| Error::Database(e.to_string()))?;
+            while let Some(row) = rows.next().map_err(|e| Error::Database(e.to_string()))? {
+                let table_name: String = row.get(0).map_err(|e| Error::Database(e.to_string()))?;
+                let row_key: Vec<u8> = row.get(1).map_err(|e| Error::Database(e.to_string()))?;
+                let row_data: Vec<u8> = row.get(2).map_err(|e| Error::Database(e.to_string()))?;
 
-            match table_name.as_str() {
-                "openmls_group_data" => {
-                    let (gid, data_type): (Vec<u8>, String) = serde_json::from_slice(&row_key)
+                match table_name.as_str() {
+                    "openmls_group_data" => {
+                        let (gid, data_type): (Vec<u8>, String) =
+                            serde_json::from_slice(&row_key)
+                                .map_err(|e| Error::Database(e.to_string()))?;
+                        conn.execute(
+                            "INSERT INTO openmls_group_data (provider_version, group_id, data_type, group_data)
+                             VALUES (1, ?, ?, ?)",
+                            rusqlite::params![gid, data_type, row_data],
+                        )
                         .map_err(|e| Error::Database(e.to_string()))?;
-                    conn.execute(
-                        "INSERT INTO openmls_group_data (provider_version, group_id, data_type, group_data)
-                         VALUES (1, ?, ?, ?)",
-                        rusqlite::params![gid, data_type, row_data],
-                    )
-                    .map_err(|e| Error::Database(e.to_string()))?;
-                }
-                "openmls_proposals" => {
-                    let (gid, proposal_ref): (Vec<u8>, Vec<u8>) = serde_json::from_slice(&row_key)
+                    }
+                    "openmls_proposals" => {
+                        let (gid, proposal_ref): (Vec<u8>, Vec<u8>) =
+                            serde_json::from_slice(&row_key)
+                                .map_err(|e| Error::Database(e.to_string()))?;
+                        conn.execute(
+                            "INSERT INTO openmls_proposals (provider_version, group_id, proposal_ref, proposal)
+                             VALUES (1, ?, ?, ?)",
+                            rusqlite::params![gid, proposal_ref, row_data],
+                        )
                         .map_err(|e| Error::Database(e.to_string()))?;
-                    conn.execute(
-                        "INSERT INTO openmls_proposals (provider_version, group_id, proposal_ref, proposal)
-                         VALUES (1, ?, ?, ?)",
-                        rusqlite::params![gid, proposal_ref, row_data],
-                    )
-                    .map_err(|e| Error::Database(e.to_string()))?;
-                }
-                "openmls_own_leaf_nodes" => {
-                    let (gid, leaf_node): (Vec<u8>, Vec<u8>) = serde_json::from_slice(&row_data)
+                    }
+                    "openmls_own_leaf_nodes" => {
+                        let (gid, leaf_node): (Vec<u8>, Vec<u8>) =
+                            serde_json::from_slice(&row_data)
+                                .map_err(|e| Error::Database(e.to_string()))?;
+                        conn.execute(
+                            "INSERT INTO openmls_own_leaf_nodes (provider_version, group_id, leaf_node)
+                             VALUES (1, ?, ?)",
+                            rusqlite::params![gid, leaf_node],
+                        )
                         .map_err(|e| Error::Database(e.to_string()))?;
-                    conn.execute(
-                        "INSERT INTO openmls_own_leaf_nodes (provider_version, group_id, leaf_node)
-                         VALUES (1, ?, ?)",
-                        rusqlite::params![gid, leaf_node],
-                    )
-                    .map_err(|e| Error::Database(e.to_string()))?;
-                }
-                "openmls_epoch_key_pairs" => {
-                    let (gid, epoch_id, leaf_index): (Vec<u8>, Vec<u8>, i64) =
-                        serde_json::from_slice(&row_key)
+                    }
+                    "openmls_epoch_key_pairs" => {
+                        let (gid, epoch_id, leaf_index): (Vec<u8>, Vec<u8>, i64) =
+                            serde_json::from_slice(&row_key)
+                                .map_err(|e| Error::Database(e.to_string()))?;
+                        conn.execute(
+                            "INSERT INTO openmls_epoch_key_pairs (provider_version, group_id, epoch_id, leaf_index, key_pairs)
+                             VALUES (1, ?, ?, ?, ?)",
+                            rusqlite::params![gid, epoch_id, leaf_index, row_data],
+                        )
+                        .map_err(|e| Error::Database(e.to_string()))?;
+                    }
+                    "groups" => {
+                        let mls_group_id: Vec<u8> = serde_json::from_slice(&row_key)
                             .map_err(|e| Error::Database(e.to_string()))?;
-                    conn.execute(
-                        "INSERT INTO openmls_epoch_key_pairs (provider_version, group_id, epoch_id, leaf_index, key_pairs)
-                         VALUES (1, ?, ?, ?, ?)",
-                        rusqlite::params![gid, epoch_id, leaf_index, row_data],
-                    )
-                    .map_err(|e| Error::Database(e.to_string()))?;
-                }
-                "groups" => {
-                    let mls_group_id: Vec<u8> = serde_json::from_slice(&row_key)
-                        .map_err(|e| Error::Database(e.to_string()))?;
-                    #[allow(clippy::type_complexity)]
-                    let (
-                        nostr_group_id,
-                        name_val,
-                        description,
-                        admin_pubkeys,
-                        last_message_id,
-                        last_message_at,
-                        epoch,
-                        state,
-                        image_hash,
-                        image_key,
-                        image_nonce,
-                    ): (
-                        Vec<u8>,
-                        String,
-                        String,
-                        String,
-                        Option<Vec<u8>>,
-                        Option<i64>,
-                        i64,
-                        String,
-                        Option<Vec<u8>>,
-                        Option<Vec<u8>>,
-                        Option<Vec<u8>>,
-                    ) = serde_json::from_slice(&row_data)
-                        .map_err(|e| Error::Database(e.to_string()))?;
-                    conn.execute(
-                        "INSERT INTO groups (mls_group_id, nostr_group_id, name, description, admin_pubkeys,
-                                            last_message_id, last_message_at, epoch, state,
-                                            image_hash, image_key, image_nonce)
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                        rusqlite::params![
-                            mls_group_id,
+                        #[allow(clippy::type_complexity)]
+                        let (
                             nostr_group_id,
                             name_val,
                             description,
@@ -891,46 +885,92 @@ impl MdkSqliteStorage {
                             state,
                             image_hash,
                             image_key,
-                            image_nonce
-                        ],
-                    )
-                    .map_err(|e| Error::Database(e.to_string()))?;
-                }
-                "group_relays" => {
-                    let (mls_group_id, relay_url): (Vec<u8>, String) =
-                        serde_json::from_slice(&row_data)
+                            image_nonce,
+                        ): (
+                            Vec<u8>,
+                            String,
+                            String,
+                            String,
+                            Option<Vec<u8>>,
+                            Option<i64>,
+                            i64,
+                            String,
+                            Option<Vec<u8>>,
+                            Option<Vec<u8>>,
+                            Option<Vec<u8>>,
+                        ) = serde_json::from_slice(&row_data)
                             .map_err(|e| Error::Database(e.to_string()))?;
-                    conn.execute(
-                        "INSERT INTO group_relays (mls_group_id, relay_url) VALUES (?, ?)",
-                        rusqlite::params![mls_group_id, relay_url],
-                    )
-                    .map_err(|e| Error::Database(e.to_string()))?;
-                }
-                "group_exporter_secrets" => {
-                    let (mls_group_id, epoch): (Vec<u8>, i64) = serde_json::from_slice(&row_key)
+                        conn.execute(
+                            "INSERT INTO groups (mls_group_id, nostr_group_id, name, description, admin_pubkeys,
+                                                last_message_id, last_message_at, epoch, state,
+                                                image_hash, image_key, image_nonce)
+                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            rusqlite::params![
+                                mls_group_id,
+                                nostr_group_id,
+                                name_val,
+                                description,
+                                admin_pubkeys,
+                                last_message_id,
+                                last_message_at,
+                                epoch,
+                                state,
+                                image_hash,
+                                image_key,
+                                image_nonce
+                            ],
+                        )
                         .map_err(|e| Error::Database(e.to_string()))?;
-                    conn.execute(
-                        "INSERT INTO group_exporter_secrets (mls_group_id, epoch, secret) VALUES (?, ?, ?)",
-                        rusqlite::params![mls_group_id, epoch, row_data],
-                    )
-                    .map_err(|e| Error::Database(e.to_string()))?;
-                }
-                _ => {
-                    // Unknown table, skip
+                    }
+                    "group_relays" => {
+                        let (mls_group_id, relay_url): (Vec<u8>, String) =
+                            serde_json::from_slice(&row_data)
+                                .map_err(|e| Error::Database(e.to_string()))?;
+                        conn.execute(
+                            "INSERT INTO group_relays (mls_group_id, relay_url) VALUES (?, ?)",
+                            rusqlite::params![mls_group_id, relay_url],
+                        )
+                        .map_err(|e| Error::Database(e.to_string()))?;
+                    }
+                    "group_exporter_secrets" => {
+                        let (mls_group_id, epoch): (Vec<u8>, i64) =
+                            serde_json::from_slice(&row_key)
+                                .map_err(|e| Error::Database(e.to_string()))?;
+                        conn.execute(
+                            "INSERT INTO group_exporter_secrets (mls_group_id, epoch, secret) VALUES (?, ?, ?)",
+                            rusqlite::params![mls_group_id, epoch, row_data],
+                        )
+                        .map_err(|e| Error::Database(e.to_string()))?;
+                    }
+                    _ => {
+                        // Unknown table, skip
+                    }
                 }
             }
+
+            // 3. Delete the consumed snapshot
+            drop(rows);
+            drop(stmt);
+            conn.execute(
+                "DELETE FROM group_state_snapshots WHERE snapshot_name = ? AND group_id = ?",
+                rusqlite::params![name, group_id_bytes],
+            )
+            .map_err(|e| Error::Database(e.to_string()))?;
+
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                conn.execute("COMMIT", [])
+                    .map_err(|e| Error::Database(e.to_string()))?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK", []);
+                Err(e)
+            }
         }
-
-        // 3. Delete the consumed snapshot
-        drop(rows);
-        drop(stmt);
-        conn.execute(
-            "DELETE FROM group_state_snapshots WHERE snapshot_name = ? AND group_id = ?",
-            rusqlite::params![name, group_id_bytes],
-        )
-        .map_err(|e| Error::Database(e.to_string()))?;
-
-        Ok(())
     }
 
     /// Deletes a snapshot that is no longer needed.

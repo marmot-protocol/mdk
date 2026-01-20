@@ -29,16 +29,7 @@
 
 ### Changed
 
-- **Transactional Snapshots**: Implemented snapshot support using SQLite `SAVEPOINT`. `create_named_snapshot`, `rollback_to_snapshot`, and `release_snapshot` map to `SAVEPOINT`, `ROLLBACK TO`, and `RELEASE` respectively. ([#152](https://github.com/marmot-protocol/mdk/pull/152))
-
-### Added
-
-### Fixed
-
-### Removed
-
-### Deprecated
-
+- **Persistent Snapshots**: Implemented snapshot support by copying group-specific rows to a dedicated snapshot table. `create_group_snapshot`, `rollback_group_to_snapshot`, and `release_group_snapshot` persist across app restarts. ([#152](https://github.com/marmot-protocol/mdk/pull/152))
 - **Unified Storage Architecture**: `MdkSqliteStorage` now directly implements OpenMLS's `StorageProvider<1>` trait instead of wrapping `openmls_sqlite_storage`. This enables atomic transactions across MLS and MDK state, which is required for proper commit race resolution per MIP-03. ([#148](https://github.com/marmot-protocol/mdk/pull/148))
   - Removed `openmls_sqlite_storage` dependency
   - New unified schema in `V001__initial_schema.sql` replaces all previous migrations
@@ -47,9 +38,6 @@
 - **Security (Audit Issue M)**: Changed `MessageStorage::find_message_by_event_id()` to require both `mls_group_id` and `event_id` parameters. This prevents messages from different groups from overwriting each other. Database migration V105 changes the messages table primary key from `id` to `(mls_group_id, id)`. ([#124](https://github.com/marmot-protocol/mdk/pull/124))
 - Updated `messages()` implementation to accept `Option<Pagination>` parameter ([#111](https://github.com/marmot-protocol/mdk/pull/111))
 - Updated `pending_welcomes()` implementation to accept `Option<Pagination>` parameter ([#110](https://github.com/marmot-protocol/mdk/pull/110))
-
-### Changed
-
 - Upgraded `refinery` from 0.8 to 0.9 to align with OpenMLS dependencies ([#142](https://github.com/marmot-protocol/mdk/pull/142))
 - **Storage Security**: Updated storage operations to use `Secret<T>` wrapper for secret values, ensuring automatic memory zeroization when values are dropped ([#109](https://github.com/marmot-protocol/mdk/pull/109))
 - SQLite is now built with SQLCipher support (`bundled-sqlcipher`) instead of plain SQLite (`bundled`), enabling transparent AES-256 encryption at rest ([#102](https://github.com/marmot-protocol/mdk/pull/102))

@@ -586,7 +586,7 @@ impl MdkStorageProvider for MdkMemoryStorage {
         // Remove and restore the snapshot (consume it)
         let snapshot =
             self.group_snapshots.write().remove(&key).ok_or_else(|| {
-                MdkStorageError::NotFound(format!("Snapshot not found: {}", name))
+                MdkStorageError::NotFound("Snapshot not found".to_string())
             })?;
         self.restore_snapshot(snapshot);
         Ok(())
