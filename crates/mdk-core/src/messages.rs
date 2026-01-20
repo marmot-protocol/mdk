@@ -1793,6 +1793,12 @@ where
             if processed.state == message_types::ProcessedMessageState::Failed {
                 let mls_group_id = self.extract_group_id_from_failed_message(event);
 
+                tracing::debug!(
+                    target: "mdk_core::messages::process_message",
+                    "Returning Unprocessable for previously failed message, extracted group_id: {}",
+                    if mls_group_id.as_slice() == [0u8; 32] { "none (zero fallback)" } else { "found" }
+                );
+
                 return Ok(MessageProcessingResult::Unprocessable { mls_group_id });
             }
         }
