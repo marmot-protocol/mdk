@@ -3042,4 +3042,321 @@ mod tests {
             });
         }
     }
+
+    // ========================================
+    // Snapshot tests
+    // ========================================
+
+    mod snapshot_tests {
+        use std::collections::BTreeSet;
+
+        use mdk_storage_traits::groups::GroupStorage;
+        use mdk_storage_traits::groups::types::{Group, GroupExporterSecret, GroupState};
+        use mdk_storage_traits::{GroupId, MdkStorageProvider, Secret};
+
+        use super::*;
+
+        fn create_test_group(id: u8) -> Group {
+            Group {
+                mls_group_id: GroupId::from_slice(&[id; 32]),
+                nostr_group_id: [id; 32],
+                name: format!("Test Group {}", id),
+                description: format!("Description {}", id),
+                admin_pubkeys: BTreeSet::new(),
+                last_message_id: None,
+                last_message_at: None,
+                epoch: 0,
+                state: GroupState::Active,
+                image_hash: None,
+                image_key: None,
+                image_nonce: None,
+            }
+        }
+
+        #[test]
+        fn test_snapshot_and_rollback_group_state() {
+            let storage = MdkSqliteStorage::new_in_memory().unwrap();
+
+            // Create and save a group
+            let group = create_test_group(1);
+            let group_id = group.mls_group_id.clone();
+            storage.save_group(group).unwrap();
+
+            // Verify initial state
+            let initial_group = storage
+                .find_group_by_mls_group_id(&group_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(initial_group.name, "Test Group 1");
+            assert_eq!(initial_group.epoch, 0);
+
+            // Create a snapshot
+            storage
+                .create_group_snapshot(&group_id, "snap_epoch_0")
+                .unwrap();
+
+            // Modify the group
+            let mut modified_group = initial_group.clone();
+            modified_group.name = "Modified Group".to_string();
+            modified_group.epoch = 1;
+            storage.save_group(modified_group).unwrap();
+
+            // Verify modification
+            let after_mod = storage
+                .find_group_by_mls_group_id(&group_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(after_mod.name, "Modified Group");
+            assert_eq!(after_mod.epoch, 1);
+
+            // Rollback to snapshot
+            storage
+                .rollback_group_to_snapshot(&group_id, "snap_epoch_0")
+                .unwrap();
+
+            // Verify rollback restored original state
+            let after_rollback = storage
+                .find_group_by_mls_group_id(&group_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(after_rollback.name, "Test Group 1");
+            assert_eq!(after_rollback.epoch, 0);
+        }
+
+        #[test]
+        fn test_snapshot_release_without_rollback() {
+            let storage = MdkSqliteStorage::new_in_memory().unwrap();
+
+            // Create and save a group
+            let group = create_test_group(2);
+            let group_id = group.mls_group_id.clone();
+            storage.save_group(group).unwrap();
+
+            // Create a snapshot
+            storage
+                .create_group_snapshot(&group_id, "snap_to_release")
+                .unwrap();
+
+            // Modify the group
+            let mut modified = storage
+                .find_group_by_mls_group_id(&group_id)
+                .unwrap()
+                .unwrap();
+            modified.name = "Modified Name".to_string();
+            storage.save_group(modified).unwrap();
+
+            // Release the snapshot (commit the changes)
+            storage
+                .release_group_snapshot(&group_id, "snap_to_release")
+                .unwrap();
+
+            // Verify modifications are kept
+            let final_state = storage
+                .find_group_by_mls_group_id(&group_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(final_state.name, "Modified Name");
+        }
+
+        #[test]
+        fn test_snapshot_with_exporter_secrets_rollback() {
+            let storage = MdkSqliteStorage::new_in_memory().unwrap();
+
+            // Create and save a group
+            let group = create_test_group(3);
+            let group_id = group.mls_group_id.clone();
+            storage.save_group(group).unwrap();
+
+            // Save initial exporter secret
+            let secret_0 = GroupExporterSecret {
+                mls_group_id: group_id.clone(),
+                epoch: 0,
+                secret: Secret::new([0u8; 32]),
+            };
+            storage.save_group_exporter_secret(secret_0).unwrap();
+
+            // Create snapshot
+            storage
+                .create_group_snapshot(&group_id, "snap_secrets")
+                .unwrap();
+
+            // Add more exporter secrets
+            let secret_1 = GroupExporterSecret {
+                mls_group_id: group_id.clone(),
+                epoch: 1,
+                secret: Secret::new([1u8; 32]),
+            };
+            storage.save_group_exporter_secret(secret_1).unwrap();
+
+            // Verify new secret exists
+            let secret_check = storage.get_group_exporter_secret(&group_id, 1).unwrap();
+            assert!(secret_check.is_some());
+
+            // Rollback
+            storage
+                .rollback_group_to_snapshot(&group_id, "snap_secrets")
+                .unwrap();
+
+            // Epoch 1 secret should be gone after rollback
+            let after_rollback = storage.get_group_exporter_secret(&group_id, 1).unwrap();
+            assert!(after_rollback.is_none());
+
+            // Epoch 0 secret should still exist
+            let epoch_0 = storage.get_group_exporter_secret(&group_id, 0).unwrap();
+            assert!(epoch_0.is_some());
+        }
+
+        #[test]
+        fn test_snapshot_isolation_between_groups() {
+            let storage = MdkSqliteStorage::new_in_memory().unwrap();
+
+            // Create two groups
+            let group1 = create_test_group(10);
+            let group2 = create_test_group(20);
+            let group1_id = group1.mls_group_id.clone();
+            let group2_id = group2.mls_group_id.clone();
+
+            storage.save_group(group1).unwrap();
+            storage.save_group(group2).unwrap();
+
+            // Snapshot group1
+            storage
+                .create_group_snapshot(&group1_id, "snap_group1")
+                .unwrap();
+
+            // Modify both groups
+            let mut mod1 = storage
+                .find_group_by_mls_group_id(&group1_id)
+                .unwrap()
+                .unwrap();
+            let mut mod2 = storage
+                .find_group_by_mls_group_id(&group2_id)
+                .unwrap()
+                .unwrap();
+            mod1.name = "Modified Group 1".to_string();
+            mod2.name = "Modified Group 2".to_string();
+            storage.save_group(mod1).unwrap();
+            storage.save_group(mod2).unwrap();
+
+            // Rollback group1 only
+            storage
+                .rollback_group_to_snapshot(&group1_id, "snap_group1")
+                .unwrap();
+
+            // Group1 should be rolled back
+            let final1 = storage
+                .find_group_by_mls_group_id(&group1_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(final1.name, "Test Group 10");
+
+            // Group2 should still have modifications
+            let final2 = storage
+                .find_group_by_mls_group_id(&group2_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(final2.name, "Modified Group 2");
+        }
+
+        #[test]
+        fn test_rollback_nonexistent_snapshot_behavior() {
+            let storage = MdkSqliteStorage::new_in_memory().unwrap();
+
+            let group = create_test_group(5);
+            let group_id = group.mls_group_id.clone();
+            storage.save_group(group).unwrap();
+
+            // Rolling back to a nonexistent snapshot doesn't fail but clears state
+            // since it deletes current data and finds nothing to restore.
+            // This is acceptable behavior for the MdkStorageProvider contract
+            // (callers should only rollback to snapshots they created).
+            let result = storage.rollback_group_to_snapshot(&group_id, "nonexistent_snap");
+            assert!(
+                result.is_ok(),
+                "Rollback to nonexistent snapshot should not error"
+            );
+
+            // Group should now be gone (deleted during rollback, nothing to restore)
+            let after_rollback = storage.find_group_by_mls_group_id(&group_id).unwrap();
+            assert!(
+                after_rollback.is_none(),
+                "Group should be deleted when rolling back to nonexistent snapshot"
+            );
+        }
+
+        #[test]
+        fn test_release_nonexistent_snapshot_succeeds() {
+            let storage = MdkSqliteStorage::new_in_memory().unwrap();
+
+            let group = create_test_group(6);
+            let group_id = group.mls_group_id.clone();
+            storage.save_group(group).unwrap();
+
+            // Releasing a non-existent snapshot should be a no-op (idempotent)
+            let result = storage.release_group_snapshot(&group_id, "nonexistent_snap");
+            // Should succeed (no-op)
+            assert!(result.is_ok());
+        }
+
+        #[test]
+        fn test_multiple_snapshots_same_group() {
+            let storage = MdkSqliteStorage::new_in_memory().unwrap();
+
+            let group = create_test_group(7);
+            let group_id = group.mls_group_id.clone();
+            storage.save_group(group).unwrap();
+
+            // Create first snapshot at epoch 0
+            storage
+                .create_group_snapshot(&group_id, "snap_epoch_0")
+                .unwrap();
+
+            // Modify to epoch 1
+            let mut mod1 = storage
+                .find_group_by_mls_group_id(&group_id)
+                .unwrap()
+                .unwrap();
+            mod1.epoch = 1;
+            mod1.name = "Epoch 1".to_string();
+            storage.save_group(mod1).unwrap();
+
+            // Create second snapshot at epoch 1
+            storage
+                .create_group_snapshot(&group_id, "snap_epoch_1")
+                .unwrap();
+
+            // Modify to epoch 2
+            let mut mod2 = storage
+                .find_group_by_mls_group_id(&group_id)
+                .unwrap()
+                .unwrap();
+            mod2.epoch = 2;
+            mod2.name = "Epoch 2".to_string();
+            storage.save_group(mod2).unwrap();
+
+            // Rollback to epoch 1 snapshot
+            storage
+                .rollback_group_to_snapshot(&group_id, "snap_epoch_1")
+                .unwrap();
+
+            let after_rollback = storage
+                .find_group_by_mls_group_id(&group_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(after_rollback.epoch, 1);
+            assert_eq!(after_rollback.name, "Epoch 1");
+
+            // Can still rollback further to epoch 0
+            storage
+                .rollback_group_to_snapshot(&group_id, "snap_epoch_0")
+                .unwrap();
+
+            let final_state = storage
+                .find_group_by_mls_group_id(&group_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(final_state.epoch, 0);
+            assert_eq!(final_state.name, "Test Group 7");
+        }
+    }
 }

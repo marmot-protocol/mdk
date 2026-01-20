@@ -560,4 +560,40 @@ mod tests {
         let debug_str = format!("{:?}", error);
         assert!(debug_str.contains("UnexpectedEvent"));
     }
+
+    /// Test ProcessMessageWrongEpochWithInfo error variant
+    #[test]
+    fn test_process_message_wrong_epoch_with_info() {
+        let error = Error::ProcessMessageWrongEpochWithInfo(42);
+        assert_eq!(
+            error.to_string(),
+            "Message epoch 42 differs from the group's epoch"
+        );
+
+        let error2 = Error::ProcessMessageWrongEpochWithInfo(100);
+        assert_eq!(
+            error2.to_string(),
+            "Message epoch 100 differs from the group's epoch"
+        );
+    }
+
+    /// Test OwnCommitPending error variant
+    #[test]
+    fn test_own_commit_pending() {
+        let error = Error::OwnCommitPending;
+        assert_eq!(error.to_string(), "own commit pending merge");
+    }
+
+    /// Test Storage error conversion
+    #[test]
+    fn test_storage_error_conversion() {
+        use mdk_storage_traits::MdkStorageError;
+
+        let storage_error = MdkStorageError::NotFound("group not found".to_string());
+        let error: Error = storage_error.into();
+
+        assert!(matches!(error, Error::Storage(_)));
+        let msg = error.to_string();
+        assert!(msg.contains("not found"));
+    }
 }
