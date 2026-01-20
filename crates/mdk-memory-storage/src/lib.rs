@@ -332,8 +332,9 @@ pub struct MdkMemoryStorage {
     limits: ValidationLimits,
     /// Thread-safe inner storage
     inner: RwLock<MdkMemoryStorageInner>,
-    /// Named snapshots for rollback support
-    named_snapshots: RwLock<HashMap<String, MemoryStorageSnapshot>>,
+    /// Group-scoped snapshots for rollback support (MIP-03)
+    /// Key is (group_id, snapshot_name) for group-specific rollback
+    group_snapshots: RwLock<HashMap<(GroupId, String), MemoryStorageSnapshot>>,
 }
 
 /// Unified storage architecture container
@@ -445,7 +446,7 @@ impl MdkMemoryStorage {
         MdkMemoryStorage {
             limits,
             inner: RwLock::new(inner),
-            named_snapshots: RwLock::new(HashMap::new()),
+            group_snapshots: RwLock::new(HashMap::new()),
         }
     }
 
@@ -566,29 +567,38 @@ impl MdkStorageProvider for MdkMemoryStorage {
         Backend::Memory
     }
 
-    fn create_named_snapshot(&self, name: &str) -> Result<(), MdkStorageError> {
+    fn create_group_snapshot(&self, group_id: &GroupId, name: &str) -> Result<(), MdkStorageError> {
+        // For simplicity in memory storage, we take a full snapshot.
+        // This is acceptable since memory storage is primarily for testing.
         let snapshot = self.create_snapshot();
-        self.named_snapshots
+        self.group_snapshots
             .write()
-            .insert(name.to_string(), snapshot);
+            .insert((group_id.clone(), name.to_string()), snapshot);
         Ok(())
     }
 
-    fn rollback_to_snapshot(&self, name: &str) -> Result<(), MdkStorageError> {
-        let guard = self.named_snapshots.read();
-        if let Some(snapshot) = guard.get(name) {
-            self.restore_snapshot(snapshot.clone());
-            Ok(())
-        } else {
-            Err(MdkStorageError::NotFound(format!(
-                "Snapshot not found: {}",
-                name
-            )))
-        }
+    fn rollback_group_to_snapshot(
+        &self,
+        group_id: &GroupId,
+        name: &str,
+    ) -> Result<(), MdkStorageError> {
+        let key = (group_id.clone(), name.to_string());
+        // Remove and restore the snapshot (consume it)
+        let snapshot =
+            self.group_snapshots.write().remove(&key).ok_or_else(|| {
+                MdkStorageError::NotFound(format!("Snapshot not found: {}", name))
+            })?;
+        self.restore_snapshot(snapshot);
+        Ok(())
     }
 
-    fn release_snapshot(&self, name: &str) -> Result<(), MdkStorageError> {
-        self.named_snapshots.write().remove(name);
+    fn release_group_snapshot(
+        &self,
+        group_id: &GroupId,
+        name: &str,
+    ) -> Result<(), MdkStorageError> {
+        let key = (group_id.clone(), name.to_string());
+        self.group_snapshots.write().remove(&key);
         Ok(())
     }
 }

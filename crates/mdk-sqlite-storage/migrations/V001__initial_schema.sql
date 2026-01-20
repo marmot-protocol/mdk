@@ -197,3 +197,23 @@ CREATE TABLE IF NOT EXISTS processed_welcomes (
 CREATE INDEX IF NOT EXISTS idx_processed_welcomes_welcome_event_id ON processed_welcomes(welcome_event_id);
 CREATE INDEX IF NOT EXISTS idx_processed_welcomes_state ON processed_welcomes(state);
 CREATE INDEX IF NOT EXISTS idx_processed_welcomes_processed_at ON processed_welcomes(processed_at);
+
+-- ============================================================================
+-- Group State Snapshots (MIP-03 Commit Race Resolution)
+-- ============================================================================
+-- Instead of SQLite savepoints (which have stack-ordering issues where
+-- releasing an old savepoint destroys all newer ones), we copy group-specific
+-- rows to this table for later restoration.
+
+CREATE TABLE IF NOT EXISTS group_state_snapshots (
+    snapshot_name TEXT NOT NULL,
+    group_id BLOB NOT NULL,
+    table_name TEXT NOT NULL,
+    row_key BLOB NOT NULL,      -- Serialized primary key (JSON)
+    row_data BLOB NOT NULL,     -- Serialized row data (JSON)
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (snapshot_name, group_id, table_name, row_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_group_state_snapshots_lookup
+    ON group_state_snapshots(snapshot_name, group_id);

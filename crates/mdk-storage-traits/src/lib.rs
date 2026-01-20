@@ -69,24 +69,30 @@ pub trait MdkStorageProvider:
     /// The storage backend type (e.g., [`Backend::Memory`] or [`Backend::SQLite`]).
     fn backend(&self) -> Backend;
 
-    /// Create a named snapshot/savepoint
+    /// Create a snapshot of a group's state before applying a commit.
     ///
-    /// This creates a point in time that can be rolled back to later.
-    /// In SQLite, this corresponds to `SAVEPOINT name`.
-    /// In Memory, this captures a snapshot of the current state.
-    fn create_named_snapshot(&self, name: &str) -> Result<(), MdkStorageError>;
+    /// This captures all MLS and MDK state for the specified group,
+    /// enabling rollback if a better commit arrives later (MIP-03).
+    ///
+    /// The snapshot is stored persistently (in SQLite) or in memory,
+    /// keyed by both the group ID and snapshot name.
+    fn create_group_snapshot(&self, group_id: &GroupId, name: &str) -> Result<(), MdkStorageError>;
 
-    /// Rollback to a previously created snapshot
+    /// Rollback a group's state to a previously created snapshot.
     ///
-    /// This restores the state to what it was when the snapshot was created.
-    /// In SQLite, this corresponds to `ROLLBACK TO name`.
-    fn rollback_to_snapshot(&self, name: &str) -> Result<(), MdkStorageError>;
+    /// This restores all MLS and MDK state for the group to what it was
+    /// when the snapshot was created. The snapshot is consumed (deleted) after use.
+    fn rollback_group_to_snapshot(
+        &self,
+        group_id: &GroupId,
+        name: &str,
+    ) -> Result<(), MdkStorageError>;
 
-    /// Release/commit a snapshot (no longer needed)
+    /// Release a snapshot that is no longer needed.
     ///
-    /// This frees resources associated with the snapshot.
-    /// In SQLite, this corresponds to `RELEASE name`.
-    fn release_snapshot(&self, name: &str) -> Result<(), MdkStorageError>;
+    /// Call this to free resources when a snapshot won't be used for rollback.
+    fn release_group_snapshot(&self, group_id: &GroupId, name: &str)
+    -> Result<(), MdkStorageError>;
 }
 
 #[cfg(test)]

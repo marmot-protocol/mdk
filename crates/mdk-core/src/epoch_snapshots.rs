@@ -39,14 +39,11 @@ pub struct EpochSnapshot {
 
 impl fmt::Debug for EpochSnapshot {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Note: snapshot_name contains group_id hex, so we redact it too
         write!(
             f,
-            "EpochSnapshot {{ group_id: \"[REDACTED]\", epoch: {:?}, applied_commit_id: {:?}, applied_commit_ts: {:?}, created_at: {:?}, snapshot_name: {:?} }}",
-            self.epoch,
-            self.applied_commit_id,
-            self.applied_commit_ts,
-            self.created_at,
-            self.snapshot_name
+            "EpochSnapshot {{ group_id: [REDACTED], epoch: {}, applied_commit_id: {:?}, applied_commit_ts: {}, snapshot_name: [REDACTED] }}",
+            self.epoch, self.applied_commit_id, self.applied_commit_ts,
         )
     }
 }
@@ -58,27 +55,21 @@ struct EpochSnapshotManagerInner {
 
 impl fmt::Debug for EpochSnapshotManagerInner {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let total_snapshots: usize = self.snapshots.values().map(|q| q.len()).sum();
         write!(
             f,
-            "EpochSnapshotManagerInner {{ snapshots: \"[REDACTED]\" }}"
+            "EpochSnapshotManagerInner {{ groups: {}, total_snapshots: {} }}",
+            self.snapshots.len(),
+            total_snapshots
         )
     }
 }
 
 /// Manages epoch snapshots for rollback support
+#[derive(Debug)]
 pub struct EpochSnapshotManager {
     inner: Mutex<EpochSnapshotManagerInner>,
     retention_count: usize,
-}
-
-impl fmt::Debug for EpochSnapshotManager {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "EpochSnapshotManager {{ inner: {:?}, retention_count: {:?} }}",
-            self.inner, self.retention_count
-        )
-    }
 }
 
 impl EpochSnapshotManager {
@@ -111,7 +102,7 @@ impl EpochSnapshotManager {
 
         // Create the snapshot in storage
         storage
-            .create_named_snapshot(&snapshot_name)
+            .create_group_snapshot(group_id, &snapshot_name)
             .map_err(Error::Storage)?;
 
         // Record metadata
@@ -134,7 +125,7 @@ impl EpochSnapshotManager {
         while queue.len() > self.retention_count {
             if let Some(old_snap) = queue.pop_front() {
                 // Best effort release
-                let _ = storage.release_snapshot(&old_snap.snapshot_name);
+                let _ = storage.release_group_snapshot(&old_snap.group_id, &old_snap.snapshot_name);
             }
         }
 
@@ -189,15 +180,20 @@ impl EpochSnapshotManager {
             if let Some(index) = queue.iter().position(|s| s.epoch == target_epoch) {
                 let snapshot = &queue[index];
 
-                // Perform rollback
+                // Perform rollback (this consumes the snapshot)
                 storage
-                    .rollback_to_snapshot(&snapshot.snapshot_name)
+                    .rollback_group_to_snapshot(group_id, &snapshot.snapshot_name)
                     .map_err(Error::Storage)?;
 
-                // Remove and release all snapshots from index onwards (including the used one)
+                // Remove all snapshots from index onwards from our tracking
+                // The rollback already consumed the target snapshot, but we need to
+                // release any snapshots that were created after it
                 let removed = queue.split_off(index);
-                for snap in removed {
-                    let _ = storage.release_snapshot(&snap.snapshot_name);
+                for (i, snap) in removed.into_iter().enumerate() {
+                    // Skip the first one (index 0) - it was already consumed by rollback
+                    if i > 0 {
+                        let _ = storage.release_group_snapshot(&snap.group_id, &snap.snapshot_name);
+                    }
                 }
 
                 return Ok(());

@@ -955,11 +955,9 @@ where
 
         let group_id: GroupId = mls_group.group_id().into();
 
-        // Snapshot current state before applying commit (for rollback support)
+        // Snapshot current state before applying commit (for rollback support).
+        // Fail if snapshot fails - without it we can't guarantee MIP-03 convergence.
         let current_epoch = mls_group.epoch().as_u64();
-        // Use best effort - log error but don't fail commit if snapshot fails?
-        // Or fail safe? If snapshot fails, we can't rollback.
-        // Let's fail safe.
         if let Err(e) = self.epoch_snapshots.create_snapshot(
             self.storage(),
             &group_id,
@@ -7922,6 +7920,159 @@ mod tests {
             );
         }
         // If timestamps differ, the earlier timestamp wins regardless of ID
+    }
+
+    /// Test that group membership is preserved after rollback
+    ///
+    /// This verifies that when a rollback occurs:
+    /// 1. The group still exists
+    /// 2. All original members are still present
+    /// 3. The group metadata (admins) is preserved
+    #[test]
+    fn test_group_membership_preserved_after_rollback() {
+        let alice_keys = Keys::generate();
+        let bob_keys = Keys::generate();
+        let carol_keys = Keys::generate();
+
+        let callback = std::sync::Arc::new(TestCallback::new());
+
+        let alice_mdk = crate::MDK::builder(mdk_memory_storage::MdkMemoryStorage::default())
+            .with_callback(callback.clone())
+            .build();
+
+        let bob_mdk = create_test_mdk();
+        let carol_mdk = create_test_mdk();
+
+        let admins = vec![
+            alice_keys.public_key(),
+            bob_keys.public_key(),
+            carol_keys.public_key(),
+        ];
+
+        // Setup: Create group with Alice, Bob, and Carol
+        let bob_key_package = create_key_package_event(&bob_mdk, &bob_keys);
+        let carol_key_package = create_key_package_event(&carol_mdk, &carol_keys);
+
+        let create_result = alice_mdk
+            .create_group(
+                &alice_keys.public_key(),
+                vec![bob_key_package, carol_key_package],
+                create_nostr_group_config_data(admins.clone()),
+            )
+            .expect("Alice should create group");
+
+        let group_id = create_result.group.mls_group_id.clone();
+
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("Failed to merge");
+
+        // Bob and Carol join
+        let bob_welcome_rumor = &create_result.welcome_rumors[0];
+        let bob_welcome = bob_mdk
+            .process_welcome(&nostr::EventId::all_zeros(), bob_welcome_rumor)
+            .expect("Bob should process welcome");
+        bob_mdk
+            .accept_welcome(&bob_welcome)
+            .expect("Bob should accept welcome");
+
+        let carol_welcome_rumor = &create_result.welcome_rumors[1];
+        let carol_welcome = carol_mdk
+            .process_welcome(&nostr::EventId::all_zeros(), carol_welcome_rumor)
+            .expect("Carol should process welcome");
+        carol_mdk
+            .accept_welcome(&carol_welcome)
+            .expect("Carol should accept welcome");
+
+        // Record initial state
+        let initial_members = alice_mdk
+            .get_members(&group_id)
+            .expect("Should get members");
+        let initial_group = alice_mdk
+            .get_group(&group_id)
+            .expect("Should get group")
+            .expect("Group should exist");
+
+        assert_eq!(initial_members.len(), 3, "Should have 3 members initially");
+        assert!(initial_members.contains(&alice_keys.public_key()));
+        assert!(initial_members.contains(&bob_keys.public_key()));
+        assert!(initial_members.contains(&carol_keys.public_key()));
+
+        // Bob and Carol create competing commits for the same epoch
+        let dave_keys = Keys::generate();
+        let eve_keys = Keys::generate();
+
+        let dave_key_package = create_key_package_event(&bob_mdk, &dave_keys);
+        let eve_key_package = create_key_package_event(&carol_mdk, &eve_keys);
+
+        // Bob creates commit to add Dave
+        let commit_a = bob_mdk
+            .add_members(&group_id, std::slice::from_ref(&dave_key_package))
+            .expect("Bob should create commit");
+
+        // Carol creates competing commit to add Eve
+        let commit_a_prime = carol_mdk
+            .add_members(&group_id, std::slice::from_ref(&eve_key_package))
+            .expect("Carol should create commit");
+
+        // Determine better/worse by MIP-03 rules
+        let (better_commit, worse_commit) =
+            order_events_by_mip03(&commit_a.evolution_event, &commit_a_prime.evolution_event);
+
+        // Alice processes the WORSE commit first
+        alice_mdk
+            .process_message(worse_commit)
+            .expect("Processing worse commit should succeed");
+
+        // Now the BETTER commit arrives - this should trigger rollback
+        alice_mdk
+            .process_message(better_commit)
+            .expect("Processing better commit should succeed");
+
+        // Verify rollback occurred
+        let rollback_count = callback.rollback_count();
+        assert!(
+            rollback_count > 0,
+            "Rollback should have occurred when better commit arrived"
+        );
+
+        // CRITICAL: Verify group still exists after rollback
+        let group_after_rollback = alice_mdk
+            .get_group(&group_id)
+            .expect("Should be able to get group after rollback")
+            .expect("Group MUST still exist after rollback");
+
+        // Verify group admins are preserved
+        assert_eq!(
+            group_after_rollback.admin_pubkeys, initial_group.admin_pubkeys,
+            "Admin pubkeys should be preserved after rollback"
+        );
+
+        // Verify membership: original 3 members + whichever new member was added by the winning commit
+        let members_after_rollback = alice_mdk
+            .get_members(&group_id)
+            .expect("Should get members after rollback");
+
+        // Original members must still be present
+        assert!(
+            members_after_rollback.contains(&alice_keys.public_key()),
+            "Alice should still be a member after rollback"
+        );
+        assert!(
+            members_after_rollback.contains(&bob_keys.public_key()),
+            "Bob should still be a member after rollback"
+        );
+        assert!(
+            members_after_rollback.contains(&carol_keys.public_key()),
+            "Carol should still be a member after rollback"
+        );
+
+        // Should have 4 members (original 3 + the one added by the winning commit)
+        assert_eq!(
+            members_after_rollback.len(),
+            4,
+            "Should have 4 members after applying winning commit (3 original + 1 new)"
+        );
     }
 
     /// Test EpochSnapshotManager directly for unit testing

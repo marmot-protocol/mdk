@@ -549,6 +549,7 @@ pub mod tests {
                 maximum_forward_distance: 500,
                 max_event_age_secs: 86400,
                 max_future_skew_secs: 120,
+                epoch_snapshot_retention: 5,
             };
 
             let alice_keys = Keys::generate();
