@@ -4,21 +4,14 @@
 //! and restore them later. This provides functionality analogous to SQLite
 //! savepoints for testing and rollback scenarios.
 //!
-//! # Concurrency Warning
+//! # Concurrency
 //!
-//! Snapshot creation and restoration are **not atomic** with respect to concurrent
-//! operations. These operations acquire multiple independent locks sequentially,
-//! which means:
+//! Snapshot creation and restoration are **atomic** operations:
 //!
-//! - During `create_snapshot()`: Concurrent writes may result in an inconsistent
-//!   snapshot (some changes captured, others not).
-//! - During `restore_snapshot()`: Concurrent reads may observe partial state
-//!   (some data restored, some still from before the restore).
-//!
-//! **Callers must ensure no concurrent operations are in progress when creating
-//! or restoring snapshots.** This is typically achieved by using snapshots only
-//! in single-threaded test scenarios or by holding an external synchronization
-//! primitive.
+//! - `create_snapshot()` acquires a global read lock on the storage state,
+//!   ensuring a consistent snapshot even with concurrent reads.
+//! - `restore_snapshot()` acquires a global write lock on the storage state,
+//!   ensuring the restore is consistent and blocks all other operations.
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -39,11 +32,11 @@ use crate::mls_storage::GroupDataType;
 /// 2. Attempt the operation
 /// 3. Restore the snapshot if the operation fails or needs to be undone
 ///
-/// # Concurrency Warning
+/// # Concurrency
 ///
-/// Snapshot creation and restoration are **not atomic** with respect to
-/// concurrent operations. Callers must ensure no concurrent operations are
-/// in progress when creating or restoring snapshots.
+/// Snapshot creation and restoration are **atomic**. `create_snapshot()` acquires
+/// a global read lock and `restore_snapshot()` acquires a global write lock,
+/// ensuring consistency in multi-threaded environments.
 ///
 /// # Example
 ///

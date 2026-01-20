@@ -12,9 +12,9 @@
 //! snapshot and restore operations for rollback scenarios, analogous to SQLite
 //! savepoints.
 //!
-//! **Note:** Snapshot and restore operations are not atomic with respect to
-//! concurrent access. Callers must ensure no other operations are in progress
-//! when creating or restoring snapshots.
+//! **Note:** Snapshot and restore operations are **atomic**. `create_snapshot()`
+//! acquires a global read lock and `restore_snapshot()` acquires a global write
+//! lock on the storage state, ensuring consistency in multi-threaded environments.
 
 //! ## Memory Exhaustion Protection
 //!
@@ -293,9 +293,9 @@ impl ValidationLimits {
 /// - Thread-safe access through `RwLock` protected data structures
 /// - LRU caching for frequently accessed MDK objects
 ///
-/// **Important:** Snapshot and restore operations read/write multiple independent
-/// locks and are not atomic with respect to concurrent operations. Callers must
-/// ensure no other operations are in progress when creating or restoring snapshots.
+/// **Concurrency:** Snapshot and restore operations are **atomic**. `create_snapshot()`
+/// acquires a global read lock and `restore_snapshot()` acquires a global write lock
+/// on the storage state, ensuring consistency in multi-threaded environments.
 ///
 /// ## Caching Strategy
 ///
