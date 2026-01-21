@@ -231,6 +231,9 @@ pub enum Error {
     /// Multiple group ID tags found (MIP-03 requires exactly one)
     #[error("multiple group ID tags found: expected exactly one h tag, found {0}")]
     MultipleGroupIdTags(usize),
+    /// Failed to create epoch snapshot for commit race resolution
+    #[error("failed to create epoch snapshot: {0}")]
+    SnapshotCreationFailed(String),
 }
 
 impl From<FromUtf8Error> for Error {
@@ -582,6 +585,16 @@ mod tests {
     fn test_own_commit_pending() {
         let error = Error::OwnCommitPending;
         assert_eq!(error.to_string(), "own commit pending merge");
+    }
+
+    /// Test SnapshotCreationFailed error variant
+    #[test]
+    fn test_snapshot_creation_failed() {
+        let error = Error::SnapshotCreationFailed("storage unavailable".to_string());
+        assert_eq!(
+            error.to_string(),
+            "failed to create epoch snapshot: storage unavailable"
+        );
     }
 
     /// Test Storage error conversion
