@@ -217,7 +217,8 @@ CREATE TABLE IF NOT EXISTS group_state_snapshots (
     row_key BLOB NOT NULL,      -- Serialized primary key (JSON)
     row_data BLOB NOT NULL,     -- Serialized row data (JSON)
     created_at INTEGER NOT NULL,
-    PRIMARY KEY (snapshot_name, group_id, table_name, row_key)
+    PRIMARY KEY (snapshot_name, group_id, table_name, row_key),
+    FOREIGN KEY (group_id) REFERENCES groups(mls_group_id) ON DELETE CASCADE
 );
 
 CREATE INDEX IF NOT EXISTS idx_group_state_snapshots_lookup

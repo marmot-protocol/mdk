@@ -770,12 +770,62 @@ impl MdkSqliteStorage {
             return Err(Error::Database("Snapshot not found".to_string()));
         }
 
+        // 1. Read snapshot data into memory FIRST, before any deletions.
+        // This is critical because the groups table has ON DELETE CASCADE to
+        // group_state_snapshots - if we delete the group first, the snapshot
+        // rows get deleted too!
+        let snapshot_rows: Vec<(String, Vec<u8>, Vec<u8>)> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT table_name, row_key, row_data FROM group_state_snapshots
+                     WHERE snapshot_name = ? AND group_id = ?",
+                )
+                .map_err(|e| Error::Database(e.to_string()))?;
+
+            let rows = stmt
+                .query_map(rusqlite::params![name, group_id_bytes], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })
+                .map_err(|e| Error::Database(e.to_string()))?;
+
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| Error::Database(e.to_string()))?
+        };
+
+        // Also read OTHER snapshots for this group (different names) so we can
+        // restore them after the CASCADE deletion. This preserves multiple snapshots.
+        #[allow(clippy::type_complexity)]
+        let other_snapshots: Vec<(String, String, Vec<u8>, Vec<u8>, i64)> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT snapshot_name, table_name, row_key, row_data, created_at
+                     FROM group_state_snapshots
+                     WHERE group_id = ? AND snapshot_name != ?",
+                )
+                .map_err(|e| Error::Database(e.to_string()))?;
+
+            let rows = stmt
+                .query_map(rusqlite::params![group_id_bytes, name], |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                })
+                .map_err(|e| Error::Database(e.to_string()))?;
+
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| Error::Database(e.to_string()))?
+        };
+
         // Begin transaction for atomicity - critical to prevent data loss on failure
         conn.execute("BEGIN IMMEDIATE", [])
             .map_err(|e| Error::Database(e.to_string()))?;
 
         let result = (|| -> Result<(), Error> {
-            // 1. Delete current rows for this group from all 7 tables
+            // 2. Delete current rows for this group from all 7 tables
             conn.execute(
                 "DELETE FROM openmls_group_data WHERE group_id = ?",
                 [group_id_bytes],
@@ -820,27 +870,16 @@ impl MdkSqliteStorage {
             )
             .map_err(|e| Error::Database(e.to_string()))?;
 
-            // 2. Restore from snapshot table
-            let mut stmt = conn
-                .prepare(
-                    "SELECT table_name, row_key, row_data FROM group_state_snapshots
-                 WHERE snapshot_name = ? AND group_id = ?",
-                )
-                .map_err(|e| Error::Database(e.to_string()))?;
+            // Note: The CASCADE will have deleted the snapshot rows, but we already
+            // have the data in memory (snapshot_rows).
 
-            let mut rows = stmt
-                .query(rusqlite::params![name, group_id_bytes])
-                .map_err(|e| Error::Database(e.to_string()))?;
-
-            while let Some(row) = rows.next().map_err(|e| Error::Database(e.to_string()))? {
-                let table_name: String = row.get(0).map_err(|e| Error::Database(e.to_string()))?;
-                let row_key: Vec<u8> = row.get(1).map_err(|e| Error::Database(e.to_string()))?;
-                let row_data: Vec<u8> = row.get(2).map_err(|e| Error::Database(e.to_string()))?;
-
+            // 3. Restore from in-memory snapshot data
+            for (table_name, row_key, row_data) in &snapshot_rows {
                 match table_name.as_str() {
                     "openmls_group_data" => {
-                        let (gid, data_type): (Vec<u8>, String) = serde_json::from_slice(&row_key)
-                            .map_err(|e| Error::Database(e.to_string()))?;
+                        let (gid, data_type): (Vec<u8>, String) =
+                            serde_json::from_slice(row_key)
+                                .map_err(|e| Error::Database(e.to_string()))?;
                         conn.execute(
                             "INSERT INTO openmls_group_data (provider_version, group_id, data_type, group_data)
                              VALUES (1, ?, ?, ?)",
@@ -850,7 +889,7 @@ impl MdkSqliteStorage {
                     }
                     "openmls_proposals" => {
                         let (gid, proposal_ref): (Vec<u8>, Vec<u8>) =
-                            serde_json::from_slice(&row_key)
+                            serde_json::from_slice(row_key)
                                 .map_err(|e| Error::Database(e.to_string()))?;
                         conn.execute(
                             "INSERT INTO openmls_proposals (provider_version, group_id, proposal_ref, proposal)
@@ -860,9 +899,8 @@ impl MdkSqliteStorage {
                         .map_err(|e| Error::Database(e.to_string()))?;
                     }
                     "openmls_own_leaf_nodes" => {
-                        let (gid, leaf_node): (Vec<u8>, Vec<u8>) =
-                            serde_json::from_slice(&row_data)
-                                .map_err(|e| Error::Database(e.to_string()))?;
+                        let (gid, leaf_node): (Vec<u8>, Vec<u8>) = serde_json::from_slice(row_data)
+                            .map_err(|e| Error::Database(e.to_string()))?;
                         conn.execute(
                             "INSERT INTO openmls_own_leaf_nodes (provider_version, group_id, leaf_node)
                              VALUES (1, ?, ?)",
@@ -872,7 +910,7 @@ impl MdkSqliteStorage {
                     }
                     "openmls_epoch_key_pairs" => {
                         let (gid, epoch_id, leaf_index): (Vec<u8>, Vec<u8>, i64) =
-                            serde_json::from_slice(&row_key)
+                            serde_json::from_slice(row_key)
                                 .map_err(|e| Error::Database(e.to_string()))?;
                         conn.execute(
                             "INSERT INTO openmls_epoch_key_pairs (provider_version, group_id, epoch_id, leaf_index, key_pairs)
@@ -882,7 +920,7 @@ impl MdkSqliteStorage {
                         .map_err(|e| Error::Database(e.to_string()))?;
                     }
                     "groups" => {
-                        let mls_group_id: Vec<u8> = serde_json::from_slice(&row_key)
+                        let mls_group_id: Vec<u8> = serde_json::from_slice(row_key)
                             .map_err(|e| Error::Database(e.to_string()))?;
                         #[allow(clippy::type_complexity)]
                         let (
@@ -909,7 +947,7 @@ impl MdkSqliteStorage {
                             Option<Vec<u8>>,
                             Option<Vec<u8>>,
                             Option<Vec<u8>>,
-                        ) = serde_json::from_slice(&row_data)
+                        ) = serde_json::from_slice(row_data)
                             .map_err(|e| Error::Database(e.to_string()))?;
                         conn.execute(
                             "INSERT INTO groups (mls_group_id, nostr_group_id, name, description, admin_pubkeys,
@@ -935,7 +973,7 @@ impl MdkSqliteStorage {
                     }
                     "group_relays" => {
                         let (mls_group_id, relay_url): (Vec<u8>, String) =
-                            serde_json::from_slice(&row_data)
+                            serde_json::from_slice(row_data)
                                 .map_err(|e| Error::Database(e.to_string()))?;
                         conn.execute(
                             "INSERT INTO group_relays (mls_group_id, relay_url) VALUES (?, ?)",
@@ -944,9 +982,8 @@ impl MdkSqliteStorage {
                         .map_err(|e| Error::Database(e.to_string()))?;
                     }
                     "group_exporter_secrets" => {
-                        let (mls_group_id, epoch): (Vec<u8>, i64) =
-                            serde_json::from_slice(&row_key)
-                                .map_err(|e| Error::Database(e.to_string()))?;
+                        let (mls_group_id, epoch): (Vec<u8>, i64) = serde_json::from_slice(row_key)
+                            .map_err(|e| Error::Database(e.to_string()))?;
                         conn.execute(
                             "INSERT INTO group_exporter_secrets (mls_group_id, epoch, secret) VALUES (?, ?, ?)",
                             rusqlite::params![mls_group_id, epoch, row_data],
@@ -959,14 +996,23 @@ impl MdkSqliteStorage {
                 }
             }
 
-            // 3. Delete the consumed snapshot
-            drop(rows);
-            drop(stmt);
+            // 4. Delete the consumed snapshot (may be no-op if CASCADE already deleted them)
             conn.execute(
                 "DELETE FROM group_state_snapshots WHERE snapshot_name = ? AND group_id = ?",
                 rusqlite::params![name, group_id_bytes],
             )
             .map_err(|e| Error::Database(e.to_string()))?;
+
+            // 5. Re-insert other snapshots that were deleted by CASCADE
+            // This preserves multiple snapshots when rolling back to one of them.
+            for (snap_name, table_name, row_key, row_data, created_at) in &other_snapshots {
+                conn.execute(
+                    "INSERT INTO group_state_snapshots (snapshot_name, group_id, table_name, row_key, row_data, created_at)
+                     VALUES (?, ?, ?, ?, ?, ?)",
+                    rusqlite::params![snap_name, group_id_bytes, table_name, row_key, row_data, created_at],
+                )
+                .map_err(|e| Error::Database(e.to_string()))?;
+            }
 
             Ok(())
         })();
