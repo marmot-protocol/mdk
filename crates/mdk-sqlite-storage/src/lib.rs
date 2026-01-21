@@ -482,256 +482,32 @@ impl MdkSqliteStorage {
                 )
                 .map_err(|e| Error::Database(e.to_string()))?;
 
-            // 1. openmls_group_data
-            {
-                let mut stmt = conn
-                .prepare("SELECT group_id, data_type, group_data FROM openmls_group_data WHERE group_id = ?")
-                .map_err(|e| Error::Database(e.to_string()))?;
-                let mut rows = stmt
-                    .query([group_id_bytes])
-                    .map_err(|e| Error::Database(e.to_string()))?;
-                while let Some(row) = rows.next().map_err(|e| Error::Database(e.to_string()))? {
-                    let gid: Vec<u8> = row.get(0).map_err(|e| Error::Database(e.to_string()))?;
-                    let data_type: String =
-                        row.get(1).map_err(|e| Error::Database(e.to_string()))?;
-                    let data: Vec<u8> = row.get(2).map_err(|e| Error::Database(e.to_string()))?;
-                    let row_key = serde_json::to_vec(&(&gid, &data_type))
-                        .map_err(|e| Error::Database(e.to_string()))?;
-                    insert_stmt
-                        .execute(rusqlite::params![
-                            name,
-                            group_id_bytes,
-                            "openmls_group_data",
-                            row_key,
-                            data,
-                            now
-                        ])
-                        .map_err(|e| Error::Database(e.to_string()))?;
-                }
-            }
-
-            // 2. openmls_proposals
-            {
-                let mut stmt = conn
-                .prepare("SELECT group_id, proposal_ref, proposal FROM openmls_proposals WHERE group_id = ?")
-                .map_err(|e| Error::Database(e.to_string()))?;
-                let mut rows = stmt
-                    .query([group_id_bytes])
-                    .map_err(|e| Error::Database(e.to_string()))?;
-                while let Some(row) = rows.next().map_err(|e| Error::Database(e.to_string()))? {
-                    let gid: Vec<u8> = row.get(0).map_err(|e| Error::Database(e.to_string()))?;
-                    let proposal_ref: Vec<u8> =
-                        row.get(1).map_err(|e| Error::Database(e.to_string()))?;
-                    let proposal: Vec<u8> =
-                        row.get(2).map_err(|e| Error::Database(e.to_string()))?;
-                    let row_key = serde_json::to_vec(&(&gid, &proposal_ref))
-                        .map_err(|e| Error::Database(e.to_string()))?;
-                    insert_stmt
-                        .execute(rusqlite::params![
-                            name,
-                            group_id_bytes,
-                            "openmls_proposals",
-                            row_key,
-                            proposal,
-                            now
-                        ])
-                        .map_err(|e| Error::Database(e.to_string()))?;
-                }
-            }
-
-            // 3. openmls_own_leaf_nodes
-            {
-                let mut stmt = conn
-                .prepare(
-                    "SELECT id, group_id, leaf_node FROM openmls_own_leaf_nodes WHERE group_id = ?",
-                )
-                .map_err(|e| Error::Database(e.to_string()))?;
-                let mut rows = stmt
-                    .query([group_id_bytes])
-                    .map_err(|e| Error::Database(e.to_string()))?;
-                while let Some(row) = rows.next().map_err(|e| Error::Database(e.to_string()))? {
-                    let id: i64 = row.get(0).map_err(|e| Error::Database(e.to_string()))?;
-                    let gid: Vec<u8> = row.get(1).map_err(|e| Error::Database(e.to_string()))?;
-                    let leaf_node: Vec<u8> =
-                        row.get(2).map_err(|e| Error::Database(e.to_string()))?;
-                    let row_key =
-                        serde_json::to_vec(&id).map_err(|e| Error::Database(e.to_string()))?;
-                    // Store the full row data for restoration
-                    let row_data = serde_json::to_vec(&(&gid, &leaf_node))
-                        .map_err(|e| Error::Database(e.to_string()))?;
-                    insert_stmt
-                        .execute(rusqlite::params![
-                            name,
-                            group_id_bytes,
-                            "openmls_own_leaf_nodes",
-                            row_key,
-                            row_data,
-                            now
-                        ])
-                        .map_err(|e| Error::Database(e.to_string()))?;
-                }
-            }
-
-            // 4. openmls_epoch_key_pairs
-            {
-                let mut stmt = conn
-                    .prepare(
-                        "SELECT group_id, epoch_id, leaf_index, key_pairs
-                     FROM openmls_epoch_key_pairs WHERE group_id = ?",
-                    )
-                    .map_err(|e| Error::Database(e.to_string()))?;
-                let mut rows = stmt
-                    .query([group_id_bytes])
-                    .map_err(|e| Error::Database(e.to_string()))?;
-                while let Some(row) = rows.next().map_err(|e| Error::Database(e.to_string()))? {
-                    let gid: Vec<u8> = row.get(0).map_err(|e| Error::Database(e.to_string()))?;
-                    let epoch_id: Vec<u8> =
-                        row.get(1).map_err(|e| Error::Database(e.to_string()))?;
-                    let leaf_index: i64 = row.get(2).map_err(|e| Error::Database(e.to_string()))?;
-                    let key_pairs: Vec<u8> =
-                        row.get(3).map_err(|e| Error::Database(e.to_string()))?;
-                    let row_key = serde_json::to_vec(&(&gid, &epoch_id, leaf_index))
-                        .map_err(|e| Error::Database(e.to_string()))?;
-                    insert_stmt
-                        .execute(rusqlite::params![
-                            name,
-                            group_id_bytes,
-                            "openmls_epoch_key_pairs",
-                            row_key,
-                            key_pairs,
-                            now
-                        ])
-                        .map_err(|e| Error::Database(e.to_string()))?;
-                }
-            }
-
-            // 5. groups (MDK table)
-            {
-                let mut stmt = conn
-                    .prepare(
-                        "SELECT mls_group_id, nostr_group_id, name, description, admin_pubkeys,
-                            last_message_id, last_message_at, epoch, state,
-                            image_hash, image_key, image_nonce
-                     FROM groups WHERE mls_group_id = ?",
-                    )
-                    .map_err(|e| Error::Database(e.to_string()))?;
-                let mut rows = stmt
-                    .query([group_id_bytes])
-                    .map_err(|e| Error::Database(e.to_string()))?;
-                while let Some(row) = rows.next().map_err(|e| Error::Database(e.to_string()))? {
-                    let mls_group_id: Vec<u8> =
-                        row.get(0).map_err(|e| Error::Database(e.to_string()))?;
-                    let nostr_group_id: Vec<u8> =
-                        row.get(1).map_err(|e| Error::Database(e.to_string()))?;
-                    let name_val: String =
-                        row.get(2).map_err(|e| Error::Database(e.to_string()))?;
-                    let description: String =
-                        row.get(3).map_err(|e| Error::Database(e.to_string()))?;
-                    let admin_pubkeys: String =
-                        row.get(4).map_err(|e| Error::Database(e.to_string()))?;
-                    let last_message_id: Option<Vec<u8>> =
-                        row.get(5).map_err(|e| Error::Database(e.to_string()))?;
-                    let last_message_at: Option<i64> =
-                        row.get(6).map_err(|e| Error::Database(e.to_string()))?;
-                    let epoch: i64 = row.get(7).map_err(|e| Error::Database(e.to_string()))?;
-                    let state: String = row.get(8).map_err(|e| Error::Database(e.to_string()))?;
-                    let image_hash: Option<Vec<u8>> =
-                        row.get(9).map_err(|e| Error::Database(e.to_string()))?;
-                    let image_key: Option<Vec<u8>> =
-                        row.get(10).map_err(|e| Error::Database(e.to_string()))?;
-                    let image_nonce: Option<Vec<u8>> =
-                        row.get(11).map_err(|e| Error::Database(e.to_string()))?;
-                    let row_key = serde_json::to_vec(&mls_group_id)
-                        .map_err(|e| Error::Database(e.to_string()))?;
-                    let row_data = serde_json::to_vec(&(
-                        &nostr_group_id,
-                        &name_val,
-                        &description,
-                        &admin_pubkeys,
-                        &last_message_id,
-                        &last_message_at,
-                        epoch,
-                        &state,
-                        &image_hash,
-                        &image_key,
-                        &image_nonce,
-                    ))
-                    .map_err(|e| Error::Database(e.to_string()))?;
-                    insert_stmt
-                        .execute(rusqlite::params![
-                            name,
-                            group_id_bytes,
-                            "groups",
-                            row_key,
-                            row_data,
-                            now
-                        ])
-                        .map_err(|e| Error::Database(e.to_string()))?;
-                }
-            }
-
-            // 6. group_relays
-            {
-                let mut stmt = conn
-                .prepare(
-                    "SELECT id, mls_group_id, relay_url FROM group_relays WHERE mls_group_id = ?",
-                )
-                .map_err(|e| Error::Database(e.to_string()))?;
-                let mut rows = stmt
-                    .query([group_id_bytes])
-                    .map_err(|e| Error::Database(e.to_string()))?;
-                while let Some(row) = rows.next().map_err(|e| Error::Database(e.to_string()))? {
-                    let id: i64 = row.get(0).map_err(|e| Error::Database(e.to_string()))?;
-                    let mls_group_id: Vec<u8> =
-                        row.get(1).map_err(|e| Error::Database(e.to_string()))?;
-                    let relay_url: String =
-                        row.get(2).map_err(|e| Error::Database(e.to_string()))?;
-                    let row_key =
-                        serde_json::to_vec(&id).map_err(|e| Error::Database(e.to_string()))?;
-                    let row_data = serde_json::to_vec(&(&mls_group_id, &relay_url))
-                        .map_err(|e| Error::Database(e.to_string()))?;
-                    insert_stmt
-                        .execute(rusqlite::params![
-                            name,
-                            group_id_bytes,
-                            "group_relays",
-                            row_key,
-                            row_data,
-                            now
-                        ])
-                        .map_err(|e| Error::Database(e.to_string()))?;
-                }
-            }
-
-            // 7. group_exporter_secrets
-            {
-                let mut stmt = conn
-                .prepare(
-                    "SELECT mls_group_id, epoch, secret FROM group_exporter_secrets WHERE mls_group_id = ?",
-                )
-                .map_err(|e| Error::Database(e.to_string()))?;
-                let mut rows = stmt
-                    .query([group_id_bytes])
-                    .map_err(|e| Error::Database(e.to_string()))?;
-                while let Some(row) = rows.next().map_err(|e| Error::Database(e.to_string()))? {
-                    let mls_group_id: Vec<u8> =
-                        row.get(0).map_err(|e| Error::Database(e.to_string()))?;
-                    let epoch: i64 = row.get(1).map_err(|e| Error::Database(e.to_string()))?;
-                    let secret: Vec<u8> = row.get(2).map_err(|e| Error::Database(e.to_string()))?;
-                    let row_key = serde_json::to_vec(&(&mls_group_id, epoch))
-                        .map_err(|e| Error::Database(e.to_string()))?;
-                    insert_stmt
-                        .execute(rusqlite::params![
-                            name,
-                            group_id_bytes,
-                            "group_exporter_secrets",
-                            row_key,
-                            secret,
-                            now
-                        ])
-                        .map_err(|e| Error::Database(e.to_string()))?;
-                }
-            }
+            // Snapshot all 7 tables (4 OpenMLS + 3 MDK)
+            Self::snapshot_openmls_group_data(&conn, &mut insert_stmt, name, group_id_bytes, now)?;
+            Self::snapshot_openmls_proposals(&conn, &mut insert_stmt, name, group_id_bytes, now)?;
+            Self::snapshot_openmls_own_leaf_nodes(
+                &conn,
+                &mut insert_stmt,
+                name,
+                group_id_bytes,
+                now,
+            )?;
+            Self::snapshot_openmls_epoch_key_pairs(
+                &conn,
+                &mut insert_stmt,
+                name,
+                group_id_bytes,
+                now,
+            )?;
+            Self::snapshot_groups_table(&conn, &mut insert_stmt, name, group_id_bytes, now)?;
+            Self::snapshot_group_relays(&conn, &mut insert_stmt, name, group_id_bytes, now)?;
+            Self::snapshot_group_exporter_secrets(
+                &conn,
+                &mut insert_stmt,
+                name,
+                group_id_bytes,
+                now,
+            )?;
 
             Ok(())
         })();
@@ -747,6 +523,300 @@ impl MdkSqliteStorage {
                 Err(e)
             }
         }
+    }
+
+    /// Snapshot helper: openmls_group_data table
+    fn snapshot_openmls_group_data(
+        conn: &rusqlite::Connection,
+        insert_stmt: &mut rusqlite::CachedStatement<'_>,
+        snapshot_name: &str,
+        group_id_bytes: &[u8],
+        now: i64,
+    ) -> Result<(), Error> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT group_id, data_type, group_data FROM openmls_group_data WHERE group_id = ?",
+            )
+            .map_err(|e| Error::Database(e.to_string()))?;
+        let mut rows = stmt
+            .query([group_id_bytes])
+            .map_err(|e| Error::Database(e.to_string()))?;
+
+        while let Some(row) = rows.next().map_err(|e| Error::Database(e.to_string()))? {
+            let gid: Vec<u8> = row.get(0).map_err(|e| Error::Database(e.to_string()))?;
+            let data_type: String = row.get(1).map_err(|e| Error::Database(e.to_string()))?;
+            let data: Vec<u8> = row.get(2).map_err(|e| Error::Database(e.to_string()))?;
+            let row_key = serde_json::to_vec(&(&gid, &data_type))
+                .map_err(|e| Error::Database(e.to_string()))?;
+            insert_stmt
+                .execute(rusqlite::params![
+                    snapshot_name,
+                    group_id_bytes,
+                    "openmls_group_data",
+                    row_key,
+                    data,
+                    now
+                ])
+                .map_err(|e| Error::Database(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Snapshot helper: openmls_proposals table
+    fn snapshot_openmls_proposals(
+        conn: &rusqlite::Connection,
+        insert_stmt: &mut rusqlite::CachedStatement<'_>,
+        snapshot_name: &str,
+        group_id_bytes: &[u8],
+        now: i64,
+    ) -> Result<(), Error> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT group_id, proposal_ref, proposal FROM openmls_proposals WHERE group_id = ?",
+            )
+            .map_err(|e| Error::Database(e.to_string()))?;
+        let mut rows = stmt
+            .query([group_id_bytes])
+            .map_err(|e| Error::Database(e.to_string()))?;
+
+        while let Some(row) = rows.next().map_err(|e| Error::Database(e.to_string()))? {
+            let gid: Vec<u8> = row.get(0).map_err(|e| Error::Database(e.to_string()))?;
+            let proposal_ref: Vec<u8> = row.get(1).map_err(|e| Error::Database(e.to_string()))?;
+            let proposal: Vec<u8> = row.get(2).map_err(|e| Error::Database(e.to_string()))?;
+            let row_key = serde_json::to_vec(&(&gid, &proposal_ref))
+                .map_err(|e| Error::Database(e.to_string()))?;
+            insert_stmt
+                .execute(rusqlite::params![
+                    snapshot_name,
+                    group_id_bytes,
+                    "openmls_proposals",
+                    row_key,
+                    proposal,
+                    now
+                ])
+                .map_err(|e| Error::Database(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Snapshot helper: openmls_own_leaf_nodes table
+    fn snapshot_openmls_own_leaf_nodes(
+        conn: &rusqlite::Connection,
+        insert_stmt: &mut rusqlite::CachedStatement<'_>,
+        snapshot_name: &str,
+        group_id_bytes: &[u8],
+        now: i64,
+    ) -> Result<(), Error> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, group_id, leaf_node FROM openmls_own_leaf_nodes WHERE group_id = ?",
+            )
+            .map_err(|e| Error::Database(e.to_string()))?;
+        let mut rows = stmt
+            .query([group_id_bytes])
+            .map_err(|e| Error::Database(e.to_string()))?;
+
+        while let Some(row) = rows.next().map_err(|e| Error::Database(e.to_string()))? {
+            let id: i64 = row.get(0).map_err(|e| Error::Database(e.to_string()))?;
+            let gid: Vec<u8> = row.get(1).map_err(|e| Error::Database(e.to_string()))?;
+            let leaf_node: Vec<u8> = row.get(2).map_err(|e| Error::Database(e.to_string()))?;
+            let row_key = serde_json::to_vec(&id).map_err(|e| Error::Database(e.to_string()))?;
+            let row_data = serde_json::to_vec(&(&gid, &leaf_node))
+                .map_err(|e| Error::Database(e.to_string()))?;
+            insert_stmt
+                .execute(rusqlite::params![
+                    snapshot_name,
+                    group_id_bytes,
+                    "openmls_own_leaf_nodes",
+                    row_key,
+                    row_data,
+                    now
+                ])
+                .map_err(|e| Error::Database(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Snapshot helper: openmls_epoch_key_pairs table
+    fn snapshot_openmls_epoch_key_pairs(
+        conn: &rusqlite::Connection,
+        insert_stmt: &mut rusqlite::CachedStatement<'_>,
+        snapshot_name: &str,
+        group_id_bytes: &[u8],
+        now: i64,
+    ) -> Result<(), Error> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT group_id, epoch_id, leaf_index, key_pairs
+                 FROM openmls_epoch_key_pairs WHERE group_id = ?",
+            )
+            .map_err(|e| Error::Database(e.to_string()))?;
+        let mut rows = stmt
+            .query([group_id_bytes])
+            .map_err(|e| Error::Database(e.to_string()))?;
+
+        while let Some(row) = rows.next().map_err(|e| Error::Database(e.to_string()))? {
+            let gid: Vec<u8> = row.get(0).map_err(|e| Error::Database(e.to_string()))?;
+            let epoch_id: Vec<u8> = row.get(1).map_err(|e| Error::Database(e.to_string()))?;
+            let leaf_index: i64 = row.get(2).map_err(|e| Error::Database(e.to_string()))?;
+            let key_pairs: Vec<u8> = row.get(3).map_err(|e| Error::Database(e.to_string()))?;
+            let row_key = serde_json::to_vec(&(&gid, &epoch_id, leaf_index))
+                .map_err(|e| Error::Database(e.to_string()))?;
+            insert_stmt
+                .execute(rusqlite::params![
+                    snapshot_name,
+                    group_id_bytes,
+                    "openmls_epoch_key_pairs",
+                    row_key,
+                    key_pairs,
+                    now
+                ])
+                .map_err(|e| Error::Database(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Snapshot helper: groups table (MDK)
+    fn snapshot_groups_table(
+        conn: &rusqlite::Connection,
+        insert_stmt: &mut rusqlite::CachedStatement<'_>,
+        snapshot_name: &str,
+        group_id_bytes: &[u8],
+        now: i64,
+    ) -> Result<(), Error> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT mls_group_id, nostr_group_id, name, description, admin_pubkeys,
+                        last_message_id, last_message_at, epoch, state,
+                        image_hash, image_key, image_nonce
+                 FROM groups WHERE mls_group_id = ?",
+            )
+            .map_err(|e| Error::Database(e.to_string()))?;
+        let mut rows = stmt
+            .query([group_id_bytes])
+            .map_err(|e| Error::Database(e.to_string()))?;
+
+        while let Some(row) = rows.next().map_err(|e| Error::Database(e.to_string()))? {
+            let mls_group_id: Vec<u8> = row.get(0).map_err(|e| Error::Database(e.to_string()))?;
+            let nostr_group_id: Vec<u8> = row.get(1).map_err(|e| Error::Database(e.to_string()))?;
+            let name_val: String = row.get(2).map_err(|e| Error::Database(e.to_string()))?;
+            let description: String = row.get(3).map_err(|e| Error::Database(e.to_string()))?;
+            let admin_pubkeys: String = row.get(4).map_err(|e| Error::Database(e.to_string()))?;
+            let last_message_id: Option<Vec<u8>> =
+                row.get(5).map_err(|e| Error::Database(e.to_string()))?;
+            let last_message_at: Option<i64> =
+                row.get(6).map_err(|e| Error::Database(e.to_string()))?;
+            let epoch: i64 = row.get(7).map_err(|e| Error::Database(e.to_string()))?;
+            let state: String = row.get(8).map_err(|e| Error::Database(e.to_string()))?;
+            let image_hash: Option<Vec<u8>> =
+                row.get(9).map_err(|e| Error::Database(e.to_string()))?;
+            let image_key: Option<Vec<u8>> =
+                row.get(10).map_err(|e| Error::Database(e.to_string()))?;
+            let image_nonce: Option<Vec<u8>> =
+                row.get(11).map_err(|e| Error::Database(e.to_string()))?;
+
+            let row_key =
+                serde_json::to_vec(&mls_group_id).map_err(|e| Error::Database(e.to_string()))?;
+            let row_data = serde_json::to_vec(&(
+                &nostr_group_id,
+                &name_val,
+                &description,
+                &admin_pubkeys,
+                &last_message_id,
+                &last_message_at,
+                epoch,
+                &state,
+                &image_hash,
+                &image_key,
+                &image_nonce,
+            ))
+            .map_err(|e| Error::Database(e.to_string()))?;
+
+            insert_stmt
+                .execute(rusqlite::params![
+                    snapshot_name,
+                    group_id_bytes,
+                    "groups",
+                    row_key,
+                    row_data,
+                    now
+                ])
+                .map_err(|e| Error::Database(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Snapshot helper: group_relays table
+    fn snapshot_group_relays(
+        conn: &rusqlite::Connection,
+        insert_stmt: &mut rusqlite::CachedStatement<'_>,
+        snapshot_name: &str,
+        group_id_bytes: &[u8],
+        now: i64,
+    ) -> Result<(), Error> {
+        let mut stmt = conn
+            .prepare("SELECT id, mls_group_id, relay_url FROM group_relays WHERE mls_group_id = ?")
+            .map_err(|e| Error::Database(e.to_string()))?;
+        let mut rows = stmt
+            .query([group_id_bytes])
+            .map_err(|e| Error::Database(e.to_string()))?;
+
+        while let Some(row) = rows.next().map_err(|e| Error::Database(e.to_string()))? {
+            let id: i64 = row.get(0).map_err(|e| Error::Database(e.to_string()))?;
+            let mls_group_id: Vec<u8> = row.get(1).map_err(|e| Error::Database(e.to_string()))?;
+            let relay_url: String = row.get(2).map_err(|e| Error::Database(e.to_string()))?;
+            let row_key = serde_json::to_vec(&id).map_err(|e| Error::Database(e.to_string()))?;
+            let row_data = serde_json::to_vec(&(&mls_group_id, &relay_url))
+                .map_err(|e| Error::Database(e.to_string()))?;
+            insert_stmt
+                .execute(rusqlite::params![
+                    snapshot_name,
+                    group_id_bytes,
+                    "group_relays",
+                    row_key,
+                    row_data,
+                    now
+                ])
+                .map_err(|e| Error::Database(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Snapshot helper: group_exporter_secrets table
+    fn snapshot_group_exporter_secrets(
+        conn: &rusqlite::Connection,
+        insert_stmt: &mut rusqlite::CachedStatement<'_>,
+        snapshot_name: &str,
+        group_id_bytes: &[u8],
+        now: i64,
+    ) -> Result<(), Error> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT mls_group_id, epoch, secret FROM group_exporter_secrets WHERE mls_group_id = ?",
+            )
+            .map_err(|e| Error::Database(e.to_string()))?;
+        let mut rows = stmt
+            .query([group_id_bytes])
+            .map_err(|e| Error::Database(e.to_string()))?;
+
+        while let Some(row) = rows.next().map_err(|e| Error::Database(e.to_string()))? {
+            let mls_group_id: Vec<u8> = row.get(0).map_err(|e| Error::Database(e.to_string()))?;
+            let epoch: i64 = row.get(1).map_err(|e| Error::Database(e.to_string()))?;
+            let secret: Vec<u8> = row.get(2).map_err(|e| Error::Database(e.to_string()))?;
+            let row_key = serde_json::to_vec(&(&mls_group_id, epoch))
+                .map_err(|e| Error::Database(e.to_string()))?;
+            insert_stmt
+                .execute(rusqlite::params![
+                    snapshot_name,
+                    group_id_bytes,
+                    "group_exporter_secrets",
+                    row_key,
+                    secret,
+                    now
+                ])
+                .map_err(|e| Error::Database(e.to_string()))?;
+        }
+        Ok(())
     }
 
     /// Restores a group's state from a snapshot by deleting current rows
