@@ -1156,7 +1156,10 @@ impl MdkStorageProvider for MdkSqliteStorage {
             .map_err(|e| MdkStorageError::Database(e.to_string()))
     }
 
-    fn list_group_snapshots(&self, group_id: &GroupId) -> Result<Vec<(String, u64)>, MdkStorageError> {
+    fn list_group_snapshots(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<Vec<(String, u64)>, MdkStorageError> {
         let conn = self.connection.blocking_lock();
         let mut stmt = conn
             .prepare_cached(
@@ -3537,7 +3540,10 @@ mod tests {
             let group_id = GroupId::from_slice(&[1, 2, 3, 4]);
 
             let snapshots = storage.list_group_snapshots(&group_id).unwrap();
-            assert!(snapshots.is_empty(), "Should return empty list for no snapshots");
+            assert!(
+                snapshots.is_empty(),
+                "Should return empty list for no snapshots"
+            );
         }
 
         #[test]
@@ -3569,11 +3575,17 @@ mod tests {
             storage.save_group(group).unwrap();
 
             // Create snapshots - they will have sequential timestamps
-            storage.create_group_snapshot(&group_id, "snap_first").unwrap();
+            storage
+                .create_group_snapshot(&group_id, "snap_first")
+                .unwrap();
             std::thread::sleep(std::time::Duration::from_millis(10));
-            storage.create_group_snapshot(&group_id, "snap_second").unwrap();
+            storage
+                .create_group_snapshot(&group_id, "snap_second")
+                .unwrap();
             std::thread::sleep(std::time::Duration::from_millis(10));
-            storage.create_group_snapshot(&group_id, "snap_third").unwrap();
+            storage
+                .create_group_snapshot(&group_id, "snap_third")
+                .unwrap();
 
             let result = storage.list_group_snapshots(&group_id).unwrap();
 
@@ -3663,7 +3675,9 @@ mod tests {
             storage.save_group(group).unwrap();
 
             // Create a snapshot
-            storage.create_group_snapshot(&group_id, "old_snap").unwrap();
+            storage
+                .create_group_snapshot(&group_id, "old_snap")
+                .unwrap();
 
             // Get the snapshot's timestamp
             let snapshots_before = storage.list_group_snapshots(&group_id).unwrap();
@@ -3705,7 +3719,9 @@ mod tests {
             storage.save_group(group).unwrap();
 
             // Create a snapshot
-            storage.create_group_snapshot(&group_id, "recent_snap").unwrap();
+            storage
+                .create_group_snapshot(&group_id, "recent_snap")
+                .unwrap();
 
             // Prune with threshold 0 - should keep everything
             let pruned = storage.prune_expired_snapshots(0).unwrap();
@@ -3745,7 +3761,9 @@ mod tests {
             storage.save_group(group).unwrap();
 
             // Create snapshot (this creates both group_state_snapshots header and data rows)
-            storage.create_group_snapshot(&group_id, "to_prune").unwrap();
+            storage
+                .create_group_snapshot(&group_id, "to_prune")
+                .unwrap();
 
             // Verify snapshot exists
             let before = storage.list_group_snapshots(&group_id).unwrap();

@@ -821,7 +821,10 @@ impl MdkStorageProvider for MdkMemoryStorage {
         Ok(())
     }
 
-    fn list_group_snapshots(&self, group_id: &GroupId) -> Result<Vec<(String, u64)>, MdkStorageError> {
+    fn list_group_snapshots(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<Vec<(String, u64)>, MdkStorageError> {
         let snapshots = self.group_snapshots.read();
         let mut result: Vec<(String, u64)> = snapshots
             .iter()
@@ -3249,7 +3252,10 @@ mod tests {
         let group_id = GroupId::from_slice(&[1, 2, 3, 4]);
 
         let snapshots = storage.list_group_snapshots(&group_id).unwrap();
-        assert!(snapshots.is_empty(), "Should return empty list for no snapshots");
+        assert!(
+            snapshots.is_empty(),
+            "Should return empty list for no snapshots"
+        );
     }
 
     #[test]

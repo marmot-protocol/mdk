@@ -92,7 +92,7 @@ pub trait MdkStorageProvider:
     ///
     /// Call this to free resources when a snapshot won't be used for rollback.
     fn release_group_snapshot(&self, group_id: &GroupId, name: &str)
-        -> Result<(), MdkStorageError>;
+    -> Result<(), MdkStorageError>;
 
     /// List all snapshots for a specific group with their creation timestamps.
     ///
@@ -108,8 +108,10 @@ pub trait MdkStorageProvider:
     /// # Returns
     ///
     /// A vector of (snapshot_name, created_at) tuples, or an error.
-    fn list_group_snapshots(&self, group_id: &GroupId)
-        -> Result<Vec<(String, u64)>, MdkStorageError>;
+    fn list_group_snapshots(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<Vec<(String, u64)>, MdkStorageError>;
 
     /// Prune all snapshots created before the given Unix timestamp.
     ///
