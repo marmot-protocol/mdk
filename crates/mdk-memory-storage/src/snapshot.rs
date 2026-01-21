@@ -57,6 +57,9 @@ pub struct GroupScopedSnapshot {
     /// The group ID this snapshot is for
     pub(crate) group_id: GroupId,
 
+    /// Unix timestamp when this snapshot was created
+    pub(crate) created_at: u64,
+
     // MLS data (filtered by group_id)
     /// MLS group data: (group_id, data_type) -> data
     pub(crate) mls_group_data: HashMap<(Vec<u8>, GroupDataType), Vec<u8>>,

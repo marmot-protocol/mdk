@@ -64,6 +64,11 @@ pub struct MdkConfig {
     /// Number of epoch snapshots to retain for rollback support.
     /// Default: 5
     pub epoch_snapshot_retention: Option<u32>,
+
+    /// Time-to-live for snapshots in seconds.
+    /// Snapshots older than this will be pruned on startup.
+    /// Default: 604800 (1 week)
+    pub snapshot_ttl_seconds: Option<u64>,
 }
 
 impl From<MdkConfig> for CoreMdkConfig {
@@ -86,6 +91,9 @@ impl From<MdkConfig> for CoreMdkConfig {
                 .epoch_snapshot_retention
                 .map(|v| v as usize)
                 .unwrap_or(defaults.epoch_snapshot_retention),
+            snapshot_ttl_seconds: config
+                .snapshot_ttl_seconds
+                .unwrap_or(defaults.snapshot_ttl_seconds),
         }
     }
 }
@@ -1368,6 +1376,7 @@ mod tests {
             out_of_order_tolerance: Some(50),    // 50 past messages
             maximum_forward_distance: Some(500), // 500 forward messages
             epoch_snapshot_retention: Some(5),   // 5 snapshots
+            snapshot_ttl_seconds: Some(604800),  // 1 week
         };
 
         let result = new_mdk_unencrypted(db_path.to_string_lossy().to_string(), Some(config));
@@ -1389,6 +1398,7 @@ mod tests {
             out_of_order_tolerance: Some(200), // Only override this one
             maximum_forward_distance: None,
             epoch_snapshot_retention: None,
+            snapshot_ttl_seconds: None,
         };
 
         let result = new_mdk_unencrypted(db_path.to_string_lossy().to_string(), Some(config));
@@ -1407,6 +1417,7 @@ mod tests {
             out_of_order_tolerance: None,
             maximum_forward_distance: None,
             epoch_snapshot_retention: None,
+            snapshot_ttl_seconds: None,
         };
 
         let core_config: CoreMdkConfig = config.into();
@@ -1415,6 +1426,7 @@ mod tests {
         assert_eq!(core_config.out_of_order_tolerance, 100);
         assert_eq!(core_config.maximum_forward_distance, 1000);
         assert_eq!(core_config.epoch_snapshot_retention, 5);
+        assert_eq!(core_config.snapshot_ttl_seconds, 604800);
     }
 
     #[test]

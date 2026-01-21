@@ -1627,6 +1627,7 @@ where
             Error::ProcessMessageWrongEpochWithInfo(msg_epoch) => {
                 // Check if this commit is "better" than what we have for this epoch
                 let is_better = self.epoch_snapshots.is_better_candidate(
+                    self.storage(),
                     &group.mls_group_id,
                     msg_epoch,
                     event.created_at.as_u64(),
@@ -8372,14 +8373,14 @@ mod tests {
             let earlier_ts = 999u64;
 
             assert!(
-                manager.is_better_candidate(&group_id, 0, earlier_ts, &candidate_id),
+                manager.is_better_candidate(&storage, &group_id, 0, earlier_ts, &candidate_id),
                 "Earlier timestamp should be better"
             );
 
             // Test: later timestamp should NOT be better
             let later_ts = 1001u64;
             assert!(
-                !manager.is_better_candidate(&group_id, 0, later_ts, &candidate_id),
+                !manager.is_better_candidate(&storage, &group_id, 0, later_ts, &candidate_id),
                 "Later timestamp should not be better"
             );
         }
@@ -8399,14 +8400,14 @@ mod tests {
             // Test: smaller ID (same timestamp) should be better
             let smaller_id = EventId::from_slice(&[0x70u8; 32]).unwrap();
             assert!(
-                manager.is_better_candidate(&group_id, 0, ts, &smaller_id),
+                manager.is_better_candidate(&storage, &group_id, 0, ts, &smaller_id),
                 "Smaller ID should be better when timestamps are equal"
             );
 
             // Test: larger ID (same timestamp) should NOT be better
             let larger_id = EventId::from_slice(&[0x90u8; 32]).unwrap();
             assert!(
-                !manager.is_better_candidate(&group_id, 0, ts, &larger_id),
+                !manager.is_better_candidate(&storage, &group_id, 0, ts, &larger_id),
                 "Larger ID should not be better when timestamps are equal"
             );
         }
@@ -8426,7 +8427,7 @@ mod tests {
             // Check epoch 1 (no snapshot exists) - should return false
             let candidate_id = EventId::from_slice(&[1u8; 32]).unwrap();
             assert!(
-                !manager.is_better_candidate(&group_id, 1, 999, &candidate_id),
+                !manager.is_better_candidate(&storage, &group_id, 1, 999, &candidate_id),
                 "Should return false for epoch with no snapshot"
             );
         }
@@ -8453,7 +8454,7 @@ mod tests {
             // Check by trying to see if epoch 2 candidate comparison works
             let candidate_id = EventId::from_slice(&[0xFFu8; 32]).unwrap();
             assert!(
-                !manager.is_better_candidate(&group_id, 2, 999, &candidate_id),
+                !manager.is_better_candidate(&storage, &group_id, 2, 999, &candidate_id),
                 "Epoch 2 snapshot should have been removed after rollback to epoch 1"
             );
         }
@@ -8472,7 +8473,7 @@ mod tests {
 
             // Same ID, same timestamp - should NOT be better
             assert!(
-                !manager.is_better_candidate(&group_id, 0, ts, &applied_commit_id),
+                !manager.is_better_candidate(&storage, &group_id, 0, ts, &applied_commit_id),
                 "Same event ID should not be considered better than itself"
             );
         }
@@ -8530,21 +8531,21 @@ mod tests {
             // Check that group A comparison uses group A's data (ts=1000)
             let candidate = EventId::from_slice(&[0x05u8; 32]).unwrap();
             assert!(
-                manager.is_better_candidate(&group_a, 0, 999, &candidate),
+                manager.is_better_candidate(&storage, &group_a, 0, 999, &candidate),
                 "Earlier timestamp (999) should be better for group A (ts=1000)"
             );
             assert!(
-                !manager.is_better_candidate(&group_a, 0, 1001, &candidate),
+                !manager.is_better_candidate(&storage, &group_a, 0, 1001, &candidate),
                 "Later timestamp (1001) should not be better for group A (ts=1000)"
             );
 
             // Check that group B comparison uses group B's data (ts=2000)
             assert!(
-                manager.is_better_candidate(&group_b, 0, 1999, &candidate),
+                manager.is_better_candidate(&storage, &group_b, 0, 1999, &candidate),
                 "Earlier timestamp (1999) should be better for group B (ts=2000)"
             );
             assert!(
-                !manager.is_better_candidate(&group_b, 0, 2001, &candidate),
+                !manager.is_better_candidate(&storage, &group_b, 0, 2001, &candidate),
                 "Later timestamp (2001) should not be better for group B (ts=2000)"
             );
         }
@@ -8569,25 +8570,25 @@ mod tests {
 
             // Epoch 0 should not exist anymore
             assert!(
-                !manager.is_better_candidate(&group_id, 0, 0, &candidate),
+                !manager.is_better_candidate(&storage, &group_id, 0, 0, &candidate),
                 "Epoch 0 snapshot should have been pruned"
             );
 
             // Epoch 1 should not exist anymore
             assert!(
-                !manager.is_better_candidate(&group_id, 1, 0, &candidate),
+                !manager.is_better_candidate(&storage, &group_id, 1, 0, &candidate),
                 "Epoch 1 snapshot should have been pruned"
             );
 
             // Epoch 2 should still exist (ts=1002)
             assert!(
-                manager.is_better_candidate(&group_id, 2, 1001, &candidate),
+                manager.is_better_candidate(&storage, &group_id, 2, 1001, &candidate),
                 "Epoch 2 snapshot should still exist"
             );
 
             // Epoch 4 should still exist (ts=1004)
             assert!(
-                manager.is_better_candidate(&group_id, 4, 1003, &candidate),
+                manager.is_better_candidate(&storage, &group_id, 4, 1003, &candidate),
                 "Epoch 4 snapshot should still exist"
             );
         }

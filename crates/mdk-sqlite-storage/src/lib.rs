@@ -1155,6 +1155,38 @@ impl MdkStorageProvider for MdkSqliteStorage {
         self.delete_group_snapshot(group_id, name)
             .map_err(|e| MdkStorageError::Database(e.to_string()))
     }
+
+    fn list_group_snapshots(&self, group_id: &GroupId) -> Result<Vec<(String, u64)>, MdkStorageError> {
+        let conn = self.connection.blocking_lock();
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT DISTINCT snapshot_name, created_at FROM group_state_snapshots
+                 WHERE group_id = ? ORDER BY created_at ASC",
+            )
+            .map_err(|e| MdkStorageError::Database(e.to_string()))?;
+
+        let rows = stmt
+            .query_map(rusqlite::params![group_id.as_slice()], |row| {
+                let name: String = row.get(0)?;
+                let created_at: i64 = row.get(1)?;
+                Ok((name, created_at as u64))
+            })
+            .map_err(|e| MdkStorageError::Database(e.to_string()))?;
+
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| MdkStorageError::Database(e.to_string()))
+    }
+
+    fn prune_expired_snapshots(&self, min_timestamp: u64) -> Result<usize, MdkStorageError> {
+        let conn = self.connection.blocking_lock();
+        let deleted = conn
+            .execute(
+                "DELETE FROM group_state_snapshots WHERE created_at < ?",
+                rusqlite::params![min_timestamp as i64],
+            )
+            .map_err(|e| MdkStorageError::Database(e.to_string()))?;
+        Ok(deleted)
+    }
 }
 
 // ============================================================================
@@ -3492,6 +3524,245 @@ mod tests {
                 .unwrap();
             assert_eq!(final_state.epoch, 0);
             assert_eq!(final_state.name, "Test Group 7");
+        }
+
+        #[test]
+        fn test_list_group_snapshots_empty() {
+            use mdk_storage_traits::MdkStorageProvider;
+
+            let temp_dir = tempdir().unwrap();
+            let db_path = temp_dir.path().join("list_snapshots_empty.db");
+            let storage = MdkSqliteStorage::new_unencrypted(&db_path).unwrap();
+
+            let group_id = GroupId::from_slice(&[1, 2, 3, 4]);
+
+            let snapshots = storage.list_group_snapshots(&group_id).unwrap();
+            assert!(snapshots.is_empty(), "Should return empty list for no snapshots");
+        }
+
+        #[test]
+        fn test_list_group_snapshots_returns_snapshots_sorted_by_created_at() {
+            use mdk_storage_traits::MdkStorageProvider;
+
+            let temp_dir = tempdir().unwrap();
+            let db_path = temp_dir.path().join("list_snapshots_sorted.db");
+            let storage = MdkSqliteStorage::new_unencrypted(&db_path).unwrap();
+
+            let group_id = GroupId::from_slice(&[8; 32]);
+            let nostr_group_id: [u8; 32] = [9; 32];
+
+            // Create a group first
+            let group = Group {
+                mls_group_id: group_id.clone(),
+                nostr_group_id,
+                name: "Test Group".to_string(),
+                description: "".to_string(),
+                admin_pubkeys: BTreeSet::new(),
+                last_message_id: None,
+                last_message_at: None,
+                epoch: 1,
+                state: GroupState::Active,
+                image_hash: None,
+                image_key: None,
+                image_nonce: None,
+            };
+            storage.save_group(group).unwrap();
+
+            // Create snapshots - they will have sequential timestamps
+            storage.create_group_snapshot(&group_id, "snap_first").unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            storage.create_group_snapshot(&group_id, "snap_second").unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            storage.create_group_snapshot(&group_id, "snap_third").unwrap();
+
+            let result = storage.list_group_snapshots(&group_id).unwrap();
+
+            assert_eq!(result.len(), 3);
+            // Should be sorted by created_at ascending
+            assert_eq!(result[0].0, "snap_first");
+            assert_eq!(result[1].0, "snap_second");
+            assert_eq!(result[2].0, "snap_third");
+            // Verify timestamps are increasing
+            assert!(result[0].1 <= result[1].1);
+            assert!(result[1].1 <= result[2].1);
+        }
+
+        #[test]
+        fn test_list_group_snapshots_only_returns_matching_group() {
+            use mdk_storage_traits::MdkStorageProvider;
+
+            let temp_dir = tempdir().unwrap();
+            let db_path = temp_dir.path().join("list_snapshots_filtered.db");
+            let storage = MdkSqliteStorage::new_unencrypted(&db_path).unwrap();
+
+            let group1 = GroupId::from_slice(&[1; 32]);
+            let group2 = GroupId::from_slice(&[2; 32]);
+
+            // Create groups
+            let g1 = Group {
+                mls_group_id: group1.clone(),
+                nostr_group_id: [11; 32],
+                name: "Group 1".to_string(),
+                description: "".to_string(),
+                admin_pubkeys: BTreeSet::new(),
+                last_message_id: None,
+                last_message_at: None,
+                epoch: 1,
+                state: GroupState::Active,
+                image_hash: None,
+                image_key: None,
+                image_nonce: None,
+            };
+            let g2 = Group {
+                mls_group_id: group2.clone(),
+                nostr_group_id: [22; 32],
+                name: "Group 2".to_string(),
+                ..g1.clone()
+            };
+            storage.save_group(g1).unwrap();
+            storage.save_group(g2).unwrap();
+
+            // Create snapshots for each group
+            storage.create_group_snapshot(&group1, "snap_g1").unwrap();
+            storage.create_group_snapshot(&group2, "snap_g2").unwrap();
+
+            let result1 = storage.list_group_snapshots(&group1).unwrap();
+            let result2 = storage.list_group_snapshots(&group2).unwrap();
+
+            assert_eq!(result1.len(), 1);
+            assert_eq!(result1[0].0, "snap_g1");
+
+            assert_eq!(result2.len(), 1);
+            assert_eq!(result2[0].0, "snap_g2");
+        }
+
+        #[test]
+        fn test_prune_expired_snapshots_removes_old_snapshots() {
+            use mdk_storage_traits::MdkStorageProvider;
+
+            let temp_dir = tempdir().unwrap();
+            let db_path = temp_dir.path().join("prune_expired.db");
+            let storage = MdkSqliteStorage::new_unencrypted(&db_path).unwrap();
+
+            let group_id = GroupId::from_slice(&[3; 32]);
+
+            let group = Group {
+                mls_group_id: group_id.clone(),
+                nostr_group_id: [33; 32],
+                name: "Test Group".to_string(),
+                description: "".to_string(),
+                admin_pubkeys: BTreeSet::new(),
+                last_message_id: None,
+                last_message_at: None,
+                epoch: 1,
+                state: GroupState::Active,
+                image_hash: None,
+                image_key: None,
+                image_nonce: None,
+            };
+            storage.save_group(group).unwrap();
+
+            // Create a snapshot
+            storage.create_group_snapshot(&group_id, "old_snap").unwrap();
+
+            // Get the snapshot's timestamp
+            let snapshots_before = storage.list_group_snapshots(&group_id).unwrap();
+            assert_eq!(snapshots_before.len(), 1);
+            let old_ts = snapshots_before[0].1;
+
+            // Prune with a threshold in the future - should prune the snapshot
+            let pruned = storage.prune_expired_snapshots(old_ts + 1).unwrap();
+            assert_eq!(pruned, 1, "Should have pruned 1 snapshot");
+
+            let remaining = storage.list_group_snapshots(&group_id).unwrap();
+            assert!(remaining.is_empty());
+        }
+
+        #[test]
+        fn test_prune_expired_snapshots_keeps_recent_snapshots() {
+            use mdk_storage_traits::MdkStorageProvider;
+
+            let temp_dir = tempdir().unwrap();
+            let db_path = temp_dir.path().join("prune_keeps_recent.db");
+            let storage = MdkSqliteStorage::new_unencrypted(&db_path).unwrap();
+
+            let group_id = GroupId::from_slice(&[4; 32]);
+
+            let group = Group {
+                mls_group_id: group_id.clone(),
+                nostr_group_id: [44; 32],
+                name: "Test Group".to_string(),
+                description: "".to_string(),
+                admin_pubkeys: BTreeSet::new(),
+                last_message_id: None,
+                last_message_at: None,
+                epoch: 1,
+                state: GroupState::Active,
+                image_hash: None,
+                image_key: None,
+                image_nonce: None,
+            };
+            storage.save_group(group).unwrap();
+
+            // Create a snapshot
+            storage.create_group_snapshot(&group_id, "recent_snap").unwrap();
+
+            // Prune with threshold 0 - should keep everything
+            let pruned = storage.prune_expired_snapshots(0).unwrap();
+            assert_eq!(pruned, 0, "Should have pruned 0 snapshots");
+
+            let remaining = storage.list_group_snapshots(&group_id).unwrap();
+            assert_eq!(remaining.len(), 1);
+            assert_eq!(remaining[0].0, "recent_snap");
+        }
+
+        #[test]
+        fn test_prune_expired_snapshots_with_cascade_delete() {
+            // This test verifies that pruning removes all related snapshot data
+            // (the CASCADE DELETE on the FK should handle this)
+            use mdk_storage_traits::MdkStorageProvider;
+
+            let temp_dir = tempdir().unwrap();
+            let db_path = temp_dir.path().join("prune_cascade.db");
+            let storage = MdkSqliteStorage::new_unencrypted(&db_path).unwrap();
+
+            let group_id = GroupId::from_slice(&[5; 32]);
+
+            let group = Group {
+                mls_group_id: group_id.clone(),
+                nostr_group_id: [55; 32],
+                name: "Test Group".to_string(),
+                description: "".to_string(),
+                admin_pubkeys: BTreeSet::new(),
+                last_message_id: None,
+                last_message_at: None,
+                epoch: 1,
+                state: GroupState::Active,
+                image_hash: None,
+                image_key: None,
+                image_nonce: None,
+            };
+            storage.save_group(group).unwrap();
+
+            // Create snapshot (this creates both group_state_snapshots header and data rows)
+            storage.create_group_snapshot(&group_id, "to_prune").unwrap();
+
+            // Verify snapshot exists
+            let before = storage.list_group_snapshots(&group_id).unwrap();
+            assert_eq!(before.len(), 1);
+
+            // Get timestamp and prune
+            let ts = before[0].1;
+            let pruned = storage.prune_expired_snapshots(ts + 1).unwrap();
+            assert_eq!(pruned, 1);
+
+            // Verify snapshot is completely gone
+            let after = storage.list_group_snapshots(&group_id).unwrap();
+            assert!(after.is_empty());
+
+            // Attempting to rollback should fail (no snapshot exists)
+            let rollback_result = storage.rollback_group_to_snapshot(&group_id, "to_prune");
+            assert!(rollback_result.is_err());
         }
     }
 }

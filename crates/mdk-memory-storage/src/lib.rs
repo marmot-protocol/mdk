@@ -632,8 +632,15 @@ impl MdkMemoryStorage {
             .map(|((_, epoch), secret)| (*epoch, secret.clone()))
             .collect();
 
+        // Get current Unix timestamp
+        let created_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("System time before Unix epoch")
+            .as_secs();
+
         GroupScopedSnapshot {
             group_id: group_id.clone(),
+            created_at,
             mls_group_data,
             mls_own_leaf_nodes,
             mls_proposals,
@@ -812,6 +819,26 @@ impl MdkStorageProvider for MdkMemoryStorage {
         let key = (group_id.clone(), name.to_string());
         self.group_snapshots.write().remove(&key);
         Ok(())
+    }
+
+    fn list_group_snapshots(&self, group_id: &GroupId) -> Result<Vec<(String, u64)>, MdkStorageError> {
+        let snapshots = self.group_snapshots.read();
+        let mut result: Vec<(String, u64)> = snapshots
+            .iter()
+            .filter(|((gid, _), _)| gid == group_id)
+            .map(|((_, name), snap)| (name.clone(), snap.created_at))
+            .collect();
+        // Sort by created_at ascending (oldest first)
+        result.sort_by_key(|(_, created_at)| *created_at);
+        Ok(result)
+    }
+
+    fn prune_expired_snapshots(&self, min_timestamp: u64) -> Result<usize, MdkStorageError> {
+        let mut snapshots = self.group_snapshots.write();
+        let initial_count = snapshots.len();
+        snapshots.retain(|_, snap| snap.created_at >= min_timestamp);
+        let pruned_count = initial_count - snapshots.len();
+        Ok(pruned_count)
     }
 }
 
@@ -3212,5 +3239,261 @@ mod tests {
             }
             _ => panic!("Expected NotFound error"),
         }
+    }
+
+    #[test]
+    fn test_list_group_snapshots_empty() {
+        use mdk_storage_traits::MdkStorageProvider;
+
+        let storage = MdkMemoryStorage::default();
+        let group_id = GroupId::from_slice(&[1, 2, 3, 4]);
+
+        let snapshots = storage.list_group_snapshots(&group_id).unwrap();
+        assert!(snapshots.is_empty(), "Should return empty list for no snapshots");
+    }
+
+    #[test]
+    fn test_list_group_snapshots_returns_snapshots_sorted_by_created_at() {
+        use mdk_storage_traits::MdkStorageProvider;
+
+        let storage = MdkMemoryStorage::default();
+        let group_id = GroupId::from_slice(&[1, 2, 3, 4]);
+        let nostr_group_id: [u8; 32] = generate_random_bytes(32).try_into().unwrap();
+
+        // Create a group first
+        let group = Group {
+            mls_group_id: group_id.clone(),
+            nostr_group_id,
+            name: "Test Group".to_string(),
+            description: "".to_string(),
+            admin_pubkeys: BTreeSet::new(),
+            last_message_id: None,
+            last_message_at: None,
+            epoch: 1,
+            state: GroupState::Active,
+            image_hash: None,
+            image_key: None,
+            image_nonce: None,
+        };
+        storage.save_group(group).unwrap();
+
+        // Create snapshots with different timestamps
+        // We need to manipulate the created_at directly since create_group_scoped_snapshot uses system time
+        {
+            let mut snapshots = storage.group_snapshots.write();
+
+            // Insert snapshots with known created_at values (out of order)
+            let snap1 = crate::snapshot::GroupScopedSnapshot {
+                group_id: group_id.clone(),
+                created_at: 1000,
+                mls_group_data: std::collections::HashMap::new(),
+                mls_own_leaf_nodes: vec![],
+                mls_proposals: std::collections::HashMap::new(),
+                mls_epoch_key_pairs: std::collections::HashMap::new(),
+                group: None,
+                group_relays: std::collections::BTreeSet::new(),
+                group_exporter_secrets: std::collections::HashMap::new(),
+            };
+            let snap2 = crate::snapshot::GroupScopedSnapshot {
+                group_id: group_id.clone(),
+                created_at: 3000, // Newest
+                ..snap1.clone()
+            };
+            let snap3 = crate::snapshot::GroupScopedSnapshot {
+                group_id: group_id.clone(),
+                created_at: 2000, // Middle
+                ..snap1.clone()
+            };
+
+            snapshots.insert((group_id.clone(), "snap_oldest".to_string()), snap1);
+            snapshots.insert((group_id.clone(), "snap_newest".to_string()), snap2);
+            snapshots.insert((group_id.clone(), "snap_middle".to_string()), snap3);
+        }
+
+        let result = storage.list_group_snapshots(&group_id).unwrap();
+
+        assert_eq!(result.len(), 3);
+        // Should be sorted by created_at ascending
+        assert_eq!(result[0].0, "snap_oldest");
+        assert_eq!(result[0].1, 1000);
+        assert_eq!(result[1].0, "snap_middle");
+        assert_eq!(result[1].1, 2000);
+        assert_eq!(result[2].0, "snap_newest");
+        assert_eq!(result[2].1, 3000);
+    }
+
+    #[test]
+    fn test_list_group_snapshots_only_returns_matching_group() {
+        use mdk_storage_traits::MdkStorageProvider;
+
+        let storage = MdkMemoryStorage::default();
+        let group1 = GroupId::from_slice(&[1, 1, 1, 1]);
+        let group2 = GroupId::from_slice(&[2, 2, 2, 2]);
+
+        {
+            let mut snapshots = storage.group_snapshots.write();
+
+            let snap1 = crate::snapshot::GroupScopedSnapshot {
+                group_id: group1.clone(),
+                created_at: 1000,
+                mls_group_data: std::collections::HashMap::new(),
+                mls_own_leaf_nodes: vec![],
+                mls_proposals: std::collections::HashMap::new(),
+                mls_epoch_key_pairs: std::collections::HashMap::new(),
+                group: None,
+                group_relays: std::collections::BTreeSet::new(),
+                group_exporter_secrets: std::collections::HashMap::new(),
+            };
+            let snap2 = crate::snapshot::GroupScopedSnapshot {
+                group_id: group2.clone(),
+                created_at: 2000,
+                ..snap1.clone()
+            };
+
+            snapshots.insert((group1.clone(), "snap_group1".to_string()), snap1);
+            snapshots.insert((group2.clone(), "snap_group2".to_string()), snap2);
+        }
+
+        let result1 = storage.list_group_snapshots(&group1).unwrap();
+        let result2 = storage.list_group_snapshots(&group2).unwrap();
+
+        assert_eq!(result1.len(), 1);
+        assert_eq!(result1[0].0, "snap_group1");
+
+        assert_eq!(result2.len(), 1);
+        assert_eq!(result2[0].0, "snap_group2");
+    }
+
+    #[test]
+    fn test_prune_expired_snapshots_removes_old_snapshots() {
+        use mdk_storage_traits::MdkStorageProvider;
+
+        let storage = MdkMemoryStorage::default();
+        let group_id = GroupId::from_slice(&[1, 2, 3, 4]);
+
+        {
+            let mut snapshots = storage.group_snapshots.write();
+
+            let base_snap = crate::snapshot::GroupScopedSnapshot {
+                group_id: group_id.clone(),
+                created_at: 0,
+                mls_group_data: std::collections::HashMap::new(),
+                mls_own_leaf_nodes: vec![],
+                mls_proposals: std::collections::HashMap::new(),
+                mls_epoch_key_pairs: std::collections::HashMap::new(),
+                group: None,
+                group_relays: std::collections::BTreeSet::new(),
+                group_exporter_secrets: std::collections::HashMap::new(),
+            };
+
+            // Old snapshot (should be pruned)
+            let old_snap = crate::snapshot::GroupScopedSnapshot {
+                created_at: 1000,
+                ..base_snap.clone()
+            };
+            // New snapshot (should be kept)
+            let new_snap = crate::snapshot::GroupScopedSnapshot {
+                created_at: 5000,
+                ..base_snap.clone()
+            };
+
+            snapshots.insert((group_id.clone(), "old_snap".to_string()), old_snap);
+            snapshots.insert((group_id.clone(), "new_snap".to_string()), new_snap);
+        }
+
+        // Prune snapshots older than 3000
+        let pruned = storage.prune_expired_snapshots(3000).unwrap();
+
+        assert_eq!(pruned, 1, "Should have pruned 1 snapshot");
+
+        let remaining = storage.list_group_snapshots(&group_id).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].0, "new_snap");
+        assert_eq!(remaining[0].1, 5000);
+    }
+
+    #[test]
+    fn test_prune_expired_snapshots_returns_zero_when_nothing_to_prune() {
+        use mdk_storage_traits::MdkStorageProvider;
+
+        let storage = MdkMemoryStorage::default();
+        let group_id = GroupId::from_slice(&[1, 2, 3, 4]);
+
+        {
+            let mut snapshots = storage.group_snapshots.write();
+
+            let snap = crate::snapshot::GroupScopedSnapshot {
+                group_id: group_id.clone(),
+                created_at: 5000, // Newer than threshold
+                mls_group_data: std::collections::HashMap::new(),
+                mls_own_leaf_nodes: vec![],
+                mls_proposals: std::collections::HashMap::new(),
+                mls_epoch_key_pairs: std::collections::HashMap::new(),
+                group: None,
+                group_relays: std::collections::BTreeSet::new(),
+                group_exporter_secrets: std::collections::HashMap::new(),
+            };
+
+            snapshots.insert((group_id.clone(), "recent_snap".to_string()), snap);
+        }
+
+        // Prune snapshots older than 1000 (none qualify)
+        let pruned = storage.prune_expired_snapshots(1000).unwrap();
+
+        assert_eq!(pruned, 0, "Should have pruned 0 snapshots");
+
+        let remaining = storage.list_group_snapshots(&group_id).unwrap();
+        assert_eq!(remaining.len(), 1);
+    }
+
+    #[test]
+    fn test_prune_expired_snapshots_across_multiple_groups() {
+        use mdk_storage_traits::MdkStorageProvider;
+
+        let storage = MdkMemoryStorage::default();
+        let group1 = GroupId::from_slice(&[1, 1, 1, 1]);
+        let group2 = GroupId::from_slice(&[2, 2, 2, 2]);
+
+        {
+            let mut snapshots = storage.group_snapshots.write();
+
+            let base_snap1 = crate::snapshot::GroupScopedSnapshot {
+                group_id: group1.clone(),
+                created_at: 1000, // Old, should be pruned
+                mls_group_data: std::collections::HashMap::new(),
+                mls_own_leaf_nodes: vec![],
+                mls_proposals: std::collections::HashMap::new(),
+                mls_epoch_key_pairs: std::collections::HashMap::new(),
+                group: None,
+                group_relays: std::collections::BTreeSet::new(),
+                group_exporter_secrets: std::collections::HashMap::new(),
+            };
+            let base_snap2 = crate::snapshot::GroupScopedSnapshot {
+                group_id: group2.clone(),
+                created_at: 2000, // Old, should be pruned
+                ..base_snap1.clone()
+            };
+            let new_snap1 = crate::snapshot::GroupScopedSnapshot {
+                group_id: group1.clone(),
+                created_at: 5000, // New, keep
+                ..base_snap1.clone()
+            };
+
+            snapshots.insert((group1.clone(), "old_snap_g1".to_string()), base_snap1);
+            snapshots.insert((group2.clone(), "old_snap_g2".to_string()), base_snap2);
+            snapshots.insert((group1.clone(), "new_snap_g1".to_string()), new_snap1);
+        }
+
+        // Prune snapshots older than 3000
+        let pruned = storage.prune_expired_snapshots(3000).unwrap();
+
+        assert_eq!(pruned, 2, "Should have pruned 2 snapshots across groups");
+
+        let remaining1 = storage.list_group_snapshots(&group1).unwrap();
+        let remaining2 = storage.list_group_snapshots(&group2).unwrap();
+
+        assert_eq!(remaining1.len(), 1);
+        assert_eq!(remaining1[0].0, "new_snap_g1");
+        assert!(remaining2.is_empty());
     }
 }

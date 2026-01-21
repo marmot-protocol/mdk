@@ -9,7 +9,7 @@
 //! 1. Earliest timestamp wins
 //! 2. Lexicographically smallest event ID breaks ties
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::sync::Mutex;
 use std::time::Instant;
@@ -51,6 +51,8 @@ impl fmt::Debug for EpochSnapshot {
 struct EpochSnapshotManagerInner {
     /// Snapshots per group, ordered by epoch (oldest first)
     snapshots: HashMap<GroupId, VecDeque<EpochSnapshot>>,
+    /// Groups that have been hydrated from storage (only relevant for persistent backends)
+    hydrated_groups: HashSet<GroupId>,
 }
 
 impl fmt::Debug for EpochSnapshotManagerInner {
@@ -86,9 +88,100 @@ impl EpochSnapshotManager {
         Self {
             inner: Mutex::new(EpochSnapshotManagerInner {
                 snapshots: HashMap::new(),
+                hydrated_groups: HashSet::new(),
             }),
             retention_count,
         }
+    }
+
+    /// Ensure a group's snapshots have been loaded from storage.
+    ///
+    /// For persistent backends (SQLite), this loads existing snapshots into memory
+    /// so the manager knows about them after a restart. For memory backends, this
+    /// is a no-op since all snapshots are already in memory.
+    ///
+    /// This method must be called at the start of any operation that reads or
+    /// modifies the snapshot queue for a group.
+    fn ensure_hydrated<S: MdkStorageProvider>(&self, storage: &S, group_id: &GroupId) {
+        // Memory backend doesn't need hydration - all snapshots are already tracked
+        if !storage.backend().is_persistent() {
+            return;
+        }
+
+        let mut inner = self.inner.lock().unwrap();
+
+        // Skip if already hydrated
+        if inner.hydrated_groups.contains(group_id) {
+            return;
+        }
+
+        // Load snapshots from storage
+        let stored_snapshots = match storage.list_group_snapshots(group_id) {
+            Ok(snapshots) => snapshots,
+            Err(e) => {
+                tracing::warn!("Failed to load snapshots for hydration: {}", e);
+                // Mark as hydrated anyway to avoid repeated failures
+                inner.hydrated_groups.insert(group_id.clone());
+                return;
+            }
+        };
+
+        // Parse snapshot names and populate the queue
+        // Format: "snap_{group_id_hex}_{epoch}_{commit_id_hex}"
+        let queue = inner.snapshots.entry(group_id.clone()).or_default();
+
+        for (snapshot_name, created_at_unix) in stored_snapshots {
+            if let Some(snapshot) =
+                Self::parse_snapshot_name(&snapshot_name, group_id, created_at_unix)
+            {
+                queue.push_back(snapshot);
+            } else {
+                tracing::warn!(
+                    "Failed to parse snapshot name during hydration: {}",
+                    snapshot_name
+                );
+            }
+        }
+
+        // Enforce retention limit after hydration
+        while queue.len() > self.retention_count {
+            if let Some(old_snap) = queue.pop_front() {
+                let _ = storage.release_group_snapshot(&old_snap.group_id, &old_snap.snapshot_name);
+            }
+        }
+
+        inner.hydrated_groups.insert(group_id.clone());
+    }
+
+    /// Parse a snapshot name to reconstruct EpochSnapshot metadata.
+    ///
+    /// The format is: "snap_{group_id_hex}_{epoch}_{commit_id_hex}"
+    fn parse_snapshot_name(
+        snapshot_name: &str,
+        group_id: &GroupId,
+        _created_at_unix: u64,
+    ) -> Option<EpochSnapshot> {
+        let parts: Vec<&str> = snapshot_name.split('_').collect();
+        // Expected: ["snap", "{group_id_hex}", "{epoch}", "{commit_id_hex}"]
+        if parts.len() != 4 || parts[0] != "snap" {
+            return None;
+        }
+
+        let epoch: u64 = parts[2].parse().ok()?;
+        let commit_id = EventId::parse(parts[3]).ok()?;
+
+        // We don't have the original timestamp, so we use 0 as a placeholder.
+        // The comparison logic doesn't use applied_commit_ts from hydrated snapshots
+        // for the "better candidate" check - that info is lost. But the snapshot
+        // can still be used for rollback if explicitly requested.
+        Some(EpochSnapshot {
+            group_id: group_id.clone(),
+            epoch,
+            applied_commit_id: commit_id,
+            applied_commit_ts: 0, // Unknown after restart - hydrated snapshots should not be used for is_better_candidate
+            created_at: Instant::now(), // Placeholder - not used for comparisons
+            snapshot_name: snapshot_name.to_string(),
+        })
     }
 
     /// Create a snapshot before applying a commit
@@ -100,6 +193,9 @@ impl EpochSnapshotManager {
         commit_id: &EventId,
         commit_ts: u64,
     ) -> Result<String, Error> {
+        // Ensure we have loaded any existing snapshots from storage
+        self.ensure_hydrated(storage, group_id);
+
         // Generate a unique snapshot name
         let snapshot_name = format!(
             "snap_{}_{}_{}",
@@ -142,18 +238,27 @@ impl EpochSnapshotManager {
 
     /// Check if a candidate commit is "better" than the one we applied for this epoch.
     /// Returns true if we should rollback.
-    pub fn is_better_candidate(
+    pub fn is_better_candidate<S: MdkStorageProvider>(
         &self,
+        storage: &S,
         group_id: &GroupId,
         candidate_epoch: u64,
         candidate_ts: u64,
         candidate_id: &EventId,
     ) -> bool {
+        // Ensure we have loaded any existing snapshots from storage
+        self.ensure_hydrated(storage, group_id);
+
         let inner = self.inner.lock().unwrap();
 
         if let Some(queue) = inner.snapshots.get(group_id)
             && let Some(snapshot) = queue.iter().find(|s| s.epoch == candidate_epoch)
         {
+            // Skip comparison for hydrated snapshots (applied_commit_ts == 0) since
+            // we don't have the original timestamp info after restart
+            if snapshot.applied_commit_ts == 0 {
+                return false;
+            }
             // Compare according to MIP-03
             // 1. Earliest timestamp wins
             if candidate_ts < snapshot.applied_commit_ts {
@@ -181,6 +286,9 @@ impl EpochSnapshotManager {
         group_id: &GroupId,
         target_epoch: u64,
     ) -> Result<(), Error> {
+        // Ensure we have loaded any existing snapshots from storage
+        self.ensure_hydrated(storage, group_id);
+
         let mut inner = self.inner.lock().unwrap();
 
         if let Some(queue) = inner.snapshots.get_mut(group_id) {
@@ -252,6 +360,7 @@ mod tests {
     #[test]
     fn test_is_better_candidate_earlier_timestamp_wins() {
         let manager = EpochSnapshotManager::new(5);
+        let storage = mdk_memory_storage::MdkMemoryStorage::default();
         let group_id = test_group_id(1);
         let applied_id =
             test_event_id("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
@@ -277,12 +386,13 @@ mod tests {
         // Candidate with earlier timestamp (999 < 1000) should be better
         let candidate_id =
             test_event_id("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
-        assert!(manager.is_better_candidate(&group_id, 10, 999, &candidate_id));
+        assert!(manager.is_better_candidate(&storage, &group_id, 10, 999, &candidate_id));
     }
 
     #[test]
     fn test_is_better_candidate_later_timestamp_loses() {
         let manager = EpochSnapshotManager::new(5);
+        let storage = mdk_memory_storage::MdkMemoryStorage::default();
         let group_id = test_group_id(1);
         let applied_id =
             test_event_id("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
@@ -307,12 +417,13 @@ mod tests {
         // Candidate with later timestamp (1001 > 1000) should NOT be better
         let candidate_id =
             test_event_id("0000000000000000000000000000000000000000000000000000000000000000");
-        assert!(!manager.is_better_candidate(&group_id, 10, 1001, &candidate_id));
+        assert!(!manager.is_better_candidate(&storage, &group_id, 10, 1001, &candidate_id));
     }
 
     #[test]
     fn test_is_better_candidate_smaller_id_wins_on_same_timestamp() {
         let manager = EpochSnapshotManager::new(5);
+        let storage = mdk_memory_storage::MdkMemoryStorage::default();
         let group_id = test_group_id(1);
         // Applied commit has ID starting with 'b'
         let applied_id =
@@ -338,12 +449,13 @@ mod tests {
         // Candidate with same timestamp but smaller ID ('a' < 'b') should be better
         let candidate_id =
             test_event_id("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
-        assert!(manager.is_better_candidate(&group_id, 10, 1000, &candidate_id));
+        assert!(manager.is_better_candidate(&storage, &group_id, 10, 1000, &candidate_id));
     }
 
     #[test]
     fn test_is_better_candidate_larger_id_loses_on_same_timestamp() {
         let manager = EpochSnapshotManager::new(5);
+        let storage = mdk_memory_storage::MdkMemoryStorage::default();
         let group_id = test_group_id(1);
         // Applied commit has ID starting with 'a'
         let applied_id =
@@ -369,12 +481,13 @@ mod tests {
         // Candidate with same timestamp but larger ID ('c' > 'a') should NOT be better
         let candidate_id =
             test_event_id("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc");
-        assert!(!manager.is_better_candidate(&group_id, 10, 1000, &candidate_id));
+        assert!(!manager.is_better_candidate(&storage, &group_id, 10, 1000, &candidate_id));
     }
 
     #[test]
     fn test_is_better_candidate_same_id_returns_false() {
         let manager = EpochSnapshotManager::new(5);
+        let storage = mdk_memory_storage::MdkMemoryStorage::default();
         let group_id = test_group_id(1);
         let applied_id =
             test_event_id("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
@@ -397,12 +510,13 @@ mod tests {
         }
 
         // Same ID and timestamp should NOT be better (it's the same commit)
-        assert!(!manager.is_better_candidate(&group_id, 10, 1000, &applied_id));
+        assert!(!manager.is_better_candidate(&storage, &group_id, 10, 1000, &applied_id));
     }
 
     #[test]
     fn test_is_better_candidate_wrong_epoch_returns_false() {
         let manager = EpochSnapshotManager::new(5);
+        let storage = mdk_memory_storage::MdkMemoryStorage::default();
         let group_id = test_group_id(1);
         let applied_id =
             test_event_id("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
@@ -427,18 +541,19 @@ mod tests {
         // Even with earlier timestamp, wrong epoch should return false
         let candidate_id =
             test_event_id("0000000000000000000000000000000000000000000000000000000000000000");
-        assert!(!manager.is_better_candidate(&group_id, 11, 999, &candidate_id)); // epoch 11 != 10
+        assert!(!manager.is_better_candidate(&storage, &group_id, 11, 999, &candidate_id)); // epoch 11 != 10
     }
 
     #[test]
     fn test_is_better_candidate_unknown_group_returns_false() {
         let manager = EpochSnapshotManager::new(5);
+        let storage = mdk_memory_storage::MdkMemoryStorage::default();
         let unknown_group_id = test_group_id(99);
         let candidate_id =
             test_event_id("0000000000000000000000000000000000000000000000000000000000000000");
 
         // No snapshots for this group, should return false
-        assert!(!manager.is_better_candidate(&unknown_group_id, 10, 999, &candidate_id));
+        assert!(!manager.is_better_candidate(&storage, &unknown_group_id, 10, 999, &candidate_id));
     }
 
     #[test]
@@ -471,6 +586,7 @@ mod tests {
     #[test]
     fn test_snapshots_isolated_per_group() {
         let manager = EpochSnapshotManager::new(5);
+        let storage = mdk_memory_storage::MdkMemoryStorage::default();
         let group1 = test_group_id(1);
         let group2 = test_group_id(2);
         let applied_id =
@@ -498,10 +614,10 @@ mod tests {
             test_event_id("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
 
         // Group1 should find the snapshot
-        assert!(manager.is_better_candidate(&group1, 10, 999, &candidate_id));
+        assert!(manager.is_better_candidate(&storage, &group1, 10, 999, &candidate_id));
 
         // Group2 should NOT find any snapshot
-        assert!(!manager.is_better_candidate(&group2, 10, 999, &candidate_id));
+        assert!(!manager.is_better_candidate(&storage, &group2, 10, 999, &candidate_id));
     }
 
     #[test]
@@ -743,5 +859,115 @@ mod tests {
         assert!(name.starts_with("snap_"));
         assert!(name.contains("_5_")); // epoch
         assert!(name.contains("aaaa")); // part of commit_id
+    }
+
+    // ========================================
+    // Hydration Tests
+    // ========================================
+
+    #[test]
+    fn test_hydration_skipped_for_memory_storage() {
+        // Memory storage is not persistent, so hydration should be skipped
+        // We can verify this by checking that is_better_candidate returns false
+        // for a non-existent in-memory snapshot (no hydration occurs)
+        let manager = EpochSnapshotManager::new(5);
+        let storage = mdk_memory_storage::MdkMemoryStorage::default();
+        let group_id = test_group_id(1);
+
+        // Call is_better_candidate - since memory storage is not persistent,
+        // no hydration occurs and there are no snapshots
+        let candidate_id =
+            test_event_id("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        let result = manager.is_better_candidate(&storage, &group_id, 5, 999, &candidate_id);
+
+        // Should return false since there are no snapshots and no hydration
+        assert!(
+            !result,
+            "Should return false for non-persistent storage with no snapshots"
+        );
+
+        // Verify the internal state - no snapshots should have been added
+        {
+            let inner = manager.inner.lock().unwrap();
+            assert!(
+                !inner.snapshots.contains_key(&group_id)
+                    || inner.snapshots.get(&group_id).unwrap().is_empty(),
+                "Memory storage should not trigger hydration"
+            );
+        }
+    }
+
+    #[test]
+    fn test_memory_storage_not_tracked_for_hydration() {
+        // Memory storage groups should not be tracked in hydrated_groups set
+        // since they don't need hydration
+        let manager = EpochSnapshotManager::new(5);
+        let storage = mdk_memory_storage::MdkMemoryStorage::default();
+        let group_id = test_group_id(1);
+
+        let candidate_id =
+            test_event_id("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let _ = manager.is_better_candidate(&storage, &group_id, 5, 999, &candidate_id);
+
+        // For memory storage, hydrated_groups won't be marked (hydration is skipped entirely)
+        {
+            let inner = manager.inner.lock().unwrap();
+            assert!(
+                !inner.hydrated_groups.contains(&group_id),
+                "Memory storage groups should not be tracked in hydrated_groups"
+            );
+        }
+    }
+
+    #[test]
+    fn test_snapshot_name_format() {
+        // Verify that snapshot names follow the expected format:
+        // "snap_{group_id_hex}_{epoch}_{commit_id_hex}"
+        // This ensures hydration can correctly parse them later
+        let manager = EpochSnapshotManager::new(5);
+        let storage = mdk_memory_storage::MdkMemoryStorage::default();
+        let group_id = test_group_id(42);
+
+        // Set up group in storage
+        use mdk_storage_traits::groups::GroupStorage;
+        use mdk_storage_traits::groups::types::{Group, GroupState};
+        use nostr::PublicKey;
+        use std::collections::BTreeSet;
+
+        let admin_pk = PublicKey::from_slice(&[2u8; 32]).unwrap();
+        let mut admin_pubkeys = BTreeSet::new();
+        admin_pubkeys.insert(admin_pk);
+        let group = Group {
+            mls_group_id: group_id.clone(),
+            nostr_group_id: [0u8; 32],
+            name: "Test Group".to_string(),
+            description: "Test".to_string(),
+            admin_pubkeys,
+            epoch: 0,
+            last_message_at: None,
+            last_message_id: None,
+            image_hash: None,
+            image_key: None,
+            image_nonce: None,
+            state: GroupState::Active,
+        };
+        storage.save_group(group).unwrap();
+
+        let commit_id =
+            test_event_id("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        let epoch = 7u64;
+
+        let name = manager
+            .create_snapshot(&storage, &group_id, epoch, &commit_id, 1000)
+            .unwrap();
+
+        // Verify the format
+        let parts: Vec<&str> = name.split('_').collect();
+        assert_eq!(parts.len(), 4, "Snapshot name should have 4 parts");
+        assert_eq!(parts[0], "snap", "First part should be 'snap'");
+        assert_eq!(parts[2], "7", "Third part should be the epoch");
+        // parts[1] is the group_id hex, parts[3] is the commit_id hex
+        assert_eq!(parts[1].len(), 64, "Group ID hex should be 64 chars");
+        assert_eq!(parts[3].len(), 64, "Commit ID hex should be 64 chars");
     }
 }

@@ -92,7 +92,39 @@ pub trait MdkStorageProvider:
     ///
     /// Call this to free resources when a snapshot won't be used for rollback.
     fn release_group_snapshot(&self, group_id: &GroupId, name: &str)
-    -> Result<(), MdkStorageError>;
+        -> Result<(), MdkStorageError>;
+
+    /// List all snapshots for a specific group with their creation timestamps.
+    ///
+    /// Returns a list of (snapshot_name, created_at_unix_timestamp) tuples
+    /// ordered by creation time (oldest first). This is used for:
+    /// - Hydrating the EpochSnapshotManager after restart
+    /// - Auditing existing snapshots
+    ///
+    /// # Arguments
+    ///
+    /// * `group_id` - The group to list snapshots for
+    ///
+    /// # Returns
+    ///
+    /// A vector of (snapshot_name, created_at) tuples, or an error.
+    fn list_group_snapshots(&self, group_id: &GroupId)
+        -> Result<Vec<(String, u64)>, MdkStorageError>;
+
+    /// Prune all snapshots created before the given Unix timestamp.
+    ///
+    /// This is used for TTL-based cleanup of old snapshots to prevent
+    /// indefinite storage growth and ensure cryptographic key material
+    /// doesn't persist longer than necessary.
+    ///
+    /// # Arguments
+    ///
+    /// * `min_timestamp` - Unix timestamp cutoff; snapshots with `created_at < min_timestamp` are deleted
+    ///
+    /// # Returns
+    ///
+    /// The number of snapshots deleted, or an error.
+    fn prune_expired_snapshots(&self, min_timestamp: u64) -> Result<usize, MdkStorageError>;
 }
 
 #[cfg(test)]

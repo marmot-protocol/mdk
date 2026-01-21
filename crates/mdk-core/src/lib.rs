@@ -128,6 +128,15 @@ pub struct MdkConfig {
     ///
     /// Default: 5
     pub epoch_snapshot_retention: usize,
+
+    /// Time-to-live for snapshots in seconds.
+    ///
+    /// Snapshots older than this will be pruned on startup to prevent
+    /// indefinite storage growth. This ensures that cryptographic key
+    /// material in snapshots doesn't persist longer than necessary.
+    ///
+    /// Default: 604800 (1 week)
+    pub snapshot_ttl_seconds: u64,
 }
 
 impl Default for MdkConfig {
@@ -138,6 +147,7 @@ impl Default for MdkConfig {
             out_of_order_tolerance: 100,    // 100 past messages
             maximum_forward_distance: 1000, // 1000 forward messages
             epoch_snapshot_retention: 5,
+            snapshot_ttl_seconds: 604800, // 1 week
         }
     }
 }
@@ -213,6 +223,24 @@ where
 
     /// Build the MDK instance with the configured settings
     pub fn build(self) -> MDK<Storage> {
+        // Prune expired snapshots on startup for persistent backends
+        if self.storage.backend().is_persistent() {
+            let current_time = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("System time before Unix epoch")
+                .as_secs();
+            let min_timestamp = current_time.saturating_sub(self.config.snapshot_ttl_seconds);
+            if let Ok(pruned_count) = self.storage.prune_expired_snapshots(min_timestamp)
+                && pruned_count > 0
+            {
+                tracing::info!(
+                    pruned = pruned_count,
+                    ttl_seconds = self.config.snapshot_ttl_seconds,
+                    "Pruned expired snapshots on startup"
+                );
+            }
+        }
+
         let epoch_snapshots = Arc::new(EpochSnapshotManager::new(
             self.config.epoch_snapshot_retention,
         ));
@@ -550,6 +578,7 @@ pub mod tests {
                 max_event_age_secs: 86400,
                 max_future_skew_secs: 120,
                 epoch_snapshot_retention: 5,
+                snapshot_ttl_seconds: 604800,
             };
 
             let alice_keys = Keys::generate();
