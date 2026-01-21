@@ -220,6 +220,3 @@ CREATE TABLE IF NOT EXISTS group_state_snapshots (
     PRIMARY KEY (snapshot_name, group_id, table_name, row_key),
     FOREIGN KEY (group_id) REFERENCES groups(mls_group_id) ON DELETE CASCADE
 );
-
-CREATE INDEX IF NOT EXISTS idx_group_state_snapshots_lookup
-    ON group_state_snapshots(snapshot_name, group_id);

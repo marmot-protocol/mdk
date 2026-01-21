@@ -874,6 +874,65 @@ impl MdkSqliteStorage {
             // have the data in memory (snapshot_rows).
 
             // 3. Restore from in-memory snapshot data
+            // IMPORTANT: We must restore "groups" first because group_relays and
+            // group_exporter_secrets have FK constraints that reference groups.
+            // Process in two passes: groups first, then everything else.
+            for (table_name, row_key, row_data) in &snapshot_rows {
+                if table_name != "groups" {
+                    continue;
+                }
+                let mls_group_id: Vec<u8> =
+                    serde_json::from_slice(row_key).map_err(|e| Error::Database(e.to_string()))?;
+                #[allow(clippy::type_complexity)]
+                let (
+                    nostr_group_id,
+                    name_val,
+                    description,
+                    admin_pubkeys,
+                    last_message_id,
+                    last_message_at,
+                    epoch,
+                    state,
+                    image_hash,
+                    image_key,
+                    image_nonce,
+                ): (
+                    Vec<u8>,
+                    String,
+                    String,
+                    String,
+                    Option<Vec<u8>>,
+                    Option<i64>,
+                    i64,
+                    String,
+                    Option<Vec<u8>>,
+                    Option<Vec<u8>>,
+                    Option<Vec<u8>>,
+                ) = serde_json::from_slice(row_data).map_err(|e| Error::Database(e.to_string()))?;
+                conn.execute(
+                    "INSERT INTO groups (mls_group_id, nostr_group_id, name, description, admin_pubkeys,
+                                        last_message_id, last_message_at, epoch, state,
+                                        image_hash, image_key, image_nonce)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    rusqlite::params![
+                        mls_group_id,
+                        nostr_group_id,
+                        name_val,
+                        description,
+                        admin_pubkeys,
+                        last_message_id,
+                        last_message_at,
+                        epoch,
+                        state,
+                        image_hash,
+                        image_key,
+                        image_nonce
+                    ],
+                )
+                .map_err(|e| Error::Database(e.to_string()))?;
+            }
+
+            // Now restore all other tables (groups already done above)
             for (table_name, row_key, row_data) in &snapshot_rows {
                 match table_name.as_str() {
                     "openmls_group_data" => {
@@ -920,56 +979,7 @@ impl MdkSqliteStorage {
                         .map_err(|e| Error::Database(e.to_string()))?;
                     }
                     "groups" => {
-                        let mls_group_id: Vec<u8> = serde_json::from_slice(row_key)
-                            .map_err(|e| Error::Database(e.to_string()))?;
-                        #[allow(clippy::type_complexity)]
-                        let (
-                            nostr_group_id,
-                            name_val,
-                            description,
-                            admin_pubkeys,
-                            last_message_id,
-                            last_message_at,
-                            epoch,
-                            state,
-                            image_hash,
-                            image_key,
-                            image_nonce,
-                        ): (
-                            Vec<u8>,
-                            String,
-                            String,
-                            String,
-                            Option<Vec<u8>>,
-                            Option<i64>,
-                            i64,
-                            String,
-                            Option<Vec<u8>>,
-                            Option<Vec<u8>>,
-                            Option<Vec<u8>>,
-                        ) = serde_json::from_slice(row_data)
-                            .map_err(|e| Error::Database(e.to_string()))?;
-                        conn.execute(
-                            "INSERT INTO groups (mls_group_id, nostr_group_id, name, description, admin_pubkeys,
-                                                last_message_id, last_message_at, epoch, state,
-                                                image_hash, image_key, image_nonce)
-                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                            rusqlite::params![
-                                mls_group_id,
-                                nostr_group_id,
-                                name_val,
-                                description,
-                                admin_pubkeys,
-                                last_message_id,
-                                last_message_at,
-                                epoch,
-                                state,
-                                image_hash,
-                                image_key,
-                                image_nonce
-                            ],
-                        )
-                        .map_err(|e| Error::Database(e.to_string()))?;
+                        // Already restored in the first pass above
                     }
                     "group_relays" => {
                         let (mls_group_id, relay_url): (Vec<u8>, String) =
