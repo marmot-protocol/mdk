@@ -7289,6 +7289,10 @@ mod tests {
                 })
                 .collect()
         }
+
+        fn get_rollback_infos(&self) -> Vec<crate::RollbackInfo> {
+            self.rollbacks.lock().unwrap().clone()
+        }
     }
 
     impl crate::callback::MdkCallback for TestCallback {
@@ -7481,6 +7485,57 @@ mod tests {
             final_epoch,
             initial_epoch + 1,
             "Final epoch should be initial + 1 (better commit applied)"
+        );
+
+        // Step 7: Verify group members are correct after rollback
+        // The better commit should have been applied, so we need to check which member was added
+        let members = alice_mdk
+            .get_members(&group_id)
+            .expect("Should be able to get group members");
+
+        // Original members should always be present
+        assert!(
+            members.contains(&alice_keys.public_key()),
+            "Alice should still be a member"
+        );
+        assert!(
+            members.contains(&bob_keys.public_key()),
+            "Bob should still be a member"
+        );
+        assert!(
+            members.contains(&carol_keys.public_key()),
+            "Carol should still be a member"
+        );
+
+        // Determine which member should have been added based on which commit was better
+        let bob_commit_was_better = better_commit.id == bob_commit.evolution_event.id;
+        if bob_commit_was_better {
+            // Bob's commit added Dave
+            assert!(
+                members.contains(&dave_keys.public_key()),
+                "Dave should be a member (Bob's better commit added Dave)"
+            );
+            assert!(
+                !members.contains(&eve_keys.public_key()),
+                "Eve should NOT be a member (Carol's worse commit was rolled back)"
+            );
+        } else {
+            // Carol's commit added Eve
+            assert!(
+                members.contains(&eve_keys.public_key()),
+                "Eve should be a member (Carol's better commit added Eve)"
+            );
+            assert!(
+                !members.contains(&dave_keys.public_key()),
+                "Dave should NOT be a member (Bob's worse commit was rolled back)"
+            );
+        }
+
+        // Verify total member count: Alice + Bob + Carol + (Dave or Eve) = 4
+        assert_eq!(
+            members.len(),
+            4,
+            "Group should have exactly 4 members after rollback"
         );
     }
 
@@ -8144,6 +8199,152 @@ mod tests {
             members_after_rollback.len(),
             4,
             "Should have 4 members after applying winning commit (3 original + 1 new)"
+        );
+    }
+
+    /// Test that messages sent at an epoch that gets rolled back are invalidated
+    ///
+    /// This verifies that when a rollback occurs:
+    /// 1. Messages sent at the rolled-back epoch are marked as EpochInvalidated
+    /// 2. The callback receives the list of invalidated message event IDs
+    #[test]
+    fn test_message_invalidation_during_rollback() {
+        let alice_keys = Keys::generate();
+        let bob_keys = Keys::generate();
+        let carol_keys = Keys::generate();
+
+        let callback = std::sync::Arc::new(TestCallback::new());
+
+        let alice_mdk = crate::MDK::builder(mdk_memory_storage::MdkMemoryStorage::default())
+            .with_callback(callback.clone())
+            .build();
+
+        let bob_mdk = create_test_mdk();
+        let carol_mdk = create_test_mdk();
+
+        let admins = vec![
+            alice_keys.public_key(),
+            bob_keys.public_key(),
+            carol_keys.public_key(),
+        ];
+
+        // Setup: Create group with Alice, Bob, and Carol
+        let bob_key_package = create_key_package_event(&bob_mdk, &bob_keys);
+        let carol_key_package = create_key_package_event(&carol_mdk, &carol_keys);
+
+        let create_result = alice_mdk
+            .create_group(
+                &alice_keys.public_key(),
+                vec![bob_key_package, carol_key_package],
+                create_nostr_group_config_data(admins),
+            )
+            .expect("Alice should create group");
+
+        let group_id = create_result.group.mls_group_id.clone();
+
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("Failed to merge");
+
+        // Bob and Carol join
+        let bob_welcome_rumor = &create_result.welcome_rumors[0];
+        let bob_welcome = bob_mdk
+            .process_welcome(&nostr::EventId::all_zeros(), bob_welcome_rumor)
+            .expect("Bob should process welcome");
+        bob_mdk
+            .accept_welcome(&bob_welcome)
+            .expect("Bob should accept welcome");
+
+        let carol_welcome_rumor = &create_result.welcome_rumors[1];
+        let carol_welcome = carol_mdk
+            .process_welcome(&nostr::EventId::all_zeros(), carol_welcome_rumor)
+            .expect("Carol should process welcome");
+        carol_mdk
+            .accept_welcome(&carol_welcome)
+            .expect("Carol should accept welcome");
+
+        // Record initial epoch
+        let initial_epoch = alice_mdk
+            .get_group(&group_id)
+            .expect("Should get group")
+            .expect("Group should exist")
+            .epoch;
+
+        // Bob and Carol create competing commits for the same epoch
+        let dave_keys = Keys::generate();
+        let eve_keys = Keys::generate();
+
+        let dave_key_package = create_key_package_event(&bob_mdk, &dave_keys);
+        let eve_key_package = create_key_package_event(&carol_mdk, &eve_keys);
+
+        let bob_commit = bob_mdk
+            .add_members(&group_id, std::slice::from_ref(&dave_key_package))
+            .expect("Bob should create commit");
+
+        let carol_commit = carol_mdk
+            .add_members(&group_id, std::slice::from_ref(&eve_key_package))
+            .expect("Carol should create commit");
+
+        // Determine better/worse by MIP-03 rules
+        let (better_commit, worse_commit) =
+            order_events_by_mip03(&bob_commit.evolution_event, &carol_commit.evolution_event);
+
+        // Alice processes the WORSE commit first - this advances her to epoch initial_epoch + 1
+        alice_mdk
+            .process_message(worse_commit)
+            .expect("Processing worse commit should succeed");
+
+        let epoch_after_worse = alice_mdk
+            .get_group(&group_id)
+            .expect("Should get group")
+            .expect("Group should exist")
+            .epoch;
+        assert_eq!(
+            epoch_after_worse,
+            initial_epoch + 1,
+            "Epoch should advance after processing commit"
+        );
+
+        // Now Alice sends a message at this (wrong) epoch
+        // This message should be invalidated when the better commit arrives
+        let mut message_rumor = create_test_rumor(&alice_keys, "Test message at wrong epoch");
+        let rumor_id = message_rumor.id(); // Get the rumor ID before create_message takes ownership
+
+        let _wrapper_event = alice_mdk
+            .create_message(&group_id, message_rumor)
+            .expect("Should create message");
+
+        // The invalidated_messages list contains rumor IDs (internal message IDs), not wrapper event IDs
+        let message_id = rumor_id;
+
+        // Now the BETTER commit arrives - this should trigger rollback and invalidate the message
+        alice_mdk
+            .process_message(better_commit)
+            .expect("Processing better commit should succeed");
+
+        // Verify rollback occurred
+        assert!(
+            callback.rollback_count() > 0,
+            "Rollback should have occurred when better commit arrived"
+        );
+
+        // Get the rollback info and check that our message was invalidated
+        let rollback_infos = callback.get_rollback_infos();
+        assert!(!rollback_infos.is_empty(), "Should have rollback info");
+
+        let rollback_info = &rollback_infos[0];
+
+        // The message we sent at the rolled-back epoch should be in the invalidated list
+        // Note: The message was encrypted at epoch initial_epoch + 1 (the worse commit's epoch)
+        // which is now invalid, so it should be marked as invalidated
+        assert!(
+            rollback_info.invalidated_messages.contains(&message_id)
+                || rollback_info.messages_needing_refetch.contains(&message_id),
+            "Message sent at rolled-back epoch should be invalidated or need refetch. \
+             Message ID: {:?}, Invalidated: {:?}, Needing refetch: {:?}",
+            message_id,
+            rollback_info.invalidated_messages,
+            rollback_info.messages_needing_refetch
         );
     }
 
