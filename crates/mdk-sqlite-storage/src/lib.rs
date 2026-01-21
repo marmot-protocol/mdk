@@ -458,17 +458,6 @@ impl MdkSqliteStorage {
         f(&conn)
     }
 
-    // ============================================================================
-    // Group Snapshot Support (MIP-03 Commit Race Resolution)
-    // ============================================================================
-    //
-    // Instead of SQLite savepoints (which have stack-ordering issues where
-    // releasing an old savepoint destroys all newer ones), we copy group-specific
-    // rows to a dedicated snapshot table. This approach:
-    // - Avoids SQLite savepoint stack semantics
-    // - Survives app restarts
-    // - Is group-scoped (only affects the relevant group)
-
     /// Creates a snapshot of a group's state by copying all group-related rows
     /// to the snapshot table.
     fn snapshot_group_state(&self, group_id: &GroupId, name: &str) -> Result<(), Error> {
