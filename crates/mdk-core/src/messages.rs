@@ -1653,12 +1653,10 @@ where
                                 .unwrap_or_default();
 
                             // Also invalidate processed_messages from wrong epochs
-                            let _ = self
-                                .storage()
-                                .invalidate_processed_messages_after_epoch(
-                                    &group.mls_group_id,
-                                    msg_epoch,
-                                );
+                            let _ = self.storage().invalidate_processed_messages_after_epoch(
+                                &group.mls_group_id,
+                                msg_epoch,
+                            );
 
                             // Find messages that failed to decrypt because we had the wrong
                             // commit's keys. Now that we've rolled back and will apply the
@@ -7282,7 +7280,13 @@ mod tests {
                 .lock()
                 .unwrap()
                 .iter()
-                .map(|info| (info.group_id.clone(), info.target_epoch, info.new_head_event))
+                .map(|info| {
+                    (
+                        info.group_id.clone(),
+                        info.target_epoch,
+                        info.new_head_event,
+                    )
+                })
                 .collect()
         }
     }

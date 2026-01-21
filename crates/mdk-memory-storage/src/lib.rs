@@ -73,7 +73,7 @@ use self::mls_storage::{
     GroupDataType, MlsEncryptionKeys, MlsEpochKeyPairs, MlsGroupData, MlsKeyPackages,
     MlsOwnLeafNodes, MlsProposals, MlsPsks, MlsSignatureKeys, STORAGE_PROVIDER_VERSION,
 };
-pub use self::snapshot::MemoryStorageSnapshot;
+pub use self::snapshot::{GroupScopedSnapshot, MemoryStorageSnapshot};
 use self::snapshot::{HashMapToLruExt, LruCacheExt};
 
 /// Default cache size for each LRU cache
@@ -334,7 +334,8 @@ pub struct MdkMemoryStorage {
     inner: RwLock<MdkMemoryStorageInner>,
     /// Group-scoped snapshots for rollback support (MIP-03)
     /// Key is (group_id, snapshot_name) for group-specific rollback
-    group_snapshots: RwLock<HashMap<(GroupId, String), MemoryStorageSnapshot>>,
+    /// Uses GroupScopedSnapshot to ensure rollback only affects the target group
+    group_snapshots: RwLock<HashMap<(GroupId, String), GroupScopedSnapshot>>,
 }
 
 /// Unified storage architecture container
@@ -550,6 +551,216 @@ impl MdkMemoryStorage {
             .restore_to_lru(&mut inner.processed_messages_cache);
     }
 
+    // ========================================================================
+    // Group-Scoped Snapshot Support
+    // ========================================================================
+
+    /// Creates a snapshot containing only data for a specific group.
+    ///
+    /// This is used by the `MdkStorageProvider::create_group_snapshot` trait method
+    /// to create rollback points that don't affect other groups. Unlike `create_snapshot()`
+    /// which captures ALL data, this only captures data belonging to the specified group.
+    ///
+    /// # Concurrency
+    ///
+    /// This operation is **atomic**. It acquires a global read lock on the storage
+    /// state, ensuring a consistent snapshot even in multi-threaded environments.
+    ///
+    /// # Arguments
+    ///
+    /// * `group_id` - The group to create a snapshot for.
+    ///
+    /// # Returns
+    ///
+    /// A `GroupScopedSnapshot` containing cloned copies of all state for that group.
+    pub fn create_group_scoped_snapshot(&self, group_id: &GroupId) -> GroupScopedSnapshot {
+        let inner = self.inner.read();
+
+        // MLS storage uses JSON serialization for group_id keys.
+        // We need to use the same serialization to match the stored keys.
+        let mls_group_id_bytes = mls_storage::JsonCodec::serialize(group_id.inner())
+            .expect("Failed to serialize group_id for MLS lookup");
+
+        // Filter MLS group data by group_id
+        let mls_group_data: HashMap<(Vec<u8>, GroupDataType), Vec<u8>> = inner
+            .mls_group_data
+            .data
+            .iter()
+            .filter(|((gid, _), _)| *gid == mls_group_id_bytes)
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+
+        // Get own leaf nodes for this group
+        let mls_own_leaf_nodes = inner
+            .mls_own_leaf_nodes
+            .data
+            .get(&mls_group_id_bytes)
+            .cloned()
+            .unwrap_or_default();
+
+        // Filter proposals by group_id, keeping only the proposal_ref as the key
+        let mls_proposals: HashMap<Vec<u8>, Vec<u8>> = inner
+            .mls_proposals
+            .data
+            .iter()
+            .filter(|((gid, _), _)| *gid == mls_group_id_bytes)
+            .map(|((_, prop_ref), prop)| (prop_ref.clone(), prop.clone()))
+            .collect();
+
+        // Filter epoch key pairs by group_id
+        let mls_epoch_key_pairs: HashMap<(Vec<u8>, u32), Vec<u8>> = inner
+            .mls_epoch_key_pairs
+            .data
+            .iter()
+            .filter(|((gid, _, _), _)| *gid == mls_group_id_bytes)
+            .map(|((_, epoch_id, leaf_idx), kp)| ((epoch_id.clone(), *leaf_idx), kp.clone()))
+            .collect();
+
+        // Get MDK group data
+        let group = inner.groups_cache.peek(group_id).cloned();
+
+        let group_relays = inner
+            .group_relays_cache
+            .peek(group_id)
+            .cloned()
+            .unwrap_or_default();
+
+        let group_exporter_secrets: HashMap<u64, GroupExporterSecret> = inner
+            .group_exporter_secrets_cache
+            .iter()
+            .filter(|((gid, _), _)| gid == group_id)
+            .map(|((_, epoch), secret)| (*epoch, secret.clone()))
+            .collect();
+
+        GroupScopedSnapshot {
+            group_id: group_id.clone(),
+            mls_group_data,
+            mls_own_leaf_nodes,
+            mls_proposals,
+            mls_epoch_key_pairs,
+            group,
+            group_relays,
+            group_exporter_secrets,
+        }
+    }
+
+    /// Restores state for a specific group from a previously created group-scoped snapshot.
+    ///
+    /// This replaces all current in-memory state for the specified group with the state
+    /// from the snapshot, leaving all other groups unaffected.
+    ///
+    /// # Concurrency
+    ///
+    /// This operation is **atomic**. It acquires a global write lock on the storage
+    /// state, ensuring that the restore is consistent even in multi-threaded environments.
+    ///
+    /// # Arguments
+    ///
+    /// * `snapshot` - The group-scoped snapshot to restore from.
+    pub fn restore_group_scoped_snapshot(&self, snapshot: GroupScopedSnapshot) {
+        let mut inner = self.inner.write();
+        let group_id = &snapshot.group_id;
+
+        // MLS storage uses JSON serialization for group_id keys.
+        // We need to use the same serialization to match the stored keys.
+        let mls_group_id_bytes = mls_storage::JsonCodec::serialize(group_id.inner())
+            .expect("Failed to serialize group_id for MLS lookup");
+
+        // 1. Remove existing data for this group
+
+        // Remove MLS group data for this group
+        inner
+            .mls_group_data
+            .data
+            .retain(|(gid, _), _| *gid != mls_group_id_bytes);
+
+        // Remove own leaf nodes for this group
+        inner.mls_own_leaf_nodes.data.remove(&mls_group_id_bytes);
+
+        // Remove proposals for this group
+        inner
+            .mls_proposals
+            .data
+            .retain(|(gid, _), _| *gid != mls_group_id_bytes);
+
+        // Remove epoch key pairs for this group
+        inner
+            .mls_epoch_key_pairs
+            .data
+            .retain(|(gid, _, _), _| *gid != mls_group_id_bytes);
+
+        // Remove from MDK caches
+        // First, get the nostr_group_id if the group exists (for cache cleanup)
+        let nostr_group_id = inner.groups_cache.peek(group_id).map(|g| g.nostr_group_id);
+        inner.groups_cache.pop(group_id);
+        if let Some(nostr_id) = nostr_group_id {
+            inner.groups_by_nostr_id_cache.pop(&nostr_id);
+        }
+
+        inner.group_relays_cache.pop(group_id);
+
+        // Remove all exporter secrets for this group
+        let keys_to_remove: Vec<_> = inner
+            .group_exporter_secrets_cache
+            .iter()
+            .filter(|((gid, _), _)| gid == group_id)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for key in keys_to_remove {
+            inner.group_exporter_secrets_cache.pop(&key);
+        }
+
+        // 2. Restore from snapshot
+
+        // Restore MLS group data
+        for (key, value) in snapshot.mls_group_data {
+            inner.mls_group_data.data.insert(key, value);
+        }
+
+        // Restore own leaf nodes
+        if !snapshot.mls_own_leaf_nodes.is_empty() {
+            inner
+                .mls_own_leaf_nodes
+                .data
+                .insert(mls_group_id_bytes.clone(), snapshot.mls_own_leaf_nodes);
+        }
+
+        // Restore proposals (re-add group_id to the key)
+        for (prop_ref, prop) in snapshot.mls_proposals {
+            inner
+                .mls_proposals
+                .data
+                .insert((mls_group_id_bytes.clone(), prop_ref), prop);
+        }
+
+        // Restore epoch key pairs (re-add group_id to the key)
+        for ((epoch_id, leaf_idx), kp) in snapshot.mls_epoch_key_pairs {
+            inner
+                .mls_epoch_key_pairs
+                .data
+                .insert((mls_group_id_bytes.clone(), epoch_id, leaf_idx), kp);
+        }
+
+        // Restore MDK data
+        if let Some(group) = snapshot.group {
+            let nostr_id = group.nostr_group_id;
+            inner.groups_cache.put(group_id.clone(), group.clone());
+            inner.groups_by_nostr_id_cache.put(nostr_id, group);
+        }
+
+        if !snapshot.group_relays.is_empty() {
+            inner
+                .group_relays_cache
+                .put(group_id.clone(), snapshot.group_relays);
+        }
+
+        for (epoch, secret) in snapshot.group_exporter_secrets {
+            inner
+                .group_exporter_secrets_cache
+                .put((group_id.clone(), epoch), secret);
+        }
+    }
+
     /// Returns the current validation limits.
     pub fn limits(&self) -> &ValidationLimits {
         &self.limits
@@ -568,9 +779,9 @@ impl MdkStorageProvider for MdkMemoryStorage {
     }
 
     fn create_group_snapshot(&self, group_id: &GroupId, name: &str) -> Result<(), MdkStorageError> {
-        // For simplicity in memory storage, we take a full snapshot.
-        // This is acceptable since memory storage is primarily for testing.
-        let snapshot = self.create_snapshot();
+        // Create a group-scoped snapshot that only captures data for this group.
+        // This ensures that rolling back this snapshot won't affect other groups.
+        let snapshot = self.create_group_scoped_snapshot(group_id);
         self.group_snapshots
             .write()
             .insert((group_id.clone(), name.to_string()), snapshot);
@@ -589,7 +800,7 @@ impl MdkStorageProvider for MdkMemoryStorage {
             .write()
             .remove(&key)
             .ok_or_else(|| MdkStorageError::NotFound("Snapshot not found".to_string()))?;
-        self.restore_snapshot(snapshot);
+        self.restore_group_scoped_snapshot(snapshot);
         Ok(())
     }
 
@@ -2722,5 +2933,284 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(final_state.name, "State A");
+    }
+
+    /// Test that group-scoped snapshots provide proper isolation between groups.
+    ///
+    /// This test verifies the fix for Issue 1: Memory Storage Rollback Affects All Groups.
+    /// When rolling back Group A's snapshot, Group B should be completely unaffected.
+    #[test]
+    fn test_snapshot_isolation_between_groups() {
+        use mdk_storage_traits::MdkStorageProvider;
+
+        let storage = MdkMemoryStorage::default();
+
+        // Create two independent groups
+        let group1_id = GroupId::from_slice(&[1; 32]);
+        let group2_id = GroupId::from_slice(&[2; 32]);
+        let nostr_group_id_1: [u8; 32] = generate_random_bytes(32).try_into().unwrap();
+        let nostr_group_id_2: [u8; 32] = generate_random_bytes(32).try_into().unwrap();
+
+        let group1 = Group {
+            mls_group_id: group1_id.clone(),
+            nostr_group_id: nostr_group_id_1,
+            name: "Group 1 Original".to_string(),
+            description: "First group".to_string(),
+            admin_pubkeys: BTreeSet::new(),
+            last_message_id: None,
+            last_message_at: None,
+            epoch: 5,
+            state: GroupState::Active,
+            image_hash: None,
+            image_key: None,
+            image_nonce: None,
+        };
+
+        let group2 = Group {
+            mls_group_id: group2_id.clone(),
+            nostr_group_id: nostr_group_id_2,
+            name: "Group 2 Original".to_string(),
+            description: "Second group".to_string(),
+            admin_pubkeys: BTreeSet::new(),
+            last_message_id: None,
+            last_message_at: None,
+            epoch: 10,
+            state: GroupState::Active,
+            image_hash: None,
+            image_key: None,
+            image_nonce: None,
+        };
+
+        storage.save_group(group1.clone()).unwrap();
+        storage.save_group(group2.clone()).unwrap();
+
+        // Create a snapshot for Group 1 only (at epoch 5)
+        storage
+            .create_group_snapshot(&group1_id, "group1_snap")
+            .unwrap();
+
+        // Modify BOTH groups
+        let modified_group1 = Group {
+            name: "Group 1 Modified".to_string(),
+            epoch: 6,
+            ..group1.clone()
+        };
+        let modified_group2 = Group {
+            name: "Group 2 Modified".to_string(),
+            epoch: 11,
+            ..group2.clone()
+        };
+
+        storage.save_group(modified_group1).unwrap();
+        storage.save_group(modified_group2).unwrap();
+
+        // Verify both groups are modified
+        let found1 = storage
+            .find_group_by_mls_group_id(&group1_id)
+            .unwrap()
+            .unwrap();
+        let found2 = storage
+            .find_group_by_mls_group_id(&group2_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(found1.name, "Group 1 Modified");
+        assert_eq!(found1.epoch, 6);
+        assert_eq!(found2.name, "Group 2 Modified");
+        assert_eq!(found2.epoch, 11);
+
+        // Rollback Group 1 to its snapshot
+        storage
+            .rollback_group_to_snapshot(&group1_id, "group1_snap")
+            .unwrap();
+
+        // Verify Group 1 is rolled back
+        let final1 = storage
+            .find_group_by_mls_group_id(&group1_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(final1.name, "Group 1 Original");
+        assert_eq!(final1.epoch, 5);
+
+        // CRITICAL: Verify Group 2 is STILL at its modified state (not rolled back)
+        let final2 = storage
+            .find_group_by_mls_group_id(&group2_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            final2.name, "Group 2 Modified",
+            "Group 2 should NOT be affected by Group 1's rollback"
+        );
+        assert_eq!(
+            final2.epoch, 11,
+            "Group 2's epoch should NOT be affected by Group 1's rollback"
+        );
+    }
+
+    /// Test that group-scoped snapshots also isolate exporter secrets correctly.
+    #[test]
+    fn test_snapshot_isolation_with_exporter_secrets() {
+        use mdk_storage_traits::MdkStorageProvider;
+
+        let storage = MdkMemoryStorage::default();
+
+        // Create two groups
+        let group1_id = GroupId::from_slice(&[11; 32]);
+        let group2_id = GroupId::from_slice(&[22; 32]);
+        let nostr_group_id_1: [u8; 32] = generate_random_bytes(32).try_into().unwrap();
+        let nostr_group_id_2: [u8; 32] = generate_random_bytes(32).try_into().unwrap();
+
+        let group1 = Group {
+            mls_group_id: group1_id.clone(),
+            nostr_group_id: nostr_group_id_1,
+            name: "Group 1".to_string(),
+            description: "".to_string(),
+            admin_pubkeys: BTreeSet::new(),
+            last_message_id: None,
+            last_message_at: None,
+            epoch: 1,
+            state: GroupState::Active,
+            image_hash: None,
+            image_key: None,
+            image_nonce: None,
+        };
+
+        let group2 = Group {
+            mls_group_id: group2_id.clone(),
+            nostr_group_id: nostr_group_id_2,
+            name: "Group 2".to_string(),
+            description: "".to_string(),
+            admin_pubkeys: BTreeSet::new(),
+            last_message_id: None,
+            last_message_at: None,
+            epoch: 1,
+            state: GroupState::Active,
+            image_hash: None,
+            image_key: None,
+            image_nonce: None,
+        };
+
+        storage.save_group(group1).unwrap();
+        storage.save_group(group2).unwrap();
+
+        // Add exporter secrets for both groups
+        let secret1_epoch0 = GroupExporterSecret {
+            mls_group_id: group1_id.clone(),
+            epoch: 0,
+            secret: Secret::new([1u8; 32]),
+        };
+        let secret2_epoch0 = GroupExporterSecret {
+            mls_group_id: group2_id.clone(),
+            epoch: 0,
+            secret: Secret::new([2u8; 32]),
+        };
+
+        storage
+            .save_group_exporter_secret(secret1_epoch0.clone())
+            .unwrap();
+        storage
+            .save_group_exporter_secret(secret2_epoch0.clone())
+            .unwrap();
+
+        // Snapshot Group 1
+        storage
+            .create_group_snapshot(&group1_id, "group1_secrets_snap")
+            .unwrap();
+
+        // Add new epoch secrets to BOTH groups
+        let secret1_epoch1 = GroupExporterSecret {
+            mls_group_id: group1_id.clone(),
+            epoch: 1,
+            secret: Secret::new([11u8; 32]),
+        };
+        let secret2_epoch1 = GroupExporterSecret {
+            mls_group_id: group2_id.clone(),
+            epoch: 1,
+            secret: Secret::new([22u8; 32]),
+        };
+
+        storage.save_group_exporter_secret(secret1_epoch1).unwrap();
+        storage.save_group_exporter_secret(secret2_epoch1).unwrap();
+
+        // Verify both groups have epoch 1 secrets
+        assert!(
+            storage
+                .get_group_exporter_secret(&group1_id, 1)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            storage
+                .get_group_exporter_secret(&group2_id, 1)
+                .unwrap()
+                .is_some()
+        );
+
+        // Rollback Group 1
+        storage
+            .rollback_group_to_snapshot(&group1_id, "group1_secrets_snap")
+            .unwrap();
+
+        // Group 1's epoch 1 secret should be gone
+        assert!(
+            storage
+                .get_group_exporter_secret(&group1_id, 1)
+                .unwrap()
+                .is_none(),
+            "Group 1's epoch 1 secret should be rolled back"
+        );
+
+        // Group 2's epoch 1 secret should STILL exist
+        assert!(
+            storage
+                .get_group_exporter_secret(&group2_id, 1)
+                .unwrap()
+                .is_some(),
+            "Group 2's epoch 1 secret should NOT be affected by Group 1's rollback"
+        );
+    }
+
+    /// Test that rolling back to a nonexistent snapshot returns an error.
+    #[test]
+    fn test_rollback_nonexistent_snapshot_returns_error() {
+        use mdk_storage_traits::MdkStorageProvider;
+
+        let storage = MdkMemoryStorage::default();
+
+        let group_id = GroupId::from_slice(&[99; 32]);
+        let nostr_group_id: [u8; 32] = generate_random_bytes(32).try_into().unwrap();
+
+        let group = Group {
+            mls_group_id: group_id.clone(),
+            nostr_group_id,
+            name: "Test Group".to_string(),
+            description: "".to_string(),
+            admin_pubkeys: BTreeSet::new(),
+            last_message_id: None,
+            last_message_at: None,
+            epoch: 1,
+            state: GroupState::Active,
+            image_hash: None,
+            image_key: None,
+            image_nonce: None,
+        };
+
+        storage.save_group(group).unwrap();
+
+        // Try to rollback to a snapshot that was never created
+        let result = storage.rollback_group_to_snapshot(&group_id, "nonexistent_snapshot");
+
+        assert!(
+            result.is_err(),
+            "Should return error for nonexistent snapshot"
+        );
+        match result {
+            Err(MdkStorageError::NotFound(msg)) => {
+                assert!(
+                    msg.contains("Snapshot not found"),
+                    "Error should indicate snapshot not found"
+                );
+            }
+            _ => panic!("Expected NotFound error"),
+        }
     }
 }

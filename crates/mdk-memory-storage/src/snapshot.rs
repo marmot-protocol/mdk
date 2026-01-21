@@ -24,6 +24,58 @@ use nostr::EventId;
 
 use crate::mls_storage::GroupDataType;
 
+/// A group-scoped snapshot that only contains data for a single group.
+///
+/// Unlike [`MemoryStorageSnapshot`] which captures all data in the storage,
+/// this snapshot only captures data relevant to a specific group. This enables
+/// proper rollback isolation where rolling back Group A doesn't affect Group B.
+///
+/// This matches the behavior of SQLite's group-scoped snapshots where:
+/// - `snapshot_group_state()` only copies rows WHERE `group_id = ?`
+/// - `restore_group_from_snapshot()` only deletes/restores rows for that group
+///
+/// # Group-Scoped Data
+///
+/// The following data is captured per group:
+/// - MLS group data (tree state, join config, etc.)
+/// - MLS own leaf nodes for this group
+/// - MLS proposals for this group
+/// - MLS epoch key pairs for this group
+/// - MDK group record
+/// - MDK group relays
+/// - MDK group exporter secrets
+///
+/// The following data is NOT captured (not group-scoped):
+/// - MLS key packages (identity-scoped, not group-scoped)
+/// - MLS PSKs (identity-scoped, not group-scoped)
+/// - MLS signature keys (identity-scoped, not group-scoped)
+/// - MLS encryption keys (identity-scoped, not group-scoped)
+/// - Messages (handled separately via `invalidate_messages_after_epoch`)
+/// - Welcomes (keyed by EventId, not group-scoped)
+#[derive(Clone)]
+pub struct GroupScopedSnapshot {
+    /// The group ID this snapshot is for
+    pub(crate) group_id: GroupId,
+
+    // MLS data (filtered by group_id)
+    /// MLS group data: (group_id, data_type) -> data
+    pub(crate) mls_group_data: HashMap<(Vec<u8>, GroupDataType), Vec<u8>>,
+    /// MLS own leaf nodes for this group
+    pub(crate) mls_own_leaf_nodes: Vec<Vec<u8>>,
+    /// MLS proposals: proposal_ref -> proposal (group_id is implicit)
+    pub(crate) mls_proposals: HashMap<Vec<u8>, Vec<u8>>,
+    /// MLS epoch key pairs: (epoch_id, leaf_index) -> key_pairs (group_id is implicit)
+    pub(crate) mls_epoch_key_pairs: HashMap<(Vec<u8>, u32), Vec<u8>>,
+
+    // MDK data
+    /// The group record itself
+    pub(crate) group: Option<Group>,
+    /// Group relays
+    pub(crate) group_relays: BTreeSet<GroupRelay>,
+    /// Group exporter secrets: epoch -> secret
+    pub(crate) group_exporter_secrets: HashMap<u64, GroupExporterSecret>,
+}
+
 /// A snapshot of all in-memory state that can be restored later.
 ///
 /// This enables rollback functionality similar to SQLite savepoints,

@@ -766,6 +766,21 @@ impl MdkSqliteStorage {
         let conn = self.connection.blocking_lock();
         let group_id_bytes = group_id.as_slice();
 
+        // Check if snapshot exists BEFORE starting transaction or deleting any data.
+        // This prevents data loss if the snapshot name is typo'd or doesn't exist.
+        // This matches the memory storage behavior which returns NotFound error.
+        let snapshot_exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM group_state_snapshots WHERE snapshot_name = ? AND group_id = ?)",
+                rusqlite::params![name, group_id_bytes],
+                |row| row.get(0),
+            )
+            .map_err(|e| Error::Database(e.to_string()))?;
+
+        if !snapshot_exists {
+            return Err(Error::Database("Snapshot not found".to_string()));
+        }
+
         // Begin transaction for atomicity - critical to prevent data loss on failure
         conn.execute("BEGIN IMMEDIATE", [])
             .map_err(|e| Error::Database(e.to_string()))?;
@@ -3259,28 +3274,33 @@ mod tests {
         }
 
         #[test]
-        fn test_rollback_nonexistent_snapshot_behavior() {
+        fn test_rollback_nonexistent_snapshot_returns_error() {
             let storage = MdkSqliteStorage::new_in_memory().unwrap();
 
             let group = create_test_group(5);
             let group_id = group.mls_group_id.clone();
-            storage.save_group(group).unwrap();
+            storage.save_group(group.clone()).unwrap();
 
-            // Rolling back to a nonexistent snapshot doesn't fail but clears state
-            // since it deletes current data and finds nothing to restore.
-            // This is acceptable behavior for the MdkStorageProvider contract
-            // (callers should only rollback to snapshots they created).
+            // Rolling back to a nonexistent snapshot should return an error
+            // and NOT delete any data. This prevents accidental data loss
+            // from typos in snapshot names.
+            // This matches the memory storage behavior.
             let result = storage.rollback_group_to_snapshot(&group_id, "nonexistent_snap");
             assert!(
-                result.is_ok(),
-                "Rollback to nonexistent snapshot should not error"
+                result.is_err(),
+                "Rollback to nonexistent snapshot should return an error"
             );
 
-            // Group should now be gone (deleted during rollback, nothing to restore)
+            // CRITICAL: Group should still exist (no data was deleted)
             let after_rollback = storage.find_group_by_mls_group_id(&group_id).unwrap();
             assert!(
-                after_rollback.is_none(),
-                "Group should be deleted when rolling back to nonexistent snapshot"
+                after_rollback.is_some(),
+                "Group should NOT be deleted when rolling back to nonexistent snapshot"
+            );
+            assert_eq!(
+                after_rollback.unwrap().epoch,
+                group.epoch,
+                "Group data should be unchanged"
             );
         }
 

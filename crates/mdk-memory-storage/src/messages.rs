@@ -121,11 +121,11 @@ impl MessageStorage for MdkMemoryStorage {
         if let Some(group_messages) = inner.messages_by_group_cache.get_mut(group_id) {
             for (event_id, message) in group_messages.iter_mut() {
                 // Only invalidate messages with epoch > target
-                if let Some(msg_epoch) = message.epoch {
-                    if msg_epoch > epoch {
-                        message.state = MessageState::EpochInvalidated;
-                        invalidated_ids.push(*event_id);
-                    }
+                if let Some(msg_epoch) = message.epoch
+                    && msg_epoch > epoch
+                {
+                    message.state = MessageState::EpochInvalidated;
+                    invalidated_ids.push(*event_id);
                 }
             }
         }
@@ -152,15 +152,13 @@ impl MessageStorage for MdkMemoryStorage {
         let cache = &mut inner.processed_messages_cache;
         for (wrapper_event_id, processed_message) in cache.iter_mut() {
             // Check if this message belongs to the specified group
-            if let Some(ref msg_group_id) = processed_message.mls_group_id {
-                if msg_group_id == group_id {
-                    if let Some(msg_epoch) = processed_message.epoch {
-                        if msg_epoch > epoch {
-                            processed_message.state = ProcessedMessageState::EpochInvalidated;
-                            invalidated_ids.push(*wrapper_event_id);
-                        }
-                    }
-                }
+            if let Some(ref msg_group_id) = processed_message.mls_group_id
+                && msg_group_id == group_id
+                && let Some(msg_epoch) = processed_message.epoch
+                && msg_epoch > epoch
+            {
+                processed_message.state = ProcessedMessageState::EpochInvalidated;
+                invalidated_ids.push(*wrapper_event_id);
             }
         }
 
@@ -192,12 +190,11 @@ impl MessageStorage for MdkMemoryStorage {
             .processed_messages_cache
             .iter()
             .filter_map(|(_, pm)| {
-                if let Some(ref msg_group_id) = pm.mls_group_id {
-                    if msg_group_id == group_id
-                        && pm.state == ProcessedMessageState::EpochInvalidated
-                    {
-                        return Some(pm.clone());
-                    }
+                if let Some(ref msg_group_id) = pm.mls_group_id
+                    && msg_group_id == group_id
+                    && pm.state == ProcessedMessageState::EpochInvalidated
+                {
+                    return Some(pm.clone());
                 }
                 None
             })
@@ -220,13 +217,12 @@ impl MessageStorage for MdkMemoryStorage {
             .processed_messages_cache
             .iter()
             .filter_map(|(wrapper_event_id, pm)| {
-                if let Some(ref msg_group_id) = pm.mls_group_id {
-                    if msg_group_id == group_id
-                        && pm.state == ProcessedMessageState::Failed
-                        && pm.epoch.is_none()
-                    {
-                        return Some(*wrapper_event_id);
-                    }
+                if let Some(ref msg_group_id) = pm.mls_group_id
+                    && msg_group_id == group_id
+                    && pm.state == ProcessedMessageState::Failed
+                    && pm.epoch.is_none()
+                {
+                    return Some(*wrapper_event_id);
                 }
                 None
             })
