@@ -603,6 +603,8 @@ where
             wrapper_event_id: commit_event.id,
             message_event_id: None,
             processed_at: Timestamp::now(),
+            epoch: Some(mls_group.epoch().as_u64()),
+            mls_group_id: Some(mls_group.group_id().into()),
             state: message_types::ProcessedMessageState::ProcessedCommit,
             failure_reason: None,
         };
@@ -708,6 +710,8 @@ where
             wrapper_event_id: commit_event.id,
             message_event_id: None,
             processed_at: Timestamp::now(),
+            epoch: Some(mls_group.epoch().as_u64()),
+            mls_group_id: Some(mls_group.group_id().into()),
             state: message_types::ProcessedMessageState::ProcessedCommit,
             failure_reason: None,
         };
@@ -777,6 +781,8 @@ where
             wrapper_event_id: commit_event.id,
             message_event_id: None,
             processed_at: Timestamp::now(),
+            epoch: Some(mls_group.epoch().as_u64()),
+            mls_group_id: Some(mls_group.group_id().into()),
             state: message_types::ProcessedMessageState::ProcessedCommit,
             failure_reason: None,
         };
@@ -1177,6 +1183,8 @@ where
             wrapper_event_id: commit_event.id,
             message_event_id: None,
             processed_at: Timestamp::now(),
+            epoch: Some(mls_group.epoch().as_u64()),
+            mls_group_id: Some(mls_group.group_id().into()),
             state: message_types::ProcessedMessageState::ProcessedCommit,
             failure_reason: None,
         };
@@ -1241,6 +1249,8 @@ where
             wrapper_event_id: evolution_event.id,
             message_event_id: None,
             processed_at: Timestamp::now(),
+            epoch: Some(group.epoch().as_u64()),
+            mls_group_id: Some(group.group_id().into()),
             state: message_types::ProcessedMessageState::ProcessedCommit,
             failure_reason: None,
         };

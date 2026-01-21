@@ -137,6 +137,7 @@ CREATE TABLE IF NOT EXISTS messages (
     event JSONB NOT NULL,
     wrapper_event_id BLOB NOT NULL,
     state TEXT NOT NULL,
+    epoch INTEGER,
     PRIMARY KEY (mls_group_id, id),
     FOREIGN KEY (mls_group_id) REFERENCES groups(mls_group_id) ON DELETE CASCADE
 );
@@ -147,12 +148,15 @@ CREATE INDEX IF NOT EXISTS idx_messages_created_at ON messages(created_at);
 CREATE INDEX IF NOT EXISTS idx_messages_pubkey ON messages(pubkey);
 CREATE INDEX IF NOT EXISTS idx_messages_kind ON messages(kind);
 CREATE INDEX IF NOT EXISTS idx_messages_state ON messages(state);
+CREATE INDEX IF NOT EXISTS idx_messages_epoch ON messages(mls_group_id, epoch);
 
 -- Processed messages: tracking of processed wrapper events
 CREATE TABLE IF NOT EXISTS processed_messages (
     wrapper_event_id BLOB PRIMARY KEY,
     message_event_id BLOB,
     processed_at INTEGER NOT NULL,
+    epoch INTEGER,
+    mls_group_id BLOB,
     state TEXT NOT NULL,
     failure_reason TEXT
 );
@@ -160,6 +164,7 @@ CREATE TABLE IF NOT EXISTS processed_messages (
 CREATE INDEX IF NOT EXISTS idx_processed_messages_message_event_id ON processed_messages(message_event_id);
 CREATE INDEX IF NOT EXISTS idx_processed_messages_state ON processed_messages(state);
 CREATE INDEX IF NOT EXISTS idx_processed_messages_processed_at ON processed_messages(processed_at);
+CREATE INDEX IF NOT EXISTS idx_processed_messages_epoch ON processed_messages(mls_group_id, epoch);
 
 -- Welcomes: pending welcome messages
 CREATE TABLE IF NOT EXISTS welcomes (

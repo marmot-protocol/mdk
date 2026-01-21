@@ -76,6 +76,7 @@ pub fn create_test_message(mls_group_id: GroupId, event_id: EventId) -> Message 
         event,
         wrapper_event_id: event_id,
         state: MessageState::Processed,
+        epoch: None,
     }
 }
 
@@ -88,6 +89,8 @@ pub fn create_test_processed_message(
         wrapper_event_id,
         message_event_id,
         processed_at: Timestamp::now(),
+        epoch: None,
+        mls_group_id: None,
         state: ProcessedMessageState::Processed,
         failure_reason: None,
     }

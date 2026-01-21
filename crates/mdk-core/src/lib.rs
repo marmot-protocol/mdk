@@ -34,7 +34,7 @@ pub mod test_util;
 mod util;
 pub mod welcomes;
 
-use self::callback::MdkCallback;
+use self::callback::{MdkCallback, RollbackInfo};
 use self::constant::{
     DEFAULT_CIPHERSUITE, GROUP_CONTEXT_REQUIRED_EXTENSIONS, SUPPORTED_EXTENSIONS,
 };

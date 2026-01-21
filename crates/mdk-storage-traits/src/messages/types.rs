@@ -19,6 +19,10 @@ pub struct ProcessedMessage {
     pub message_event_id: Option<EventId>,
     /// The timestamp of when the message was processed
     pub processed_at: Timestamp,
+    /// The epoch when this message was processed (None for backward compatibility)
+    pub epoch: Option<u64>,
+    /// The MLS group ID this message belongs to (for epoch-scoped queries)
+    pub mls_group_id: Option<GroupId>,
     /// The state of the message
     pub state: ProcessedMessageState,
     /// The reason the message failed to be processed
@@ -47,6 +51,8 @@ pub struct Message {
     pub event: UnsignedEvent,
     /// The event id of the 1059 event that contained the message
     pub wrapper_event_id: EventId,
+    /// The epoch when this message was decrypted/processed (None for backward compatibility)
+    pub epoch: Option<u64>,
     /// The state of the message
     pub state: MessageState,
 }
@@ -60,6 +66,8 @@ pub enum MessageState {
     Processed,
     /// The message was deleted by the original sender - via a delete event
     Deleted,
+    /// The epoch was rolled back, content may be invalid and needs reprocessing
+    EpochInvalidated,
 }
 
 impl fmt::Display for MessageState {
@@ -75,6 +83,7 @@ impl MessageState {
             Self::Created => "created",
             Self::Processed => "processed",
             Self::Deleted => "deleted",
+            Self::EpochInvalidated => "epoch_invalidated",
         }
     }
 }
@@ -87,6 +96,7 @@ impl FromStr for MessageState {
             "created" => Ok(Self::Created),
             "processed" => Ok(Self::Processed),
             "deleted" => Ok(Self::Deleted),
+            "epoch_invalidated" => Ok(Self::EpochInvalidated),
             _ => Err(MessageError::InvalidParameters(format!(
                 "Invalid message state: {}",
                 s
@@ -127,6 +137,8 @@ pub enum ProcessedMessageState {
     ProcessedCommit,
     /// The message failed to be processed and stored in the database
     Failed,
+    /// The epoch was rolled back, message needs reprocessing
+    EpochInvalidated,
 }
 
 impl fmt::Display for ProcessedMessageState {
@@ -143,6 +155,7 @@ impl ProcessedMessageState {
             Self::Processed => "processed",
             Self::ProcessedCommit => "processed_commit",
             Self::Failed => "failed",
+            Self::EpochInvalidated => "epoch_invalidated",
         }
     }
 }
@@ -156,6 +169,7 @@ impl FromStr for ProcessedMessageState {
             "processed" => Ok(Self::Processed),
             "processed_commit" => Ok(Self::ProcessedCommit),
             "failed" => Ok(Self::Failed),
+            "epoch_invalidated" => Ok(Self::EpochInvalidated),
             _ => Err(MessageError::InvalidParameters(format!(
                 "Invalid processed message state: {}",
                 s
@@ -203,6 +217,10 @@ mod tests {
             MessageState::from_str("deleted").unwrap(),
             MessageState::Deleted
         );
+        assert_eq!(
+            MessageState::from_str("epoch_invalidated").unwrap(),
+            MessageState::EpochInvalidated
+        );
 
         let err = MessageState::from_str("invalid").unwrap_err();
         match err {
@@ -218,6 +236,10 @@ mod tests {
         assert_eq!(MessageState::Created.to_string(), "created");
         assert_eq!(MessageState::Processed.to_string(), "processed");
         assert_eq!(MessageState::Deleted.to_string(), "deleted");
+        assert_eq!(
+            MessageState::EpochInvalidated.to_string(),
+            "epoch_invalidated"
+        );
     }
 
     #[test]
@@ -233,6 +255,10 @@ mod tests {
         let deleted = MessageState::Deleted;
         let serialized = serde_json::to_string(&deleted).unwrap();
         assert_eq!(serialized, r#""deleted""#);
+
+        let epoch_invalidated = MessageState::EpochInvalidated;
+        let serialized = serde_json::to_string(&epoch_invalidated).unwrap();
+        assert_eq!(serialized, r#""epoch_invalidated""#);
     }
 
     #[test]
@@ -245,6 +271,10 @@ mod tests {
 
         let deleted: MessageState = serde_json::from_str(r#""deleted""#).unwrap();
         assert_eq!(deleted, MessageState::Deleted);
+
+        let epoch_invalidated: MessageState =
+            serde_json::from_str(r#""epoch_invalidated""#).unwrap();
+        assert_eq!(epoch_invalidated, MessageState::EpochInvalidated);
 
         // Test invalid state
         let result = serde_json::from_str::<MessageState>(r#""invalid""#);
@@ -273,12 +303,14 @@ mod tests {
                 "Test message".to_string(),
             ),
             wrapper_event_id: EventId::all_zeros(),
+            epoch: Some(5),
             state: MessageState::Created,
         };
 
         let serialized = serde_json::to_value(&message).unwrap();
         assert_eq!(serialized["state"], json!("created"));
         assert_eq!(serialized["content"], json!("Test message"));
+        assert_eq!(serialized["epoch"], json!(5));
     }
 
     #[test]
@@ -299,6 +331,10 @@ mod tests {
             ProcessedMessageState::from_str("failed").unwrap(),
             ProcessedMessageState::Failed
         );
+        assert_eq!(
+            ProcessedMessageState::from_str("epoch_invalidated").unwrap(),
+            ProcessedMessageState::EpochInvalidated
+        );
 
         let err = ProcessedMessageState::from_str("invalid").unwrap_err();
         match err {
@@ -318,6 +354,10 @@ mod tests {
             "processed_commit"
         );
         assert_eq!(ProcessedMessageState::Failed.to_string(), "failed");
+        assert_eq!(
+            ProcessedMessageState::EpochInvalidated.to_string(),
+            "epoch_invalidated"
+        );
     }
 
     #[test]
@@ -337,6 +377,10 @@ mod tests {
         let failed = ProcessedMessageState::Failed;
         let serialized = serde_json::to_string(&failed).unwrap();
         assert_eq!(serialized, r#""failed""#);
+
+        let epoch_invalidated = ProcessedMessageState::EpochInvalidated;
+        let serialized = serde_json::to_string(&epoch_invalidated).unwrap();
+        assert_eq!(serialized, r#""epoch_invalidated""#);
     }
 
     #[test]
@@ -354,6 +398,10 @@ mod tests {
         let failed: ProcessedMessageState = serde_json::from_str(r#""failed""#).unwrap();
         assert_eq!(failed, ProcessedMessageState::Failed);
 
+        let epoch_invalidated: ProcessedMessageState =
+            serde_json::from_str(r#""epoch_invalidated""#).unwrap();
+        assert_eq!(epoch_invalidated, ProcessedMessageState::EpochInvalidated);
+
         // Test invalid state
         let result = serde_json::from_str::<ProcessedMessageState>(r#""invalid""#);
         assert!(result.is_err());
@@ -366,6 +414,8 @@ mod tests {
             wrapper_event_id: EventId::all_zeros(),
             message_event_id: None,
             processed_at: Timestamp::now(),
+            epoch: Some(5),
+            mls_group_id: Some(GroupId::from_slice(&[1, 2, 3, 4])),
             state: ProcessedMessageState::Processed,
             failure_reason: None,
         };
@@ -373,12 +423,15 @@ mod tests {
         let serialized = serde_json::to_value(&processed_message).unwrap();
         assert_eq!(serialized["state"], json!("processed"));
         assert_eq!(serialized["failure_reason"], json!(null));
+        assert_eq!(serialized["epoch"], json!(5));
 
         // Create a failed message with a reason
         let failed_message = ProcessedMessage {
             wrapper_event_id: EventId::all_zeros(),
             message_event_id: Some(EventId::all_zeros()),
             processed_at: Timestamp::now(),
+            epoch: None,
+            mls_group_id: None,
             state: ProcessedMessageState::Failed,
             failure_reason: Some("Decryption failed".to_string()),
         };
@@ -391,10 +444,13 @@ mod tests {
 
     #[test]
     fn test_processed_message_deserialization() {
+        // Test with epoch set and mls_group_id null
         let json_str = r#"{
             "wrapper_event_id": "0000000000000000000000000000000000000000000000000000000000000000",
             "message_event_id": null,
             "processed_at": 1677721600,
+            "epoch": 5,
+            "mls_group_id": null,
             "state": "processed",
             "failure_reason": null
         }"#;
@@ -402,11 +458,16 @@ mod tests {
         let processed_message: ProcessedMessage = serde_json::from_str(json_str).unwrap();
         assert_eq!(processed_message.state, ProcessedMessageState::Processed);
         assert_eq!(processed_message.failure_reason, None);
+        assert_eq!(processed_message.epoch, Some(5));
+        assert_eq!(processed_message.mls_group_id, None);
 
+        // Test with failed state and all optional fields null
         let json_str = r#"{
             "wrapper_event_id": "0000000000000000000000000000000000000000000000000000000000000000",
             "message_event_id": "0000000000000000000000000000000000000000000000000000000000000000",
             "processed_at": 1677721600,
+            "epoch": null,
+            "mls_group_id": null,
             "state": "failed",
             "failure_reason": "Decryption failed"
         }"#;
@@ -417,5 +478,7 @@ mod tests {
             failed_message.failure_reason,
             Some("Decryption failed".to_string())
         );
+        assert_eq!(failed_message.epoch, None);
+        assert_eq!(failed_message.mls_group_id, None);
     }
 }

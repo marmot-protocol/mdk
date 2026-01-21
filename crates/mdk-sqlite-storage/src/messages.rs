@@ -48,8 +48,8 @@ impl MessageStorage for MdkSqliteStorage {
         self.with_connection(|conn| {
             conn.execute(
                 "INSERT INTO messages
-             (id, pubkey, kind, mls_group_id, created_at, content, tags, event, wrapper_event_id, state)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             (id, pubkey, kind, mls_group_id, created_at, content, tags, event, wrapper_event_id, epoch, state)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(mls_group_id, id) DO UPDATE SET
                  pubkey = excluded.pubkey,
                  kind = excluded.kind,
@@ -58,6 +58,7 @@ impl MessageStorage for MdkSqliteStorage {
                  tags = excluded.tags,
                  event = excluded.event,
                  wrapper_event_id = excluded.wrapper_event_id,
+                 epoch = excluded.epoch,
                  state = excluded.state",
                 params![
                     message.id.as_bytes(),
@@ -69,6 +70,7 @@ impl MessageStorage for MdkSqliteStorage {
                     &tags_json,
                     &event_json,
                     message.wrapper_event_id.as_bytes(),
+                    message.epoch,
                     message.state.as_str(),
                 ],
             )
@@ -101,21 +103,29 @@ impl MessageStorage for MdkSqliteStorage {
         &self,
         processed_message: ProcessedMessage,
     ) -> Result<(), MessageError> {
-        // Convert message_event_id to string if it exists
+        // Convert message_event_id to bytes if it exists
         let message_event_id = processed_message
             .message_event_id
             .as_ref()
             .map(|id| id.to_bytes());
 
+        // Convert mls_group_id to bytes if it exists
+        let mls_group_id = processed_message
+            .mls_group_id
+            .as_ref()
+            .map(|id| id.as_slice().to_vec());
+
         self.with_connection(|conn| {
             conn.execute(
                 "INSERT OR REPLACE INTO processed_messages
-             (wrapper_event_id, message_event_id, processed_at, state, failure_reason)
-             VALUES (?, ?, ?, ?, ?)",
+             (wrapper_event_id, message_event_id, processed_at, epoch, mls_group_id, state, failure_reason)
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
                 params![
                     &processed_message.wrapper_event_id.to_bytes(),
                     &message_event_id,
                     &processed_message.processed_at.as_u64(),
+                    &processed_message.epoch,
+                    &mls_group_id,
                     &processed_message.state.to_string(),
                     &processed_message.failure_reason
                 ],
@@ -138,6 +148,152 @@ impl MessageStorage for MdkSqliteStorage {
             stmt.query_row(params![event_id.to_bytes()], db::row_to_processed_message)
                 .optional()
                 .map_err(into_message_err)
+        })
+    }
+
+    fn invalidate_messages_after_epoch(
+        &self,
+        group_id: &mdk_storage_traits::GroupId,
+        epoch: u64,
+    ) -> Result<Vec<EventId>, MessageError> {
+        self.with_connection(|conn| {
+            // First, get the event IDs that will be invalidated
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id FROM messages
+                     WHERE mls_group_id = ? AND epoch > ?",
+                )
+                .map_err(into_message_err)?;
+
+            let event_ids: Vec<EventId> = stmt
+                .query_map(params![group_id.as_slice(), epoch], |row| {
+                    let id_blob: Vec<u8> = row.get(0)?;
+                    Ok(id_blob)
+                })
+                .map_err(into_message_err)?
+                .filter_map(|r| r.ok())
+                .filter_map(|id_blob| EventId::from_slice(&id_blob).ok())
+                .collect();
+
+            // Then update the state to epoch_invalidated
+            conn.execute(
+                "UPDATE messages SET state = 'epoch_invalidated'
+                 WHERE mls_group_id = ? AND epoch > ?",
+                params![group_id.as_slice(), epoch],
+            )
+            .map_err(into_message_err)?;
+
+            Ok(event_ids)
+        })
+    }
+
+    fn invalidate_processed_messages_after_epoch(
+        &self,
+        group_id: &mdk_storage_traits::GroupId,
+        epoch: u64,
+    ) -> Result<Vec<EventId>, MessageError> {
+        self.with_connection(|conn| {
+            // First, get the wrapper event IDs that will be invalidated
+            let mut stmt = conn
+                .prepare(
+                    "SELECT wrapper_event_id FROM processed_messages
+                     WHERE mls_group_id = ? AND epoch > ?",
+                )
+                .map_err(into_message_err)?;
+
+            let event_ids: Vec<EventId> = stmt
+                .query_map(params![group_id.as_slice(), epoch], |row| {
+                    let id_blob: Vec<u8> = row.get(0)?;
+                    Ok(id_blob)
+                })
+                .map_err(into_message_err)?
+                .filter_map(|r| r.ok())
+                .filter_map(|id_blob| EventId::from_slice(&id_blob).ok())
+                .collect();
+
+            // Then update the state to epoch_invalidated
+            conn.execute(
+                "UPDATE processed_messages SET state = 'epoch_invalidated'
+                 WHERE mls_group_id = ? AND epoch > ?",
+                params![group_id.as_slice(), epoch],
+            )
+            .map_err(into_message_err)?;
+
+            Ok(event_ids)
+        })
+    }
+
+    fn find_invalidated_messages(
+        &self,
+        group_id: &mdk_storage_traits::GroupId,
+    ) -> Result<Vec<Message>, MessageError> {
+        self.with_connection(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT * FROM messages
+                     WHERE mls_group_id = ? AND state = 'epoch_invalidated'",
+                )
+                .map_err(into_message_err)?;
+
+            let messages: Vec<Message> = stmt
+                .query_map(params![group_id.as_slice()], db::row_to_message)
+                .map_err(into_message_err)?
+                .filter_map(|r| r.ok())
+                .collect();
+
+            Ok(messages)
+        })
+    }
+
+    fn find_invalidated_processed_messages(
+        &self,
+        group_id: &mdk_storage_traits::GroupId,
+    ) -> Result<Vec<ProcessedMessage>, MessageError> {
+        self.with_connection(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT * FROM processed_messages
+                     WHERE mls_group_id = ? AND state = 'epoch_invalidated'",
+                )
+                .map_err(into_message_err)?;
+
+            let messages: Vec<ProcessedMessage> = stmt
+                .query_map(params![group_id.as_slice()], db::row_to_processed_message)
+                .map_err(into_message_err)?
+                .filter_map(|r| r.ok())
+                .collect();
+
+            Ok(messages)
+        })
+    }
+
+    fn find_failed_messages_for_retry(
+        &self,
+        group_id: &mdk_storage_traits::GroupId,
+    ) -> Result<Vec<EventId>, MessageError> {
+        self.with_connection(|conn| {
+            // Find processed messages that:
+            // - Are for this group
+            // - Have state = Failed
+            // - Have epoch IS NULL (decryption failed before epoch could be determined)
+            let mut stmt = conn
+                .prepare(
+                    "SELECT wrapper_event_id FROM processed_messages
+                     WHERE mls_group_id = ? AND state = 'failed' AND epoch IS NULL",
+                )
+                .map_err(into_message_err)?;
+
+            let event_ids: Vec<EventId> = stmt
+                .query_map(params![group_id.as_slice()], |row| {
+                    let id_blob: Vec<u8> = row.get(0)?;
+                    Ok(id_blob)
+                })
+                .map_err(into_message_err)?
+                .filter_map(|r| r.ok())
+                .filter_map(|id_blob| EventId::from_slice(&id_blob).ok())
+                .collect();
+
+            Ok(event_ids)
         })
     }
 }
@@ -209,6 +365,7 @@ mod tests {
                 "content".to_string(),
             ),
             wrapper_event_id,
+            epoch: Some(1),
             state: MessageState::Created,
         };
 
@@ -242,6 +399,8 @@ mod tests {
             wrapper_event_id,
             message_event_id: Some(message_event_id),
             processed_at: Timestamp::from(1_000_000_000u64),
+            epoch: Some(1),
+            mls_group_id: None,
             state: ProcessedMessageState::Processed,
             failure_reason: None,
         };
@@ -316,6 +475,7 @@ mod tests {
                 "content".to_string(),
             ),
             wrapper_event_id,
+            epoch: None,
             state: MessageState::Created,
         };
 
@@ -402,6 +562,7 @@ mod tests {
                 "content".to_string(),
             ),
             wrapper_event_id: wrapper_event_id_1,
+            epoch: Some(1),
             state: MessageState::Created,
         };
 
@@ -421,6 +582,7 @@ mod tests {
                 "content".to_string(),
             ),
             wrapper_event_id: wrapper_event_id_2,
+            epoch: Some(2),
             state: MessageState::Created,
         };
 

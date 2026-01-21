@@ -1650,6 +1650,7 @@ mod tests {
             ),
             wrapper_event_id: wrapper_id,
             state: MessageState::Created,
+            epoch: None,
         };
         nostr_storage.save_message(message.clone()).unwrap();
         let found_message = nostr_storage
@@ -1682,6 +1683,8 @@ mod tests {
             wrapper_event_id: wrapper_id,
             message_event_id: Some(event_id),
             processed_at: Timestamp::now(),
+            epoch: None,
+            mls_group_id: None,
             state: ProcessedMessageState::Processed,
             failure_reason: None,
         };
@@ -1726,6 +1729,7 @@ mod tests {
             ),
             wrapper_event_id: wrapper_id,
             state: MessageState::Created,
+            epoch: None,
         };
 
         // Attempting to save a message for a non-existent group should return an error
@@ -1789,6 +1793,7 @@ mod tests {
             ),
             wrapper_event_id: wrapper_id,
             state: MessageState::Created,
+            epoch: None,
         };
 
         // Save the original message
@@ -1885,6 +1890,7 @@ mod tests {
             ),
             wrapper_event_id: wrapper_id_1,
             state: MessageState::Created,
+            epoch: None,
         };
         nostr_storage.save_message(message_1.clone()).unwrap();
 
@@ -1910,6 +1916,7 @@ mod tests {
             ),
             wrapper_event_id: wrapper_id_2,
             state: MessageState::Created,
+            epoch: None,
         };
         nostr_storage.save_message(message_2.clone()).unwrap();
 
@@ -1990,6 +1997,7 @@ mod tests {
             ),
             wrapper_event_id: wrapper_id,
             state: MessageState::Created,
+            epoch: None,
         };
 
         let result = nostr_storage.save_message(message);
@@ -2193,6 +2201,7 @@ mod tests {
             ),
             wrapper_event_id: EventId::all_zeros(),
             state: MessageState::Created,
+            epoch: None,
         };
         storage.save_message(message).unwrap();
 
@@ -2220,6 +2229,7 @@ mod tests {
             ),
             wrapper_event_id: EventId::all_zeros(),
             state: MessageState::Created,
+            epoch: None,
         };
         storage.save_message(message_2).unwrap();
 
@@ -2586,6 +2596,7 @@ mod tests {
             ),
             wrapper_event_id: EventId::all_zeros(),
             state: MessageState::Created,
+            epoch: None,
         };
         storage.save_message(message).unwrap();
 

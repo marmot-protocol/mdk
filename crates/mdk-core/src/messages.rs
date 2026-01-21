@@ -244,6 +244,7 @@ where
             event: rumor.clone(),
             wrapper_event_id: event.id,
             state: message_types::MessageState::Created,
+            epoch: Some(mls_group.epoch().as_u64()),
         };
 
         // Create processed_message to track state of message
@@ -251,6 +252,8 @@ where
             wrapper_event_id: event.id,
             message_event_id: Some(rumor_id),
             processed_at: Timestamp::now(),
+            epoch: Some(mls_group.epoch().as_u64()),
+            mls_group_id: Some(mls_group_id.clone()),
             state: message_types::ProcessedMessageState::Created,
             failure_reason: None,
         };
@@ -634,6 +637,8 @@ where
             wrapper_event_id: event.id,
             message_event_id: Some(rumor_id),
             processed_at: Timestamp::now(),
+            epoch: Some(group.epoch),
+            mls_group_id: Some(group.mls_group_id.clone()),
             state: message_types::ProcessedMessageState::Processed,
             failure_reason: None,
         };
@@ -649,6 +654,7 @@ where
             event: rumor.clone(),
             wrapper_event_id: event.id,
             state: message_types::MessageState::Processed,
+            epoch: Some(group.epoch),
         };
 
         self.storage()
@@ -865,6 +871,8 @@ where
             wrapper_event_id: event.id,
             message_event_id: None,
             processed_at: Timestamp::now(),
+            epoch: None,
+            mls_group_id: None,
             state: message_types::ProcessedMessageState::Processed,
             failure_reason: None,
         };
@@ -1000,6 +1008,8 @@ where
             wrapper_event_id: event.id,
             message_event_id: None,
             processed_at: Timestamp::now(),
+            epoch: Some(mls_group.epoch().as_u64()),
+            mls_group_id: Some(group_id.clone()),
             state: message_types::ProcessedMessageState::ProcessedCommit, // Mark as Commit
             failure_reason: None,
         };
@@ -1097,12 +1107,14 @@ where
             "Local member was removed from group, setting group state to Inactive"
         );
 
-        match self.get_group(group_id)? {
+        let group_epoch = match self.get_group(group_id)? {
             Some(mut group) => {
+                let epoch = group.epoch;
                 group.state = group_types::GroupState::Inactive;
                 self.storage()
                     .save_group(group)
                     .map_err(|e| Error::Group(e.to_string()))?;
+                Some(epoch)
             }
             None => {
                 tracing::warn!(
@@ -1110,13 +1122,16 @@ where
                     group_id = %hex::encode(group_id.as_slice()),
                     "Group not found in storage while handling eviction"
                 );
+                None
             }
-        }
+        };
 
         let processed_message = message_types::ProcessedMessage {
             wrapper_event_id: event.id,
             message_event_id: None,
             processed_at: Timestamp::now(),
+            epoch: group_epoch,
+            mls_group_id: Some(group_id.clone()),
             state: message_types::ProcessedMessageState::Processed,
             failure_reason: None,
         };
@@ -1359,6 +1374,8 @@ where
                             wrapper_event_id: event.id,
                             message_event_id: None,
                             processed_at: Timestamp::now(),
+                            epoch: Some(mls_group.epoch().as_u64()),
+                            mls_group_id: Some(group.mls_group_id.clone()),
                             state: message_types::ProcessedMessageState::Processed,
                             failure_reason: None,
                         };
@@ -1429,6 +1446,8 @@ where
                     wrapper_event_id: event.id,
                     message_event_id: None,
                     processed_at: Timestamp::now(),
+                    epoch: Some(mls_group.epoch().as_u64()),
+                    mls_group_id: Some(group.mls_group_id.clone()),
                     state: message_types::ProcessedMessageState::ProcessedCommit,
                     failure_reason: None,
                 };
@@ -1505,6 +1524,8 @@ where
             wrapper_event_id: event_id,
             message_event_id: None,
             processed_at: Timestamp::now(),
+            epoch: None,
+            mls_group_id: None,
             state: message_types::ProcessedMessageState::Failed,
             failure_reason: Some(sanitized_reason.to_string()),
         };
@@ -1599,8 +1620,9 @@ where
                         })
                     }
                     message_types::ProcessedMessageState::Processed
-                    | message_types::ProcessedMessageState::Failed => {
-                        tracing::debug!(target: "mdk_core::messages::process_message", "Message cannot be processed (already processed or failed)");
+                    | message_types::ProcessedMessageState::Failed
+                    | message_types::ProcessedMessageState::EpochInvalidated => {
+                        tracing::debug!(target: "mdk_core::messages::process_message", "Message cannot be processed (already processed, failed, or epoch invalidated)");
                         Ok(MessageProcessingResult::Unprocessable {
                             mls_group_id: group.mls_group_id.clone(),
                         })
@@ -1627,8 +1649,38 @@ where
                         Ok(_) => {
                             tracing::info!("Rollback successful. Re-processing better commit.");
 
+                            // Invalidate messages from epochs after the rollback target
+                            // These are messages processed with the wrong commit's keys - they
+                            // can never be decrypted again and should be marked as invalidated
+                            let invalidated_messages = self
+                                .storage()
+                                .invalidate_messages_after_epoch(&group.mls_group_id, msg_epoch)
+                                .unwrap_or_default();
+
+                            // Also invalidate processed_messages from wrong epochs
+                            let _ = self
+                                .storage()
+                                .invalidate_processed_messages_after_epoch(
+                                    &group.mls_group_id,
+                                    msg_epoch,
+                                );
+
+                            // Find messages that failed to decrypt because we had the wrong
+                            // commit's keys. Now that we've rolled back and will apply the
+                            // correct commit, these can potentially be decrypted.
+                            let messages_needing_refetch = self
+                                .storage()
+                                .find_failed_messages_for_retry(&group.mls_group_id)
+                                .unwrap_or_default();
+
                             if let Some(cb) = &self.callback {
-                                cb.on_rollback(&group.mls_group_id, msg_epoch, &event.id);
+                                cb.on_rollback(&crate::RollbackInfo {
+                                    group_id: group.mls_group_id.clone(),
+                                    target_epoch: msg_epoch,
+                                    new_head_event: event.id,
+                                    invalidated_messages,
+                                    messages_needing_refetch,
+                                });
                             }
 
                             // Recursively call process_message now that state is rolled back.
@@ -1671,6 +1723,8 @@ where
                     wrapper_event_id: event.id,
                     message_event_id: None,
                     processed_at: Timestamp::now(),
+                    epoch: Some(group.epoch),
+                    mls_group_id: Some(group.mls_group_id.clone()),
                     state: message_types::ProcessedMessageState::Failed,
                     failure_reason: Some("Epoch mismatch".to_string()),
                 };
@@ -1711,6 +1765,8 @@ where
                     wrapper_event_id: event.id,
                     message_event_id: None,
                     processed_at: Timestamp::now(),
+                    epoch: Some(group.epoch),
+                    mls_group_id: Some(group.mls_group_id.clone()),
                     state: message_types::ProcessedMessageState::Failed,
                     failure_reason: Some("Epoch mismatch".to_string()),
                 };
@@ -1728,6 +1784,8 @@ where
                     wrapper_event_id: event.id,
                     message_event_id: None,
                     processed_at: Timestamp::now(),
+                    epoch: Some(group.epoch),
+                    mls_group_id: Some(group.mls_group_id.clone()),
                     state: message_types::ProcessedMessageState::Failed,
                     failure_reason: Some("Group ID mismatch".to_string()),
                 };
@@ -1745,6 +1803,8 @@ where
                     wrapper_event_id: event.id,
                     message_event_id: None,
                     processed_at: Timestamp::now(),
+                    epoch: Some(group.epoch),
+                    mls_group_id: Some(group.mls_group_id.clone()),
                     state: message_types::ProcessedMessageState::Failed,
                     failure_reason: Some("Use after eviction".to_string()),
                 };
@@ -1775,6 +1835,8 @@ where
                     wrapper_event_id: event.id,
                     message_event_id: None,
                     processed_at: Timestamp::now(),
+                    epoch: Some(group.epoch),
+                    mls_group_id: Some(group.mls_group_id.clone()),
                     state: message_types::ProcessedMessageState::Failed,
                     failure_reason: Some(error.to_string()),
                 };
@@ -2343,6 +2405,7 @@ mod tests {
             ),
             wrapper_event_id: EventId::all_zeros(),
             state: message_types::MessageState::Processed,
+            epoch: None,
         };
 
         let app_result = MessageProcessingResult::ApplicationMessage(dummy_message);
@@ -6151,6 +6214,8 @@ mod tests {
             wrapper_event_id: event.id,
             message_event_id: None,
             processed_at: nostr::Timestamp::now(),
+            epoch: None,
+            mls_group_id: None,
             state: message_types::ProcessedMessageState::Processed,
             failure_reason: None,
         };
@@ -7194,7 +7259,7 @@ mod tests {
 
     /// Test callback implementation for tracking rollback events
     struct TestCallback {
-        rollbacks: std::sync::Mutex<Vec<(GroupId, u64, EventId)>>,
+        rollbacks: std::sync::Mutex<Vec<crate::RollbackInfo>>,
     }
 
     impl fmt::Debug for TestCallback {
@@ -7218,16 +7283,18 @@ mod tests {
         }
 
         fn get_rollbacks(&self) -> Vec<(GroupId, u64, EventId)> {
-            self.rollbacks.lock().unwrap().clone()
+            self.rollbacks
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|info| (info.group_id.clone(), info.target_epoch, info.new_head_event))
+                .collect()
         }
     }
 
     impl crate::callback::MdkCallback for TestCallback {
-        fn on_rollback(&self, group_id: &GroupId, target_epoch: u64, new_head_event: &EventId) {
-            self.rollbacks
-                .lock()
-                .unwrap()
-                .push((group_id.clone(), target_epoch, *new_head_event));
+        fn on_rollback(&self, info: &crate::RollbackInfo) {
+            self.rollbacks.lock().unwrap().push(info.clone());
         }
     }
 
