@@ -27,15 +27,15 @@
 
 ### Breaking changes
 
+### Changed
+
+- **Thread-Safe Snapshots**: Implemented atomic snapshot support using internal locking. `create_group_snapshot`, `rollback_group_to_snapshot`, and `release_group_snapshot` are now supported for testing and race resolution. ([#152](https://github.com/marmot-protocol/mdk/pull/152))
 - **Unified Storage Architecture**: `MdkMemoryStorage` now directly implements OpenMLS's `StorageProvider<1>` trait instead of wrapping `openmls_memory_storage`. This enables unified in-memory storage for both MLS and MDK state, consistent with the SQLite implementation. ([#148](https://github.com/marmot-protocol/mdk/pull/148))
   - Removed `openmls_memory_storage` dependency
   - All MLS state is now stored in unified in-memory data structures
   - Consistent API with `MdkSqliteStorage` for easier testing
 - Updated `messages()` implementation to accept `Option<Pagination>` parameter ([#111](https://github.com/marmot-protocol/mdk/pull/111))
 - Updated `pending_welcomes()` implementation to accept `Option<Pagination>` parameter ([#110](https://github.com/marmot-protocol/mdk/pull/110))
-
-### Changed
-
 - **Storage Security**: Updated to use `Secret<T>` wrapper for secret values from storage traits, ensuring automatic memory zeroization ([#109](https://github.com/marmot-protocol/mdk/pull/109))
 - Simplified validation logic to use range contains pattern for better readability ([#111](https://github.com/marmot-protocol/mdk/pull/111))
 - Simplified validation logic to use range contains pattern for better readability ([#110](https://github.com/marmot-protocol/mdk/pull/110))

@@ -21,11 +21,34 @@
 
 ### Deprecated
 
--->
-
 ## Unreleased
 
+### Added
+
+- Configurable `out_of_order_tolerance` and `maximum_forward_distance` in `MdkConfig` for MLS sender ratchet settings. Default `out_of_order_tolerance` increased from 5 to 100 for better handling of out-of-order message delivery on Nostr relays. ([`#155`](https://github.com/marmot-protocol/mdk/pull/155))
+
 ### Breaking changes
+
+### Changed
+
+- **MIP-03 Commit Race Resolution**: Commits are now resolved deterministically based on timestamp (earliest wins) and event ID (lexicographically smallest wins). ([#152](https://github.com/marmot-protocol/mdk/pull/152))
+  - When multiple valid commits are published for the same epoch, clients converge on the same "winning" commit.
+  - If a "better" commit (earlier timestamp) arrives after a "worse" commit has been applied, the client automatically rolls back to the previous epoch and applies the winning commit.
+  - This ensures consistent group state across all clients even with out-of-order message delivery.
+
+### Added
+
+- **Epoch Snapshots & Rollback**: Added `EpochSnapshotManager` to maintain historical epoch states for rollback. ([#152](https://github.com/marmot-protocol/mdk/pull/152))
+- **Configuration**: Added `epoch_snapshot_retention` to `MdkConfig` (default: 5) to control how many past epochs are retained for rollback support. ([#152](https://github.com/marmot-protocol/mdk/pull/152))
+- **Rollback Callback**: Added `MdkCallback` trait and `MdkBuilder::with_callback()` to allow applications to react to rollback events (e.g., to refresh UI). ([#152](https://github.com/marmot-protocol/mdk/pull/152))
+
+### Fixed
+
+- **Security**: Prevent `GroupId` leakage in `test_commit_race_simple_better_commit_wins` assertion failure messages to avoid exposing sensitive identifiers in logs. ([#152](https://github.com/marmot-protocol/mdk/pull/152))
+
+### Removed
+
+### Deprecated
 
 - **Unified Storage Architecture**: `MdkProvider` now uses the storage provider directly as the OpenMLS `StorageProvider`, instead of accessing it via `openmls_storage()`. This enables atomic transactions across MLS and MDK state for proper commit race resolution per MIP-03. Storage implementations must now directly implement `StorageProvider<1>`. ([#148](https://github.com/marmot-protocol/mdk/pull/148))
 - **OpenMLS Dependency**: Updated to OpenMLS git main branch (commit b90ca23b) for GREASE support. This may introduce minor API changes from upstream. The dependency will be reverted to crates.io versions once OpenMLS releases a version with GREASE support. ([#142](https://github.com/marmot-protocol/mdk/pull/142))

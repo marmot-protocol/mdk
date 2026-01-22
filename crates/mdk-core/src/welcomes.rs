@@ -402,8 +402,13 @@ where
             _ => return Err(Error::InvalidWelcomeMessage),
         };
 
+        let sender_ratchet_config = SenderRatchetConfiguration::new(
+            self.config.out_of_order_tolerance,
+            self.config.maximum_forward_distance,
+        );
         let mls_group_config = MlsGroupJoinConfig::builder()
             .use_ratchet_tree_extension(true)
+            .sender_ratchet_configuration(sender_ratchet_config)
             .build();
 
         let staged_welcome =

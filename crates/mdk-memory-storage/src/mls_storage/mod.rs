@@ -12,23 +12,26 @@ use std::collections::HashMap;
 
 use mdk_storage_traits::MdkStorageError;
 pub use mdk_storage_traits::mls_codec::{GroupDataType, JsonCodec};
-use parking_lot::RwLock;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 /// The storage provider version matching OpenMLS's CURRENT_VERSION.
 pub const STORAGE_PROVIDER_VERSION: u16 = 1;
 
-// ============================================================================
-// In-Memory Data Structures
-// ============================================================================
-
-/// In-memory storage for MLS group data.
-/// Key: (group_id bytes, data type)
-/// Value: serialized data bytes
-#[derive(Debug, Default)]
+// In-memory data structures now expect external locking via MdkMemoryStorage
+// Key: (group_id bytes, data type)
+// Value: serialized data bytes
+#[derive(Default)]
 pub struct MlsGroupData {
-    data: RwLock<HashMap<(Vec<u8>, GroupDataType), Vec<u8>>>,
+    pub(crate) data: HashMap<(Vec<u8>, GroupDataType), Vec<u8>>,
+}
+
+impl std::fmt::Debug for MlsGroupData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MlsGroupData")
+            .field("data", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl MlsGroupData {
@@ -39,7 +42,7 @@ impl MlsGroupData {
 
     /// Write group data.
     pub fn write<GroupId, GroupData>(
-        &self,
+        &mut self,
         group_id: &GroupId,
         data_type: GroupDataType,
         data: &GroupData,
@@ -50,9 +53,7 @@ impl MlsGroupData {
     {
         let group_id_bytes = serialize_key(group_id)?;
         let data_bytes = serialize_entity(data)?;
-        self.data
-            .write()
-            .insert((group_id_bytes, data_type), data_bytes);
+        self.data.insert((group_id_bytes, data_type), data_bytes);
         Ok(())
     }
 
@@ -67,8 +68,7 @@ impl MlsGroupData {
         GroupData: DeserializeOwned,
     {
         let group_id_bytes = serialize_key(group_id)?;
-        let guard = self.data.read();
-        match guard.get(&(group_id_bytes, data_type)) {
+        match self.data.get(&(group_id_bytes, data_type)) {
             Some(bytes) => Ok(Some(deserialize_entity(bytes)?)),
             None => Ok(None),
         }
@@ -76,7 +76,7 @@ impl MlsGroupData {
 
     /// Delete group data.
     pub fn delete<GroupId>(
-        &self,
+        &mut self,
         group_id: &GroupId,
         data_type: GroupDataType,
     ) -> Result<(), MdkStorageError>
@@ -84,27 +84,35 @@ impl MlsGroupData {
         GroupId: Serialize,
     {
         let group_id_bytes = serialize_key(group_id)?;
-        self.data.write().remove(&(group_id_bytes, data_type));
+        self.data.remove(&(group_id_bytes, data_type));
         Ok(())
     }
 
     /// Clone all data for snapshotting.
     pub fn clone_data(&self) -> HashMap<(Vec<u8>, GroupDataType), Vec<u8>> {
-        self.data.read().clone()
+        self.data.clone()
     }
 
     /// Restore data from a snapshot.
-    pub fn restore_data(&self, data: HashMap<(Vec<u8>, GroupDataType), Vec<u8>>) {
-        *self.data.write() = data;
+    pub fn restore_data(&mut self, data: HashMap<(Vec<u8>, GroupDataType), Vec<u8>>) {
+        self.data = data;
     }
 }
 
 /// In-memory storage for MLS own leaf nodes.
 /// Key: group_id bytes
 /// Value: list of serialized leaf node bytes (in insertion order)
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct MlsOwnLeafNodes {
-    data: RwLock<HashMap<Vec<u8>, Vec<Vec<u8>>>>,
+    pub(crate) data: HashMap<Vec<u8>, Vec<Vec<u8>>>,
+}
+
+impl std::fmt::Debug for MlsOwnLeafNodes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MlsOwnLeafNodes")
+            .field("data", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl MlsOwnLeafNodes {
@@ -115,7 +123,7 @@ impl MlsOwnLeafNodes {
 
     /// Append a leaf node for a group.
     pub fn append<GroupId, LeafNode>(
-        &self,
+        &mut self,
         group_id: &GroupId,
         leaf_node: &LeafNode,
     ) -> Result<(), MdkStorageError>
@@ -126,7 +134,6 @@ impl MlsOwnLeafNodes {
         let group_id_bytes = serialize_key(group_id)?;
         let leaf_node_bytes = serialize_entity(leaf_node)?;
         self.data
-            .write()
             .entry(group_id_bytes)
             .or_default()
             .push(leaf_node_bytes);
@@ -143,8 +150,7 @@ impl MlsOwnLeafNodes {
         LeafNode: DeserializeOwned,
     {
         let group_id_bytes = serialize_key(group_id)?;
-        let guard = self.data.read();
-        match guard.get(&group_id_bytes) {
+        match self.data.get(&group_id_bytes) {
             Some(leaf_nodes) => {
                 let mut result = Vec::with_capacity(leaf_nodes.len());
                 for bytes in leaf_nodes {
@@ -157,32 +163,40 @@ impl MlsOwnLeafNodes {
     }
 
     /// Delete all leaf nodes for a group.
-    pub fn delete<GroupId>(&self, group_id: &GroupId) -> Result<(), MdkStorageError>
+    pub fn delete<GroupId>(&mut self, group_id: &GroupId) -> Result<(), MdkStorageError>
     where
         GroupId: Serialize,
     {
         let group_id_bytes = serialize_key(group_id)?;
-        self.data.write().remove(&group_id_bytes);
+        self.data.remove(&group_id_bytes);
         Ok(())
     }
 
     /// Clone all data for snapshotting.
     pub fn clone_data(&self) -> HashMap<Vec<u8>, Vec<Vec<u8>>> {
-        self.data.read().clone()
+        self.data.clone()
     }
 
     /// Restore data from a snapshot.
-    pub fn restore_data(&self, data: HashMap<Vec<u8>, Vec<Vec<u8>>>) {
-        *self.data.write() = data;
+    pub fn restore_data(&mut self, data: HashMap<Vec<u8>, Vec<Vec<u8>>>) {
+        self.data = data;
     }
 }
 
 /// In-memory storage for MLS proposals.
 /// Key: (group_id bytes, proposal_ref bytes)
 /// Value: serialized proposal bytes
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct MlsProposals {
-    data: RwLock<HashMap<(Vec<u8>, Vec<u8>), Vec<u8>>>,
+    pub(crate) data: HashMap<(Vec<u8>, Vec<u8>), Vec<u8>>,
+}
+
+impl std::fmt::Debug for MlsProposals {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MlsProposals")
+            .field("data", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl MlsProposals {
@@ -193,7 +207,7 @@ impl MlsProposals {
 
     /// Queue a proposal.
     pub fn queue<GroupId, ProposalRef, QueuedProposal>(
-        &self,
+        &mut self,
         group_id: &GroupId,
         proposal_ref: &ProposalRef,
         proposal: &QueuedProposal,
@@ -207,7 +221,6 @@ impl MlsProposals {
         let proposal_ref_bytes = serialize_key(proposal_ref)?;
         let proposal_bytes = serialize_entity(proposal)?;
         self.data
-            .write()
             .insert((group_id_bytes, proposal_ref_bytes), proposal_bytes);
         Ok(())
     }
@@ -222,9 +235,8 @@ impl MlsProposals {
         ProposalRef: DeserializeOwned,
     {
         let group_id_bytes = serialize_key(group_id)?;
-        let guard = self.data.read();
         let mut refs = Vec::new();
-        for (key, _) in guard.iter() {
+        for (key, _) in self.data.iter() {
             if key.0 == group_id_bytes {
                 refs.push(deserialize_entity(&key.1)?);
             }
@@ -243,9 +255,8 @@ impl MlsProposals {
         QueuedProposal: DeserializeOwned,
     {
         let group_id_bytes = serialize_key(group_id)?;
-        let guard = self.data.read();
         let mut proposals = Vec::new();
-        for ((gid, ref_bytes), proposal_bytes) in guard.iter() {
+        for ((gid, ref_bytes), proposal_bytes) in self.data.iter() {
             if *gid == group_id_bytes {
                 let proposal_ref: ProposalRef = deserialize_entity(ref_bytes)?;
                 let proposal: QueuedProposal = deserialize_entity(proposal_bytes)?;
@@ -257,7 +268,7 @@ impl MlsProposals {
 
     /// Remove a single proposal.
     pub fn remove<GroupId, ProposalRef>(
-        &self,
+        &mut self,
         group_id: &GroupId,
         proposal_ref: &ProposalRef,
     ) -> Result<(), MdkStorageError>
@@ -267,41 +278,45 @@ impl MlsProposals {
     {
         let group_id_bytes = serialize_key(group_id)?;
         let proposal_ref_bytes = serialize_key(proposal_ref)?;
-        self.data
-            .write()
-            .remove(&(group_id_bytes, proposal_ref_bytes));
+        self.data.remove(&(group_id_bytes, proposal_ref_bytes));
         Ok(())
     }
 
     /// Clear all proposals for a group.
-    pub fn clear<GroupId>(&self, group_id: &GroupId) -> Result<(), MdkStorageError>
+    pub fn clear<GroupId>(&mut self, group_id: &GroupId) -> Result<(), MdkStorageError>
     where
         GroupId: Serialize,
     {
         let group_id_bytes = serialize_key(group_id)?;
-        self.data
-            .write()
-            .retain(|(gid, _), _| *gid != group_id_bytes);
+        self.data.retain(|(gid, _), _| *gid != group_id_bytes);
         Ok(())
     }
 
     /// Clone all data for snapshotting.
     pub fn clone_data(&self) -> HashMap<(Vec<u8>, Vec<u8>), Vec<u8>> {
-        self.data.read().clone()
+        self.data.clone()
     }
 
     /// Restore data from a snapshot.
-    pub fn restore_data(&self, data: HashMap<(Vec<u8>, Vec<u8>), Vec<u8>>) {
-        *self.data.write() = data;
+    pub fn restore_data(&mut self, data: HashMap<(Vec<u8>, Vec<u8>), Vec<u8>>) {
+        self.data = data;
     }
 }
 
 /// In-memory storage for MLS key packages.
 /// Key: hash_ref bytes
 /// Value: serialized key package bytes
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct MlsKeyPackages {
-    data: RwLock<HashMap<Vec<u8>, Vec<u8>>>,
+    pub(crate) data: HashMap<Vec<u8>, Vec<u8>>,
+}
+
+impl std::fmt::Debug for MlsKeyPackages {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MlsKeyPackages")
+            .field("data", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl MlsKeyPackages {
@@ -312,7 +327,7 @@ impl MlsKeyPackages {
 
     /// Write a key package.
     pub fn write<HashReference, KeyPackage>(
-        &self,
+        &mut self,
         hash_ref: &HashReference,
         key_package: &KeyPackage,
     ) -> Result<(), MdkStorageError>
@@ -322,7 +337,7 @@ impl MlsKeyPackages {
     {
         let hash_ref_bytes = serialize_key(hash_ref)?;
         let key_package_bytes = serialize_entity(key_package)?;
-        self.data.write().insert(hash_ref_bytes, key_package_bytes);
+        self.data.insert(hash_ref_bytes, key_package_bytes);
         Ok(())
     }
 
@@ -336,40 +351,47 @@ impl MlsKeyPackages {
         KeyPackage: DeserializeOwned,
     {
         let hash_ref_bytes = serialize_key(hash_ref)?;
-        let guard = self.data.read();
-        match guard.get(&hash_ref_bytes) {
+        match self.data.get(&hash_ref_bytes) {
             Some(bytes) => Ok(Some(deserialize_entity(bytes)?)),
             None => Ok(None),
         }
     }
 
     /// Delete a key package.
-    pub fn delete<HashReference>(&self, hash_ref: &HashReference) -> Result<(), MdkStorageError>
+    pub fn delete<HashReference>(&mut self, hash_ref: &HashReference) -> Result<(), MdkStorageError>
     where
         HashReference: Serialize,
     {
         let hash_ref_bytes = serialize_key(hash_ref)?;
-        self.data.write().remove(&hash_ref_bytes);
+        self.data.remove(&hash_ref_bytes);
         Ok(())
     }
 
     /// Clone all data for snapshotting.
     pub fn clone_data(&self) -> HashMap<Vec<u8>, Vec<u8>> {
-        self.data.read().clone()
+        self.data.clone()
     }
 
     /// Restore data from a snapshot.
-    pub fn restore_data(&self, data: HashMap<Vec<u8>, Vec<u8>>) {
-        *self.data.write() = data;
+    pub fn restore_data(&mut self, data: HashMap<Vec<u8>, Vec<u8>>) {
+        self.data = data;
     }
 }
 
 /// In-memory storage for MLS PSKs.
 /// Key: psk_id bytes
 /// Value: serialized PSK bundle bytes
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct MlsPsks {
-    data: RwLock<HashMap<Vec<u8>, Vec<u8>>>,
+    pub(crate) data: HashMap<Vec<u8>, Vec<u8>>,
+}
+
+impl std::fmt::Debug for MlsPsks {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MlsPsks")
+            .field("data", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl MlsPsks {
@@ -380,7 +402,7 @@ impl MlsPsks {
 
     /// Write a PSK.
     pub fn write<PskId, PskBundle>(
-        &self,
+        &mut self,
         psk_id: &PskId,
         psk: &PskBundle,
     ) -> Result<(), MdkStorageError>
@@ -390,7 +412,7 @@ impl MlsPsks {
     {
         let psk_id_bytes = serialize_key(psk_id)?;
         let psk_bytes = serialize_entity(psk)?;
-        self.data.write().insert(psk_id_bytes, psk_bytes);
+        self.data.insert(psk_id_bytes, psk_bytes);
         Ok(())
     }
 
@@ -404,40 +426,47 @@ impl MlsPsks {
         PskBundle: DeserializeOwned,
     {
         let psk_id_bytes = serialize_key(psk_id)?;
-        let guard = self.data.read();
-        match guard.get(&psk_id_bytes) {
+        match self.data.get(&psk_id_bytes) {
             Some(bytes) => Ok(Some(deserialize_entity(bytes)?)),
             None => Ok(None),
         }
     }
 
     /// Delete a PSK.
-    pub fn delete<PskId>(&self, psk_id: &PskId) -> Result<(), MdkStorageError>
+    pub fn delete<PskId>(&mut self, psk_id: &PskId) -> Result<(), MdkStorageError>
     where
         PskId: Serialize,
     {
         let psk_id_bytes = serialize_key(psk_id)?;
-        self.data.write().remove(&psk_id_bytes);
+        self.data.remove(&psk_id_bytes);
         Ok(())
     }
 
     /// Clone all data for snapshotting.
     pub fn clone_data(&self) -> HashMap<Vec<u8>, Vec<u8>> {
-        self.data.read().clone()
+        self.data.clone()
     }
 
     /// Restore data from a snapshot.
-    pub fn restore_data(&self, data: HashMap<Vec<u8>, Vec<u8>>) {
-        *self.data.write() = data;
+    pub fn restore_data(&mut self, data: HashMap<Vec<u8>, Vec<u8>>) {
+        self.data = data;
     }
 }
 
 /// In-memory storage for MLS signature keys.
 /// Key: public_key bytes
 /// Value: serialized signature key pair bytes
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct MlsSignatureKeys {
-    data: RwLock<HashMap<Vec<u8>, Vec<u8>>>,
+    pub(crate) data: HashMap<Vec<u8>, Vec<u8>>,
+}
+
+impl std::fmt::Debug for MlsSignatureKeys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MlsSignatureKeys")
+            .field("data", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl MlsSignatureKeys {
@@ -448,7 +477,7 @@ impl MlsSignatureKeys {
 
     /// Write a signature key pair.
     pub fn write<SignaturePublicKey, SignatureKeyPair>(
-        &self,
+        &mut self,
         public_key: &SignaturePublicKey,
         key_pair: &SignatureKeyPair,
     ) -> Result<(), MdkStorageError>
@@ -458,7 +487,7 @@ impl MlsSignatureKeys {
     {
         let public_key_bytes = serialize_key(public_key)?;
         let key_pair_bytes = serialize_entity(key_pair)?;
-        self.data.write().insert(public_key_bytes, key_pair_bytes);
+        self.data.insert(public_key_bytes, key_pair_bytes);
         Ok(())
     }
 
@@ -472,8 +501,7 @@ impl MlsSignatureKeys {
         SignatureKeyPair: DeserializeOwned,
     {
         let public_key_bytes = serialize_key(public_key)?;
-        let guard = self.data.read();
-        match guard.get(&public_key_bytes) {
+        match self.data.get(&public_key_bytes) {
             Some(bytes) => Ok(Some(deserialize_entity(bytes)?)),
             None => Ok(None),
         }
@@ -481,34 +509,42 @@ impl MlsSignatureKeys {
 
     /// Delete a signature key pair.
     pub fn delete<SignaturePublicKey>(
-        &self,
+        &mut self,
         public_key: &SignaturePublicKey,
     ) -> Result<(), MdkStorageError>
     where
         SignaturePublicKey: Serialize,
     {
         let public_key_bytes = serialize_key(public_key)?;
-        self.data.write().remove(&public_key_bytes);
+        self.data.remove(&public_key_bytes);
         Ok(())
     }
 
     /// Clone all data for snapshotting.
     pub fn clone_data(&self) -> HashMap<Vec<u8>, Vec<u8>> {
-        self.data.read().clone()
+        self.data.clone()
     }
 
     /// Restore data from a snapshot.
-    pub fn restore_data(&self, data: HashMap<Vec<u8>, Vec<u8>>) {
-        *self.data.write() = data;
+    pub fn restore_data(&mut self, data: HashMap<Vec<u8>, Vec<u8>>) {
+        self.data = data;
     }
 }
 
 /// In-memory storage for MLS encryption keys.
 /// Key: public_key bytes
 /// Value: serialized HPKE key pair bytes
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct MlsEncryptionKeys {
-    data: RwLock<HashMap<Vec<u8>, Vec<u8>>>,
+    pub(crate) data: HashMap<Vec<u8>, Vec<u8>>,
+}
+
+impl std::fmt::Debug for MlsEncryptionKeys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MlsEncryptionKeys")
+            .field("data", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl MlsEncryptionKeys {
@@ -519,7 +555,7 @@ impl MlsEncryptionKeys {
 
     /// Write an encryption key pair.
     pub fn write<EncryptionKey, HpkeKeyPair>(
-        &self,
+        &mut self,
         public_key: &EncryptionKey,
         key_pair: &HpkeKeyPair,
     ) -> Result<(), MdkStorageError>
@@ -529,7 +565,7 @@ impl MlsEncryptionKeys {
     {
         let public_key_bytes = serialize_key(public_key)?;
         let key_pair_bytes = serialize_entity(key_pair)?;
-        self.data.write().insert(public_key_bytes, key_pair_bytes);
+        self.data.insert(public_key_bytes, key_pair_bytes);
         Ok(())
     }
 
@@ -543,40 +579,50 @@ impl MlsEncryptionKeys {
         HpkeKeyPair: DeserializeOwned,
     {
         let public_key_bytes = serialize_key(public_key)?;
-        let guard = self.data.read();
-        match guard.get(&public_key_bytes) {
+        match self.data.get(&public_key_bytes) {
             Some(bytes) => Ok(Some(deserialize_entity(bytes)?)),
             None => Ok(None),
         }
     }
 
     /// Delete an encryption key pair.
-    pub fn delete<EncryptionKey>(&self, public_key: &EncryptionKey) -> Result<(), MdkStorageError>
+    pub fn delete<EncryptionKey>(
+        &mut self,
+        public_key: &EncryptionKey,
+    ) -> Result<(), MdkStorageError>
     where
         EncryptionKey: Serialize,
     {
         let public_key_bytes = serialize_key(public_key)?;
-        self.data.write().remove(&public_key_bytes);
+        self.data.remove(&public_key_bytes);
         Ok(())
     }
 
     /// Clone all data for snapshotting.
     pub fn clone_data(&self) -> HashMap<Vec<u8>, Vec<u8>> {
-        self.data.read().clone()
+        self.data.clone()
     }
 
     /// Restore data from a snapshot.
-    pub fn restore_data(&self, data: HashMap<Vec<u8>, Vec<u8>>) {
-        *self.data.write() = data;
+    pub fn restore_data(&mut self, data: HashMap<Vec<u8>, Vec<u8>>) {
+        self.data = data;
     }
 }
 
 /// In-memory storage for MLS epoch key pairs.
 /// Key: (group_id bytes, epoch bytes, leaf_index)
 /// Value: serialized list of HPKE key pairs
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct MlsEpochKeyPairs {
-    data: RwLock<HashMap<(Vec<u8>, Vec<u8>, u32), Vec<u8>>>,
+    pub(crate) data: HashMap<(Vec<u8>, Vec<u8>, u32), Vec<u8>>,
+}
+
+impl std::fmt::Debug for MlsEpochKeyPairs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MlsEpochKeyPairs")
+            .field("data", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl MlsEpochKeyPairs {
@@ -587,7 +633,7 @@ impl MlsEpochKeyPairs {
 
     /// Write epoch encryption key pairs.
     pub fn write<GroupId, EpochKey, HpkeKeyPair>(
-        &self,
+        &mut self,
         group_id: &GroupId,
         epoch: &EpochKey,
         leaf_index: u32,
@@ -602,7 +648,6 @@ impl MlsEpochKeyPairs {
         let epoch_bytes = serialize_key(epoch)?;
         let key_pairs_bytes = serialize_entity(&key_pairs)?;
         self.data
-            .write()
             .insert((group_id_bytes, epoch_bytes, leaf_index), key_pairs_bytes);
         Ok(())
     }
@@ -621,8 +666,7 @@ impl MlsEpochKeyPairs {
     {
         let group_id_bytes = serialize_key(group_id)?;
         let epoch_bytes = serialize_key(epoch)?;
-        let guard = self.data.read();
-        match guard.get(&(group_id_bytes, epoch_bytes, leaf_index)) {
+        match self.data.get(&(group_id_bytes, epoch_bytes, leaf_index)) {
             Some(bytes) => deserialize_entity(bytes),
             None => Ok(Vec::new()),
         }
@@ -630,7 +674,7 @@ impl MlsEpochKeyPairs {
 
     /// Delete epoch encryption key pairs.
     pub fn delete<GroupId, EpochKey>(
-        &self,
+        &mut self,
         group_id: &GroupId,
         epoch: &EpochKey,
         leaf_index: u32,
@@ -641,20 +685,18 @@ impl MlsEpochKeyPairs {
     {
         let group_id_bytes = serialize_key(group_id)?;
         let epoch_bytes = serialize_key(epoch)?;
-        self.data
-            .write()
-            .remove(&(group_id_bytes, epoch_bytes, leaf_index));
+        self.data.remove(&(group_id_bytes, epoch_bytes, leaf_index));
         Ok(())
     }
 
     /// Clone all data for snapshotting.
     pub fn clone_data(&self) -> HashMap<(Vec<u8>, Vec<u8>, u32), Vec<u8>> {
-        self.data.read().clone()
+        self.data.clone()
     }
 
     /// Restore data from a snapshot.
-    pub fn restore_data(&self, data: HashMap<(Vec<u8>, Vec<u8>, u32), Vec<u8>>) {
-        *self.data.write() = data;
+    pub fn restore_data(&mut self, data: HashMap<(Vec<u8>, Vec<u8>, u32), Vec<u8>>) {
+        self.data = data;
     }
 }
 
@@ -701,7 +743,7 @@ mod tests {
 
     #[test]
     fn test_mls_group_data_basic() {
-        let store = MlsGroupData::new();
+        let mut store = MlsGroupData::new();
         let group_id = vec![1u8, 2, 3, 4];
         let data = "test data".to_string();
 
@@ -726,7 +768,7 @@ mod tests {
 
     #[test]
     fn test_mls_key_packages_basic() {
-        let store = MlsKeyPackages::new();
+        let mut store = MlsKeyPackages::new();
         let hash_ref = vec![1u8, 2, 3, 4];
         let key_package = "key package data".to_string();
 
@@ -745,7 +787,7 @@ mod tests {
 
     #[test]
     fn test_mls_own_leaf_nodes_basic() {
-        let store = MlsOwnLeafNodes::new();
+        let mut store = MlsOwnLeafNodes::new();
         let group_id = vec![1u8, 2, 3, 4];
 
         // Append leaf nodes
@@ -764,7 +806,7 @@ mod tests {
 
     #[test]
     fn test_snapshot_restore() {
-        let store = MlsGroupData::new();
+        let mut store = MlsGroupData::new();
         let group_id = vec![1u8, 2, 3, 4];
 
         // Write initial data
@@ -798,7 +840,7 @@ mod tests {
 
     #[test]
     fn test_proposals_queue_and_read() {
-        let store = MlsProposals::new();
+        let mut store = MlsProposals::new();
         let group_id = vec![1u8, 2, 3, 4];
         let proposal_ref = vec![10u8, 20, 30];
         let proposal = "test proposal".to_string();
@@ -819,7 +861,7 @@ mod tests {
 
     #[test]
     fn test_proposals_remove_single() {
-        let store = MlsProposals::new();
+        let mut store = MlsProposals::new();
         let group_id = vec![1u8, 2, 3, 4];
         let proposal_ref = vec![10u8, 20, 30];
         let proposal = "test proposal".to_string();
@@ -835,7 +877,7 @@ mod tests {
 
     #[test]
     fn test_proposals_clear() {
-        let store = MlsProposals::new();
+        let mut store = MlsProposals::new();
         let group_id = vec![1u8, 2, 3, 4];
 
         // Queue multiple proposals
@@ -868,7 +910,7 @@ mod tests {
 
     #[test]
     fn test_proposals_snapshot_restore() {
-        let store = MlsProposals::new();
+        let mut store = MlsProposals::new();
         let group_id = vec![1u8, 2, 3, 4];
         let proposal_ref = vec![10u8, 20, 30];
 
@@ -901,7 +943,7 @@ mod tests {
 
     #[test]
     fn test_psks_write_and_read() {
-        let store = MlsPsks::new();
+        let mut store = MlsPsks::new();
         let psk_id = vec![1u8, 2, 3, 4];
         let psk_bundle = "psk bundle data".to_string();
 
@@ -924,7 +966,7 @@ mod tests {
 
     #[test]
     fn test_psks_delete() {
-        let store = MlsPsks::new();
+        let mut store = MlsPsks::new();
         let psk_id = vec![1u8, 2, 3, 4];
         let psk_bundle = "psk bundle".to_string();
 
@@ -939,7 +981,7 @@ mod tests {
 
     #[test]
     fn test_psks_overwrite() {
-        let store = MlsPsks::new();
+        let mut store = MlsPsks::new();
         let psk_id = vec![1u8, 2, 3, 4];
 
         // Write first
@@ -955,7 +997,7 @@ mod tests {
 
     #[test]
     fn test_psks_snapshot_restore() {
-        let store = MlsPsks::new();
+        let mut store = MlsPsks::new();
         let psk_id = vec![1u8, 2, 3, 4];
 
         // Write
@@ -981,7 +1023,7 @@ mod tests {
 
     #[test]
     fn test_signature_keys_write_and_read() {
-        let store = MlsSignatureKeys::new();
+        let mut store = MlsSignatureKeys::new();
         let public_key = vec![1u8, 2, 3, 4];
         let key_pair = "signature key pair".to_string();
 
@@ -1004,7 +1046,7 @@ mod tests {
 
     #[test]
     fn test_signature_keys_delete() {
-        let store = MlsSignatureKeys::new();
+        let mut store = MlsSignatureKeys::new();
         let public_key = vec![1u8, 2, 3, 4];
         let key_pair = "signature key pair".to_string();
 
@@ -1019,7 +1061,7 @@ mod tests {
 
     #[test]
     fn test_signature_keys_snapshot_restore() {
-        let store = MlsSignatureKeys::new();
+        let mut store = MlsSignatureKeys::new();
         let public_key = vec![1u8, 2, 3, 4];
 
         // Write
@@ -1045,7 +1087,7 @@ mod tests {
 
     #[test]
     fn test_encryption_keys_write_and_read() {
-        let store = MlsEncryptionKeys::new();
+        let mut store = MlsEncryptionKeys::new();
         let public_key = vec![1u8, 2, 3, 4];
         let key_pair = "encryption key pair".to_string();
 
@@ -1068,7 +1110,7 @@ mod tests {
 
     #[test]
     fn test_encryption_keys_delete() {
-        let store = MlsEncryptionKeys::new();
+        let mut store = MlsEncryptionKeys::new();
         let public_key = vec![1u8, 2, 3, 4];
         let key_pair = "encryption key pair".to_string();
 
@@ -1083,7 +1125,7 @@ mod tests {
 
     #[test]
     fn test_encryption_keys_snapshot_restore() {
-        let store = MlsEncryptionKeys::new();
+        let mut store = MlsEncryptionKeys::new();
         let public_key = vec![1u8, 2, 3, 4];
 
         // Write
@@ -1109,7 +1151,7 @@ mod tests {
 
     #[test]
     fn test_epoch_key_pairs_write_and_read() {
-        let store = MlsEpochKeyPairs::new();
+        let mut store = MlsEpochKeyPairs::new();
         let group_id = vec![1u8, 2, 3, 4];
         let epoch = 5u64;
         let leaf_index = 0u32;
@@ -1138,7 +1180,7 @@ mod tests {
 
     #[test]
     fn test_epoch_key_pairs_delete() {
-        let store = MlsEpochKeyPairs::new();
+        let mut store = MlsEpochKeyPairs::new();
         let group_id = vec![1u8, 2, 3, 4];
         let epoch = 5u64;
         let leaf_index = 0u32;
@@ -1157,7 +1199,7 @@ mod tests {
 
     #[test]
     fn test_epoch_key_pairs_different_epochs() {
-        let store = MlsEpochKeyPairs::new();
+        let mut store = MlsEpochKeyPairs::new();
         let group_id = vec![1u8, 2, 3, 4];
         let leaf_index = 0u32;
 
@@ -1182,7 +1224,7 @@ mod tests {
 
     #[test]
     fn test_epoch_key_pairs_different_leaf_indices() {
-        let store = MlsEpochKeyPairs::new();
+        let mut store = MlsEpochKeyPairs::new();
         let group_id = vec![1u8, 2, 3, 4];
         let epoch = 1u64;
 
@@ -1203,7 +1245,7 @@ mod tests {
 
     #[test]
     fn test_epoch_key_pairs_snapshot_restore() {
-        let store = MlsEpochKeyPairs::new();
+        let mut store = MlsEpochKeyPairs::new();
         let group_id = vec![1u8, 2, 3, 4];
         let epoch = 1u64;
         let leaf_index = 0u32;

@@ -137,6 +137,7 @@ CREATE TABLE IF NOT EXISTS messages (
     event JSONB NOT NULL,
     wrapper_event_id BLOB NOT NULL,
     state TEXT NOT NULL,
+    epoch INTEGER,
     PRIMARY KEY (mls_group_id, id),
     FOREIGN KEY (mls_group_id) REFERENCES groups(mls_group_id) ON DELETE CASCADE
 );
@@ -147,12 +148,15 @@ CREATE INDEX IF NOT EXISTS idx_messages_created_at ON messages(created_at);
 CREATE INDEX IF NOT EXISTS idx_messages_pubkey ON messages(pubkey);
 CREATE INDEX IF NOT EXISTS idx_messages_kind ON messages(kind);
 CREATE INDEX IF NOT EXISTS idx_messages_state ON messages(state);
+CREATE INDEX IF NOT EXISTS idx_messages_epoch ON messages(mls_group_id, epoch);
 
 -- Processed messages: tracking of processed wrapper events
 CREATE TABLE IF NOT EXISTS processed_messages (
     wrapper_event_id BLOB PRIMARY KEY,
     message_event_id BLOB,
     processed_at INTEGER NOT NULL,
+    epoch INTEGER,
+    mls_group_id BLOB,
     state TEXT NOT NULL,
     failure_reason TEXT
 );
@@ -160,6 +164,7 @@ CREATE TABLE IF NOT EXISTS processed_messages (
 CREATE INDEX IF NOT EXISTS idx_processed_messages_message_event_id ON processed_messages(message_event_id);
 CREATE INDEX IF NOT EXISTS idx_processed_messages_state ON processed_messages(state);
 CREATE INDEX IF NOT EXISTS idx_processed_messages_processed_at ON processed_messages(processed_at);
+CREATE INDEX IF NOT EXISTS idx_processed_messages_epoch ON processed_messages(mls_group_id, epoch);
 
 -- Welcomes: pending welcome messages
 CREATE TABLE IF NOT EXISTS welcomes (
@@ -197,3 +202,21 @@ CREATE TABLE IF NOT EXISTS processed_welcomes (
 CREATE INDEX IF NOT EXISTS idx_processed_welcomes_welcome_event_id ON processed_welcomes(welcome_event_id);
 CREATE INDEX IF NOT EXISTS idx_processed_welcomes_state ON processed_welcomes(state);
 CREATE INDEX IF NOT EXISTS idx_processed_welcomes_processed_at ON processed_welcomes(processed_at);
+
+-- ============================================================================
+-- Group State Snapshots (MIP-03 Commit Race Resolution)
+-- ============================================================================
+-- Instead of SQLite savepoints (which have stack-ordering issues where
+-- releasing an old savepoint destroys all newer ones), we copy group-specific
+-- rows to this table for later restoration.
+
+CREATE TABLE IF NOT EXISTS group_state_snapshots (
+    snapshot_name TEXT NOT NULL,
+    group_id BLOB NOT NULL,
+    table_name TEXT NOT NULL,
+    row_key BLOB NOT NULL,      -- Serialized primary key (JSON)
+    row_data BLOB NOT NULL,     -- Serialized row data (JSON)
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (snapshot_name, group_id, table_name, row_key),
+    FOREIGN KEY (group_id) REFERENCES groups(mls_group_id) ON DELETE CASCADE
+);

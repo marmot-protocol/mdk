@@ -513,6 +513,7 @@ mod tests {
                 ),
                 wrapper_event_id,
                 state: MessageState::Created,
+                epoch: None,
             };
 
             storage.save_message(message).unwrap();

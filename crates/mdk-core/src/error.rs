@@ -56,6 +56,9 @@ pub enum Error {
     /// Crypto error
     #[error(transparent)]
     Crypto(#[from] CryptoError),
+    /// Storage error
+    #[error(transparent)]
+    Storage(#[from] mdk_storage_traits::MdkStorageError),
     /// Generic OpenMLS error
     #[error(transparent)]
     OpenMlsGeneric(#[from] LibraryError),
@@ -74,6 +77,9 @@ pub enum Error {
     /// Process message error - epoch mismatch
     #[error("Message epoch differs from the group's epoch")]
     ProcessMessageWrongEpoch,
+    /// Process message error - epoch mismatch with epoch info
+    #[error("Message epoch {0} differs from the group's epoch")]
+    ProcessMessageWrongEpochWithInfo(u64),
     /// Process message error - wrong group ID
     #[error("Wrong group ID")]
     ProcessMessageWrongGroupId,
@@ -163,6 +169,9 @@ pub enum Error {
     /// Commit message received from a non-admin
     #[error("not processing commit from non-admin")]
     CommitFromNonAdmin,
+    /// Own commit pending merge
+    #[error("own commit pending merge")]
+    OwnCommitPending,
     /// Error when updating group context extensions
     #[error("Error when updating group context extensions {0}")]
     UpdateGroupContextExts(String),
@@ -222,6 +231,9 @@ pub enum Error {
     /// Multiple group ID tags found (MIP-03 requires exactly one)
     #[error("multiple group ID tags found: expected exactly one h tag, found {0}")]
     MultipleGroupIdTags(usize),
+    /// Failed to create epoch snapshot for commit race resolution
+    #[error("failed to create epoch snapshot: {0}")]
+    SnapshotCreationFailed(String),
 }
 
 impl From<FromUtf8Error> for Error {
@@ -550,5 +562,51 @@ mod tests {
         };
         let debug_str = format!("{:?}", error);
         assert!(debug_str.contains("UnexpectedEvent"));
+    }
+
+    /// Test ProcessMessageWrongEpochWithInfo error variant
+    #[test]
+    fn test_process_message_wrong_epoch_with_info() {
+        let error = Error::ProcessMessageWrongEpochWithInfo(42);
+        assert_eq!(
+            error.to_string(),
+            "Message epoch 42 differs from the group's epoch"
+        );
+
+        let error2 = Error::ProcessMessageWrongEpochWithInfo(100);
+        assert_eq!(
+            error2.to_string(),
+            "Message epoch 100 differs from the group's epoch"
+        );
+    }
+
+    /// Test OwnCommitPending error variant
+    #[test]
+    fn test_own_commit_pending() {
+        let error = Error::OwnCommitPending;
+        assert_eq!(error.to_string(), "own commit pending merge");
+    }
+
+    /// Test SnapshotCreationFailed error variant
+    #[test]
+    fn test_snapshot_creation_failed() {
+        let error = Error::SnapshotCreationFailed("storage unavailable".to_string());
+        assert_eq!(
+            error.to_string(),
+            "failed to create epoch snapshot: storage unavailable"
+        );
+    }
+
+    /// Test Storage error conversion
+    #[test]
+    fn test_storage_error_conversion() {
+        use mdk_storage_traits::MdkStorageError;
+
+        let storage_error = MdkStorageError::NotFound("group not found".to_string());
+        let error: Error = storage_error.into();
+
+        assert!(matches!(error, Error::Storage(_)));
+        let msg = error.to_string();
+        assert!(msg.contains("not found"));
     }
 }

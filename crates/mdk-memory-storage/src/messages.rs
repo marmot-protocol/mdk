@@ -34,9 +34,11 @@ impl MessageStorage for MdkMemoryStorage {
             }
         }
 
-        // Acquire both cache write guards to ensure coordinated eviction
-        let mut cache = self.messages_cache.write();
-        let mut group_cache = self.messages_by_group_cache.write();
+        // Acquire lock on inner storage
+        let mut guard = self.inner.write();
+        let inner = &mut *guard;
+        let cache = &mut inner.messages_cache;
+        let group_cache = &mut inner.messages_by_group_cache;
 
         match group_cache.get_mut(&message.mls_group_id) {
             Some(group_messages) => {
@@ -80,8 +82,8 @@ impl MessageStorage for MdkMemoryStorage {
         mls_group_id: &GroupId,
         event_id: &EventId,
     ) -> Result<Option<Message>, MessageError> {
-        let group_cache = self.messages_by_group_cache.read();
-        match group_cache.peek(mls_group_id) {
+        let inner = self.inner.read();
+        match inner.messages_by_group_cache.peek(mls_group_id) {
             Some(group_messages) => Ok(group_messages.get(event_id).cloned()),
             None => Ok(None),
         }
@@ -91,18 +93,142 @@ impl MessageStorage for MdkMemoryStorage {
         &self,
         event_id: &EventId,
     ) -> Result<Option<ProcessedMessage>, MessageError> {
-        let cache = self.processed_messages_cache.read();
-        Ok(cache.peek(event_id).cloned())
+        let inner = self.inner.read();
+        Ok(inner.processed_messages_cache.peek(event_id).cloned())
     }
 
     fn save_processed_message(
         &self,
         processed_message: ProcessedMessage,
     ) -> Result<(), MessageError> {
-        let mut cache = self.processed_messages_cache.write();
-        cache.put(processed_message.wrapper_event_id, processed_message);
+        let mut inner = self.inner.write();
+        inner
+            .processed_messages_cache
+            .put(processed_message.wrapper_event_id, processed_message);
 
         Ok(())
+    }
+
+    fn invalidate_messages_after_epoch(
+        &self,
+        group_id: &GroupId,
+        epoch: u64,
+    ) -> Result<Vec<EventId>, MessageError> {
+        let mut inner = self.inner.write();
+        let mut invalidated_ids = Vec::new();
+
+        // Get the group messages
+        if let Some(group_messages) = inner.messages_by_group_cache.get_mut(group_id) {
+            for (event_id, message) in group_messages.iter_mut() {
+                // Only invalidate messages with epoch > target
+                if let Some(msg_epoch) = message.epoch
+                    && msg_epoch > epoch
+                {
+                    message.state = MessageState::EpochInvalidated;
+                    invalidated_ids.push(*event_id);
+                }
+            }
+        }
+
+        // Also update in the messages_cache
+        for event_id in &invalidated_ids {
+            if let Some(message) = inner.messages_cache.get_mut(event_id) {
+                message.state = MessageState::EpochInvalidated;
+            }
+        }
+
+        Ok(invalidated_ids)
+    }
+
+    fn invalidate_processed_messages_after_epoch(
+        &self,
+        group_id: &GroupId,
+        epoch: u64,
+    ) -> Result<Vec<EventId>, MessageError> {
+        let mut inner = self.inner.write();
+        let mut invalidated_ids = Vec::new();
+
+        // Iterate through all processed messages and invalidate those matching the group and epoch
+        let cache = &mut inner.processed_messages_cache;
+        for (wrapper_event_id, processed_message) in cache.iter_mut() {
+            // Check if this message belongs to the specified group
+            if let Some(ref msg_group_id) = processed_message.mls_group_id
+                && msg_group_id == group_id
+                && let Some(msg_epoch) = processed_message.epoch
+                && msg_epoch > epoch
+            {
+                processed_message.state = ProcessedMessageState::EpochInvalidated;
+                invalidated_ids.push(*wrapper_event_id);
+            }
+        }
+
+        Ok(invalidated_ids)
+    }
+
+    fn find_invalidated_messages(&self, group_id: &GroupId) -> Result<Vec<Message>, MessageError> {
+        let inner = self.inner.read();
+
+        if let Some(group_messages) = inner.messages_by_group_cache.peek(group_id) {
+            let invalidated: Vec<Message> = group_messages
+                .values()
+                .filter(|msg| msg.state == MessageState::EpochInvalidated)
+                .cloned()
+                .collect();
+            Ok(invalidated)
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    fn find_invalidated_processed_messages(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<Vec<ProcessedMessage>, MessageError> {
+        let inner = self.inner.read();
+
+        let invalidated: Vec<ProcessedMessage> = inner
+            .processed_messages_cache
+            .iter()
+            .filter_map(|(_, pm)| {
+                if let Some(ref msg_group_id) = pm.mls_group_id
+                    && msg_group_id == group_id
+                    && pm.state == ProcessedMessageState::EpochInvalidated
+                {
+                    return Some(pm.clone());
+                }
+                None
+            })
+            .collect();
+
+        Ok(invalidated)
+    }
+
+    fn find_failed_messages_for_retry(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<Vec<EventId>, MessageError> {
+        let inner = self.inner.read();
+
+        // Find processed messages that:
+        // - Are for this group
+        // - Have state = Failed
+        // - Have epoch = None (decryption failed before epoch could be determined)
+        let event_ids: Vec<EventId> = inner
+            .processed_messages_cache
+            .iter()
+            .filter_map(|(wrapper_event_id, pm)| {
+                if let Some(ref msg_group_id) = pm.mls_group_id
+                    && msg_group_id == group_id
+                    && pm.state == ProcessedMessageState::Failed
+                    && pm.epoch.is_none()
+                {
+                    return Some(*wrapper_event_id);
+                }
+                None
+            })
+            .collect();
+
+        Ok(event_ids)
     }
 }
 
@@ -145,6 +271,16 @@ mod tests {
         content: &str,
         timestamp: u64,
     ) -> Message {
+        create_test_message_with_epoch(event_id, group_id, content, timestamp, None)
+    }
+
+    fn create_test_message_with_epoch(
+        event_id: EventId,
+        group_id: GroupId,
+        content: &str,
+        timestamp: u64,
+        epoch: Option<u64>,
+    ) -> Message {
         let pubkey = Keys::generate().public_key();
         let wrapper_event_id = EventId::from_slice(&[200u8; 32]).unwrap();
 
@@ -164,6 +300,7 @@ mod tests {
                 content.to_string(),
             ),
             wrapper_event_id,
+            epoch,
             state: MessageState::Created,
         }
     }
@@ -195,7 +332,8 @@ mod tests {
 
         // Verify the group cache has exactly 1 message
         {
-            let cache = storage.messages_by_group_cache.read();
+            let inner = storage.inner.read();
+            let cache = &inner.messages_by_group_cache;
             let group_messages = cache.peek(&group_id).unwrap();
             assert_eq!(group_messages.len(), 1);
         }
@@ -214,7 +352,8 @@ mod tests {
 
         // Verify the group cache still has exactly 1 message (no duplicates)
         {
-            let cache = storage.messages_by_group_cache.read();
+            let inner = storage.inner.read();
+            let cache = &inner.messages_by_group_cache;
             let group_messages = cache.peek(&group_id).unwrap();
             assert_eq!(
                 group_messages.len(),
@@ -268,14 +407,16 @@ mod tests {
 
         // Verify group 1 has 3 messages
         {
-            let cache = storage.messages_by_group_cache.read();
+            let inner = storage.inner.read();
+            let cache = &inner.messages_by_group_cache;
             let group1_messages = cache.peek(&group1_id).unwrap();
             assert_eq!(group1_messages.len(), 3);
         }
 
         // Verify group 2 has 5 messages
         {
-            let cache = storage.messages_by_group_cache.read();
+            let inner = storage.inner.read();
+            let cache = &inner.messages_by_group_cache;
             let group2_messages = cache.peek(&group2_id).unwrap();
             assert_eq!(group2_messages.len(), 5);
         }
@@ -330,7 +471,8 @@ mod tests {
 
         // Verify the group cache has exactly 1 message
         {
-            let cache = storage.messages_by_group_cache.read();
+            let inner = storage.inner.read();
+            let cache = &inner.messages_by_group_cache;
             let group_messages = cache.peek(&group_id).unwrap();
             assert_eq!(
                 group_messages.len(),
@@ -378,7 +520,8 @@ mod tests {
 
         // Verify still only 1 message in the group
         {
-            let cache = storage.messages_by_group_cache.read();
+            let inner = storage.inner.read();
+            let cache = &inner.messages_by_group_cache;
             let group_messages = cache.peek(&group_id).unwrap();
             assert_eq!(group_messages.len(), 1);
         }
@@ -422,7 +565,8 @@ mod tests {
 
         // Verify all messages are stored
         {
-            let cache = storage.messages_by_group_cache.read();
+            let inner = storage.inner.read();
+            let cache = &inner.messages_by_group_cache;
             let group_messages = cache.peek(&group_id).unwrap();
             assert_eq!(group_messages.len(), DEFAULT_MAX_MESSAGES_PER_GROUP);
         }
@@ -452,7 +596,8 @@ mod tests {
 
         // Verify the count is still at MAX (eviction occurred)
         {
-            let cache = storage.messages_by_group_cache.read();
+            let inner = storage.inner.read();
+            let cache = &inner.messages_by_group_cache;
             let group_messages = cache.peek(&group_id).unwrap();
             assert_eq!(
                 group_messages.len(),
@@ -475,7 +620,8 @@ mod tests {
         // CRITICAL: The oldest message should ALSO be evicted from messages_cache
         // This verifies the coordinated eviction fix
         {
-            let cache = storage.messages_cache.read();
+            let inner = storage.inner.read();
+            let cache = &inner.messages_cache;
             assert!(
                 !cache.contains(&oldest_event_id),
                 "Oldest message should be evicted from messages_cache too (no orphaned entries)"
@@ -502,7 +648,8 @@ mod tests {
 
         // Should still have the same count (no eviction for updates)
         {
-            let cache = storage.messages_by_group_cache.read();
+            let inner = storage.inner.read();
+            let cache = &inner.messages_by_group_cache;
             let group_messages = cache.peek(&group_id).unwrap();
             assert_eq!(
                 group_messages.len(),
@@ -553,7 +700,8 @@ mod tests {
 
         // Verify all messages are stored
         {
-            let cache = storage.messages_by_group_cache.read();
+            let inner = storage.inner.read();
+            let cache = &inner.messages_by_group_cache;
             let group_messages = cache.peek(&group_id).unwrap();
             assert_eq!(group_messages.len(), custom_limit);
         }
@@ -570,7 +718,8 @@ mod tests {
 
         // Verify the count is still at custom_limit (eviction occurred)
         {
-            let cache = storage.messages_by_group_cache.read();
+            let inner = storage.inner.read();
+            let cache = &inner.messages_by_group_cache;
             let group_messages = cache.peek(&group_id).unwrap();
             assert_eq!(group_messages.len(), custom_limit);
         }

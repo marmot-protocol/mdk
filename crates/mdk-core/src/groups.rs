@@ -603,6 +603,8 @@ where
             wrapper_event_id: commit_event.id,
             message_event_id: None,
             processed_at: Timestamp::now(),
+            epoch: Some(mls_group.epoch().as_u64()),
+            mls_group_id: Some(mls_group.group_id().into()),
             state: message_types::ProcessedMessageState::ProcessedCommit,
             failure_reason: None,
         };
@@ -708,6 +710,8 @@ where
             wrapper_event_id: commit_event.id,
             message_event_id: None,
             processed_at: Timestamp::now(),
+            epoch: Some(mls_group.epoch().as_u64()),
+            mls_group_id: Some(mls_group.group_id().into()),
             state: message_types::ProcessedMessageState::ProcessedCommit,
             failure_reason: None,
         };
@@ -777,6 +781,8 @@ where
             wrapper_event_id: commit_event.id,
             message_event_id: None,
             processed_at: Timestamp::now(),
+            epoch: Some(mls_group.epoch().as_u64()),
+            mls_group_id: Some(mls_group.group_id().into()),
             state: message_types::ProcessedMessageState::ProcessedCommit,
             failure_reason: None,
         };
@@ -988,11 +994,16 @@ where
 
         // Build the group config
         let capabilities = self.capabilities();
+        let sender_ratchet_config = SenderRatchetConfiguration::new(
+            self.config.out_of_order_tolerance,
+            self.config.maximum_forward_distance,
+        );
         let group_config = MlsGroupCreateConfig::builder()
             .ciphersuite(self.ciphersuite)
             .use_ratchet_tree_extension(true)
             .capabilities(capabilities)
             .with_group_context_extensions(extensions)?
+            .sender_ratchet_configuration(sender_ratchet_config)
             .build();
 
         let mut mls_group =
@@ -1172,6 +1183,8 @@ where
             wrapper_event_id: commit_event.id,
             message_event_id: None,
             processed_at: Timestamp::now(),
+            epoch: Some(mls_group.epoch().as_u64()),
+            mls_group_id: Some(mls_group.group_id().into()),
             state: message_types::ProcessedMessageState::ProcessedCommit,
             failure_reason: None,
         };
@@ -1236,6 +1249,8 @@ where
             wrapper_event_id: evolution_event.id,
             message_event_id: None,
             processed_at: Timestamp::now(),
+            epoch: Some(group.epoch().as_u64()),
+            mls_group_id: Some(group.group_id().into()),
             state: message_types::ProcessedMessageState::ProcessedCommit,
             failure_reason: None,
         };

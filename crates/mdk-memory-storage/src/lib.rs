@@ -12,9 +12,9 @@
 //! snapshot and restore operations for rollback scenarios, analogous to SQLite
 //! savepoints.
 //!
-//! **Note:** Snapshot and restore operations are not atomic with respect to
-//! concurrent access. Callers must ensure no other operations are in progress
-//! when creating or restoring snapshots.
+//! **Note:** Snapshot and restore operations are **atomic**. `create_snapshot()`
+//! acquires a global read lock and `restore_snapshot()` acquires a global write
+//! lock on the storage state, ensuring consistency in multi-threaded environments.
 
 //! ## Memory Exhaustion Protection
 //!
@@ -73,7 +73,7 @@ use self::mls_storage::{
     GroupDataType, MlsEncryptionKeys, MlsEpochKeyPairs, MlsGroupData, MlsKeyPackages,
     MlsOwnLeafNodes, MlsProposals, MlsPsks, MlsSignatureKeys, STORAGE_PROVIDER_VERSION,
 };
-pub use self::snapshot::MemoryStorageSnapshot;
+pub use self::snapshot::{GroupScopedSnapshot, MemoryStorageSnapshot};
 use self::snapshot::{HashMapToLruExt, LruCacheExt};
 
 /// Default cache size for each LRU cache
@@ -293,9 +293,9 @@ impl ValidationLimits {
 /// - Thread-safe access through `RwLock` protected data structures
 /// - LRU caching for frequently accessed MDK objects
 ///
-/// **Important:** Snapshot and restore operations read/write multiple independent
-/// locks and are not atomic with respect to concurrent operations. Callers must
-/// ensure no other operations are in progress when creating or restoring snapshots.
+/// **Concurrency:** Snapshot and restore operations are **atomic**. `create_snapshot()`
+/// acquires a global read lock and `restore_snapshot()` acquires a global write lock
+/// on the storage state, ensuring consistency in multi-threaded environments.
 ///
 /// ## Caching Strategy
 ///
@@ -328,74 +328,49 @@ impl ValidationLimits {
 /// let storage = MdkMemoryStorage::with_limits(limits);
 /// ```
 pub struct MdkMemoryStorage {
+    /// Configurable validation limits
+    limits: ValidationLimits,
+    /// Thread-safe inner storage
+    inner: RwLock<MdkMemoryStorageInner>,
+    /// Group-scoped snapshots for rollback support (MIP-03)
+    /// Key is (group_id, snapshot_name) for group-specific rollback
+    /// Uses GroupScopedSnapshot to ensure rollback only affects the target group
+    group_snapshots: RwLock<HashMap<(GroupId, String), GroupScopedSnapshot>>,
+}
+
+/// Unified storage architecture container
+struct MdkMemoryStorageInner {
     // ========================================================================
-    // MLS Storage (replaces openmls_memory_storage)
+    // MLS Storage
     // ========================================================================
-    /// MLS group data (join config, tree, context, etc.)
     mls_group_data: MlsGroupData,
-    /// MLS own leaf nodes for each group
     mls_own_leaf_nodes: MlsOwnLeafNodes,
-    /// MLS proposals queue
     mls_proposals: MlsProposals,
-    /// MLS key packages
     mls_key_packages: MlsKeyPackages,
-    /// MLS pre-shared keys
     mls_psks: MlsPsks,
-    /// MLS signature key pairs
     mls_signature_keys: MlsSignatureKeys,
-    /// MLS HPKE encryption key pairs
     mls_encryption_keys: MlsEncryptionKeys,
-    /// MLS epoch encryption key pairs
     mls_epoch_key_pairs: MlsEpochKeyPairs,
 
     // ========================================================================
-    // MDK Storage (groups, messages, welcomes)
+    // MDK Storage
     // ========================================================================
-    /// Configurable validation limits
-    limits: ValidationLimits,
-
-    /// LRU Cache for Group objects, keyed by MLS group ID (GroupId)
-    groups_cache: RwLock<LruCache<GroupId, Group>>,
-    /// LRU Cache for Group objects, keyed by Nostr group ID ([u8; 32])
-    groups_by_nostr_id_cache: RwLock<LruCache<[u8; 32], Group>>,
-    /// LRU Cache for GroupRelay objects, keyed by MLS group ID (GroupId)
-    group_relays_cache: RwLock<LruCache<GroupId, BTreeSet<GroupRelay>>>,
-    /// LRU Cache for Welcome objects, keyed by Event ID
-    welcomes_cache: RwLock<LruCache<EventId, Welcome>>,
-    /// LRU Cache for ProcessedWelcome objects, keyed by Event ID
-    processed_welcomes_cache: RwLock<LruCache<EventId, ProcessedWelcome>>,
-    /// LRU Cache for Message objects, keyed by Event ID
-    messages_cache: RwLock<LruCache<EventId, Message>>,
-    /// LRU Cache for Messages by Group ID, using HashMap for O(1) lookups by EventId
-    messages_by_group_cache: RwLock<LruCache<GroupId, HashMap<EventId, Message>>>,
-    /// LRU Cache for ProcessedMessage objects, keyed by Event ID
-    processed_messages_cache: RwLock<LruCache<EventId, ProcessedMessage>>,
-    /// LRU Cache for GroupExporterSecret objects, keyed by a tuple of (GroupId, epoch)
-    group_exporter_secrets_cache: RwLock<LruCache<(GroupId, u64), GroupExporterSecret>>,
+    groups_cache: LruCache<GroupId, Group>,
+    groups_by_nostr_id_cache: LruCache<[u8; 32], Group>,
+    group_relays_cache: LruCache<GroupId, BTreeSet<GroupRelay>>,
+    welcomes_cache: LruCache<EventId, Welcome>,
+    processed_welcomes_cache: LruCache<EventId, ProcessedWelcome>,
+    messages_cache: LruCache<EventId, Message>,
+    messages_by_group_cache: LruCache<GroupId, HashMap<EventId, Message>>,
+    processed_messages_cache: LruCache<EventId, ProcessedMessage>,
+    group_exporter_secrets_cache: LruCache<(GroupId, u64), GroupExporterSecret>,
 }
 
 impl fmt::Debug for MdkMemoryStorage {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Redact all caches that contain GroupId keys to prevent sensitive identifier exposure
         f.debug_struct("MdkMemoryStorage")
-            .field("mls_group_data", &"[REDACTED]")
-            .field("mls_own_leaf_nodes", &"[REDACTED]")
-            .field("mls_proposals", &"[REDACTED]")
-            .field("mls_key_packages", &"[REDACTED]")
-            .field("mls_psks", &"[REDACTED]")
-            .field("mls_signature_keys", &"[REDACTED]")
-            .field("mls_encryption_keys", &"[REDACTED]")
-            .field("mls_epoch_key_pairs", &"[REDACTED]")
             .field("limits", &self.limits)
-            .field("groups_cache", &"[REDACTED]")
-            .field("groups_by_nostr_id_cache", &"[REDACTED]")
-            .field("group_relays_cache", &"[REDACTED]")
-            .field("welcomes_cache", &"[REDACTED]")
-            .field("processed_welcomes_cache", &"[REDACTED]")
-            .field("messages_cache", &"[REDACTED]")
-            .field("messages_by_group_cache", &"[REDACTED]")
-            .field("processed_messages_cache", &"[REDACTED]")
-            .field("group_exporter_secrets_cache", &"[REDACTED]")
+            .field("inner", &"RwLock<MdkMemoryStorageInner>")
             .finish()
     }
 }
@@ -446,7 +421,8 @@ impl MdkMemoryStorage {
     pub fn with_limits(limits: ValidationLimits) -> Self {
         let cache_size =
             NonZeroUsize::new(limits.cache_size).expect("cache_size must be greater than 0");
-        MdkMemoryStorage {
+
+        let inner = MdkMemoryStorageInner {
             // MLS storage
             mls_group_data: MlsGroupData::new(),
             mls_own_leaf_nodes: MlsOwnLeafNodes::new(),
@@ -457,17 +433,21 @@ impl MdkMemoryStorage {
             mls_encryption_keys: MlsEncryptionKeys::new(),
             mls_epoch_key_pairs: MlsEpochKeyPairs::new(),
             // MDK storage
-            limits,
+            groups_cache: LruCache::new(cache_size),
+            groups_by_nostr_id_cache: LruCache::new(cache_size),
+            group_relays_cache: LruCache::new(cache_size),
+            welcomes_cache: LruCache::new(cache_size),
+            processed_welcomes_cache: LruCache::new(cache_size),
+            messages_cache: LruCache::new(cache_size),
+            messages_by_group_cache: LruCache::new(cache_size),
+            processed_messages_cache: LruCache::new(cache_size),
+            group_exporter_secrets_cache: LruCache::new(cache_size),
+        };
 
-            groups_cache: RwLock::new(LruCache::new(cache_size)),
-            groups_by_nostr_id_cache: RwLock::new(LruCache::new(cache_size)),
-            group_relays_cache: RwLock::new(LruCache::new(cache_size)),
-            welcomes_cache: RwLock::new(LruCache::new(cache_size)),
-            processed_welcomes_cache: RwLock::new(LruCache::new(cache_size)),
-            messages_cache: RwLock::new(LruCache::new(cache_size)),
-            messages_by_group_cache: RwLock::new(LruCache::new(cache_size)),
-            processed_messages_cache: RwLock::new(LruCache::new(cache_size)),
-            group_exporter_secrets_cache: RwLock::new(LruCache::new(cache_size)),
+        MdkMemoryStorage {
+            limits,
+            inner: RwLock::new(inner),
+            group_snapshots: RwLock::new(HashMap::new()),
         }
     }
 
@@ -477,59 +457,38 @@ impl MdkMemoryStorage {
 
     /// Creates a snapshot of all in-memory state.
     ///
-    /// This enables rollback functionality similar to SQLite savepoints,
-    /// allowing you to:
-    /// 1. Create a snapshot before an operation
-    /// 2. Attempt the operation
-    /// 3. Restore the snapshot if the operation fails or needs to be undone
+    /// This enables rollback functionality similar to SQLite savepoints.
     ///
-    /// # Concurrency Warning
+    /// # Concurrency
     ///
-    /// This method acquires multiple independent locks sequentially. If other
-    /// threads are performing operations concurrently, the snapshot may capture
-    /// an inconsistent state. **Callers must ensure no concurrent operations
-    /// are in progress when creating a snapshot.**
+    /// This operation is **atomic**. It acquires a global read lock on the storage
+    /// state, ensuring a consistent snapshot even in multi-threaded environments.
     ///
     /// # Returns
     ///
     /// A `MemoryStorageSnapshot` containing cloned copies of all state.
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// use mdk_memory_storage::MdkMemoryStorage;
-    ///
-    /// let storage = MdkMemoryStorage::default();
-    ///
-    /// // Create a snapshot before an operation
-    /// let snapshot = storage.create_snapshot();
-    ///
-    /// // ... perform operations that might need rollback ...
-    ///
-    /// // If something goes wrong, restore the snapshot
-    /// storage.restore_snapshot(snapshot);
-    /// ```
     pub fn create_snapshot(&self) -> MemoryStorageSnapshot {
+        let inner = self.inner.read();
         MemoryStorageSnapshot {
             // MLS data
-            mls_group_data: self.mls_group_data.clone_data(),
-            mls_own_leaf_nodes: self.mls_own_leaf_nodes.clone_data(),
-            mls_proposals: self.mls_proposals.clone_data(),
-            mls_key_packages: self.mls_key_packages.clone_data(),
-            mls_psks: self.mls_psks.clone_data(),
-            mls_signature_keys: self.mls_signature_keys.clone_data(),
-            mls_encryption_keys: self.mls_encryption_keys.clone_data(),
-            mls_epoch_key_pairs: self.mls_epoch_key_pairs.clone_data(),
+            mls_group_data: inner.mls_group_data.clone_data(),
+            mls_own_leaf_nodes: inner.mls_own_leaf_nodes.clone_data(),
+            mls_proposals: inner.mls_proposals.clone_data(),
+            mls_key_packages: inner.mls_key_packages.clone_data(),
+            mls_psks: inner.mls_psks.clone_data(),
+            mls_signature_keys: inner.mls_signature_keys.clone_data(),
+            mls_encryption_keys: inner.mls_encryption_keys.clone_data(),
+            mls_epoch_key_pairs: inner.mls_epoch_key_pairs.clone_data(),
             // MDK data
-            groups: self.groups_cache.read().clone_to_hashmap(),
-            groups_by_nostr_id: self.groups_by_nostr_id_cache.read().clone_to_hashmap(),
-            group_relays: self.group_relays_cache.read().clone_to_hashmap(),
-            group_exporter_secrets: self.group_exporter_secrets_cache.read().clone_to_hashmap(),
-            welcomes: self.welcomes_cache.read().clone_to_hashmap(),
-            processed_welcomes: self.processed_welcomes_cache.read().clone_to_hashmap(),
-            messages: self.messages_cache.read().clone_to_hashmap(),
-            messages_by_group: self.messages_by_group_cache.read().clone_to_hashmap(),
-            processed_messages: self.processed_messages_cache.read().clone_to_hashmap(),
+            groups: inner.groups_cache.clone_to_hashmap(),
+            groups_by_nostr_id: inner.groups_by_nostr_id_cache.clone_to_hashmap(),
+            group_relays: inner.group_relays_cache.clone_to_hashmap(),
+            group_exporter_secrets: inner.group_exporter_secrets_cache.clone_to_hashmap(),
+            welcomes: inner.welcomes_cache.clone_to_hashmap(),
+            processed_welcomes: inner.processed_welcomes_cache.clone_to_hashmap(),
+            messages: inner.messages_cache.clone_to_hashmap(),
+            messages_by_group: inner.messages_by_group_cache.clone_to_hashmap(),
+            processed_messages: inner.processed_messages_cache.clone_to_hashmap(),
         }
     }
 
@@ -537,60 +496,276 @@ impl MdkMemoryStorage {
     ///
     /// This replaces all current in-memory state with the state from the snapshot.
     ///
-    /// # Concurrency Warning
+    /// # Concurrency
     ///
-    /// This method acquires multiple independent locks sequentially. If other
-    /// threads are performing operations concurrently, they may observe partial
-    /// restore state (some data restored, some not yet). **Callers must ensure
-    /// no concurrent operations are in progress when restoring a snapshot.**
+    /// This operation is **atomic**. It acquires a global write lock on the storage
+    /// state, ensuring that the restore is consistent even in multi-threaded environments.
     ///
     /// # Arguments
     ///
     /// * `snapshot` - The snapshot to restore from.
     pub fn restore_snapshot(&self, snapshot: MemoryStorageSnapshot) {
+        let mut inner = self.inner.write();
+
         // Restore MLS data
-        self.mls_group_data.restore_data(snapshot.mls_group_data);
-        self.mls_own_leaf_nodes
+        inner.mls_group_data.restore_data(snapshot.mls_group_data);
+        inner
+            .mls_own_leaf_nodes
             .restore_data(snapshot.mls_own_leaf_nodes);
-        self.mls_proposals.restore_data(snapshot.mls_proposals);
-        self.mls_key_packages
+        inner.mls_proposals.restore_data(snapshot.mls_proposals);
+        inner
+            .mls_key_packages
             .restore_data(snapshot.mls_key_packages);
-        self.mls_psks.restore_data(snapshot.mls_psks);
-        self.mls_signature_keys
+        inner.mls_psks.restore_data(snapshot.mls_psks);
+        inner
+            .mls_signature_keys
             .restore_data(snapshot.mls_signature_keys);
-        self.mls_encryption_keys
+        inner
+            .mls_encryption_keys
             .restore_data(snapshot.mls_encryption_keys);
-        self.mls_epoch_key_pairs
+        inner
+            .mls_epoch_key_pairs
             .restore_data(snapshot.mls_epoch_key_pairs);
 
         // Restore MDK data
-        snapshot
-            .groups
-            .restore_to_lru(&mut self.groups_cache.write());
+        snapshot.groups.restore_to_lru(&mut inner.groups_cache);
         snapshot
             .groups_by_nostr_id
-            .restore_to_lru(&mut self.groups_by_nostr_id_cache.write());
+            .restore_to_lru(&mut inner.groups_by_nostr_id_cache);
         snapshot
             .group_relays
-            .restore_to_lru(&mut self.group_relays_cache.write());
+            .restore_to_lru(&mut inner.group_relays_cache);
         snapshot
             .group_exporter_secrets
-            .restore_to_lru(&mut self.group_exporter_secrets_cache.write());
-        snapshot
-            .welcomes
-            .restore_to_lru(&mut self.welcomes_cache.write());
+            .restore_to_lru(&mut inner.group_exporter_secrets_cache);
+        snapshot.welcomes.restore_to_lru(&mut inner.welcomes_cache);
         snapshot
             .processed_welcomes
-            .restore_to_lru(&mut self.processed_welcomes_cache.write());
-        snapshot
-            .messages
-            .restore_to_lru(&mut self.messages_cache.write());
+            .restore_to_lru(&mut inner.processed_welcomes_cache);
+        snapshot.messages.restore_to_lru(&mut inner.messages_cache);
         snapshot
             .messages_by_group
-            .restore_to_lru(&mut self.messages_by_group_cache.write());
+            .restore_to_lru(&mut inner.messages_by_group_cache);
         snapshot
             .processed_messages
-            .restore_to_lru(&mut self.processed_messages_cache.write());
+            .restore_to_lru(&mut inner.processed_messages_cache);
+    }
+
+    // ========================================================================
+    // Group-Scoped Snapshot Support
+    // ========================================================================
+
+    /// Creates a snapshot containing only data for a specific group.
+    ///
+    /// This is used by the `MdkStorageProvider::create_group_snapshot` trait method
+    /// to create rollback points that don't affect other groups. Unlike `create_snapshot()`
+    /// which captures ALL data, this only captures data belonging to the specified group.
+    ///
+    /// # Concurrency
+    ///
+    /// This operation is **atomic**. It acquires a global read lock on the storage
+    /// state, ensuring a consistent snapshot even in multi-threaded environments.
+    ///
+    /// # Arguments
+    ///
+    /// * `group_id` - The group to create a snapshot for.
+    ///
+    /// # Returns
+    ///
+    /// A `GroupScopedSnapshot` containing cloned copies of all state for that group.
+    pub fn create_group_scoped_snapshot(&self, group_id: &GroupId) -> GroupScopedSnapshot {
+        let inner = self.inner.read();
+
+        // MLS storage uses JSON serialization for group_id keys.
+        // We need to use the same serialization to match the stored keys.
+        let mls_group_id_bytes = mls_storage::JsonCodec::serialize(group_id.inner())
+            .expect("Failed to serialize group_id for MLS lookup");
+
+        // Filter MLS group data by group_id
+        let mls_group_data: HashMap<(Vec<u8>, GroupDataType), Vec<u8>> = inner
+            .mls_group_data
+            .data
+            .iter()
+            .filter(|((gid, _), _)| *gid == mls_group_id_bytes)
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+
+        // Get own leaf nodes for this group
+        let mls_own_leaf_nodes = inner
+            .mls_own_leaf_nodes
+            .data
+            .get(&mls_group_id_bytes)
+            .cloned()
+            .unwrap_or_default();
+
+        // Filter proposals by group_id, keeping only the proposal_ref as the key
+        let mls_proposals: HashMap<Vec<u8>, Vec<u8>> = inner
+            .mls_proposals
+            .data
+            .iter()
+            .filter(|((gid, _), _)| *gid == mls_group_id_bytes)
+            .map(|((_, prop_ref), prop)| (prop_ref.clone(), prop.clone()))
+            .collect();
+
+        // Filter epoch key pairs by group_id
+        let mls_epoch_key_pairs: HashMap<(Vec<u8>, u32), Vec<u8>> = inner
+            .mls_epoch_key_pairs
+            .data
+            .iter()
+            .filter(|((gid, _, _), _)| *gid == mls_group_id_bytes)
+            .map(|((_, epoch_id, leaf_idx), kp)| ((epoch_id.clone(), *leaf_idx), kp.clone()))
+            .collect();
+
+        // Get MDK group data
+        let group = inner.groups_cache.peek(group_id).cloned();
+
+        let group_relays = inner
+            .group_relays_cache
+            .peek(group_id)
+            .cloned()
+            .unwrap_or_default();
+
+        let group_exporter_secrets: HashMap<u64, GroupExporterSecret> = inner
+            .group_exporter_secrets_cache
+            .iter()
+            .filter(|((gid, _), _)| gid == group_id)
+            .map(|((_, epoch), secret)| (*epoch, secret.clone()))
+            .collect();
+
+        // Get current Unix timestamp
+        let created_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("System time before Unix epoch")
+            .as_secs();
+
+        GroupScopedSnapshot {
+            group_id: group_id.clone(),
+            created_at,
+            mls_group_data,
+            mls_own_leaf_nodes,
+            mls_proposals,
+            mls_epoch_key_pairs,
+            group,
+            group_relays,
+            group_exporter_secrets,
+        }
+    }
+
+    /// Restores state for a specific group from a previously created group-scoped snapshot.
+    ///
+    /// This replaces all current in-memory state for the specified group with the state
+    /// from the snapshot, leaving all other groups unaffected.
+    ///
+    /// # Concurrency
+    ///
+    /// This operation is **atomic**. It acquires a global write lock on the storage
+    /// state, ensuring that the restore is consistent even in multi-threaded environments.
+    ///
+    /// # Arguments
+    ///
+    /// * `snapshot` - The group-scoped snapshot to restore from.
+    pub fn restore_group_scoped_snapshot(&self, snapshot: GroupScopedSnapshot) {
+        let mut inner = self.inner.write();
+        let group_id = &snapshot.group_id;
+
+        // MLS storage uses JSON serialization for group_id keys.
+        // We need to use the same serialization to match the stored keys.
+        let mls_group_id_bytes = mls_storage::JsonCodec::serialize(group_id.inner())
+            .expect("Failed to serialize group_id for MLS lookup");
+
+        // 1. Remove existing data for this group
+
+        // Remove MLS group data for this group
+        inner
+            .mls_group_data
+            .data
+            .retain(|(gid, _), _| *gid != mls_group_id_bytes);
+
+        // Remove own leaf nodes for this group
+        inner.mls_own_leaf_nodes.data.remove(&mls_group_id_bytes);
+
+        // Remove proposals for this group
+        inner
+            .mls_proposals
+            .data
+            .retain(|(gid, _), _| *gid != mls_group_id_bytes);
+
+        // Remove epoch key pairs for this group
+        inner
+            .mls_epoch_key_pairs
+            .data
+            .retain(|(gid, _, _), _| *gid != mls_group_id_bytes);
+
+        // Remove from MDK caches
+        // First, get the nostr_group_id if the group exists (for cache cleanup)
+        let nostr_group_id = inner.groups_cache.peek(group_id).map(|g| g.nostr_group_id);
+        inner.groups_cache.pop(group_id);
+        if let Some(nostr_id) = nostr_group_id {
+            inner.groups_by_nostr_id_cache.pop(&nostr_id);
+        }
+
+        inner.group_relays_cache.pop(group_id);
+
+        // Remove all exporter secrets for this group
+        let keys_to_remove: Vec<_> = inner
+            .group_exporter_secrets_cache
+            .iter()
+            .filter(|((gid, _), _)| gid == group_id)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for key in keys_to_remove {
+            inner.group_exporter_secrets_cache.pop(&key);
+        }
+
+        // 2. Restore from snapshot
+
+        // Restore MLS group data
+        for (key, value) in snapshot.mls_group_data {
+            inner.mls_group_data.data.insert(key, value);
+        }
+
+        // Restore own leaf nodes
+        if !snapshot.mls_own_leaf_nodes.is_empty() {
+            inner
+                .mls_own_leaf_nodes
+                .data
+                .insert(mls_group_id_bytes.clone(), snapshot.mls_own_leaf_nodes);
+        }
+
+        // Restore proposals (re-add group_id to the key)
+        for (prop_ref, prop) in snapshot.mls_proposals {
+            inner
+                .mls_proposals
+                .data
+                .insert((mls_group_id_bytes.clone(), prop_ref), prop);
+        }
+
+        // Restore epoch key pairs (re-add group_id to the key)
+        for ((epoch_id, leaf_idx), kp) in snapshot.mls_epoch_key_pairs {
+            inner
+                .mls_epoch_key_pairs
+                .data
+                .insert((mls_group_id_bytes.clone(), epoch_id, leaf_idx), kp);
+        }
+
+        // Restore MDK data
+        if let Some(group) = snapshot.group {
+            let nostr_id = group.nostr_group_id;
+            inner.groups_cache.put(group_id.clone(), group.clone());
+            inner.groups_by_nostr_id_cache.put(nostr_id, group);
+        }
+
+        if !snapshot.group_relays.is_empty() {
+            inner
+                .group_relays_cache
+                .put(group_id.clone(), snapshot.group_relays);
+        }
+
+        for (epoch, secret) in snapshot.group_exporter_secrets {
+            inner
+                .group_exporter_secrets_cache
+                .put((group_id.clone(), epoch), secret);
+        }
     }
 
     /// Returns the current validation limits.
@@ -608,6 +783,65 @@ impl MdkStorageProvider for MdkMemoryStorage {
     /// [`Backend::Memory`] indicating this is a memory-based storage implementation.
     fn backend(&self) -> Backend {
         Backend::Memory
+    }
+
+    fn create_group_snapshot(&self, group_id: &GroupId, name: &str) -> Result<(), MdkStorageError> {
+        // Create a group-scoped snapshot that only captures data for this group.
+        // This ensures that rolling back this snapshot won't affect other groups.
+        let snapshot = self.create_group_scoped_snapshot(group_id);
+        self.group_snapshots
+            .write()
+            .insert((group_id.clone(), name.to_string()), snapshot);
+        Ok(())
+    }
+
+    fn rollback_group_to_snapshot(
+        &self,
+        group_id: &GroupId,
+        name: &str,
+    ) -> Result<(), MdkStorageError> {
+        let key = (group_id.clone(), name.to_string());
+        // Remove and restore the snapshot (consume it)
+        let snapshot = self
+            .group_snapshots
+            .write()
+            .remove(&key)
+            .ok_or_else(|| MdkStorageError::NotFound("Snapshot not found".to_string()))?;
+        self.restore_group_scoped_snapshot(snapshot);
+        Ok(())
+    }
+
+    fn release_group_snapshot(
+        &self,
+        group_id: &GroupId,
+        name: &str,
+    ) -> Result<(), MdkStorageError> {
+        let key = (group_id.clone(), name.to_string());
+        self.group_snapshots.write().remove(&key);
+        Ok(())
+    }
+
+    fn list_group_snapshots(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<Vec<(String, u64)>, MdkStorageError> {
+        let snapshots = self.group_snapshots.read();
+        let mut result: Vec<(String, u64)> = snapshots
+            .iter()
+            .filter(|((gid, _), _)| gid == group_id)
+            .map(|((_, name), snap)| (name.clone(), snap.created_at))
+            .collect();
+        // Sort by created_at ascending (oldest first)
+        result.sort_by_key(|(_, created_at)| *created_at);
+        Ok(result)
+    }
+
+    fn prune_expired_snapshots(&self, min_timestamp: u64) -> Result<usize, MdkStorageError> {
+        let mut snapshots = self.group_snapshots.write();
+        let initial_count = snapshots.len();
+        snapshots.retain(|_, snap| snap.created_at >= min_timestamp);
+        let pruned_count = initial_count - snapshots.len();
+        Ok(pruned_count)
     }
 }
 
@@ -631,7 +865,9 @@ impl StorageProvider<STORAGE_PROVIDER_VERSION> for MdkMemoryStorage {
         GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
         MlsGroupJoinConfig: traits::MlsGroupJoinConfig<STORAGE_PROVIDER_VERSION>,
     {
-        self.mls_group_data
+        self.inner
+            .write()
+            .mls_group_data
             .write(group_id, GroupDataType::JoinGroupConfig, config)
     }
 
@@ -644,7 +880,10 @@ impl StorageProvider<STORAGE_PROVIDER_VERSION> for MdkMemoryStorage {
         GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
         LeafNode: traits::LeafNode<STORAGE_PROVIDER_VERSION>,
     {
-        self.mls_own_leaf_nodes.append(group_id, leaf_node)
+        self.inner
+            .write()
+            .mls_own_leaf_nodes
+            .append(group_id, leaf_node)
     }
 
     fn queue_proposal<GroupId, ProposalRef, QueuedProposal>(
@@ -658,7 +897,10 @@ impl StorageProvider<STORAGE_PROVIDER_VERSION> for MdkMemoryStorage {
         ProposalRef: traits::ProposalRef<STORAGE_PROVIDER_VERSION>,
         QueuedProposal: traits::QueuedProposal<STORAGE_PROVIDER_VERSION>,
     {
-        self.mls_proposals.queue(group_id, proposal_ref, proposal)
+        self.inner
+            .write()
+            .mls_proposals
+            .queue(group_id, proposal_ref, proposal)
     }
 
     fn write_tree<GroupId, TreeSync>(
@@ -670,7 +912,9 @@ impl StorageProvider<STORAGE_PROVIDER_VERSION> for MdkMemoryStorage {
         GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
         TreeSync: traits::TreeSync<STORAGE_PROVIDER_VERSION>,
     {
-        self.mls_group_data
+        self.inner
+            .write()
+            .mls_group_data
             .write(group_id, GroupDataType::Tree, tree)
     }
 
@@ -683,7 +927,7 @@ impl StorageProvider<STORAGE_PROVIDER_VERSION> for MdkMemoryStorage {
         GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
         InterimTranscriptHash: traits::InterimTranscriptHash<STORAGE_PROVIDER_VERSION>,
     {
-        self.mls_group_data.write(
+        self.inner.write().mls_group_data.write(
             group_id,
             GroupDataType::InterimTranscriptHash,
             interim_transcript_hash,
@@ -699,7 +943,9 @@ impl StorageProvider<STORAGE_PROVIDER_VERSION> for MdkMemoryStorage {
         GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
         GroupContext: traits::GroupContext<STORAGE_PROVIDER_VERSION>,
     {
-        self.mls_group_data
+        self.inner
+            .write()
+            .mls_group_data
             .write(group_id, GroupDataType::Context, group_context)
     }
 
@@ -712,8 +958,11 @@ impl StorageProvider<STORAGE_PROVIDER_VERSION> for MdkMemoryStorage {
         GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
         ConfirmationTag: traits::ConfirmationTag<STORAGE_PROVIDER_VERSION>,
     {
-        self.mls_group_data
-            .write(group_id, GroupDataType::ConfirmationTag, confirmation_tag)
+        self.inner.write().mls_group_data.write(
+            group_id,
+            GroupDataType::ConfirmationTag,
+            confirmation_tag,
+        )
     }
 
     fn write_group_state<GroupState, GroupId>(
@@ -725,7 +974,9 @@ impl StorageProvider<STORAGE_PROVIDER_VERSION> for MdkMemoryStorage {
         GroupState: traits::GroupState<STORAGE_PROVIDER_VERSION>,
         GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
     {
-        self.mls_group_data
+        self.inner
+            .write()
+            .mls_group_data
             .write(group_id, GroupDataType::GroupState, group_state)
     }
 
@@ -738,8 +989,11 @@ impl StorageProvider<STORAGE_PROVIDER_VERSION> for MdkMemoryStorage {
         GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
         MessageSecrets: traits::MessageSecrets<STORAGE_PROVIDER_VERSION>,
     {
-        self.mls_group_data
-            .write(group_id, GroupDataType::MessageSecrets, message_secrets)
+        self.inner.write().mls_group_data.write(
+            group_id,
+            GroupDataType::MessageSecrets,
+            message_secrets,
+        )
     }
 
     fn write_resumption_psk_store<GroupId, ResumptionPskStore>(
@@ -751,7 +1005,7 @@ impl StorageProvider<STORAGE_PROVIDER_VERSION> for MdkMemoryStorage {
         GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
         ResumptionPskStore: traits::ResumptionPskStore<STORAGE_PROVIDER_VERSION>,
     {
-        self.mls_group_data.write(
+        self.inner.write().mls_group_data.write(
             group_id,
             GroupDataType::ResumptionPskStore,
             resumption_psk_store,
@@ -767,8 +1021,11 @@ impl StorageProvider<STORAGE_PROVIDER_VERSION> for MdkMemoryStorage {
         GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
         LeafNodeIndex: traits::LeafNodeIndex<STORAGE_PROVIDER_VERSION>,
     {
-        self.mls_group_data
-            .write(group_id, GroupDataType::OwnLeafIndex, own_leaf_index)
+        self.inner.write().mls_group_data.write(
+            group_id,
+            GroupDataType::OwnLeafIndex,
+            own_leaf_index,
+        )
     }
 
     fn write_group_epoch_secrets<GroupId, GroupEpochSecrets>(
@@ -780,7 +1037,7 @@ impl StorageProvider<STORAGE_PROVIDER_VERSION> for MdkMemoryStorage {
         GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
         GroupEpochSecrets: traits::GroupEpochSecrets<STORAGE_PROVIDER_VERSION>,
     {
-        self.mls_group_data.write(
+        self.inner.write().mls_group_data.write(
             group_id,
             GroupDataType::GroupEpochSecrets,
             group_epoch_secrets,
@@ -796,7 +1053,9 @@ impl StorageProvider<STORAGE_PROVIDER_VERSION> for MdkMemoryStorage {
         SignaturePublicKey: traits::SignaturePublicKey<STORAGE_PROVIDER_VERSION>,
         SignatureKeyPair: traits::SignatureKeyPair<STORAGE_PROVIDER_VERSION>,
     {
-        self.mls_signature_keys
+        self.inner
+            .write()
+            .mls_signature_keys
             .write(public_key, signature_key_pair)
     }
 
@@ -809,7 +1068,10 @@ impl StorageProvider<STORAGE_PROVIDER_VERSION> for MdkMemoryStorage {
         EncryptionKey: traits::EncryptionKey<STORAGE_PROVIDER_VERSION>,
         HpkeKeyPair: traits::HpkeKeyPair<STORAGE_PROVIDER_VERSION>,
     {
-        self.mls_encryption_keys.write(public_key, key_pair)
+        self.inner
+            .write()
+            .mls_encryption_keys
+            .write(public_key, key_pair)
     }
 
     fn write_encryption_epoch_key_pairs<GroupId, EpochKey, HpkeKeyPair>(
@@ -824,7 +1086,9 @@ impl StorageProvider<STORAGE_PROVIDER_VERSION> for MdkMemoryStorage {
         EpochKey: traits::EpochKey<STORAGE_PROVIDER_VERSION>,
         HpkeKeyPair: traits::HpkeKeyPair<STORAGE_PROVIDER_VERSION>,
     {
-        self.mls_epoch_key_pairs
+        self.inner
+            .write()
+            .mls_epoch_key_pairs
             .write(group_id, epoch, leaf_index, key_pairs)
     }
 
@@ -837,7 +1101,10 @@ impl StorageProvider<STORAGE_PROVIDER_VERSION> for MdkMemoryStorage {
         HashReference: traits::HashReference<STORAGE_PROVIDER_VERSION>,
         KeyPackage: traits::KeyPackage<STORAGE_PROVIDER_VERSION>,
     {
-        self.mls_key_packages.write(hash_ref, key_package)
+        self.inner
+            .write()
+            .mls_key_packages
+            .write(hash_ref, key_package)
     }
 
     fn write_psk<PskId, PskBundle>(
@@ -849,7 +1116,7 @@ impl StorageProvider<STORAGE_PROVIDER_VERSION> for MdkMemoryStorage {
         PskId: traits::PskId<STORAGE_PROVIDER_VERSION>,
         PskBundle: traits::PskBundle<STORAGE_PROVIDER_VERSION>,
     {
-        self.mls_psks.write(psk_id, psk)
+        self.inner.write().mls_psks.write(psk_id, psk)
     }
 
     // ========================================================================
@@ -864,7 +1131,9 @@ impl StorageProvider<STORAGE_PROVIDER_VERSION> for MdkMemoryStorage {
         GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
         MlsGroupJoinConfig: traits::MlsGroupJoinConfig<STORAGE_PROVIDER_VERSION>,
     {
-        self.mls_group_data
+        self.inner
+            .read()
+            .mls_group_data
             .read(group_id, GroupDataType::JoinGroupConfig)
     }
 
@@ -876,7 +1145,7 @@ impl StorageProvider<STORAGE_PROVIDER_VERSION> for MdkMemoryStorage {
         GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
         LeafNode: traits::LeafNode<STORAGE_PROVIDER_VERSION>,
     {
-        self.mls_own_leaf_nodes.read(group_id)
+        self.inner.read().mls_own_leaf_nodes.read(group_id)
     }
 
     fn queued_proposal_refs<GroupId, ProposalRef>(
@@ -887,7 +1156,7 @@ impl StorageProvider<STORAGE_PROVIDER_VERSION> for MdkMemoryStorage {
         GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
         ProposalRef: traits::ProposalRef<STORAGE_PROVIDER_VERSION>,
     {
-        self.mls_proposals.read_refs(group_id)
+        self.inner.read().mls_proposals.read_refs(group_id)
     }
 
     fn queued_proposals<GroupId, ProposalRef, QueuedProposal>(
@@ -899,7 +1168,7 @@ impl StorageProvider<STORAGE_PROVIDER_VERSION> for MdkMemoryStorage {
         ProposalRef: traits::ProposalRef<STORAGE_PROVIDER_VERSION>,
         QueuedProposal: traits::QueuedProposal<STORAGE_PROVIDER_VERSION>,
     {
-        self.mls_proposals.read_proposals(group_id)
+        self.inner.read().mls_proposals.read_proposals(group_id)
     }
 
     fn tree<GroupId, TreeSync>(&self, group_id: &GroupId) -> Result<Option<TreeSync>, Self::Error>
@@ -907,7 +1176,10 @@ impl StorageProvider<STORAGE_PROVIDER_VERSION> for MdkMemoryStorage {
         GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
         TreeSync: traits::TreeSync<STORAGE_PROVIDER_VERSION>,
     {
-        self.mls_group_data.read(group_id, GroupDataType::Tree)
+        self.inner
+            .read()
+            .mls_group_data
+            .read(group_id, GroupDataType::Tree)
     }
 
     fn group_context<GroupId, GroupContext>(
@@ -918,7 +1190,10 @@ impl StorageProvider<STORAGE_PROVIDER_VERSION> for MdkMemoryStorage {
         GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
         GroupContext: traits::GroupContext<STORAGE_PROVIDER_VERSION>,
     {
-        self.mls_group_data.read(group_id, GroupDataType::Context)
+        self.inner
+            .read()
+            .mls_group_data
+            .read(group_id, GroupDataType::Context)
     }
 
     fn interim_transcript_hash<GroupId, InterimTranscriptHash>(
@@ -929,7 +1204,9 @@ impl StorageProvider<STORAGE_PROVIDER_VERSION> for MdkMemoryStorage {
         GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
         InterimTranscriptHash: traits::InterimTranscriptHash<STORAGE_PROVIDER_VERSION>,
     {
-        self.mls_group_data
+        self.inner
+            .read()
+            .mls_group_data
             .read(group_id, GroupDataType::InterimTranscriptHash)
     }
 
@@ -941,7 +1218,9 @@ impl StorageProvider<STORAGE_PROVIDER_VERSION> for MdkMemoryStorage {
         GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
         ConfirmationTag: traits::ConfirmationTag<STORAGE_PROVIDER_VERSION>,
     {
-        self.mls_group_data
+        self.inner
+            .read()
+            .mls_group_data
             .read(group_id, GroupDataType::ConfirmationTag)
     }
 
@@ -953,7 +1232,9 @@ impl StorageProvider<STORAGE_PROVIDER_VERSION> for MdkMemoryStorage {
         GroupState: traits::GroupState<STORAGE_PROVIDER_VERSION>,
         GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
     {
-        self.mls_group_data
+        self.inner
+            .read()
+            .mls_group_data
             .read(group_id, GroupDataType::GroupState)
     }
 
@@ -965,7 +1246,9 @@ impl StorageProvider<STORAGE_PROVIDER_VERSION> for MdkMemoryStorage {
         GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
         MessageSecrets: traits::MessageSecrets<STORAGE_PROVIDER_VERSION>,
     {
-        self.mls_group_data
+        self.inner
+            .read()
+            .mls_group_data
             .read(group_id, GroupDataType::MessageSecrets)
     }
 
@@ -977,7 +1260,9 @@ impl StorageProvider<STORAGE_PROVIDER_VERSION> for MdkMemoryStorage {
         GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
         ResumptionPskStore: traits::ResumptionPskStore<STORAGE_PROVIDER_VERSION>,
     {
-        self.mls_group_data
+        self.inner
+            .read()
+            .mls_group_data
             .read(group_id, GroupDataType::ResumptionPskStore)
     }
 
@@ -989,7 +1274,9 @@ impl StorageProvider<STORAGE_PROVIDER_VERSION> for MdkMemoryStorage {
         GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
         LeafNodeIndex: traits::LeafNodeIndex<STORAGE_PROVIDER_VERSION>,
     {
-        self.mls_group_data
+        self.inner
+            .read()
+            .mls_group_data
             .read(group_id, GroupDataType::OwnLeafIndex)
     }
 
@@ -1001,7 +1288,9 @@ impl StorageProvider<STORAGE_PROVIDER_VERSION> for MdkMemoryStorage {
         GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
         GroupEpochSecrets: traits::GroupEpochSecrets<STORAGE_PROVIDER_VERSION>,
     {
-        self.mls_group_data
+        self.inner
+            .read()
+            .mls_group_data
             .read(group_id, GroupDataType::GroupEpochSecrets)
     }
 
@@ -1013,7 +1302,7 @@ impl StorageProvider<STORAGE_PROVIDER_VERSION> for MdkMemoryStorage {
         SignaturePublicKey: traits::SignaturePublicKey<STORAGE_PROVIDER_VERSION>,
         SignatureKeyPair: traits::SignatureKeyPair<STORAGE_PROVIDER_VERSION>,
     {
-        self.mls_signature_keys.read(public_key)
+        self.inner.read().mls_signature_keys.read(public_key)
     }
 
     fn encryption_key_pair<HpkeKeyPair, EncryptionKey>(
@@ -1024,7 +1313,7 @@ impl StorageProvider<STORAGE_PROVIDER_VERSION> for MdkMemoryStorage {
         HpkeKeyPair: traits::HpkeKeyPair<STORAGE_PROVIDER_VERSION>,
         EncryptionKey: traits::EncryptionKey<STORAGE_PROVIDER_VERSION>,
     {
-        self.mls_encryption_keys.read(public_key)
+        self.inner.read().mls_encryption_keys.read(public_key)
     }
 
     fn encryption_epoch_key_pairs<GroupId, EpochKey, HpkeKeyPair>(
@@ -1038,7 +1327,10 @@ impl StorageProvider<STORAGE_PROVIDER_VERSION> for MdkMemoryStorage {
         EpochKey: traits::EpochKey<STORAGE_PROVIDER_VERSION>,
         HpkeKeyPair: traits::HpkeKeyPair<STORAGE_PROVIDER_VERSION>,
     {
-        self.mls_epoch_key_pairs.read(group_id, epoch, leaf_index)
+        self.inner
+            .read()
+            .mls_epoch_key_pairs
+            .read(group_id, epoch, leaf_index)
     }
 
     fn key_package<HashReference, KeyPackage>(
@@ -1049,7 +1341,7 @@ impl StorageProvider<STORAGE_PROVIDER_VERSION> for MdkMemoryStorage {
         HashReference: traits::HashReference<STORAGE_PROVIDER_VERSION>,
         KeyPackage: traits::KeyPackage<STORAGE_PROVIDER_VERSION>,
     {
-        self.mls_key_packages.read(hash_ref)
+        self.inner.read().mls_key_packages.read(hash_ref)
     }
 
     fn psk<PskBundle, PskId>(&self, psk_id: &PskId) -> Result<Option<PskBundle>, Self::Error>
@@ -1057,7 +1349,7 @@ impl StorageProvider<STORAGE_PROVIDER_VERSION> for MdkMemoryStorage {
         PskBundle: traits::PskBundle<STORAGE_PROVIDER_VERSION>,
         PskId: traits::PskId<STORAGE_PROVIDER_VERSION>,
     {
-        self.mls_psks.read(psk_id)
+        self.inner.read().mls_psks.read(psk_id)
     }
 
     // ========================================================================
@@ -1073,21 +1365,26 @@ impl StorageProvider<STORAGE_PROVIDER_VERSION> for MdkMemoryStorage {
         GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
         ProposalRef: traits::ProposalRef<STORAGE_PROVIDER_VERSION>,
     {
-        self.mls_proposals.remove(group_id, proposal_ref)
+        self.inner
+            .write()
+            .mls_proposals
+            .remove(group_id, proposal_ref)
     }
 
     fn delete_own_leaf_nodes<GroupId>(&self, group_id: &GroupId) -> Result<(), Self::Error>
     where
         GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
     {
-        self.mls_own_leaf_nodes.delete(group_id)
+        self.inner.write().mls_own_leaf_nodes.delete(group_id)
     }
 
     fn delete_group_config<GroupId>(&self, group_id: &GroupId) -> Result<(), Self::Error>
     where
         GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
     {
-        self.mls_group_data
+        self.inner
+            .write()
+            .mls_group_data
             .delete(group_id, GroupDataType::JoinGroupConfig)
     }
 
@@ -1095,14 +1392,19 @@ impl StorageProvider<STORAGE_PROVIDER_VERSION> for MdkMemoryStorage {
     where
         GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
     {
-        self.mls_group_data.delete(group_id, GroupDataType::Tree)
+        self.inner
+            .write()
+            .mls_group_data
+            .delete(group_id, GroupDataType::Tree)
     }
 
     fn delete_confirmation_tag<GroupId>(&self, group_id: &GroupId) -> Result<(), Self::Error>
     where
         GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
     {
-        self.mls_group_data
+        self.inner
+            .write()
+            .mls_group_data
             .delete(group_id, GroupDataType::ConfirmationTag)
     }
 
@@ -1110,7 +1412,9 @@ impl StorageProvider<STORAGE_PROVIDER_VERSION> for MdkMemoryStorage {
     where
         GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
     {
-        self.mls_group_data
+        self.inner
+            .write()
+            .mls_group_data
             .delete(group_id, GroupDataType::GroupState)
     }
 
@@ -1118,14 +1422,19 @@ impl StorageProvider<STORAGE_PROVIDER_VERSION> for MdkMemoryStorage {
     where
         GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
     {
-        self.mls_group_data.delete(group_id, GroupDataType::Context)
+        self.inner
+            .write()
+            .mls_group_data
+            .delete(group_id, GroupDataType::Context)
     }
 
     fn delete_interim_transcript_hash<GroupId>(&self, group_id: &GroupId) -> Result<(), Self::Error>
     where
         GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
     {
-        self.mls_group_data
+        self.inner
+            .write()
+            .mls_group_data
             .delete(group_id, GroupDataType::InterimTranscriptHash)
     }
 
@@ -1133,7 +1442,9 @@ impl StorageProvider<STORAGE_PROVIDER_VERSION> for MdkMemoryStorage {
     where
         GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
     {
-        self.mls_group_data
+        self.inner
+            .write()
+            .mls_group_data
             .delete(group_id, GroupDataType::MessageSecrets)
     }
 
@@ -1144,7 +1455,9 @@ impl StorageProvider<STORAGE_PROVIDER_VERSION> for MdkMemoryStorage {
     where
         GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
     {
-        self.mls_group_data
+        self.inner
+            .write()
+            .mls_group_data
             .delete(group_id, GroupDataType::ResumptionPskStore)
     }
 
@@ -1152,7 +1465,9 @@ impl StorageProvider<STORAGE_PROVIDER_VERSION> for MdkMemoryStorage {
     where
         GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
     {
-        self.mls_group_data
+        self.inner
+            .write()
+            .mls_group_data
             .delete(group_id, GroupDataType::OwnLeafIndex)
     }
 
@@ -1160,7 +1475,9 @@ impl StorageProvider<STORAGE_PROVIDER_VERSION> for MdkMemoryStorage {
     where
         GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
     {
-        self.mls_group_data
+        self.inner
+            .write()
+            .mls_group_data
             .delete(group_id, GroupDataType::GroupEpochSecrets)
     }
 
@@ -1172,7 +1489,7 @@ impl StorageProvider<STORAGE_PROVIDER_VERSION> for MdkMemoryStorage {
         GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
         ProposalRef: traits::ProposalRef<STORAGE_PROVIDER_VERSION>,
     {
-        self.mls_proposals.clear(group_id)
+        self.inner.write().mls_proposals.clear(group_id)
     }
 
     fn delete_signature_key_pair<SignaturePublicKey>(
@@ -1182,7 +1499,7 @@ impl StorageProvider<STORAGE_PROVIDER_VERSION> for MdkMemoryStorage {
     where
         SignaturePublicKey: traits::SignaturePublicKey<STORAGE_PROVIDER_VERSION>,
     {
-        self.mls_signature_keys.delete(public_key)
+        self.inner.write().mls_signature_keys.delete(public_key)
     }
 
     fn delete_encryption_key_pair<EncryptionKey>(
@@ -1192,7 +1509,7 @@ impl StorageProvider<STORAGE_PROVIDER_VERSION> for MdkMemoryStorage {
     where
         EncryptionKey: traits::EncryptionKey<STORAGE_PROVIDER_VERSION>,
     {
-        self.mls_encryption_keys.delete(public_key)
+        self.inner.write().mls_encryption_keys.delete(public_key)
     }
 
     fn delete_encryption_epoch_key_pairs<GroupId, EpochKey>(
@@ -1205,21 +1522,24 @@ impl StorageProvider<STORAGE_PROVIDER_VERSION> for MdkMemoryStorage {
         GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
         EpochKey: traits::EpochKey<STORAGE_PROVIDER_VERSION>,
     {
-        self.mls_epoch_key_pairs.delete(group_id, epoch, leaf_index)
+        self.inner
+            .write()
+            .mls_epoch_key_pairs
+            .delete(group_id, epoch, leaf_index)
     }
 
     fn delete_key_package<HashReference>(&self, hash_ref: &HashReference) -> Result<(), Self::Error>
     where
         HashReference: traits::HashReference<STORAGE_PROVIDER_VERSION>,
     {
-        self.mls_key_packages.delete(hash_ref)
+        self.inner.write().mls_key_packages.delete(hash_ref)
     }
 
     fn delete_psk<PskId>(&self, psk_id: &PskId) -> Result<(), Self::Error>
     where
         PskId: traits::PskId<STORAGE_PROVIDER_VERSION>,
     {
-        self.mls_psks.delete(psk_id)
+        self.inner.write().mls_psks.delete(psk_id)
     }
 }
 
@@ -1320,11 +1640,13 @@ mod tests {
 
         // Verify the group is in the cache
         {
-            let cache = nostr_storage.groups_cache.read();
+            let inner = nostr_storage.inner.read();
+            let cache = &inner.groups_cache;
             assert!(cache.contains(&mls_group_id));
         }
         {
-            let cache = nostr_storage.groups_by_nostr_id_cache.read();
+            let inner = nostr_storage.inner.read();
+            let cache = &inner.groups_by_nostr_id_cache;
             assert!(cache.contains(&nostr_group_id));
         }
     }
@@ -1363,7 +1685,8 @@ mod tests {
 
         // Check that they're in the cache
         {
-            let cache = nostr_storage.group_relays_cache.read();
+            let inner = nostr_storage.inner.read();
+            let cache = &inner.group_relays_cache;
             assert!(cache.contains(&mls_group_id));
             if let Some(relays) = cache.peek(&mls_group_id) {
                 assert_eq!(relays.len(), 2);
@@ -1429,7 +1752,8 @@ mod tests {
 
         // Check cache
         {
-            let cache = nostr_storage.group_exporter_secrets_cache.read();
+            let inner = nostr_storage.inner.read();
+            let cache = &inner.group_exporter_secrets_cache;
             assert!(cache.contains(&(mls_group_id.clone(), 0)));
             assert!(cache.contains(&(mls_group_id.clone(), 1)));
             assert!(!cache.contains(&(mls_group_id.clone(), 999)));
@@ -1489,7 +1813,8 @@ mod tests {
 
         // Check that it's in the cache
         {
-            let cache = nostr_storage.welcomes_cache.read();
+            let inner = nostr_storage.inner.read();
+            let cache = &inner.welcomes_cache;
             assert!(cache.contains(&event_id));
         }
 
@@ -1515,7 +1840,8 @@ mod tests {
 
         // Check that it's in the cache
         {
-            let cache = nostr_storage.processed_welcomes_cache.read();
+            let inner = nostr_storage.inner.read();
+            let cache = &inner.processed_welcomes_cache;
             assert!(cache.contains(&wrapper_id));
         }
     }
@@ -1565,6 +1891,7 @@ mod tests {
             ),
             wrapper_event_id: wrapper_id,
             state: MessageState::Created,
+            epoch: None,
         };
         nostr_storage.save_message(message.clone()).unwrap();
         let found_message = nostr_storage
@@ -1576,12 +1903,14 @@ mod tests {
 
         // Check caches
         {
-            let cache = nostr_storage.messages_cache.read();
+            let inner = nostr_storage.inner.read();
+            let cache = &inner.messages_cache;
             assert!(cache.contains(&event_id));
         }
         {
             // Verify save_message populated the messages_by_group_cache correctly
-            let cache = nostr_storage.messages_by_group_cache.read();
+            let inner = nostr_storage.inner.read();
+            let cache = &inner.messages_by_group_cache;
             assert!(cache.contains(&mls_group_id));
             if let Some(msgs) = cache.peek(&mls_group_id) {
                 assert_eq!(msgs.len(), 1);
@@ -1595,6 +1924,8 @@ mod tests {
             wrapper_event_id: wrapper_id,
             message_event_id: Some(event_id),
             processed_at: Timestamp::now(),
+            epoch: None,
+            mls_group_id: None,
             state: ProcessedMessageState::Processed,
             failure_reason: None,
         };
@@ -1607,7 +1938,8 @@ mod tests {
             .unwrap();
         assert_eq!(found_processed.wrapper_event_id, wrapper_id);
         {
-            let cache = nostr_storage.processed_messages_cache.read();
+            let inner = nostr_storage.inner.read();
+            let cache = &inner.processed_messages_cache;
             assert!(cache.contains(&wrapper_id));
         }
     }
@@ -1638,6 +1970,7 @@ mod tests {
             ),
             wrapper_event_id: wrapper_id,
             state: MessageState::Created,
+            epoch: None,
         };
 
         // Attempting to save a message for a non-existent group should return an error
@@ -1652,7 +1985,8 @@ mod tests {
 
         // Verify the message was not added to the cache
         {
-            let cache = nostr_storage.messages_by_group_cache.read();
+            let inner = nostr_storage.inner.read();
+            let cache = &inner.messages_by_group_cache;
             assert!(!cache.contains(&nonexistent_group_id));
         }
     }
@@ -1700,6 +2034,7 @@ mod tests {
             ),
             wrapper_event_id: wrapper_id,
             state: MessageState::Created,
+            epoch: None,
         };
 
         // Save the original message
@@ -1739,7 +2074,8 @@ mod tests {
 
         // Verify the message was updated in the group cache
         {
-            let cache = nostr_storage.messages_by_group_cache.read();
+            let inner = nostr_storage.inner.read();
+            let cache = &inner.messages_by_group_cache;
             let group_messages = cache.peek(&mls_group_id).unwrap();
             assert_eq!(group_messages.len(), 1);
             let msg = group_messages.get(&event_id).unwrap();
@@ -1795,6 +2131,7 @@ mod tests {
             ),
             wrapper_event_id: wrapper_id_1,
             state: MessageState::Created,
+            epoch: None,
         };
         nostr_storage.save_message(message_1.clone()).unwrap();
 
@@ -1820,6 +2157,7 @@ mod tests {
             ),
             wrapper_event_id: wrapper_id_2,
             state: MessageState::Created,
+            epoch: None,
         };
         nostr_storage.save_message(message_2.clone()).unwrap();
 
@@ -1838,7 +2176,8 @@ mod tests {
 
         // Verify both messages are in the group cache
         {
-            let cache = nostr_storage.messages_by_group_cache.read();
+            let inner = nostr_storage.inner.read();
+            let cache = &inner.messages_by_group_cache;
             let group_messages = cache.peek(&mls_group_id).unwrap();
             assert_eq!(group_messages.len(), 2);
             assert_eq!(
@@ -1899,6 +2238,7 @@ mod tests {
             ),
             wrapper_event_id: wrapper_id,
             state: MessageState::Created,
+            epoch: None,
         };
 
         let result = nostr_storage.save_message(message);
@@ -1906,17 +2246,20 @@ mod tests {
 
         // Verify the message was not added to either cache
         {
-            let cache = nostr_storage.messages_cache.read();
+            let inner = nostr_storage.inner.read();
+            let cache = &inner.messages_cache;
             assert!(!cache.contains(&event_id));
         }
         {
-            let cache = nostr_storage.messages_by_group_cache.read();
+            let inner = nostr_storage.inner.read();
+            let cache = &inner.messages_by_group_cache;
             assert!(!cache.contains(&nonexistent_group_id));
         }
 
         // Verify the existing group's cache is still empty (no messages were added)
         {
-            let cache = nostr_storage.messages_by_group_cache.read();
+            let inner = nostr_storage.inner.read();
+            let cache = &inner.messages_by_group_cache;
             if let Some(messages) = cache.peek(&mls_group_id) {
                 assert!(messages.is_empty());
             }
@@ -2099,6 +2442,7 @@ mod tests {
             ),
             wrapper_event_id: EventId::all_zeros(),
             state: MessageState::Created,
+            epoch: None,
         };
         storage.save_message(message).unwrap();
 
@@ -2126,6 +2470,7 @@ mod tests {
             ),
             wrapper_event_id: EventId::all_zeros(),
             state: MessageState::Created,
+            epoch: None,
         };
         storage.save_message(message_2).unwrap();
 
@@ -2492,6 +2837,7 @@ mod tests {
             ),
             wrapper_event_id: EventId::all_zeros(),
             state: MessageState::Created,
+            epoch: None,
         };
         storage.save_message(message).unwrap();
 
@@ -2617,5 +2963,543 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(final_state.name, "State A");
+    }
+
+    /// Test that group-scoped snapshots provide proper isolation between groups.
+    ///
+    /// This test verifies the fix for Issue 1: Memory Storage Rollback Affects All Groups.
+    /// When rolling back Group A's snapshot, Group B should be completely unaffected.
+    #[test]
+    fn test_snapshot_isolation_between_groups() {
+        use mdk_storage_traits::MdkStorageProvider;
+
+        let storage = MdkMemoryStorage::default();
+
+        // Create two independent groups
+        let group1_id = GroupId::from_slice(&[1; 32]);
+        let group2_id = GroupId::from_slice(&[2; 32]);
+        let nostr_group_id_1: [u8; 32] = generate_random_bytes(32).try_into().unwrap();
+        let nostr_group_id_2: [u8; 32] = generate_random_bytes(32).try_into().unwrap();
+
+        let group1 = Group {
+            mls_group_id: group1_id.clone(),
+            nostr_group_id: nostr_group_id_1,
+            name: "Group 1 Original".to_string(),
+            description: "First group".to_string(),
+            admin_pubkeys: BTreeSet::new(),
+            last_message_id: None,
+            last_message_at: None,
+            epoch: 5,
+            state: GroupState::Active,
+            image_hash: None,
+            image_key: None,
+            image_nonce: None,
+        };
+
+        let group2 = Group {
+            mls_group_id: group2_id.clone(),
+            nostr_group_id: nostr_group_id_2,
+            name: "Group 2 Original".to_string(),
+            description: "Second group".to_string(),
+            admin_pubkeys: BTreeSet::new(),
+            last_message_id: None,
+            last_message_at: None,
+            epoch: 10,
+            state: GroupState::Active,
+            image_hash: None,
+            image_key: None,
+            image_nonce: None,
+        };
+
+        storage.save_group(group1.clone()).unwrap();
+        storage.save_group(group2.clone()).unwrap();
+
+        // Create a snapshot for Group 1 only (at epoch 5)
+        storage
+            .create_group_snapshot(&group1_id, "group1_snap")
+            .unwrap();
+
+        // Modify BOTH groups
+        let modified_group1 = Group {
+            name: "Group 1 Modified".to_string(),
+            epoch: 6,
+            ..group1.clone()
+        };
+        let modified_group2 = Group {
+            name: "Group 2 Modified".to_string(),
+            epoch: 11,
+            ..group2.clone()
+        };
+
+        storage.save_group(modified_group1).unwrap();
+        storage.save_group(modified_group2).unwrap();
+
+        // Verify both groups are modified
+        let found1 = storage
+            .find_group_by_mls_group_id(&group1_id)
+            .unwrap()
+            .unwrap();
+        let found2 = storage
+            .find_group_by_mls_group_id(&group2_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(found1.name, "Group 1 Modified");
+        assert_eq!(found1.epoch, 6);
+        assert_eq!(found2.name, "Group 2 Modified");
+        assert_eq!(found2.epoch, 11);
+
+        // Rollback Group 1 to its snapshot
+        storage
+            .rollback_group_to_snapshot(&group1_id, "group1_snap")
+            .unwrap();
+
+        // Verify Group 1 is rolled back
+        let final1 = storage
+            .find_group_by_mls_group_id(&group1_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(final1.name, "Group 1 Original");
+        assert_eq!(final1.epoch, 5);
+
+        // CRITICAL: Verify Group 2 is STILL at its modified state (not rolled back)
+        let final2 = storage
+            .find_group_by_mls_group_id(&group2_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            final2.name, "Group 2 Modified",
+            "Group 2 should NOT be affected by Group 1's rollback"
+        );
+        assert_eq!(
+            final2.epoch, 11,
+            "Group 2's epoch should NOT be affected by Group 1's rollback"
+        );
+    }
+
+    /// Test that group-scoped snapshots also isolate exporter secrets correctly.
+    #[test]
+    fn test_snapshot_isolation_with_exporter_secrets() {
+        use mdk_storage_traits::MdkStorageProvider;
+
+        let storage = MdkMemoryStorage::default();
+
+        // Create two groups
+        let group1_id = GroupId::from_slice(&[11; 32]);
+        let group2_id = GroupId::from_slice(&[22; 32]);
+        let nostr_group_id_1: [u8; 32] = generate_random_bytes(32).try_into().unwrap();
+        let nostr_group_id_2: [u8; 32] = generate_random_bytes(32).try_into().unwrap();
+
+        let group1 = Group {
+            mls_group_id: group1_id.clone(),
+            nostr_group_id: nostr_group_id_1,
+            name: "Group 1".to_string(),
+            description: "".to_string(),
+            admin_pubkeys: BTreeSet::new(),
+            last_message_id: None,
+            last_message_at: None,
+            epoch: 1,
+            state: GroupState::Active,
+            image_hash: None,
+            image_key: None,
+            image_nonce: None,
+        };
+
+        let group2 = Group {
+            mls_group_id: group2_id.clone(),
+            nostr_group_id: nostr_group_id_2,
+            name: "Group 2".to_string(),
+            description: "".to_string(),
+            admin_pubkeys: BTreeSet::new(),
+            last_message_id: None,
+            last_message_at: None,
+            epoch: 1,
+            state: GroupState::Active,
+            image_hash: None,
+            image_key: None,
+            image_nonce: None,
+        };
+
+        storage.save_group(group1).unwrap();
+        storage.save_group(group2).unwrap();
+
+        // Add exporter secrets for both groups
+        let secret1_epoch0 = GroupExporterSecret {
+            mls_group_id: group1_id.clone(),
+            epoch: 0,
+            secret: Secret::new([1u8; 32]),
+        };
+        let secret2_epoch0 = GroupExporterSecret {
+            mls_group_id: group2_id.clone(),
+            epoch: 0,
+            secret: Secret::new([2u8; 32]),
+        };
+
+        storage
+            .save_group_exporter_secret(secret1_epoch0.clone())
+            .unwrap();
+        storage
+            .save_group_exporter_secret(secret2_epoch0.clone())
+            .unwrap();
+
+        // Snapshot Group 1
+        storage
+            .create_group_snapshot(&group1_id, "group1_secrets_snap")
+            .unwrap();
+
+        // Add new epoch secrets to BOTH groups
+        let secret1_epoch1 = GroupExporterSecret {
+            mls_group_id: group1_id.clone(),
+            epoch: 1,
+            secret: Secret::new([11u8; 32]),
+        };
+        let secret2_epoch1 = GroupExporterSecret {
+            mls_group_id: group2_id.clone(),
+            epoch: 1,
+            secret: Secret::new([22u8; 32]),
+        };
+
+        storage.save_group_exporter_secret(secret1_epoch1).unwrap();
+        storage.save_group_exporter_secret(secret2_epoch1).unwrap();
+
+        // Verify both groups have epoch 1 secrets
+        assert!(
+            storage
+                .get_group_exporter_secret(&group1_id, 1)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            storage
+                .get_group_exporter_secret(&group2_id, 1)
+                .unwrap()
+                .is_some()
+        );
+
+        // Rollback Group 1
+        storage
+            .rollback_group_to_snapshot(&group1_id, "group1_secrets_snap")
+            .unwrap();
+
+        // Group 1's epoch 1 secret should be gone
+        assert!(
+            storage
+                .get_group_exporter_secret(&group1_id, 1)
+                .unwrap()
+                .is_none(),
+            "Group 1's epoch 1 secret should be rolled back"
+        );
+
+        // Group 2's epoch 1 secret should STILL exist
+        assert!(
+            storage
+                .get_group_exporter_secret(&group2_id, 1)
+                .unwrap()
+                .is_some(),
+            "Group 2's epoch 1 secret should NOT be affected by Group 1's rollback"
+        );
+    }
+
+    /// Test that rolling back to a nonexistent snapshot returns an error.
+    #[test]
+    fn test_rollback_nonexistent_snapshot_returns_error() {
+        use mdk_storage_traits::MdkStorageProvider;
+
+        let storage = MdkMemoryStorage::default();
+
+        let group_id = GroupId::from_slice(&[99; 32]);
+        let nostr_group_id: [u8; 32] = generate_random_bytes(32).try_into().unwrap();
+
+        let group = Group {
+            mls_group_id: group_id.clone(),
+            nostr_group_id,
+            name: "Test Group".to_string(),
+            description: "".to_string(),
+            admin_pubkeys: BTreeSet::new(),
+            last_message_id: None,
+            last_message_at: None,
+            epoch: 1,
+            state: GroupState::Active,
+            image_hash: None,
+            image_key: None,
+            image_nonce: None,
+        };
+
+        storage.save_group(group).unwrap();
+
+        // Try to rollback to a snapshot that was never created
+        let result = storage.rollback_group_to_snapshot(&group_id, "nonexistent_snapshot");
+
+        assert!(
+            result.is_err(),
+            "Should return error for nonexistent snapshot"
+        );
+        match result {
+            Err(MdkStorageError::NotFound(msg)) => {
+                assert!(
+                    msg.contains("Snapshot not found"),
+                    "Error should indicate snapshot not found"
+                );
+            }
+            _ => panic!("Expected NotFound error"),
+        }
+    }
+
+    #[test]
+    fn test_list_group_snapshots_empty() {
+        use mdk_storage_traits::MdkStorageProvider;
+
+        let storage = MdkMemoryStorage::default();
+        let group_id = GroupId::from_slice(&[1, 2, 3, 4]);
+
+        let snapshots = storage.list_group_snapshots(&group_id).unwrap();
+        assert!(
+            snapshots.is_empty(),
+            "Should return empty list for no snapshots"
+        );
+    }
+
+    #[test]
+    fn test_list_group_snapshots_returns_snapshots_sorted_by_created_at() {
+        use mdk_storage_traits::MdkStorageProvider;
+
+        let storage = MdkMemoryStorage::default();
+        let group_id = GroupId::from_slice(&[1, 2, 3, 4]);
+        let nostr_group_id: [u8; 32] = generate_random_bytes(32).try_into().unwrap();
+
+        // Create a group first
+        let group = Group {
+            mls_group_id: group_id.clone(),
+            nostr_group_id,
+            name: "Test Group".to_string(),
+            description: "".to_string(),
+            admin_pubkeys: BTreeSet::new(),
+            last_message_id: None,
+            last_message_at: None,
+            epoch: 1,
+            state: GroupState::Active,
+            image_hash: None,
+            image_key: None,
+            image_nonce: None,
+        };
+        storage.save_group(group).unwrap();
+
+        // Create snapshots with different timestamps
+        // We need to manipulate the created_at directly since create_group_scoped_snapshot uses system time
+        {
+            let mut snapshots = storage.group_snapshots.write();
+
+            // Insert snapshots with known created_at values (out of order)
+            let snap1 = crate::snapshot::GroupScopedSnapshot {
+                group_id: group_id.clone(),
+                created_at: 1000,
+                mls_group_data: std::collections::HashMap::new(),
+                mls_own_leaf_nodes: vec![],
+                mls_proposals: std::collections::HashMap::new(),
+                mls_epoch_key_pairs: std::collections::HashMap::new(),
+                group: None,
+                group_relays: std::collections::BTreeSet::new(),
+                group_exporter_secrets: std::collections::HashMap::new(),
+            };
+            let snap2 = crate::snapshot::GroupScopedSnapshot {
+                group_id: group_id.clone(),
+                created_at: 3000, // Newest
+                ..snap1.clone()
+            };
+            let snap3 = crate::snapshot::GroupScopedSnapshot {
+                group_id: group_id.clone(),
+                created_at: 2000, // Middle
+                ..snap1.clone()
+            };
+
+            snapshots.insert((group_id.clone(), "snap_oldest".to_string()), snap1);
+            snapshots.insert((group_id.clone(), "snap_newest".to_string()), snap2);
+            snapshots.insert((group_id.clone(), "snap_middle".to_string()), snap3);
+        }
+
+        let result = storage.list_group_snapshots(&group_id).unwrap();
+
+        assert_eq!(result.len(), 3);
+        // Should be sorted by created_at ascending
+        assert_eq!(result[0].0, "snap_oldest");
+        assert_eq!(result[0].1, 1000);
+        assert_eq!(result[1].0, "snap_middle");
+        assert_eq!(result[1].1, 2000);
+        assert_eq!(result[2].0, "snap_newest");
+        assert_eq!(result[2].1, 3000);
+    }
+
+    #[test]
+    fn test_list_group_snapshots_only_returns_matching_group() {
+        use mdk_storage_traits::MdkStorageProvider;
+
+        let storage = MdkMemoryStorage::default();
+        let group1 = GroupId::from_slice(&[1, 1, 1, 1]);
+        let group2 = GroupId::from_slice(&[2, 2, 2, 2]);
+
+        {
+            let mut snapshots = storage.group_snapshots.write();
+
+            let snap1 = crate::snapshot::GroupScopedSnapshot {
+                group_id: group1.clone(),
+                created_at: 1000,
+                mls_group_data: std::collections::HashMap::new(),
+                mls_own_leaf_nodes: vec![],
+                mls_proposals: std::collections::HashMap::new(),
+                mls_epoch_key_pairs: std::collections::HashMap::new(),
+                group: None,
+                group_relays: std::collections::BTreeSet::new(),
+                group_exporter_secrets: std::collections::HashMap::new(),
+            };
+            let snap2 = crate::snapshot::GroupScopedSnapshot {
+                group_id: group2.clone(),
+                created_at: 2000,
+                ..snap1.clone()
+            };
+
+            snapshots.insert((group1.clone(), "snap_group1".to_string()), snap1);
+            snapshots.insert((group2.clone(), "snap_group2".to_string()), snap2);
+        }
+
+        let result1 = storage.list_group_snapshots(&group1).unwrap();
+        let result2 = storage.list_group_snapshots(&group2).unwrap();
+
+        assert_eq!(result1.len(), 1);
+        assert_eq!(result1[0].0, "snap_group1");
+
+        assert_eq!(result2.len(), 1);
+        assert_eq!(result2[0].0, "snap_group2");
+    }
+
+    #[test]
+    fn test_prune_expired_snapshots_removes_old_snapshots() {
+        use mdk_storage_traits::MdkStorageProvider;
+
+        let storage = MdkMemoryStorage::default();
+        let group_id = GroupId::from_slice(&[1, 2, 3, 4]);
+
+        {
+            let mut snapshots = storage.group_snapshots.write();
+
+            let base_snap = crate::snapshot::GroupScopedSnapshot {
+                group_id: group_id.clone(),
+                created_at: 0,
+                mls_group_data: std::collections::HashMap::new(),
+                mls_own_leaf_nodes: vec![],
+                mls_proposals: std::collections::HashMap::new(),
+                mls_epoch_key_pairs: std::collections::HashMap::new(),
+                group: None,
+                group_relays: std::collections::BTreeSet::new(),
+                group_exporter_secrets: std::collections::HashMap::new(),
+            };
+
+            // Old snapshot (should be pruned)
+            let old_snap = crate::snapshot::GroupScopedSnapshot {
+                created_at: 1000,
+                ..base_snap.clone()
+            };
+            // New snapshot (should be kept)
+            let new_snap = crate::snapshot::GroupScopedSnapshot {
+                created_at: 5000,
+                ..base_snap.clone()
+            };
+
+            snapshots.insert((group_id.clone(), "old_snap".to_string()), old_snap);
+            snapshots.insert((group_id.clone(), "new_snap".to_string()), new_snap);
+        }
+
+        // Prune snapshots older than 3000
+        let pruned = storage.prune_expired_snapshots(3000).unwrap();
+
+        assert_eq!(pruned, 1, "Should have pruned 1 snapshot");
+
+        let remaining = storage.list_group_snapshots(&group_id).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].0, "new_snap");
+        assert_eq!(remaining[0].1, 5000);
+    }
+
+    #[test]
+    fn test_prune_expired_snapshots_returns_zero_when_nothing_to_prune() {
+        use mdk_storage_traits::MdkStorageProvider;
+
+        let storage = MdkMemoryStorage::default();
+        let group_id = GroupId::from_slice(&[1, 2, 3, 4]);
+
+        {
+            let mut snapshots = storage.group_snapshots.write();
+
+            let snap = crate::snapshot::GroupScopedSnapshot {
+                group_id: group_id.clone(),
+                created_at: 5000, // Newer than threshold
+                mls_group_data: std::collections::HashMap::new(),
+                mls_own_leaf_nodes: vec![],
+                mls_proposals: std::collections::HashMap::new(),
+                mls_epoch_key_pairs: std::collections::HashMap::new(),
+                group: None,
+                group_relays: std::collections::BTreeSet::new(),
+                group_exporter_secrets: std::collections::HashMap::new(),
+            };
+
+            snapshots.insert((group_id.clone(), "recent_snap".to_string()), snap);
+        }
+
+        // Prune snapshots older than 1000 (none qualify)
+        let pruned = storage.prune_expired_snapshots(1000).unwrap();
+
+        assert_eq!(pruned, 0, "Should have pruned 0 snapshots");
+
+        let remaining = storage.list_group_snapshots(&group_id).unwrap();
+        assert_eq!(remaining.len(), 1);
+    }
+
+    #[test]
+    fn test_prune_expired_snapshots_across_multiple_groups() {
+        use mdk_storage_traits::MdkStorageProvider;
+
+        let storage = MdkMemoryStorage::default();
+        let group1 = GroupId::from_slice(&[1, 1, 1, 1]);
+        let group2 = GroupId::from_slice(&[2, 2, 2, 2]);
+
+        {
+            let mut snapshots = storage.group_snapshots.write();
+
+            let base_snap1 = crate::snapshot::GroupScopedSnapshot {
+                group_id: group1.clone(),
+                created_at: 1000, // Old, should be pruned
+                mls_group_data: std::collections::HashMap::new(),
+                mls_own_leaf_nodes: vec![],
+                mls_proposals: std::collections::HashMap::new(),
+                mls_epoch_key_pairs: std::collections::HashMap::new(),
+                group: None,
+                group_relays: std::collections::BTreeSet::new(),
+                group_exporter_secrets: std::collections::HashMap::new(),
+            };
+            let base_snap2 = crate::snapshot::GroupScopedSnapshot {
+                group_id: group2.clone(),
+                created_at: 2000, // Old, should be pruned
+                ..base_snap1.clone()
+            };
+            let new_snap1 = crate::snapshot::GroupScopedSnapshot {
+                group_id: group1.clone(),
+                created_at: 5000, // New, keep
+                ..base_snap1.clone()
+            };
+
+            snapshots.insert((group1.clone(), "old_snap_g1".to_string()), base_snap1);
+            snapshots.insert((group2.clone(), "old_snap_g2".to_string()), base_snap2);
+            snapshots.insert((group1.clone(), "new_snap_g1".to_string()), new_snap1);
+        }
+
+        // Prune snapshots older than 3000
+        let pruned = storage.prune_expired_snapshots(3000).unwrap();
+
+        assert_eq!(pruned, 2, "Should have pruned 2 snapshots across groups");
+
+        let remaining1 = storage.list_group_snapshots(&group1).unwrap();
+        let remaining2 = storage.list_group_snapshots(&group2).unwrap();
+
+        assert_eq!(remaining1.len(), 1);
+        assert_eq!(remaining1[0].0, "new_snap_g1");
+        assert!(remaining2.is_empty());
     }
 }

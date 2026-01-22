@@ -27,6 +27,11 @@
 
 ### Breaking changes
 
+- **Snapshot API**: Added group-scoped snapshot management methods to `MdkStorageProvider` trait to support MIP-03 commit race resolution. Implementations must now provide: ([#152](https://github.com/marmot-protocol/mdk/pull/152))
+  - `create_group_snapshot(group_id, name)`: Create a named snapshot of a group's current state
+  - `rollback_group_to_snapshot(group_id, name)`: Roll back a group's state to a named snapshot
+  - `release_group_snapshot(group_id, name)`: Release/delete a group's named snapshot
+
 - **Unified Storage Architecture**: The `MdkStorageProvider` trait now requires implementors to directly implement OpenMLS's `StorageProvider<1>` trait, enabling atomic transactions across MLS and MDK state. This is required for proper commit race resolution per MIP-03. ([#148](https://github.com/marmot-protocol/mdk/pull/148))
   - Removed `OpenMlsStorageProvider` associated type
   - Removed `openmls_storage()` and `openmls_storage_mut()` accessor methods

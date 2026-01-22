@@ -68,7 +68,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use mdk_storage_traits::{Backend, MdkStorageError, MdkStorageProvider};
+use mdk_storage_traits::{Backend, GroupId, MdkStorageError, MdkStorageProvider};
 use openmls_traits::storage::{StorageProvider, traits};
 use rusqlite::Connection;
 use tokio::sync::Mutex;
@@ -447,77 +447,6 @@ impl MdkSqliteStorage {
         })
     }
 
-    // ============================================================================
-    // Transaction and Savepoint Support
-    // ============================================================================
-
-    fn validate_savepoint_name(name: &str) -> Result<(), Error> {
-        if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
-            return Err(Error::Database(
-                "Invalid savepoint name: must be non-empty and contain only alphanumeric characters and underscores".to_string(),
-            ));
-        }
-        Ok(())
-    }
-
-    /// Creates a savepoint with the given name.
-    ///
-    /// Savepoints allow nested transactions and the ability to rollback to a
-    /// specific point without rolling back the entire transaction.
-    ///
-    /// # Arguments
-    ///
-    /// * `name` - The name of the savepoint.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the savepoint cannot be created.
-    pub fn savepoint(&self, name: &str) -> Result<(), Error> {
-        Self::validate_savepoint_name(name)?;
-        let conn = self.connection.blocking_lock();
-        conn.execute(&format!("SAVEPOINT {}", name), [])
-            .map_err(|e| Error::Database(e.to_string()))?;
-        Ok(())
-    }
-
-    /// Releases (commits) a savepoint.
-    ///
-    /// This commits all changes since the savepoint was created.
-    ///
-    /// # Arguments
-    ///
-    /// * `name` - The name of the savepoint to release.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the savepoint cannot be released.
-    pub fn release_savepoint(&self, name: &str) -> Result<(), Error> {
-        Self::validate_savepoint_name(name)?;
-        let conn = self.connection.blocking_lock();
-        conn.execute(&format!("RELEASE SAVEPOINT {}", name), [])
-            .map_err(|e| Error::Database(e.to_string()))?;
-        Ok(())
-    }
-
-    /// Rolls back to a savepoint.
-    ///
-    /// This discards all changes made since the savepoint was created.
-    ///
-    /// # Arguments
-    ///
-    /// * `name` - The name of the savepoint to roll back to.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the rollback fails.
-    pub fn rollback_to_savepoint(&self, name: &str) -> Result<(), Error> {
-        Self::validate_savepoint_name(name)?;
-        let conn = self.connection.blocking_lock();
-        conn.execute(&format!("ROLLBACK TO SAVEPOINT {}", name), [])
-            .map_err(|e| Error::Database(e.to_string()))?;
-        Ok(())
-    }
-
     /// Provides access to the underlying connection for MDK storage operations.
     ///
     /// This method is for internal use by the group, message, and welcome storage implementations.
@@ -527,6 +456,669 @@ impl MdkSqliteStorage {
     {
         let conn = self.connection.blocking_lock();
         f(&conn)
+    }
+
+    /// Creates a snapshot of a group's state by copying all group-related rows
+    /// to the snapshot table.
+    fn snapshot_group_state(&self, group_id: &GroupId, name: &str) -> Result<(), Error> {
+        let conn = self.connection.blocking_lock();
+        let group_id_bytes = group_id.as_slice();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| Error::Database(format!("Time error: {}", e)))?
+            .as_secs() as i64;
+
+        // Begin transaction for atomicity
+        conn.execute("BEGIN IMMEDIATE", [])
+            .map_err(|e| Error::Database(e.to_string()))?;
+
+        let result = (|| -> Result<(), Error> {
+            // Helper to insert snapshot rows
+            let mut insert_stmt = conn
+                .prepare_cached(
+                    "INSERT INTO group_state_snapshots
+                 (snapshot_name, group_id, table_name, row_key, row_data, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                )
+                .map_err(|e| Error::Database(e.to_string()))?;
+
+            // Snapshot all 7 tables (4 OpenMLS + 3 MDK)
+            Self::snapshot_openmls_group_data(&conn, &mut insert_stmt, name, group_id_bytes, now)?;
+            Self::snapshot_openmls_proposals(&conn, &mut insert_stmt, name, group_id_bytes, now)?;
+            Self::snapshot_openmls_own_leaf_nodes(
+                &conn,
+                &mut insert_stmt,
+                name,
+                group_id_bytes,
+                now,
+            )?;
+            Self::snapshot_openmls_epoch_key_pairs(
+                &conn,
+                &mut insert_stmt,
+                name,
+                group_id_bytes,
+                now,
+            )?;
+            Self::snapshot_groups_table(&conn, &mut insert_stmt, name, group_id_bytes, now)?;
+            Self::snapshot_group_relays(&conn, &mut insert_stmt, name, group_id_bytes, now)?;
+            Self::snapshot_group_exporter_secrets(
+                &conn,
+                &mut insert_stmt,
+                name,
+                group_id_bytes,
+                now,
+            )?;
+
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                conn.execute("COMMIT", [])
+                    .map_err(|e| Error::Database(e.to_string()))?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK", []);
+                Err(e)
+            }
+        }
+    }
+
+    /// Snapshot helper: openmls_group_data table
+    fn snapshot_openmls_group_data(
+        conn: &rusqlite::Connection,
+        insert_stmt: &mut rusqlite::CachedStatement<'_>,
+        snapshot_name: &str,
+        group_id_bytes: &[u8],
+        now: i64,
+    ) -> Result<(), Error> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT group_id, data_type, group_data FROM openmls_group_data WHERE group_id = ?",
+            )
+            .map_err(|e| Error::Database(e.to_string()))?;
+        let mut rows = stmt
+            .query([group_id_bytes])
+            .map_err(|e| Error::Database(e.to_string()))?;
+
+        while let Some(row) = rows.next().map_err(|e| Error::Database(e.to_string()))? {
+            let gid: Vec<u8> = row.get(0).map_err(|e| Error::Database(e.to_string()))?;
+            let data_type: String = row.get(1).map_err(|e| Error::Database(e.to_string()))?;
+            let data: Vec<u8> = row.get(2).map_err(|e| Error::Database(e.to_string()))?;
+            let row_key = serde_json::to_vec(&(&gid, &data_type))
+                .map_err(|e| Error::Database(e.to_string()))?;
+            insert_stmt
+                .execute(rusqlite::params![
+                    snapshot_name,
+                    group_id_bytes,
+                    "openmls_group_data",
+                    row_key,
+                    data,
+                    now
+                ])
+                .map_err(|e| Error::Database(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Snapshot helper: openmls_proposals table
+    fn snapshot_openmls_proposals(
+        conn: &rusqlite::Connection,
+        insert_stmt: &mut rusqlite::CachedStatement<'_>,
+        snapshot_name: &str,
+        group_id_bytes: &[u8],
+        now: i64,
+    ) -> Result<(), Error> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT group_id, proposal_ref, proposal FROM openmls_proposals WHERE group_id = ?",
+            )
+            .map_err(|e| Error::Database(e.to_string()))?;
+        let mut rows = stmt
+            .query([group_id_bytes])
+            .map_err(|e| Error::Database(e.to_string()))?;
+
+        while let Some(row) = rows.next().map_err(|e| Error::Database(e.to_string()))? {
+            let gid: Vec<u8> = row.get(0).map_err(|e| Error::Database(e.to_string()))?;
+            let proposal_ref: Vec<u8> = row.get(1).map_err(|e| Error::Database(e.to_string()))?;
+            let proposal: Vec<u8> = row.get(2).map_err(|e| Error::Database(e.to_string()))?;
+            let row_key = serde_json::to_vec(&(&gid, &proposal_ref))
+                .map_err(|e| Error::Database(e.to_string()))?;
+            insert_stmt
+                .execute(rusqlite::params![
+                    snapshot_name,
+                    group_id_bytes,
+                    "openmls_proposals",
+                    row_key,
+                    proposal,
+                    now
+                ])
+                .map_err(|e| Error::Database(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Snapshot helper: openmls_own_leaf_nodes table
+    fn snapshot_openmls_own_leaf_nodes(
+        conn: &rusqlite::Connection,
+        insert_stmt: &mut rusqlite::CachedStatement<'_>,
+        snapshot_name: &str,
+        group_id_bytes: &[u8],
+        now: i64,
+    ) -> Result<(), Error> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, group_id, leaf_node FROM openmls_own_leaf_nodes WHERE group_id = ?",
+            )
+            .map_err(|e| Error::Database(e.to_string()))?;
+        let mut rows = stmt
+            .query([group_id_bytes])
+            .map_err(|e| Error::Database(e.to_string()))?;
+
+        while let Some(row) = rows.next().map_err(|e| Error::Database(e.to_string()))? {
+            let id: i64 = row.get(0).map_err(|e| Error::Database(e.to_string()))?;
+            let gid: Vec<u8> = row.get(1).map_err(|e| Error::Database(e.to_string()))?;
+            let leaf_node: Vec<u8> = row.get(2).map_err(|e| Error::Database(e.to_string()))?;
+            let row_key = serde_json::to_vec(&id).map_err(|e| Error::Database(e.to_string()))?;
+            let row_data = serde_json::to_vec(&(&gid, &leaf_node))
+                .map_err(|e| Error::Database(e.to_string()))?;
+            insert_stmt
+                .execute(rusqlite::params![
+                    snapshot_name,
+                    group_id_bytes,
+                    "openmls_own_leaf_nodes",
+                    row_key,
+                    row_data,
+                    now
+                ])
+                .map_err(|e| Error::Database(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Snapshot helper: openmls_epoch_key_pairs table
+    fn snapshot_openmls_epoch_key_pairs(
+        conn: &rusqlite::Connection,
+        insert_stmt: &mut rusqlite::CachedStatement<'_>,
+        snapshot_name: &str,
+        group_id_bytes: &[u8],
+        now: i64,
+    ) -> Result<(), Error> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT group_id, epoch_id, leaf_index, key_pairs
+                 FROM openmls_epoch_key_pairs WHERE group_id = ?",
+            )
+            .map_err(|e| Error::Database(e.to_string()))?;
+        let mut rows = stmt
+            .query([group_id_bytes])
+            .map_err(|e| Error::Database(e.to_string()))?;
+
+        while let Some(row) = rows.next().map_err(|e| Error::Database(e.to_string()))? {
+            let gid: Vec<u8> = row.get(0).map_err(|e| Error::Database(e.to_string()))?;
+            let epoch_id: Vec<u8> = row.get(1).map_err(|e| Error::Database(e.to_string()))?;
+            let leaf_index: i64 = row.get(2).map_err(|e| Error::Database(e.to_string()))?;
+            let key_pairs: Vec<u8> = row.get(3).map_err(|e| Error::Database(e.to_string()))?;
+            let row_key = serde_json::to_vec(&(&gid, &epoch_id, leaf_index))
+                .map_err(|e| Error::Database(e.to_string()))?;
+            insert_stmt
+                .execute(rusqlite::params![
+                    snapshot_name,
+                    group_id_bytes,
+                    "openmls_epoch_key_pairs",
+                    row_key,
+                    key_pairs,
+                    now
+                ])
+                .map_err(|e| Error::Database(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Snapshot helper: groups table (MDK)
+    fn snapshot_groups_table(
+        conn: &rusqlite::Connection,
+        insert_stmt: &mut rusqlite::CachedStatement<'_>,
+        snapshot_name: &str,
+        group_id_bytes: &[u8],
+        now: i64,
+    ) -> Result<(), Error> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT mls_group_id, nostr_group_id, name, description, admin_pubkeys,
+                        last_message_id, last_message_at, epoch, state,
+                        image_hash, image_key, image_nonce
+                 FROM groups WHERE mls_group_id = ?",
+            )
+            .map_err(|e| Error::Database(e.to_string()))?;
+        let mut rows = stmt
+            .query([group_id_bytes])
+            .map_err(|e| Error::Database(e.to_string()))?;
+
+        while let Some(row) = rows.next().map_err(|e| Error::Database(e.to_string()))? {
+            let mls_group_id: Vec<u8> = row.get(0).map_err(|e| Error::Database(e.to_string()))?;
+            let nostr_group_id: Vec<u8> = row.get(1).map_err(|e| Error::Database(e.to_string()))?;
+            let name_val: String = row.get(2).map_err(|e| Error::Database(e.to_string()))?;
+            let description: String = row.get(3).map_err(|e| Error::Database(e.to_string()))?;
+            let admin_pubkeys: String = row.get(4).map_err(|e| Error::Database(e.to_string()))?;
+            let last_message_id: Option<Vec<u8>> =
+                row.get(5).map_err(|e| Error::Database(e.to_string()))?;
+            let last_message_at: Option<i64> =
+                row.get(6).map_err(|e| Error::Database(e.to_string()))?;
+            let epoch: i64 = row.get(7).map_err(|e| Error::Database(e.to_string()))?;
+            let state: String = row.get(8).map_err(|e| Error::Database(e.to_string()))?;
+            let image_hash: Option<Vec<u8>> =
+                row.get(9).map_err(|e| Error::Database(e.to_string()))?;
+            let image_key: Option<Vec<u8>> =
+                row.get(10).map_err(|e| Error::Database(e.to_string()))?;
+            let image_nonce: Option<Vec<u8>> =
+                row.get(11).map_err(|e| Error::Database(e.to_string()))?;
+
+            let row_key =
+                serde_json::to_vec(&mls_group_id).map_err(|e| Error::Database(e.to_string()))?;
+            let row_data = serde_json::to_vec(&(
+                &nostr_group_id,
+                &name_val,
+                &description,
+                &admin_pubkeys,
+                &last_message_id,
+                &last_message_at,
+                epoch,
+                &state,
+                &image_hash,
+                &image_key,
+                &image_nonce,
+            ))
+            .map_err(|e| Error::Database(e.to_string()))?;
+
+            insert_stmt
+                .execute(rusqlite::params![
+                    snapshot_name,
+                    group_id_bytes,
+                    "groups",
+                    row_key,
+                    row_data,
+                    now
+                ])
+                .map_err(|e| Error::Database(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Snapshot helper: group_relays table
+    fn snapshot_group_relays(
+        conn: &rusqlite::Connection,
+        insert_stmt: &mut rusqlite::CachedStatement<'_>,
+        snapshot_name: &str,
+        group_id_bytes: &[u8],
+        now: i64,
+    ) -> Result<(), Error> {
+        let mut stmt = conn
+            .prepare("SELECT id, mls_group_id, relay_url FROM group_relays WHERE mls_group_id = ?")
+            .map_err(|e| Error::Database(e.to_string()))?;
+        let mut rows = stmt
+            .query([group_id_bytes])
+            .map_err(|e| Error::Database(e.to_string()))?;
+
+        while let Some(row) = rows.next().map_err(|e| Error::Database(e.to_string()))? {
+            let id: i64 = row.get(0).map_err(|e| Error::Database(e.to_string()))?;
+            let mls_group_id: Vec<u8> = row.get(1).map_err(|e| Error::Database(e.to_string()))?;
+            let relay_url: String = row.get(2).map_err(|e| Error::Database(e.to_string()))?;
+            let row_key = serde_json::to_vec(&id).map_err(|e| Error::Database(e.to_string()))?;
+            let row_data = serde_json::to_vec(&(&mls_group_id, &relay_url))
+                .map_err(|e| Error::Database(e.to_string()))?;
+            insert_stmt
+                .execute(rusqlite::params![
+                    snapshot_name,
+                    group_id_bytes,
+                    "group_relays",
+                    row_key,
+                    row_data,
+                    now
+                ])
+                .map_err(|e| Error::Database(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Snapshot helper: group_exporter_secrets table
+    fn snapshot_group_exporter_secrets(
+        conn: &rusqlite::Connection,
+        insert_stmt: &mut rusqlite::CachedStatement<'_>,
+        snapshot_name: &str,
+        group_id_bytes: &[u8],
+        now: i64,
+    ) -> Result<(), Error> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT mls_group_id, epoch, secret FROM group_exporter_secrets WHERE mls_group_id = ?",
+            )
+            .map_err(|e| Error::Database(e.to_string()))?;
+        let mut rows = stmt
+            .query([group_id_bytes])
+            .map_err(|e| Error::Database(e.to_string()))?;
+
+        while let Some(row) = rows.next().map_err(|e| Error::Database(e.to_string()))? {
+            let mls_group_id: Vec<u8> = row.get(0).map_err(|e| Error::Database(e.to_string()))?;
+            let epoch: i64 = row.get(1).map_err(|e| Error::Database(e.to_string()))?;
+            let secret: Vec<u8> = row.get(2).map_err(|e| Error::Database(e.to_string()))?;
+            let row_key = serde_json::to_vec(&(&mls_group_id, epoch))
+                .map_err(|e| Error::Database(e.to_string()))?;
+            insert_stmt
+                .execute(rusqlite::params![
+                    snapshot_name,
+                    group_id_bytes,
+                    "group_exporter_secrets",
+                    row_key,
+                    secret,
+                    now
+                ])
+                .map_err(|e| Error::Database(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Restores a group's state from a snapshot by deleting current rows
+    /// and re-inserting from the snapshot table.
+    fn restore_group_from_snapshot(&self, group_id: &GroupId, name: &str) -> Result<(), Error> {
+        let conn = self.connection.blocking_lock();
+        let group_id_bytes = group_id.as_slice();
+
+        // Check if snapshot exists BEFORE starting transaction or deleting any data.
+        // This prevents data loss if the snapshot name is typo'd or doesn't exist.
+        // This matches the memory storage behavior which returns NotFound error.
+        let snapshot_exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM group_state_snapshots WHERE snapshot_name = ? AND group_id = ?)",
+                rusqlite::params![name, group_id_bytes],
+                |row| row.get(0),
+            )
+            .map_err(|e| Error::Database(e.to_string()))?;
+
+        if !snapshot_exists {
+            return Err(Error::Database("Snapshot not found".to_string()));
+        }
+
+        // 1. Read snapshot data into memory FIRST, before any deletions.
+        // This is critical because the groups table has ON DELETE CASCADE to
+        // group_state_snapshots - if we delete the group first, the snapshot
+        // rows get deleted too!
+        let snapshot_rows: Vec<(String, Vec<u8>, Vec<u8>)> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT table_name, row_key, row_data FROM group_state_snapshots
+                     WHERE snapshot_name = ? AND group_id = ?",
+                )
+                .map_err(|e| Error::Database(e.to_string()))?;
+
+            let rows = stmt
+                .query_map(rusqlite::params![name, group_id_bytes], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })
+                .map_err(|e| Error::Database(e.to_string()))?;
+
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| Error::Database(e.to_string()))?
+        };
+
+        // Also read OTHER snapshots for this group (different names) so we can
+        // restore them after the CASCADE deletion. This preserves multiple snapshots.
+        #[allow(clippy::type_complexity)]
+        let other_snapshots: Vec<(String, String, Vec<u8>, Vec<u8>, i64)> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT snapshot_name, table_name, row_key, row_data, created_at
+                     FROM group_state_snapshots
+                     WHERE group_id = ? AND snapshot_name != ?",
+                )
+                .map_err(|e| Error::Database(e.to_string()))?;
+
+            let rows = stmt
+                .query_map(rusqlite::params![group_id_bytes, name], |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                })
+                .map_err(|e| Error::Database(e.to_string()))?;
+
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| Error::Database(e.to_string()))?
+        };
+
+        // Begin transaction for atomicity - critical to prevent data loss on failure
+        conn.execute("BEGIN IMMEDIATE", [])
+            .map_err(|e| Error::Database(e.to_string()))?;
+
+        let result = (|| -> Result<(), Error> {
+            // 2. Delete current rows for this group from all 7 tables
+            conn.execute(
+                "DELETE FROM openmls_group_data WHERE group_id = ?",
+                [group_id_bytes],
+            )
+            .map_err(|e| Error::Database(e.to_string()))?;
+
+            conn.execute(
+                "DELETE FROM openmls_proposals WHERE group_id = ?",
+                [group_id_bytes],
+            )
+            .map_err(|e| Error::Database(e.to_string()))?;
+
+            conn.execute(
+                "DELETE FROM openmls_own_leaf_nodes WHERE group_id = ?",
+                [group_id_bytes],
+            )
+            .map_err(|e| Error::Database(e.to_string()))?;
+
+            conn.execute(
+                "DELETE FROM openmls_epoch_key_pairs WHERE group_id = ?",
+                [group_id_bytes],
+            )
+            .map_err(|e| Error::Database(e.to_string()))?;
+
+            // For MDK tables, we need to disable foreign key checks temporarily
+            // or delete in the right order to avoid FK violations
+            conn.execute(
+                "DELETE FROM group_exporter_secrets WHERE mls_group_id = ?",
+                [group_id_bytes],
+            )
+            .map_err(|e| Error::Database(e.to_string()))?;
+
+            conn.execute(
+                "DELETE FROM group_relays WHERE mls_group_id = ?",
+                [group_id_bytes],
+            )
+            .map_err(|e| Error::Database(e.to_string()))?;
+
+            conn.execute(
+                "DELETE FROM groups WHERE mls_group_id = ?",
+                [group_id_bytes],
+            )
+            .map_err(|e| Error::Database(e.to_string()))?;
+
+            // Note: The CASCADE will have deleted the snapshot rows, but we already
+            // have the data in memory (snapshot_rows).
+
+            // 3. Restore from in-memory snapshot data
+            // IMPORTANT: We must restore "groups" first because group_relays and
+            // group_exporter_secrets have FK constraints that reference groups.
+            // Process in two passes: groups first, then everything else.
+            for (table_name, row_key, row_data) in &snapshot_rows {
+                if table_name != "groups" {
+                    continue;
+                }
+                let mls_group_id: Vec<u8> =
+                    serde_json::from_slice(row_key).map_err(|e| Error::Database(e.to_string()))?;
+                #[allow(clippy::type_complexity)]
+                let (
+                    nostr_group_id,
+                    name_val,
+                    description,
+                    admin_pubkeys,
+                    last_message_id,
+                    last_message_at,
+                    epoch,
+                    state,
+                    image_hash,
+                    image_key,
+                    image_nonce,
+                ): (
+                    Vec<u8>,
+                    String,
+                    String,
+                    String,
+                    Option<Vec<u8>>,
+                    Option<i64>,
+                    i64,
+                    String,
+                    Option<Vec<u8>>,
+                    Option<Vec<u8>>,
+                    Option<Vec<u8>>,
+                ) = serde_json::from_slice(row_data).map_err(|e| Error::Database(e.to_string()))?;
+                conn.execute(
+                    "INSERT INTO groups (mls_group_id, nostr_group_id, name, description, admin_pubkeys,
+                                        last_message_id, last_message_at, epoch, state,
+                                        image_hash, image_key, image_nonce)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    rusqlite::params![
+                        mls_group_id,
+                        nostr_group_id,
+                        name_val,
+                        description,
+                        admin_pubkeys,
+                        last_message_id,
+                        last_message_at,
+                        epoch,
+                        state,
+                        image_hash,
+                        image_key,
+                        image_nonce
+                    ],
+                )
+                .map_err(|e| Error::Database(e.to_string()))?;
+            }
+
+            // Now restore all other tables (groups already done above)
+            for (table_name, row_key, row_data) in &snapshot_rows {
+                match table_name.as_str() {
+                    "openmls_group_data" => {
+                        let (gid, data_type): (Vec<u8>, String) =
+                            serde_json::from_slice(row_key)
+                                .map_err(|e| Error::Database(e.to_string()))?;
+                        conn.execute(
+                            "INSERT INTO openmls_group_data (provider_version, group_id, data_type, group_data)
+                             VALUES (1, ?, ?, ?)",
+                            rusqlite::params![gid, data_type, row_data],
+                        )
+                        .map_err(|e| Error::Database(e.to_string()))?;
+                    }
+                    "openmls_proposals" => {
+                        let (gid, proposal_ref): (Vec<u8>, Vec<u8>) =
+                            serde_json::from_slice(row_key)
+                                .map_err(|e| Error::Database(e.to_string()))?;
+                        conn.execute(
+                            "INSERT INTO openmls_proposals (provider_version, group_id, proposal_ref, proposal)
+                             VALUES (1, ?, ?, ?)",
+                            rusqlite::params![gid, proposal_ref, row_data],
+                        )
+                        .map_err(|e| Error::Database(e.to_string()))?;
+                    }
+                    "openmls_own_leaf_nodes" => {
+                        let (gid, leaf_node): (Vec<u8>, Vec<u8>) = serde_json::from_slice(row_data)
+                            .map_err(|e| Error::Database(e.to_string()))?;
+                        conn.execute(
+                            "INSERT INTO openmls_own_leaf_nodes (provider_version, group_id, leaf_node)
+                             VALUES (1, ?, ?)",
+                            rusqlite::params![gid, leaf_node],
+                        )
+                        .map_err(|e| Error::Database(e.to_string()))?;
+                    }
+                    "openmls_epoch_key_pairs" => {
+                        let (gid, epoch_id, leaf_index): (Vec<u8>, Vec<u8>, i64) =
+                            serde_json::from_slice(row_key)
+                                .map_err(|e| Error::Database(e.to_string()))?;
+                        conn.execute(
+                            "INSERT INTO openmls_epoch_key_pairs (provider_version, group_id, epoch_id, leaf_index, key_pairs)
+                             VALUES (1, ?, ?, ?, ?)",
+                            rusqlite::params![gid, epoch_id, leaf_index, row_data],
+                        )
+                        .map_err(|e| Error::Database(e.to_string()))?;
+                    }
+                    "groups" => {
+                        // Already restored in the first pass above
+                    }
+                    "group_relays" => {
+                        let (mls_group_id, relay_url): (Vec<u8>, String) =
+                            serde_json::from_slice(row_data)
+                                .map_err(|e| Error::Database(e.to_string()))?;
+                        conn.execute(
+                            "INSERT INTO group_relays (mls_group_id, relay_url) VALUES (?, ?)",
+                            rusqlite::params![mls_group_id, relay_url],
+                        )
+                        .map_err(|e| Error::Database(e.to_string()))?;
+                    }
+                    "group_exporter_secrets" => {
+                        let (mls_group_id, epoch): (Vec<u8>, i64) = serde_json::from_slice(row_key)
+                            .map_err(|e| Error::Database(e.to_string()))?;
+                        conn.execute(
+                            "INSERT INTO group_exporter_secrets (mls_group_id, epoch, secret) VALUES (?, ?, ?)",
+                            rusqlite::params![mls_group_id, epoch, row_data],
+                        )
+                        .map_err(|e| Error::Database(e.to_string()))?;
+                    }
+                    _ => {
+                        // Unknown table, skip
+                    }
+                }
+            }
+
+            // 4. Delete the consumed snapshot (may be no-op if CASCADE already deleted them)
+            conn.execute(
+                "DELETE FROM group_state_snapshots WHERE snapshot_name = ? AND group_id = ?",
+                rusqlite::params![name, group_id_bytes],
+            )
+            .map_err(|e| Error::Database(e.to_string()))?;
+
+            // 5. Re-insert other snapshots that were deleted by CASCADE
+            // This preserves multiple snapshots when rolling back to one of them.
+            for (snap_name, table_name, row_key, row_data, created_at) in &other_snapshots {
+                conn.execute(
+                    "INSERT INTO group_state_snapshots (snapshot_name, group_id, table_name, row_key, row_data, created_at)
+                     VALUES (?, ?, ?, ?, ?, ?)",
+                    rusqlite::params![snap_name, group_id_bytes, table_name, row_key, row_data, created_at],
+                )
+                .map_err(|e| Error::Database(e.to_string()))?;
+            }
+
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                conn.execute("COMMIT", [])
+                    .map_err(|e| Error::Database(e.to_string()))?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK", []);
+                Err(e)
+            }
+        }
+    }
+
+    /// Deletes a snapshot that is no longer needed.
+    fn delete_group_snapshot(&self, group_id: &GroupId, name: &str) -> Result<(), Error> {
+        let conn = self.connection.blocking_lock();
+        conn.execute(
+            "DELETE FROM group_state_snapshots WHERE snapshot_name = ? AND group_id = ?",
+            rusqlite::params![name, group_id.as_slice()],
+        )
+        .map_err(|e| Error::Database(e.to_string()))?;
+        Ok(())
     }
 }
 
@@ -539,6 +1131,64 @@ impl MdkStorageProvider for MdkSqliteStorage {
     /// [`Backend::SQLite`] indicating this is a SQLite-based storage implementation.
     fn backend(&self) -> Backend {
         Backend::SQLite
+    }
+
+    fn create_group_snapshot(&self, group_id: &GroupId, name: &str) -> Result<(), MdkStorageError> {
+        self.snapshot_group_state(group_id, name)
+            .map_err(|e| MdkStorageError::Database(e.to_string()))
+    }
+
+    fn rollback_group_to_snapshot(
+        &self,
+        group_id: &GroupId,
+        name: &str,
+    ) -> Result<(), MdkStorageError> {
+        self.restore_group_from_snapshot(group_id, name)
+            .map_err(|e| MdkStorageError::Database(e.to_string()))
+    }
+
+    fn release_group_snapshot(
+        &self,
+        group_id: &GroupId,
+        name: &str,
+    ) -> Result<(), MdkStorageError> {
+        self.delete_group_snapshot(group_id, name)
+            .map_err(|e| MdkStorageError::Database(e.to_string()))
+    }
+
+    fn list_group_snapshots(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<Vec<(String, u64)>, MdkStorageError> {
+        let conn = self.connection.blocking_lock();
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT DISTINCT snapshot_name, created_at FROM group_state_snapshots
+                 WHERE group_id = ? ORDER BY created_at ASC",
+            )
+            .map_err(|e| MdkStorageError::Database(e.to_string()))?;
+
+        let rows = stmt
+            .query_map(rusqlite::params![group_id.as_slice()], |row| {
+                let name: String = row.get(0)?;
+                let created_at: i64 = row.get(1)?;
+                Ok((name, created_at as u64))
+            })
+            .map_err(|e| MdkStorageError::Database(e.to_string()))?;
+
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| MdkStorageError::Database(e.to_string()))
+    }
+
+    fn prune_expired_snapshots(&self, min_timestamp: u64) -> Result<usize, MdkStorageError> {
+        let conn = self.connection.blocking_lock();
+        let deleted = conn
+            .execute(
+                "DELETE FROM group_state_snapshots WHERE created_at < ?",
+                rusqlite::params![min_timestamp as i64],
+            )
+            .map_err(|e| MdkStorageError::Database(e.to_string()))?;
+        Ok(deleted)
     }
 }
 
@@ -2356,261 +3006,6 @@ mod tests {
     }
 
     // ========================================
-    // Transaction/Savepoint Tests (Phase 5)
-    // ========================================
-
-    mod savepoint_tests {
-        use mdk_storage_traits::groups::GroupStorage;
-        use mdk_storage_traits::test_utils::cross_storage::create_test_group;
-
-        use super::*;
-
-        #[test]
-        fn test_savepoint_creation_succeeds() {
-            let storage = MdkSqliteStorage::new_in_memory().unwrap();
-
-            // Create a savepoint
-            let result = storage.savepoint("test_sp");
-            assert!(result.is_ok());
-
-            // Clean up by releasing
-            let result = storage.release_savepoint("test_sp");
-            assert!(result.is_ok());
-        }
-
-        #[test]
-        fn test_rollback_to_savepoint_restores_state() {
-            let storage = MdkSqliteStorage::new_in_memory().unwrap();
-
-            // Create and save initial group
-            let mls_group_id = GroupId::from_slice(&[1, 2, 3, 4]);
-            let mut group = create_test_group(mls_group_id.clone());
-            group.name = "Original Name".to_string();
-            group.epoch = 1;
-            storage.save_group(group.clone()).unwrap();
-
-            // Verify initial state
-            let initial_group = storage
-                .find_group_by_mls_group_id(&mls_group_id)
-                .unwrap()
-                .unwrap();
-            assert_eq!(initial_group.name, "Original Name");
-            assert_eq!(initial_group.epoch, 1);
-
-            // Create a savepoint
-            storage.savepoint("before_modification").unwrap();
-
-            // Modify the group
-            let mut modified_group = group.clone();
-            modified_group.name = "Modified Name".to_string();
-            modified_group.epoch = 5;
-            storage.save_group(modified_group).unwrap();
-
-            // Verify modification
-            let after_mod = storage
-                .find_group_by_mls_group_id(&mls_group_id)
-                .unwrap()
-                .unwrap();
-            assert_eq!(after_mod.name, "Modified Name");
-            assert_eq!(after_mod.epoch, 5);
-
-            // Rollback to savepoint
-            storage
-                .rollback_to_savepoint("before_modification")
-                .unwrap();
-
-            // Verify original state is restored
-            let after_rollback = storage
-                .find_group_by_mls_group_id(&mls_group_id)
-                .unwrap()
-                .unwrap();
-            assert_eq!(after_rollback.name, "Original Name");
-            assert_eq!(after_rollback.epoch, 1);
-
-            // Release the savepoint
-            storage.release_savepoint("before_modification").unwrap();
-        }
-
-        #[test]
-        fn test_release_savepoint_commits_changes() {
-            let storage = MdkSqliteStorage::new_in_memory().unwrap();
-
-            // Create initial group
-            let mls_group_id = GroupId::from_slice(&[5, 6, 7, 8]);
-            let mut group = create_test_group(mls_group_id.clone());
-            group.name = "Initial".to_string();
-            storage.save_group(group.clone()).unwrap();
-
-            // Create savepoint
-            storage.savepoint("commit_test").unwrap();
-
-            // Modify the group
-            let mut modified = group.clone();
-            modified.name = "Committed Changes".to_string();
-            storage.save_group(modified).unwrap();
-
-            // Release savepoint (commit changes)
-            storage.release_savepoint("commit_test").unwrap();
-
-            // Verify changes are still there after release
-            let result = storage
-                .find_group_by_mls_group_id(&mls_group_id)
-                .unwrap()
-                .unwrap();
-            assert_eq!(result.name, "Committed Changes");
-        }
-
-        #[test]
-        fn test_nested_savepoints() {
-            let storage = MdkSqliteStorage::new_in_memory().unwrap();
-
-            // Create a group
-            let mls_group_id = GroupId::from_slice(&[9, 10, 11, 12]);
-            let mut group = create_test_group(mls_group_id.clone());
-            group.name = "Level 0".to_string();
-            storage.save_group(group.clone()).unwrap();
-
-            // First savepoint
-            storage.savepoint("level1").unwrap();
-
-            // Modify to level 1
-            let mut level1_group = group.clone();
-            level1_group.name = "Level 1".to_string();
-            storage.save_group(level1_group.clone()).unwrap();
-
-            // Second nested savepoint
-            storage.savepoint("level2").unwrap();
-
-            // Modify to level 2
-            let mut level2_group = level1_group.clone();
-            level2_group.name = "Level 2".to_string();
-            storage.save_group(level2_group).unwrap();
-
-            // Verify we're at level 2
-            let current = storage
-                .find_group_by_mls_group_id(&mls_group_id)
-                .unwrap()
-                .unwrap();
-            assert_eq!(current.name, "Level 2");
-
-            // Rollback to level 2 savepoint (back to level 1)
-            storage.rollback_to_savepoint("level2").unwrap();
-
-            // Verify we're at level 1
-            let after_rollback = storage
-                .find_group_by_mls_group_id(&mls_group_id)
-                .unwrap()
-                .unwrap();
-            assert_eq!(after_rollback.name, "Level 1");
-
-            // Release level 2 savepoint
-            storage.release_savepoint("level2").unwrap();
-
-            // Rollback to level 1 savepoint (back to level 0)
-            storage.rollback_to_savepoint("level1").unwrap();
-
-            // Verify we're at level 0
-            let final_state = storage
-                .find_group_by_mls_group_id(&mls_group_id)
-                .unwrap()
-                .unwrap();
-            assert_eq!(final_state.name, "Level 0");
-
-            // Clean up
-            storage.release_savepoint("level1").unwrap();
-        }
-
-        #[test]
-        fn test_savepoint_with_new_group_rollback() {
-            let storage = MdkSqliteStorage::new_in_memory().unwrap();
-
-            // Verify group doesn't exist
-            let mls_group_id = GroupId::from_slice(&[13, 14, 15, 16]);
-            let before = storage.find_group_by_mls_group_id(&mls_group_id).unwrap();
-            assert!(before.is_none());
-
-            // Create savepoint
-            storage.savepoint("before_insert").unwrap();
-
-            // Insert a new group
-            let group = create_test_group(mls_group_id.clone());
-            storage.save_group(group).unwrap();
-
-            // Verify group exists
-            let after_insert = storage.find_group_by_mls_group_id(&mls_group_id).unwrap();
-            assert!(after_insert.is_some());
-
-            // Rollback
-            storage.rollback_to_savepoint("before_insert").unwrap();
-
-            // Verify group no longer exists
-            let after_rollback = storage.find_group_by_mls_group_id(&mls_group_id).unwrap();
-            assert!(after_rollback.is_none());
-
-            // Clean up
-            storage.release_savepoint("before_insert").unwrap();
-        }
-
-        #[test]
-        fn test_savepoint_with_multiple_modifications_rollback() {
-            let storage = MdkSqliteStorage::new_in_memory().unwrap();
-
-            // Create and save a group
-            let mls_group_id = GroupId::from_slice(&[17, 18, 19, 20]);
-            let mut group = create_test_group(mls_group_id.clone());
-            group.name = "Original".to_string();
-            group.epoch = 1;
-            storage.save_group(group.clone()).unwrap();
-
-            // Verify group exists with original values
-            let exists = storage
-                .find_group_by_mls_group_id(&mls_group_id)
-                .unwrap()
-                .unwrap();
-            assert_eq!(exists.name, "Original");
-            assert_eq!(exists.epoch, 1);
-
-            // Create savepoint
-            storage.savepoint("before_modifications").unwrap();
-
-            // Make multiple modifications
-            let mut modified1 = group.clone();
-            modified1.name = "Modified Once".to_string();
-            modified1.epoch = 10;
-            storage.save_group(modified1).unwrap();
-
-            let mut modified2 = group.clone();
-            modified2.name = "Modified Twice".to_string();
-            modified2.epoch = 20;
-            storage.save_group(modified2).unwrap();
-
-            // Verify final modification
-            let after_mods = storage
-                .find_group_by_mls_group_id(&mls_group_id)
-                .unwrap()
-                .unwrap();
-            assert_eq!(after_mods.name, "Modified Twice");
-            assert_eq!(after_mods.epoch, 20);
-
-            // Rollback
-            storage
-                .rollback_to_savepoint("before_modifications")
-                .unwrap();
-
-            // Verify original values are restored
-            let after_rollback = storage
-                .find_group_by_mls_group_id(&mls_group_id)
-                .unwrap()
-                .unwrap();
-            assert_eq!(after_rollback.name, "Original");
-            assert_eq!(after_rollback.epoch, 1);
-
-            // Clean up
-            storage.release_savepoint("before_modifications").unwrap();
-        }
-    }
-
-    // ========================================
     // Migration Tests (Phase 5)
     // ========================================
 
@@ -2814,159 +3209,578 @@ mod tests {
     }
 
     // ========================================
-    // Cross-Storage Atomicity Tests (Phase 5)
+    // Snapshot tests
     // ========================================
 
-    mod atomicity_tests {
+    mod snapshot_tests {
+        use std::collections::BTreeSet;
+
         use mdk_storage_traits::groups::GroupStorage;
-        use mdk_storage_traits::messages::MessageStorage;
-        use mdk_storage_traits::test_utils::cross_storage::{
-            create_test_group, create_test_message,
-        };
-        use nostr::EventId;
+        use mdk_storage_traits::groups::types::{Group, GroupExporterSecret, GroupState};
+        use mdk_storage_traits::{GroupId, MdkStorageProvider, Secret};
 
         use super::*;
 
-        #[test]
-        fn test_mdk_operations_in_single_transaction_rollback() {
-            let storage = MdkSqliteStorage::new_in_memory().unwrap();
-
-            // Create a group first
-            let mls_group_id = GroupId::from_slice(&[1, 2, 3, 4]);
-            let group = create_test_group(mls_group_id.clone());
-            storage.save_group(group).unwrap();
-
-            // Create savepoint
-            storage.savepoint("mdk_atomic").unwrap();
-
-            // Save a message
-            let event_id = EventId::all_zeros();
-            let message = create_test_message(mls_group_id.clone(), event_id);
-            storage.save_message(message).unwrap();
-
-            // Verify message exists
-            let messages = storage.messages(&mls_group_id, None).unwrap();
-            assert_eq!(messages.len(), 1);
-
-            // Rollback
-            storage.rollback_to_savepoint("mdk_atomic").unwrap();
-
-            // Verify message is gone
-            let messages_after = storage.messages(&mls_group_id, None).unwrap();
-            assert_eq!(messages_after.len(), 0);
-
-            // Release savepoint
-            storage.release_savepoint("mdk_atomic").unwrap();
+        fn create_test_group(id: u8) -> Group {
+            Group {
+                mls_group_id: GroupId::from_slice(&[id; 32]),
+                nostr_group_id: [id; 32],
+                name: format!("Test Group {}", id),
+                description: format!("Description {}", id),
+                admin_pubkeys: BTreeSet::new(),
+                last_message_id: None,
+                last_message_at: None,
+                epoch: 0,
+                state: GroupState::Active,
+                image_hash: None,
+                image_key: None,
+                image_nonce: None,
+            }
         }
 
         #[test]
-        fn test_group_atomic_rollback() {
+        fn test_snapshot_and_rollback_group_state() {
             let storage = MdkSqliteStorage::new_in_memory().unwrap();
 
-            // Create savepoint before anything
-            storage.savepoint("atomic_group").unwrap();
-
-            // Create group
-            let mls_group_id = GroupId::from_slice(&[5, 6, 7, 8]);
-            let group = create_test_group(mls_group_id.clone());
+            // Create and save a group
+            let group = create_test_group(1);
+            let group_id = group.mls_group_id.clone();
             storage.save_group(group).unwrap();
 
-            // Verify group exists
-            let found_group = storage.find_group_by_mls_group_id(&mls_group_id).unwrap();
-            assert!(found_group.is_some());
+            // Verify initial state
+            let initial_group = storage
+                .find_group_by_mls_group_id(&group_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(initial_group.name, "Test Group 1");
+            assert_eq!(initial_group.epoch, 0);
 
-            // Rollback
-            storage.rollback_to_savepoint("atomic_group").unwrap();
+            // Create a snapshot
+            storage
+                .create_group_snapshot(&group_id, "snap_epoch_0")
+                .unwrap();
 
-            // Verify group is gone
-            let after_group = storage.find_group_by_mls_group_id(&mls_group_id).unwrap();
-            assert!(after_group.is_none());
+            // Modify the group
+            let mut modified_group = initial_group.clone();
+            modified_group.name = "Modified Group".to_string();
+            modified_group.epoch = 1;
+            storage.save_group(modified_group).unwrap();
 
-            // Release savepoint
-            storage.release_savepoint("atomic_group").unwrap();
+            // Verify modification
+            let after_mod = storage
+                .find_group_by_mls_group_id(&group_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(after_mod.name, "Modified Group");
+            assert_eq!(after_mod.epoch, 1);
+
+            // Rollback to snapshot
+            storage
+                .rollback_group_to_snapshot(&group_id, "snap_epoch_0")
+                .unwrap();
+
+            // Verify rollback restored original state
+            let after_rollback = storage
+                .find_group_by_mls_group_id(&group_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(after_rollback.name, "Test Group 1");
+            assert_eq!(after_rollback.epoch, 0);
         }
 
         #[test]
-        fn test_exporter_secrets_atomic_rollback() {
+        fn test_snapshot_release_without_rollback() {
             let storage = MdkSqliteStorage::new_in_memory().unwrap();
 
-            // Create group first
-            let mls_group_id = GroupId::from_slice(&[6, 7, 8, 9]);
-            let group = create_test_group(mls_group_id.clone());
+            // Create and save a group
+            let group = create_test_group(2);
+            let group_id = group.mls_group_id.clone();
             storage.save_group(group).unwrap();
 
-            // Create savepoint
-            storage.savepoint("atomic_secrets").unwrap();
+            // Create a snapshot
+            storage
+                .create_group_snapshot(&group_id, "snap_to_release")
+                .unwrap();
 
-            // Add exporter secrets
-            let secret = mdk_storage_traits::groups::types::GroupExporterSecret {
-                mls_group_id: mls_group_id.clone(),
-                epoch: 1,
-                secret: mdk_storage_traits::Secret::new([1u8; 32]),
+            // Modify the group
+            let mut modified = storage
+                .find_group_by_mls_group_id(&group_id)
+                .unwrap()
+                .unwrap();
+            modified.name = "Modified Name".to_string();
+            storage.save_group(modified).unwrap();
+
+            // Release the snapshot (commit the changes)
+            storage
+                .release_group_snapshot(&group_id, "snap_to_release")
+                .unwrap();
+
+            // Verify modifications are kept
+            let final_state = storage
+                .find_group_by_mls_group_id(&group_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(final_state.name, "Modified Name");
+        }
+
+        #[test]
+        fn test_snapshot_with_exporter_secrets_rollback() {
+            let storage = MdkSqliteStorage::new_in_memory().unwrap();
+
+            // Create and save a group
+            let group = create_test_group(3);
+            let group_id = group.mls_group_id.clone();
+            storage.save_group(group).unwrap();
+
+            // Save initial exporter secret
+            let secret_0 = GroupExporterSecret {
+                mls_group_id: group_id.clone(),
+                epoch: 0,
+                secret: Secret::new([0u8; 32]),
             };
-            storage.save_group_exporter_secret(secret.clone()).unwrap();
+            storage.save_group_exporter_secret(secret_0).unwrap();
 
-            // Verify secret exists
-            let found = storage.get_group_exporter_secret(&mls_group_id, 1).unwrap();
-            assert!(found.is_some());
+            // Create snapshot
+            storage
+                .create_group_snapshot(&group_id, "snap_secrets")
+                .unwrap();
+
+            // Add more exporter secrets
+            let secret_1 = GroupExporterSecret {
+                mls_group_id: group_id.clone(),
+                epoch: 1,
+                secret: Secret::new([1u8; 32]),
+            };
+            storage.save_group_exporter_secret(secret_1).unwrap();
+
+            // Verify new secret exists
+            let secret_check = storage.get_group_exporter_secret(&group_id, 1).unwrap();
+            assert!(secret_check.is_some());
 
             // Rollback
-            storage.rollback_to_savepoint("atomic_secrets").unwrap();
+            storage
+                .rollback_group_to_snapshot(&group_id, "snap_secrets")
+                .unwrap();
 
-            // Verify secret is gone
-            let after = storage.get_group_exporter_secret(&mls_group_id, 1).unwrap();
-            assert!(after.is_none());
+            // Epoch 1 secret should be gone after rollback
+            let after_rollback = storage.get_group_exporter_secret(&group_id, 1).unwrap();
+            assert!(after_rollback.is_none());
 
-            // Release savepoint
-            storage.release_savepoint("atomic_secrets").unwrap();
+            // Epoch 0 secret should still exist
+            let epoch_0 = storage.get_group_exporter_secret(&group_id, 0).unwrap();
+            assert!(epoch_0.is_some());
         }
 
         #[test]
-        fn test_partial_failure_rollback() {
+        fn test_snapshot_isolation_between_groups() {
             let storage = MdkSqliteStorage::new_in_memory().unwrap();
 
             // Create two groups
-            let group_id_1 = GroupId::from_slice(&[1, 1, 1, 1]);
-            let group_id_2 = GroupId::from_slice(&[2, 2, 2, 2]);
+            let group1 = create_test_group(10);
+            let group2 = create_test_group(20);
+            let group1_id = group1.mls_group_id.clone();
+            let group2_id = group2.mls_group_id.clone();
 
-            let group1 = create_test_group(group_id_1.clone());
             storage.save_group(group1).unwrap();
-
-            // Create savepoint
-            storage.savepoint("partial_test").unwrap();
-
-            // Save second group
-            let group2 = create_test_group(group_id_2.clone());
             storage.save_group(group2).unwrap();
 
-            // Add message to first group
-            let event_id = EventId::all_zeros();
-            let message = create_test_message(group_id_1.clone(), event_id);
-            storage.save_message(message).unwrap();
+            // Snapshot group1
+            storage
+                .create_group_snapshot(&group1_id, "snap_group1")
+                .unwrap();
 
-            // Verify both changes
-            let groups = storage.all_groups().unwrap();
-            assert_eq!(groups.len(), 2);
-            let messages = storage.messages(&group_id_1, None).unwrap();
-            assert_eq!(messages.len(), 1);
+            // Modify both groups
+            let mut mod1 = storage
+                .find_group_by_mls_group_id(&group1_id)
+                .unwrap()
+                .unwrap();
+            let mut mod2 = storage
+                .find_group_by_mls_group_id(&group2_id)
+                .unwrap()
+                .unwrap();
+            mod1.name = "Modified Group 1".to_string();
+            mod2.name = "Modified Group 2".to_string();
+            storage.save_group(mod1).unwrap();
+            storage.save_group(mod2).unwrap();
 
-            // Rollback - simulating a failure after partial operations
-            storage.rollback_to_savepoint("partial_test").unwrap();
+            // Rollback group1 only
+            storage
+                .rollback_group_to_snapshot(&group1_id, "snap_group1")
+                .unwrap();
 
-            // Verify only first group remains, no new group, no messages
-            let groups_after = storage.all_groups().unwrap();
-            assert_eq!(groups_after.len(), 1);
+            // Group1 should be rolled back
+            let final1 = storage
+                .find_group_by_mls_group_id(&group1_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(final1.name, "Test Group 10");
+
+            // Group2 should still have modifications
+            let final2 = storage
+                .find_group_by_mls_group_id(&group2_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(final2.name, "Modified Group 2");
+        }
+
+        #[test]
+        fn test_rollback_nonexistent_snapshot_returns_error() {
+            let storage = MdkSqliteStorage::new_in_memory().unwrap();
+
+            let group = create_test_group(5);
+            let group_id = group.mls_group_id.clone();
+            storage.save_group(group.clone()).unwrap();
+
+            // Rolling back to a nonexistent snapshot should return an error
+            // and NOT delete any data. This prevents accidental data loss
+            // from typos in snapshot names.
+            // This matches the memory storage behavior.
+            let result = storage.rollback_group_to_snapshot(&group_id, "nonexistent_snap");
             assert!(
-                storage
-                    .find_group_by_mls_group_id(&group_id_2)
-                    .unwrap()
-                    .is_none()
+                result.is_err(),
+                "Rollback to nonexistent snapshot should return an error"
             );
-            let messages_after = storage.messages(&group_id_1, None).unwrap();
-            assert_eq!(messages_after.len(), 0);
 
-            // Release savepoint
-            storage.release_savepoint("partial_test").unwrap();
+            // CRITICAL: Group should still exist (no data was deleted)
+            let after_rollback = storage.find_group_by_mls_group_id(&group_id).unwrap();
+            assert!(
+                after_rollback.is_some(),
+                "Group should NOT be deleted when rolling back to nonexistent snapshot"
+            );
+            assert_eq!(
+                after_rollback.unwrap().epoch,
+                group.epoch,
+                "Group data should be unchanged"
+            );
+        }
+
+        #[test]
+        fn test_release_nonexistent_snapshot_succeeds() {
+            let storage = MdkSqliteStorage::new_in_memory().unwrap();
+
+            let group = create_test_group(6);
+            let group_id = group.mls_group_id.clone();
+            storage.save_group(group).unwrap();
+
+            // Releasing a non-existent snapshot should be a no-op (idempotent)
+            let result = storage.release_group_snapshot(&group_id, "nonexistent_snap");
+            // Should succeed (no-op)
+            assert!(result.is_ok());
+        }
+
+        #[test]
+        fn test_multiple_snapshots_same_group() {
+            let storage = MdkSqliteStorage::new_in_memory().unwrap();
+
+            let group = create_test_group(7);
+            let group_id = group.mls_group_id.clone();
+            storage.save_group(group).unwrap();
+
+            // Create first snapshot at epoch 0
+            storage
+                .create_group_snapshot(&group_id, "snap_epoch_0")
+                .unwrap();
+
+            // Modify to epoch 1
+            let mut mod1 = storage
+                .find_group_by_mls_group_id(&group_id)
+                .unwrap()
+                .unwrap();
+            mod1.epoch = 1;
+            mod1.name = "Epoch 1".to_string();
+            storage.save_group(mod1).unwrap();
+
+            // Create second snapshot at epoch 1
+            storage
+                .create_group_snapshot(&group_id, "snap_epoch_1")
+                .unwrap();
+
+            // Modify to epoch 2
+            let mut mod2 = storage
+                .find_group_by_mls_group_id(&group_id)
+                .unwrap()
+                .unwrap();
+            mod2.epoch = 2;
+            mod2.name = "Epoch 2".to_string();
+            storage.save_group(mod2).unwrap();
+
+            // Rollback to epoch 1 snapshot
+            storage
+                .rollback_group_to_snapshot(&group_id, "snap_epoch_1")
+                .unwrap();
+
+            let after_rollback = storage
+                .find_group_by_mls_group_id(&group_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(after_rollback.epoch, 1);
+            assert_eq!(after_rollback.name, "Epoch 1");
+
+            // Can still rollback further to epoch 0
+            storage
+                .rollback_group_to_snapshot(&group_id, "snap_epoch_0")
+                .unwrap();
+
+            let final_state = storage
+                .find_group_by_mls_group_id(&group_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(final_state.epoch, 0);
+            assert_eq!(final_state.name, "Test Group 7");
+        }
+
+        #[test]
+        fn test_list_group_snapshots_empty() {
+            use mdk_storage_traits::MdkStorageProvider;
+
+            let temp_dir = tempdir().unwrap();
+            let db_path = temp_dir.path().join("list_snapshots_empty.db");
+            let storage = MdkSqliteStorage::new_unencrypted(&db_path).unwrap();
+
+            let group_id = GroupId::from_slice(&[1, 2, 3, 4]);
+
+            let snapshots = storage.list_group_snapshots(&group_id).unwrap();
+            assert!(
+                snapshots.is_empty(),
+                "Should return empty list for no snapshots"
+            );
+        }
+
+        #[test]
+        fn test_list_group_snapshots_returns_snapshots_sorted_by_created_at() {
+            use mdk_storage_traits::MdkStorageProvider;
+
+            let temp_dir = tempdir().unwrap();
+            let db_path = temp_dir.path().join("list_snapshots_sorted.db");
+            let storage = MdkSqliteStorage::new_unencrypted(&db_path).unwrap();
+
+            let group_id = GroupId::from_slice(&[8; 32]);
+            let nostr_group_id: [u8; 32] = [9; 32];
+
+            // Create a group first
+            let group = Group {
+                mls_group_id: group_id.clone(),
+                nostr_group_id,
+                name: "Test Group".to_string(),
+                description: "".to_string(),
+                admin_pubkeys: BTreeSet::new(),
+                last_message_id: None,
+                last_message_at: None,
+                epoch: 1,
+                state: GroupState::Active,
+                image_hash: None,
+                image_key: None,
+                image_nonce: None,
+            };
+            storage.save_group(group).unwrap();
+
+            // Create snapshots - they will have sequential timestamps
+            storage
+                .create_group_snapshot(&group_id, "snap_first")
+                .unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            storage
+                .create_group_snapshot(&group_id, "snap_second")
+                .unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            storage
+                .create_group_snapshot(&group_id, "snap_third")
+                .unwrap();
+
+            let result = storage.list_group_snapshots(&group_id).unwrap();
+
+            assert_eq!(result.len(), 3);
+            // Should be sorted by created_at ascending
+            assert_eq!(result[0].0, "snap_first");
+            assert_eq!(result[1].0, "snap_second");
+            assert_eq!(result[2].0, "snap_third");
+            // Verify timestamps are increasing
+            assert!(result[0].1 <= result[1].1);
+            assert!(result[1].1 <= result[2].1);
+        }
+
+        #[test]
+        fn test_list_group_snapshots_only_returns_matching_group() {
+            use mdk_storage_traits::MdkStorageProvider;
+
+            let temp_dir = tempdir().unwrap();
+            let db_path = temp_dir.path().join("list_snapshots_filtered.db");
+            let storage = MdkSqliteStorage::new_unencrypted(&db_path).unwrap();
+
+            let group1 = GroupId::from_slice(&[1; 32]);
+            let group2 = GroupId::from_slice(&[2; 32]);
+
+            // Create groups
+            let g1 = Group {
+                mls_group_id: group1.clone(),
+                nostr_group_id: [11; 32],
+                name: "Group 1".to_string(),
+                description: "".to_string(),
+                admin_pubkeys: BTreeSet::new(),
+                last_message_id: None,
+                last_message_at: None,
+                epoch: 1,
+                state: GroupState::Active,
+                image_hash: None,
+                image_key: None,
+                image_nonce: None,
+            };
+            let g2 = Group {
+                mls_group_id: group2.clone(),
+                nostr_group_id: [22; 32],
+                name: "Group 2".to_string(),
+                ..g1.clone()
+            };
+            storage.save_group(g1).unwrap();
+            storage.save_group(g2).unwrap();
+
+            // Create snapshots for each group
+            storage.create_group_snapshot(&group1, "snap_g1").unwrap();
+            storage.create_group_snapshot(&group2, "snap_g2").unwrap();
+
+            let result1 = storage.list_group_snapshots(&group1).unwrap();
+            let result2 = storage.list_group_snapshots(&group2).unwrap();
+
+            assert_eq!(result1.len(), 1);
+            assert_eq!(result1[0].0, "snap_g1");
+
+            assert_eq!(result2.len(), 1);
+            assert_eq!(result2[0].0, "snap_g2");
+        }
+
+        #[test]
+        fn test_prune_expired_snapshots_removes_old_snapshots() {
+            use mdk_storage_traits::MdkStorageProvider;
+
+            let temp_dir = tempdir().unwrap();
+            let db_path = temp_dir.path().join("prune_expired.db");
+            let storage = MdkSqliteStorage::new_unencrypted(&db_path).unwrap();
+
+            let group_id = GroupId::from_slice(&[3; 32]);
+
+            let group = Group {
+                mls_group_id: group_id.clone(),
+                nostr_group_id: [33; 32],
+                name: "Test Group".to_string(),
+                description: "".to_string(),
+                admin_pubkeys: BTreeSet::new(),
+                last_message_id: None,
+                last_message_at: None,
+                epoch: 1,
+                state: GroupState::Active,
+                image_hash: None,
+                image_key: None,
+                image_nonce: None,
+            };
+            storage.save_group(group).unwrap();
+
+            // Create a snapshot
+            storage
+                .create_group_snapshot(&group_id, "old_snap")
+                .unwrap();
+
+            // Get the snapshot's timestamp
+            let snapshots_before = storage.list_group_snapshots(&group_id).unwrap();
+            assert_eq!(snapshots_before.len(), 1);
+            let old_ts = snapshots_before[0].1;
+
+            // Prune with a threshold in the future - should prune the snapshot
+            let pruned = storage.prune_expired_snapshots(old_ts + 1).unwrap();
+            assert_eq!(pruned, 1, "Should have pruned 1 snapshot");
+
+            let remaining = storage.list_group_snapshots(&group_id).unwrap();
+            assert!(remaining.is_empty());
+        }
+
+        #[test]
+        fn test_prune_expired_snapshots_keeps_recent_snapshots() {
+            use mdk_storage_traits::MdkStorageProvider;
+
+            let temp_dir = tempdir().unwrap();
+            let db_path = temp_dir.path().join("prune_keeps_recent.db");
+            let storage = MdkSqliteStorage::new_unencrypted(&db_path).unwrap();
+
+            let group_id = GroupId::from_slice(&[4; 32]);
+
+            let group = Group {
+                mls_group_id: group_id.clone(),
+                nostr_group_id: [44; 32],
+                name: "Test Group".to_string(),
+                description: "".to_string(),
+                admin_pubkeys: BTreeSet::new(),
+                last_message_id: None,
+                last_message_at: None,
+                epoch: 1,
+                state: GroupState::Active,
+                image_hash: None,
+                image_key: None,
+                image_nonce: None,
+            };
+            storage.save_group(group).unwrap();
+
+            // Create a snapshot
+            storage
+                .create_group_snapshot(&group_id, "recent_snap")
+                .unwrap();
+
+            // Prune with threshold 0 - should keep everything
+            let pruned = storage.prune_expired_snapshots(0).unwrap();
+            assert_eq!(pruned, 0, "Should have pruned 0 snapshots");
+
+            let remaining = storage.list_group_snapshots(&group_id).unwrap();
+            assert_eq!(remaining.len(), 1);
+            assert_eq!(remaining[0].0, "recent_snap");
+        }
+
+        #[test]
+        fn test_prune_expired_snapshots_with_cascade_delete() {
+            // This test verifies that pruning removes all related snapshot data
+            // (the CASCADE DELETE on the FK should handle this)
+            use mdk_storage_traits::MdkStorageProvider;
+
+            let temp_dir = tempdir().unwrap();
+            let db_path = temp_dir.path().join("prune_cascade.db");
+            let storage = MdkSqliteStorage::new_unencrypted(&db_path).unwrap();
+
+            let group_id = GroupId::from_slice(&[5; 32]);
+
+            let group = Group {
+                mls_group_id: group_id.clone(),
+                nostr_group_id: [55; 32],
+                name: "Test Group".to_string(),
+                description: "".to_string(),
+                admin_pubkeys: BTreeSet::new(),
+                last_message_id: None,
+                last_message_at: None,
+                epoch: 1,
+                state: GroupState::Active,
+                image_hash: None,
+                image_key: None,
+                image_nonce: None,
+            };
+            storage.save_group(group).unwrap();
+
+            // Create snapshot (this creates both group_state_snapshots header and data rows)
+            storage
+                .create_group_snapshot(&group_id, "to_prune")
+                .unwrap();
+
+            // Verify snapshot exists
+            let before = storage.list_group_snapshots(&group_id).unwrap();
+            assert_eq!(before.len(), 1);
+
+            // Get timestamp and prune
+            let ts = before[0].1;
+            let pruned = storage.prune_expired_snapshots(ts + 1).unwrap();
+            assert_eq!(pruned, 1);
+
+            // Verify snapshot is completely gone
+            let after = storage.list_group_snapshots(&group_id).unwrap();
+            assert!(after.is_empty());
+
+            // Attempting to rollback should fail (no snapshot exists)
+            let rollback_result = storage.rollback_group_to_snapshot(&group_id, "to_prune");
+            assert!(rollback_result.is_err());
         }
     }
 }

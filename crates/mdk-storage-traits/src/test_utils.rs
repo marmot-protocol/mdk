@@ -403,6 +403,7 @@ pub mod cross_storage {
             event,
             wrapper_event_id: event_id,
             state: MessageState::Processed,
+            epoch: None,
         }
     }
 
@@ -415,6 +416,8 @@ pub mod cross_storage {
             wrapper_event_id,
             message_event_id,
             processed_at: Timestamp::now(),
+            epoch: None,
+            mls_group_id: None,
             state: ProcessedMessageState::Processed,
             failure_reason: None,
         }

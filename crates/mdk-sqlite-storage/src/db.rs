@@ -219,6 +219,7 @@ pub fn row_to_message(row: &Row) -> SqliteResult<Message> {
     let tags_json: &str = row.get_ref("tags")?.as_str()?;
     let event_json: &str = row.get_ref("event")?.as_str()?;
     let wrapper_event_id_blob: &[u8] = row.get_ref("wrapper_event_id")?.as_blob()?;
+    let epoch: Option<u64> = row.get("epoch")?;
     let state_str: &str = row.get_ref("state")?.as_str()?;
 
     // Parse values
@@ -252,6 +253,7 @@ pub fn row_to_message(row: &Row) -> SqliteResult<Message> {
         tags,
         event,
         wrapper_event_id,
+        epoch,
         state,
     })
 }
@@ -262,6 +264,8 @@ pub fn row_to_processed_message(row: &Row) -> SqliteResult<ProcessedMessage> {
     let message_event_id_blob: Option<&[u8]> =
         row.get_ref("message_event_id")?.as_blob_or_null()?;
     let processed_at_value: u64 = row.get("processed_at")?;
+    let epoch: Option<u64> = row.get("epoch")?;
+    let mls_group_id_blob: Option<&[u8]> = row.get_ref("mls_group_id")?.as_blob_or_null()?;
     let state_str: &str = row.get_ref("state")?.as_str()?;
     let failure_reason: Option<String> = row.get("failure_reason")?;
 
@@ -277,6 +281,8 @@ pub fn row_to_processed_message(row: &Row) -> SqliteResult<ProcessedMessage> {
         None => None,
     };
 
+    let mls_group_id: Option<GroupId> = mls_group_id_blob.map(GroupId::from_slice);
+
     let processed_at: Timestamp = Timestamp::from_secs(processed_at_value);
     let state: ProcessedMessageState = ProcessedMessageState::from_str(state_str)
         .map_err(|_| map_invalid_text_data("Invalid state"))?;
@@ -285,6 +291,8 @@ pub fn row_to_processed_message(row: &Row) -> SqliteResult<ProcessedMessage> {
         wrapper_event_id,
         message_event_id,
         processed_at,
+        epoch,
+        mls_group_id,
         state,
         failure_reason,
     })
