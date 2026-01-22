@@ -233,7 +233,7 @@ impl RaceConditionSimulator {
 
     /// Get a timestamp offset from the base by the specified number of seconds
     pub fn timestamp_offset(&self, offset_seconds: i64) -> nostr::Timestamp {
-        let new_timestamp = (self.base_timestamp.as_u64() as i64 + offset_seconds).max(0) as u64;
+        let new_timestamp = (self.base_timestamp.as_secs() as i64 + offset_seconds).max(0) as u64;
         nostr::Timestamp::from(new_timestamp)
     }
 }

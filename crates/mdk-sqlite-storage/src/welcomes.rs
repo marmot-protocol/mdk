@@ -171,7 +171,7 @@ impl WelcomeStorage for MdkSqliteStorage {
                 params![
                     processed_welcome.wrapper_event_id.as_bytes(),
                     welcome_event_id,
-                    processed_welcome.processed_at.as_u64(),
+                    processed_welcome.processed_at.as_secs(),
                     processed_welcome.state.as_str(),
                     &processed_welcome.failure_reason
                 ],

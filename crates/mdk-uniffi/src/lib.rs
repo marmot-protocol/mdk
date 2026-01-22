@@ -1081,7 +1081,7 @@ impl From<group_types::Group> for Group {
             image_nonce: g.image_nonce.map(|n| n.as_ref().to_vec()),
             admin_pubkeys: g.admin_pubkeys.iter().map(|pk| pk.to_hex()).collect(),
             last_message_id: g.last_message_id.map(|id| id.to_hex()),
-            last_message_at: g.last_message_at.map(|ts| ts.as_u64()),
+            last_message_at: g.last_message_at.map(|ts| ts.as_secs()),
             epoch: g.epoch,
             state: g.state.as_str().to_string(),
         }
@@ -1134,7 +1134,7 @@ impl From<message_types::Message> for Message {
             event_id: m.wrapper_event_id.to_hex(),
             sender_pubkey: m.pubkey.to_hex(),
             event_json,
-            processed_at: m.created_at.as_u64(),
+            processed_at: m.created_at.as_secs(),
             kind: m.kind.as_u16(),
             state: m.state.as_str().to_string(),
         }

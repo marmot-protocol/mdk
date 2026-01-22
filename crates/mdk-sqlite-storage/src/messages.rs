@@ -65,7 +65,7 @@ impl MessageStorage for MdkSqliteStorage {
                     message.pubkey.as_bytes(),
                     message.kind.as_u16(),
                     message.mls_group_id.as_slice(),
-                    message.created_at.as_u64(),
+                    message.created_at.as_secs(),
                     &message.content,
                     &tags_json,
                     &event_json,
@@ -123,7 +123,7 @@ impl MessageStorage for MdkSqliteStorage {
                 params![
                     &processed_message.wrapper_event_id.to_bytes(),
                     &message_event_id,
-                    &processed_message.processed_at.as_u64(),
+                    &processed_message.processed_at.as_secs(),
                     &processed_message.epoch,
                     &mls_group_id,
                     &processed_message.state.to_string(),

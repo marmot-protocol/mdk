@@ -113,7 +113,7 @@ impl GroupStorage for MdkSqliteStorage {
 
         let last_message_id: Option<&[u8; 32]> =
             group.last_message_id.as_ref().map(|id| id.as_bytes());
-        let last_message_at: Option<u64> = group.last_message_at.as_ref().map(|ts| ts.as_u64());
+        let last_message_at: Option<u64> = group.last_message_at.as_ref().map(|ts| ts.as_secs());
 
         self.with_connection(|conn| {
             conn.execute(
