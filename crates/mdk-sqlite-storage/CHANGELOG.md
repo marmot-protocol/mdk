@@ -25,6 +25,10 @@
 
 ## Unreleased
 
+### Added
+
+- **Retryable Message Support**: Updated storage implementation to handle `ProcessedMessageState::Retryable` transitions and persistence. ([#161](https://github.com/marmot-protocol/mdk/pull/161))
+
 ### Breaking changes
 
 ### Changed

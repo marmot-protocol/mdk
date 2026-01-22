@@ -82,4 +82,14 @@ pub trait MessageStorage {
         &self,
         group_id: &GroupId,
     ) -> Result<Vec<ProcessedMessage>, MessageError>;
+
+    /// Mark a processed message as retryable.
+    ///
+    /// This is called during rollback when group state has been corrected and
+    /// previously failed messages may now be processable. Only messages in
+    /// `Failed` state can be marked as `Retryable`.
+    ///
+    /// Returns `Ok(())` if the message was successfully marked as retryable,
+    /// or `Err(MessageError::NotFound)` if no failed message with that event ID exists.
+    fn mark_processed_message_retryable(&self, event_id: &EventId) -> Result<(), MessageError>;
 }

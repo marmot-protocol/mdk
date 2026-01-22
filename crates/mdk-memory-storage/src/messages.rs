@@ -230,6 +230,20 @@ impl MessageStorage for MdkMemoryStorage {
 
         Ok(event_ids)
     }
+
+    fn mark_processed_message_retryable(&self, event_id: &EventId) -> Result<(), MessageError> {
+        let mut inner = self.inner.write();
+
+        // Only update messages that are currently in Failed state
+        if let Some(pm) = inner.processed_messages_cache.get_mut(event_id)
+            && pm.state == ProcessedMessageState::Failed
+        {
+            pm.state = ProcessedMessageState::Retryable;
+            return Ok(());
+        }
+
+        Err(MessageError::NotFound)
+    }
 }
 
 #[cfg(test)]
@@ -732,5 +746,103 @@ mod tests {
                 .unwrap();
             assert!(found.is_none(), "Oldest message should be evicted");
         }
+    }
+
+    #[test]
+    fn test_mark_processed_message_retryable() {
+        use mdk_storage_traits::messages::types::ProcessedMessage;
+
+        let storage = MdkMemoryStorage::new();
+
+        // Create a failed processed message
+        let wrapper_event_id = EventId::from_slice(&[100u8; 32]).unwrap();
+
+        let processed_message = ProcessedMessage {
+            wrapper_event_id,
+            message_event_id: None,
+            processed_at: Timestamp::from(1_000_000_000u64),
+            epoch: None,
+            mls_group_id: Some(GroupId::from_slice(&[1, 2, 3, 4])),
+            state: ProcessedMessageState::Failed,
+            failure_reason: Some("Decryption failed".to_string()),
+        };
+
+        // Save the failed processed message
+        storage
+            .save_processed_message(processed_message)
+            .expect("Failed to save processed message");
+
+        // Verify it's in Failed state
+        let found = storage
+            .find_processed_message_by_event_id(&wrapper_event_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.state, ProcessedMessageState::Failed);
+
+        // Mark as retryable
+        storage
+            .mark_processed_message_retryable(&wrapper_event_id)
+            .expect("Failed to mark message as retryable");
+
+        // Verify state changed to Retryable
+        let found = storage
+            .find_processed_message_by_event_id(&wrapper_event_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.state, ProcessedMessageState::Retryable);
+
+        // Verify failure_reason is preserved
+        assert_eq!(found.failure_reason, Some("Decryption failed".to_string()));
+    }
+
+    #[test]
+    fn test_mark_nonexistent_message_retryable_fails() {
+        use mdk_storage_traits::messages::error::MessageError;
+
+        let storage = MdkMemoryStorage::new();
+
+        let wrapper_event_id = EventId::from_slice(&[100u8; 32]).unwrap();
+
+        // Attempt to mark a non-existent message as retryable
+        let result = storage.mark_processed_message_retryable(&wrapper_event_id);
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), MessageError::NotFound));
+    }
+
+    #[test]
+    fn test_mark_non_failed_message_retryable_fails() {
+        use mdk_storage_traits::messages::error::MessageError;
+        use mdk_storage_traits::messages::types::ProcessedMessage;
+
+        let storage = MdkMemoryStorage::new();
+
+        // Create a processed message in Processed state (not Failed)
+        let wrapper_event_id = EventId::from_slice(&[100u8; 32]).unwrap();
+
+        let processed_message = ProcessedMessage {
+            wrapper_event_id,
+            message_event_id: None,
+            processed_at: Timestamp::from(1_000_000_000u64),
+            epoch: Some(1),
+            mls_group_id: Some(GroupId::from_slice(&[1, 2, 3, 4])),
+            state: ProcessedMessageState::Processed,
+            failure_reason: None,
+        };
+
+        storage
+            .save_processed_message(processed_message)
+            .expect("Failed to save processed message");
+
+        // Attempt to mark a Processed message as retryable should fail
+        let result = storage.mark_processed_message_retryable(&wrapper_event_id);
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), MessageError::NotFound));
+
+        // Verify state is unchanged
+        let found = storage
+            .find_processed_message_by_event_id(&wrapper_event_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.state, ProcessedMessageState::Processed);
     }
 }

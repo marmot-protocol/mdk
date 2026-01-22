@@ -1515,12 +1515,25 @@ where
             sanitized_reason
         );
 
+        // Try to fetch existing record to preserve message_event_id and other context
+        let existing_record = self
+            .storage()
+            .find_processed_message_by_event_id(&event_id)
+            .ok()
+            .flatten();
+
+        let message_event_id = existing_record.as_ref().and_then(|r| r.message_event_id);
+        let mls_group_id = existing_record
+            .as_ref()
+            .and_then(|r| r.mls_group_id.clone());
+        let epoch = existing_record.as_ref().and_then(|r| r.epoch);
+
         let processed_message = message_types::ProcessedMessage {
             wrapper_event_id: event_id,
-            message_event_id: None,
+            message_event_id,
             processed_at: Timestamp::now(),
-            epoch: None,
-            mls_group_id: None,
+            epoch,
+            mls_group_id,
             state: message_types::ProcessedMessageState::Failed,
             failure_reason: Some(sanitized_reason.to_string()),
         };
@@ -1599,6 +1612,50 @@ where
                             .ok_or(Error::MessageNotFound)?;
                         Ok(MessageProcessingResult::ApplicationMessage(message))
                     }
+                    message_types::ProcessedMessageState::Retryable => {
+                        // Retryable messages are ones that previously failed due to wrong epoch keys
+                        // but have been marked for retry after a rollback. For our own messages,
+                        // we should have cached content - try to retrieve and return it.
+                        tracing::debug!(target: "mdk_core::messages::process_message", "Retrying own message after rollback");
+
+                        if let Some(message_event_id) = processed_message.message_event_id
+                            && let Ok(Some(mut message)) =
+                                self.get_message(&group.mls_group_id, &message_event_id)
+                        {
+                            // Update states to mark as successfully processed
+                            message.state = message_types::MessageState::Processed;
+                            self.storage()
+                                .save_message(message)
+                                .map_err(|e| Error::Message(e.to_string()))?;
+
+                            processed_message.state =
+                                message_types::ProcessedMessageState::Processed;
+                            processed_message.failure_reason = None;
+                            processed_message.processed_at = Timestamp::now();
+                            self.storage()
+                                .save_processed_message(processed_message.clone())
+                                .map_err(|e| Error::Message(e.to_string()))?;
+
+                            tracing::info!(
+                                target: "mdk_core::messages::process_message",
+                                "Successfully retried own cached message after rollback"
+                            );
+                            let message = self
+                                .get_message(&group.mls_group_id, &message_event_id)?
+                                .ok_or(Error::MessageNotFound)?;
+                            return Ok(MessageProcessingResult::ApplicationMessage(message));
+                        }
+
+                        // No cached content available - this shouldn't happen for our own messages,
+                        // but if it does, we can't recover
+                        tracing::warn!(
+                            target: "mdk_core::messages::process_message",
+                            "Retryable own message has no cached content - cannot recover"
+                        );
+                        Ok(MessageProcessingResult::Unprocessable {
+                            mls_group_id: group.mls_group_id.clone(),
+                        })
+                    }
                     message_types::ProcessedMessageState::ProcessedCommit => {
                         tracing::debug!(target: "mdk_core::messages::process_message", "Message already processed as a commit");
 
@@ -1667,6 +1724,21 @@ where
                                 .find_failed_messages_for_retry(&group.mls_group_id)
                                 .unwrap_or_default();
 
+                            // Mark these messages as Retryable so they can pass through
+                            // deduplication when the application re-fetches and reprocesses them
+                            for event_id in &messages_needing_refetch {
+                                if let Err(e) =
+                                    self.storage().mark_processed_message_retryable(event_id)
+                                {
+                                    tracing::warn!(
+                                        target: "mdk_core::messages::process_message",
+                                        "Failed to mark message {} as retryable: {}",
+                                        event_id,
+                                        e
+                                    );
+                                }
+                            }
+
                             if let Some(cb) = &self.callback {
                                 cb.on_rollback(&crate::RollbackInfo {
                                     group_id: group.mls_group_id.clone(),
@@ -1713,9 +1785,19 @@ where
 
                 // Not our own commit - this is a genuine error
                 tracing::error!(target: "mdk_core::messages::process_message", "Epoch mismatch for message that is not our own commit: {:?}", error);
+
+                // Try to fetch existing record to preserve message_event_id and other context
+                let existing_record = self
+                    .storage()
+                    .find_processed_message_by_event_id(&event.id)
+                    .ok()
+                    .flatten();
+
+                let message_event_id = existing_record.as_ref().and_then(|r| r.message_event_id);
+
                 let processed_message = message_types::ProcessedMessage {
                     wrapper_event_id: event.id,
-                    message_event_id: None,
+                    message_event_id,
                     processed_at: Timestamp::now(),
                     epoch: Some(group.epoch),
                     mls_group_id: Some(group.mls_group_id.clone()),
@@ -1755,9 +1837,19 @@ where
                 }
 
                 tracing::error!(target: "mdk_core::messages::process_message", "Epoch mismatch for message that is not our own commit: {:?}", error);
+
+                // Try to fetch existing record to preserve message_event_id and other context
+                let existing_record = self
+                    .storage()
+                    .find_processed_message_by_event_id(&event.id)
+                    .ok()
+                    .flatten();
+
+                let message_event_id = existing_record.as_ref().and_then(|r| r.message_event_id);
+
                 let processed_message = message_types::ProcessedMessage {
                     wrapper_event_id: event.id,
-                    message_event_id: None,
+                    message_event_id,
                     processed_at: Timestamp::now(),
                     epoch: Some(group.epoch),
                     mls_group_id: Some(group.mls_group_id.clone()),
@@ -1774,9 +1866,19 @@ where
             }
             Error::ProcessMessageWrongGroupId => {
                 tracing::error!(target: "mdk_core::messages::process_message", "Group ID mismatch: {:?}", error);
+
+                // Try to fetch existing record to preserve message_event_id and other context
+                let existing_record = self
+                    .storage()
+                    .find_processed_message_by_event_id(&event.id)
+                    .ok()
+                    .flatten();
+
+                let message_event_id = existing_record.as_ref().and_then(|r| r.message_event_id);
+
                 let processed_message = message_types::ProcessedMessage {
                     wrapper_event_id: event.id,
-                    message_event_id: None,
+                    message_event_id,
                     processed_at: Timestamp::now(),
                     epoch: Some(group.epoch),
                     mls_group_id: Some(group.mls_group_id.clone()),
@@ -1793,9 +1895,19 @@ where
             }
             Error::ProcessMessageUseAfterEviction => {
                 tracing::error!(target: "mdk_core::messages::process_message", "Attempted to use group after eviction: {:?}", error);
+
+                // Try to fetch existing record to preserve message_event_id and other context
+                let existing_record = self
+                    .storage()
+                    .find_processed_message_by_event_id(&event.id)
+                    .ok()
+                    .flatten();
+
+                let message_event_id = existing_record.as_ref().and_then(|r| r.message_event_id);
+
                 let processed_message = message_types::ProcessedMessage {
                     wrapper_event_id: event.id,
-                    message_event_id: None,
+                    message_event_id,
                     processed_at: Timestamp::now(),
                     epoch: Some(group.epoch),
                     mls_group_id: Some(group.mls_group_id.clone()),
@@ -1825,9 +1937,19 @@ where
             }
             _ => {
                 tracing::error!(target: "mdk_core::messages::process_message", "Unexpected error processing message: {:?}", error);
+
+                // Try to fetch existing record to preserve message_event_id and other context
+                let existing_record = self
+                    .storage()
+                    .find_processed_message_by_event_id(&event.id)
+                    .ok()
+                    .flatten();
+
+                let message_event_id = existing_record.as_ref().and_then(|r| r.message_event_id);
+
                 let processed_message = message_types::ProcessedMessage {
                     wrapper_event_id: event.id,
-                    message_event_id: None,
+                    message_event_id,
                     processed_at: Timestamp::now(),
                     epoch: Some(group.epoch),
                     mls_group_id: Some(group.mls_group_id.clone()),
@@ -2026,7 +2148,7 @@ where
                 processed.state
             );
 
-            // Only block reprocessing for Failed state
+            // Block reprocessing for Failed state
             // Other states (Created, Processed, ProcessedCommit) should continue
             // to allow normal message flow (e.g., processing own messages from relay)
             if processed.state == message_types::ProcessedMessageState::Failed {
@@ -2050,6 +2172,16 @@ where
                 };
 
                 return Ok(MessageProcessingResult::Unprocessable { mls_group_id });
+            }
+
+            // Allow Retryable messages to be reprocessed after rollback
+            if processed.state == message_types::ProcessedMessageState::Retryable {
+                tracing::info!(
+                    target: "mdk_core::messages::process_message",
+                    "Retrying previously failed message after rollback (event_id: {})",
+                    event.id
+                );
+                // Continue to processing - don't return early
             }
         }
 
@@ -8720,6 +8852,63 @@ mod tests {
             message_id,
             rollback_info.invalidated_messages,
             rollback_info.messages_needing_refetch
+        );
+    }
+
+    #[test]
+    fn test_save_failed_processed_message_preserves_message_event_id() {
+        let mdk = create_test_mdk();
+        let keys = Keys::generate();
+
+        // Create a test event
+        let event = EventBuilder::new(Kind::Metadata, "")
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        // Create a fake message event ID
+        let message_event_id =
+            EventId::from_hex("0000000000000000000000000000000000000000000000000000000000000001")
+                .unwrap();
+
+        // Manually save a Created state with message_event_id (simulating a message we created/sent)
+        let processed_message = message_types::ProcessedMessage {
+            wrapper_event_id: event.id,
+            message_event_id: Some(message_event_id),
+            processed_at: nostr::Timestamp::now(),
+            epoch: Some(123),
+            mls_group_id: Some(GroupId::from_slice(&[1, 2, 3, 4])),
+            state: message_types::ProcessedMessageState::Created,
+            failure_reason: None,
+        };
+        mdk.storage()
+            .save_processed_message(processed_message)
+            .unwrap();
+
+        // Now simulate a failure (e.g. decryption failed for own message)
+        let error = Error::CannotDecryptOwnMessage;
+        mdk.save_failed_processed_message(event.id, &error).unwrap();
+
+        // Verify the message_event_id is preserved
+        let updated_record = mdk
+            .storage()
+            .find_processed_message_by_event_id(&event.id)
+            .unwrap()
+            .expect("Record should exist");
+
+        assert_eq!(
+            updated_record.state,
+            message_types::ProcessedMessageState::Failed
+        );
+        assert_eq!(
+            updated_record.message_event_id,
+            Some(message_event_id),
+            "message_event_id should be preserved"
+        );
+        assert_eq!(updated_record.epoch, Some(123), "epoch should be preserved");
+        assert_eq!(
+            updated_record.mls_group_id,
+            Some(GroupId::from_slice(&[1, 2, 3, 4])),
+            "mls_group_id should be preserved"
         );
     }
 

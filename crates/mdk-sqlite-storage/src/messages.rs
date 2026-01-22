@@ -296,6 +296,25 @@ impl MessageStorage for MdkSqliteStorage {
             Ok(event_ids)
         })
     }
+
+    fn mark_processed_message_retryable(&self, event_id: &EventId) -> Result<(), MessageError> {
+        self.with_connection(|conn| {
+            // Only update messages that are currently in Failed state
+            let rows_affected = conn
+                .execute(
+                    "UPDATE processed_messages SET state = 'retryable'
+                     WHERE wrapper_event_id = ? AND state = 'failed'",
+                    params![event_id.to_bytes()],
+                )
+                .map_err(into_message_err)?;
+
+            if rows_affected == 0 {
+                return Err(MessageError::NotFound);
+            }
+
+            Ok(())
+        })
+    }
 }
 
 #[cfg(test)]
@@ -621,5 +640,102 @@ mod tests {
         let group_1_message = group_1_lookup.unwrap();
         assert_eq!(group_1_message.mls_group_id, mls_group_id_1);
         assert_eq!(group_1_message.content, "Message in group 1");
+    }
+
+    #[test]
+    fn test_mark_processed_message_retryable() {
+        let storage = MdkSqliteStorage::new_in_memory().unwrap();
+
+        // Create a failed processed message
+        let wrapper_event_id =
+            EventId::parse("3287abd422284bc3679812c373c52ed4aa0af4f7c57b9c63ec440f6c3ed6c3a2")
+                .unwrap();
+
+        let processed_message = ProcessedMessage {
+            wrapper_event_id,
+            message_event_id: None,
+            processed_at: Timestamp::from(1_000_000_000u64),
+            epoch: None,
+            mls_group_id: Some(GroupId::from_slice(&[1, 2, 3, 4])),
+            state: ProcessedMessageState::Failed,
+            failure_reason: Some("Decryption failed".to_string()),
+        };
+
+        // Save the failed processed message
+        storage
+            .save_processed_message(processed_message)
+            .expect("Failed to save processed message");
+
+        // Verify it's in Failed state
+        let found = storage
+            .find_processed_message_by_event_id(&wrapper_event_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.state, ProcessedMessageState::Failed);
+
+        // Mark as retryable
+        storage
+            .mark_processed_message_retryable(&wrapper_event_id)
+            .expect("Failed to mark message as retryable");
+
+        // Verify state changed to Retryable
+        let found = storage
+            .find_processed_message_by_event_id(&wrapper_event_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.state, ProcessedMessageState::Retryable);
+
+        // Verify failure_reason is preserved
+        assert_eq!(found.failure_reason, Some("Decryption failed".to_string()));
+    }
+
+    #[test]
+    fn test_mark_nonexistent_message_retryable_fails() {
+        let storage = MdkSqliteStorage::new_in_memory().unwrap();
+
+        let wrapper_event_id =
+            EventId::parse("3287abd422284bc3679812c373c52ed4aa0af4f7c57b9c63ec440f6c3ed6c3a2")
+                .unwrap();
+
+        // Attempt to mark a non-existent message as retryable
+        let result = storage.mark_processed_message_retryable(&wrapper_event_id);
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), MessageError::NotFound));
+    }
+
+    #[test]
+    fn test_mark_non_failed_message_retryable_fails() {
+        let storage = MdkSqliteStorage::new_in_memory().unwrap();
+
+        // Create a processed message in Processed state (not Failed)
+        let wrapper_event_id =
+            EventId::parse("3287abd422284bc3679812c373c52ed4aa0af4f7c57b9c63ec440f6c3ed6c3a2")
+                .unwrap();
+
+        let processed_message = ProcessedMessage {
+            wrapper_event_id,
+            message_event_id: None,
+            processed_at: Timestamp::from(1_000_000_000u64),
+            epoch: Some(1),
+            mls_group_id: Some(GroupId::from_slice(&[1, 2, 3, 4])),
+            state: ProcessedMessageState::Processed,
+            failure_reason: None,
+        };
+
+        storage
+            .save_processed_message(processed_message)
+            .expect("Failed to save processed message");
+
+        // Attempt to mark a Processed message as retryable should fail
+        let result = storage.mark_processed_message_retryable(&wrapper_event_id);
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), MessageError::NotFound));
+
+        // Verify state is unchanged
+        let found = storage
+            .find_processed_message_by_event_id(&wrapper_event_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.state, ProcessedMessageState::Processed);
     }
 }

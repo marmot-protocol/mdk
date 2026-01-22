@@ -139,6 +139,10 @@ pub enum ProcessedMessageState {
     Failed,
     /// The epoch was rolled back, message needs reprocessing
     EpochInvalidated,
+    /// The message previously failed but is now eligible for retry after a rollback.
+    /// This state is set by the rollback flow when group state has been corrected,
+    /// allowing messages that failed due to stale epoch keys to be reprocessed.
+    Retryable,
 }
 
 impl fmt::Display for ProcessedMessageState {
@@ -156,6 +160,7 @@ impl ProcessedMessageState {
             Self::ProcessedCommit => "processed_commit",
             Self::Failed => "failed",
             Self::EpochInvalidated => "epoch_invalidated",
+            Self::Retryable => "retryable",
         }
     }
 }
@@ -170,6 +175,7 @@ impl FromStr for ProcessedMessageState {
             "processed_commit" => Ok(Self::ProcessedCommit),
             "failed" => Ok(Self::Failed),
             "epoch_invalidated" => Ok(Self::EpochInvalidated),
+            "retryable" => Ok(Self::Retryable),
             _ => Err(MessageError::InvalidParameters(format!(
                 "Invalid processed message state: {}",
                 s
@@ -335,6 +341,10 @@ mod tests {
             ProcessedMessageState::from_str("epoch_invalidated").unwrap(),
             ProcessedMessageState::EpochInvalidated
         );
+        assert_eq!(
+            ProcessedMessageState::from_str("retryable").unwrap(),
+            ProcessedMessageState::Retryable
+        );
 
         let err = ProcessedMessageState::from_str("invalid").unwrap_err();
         match err {
@@ -358,6 +368,7 @@ mod tests {
             ProcessedMessageState::EpochInvalidated.to_string(),
             "epoch_invalidated"
         );
+        assert_eq!(ProcessedMessageState::Retryable.to_string(), "retryable");
     }
 
     #[test]
@@ -381,6 +392,10 @@ mod tests {
         let epoch_invalidated = ProcessedMessageState::EpochInvalidated;
         let serialized = serde_json::to_string(&epoch_invalidated).unwrap();
         assert_eq!(serialized, r#""epoch_invalidated""#);
+
+        let retryable = ProcessedMessageState::Retryable;
+        let serialized = serde_json::to_string(&retryable).unwrap();
+        assert_eq!(serialized, r#""retryable""#);
     }
 
     #[test]
@@ -401,6 +416,9 @@ mod tests {
         let epoch_invalidated: ProcessedMessageState =
             serde_json::from_str(r#""epoch_invalidated""#).unwrap();
         assert_eq!(epoch_invalidated, ProcessedMessageState::EpochInvalidated);
+
+        let retryable: ProcessedMessageState = serde_json::from_str(r#""retryable""#).unwrap();
+        assert_eq!(retryable, ProcessedMessageState::Retryable);
 
         // Test invalid state
         let result = serde_json::from_str::<ProcessedMessageState>(r#""invalid""#);

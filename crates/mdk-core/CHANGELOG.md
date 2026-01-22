@@ -25,6 +25,7 @@
 
 ### Added
 
+- **Message Retry Support**: Implemented better handling for retryable message states. When a message fails processing, it now preserves the `message_event_id` and other context. Added logic to allow reprocessing of messages marked as `Retryable`, with automatic state recovery to `Processed` upon success. ([#161](https://github.com/marmot-protocol/mdk/pull/161))
 - Configurable `out_of_order_tolerance` and `maximum_forward_distance` in `MdkConfig` for MLS sender ratchet settings. Default `out_of_order_tolerance` increased from 5 to 100 for better handling of out-of-order message delivery on Nostr relays. ([`#155`](https://github.com/marmot-protocol/mdk/pull/155))
 
 ### Breaking changes

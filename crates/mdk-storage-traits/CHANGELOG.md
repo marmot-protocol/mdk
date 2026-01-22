@@ -25,6 +25,10 @@
 
 ## Unreleased
 
+### Added
+
+- **Retryable Message State**: Added `Retryable` variant to `ProcessedMessageState` enum to support message retries after rollback or temporary failures. ([#161](https://github.com/marmot-protocol/mdk/pull/161))
+
 ### Breaking changes
 
 - **Snapshot API**: Added group-scoped snapshot management methods to `MdkStorageProvider` trait to support MIP-03 commit race resolution. Implementations must now provide: ([#152](https://github.com/marmot-protocol/mdk/pull/152))
