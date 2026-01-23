@@ -1618,32 +1618,42 @@ where
                         // we should have cached content - try to retrieve and return it.
                         tracing::debug!(target: "mdk_core::messages::process_message", "Retrying own message after rollback");
 
-                        if let Some(message_event_id) = processed_message.message_event_id
-                            && let Ok(Some(mut message)) =
-                                self.get_message(&group.mls_group_id, &message_event_id)
-                        {
-                            // Update states to mark as successfully processed
-                            message.state = message_types::MessageState::Processed;
-                            self.storage()
-                                .save_message(message)
-                                .map_err(|e| Error::Message(e.to_string()))?;
+                        if let Some(message_event_id) = processed_message.message_event_id {
+                            match self
+                                .get_message(&group.mls_group_id, &message_event_id)
+                                .map_err(|e| Error::Message(e.to_string()))?
+                            {
+                                Some(mut message) => {
+                                    // Update states to mark as successfully processed
+                                    message.state = message_types::MessageState::Processed;
+                                    self.storage()
+                                        .save_message(message)
+                                        .map_err(|e| Error::Message(e.to_string()))?;
 
-                            processed_message.state =
-                                message_types::ProcessedMessageState::Processed;
-                            processed_message.failure_reason = None;
-                            processed_message.processed_at = Timestamp::now();
-                            self.storage()
-                                .save_processed_message(processed_message.clone())
-                                .map_err(|e| Error::Message(e.to_string()))?;
+                                    processed_message.state =
+                                        message_types::ProcessedMessageState::Processed;
+                                    processed_message.failure_reason = None;
+                                    processed_message.processed_at = Timestamp::now();
+                                    self.storage()
+                                        .save_processed_message(processed_message.clone())
+                                        .map_err(|e| Error::Message(e.to_string()))?;
 
-                            tracing::info!(
-                                target: "mdk_core::messages::process_message",
-                                "Successfully retried own cached message after rollback"
-                            );
-                            let message = self
-                                .get_message(&group.mls_group_id, &message_event_id)?
-                                .ok_or(Error::MessageNotFound)?;
-                            return Ok(MessageProcessingResult::ApplicationMessage(message));
+                                    tracing::info!(
+                                        target: "mdk_core::messages::process_message",
+                                        "Successfully retried own cached message after rollback"
+                                    );
+                                    let message = self
+                                        .get_message(&group.mls_group_id, &message_event_id)
+                                        .map_err(|e| Error::Message(e.to_string()))?
+                                        .ok_or(Error::MessageNotFound)?;
+                                    return Ok(MessageProcessingResult::ApplicationMessage(
+                                        message,
+                                    ));
+                                }
+                                None => {
+                                    // No cached content available - fall through to Unprocessable
+                                }
+                            }
                         }
 
                         // No cached content available - this shouldn't happen for our own messages,
