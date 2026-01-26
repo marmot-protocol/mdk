@@ -318,7 +318,7 @@ end
 # - event_id: String (event ID, hex-encoded)
 # - sender_pubkey: String (sender public key, hex-encoded)
 # - event_json: String (JSON representation of the event)
-# - processed_at: Integer (timestamp when message was processed, Unix timestamp)
+# - created_at: Integer (timestamp when message was created, Unix timestamp)
 # - kind: Integer (message kind)
 # - state: String (message state, e.g., "processed", "pending")
 ```

@@ -1103,8 +1103,8 @@ pub struct Message {
     pub sender_pubkey: String,
     /// JSON representation of the event
     pub event_json: String,
-    /// Timestamp when message was processed (Unix timestamp)
-    pub processed_at: u64,
+    /// Timestamp when message was created (Unix timestamp)
+    pub created_at: u64,
     /// Message kind
     pub kind: u16,
     /// Message state (e.g., "processed", "pending")
@@ -1134,7 +1134,7 @@ impl From<message_types::Message> for Message {
             event_id: m.wrapper_event_id.to_hex(),
             sender_pubkey: m.pubkey.to_hex(),
             event_json,
-            processed_at: m.created_at.as_secs(),
+            created_at: m.created_at.as_secs(),
             kind: m.kind.as_u16(),
             state: m.state.as_str().to_string(),
         }
