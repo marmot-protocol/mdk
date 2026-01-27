@@ -45,20 +45,21 @@ where
 
     /// Records a failed message processing attempt to prevent reprocessing
     ///
-    /// This method saves a failed processing record with a sanitized error reason.
-    /// If `group` is provided, epoch and group_id are taken from it.
-    /// Otherwise, falls back to any existing record's context.
+    /// Saves a failed processing record with a sanitized error reason.
+    /// Falls back to any existing record's context for fields not provided.
     ///
     /// # Arguments
     ///
     /// * `event_id` - The event ID of the failed message
     /// * `error` - The error that caused the failure (will be sanitized for storage)
-    /// * `group` - Optional group context for epoch/group_id
+    /// * `mls_group_id` - Optional group ID for retry tracking
+    /// * `epoch` - Optional epoch (pass None for decryption failures where epoch is unknown)
     pub(super) fn record_failure(
         &self,
         event_id: EventId,
         error: &Error,
-        group: Option<&group_types::Group>,
+        mls_group_id: Option<&GroupId>,
+        epoch: Option<u64>,
     ) -> Result<()> {
         let sanitized_reason = Self::sanitize_error_reason(error);
 
@@ -69,7 +70,7 @@ where
             sanitized_reason
         );
 
-        // Try to fetch existing record to preserve message_event_id and other context
+        // Try to fetch existing record to preserve message_event_id
         let existing_record = match self.storage().find_processed_message_by_event_id(&event_id) {
             Ok(record) => record,
             Err(_e) => {
@@ -81,18 +82,13 @@ where
             }
         };
 
+        // Preserve message_event_id from existing record
+        // Use provided epoch/mls_group_id, falling back to existing record
         let message_event_id = existing_record.as_ref().and_then(|r| r.message_event_id);
-
-        // Use group context if provided, otherwise fallback to existing record
-        let (epoch, mls_group_id) = match group {
-            Some(g) => (Some(g.epoch), Some(g.mls_group_id.clone())),
-            None => (
-                existing_record.as_ref().and_then(|r| r.epoch),
-                existing_record
-                    .as_ref()
-                    .and_then(|r| r.mls_group_id.clone()),
-            ),
-        };
+        let epoch = epoch.or_else(|| existing_record.as_ref().and_then(|r| r.epoch));
+        let mls_group_id = mls_group_id
+            .cloned()
+            .or_else(|| existing_record.and_then(|r| r.mls_group_id));
 
         let processed_message = super::create_processed_message_record(
             event_id,
@@ -117,7 +113,12 @@ where
         error: &Error,
         group: &group_types::Group,
     ) -> Result<MessageProcessingResult> {
-        self.record_failure(event_id, error, Some(group))?;
+        self.record_failure(
+            event_id,
+            error,
+            Some(&group.mls_group_id),
+            Some(group.epoch),
+        )?;
 
         Ok(MessageProcessingResult::Unprocessable {
             mls_group_id: group.mls_group_id.clone(),
@@ -398,7 +399,12 @@ where
             Error::CommitFromNonAdmin => {
                 // Authorization errors should propagate as errors, not be silently swallowed
                 // Save a failed processing record to prevent reprocessing (best-effort)
-                if let Err(_save_err) = self.record_failure(event.id, &error, Some(group)) {
+                if let Err(_save_err) = self.record_failure(
+                    event.id,
+                    &error,
+                    Some(&group.mls_group_id),
+                    Some(group.epoch),
+                ) {
                     tracing::warn!(
                         target: "mdk_core::messages::handle_processing_error",
                         "Failed to persist failure record for commit from non-admin"
@@ -1032,7 +1038,7 @@ mod tests {
 
         // Now simulate a failure (e.g. decryption failed for own message)
         let error = Error::CannotDecryptOwnMessage;
-        mdk.record_failure(event.id, &error, None).unwrap();
+        mdk.record_failure(event.id, &error, None, None).unwrap();
 
         // Verify the message_event_id is preserved
         let updated_record = mdk
@@ -1055,6 +1061,218 @@ mod tests {
             updated_record.mls_group_id,
             Some(GroupId::from_slice(&[1, 2, 3, 4])),
             "mls_group_id should be preserved"
+        );
+    }
+
+    /// Test: Commit race recovery - rollback should enable retry of failed messages
+    ///
+    /// This test reproduces a realistic commit race scenario and verifies that
+    /// the rollback mechanism correctly recovers failed messages:
+    ///
+    /// ```text
+    /// Timeline:
+    ///   1. Alice, Bob, and Charlie are in a group at epoch 1
+    ///   2. Both Alice and Bob create commits simultaneously (race condition)
+    ///   3. Charlie receives and applies Alice's commit first → epoch 2 (Alice's keys)
+    ///   4. A message encrypted with Bob's epoch 2 keys arrives at Charlie
+    ///   5. Charlie cannot decrypt it (has Alice's keys, not Bob's) → FAILS
+    ///   6. Bob's commit arrives - it's "better" (earlier timestamp per MIP-03) → ROLLBACK
+    ///   7. Charlie retries the failed message → SUCCESS
+    /// ```
+    #[test]
+    fn test_commit_race_rollback_enables_message_retry() {
+        // =========================================================================
+        // SETUP: Create a 3-member group (Alice admin, Bob admin, Charlie member)
+        //
+        // We need 3 members because:
+        // - Alice and Bob will race to create commits
+        // - Charlie is the observer who processes messages in a specific order
+        // =========================================================================
+        let alice_keys = Keys::generate();
+        let bob_keys = Keys::generate();
+        let charlie_keys = Keys::generate();
+
+        let alice_mdk = create_test_mdk();
+        let bob_mdk = create_test_mdk();
+        let charlie_mdk = create_test_mdk();
+
+        // Create key packages for Bob and Charlie
+        let bob_key_package = create_key_package_event(&bob_mdk, &bob_keys);
+        let charlie_key_package = create_key_package_event(&charlie_mdk, &charlie_keys);
+
+        // Alice creates group with Bob and Charlie as members
+        // Both Alice and Bob are admins (so both can create commits)
+        let admin_pubkeys = vec![alice_keys.public_key(), bob_keys.public_key()];
+        let config = create_nostr_group_config_data(admin_pubkeys);
+
+        let create_result = alice_mdk
+            .create_group(
+                &alice_keys.public_key(),
+                vec![bob_key_package, charlie_key_package],
+                config,
+            )
+            .expect("Alice should create group");
+
+        let group_id = create_result.group.mls_group_id.clone();
+
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("Alice should merge create commit");
+
+        // Bob joins via welcome
+        let bob_welcome = bob_mdk
+            .process_welcome(&EventId::all_zeros(), &create_result.welcome_rumors[0])
+            .expect("Bob should process welcome");
+        bob_mdk
+            .accept_welcome(&bob_welcome)
+            .expect("Bob should accept welcome");
+
+        // Charlie joins via welcome
+        let charlie_welcome = charlie_mdk
+            .process_welcome(&EventId::all_zeros(), &create_result.welcome_rumors[1])
+            .expect("Charlie should process welcome");
+        charlie_mdk
+            .accept_welcome(&charlie_welcome)
+            .expect("Charlie should accept welcome");
+
+        // Verify all are at epoch 1
+        let initial_epoch = alice_mdk.get_group(&group_id).unwrap().unwrap().epoch;
+        assert_eq!(initial_epoch, 1, "All should start at epoch 1");
+
+        // =========================================================================
+        // STEP 1: COMMIT RACE - Alice and Bob both create commits
+        //
+        // In the real world, this happens when both admins try to update the
+        // group simultaneously (e.g., both adding a member, both doing self-update).
+        // Each commit produces different epoch keys.
+        //
+        // Per MIP-03, the commit with the EARLIEST timestamp wins. So we create
+        // Bob's commit first (he will be the "winner"), then Alice's commit second.
+        // Charlie will apply Alice's commit first (simulating out-of-order delivery),
+        // then when Bob's commit arrives, it should trigger a rollback.
+        // =========================================================================
+
+        // Bob creates a self-update commit FIRST (earlier timestamp = winner)
+        let bob_commit_result = bob_mdk
+            .self_update(&group_id)
+            .expect("Bob should create self-update");
+        let bob_commit_event = bob_commit_result.evolution_event.clone();
+
+        // Wait to ensure distinct timestamps (MIP-03 uses created_at for ordering)
+        std::thread::sleep(std::time::Duration::from_secs(2));
+
+        // Alice creates a self-update commit SECOND (later timestamp = loser)
+        // Both commits are based on epoch 1, but Alice's has a later timestamp
+        let alice_commit_result = alice_mdk
+            .self_update(&group_id)
+            .expect("Alice should create self-update");
+        let alice_commit_event = alice_commit_result.evolution_event.clone();
+
+        // Bob merges his own commit and sends a message with his new epoch 2 keys
+        bob_mdk
+            .merge_pending_commit(&group_id)
+            .expect("Bob should merge his commit");
+
+        let bob_message_rumor = create_test_rumor(&bob_keys, "Message from Bob after his commit");
+        let bob_message_event = bob_mdk
+            .create_message(&group_id, bob_message_rumor)
+            .expect("Bob should create message with his epoch 2 keys");
+
+        // =========================================================================
+        // STEP 2: Charlie applies ALICE's commit first (wrong order)
+        //
+        // Charlie receives Alice's commit first and applies it.
+        // Now Charlie has epoch 2 with ALICE's keys.
+        // =========================================================================
+        charlie_mdk
+            .process_message(&alice_commit_event)
+            .expect("Charlie should process Alice's commit");
+
+        let charlie_epoch = charlie_mdk.get_group(&group_id).unwrap().unwrap().epoch;
+        assert_eq!(charlie_epoch, 2, "Charlie should be at epoch 2 (Alice's)");
+
+        // =========================================================================
+        // STEP 3: Bob's message arrives - Charlie CANNOT decrypt it
+        //
+        // Bob's message was encrypted with BOB's epoch 2 keys.
+        // Charlie has ALICE's epoch 2 keys.
+        // Decryption fails and the message is recorded as Failed.
+        // =========================================================================
+        let decrypt_result = charlie_mdk.process_message(&bob_message_event);
+        assert!(
+            decrypt_result.is_err(),
+            "Charlie should fail to decrypt Bob's message (wrong epoch keys)"
+        );
+
+        // Verify the message is in Failed state
+        let failed_record = charlie_mdk
+            .storage()
+            .find_processed_message_by_event_id(&bob_message_event.id)
+            .expect("Storage should not error")
+            .expect("Failed record should exist");
+
+        assert_eq!(
+            failed_record.state,
+            message_types::ProcessedMessageState::Failed,
+            "Bob's message should be in Failed state"
+        );
+
+        // =========================================================================
+        // STEP 4: Bob's commit arrives - it's "better" so Charlie should ROLLBACK
+        //
+        // Bob's commit has an earlier timestamp (MIP-03 ordering), so when Charlie
+        // processes it, the rollback mechanism should:
+        // 1. Detect Bob's commit is "better" than Alice's
+        // 2. Restore group state to epoch 1
+        // 3. Find failed messages via find_failed_messages_for_retry (internal)
+        // 4. Mark them as Retryable
+        // 5. Apply Bob's commit
+        // =========================================================================
+        let rollback_result = charlie_mdk.process_message(&bob_commit_event);
+        assert!(
+            rollback_result.is_ok(),
+            "Charlie should successfully process Bob's commit (triggering rollback): {:?}",
+            rollback_result.err()
+        );
+
+        // =========================================================================
+        // STEP 5: Retry the message - should now succeed
+        //
+        // After rollback, Charlie has Bob's epoch 2 keys. The rollback mechanism
+        // should have marked the failed message as Retryable, allowing it to pass
+        // through deduplication and be decrypted successfully.
+        // =========================================================================
+
+        // Check the message state before retry
+        let pre_retry_record = charlie_mdk
+            .storage()
+            .find_processed_message_by_event_id(&bob_message_event.id)
+            .expect("Storage should not error")
+            .expect("Record should exist");
+
+        assert_eq!(
+            pre_retry_record.state,
+            message_types::ProcessedMessageState::Retryable,
+            "After rollback, Bob's message should be marked as Retryable so it can be reprocessed"
+        );
+
+        let retry_result = charlie_mdk.process_message(&bob_message_event);
+        assert!(
+            retry_result.is_ok(),
+            "After rollback, Charlie should successfully decrypt Bob's message: {:?}",
+            retry_result.err()
+        );
+
+        // Verify Charlie received Bob's message
+        let charlie_messages = charlie_mdk
+            .get_messages(&group_id, None)
+            .expect("Should get messages");
+
+        assert!(
+            charlie_messages
+                .iter()
+                .any(|m| m.content.contains("Message from Bob")),
+            "Charlie should have Bob's message after retry"
         );
     }
 }

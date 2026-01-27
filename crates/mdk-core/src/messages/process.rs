@@ -325,7 +325,7 @@ where
             Err(e) => {
                 // Save failed processing record to prevent reprocessing
                 // Don't fail if we can't save the failure record - log and continue
-                if let Err(_save_err) = self.record_failure(event.id, &e, None) {
+                if let Err(_save_err) = self.record_failure(event.id, &e, None, None) {
                     tracing::warn!(
                         target: "mdk_core::messages::process_message",
                         "Failed to persist failure record; error details redacted"
@@ -342,7 +342,20 @@ where
                 Err(e) => {
                     // Save failed processing record to prevent reprocessing
                     // Don't fail if we can't save the failure record - log and continue
-                    if let Err(_save_err) = self.record_failure(event.id, &e, None) {
+                    //
+                    // For decryption failures, we look up the group to get mls_group_id for
+                    // retry tracking, but we pass epoch=None because we don't know what
+                    // epoch the message was encrypted for. Messages with epoch=None and
+                    // state=Failed are candidates for retry after rollback.
+                    let mls_group_id = self
+                        .storage()
+                        .find_group_by_nostr_group_id(&nostr_group_id)
+                        .ok()
+                        .flatten()
+                        .map(|g| g.mls_group_id);
+                    if let Err(_save_err) =
+                        self.record_failure(event.id, &e, mls_group_id.as_ref(), None)
+                    {
                         tracing::warn!(
                             target: "mdk_core::messages::process_message",
                             "Failed to persist failure record; error details redacted"
