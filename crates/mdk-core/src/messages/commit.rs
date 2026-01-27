@@ -127,7 +127,6 @@ where
     ) -> Result<()> {
         tracing::info!(
             target: "mdk_core::messages::process_commit",
-            group_id = %hex::encode(group_id.as_slice()),
             "Local member was removed from group, setting group state to Inactive"
         );
 
@@ -141,7 +140,6 @@ where
             None => {
                 tracing::warn!(
                     target: "mdk_core::messages::process_commit",
-                    group_id = %hex::encode(group_id.as_slice()),
                     "Group not found in storage while handling eviction"
                 );
                 None

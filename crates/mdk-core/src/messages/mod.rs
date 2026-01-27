@@ -20,6 +20,224 @@ mod process;
 mod proposal;
 mod validation;
 
+use mdk_storage_traits::groups::Pagination;
+use mdk_storage_traits::groups::types as group_types;
+use mdk_storage_traits::messages::types as message_types;
+use mdk_storage_traits::{GroupId, MdkStorageProvider};
+use nostr::{EventId, Timestamp};
+
+use crate::MDK;
+use crate::error::Error;
+use crate::groups::UpdateGroupResult;
+
+// Internal Result type alias for this module
+pub(crate) type Result<T> = std::result::Result<T, Error>;
+
+// =============================================================================
+// Helper Functions for ProcessedMessage Creation
+// =============================================================================
+
+/// Creates a ProcessedMessage record with common defaults
+///
+/// This helper reduces boilerplate across the many places that create
+/// ProcessedMessage records. The `processed_at` timestamp is automatically
+/// set to the current time.
+pub(crate) fn create_processed_message_record(
+    wrapper_event_id: EventId,
+    message_event_id: Option<EventId>,
+    epoch: Option<u64>,
+    mls_group_id: Option<GroupId>,
+    state: message_types::ProcessedMessageState,
+    failure_reason: Option<String>,
+) -> message_types::ProcessedMessage {
+    message_types::ProcessedMessage {
+        wrapper_event_id,
+        message_event_id,
+        processed_at: Timestamp::now(),
+        epoch,
+        mls_group_id,
+        state,
+        failure_reason,
+    }
+}
+
+/// Default number of epochs to look back when trying to decrypt messages with older exporter secrets
+pub(crate) const DEFAULT_EPOCH_LOOKBACK: u64 = 5;
+
+/// MessageProcessingResult covers the full spectrum of responses that we can get back from attempting to process a message
+pub enum MessageProcessingResult {
+    /// An application message (this is usually a message in a chat)
+    ApplicationMessage(message_types::Message),
+    /// Proposal message that was auto-committed (self-remove proposals when receiver is admin)
+    Proposal(UpdateGroupResult),
+    /// Pending proposal message stored but not committed
+    ///
+    /// For add/remove member proposals, these are always stored as pending so that
+    /// admins can approve them through a manual commit. For self-remove (leave) proposals,
+    /// these are stored as pending when the receiver is not an admin.
+    PendingProposal {
+        /// The MLS group ID this pending proposal belongs to
+        mls_group_id: GroupId,
+    },
+    /// Proposal was ignored and not stored
+    ///
+    /// This occurs for proposals that should not be processed, such as:
+    /// - Extension/ciphersuite change proposals (admins should create commits directly)
+    /// - Other unsupported proposal types
+    IgnoredProposal {
+        /// The MLS group ID this proposal was for
+        mls_group_id: GroupId,
+        /// Reason the proposal was ignored
+        reason: String,
+    },
+    /// External Join Proposal
+    ExternalJoinProposal {
+        /// The MLS group ID this proposal belongs to
+        mls_group_id: GroupId,
+    },
+    /// Commit message
+    Commit {
+        /// The MLS group ID this commit applies to
+        mls_group_id: GroupId,
+    },
+    /// Unprocessable message
+    Unprocessable {
+        /// The MLS group ID of the message that could not be processed
+        mls_group_id: GroupId,
+    },
+}
+
+impl std::fmt::Debug for MessageProcessingResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ApplicationMessage(msg) => {
+                f.debug_tuple("ApplicationMessage").field(msg).finish()
+            }
+            Self::Proposal(result) => f.debug_tuple("Proposal").field(result).finish(),
+            Self::PendingProposal { .. } => f
+                .debug_struct("PendingProposal")
+                .field("mls_group_id", &"[REDACTED]")
+                .finish(),
+            Self::IgnoredProposal { reason, .. } => f
+                .debug_struct("IgnoredProposal")
+                .field("mls_group_id", &"[REDACTED]")
+                .field("reason", reason)
+                .finish(),
+            Self::ExternalJoinProposal { .. } => f
+                .debug_struct("ExternalJoinProposal")
+                .field("mls_group_id", &"[REDACTED]")
+                .finish(),
+            Self::Commit { .. } => f
+                .debug_struct("Commit")
+                .field("mls_group_id", &"[REDACTED]")
+                .finish(),
+            Self::Unprocessable { .. } => f
+                .debug_struct("Unprocessable")
+                .field("mls_group_id", &"[REDACTED]")
+                .finish(),
+        }
+    }
+}
+
+impl<Storage> MDK<Storage>
+where
+    Storage: MdkStorageProvider,
+{
+    /// Retrieves a message by its Nostr event ID within a specific group
+    ///
+    /// This function looks up a message in storage using its associated Nostr event ID
+    /// and MLS group ID. The message must have been previously processed and stored.
+    /// Requiring both the event ID and group ID prevents messages from different groups
+    /// from overwriting each other.
+    ///
+    /// # Arguments
+    ///
+    /// * `mls_group_id` - The MLS group ID the message belongs to
+    /// * `event_id` - The Nostr event ID to look up
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(Some(Message))` - The message if found
+    /// * `Ok(None)` - If no message exists with the given event ID in the specified group
+    /// * `Err(Error)` - If there is an error accessing storage
+    pub fn get_message(
+        &self,
+        mls_group_id: &GroupId,
+        event_id: &EventId,
+    ) -> Result<Option<message_types::Message>> {
+        self.storage()
+            .find_message_by_event_id(mls_group_id, event_id)
+            .map_err(|e| Error::Message(e.to_string()))
+    }
+
+    /// Retrieves messages for a specific MLS group with optional pagination
+    ///
+    /// This function returns messages that have been processed and stored for a group,
+    /// ordered by creation time (descending). If no pagination is specified, uses default
+    /// pagination (1000 messages, offset 0).
+    ///
+    /// # Arguments
+    ///
+    /// * `mls_group_id` - The MLS group ID to get messages for
+    /// * `pagination` - Optional pagination parameters. If `None`, uses default limit and offset.
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(Vec<Message>)` - List of messages for the group (up to limit)
+    /// * `Err(Error)` - If there is an error accessing storage
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// // Get messages with default pagination (1000 messages, offset 0)
+    /// let messages = mdk.get_messages(&group_id, None)?;
+    ///
+    /// // Get first 100 messages
+    /// use mdk_storage_traits::groups::Pagination;
+    /// let messages = mdk.get_messages(&group_id, Some(Pagination::new(Some(100), Some(0))))?;
+    ///
+    /// // Get next 100 messages
+    /// let messages = mdk.get_messages(&group_id, Some(Pagination::new(Some(100), Some(100))))?;
+    /// ```
+    pub fn get_messages(
+        &self,
+        mls_group_id: &GroupId,
+        pagination: Option<Pagination>,
+    ) -> Result<Vec<message_types::Message>> {
+        self.storage()
+            .messages(mls_group_id, pagination)
+            .map_err(|e| Error::Message(e.to_string()))
+    }
+
+    // =========================================================================
+    // Storage Save Helpers
+    // =========================================================================
+
+    /// Saves a message record to storage with standardized error handling
+    pub(crate) fn save_message_record(&self, message: message_types::Message) -> Result<()> {
+        self.storage()
+            .save_message(message)
+            .map_err(|e| Error::Message(e.to_string()))
+    }
+
+    /// Saves a processed message record to storage with standardized error handling
+    pub(crate) fn save_processed_message_record(
+        &self,
+        processed_message: message_types::ProcessedMessage,
+    ) -> Result<()> {
+        self.storage()
+            .save_processed_message(processed_message)
+            .map_err(|e| Error::Message(e.to_string()))
+    }
+
+    /// Saves a group record to storage with standardized error handling
+    pub(crate) fn save_group_record(&self, group: group_types::Group) -> Result<()> {
+        self.storage()
+            .save_group(group)
+            .map_err(|e| Error::Group(e.to_string()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
@@ -178,192 +396,5 @@ mod tests {
             result.unwrap().is_none(),
             "Should return None for non-existent message"
         );
-    }
-}
-
-use mdk_storage_traits::groups::Pagination;
-use mdk_storage_traits::groups::types as group_types;
-use mdk_storage_traits::messages::types as message_types;
-use mdk_storage_traits::{GroupId, MdkStorageProvider};
-use nostr::{EventId, Timestamp};
-
-use crate::MDK;
-use crate::error::Error;
-use crate::groups::UpdateGroupResult;
-
-// Internal Result type alias for this module
-pub(crate) type Result<T> = std::result::Result<T, Error>;
-
-// =============================================================================
-// Helper Functions for ProcessedMessage Creation
-// =============================================================================
-
-/// Creates a ProcessedMessage record with common defaults
-///
-/// This helper reduces boilerplate across the many places that create
-/// ProcessedMessage records. The `processed_at` timestamp is automatically
-/// set to the current time.
-pub(crate) fn create_processed_message_record(
-    wrapper_event_id: EventId,
-    message_event_id: Option<EventId>,
-    epoch: Option<u64>,
-    mls_group_id: Option<GroupId>,
-    state: message_types::ProcessedMessageState,
-    failure_reason: Option<String>,
-) -> message_types::ProcessedMessage {
-    message_types::ProcessedMessage {
-        wrapper_event_id,
-        message_event_id,
-        processed_at: Timestamp::now(),
-        epoch,
-        mls_group_id,
-        state,
-        failure_reason,
-    }
-}
-
-/// Default number of epochs to look back when trying to decrypt messages with older exporter secrets
-pub(crate) const DEFAULT_EPOCH_LOOKBACK: u64 = 5;
-
-/// MessageProcessingResult covers the full spectrum of responses that we can get back from attempting to process a message
-#[derive(Debug)]
-pub enum MessageProcessingResult {
-    /// An application message (this is usually a message in a chat)
-    ApplicationMessage(message_types::Message),
-    /// Proposal message that was auto-committed (self-remove proposals when receiver is admin)
-    Proposal(UpdateGroupResult),
-    /// Pending proposal message stored but not committed
-    ///
-    /// For add/remove member proposals, these are always stored as pending so that
-    /// admins can approve them through a manual commit. For self-remove (leave) proposals,
-    /// these are stored as pending when the receiver is not an admin.
-    PendingProposal {
-        /// The MLS group ID this pending proposal belongs to
-        mls_group_id: GroupId,
-    },
-    /// Proposal was ignored and not stored
-    ///
-    /// This occurs for proposals that should not be processed, such as:
-    /// - Extension/ciphersuite change proposals (admins should create commits directly)
-    /// - Other unsupported proposal types
-    IgnoredProposal {
-        /// The MLS group ID this proposal was for
-        mls_group_id: GroupId,
-        /// Reason the proposal was ignored
-        reason: String,
-    },
-    /// External Join Proposal
-    ExternalJoinProposal {
-        /// The MLS group ID this proposal belongs to
-        mls_group_id: GroupId,
-    },
-    /// Commit message
-    Commit {
-        /// The MLS group ID this commit applies to
-        mls_group_id: GroupId,
-    },
-    /// Unprocessable message
-    Unprocessable {
-        /// The MLS group ID of the message that could not be processed
-        mls_group_id: GroupId,
-    },
-}
-
-impl<Storage> MDK<Storage>
-where
-    Storage: MdkStorageProvider,
-{
-    /// Retrieves a message by its Nostr event ID within a specific group
-    ///
-    /// This function looks up a message in storage using its associated Nostr event ID
-    /// and MLS group ID. The message must have been previously processed and stored.
-    /// Requiring both the event ID and group ID prevents messages from different groups
-    /// from overwriting each other.
-    ///
-    /// # Arguments
-    ///
-    /// * `mls_group_id` - The MLS group ID the message belongs to
-    /// * `event_id` - The Nostr event ID to look up
-    ///
-    /// # Returns
-    ///
-    /// * `Ok(Some(Message))` - The message if found
-    /// * `Ok(None)` - If no message exists with the given event ID in the specified group
-    /// * `Err(Error)` - If there is an error accessing storage
-    pub fn get_message(
-        &self,
-        mls_group_id: &GroupId,
-        event_id: &EventId,
-    ) -> Result<Option<message_types::Message>> {
-        self.storage()
-            .find_message_by_event_id(mls_group_id, event_id)
-            .map_err(|e| Error::Message(e.to_string()))
-    }
-
-    /// Retrieves messages for a specific MLS group with optional pagination
-    ///
-    /// This function returns messages that have been processed and stored for a group,
-    /// ordered by creation time (descending). If no pagination is specified, uses default
-    /// pagination (1000 messages, offset 0).
-    ///
-    /// # Arguments
-    ///
-    /// * `mls_group_id` - The MLS group ID to get messages for
-    /// * `pagination` - Optional pagination parameters. If `None`, uses default limit and offset.
-    ///
-    /// # Returns
-    ///
-    /// * `Ok(Vec<Message>)` - List of messages for the group (up to limit)
-    /// * `Err(Error)` - If there is an error accessing storage
-    ///
-    /// # Examples
-    ///
-    /// ```ignore
-    /// // Get messages with default pagination (1000 messages, offset 0)
-    /// let messages = mdk.get_messages(&group_id, None)?;
-    ///
-    /// // Get first 100 messages
-    /// use mdk_storage_traits::groups::Pagination;
-    /// let messages = mdk.get_messages(&group_id, Some(Pagination::new(Some(100), Some(0))))?;
-    ///
-    /// // Get next 100 messages
-    /// let messages = mdk.get_messages(&group_id, Some(Pagination::new(Some(100), Some(100))))?;
-    /// ```
-    pub fn get_messages(
-        &self,
-        mls_group_id: &GroupId,
-        pagination: Option<Pagination>,
-    ) -> Result<Vec<message_types::Message>> {
-        self.storage()
-            .messages(mls_group_id, pagination)
-            .map_err(|e| Error::Message(e.to_string()))
-    }
-
-    // =========================================================================
-    // Storage Save Helpers
-    // =========================================================================
-
-    /// Saves a message record to storage with standardized error handling
-    pub(crate) fn save_message_record(&self, message: message_types::Message) -> Result<()> {
-        self.storage()
-            .save_message(message)
-            .map_err(|e| Error::Message(e.to_string()))
-    }
-
-    /// Saves a processed message record to storage with standardized error handling
-    pub(crate) fn save_processed_message_record(
-        &self,
-        processed_message: message_types::ProcessedMessage,
-    ) -> Result<()> {
-        self.storage()
-            .save_processed_message(processed_message)
-            .map_err(|e| Error::Message(e.to_string()))
-    }
-
-    /// Saves a group record to storage with standardized error handling
-    pub(crate) fn save_group_record(&self, group: group_types::Group) -> Result<()> {
-        self.storage()
-            .save_group(group)
-            .map_err(|e| Error::Group(e.to_string()))
     }
 }

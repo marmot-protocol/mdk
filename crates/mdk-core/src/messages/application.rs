@@ -85,8 +85,10 @@ where
         group.last_message_id = Some(message.id);
         self.save_group_record(group)?;
 
-        tracing::debug!(target: "mdk_core::messages::process_message", "Processed message: {:?}", processed_message);
-        tracing::debug!(target: "mdk_core::messages::process_message", "Message: {:?}", message);
+        tracing::debug!(
+            target: "mdk_core::messages::process_message",
+            "Processed application message"
+        );
         Ok(message)
     }
 }

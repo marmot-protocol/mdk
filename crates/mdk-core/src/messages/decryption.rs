@@ -92,9 +92,8 @@ where
         for epoch in (end_epoch..=start_epoch).rev() {
             tracing::debug!(
                 target: "mdk_core::messages::try_decrypt_with_past_epochs",
-                "Trying to decrypt with epoch {} for group {:?}",
-                epoch,
-                group_id
+                "Trying to decrypt with epoch {}",
+                epoch
             );
 
             // Try to get the exporter secret for this epoch
@@ -108,9 +107,8 @@ where
                     Ok(decrypted_bytes) => {
                         tracing::debug!(
                             target: "mdk_core::messages::try_decrypt_with_past_epochs",
-                            "Successfully decrypted message with epoch {} for group {:?}",
-                            epoch,
-                            group_id
+                            "Successfully decrypted message with epoch {}",
+                            epoch
                         );
                         return Ok(decrypted_bytes);
                     }
@@ -127,16 +125,15 @@ where
             } else {
                 tracing::trace!(
                     target: "mdk_core::messages::try_decrypt_with_past_epochs",
-                    "No exporter secret found for epoch {} in group {:?}",
-                    epoch,
-                    group_id
+                    "No exporter secret found for epoch {}",
+                    epoch
                 );
             }
         }
 
         Err(Error::Message(format!(
-            "Failed to decrypt message with any exporter secret from epochs {} to {} for group {:?}",
-            end_epoch, start_epoch, group_id
+            "Failed to decrypt message with any exporter secret from epochs {} to {}",
+            end_epoch, start_epoch
         )))
     }
 
@@ -152,10 +149,7 @@ where
         // Try to decrypt it for the current epoch
         match util::decrypt_with_exporter_secret(&secret, encrypted_content) {
             Ok(decrypted_bytes) => {
-                tracing::debug!(
-                    "Successfully decrypted message with current exporter secret for group {:?}",
-                    mls_group.group_id()
-                );
+                tracing::debug!("Successfully decrypted message with current exporter secret");
                 Ok(decrypted_bytes)
             }
             // Decryption failed using the current epoch exporter secret

@@ -69,8 +69,7 @@ where
 
                                 tracing::debug!(
                                     target: "mdk_core::messages::process_proposal",
-                                    "Stored Add proposal as pending for admin approval in group {:?}",
-                                    group_id
+                                    "Stored Add proposal as pending for admin approval"
                                 );
 
                                 Ok(MessageProcessingResult::PendingProposal {
@@ -103,14 +102,12 @@ where
                                     if is_self_remove {
                                         tracing::debug!(
                                             target: "mdk_core::messages::process_proposal",
-                                            "Non-admin receiver stored self-remove proposal as pending for group {:?}",
-                                            group_id
+                                            "Non-admin receiver stored self-remove proposal as pending"
                                         );
                                     } else {
                                         tracing::debug!(
                                             target: "mdk_core::messages::process_proposal",
-                                            "Stored Remove proposal as pending for admin approval in group {:?}",
-                                            group_id
+                                            "Stored Remove proposal as pending for admin approval"
                                         );
                                     }
 
@@ -265,8 +262,7 @@ where
 
         tracing::debug!(
             target: "mdk_core::messages::process_proposal",
-            "Admin auto-committed self-remove proposal for group {:?}",
-            group_id
+            "Admin auto-committed self-remove proposal"
         );
 
         Ok(MessageProcessingResult::Proposal(UpdateGroupResult {

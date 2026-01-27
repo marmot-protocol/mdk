@@ -37,6 +37,7 @@ struct Message {
 ```
 
 **MessageState values:**
+
 | State | Meaning |
 |-------|---------|
 | `Created` | We sent this message; not yet confirmed by relay |
@@ -61,6 +62,7 @@ struct ProcessedMessage {
 ```
 
 **ProcessedMessageState values:**
+
 | State | Meaning |
 |-------|---------|
 | `Created` | We sent this; awaiting relay confirmation |
@@ -78,7 +80,7 @@ struct ProcessedMessage {
 
 When we create and send a message:
 
-```
+```text
 ┌─────────────────────────────────────────────────────────────────┐
 │                      create_message()                           │
 │                                                                 │
@@ -130,7 +132,7 @@ When we create and send a message:
 
 When we receive a message from another group member:
 
-```
+```text
               ┌───────────────────────────────┐
               │  Wrapper event arrives        │
               │  from relay subscription      │
@@ -165,7 +167,7 @@ When we receive a message from another group member:
 
 When decryption fails and won't ever succeed:
 
-```
+```text
               ┌───────────────────────────────┐
               │  Wrapper event arrives        │
               │  from relay subscription      │
@@ -201,7 +203,7 @@ This is the most complex flow. It occurs when we receive a "better" commit for a
 
 **Background**: MIP-03 defines deterministic commit ordering. When two commits compete for the same epoch, the one with the earlier timestamp (or smaller event ID as tiebreaker) wins.
 
-```
+```text
 ┌─────────────────────────────────────────────────────────────────┐
 │                    INITIAL STATE                                │
 │                                                                 │
@@ -268,7 +270,7 @@ This is the most complex flow. It occurs when we receive a "better" commit for a
 
 Commits have their own flow and use `ProcessedCommit` state:
 
-```
+```text
               ┌───────────────────────────────┐
               │  Commit event arrives         │
               └───────────────────────────────┘
@@ -305,7 +307,7 @@ Commits have their own flow and use `ProcessedCommit` state:
 
 Proposals are stored as pending and don't create `Message` records:
 
-```
+```text
               ┌───────────────────────────────┐
               │  Proposal event arrives       │
               └───────────────────────────────┘
@@ -336,7 +338,7 @@ Proposals are stored as pending and don't create `Message` records:
 
 ### MessageState Transitions
 
-```
+```text
 Created ─────────────► Processed
    │                      │
    │                      │ (rollback)
@@ -348,7 +350,7 @@ Created ─────────────► Processed
 
 ### ProcessedMessageState Transitions
 
-```
+```text
                     ┌──────────────────┐
                     │     Created      │ (own messages only)
                     └────────┬─────────┘

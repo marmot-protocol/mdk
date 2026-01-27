@@ -44,8 +44,6 @@ where
         message_bytes: &[u8],
     ) -> Result<ProcessedMessage> {
         let mls_message = MlsMessageIn::tls_deserialize_exact(message_bytes)?;
-
-        tracing::debug!(target: "mdk_core::messages::process_mls_message", "Received message: {:?}", mls_message);
         let protocol_message = mls_message.try_into_protocol_message()?;
 
         // Return error if group ID doesn't match
@@ -56,6 +54,13 @@ where
         // Capture epoch in case we need it for error reporting
         let msg_epoch = protocol_message.epoch().as_u64();
         let content_type = protocol_message.content_type();
+
+        tracing::debug!(
+            target: "mdk_core::messages::process_mls_message",
+            "Received MLS message (epoch={}, content_type={:?})",
+            msg_epoch,
+            content_type
+        );
 
         let processed_message = match group.process_message(&self.provider, protocol_message) {
             Ok(processed_message) => processed_message,
@@ -80,8 +85,9 @@ where
 
         tracing::debug!(
             target: "mdk_core::messages::process_mls_message",
-            "Processed message: {:?}",
-            processed_message
+            "Processed MLS message (epoch={}, content_type={:?})",
+            msg_epoch,
+            content_type
         );
 
         Ok(processed_message)
