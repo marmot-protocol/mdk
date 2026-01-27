@@ -19,7 +19,7 @@
 
 ### Removed
 
-### Deprecated
+### Deprecated -->
 
 ## Unreleased
 
@@ -36,6 +36,7 @@
   - When multiple valid commits are published for the same epoch, clients converge on the same "winning" commit.
   - If a "better" commit (earlier timestamp) arrives after a "worse" commit has been applied, the client automatically rolls back to the previous epoch and applies the winning commit.
   - This ensures consistent group state across all clients even with out-of-order message delivery.
+- Upgraded `nostr` dependency from 0.43 to 0.44, replacing deprecated `Timestamp::as_u64()` calls with `Timestamp::as_secs()` ([#162](https://github.com/marmot-protocol/mdk/pull/162))
 
 ### Added
 

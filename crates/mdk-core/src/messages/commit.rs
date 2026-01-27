@@ -65,7 +65,7 @@ where
             &group_id,
             current_epoch,
             &event.id,
-            event.created_at.as_u64(),
+            event.created_at.as_secs(),
         ) {
             tracing::warn!(
                 target: "mdk_core::messages::process_commit",

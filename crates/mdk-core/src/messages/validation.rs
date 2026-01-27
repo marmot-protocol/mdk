@@ -348,24 +348,24 @@ where
         let now = Timestamp::now();
 
         // Reject events from the future (allow configurable clock skew)
-        if event.created_at.as_u64()
+        if event.created_at.as_secs()
             > now
-                .as_u64()
+                .as_secs()
                 .saturating_add(self.config.max_future_skew_secs)
         {
             return Err(Error::InvalidTimestamp(format!(
                 "event timestamp {} is too far in the future (current time: {})",
-                event.created_at.as_u64(),
-                now.as_u64()
+                event.created_at.as_secs(),
+                now.as_secs()
             )));
         }
 
         // Reject events that are too old (configurable via MdkConfig)
-        let min_timestamp = now.as_u64().saturating_sub(self.config.max_event_age_secs);
-        if event.created_at.as_u64() < min_timestamp {
+        let min_timestamp = now.as_secs().saturating_sub(self.config.max_event_age_secs);
+        if event.created_at.as_secs() < min_timestamp {
             return Err(Error::InvalidTimestamp(format!(
                 "event timestamp {} is too old (minimum acceptable: {})",
-                event.created_at.as_u64(),
+                event.created_at.as_secs(),
                 min_timestamp
             )));
         }
@@ -577,7 +577,7 @@ mod tests {
             .expect("Group should exist");
 
         // Set timestamp to far future (1 hour ahead, beyond 5 minute skew allowance)
-        let future_time = nostr::Timestamp::now().as_u64() + 3600;
+        let future_time = nostr::Timestamp::now().as_secs() + 3600;
 
         // Create an event with future timestamp
         let message_event = EventBuilder::new(Kind::MlsGroupMessage, "test content")
@@ -612,7 +612,7 @@ mod tests {
             .expect("Group should exist");
 
         // Set timestamp to 46 days ago (beyond 45 day limit)
-        let old_time = nostr::Timestamp::now().as_u64().saturating_sub(46 * 86400);
+        let old_time = nostr::Timestamp::now().as_secs().saturating_sub(46 * 86400);
 
         // Create an event with old timestamp
         let message_event = EventBuilder::new(Kind::MlsGroupMessage, "test content")

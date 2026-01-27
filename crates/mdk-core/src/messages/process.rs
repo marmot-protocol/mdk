@@ -180,7 +180,7 @@ where
                         &group.mls_group_id,
                         mls_group.epoch().as_u64(),
                         &event.id,
-                        event.created_at.as_u64(),
+                        event.created_at.as_secs(),
                     )
                     .is_err()
                 {

@@ -276,7 +276,7 @@ where
                     self.storage(),
                     &group.mls_group_id,
                     msg_epoch,
-                    event.created_at.as_u64(),
+                    event.created_at.as_secs(),
                     &event.id,
                 );
 

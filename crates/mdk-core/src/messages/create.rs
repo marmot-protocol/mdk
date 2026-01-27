@@ -746,9 +746,9 @@ mod tests {
         );
 
         // Allow for some clock skew, but message shouldn't be more than a day old
-        let one_day_ago = now.as_u64().saturating_sub(86400);
+        let one_day_ago = now.as_secs().saturating_sub(86400);
         assert!(
-            message_event.created_at.as_u64() > one_day_ago,
+            message_event.created_at.as_secs() > one_day_ago,
             "Message timestamp should be recent"
         );
     }

@@ -303,7 +303,7 @@ class Message:
     event_id: str                  # Event ID (hex-encoded)
     sender_pubkey: str             # Sender public key (hex-encoded)
     event_json: str                # JSON representation of the event
-    processed_at: int              # Timestamp when message was processed (Unix timestamp)
+    created_at: int                # Timestamp when message was created (Unix timestamp)
     kind: int                      # Message kind
     state: str                     # Message state (e.g., "processed", "pending")
 ```
