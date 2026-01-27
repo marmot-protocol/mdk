@@ -76,10 +76,7 @@ pub enum Error {
     BasicCredential(#[from] BasicCredentialError),
     /// Process message error - epoch mismatch
     #[error("Message epoch differs from the group's epoch")]
-    ProcessMessageWrongEpoch,
-    /// Process message error - epoch mismatch with epoch info
-    #[error("Message epoch {0} differs from the group's epoch")]
-    ProcessMessageWrongEpochWithInfo(u64),
+    ProcessMessageWrongEpoch(u64),
     /// Process message error - wrong group ID
     #[error("Wrong group ID")]
     ProcessMessageWrongGroupId,
@@ -331,7 +328,6 @@ where
     fn from(e: ProcessMessageError<T>) -> Self {
         match e {
             ProcessMessageError::ValidationError(validation_error) => match validation_error {
-                ValidationError::WrongEpoch => Self::ProcessMessageWrongEpoch,
                 ValidationError::WrongGroupId => Self::ProcessMessageWrongGroupId,
                 ValidationError::CannotDecryptOwnMessage => Self::CannotDecryptOwnMessage,
                 _ => Self::ProcessMessageOther(validation_error.to_string()),
@@ -354,7 +350,7 @@ mod tests {
     #[test]
     fn test_error_display_messages() {
         // Test simple message errors
-        let error = Error::ProcessMessageWrongEpoch;
+        let error = Error::ProcessMessageWrongEpoch(5);
         assert_eq!(
             error.to_string(),
             "Message epoch differs from the group's epoch"
@@ -564,20 +560,19 @@ mod tests {
         assert!(debug_str.contains("UnexpectedEvent"));
     }
 
-    /// Test ProcessMessageWrongEpochWithInfo error variant
+    /// Test ProcessMessageWrongEpoch error variant preserves epoch for internal use
     #[test]
-    fn test_process_message_wrong_epoch_with_info() {
-        let error = Error::ProcessMessageWrongEpochWithInfo(42);
+    fn test_process_message_wrong_epoch() {
+        // Epoch value is preserved for internal rollback logic but not exposed in message
+        let error = Error::ProcessMessageWrongEpoch(42);
         assert_eq!(
             error.to_string(),
-            "Message epoch 42 differs from the group's epoch"
+            "Message epoch differs from the group's epoch"
         );
 
-        let error2 = Error::ProcessMessageWrongEpochWithInfo(100);
-        assert_eq!(
-            error2.to_string(),
-            "Message epoch 100 differs from the group's epoch"
-        );
+        // Different epoch values produce same message (epoch used internally only)
+        let error2 = Error::ProcessMessageWrongEpoch(100);
+        assert_eq!(error.to_string(), error2.to_string());
     }
 
     /// Test OwnCommitPending error variant

@@ -593,10 +593,8 @@ where
             .tls_serialize_detached()
             .map_err(|e| Error::Group(e.to_string()))?;
 
-        let commit_event = self.build_encrypted_message_event(
-            &mls_group.group_id().into(),
-            serialized_commit_message,
-        )?;
+        let commit_event =
+            self.build_message_event(&mls_group.group_id().into(), serialized_commit_message)?;
 
         // Create processed_message to track state of message
         let processed_message: message_types::ProcessedMessage = message_types::ProcessedMessage {
@@ -700,10 +698,8 @@ where
             .tls_serialize_detached()
             .map_err(|e| Error::Group(e.to_string()))?;
 
-        let commit_event = self.build_encrypted_message_event(
-            &mls_group.group_id().into(),
-            serialized_commit_message,
-        )?;
+        let commit_event =
+            self.build_message_event(&mls_group.group_id().into(), serialized_commit_message)?;
 
         // Create processed_message to track state of message
         let processed_message: message_types::ProcessedMessage = message_types::ProcessedMessage {
@@ -771,7 +767,7 @@ where
             extensions,
             &signature_keypair,
         )?;
-        let commit_event = self.build_encrypted_message_event(
+        let commit_event = self.build_message_event(
             &mls_group.group_id().into(),
             message_out.tls_serialize_detached()?,
         )?;
@@ -1173,10 +1169,8 @@ where
         // Serialize the message
         let serialized_commit_message = commit_message_bundle.commit().tls_serialize_detached()?;
 
-        let commit_event = self.build_encrypted_message_event(
-            &mls_group.group_id().into(),
-            serialized_commit_message,
-        )?;
+        let commit_event =
+            self.build_message_event(&mls_group.group_id().into(), serialized_commit_message)?;
 
         // Create processed_message to track state of message
         let processed_message: message_types::ProcessedMessage = message_types::ProcessedMessage {
@@ -1242,7 +1236,7 @@ where
             .map_err(|e| Error::Group(e.to_string()))?;
 
         let evolution_event =
-            self.build_encrypted_message_event(&group.group_id().into(), serialized_message_out)?;
+            self.build_message_event(&group.group_id().into(), serialized_message_out)?;
 
         // Create processed_message to track state of message
         let processed_message: message_types::ProcessedMessage = message_types::ProcessedMessage {
@@ -1422,7 +1416,7 @@ where
     }
 
     /// Creates a NIP-44 encrypted message event Kind: 445 signing with an ephemeral keypair.
-    pub(crate) fn build_encrypted_message_event(
+    pub(crate) fn build_message_event(
         &self,
         group_id: &GroupId,
         serialized_content: Vec<u8>,
