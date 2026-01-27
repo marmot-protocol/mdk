@@ -887,4 +887,313 @@ mod tests {
             assert!(found, "Should find message with content '{}'", content);
         }
     }
+
+    #[test]
+    fn test_extended_offline_period_sync() {
+        let alice_keys = Keys::generate();
+        let bob_keys = Keys::generate();
+
+        let alice_mdk = create_test_mdk();
+        let bob_mdk = create_test_mdk();
+
+        // Create key packages
+        let bob_key_package = create_key_package_event(&bob_mdk, &bob_keys);
+
+        // Alice creates group with Bob
+        let admin_pubkeys = vec![alice_keys.public_key()];
+        let config = create_nostr_group_config_data(admin_pubkeys);
+
+        let create_result = alice_mdk
+            .create_group(&alice_keys.public_key(), vec![bob_key_package], config)
+            .expect("Alice should create group");
+
+        let group_id = create_result.group.mls_group_id.clone();
+
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("Alice should merge commit");
+
+        // Bob joins the group
+        let bob_welcome_rumor = &create_result.welcome_rumors[0];
+        let bob_welcome = bob_mdk
+            .process_welcome(&nostr::EventId::all_zeros(), bob_welcome_rumor)
+            .expect("Bob should process welcome");
+
+        bob_mdk
+            .accept_welcome(&bob_welcome)
+            .expect("Bob should accept welcome");
+
+        // Simulate Bob going offline - Alice sends multiple messages
+        let mut alice_messages = Vec::new();
+        for i in 0..5 {
+            let rumor = create_test_rumor(&alice_keys, &format!("Message {} while Bob offline", i));
+            let message_event = alice_mdk
+                .create_message(&group_id, rumor)
+                .expect("Alice should create message");
+            alice_messages.push(message_event);
+        }
+
+        // Bob comes back online and processes all messages
+        for message_event in &alice_messages {
+            let result = bob_mdk.process_message(message_event);
+            assert!(
+                result.is_ok(),
+                "Bob should process offline message: {:?}",
+                result.err()
+            );
+        }
+
+        // Verify Bob received all messages
+        let bob_messages = bob_mdk
+            .get_messages(&group_id, None)
+            .expect("Bob should get messages");
+
+        assert_eq!(
+            bob_messages.len(),
+            5,
+            "Bob should have all 5 messages after sync"
+        );
+
+        // Verify all messages are present (order may vary with equal timestamps)
+        let bob_contents: Vec<&str> = bob_messages.iter().map(|m| m.content.as_str()).collect();
+        for i in 0..5 {
+            let expected = format!("Message {} while Bob offline", i);
+            assert!(
+                bob_contents
+                    .iter()
+                    .any(|&content| content.contains(&expected)),
+                "Should contain: {}",
+                expected
+            );
+        }
+    }
+
+    /// Device Synchronization After Member Changes
+    ///
+    /// Validates that when one device makes member changes (add/remove),
+    /// other devices can properly process and synchronize those changes.
+    #[test]
+    fn test_device_sync_after_member_changes() {
+        let alice_keys = Keys::generate();
+        let bob_keys = Keys::generate();
+
+        let alice_device1 = create_test_mdk();
+        let bob_mdk = create_test_mdk();
+
+        // Create key packages
+        let bob_key_package = create_key_package_event(&bob_mdk, &bob_keys);
+
+        // Alice device 1 creates group with Bob
+        let admin_pubkeys = vec![alice_keys.public_key()];
+        let config = create_nostr_group_config_data(admin_pubkeys);
+
+        let create_result = alice_device1
+            .create_group(&alice_keys.public_key(), vec![bob_key_package], config)
+            .expect("Alice device 1 should create group");
+
+        let group_id = create_result.group.mls_group_id.clone();
+
+        alice_device1
+            .merge_pending_commit(&group_id)
+            .expect("Alice device 1 should merge commit");
+
+        // Bob joins
+        let bob_welcome_rumor = &create_result.welcome_rumors[0];
+        let bob_welcome = bob_mdk
+            .process_welcome(&nostr::EventId::all_zeros(), bob_welcome_rumor)
+            .expect("Bob should process welcome");
+
+        bob_mdk
+            .accept_welcome(&bob_welcome)
+            .expect("Bob should accept welcome");
+
+        // Verify initial state - Alice device 1 and Bob both see 2 members
+        let alice_d1_members = alice_device1
+            .get_members(&group_id)
+            .expect("Alice device 1 should get members");
+        let bob_members = bob_mdk
+            .get_members(&group_id)
+            .expect("Bob should get members");
+
+        assert_eq!(
+            alice_d1_members.len(),
+            2,
+            "Alice device 1 should see 2 members"
+        );
+        assert_eq!(bob_members.len(), 2, "Bob should see 2 members");
+
+        // Alice device 1 sends a message
+        let rumor1 = create_test_rumor(&alice_keys, "Message from device 1");
+        let message1 = alice_device1
+            .create_message(&group_id, rumor1)
+            .expect("Alice device 1 should create message");
+
+        // Bob processes the message
+        bob_mdk
+            .process_message(&message1)
+            .expect("Bob should process message");
+
+        // Alice adds a new member (Charlie)
+        let charlie_keys = Keys::generate();
+        let charlie_mdk = create_test_mdk();
+        let charlie_key_package = create_key_package_event(&charlie_mdk, &charlie_keys);
+
+        let add_result = alice_device1
+            .add_members(&group_id, &[charlie_key_package])
+            .expect("Alice should add Charlie");
+
+        alice_device1
+            .merge_pending_commit(&group_id)
+            .expect("Alice should merge commit");
+
+        // Bob processes the member addition commit
+        bob_mdk
+            .process_message(&add_result.evolution_event)
+            .expect("Bob should process member addition");
+
+        // Verify Bob's member list is synchronized
+        let bob_updated_members = bob_mdk
+            .get_members(&group_id)
+            .expect("Bob should get updated members");
+
+        assert_eq!(
+            bob_updated_members.len(),
+            3,
+            "Bob should see Charlie was added"
+        );
+        assert!(
+            bob_updated_members.contains(&charlie_keys.public_key()),
+            "Bob should see Charlie in member list"
+        );
+
+        // Verify Bob received the message
+        let bob_messages = bob_mdk
+            .get_messages(&group_id, None)
+            .expect("Bob should get messages");
+
+        assert_eq!(bob_messages.len(), 1, "Bob should have 1 message");
+        assert!(
+            bob_messages[0].content.contains("Message from device 1"),
+            "Bob should have message from Alice device 1"
+        );
+    }
+
+    /// Message Processing Across Epoch Transitions
+    ///
+    /// Validates that devices can process messages from different epochs correctly,
+    /// especially when syncing after being offline during epoch transitions.
+    #[test]
+    fn test_message_processing_across_epochs() {
+        let alice_keys = Keys::generate();
+        let bob_keys = Keys::generate();
+        let charlie_keys = Keys::generate();
+
+        let alice_mdk = create_test_mdk();
+        let bob_mdk = create_test_mdk();
+        let charlie_mdk = create_test_mdk();
+
+        // Create key packages
+        let bob_key_package = create_key_package_event(&bob_mdk, &bob_keys);
+
+        // Alice creates group with Bob
+        let admin_pubkeys = vec![alice_keys.public_key()];
+        let config = create_nostr_group_config_data(admin_pubkeys);
+
+        let create_result = alice_mdk
+            .create_group(&alice_keys.public_key(), vec![bob_key_package], config)
+            .expect("Alice should create group");
+
+        let group_id = create_result.group.mls_group_id.clone();
+
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("Alice should merge commit");
+
+        // Bob joins the group
+        let bob_welcome_rumor = &create_result.welcome_rumors[0];
+        let bob_welcome = bob_mdk
+            .process_welcome(&nostr::EventId::all_zeros(), bob_welcome_rumor)
+            .expect("Bob should process welcome");
+
+        bob_mdk
+            .accept_welcome(&bob_welcome)
+            .expect("Bob should accept welcome");
+
+        // Get initial epoch
+        let epoch0 = alice_mdk
+            .get_group(&group_id)
+            .expect("Should get group")
+            .expect("Group should exist")
+            .epoch;
+
+        // Alice sends message in epoch 0
+        let rumor0 = create_test_rumor(&alice_keys, "Message in epoch 0");
+        let message0 = alice_mdk
+            .create_message(&group_id, rumor0)
+            .expect("Alice should create message in epoch 0");
+
+        // Advance epoch by adding Charlie
+        let charlie_key_package = create_key_package_event(&charlie_mdk, &charlie_keys);
+        let add_result = alice_mdk
+            .add_members(&group_id, &[charlie_key_package])
+            .expect("Alice should add Charlie");
+
+        let add_commit_event = add_result.evolution_event.clone();
+
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("Alice should merge commit");
+
+        // Verify epoch advanced
+        let epoch1 = alice_mdk
+            .get_group(&group_id)
+            .expect("Should get group")
+            .expect("Group should exist")
+            .epoch;
+
+        assert!(epoch1 > epoch0, "Epoch should have advanced");
+
+        // Alice sends message in epoch 1
+        let rumor1 = create_test_rumor(&alice_keys, "Message in epoch 1");
+        let message1 = alice_mdk
+            .create_message(&group_id, rumor1)
+            .expect("Alice should create message in epoch 1");
+
+        // Bob processes message from epoch 0
+        bob_mdk
+            .process_message(&message0)
+            .expect("Bob should process message from epoch 0");
+
+        // Bob processes the commit to advance to epoch 1
+
+        bob_mdk
+            .process_message(&add_commit_event)
+            .expect("Bob should process commit to advance epoch");
+
+        // Bob processes message from epoch 1
+        bob_mdk
+            .process_message(&message1)
+            .expect("Bob should process message from epoch 1");
+
+        let bob_messages = bob_mdk
+            .get_messages(&group_id, None)
+            .expect("Bob should get messages");
+
+        assert!(
+            !bob_messages.is_empty(),
+            "Bob should have messages from both epochs"
+        );
+        assert!(
+            bob_messages
+                .iter()
+                .any(|m| m.content.contains("Message in epoch 0")),
+            "Bob should have message from epoch 0"
+        );
+        assert!(
+            bob_messages
+                .iter()
+                .any(|m| m.content.contains("Message in epoch 1")),
+            "Bob should have message from epoch 1"
+        );
+    }
 }
