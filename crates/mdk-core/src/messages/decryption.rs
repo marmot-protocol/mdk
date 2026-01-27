@@ -85,6 +85,13 @@ where
         let group_id: GroupId = mls_group.group_id().into();
         let current_epoch: u64 = mls_group.epoch().as_u64();
 
+        // Guard: no past epochs to try if we're at epoch 0 or lookback is 0
+        if current_epoch == 0 || max_epoch_lookback == 0 {
+            return Err(Error::Message(
+                "No past epochs available for decryption".to_string(),
+            ));
+        }
+
         // Start from current epoch and go backwards
         // We want exactly max_epoch_lookback iterations, so end_epoch is calculated
         // to make the inclusive range have that many elements
@@ -179,6 +186,7 @@ where
 #[cfg(test)]
 mod tests {
     use nostr::Keys;
+    use openmls::prelude::MlsGroup;
 
     use crate::test_util::{
         create_key_package_event, create_nostr_group_config_data, create_test_rumor,
@@ -314,5 +322,120 @@ mod tests {
         // store encrypted messages from old epochs and attempt decryption after
         // advancing beyond the lookback window. This is a protocol-level test
         // that would need access to the exporter secret retention mechanism.
+    }
+
+    /// Test that try_decrypt_with_past_epochs returns early when at epoch 0
+    ///
+    /// When a group is at epoch 0, there are no past epochs to try.
+    /// The function should return an error immediately rather than
+    /// attempting to iterate over an empty or invalid range.
+    #[test]
+    fn test_past_epoch_decryption_guards_epoch_zero() {
+        let alice_keys = Keys::generate();
+        let alice_mdk = create_test_mdk();
+
+        // Create a group - after creation and merge, we're still at epoch 0
+        let create_result = alice_mdk
+            .create_group(
+                &alice_keys.public_key(),
+                vec![],
+                create_nostr_group_config_data(vec![alice_keys.public_key()]),
+            )
+            .expect("Should create group");
+
+        let group_id = create_result.group.mls_group_id.clone();
+
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("Should merge commit");
+
+        // Load the MLS group to check its epoch
+        let mls_group: MlsGroup = alice_mdk
+            .load_mls_group(&group_id)
+            .expect("Should load group")
+            .expect("Group should exist");
+
+        // Newly created group is at epoch 0
+        assert_eq!(
+            mls_group.epoch().as_u64(),
+            0,
+            "Group should be at epoch 0 after creation"
+        );
+
+        // Test with epoch 0 - should return early since there are no past epochs
+        let result = alice_mdk.try_decrypt_with_past_epochs(
+            &mls_group,
+            "invalid_encrypted_content",
+            5, // normal lookback, but epoch 0 means no past epochs
+        );
+
+        assert!(result.is_err(), "Should fail at epoch 0");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("No past epochs available"),
+            "Error should indicate no past epochs: {}",
+            err_msg
+        );
+    }
+
+    /// Test that try_decrypt_with_past_epochs handles zero lookback parameter
+    ///
+    /// When max_epoch_lookback is 0, no past epochs should be tried.
+    #[test]
+    fn test_past_epoch_decryption_guards_zero_lookback() {
+        let alice_keys = Keys::generate();
+        let alice_mdk = create_test_mdk();
+
+        // Create a group and advance a few epochs
+        let create_result = alice_mdk
+            .create_group(
+                &alice_keys.public_key(),
+                vec![],
+                create_nostr_group_config_data(vec![alice_keys.public_key()]),
+            )
+            .expect("Should create group");
+
+        let group_id = create_result.group.mls_group_id.clone();
+
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("Should merge commit");
+
+        // Advance a few epochs so we're not at epoch 0/1
+        for _ in 0..3 {
+            let update = alice_mdk.self_update(&group_id).expect("Should update");
+            alice_mdk
+                .process_message(&update.evolution_event)
+                .expect("Should process update");
+            alice_mdk
+                .merge_pending_commit(&group_id)
+                .expect("Should merge");
+        }
+
+        let mls_group: MlsGroup = alice_mdk
+            .load_mls_group(&group_id)
+            .expect("Should load group")
+            .expect("Group should exist");
+
+        // Verify we're at a higher epoch
+        assert!(
+            mls_group.epoch().as_u64() > 1,
+            "Group should be past epoch 1"
+        );
+
+        // Test with max_epoch_lookback = 0
+        let result = alice_mdk.try_decrypt_with_past_epochs(
+            &mls_group,
+            "invalid_encrypted_content",
+            0, // zero lookback - should return early
+        );
+
+        assert!(result.is_err(), "Should fail with zero lookback");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("No past epochs available"),
+            "Error should indicate no past epochs: {}",
+            err_msg
+        );
     }
 }
