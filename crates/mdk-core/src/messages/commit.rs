@@ -512,11 +512,8 @@ mod tests {
             Ok(MessageProcessingResult::Commit { .. }) => {
                 panic!("Add-member commit from demoted admin should have been rejected");
             }
-            other => {
-                panic!(
-                    "Unexpected result for add-member commit from demoted admin: {:?}",
-                    other
-                );
+            _ => {
+                panic!("Unexpected result for add-member commit from demoted admin");
             }
         }
     }

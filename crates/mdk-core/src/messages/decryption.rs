@@ -144,7 +144,7 @@ where
         )))
     }
 
-    /// Try to decrypt using the current exporter secret and if fails try with the past ones until a max loopback of [`DEFAULT_EPOCH_LOOKBACK`].
+    /// Try to decrypt using the current exporter secret and if fails try with the past ones until a max lookback of [`DEFAULT_EPOCH_LOOKBACK`].
     pub(super) fn try_decrypt_with_recent_epochs(
         &self,
         mls_group: &MlsGroup,
