@@ -21,6 +21,7 @@ coverage/
 .cody/
 .continue/
 .github-copilot/
+Plans/
 
 # Android build artifacts
 **/jniLibs/
