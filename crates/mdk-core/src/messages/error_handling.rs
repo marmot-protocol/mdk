@@ -315,14 +315,15 @@ where
                             // Mark these messages as Retryable so they can pass through
                             // deduplication when the application re-fetches and reprocesses them
                             for event_id in &messages_needing_refetch {
-                                if let Err(e) =
-                                    self.storage().mark_processed_message_retryable(event_id)
+                                if self
+                                    .storage()
+                                    .mark_processed_message_retryable(event_id)
+                                    .is_err()
                                 {
                                     tracing::warn!(
                                         target: "mdk_core::messages::process_message",
-                                        "Failed to mark message {} as retryable: {}",
-                                        event_id,
-                                        e
+                                        "Failed to mark message {} as retryable",
+                                        event_id
                                     );
                                 }
                             }

@@ -78,7 +78,7 @@ where
             }
 
             Err(e) => {
-                tracing::error!(target: "mdk_core::messages::process_mls_message", "Error processing message: {:?}", e);
+                tracing::error!(target: "mdk_core::messages::process_mls_message", "Error processing MLS message");
                 return Err(e.into());
             }
         };
@@ -326,9 +326,8 @@ where
                 if let Err(save_err) = self.record_failure(event.id, &e, None) {
                     tracing::warn!(
                         target: "mdk_core::messages::process_message",
-                        "Failed to persist failure record: {}. Original error: {}",
-                        save_err,
-                        e
+                        "Failed to persist failure record: {}. Original error redacted",
+                        save_err
                     );
                 }
                 return Err(e);
@@ -345,9 +344,8 @@ where
                     if let Err(save_err) = self.record_failure(event.id, &e, None) {
                         tracing::warn!(
                             target: "mdk_core::messages::process_message",
-                            "Failed to persist failure record: {}. Original error: {}",
-                            save_err,
-                            e
+                            "Failed to persist failure record: {}. Original error redacted",
+                            save_err
                         );
                     }
                     return Err(e);
