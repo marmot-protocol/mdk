@@ -816,7 +816,7 @@ mod tests {
                     "Should return MLS group ID from storage, not Nostr group ID"
                 );
             }
-            other => panic!("Expected Unprocessable, got: {:?}", other),
+            _ => panic!("Expected Unprocessable variant"),
         }
     }
 
@@ -997,10 +997,7 @@ mod tests {
                     "Should return a non-empty group ID"
                 );
             }
-            other => panic!(
-                "Expected MessageProcessingResult::Unprocessable, got: {:?}",
-                other
-            ),
+            _ => panic!("Expected Unprocessable variant"),
         }
     }
 

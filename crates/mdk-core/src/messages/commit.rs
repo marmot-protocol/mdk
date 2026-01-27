@@ -60,7 +60,7 @@ where
         // Snapshot current state before applying commit (for rollback support).
         // Fail if snapshot fails - without it we can't guarantee MIP-03 convergence.
         let current_epoch = mls_group.epoch().as_u64();
-        if let Err(e) = self.epoch_snapshots.create_snapshot(
+        if let Err(_e) = self.epoch_snapshots.create_snapshot(
             self.storage(),
             &group_id,
             current_epoch,
@@ -69,12 +69,13 @@ where
         ) {
             tracing::warn!(
                 target: "mdk_core::messages::process_commit",
-                "Failed to create snapshot for epoch {}: {}",
-                current_epoch,
-                e
+                "Failed to create snapshot for epoch {}",
+                current_epoch
             );
             // Without a snapshot we can't guarantee MIP-03 convergence if a better commit arrives.
-            return Err(Error::SnapshotCreationFailed(e.to_string()));
+            return Err(Error::SnapshotCreationFailed(
+                "snapshot creation failed".to_string(),
+            ));
         }
 
         mls_group
