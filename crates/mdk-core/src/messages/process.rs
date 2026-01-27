@@ -272,9 +272,11 @@ where
             // Block reprocessing for Failed and EpochInvalidated states
             // Other states (Created, Processed, ProcessedCommit) should continue
             // to allow normal message flow (e.g., processing own messages from relay)
-            if processed.state == message_types::ProcessedMessageState::Failed
-                || processed.state == message_types::ProcessedMessageState::EpochInvalidated
-            {
+            let is_failed = processed.state == message_types::ProcessedMessageState::Failed;
+            let is_epoch_invalidated =
+                processed.state == message_types::ProcessedMessageState::EpochInvalidated;
+
+            if is_failed || is_epoch_invalidated {
                 let mls_group_id = match self.extract_mls_group_id_from_event(event) {
                     Some(id) => {
                         tracing::debug!(
@@ -288,9 +290,13 @@ where
                             target: "mdk_core::messages::process_message",
                             "Cannot extract group_id from previously failed/invalidated message (missing or malformed h-tag)"
                         );
-                        return Err(Error::Message(
-                            "Message processing previously failed or epoch invalidated".to_string(),
-                        ));
+                        // Return the appropriate error message based on the prior state
+                        let error_msg = if is_failed {
+                            "Message processing previously failed"
+                        } else {
+                            "Message epoch was invalidated"
+                        };
+                        return Err(Error::Message(error_msg.to_string()));
                     }
                 };
 

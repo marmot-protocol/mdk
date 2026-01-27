@@ -64,9 +64,8 @@ where
 
         tracing::warn!(
             target: "mdk_core::messages::record_failure",
-            "Message processing failed for event {}: {} (classified as: {})",
+            "Message processing failed for event {}: {}",
             event_id,
-            error,
             sanitized_reason
         );
 
@@ -360,32 +359,30 @@ where
                 }
 
                 // Not our own commit - this is a genuine error
-                tracing::error!(target: "mdk_core::messages::process_message", "Epoch mismatch for message that is not our own commit: {:?}", error);
+                tracing::error!(target: "mdk_core::messages::process_message", "Epoch mismatch for message that is not our own commit");
                 self.fail_unprocessable(event.id, &error, group)
             }
             Error::ProcessMessageWrongGroupId => {
-                tracing::error!(target: "mdk_core::messages::process_message", "Group ID mismatch: {:?}", error);
+                tracing::error!(target: "mdk_core::messages::process_message", "Group ID mismatch");
                 self.fail_unprocessable(event.id, &error, group)
             }
             Error::ProcessMessageUseAfterEviction => {
-                tracing::error!(target: "mdk_core::messages::process_message", "Attempted to use group after eviction: {:?}", error);
+                tracing::error!(target: "mdk_core::messages::process_message", "Attempted to use group after eviction");
                 self.fail_unprocessable(event.id, &error, group)
             }
             Error::CommitFromNonAdmin => {
                 // Authorization errors should propagate as errors, not be silently swallowed
                 // Save a failed processing record to prevent reprocessing (best-effort)
-                if let Err(save_err) = self.record_failure(event.id, &error, Some(group)) {
+                if let Err(_save_err) = self.record_failure(event.id, &error, Some(group)) {
                     tracing::warn!(
                         target: "mdk_core::messages::handle_processing_error",
-                        "Failed to persist failure record: {}. Original error: {}",
-                        save_err,
-                        error
+                        "Failed to persist failure record for commit from non-admin"
                     );
                 }
                 Err(error)
             }
             _ => {
-                tracing::error!(target: "mdk_core::messages::process_message", "Unexpected error processing message: {:?}", error);
+                tracing::error!(target: "mdk_core::messages::process_message", "Unexpected error processing message");
                 self.fail_unprocessable(event.id, &error, group)
             }
         }
