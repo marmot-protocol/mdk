@@ -71,7 +71,7 @@ use std::sync::Arc;
 use mdk_storage_traits::{Backend, GroupId, MdkStorageError, MdkStorageProvider};
 use openmls_traits::storage::{StorageProvider, traits};
 use rusqlite::Connection;
-use tokio::sync::Mutex;
+use std::sync::Mutex;
 
 mod db;
 pub mod encryption;
@@ -454,14 +454,14 @@ impl MdkSqliteStorage {
     where
         F: FnOnce(&Connection) -> T,
     {
-        let conn = self.connection.blocking_lock();
+        let conn = self.connection.lock().unwrap();
         f(&conn)
     }
 
     /// Creates a snapshot of a group's state by copying all group-related rows
     /// to the snapshot table.
     fn snapshot_group_state(&self, group_id: &GroupId, name: &str) -> Result<(), Error> {
-        let conn = self.connection.blocking_lock();
+        let conn = self.connection.lock().unwrap();
         let group_id_bytes = group_id.as_slice();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -822,7 +822,7 @@ impl MdkSqliteStorage {
     /// Restores a group's state from a snapshot by deleting current rows
     /// and re-inserting from the snapshot table.
     fn restore_group_from_snapshot(&self, group_id: &GroupId, name: &str) -> Result<(), Error> {
-        let conn = self.connection.blocking_lock();
+        let conn = self.connection.lock().unwrap();
         let group_id_bytes = group_id.as_slice();
 
         // Check if snapshot exists BEFORE starting transaction or deleting any data.
@@ -1112,7 +1112,7 @@ impl MdkSqliteStorage {
 
     /// Deletes a snapshot that is no longer needed.
     fn delete_group_snapshot(&self, group_id: &GroupId, name: &str) -> Result<(), Error> {
-        let conn = self.connection.blocking_lock();
+        let conn = self.connection.lock().unwrap();
         conn.execute(
             "DELETE FROM group_state_snapshots WHERE snapshot_name = ? AND group_id = ?",
             rusqlite::params![name, group_id.as_slice()],
@@ -1160,7 +1160,7 @@ impl MdkStorageProvider for MdkSqliteStorage {
         &self,
         group_id: &GroupId,
     ) -> Result<Vec<(String, u64)>, MdkStorageError> {
-        let conn = self.connection.blocking_lock();
+        let conn = self.connection.lock().unwrap();
         let mut stmt = conn
             .prepare_cached(
                 "SELECT DISTINCT snapshot_name, created_at FROM group_state_snapshots
@@ -1181,7 +1181,7 @@ impl MdkStorageProvider for MdkSqliteStorage {
     }
 
     fn prune_expired_snapshots(&self, min_timestamp: u64) -> Result<usize, MdkStorageError> {
-        let conn = self.connection.blocking_lock();
+        let conn = self.connection.lock().unwrap();
         let deleted = conn
             .execute(
                 "DELETE FROM group_state_snapshots WHERE created_at < ?",

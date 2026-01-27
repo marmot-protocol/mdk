@@ -74,6 +74,7 @@
 - **Security (Audit Issue AB)**: Added size limits to prevent disk and CPU exhaustion from unbounded user input ([#94](https://github.com/marmot-protocol/mdk/pull/94))
 - **Security (Audit Issue AG)**: `all_groups` now skips corrupted rows instead of failing on the first deserialization error, improving availability when database contains malformed data ([#115](https://github.com/marmot-protocol/mdk/pull/115))
 - Propagate `last_message_id` parse errors in `row_to_group` instead of silently converting to `None` ([#105](https://github.com/marmot-protocol/mdk/pull/105))
+- Changed `tokio::sync::Mutex` to `std::sync::Mutex` for SQLite connection to avoid panics when called from within tokio async runtime contexts ([#164](https://github.com/marmot-protocol/mdk/pull/164))
 
 ### Removed
 
