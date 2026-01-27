@@ -91,7 +91,7 @@ where
 
         let mut group: group_types::Group = self
             .get_group(mls_group_id)
-            .map_err(|e| Error::Group(e.to_string()))?
+            .map_err(|_e| Error::Group("Storage error while getting group".to_string()))?
             .ok_or(Error::GroupNotFound)?;
 
         // Create message

@@ -43,13 +43,13 @@ where
         let group = self
             .storage()
             .find_group_by_nostr_group_id(&nostr_group_id)
-            .map_err(|e| Error::Group(e.to_string()))?
+            .map_err(|_e| Error::Group("Storage error while finding group".to_string()))?
             .ok_or(Error::GroupNotFound)?;
 
         // Load the MLS group to get the current epoch
         let mls_group: MlsGroup = self
             .load_mls_group(&group.mls_group_id)
-            .map_err(|e| Error::Group(e.to_string()))?
+            .map_err(|_e| Error::Group("Storage error while loading MLS group".to_string()))?
             .ok_or(Error::GroupNotFound)?;
 
         // Try to decrypt message with recent exporter secrets (fallback across epochs)
@@ -130,8 +130,10 @@ where
                         epoch
                     );
                 }
-                Err(e) => {
-                    return Err(Error::Group(e.to_string()));
+                Err(_e) => {
+                    return Err(Error::Group(
+                        "Storage error while finding exporter secret".to_string(),
+                    ));
                 }
             }
         }

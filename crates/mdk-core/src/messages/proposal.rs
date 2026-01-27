@@ -203,7 +203,7 @@ where
     ) -> Result<()> {
         mls_group
             .store_pending_proposal(self.provider.storage(), staged_proposal)
-            .map_err(|e| Error::Message(e.to_string()))?;
+            .map_err(|_e| Error::Message("Failed to store pending proposal".to_string()))?;
 
         self.mark_processed(event, group_id, mls_group.epoch().as_u64())
     }
@@ -243,7 +243,7 @@ where
     ) -> Result<MessageProcessingResult> {
         mls_group
             .store_pending_proposal(self.provider.storage(), staged_proposal)
-            .map_err(|e| Error::Message(e.to_string()))?;
+            .map_err(|_e| Error::Message("Failed to store pending proposal".to_string()))?;
 
         let mls_signer = self.load_mls_signer(mls_group)?;
 
@@ -254,7 +254,7 @@ where
 
         let serialized_commit_message = commit_message
             .tls_serialize_detached()
-            .map_err(|e| Error::Group(e.to_string()))?;
+            .map_err(|_e| Error::Group("Failed to serialize commit message".to_string()))?;
 
         let commit_event = self.build_message_event(group_id, serialized_commit_message)?;
 

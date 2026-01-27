@@ -177,7 +177,7 @@ where
     ) -> Result<Option<message_types::Message>> {
         self.storage()
             .find_message_by_event_id(mls_group_id, event_id)
-            .map_err(|e| Error::Message(e.to_string()))
+            .map_err(|_e| Error::Message("Storage error while finding message".to_string()))
     }
 
     /// Retrieves messages for a specific MLS group with optional pagination
@@ -216,7 +216,7 @@ where
     ) -> Result<Vec<message_types::Message>> {
         self.storage()
             .messages(mls_group_id, pagination)
-            .map_err(|e| Error::Message(e.to_string()))
+            .map_err(|_e| Error::Message("Storage error while getting messages".to_string()))
     }
 
     // =========================================================================
@@ -227,7 +227,7 @@ where
     pub(crate) fn save_message_record(&self, message: message_types::Message) -> Result<()> {
         self.storage()
             .save_message(message)
-            .map_err(|e| Error::Message(e.to_string()))
+            .map_err(|_e| Error::Message("Storage error while saving message".to_string()))
     }
 
     /// Saves a processed message record to storage with standardized error handling
@@ -237,14 +237,16 @@ where
     ) -> Result<()> {
         self.storage()
             .save_processed_message(processed_message)
-            .map_err(|e| Error::Message(e.to_string()))
+            .map_err(|_e| {
+                Error::Message("Storage error while saving processed message".to_string())
+            })
     }
 
     /// Saves a group record to storage with standardized error handling
     pub(crate) fn save_group_record(&self, group: group_types::Group) -> Result<()> {
         self.storage()
             .save_group(group)
-            .map_err(|e| Error::Group(e.to_string()))
+            .map_err(|_e| Error::Group("Storage error while saving group".to_string()))
     }
 }
 

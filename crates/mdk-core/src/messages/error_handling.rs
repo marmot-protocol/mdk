@@ -72,11 +72,10 @@ where
         // Try to fetch existing record to preserve message_event_id and other context
         let existing_record = match self.storage().find_processed_message_by_event_id(&event_id) {
             Ok(record) => record,
-            Err(e) => {
+            Err(_e) => {
                 tracing::warn!(
                     target: "mdk_core::messages::record_failure",
-                    "Failed to fetch existing record for context preservation: {}",
-                    e
+                    "Failed to fetch existing record for context preservation"
                 );
                 None
             }
@@ -133,8 +132,13 @@ where
         &self,
         group: &group_types::Group,
     ) -> Result<MessageProcessingResult> {
-        self.sync_group_metadata_from_mls(&group.mls_group_id)
-            .map_err(|e| Error::Message(format!("Failed to sync group metadata: {}", e)))?;
+        if let Err(_e) = self.sync_group_metadata_from_mls(&group.mls_group_id) {
+            tracing::warn!(
+                target: "mdk_core::messages::return_own_commit",
+                "Failed to sync group metadata"
+            );
+            return Err(Error::Message("Failed to sync group metadata".to_string()));
+        }
 
         Ok(MessageProcessingResult::Commit {
             mls_group_id: group.mls_group_id.clone(),
@@ -170,7 +174,9 @@ where
                 let mut processed_message = self
                     .storage()
                     .find_processed_message_by_event_id(&event.id)
-                    .map_err(|e| Error::Message(e.to_string()))?
+                    .map_err(|_e| {
+                        Error::Message("Storage error while finding processed message".to_string())
+                    })?
                     .ok_or(Error::Message("Processed message not found".to_string()))?;
 
                 // If the message is created, we need to update the state of the message and processed message
@@ -186,14 +192,18 @@ where
                             .ok_or(Error::Message("Message not found".to_string()))?;
 
                         message.state = message_types::MessageState::Processed;
-                        self.storage()
-                            .save_message(message)
-                            .map_err(|e| Error::Message(e.to_string()))?;
+                        self.storage().save_message(message).map_err(|_e| {
+                            Error::Message("Storage error while saving message".to_string())
+                        })?;
 
                         processed_message.state = message_types::ProcessedMessageState::Processed;
                         self.storage()
                             .save_processed_message(processed_message.clone())
-                            .map_err(|e| Error::Message(e.to_string()))?;
+                            .map_err(|_e| {
+                                Error::Message(
+                                    "Storage error while saving processed message".to_string(),
+                                )
+                            })?;
 
                         tracing::debug!(target: "mdk_core::messages::process_message", "Updated state of own cached message");
                         let message = self
@@ -210,14 +220,19 @@ where
                         if let Some(message_event_id) = processed_message.message_event_id {
                             match self
                                 .get_message(&group.mls_group_id, &message_event_id)
-                                .map_err(|e| Error::Message(e.to_string()))?
-                            {
+                                .map_err(|_e| {
+                                    Error::Message(
+                                        "Storage error while getting message".to_string(),
+                                    )
+                                })? {
                                 Some(mut message) => {
                                     // Update states to mark as successfully processed
                                     message.state = message_types::MessageState::Processed;
-                                    self.storage()
-                                        .save_message(message)
-                                        .map_err(|e| Error::Message(e.to_string()))?;
+                                    self.storage().save_message(message).map_err(|_e| {
+                                        Error::Message(
+                                            "Storage error while saving message".to_string(),
+                                        )
+                                    })?;
 
                                     processed_message.state =
                                         message_types::ProcessedMessageState::Processed;
@@ -225,7 +240,12 @@ where
                                     processed_message.processed_at = Timestamp::now();
                                     self.storage()
                                         .save_processed_message(processed_message.clone())
-                                        .map_err(|e| Error::Message(e.to_string()))?;
+                                        .map_err(|_e| {
+                                            Error::Message(
+                                                "Storage error while saving processed message"
+                                                    .to_string(),
+                                            )
+                                        })?;
 
                                     tracing::info!(
                                         target: "mdk_core::messages::process_message",
@@ -233,7 +253,11 @@ where
                                     );
                                     let message = self
                                         .get_message(&group.mls_group_id, &message_event_id)
-                                        .map_err(|e| Error::Message(e.to_string()))?
+                                        .map_err(|_e| {
+                                            Error::Message(
+                                                "Storage error while getting message".to_string(),
+                                            )
+                                        })?
                                         .ok_or(Error::MessageNotFound)?;
                                     return Ok(MessageProcessingResult::ApplicationMessage(
                                         message,

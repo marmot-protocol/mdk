@@ -79,7 +79,7 @@ where
 
         mls_group
             .merge_staged_commit(&self.provider, staged_commit)
-            .map_err(|e| Error::Message(e.to_string()))?;
+            .map_err(|_e| Error::Message("Failed to merge staged commit".to_string()))?;
 
         // Check if the local member was removed by this commit
         if mls_group.own_leaf().is_none() {

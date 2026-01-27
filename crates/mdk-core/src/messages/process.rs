@@ -195,7 +195,7 @@ where
 
                 mls_group
                     .merge_pending_commit(&self.provider)
-                    .map_err(|e| Error::Message(e.to_string()))?;
+                    .map_err(|_e| Error::Message("Failed to merge pending commit".to_string()))?;
 
                 // Handle post-commit operations
 
@@ -261,7 +261,9 @@ where
         if let Some(processed) = self
             .storage()
             .find_processed_message_by_event_id(&event.id)
-            .map_err(|e| Error::Message(e.to_string()))?
+            .map_err(|_e| {
+                Error::Message("Storage error while checking for processed message".to_string())
+            })?
         {
             tracing::debug!(
                 target: "mdk_core::messages::process_message",
@@ -323,11 +325,10 @@ where
             Err(e) => {
                 // Save failed processing record to prevent reprocessing
                 // Don't fail if we can't save the failure record - log and continue
-                if let Err(save_err) = self.record_failure(event.id, &e, None) {
+                if let Err(_save_err) = self.record_failure(event.id, &e, None) {
                     tracing::warn!(
                         target: "mdk_core::messages::process_message",
-                        "Failed to persist failure record: {}. Original error redacted",
-                        save_err
+                        "Failed to persist failure record; error details redacted"
                     );
                 }
                 return Err(e);
@@ -341,11 +342,10 @@ where
                 Err(e) => {
                     // Save failed processing record to prevent reprocessing
                     // Don't fail if we can't save the failure record - log and continue
-                    if let Err(save_err) = self.record_failure(event.id, &e, None) {
+                    if let Err(_save_err) = self.record_failure(event.id, &e, None) {
                         tracing::warn!(
                             target: "mdk_core::messages::process_message",
-                            "Failed to persist failure record: {}. Original error redacted",
-                            save_err
+                            "Failed to persist failure record; error details redacted"
                         );
                     }
                     return Err(e);
