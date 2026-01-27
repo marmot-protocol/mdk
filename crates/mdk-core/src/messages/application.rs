@@ -80,10 +80,23 @@ where
         self.save_message_record(message.clone())?;
         self.save_processed_message_record(processed_message.clone())?;
 
-        // Update last_message_at and last_message_id
-        group.last_message_at = Some(rumor.created_at);
-        group.last_message_id = Some(message.id);
-        self.save_group_record(group)?;
+        // Update last_message_at and last_message_id only if this message is newer
+        let should_update = match (group.last_message_at, group.last_message_id) {
+            (None, _) => true,
+            (Some(existing_at), _) if rumor.created_at > existing_at => true,
+            (Some(existing_at), Some(existing_id))
+                if rumor.created_at == existing_at && message.id > existing_id =>
+            {
+                true
+            }
+            _ => false,
+        };
+
+        if should_update {
+            group.last_message_at = Some(rumor.created_at);
+            group.last_message_id = Some(message.id);
+            self.save_group_record(group)?;
+        }
 
         tracing::debug!(
             target: "mdk_core::messages::process_message",

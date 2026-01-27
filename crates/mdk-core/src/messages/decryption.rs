@@ -86,8 +86,10 @@ where
         let current_epoch: u64 = mls_group.epoch().as_u64();
 
         // Start from current epoch and go backwards
+        // We want exactly max_epoch_lookback iterations, so end_epoch is calculated
+        // to make the inclusive range have that many elements
         let start_epoch: u64 = current_epoch.saturating_sub(1);
-        let end_epoch: u64 = start_epoch.saturating_sub(max_epoch_lookback);
+        let end_epoch: u64 = start_epoch.saturating_sub(max_epoch_lookback.saturating_sub(1));
 
         for epoch in (end_epoch..=start_epoch).rev() {
             tracing::debug!(
@@ -97,37 +99,40 @@ where
             );
 
             // Try to get the exporter secret for this epoch
-            if let Ok(Some(secret)) = self
-                .storage()
-                .get_group_exporter_secret(&group_id, epoch)
-                .map_err(|e| Error::Group(e.to_string()))
-            {
-                // Try to decrypt with this epoch's secret
-                match util::decrypt_with_exporter_secret(&secret, encrypted_content) {
-                    Ok(decrypted_bytes) => {
-                        tracing::debug!(
-                            target: "mdk_core::messages::try_decrypt_with_past_epochs",
-                            "Successfully decrypted message with epoch {}",
-                            epoch
-                        );
-                        return Ok(decrypted_bytes);
-                    }
-                    Err(e) => {
-                        tracing::trace!(
-                            target: "mdk_core::messages::try_decrypt_with_past_epochs",
-                            "Failed to decrypt with epoch {}: {:?}",
-                            epoch,
-                            e
-                        );
-                        // Continue to next epoch
+            // Propagate storage errors instead of swallowing them
+            match self.storage().get_group_exporter_secret(&group_id, epoch) {
+                Ok(Some(secret)) => {
+                    // Try to decrypt with this epoch's secret
+                    match util::decrypt_with_exporter_secret(&secret, encrypted_content) {
+                        Ok(decrypted_bytes) => {
+                            tracing::debug!(
+                                target: "mdk_core::messages::try_decrypt_with_past_epochs",
+                                "Successfully decrypted message with epoch {}",
+                                epoch
+                            );
+                            return Ok(decrypted_bytes);
+                        }
+                        Err(e) => {
+                            tracing::trace!(
+                                target: "mdk_core::messages::try_decrypt_with_past_epochs",
+                                "Failed to decrypt with epoch {}: {:?}",
+                                epoch,
+                                e
+                            );
+                            // Continue to next epoch
+                        }
                     }
                 }
-            } else {
-                tracing::trace!(
-                    target: "mdk_core::messages::try_decrypt_with_past_epochs",
-                    "No exporter secret found for epoch {}",
-                    epoch
-                );
+                Ok(None) => {
+                    tracing::trace!(
+                        target: "mdk_core::messages::try_decrypt_with_past_epochs",
+                        "No exporter secret found for epoch {}",
+                        epoch
+                    );
+                }
+                Err(e) => {
+                    return Err(Error::Group(e.to_string()));
+                }
             }
         }
 

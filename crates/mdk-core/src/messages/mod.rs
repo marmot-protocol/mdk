@@ -110,10 +110,20 @@ pub enum MessageProcessingResult {
 impl std::fmt::Debug for MessageProcessingResult {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::ApplicationMessage(msg) => {
-                f.debug_tuple("ApplicationMessage").field(msg).finish()
-            }
-            Self::Proposal(result) => f.debug_tuple("Proposal").field(result).finish(),
+            Self::ApplicationMessage(msg) => f
+                .debug_struct("ApplicationMessage")
+                .field("id", &msg.id)
+                .field("pubkey", &msg.pubkey)
+                .field("kind", &msg.kind)
+                .field("mls_group_id", &"[REDACTED]")
+                .field("created_at", &msg.created_at)
+                .field("state", &msg.state)
+                .finish(),
+            Self::Proposal(result) => f
+                .debug_struct("Proposal")
+                .field("evolution_event_id", &result.evolution_event.id)
+                .field("mls_group_id", &"[REDACTED]")
+                .finish(),
             Self::PendingProposal { .. } => f
                 .debug_struct("PendingProposal")
                 .field("mls_group_id", &"[REDACTED]")
