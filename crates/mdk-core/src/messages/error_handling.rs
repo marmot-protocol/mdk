@@ -990,6 +990,84 @@ mod tests {
         }
     }
 
+    /// Test that sanitize_error_reason covers all explicitly mapped error variants
+    /// and falls back to "processing_failed" for unmapped variants
+    #[test]
+    fn test_sanitize_error_reason_all_variants() {
+        use crate::MDK;
+        use mdk_memory_storage::MdkMemoryStorage;
+        use nostr::Kind;
+
+        // Test explicitly mapped error variants
+        assert_eq!(
+            MDK::<MdkMemoryStorage>::sanitize_error_reason(&Error::UnexpectedEvent {
+                expected: Kind::MlsGroupMessage,
+                received: Kind::TextNote,
+            }),
+            "invalid_event_type"
+        );
+
+        assert_eq!(
+            MDK::<MdkMemoryStorage>::sanitize_error_reason(&Error::MissingGroupIdTag),
+            "invalid_event_format"
+        );
+
+        assert_eq!(
+            MDK::<MdkMemoryStorage>::sanitize_error_reason(&Error::InvalidGroupIdFormat(
+                "bad format".to_string()
+            )),
+            "invalid_event_format"
+        );
+
+        assert_eq!(
+            MDK::<MdkMemoryStorage>::sanitize_error_reason(&Error::MultipleGroupIdTags(3)),
+            "invalid_event_format"
+        );
+
+        assert_eq!(
+            MDK::<MdkMemoryStorage>::sanitize_error_reason(&Error::InvalidTimestamp(
+                "future timestamp".to_string()
+            )),
+            "invalid_event_format"
+        );
+
+        assert_eq!(
+            MDK::<MdkMemoryStorage>::sanitize_error_reason(&Error::GroupNotFound),
+            "group_not_found"
+        );
+
+        assert_eq!(
+            MDK::<MdkMemoryStorage>::sanitize_error_reason(&Error::CannotDecryptOwnMessage),
+            "own_message"
+        );
+
+        assert_eq!(
+            MDK::<MdkMemoryStorage>::sanitize_error_reason(&Error::AuthorMismatch),
+            "authentication_failed"
+        );
+
+        assert_eq!(
+            MDK::<MdkMemoryStorage>::sanitize_error_reason(&Error::CommitFromNonAdmin),
+            "authorization_failed"
+        );
+
+        // Test catch-all for unmapped variants (should return "processing_failed")
+        assert_eq!(
+            MDK::<MdkMemoryStorage>::sanitize_error_reason(&Error::MessageNotFound),
+            "processing_failed"
+        );
+
+        assert_eq!(
+            MDK::<MdkMemoryStorage>::sanitize_error_reason(&Error::OwnLeafNotFound),
+            "processing_failed"
+        );
+
+        assert_eq!(
+            MDK::<MdkMemoryStorage>::sanitize_error_reason(&Error::ProcessMessageWrongEpoch(5)),
+            "processing_failed"
+        );
+    }
+
     #[test]
     fn test_record_failure_preserves_message_event_id() {
         let mdk = create_test_mdk();
