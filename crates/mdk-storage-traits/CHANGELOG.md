@@ -56,7 +56,7 @@
 
 ### Changed
 
-- **Message Sorting**: The `GroupStorage::messages()` method now sorts messages by `created_at DESC, id DESC` (instead of just `created_at DESC`). The secondary sort by `id` ensures deterministic ordering when timestamps are equal (common with second-precision timestamps), and guarantees that the first message in the result matches `group.last_message_id`. ([#166](https://github.com/marmot-protocol/mdk/pull/166))
+- **Message Sorting**: The `GroupStorage::messages()` method now sorts messages by `created_at DESC, processed_at DESC, id DESC` (instead of just `created_at DESC`). The secondary sort by `processed_at` keeps messages in reception order when `created_at` is the same (avoids visual reordering). The tertiary sort by `id` ensures deterministic ordering when both timestamps are equal. ([#166](https://github.com/marmot-protocol/mdk/pull/166))
 
 ### Added
 

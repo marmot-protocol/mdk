@@ -121,12 +121,15 @@ impl GroupStorage for MdkMemoryStorage {
                 // Collect values from HashMap into a Vec for sorting
                 let mut messages: Vec<Message> = messages_map.values().cloned().collect();
 
-                // Sort by created_at DESC, then id DESC (newest first)
-                // The secondary sort by id ensures deterministic ordering when
-                // timestamps are equal (e.g., multiple messages in the same second)
+                // Sort by created_at DESC, then processed_at DESC, then id DESC (newest first)
+                // The secondary sort by processed_at keeps messages in the order they were
+                // received locally when created_at is the same (avoids visual reordering).
+                // The tertiary sort by id ensures deterministic ordering when both timestamps
+                // are equal (e.g., multiple messages in the same second from different senders).
                 messages.sort_by(|a, b| {
                     b.created_at
                         .cmp(&a.created_at)
+                        .then_with(|| b.processed_at.cmp(&a.processed_at))
                         .then_with(|| b.id.cmp(&a.id))
                 });
 

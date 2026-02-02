@@ -179,7 +179,7 @@ impl GroupStorage for MdkSqliteStorage {
         self.with_connection(|conn| {
             let mut stmt = conn
                 .prepare(
-                    "SELECT * FROM messages WHERE mls_group_id = ? ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+                    "SELECT * FROM messages WHERE mls_group_id = ? ORDER BY created_at DESC, processed_at DESC, id DESC LIMIT ? OFFSET ?",
                 )
                 .map_err(into_group_err)?;
 

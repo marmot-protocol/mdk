@@ -35,7 +35,7 @@
 
 ### Changed
 
-- **Message Sorting**: The `messages()` query now uses `ORDER BY created_at DESC, id DESC` (adding `id` as secondary sort key). This ensures deterministic ordering for messages with the same timestamp and consistency with `last_message_id` updates. A new composite index `idx_messages_sorting` supports this query. ([#166](https://github.com/marmot-protocol/mdk/pull/166))
+- **Message Sorting**: The `messages()` query now uses `ORDER BY created_at DESC, processed_at DESC, id DESC`. The secondary sort by `processed_at` keeps messages in reception order when `created_at` is the same. The tertiary sort by `id` ensures deterministic ordering. A new composite index `idx_messages_sorting` supports this query. ([#166](https://github.com/marmot-protocol/mdk/pull/166))
 - Upgraded `nostr` dependency from 0.43 to 0.44, replacing deprecated `Timestamp::as_u64()` calls with `Timestamp::as_secs()` ([#162](https://github.com/marmot-protocol/mdk/pull/162))
 - **Persistent Snapshots**: Implemented snapshot support by copying group-specific rows to a dedicated snapshot table. `create_group_snapshot`, `rollback_group_to_snapshot`, and `release_group_snapshot` persist across app restarts. ([#152](https://github.com/marmot-protocol/mdk/pull/152))
 - **Unified Storage Architecture**: `MdkSqliteStorage` now directly implements OpenMLS's `StorageProvider<1>` trait instead of wrapping `openmls_sqlite_storage`. This enables atomic transactions across MLS and MDK state, which is required for proper commit race resolution per MIP-03. ([#148](https://github.com/marmot-protocol/mdk/pull/148))

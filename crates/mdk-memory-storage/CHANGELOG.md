@@ -33,7 +33,7 @@
 
 ### Changed
 
-- **Message Sorting**: The `messages()` method now sorts by `created_at DESC, id DESC` (adding `id` as secondary sort key). This ensures deterministic ordering for messages with the same timestamp and consistency with `last_message_id` updates. ([#166](https://github.com/marmot-protocol/mdk/pull/166))
+- **Message Sorting**: The `messages()` method now sorts by `created_at DESC, processed_at DESC, id DESC`. The secondary sort by `processed_at` keeps messages in reception order when `created_at` is the same. The tertiary sort by `id` ensures deterministic ordering. ([#166](https://github.com/marmot-protocol/mdk/pull/166))
 - **Thread-Safe Snapshots**: Implemented atomic snapshot support using internal locking. `create_group_snapshot`, `rollback_group_to_snapshot`, and `release_group_snapshot` are now supported for testing and race resolution. ([#152](https://github.com/marmot-protocol/mdk/pull/152))
 - **Unified Storage Architecture**: `MdkMemoryStorage` now directly implements OpenMLS's `StorageProvider<1>` trait instead of wrapping `openmls_memory_storage`. This enables unified in-memory storage for both MLS and MDK state, consistent with the SQLite implementation. ([#148](https://github.com/marmot-protocol/mdk/pull/148))
   - Removed `openmls_memory_storage` dependency

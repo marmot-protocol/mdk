@@ -79,14 +79,15 @@ pub trait GroupStorage {
 
     /// Get messages for a group with optional pagination
     ///
-    /// Returns messages ordered by `created_at DESC, id DESC` (newest first).
+    /// Returns messages ordered by `created_at DESC, processed_at DESC, id DESC` (newest first).
     ///
-    /// The secondary sort key (`id DESC`) ensures deterministic ordering when
-    /// multiple messages have the same `created_at` timestamp (which is common
-    /// since Nostr timestamps have second precision). This guarantees that:
-    /// - The first message in the result matches `group.last_message_id`
-    /// - Message order is consistent across multiple calls
-    /// - Messages sent within the same second have a stable order
+    /// The sort keys ensure stable, intuitive ordering:
+    /// - `created_at DESC`: Primary sort by the sender's timestamp
+    /// - `processed_at DESC`: Secondary sort by when this client received the message,
+    ///   which keeps messages in reception order when `created_at` is the same
+    ///   (avoids visual reordering due to clock skew between senders)
+    /// - `id DESC`: Tertiary sort ensures deterministic ordering when both timestamps
+    ///   are equal (e.g., multiple messages in the same second from different senders)
     ///
     /// # Arguments
     /// * `group_id` - The group ID to fetch messages for
@@ -94,7 +95,7 @@ pub trait GroupStorage {
     ///
     /// # Returns
     ///
-    /// Returns a vector of messages ordered by `created_at DESC, id DESC`
+    /// Returns a vector of messages ordered by `created_at DESC, processed_at DESC, id DESC`
     ///
     /// # Errors
     ///
