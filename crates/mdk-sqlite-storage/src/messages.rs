@@ -48,12 +48,13 @@ impl MessageStorage for MdkSqliteStorage {
         self.with_connection(|conn| {
             conn.execute(
                 "INSERT INTO messages
-             (id, pubkey, kind, mls_group_id, created_at, content, tags, event, wrapper_event_id, epoch, state)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             (id, pubkey, kind, mls_group_id, created_at, processed_at, content, tags, event, wrapper_event_id, epoch, state)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(mls_group_id, id) DO UPDATE SET
                  pubkey = excluded.pubkey,
                  kind = excluded.kind,
                  created_at = excluded.created_at,
+                 processed_at = excluded.processed_at,
                  content = excluded.content,
                  tags = excluded.tags,
                  event = excluded.event,
@@ -66,6 +67,7 @@ impl MessageStorage for MdkSqliteStorage {
                     message.kind.as_u16(),
                     message.mls_group_id.as_slice(),
                     message.created_at.as_secs(),
+                    message.processed_at.as_secs(),
                     &message.content,
                     &tags_json,
                     &event_json,
@@ -368,21 +370,17 @@ mod tests {
             EventId::parse("3287abd422284bc3679812c373c52ed4aa0af4f7c57b9c63ec440f6c3ed6c3a2")
                 .unwrap();
 
+        let now = Timestamp::now();
         let message = Message {
             id: event_id,
             pubkey,
             kind: Kind::from(1u16),
             mls_group_id: mls_group_id.clone(),
-            created_at: Timestamp::now(),
+            created_at: now,
+            processed_at: now,
             content: "Test message content".to_string(),
             tags: Tags::new(),
-            event: UnsignedEvent::new(
-                pubkey,
-                Timestamp::now(),
-                Kind::from(9u16),
-                vec![],
-                "content".to_string(),
-            ),
+            event: UnsignedEvent::new(pubkey, now, Kind::from(9u16), vec![], "content".to_string()),
             wrapper_event_id,
             epoch: Some(1),
             state: MessageState::Created,
@@ -478,21 +476,17 @@ mod tests {
             EventId::from_hex("1111111111111111111111111111111111111111111111111111111111111111")
                 .unwrap();
 
+        let now = Timestamp::now();
         let message = Message {
             id: event_id,
             pubkey,
             kind: Kind::from(1u16),
             mls_group_id: mls_group_id.clone(),
-            created_at: Timestamp::now(),
+            created_at: now,
+            processed_at: now,
             content: oversized_content,
             tags: Tags::new(),
-            event: UnsignedEvent::new(
-                pubkey,
-                Timestamp::now(),
-                Kind::from(9u16),
-                vec![],
-                "content".to_string(),
-            ),
+            event: UnsignedEvent::new(pubkey, now, Kind::from(9u16), vec![], "content".to_string()),
             wrapper_event_id,
             epoch: None,
             state: MessageState::Created,
@@ -565,21 +559,17 @@ mod tests {
             EventId::parse("3287abd422284bc3679812c373c52ed4aa0af4f7c57b9c63ec440f6c3ed6c3a2")
                 .unwrap();
 
+        let now = Timestamp::now();
         let message_1 = Message {
             id: same_event_id,
             pubkey,
             kind: Kind::from(1u16),
             mls_group_id: mls_group_id_1.clone(),
-            created_at: Timestamp::now(),
+            created_at: now,
+            processed_at: now,
             content: "Message in group 1".to_string(),
             tags: Tags::new(),
-            event: UnsignedEvent::new(
-                pubkey,
-                Timestamp::now(),
-                Kind::from(9u16),
-                vec![],
-                "content".to_string(),
-            ),
+            event: UnsignedEvent::new(pubkey, now, Kind::from(9u16), vec![], "content".to_string()),
             wrapper_event_id: wrapper_event_id_1,
             epoch: Some(1),
             state: MessageState::Created,
@@ -590,16 +580,11 @@ mod tests {
             pubkey,
             kind: Kind::from(1u16),
             mls_group_id: mls_group_id_2.clone(),
-            created_at: Timestamp::now(),
+            created_at: now,
+            processed_at: now,
             content: "Message in group 2".to_string(),
             tags: Tags::new(),
-            event: UnsignedEvent::new(
-                pubkey,
-                Timestamp::now(),
-                Kind::from(9u16),
-                vec![],
-                "content".to_string(),
-            ),
+            event: UnsignedEvent::new(pubkey, now, Kind::from(9u16), vec![], "content".to_string()),
             wrapper_event_id: wrapper_event_id_2,
             epoch: Some(2),
             state: MessageState::Created,

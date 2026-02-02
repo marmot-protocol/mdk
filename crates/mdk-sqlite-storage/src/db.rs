@@ -215,6 +215,8 @@ pub fn row_to_message(row: &Row) -> SqliteResult<Message> {
     let kind_value: u16 = row.get("kind")?;
     let mls_group_id: GroupId = GroupId::from_slice(row.get_ref("mls_group_id")?.as_blob()?);
     let created_at_value: u64 = row.get("created_at")?;
+    // processed_at may be NULL for rows created before the migration
+    let processed_at_value: Option<u64> = row.get("processed_at")?;
     let content: String = row.get("content")?;
     let tags_json: &str = row.get_ref("tags")?.as_str()?;
     let event_json: &str = row.get_ref("event")?.as_str()?;
@@ -231,6 +233,8 @@ pub fn row_to_message(row: &Row) -> SqliteResult<Message> {
 
     let kind: Kind = Kind::from(kind_value);
     let created_at: Timestamp = Timestamp::from(created_at_value);
+    // Fall back to created_at if processed_at is NULL (for backward compatibility)
+    let processed_at: Timestamp = Timestamp::from(processed_at_value.unwrap_or(created_at_value));
 
     let tags: Tags = serde_json::from_str(tags_json).map_err(map_to_text_boxed_error)?;
 
@@ -249,6 +253,7 @@ pub fn row_to_message(row: &Row) -> SqliteResult<Message> {
         kind,
         mls_group_id,
         created_at,
+        processed_at,
         content,
         tags,
         event,

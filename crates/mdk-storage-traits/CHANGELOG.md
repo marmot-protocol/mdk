@@ -29,6 +29,8 @@
 
 ### Breaking changes
 
+- **Message `processed_at` Field**: Added `processed_at: Timestamp` field to the `Message` struct to track when a message was processed/received by the client. This is distinct from `created_at`, which reflects the sender's timestamp and may differ due to clock skew between devices. This is a breaking change - all code that constructs `Message` structs must now provide this new field. ([#166](https://github.com/marmot-protocol/mdk/pull/166))
+
 - **Retryable Message State**: Added `ProcessedMessageState::Retryable` variant and `MessageStorage::mark_processed_message_retryable()` method to support message retries after rollback or temporary failures. This is a breaking change because `ProcessedMessageState` is not marked `#[non_exhaustive]`, so downstream users must update exhaustive match statements to handle the new `Retryable` variant, and storage trait implementations must implement the new `mark_processed_message_retryable()` method. ([#161](https://github.com/marmot-protocol/mdk/pull/161))
 
 - **Snapshot API**: Added group-scoped snapshot management methods to `MdkStorageProvider` trait to support MIP-03 commit race resolution. Implementations must now provide: ([#152](https://github.com/marmot-protocol/mdk/pull/152))
@@ -53,6 +55,8 @@
 - Changed `GroupStorage::messages()` to accept `Option<Pagination>` parameter instead of having separate `messages()` and `messages_paginated()` methods ([#111](https://github.com/marmot-protocol/mdk/pull/111))
 
 ### Changed
+
+- **Message Sorting**: The `GroupStorage::messages()` method now sorts messages by `created_at DESC, id DESC` (instead of just `created_at DESC`). The secondary sort by `id` ensures deterministic ordering when timestamps are equal (common with second-precision timestamps), and guarantees that the first message in the result matches `group.last_message_id`. ([#166](https://github.com/marmot-protocol/mdk/pull/166))
 
 ### Added
 

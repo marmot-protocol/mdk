@@ -25,6 +25,10 @@
 
 ## Unreleased
 
+### Added
+
+- **Message `processed_at` Field**: The `Message` record now includes a `processed_at: u64` field (Unix timestamp) indicating when this client received/processed the message. This complements the existing `created_at` field (sender's timestamp) and helps clients handle clock skew between devices - messages can now be displayed in reception order if desired. ([#166](https://github.com/marmot-protocol/mdk/pull/166))
+
 ### Breaking changes
 
 - **Security (Audit Issue M)**: Changed `get_message()` to require both `mls_group_id` and `event_id` parameters. This prevents messages from different groups from overwriting each other by scoping lookups to a specific group. ([#124](https://github.com/marmot-protocol/mdk/pull/124))

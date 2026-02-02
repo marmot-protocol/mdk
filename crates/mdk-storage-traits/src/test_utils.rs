@@ -398,6 +398,7 @@ pub mod cross_storage {
             kind: Kind::Custom(445),
             mls_group_id,
             created_at,
+            processed_at: created_at,
             content,
             tags,
             event,

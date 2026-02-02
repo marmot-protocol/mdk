@@ -41,8 +41,13 @@ pub struct Message {
     pub kind: Kind,
     /// The MLS group id of the message
     pub mls_group_id: GroupId,
-    /// The created at timestamp of the message
+    /// The created at timestamp of the message (from the rumor event)
     pub created_at: Timestamp,
+    /// The timestamp when this message was processed/received by this client.
+    /// This is useful for clients that want to display messages in the order
+    /// they were received locally, rather than in the order they were created
+    /// (which may differ due to clock skew between devices).
+    pub processed_at: Timestamp,
     /// The content of the message
     pub content: String,
     /// The tags of the message
@@ -293,17 +298,19 @@ mod tests {
         let pubkey =
             PublicKey::from_hex("8a9de562cbbed225b6ea0118dd3997a02df92c0bffd2224f71081a7450c3e549")
                 .unwrap();
+        let now = Timestamp::now();
         let message = Message {
             id: EventId::all_zeros(),
             pubkey,
             kind: Kind::MlsGroupMessage,
             mls_group_id: GroupId::from_slice(&[1, 2, 3, 4]),
-            created_at: Timestamp::now(),
+            created_at: now,
+            processed_at: now,
             content: "Test message".to_string(),
             tags: Tags::new(),
             event: UnsignedEvent::new(
                 pubkey,
-                Timestamp::now(),
+                now,
                 Kind::MlsGroupMessage,
                 Tags::new(),
                 "Test message".to_string(),

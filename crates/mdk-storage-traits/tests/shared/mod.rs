@@ -71,6 +71,7 @@ pub fn create_test_message(mls_group_id: GroupId, event_id: EventId) -> Message 
         kind: Kind::Custom(445),
         mls_group_id,
         created_at,
+        processed_at: created_at,
         content,
         tags,
         event,

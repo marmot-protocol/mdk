@@ -395,6 +395,7 @@ mod tests {
     fn test_message_processing_result_variants() {
         // Test that MessageProcessingResult variants can be created and matched
         let test_group_id = GroupId::from_slice(&[1, 2, 3, 4]);
+        let now = Timestamp::now();
         let dummy_message = message_types::Message {
             id: EventId::all_zeros(),
             pubkey: PublicKey::from_hex(
@@ -403,7 +404,8 @@ mod tests {
             .unwrap(),
             kind: Kind::TextNote,
             mls_group_id: test_group_id.clone(),
-            created_at: Timestamp::now(),
+            created_at: now,
+            processed_at: now,
             content: "Test".to_string(),
             tags: Tags::new(),
             event: EventBuilder::new(Kind::TextNote, "Test").build(

@@ -32,6 +32,7 @@
 
 ### Changed
 
+- **Message Processing Timestamps**: Messages now record both `created_at` (from the rumor event, reflecting sender's clock) and `processed_at` (when this client processed the message). This allows clients to choose their preferred ordering strategy - by creation time or by reception time. ([#166](https://github.com/marmot-protocol/mdk/pull/166))
 - **MIP-03 Commit Race Resolution**: Commits are now resolved deterministically based on timestamp (earliest wins) and event ID (lexicographically smallest wins). ([#152](https://github.com/marmot-protocol/mdk/pull/152))
   - When multiple valid commits are published for the same epoch, clients converge on the same "winning" commit.
   - If a "better" commit (earlier timestamp) arrives after a "worse" commit has been applied, the client automatically rolls back to the previous epoch and applies the winning commit.
@@ -46,6 +47,7 @@
 
 ### Fixed
 
+- **Message Ordering Consistency**: Fixed inconsistency where `group.last_message_id` might not match `get_messages()[0].id` due to different sorting logic. Both now use `created_at DESC, id DESC` ordering, ensuring the first message returned is always the most recent one. ([#166](https://github.com/marmot-protocol/mdk/pull/166))
 - **Security**: Prevent `GroupId` leakage in `test_commit_race_simple_better_commit_wins` assertion failure messages to avoid exposing sensitive identifiers in logs. ([#152](https://github.com/marmot-protocol/mdk/pull/152))
 
 ### Removed

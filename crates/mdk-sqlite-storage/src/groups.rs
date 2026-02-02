@@ -179,7 +179,7 @@ impl GroupStorage for MdkSqliteStorage {
         self.with_connection(|conn| {
             let mut stmt = conn
                 .prepare(
-                    "SELECT * FROM messages WHERE mls_group_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                    "SELECT * FROM messages WHERE mls_group_id = ? ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
                 )
                 .map_err(into_group_err)?;
 
@@ -496,17 +496,19 @@ mod tests {
             let event_id = EventId::from_slice(&[i as u8; 32]).unwrap();
             let wrapper_event_id = EventId::from_slice(&[100 + i as u8; 32]).unwrap();
 
+            let ts = Timestamp::from((1000 + i) as u64);
             let message = Message {
                 id: event_id,
                 pubkey,
                 kind: Kind::from(1u16),
                 mls_group_id: mls_group_id.clone(),
-                created_at: Timestamp::from((1000 + i) as u64),
+                created_at: ts,
+                processed_at: ts,
                 content: format!("Message {}", i),
                 tags: Tags::new(),
                 event: UnsignedEvent::new(
                     pubkey,
-                    Timestamp::from((1000 + i) as u64),
+                    ts,
                     Kind::from(9u16),
                     vec![],
                     format!("content {}", i),
