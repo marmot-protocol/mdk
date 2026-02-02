@@ -279,30 +279,22 @@ where
                 processed.state == message_types::ProcessedMessageState::EpochInvalidated;
 
             if is_failed || is_epoch_invalidated {
-                let mls_group_id = match self.extract_mls_group_id_from_event(event) {
-                    Some(id) => {
+                match self.extract_mls_group_id_from_event(event) {
+                    Some(mls_group_id) => {
                         tracing::debug!(
                             target: "mdk_core::messages::process_message",
                             "Returning Unprocessable for previously failed/invalidated message with extracted group_id"
                         );
-                        id
+                        return Ok(MessageProcessingResult::Unprocessable { mls_group_id });
                     }
                     None => {
                         tracing::debug!(
                             target: "mdk_core::messages::process_message",
-                            "Cannot extract group_id from previously failed/invalidated message (missing or malformed h-tag)"
+                            "Returning PreviouslyFailed for message without extractable group_id"
                         );
-                        // Return the appropriate error message based on the prior state
-                        let error_msg = if is_failed {
-                            "Message processing previously failed"
-                        } else {
-                            "Message epoch was invalidated"
-                        };
-                        return Err(Error::Message(error_msg.to_string()));
+                        return Ok(MessageProcessingResult::PreviouslyFailed);
                     }
-                };
-
-                return Ok(MessageProcessingResult::Unprocessable { mls_group_id });
+                }
             }
 
             // Allow Retryable messages to be reprocessed after rollback
@@ -431,6 +423,8 @@ mod tests {
         let pending_proposal_result = MessageProcessingResult::PendingProposal {
             mls_group_id: test_group_id.clone(),
         };
+        // PreviouslyFailed: for when a message that previously failed cannot provide a group_id
+        let previously_failed_result = MessageProcessingResult::PreviouslyFailed;
 
         // Test that we can match on variants
         match app_result {
@@ -456,6 +450,11 @@ mod tests {
         match pending_proposal_result {
             MessageProcessingResult::PendingProposal { .. } => {}
             _ => panic!("Expected PendingProposal variant"),
+        }
+
+        match previously_failed_result {
+            MessageProcessingResult::PreviouslyFailed => {}
+            _ => panic!("Expected PreviouslyFailed variant"),
         }
     }
 

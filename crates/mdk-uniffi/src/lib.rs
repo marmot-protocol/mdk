@@ -946,6 +946,7 @@ impl Mdk {
                 mls_group_id: hex::encode(mls_group_id.as_slice()),
                 reason,
             },
+            MessageProcessingResult::PreviouslyFailed => ProcessMessageResult::PreviouslyFailed,
         })
     }
 }
@@ -1038,6 +1039,12 @@ pub enum ProcessMessageResult {
         /// Reason the proposal was ignored
         reason: String,
     },
+    /// Message was previously marked as failed and cannot be reprocessed
+    ///
+    /// This is returned when attempting to process a message that previously
+    /// failed. Unlike throwing an error, this allows clients to handle the
+    /// case gracefully without crashing.
+    PreviouslyFailed,
 }
 
 /// Group representation

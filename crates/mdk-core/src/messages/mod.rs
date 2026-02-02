@@ -105,6 +105,12 @@ pub enum MessageProcessingResult {
         /// The MLS group ID of the message that could not be processed
         mls_group_id: GroupId,
     },
+    /// Message was previously marked as failed and cannot be reprocessed
+    ///
+    /// This variant is returned when a message that previously failed processing
+    /// is received again. Unlike `Unprocessable`, this does not require an MLS group ID
+    /// because the group ID may not be extractable from malformed messages.
+    PreviouslyFailed,
 }
 
 impl std::fmt::Debug for MessageProcessingResult {
@@ -145,6 +151,7 @@ impl std::fmt::Debug for MessageProcessingResult {
                 .debug_struct("Unprocessable")
                 .field("mls_group_id", &"[REDACTED]")
                 .finish(),
+            Self::PreviouslyFailed => f.debug_struct("PreviouslyFailed").finish(),
         }
     }
 }
