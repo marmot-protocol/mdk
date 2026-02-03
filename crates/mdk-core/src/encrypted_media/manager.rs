@@ -145,13 +145,14 @@ where
         // Fast path: try decryption with the current epoch's key
         match self.try_decrypt_media(encrypted_data, reference) {
             Ok(data) => return Ok(data),
-            Err(e) => {
+            Err(e @ EncryptedMediaError::DecryptionFailed { .. }) => {
                 tracing::debug!(
                     target: "mdk_core::encrypted_media::manager",
                     "Current epoch decrypt failed: {}. Trying historical epochs...",
                     e
                 );
             }
+            Err(e) => return Err(e),
         }
 
         // Fallback: try all stored historical epoch secrets
@@ -256,6 +257,7 @@ where
                                         "Epoch {} decrypted but hash verification failed",
                                         epoch
                                     );
+                                    return Err(EncryptedMediaError::HashVerificationFailed);
                                 }
                                 Err(_) => {
                                     tracing::trace!(
