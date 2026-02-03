@@ -317,6 +317,29 @@ impl MessageStorage for MdkSqliteStorage {
             Ok(())
         })
     }
+
+    fn find_message_epoch_by_tag_content(
+        &self,
+        group_id: &mdk_storage_traits::GroupId,
+        content_substring: &str,
+    ) -> Result<Option<u64>, MessageError> {
+        let pattern = format!("%{}%", content_substring);
+        self.with_connection(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT epoch FROM messages
+                     WHERE mls_group_id = ? AND tags LIKE ? AND epoch IS NOT NULL
+                     LIMIT 1",
+                )
+                .map_err(into_message_err)?;
+
+            stmt.query_row(params![group_id.as_slice(), &pattern], |row| {
+                row.get::<_, u64>(0)
+            })
+            .optional()
+            .map_err(into_message_err)
+        })
+    }
 }
 
 #[cfg(test)]
