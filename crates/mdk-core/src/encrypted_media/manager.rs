@@ -8,8 +8,9 @@ use nostr::{Tag as NostrTag, TagKind};
 use sha2::{Digest, Sha256};
 
 use crate::encrypted_media::crypto::{
-    DEFAULT_SCHEME_VERSION, decrypt_data_with_aad, derive_encryption_key, encrypt_data_with_aad,
-    generate_encryption_nonce, is_scheme_version_supported,
+    DEFAULT_SCHEME_VERSION, decrypt_data_with_aad, derive_encryption_key,
+    derive_encryption_key_with_secret, encrypt_data_with_aad, generate_encryption_nonce,
+    is_scheme_version_supported,
 };
 use crate::encrypted_media::metadata::extract_and_process_metadata;
 use crate::encrypted_media::types::{
@@ -132,22 +133,43 @@ where
     ///
     /// The filename for AAD is taken from the MediaReference, which was parsed from the imeta tag.
     /// The scheme_version from MediaReference is used to select the correct encryption scheme.
+    ///
+    /// If decryption fails with the current epoch's key, automatically falls back to trying
+    /// all stored historical epoch secrets. This handles the case where the MLS group epoch
+    /// has advanced (due to member joins/leaves) since the media was originally encrypted.
     pub fn decrypt_from_download(
         &self,
         encrypted_data: &[u8],
         reference: &MediaReference,
     ) -> Result<Vec<u8>, EncryptedMediaError> {
-        let encryption_key = derive_encryption_key(
-            self.mdk,
-            &self.group_id,
-            &reference.scheme_version,
-            &reference.original_hash,
-            &reference.mime_type,
-            &reference.filename,
-        )?;
+        // Fast path: try decryption with the current epoch's key
+        match self.try_decrypt_media(encrypted_data, reference) {
+            Ok(data) => return Ok(data),
+            Err(e) => {
+                tracing::debug!(
+                    target: "mdk_core::encrypted_media::manager",
+                    "Current epoch decrypt failed: {}. Trying historical epochs...",
+                    e
+                );
+            }
+        }
+
+        // Fallback: try all stored historical epoch secrets
+        self.try_decrypt_with_past_epoch_secrets(encrypted_data, reference)
+    }
+
+    /// Decrypt and verify media data using a pre-derived encryption key
+    ///
+    /// Performs ChaCha20-Poly1305 decryption with AAD, then verifies the SHA256 hash
+    /// of the decrypted data matches the original hash from the MediaReference.
+    fn decrypt_and_verify(
+        encrypted_data: &[u8],
+        key: &Secret<[u8; 32]>,
+        reference: &MediaReference,
+    ) -> Result<Vec<u8>, EncryptedMediaError> {
         let decrypted_data = decrypt_data_with_aad(
             encrypted_data,
-            &encryption_key,
+            key,
             &Secret::new(reference.nonce),
             &reference.scheme_version,
             &reference.original_hash,
@@ -161,6 +183,119 @@ where
         }
 
         Ok(decrypted_data)
+    }
+
+    /// Try to decrypt media using the current epoch's encryption key
+    fn try_decrypt_media(
+        &self,
+        encrypted_data: &[u8],
+        reference: &MediaReference,
+    ) -> Result<Vec<u8>, EncryptedMediaError> {
+        let key = derive_encryption_key(
+            self.mdk,
+            &self.group_id,
+            &reference.scheme_version,
+            &reference.original_hash,
+            &reference.mime_type,
+            &reference.filename,
+        )?;
+
+        Self::decrypt_and_verify(encrypted_data, &key, reference)
+    }
+
+    /// Try to decrypt media using historical epoch secrets
+    ///
+    /// Unlike message decryption which uses a limited lookback window, media decryption
+    /// tries all stored epoch secrets because media files may persist on blob servers
+    /// indefinitely and may be downloaded long after the encryption epoch has passed.
+    fn try_decrypt_with_past_epoch_secrets(
+        &self,
+        encrypted_data: &[u8],
+        reference: &MediaReference,
+    ) -> Result<Vec<u8>, EncryptedMediaError> {
+        let group = self
+            .mdk
+            .load_mls_group(&self.group_id)
+            .map_err(|_| EncryptedMediaError::GroupNotFound)?
+            .ok_or(EncryptedMediaError::GroupNotFound)?;
+
+        let current_epoch = group.epoch().as_u64();
+        if current_epoch == 0 {
+            return Err(EncryptedMediaError::DecryptionFailed {
+                reason: "No past epochs available for media decryption".to_string(),
+            });
+        }
+
+        for epoch in (0..current_epoch).rev() {
+            match self
+                .mdk
+                .storage()
+                .get_group_exporter_secret(&self.group_id, epoch)
+            {
+                Ok(Some(secret)) => {
+                    match derive_encryption_key_with_secret(
+                        &secret.secret,
+                        &reference.scheme_version,
+                        &reference.original_hash,
+                        &reference.mime_type,
+                        &reference.filename,
+                    ) {
+                        Ok(key) => {
+                            match Self::decrypt_and_verify(encrypted_data, &key, reference) {
+                                Ok(data) => {
+                                    tracing::debug!(
+                                        target: "mdk_core::encrypted_media::manager",
+                                        "Media epoch fallback succeeded at epoch {}",
+                                        epoch
+                                    );
+                                    return Ok(data);
+                                }
+                                Err(EncryptedMediaError::HashVerificationFailed) => {
+                                    tracing::trace!(
+                                        target: "mdk_core::encrypted_media::manager",
+                                        "Epoch {} decrypted but hash verification failed",
+                                        epoch
+                                    );
+                                }
+                                Err(_) => {
+                                    tracing::trace!(
+                                        target: "mdk_core::encrypted_media::manager",
+                                        "Failed to decrypt media with epoch {}",
+                                        epoch
+                                    );
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            tracing::trace!(
+                                target: "mdk_core::encrypted_media::manager",
+                                "Failed to derive key for epoch {}",
+                                epoch
+                            );
+                        }
+                    }
+                }
+                Ok(None) => {
+                    tracing::trace!(
+                        target: "mdk_core::encrypted_media::manager",
+                        "No exporter secret found for epoch {}",
+                        epoch
+                    );
+                }
+                Err(_) => {
+                    return Err(EncryptedMediaError::DecryptionFailed {
+                        reason: "Storage error while reading epoch secrets".to_string(),
+                    });
+                }
+            }
+        }
+
+        Err(EncryptedMediaError::DecryptionFailed {
+            reason: format!(
+                "Media decryption failed with all epoch secrets (epochs 0..{})",
+                current_epoch
+            ),
+        })
     }
 
     /// Create an imeta tag for encrypted media (after upload)
@@ -1255,5 +1390,65 @@ mod tests {
             result,
             Err(EncryptedMediaError::DecryptionFailed { .. })
         ));
+    }
+
+    #[test]
+    fn test_decrypt_from_download_epoch_fallback() {
+        use crate::test_util::create_nostr_group_config_data;
+        use nostr::Keys;
+
+        let mdk = create_test_mdk();
+
+        // Create a group so we have secrets for encryption/decryption
+        let alice_keys = Keys::generate();
+        let admins = vec![alice_keys.public_key()];
+        let create_result = mdk
+            .create_group(
+                &alice_keys.public_key(),
+                vec![],
+                create_nostr_group_config_data(admins),
+            )
+            .expect("Failed to create group");
+
+        let group_id = create_result.group.mls_group_id.clone();
+
+        // Merge the pending commit to finalize group creation
+        mdk.merge_pending_commit(&group_id)
+            .expect("Failed to merge pending commit");
+
+        // Encrypt media at the current epoch
+        let manager = mdk.media_manager(group_id.clone());
+        let data = b"epoch fallback test data";
+        let upload = manager
+            .encrypt_for_upload(data, "text/plain", "fallback.txt")
+            .expect("Failed to encrypt media");
+
+        let media_ref =
+            manager.create_media_reference(&upload, "https://example.com/fallback".to_string());
+
+        // Verify decryption works at the current epoch (sanity check)
+        let decrypted = manager
+            .decrypt_from_download(&upload.encrypted_data, &media_ref)
+            .expect("Failed to decrypt at current epoch");
+        assert_eq!(decrypted, data);
+
+        // Advance the epoch multiple times via self_update + merge_pending_commit
+        for _ in 0..3 {
+            mdk.self_update(&group_id)
+                .expect("Failed to perform self update");
+            mdk.merge_pending_commit(&group_id)
+                .expect("Failed to merge pending commit for self update");
+        }
+
+        // The current epoch's key is now different from when the media was encrypted.
+        // decrypt_from_download should fall back to historical epoch secrets.
+        let manager = mdk.media_manager(group_id);
+        let decrypted = manager
+            .decrypt_from_download(&upload.encrypted_data, &media_ref)
+            .expect("Epoch fallback decryption failed");
+        assert_eq!(
+            decrypted, data,
+            "Decrypted data should match original after epoch advancement"
+        );
     }
 }

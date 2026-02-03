@@ -88,9 +88,10 @@ fn build_aad(
     aad
 }
 
-/// Derive encryption key from MLS group secret according to Marmot protocol specification
+/// Derive encryption key from the current epoch's MLS group secret
 ///
-/// As specified in Marmot protocol 04.md, the encryption key is derived using:
+/// Looks up the current epoch's exporter secret and derives the encryption
+/// key according to the Marmot protocol 04.md specification:
 /// file_key = HKDF-Expand(exporter_secret, SCHEME_LABEL || 0x00 || file_hash_bytes || 0x00 || mime_type_bytes || 0x00 || filename_bytes || 0x00 || "key", 32)
 pub fn derive_encryption_key<Storage>(
     mdk: &MDK<Storage>,
@@ -103,21 +104,35 @@ pub fn derive_encryption_key<Storage>(
 where
     Storage: MdkStorageProvider,
 {
-    // Get the group's exporter secret
     let exporter_secret = mdk
         .exporter_secret(group_id)
         .map_err(|_| EncryptedMediaError::GroupNotFound)?;
 
-    // Get scheme label from version
-    let scheme_label = get_scheme_label(scheme_version)?;
+    derive_encryption_key_with_secret(
+        &exporter_secret.secret,
+        scheme_version,
+        original_hash,
+        mime_type,
+        filename,
+    )
+}
 
-    // Create context as specified in Marmot protocol 04.md:
-    // SCHEME_LABEL || 0x00 || file_hash_bytes || 0x00 || mime_type_bytes || 0x00 || filename_bytes || 0x00 || "key"
+/// Derive encryption key from an explicit exporter secret
+///
+/// This variant accepts a raw exporter secret instead of looking it up.
+/// Used by the epoch fallback logic in media decryption, which needs to try
+/// multiple historical epoch secrets when the current epoch's key doesn't work.
+pub(crate) fn derive_encryption_key_with_secret(
+    exporter_secret: &Secret<[u8; 32]>,
+    scheme_version: &str,
+    original_hash: &[u8; 32],
+    mime_type: &str,
+    filename: &str,
+) -> Result<Secret<[u8; 32]>, EncryptedMediaError> {
+    let scheme_label = get_scheme_label(scheme_version)?;
     let context = build_hkdf_context(scheme_label, original_hash, mime_type, filename, b"key");
 
-    // Use HKDF to derive encryption key with context
-    let hk = Hkdf::<Sha256>::new(None, exporter_secret.secret.as_ref());
-
+    let hk = Hkdf::<Sha256>::new(None, exporter_secret.as_ref());
     let mut key = [0u8; 32];
     hk.expand(&context, &mut key)
         .map_err(|e| EncryptedMediaError::EncryptionFailed {
