@@ -27,6 +27,8 @@
 
 ### Added
 
+- **Epoch Lookup by Tag Content**: Added `find_message_epoch_by_tag_content` method to `MessageStorage` trait for looking up a message's epoch by searching serialized tag content. Used for MIP-04 media decryption epoch hint resolution. ([#167](https://github.com/marmot-protocol/mdk/pull/167))
+
 ### Breaking changes
 
 - **Group `last_message_processed_at` Field**: Added `last_message_processed_at: Option<Timestamp>` field to the `Group` struct to track when the last message was processed/received by this client. This enables consistent ordering between `group.last_message_id` and `get_messages()[0].id` by matching the `messages()` query sort order (`created_at DESC, processed_at DESC, id DESC`). This is a breaking change - all code that constructs `Group` structs must now provide this new field. ([#166](https://github.com/marmot-protocol/mdk/pull/166))

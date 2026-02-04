@@ -31,6 +31,7 @@
 
 - **Message `processed_at` Column**: Added `processed_at` column to the `messages` table via V002 migration to store when messages were processed/received by the client. Existing messages are backfilled with their `created_at` value as a reasonable default. ([#166](https://github.com/marmot-protocol/mdk/pull/166))
 
+- **Epoch Lookup by Tag Content**: Implemented `find_message_epoch_by_tag_content` for SQLite storage using `SELECT epoch FROM messages WHERE tags LIKE ?` query. ([#167](https://github.com/marmot-protocol/mdk/pull/167))
 - **Retryable Message Support**: Updated storage implementation to handle `ProcessedMessageState::Retryable` transitions and persistence. ([#161](https://github.com/marmot-protocol/mdk/pull/161))
 
 ### Breaking changes

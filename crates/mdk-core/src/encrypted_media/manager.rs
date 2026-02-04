@@ -199,12 +199,8 @@ where
             .mdk
             .storage()
             .get_group_exporter_secret(&self.group_id, epoch)
-            .map_err(|_| EncryptedMediaError::DecryptionFailed {
-                reason: format!("Failed to read exporter secret for hinted epoch {}", epoch),
-            })?
-            .ok_or(EncryptedMediaError::DecryptionFailed {
-                reason: format!("No exporter secret found for hinted epoch {}", epoch),
-            })?;
+            .map_err(|_| EncryptedMediaError::NoExporterSecretForEpoch(epoch))?
+            .ok_or(EncryptedMediaError::NoExporterSecretForEpoch(epoch))?;
 
         let key = derive_encryption_key_with_secret(
             &secret.secret,
@@ -440,8 +436,12 @@ mod tests {
 
     use image::{ImageBuffer, Rgb};
     use mdk_memory_storage::MdkMemoryStorage;
+    use mdk_storage_traits::messages::MessageStorage;
+    use mdk_storage_traits::messages::types::{Message, MessageState};
+    use nostr::{Keys, Kind, Tags, Timestamp, UnsignedEvent};
 
     use crate::media_processing::types::MediaProcessingError;
+    use crate::test_util::create_nostr_group_config_data;
 
     fn create_test_mdk() -> MDK<MdkMemoryStorage> {
         MDK::new(MdkMemoryStorage::default())
@@ -1319,11 +1319,6 @@ mod tests {
 
     #[test]
     fn test_decrypt_from_download_epoch_fallback() {
-        use crate::test_util::create_nostr_group_config_data;
-        use mdk_storage_traits::messages::MessageStorage;
-        use mdk_storage_traits::messages::types::{Message, MessageState};
-        use nostr::{Keys, Kind, Tags, Timestamp, UnsignedEvent};
-
         let mdk = create_test_mdk();
 
         // Create a group so we have secrets for encryption/decryption
@@ -1413,11 +1408,6 @@ mod tests {
 
     #[test]
     fn test_decrypt_from_download_epoch_hint() {
-        use crate::test_util::create_nostr_group_config_data;
-        use mdk_storage_traits::messages::MessageStorage;
-        use mdk_storage_traits::messages::types::{Message, MessageState};
-        use nostr::{Keys, Kind, Tags, Timestamp, UnsignedEvent};
-
         let mdk = create_test_mdk();
 
         // Create a group

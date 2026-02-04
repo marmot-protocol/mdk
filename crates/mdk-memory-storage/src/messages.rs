@@ -251,18 +251,23 @@ impl MessageStorage for MdkMemoryStorage {
         content_substring: &str,
     ) -> Result<Option<u64>, MessageError> {
         let inner = self.inner.read();
-        if let Some(group_messages) = inner.messages_by_group_cache.peek(group_id) {
-            for message in group_messages.values() {
-                if let Some(epoch) = message.epoch {
-                    let tags_json = serde_json::to_string(&message.tags).map_err(|e| {
-                        MessageError::DatabaseError(format!("Failed to serialize tags: {}", e))
-                    })?;
-                    if tags_json.contains(content_substring) {
-                        return Ok(Some(epoch));
-                    }
-                }
+
+        let Some(group_messages) = inner.messages_by_group_cache.peek(group_id) else {
+            return Ok(None);
+        };
+
+        for (epoch, message) in group_messages
+            .values()
+            .filter_map(|message| message.epoch.map(|epoch| (epoch, message)))
+        {
+            let tags_json = serde_json::to_string(&message.tags)
+                .map_err(|e| MessageError::DatabaseError(format!("Failed to serialize tags: {e}")))?;
+
+            if tags_json.contains(content_substring) {
+                return Ok(Some(epoch));
             }
         }
+
         Ok(None)
     }
 }
