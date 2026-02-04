@@ -96,8 +96,13 @@ pub struct Group {
     pub admin_pubkeys: BTreeSet<PublicKey>,
     /// Hex encoded Nostr event ID of the last message in the group
     pub last_message_id: Option<EventId>,
-    /// Timestamp of the last message in the group
+    /// Timestamp of the last message in the group (sender's `created_at`)
     pub last_message_at: Option<Timestamp>,
+    /// Timestamp when the last message was processed/received by this client
+    ///
+    /// This is used as a secondary sort key when `last_message_at` values are equal,
+    /// matching the `messages()` query ordering (`created_at DESC, processed_at DESC, id DESC`).
+    pub last_message_processed_at: Option<Timestamp>,
     /// Epoch of the group
     pub epoch: u64,
     /// The state of the group
@@ -189,6 +194,7 @@ mod tests {
             admin_pubkeys: BTreeSet::new(),
             last_message_id: None,
             last_message_at: None,
+            last_message_processed_at: None,
             epoch: 0,
             state: GroupState::Active,
         };

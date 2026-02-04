@@ -47,7 +47,7 @@
 
 ### Fixed
 
-- **Message Ordering Consistency**: Fixed inconsistency where `group.last_message_id` might not match `get_messages()[0].id` due to different sorting logic. Both now use `created_at DESC, id DESC` ordering, ensuring the first message returned is always the most recent one. ([#166](https://github.com/marmot-protocol/mdk/pull/166))
+- **Message Ordering Consistency**: Fixed inconsistency where `group.last_message_id` might not match `get_messages()[0].id` due to different sorting logic. The `last_message_id` update logic now uses `created_at DESC, processed_at DESC, id DESC` ordering to match the `messages()` query, ensuring the first message returned is always the same as `last_message_id`. Added `last_message_processed_at` field to `Group` to track this secondary sort key. ([#166](https://github.com/marmot-protocol/mdk/pull/166))
 - **Security**: Prevent `GroupId` leakage in `test_commit_race_simple_better_commit_wins` assertion failure messages to avoid exposing sensitive identifiers in logs. ([#152](https://github.com/marmot-protocol/mdk/pull/152))
 
 ### Removed

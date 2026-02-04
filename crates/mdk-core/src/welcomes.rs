@@ -237,6 +237,7 @@ where
             admin_pubkeys: welcome_preview.nostr_group_data.admins.clone(),
             last_message_id: None,
             last_message_at: None,
+            last_message_processed_at: None,
             epoch: welcome_preview
                 .staged_welcome
                 .group_context()

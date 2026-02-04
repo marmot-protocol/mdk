@@ -1073,6 +1073,7 @@ where
             admin_pubkeys: group_data.clone().admins,
             last_message_id: None,
             last_message_at: None,
+            last_message_processed_at: None,
             epoch: mls_group.epoch().as_u64(),
             state: group_types::GroupState::Active,
             image_hash: config.image_hash,

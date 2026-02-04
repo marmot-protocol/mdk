@@ -1061,8 +1061,14 @@ pub struct Group {
     pub admin_pubkeys: Vec<String>,
     /// Last message event ID (hex-encoded)
     pub last_message_id: Option<String>,
-    /// Timestamp of last message (Unix timestamp)
+    /// Timestamp of last message (Unix timestamp, sender's `created_at`)
     pub last_message_at: Option<u64>,
+    /// Timestamp when the last message was processed/received (Unix timestamp)
+    ///
+    /// This differs from `last_message_at` which reflects the sender's timestamp.
+    /// `last_message_processed_at` reflects when this client received the message,
+    /// which may differ due to network delays or clock skew.
+    pub last_message_processed_at: Option<u64>,
     /// Current epoch number
     pub epoch: u64,
     /// Group state (e.g., "active", "archived")
@@ -1082,6 +1088,7 @@ impl From<group_types::Group> for Group {
             admin_pubkeys: g.admin_pubkeys.iter().map(|pk| pk.to_hex()).collect(),
             last_message_id: g.last_message_id.map(|id| id.to_hex()),
             last_message_at: g.last_message_at.map(|ts| ts.as_secs()),
+            last_message_processed_at: g.last_message_processed_at.map(|ts| ts.as_secs()),
             epoch: g.epoch,
             state: g.state.as_str().to_string(),
         }

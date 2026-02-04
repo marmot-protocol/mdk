@@ -27,6 +27,8 @@
 
 ### Added
 
+- **Group `last_message_processed_at` Field**: The `Group` record now includes an optional `last_message_processed_at: u64` field (Unix timestamp) indicating when the last message was received/processed by this client. This complements `last_message_at` (sender's timestamp) and ensures `last_message_id` is consistent with the first message returned by `get_messages()`. ([#166](https://github.com/marmot-protocol/mdk/pull/166))
+
 - **Message `processed_at` Field**: The `Message` record now includes a `processed_at: u64` field (Unix timestamp) indicating when this client received/processed the message. This complements the existing `created_at` field (sender's timestamp) and helps clients handle clock skew between devices - messages can now be displayed in reception order if desired. ([#166](https://github.com/marmot-protocol/mdk/pull/166))
 
 ### Breaking changes

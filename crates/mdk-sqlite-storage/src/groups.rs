@@ -114,13 +114,17 @@ impl GroupStorage for MdkSqliteStorage {
         let last_message_id: Option<&[u8; 32]> =
             group.last_message_id.as_ref().map(|id| id.as_bytes());
         let last_message_at: Option<u64> = group.last_message_at.as_ref().map(|ts| ts.as_secs());
+        let last_message_processed_at: Option<u64> = group
+            .last_message_processed_at
+            .as_ref()
+            .map(|ts| ts.as_secs());
 
         self.with_connection(|conn| {
             conn.execute(
                 "INSERT INTO groups
              (mls_group_id, nostr_group_id, name, description, image_hash, image_key, image_nonce, admin_pubkeys, last_message_id,
-              last_message_at, epoch, state)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              last_message_at, last_message_processed_at, epoch, state)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(mls_group_id) DO UPDATE SET
                 nostr_group_id = excluded.nostr_group_id,
                 name = excluded.name,
@@ -131,6 +135,7 @@ impl GroupStorage for MdkSqliteStorage {
                 admin_pubkeys = excluded.admin_pubkeys,
                 last_message_id = excluded.last_message_id,
                 last_message_at = excluded.last_message_at,
+                last_message_processed_at = excluded.last_message_processed_at,
                 epoch = excluded.epoch,
                 state = excluded.state",
                 params![
@@ -144,6 +149,7 @@ impl GroupStorage for MdkSqliteStorage {
                     &admin_pubkeys_json,
                     last_message_id,
                     &last_message_at,
+                    &last_message_processed_at,
                     &(group.epoch as i64),
                     group.state.as_str()
                 ],
@@ -364,6 +370,7 @@ mod tests {
             admin_pubkeys: BTreeSet::new(),
             last_message_id: None,
             last_message_at: None,
+            last_message_processed_at: None,
             epoch: 0,
             state: GroupState::Active,
             image_hash,
@@ -410,6 +417,7 @@ mod tests {
             admin_pubkeys: BTreeSet::new(),
             last_message_id: None,
             last_message_at: None,
+            last_message_processed_at: None,
             epoch: 0,
             state: GroupState::Active,
             image_hash: None,
@@ -444,6 +452,7 @@ mod tests {
             admin_pubkeys: BTreeSet::new(),
             last_message_id: None,
             last_message_at: None,
+            last_message_processed_at: None,
             epoch: 0,
             state: GroupState::Active,
             image_hash: None,
@@ -481,6 +490,7 @@ mod tests {
             admin_pubkeys: BTreeSet::new(),
             last_message_id: None,
             last_message_at: None,
+            last_message_processed_at: None,
             epoch: 0,
             state: GroupState::Active,
             image_hash: None,
@@ -610,6 +620,7 @@ mod tests {
             admin_pubkeys: BTreeSet::new(),
             last_message_id: None,
             last_message_at: None,
+            last_message_processed_at: None,
             epoch: 0,
             state: GroupState::Active,
             image_hash: None,
@@ -695,6 +706,7 @@ mod tests {
             admin_pubkeys: BTreeSet::new(),
             last_message_id: None,
             last_message_at: None,
+            last_message_processed_at: None,
             epoch: 0,
             state: GroupState::Active,
             image_hash: None,
@@ -713,6 +725,7 @@ mod tests {
             admin_pubkeys: BTreeSet::new(),
             last_message_id: None,
             last_message_at: None,
+            last_message_processed_at: None,
             epoch: 0,
             state: GroupState::Active,
             image_hash: None,

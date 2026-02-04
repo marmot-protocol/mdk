@@ -27,6 +27,8 @@
 
 ### Added
 
+- **Group `last_message_processed_at` Column**: Added `last_message_processed_at` column to the `groups` table via V003 migration to track when the last message was processed/received by this client. This enables consistent ordering between `group.last_message_id` and `get_messages()[0].id`. Existing groups are backfilled with their `last_message_at` value as a reasonable default. ([#166](https://github.com/marmot-protocol/mdk/pull/166))
+
 - **Message `processed_at` Column**: Added `processed_at` column to the `messages` table via V002 migration to store when messages were processed/received by the client. Existing messages are backfilled with their `created_at` value as a reasonable default. ([#166](https://github.com/marmot-protocol/mdk/pull/166))
 
 - **Retryable Message Support**: Updated storage implementation to handle `ProcessedMessageState::Retryable` transitions and persistence. ([#161](https://github.com/marmot-protocol/mdk/pull/161))

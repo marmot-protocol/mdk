@@ -124,6 +124,7 @@ fn create_test_group_for_cross_storage(
         admin_pubkeys: BTreeSet::new(),
         last_message_id: None,
         last_message_at: None,
+        last_message_processed_at: None,
         epoch: 0,
         state: GroupState::Active,
         image_hash: None,
