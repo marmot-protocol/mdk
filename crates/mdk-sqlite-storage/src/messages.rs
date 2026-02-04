@@ -323,12 +323,16 @@ impl MessageStorage for MdkSqliteStorage {
         group_id: &mdk_storage_traits::GroupId,
         content_substring: &str,
     ) -> Result<Option<u64>, MessageError> {
-        let pattern = format!("%{}%", content_substring);
+        let escaped = content_substring
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let pattern = format!("%{}%", escaped);
         self.with_connection(|conn| {
             let mut stmt = conn
                 .prepare(
                     "SELECT epoch FROM messages
-                     WHERE mls_group_id = ? AND tags LIKE ? AND epoch IS NOT NULL
+                     WHERE mls_group_id = ? AND tags LIKE ? ESCAPE '\\' AND epoch IS NOT NULL
                      LIMIT 1",
                 )
                 .map_err(into_message_err)?;

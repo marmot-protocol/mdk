@@ -100,6 +100,9 @@ pub trait MessageStorage {
     /// historical epoch secrets. The caller typically searches for the IMETA tag's
     /// `x <hex_hash>` field which uniquely identifies the media file.
     ///
+    /// `content_substring` is treated as a literal substring match. SQL backends
+    /// must escape `%` and `_` characters to prevent LIKE wildcard expansion.
+    ///
     /// Returns `Ok(Some(epoch))` if a matching message with a non-null epoch is found,
     /// `Ok(None)` if no match exists.
     fn find_message_epoch_by_tag_content(

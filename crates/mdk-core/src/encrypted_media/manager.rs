@@ -142,7 +142,26 @@ where
         encrypted_data: &[u8],
         reference: &MediaReference,
     ) -> Result<Vec<u8>, EncryptedMediaError> {
-        self.try_decrypt_with_epoch_hint(encrypted_data, reference)
+        match self.try_decrypt_with_epoch_hint(encrypted_data, reference) {
+            Ok(data) => Ok(data),
+            Err(EncryptedMediaError::NoExporterSecretForEpoch(_))
+            | Err(EncryptedMediaError::DecryptionFailed { .. }) => {
+                tracing::debug!(
+                    target: "mdk_core::encrypted_media::manager",
+                    "Epoch hint unavailable or failed, falling back to current epoch key",
+                );
+                let key = derive_encryption_key(
+                    self.mdk,
+                    &self.group_id,
+                    &reference.scheme_version,
+                    &reference.original_hash,
+                    &reference.mime_type,
+                    &reference.filename,
+                )?;
+                Self::decrypt_and_verify(encrypted_data, &key, reference)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Decrypt and verify media data using a pre-derived encryption key
