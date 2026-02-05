@@ -754,4 +754,84 @@ mod tests {
             .unwrap();
         assert_eq!(found.state, ProcessedMessageState::Processed);
     }
+
+    /// Verifies that %, _, and \ in content_substring are treated as literal
+    /// characters and not as SQL LIKE wildcards.
+    #[test]
+    fn test_find_message_epoch_by_tag_content_escapes_like_wildcards() {
+        let storage = MdkSqliteStorage::new_in_memory().unwrap();
+
+        let group_id = GroupId::from_slice(&[1, 2, 3, 4]);
+        let mut nostr_group_id = [0u8; 32];
+        nostr_group_id[0..4].copy_from_slice(&[1, 2, 3, 4]);
+
+        let group = Group {
+            mls_group_id: group_id.clone(),
+            nostr_group_id,
+            name: "Test Group".to_string(),
+            description: "A test group".to_string(),
+            admin_pubkeys: BTreeSet::new(),
+            last_message_id: None,
+            last_message_at: None,
+            epoch: 0,
+            state: GroupState::Active,
+            image_hash: None,
+            image_key: None,
+            image_nonce: None,
+        };
+        storage.save_group(group).unwrap();
+
+        let pubkey =
+            PublicKey::parse("79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
+                .unwrap();
+        let event_id = EventId::from_slice(&[10u8; 32]).unwrap();
+        let wrapper_event_id = EventId::from_slice(&[200u8; 32]).unwrap();
+
+        // Store a message with tags containing "x abc" (no wildcards)
+        let tags = Tags::parse(vec![vec!["imeta", "x abc"]]).unwrap();
+        let message = Message {
+            id: event_id,
+            pubkey,
+            kind: Kind::from(445u16),
+            mls_group_id: group_id.clone(),
+            created_at: Timestamp::from(1000u64),
+            content: "".to_string(),
+            tags: tags.clone(),
+            event: UnsignedEvent::new(
+                pubkey,
+                Timestamp::from(1000u64),
+                Kind::from(445u16),
+                tags,
+                "".to_string(),
+            ),
+            wrapper_event_id,
+            epoch: Some(42),
+            state: MessageState::Processed,
+        };
+        storage.save_message(message).unwrap();
+
+        // Searching for exact content should find it
+        let result = storage
+            .find_message_epoch_by_tag_content(&group_id, "x abc")
+            .unwrap();
+        assert_eq!(result, Some(42), "Exact substring should match");
+
+        // Searching with SQL wildcard % should NOT match (treated literally)
+        let result = storage
+            .find_message_epoch_by_tag_content(&group_id, "x%abc")
+            .unwrap();
+        assert_eq!(result, None, "% must be treated as a literal, not a wildcard");
+
+        // Searching with SQL wildcard _ should NOT match (treated literally)
+        let result = storage
+            .find_message_epoch_by_tag_content(&group_id, "x_abc")
+            .unwrap();
+        assert_eq!(result, None, "_ must be treated as a literal, not a wildcard");
+
+        // Searching with backslash should NOT match (treated literally)
+        let result = storage
+            .find_message_epoch_by_tag_content(&group_id, "x\\abc")
+            .unwrap();
+        assert_eq!(result, None, "\\ must be treated as a literal, not an escape");
+    }
 }

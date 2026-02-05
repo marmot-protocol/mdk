@@ -869,4 +869,131 @@ mod tests {
             .unwrap();
         assert_eq!(found.state, ProcessedMessageState::Processed);
     }
+
+    /// Verifies that querying a group with no stored messages returns Ok(None).
+    #[test]
+    fn test_find_message_epoch_by_tag_content_unknown_group() {
+        let storage = MdkMemoryStorage::new();
+        let unknown_group_id = GroupId::from_slice(&[99, 99, 99, 99]);
+
+        let result = storage
+            .find_message_epoch_by_tag_content(&unknown_group_id, "x abcdef")
+            .unwrap();
+
+        assert_eq!(result, None);
+    }
+
+    /// Verifies that when messages exist but none contain the searched
+    /// substring, Ok(None) is returned.
+    #[test]
+    fn test_find_message_epoch_by_tag_content_no_matching_tag() {
+        let storage = MdkMemoryStorage::new();
+        let group_id = GroupId::from_slice(&[1, 2, 3, 4]);
+
+        let group = create_test_group(group_id.clone());
+        storage.save_group(group).unwrap();
+
+        let event_id = EventId::from_slice(&[10u8; 32]).unwrap();
+        let message = create_test_message_with_epoch(
+            event_id,
+            group_id.clone(),
+            "some content",
+            1000,
+            Some(5),
+        );
+        storage.save_message(message).unwrap();
+
+        let result = storage
+            .find_message_epoch_by_tag_content(&group_id, "x deadbeef_not_present")
+            .unwrap();
+
+        assert_eq!(result, None);
+    }
+
+    /// Verifies the happy path: a message with matching tag content and a
+    /// non-null epoch returns Ok(Some(epoch)).
+    #[test]
+    fn test_find_message_epoch_by_tag_content_happy_path() {
+        let storage = MdkMemoryStorage::new();
+        let group_id = GroupId::from_slice(&[1, 2, 3, 4]);
+
+        let group = create_test_group(group_id.clone());
+        storage.save_group(group).unwrap();
+
+        let event_id = EventId::from_slice(&[10u8; 32]).unwrap();
+        let pubkey = Keys::generate().public_key();
+        let wrapper_event_id = EventId::from_slice(&[200u8; 32]).unwrap();
+
+        let tags = Tags::parse(vec![vec!["imeta", "x abcdef123456"]]).unwrap();
+        let message = Message {
+            id: event_id,
+            pubkey,
+            kind: Kind::from(445u16),
+            mls_group_id: group_id.clone(),
+            created_at: Timestamp::from(1000u64),
+            content: "".to_string(),
+            tags: tags.clone(),
+            event: UnsignedEvent::new(
+                pubkey,
+                Timestamp::from(1000u64),
+                Kind::from(445u16),
+                tags,
+                "".to_string(),
+            ),
+            wrapper_event_id,
+            epoch: Some(7),
+            state: MessageState::Processed,
+        };
+        storage.save_message(message).unwrap();
+
+        let result = storage
+            .find_message_epoch_by_tag_content(&group_id, "x abcdef123456")
+            .unwrap();
+
+        assert_eq!(result, Some(7));
+    }
+
+    /// Verifies that messages with epoch: None are skipped even when their
+    /// tags match the search substring.
+    #[test]
+    fn test_find_message_epoch_by_tag_content_skips_null_epoch() {
+        let storage = MdkMemoryStorage::new();
+        let group_id = GroupId::from_slice(&[1, 2, 3, 4]);
+
+        let group = create_test_group(group_id.clone());
+        storage.save_group(group).unwrap();
+
+        let event_id = EventId::from_slice(&[10u8; 32]).unwrap();
+        let pubkey = Keys::generate().public_key();
+        let wrapper_event_id = EventId::from_slice(&[200u8; 32]).unwrap();
+
+        // Store a message with matching tags but epoch: None
+        let tags = Tags::parse(vec![vec!["imeta", "x abcdef123456"]]).unwrap();
+        let message = Message {
+            id: event_id,
+            pubkey,
+            kind: Kind::from(445u16),
+            mls_group_id: group_id.clone(),
+            created_at: Timestamp::from(1000u64),
+            content: "".to_string(),
+            tags: tags.clone(),
+            event: UnsignedEvent::new(
+                pubkey,
+                Timestamp::from(1000u64),
+                Kind::from(445u16),
+                tags,
+                "".to_string(),
+            ),
+            wrapper_event_id,
+            epoch: None,
+            state: MessageState::Processed,
+        };
+        storage.save_message(message).unwrap();
+
+        let result = storage
+            .find_message_epoch_by_tag_content(&group_id, "x abcdef123456")
+            .unwrap();
+
+        assert_eq!(result, None);
+    }
 }

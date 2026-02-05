@@ -253,6 +253,8 @@ mod tests {
             EncryptedMediaError::InvalidImetaTag {
                 reason: "Test invalid tag".to_string(),
             },
+            EncryptedMediaError::NoExporterSecretForEpoch(42),
+            EncryptedMediaError::UnknownSchemeVersion("v99".to_string()),
         ];
 
         // Verify all errors can be formatted (tests Display implementation)
