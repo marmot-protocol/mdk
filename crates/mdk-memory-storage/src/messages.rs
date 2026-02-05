@@ -260,8 +260,9 @@ impl MessageStorage for MdkMemoryStorage {
             .values()
             .filter_map(|message| message.epoch.map(|epoch| (epoch, message)))
         {
-            let tags_json = serde_json::to_string(&message.tags)
-                .map_err(|e| MessageError::DatabaseError(format!("Failed to serialize tags: {e}")))?;
+            let tags_json = serde_json::to_string(&message.tags).map_err(|e| {
+                MessageError::DatabaseError(format!("Failed to serialize tags: {e}"))
+            })?;
 
             if tags_json.contains(content_substring) {
                 return Ok(Some(epoch));
