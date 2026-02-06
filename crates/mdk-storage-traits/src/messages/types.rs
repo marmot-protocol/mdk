@@ -93,8 +93,8 @@ impl Message {
     /// Compares display-order keys without requiring full [`Message`] structs.
     ///
     /// This is useful when the caller only has the raw fields (e.g. from
-    /// [`Group::last_message_at`] / [`Group::last_message_processed_at`] /
-    /// [`Group::last_message_id`]).
+    /// [`crate::groups::types::Group::last_message_at`] / [`crate::groups::types::Group::last_message_processed_at`] /
+    /// [`crate::groups::types::Group::last_message_id`]).
     ///
     /// Returns [`Ordering::Greater`] when the first set of keys (`a_*`) should
     /// appear **before** the second set (`b_*`) in a newest-first list.
