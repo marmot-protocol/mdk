@@ -133,10 +133,9 @@ where
         self.save_message_record(message.clone())?;
         self.save_processed_message_record(processed_message)?;
 
-        // Update last_message_at, last_message_processed_at, and last_message_id
-        group.last_message_at = Some(rumor.created_at);
-        group.last_message_processed_at = Some(now);
-        group.last_message_id = Some(message.id);
+        // Update last_message_at, last_message_processed_at, and last_message_id using
+        // the canonical display-order comparison.
+        group.update_last_message_if_newer(&message);
         self.save_group_record(group)?;
 
         Ok(event)

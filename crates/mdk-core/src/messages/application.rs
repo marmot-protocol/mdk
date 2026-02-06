@@ -83,40 +83,10 @@ where
         self.save_processed_message_record(processed_message.clone())?;
 
         // Update last_message_at, last_message_processed_at, and last_message_id only if this
-        // message should appear first in get_messages(). The comparison logic must match the
-        // messages() query order: `created_at DESC, processed_at DESC, id DESC`.
-        let should_update = match (
-            group.last_message_at,
-            group.last_message_processed_at,
-            group.last_message_id,
-        ) {
-            // No existing last message - always update
-            (None, _, _) => true,
-            // New message has later created_at - update
-            (Some(existing_at), _, _) if rumor.created_at > existing_at => true,
-            // Same created_at, but new message has later processed_at - update
-            (Some(existing_at), Some(existing_processed_at), _)
-                if rumor.created_at == existing_at && now > existing_processed_at =>
-            {
-                true
-            }
-            // Same created_at and processed_at, but new message has larger id - update
-            (Some(existing_at), Some(existing_processed_at), Some(existing_id))
-                if rumor.created_at == existing_at
-                    && now == existing_processed_at
-                    && message.id > existing_id =>
-            {
-                true
-            }
-            // Same created_at, no existing processed_at (backfilled data) - update
-            (Some(existing_at), None, _) if rumor.created_at == existing_at => true,
-            _ => false,
-        };
-
-        if should_update {
-            group.last_message_at = Some(rumor.created_at);
-            group.last_message_processed_at = Some(now);
-            group.last_message_id = Some(message.id);
+        // message should appear first in get_messages(). Delegates to the centralized
+        // Group::update_last_message_if_newer which uses the canonical display ordering
+        // (`created_at DESC, processed_at DESC, id DESC`).
+        if group.update_last_message_if_newer(&message) {
             self.save_group_record(group)?;
         }
 

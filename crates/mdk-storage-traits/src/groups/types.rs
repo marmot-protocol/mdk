@@ -4,6 +4,7 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::str::FromStr;
 
+use crate::messages::types::Message;
 use crate::{GroupId, Secret};
 use nostr::{EventId, PublicKey, RelayUrl, Timestamp};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -109,6 +110,50 @@ pub struct Group {
     pub state: GroupState,
 }
 
+impl Group {
+    /// Updates the group's last-message metadata if `message` should appear
+    /// before the current last message in display order.
+    ///
+    /// Display order is `created_at DESC, processed_at DESC, id DESC`,
+    /// matching the [`crate::groups::GroupStorage::messages()`] query.
+    ///
+    /// Returns `true` if the fields were updated.
+    pub fn update_last_message_if_newer(&mut self, message: &Message) -> bool {
+        let dominated = match (
+            self.last_message_at,
+            self.last_message_processed_at,
+            self.last_message_id,
+        ) {
+            // No existing last message — always update.
+            (None, _, _) => true,
+            // All three fields present — canonical comparison.
+            (Some(existing_at), Some(existing_processed_at), Some(existing_id)) => {
+                Message::compare_display_keys(
+                    message.created_at,
+                    message.processed_at,
+                    message.id,
+                    existing_at,
+                    existing_processed_at,
+                    existing_id,
+                )
+                .is_gt()
+            }
+            // Backfilled data: created_at exists but processed_at is missing.
+            // If the new message ties on created_at it wins (it has a real processed_at).
+            (Some(existing_at), None, _) => message.created_at >= existing_at,
+            // processed_at exists but id is missing (unlikely but safe fallback).
+            (Some(existing_at), Some(_), None) => message.created_at > existing_at,
+        };
+
+        if dominated {
+            self.last_message_at = Some(message.created_at);
+            self.last_message_processed_at = Some(message.processed_at);
+            self.last_message_id = Some(message.id);
+        }
+        dominated
+    }
+}
+
 /// A Nostr MLS group relay
 ///
 /// Stores a relay URL and the MLS group ID it belongs to
@@ -133,9 +178,155 @@ pub struct GroupExporterSecret {
 
 #[cfg(test)]
 mod tests {
+    use crate::messages::types::MessageState;
+    use nostr::{Kind, Tags, UnsignedEvent};
     use serde_json::json;
 
     use super::*;
+
+    fn make_test_group() -> Group {
+        Group {
+            mls_group_id: GroupId::from_slice(&[1, 2, 3]),
+            nostr_group_id: [0u8; 32],
+            name: "Test".to_string(),
+            description: String::new(),
+            image_hash: None,
+            image_key: None,
+            image_nonce: None,
+            admin_pubkeys: BTreeSet::new(),
+            last_message_id: None,
+            last_message_at: None,
+            last_message_processed_at: None,
+            epoch: 0,
+            state: GroupState::Active,
+        }
+    }
+
+    fn make_test_message(created_at: u64, processed_at: u64, id_byte: u8) -> Message {
+        let pubkey =
+            PublicKey::from_hex("8a9de562cbbed225b6ea0118dd3997a02df92c0bffd2224f71081a7450c3e549")
+                .unwrap();
+        let ca = Timestamp::from(created_at);
+        let pa = Timestamp::from(processed_at);
+        Message {
+            id: EventId::from_slice(&[id_byte; 32]).unwrap(),
+            pubkey,
+            kind: Kind::from(1u16),
+            mls_group_id: GroupId::from_slice(&[1, 2, 3]),
+            created_at: ca,
+            processed_at: pa,
+            content: String::new(),
+            tags: Tags::new(),
+            event: UnsignedEvent::new(pubkey, ca, Kind::from(1u16), Tags::new(), String::new()),
+            wrapper_event_id: EventId::all_zeros(),
+            epoch: None,
+            state: MessageState::Processed,
+        }
+    }
+
+    #[test]
+    fn test_update_last_message_if_newer_no_previous() {
+        let mut group = make_test_group();
+        let msg = make_test_message(100, 105, 1);
+        assert!(group.update_last_message_if_newer(&msg));
+        assert_eq!(group.last_message_at, Some(Timestamp::from(100u64)));
+        assert_eq!(
+            group.last_message_processed_at,
+            Some(Timestamp::from(105u64))
+        );
+        assert_eq!(group.last_message_id, Some(msg.id));
+    }
+
+    #[test]
+    fn test_update_last_message_if_newer_newer_created_at_wins() {
+        let mut group = make_test_group();
+        let old = make_test_message(100, 105, 1);
+        group.update_last_message_if_newer(&old);
+
+        let newer = make_test_message(200, 201, 2);
+        assert!(group.update_last_message_if_newer(&newer));
+        assert_eq!(group.last_message_at, Some(Timestamp::from(200u64)));
+    }
+
+    #[test]
+    fn test_update_last_message_if_newer_older_created_at_loses() {
+        let mut group = make_test_group();
+        let current = make_test_message(200, 205, 5);
+        group.update_last_message_if_newer(&current);
+
+        // Even though this was processed much later, it has an older created_at
+        let older = make_test_message(100, 999, 9);
+        assert!(!group.update_last_message_if_newer(&older));
+        assert_eq!(group.last_message_at, Some(Timestamp::from(200u64)));
+    }
+
+    #[test]
+    fn test_update_last_message_if_newer_processed_at_tiebreaker() {
+        let mut group = make_test_group();
+        // First message: created_at=100, processed right away at t=101
+        let first = make_test_message(100, 101, 5);
+        group.update_last_message_if_newer(&first);
+
+        // Second message: also created_at=100, but processed later at t=110
+        let second = make_test_message(100, 110, 3);
+        assert!(group.update_last_message_if_newer(&second));
+        assert_eq!(
+            group.last_message_processed_at,
+            Some(Timestamp::from(110u64))
+        );
+        assert_eq!(group.last_message_id, Some(second.id));
+    }
+
+    #[test]
+    fn test_update_last_message_if_newer_id_tiebreaker() {
+        let mut group = make_test_group();
+        let first = make_test_message(100, 105, 1);
+        group.update_last_message_if_newer(&first);
+
+        // Same created_at and processed_at, larger id wins
+        let second = make_test_message(100, 105, 5);
+        assert!(group.update_last_message_if_newer(&second));
+        assert_eq!(group.last_message_id, Some(second.id));
+    }
+
+    #[test]
+    fn test_update_last_message_if_newer_backfilled_data() {
+        // Simulates a group upgraded from before processed_at existed (has created_at but
+        // no processed_at). A new message with the same created_at should win because it
+        // has a real processed_at.
+        let mut group = make_test_group();
+        group.last_message_at = Some(Timestamp::from(100u64));
+        group.last_message_id = Some(EventId::from_slice(&[1u8; 32]).unwrap());
+        // processed_at is None (backfilled)
+
+        let msg = make_test_message(100, 105, 2);
+        assert!(
+            group.update_last_message_if_newer(&msg),
+            "Should update when processed_at was missing (backfilled data)"
+        );
+        assert_eq!(
+            group.last_message_processed_at,
+            Some(Timestamp::from(105u64))
+        );
+    }
+
+    #[test]
+    fn test_update_last_message_review_scenario() {
+        // Scenario from PR review by erskingardner:
+        // Message A: created_at=100, processed_at=101, id=5
+        // Message B: created_at=100, processed_at=102, id=3
+        // B should win because processed_at=102 > processed_at=101
+        let mut group = make_test_group();
+        let msg_a = make_test_message(100, 101, 5);
+        group.update_last_message_if_newer(&msg_a);
+
+        let msg_b = make_test_message(100, 102, 3);
+        assert!(
+            group.update_last_message_if_newer(&msg_b),
+            "Message B should win: higher processed_at"
+        );
+        assert_eq!(group.last_message_id, Some(msg_b.id));
+    }
 
     #[test]
     fn test_group_state_from_str() {
