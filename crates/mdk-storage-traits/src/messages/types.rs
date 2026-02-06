@@ -5,6 +5,8 @@ use std::fmt;
 use std::str::FromStr;
 
 use crate::GroupId;
+#[allow(unused_imports)] // Referenced in doc links
+use crate::groups::types::Group;
 use nostr::event::Kind;
 use nostr::{EventId, PublicKey, Tags, Timestamp, UnsignedEvent};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
