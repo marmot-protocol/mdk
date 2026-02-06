@@ -512,6 +512,7 @@ mod tests {
             kind: Kind::from(445u16),
             mls_group_id: group_id.clone(),
             created_at: Timestamp::now(),
+            processed_at: Timestamp::now(),
             content: "".to_string(),
             tags: tags.clone(),
             event: UnsignedEvent::new(
@@ -1546,6 +1547,7 @@ mod tests {
             kind: Kind::from(445u16),
             mls_group_id: group_id.clone(),
             created_at: Timestamp::now(),
+            processed_at: Timestamp::now(),
             content: "".to_string(),
             tags: tags.clone(),
             event: UnsignedEvent::new(

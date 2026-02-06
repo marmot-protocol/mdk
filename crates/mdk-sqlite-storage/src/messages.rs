@@ -773,6 +773,7 @@ mod tests {
             admin_pubkeys: BTreeSet::new(),
             last_message_id: None,
             last_message_at: None,
+            last_message_processed_at: None,
             epoch: 0,
             state: GroupState::Active,
             image_hash: None,
@@ -795,6 +796,7 @@ mod tests {
             kind: Kind::from(445u16),
             mls_group_id: group_id.clone(),
             created_at: Timestamp::from(1000u64),
+            processed_at: Timestamp::from(1000u64),
             content: "".to_string(),
             tags: tags.clone(),
             event: UnsignedEvent::new(
