@@ -820,18 +820,27 @@ mod tests {
         let result = storage
             .find_message_epoch_by_tag_content(&group_id, "x%abc")
             .unwrap();
-        assert_eq!(result, None, "% must be treated as a literal, not a wildcard");
+        assert_eq!(
+            result, None,
+            "% must be treated as a literal, not a wildcard"
+        );
 
         // Searching with SQL wildcard _ should NOT match (treated literally)
         let result = storage
             .find_message_epoch_by_tag_content(&group_id, "x_abc")
             .unwrap();
-        assert_eq!(result, None, "_ must be treated as a literal, not a wildcard");
+        assert_eq!(
+            result, None,
+            "_ must be treated as a literal, not a wildcard"
+        );
 
         // Searching with backslash should NOT match (treated literally)
         let result = storage
             .find_message_epoch_by_tag_content(&group_id, "x\\abc")
             .unwrap();
-        assert_eq!(result, None, "\\ must be treated as a literal, not an escape");
+        assert_eq!(
+            result, None,
+            "\\ must be treated as a literal, not an escape"
+        );
     }
 }

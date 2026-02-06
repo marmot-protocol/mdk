@@ -495,10 +495,7 @@ mod tests {
         pubkey: nostr::PublicKey,
         url: &str,
     ) -> u64 {
-        let group = mdk
-            .load_mls_group(group_id)
-            .unwrap()
-            .unwrap();
+        let group = mdk.load_mls_group(group_id).unwrap().unwrap();
         let encryption_epoch = group.epoch().as_u64();
 
         let manager = mdk.media_manager(group_id.clone());
