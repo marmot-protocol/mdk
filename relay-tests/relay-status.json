@@ -1,0 +1,287 @@
+{
+  "last_updated": "2026-02-08T16:11:19.216926Z",
+  "relays": [
+    {
+      "url": "wss://relay.damus.io",
+      "reachable": true,
+      "auth_supported": false,
+      "kind_results": {
+        "443": {
+          "unprotected_accepted": true,
+          "protected_accepted": false,
+          "protected_rejection_reason": "blocked: event marked as protected"
+        },
+        "1": {
+          "unprotected_accepted": true,
+          "protected_accepted": false,
+          "protected_rejection_reason": "blocked: event marked as protected"
+        }
+      },
+      "tested_at": "2026-02-08T16:10:44.603369Z"
+    },
+    {
+      "url": "wss://relay.primal.net",
+      "reachable": true,
+      "auth_supported": false,
+      "kind_results": {
+        "443": {
+          "unprotected_accepted": true,
+          "protected_accepted": false,
+          "protected_rejection_reason": "blocked: event marked as protected"
+        },
+        "1": {
+          "unprotected_accepted": true,
+          "protected_accepted": false,
+          "protected_rejection_reason": "blocked: event marked as protected"
+        }
+      },
+      "tested_at": "2026-02-08T16:10:47.404004Z"
+    },
+    {
+      "url": "wss://nos.lol",
+      "reachable": true,
+      "auth_supported": false,
+      "kind_results": {
+        "1": {
+          "unprotected_accepted": true,
+          "protected_accepted": false,
+          "protected_rejection_reason": "blocked: event marked as protected"
+        },
+        "443": {
+          "unprotected_accepted": true,
+          "protected_accepted": false,
+          "protected_rejection_reason": "blocked: event marked as protected"
+        }
+      },
+      "tested_at": "2026-02-08T16:10:49.506016Z"
+    },
+    {
+      "url": "wss://relay.nostr.band",
+      "reachable": false,
+      "auth_supported": false,
+      "kind_results": {},
+      "error": "Failed to connect",
+      "tested_at": "2026-02-08T16:10:51.758277Z"
+    },
+    {
+      "url": "wss://relay.snort.social",
+      "reachable": true,
+      "auth_supported": false,
+      "kind_results": {
+        "1": {
+          "unprotected_accepted": true,
+          "protected_accepted": false,
+          "protected_rejection_reason": "blocked: event marked as protected"
+        },
+        "443": {
+          "unprotected_accepted": true,
+          "protected_accepted": false,
+          "protected_rejection_reason": "blocked: event marked as protected"
+        }
+      },
+      "tested_at": "2026-02-08T16:10:52.759926Z"
+    },
+    {
+      "url": "wss://relay.nostr.wine",
+      "reachable": false,
+      "auth_supported": false,
+      "kind_results": {},
+      "error": "Failed to connect",
+      "tested_at": "2026-02-08T16:10:54.838516Z"
+    },
+    {
+      "url": "wss://eden.nostr.land",
+      "reachable": false,
+      "auth_supported": false,
+      "kind_results": {},
+      "error": "Failed to connect",
+      "tested_at": "2026-02-08T16:10:55.841043Z"
+    },
+    {
+      "url": "wss://nostr.land",
+      "reachable": false,
+      "auth_supported": false,
+      "kind_results": {},
+      "error": "Failed to connect",
+      "tested_at": "2026-02-08T16:10:56.844015Z"
+    },
+    {
+      "url": "wss://nostr.mutinywallet.com",
+      "reachable": false,
+      "auth_supported": false,
+      "kind_results": {},
+      "error": "Failed to connect",
+      "tested_at": "2026-02-08T16:10:57.846012Z"
+    },
+    {
+      "url": "wss://cache1.primal.net",
+      "reachable": false,
+      "auth_supported": false,
+      "kind_results": {},
+      "error": "Failed to connect",
+      "tested_at": "2026-02-08T16:10:58.848532Z"
+    },
+    {
+      "url": "wss://purplepag.es",
+      "reachable": false,
+      "auth_supported": false,
+      "kind_results": {},
+      "error": "Failed to connect",
+      "tested_at": "2026-02-08T16:10:59.850384Z"
+    },
+    {
+      "url": "wss://filter.nostr1.com",
+      "reachable": false,
+      "auth_supported": false,
+      "kind_results": {},
+      "error": "Failed to connect",
+      "tested_at": "2026-02-08T16:11:00.852467Z"
+    },
+    {
+      "url": "wss://wot.nostr.party",
+      "reachable": true,
+      "auth_supported": false,
+      "kind_results": {
+        "443": {
+          "unprotected_accepted": false,
+          "protected_accepted": false,
+          "protected_rejection_reason": "auth-required: must be published by event author"
+        },
+        "1": {
+          "unprotected_accepted": false,
+          "protected_accepted": false,
+          "protected_rejection_reason": "auth-required: must be published by event author"
+        }
+      },
+      "tested_at": "2026-02-08T16:11:01.854031Z"
+    },
+    {
+      "url": "wss://relay.nostr.dev.br",
+      "reachable": false,
+      "auth_supported": false,
+      "kind_results": {},
+      "error": "Failed to connect",
+      "tested_at": "2026-02-08T16:11:03.833100Z"
+    },
+    {
+      "url": "wss://relay.nostr.inosta.cc",
+      "reachable": false,
+      "auth_supported": false,
+      "kind_results": {},
+      "error": "Failed to connect",
+      "tested_at": "2026-02-08T16:11:04.834902Z"
+    },
+    {
+      "url": "wss://relay.nostr.pub",
+      "reachable": false,
+      "auth_supported": false,
+      "kind_results": {},
+      "error": "Failed to connect",
+      "tested_at": "2026-02-08T16:11:05.837157Z"
+    },
+    {
+      "url": "wss://nostr.rocks",
+      "reachable": false,
+      "auth_supported": false,
+      "kind_results": {},
+      "error": "Failed to connect",
+      "tested_at": "2026-02-08T16:11:06.837515Z"
+    },
+    {
+      "url": "wss://relay.nostr.info",
+      "reachable": false,
+      "auth_supported": false,
+      "kind_results": {},
+      "error": "Failed to connect",
+      "tested_at": "2026-02-08T16:11:07.845143Z"
+    },
+    {
+      "url": "wss://relay.nostrich.de",
+      "reachable": false,
+      "auth_supported": false,
+      "kind_results": {},
+      "error": "Failed to connect",
+      "tested_at": "2026-02-08T16:11:08.846818Z"
+    },
+    {
+      "url": "wss://nostr-pub.wellorder.net",
+      "reachable": true,
+      "auth_supported": false,
+      "kind_results": {
+        "1": {
+          "unprotected_accepted": true,
+          "protected_accepted": true
+        },
+        "443": {
+          "unprotected_accepted": true,
+          "protected_accepted": true
+        }
+      },
+      "tested_at": "2026-02-08T16:11:09.850008Z"
+    },
+    {
+      "url": "wss://relay.wellorder.net",
+      "reachable": true,
+      "auth_supported": false,
+      "kind_results": {
+        "1": {
+          "unprotected_accepted": true,
+          "protected_accepted": true
+        },
+        "443": {
+          "unprotected_accepted": true,
+          "protected_accepted": true
+        }
+      },
+      "tested_at": "2026-02-08T16:11:11.784246Z"
+    },
+    {
+      "url": "wss://nostr-01.yakihonne.com",
+      "reachable": false,
+      "auth_supported": false,
+      "kind_results": {},
+      "error": "Failed to connect",
+      "tested_at": "2026-02-08T16:11:13.749930Z"
+    },
+    {
+      "url": "wss://nostr-02.yakihonne.com",
+      "reachable": false,
+      "auth_supported": false,
+      "kind_results": {},
+      "error": "Failed to connect",
+      "tested_at": "2026-02-08T16:11:14.751457Z"
+    },
+    {
+      "url": "wss://relay.satlantis.io",
+      "reachable": true,
+      "auth_supported": false,
+      "kind_results": {
+        "1": {
+          "unprotected_accepted": true,
+          "protected_accepted": true
+        },
+        "443": {
+          "unprotected_accepted": true,
+          "protected_accepted": true
+        }
+      },
+      "tested_at": "2026-02-08T16:11:15.754225Z"
+    },
+    {
+      "url": "wss://relay.bitcoiner.social",
+      "reachable": false,
+      "auth_supported": false,
+      "kind_results": {},
+      "error": "Failed to connect",
+      "tested_at": "2026-02-08T16:11:17.213016Z"
+    },
+    {
+      "url": "wss://relay.current.fyi",
+      "reachable": false,
+      "auth_supported": false,
+      "kind_results": {},
+      "error": "Failed to connect",
+      "tested_at": "2026-02-08T16:11:18.214824Z"
+    }
+  ]
+}
