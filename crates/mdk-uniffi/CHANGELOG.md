@@ -59,6 +59,7 @@
 - **Build**: Added `RANLIB` configuration for Android NDK toolchain to fix OpenSSL library installation ([#140](https://github.com/marmot-protocol/mdk/pull/140))
 - **Build**: Added Rust target installation checks for both Android and iOS builds with helpful error messages showing how to install missing targets ([#140](https://github.com/marmot-protocol/mdk/pull/140))
 - **Build**: Fixed Windows CI builds for Python and Ruby bindings by installing OpenSSL via vcpkg, resolving `libsqlite3-sys` build failures caused by missing `OPENSSL_DIR` ([#144](https://github.com/marmot-protocol/mdk/pull/144))
+- **Build**: Fixed Windows linker errors for Python and Ruby bindings by adding missing `crypt32` and `user32` system library links required by statically-linked OpenSSL ([#172](https://github.com/marmot-protocol/mdk/pull/172))
 
 ### Removed
 
