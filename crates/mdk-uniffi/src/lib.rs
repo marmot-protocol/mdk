@@ -356,6 +356,10 @@ pub fn new_mdk_unencrypted(
 #[uniffi::export]
 impl Mdk {
     /// Create a key package for a Nostr event
+    ///
+    /// This function does NOT add the NIP-70 protected tag, ensuring maximum relay
+    /// compatibility. Many popular relays (Damus, Primal, nos.lol) reject protected events.
+    /// If you need the protected tag, use `create_key_package_for_event_with_options` instead.
     pub fn create_key_package_for_event(
         &self,
         public_key: String,
@@ -366,6 +370,37 @@ impl Mdk {
 
         let mdk = self.lock()?;
         let (key_package_hex, tags) = mdk.create_key_package_for_event(&pubkey, relay_urls)?;
+
+        let tags: Vec<Vec<String>> = tags.iter().map(|tag| tag.as_slice().to_vec()).collect();
+
+        Ok(KeyPackageResult {
+            key_package: key_package_hex,
+            tags,
+        })
+    }
+
+    /// Create a key package for a Nostr event with additional options
+    ///
+    /// # Arguments
+    ///
+    /// * `public_key` - The Nostr public key (hex) for the credential
+    /// * `relays` - Relay URLs where the key package will be published
+    /// * `protected` - Whether to add the NIP-70 protected tag. When `true`, relays that
+    ///   implement NIP-70 will reject republishing by third parties. However, many popular
+    ///   relays reject protected events entirely. Set to `false` for maximum relay
+    ///   compatibility.
+    pub fn create_key_package_for_event_with_options(
+        &self,
+        public_key: String,
+        relays: Vec<String>,
+        protected: bool,
+    ) -> Result<KeyPackageResult, MdkUniffiError> {
+        let pubkey = parse_public_key(&public_key)?;
+        let relay_urls = parse_relay_urls(&relays)?;
+
+        let mdk = self.lock()?;
+        let (key_package_hex, tags) =
+            mdk.create_key_package_for_event_with_options(&pubkey, relay_urls, protected)?;
 
         let tags: Vec<Vec<String>> = tags.iter().map(|tag| tag.as_slice().to_vec()).collect();
 
