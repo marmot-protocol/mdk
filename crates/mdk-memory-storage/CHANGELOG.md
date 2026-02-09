@@ -27,6 +27,8 @@
 
 ### Added
 
+- **Custom Message Sort Order**: `messages()` now respects the `sort_order` field in `Pagination`, supporting both `CreatedAtFirst` (default) and `ProcessedAtFirst` orderings. ([#171](https://github.com/marmot-protocol/mdk/pull/171))
+- **Last Message by Sort Order**: Implemented `last_message()` to return the most recent message under a given sort order. ([#171](https://github.com/marmot-protocol/mdk/pull/171))
 - **Epoch Lookup by Tag Content**: Implemented `find_message_epoch_by_tag_content` for in-memory storage, scanning cached group messages and matching serialized tags. ([#167](https://github.com/marmot-protocol/mdk/pull/167))
 - **Retryable Message Support**: Updated storage implementation to handle `ProcessedMessageState::Retryable` transitions and persistence. ([#161](https://github.com/marmot-protocol/mdk/pull/161))
 

@@ -23,7 +23,7 @@ use mdk_core::{
 use mdk_sqlite_storage::{EncryptionConfig, MdkSqliteStorage};
 use mdk_storage_traits::{
     GroupId,
-    groups::{Pagination as MessagePagination, types as group_types},
+    groups::{MessageSortOrder, Pagination as MessagePagination, types as group_types},
     messages::types as message_types,
     welcomes::{Pagination as WelcomePagination, types as welcome_types},
 };
@@ -171,6 +171,19 @@ fn vec_to_array<const N: usize>(vec: Option<Vec<u8>>) -> Result<Option<[u8; N]>,
             bytes.len()
         ))),
         None => Ok(None),
+    }
+}
+
+fn parse_message_sort_order(
+    sort_order: Option<&str>,
+) -> Result<Option<MessageSortOrder>, MdkUniffiError> {
+    match sort_order {
+        None => Ok(None),
+        Some("created_at_first") => Ok(Some(MessageSortOrder::CreatedAtFirst)),
+        Some("processed_at_first") => Ok(Some(MessageSortOrder::ProcessedAtFirst)),
+        Some(other) => Err(MdkUniffiError::InvalidInput(format!(
+            "Invalid sort order: {other}. Expected \"created_at_first\" or \"processed_at_first\""
+        ))),
     }
 }
 
@@ -416,23 +429,28 @@ impl Mdk {
     /// * `mls_group_id` - Hex-encoded MLS group ID
     /// * `limit` - Optional maximum number of messages to return (defaults to 1000 if None)
     /// * `offset` - Optional number of messages to skip (defaults to 0 if None)
+    /// * `sort_order` - Optional sort order: `"created_at_first"` (default) or `"processed_at_first"`
     ///
     /// # Returns
     ///
-    /// Returns a vector of messages ordered by creation time
+    /// Returns a vector of messages in the requested sort order
     pub fn get_messages(
         &self,
         mls_group_id: String,
         limit: Option<u32>,
         offset: Option<u32>,
+        sort_order: Option<String>,
     ) -> Result<Vec<Message>, MdkUniffiError> {
         let group_id = parse_group_id(&mls_group_id)?;
-        let pagination = match (limit, offset) {
-            (None, None) => None,
-            _ => Some(MessagePagination::new(
-                limit.map(|l| l as usize),
-                offset.map(|o| o as usize),
-            )),
+        let sort = parse_message_sort_order(sort_order.as_deref())?;
+        let pagination = match (limit, offset, sort) {
+            (None, None, None) => None,
+            _ => {
+                let mut p =
+                    MessagePagination::new(limit.map(|l| l as usize), offset.map(|o| o as usize));
+                p.sort_order = sort;
+                Some(p)
+            }
         };
         Ok(self
             .lock()?
@@ -462,6 +480,34 @@ impl Mdk {
         Ok(self
             .lock()?
             .get_message(&group_id, &event_id)?
+            .map(Message::from))
+    }
+
+    /// Get the most recent message in a group according to the given sort order
+    ///
+    /// This is useful for clients that use `"processed_at_first"` sort order and need
+    /// a "last message" value that is consistent with their `get_messages()` ordering.
+    /// The cached `group.last_message_id` always reflects `"created_at_first"` ordering.
+    ///
+    /// # Arguments
+    ///
+    /// * `mls_group_id` - Hex-encoded MLS group ID
+    /// * `sort_order` - Sort order: `"created_at_first"` or `"processed_at_first"`
+    ///
+    /// # Returns
+    ///
+    /// Returns the most recent message under the given ordering, or None if the group has no messages
+    pub fn get_last_message(
+        &self,
+        mls_group_id: String,
+        sort_order: String,
+    ) -> Result<Option<Message>, MdkUniffiError> {
+        let group_id = parse_group_id(&mls_group_id)?;
+        let sort = parse_message_sort_order(Some(&sort_order))?
+            .ok_or_else(|| MdkUniffiError::InvalidInput("sort_order is required".to_string()))?;
+        Ok(self
+            .lock()?
+            .get_last_message(&group_id, sort)?
             .map(Message::from))
     }
 
@@ -1522,7 +1568,7 @@ mod tests {
     fn test_get_messages_empty_group() {
         let mdk = create_test_mdk();
         let fake_group_id = hex::encode([0u8; 32]);
-        let result = mdk.get_messages(fake_group_id, None, None);
+        let result = mdk.get_messages(fake_group_id, None, None, None);
         // Should return error for non-existent group
         assert!(result.is_err());
     }
@@ -1579,13 +1625,18 @@ mod tests {
 
         // Test 1: Get with default pagination (None, None)
         let default_messages = mdk
-            .get_messages(create_result.group.mls_group_id.clone(), None, None)
+            .get_messages(create_result.group.mls_group_id.clone(), None, None, None)
             .unwrap();
         assert_eq!(default_messages.len(), 1, "Should have 1 message");
 
         // Test 2: Get with explicit limit and offset
         let paginated = mdk
-            .get_messages(create_result.group.mls_group_id.clone(), Some(10), Some(0))
+            .get_messages(
+                create_result.group.mls_group_id.clone(),
+                Some(10),
+                Some(0),
+                None,
+            )
             .unwrap();
         assert_eq!(paginated.len(), 1, "Should have 1 message with pagination");
 
@@ -1595,6 +1646,7 @@ mod tests {
                 create_result.group.mls_group_id.clone(),
                 Some(10),
                 Some(100),
+                None,
             )
             .unwrap();
         assert_eq!(
@@ -1605,7 +1657,12 @@ mod tests {
 
         // Test 4: Get with limit 1
         let limited = mdk
-            .get_messages(create_result.group.mls_group_id.clone(), Some(1), Some(0))
+            .get_messages(
+                create_result.group.mls_group_id.clone(),
+                Some(1),
+                Some(0),
+                None,
+            )
             .unwrap();
         assert_eq!(
             limited.len(),

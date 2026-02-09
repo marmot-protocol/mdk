@@ -464,6 +464,214 @@ pub mod cross_storage {
         assert!(result.is_none());
     }
 
+    /// Test that messages can be sorted by processed_at-first ordering
+    ///
+    /// Creates messages where `created_at` and `processed_at` differ,
+    /// then verifies that `MessageSortOrder::ProcessedAtFirst` changes
+    /// the result order compared to the default `CreatedAtFirst`.
+    pub fn test_messages_sort_order<S>(storage: S)
+    where
+        S: GroupStorage + MessageStorage,
+    {
+        use crate::groups::{MessageSortOrder, Pagination};
+        use nostr::{Kind, PublicKey, Tags, Timestamp, UnsignedEvent};
+
+        let mls_group_id = GroupId::from_slice(&[1, 2, 3, 20]);
+        let group = create_test_group(mls_group_id.clone());
+        storage.save_group(group).unwrap();
+
+        let pubkey =
+            PublicKey::parse("npub1a6awmmklxfmspwdv52qq58sk5c07kghwc4v2eaudjx2ju079cdqs2452ys")
+                .unwrap();
+
+        // Message A: created_at=200, processed_at=100  (created early, processed late? no:
+        //   created LATER at 200 but processed EARLIER at 100)
+        // Message B: created_at=100, processed_at=200  (created earlier but processed later)
+        //
+        // CreatedAtFirst  order: A first (created_at 200 > 100)
+        // ProcessedAtFirst order: B first (processed_at 200 > 100)
+        let id_a = EventId::from_slice(&[0xAA; 32]).unwrap();
+        let id_b = EventId::from_slice(&[0xBB; 32]).unwrap();
+
+        let msg_a = Message {
+            id: id_a,
+            pubkey,
+            kind: Kind::Custom(445),
+            mls_group_id: mls_group_id.clone(),
+            created_at: Timestamp::from(200u64),
+            processed_at: Timestamp::from(100u64),
+            content: "Message A".to_string(),
+            tags: Tags::new(),
+            event: UnsignedEvent::new(
+                pubkey,
+                Timestamp::from(200u64),
+                Kind::Custom(445),
+                vec![],
+                "Message A".to_string(),
+            ),
+            wrapper_event_id: id_a,
+            state: MessageState::Processed,
+            epoch: None,
+        };
+
+        let msg_b = Message {
+            id: id_b,
+            pubkey,
+            kind: Kind::Custom(445),
+            mls_group_id: mls_group_id.clone(),
+            created_at: Timestamp::from(100u64),
+            processed_at: Timestamp::from(200u64),
+            content: "Message B".to_string(),
+            tags: Tags::new(),
+            event: UnsignedEvent::new(
+                pubkey,
+                Timestamp::from(100u64),
+                Kind::Custom(445),
+                vec![],
+                "Message B".to_string(),
+            ),
+            wrapper_event_id: id_b,
+            state: MessageState::Processed,
+            epoch: None,
+        };
+
+        storage.save_message(msg_a).unwrap();
+        storage.save_message(msg_b).unwrap();
+
+        // Default (CreatedAtFirst): A should be first (created_at=200 > 100)
+        let default_order = storage.messages(&mls_group_id, None).unwrap();
+        assert_eq!(default_order.len(), 2);
+        assert_eq!(
+            default_order[0].content, "Message A",
+            "CreatedAtFirst: Message A (created_at=200) should be first"
+        );
+        assert_eq!(default_order[1].content, "Message B");
+
+        // Explicit CreatedAtFirst should match default
+        let created_first = storage
+            .messages(
+                &mls_group_id,
+                Some(Pagination::with_sort_order(
+                    Some(100),
+                    Some(0),
+                    MessageSortOrder::CreatedAtFirst,
+                )),
+            )
+            .unwrap();
+        assert_eq!(created_first[0].content, "Message A");
+        assert_eq!(created_first[1].content, "Message B");
+
+        // ProcessedAtFirst: B should be first (processed_at=200 > 100)
+        let processed_first = storage
+            .messages(
+                &mls_group_id,
+                Some(Pagination::with_sort_order(
+                    Some(100),
+                    Some(0),
+                    MessageSortOrder::ProcessedAtFirst,
+                )),
+            )
+            .unwrap();
+        assert_eq!(
+            processed_first[0].content, "Message B",
+            "ProcessedAtFirst: Message B (processed_at=200) should be first"
+        );
+        assert_eq!(processed_first[1].content, "Message A");
+    }
+
+    /// Test that pagination works correctly with ProcessedAtFirst sort order
+    pub fn test_messages_sort_order_pagination<S>(storage: S)
+    where
+        S: GroupStorage + MessageStorage,
+    {
+        use crate::groups::{MessageSortOrder, Pagination};
+        use nostr::{Kind, PublicKey, Tags, Timestamp, UnsignedEvent};
+
+        let mls_group_id = GroupId::from_slice(&[1, 2, 3, 21]);
+        let group = create_test_group(mls_group_id.clone());
+        storage.save_group(group).unwrap();
+
+        let pubkey =
+            PublicKey::parse("npub1a6awmmklxfmspwdv52qq58sk5c07kghwc4v2eaudjx2ju079cdqs2452ys")
+                .unwrap();
+
+        // Create 4 messages with distinct created_at and processed_at
+        // processed_at order: D(400) > C(300) > B(200) > A(100)
+        // created_at order:   A(400) > B(300) > C(200) > D(100)
+        // (reversed relationship between the two orderings)
+        let test_data = [
+            ("A", [0xA0; 32], 400u64, 100u64),
+            ("B", [0xB0; 32], 300u64, 200u64),
+            ("C", [0xC0; 32], 200u64, 300u64),
+            ("D", [0xD0; 32], 100u64, 400u64),
+        ];
+
+        for (content, id_bytes, created_at, processed_at) in &test_data {
+            let event_id = EventId::from_slice(id_bytes).unwrap();
+            let msg = Message {
+                id: event_id,
+                pubkey,
+                kind: Kind::Custom(445),
+                mls_group_id: mls_group_id.clone(),
+                created_at: Timestamp::from(*created_at),
+                processed_at: Timestamp::from(*processed_at),
+                content: content.to_string(),
+                tags: Tags::new(),
+                event: UnsignedEvent::new(
+                    pubkey,
+                    Timestamp::from(*created_at),
+                    Kind::Custom(445),
+                    vec![],
+                    content.to_string(),
+                ),
+                wrapper_event_id: event_id,
+                state: MessageState::Processed,
+                epoch: None,
+            };
+            storage.save_message(msg).unwrap();
+        }
+
+        // ProcessedAtFirst, page 1 (limit=2, offset=0): D, C
+        let page1 = storage
+            .messages(
+                &mls_group_id,
+                Some(Pagination::with_sort_order(
+                    Some(2),
+                    Some(0),
+                    MessageSortOrder::ProcessedAtFirst,
+                )),
+            )
+            .unwrap();
+        assert_eq!(page1.len(), 2);
+        assert_eq!(page1[0].content, "D");
+        assert_eq!(page1[1].content, "C");
+
+        // ProcessedAtFirst, page 2 (limit=2, offset=2): B, A
+        let page2 = storage
+            .messages(
+                &mls_group_id,
+                Some(Pagination::with_sort_order(
+                    Some(2),
+                    Some(2),
+                    MessageSortOrder::ProcessedAtFirst,
+                )),
+            )
+            .unwrap();
+        assert_eq!(page2.len(), 2);
+        assert_eq!(page2[0].content, "B");
+        assert_eq!(page2[1].content, "A");
+
+        // Verify no overlap between pages
+        let page1_ids: Vec<EventId> = page1.iter().map(|m| m.id).collect();
+        let page2_ids: Vec<EventId> = page2.iter().map(|m| m.id).collect();
+        for id in &page1_ids {
+            assert!(
+                !page2_ids.contains(id),
+                "Pages should not overlap in ProcessedAtFirst ordering"
+            );
+        }
+    }
+
     /// Test message storage functionality with group queries
     pub fn test_messages_for_group<S>(storage: S)
     where

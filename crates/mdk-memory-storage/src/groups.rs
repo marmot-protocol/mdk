@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 use mdk_storage_traits::GroupId;
 use mdk_storage_traits::groups::error::GroupError;
 use mdk_storage_traits::groups::types::*;
-use mdk_storage_traits::groups::{GroupStorage, MAX_MESSAGE_LIMIT, Pagination};
+use mdk_storage_traits::groups::{GroupStorage, MAX_MESSAGE_LIMIT, MessageSortOrder, Pagination};
 use mdk_storage_traits::messages::types::Message;
 use nostr::{PublicKey, RelayUrl};
 
@@ -116,14 +116,23 @@ impl GroupStorage for MdkMemoryStorage {
             return Err(GroupError::InvalidParameters("Group not found".to_string()));
         }
 
+        let sort_order = pagination.sort_order();
+
         match inner.messages_by_group_cache.peek(mls_group_id) {
             Some(messages_map) => {
                 // Collect values from HashMap into a Vec for sorting
                 let mut messages: Vec<Message> = messages_map.values().cloned().collect();
 
-                // Sort by created_at DESC, processed_at DESC, id DESC (newest first).
-                // Uses the centralized display_order_cmp (reversed for DESC).
-                messages.sort_by(|a, b| b.display_order_cmp(a));
+                // Sort newest-first using the requested sort order.
+                // Both comparators are called with (b, a) to get DESC ordering.
+                match sort_order {
+                    MessageSortOrder::CreatedAtFirst => {
+                        messages.sort_by(|a, b| b.display_order_cmp(a));
+                    }
+                    MessageSortOrder::ProcessedAtFirst => {
+                        messages.sort_by(|a, b| b.processed_at_order_cmp(a));
+                    }
+                }
 
                 // Apply pagination
                 let start = offset.min(messages.len());
@@ -133,6 +142,35 @@ impl GroupStorage for MdkMemoryStorage {
             }
             // If not in cache but group exists, return empty vector
             None => Ok(Vec::new()),
+        }
+    }
+
+    fn last_message(
+        &self,
+        mls_group_id: &GroupId,
+        sort_order: MessageSortOrder,
+    ) -> Result<Option<Message>, GroupError> {
+        let inner = self.inner.read();
+
+        if inner.groups_cache.peek(mls_group_id).is_none() {
+            return Err(GroupError::InvalidParameters("Group not found".to_string()));
+        }
+
+        match inner.messages_by_group_cache.peek(mls_group_id) {
+            Some(messages_map) if !messages_map.is_empty() => {
+                // Find the maximum element under the requested ordering.
+                // Both comparators compare (b, a) to find the DESC-first element via max_by.
+                let winner = match sort_order {
+                    MessageSortOrder::CreatedAtFirst => {
+                        messages_map.values().max_by(|a, b| a.display_order_cmp(b))
+                    }
+                    MessageSortOrder::ProcessedAtFirst => messages_map
+                        .values()
+                        .max_by(|a, b| a.processed_at_order_cmp(b)),
+                };
+                Ok(winner.cloned())
+            }
+            _ => Ok(None),
         }
     }
 

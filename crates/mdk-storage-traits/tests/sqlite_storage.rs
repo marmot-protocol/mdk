@@ -93,6 +93,21 @@ test_sqlite_storage!(
     shared::group_tests::test_group_relays_error_for_nonexistent_group
 );
 
+test_sqlite_storage!(
+    test_messages_sort_order_sqlite,
+    shared::group_tests::test_messages_sort_order
+);
+
+test_sqlite_storage!(
+    test_messages_sort_order_pagination_sqlite,
+    shared::group_tests::test_messages_sort_order_pagination
+);
+
+test_sqlite_storage!(
+    test_last_message_sqlite,
+    shared::group_tests::test_last_message
+);
+
 // Welcome functionality tests
 test_sqlite_storage!(
     test_save_and_find_welcome_sqlite,

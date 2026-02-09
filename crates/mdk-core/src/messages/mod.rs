@@ -20,8 +20,8 @@ mod process;
 mod proposal;
 mod validation;
 
-use mdk_storage_traits::groups::Pagination;
 use mdk_storage_traits::groups::types as group_types;
+use mdk_storage_traits::groups::{MessageSortOrder, Pagination};
 use mdk_storage_traits::messages::types as message_types;
 use mdk_storage_traits::{GroupId, MdkStorageProvider};
 use nostr::{EventId, Timestamp};
@@ -224,6 +224,34 @@ where
         self.storage()
             .messages(mls_group_id, pagination)
             .map_err(|_e| Error::Message("Storage error while getting messages".to_string()))
+    }
+
+    /// Returns the most recent message in a group according to the given sort order.
+    ///
+    /// This is useful for clients that use [`MessageSortOrder::ProcessedAtFirst`] and
+    /// need a "last message" value that is consistent with their [`get_messages()`](Self::get_messages)
+    /// ordering. The cached [`Group::last_message_id`](group_types::Group::last_message_id) always
+    /// reflects [`MessageSortOrder::CreatedAtFirst`], so clients using a different sort order
+    /// can call this method instead.
+    ///
+    /// # Arguments
+    ///
+    /// * `mls_group_id` - The MLS group ID
+    /// * `sort_order` - The sort order to use when determining the "last" message
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(Some(Message))` - The most recent message under the given ordering
+    /// * `Ok(None)` - If the group has no messages
+    /// * `Err(Error)` - If the group does not exist or a storage error occurs
+    pub fn get_last_message(
+        &self,
+        mls_group_id: &GroupId,
+        sort_order: MessageSortOrder,
+    ) -> Result<Option<message_types::Message>> {
+        self.storage()
+            .last_message(mls_group_id, sort_order)
+            .map_err(|_e| Error::Message("Storage error while getting last message".to_string()))
     }
 
     // =========================================================================

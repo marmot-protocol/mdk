@@ -27,7 +27,10 @@
 
 ### Added
 
-- **Group `last_message_processed_at` Column**: Added `last_message_processed_at` column to the `groups` table via V003 migration to track when the last message was processed/received by this client. This enables consistent ordering between `group.last_message_id` and `get_messages()[0].id`. Existing groups are backfilled with their `last_message_at` value as a reasonable default. ([#166](https://github.com/marmot-protocol/mdk/pull/166))
+- **Custom Message Sort Order**: `messages()` now respects the `sort_order` field in `Pagination`, supporting both `CreatedAtFirst` (default) and `ProcessedAtFirst` orderings via different SQL `ORDER BY` clauses. ([#171](https://github.com/marmot-protocol/mdk/pull/171))
+- **Last Message by Sort Order**: Implemented `last_message()` to return the most recent message under a given sort order via `SELECT ... ORDER BY ... LIMIT 1`. ([#171](https://github.com/marmot-protocol/mdk/pull/171))
+- **Processed-At-First Sort Index**: Added V003 migration creating `idx_messages_sorting_processed_at` composite index on `messages(mls_group_id, processed_at DESC, created_at DESC, id DESC)` for efficient `ProcessedAtFirst` queries. ([#171](https://github.com/marmot-protocol/mdk/pull/171))
+- **Group `last_message_processed_at` Column**: Added `last_message_processed_at` column to the `groups` table via V002 migration to track when the last message was processed/received by this client. This enables consistent ordering between `group.last_message_id` and `get_messages()[0].id`. Existing groups are backfilled with their `last_message_at` value as a reasonable default. ([#166](https://github.com/marmot-protocol/mdk/pull/166))
 
 - **Message `processed_at` Column**: Added `processed_at` column to the `messages` table via V002 migration to store when messages were processed/received by the client. Existing messages are backfilled with their `created_at` value as a reasonable default. ([#166](https://github.com/marmot-protocol/mdk/pull/166))
 

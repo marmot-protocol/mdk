@@ -27,6 +27,8 @@
 
 ### Added
 
+- **Custom Message Sort Order**: Added `MessageSortOrder` enum with `CreatedAtFirst` (default) and `ProcessedAtFirst` variants to allow clients to choose how messages are ordered. Added `sort_order` field to `Pagination` struct and `Pagination::with_sort_order()` constructor. Added `Message::processed_at_order_cmp()` and `Message::compare_processed_at_keys()` comparison methods for the processed-at-first ordering. ([#171](https://github.com/marmot-protocol/mdk/pull/171))
+- **Last Message by Sort Order**: Added `GroupStorage::last_message()` method to query the most recent message in a group according to a given sort order. This allows clients using `ProcessedAtFirst` ordering to get a "last message" consistent with their `messages()` call, independent of the cached `Group::last_message_id` (which always reflects `CreatedAtFirst`). ([#171](https://github.com/marmot-protocol/mdk/pull/171))
 - **Epoch Lookup by Tag Content**: Added `find_message_epoch_by_tag_content` method to `MessageStorage` trait for looking up a message's epoch by searching serialized tag content. Used for MIP-04 media decryption epoch hint resolution. ([#167](https://github.com/marmot-protocol/mdk/pull/167))
 
 ### Breaking changes

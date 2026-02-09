@@ -111,6 +111,48 @@ impl Message {
             .then_with(|| a_processed_at.cmp(&b_processed_at))
             .then_with(|| a_id.cmp(&b_id))
     }
+
+    /// Compares two messages for processed-at-first ordering.
+    ///
+    /// Messages are sorted in descending order by:
+    /// 1. `processed_at` (most recently received first)
+    /// 2. `created_at` (newest first, as a tiebreaker)
+    /// 3. `id` (largest ID first, for deterministic ordering)
+    ///
+    /// This ordering prioritises local reception time, making it useful
+    /// when clients want to avoid visual reordering caused by clock skew
+    /// between senders.
+    ///
+    /// Returns [`Ordering::Greater`] if `self` should appear **before** `other`
+    /// in a newest-first list.
+    pub fn processed_at_order_cmp(&self, other: &Self) -> Ordering {
+        Self::compare_processed_at_keys(
+            self.processed_at,
+            self.created_at,
+            self.id,
+            other.processed_at,
+            other.created_at,
+            other.id,
+        )
+    }
+
+    /// Compares processed-at-first ordering keys without requiring full [`Message`] structs.
+    ///
+    /// Returns [`Ordering::Greater`] when the first set of keys (`a_*`) should
+    /// appear **before** the second set (`b_*`) in a newest-first list.
+    pub fn compare_processed_at_keys(
+        a_processed_at: Timestamp,
+        a_created_at: Timestamp,
+        a_id: EventId,
+        b_processed_at: Timestamp,
+        b_created_at: Timestamp,
+        b_id: EventId,
+    ) -> Ordering {
+        a_processed_at
+            .cmp(&b_processed_at)
+            .then_with(|| a_created_at.cmp(&b_created_at))
+            .then_with(|| a_id.cmp(&b_id))
+    }
 }
 
 /// The state of the message
@@ -356,6 +398,96 @@ mod tests {
             result,
             Ordering::Less,
             "Message B should win: same created_at but higher processed_at"
+        );
+    }
+
+    #[test]
+    fn test_compare_processed_at_keys_processed_at_wins() {
+        let id_a = EventId::from_slice(&[1u8; 32]).unwrap();
+        let id_b = EventId::from_slice(&[2u8; 32]).unwrap();
+
+        // Message a: processed at t=300, created at t=100
+        // Message b: processed at t=200, created at t=200
+        // a wins because processed_at is the primary sort key
+        let result = Message::compare_processed_at_keys(
+            Timestamp::from(300u64),
+            Timestamp::from(100u64),
+            id_a,
+            Timestamp::from(200u64),
+            Timestamp::from(200u64),
+            id_b,
+        );
+        assert_eq!(result, Ordering::Greater);
+    }
+
+    #[test]
+    fn test_compare_processed_at_keys_created_at_tiebreaker() {
+        let id_a = EventId::from_slice(&[1u8; 32]).unwrap();
+        let id_b = EventId::from_slice(&[2u8; 32]).unwrap();
+
+        // Both processed at t=100, but a was created later (t=120 vs t=105)
+        let result = Message::compare_processed_at_keys(
+            Timestamp::from(100u64),
+            Timestamp::from(120u64),
+            id_a,
+            Timestamp::from(100u64),
+            Timestamp::from(105u64),
+            id_b,
+        );
+        assert_eq!(result, Ordering::Greater);
+    }
+
+    #[test]
+    fn test_compare_processed_at_keys_id_tiebreaker() {
+        let id_small = EventId::from_slice(&[1u8; 32]).unwrap();
+        let id_large = EventId::from_slice(&[2u8; 32]).unwrap();
+
+        // Same processed_at and created_at, larger id wins
+        let result = Message::compare_processed_at_keys(
+            Timestamp::from(100u64),
+            Timestamp::from(105u64),
+            id_large,
+            Timestamp::from(100u64),
+            Timestamp::from(105u64),
+            id_small,
+        );
+        assert_eq!(result, Ordering::Greater);
+    }
+
+    #[test]
+    fn test_compare_processed_at_keys_equal() {
+        let id = EventId::from_slice(&[1u8; 32]).unwrap();
+
+        let result = Message::compare_processed_at_keys(
+            Timestamp::from(100u64),
+            Timestamp::from(105u64),
+            id,
+            Timestamp::from(100u64),
+            Timestamp::from(105u64),
+            id,
+        );
+        assert_eq!(result, Ordering::Equal);
+    }
+
+    #[test]
+    fn test_compare_processed_at_keys_ignores_created_at_when_processed_at_differs() {
+        // Scenario: Message A has higher created_at but lower processed_at
+        // In processed_at-first ordering, B should win because it was processed later
+        let id_a = EventId::from_slice(&[5u8; 32]).unwrap();
+        let id_b = EventId::from_slice(&[3u8; 32]).unwrap();
+
+        let result = Message::compare_processed_at_keys(
+            Timestamp::from(100u64), // a processed_at
+            Timestamp::from(200u64), // a created_at (higher!)
+            id_a,
+            Timestamp::from(150u64), // b processed_at (higher)
+            Timestamp::from(50u64),  // b created_at (lower)
+            id_b,
+        );
+        assert_eq!(
+            result,
+            Ordering::Less,
+            "Message B should win: higher processed_at despite lower created_at"
         );
     }
 

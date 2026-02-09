@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 use mdk_storage_traits::GroupId;
 use mdk_storage_traits::groups::error::GroupError;
 use mdk_storage_traits::groups::types::{Group, GroupExporterSecret, GroupRelay};
-use mdk_storage_traits::groups::{GroupStorage, MAX_MESSAGE_LIMIT, Pagination};
+use mdk_storage_traits::groups::{GroupStorage, MAX_MESSAGE_LIMIT, MessageSortOrder, Pagination};
 use mdk_storage_traits::messages::types::Message;
 use nostr::{PublicKey, RelayUrl};
 use rusqlite::{OptionalExtension, params};
@@ -182,12 +182,23 @@ impl GroupStorage for MdkSqliteStorage {
             return Err(GroupError::InvalidParameters("Group not found".to_string()));
         }
 
+        let sort_order = pagination.sort_order();
+
         self.with_connection(|conn| {
-            let mut stmt = conn
-                .prepare(
-                    "SELECT * FROM messages WHERE mls_group_id = ? ORDER BY created_at DESC, processed_at DESC, id DESC LIMIT ? OFFSET ?",
-                )
-                .map_err(into_group_err)?;
+            let query = match sort_order {
+                MessageSortOrder::CreatedAtFirst => {
+                    "SELECT * FROM messages WHERE mls_group_id = ? \
+                     ORDER BY created_at DESC, processed_at DESC, id DESC \
+                     LIMIT ? OFFSET ?"
+                }
+                MessageSortOrder::ProcessedAtFirst => {
+                    "SELECT * FROM messages WHERE mls_group_id = ? \
+                     ORDER BY processed_at DESC, created_at DESC, id DESC \
+                     LIMIT ? OFFSET ?"
+                }
+            };
+
+            let mut stmt = conn.prepare(query).map_err(into_group_err)?;
 
             let messages_iter = stmt
                 .query_map(
@@ -204,6 +215,37 @@ impl GroupStorage for MdkSqliteStorage {
             }
 
             Ok(messages)
+        })
+    }
+
+    fn last_message(
+        &self,
+        mls_group_id: &GroupId,
+        sort_order: MessageSortOrder,
+    ) -> Result<Option<Message>, GroupError> {
+        if self.find_group_by_mls_group_id(mls_group_id)?.is_none() {
+            return Err(GroupError::InvalidParameters("Group not found".to_string()));
+        }
+
+        self.with_connection(|conn| {
+            let query = match sort_order {
+                MessageSortOrder::CreatedAtFirst => {
+                    "SELECT * FROM messages WHERE mls_group_id = ? \
+                     ORDER BY created_at DESC, processed_at DESC, id DESC \
+                     LIMIT 1"
+                }
+                MessageSortOrder::ProcessedAtFirst => {
+                    "SELECT * FROM messages WHERE mls_group_id = ? \
+                     ORDER BY processed_at DESC, created_at DESC, id DESC \
+                     LIMIT 1"
+                }
+            };
+
+            conn.prepare(query)
+                .map_err(into_group_err)?
+                .query_row(params![mls_group_id.as_slice()], db::row_to_message)
+                .optional()
+                .map_err(into_group_err)
         })
     }
 

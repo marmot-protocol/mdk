@@ -93,6 +93,21 @@ test_memory_storage!(
     shared::group_tests::test_group_relays_error_for_nonexistent_group
 );
 
+test_memory_storage!(
+    test_messages_sort_order_memory,
+    shared::group_tests::test_messages_sort_order
+);
+
+test_memory_storage!(
+    test_messages_sort_order_pagination_memory,
+    shared::group_tests::test_messages_sort_order_pagination
+);
+
+test_memory_storage!(
+    test_last_message_memory,
+    shared::group_tests::test_last_message
+);
+
 // Welcome functionality tests
 test_memory_storage!(
     test_save_and_find_welcome_memory,

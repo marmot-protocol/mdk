@@ -25,6 +25,28 @@ pub const DEFAULT_MESSAGE_LIMIT: usize = 1000;
 /// Maximum allowed limit for messages queries to prevent resource exhaustion
 pub const MAX_MESSAGE_LIMIT: usize = 10000;
 
+/// Sort order for message queries
+///
+/// Controls the column priority used when ordering messages.
+/// Both orderings are descending (newest first) and use three columns
+/// as a compound sort key to guarantee stable, deterministic results.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MessageSortOrder {
+    /// Sort by `created_at DESC, processed_at DESC, id DESC` (default).
+    ///
+    /// Best for showing messages in sender-timestamp order.
+    /// This is the natural ordering when the sender's clock is trusted.
+    #[default]
+    CreatedAtFirst,
+
+    /// Sort by `processed_at DESC, created_at DESC, id DESC`.
+    ///
+    /// Best for showing messages in local reception order.
+    /// This avoids visual reordering caused by clock skew between senders
+    /// and ensures that the most recently received messages always appear first.
+    ProcessedAtFirst,
+}
+
 /// Pagination parameters for querying messages
 #[derive(Debug, Clone, Copy)]
 pub struct Pagination {
@@ -32,12 +54,31 @@ pub struct Pagination {
     pub limit: Option<usize>,
     /// Number of messages to skip
     pub offset: Option<usize>,
+    /// Sort order for the query results. Defaults to [`MessageSortOrder::CreatedAtFirst`].
+    pub sort_order: Option<MessageSortOrder>,
 }
 
 impl Pagination {
     /// Create a new Pagination with specified limit and offset
     pub fn new(limit: Option<usize>, offset: Option<usize>) -> Self {
-        Self { limit, offset }
+        Self {
+            limit,
+            offset,
+            sort_order: None,
+        }
+    }
+
+    /// Create a new Pagination with specified limit, offset, and sort order
+    pub fn with_sort_order(
+        limit: Option<usize>,
+        offset: Option<usize>,
+        sort_order: MessageSortOrder,
+    ) -> Self {
+        Self {
+            limit,
+            offset,
+            sort_order: Some(sort_order),
+        }
     }
 
     /// Get the limit value, using default if not specified
@@ -49,6 +90,11 @@ impl Pagination {
     pub fn offset(&self) -> usize {
         self.offset.unwrap_or(0)
     }
+
+    /// Get the sort order, using default if not specified
+    pub fn sort_order(&self) -> MessageSortOrder {
+        self.sort_order.unwrap_or_default()
+    }
 }
 
 impl Default for Pagination {
@@ -56,6 +102,7 @@ impl Default for Pagination {
         Self {
             limit: Some(DEFAULT_MESSAGE_LIMIT),
             offset: Some(0),
+            sort_order: None,
         }
     }
 }
@@ -77,25 +124,33 @@ pub trait GroupStorage {
     /// Save a group
     fn save_group(&self, group: Group) -> Result<(), GroupError>;
 
-    /// Get messages for a group with optional pagination
+    /// Get messages for a group with optional pagination and sort order
     ///
-    /// Returns messages ordered by `created_at DESC, processed_at DESC, id DESC` (newest first).
+    /// Returns messages ordered according to the sort order specified in
+    /// [`Pagination::sort_order`] (defaults to [`MessageSortOrder::CreatedAtFirst`]).
     ///
-    /// The sort keys ensure stable, intuitive ordering:
-    /// - `created_at DESC`: Primary sort by the sender's timestamp
-    /// - `processed_at DESC`: Secondary sort by when this client received the message,
-    ///   which keeps messages in reception order when `created_at` is the same
-    ///   (avoids visual reordering due to clock skew between senders)
-    /// - `id DESC`: Tertiary sort ensures deterministic ordering when both timestamps
-    ///   are equal (e.g., multiple messages in the same second from different senders)
+    /// ## Sort orders
+    ///
+    /// **[`MessageSortOrder::CreatedAtFirst`]** (default):
+    /// `created_at DESC, processed_at DESC, id DESC`
+    /// - Primary sort by the sender's timestamp
+    /// - `processed_at` tiebreaker keeps reception order when `created_at` matches
+    /// - `id` ensures deterministic ordering when both timestamps are equal
+    ///
+    /// **[`MessageSortOrder::ProcessedAtFirst`]**:
+    /// `processed_at DESC, created_at DESC, id DESC`
+    /// - Primary sort by when this client received the message
+    /// - Best for local reception ordering; avoids visual reordering from clock skew
+    /// - `created_at` and `id` provide secondary/tertiary tiebreakers
     ///
     /// # Arguments
     /// * `group_id` - The group ID to fetch messages for
-    /// * `pagination` - Optional pagination parameters. If `None`, uses default limit and offset.
+    /// * `pagination` - Optional pagination parameters. If `None`, uses default limit, offset,
+    ///   and sort order.
     ///
     /// # Returns
     ///
-    /// Returns a vector of messages ordered by `created_at DESC, processed_at DESC, id DESC`
+    /// Returns a vector of messages in the requested sort order
     ///
     /// # Errors
     ///
@@ -106,20 +161,50 @@ pub trait GroupStorage {
     ///
     /// # Examples
     /// ```ignore
-    /// // Get messages with default pagination
+    /// // Get messages with default pagination (created_at first)
     /// let messages = storage.messages(&group_id, None)?;
     ///
-    /// // Get first 100 messages
+    /// // Get first 100 messages sorted by created_at
     /// let messages = storage.messages(&group_id, Some(Pagination::new(Some(100), Some(0))))?;
     ///
-    /// // Get next 100 messages
-    /// let messages = storage.messages(&group_id, Some(Pagination::new(Some(100), Some(100))))?;
+    /// // Get first 100 messages sorted by processed_at
+    /// let messages = storage.messages(
+    ///     &group_id,
+    ///     Some(Pagination::with_sort_order(Some(100), Some(0), MessageSortOrder::ProcessedAtFirst)),
+    /// )?;
     /// ```
     fn messages(
         &self,
         group_id: &GroupId,
         pagination: Option<Pagination>,
     ) -> Result<Vec<Message>, GroupError>;
+
+    /// Get the most recent message in a group according to the given sort order.
+    ///
+    /// This is equivalent to calling [`messages()`](GroupStorage::messages) with `limit=1, offset=0`
+    /// and the specified sort order, but may be implemented more efficiently.
+    ///
+    /// Clients can use this to obtain the "last message" that is consistent with the
+    /// sort order they pass to [`messages()`](GroupStorage::messages), which may differ
+    /// from the cached [`Group::last_message_id`] (which always reflects
+    /// [`MessageSortOrder::CreatedAtFirst`]).
+    ///
+    /// # Arguments
+    /// * `group_id` - The group ID to fetch the last message for
+    /// * `sort_order` - The sort order to use when determining the "last" message
+    ///
+    /// # Returns
+    ///
+    /// Returns the first message in the given sort order, or `None` if the group has no messages.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GroupError::InvalidParameters`] if the group does not exist.
+    fn last_message(
+        &self,
+        group_id: &GroupId,
+        sort_order: MessageSortOrder,
+    ) -> Result<Option<Message>, GroupError>;
 
     /// Get all admins for a group
     fn admins(&self, group_id: &GroupId) -> Result<BTreeSet<PublicKey>, GroupError>;
