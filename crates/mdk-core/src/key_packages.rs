@@ -24,16 +24,19 @@ where
     ///
     /// The key package contains the user's credential and capabilities required for MLS operations.
     ///
+    /// **Note**: This function does NOT add the NIP-70 protected tag, ensuring maximum relay
+    /// compatibility. Many popular relays (Damus, Primal, nos.lol) reject protected events.
+    /// If you need the protected tag, use `create_key_package_for_event_with_options` instead.
+    ///
     /// # Returns
     ///
     /// A tuple containing:
     /// * A base64-encoded string containing the serialized key package
-    /// * A fixed array of 7 tags for the Nostr event, in order:
+    /// * A vector of tags for the Nostr event:
     ///   - `mls_protocol_version` - MLS protocol version (e.g., "1.0")
     ///   - `mls_ciphersuite` - Ciphersuite identifier (e.g., "0x0001")
     ///   - `mls_extensions` - Required MLS extensions
     ///   - `relays` - Relay URLs for distribution
-    ///   - `protected` - Marks the event as protected
     ///   - `client` - Client identifier and version
     ///   - `encoding` - The encoding format tag ("base64")
     ///
@@ -47,7 +50,67 @@ where
         &self,
         public_key: &PublicKey,
         relays: I,
-    ) -> Result<(String, [Tag; 7]), Error>
+    ) -> Result<(String, Vec<Tag>), Error>
+    where
+        I: IntoIterator<Item = RelayUrl>,
+    {
+        self.create_key_package_for_event_internal(public_key, relays, false)
+    }
+
+    /// Creates a key package for a Nostr event with additional options.
+    ///
+    /// This is the same as `create_key_package_for_event` but allows specifying
+    /// whether to include the NIP-70 protected tag.
+    ///
+    /// # Arguments
+    ///
+    /// * `public_key` - The Nostr public key for the credential
+    /// * `relays` - Relay URLs where the key package will be published
+    /// * `protected` - Whether to add the NIP-70 protected tag (`["-"]`). When `true`, relays
+    ///   that implement NIP-70 will reject republishing by third parties. However, many popular
+    ///   relays (Damus, Primal, nos.lol) reject protected events entirely. Only set to `true`
+    ///   if publishing to relays known to accept NIP-70 protected events.
+    ///
+    /// # Returns
+    ///
+    /// A tuple containing:
+    /// * A base64-encoded string containing the serialized key package
+    /// * A vector of tags for the Nostr event
+    ///
+    /// # Errors
+    ///
+    /// This function will return an error if:
+    /// * It fails to generate the credential and signature keypair
+    /// * It fails to build the key package
+    /// * It fails to serialize the key package
+    pub fn create_key_package_for_event_with_options<I>(
+        &self,
+        public_key: &PublicKey,
+        relays: I,
+        protected: bool,
+    ) -> Result<(String, Vec<Tag>), Error>
+    where
+        I: IntoIterator<Item = RelayUrl>,
+    {
+        self.create_key_package_for_event_internal(public_key, relays, protected)
+    }
+
+    /// Internal implementation for creating key packages.
+    ///
+    /// This is the shared implementation used by both `create_key_package_for_event` and
+    /// `create_key_package_for_event_with_options`. It generates an MLS key package with
+    /// the user's credential and builds the Nostr event tags.
+    ///
+    /// The `protected` parameter controls whether the NIP-70 protected tag (`["-"]`) is
+    /// included in the output tags. When `true`, the tag is inserted between the `relays`
+    /// and `client` tags, resulting in 7 total tags. When `false`, the protected tag is
+    /// omitted, resulting in 6 total tags.
+    fn create_key_package_for_event_internal<I>(
+        &self,
+        public_key: &PublicKey,
+        relays: I,
+        protected: bool,
+    ) -> Result<(String, Vec<Tag>), Error>
     where
         I: IntoIterator<Item = RelayUrl>,
     {
@@ -75,22 +138,27 @@ where
 
         tracing::debug!(
             target: "mdk_core::key_packages",
-            "Encoded key package using {} format",
-            encoding.as_tag_value()
+            "Encoded key package using {} format (protected: {})",
+            encoding.as_tag_value(),
+            protected
         );
 
-        let tags = [
+        let mut tags = vec![
             Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
             Tag::custom(TagKind::MlsCiphersuite, [self.ciphersuite_value()]),
             Tag::custom(TagKind::MlsExtensions, self.extensions_value()),
             Tag::relays(relays),
-            Tag::protected(),
-            Tag::client(format!("MDK/{}", env!("CARGO_PKG_VERSION"))),
-            Tag::custom(
-                TagKind::Custom("encoding".into()),
-                [encoding.as_tag_value()],
-            ),
         ];
+
+        if protected {
+            tags.push(Tag::protected());
+        }
+
+        tags.push(Tag::client(format!("MDK/{}", env!("CARGO_PKG_VERSION"))));
+        tags.push(Tag::custom(
+            TagKind::Custom("encoding".into()),
+            [encoding.as_tag_value()],
+        ));
 
         Ok((encoded_content, tags))
     }
@@ -530,7 +598,7 @@ mod tests {
                 .unwrap();
         let relays = vec![RelayUrl::parse("wss://relay.example.com").unwrap()];
 
-        // Create key package
+        // Create key package without protected tag (default for maximum relay compatibility)
         let (key_package_str, tags) = mdk
             .create_key_package_for_event(&test_pubkey, relays.clone())
             .expect("Failed to create key package");
@@ -546,14 +614,14 @@ mod tests {
         // Verify the key package has the expected properties
         assert_eq!(key_package.ciphersuite(), DEFAULT_CIPHERSUITE);
 
-        assert_eq!(tags.len(), 7);
+        // Without protected tag: 6 tags (3 MLS + relays + client + encoding)
+        assert_eq!(tags.len(), 6);
         assert_eq!(tags[0].kind(), TagKind::MlsProtocolVersion);
         assert_eq!(tags[1].kind(), TagKind::MlsCiphersuite);
         assert_eq!(tags[2].kind(), TagKind::MlsExtensions);
         assert_eq!(tags[3].kind(), TagKind::Relays);
-        assert_eq!(tags[4].kind(), TagKind::Protected);
-        assert_eq!(tags[5].kind(), TagKind::Client);
-        assert_eq!(tags[6].kind(), TagKind::Custom("encoding".into()));
+        assert_eq!(tags[4].kind(), TagKind::Client);
+        assert_eq!(tags[5].kind(), TagKind::Custom("encoding".into()));
 
         assert_eq!(
             tags[3].content().unwrap(),
@@ -564,11 +632,14 @@ mod tests {
                 .join(",")
         );
 
-        // Verify protected tag is present
-        assert_eq!(tags[4].kind(), TagKind::Protected);
+        // Verify protected tag is NOT present when protected=false
+        assert!(
+            !tags.iter().any(|t| t.kind() == TagKind::Protected),
+            "Protected tag should not be present when protected=false"
+        );
 
         // Verify client tag contains version
-        let client_tag = tags[5].content().unwrap();
+        let client_tag = tags[4].content().unwrap();
         assert!(
             client_tag.starts_with("MDK/"),
             "Client tag should start with MDK/"
@@ -725,10 +796,10 @@ mod tests {
         );
     }
 
-    /// Test complete tag structure matches Marmot spec (MIP-00)
+    /// Test complete tag structure matches Marmot spec (MIP-00) without protected tag
     /// This is an integration test ensuring all tags work together correctly
     #[test]
-    fn test_complete_tag_structure_mip00_compliance() {
+    fn test_complete_tag_structure_mip00_compliance_without_protected() {
         let mdk = create_test_mdk();
         let test_pubkey =
             PublicKey::from_hex("884704bd421671e01c13f854d2ce23ce2a5bfe9562f4f297ad2bc921ba30c3a6")
@@ -742,8 +813,13 @@ mod tests {
             .create_key_package_for_event(&test_pubkey, relays.clone())
             .expect("Failed to create key package");
 
-        // Verify we have exactly 7 tags (3 MLS required + relays + protected + client + encoding)
-        assert_eq!(tags.len(), 7, "Should have exactly 7 tags");
+        // Verify we have exactly 6 tags (3 MLS required + relays + client + encoding)
+        // No protected tag when protected=false
+        assert_eq!(
+            tags.len(),
+            6,
+            "Should have exactly 6 tags without protected"
+        );
 
         // Verify tag order matches spec example
         assert_eq!(
@@ -768,18 +844,13 @@ mod tests {
         );
         assert_eq!(
             tags[4].kind(),
-            TagKind::Protected,
-            "Fifth tag should be protected"
+            TagKind::Client,
+            "Fifth tag should be client (no protected tag)"
         );
         assert_eq!(
             tags[5].kind(),
-            TagKind::Client,
-            "Sixth tag should be client"
-        );
-        assert_eq!(
-            tags[6].kind(),
             TagKind::Custom("encoding".into()),
-            "Seventh tag should be encoding"
+            "Sixth tag should be encoding"
         );
 
         // Verify relays tag format
@@ -801,8 +872,49 @@ mod tests {
             "Should contain relay2"
         );
 
-        // Verify protected tag is present
-        assert_eq!(tags[4].kind(), TagKind::Protected);
+        // Verify protected tag is NOT present
+        assert!(
+            !tags.iter().any(|t| t.kind() == TagKind::Protected),
+            "Protected tag should not be present when protected=false"
+        );
+    }
+
+    /// Test complete tag structure with protected tag (NIP-70)
+    #[test]
+    fn test_complete_tag_structure_with_protected() {
+        let mdk = create_test_mdk();
+        let test_pubkey =
+            PublicKey::from_hex("884704bd421671e01c13f854d2ce23ce2a5bfe9562f4f297ad2bc921ba30c3a6")
+                .unwrap();
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").unwrap()];
+
+        let (_, tags) = mdk
+            .create_key_package_for_event_with_options(&test_pubkey, relays, true)
+            .expect("Failed to create key package");
+
+        // Verify we have exactly 7 tags (3 MLS required + relays + protected + client + encoding)
+        assert_eq!(
+            tags.len(),
+            7,
+            "Should have exactly 7 tags with protected=true"
+        );
+
+        // Verify protected tag is present at the correct position
+        assert_eq!(
+            tags[4].kind(),
+            TagKind::Protected,
+            "Fifth tag should be protected"
+        );
+        assert_eq!(
+            tags[5].kind(),
+            TagKind::Client,
+            "Sixth tag should be client"
+        );
+        assert_eq!(
+            tags[6].kind(),
+            TagKind::Custom("encoding".into()),
+            "Seventh tag should be encoding"
+        );
     }
 
     #[test]
@@ -1722,7 +1834,7 @@ mod tests {
 
         // Create an event signed by the same keys used in the credential
         let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_str)
-            .tags(tags.to_vec())
+            .tags(tags)
             .sign_with_keys(&keys)
             .unwrap();
 
@@ -1821,7 +1933,7 @@ mod tests {
 
         // Create the KeyPackage event
         let bob_key_package_event = EventBuilder::new(Kind::MlsKeyPackage, bob_key_package_hex)
-            .tags(tags.to_vec())
+            .tags(tags)
             .sign_with_keys(&bob_keys)
             .expect("Failed to sign event");
 
@@ -1974,7 +2086,7 @@ mod tests {
 
         // Attacker signs the event with their own keys (NOT the victim's keys)
         let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex)
-            .tags(tags.to_vec())
+            .tags(tags)
             .sign_with_keys(&attacker_keys)
             .unwrap();
 
@@ -2027,7 +2139,7 @@ mod tests {
 
         // Sign the event with the same keys (legitimate scenario)
         let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex)
-            .tags(tags.to_vec())
+            .tags(tags)
             .sign_with_keys(&keys)
             .unwrap();
 

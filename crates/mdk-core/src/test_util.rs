@@ -40,7 +40,7 @@ where
         .expect("Failed to create key package");
 
     EventBuilder::new(Kind::MlsKeyPackage, key_package_hex)
-        .tags(tags.to_vec())
+        .tags(tags)
         .sign_with_keys(member_keys)
         .expect("Failed to sign event")
 }
@@ -63,7 +63,7 @@ where
         .expect("Failed to create key package");
 
     EventBuilder::new(Kind::MlsKeyPackage, key_package_hex)
-        .tags(tags.to_vec())
+        .tags(tags)
         .sign_with_keys(signing_keys)
         .expect("Failed to sign event")
 }

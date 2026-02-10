@@ -25,14 +25,9 @@
 
 ## Unreleased
 
-### Added
-
-- **Group `last_message_processed_at` Field**: The `Group` record now includes an optional `last_message_processed_at: u64` field (Unix timestamp) indicating when the last message was received/processed by this client. This complements `last_message_at` (sender's timestamp) and ensures `last_message_id` is consistent with the first message returned by `get_messages()`. ([#166](https://github.com/marmot-protocol/mdk/pull/166))
-
-- **Message `processed_at` Field**: The `Message` record now includes a `processed_at: u64` field (Unix timestamp) indicating when this client received/processed the message. This complements the existing `created_at` field (sender's timestamp) and helps clients handle clock skew between devices - messages can now be displayed in reception order if desired. ([#166](https://github.com/marmot-protocol/mdk/pull/166))
-
 ### Breaking changes
 
+- **`create_key_package_for_event` No Longer Adds Protected Tag**: The `create_key_package_for_event()` function no longer adds the NIP-70 protected tag by default. This is a behavioral change - existing code that relied on the protected tag being present will now produce key packages without it. Key packages can now be republished by third parties to any relay. For users who need the protected tag, use the new `create_key_package_for_event_with_options()` function with `protected: true`. ([#173](https://github.com/marmot-protocol/mdk/pull/173), related: [#168](https://github.com/marmot-protocol/mdk/issues/168))
 - **Security (Audit Issue M)**: Changed `get_message()` to require both `mls_group_id` and `event_id` parameters. This prevents messages from different groups from overwriting each other by scoping lookups to a specific group. ([#124](https://github.com/marmot-protocol/mdk/pull/124))
 - Renamed `Message.processed_at` to `Message.created_at` for semantic accuracy. The field represents when a message was created, not when it was processed by the system. ([`#163`](https://github.com/marmot-protocol/mdk/pull/163))
 
@@ -43,10 +38,11 @@
 - Changed `get_pending_welcomes()` to accept optional `limit` and `offset` parameters for pagination control. Existing calls must be updated to pass `None, None` for default behavior (limit: 1000, offset: 0), or specify values for custom pagination. ([#119](https://github.com/marmot-protocol/mdk/pull/119))
 - Changed `new_mdk()`, `new_mdk_with_key()`, and `new_mdk_unencrypted()` to accept an optional `MdkConfig` parameter for customizing MDK behavior. Existing calls must be updated to pass `None` for default behavior. ([`#155`](https://github.com/marmot-protocol/mdk/pull/155))
 
-### Changed
-
 ### Added
 
+- **`create_key_package_for_event_with_options`**: New function that allows specifying whether to include the NIP-70 protected tag. Use this if you need to publish to relays that accept protected events. ([#173](https://github.com/marmot-protocol/mdk/pull/173), related: [#168](https://github.com/marmot-protocol/mdk/issues/168))
+- **Group `last_message_processed_at` Field**: The `Group` record now includes an optional `last_message_processed_at: u64` field (Unix timestamp) indicating when the last message was received/processed by this client. This complements `last_message_at` (sender's timestamp) and ensures `last_message_id` is consistent with the first message returned by `get_messages()`. ([#166](https://github.com/marmot-protocol/mdk/pull/166))
+- **Message `processed_at` Field**: The `Message` record now includes a `processed_at: u64` field (Unix timestamp) indicating when this client received/processed the message. This complements the existing `created_at` field (sender's timestamp) and helps clients handle clock skew between devices - messages can now be displayed in reception order if desired. ([#166](https://github.com/marmot-protocol/mdk/pull/166))
 - **`PreviouslyFailed` Result Variant**: Added `ProcessMessageResult.PreviouslyFailed` enum variant to handle cases where a previously failed message arrives again but the MLS group ID cannot be extracted. This prevents crashes in client applications (fixes [#153](https://github.com/marmot-protocol/mdk/issues/153)) by returning a result instead of throwing an exception. ([#165](https://github.com/marmot-protocol/mdk/pull/165), fixes [#154](https://github.com/marmot-protocol/mdk/issues/154), [#159](https://github.com/marmot-protocol/mdk/issues/159))
 - Added `MdkConfig` record for configuring MDK behavior, including `out_of_order_tolerance` and `maximum_forward_distance` settings for MLS sender ratchet configuration. All fields are optional and default to sensible values. ([`#155`](https://github.com/marmot-protocol/mdk/pull/155))
 - Exposed pagination control for `get_messages()` to foreign language bindings via optional `limit` and `offset` parameters. ([#111](https://github.com/marmot-protocol/mdk/pull/111))
