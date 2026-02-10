@@ -432,9 +432,9 @@ _run-quiet recipe label:
     trap 'rm -f "$TMPFILE"' EXIT
     printf "  %-25s" "{{label}}..."
     if just {{recipe}} > "$TMPFILE" 2>&1; then
-        echo "ok"
+        echo "✓"
     else
-        echo "FAILED"
+        echo "✗"
         echo ""
         cat "$TMPFILE"
         exit 1

@@ -116,24 +116,24 @@ just precommit
 Example output on success:
 
 ```
-  fmt (stable)...          ok
-  docs (stable)...         ok
-  clippy (stable)...       ok
-  fmt (msrv)...            ok
-  docs (msrv)...           ok
-  clippy (msrv)...         ok
-  test (all features)...   ok
-  test (no features)...    ok
-  test (mip04)...          ok
+  fmt (stable)...          ✓
+  docs (stable)...         ✓
+  clippy (stable)...       ✓
+  fmt (msrv)...            ✓
+  docs (msrv)...           ✓
+  clippy (msrv)...         ✓
+  test (all features)...   ✓
+  test (no features)...    ✓
+  test (mip04)...          ✓
 PRECOMMIT PASSED
 ```
 
 On failure, only the failing step's full output is shown, making it straightforward to identify and fix the issue:
 
 ```
-  fmt (stable)...          ok
-  docs (stable)...         ok
-  clippy (stable)...       FAILED
+  fmt (stable)...          ✓
+  docs (stable)...         ✓
+  clippy (stable)...       ✗
 
 <full clippy error output here>
 ```
