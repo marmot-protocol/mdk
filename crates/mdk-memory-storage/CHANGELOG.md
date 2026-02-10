@@ -27,7 +27,7 @@
 
 ### Changed
 
-- **OpenMLS 0.8.0 Upgrade**: Updated `openmls` to 0.8.0 and `openmls_traits` to 0.5. Updated `lru` to 0.16.3 to resolve a security advisory.
+- **OpenMLS 0.8.0 Upgrade**: Updated `openmls` to 0.8.0 and `openmls_traits` to 0.5. Updated `lru` to 0.16.3 to resolve a security advisory. ([#174](https://github.com/marmot-protocol/mdk/pull/174))
 
 ### Added
 

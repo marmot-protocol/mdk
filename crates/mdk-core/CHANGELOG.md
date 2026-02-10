@@ -25,15 +25,15 @@
 
 ### Breaking changes
 
-- **OpenMLS 0.8.0 Upgrade**: Upgraded from a git-pinned openmls 0.7.1 to the crates.io openmls 0.8.0 release. This resolves security advisory [GHSA-8x3w-qj7j-gqhf](https://github.com/openmls/openmls/security/advisories/GHSA-8x3w-qj7j-gqhf) (improper tag validation) and moves GREASE support from a git pin to an official release. Companion crates updated: `openmls_traits` 0.5, `openmls_basic_credential` 0.5, `openmls_rust_crypto` 0.5.
+- **OpenMLS 0.8.0 Upgrade**: Upgraded from a git-pinned openmls 0.7.1 to the crates.io openmls 0.8.0 release. This resolves security advisory [GHSA-8x3w-qj7j-gqhf](https://github.com/openmls/openmls/security/advisories/GHSA-8x3w-qj7j-gqhf) (improper tag validation) and moves GREASE support from a git pin to an official release. Companion crates updated: `openmls_traits` 0.5, `openmls_basic_credential` 0.5, `openmls_rust_crypto` 0.5. ([#174](https://github.com/marmot-protocol/mdk/pull/174))
 
 ### Changed
 
-- **Welcome processing uses builder API**: Welcome message parsing now uses `StagedWelcome::build_from_welcome` with `replace_old_group()` to handle openmls 0.8.0's `GroupId` uniqueness enforcement.
+- **Welcome processing uses builder API**: Welcome message parsing now uses `StagedWelcome::build_from_welcome` with `replace_old_group()` to handle openmls 0.8.0's `GroupId` uniqueness enforcement. ([#174](https://github.com/marmot-protocol/mdk/pull/174))
 
 ### Fixed
 
-- **Security dependency updates**: Updated `time` (0.3.44 → 0.3.47), `bytes` (1.11.0 → 1.11.1), and `lru` (0.16.2 → 0.16.3) to resolve Dependabot security advisories.
+- **Security dependency updates**: Updated `time` (0.3.44 → 0.3.47), `bytes` (1.11.0 → 1.11.1), and `lru` (0.16.2 → 0.16.3) to resolve Dependabot security advisories. ([#174](https://github.com/marmot-protocol/mdk/pull/174))
 
 ### Added
 
