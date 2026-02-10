@@ -103,18 +103,54 @@ just docs    # Documentation check
 
 ## Pre-Commit Requirements
 
-**CRITICAL**: Before every commit or pull request, you MUST run:
+**CRITICAL**: Before every commit or pull request, you MUST run pre-commit checks. All commits must pass before being pushed.
+
+### For AI Agents
+
+**Always use `just precommit`** (quiet mode). This produces minimal, structured output that is easy to parse:
 
 ```bash
 just precommit
 ```
 
-This command:
-1. Runs format, documentation, and clippy checks with stable Rust
-2. Runs the same checks with MSRV (1.90.0)
-3. Runs all test combinations
+Example output on success:
 
-Do NOT skip this step. All commits must pass `just precommit` before being pushed.
+```
+  fmt (stable)...          ok
+  docs (stable)...         ok
+  clippy (stable)...       ok
+  fmt (msrv)...            ok
+  docs (msrv)...           ok
+  clippy (msrv)...         ok
+  test (all features)...   ok
+  test (no features)...    ok
+  test (mip04)...          ok
+PRECOMMIT PASSED
+```
+
+On failure, only the failing step's full output is shown, making it straightforward to identify and fix the issue:
+
+```
+  fmt (stable)...          ok
+  docs (stable)...         ok
+  clippy (stable)...       FAILED
+
+<full clippy error output here>
+```
+
+### For Humans
+
+Use `just precommit-verbose` for full output from every step:
+
+```bash
+just precommit-verbose
+```
+
+### What Precommit Checks
+
+1. Format, documentation, and clippy checks with **stable** Rust
+2. The same checks with **MSRV** (1.90.0)
+3. All test combinations (all features, no features, mip04-only)
 
 ### Recommended Workflow
 
