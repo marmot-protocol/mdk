@@ -1,7 +1,9 @@
 //! Nostr MLS Key Packages
 
 use mdk_storage_traits::MdkStorageProvider;
+use mdk_storage_traits::mls_codec::JsonCodec;
 use nostr::{Event, Kind, PublicKey, RelayUrl, Tag, TagKind};
+use openmls::ciphersuite::hash_ref::HashReference;
 use openmls::key_packages::KeyPackage;
 use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
@@ -508,6 +510,36 @@ where
         Ok(())
     }
 
+    /// Computes and serializes the hash_ref for a key package.
+    ///
+    /// Returns the hash_ref as serialized bytes that can be stored externally
+    /// and later used with [`delete_key_package_from_storage_by_hash_ref`](Self::delete_key_package_from_storage_by_hash_ref)
+    /// to delete the key package from storage.
+    pub fn compute_key_package_hash_ref(&self, key_package: &KeyPackage) -> Result<Vec<u8>, Error> {
+        let hash_ref = key_package.hash_ref(self.provider.crypto())?;
+        JsonCodec::serialize(&hash_ref)
+            .map_err(|e| Error::Provider(format!("Failed to serialize hash_ref: {}", e)))
+    }
+
+    /// Deletes a key package from storage using previously serialized hash_ref bytes.
+    ///
+    /// The `hash_ref_bytes` should be bytes previously returned by
+    /// [`compute_key_package_hash_ref`](Self::compute_key_package_hash_ref).
+    pub fn delete_key_package_from_storage_by_hash_ref(
+        &self,
+        hash_ref_bytes: &[u8],
+    ) -> Result<(), Error> {
+        let hash_ref: HashReference = JsonCodec::deserialize(hash_ref_bytes)
+            .map_err(|e| Error::Provider(format!("Failed to deserialize hash_ref: {}", e)))?;
+
+        self.provider
+            .storage()
+            .delete_key_package(&hash_ref)
+            .map_err(|e| Error::Provider(e.to_string()))?;
+
+        Ok(())
+    }
+
     /// Generates a credential with a key for MLS (Messaging Layer Security) operations.
     ///
     /// This function creates a new credential and associated signature key pair for use in MLS.
@@ -941,6 +973,46 @@ mod tests {
         deletion_mls
             .delete_key_package_from_storage(&key_package)
             .expect("Failed to delete key package");
+    }
+
+    #[test]
+    fn test_key_package_deletion_by_hash_ref_roundtrip() {
+        let mdk = create_test_mdk();
+        let test_pubkey =
+            PublicKey::from_hex("884704bd421671e01c13f854d2ce23ce2a5bfe9562f4f297ad2bc921ba30c3a6")
+                .unwrap();
+
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").unwrap()];
+
+        // Create and parse key package
+        let (key_package_str, _) = mdk
+            .create_key_package_for_event(&test_pubkey, relays.clone())
+            .expect("Failed to create key package");
+
+        let deletion_mdk = create_test_mdk();
+        let key_package = deletion_mdk
+            .parse_serialized_key_package(&key_package_str, ContentEncoding::Base64)
+            .expect("Failed to parse key package");
+
+        // Compute hash_ref bytes (simulates what whitenoise-rs caches in DB)
+        let hash_ref_bytes = deletion_mdk
+            .compute_key_package_hash_ref(&key_package)
+            .expect("Failed to compute hash_ref");
+
+        assert!(
+            !hash_ref_bytes.is_empty(),
+            "hash_ref bytes should not be empty"
+        );
+
+        // Delete using the serialized hash_ref bytes (simulates delayed cleanup)
+        deletion_mdk
+            .delete_key_package_from_storage_by_hash_ref(&hash_ref_bytes)
+            .expect("Failed to delete key package by hash_ref");
+
+        // Deleting again should also succeed (idempotent, no-op)
+        deletion_mdk
+            .delete_key_package_from_storage_by_hash_ref(&hash_ref_bytes)
+            .expect("Second deletion should succeed (idempotent)");
     }
 
     #[test]
