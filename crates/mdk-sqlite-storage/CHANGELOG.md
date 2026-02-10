@@ -41,6 +41,7 @@
 
 ### Changed
 
+- **OpenMLS 0.8.0 Upgrade**: Updated `openmls` to 0.8.0 and `openmls_traits` to 0.5. Updated `time` (via `refinery`) to 0.3.47 to resolve a security advisory. ([#174](https://github.com/marmot-protocol/mdk/pull/174))
 - **Message Sorting**: The `messages()` query now uses `ORDER BY created_at DESC, processed_at DESC, id DESC`. The secondary sort by `processed_at` keeps messages in reception order when `created_at` is the same. The tertiary sort by `id` ensures deterministic ordering. A new composite index `idx_messages_sorting` supports this query. ([#166](https://github.com/marmot-protocol/mdk/pull/166))
 - Upgraded `nostr` dependency from 0.43 to 0.44, replacing deprecated `Timestamp::as_u64()` calls with `Timestamp::as_secs()` ([#162](https://github.com/marmot-protocol/mdk/pull/162))
 - **Persistent Snapshots**: Implemented snapshot support by copying group-specific rows to a dedicated snapshot table. `create_group_snapshot`, `rollback_group_to_snapshot`, and `release_group_snapshot` persist across app restarts. ([#152](https://github.com/marmot-protocol/mdk/pull/152))

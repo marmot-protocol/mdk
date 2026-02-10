@@ -3,6 +3,10 @@
 default:
     @just --list
 
+# ==============================================================================
+# TESTING
+# ==============================================================================
+
 # Run tests with all features (default)
 test:
     cargo test --all-features --all-targets
@@ -25,6 +29,10 @@ test-all:
     @echo "Testing with mip04 feature only..."
     @just test-mip04
 
+# ==============================================================================
+# LINTING & FORMATTING
+# ==============================================================================
+
 # Check clippy for all feature combinations (uses stable by default)
 lint:
     @bash scripts/check-clippy.sh
@@ -45,13 +53,25 @@ fmt:
 docs:
     @bash scripts/check-docs.sh
 
-# Quick check with stable (fast for local development)
-check:
-    @bash scripts/check-all.sh
-    @just test-all
+# ==============================================================================
+# PRE-COMMIT CHECKS
+# ==============================================================================
 
-# Pre-commit check: runs both stable and MSRV checks
+# Pre-commit checks: quiet mode with minimal output (recommended for agents/CI)
 precommit:
+    @just _run-quiet "fmt"               "fmt (stable)"
+    @just _run-quiet "docs"              "docs (stable)"
+    @just _run-quiet "lint"              "clippy (stable)"
+    @just _run-quiet "_fmt-msrv"         "fmt (msrv)"
+    @just _run-quiet "_docs-msrv"        "docs (msrv)"
+    @just _run-quiet "_lint-msrv"        "clippy (msrv)"
+    @just _run-quiet "test"              "test (all features)"
+    @just _run-quiet "test-no-features"  "test (no features)"
+    @just _run-quiet "test-mip04"        "test (mip04)"
+    @echo "PRECOMMIT PASSED"
+
+# Pre-commit checks with verbose output (shows all command output)
+precommit-verbose:
     @echo "=========================================="
     @echo "Running pre-commit checks (stable + MSRV)"
     @echo "=========================================="
@@ -69,9 +89,33 @@ precommit:
     @echo "✓ All pre-commit checks passed!"
     @echo "=========================================="
 
+# Quick check with stable (fast for local development)
+check:
+    @bash scripts/check-all.sh
+    @just test-all
+
 # Full comprehensive check including all feature combinations (same as check for now)
 check-full:
     @just check
+
+# ==============================================================================
+# MSRV CHECK RECIPES (used by precommit quiet mode)
+# ==============================================================================
+
+# Check fmt with MSRV
+[private]
+_fmt-msrv:
+    @bash scripts/check-fmt.sh 1.90.0
+
+# Check docs with MSRV
+[private]
+_docs-msrv:
+    @bash scripts/check-docs.sh 1.90.0
+
+# Check clippy with MSRV
+[private]
+_lint-msrv:
+    @bash scripts/check-clippy.sh 1.90.0
 
 _build-uniffi needs_android="false" needs_ios="false":
     #!/usr/bin/env bash
@@ -375,4 +419,24 @@ publish-test-pypi:
     @echo "Triggering TestPyPI publish workflow..."
     gh workflow run package-mdk-bindings.yml -f publish_test_pypi=true
     @echo "✓ Workflow triggered. Check status at: https://github.com/marmot-protocol/mdk/actions"
+
+# ==============================================================================
+# HELPER RECIPES
+# ==============================================================================
+
+# Run a recipe quietly, showing only name and pass/fail status (internal use)
+[private]
+_run-quiet recipe label:
+    #!/usr/bin/env bash
+    TMPFILE=$(mktemp)
+    trap 'rm -f "$TMPFILE"' EXIT
+    printf "  %-25s" "{{label}}..."
+    if just {{recipe}} > "$TMPFILE" 2>&1; then
+        echo "✓"
+    else
+        echo "✗"
+        echo ""
+        cat "$TMPFILE"
+        exit 1
+    fi
 

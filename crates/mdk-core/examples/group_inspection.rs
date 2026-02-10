@@ -68,7 +68,7 @@ async fn main() -> Result<(), Error> {
 
     let member1_event =
         nostr::event::builder::EventBuilder::new(nostr::Kind::MlsKeyPackage, member1_kp_encoded)
-            .tags(member1_tags.to_vec())
+            .tags(member1_tags)
             .build(member1_keys.public_key())
             .sign(&member1_keys)
             .await?;
@@ -78,7 +78,7 @@ async fn main() -> Result<(), Error> {
 
     let member2_event =
         nostr::event::builder::EventBuilder::new(nostr::Kind::MlsKeyPackage, member2_kp_encoded)
-            .tags(member2_tags.to_vec())
+            .tags(member2_tags)
             .build(member2_keys.public_key())
             .sign(&member2_keys)
             .await?;

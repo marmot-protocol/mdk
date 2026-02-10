@@ -36,6 +36,7 @@
 
 ### Changed
 
+- **OpenMLS 0.8.0 Upgrade**: Updated `openmls` to 0.8.0 and `openmls_traits` to 0.5. Updated `lru` to 0.16.3 to resolve a security advisory. ([#174](https://github.com/marmot-protocol/mdk/pull/174))
 - **Message Sorting**: The `messages()` method now sorts by `created_at DESC, processed_at DESC, id DESC`. The secondary sort by `processed_at` keeps messages in reception order when `created_at` is the same. The tertiary sort by `id` ensures deterministic ordering. ([#166](https://github.com/marmot-protocol/mdk/pull/166))
 - **Thread-Safe Snapshots**: Implemented atomic snapshot support using internal locking. `create_group_snapshot`, `rollback_group_to_snapshot`, and `release_group_snapshot` are now supported for testing and race resolution. ([#152](https://github.com/marmot-protocol/mdk/pull/152))
 - **Unified Storage Architecture**: `MdkMemoryStorage` now directly implements OpenMLS's `StorageProvider<1>` trait instead of wrapping `openmls_memory_storage`. This enables unified in-memory storage for both MLS and MDK state, consistent with the SQLite implementation. ([#148](https://github.com/marmot-protocol/mdk/pull/148))

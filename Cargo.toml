@@ -17,12 +17,11 @@ mdk-sqlite-storage = { version = "0.5.1", path = "./crates/mdk-sqlite-storage", 
 mdk-storage-traits = { version = "0.5.1", path = "./crates/mdk-storage-traits", default-features = false }
 mdk-core = { version = "0.5.1", path = "./crates/mdk-core", default-features = false }
 
-# OpenMLS family - using git main branch for GREASE support (PR #1900)
-# TODO: Revert to crates.io versions once OpenMLS releases a version with GREASE support
-openmls = { git = "https://github.com/openmls/openmls", rev = "b90ca23b1238d9e189142d06234527b2d344d748", default-features = false }
-openmls_traits = { git = "https://github.com/openmls/openmls", rev = "b90ca23b1238d9e189142d06234527b2d344d748", default-features = false }
-openmls_basic_credential = { git = "https://github.com/openmls/openmls", rev = "b90ca23b1238d9e189142d06234527b2d344d748", default-features = false }
-openmls_rust_crypto = { git = "https://github.com/openmls/openmls", rev = "b90ca23b1238d9e189142d06234527b2d344d748", default-features = false }
+# OpenMLS family
+openmls = { version = "0.8", default-features = false }
+openmls_traits = { version = "0.5", default-features = false }
+openmls_basic_credential = { version = "0.5", default-features = false }
+openmls_rust_crypto = { version = "0.5", default-features = false }
 
 # Nostr
 nostr = { version = "0.44", default-features = false }
