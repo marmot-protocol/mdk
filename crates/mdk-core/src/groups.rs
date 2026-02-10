@@ -759,7 +759,7 @@ where
 
         let extension = Self::get_unknown_extension_from_group_data(group_data)?;
         let mut extensions = mls_group.extensions().clone();
-        extensions.add_or_replace(extension);
+        extensions.add_or_replace(extension)?;
 
         let signature_keypair = self.load_mls_signer(mls_group)?;
         let (message_out, _, _) = mls_group.update_group_context_extensions(
@@ -998,7 +998,7 @@ where
             .ciphersuite(self.ciphersuite)
             .use_ratchet_tree_extension(true)
             .capabilities(capabilities)
-            .with_group_context_extensions(extensions)?
+            .with_group_context_extensions(extensions)
             .sender_ratchet_configuration(sender_ratchet_config)
             .build();
 
@@ -1157,7 +1157,7 @@ where
         let leaf_node_params = LeafNodeParameters::builder()
             .with_credential_with_key(new_credential_with_key)
             .with_capabilities(own_leaf.capabilities().clone())
-            .with_extensions(own_leaf.extensions().clone())?
+            .with_extensions(own_leaf.extensions().clone())
             .build();
 
         let commit_message_bundle = mls_group.self_update_with_new_signer(
@@ -2678,7 +2678,7 @@ mod tests {
             super::MDK::<MdkMemoryStorage>::get_unknown_extension_from_group_data(&new_group_data)
                 .unwrap();
         let mut extensions = mls_group.extensions().clone();
-        extensions.add_or_replace(extension);
+        extensions.add_or_replace(extension).unwrap();
 
         let signature_keypair = creator_mdk.load_mls_signer(&mls_group).unwrap();
         let (_message_out, _, _) = mls_group
@@ -2954,7 +2954,7 @@ mod tests {
 
         // Replace the group-data extension with the corrupted one
         let mut extensions = mls_group.extensions().clone();
-        extensions.add_or_replace(corrupted_extension);
+        extensions.add_or_replace(corrupted_extension).unwrap();
 
         let signature_keypair = creator_mdk.load_mls_signer(&mls_group).unwrap();
         let (_message_out, _, _) = mls_group

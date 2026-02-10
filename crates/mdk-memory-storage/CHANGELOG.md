@@ -25,6 +25,10 @@
 
 ## Unreleased
 
+### Changed
+
+- **OpenMLS 0.8.0 Upgrade**: Updated `openmls` to 0.8.0 and `openmls_traits` to 0.5. Updated `lru` to 0.16.3 to resolve a security advisory.
+
 ### Added
 
 - **Epoch Lookup by Tag Content**: Implemented `find_message_epoch_by_tag_content` for in-memory storage, scanning cached group messages and matching serialized tags. ([#167](https://github.com/marmot-protocol/mdk/pull/167))

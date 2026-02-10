@@ -25,6 +25,10 @@
 
 ## Unreleased
 
+### Changed
+
+- **OpenMLS 0.8.0 Upgrade**: Updated `openmls` to 0.8.0 and `openmls_traits` to 0.5. Updated `time` (via `refinery`) to 0.3.47 to resolve a security advisory.
+
 ### Added
 
 - **Group `last_message_processed_at` Column**: Added `last_message_processed_at` column to the `groups` table via V003 migration to track when the last message was processed/received by this client. This enables consistent ordering between `group.last_message_id` and `get_messages()[0].id`. Existing groups are backfilled with their `last_message_at` value as a reasonable default. ([#166](https://github.com/marmot-protocol/mdk/pull/166))

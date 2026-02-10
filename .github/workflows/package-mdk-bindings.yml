@@ -13,6 +13,9 @@ on:
         type: boolean
         default: false
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   SWIFT_PACKAGE_REPO: "marmot-protocol/mdk-swift"

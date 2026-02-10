@@ -413,7 +413,9 @@ where
             .build();
 
         let staged_welcome =
-            StagedWelcome::new_from_welcome(&self.provider, &mls_group_config, welcome, None)?;
+            StagedWelcome::build_from_welcome(&self.provider, &mls_group_config, welcome)?
+                .replace_old_group()
+                .build()?;
 
         let nostr_group_data =
             NostrGroupDataExtension::from_group_context(staged_welcome.group_context())?;

@@ -25,6 +25,10 @@
 
 ## Unreleased
 
+### Changed
+
+- **OpenMLS 0.8.0 Upgrade**: Updated `openmls` to 0.8.0 and `openmls_traits` to 0.5.
+
 ### Added
 
 - **Epoch Lookup by Tag Content**: Added `find_message_epoch_by_tag_content` method to `MessageStorage` trait for looking up a message's epoch by searching serialized tag content. Used for MIP-04 media decryption epoch hint resolution. ([#167](https://github.com/marmot-protocol/mdk/pull/167))
