@@ -115,7 +115,7 @@ just precommit
 
 Example output on success:
 
-```
+```text
   fmt (stable)...          ✓
   docs (stable)...         ✓
   clippy (stable)...       ✓
@@ -130,7 +130,7 @@ PRECOMMIT PASSED
 
 On failure, only the failing step's full output is shown, making it straightforward to identify and fix the issue:
 
-```
+```text
   fmt (stable)...          ✓
   docs (stable)...         ✓
   clippy (stable)...       ✗
