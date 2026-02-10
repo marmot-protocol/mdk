@@ -30,22 +30,6 @@
 ### Changed
 
 - **Welcome processing uses builder API**: Welcome message parsing now uses `StagedWelcome::build_from_welcome` with `replace_old_group()` to handle openmls 0.8.0's `GroupId` uniqueness enforcement. ([#174](https://github.com/marmot-protocol/mdk/pull/174))
-
-### Fixed
-
-- **Security dependency updates**: Updated `time` (0.3.44 → 0.3.47), `bytes` (1.11.0 → 1.11.1), and `lru` (0.16.2 → 0.16.3) to resolve Dependabot security advisories. ([#174](https://github.com/marmot-protocol/mdk/pull/174))
-
-### Added
-
-- **MIP-04 Epoch Fallback for Media Decryption**: `decrypt_from_download` now resolves the correct decryption key via an O(1) epoch hint lookup instead of only using the current epoch's exporter secret. Added `NoExporterSecretForEpoch` variant to `EncryptedMediaError` for programmatic error matching. ([#167](https://github.com/marmot-protocol/mdk/pull/167))
-- **`PreviouslyFailed` Result Variant**: Added `MessageProcessingResult::PreviouslyFailed` variant to handle cases where a previously failed message arrives again but the MLS group ID cannot be extracted. This prevents crashes in client applications by returning a result instead of throwing an error. ([#165](https://github.com/marmot-protocol/mdk/pull/165), fixes [#154](https://github.com/marmot-protocol/mdk/issues/154), [#159](https://github.com/marmot-protocol/mdk/issues/159))
-- **Message Retry Support**: Implemented better handling for retryable message states. When a message fails processing, it now preserves the `message_event_id` and other context. Added logic to allow reprocessing of messages marked as `Retryable`, with automatic state recovery to `Processed` upon success. ([#161](https://github.com/marmot-protocol/mdk/pull/161))
-- Configurable `out_of_order_tolerance` and `maximum_forward_distance` in `MdkConfig` for MLS sender ratchet settings. Default `out_of_order_tolerance` increased from 5 to 100 for better handling of out-of-order message delivery on Nostr relays. ([`#155`](https://github.com/marmot-protocol/mdk/pull/155))
-
-### Breaking changes
-
-### Changed
-
 - **Message Processing Timestamps**: Messages now record both `created_at` (from the rumor event, reflecting sender's clock) and `processed_at` (when this client processed the message). This allows clients to choose their preferred ordering strategy - by creation time or by reception time. ([#166](https://github.com/marmot-protocol/mdk/pull/166))
 - **MIP-03 Commit Race Resolution**: Commits are now resolved deterministically based on timestamp (earliest wins) and event ID (lexicographically smallest wins). ([#152](https://github.com/marmot-protocol/mdk/pull/152))
   - When multiple valid commits are published for the same epoch, clients converge on the same "winning" commit.
@@ -55,12 +39,17 @@
 
 ### Added
 
+- **MIP-04 Epoch Fallback for Media Decryption**: `decrypt_from_download` now resolves the correct decryption key via an O(1) epoch hint lookup instead of only using the current epoch's exporter secret. Added `NoExporterSecretForEpoch` variant to `EncryptedMediaError` for programmatic error matching. ([#167](https://github.com/marmot-protocol/mdk/pull/167))
+- **`PreviouslyFailed` Result Variant**: Added `MessageProcessingResult::PreviouslyFailed` variant to handle cases where a previously failed message arrives again but the MLS group ID cannot be extracted. This prevents crashes in client applications by returning a result instead of throwing an error. ([#165](https://github.com/marmot-protocol/mdk/pull/165), fixes [#154](https://github.com/marmot-protocol/mdk/issues/154), [#159](https://github.com/marmot-protocol/mdk/issues/159))
+- **Message Retry Support**: Implemented better handling for retryable message states. When a message fails processing, it now preserves the `message_event_id` and other context. Added logic to allow reprocessing of messages marked as `Retryable`, with automatic state recovery to `Processed` upon success. ([#161](https://github.com/marmot-protocol/mdk/pull/161))
+- Configurable `out_of_order_tolerance` and `maximum_forward_distance` in `MdkConfig` for MLS sender ratchet settings. Default `out_of_order_tolerance` increased from 5 to 100 for better handling of out-of-order message delivery on Nostr relays. ([`#155`](https://github.com/marmot-protocol/mdk/pull/155))
 - **Epoch Snapshots & Rollback**: Added `EpochSnapshotManager` to maintain historical epoch states for rollback. ([#152](https://github.com/marmot-protocol/mdk/pull/152))
 - **Configuration**: Added `epoch_snapshot_retention` to `MdkConfig` (default: 5) to control how many past epochs are retained for rollback support. ([#152](https://github.com/marmot-protocol/mdk/pull/152))
 - **Rollback Callback**: Added `MdkCallback` trait and `MdkBuilder::with_callback()` to allow applications to react to rollback events (e.g., to refresh UI). ([#152](https://github.com/marmot-protocol/mdk/pull/152))
 
 ### Fixed
 
+- **Security dependency updates**: Updated `time` (0.3.44 → 0.3.47), `bytes` (1.11.0 → 1.11.1), and `lru` (0.16.2 → 0.16.3) to resolve Dependabot security advisories. ([#174](https://github.com/marmot-protocol/mdk/pull/174))
 - **Message Ordering Consistency**: Fixed inconsistency where `group.last_message_id` might not match `get_messages()[0].id` due to different sorting logic. The `last_message_id` update logic now uses `created_at DESC, processed_at DESC, id DESC` ordering to match the `messages()` query, ensuring the first message returned is always the same as `last_message_id`. Added `last_message_processed_at` field to `Group` to track this secondary sort key. ([#166](https://github.com/marmot-protocol/mdk/pull/166))
 - **Security**: Prevent `GroupId` leakage in `test_commit_race_simple_better_commit_wins` assertion failure messages to avoid exposing sensitive identifiers in logs. ([#152](https://github.com/marmot-protocol/mdk/pull/152))
 
