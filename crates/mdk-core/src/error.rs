@@ -23,7 +23,7 @@ use openmls::key_packages::errors::{KeyPackageNewError, KeyPackageVerifyError};
 use openmls::prelude::{MlsGroupStateError, ValidationError};
 use openmls_traits::types::CryptoError;
 
-/// Nostr MLS error
+/// MDK error
 #[derive(Debug, PartialEq, thiserror::Error)]
 pub enum Error {
     /// Hex error

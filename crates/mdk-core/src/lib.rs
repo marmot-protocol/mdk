@@ -259,9 +259,9 @@ where
     }
 }
 
-/// The main struct for the Nostr MLS implementation.
+/// The main struct for the MDK implementation.
 ///
-/// This struct provides the core functionality for MLS operations in Nostr:
+/// This struct provides the core functionality for MLS operations in the Marmot protocol:
 /// - Group management (creation, updates, member management)
 /// - Message handling (encryption, decryption, processing)
 /// - Key management (key packages, welcome messages)
@@ -380,7 +380,7 @@ where
         .with_grease(&self.provider.crypto)
     }
 
-    /// Get nostr mls group's required capabilities extension
+    /// Get the group's required capabilities extension
     #[inline]
     pub(crate) fn required_capabilities_extension(&self) -> Extension {
         Extension::RequiredCapabilities(RequiredCapabilitiesExtension::new(
@@ -406,7 +406,7 @@ where
     }
 }
 
-/// Tests module for nostr-mls
+/// Tests module for mdk-core
 #[cfg(test)]
 pub mod tests {
     use mdk_memory_storage::MdkMemoryStorage;

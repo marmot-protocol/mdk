@@ -1,4 +1,4 @@
-//! Memory-based storage implementation of the MdkStorageProvider trait for Nostr MLS groups
+//! Memory-based storage implementation of the MdkStorageProvider trait for MDK groups
 
 use std::collections::BTreeSet;
 

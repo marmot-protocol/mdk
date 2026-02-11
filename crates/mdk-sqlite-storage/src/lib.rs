@@ -1,7 +1,7 @@
-//! SQLite-based storage implementation for Nostr MLS.
+//! SQLite-based storage implementation for MDK.
 //!
-//! This module provides a SQLite-based storage implementation for the Nostr MLS (Messaging Layer Security)
-//! crate. It implements the [`MdkStorageProvider`] trait, allowing it to be used within the Nostr MLS context.
+//! This module provides a SQLite-based storage implementation for MDK (Marmot Development Kit).
+//! It implements the [`MdkStorageProvider`] trait, allowing it to be used as a persistent storage backend.
 //!
 //! SQLite-based storage is persistent and will be saved to a file. It's useful for production applications
 //! where data persistence is required.
@@ -95,7 +95,7 @@ use self::permissions::{
     FileCreationOutcome, precreate_secure_database_file, set_secure_file_permissions,
 };
 
-/// A SQLite-based storage implementation for Nostr MLS.
+/// A SQLite-based storage implementation for MDK.
 ///
 /// This struct implements the MdkStorageProvider trait for SQLite databases.
 /// It directly interfaces with a SQLite database for storing MLS data, using

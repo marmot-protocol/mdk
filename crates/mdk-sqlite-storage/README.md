@@ -1,4 +1,4 @@
-# Nostr MLS Sqlite Storage
+# MDK SQLite Storage
 
 Sqlite MLS storage backend for nostr apps
 

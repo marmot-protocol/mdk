@@ -2,7 +2,7 @@
 name = "mdk-sqlite-storage"
 version = "0.5.1"
 edition = "2024"
-description = "Sqlite database for nostr-mls that implements the MdkStorageProvider Trait"
+description = "SQLite database for MDK that implements the MdkStorageProvider trait"
 authors = ["Jeff Gardner <j@jeffg.me>", "Yuki Kishimoto <yukikishimoto@protonmail.com>", "MDK Developers"]
 homepage.workspace = true
 repository.workspace = true

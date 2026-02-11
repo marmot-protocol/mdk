@@ -1,4 +1,4 @@
-//! Nostr MLS Key Packages
+//! MDK Key Packages
 
 use mdk_storage_traits::MdkStorageProvider;
 use nostr::{Event, Kind, PublicKey, RelayUrl, Tag, TagKind};

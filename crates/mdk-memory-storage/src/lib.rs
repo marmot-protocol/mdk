@@ -1,7 +1,7 @@
-//! Memory-based storage implementation for Nostr MLS.
+//! Memory-based storage implementation for MDK.
 //!
-//! This module provides a memory-based storage implementation for the Nostr MLS (Messaging Layer Security)
-//! crate. It implements the `MdkStorageProvider` trait, allowing it to be used within the Nostr MLS context.
+//! This module provides a memory-based storage implementation for MDK (Marmot Development Kit).
+//! It implements the `MdkStorageProvider` trait, allowing it to be used as an in-memory storage backend.
 //!
 //! Memory-based storage is non-persistent and will be cleared when the application terminates.
 //! It's useful for testing or ephemeral applications where persistence isn't required.
@@ -280,7 +280,7 @@ impl ValidationLimits {
     }
 }
 
-/// A memory-based storage implementation for Nostr MLS.
+/// A memory-based storage implementation for MDK.
 ///
 /// This struct implements both the OpenMLS `StorageProvider<1>` trait and MDK storage
 /// traits directly, providing unified storage for MLS cryptographic state and

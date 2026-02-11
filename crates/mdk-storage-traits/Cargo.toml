@@ -2,7 +2,7 @@
 name = "mdk-storage-traits"
 version = "0.5.1"
 edition = "2024"
-description = "Storage abstraction for nostr-mls that wraps OpenMLS storage backends"
+description = "Storage abstraction for MDK that wraps OpenMLS storage backends"
 authors = ["Jeff Gardner <j@jeffg.me>", "Yuki Kishimoto <yukikishimoto@protonmail.com>", "MDK Developers"]
 homepage.workspace = true
 repository.workspace = true

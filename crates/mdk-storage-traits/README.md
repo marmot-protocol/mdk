@@ -1,4 +1,4 @@
-# Nostr MLS Storage
+# MDK Storage Traits
 
 This crate provides an abstraction for the storage layer that MLS requires.
 

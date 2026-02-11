@@ -1,4 +1,4 @@
-//! Nostr MLS Group Management
+//! MDK groups
 //!
 //! This module provides functionality for managing MLS groups in Nostr:
 //! - Group creation and configuration
@@ -7,7 +7,7 @@
 //! - Group metadata handling
 //! - Group secret management
 //!
-//! Groups in Nostr MLS have both an MLS group ID and a Nostr group ID. The MLS group ID
+//! Groups in MDK have both an MLS group ID and a Nostr group ID. The MLS group ID
 //! is used internally by the MLS protocol, while the Nostr group ID is used for
 //! relay-based message routing and group discovery.
 
@@ -380,7 +380,7 @@ where
         }
     }
 
-    /// Retrieves a Nostr MLS group by its MLS group ID
+    /// Retrieves a MDK group by its MLS group ID
     ///
     /// # Arguments
     ///
@@ -397,7 +397,7 @@ where
             .map_err(|e| Error::Group(e.to_string()))
     }
 
-    /// Retrieves all Nostr MLS groups from storage
+    /// Retrieves all MDK groups from storage
     ///
     /// # Returns
     ///

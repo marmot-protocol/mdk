@@ -1,6 +1,6 @@
-# Nostr MLS Memory Storage
+# MDK Memory Storage
 
-Memory-based storage implementation for [Nostr MLS](../nostr-mls). This crate provides a storage backend that implements the `MdkStorageProvider` trait from the [mdk-storage](../mdk-storage) crate.
+Memory-based storage implementation for MDK. This crate provides a storage backend that implements the `MdkStorageProvider` trait from the [mdk-storage-traits](../mdk-storage-traits) crate.
 
 ## Features
 

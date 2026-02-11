@@ -1,4 +1,4 @@
-//! Nostr MLS Welcomes
+//! MDK welcomes
 
 use nostr::{EventId, Kind, Tag, TagKind, Timestamp, UnsignedEvent};
 use openmls::prelude::*;

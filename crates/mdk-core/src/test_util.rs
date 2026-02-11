@@ -1,4 +1,4 @@
-//! Test utilities for the nostr-mls crate
+//! Test utilities for the mdk-core crate
 //!
 //! This module provides shared test utilities used across multiple test modules
 //! to avoid code duplication and ensure consistency in test setup.

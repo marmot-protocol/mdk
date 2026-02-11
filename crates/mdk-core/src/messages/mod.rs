@@ -1,4 +1,4 @@
-//! Nostr MLS Messages
+//! MDK messages
 //!
 //! This module provides functionality for creating, processing, and managing encrypted
 //! messages in MLS groups. It handles:
@@ -7,7 +7,7 @@
 //! - Message state tracking
 //! - Integration with Nostr events
 //!
-//! Messages in Nostr MLS are wrapped in Nostr events (kind:445) for relay transmission.
+//! Messages in MDK are wrapped in Nostr events (kind:445) for relay transmission.
 //! The message content is encrypted using both MLS group keys and NIP-44 encryption.
 //! Message state is tracked to handle processing status and failure scenarios.
 

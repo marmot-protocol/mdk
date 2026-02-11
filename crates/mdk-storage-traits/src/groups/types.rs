@@ -74,7 +74,7 @@ impl<'de> Deserialize<'de> for GroupState {
     }
 }
 
-/// A Nostr MLS group
+/// An MDK group
 ///
 /// Stores metadata about the group
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -154,7 +154,7 @@ impl Group {
     }
 }
 
-/// A Nostr MLS group relay
+/// An MDK group relay
 ///
 /// Stores a relay URL and the MLS group ID it belongs to
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]

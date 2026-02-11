@@ -17,7 +17,7 @@
 // === Core MDK Types ===
 /// MDK error type
 pub use crate::Error;
-/// The main MDK struct for Nostr MLS operations
+/// The main MDK struct for Marmot protocol operations
 pub use crate::MDK;
 /// MDK provider for OpenMLS integration
 pub use crate::MdkProvider;
