@@ -25,6 +25,7 @@
 
 ### Breaking changes
 
+- **`create_key_package_for_event` Return Type Change**: The return type changed from `(String, Vec<Tag>)` to `(String, Vec<Tag>, Vec<u8>)`. The third element is the serialized hash_ref of the key package, computed atomically during creation. This enables callers to track key packages for lifecycle management (publish → consume → cleanup) without needing to re-parse the package. Callers that don't need the hash_ref can destructure with `_`. ([#178](https://github.com/marmot-protocol/mdk/pull/178))
 - **`create_key_package_for_event` Return Type Change**: The return type changed from `(String, [Tag; 7])` to `(String, Vec<Tag>)`. Most code patterns (iteration, indexing) continue to work unchanged. This change was necessary because the protected tag is now optional. ([#173](https://github.com/marmot-protocol/mdk/pull/173), related: [#168](https://github.com/marmot-protocol/mdk/issues/168))
 - **`create_key_package_for_event` No Longer Adds Protected Tag**: The `create_key_package_for_event()` function no longer adds the NIP-70 protected tag (`["-"]`) by default. This is a behavioral change - existing code that relied on the protected tag being present will now produce key packages without it. Key packages can now be republished by third parties to any relay. This improves relay compatibility since many popular relays (Damus, Primal, nos.lol) reject protected events outright. For users who need the protected tag, use the new `create_key_package_for_event_with_options()` function with `protected: true`. ([#173](https://github.com/marmot-protocol/mdk/pull/173), related: [#168](https://github.com/marmot-protocol/mdk/issues/168))
 - **OpenMLS 0.8.0 Upgrade**: Upgraded from a git-pinned openmls 0.7.1 to the crates.io openmls 0.8.0 release. This resolves security advisory [GHSA-8x3w-qj7j-gqhf](https://github.com/openmls/openmls/security/advisories/GHSA-8x3w-qj7j-gqhf) (improper tag validation) and moves GREASE support from a git pin to an official release. Companion crates updated: `openmls_traits` 0.5, `openmls_basic_credential` 0.5, `openmls_rust_crypto` 0.5. ([#174](https://github.com/marmot-protocol/mdk/pull/174))
@@ -41,7 +42,7 @@
 
 ### Added
 
-- **KeyPackage hash_ref computation and deletion by bytes**: Added `compute_key_package_hash_ref()` to serialize a key package's hash_ref for external caching, and `delete_key_package_from_storage_by_hash_ref()` to delete a key package using previously serialized hash_ref bytes. This enables delayed key material cleanup workflows where the hash_ref is cached at welcome-processing time and used for deletion later. ([#176](https://github.com/marmot-protocol/mdk/pull/176))
+- **KeyPackage deletion by hash_ref bytes**: Added `delete_key_package_from_storage_by_hash_ref()` to delete a key package using previously serialized hash_ref bytes. This enables delayed key material cleanup workflows where the hash_ref is obtained at creation time (via `create_key_package_for_event`) and used for deletion later. ([#178](https://github.com/marmot-protocol/mdk/pull/178))
 - **Custom Message Sort Order**: `get_messages()` now supports custom sort orders via the `Pagination::sort_order` field. Added `get_last_message(group_id, sort_order)` method to retrieve the most recent message under a given sort order, enabling clients using `ProcessedAtFirst` ordering to get a consistent "last message" value. ([#171](https://github.com/marmot-protocol/mdk/pull/171))
 - **`create_key_package_for_event_with_options`**: New function that allows specifying whether to include the NIP-70 protected tag. Use this if you need to publish to relays that accept protected events. ([#173](https://github.com/marmot-protocol/mdk/pull/173), related: [#168](https://github.com/marmot-protocol/mdk/issues/168))
 - **MIP-04 Epoch Fallback for Media Decryption**: `decrypt_from_download` now resolves the correct decryption key via an O(1) epoch hint lookup instead of only using the current epoch's exporter secret. Added `NoExporterSecretForEpoch` variant to `EncryptedMediaError` for programmatic error matching. ([#167](https://github.com/marmot-protocol/mdk/pull/167))
@@ -59,6 +60,8 @@
 - **Security**: Prevent `GroupId` leakage in `test_commit_race_simple_better_commit_wins` assertion failure messages to avoid exposing sensitive identifiers in logs. ([#152](https://github.com/marmot-protocol/mdk/pull/152))
 
 ### Removed
+
+- **`compute_key_package_hash_ref` removed**: This method is no longer needed now that `create_key_package_for_event` returns the hash_ref directly as its third tuple element. Callers should use the hash_ref from `create_key_package_for_event` instead. ([#178](https://github.com/marmot-protocol/mdk/pull/178))
 
 ### Deprecated
 

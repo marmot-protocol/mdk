@@ -41,6 +41,7 @@ where
     ///   - `relays` - Relay URLs for distribution
     ///   - `client` - Client identifier and version
     ///   - `encoding` - The encoding format tag ("base64")
+    /// * The serialized hash_ref bytes for the key package (for lifecycle tracking)
     ///
     /// # Errors
     ///
@@ -52,7 +53,7 @@ where
         &self,
         public_key: &PublicKey,
         relays: I,
-    ) -> Result<(String, Vec<Tag>), Error>
+    ) -> Result<(String, Vec<Tag>, Vec<u8>), Error>
     where
         I: IntoIterator<Item = RelayUrl>,
     {
@@ -78,6 +79,7 @@ where
     /// A tuple containing:
     /// * A base64-encoded string containing the serialized key package
     /// * A vector of tags for the Nostr event
+    /// * The serialized hash_ref bytes for the key package (for lifecycle tracking)
     ///
     /// # Errors
     ///
@@ -90,7 +92,7 @@ where
         public_key: &PublicKey,
         relays: I,
         protected: bool,
-    ) -> Result<(String, Vec<Tag>), Error>
+    ) -> Result<(String, Vec<Tag>, Vec<u8>), Error>
     where
         I: IntoIterator<Item = RelayUrl>,
     {
@@ -112,7 +114,7 @@ where
         public_key: &PublicKey,
         relays: I,
         protected: bool,
-    ) -> Result<(String, Vec<Tag>), Error>
+    ) -> Result<(String, Vec<Tag>, Vec<u8>), Error>
     where
         I: IntoIterator<Item = RelayUrl>,
     {
@@ -129,6 +131,15 @@ where
                 &signature_keypair,
                 credential,
             )?;
+
+        // Compute hash_ref while we have the KeyPackage available.
+        // This allows callers to track the key package for later cleanup
+        // without needing to re-parse it.
+        let hash_ref = key_package_bundle
+            .key_package()
+            .hash_ref(self.provider.crypto())?;
+        let hash_ref_bytes = JsonCodec::serialize(&hash_ref)
+            .map_err(|e| Error::Provider(format!("Failed to serialize hash_ref: {}", e)))?;
 
         let key_package_serialized = key_package_bundle.key_package().tls_serialize_detached()?;
 
@@ -162,7 +173,7 @@ where
             [encoding.as_tag_value()],
         ));
 
-        Ok((encoded_content, tags))
+        Ok((encoded_content, tags, hash_ref_bytes))
     }
 
     /// Parses and validates a key package using base64 encoding.
@@ -510,21 +521,10 @@ where
         Ok(())
     }
 
-    /// Computes and serializes the hash_ref for a key package.
-    ///
-    /// Returns the hash_ref as serialized bytes that can be stored externally
-    /// and later used with [`delete_key_package_from_storage_by_hash_ref`](Self::delete_key_package_from_storage_by_hash_ref)
-    /// to delete the key package from storage.
-    pub fn compute_key_package_hash_ref(&self, key_package: &KeyPackage) -> Result<Vec<u8>, Error> {
-        let hash_ref = key_package.hash_ref(self.provider.crypto())?;
-        JsonCodec::serialize(&hash_ref)
-            .map_err(|e| Error::Provider(format!("Failed to serialize hash_ref: {}", e)))
-    }
-
     /// Deletes a key package from storage using previously serialized hash_ref bytes.
     ///
-    /// The `hash_ref_bytes` should be bytes previously returned by
-    /// [`compute_key_package_hash_ref`](Self::compute_key_package_hash_ref).
+    /// The `hash_ref_bytes` should be the bytes returned as the third element of
+    /// [`create_key_package_for_event`](Self::create_key_package_for_event).
     pub fn delete_key_package_from_storage_by_hash_ref(
         &self,
         hash_ref_bytes: &[u8],
@@ -615,11 +615,13 @@ where
 #[cfg(test)]
 mod tests {
     use nostr::EventBuilder;
+    use nostr::Keys;
     use nostr::base64::Engine;
     use nostr::base64::engine::general_purpose::STANDARD as BASE64;
 
     use super::*;
     use crate::constant::DEFAULT_CIPHERSUITE;
+    use crate::test_util::create_nostr_group_config_data;
     use crate::tests::create_test_mdk;
 
     #[test]
@@ -631,7 +633,7 @@ mod tests {
         let relays = vec![RelayUrl::parse("wss://relay.example.com").unwrap()];
 
         // Create key package without protected tag (default for maximum relay compatibility)
-        let (key_package_str, tags) = mdk
+        let (key_package_str, tags, _hash_ref) = mdk
             .create_key_package_for_event(&test_pubkey, relays.clone())
             .expect("Failed to create key package");
 
@@ -692,7 +694,7 @@ mod tests {
                 .unwrap();
         let relays = vec![RelayUrl::parse("wss://relay.example.com").unwrap()];
 
-        let (_, tags) = mdk
+        let (_, tags, _) = mdk
             .create_key_package_for_event(&test_pubkey, relays)
             .expect("Failed to create key package");
 
@@ -729,7 +731,7 @@ mod tests {
                 .unwrap();
         let relays = vec![RelayUrl::parse("wss://relay.example.com").unwrap()];
 
-        let (_, tags) = mdk
+        let (_, tags, _) = mdk
             .create_key_package_for_event(&test_pubkey, relays)
             .expect("Failed to create key package");
 
@@ -810,7 +812,7 @@ mod tests {
                 .unwrap();
         let relays = vec![RelayUrl::parse("wss://relay.example.com").unwrap()];
 
-        let (_, tags) = mdk
+        let (_, tags, _) = mdk
             .create_key_package_for_event(&test_pubkey, relays)
             .expect("Failed to create key package");
 
@@ -841,7 +843,7 @@ mod tests {
             RelayUrl::parse("wss://relay2.example.com").unwrap(),
         ];
 
-        let (_, tags) = mdk
+        let (_, tags, _) = mdk
             .create_key_package_for_event(&test_pubkey, relays.clone())
             .expect("Failed to create key package");
 
@@ -920,9 +922,15 @@ mod tests {
                 .unwrap();
         let relays = vec![RelayUrl::parse("wss://relay.example.com").unwrap()];
 
-        let (_, tags) = mdk
+        let (_, tags, hash_ref) = mdk
             .create_key_package_for_event_with_options(&test_pubkey, relays, true)
             .expect("Failed to create key package");
+
+        // Verify hash_ref is returned from the with_options variant too
+        assert!(
+            !hash_ref.is_empty(),
+            "hash_ref should be returned from create_key_package_for_event_with_options"
+        );
 
         // Verify we have exactly 7 tags (3 MLS required + relays + protected + client + encoding)
         assert_eq!(
@@ -959,7 +967,7 @@ mod tests {
         let relays = vec![RelayUrl::parse("wss://relay.example.com").unwrap()];
 
         // Create and parse key package
-        let (key_package_str, _) = mdk
+        let (key_package_str, _, _) = mdk
             .create_key_package_for_event(&test_pubkey, relays.clone())
             .expect("Failed to create key package");
 
@@ -976,7 +984,7 @@ mod tests {
     }
 
     #[test]
-    fn test_key_package_deletion_by_hash_ref_roundtrip() {
+    fn test_key_package_deletion_by_hash_ref() {
         let mdk = create_test_mdk();
         let test_pubkey =
             PublicKey::from_hex("884704bd421671e01c13f854d2ce23ce2a5bfe9562f4f297ad2bc921ba30c3a6")
@@ -984,34 +992,19 @@ mod tests {
 
         let relays = vec![RelayUrl::parse("wss://relay.example.com").unwrap()];
 
-        // Create and parse key package
-        let (key_package_str, _) = mdk
-            .create_key_package_for_event(&test_pubkey, relays.clone())
+        // hash_ref is returned directly from create_key_package_for_event
+        let (_, _, hash_ref) = mdk
+            .create_key_package_for_event(&test_pubkey, relays)
             .expect("Failed to create key package");
 
-        let deletion_mdk = create_test_mdk();
-        let key_package = deletion_mdk
-            .parse_serialized_key_package(&key_package_str, ContentEncoding::Base64)
-            .expect("Failed to parse key package");
+        assert!(!hash_ref.is_empty(), "hash_ref bytes should not be empty");
 
-        // Compute hash_ref bytes (simulates what whitenoise-rs caches in DB)
-        let hash_ref_bytes = deletion_mdk
-            .compute_key_package_hash_ref(&key_package)
-            .expect("Failed to compute hash_ref");
-
-        assert!(
-            !hash_ref_bytes.is_empty(),
-            "hash_ref bytes should not be empty"
-        );
-
-        // Delete using the serialized hash_ref bytes (simulates delayed cleanup)
-        deletion_mdk
-            .delete_key_package_from_storage_by_hash_ref(&hash_ref_bytes)
+        // Delete using the hash_ref bytes (simulates delayed cleanup)
+        mdk.delete_key_package_from_storage_by_hash_ref(&hash_ref)
             .expect("Failed to delete key package by hash_ref");
 
         // Deleting again should also succeed (idempotent, no-op)
-        deletion_mdk
-            .delete_key_package_from_storage_by_hash_ref(&hash_ref_bytes)
+        mdk.delete_key_package_from_storage_by_hash_ref(&hash_ref)
             .expect("Second deletion should succeed (idempotent)");
     }
 
@@ -1136,7 +1129,7 @@ mod tests {
             PublicKey::from_hex("884704bd421671e01c13f854d2ce23ce2a5bfe9562f4f297ad2bc921ba30c3a6")
                 .unwrap();
 
-        let (key_package_hex, _) = mdk
+        let (key_package_hex, _, _) = mdk
             .create_key_package_for_event(&test_pubkey, vec![])
             .expect("Failed to create key package");
 
@@ -1236,7 +1229,7 @@ mod tests {
             PublicKey::from_hex("884704bd421671e01c13f854d2ce23ce2a5bfe9562f4f297ad2bc921ba30c3a6")
                 .unwrap();
 
-        let (key_package_hex, _) = mdk
+        let (key_package_hex, _, _) = mdk
             .create_key_package_for_event(&test_pubkey, vec![])
             .expect("Failed to create key package");
 
@@ -1390,7 +1383,7 @@ mod tests {
             PublicKey::from_hex("884704bd421671e01c13f854d2ce23ce2a5bfe9562f4f297ad2bc921ba30c3a6")
                 .unwrap();
 
-        let (key_package_hex, _) = mdk
+        let (key_package_hex, _, _) = mdk
             .create_key_package_for_event(&test_pubkey, vec![])
             .expect("Failed to create key package");
 
@@ -1478,7 +1471,7 @@ mod tests {
             PublicKey::from_hex("884704bd421671e01c13f854d2ce23ce2a5bfe9562f4f297ad2bc921ba30c3a6")
                 .unwrap();
 
-        let (key_package_hex, _) = mdk
+        let (key_package_hex, _, _) = mdk
             .create_key_package_for_event(&test_pubkey, vec![])
             .expect("Failed to create key package");
 
@@ -1555,7 +1548,7 @@ mod tests {
             PublicKey::from_hex("884704bd421671e01c13f854d2ce23ce2a5bfe9562f4f297ad2bc921ba30c3a6")
                 .unwrap();
 
-        let (key_package_hex, _) = mdk
+        let (key_package_hex, _, _) = mdk
             .create_key_package_for_event(&test_pubkey, vec![])
             .expect("Failed to create key package");
 
@@ -1632,7 +1625,7 @@ mod tests {
             PublicKey::from_hex("884704bd421671e01c13f854d2ce23ce2a5bfe9562f4f297ad2bc921ba30c3a6")
                 .unwrap();
 
-        let (key_package_hex, _) = mdk
+        let (key_package_hex, _, _) = mdk
             .create_key_package_for_event(&test_pubkey, vec![])
             .expect("Failed to create key package");
 
@@ -1698,7 +1691,7 @@ mod tests {
             PublicKey::from_hex("884704bd421671e01c13f854d2ce23ce2a5bfe9562f4f297ad2bc921ba30c3a6")
                 .unwrap();
 
-        let (key_package_hex, _) = mdk
+        let (key_package_hex, _, _) = mdk
             .create_key_package_for_event(&test_pubkey, vec![])
             .expect("Failed to create key package");
 
@@ -1769,7 +1762,7 @@ mod tests {
             PublicKey::from_hex("884704bd421671e01c13f854d2ce23ce2a5bfe9562f4f297ad2bc921ba30c3a6")
                 .unwrap();
 
-        let (key_package_hex, _) = mdk
+        let (key_package_hex, _, _) = mdk
             .create_key_package_for_event(&test_pubkey, vec![])
             .expect("Failed to create key package");
 
@@ -1826,7 +1819,7 @@ mod tests {
             PublicKey::from_hex("884704bd421671e01c13f854d2ce23ce2a5bfe9562f4f297ad2bc921ba30c3a6")
                 .unwrap();
 
-        let (key_package_hex, _) = mdk
+        let (key_package_hex, _, _) = mdk
             .create_key_package_for_event(&test_pubkey, vec![])
             .expect("Failed to create key package");
 
@@ -1863,7 +1856,7 @@ mod tests {
             PublicKey::from_hex("884704bd421671e01c13f854d2ce23ce2a5bfe9562f4f297ad2bc921ba30c3a6")
                 .unwrap();
 
-        let (key_package_hex, _) = mdk
+        let (key_package_hex, _, _) = mdk
             .create_key_package_for_event(&test_pubkey, vec![])
             .expect("Failed to create key package");
 
@@ -1900,7 +1893,7 @@ mod tests {
         let keys = nostr::Keys::generate();
         let relays = vec![RelayUrl::parse("wss://relay.example.com").unwrap()];
 
-        let (key_package_str, tags) = mdk
+        let (key_package_str, tags, _hash_ref) = mdk
             .create_key_package_for_event(&keys.public_key(), relays)
             .expect("Failed to create key package");
 
@@ -1927,7 +1920,7 @@ mod tests {
             PublicKey::from_hex("884704bd421671e01c13f854d2ce23ce2a5bfe9562f4f297ad2bc921ba30c3a6")
                 .unwrap();
 
-        let (key_package_hex, _) = mdk
+        let (key_package_hex, _, _) = mdk
             .create_key_package_for_event(&test_pubkey, vec![])
             .expect("Failed to create key package");
 
@@ -1968,9 +1961,6 @@ mod tests {
     /// - Key rotation proposals can be created after joining
     #[test]
     fn test_last_resort_keypackage_lifecycle() {
-        use crate::test_util::create_nostr_group_config_data;
-        use nostr::{EventBuilder, Keys};
-
         // Setup: Create Bob who will be invited to a group
         let bob_keys = Keys::generate();
         let bob_mdk = create_test_mdk();
@@ -1983,7 +1973,7 @@ mod tests {
         // Step 1: Bob creates a KeyPackage with last_resort extension
         // Note: By default, MDK creates KeyPackages with last_resort extension enabled
         let relays = vec![RelayUrl::parse("wss://test.relay").unwrap()];
-        let (bob_key_package_hex, tags) = bob_mdk
+        let (bob_key_package_hex, tags, _hash_ref) = bob_mdk
             .create_key_package_for_event(&bob_pubkey, relays.clone())
             .expect("Failed to create key package");
 
@@ -2082,7 +2072,7 @@ mod tests {
                 .unwrap();
         let relays = vec![RelayUrl::parse("wss://relay.example.com").unwrap()];
 
-        let (key_package_str, tags) = mdk
+        let (key_package_str, tags, _hash_ref) = mdk
             .create_key_package_for_event(&test_pubkey, relays)
             .expect("Failed to create key package");
 
@@ -2117,7 +2107,7 @@ mod tests {
                 .unwrap();
         let relays = vec![RelayUrl::parse("wss://relay.example.com").unwrap()];
 
-        let (base64_key_package, _) = mdk
+        let (base64_key_package, _, _) = mdk
             .create_key_package_for_event(&test_pubkey, relays)
             .expect("Failed to create base64 key package");
 
@@ -2152,7 +2142,7 @@ mod tests {
         let relays = vec![RelayUrl::parse("wss://relay.example.com").unwrap()];
 
         // Create a key package with the victim's public key in the credential
-        let (key_package_hex, tags) = mdk
+        let (key_package_hex, tags, _hash_ref) = mdk
             .create_key_package_for_event(&victim_keys.public_key(), relays)
             .expect("Failed to create key package");
 
@@ -2205,7 +2195,7 @@ mod tests {
         let relays = vec![RelayUrl::parse("wss://relay.example.com").unwrap()];
 
         // Create a key package with the user's public key
-        let (key_package_hex, tags) = mdk
+        let (key_package_hex, tags, _hash_ref) = mdk
             .create_key_package_for_event(&keys.public_key(), relays)
             .expect("Failed to create key package");
 
