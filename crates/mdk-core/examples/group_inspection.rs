@@ -63,7 +63,7 @@ async fn main() -> Result<(), Error> {
     let relay_url = RelayUrl::parse("wss://relay.example.com").unwrap();
 
     // Create key packages for members (not creator)
-    let (member1_kp_encoded, member1_tags) =
+    let (member1_kp_encoded, member1_tags, _) =
         mdk.create_key_package_for_event(&member1_keys.public_key(), [relay_url.clone()])?;
 
     let member1_event =
@@ -73,7 +73,7 @@ async fn main() -> Result<(), Error> {
             .sign(&member1_keys)
             .await?;
 
-    let (member2_kp_encoded, member2_tags) =
+    let (member2_kp_encoded, member2_tags, _) =
         mdk.create_key_package_for_event(&member2_keys.public_key(), [relay_url.clone()])?;
 
     let member2_event =

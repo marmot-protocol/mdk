@@ -136,7 +136,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let relay_url = RelayUrl::parse("wss://relay.example.com")?;
 
     // Bob creates a key package
-    let (bob_key_package, tags) = bob_mdk
+    let (bob_key_package, tags, _hash_ref) = bob_mdk
         .create_key_package_for_event(&bob_keys.public_key(), [relay_url.clone()])?;
 
     let bob_key_package_event = EventBuilder::new(Kind::MlsKeyPackage, bob_key_package)

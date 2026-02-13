@@ -382,13 +382,15 @@ impl Mdk {
         let relay_urls = parse_relay_urls(&relays)?;
 
         let mdk = self.lock()?;
-        let (key_package_hex, tags) = mdk.create_key_package_for_event(&pubkey, relay_urls)?;
+        let (key_package_hex, tags, hash_ref) =
+            mdk.create_key_package_for_event(&pubkey, relay_urls)?;
 
         let tags: Vec<Vec<String>> = tags.iter().map(|tag| tag.as_slice().to_vec()).collect();
 
         Ok(KeyPackageResult {
             key_package: key_package_hex,
             tags,
+            hash_ref,
         })
     }
 
@@ -412,7 +414,7 @@ impl Mdk {
         let relay_urls = parse_relay_urls(&relays)?;
 
         let mdk = self.lock()?;
-        let (key_package_hex, tags) =
+        let (key_package_hex, tags, hash_ref) =
             mdk.create_key_package_for_event_with_options(&pubkey, relay_urls, protected)?;
 
         let tags: Vec<Vec<String>> = tags.iter().map(|tag| tag.as_slice().to_vec()).collect();
@@ -420,6 +422,7 @@ impl Mdk {
         Ok(KeyPackageResult {
             key_package: key_package_hex,
             tags,
+            hash_ref,
         })
     }
 
@@ -1039,6 +1042,8 @@ pub struct KeyPackageResult {
     pub key_package: String,
     /// JSON-encoded tags for the key package event
     pub tags: Vec<Vec<String>>,
+    /// Serialized hash_ref bytes for the key package (for lifecycle tracking)
+    pub hash_ref: Vec<u8>,
 }
 
 /// Result of creating a group
@@ -1543,6 +1548,10 @@ mod tests {
         let key_package_result = result.unwrap();
         assert!(!key_package_result.key_package.is_empty());
         assert!(!key_package_result.tags.is_empty());
+        assert!(
+            !key_package_result.hash_ref.is_empty(),
+            "hash_ref should be non-empty"
+        );
     }
 
     #[test]

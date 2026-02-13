@@ -42,7 +42,7 @@ async fn main() -> Result<(), Error> {
     println!("=== Creating Key Package ===\n");
 
     // Create key package with protected=true to demonstrate NIP-70 tag
-    let (key_package_encoded, tags) = mdk.create_key_package_for_event_with_options(
+    let (key_package_encoded, tags, _hash_ref) = mdk.create_key_package_for_event_with_options(
         &keys.public_key(),
         [relay_url.clone()],
         true,
