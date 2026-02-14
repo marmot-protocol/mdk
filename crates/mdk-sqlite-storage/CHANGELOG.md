@@ -25,6 +25,14 @@
 
 ## Unreleased
 
+### Breaking changes
+
+- **MLS codec switched from JSON to postcard**: MLS storage serialization now uses `MlsCodec` (postcard binary format) instead of the removed `JsonCodec` (serde_json). Existing SQLite databases contain JSON-encoded MLS data and are incompatible — they must be recreated. ([#179](https://github.com/marmot-protocol/mdk/pull/179))
+
+### Fixed
+
+- **Snapshot/rollback now correctly captures OpenMLS data**: The snapshot and restore code used `group_id.as_slice()` (raw bytes) to query OpenMLS tables, but the `StorageProvider` writes group_id via `MlsCodec::serialize()` (serialized bytes). The WHERE clauses never matched, so snapshots silently captured zero OpenMLS rows and rollbacks left MLS cryptographic state untouched — creating a metadata/crypto split-brain where MDK metadata was rolled back but the MLS engine retained the wrong epoch's keys. ([#179](https://github.com/marmot-protocol/mdk/pull/179))
+
 ### Added
 
 - **Custom Message Sort Order**: `messages()` now respects the `sort_order` field in `Pagination`, supporting both `CreatedAtFirst` (default) and `ProcessedAtFirst` orderings via different SQL `ORDER BY` clauses. ([#171](https://github.com/marmot-protocol/mdk/pull/171))

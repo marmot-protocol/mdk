@@ -29,6 +29,7 @@ nostr = { version = "0.44", default-features = false }
 # Serialization
 serde = { version = "1.0", default-features = false }
 serde_json = { version = "1.0", default-features = false }
+postcard = { version = "1.1", default-features = false }
 tls_codec = "0.4"
 
 # Cryptography

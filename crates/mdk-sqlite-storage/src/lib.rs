@@ -463,6 +463,10 @@ impl MdkSqliteStorage {
     fn snapshot_group_state(&self, group_id: &GroupId, name: &str) -> Result<(), Error> {
         let conn = self.connection.lock().unwrap();
         let group_id_bytes = group_id.as_slice();
+        // MLS storage uses MlsCodec serialization for group_id keys.
+        // We need to use the same serialization to match the stored keys.
+        let mls_group_id_bytes = mls_storage::MlsCodec::serialize(group_id)
+            .map_err(|e| Error::Database(e.to_string()))?;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_err(|e| Error::Database(format!("Time error: {}", e)))?
@@ -483,13 +487,29 @@ impl MdkSqliteStorage {
                 .map_err(|e| Error::Database(e.to_string()))?;
 
             // Snapshot all 7 tables (4 OpenMLS + 3 MDK)
-            Self::snapshot_openmls_group_data(&conn, &mut insert_stmt, name, group_id_bytes, now)?;
-            Self::snapshot_openmls_proposals(&conn, &mut insert_stmt, name, group_id_bytes, now)?;
+            // OpenMLS tables use MlsCodec-serialized group_id as their key
+            Self::snapshot_openmls_group_data(
+                &conn,
+                &mut insert_stmt,
+                name,
+                group_id_bytes,
+                &mls_group_id_bytes,
+                now,
+            )?;
+            Self::snapshot_openmls_proposals(
+                &conn,
+                &mut insert_stmt,
+                name,
+                group_id_bytes,
+                &mls_group_id_bytes,
+                now,
+            )?;
             Self::snapshot_openmls_own_leaf_nodes(
                 &conn,
                 &mut insert_stmt,
                 name,
                 group_id_bytes,
+                &mls_group_id_bytes,
                 now,
             )?;
             Self::snapshot_openmls_epoch_key_pairs(
@@ -497,8 +517,10 @@ impl MdkSqliteStorage {
                 &mut insert_stmt,
                 name,
                 group_id_bytes,
+                &mls_group_id_bytes,
                 now,
             )?;
+            // MDK tables use raw bytes for mls_group_id
             Self::snapshot_groups_table(&conn, &mut insert_stmt, name, group_id_bytes, now)?;
             Self::snapshot_group_relays(&conn, &mut insert_stmt, name, group_id_bytes, now)?;
             Self::snapshot_group_exporter_secrets(
@@ -531,6 +553,7 @@ impl MdkSqliteStorage {
         insert_stmt: &mut rusqlite::CachedStatement<'_>,
         snapshot_name: &str,
         group_id_bytes: &[u8],
+        mls_group_id_bytes: &[u8],
         now: i64,
     ) -> Result<(), Error> {
         let mut stmt = conn
@@ -539,7 +562,7 @@ impl MdkSqliteStorage {
             )
             .map_err(|e| Error::Database(e.to_string()))?;
         let mut rows = stmt
-            .query([group_id_bytes])
+            .query([mls_group_id_bytes])
             .map_err(|e| Error::Database(e.to_string()))?;
 
         while let Some(row) = rows.next().map_err(|e| Error::Database(e.to_string()))? {
@@ -568,6 +591,7 @@ impl MdkSqliteStorage {
         insert_stmt: &mut rusqlite::CachedStatement<'_>,
         snapshot_name: &str,
         group_id_bytes: &[u8],
+        mls_group_id_bytes: &[u8],
         now: i64,
     ) -> Result<(), Error> {
         let mut stmt = conn
@@ -576,7 +600,7 @@ impl MdkSqliteStorage {
             )
             .map_err(|e| Error::Database(e.to_string()))?;
         let mut rows = stmt
-            .query([group_id_bytes])
+            .query([mls_group_id_bytes])
             .map_err(|e| Error::Database(e.to_string()))?;
 
         while let Some(row) = rows.next().map_err(|e| Error::Database(e.to_string()))? {
@@ -605,6 +629,7 @@ impl MdkSqliteStorage {
         insert_stmt: &mut rusqlite::CachedStatement<'_>,
         snapshot_name: &str,
         group_id_bytes: &[u8],
+        mls_group_id_bytes: &[u8],
         now: i64,
     ) -> Result<(), Error> {
         let mut stmt = conn
@@ -613,7 +638,7 @@ impl MdkSqliteStorage {
             )
             .map_err(|e| Error::Database(e.to_string()))?;
         let mut rows = stmt
-            .query([group_id_bytes])
+            .query([mls_group_id_bytes])
             .map_err(|e| Error::Database(e.to_string()))?;
 
         while let Some(row) = rows.next().map_err(|e| Error::Database(e.to_string()))? {
@@ -643,6 +668,7 @@ impl MdkSqliteStorage {
         insert_stmt: &mut rusqlite::CachedStatement<'_>,
         snapshot_name: &str,
         group_id_bytes: &[u8],
+        mls_group_id_bytes: &[u8],
         now: i64,
     ) -> Result<(), Error> {
         let mut stmt = conn
@@ -652,7 +678,7 @@ impl MdkSqliteStorage {
             )
             .map_err(|e| Error::Database(e.to_string()))?;
         let mut rows = stmt
-            .query([group_id_bytes])
+            .query([mls_group_id_bytes])
             .map_err(|e| Error::Database(e.to_string()))?;
 
         while let Some(row) = rows.next().map_err(|e| Error::Database(e.to_string()))? {
@@ -824,6 +850,10 @@ impl MdkSqliteStorage {
     fn restore_group_from_snapshot(&self, group_id: &GroupId, name: &str) -> Result<(), Error> {
         let conn = self.connection.lock().unwrap();
         let group_id_bytes = group_id.as_slice();
+        // MLS storage uses a serde-compatible binary serialization codec for group_id keys.
+        // We need to use the same serialization to match the stored keys.
+        let mls_group_id_bytes = mls_storage::MlsCodec::serialize(group_id)
+            .map_err(|e| Error::Database(e.to_string()))?;
 
         // Check if snapshot exists BEFORE starting transaction or deleting any data.
         // This prevents data loss if the snapshot name is typo'd or doesn't exist.
@@ -896,27 +926,28 @@ impl MdkSqliteStorage {
 
         let result = (|| -> Result<(), Error> {
             // 2. Delete current rows for this group from all 7 tables
+            // OpenMLS tables use MlsCodec-serialized group_id as their key
             conn.execute(
                 "DELETE FROM openmls_group_data WHERE group_id = ?",
-                [group_id_bytes],
+                [&mls_group_id_bytes],
             )
             .map_err(|e| Error::Database(e.to_string()))?;
 
             conn.execute(
                 "DELETE FROM openmls_proposals WHERE group_id = ?",
-                [group_id_bytes],
+                [&mls_group_id_bytes],
             )
             .map_err(|e| Error::Database(e.to_string()))?;
 
             conn.execute(
                 "DELETE FROM openmls_own_leaf_nodes WHERE group_id = ?",
-                [group_id_bytes],
+                [&mls_group_id_bytes],
             )
             .map_err(|e| Error::Database(e.to_string()))?;
 
             conn.execute(
                 "DELETE FROM openmls_epoch_key_pairs WHERE group_id = ?",
-                [group_id_bytes],
+                [&mls_group_id_bytes],
             )
             .map_err(|e| Error::Database(e.to_string()))?;
 
@@ -3790,6 +3821,649 @@ mod tests {
             // Attempting to rollback should fail (no snapshot exists)
             let rollback_result = storage.rollback_group_to_snapshot(&group_id, "to_prune");
             assert!(rollback_result.is_err());
+        }
+    }
+
+    // ========================================
+    // Snapshot tests for OpenMLS data
+    // ========================================
+    // These tests verify that snapshots correctly capture and restore OpenMLS
+    // cryptographic state that is written through the StorageProvider trait
+    // (which uses MlsCodec::serialize for group_id keys). The existing snapshot
+    // tests only exercise MDK-level data (groups, relays, exporter secrets),
+    // missing the fact that OpenMLS tables store group_id as MlsCodec-encoded bytes
+    // while the snapshot code queries them with raw bytes from as_slice().
+
+    mod snapshot_openmls_tests {
+        use std::collections::BTreeSet;
+
+        use mdk_storage_traits::groups::GroupStorage;
+        use mdk_storage_traits::groups::types::{Group, GroupState};
+        use mdk_storage_traits::mls_codec::MlsCodec;
+        use mdk_storage_traits::{GroupId, MdkStorageProvider};
+        use rusqlite::params;
+
+        use super::*;
+
+        /// Helper: create a minimal test group for snapshot tests.
+        fn create_test_group(id: u8) -> Group {
+            Group {
+                mls_group_id: GroupId::from_slice(&[id; 32]),
+                nostr_group_id: [id; 32],
+                name: format!("Test Group {}", id),
+                description: format!("Description {}", id),
+                admin_pubkeys: BTreeSet::new(),
+                last_message_id: None,
+                last_message_at: None,
+                last_message_processed_at: None,
+                epoch: 0,
+                state: GroupState::Active,
+                image_hash: None,
+                image_key: None,
+                image_nonce: None,
+            }
+        }
+
+        /// Helper: count rows in an OpenMLS table for a given group_id using
+        /// MlsCodec-serialized key (the way OpenMLS actually stores them).
+        fn count_openmls_rows(storage: &MdkSqliteStorage, table: &str, group_id: &GroupId) -> i64 {
+            let mls_key = MlsCodec::serialize(group_id).unwrap();
+            storage.with_connection(|conn| {
+                conn.query_row(
+                    &format!("SELECT COUNT(*) FROM {} WHERE group_id = ?", table),
+                    params![mls_key],
+                    |row| row.get(0),
+                )
+                .unwrap()
+            })
+        }
+
+        /// Helper: count snapshot rows for a given table_name.
+        fn count_snapshot_rows_for_table(
+            storage: &MdkSqliteStorage,
+            snapshot_name: &str,
+            group_id: &GroupId,
+            table_name: &str,
+        ) -> i64 {
+            let raw_bytes = group_id.as_slice().to_vec();
+            storage.with_connection(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM group_state_snapshots
+                     WHERE snapshot_name = ? AND group_id = ? AND table_name = ?",
+                    params![snapshot_name, raw_bytes, table_name],
+                    |row| row.get(0),
+                )
+                .unwrap()
+            })
+        }
+
+        /// Helper: insert OpenMLS data via the same code path as StorageProvider.
+        ///
+        /// This uses `MlsCodec::serialize()` for the group_id key, exactly as
+        /// the `write_group_data`, `append_own_leaf_node`, `queue_proposal`, and
+        /// `write_encryption_epoch_key_pairs` functions do in `mls_storage/mod.rs`.
+        fn seed_openmls_data(storage: &MdkSqliteStorage, group_id: &GroupId) {
+            let mls_key = MlsCodec::serialize(group_id).unwrap();
+            storage.with_connection(|conn| {
+                // openmls_group_data — written by write_group_data() via serialize_key()
+                conn.execute(
+                    "INSERT OR REPLACE INTO openmls_group_data
+                     (group_id, data_type, group_data, provider_version)
+                     VALUES (?, ?, ?, ?)",
+                    params![mls_key, "group_state", b"test_crypto_state" as &[u8], 1i32],
+                )
+                .unwrap();
+
+                conn.execute(
+                    "INSERT OR REPLACE INTO openmls_group_data
+                     (group_id, data_type, group_data, provider_version)
+                     VALUES (?, ?, ?, ?)",
+                    params![mls_key, "tree", b"test_tree_data" as &[u8], 1i32],
+                )
+                .unwrap();
+
+                // openmls_own_leaf_nodes — written by append_own_leaf_node() via serialize_key()
+                conn.execute(
+                    "INSERT INTO openmls_own_leaf_nodes
+                     (group_id, leaf_node, provider_version)
+                     VALUES (?, ?, ?)",
+                    params![mls_key, b"test_leaf_node" as &[u8], 1i32],
+                )
+                .unwrap();
+
+                // openmls_proposals — written by queue_proposal() via serialize_key()
+                let proposal_ref = MlsCodec::serialize(&vec![10u8, 20, 30]).unwrap();
+                conn.execute(
+                    "INSERT OR REPLACE INTO openmls_proposals
+                     (group_id, proposal_ref, proposal, provider_version)
+                     VALUES (?, ?, ?, ?)",
+                    params![mls_key, proposal_ref, b"test_proposal" as &[u8], 1i32],
+                )
+                .unwrap();
+
+                // openmls_epoch_key_pairs — written by write_encryption_epoch_key_pairs()
+                let epoch_key = MlsCodec::serialize(&5u64).unwrap();
+                conn.execute(
+                    "INSERT OR REPLACE INTO openmls_epoch_key_pairs
+                     (group_id, epoch_id, leaf_index, key_pairs, provider_version)
+                     VALUES (?, ?, ?, ?, ?)",
+                    params![mls_key, epoch_key, 0i32, b"test_key_pairs" as &[u8], 1i32],
+                )
+                .unwrap();
+            });
+        }
+
+        /// Snapshot must capture openmls_group_data rows written via StorageProvider.
+        ///
+        /// The StorageProvider writes group_id using `MlsCodec::serialize()` which
+        /// produces serialized bytes distinct from the raw group_id. The snapshot
+        /// code queries these tables using `group_id.as_slice()` (raw bytes), so
+        /// the WHERE clause never matches and zero rows are captured.
+        #[test]
+        fn test_snapshot_captures_openmls_group_data() {
+            let storage = MdkSqliteStorage::new_in_memory().unwrap();
+
+            let group = create_test_group(1);
+            let group_id = group.mls_group_id.clone();
+            storage.save_group(group).unwrap();
+
+            // Write OpenMLS data the way StorageProvider does (MlsCodec keys)
+            seed_openmls_data(&storage, &group_id);
+
+            // Verify data exists in the tables
+            assert_eq!(
+                count_openmls_rows(&storage, "openmls_group_data", &group_id),
+                2,
+                "openmls_group_data should have 2 rows (group_state + tree)"
+            );
+
+            // Take a snapshot
+            storage
+                .create_group_snapshot(&group_id, "snap_mls")
+                .unwrap();
+
+            // Verify snapshot captured the OpenMLS group data rows
+            let snap_count = count_snapshot_rows_for_table(
+                &storage,
+                "snap_mls",
+                &group_id,
+                "openmls_group_data",
+            );
+            assert_eq!(
+                snap_count, 2,
+                "Snapshot must capture openmls_group_data rows written via StorageProvider \
+                 (MlsCodec-serialized group_id keys)"
+            );
+        }
+
+        /// Snapshot must capture openmls_own_leaf_nodes written via StorageProvider.
+        #[test]
+        fn test_snapshot_captures_openmls_own_leaf_nodes() {
+            let storage = MdkSqliteStorage::new_in_memory().unwrap();
+
+            let group = create_test_group(2);
+            let group_id = group.mls_group_id.clone();
+            storage.save_group(group).unwrap();
+
+            seed_openmls_data(&storage, &group_id);
+
+            assert_eq!(
+                count_openmls_rows(&storage, "openmls_own_leaf_nodes", &group_id),
+                1,
+                "openmls_own_leaf_nodes should have 1 row"
+            );
+
+            storage
+                .create_group_snapshot(&group_id, "snap_leaf")
+                .unwrap();
+
+            let snap_count = count_snapshot_rows_for_table(
+                &storage,
+                "snap_leaf",
+                &group_id,
+                "openmls_own_leaf_nodes",
+            );
+            assert_eq!(
+                snap_count, 1,
+                "Snapshot must capture openmls_own_leaf_nodes rows written via \
+                 StorageProvider"
+            );
+        }
+
+        /// Snapshot must capture openmls_proposals written via StorageProvider.
+        #[test]
+        fn test_snapshot_captures_openmls_proposals() {
+            let storage = MdkSqliteStorage::new_in_memory().unwrap();
+
+            let group = create_test_group(3);
+            let group_id = group.mls_group_id.clone();
+            storage.save_group(group).unwrap();
+
+            seed_openmls_data(&storage, &group_id);
+
+            assert_eq!(
+                count_openmls_rows(&storage, "openmls_proposals", &group_id),
+                1,
+                "openmls_proposals should have 1 row"
+            );
+
+            storage
+                .create_group_snapshot(&group_id, "snap_prop")
+                .unwrap();
+
+            let snap_count = count_snapshot_rows_for_table(
+                &storage,
+                "snap_prop",
+                &group_id,
+                "openmls_proposals",
+            );
+            assert_eq!(
+                snap_count, 1,
+                "Snapshot must capture openmls_proposals rows written via \
+                 StorageProvider"
+            );
+        }
+
+        /// Snapshot must capture openmls_epoch_key_pairs written via StorageProvider.
+        #[test]
+        fn test_snapshot_captures_openmls_epoch_key_pairs() {
+            let storage = MdkSqliteStorage::new_in_memory().unwrap();
+
+            let group = create_test_group(4);
+            let group_id = group.mls_group_id.clone();
+            storage.save_group(group).unwrap();
+
+            seed_openmls_data(&storage, &group_id);
+
+            assert_eq!(
+                count_openmls_rows(&storage, "openmls_epoch_key_pairs", &group_id),
+                1,
+                "openmls_epoch_key_pairs should have 1 row"
+            );
+
+            storage
+                .create_group_snapshot(&group_id, "snap_epoch")
+                .unwrap();
+
+            let snap_count = count_snapshot_rows_for_table(
+                &storage,
+                "snap_epoch",
+                &group_id,
+                "openmls_epoch_key_pairs",
+            );
+            assert_eq!(
+                snap_count, 1,
+                "Snapshot must capture openmls_epoch_key_pairs rows written via \
+                 StorageProvider"
+            );
+        }
+
+        /// Rollback must restore OpenMLS group_data to pre-modification state.
+        ///
+        /// This simulates the MIP-03 epoch rollback flow:
+        /// 1. Write MLS data at epoch N (via StorageProvider / MlsCodec)
+        /// 2. Take snapshot
+        /// 3. Advance MLS data to epoch N+1
+        /// 4. Rollback to snapshot
+        /// 5. Verify MLS data is back to epoch N state
+        ///
+        /// Due to the group_id encoding mismatch, the snapshot captures zero
+        /// OpenMLS rows, so rollback has nothing to restore — the crypto state
+        /// from epoch N+1 persists (or worse, gets deleted with nothing to
+        /// replace it), creating a metadata/crypto split-brain.
+        #[test]
+        fn test_rollback_restores_openmls_group_data() {
+            let storage = MdkSqliteStorage::new_in_memory().unwrap();
+
+            let group = create_test_group(5);
+            let group_id = group.mls_group_id.clone();
+            storage.save_group(group).unwrap();
+
+            let mls_key = MlsCodec::serialize(&group_id).unwrap();
+
+            // Write epoch 5 OpenMLS state
+            storage.with_connection(|conn| {
+                conn.execute(
+                    "INSERT OR REPLACE INTO openmls_group_data
+                     (group_id, data_type, group_data, provider_version)
+                     VALUES (?, ?, ?, ?)",
+                    params![mls_key, "group_state", b"epoch5_crypto" as &[u8], 1i32],
+                )
+                .unwrap();
+            });
+
+            // Snapshot at epoch 5
+            storage.create_group_snapshot(&group_id, "snap_e5").unwrap();
+
+            // Advance to epoch 6 (simulate processing a commit)
+            storage.with_connection(|conn| {
+                conn.execute(
+                    "UPDATE openmls_group_data SET group_data = ?
+                     WHERE group_id = ? AND data_type = ?",
+                    params![b"epoch6_crypto" as &[u8], mls_key, "group_state"],
+                )
+                .unwrap();
+            });
+
+            // Verify we're at epoch 6
+            let crypto_before_rollback: Vec<u8> = storage.with_connection(|conn| {
+                conn.query_row(
+                    "SELECT group_data FROM openmls_group_data
+                     WHERE group_id = ? AND data_type = ?",
+                    params![mls_key, "group_state"],
+                    |row| row.get(0),
+                )
+                .unwrap()
+            });
+            assert_eq!(crypto_before_rollback, b"epoch6_crypto");
+
+            // Rollback to snapshot
+            storage
+                .rollback_group_to_snapshot(&group_id, "snap_e5")
+                .unwrap();
+
+            // Verify OpenMLS data was restored to epoch 5 state
+            let crypto_after_rollback: Vec<u8> = storage.with_connection(|conn| {
+                conn.query_row(
+                    "SELECT group_data FROM openmls_group_data
+                     WHERE group_id = ? AND data_type = ?",
+                    params![mls_key, "group_state"],
+                    |row| row.get(0),
+                )
+                .unwrap()
+            });
+            assert_eq!(
+                crypto_after_rollback, b"epoch5_crypto",
+                "Rollback must restore openmls_group_data to the snapshot state. \
+                 If this is epoch6_crypto, the snapshot failed to capture the \
+                 OpenMLS rows due to group_id encoding mismatch \
+                 (as_slice vs MlsCodec::serialize)."
+            );
+        }
+
+        /// Rollback must restore openmls_epoch_key_pairs to pre-modification state.
+        #[test]
+        fn test_rollback_restores_openmls_epoch_key_pairs() {
+            let storage = MdkSqliteStorage::new_in_memory().unwrap();
+
+            let group = create_test_group(6);
+            let group_id = group.mls_group_id.clone();
+            storage.save_group(group).unwrap();
+
+            let mls_key = MlsCodec::serialize(&group_id).unwrap();
+            let epoch_key = MlsCodec::serialize(&5u64).unwrap();
+
+            // Write epoch 5 key pairs
+            storage.with_connection(|conn| {
+                conn.execute(
+                    "INSERT OR REPLACE INTO openmls_epoch_key_pairs
+                     (group_id, epoch_id, leaf_index, key_pairs, provider_version)
+                     VALUES (?, ?, ?, ?, ?)",
+                    params![mls_key, epoch_key, 0i32, b"epoch5_keys" as &[u8], 1i32],
+                )
+                .unwrap();
+            });
+
+            // Snapshot
+            storage
+                .create_group_snapshot(&group_id, "snap_keys")
+                .unwrap();
+
+            // Advance key pairs to epoch 6
+            storage.with_connection(|conn| {
+                conn.execute(
+                    "UPDATE openmls_epoch_key_pairs SET key_pairs = ?
+                     WHERE group_id = ? AND epoch_id = ? AND leaf_index = ?",
+                    params![b"epoch6_keys" as &[u8], mls_key, epoch_key, 0i32],
+                )
+                .unwrap();
+            });
+
+            // Rollback
+            storage
+                .rollback_group_to_snapshot(&group_id, "snap_keys")
+                .unwrap();
+
+            // Verify restoration
+            let keys_after: Vec<u8> = storage.with_connection(|conn| {
+                conn.query_row(
+                    "SELECT key_pairs FROM openmls_epoch_key_pairs
+                     WHERE group_id = ? AND epoch_id = ? AND leaf_index = ?",
+                    params![mls_key, epoch_key, 0i32],
+                    |row| row.get(0),
+                )
+                .unwrap()
+            });
+            assert_eq!(
+                keys_after, b"epoch5_keys",
+                "Rollback must restore openmls_epoch_key_pairs to snapshot state"
+            );
+        }
+
+        /// Rollback must restore openmls_own_leaf_nodes to pre-modification state.
+        #[test]
+        fn test_rollback_restores_openmls_own_leaf_nodes() {
+            let storage = MdkSqliteStorage::new_in_memory().unwrap();
+
+            let group = create_test_group(7);
+            let group_id = group.mls_group_id.clone();
+            storage.save_group(group).unwrap();
+
+            let mls_key = MlsCodec::serialize(&group_id).unwrap();
+
+            // Write initial leaf node
+            storage.with_connection(|conn| {
+                conn.execute(
+                    "INSERT INTO openmls_own_leaf_nodes
+                     (group_id, leaf_node, provider_version)
+                     VALUES (?, ?, ?)",
+                    params![mls_key, b"original_leaf" as &[u8], 1i32],
+                )
+                .unwrap();
+            });
+
+            // Snapshot
+            storage
+                .create_group_snapshot(&group_id, "snap_leaf")
+                .unwrap();
+
+            // Modify: add a second leaf node (simulating post-commit state)
+            storage.with_connection(|conn| {
+                conn.execute(
+                    "INSERT INTO openmls_own_leaf_nodes
+                     (group_id, leaf_node, provider_version)
+                     VALUES (?, ?, ?)",
+                    params![mls_key, b"added_after_snapshot" as &[u8], 1i32],
+                )
+                .unwrap();
+            });
+
+            // Verify 2 leaf nodes exist before rollback
+            assert_eq!(
+                count_openmls_rows(&storage, "openmls_own_leaf_nodes", &group_id),
+                2
+            );
+
+            // Rollback
+            storage
+                .rollback_group_to_snapshot(&group_id, "snap_leaf")
+                .unwrap();
+
+            // Verify only the original leaf node remains
+            let leaf_count = count_openmls_rows(&storage, "openmls_own_leaf_nodes", &group_id);
+            assert_eq!(
+                leaf_count, 1,
+                "Rollback must restore openmls_own_leaf_nodes to snapshot state \
+                 (1 leaf, not 2)"
+            );
+
+            let leaf_data: Vec<u8> = storage.with_connection(|conn| {
+                conn.query_row(
+                    "SELECT leaf_node FROM openmls_own_leaf_nodes
+                     WHERE group_id = ? AND provider_version = ?",
+                    params![mls_key, 1i32],
+                    |row| row.get(0),
+                )
+                .unwrap()
+            });
+            assert_eq!(
+                leaf_data, b"original_leaf",
+                "Rollback must restore the original leaf node data"
+            );
+        }
+
+        /// Full MIP-03 rollback simulation: metadata and crypto state must be
+        /// consistent after rollback.
+        ///
+        /// This is the most critical test — it proves the split-brain condition
+        /// where MDK metadata (groups.epoch) gets rolled back but OpenMLS
+        /// cryptographic state is left at the wrong epoch.
+        #[test]
+        fn test_rollback_metadata_crypto_consistency() {
+            let storage = MdkSqliteStorage::new_in_memory().unwrap();
+
+            let group = create_test_group(8);
+            let group_id = group.mls_group_id.clone();
+            storage.save_group(group).unwrap();
+
+            let mls_key = MlsCodec::serialize(&group_id).unwrap();
+
+            // Set up epoch 5 state: both MDK metadata and OpenMLS crypto
+            {
+                let mut g = storage
+                    .find_group_by_mls_group_id(&group_id)
+                    .unwrap()
+                    .unwrap();
+                g.epoch = 5;
+                storage.save_group(g).unwrap();
+            }
+            storage.with_connection(|conn| {
+                conn.execute(
+                    "INSERT OR REPLACE INTO openmls_group_data
+                     (group_id, data_type, group_data, provider_version)
+                     VALUES (?, ?, ?, ?)",
+                    params![mls_key, "group_state", b"epoch5_state" as &[u8], 1i32],
+                )
+                .unwrap();
+            });
+
+            // Snapshot at epoch 5
+            storage
+                .create_group_snapshot(&group_id, "snap_epoch5")
+                .unwrap();
+
+            // Advance to epoch 6 (simulate processing a commit)
+            {
+                let mut g = storage
+                    .find_group_by_mls_group_id(&group_id)
+                    .unwrap()
+                    .unwrap();
+                g.epoch = 6;
+                storage.save_group(g).unwrap();
+            }
+            storage.with_connection(|conn| {
+                conn.execute(
+                    "UPDATE openmls_group_data SET group_data = ?
+                     WHERE group_id = ? AND data_type = ?",
+                    params![b"epoch6_state" as &[u8], mls_key, "group_state"],
+                )
+                .unwrap();
+            });
+
+            // MIP-03: detect conflict, rollback to epoch 5
+            storage
+                .rollback_group_to_snapshot(&group_id, "snap_epoch5")
+                .unwrap();
+
+            // Check MDK metadata
+            let group_after = storage
+                .find_group_by_mls_group_id(&group_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                group_after.epoch, 5,
+                "MDK groups.epoch should be 5 after rollback"
+            );
+
+            // Check OpenMLS crypto state
+            let crypto_after: Vec<u8> = storage.with_connection(|conn| {
+                conn.query_row(
+                    "SELECT group_data FROM openmls_group_data
+                     WHERE group_id = ? AND data_type = ?",
+                    params![mls_key, "group_state"],
+                    |row| row.get(0),
+                )
+                .unwrap()
+            });
+            assert_eq!(
+                crypto_after, b"epoch5_state",
+                "OpenMLS crypto state must match MDK metadata epoch after rollback. \
+                 groups.epoch=5 but crypto state is still epoch6 data means \
+                 split-brain: MDK thinks epoch 5, MLS engine has epoch 6 keys. \
+                 Every subsequent message in this group will fail to decrypt."
+            );
+        }
+
+        /// Restore DELETE path must also use correct key format for OpenMLS
+        /// tables.
+        ///
+        /// The restore code deletes existing OpenMLS rows before re-inserting
+        /// from the snapshot. If it uses raw bytes (as_slice) for the DELETE,
+        /// it won't match the MlsCodec-keyed rows and they persist alongside the
+        /// (hypothetically fixed) snapshot data — causing duplicate/stale state.
+        #[test]
+        fn test_restore_deletes_openmls_data_before_reinserting() {
+            let storage = MdkSqliteStorage::new_in_memory().unwrap();
+
+            let group = create_test_group(9);
+            let group_id = group.mls_group_id.clone();
+            storage.save_group(group).unwrap();
+
+            let mls_key = MlsCodec::serialize(&group_id).unwrap();
+
+            // Write initial OpenMLS state
+            storage.with_connection(|conn| {
+                conn.execute(
+                    "INSERT OR REPLACE INTO openmls_group_data
+                     (group_id, data_type, group_data, provider_version)
+                     VALUES (?, ?, ?, ?)",
+                    params![mls_key, "group_state", b"initial_state" as &[u8], 1i32],
+                )
+                .unwrap();
+            });
+
+            // Take snapshot
+            storage
+                .create_group_snapshot(&group_id, "snap_initial")
+                .unwrap();
+
+            // Replace with new state
+            storage.with_connection(|conn| {
+                conn.execute(
+                    "UPDATE openmls_group_data SET group_data = ?
+                     WHERE group_id = ? AND data_type = ?",
+                    params![b"modified_state" as &[u8], mls_key, "group_state"],
+                )
+                .unwrap();
+            });
+
+            // Rollback
+            storage
+                .rollback_group_to_snapshot(&group_id, "snap_initial")
+                .unwrap();
+
+            // Count how many openmls_group_data rows exist for this group.
+            // If DELETE used raw bytes (missing the MlsCodec-keyed rows), the old
+            // "modified_state" row persists alongside the restored
+            // "initial_state".
+            let row_count = count_openmls_rows(&storage, "openmls_group_data", &group_id);
+            assert_eq!(
+                row_count, 1,
+                "After rollback, there should be exactly 1 openmls_group_data \
+                 row. More than 1 means the DELETE used the wrong key format and \
+                 failed to remove the stale OpenMLS row before re-inserting from \
+                 snapshot."
+            );
         }
     }
 }
