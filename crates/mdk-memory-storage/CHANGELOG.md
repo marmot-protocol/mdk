@@ -25,6 +25,10 @@
 
 ## Unreleased
 
+### Breaking changes
+
+- **MLS codec switched from JSON to postcard**: MLS storage serialization now uses `MlsCodec` (postcard binary format) instead of the removed `JsonCodec` (serde_json). In-memory data is ephemeral so no migration is needed, but the serialized byte format has changed. ([#179](https://github.com/marmot-protocol/mdk/pull/179))
+
 ### Added
 
 - **Custom Message Sort Order**: `messages()` now respects the `sort_order` field in `Pagination`, supporting both `CreatedAtFirst` (default) and `ProcessedAtFirst` orderings. ([#171](https://github.com/marmot-protocol/mdk/pull/171))

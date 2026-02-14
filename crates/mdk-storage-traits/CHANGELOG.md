@@ -25,6 +25,10 @@
 
 ## Unreleased
 
+### Breaking changes
+
+- **MLS codec switched from JSON to postcard**: `JsonCodec` has been removed and replaced with `MlsCodec`, which uses the `postcard` binary serialization format instead of `serde_json`. MLS storage keys and entities are now significantly more compact (~33 bytes for a 32-byte group_id vs ~130 bytes with JSON). All persisted MLS data is incompatible and must be recreated. ([#179](https://github.com/marmot-protocol/mdk/pull/179))
+
 ### Added
 
 - **Custom Message Sort Order**: Added `MessageSortOrder` enum with `CreatedAtFirst` (default) and `ProcessedAtFirst` variants to allow clients to choose how messages are ordered. Added `sort_order` field to `Pagination` struct and `Pagination::with_sort_order()` constructor. Added `Message::processed_at_order_cmp()` and `Message::compare_processed_at_keys()` comparison methods for the processed-at-first ordering. ([#171](https://github.com/marmot-protocol/mdk/pull/171))

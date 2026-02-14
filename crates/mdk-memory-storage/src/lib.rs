@@ -1547,8 +1547,6 @@ impl StorageProvider<STORAGE_PROVIDER_VERSION> for MdkMemoryStorage {
 mod tests {
     use std::collections::BTreeSet;
 
-    use mdk_storage_traits::GroupId;
-    use mdk_storage_traits::Secret;
     use mdk_storage_traits::groups::GroupStorage;
     use mdk_storage_traits::groups::types::{Group, GroupExporterSecret, GroupState};
     use mdk_storage_traits::messages::MessageStorage;
@@ -1557,6 +1555,7 @@ mod tests {
     use mdk_storage_traits::test_utils::crypto_utils::generate_random_bytes;
     use mdk_storage_traits::welcomes::WelcomeStorage;
     use mdk_storage_traits::welcomes::types::{ProcessedWelcomeState, Welcome, WelcomeState};
+    use mdk_storage_traits::{GroupId, MdkStorageProvider, Secret};
     use nostr::{EventId, Kind, PublicKey, RelayUrl, Tags, Timestamp, UnsignedEvent};
 
     use super::*;
@@ -3006,8 +3005,6 @@ mod tests {
     /// When rolling back Group A's snapshot, Group B should be completely unaffected.
     #[test]
     fn test_snapshot_isolation_between_groups() {
-        use mdk_storage_traits::MdkStorageProvider;
-
         let storage = MdkMemoryStorage::default();
 
         // Create two independent groups
@@ -3116,8 +3113,6 @@ mod tests {
     /// Test that group-scoped snapshots also isolate exporter secrets correctly.
     #[test]
     fn test_snapshot_isolation_with_exporter_secrets() {
-        use mdk_storage_traits::MdkStorageProvider;
-
         let storage = MdkMemoryStorage::default();
 
         // Create two groups
@@ -3241,8 +3236,6 @@ mod tests {
     /// Test that rolling back to a nonexistent snapshot returns an error.
     #[test]
     fn test_rollback_nonexistent_snapshot_returns_error() {
-        use mdk_storage_traits::MdkStorageProvider;
-
         let storage = MdkMemoryStorage::default();
 
         let group_id = GroupId::from_slice(&[99; 32]);
@@ -3286,8 +3279,6 @@ mod tests {
 
     #[test]
     fn test_list_group_snapshots_empty() {
-        use mdk_storage_traits::MdkStorageProvider;
-
         let storage = MdkMemoryStorage::default();
         let group_id = GroupId::from_slice(&[1, 2, 3, 4]);
 
@@ -3300,8 +3291,6 @@ mod tests {
 
     #[test]
     fn test_list_group_snapshots_returns_snapshots_sorted_by_created_at() {
-        use mdk_storage_traits::MdkStorageProvider;
-
         let storage = MdkMemoryStorage::default();
         let group_id = GroupId::from_slice(&[1, 2, 3, 4]);
         let nostr_group_id: [u8; 32] = generate_random_bytes(32).try_into().unwrap();
@@ -3371,8 +3360,6 @@ mod tests {
 
     #[test]
     fn test_list_group_snapshots_only_returns_matching_group() {
-        use mdk_storage_traits::MdkStorageProvider;
-
         let storage = MdkMemoryStorage::default();
         let group1 = GroupId::from_slice(&[1, 1, 1, 1]);
         let group2 = GroupId::from_slice(&[2, 2, 2, 2]);
@@ -3413,8 +3400,6 @@ mod tests {
 
     #[test]
     fn test_prune_expired_snapshots_removes_old_snapshots() {
-        use mdk_storage_traits::MdkStorageProvider;
-
         let storage = MdkMemoryStorage::default();
         let group_id = GroupId::from_slice(&[1, 2, 3, 4]);
 
@@ -3461,8 +3446,6 @@ mod tests {
 
     #[test]
     fn test_prune_expired_snapshots_returns_zero_when_nothing_to_prune() {
-        use mdk_storage_traits::MdkStorageProvider;
-
         let storage = MdkMemoryStorage::default();
         let group_id = GroupId::from_slice(&[1, 2, 3, 4]);
 
@@ -3495,8 +3478,6 @@ mod tests {
 
     #[test]
     fn test_prune_expired_snapshots_across_multiple_groups() {
-        use mdk_storage_traits::MdkStorageProvider;
-
         let storage = MdkMemoryStorage::default();
         let group1 = GroupId::from_slice(&[1, 1, 1, 1]);
         let group2 = GroupId::from_slice(&[2, 2, 2, 2]);
@@ -3557,8 +3538,6 @@ mod tests {
     /// Snapshot must capture MLS group_data written through the storage layer.
     #[test]
     fn test_snapshot_captures_mls_group_data() {
-        use mdk_storage_traits::MdkStorageProvider;
-
         let storage = MdkMemoryStorage::default();
 
         let group_id = GroupId::from_slice(&[1; 32]);
@@ -3670,8 +3649,6 @@ mod tests {
     /// Snapshot must capture MLS own_leaf_nodes written through the storage layer.
     #[test]
     fn test_snapshot_captures_mls_own_leaf_nodes() {
-        use mdk_storage_traits::MdkStorageProvider;
-
         let storage = MdkMemoryStorage::default();
 
         let group_id = GroupId::from_slice(&[2; 32]);
@@ -3744,8 +3721,6 @@ mod tests {
     /// Snapshot must capture MLS epoch_key_pairs written through the storage layer.
     #[test]
     fn test_snapshot_captures_mls_epoch_key_pairs() {
-        use mdk_storage_traits::MdkStorageProvider;
-
         let storage = MdkMemoryStorage::default();
 
         let group_id = GroupId::from_slice(&[3; 32]);
@@ -3830,8 +3805,6 @@ mod tests {
     /// this test would catch the metadata/crypto split-brain condition.
     #[test]
     fn test_rollback_metadata_crypto_consistency() {
-        use mdk_storage_traits::MdkStorageProvider;
-
         let storage = MdkMemoryStorage::default();
 
         let group_id = GroupId::from_slice(&[4; 32]);
