@@ -3543,4 +3543,381 @@ mod tests {
         assert_eq!(remaining1[0].0, "new_snap_g1");
         assert!(remaining2.is_empty());
     }
+
+    // ========================================
+    // Snapshot tests for OpenMLS data
+    // ========================================
+    // These tests verify that group-scoped snapshots correctly capture and
+    // restore OpenMLS cryptographic state written through the MLS storage layer
+    // (which uses JsonCodec::serialize for group_id keys). This ensures the
+    // memory backend cannot regress to the same bug that affected the SQLite
+    // backend, where snapshots silently missed all OpenMLS rows due to a
+    // group_id encoding mismatch.
+
+    /// Snapshot must capture MLS group_data written through the storage layer.
+    #[test]
+    fn test_snapshot_captures_mls_group_data() {
+        use mdk_storage_traits::MdkStorageProvider;
+
+        let storage = MdkMemoryStorage::default();
+
+        let group_id = GroupId::from_slice(&[1; 32]);
+        let nostr_group_id: [u8; 32] = generate_random_bytes(32).try_into().unwrap();
+        let group = Group {
+            mls_group_id: group_id.clone(),
+            nostr_group_id,
+            name: "MLS Data Test".to_string(),
+            description: "".to_string(),
+            admin_pubkeys: BTreeSet::new(),
+            last_message_id: None,
+            last_message_at: None,
+            last_message_processed_at: None,
+            epoch: 5,
+            state: GroupState::Active,
+            image_hash: None,
+            image_key: None,
+            image_nonce: None,
+        };
+        storage.save_group(group).unwrap();
+
+        // Write MLS group data via the internal MLS storage (uses JsonCodec)
+        {
+            let mut inner = storage.inner.write();
+            inner
+                .mls_group_data
+                .write(
+                    &group_id,
+                    mls_storage::GroupDataType::GroupState,
+                    &"epoch5_state".to_string(),
+                )
+                .unwrap();
+            inner
+                .mls_group_data
+                .write(
+                    &group_id,
+                    mls_storage::GroupDataType::Tree,
+                    &"epoch5_tree".to_string(),
+                )
+                .unwrap();
+        }
+
+        // Take a group-scoped snapshot
+        storage
+            .create_group_snapshot(&group_id, "snap_mls")
+            .unwrap();
+
+        // Modify MLS data (simulate advancing to epoch 6)
+        {
+            let mut inner = storage.inner.write();
+            inner
+                .mls_group_data
+                .write(
+                    &group_id,
+                    mls_storage::GroupDataType::GroupState,
+                    &"epoch6_state".to_string(),
+                )
+                .unwrap();
+            inner
+                .mls_group_data
+                .write(
+                    &group_id,
+                    mls_storage::GroupDataType::Tree,
+                    &"epoch6_tree".to_string(),
+                )
+                .unwrap();
+        }
+
+        // Verify we're at epoch 6 data
+        {
+            let inner = storage.inner.read();
+            let state: Option<String> = inner
+                .mls_group_data
+                .read(&group_id, mls_storage::GroupDataType::GroupState)
+                .unwrap();
+            assert_eq!(state.as_deref(), Some("epoch6_state"));
+        }
+
+        // Rollback
+        storage
+            .rollback_group_to_snapshot(&group_id, "snap_mls")
+            .unwrap();
+
+        // Verify MLS data was restored to epoch 5 state
+        {
+            let inner = storage.inner.read();
+            let state: Option<String> = inner
+                .mls_group_data
+                .read(&group_id, mls_storage::GroupDataType::GroupState)
+                .unwrap();
+            assert_eq!(
+                state.as_deref(),
+                Some("epoch5_state"),
+                "MLS group_data (GroupState) must be restored to snapshot state"
+            );
+
+            let tree: Option<String> = inner
+                .mls_group_data
+                .read(&group_id, mls_storage::GroupDataType::Tree)
+                .unwrap();
+            assert_eq!(
+                tree.as_deref(),
+                Some("epoch5_tree"),
+                "MLS group_data (Tree) must be restored to snapshot state"
+            );
+        }
+    }
+
+    /// Snapshot must capture MLS own_leaf_nodes written through the storage layer.
+    #[test]
+    fn test_snapshot_captures_mls_own_leaf_nodes() {
+        use mdk_storage_traits::MdkStorageProvider;
+
+        let storage = MdkMemoryStorage::default();
+
+        let group_id = GroupId::from_slice(&[2; 32]);
+        let nostr_group_id: [u8; 32] = generate_random_bytes(32).try_into().unwrap();
+        let group = Group {
+            mls_group_id: group_id.clone(),
+            nostr_group_id,
+            name: "Leaf Node Test".to_string(),
+            description: "".to_string(),
+            admin_pubkeys: BTreeSet::new(),
+            last_message_id: None,
+            last_message_at: None,
+            last_message_processed_at: None,
+            epoch: 0,
+            state: GroupState::Active,
+            image_hash: None,
+            image_key: None,
+            image_nonce: None,
+        };
+        storage.save_group(group).unwrap();
+
+        // Write MLS leaf node
+        {
+            let mut inner = storage.inner.write();
+            inner
+                .mls_own_leaf_nodes
+                .append(&group_id, &"original_leaf".to_string())
+                .unwrap();
+        }
+
+        // Snapshot
+        storage
+            .create_group_snapshot(&group_id, "snap_leaf")
+            .unwrap();
+
+        // Add another leaf node after snapshot
+        {
+            let mut inner = storage.inner.write();
+            inner
+                .mls_own_leaf_nodes
+                .append(&group_id, &"added_after_snapshot".to_string())
+                .unwrap();
+        }
+
+        // Verify 2 leaf nodes exist
+        {
+            let inner = storage.inner.read();
+            let leaves: Vec<String> = inner.mls_own_leaf_nodes.read(&group_id).unwrap();
+            assert_eq!(leaves.len(), 2);
+        }
+
+        // Rollback
+        storage
+            .rollback_group_to_snapshot(&group_id, "snap_leaf")
+            .unwrap();
+
+        // Verify only original leaf node remains
+        {
+            let inner = storage.inner.read();
+            let leaves: Vec<String> = inner.mls_own_leaf_nodes.read(&group_id).unwrap();
+            assert_eq!(
+                leaves.len(),
+                1,
+                "Rollback must restore own_leaf_nodes to snapshot state (1 leaf, not 2)"
+            );
+            assert_eq!(leaves[0], "original_leaf");
+        }
+    }
+
+    /// Snapshot must capture MLS epoch_key_pairs written through the storage layer.
+    #[test]
+    fn test_snapshot_captures_mls_epoch_key_pairs() {
+        use mdk_storage_traits::MdkStorageProvider;
+
+        let storage = MdkMemoryStorage::default();
+
+        let group_id = GroupId::from_slice(&[3; 32]);
+        let nostr_group_id: [u8; 32] = generate_random_bytes(32).try_into().unwrap();
+        let group = Group {
+            mls_group_id: group_id.clone(),
+            nostr_group_id,
+            name: "Epoch Keys Test".to_string(),
+            description: "".to_string(),
+            admin_pubkeys: BTreeSet::new(),
+            last_message_id: None,
+            last_message_at: None,
+            last_message_processed_at: None,
+            epoch: 5,
+            state: GroupState::Active,
+            image_hash: None,
+            image_key: None,
+            image_nonce: None,
+        };
+        storage.save_group(group).unwrap();
+
+        // Write epoch key pairs
+        let epoch_id = 5u64;
+        let leaf_index = 0u32;
+        {
+            let mut inner = storage.inner.write();
+            inner
+                .mls_epoch_key_pairs
+                .write(
+                    &group_id,
+                    &epoch_id,
+                    leaf_index,
+                    &["epoch5_key_pair".to_string()],
+                )
+                .unwrap();
+        }
+
+        // Snapshot
+        storage
+            .create_group_snapshot(&group_id, "snap_keys")
+            .unwrap();
+
+        // Modify key pairs (simulate epoch advance)
+        {
+            let mut inner = storage.inner.write();
+            inner
+                .mls_epoch_key_pairs
+                .write(
+                    &group_id,
+                    &epoch_id,
+                    leaf_index,
+                    &["epoch6_key_pair".to_string()],
+                )
+                .unwrap();
+        }
+
+        // Rollback
+        storage
+            .rollback_group_to_snapshot(&group_id, "snap_keys")
+            .unwrap();
+
+        // Verify epoch key pairs restored
+        {
+            let inner = storage.inner.read();
+            let key_pairs: Vec<String> = inner
+                .mls_epoch_key_pairs
+                .read(&group_id, &epoch_id, leaf_index)
+                .unwrap();
+            assert_eq!(
+                key_pairs,
+                vec!["epoch5_key_pair"],
+                "Rollback must restore epoch_key_pairs to snapshot state"
+            );
+        }
+    }
+
+    /// Full MIP-03 rollback simulation: metadata and crypto state must be
+    /// consistent after rollback.
+    ///
+    /// This is the regression guard — if the memory storage's JsonCodec
+    /// serialization for group_id filtering were ever removed or broken,
+    /// this test would catch the metadata/crypto split-brain condition.
+    #[test]
+    fn test_rollback_metadata_crypto_consistency() {
+        use mdk_storage_traits::MdkStorageProvider;
+
+        let storage = MdkMemoryStorage::default();
+
+        let group_id = GroupId::from_slice(&[4; 32]);
+        let nostr_group_id: [u8; 32] = generate_random_bytes(32).try_into().unwrap();
+        let group = Group {
+            mls_group_id: group_id.clone(),
+            nostr_group_id,
+            name: "Consistency Test".to_string(),
+            description: "".to_string(),
+            admin_pubkeys: BTreeSet::new(),
+            last_message_id: None,
+            last_message_at: None,
+            last_message_processed_at: None,
+            epoch: 5,
+            state: GroupState::Active,
+            image_hash: None,
+            image_key: None,
+            image_nonce: None,
+        };
+        storage.save_group(group).unwrap();
+
+        // Write epoch 5 MLS state
+        {
+            let mut inner = storage.inner.write();
+            inner
+                .mls_group_data
+                .write(
+                    &group_id,
+                    mls_storage::GroupDataType::GroupState,
+                    &"epoch5_state".to_string(),
+                )
+                .unwrap();
+        }
+
+        // Snapshot at epoch 5
+        storage
+            .create_group_snapshot(&group_id, "snap_epoch5")
+            .unwrap();
+
+        // Advance to epoch 6: both MDK metadata and MLS crypto
+        {
+            let mut g = storage
+                .find_group_by_mls_group_id(&group_id)
+                .unwrap()
+                .unwrap();
+            g.epoch = 6;
+            storage.save_group(g).unwrap();
+        }
+        {
+            let mut inner = storage.inner.write();
+            inner
+                .mls_group_data
+                .write(
+                    &group_id,
+                    mls_storage::GroupDataType::GroupState,
+                    &"epoch6_state".to_string(),
+                )
+                .unwrap();
+        }
+
+        // MIP-03: rollback to epoch 5
+        storage
+            .rollback_group_to_snapshot(&group_id, "snap_epoch5")
+            .unwrap();
+
+        // Check MDK metadata
+        let group_after = storage
+            .find_group_by_mls_group_id(&group_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(group_after.epoch, 5, "MDK epoch should be 5 after rollback");
+
+        // Check MLS crypto state
+        let crypto_after: Option<String> = {
+            let inner = storage.inner.read();
+            inner
+                .mls_group_data
+                .read(&group_id, mls_storage::GroupDataType::GroupState)
+                .unwrap()
+        };
+        assert_eq!(
+            crypto_after.as_deref(),
+            Some("epoch5_state"),
+            "MLS crypto state must match MDK metadata epoch after rollback. \
+             groups.epoch=5 but crypto state is epoch6 means split-brain: \
+             MDK thinks epoch 5, MLS engine has epoch 6 keys."
+        );
+    }
 }
