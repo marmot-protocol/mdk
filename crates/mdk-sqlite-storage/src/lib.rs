@@ -463,9 +463,9 @@ impl MdkSqliteStorage {
     fn snapshot_group_state(&self, group_id: &GroupId, name: &str) -> Result<(), Error> {
         let conn = self.connection.lock().unwrap();
         let group_id_bytes = group_id.as_slice();
-        // MLS storage uses JSON serialization for group_id keys.
+        // MLS storage uses MlsCodec serialization for group_id keys.
         // We need to use the same serialization to match the stored keys.
-        let mls_group_id_bytes = mls_storage::JsonCodec::serialize(group_id)
+        let mls_group_id_bytes = mls_storage::MlsCodec::serialize(group_id)
             .map_err(|e| Error::Database(e.to_string()))?;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -487,7 +487,7 @@ impl MdkSqliteStorage {
                 .map_err(|e| Error::Database(e.to_string()))?;
 
             // Snapshot all 7 tables (4 OpenMLS + 3 MDK)
-            // OpenMLS tables use JsonCodec-serialized group_id as their key
+            // OpenMLS tables use MlsCodec-serialized group_id as their key
             Self::snapshot_openmls_group_data(
                 &conn,
                 &mut insert_stmt,
@@ -850,9 +850,9 @@ impl MdkSqliteStorage {
     fn restore_group_from_snapshot(&self, group_id: &GroupId, name: &str) -> Result<(), Error> {
         let conn = self.connection.lock().unwrap();
         let group_id_bytes = group_id.as_slice();
-        // MLS storage uses JSON serialization for group_id keys.
+        // MLS storage uses a serde-compatible binary serialization codec for group_id keys.
         // We need to use the same serialization to match the stored keys.
-        let mls_group_id_bytes = mls_storage::JsonCodec::serialize(group_id)
+        let mls_group_id_bytes = mls_storage::MlsCodec::serialize(group_id)
             .map_err(|e| Error::Database(e.to_string()))?;
 
         // Check if snapshot exists BEFORE starting transaction or deleting any data.
@@ -926,7 +926,7 @@ impl MdkSqliteStorage {
 
         let result = (|| -> Result<(), Error> {
             // 2. Delete current rows for this group from all 7 tables
-            // OpenMLS tables use JsonCodec-serialized group_id as their key
+            // OpenMLS tables use MlsCodec-serialized group_id as their key
             conn.execute(
                 "DELETE FROM openmls_group_data WHERE group_id = ?",
                 [&mls_group_id_bytes],
@@ -3829,9 +3829,9 @@ mod tests {
     // ========================================
     // These tests verify that snapshots correctly capture and restore OpenMLS
     // cryptographic state that is written through the StorageProvider trait
-    // (which uses JsonCodec::serialize for group_id keys). The existing snapshot
+    // (which uses MlsCodec::serialize for group_id keys). The existing snapshot
     // tests only exercise MDK-level data (groups, relays, exporter secrets),
-    // missing the fact that OpenMLS tables store group_id as JSON-encoded bytes
+    // missing the fact that OpenMLS tables store group_id as MlsCodec-encoded bytes
     // while the snapshot code queries them with raw bytes from as_slice().
 
     mod snapshot_openmls_tests {
@@ -3839,7 +3839,7 @@ mod tests {
 
         use mdk_storage_traits::groups::GroupStorage;
         use mdk_storage_traits::groups::types::{Group, GroupState};
-        use mdk_storage_traits::mls_codec::JsonCodec;
+        use mdk_storage_traits::mls_codec::MlsCodec;
         use mdk_storage_traits::{GroupId, MdkStorageProvider};
         use rusqlite::params;
 
@@ -3865,13 +3865,13 @@ mod tests {
         }
 
         /// Helper: count rows in an OpenMLS table for a given group_id using
-        /// JsonCodec-serialized key (the way OpenMLS actually stores them).
+        /// MlsCodec-serialized key (the way OpenMLS actually stores them).
         fn count_openmls_rows(storage: &MdkSqliteStorage, table: &str, group_id: &GroupId) -> i64 {
-            let json_key = JsonCodec::serialize(group_id).unwrap();
+            let mls_key = MlsCodec::serialize(group_id).unwrap();
             storage.with_connection(|conn| {
                 conn.query_row(
                     &format!("SELECT COUNT(*) FROM {} WHERE group_id = ?", table),
-                    params![json_key],
+                    params![mls_key],
                     |row| row.get(0),
                 )
                 .unwrap()
@@ -3899,18 +3899,18 @@ mod tests {
 
         /// Helper: insert OpenMLS data via the same code path as StorageProvider.
         ///
-        /// This uses `JsonCodec::serialize()` for the group_id key, exactly as
+        /// This uses `MlsCodec::serialize()` for the group_id key, exactly as
         /// the `write_group_data`, `append_own_leaf_node`, `queue_proposal`, and
         /// `write_encryption_epoch_key_pairs` functions do in `mls_storage/mod.rs`.
         fn seed_openmls_data(storage: &MdkSqliteStorage, group_id: &GroupId) {
-            let json_key = JsonCodec::serialize(group_id).unwrap();
+            let mls_key = MlsCodec::serialize(group_id).unwrap();
             storage.with_connection(|conn| {
                 // openmls_group_data — written by write_group_data() via serialize_key()
                 conn.execute(
                     "INSERT OR REPLACE INTO openmls_group_data
                      (group_id, data_type, group_data, provider_version)
                      VALUES (?, ?, ?, ?)",
-                    params![json_key, "group_state", b"test_crypto_state" as &[u8], 1i32],
+                    params![mls_key, "group_state", b"test_crypto_state" as &[u8], 1i32],
                 )
                 .unwrap();
 
@@ -3918,7 +3918,7 @@ mod tests {
                     "INSERT OR REPLACE INTO openmls_group_data
                      (group_id, data_type, group_data, provider_version)
                      VALUES (?, ?, ?, ?)",
-                    params![json_key, "tree", b"test_tree_data" as &[u8], 1i32],
+                    params![mls_key, "tree", b"test_tree_data" as &[u8], 1i32],
                 )
                 .unwrap();
 
@@ -3927,27 +3927,27 @@ mod tests {
                     "INSERT INTO openmls_own_leaf_nodes
                      (group_id, leaf_node, provider_version)
                      VALUES (?, ?, ?)",
-                    params![json_key, b"test_leaf_node" as &[u8], 1i32],
+                    params![mls_key, b"test_leaf_node" as &[u8], 1i32],
                 )
                 .unwrap();
 
                 // openmls_proposals — written by queue_proposal() via serialize_key()
-                let proposal_ref = JsonCodec::serialize(&vec![10u8, 20, 30]).unwrap();
+                let proposal_ref = MlsCodec::serialize(&vec![10u8, 20, 30]).unwrap();
                 conn.execute(
                     "INSERT OR REPLACE INTO openmls_proposals
                      (group_id, proposal_ref, proposal, provider_version)
                      VALUES (?, ?, ?, ?)",
-                    params![json_key, proposal_ref, b"test_proposal" as &[u8], 1i32],
+                    params![mls_key, proposal_ref, b"test_proposal" as &[u8], 1i32],
                 )
                 .unwrap();
 
                 // openmls_epoch_key_pairs — written by write_encryption_epoch_key_pairs()
-                let epoch_key = JsonCodec::serialize(&5u64).unwrap();
+                let epoch_key = MlsCodec::serialize(&5u64).unwrap();
                 conn.execute(
                     "INSERT OR REPLACE INTO openmls_epoch_key_pairs
                      (group_id, epoch_id, leaf_index, key_pairs, provider_version)
                      VALUES (?, ?, ?, ?, ?)",
-                    params![json_key, epoch_key, 0i32, b"test_key_pairs" as &[u8], 1i32],
+                    params![mls_key, epoch_key, 0i32, b"test_key_pairs" as &[u8], 1i32],
                 )
                 .unwrap();
             });
@@ -3955,8 +3955,8 @@ mod tests {
 
         /// Snapshot must capture openmls_group_data rows written via StorageProvider.
         ///
-        /// The StorageProvider writes group_id using `JsonCodec::serialize()` which
-        /// produces JSON blobs like `{"value":{"vec":[1,1,1,...]}}`. The snapshot
+        /// The StorageProvider writes group_id using `MlsCodec::serialize()` which
+        /// produces serialized bytes distinct from the raw group_id. The snapshot
         /// code queries these tables using `group_id.as_slice()` (raw bytes), so
         /// the WHERE clause never matches and zero rows are captured.
         #[test]
@@ -3967,7 +3967,7 @@ mod tests {
             let group_id = group.mls_group_id.clone();
             storage.save_group(group).unwrap();
 
-            // Write OpenMLS data the way StorageProvider does (JsonCodec keys)
+            // Write OpenMLS data the way StorageProvider does (MlsCodec keys)
             seed_openmls_data(&storage, &group_id);
 
             // Verify data exists in the tables
@@ -3992,7 +3992,7 @@ mod tests {
             assert_eq!(
                 snap_count, 2,
                 "Snapshot must capture openmls_group_data rows written via StorageProvider \
-                 (JsonCodec-serialized group_id keys)"
+                 (MlsCodec-serialized group_id keys)"
             );
         }
 
@@ -4101,7 +4101,7 @@ mod tests {
         /// Rollback must restore OpenMLS group_data to pre-modification state.
         ///
         /// This simulates the MIP-03 epoch rollback flow:
-        /// 1. Write MLS data at epoch N (via StorageProvider / JsonCodec)
+        /// 1. Write MLS data at epoch N (via StorageProvider / MlsCodec)
         /// 2. Take snapshot
         /// 3. Advance MLS data to epoch N+1
         /// 4. Rollback to snapshot
@@ -4119,7 +4119,7 @@ mod tests {
             let group_id = group.mls_group_id.clone();
             storage.save_group(group).unwrap();
 
-            let json_key = JsonCodec::serialize(&group_id).unwrap();
+            let mls_key = MlsCodec::serialize(&group_id).unwrap();
 
             // Write epoch 5 OpenMLS state
             storage.with_connection(|conn| {
@@ -4127,7 +4127,7 @@ mod tests {
                     "INSERT OR REPLACE INTO openmls_group_data
                      (group_id, data_type, group_data, provider_version)
                      VALUES (?, ?, ?, ?)",
-                    params![json_key, "group_state", b"epoch5_crypto" as &[u8], 1i32],
+                    params![mls_key, "group_state", b"epoch5_crypto" as &[u8], 1i32],
                 )
                 .unwrap();
             });
@@ -4140,7 +4140,7 @@ mod tests {
                 conn.execute(
                     "UPDATE openmls_group_data SET group_data = ?
                      WHERE group_id = ? AND data_type = ?",
-                    params![b"epoch6_crypto" as &[u8], json_key, "group_state"],
+                    params![b"epoch6_crypto" as &[u8], mls_key, "group_state"],
                 )
                 .unwrap();
             });
@@ -4150,7 +4150,7 @@ mod tests {
                 conn.query_row(
                     "SELECT group_data FROM openmls_group_data
                      WHERE group_id = ? AND data_type = ?",
-                    params![json_key, "group_state"],
+                    params![mls_key, "group_state"],
                     |row| row.get(0),
                 )
                 .unwrap()
@@ -4167,7 +4167,7 @@ mod tests {
                 conn.query_row(
                     "SELECT group_data FROM openmls_group_data
                      WHERE group_id = ? AND data_type = ?",
-                    params![json_key, "group_state"],
+                    params![mls_key, "group_state"],
                     |row| row.get(0),
                 )
                 .unwrap()
@@ -4177,7 +4177,7 @@ mod tests {
                 "Rollback must restore openmls_group_data to the snapshot state. \
                  If this is epoch6_crypto, the snapshot failed to capture the \
                  OpenMLS rows due to group_id encoding mismatch \
-                 (as_slice vs JsonCodec::serialize)."
+                 (as_slice vs MlsCodec::serialize)."
             );
         }
 
@@ -4190,8 +4190,8 @@ mod tests {
             let group_id = group.mls_group_id.clone();
             storage.save_group(group).unwrap();
 
-            let json_key = JsonCodec::serialize(&group_id).unwrap();
-            let epoch_key = JsonCodec::serialize(&5u64).unwrap();
+            let mls_key = MlsCodec::serialize(&group_id).unwrap();
+            let epoch_key = MlsCodec::serialize(&5u64).unwrap();
 
             // Write epoch 5 key pairs
             storage.with_connection(|conn| {
@@ -4199,7 +4199,7 @@ mod tests {
                     "INSERT OR REPLACE INTO openmls_epoch_key_pairs
                      (group_id, epoch_id, leaf_index, key_pairs, provider_version)
                      VALUES (?, ?, ?, ?, ?)",
-                    params![json_key, epoch_key, 0i32, b"epoch5_keys" as &[u8], 1i32],
+                    params![mls_key, epoch_key, 0i32, b"epoch5_keys" as &[u8], 1i32],
                 )
                 .unwrap();
             });
@@ -4214,7 +4214,7 @@ mod tests {
                 conn.execute(
                     "UPDATE openmls_epoch_key_pairs SET key_pairs = ?
                      WHERE group_id = ? AND epoch_id = ? AND leaf_index = ?",
-                    params![b"epoch6_keys" as &[u8], json_key, epoch_key, 0i32],
+                    params![b"epoch6_keys" as &[u8], mls_key, epoch_key, 0i32],
                 )
                 .unwrap();
             });
@@ -4229,7 +4229,7 @@ mod tests {
                 conn.query_row(
                     "SELECT key_pairs FROM openmls_epoch_key_pairs
                      WHERE group_id = ? AND epoch_id = ? AND leaf_index = ?",
-                    params![json_key, epoch_key, 0i32],
+                    params![mls_key, epoch_key, 0i32],
                     |row| row.get(0),
                 )
                 .unwrap()
@@ -4249,7 +4249,7 @@ mod tests {
             let group_id = group.mls_group_id.clone();
             storage.save_group(group).unwrap();
 
-            let json_key = JsonCodec::serialize(&group_id).unwrap();
+            let mls_key = MlsCodec::serialize(&group_id).unwrap();
 
             // Write initial leaf node
             storage.with_connection(|conn| {
@@ -4257,7 +4257,7 @@ mod tests {
                     "INSERT INTO openmls_own_leaf_nodes
                      (group_id, leaf_node, provider_version)
                      VALUES (?, ?, ?)",
-                    params![json_key, b"original_leaf" as &[u8], 1i32],
+                    params![mls_key, b"original_leaf" as &[u8], 1i32],
                 )
                 .unwrap();
             });
@@ -4273,7 +4273,7 @@ mod tests {
                     "INSERT INTO openmls_own_leaf_nodes
                      (group_id, leaf_node, provider_version)
                      VALUES (?, ?, ?)",
-                    params![json_key, b"added_after_snapshot" as &[u8], 1i32],
+                    params![mls_key, b"added_after_snapshot" as &[u8], 1i32],
                 )
                 .unwrap();
             });
@@ -4301,7 +4301,7 @@ mod tests {
                 conn.query_row(
                     "SELECT leaf_node FROM openmls_own_leaf_nodes
                      WHERE group_id = ? AND provider_version = ?",
-                    params![json_key, 1i32],
+                    params![mls_key, 1i32],
                     |row| row.get(0),
                 )
                 .unwrap()
@@ -4326,7 +4326,7 @@ mod tests {
             let group_id = group.mls_group_id.clone();
             storage.save_group(group).unwrap();
 
-            let json_key = JsonCodec::serialize(&group_id).unwrap();
+            let mls_key = MlsCodec::serialize(&group_id).unwrap();
 
             // Set up epoch 5 state: both MDK metadata and OpenMLS crypto
             {
@@ -4342,7 +4342,7 @@ mod tests {
                     "INSERT OR REPLACE INTO openmls_group_data
                      (group_id, data_type, group_data, provider_version)
                      VALUES (?, ?, ?, ?)",
-                    params![json_key, "group_state", b"epoch5_state" as &[u8], 1i32],
+                    params![mls_key, "group_state", b"epoch5_state" as &[u8], 1i32],
                 )
                 .unwrap();
             });
@@ -4365,7 +4365,7 @@ mod tests {
                 conn.execute(
                     "UPDATE openmls_group_data SET group_data = ?
                      WHERE group_id = ? AND data_type = ?",
-                    params![b"epoch6_state" as &[u8], json_key, "group_state"],
+                    params![b"epoch6_state" as &[u8], mls_key, "group_state"],
                 )
                 .unwrap();
             });
@@ -4390,7 +4390,7 @@ mod tests {
                 conn.query_row(
                     "SELECT group_data FROM openmls_group_data
                      WHERE group_id = ? AND data_type = ?",
-                    params![json_key, "group_state"],
+                    params![mls_key, "group_state"],
                     |row| row.get(0),
                 )
                 .unwrap()
@@ -4409,7 +4409,7 @@ mod tests {
         ///
         /// The restore code deletes existing OpenMLS rows before re-inserting
         /// from the snapshot. If it uses raw bytes (as_slice) for the DELETE,
-        /// it won't match the JSON-keyed rows and they persist alongside the
+        /// it won't match the MlsCodec-keyed rows and they persist alongside the
         /// (hypothetically fixed) snapshot data — causing duplicate/stale state.
         #[test]
         fn test_restore_deletes_openmls_data_before_reinserting() {
@@ -4419,7 +4419,7 @@ mod tests {
             let group_id = group.mls_group_id.clone();
             storage.save_group(group).unwrap();
 
-            let json_key = JsonCodec::serialize(&group_id).unwrap();
+            let mls_key = MlsCodec::serialize(&group_id).unwrap();
 
             // Write initial OpenMLS state
             storage.with_connection(|conn| {
@@ -4427,7 +4427,7 @@ mod tests {
                     "INSERT OR REPLACE INTO openmls_group_data
                      (group_id, data_type, group_data, provider_version)
                      VALUES (?, ?, ?, ?)",
-                    params![json_key, "group_state", b"initial_state" as &[u8], 1i32],
+                    params![mls_key, "group_state", b"initial_state" as &[u8], 1i32],
                 )
                 .unwrap();
             });
@@ -4442,7 +4442,7 @@ mod tests {
                 conn.execute(
                     "UPDATE openmls_group_data SET group_data = ?
                      WHERE group_id = ? AND data_type = ?",
-                    params![b"modified_state" as &[u8], json_key, "group_state"],
+                    params![b"modified_state" as &[u8], mls_key, "group_state"],
                 )
                 .unwrap();
             });
@@ -4453,7 +4453,7 @@ mod tests {
                 .unwrap();
 
             // Count how many openmls_group_data rows exist for this group.
-            // If DELETE used raw bytes (missing the JSON-keyed rows), the old
+            // If DELETE used raw bytes (missing the MlsCodec-keyed rows), the old
             // "modified_state" row persists alongside the restored
             // "initial_state".
             let row_count = count_openmls_rows(&storage, "openmls_group_data", &group_id);

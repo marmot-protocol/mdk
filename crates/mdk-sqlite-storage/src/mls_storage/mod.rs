@@ -5,7 +5,7 @@
 //! cryptographic state and MDK-specific data within a single database connection.
 
 use mdk_storage_traits::MdkStorageError;
-pub use mdk_storage_traits::mls_codec::{GroupDataType, JsonCodec};
+pub use mdk_storage_traits::mls_codec::{GroupDataType, MlsCodec};
 use openmls_traits::storage::{Entity, Key};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
@@ -23,7 +23,7 @@ fn serialize_key<K>(key: &K) -> Result<Vec<u8>, MdkStorageError>
 where
     K: Serialize,
 {
-    JsonCodec::serialize(key)
+    MlsCodec::serialize(key)
 }
 
 /// Serialize an entity to bytes for database storage.
@@ -31,7 +31,7 @@ fn serialize_entity<E>(entity: &E) -> Result<Vec<u8>, MdkStorageError>
 where
     E: Serialize,
 {
-    JsonCodec::serialize(entity)
+    MlsCodec::serialize(entity)
 }
 
 /// Deserialize an entity from bytes.
@@ -39,7 +39,7 @@ fn deserialize_entity<E>(bytes: &[u8]) -> Result<E, MdkStorageError>
 where
     E: DeserializeOwned,
 {
-    JsonCodec::deserialize(bytes)
+    MlsCodec::deserialize(bytes)
 }
 
 // ============================================================================
@@ -796,7 +796,7 @@ mod tests {
 
     #[test]
     fn test_deserialize_invalid_data() {
-        let invalid = b"not valid json";
+        let invalid = b"not valid data";
         let result: Result<TestData, _> = deserialize_entity(invalid);
         assert!(result.is_err());
     }
@@ -811,8 +811,8 @@ mod tests {
     #[test]
     fn test_openmls_group_data_table_operations() {
         with_test_storage(|conn| {
-            let group_id_bytes = JsonCodec::serialize(&vec![1u8, 2, 3, 4]).unwrap();
-            let data_bytes = JsonCodec::serialize(&"test data".to_string()).unwrap();
+            let group_id_bytes = MlsCodec::serialize(&vec![1u8, 2, 3, 4]).unwrap();
+            let data_bytes = MlsCodec::serialize(&"test data".to_string()).unwrap();
             let data_type = GroupDataType::Tree.as_str();
 
             // Insert
@@ -834,7 +834,7 @@ mod tests {
                 .unwrap();
 
             assert!(result.is_some());
-            let retrieved: String = JsonCodec::deserialize(&result.unwrap()).unwrap();
+            let retrieved: String = MlsCodec::deserialize(&result.unwrap()).unwrap();
             assert_eq!(retrieved, "test data");
 
             // Delete
@@ -863,11 +863,11 @@ mod tests {
     #[test]
     fn test_openmls_own_leaf_nodes_table_operations() {
         with_test_storage(|conn| {
-            let group_id_bytes = JsonCodec::serialize(&vec![1u8, 2, 3, 4]).unwrap();
+            let group_id_bytes = MlsCodec::serialize(&vec![1u8, 2, 3, 4]).unwrap();
 
             // Insert multiple leaf nodes
             for i in 0..3 {
-                let leaf_bytes = JsonCodec::serialize(&format!("leaf_{}", i)).unwrap();
+                let leaf_bytes = MlsCodec::serialize(&format!("leaf_{}", i)).unwrap();
                 conn.execute(
                     "INSERT INTO openmls_own_leaf_nodes (group_id, leaf_node, provider_version)
                      VALUES (?, ?, ?)",
@@ -890,7 +890,7 @@ mod tests {
                     row.get::<_, Vec<u8>>(0)
                 })
                 .unwrap()
-                .map(|r| JsonCodec::deserialize(&r.unwrap()).unwrap())
+                .map(|r| MlsCodec::deserialize(&r.unwrap()).unwrap())
                 .collect();
 
             assert_eq!(leaf_nodes, vec!["leaf_0", "leaf_1", "leaf_2"]);
@@ -920,9 +920,9 @@ mod tests {
     #[test]
     fn test_openmls_proposals_table_operations() {
         with_test_storage(|conn| {
-            let group_id_bytes = JsonCodec::serialize(&vec![1u8, 2, 3, 4]).unwrap();
-            let proposal_ref_bytes = JsonCodec::serialize(&vec![10u8, 20, 30]).unwrap();
-            let proposal_bytes = JsonCodec::serialize(&"test proposal".to_string()).unwrap();
+            let group_id_bytes = MlsCodec::serialize(&vec![1u8, 2, 3, 4]).unwrap();
+            let proposal_ref_bytes = MlsCodec::serialize(&vec![10u8, 20, 30]).unwrap();
+            let proposal_bytes = MlsCodec::serialize(&"test proposal".to_string()).unwrap();
 
             // Insert proposal
             conn.execute(
@@ -946,7 +946,7 @@ mod tests {
                 .unwrap()
                 .map(|r| {
                     let (ref_bytes, prop_bytes) = r.unwrap();
-                    let prop: String = JsonCodec::deserialize(&prop_bytes).unwrap();
+                    let prop: String = MlsCodec::deserialize(&prop_bytes).unwrap();
                     (ref_bytes, prop)
                 })
                 .collect();
@@ -979,8 +979,8 @@ mod tests {
     #[test]
     fn test_openmls_key_packages_table_operations() {
         with_test_storage(|conn| {
-            let hash_ref_bytes = JsonCodec::serialize(&vec![1u8, 2, 3, 4]).unwrap();
-            let key_package_bytes = JsonCodec::serialize(&"key package data".to_string()).unwrap();
+            let hash_ref_bytes = MlsCodec::serialize(&vec![1u8, 2, 3, 4]).unwrap();
+            let key_package_bytes = MlsCodec::serialize(&"key package data".to_string()).unwrap();
 
             // Insert
             conn.execute(
@@ -1001,7 +1001,7 @@ mod tests {
                 .unwrap();
 
             assert!(result.is_some());
-            let retrieved: String = JsonCodec::deserialize(&result.unwrap()).unwrap();
+            let retrieved: String = MlsCodec::deserialize(&result.unwrap()).unwrap();
             assert_eq!(retrieved, "key package data");
 
             // Delete
@@ -1030,8 +1030,8 @@ mod tests {
     #[test]
     fn test_openmls_signature_keys_table_operations() {
         with_test_storage(|conn| {
-            let public_key_bytes = JsonCodec::serialize(&vec![1u8, 2, 3, 4]).unwrap();
-            let key_pair_bytes = JsonCodec::serialize(&"signature key pair".to_string()).unwrap();
+            let public_key_bytes = MlsCodec::serialize(&vec![1u8, 2, 3, 4]).unwrap();
+            let key_pair_bytes = MlsCodec::serialize(&"signature key pair".to_string()).unwrap();
 
             // Insert
             conn.execute(
@@ -1078,8 +1078,8 @@ mod tests {
     #[test]
     fn test_openmls_encryption_keys_table_operations() {
         with_test_storage(|conn| {
-            let public_key_bytes = JsonCodec::serialize(&vec![1u8, 2, 3, 4]).unwrap();
-            let key_pair_bytes = JsonCodec::serialize(&"encryption key pair".to_string()).unwrap();
+            let public_key_bytes = MlsCodec::serialize(&vec![1u8, 2, 3, 4]).unwrap();
+            let key_pair_bytes = MlsCodec::serialize(&"encryption key pair".to_string()).unwrap();
 
             // Insert
             conn.execute(
@@ -1126,11 +1126,11 @@ mod tests {
     #[test]
     fn test_openmls_epoch_key_pairs_table_operations() {
         with_test_storage(|conn| {
-            let group_id_bytes = JsonCodec::serialize(&vec![1u8, 2, 3, 4]).unwrap();
-            let epoch_bytes = JsonCodec::serialize(&5u64).unwrap();
+            let group_id_bytes = MlsCodec::serialize(&vec![1u8, 2, 3, 4]).unwrap();
+            let epoch_bytes = MlsCodec::serialize(&5u64).unwrap();
             let leaf_index = 0u32;
             let key_pairs_bytes =
-                JsonCodec::serialize(&vec!["key1".to_string(), "key2".to_string()]).unwrap();
+                MlsCodec::serialize(&vec!["key1".to_string(), "key2".to_string()]).unwrap();
 
             // Insert
             conn.execute(
@@ -1151,7 +1151,7 @@ mod tests {
                 .unwrap();
 
             assert!(result.is_some());
-            let retrieved: Vec<String> = JsonCodec::deserialize(&result.unwrap()).unwrap();
+            let retrieved: Vec<String> = MlsCodec::deserialize(&result.unwrap()).unwrap();
             assert_eq!(retrieved, vec!["key1", "key2"]);
 
             // Delete
@@ -1184,8 +1184,8 @@ mod tests {
     #[test]
     fn test_openmls_psks_table_operations() {
         with_test_storage(|conn| {
-            let psk_id_bytes = JsonCodec::serialize(&vec![1u8, 2, 3, 4]).unwrap();
-            let psk_bundle_bytes = JsonCodec::serialize(&"psk bundle data".to_string()).unwrap();
+            let psk_id_bytes = MlsCodec::serialize(&vec![1u8, 2, 3, 4]).unwrap();
+            let psk_bundle_bytes = MlsCodec::serialize(&"psk bundle data".to_string()).unwrap();
 
             // Insert
             conn.execute(
@@ -1207,7 +1207,7 @@ mod tests {
                 .unwrap();
 
             assert!(result.is_some());
-            let retrieved: String = JsonCodec::deserialize(&result.unwrap()).unwrap();
+            let retrieved: String = MlsCodec::deserialize(&result.unwrap()).unwrap();
             assert_eq!(retrieved, "psk bundle data");
 
             // Delete
@@ -1259,11 +1259,11 @@ mod tests {
     #[test]
     fn test_insert_or_replace_behavior() {
         with_test_storage(|conn| {
-            let group_id_bytes = JsonCodec::serialize(&vec![1u8, 2, 3, 4]).unwrap();
+            let group_id_bytes = MlsCodec::serialize(&vec![1u8, 2, 3, 4]).unwrap();
             let data_type = GroupDataType::Tree.as_str();
 
             // Insert first value
-            let data1 = JsonCodec::serialize(&"first".to_string()).unwrap();
+            let data1 = MlsCodec::serialize(&"first".to_string()).unwrap();
             conn.execute(
                 "INSERT OR REPLACE INTO openmls_group_data (group_id, data_type, group_data, provider_version)
                  VALUES (?, ?, ?, ?)",
@@ -1271,7 +1271,7 @@ mod tests {
             ).unwrap();
 
             // Replace with second value
-            let data2 = JsonCodec::serialize(&"second".to_string()).unwrap();
+            let data2 = MlsCodec::serialize(&"second".to_string()).unwrap();
             conn.execute(
                 "INSERT OR REPLACE INTO openmls_group_data (group_id, data_type, group_data, provider_version)
                  VALUES (?, ?, ?, ?)",
@@ -1298,7 +1298,7 @@ mod tests {
                 )
                 .unwrap();
 
-            let retrieved: String = JsonCodec::deserialize(&result).unwrap();
+            let retrieved: String = MlsCodec::deserialize(&result).unwrap();
             assert_eq!(retrieved, "second");
         });
     }

@@ -1,7 +1,7 @@
 //! MDK Key Packages
 
 use mdk_storage_traits::MdkStorageProvider;
-use mdk_storage_traits::mls_codec::JsonCodec;
+use mdk_storage_traits::mls_codec::MlsCodec;
 use nostr::{Event, Kind, PublicKey, RelayUrl, Tag, TagKind};
 use openmls::ciphersuite::hash_ref::HashReference;
 use openmls::key_packages::KeyPackage;
@@ -138,7 +138,7 @@ where
         let hash_ref = key_package_bundle
             .key_package()
             .hash_ref(self.provider.crypto())?;
-        let hash_ref_bytes = JsonCodec::serialize(&hash_ref)
+        let hash_ref_bytes = MlsCodec::serialize(&hash_ref)
             .map_err(|e| Error::Provider(format!("Failed to serialize hash_ref: {}", e)))?;
 
         let key_package_serialized = key_package_bundle.key_package().tls_serialize_detached()?;
@@ -529,7 +529,7 @@ where
         &self,
         hash_ref_bytes: &[u8],
     ) -> Result<(), Error> {
-        let hash_ref: HashReference = JsonCodec::deserialize(hash_ref_bytes)
+        let hash_ref: HashReference = MlsCodec::deserialize(hash_ref_bytes)
             .map_err(|e| Error::Provider(format!("Failed to deserialize hash_ref: {}", e)))?;
 
         self.provider

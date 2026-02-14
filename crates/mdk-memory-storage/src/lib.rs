@@ -576,9 +576,9 @@ impl MdkMemoryStorage {
     pub fn create_group_scoped_snapshot(&self, group_id: &GroupId) -> GroupScopedSnapshot {
         let inner = self.inner.read();
 
-        // MLS storage uses JSON serialization for group_id keys.
+        // MLS storage uses MlsCodec serialization for group_id keys.
         // We need to use the same serialization to match the stored keys.
-        let mls_group_id_bytes = mls_storage::JsonCodec::serialize(group_id.inner())
+        let mls_group_id_bytes = mls_storage::MlsCodec::serialize(group_id.inner())
             .expect("Failed to serialize group_id for MLS lookup");
 
         // Filter MLS group data by group_id
@@ -668,9 +668,9 @@ impl MdkMemoryStorage {
         let mut inner = self.inner.write();
         let group_id = &snapshot.group_id;
 
-        // MLS storage uses JSON serialization for group_id keys.
+        // MLS storage uses MlsCodec serialization for group_id keys.
         // We need to use the same serialization to match the stored keys.
-        let mls_group_id_bytes = mls_storage::JsonCodec::serialize(group_id.inner())
+        let mls_group_id_bytes = mls_storage::MlsCodec::serialize(group_id.inner())
             .expect("Failed to serialize group_id for MLS lookup");
 
         // 1. Remove existing data for this group
@@ -3549,7 +3549,7 @@ mod tests {
     // ========================================
     // These tests verify that group-scoped snapshots correctly capture and
     // restore OpenMLS cryptographic state written through the MLS storage layer
-    // (which uses JsonCodec::serialize for group_id keys). This ensures the
+    // (which uses MlsCodec::serialize for group_id keys). This ensures the
     // memory backend cannot regress to the same bug that affected the SQLite
     // backend, where snapshots silently missed all OpenMLS rows due to a
     // group_id encoding mismatch.
@@ -3580,7 +3580,7 @@ mod tests {
         };
         storage.save_group(group).unwrap();
 
-        // Write MLS group data via the internal MLS storage (uses JsonCodec)
+        // Write MLS group data via the internal MLS storage (uses MlsCodec)
         {
             let mut inner = storage.inner.write();
             inner
@@ -3825,7 +3825,7 @@ mod tests {
     /// Full MIP-03 rollback simulation: metadata and crypto state must be
     /// consistent after rollback.
     ///
-    /// This is the regression guard — if the memory storage's JsonCodec
+    /// This is the regression guard — if the memory storage's MlsCodec
     /// serialization for group_id filtering were ever removed or broken,
     /// this test would catch the metadata/crypto split-brain condition.
     #[test]
