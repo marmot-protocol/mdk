@@ -223,7 +223,7 @@ where
 
     /// Parses and validates an MLS KeyPackage from a Nostr event.
     ///
-    /// This method performs comprehensive validation before deserializing the key package:
+    /// This method performs comprehensive validation:
     /// 1. Verifies the event is of kind `MlsKeyPackage` (Kind 443)
     /// 2. Validates all required tags are present and correctly formatted per MIP-00:
     ///    - `mls_protocol_version`: Protocol version (e.g., "1.0")
@@ -231,6 +231,8 @@ where
     ///    - `mls_extensions`: Must include all required extensions (0x000a, 0xf2ee), but not the default extensions (0x0003, 0x0002)
     ///    - `i`: Hex-encoded KeyPackageRef, validated against computed value from content
     /// 3. Deserializes the TLS-encoded key package from the event content
+    /// 4. Verifies identity binding (credential identity matches event signer)
+    /// 5. Validates the `i` tag value matches the computed `KeyPackageRef` from the parsed content
     ///
     /// # Arguments
     ///
@@ -266,8 +268,9 @@ where
             });
         }
 
-        // Validate tags before parsing the key package
-        self.validate_key_package_tags(event)?;
+        // Validate tag format before parsing the key package content.
+        // This catches malformed tags early without the cost of deserialization.
+        self.validate_key_package_tags(event, None)?;
 
         // SECURITY: Require explicit encoding tag to prevent downgrade attacks and parsing ambiguity.
         // Per MIP-00/MIP-02, encoding tag must be present.
@@ -292,24 +295,8 @@ where
         }
 
         // SECURITY: Validate that the `i` tag value matches the computed KeyPackageRef.
-        // This prevents an attacker from publishing a KeyPackage event with a fabricated
-        // `i` tag that doesn't correspond to the actual key package content, which could
-        // cause relay query results to return incorrect key packages.
-        let computed_ref = key_package.hash_ref(self.provider.crypto())?;
-        let computed_ref_hex = hex::encode(computed_ref.as_slice());
-
-        let i_tag_value = event
-            .tags
-            .iter()
-            .find(|t| t.kind() == TagKind::i())
-            .and_then(|t| t.as_slice().get(1).cloned())
-            .ok_or_else(|| Error::KeyPackage("Missing required i tag".to_string()))?;
-
-        if i_tag_value != computed_ref_hex {
-            return Err(Error::KeyPackage(
-                "KeyPackageRef in i tag does not match computed value from content".to_string(),
-            ));
-        }
+        // Now that we have the parsed key package, re-validate tags with content verification.
+        self.validate_key_package_tags(event, Some(&key_package))?;
 
         Ok(key_package)
     }
@@ -321,16 +308,22 @@ where
     /// - Tag values are in the correct format and contain valid values
     /// - The relays tag contains at least one valid relay URL (mandatory per MIP-00)
     /// - The `i` tag contains valid hex-encoded data (mandatory per MIP-00)
+    /// - If a parsed `KeyPackage` is provided, the `i` tag value matches the computed `KeyPackageRef`
     /// - Supports backward compatibility with legacy formats
     ///
     /// # Arguments
     ///
     /// * `event` - The key package event to validate
+    /// * `key_package` - Optional parsed key package for content-level `i` tag verification
     ///
     /// # Returns
     ///
     /// Ok(()) if validation succeeds, or an Error describing what's wrong
-    fn validate_key_package_tags(&self, event: &Event) -> Result<(), Error> {
+    fn validate_key_package_tags(
+        &self,
+        event: &Event,
+        key_package: Option<&KeyPackage>,
+    ) -> Result<(), Error> {
         let require = |pred: fn(&Self, &Tag) -> bool, name: &str| {
             event
                 .tags
@@ -350,6 +343,27 @@ where
         self.validate_extensions_tag(ext)?;
         self.validate_relays_tag(relays)?;
         self.validate_key_package_ref_tag(i_tag)?;
+
+        // SECURITY: When a parsed KeyPackage is available, validate that the `i` tag value
+        // matches the computed KeyPackageRef. This prevents an attacker from publishing a
+        // KeyPackage event with a fabricated `i` tag that doesn't correspond to the actual
+        // key package content, which could cause relay query results to return incorrect
+        // key packages.
+        if let Some(kp) = key_package {
+            let computed_ref = kp.hash_ref(self.provider.crypto())?;
+            let computed_ref_hex = hex::encode(computed_ref.as_slice());
+
+            let i_tag_value = i_tag
+                .as_slice()
+                .get(1)
+                .ok_or_else(|| Error::KeyPackage("Missing required i tag".to_string()))?;
+
+            if *i_tag_value != computed_ref_hex {
+                return Err(Error::KeyPackage(
+                    "KeyPackageRef in i tag does not match computed value from content".to_string(),
+                ));
+            }
+        }
 
         Ok(())
     }
@@ -546,7 +560,7 @@ where
     ///
     /// The `i` tag must contain a single hex-encoded `KeyPackageRef` value.
     /// Content validation (matching the computed `KeyPackageRef`) is performed
-    /// separately in `parse_key_package` after the key package is deserialized.
+    /// by `validate_key_package_tags` when a parsed `KeyPackage` is provided.
     fn validate_key_package_ref_tag(&self, tag: &Tag) -> Result<(), Error> {
         let slice = tag.as_slice();
 
@@ -1227,7 +1241,7 @@ mod tests {
                 .sign_with_keys(&nostr::Keys::generate())
                 .unwrap();
 
-            let result = mdk.validate_key_package_tags(&event);
+            let result = mdk.validate_key_package_tags(&event, None);
             assert!(
                 result.is_err(),
                 "Should reject event without protocol_version tag"
@@ -1252,7 +1266,7 @@ mod tests {
                 .sign_with_keys(&nostr::Keys::generate())
                 .unwrap();
 
-            let result = mdk.validate_key_package_tags(&event);
+            let result = mdk.validate_key_package_tags(&event, None);
             assert!(
                 result.is_err(),
                 "Should reject event without ciphersuite tag"
@@ -1272,7 +1286,7 @@ mod tests {
                 .sign_with_keys(&nostr::Keys::generate())
                 .unwrap();
 
-            let result = mdk.validate_key_package_tags(&event);
+            let result = mdk.validate_key_package_tags(&event, None);
             assert!(
                 result.is_err(),
                 "Should reject event without extensions tag"
@@ -1296,7 +1310,7 @@ mod tests {
                 .sign_with_keys(&nostr::Keys::generate())
                 .unwrap();
 
-            let result = mdk.validate_key_package_tags(&event);
+            let result = mdk.validate_key_package_tags(&event, None);
             assert!(result.is_err(), "Should reject event without relays tag");
             assert!(result.unwrap_err().to_string().contains("relays"));
         }
@@ -1332,7 +1346,7 @@ mod tests {
                 .sign_with_keys(&nostr::Keys::generate())
                 .unwrap();
 
-            let result = mdk.validate_key_package_tags(&event);
+            let result = mdk.validate_key_package_tags(&event, None);
             assert!(result.is_err(), "Should reject event with empty relays tag");
             let error_msg = result.unwrap_err().to_string();
             assert!(
@@ -1360,7 +1374,7 @@ mod tests {
                 .sign_with_keys(&nostr::Keys::generate())
                 .unwrap();
 
-            let result = mdk.validate_key_package_tags(&event);
+            let result = mdk.validate_key_package_tags(&event, None);
             assert!(
                 result.is_err(),
                 "Should reject event with invalid relay URL format"
@@ -1391,7 +1405,7 @@ mod tests {
                 .sign_with_keys(&nostr::Keys::generate())
                 .unwrap();
 
-            let result = mdk.validate_key_package_tags(&event);
+            let result = mdk.validate_key_package_tags(&event, None);
             assert!(
                 result.is_err(),
                 "Should reject event with invalid relay URL in list"
@@ -1422,7 +1436,7 @@ mod tests {
                 .sign_with_keys(&nostr::Keys::generate())
                 .unwrap();
 
-            let result = mdk.validate_key_package_tags(&event);
+            let result = mdk.validate_key_package_tags(&event, None);
             assert!(
                 result.is_ok(),
                 "Should accept event with single valid relay URL, got error: {:?}",
@@ -1452,7 +1466,7 @@ mod tests {
                 .sign_with_keys(&nostr::Keys::generate())
                 .unwrap();
 
-            let result = mdk.validate_key_package_tags(&event);
+            let result = mdk.validate_key_package_tags(&event, None);
             assert!(
                 result.is_ok(),
                 "Should accept event with multiple valid relay URLs, got error: {:?}",
@@ -1488,7 +1502,7 @@ mod tests {
                 .sign_with_keys(&nostr::Keys::generate())
                 .unwrap();
 
-            let result = mdk.validate_key_package_tags(&event);
+            let result = mdk.validate_key_package_tags(&event, None);
             assert!(result.is_err(), "Should reject protocol version 2.0");
             let error_msg = result.unwrap_err().to_string();
             assert!(
@@ -1513,7 +1527,7 @@ mod tests {
                 .sign_with_keys(&nostr::Keys::generate())
                 .unwrap();
 
-            let result = mdk.validate_key_package_tags(&event);
+            let result = mdk.validate_key_package_tags(&event, None);
             assert!(result.is_err(), "Should reject protocol version 0.9");
             let error_msg = result.unwrap_err().to_string();
             assert!(
@@ -1538,7 +1552,7 @@ mod tests {
                 .sign_with_keys(&nostr::Keys::generate())
                 .unwrap();
 
-            let result = mdk.validate_key_package_tags(&event);
+            let result = mdk.validate_key_package_tags(&event, None);
             assert!(
                 result.is_err(),
                 "Should reject protocol version tag without value"
@@ -1579,7 +1593,7 @@ mod tests {
                 .sign_with_keys(&nostr::Keys::generate())
                 .unwrap();
 
-            let result = mdk.validate_key_package_tags(&event);
+            let result = mdk.validate_key_package_tags(&event, None);
             assert!(
                 result.is_err(),
                 "Should reject ciphersuite with invalid hex length"
@@ -1602,7 +1616,7 @@ mod tests {
                 .sign_with_keys(&nostr::Keys::generate())
                 .unwrap();
 
-            let result = mdk.validate_key_package_tags(&event);
+            let result = mdk.validate_key_package_tags(&event, None);
             assert!(
                 result.is_err(),
                 "Should reject ciphersuite with invalid hex characters"
@@ -1625,7 +1639,7 @@ mod tests {
                 .sign_with_keys(&nostr::Keys::generate())
                 .unwrap();
 
-            let result = mdk.validate_key_package_tags(&event);
+            let result = mdk.validate_key_package_tags(&event, None);
             assert!(result.is_err(), "Should reject empty ciphersuite value");
             // Empty string fails hex format validation (must be 6 characters)
             assert!(result.unwrap_err().to_string().contains("6 characters"));
@@ -1659,7 +1673,7 @@ mod tests {
                 .sign_with_keys(&nostr::Keys::generate())
                 .unwrap();
 
-            let result = mdk.validate_key_package_tags(&event);
+            let result = mdk.validate_key_package_tags(&event, None);
             assert!(
                 result.is_err(),
                 "Should reject extension with invalid hex length"
@@ -1682,7 +1696,7 @@ mod tests {
                 .sign_with_keys(&nostr::Keys::generate())
                 .unwrap();
 
-            let result = mdk.validate_key_package_tags(&event);
+            let result = mdk.validate_key_package_tags(&event, None);
             assert!(
                 result.is_err(),
                 "Should reject extension with invalid hex characters"
@@ -1705,7 +1719,7 @@ mod tests {
                 .sign_with_keys(&nostr::Keys::generate())
                 .unwrap();
 
-            let result = mdk.validate_key_package_tags(&event);
+            let result = mdk.validate_key_package_tags(&event, None);
             assert!(result.is_err(), "Should reject empty extension value");
             // Empty string fails hex format validation (must be 6 characters)
             assert!(result.unwrap_err().to_string().contains("6 characters"));
@@ -1742,7 +1756,7 @@ mod tests {
                 .sign_with_keys(&nostr::Keys::generate())
                 .unwrap();
 
-            let result = mdk.validate_key_package_tags(&event);
+            let result = mdk.validate_key_package_tags(&event, None);
             assert!(
                 result.is_err(),
                 "Should reject unsupported ciphersuite 0x0002"
@@ -1773,7 +1787,7 @@ mod tests {
                 .sign_with_keys(&nostr::Keys::generate())
                 .unwrap();
 
-            let result = mdk.validate_key_package_tags(&event);
+            let result = mdk.validate_key_package_tags(&event, None);
             assert!(result.is_err(), "Should reject non-hex ciphersuite format");
             // Should fail on hex format validation, not legacy validation
             assert!(result.unwrap_err().to_string().contains("6 characters"));
@@ -1808,7 +1822,7 @@ mod tests {
                 .sign_with_keys(&nostr::Keys::generate())
                 .unwrap();
 
-            let result = mdk.validate_key_package_tags(&event);
+            let result = mdk.validate_key_package_tags(&event, None);
             assert!(result.is_err(), "Should reject event missing LastResort");
             let error_msg = result.unwrap_err().to_string();
             assert!(
@@ -1836,7 +1850,7 @@ mod tests {
                 .sign_with_keys(&nostr::Keys::generate())
                 .unwrap();
 
-            let result = mdk.validate_key_package_tags(&event);
+            let result = mdk.validate_key_package_tags(&event, None);
             assert!(
                 result.is_err(),
                 "Should reject event missing NostrGroupData"
@@ -1880,7 +1894,7 @@ mod tests {
                 .sign_with_keys(&nostr::Keys::generate())
                 .unwrap();
 
-            let result = mdk.validate_key_package_tags(&event);
+            let result = mdk.validate_key_package_tags(&event, None);
             assert!(
                 result.is_ok(),
                 "Should accept uppercase hex digits in extensions, got error: {:?}",
@@ -1903,7 +1917,7 @@ mod tests {
                 .sign_with_keys(&nostr::Keys::generate())
                 .unwrap();
 
-            let result = mdk.validate_key_package_tags(&event);
+            let result = mdk.validate_key_package_tags(&event, None);
             assert!(
                 result.is_ok(),
                 "Should accept mixed case hex digits in extensions, got error: {:?}",
@@ -1937,7 +1951,7 @@ mod tests {
             .sign_with_keys(&nostr::Keys::generate())
             .unwrap();
 
-        let result = mdk.validate_key_package_tags(&event);
+        let result = mdk.validate_key_package_tags(&event, None);
         assert!(
             result.is_err(),
             "Should reject ciphersuite tag without value"
@@ -1975,7 +1989,7 @@ mod tests {
             .sign_with_keys(&nostr::Keys::generate())
             .unwrap();
 
-        let result = mdk.validate_key_package_tags(&event);
+        let result = mdk.validate_key_package_tags(&event, None);
         assert!(
             result.is_err(),
             "Should reject extensions tag without values"
@@ -2433,7 +2447,7 @@ mod tests {
             .sign_with_keys(&nostr::Keys::generate())
             .unwrap();
 
-        let result = mdk.validate_key_package_tags(&event);
+        let result = mdk.validate_key_package_tags(&event, None);
         assert!(result.is_err(), "Should reject event without i tag");
         let error_msg = result.unwrap_err().to_string();
         assert!(
@@ -2468,7 +2482,7 @@ mod tests {
             .sign_with_keys(&nostr::Keys::generate())
             .unwrap();
 
-        let result = mdk.validate_key_package_tags(&event);
+        let result = mdk.validate_key_package_tags(&event, None);
         assert!(
             result.is_err(),
             "Should reject event with invalid hex in i tag"
@@ -2506,7 +2520,7 @@ mod tests {
             .sign_with_keys(&nostr::Keys::generate())
             .unwrap();
 
-        let result = mdk.validate_key_package_tags(&event);
+        let result = mdk.validate_key_package_tags(&event, None);
         assert!(result.is_err(), "Should reject event with empty i tag");
         let error_msg = result.unwrap_err().to_string();
         assert!(
@@ -2544,7 +2558,7 @@ mod tests {
             .sign_with_keys(&nostr::Keys::generate())
             .unwrap();
 
-        let result = mdk.validate_key_package_tags(&event);
+        let result = mdk.validate_key_package_tags(&event, None);
         assert!(
             result.is_err(),
             "Should reject event with multi-value i tag"
@@ -2582,7 +2596,7 @@ mod tests {
             .sign_with_keys(&nostr::Keys::generate())
             .unwrap();
 
-        let result = mdk.validate_key_package_tags(&event);
+        let result = mdk.validate_key_package_tags(&event, None);
         assert!(
             result.is_err(),
             "Should reject event with empty string i tag value"
