@@ -548,14 +548,25 @@ where
     /// Content validation (matching the computed `KeyPackageRef`) is performed
     /// separately in `parse_key_package` after the key package is deserialized.
     fn validate_key_package_ref_tag(&self, tag: &Tag) -> Result<(), Error> {
-        let values: Vec<&str> = tag.as_slice().iter().map(|s| s.as_str()).collect();
+        let slice = tag.as_slice();
 
-        let hex_value = values
-            .get(1)
-            .ok_or_else(|| Error::KeyPackage("i tag must have a value".to_string()))?;
+        // Tag slice includes the tag name at index 0, so exactly 2 elements means one value.
+        if slice.len() != 2 {
+            return Err(Error::KeyPackage(
+                "i tag must contain exactly one value".to_string(),
+            ));
+        }
+
+        let hex_value = &slice[1];
+
+        if hex_value.is_empty() {
+            return Err(Error::KeyPackage(
+                "i tag value must not be empty".to_string(),
+            ));
+        }
 
         // Validate that the value is valid hex
-        hex::decode(hex_value).map_err(|e| {
+        hex::decode(hex_value.as_str()).map_err(|e| {
             Error::KeyPackage(format!("i tag must contain valid hex-encoded data: {}", e))
         })?;
 
@@ -2470,7 +2481,7 @@ mod tests {
         );
     }
 
-    /// Test that validate_key_package_tags rejects events with empty `i` tag
+    /// Test that validate_key_package_tags rejects events with empty `i` tag (no value)
     #[test]
     fn test_validate_empty_i_tag() {
         let mdk = create_test_mdk();
@@ -2499,8 +2510,87 @@ mod tests {
         assert!(result.is_err(), "Should reject event with empty i tag");
         let error_msg = result.unwrap_err().to_string();
         assert!(
-            error_msg.contains("must have a value"),
-            "Error should mention missing value, got: {}",
+            error_msg.contains("exactly one value"),
+            "Error should mention exactly one value, got: {}",
+            error_msg
+        );
+    }
+
+    /// Test that validate_key_package_tags rejects events with multi-value `i` tag
+    #[test]
+    fn test_validate_multi_value_i_tag() {
+        let mdk = create_test_mdk();
+        let test_pubkey =
+            PublicKey::from_hex("884704bd421671e01c13f854d2ce23ce2a5bfe9562f4f297ad2bc921ba30c3a6")
+                .unwrap();
+
+        let (key_package_hex, _, _) = mdk
+            .create_key_package_for_event(&test_pubkey, vec![])
+            .expect("Failed to create key package");
+
+        let tags = vec![
+            Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
+            Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
+            Tag::custom(TagKind::MlsExtensions, ["0x000a", "0xf2ee"]),
+            Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
+            Tag::custom(
+                TagKind::i(),
+                [hex::encode([0xaa; 32]), hex::encode([0xbb; 32])],
+            ),
+        ];
+
+        let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex)
+            .tags(tags)
+            .sign_with_keys(&nostr::Keys::generate())
+            .unwrap();
+
+        let result = mdk.validate_key_package_tags(&event);
+        assert!(
+            result.is_err(),
+            "Should reject event with multi-value i tag"
+        );
+        let error_msg = result.unwrap_err().to_string();
+        assert!(
+            error_msg.contains("exactly one value"),
+            "Error should mention exactly one value, got: {}",
+            error_msg
+        );
+    }
+
+    /// Test that validate_key_package_tags rejects events with empty string in `i` tag
+    #[test]
+    fn test_validate_empty_string_i_tag() {
+        let mdk = create_test_mdk();
+        let test_pubkey =
+            PublicKey::from_hex("884704bd421671e01c13f854d2ce23ce2a5bfe9562f4f297ad2bc921ba30c3a6")
+                .unwrap();
+
+        let (key_package_hex, _, _) = mdk
+            .create_key_package_for_event(&test_pubkey, vec![])
+            .expect("Failed to create key package");
+
+        let tags = vec![
+            Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
+            Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
+            Tag::custom(TagKind::MlsExtensions, ["0x000a", "0xf2ee"]),
+            Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
+            Tag::custom(TagKind::i(), [""]),
+        ];
+
+        let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex)
+            .tags(tags)
+            .sign_with_keys(&nostr::Keys::generate())
+            .unwrap();
+
+        let result = mdk.validate_key_package_tags(&event);
+        assert!(
+            result.is_err(),
+            "Should reject event with empty string i tag value"
+        );
+        let error_msg = result.unwrap_err().to_string();
+        assert!(
+            error_msg.contains("must not be empty"),
+            "Error should mention empty value, got: {}",
             error_msg
         );
     }
