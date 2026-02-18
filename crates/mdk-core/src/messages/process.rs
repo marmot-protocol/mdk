@@ -5,10 +5,10 @@
 use mdk_storage_traits::MdkStorageProvider;
 use mdk_storage_traits::groups::types as group_types;
 use mdk_storage_traits::messages::types as message_types;
-use nostr::Event;
+use nostr::{Event, Timestamp};
 use openmls::group::{ProcessMessageError, ValidationError};
 use openmls::prelude::{
-    ContentType, MlsGroup, MlsMessageIn, ProcessedMessage, ProcessedMessageContent,
+    ContentType, MlsGroup, MlsMessageIn, ProcessedMessage, ProcessedMessageContent, Proposal,
 };
 use tls_codec::Deserialize as TlsDeserialize;
 
@@ -193,6 +193,16 @@ where
                     ));
                 }
 
+                // Detect self-update before merging (same logic as MDK::merge_pending_commit)
+                let is_self_update = mls_group.pending_commit().is_some_and(|staged_commit| {
+                    let has_update_signal = staged_commit.update_path_leaf_node().is_some()
+                        || staged_commit.update_proposals().next().is_some();
+                    let no_non_update_proposals = staged_commit
+                        .queued_proposals()
+                        .all(|p| matches!(p.proposal(), Proposal::Update(_)));
+                    has_update_signal && no_non_update_proposals
+                });
+
                 mls_group
                     .merge_pending_commit(&self.provider)
                     .map_err(|_e| Error::Message("Failed to merge pending commit".to_string()))?;
@@ -214,6 +224,18 @@ where
 
                 // Sync the stored group metadata with the updated MLS group state
                 self.sync_group_metadata_from_mls(&group.mls_group_id)?;
+
+                // Update self-update tracking if this was a self-update commit
+                if is_self_update {
+                    let mut stored_group = self
+                        .get_group(&group.mls_group_id)?
+                        .ok_or(Error::GroupNotFound)?;
+                    stored_group.self_update_state =
+                        group_types::SelfUpdateState::CompletedAt(Timestamp::now());
+                    self.storage()
+                        .save_group(stored_group)
+                        .map_err(|e| Error::Group(e.to_string()))?;
+                }
 
                 // Save a processed message so we don't reprocess
                 let processed_message = super::create_processed_message_record(
