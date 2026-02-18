@@ -23,6 +23,10 @@
 
 ## Unreleased
 
+### Fixed
+
+- **Welcome validation no longer requires `client` tag**: The `validate_welcome_event` function now correctly treats the `client` tag as optional per MIP-02. Previously, welcome events without a `client` tag were rejected, which would cause spec-compliant third-party implementations to be unable to send Welcome events to MDK-based clients.
+
 ### Breaking changes
 
 - **Required `i` tag on KeyPackage events**: KeyPackage events (kind 443) now include a required `i` tag containing the hex-encoded `KeyPackageRef` (per updated MIP-00 spec). `parse_key_package()` now requires the `i` tag to be present and validates that its value matches the computed `KeyPackageRef` from the event content. Events without the `i` tag will be rejected. The tag vector returned by `create_key_package_for_event` now contains one additional tag, shifting indices of subsequent tags. ([#182](https://github.com/marmot-protocol/mdk/pull/182))
