@@ -10,7 +10,7 @@
 use std::collections::BTreeSet;
 
 use crate::GroupId;
-use nostr::{PublicKey, RelayUrl};
+use nostr::{PublicKey, RelayUrl, Timestamp};
 
 pub mod error;
 pub mod types;
@@ -232,4 +232,33 @@ pub trait GroupStorage {
         &self,
         group_exporter_secret: GroupExporterSecret,
     ) -> Result<(), GroupError>;
+
+    /// Returns active groups that need a self-update: either because
+    /// `needs_self_update` is `true` (post-join requirement) or because
+    /// `last_self_update_at` is older than `threshold_secs` seconds ago
+    /// (periodic rotation).
+    ///
+    /// Groups that have never self-updated (`last_self_update_at == None`)
+    /// and do not have `needs_self_update` set are NOT included — they
+    /// were created (not joined) and have no rotation obligation yet.
+    fn groups_needing_self_update(&self, threshold_secs: u64) -> Result<Vec<GroupId>, GroupError> {
+        let now = Timestamp::now().as_secs();
+        let groups = self.all_groups()?;
+        Ok(groups
+            .into_iter()
+            .filter(|g| {
+                if g.state != types::GroupState::Active {
+                    return false;
+                }
+                if g.needs_self_update {
+                    return true;
+                }
+                if let Some(ts) = g.last_self_update_at {
+                    return now.saturating_sub(ts.as_secs()) >= threshold_secs;
+                }
+                false
+            })
+            .map(|g| g.mls_group_id)
+            .collect())
+    }
 }

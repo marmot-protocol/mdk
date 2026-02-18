@@ -108,6 +108,11 @@ test_memory_storage!(
     shared::group_tests::test_last_message
 );
 
+test_memory_storage!(
+    test_groups_needing_self_update_memory,
+    shared::group_tests::test_groups_needing_self_update
+);
+
 // Welcome functionality tests
 test_memory_storage!(
     test_save_and_find_welcome_memory,

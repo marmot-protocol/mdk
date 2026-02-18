@@ -409,6 +409,27 @@ where
             .map_err(|e| Error::Group(e.to_string()))
     }
 
+    /// Returns the group IDs of active groups that need a self-update.
+    ///
+    /// A group needs a self-update if:
+    /// - `needs_self_update` is `true` (post-join requirement, MIP-02), or
+    /// - `last_self_update_at` is older than `threshold_secs` (periodic rotation, MIP-00)
+    ///
+    /// # Arguments
+    /// * `threshold_secs` - Maximum age in seconds before a group's key rotation is considered stale
+    ///
+    /// # Returns
+    /// * `Ok(Vec<GroupId>)` - Group IDs needing self-update
+    /// * `Err(Error)` - If there is an error accessing storage
+    pub fn groups_needing_self_update(
+        &self,
+        threshold_secs: u64,
+    ) -> Result<Vec<GroupId>, Error> {
+        self.storage()
+            .groups_needing_self_update(threshold_secs)
+            .map_err(|e| Error::Group(e.to_string()))
+    }
+
     /// Gets the public keys of all members in an MLS group
     ///
     /// # Arguments

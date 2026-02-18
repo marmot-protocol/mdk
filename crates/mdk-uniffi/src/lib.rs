@@ -449,6 +449,19 @@ impl Mdk {
         Ok(self.lock()?.get_group(&group_id)?.map(Group::from))
     }
 
+    /// Get group IDs that need a self-update (post-join or stale rotation).
+    pub fn groups_needing_self_update(
+        &self,
+        threshold_secs: u64,
+    ) -> Result<Vec<String>, MdkUniffiError> {
+        Ok(self
+            .lock()?
+            .groups_needing_self_update(threshold_secs)?
+            .into_iter()
+            .map(|id| hex::encode(id.as_slice()))
+            .collect())
+    }
+
     /// Get members of a group
     pub fn get_members(&self, mls_group_id: String) -> Result<Vec<String>, MdkUniffiError> {
         let group_id = parse_group_id(&mls_group_id)?;

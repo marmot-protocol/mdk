@@ -6,6 +6,7 @@ use mdk_storage_traits::GroupId;
 use mdk_storage_traits::groups::GroupStorage;
 use mdk_storage_traits::groups::error::GroupError;
 use mdk_storage_traits::groups::types::GroupExporterSecret;
+use mdk_storage_traits::groups::types::GroupState;
 use mdk_storage_traits::groups::{MessageSortOrder, Pagination};
 use mdk_storage_traits::messages::MessageStorage;
 use mdk_storage_traits::messages::types::{Message, MessageState};
@@ -731,4 +732,60 @@ where
             .last_message(&non_existent, MessageSortOrder::CreatedAtFirst)
             .is_err()
     );
+}
+
+/// Test `groups_needing_self_update()` query
+pub fn test_groups_needing_self_update<S>(storage: S)
+where
+    S: GroupStorage,
+{
+    // Group A: needs_self_update = true (just joined)
+    let mut group_a = create_test_group(GroupId::from_slice(&[1, 2, 3, 30]));
+    group_a.needs_self_update = true;
+    storage.save_group(group_a.clone()).unwrap();
+
+    // Group B: last_self_update_at = 100 seconds ago (stale)
+    let mut group_b = create_test_group(GroupId::from_slice(&[1, 2, 3, 31]));
+    let now = Timestamp::now().as_secs();
+    group_b.last_self_update_at = Some(Timestamp::from_secs(now.saturating_sub(100)));
+    storage.save_group(group_b.clone()).unwrap();
+
+    // Group C: last_self_update_at = 5 seconds ago (fresh)
+    let mut group_c = create_test_group(GroupId::from_slice(&[1, 2, 3, 32]));
+    group_c.last_self_update_at = Some(Timestamp::from_secs(now.saturating_sub(5)));
+    storage.save_group(group_c.clone()).unwrap();
+
+    // Group D: inactive (should be excluded even if needs_self_update)
+    let mut group_d = create_test_group(GroupId::from_slice(&[1, 2, 3, 33]));
+    group_d.needs_self_update = true;
+    group_d.state = GroupState::Inactive;
+    storage.save_group(group_d.clone()).unwrap();
+
+    // Group E: no flags set, no last_self_update_at (creator, no obligation)
+    let group_e = create_test_group(GroupId::from_slice(&[1, 2, 3, 34]));
+    storage.save_group(group_e.clone()).unwrap();
+
+    // Threshold = 60 seconds: should return A (needs_self_update) and B (stale)
+    let needing = storage.groups_needing_self_update(60).unwrap();
+    assert!(
+        needing.contains(&group_a.mls_group_id),
+        "Group A should need self-update (needs_self_update=true)"
+    );
+    assert!(
+        needing.contains(&group_b.mls_group_id),
+        "Group B should need self-update (last update 100s ago > 60s threshold)"
+    );
+    assert!(
+        !needing.contains(&group_c.mls_group_id),
+        "Group C should NOT need self-update (last update 5s ago < 60s threshold)"
+    );
+    assert!(
+        !needing.contains(&group_d.mls_group_id),
+        "Group D should NOT be included (inactive)"
+    );
+    assert!(
+        !needing.contains(&group_e.mls_group_id),
+        "Group E should NOT be included (no obligation)"
+    );
+    assert_eq!(needing.len(), 2);
 }
