@@ -43,6 +43,8 @@ pub fn create_test_group(mls_group_id: GroupId) -> Group {
         image_hash: None,
         image_key: None,
         image_nonce: None,
+        needs_self_update: false,
+        last_self_update_at: None,
     }
 }
 

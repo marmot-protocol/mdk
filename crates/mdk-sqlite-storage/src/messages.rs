@@ -381,6 +381,8 @@ mod tests {
             image_hash: None,
             image_key: None,
             image_nonce: None,
+            needs_self_update: false,
+            last_self_update_at: None,
         };
 
         // Save the group
@@ -493,6 +495,8 @@ mod tests {
             image_hash: None,
             image_key: None,
             image_nonce: None,
+            needs_self_update: false,
+            last_self_update_at: None,
         };
         storage.save_group(group).unwrap();
 
@@ -555,6 +559,8 @@ mod tests {
             image_hash: None,
             image_key: None,
             image_nonce: None,
+            needs_self_update: false,
+            last_self_update_at: None,
         };
 
         let group_2 = Group {
@@ -571,6 +577,8 @@ mod tests {
             image_hash: None,
             image_key: None,
             image_nonce: None,
+            needs_self_update: false,
+            last_self_update_at: None,
         };
 
         storage.save_group(group_1).unwrap();
@@ -779,6 +787,8 @@ mod tests {
             image_hash: None,
             image_key: None,
             image_nonce: None,
+            needs_self_update: false,
+            last_self_update_at: None,
         };
         storage.save_group(group).unwrap();
 

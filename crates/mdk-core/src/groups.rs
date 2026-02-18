@@ -1079,6 +1079,8 @@ where
             image_hash: config.image_hash,
             image_key: config.image_key.map(mdk_storage_traits::Secret::new),
             image_nonce: config.image_nonce.map(mdk_storage_traits::Secret::new),
+            needs_self_update: false,
+            last_self_update_at: None,
         };
 
         self.storage().save_group(group.clone()).map_err(
@@ -1272,10 +1274,38 @@ where
     /// * Err(GroupError) - if something goes wrong
     pub fn merge_pending_commit(&self, group_id: &GroupId) -> Result<(), Error> {
         let mut mls_group = self.load_mls_group(group_id)?.ok_or(Error::GroupNotFound)?;
+
+        // Detect whether the pending commit is a self-update BEFORE merging,
+        // since merge_pending_commit() consumes the staged commit.
+        let is_self_update = mls_group.pending_commit().is_some_and(|staged_commit| {
+            // Must contain at least one update signal
+            let has_update_signal = staged_commit.update_path_leaf_node().is_some()
+                || staged_commit.update_proposals().next().is_some();
+            // All proposals must be Update type (no add/remove/psk/etc.)
+            let all_updates = staged_commit
+                .queued_proposals()
+                .all(|p| matches!(p.proposal(), Proposal::Update(_)));
+            has_update_signal && all_updates
+        });
+
         mls_group.merge_pending_commit(&self.provider)?;
 
         // Sync the stored group metadata with the updated MLS group state
         self.sync_group_metadata_from_mls(group_id)?;
+
+        // If this was actually a self-update commit, clear the post-join flag
+        // and record the timestamp. This correctly handles:
+        // - Post-join self-updates (clears needs_self_update, records timestamp)
+        // - Creator self-updates (records timestamp for rotation tracking)
+        // - Non-self-update commits (leaves both fields untouched)
+        if is_self_update {
+            let mut group = self.get_group(group_id)?.ok_or(Error::GroupNotFound)?;
+            group.needs_self_update = false;
+            group.last_self_update_at = Some(nostr::Timestamp::now());
+            self.storage()
+                .save_group(group)
+                .map_err(|e| Error::Group(e.to_string()))?;
+        }
 
         Ok(())
     }

@@ -2017,6 +2017,8 @@ mod tests {
             image_hash: None,
             image_key: None,
             image_nonce: None,
+            needs_self_update: false,
+            last_self_update_at: None,
         };
 
         // Save the group
@@ -2231,6 +2233,8 @@ mod tests {
                     image_hash: None,
                     image_key: None,
                     image_nonce: None,
+                    needs_self_update: false,
+                    last_self_update_at: None,
                 };
 
                 storage.save_group(group).unwrap();
@@ -2398,6 +2402,8 @@ mod tests {
                     image_hash: None,
                     image_key: None,
                     image_nonce: None,
+                    needs_self_update: false,
+                    last_self_update_at: None,
                 };
                 storage.save_group(group).unwrap();
 
@@ -3270,6 +3276,8 @@ mod tests {
                 image_hash: None,
                 image_key: None,
                 image_nonce: None,
+                needs_self_update: false,
+                last_self_update_at: None,
             }
         }
 
@@ -3607,6 +3615,8 @@ mod tests {
                 image_hash: None,
                 image_key: None,
                 image_nonce: None,
+                needs_self_update: false,
+                last_self_update_at: None,
             };
             storage.save_group(group).unwrap();
 
@@ -3661,6 +3671,8 @@ mod tests {
                 image_hash: None,
                 image_key: None,
                 image_nonce: None,
+                needs_self_update: false,
+                last_self_update_at: None,
             };
             let g2 = Group {
                 mls_group_id: group2.clone(),
@@ -3709,6 +3721,8 @@ mod tests {
                 image_hash: None,
                 image_key: None,
                 image_nonce: None,
+                needs_self_update: false,
+                last_self_update_at: None,
             };
             storage.save_group(group).unwrap();
 
@@ -3754,6 +3768,8 @@ mod tests {
                 image_hash: None,
                 image_key: None,
                 image_nonce: None,
+                needs_self_update: false,
+                last_self_update_at: None,
             };
             storage.save_group(group).unwrap();
 
@@ -3797,6 +3813,8 @@ mod tests {
                 image_hash: None,
                 image_key: None,
                 image_nonce: None,
+                needs_self_update: false,
+                last_self_update_at: None,
             };
             storage.save_group(group).unwrap();
 
@@ -3861,6 +3879,8 @@ mod tests {
                 image_hash: None,
                 image_key: None,
                 image_nonce: None,
+                needs_self_update: false,
+                last_self_update_at: None,
             }
         }
 

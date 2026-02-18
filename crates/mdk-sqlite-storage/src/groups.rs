@@ -119,12 +119,16 @@ impl GroupStorage for MdkSqliteStorage {
             .as_ref()
             .map(|ts| ts.as_secs());
 
+        let needs_self_update: i64 = if group.needs_self_update { 1 } else { 0 };
+        let last_self_update_at: Option<u64> =
+            group.last_self_update_at.as_ref().map(|ts| ts.as_secs());
+
         self.with_connection(|conn| {
             conn.execute(
                 "INSERT INTO groups
              (mls_group_id, nostr_group_id, name, description, image_hash, image_key, image_nonce, admin_pubkeys, last_message_id,
-              last_message_at, last_message_processed_at, epoch, state)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              last_message_at, last_message_processed_at, epoch, state, needs_self_update, last_self_update_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(mls_group_id) DO UPDATE SET
                 nostr_group_id = excluded.nostr_group_id,
                 name = excluded.name,
@@ -137,7 +141,9 @@ impl GroupStorage for MdkSqliteStorage {
                 last_message_at = excluded.last_message_at,
                 last_message_processed_at = excluded.last_message_processed_at,
                 epoch = excluded.epoch,
-                state = excluded.state",
+                state = excluded.state,
+                needs_self_update = excluded.needs_self_update,
+                last_self_update_at = excluded.last_self_update_at",
                 params![
                     &group.mls_group_id.as_slice(),
                     &group.nostr_group_id,
@@ -151,7 +157,9 @@ impl GroupStorage for MdkSqliteStorage {
                     &last_message_at,
                     &last_message_processed_at,
                     &(group.epoch as i64),
-                    group.state.as_str()
+                    group.state.as_str(),
+                    &needs_self_update,
+                    &last_self_update_at
                 ],
             )
             .map_err(into_group_err)?;
@@ -418,6 +426,8 @@ mod tests {
             image_hash,
             image_key,
             image_nonce,
+            needs_self_update: false,
+            last_self_update_at: None,
         };
 
         // Save the group
@@ -465,6 +475,8 @@ mod tests {
             image_hash: None,
             image_key: None,
             image_nonce: None,
+            needs_self_update: false,
+            last_self_update_at: None,
         };
 
         // Should fail due to name length
@@ -500,6 +512,8 @@ mod tests {
             image_hash: None,
             image_key: None,
             image_nonce: None,
+            needs_self_update: false,
+            last_self_update_at: None,
         };
 
         // Should fail due to description length
@@ -538,6 +552,8 @@ mod tests {
             image_hash: None,
             image_key: None,
             image_nonce: None,
+            needs_self_update: false,
+            last_self_update_at: None,
         };
 
         storage.save_group(group).unwrap();
@@ -668,6 +684,8 @@ mod tests {
             image_hash: None,
             image_key: None,
             image_nonce: None,
+            needs_self_update: false,
+            last_self_update_at: None,
         };
 
         // Save the group
@@ -754,6 +772,8 @@ mod tests {
             image_hash: None,
             image_key: None,
             image_nonce: None,
+            needs_self_update: false,
+            last_self_update_at: None,
         };
         storage.save_group(group1).unwrap();
 
@@ -773,6 +793,8 @@ mod tests {
             image_hash: None,
             image_key: None,
             image_nonce: None,
+            needs_self_update: false,
+            last_self_update_at: None,
         };
         storage.save_group(group2).unwrap();
 

@@ -304,6 +304,8 @@ mod tests {
             image_hash: None,
             image_key: None,
             image_nonce: None,
+            needs_self_update: false,
+            last_self_update_at: None,
         }
     }
 

@@ -108,6 +108,18 @@ pub struct Group {
     pub epoch: u64,
     /// The state of the group
     pub state: GroupState,
+    /// Whether this group needs a post-join self-update (key rotation after joining).
+    /// Set to `true` by `accept_welcome()`. Cleared by `merge_pending_commit()`
+    /// only when the merged commit is detected as a pure self-update (no
+    /// add/remove/psk proposals). Non-self-update commits leave this flag untouched.
+    #[serde(default)]
+    pub needs_self_update: bool,
+    /// When the last self-update was successfully merged for this group.
+    /// Updated by `merge_pending_commit()` every time a pure self-update commit
+    /// is merged, regardless of the `needs_self_update` flag. This ensures both
+    /// post-join and periodic rotation self-updates are tracked.
+    #[serde(default)]
+    pub last_self_update_at: Option<Timestamp>,
 }
 
 impl Group {
@@ -199,6 +211,8 @@ mod tests {
             last_message_processed_at: None,
             epoch: 0,
             state: GroupState::Active,
+            needs_self_update: false,
+            last_self_update_at: None,
         }
     }
 
@@ -388,6 +402,8 @@ mod tests {
             last_message_processed_at: None,
             epoch: 0,
             state: GroupState::Active,
+            needs_self_update: false,
+            last_self_update_at: None,
         };
 
         let serialized = serde_json::to_value(&group).unwrap();

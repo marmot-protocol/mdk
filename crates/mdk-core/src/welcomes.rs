@@ -243,6 +243,8 @@ where
                 .epoch()
                 .as_u64(),
             state: group_types::GroupState::Pending,
+            needs_self_update: false,
+            last_self_update_at: None,
         };
 
         let mls_group_id = group.mls_group_id.clone();
@@ -328,6 +330,8 @@ where
 
             // Update group state
             group.state = group_types::GroupState::Active;
+            // Flag that this group needs a post-join self-update (MIP-02)
+            group.needs_self_update = true;
 
             // Save group
             self.storage().save_group(group).map_err(

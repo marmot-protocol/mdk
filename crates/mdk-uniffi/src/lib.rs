@@ -1166,6 +1166,10 @@ pub struct Group {
     pub epoch: u64,
     /// Group state (e.g., "active", "archived")
     pub state: String,
+    /// Whether this group needs a post-join self-update (MIP-02)
+    pub needs_self_update: bool,
+    /// Unix timestamp of the last successful self-update merge
+    pub last_self_update_at: Option<u64>,
 }
 
 impl From<group_types::Group> for Group {
@@ -1184,6 +1188,8 @@ impl From<group_types::Group> for Group {
             last_message_processed_at: g.last_message_processed_at.map(|ts| ts.as_secs()),
             epoch: g.epoch,
             state: g.state.as_str().to_string(),
+            needs_self_update: g.needs_self_update,
+            last_self_update_at: g.last_self_update_at.map(|ts| ts.as_secs()),
         }
     }
 }

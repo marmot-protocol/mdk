@@ -649,6 +649,8 @@ mod tests {
             image_key: None,
             image_nonce: None,
             state: GroupState::Active,
+            needs_self_update: false,
+            last_self_update_at: None,
         };
         storage.save_group(group).unwrap();
 
@@ -695,6 +697,8 @@ mod tests {
             image_key: None,
             image_nonce: None,
             state: GroupState::Active,
+            needs_self_update: false,
+            last_self_update_at: None,
         };
         storage.save_group(group).unwrap();
 
@@ -848,6 +852,8 @@ mod tests {
             image_key: None,
             image_nonce: None,
             state: GroupState::Active,
+            needs_self_update: false,
+            last_self_update_at: None,
         };
         storage.save_group(group).unwrap();
 
@@ -954,6 +960,8 @@ mod tests {
             image_key: None,
             image_nonce: None,
             state: GroupState::Active,
+            needs_self_update: false,
+            last_self_update_at: None,
         };
         storage.save_group(group).unwrap();
 
