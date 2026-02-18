@@ -351,14 +351,16 @@ where
         // key packages.
         if let Some(kp) = key_package {
             let computed_ref = kp.hash_ref(self.provider.crypto())?;
-            let computed_ref_hex = hex::encode(computed_ref.as_slice());
 
             let i_tag_value = i_tag
                 .as_slice()
                 .get(1)
                 .ok_or_else(|| Error::KeyPackage("Missing required i tag".to_string()))?;
 
-            if *i_tag_value != computed_ref_hex {
+            let i_tag_bytes = hex::decode(i_tag_value.as_str())
+                .map_err(|_| Error::KeyPackage("Invalid i tag hex".to_string()))?;
+
+            if i_tag_bytes != computed_ref.as_slice() {
                 return Err(Error::KeyPackage(
                     "KeyPackageRef in i tag does not match computed value from content".to_string(),
                 ));
