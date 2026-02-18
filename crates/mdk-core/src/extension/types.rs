@@ -41,7 +41,7 @@ pub(crate) struct TlsNostrGroupDataExtension {
     pub nostr_group_id: [u8; 32],
     pub name: Vec<u8>,
     pub description: Vec<u8>,
-    pub admin_pubkeys: Vec<Vec<u8>>,
+    pub admin_pubkeys: Vec<[u8; 32]>,
     pub relays: Vec<Vec<u8>>,
     pub image_hash: Vec<u8>,       // Use Vec<u8> to allow empty for None
     pub image_key: Vec<u8>,        // Use Vec<u8> to allow empty for None
@@ -185,8 +185,7 @@ impl NostrGroupDataExtension {
 
         let mut admins = BTreeSet::new();
         for admin in raw.admin_pubkeys {
-            let bytes = hex::decode(&admin)?;
-            let pk = PublicKey::from_slice(&bytes)?;
+            let pk = PublicKey::from_byte_array(admin);
             admins.insert(pk);
         }
 
@@ -526,11 +525,7 @@ impl NostrGroupDataExtension {
             nostr_group_id: self.nostr_group_id,
             name: self.name.as_bytes().to_vec(),
             description: self.description.as_bytes().to_vec(),
-            admin_pubkeys: self
-                .admins
-                .iter()
-                .map(|pk| pk.to_hex().into_bytes())
-                .collect(),
+            admin_pubkeys: self.admins.iter().map(|pk| *pk.as_bytes()).collect(),
             relays: self
                 .relays
                 .iter()
@@ -847,7 +842,7 @@ mod tests {
             nostr_group_id: [0u8; 32],
             name: b"Test".to_vec(),
             description: b"Desc".to_vec(),
-            admin_pubkeys: vec![pk1.to_hex().into_bytes()],
+            admin_pubkeys: vec![*pk1.as_bytes()],
             relays: vec![relay1.to_string().into_bytes()],
             image_hash: Vec::new(),
             image_key: Vec::new(),
@@ -867,7 +862,7 @@ mod tests {
             nostr_group_id: [0u8; 32],
             name: b"Test".to_vec(),
             description: b"Desc".to_vec(),
-            admin_pubkeys: vec![pk1.to_hex().into_bytes()],
+            admin_pubkeys: vec![*pk1.as_bytes()],
             relays: vec![relay1.to_string().into_bytes()],
             image_hash: Vec::new(),
             image_key: Vec::new(),
@@ -885,7 +880,7 @@ mod tests {
             nostr_group_id: [0u8; 32],
             name: b"Test".to_vec(),
             description: b"Desc".to_vec(),
-            admin_pubkeys: vec![pk1.to_hex().into_bytes()],
+            admin_pubkeys: vec![*pk1.as_bytes()],
             relays: vec![relay1.to_string().into_bytes()],
             image_hash: Vec::new(),
             image_key: Vec::new(),
