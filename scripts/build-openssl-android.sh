@@ -27,23 +27,27 @@ if [ -z "${NDK_HOME:-}" ]; then
     exit 1
 fi
 
-# Map ABI to OpenSSL target
+# Map ABI to OpenSSL target and NDK clang triple
 case "$ABI" in
     arm64-v8a)
         OPENSSL_TARGET="android-arm64"
         ANDROID_API=21
+        CLANG_TRIPLE="aarch64-linux-android"
         ;;
     armeabi-v7a)
         OPENSSL_TARGET="android-arm"
         ANDROID_API=21
+        CLANG_TRIPLE="armv7a-linux-androideabi"
         ;;
     x86_64)
         OPENSSL_TARGET="android-x86_64"
         ANDROID_API=21
+        CLANG_TRIPLE="x86_64-linux-android"
         ;;
     x86)
         OPENSSL_TARGET="android-x86"
         ANDROID_API=21
+        CLANG_TRIPLE="i686-linux-android"
         ;;
     *)
         echo "Error: Unknown ABI: $ABI"
@@ -70,6 +74,13 @@ esac
 TOOLCHAIN="${NDK_HOME}/toolchains/llvm/prebuilt/${NDK_HOST}"
 export PATH="${TOOLCHAIN}/bin:$PATH"
 export ANDROID_NDK_ROOT="${NDK_HOME}"
+
+# NDK r23+ removed standalone GCC toolchains. OpenSSL's android-* targets
+# look for <triple>-gcc by default, so we explicitly set CC/AR/RANLIB to
+# point at the LLVM/Clang equivalents shipped with modern NDKs.
+export CC="${CLANG_TRIPLE}${ANDROID_API}-clang"
+export AR="llvm-ar"
+export RANLIB="llvm-ranlib"
 
 # Create temporary build directory
 BUILD_DIR=$(mktemp -d)
