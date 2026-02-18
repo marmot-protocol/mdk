@@ -713,7 +713,7 @@ impl MdkSqliteStorage {
         let mut stmt = conn
             .prepare(
                 "SELECT mls_group_id, nostr_group_id, name, description, admin_pubkeys,
-                        last_message_id, last_message_at, epoch, state,
+                        last_message_id, last_message_at, last_message_processed_at, epoch, state,
                         image_hash, image_key, image_nonce, last_self_update_at
                  FROM groups WHERE mls_group_id = ?",
             )
@@ -732,16 +732,18 @@ impl MdkSqliteStorage {
                 row.get(5).map_err(|e| Error::Database(e.to_string()))?;
             let last_message_at: Option<i64> =
                 row.get(6).map_err(|e| Error::Database(e.to_string()))?;
-            let epoch: i64 = row.get(7).map_err(|e| Error::Database(e.to_string()))?;
-            let state: String = row.get(8).map_err(|e| Error::Database(e.to_string()))?;
+            let last_message_processed_at: Option<i64> =
+                row.get(7).map_err(|e| Error::Database(e.to_string()))?;
+            let epoch: i64 = row.get(8).map_err(|e| Error::Database(e.to_string()))?;
+            let state: String = row.get(9).map_err(|e| Error::Database(e.to_string()))?;
             let image_hash: Option<Vec<u8>> =
-                row.get(9).map_err(|e| Error::Database(e.to_string()))?;
-            let image_key: Option<Vec<u8>> =
                 row.get(10).map_err(|e| Error::Database(e.to_string()))?;
-            let image_nonce: Option<Vec<u8>> =
+            let image_key: Option<Vec<u8>> =
                 row.get(11).map_err(|e| Error::Database(e.to_string()))?;
-            let last_self_update_at: Option<i64> =
+            let image_nonce: Option<Vec<u8>> =
                 row.get(12).map_err(|e| Error::Database(e.to_string()))?;
+            let last_self_update_at: Option<i64> =
+                row.get(13).map_err(|e| Error::Database(e.to_string()))?;
 
             let row_key =
                 serde_json::to_vec(&mls_group_id).map_err(|e| Error::Database(e.to_string()))?;
@@ -752,6 +754,7 @@ impl MdkSqliteStorage {
                 &admin_pubkeys,
                 &last_message_id,
                 &last_message_at,
+                &last_message_processed_at,
                 epoch,
                 &state,
                 &image_hash,
@@ -995,6 +998,7 @@ impl MdkSqliteStorage {
                     admin_pubkeys,
                     last_message_id,
                     last_message_at,
+                    last_message_processed_at,
                     epoch,
                     state,
                     image_hash,
@@ -1008,6 +1012,7 @@ impl MdkSqliteStorage {
                     String,
                     Option<Vec<u8>>,
                     Option<i64>,
+                    Option<i64>,
                     i64,
                     String,
                     Option<Vec<u8>>,
@@ -1017,9 +1022,9 @@ impl MdkSqliteStorage {
                 ) = serde_json::from_slice(row_data).map_err(|e| Error::Database(e.to_string()))?;
                 conn.execute(
                     "INSERT INTO groups (mls_group_id, nostr_group_id, name, description, admin_pubkeys,
-                                        last_message_id, last_message_at, epoch, state,
+                                        last_message_id, last_message_at, last_message_processed_at, epoch, state,
                                         image_hash, image_key, image_nonce, last_self_update_at)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     rusqlite::params![
                         mls_group_id,
                         nostr_group_id,
@@ -1028,6 +1033,7 @@ impl MdkSqliteStorage {
                         admin_pubkeys,
                         last_message_id,
                         last_message_at,
+                        last_message_processed_at,
                         epoch,
                         state,
                         image_hash,
