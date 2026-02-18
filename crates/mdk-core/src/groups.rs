@@ -413,7 +413,7 @@ where
     ///
     /// A group needs a self-update if:
     /// - `self_update_state` is `SelfUpdateState::Required` (post-join requirement, MIP-02), or
-    /// - `self_update_state` is `SelfUpdateState::CompletedAt(ts)` and `ts` is older than `threshold_secs` (periodic rotation, MIP-00)
+    /// - `self_update_state` is `SelfUpdateState::CompletedAt` and the timestamp is older than `threshold_secs` (periodic rotation, MIP-00)
     ///
     /// # Arguments
     /// * `threshold_secs` - Maximum age in seconds before a group's key rotation is considered stale
@@ -1097,7 +1097,7 @@ where
             image_hash: config.image_hash,
             image_key: config.image_key.map(mdk_storage_traits::Secret::new),
             image_nonce: config.image_nonce.map(mdk_storage_traits::Secret::new),
-            self_update_state: group_types::SelfUpdateState::NotRequired,
+            self_update_state: group_types::SelfUpdateState::CompletedAt(Timestamp::now()),
         };
 
         self.storage().save_group(group.clone()).map_err(
@@ -1317,7 +1317,7 @@ where
         // If this was actually a self-update commit, record the timestamp.
         // This correctly handles:
         // - Post-join self-updates (transitions Required → CompletedAt)
-        // - Creator self-updates (transitions None → CompletedAt for rotation tracking)
+        // - Periodic rotation self-updates (updates CompletedAt timestamp)
         // - Non-self-update commits (leaves self_update_state untouched)
         if is_self_update {
             let mut group = self.get_group(group_id)?.ok_or(Error::GroupNotFound)?;

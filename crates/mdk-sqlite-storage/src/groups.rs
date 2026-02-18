@@ -119,10 +119,9 @@ impl GroupStorage for MdkSqliteStorage {
             .as_ref()
             .map(|ts| ts.as_secs());
 
-        let last_self_update_at: Option<u64> = match group.self_update_state {
-            SelfUpdateState::NotRequired => None,
-            SelfUpdateState::Required => Some(0),
-            SelfUpdateState::CompletedAt(ts) => Some(ts.as_secs()),
+        let last_self_update_at: u64 = match group.self_update_state {
+            SelfUpdateState::Required => 0,
+            SelfUpdateState::CompletedAt(ts) => ts.as_secs(),
         };
 
         self.with_connection(|conn| {
@@ -426,7 +425,7 @@ mod tests {
             image_hash,
             image_key,
             image_nonce,
-            self_update_state: SelfUpdateState::NotRequired,
+            self_update_state: SelfUpdateState::Required,
         };
 
         // Save the group
@@ -474,7 +473,7 @@ mod tests {
             image_hash: None,
             image_key: None,
             image_nonce: None,
-            self_update_state: SelfUpdateState::NotRequired,
+            self_update_state: SelfUpdateState::Required,
         };
 
         // Should fail due to name length
@@ -510,7 +509,7 @@ mod tests {
             image_hash: None,
             image_key: None,
             image_nonce: None,
-            self_update_state: SelfUpdateState::NotRequired,
+            self_update_state: SelfUpdateState::Required,
         };
 
         // Should fail due to description length
@@ -549,7 +548,7 @@ mod tests {
             image_hash: None,
             image_key: None,
             image_nonce: None,
-            self_update_state: SelfUpdateState::NotRequired,
+            self_update_state: SelfUpdateState::Required,
         };
 
         storage.save_group(group).unwrap();
@@ -680,7 +679,7 @@ mod tests {
             image_hash: None,
             image_key: None,
             image_nonce: None,
-            self_update_state: SelfUpdateState::NotRequired,
+            self_update_state: SelfUpdateState::Required,
         };
 
         // Save the group
@@ -767,7 +766,7 @@ mod tests {
             image_hash: None,
             image_key: None,
             image_nonce: None,
-            self_update_state: SelfUpdateState::NotRequired,
+            self_update_state: SelfUpdateState::Required,
         };
         storage.save_group(group1).unwrap();
 
@@ -787,7 +786,7 @@ mod tests {
             image_hash: None,
             image_key: None,
             image_nonce: None,
-            self_update_state: SelfUpdateState::NotRequired,
+            self_update_state: SelfUpdateState::Required,
         };
         storage.save_group(group2).unwrap();
 

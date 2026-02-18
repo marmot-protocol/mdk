@@ -126,7 +126,7 @@ fn create_test_group_for_cross_storage(mls_group_id: &GroupId, nostr_group_id: [
         image_hash: None,
         image_key: None,
         image_nonce: None,
-        self_update_state: SelfUpdateState::NotRequired,
+        self_update_state: SelfUpdateState::Required,
     }
 }
 

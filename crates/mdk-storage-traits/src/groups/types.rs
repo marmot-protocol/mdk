@@ -14,18 +14,17 @@ use super::error::GroupError;
 /// Tracks whether and when a self-update (key rotation) is needed or was
 /// last performed for this group.
 ///
-/// - `NotRequired`: No self-update obligation (e.g., group creator before
-///   first rotation threshold). Maps to `NULL` in storage.
 /// - `Required`: The member must perform a self-update (e.g., after joining
 ///   via welcome per MIP-02). Maps to `0` in storage.
-/// - `CompletedAt(Timestamp)`: The last self-update was merged at this time.
-///   Used for periodic rotation staleness checks (MIP-00). Maps to a
-///   non-zero timestamp in storage.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+/// - `CompletedAt(Timestamp)`: The last self-update (or group creation) was
+///   at this time. Used for periodic rotation staleness checks (MIP-00).
+///   Maps to a non-zero timestamp in storage.
+///
+/// Every group always has a self-update state — group creators start with
+/// `CompletedAt(now)` since creating a group with a fresh key is effectively
+/// the first rotation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum SelfUpdateState {
-    /// No self-update obligation.
-    #[default]
-    NotRequired,
     /// A self-update is required (post-join obligation per MIP-02).
     Required,
     /// The last self-update was successfully merged at this timestamp.
@@ -38,9 +37,8 @@ impl Serialize for SelfUpdateState {
         S: Serializer,
     {
         match self {
-            Self::NotRequired => serializer.serialize_none(),
-            Self::Required => serializer.serialize_some(&0u64),
-            Self::CompletedAt(ts) => serializer.serialize_some(&ts.as_secs()),
+            Self::Required => serializer.serialize_u64(0),
+            Self::CompletedAt(ts) => serializer.serialize_u64(ts.as_secs()),
         }
     }
 }
@@ -50,11 +48,10 @@ impl<'de> Deserialize<'de> for SelfUpdateState {
     where
         D: Deserializer<'de>,
     {
-        let opt: Option<u64> = Option::deserialize(deserializer)?;
-        match opt {
-            None => Ok(Self::NotRequired),
-            Some(0) => Ok(Self::Required),
-            Some(secs) => Ok(Self::CompletedAt(Timestamp::from_secs(secs))),
+        let secs: u64 = u64::deserialize(deserializer)?;
+        match secs {
+            0 => Ok(Self::Required),
+            _ => Ok(Self::CompletedAt(Timestamp::from_secs(secs))),
         }
     }
 }
@@ -159,7 +156,6 @@ pub struct Group {
     /// Self-update (key rotation) tracking state.
     ///
     /// See [`SelfUpdateState`] for the possible values and their meanings.
-    #[serde(default)]
     pub self_update_state: SelfUpdateState,
 }
 
@@ -252,7 +248,7 @@ mod tests {
             last_message_processed_at: None,
             epoch: 0,
             state: GroupState::Active,
-            self_update_state: SelfUpdateState::NotRequired,
+            self_update_state: SelfUpdateState::Required,
         }
     }
 
@@ -442,7 +438,7 @@ mod tests {
             last_message_processed_at: None,
             epoch: 0,
             state: GroupState::Active,
-            self_update_state: SelfUpdateState::NotRequired,
+            self_update_state: SelfUpdateState::Required,
         };
 
         let serialized = serde_json::to_value(&group).unwrap();
@@ -505,12 +501,6 @@ mod tests {
 
     #[test]
     fn test_self_update_state_serde_roundtrip() {
-        // NotRequired serializes to null
-        let val = serde_json::to_value(SelfUpdateState::NotRequired).unwrap();
-        assert_eq!(val, serde_json::Value::Null);
-        let rt: SelfUpdateState = serde_json::from_value(val).unwrap();
-        assert_eq!(rt, SelfUpdateState::NotRequired);
-
         // Required serializes to 0
         let val = serde_json::to_value(SelfUpdateState::Required).unwrap();
         assert_eq!(val, json!(0));
@@ -523,18 +513,5 @@ mod tests {
         assert_eq!(val, json!(1_700_000_000));
         let rt: SelfUpdateState = serde_json::from_value(val).unwrap();
         assert_eq!(rt, SelfUpdateState::CompletedAt(ts));
-    }
-
-    #[test]
-    fn test_group_missing_self_update_state_defaults_to_not_required() {
-        // A Group JSON missing self_update_state should deserialize with
-        // SelfUpdateState::NotRequired due to #[serde(default)]
-        let group = make_test_group();
-        let mut val = serde_json::to_value(&group).unwrap();
-
-        // Remove the field entirely
-        val.as_object_mut().unwrap().remove("self_update_state");
-        let deserialized: Group = serde_json::from_value(val).unwrap();
-        assert_eq!(deserialized.self_update_state, SelfUpdateState::NotRequired);
     }
 }

@@ -762,8 +762,10 @@ where
     group_d.state = GroupState::Inactive;
     storage.save_group(group_d.clone()).unwrap();
 
-    // Group E: None (creator, no obligation)
-    let group_e = create_test_group(GroupId::from_slice(&[1, 2, 3, 34]));
+    // Group E: CompletedAt(now) (creator, fresh — no rotation needed yet)
+    let mut group_e = create_test_group(GroupId::from_slice(&[1, 2, 3, 34]));
+    group_e.self_update_state =
+        SelfUpdateState::CompletedAt(Timestamp::from_secs(now.saturating_sub(1)));
     storage.save_group(group_e.clone()).unwrap();
 
     // Threshold = 60 seconds: should return A (Required) and B (stale)
@@ -786,7 +788,7 @@ where
     );
     assert!(
         !needing.contains(&group_e.mls_group_id),
-        "Group E should NOT be included (no obligation)"
+        "Group E should NOT need self-update (created 1s ago < 60s threshold)"
     );
     assert_eq!(needing.len(), 2);
 }

@@ -742,7 +742,7 @@ impl MdkSqliteStorage {
                 row.get(11).map_err(|e| Error::Database(e.to_string()))?;
             let image_nonce: Option<Vec<u8>> =
                 row.get(12).map_err(|e| Error::Database(e.to_string()))?;
-            let last_self_update_at: Option<i64> =
+            let last_self_update_at: i64 =
                 row.get(13).map_err(|e| Error::Database(e.to_string()))?;
 
             let row_key =
@@ -1018,7 +1018,7 @@ impl MdkSqliteStorage {
                     Option<Vec<u8>>,
                     Option<Vec<u8>>,
                     Option<Vec<u8>>,
-                    Option<i64>,
+                    i64,
                 ) = serde_json::from_slice(row_data).map_err(|e| Error::Database(e.to_string()))?;
                 conn.execute(
                     "INSERT INTO groups (mls_group_id, nostr_group_id, name, description, admin_pubkeys,
@@ -2031,7 +2031,7 @@ mod tests {
             image_hash: None,
             image_key: None,
             image_nonce: None,
-            self_update_state: SelfUpdateState::NotRequired,
+            self_update_state: SelfUpdateState::Required,
         };
 
         // Save the group
@@ -2246,7 +2246,7 @@ mod tests {
                     image_hash: None,
                     image_key: None,
                     image_nonce: None,
-                    self_update_state: SelfUpdateState::NotRequired,
+                    self_update_state: SelfUpdateState::Required,
                 };
 
                 storage.save_group(group).unwrap();
@@ -2414,7 +2414,7 @@ mod tests {
                     image_hash: None,
                     image_key: None,
                     image_nonce: None,
-                    self_update_state: SelfUpdateState::NotRequired,
+                    self_update_state: SelfUpdateState::Required,
                 };
                 storage.save_group(group).unwrap();
 
@@ -3289,7 +3289,7 @@ mod tests {
                 image_hash: None,
                 image_key: None,
                 image_nonce: None,
-                self_update_state: SelfUpdateState::NotRequired,
+                self_update_state: SelfUpdateState::Required,
             }
         }
 
@@ -3627,7 +3627,7 @@ mod tests {
                 image_hash: None,
                 image_key: None,
                 image_nonce: None,
-                self_update_state: SelfUpdateState::NotRequired,
+                self_update_state: SelfUpdateState::Required,
             };
             storage.save_group(group).unwrap();
 
@@ -3682,7 +3682,7 @@ mod tests {
                 image_hash: None,
                 image_key: None,
                 image_nonce: None,
-                self_update_state: SelfUpdateState::NotRequired,
+                self_update_state: SelfUpdateState::Required,
             };
             let g2 = Group {
                 mls_group_id: group2.clone(),
@@ -3731,7 +3731,7 @@ mod tests {
                 image_hash: None,
                 image_key: None,
                 image_nonce: None,
-                self_update_state: SelfUpdateState::NotRequired,
+                self_update_state: SelfUpdateState::Required,
             };
             storage.save_group(group).unwrap();
 
@@ -3777,7 +3777,7 @@ mod tests {
                 image_hash: None,
                 image_key: None,
                 image_nonce: None,
-                self_update_state: SelfUpdateState::NotRequired,
+                self_update_state: SelfUpdateState::Required,
             };
             storage.save_group(group).unwrap();
 
@@ -3821,7 +3821,7 @@ mod tests {
                 image_hash: None,
                 image_key: None,
                 image_nonce: None,
-                self_update_state: SelfUpdateState::NotRequired,
+                self_update_state: SelfUpdateState::Required,
             };
             storage.save_group(group).unwrap();
 
@@ -3886,7 +3886,7 @@ mod tests {
                 image_hash: None,
                 image_key: None,
                 image_nonce: None,
-                self_update_state: SelfUpdateState::NotRequired,
+                self_update_state: SelfUpdateState::Required,
             }
         }
 

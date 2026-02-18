@@ -51,7 +51,7 @@ pub mod cross_storage {
             image_hash: None,
             image_key: None,
             image_nonce: None,
-            self_update_state: SelfUpdateState::NotRequired,
+            self_update_state: SelfUpdateState::Required,
         }
     }
 

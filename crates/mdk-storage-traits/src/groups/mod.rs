@@ -237,8 +237,6 @@ pub trait GroupStorage {
     /// `self_update_state` is [`SelfUpdateState::Required`] (post-join
     /// requirement per MIP-02) or because the last self-update is older than
     /// `threshold_secs` seconds ago (periodic rotation per MIP-00).
-    ///
-    /// Groups with [`SelfUpdateState::NotRequired`] are NOT included.
     fn groups_needing_self_update(&self, threshold_secs: u64) -> Result<Vec<GroupId>, GroupError> {
         let now = Timestamp::now().as_secs();
         let groups = self.all_groups()?;
@@ -249,7 +247,6 @@ pub trait GroupStorage {
                     return false;
                 }
                 match g.self_update_state {
-                    types::SelfUpdateState::NotRequired => false,
                     types::SelfUpdateState::Required => true,
                     types::SelfUpdateState::CompletedAt(ts) => {
                         now.saturating_sub(ts.as_secs()) >= threshold_secs

@@ -381,7 +381,7 @@ mod tests {
             image_hash: None,
             image_key: None,
             image_nonce: None,
-            self_update_state: SelfUpdateState::NotRequired,
+            self_update_state: SelfUpdateState::Required,
         };
 
         // Save the group
@@ -494,7 +494,7 @@ mod tests {
             image_hash: None,
             image_key: None,
             image_nonce: None,
-            self_update_state: SelfUpdateState::NotRequired,
+            self_update_state: SelfUpdateState::Required,
         };
         storage.save_group(group).unwrap();
 
@@ -557,7 +557,7 @@ mod tests {
             image_hash: None,
             image_key: None,
             image_nonce: None,
-            self_update_state: SelfUpdateState::NotRequired,
+            self_update_state: SelfUpdateState::Required,
         };
 
         let group_2 = Group {
@@ -574,7 +574,7 @@ mod tests {
             image_hash: None,
             image_key: None,
             image_nonce: None,
-            self_update_state: SelfUpdateState::NotRequired,
+            self_update_state: SelfUpdateState::Required,
         };
 
         storage.save_group(group_1).unwrap();
@@ -783,7 +783,7 @@ mod tests {
             image_hash: None,
             image_key: None,
             image_nonce: None,
-            self_update_state: SelfUpdateState::NotRequired,
+            self_update_state: SelfUpdateState::Required,
         };
         storage.save_group(group).unwrap();
 

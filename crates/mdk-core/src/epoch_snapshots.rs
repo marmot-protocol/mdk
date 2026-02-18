@@ -650,7 +650,7 @@ mod tests {
             image_key: None,
             image_nonce: None,
             state: GroupState::Active,
-            self_update_state: SelfUpdateState::NotRequired,
+            self_update_state: SelfUpdateState::Required,
         };
         storage.save_group(group).unwrap();
 
@@ -692,7 +692,7 @@ mod tests {
             image_key: None,
             image_nonce: None,
             state: GroupState::Active,
-            self_update_state: SelfUpdateState::NotRequired,
+            self_update_state: SelfUpdateState::Required,
         };
         storage.save_group(group).unwrap();
 
@@ -841,7 +841,7 @@ mod tests {
             image_key: None,
             image_nonce: None,
             state: GroupState::Active,
-            self_update_state: SelfUpdateState::NotRequired,
+            self_update_state: SelfUpdateState::Required,
         };
         storage.save_group(group).unwrap();
 
@@ -943,7 +943,7 @@ mod tests {
             image_key: None,
             image_nonce: None,
             state: GroupState::Active,
-            self_update_state: SelfUpdateState::NotRequired,
+            self_update_state: SelfUpdateState::Required,
         };
         storage.save_group(group).unwrap();
 

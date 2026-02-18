@@ -243,7 +243,7 @@ where
                 .epoch()
                 .as_u64(),
             state: group_types::GroupState::Pending,
-            self_update_state: group_types::SelfUpdateState::NotRequired,
+            self_update_state: group_types::SelfUpdateState::Required,
         };
 
         let mls_group_id = group.mls_group_id.clone();
