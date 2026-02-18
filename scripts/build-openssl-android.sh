@@ -72,8 +72,41 @@ esac
 
 # Set up paths
 TOOLCHAIN="${NDK_HOME}/toolchains/llvm/prebuilt/${NDK_HOST}"
-export PATH="${TOOLCHAIN}/bin:$PATH"
 export ANDROID_NDK_ROOT="${NDK_HOME}"
+
+# OpenSSL's android-* Configure targets detect the compiler by running
+# `which clang` and checking that the result lives inside $ANDROID_NDK_ROOT.
+# If a system clang (e.g. /usr/bin/clang) appears on $PATH before the NDK
+# toolchain, the check fails and Configure falls back to looking for the
+# long-removed <triple>-gcc.  Guard against this by putting the NDK
+# toolchain directory at the very front of PATH *and* verifying the
+# resolution before proceeding.
+export PATH="${TOOLCHAIN}/bin:${PATH}"
+
+NDK_CLANG="${TOOLCHAIN}/bin/clang"
+if [ ! -x "${NDK_CLANG}" ]; then
+    echo "Error: NDK clang not found at ${NDK_CLANG}"
+    exit 1
+fi
+
+RESOLVED_CLANG=$(which clang 2>/dev/null || true)
+if [ "${RESOLVED_CLANG}" != "${NDK_CLANG}" ]; then
+    echo "Warning: 'which clang' resolves to ${RESOLVED_CLANG}, not ${NDK_CLANG}"
+    echo "  Overriding PATH to ensure NDK clang is found first"
+    # Re-build PATH with the NDK toolchain directory first, stripping any
+    # earlier directories that also contain a clang binary.
+    _NEW_PATH="${TOOLCHAIN}/bin"
+    IFS=':' read -ra _DIRS <<< "${PATH}"
+    for _dir in "${_DIRS[@]}"; do
+        [ "${_dir}" = "${TOOLCHAIN}/bin" ] && continue
+        if [ -x "${_dir}/clang" ]; then
+            echo "  Removing ${_dir} from PATH (contains non-NDK clang)"
+            continue
+        fi
+        _NEW_PATH="${_NEW_PATH}:${_dir}"
+    done
+    export PATH="${_NEW_PATH}"
+fi
 
 # NDK r23+ removed standalone GCC toolchains. OpenSSL's android-* targets
 # look for <triple>-gcc by default, so we explicitly set CC/AR/RANLIB to
