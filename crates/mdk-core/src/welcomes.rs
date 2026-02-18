@@ -137,6 +137,13 @@ where
                         has_event_ref = true;
                     }
                 }
+                TagKind::Client => {
+                    // Client tag is optional, but if present its value must be non-empty
+                    match tag.content() {
+                        Some(value) if !value.is_empty() => {}
+                        _ => return Err(Error::InvalidWelcomeMessage),
+                    }
+                }
                 TagKind::Custom(name) if name.as_ref() == "encoding" => {
                     // Validate encoding value is "base64"
                     if let Some(encoding_value) = tag.content() {
@@ -621,18 +628,21 @@ mod tests {
                 "Event reference tag must have content (KeyPackage event ID)"
             );
 
-            // 6. Verify third tag is client tag
-            let client_tag = tags_vec[2];
-            assert_eq!(
-                client_tag.kind(),
-                TagKind::Client,
-                "Third tag must be 'client' tag"
-            );
-
-            // Verify client tag has content (MDK version)
+            // 6. Verify encoding tag is present with valid value
+            let encoding_tag = tags_vec
+                .iter()
+                .find(|t| matches!(t.kind(), TagKind::Custom(name) if name.as_ref() == "encoding"))
+                .expect("Welcome event must have an 'encoding' tag");
+            let encoding_value = encoding_tag
+                .content()
+                .expect("Encoding tag must have a value");
             assert!(
-                client_tag.content().is_some(),
-                "Client tag should contain MDK version"
+                !encoding_value.is_empty(),
+                "Encoding tag value must be non-empty"
+            );
+            assert_eq!(
+                encoding_value, "base64",
+                "Encoding tag value must be 'base64'"
             );
 
             // 7. Verify event is unsigned (UnsignedEvent - no sig field when serialized)
@@ -716,7 +726,7 @@ mod tests {
         let mut tags4 = nostr::Tags::new();
         tags4.push(nostr::Tag::relays(vec![])); // Empty relays
         tags4.push(nostr::Tag::event(EventId::all_zeros()));
-        tags4.push(nostr::Tag::parse(&["encoding".to_string(), "hex".to_string()]).unwrap());
+        tags4.push(nostr::Tag::parse(&["encoding".to_string(), "base64".to_string()]).unwrap());
 
         let empty_relays_event = UnsignedEvent {
             id: None,
@@ -736,7 +746,7 @@ mod tests {
             nostr::Tag::parse(&["relays".to_string(), "http://invalid.com".to_string()]).unwrap(),
         ); // Invalid protocol
         tags5.push(nostr::Tag::event(EventId::all_zeros()));
-        tags5.push(nostr::Tag::parse(&["encoding".to_string(), "hex".to_string()]).unwrap());
+        tags5.push(nostr::Tag::parse(&["encoding".to_string(), "base64".to_string()]).unwrap());
 
         let invalid_relay_url_event = UnsignedEvent {
             id: None,
@@ -754,7 +764,7 @@ mod tests {
         let mut tags6 = nostr::Tags::new();
         tags6.push(nostr::Tag::parse(&["relays".to_string(), "wss://".to_string()]).unwrap()); // No host after protocol
         tags6.push(nostr::Tag::event(EventId::all_zeros()));
-        tags6.push(nostr::Tag::parse(&["encoding".to_string(), "hex".to_string()]).unwrap());
+        tags6.push(nostr::Tag::parse(&["encoding".to_string(), "base64".to_string()]).unwrap());
 
         let incomplete_relay_url_event = UnsignedEvent {
             id: None,
@@ -774,7 +784,7 @@ mod tests {
             RelayUrl::parse("wss://relay.example.com").unwrap(),
         ]));
         tags7.push(nostr::Tag::parse(&["e".to_string(), "".to_string()]).unwrap()); // Empty event ID
-        tags7.push(nostr::Tag::parse(&["encoding".to_string(), "hex".to_string()]).unwrap());
+        tags7.push(nostr::Tag::parse(&["encoding".to_string(), "base64".to_string()]).unwrap());
 
         let empty_e_tag_event = UnsignedEvent {
             id: None,
@@ -806,6 +816,30 @@ mod tests {
         };
         let result = mdk.process_welcome(&wrapper_event_id, &invalid_encoding_event);
         assert!(result.is_err(), "Should reject invalid encoding value");
+        assert!(matches!(result.unwrap_err(), Error::InvalidWelcomeMessage));
+
+        // Test 9: Empty client tag content (client is optional but must be non-empty if present)
+        let mut tags9 = nostr::Tags::new();
+        tags9.push(nostr::Tag::relays(vec![
+            RelayUrl::parse("wss://relay.example.com").unwrap(),
+        ]));
+        tags9.push(nostr::Tag::event(EventId::all_zeros()));
+        tags9.push(nostr::Tag::parse(&["client".to_string(), "".to_string()]).unwrap()); // Empty client
+        tags9.push(nostr::Tag::parse(&["encoding".to_string(), "base64".to_string()]).unwrap());
+
+        let empty_client_tag_event = UnsignedEvent {
+            id: None,
+            pubkey: Keys::generate().public_key(),
+            created_at: Timestamp::now(),
+            kind: Kind::MlsWelcome,
+            tags: tags9,
+            content: "test".to_string(),
+        };
+        let result = mdk.process_welcome(&wrapper_event_id, &empty_client_tag_event);
+        assert!(
+            result.is_err(),
+            "Should reject empty client tag content when present"
+        );
         assert!(matches!(result.unwrap_err(), Error::InvalidWelcomeMessage));
     }
 
