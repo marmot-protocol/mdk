@@ -25,7 +25,7 @@
 
 ### Fixed
 
-- **Welcome validation no longer requires `client` tag**: The `validate_welcome_event` function now correctly treats the `client` tag as optional per MIP-02. Previously, welcome events without a `client` tag were rejected, which would cause spec-compliant third-party implementations to be unable to send Welcome events to MDK-based clients.
+- **Welcome validation no longer requires `client` tag**: The `validate_welcome_event` function now correctly treats the `client` tag as optional per MIP-02. Previously, welcome events without a `client` tag were rejected, which would cause spec-compliant third-party implementations to be unable to send Welcome events to MDK-based clients. ([#186](https://github.com/marmot-protocol/mdk/pull/186))
 
 ### Breaking changes
 
