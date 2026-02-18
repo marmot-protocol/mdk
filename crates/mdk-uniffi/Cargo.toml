@@ -1,6 +1,6 @@
 [package]
 name = "mdk-uniffi"
-version = "0.5.2"
+version = "0.6.0"
 edition = "2024"
 description = "UniFFI bindings for mdk-core with SQLite storage"
 authors = [
@@ -14,6 +14,9 @@ repository.workspace = true
 license.workspace = true
 rust-version = "1.90.0"
 keywords = ["nostr", "mls", "openmls", "uniffi", "bindings"]
+categories = ["cryptography", "api-bindings"]
+readme = "README.md"
+publish = false
 
 [lib]
 name = "mdk_uniffi"

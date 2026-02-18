@@ -23,14 +23,19 @@
 
 ## Unreleased
 
-### Added
+### Breaking changes
 
-- **Self-update tracking**: `accept_welcome()` now sets `self_update_state` to `SelfUpdateState::Required` on the joined group (MIP-02 post-join obligation). `merge_pending_commit()` detects pure self-update commits and transitions the state to `SelfUpdateState::CompletedAt(now)`, recording the rotation timestamp for MIP-00 periodic staleness checks. `create_group()` initializes the state to `SelfUpdateState::NotRequired` (creator has no immediate obligation). ([#184](https://github.com/marmot-protocol/mdk/pull/184))
-- **`groups_needing_self_update()` method**: Returns group IDs of active groups that need a self-update, either because the state is `Required` or because the last rotation is older than a configurable threshold. ([#184](https://github.com/marmot-protocol/mdk/pull/184))
+### Changed
+
+### Added
 
 ### Fixed
 
-- **Welcome validation no longer requires `client` tag**: The `validate_welcome_event` function now correctly treats the `client` tag as optional per MIP-02. Previously, welcome events without a `client` tag were rejected, which would cause spec-compliant third-party implementations to be unable to send Welcome events to MDK-based clients. ([#186](https://github.com/marmot-protocol/mdk/pull/186))
+### Removed
+
+### Deprecated
+
+## [0.6.0] - 2026-02-18
 
 ### Breaking changes
 
@@ -41,45 +46,7 @@
 - **`create_key_package_for_event` Return Type Change**: The return type changed from `(String, [Tag; 7])` to `(String, Vec<Tag>)`. Most code patterns (iteration, indexing) continue to work unchanged. This change was necessary because the protected tag is now optional. ([#173](https://github.com/marmot-protocol/mdk/pull/173), related: [#168](https://github.com/marmot-protocol/mdk/issues/168))
 - **`create_key_package_for_event` No Longer Adds Protected Tag**: The `create_key_package_for_event()` function no longer adds the NIP-70 protected tag (`["-"]`) by default. This is a behavioral change - existing code that relied on the protected tag being present will now produce key packages without it. Key packages can now be republished by third parties to any relay. This improves relay compatibility since many popular relays (Damus, Primal, nos.lol) reject protected events outright. For users who need the protected tag, use the new `create_key_package_for_event_with_options()` function with `protected: true`. ([#173](https://github.com/marmot-protocol/mdk/pull/173), related: [#168](https://github.com/marmot-protocol/mdk/issues/168))
 - **OpenMLS 0.8.0 Upgrade**: Upgraded from a git-pinned openmls 0.7.1 to the crates.io openmls 0.8.0 release. This resolves security advisory [GHSA-8x3w-qj7j-gqhf](https://github.com/openmls/openmls/security/advisories/GHSA-8x3w-qj7j-gqhf) (improper tag validation) and moves GREASE support from a git pin to an official release. Companion crates updated: `openmls_traits` 0.5, `openmls_basic_credential` 0.5, `openmls_rust_crypto` 0.5. ([#174](https://github.com/marmot-protocol/mdk/pull/174))
-
-### Changed
-
-- **Welcome processing uses builder API**: Welcome message parsing now uses `StagedWelcome::build_from_welcome` with `replace_old_group()` to handle openmls 0.8.0's `GroupId` uniqueness enforcement. ([#174](https://github.com/marmot-protocol/mdk/pull/174))
-- **Message Processing Timestamps**: Messages now record both `created_at` (from the rumor event, reflecting sender's clock) and `processed_at` (when this client processed the message). This allows clients to choose their preferred ordering strategy - by creation time or by reception time. ([#166](https://github.com/marmot-protocol/mdk/pull/166))
-- **MIP-03 Commit Race Resolution**: Commits are now resolved deterministically based on timestamp (earliest wins) and event ID (lexicographically smallest wins). ([#152](https://github.com/marmot-protocol/mdk/pull/152))
-  - When multiple valid commits are published for the same epoch, clients converge on the same "winning" commit.
-  - If a "better" commit (earlier timestamp) arrives after a "worse" commit has been applied, the client automatically rolls back to the previous epoch and applies the winning commit.
-  - This ensures consistent group state across all clients even with out-of-order message delivery.
-- Upgraded `nostr` dependency from 0.43 to 0.44, replacing deprecated `Timestamp::as_u64()` calls with `Timestamp::as_secs()` ([#162](https://github.com/marmot-protocol/mdk/pull/162))
-
-### Added
-
-- **KeyPackageRef `i` tag for efficient relay queries**: KeyPackage events now include an `i` tag with the hex-encoded `KeyPackageRef` (computed per RFC 9420 Section 5.2). This enables efficient relay queries for specific KeyPackages when processing Welcome messages, avoiding the need to download and decode all KeyPackage events. ([#182](https://github.com/marmot-protocol/mdk/pull/182))
-- **KeyPackage deletion by hash_ref bytes**: Added `delete_key_package_from_storage_by_hash_ref()` to delete a key package using previously serialized hash_ref bytes. This enables delayed key material cleanup workflows where the hash_ref is obtained at creation time (via `create_key_package_for_event`) and used for deletion later. ([#178](https://github.com/marmot-protocol/mdk/pull/178))
-- **Custom Message Sort Order**: `get_messages()` now supports custom sort orders via the `Pagination::sort_order` field. Added `get_last_message(group_id, sort_order)` method to retrieve the most recent message under a given sort order, enabling clients using `ProcessedAtFirst` ordering to get a consistent "last message" value. ([#171](https://github.com/marmot-protocol/mdk/pull/171))
-- **`create_key_package_for_event_with_options`**: New function that allows specifying whether to include the NIP-70 protected tag. Use this if you need to publish to relays that accept protected events. ([#173](https://github.com/marmot-protocol/mdk/pull/173), related: [#168](https://github.com/marmot-protocol/mdk/issues/168))
-- **MIP-04 Epoch Fallback for Media Decryption**: `decrypt_from_download` now resolves the correct decryption key via an O(1) epoch hint lookup instead of only using the current epoch's exporter secret. Added `NoExporterSecretForEpoch` variant to `EncryptedMediaError` for programmatic error matching. ([#167](https://github.com/marmot-protocol/mdk/pull/167))
-- **`PreviouslyFailed` Result Variant**: Added `MessageProcessingResult::PreviouslyFailed` variant to handle cases where a previously failed message arrives again but the MLS group ID cannot be extracted. This prevents crashes in client applications by returning a result instead of throwing an error. ([#165](https://github.com/marmot-protocol/mdk/pull/165), fixes [#154](https://github.com/marmot-protocol/mdk/issues/154), [#159](https://github.com/marmot-protocol/mdk/issues/159))
-- **Message Retry Support**: Implemented better handling for retryable message states. When a message fails processing, it now preserves the `message_event_id` and other context. Added logic to allow reprocessing of messages marked as `Retryable`, with automatic state recovery to `Processed` upon success. ([#161](https://github.com/marmot-protocol/mdk/pull/161))
-- Configurable `out_of_order_tolerance` and `maximum_forward_distance` in `MdkConfig` for MLS sender ratchet settings. Default `out_of_order_tolerance` increased from 5 to 100 for better handling of out-of-order message delivery on Nostr relays. ([`#155`](https://github.com/marmot-protocol/mdk/pull/155))
-- **Epoch Snapshots & Rollback**: Added `EpochSnapshotManager` to maintain historical epoch states for rollback. ([#152](https://github.com/marmot-protocol/mdk/pull/152))
-- **Configuration**: Added `epoch_snapshot_retention` to `MdkConfig` (default: 5) to control how many past epochs are retained for rollback support. ([#152](https://github.com/marmot-protocol/mdk/pull/152))
-- **Rollback Callback**: Added `MdkCallback` trait and `MdkBuilder::with_callback()` to allow applications to react to rollback events (e.g., to refresh UI). ([#152](https://github.com/marmot-protocol/mdk/pull/152))
-
-### Fixed
-
-- **Security dependency updates**: Updated `time` (0.3.44 → 0.3.47), `bytes` (1.11.0 → 1.11.1), and `lru` (0.16.2 → 0.16.3) to resolve Dependabot security advisories. ([#174](https://github.com/marmot-protocol/mdk/pull/174))
-- **Message Ordering Consistency**: Fixed inconsistency where `group.last_message_id` might not match `get_messages()[0].id` due to different sorting logic. The `last_message_id` update logic now uses `created_at DESC, processed_at DESC, id DESC` ordering to match the `messages()` query, ensuring the first message returned is always the same as `last_message_id`. Added `last_message_processed_at` field to `Group` to track this secondary sort key. ([#166](https://github.com/marmot-protocol/mdk/pull/166))
-- **Security**: Prevent `GroupId` leakage in `test_commit_race_simple_better_commit_wins` assertion failure messages to avoid exposing sensitive identifiers in logs. ([#152](https://github.com/marmot-protocol/mdk/pull/152))
-
-### Removed
-
-- **`compute_key_package_hash_ref` removed**: This method is no longer needed now that `create_key_package_for_event` returns the hash_ref directly as its third tuple element. Callers should use the hash_ref from `create_key_package_for_event` instead. ([#178](https://github.com/marmot-protocol/mdk/pull/178))
-
-### Deprecated
-
 - **Unified Storage Architecture**: `MdkProvider` now uses the storage provider directly as the OpenMLS `StorageProvider`, instead of accessing it via `openmls_storage()`. This enables atomic transactions across MLS and MDK state for proper commit race resolution per MIP-03. Storage implementations must now directly implement `StorageProvider<1>`. ([#148](https://github.com/marmot-protocol/mdk/pull/148))
-- **OpenMLS Dependency**: Updated to OpenMLS git main branch (commit b90ca23b) for GREASE support. This may introduce minor API changes from upstream. The dependency will be reverted to crates.io versions once OpenMLS releases a version with GREASE support. ([#142](https://github.com/marmot-protocol/mdk/pull/142))
 - **Legacy Format Removal**: Removed support for legacy key package tag formats and extension formats that were deprecated after EOY 2025 migration period ([#146](https://github.com/marmot-protocol/mdk/pull/146))
   - Key package validation now only accepts MIP-00 compliant formats:
     - `mls_ciphersuite` tag must use hex format (e.g., `0x0001`), numeric (`1`) and string (`MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519`) formats are no longer accepted
@@ -93,9 +60,9 @@
   - Key packages with 64-byte hex-encoded identities are no longer accepted
   - This completes the migration period that began in November 2024
 - **Encrypted Media (MIP-04)**: The `derive_encryption_nonce()` function has been removed. All encrypted media must now include a random nonce in the IMETA tag (`n` field). Legacy media encrypted with deterministic nonces can no longer be decrypted. This is a breaking change to fix the security issue (Audit Issue U) where deterministic nonce derivation caused nonce reuse. ([#114](https://github.com/marmot-protocol/mdk/pull/114))
-- **BREAKING**: Changed `get_messages()` signature to accept `Option<Pagination>` parameter. Callers must now pass `None` for default pagination or `Some(Pagination::new(...))` for custom pagination ([#111](https://github.com/marmot-protocol/mdk/pull/111))
-- **BREAKING**: Changed `get_pending_welcomes()` to accept `Option<Pagination>` parameter for pagination support. Existing calls should pass `None` for default pagination. ([#110](https://github.com/marmot-protocol/mdk/pull/110))
-- Replaced `Error::MissingWelcomeForProcessedWelcome` with `Error::WelcomePreviouslyFailed(String)`. When retrying a welcome that previously failed, the new error includes the original failure reason instead of a generic message. ([#136](https://github.com/marmot-protocol/mdk/pull/136))
+- **`get_messages()` Signature Change**: Changed `get_messages()` signature to accept `Option<Pagination>` parameter. Callers must now pass `None` for default pagination or `Some(Pagination::new(...))` for custom pagination ([#111](https://github.com/marmot-protocol/mdk/pull/111))
+- **`get_pending_welcomes()` Signature Change**: Changed `get_pending_welcomes()` to accept `Option<Pagination>` parameter for pagination support. Existing calls should pass `None` for default pagination. ([#110](https://github.com/marmot-protocol/mdk/pull/110))
+- **Error Variant Rename**: Replaced `Error::MissingWelcomeForProcessedWelcome` with `Error::WelcomePreviouslyFailed(String)`. When retrying a welcome that previously failed, the new error includes the original failure reason instead of a generic message. ([#136](https://github.com/marmot-protocol/mdk/pull/136))
 - **Content Encoding**: Removed support for hex encoding in key package and welcome event content ([#98](https://github.com/marmot-protocol/mdk/pull/98))
   - Key packages and welcome events now require explicit `["encoding", "base64"]` tag
   - Events without encoding tags or with hex encoding are rejected
@@ -110,10 +77,31 @@
 
 ### Changed
 
+- **Welcome processing uses builder API**: Welcome message parsing now uses `StagedWelcome::build_from_welcome` with `replace_old_group()` to handle openmls 0.8.0's `GroupId` uniqueness enforcement. ([#174](https://github.com/marmot-protocol/mdk/pull/174))
+- **Message Processing Timestamps**: Messages now record both `created_at` (from the rumor event, reflecting sender's clock) and `processed_at` (when this client processed the message). This allows clients to choose their preferred ordering strategy - by creation time or by reception time. ([#166](https://github.com/marmot-protocol/mdk/pull/166))
+- **MIP-03 Commit Race Resolution**: Commits are now resolved deterministically based on timestamp (earliest wins) and event ID (lexicographically smallest wins). ([#152](https://github.com/marmot-protocol/mdk/pull/152))
+  - When multiple valid commits are published for the same epoch, clients converge on the same "winning" commit.
+  - If a "better" commit (earlier timestamp) arrives after a "worse" commit has been applied, the client automatically rolls back to the previous epoch and applies the winning commit.
+  - This ensures consistent group state across all clients even with out-of-order message delivery.
+- Upgraded `nostr` dependency from 0.43 to 0.44, replacing deprecated `Timestamp::as_u64()` calls with `Timestamp::as_secs()` ([#162](https://github.com/marmot-protocol/mdk/pull/162))
+- **OpenMLS Dependency**: Updated to OpenMLS git main branch (commit b90ca23b) for GREASE support. This may introduce minor API changes from upstream. The dependency will be reverted to crates.io versions once OpenMLS releases a version with GREASE support. ([#142](https://github.com/marmot-protocol/mdk/pull/142))
 - `create_group()` now supports creating single-member groups (groups with only the creator). This enables "message to self" functionality, setting up groups before inviting members, and multi-device scenarios. When no members are provided, the method returns an empty `welcome_rumors` vec. ([#138](https://github.com/marmot-protocol/mdk/pull/138))
 
 ### Added
 
+- **Self-update tracking**: `accept_welcome()` now sets `self_update_state` to `SelfUpdateState::Required` on the joined group (MIP-02 post-join obligation). `merge_pending_commit()` detects pure self-update commits and transitions the state to `SelfUpdateState::CompletedAt(now)`, recording the rotation timestamp for MIP-00 periodic staleness checks. `create_group()` initializes the state to `SelfUpdateState::NotRequired` (creator has no immediate obligation). ([#184](https://github.com/marmot-protocol/mdk/pull/184))
+- **`groups_needing_self_update()` method**: Returns group IDs of active groups that need a self-update, either because the state is `Required` or because the last rotation is older than a configurable threshold. ([#184](https://github.com/marmot-protocol/mdk/pull/184))
+- **KeyPackageRef `i` tag for efficient relay queries**: KeyPackage events now include an `i` tag with the hex-encoded `KeyPackageRef` (computed per RFC 9420 Section 5.2). This enables efficient relay queries for specific KeyPackages when processing Welcome messages, avoiding the need to download and decode all KeyPackage events. ([#182](https://github.com/marmot-protocol/mdk/pull/182))
+- **KeyPackage deletion by hash_ref bytes**: Added `delete_key_package_from_storage_by_hash_ref()` to delete a key package using previously serialized hash_ref bytes. This enables delayed key material cleanup workflows where the hash_ref is obtained at creation time (via `create_key_package_for_event`) and used for deletion later. ([#178](https://github.com/marmot-protocol/mdk/pull/178))
+- **Custom Message Sort Order**: `get_messages()` now supports custom sort orders via the `Pagination::sort_order` field. Added `get_last_message(group_id, sort_order)` method to retrieve the most recent message under a given sort order, enabling clients using `ProcessedAtFirst` ordering to get a consistent "last message" value. ([#171](https://github.com/marmot-protocol/mdk/pull/171))
+- **`create_key_package_for_event_with_options`**: New function that allows specifying whether to include the NIP-70 protected tag. Use this if you need to publish to relays that accept protected events. ([#173](https://github.com/marmot-protocol/mdk/pull/173), related: [#168](https://github.com/marmot-protocol/mdk/issues/168))
+- **MIP-04 Epoch Fallback for Media Decryption**: `decrypt_from_download` now resolves the correct decryption key via an O(1) epoch hint lookup instead of only using the current epoch's exporter secret. Added `NoExporterSecretForEpoch` variant to `EncryptedMediaError` for programmatic error matching. ([#167](https://github.com/marmot-protocol/mdk/pull/167))
+- **`PreviouslyFailed` Result Variant**: Added `MessageProcessingResult::PreviouslyFailed` variant to handle cases where a previously failed message arrives again but the MLS group ID cannot be extracted. This prevents crashes in client applications by returning a result instead of throwing an error. ([#165](https://github.com/marmot-protocol/mdk/pull/165), fixes [#154](https://github.com/marmot-protocol/mdk/issues/154), [#159](https://github.com/marmot-protocol/mdk/issues/159))
+- **Message Retry Support**: Implemented better handling for retryable message states. When a message fails processing, it now preserves the `message_event_id` and other context. Added logic to allow reprocessing of messages marked as `Retryable`, with automatic state recovery to `Processed` upon success. ([#161](https://github.com/marmot-protocol/mdk/pull/161))
+- Configurable `out_of_order_tolerance` and `maximum_forward_distance` in `MdkConfig` for MLS sender ratchet settings. Default `out_of_order_tolerance` increased from 5 to 100 for better handling of out-of-order message delivery on Nostr relays. ([`#155`](https://github.com/marmot-protocol/mdk/pull/155))
+- **Epoch Snapshots & Rollback**: Added `EpochSnapshotManager` to maintain historical epoch states for rollback. ([#152](https://github.com/marmot-protocol/mdk/pull/152))
+- **Configuration**: Added `epoch_snapshot_retention` to `MdkConfig` (default: 5) to control how many past epochs are retained for rollback support. ([#152](https://github.com/marmot-protocol/mdk/pull/152))
+- **Rollback Callback**: Added `MdkCallback` trait and `MdkBuilder::with_callback()` to allow applications to react to rollback events (e.g., to refresh UI). ([#152](https://github.com/marmot-protocol/mdk/pull/152))
 - **GREASE Support (RFC 9420 Section 13.5)**: KeyPackage capabilities now automatically include random GREASE values for extensibility testing. GREASE ensures implementations correctly handle unknown values and maintains protocol forward compatibility. Values are injected into ciphersuites, extensions, proposals, and credentials capabilities. ([#142](https://github.com/marmot-protocol/mdk/pull/142))
 - New `MessageProcessingResult::PendingProposal` variant returned when a non-admin member receives a proposal. The proposal is stored as pending and awaits commitment by an admin. ([#122](https://github.com/marmot-protocol/mdk/pull/122))
 - New error variant `IdentityChangeNotAllowed` for rejecting proposals and commits that attempt to change member identity ([#126](https://github.com/marmot-protocol/mdk/pull/126))
@@ -136,6 +124,11 @@
 
 ### Fixed
 
+- **Welcome validation no longer requires `client` tag**: The `validate_welcome_event` function now correctly treats the `client` tag as optional per MIP-02. Previously, welcome events without a `client` tag were rejected, which would cause spec-compliant third-party implementations to be unable to send Welcome events to MDK-based clients. ([#186](https://github.com/marmot-protocol/mdk/pull/186))
+- **Security dependency updates**: Updated `time` (0.3.44 → 0.3.47), `bytes` (1.11.0 → 1.11.1), and `lru` (0.16.2 → 0.16.3) to resolve Dependabot security advisories. ([#174](https://github.com/marmot-protocol/mdk/pull/174))
+- **Message Ordering Consistency**: Fixed inconsistency where `group.last_message_id` might not match `get_messages()[0].id` due to different sorting logic. The `last_message_id` update logic now uses `created_at DESC, processed_at DESC, id DESC` ordering to match the `messages()` query, ensuring the first message returned is always the same as `last_message_id`. Added `last_message_processed_at` field to `Group` to track this secondary sort key. ([#166](https://github.com/marmot-protocol/mdk/pull/166))
+- **Security**: Prevent `GroupId` leakage in `test_commit_race_simple_better_commit_wins` assertion failure messages to avoid exposing sensitive identifiers in logs. ([#152](https://github.com/marmot-protocol/mdk/pull/152))
+- Fixed crash when processing messages that previously failed. Now returns `MessageProcessingResult::Unprocessable` instead of throwing an error, consistent with other unprocessable message handling. This prevents application crashes when duplicate failed messages arrive from relays. (Fixes [#154](https://github.com/marmot-protocol/mdk/issues/154)) ([#156](https://github.com/marmot-protocol/mdk/pull/156))
 - **Security (Audit Suggestion 5)**: Prevent panic in `process_welcome` when rumor event ID is missing. A malformed or non-NIP-59-compliant rumor now returns a `MissingRumorEventId` error instead of panicking. ([#107](https://github.com/marmot-protocol/mdk/pull/107))
 - **Security (Audit Issue A)**: Added admin authorization check for MLS commit messages. Previously, commits were merged without verifying the sender against `admin_pubkeys`, allowing non-admin members to modify group state. Now, `process_commit_message_for_group` validates that the commit sender is an admin before merging. ([#130](https://github.com/marmot-protocol/mdk/pull/130))
 - **Security (Audit Issue B)**: Added author verification to message processing to prevent impersonation attacks. The rumor pubkey is now validated against the MLS sender's credential before processing application messages. ([#40](https://github.com/marmot-protocol/mdk/pull/40))
@@ -151,29 +144,24 @@
 - **Security (Audit Issue Q)**: Fixed `remove_members` to use actual leaf indices from the ratchet tree instead of enumeration indices. Previously, using `enumerate()` to derive `LeafNodeIndex` caused removal of incorrect members when the tree had holes from prior removals. Now uses `member.index` directly. ([#120](https://github.com/marmot-protocol/mdk/pull/120))
 - **Security (Audit Issue R)**: Refactor encoding handling to enforce base64 usage for key packages and welcome ([#98](https://github.com/marmot-protocol/mdk/pull/98))
 - **Security (Audit Issue S)**: Added validation for mandatory `relays` tag in MLS KeyPackage events. The `validate_key_package_tags` function now requires a `relays` tag with at least one valid relay URL, preventing acceptance of unroutable key packages that could cause delivery failures or enable denial-of-service attacks. ([#118](https://github.com/marmot-protocol/mdk/pull/118))
-- **Security (Audit Issue T)**: Fixed incomplete MIME type canonicalization in `validate_mime_type` ([#95](https://github.com/marmot-protocol/mdk/pull/110))
+- **Security (Audit Issue T)**: Fixed incomplete MIME type canonicalization in `validate_mime_type` ([#110](https://github.com/marmot-protocol/mdk/pull/110))
 - **Security (Audit Issue U)**: Fixed deterministic nonce derivation that caused nonce reuse and message linkability. Encryption now uses random nonces per encryption operation, stored in the IMETA tag. The nonce field (`n`) is now required in IMETA tags. ([#114](https://github.com/marmot-protocol/mdk/pull/114))
 - **Security (Audit Issue V)**: Replaced hard-coded MIP-04 version check with dynamic validation. Previously, the media manager explicitly checked for 'mip04-v2', which would require code changes to support future versions. Now, it validates against the supported versions defined in the crypto module, allowing for smoother protocol upgrades while still rejecting insecure legacy versions (v1). ([#145](https://github.com/marmot-protocol/mdk/pull/145))
-- **Security (Audit Issue W)**: Added MIME type validation and allowlist enforcement ([#95](https://github.com/marmot-protocol/mdk/pull/110))
+- **Security (Audit Issue W)**: Added MIME type validation and allowlist enforcement ([#110](https://github.com/marmot-protocol/mdk/pull/110))
 - **Security (Audit Issue Y)**: Encrypted media keys and nonces now use `Secret<T>` wrapper for automatic memory zeroization, preventing sensitive cryptographic material from persisting in memory ([#109](https://github.com/marmot-protocol/mdk/pull/109))
 - **Security (Audit Issue Z)**: Added pagination to prevent memory exhaustion from unbounded loading of group messages ([#111](https://github.com/marmot-protocol/mdk/pull/111))
 - **Security (Audit Issue AA)**: Added pagination to prevent memory exhaustion from unbounded loading of pending welcomes ([#110](https://github.com/marmot-protocol/mdk/pull/110))
 - **Security (Audit Issue AE)**: Added comprehensive Nostr-based validations when processing messages per MIP-03 requirements. The `validate_event_and_extract_group_id` function now validates timestamp bounds using `MdkConfig` settings (rejects events >5 minutes in future or >45 days old by default), and enforces exactly one `h` tag requirement with proper format validation. Note: MDK-core delegates Nostr signature verification to nostr-sdk's relay pool layer; it does not perform signature verification itself. This prevents misrouting messages via manipulated tags and degrading availability through abnormal timestamps. ([#128](https://github.com/marmot-protocol/mdk/pull/128))
 - **Security (Audit Issue AK)**: Fixed removed member commit processing to handle eviction gracefully. When a member is removed from a group and processes their removal commit, the group state is now set to `Inactive` instead of failing with a `UseAfterEviction` error. (Fixes [#80](https://github.com/marmot-protocol/mdk/issues/80)) ([#137](https://github.com/marmot-protocol/mdk/pull/137))
 - **Security (Audit Issue AP)**: Early validation and decryption failures now persist failed processing state to prevent DoS via repeated expensive reprocessing of invalid events. Added deduplication check to reject previously failed messages immediately. Failure reasons are sanitized to prevent information leakage. ([#116](https://github.com/marmot-protocol/mdk/pull/116))
-- Fixed crash when processing messages that previously failed. Now returns `MessageProcessingResult::Unprocessable` instead of throwing an error, consistent with other unprocessable message handling. This prevents application crashes when duplicate failed messages arrive from relays. (Fixes [#154](https://github.com/marmot-protocol/mdk/issues/154)) ([#156](https://github.com/marmot-protocol/mdk/pull/156))
-
 
 ### Removed
 
+- **`compute_key_package_hash_ref` removed**: This method is no longer needed now that `create_key_package_for_event` returns the hash_ref directly as its third tuple element. Callers should use the hash_ref from `create_key_package_for_event` instead. ([#178](https://github.com/marmot-protocol/mdk/pull/178))
 - Removed `Error::ProposalFromNonAdmin` variant as proposals are now accepted from any member per the Marmot protocol specification ([#122](https://github.com/marmot-protocol/mdk/pull/122))
 - Removed all traces of hex encoding support for content fields in key packages and welcome events ([#98](https://github.com/marmot-protocol/mdk/pull/98))
 
-### Deprecated
-
 ## [0.5.3] - 2025-11-14
-
-### Breaking changes
 
 ### Changed
 
@@ -207,10 +195,6 @@
 
 - Blurhash Generation: Fixed blurhash generation to use RGBA format instead of RGB (changed `to_rgb8()` to `to_rgba8()`)
 
-### Removed
-
-### Deprecated
-
 ## [0.5.2] - 2025-10-16
 
 ### Breaking changes
@@ -243,10 +227,6 @@
   - `mls_ciphersuite` tag now uses single hex value format: `["mls_ciphersuite", "0x0001"]` instead of string format
   - `mls_extensions` tag now uses multiple hex values: `["mls_extensions", "0x0003", "0x000a", "0x0002", "0xf2ee"]` instead of single comma-separated string
   - Ensures interoperability with other Marmot protocol implementations
-
-### Removed
-
-### Deprecated
 
 ## [0.5.1] - 2025-10-01
 
@@ -296,7 +276,7 @@
 
 - Bug where group relays weren't being persisted properly on change in NostrGroupDataExtension ([#1056](https://github.com/rust-nostr/nostr/pull/1056))
 
-## v0.43.0 - 2025/07/28
+## [0.43.0] - 2025-07-28
 
 ### Breaking changes
 
@@ -316,6 +296,6 @@
 - Add method to check previous exporter_secrets when NIP-44 decrypting kind 445 messages ([#954](https://github.com/rust-nostr/nostr/pull/954))
 - Add methods to update group name, description and image ([#978](https://github.com/rust-nostr/nostr/pull/978))
 
-## v0.42.0 - 2025/05/20
+## [0.42.0] - 2025-05-20
 
 First release ([#843](https://github.com/rust-nostr/nostr/pull/843))

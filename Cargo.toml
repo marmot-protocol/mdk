@@ -6,16 +6,16 @@ resolver = "2"
 [workspace.package]
 authors = ["Jeff Gardner <j@jeffg.me>", "MDK Developers"]
 homepage = "https://github.com/marmot-protocol/mdk"
-repository = "https://github.com/marmot-protocol/mdk.git"
+repository = "https://github.com/marmot-protocol/mdk"
 license = "MIT"
 rust-version = "1.90.0"
 
 [workspace.dependencies]
 # Internal crates
-mdk-memory-storage = { version = "0.5.1", path = "./crates/mdk-memory-storage", default-features = false }
-mdk-sqlite-storage = { version = "0.5.1", path = "./crates/mdk-sqlite-storage", default-features = false }
-mdk-storage-traits = { version = "0.5.1", path = "./crates/mdk-storage-traits", default-features = false }
-mdk-core = { version = "0.5.1", path = "./crates/mdk-core", default-features = false }
+mdk-memory-storage = { version = "0.6.0", path = "./crates/mdk-memory-storage", default-features = false }
+mdk-sqlite-storage = { version = "0.6.0", path = "./crates/mdk-sqlite-storage", default-features = false }
+mdk-storage-traits = { version = "0.6.0", path = "./crates/mdk-storage-traits", default-features = false }
+mdk-core = { version = "0.6.0", path = "./crates/mdk-core", default-features = false }
 
 # OpenMLS family
 openmls = { version = "0.8", default-features = false }

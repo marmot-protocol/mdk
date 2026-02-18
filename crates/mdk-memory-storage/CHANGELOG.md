@@ -27,16 +27,21 @@
 
 ### Breaking changes
 
-- **MLS codec switched from JSON to postcard**: MLS storage serialization now uses `MlsCodec` (postcard binary format) instead of the removed `JsonCodec` (serde_json). In-memory data is ephemeral so no migration is needed, but the serialized byte format has changed. ([#179](https://github.com/marmot-protocol/mdk/pull/179))
+### Changed
 
 ### Added
 
-- **Custom Message Sort Order**: `messages()` now respects the `sort_order` field in `Pagination`, supporting both `CreatedAtFirst` (default) and `ProcessedAtFirst` orderings. ([#171](https://github.com/marmot-protocol/mdk/pull/171))
-- **Last Message by Sort Order**: Implemented `last_message()` to return the most recent message under a given sort order. ([#171](https://github.com/marmot-protocol/mdk/pull/171))
-- **Epoch Lookup by Tag Content**: Implemented `find_message_epoch_by_tag_content` for in-memory storage, scanning cached group messages and matching serialized tags. ([#167](https://github.com/marmot-protocol/mdk/pull/167))
-- **Retryable Message Support**: Updated storage implementation to handle `ProcessedMessageState::Retryable` transitions and persistence. ([#161](https://github.com/marmot-protocol/mdk/pull/161))
+### Fixed
+
+### Removed
+
+### Deprecated
+
+## [0.6.0] - 2026-02-18
 
 ### Breaking changes
+
+- **MLS codec switched from JSON to postcard**: MLS storage serialization now uses `MlsCodec` (postcard binary format) instead of the removed `JsonCodec` (serde_json). In-memory data is ephemeral so no migration is needed, but the serialized byte format has changed. ([#179](https://github.com/marmot-protocol/mdk/pull/179))
 
 ### Changed
 
@@ -55,6 +60,10 @@
 
 ### Added
 
+- **Custom Message Sort Order**: `messages()` now respects the `sort_order` field in `Pagination`, supporting both `CreatedAtFirst` (default) and `ProcessedAtFirst` orderings. ([#171](https://github.com/marmot-protocol/mdk/pull/171))
+- **Last Message by Sort Order**: Implemented `last_message()` to return the most recent message under a given sort order. ([#171](https://github.com/marmot-protocol/mdk/pull/171))
+- **Epoch Lookup by Tag Content**: Implemented `find_message_epoch_by_tag_content` for in-memory storage, scanning cached group messages and matching serialized tags. ([#167](https://github.com/marmot-protocol/mdk/pull/167))
+- **Retryable Message Support**: Updated storage implementation to handle `ProcessedMessageState::Retryable` transitions and persistence. ([#161](https://github.com/marmot-protocol/mdk/pull/161))
 - **MLS Storage Module**: New `mls_storage` module with complete `StorageProvider<1>` implementation for OpenMLS integration ([#148](https://github.com/marmot-protocol/mdk/pull/148))
   - JSON codec for serializing/deserializing OpenMLS types
   - Support for all 53 `StorageProvider<1>` methods
@@ -83,8 +92,6 @@
 
 - Removed `openmls_memory_storage` dependency in favor of direct `StorageProvider<1>` implementation ([#148](https://github.com/marmot-protocol/mdk/pull/148))
 
-### Deprecated
-
 ## [0.5.1] - 2025-10-01
 
 ### Changed
@@ -107,12 +114,12 @@
 
 - Upgrade openmls to v0.7.0
 
-## v0.43.0 - 2025/07/28
+## [0.43.0] - 2025-07-28
 
 ### Changed
 
 - Bump lru from 0.14 to 0.16
 
-## v0.42.0 - 2025/05/20
+## [0.42.0] - 2025-05-20
 
 - First release ([#839](https://github.com/rust-nostr/nostr/pull/839))

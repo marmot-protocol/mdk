@@ -1,6 +1,6 @@
 [package]
 name = "mdk-storage-traits"
-version = "0.5.1"
+version = "0.6.0"
 edition = "2024"
 description = "Storage abstraction for MDK that wraps OpenMLS storage backends"
 authors = ["Jeff Gardner <j@jeffg.me>", "Yuki Kishimoto <yukikishimoto@protonmail.com>", "MDK Developers"]
@@ -10,6 +10,7 @@ license.workspace = true
 readme = "README.md"
 rust-version = "1.90.0"
 keywords = ["nostr", "mls", "openmls"]
+categories = ["cryptography", "database"]
 
 [features]
 default = []

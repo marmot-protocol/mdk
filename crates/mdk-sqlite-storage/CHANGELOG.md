@@ -25,31 +25,23 @@
 
 ## Unreleased
 
+### Breaking changes
+
+### Changed
+
 ### Added
 
-- **Self-update tracking column**: Added V004 migration adding `last_self_update_at INTEGER` column to the `groups` table for self-update state tracking. `NULL` = no obligation, `0` = required (MIP-02), `>0` = unix timestamp of last rotation (MIP-00). The column is also captured and restored by the snapshot/rollback mechanism. ([#184](https://github.com/marmot-protocol/mdk/pull/184))
+### Fixed
+
+### Removed
+
+### Deprecated
+
+## [0.6.0] - 2026-02-18
 
 ### Breaking changes
 
 - **MLS codec switched from JSON to postcard**: MLS storage serialization now uses `MlsCodec` (postcard binary format) instead of the removed `JsonCodec` (serde_json). Existing SQLite databases contain JSON-encoded MLS data and are incompatible — they must be recreated. ([#179](https://github.com/marmot-protocol/mdk/pull/179))
-
-### Fixed
-
-- **Snapshot/rollback now correctly captures OpenMLS data**: The snapshot and restore code used `group_id.as_slice()` (raw bytes) to query OpenMLS tables, but the `StorageProvider` writes group_id via `MlsCodec::serialize()` (serialized bytes). The WHERE clauses never matched, so snapshots silently captured zero OpenMLS rows and rollbacks left MLS cryptographic state untouched — creating a metadata/crypto split-brain where MDK metadata was rolled back but the MLS engine retained the wrong epoch's keys. ([#179](https://github.com/marmot-protocol/mdk/pull/179))
-
-### Added
-
-- **Custom Message Sort Order**: `messages()` now respects the `sort_order` field in `Pagination`, supporting both `CreatedAtFirst` (default) and `ProcessedAtFirst` orderings via different SQL `ORDER BY` clauses. ([#171](https://github.com/marmot-protocol/mdk/pull/171))
-- **Last Message by Sort Order**: Implemented `last_message()` to return the most recent message under a given sort order via `SELECT ... ORDER BY ... LIMIT 1`. ([#171](https://github.com/marmot-protocol/mdk/pull/171))
-- **Processed-At-First Sort Index**: Added V003 migration creating `idx_messages_sorting_processed_at` composite index on `messages(mls_group_id, processed_at DESC, created_at DESC, id DESC)` for efficient `ProcessedAtFirst` queries. ([#171](https://github.com/marmot-protocol/mdk/pull/171))
-- **Group `last_message_processed_at` Column**: Added `last_message_processed_at` column to the `groups` table via V002 migration to track when the last message was processed/received by this client. This enables consistent ordering between `group.last_message_id` and `get_messages()[0].id`. Existing groups are backfilled with their `last_message_at` value as a reasonable default. ([#166](https://github.com/marmot-protocol/mdk/pull/166))
-
-- **Message `processed_at` Column**: Added `processed_at` column to the `messages` table via V002 migration to store when messages were processed/received by the client. Existing messages are backfilled with their `created_at` value as a reasonable default. ([#166](https://github.com/marmot-protocol/mdk/pull/166))
-
-- **Epoch Lookup by Tag Content**: Implemented `find_message_epoch_by_tag_content` for SQLite storage using `SELECT epoch FROM messages WHERE tags LIKE ?` query. ([#167](https://github.com/marmot-protocol/mdk/pull/167))
-- **Retryable Message Support**: Updated storage implementation to handle `ProcessedMessageState::Retryable` transitions and persistence. ([#161](https://github.com/marmot-protocol/mdk/pull/161))
-
-### Breaking changes
 
 ### Changed
 
@@ -72,6 +64,14 @@
 
 ### Added
 
+- **Self-update tracking column**: Added V004 migration adding `last_self_update_at INTEGER` column to the `groups` table for self-update state tracking. `NULL` = no obligation, `0` = required (MIP-02), `>0` = unix timestamp of last rotation (MIP-00). The column is also captured and restored by the snapshot/rollback mechanism. ([#184](https://github.com/marmot-protocol/mdk/pull/184))
+- **Custom Message Sort Order**: `messages()` now respects the `sort_order` field in `Pagination`, supporting both `CreatedAtFirst` (default) and `ProcessedAtFirst` orderings via different SQL `ORDER BY` clauses. ([#171](https://github.com/marmot-protocol/mdk/pull/171))
+- **Last Message by Sort Order**: Implemented `last_message()` to return the most recent message under a given sort order via `SELECT ... ORDER BY ... LIMIT 1`. ([#171](https://github.com/marmot-protocol/mdk/pull/171))
+- **Processed-At-First Sort Index**: Added V003 migration creating `idx_messages_sorting_processed_at` composite index on `messages(mls_group_id, processed_at DESC, created_at DESC, id DESC)` for efficient `ProcessedAtFirst` queries. ([#171](https://github.com/marmot-protocol/mdk/pull/171))
+- **Group `last_message_processed_at` Column**: Added `last_message_processed_at` column to the `groups` table via V002 migration to track when the last message was processed/received by this client. This enables consistent ordering between `group.last_message_id` and `get_messages()[0].id`. Existing groups are backfilled with their `last_message_at` value as a reasonable default. ([#166](https://github.com/marmot-protocol/mdk/pull/166))
+- **Message `processed_at` Column**: Added `processed_at` column to the `messages` table via V002 migration to store when messages were processed/received by the client. Existing messages are backfilled with their `created_at` value as a reasonable default. ([#166](https://github.com/marmot-protocol/mdk/pull/166))
+- **Epoch Lookup by Tag Content**: Implemented `find_message_epoch_by_tag_content` for SQLite storage using `SELECT epoch FROM messages WHERE tags LIKE ?` query. ([#167](https://github.com/marmot-protocol/mdk/pull/167))
+- **Retryable Message Support**: Updated storage implementation to handle `ProcessedMessageState::Retryable` transitions and persistence. ([#161](https://github.com/marmot-protocol/mdk/pull/161))
 - **MLS Storage Module**: New `mls_storage` module with complete `StorageProvider<1>` implementation for OpenMLS integration ([#148](https://github.com/marmot-protocol/mdk/pull/148))
   - JSON codec for serializing/deserializing OpenMLS types
   - Support for all 53 `StorageProvider<1>` methods
@@ -92,6 +92,7 @@
 
 ### Fixed
 
+- **Snapshot/rollback now correctly captures OpenMLS data**: The snapshot and restore code used `group_id.as_slice()` (raw bytes) to query OpenMLS tables, but the `StorageProvider` writes group_id via `MlsCodec::serialize()` (serialized bytes). The WHERE clauses never matched, so snapshots silently captured zero OpenMLS rows and rollbacks left MLS cryptographic state untouched — creating a metadata/crypto split-brain where MDK metadata was rolled back but the MLS engine retained the wrong epoch's keys. ([#179](https://github.com/marmot-protocol/mdk/pull/179))
 - **Security (Audit Issue M)**: Fixed messages being overwritten across groups due to non-scoped primary key. Changed messages table primary key from `id` to `(mls_group_id, id)` and updated `save_message()` to use `INSERT ... ON CONFLICT(mls_group_id, id) DO UPDATE` instead of `INSERT OR REPLACE`. This prevents an attacker or faulty relay from causing message loss and misattribution across groups by reusing deterministic rumor IDs. ([#124](https://github.com/marmot-protocol/mdk/pull/124))
 - **Security (Audit Issue Y)**: Secret values stored in SQLite are now wrapped in `Secret<T>` type, ensuring automatic memory zeroization and preventing sensitive cryptographic material from persisting in memory ([#109](https://github.com/marmot-protocol/mdk/pull/109))
 - **Security (Audit Issue Z)**: Added pagination to prevent memory exhaustion from unbounded loading of group messages ([#111](https://github.com/marmot-protocol/mdk/pull/111))
@@ -106,8 +107,6 @@
 
 - Removed `openmls_sqlite_storage` dependency in favor of direct `StorageProvider<1>` implementation ([#148](https://github.com/marmot-protocol/mdk/pull/148))
 - Removed legacy migrations V100-V105 in favor of unified V001 schema ([#148](https://github.com/marmot-protocol/mdk/pull/148))
-
-### Deprecated
 
 ## [0.5.1] - 2025-10-01
 
@@ -131,10 +130,10 @@
 
 - Upgrade openmls to v0.7.0
 
-## v0.43.0 - 2025/07/28
+## [0.43.0] - 2025-07-28
 
 No notable changes in this release.
 
-## v0.42.0 - 2025/05/20
+## [0.42.0] - 2025-05-20
 
 First release ([#842](https://github.com/rust-nostr/nostr/pull/842))

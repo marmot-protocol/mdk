@@ -27,6 +27,20 @@
 
 ### Breaking changes
 
+### Changed
+
+### Added
+
+### Fixed
+
+### Removed
+
+### Deprecated
+
+## [0.6.0] - 2026-02-18
+
+### Breaking changes
+
 - **Self-update tracking via `SelfUpdateState` enum**: Replaced the `needs_self_update: bool` and `last_self_update_at: Option<Timestamp>` fields on `Group` with a single `self_update_state: SelfUpdateState` field. The new `SelfUpdateState` enum has two variants: `Required` (post-join obligation per MIP-02) and `CompletedAt(Timestamp)` (last rotation time for MIP-00 staleness checks). Group creators start with `CompletedAt(now)` since creating a group with a fresh key is effectively the first rotation. All code that constructs `Group` structs must be updated. ([#184](https://github.com/marmot-protocol/mdk/pull/184))
 - **MLS codec switched from JSON to postcard**: `JsonCodec` has been removed and replaced with `MlsCodec`, which uses the `postcard` binary serialization format instead of `serde_json`. MLS storage keys and entities are now significantly more compact (~33 bytes for a 32-byte group_id vs ~130 bytes with JSON). All persisted MLS data is incompatible and must be recreated. ([#179](https://github.com/marmot-protocol/mdk/pull/179))
 - **Group `last_message_processed_at` Field**: Added `last_message_processed_at: Option<Timestamp>` field to the `Group` struct to track when the last message was processed/received by this client. This enables consistent ordering between `group.last_message_id` and `get_messages()[0].id` by matching the `messages()` query sort order (`created_at DESC, processed_at DESC, id DESC`). This is a breaking change - all code that constructs `Group` structs must now provide this new field. ([#166](https://github.com/marmot-protocol/mdk/pull/166))
@@ -48,8 +62,8 @@
   - `Welcome.group_image_key` changed from `Option<[u8; 32]>` to `Option<Secret<[u8; 32]>>`
   - `Welcome.group_image_nonce` changed from `Option<[u8; 12]>` to `Option<Secret<[u8; 12]>>`
   - Code accessing these fields must use `Secret::new()` to wrap values or dereference/clone to access inner values ([#109](https://github.com/marmot-protocol/mdk/pull/109))
-- **BREAKING**: Changed `WelcomeStorage::pending_welcomes()` to accept `Option<Pagination>` parameter instead of having separate `pending_welcomes()` and `pending_welcomes_paginated()` methods ([#110](https://github.com/marmot-protocol/mdk/pull/110))
-- **BREAKING**: Removed `MAX_PENDING_WELCOMES_OFFSET` constant - offset validation removed to allow legitimate large-scale use cases ([#110](https://github.com/marmot-protocol/mdk/pull/110))
+- Changed `WelcomeStorage::pending_welcomes()` to accept `Option<Pagination>` parameter instead of having separate `pending_welcomes()` and `pending_welcomes_paginated()` methods ([#110](https://github.com/marmot-protocol/mdk/pull/110))
+- Removed `MAX_PENDING_WELCOMES_OFFSET` constant - offset validation removed to allow legitimate large-scale use cases ([#110](https://github.com/marmot-protocol/mdk/pull/110))
 - Changed `GroupStorage::messages()` to accept `Option<Pagination>` parameter instead of having separate `messages()` and `messages_paginated()` methods ([#111](https://github.com/marmot-protocol/mdk/pull/111))
 
 ### Changed
@@ -81,10 +95,6 @@
 - **Security (Audit Issue Z)**: Added pagination to prevent memory exhaustion from unbounded loading of group messages ([#111](https://github.com/marmot-protocol/mdk/pull/111))
 - **Security (Audit Issue AA)**: Added pagination to prevent memory exhaustion from unbounded loading of pending welcomes ([#110](https://github.com/marmot-protocol/mdk/pull/110))
 
-### Removed
-
-### Deprecated
-
 ## [0.5.1] - 2025-10-01
 
 ### Changed
@@ -114,10 +124,10 @@
 - Comprehensive consistency testing framework for testing all mdk-storage-traits implementations for correctness and consistency ([#1056](https://github.com/rust-nostr/nostr/pull/1056))
 - Added Serde support for GroupId
 
-## v0.43.0 - 2025/07/28
+## [0.43.0] - 2025-07-28
 
 No notable changes in this release.
 
-## v0.42.0 - 2025/05/20
+## [0.42.0] - 2025-05-20
 
 First release ([#836](https://github.com/rust-nostr/nostr/pull/836))

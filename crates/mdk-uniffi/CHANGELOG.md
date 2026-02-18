@@ -27,6 +27,20 @@
 
 ### Breaking changes
 
+### Changed
+
+### Added
+
+### Fixed
+
+### Removed
+
+### Deprecated
+
+## [0.6.0] - 2026-02-18
+
+### Breaking changes
+
 - **Self-update tracking field change**: The `Group` record's `needs_self_update: bool` and `last_self_update_at: Option<u64>` fields have been replaced with a single `self_update_state: String` field. Values are `"required"` (post-join obligation) or `"completed_at:<unix_timestamp>"` (last rotation time). ([#184](https://github.com/marmot-protocol/mdk/pull/184))
 - **`KeyPackageResult` now includes `hash_ref`**: The `KeyPackageResult` struct returned by `create_key_package_for_event` and `create_key_package_for_event_with_options` now includes a `hash_ref: Vec<u8>` field containing the serialized hash reference of the key package. This enables callers to track key packages for lifecycle management without re-parsing. ([#178](https://github.com/marmot-protocol/mdk/pull/178))
 - **`create_key_package_for_event` No Longer Adds Protected Tag**: The `create_key_package_for_event()` function no longer adds the NIP-70 protected tag by default. This is a behavioral change - existing code that relied on the protected tag being present will now produce key packages without it. Key packages can now be republished by third parties to any relay. For users who need the protected tag, use the new `create_key_package_for_event_with_options()` function with `protected: true`. ([#173](https://github.com/marmot-protocol/mdk/pull/173), related: [#168](https://github.com/marmot-protocol/mdk/issues/168))
@@ -61,10 +75,6 @@
 - **Build**: Added Rust target installation checks for both Android and iOS builds with helpful error messages showing how to install missing targets ([#140](https://github.com/marmot-protocol/mdk/pull/140))
 - **Build**: Fixed Windows CI builds for Python and Ruby bindings by installing OpenSSL via vcpkg, resolving `libsqlite3-sys` build failures caused by missing `OPENSSL_DIR` ([#144](https://github.com/marmot-protocol/mdk/pull/144))
 - **Build**: Fixed Windows linker errors for Python and Ruby bindings by adding missing `crypt32` and `user32` system library links required by statically-linked OpenSSL ([#172](https://github.com/marmot-protocol/mdk/pull/172))
-
-### Removed
-
-### Deprecated
 
 ## [0.5.3] - 2025-12-09
 
