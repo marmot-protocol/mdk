@@ -412,8 +412,8 @@ where
     /// Returns the group IDs of active groups that need a self-update.
     ///
     /// A group needs a self-update if:
-    /// - `needs_self_update` is `true` (post-join requirement, MIP-02), or
-    /// - `last_self_update_at` is older than `threshold_secs` (periodic rotation, MIP-00)
+    /// - `self_update_state` is `SelfUpdateState::Required` (post-join requirement, MIP-02), or
+    /// - `self_update_state` is `SelfUpdateState::CompletedAt(ts)` and `ts` is older than `threshold_secs` (periodic rotation, MIP-00)
     ///
     /// # Arguments
     /// * `threshold_secs` - Maximum age in seconds before a group's key rotation is considered stale
@@ -421,10 +421,7 @@ where
     /// # Returns
     /// * `Ok(Vec<GroupId>)` - Group IDs needing self-update
     /// * `Err(Error)` - If there is an error accessing storage
-    pub fn groups_needing_self_update(
-        &self,
-        threshold_secs: u64,
-    ) -> Result<Vec<GroupId>, Error> {
+    pub fn groups_needing_self_update(&self, threshold_secs: u64) -> Result<Vec<GroupId>, Error> {
         self.storage()
             .groups_needing_self_update(threshold_secs)
             .map_err(|e| Error::Group(e.to_string()))
@@ -1100,8 +1097,7 @@ where
             image_hash: config.image_hash,
             image_key: config.image_key.map(mdk_storage_traits::Secret::new),
             image_nonce: config.image_nonce.map(mdk_storage_traits::Secret::new),
-            needs_self_update: false,
-            last_self_update_at: None,
+            self_update_state: group_types::SelfUpdateState::NotRequired,
         };
 
         self.storage().save_group(group.clone()).map_err(
@@ -1314,15 +1310,14 @@ where
         // Sync the stored group metadata with the updated MLS group state
         self.sync_group_metadata_from_mls(group_id)?;
 
-        // If this was actually a self-update commit, clear the post-join flag
-        // and record the timestamp. This correctly handles:
-        // - Post-join self-updates (clears needs_self_update, records timestamp)
-        // - Creator self-updates (records timestamp for rotation tracking)
-        // - Non-self-update commits (leaves both fields untouched)
+        // If this was actually a self-update commit, record the timestamp.
+        // This correctly handles:
+        // - Post-join self-updates (transitions Required → CompletedAt)
+        // - Creator self-updates (transitions None → CompletedAt for rotation tracking)
+        // - Non-self-update commits (leaves self_update_state untouched)
         if is_self_update {
             let mut group = self.get_group(group_id)?.ok_or(Error::GroupNotFound)?;
-            group.needs_self_update = false;
-            group.last_self_update_at = Some(nostr::Timestamp::now());
+            group.self_update_state = group_types::SelfUpdateState::CompletedAt(Timestamp::now());
             self.storage()
                 .save_group(group)
                 .map_err(|e| Error::Group(e.to_string()))?;

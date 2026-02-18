@@ -114,7 +114,7 @@ fn create_test_group_for_cross_storage(
     mls_group_id: &GroupId,
     nostr_group_id: [u8; 32],
 ) -> mdk_storage_traits::groups::types::Group {
-    use mdk_storage_traits::groups::types::{Group, GroupState};
+    use mdk_storage_traits::groups::types::{Group, GroupState, SelfUpdateState};
 
     Group {
         mls_group_id: mls_group_id.clone(),
@@ -130,8 +130,7 @@ fn create_test_group_for_cross_storage(
         image_hash: None,
         image_key: None,
         image_nonce: None,
-        needs_self_update: false,
-        last_self_update_at: None,
+        self_update_state: SelfUpdateState::NotRequired,
     }
 }
 

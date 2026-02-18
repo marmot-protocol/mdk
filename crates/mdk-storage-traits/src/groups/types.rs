@@ -11,6 +11,54 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use super::error::GroupError;
 
+/// Tracks whether and when a self-update (key rotation) is needed or was
+/// last performed for this group.
+///
+/// - `NotRequired`: No self-update obligation (e.g., group creator before
+///   first rotation threshold). Maps to `NULL` in storage.
+/// - `Required`: The member must perform a self-update (e.g., after joining
+///   via welcome per MIP-02). Maps to `0` in storage.
+/// - `CompletedAt(Timestamp)`: The last self-update was merged at this time.
+///   Used for periodic rotation staleness checks (MIP-00). Maps to a
+///   non-zero timestamp in storage.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SelfUpdateState {
+    /// No self-update obligation.
+    #[default]
+    NotRequired,
+    /// A self-update is required (post-join obligation per MIP-02).
+    Required,
+    /// The last self-update was successfully merged at this timestamp.
+    CompletedAt(Timestamp),
+}
+
+impl Serialize for SelfUpdateState {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::NotRequired => serializer.serialize_none(),
+            Self::Required => serializer.serialize_some(&0u64),
+            Self::CompletedAt(ts) => serializer.serialize_some(&ts.as_secs()),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for SelfUpdateState {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let opt: Option<u64> = Option::deserialize(deserializer)?;
+        match opt {
+            None => Ok(Self::NotRequired),
+            Some(0) => Ok(Self::Required),
+            Some(secs) => Ok(Self::CompletedAt(Timestamp::from_secs(secs))),
+        }
+    }
+}
+
 /// The state of the group, this matches the MLS group state
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum GroupState {
@@ -108,18 +156,11 @@ pub struct Group {
     pub epoch: u64,
     /// The state of the group
     pub state: GroupState,
-    /// Whether this group needs a post-join self-update (key rotation after joining).
-    /// Set to `true` by `accept_welcome()`. Cleared by `merge_pending_commit()`
-    /// only when the merged commit is detected as a pure self-update (no
-    /// add/remove/psk proposals). Non-self-update commits leave this flag untouched.
+    /// Self-update (key rotation) tracking state.
+    ///
+    /// See [`SelfUpdateState`] for the possible values and their meanings.
     #[serde(default)]
-    pub needs_self_update: bool,
-    /// When the last self-update was successfully merged for this group.
-    /// Updated by `merge_pending_commit()` every time a pure self-update commit
-    /// is merged, regardless of the `needs_self_update` flag. This ensures both
-    /// post-join and periodic rotation self-updates are tracked.
-    #[serde(default)]
-    pub last_self_update_at: Option<Timestamp>,
+    pub self_update_state: SelfUpdateState,
 }
 
 impl Group {
@@ -211,8 +252,7 @@ mod tests {
             last_message_processed_at: None,
             epoch: 0,
             state: GroupState::Active,
-            needs_self_update: false,
-            last_self_update_at: None,
+            self_update_state: SelfUpdateState::NotRequired,
         }
     }
 
@@ -402,8 +442,7 @@ mod tests {
             last_message_processed_at: None,
             epoch: 0,
             state: GroupState::Active,
-            needs_self_update: false,
-            last_self_update_at: None,
+            self_update_state: SelfUpdateState::NotRequired,
         };
 
         let serialized = serde_json::to_value(&group).unwrap();

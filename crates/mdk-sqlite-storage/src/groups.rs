@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 
 use mdk_storage_traits::GroupId;
 use mdk_storage_traits::groups::error::GroupError;
-use mdk_storage_traits::groups::types::{Group, GroupExporterSecret, GroupRelay};
+use mdk_storage_traits::groups::types::{Group, GroupExporterSecret, GroupRelay, SelfUpdateState};
 use mdk_storage_traits::groups::{GroupStorage, MAX_MESSAGE_LIMIT, MessageSortOrder, Pagination};
 use mdk_storage_traits::messages::types::Message;
 use nostr::{PublicKey, RelayUrl};
@@ -119,16 +119,18 @@ impl GroupStorage for MdkSqliteStorage {
             .as_ref()
             .map(|ts| ts.as_secs());
 
-        let needs_self_update: i64 = if group.needs_self_update { 1 } else { 0 };
-        let last_self_update_at: Option<u64> =
-            group.last_self_update_at.as_ref().map(|ts| ts.as_secs());
+        let last_self_update_at: Option<u64> = match group.self_update_state {
+            SelfUpdateState::NotRequired => None,
+            SelfUpdateState::Required => Some(0),
+            SelfUpdateState::CompletedAt(ts) => Some(ts.as_secs()),
+        };
 
         self.with_connection(|conn| {
             conn.execute(
                 "INSERT INTO groups
              (mls_group_id, nostr_group_id, name, description, image_hash, image_key, image_nonce, admin_pubkeys, last_message_id,
-              last_message_at, last_message_processed_at, epoch, state, needs_self_update, last_self_update_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              last_message_at, last_message_processed_at, epoch, state, last_self_update_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(mls_group_id) DO UPDATE SET
                 nostr_group_id = excluded.nostr_group_id,
                 name = excluded.name,
@@ -142,7 +144,6 @@ impl GroupStorage for MdkSqliteStorage {
                 last_message_processed_at = excluded.last_message_processed_at,
                 epoch = excluded.epoch,
                 state = excluded.state,
-                needs_self_update = excluded.needs_self_update,
                 last_self_update_at = excluded.last_self_update_at",
                 params![
                     &group.mls_group_id.as_slice(),
@@ -158,7 +159,6 @@ impl GroupStorage for MdkSqliteStorage {
                     &last_message_processed_at,
                     &(group.epoch as i64),
                     group.state.as_str(),
-                    &needs_self_update,
                     &last_self_update_at
                 ],
             )
@@ -426,8 +426,7 @@ mod tests {
             image_hash,
             image_key,
             image_nonce,
-            needs_self_update: false,
-            last_self_update_at: None,
+            self_update_state: SelfUpdateState::NotRequired,
         };
 
         // Save the group
@@ -475,8 +474,7 @@ mod tests {
             image_hash: None,
             image_key: None,
             image_nonce: None,
-            needs_self_update: false,
-            last_self_update_at: None,
+            self_update_state: SelfUpdateState::NotRequired,
         };
 
         // Should fail due to name length
@@ -512,8 +510,7 @@ mod tests {
             image_hash: None,
             image_key: None,
             image_nonce: None,
-            needs_self_update: false,
-            last_self_update_at: None,
+            self_update_state: SelfUpdateState::NotRequired,
         };
 
         // Should fail due to description length
@@ -552,8 +549,7 @@ mod tests {
             image_hash: None,
             image_key: None,
             image_nonce: None,
-            needs_self_update: false,
-            last_self_update_at: None,
+            self_update_state: SelfUpdateState::NotRequired,
         };
 
         storage.save_group(group).unwrap();
@@ -684,8 +680,7 @@ mod tests {
             image_hash: None,
             image_key: None,
             image_nonce: None,
-            needs_self_update: false,
-            last_self_update_at: None,
+            self_update_state: SelfUpdateState::NotRequired,
         };
 
         // Save the group
@@ -772,8 +767,7 @@ mod tests {
             image_hash: None,
             image_key: None,
             image_nonce: None,
-            needs_self_update: false,
-            last_self_update_at: None,
+            self_update_state: SelfUpdateState::NotRequired,
         };
         storage.save_group(group1).unwrap();
 
@@ -793,8 +787,7 @@ mod tests {
             image_hash: None,
             image_key: None,
             image_nonce: None,
-            needs_self_update: false,
-            last_self_update_at: None,
+            self_update_state: SelfUpdateState::NotRequired,
         };
         storage.save_group(group2).unwrap();
 

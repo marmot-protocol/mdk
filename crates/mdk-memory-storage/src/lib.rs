@@ -1548,7 +1548,9 @@ mod tests {
     use std::collections::BTreeSet;
 
     use mdk_storage_traits::groups::GroupStorage;
-    use mdk_storage_traits::groups::types::{Group, GroupExporterSecret, GroupState};
+    use mdk_storage_traits::groups::types::{
+        Group, GroupExporterSecret, GroupState, SelfUpdateState,
+    };
     use mdk_storage_traits::messages::MessageStorage;
     use mdk_storage_traits::messages::error::MessageError;
     use mdk_storage_traits::messages::types::{Message, MessageState, ProcessedMessageState};
@@ -1629,8 +1631,7 @@ mod tests {
             image_hash,
             image_key,
             image_nonce,
-            needs_self_update: false,
-            last_self_update_at: None,
+            self_update_state: SelfUpdateState::NotRequired,
         };
         nostr_storage.save_group(group.clone()).unwrap();
         let found_group = nostr_storage
@@ -1675,8 +1676,7 @@ mod tests {
             image_hash,
             image_key,
             image_nonce,
-            needs_self_update: false,
-            last_self_update_at: None,
+            self_update_state: SelfUpdateState::NotRequired,
         };
         nostr_storage.save_group(group.clone()).unwrap();
         let relay_url1 = RelayUrl::parse("wss://relay1.example.com").unwrap();
@@ -1723,8 +1723,7 @@ mod tests {
             image_hash,
             image_key,
             image_nonce,
-            needs_self_update: false,
-            last_self_update_at: None,
+            self_update_state: SelfUpdateState::NotRequired,
         };
         nostr_storage.save_group(group.clone()).unwrap();
         let group_exporter_secret_0 = GroupExporterSecret {
@@ -1876,8 +1875,7 @@ mod tests {
             image_hash,
             image_key,
             image_nonce,
-            needs_self_update: false,
-            last_self_update_at: None,
+            self_update_state: SelfUpdateState::NotRequired,
         };
         nostr_storage.save_group(group.clone()).unwrap();
         let event_id = EventId::all_zeros();
@@ -2025,8 +2023,7 @@ mod tests {
             image_hash: None,
             image_key: None,
             image_nonce: None,
-            needs_self_update: false,
-            last_self_update_at: None,
+            self_update_state: SelfUpdateState::NotRequired,
         };
         nostr_storage.save_group(group).unwrap();
 
@@ -2123,8 +2120,7 @@ mod tests {
             image_hash: None,
             image_key: None,
             image_nonce: None,
-            needs_self_update: false,
-            last_self_update_at: None,
+            self_update_state: SelfUpdateState::NotRequired,
         };
         nostr_storage.save_group(group).unwrap();
 
@@ -2244,8 +2240,7 @@ mod tests {
             image_hash: None,
             image_key: None,
             image_nonce: None,
-            needs_self_update: false,
-            last_self_update_at: None,
+            self_update_state: SelfUpdateState::NotRequired,
         };
         nostr_storage.save_group(group).unwrap();
 
@@ -2325,8 +2320,7 @@ mod tests {
             image_hash,
             image_key,
             image_nonce,
-            needs_self_update: false,
-            last_self_update_at: None,
+            self_update_state: SelfUpdateState::NotRequired,
         };
 
         // Save the group
@@ -2364,8 +2358,7 @@ mod tests {
             image_hash,
             image_key,
             image_nonce,
-            needs_self_update: false,
-            last_self_update_at: None,
+            self_update_state: SelfUpdateState::NotRequired,
         };
 
         // Save the group
@@ -2399,8 +2392,7 @@ mod tests {
             image_hash: None,
             image_key: None,
             image_nonce: None,
-            needs_self_update: false,
-            last_self_update_at: None,
+            self_update_state: SelfUpdateState::NotRequired,
         };
         storage.save_group(group.clone()).unwrap();
 
@@ -2456,8 +2448,7 @@ mod tests {
             image_hash: None,
             image_key: None,
             image_nonce: None,
-            needs_self_update: false,
-            last_self_update_at: None,
+            self_update_state: SelfUpdateState::NotRequired,
         };
         storage.save_group(group).unwrap();
 
@@ -2565,8 +2556,7 @@ mod tests {
             image_hash: None,
             image_key: None,
             image_nonce: None,
-            needs_self_update: false,
-            last_self_update_at: None,
+            self_update_state: SelfUpdateState::NotRequired,
         };
         storage.save_group(group).unwrap();
 
@@ -2603,8 +2593,7 @@ mod tests {
             image_hash: None,
             image_key: None,
             image_nonce: None,
-            needs_self_update: false,
-            last_self_update_at: None,
+            self_update_state: SelfUpdateState::NotRequired,
         };
         storage.save_group(group.clone()).unwrap();
 
@@ -2675,8 +2664,7 @@ mod tests {
             image_hash: None,
             image_key: None,
             image_nonce: None,
-            needs_self_update: false,
-            last_self_update_at: None,
+            self_update_state: SelfUpdateState::NotRequired,
         };
         storage.save_group(group).unwrap();
 
@@ -2728,8 +2716,7 @@ mod tests {
             image_hash: None,
             image_key: None,
             image_nonce: None,
-            needs_self_update: false,
-            last_self_update_at: None,
+            self_update_state: SelfUpdateState::NotRequired,
         };
         storage.save_group(group).unwrap();
 
@@ -2846,8 +2833,7 @@ mod tests {
             image_hash: None,
             image_key: None,
             image_nonce: None,
-            needs_self_update: false,
-            last_self_update_at: None,
+            self_update_state: SelfUpdateState::NotRequired,
         };
         storage.save_group(group1).unwrap();
 
@@ -2872,8 +2858,7 @@ mod tests {
             image_hash: None,
             image_key: None,
             image_nonce: None,
-            needs_self_update: false,
-            last_self_update_at: None,
+            self_update_state: SelfUpdateState::NotRequired,
         };
         storage.save_group(group2).unwrap();
 
@@ -2922,8 +2907,7 @@ mod tests {
             image_hash: None,
             image_key: None,
             image_nonce: None,
-            needs_self_update: false,
-            last_self_update_at: None,
+            self_update_state: SelfUpdateState::NotRequired,
         };
         storage.save_group(modified_group1).unwrap();
 
@@ -2978,8 +2962,7 @@ mod tests {
             image_hash: None,
             image_key: None,
             image_nonce: None,
-            needs_self_update: false,
-            last_self_update_at: None,
+            self_update_state: SelfUpdateState::NotRequired,
         };
         storage.save_group(group.clone()).unwrap();
 
@@ -3065,8 +3048,7 @@ mod tests {
             image_hash: None,
             image_key: None,
             image_nonce: None,
-            needs_self_update: false,
-            last_self_update_at: None,
+            self_update_state: SelfUpdateState::NotRequired,
         };
 
         let group2 = Group {
@@ -3083,8 +3065,7 @@ mod tests {
             image_hash: None,
             image_key: None,
             image_nonce: None,
-            needs_self_update: false,
-            last_self_update_at: None,
+            self_update_state: SelfUpdateState::NotRequired,
         };
 
         storage.save_group(group1.clone()).unwrap();
@@ -3177,8 +3158,7 @@ mod tests {
             image_hash: None,
             image_key: None,
             image_nonce: None,
-            needs_self_update: false,
-            last_self_update_at: None,
+            self_update_state: SelfUpdateState::NotRequired,
         };
 
         let group2 = Group {
@@ -3195,8 +3175,7 @@ mod tests {
             image_hash: None,
             image_key: None,
             image_nonce: None,
-            needs_self_update: false,
-            last_self_update_at: None,
+            self_update_state: SelfUpdateState::NotRequired,
         };
 
         storage.save_group(group1).unwrap();
@@ -3301,8 +3280,7 @@ mod tests {
             image_hash: None,
             image_key: None,
             image_nonce: None,
-            needs_self_update: false,
-            last_self_update_at: None,
+            self_update_state: SelfUpdateState::NotRequired,
         };
 
         storage.save_group(group).unwrap();
@@ -3358,8 +3336,7 @@ mod tests {
             image_hash: None,
             image_key: None,
             image_nonce: None,
-            needs_self_update: false,
-            last_self_update_at: None,
+            self_update_state: SelfUpdateState::NotRequired,
         };
         storage.save_group(group).unwrap();
 
@@ -3606,8 +3583,7 @@ mod tests {
             image_hash: None,
             image_key: None,
             image_nonce: None,
-            needs_self_update: false,
-            last_self_update_at: None,
+            self_update_state: SelfUpdateState::NotRequired,
         };
         storage.save_group(group).unwrap();
 
@@ -3719,8 +3695,7 @@ mod tests {
             image_hash: None,
             image_key: None,
             image_nonce: None,
-            needs_self_update: false,
-            last_self_update_at: None,
+            self_update_state: SelfUpdateState::NotRequired,
         };
         storage.save_group(group).unwrap();
 
@@ -3793,8 +3768,7 @@ mod tests {
             image_hash: None,
             image_key: None,
             image_nonce: None,
-            needs_self_update: false,
-            last_self_update_at: None,
+            self_update_state: SelfUpdateState::NotRequired,
         };
         storage.save_group(group).unwrap();
 
@@ -3879,8 +3853,7 @@ mod tests {
             image_hash: None,
             image_key: None,
             image_nonce: None,
-            needs_self_update: false,
-            last_self_update_at: None,
+            self_update_state: SelfUpdateState::NotRequired,
         };
         storage.save_group(group).unwrap();
 

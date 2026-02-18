@@ -27,6 +27,14 @@
 
 ### Breaking changes
 
+- **Self-update tracking via `SelfUpdateState` enum**: Replaced the `needs_self_update: bool` and `last_self_update_at: Option<Timestamp>` fields on `Group` with a single `self_update_state: SelfUpdateState` field. The new `SelfUpdateState` enum has three variants: `NotRequired` (default, no obligation), `Required` (post-join obligation per MIP-02), and `CompletedAt(Timestamp)` (last rotation time for MIP-00 staleness checks). All code that constructs `Group` structs must be updated. ([#184](https://github.com/marmot-protocol/mdk/pull/184))
+
+### Added
+
+- **`groups_needing_self_update()` default method**: Added a default implementation on `GroupStorage` that returns active groups needing a self-update based on `SelfUpdateState::Required` or `SelfUpdateState::CompletedAt` staleness exceeding a configurable threshold. ([#184](https://github.com/marmot-protocol/mdk/pull/184))
+
+### Breaking changes
+
 - **MLS codec switched from JSON to postcard**: `JsonCodec` has been removed and replaced with `MlsCodec`, which uses the `postcard` binary serialization format instead of `serde_json`. MLS storage keys and entities are now significantly more compact (~33 bytes for a 32-byte group_id vs ~130 bytes with JSON). All persisted MLS data is incompatible and must be recreated. ([#179](https://github.com/marmot-protocol/mdk/pull/179))
 
 ### Added

@@ -234,13 +234,11 @@ pub trait GroupStorage {
     ) -> Result<(), GroupError>;
 
     /// Returns active groups that need a self-update: either because
-    /// `needs_self_update` is `true` (post-join requirement) or because
-    /// `last_self_update_at` is older than `threshold_secs` seconds ago
-    /// (periodic rotation).
+    /// `self_update_state` is [`SelfUpdateState::Required`] (post-join
+    /// requirement per MIP-02) or because the last self-update is older than
+    /// `threshold_secs` seconds ago (periodic rotation per MIP-00).
     ///
-    /// Groups that have never self-updated (`last_self_update_at == None`)
-    /// and do not have `needs_self_update` set are NOT included — they
-    /// were created (not joined) and have no rotation obligation yet.
+    /// Groups with [`SelfUpdateState::NotRequired`] are NOT included.
     fn groups_needing_self_update(&self, threshold_secs: u64) -> Result<Vec<GroupId>, GroupError> {
         let now = Timestamp::now().as_secs();
         let groups = self.all_groups()?;
@@ -250,13 +248,13 @@ pub trait GroupStorage {
                 if g.state != types::GroupState::Active {
                     return false;
                 }
-                if g.needs_self_update {
-                    return true;
+                match g.self_update_state {
+                    types::SelfUpdateState::NotRequired => false,
+                    types::SelfUpdateState::Required => true,
+                    types::SelfUpdateState::CompletedAt(ts) => {
+                        now.saturating_sub(ts.as_secs()) >= threshold_secs
+                    }
                 }
-                if let Some(ts) = g.last_self_update_at {
-                    return now.saturating_sub(ts.as_secs()) >= threshold_secs;
-                }
-                false
             })
             .map(|g| g.mls_group_id)
             .collect())

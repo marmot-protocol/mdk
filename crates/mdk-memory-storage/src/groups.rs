@@ -317,8 +317,7 @@ mod tests {
             image_hash: None,
             image_key: None,
             image_nonce: None,
-            needs_self_update: false,
-            last_self_update_at: None,
+            self_update_state: SelfUpdateState::NotRequired,
         }
     }
 
@@ -478,8 +477,7 @@ mod tests {
             image_hash: None,
             image_key: None,
             image_nonce: None,
-            needs_self_update: false,
-            last_self_update_at: None,
+            self_update_state: SelfUpdateState::NotRequired,
         };
 
         storage.save_group(group).unwrap();
@@ -605,8 +603,7 @@ mod tests {
             image_hash: None,
             image_key: None,
             image_nonce: None,
-            needs_self_update: false,
-            last_self_update_at: None,
+            self_update_state: SelfUpdateState::NotRequired,
         };
         storage.save_group(empty_group).unwrap();
 
@@ -723,8 +720,7 @@ mod tests {
             image_hash: None,
             image_key: None,
             image_nonce: None,
-            needs_self_update: false,
-            last_self_update_at: None,
+            self_update_state: SelfUpdateState::NotRequired,
         };
 
         storage.save_group(group1).unwrap();
@@ -746,8 +742,7 @@ mod tests {
             image_hash: None,
             image_key: None,
             image_nonce: None,
-            needs_self_update: false,
-            last_self_update_at: None,
+            self_update_state: SelfUpdateState::NotRequired,
         };
 
         // This should fail because nostr_group_id is already used by a different group
@@ -792,8 +787,7 @@ mod tests {
             image_hash: None,
             image_key: None,
             image_nonce: None,
-            needs_self_update: false,
-            last_self_update_at: None,
+            self_update_state: SelfUpdateState::NotRequired,
         };
 
         storage.save_group(group).unwrap();
@@ -821,8 +815,7 @@ mod tests {
             image_hash: None,
             image_key: None,
             image_nonce: None,
-            needs_self_update: false,
-            last_self_update_at: None,
+            self_update_state: SelfUpdateState::NotRequired,
         };
 
         storage.save_group(updated_group).unwrap();
@@ -868,8 +861,7 @@ mod tests {
             image_hash: None,
             image_key: None,
             image_nonce: None,
-            needs_self_update: false,
-            last_self_update_at: None,
+            self_update_state: SelfUpdateState::NotRequired,
         };
 
         storage.save_group(group).unwrap();
@@ -889,8 +881,7 @@ mod tests {
             image_hash: None,
             image_key: None,
             image_nonce: None,
-            needs_self_update: false,
-            last_self_update_at: None,
+            self_update_state: SelfUpdateState::NotRequired,
         };
 
         // This should succeed - updating the same group

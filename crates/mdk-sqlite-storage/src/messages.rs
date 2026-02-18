@@ -352,7 +352,7 @@ mod tests {
 
     use mdk_storage_traits::GroupId;
     use mdk_storage_traits::groups::GroupStorage;
-    use mdk_storage_traits::groups::types::{Group, GroupState};
+    use mdk_storage_traits::groups::types::{Group, GroupState, SelfUpdateState};
     use mdk_storage_traits::messages::types::{MessageState, ProcessedMessageState};
     use nostr::{EventId, Kind, PublicKey, Tags, Timestamp, UnsignedEvent};
 
@@ -381,8 +381,7 @@ mod tests {
             image_hash: None,
             image_key: None,
             image_nonce: None,
-            needs_self_update: false,
-            last_self_update_at: None,
+            self_update_state: SelfUpdateState::NotRequired,
         };
 
         // Save the group
@@ -495,8 +494,7 @@ mod tests {
             image_hash: None,
             image_key: None,
             image_nonce: None,
-            needs_self_update: false,
-            last_self_update_at: None,
+            self_update_state: SelfUpdateState::NotRequired,
         };
         storage.save_group(group).unwrap();
 
@@ -559,8 +557,7 @@ mod tests {
             image_hash: None,
             image_key: None,
             image_nonce: None,
-            needs_self_update: false,
-            last_self_update_at: None,
+            self_update_state: SelfUpdateState::NotRequired,
         };
 
         let group_2 = Group {
@@ -577,8 +574,7 @@ mod tests {
             image_hash: None,
             image_key: None,
             image_nonce: None,
-            needs_self_update: false,
-            last_self_update_at: None,
+            self_update_state: SelfUpdateState::NotRequired,
         };
 
         storage.save_group(group_1).unwrap();
@@ -787,8 +783,7 @@ mod tests {
             image_hash: None,
             image_key: None,
             image_nonce: None,
-            needs_self_update: false,
-            last_self_update_at: None,
+            self_update_state: SelfUpdateState::NotRequired,
         };
         storage.save_group(group).unwrap();
 

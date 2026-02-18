@@ -1179,10 +1179,11 @@ pub struct Group {
     pub epoch: u64,
     /// Group state (e.g., "active", "archived")
     pub state: String,
-    /// Whether this group needs a post-join self-update (MIP-02)
-    pub needs_self_update: bool,
-    /// Unix timestamp of the last successful self-update merge
-    pub last_self_update_at: Option<u64>,
+    /// Self-update tracking state.
+    /// - `"not_required"`: No self-update obligation (e.g., group creator).
+    /// - `"required"`: Must perform a post-join self-update (MIP-02).
+    /// - `"<unix_timestamp>"`: Last self-update merged at this time (MIP-00).
+    pub self_update_state: String,
 }
 
 impl From<group_types::Group> for Group {
@@ -1201,8 +1202,11 @@ impl From<group_types::Group> for Group {
             last_message_processed_at: g.last_message_processed_at.map(|ts| ts.as_secs()),
             epoch: g.epoch,
             state: g.state.as_str().to_string(),
-            needs_self_update: g.needs_self_update,
-            last_self_update_at: g.last_self_update_at.map(|ts| ts.as_secs()),
+            self_update_state: match g.self_update_state {
+                group_types::SelfUpdateState::NotRequired => "not_required".to_string(),
+                group_types::SelfUpdateState::Required => "required".to_string(),
+                group_types::SelfUpdateState::CompletedAt(ts) => ts.as_secs().to_string(),
+            },
         }
     }
 }

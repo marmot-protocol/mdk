@@ -25,6 +25,10 @@
 
 ## Unreleased
 
+### Added
+
+- **Self-update tracking column**: Added V004 migration adding `last_self_update_at INTEGER` column to the `groups` table for self-update state tracking. `NULL` = no obligation, `0` = required (MIP-02), `>0` = unix timestamp of last rotation (MIP-00). The column is also captured and restored by the snapshot/rollback mechanism. ([#184](https://github.com/marmot-protocol/mdk/pull/184))
+
 ### Breaking changes
 
 - **MLS codec switched from JSON to postcard**: MLS storage serialization now uses `MlsCodec` (postcard binary format) instead of the removed `JsonCodec` (serde_json). Existing SQLite databases contain JSON-encoded MLS data and are incompatible — they must be recreated. ([#179](https://github.com/marmot-protocol/mdk/pull/179))

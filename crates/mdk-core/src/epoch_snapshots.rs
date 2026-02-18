@@ -628,7 +628,7 @@ mod tests {
 
         // We need to set up the group in storage first
         use mdk_storage_traits::groups::GroupStorage;
-        use mdk_storage_traits::groups::types::{Group, GroupState};
+        use mdk_storage_traits::groups::types::{Group, GroupState, SelfUpdateState};
         use nostr::PublicKey;
         use std::collections::BTreeSet;
 
@@ -649,8 +649,7 @@ mod tests {
             image_key: None,
             image_nonce: None,
             state: GroupState::Active,
-            needs_self_update: false,
-            last_self_update_at: None,
+            self_update_state: SelfUpdateState::NotRequired,
         };
         storage.save_group(group).unwrap();
 
@@ -676,7 +675,7 @@ mod tests {
 
         // Set up group in storage
         use mdk_storage_traits::groups::GroupStorage;
-        use mdk_storage_traits::groups::types::{Group, GroupState};
+        use mdk_storage_traits::groups::types::{Group, GroupState, SelfUpdateState};
         use nostr::PublicKey;
         use std::collections::BTreeSet;
 
@@ -697,8 +696,7 @@ mod tests {
             image_key: None,
             image_nonce: None,
             state: GroupState::Active,
-            needs_self_update: false,
-            last_self_update_at: None,
+            self_update_state: SelfUpdateState::NotRequired,
         };
         storage.save_group(group).unwrap();
 
@@ -831,7 +829,7 @@ mod tests {
 
         // Set up group
         use mdk_storage_traits::groups::GroupStorage;
-        use mdk_storage_traits::groups::types::{Group, GroupState};
+        use mdk_storage_traits::groups::types::{Group, GroupState, SelfUpdateState};
         use nostr::PublicKey;
         use std::collections::BTreeSet;
 
@@ -852,8 +850,7 @@ mod tests {
             image_key: None,
             image_nonce: None,
             state: GroupState::Active,
-            needs_self_update: false,
-            last_self_update_at: None,
+            self_update_state: SelfUpdateState::NotRequired,
         };
         storage.save_group(group).unwrap();
 
@@ -939,7 +936,7 @@ mod tests {
 
         // Set up group in storage
         use mdk_storage_traits::groups::GroupStorage;
-        use mdk_storage_traits::groups::types::{Group, GroupState};
+        use mdk_storage_traits::groups::types::{Group, GroupState, SelfUpdateState};
         use nostr::PublicKey;
         use std::collections::BTreeSet;
 
@@ -960,8 +957,7 @@ mod tests {
             image_key: None,
             image_nonce: None,
             state: GroupState::Active,
-            needs_self_update: false,
-            last_self_update_at: None,
+            self_update_state: SelfUpdateState::NotRequired,
         };
         storage.save_group(group).unwrap();
 

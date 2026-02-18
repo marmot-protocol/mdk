@@ -1,6 +1,6 @@
--- Add self-update tracking fields to groups table (MIP-02 post-join self-update).
--- needs_self_update: set after accept_welcome(), cleared after merge_pending_commit()
--- last_self_update_at: timestamp of last successful self-update merge
+-- Add self-update tracking to groups table.
+-- NULL = no self-update obligation (e.g., group creator before first rotation)
+-- 0    = self-update required (post-join obligation per MIP-02)
+-- >0   = unix timestamp of last successful self-update (periodic rotation per MIP-00)
 
-ALTER TABLE groups ADD COLUMN needs_self_update INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE groups ADD COLUMN last_self_update_at INTEGER;

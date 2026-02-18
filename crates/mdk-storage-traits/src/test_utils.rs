@@ -22,7 +22,7 @@ pub mod cross_storage {
 
     use crate::groups::GroupStorage;
     use crate::groups::error::GroupError;
-    use crate::groups::types::{Group, GroupExporterSecret, GroupState};
+    use crate::groups::types::{Group, GroupExporterSecret, GroupState, SelfUpdateState};
     use crate::messages::MessageStorage;
     use crate::messages::types::{Message, MessageState, ProcessedMessage, ProcessedMessageState};
     use crate::welcomes::WelcomeStorage;
@@ -51,8 +51,7 @@ pub mod cross_storage {
             image_hash: None,
             image_key: None,
             image_nonce: None,
-            needs_self_update: false,
-            last_self_update_at: None,
+            self_update_state: SelfUpdateState::NotRequired,
         }
     }
 

@@ -23,6 +23,11 @@
 
 ## Unreleased
 
+### Added
+
+- **Self-update tracking**: `accept_welcome()` now sets `self_update_state` to `SelfUpdateState::Required` on the joined group (MIP-02 post-join obligation). `merge_pending_commit()` detects pure self-update commits and transitions the state to `SelfUpdateState::CompletedAt(now)`, recording the rotation timestamp for MIP-00 periodic staleness checks. `create_group()` initializes the state to `SelfUpdateState::NotRequired` (creator has no immediate obligation). ([#184](https://github.com/marmot-protocol/mdk/pull/184))
+- **`groups_needing_self_update()` method**: Returns group IDs of active groups that need a self-update, either because the state is `Required` or because the last rotation is older than a configurable threshold. ([#184](https://github.com/marmot-protocol/mdk/pull/184))
+
 ### Fixed
 
 - **Welcome validation no longer requires `client` tag**: The `validate_welcome_event` function now correctly treats the `client` tag as optional per MIP-02. Previously, welcome events without a `client` tag were rejected, which would cause spec-compliant third-party implementations to be unable to send Welcome events to MDK-based clients. ([#186](https://github.com/marmot-protocol/mdk/pull/186))
