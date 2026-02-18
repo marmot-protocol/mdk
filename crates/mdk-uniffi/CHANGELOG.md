@@ -27,14 +27,7 @@
 
 ### Breaking changes
 
-- **Self-update tracking field change**: The `Group` record's `needs_self_update: bool` and `last_self_update_at: Option<u64>` fields have been replaced with a single `self_update_state: String` field. Values are `"not_required"`, `"required"`, or a unix timestamp string. ([#184](https://github.com/marmot-protocol/mdk/pull/184))
-
-### Added
-
-- **`groups_needing_self_update()` method**: Returns hex-encoded group IDs of active groups that need a self-update (post-join obligation or stale rotation), given a threshold in seconds. ([#184](https://github.com/marmot-protocol/mdk/pull/184))
-
-### Breaking changes
-
+- **Self-update tracking field change**: The `Group` record's `needs_self_update: bool` and `last_self_update_at: Option<u64>` fields have been replaced with a single `self_update_state: String` field. Values are `"not_required"`, `"required"`, or `"completed_at:<unix_timestamp>"`. ([#184](https://github.com/marmot-protocol/mdk/pull/184))
 - **`KeyPackageResult` now includes `hash_ref`**: The `KeyPackageResult` struct returned by `create_key_package_for_event` and `create_key_package_for_event_with_options` now includes a `hash_ref: Vec<u8>` field containing the serialized hash reference of the key package. This enables callers to track key packages for lifecycle management without re-parsing. ([#178](https://github.com/marmot-protocol/mdk/pull/178))
 - **`create_key_package_for_event` No Longer Adds Protected Tag**: The `create_key_package_for_event()` function no longer adds the NIP-70 protected tag by default. This is a behavioral change - existing code that relied on the protected tag being present will now produce key packages without it. Key packages can now be republished by third parties to any relay. For users who need the protected tag, use the new `create_key_package_for_event_with_options()` function with `protected: true`. ([#173](https://github.com/marmot-protocol/mdk/pull/173), related: [#168](https://github.com/marmot-protocol/mdk/issues/168))
 - **Security (Audit Issue M)**: Changed `get_message()` to require both `mls_group_id` and `event_id` parameters. This prevents messages from different groups from overwriting each other by scoping lookups to a specific group. ([#124](https://github.com/marmot-protocol/mdk/pull/124))
@@ -49,6 +42,7 @@
 
 ### Added
 
+- **`groups_needing_self_update()` method**: Returns hex-encoded group IDs of active groups that need a self-update (post-join obligation or stale rotation), given a threshold in seconds. ([#184](https://github.com/marmot-protocol/mdk/pull/184))
 - **Custom Message Sort Order**: `get_messages()` now accepts an optional `sort_order` parameter (`"created_at_first"` or `"processed_at_first"`) to control message ordering. Defaults to `"created_at_first"` when omitted. ([#171](https://github.com/marmot-protocol/mdk/pull/171))
 - **Last Message by Sort Order**: Added `get_last_message(mls_group_id, sort_order)` method to retrieve the most recent message under a given sort order, so clients using `"processed_at_first"` can get a "last message" consistent with their `get_messages()` ordering. ([#171](https://github.com/marmot-protocol/mdk/pull/171))
 - **`create_key_package_for_event_with_options`**: New function that allows specifying whether to include the NIP-70 protected tag. Use this if you need to publish to relays that accept protected events. ([#173](https://github.com/marmot-protocol/mdk/pull/173), related: [#168](https://github.com/marmot-protocol/mdk/issues/168))

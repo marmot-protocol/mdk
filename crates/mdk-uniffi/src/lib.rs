@@ -1182,7 +1182,7 @@ pub struct Group {
     /// Self-update tracking state.
     /// - `"not_required"`: No self-update obligation (e.g., group creator).
     /// - `"required"`: Must perform a post-join self-update (MIP-02).
-    /// - `"<unix_timestamp>"`: Last self-update merged at this time (MIP-00).
+    /// - `"completed_at:<unix_timestamp>"`: Last self-update merged at this time (MIP-00).
     pub self_update_state: String,
 }
 
@@ -1205,7 +1205,9 @@ impl From<group_types::Group> for Group {
             self_update_state: match g.self_update_state {
                 group_types::SelfUpdateState::NotRequired => "not_required".to_string(),
                 group_types::SelfUpdateState::Required => "required".to_string(),
-                group_types::SelfUpdateState::CompletedAt(ts) => ts.as_secs().to_string(),
+                group_types::SelfUpdateState::CompletedAt(ts) => {
+                    format!("completed_at:{}", ts.as_secs())
+                }
             },
         }
     }

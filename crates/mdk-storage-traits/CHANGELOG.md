@@ -28,17 +28,11 @@
 ### Breaking changes
 
 - **Self-update tracking via `SelfUpdateState` enum**: Replaced the `needs_self_update: bool` and `last_self_update_at: Option<Timestamp>` fields on `Group` with a single `self_update_state: SelfUpdateState` field. The new `SelfUpdateState` enum has three variants: `NotRequired` (default, no obligation), `Required` (post-join obligation per MIP-02), and `CompletedAt(Timestamp)` (last rotation time for MIP-00 staleness checks). All code that constructs `Group` structs must be updated. ([#184](https://github.com/marmot-protocol/mdk/pull/184))
-
-### Added
-
-- **`groups_needing_self_update()` default method**: Added a default implementation on `GroupStorage` that returns active groups needing a self-update based on `SelfUpdateState::Required` or `SelfUpdateState::CompletedAt` staleness exceeding a configurable threshold. ([#184](https://github.com/marmot-protocol/mdk/pull/184))
-
-### Breaking changes
-
 - **MLS codec switched from JSON to postcard**: `JsonCodec` has been removed and replaced with `MlsCodec`, which uses the `postcard` binary serialization format instead of `serde_json`. MLS storage keys and entities are now significantly more compact (~33 bytes for a 32-byte group_id vs ~130 bytes with JSON). All persisted MLS data is incompatible and must be recreated. ([#179](https://github.com/marmot-protocol/mdk/pull/179))
 
 ### Added
 
+- **`groups_needing_self_update()` default method**: Added a default implementation on `GroupStorage` that returns active groups needing a self-update based on `SelfUpdateState::Required` or `SelfUpdateState::CompletedAt` staleness exceeding a configurable threshold. ([#184](https://github.com/marmot-protocol/mdk/pull/184))
 - **Custom Message Sort Order**: Added `MessageSortOrder` enum with `CreatedAtFirst` (default) and `ProcessedAtFirst` variants to allow clients to choose how messages are ordered. Added `sort_order` field to `Pagination` struct and `Pagination::with_sort_order()` constructor. Added `Message::processed_at_order_cmp()` and `Message::compare_processed_at_keys()` comparison methods for the processed-at-first ordering. ([#171](https://github.com/marmot-protocol/mdk/pull/171))
 - **Last Message by Sort Order**: Added `GroupStorage::last_message()` method to query the most recent message in a group according to a given sort order. This allows clients using `ProcessedAtFirst` ordering to get a "last message" consistent with their `messages()` call, independent of the cached `Group::last_message_id` (which always reflects `CreatedAtFirst`). ([#171](https://github.com/marmot-protocol/mdk/pull/171))
 - **Epoch Lookup by Tag Content**: Added `find_message_epoch_by_tag_content` method to `MessageStorage` trait for looking up a message's epoch by searching serialized tag content. Used for MIP-04 media decryption epoch hint resolution. ([#167](https://github.com/marmot-protocol/mdk/pull/167))
