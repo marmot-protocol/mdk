@@ -29,6 +29,8 @@
 
 ### Added
 
+- **`clear_pending_commit` method**: Added `MDK::clear_pending_commit(group_id)` to allow callers to roll back an uncommitted pending MLS commit. This is essential for recovering from failed relay publishes — without it, a single failed publish permanently blocks all future group operations with "pending commit exists" errors. Wraps OpenMLS's `MlsGroup::clear_pending_commit` with MDK's group-loading and error handling. ([#192](https://github.com/marmot-protocol/mdk/pull/192))
+
 ### Fixed
 
 ### Removed
