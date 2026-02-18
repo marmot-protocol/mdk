@@ -1298,11 +1298,15 @@ where
             // Must contain at least one update signal
             let has_update_signal = staged_commit.update_path_leaf_node().is_some()
                 || staged_commit.update_proposals().next().is_some();
-            // All proposals must be Update type (no add/remove/psk/etc.)
-            let all_updates = staged_commit
+            // No non-update proposals present (add/remove/psk/etc.).
+            // Note: `all()` is vacuously true on an empty iterator, which is
+            // the expected case for path-based self-updates where the update
+            // comes via `update_path_leaf_node()` rather than explicit Update
+            // proposals in `queued_proposals()`.
+            let no_non_update_proposals = staged_commit
                 .queued_proposals()
                 .all(|p| matches!(p.proposal(), Proposal::Update(_)));
-            has_update_signal && all_updates
+            has_update_signal && no_non_update_proposals
         });
 
         mls_group.merge_pending_commit(&self.provider)?;

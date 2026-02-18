@@ -21,7 +21,7 @@ use super::error::GroupError;
 /// - `CompletedAt(Timestamp)`: The last self-update was merged at this time.
 ///   Used for periodic rotation staleness checks (MIP-00). Maps to a
 ///   non-zero timestamp in storage.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub enum SelfUpdateState {
     /// No self-update obligation.
     #[default]
@@ -501,5 +501,40 @@ mod tests {
             deserialized.relay_url.to_string(),
             "wss://relay.example.com"
         );
+    }
+
+    #[test]
+    fn test_self_update_state_serde_roundtrip() {
+        // NotRequired serializes to null
+        let val = serde_json::to_value(SelfUpdateState::NotRequired).unwrap();
+        assert_eq!(val, serde_json::Value::Null);
+        let rt: SelfUpdateState = serde_json::from_value(val).unwrap();
+        assert_eq!(rt, SelfUpdateState::NotRequired);
+
+        // Required serializes to 0
+        let val = serde_json::to_value(SelfUpdateState::Required).unwrap();
+        assert_eq!(val, json!(0));
+        let rt: SelfUpdateState = serde_json::from_value(val).unwrap();
+        assert_eq!(rt, SelfUpdateState::Required);
+
+        // CompletedAt serializes to the timestamp seconds
+        let ts = Timestamp::from_secs(1_700_000_000);
+        let val = serde_json::to_value(SelfUpdateState::CompletedAt(ts)).unwrap();
+        assert_eq!(val, json!(1_700_000_000));
+        let rt: SelfUpdateState = serde_json::from_value(val).unwrap();
+        assert_eq!(rt, SelfUpdateState::CompletedAt(ts));
+    }
+
+    #[test]
+    fn test_group_missing_self_update_state_defaults_to_not_required() {
+        // A Group JSON missing self_update_state should deserialize with
+        // SelfUpdateState::NotRequired due to #[serde(default)]
+        let group = make_test_group();
+        let mut val = serde_json::to_value(&group).unwrap();
+
+        // Remove the field entirely
+        val.as_object_mut().unwrap().remove("self_update_state");
+        let deserialized: Group = serde_json::from_value(val).unwrap();
+        assert_eq!(deserialized.self_update_state, SelfUpdateState::NotRequired);
     }
 }

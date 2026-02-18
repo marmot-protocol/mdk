@@ -29,27 +29,13 @@
 
 - **Self-update tracking via `SelfUpdateState` enum**: Replaced the `needs_self_update: bool` and `last_self_update_at: Option<Timestamp>` fields on `Group` with a single `self_update_state: SelfUpdateState` field. The new `SelfUpdateState` enum has three variants: `NotRequired` (default, no obligation), `Required` (post-join obligation per MIP-02), and `CompletedAt(Timestamp)` (last rotation time for MIP-00 staleness checks). All code that constructs `Group` structs must be updated. ([#184](https://github.com/marmot-protocol/mdk/pull/184))
 - **MLS codec switched from JSON to postcard**: `JsonCodec` has been removed and replaced with `MlsCodec`, which uses the `postcard` binary serialization format instead of `serde_json`. MLS storage keys and entities are now significantly more compact (~33 bytes for a 32-byte group_id vs ~130 bytes with JSON). All persisted MLS data is incompatible and must be recreated. ([#179](https://github.com/marmot-protocol/mdk/pull/179))
-
-### Added
-
-- **`groups_needing_self_update()` default method**: Added a default implementation on `GroupStorage` that returns active groups needing a self-update based on `SelfUpdateState::Required` or `SelfUpdateState::CompletedAt` staleness exceeding a configurable threshold. ([#184](https://github.com/marmot-protocol/mdk/pull/184))
-- **Custom Message Sort Order**: Added `MessageSortOrder` enum with `CreatedAtFirst` (default) and `ProcessedAtFirst` variants to allow clients to choose how messages are ordered. Added `sort_order` field to `Pagination` struct and `Pagination::with_sort_order()` constructor. Added `Message::processed_at_order_cmp()` and `Message::compare_processed_at_keys()` comparison methods for the processed-at-first ordering. ([#171](https://github.com/marmot-protocol/mdk/pull/171))
-- **Last Message by Sort Order**: Added `GroupStorage::last_message()` method to query the most recent message in a group according to a given sort order. This allows clients using `ProcessedAtFirst` ordering to get a "last message" consistent with their `messages()` call, independent of the cached `Group::last_message_id` (which always reflects `CreatedAtFirst`). ([#171](https://github.com/marmot-protocol/mdk/pull/171))
-- **Epoch Lookup by Tag Content**: Added `find_message_epoch_by_tag_content` method to `MessageStorage` trait for looking up a message's epoch by searching serialized tag content. Used for MIP-04 media decryption epoch hint resolution. ([#167](https://github.com/marmot-protocol/mdk/pull/167))
-
-### Breaking changes
-
 - **Group `last_message_processed_at` Field**: Added `last_message_processed_at: Option<Timestamp>` field to the `Group` struct to track when the last message was processed/received by this client. This enables consistent ordering between `group.last_message_id` and `get_messages()[0].id` by matching the `messages()` query sort order (`created_at DESC, processed_at DESC, id DESC`). This is a breaking change - all code that constructs `Group` structs must now provide this new field. ([#166](https://github.com/marmot-protocol/mdk/pull/166))
-
 - **Message `processed_at` Field**: Added `processed_at: Timestamp` field to the `Message` struct to track when a message was processed/received by the client. This is distinct from `created_at`, which reflects the sender's timestamp and may differ due to clock skew between devices. This is a breaking change - all code that constructs `Message` structs must now provide this new field. ([#166](https://github.com/marmot-protocol/mdk/pull/166))
-
 - **Retryable Message State**: Added `ProcessedMessageState::Retryable` variant and `MessageStorage::mark_processed_message_retryable()` method to support message retries after rollback or temporary failures. This is a breaking change because `ProcessedMessageState` is not marked `#[non_exhaustive]`, so downstream users must update exhaustive match statements to handle the new `Retryable` variant, and storage trait implementations must implement the new `mark_processed_message_retryable()` method. ([#161](https://github.com/marmot-protocol/mdk/pull/161))
-
 - **Snapshot API**: Added group-scoped snapshot management methods to `MdkStorageProvider` trait to support MIP-03 commit race resolution. Implementations must now provide: ([#152](https://github.com/marmot-protocol/mdk/pull/152))
   - `create_group_snapshot(group_id, name)`: Create a named snapshot of a group's current state
   - `rollback_group_to_snapshot(group_id, name)`: Roll back a group's state to a named snapshot
   - `release_group_snapshot(group_id, name)`: Release/delete a group's named snapshot
-
 - **Unified Storage Architecture**: The `MdkStorageProvider` trait now requires implementors to directly implement OpenMLS's `StorageProvider<1>` trait, enabling atomic transactions across MLS and MDK state. This is required for proper commit race resolution per MIP-03. ([#148](https://github.com/marmot-protocol/mdk/pull/148))
   - Removed `OpenMlsStorageProvider` associated type
   - Removed `openmls_storage()` and `openmls_storage_mut()` accessor methods
@@ -73,6 +59,10 @@
 
 ### Added
 
+- **`groups_needing_self_update()` default method**: Added a default implementation on `GroupStorage` that returns active groups needing a self-update based on `SelfUpdateState::Required` or `SelfUpdateState::CompletedAt` staleness exceeding a configurable threshold. ([#184](https://github.com/marmot-protocol/mdk/pull/184))
+- **Custom Message Sort Order**: Added `MessageSortOrder` enum with `CreatedAtFirst` (default) and `ProcessedAtFirst` variants to allow clients to choose how messages are ordered. Added `sort_order` field to `Pagination` struct and `Pagination::with_sort_order()` constructor. Added `Message::processed_at_order_cmp()` and `Message::compare_processed_at_keys()` comparison methods for the processed-at-first ordering. ([#171](https://github.com/marmot-protocol/mdk/pull/171))
+- **Last Message by Sort Order**: Added `GroupStorage::last_message()` method to query the most recent message in a group according to a given sort order. This allows clients using `ProcessedAtFirst` ordering to get a "last message" consistent with their `messages()` call, independent of the cached `Group::last_message_id` (which always reflects `CreatedAtFirst`). ([#171](https://github.com/marmot-protocol/mdk/pull/171))
+- **Epoch Lookup by Tag Content**: Added `find_message_epoch_by_tag_content` method to `MessageStorage` trait for looking up a message's epoch by searching serialized tag content. Used for MIP-04 media decryption epoch hint resolution. ([#167](https://github.com/marmot-protocol/mdk/pull/167))
 - **MdkStorageError**: New error type for OpenMLS `StorageProvider` trait implementations, with variants for database, serialization, deserialization, not found, and other errors. ([#148](https://github.com/marmot-protocol/mdk/pull/148))
 - **Secret Type and Zeroization**: Added `Secret<T>` wrapper type that automatically zeroizes memory on drop ([#109](https://github.com/marmot-protocol/mdk/pull/109))
   - Implements `Zeroize` trait for `[u8; 32]`, `[u8; 12]`, and `Vec<u8>`
