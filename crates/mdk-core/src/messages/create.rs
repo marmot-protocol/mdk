@@ -15,6 +15,16 @@ use crate::error::Error;
 
 use super::Result;
 
+/// Options for controlling message creation behavior.
+#[derive(Debug, Clone, Default)]
+pub struct CreateMessageOptions {
+    /// When true, the message and processed-message records are NOT persisted to
+    /// storage.  The MLS ratchet still advances (the ciphertext is produced by
+    /// OpenMLS) but MDK's sqlite tables stay clean.  Useful for ephemeral signals
+    /// such as typing indicators that should not pollute chat history.
+    pub skip_storage: bool,
+}
+
 impl<Storage> MDK<Storage>
 where
     Storage: MdkStorageProvider,
@@ -76,15 +86,19 @@ where
     ///
     /// * `Ok(Event)` - The signed Nostr event ready for relay publication
     /// * `Err(Error)` - If message creation or encryption fails
-    pub fn create_message(
+    pub fn create_message(&self, mls_group_id: &GroupId, rumor: UnsignedEvent) -> Result<Event> {
+        self.create_message_with_options(mls_group_id, rumor, CreateMessageOptions::default())
+    }
+
+    /// Creates an encrypted Nostr event with caller-controlled options.
+    ///
+    /// See [`CreateMessageOptions`] for available knobs.
+    pub fn create_message_with_options(
         &self,
         mls_group_id: &GroupId,
         mut rumor: UnsignedEvent,
+        options: CreateMessageOptions,
     ) -> Result<Event> {
-        // Load groups by MLS Group ID (Pattern A)
-        // Used when we already have the MLS group ID (e.g., from API calls).
-        // This is different from Pattern B (in decryption.rs) which loads by
-        // Nostr group ID when processing incoming events.
         let mut mls_group = self
             .load_mls_group(mls_group_id)?
             .ok_or(Error::GroupNotFound)?;
@@ -102,41 +116,43 @@ where
 
         let event = self.build_message_event(mls_group_id, message)?;
 
-        // Create message to save to storage
-        let now = Timestamp::now();
-        let message: message_types::Message = message_types::Message {
-            id: rumor_id,
-            pubkey: rumor.pubkey,
-            kind: rumor.kind,
-            mls_group_id: mls_group_id.clone(),
-            created_at: rumor.created_at,
-            processed_at: now,
-            content: rumor.content.clone(),
-            tags: rumor.tags.clone(),
-            event: rumor.clone(),
-            wrapper_event_id: event.id,
-            state: message_types::MessageState::Created,
-            epoch: Some(mls_group.epoch().as_u64()),
-        };
+        if !options.skip_storage {
+            // Create message to save to storage
+            let now = Timestamp::now();
+            let message: message_types::Message = message_types::Message {
+                id: rumor_id,
+                pubkey: rumor.pubkey,
+                kind: rumor.kind,
+                mls_group_id: mls_group_id.clone(),
+                created_at: rumor.created_at,
+                processed_at: now,
+                content: rumor.content.clone(),
+                tags: rumor.tags.clone(),
+                event: rumor.clone(),
+                wrapper_event_id: event.id,
+                state: message_types::MessageState::Created,
+                epoch: Some(mls_group.epoch().as_u64()),
+            };
 
-        // Create processed_message to track state of message
-        let processed_message = super::create_processed_message_record(
-            event.id,
-            Some(rumor_id),
-            Some(mls_group.epoch().as_u64()),
-            Some(mls_group_id.clone()),
-            message_types::ProcessedMessageState::Created,
-            None,
-        );
+            // Create processed_message to track state of message
+            let processed_message = super::create_processed_message_record(
+                event.id,
+                Some(rumor_id),
+                Some(mls_group.epoch().as_u64()),
+                Some(mls_group_id.clone()),
+                message_types::ProcessedMessageState::Created,
+                None,
+            );
 
-        // Save message and processed message to storage
-        self.save_message_record(message.clone())?;
-        self.save_processed_message_record(processed_message)?;
+            // Save message and processed message to storage
+            self.save_message_record(message.clone())?;
+            self.save_processed_message_record(processed_message)?;
 
-        // Update last_message_at, last_message_processed_at, and last_message_id using
-        // the canonical display-order comparison.
-        group.update_last_message_if_newer(&message);
-        self.save_group_record(group)?;
+            // Update last_message_at, last_message_processed_at, and last_message_id using
+            // the canonical display-order comparison.
+            group.update_last_message_if_newer(&message);
+            self.save_group_record(group)?;
+        }
 
         Ok(event)
     }
@@ -804,4 +820,42 @@ mod tests {
         let event = result.unwrap();
         assert_eq!(event.kind, Kind::MlsGroupMessage);
     }
+
+    #[test]
+    fn test_create_message_skip_storage() {
+        let mdk = create_test_mdk();
+        let (creator, members, admins) = create_test_group_members();
+        let group_id = create_test_group(&mdk, &creator, &members, &admins);
+
+        let mut rumor = create_test_rumor(&creator, "ephemeral signal");
+        let rumor_id = rumor.id();
+
+        let options = super::CreateMessageOptions {
+            skip_storage: true,
+            ..Default::default()
+        };
+
+        let event = mdk
+            .create_message_with_options(&group_id, rumor, options)
+            .expect("Failed to create ephemeral message");
+
+        assert_eq!(event.kind, Kind::MlsGroupMessage);
+
+        // Message must NOT be in storage
+        let stored = mdk
+            .get_message(&group_id, &rumor_id)
+            .expect("storage lookup failed");
+        assert!(stored.is_none(), "ephemeral message should not be stored");
+
+        // Group metadata should not have been updated
+        let group = mdk
+            .get_group(&group_id)
+            .expect("get_group failed")
+            .expect("group should exist");
+        assert!(
+            group.last_message_id.is_none(),
+            "last_message_id should remain unset for ephemeral messages"
+        );
+    }
+
 }
