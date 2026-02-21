@@ -367,7 +367,11 @@ mod tests {
 
         // Test with thumbhash generation
         let result = extract_metadata_from_encoded_image(&png_data, &options, true);
-        assert!(result.is_ok(), "Failed to extract metadata with thumbhash: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "Failed to extract metadata with thumbhash: {:?}",
+            result
+        );
         let metadata = result.unwrap();
         assert_eq!(metadata.dimensions, Some((10, 10)));
         assert!(metadata.thumbhash.is_some());
