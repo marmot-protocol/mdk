@@ -72,7 +72,7 @@ pub(crate) fn extract_metadata_from_encoded_image(
                     reason: format!("Failed to decode image for thumbhash: {}", e),
                 })?;
 
-        metadata.thumbhash = generate_thumbhash(&img);
+        metadata.thumbhash = Some(generate_thumbhash(&img));
     }
 
     Ok(metadata)
@@ -111,7 +111,7 @@ pub(crate) fn extract_metadata_from_decoded_image(
 
     // Generate thumbhash if requested
     if generate_thumbhash_flag {
-        metadata.thumbhash = generate_thumbhash(img);
+        metadata.thumbhash = Some(generate_thumbhash(img));
     }
 
     Ok(metadata)
@@ -126,18 +126,18 @@ pub(crate) fn extract_metadata_from_decoded_image(
 /// * `img` - The decoded image
 ///
 /// # Returns
-/// * `Some(String)` with the thumbhash, or `None` if generation fails
-pub(crate) fn generate_thumbhash(img: &image::DynamicImage) -> Option<String> {
+/// * A base91-encoded thumbhash string
+pub(crate) fn generate_thumbhash(img: &image::DynamicImage) -> String {
     // Resize image for thumbhash (max 100x100 as recommended by thumbhash spec)
     let small_img = img.resize(100, 100, image::imageops::FilterType::Lanczos3);
     // Convert to RGBA8 because thumbhash expects 4 bytes per pixel (RGBA format)
     let rgba_img = small_img.to_rgba8();
 
-    Some(rgba_to_thumb_hash_b91(
+    rgba_to_thumb_hash_b91(
         rgba_img.width() as usize,
         rgba_img.height() as usize,
         rgba_img.as_raw(),
-    ))
+    )
 }
 
 /// Check if a MIME type is a known safe raster format that supports EXIF sanitization
@@ -365,8 +365,12 @@ mod tests {
         assert_eq!(metadata.dimensions, Some((10, 10)));
         assert!(metadata.thumbhash.is_none());
 
-        // Note: Skipping thumbhash test due to known issues with the thumbhash library
-        // The thumbhash functionality is tested in the encrypted_media module tests
+        // Test with thumbhash generation
+        let result = extract_metadata_from_encoded_image(&png_data, &options, true);
+        assert!(result.is_ok(), "Failed to extract metadata with thumbhash: {:?}", result);
+        let metadata = result.unwrap();
+        assert_eq!(metadata.dimensions, Some((10, 10)));
+        assert!(metadata.thumbhash.is_some());
     }
 
     #[test]
@@ -511,13 +515,9 @@ mod tests {
         });
         let dynamic_img = DynamicImage::ImageRgb8(img);
 
-        let result = generate_thumbhash(&dynamic_img);
-        assert!(result.is_some());
-
-        let hash = result.unwrap();
-        // Thumbhash should be a non-empty string
+        let hash = generate_thumbhash(&dynamic_img);
+        // Thumbhash should be a non-empty base91 string
         assert!(!hash.is_empty());
-        // Thumbhash typically starts with a component count indicator
         assert!(hash.len() > 4);
     }
 

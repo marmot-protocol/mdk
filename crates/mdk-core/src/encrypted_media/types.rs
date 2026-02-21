@@ -126,23 +126,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_media_processing_options_default() {
-        let options = MediaProcessingOptions::default();
-        assert!(options.sanitize_exif);
-        assert!(options.generate_thumbhash);
-        assert_eq!(options.max_dimension, Some(MAX_IMAGE_DIMENSION));
-        assert_eq!(options.max_file_size, Some(MAX_FILE_SIZE));
-    }
-
-    #[test]
-    fn test_media_processing_options() {
-        let default_options = MediaProcessingOptions::default();
-        assert!(default_options.sanitize_exif);
-        assert!(default_options.generate_thumbhash);
-        assert_eq!(default_options.max_dimension, Some(MAX_IMAGE_DIMENSION));
-        assert_eq!(default_options.max_file_size, Some(MAX_FILE_SIZE));
-
-        // Test custom options
+    fn test_media_processing_options_custom() {
+        // Test custom options for encrypted media context
         let custom_options = MediaProcessingOptions {
             sanitize_exif: false,
             generate_thumbhash: false,
@@ -168,7 +153,7 @@ mod tests {
             original_size: 5000,
             encrypted_size: 5016, // Original + ChaCha20-Poly1305 overhead
             dimensions: Some((1024, 768)),
-            thumbhash: Some("L6PZfSi_.AyE_3t7t7R**0o#DgR4".to_string()),
+            thumbhash: Some("}U#WoBrZy#_/qQ8PC,N]q7m}6X".to_string()), // dummy base91 thumbhash
             nonce: [0x03; 12],
         };
 

@@ -27,6 +27,8 @@
 
 ### Breaking changes
 
+- **`GroupImageUpload.blurhash` renamed to `thumbhash`**: The `blurhash` field in `GroupImageUpload` (returned by `prepare_group_image_for_upload`) has been renamed to `thumbhash` to reflect the switch from BlurHash to ThumbHash for image preview generation. ([#195](https://github.com/marmot-protocol/mdk/pull/195))
+
 ### Changed
 
 ### Added
