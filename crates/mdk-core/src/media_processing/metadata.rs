@@ -119,8 +119,8 @@ pub(crate) fn extract_metadata_from_decoded_image(
 
 /// Generate thumbhash for an image
 ///
-/// Creates a compact string representation of the image that can be used
-/// to generate a blurred placeholder while the full image loads.
+/// Produces a compact base91-encoded DCT-based preview that captures color,
+/// structure, alpha, and aspect ratio of the original image.
 ///
 /// # Arguments
 /// * `img` - The decoded image
@@ -129,7 +129,8 @@ pub(crate) fn extract_metadata_from_decoded_image(
 /// * A base91-encoded thumbhash string
 pub(crate) fn generate_thumbhash(img: &image::DynamicImage) -> String {
     // Resize image for thumbhash (max 100x100 as recommended by thumbhash spec)
-    let small_img = img.resize(100, 100, image::imageops::FilterType::Lanczos3);
+    // Triangle (bilinear) is sufficient — the output is DCT-compressed anyway
+    let small_img = img.resize(100, 100, image::imageops::FilterType::Triangle);
     // Convert to RGBA8 because thumbhash expects 4 bytes per pixel (RGBA format)
     let rgba_img = small_img.to_rgba8();
 
