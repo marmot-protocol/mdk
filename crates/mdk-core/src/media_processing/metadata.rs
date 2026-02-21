@@ -523,6 +523,13 @@ mod tests {
         // Thumbhash should be a non-empty base91 string
         assert!(!hash.is_empty());
         assert!(hash.len() > 4);
+        // Base91 output must be JSON-safe (no " or \)
+        assert!(
+            !hash.contains('"'),
+            "thumbhash must not contain double quote"
+        );
+        assert!(!hash.contains('\\'), "thumbhash must not contain backslash");
+        assert!(hash.is_ascii(), "thumbhash must be ASCII");
     }
 
     #[test]

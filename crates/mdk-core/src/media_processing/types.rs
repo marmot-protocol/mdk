@@ -201,11 +201,22 @@ mod tests {
         assert_eq!(empty.dimensions, None);
         assert_eq!(empty.thumbhash, None);
 
+        // Default delegates to new()
+        let default = ImageMetadata::default();
+        assert_eq!(default, empty);
+
         let with_dims = ImageMetadata {
             dimensions: Some((1920, 1080)),
             thumbhash: None,
         };
         assert_eq!(with_dims.dimensions, Some((1920, 1080)));
         assert_eq!(with_dims.thumbhash, None);
+
+        let with_thumbhash = ImageMetadata {
+            dimensions: Some((100, 75)),
+            thumbhash: Some("}U#WoBrZy#_/qQ8PC".to_string()),
+        };
+        assert_eq!(with_thumbhash.dimensions, Some((100, 75)));
+        assert!(with_thumbhash.thumbhash.is_some());
     }
 }

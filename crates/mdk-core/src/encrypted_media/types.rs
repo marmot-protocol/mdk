@@ -140,6 +140,7 @@ mod tests {
         assert!(!custom_options.generate_thumbhash);
         assert_eq!(custom_options.max_dimension, Some(1024));
         assert_eq!(custom_options.max_file_size, Some(1024 * 1024));
+        assert_eq!(custom_options.max_filename_length, Some(100));
     }
 
     #[test]
