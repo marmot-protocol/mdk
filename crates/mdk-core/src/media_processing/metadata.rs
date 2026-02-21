@@ -1,13 +1,13 @@
 //! Image metadata extraction and EXIF sanitization
 //!
 //! This module handles extraction of metadata from image files, including
-//! dimensions and blurhash generation for previews. It also provides EXIF
+//! dimensions and thumbhash generation for previews. It also provides EXIF
 //! sanitization for privacy protection.
 
 use std::io::Cursor;
 
-use blurhash::encode;
 use exif::{In, Reader, Tag};
+use fast_thumbhash::rgba_to_thumb_hash_b91;
 use image::codecs::jpeg::JpegEncoder;
 use image::codecs::png::PngEncoder;
 use image::{ImageEncoder, ImageReader};
@@ -18,15 +18,15 @@ use crate::media_processing::validation::validate_image_dimensions;
 /// Extract metadata from an encoded image (decodes the image data first)
 ///
 /// This function decodes the image and extracts dimensions and optionally generates
-/// a blurhash for preview purposes.
+/// a thumbhash for preview purposes.
 ///
 /// # Arguments
 /// * `data` - The encoded image data
 /// * `options` - Validation options for dimension checking
-/// * `generate_blurhash` - Whether to generate a blurhash (requires full decode)
+/// * `generate_thumbhash` - Whether to generate a thumbhash (requires full decode)
 ///
 /// # Returns
-/// * `ImageMetadata` with dimensions and optional blurhash
+/// * `ImageMetadata` with dimensions and optional thumbhash
 ///
 /// # Errors
 /// * `MetadataExtractionFailed` - If the image cannot be decoded
@@ -34,7 +34,7 @@ use crate::media_processing::validation::validate_image_dimensions;
 pub(crate) fn extract_metadata_from_encoded_image(
     data: &[u8],
     options: &MediaProcessingOptions,
-    generate_blurhash_flag: bool,
+    generate_thumbhash_flag: bool,
 ) -> Result<ImageMetadata, MediaProcessingError> {
     // First, get dimensions without full decode for performance
     let img_reader = ImageReader::new(Cursor::new(data))
@@ -54,25 +54,25 @@ pub(crate) fn extract_metadata_from_encoded_image(
 
     let mut metadata = ImageMetadata {
         dimensions: Some((width, height)),
-        blurhash: None,
+        thumbhash: None,
     };
 
-    // Only decode the full image if we need to generate blurhash
-    if generate_blurhash_flag {
+    // Only decode the full image if we need to generate thumbhash
+    if generate_thumbhash_flag {
         let img_reader = ImageReader::new(Cursor::new(data))
             .with_guessed_format()
             .map_err(|e| MediaProcessingError::MetadataExtractionFailed {
-                reason: format!("Failed to read image for blurhash: {}", e),
+                reason: format!("Failed to read image for thumbhash: {}", e),
             })?;
 
         let img =
             img_reader
                 .decode()
                 .map_err(|e| MediaProcessingError::MetadataExtractionFailed {
-                    reason: format!("Failed to decode image for blurhash: {}", e),
+                    reason: format!("Failed to decode image for thumbhash: {}", e),
                 })?;
 
-        metadata.blurhash = generate_blurhash(&img);
+        metadata.thumbhash = generate_thumbhash(&img);
     }
 
     Ok(metadata)
@@ -80,23 +80,23 @@ pub(crate) fn extract_metadata_from_encoded_image(
 
 /// Extract metadata from an already-decoded image
 ///
-/// This function extracts dimensions and blurhash from a decoded DynamicImage,
+/// This function extracts dimensions and thumbhash from a decoded DynamicImage,
 /// avoiding the need to decode the image again.
 ///
 /// # Arguments
 /// * `img` - The decoded image
 /// * `options` - Validation options for dimension checking
-/// * `generate_blurhash_flag` - Whether to generate a blurhash
+/// * `generate_thumbhash_flag` - Whether to generate a thumbhash
 ///
 /// # Returns
-/// * `ImageMetadata` with dimensions and optional blurhash
+/// * `ImageMetadata` with dimensions and optional thumbhash
 ///
 /// # Errors
 /// * `ImageDimensionsTooLarge` / `ImageTooManyPixels` / `ImageMemoryTooLarge` - If dimensions exceed limits
 pub(crate) fn extract_metadata_from_decoded_image(
     img: &image::DynamicImage,
     options: &MediaProcessingOptions,
-    generate_blurhash_flag: bool,
+    generate_thumbhash_flag: bool,
 ) -> Result<ImageMetadata, MediaProcessingError> {
     let width = img.width();
     let height = img.height();
@@ -106,18 +106,18 @@ pub(crate) fn extract_metadata_from_decoded_image(
 
     let mut metadata = ImageMetadata {
         dimensions: Some((width, height)),
-        blurhash: None,
+        thumbhash: None,
     };
 
-    // Generate blurhash if requested
-    if generate_blurhash_flag {
-        metadata.blurhash = generate_blurhash(img);
+    // Generate thumbhash if requested
+    if generate_thumbhash_flag {
+        metadata.thumbhash = generate_thumbhash(img);
     }
 
     Ok(metadata)
 }
 
-/// Generate blurhash for an image
+/// Generate thumbhash for an image
 ///
 /// Creates a compact string representation of the image that can be used
 /// to generate a blurred placeholder while the full image loads.
@@ -126,14 +126,18 @@ pub(crate) fn extract_metadata_from_decoded_image(
 /// * `img` - The decoded image
 ///
 /// # Returns
-/// * `Some(String)` with the blurhash, or `None` if generation fails
-pub(crate) fn generate_blurhash(img: &image::DynamicImage) -> Option<String> {
-    // Resize image for blurhash (max 32x32 for performance)
-    let small_img = img.resize(32, 32, image::imageops::FilterType::Lanczos3);
-    // Convert to RGBA8 because blurhash expects 4 bytes per pixel (RGBA format)
+/// * `Some(String)` with the thumbhash, or `None` if generation fails
+pub(crate) fn generate_thumbhash(img: &image::DynamicImage) -> Option<String> {
+    // Resize image for thumbhash (max 100x100 as recommended by thumbhash spec)
+    let small_img = img.resize(100, 100, image::imageops::FilterType::Lanczos3);
+    // Convert to RGBA8 because thumbhash expects 4 bytes per pixel (RGBA format)
     let rgba_img = small_img.to_rgba8();
 
-    encode(4, 3, rgba_img.width(), rgba_img.height(), rgba_img.as_raw()).ok()
+    Some(rgba_to_thumb_hash_b91(
+        rgba_img.width() as usize,
+        rgba_img.height() as usize,
+        rgba_img.as_raw(),
+    ))
 }
 
 /// Check if a MIME type is a known safe raster format that supports EXIF sanitization
@@ -343,7 +347,7 @@ mod tests {
 
     #[test]
     fn test_extract_metadata_from_encoded_image() {
-        // Create a valid 10x10 red PNG image (1x1 causes issues with blurhash library)
+        // Create a valid 10x10 red PNG image (1x1 causes issues with thumbhash library)
         let img = ImageBuffer::from_fn(10, 10, |_, _| Rgb([255u8, 0u8, 0u8]));
         let mut png_data = Vec::new();
         img.write_to(
@@ -354,15 +358,15 @@ mod tests {
 
         let options = MediaProcessingOptions::validation_only();
 
-        // Test without blurhash
+        // Test without thumbhash
         let result = extract_metadata_from_encoded_image(&png_data, &options, false);
         assert!(result.is_ok(), "Failed to extract metadata: {:?}", result);
         let metadata = result.unwrap();
         assert_eq!(metadata.dimensions, Some((10, 10)));
-        assert!(metadata.blurhash.is_none());
+        assert!(metadata.thumbhash.is_none());
 
-        // Note: Skipping blurhash test due to known issues with the blurhash library
-        // The blurhash functionality is tested in the encrypted_media module tests
+        // Note: Skipping thumbhash test due to known issues with the thumbhash library
+        // The thumbhash functionality is tested in the encrypted_media module tests
     }
 
     #[test]
@@ -384,7 +388,7 @@ mod tests {
         // Test with dimension validation failure
         let strict_options = MediaProcessingOptions {
             sanitize_exif: false,
-            generate_blurhash: false,
+            generate_thumbhash: false,
             max_dimension: Some(0), // This should cause validation to fail
             ..Default::default()
         };
@@ -467,19 +471,19 @@ mod tests {
 
         let options = MediaProcessingOptions::default();
 
-        // Test without blurhash
+        // Test without thumbhash
         let result = extract_metadata_from_decoded_image(&dynamic_img, &options, false);
         assert!(result.is_ok());
         let metadata = result.unwrap();
         assert_eq!(metadata.dimensions, Some((100, 50)));
-        assert!(metadata.blurhash.is_none());
+        assert!(metadata.thumbhash.is_none());
 
-        // Test with blurhash
+        // Test with thumbhash
         let result = extract_metadata_from_decoded_image(&dynamic_img, &options, true);
         assert!(result.is_ok());
         let metadata = result.unwrap();
         assert_eq!(metadata.dimensions, Some((100, 50)));
-        assert!(metadata.blurhash.is_some());
+        assert!(metadata.thumbhash.is_some());
     }
 
     #[test]
@@ -501,19 +505,19 @@ mod tests {
     }
 
     #[test]
-    fn test_generate_blurhash_produces_valid_hash() {
+    fn test_generate_thumbhash_produces_valid_hash() {
         let img: RgbImage = ImageBuffer::from_fn(32, 32, |x, y| {
             Rgb([((x * 8) % 256) as u8, ((y * 8) % 256) as u8, 128u8])
         });
         let dynamic_img = DynamicImage::ImageRgb8(img);
 
-        let result = generate_blurhash(&dynamic_img);
+        let result = generate_thumbhash(&dynamic_img);
         assert!(result.is_some());
 
         let hash = result.unwrap();
-        // Blurhash should be a non-empty string
+        // Thumbhash should be a non-empty string
         assert!(!hash.is_empty());
-        // Blurhash typically starts with a component count indicator
+        // Thumbhash typically starts with a component count indicator
         assert!(hash.len() > 4);
     }
 
@@ -596,7 +600,7 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_metadata_with_blurhash_generation() {
+    fn test_extract_metadata_with_thumbhash_generation() {
         let png_data = create_test_png(32, 32);
         let options = MediaProcessingOptions::default();
 
@@ -605,6 +609,6 @@ mod tests {
 
         let metadata = result.unwrap();
         assert_eq!(metadata.dimensions, Some((32, 32)));
-        assert!(metadata.blurhash.is_some());
+        assert!(metadata.thumbhash.is_some());
     }
 }

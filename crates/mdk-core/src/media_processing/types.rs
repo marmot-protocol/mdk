@@ -27,8 +27,8 @@ pub const MAX_IMAGE_MEMORY_MB: u64 = 256;
 pub struct MediaProcessingOptions {
     /// Sanitize EXIF and other metadata for privacy (default: true)
     pub sanitize_exif: bool,
-    /// Generate blurhash for images (default: true)
-    pub generate_blurhash: bool,
+    /// Generate thumbhash for images (default: true)
+    pub generate_thumbhash: bool,
     /// Maximum allowed dimension for images (default: uses MAX_IMAGE_DIMENSION)
     pub max_dimension: Option<u32>,
     /// Custom file size limit (default: uses MAX_FILE_SIZE)
@@ -40,8 +40,8 @@ pub struct MediaProcessingOptions {
 impl Default for MediaProcessingOptions {
     fn default() -> Self {
         Self {
-            sanitize_exif: true,     // Privacy-first default
-            generate_blurhash: true, // Good UX
+            sanitize_exif: true,      // Privacy-first default
+            generate_thumbhash: true, // Good UX
             max_dimension: Some(MAX_IMAGE_DIMENSION),
             max_file_size: Some(MAX_FILE_SIZE),
             max_filename_length: Some(MAX_FILENAME_LENGTH),
@@ -51,11 +51,11 @@ impl Default for MediaProcessingOptions {
 
 impl MediaProcessingOptions {
     /// Create options suitable for validation-only use cases
-    /// (no sanitization or blurhash generation)
+    /// (no sanitization or thumbhash generation)
     pub fn validation_only() -> Self {
         Self {
             sanitize_exif: false,
-            generate_blurhash: false,
+            generate_thumbhash: false,
             ..Default::default()
         }
     }
@@ -69,8 +69,8 @@ impl MediaProcessingOptions {
 pub struct ImageMetadata {
     /// Image dimensions (width, height)
     pub dimensions: Option<(u32, u32)>,
-    /// Blurhash for preview
-    pub blurhash: Option<String>,
+    /// Thumbhash for preview
+    pub thumbhash: Option<String>,
 }
 
 impl ImageMetadata {
@@ -78,7 +78,7 @@ impl ImageMetadata {
     pub fn new() -> Self {
         Self {
             dimensions: None,
-            blurhash: None,
+            thumbhash: None,
         }
     }
 }
@@ -179,7 +179,7 @@ mod tests {
     fn test_media_processing_options_default() {
         let options = MediaProcessingOptions::default();
         assert!(options.sanitize_exif);
-        assert!(options.generate_blurhash);
+        assert!(options.generate_thumbhash);
         assert_eq!(options.max_dimension, Some(MAX_IMAGE_DIMENSION));
         assert_eq!(options.max_file_size, Some(MAX_FILE_SIZE));
         assert_eq!(options.max_filename_length, Some(MAX_FILENAME_LENGTH));
@@ -189,7 +189,7 @@ mod tests {
     fn test_media_processing_options_validation_only() {
         let options = MediaProcessingOptions::validation_only();
         assert!(!options.sanitize_exif);
-        assert!(!options.generate_blurhash);
+        assert!(!options.generate_thumbhash);
         assert_eq!(options.max_dimension, Some(MAX_IMAGE_DIMENSION));
         assert_eq!(options.max_file_size, Some(MAX_FILE_SIZE));
         assert_eq!(options.max_filename_length, Some(MAX_FILENAME_LENGTH));
@@ -199,13 +199,13 @@ mod tests {
     fn test_image_metadata() {
         let empty = ImageMetadata::new();
         assert_eq!(empty.dimensions, None);
-        assert_eq!(empty.blurhash, None);
+        assert_eq!(empty.thumbhash, None);
 
         let with_dims = ImageMetadata {
             dimensions: Some((1920, 1080)),
-            blurhash: None,
+            thumbhash: None,
         };
         assert_eq!(with_dims.dimensions, Some((1920, 1080)));
-        assert_eq!(with_dims.blurhash, None);
+        assert_eq!(with_dims.thumbhash, None);
     }
 }

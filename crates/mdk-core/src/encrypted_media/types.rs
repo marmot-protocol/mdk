@@ -15,8 +15,8 @@ pub struct MediaMetadata {
     pub mime_type: String,
     /// Dimensions for images/videos (width, height)
     pub dimensions: Option<(u32, u32)>,
-    /// Blurhash for images
-    pub blurhash: Option<String>,
+    /// Thumbhash for images
+    pub thumbhash: Option<String>,
     /// Original file size in bytes
     pub original_size: u64,
 }
@@ -40,8 +40,8 @@ pub struct EncryptedMediaUpload {
     pub encrypted_size: u64,
     /// Image/video dimensions if applicable
     pub dimensions: Option<(u32, u32)>,
-    /// Blurhash for images
-    pub blurhash: Option<String>,
+    /// Thumbhash for images
+    pub thumbhash: Option<String>,
     /// Encryption nonce (96 bits, 12 bytes) - randomly generated per encryption
     pub nonce: [u8; 12],
 }
@@ -129,7 +129,7 @@ mod tests {
     fn test_media_processing_options_default() {
         let options = MediaProcessingOptions::default();
         assert!(options.sanitize_exif);
-        assert!(options.generate_blurhash);
+        assert!(options.generate_thumbhash);
         assert_eq!(options.max_dimension, Some(MAX_IMAGE_DIMENSION));
         assert_eq!(options.max_file_size, Some(MAX_FILE_SIZE));
     }
@@ -138,21 +138,21 @@ mod tests {
     fn test_media_processing_options() {
         let default_options = MediaProcessingOptions::default();
         assert!(default_options.sanitize_exif);
-        assert!(default_options.generate_blurhash);
+        assert!(default_options.generate_thumbhash);
         assert_eq!(default_options.max_dimension, Some(MAX_IMAGE_DIMENSION));
         assert_eq!(default_options.max_file_size, Some(MAX_FILE_SIZE));
 
         // Test custom options
         let custom_options = MediaProcessingOptions {
             sanitize_exif: false,
-            generate_blurhash: false,
+            generate_thumbhash: false,
             max_dimension: Some(1024),
             max_file_size: Some(1024 * 1024),
             max_filename_length: Some(100),
         };
 
         assert!(!custom_options.sanitize_exif);
-        assert!(!custom_options.generate_blurhash);
+        assert!(!custom_options.generate_thumbhash);
         assert_eq!(custom_options.max_dimension, Some(1024));
         assert_eq!(custom_options.max_file_size, Some(1024 * 1024));
     }
@@ -168,7 +168,7 @@ mod tests {
             original_size: 5000,
             encrypted_size: 5016, // Original + ChaCha20-Poly1305 overhead
             dimensions: Some((1024, 768)),
-            blurhash: Some("L6PZfSi_.AyE_3t7t7R**0o#DgR4".to_string()),
+            thumbhash: Some("L6PZfSi_.AyE_3t7t7R**0o#DgR4".to_string()),
             nonce: [0x03; 12],
         };
 
@@ -181,7 +181,7 @@ mod tests {
         assert_eq!(upload.original_size, 5000);
         assert_eq!(upload.encrypted_size, 5016);
         assert_eq!(upload.dimensions, Some((1024, 768)));
-        assert!(upload.blurhash.is_some());
+        assert!(upload.thumbhash.is_some());
         assert_eq!(upload.nonce, [0x03; 12]);
     }
 
