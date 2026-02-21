@@ -57,8 +57,8 @@ pub struct GroupImageUpload {
     pub mime_type: String,
     /// Image dimensions (width, height) if available
     pub dimensions: Option<(u32, u32)>,
-    /// Blurhash for preview if generated
-    pub blurhash: Option<String>,
+    /// Thumbhash for preview if generated
+    pub thumbhash: Option<String>,
 }
 
 /// Group image encryption result with hash (internal type)
@@ -367,7 +367,7 @@ pub fn derive_upload_keypair(
 ///
 /// This function validates the image and MIME type, encrypts it, and derives the upload keypair
 /// in one step, returning everything needed for the upload workflow. Uses default processing
-/// options (EXIF stripping enabled, blurhash generation enabled).
+/// options (EXIF stripping enabled, thumbhash generation enabled).
 ///
 /// # Arguments
 /// * `image_data` - Raw image bytes
@@ -387,7 +387,7 @@ pub fn derive_upload_keypair(
 ///
 /// // Access metadata
 /// println!("Dimensions: {:?}", prepared.dimensions);
-/// println!("Blurhash: {:?}", prepared.blurhash);
+/// println!("Thumbhash: {:?}", prepared.thumbhash);
 /// println!("MIME type: {}", prepared.mime_type);
 /// println!("Original size: {} bytes", prepared.original_size);
 /// println!("Encrypted size: {} bytes", prepared.encrypted_size);
@@ -424,7 +424,7 @@ pub fn prepare_group_image_for_upload(
 /// Prepare group image for upload with custom processing options
 ///
 /// This function provides full control over image processing behavior including
-/// EXIF stripping, blurhash generation, and validation limits.
+/// EXIF stripping, thumbhash generation, and validation limits.
 ///
 /// # Arguments
 /// * `image_data` - Raw image bytes
@@ -441,10 +441,10 @@ pub fn prepare_group_image_for_upload(
 ///
 /// # Example
 /// ```ignore
-/// // Custom options: disable blurhash, enable EXIF stripping
+/// // Custom options: disable thumbhash, enable EXIF stripping
 /// let options = MediaProcessingOptions {
 ///     sanitize_exif: true,
-///     generate_blurhash: false,
+///     generate_thumbhash: false,
 ///     max_dimension: Some(8192),
 ///     max_file_size: Some(10 * 1024 * 1024), // 10MB
 ///     max_filename_length: None,
@@ -475,7 +475,7 @@ pub fn prepare_group_image_for_upload_with_options(
     let original_size = image_data.len();
     let sanitized_data: Vec<u8>;
     let dimensions: Option<(u32, u32)>;
-    let blurhash: Option<String>;
+    let thumbhash: Option<String>;
 
     // Strip EXIF data for privacy if it's a safe raster format (JPEG, PNG)
     // For other formats (GIF, WebP, etc.), use the original data
@@ -493,21 +493,21 @@ pub fn prepare_group_image_for_upload_with_options(
         let metadata = metadata::extract_metadata_from_decoded_image(
             &decoded_img,
             options,
-            options.generate_blurhash,
+            options.generate_thumbhash,
         )?;
 
         sanitized_data = cleaned_data;
         dimensions = metadata.dimensions;
-        blurhash = metadata.blurhash;
+        thumbhash = metadata.thumbhash;
     } else {
         // For non-safe formats (GIF, WebP, etc.), skip EXIF stripping
         // and extract metadata from the encoded image
         let metadata =
-            extract_metadata_from_encoded_image(image_data, options, options.generate_blurhash)?;
+            extract_metadata_from_encoded_image(image_data, options, options.generate_thumbhash)?;
 
         sanitized_data = image_data.to_vec();
         dimensions = metadata.dimensions;
-        blurhash = metadata.blurhash;
+        thumbhash = metadata.thumbhash;
     }
 
     // Now that validation and sanitization passed, proceed with encryption
@@ -528,7 +528,7 @@ pub fn prepare_group_image_for_upload_with_options(
         encrypted_size,
         mime_type: canonical_mime_type,
         dimensions,
-        blurhash,
+        thumbhash,
     })
 }
 
@@ -714,11 +714,11 @@ mod tests {
         )
         .unwrap();
 
-        // Test without blurhash due to bugs in blurhash library v0.2
+        // Test without thumbhash due to bugs in thumbhash library v0.2
         // The important thing is that the metadata structure is returned
         let options = MediaProcessingOptions {
             sanitize_exif: true,
-            generate_blurhash: false,
+            generate_thumbhash: false,
             ..Default::default()
         };
         let prepared =
@@ -732,7 +732,7 @@ mod tests {
 
         // Verify metadata is populated
         assert_eq!(prepared.dimensions, Some((64, 64)));
-        assert_eq!(prepared.blurhash, None); // Disabled for this test
+        assert_eq!(prepared.thumbhash, None); // Disabled for this test
 
         // Verify size fields
         assert_eq!(prepared.original_size, image_data.len());
@@ -897,7 +897,7 @@ mod tests {
 
         let options = MediaProcessingOptions {
             sanitize_exif: true,
-            generate_blurhash: false,
+            generate_thumbhash: false,
             ..Default::default()
         };
 
@@ -953,10 +953,10 @@ mod tests {
         )
         .unwrap();
 
-        // Test with default options but blurhash disabled due to library bugs
+        // Test with default options but thumbhash disabled due to library bugs
         let options = MediaProcessingOptions {
             sanitize_exif: true,
-            generate_blurhash: false, // Disabled due to blurhash library bugs
+            generate_thumbhash: false, // Disabled due to thumbhash library bugs
             ..Default::default()
         };
 
@@ -967,7 +967,7 @@ mod tests {
         let prepared = result.unwrap();
         assert_eq!(prepared.mime_type, "image/png");
         assert_eq!(prepared.dimensions, Some((64, 64)));
-        assert_eq!(prepared.blurhash, None); // Blurhash disabled
+        assert_eq!(prepared.thumbhash, None); // Thumbhash disabled
 
         // Verify EXIF stripping is enabled by checking the data was processed
         assert!(!prepared.encrypted_data.is_empty());
@@ -988,7 +988,7 @@ mod tests {
         // Test with very restrictive size limit that should reject the image
         let restrictive_options = MediaProcessingOptions {
             sanitize_exif: true,
-            generate_blurhash: false,
+            generate_thumbhash: false,
             max_dimension: Some(16),  // Very small limit
             max_file_size: Some(100), // Very small file size
             max_filename_length: None,
@@ -1006,8 +1006,8 @@ mod tests {
 
         // Test with permissive options
         let permissive_options = MediaProcessingOptions {
-            sanitize_exif: false,     // Don't sanitize
-            generate_blurhash: false, // Don't generate blurhash
+            sanitize_exif: false,      // Don't sanitize
+            generate_thumbhash: false, // Don't generate thumbhash
             max_dimension: Some(1024),
             max_file_size: Some(10 * 1024 * 1024), // 10MB
             max_filename_length: None,
@@ -1024,7 +1024,7 @@ mod tests {
         let prepared = result.unwrap();
         assert_eq!(prepared.mime_type, "image/png");
         assert_eq!(prepared.dimensions, Some((32, 32)));
-        assert_eq!(prepared.blurhash, None); // Blurhash disabled
+        assert_eq!(prepared.thumbhash, None); // Thumbhash disabled
     }
 
     /// Test v2 encryption/decryption (current format using seed derivation)

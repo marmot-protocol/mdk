@@ -25,6 +25,8 @@
 
 ### Breaking changes
 
+- **ThumbHash replaces BlurHash**: The `blurhash` dependency has been replaced with [`fast-thumbhash`](https://crates.io/crates/fast-thumbhash) for image preview generation — a 12x faster ThumbHash encoder/decoder with built-in base91 encoding. All `blurhash` fields are renamed to `thumbhash` in `ImageMetadata`, `MediaMetadata`, `EncryptedMediaUpload`, and `GroupImageUpload`. The `generate_blurhash` option in `MediaProcessingOptions` is renamed to `generate_thumbhash`. IMETA tags now emit `thumbhash <base91>` instead of `blurhash <base83>`. Base91 produces shorter strings than BlurHash's base83 (typically 26 vs 28 chars) while encoding strictly more information (alpha channel, aspect ratio, full DCT). The standalone `base64` dependency has been removed. Old IMETA tags with `blurhash` fields are silently ignored during parsing. ([#195](https://github.com/marmot-protocol/mdk/pull/195))
+
 ### Changed
 
 ### Added

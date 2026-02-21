@@ -1354,8 +1354,8 @@ pub struct GroupImageUpload {
     pub mime_type: String,
     /// Image dimensions (width, height) if available
     pub dimensions: Option<ImageDimensions>,
-    /// Blurhash for preview if generated
-    pub blurhash: Option<String>,
+    /// Thumbhash for preview if generated
+    pub thumbhash: Option<String>,
 }
 
 /// Image dimensions
@@ -1389,7 +1389,7 @@ pub fn prepare_group_image_for_upload(
             width: w,
             height: h,
         }),
-        blurhash: prepared.blurhash.clone(),
+        thumbhash: prepared.thumbhash.clone(),
     })
 }
 
