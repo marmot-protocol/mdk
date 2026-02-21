@@ -54,15 +54,6 @@ where
 
         let rumor_id: EventId = rumor.id();
 
-        let processed_message = super::create_processed_message_record(
-            event.id,
-            Some(rumor_id),
-            Some(mls_epoch),
-            Some(group.mls_group_id.clone()),
-            message_types::ProcessedMessageState::Processed,
-            None,
-        );
-
         let now = Timestamp::now();
         let message = message_types::Message {
             id: rumor_id,
@@ -79,15 +70,26 @@ where
             epoch: Some(mls_epoch),
         };
 
-        self.save_message_record(message.clone())?;
-        self.save_processed_message_record(processed_message.clone())?;
+        if !rumor.kind.is_ephemeral() {
+            let processed_message = super::create_processed_message_record(
+                event.id,
+                Some(rumor_id),
+                Some(mls_epoch),
+                Some(group.mls_group_id.clone()),
+                message_types::ProcessedMessageState::Processed,
+                None,
+            );
 
-        // Update last_message_at, last_message_processed_at, and last_message_id only if this
-        // message should appear first in get_messages(). Delegates to the centralized
-        // Group::update_last_message_if_newer which uses the canonical display ordering
-        // (`created_at DESC, processed_at DESC, id DESC`).
-        if group.update_last_message_if_newer(&message) {
-            self.save_group_record(group)?;
+            self.save_message_record(message.clone())?;
+            self.save_processed_message_record(processed_message)?;
+
+            // Update last_message_at, last_message_processed_at, and last_message_id only if this
+            // message should appear first in get_messages(). Delegates to the centralized
+            // Group::update_last_message_if_newer which uses the canonical display ordering
+            // (`created_at DESC, processed_at DESC, id DESC`).
+            if group.update_last_message_if_newer(&message) {
+                self.save_group_record(group)?;
+            }
         }
 
         tracing::debug!(
@@ -102,11 +104,13 @@ where
 mod tests {
     use mdk_storage_traits::messages::MessageStorage;
     use mdk_storage_traits::messages::types as message_types;
-    use nostr::{Keys, Kind};
+    use nostr::{EventBuilder, Keys, Kind};
 
+    use crate::MdkConfig;
     use crate::messages::MessageProcessingResult;
     use crate::test_util::*;
     use crate::tests::create_test_mdk;
+    use crate::tests::create_test_mdk_with_config;
 
     #[test]
     fn test_message_state_tracking() {
@@ -467,5 +471,104 @@ mod tests {
         // - Messages can be processed across epoch transitions
         // - Both clients maintain synchronized state
         // - Message history is consistent across all clients
+    }
+
+    /// Verify that received messages whose inner rumor kind is
+    /// ephemeral are returned but NOT persisted.
+    #[test]
+    fn test_ephemeral_kind_skips_storage_on_receive() {
+        let ephemeral_kind = Kind::Custom(20_000);
+        assert!(ephemeral_kind.is_ephemeral());
+
+        // Alice sends (default config -- stores everything on her side)
+        let alice_keys = Keys::generate();
+        let bob_keys = Keys::generate();
+
+        let alice_mdk = create_test_mdk();
+        let bob_config = MdkConfig {
+            ..Default::default()
+        };
+        let bob_mdk = create_test_mdk_with_config(bob_config);
+
+        let admins = vec![alice_keys.public_key(), bob_keys.public_key()];
+
+        let bob_kp = create_key_package_event(&bob_mdk, &bob_keys);
+        let create_result = alice_mdk
+            .create_group(
+                &alice_keys.public_key(),
+                vec![bob_kp],
+                create_nostr_group_config_data(admins),
+            )
+            .expect("group creation failed");
+
+        let group_id = create_result.group.mls_group_id.clone();
+        alice_mdk.merge_pending_commit(&group_id).unwrap();
+
+        let bob_welcome = bob_mdk
+            .process_welcome(
+                &nostr::EventId::all_zeros(),
+                &create_result.welcome_rumors[0],
+            )
+            .unwrap();
+        bob_mdk.accept_welcome(&bob_welcome).unwrap();
+
+        // Alice sends an ephemeral-kind rumor (typing indicator style)
+        let rumor = EventBuilder::new(ephemeral_kind, "typing").build(alice_keys.public_key());
+
+        let wrapper = alice_mdk
+            .create_message(&group_id, rumor)
+            .expect("create_message failed");
+
+        // Bob processes it
+        let result = bob_mdk
+            .process_message(&wrapper)
+            .expect("process_message failed");
+
+        // Bob should still get the message content back
+        match result {
+            MessageProcessingResult::ApplicationMessage(msg) => {
+                assert_eq!(msg.content, "typing");
+                assert_eq!(msg.kind, ephemeral_kind);
+
+                // But it must NOT be in Bob's storage
+                let stored = bob_mdk
+                    .get_message(&group_id, &msg.id)
+                    .expect("storage lookup failed");
+                assert!(
+                    stored.is_none(),
+                    "ephemeral kind message should not be persisted on receiver"
+                );
+            }
+            other => panic!("Expected ApplicationMessage, got {:?}", other),
+        }
+
+        // Bob's group metadata should be untouched
+        let bob_group = bob_mdk.get_group(&group_id).unwrap().unwrap();
+        assert!(
+            bob_group.last_message_id.is_none(),
+            "last_message_id must not be updated for ephemeral kinds"
+        );
+
+        // A normal message right after should still work and be stored
+        let normal_rumor = create_test_rumor(&alice_keys, "Hello for real");
+        let normal_wrapper = alice_mdk
+            .create_message(&group_id, normal_rumor)
+            .expect("normal create_message failed");
+
+        let normal_result = bob_mdk
+            .process_message(&normal_wrapper)
+            .expect("normal process_message failed");
+
+        match normal_result {
+            MessageProcessingResult::ApplicationMessage(msg) => {
+                assert_eq!(msg.content, "Hello for real");
+
+                let stored = bob_mdk
+                    .get_message(&group_id, &msg.id)
+                    .expect("storage lookup failed");
+                assert!(stored.is_some(), "normal message should be persisted");
+            }
+            other => panic!("Expected ApplicationMessage, got {:?}", other),
+        }
     }
 }

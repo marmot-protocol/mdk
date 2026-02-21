@@ -32,6 +32,8 @@ pub use crate::groups::{
     GroupResult, NostrGroupConfigData, NostrGroupDataUpdate, PendingMemberChanges,
     UpdateGroupResult,
 };
+/// Options for create_message_with_options
+pub use crate::messages::CreateMessageOptions;
 /// Message processing result variants
 pub use crate::messages::MessageProcessingResult;
 /// Welcome operation results

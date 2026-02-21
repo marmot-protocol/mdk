@@ -14,6 +14,7 @@
 mod application;
 mod commit;
 mod create;
+pub use create::CreateMessageOptions;
 mod decryption;
 mod error_handling;
 mod process;
