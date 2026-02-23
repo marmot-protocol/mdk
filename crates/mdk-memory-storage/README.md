@@ -32,4 +32,4 @@ All notable changes to this library are documented in the [CHANGELOG.md](CHANGEL
 
 ## License
 
-This project is distributed under the MIT software license - see the [LICENSE](LICENSE) file for details, or visit <https://opensource.org/licenses/MIT>.
+This project is distributed under the MIT software license - see the [LICENSE](https://github.com/marmot-protocol/mdk/blob/master/LICENSE) file for details, or visit <https://opensource.org/licenses/MIT>.
