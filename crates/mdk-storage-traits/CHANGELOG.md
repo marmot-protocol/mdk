@@ -39,6 +39,10 @@
 
 ## [0.6.0] - 2026-02-18
 
+### Changed
+
+- **Integration tests moved to `mdk-core`**: The storage trait compliance tests (memory, SQLite, and cross-storage differential tests) have been moved to the `mdk-core` crate. This removes `mdk-memory-storage` and `mdk-sqlite-storage` as dev-dependencies, which previously prevented `cargo publish` from packaging this crate before the other two were on crates.io. ([#202](https://github.com/marmot-protocol/mdk/pull/202))
+
 ### Breaking changes
 
 - **Self-update tracking via `SelfUpdateState` enum**: Replaced the `needs_self_update: bool` and `last_self_update_at: Option<Timestamp>` fields on `Group` with a single `self_update_state: SelfUpdateState` field. The new `SelfUpdateState` enum has two variants: `Required` (post-join obligation per MIP-02) and `CompletedAt(Timestamp)` (last rotation time for MIP-00 staleness checks). Group creators start with `CompletedAt(now)` since creating a group with a fresh key is effectively the first rotation. All code that constructs `Group` structs must be updated. ([#184](https://github.com/marmot-protocol/mdk/pull/184))
