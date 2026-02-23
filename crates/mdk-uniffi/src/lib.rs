@@ -796,6 +796,23 @@ impl Mdk {
         Ok(())
     }
 
+    /// Clear pending commit for a group
+    ///
+    /// This rolls back the group to its pre-commit state — no epoch advance, no member changes.
+    /// Call this when publish exhausts retries to recover from failed relay publishes.
+    ///
+    /// # Arguments
+    /// * `mls_group_id` - The MLS group ID to clear the pending commit for (hex-encoded)
+    ///
+    /// # Returns
+    /// * `Ok(())` - if the pending commit was cleared successfully
+    /// * `Err` - if the group doesn't exist or another error occurs
+    pub fn clear_pending_commit(&self, mls_group_id: String) -> Result<(), MdkUniffiError> {
+        let group_id = parse_group_id(&mls_group_id)?;
+        self.lock()?.clear_pending_commit(&group_id)?;
+        Ok(())
+    }
+
     /// Sync group metadata from MLS
     pub fn sync_group_metadata_from_mls(&self, mls_group_id: String) -> Result<(), MdkUniffiError> {
         let group_id = parse_group_id(&mls_group_id)?;
