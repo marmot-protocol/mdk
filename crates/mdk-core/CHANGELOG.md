@@ -33,7 +33,7 @@
 
 ### Fixed
 
-- **`clear_pending_commit` orphaned keypair**: When `clear_pending_commit` rolls back a `self_update` pending commit, it now deletes the new `SignatureKeyPair` that was eagerly stored in the provider during `self_update`. Previously, repeated failed self-update publishes would accumulate unreachable private key material in storage. ([#193](https://github.com/marmot-protocol/mdk/pull/193))
+- **`clear_pending_commit` orphaned keypair**: When `clear_pending_commit` rolls back a `self_update` pending commit, it now deletes the new `SignatureKeyPair` that was eagerly stored in the provider during `self_update`. Previously, repeated failed self-update publishes would accumulate unreachable private key material in storage. ([#197](https://github.com/marmot-protocol/mdk/pull/197))
 
 ### Removed
 
