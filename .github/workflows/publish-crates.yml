@@ -1,0 +1,120 @@
+name: Publish to crates.io
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  publish-storage-traits:
+    runs-on: ubuntu-latest
+    name: Publish mdk-storage-traits
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Rust (stable)
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Cache Rust dependencies
+      uses: Swatinem/rust-cache@v2
+      with:
+        key: publish-storage-traits
+
+    - name: Install system dependencies
+      run: sudo apt-get update && sudo apt-get install -y pkg-config
+
+    - name: Publish mdk-storage-traits
+      run: cargo publish -p mdk-storage-traits
+      env:
+        CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  publish-memory-storage:
+    needs: publish-storage-traits
+    runs-on: ubuntu-latest
+    name: Publish mdk-memory-storage
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Rust (stable)
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Cache Rust dependencies
+      uses: Swatinem/rust-cache@v2
+      with:
+        key: publish-memory-storage
+
+    - name: Install system dependencies
+      run: sudo apt-get update && sudo apt-get install -y pkg-config
+
+    - name: Wait for mdk-storage-traits to be indexed
+      run: sleep 30
+
+    - name: Publish mdk-memory-storage
+      run: cargo publish -p mdk-memory-storage
+      env:
+        CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  publish-sqlite-storage:
+    needs: publish-storage-traits
+    runs-on: ubuntu-latest
+    name: Publish mdk-sqlite-storage
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Rust (stable)
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Cache Rust dependencies
+      uses: Swatinem/rust-cache@v2
+      with:
+        key: publish-sqlite-storage
+
+    - name: Install system dependencies
+      run: sudo apt-get update && sudo apt-get install -y pkg-config
+
+    - name: Wait for mdk-storage-traits to be indexed
+      run: sleep 30
+
+    - name: Publish mdk-sqlite-storage
+      run: cargo publish -p mdk-sqlite-storage
+      env:
+        CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  publish-core:
+    needs: [publish-memory-storage, publish-sqlite-storage]
+    runs-on: ubuntu-latest
+    name: Publish mdk-core
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Rust (stable)
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Cache Rust dependencies
+      uses: Swatinem/rust-cache@v2
+      with:
+        key: publish-core
+
+    - name: Install system dependencies
+      run: sudo apt-get update && sudo apt-get install -y pkg-config
+
+    - name: Wait for dependencies to be indexed
+      run: sleep 30
+
+    - name: Publish mdk-core
+      run: cargo publish -p mdk-core --all-features
+      env:
+        CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
