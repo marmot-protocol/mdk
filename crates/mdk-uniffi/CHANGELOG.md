@@ -31,6 +31,8 @@
 
 ### Added
 
+- **`clear_pending_commit` method**: Added `clear_pending_commit(group_id)` to allow callers to roll back an uncommitted pending MLS commit. ([#196](https://github.com/marmot-protocol/mdk/pull/196))
+
 ### Fixed
 
 ### Removed
