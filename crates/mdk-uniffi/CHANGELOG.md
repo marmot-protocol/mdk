@@ -31,8 +31,6 @@
 
 ### Added
 
-- **`clear_pending_commit` method**: Added `clear_pending_commit(group_id)` to allow callers to roll back an uncommitted pending MLS commit. ([#196](https://github.com/marmot-protocol/mdk/pull/196))
-
 ### Fixed
 
 ### Removed
@@ -58,6 +56,7 @@
 
 ### Added
 
+- **`clear_pending_commit` method**: Added `clear_pending_commit(group_id)` to allow callers to roll back an uncommitted pending MLS commit. ([#196](https://github.com/marmot-protocol/mdk/pull/196))
 - **`groups_needing_self_update()` method**: Returns hex-encoded group IDs of active groups that need a self-update (post-join obligation or stale rotation), given a threshold in seconds. ([#184](https://github.com/marmot-protocol/mdk/pull/184))
 - **Custom Message Sort Order**: `get_messages()` now accepts an optional `sort_order` parameter (`"created_at_first"` or `"processed_at_first"`) to control message ordering. Defaults to `"created_at_first"` when omitted. ([#171](https://github.com/marmot-protocol/mdk/pull/171))
 - **Last Message by Sort Order**: Added `get_last_message(mls_group_id, sort_order)` method to retrieve the most recent message under a given sort order, so clients using `"processed_at_first"` can get a "last message" consistent with their `get_messages()` ordering. ([#171](https://github.com/marmot-protocol/mdk/pull/171))

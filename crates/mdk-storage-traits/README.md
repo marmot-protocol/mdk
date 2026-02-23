@@ -1,10 +1,11 @@
-# MDK Storage Traits
+# mdk-storage-traits
 
-This crate provides an abstraction for the storage layer that MLS requires.
+Storage abstraction layer for [MDK](https://github.com/marmot-protocol/mdk). This crate defines the `MdkStorageProvider` trait and associated types that storage backends must implement.
 
-## MdkStorageProvider trait
+Storage backends in the MDK ecosystem:
 
-THis library contains the `MdkStorageProvider` trait.
+- [`mdk-memory-storage`](https://crates.io/crates/mdk-memory-storage): In-memory storage for testing and development
+- [`mdk-sqlite-storage`](https://crates.io/crates/mdk-sqlite-storage): SQLite-based persistent storage for production use
 
 ## Changelog
 
@@ -12,12 +13,8 @@ All notable changes to this library are documented in the [CHANGELOG.md](CHANGEL
 
 ## State
 
-**This library is in an ALPHA state**, things that are implemented generally work but the API will change in breaking ways.
-
-## Donations
-
-`rust-nostr` is free and open-source. This means we do not earn any revenue by selling it. Instead, we rely on your financial support. If you actively use any of the `rust-nostr` libs/software/services, then please [donate](https://rust-nostr.org/donate).
+**This library is in an ALPHA state.** Things that are implemented generally work, but the API may change in breaking ways.
 
 ## License
 
-This project is distributed under the MIT software license - see the [LICENSE](../../LICENSE) file for details
+This project is distributed under the MIT software license - see the [LICENSE](LICENSE) file for details, or visit <https://opensource.org/licenses/MIT>.

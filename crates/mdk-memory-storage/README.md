@@ -1,38 +1,26 @@
-# MDK Memory Storage
+# mdk-memory-storage
 
-Memory-based storage implementation for MDK. This crate provides a storage backend that implements the `MdkStorageProvider` trait from the [mdk-storage-traits](../mdk-storage-traits) crate.
+In-memory storage backend for [MDK](https://github.com/marmot-protocol/mdk). Implements the `MdkStorageProvider` trait from [`mdk-storage-traits`](https://crates.io/crates/mdk-storage-traits).
+
+Intended for testing and development. Data is not persisted across restarts. For production use, see [`mdk-sqlite-storage`](https://crates.io/crates/mdk-sqlite-storage).
 
 ## Features
 
-- Uses an LRU (Least Recently Used) caching mechanism to store data in memory
-- Provides both read and write operations that are thread-safe through `parking_lot::RwLock`
-- Configurable cache size (default: 1000 items)
-- Non-persistent storage that is cleared when the application terminates
-
-## Performance
-
-This implementation uses `parking_lot::RwLock` instead of the standard library's `std::sync::RwLock` for improved performance. The `parking_lot` implementation offers several advantages:
-
-- Smaller memory footprint
-- Faster lock acquisition and release
-- No poisoning on panic
-- More efficient read-heavy workloads, which is ideal for this caching implementation
-- Consistent behavior across different platforms
+- LRU (Least Recently Used) caching with configurable capacity (default: 1000 items)
+- Thread-safe via `parking_lot::RwLock` for efficient read-heavy workloads
+- No external dependencies or setup required
 
 ## Example Usage
 
-```rust,ignore
+```rust
 use mdk_memory_storage::MdkMemoryStorage;
-use mdk_storage_traits::MdkStorageProvider;
 
-// Create a new memory storage instance
+// Default cache size (1000 items)
 let storage = MdkMemoryStorage::default();
 
-// Or create with a custom cache size
-let custom_storage = MdkMemoryStorage::with_cache_size(100);
+// Custom cache size
+let storage = MdkMemoryStorage::with_cache_size(500);
 ```
-
-For more advanced usage examples, see the tests in the source code.
 
 ## Changelog
 
@@ -40,12 +28,8 @@ All notable changes to this library are documented in the [CHANGELOG.md](CHANGEL
 
 ## State
 
-**This library is in an ALPHA state**, things that are implemented generally work but the API will change in breaking ways.
-
-## Donations
-
-`rust-nostr` is free and open-source. This means we do not earn any revenue by selling it. Instead, we rely on your financial support. If you actively use any of the `rust-nostr` libs/software/services, then please [donate](https://rust-nostr.org/donate).
+**This library is in an ALPHA state.** Things that are implemented generally work, but the API may change in breaking ways.
 
 ## License
 
-This project is distributed under the MIT software license - see the [LICENSE](../../LICENSE) file for details
+This project is distributed under the MIT software license - see the [LICENSE](LICENSE) file for details, or visit <https://opensource.org/licenses/MIT>.

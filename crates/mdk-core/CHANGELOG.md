@@ -29,11 +29,7 @@
 
 ### Added
 
-- **`clear_pending_commit` method**: Added `MDK::clear_pending_commit(group_id)` to allow callers to roll back an uncommitted pending MLS commit. This is essential for recovering from failed relay publishes — without it, a single failed publish permanently blocks all future group operations with "pending commit exists" errors. Wraps OpenMLS's `MlsGroup::clear_pending_commit` with MDK's group-loading and error handling. ([#192](https://github.com/marmot-protocol/mdk/pull/192))
-
 ### Fixed
-
-- **`clear_pending_commit` orphaned keypair**: When `clear_pending_commit` rolls back a `self_update` pending commit, it now deletes the new `SignatureKeyPair` that was eagerly stored in the provider during `self_update`. Previously, repeated failed self-update publishes would accumulate unreachable private key material in storage. ([#197](https://github.com/marmot-protocol/mdk/pull/197))
 
 ### Removed
 
@@ -93,6 +89,7 @@
 
 ### Added
 
+- **`clear_pending_commit` method**: Added `MDK::clear_pending_commit(group_id)` to allow callers to roll back an uncommitted pending MLS commit. This is essential for recovering from failed relay publishes — without it, a single failed publish permanently blocks all future group operations with "pending commit exists" errors. Wraps OpenMLS's `MlsGroup::clear_pending_commit` with MDK's group-loading and error handling. ([#192](https://github.com/marmot-protocol/mdk/pull/192))
 - **Self-update tracking**: `accept_welcome()` now sets `self_update_state` to `SelfUpdateState::Required` on the joined group (MIP-02 post-join obligation). `merge_pending_commit()` detects pure self-update commits and transitions the state to `SelfUpdateState::CompletedAt(now)`, recording the rotation timestamp for MIP-00 periodic staleness checks. `create_group()` initializes the state to `SelfUpdateState::NotRequired` (creator has no immediate obligation). ([#184](https://github.com/marmot-protocol/mdk/pull/184))
 - **`groups_needing_self_update()` method**: Returns group IDs of active groups that need a self-update, either because the state is `Required` or because the last rotation is older than a configurable threshold. ([#184](https://github.com/marmot-protocol/mdk/pull/184))
 - **KeyPackageRef `i` tag for efficient relay queries**: KeyPackage events now include an `i` tag with the hex-encoded `KeyPackageRef` (computed per RFC 9420 Section 5.2). This enables efficient relay queries for specific KeyPackages when processing Welcome messages, avoiding the need to download and decode all KeyPackage events. ([#182](https://github.com/marmot-protocol/mdk/pull/182))
@@ -128,6 +125,7 @@
 
 ### Fixed
 
+- **`clear_pending_commit` orphaned keypair**: When `clear_pending_commit` rolls back a `self_update` pending commit, it now deletes the new `SignatureKeyPair` that was eagerly stored in the provider during `self_update`. Previously, repeated failed self-update publishes would accumulate unreachable private key material in storage. ([#197](https://github.com/marmot-protocol/mdk/pull/197))
 - **Welcome validation no longer requires `client` tag**: The `validate_welcome_event` function now correctly treats the `client` tag as optional per MIP-02. Previously, welcome events without a `client` tag were rejected, which would cause spec-compliant third-party implementations to be unable to send Welcome events to MDK-based clients. ([#186](https://github.com/marmot-protocol/mdk/pull/186))
 - **Security dependency updates**: Updated `time` (0.3.44 → 0.3.47), `bytes` (1.11.0 → 1.11.1), and `lru` (0.16.2 → 0.16.3) to resolve Dependabot security advisories. ([#174](https://github.com/marmot-protocol/mdk/pull/174))
 - **Message Ordering Consistency**: Fixed inconsistency where `group.last_message_id` might not match `get_messages()[0].id` due to different sorting logic. The `last_message_id` update logic now uses `created_at DESC, processed_at DESC, id DESC` ordering to match the `messages()` query, ensuring the first message returned is always the same as `last_message_id`. Added `last_message_processed_at` field to `Group` to track this secondary sort key. ([#166](https://github.com/marmot-protocol/mdk/pull/166))

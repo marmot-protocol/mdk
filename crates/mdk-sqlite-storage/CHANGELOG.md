@@ -73,7 +73,7 @@
 - **Epoch Lookup by Tag Content**: Implemented `find_message_epoch_by_tag_content` for SQLite storage using `SELECT epoch FROM messages WHERE tags LIKE ?` query. ([#167](https://github.com/marmot-protocol/mdk/pull/167))
 - **Retryable Message Support**: Updated storage implementation to handle `ProcessedMessageState::Retryable` transitions and persistence. ([#161](https://github.com/marmot-protocol/mdk/pull/161))
 - **MLS Storage Module**: New `mls_storage` module with complete `StorageProvider<1>` implementation for OpenMLS integration ([#148](https://github.com/marmot-protocol/mdk/pull/148))
-  - JSON codec for serializing/deserializing OpenMLS types
+  - Postcard codec (`MlsCodec`) for serializing/deserializing OpenMLS types ([#179](https://github.com/marmot-protocol/mdk/pull/179))
   - Support for all 53 `StorageProvider<1>` methods
   - Manages 8 OpenMLS tables: `openmls_group_data`, `openmls_proposals`, `openmls_own_leaf_nodes`, `openmls_key_packages`, `openmls_psks`, `openmls_signature_keys`, `openmls_encryption_keys`, `openmls_epoch_key_pairs`
 - Input validation for storage operations to prevent unbounded writes ([#94](https://github.com/marmot-protocol/mdk/pull/94))

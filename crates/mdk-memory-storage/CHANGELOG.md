@@ -65,7 +65,7 @@
 - **Epoch Lookup by Tag Content**: Implemented `find_message_epoch_by_tag_content` for in-memory storage, scanning cached group messages and matching serialized tags. ([#167](https://github.com/marmot-protocol/mdk/pull/167))
 - **Retryable Message Support**: Updated storage implementation to handle `ProcessedMessageState::Retryable` transitions and persistence. ([#161](https://github.com/marmot-protocol/mdk/pull/161))
 - **MLS Storage Module**: New `mls_storage` module with complete `StorageProvider<1>` implementation for OpenMLS integration ([#148](https://github.com/marmot-protocol/mdk/pull/148))
-  - JSON codec for serializing/deserializing OpenMLS types
+  - Postcard codec (`MlsCodec`) for serializing/deserializing OpenMLS types ([#179](https://github.com/marmot-protocol/mdk/pull/179))
   - Support for all 53 `StorageProvider<1>` methods
   - In-memory storage using `HashMap` for all MLS data types
 - **Snapshot Support**: New `snapshot` module for creating and restoring storage snapshots, useful for testing rollback scenarios ([#148](https://github.com/marmot-protocol/mdk/pull/148))
