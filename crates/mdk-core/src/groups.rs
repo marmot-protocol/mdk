@@ -1289,13 +1289,51 @@ where
     ///
     /// The group returns to its pre-commit state — no epoch advance, no member changes.
     ///
+    /// When the pending commit is a `self_update`, the new `SignatureKeyPair` that was
+    /// stored in the provider before creating the commit is deleted from storage, since
+    /// the group reverts to the previous signer.
+    ///
     /// # Arguments
     /// * `group_id` - the MlsGroup GroupId value
     pub fn clear_pending_commit(&self, group_id: &GroupId) -> Result<(), Error> {
         let mut mls_group = self.load_mls_group(group_id)?.ok_or(Error::GroupNotFound)?;
+
+        // Detect whether the pending commit is a self-update BEFORE clearing,
+        // since clear_pending_commit() consumes the staged commit.
+        // If it is, capture the new leaf's signature public key so we can delete
+        // the orphaned keypair from storage after the rollback.
+        let self_update_new_pubkey: Option<Vec<u8>> =
+            mls_group.pending_commit().and_then(|staged_commit| {
+                let has_update_signal = staged_commit.update_path_leaf_node().is_some()
+                    || staged_commit.update_proposals().next().is_some();
+                let no_non_update_proposals = staged_commit
+                    .queued_proposals()
+                    .all(|p| matches!(p.proposal(), Proposal::Update(_)));
+                if has_update_signal && no_non_update_proposals {
+                    staged_commit
+                        .update_path_leaf_node()
+                        .map(|leaf| leaf.signature_key().as_slice().to_vec())
+                } else {
+                    None
+                }
+            });
+
         mls_group
             .clear_pending_commit(self.provider.storage())
             .map_err(|e| Error::Provider(e.to_string()))?;
+
+        // If this was a self-update, delete the orphaned new signature keypair.
+        // OpenMLS reverts to the old signer after clear_pending_commit; the new
+        // keypair was stored eagerly in self_update() and is now unreachable.
+        if let Some(pubkey_bytes) = self_update_new_pubkey {
+            SignatureKeyPair::delete(
+                self.provider.storage(),
+                &pubkey_bytes,
+                self.ciphersuite.signature_algorithm(),
+            )
+            .map_err(|e| Error::Provider(e.to_string()))?;
+        }
+
         Ok(())
     }
 
@@ -1582,6 +1620,7 @@ mod tests {
     use mdk_storage_traits::messages::{MessageStorage, types as message_types};
     use nostr::{Keys, PublicKey};
     use openmls::prelude::BasicCredential;
+    use openmls_basic_credential::SignatureKeyPair;
 
     use super::NostrGroupDataExtension;
     use crate::constant::NOSTR_GROUP_DATA_EXTENSION_TYPE;
@@ -4929,6 +4968,160 @@ mod tests {
         assert!(
             result.is_err(),
             "clear_pending_commit should error for non-existent group"
+        );
+    }
+
+    /// Tests that `self_update` followed by `merge_pending_commit` rotates the signing key and
+    /// leaves no orphaned keypairs in storage — the new key becomes the active signer.
+    #[test]
+    fn test_self_update_then_merge_no_orphan() {
+        let mdk = create_test_mdk();
+        let (creator, members, admins) = create_test_group_members();
+        let group_id = create_test_group(&mdk, &creator, &members, &admins);
+
+        // Capture the pre-update signature key so we can verify rotation.
+        let pre_update_mls_group = mdk
+            .load_mls_group(&group_id)
+            .expect("load mls group")
+            .expect("group exists");
+        let pre_update_pubkey = pre_update_mls_group
+            .own_leaf()
+            .expect("own leaf")
+            .signature_key()
+            .as_slice()
+            .to_vec();
+
+        // Perform self_update — stores the new keypair and creates a pending commit.
+        mdk.self_update(&group_id).expect("self_update");
+
+        // Capture the pending new public key before merging.
+        let pending_mls_group = mdk
+            .load_mls_group(&group_id)
+            .expect("load mls group")
+            .expect("group exists");
+        let new_pubkey = pending_mls_group
+            .pending_commit()
+            .expect("pending commit exists")
+            .update_path_leaf_node()
+            .expect("update path leaf node in self_update commit")
+            .signature_key()
+            .as_slice()
+            .to_vec();
+
+        // The new key should differ from the pre-update key.
+        assert_ne!(
+            pre_update_pubkey, new_pubkey,
+            "self_update should rotate the signature key"
+        );
+
+        // The new keypair must be in storage at this point (used by OpenMLS for the commit).
+        let stored_before_merge = SignatureKeyPair::read(
+            &mdk.provider.storage,
+            &new_pubkey,
+            mdk.ciphersuite.signature_algorithm(),
+        );
+        assert!(
+            stored_before_merge.is_some(),
+            "new keypair must be in storage before merge_pending_commit"
+        );
+
+        // Merge — advances the epoch and makes the new key the active signer.
+        mdk.merge_pending_commit(&group_id)
+            .expect("merge_pending_commit");
+
+        // After a successful merge the new key must still be in storage (it is now the active signer).
+        let stored_after_merge = SignatureKeyPair::read(
+            &mdk.provider.storage,
+            &new_pubkey,
+            mdk.ciphersuite.signature_algorithm(),
+        );
+        assert!(
+            stored_after_merge.is_some(),
+            "new keypair must remain in storage after successful merge (it is the active signer)"
+        );
+
+        // The group should still be functional.
+        let members_after = mdk.get_members(&group_id).expect("get members");
+        assert!(!members_after.is_empty(), "group should still have members");
+    }
+
+    /// Tests that `self_update` followed by `clear_pending_commit` rolls back the commit and
+    /// removes the orphaned new signature keypair from storage.
+    #[test]
+    fn test_self_update_then_clear_removes_orphaned_keypair() {
+        let mdk = create_test_mdk();
+        let (creator, members, admins) = create_test_group_members();
+        let group_id = create_test_group(&mdk, &creator, &members, &admins);
+
+        // Perform self_update — stores the new keypair and creates a pending commit.
+        mdk.self_update(&group_id).expect("self_update");
+
+        // Capture the new public key that was stored during self_update.
+        let pending_mls_group = mdk
+            .load_mls_group(&group_id)
+            .expect("load mls group")
+            .expect("group exists");
+        let new_pubkey = pending_mls_group
+            .pending_commit()
+            .expect("pending commit exists")
+            .update_path_leaf_node()
+            .expect("update path leaf node in self_update commit")
+            .signature_key()
+            .as_slice()
+            .to_vec();
+
+        // The new keypair must be present in storage before we clear.
+        let stored_before_clear = SignatureKeyPair::read(
+            &mdk.provider.storage,
+            &new_pubkey,
+            mdk.ciphersuite.signature_algorithm(),
+        );
+        assert!(
+            stored_before_clear.is_some(),
+            "new keypair must be in storage before clear_pending_commit"
+        );
+
+        // Clear — rolls back the MLS state and must delete the orphaned keypair.
+        mdk.clear_pending_commit(&group_id)
+            .expect("clear_pending_commit");
+
+        // The orphaned new keypair must now be gone from storage.
+        let stored_after_clear = SignatureKeyPair::read(
+            &mdk.provider.storage,
+            &new_pubkey,
+            mdk.ciphersuite.signature_algorithm(),
+        );
+        assert!(
+            stored_after_clear.is_none(),
+            "orphaned new keypair must be deleted from storage after clear_pending_commit"
+        );
+
+        // The group must be functional and able to perform a new self_update.
+        mdk.self_update(&group_id)
+            .expect("self_update should succeed after clearing pending commit");
+        mdk.merge_pending_commit(&group_id)
+            .expect("merge should succeed after retry");
+
+        // After the successful retry the active signer is the newly rotated key.
+        let final_mls_group = mdk
+            .load_mls_group(&group_id)
+            .expect("load mls group")
+            .expect("group exists");
+        let final_pubkey = final_mls_group
+            .own_leaf()
+            .expect("own leaf")
+            .signature_key()
+            .as_slice()
+            .to_vec();
+
+        let active_signer = SignatureKeyPair::read(
+            &mdk.provider.storage,
+            &final_pubkey,
+            mdk.ciphersuite.signature_algorithm(),
+        );
+        assert!(
+            active_signer.is_some(),
+            "active signer keypair must be present in storage after successful retry"
         );
     }
 }
