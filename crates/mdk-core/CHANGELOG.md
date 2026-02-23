@@ -37,6 +37,10 @@
 
 ## [0.6.0] - 2026-02-18
 
+### Changed
+
+- **Storage trait compliance tests moved here from `mdk-storage-traits`**: The memory, SQLite, and cross-storage differential integration tests now live in `mdk-core/tests/`, which already had both storage crates as dev-dependencies. ([#202](https://github.com/marmot-protocol/mdk/pull/202))
+
 ### Breaking changes
 
 - **`admin_pubkeys` wire format change**: The `admin_pubkeys` field in `TlsNostrGroupDataExtension` changed from `Vec<Vec<u8>>` (hex-encoded strings) to `Vec<[u8; 32]>` (raw 32-byte x-only public keys), aligning with MIP-01 v2. Extensions serialized with the old hex-encoded format are incompatible. ([#185](https://github.com/marmot-protocol/mdk/pull/185))

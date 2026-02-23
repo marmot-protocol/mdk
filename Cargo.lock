@@ -1539,8 +1539,6 @@ dependencies = [
 name = "mdk-storage-traits"
 version = "0.6.0"
 dependencies = [
- "mdk-memory-storage",
- "mdk-sqlite-storage",
  "nostr",
  "openmls",
  "openmls_traits",
