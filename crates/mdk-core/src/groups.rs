@@ -1280,6 +1280,25 @@ where
         })
     }
 
+    /// Clear (rollback) a pending commit without merging it.
+    ///
+    /// This should be called when the Kind:445 publish fails after creating a commit
+    /// via `add_members`, `remove_members`, or `self_update`. Without clearing, the
+    /// pending commit blocks all future group operations with "Can't execute operation
+    /// because a pending commit exists".
+    ///
+    /// The group returns to its pre-commit state — no epoch advance, no member changes.
+    ///
+    /// # Arguments
+    /// * `group_id` - the MlsGroup GroupId value
+    pub fn clear_pending_commit(&self, group_id: &GroupId) -> Result<(), Error> {
+        let mut mls_group = self.load_mls_group(group_id)?.ok_or(Error::GroupNotFound)?;
+        mls_group
+            .clear_pending_commit(self.provider.storage())
+            .map_err(|e| Error::Provider(e.to_string()))?;
+        Ok(())
+    }
+
     /// Merge any pending commits.
     /// This should be called AFTER publishing the Kind:445 message that contains a commit message to mitigate race conditions
     ///
@@ -4772,5 +4791,144 @@ mod tests {
 
         let result = alice_mdk.pending_member_changes(&fake_group_id);
         assert!(result.is_err(), "Should error for non-existent group");
+    }
+
+    /// Tests that `clear_pending_commit` rolls back a pending add-member commit,
+    /// allowing subsequent group operations to succeed.
+    #[test]
+    fn test_clear_pending_commit_after_failed_add() {
+        let mdk = create_test_mdk();
+        let (creator, members, admins) = create_test_group_members();
+        let group_id = create_test_group(&mdk, &creator, &members, &admins);
+
+        let initial_members = mdk.get_members(&group_id).expect("get members");
+        let initial_count = initial_members.len();
+
+        // Add a new member — creates a pending commit but do NOT merge
+        // (simulates a failed relay publish)
+        let new_member = Keys::generate();
+        let kp_event = create_key_package_event(&mdk, &new_member);
+        let _add_result = mdk
+            .add_members(&group_id, &[kp_event])
+            .expect("add_members should succeed");
+
+        // A second add_members should fail because there is already a pending commit
+        let another_member = Keys::generate();
+        let kp_event2 = create_key_package_event(&mdk, &another_member);
+        let err = mdk.add_members(&group_id, &[kp_event2]);
+        assert!(err.is_err(), "Should fail due to existing pending commit");
+
+        // Clear the pending commit (simulates cleanup after failed publish)
+        mdk.clear_pending_commit(&group_id)
+            .expect("clear_pending_commit should succeed");
+
+        // Verify the member was NOT added
+        let after_clear = mdk.get_members(&group_id).expect("get members");
+        assert_eq!(
+            after_clear.len(),
+            initial_count,
+            "Member count should be unchanged after clearing pending commit"
+        );
+        assert!(
+            !after_clear.contains(&new_member.public_key()),
+            "New member should not be in group after clearing pending commit"
+        );
+
+        // Verify the group is usable again — a new operation should succeed
+        let kp_event3 = create_key_package_event(&mdk, &another_member);
+        mdk.add_members(&group_id, &[kp_event3])
+            .expect("add_members should succeed after clearing pending commit");
+        mdk.merge_pending_commit(&group_id)
+            .expect("merge should succeed after clearing pending commit");
+
+        let final_members = mdk.get_members(&group_id).expect("get members");
+        assert_eq!(
+            final_members.len(),
+            initial_count + 1,
+            "Member should be added after clearing stale commit and retrying"
+        );
+        assert!(
+            final_members.contains(&another_member.public_key()),
+            "New member should be in group after successful retry"
+        );
+    }
+
+    /// Tests that `clear_pending_commit` rolls back a pending remove-member commit.
+    #[test]
+    fn test_clear_pending_commit_after_failed_remove() {
+        let mdk = create_test_mdk();
+        let (creator, members, admins) = create_test_group_members();
+        let group_id = create_test_group(&mdk, &creator, &members, &admins);
+
+        let initial_members = mdk.get_members(&group_id).expect("get members");
+        let initial_count = initial_members.len();
+        let member_to_remove = members[0].public_key();
+
+        // Remove a member — creates a pending commit but do NOT merge
+        let _remove_result = mdk
+            .remove_members(&group_id, &[member_to_remove])
+            .expect("remove_members should succeed");
+
+        // Clear the pending commit
+        mdk.clear_pending_commit(&group_id)
+            .expect("clear_pending_commit should succeed");
+
+        // Verify the member was NOT removed
+        let after_clear = mdk.get_members(&group_id).expect("get members");
+        assert_eq!(
+            after_clear.len(),
+            initial_count,
+            "Member count should be unchanged after clearing pending remove commit"
+        );
+        assert!(
+            after_clear.contains(&member_to_remove),
+            "Member should still be in group after clearing pending remove commit"
+        );
+
+        // Verify the group is usable again — retry the removal
+        mdk.remove_members(&group_id, &[member_to_remove])
+            .expect("remove_members should succeed after clearing pending commit");
+        mdk.merge_pending_commit(&group_id)
+            .expect("merge should succeed after clearing pending commit");
+
+        let final_members = mdk.get_members(&group_id).expect("get members");
+        assert_eq!(
+            final_members.len(),
+            initial_count - 1,
+            "Member should be removed after clearing stale commit and retrying"
+        );
+        assert!(
+            !final_members.contains(&member_to_remove),
+            "Removed member should not be in group after successful retry"
+        );
+    }
+
+    /// Tests that `clear_pending_commit` is a no-op when there is no pending commit.
+    #[test]
+    fn test_clear_pending_commit_no_pending() {
+        let mdk = create_test_mdk();
+        let (creator, members, admins) = create_test_group_members();
+        let group_id = create_test_group(&mdk, &creator, &members, &admins);
+
+        // Clearing when there's nothing pending should succeed (no-op)
+        mdk.clear_pending_commit(&group_id)
+            .expect("clear_pending_commit should succeed even with no pending commit");
+
+        // Group should still be functional
+        let member_count = mdk.get_members(&group_id).expect("get members").len();
+        assert!(member_count > 0, "Group should still have members");
+    }
+
+    /// Tests that `clear_pending_commit` returns an error for a non-existent group.
+    #[test]
+    fn test_clear_pending_commit_group_not_found() {
+        let mdk = create_test_mdk();
+        let fake_group_id = mdk_storage_traits::GroupId::from_slice(&[0u8; 16]);
+
+        let result = mdk.clear_pending_commit(&fake_group_id);
+        assert!(
+            result.is_err(),
+            "clear_pending_commit should error for non-existent group"
+        );
     }
 }
