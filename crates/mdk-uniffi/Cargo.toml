@@ -32,8 +32,8 @@ serde_json.workspace = true
 thiserror.workspace = true
 hex = { workspace = true, features = ["std"] }
 tracing = { workspace = true, features = ["std"] }
-uniffi = { version = "0.30", features = ["cli"] }
-uniffi_macros = "0.30"
+uniffi = { version = "0.31", features = ["cli"] }
+uniffi_macros = "0.31"
 
 [features]
 default = []
