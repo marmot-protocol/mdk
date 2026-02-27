@@ -18,7 +18,7 @@ mdk-storage-traits = { version = "0.6.0", path = "./crates/mdk-storage-traits", 
 mdk-core = { version = "0.6.0", path = "./crates/mdk-core", default-features = false }
 
 # OpenMLS family
-openmls = { version = "0.8", default-features = false }
+openmls = { version = "0.8.1", default-features = false }
 openmls_traits = { version = "0.5", default-features = false }
 openmls_basic_credential = { version = "0.5", default-features = false }
 openmls_rust_crypto = { version = "0.5", default-features = false }
@@ -43,11 +43,11 @@ blurhash = "0.2"
 kamadak-exif = "0.6"
 
 # Storage
-rusqlite = { version = "0.32", default-features = false }
+rusqlite = { version = "0.37", default-features = false }
 refinery = "0.9"
 
 # Random number generation
-getrandom = "0.3"
+getrandom = "0.4"
 
 # Secure credential storage (v4 architecture - see https://github.com/open-source-cooperative/keyring-rs/issues/259)
 keyring-core = "0.7"
