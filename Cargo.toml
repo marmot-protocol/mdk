@@ -1,7 +1,7 @@
 [workspace]
 members = ["crates/*"]
 default-members = ["crates/*"]
-exclude = ["crates/mdk-zig"]
+exclude = ["crates/mdk-zig", "crates/mdk-js"]
 resolver = "2"
 
 [workspace.package]
