@@ -30,3 +30,5 @@ Plans/
 /trees/*
 !/trees/.gitkeep
 
+crates/mdk-zig/.zig-cache
+crates/mdk-zig/target

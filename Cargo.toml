@@ -1,6 +1,7 @@
 [workspace]
 members = ["crates/*"]
 default-members = ["crates/*"]
+exclude = ["crates/mdk-zig"]
 resolver = "2"
 
 [workspace.package]
