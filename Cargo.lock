@@ -224,12 +224,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "blurhash"
-version = "0.2.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e79769241dcd44edf79a732545e8b5cec84c247ac060f5252cd51885d093a8fc"
-
-[[package]]
 name = "bumpalo"
 version = "3.20.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -710,6 +704,12 @@ name = "fallible-streaming-iterator"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7360491ce676a36bf9bb3c56c1aa791658183a54d2744120f27285738d90465a"
+
+[[package]]
+name = "fast-thumbhash"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5243a22cce29dff488db8ef03d8e0e54dd06cd3e6d98475160dff390fa414de2"
 
 [[package]]
 name = "fastrand"
@@ -1623,8 +1623,8 @@ dependencies = [
 name = "mdk-core"
 version = "0.6.0"
 dependencies = [
- "blurhash",
  "chacha20poly1305",
+ "fast-thumbhash",
  "hex",
  "hkdf",
  "image",

@@ -3,7 +3,7 @@
 //! This module provides common image processing functionality used by both
 //! MIP-04 encrypted media and MIP-01 group images. It includes:
 //! - Image validation (dimensions, file size, format)
-//! - Metadata extraction (dimensions, blurhash)
+//! - Metadata extraction (dimensions, thumbhash)
 //! - EXIF sanitization for privacy
 
 pub mod metadata;

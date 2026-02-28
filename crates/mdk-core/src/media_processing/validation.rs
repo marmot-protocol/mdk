@@ -416,7 +416,7 @@ mod tests {
         // Test custom size limit
         let custom_options = MediaProcessingOptions {
             sanitize_exif: false,
-            generate_blurhash: false,
+            generate_thumbhash: false,
             max_file_size: Some(500),
             ..Default::default()
         };
@@ -532,7 +532,7 @@ mod tests {
         // Test with no dimension limit but still check memory
         let no_limit_options = MediaProcessingOptions {
             sanitize_exif: false,
-            generate_blurhash: false,
+            generate_thumbhash: false,
             max_dimension: None,
             ..Default::default()
         };
@@ -549,7 +549,7 @@ mod tests {
         // Test with custom dimension limit
         let custom_options = MediaProcessingOptions {
             sanitize_exif: false,
-            generate_blurhash: false,
+            generate_thumbhash: false,
             max_dimension: Some(1024),
             ..Default::default()
         };
@@ -564,7 +564,7 @@ mod tests {
     fn test_validate_image_dimensions_decompression_bomb_protection() {
         let options = MediaProcessingOptions {
             sanitize_exif: false,
-            generate_blurhash: false,
+            generate_thumbhash: false,
             max_dimension: None, // No individual dimension limit
             ..Default::default()
         };

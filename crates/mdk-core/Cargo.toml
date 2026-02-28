@@ -37,8 +37,8 @@ sha2.workspace = true
 
 # Image processing dependencies - mandatory (used by both MIP-01 and MIP-04)
 image = { workspace = true, features = ["jpeg", "png", "webp", "gif"] }
-blurhash.workspace = true
-kamadak-exif.workspace = true  # EXIF stripping for privacy (used by both MIP-01 and MIP-04)
+fast-thumbhash.workspace = true
+kamadak-exif.workspace = true
 
 [dev-dependencies]
 mdk-storage-traits = { workspace = true, features = ["test-utils"] }
