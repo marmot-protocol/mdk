@@ -1,9 +1,32 @@
 /**
  * High-level MDK wrapper that works with both Bun and Deno FFI backends.
  *
- * All methods accept/return plain JS values (strings, objects, arrays).
- * JSON serialisation is handled transparently.
+ * The FFI backend is set once at module load via `setBackend()` — called
+ * automatically by the runtime-specific entry point (index.js / mod.ts).
+ * Users never interact with the backend directly.
  */
+
+/** @type {import("./ffi_bun.js").BunFfi | import("./ffi_deno.ts").DenoFfi | null} */
+let _ffi = null;
+
+/**
+ * Set the FFI backend for this module.  Called once by the entry point.
+ * @param {object} backend
+ */
+export function setBackend(backend) {
+  _ffi = backend;
+}
+
+/** Return the active backend, throwing if not yet initialised. */
+function ffi() {
+  if (!_ffi) {
+    throw new Error(
+      "MDK not initialised. Import from the runtime-specific entry point " +
+        '(e.g. import { Mdk } from "mdk-js" for Bun, or import { Mdk } from "./mod.ts" for Deno).',
+    );
+  }
+  return _ffi;
+}
 
 /** Error thrown by MDK operations. */
 export class MdkError extends Error {
@@ -15,7 +38,6 @@ export class MdkError extends Error {
   }
 }
 
-// Error code constants matching the C enum.
 export const ErrorCode = Object.freeze({
   OK: 0,
   STORAGE: 1,
@@ -24,35 +46,23 @@ export const ErrorCode = Object.freeze({
   NULL_POINTER: 4,
 });
 
-/**
- * Check an FFI return code; throw MdkError on failure.
- * @param {object} ffi — the backend instance
- * @param {number} code — MdkError enum value
- */
-function check(ffi, code) {
+function check(code) {
   if (code !== ErrorCode.OK) {
-    const detail = ffi.lastError();
+    const detail = ffi().lastError();
     throw new MdkError(code, detail);
   }
 }
 
-/**
- * Call an FFI function that writes its result into a char** out-parameter.
- * Returns the result as a JS string.
- */
-function callWithStringOut(ffi, fn, ...args) {
-  const out = ffi.allocOutString();
+function callWithStringOut(fn, ...args) {
+  const f = ffi();
+  const out = f.allocOutString();
   const code = fn(...args, out.ptr);
-  check(ffi, code);
+  check(code);
   return out.readAndFree();
 }
 
-/**
- * Call an FFI function that writes its result into a char** out-parameter.
- * Parses the result as JSON.
- */
-function callWithJsonOut(ffi, fn, ...args) {
-  const s = callWithStringOut(ffi, fn, ...args);
+function callWithJsonOut(fn, ...args) {
+  const s = callWithStringOut(fn, ...args);
   return s ? JSON.parse(s) : null;
 }
 
@@ -61,100 +71,76 @@ function callWithJsonOut(ffi, fn, ...args) {
 // ---------------------------------------------------------------------------
 
 export class Mdk {
-  #ffi;
   #handle;
 
-  /**
-   * @param {object} ffi — BunFfi or DenoFfi instance
-   * @param {*} handle — opaque MdkHandle pointer
-   */
-  constructor(ffi, handle) {
-    this.#ffi = ffi;
+  /** @param {*} handle — opaque MdkHandle pointer */
+  constructor(handle) {
     this.#handle = handle;
   }
 
-  /** @returns {*} the raw handle pointer (for advanced use) */
-  get handle() {
-    return this.#handle;
-  }
-
-  /** @returns {object} the FFI backend (for advanced use) */
-  get ffi() {
-    return this.#ffi;
-  }
-
-  // -- Constructors (static) ------------------------------------------------
+  // -- Constructors ---------------------------------------------------------
 
   /**
    * Create an MDK instance with encrypted storage (platform keyring).
    *
-   * @param {object} ffi — BunFfi or DenoFfi
    * @param {string} dbPath
    * @param {string} serviceId
    * @param {string} dbKeyId
    * @param {object|null} [config]
    * @returns {Mdk}
    */
-  static create(ffi, dbPath, serviceId, dbKeyId, config = null) {
-    const cPath = ffi.toCString(dbPath);
-    const cSvc = ffi.toCString(serviceId);
-    const cKey = ffi.toCString(dbKeyId);
-    const cCfg = config ? ffi.toCString(JSON.stringify(config)) : { ptr: ffi.nullptr };
-    const out = ffi.allocOutPtr();
+  static create(dbPath, serviceId, dbKeyId, config = null) {
+    const f = ffi();
+    const cPath = f.toCString(dbPath);
+    const cSvc = f.toCString(serviceId);
+    const cKey = f.toCString(dbKeyId);
+    const cCfg = config ? f.toCString(JSON.stringify(config)) : { ptr: f.nullptr };
+    const out = f.allocOutPtr();
 
-    const code = ffi.sym.mdk_new(cPath.ptr, cSvc.ptr, cKey.ptr, cCfg.ptr, out.ptr);
-    check(ffi, code);
-    return new Mdk(ffi, out.read());
+    check(f.sym.mdk_new(cPath.ptr, cSvc.ptr, cKey.ptr, cCfg.ptr, out.ptr));
+    return new Mdk(out.read());
   }
 
   /**
    * Create an MDK instance with a directly provided encryption key.
    *
-   * @param {object} ffi
    * @param {string} dbPath
    * @param {Uint8Array} key — 32-byte encryption key
    * @param {object|null} [config]
    * @returns {Mdk}
    */
-  static createWithKey(ffi, dbPath, key, config = null) {
-    const cPath = ffi.toCString(dbPath);
-    const cCfg = config ? ffi.toCString(JSON.stringify(config)) : { ptr: ffi.nullptr };
-    const out = ffi.allocOutPtr();
+  static createWithKey(dbPath, key, config = null) {
+    const f = ffi();
+    const cPath = f.toCString(dbPath);
+    const cCfg = config ? f.toCString(JSON.stringify(config)) : { ptr: f.nullptr };
+    const out = f.allocOutPtr();
 
-    const code = ffi.sym.mdk_new_with_key(
-      cPath.ptr,
-      ffi.bufferPtr(key),
-      key.length,
-      cCfg.ptr,
-      out.ptr,
-    );
-    check(ffi, code);
-    return new Mdk(ffi, out.read());
+    check(f.sym.mdk_new_with_key(cPath.ptr, f.bufferPtr(key), key.length, cCfg.ptr, out.ptr));
+    return new Mdk(out.read());
   }
 
   /**
    * Create an MDK instance with unencrypted storage.
    * WARNING: only for development/testing.
    *
-   * @param {object} ffi
    * @param {string} dbPath
    * @param {object|null} [config]
    * @returns {Mdk}
    */
-  static createUnencrypted(ffi, dbPath, config = null) {
-    const cPath = ffi.toCString(dbPath);
-    const cCfg = config ? ffi.toCString(JSON.stringify(config)) : { ptr: ffi.nullptr };
-    const out = ffi.allocOutPtr();
+  static createUnencrypted(dbPath, config = null) {
+    const f = ffi();
+    const cPath = f.toCString(dbPath);
+    const cCfg = config ? f.toCString(JSON.stringify(config)) : { ptr: f.nullptr };
+    const out = f.allocOutPtr();
 
-    const code = ffi.sym.mdk_new_unencrypted(cPath.ptr, cCfg.ptr, out.ptr);
-    check(ffi, code);
-    return new Mdk(ffi, out.read());
+    check(f.sym.mdk_new_unencrypted(cPath.ptr, cCfg.ptr, out.ptr));
+    return new Mdk(out.read());
   }
 
   /** Free the MDK handle. Must be called when done. */
   close() {
     if (this.#handle) {
-      this.#ffi.sym.mdk_free(this.#handle);
+      ffi().sym.mdk_free(this.#handle);
       this.#handle = null;
     }
   }
@@ -168,24 +154,25 @@ export class Mdk {
    * @returns {{ key_package: string, tags: string[][], hash_ref: number[] }}
    */
   createKeyPackage(pubkey, relays) {
-    const cPk = this.#ffi.toCString(pubkey);
-    const cRelays = this.#ffi.toCString(JSON.stringify(relays));
-    return callWithJsonOut(this.#ffi, this.#ffi.sym.mdk_create_key_package, this.#handle, cPk.ptr, cRelays.ptr);
+    const f = ffi();
+    const cPk = f.toCString(pubkey);
+    const cRelays = f.toCString(JSON.stringify(relays));
+    return callWithJsonOut(f.sym.mdk_create_key_package, this.#handle, cPk.ptr, cRelays.ptr);
   }
 
   /**
    * Create a key package with options.
    * @param {string} pubkey
    * @param {string[]} relays
-   * @param {boolean} protected_ — add NIP-70 protected tag
+   * @param {boolean} isProtected — add NIP-70 protected tag
    */
-  createKeyPackageWithOptions(pubkey, relays, protected_) {
-    const cPk = this.#ffi.toCString(pubkey);
-    const cRelays = this.#ffi.toCString(JSON.stringify(relays));
+  createKeyPackageWithOptions(pubkey, relays, isProtected) {
+    const f = ffi();
+    const cPk = f.toCString(pubkey);
+    const cRelays = f.toCString(JSON.stringify(relays));
     return callWithJsonOut(
-      this.#ffi,
-      this.#ffi.sym.mdk_create_key_package_with_options,
-      this.#handle, cPk.ptr, cRelays.ptr, protected_,
+      f.sym.mdk_create_key_package_with_options,
+      this.#handle, cPk.ptr, cRelays.ptr, isProtected,
     );
   }
 
@@ -195,15 +182,16 @@ export class Mdk {
    * @returns {string}
    */
   parseKeyPackage(event) {
-    const cEv = this.#ffi.toCString(JSON.stringify(event));
-    return callWithStringOut(this.#ffi, this.#ffi.sym.mdk_parse_key_package, this.#handle, cEv.ptr);
+    const f = ffi();
+    const cEv = f.toCString(JSON.stringify(event));
+    return callWithStringOut(f.sym.mdk_parse_key_package, this.#handle, cEv.ptr);
   }
 
   // -- Groups ---------------------------------------------------------------
 
   /** Get all groups. @returns {object[]} */
   getGroups() {
-    return callWithJsonOut(this.#ffi, this.#ffi.sym.mdk_get_groups, this.#handle);
+    return callWithJsonOut(ffi().sym.mdk_get_groups, this.#handle);
   }
 
   /**
@@ -212,8 +200,8 @@ export class Mdk {
    * @returns {object|null}
    */
   getGroup(mlsGroupId) {
-    const cGid = this.#ffi.toCString(mlsGroupId);
-    return callWithJsonOut(this.#ffi, this.#ffi.sym.mdk_get_group, this.#handle, cGid.ptr);
+    const cGid = ffi().toCString(mlsGroupId);
+    return callWithJsonOut(ffi().sym.mdk_get_group, this.#handle, cGid.ptr);
   }
 
   /**
@@ -222,8 +210,8 @@ export class Mdk {
    * @returns {string[]} — hex public keys
    */
   getMembers(mlsGroupId) {
-    const cGid = this.#ffi.toCString(mlsGroupId);
-    return callWithJsonOut(this.#ffi, this.#ffi.sym.mdk_get_members, this.#handle, cGid.ptr);
+    const cGid = ffi().toCString(mlsGroupId);
+    return callWithJsonOut(ffi().sym.mdk_get_members, this.#handle, cGid.ptr);
   }
 
   /**
@@ -232,11 +220,7 @@ export class Mdk {
    * @returns {string[]} — hex group IDs
    */
   groupsNeedingSelfUpdate(thresholdSecs) {
-    return callWithJsonOut(
-      this.#ffi,
-      this.#ffi.sym.mdk_groups_needing_self_update,
-      this.#handle, thresholdSecs,
-    );
+    return callWithJsonOut(ffi().sym.mdk_groups_needing_self_update, this.#handle, thresholdSecs);
   }
 
   /**
@@ -249,15 +233,15 @@ export class Mdk {
    * @param {string[]} admins — hex public keys
    */
   createGroup(creatorPk, keyPackageEvents, name, description, relays, admins) {
-    const cPk = this.#ffi.toCString(creatorPk);
-    const cKp = this.#ffi.toCString(JSON.stringify(keyPackageEvents.map((e) => JSON.stringify(e))));
-    const cName = this.#ffi.toCString(name);
-    const cDesc = this.#ffi.toCString(description);
-    const cRelays = this.#ffi.toCString(JSON.stringify(relays));
-    const cAdmins = this.#ffi.toCString(JSON.stringify(admins));
+    const f = ffi();
+    const cPk = f.toCString(creatorPk);
+    const cKp = f.toCString(JSON.stringify(keyPackageEvents.map((e) => JSON.stringify(e))));
+    const cName = f.toCString(name);
+    const cDesc = f.toCString(description);
+    const cRelays = f.toCString(JSON.stringify(relays));
+    const cAdmins = f.toCString(JSON.stringify(admins));
     return callWithJsonOut(
-      this.#ffi,
-      this.#ffi.sym.mdk_create_group,
+      f.sym.mdk_create_group,
       this.#handle, cPk.ptr, cKp.ptr, cName.ptr, cDesc.ptr, cRelays.ptr, cAdmins.ptr,
     );
   }
@@ -268,9 +252,10 @@ export class Mdk {
    * @param {object[]} keyPackageEvents
    */
   addMembers(mlsGroupId, keyPackageEvents) {
-    const cGid = this.#ffi.toCString(mlsGroupId);
-    const cKp = this.#ffi.toCString(JSON.stringify(keyPackageEvents.map((e) => JSON.stringify(e))));
-    return callWithJsonOut(this.#ffi, this.#ffi.sym.mdk_add_members, this.#handle, cGid.ptr, cKp.ptr);
+    const f = ffi();
+    const cGid = f.toCString(mlsGroupId);
+    const cKp = f.toCString(JSON.stringify(keyPackageEvents.map((e) => JSON.stringify(e))));
+    return callWithJsonOut(f.sym.mdk_add_members, this.#handle, cGid.ptr, cKp.ptr);
   }
 
   /**
@@ -279,9 +264,10 @@ export class Mdk {
    * @param {string[]} pubkeys — hex public keys
    */
   removeMembers(mlsGroupId, pubkeys) {
-    const cGid = this.#ffi.toCString(mlsGroupId);
-    const cPks = this.#ffi.toCString(JSON.stringify(pubkeys));
-    return callWithJsonOut(this.#ffi, this.#ffi.sym.mdk_remove_members, this.#handle, cGid.ptr, cPks.ptr);
+    const f = ffi();
+    const cGid = f.toCString(mlsGroupId);
+    const cPks = f.toCString(JSON.stringify(pubkeys));
+    return callWithJsonOut(f.sym.mdk_remove_members, this.#handle, cGid.ptr, cPks.ptr);
   }
 
   /**
@@ -290,45 +276,40 @@ export class Mdk {
    * @param {object} update — { name?, description?, image_hash?, relays?, admins? }
    */
   updateGroupData(mlsGroupId, update) {
-    const cGid = this.#ffi.toCString(mlsGroupId);
-    const cUpd = this.#ffi.toCString(JSON.stringify(update));
-    return callWithJsonOut(this.#ffi, this.#ffi.sym.mdk_update_group_data, this.#handle, cGid.ptr, cUpd.ptr);
+    const f = ffi();
+    const cGid = f.toCString(mlsGroupId);
+    const cUpd = f.toCString(JSON.stringify(update));
+    return callWithJsonOut(f.sym.mdk_update_group_data, this.#handle, cGid.ptr, cUpd.ptr);
   }
 
-  /**
-   * Perform a self-update (key rotation).
-   * @param {string} mlsGroupId
-   */
+  /** Perform a self-update (key rotation). @param {string} mlsGroupId */
   selfUpdate(mlsGroupId) {
-    const cGid = this.#ffi.toCString(mlsGroupId);
-    return callWithJsonOut(this.#ffi, this.#ffi.sym.mdk_self_update, this.#handle, cGid.ptr);
+    const cGid = ffi().toCString(mlsGroupId);
+    return callWithJsonOut(ffi().sym.mdk_self_update, this.#handle, cGid.ptr);
   }
 
-  /**
-   * Leave a group.
-   * @param {string} mlsGroupId
-   */
+  /** Leave a group. @param {string} mlsGroupId */
   leaveGroup(mlsGroupId) {
-    const cGid = this.#ffi.toCString(mlsGroupId);
-    return callWithJsonOut(this.#ffi, this.#ffi.sym.mdk_leave_group, this.#handle, cGid.ptr);
+    const cGid = ffi().toCString(mlsGroupId);
+    return callWithJsonOut(ffi().sym.mdk_leave_group, this.#handle, cGid.ptr);
   }
 
   /** Merge pending commit. @param {string} mlsGroupId */
   mergePendingCommit(mlsGroupId) {
-    const cGid = this.#ffi.toCString(mlsGroupId);
-    check(this.#ffi, this.#ffi.sym.mdk_merge_pending_commit(this.#handle, cGid.ptr));
+    const cGid = ffi().toCString(mlsGroupId);
+    check(ffi().sym.mdk_merge_pending_commit(this.#handle, cGid.ptr));
   }
 
   /** Clear pending commit. @param {string} mlsGroupId */
   clearPendingCommit(mlsGroupId) {
-    const cGid = this.#ffi.toCString(mlsGroupId);
-    check(this.#ffi, this.#ffi.sym.mdk_clear_pending_commit(this.#handle, cGid.ptr));
+    const cGid = ffi().toCString(mlsGroupId);
+    check(ffi().sym.mdk_clear_pending_commit(this.#handle, cGid.ptr));
   }
 
   /** Sync group metadata from MLS. @param {string} mlsGroupId */
   syncGroupMetadata(mlsGroupId) {
-    const cGid = this.#ffi.toCString(mlsGroupId);
-    check(this.#ffi, this.#ffi.sym.mdk_sync_group_metadata(this.#handle, cGid.ptr));
+    const cGid = ffi().toCString(mlsGroupId);
+    check(ffi().sym.mdk_sync_group_metadata(this.#handle, cGid.ptr));
   }
 
   /**
@@ -337,8 +318,8 @@ export class Mdk {
    * @returns {string[]}
    */
   getRelays(mlsGroupId) {
-    const cGid = this.#ffi.toCString(mlsGroupId);
-    return callWithJsonOut(this.#ffi, this.#ffi.sym.mdk_get_relays, this.#handle, cGid.ptr);
+    const cGid = ffi().toCString(mlsGroupId);
+    return callWithJsonOut(ffi().sym.mdk_get_relays, this.#handle, cGid.ptr);
   }
 
   // -- Messages -------------------------------------------------------------
@@ -349,16 +330,16 @@ export class Mdk {
    * @param {string} senderPk — hex
    * @param {string} content
    * @param {number} kind — Nostr event kind
-   * @param {string[][]|null} [tags] — e.g. [["p","hex..."],["e","hex..."]]
+   * @param {string[][]|null} [tags]
    */
   createMessage(mlsGroupId, senderPk, content, kind, tags = null) {
-    const cGid = this.#ffi.toCString(mlsGroupId);
-    const cPk = this.#ffi.toCString(senderPk);
-    const cContent = this.#ffi.toCString(content);
-    const cTags = tags ? this.#ffi.toCString(JSON.stringify(tags)) : { ptr: this.#ffi.nullptr };
+    const f = ffi();
+    const cGid = f.toCString(mlsGroupId);
+    const cPk = f.toCString(senderPk);
+    const cContent = f.toCString(content);
+    const cTags = tags ? f.toCString(JSON.stringify(tags)) : { ptr: f.nullptr };
     return callWithJsonOut(
-      this.#ffi,
-      this.#ffi.sym.mdk_create_message,
+      f.sym.mdk_create_message,
       this.#handle, cGid.ptr, cPk.ptr, cContent.ptr, kind, cTags.ptr,
     );
   }
@@ -369,8 +350,8 @@ export class Mdk {
    * @returns {{ type: string, message?, result?, mls_group_id?, reason? }}
    */
   processMessage(event) {
-    const cEv = this.#ffi.toCString(JSON.stringify(event));
-    return callWithJsonOut(this.#ffi, this.#ffi.sym.mdk_process_message, this.#handle, cEv.ptr);
+    const cEv = ffi().toCString(JSON.stringify(event));
+    return callWithJsonOut(ffi().sym.mdk_process_message, this.#handle, cEv.ptr);
   }
 
   /**
@@ -380,11 +361,11 @@ export class Mdk {
    * @returns {object[]}
    */
   getMessages(mlsGroupId, opts = {}) {
-    const cGid = this.#ffi.toCString(mlsGroupId);
-    const cSort = opts.sortOrder ? this.#ffi.toCString(opts.sortOrder) : { ptr: this.#ffi.nullptr };
+    const f = ffi();
+    const cGid = f.toCString(mlsGroupId);
+    const cSort = opts.sortOrder ? f.toCString(opts.sortOrder) : { ptr: f.nullptr };
     return callWithJsonOut(
-      this.#ffi,
-      this.#ffi.sym.mdk_get_messages,
+      f.sym.mdk_get_messages,
       this.#handle, cGid.ptr, opts.limit ?? 0, opts.offset ?? 0, cSort.ptr,
     );
   }
@@ -396,9 +377,10 @@ export class Mdk {
    * @returns {object|null}
    */
   getMessage(mlsGroupId, eventId) {
-    const cGid = this.#ffi.toCString(mlsGroupId);
-    const cEid = this.#ffi.toCString(eventId);
-    return callWithJsonOut(this.#ffi, this.#ffi.sym.mdk_get_message, this.#handle, cGid.ptr, cEid.ptr);
+    const f = ffi();
+    const cGid = f.toCString(mlsGroupId);
+    const cEid = f.toCString(eventId);
+    return callWithJsonOut(f.sym.mdk_get_message, this.#handle, cGid.ptr, cEid.ptr);
   }
 
   /**
@@ -407,9 +389,10 @@ export class Mdk {
    * @param {"created_at_first"|"processed_at_first"} sortOrder
    */
   getLastMessage(mlsGroupId, sortOrder) {
-    const cGid = this.#ffi.toCString(mlsGroupId);
-    const cSort = this.#ffi.toCString(sortOrder);
-    return callWithJsonOut(this.#ffi, this.#ffi.sym.mdk_get_last_message, this.#handle, cGid.ptr, cSort.ptr);
+    const f = ffi();
+    const cGid = f.toCString(mlsGroupId);
+    const cSort = f.toCString(sortOrder);
+    return callWithJsonOut(f.sym.mdk_get_last_message, this.#handle, cGid.ptr, cSort.ptr);
   }
 
   // -- Welcomes -------------------------------------------------------------
@@ -420,19 +403,15 @@ export class Mdk {
    */
   getPendingWelcomes(opts = {}) {
     return callWithJsonOut(
-      this.#ffi,
-      this.#ffi.sym.mdk_get_pending_welcomes,
+      ffi().sym.mdk_get_pending_welcomes,
       this.#handle, opts.limit ?? 0, opts.offset ?? 0,
     );
   }
 
-  /**
-   * Get a welcome by event ID.
-   * @param {string} eventId
-   */
+  /** Get a welcome by event ID. @param {string} eventId */
   getWelcome(eventId) {
-    const cEid = this.#ffi.toCString(eventId);
-    return callWithJsonOut(this.#ffi, this.#ffi.sym.mdk_get_welcome, this.#handle, cEid.ptr);
+    const cEid = ffi().toCString(eventId);
+    return callWithJsonOut(ffi().sym.mdk_get_welcome, this.#handle, cEid.ptr);
   }
 
   /**
@@ -441,18 +420,19 @@ export class Mdk {
    * @param {object} rumor — unsigned event object
    */
   processWelcome(wrapperEventId, rumor) {
-    const cWid = this.#ffi.toCString(wrapperEventId);
-    const cRumor = this.#ffi.toCString(JSON.stringify(rumor));
-    return callWithJsonOut(this.#ffi, this.#ffi.sym.mdk_process_welcome, this.#handle, cWid.ptr, cRumor.ptr);
+    const f = ffi();
+    const cWid = f.toCString(wrapperEventId);
+    const cRumor = f.toCString(JSON.stringify(rumor));
+    return callWithJsonOut(f.sym.mdk_process_welcome, this.#handle, cWid.ptr, cRumor.ptr);
   }
 
   /**
    * Accept a welcome.
-   * @param {object} welcome — welcome object (as from processWelcome/getWelcome)
+   * @param {object} welcome
    */
   acceptWelcome(welcome) {
-    const cJson = this.#ffi.toCString(JSON.stringify(welcome));
-    check(this.#ffi, this.#ffi.sym.mdk_accept_welcome(this.#handle, cJson.ptr));
+    const cJson = ffi().toCString(JSON.stringify(welcome));
+    check(ffi().sym.mdk_accept_welcome(this.#handle, cJson.ptr));
   }
 
   /**
@@ -460,8 +440,8 @@ export class Mdk {
    * @param {object} welcome
    */
   declineWelcome(welcome) {
-    const cJson = this.#ffi.toCString(JSON.stringify(welcome));
-    check(this.#ffi, this.#ffi.sym.mdk_decline_welcome(this.#handle, cJson.ptr));
+    const cJson = ffi().toCString(JSON.stringify(welcome));
+    check(ffi().sym.mdk_decline_welcome(this.#handle, cJson.ptr));
   }
 }
 
@@ -471,54 +451,51 @@ export class Mdk {
 
 /**
  * Prepare a group image for upload.
- * @param {object} ffi — BunFfi or DenoFfi
  * @param {Uint8Array} data — raw image bytes
  * @param {string} mime — e.g. "image/png"
  */
-export function prepareGroupImage(ffi, data, mime) {
-  const cMime = ffi.toCString(mime);
+export function prepareGroupImage(data, mime) {
+  const f = ffi();
+  const cMime = f.toCString(mime);
   return callWithJsonOut(
-    ffi,
-    ffi.sym.mdk_prepare_group_image,
-    ffi.bufferPtr(data), data.length, cMime.ptr,
+    f.sym.mdk_prepare_group_image,
+    f.bufferPtr(data), data.length, cMime.ptr,
   );
 }
 
 /**
  * Decrypt a group image.
- * @param {object} ffi
  * @param {Uint8Array} data — encrypted data
  * @param {Uint8Array|null} expectedHash — 32-byte SHA-256 hash (null to skip)
  * @param {Uint8Array} key — 32-byte key
  * @param {Uint8Array} nonce — 12-byte nonce
  * @returns {Uint8Array}
  */
-export function decryptGroupImage(ffi, data, expectedHash, key, nonce) {
-  const out = ffi.allocOutBytes();
+export function decryptGroupImage(data, expectedHash, key, nonce) {
+  const f = ffi();
+  const out = f.allocOutBytes();
 
-  const code = ffi.sym.mdk_decrypt_group_image(
-    ffi.bufferPtr(data), data.length,
-    expectedHash ? ffi.bufferPtr(expectedHash) : ffi.nullptr,
+  check(f.sym.mdk_decrypt_group_image(
+    f.bufferPtr(data), data.length,
+    expectedHash ? f.bufferPtr(expectedHash) : f.nullptr,
     expectedHash ? expectedHash.length : 0,
-    ffi.bufferPtr(key), key.length,
-    ffi.bufferPtr(nonce), nonce.length,
+    f.bufferPtr(key), key.length,
+    f.bufferPtr(nonce), nonce.length,
     out.ptrPtr, out.lenPtr,
-  );
-  check(ffi, code);
+  ));
   return out.readAndFree();
 }
 
 /**
  * Derive an upload keypair from an image key.
- * @param {object} ffi
  * @param {Uint8Array} key — 32-byte key
  * @param {number} version
  * @returns {string} — hex-encoded secret key
  */
-export function deriveUploadKeypair(ffi, key, version) {
+export function deriveUploadKeypair(key, version) {
+  const f = ffi();
   return callWithStringOut(
-    ffi,
-    ffi.sym.mdk_derive_upload_keypair,
-    ffi.bufferPtr(key), key.length, version,
+    f.sym.mdk_derive_upload_keypair,
+    f.bufferPtr(key), key.length, version,
   );
 }

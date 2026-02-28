@@ -1,10 +1,9 @@
 /**
  * Deno FFI backend for libmdk.
  *
- * Loads the shared library via Deno.dlopen and provides a uniform
- * interface that the high-level Mdk class consumes.
+ * Auto-loads the native library from the bundled package paths.
  *
- * Requires: --allow-ffi --unstable-ffi
+ * Requires: --allow-ffi
  */
 import { symbols as defs } from "./symbols.js";
 
@@ -25,7 +24,6 @@ type NativeType =
   | "pointer"
   | "buffer";
 
-/** Map our shorthand types to Deno FFI types. */
 const TYPE_MAP: Record<string, NativeType> = {
   ptr: "pointer",
   cstr: "buffer",
@@ -55,17 +53,6 @@ function toDenoSymbols(
   return out;
 }
 
-/**
- * Open the libmdk shared library.
- *
- * @param libPath — Path to libmdk. Defaults to searching standard locations.
- */
-export function openLibrary(libPath?: string): DenoFfi {
-  const path = libPath ?? findLibrary();
-  const lib = Deno.dlopen(path, toDenoSymbols(defs) as any);
-  return new DenoFfi(lib);
-}
-
 function findLibrary(): string {
   const ext =
     Deno.build.os === "darwin"
@@ -74,11 +61,23 @@ function findLibrary(): string {
         ? "dll"
         : "so";
   const base = `libmdk.${ext}`;
+  const pkgRoot = new URL(".", import.meta.url).pathname;
+
+  const platform =
+    Deno.build.os === "darwin"
+      ? "macos-aarch64"
+      : Deno.build.os === "windows"
+        ? "windows-x86_64"
+        : "linux-x86_64";
+
   const candidates = [
-    `../../target/release/${base}`,
-    `../../target/debug/${base}`,
-    base,
+    // Packaged layout
+    `${pkgRoot}../native/${platform}/${base}`,
+    // Development: cargo build output
+    `${pkgRoot}../../../target/release/${base}`,
+    `${pkgRoot}../../../target/debug/${base}`,
   ];
+
   for (const c of candidates) {
     try {
       Deno.statSync(c);
@@ -92,21 +91,24 @@ function findLibrary(): string {
 
 const encoder = new TextEncoder();
 
-/** Encode a JS string as a null-terminated Uint8Array. */
-function cstr(s: string | null | undefined): Uint8Array | null {
-  if (s === null || s === undefined) return null;
-  return encoder.encode(s + "\0");
+function cstr(
+  s: string | null | undefined,
+): { buf: Uint8Array | null; ptr: Deno.PointerObject | null } {
+  if (s === null || s === undefined) return { buf: null, ptr: null };
+  const buf = encoder.encode(s + "\0");
+  return { buf, ptr: Deno.UnsafePointer.of(buf) };
 }
 
 /**
  * Deno FFI backend — wraps the raw library handle and provides
- * uniform helpers for string and pointer management.
+ * helpers for string and pointer management.
  */
 export class DenoFfi {
   #lib: Deno.DynamicLibrary<any>;
 
-  constructor(lib: Deno.DynamicLibrary<any>) {
-    this.#lib = lib;
+  constructor(libPath?: string) {
+    const path = libPath ?? findLibrary();
+    this.#lib = Deno.dlopen(path, toDenoSymbols(defs) as any);
   }
 
   get sym(): any {
@@ -117,22 +119,10 @@ export class DenoFfi {
     this.#lib.close();
   }
 
-  // -- String helpers --
-
-  /** Encode a JS string to a null-terminated buffer. */
-  toCString(s: string | null | undefined): {
-    buf: Uint8Array | null;
-    ptr: Deno.PointerObject | null;
-  } {
-    const buf = cstr(s);
-    if (!buf) return { buf: null, ptr: null };
-    return { buf, ptr: Deno.UnsafePointer.of(buf) };
+  toCString(s: string | null | undefined) {
+    return cstr(s);
   }
 
-  /**
-   * Read a C string from a pointer returned by Rust, then free it.
-   * IMPORTANT: must read BEFORE freeing on Deno (no clone safety).
-   */
   readAndFreeString(pointer: Deno.PointerObject | null): string | null {
     if (!pointer) return null;
     const s = new Deno.UnsafePointerView(pointer).getCString();
@@ -140,33 +130,21 @@ export class DenoFfi {
     return s;
   }
 
-  /** Read a C string from a pointer WITHOUT freeing. */
   readString(pointer: Deno.PointerObject | null): string | null {
     if (!pointer) return null;
     return new Deno.UnsafePointerView(pointer).getCString();
   }
 
-  /** Read the last error message (thread-local, consumes it). */
   lastError(): string | null {
     const p = this.sym.mdk_last_error_message();
     return this.readAndFreeString(p);
   }
 
-  // -- Pointer helpers --
-
-  /** Get a pointer to a Uint8Array. */
   bufferPtr(buf: Uint8Array): Deno.PointerObject | null {
     return Deno.UnsafePointer.of(buf);
   }
 
-  /**
-   * Allocate a pointer-sized buffer suitable for an out-parameter.
-   */
-  allocOutPtr(): {
-    buf: BigUint64Array;
-    ptr: Deno.PointerObject | null;
-    read: () => Deno.PointerObject | null;
-  } {
+  allocOutPtr() {
     const buf = new BigUint64Array(1);
     const p = Deno.UnsafePointer.of(buf);
     return {
@@ -180,14 +158,7 @@ export class DenoFfi {
     };
   }
 
-  /**
-   * Allocate an out-parameter for a string pointer (char**).
-   */
-  allocOutString(): {
-    buf: BigUint64Array;
-    ptr: Deno.PointerObject | null;
-    readAndFree: () => string | null;
-  } {
+  allocOutString() {
     const out = this.allocOutPtr();
     const ffi = this;
     return {
@@ -199,14 +170,7 @@ export class DenoFfi {
     };
   }
 
-  /**
-   * Allocate out-parameters for byte output (uint8_t** + usize*).
-   */
-  allocOutBytes(): {
-    ptrPtr: Deno.PointerObject | null;
-    lenPtr: Deno.PointerObject | null;
-    readAndFree: () => Uint8Array | null;
-  } {
+  allocOutBytes() {
     const ptrBuf = new BigUint64Array(1);
     const lenBuf = new BigUint64Array(1);
     const ffi = this;
@@ -227,7 +191,6 @@ export class DenoFfi {
     };
   }
 
-  /** Null pointer constant. */
   get nullptr(): null {
     return null;
   }
