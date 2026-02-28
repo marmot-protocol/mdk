@@ -100,7 +100,7 @@ pub struct PendingMemberChanges {
     pub removals: Vec<PublicKey>,
 }
 
-/// Debug information about a leaf node in the ratchet tree
+/// Public information about a leaf node in the ratchet tree
 ///
 /// Contains only public information (encryption key, signature key, credential
 /// identity). No secret key material is included.
@@ -110,7 +110,7 @@ pub struct PendingMemberChanges {
 /// The ratchet tree holds public keys and tree structure, not secrets.
 /// The MLS spec assumes this data can be shared (e.g. in Welcome messages).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LeafNodeDebugInfo {
+pub struct LeafNodeInfo {
     /// The leaf index in the ratchet tree
     pub index: u32,
     /// The member's public HPKE encryption key (hex-encoded)
@@ -121,9 +121,9 @@ pub struct LeafNodeDebugInfo {
     pub credential_identity: String,
 }
 
-/// Debug information about the ratchet tree of an MLS group
+/// Public information about the ratchet tree of an MLS group
 ///
-/// Provides a view into the MLS group's tree structure for debugging purposes.
+/// Provides a view into the MLS group's tree structure.
 /// Contains only public information — no secrets or private key material.
 ///
 /// # Security Note
@@ -131,14 +131,14 @@ pub struct LeafNodeDebugInfo {
 /// The ratchet tree holds public keys and tree structure, not secrets.
 /// The MLS spec assumes this data can be shared (e.g. in Welcome messages).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RatchetTreeDebugInfo {
+pub struct RatchetTreeInfo {
     /// SHA-256 fingerprint of the TLS-serialized ratchet tree (hex-encoded).
     /// Useful for comparing tree state across clients.
     pub tree_hash: String,
     /// The full ratchet tree serialized via TLS encoding (hex-encoded)
     pub serialized_tree: String,
     /// Leaf nodes with their indices and public keys
-    pub leaf_nodes: Vec<LeafNodeDebugInfo>,
+    pub leaf_nodes: Vec<LeafNodeInfo>,
 }
 
 impl NostrGroupConfigData {
@@ -494,7 +494,7 @@ where
         })
     }
 
-    /// Returns debug information about the ratchet tree of an MLS group
+    /// Returns public information about the ratchet tree of an MLS group
     ///
     /// This includes a SHA-256 fingerprint of the TLS-serialized ratchet tree,
     /// the full serialized tree as hex, and a list of leaf nodes with their
@@ -511,12 +511,9 @@ where
     ///
     /// # Returns
     ///
-    /// * `Ok(RatchetTreeDebugInfo)` - Debug information about the ratchet tree
+    /// * `Ok(RatchetTreeInfo)` - Public information about the ratchet tree
     /// * `Err(Error)` - If the group is not found or there is an error accessing the tree
-    pub fn get_ratchet_tree_debug_info(
-        &self,
-        group_id: &GroupId,
-    ) -> Result<RatchetTreeDebugInfo, Error> {
+    pub fn get_ratchet_tree_info(&self, group_id: &GroupId) -> Result<RatchetTreeInfo, Error> {
         let mls_group = self.load_mls_group(group_id)?.ok_or(Error::GroupNotFound)?;
 
         // Export and TLS-serialize the ratchet tree
@@ -528,7 +525,7 @@ where
         let serialized_tree = hex::encode(&serialized_bytes);
 
         // Extract leaf nodes with their public keys
-        let leaf_nodes: Vec<LeafNodeDebugInfo> = mls_group
+        let leaf_nodes: Vec<LeafNodeInfo> = mls_group
             .members()
             .map(|member| {
                 let credential_identity = match BasicCredential::try_from(member.credential.clone())
@@ -537,7 +534,7 @@ where
                     Err(_) => "(unknown)".to_string(),
                 };
 
-                LeafNodeDebugInfo {
+                LeafNodeInfo {
                     index: member.index.u32(),
                     encryption_key: hex::encode(&member.encryption_key),
                     signature_key: hex::encode(&member.signature_key),
@@ -546,7 +543,7 @@ where
             })
             .collect();
 
-        Ok(RatchetTreeDebugInfo {
+        Ok(RatchetTreeInfo {
             tree_hash,
             serialized_tree,
             leaf_nodes,
@@ -5228,7 +5225,7 @@ mod tests {
     }
 
     #[test]
-    fn test_get_ratchet_tree_debug_info_basic() {
+    fn test_get_ratchet_tree_info() {
         let creator_mdk = create_test_mdk();
         let (creator, initial_members, admins) = create_test_group_members();
         let creator_pk = creator.public_key();
@@ -5254,8 +5251,8 @@ mod tests {
             .expect("Failed to merge pending commit");
 
         let debug_info = creator_mdk
-            .get_ratchet_tree_debug_info(group_id)
-            .expect("Failed to get ratchet tree debug info");
+            .get_ratchet_tree_info(group_id)
+            .expect("Failed to get ratchet tree info");
 
         // tree_hash should be a 64-character hex string (SHA-256 = 32 bytes)
         assert_eq!(debug_info.tree_hash.len(), 64);
@@ -5314,16 +5311,16 @@ mod tests {
     }
 
     #[test]
-    fn test_get_ratchet_tree_debug_info_nonexistent_group() {
+    fn test_get_ratchet_tree_info_nonexistent_group() {
         let mdk = create_test_mdk();
         let fake_group_id = mdk_storage_traits::GroupId::from_slice(&[0u8; 32]);
 
-        let result = mdk.get_ratchet_tree_debug_info(&fake_group_id);
+        let result = mdk.get_ratchet_tree_info(&fake_group_id);
         assert!(result.is_err(), "should error for nonexistent group");
     }
 
     #[test]
-    fn test_get_ratchet_tree_debug_info_deterministic() {
+    fn test_get_ratchet_tree_info_deterministic() {
         let creator_mdk = create_test_mdk();
         let (creator, initial_members, admins) = create_test_group_members();
         let creator_pk = creator.public_key();
@@ -5350,12 +5347,12 @@ mod tests {
 
         // Call twice — should return identical results
         let info1 = creator_mdk
-            .get_ratchet_tree_debug_info(group_id)
+            .get_ratchet_tree_info(group_id)
             .expect("first call");
         let info2 = creator_mdk
-            .get_ratchet_tree_debug_info(group_id)
+            .get_ratchet_tree_info(group_id)
             .expect("second call");
 
-        assert_eq!(info1, info2, "debug info should be deterministic");
+        assert_eq!(info1, info2, "ratchet tree info should be deterministic");
     }
 }
