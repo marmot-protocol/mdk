@@ -15,19 +15,8 @@
 
 ### Added
 
-### Fixed
-
-### Removed
-
-### Deprecated -->
-
-## Unreleased
-
-### Breaking changes
-
-### Changed
-
-### Added
+- Added `get_ratchet_tree_debug_info()` method to `MDK` for inspecting MLS ratchet tree state. Returns a `RatchetTreeDebugInfo` struct containing a SHA-256 tree fingerprint, the full TLS-serialized tree as hex, and leaf nodes with indices and public keys. Only exposes public information (no secrets).
+- Added `RatchetTreeDebugInfo` and `LeafNodeDebugInfo` structs, exported via the prelude.
 
 ### Fixed
 
