@@ -75,8 +75,7 @@ pub unsafe extern "C" fn mdk_prepare_group_image(
         let image_bytes = unsafe { std::slice::from_raw_parts(data, len) };
         let mime_str = unsafe { cstr_to_str(mime) }?;
 
-        let prepared = core_prepare(image_bytes, mime_str).map_err(|e| {
-            tracing::debug!("prepare_group_image internal: {e}");
+        let prepared = core_prepare(image_bytes, mime_str).map_err(|_| {
             tracing::warn!("Prepare group image failed");
             error::set_last_error("Prepare group image failed");
             MdkError::Mdk
@@ -165,8 +164,7 @@ pub unsafe extern "C" fn mdk_decrypt_group_image(
         nonce_arr.zeroize();
 
         let decrypted = core_decrypt(encrypted, hash_opt.as_ref(), &key_secret, &nonce_secret)
-            .map_err(|e| {
-                tracing::debug!("decrypt_group_image internal: {e}");
+            .map_err(|_| {
                 tracing::warn!("Decrypt group image failed");
                 error::set_last_error("Decrypt group image failed");
                 MdkError::Mdk
@@ -216,8 +214,7 @@ pub unsafe extern "C" fn mdk_derive_upload_keypair(
         let key_secret = mdk_storage_traits::Secret::new(key_arr);
         key_arr.zeroize();
 
-        let keys = core_derive_upload_keypair(&key_secret, version).map_err(|e| {
-            tracing::debug!("derive_upload_keypair internal: {e}");
+        let keys = core_derive_upload_keypair(&key_secret, version).map_err(|_| {
             tracing::warn!("Derive upload keypair failed");
             error::set_last_error("Derive upload keypair failed");
             MdkError::Mdk

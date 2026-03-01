@@ -154,9 +154,7 @@ mod tests {
     }
 
     #[test]
-    fn from_storage_error_sets_message() {
-        // We can't easily construct a StorageError, but we can test
-        // the simpler helpers
+    fn invalid_input_sets_message() {
         let code = invalid_input("bad input");
         assert_eq!(code, MdkError::InvalidInput);
 
