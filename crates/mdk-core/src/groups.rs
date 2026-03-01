@@ -22,6 +22,8 @@ use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
 use tls_codec::Serialize as TlsSerialize;
 
+use sha2::{Digest, Sha256};
+
 use super::MDK;
 use super::extension::NostrGroupDataExtension;
 use crate::error::Error;
@@ -96,6 +98,47 @@ pub struct PendingMemberChanges {
     pub additions: Vec<PublicKey>,
     /// Public keys of members that will be removed when proposals are committed
     pub removals: Vec<PublicKey>,
+}
+
+/// Public information about a leaf node in the ratchet tree
+///
+/// Contains only public information (encryption key, signature key, credential
+/// identity). No secret key material is included.
+///
+/// # Security Note
+///
+/// The ratchet tree holds public keys and tree structure, not secrets.
+/// The MLS spec assumes this data can be shared (e.g. in Welcome messages).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeafNodeInfo {
+    /// The leaf index in the ratchet tree
+    pub index: u32,
+    /// The member's public HPKE encryption key (hex-encoded)
+    pub encryption_key: String,
+    /// The member's public signature key (hex-encoded)
+    pub signature_key: String,
+    /// The member's credential identity (hex-encoded, typically a Nostr public key)
+    pub credential_identity: String,
+}
+
+/// Public information about the ratchet tree of an MLS group
+///
+/// Provides a view into the MLS group's tree structure.
+/// Contains only public information — no secrets or private key material.
+///
+/// # Security Note
+///
+/// The ratchet tree holds public keys and tree structure, not secrets.
+/// The MLS spec assumes this data can be shared (e.g. in Welcome messages).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RatchetTreeInfo {
+    /// SHA-256 fingerprint of the TLS-serialized ratchet tree (hex-encoded).
+    /// Useful for comparing tree state across clients.
+    pub tree_hash: String,
+    /// The full ratchet tree serialized via TLS encoding (hex-encoded)
+    pub serialized_tree: String,
+    /// Leaf nodes with their indices and public keys
+    pub leaf_nodes: Vec<LeafNodeInfo>,
 }
 
 impl NostrGroupConfigData {
@@ -448,6 +491,68 @@ where
             let public_key = self.parse_credential_identity(identity_bytes)?;
             acc.insert(public_key);
             Ok(acc)
+        })
+    }
+
+    /// Returns public information about the ratchet tree of an MLS group
+    ///
+    /// This includes a SHA-256 fingerprint of the TLS-serialized ratchet tree,
+    /// the full serialized tree as hex, and a list of leaf nodes with their
+    /// indices and public keys.
+    ///
+    /// # Security Note
+    ///
+    /// The ratchet tree holds public keys and tree structure, not secrets.
+    /// Per the MLS spec, ratchet tree data is public information that can be
+    /// shared (e.g., in Welcome messages).
+    ///
+    /// # Arguments
+    ///
+    /// * `group_id` - The MLS group ID
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(RatchetTreeInfo)` - Public information about the ratchet tree
+    /// * `Err(Error)` - If the group is not found or there is an error accessing the tree
+    pub fn get_ratchet_tree_info(&self, group_id: &GroupId) -> Result<RatchetTreeInfo, Error> {
+        let mls_group = self.load_mls_group(group_id)?.ok_or(Error::GroupNotFound)?;
+
+        // Export and TLS-serialize the ratchet tree
+        let ratchet_tree = mls_group.export_ratchet_tree();
+        let serialized_bytes = ratchet_tree.tls_serialize_detached()?;
+
+        // Compute SHA-256 fingerprint of the serialized tree for easy comparison
+        let tree_hash = hex::encode(Sha256::digest(&serialized_bytes));
+        let serialized_tree = hex::encode(&serialized_bytes);
+
+        // Extract leaf nodes with their public keys
+        let leaf_nodes: Vec<LeafNodeInfo> = mls_group
+            .members()
+            .map(|member| {
+                let index = member.index.u32();
+                let basic_cred = BasicCredential::try_from(member.credential).map_err(|e| {
+                    tracing::warn!(
+                        leaf_index = index,
+                        error = %e,
+                        "Failed to parse credential for leaf node in ratchet tree"
+                    );
+                    Error::Group(format!("invalid credential at leaf index {index}: {e}"))
+                })?;
+                let credential_identity = hex::encode(basic_cred.identity());
+
+                Ok(LeafNodeInfo {
+                    index,
+                    encryption_key: hex::encode(&member.encryption_key),
+                    signature_key: hex::encode(&member.signature_key),
+                    credential_identity,
+                })
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+
+        Ok(RatchetTreeInfo {
+            tree_hash,
+            serialized_tree,
+            leaf_nodes,
         })
     }
 
@@ -5123,5 +5228,137 @@ mod tests {
             active_signer.is_some(),
             "active signer keypair must be present in storage after successful retry"
         );
+    }
+
+    #[test]
+    fn test_get_ratchet_tree_info() {
+        let creator_mdk = create_test_mdk();
+        let (creator, initial_members, admins) = create_test_group_members();
+        let creator_pk = creator.public_key();
+
+        let mut initial_key_package_events = Vec::new();
+        for member_keys in &initial_members {
+            let key_package_event = create_key_package_event(&creator_mdk, member_keys);
+            initial_key_package_events.push(key_package_event);
+        }
+
+        let create_result = creator_mdk
+            .create_group(
+                &creator_pk,
+                initial_key_package_events,
+                create_nostr_group_config_data(admins),
+            )
+            .expect("Failed to create group");
+
+        let group_id = &create_result.group.mls_group_id;
+
+        creator_mdk
+            .merge_pending_commit(group_id)
+            .expect("Failed to merge pending commit");
+
+        let debug_info = creator_mdk
+            .get_ratchet_tree_info(group_id)
+            .expect("Failed to get ratchet tree info");
+
+        // tree_hash should be a 64-character hex string (SHA-256 = 32 bytes)
+        assert_eq!(debug_info.tree_hash.len(), 64);
+        assert!(
+            debug_info.tree_hash.chars().all(|c| c.is_ascii_hexdigit()),
+            "tree_hash should be valid hex"
+        );
+
+        // serialized_tree should be non-empty hex
+        assert!(
+            !debug_info.serialized_tree.is_empty(),
+            "serialized tree should not be empty"
+        );
+        assert!(
+            debug_info
+                .serialized_tree
+                .chars()
+                .all(|c| c.is_ascii_hexdigit()),
+            "serialized tree should be valid hex"
+        );
+
+        // Should have 3 leaf nodes: creator + 2 members
+        assert_eq!(
+            debug_info.leaf_nodes.len(),
+            3,
+            "should have 3 leaf nodes (creator + 2 members)"
+        );
+
+        // Each leaf node should have valid data
+        for leaf in &debug_info.leaf_nodes {
+            assert!(
+                !leaf.encryption_key.is_empty(),
+                "encryption key should not be empty"
+            );
+            assert!(
+                !leaf.signature_key.is_empty(),
+                "signature key should not be empty"
+            );
+            // Credential identity should be a 32-byte hex pubkey (64 hex chars)
+            assert_eq!(
+                leaf.credential_identity.len(),
+                64,
+                "credential identity should be a 32-byte hex pubkey"
+            );
+        }
+
+        // Verify the creator's pubkey is among the leaf nodes
+        let creator_hex = creator_pk.to_hex();
+        assert!(
+            debug_info
+                .leaf_nodes
+                .iter()
+                .any(|l| l.credential_identity == creator_hex),
+            "creator pubkey should be in leaf nodes"
+        );
+    }
+
+    #[test]
+    fn test_get_ratchet_tree_info_nonexistent_group() {
+        let mdk = create_test_mdk();
+        let fake_group_id = mdk_storage_traits::GroupId::from_slice(&[0u8; 32]);
+
+        let result = mdk.get_ratchet_tree_info(&fake_group_id);
+        assert!(result.is_err(), "should error for nonexistent group");
+    }
+
+    #[test]
+    fn test_get_ratchet_tree_info_deterministic() {
+        let creator_mdk = create_test_mdk();
+        let (creator, initial_members, admins) = create_test_group_members();
+        let creator_pk = creator.public_key();
+
+        let mut initial_key_package_events = Vec::new();
+        for member_keys in &initial_members {
+            let key_package_event = create_key_package_event(&creator_mdk, member_keys);
+            initial_key_package_events.push(key_package_event);
+        }
+
+        let create_result = creator_mdk
+            .create_group(
+                &creator_pk,
+                initial_key_package_events,
+                create_nostr_group_config_data(admins),
+            )
+            .expect("Failed to create group");
+
+        let group_id = &create_result.group.mls_group_id;
+
+        creator_mdk
+            .merge_pending_commit(group_id)
+            .expect("Failed to merge pending commit");
+
+        // Call twice — should return identical results
+        let info1 = creator_mdk
+            .get_ratchet_tree_info(group_id)
+            .expect("first call");
+        let info2 = creator_mdk
+            .get_ratchet_tree_info(group_id)
+            .expect("second call");
+
+        assert_eq!(info1, info2, "ratchet tree info should be deterministic");
     }
 }
