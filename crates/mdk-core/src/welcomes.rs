@@ -412,6 +412,7 @@ where
         let mls_group_config = MlsGroupJoinConfig::builder()
             .use_ratchet_tree_extension(true)
             .sender_ratchet_configuration(sender_ratchet_config)
+            .max_past_epochs(self.config.max_past_epochs)
             .build();
 
         let staged_welcome =

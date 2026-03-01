@@ -188,10 +188,155 @@ mod tests {
     use nostr::Keys;
     use openmls::prelude::MlsGroup;
 
+    use crate::MdkConfig;
     use crate::test_util::{
         create_key_package_event, create_nostr_group_config_data, create_test_rumor,
     };
-    use crate::tests::create_test_mdk;
+    use crate::tests::{create_test_mdk, create_test_mdk_with_config};
+
+    /// Helper: run the past-epoch delivery scenario and return the result of Bob processing
+    /// Alice's delayed epoch-N message after the group has advanced to epoch N+1.
+    ///
+    /// Both MDK instances are constructed using the provided config, which controls
+    /// `max_past_epochs` on the underlying OpenMLS group.
+    fn past_epoch_delivery_result(config: MdkConfig) -> crate::messages::MessageProcessingResult {
+        let alice_keys = Keys::generate();
+        let bob_keys = Keys::generate();
+
+        let alice_mdk = create_test_mdk_with_config(config.clone());
+        let bob_mdk = create_test_mdk_with_config(config);
+
+        let admins = vec![alice_keys.public_key(), bob_keys.public_key()];
+
+        // Alice creates the group with Bob
+        let bob_key_package = create_key_package_event(&bob_mdk, &bob_keys);
+        let create_result = alice_mdk
+            .create_group(
+                &alice_keys.public_key(),
+                vec![bob_key_package],
+                create_nostr_group_config_data(admins),
+            )
+            .expect("Alice should create group");
+
+        let group_id = create_result.group.mls_group_id.clone();
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("Alice should merge creation commit");
+
+        // Bob joins
+        let bob_welcome_rumor = &create_result.welcome_rumors[0];
+        let bob_welcome = bob_mdk
+            .process_welcome(&nostr::EventId::all_zeros(), bob_welcome_rumor)
+            .expect("Bob should process welcome");
+        bob_mdk
+            .accept_welcome(&bob_welcome)
+            .expect("Bob should accept welcome");
+
+        // Alice sends a message at epoch 1 — held back from Bob
+        let rumor = create_test_rumor(&alice_keys, "message from the past epoch");
+        let past_epoch_msg = alice_mdk
+            .create_message(&group_id, rumor)
+            .expect("Alice should create message");
+
+        // Alice self-updates → epoch 2; both process the commit
+        let update_result = alice_mdk
+            .self_update(&group_id)
+            .expect("Alice should self-update");
+        alice_mdk
+            .process_message(&update_result.evolution_event)
+            .expect("Alice should process her own evolution event");
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("Alice should merge self-update");
+        bob_mdk
+            .process_message(&update_result.evolution_event)
+            .expect("Bob should process self-update commit");
+
+        // Now deliver the held-back epoch-1 message to Bob (group is at epoch 2)
+        bob_mdk
+            .process_message(&past_epoch_msg)
+            .expect("process_message should not return Err")
+    }
+
+    /// Regression test: past-epoch application messages fail when max_past_epochs = 0.
+    ///
+    /// This test proves a concrete bug: MDK was not setting max_past_epochs on the OpenMLS
+    /// group config, which defaulted to 0. When a commit advances the group to epoch N+1
+    /// and an application message from epoch N arrives late, OpenMLS has no retained past
+    /// message secrets and returns SecretTreeError::TooDistantInThePast, causing MDK to
+    /// permanently mark the message as Failed.
+    ///
+    /// Scenario:
+    ///   1. Alice creates a group with Bob, both using max_past_epochs = 0.
+    ///   2. Alice sends a message at epoch 1 — not yet delivered to Bob.
+    ///   3. Alice self-updates; both process the commit → epoch 2.
+    ///   4. Bob receives Alice's epoch-1 message. Without past secrets it cannot be
+    ///      decrypted → Unprocessable.
+    #[test]
+    fn test_past_epoch_application_message_fails_without_max_past_epochs() {
+        let config = MdkConfig {
+            max_past_epochs: 0, // explicitly disable past epoch retention
+            ..MdkConfig::default()
+        };
+
+        let result = past_epoch_delivery_result(config);
+
+        match result {
+            crate::messages::MessageProcessingResult::ApplicationMessage(_) => {
+                panic!(
+                    "Expected Unprocessable when max_past_epochs = 0, but the message \
+                     decrypted successfully. OpenMLS may be retaining secrets despite \
+                     max_past_epochs = 0."
+                );
+            }
+            crate::messages::MessageProcessingResult::Unprocessable { .. } => {
+                // Expected: OpenMLS had no past epoch secrets, message permanently Failed.
+            }
+            other => {
+                panic!(
+                    "Unexpected result variant (expected Unprocessable): {:?}",
+                    other
+                );
+            }
+        }
+    }
+
+    /// Fix verification: past-epoch application messages succeed when max_past_epochs >= 1.
+    ///
+    /// This is the companion to the regression test above. With max_past_epochs = 5
+    /// (the corrected default), OpenMLS retains message secrets for up to 5 past epochs.
+    /// The same delayed epoch-N message that previously failed now decrypts successfully.
+    #[test]
+    fn test_past_epoch_application_message_succeeds_with_max_past_epochs() {
+        let config = MdkConfig {
+            max_past_epochs: 5, // retain secrets for 5 past epochs
+            ..MdkConfig::default()
+        };
+
+        let result = past_epoch_delivery_result(config);
+
+        match result {
+            crate::messages::MessageProcessingResult::ApplicationMessage(msg) => {
+                // Success: the epoch-1 message was decrypted despite the group being at epoch 2.
+                assert_eq!(
+                    msg.content, "message from the past epoch",
+                    "Decrypted content should match what Alice sent"
+                );
+            }
+            crate::messages::MessageProcessingResult::Unprocessable { .. } => {
+                panic!(
+                    "Expected ApplicationMessage with max_past_epochs = 5, but got Unprocessable. \
+                     The fix (wiring max_past_epochs into OpenMLS group config) is not working."
+                );
+            }
+            other => {
+                panic!(
+                    "Unexpected result variant (expected ApplicationMessage): {:?}",
+                    other
+                );
+            }
+        }
+    }
 
     /// Test epoch lookback limits for message decryption (MIP-03)
     ///

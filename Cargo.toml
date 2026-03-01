@@ -21,7 +21,7 @@ mdk-core = { version = "0.6.0", path = "./crates/mdk-core", default-features = f
 openmls = { version = "0.8.1", default-features = false }
 openmls_traits = { version = "0.5", default-features = false }
 openmls_basic_credential = { version = "0.5", default-features = false }
-openmls_rust_crypto = { version = "0.5", default-features = false }
+openmls_rust_crypto = { version = "0.5.1", default-features = false }
 
 # Nostr
 nostr = { version = "0.44", default-features = false }

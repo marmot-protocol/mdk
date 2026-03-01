@@ -27,12 +27,19 @@
 
 ### Changed
 
+- Bumped `openmls_rust_crypto` from `0.5.0` to `0.5.1` (see also the `openmls` 0.8.1 bump in [#204](https://github.com/marmot-protocol/mdk/pull/204)). ([#207](https://github.com/marmot-protocol/mdk/pull/207))
+- `MdkConfig` now includes `max_past_epochs: usize` (default `5`), which is wired into the OpenMLS group config so that application messages from up to 5 past epochs can be decrypted when they arrive after a commit has advanced the group epoch. ([#207](https://github.com/marmot-protocol/mdk/pull/207))
+
 ### Added
 
 - Added `get_ratchet_tree_info()` method to `MDK` for inspecting the public MLS ratchet tree state. Returns a `RatchetTreeInfo` struct containing a SHA-256 tree fingerprint, the full TLS-serialized tree as hex, and leaf nodes with indices and public keys. Only exposes public information (no secrets). ([#206](https://github.com/marmot-protocol/mdk/pull/206))
 - Added `RatchetTreeInfo` and `LeafNodeInfo` structs, exported via the prelude. ([#206](https://github.com/marmot-protocol/mdk/pull/206))
+- `max_past_epochs` field to `MdkConfig` controls how many past MLS epoch message secrets OpenMLS retains. Setting this to at least `1` ensures that messages sent just before a commit are not permanently lost when the commit arrives first (a real scenario on Nostr relays where delivery order is not guaranteed). ([#207](https://github.com/marmot-protocol/mdk/pull/207))
+- Regression tests `test_past_epoch_application_message_fails_without_max_past_epochs` and `test_past_epoch_application_message_succeeds_with_max_past_epochs` prove the bug and verify the fix: with `max_past_epochs = 0` a late epoch-N message returns `Unprocessable`; with `max_past_epochs = 5` it decrypts successfully. ([#207](https://github.com/marmot-protocol/mdk/pull/207))
 
 ### Fixed
+
+- **Past-epoch application messages permanently failed**: When a commit advanced the group to epoch N+1 and an application message from epoch N arrived late, OpenMLS returned `SecretTreeError::TooDistantInThePast` because no past epoch message secrets were retained (`max_past_epochs` defaulted to `0`). MDK then marked the message as permanently `Failed`. Fixed by wiring `MdkConfig::max_past_epochs` into both `MlsGroupCreateConfig` and `MlsGroupJoinConfig`. ([#207](https://github.com/marmot-protocol/mdk/pull/207))
 
 ### Removed
 

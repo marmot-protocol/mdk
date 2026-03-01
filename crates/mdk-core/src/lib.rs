@@ -121,6 +121,27 @@ pub struct MdkConfig {
     /// handles most message loss scenarios while keeping catch-up costs reasonable.
     pub maximum_forward_distance: u32,
 
+    /// Number of past MLS epochs for which application messages can be decrypted.
+    ///
+    /// This controls how many past epoch message secrets OpenMLS retains. When a
+    /// commit advances the group to epoch N+1, messages encrypted at epoch N that
+    /// arrive late can still be decrypted as long as the epoch delta is within
+    /// this window.
+    ///
+    /// Nostr relays do not guarantee ordering, so commits and application messages
+    /// can arrive in any order. Setting this to at least 1 ensures that messages
+    /// sent just before a commit are not permanently lost when the commit arrives
+    /// first.
+    ///
+    /// Default: 5
+    ///
+    /// # Security Note
+    /// Higher values retain more past epoch key material, reducing forward secrecy
+    /// across epoch boundaries. The default of 5 balances reliability with security.
+    /// Set to 0 only if strict per-epoch forward secrecy is required and the
+    /// delivery service guarantees strict ordering.
+    pub max_past_epochs: usize,
+
     /// Number of epoch snapshots to retain for rollback support.
     ///
     /// Enables recovery when a better commit arrives late by allowing the
@@ -146,6 +167,7 @@ impl Default for MdkConfig {
             max_future_skew_secs: 300,      // 5 minutes
             out_of_order_tolerance: 100,    // 100 past messages
             maximum_forward_distance: 1000, // 1000 forward messages
+            max_past_epochs: 5,             // 5 past epochs
             epoch_snapshot_retention: 5,
             snapshot_ttl_seconds: 604800, // 1 week
         }
@@ -577,6 +599,7 @@ pub mod tests {
                 maximum_forward_distance: 500,
                 max_event_age_secs: 86400,
                 max_future_skew_secs: 120,
+                max_past_epochs: 5,
                 epoch_snapshot_retention: 5,
                 snapshot_ttl_seconds: 604800,
             };
