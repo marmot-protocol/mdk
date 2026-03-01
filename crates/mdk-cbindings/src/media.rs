@@ -9,6 +9,7 @@ use mdk_core::extension::group_image::{
     decrypt_group_image as core_decrypt, derive_upload_keypair as core_derive_upload_keypair,
     prepare_group_image_for_upload as core_prepare,
 };
+use zeroize::Zeroize;
 
 use crate::error::{self, MdkError};
 use crate::types::{cstr_to_str, ffi_try_unwind_safe, require_non_null, to_json, write_cstring_to};
@@ -19,23 +20,15 @@ use crate::types::{cstr_to_str, ffi_try_unwind_safe, require_non_null, to_json, 
 
 /// JSON representation returned by [`mdk_prepare_group_image`].
 ///
-/// # Security Note
-///
-/// `upload_secret_key` is serialised as a plain hex string. Because this
-/// struct is immediately JSON-serialised and the JSON string is handed back
-/// to the caller, the secret key will briefly reside in a regular heap
-/// `String` that is not zeroised on drop. This is an inherent limitation of
-/// returning secret material through a JSON-over-FFI interface. Callers
-/// that need stronger guarantees should use the dedicated
-/// [`mdk_derive_upload_keypair`] function and handle the key material on
-/// their side of the FFI boundary.
+/// The upload secret key is intentionally **not** included here.
+/// Callers must use [`mdk_derive_upload_keypair`] to obtain the upload
+/// keypair from the `image_key` returned in this struct.
 #[derive(serde::Serialize)]
 struct PreparedImageJson {
     encrypted_data: Vec<u8>,
     encrypted_hash: Vec<u8>,
     image_key: Vec<u8>,
     image_nonce: Vec<u8>,
-    upload_secret_key: String,
     original_size: u64,
     encrypted_size: u64,
     mime_type: String,
@@ -88,7 +81,6 @@ pub unsafe extern "C" fn mdk_prepare_group_image(
             encrypted_hash: prepared.encrypted_hash.to_vec(),
             image_key: prepared.image_key.as_ref().to_vec(),
             image_nonce: prepared.image_nonce.as_ref().to_vec(),
-            upload_secret_key: prepared.upload_keypair.secret_key().to_secret_hex(),
             original_size: prepared.original_size as u64,
             encrypted_size: prepared.encrypted_size as u64,
             mime_type: prepared.mime_type,
@@ -156,23 +148,22 @@ pub unsafe extern "C" fn mdk_decrypt_group_image(
         }
         let mut key_arr = [0u8; 32];
         key_arr.copy_from_slice(unsafe { std::slice::from_raw_parts(key, 32) });
+        let key_secret = mdk_storage_traits::Secret::new(key_arr);
+        key_arr.zeroize();
 
         if nonce_len != 12 {
             return Err(error::invalid_input("Image nonce must be 12 bytes"));
         }
         let mut nonce_arr = [0u8; 12];
         nonce_arr.copy_from_slice(unsafe { std::slice::from_raw_parts(nonce, 12) });
+        let nonce_secret = mdk_storage_traits::Secret::new(nonce_arr);
+        nonce_arr.zeroize();
 
-        let decrypted = core_decrypt(
-            encrypted,
-            hash_opt.as_ref(),
-            &mdk_storage_traits::Secret::new(key_arr),
-            &mdk_storage_traits::Secret::new(nonce_arr),
-        )
-        .map_err(|e| {
-            error::set_last_error(&format!("Decrypt group image failed: {e}"));
-            MdkError::Mdk
-        })?;
+        let decrypted = core_decrypt(encrypted, hash_opt.as_ref(), &key_secret, &nonce_secret)
+            .map_err(|e| {
+                error::set_last_error(&format!("Decrypt group image failed: {e}"));
+                MdkError::Mdk
+            })?;
 
         let len = decrypted.len();
         let boxed = decrypted.into_boxed_slice();
@@ -215,9 +206,10 @@ pub unsafe extern "C" fn mdk_derive_upload_keypair(
 
         let mut key_arr = [0u8; 32];
         key_arr.copy_from_slice(unsafe { std::slice::from_raw_parts(key, 32) });
+        let key_secret = mdk_storage_traits::Secret::new(key_arr);
+        key_arr.zeroize();
 
-        let keys = core_derive_upload_keypair(&mdk_storage_traits::Secret::new(key_arr), version)
-            .map_err(|e| {
+        let keys = core_derive_upload_keypair(&key_secret, version).map_err(|e| {
             error::set_last_error(&format!("Derive upload keypair failed: {e}"));
             MdkError::Mdk
         })?;

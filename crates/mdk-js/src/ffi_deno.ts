@@ -26,7 +26,7 @@ type NativeType =
 
 const TYPE_MAP: Record<string, NativeType> = {
   ptr: "pointer",
-  cstr: "buffer",
+  cstr: "pointer",
   u8: "u8",
   u16: "u16",
   u32: "u32",
@@ -60,7 +60,7 @@ function findLibrary(): string {
       : Deno.build.os === "windows"
         ? "dll"
         : "so";
-  const base = `libmdk.${ext}`;
+  const base = Deno.build.os === "windows" ? `mdk.${ext}` : `libmdk.${ext}`;
   const pkgRoot = new URL(".", import.meta.url).pathname;
 
   const arch = Deno.build.arch === "aarch64" ? "aarch64" : "x86_64";
@@ -181,8 +181,12 @@ export class DenoFfi {
       readAndFree() {
         const pVal = ptrBuf[0];
         const len = Number(lenBuf[0]);
-        if (pVal === 0n || len === 0) return null;
+        if (pVal === 0n) return null;
         const p = Deno.UnsafePointer.create(pVal);
+        if (len === 0) {
+          ffi.sym.mdk_bytes_free(p, 0n);
+          return null;
+        }
         const view = new Deno.UnsafePointerView(p!);
         const copy = new Uint8Array(len);
         view.copyInto(copy);

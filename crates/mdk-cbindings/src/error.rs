@@ -81,15 +81,22 @@ pub unsafe extern "C" fn mdk_last_error_message() -> *mut c_char {
 // Conversion helpers used by the domain modules
 // ---------------------------------------------------------------------------
 
-/// Map a [`StorageError`] into an [`MdkError`], recording the message.
-pub(crate) fn from_storage_error(e: StorageError) -> MdkError {
-    set_last_error(&format!("Storage error: {e}"));
+/// Map a [`StorageError`] into an [`MdkError`], recording a generic message.
+///
+/// The original error is intentionally **not** interpolated into the
+/// user-visible message to avoid leaking sensitive internals (group IDs,
+/// key material, file paths, etc.) through the FFI error channel.
+pub(crate) fn from_storage_error(_e: StorageError) -> MdkError {
+    set_last_error("Storage error: internal");
     MdkError::Storage
 }
 
-/// Map a [`CoreMdkError`] into an [`MdkError`], recording the message.
-pub(crate) fn from_mdk_error(e: CoreMdkError) -> MdkError {
-    set_last_error(&format!("MDK error: {e}"));
+/// Map a [`CoreMdkError`] into an [`MdkError`], recording a generic message.
+///
+/// See [`from_storage_error`] for the rationale on why the original error
+/// is not included in the user-visible message.
+pub(crate) fn from_mdk_error(_e: CoreMdkError) -> MdkError {
+    set_last_error("MDK error: internal");
     MdkError::Mdk
 }
 

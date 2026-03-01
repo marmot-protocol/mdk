@@ -12,7 +12,7 @@ These bindings use native FFI (`bun:ffi` / `Deno.dlopen`) to call the [C binding
 
 Clone or download from [mdk-js releases](https://github.com/marmot-protocol/mdk-js/releases). The package ships with prebuilt native libraries for Linux, macOS, and Windows.
 
-```
+```text
 src/          # JS source
 native/       # prebuilt libmdk per platform
   linux-x86_64/libmdk.so
@@ -222,7 +222,7 @@ import { prepareGroupImage, decryptGroupImage, deriveUploadKeypair } from "./src
 
 // Encrypt an image for upload
 const prepared = prepareGroupImage(imageBytes, "image/png");
-// prepared = { encrypted_data, encrypted_hash, image_key, image_nonce, upload_secret_key, ... }
+// prepared = { encrypted_data, encrypted_hash, image_key, image_nonce, ... }
 
 // Decrypt a group image
 const decrypted = decryptGroupImage(encryptedData, expectedHash, key, nonce);

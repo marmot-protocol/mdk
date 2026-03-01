@@ -683,19 +683,16 @@ jobs:
         VERSION="${{ steps.cargo_version.outputs.version }}"
         TAG="$VERSION"
 
-        # Check if tag already exists locally
-        if git rev-parse "$TAG" >/dev/null 2>&1; then
-          echo "Tag $TAG already exists locally, updating it"
-          git tag -d "$TAG" 2>/dev/null || true
-        fi
-
-        # Create or update the tag
-        git tag -a "$TAG" -m "Release version $VERSION"
         git remote set-url origin https://x-access-token:${{ secrets.BINDINGS_PACKAGE_PAT }}@github.com/${{ env.KOTLIN_PACKAGE_REPO }}.git
 
-        # Force push to update remote tag if it exists
-        git push origin "$TAG" --force
-        echo "Created/updated and pushed tag: $TAG"
+        # Only create and push if the tag does not already exist on the remote
+        if git ls-remote --tags origin "$TAG" | grep -q "$TAG"; then
+          echo "Tag $TAG already exists on remote, skipping"
+        else
+          git tag -a "$TAG" -m "Release version $VERSION"
+          git push origin "$TAG"
+          echo "Created and pushed tag: $TAG"
+        fi
 
   # ═══════════════════════════════════════════════════════════════════════════
   # FFI Bindings (C, Zig, JS) — uses mdk-cbindings instead of mdk-uniffi
@@ -841,9 +838,13 @@ jobs:
       run: |
         cd cbindings-repo
         VERSION="${{ steps.cargo_version.outputs.version }}"
-        git tag -a "v${VERSION}" -m "Release v${VERSION}" 2>/dev/null || true
         git remote set-url origin https://x-access-token:${{ secrets.BINDINGS_PACKAGE_PAT }}@github.com/${{ env.CBINDINGS_REPO }}.git
-        git push origin "v${VERSION}" --force
+        if git ls-remote --tags origin "v${VERSION}" | grep -q "v${VERSION}"; then
+          echo "Tag v${VERSION} already exists on remote, skipping"
+        else
+          git tag -a "v${VERSION}" -m "Release v${VERSION}"
+          git push origin "v${VERSION}"
+        fi
 
   publish-zig:
     needs: build-ffi-native
@@ -936,9 +937,13 @@ jobs:
       run: |
         cd zig-repo
         VERSION="${{ steps.cargo_version.outputs.version }}"
-        git tag -a "v${VERSION}" -m "Release v${VERSION}" 2>/dev/null || true
         git remote set-url origin https://x-access-token:${{ secrets.BINDINGS_PACKAGE_PAT }}@github.com/${{ env.ZIG_REPO }}.git
-        git push origin "v${VERSION}" --force
+        if git ls-remote --tags origin "v${VERSION}" | grep -q "v${VERSION}"; then
+          echo "Tag v${VERSION} already exists on remote, skipping"
+        else
+          git tag -a "v${VERSION}" -m "Release v${VERSION}"
+          git push origin "v${VERSION}"
+        fi
 
   publish-js:
     needs: build-ffi-native
@@ -1028,7 +1033,11 @@ jobs:
       run: |
         cd js-repo
         VERSION="${{ steps.cargo_version.outputs.version }}"
-        git tag -a "v${VERSION}" -m "Release v${VERSION}" 2>/dev/null || true
         git remote set-url origin https://x-access-token:${{ secrets.BINDINGS_PACKAGE_PAT }}@github.com/${{ env.JS_REPO }}.git
-        git push origin "v${VERSION}" --force
+        if git ls-remote --tags origin "v${VERSION}" | grep -q "v${VERSION}"; then
+          echo "Tag v${VERSION} already exists on remote, skipping"
+        else
+          git tag -a "v${VERSION}" -m "Release v${VERSION}"
+          git push origin "v${VERSION}"
+        fi
 

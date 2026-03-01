@@ -1567,6 +1567,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]

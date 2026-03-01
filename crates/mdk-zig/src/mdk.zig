@@ -158,8 +158,13 @@ pub const SortOrder = enum {
 /// Create with `init`, `initWithKey`, or `initUnencrypted`.
 /// Call `deinit()` when done — this frees all internal state.
 pub const Mdk = struct {
-    handle: *raw.MdkHandle,
+    handle: ?*raw.MdkHandle,
     allocator: std.mem.Allocator,
+
+    /// Return the live handle, or `NullPointer` if already freed.
+    fn liveHandle(self: *const Mdk) Error!*raw.MdkHandle {
+        return self.handle orelse Error.NullPointer;
+    }
 
     // ── Constructors ────────────────────────────────────────────────────
 
@@ -186,7 +191,7 @@ pub const Mdk = struct {
 
         var out: ?*raw.MdkHandle = null;
         try check(raw.mdk_new(c_path, c_svc, c_key, c_cfg, &out));
-        return .{ .handle = out.?, .allocator = allocator };
+        return .{ .handle = out orelse return Error.NullPointer, .allocator = allocator };
     }
 
     /// Create a new MDK instance with encrypted storage using a directly
@@ -213,7 +218,7 @@ pub const Mdk = struct {
             c_cfg,
             &out,
         ));
-        return .{ .handle = out.?, .allocator = allocator };
+        return .{ .handle = out orelse return Error.NullPointer, .allocator = allocator };
     }
 
     /// Create a new MDK instance with **unencrypted** storage.
@@ -235,13 +240,17 @@ pub const Mdk = struct {
 
         var out: ?*raw.MdkHandle = null;
         try check(raw.mdk_new_unencrypted(c_path, c_cfg, &out));
-        return .{ .handle = out.?, .allocator = allocator };
+        return .{ .handle = out orelse return Error.NullPointer, .allocator = allocator };
     }
 
     /// Free the MDK handle and all associated resources.
+    ///
+    /// Safe to call multiple times — subsequent calls are no-ops.
     pub fn deinit(self: *Mdk) void {
-        raw.mdk_free(self.handle);
-        self.handle = undefined;
+        if (self.handle) |h| {
+            raw.mdk_free(h);
+            self.handle = null;
+        }
     }
 
     // ── Key Packages ────────────────────────────────────────────────────
@@ -258,7 +267,8 @@ pub const Mdk = struct {
         defer freeCStr(self.allocator, c_relays, relays_json.len);
 
         var out: [*c]u8 = null;
-        try check(raw.mdk_create_key_package(self.handle, c_pk, c_relays, &out));
+        const h = try self.liveHandle();
+        try check(raw.mdk_create_key_package(h, c_pk, c_relays, &out));
         return CString{ .ptr = out };
     }
 
@@ -275,7 +285,8 @@ pub const Mdk = struct {
         defer freeCStr(self.allocator, c_relays, relays_json.len);
 
         var out: [*c]u8 = null;
-        try check(raw.mdk_create_key_package_with_options(self.handle, c_pk, c_relays, protected, &out));
+        const h = try self.liveHandle();
+        try check(raw.mdk_create_key_package_with_options(h, c_pk, c_relays, protected, &out));
         return CString{ .ptr = out };
     }
 
@@ -288,7 +299,8 @@ pub const Mdk = struct {
         defer freeCStr(self.allocator, c_ev, event_json.len);
 
         var out: [*c]u8 = null;
-        try check(raw.mdk_parse_key_package(self.handle, c_ev, &out));
+        const h = try self.liveHandle();
+        try check(raw.mdk_parse_key_package(h, c_ev, &out));
         return CString{ .ptr = out };
     }
 
@@ -296,8 +308,9 @@ pub const Mdk = struct {
 
     /// Get all groups as a JSON array.
     pub fn getGroups(self: *const Mdk) Error!CString {
+        const h = try self.liveHandle();
         var out: [*c]u8 = null;
-        try check(raw.mdk_get_groups(self.handle, &out));
+        try check(raw.mdk_get_groups(h, &out));
         return CString{ .ptr = out };
     }
 
@@ -310,7 +323,8 @@ pub const Mdk = struct {
         defer freeCStr(self.allocator, c_gid, mls_group_id.len);
 
         var out: [*c]u8 = null;
-        try check(raw.mdk_get_group(self.handle, c_gid, &out));
+        const h = try self.liveHandle();
+        try check(raw.mdk_get_group(h, c_gid, &out));
         return CString{ .ptr = out };
     }
 
@@ -323,7 +337,8 @@ pub const Mdk = struct {
         defer freeCStr(self.allocator, c_gid, mls_group_id.len);
 
         var out: [*c]u8 = null;
-        try check(raw.mdk_get_members(self.handle, c_gid, &out));
+        const h = try self.liveHandle();
+        try check(raw.mdk_get_members(h, c_gid, &out));
         return CString{ .ptr = out };
     }
 
@@ -332,8 +347,9 @@ pub const Mdk = struct {
         self: *const Mdk,
         threshold_secs: u64,
     ) Error!CString {
+        const h = try self.liveHandle();
         var out: [*c]u8 = null;
-        try check(raw.mdk_groups_needing_self_update(self.handle, threshold_secs, &out));
+        try check(raw.mdk_groups_needing_self_update(h, threshold_secs, &out));
         return CString{ .ptr = out };
     }
 
@@ -361,7 +377,8 @@ pub const Mdk = struct {
         defer freeCStr(self.allocator, c_admins, admins_json.len);
 
         var out: [*c]u8 = null;
-        try check(raw.mdk_create_group(self.handle, c_pk, c_kp, c_name, c_desc, c_relays, c_admins, &out));
+        const h = try self.liveHandle();
+        try check(raw.mdk_create_group(h, c_pk, c_kp, c_name, c_desc, c_relays, c_admins, &out));
         return CString{ .ptr = out };
     }
 
@@ -377,7 +394,8 @@ pub const Mdk = struct {
         defer freeCStr(self.allocator, c_kp, key_packages_json.len);
 
         var out: [*c]u8 = null;
-        try check(raw.mdk_add_members(self.handle, c_gid, c_kp, &out));
+        const h = try self.liveHandle();
+        try check(raw.mdk_add_members(h, c_gid, c_kp, &out));
         return CString{ .ptr = out };
     }
 
@@ -393,7 +411,8 @@ pub const Mdk = struct {
         defer freeCStr(self.allocator, c_pks, pubkeys_json.len);
 
         var out: [*c]u8 = null;
-        try check(raw.mdk_remove_members(self.handle, c_gid, c_pks, &out));
+        const h = try self.liveHandle();
+        try check(raw.mdk_remove_members(h, c_gid, c_pks, &out));
         return CString{ .ptr = out };
     }
 
@@ -409,7 +428,8 @@ pub const Mdk = struct {
         defer freeCStr(self.allocator, c_upd, update_json.len);
 
         var out: [*c]u8 = null;
-        try check(raw.mdk_update_group_data(self.handle, c_gid, c_upd, &out));
+        const h = try self.liveHandle();
+        try check(raw.mdk_update_group_data(h, c_gid, c_upd, &out));
         return CString{ .ptr = out };
     }
 
@@ -422,7 +442,8 @@ pub const Mdk = struct {
         defer freeCStr(self.allocator, c_gid, mls_group_id.len);
 
         var out: [*c]u8 = null;
-        try check(raw.mdk_self_update(self.handle, c_gid, &out));
+        const h = try self.liveHandle();
+        try check(raw.mdk_self_update(h, c_gid, &out));
         return CString{ .ptr = out };
     }
 
@@ -435,7 +456,8 @@ pub const Mdk = struct {
         defer freeCStr(self.allocator, c_gid, mls_group_id.len);
 
         var out: [*c]u8 = null;
-        try check(raw.mdk_leave_group(self.handle, c_gid, &out));
+        const h = try self.liveHandle();
+        try check(raw.mdk_leave_group(h, c_gid, &out));
         return CString{ .ptr = out };
     }
 
@@ -446,7 +468,8 @@ pub const Mdk = struct {
     ) (Error || std.mem.Allocator.Error)!void {
         const c_gid = try sliceToC(self.allocator, mls_group_id);
         defer freeCStr(self.allocator, c_gid, mls_group_id.len);
-        try check(raw.mdk_merge_pending_commit(self.handle, c_gid));
+        const h = try self.liveHandle();
+        try check(raw.mdk_merge_pending_commit(h, c_gid));
     }
 
     /// Clear pending commit for a group (rollback).
@@ -456,7 +479,8 @@ pub const Mdk = struct {
     ) (Error || std.mem.Allocator.Error)!void {
         const c_gid = try sliceToC(self.allocator, mls_group_id);
         defer freeCStr(self.allocator, c_gid, mls_group_id.len);
-        try check(raw.mdk_clear_pending_commit(self.handle, c_gid));
+        const h = try self.liveHandle();
+        try check(raw.mdk_clear_pending_commit(h, c_gid));
     }
 
     /// Sync group metadata from MLS state.
@@ -466,7 +490,8 @@ pub const Mdk = struct {
     ) (Error || std.mem.Allocator.Error)!void {
         const c_gid = try sliceToC(self.allocator, mls_group_id);
         defer freeCStr(self.allocator, c_gid, mls_group_id.len);
-        try check(raw.mdk_sync_group_metadata(self.handle, c_gid));
+        const h = try self.liveHandle();
+        try check(raw.mdk_sync_group_metadata(h, c_gid));
     }
 
     /// Get relays for a group as a JSON array of URL strings.
@@ -478,7 +503,8 @@ pub const Mdk = struct {
         defer freeCStr(self.allocator, c_gid, mls_group_id.len);
 
         var out: [*c]u8 = null;
-        try check(raw.mdk_get_relays(self.handle, c_gid, &out));
+        const h = try self.liveHandle();
+        try check(raw.mdk_get_relays(h, c_gid, &out));
         return CString{ .ptr = out };
     }
 
@@ -504,7 +530,8 @@ pub const Mdk = struct {
         defer freeOptCStr(self.allocator, c_tags, tags_json);
 
         var out: [*c]u8 = null;
-        try check(raw.mdk_create_message(self.handle, c_gid, c_pk, c_content, kind, c_tags, &out));
+        const h = try self.liveHandle();
+        try check(raw.mdk_create_message(h, c_gid, c_pk, c_content, kind, c_tags, &out));
         return CString{ .ptr = out };
     }
 
@@ -517,7 +544,8 @@ pub const Mdk = struct {
         defer freeCStr(self.allocator, c_ev, event_json.len);
 
         var out: [*c]u8 = null;
-        try check(raw.mdk_process_message(self.handle, c_ev, &out));
+        const h = try self.liveHandle();
+        try check(raw.mdk_process_message(h, c_ev, &out));
         return CString{ .ptr = out };
     }
 
@@ -538,7 +566,8 @@ pub const Mdk = struct {
         defer if (sort_order) |so| freeCStr(self.allocator, c_sort.?, so.asSlice().len);
 
         var out: [*c]u8 = null;
-        try check(raw.mdk_get_messages(self.handle, c_gid, limit, offset, c_sort, &out));
+        const h = try self.liveHandle();
+        try check(raw.mdk_get_messages(h, c_gid, limit, offset, c_sort, &out));
         return CString{ .ptr = out };
     }
 
@@ -554,7 +583,8 @@ pub const Mdk = struct {
         defer freeCStr(self.allocator, c_eid, event_id.len);
 
         var out: [*c]u8 = null;
-        try check(raw.mdk_get_message(self.handle, c_gid, c_eid, &out));
+        const h = try self.liveHandle();
+        try check(raw.mdk_get_message(h, c_gid, c_eid, &out));
         return CString{ .ptr = out };
     }
 
@@ -570,7 +600,8 @@ pub const Mdk = struct {
         defer freeCStr(self.allocator, c_sort, sort_order.asSlice().len);
 
         var out: [*c]u8 = null;
-        try check(raw.mdk_get_last_message(self.handle, c_gid, c_sort, &out));
+        const h = try self.liveHandle();
+        try check(raw.mdk_get_last_message(h, c_gid, c_sort, &out));
         return CString{ .ptr = out };
     }
 
@@ -584,8 +615,9 @@ pub const Mdk = struct {
         limit: u32,
         offset: u32,
     ) Error!CString {
+        const h = try self.liveHandle();
         var out: [*c]u8 = null;
-        try check(raw.mdk_get_pending_welcomes(self.handle, limit, offset, &out));
+        try check(raw.mdk_get_pending_welcomes(h, limit, offset, &out));
         return CString{ .ptr = out };
     }
 
@@ -598,7 +630,8 @@ pub const Mdk = struct {
         defer freeCStr(self.allocator, c_eid, event_id.len);
 
         var out: [*c]u8 = null;
-        try check(raw.mdk_get_welcome(self.handle, c_eid, &out));
+        const h = try self.liveHandle();
+        try check(raw.mdk_get_welcome(h, c_eid, &out));
         return CString{ .ptr = out };
     }
 
@@ -614,7 +647,8 @@ pub const Mdk = struct {
         defer freeCStr(self.allocator, c_rumor, rumor_json.len);
 
         var out: [*c]u8 = null;
-        try check(raw.mdk_process_welcome(self.handle, c_wid, c_rumor, &out));
+        const h = try self.liveHandle();
+        try check(raw.mdk_process_welcome(h, c_wid, c_rumor, &out));
         return CString{ .ptr = out };
     }
 
@@ -625,7 +659,8 @@ pub const Mdk = struct {
     ) (Error || std.mem.Allocator.Error)!void {
         const c_json = try sliceToC(self.allocator, welcome_json);
         defer freeCStr(self.allocator, c_json, welcome_json.len);
-        try check(raw.mdk_accept_welcome(self.handle, c_json));
+        const h = try self.liveHandle();
+        try check(raw.mdk_accept_welcome(h, c_json));
     }
 
     /// Decline a welcome message.
@@ -635,7 +670,8 @@ pub const Mdk = struct {
     ) (Error || std.mem.Allocator.Error)!void {
         const c_json = try sliceToC(self.allocator, welcome_json);
         defer freeCStr(self.allocator, c_json, welcome_json.len);
-        try check(raw.mdk_decline_welcome(self.handle, c_json));
+        const h = try self.liveHandle();
+        try check(raw.mdk_decline_welcome(h, c_json));
     }
 };
 
