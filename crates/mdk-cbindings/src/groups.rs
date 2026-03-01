@@ -74,6 +74,7 @@ pub unsafe extern "C" fn mdk_get_groups(h: *mut MdkHandle, out_json: *mut *mut c
     ffi_try_unwind_safe(|| {
         let handle = deref_handle!(h);
         require_non_null!(out_json, "out_json");
+        unsafe { *out_json = std::ptr::null_mut() };
         let groups = lock_handle(handle)?
             .get_groups()
             .map_err(error::from_mdk_error)?;
@@ -99,6 +100,7 @@ pub unsafe extern "C" fn mdk_get_group(
     ffi_try_unwind_safe(|| {
         let handle = deref_handle!(h);
         require_non_null!(out_json, "out_json");
+        unsafe { *out_json = std::ptr::null_mut() };
         let gid = parse_group_id(unsafe { cstr_to_str(mls_group_id) }?)?;
         let group = lock_handle(handle)?
             .get_group(&gid)
@@ -123,6 +125,7 @@ pub unsafe extern "C" fn mdk_get_members(
     ffi_try_unwind_safe(|| {
         let handle = deref_handle!(h);
         require_non_null!(out_json, "out_json");
+        unsafe { *out_json = std::ptr::null_mut() };
         let gid = parse_group_id(unsafe { cstr_to_str(mls_group_id) }?)?;
         let members = lock_handle(handle)?
             .get_members(&gid)
@@ -152,6 +155,7 @@ pub unsafe extern "C" fn mdk_groups_needing_self_update(
     ffi_try_unwind_safe(|| {
         let handle = deref_handle!(h);
         require_non_null!(out_json, "out_json");
+        unsafe { *out_json = std::ptr::null_mut() };
         let ids = lock_handle(handle)?
             .groups_needing_self_update(threshold_secs)
             .map_err(error::from_mdk_error)?;
@@ -191,6 +195,7 @@ pub unsafe extern "C" fn mdk_create_group(
     ffi_try_unwind_safe(|| {
         let handle = deref_handle!(h);
         require_non_null!(out_json, "out_json");
+        unsafe { *out_json = std::ptr::null_mut() };
 
         let creator = types::parse_public_key(unsafe { cstr_to_str(creator_pk) }?)?;
         let name_str = unsafe { cstr_to_str(name) }?.to_string();
@@ -257,6 +262,7 @@ pub unsafe extern "C" fn mdk_add_members(
     ffi_try_unwind_safe(|| {
         let handle = deref_handle!(h);
         require_non_null!(out_json, "out_json");
+        unsafe { *out_json = std::ptr::null_mut() };
         let gid = parse_group_id(unsafe { cstr_to_str(mls_group_id) }?)?;
 
         let kp_events: Vec<Event> = parse_json(
@@ -293,6 +299,7 @@ pub unsafe extern "C" fn mdk_remove_members(
     ffi_try_unwind_safe(|| {
         let handle = deref_handle!(h);
         require_non_null!(out_json, "out_json");
+        unsafe { *out_json = std::ptr::null_mut() };
         let gid = parse_group_id(unsafe { cstr_to_str(mls_group_id) }?)?;
         let pks = parse_public_keys(unsafe { cstr_to_str(pubkeys_json) }?)?;
 
@@ -326,6 +333,7 @@ pub unsafe extern "C" fn mdk_update_group_data(
     ffi_try_unwind_safe(|| {
         let handle = deref_handle!(h);
         require_non_null!(out_json, "out_json");
+        unsafe { *out_json = std::ptr::null_mut() };
         let gid = parse_group_id(unsafe { cstr_to_str(mls_group_id) }?)?;
         let update: GroupDataUpdateJson = parse_json(
             unsafe { cstr_to_str(update_json) }?,
@@ -390,6 +398,7 @@ pub unsafe extern "C" fn mdk_self_update(
     ffi_try_unwind_safe(|| {
         let handle = deref_handle!(h);
         require_non_null!(out_json, "out_json");
+        unsafe { *out_json = std::ptr::null_mut() };
         let gid = parse_group_id(unsafe { cstr_to_str(mls_group_id) }?)?;
 
         let mdk = lock_handle(handle)?;
@@ -414,6 +423,7 @@ pub unsafe extern "C" fn mdk_leave_group(
     ffi_try_unwind_safe(|| {
         let handle = deref_handle!(h);
         require_non_null!(out_json, "out_json");
+        unsafe { *out_json = std::ptr::null_mut() };
         let gid = parse_group_id(unsafe { cstr_to_str(mls_group_id) }?)?;
 
         let mdk = lock_handle(handle)?;
@@ -498,6 +508,7 @@ pub unsafe extern "C" fn mdk_get_relays(
     ffi_try_unwind_safe(|| {
         let handle = deref_handle!(h);
         require_non_null!(out_json, "out_json");
+        unsafe { *out_json = std::ptr::null_mut() };
         let gid = parse_group_id(unsafe { cstr_to_str(mls_group_id) }?)?;
         let relays = lock_handle(handle)?
             .get_relays(&gid)

@@ -15,8 +15,10 @@ let _ffi = null;
  */
 export function setBackend(backend) {
   if (_ffi !== null) {
-    console.warn("MDK: backend already set — replacing previous backend. " +
-      "This usually means both index.js (Bun) and mod.ts (Deno) were imported.");
+    throw new Error(
+      "MDK: backend already set. " +
+      "This usually means both index.js (Bun) and mod.ts (Deno) were imported.",
+    );
   }
   _ffi = backend;
 }
@@ -66,9 +68,14 @@ function check(code) {
 function callWithStringOut(fn, ...args) {
   const f = ffi();
   const out = f.allocOutString();
-  const code = fn(...args, out.ptr);
-  check(code);
-  return out.readAndFree();
+  try {
+    const code = fn(...args, out.ptr);
+    check(code);
+    return out.readAndFree();
+  } catch (e) {
+    out.readAndFree();
+    throw e;
+  }
 }
 
 /**
@@ -132,6 +139,9 @@ export class Mdk {
    * @returns {Mdk}
    */
   static createWithKey(dbPath, key, config = null) {
+    if (!(key instanceof Uint8Array) || key.length !== 32) {
+      throw new Error("createWithKey: key must be a Uint8Array of exactly 32 bytes");
+    }
     const f = ffi();
     const cPath = f.toCString(dbPath);
     const cCfg = config ? f.toCString(JSON.stringify(config)) : { ptr: f.nullptr };
@@ -530,18 +540,31 @@ export function prepareGroupImage(data, mime) {
  * @returns {Uint8Array}
  */
 export function decryptGroupImage(data, expectedHash, key, nonce) {
+  if (!(key instanceof Uint8Array) || key.length !== 32) {
+    throw new Error("decryptGroupImage: key must be a Uint8Array of exactly 32 bytes");
+  }
+  if (!(nonce instanceof Uint8Array) || nonce.length !== 12) {
+    throw new Error("decryptGroupImage: nonce must be a Uint8Array of exactly 12 bytes");
+  }
+  if (expectedHash != null && (!(expectedHash instanceof Uint8Array) || expectedHash.length !== 32)) {
+    throw new Error("decryptGroupImage: expectedHash must be a Uint8Array of exactly 32 bytes or null");
+  }
   const f = ffi();
   const out = f.allocOutBytes();
-
-  check(f.sym.mdk_decrypt_group_image(
-    f.bufferPtr(data), data.length,
-    expectedHash ? f.bufferPtr(expectedHash) : f.nullptr,
-    expectedHash ? expectedHash.length : 0,
-    f.bufferPtr(key), key.length,
-    f.bufferPtr(nonce), nonce.length,
-    out.ptrPtr, out.lenPtr,
-  ));
-  return out.readAndFree();
+  try {
+    check(f.sym.mdk_decrypt_group_image(
+      f.bufferPtr(data), data.length,
+      expectedHash ? f.bufferPtr(expectedHash) : f.nullptr,
+      expectedHash ? expectedHash.length : 0,
+      f.bufferPtr(key), key.length,
+      f.bufferPtr(nonce), nonce.length,
+      out.ptrPtr, out.lenPtr,
+    ));
+    return out.readAndFree();
+  } catch (e) {
+    out.readAndFree();
+    throw e;
+  }
 }
 
 /**
@@ -551,6 +574,9 @@ export function decryptGroupImage(data, expectedHash, key, nonce) {
  * @returns {string} — hex-encoded secret key
  */
 export function deriveUploadKeypair(key, version) {
+  if (!(key instanceof Uint8Array) || key.length !== 32) {
+    throw new Error("deriveUploadKeypair: key must be a Uint8Array of exactly 32 bytes");
+  }
   const f = ffi();
   return callWithStringOut(
     f.sym.mdk_derive_upload_keypair,

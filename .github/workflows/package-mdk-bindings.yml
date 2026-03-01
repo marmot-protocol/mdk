@@ -608,7 +608,7 @@ jobs:
         echo "Updated gradle.properties with version: $VERSION"
 
     - name: Checkout Kotlin package repo
-      uses: actions/checkout@v6
+      uses: actions/checkout@v4
       with:
         repository: ${{ env.KOTLIN_PACKAGE_REPO }}
         path: kotlin-package-repo

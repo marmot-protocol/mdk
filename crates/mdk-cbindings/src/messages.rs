@@ -66,6 +66,7 @@ pub unsafe extern "C" fn mdk_create_message(
     ffi_try_unwind_safe(|| {
         let handle = deref_handle!(h);
         require_non_null!(out_json, "out_json");
+        unsafe { *out_json = std::ptr::null_mut() };
         let gid = parse_group_id(unsafe { cstr_to_str(mls_group_id) }?)?;
         let sender: PublicKey = parse_public_key(unsafe { cstr_to_str(sender_pk) }?)?;
         let content_str = unsafe { cstr_to_str(content) }?;
@@ -116,6 +117,7 @@ pub unsafe extern "C" fn mdk_process_message(
     ffi_try_unwind_safe(|| {
         let handle = deref_handle!(h);
         require_non_null!(out_json, "out_json");
+        unsafe { *out_json = std::ptr::null_mut() };
         let event: Event = parse_json(unsafe { cstr_to_str(event_json) }?, "event JSON")?;
 
         let mdk = lock_handle(handle)?;
@@ -233,6 +235,7 @@ pub unsafe extern "C" fn mdk_get_messages(
     ffi_try_unwind_safe(|| {
         let handle = deref_handle!(h);
         require_non_null!(out_json, "out_json");
+        unsafe { *out_json = std::ptr::null_mut() };
         let gid = parse_group_id(unsafe { cstr_to_str(mls_group_id) }?)?;
         let sort = parse_sort_order(sort_order)?;
 
@@ -280,6 +283,7 @@ pub unsafe extern "C" fn mdk_get_message(
     ffi_try_unwind_safe(|| {
         let handle = deref_handle!(h);
         require_non_null!(out_json, "out_json");
+        unsafe { *out_json = std::ptr::null_mut() };
         let gid = parse_group_id(unsafe { cstr_to_str(mls_group_id) }?)?;
         let eid = parse_event_id(unsafe { cstr_to_str(event_id) }?)?;
 
@@ -311,6 +315,7 @@ pub unsafe extern "C" fn mdk_get_last_message(
     ffi_try_unwind_safe(|| {
         let handle = deref_handle!(h);
         require_non_null!(out_json, "out_json");
+        unsafe { *out_json = std::ptr::null_mut() };
         let gid = parse_group_id(unsafe { cstr_to_str(mls_group_id) }?)?;
         let sort = parse_sort_order(sort_order)?
             .ok_or_else(|| error::invalid_input("sort_order is required"))?;

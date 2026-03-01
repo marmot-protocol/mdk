@@ -83,6 +83,7 @@ pub unsafe extern "C" fn mdk_new(
 ) -> MdkError {
     types::ffi_try_unwind_safe(|| {
         require_non_null!(out, "out");
+        unsafe { *out = std::ptr::null_mut() };
         let db_path = unsafe { types::cstr_to_str(db_path) }?;
         let service_id = unsafe { types::cstr_to_str(service_id) }?;
         let db_key_id = unsafe { types::cstr_to_str(db_key_id) }?;
@@ -120,6 +121,7 @@ pub unsafe extern "C" fn mdk_new_with_key(
 ) -> MdkError {
     types::ffi_try_unwind_safe(|| {
         require_non_null!(out, "out");
+        unsafe { *out = std::ptr::null_mut() };
         require_non_null!(key, "key");
         let db_path = unsafe { types::cstr_to_str(db_path) }?;
         let config = parse_config(config_json)?;
@@ -158,6 +160,7 @@ pub unsafe extern "C" fn mdk_new_unencrypted(
 ) -> MdkError {
     types::ffi_try_unwind_safe(|| {
         require_non_null!(out, "out");
+        unsafe { *out = std::ptr::null_mut() };
         let db_path = unsafe { types::cstr_to_str(db_path) }?;
         let config = parse_config(config_json)?;
 

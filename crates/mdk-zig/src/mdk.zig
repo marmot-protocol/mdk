@@ -40,8 +40,8 @@ fn check(code: raw.MdkError) Error!void {
 /// Retrieve the detailed error message from the last failed MDK call.
 ///
 /// Returns `null` if no error has been recorded on this thread (or if the
-/// message has already been consumed).  The returned `CString` must be
-/// allowed to go out of scope (its `deinit` frees the C memory).
+/// message has already been consumed).  The caller must call `CString.deinit()`
+/// on the returned value to free the C-allocated memory.
 pub fn lastErrorMessage() ?CString {
     const ptr = raw.mdk_last_error_message();
     if (ptr == null) return null;
@@ -76,7 +76,7 @@ pub const CString = struct {
 
 /// Owned byte array allocated by the Rust side.
 ///
-/// Call `deinit()` when done, or use `slice()` to read the contents.
+/// Call `deinit()` when done, or use `bytes()` to read the contents.
 pub const CBytes = struct {
     ptr: [*c]u8,
     len: usize,
