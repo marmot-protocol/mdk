@@ -503,7 +503,8 @@ where
     /// # Security Note
     ///
     /// The ratchet tree holds public keys and tree structure, not secrets.
-    /// The MLS spec assumes this data can be shared (e.g. in Welcome messages).
+    /// Per the MLS spec, ratchet tree data is public information that can be
+    /// shared (e.g., in Welcome messages).
     ///
     /// # Arguments
     ///
@@ -528,8 +529,7 @@ where
         let leaf_nodes: Vec<LeafNodeInfo> = mls_group
             .members()
             .map(|member| {
-                let credential_identity = match BasicCredential::try_from(member.credential.clone())
-                {
+                let credential_identity = match BasicCredential::try_from(member.credential) {
                     Ok(basic_cred) => hex::encode(basic_cred.identity()),
                     Err(_) => "(unknown)".to_string(),
                 };
