@@ -65,7 +65,8 @@ pub use mdk_storage_traits::GroupId;
 ///     ..Default::default()
 /// };
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(default)]
 pub struct MdkConfig {
     /// Maximum age for accepted events in seconds.
     ///

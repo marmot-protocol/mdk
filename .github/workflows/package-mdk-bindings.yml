@@ -22,6 +22,9 @@ env:
   PYTHON_PACKAGE_REPO: "marmot-protocol/mdk-python"
   RUBY_PACKAGE_REPO: "marmot-protocol/mdk-ruby"
   KOTLIN_PACKAGE_REPO: "marmot-protocol/mdk-kotlin"
+  CBINDINGS_REPO: "marmot-protocol/mdk-cbindings"
+  ZIG_REPO: "marmot-protocol/mdk-zig"
+  JS_REPO: "marmot-protocol/mdk-js"
 
 jobs:
   package-swift:
@@ -605,7 +608,7 @@ jobs:
         echo "Updated gradle.properties with version: $VERSION"
 
     - name: Checkout Kotlin package repo
-      uses: actions/checkout@v6
+      uses: actions/checkout@v4
       with:
         repository: ${{ env.KOTLIN_PACKAGE_REPO }}
         path: kotlin-package-repo
@@ -680,17 +683,369 @@ jobs:
         VERSION="${{ steps.cargo_version.outputs.version }}"
         TAG="$VERSION"
 
-        # Check if tag already exists locally
-        if git rev-parse "$TAG" >/dev/null 2>&1; then
-          echo "Tag $TAG already exists locally, updating it"
-          git tag -d "$TAG" 2>/dev/null || true
-        fi
-
-        # Create or update the tag
-        git tag -a "$TAG" -m "Release version $VERSION"
         git remote set-url origin https://x-access-token:${{ secrets.BINDINGS_PACKAGE_PAT }}@github.com/${{ env.KOTLIN_PACKAGE_REPO }}.git
 
-        # Force push to update remote tag if it exists
-        git push origin "$TAG" --force
-        echo "Created/updated and pushed tag: $TAG"
+        # Only create and push if the tag does not already exist on the remote
+        if git ls-remote --tags origin "$TAG" | grep -q "$TAG"; then
+          echo "Tag $TAG already exists on remote, skipping"
+        else
+          git tag -a "$TAG" -m "Release version $VERSION"
+          git push origin "$TAG"
+          echo "Created and pushed tag: $TAG"
+        fi
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # FFI Bindings (C, Zig, JS) — uses mdk-cbindings instead of mdk-uniffi
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  build-ffi-native:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            lib: libmdk.so
+          - os: macos-latest
+            lib: libmdk.dylib
+          - os: macos-15-intel
+            lib: libmdk.dylib
+          - os: windows-latest
+            lib: mdk.dll
+    runs-on: ${{ matrix.os }}
+    name: Build libmdk (${{ matrix.os }})
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Setup Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Cache Rust dependencies
+      uses: Swatinem/rust-cache@v2
+
+    - name: Install OpenSSL (Windows)
+      if: runner.os == 'Windows'
+      shell: powershell
+      run: |
+        vcpkg install openssl:x64-windows-static
+        vcpkg integrate install
+        echo "OPENSSL_DIR=C:\vcpkg\packages\openssl_x64-windows-static" >> $env:GITHUB_ENV
+        echo "OPENSSL_STATIC=1" >> $env:GITHUB_ENV
+
+    - name: Build release library
+      run: cargo build --release -p mdk-cbindings
+
+    - name: Prepare artifacts
+      shell: bash
+      run: |
+        mkdir -p ffi-artifacts
+        cp target/release/${{ matrix.lib }} ffi-artifacts/
+        cp crates/mdk-cbindings/include/mdk.h ffi-artifacts/
+
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: ffi-native-${{ matrix.os }}
+        path: ffi-artifacts/
+        retention-days: 1
+
+  publish-cbindings:
+    needs: build-ffi-native
+    runs-on: ubuntu-latest
+    name: Publish C Bindings
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Download all native artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: ffi-native-all
+        pattern: ffi-native-*
+        merge-multiple: false
+
+    - name: Extract version
+      id: cargo_version
+      shell: bash
+      run: |
+        VERSION=$(grep -E '^version\s*=' crates/mdk-cbindings/Cargo.toml | head -1 | sed -E 's/version\s*=\s*"([^"]+)"/\1/')
+        if [ -z "$VERSION" ]; then
+          echo "ERROR: Could not extract version from Cargo.toml" >&2
+          exit 1
+        fi
+        echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+    - name: Assemble C bindings package
+      shell: bash
+      run: |
+        mkdir -p cbindings-package/include
+        mkdir -p cbindings-package/lib/linux-x86_64
+        mkdir -p cbindings-package/lib/macos-aarch64
+        mkdir -p cbindings-package/lib/macos-x86_64
+        mkdir -p cbindings-package/lib/windows-x86_64
+
+        cp ffi-native-all/ffi-native-ubuntu-latest/mdk.h cbindings-package/include/
+        cp ffi-native-all/ffi-native-ubuntu-latest/libmdk.so cbindings-package/lib/linux-x86_64/
+        cp ffi-native-all/ffi-native-macos-latest/libmdk.dylib cbindings-package/lib/macos-aarch64/
+        cp ffi-native-all/ffi-native-macos-13/libmdk.dylib cbindings-package/lib/macos-x86_64/
+        cp ffi-native-all/ffi-native-windows-latest/mdk.dll cbindings-package/lib/windows-x86_64/
+
+        cp crates/mdk-cbindings/CHANGELOG.md cbindings-package/ 2>/dev/null || true
+        echo "${{ steps.cargo_version.outputs.version }}" > cbindings-package/VERSION
+        echo "✓ C bindings package assembled"
+
+    - name: Checkout C bindings repo
+      uses: actions/checkout@v4
+      with:
+        repository: ${{ env.CBINDINGS_REPO }}
+        path: cbindings-repo
+        token: ${{ secrets.BINDINGS_PACKAGE_PAT }}
+        lfs: true
+
+    - name: Configure Git
+      run: |
+        git config --global user.name "github-actions[bot]"
+        git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+    - name: Copy package to repo
+      shell: bash
+      run: |
+        find cbindings-repo -mindepth 1 -maxdepth 1 ! -name '.git' ! -iname 'README.md' -exec rm -rf {} +
+        cp -R cbindings-package/* cbindings-repo/
+        cd cbindings-repo
+        git lfs install
+        git lfs track "*.so" "*.dylib" "*.dll"
+        git add .gitattributes
+        git add -A
+
+    - name: Commit and push
+      shell: bash
+      run: |
+        cd cbindings-repo
+        if git diff --staged --quiet; then
+          echo "No changes to commit"
+        else
+          git commit -m "Update C bindings from mdk@${GITHUB_SHA:0:7}"
+          git remote set-url origin https://x-access-token:${{ secrets.BINDINGS_PACKAGE_PAT }}@github.com/${{ env.CBINDINGS_REPO }}.git
+          git push origin HEAD
+        fi
+
+    - name: Create version tag
+      if: startsWith(github.ref, 'refs/tags/v')
+      shell: bash
+      run: |
+        cd cbindings-repo
+        VERSION="${{ steps.cargo_version.outputs.version }}"
+        git remote set-url origin https://x-access-token:${{ secrets.BINDINGS_PACKAGE_PAT }}@github.com/${{ env.CBINDINGS_REPO }}.git
+        if git ls-remote --tags origin "v${VERSION}" | grep -q "v${VERSION}"; then
+          echo "Tag v${VERSION} already exists on remote, skipping"
+        else
+          git tag -a "v${VERSION}" -m "Release v${VERSION}"
+          git push origin "v${VERSION}"
+        fi
+
+  publish-zig:
+    needs: build-ffi-native
+    runs-on: ubuntu-latest
+    name: Publish Zig Bindings
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Download all native artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: ffi-native-all
+        pattern: ffi-native-*
+        merge-multiple: false
+
+    - name: Extract version
+      id: cargo_version
+      shell: bash
+      run: |
+        VERSION=$(grep -E '^version\s*=' crates/mdk-cbindings/Cargo.toml | head -1 | sed -E 's/version\s*=\s*"([^"]+)"/\1/')
+        if [ -z "$VERSION" ]; then
+          echo "ERROR: Could not extract version from Cargo.toml" >&2
+          exit 1
+        fi
+        echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+    - name: Assemble Zig package
+      shell: bash
+      run: |
+        mkdir -p zig-package/include
+        mkdir -p zig-package/lib/linux-x86_64
+        mkdir -p zig-package/lib/macos-aarch64
+        mkdir -p zig-package/lib/macos-x86_64
+        mkdir -p zig-package/lib/windows-x86_64
+
+        cp crates/mdk-zig/build.zig zig-package/
+        cp crates/mdk-zig/build.zig.zon zig-package/
+        cp -R crates/mdk-zig/src zig-package/
+
+        cp ffi-native-all/ffi-native-ubuntu-latest/mdk.h zig-package/include/
+        cp ffi-native-all/ffi-native-ubuntu-latest/libmdk.so zig-package/lib/linux-x86_64/
+        cp ffi-native-all/ffi-native-macos-latest/libmdk.dylib zig-package/lib/macos-aarch64/
+        cp ffi-native-all/ffi-native-macos-13/libmdk.dylib zig-package/lib/macos-x86_64/
+        cp ffi-native-all/ffi-native-windows-latest/mdk.dll zig-package/lib/windows-x86_64/
+
+        echo "${{ steps.cargo_version.outputs.version }}" > zig-package/VERSION
+        echo "✓ Zig package assembled"
+
+    - name: Checkout Zig package repo
+      uses: actions/checkout@v4
+      with:
+        repository: ${{ env.ZIG_REPO }}
+        path: zig-repo
+        token: ${{ secrets.BINDINGS_PACKAGE_PAT }}
+        lfs: true
+
+    - name: Configure Git
+      run: |
+        git config --global user.name "github-actions[bot]"
+        git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+    - name: Copy package to repo
+      shell: bash
+      run: |
+        find zig-repo -mindepth 1 -maxdepth 1 ! -name '.git' ! -iname 'README.md' -exec rm -rf {} +
+        cp -R zig-package/* zig-repo/
+        cd zig-repo
+        git lfs install
+        git lfs track "*.so" "*.dylib" "*.dll"
+        git add .gitattributes
+        git add -A
+
+    - name: Commit and push
+      shell: bash
+      run: |
+        cd zig-repo
+        if git diff --staged --quiet; then
+          echo "No changes to commit"
+        else
+          git commit -m "Update Zig package from mdk@${GITHUB_SHA:0:7}"
+          git remote set-url origin https://x-access-token:${{ secrets.BINDINGS_PACKAGE_PAT }}@github.com/${{ env.ZIG_REPO }}.git
+          git push origin HEAD
+        fi
+
+    - name: Create version tag
+      if: startsWith(github.ref, 'refs/tags/v')
+      shell: bash
+      run: |
+        cd zig-repo
+        VERSION="${{ steps.cargo_version.outputs.version }}"
+        git remote set-url origin https://x-access-token:${{ secrets.BINDINGS_PACKAGE_PAT }}@github.com/${{ env.ZIG_REPO }}.git
+        if git ls-remote --tags origin "v${VERSION}" | grep -q "v${VERSION}"; then
+          echo "Tag v${VERSION} already exists on remote, skipping"
+        else
+          git tag -a "v${VERSION}" -m "Release v${VERSION}"
+          git push origin "v${VERSION}"
+        fi
+
+  publish-js:
+    needs: build-ffi-native
+    runs-on: ubuntu-latest
+    name: Publish JS Bindings
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Download all native artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: ffi-native-all
+        pattern: ffi-native-*
+        merge-multiple: false
+
+    - name: Extract version
+      id: cargo_version
+      shell: bash
+      run: |
+        VERSION=$(grep -E '^version\s*=' crates/mdk-cbindings/Cargo.toml | head -1 | sed -E 's/version\s*=\s*"([^"]+)"/\1/')
+        if [ -z "$VERSION" ]; then
+          echo "ERROR: Could not extract version from Cargo.toml" >&2
+          exit 1
+        fi
+        echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+    - name: Assemble JS package
+      shell: bash
+      run: |
+        mkdir -p js-package/native/linux-x86_64
+        mkdir -p js-package/native/macos-aarch64
+        mkdir -p js-package/native/macos-x86_64
+        mkdir -p js-package/native/windows-x86_64
+        mkdir -p js-package/include
+
+        cp -R crates/mdk-js/src js-package/
+        cp ffi-native-all/ffi-native-ubuntu-latest/mdk.h js-package/include/
+        cp ffi-native-all/ffi-native-ubuntu-latest/libmdk.so js-package/native/linux-x86_64/
+        cp ffi-native-all/ffi-native-macos-latest/libmdk.dylib js-package/native/macos-aarch64/
+        cp ffi-native-all/ffi-native-macos-13/libmdk.dylib js-package/native/macos-x86_64/
+        cp ffi-native-all/ffi-native-windows-latest/mdk.dll js-package/native/windows-x86_64/
+
+        echo "${{ steps.cargo_version.outputs.version }}" > js-package/VERSION
+        echo "✓ JS package assembled"
+
+    - name: Checkout JS package repo
+      uses: actions/checkout@v4
+      with:
+        repository: ${{ env.JS_REPO }}
+        path: js-repo
+        token: ${{ secrets.BINDINGS_PACKAGE_PAT }}
+        lfs: true
+
+    - name: Configure Git
+      run: |
+        git config --global user.name "github-actions[bot]"
+        git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+    - name: Copy package to repo
+      shell: bash
+      run: |
+        find js-repo -mindepth 1 -maxdepth 1 ! -name '.git' ! -iname 'README.md' -exec rm -rf {} +
+        cp -R js-package/* js-repo/
+        cd js-repo
+        git lfs install
+        git lfs track "*.so" "*.dylib" "*.dll"
+        git add .gitattributes
+        git add -A
+
+    - name: Commit and push
+      shell: bash
+      run: |
+        cd js-repo
+        if git diff --staged --quiet; then
+          echo "No changes to commit"
+        else
+          git commit -m "Update JS package from mdk@${GITHUB_SHA:0:7}"
+          git remote set-url origin https://x-access-token:${{ secrets.BINDINGS_PACKAGE_PAT }}@github.com/${{ env.JS_REPO }}.git
+          git push origin HEAD
+        fi
+
+    - name: Create version tag
+      if: startsWith(github.ref, 'refs/tags/v')
+      shell: bash
+      run: |
+        cd js-repo
+        VERSION="${{ steps.cargo_version.outputs.version }}"
+        git remote set-url origin https://x-access-token:${{ secrets.BINDINGS_PACKAGE_PAT }}@github.com/${{ env.JS_REPO }}.git
+        if git ls-remote --tags origin "v${VERSION}" | grep -q "v${VERSION}"; then
+          echo "Tag v${VERSION} already exists on remote, skipping"
+        else
+          git tag -a "v${VERSION}" -m "Release v${VERSION}"
+          git push origin "v${VERSION}"
+        fi
 

@@ -30,3 +30,7 @@ Plans/
 /trees/*
 !/trees/.gitkeep
 
+crates/mdk-cbindings/include/mdk.h
+
+crates/mdk-zig/.zig-cache
+crates/mdk-zig/target
