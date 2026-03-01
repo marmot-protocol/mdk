@@ -37,6 +37,14 @@ const TYPE_MAP: Record<string, NativeType> = {
   void: "void",
 };
 
+function mapType(t: string, symbol: string): NativeType {
+  const mapped = TYPE_MAP[t];
+  if (!mapped) {
+    throw new Error(`Unknown FFI type "${t}" in symbol "${symbol}"`);
+  }
+  return mapped;
+}
+
 function toDenoSymbols(
   defs: Record<string, { params: string[]; result: string }>,
 ) {
@@ -46,8 +54,8 @@ function toDenoSymbols(
   > = {};
   for (const [name, def] of Object.entries(defs)) {
     out[name] = {
-      parameters: def.params.map((t) => TYPE_MAP[t]),
-      result: TYPE_MAP[def.result],
+      parameters: def.params.map((t) => mapType(t, name)),
+      result: mapType(def.result, name),
     };
   }
   return out;
@@ -82,6 +90,9 @@ function findLibrary(): string {
     // Development: cargo build output
     `${pkgRoot}../../../target/release/${base}`,
     `${pkgRoot}../../../target/debug/${base}`,
+    // Monorepo sibling (mdk-cbindings crate)
+    `${pkgRoot}../../mdk-cbindings/target/release/${base}`,
+    `${pkgRoot}../../mdk-cbindings/target/debug/${base}`,
   ];
 
   for (const c of candidates) {

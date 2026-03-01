@@ -123,7 +123,7 @@ enum MdkError mdk_new_unencrypted(const char *db_path,
  * Retrieve the last error message from the **calling thread**.
  *
  * Returns a heap-allocated C string that the caller **must** free with
- * [`mdk_string_free`](crate::free::mdk_string_free). Returns null if no
+ * `mdk_string_free`. Returns null if no
  * error has been recorded on this thread.
  *
  * **Important**: Error messages are thread-local. You must call this from the
@@ -436,7 +436,7 @@ enum MdkError mdk_prepare_group_image(const uint8_t *data,
  * * `key` / `key_len`   — 32-byte encryption key.
  * * `nonce` / `nonce_len` — 12-byte nonce.
  * * `out` / `out_len`   — On success, receives the decrypted image bytes
- *   (caller must free with [`mdk_bytes_free`](crate::free::mdk_bytes_free)).
+ *   (caller must free with `mdk_bytes_free`).
  *
  * # Safety
  *

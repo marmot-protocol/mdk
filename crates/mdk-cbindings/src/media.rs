@@ -76,7 +76,8 @@ pub unsafe extern "C" fn mdk_prepare_group_image(
         let mime_str = unsafe { cstr_to_str(mime) }?;
 
         let prepared = core_prepare(image_bytes, mime_str).map_err(|e| {
-            tracing::warn!("Prepare group image failed: {e}");
+            tracing::debug!("prepare_group_image internal: {e}");
+            tracing::warn!("Prepare group image failed");
             error::set_last_error("Prepare group image failed");
             MdkError::Mdk
         })?;
@@ -107,7 +108,7 @@ pub unsafe extern "C" fn mdk_prepare_group_image(
 /// * `key` / `key_len`   — 32-byte encryption key.
 /// * `nonce` / `nonce_len` — 12-byte nonce.
 /// * `out` / `out_len`   — On success, receives the decrypted image bytes
-///   (caller must free with [`mdk_bytes_free`](crate::free::mdk_bytes_free)).
+///   (caller must free with `mdk_bytes_free`).
 ///
 /// # Safety
 ///
@@ -165,7 +166,8 @@ pub unsafe extern "C" fn mdk_decrypt_group_image(
 
         let decrypted = core_decrypt(encrypted, hash_opt.as_ref(), &key_secret, &nonce_secret)
             .map_err(|e| {
-                tracing::warn!("Decrypt group image failed: {e}");
+                tracing::debug!("decrypt_group_image internal: {e}");
+                tracing::warn!("Decrypt group image failed");
                 error::set_last_error("Decrypt group image failed");
                 MdkError::Mdk
             })?;
@@ -215,7 +217,8 @@ pub unsafe extern "C" fn mdk_derive_upload_keypair(
         key_arr.zeroize();
 
         let keys = core_derive_upload_keypair(&key_secret, version).map_err(|e| {
-            tracing::warn!("Derive upload keypair failed: {e}");
+            tracing::debug!("derive_upload_keypair internal: {e}");
+            tracing::warn!("Derive upload keypair failed");
             error::set_last_error("Derive upload keypair failed");
             MdkError::Mdk
         })?;

@@ -55,7 +55,7 @@ pub(crate) fn set_last_error(msg: &str) {
 /// Retrieve the last error message from the **calling thread**.
 ///
 /// Returns a heap-allocated C string that the caller **must** free with
-/// [`mdk_string_free`](crate::free::mdk_string_free). Returns null if no
+/// `mdk_string_free`. Returns null if no
 /// error has been recorded on this thread.
 ///
 /// **Important**: Error messages are thread-local. You must call this from the

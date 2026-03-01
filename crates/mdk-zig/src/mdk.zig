@@ -727,6 +727,7 @@ pub fn decryptGroupImage(
         &out_ptr,
         &out_len,
     ));
+    if (out_ptr == null) return Error.NullPointer;
     return CBytes{ .ptr = out_ptr, .len = out_len };
 }
 
@@ -767,8 +768,7 @@ test "check passes on OK" {
 }
 
 test "check returns error on non-OK" {
-    const result = check(raw.MDK_ERROR_STORAGE);
-    try std.testing.expectEqual(Error.Storage, result);
+    try std.testing.expectError(Error.Storage, check(raw.MDK_ERROR_STORAGE));
 }
 
 test "SortOrder asSlice" {
