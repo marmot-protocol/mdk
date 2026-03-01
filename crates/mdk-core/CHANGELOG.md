@@ -15,6 +15,20 @@
 
 ### Added
 
+### Fixed
+
+### Removed
+
+### Deprecated -->
+
+## Unreleased
+
+### Breaking changes
+
+### Changed
+
+### Added
+
 - Added `get_ratchet_tree_info()` method to `MDK` for inspecting the public MLS ratchet tree state. Returns a `RatchetTreeInfo` struct containing a SHA-256 tree fingerprint, the full TLS-serialized tree as hex, and leaf nodes with indices and public keys. Only exposes public information (no secrets). ([#206](https://github.com/marmot-protocol/mdk/pull/206))
 - Added `RatchetTreeInfo` and `LeafNodeInfo` structs, exported via the prelude. ([#206](https://github.com/marmot-protocol/mdk/pull/206))
 
