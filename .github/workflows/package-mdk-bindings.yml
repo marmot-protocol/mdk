@@ -707,7 +707,7 @@ jobs:
             lib: libmdk.so
           - os: macos-latest
             lib: libmdk.dylib
-          - os: macos-13
+          - os: macos-15-intel
             lib: libmdk.dylib
           - os: windows-latest
             lib: mdk.dll
