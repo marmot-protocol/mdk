@@ -9,8 +9,9 @@ use mdk_storage_traits::groups::Pagination as MessagePagination;
 
 use crate::error::{self, MdkError};
 use crate::types::{
-    MdkHandle, cstr_to_str, ffi_try_unwind_safe, lock_handle, parse_event_id, parse_group_id,
-    parse_json, parse_public_key, parse_sort_order, to_json, write_cstring_to,
+    MdkHandle, cstr_to_str, deref_handle, ffi_try_unwind_safe, lock_handle, parse_event_id,
+    parse_group_id, parse_json, parse_public_key, parse_sort_order, require_non_null,
+    serialize_update_result, to_json, write_cstring_to,
 };
 
 // ---------------------------------------------------------------------------
@@ -32,42 +33,6 @@ struct ProcessMessageResultJson {
     reason: Option<String>,
 }
 
-/// JSON envelope for the UpdateGroupResult used inside ProcessMessageResult.
-#[derive(serde::Serialize)]
-struct UpdateGroupResultJson {
-    evolution_event_json: String,
-    welcome_rumors_json: Option<Vec<String>>,
-    mls_group_id: String,
-}
-
-fn serialize_core_update(
-    result: mdk_core::groups::UpdateGroupResult,
-) -> Result<serde_json::Value, MdkError> {
-    let evolution_json = serde_json::to_string(&result.evolution_event)
-        .map_err(|e| error::invalid_input(&format!("Failed to serialize evolution event: {e}")))?;
-
-    let welcome_rumors: Option<Vec<String>> = result
-        .welcome_rumors
-        .map(|rumors| {
-            rumors
-                .iter()
-                .map(|r| {
-                    serde_json::to_string(r).map_err(|e| {
-                        error::invalid_input(&format!("Failed to serialize welcome rumor: {e}"))
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()
-        })
-        .transpose()?;
-
-    serde_json::to_value(UpdateGroupResultJson {
-        evolution_event_json: evolution_json,
-        welcome_rumors_json: welcome_rumors,
-        mls_group_id: hex::encode(result.mls_group_id.as_slice()),
-    })
-    .map_err(|e| error::invalid_input(&format!("Serialization failed: {e}")))
-}
-
 // ---------------------------------------------------------------------------
 // API
 // ---------------------------------------------------------------------------
@@ -87,6 +52,7 @@ fn serialize_core_update(
 /// # Safety
 ///
 /// All non-null pointer arguments must be valid C strings.
+#[allow(unsafe_code)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn mdk_create_message(
     h: *mut MdkHandle,
@@ -98,13 +64,8 @@ pub unsafe extern "C" fn mdk_create_message(
     out_json: *mut *mut c_char,
 ) -> MdkError {
     ffi_try_unwind_safe(|| {
-        if h.is_null() {
-            return Err(error::null_pointer("handle"));
-        }
-        if out_json.is_null() {
-            return Err(error::null_pointer("out_json"));
-        }
-        let handle = unsafe { &*h };
+        let handle = deref_handle!(h);
+        require_non_null!(out_json, "out_json");
         let gid = parse_group_id(unsafe { cstr_to_str(mls_group_id) }?)?;
         let sender: PublicKey = parse_public_key(unsafe { cstr_to_str(sender_pk) }?)?;
         let content_str = unsafe { cstr_to_str(content) }?;
@@ -145,6 +106,7 @@ pub unsafe extern "C" fn mdk_create_message(
 /// # Safety
 ///
 /// All pointer arguments must be valid.
+#[allow(unsafe_code)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn mdk_process_message(
     h: *mut MdkHandle,
@@ -152,13 +114,8 @@ pub unsafe extern "C" fn mdk_process_message(
     out_json: *mut *mut c_char,
 ) -> MdkError {
     ffi_try_unwind_safe(|| {
-        if h.is_null() {
-            return Err(error::null_pointer("handle"));
-        }
-        if out_json.is_null() {
-            return Err(error::null_pointer("out_json"));
-        }
-        let handle = unsafe { &*h };
+        let handle = deref_handle!(h);
+        require_non_null!(out_json, "out_json");
         let event: Event = parse_json(unsafe { cstr_to_str(event_json) }?, "event JSON")?;
 
         let mdk = lock_handle(handle)?;
@@ -178,7 +135,7 @@ pub unsafe extern "C" fn mdk_process_message(
                 }
             }
             MessageProcessingResult::Proposal(update) => {
-                let update_val = serialize_core_update(update)?;
+                let update_val = serialize_update_result(update)?;
                 ProcessMessageResultJson {
                     result_type: "Proposal".to_string(),
                     message: None,
@@ -255,6 +212,7 @@ pub unsafe extern "C" fn mdk_process_message(
 /// # Safety
 ///
 /// All pointer arguments must be valid. `sort_order` may be null.
+#[allow(unsafe_code)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn mdk_get_messages(
     h: *mut MdkHandle,
@@ -265,13 +223,8 @@ pub unsafe extern "C" fn mdk_get_messages(
     out_json: *mut *mut c_char,
 ) -> MdkError {
     ffi_try_unwind_safe(|| {
-        if h.is_null() {
-            return Err(error::null_pointer("handle"));
-        }
-        if out_json.is_null() {
-            return Err(error::null_pointer("out_json"));
-        }
-        let handle = unsafe { &*h };
+        let handle = deref_handle!(h);
+        require_non_null!(out_json, "out_json");
         let gid = parse_group_id(unsafe { cstr_to_str(mls_group_id) }?)?;
         let sort = parse_sort_order(sort_order)?;
 
@@ -308,6 +261,7 @@ pub unsafe extern "C" fn mdk_get_messages(
 /// # Safety
 ///
 /// All pointer arguments must be valid.
+#[allow(unsafe_code)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn mdk_get_message(
     h: *mut MdkHandle,
@@ -316,13 +270,8 @@ pub unsafe extern "C" fn mdk_get_message(
     out_json: *mut *mut c_char,
 ) -> MdkError {
     ffi_try_unwind_safe(|| {
-        if h.is_null() {
-            return Err(error::null_pointer("handle"));
-        }
-        if out_json.is_null() {
-            return Err(error::null_pointer("out_json"));
-        }
-        let handle = unsafe { &*h };
+        let handle = deref_handle!(h);
+        require_non_null!(out_json, "out_json");
         let gid = parse_group_id(unsafe { cstr_to_str(mls_group_id) }?)?;
         let eid = parse_event_id(unsafe { cstr_to_str(event_id) }?)?;
 
@@ -343,6 +292,7 @@ pub unsafe extern "C" fn mdk_get_message(
 /// # Safety
 ///
 /// All pointer arguments must be valid. `sort_order` must not be null.
+#[allow(unsafe_code)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn mdk_get_last_message(
     h: *mut MdkHandle,
@@ -351,13 +301,8 @@ pub unsafe extern "C" fn mdk_get_last_message(
     out_json: *mut *mut c_char,
 ) -> MdkError {
     ffi_try_unwind_safe(|| {
-        if h.is_null() {
-            return Err(error::null_pointer("handle"));
-        }
-        if out_json.is_null() {
-            return Err(error::null_pointer("out_json"));
-        }
-        let handle = unsafe { &*h };
+        let handle = deref_handle!(h);
+        require_non_null!(out_json, "out_json");
         let gid = parse_group_id(unsafe { cstr_to_str(mls_group_id) }?)?;
         let sort = parse_sort_order(sort_order)?
             .ok_or_else(|| error::invalid_input("sort_order is required"))?;

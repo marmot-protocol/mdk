@@ -6,7 +6,7 @@ JavaScript bindings for the [Marmot Development Kit](https://github.com/marmot-p
 
 MDK combines [MLS (Messaging Layer Security)](https://www.rfc-editor.org/rfc/rfc9420.html) with [Nostr](https://github.com/nostr-protocol/nostr) for real end-to-end encrypted group messaging. Forward secrecy, post-compromise security, automatic key rotation, metadata protection. No server required.
 
-These bindings use native FFI (`bun:ffi` / `Deno.dlopen`) to call the [C bindings](https://github.com/marmot-protocol/mdk-cbindings) directly — no WASM, no N-API, no overhead.
+These bindings use native FFI (`bun:ffi` / `Deno.dlopen`) to call the [C bindings](https://github.com/marmot-protocol/mdk-cbindings) directly — no WASM, no N-API, no overhead. Note: the linked repos (`mdk-cbindings`, `mdk-js`) are auto-populated by CI on first publish.
 
 ## Installation
 

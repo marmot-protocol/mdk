@@ -6,7 +6,7 @@ Idiomatic Zig wrapper for the [Marmot Development Kit](https://github.com/marmot
 
 MDK combines [MLS (Messaging Layer Security)](https://www.rfc-editor.org/rfc/rfc9420.html) with [Nostr](https://github.com/nostr-protocol/nostr) for real end-to-end encrypted group messaging. Forward secrecy, post-compromise security, automatic key rotation, metadata protection. No server required.
 
-This package provides a safe Zig API over the [C bindings](https://github.com/marmot-protocol/mdk-cbindings), handling null-termination, memory management, and error translation automatically.
+This package provides a safe Zig API over the [C bindings](https://github.com/marmot-protocol/mdk-cbindings), handling null-termination, memory management, and error translation automatically. Note: the linked repos (`mdk-cbindings`, `mdk-zig`) are auto-populated by CI on first publish.
 
 ## Installation
 

@@ -63,12 +63,13 @@ function findLibrary(): string {
   const base = `libmdk.${ext}`;
   const pkgRoot = new URL(".", import.meta.url).pathname;
 
+  const arch = Deno.build.arch === "aarch64" ? "aarch64" : "x86_64";
   const platform =
     Deno.build.os === "darwin"
-      ? "macos-aarch64"
+      ? `macos-${arch}`
       : Deno.build.os === "windows"
-        ? "windows-x86_64"
-        : "linux-x86_64";
+        ? `windows-${arch}`
+        : `linux-${arch}`;
 
   const candidates = [
     // Packaged layout

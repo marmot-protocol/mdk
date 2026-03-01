@@ -38,12 +38,13 @@ function findLibrary() {
   const pkgRoot = dirname(new URL(import.meta.url).pathname);
 
   // Platform directory name used in the packaged layout
+  const arch = process.arch === "arm64" ? "aarch64" : "x86_64";
   const platform =
     process.platform === "darwin"
-      ? "macos-aarch64"
+      ? `macos-${arch}`
       : process.platform === "win32"
-        ? "windows-x86_64"
-        : "linux-x86_64";
+        ? `windows-${arch}`
+        : `linux-${arch}`;
 
   const candidates = [
     // Packaged layout (CI publishes here)
@@ -123,7 +124,14 @@ export class BunFfi {
       buf,
       ptr: p,
       read() {
-        return Number(buf[0]);
+        const val = buf[0];
+        if (val > BigInt(Number.MAX_SAFE_INTEGER)) {
+          throw new Error(
+            "Pointer value exceeds Number.MAX_SAFE_INTEGER — " +
+            "this platform requires BigInt pointer support"
+          );
+        }
+        return Number(val);
       },
     };
   }
@@ -148,8 +156,13 @@ export class BunFfi {
       ptrPtr: ptr(ptrBuf),
       lenPtr: ptr(lenBuf),
       readAndFree() {
-        const p = Number(ptrBuf[0]);
-        const len = Number(lenBuf[0]);
+        const pVal = ptrBuf[0];
+        const lenVal = lenBuf[0];
+        if (pVal > BigInt(Number.MAX_SAFE_INTEGER) || lenVal > BigInt(Number.MAX_SAFE_INTEGER)) {
+          throw new Error("Pointer/length exceeds Number.MAX_SAFE_INTEGER");
+        }
+        const p = Number(pVal);
+        const len = Number(lenVal);
         if (!p || len === 0) return null;
         const ab = toArrayBuffer(p, 0, len);
         const copy = new Uint8Array(ab.slice(0));

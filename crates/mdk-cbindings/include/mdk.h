@@ -120,11 +120,16 @@ enum MdkError mdk_new_unencrypted(const char *db_path,
  void mdk_free(struct MdkHandle *handle) ;
 
 /**
- * Retrieve the last error message.
+ * Retrieve the last error message from the **calling thread**.
  *
  * Returns a heap-allocated C string that the caller **must** free with
  * [`mdk_string_free`](crate::free::mdk_string_free). Returns null if no
  * error has been recorded on this thread.
+ *
+ * **Important**: Error messages are thread-local. You must call this from the
+ * same thread that received the error code. In callback-based architectures
+ * where the call and the error check happen on different threads, the message
+ * will not be available.
  *
  * # Safety
  *
@@ -146,6 +151,10 @@ enum MdkError mdk_new_unencrypted(const char *db_path,
 
 /**
  * Free a byte array previously returned by an `mdk_*` function.
+ *
+ * Handles zero-length allocations correctly — `Box::from_raw` with a
+ * zero-length slice is valid in Rust, so `len == 0` with a non-null
+ * `data` will still free the allocation.
  *
  * # Safety
  *
@@ -207,7 +216,7 @@ enum MdkError mdk_groups_needing_self_update(struct MdkHandle *h,
  * # Parameters
  *
  * * `creator_pk`          — Hex-encoded creator public key.
- * * `key_packages_json`   — JSON array of key-package event JSON strings.
+ * * `key_packages_json`   — JSON array of key-package event objects.
  * * `name`                — Group name.
  * * `description`         — Group description.
  * * `relays_json`         — JSON array of relay URL strings.
@@ -234,7 +243,7 @@ enum MdkError mdk_create_group(struct MdkHandle *h,
  *
  * # Parameters
  *
- * * `key_packages_json` — JSON array of key-package event JSON strings.
+ * * `key_packages_json` — JSON array of key-package event objects.
  *
  * # Safety
  *

@@ -8,8 +8,9 @@ use mdk_core::groups::{NostrGroupConfigData, NostrGroupDataUpdate};
 
 use crate::error::{self, MdkError};
 use crate::types::{
-    self, MdkHandle, cstr_to_str, ffi_try_unwind_safe, lock_handle, parse_group_id, parse_json,
-    parse_public_keys, parse_relay_urls, to_json, write_cstring_to,
+    self, MdkHandle, cstr_to_str, deref_handle, ffi_try_unwind_safe, lock_handle, parse_group_id,
+    parse_json, parse_public_keys, parse_relay_urls, require_non_null, serialize_update_result,
+    to_json, write_cstring_to,
 };
 
 // ---------------------------------------------------------------------------
@@ -23,14 +24,6 @@ struct CreateGroupResultJson {
     welcome_rumors_json: Vec<String>,
 }
 
-/// JSON envelope for `UpdateGroupResult`.
-#[derive(serde::Serialize)]
-struct UpdateGroupResultJson {
-    evolution_event_json: String,
-    welcome_rumors_json: Option<Vec<String>>,
-    mls_group_id: String,
-}
-
 /// JSON representation of a group data update (for input parsing).
 #[derive(serde::Deserialize)]
 struct GroupDataUpdateJson {
@@ -41,37 +34,6 @@ struct GroupDataUpdateJson {
     image_nonce: Option<Option<Vec<u8>>>,
     relays: Option<Vec<String>>,
     admins: Option<Vec<String>>,
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-fn serialize_update_result(
-    result: mdk_core::groups::UpdateGroupResult,
-) -> Result<String, MdkError> {
-    let evolution_json = serde_json::to_string(&result.evolution_event)
-        .map_err(|e| error::invalid_input(&format!("Failed to serialize evolution event: {e}")))?;
-
-    let welcome_rumors: Option<Vec<String>> = result
-        .welcome_rumors
-        .map(|rumors| {
-            rumors
-                .iter()
-                .map(|r| {
-                    serde_json::to_string(r).map_err(|e| {
-                        error::invalid_input(&format!("Failed to serialize welcome rumor: {e}"))
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()
-        })
-        .transpose()?;
-
-    to_json(&UpdateGroupResultJson {
-        evolution_event_json: evolution_json,
-        welcome_rumors_json: welcome_rumors,
-        mls_group_id: hex::encode(result.mls_group_id.as_slice()),
-    })
 }
 
 fn vec_to_array<const N: usize>(v: Option<Vec<u8>>) -> Result<Option<[u8; N]>, MdkError> {
@@ -98,16 +60,12 @@ fn vec_to_array<const N: usize>(v: Option<Vec<u8>>) -> Result<Option<[u8; N]>, M
 /// # Safety
 ///
 /// `h` must be a valid handle. `out_json` must not be null.
+#[allow(unsafe_code)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn mdk_get_groups(h: *mut MdkHandle, out_json: *mut *mut c_char) -> MdkError {
     ffi_try_unwind_safe(|| {
-        if h.is_null() {
-            return Err(error::null_pointer("handle"));
-        }
-        if out_json.is_null() {
-            return Err(error::null_pointer("out_json"));
-        }
-        let handle = unsafe { &*h };
+        let handle = deref_handle!(h);
+        require_non_null!(out_json, "out_json");
         let groups = lock_handle(handle)?
             .get_groups()
             .map_err(error::from_mdk_error)?;
@@ -123,6 +81,7 @@ pub unsafe extern "C" fn mdk_get_groups(h: *mut MdkHandle, out_json: *mut *mut c
 /// # Safety
 ///
 /// All pointer arguments must be valid.
+#[allow(unsafe_code)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn mdk_get_group(
     h: *mut MdkHandle,
@@ -130,13 +89,8 @@ pub unsafe extern "C" fn mdk_get_group(
     out_json: *mut *mut c_char,
 ) -> MdkError {
     ffi_try_unwind_safe(|| {
-        if h.is_null() {
-            return Err(error::null_pointer("handle"));
-        }
-        if out_json.is_null() {
-            return Err(error::null_pointer("out_json"));
-        }
-        let handle = unsafe { &*h };
+        let handle = deref_handle!(h);
+        require_non_null!(out_json, "out_json");
         let gid = parse_group_id(unsafe { cstr_to_str(mls_group_id) }?)?;
         let group = lock_handle(handle)?
             .get_group(&gid)
@@ -151,6 +105,7 @@ pub unsafe extern "C" fn mdk_get_group(
 /// # Safety
 ///
 /// All pointer arguments must be valid.
+#[allow(unsafe_code)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn mdk_get_members(
     h: *mut MdkHandle,
@@ -158,13 +113,8 @@ pub unsafe extern "C" fn mdk_get_members(
     out_json: *mut *mut c_char,
 ) -> MdkError {
     ffi_try_unwind_safe(|| {
-        if h.is_null() {
-            return Err(error::null_pointer("handle"));
-        }
-        if out_json.is_null() {
-            return Err(error::null_pointer("out_json"));
-        }
-        let handle = unsafe { &*h };
+        let handle = deref_handle!(h);
+        require_non_null!(out_json, "out_json");
         let gid = parse_group_id(unsafe { cstr_to_str(mls_group_id) }?)?;
         let members = lock_handle(handle)?
             .get_members(&gid)
@@ -184,6 +134,7 @@ pub unsafe extern "C" fn mdk_get_members(
 /// # Safety
 ///
 /// All pointer arguments must be valid.
+#[allow(unsafe_code)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn mdk_groups_needing_self_update(
     h: *mut MdkHandle,
@@ -191,13 +142,8 @@ pub unsafe extern "C" fn mdk_groups_needing_self_update(
     out_json: *mut *mut c_char,
 ) -> MdkError {
     ffi_try_unwind_safe(|| {
-        if h.is_null() {
-            return Err(error::null_pointer("handle"));
-        }
-        if out_json.is_null() {
-            return Err(error::null_pointer("out_json"));
-        }
-        let handle = unsafe { &*h };
+        let handle = deref_handle!(h);
+        require_non_null!(out_json, "out_json");
         let ids = lock_handle(handle)?
             .groups_needing_self_update(threshold_secs)
             .map_err(error::from_mdk_error)?;
@@ -212,7 +158,7 @@ pub unsafe extern "C" fn mdk_groups_needing_self_update(
 /// # Parameters
 ///
 /// * `creator_pk`          — Hex-encoded creator public key.
-/// * `key_packages_json`   — JSON array of key-package event JSON strings.
+/// * `key_packages_json`   — JSON array of key-package event objects.
 /// * `name`                — Group name.
 /// * `description`         — Group description.
 /// * `relays_json`         — JSON array of relay URL strings.
@@ -222,6 +168,7 @@ pub unsafe extern "C" fn mdk_groups_needing_self_update(
 /// # Safety
 ///
 /// All pointer arguments must be valid.
+#[allow(unsafe_code)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn mdk_create_group(
     h: *mut MdkHandle,
@@ -234,13 +181,8 @@ pub unsafe extern "C" fn mdk_create_group(
     out_json: *mut *mut c_char,
 ) -> MdkError {
     ffi_try_unwind_safe(|| {
-        if h.is_null() {
-            return Err(error::null_pointer("handle"));
-        }
-        if out_json.is_null() {
-            return Err(error::null_pointer("out_json"));
-        }
-        let handle = unsafe { &*h };
+        let handle = deref_handle!(h);
+        require_non_null!(out_json, "out_json");
 
         let creator = types::parse_public_key(unsafe { cstr_to_str(creator_pk) }?)?;
         let name_str = unsafe { cstr_to_str(name) }?.to_string();
@@ -248,14 +190,10 @@ pub unsafe extern "C" fn mdk_create_group(
         let relay_urls = parse_relay_urls(unsafe { cstr_to_str(relays_json) }?)?;
         let admin_pks = parse_public_keys(unsafe { cstr_to_str(admins_json) }?)?;
 
-        let kp_jsons: Vec<String> = parse_json(
+        let kp_events: Vec<Event> = parse_json(
             unsafe { cstr_to_str(key_packages_json) }?,
             "key packages JSON array",
         )?;
-        let kp_events: Vec<Event> = kp_jsons
-            .iter()
-            .map(|j| parse_json(j, "key package event JSON"))
-            .collect::<Result<Vec<_>, _>>()?;
 
         let config = NostrGroupConfigData::new(
             name_str, desc_str, None, // image_hash
@@ -295,11 +233,12 @@ pub unsafe extern "C" fn mdk_create_group(
 ///
 /// # Parameters
 ///
-/// * `key_packages_json` — JSON array of key-package event JSON strings.
+/// * `key_packages_json` — JSON array of key-package event objects.
 ///
 /// # Safety
 ///
 /// All pointer arguments must be valid.
+#[allow(unsafe_code)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn mdk_add_members(
     h: *mut MdkHandle,
@@ -308,29 +247,20 @@ pub unsafe extern "C" fn mdk_add_members(
     out_json: *mut *mut c_char,
 ) -> MdkError {
     ffi_try_unwind_safe(|| {
-        if h.is_null() {
-            return Err(error::null_pointer("handle"));
-        }
-        if out_json.is_null() {
-            return Err(error::null_pointer("out_json"));
-        }
-        let handle = unsafe { &*h };
+        let handle = deref_handle!(h);
+        require_non_null!(out_json, "out_json");
         let gid = parse_group_id(unsafe { cstr_to_str(mls_group_id) }?)?;
 
-        let kp_jsons: Vec<String> = parse_json(
+        let kp_events: Vec<Event> = parse_json(
             unsafe { cstr_to_str(key_packages_json) }?,
             "key packages JSON array",
         )?;
-        let kp_events: Vec<Event> = kp_jsons
-            .iter()
-            .map(|j| parse_json(j, "key package event JSON"))
-            .collect::<Result<Vec<_>, _>>()?;
 
         let mdk = lock_handle(handle)?;
         let result = mdk
             .add_members(&gid, &kp_events)
             .map_err(error::from_mdk_error)?;
-        let json = serialize_update_result(result)?;
+        let json = serialize_update_result(result)?.to_string();
         unsafe { write_cstring_to(out_json, json) }
     })
 }
@@ -344,6 +274,7 @@ pub unsafe extern "C" fn mdk_add_members(
 /// # Safety
 ///
 /// All pointer arguments must be valid.
+#[allow(unsafe_code)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn mdk_remove_members(
     h: *mut MdkHandle,
@@ -352,13 +283,8 @@ pub unsafe extern "C" fn mdk_remove_members(
     out_json: *mut *mut c_char,
 ) -> MdkError {
     ffi_try_unwind_safe(|| {
-        if h.is_null() {
-            return Err(error::null_pointer("handle"));
-        }
-        if out_json.is_null() {
-            return Err(error::null_pointer("out_json"));
-        }
-        let handle = unsafe { &*h };
+        let handle = deref_handle!(h);
+        require_non_null!(out_json, "out_json");
         let gid = parse_group_id(unsafe { cstr_to_str(mls_group_id) }?)?;
         let pks = parse_public_keys(unsafe { cstr_to_str(pubkeys_json) }?)?;
 
@@ -366,7 +292,7 @@ pub unsafe extern "C" fn mdk_remove_members(
         let result = mdk
             .remove_members(&gid, &pks)
             .map_err(error::from_mdk_error)?;
-        let json = serialize_update_result(result)?;
+        let json = serialize_update_result(result)?.to_string();
         unsafe { write_cstring_to(out_json, json) }
     })
 }
@@ -381,6 +307,7 @@ pub unsafe extern "C" fn mdk_remove_members(
 /// # Safety
 ///
 /// All pointer arguments must be valid.
+#[allow(unsafe_code)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn mdk_update_group_data(
     h: *mut MdkHandle,
@@ -389,13 +316,8 @@ pub unsafe extern "C" fn mdk_update_group_data(
     out_json: *mut *mut c_char,
 ) -> MdkError {
     ffi_try_unwind_safe(|| {
-        if h.is_null() {
-            return Err(error::null_pointer("handle"));
-        }
-        if out_json.is_null() {
-            return Err(error::null_pointer("out_json"));
-        }
-        let handle = unsafe { &*h };
+        let handle = deref_handle!(h);
+        require_non_null!(out_json, "out_json");
         let gid = parse_group_id(unsafe { cstr_to_str(mls_group_id) }?)?;
         let update: GroupDataUpdateJson = parse_json(
             unsafe { cstr_to_str(update_json) }?,
@@ -440,7 +362,7 @@ pub unsafe extern "C" fn mdk_update_group_data(
         let result = mdk
             .update_group_data(&gid, group_update)
             .map_err(error::from_mdk_error)?;
-        let json = serialize_update_result(result)?;
+        let json = serialize_update_result(result)?.to_string();
         unsafe { write_cstring_to(out_json, json) }
     })
 }
@@ -450,6 +372,7 @@ pub unsafe extern "C" fn mdk_update_group_data(
 /// # Safety
 ///
 /// All pointer arguments must be valid.
+#[allow(unsafe_code)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn mdk_self_update(
     h: *mut MdkHandle,
@@ -457,18 +380,13 @@ pub unsafe extern "C" fn mdk_self_update(
     out_json: *mut *mut c_char,
 ) -> MdkError {
     ffi_try_unwind_safe(|| {
-        if h.is_null() {
-            return Err(error::null_pointer("handle"));
-        }
-        if out_json.is_null() {
-            return Err(error::null_pointer("out_json"));
-        }
-        let handle = unsafe { &*h };
+        let handle = deref_handle!(h);
+        require_non_null!(out_json, "out_json");
         let gid = parse_group_id(unsafe { cstr_to_str(mls_group_id) }?)?;
 
         let mdk = lock_handle(handle)?;
         let result = mdk.self_update(&gid).map_err(error::from_mdk_error)?;
-        let json = serialize_update_result(result)?;
+        let json = serialize_update_result(result)?.to_string();
         unsafe { write_cstring_to(out_json, json) }
     })
 }
@@ -478,6 +396,7 @@ pub unsafe extern "C" fn mdk_self_update(
 /// # Safety
 ///
 /// All pointer arguments must be valid.
+#[allow(unsafe_code)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn mdk_leave_group(
     h: *mut MdkHandle,
@@ -485,18 +404,13 @@ pub unsafe extern "C" fn mdk_leave_group(
     out_json: *mut *mut c_char,
 ) -> MdkError {
     ffi_try_unwind_safe(|| {
-        if h.is_null() {
-            return Err(error::null_pointer("handle"));
-        }
-        if out_json.is_null() {
-            return Err(error::null_pointer("out_json"));
-        }
-        let handle = unsafe { &*h };
+        let handle = deref_handle!(h);
+        require_non_null!(out_json, "out_json");
         let gid = parse_group_id(unsafe { cstr_to_str(mls_group_id) }?)?;
 
         let mdk = lock_handle(handle)?;
         let result = mdk.leave_group(&gid).map_err(error::from_mdk_error)?;
-        let json = serialize_update_result(result)?;
+        let json = serialize_update_result(result)?.to_string();
         unsafe { write_cstring_to(out_json, json) }
     })
 }
@@ -506,16 +420,14 @@ pub unsafe extern "C" fn mdk_leave_group(
 /// # Safety
 ///
 /// `h` and `mls_group_id` must be valid.
+#[allow(unsafe_code)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn mdk_merge_pending_commit(
     h: *mut MdkHandle,
     mls_group_id: *const c_char,
 ) -> MdkError {
     ffi_try_unwind_safe(|| {
-        if h.is_null() {
-            return Err(error::null_pointer("handle"));
-        }
-        let handle = unsafe { &*h };
+        let handle = deref_handle!(h);
         let gid = parse_group_id(unsafe { cstr_to_str(mls_group_id) }?)?;
         lock_handle(handle)?
             .merge_pending_commit(&gid)
@@ -528,16 +440,14 @@ pub unsafe extern "C" fn mdk_merge_pending_commit(
 /// # Safety
 ///
 /// `h` and `mls_group_id` must be valid.
+#[allow(unsafe_code)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn mdk_clear_pending_commit(
     h: *mut MdkHandle,
     mls_group_id: *const c_char,
 ) -> MdkError {
     ffi_try_unwind_safe(|| {
-        if h.is_null() {
-            return Err(error::null_pointer("handle"));
-        }
-        let handle = unsafe { &*h };
+        let handle = deref_handle!(h);
         let gid = parse_group_id(unsafe { cstr_to_str(mls_group_id) }?)?;
         lock_handle(handle)?
             .clear_pending_commit(&gid)
@@ -550,16 +460,14 @@ pub unsafe extern "C" fn mdk_clear_pending_commit(
 /// # Safety
 ///
 /// `h` and `mls_group_id` must be valid.
+#[allow(unsafe_code)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn mdk_sync_group_metadata(
     h: *mut MdkHandle,
     mls_group_id: *const c_char,
 ) -> MdkError {
     ffi_try_unwind_safe(|| {
-        if h.is_null() {
-            return Err(error::null_pointer("handle"));
-        }
-        let handle = unsafe { &*h };
+        let handle = deref_handle!(h);
         let gid = parse_group_id(unsafe { cstr_to_str(mls_group_id) }?)?;
         lock_handle(handle)?
             .sync_group_metadata_from_mls(&gid)
@@ -572,6 +480,7 @@ pub unsafe extern "C" fn mdk_sync_group_metadata(
 /// # Safety
 ///
 /// All pointer arguments must be valid.
+#[allow(unsafe_code)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn mdk_get_relays(
     h: *mut MdkHandle,
@@ -579,13 +488,8 @@ pub unsafe extern "C" fn mdk_get_relays(
     out_json: *mut *mut c_char,
 ) -> MdkError {
     ffi_try_unwind_safe(|| {
-        if h.is_null() {
-            return Err(error::null_pointer("handle"));
-        }
-        if out_json.is_null() {
-            return Err(error::null_pointer("out_json"));
-        }
-        let handle = unsafe { &*h };
+        let handle = deref_handle!(h);
+        require_non_null!(out_json, "out_json");
         let gid = parse_group_id(unsafe { cstr_to_str(mls_group_id) }?)?;
         let relays = lock_handle(handle)?
             .get_relays(&gid)

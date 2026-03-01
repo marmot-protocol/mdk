@@ -776,6 +776,10 @@ jobs:
       shell: bash
       run: |
         VERSION=$(grep -E '^version\s*=' crates/mdk-cbindings/Cargo.toml | head -1 | sed -E 's/version\s*=\s*"([^"]+)"/\1/')
+        if [ -z "$VERSION" ]; then
+          echo "ERROR: Could not extract version from Cargo.toml" >&2
+          exit 1
+        fi
         echo "version=$VERSION" >> $GITHUB_OUTPUT
 
     - name: Assemble C bindings package
@@ -787,9 +791,9 @@ jobs:
         mkdir -p cbindings-package/lib/windows-x86_64
 
         cp ffi-native-all/ffi-native-ubuntu-latest/mdk.h cbindings-package/include/
-        cp ffi-native-all/ffi-native-ubuntu-latest/libmdk.so cbindings-package/lib/linux-x86_64/ 2>/dev/null || true
-        cp ffi-native-all/ffi-native-macos-latest/libmdk.dylib cbindings-package/lib/macos-aarch64/ 2>/dev/null || true
-        cp ffi-native-all/ffi-native-windows-latest/mdk.dll cbindings-package/lib/windows-x86_64/ 2>/dev/null || true
+        cp ffi-native-all/ffi-native-ubuntu-latest/libmdk.so cbindings-package/lib/linux-x86_64/
+        cp ffi-native-all/ffi-native-macos-latest/libmdk.dylib cbindings-package/lib/macos-aarch64/
+        cp ffi-native-all/ffi-native-windows-latest/mdk.dll cbindings-package/lib/windows-x86_64/
 
         cp crates/mdk-cbindings/CHANGELOG.md cbindings-package/ 2>/dev/null || true
         echo "${{ steps.cargo_version.outputs.version }}" > cbindings-package/VERSION
@@ -864,6 +868,10 @@ jobs:
       shell: bash
       run: |
         VERSION=$(grep -E '^version\s*=' crates/mdk-cbindings/Cargo.toml | head -1 | sed -E 's/version\s*=\s*"([^"]+)"/\1/')
+        if [ -z "$VERSION" ]; then
+          echo "ERROR: Could not extract version from Cargo.toml" >&2
+          exit 1
+        fi
         echo "version=$VERSION" >> $GITHUB_OUTPUT
 
     - name: Assemble Zig package
@@ -879,9 +887,9 @@ jobs:
         cp -R crates/mdk-zig/src zig-package/
 
         cp ffi-native-all/ffi-native-ubuntu-latest/mdk.h zig-package/include/
-        cp ffi-native-all/ffi-native-ubuntu-latest/libmdk.so zig-package/lib/linux-x86_64/ 2>/dev/null || true
-        cp ffi-native-all/ffi-native-macos-latest/libmdk.dylib zig-package/lib/macos-aarch64/ 2>/dev/null || true
-        cp ffi-native-all/ffi-native-windows-latest/mdk.dll zig-package/lib/windows-x86_64/ 2>/dev/null || true
+        cp ffi-native-all/ffi-native-ubuntu-latest/libmdk.so zig-package/lib/linux-x86_64/
+        cp ffi-native-all/ffi-native-macos-latest/libmdk.dylib zig-package/lib/macos-aarch64/
+        cp ffi-native-all/ffi-native-windows-latest/mdk.dll zig-package/lib/windows-x86_64/
 
         echo "${{ steps.cargo_version.outputs.version }}" > zig-package/VERSION
         echo "✓ Zig package assembled"
@@ -955,6 +963,10 @@ jobs:
       shell: bash
       run: |
         VERSION=$(grep -E '^version\s*=' crates/mdk-cbindings/Cargo.toml | head -1 | sed -E 's/version\s*=\s*"([^"]+)"/\1/')
+        if [ -z "$VERSION" ]; then
+          echo "ERROR: Could not extract version from Cargo.toml" >&2
+          exit 1
+        fi
         echo "version=$VERSION" >> $GITHUB_OUTPUT
 
     - name: Assemble JS package
@@ -967,9 +979,9 @@ jobs:
 
         cp -R crates/mdk-js/src js-package/
         cp ffi-native-all/ffi-native-ubuntu-latest/mdk.h js-package/include/
-        cp ffi-native-all/ffi-native-ubuntu-latest/libmdk.so js-package/native/linux-x86_64/ 2>/dev/null || true
-        cp ffi-native-all/ffi-native-macos-latest/libmdk.dylib js-package/native/macos-aarch64/ 2>/dev/null || true
-        cp ffi-native-all/ffi-native-windows-latest/mdk.dll js-package/native/windows-x86_64/ 2>/dev/null || true
+        cp ffi-native-all/ffi-native-ubuntu-latest/libmdk.so js-package/native/linux-x86_64/
+        cp ffi-native-all/ffi-native-macos-latest/libmdk.dylib js-package/native/macos-aarch64/
+        cp ffi-native-all/ffi-native-windows-latest/mdk.dll js-package/native/windows-x86_64/
 
         echo "${{ steps.cargo_version.outputs.version }}" > js-package/VERSION
         echo "✓ JS package assembled"

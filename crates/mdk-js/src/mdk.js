@@ -14,6 +14,10 @@ let _ffi = null;
  * @param {object} backend
  */
 export function setBackend(backend) {
+  if (_ffi !== null) {
+    console.warn("MDK: backend already set — replacing previous backend. " +
+      "This usually means both index.js (Bun) and mod.ts (Deno) were imported.");
+  }
   _ffi = backend;
 }
 
@@ -53,6 +57,12 @@ function check(code) {
   }
 }
 
+/**
+ * Call an FFI function that writes a string to an out-pointer.
+ * NOTE: All toCString() buffers must be kept alive (referenced by local
+ * variables) until the FFI call returns. Do not extract .ptr from a
+ * toCString result and discard the wrapper before the call completes.
+ */
 function callWithStringOut(fn, ...args) {
   const f = ffi();
   const out = f.allocOutString();
@@ -61,6 +71,10 @@ function callWithStringOut(fn, ...args) {
   return out.readAndFree();
 }
 
+/**
+ * Call an FFI function that writes JSON to an out-pointer and parses the result.
+ * See callWithStringOut for buffer lifetime notes.
+ */
 function callWithJsonOut(fn, ...args) {
   const s = callWithStringOut(fn, ...args);
   return s ? JSON.parse(s) : null;
@@ -76,6 +90,14 @@ export class Mdk {
   /** @param {*} handle — opaque MdkHandle pointer */
   constructor(handle) {
     this.#handle = handle;
+    _leakRegistry.register(this, new Error().stack, this);
+  }
+
+  /** @throws {Error} if the instance has been closed */
+  #assertOpen() {
+    if (this.#handle === null) {
+      throw new Error("MDK instance already closed");
+    }
   }
 
   // -- Constructors ---------------------------------------------------------
@@ -140,6 +162,7 @@ export class Mdk {
   /** Free the MDK handle. Must be called when done. */
   close() {
     if (this.#handle) {
+      _leakRegistry.unregister(this);
       ffi().sym.mdk_free(this.#handle);
       this.#handle = null;
     }
@@ -154,6 +177,7 @@ export class Mdk {
    * @returns {{ key_package: string, tags: string[][], hash_ref: number[] }}
    */
   createKeyPackage(pubkey, relays) {
+    this.#assertOpen();
     const f = ffi();
     const cPk = f.toCString(pubkey);
     const cRelays = f.toCString(JSON.stringify(relays));
@@ -167,6 +191,7 @@ export class Mdk {
    * @param {boolean} isProtected — add NIP-70 protected tag
    */
   createKeyPackageWithOptions(pubkey, relays, isProtected) {
+    this.#assertOpen();
     const f = ffi();
     const cPk = f.toCString(pubkey);
     const cRelays = f.toCString(JSON.stringify(relays));
@@ -182,6 +207,7 @@ export class Mdk {
    * @returns {string}
    */
   parseKeyPackage(event) {
+    this.#assertOpen();
     const f = ffi();
     const cEv = f.toCString(JSON.stringify(event));
     return callWithStringOut(f.sym.mdk_parse_key_package, this.#handle, cEv.ptr);
@@ -191,6 +217,7 @@ export class Mdk {
 
   /** Get all groups. @returns {object[]} */
   getGroups() {
+    this.#assertOpen();
     return callWithJsonOut(ffi().sym.mdk_get_groups, this.#handle);
   }
 
@@ -200,6 +227,7 @@ export class Mdk {
    * @returns {object|null}
    */
   getGroup(mlsGroupId) {
+    this.#assertOpen();
     const cGid = ffi().toCString(mlsGroupId);
     return callWithJsonOut(ffi().sym.mdk_get_group, this.#handle, cGid.ptr);
   }
@@ -210,6 +238,7 @@ export class Mdk {
    * @returns {string[]} — hex public keys
    */
   getMembers(mlsGroupId) {
+    this.#assertOpen();
     const cGid = ffi().toCString(mlsGroupId);
     return callWithJsonOut(ffi().sym.mdk_get_members, this.#handle, cGid.ptr);
   }
@@ -220,6 +249,7 @@ export class Mdk {
    * @returns {string[]} — hex group IDs
    */
   groupsNeedingSelfUpdate(thresholdSecs) {
+    this.#assertOpen();
     return callWithJsonOut(ffi().sym.mdk_groups_needing_self_update, this.#handle, thresholdSecs);
   }
 
@@ -233,9 +263,10 @@ export class Mdk {
    * @param {string[]} admins — hex public keys
    */
   createGroup(creatorPk, keyPackageEvents, name, description, relays, admins) {
+    this.#assertOpen();
     const f = ffi();
     const cPk = f.toCString(creatorPk);
-    const cKp = f.toCString(JSON.stringify(keyPackageEvents.map((e) => JSON.stringify(e))));
+    const cKp = f.toCString(JSON.stringify(keyPackageEvents));
     const cName = f.toCString(name);
     const cDesc = f.toCString(description);
     const cRelays = f.toCString(JSON.stringify(relays));
@@ -252,9 +283,10 @@ export class Mdk {
    * @param {object[]} keyPackageEvents
    */
   addMembers(mlsGroupId, keyPackageEvents) {
+    this.#assertOpen();
     const f = ffi();
     const cGid = f.toCString(mlsGroupId);
-    const cKp = f.toCString(JSON.stringify(keyPackageEvents.map((e) => JSON.stringify(e))));
+    const cKp = f.toCString(JSON.stringify(keyPackageEvents));
     return callWithJsonOut(f.sym.mdk_add_members, this.#handle, cGid.ptr, cKp.ptr);
   }
 
@@ -264,6 +296,7 @@ export class Mdk {
    * @param {string[]} pubkeys — hex public keys
    */
   removeMembers(mlsGroupId, pubkeys) {
+    this.#assertOpen();
     const f = ffi();
     const cGid = f.toCString(mlsGroupId);
     const cPks = f.toCString(JSON.stringify(pubkeys));
@@ -276,6 +309,7 @@ export class Mdk {
    * @param {object} update — { name?, description?, image_hash?, relays?, admins? }
    */
   updateGroupData(mlsGroupId, update) {
+    this.#assertOpen();
     const f = ffi();
     const cGid = f.toCString(mlsGroupId);
     const cUpd = f.toCString(JSON.stringify(update));
@@ -284,30 +318,35 @@ export class Mdk {
 
   /** Perform a self-update (key rotation). @param {string} mlsGroupId */
   selfUpdate(mlsGroupId) {
+    this.#assertOpen();
     const cGid = ffi().toCString(mlsGroupId);
     return callWithJsonOut(ffi().sym.mdk_self_update, this.#handle, cGid.ptr);
   }
 
   /** Leave a group. @param {string} mlsGroupId */
   leaveGroup(mlsGroupId) {
+    this.#assertOpen();
     const cGid = ffi().toCString(mlsGroupId);
     return callWithJsonOut(ffi().sym.mdk_leave_group, this.#handle, cGid.ptr);
   }
 
   /** Merge pending commit. @param {string} mlsGroupId */
   mergePendingCommit(mlsGroupId) {
+    this.#assertOpen();
     const cGid = ffi().toCString(mlsGroupId);
     check(ffi().sym.mdk_merge_pending_commit(this.#handle, cGid.ptr));
   }
 
   /** Clear pending commit. @param {string} mlsGroupId */
   clearPendingCommit(mlsGroupId) {
+    this.#assertOpen();
     const cGid = ffi().toCString(mlsGroupId);
     check(ffi().sym.mdk_clear_pending_commit(this.#handle, cGid.ptr));
   }
 
   /** Sync group metadata from MLS. @param {string} mlsGroupId */
   syncGroupMetadata(mlsGroupId) {
+    this.#assertOpen();
     const cGid = ffi().toCString(mlsGroupId);
     check(ffi().sym.mdk_sync_group_metadata(this.#handle, cGid.ptr));
   }
@@ -318,6 +357,7 @@ export class Mdk {
    * @returns {string[]}
    */
   getRelays(mlsGroupId) {
+    this.#assertOpen();
     const cGid = ffi().toCString(mlsGroupId);
     return callWithJsonOut(ffi().sym.mdk_get_relays, this.#handle, cGid.ptr);
   }
@@ -333,6 +373,7 @@ export class Mdk {
    * @param {string[][]|null} [tags]
    */
   createMessage(mlsGroupId, senderPk, content, kind, tags = null) {
+    this.#assertOpen();
     const f = ffi();
     const cGid = f.toCString(mlsGroupId);
     const cPk = f.toCString(senderPk);
@@ -350,6 +391,7 @@ export class Mdk {
    * @returns {{ type: string, message?, result?, mls_group_id?, reason? }}
    */
   processMessage(event) {
+    this.#assertOpen();
     const cEv = ffi().toCString(JSON.stringify(event));
     return callWithJsonOut(ffi().sym.mdk_process_message, this.#handle, cEv.ptr);
   }
@@ -361,6 +403,7 @@ export class Mdk {
    * @returns {object[]}
    */
   getMessages(mlsGroupId, opts = {}) {
+    this.#assertOpen();
     const f = ffi();
     const cGid = f.toCString(mlsGroupId);
     const cSort = opts.sortOrder ? f.toCString(opts.sortOrder) : { ptr: f.nullptr };
@@ -377,6 +420,7 @@ export class Mdk {
    * @returns {object|null}
    */
   getMessage(mlsGroupId, eventId) {
+    this.#assertOpen();
     const f = ffi();
     const cGid = f.toCString(mlsGroupId);
     const cEid = f.toCString(eventId);
@@ -389,6 +433,7 @@ export class Mdk {
    * @param {"created_at_first"|"processed_at_first"} sortOrder
    */
   getLastMessage(mlsGroupId, sortOrder) {
+    this.#assertOpen();
     const f = ffi();
     const cGid = f.toCString(mlsGroupId);
     const cSort = f.toCString(sortOrder);
@@ -402,6 +447,7 @@ export class Mdk {
    * @param {{ limit?: number, offset?: number }} [opts]
    */
   getPendingWelcomes(opts = {}) {
+    this.#assertOpen();
     return callWithJsonOut(
       ffi().sym.mdk_get_pending_welcomes,
       this.#handle, opts.limit ?? 0, opts.offset ?? 0,
@@ -410,6 +456,7 @@ export class Mdk {
 
   /** Get a welcome by event ID. @param {string} eventId */
   getWelcome(eventId) {
+    this.#assertOpen();
     const cEid = ffi().toCString(eventId);
     return callWithJsonOut(ffi().sym.mdk_get_welcome, this.#handle, cEid.ptr);
   }
@@ -420,6 +467,7 @@ export class Mdk {
    * @param {object} rumor — unsigned event object
    */
   processWelcome(wrapperEventId, rumor) {
+    this.#assertOpen();
     const f = ffi();
     const cWid = f.toCString(wrapperEventId);
     const cRumor = f.toCString(JSON.stringify(rumor));
@@ -431,6 +479,7 @@ export class Mdk {
    * @param {object} welcome
    */
   acceptWelcome(welcome) {
+    this.#assertOpen();
     const cJson = ffi().toCString(JSON.stringify(welcome));
     check(ffi().sym.mdk_accept_welcome(this.#handle, cJson.ptr));
   }
@@ -440,10 +489,19 @@ export class Mdk {
    * @param {object} welcome
    */
   declineWelcome(welcome) {
+    this.#assertOpen();
     const cJson = ffi().toCString(JSON.stringify(welcome));
     check(ffi().sym.mdk_decline_welcome(this.#handle, cJson.ptr));
   }
 }
+
+// Leak detection: warn if an Mdk instance is GC'd without close().
+const _leakRegistry = new FinalizationRegistry((hint) => {
+  console.warn(
+    `MDK: handle was garbage-collected without calling close() (created at: ${hint}). ` +
+    "This leaks native memory. Always call mdk.close() when done.",
+  );
+});
 
 // ---------------------------------------------------------------------------
 // Free functions (media)

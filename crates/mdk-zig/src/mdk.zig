@@ -90,6 +90,10 @@ pub const CBytes = struct {
 ///
 /// Uses `allocator` to create a temporary copy with a sentinel.
 /// Caller must free the returned pointer.
+///
+/// NOTE: For performance-critical paths with many string arguments, consider
+/// using sentinel-terminated slices (`[:0]const u8`) and calling the raw
+/// C functions in the `c` module directly to avoid the allocation overhead.
 fn sliceToC(allocator: std.mem.Allocator, s: []const u8) std.mem.Allocator.Error![*c]const u8 {
     const buf = try allocator.alloc(u8, s.len + 1);
     @memcpy(buf[0..s.len], s);
@@ -128,30 +132,8 @@ pub const Config = struct {
 
 fn configToJson(allocator: std.mem.Allocator, cfg: ?Config) std.mem.Allocator.Error!?[]const u8 {
     const conf = cfg orelse return null;
-
-    var buf = std.ArrayList(u8).init(allocator);
-    const writer = buf.writer();
-    writer.writeByte('{') catch return std.mem.Allocator.Error.OutOfMemory;
-
-    var first = true;
-
-    inline for (.{
-        .{ "max_event_age_secs", conf.max_event_age_secs },
-        .{ "max_future_skew_secs", conf.max_future_skew_secs },
-        .{ "out_of_order_tolerance", conf.out_of_order_tolerance },
-        .{ "maximum_forward_distance", conf.maximum_forward_distance },
-        .{ "epoch_snapshot_retention", conf.epoch_snapshot_retention },
-        .{ "snapshot_ttl_seconds", conf.snapshot_ttl_seconds },
-    }) |entry| {
-        if (entry[1]) |val| {
-            if (!first) writer.writeByte(',') catch return std.mem.Allocator.Error.OutOfMemory;
-            writer.print("\"{s}\":{d}", .{ entry[0], val }) catch return std.mem.Allocator.Error.OutOfMemory;
-            first = false;
-        }
-    }
-
-    writer.writeByte('}') catch return std.mem.Allocator.Error.OutOfMemory;
-    return buf.toOwnedSlice() catch return std.mem.Allocator.Error.OutOfMemory;
+    const result = try std.json.Stringify.valueAlloc(allocator, conf, .{ .emit_null_optional_fields = false });
+    return result;
 }
 
 // ── Sort order ──────────────────────────────────────────────────────────────
@@ -275,7 +257,7 @@ pub const Mdk = struct {
         const c_relays = try sliceToC(self.allocator, relays_json);
         defer freeCStr(self.allocator, c_relays, relays_json.len);
 
-        var out: [*c]u8 = undefined;
+        var out: [*c]u8 = null;
         try check(raw.mdk_create_key_package(self.handle, c_pk, c_relays, &out));
         return CString{ .ptr = out };
     }
@@ -292,7 +274,7 @@ pub const Mdk = struct {
         const c_relays = try sliceToC(self.allocator, relays_json);
         defer freeCStr(self.allocator, c_relays, relays_json.len);
 
-        var out: [*c]u8 = undefined;
+        var out: [*c]u8 = null;
         try check(raw.mdk_create_key_package_with_options(self.handle, c_pk, c_relays, protected, &out));
         return CString{ .ptr = out };
     }
@@ -305,7 +287,7 @@ pub const Mdk = struct {
         const c_ev = try sliceToC(self.allocator, event_json);
         defer freeCStr(self.allocator, c_ev, event_json.len);
 
-        var out: [*c]u8 = undefined;
+        var out: [*c]u8 = null;
         try check(raw.mdk_parse_key_package(self.handle, c_ev, &out));
         return CString{ .ptr = out };
     }
@@ -314,7 +296,7 @@ pub const Mdk = struct {
 
     /// Get all groups as a JSON array.
     pub fn getGroups(self: *const Mdk) Error!CString {
-        var out: [*c]u8 = undefined;
+        var out: [*c]u8 = null;
         try check(raw.mdk_get_groups(self.handle, &out));
         return CString{ .ptr = out };
     }
@@ -327,7 +309,7 @@ pub const Mdk = struct {
         const c_gid = try sliceToC(self.allocator, mls_group_id);
         defer freeCStr(self.allocator, c_gid, mls_group_id.len);
 
-        var out: [*c]u8 = undefined;
+        var out: [*c]u8 = null;
         try check(raw.mdk_get_group(self.handle, c_gid, &out));
         return CString{ .ptr = out };
     }
@@ -340,7 +322,7 @@ pub const Mdk = struct {
         const c_gid = try sliceToC(self.allocator, mls_group_id);
         defer freeCStr(self.allocator, c_gid, mls_group_id.len);
 
-        var out: [*c]u8 = undefined;
+        var out: [*c]u8 = null;
         try check(raw.mdk_get_members(self.handle, c_gid, &out));
         return CString{ .ptr = out };
     }
@@ -350,7 +332,7 @@ pub const Mdk = struct {
         self: *const Mdk,
         threshold_secs: u64,
     ) Error!CString {
-        var out: [*c]u8 = undefined;
+        var out: [*c]u8 = null;
         try check(raw.mdk_groups_needing_self_update(self.handle, threshold_secs, &out));
         return CString{ .ptr = out };
     }
@@ -378,7 +360,7 @@ pub const Mdk = struct {
         const c_admins = try sliceToC(self.allocator, admins_json);
         defer freeCStr(self.allocator, c_admins, admins_json.len);
 
-        var out: [*c]u8 = undefined;
+        var out: [*c]u8 = null;
         try check(raw.mdk_create_group(self.handle, c_pk, c_kp, c_name, c_desc, c_relays, c_admins, &out));
         return CString{ .ptr = out };
     }
@@ -394,7 +376,7 @@ pub const Mdk = struct {
         const c_kp = try sliceToC(self.allocator, key_packages_json);
         defer freeCStr(self.allocator, c_kp, key_packages_json.len);
 
-        var out: [*c]u8 = undefined;
+        var out: [*c]u8 = null;
         try check(raw.mdk_add_members(self.handle, c_gid, c_kp, &out));
         return CString{ .ptr = out };
     }
@@ -410,7 +392,7 @@ pub const Mdk = struct {
         const c_pks = try sliceToC(self.allocator, pubkeys_json);
         defer freeCStr(self.allocator, c_pks, pubkeys_json.len);
 
-        var out: [*c]u8 = undefined;
+        var out: [*c]u8 = null;
         try check(raw.mdk_remove_members(self.handle, c_gid, c_pks, &out));
         return CString{ .ptr = out };
     }
@@ -426,7 +408,7 @@ pub const Mdk = struct {
         const c_upd = try sliceToC(self.allocator, update_json);
         defer freeCStr(self.allocator, c_upd, update_json.len);
 
-        var out: [*c]u8 = undefined;
+        var out: [*c]u8 = null;
         try check(raw.mdk_update_group_data(self.handle, c_gid, c_upd, &out));
         return CString{ .ptr = out };
     }
@@ -439,7 +421,7 @@ pub const Mdk = struct {
         const c_gid = try sliceToC(self.allocator, mls_group_id);
         defer freeCStr(self.allocator, c_gid, mls_group_id.len);
 
-        var out: [*c]u8 = undefined;
+        var out: [*c]u8 = null;
         try check(raw.mdk_self_update(self.handle, c_gid, &out));
         return CString{ .ptr = out };
     }
@@ -452,7 +434,7 @@ pub const Mdk = struct {
         const c_gid = try sliceToC(self.allocator, mls_group_id);
         defer freeCStr(self.allocator, c_gid, mls_group_id.len);
 
-        var out: [*c]u8 = undefined;
+        var out: [*c]u8 = null;
         try check(raw.mdk_leave_group(self.handle, c_gid, &out));
         return CString{ .ptr = out };
     }
@@ -495,7 +477,7 @@ pub const Mdk = struct {
         const c_gid = try sliceToC(self.allocator, mls_group_id);
         defer freeCStr(self.allocator, c_gid, mls_group_id.len);
 
-        var out: [*c]u8 = undefined;
+        var out: [*c]u8 = null;
         try check(raw.mdk_get_relays(self.handle, c_gid, &out));
         return CString{ .ptr = out };
     }
@@ -521,7 +503,7 @@ pub const Mdk = struct {
         const c_tags = try optSliceToC(self.allocator, tags_json);
         defer freeOptCStr(self.allocator, c_tags, tags_json);
 
-        var out: [*c]u8 = undefined;
+        var out: [*c]u8 = null;
         try check(raw.mdk_create_message(self.handle, c_gid, c_pk, c_content, kind, c_tags, &out));
         return CString{ .ptr = out };
     }
@@ -534,7 +516,7 @@ pub const Mdk = struct {
         const c_ev = try sliceToC(self.allocator, event_json);
         defer freeCStr(self.allocator, c_ev, event_json.len);
 
-        var out: [*c]u8 = undefined;
+        var out: [*c]u8 = null;
         try check(raw.mdk_process_message(self.handle, c_ev, &out));
         return CString{ .ptr = out };
     }
@@ -555,7 +537,7 @@ pub const Mdk = struct {
         const c_sort = if (sort_order) |so| try sliceToC(self.allocator, so.asSlice()) else null;
         defer if (sort_order) |so| freeCStr(self.allocator, c_sort.?, so.asSlice().len);
 
-        var out: [*c]u8 = undefined;
+        var out: [*c]u8 = null;
         try check(raw.mdk_get_messages(self.handle, c_gid, limit, offset, c_sort, &out));
         return CString{ .ptr = out };
     }
@@ -571,7 +553,7 @@ pub const Mdk = struct {
         const c_eid = try sliceToC(self.allocator, event_id);
         defer freeCStr(self.allocator, c_eid, event_id.len);
 
-        var out: [*c]u8 = undefined;
+        var out: [*c]u8 = null;
         try check(raw.mdk_get_message(self.handle, c_gid, c_eid, &out));
         return CString{ .ptr = out };
     }
@@ -587,7 +569,7 @@ pub const Mdk = struct {
         const c_sort = try sliceToC(self.allocator, sort_order.asSlice());
         defer freeCStr(self.allocator, c_sort, sort_order.asSlice().len);
 
-        var out: [*c]u8 = undefined;
+        var out: [*c]u8 = null;
         try check(raw.mdk_get_last_message(self.handle, c_gid, c_sort, &out));
         return CString{ .ptr = out };
     }
@@ -602,7 +584,7 @@ pub const Mdk = struct {
         limit: u32,
         offset: u32,
     ) Error!CString {
-        var out: [*c]u8 = undefined;
+        var out: [*c]u8 = null;
         try check(raw.mdk_get_pending_welcomes(self.handle, limit, offset, &out));
         return CString{ .ptr = out };
     }
@@ -615,7 +597,7 @@ pub const Mdk = struct {
         const c_eid = try sliceToC(self.allocator, event_id);
         defer freeCStr(self.allocator, c_eid, event_id.len);
 
-        var out: [*c]u8 = undefined;
+        var out: [*c]u8 = null;
         try check(raw.mdk_get_welcome(self.handle, c_eid, &out));
         return CString{ .ptr = out };
     }
@@ -631,7 +613,7 @@ pub const Mdk = struct {
         const c_rumor = try sliceToC(self.allocator, rumor_json);
         defer freeCStr(self.allocator, c_rumor, rumor_json.len);
 
-        var out: [*c]u8 = undefined;
+        var out: [*c]u8 = null;
         try check(raw.mdk_process_welcome(self.handle, c_wid, c_rumor, &out));
         return CString{ .ptr = out };
     }
@@ -670,7 +652,7 @@ pub fn prepareGroupImage(
     const c_mime = try sliceToC(allocator, mime);
     defer freeCStr(allocator, c_mime, mime.len);
 
-    var out: [*c]u8 = undefined;
+    var out: [*c]u8 = null;
     try check(raw.mdk_prepare_group_image(data.ptr, data.len, c_mime, &out));
     return CString{ .ptr = out };
 }
@@ -684,8 +666,8 @@ pub fn decryptGroupImage(
     key: *const [32]u8,
     nonce: *const [12]u8,
 ) Error!CBytes {
-    var out_ptr: [*c]u8 = undefined;
-    var out_len: usize = undefined;
+    var out_ptr: [*c]u8 = null;
+    var out_len: usize = 0;
 
     const hash_ptr: [*c]const u8 = if (expected_hash) |h| h else null;
     const hash_len: usize = if (expected_hash != null) 32 else 0;
@@ -712,7 +694,7 @@ pub fn deriveUploadKeypair(
     key: *const [32]u8,
     version: u16,
 ) Error!CString {
-    var out: [*c]u8 = undefined;
+    var out: [*c]u8 = null;
     try check(raw.mdk_derive_upload_keypair(key, 32, version, &out));
     return CString{ .ptr = out };
 }
@@ -749,4 +731,73 @@ test "check returns error on non-OK" {
 test "SortOrder asSlice" {
     try std.testing.expectEqualStrings("created_at_first", SortOrder.created_at_first.asSlice());
     try std.testing.expectEqualStrings("processed_at_first", SortOrder.processed_at_first.asSlice());
+}
+
+test "sliceToC and freeCStr round-trip" {
+    const allocator = std.testing.allocator;
+    const input = "hello world";
+    const c_ptr = try sliceToC(allocator, input);
+    defer freeCStr(allocator, c_ptr, input.len);
+
+    // The C string should be null-terminated
+    const slice = std.mem.sliceTo(c_ptr, 0);
+    try std.testing.expectEqualStrings(input, slice);
+}
+
+test "sliceToC empty string" {
+    const allocator = std.testing.allocator;
+    const input = "";
+    const c_ptr = try sliceToC(allocator, input);
+    defer freeCStr(allocator, c_ptr, input.len);
+
+    const slice = std.mem.sliceTo(c_ptr, 0);
+    try std.testing.expectEqualStrings("", slice);
+}
+
+test "optSliceToC with null" {
+    const allocator = std.testing.allocator;
+    const result = try optSliceToC(allocator, null);
+    try std.testing.expect(result == null);
+}
+
+test "optSliceToC with value" {
+    const allocator = std.testing.allocator;
+    const input: ?[]const u8 = "test";
+    const c_ptr = try optSliceToC(allocator, input);
+    defer freeOptCStr(allocator, c_ptr, input);
+
+    const slice = std.mem.sliceTo(c_ptr, 0);
+    try std.testing.expectEqualStrings("test", slice);
+}
+
+test "configToJson with null config" {
+    const allocator = std.testing.allocator;
+    const result = try configToJson(allocator, null);
+    try std.testing.expect(result == null);
+}
+
+test "configToJson with defaults" {
+    const allocator = std.testing.allocator;
+    const cfg = Config{};
+    const result = try configToJson(allocator, cfg);
+    // All fields are null, so this should be an empty object or have no fields
+    try std.testing.expect(result != null);
+    defer allocator.free(result.?);
+}
+
+test "configToJson with some values" {
+    const allocator = std.testing.allocator;
+    const cfg = Config{
+        .max_event_age_secs = 86400,
+        .out_of_order_tolerance = 50,
+    };
+    const result = try configToJson(allocator, cfg);
+    try std.testing.expect(result != null);
+    defer allocator.free(result.?);
+    // Parse it back to verify it's valid JSON
+    const parsed = try std.json.parseFromSlice(Config, allocator, result.?, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(?u64, 86400), parsed.value.max_event_age_secs);
+    try std.testing.expectEqual(@as(?u32, 50), parsed.value.out_of_order_tolerance);
+    try std.testing.expect(parsed.value.max_future_skew_secs == null);
 }

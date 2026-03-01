@@ -11,13 +11,24 @@ use mdk_core::extension::group_image::{
 };
 
 use crate::error::{self, MdkError};
-use crate::types::{cstr_to_str, ffi_try_unwind_safe, to_json, write_cstring_to};
+use crate::types::{cstr_to_str, ffi_try_unwind_safe, require_non_null, to_json, write_cstring_to};
 
 // ---------------------------------------------------------------------------
 // Serialisation helper
 // ---------------------------------------------------------------------------
 
 /// JSON representation returned by [`mdk_prepare_group_image`].
+///
+/// # Security Note
+///
+/// `upload_secret_key` is serialised as a plain hex string. Because this
+/// struct is immediately JSON-serialised and the JSON string is handed back
+/// to the caller, the secret key will briefly reside in a regular heap
+/// `String` that is not zeroised on drop. This is an inherent limitation of
+/// returning secret material through a JSON-over-FFI interface. Callers
+/// that need stronger guarantees should use the dedicated
+/// [`mdk_derive_upload_keypair`] function and handle the key material on
+/// their side of the FFI boundary.
 #[derive(serde::Serialize)]
 struct PreparedImageJson {
     encrypted_data: Vec<u8>,
@@ -54,6 +65,7 @@ struct PreparedImageJson {
 ///
 /// `data` must point to at least `len` readable bytes. Other pointer
 /// arguments must be valid.
+#[allow(unsafe_code)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn mdk_prepare_group_image(
     data: *const u8,
@@ -62,12 +74,8 @@ pub unsafe extern "C" fn mdk_prepare_group_image(
     out_json: *mut *mut c_char,
 ) -> MdkError {
     ffi_try_unwind_safe(|| {
-        if data.is_null() {
-            return Err(error::null_pointer("data"));
-        }
-        if out_json.is_null() {
-            return Err(error::null_pointer("out_json"));
-        }
+        require_non_null!(data, "data");
+        require_non_null!(out_json, "out_json");
         let image_bytes = unsafe { std::slice::from_raw_parts(data, len) };
         let mime_str = unsafe { cstr_to_str(mime) }?;
 
@@ -77,16 +85,16 @@ pub unsafe extern "C" fn mdk_prepare_group_image(
         })?;
 
         let result = PreparedImageJson {
-            encrypted_data: prepared.encrypted_data.as_ref().clone(),
             encrypted_hash: prepared.encrypted_hash.to_vec(),
             image_key: prepared.image_key.as_ref().to_vec(),
             image_nonce: prepared.image_nonce.as_ref().to_vec(),
             upload_secret_key: prepared.upload_keypair.secret_key().to_secret_hex(),
             original_size: prepared.original_size as u64,
             encrypted_size: prepared.encrypted_size as u64,
-            mime_type: prepared.mime_type.clone(),
+            mime_type: prepared.mime_type,
             dimensions: prepared.dimensions.map(|(w, h)| [w, h]),
-            blurhash: prepared.blurhash.clone(),
+            blurhash: prepared.blurhash,
+            encrypted_data: prepared.encrypted_data.to_vec(),
         };
 
         let json = to_json(&result)?;
@@ -109,6 +117,7 @@ pub unsafe extern "C" fn mdk_prepare_group_image(
 ///
 /// All data pointers must point to at least their corresponding `*_len` bytes.
 /// `hash` may be null (no hash verification). `out` and `out_len` must be valid.
+#[allow(unsafe_code)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn mdk_decrypt_group_image(
     data: *const u8,
@@ -123,21 +132,11 @@ pub unsafe extern "C" fn mdk_decrypt_group_image(
     out_len: *mut usize,
 ) -> MdkError {
     ffi_try_unwind_safe(|| {
-        if data.is_null() {
-            return Err(error::null_pointer("data"));
-        }
-        if key.is_null() {
-            return Err(error::null_pointer("key"));
-        }
-        if nonce.is_null() {
-            return Err(error::null_pointer("nonce"));
-        }
-        if out.is_null() {
-            return Err(error::null_pointer("out"));
-        }
-        if out_len.is_null() {
-            return Err(error::null_pointer("out_len"));
-        }
+        require_non_null!(data, "data");
+        require_non_null!(key, "key");
+        require_non_null!(nonce, "nonce");
+        require_non_null!(out, "out");
+        require_non_null!(out_len, "out_len");
 
         let encrypted = unsafe { std::slice::from_raw_parts(data, data_len) };
 
@@ -199,6 +198,7 @@ pub unsafe extern "C" fn mdk_decrypt_group_image(
 /// # Safety
 ///
 /// `key` must point to at least `key_len` bytes. `out` must be valid.
+#[allow(unsafe_code)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn mdk_derive_upload_keypair(
     key: *const u8,
@@ -207,12 +207,8 @@ pub unsafe extern "C" fn mdk_derive_upload_keypair(
     out: *mut *mut c_char,
 ) -> MdkError {
     ffi_try_unwind_safe(|| {
-        if key.is_null() {
-            return Err(error::null_pointer("key"));
-        }
-        if out.is_null() {
-            return Err(error::null_pointer("out"));
-        }
+        require_non_null!(key, "key");
+        require_non_null!(out, "out");
         if key_len != 32 {
             return Err(error::invalid_input("Image key must be 32 bytes"));
         }
