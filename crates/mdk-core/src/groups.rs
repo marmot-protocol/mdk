@@ -529,19 +529,25 @@ where
         let leaf_nodes: Vec<LeafNodeInfo> = mls_group
             .members()
             .map(|member| {
-                let credential_identity = match BasicCredential::try_from(member.credential) {
-                    Ok(basic_cred) => hex::encode(basic_cred.identity()),
-                    Err(_) => "(unknown)".to_string(),
-                };
+                let index = member.index.u32();
+                let basic_cred = BasicCredential::try_from(member.credential).map_err(|e| {
+                    tracing::warn!(
+                        leaf_index = index,
+                        error = %e,
+                        "Failed to parse credential for leaf node in ratchet tree"
+                    );
+                    Error::Group(format!("invalid credential at leaf index {index}: {e}"))
+                })?;
+                let credential_identity = hex::encode(basic_cred.identity());
 
-                LeafNodeInfo {
-                    index: member.index.u32(),
+                Ok(LeafNodeInfo {
+                    index,
                     encryption_key: hex::encode(&member.encryption_key),
                     signature_key: hex::encode(&member.signature_key),
                     credential_identity,
-                }
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>, Error>>()?;
 
         Ok(RatchetTreeInfo {
             tree_hash,
