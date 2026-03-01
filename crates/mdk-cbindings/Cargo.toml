@@ -35,5 +35,8 @@ tracing = { workspace = true, features = ["std"] }
 default = []
 mip04 = ["mdk-core/mip04"]
 
+[dev-dependencies]
+tempfile.workspace = true
+
 [build-dependencies]
 cbindgen = "0.28"

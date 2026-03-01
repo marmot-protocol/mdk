@@ -1,9 +1,9 @@
-///! Idiomatic Zig wrapper for the MDK C bindings.
-///!
-///! Provides a safe, ergonomic interface to mdk-core's MLS + Nostr
-///! group messaging functionality.  All strings are Zig slices; owned
-///! types (`CString`, `CBytes`, `Mdk`) must be released by calling
-///! `deinit()` (typically via `defer`) when no longer needed.
+//! Idiomatic Zig wrapper for the MDK C bindings.
+//!
+//! Provides a safe, ergonomic interface to mdk-core's MLS + Nostr
+//! group messaging functionality.  All strings are Zig slices; owned
+//! types (`CString`, `CBytes`, `Mdk`) must be released by calling
+//! `deinit()` (typically via `defer`) when no longer needed.
 const std = @import("std");
 const raw = @import("c.zig").c;
 

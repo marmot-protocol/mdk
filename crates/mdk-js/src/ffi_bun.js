@@ -62,6 +62,11 @@ function findLibrary() {
   }
 
   // Last resort: let the linker search system paths
+  console.warn(
+    `MDK: no bundled native library found for platform "${platform}". ` +
+    `Falling back to system library search for "${base}". ` +
+    "If loading fails, ensure the library is installed or built for this platform."
+  );
   return base;
 }
 

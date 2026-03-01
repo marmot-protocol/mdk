@@ -25,6 +25,14 @@ struct CreateGroupResultJson {
 }
 
 /// JSON representation of a group data update (for input parsing).
+///
+/// Fields use a double-`Option` pattern for nullable, optional values:
+///
+/// - **Outer `Option`** — `None` means the field was absent from the JSON
+///   (i.e. "don't change this field").
+/// - **Inner `Option`** (on `image_hash`, `image_key`, `image_nonce`) —
+///   `Some(None)` / JSON `null` means "clear the value";
+///   `Some(Some(bytes))` means "set to this value".
 #[derive(serde::Deserialize)]
 struct GroupDataUpdateJson {
     name: Option<String>,

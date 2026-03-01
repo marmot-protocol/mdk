@@ -202,10 +202,18 @@ pub unsafe extern "C" fn mdk_process_message(
 ///
 /// # Parameters
 ///
-/// * `limit`      — Maximum number of messages (0 = no limit / default 1000).
-/// * `offset`     — Number of messages to skip (0 = none).
+/// * `limit`      — Maximum number of messages to return.  **`0` is a sentinel
+///   value meaning "no limit"** (the storage layer's default applies, typically
+///   1000). Any positive value is used as a literal cap.
+/// * `offset`     — Number of messages to skip from the beginning of the result
+///   set.  **`0` is a sentinel value meaning "no offset"** (start from the
+///   first matching message). Any positive value skips that many rows.
 /// * `sort_order` — Optional: `"created_at_first"` or `"processed_at_first"`.
 ///   Null = default (`created_at_first`).
+///
+/// When both `limit` and `offset` are `0` and `sort_order` is null, no
+/// pagination object is created and the storage layer returns its default
+/// result set.
 ///
 /// On success, `*out_json` receives a JSON array of message objects.
 ///

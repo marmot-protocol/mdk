@@ -20,8 +20,15 @@ use crate::types::{
 ///
 /// # Parameters
 ///
-/// * `limit`  — Maximum number of welcomes (0 = no limit / default 1000).
-/// * `offset` — Number of welcomes to skip (0 = none).
+/// * `limit`  — Maximum number of welcomes to return.  **`0` is a sentinel
+///   value meaning "no limit"** (the storage layer's default applies, typically
+///   1000). Any positive value is used as a literal cap.
+/// * `offset` — Number of welcomes to skip from the beginning of the result
+///   set.  **`0` is a sentinel value meaning "no offset"** (start from the
+///   first matching welcome). Any positive value skips that many rows.
+///
+/// When both `limit` and `offset` are `0`, no pagination object is created
+/// and the storage layer returns its default result set.
 ///
 /// On success, `*out_json` receives a JSON array of welcome objects.
 ///

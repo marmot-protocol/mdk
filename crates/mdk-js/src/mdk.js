@@ -161,7 +161,7 @@ export class Mdk {
 
   /** Free the MDK handle. Must be called when done. */
   close() {
-    if (this.#handle) {
+    if (this.#handle !== null) {
       _leakRegistry.unregister(this);
       ffi().sym.mdk_free(this.#handle);
       this.#handle = null;

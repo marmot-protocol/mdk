@@ -199,6 +199,8 @@ pub unsafe extern "C" fn mdk_free(handle: *mut MdkHandle) {
 #[cfg(test)]
 #[allow(unsafe_code)]
 mod tests {
+    use std::ffi::{CStr, CString};
+
     use super::*;
 
     #[test]
@@ -251,5 +253,44 @@ mod tests {
         let config = parse_config(json.as_ptr()).unwrap();
         let default = CoreMdkConfig::default();
         assert_eq!(config.max_event_age_secs, default.max_event_age_secs);
+    }
+
+    #[test]
+    fn ffi_roundtrip_create_get_groups_free() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let c_path = CString::new(db_path.to_str().unwrap()).unwrap();
+
+        // Create an unencrypted handle
+        let mut handle: *mut MdkHandle = std::ptr::null_mut();
+        let code = unsafe { mdk_new_unencrypted(c_path.as_ptr(), std::ptr::null(), &mut handle) };
+        assert_eq!(code, MdkError::Ok, "mdk_new_unencrypted should succeed");
+        assert!(!handle.is_null(), "handle should be non-null");
+
+        // Get groups — should return an empty JSON array
+        let mut out_json: *mut std::os::raw::c_char = std::ptr::null_mut();
+        let code = unsafe { groups::mdk_get_groups(handle, &mut out_json) };
+        assert_eq!(code, MdkError::Ok, "mdk_get_groups should succeed");
+        assert!(!out_json.is_null(), "out_json should be non-null");
+
+        let json_str = unsafe { CStr::from_ptr(out_json) }.to_str().unwrap();
+        assert_eq!(json_str, "[]", "new instance should have no groups");
+
+        // Free the returned string
+        unsafe { free::mdk_string_free(out_json) };
+
+        // Free the handle
+        unsafe { mdk_free(handle) };
+    }
+
+    #[test]
+    fn ffi_null_handle_returns_null_pointer_error() {
+        let mut out_json: *mut std::os::raw::c_char = std::ptr::null_mut();
+        let code = unsafe { groups::mdk_get_groups(std::ptr::null_mut(), &mut out_json) };
+        assert_eq!(
+            code,
+            MdkError::NullPointer,
+            "null handle should return NullPointer error"
+        );
     }
 }
