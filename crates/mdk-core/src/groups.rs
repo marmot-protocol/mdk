@@ -1123,6 +1123,7 @@ where
             .capabilities(capabilities)
             .with_group_context_extensions(extensions)
             .sender_ratchet_configuration(sender_ratchet_config)
+            .max_past_epochs(self.config.max_past_epochs)
             .build();
 
         let mut mls_group =

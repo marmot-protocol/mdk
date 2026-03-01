@@ -61,6 +61,12 @@ pub struct MdkConfig {
     /// Default: 1000
     pub maximum_forward_distance: Option<u32>,
 
+    /// Number of past MLS epochs for which application messages can be decrypted.
+    /// When a commit advances the group to epoch N+1, messages from epoch N that arrive
+    /// late can still be decrypted if the epoch delta is within this window.
+    /// Default: 5
+    pub max_past_epochs: Option<u32>,
+
     /// Number of epoch snapshots to retain for rollback support.
     /// Default: 5
     pub epoch_snapshot_retention: Option<u32>,
@@ -87,6 +93,10 @@ impl From<MdkConfig> for CoreMdkConfig {
             maximum_forward_distance: config
                 .maximum_forward_distance
                 .unwrap_or(defaults.maximum_forward_distance),
+            max_past_epochs: config
+                .max_past_epochs
+                .map(|v| v as usize)
+                .unwrap_or(defaults.max_past_epochs),
             epoch_snapshot_retention: config
                 .epoch_snapshot_retention
                 .map(|v| v as usize)
@@ -1522,6 +1532,7 @@ mod tests {
             max_future_skew_secs: Some(60),      // 1 minute
             out_of_order_tolerance: Some(50),    // 50 past messages
             maximum_forward_distance: Some(500), // 500 forward messages
+            max_past_epochs: Some(5),            // 5 past epochs
             epoch_snapshot_retention: Some(5),   // 5 snapshots
             snapshot_ttl_seconds: Some(604800),  // 1 week
         };
@@ -1544,6 +1555,7 @@ mod tests {
             max_future_skew_secs: None,
             out_of_order_tolerance: Some(200), // Only override this one
             maximum_forward_distance: None,
+            max_past_epochs: None,
             epoch_snapshot_retention: None,
             snapshot_ttl_seconds: None,
         };
@@ -1563,6 +1575,7 @@ mod tests {
             max_future_skew_secs: None,
             out_of_order_tolerance: None,
             maximum_forward_distance: None,
+            max_past_epochs: None,
             epoch_snapshot_retention: None,
             snapshot_ttl_seconds: None,
         };
@@ -1572,6 +1585,7 @@ mod tests {
         assert_eq!(core_config.max_future_skew_secs, 300);
         assert_eq!(core_config.out_of_order_tolerance, 100);
         assert_eq!(core_config.maximum_forward_distance, 1000);
+        assert_eq!(core_config.max_past_epochs, 5);
         assert_eq!(core_config.epoch_snapshot_retention, 5);
         assert_eq!(core_config.snapshot_ttl_seconds, 604800);
     }

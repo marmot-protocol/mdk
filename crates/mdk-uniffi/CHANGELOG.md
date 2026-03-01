@@ -29,7 +29,11 @@
 
 ### Changed
 
+- `MdkConfig` now includes a `max_past_epochs: Option<u32>` field (defaults to `5` when `None`) that controls how many past MLS epoch message secrets are retained for late message decryption.
+
 ### Added
+
+- `max_past_epochs` field to the `MdkConfig` UniFFI record, allowing callers to configure past-epoch message decryption tolerance.
 
 ### Fixed
 
