@@ -44,8 +44,11 @@ struct PreparedImageJson {
 
 /// Prepare a group image for upload to Blossom.
 ///
-/// Encrypts the image, derives the upload keypair, and returns everything
-/// needed to publish the image as a JSON string.
+/// Encrypts the image and returns the encrypted data together with the
+/// encryption key and metadata as a JSON string.  The returned JSON does
+/// **not** include the upload secret key — callers must derive the upload
+/// keypair separately via [`mdk_derive_upload_keypair`] using the
+/// `image_key` from the returned JSON.
 ///
 /// # Parameters
 ///
@@ -73,7 +76,8 @@ pub unsafe extern "C" fn mdk_prepare_group_image(
         let mime_str = unsafe { cstr_to_str(mime) }?;
 
         let prepared = core_prepare(image_bytes, mime_str).map_err(|e| {
-            error::set_last_error(&format!("Prepare group image failed: {e}"));
+            tracing::warn!("Prepare group image failed: {e}");
+            error::set_last_error("Prepare group image failed");
             MdkError::Mdk
         })?;
 
@@ -161,7 +165,8 @@ pub unsafe extern "C" fn mdk_decrypt_group_image(
 
         let decrypted = core_decrypt(encrypted, hash_opt.as_ref(), &key_secret, &nonce_secret)
             .map_err(|e| {
-                error::set_last_error(&format!("Decrypt group image failed: {e}"));
+                tracing::warn!("Decrypt group image failed: {e}");
+                error::set_last_error("Decrypt group image failed");
                 MdkError::Mdk
             })?;
 
@@ -210,7 +215,8 @@ pub unsafe extern "C" fn mdk_derive_upload_keypair(
         key_arr.zeroize();
 
         let keys = core_derive_upload_keypair(&key_secret, version).map_err(|e| {
-            error::set_last_error(&format!("Derive upload keypair failed: {e}"));
+            tracing::warn!("Derive upload keypair failed: {e}");
+            error::set_last_error("Derive upload keypair failed");
             MdkError::Mdk
         })?;
 

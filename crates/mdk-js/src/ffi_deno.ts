@@ -61,7 +61,12 @@ function findLibrary(): string {
         ? "dll"
         : "so";
   const base = Deno.build.os === "windows" ? `mdk.${ext}` : `libmdk.${ext}`;
-  const pkgRoot = new URL(".", import.meta.url).pathname;
+  // `URL.pathname` on Windows yields `/C:/…`; strip the leading slash so
+  // that path concatenation produces a valid native path.
+  let pkgRoot = new URL(".", import.meta.url).pathname;
+  if (Deno.build.os === "windows" && /^\/[A-Za-z]:/.test(pkgRoot)) {
+    pkgRoot = pkgRoot.slice(1);
+  }
 
   const arch = Deno.build.arch === "aarch64" ? "aarch64" : "x86_64";
   const platform =

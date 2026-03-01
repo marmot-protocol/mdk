@@ -55,6 +55,13 @@ pub fn lastErrorMessage() ?CString {
 pub const CString = struct {
     ptr: [*c]u8,
 
+    /// Construct a `CString` from a C pointer, returning `NullPointer`
+    /// if the pointer is null.
+    fn fromRaw(ptr: [*c]u8) Error!CString {
+        if (ptr == null) return Error.NullPointer;
+        return .{ .ptr = ptr };
+    }
+
     /// View the string as a Zig slice (without the null terminator).
     pub fn slice(self: CString) []const u8 {
         return std.mem.sliceTo(self.ptr, 0);
@@ -269,7 +276,7 @@ pub const Mdk = struct {
         var out: [*c]u8 = null;
         const h = try self.liveHandle();
         try check(raw.mdk_create_key_package(h, c_pk, c_relays, &out));
-        return CString{ .ptr = out };
+        return CString.fromRaw(out);
     }
 
     /// Create a key package with the option to add the NIP-70 protected tag.
@@ -287,7 +294,7 @@ pub const Mdk = struct {
         var out: [*c]u8 = null;
         const h = try self.liveHandle();
         try check(raw.mdk_create_key_package_with_options(h, c_pk, c_relays, protected, &out));
-        return CString{ .ptr = out };
+        return CString.fromRaw(out);
     }
 
     /// Parse and validate a key package from a Nostr event JSON.
@@ -301,7 +308,7 @@ pub const Mdk = struct {
         var out: [*c]u8 = null;
         const h = try self.liveHandle();
         try check(raw.mdk_parse_key_package(h, c_ev, &out));
-        return CString{ .ptr = out };
+        return CString.fromRaw(out);
     }
 
     // ── Groups ──────────────────────────────────────────────────────────
@@ -311,7 +318,7 @@ pub const Mdk = struct {
         const h = try self.liveHandle();
         var out: [*c]u8 = null;
         try check(raw.mdk_get_groups(h, &out));
-        return CString{ .ptr = out };
+        return CString.fromRaw(out);
     }
 
     /// Get a single group by hex-encoded MLS group ID.
@@ -325,7 +332,7 @@ pub const Mdk = struct {
         var out: [*c]u8 = null;
         const h = try self.liveHandle();
         try check(raw.mdk_get_group(h, c_gid, &out));
-        return CString{ .ptr = out };
+        return CString.fromRaw(out);
     }
 
     /// Get members of a group as a JSON array of hex public keys.
@@ -339,7 +346,7 @@ pub const Mdk = struct {
         var out: [*c]u8 = null;
         const h = try self.liveHandle();
         try check(raw.mdk_get_members(h, c_gid, &out));
-        return CString{ .ptr = out };
+        return CString.fromRaw(out);
     }
 
     /// Get group IDs needing a self-update as a JSON array of hex strings.
@@ -350,7 +357,7 @@ pub const Mdk = struct {
         const h = try self.liveHandle();
         var out: [*c]u8 = null;
         try check(raw.mdk_groups_needing_self_update(h, threshold_secs, &out));
-        return CString{ .ptr = out };
+        return CString.fromRaw(out);
     }
 
     /// Create a new group.
@@ -379,7 +386,7 @@ pub const Mdk = struct {
         var out: [*c]u8 = null;
         const h = try self.liveHandle();
         try check(raw.mdk_create_group(h, c_pk, c_kp, c_name, c_desc, c_relays, c_admins, &out));
-        return CString{ .ptr = out };
+        return CString.fromRaw(out);
     }
 
     /// Add members to a group.
@@ -396,7 +403,7 @@ pub const Mdk = struct {
         var out: [*c]u8 = null;
         const h = try self.liveHandle();
         try check(raw.mdk_add_members(h, c_gid, c_kp, &out));
-        return CString{ .ptr = out };
+        return CString.fromRaw(out);
     }
 
     /// Remove members from a group.
@@ -413,7 +420,7 @@ pub const Mdk = struct {
         var out: [*c]u8 = null;
         const h = try self.liveHandle();
         try check(raw.mdk_remove_members(h, c_gid, c_pks, &out));
-        return CString{ .ptr = out };
+        return CString.fromRaw(out);
     }
 
     /// Update group data (name, description, image, relays, admins).
@@ -430,7 +437,7 @@ pub const Mdk = struct {
         var out: [*c]u8 = null;
         const h = try self.liveHandle();
         try check(raw.mdk_update_group_data(h, c_gid, c_upd, &out));
-        return CString{ .ptr = out };
+        return CString.fromRaw(out);
     }
 
     /// Perform a self-update (key rotation) for a group.
@@ -444,7 +451,7 @@ pub const Mdk = struct {
         var out: [*c]u8 = null;
         const h = try self.liveHandle();
         try check(raw.mdk_self_update(h, c_gid, &out));
-        return CString{ .ptr = out };
+        return CString.fromRaw(out);
     }
 
     /// Create a proposal to leave the group.
@@ -458,7 +465,7 @@ pub const Mdk = struct {
         var out: [*c]u8 = null;
         const h = try self.liveHandle();
         try check(raw.mdk_leave_group(h, c_gid, &out));
-        return CString{ .ptr = out };
+        return CString.fromRaw(out);
     }
 
     /// Merge pending commit for a group.
@@ -505,7 +512,7 @@ pub const Mdk = struct {
         var out: [*c]u8 = null;
         const h = try self.liveHandle();
         try check(raw.mdk_get_relays(h, c_gid, &out));
-        return CString{ .ptr = out };
+        return CString.fromRaw(out);
     }
 
     // ── Messages ────────────────────────────────────────────────────────
@@ -532,7 +539,7 @@ pub const Mdk = struct {
         var out: [*c]u8 = null;
         const h = try self.liveHandle();
         try check(raw.mdk_create_message(h, c_gid, c_pk, c_content, kind, c_tags, &out));
-        return CString{ .ptr = out };
+        return CString.fromRaw(out);
     }
 
     /// Process an incoming MLS message.
@@ -546,7 +553,7 @@ pub const Mdk = struct {
         var out: [*c]u8 = null;
         const h = try self.liveHandle();
         try check(raw.mdk_process_message(h, c_ev, &out));
-        return CString{ .ptr = out };
+        return CString.fromRaw(out);
     }
 
     /// Get messages for a group with optional pagination.
@@ -568,7 +575,7 @@ pub const Mdk = struct {
         var out: [*c]u8 = null;
         const h = try self.liveHandle();
         try check(raw.mdk_get_messages(h, c_gid, limit, offset, c_sort, &out));
-        return CString{ .ptr = out };
+        return CString.fromRaw(out);
     }
 
     /// Get a single message by event ID within a group.
@@ -585,7 +592,7 @@ pub const Mdk = struct {
         var out: [*c]u8 = null;
         const h = try self.liveHandle();
         try check(raw.mdk_get_message(h, c_gid, c_eid, &out));
-        return CString{ .ptr = out };
+        return CString.fromRaw(out);
     }
 
     /// Get the most recent message in a group under the given sort order.
@@ -602,7 +609,7 @@ pub const Mdk = struct {
         var out: [*c]u8 = null;
         const h = try self.liveHandle();
         try check(raw.mdk_get_last_message(h, c_gid, c_sort, &out));
-        return CString{ .ptr = out };
+        return CString.fromRaw(out);
     }
 
     // ── Welcomes ────────────────────────────────────────────────────────
@@ -618,7 +625,7 @@ pub const Mdk = struct {
         const h = try self.liveHandle();
         var out: [*c]u8 = null;
         try check(raw.mdk_get_pending_welcomes(h, limit, offset, &out));
-        return CString{ .ptr = out };
+        return CString.fromRaw(out);
     }
 
     /// Get a welcome by hex-encoded event ID.
@@ -632,7 +639,7 @@ pub const Mdk = struct {
         var out: [*c]u8 = null;
         const h = try self.liveHandle();
         try check(raw.mdk_get_welcome(h, c_eid, &out));
-        return CString{ .ptr = out };
+        return CString.fromRaw(out);
     }
 
     /// Process a welcome message.
@@ -649,7 +656,7 @@ pub const Mdk = struct {
         var out: [*c]u8 = null;
         const h = try self.liveHandle();
         try check(raw.mdk_process_welcome(h, c_wid, c_rumor, &out));
-        return CString{ .ptr = out };
+        return CString.fromRaw(out);
     }
 
     /// Accept a welcome message (pass the JSON as returned by processWelcome/getWelcome).
@@ -690,7 +697,7 @@ pub fn prepareGroupImage(
 
     var out: [*c]u8 = null;
     try check(raw.mdk_prepare_group_image(data.ptr, data.len, c_mime, &out));
-    return CString{ .ptr = out };
+    return CString.fromRaw(out);
 }
 
 /// Decrypt a group image.
@@ -732,7 +739,7 @@ pub fn deriveUploadKeypair(
 ) Error!CString {
     var out: [*c]u8 = null;
     try check(raw.mdk_derive_upload_keypair(key, 32, version, &out));
-    return CString{ .ptr = out };
+    return CString.fromRaw(out);
 }
 
 // ── Re-exports ──────────────────────────────────────────────────────────────

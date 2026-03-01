@@ -401,8 +401,11 @@ enum MdkError mdk_create_key_package_with_options(struct MdkHandle *h,
 /**
  * Prepare a group image for upload to Blossom.
  *
- * Encrypts the image, derives the upload keypair, and returns everything
- * needed to publish the image as a JSON string.
+ * Encrypts the image and returns the encrypted data together with the
+ * encryption key and metadata as a JSON string.  The returned JSON does
+ * **not** include the upload secret key — callers must derive the upload
+ * keypair separately via [`mdk_derive_upload_keypair`] using the
+ * `image_key` from the returned JSON.
  *
  * # Parameters
  *
