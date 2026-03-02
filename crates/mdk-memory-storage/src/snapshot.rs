@@ -75,8 +75,10 @@ pub struct GroupScopedSnapshot {
     pub(crate) group: Option<Group>,
     /// Group relays
     pub(crate) group_relays: BTreeSet<GroupRelay>,
-    /// Group exporter secrets: epoch -> secret
+    /// Group exporter secrets (MIP-03 group-event): epoch -> secret
     pub(crate) group_exporter_secrets: HashMap<u64, GroupExporterSecret>,
+    /// Group MIP-04 encrypted-media exporter secrets: epoch -> secret
+    pub(crate) group_mip04_exporter_secrets: HashMap<u64, GroupExporterSecret>,
 }
 
 /// A snapshot of all in-memory state that can be restored later.
@@ -127,6 +129,7 @@ pub struct MemoryStorageSnapshot {
     pub(crate) groups_by_nostr_id: HashMap<[u8; 32], Group>,
     pub(crate) group_relays: HashMap<GroupId, BTreeSet<GroupRelay>>,
     pub(crate) group_exporter_secrets: HashMap<(GroupId, u64), GroupExporterSecret>,
+    pub(crate) group_mip04_exporter_secrets: HashMap<(GroupId, u64), GroupExporterSecret>,
     pub(crate) welcomes: HashMap<EventId, Welcome>,
     pub(crate) processed_welcomes: HashMap<EventId, ProcessedWelcome>,
     pub(crate) messages: HashMap<EventId, Message>,
@@ -151,6 +154,7 @@ impl MemoryStorageSnapshot {
             groups_by_nostr_id: HashMap::new(),
             group_relays: HashMap::new(),
             group_exporter_secrets: HashMap::new(),
+            group_mip04_exporter_secrets: HashMap::new(),
             welcomes: HashMap::new(),
             processed_welcomes: HashMap::new(),
             messages: HashMap::new(),

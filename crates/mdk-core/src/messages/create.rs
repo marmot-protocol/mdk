@@ -557,7 +557,7 @@ mod tests {
         );
     }
 
-    /// Test message content encryption with NIP-44
+    /// Test message content encryption with ChaCha20-Poly1305 per MIP-03
     #[test]
     fn test_message_content_encryption_mip03() {
         let mdk = create_test_mdk();
@@ -583,11 +583,11 @@ mod tests {
             "Encrypted content should be longer than plaintext due to encryption overhead"
         );
 
-        // Verify content appears to be encrypted (not just hex-encoded plaintext)
-        // Encrypted NIP-44 content starts with specific markers
+        // Verify content appears to be encrypted (base64-encoded nonce || ciphertext)
+        // ChaCha20-Poly1305 with 12-byte nonce + 16-byte tag adds at least 28 bytes of overhead
         assert!(
-            message_event.content.len() > 100,
-            "NIP-44 encrypted content should be substantial"
+            message_event.content.len() > 40,
+            "ChaCha20-Poly1305 encrypted content should be substantial (base64-encoded)"
         );
     }
 

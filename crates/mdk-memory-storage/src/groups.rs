@@ -287,6 +287,50 @@ impl GroupStorage for MdkMemoryStorage {
 
         Ok(())
     }
+
+    fn get_group_mip04_exporter_secret(
+        &self,
+        mls_group_id: &GroupId,
+        epoch: u64,
+    ) -> Result<Option<GroupExporterSecret>, GroupError> {
+        let inner = self.inner.read();
+
+        // Check if the group exists while holding the lock
+        if inner.groups_cache.peek(mls_group_id).is_none() {
+            return Err(GroupError::InvalidParameters("Group not found".to_string()));
+        }
+
+        Ok(inner
+            .group_mip04_exporter_secrets_cache
+            .peek(&(mls_group_id.clone(), epoch))
+            .cloned())
+    }
+
+    fn save_group_mip04_exporter_secret(
+        &self,
+        group_exporter_secret: GroupExporterSecret,
+    ) -> Result<(), GroupError> {
+        let mut inner = self.inner.write();
+
+        // Check if the group exists while holding the lock
+        if inner
+            .groups_cache
+            .peek(&group_exporter_secret.mls_group_id)
+            .is_none()
+        {
+            return Err(GroupError::InvalidParameters("Group not found".to_string()));
+        }
+
+        let key = (
+            group_exporter_secret.mls_group_id.clone(),
+            group_exporter_secret.epoch,
+        );
+        inner
+            .group_mip04_exporter_secrets_cache
+            .put(key, group_exporter_secret);
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]

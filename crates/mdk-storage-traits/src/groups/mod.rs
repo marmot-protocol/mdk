@@ -220,15 +220,34 @@ pub trait GroupStorage {
         relays: BTreeSet<RelayUrl>,
     ) -> Result<(), GroupError>;
 
-    /// Get an exporter secret for a group and epoch
+    /// Get a MIP-03 group-event exporter secret for a group and epoch.
+    ///
+    /// Returns the secret derived via `MLS-Exporter("marmot", "group-event", 32)`,
+    /// used as the ChaCha20-Poly1305 encryption key for kind:445 messages.
     fn get_group_exporter_secret(
         &self,
         group_id: &GroupId,
         epoch: u64,
     ) -> Result<Option<GroupExporterSecret>, GroupError>;
 
-    /// Save an exporter secret for a group and epoch
+    /// Save a MIP-03 group-event exporter secret for a group and epoch.
     fn save_group_exporter_secret(
+        &self,
+        group_exporter_secret: GroupExporterSecret,
+    ) -> Result<(), GroupError>;
+
+    /// Get a MIP-04 encrypted-media exporter secret for a group and epoch.
+    ///
+    /// Returns the secret derived via `MLS-Exporter("marmot", "encrypted-media", 32)`,
+    /// used as HKDF input keying material for per-file encryption key derivation.
+    fn get_group_mip04_exporter_secret(
+        &self,
+        group_id: &GroupId,
+        epoch: u64,
+    ) -> Result<Option<GroupExporterSecret>, GroupError>;
+
+    /// Save a MIP-04 encrypted-media exporter secret for a group and epoch.
+    fn save_group_mip04_exporter_secret(
         &self,
         group_exporter_secret: GroupExporterSecret,
     ) -> Result<(), GroupError>;

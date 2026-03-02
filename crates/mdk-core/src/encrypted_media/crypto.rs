@@ -88,10 +88,10 @@ fn build_aad(
     aad
 }
 
-/// Derive encryption key from the current epoch's MLS group secret
+/// Derive encryption key from the current epoch's MLS group secret for MIP-04.
 ///
-/// Looks up the current epoch's exporter secret and derives the encryption
-/// key according to the Marmot protocol 04.md specification:
+/// Uses `MLS-Exporter("marmot", "encrypted-media", 32)` per MIP-04 and then derives
+/// a per-file key via HKDF:
 /// file_key = HKDF-Expand(exporter_secret, SCHEME_LABEL || 0x00 || file_hash_bytes || 0x00 || mime_type_bytes || 0x00 || filename_bytes || 0x00 || "key", 32)
 pub fn derive_encryption_key<Storage>(
     mdk: &MDK<Storage>,
@@ -105,7 +105,7 @@ where
     Storage: MdkStorageProvider,
 {
     let exporter_secret = mdk
-        .exporter_secret(group_id)
+        .mip04_exporter_secret(group_id)
         .map_err(|_| EncryptedMediaError::GroupNotFound)?;
 
     derive_encryption_key_with_secret(

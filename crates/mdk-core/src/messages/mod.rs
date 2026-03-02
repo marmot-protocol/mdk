@@ -8,7 +8,8 @@
 //! - Integration with Nostr events
 //!
 //! Messages in MDK are wrapped in Nostr events (kind:445) for relay transmission.
-//! The message content is encrypted using both MLS group keys and NIP-44 encryption.
+//! The message content is encrypted using both MLS group keys (MLS layer) and
+//! ChaCha20-Poly1305 (outer layer per MIP-03), with the Nostr group ID used as AAD.
 //! Message state is tracked to handle processing status and failure scenarios.
 
 mod application;

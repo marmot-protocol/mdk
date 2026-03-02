@@ -217,7 +217,7 @@ where
         let secret = self
             .mdk
             .storage()
-            .get_group_exporter_secret(&self.group_id, epoch)
+            .get_group_mip04_exporter_secret(&self.group_id, epoch)
             .map_err(|_| EncryptedMediaError::NoExporterSecretForEpoch(epoch))?
             .ok_or(EncryptedMediaError::NoExporterSecretForEpoch(epoch))?;
 

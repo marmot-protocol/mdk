@@ -13,11 +13,18 @@
 
 use std::collections::BTreeSet;
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
+use chacha20poly1305::{
+    ChaCha20Poly1305, Nonce,
+    aead::{Aead, KeyInit},
+};
 use mdk_storage_traits::GroupId;
 use mdk_storage_traits::MdkStorageProvider;
 use mdk_storage_traits::groups::types as group_types;
 use mdk_storage_traits::messages::types as message_types;
 use nostr::prelude::*;
+use nostr::secp256k1::rand::{RngCore, rngs::OsRng};
 use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
 use tls_codec::Serialize as TlsSerialize;
@@ -375,9 +382,10 @@ where
         self.load_mls_group_impl(group_id)
     }
 
-    /// Exports the current epoch's secret key from an MLS group (internal version)
+    /// Exports the current epoch's secret key from an MLS group for MIP-03 message encryption.
     ///
-    /// This secret is used for NIP-44 message encryption in Group Message Events (kind:445).
+    /// Uses `MLS-Exporter("marmot", "group-event", 32)` per MIP-03. The secret is the
+    /// ChaCha20-Poly1305 encryption key for kind:445 Group Message Events.
     /// The secret is cached in storage to avoid re-exporting it for each message.
     ///
     /// # Arguments
@@ -403,7 +411,7 @@ where
             // If it's not already in the storage, export the secret and save it
             None => {
                 let export_secret: [u8; 32] = group
-                    .export_secret(self.provider.crypto(), "nostr", b"nostr", 32)?
+                    .export_secret(self.provider.crypto(), "marmot", b"group-event", 32)?
                     .try_into()
                     .map_err(|_| {
                         Error::Group("Failed to convert export secret to [u8; 32]".to_string())
@@ -421,6 +429,41 @@ where
                 Ok(group_exporter_secret)
             }
         }
+    }
+
+    /// Exports the current epoch's secret key from an MLS group for MIP-04 encrypted media.
+    ///
+    /// Uses `MLS-Exporter("marmot", "encrypted-media", 32)` per MIP-04. This is a separate
+    /// exporter from [`Self::exporter_secret`] (which uses `"group-event"` for MIP-03).
+    /// The result is used as HKDF input keying material for per-file encryption key derivation.
+    ///
+    /// # Arguments
+    ///
+    /// * `group_id` - The MLS group ID
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(GroupExporterSecret)` - The exported secret
+    /// * `Err(Error)` - If the group is not found or there is an error exporting the secret
+    #[cfg(feature = "mip04")]
+    pub(crate) fn mip04_exporter_secret(
+        &self,
+        group_id: &crate::GroupId,
+    ) -> Result<group_types::GroupExporterSecret, Error> {
+        let group = self.load_mls_group(group_id)?.ok_or(Error::GroupNotFound)?;
+
+        let export_secret: [u8; 32] = group
+            .export_secret(self.provider.crypto(), "marmot", b"encrypted-media", 32)?
+            .try_into()
+            .map_err(|_| {
+                Error::Group("Failed to convert MIP-04 export secret to [u8; 32]".to_string())
+            })?;
+
+        Ok(group_types::GroupExporterSecret {
+            mls_group_id: group_id.clone(),
+            epoch: group.epoch().as_u64(),
+            secret: mdk_storage_traits::Secret::new(export_secret),
+        })
     }
 
     /// Retrieves a MDK group by its MLS group ID
@@ -1474,6 +1517,16 @@ where
 
         mls_group.merge_pending_commit(&self.provider)?;
 
+        // Save MIP-03 and MIP-04 exporter secrets for the new epoch
+        self.exporter_secret(group_id)?;
+        #[cfg(feature = "mip04")]
+        {
+            let mip04_secret = self.mip04_exporter_secret(group_id)?;
+            self.storage()
+                .save_group_mip04_exporter_secret(mip04_secret)
+                .map_err(|e| Error::Group(e.to_string()))?;
+        }
+
         // Sync the stored group metadata with the updated MLS group state
         self.sync_group_metadata_from_mls(group_id)?;
 
@@ -1629,7 +1682,11 @@ where
         Ok(())
     }
 
-    /// Creates a NIP-44 encrypted message event Kind: 445 signing with an ephemeral keypair.
+    /// Creates a ChaCha20-Poly1305 encrypted message event Kind: 445 signed with an ephemeral keypair.
+    ///
+    /// Per MIP-03, the encryption key is derived via `MLS-Exporter("marmot", "group-event", 32)`,
+    /// a random 12-byte nonce is generated per event, and the `nostr_group_id` raw bytes are used
+    /// as AAD. The content format is `base64(nonce || ciphertext)`.
     pub(crate) fn build_message_event(
         &self,
         group_id: &GroupId,
@@ -1637,24 +1694,44 @@ where
     ) -> Result<Event, Error> {
         let group = self.get_group(group_id)?.ok_or(Error::GroupNotFound)?;
 
-        // Export secret
+        // Derive the encryption key via MLS exporter (stable per epoch)
         let secret: group_types::GroupExporterSecret = self.exporter_secret(group_id)?;
 
-        // Convert that secret to nostr keys
-        let secret_key: SecretKey = SecretKey::from_slice(secret.secret.as_ref())?;
-        let export_nostr_keys: Keys = Keys::new(secret_key);
+        let cipher = ChaCha20Poly1305::new_from_slice(secret.secret.as_ref()).map_err(|_| {
+            Error::Message("Failed to create cipher from exporter secret".to_string())
+        })?;
 
-        // Encrypt the message content
-        // At some group size this will become too large for NIP44 encryption or relay event size limits.
-        // We're not sure yet what size, but it's something to be aware of.
-        let encrypted_content: String = nip44::encrypt(
-            export_nostr_keys.secret_key(),
-            &export_nostr_keys.public_key,
-            &serialized_content,
-            nip44::Version::default(),
-        )?;
+        // Generate a cryptographically secure random 12-byte nonce.
+        // Per MIP-03, nonce uniqueness within an epoch is critical. OsRng uses the OS CSPRNG
+        // and will abort (panic) if the RNG is unavailable — satisfying the spec requirement
+        // that RNG failure MUST abort encryption rather than fall back to a weak source.
+        // Nonce collision probability with a 96-bit random nonce over typical group message
+        // volumes is negligible (~2^-48 per message pair within an epoch).
+        let mut nonce_bytes = [0u8; 12];
+        OsRng.fill_bytes(&mut nonce_bytes);
+        let nonce = Nonce::from_slice(&nonce_bytes);
 
-        // Generate ephemeral key
+        // AAD = raw 32-byte nostr_group_id (per MIP-03)
+        let aad: &[u8] = &group.nostr_group_id;
+
+        // Encrypt with ChaCha20-Poly1305; ciphertext includes the Poly1305 authentication tag
+        let ciphertext = cipher
+            .encrypt(
+                nonce,
+                chacha20poly1305::aead::Payload {
+                    msg: &serialized_content,
+                    aad,
+                },
+            )
+            .map_err(|_| Error::Message("ChaCha20-Poly1305 encryption failed".to_string()))?;
+
+        // Content format: base64(nonce || ciphertext)
+        let mut combined = Vec::with_capacity(12 + ciphertext.len());
+        combined.extend_from_slice(&nonce_bytes);
+        combined.extend_from_slice(&ciphertext);
+        let encrypted_content = BASE64.encode(&combined);
+
+        // Generate ephemeral key for signing (MUST NOT be reused across events)
         let ephemeral_nostr_keys: Keys = Keys::generate();
 
         let tag: Tag = Tag::custom(TagKind::h(), [hex::encode(group.nostr_group_id)]);
