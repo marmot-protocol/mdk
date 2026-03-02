@@ -124,7 +124,7 @@ where
             original_size: processed_data.len() as u64,
             encrypted_size,
             dimensions: metadata.dimensions,
-            blurhash: metadata.blurhash,
+            thumbhash: metadata.thumbhash,
             nonce: *nonce,
         })
     }
@@ -241,7 +241,7 @@ where
     /// Create an imeta tag for encrypted media (after upload)
     ///
     /// Creates IMETA tag according to Marmot protocol 04.md specification:
-    /// imeta url \<storage_url\> m \<mime_type\> filename \<original_filename\> [dim \<dimensions\>] [blurhash \<blurhash\>] x \<file_hash_hex\> n \<nonce_hex\> v \<version\>
+    /// imeta url \<storage_url\> m \<mime_type\> filename \<original_filename\> [dim \<dimensions\>] [thumbhash \<thumbhash\>] x \<file_hash_hex\> n \<nonce_hex\> v \<version\>
     pub fn create_imeta_tag(&self, upload: &EncryptedMediaUpload, uploaded_url: &str) -> NostrTag {
         let mut tag_values = vec![
             format!("url {}", uploaded_url),
@@ -253,8 +253,8 @@ where
             tag_values.push(format!("dim {}x{}", width, height));
         }
 
-        if let Some(ref blurhash) = upload.blurhash {
-            tag_values.push(format!("blurhash {}", blurhash));
+        if let Some(ref thumbhash) = upload.thumbhash {
+            tag_values.push(format!("thumbhash {}", thumbhash));
         }
 
         // x field contains SHA256 hash of original file content (hex-encoded)
@@ -288,7 +288,7 @@ where
 
     /// Parse an IMETA tag to create a MediaReference for decryption
     ///
-    /// Expected IMETA format per MIP-04: url \<storage_url\> m \<mime_type\> filename \<filename\> [dim \<dimensions\>] [blurhash \<blurhash\>] x \<file_hash_hex\> n \<nonce_hex\> v \<version\>
+    /// Expected IMETA format per MIP-04: url \<storage_url\> m \<mime_type\> filename \<filename\> [dim \<dimensions\>] [thumbhash \<thumbhash\>] x \<file_hash_hex\> n \<nonce_hex\> v \<version\>
     pub fn parse_imeta_tag(
         &self,
         imeta_tag: &NostrTag,
@@ -387,8 +387,8 @@ where
                     }
                 },
                 "v" => version = Some(parts[1].to_string()),
-                "blurhash" => {
-                    // Blurhash is optional and not needed for decryption
+                "thumbhash" => {
+                    // Thumbhash is optional and not needed for decryption
                 }
                 _ => {
                     // Ignore unknown fields for forward compatibility
@@ -554,7 +554,7 @@ mod tests {
             original_size: 1000,
             encrypted_size: 1004,
             dimensions: Some((1920, 1080)),
-            blurhash: Some("LKO2?U%2Tw=w]~RBVZRi};RPxuwH".to_string()),
+            thumbhash: Some("LKO2?U%2Tw=w]~RBVZRi};RPxuwH".to_string()),
             nonce: [0xAA; 12],
         };
 
@@ -576,7 +576,7 @@ mod tests {
         assert!(
             values
                 .iter()
-                .any(|v| v.starts_with("blurhash LKO2?U%2Tw=w]~RBVZRi};RPxuwH"))
+                .any(|v| v.starts_with("thumbhash LKO2?U%2Tw=w]~RBVZRi};RPxuwH"))
         );
         assert!(
             values
@@ -604,7 +604,7 @@ mod tests {
             "m image/jpeg".to_string(),
             "filename photo.jpg".to_string(),
             "dim 1920x1080".to_string(),
-            "blurhash LKO2?U%2Tw=w]~RBVZRi};RPxuwH".to_string(),
+            "thumbhash LKO2?U%2Tw=w]~RBVZRi};RPxuwH".to_string(),
             format!("x {}", hex::encode([0x42; 32])),
             format!("n {}", hex::encode(test_nonce)),
             "v mip04-v2".to_string(),
@@ -677,7 +677,7 @@ mod tests {
             original_size: 2000,
             encrypted_size: 2004,
             dimensions: Some((800, 600)),
-            blurhash: None,
+            thumbhash: None,
             nonce: test_nonce,
         };
 
@@ -704,7 +704,7 @@ mod tests {
         // Use options that skip metadata extraction for images to avoid format errors
         let options = MediaProcessingOptions {
             sanitize_exif: true,
-            generate_blurhash: false,
+            generate_thumbhash: false,
             max_dimension: None,
             max_file_size: None,
             max_filename_length: None,
@@ -745,7 +745,7 @@ mod tests {
         let test_data = vec![0u8; 1000];
         let options = MediaProcessingOptions {
             sanitize_exif: true,
-            generate_blurhash: false,
+            generate_thumbhash: false,
             max_dimension: None,
             max_file_size: None,
             max_filename_length: None,
@@ -790,7 +790,7 @@ mod tests {
         let test_data = vec![0x42u8; 1000];
         let options = MediaProcessingOptions {
             sanitize_exif: true,
-            generate_blurhash: false,
+            generate_thumbhash: false,
             max_dimension: None,
             max_file_size: None,
             max_filename_length: None,
@@ -845,7 +845,7 @@ mod tests {
 
         let options = MediaProcessingOptions {
             sanitize_exif: true,
-            generate_blurhash: false,
+            generate_thumbhash: false,
             max_dimension: None,
             max_file_size: None,
             max_filename_length: None,
