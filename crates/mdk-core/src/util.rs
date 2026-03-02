@@ -36,7 +36,7 @@ impl NostrTagFormat for ExtensionType {
 /// The content format is `base64(nonce || ciphertext)` where:
 /// - `nonce` is 12 bytes
 /// - `ciphertext` includes the 16-byte Poly1305 authentication tag
-/// - `nostr_group_id` raw bytes are used as AAD
+/// - No AAD is used per MIP-03
 ///
 /// # Errors
 ///
@@ -47,7 +47,6 @@ impl NostrTagFormat for ExtensionType {
 pub(crate) fn decrypt_with_exporter_secret(
     secret: &GroupExporterSecret,
     encrypted_content: &str,
-    nostr_group_id: &[u8; 32],
 ) -> Result<Vec<u8>, Error> {
     // Decode base64 content (standard base64 with padding, per MIP-03)
     let combined = BASE64.decode(encrypted_content).map_err(|_| {
@@ -67,23 +66,10 @@ pub(crate) fn decrypt_with_exporter_secret(
     let cipher = ChaCha20Poly1305::new_from_slice(secret.secret.as_ref())
         .map_err(|_| Error::Message("Failed to create cipher from exporter secret".to_string()))?;
 
-    // AAD = raw 32-byte nostr_group_id (per MIP-03)
-    let aad: &[u8] = nostr_group_id;
-
-    // Decrypt and authenticate; any tampering or wrong key will cause an error here
-    let message_bytes = cipher
-        .decrypt(
-            nonce,
-            chacha20poly1305::aead::Payload {
-                msg: ciphertext,
-                aad,
-            },
-        )
-        .map_err(|_| {
-            Error::Message(
-                "AEAD authentication failed: wrong key or tampered ciphertext".to_string(),
-            )
-        })?;
+    // Decrypt and authenticate (no AAD per MIP-03); any tampering or wrong key will error here
+    let message_bytes = cipher.decrypt(nonce, ciphertext).map_err(|_| {
+        Error::Message("AEAD authentication failed: wrong key or tampered ciphertext".to_string())
+    })?;
 
     Ok(message_bytes)
 }
@@ -193,61 +179,49 @@ mod tests {
     use super::*;
     use nostr::Tag;
 
-    /// Test that ChaCha20-Poly1305 encrypt/decrypt round-trips correctly.
+    /// Test that ChaCha20-Poly1305 encrypt/decrypt round-trips correctly (no AAD per MIP-03).
     #[test]
     fn test_chacha20poly1305_roundtrip() {
         let key = [0x42u8; 32];
-        let nostr_group_id = [0xABu8; 32];
         let plaintext = b"hello marmot protocol";
 
         // Create a fake GroupExporterSecret
-        use mdk_storage_traits::GroupId;
-        let secret = mdk_storage_traits::groups::types::GroupExporterSecret {
-            mls_group_id: GroupId::from_slice(&[1, 2, 3]),
-            epoch: 0,
-            secret: Secret::new(key),
-        };
-
-        // We need to manually encrypt to test decrypt.
-        // Use the same logic as build_message_event.
         use base64::Engine;
         use base64::engine::general_purpose::STANDARD as BASE64;
         use chacha20poly1305::{
             ChaCha20Poly1305, Nonce,
             aead::{Aead, KeyInit},
         };
+        use mdk_storage_traits::GroupId;
 
+        let secret = mdk_storage_traits::groups::types::GroupExporterSecret {
+            mls_group_id: GroupId::from_slice(&[1, 2, 3]),
+            epoch: 0,
+            secret: Secret::new(key),
+        };
+
+        // Manually encrypt using the same scheme as build_message_event (no AAD)
         let cipher = ChaCha20Poly1305::new_from_slice(&key).unwrap();
         let nonce_bytes = [0x01u8; 12];
         let nonce = Nonce::from_slice(&nonce_bytes);
-        let ciphertext = cipher
-            .encrypt(
-                nonce,
-                chacha20poly1305::aead::Payload {
-                    msg: plaintext,
-                    aad: &nostr_group_id,
-                },
-            )
-            .unwrap();
+        let ciphertext = cipher.encrypt(nonce, plaintext.as_slice()).unwrap();
 
         let mut combined = Vec::new();
         combined.extend_from_slice(&nonce_bytes);
         combined.extend_from_slice(&ciphertext);
         let encrypted_content = BASE64.encode(&combined);
 
-        // Now decrypt using our function
-        let decrypted = decrypt_with_exporter_secret(&secret, &encrypted_content, &nostr_group_id)
-            .expect("Decryption should succeed");
+        // Decrypt using our function
+        let decrypted =
+            decrypt_with_exporter_secret(&secret, &encrypted_content).expect("Should decrypt");
 
         assert_eq!(decrypted, plaintext);
     }
 
-    /// Test that decryption fails with the wrong AAD (nostr_group_id).
+    /// Test that decryption fails with a tampered ciphertext.
     #[test]
-    fn test_chacha20poly1305_wrong_aad_fails() {
+    fn test_chacha20poly1305_tampered_ciphertext_fails() {
         let key = [0x42u8; 32];
-        let correct_group_id = [0xABu8; 32];
-        let wrong_group_id = [0xCDu8; 32];
         let plaintext = b"secret content";
 
         use base64::Engine;
@@ -261,15 +235,10 @@ mod tests {
         let cipher = ChaCha20Poly1305::new_from_slice(&key).unwrap();
         let nonce_bytes = [0x02u8; 12];
         let nonce = Nonce::from_slice(&nonce_bytes);
-        let ciphertext = cipher
-            .encrypt(
-                nonce,
-                chacha20poly1305::aead::Payload {
-                    msg: plaintext,
-                    aad: &correct_group_id,
-                },
-            )
-            .unwrap();
+        let mut ciphertext = cipher.encrypt(nonce, plaintext.as_slice()).unwrap();
+
+        // Tamper with the ciphertext
+        ciphertext[0] ^= 0xFF;
 
         let mut combined = Vec::new();
         combined.extend_from_slice(&nonce_bytes);
@@ -282,12 +251,8 @@ mod tests {
             secret: Secret::new(key),
         };
 
-        // Should fail with wrong AAD
-        let result = decrypt_with_exporter_secret(&secret, &encrypted_content, &wrong_group_id);
-        assert!(
-            result.is_err(),
-            "Decryption with wrong group_id AAD should fail"
-        );
+        let result = decrypt_with_exporter_secret(&secret, &encrypted_content);
+        assert!(result.is_err(), "Tampered ciphertext should fail");
         assert!(
             result
                 .unwrap_err()
@@ -308,7 +273,7 @@ mod tests {
             secret: Secret::new([0u8; 32]),
         };
 
-        let result = decrypt_with_exporter_secret(&secret, "!!!not-base64!!!", &[0u8; 32]);
+        let result = decrypt_with_exporter_secret(&secret, "!!!not-base64!!!");
         assert!(result.is_err());
         assert!(
             result.unwrap_err().to_string().contains("invalid base64"),
@@ -331,7 +296,7 @@ mod tests {
 
         // Only 8 bytes - shorter than the required 12-byte nonce
         let too_short = BASE64.encode([0u8; 8]);
-        let result = decrypt_with_exporter_secret(&secret, &too_short, &[0u8; 32]);
+        let result = decrypt_with_exporter_secret(&secret, &too_short);
         assert!(result.is_err());
         assert!(
             result

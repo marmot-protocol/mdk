@@ -54,7 +54,7 @@ where
 
         // Try to decrypt message with recent exporter secrets (fallback across epochs)
         let message_bytes: Vec<u8> =
-            self.try_decrypt_with_recent_epochs(&mls_group, &event.content, nostr_group_id)?;
+            self.try_decrypt_with_recent_epochs(&mls_group, &event.content)?;
 
         Ok((group, mls_group, message_bytes))
     }
@@ -70,7 +70,6 @@ where
     ///
     /// * `mls_group` - The MLS group
     /// * `encrypted_content` - The ChaCha20-Poly1305 encrypted message content (base64-encoded)
-    /// * `nostr_group_id` - The Nostr group ID used as AAD during encryption
     /// * `max_epoch_lookback` - Maximum number of epochs to search backwards (default: 5)
     ///
     /// # Returns
@@ -81,7 +80,6 @@ where
         &self,
         mls_group: &MlsGroup,
         encrypted_content: &str,
-        nostr_group_id: [u8; 32],
         max_epoch_lookback: u64,
     ) -> Result<Vec<u8>> {
         let group_id: GroupId = mls_group.group_id().into();
@@ -112,11 +110,7 @@ where
             match self.storage().get_group_exporter_secret(&group_id, epoch) {
                 Ok(Some(secret)) => {
                     // Try to decrypt with this epoch's secret
-                    match util::decrypt_with_exporter_secret(
-                        &secret,
-                        encrypted_content,
-                        &nostr_group_id,
-                    ) {
+                    match util::decrypt_with_exporter_secret(&secret, encrypted_content) {
                         Ok(decrypted_bytes) => {
                             tracing::debug!(
                                 target: "mdk_core::messages::try_decrypt_with_past_epochs",
@@ -162,13 +156,12 @@ where
         &self,
         mls_group: &MlsGroup,
         encrypted_content: &str,
-        nostr_group_id: [u8; 32],
     ) -> Result<Vec<u8>> {
         // Get exporter secret for current epoch
         let secret = self.exporter_secret(&mls_group.group_id().into())?;
 
         // Try to decrypt it for the current epoch
-        match util::decrypt_with_exporter_secret(&secret, encrypted_content, &nostr_group_id) {
+        match util::decrypt_with_exporter_secret(&secret, encrypted_content) {
             Ok(decrypted_bytes) => {
                 tracing::debug!("Successfully decrypted message with current exporter secret");
                 Ok(decrypted_bytes)
@@ -183,7 +176,6 @@ where
                 self.try_decrypt_with_past_epochs(
                     mls_group,
                     encrypted_content,
-                    nostr_group_id,
                     DEFAULT_EPOCH_LOOKBACK,
                 )
             }
@@ -519,7 +511,6 @@ mod tests {
         let result = alice_mdk.try_decrypt_with_past_epochs(
             &mls_group,
             "invalid_encrypted_content",
-            [0u8; 32],
             5, // normal lookback, but epoch 0 means no past epochs
         );
 
@@ -581,7 +572,6 @@ mod tests {
         let result = alice_mdk.try_decrypt_with_past_epochs(
             &mls_group,
             "invalid_encrypted_content",
-            [0u8; 32],
             0, // zero lookback - should return early
         );
 

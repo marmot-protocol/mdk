@@ -1685,8 +1685,8 @@ where
     /// Creates a ChaCha20-Poly1305 encrypted message event Kind: 445 signed with an ephemeral keypair.
     ///
     /// Per MIP-03, the encryption key is derived via `MLS-Exporter("marmot", "group-event", 32)`,
-    /// a random 12-byte nonce is generated per event, and the `nostr_group_id` raw bytes are used
-    /// as AAD. The content format is `base64(nonce || ciphertext)`.
+    /// a random 12-byte nonce is generated per event. No AAD is used per MIP-03.
+    /// The content format is `base64(nonce || ciphertext)`.
     pub(crate) fn build_message_event(
         &self,
         group_id: &GroupId,
@@ -1711,18 +1711,9 @@ where
         OsRng.fill_bytes(&mut nonce_bytes);
         let nonce = Nonce::from_slice(&nonce_bytes);
 
-        // AAD = raw 32-byte nostr_group_id (per MIP-03)
-        let aad: &[u8] = &group.nostr_group_id;
-
-        // Encrypt with ChaCha20-Poly1305; ciphertext includes the Poly1305 authentication tag
+        // Encrypt with ChaCha20-Poly1305 (no AAD per MIP-03); ciphertext includes the Poly1305 authentication tag
         let ciphertext = cipher
-            .encrypt(
-                nonce,
-                chacha20poly1305::aead::Payload {
-                    msg: &serialized_content,
-                    aad,
-                },
-            )
+            .encrypt(nonce, serialized_content.as_slice())
             .map_err(|_| Error::Message("ChaCha20-Poly1305 encryption failed".to_string()))?;
 
         // Content format: base64(nonce || ciphertext)
