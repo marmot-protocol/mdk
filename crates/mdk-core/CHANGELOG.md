@@ -25,6 +25,19 @@
 
 ### Breaking changes
 
+- **MIP-03**: kind:445 Group Message Event content format changed from NIP-44 to `base64(nonce || ChaCha20-Poly1305-ciphertext)`. The encryption key is now derived via `MLS-Exporter("marmot", "group-event", 32)` instead of being used as a NIP-44 secp256k1 private key. All implementations must update simultaneously; old and new formats are mutually incompatible. ([#208](https://github.com/marmot-protocol/mdk/pull/208))
+- **MIP-04**: MLS exporter label for encrypted media changed from `("nostr", "nostr")` to `("marmot", "encrypted-media")`. Encrypted media produced with the old label cannot be decrypted with this version. ([#208](https://github.com/marmot-protocol/mdk/pull/208))
+
+### Changed
+
+- **MIP-03**: kind:445 message events now use ChaCha20-Poly1305 AEAD directly instead of NIP-44. The raw 32-byte `nostr_group_id` is used as AAD, binding each ciphertext to its group and preventing cross-group replay. Nonces are 12 cryptographically random bytes generated via `OsRng`; RNG failure aborts encryption with no fallback. ([#208](https://github.com/marmot-protocol/mdk/pull/208))
+- **MIP-04**: `mip04_exporter_secret()` now derives a separate secret via `MLS-Exporter("marmot", "encrypted-media", 32)` instead of reusing the MIP-03 `group-event` exporter. MIP-04 exporter secrets are stored separately at each epoch advance to support media decryption epoch lookback. ([#208](https://github.com/marmot-protocol/mdk/pull/208))
+- Removed NIP-44 dependency from `mdk-core`; added `base64 = "0.22"` as a direct workspace dependency for `base64(nonce || ciphertext)` encoding. ([#208](https://github.com/marmot-protocol/mdk/pull/208))
+
+### Added
+
+- New unit tests for ChaCha20-Poly1305 encrypt/decrypt roundtrip, wrong-AAD rejection, invalid base64 rejection, and malformed nonce rejection in `util.rs`. ([#208](https://github.com/marmot-protocol/mdk/pull/208))
+
 ### Changed
 
 - Bumped `openmls_rust_crypto` from `0.5.0` to `0.5.1` (see also the `openmls` 0.8.1 bump in [#204](https://github.com/marmot-protocol/mdk/pull/204)). ([#207](https://github.com/marmot-protocol/mdk/pull/207))

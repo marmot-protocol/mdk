@@ -27,15 +27,11 @@
 
 ### Breaking changes
 
-### Changed
+- Added `get_group_mip04_exporter_secret` and `save_group_mip04_exporter_secret` methods to the `GroupStorage` trait. Implementors must add these methods to store and retrieve MIP-04 `MLS-Exporter("marmot", "encrypted-media", 32)` secrets separately from MIP-03 `group-event` secrets. ([#208](https://github.com/marmot-protocol/mdk/pull/208))
 
 ### Added
 
-### Fixed
-
-### Removed
-
-### Deprecated
+- `GroupStorage::get_group_mip04_exporter_secret` and `GroupStorage::save_group_mip04_exporter_secret` for storing MIP-04 encrypted-media exporter secrets separately from MIP-03 group-event exporter secrets. ([#208](https://github.com/marmot-protocol/mdk/pull/208))
 
 ## [0.6.0] - 2026-02-18
 
