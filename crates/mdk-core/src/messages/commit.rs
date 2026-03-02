@@ -87,8 +87,15 @@ where
             return self.handle_local_member_eviction(&group_id, event);
         }
 
-        // Save exporter secret for the new epoch
+        // Save MIP-03 and MIP-04 exporter secrets for the new epoch
         self.exporter_secret(&group_id)?;
+        #[cfg(feature = "mip04")]
+        {
+            let mip04_secret = self.mip04_exporter_secret(&group_id)?;
+            self.storage()
+                .save_group_mip04_exporter_secret(mip04_secret)
+                .map_err(|e| Error::Group(e.to_string()))?;
+        }
 
         // Sync the stored group metadata with the updated MLS group state
         self.sync_group_metadata_from_mls(&group_id)?;
@@ -167,6 +174,8 @@ mod tests {
     use std::fmt;
 
     use mdk_storage_traits::GroupId;
+    #[cfg(feature = "mip04")]
+    use mdk_storage_traits::groups::GroupStorage;
     use mdk_storage_traits::groups::types as group_types;
     use nostr::{EventBuilder, EventId, Keys, Kind};
 
@@ -253,6 +262,86 @@ mod tests {
             alice_members.len(),
             3,
             "Alice should see 3 members after adding Charlie"
+        );
+    }
+
+    #[cfg(feature = "mip04")]
+    #[test]
+    fn test_incoming_commit_persists_mip04_exporter_secret() {
+        let alice_keys = Keys::generate();
+        let bob_keys = Keys::generate();
+        let charlie_keys = Keys::generate();
+
+        let alice_mdk = create_test_mdk();
+        let bob_mdk = create_test_mdk();
+        let charlie_mdk = create_test_mdk();
+
+        let bob_key_package = create_key_package_event(&bob_mdk, &bob_keys);
+        let charlie_key_package = create_key_package_event(&charlie_mdk, &charlie_keys);
+
+        let create_result = alice_mdk
+            .create_group(
+                &alice_keys.public_key(),
+                vec![bob_key_package],
+                create_nostr_group_config_data(vec![alice_keys.public_key()]),
+            )
+            .expect("Alice should create group");
+
+        let group_id = create_result.group.mls_group_id.clone();
+
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("Alice should merge create commit");
+
+        let bob_welcome = bob_mdk
+            .process_welcome(
+                &nostr::EventId::all_zeros(),
+                &create_result.welcome_rumors[0],
+            )
+            .expect("Bob should process welcome");
+        bob_mdk
+            .accept_welcome(&bob_welcome)
+            .expect("Bob should accept welcome");
+
+        let add_result = alice_mdk
+            .add_members(&group_id, &[charlie_key_package])
+            .expect("Alice should create add-member commit");
+
+        let process_result = bob_mdk
+            .process_message(&add_result.evolution_event)
+            .expect("Bob should process incoming commit");
+
+        assert!(
+            matches!(
+                process_result,
+                MessageProcessingResult::Commit {
+                    mls_group_id: ref gid
+                } if *gid == group_id
+            ),
+            "Expected commit processing result for the same group"
+        );
+
+        let bob_epoch = bob_mdk
+            .get_group(&group_id)
+            .expect("Bob group lookup should succeed")
+            .expect("Bob group should exist")
+            .epoch;
+
+        let stored_group_event_secret = bob_mdk
+            .storage()
+            .get_group_exporter_secret(&group_id, bob_epoch)
+            .expect("Lookup of group-event exporter secret should succeed")
+            .expect("group-event exporter secret should be persisted");
+
+        let stored_mip04_secret = bob_mdk
+            .storage()
+            .get_group_mip04_exporter_secret(&group_id, bob_epoch)
+            .expect("Lookup of encrypted-media exporter secret should succeed")
+            .expect("encrypted-media exporter secret should be persisted");
+
+        assert_ne!(
+            stored_group_event_secret.secret, stored_mip04_secret.secret,
+            "MIP-03 and MIP-04 exporter secrets must differ for the same epoch"
         );
     }
 

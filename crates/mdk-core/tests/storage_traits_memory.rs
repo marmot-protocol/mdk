@@ -29,6 +29,16 @@ test_memory_storage!(
 );
 
 test_memory_storage!(
+    test_group_mip04_exporter_secret_memory,
+    shared::group_tests::test_group_mip04_exporter_secret
+);
+
+test_memory_storage!(
+    test_exporter_secret_label_isolation_memory,
+    shared::group_tests::test_exporter_secret_label_isolation
+);
+
+test_memory_storage!(
     test_basic_group_relays_memory,
     shared::group_tests::test_basic_group_relays
 );

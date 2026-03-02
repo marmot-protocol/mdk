@@ -29,6 +29,16 @@ test_sqlite_storage!(
 );
 
 test_sqlite_storage!(
+    test_group_mip04_exporter_secret_sqlite,
+    shared::group_tests::test_group_mip04_exporter_secret
+);
+
+test_sqlite_storage!(
+    test_exporter_secret_label_isolation_sqlite,
+    shared::group_tests::test_exporter_secret_label_isolation
+);
+
+test_sqlite_storage!(
     test_basic_group_relays_sqlite,
     shared::group_tests::test_basic_group_relays
 );
