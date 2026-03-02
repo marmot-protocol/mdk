@@ -22,6 +22,7 @@ coverage/
 .continue/
 .github-copilot/
 Plans/
+/reviews/
 
 # Android build artifacts
 **/jniLibs/
@@ -29,4 +30,3 @@ Plans/
 # Git worktrees
 /trees/*
 !/trees/.gitkeep
-
