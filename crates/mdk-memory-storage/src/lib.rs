@@ -3291,6 +3291,135 @@ mod tests {
         );
     }
 
+    /// Test that group-scoped snapshots also isolate MIP-04 exporter secrets correctly.
+    #[test]
+    fn test_snapshot_isolation_with_mip04_exporter_secrets() {
+        let storage = MdkMemoryStorage::default();
+
+        // Create two groups
+        let group1_id = GroupId::from_slice(&[33; 32]);
+        let group2_id = GroupId::from_slice(&[44; 32]);
+        let nostr_group_id_1: [u8; 32] = generate_random_bytes(32).try_into().unwrap();
+        let nostr_group_id_2: [u8; 32] = generate_random_bytes(32).try_into().unwrap();
+
+        let group1 = Group {
+            mls_group_id: group1_id.clone(),
+            nostr_group_id: nostr_group_id_1,
+            name: "Group 1".to_string(),
+            description: "".to_string(),
+            admin_pubkeys: BTreeSet::new(),
+            last_message_id: None,
+            last_message_at: None,
+            last_message_processed_at: None,
+            epoch: 1,
+            state: GroupState::Active,
+            image_hash: None,
+            image_key: None,
+            image_nonce: None,
+            self_update_state: SelfUpdateState::Required,
+        };
+
+        let group2 = Group {
+            mls_group_id: group2_id.clone(),
+            nostr_group_id: nostr_group_id_2,
+            name: "Group 2".to_string(),
+            description: "".to_string(),
+            admin_pubkeys: BTreeSet::new(),
+            last_message_id: None,
+            last_message_at: None,
+            last_message_processed_at: None,
+            epoch: 1,
+            state: GroupState::Active,
+            image_hash: None,
+            image_key: None,
+            image_nonce: None,
+            self_update_state: SelfUpdateState::Required,
+        };
+
+        storage.save_group(group1).unwrap();
+        storage.save_group(group2).unwrap();
+
+        // Add MIP-04 exporter secrets for both groups
+        let secret1_epoch0 = GroupExporterSecret {
+            mls_group_id: group1_id.clone(),
+            epoch: 0,
+            secret: Secret::new([3u8; 32]),
+        };
+        let secret2_epoch0 = GroupExporterSecret {
+            mls_group_id: group2_id.clone(),
+            epoch: 0,
+            secret: Secret::new([4u8; 32]),
+        };
+
+        storage
+            .save_group_mip04_exporter_secret(secret1_epoch0.clone())
+            .unwrap();
+        storage
+            .save_group_mip04_exporter_secret(secret2_epoch0.clone())
+            .unwrap();
+
+        // Snapshot Group 1
+        storage
+            .create_group_snapshot(&group1_id, "group1_mip04_secrets_snap")
+            .unwrap();
+
+        // Add new epoch MIP-04 secrets to BOTH groups
+        let secret1_epoch1 = GroupExporterSecret {
+            mls_group_id: group1_id.clone(),
+            epoch: 1,
+            secret: Secret::new([33u8; 32]),
+        };
+        let secret2_epoch1 = GroupExporterSecret {
+            mls_group_id: group2_id.clone(),
+            epoch: 1,
+            secret: Secret::new([44u8; 32]),
+        };
+
+        storage
+            .save_group_mip04_exporter_secret(secret1_epoch1)
+            .unwrap();
+        storage
+            .save_group_mip04_exporter_secret(secret2_epoch1)
+            .unwrap();
+
+        // Verify both groups have epoch 1 secrets
+        assert!(
+            storage
+                .get_group_mip04_exporter_secret(&group1_id, 1)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            storage
+                .get_group_mip04_exporter_secret(&group2_id, 1)
+                .unwrap()
+                .is_some()
+        );
+
+        // Rollback Group 1
+        storage
+            .rollback_group_to_snapshot(&group1_id, "group1_mip04_secrets_snap")
+            .unwrap();
+
+        // Group 1's epoch 1 secret should be gone
+        assert!(
+            storage
+                .get_group_mip04_exporter_secret(&group1_id, 1)
+                .unwrap()
+                .is_none(),
+            "Group 1's MIP-04 epoch 1 secret should be rolled back"
+        );
+
+        // Group 2's epoch 1 secret should STILL exist
+        assert!(
+            storage
+                .get_group_mip04_exporter_secret(&group2_id, 1)
+                .unwrap()
+                .is_some(),
+            "Group 2's MIP-04 epoch 1 secret should NOT be affected by Group 1's rollback"
+        );
+    }
+
     /// Test that rolling back to a nonexistent snapshot returns an error.
     #[test]
     fn test_rollback_nonexistent_snapshot_returns_error() {

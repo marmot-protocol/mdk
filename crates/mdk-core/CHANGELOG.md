@@ -33,18 +33,12 @@
 - **MIP-03**: kind:445 message events now use ChaCha20-Poly1305 AEAD directly instead of NIP-44. The raw 32-byte `nostr_group_id` is used as AAD, binding each ciphertext to its group and preventing cross-group replay. Nonces are 12 cryptographically random bytes generated via `OsRng`; RNG failure aborts encryption with no fallback. ([#208](https://github.com/marmot-protocol/mdk/pull/208))
 - **MIP-04**: `mip04_exporter_secret()` now derives a separate secret via `MLS-Exporter("marmot", "encrypted-media", 32)` instead of reusing the MIP-03 `group-event` exporter. MIP-04 exporter secrets are stored separately at each epoch advance to support media decryption epoch lookback. ([#208](https://github.com/marmot-protocol/mdk/pull/208))
 - Removed NIP-44 dependency from `mdk-core`; added `base64 = "0.22"` as a direct workspace dependency for `base64(nonce || ciphertext)` encoding. ([#208](https://github.com/marmot-protocol/mdk/pull/208))
-
-### Added
-
-- New unit tests for ChaCha20-Poly1305 encrypt/decrypt roundtrip, wrong-AAD rejection, invalid base64 rejection, and malformed nonce rejection in `util.rs`. ([#208](https://github.com/marmot-protocol/mdk/pull/208))
-
-### Changed
-
 - Bumped `openmls_rust_crypto` from `0.5.0` to `0.5.1` (see also the `openmls` 0.8.1 bump in [#204](https://github.com/marmot-protocol/mdk/pull/204)). ([#207](https://github.com/marmot-protocol/mdk/pull/207))
 - `MdkConfig` now includes `max_past_epochs: usize` (default `5`), which is wired into the OpenMLS group config so that application messages from up to 5 past epochs can be decrypted when they arrive after a commit has advanced the group epoch. ([#207](https://github.com/marmot-protocol/mdk/pull/207))
 
 ### Added
 
+- New unit tests for ChaCha20-Poly1305 encrypt/decrypt roundtrip, wrong-AAD rejection, invalid base64 rejection, and malformed nonce rejection in `util.rs`. ([#208](https://github.com/marmot-protocol/mdk/pull/208))
 - Added `get_ratchet_tree_info()` method to `MDK` for inspecting the public MLS ratchet tree state. Returns a `RatchetTreeInfo` struct containing a SHA-256 tree fingerprint, the full TLS-serialized tree as hex, and leaf nodes with indices and public keys. Only exposes public information (no secrets). ([#206](https://github.com/marmot-protocol/mdk/pull/206))
 - Added `RatchetTreeInfo` and `LeafNodeInfo` structs, exported via the prelude. ([#206](https://github.com/marmot-protocol/mdk/pull/206))
 - `max_past_epochs` field to `MdkConfig` controls how many past MLS epoch message secrets OpenMLS retains. Setting this to at least `1` ensures that messages sent just before a commit are not permanently lost when the commit arrives first (a real scenario on Nostr relays where delivery order is not guaranteed). ([#207](https://github.com/marmot-protocol/mdk/pull/207))
