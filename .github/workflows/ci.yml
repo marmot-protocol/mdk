@@ -65,14 +65,13 @@ jobs:
       run: cargo fmt --all -- --check
 
   # ── Clippy ──────────────────────────────────────────────────────────
-  # On PRs: stable only (3 feature combos)
-  # On master push: stable + MSRV (6 combos — full compatibility check)
+  # Both stable and MSRV on all events (matches `just precommit` contract)
   lint:
     needs: [format, changes]
     strategy:
       fail-fast: false
       matrix:
-        rust: ${{ fromJson(github.event_name == 'push' && '["1.90.0", "stable"]' || '["stable"]') }}
+        rust: ["1.90.0", "stable"]
         features:
           - name: "all-features"
             flags: "--all-features"
@@ -107,14 +106,13 @@ jobs:
       run: cargo +${{ matrix.rust }} clippy --all-targets ${{ matrix.features.flags }} --no-deps -- -D warnings
 
   # ── Documentation ───────────────────────────────────────────────────
-  # On PRs: stable only
-  # On master push: stable + MSRV
+  # Both stable and MSRV on all events (matches `just precommit` contract)
   docs:
     needs: [format, changes]
     strategy:
       fail-fast: false
       matrix:
-        rust: ${{ fromJson(github.event_name == 'push' && '["1.90.0", "stable"]' || '["stable"]') }}
+        rust: ["1.90.0", "stable"]
 
     runs-on: ubuntu-latest
     name: Documentation (${{ matrix.rust }})
