@@ -68,12 +68,17 @@ function check(code) {
 function callWithStringOut(fn, ...args) {
   const f = ffi();
   const out = f.allocOutString();
+  let called = false;
   try {
     const code = fn(...args, out.ptr);
+    called = true;
     check(code);
     return out.readAndFree();
   } catch (e) {
-    out.readAndFree();
+    // Only read/free the out-pointer if the FFI call actually executed.
+    // If the call itself threw (e.g. type error in Bun FFI), the
+    // out-pointer was never written to and contains uninitialized data.
+    if (called) out.readAndFree();
     throw e;
   }
 }
@@ -97,7 +102,7 @@ export class Mdk {
   /** @param {*} handle — opaque MdkHandle pointer */
   constructor(handle) {
     this.#handle = handle;
-    _leakRegistry.register(this, new Error().stack, this);
+    _leakRegistry.register(this, ++_instanceCounter, this);
   }
 
   /** @throws {Error} if the instance has been closed */
@@ -506,9 +511,10 @@ export class Mdk {
 }
 
 // Leak detection: warn if an Mdk instance is GC'd without close().
-const _leakRegistry = new FinalizationRegistry((hint) => {
+let _instanceCounter = 0;
+const _leakRegistry = new FinalizationRegistry((id) => {
   console.warn(
-    `MDK: handle was garbage-collected without calling close() (created at: ${hint}). ` +
+    `MDK: handle #${id} was garbage-collected without calling close(). ` +
     "This leaks native memory. Always call mdk.close() when done.",
   );
 });

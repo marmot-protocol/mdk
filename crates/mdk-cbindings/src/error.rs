@@ -25,6 +25,7 @@ use mdk_sqlite_storage::error::Error as StorageError;
 /// Error codes returned by all fallible C API functions.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
 pub enum MdkError {
     /// Success — no error.
     Ok = 0,
@@ -86,7 +87,12 @@ pub unsafe extern "C" fn mdk_last_error_message() -> *mut c_char {
 /// The original error is intentionally **not** interpolated into the
 /// user-visible message to avoid leaking sensitive internals (group IDs,
 /// key material, file paths, etc.) through the FFI error channel.
-pub(crate) fn from_storage_error(_e: StorageError) -> MdkError {
+///
+/// The full error is logged at `debug` level for development builds —
+/// `tracing::debug!` is typically stripped or disabled in release
+/// configurations, so this does not leak in production.
+pub(crate) fn from_storage_error(e: StorageError) -> MdkError {
+    tracing::debug!("Storage error (suppressed in FFI message): {e}");
     set_last_error("Storage error: internal");
     MdkError::Storage
 }
@@ -95,7 +101,8 @@ pub(crate) fn from_storage_error(_e: StorageError) -> MdkError {
 ///
 /// See [`from_storage_error`] for the rationale on why the original error
 /// is not included in the user-visible message.
-pub(crate) fn from_mdk_error(_e: CoreMdkError) -> MdkError {
+pub(crate) fn from_mdk_error(e: CoreMdkError) -> MdkError {
+    tracing::debug!("MDK error (suppressed in FFI message): {e}");
     set_last_error("MDK error: internal");
     MdkError::Mdk
 }

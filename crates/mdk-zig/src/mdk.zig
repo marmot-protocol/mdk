@@ -124,6 +124,13 @@ fn freeOptCStr(allocator: std.mem.Allocator, p: [*c]const u8, s: ?[]const u8) vo
     if (s) |val| freeCStr(allocator, p, val.len);
 }
 
+/// Convert a sentinel-terminated slice directly to a C pointer — zero
+/// allocation.  Use this when you already have `[:0]const u8` (e.g.
+/// string literals or pre-terminated buffers).
+fn sentinelPtr(s: [:0]const u8) [*c]const u8 {
+    return s.ptr;
+}
+
 // ── Configuration ───────────────────────────────────────────────────────────
 
 /// Optional configuration for MDK behaviour.  Mirrors the JSON config
@@ -336,6 +343,17 @@ pub const Mdk = struct {
         return CString.fromRaw(out);
     }
 
+    /// Zero-allocation variant of `getGroup` for sentinel-terminated IDs.
+    pub fn getGroupZ(
+        self: *const Mdk,
+        mls_group_id: [:0]const u8,
+    ) Error!CString {
+        var out: [*c]u8 = null;
+        const h = try self.liveHandle();
+        try check(raw.mdk_get_group(h, sentinelPtr(mls_group_id), &out));
+        return CString.fromRaw(out);
+    }
+
     /// Get members of a group as a JSON array of hex public keys.
     pub fn getMembers(
         self: *const Mdk,
@@ -347,6 +365,17 @@ pub const Mdk = struct {
         var out: [*c]u8 = null;
         const h = try self.liveHandle();
         try check(raw.mdk_get_members(h, c_gid, &out));
+        return CString.fromRaw(out);
+    }
+
+    /// Zero-allocation variant of `getMembers` for sentinel-terminated IDs.
+    pub fn getMembersZ(
+        self: *const Mdk,
+        mls_group_id: [:0]const u8,
+    ) Error!CString {
+        var out: [*c]u8 = null;
+        const h = try self.liveHandle();
+        try check(raw.mdk_get_members(h, sentinelPtr(mls_group_id), &out));
         return CString.fromRaw(out);
     }
 
@@ -554,6 +583,17 @@ pub const Mdk = struct {
         var out: [*c]u8 = null;
         const h = try self.liveHandle();
         try check(raw.mdk_process_message(h, c_ev, &out));
+        return CString.fromRaw(out);
+    }
+
+    /// Zero-allocation variant of `processMessage` for sentinel-terminated JSON.
+    pub fn processMessageZ(
+        self: *const Mdk,
+        event_json: [:0]const u8,
+    ) Error!CString {
+        var out: [*c]u8 = null;
+        const h = try self.liveHandle();
+        try check(raw.mdk_process_message(h, sentinelPtr(event_json), &out));
         return CString.fromRaw(out);
     }
 
@@ -827,6 +867,13 @@ test "configToJson with defaults" {
     // All fields are null, so this should be an empty object or have no fields
     try std.testing.expect(result != null);
     defer allocator.free(result.?);
+}
+
+test "sentinelPtr returns correct pointer" {
+    const input: [:0]const u8 = "hello";
+    const c_ptr = sentinelPtr(input);
+    const slice = std.mem.sliceTo(c_ptr, 0);
+    try std.testing.expectEqualStrings("hello", slice);
 }
 
 test "configToJson with some values" {

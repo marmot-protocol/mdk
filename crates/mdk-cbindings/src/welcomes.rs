@@ -46,6 +46,7 @@ pub unsafe extern "C" fn mdk_get_pending_welcomes(
     ffi_try_unwind_safe(|| {
         let handle = deref_handle!(h);
         require_non_null!(out_json, "out_json");
+        unsafe { *out_json = std::ptr::null_mut() };
 
         let limit_opt = match limit {
             0 => None,

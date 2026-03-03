@@ -21,7 +21,7 @@ use crate::types::{
 #[derive(serde::Serialize)]
 struct CreateGroupResultJson {
     group: serde_json::Value,
-    welcome_rumors_json: Vec<String>,
+    welcome_rumors: Vec<serde_json::Value>,
 }
 
 /// JSON representation of a group data update (for input parsing).
@@ -220,11 +220,11 @@ pub unsafe extern "C" fn mdk_create_group(
             .create_group(&creator, kp_events, config)
             .map_err(error::from_mdk_error)?;
 
-        let welcome_rumors: Vec<String> = result
+        let welcome_rumors: Vec<serde_json::Value> = result
             .welcome_rumors
             .iter()
             .map(|r| {
-                serde_json::to_string(r).map_err(|e| {
+                serde_json::to_value(r).map_err(|e| {
                     error::invalid_input(&format!("Failed to serialize welcome rumor: {e}"))
                 })
             })
@@ -235,7 +235,7 @@ pub unsafe extern "C" fn mdk_create_group(
 
         let out = CreateGroupResultJson {
             group: group_json,
-            welcome_rumors_json: welcome_rumors,
+            welcome_rumors,
         };
         let json = to_json(&out)?;
         unsafe { write_cstring_to(out_json, json) }

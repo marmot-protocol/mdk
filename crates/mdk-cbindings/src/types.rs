@@ -163,12 +163,21 @@ where
 /// JSON envelope for [`mdk_core::groups::UpdateGroupResult`].
 ///
 /// Used by both the groups and messages modules.
+///
+/// # Note on `mls_group_id`
+///
+/// The `mls_group_id` field is intentionally included in success responses
+/// so that callers can correlate results with their originating group.
+/// This is an architectural necessity for the FFI boundary — the caller
+/// needs the ID to route the result.  Per AGENTS.md, `mls_group_id`
+/// must not appear in *error* messages or logs.
 #[derive(serde::Serialize)]
 pub(crate) struct UpdateGroupResultJson {
-    /// Serialised evolution event JSON.
-    pub(crate) evolution_event_json: String,
-    /// Optional welcome rumor JSON strings.
-    pub(crate) welcome_rumors_json: Option<Vec<String>>,
+    /// Evolution event as a structured JSON value (not double-encoded).
+    pub(crate) evolution_event: serde_json::Value,
+    /// Optional welcome rumor JSON values.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) welcome_rumors: Option<Vec<serde_json::Value>>,
     /// Hex-encoded MLS group ID.
     pub(crate) mls_group_id: String,
 }
@@ -180,16 +189,16 @@ pub(crate) struct UpdateGroupResultJson {
 pub(crate) fn serialize_update_result(
     result: mdk_core::groups::UpdateGroupResult,
 ) -> Result<serde_json::Value, MdkError> {
-    let evolution_json = serde_json::to_string(&result.evolution_event)
+    let evolution_val = serde_json::to_value(&result.evolution_event)
         .map_err(|e| error::invalid_input(&format!("Failed to serialize evolution event: {e}")))?;
 
-    let welcome_rumors: Option<Vec<String>> = result
+    let welcome_rumors: Option<Vec<serde_json::Value>> = result
         .welcome_rumors
         .map(|rumors| {
             rumors
                 .iter()
                 .map(|r| {
-                    serde_json::to_string(r).map_err(|e| {
+                    serde_json::to_value(r).map_err(|e| {
                         error::invalid_input(&format!("Failed to serialize welcome rumor: {e}"))
                     })
                 })
@@ -198,8 +207,8 @@ pub(crate) fn serialize_update_result(
         .transpose()?;
 
     serde_json::to_value(UpdateGroupResultJson {
-        evolution_event_json: evolution_json,
-        welcome_rumors_json: welcome_rumors,
+        evolution_event: evolution_val,
+        welcome_rumors,
         mls_group_id: hex::encode(result.mls_group_id.as_slice()),
     })
     .map_err(|e| error::invalid_input(&format!("Serialization failed: {e}")))
@@ -424,19 +433,34 @@ mod tests {
 
     #[test]
     fn serialize_update_result_fields() {
-        // This test just verifies that the serializer produces valid JSON
-        // with the expected field names. We can't easily construct an
-        // UpdateGroupResult without the full MLS stack, but we can verify
-        // that the struct serialization works.
+        // This test verifies that the serializer produces valid JSON with
+        // the expected field names.  Values are structured (not
+        // double-encoded strings).
+        let evolution = serde_json::json!({"id": "abc123"});
+        let rumor = serde_json::json!({"kind": 444});
         let json_val = serde_json::to_value(UpdateGroupResultJson {
-            evolution_event_json: "{}".to_string(),
-            welcome_rumors_json: Some(vec!["rumor1".to_string()]),
+            evolution_event: evolution.clone(),
+            welcome_rumors: Some(vec![rumor.clone()]),
             mls_group_id: "aabb".to_string(),
         })
         .unwrap();
 
-        assert_eq!(json_val["evolution_event_json"], "{}");
-        assert_eq!(json_val["welcome_rumors_json"][0], "rumor1");
+        assert_eq!(json_val["evolution_event"], evolution);
+        assert_eq!(json_val["welcome_rumors"][0], rumor);
         assert_eq!(json_val["mls_group_id"], "aabb");
+    }
+
+    #[test]
+    fn serialize_update_result_no_welcome_rumors() {
+        let json_val = serde_json::to_value(UpdateGroupResultJson {
+            evolution_event: serde_json::json!({}),
+            welcome_rumors: None,
+            mls_group_id: "ccdd".to_string(),
+        })
+        .unwrap();
+
+        // welcome_rumors should be absent (not null) thanks to
+        // skip_serializing_if.
+        assert!(json_val.get("welcome_rumors").is_none());
     }
 }

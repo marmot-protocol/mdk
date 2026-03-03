@@ -3,6 +3,7 @@
 //! These are **not** methods on `MdkHandle` — they operate purely on data
 //! without group state.
 
+use std::ffi::CString;
 use std::os::raw::c_char;
 
 use mdk_core::extension::group_image::{
@@ -23,6 +24,12 @@ use crate::types::{cstr_to_str, ffi_try_unwind_safe, require_non_null, to_json, 
 /// The upload secret key is intentionally **not** included here.
 /// Callers must use [`mdk_derive_upload_keypair`] to obtain the upload
 /// keypair from the `image_key` returned in this struct.
+///
+/// # Security
+///
+/// `image_key` and `image_nonce` contain secret material.  The struct
+/// implements [`Zeroize`] so callers **must** call `.zeroize()` once the
+/// JSON has been serialized.
 #[derive(serde::Serialize)]
 struct PreparedImageJson {
     encrypted_data: Vec<u8>,
@@ -36,6 +43,14 @@ struct PreparedImageJson {
     dimensions: Option<[u32; 2]>,
     #[serde(skip_serializing_if = "Option::is_none")]
     blurhash: Option<String>,
+}
+
+impl Zeroize for PreparedImageJson {
+    fn zeroize(&mut self) {
+        self.image_key.zeroize();
+        self.image_nonce.zeroize();
+        // encrypted_data is ciphertext, not secret; no need to zeroize.
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -81,7 +96,7 @@ pub unsafe extern "C" fn mdk_prepare_group_image(
             MdkError::Mdk
         })?;
 
-        let result = PreparedImageJson {
+        let mut result = PreparedImageJson {
             encrypted_hash: prepared.encrypted_hash.to_vec(),
             image_key: prepared.image_key.as_ref().to_vec(),
             image_nonce: prepared.image_nonce.as_ref().to_vec(),
@@ -93,7 +108,9 @@ pub unsafe extern "C" fn mdk_prepare_group_image(
             encrypted_data: prepared.encrypted_data.to_vec(),
         };
 
-        let json = to_json(&result)?;
+        let json = to_json(&result);
+        result.zeroize();
+        let json = json?;
         unsafe { write_cstring_to(out_json, json) }
     })
 }
@@ -220,7 +237,249 @@ pub unsafe extern "C" fn mdk_derive_upload_keypair(
             MdkError::Mdk
         })?;
 
-        let hex = keys.secret_key().to_secret_hex();
-        unsafe { write_cstring_to(out, hex) }
+        // Convert to CString first, then zeroize the intermediate String.
+        // The CString now owns the only copy; it will be freed by the
+        // caller via `mdk_string_free`.
+        let mut hex = keys.secret_key().to_secret_hex();
+        let c = CString::new(hex.as_str()).map_err(|e| {
+            hex.zeroize();
+            error::invalid_input(&format!("String contained null byte: {e}"))
+        })?;
+        hex.zeroize();
+        unsafe {
+            *out = c.into_raw();
+        }
+        Ok(())
     })
+}
+
+#[cfg(test)]
+#[allow(unsafe_code)]
+mod tests {
+    use super::*;
+
+    // ── PreparedImageJson zeroization ────────────────────────────────────
+
+    #[test]
+    fn prepared_image_json_zeroize_clears_secrets() {
+        let mut p = PreparedImageJson {
+            encrypted_data: vec![1, 2, 3],
+            encrypted_hash: vec![4, 5, 6],
+            image_key: vec![0xAA; 32],
+            image_nonce: vec![0xBB; 12],
+            original_size: 100,
+            encrypted_size: 200,
+            mime_type: "image/png".to_string(),
+            dimensions: Some([640, 480]),
+            blurhash: None,
+        };
+        p.zeroize();
+
+        assert!(
+            p.image_key.iter().all(|&b| b == 0),
+            "image_key must be zeroed"
+        );
+        assert!(
+            p.image_nonce.iter().all(|&b| b == 0),
+            "image_nonce must be zeroed"
+        );
+        // encrypted_data is ciphertext, not secret — should be untouched.
+        assert_eq!(p.encrypted_data, vec![1, 2, 3]);
+    }
+
+    // ── Input validation ────────────────────────────────────────────────
+
+    #[test]
+    fn decrypt_null_data_returns_null_pointer() {
+        let mut out: *mut u8 = std::ptr::null_mut();
+        let mut out_len: usize = 0;
+        let key = [0u8; 32];
+        let nonce = [0u8; 12];
+
+        let code = unsafe {
+            mdk_decrypt_group_image(
+                std::ptr::null(),
+                10,
+                std::ptr::null(),
+                0,
+                key.as_ptr(),
+                32,
+                nonce.as_ptr(),
+                12,
+                &mut out,
+                &mut out_len,
+            )
+        };
+        assert_eq!(code, MdkError::NullPointer);
+    }
+
+    #[test]
+    fn decrypt_null_key_returns_null_pointer() {
+        let data = [0u8; 64];
+        let nonce = [0u8; 12];
+        let mut out: *mut u8 = std::ptr::null_mut();
+        let mut out_len: usize = 0;
+
+        let code = unsafe {
+            mdk_decrypt_group_image(
+                data.as_ptr(),
+                data.len(),
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                32,
+                nonce.as_ptr(),
+                12,
+                &mut out,
+                &mut out_len,
+            )
+        };
+        assert_eq!(code, MdkError::NullPointer);
+    }
+
+    #[test]
+    fn decrypt_null_nonce_returns_null_pointer() {
+        let data = [0u8; 64];
+        let key = [0u8; 32];
+        let mut out: *mut u8 = std::ptr::null_mut();
+        let mut out_len: usize = 0;
+
+        let code = unsafe {
+            mdk_decrypt_group_image(
+                data.as_ptr(),
+                data.len(),
+                std::ptr::null(),
+                0,
+                key.as_ptr(),
+                32,
+                std::ptr::null(),
+                12,
+                &mut out,
+                &mut out_len,
+            )
+        };
+        assert_eq!(code, MdkError::NullPointer);
+    }
+
+    #[test]
+    fn decrypt_wrong_key_len_returns_invalid_input() {
+        let data = [0u8; 64];
+        let key = [0u8; 16]; // Wrong length
+        let nonce = [0u8; 12];
+        let mut out: *mut u8 = std::ptr::null_mut();
+        let mut out_len: usize = 0;
+
+        let code = unsafe {
+            mdk_decrypt_group_image(
+                data.as_ptr(),
+                data.len(),
+                std::ptr::null(),
+                0,
+                key.as_ptr(),
+                key.len(),
+                nonce.as_ptr(),
+                12,
+                &mut out,
+                &mut out_len,
+            )
+        };
+        assert_eq!(code, MdkError::InvalidInput);
+    }
+
+    #[test]
+    fn decrypt_wrong_nonce_len_returns_invalid_input() {
+        let data = [0u8; 64];
+        let key = [0u8; 32];
+        let nonce = [0u8; 8]; // Wrong length
+        let mut out: *mut u8 = std::ptr::null_mut();
+        let mut out_len: usize = 0;
+
+        let code = unsafe {
+            mdk_decrypt_group_image(
+                data.as_ptr(),
+                data.len(),
+                std::ptr::null(),
+                0,
+                key.as_ptr(),
+                32,
+                nonce.as_ptr(),
+                nonce.len(),
+                &mut out,
+                &mut out_len,
+            )
+        };
+        assert_eq!(code, MdkError::InvalidInput);
+    }
+
+    #[test]
+    fn decrypt_wrong_hash_len_returns_invalid_input() {
+        let data = [0u8; 64];
+        let key = [0u8; 32];
+        let nonce = [0u8; 12];
+        let hash = [0u8; 16]; // Wrong length
+        let mut out: *mut u8 = std::ptr::null_mut();
+        let mut out_len: usize = 0;
+
+        let code = unsafe {
+            mdk_decrypt_group_image(
+                data.as_ptr(),
+                data.len(),
+                hash.as_ptr(),
+                hash.len(),
+                key.as_ptr(),
+                32,
+                nonce.as_ptr(),
+                12,
+                &mut out,
+                &mut out_len,
+            )
+        };
+        assert_eq!(code, MdkError::InvalidInput);
+    }
+
+    #[test]
+    fn derive_keypair_null_key_returns_null_pointer() {
+        let mut out: *mut std::os::raw::c_char = std::ptr::null_mut();
+        let code = unsafe { mdk_derive_upload_keypair(std::ptr::null(), 32, 2, &mut out) };
+        assert_eq!(code, MdkError::NullPointer);
+    }
+
+    #[test]
+    fn derive_keypair_wrong_key_len_returns_invalid_input() {
+        let key = [0u8; 16]; // Wrong length
+        let mut out: *mut std::os::raw::c_char = std::ptr::null_mut();
+        let code = unsafe { mdk_derive_upload_keypair(key.as_ptr(), key.len(), 2, &mut out) };
+        assert_eq!(code, MdkError::InvalidInput);
+    }
+
+    #[test]
+    fn derive_keypair_null_out_returns_null_pointer() {
+        let key = [0u8; 32];
+        let code = unsafe { mdk_derive_upload_keypair(key.as_ptr(), 32, 2, std::ptr::null_mut()) };
+        assert_eq!(code, MdkError::NullPointer);
+    }
+
+    #[test]
+    fn prepare_null_data_returns_null_pointer() {
+        let mime = std::ffi::CString::new("image/png").unwrap();
+        let mut out: *mut std::os::raw::c_char = std::ptr::null_mut();
+        let code =
+            unsafe { mdk_prepare_group_image(std::ptr::null(), 100, mime.as_ptr(), &mut out) };
+        assert_eq!(code, MdkError::NullPointer);
+    }
+
+    #[test]
+    fn prepare_null_out_returns_null_pointer() {
+        let data = [0u8; 10];
+        let mime = std::ffi::CString::new("image/png").unwrap();
+        let code = unsafe {
+            mdk_prepare_group_image(
+                data.as_ptr(),
+                data.len(),
+                mime.as_ptr(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(code, MdkError::NullPointer);
+    }
 }
