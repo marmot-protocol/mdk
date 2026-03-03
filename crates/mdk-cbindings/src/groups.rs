@@ -518,3 +518,29 @@ pub unsafe extern "C" fn mdk_get_relays(
         unsafe { write_cstring_to(out_json, json) }
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vec_to_array_correct_size() {
+        let result = vec_to_array::<32>(Some(vec![0xAA; 32]));
+        assert!(result.is_ok());
+        let arr = result.unwrap().unwrap();
+        assert_eq!(arr, [0xAA; 32]);
+    }
+
+    #[test]
+    fn vec_to_array_wrong_size() {
+        let result = vec_to_array::<32>(Some(vec![0xAA; 16]));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn vec_to_array_none_returns_none() {
+        let result = vec_to_array::<32>(None);
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
+    }
+}
