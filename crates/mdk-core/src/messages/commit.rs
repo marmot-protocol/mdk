@@ -94,7 +94,9 @@ where
             let mip04_secret = self.mip04_exporter_secret(&group_id)?;
             self.storage()
                 .save_group_mip04_exporter_secret(mip04_secret)
-                .map_err(|e| Error::Group(e.to_string()))?;
+                .map_err(|_| {
+                    Error::Group("Failed to persist MIP-04 exporter secret".to_string())
+                })?;
         }
 
         let min_epoch_to_keep = mls_group
