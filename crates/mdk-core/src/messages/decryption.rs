@@ -199,7 +199,9 @@ mod tests {
     ///
     /// Both MDK instances are constructed using the provided config, which controls
     /// `max_past_epochs` on the underlying OpenMLS group.
-    fn past_epoch_delivery_result(config: MdkConfig) -> crate::messages::MessageProcessingResult {
+    fn past_epoch_delivery_result(
+        config: MdkConfig,
+    ) -> Result<crate::messages::MessageProcessingResult, crate::error::Error> {
         let alice_keys = Keys::generate();
         let bob_keys = Keys::generate();
 
@@ -253,9 +255,7 @@ mod tests {
             .expect("Bob should process self-update commit");
 
         // Now deliver the held-back epoch-1 message to Bob (group is at epoch 2)
-        bob_mdk
-            .process_message(&past_epoch_msg)
-            .expect("process_message should not return Err")
+        bob_mdk.process_message(&past_epoch_msg)
     }
 
     /// Regression test: past-epoch application messages fail when max_past_epochs = 0.
@@ -282,19 +282,23 @@ mod tests {
         let result = past_epoch_delivery_result(config);
 
         match result {
-            crate::messages::MessageProcessingResult::ApplicationMessage(_) => {
+            Ok(crate::messages::MessageProcessingResult::ApplicationMessage(_)) => {
                 panic!(
                     "Expected Unprocessable when max_past_epochs = 0, but the message \
                      decrypted successfully. OpenMLS may be retaining secrets despite \
                      max_past_epochs = 0."
                 );
             }
-            crate::messages::MessageProcessingResult::Unprocessable { .. } => {
+            Ok(crate::messages::MessageProcessingResult::Unprocessable { .. }) => {
                 // Expected: OpenMLS had no past epoch secrets, message permanently Failed.
+            }
+            Err(crate::error::Error::Message(_)) => {
+                // Also expected: decryption may fail before dispatch when no past
+                // exporter secret is retained for the delayed epoch.
             }
             other => {
                 panic!(
-                    "Unexpected result variant (expected Unprocessable): {:?}",
+                    "Unexpected result (expected Unprocessable or decryption failure): {:?}",
                     other
                 );
             }
@@ -316,17 +320,23 @@ mod tests {
         let result = past_epoch_delivery_result(config);
 
         match result {
-            crate::messages::MessageProcessingResult::ApplicationMessage(msg) => {
+            Ok(crate::messages::MessageProcessingResult::ApplicationMessage(msg)) => {
                 // Success: the epoch-1 message was decrypted despite the group being at epoch 2.
                 assert_eq!(
                     msg.content, "message from the past epoch",
                     "Decrypted content should match what Alice sent"
                 );
             }
-            crate::messages::MessageProcessingResult::Unprocessable { .. } => {
+            Ok(crate::messages::MessageProcessingResult::Unprocessable { .. }) => {
                 panic!(
                     "Expected ApplicationMessage with max_past_epochs = 5, but got Unprocessable. \
                      The fix (wiring max_past_epochs into OpenMLS group config) is not working."
+                );
+            }
+            Err(e) => {
+                panic!(
+                    "Expected ApplicationMessage with max_past_epochs = 5, but got error: {:?}",
+                    e
                 );
             }
             other => {
