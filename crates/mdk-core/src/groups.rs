@@ -13,18 +13,11 @@
 
 use std::collections::BTreeSet;
 
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD as BASE64;
-use chacha20poly1305::{
-    ChaCha20Poly1305, Nonce,
-    aead::{Aead, KeyInit},
-};
 use mdk_storage_traits::GroupId;
 use mdk_storage_traits::MdkStorageProvider;
 use mdk_storage_traits::groups::types as group_types;
 use mdk_storage_traits::messages::types as message_types;
 use nostr::prelude::*;
-use nostr::secp256k1::rand::{RngCore, rngs::OsRng};
 use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
 use tls_codec::Serialize as TlsSerialize;
@@ -34,6 +27,7 @@ use sha2::{Digest, Sha256};
 use super::MDK;
 use super::extension::NostrGroupDataExtension;
 use crate::error::Error;
+use crate::messages::crypto::encrypt_message_with_exporter_secret;
 use crate::util::{ContentEncoding, encode_content};
 
 /// Result of creating a new MLS group
@@ -1704,29 +1698,7 @@ where
 
         // Derive the encryption key via MLS exporter (stable per epoch)
         let secret: group_types::GroupExporterSecret = self.exporter_secret(group_id)?;
-
-        let cipher = ChaCha20Poly1305::new_from_slice(secret.secret.as_ref()).map_err(|_| {
-            Error::Message("Failed to create cipher from exporter secret".to_string())
-        })?;
-
-        // Generate a cryptographically secure random 12-byte nonce.
-        // Per MIP-03, nonce uniqueness within an epoch is critical. OsRng uses the OS CSPRNG
-        // and will abort (panic) if the RNG is unavailable — satisfying the spec requirement
-        // that RNG failure MUST abort encryption rather than fall back to a weak source.
-        let mut nonce_bytes = [0u8; 12];
-        OsRng.fill_bytes(&mut nonce_bytes);
-        let nonce = Nonce::from_slice(&nonce_bytes);
-
-        // Encrypt with ChaCha20-Poly1305 (no AAD per MIP-03); ciphertext includes the Poly1305 authentication tag
-        let ciphertext = cipher
-            .encrypt(nonce, serialized_content.as_slice())
-            .map_err(|_| Error::Message("ChaCha20-Poly1305 encryption failed".to_string()))?;
-
-        // Content format: base64(nonce || ciphertext)
-        let mut combined = Vec::with_capacity(12 + ciphertext.len());
-        combined.extend_from_slice(&nonce_bytes);
-        combined.extend_from_slice(&ciphertext);
-        let encrypted_content = BASE64.encode(&combined);
+        let encrypted_content = encrypt_message_with_exporter_secret(&secret, &serialized_content)?;
 
         // Generate ephemeral key for signing (MUST NOT be reused across events)
         let ephemeral_nostr_keys: Keys = Keys::generate();

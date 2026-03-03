@@ -7,8 +7,9 @@ use mdk_storage_traits::{GroupId, MdkStorageProvider};
 use nostr::Event;
 use openmls::prelude::MlsGroup;
 
+use crate::MDK;
 use crate::error::Error;
-use crate::{MDK, util};
+use crate::messages::crypto::decrypt_message_with_exporter_secret;
 
 use super::{DEFAULT_EPOCH_LOOKBACK, Result};
 
@@ -110,7 +111,7 @@ where
             match self.storage().get_group_exporter_secret(&group_id, epoch) {
                 Ok(Some(secret)) => {
                     // Try to decrypt with this epoch's secret
-                    match util::decrypt_with_exporter_secret(&secret, encrypted_content) {
+                    match decrypt_message_with_exporter_secret(&secret, encrypted_content) {
                         Ok(decrypted_bytes) => {
                             tracing::debug!(
                                 target: "mdk_core::messages::try_decrypt_with_past_epochs",
@@ -161,7 +162,7 @@ where
         let secret = self.exporter_secret(&mls_group.group_id().into())?;
 
         // Try to decrypt it for the current epoch
-        match util::decrypt_with_exporter_secret(&secret, encrypted_content) {
+        match decrypt_message_with_exporter_secret(&secret, encrypted_content) {
             Ok(decrypted_bytes) => {
                 tracing::debug!("Successfully decrypted message with current exporter secret");
                 Ok(decrypted_bytes)

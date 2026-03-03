@@ -9,12 +9,13 @@
 //!
 //! Messages in MDK are wrapped in Nostr events (kind:445) for relay transmission.
 //! The message content is encrypted using both MLS group keys (MLS layer) and
-//! ChaCha20-Poly1305 (outer layer per MIP-03), with the Nostr group ID used as AAD.
+//! ChaCha20-Poly1305 (outer layer per MIP-03, no AAD).
 //! Message state is tracked to handle processing status and failure scenarios.
 
 mod application;
 mod commit;
 mod create;
+pub(crate) mod crypto;
 mod decryption;
 mod error_handling;
 mod process;
