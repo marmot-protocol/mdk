@@ -793,7 +793,7 @@ jobs:
         cp ffi-native-all/ffi-native-ubuntu-latest/mdk.h cbindings-package/include/
         cp ffi-native-all/ffi-native-ubuntu-latest/libmdk.so cbindings-package/lib/linux-x86_64/
         cp ffi-native-all/ffi-native-macos-latest/libmdk.dylib cbindings-package/lib/macos-aarch64/
-        cp ffi-native-all/ffi-native-macos-13/libmdk.dylib cbindings-package/lib/macos-x86_64/
+        cp ffi-native-all/ffi-native-macos-15-intel/libmdk.dylib cbindings-package/lib/macos-x86_64/
         cp ffi-native-all/ffi-native-windows-latest/mdk.dll cbindings-package/lib/windows-x86_64/
 
         cp crates/mdk-cbindings/CHANGELOG.md cbindings-package/ 2>/dev/null || true
@@ -895,7 +895,7 @@ jobs:
         cp ffi-native-all/ffi-native-ubuntu-latest/mdk.h zig-package/include/
         cp ffi-native-all/ffi-native-ubuntu-latest/libmdk.so zig-package/lib/linux-x86_64/
         cp ffi-native-all/ffi-native-macos-latest/libmdk.dylib zig-package/lib/macos-aarch64/
-        cp ffi-native-all/ffi-native-macos-13/libmdk.dylib zig-package/lib/macos-x86_64/
+        cp ffi-native-all/ffi-native-macos-15-intel/libmdk.dylib zig-package/lib/macos-x86_64/
         cp ffi-native-all/ffi-native-windows-latest/mdk.dll zig-package/lib/windows-x86_64/
 
         echo "${{ steps.cargo_version.outputs.version }}" > zig-package/VERSION
@@ -993,7 +993,7 @@ jobs:
         cp ffi-native-all/ffi-native-ubuntu-latest/mdk.h js-package/include/
         cp ffi-native-all/ffi-native-ubuntu-latest/libmdk.so js-package/native/linux-x86_64/
         cp ffi-native-all/ffi-native-macos-latest/libmdk.dylib js-package/native/macos-aarch64/
-        cp ffi-native-all/ffi-native-macos-13/libmdk.dylib js-package/native/macos-x86_64/
+        cp ffi-native-all/ffi-native-macos-15-intel/libmdk.dylib js-package/native/macos-x86_64/
         cp ffi-native-all/ffi-native-windows-latest/mdk.dll js-package/native/windows-x86_64/
 
         echo "${{ steps.cargo_version.outputs.version }}" > js-package/VERSION
