@@ -1705,8 +1705,6 @@ where
         // Per MIP-03, nonce uniqueness within an epoch is critical. OsRng uses the OS CSPRNG
         // and will abort (panic) if the RNG is unavailable — satisfying the spec requirement
         // that RNG failure MUST abort encryption rather than fall back to a weak source.
-        // Nonce collision probability with a 96-bit random nonce over typical group message
-        // volumes is negligible (~2^-48 per message pair within an epoch).
         let mut nonce_bytes = [0u8; 12];
         OsRng.fill_bytes(&mut nonce_bytes);
         let nonce = Nonce::from_slice(&nonce_bytes);

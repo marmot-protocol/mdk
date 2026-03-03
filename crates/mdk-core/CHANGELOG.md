@@ -30,7 +30,7 @@
 
 ### Changed
 
-- **MIP-03**: kind:445 message events now use ChaCha20-Poly1305 AEAD directly instead of NIP-44. The raw 32-byte `nostr_group_id` is used as AAD, binding each ciphertext to its group and preventing cross-group replay. Nonces are 12 cryptographically random bytes generated via `OsRng`; RNG failure aborts encryption with no fallback. ([#208](https://github.com/marmot-protocol/mdk/pull/208))
+- **MIP-03**: kind:445 message events now use ChaCha20-Poly1305 AEAD directly instead of NIP-44. Encryption uses `base64(nonce || ciphertext)` with no AAD, and nonces are 12 cryptographically random bytes generated via `OsRng`; RNG failure aborts encryption with no fallback. ([#208](https://github.com/marmot-protocol/mdk/pull/208))
 - **MIP-04**: `mip04_exporter_secret()` now derives a separate secret via `MLS-Exporter("marmot", "encrypted-media", 32)` instead of reusing the MIP-03 `group-event` exporter. MIP-04 exporter secrets are stored separately at each epoch advance to support media decryption epoch lookback. ([#208](https://github.com/marmot-protocol/mdk/pull/208))
 - Removed NIP-44 dependency from `mdk-core`; added `base64 = "0.22"` as a direct workspace dependency for `base64(nonce || ciphertext)` encoding. ([#208](https://github.com/marmot-protocol/mdk/pull/208))
 - Bumped `openmls_rust_crypto` from `0.5.0` to `0.5.1` (see also the `openmls` 0.8.1 bump in [#204](https://github.com/marmot-protocol/mdk/pull/204)). ([#207](https://github.com/marmot-protocol/mdk/pull/207))

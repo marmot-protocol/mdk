@@ -3557,6 +3557,77 @@ mod tests {
         }
 
         #[test]
+        fn test_snapshot_rollback_legacy_unlabeled_exporter_secret_row_key_regression() {
+            let storage = MdkSqliteStorage::new_in_memory().unwrap();
+
+            let group = create_test_group(34);
+            let group_id = group.mls_group_id.clone();
+            storage.save_group(group).unwrap();
+
+            let initial_group_event = GroupExporterSecret {
+                mls_group_id: group_id.clone(),
+                epoch: 7,
+                secret: Secret::new([55u8; 32]),
+            };
+            storage
+                .save_group_exporter_secret(initial_group_event.clone())
+                .unwrap();
+
+            storage
+                .create_group_snapshot(&group_id, "snap_legacy_unlabeled_key")
+                .unwrap();
+
+            // Rewrite snapshot row_key into legacy 2-tuple format: (mls_group_id, epoch)
+            // so rollback exercises the fallback parser branch that defaults label to
+            // "group-event".
+            let legacy_row_key =
+                serde_json::to_vec(&(group_id.as_slice().to_vec(), 7_i64)).unwrap();
+            storage
+                .with_connection(|conn| {
+                    conn.execute(
+                        "UPDATE group_state_snapshots SET row_key = ? WHERE snapshot_name = ? AND group_id = ? AND table_name = 'group_exporter_secrets'",
+                        rusqlite::params![
+                            legacy_row_key,
+                            "snap_legacy_unlabeled_key",
+                            group_id.as_slice()
+                        ],
+                    )
+                    .map_err(|e| Error::Database(e.to_string()))?;
+                    Ok::<(), Error>(())
+                })
+                .unwrap();
+
+            // Mutate current state so rollback has to restore from the snapshot.
+            storage
+                .save_group_exporter_secret(GroupExporterSecret {
+                    mls_group_id: group_id.clone(),
+                    epoch: 7,
+                    secret: Secret::new([99u8; 32]),
+                })
+                .unwrap();
+
+            storage
+                .rollback_group_to_snapshot(&group_id, "snap_legacy_unlabeled_key")
+                .unwrap();
+
+            let restored_group_event = storage
+                .get_group_exporter_secret(&group_id, 7)
+                .unwrap()
+                .unwrap();
+            assert_eq!(restored_group_event.mls_group_id, group_id);
+            assert_eq!(restored_group_event.epoch, 7);
+            assert_eq!(restored_group_event, initial_group_event);
+
+            let restored_mip04 = storage
+                .get_group_mip04_exporter_secret(&group_id, 7)
+                .unwrap();
+            assert!(
+                restored_mip04.is_none(),
+                "Legacy unlabeled row_key should restore as label='group-event', not MIP-04"
+            );
+        }
+
+        #[test]
         fn test_snapshot_isolation_between_groups() {
             let storage = MdkSqliteStorage::new_in_memory().unwrap();
 

@@ -212,6 +212,27 @@ where
 
     assert_eq!(got_group_event_after, group_event);
     assert_eq!(got_mip04_after, updated_mip04);
+
+    let updated_group_event = GroupExporterSecret {
+        mls_group_id: mls_group_id.clone(),
+        epoch,
+        secret: mdk_storage_traits::Secret::new([0x44u8; 32]),
+    };
+    storage
+        .save_group_exporter_secret(updated_group_event.clone())
+        .unwrap();
+
+    let got_group_event_final = storage
+        .get_group_exporter_secret(&mls_group_id, epoch)
+        .unwrap()
+        .unwrap();
+    let got_mip04_final = storage
+        .get_group_mip04_exporter_secret(&mls_group_id, epoch)
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(got_group_event_final, updated_group_event);
+    assert_eq!(got_mip04_final, updated_mip04);
 }
 
 /// Test basic group relay functionality (not the comprehensive replace tests)
