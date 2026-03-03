@@ -116,6 +116,186 @@ where
     assert!(result.is_none());
 }
 
+/// Test MIP-04 exporter secret functionality
+pub fn test_group_mip04_exporter_secret<S>(storage: S)
+where
+    S: GroupStorage,
+{
+    let mls_group_id = GroupId::from_slice(&[1, 2, 3, 70]);
+    let group = create_test_group(mls_group_id.clone());
+    storage.save_group(group).unwrap();
+
+    let epoch = 77u64;
+    let secret = [0x77u8; 32];
+    let exporter_secret = GroupExporterSecret {
+        mls_group_id: mls_group_id.clone(),
+        epoch,
+        secret: mdk_storage_traits::Secret::new(secret),
+    };
+
+    storage
+        .save_group_mip04_exporter_secret(exporter_secret.clone())
+        .unwrap();
+
+    let retrieved = storage
+        .get_group_mip04_exporter_secret(&mls_group_id, epoch)
+        .unwrap();
+    assert!(retrieved.is_some());
+    let retrieved = retrieved.unwrap();
+    assert_eq!(retrieved.mls_group_id, mls_group_id);
+    assert_eq!(retrieved.epoch, epoch);
+    assert_eq!(*retrieved.secret, secret);
+
+    let result = storage
+        .get_group_mip04_exporter_secret(&mls_group_id, 999)
+        .unwrap();
+    assert!(result.is_none());
+}
+
+/// Test MIP-03 and MIP-04 exporter secret label isolation at the same epoch
+pub fn test_exporter_secret_label_isolation<S>(storage: S)
+where
+    S: GroupStorage,
+{
+    let mls_group_id = GroupId::from_slice(&[1, 2, 3, 71]);
+    let group = create_test_group(mls_group_id.clone());
+    storage.save_group(group).unwrap();
+
+    let epoch = 5u64;
+    let group_event = GroupExporterSecret {
+        mls_group_id: mls_group_id.clone(),
+        epoch,
+        secret: mdk_storage_traits::Secret::new([0x11u8; 32]),
+    };
+    let mip04 = GroupExporterSecret {
+        mls_group_id: mls_group_id.clone(),
+        epoch,
+        secret: mdk_storage_traits::Secret::new([0x22u8; 32]),
+    };
+
+    storage
+        .save_group_exporter_secret(group_event.clone())
+        .unwrap();
+    storage
+        .save_group_mip04_exporter_secret(mip04.clone())
+        .unwrap();
+
+    let got_group_event = storage
+        .get_group_exporter_secret(&mls_group_id, epoch)
+        .unwrap()
+        .unwrap();
+    let got_mip04 = storage
+        .get_group_mip04_exporter_secret(&mls_group_id, epoch)
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(got_group_event, group_event);
+    assert_eq!(got_mip04, mip04);
+
+    let updated_mip04 = GroupExporterSecret {
+        mls_group_id: mls_group_id.clone(),
+        epoch,
+        secret: mdk_storage_traits::Secret::new([0x33u8; 32]),
+    };
+    storage
+        .save_group_mip04_exporter_secret(updated_mip04.clone())
+        .unwrap();
+
+    let got_group_event_after = storage
+        .get_group_exporter_secret(&mls_group_id, epoch)
+        .unwrap()
+        .unwrap();
+    let got_mip04_after = storage
+        .get_group_mip04_exporter_secret(&mls_group_id, epoch)
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(got_group_event_after, group_event);
+    assert_eq!(got_mip04_after, updated_mip04);
+
+    let updated_group_event = GroupExporterSecret {
+        mls_group_id: mls_group_id.clone(),
+        epoch,
+        secret: mdk_storage_traits::Secret::new([0x44u8; 32]),
+    };
+    storage
+        .save_group_exporter_secret(updated_group_event.clone())
+        .unwrap();
+
+    let got_group_event_final = storage
+        .get_group_exporter_secret(&mls_group_id, epoch)
+        .unwrap()
+        .unwrap();
+    let got_mip04_final = storage
+        .get_group_mip04_exporter_secret(&mls_group_id, epoch)
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(got_group_event_final, updated_group_event);
+    assert_eq!(got_mip04_final, updated_mip04);
+}
+
+pub fn test_exporter_secret_pruning_by_epoch<S>(storage: S)
+where
+    S: GroupStorage,
+{
+    let mls_group_id = GroupId::from_slice(&[1, 2, 3, 72]);
+    let group = create_test_group(mls_group_id.clone());
+    storage.save_group(group).unwrap();
+
+    for epoch in 0..=4_u64 {
+        storage
+            .save_group_exporter_secret(GroupExporterSecret {
+                mls_group_id: mls_group_id.clone(),
+                epoch,
+                secret: mdk_storage_traits::Secret::new([epoch as u8; 32]),
+            })
+            .unwrap();
+
+        storage
+            .save_group_mip04_exporter_secret(GroupExporterSecret {
+                mls_group_id: mls_group_id.clone(),
+                epoch,
+                secret: mdk_storage_traits::Secret::new([(epoch as u8) + 10; 32]),
+            })
+            .unwrap();
+    }
+
+    storage
+        .prune_group_exporter_secrets_before_epoch(&mls_group_id, 3)
+        .unwrap();
+
+    for epoch in 0..=2_u64 {
+        assert!(
+            storage
+                .get_group_exporter_secret(&mls_group_id, epoch)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            storage
+                .get_group_mip04_exporter_secret(&mls_group_id, epoch)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    for epoch in 3..=4_u64 {
+        assert!(
+            storage
+                .get_group_exporter_secret(&mls_group_id, epoch)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            storage
+                .get_group_mip04_exporter_secret(&mls_group_id, epoch)
+                .unwrap()
+                .is_some()
+        );
+    }
+}
+
 /// Test basic group relay functionality (not the comprehensive replace tests)
 pub fn test_basic_group_relays<S>(storage: S)
 where

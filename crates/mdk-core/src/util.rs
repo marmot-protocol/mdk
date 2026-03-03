@@ -1,11 +1,6 @@
-use mdk_storage_traits::groups::types::GroupExporterSecret;
-use nostr::base64::Engine;
-use nostr::base64::engine::general_purpose::STANDARD as BASE64;
-use nostr::nips::nip44;
-use nostr::{Keys, SecretKey};
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use openmls::prelude::{Ciphersuite, ExtensionType};
-
-use crate::Error;
 
 /// Trait for formatting MLS types as Nostr tag values
 ///
@@ -27,24 +22,6 @@ impl NostrTagFormat for ExtensionType {
     fn to_nostr_tag(&self) -> String {
         format!("0x{:04x}", u16::from(*self))
     }
-}
-
-pub(crate) fn decrypt_with_exporter_secret(
-    secret: &GroupExporterSecret,
-    encrypted_content: &str,
-) -> Result<Vec<u8>, Error> {
-    // Convert that secret to nostr keys
-    let secret_key: SecretKey = SecretKey::from_slice(secret.secret.as_ref())?;
-    let export_nostr_keys = Keys::new(secret_key);
-
-    // Decrypt message
-    let message_bytes: Vec<u8> = nip44::decrypt_to_bytes(
-        export_nostr_keys.secret_key(),
-        &export_nostr_keys.public_key,
-        encrypted_content,
-    )?;
-
-    Ok(message_bytes)
 }
 
 /// Encoding format for content fields
@@ -101,15 +78,6 @@ impl ContentEncoding {
 }
 
 /// Encodes content using base64 encoding
-///
-/// # Arguments
-///
-/// * `bytes` - The bytes to encode
-/// * `encoding` - The encoding format (must be Base64)
-///
-/// # Returns
-///
-/// The base64-encoded string
 pub(crate) fn encode_content(bytes: &[u8], encoding: ContentEncoding) -> String {
     match encoding {
         ContentEncoding::Base64 => BASE64.encode(bytes),
@@ -117,44 +85,29 @@ pub(crate) fn encode_content(bytes: &[u8], encoding: ContentEncoding) -> String 
 }
 
 /// Decodes content using base64 encoding
-///
-/// The encoding format must be determined from the `["encoding", "base64"]` tag on the event.
-///
-/// Per MIP-00/MIP-02, the encoding tag is required. Callers must extract the encoding
-/// using `ContentEncoding::from_tags()` and handle the None case by rejecting the event.
-///
-/// # Arguments
-///
-/// * `content` - The base64-encoded string
-/// * `encoding` - The encoding format (must be Base64)
-/// * `label` - A label for the content type (e.g., "key package", "welcome") used in error messages
-///
-/// # Returns
-///
-/// A tuple of (decoded bytes, format description) on success, or an error message string.
 pub(crate) fn decode_content(
     content: &str,
     encoding: ContentEncoding,
-    label: &str,
+    _label: &str,
 ) -> Result<(Vec<u8>, &'static str), String> {
     match encoding {
         ContentEncoding::Base64 => BASE64
             .decode(content)
             .map(|bytes| (bytes, "base64"))
-            .map_err(|e| format!("Failed to decode {} as base64: {}", label, e)),
+            .map_err(|e| format!("Failed to decode input as base64: {}", e)),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use nostr::Tag;
+
+    use super::*;
 
     #[test]
     fn test_encode_decode_roundtrip() {
         let original = vec![0xde, 0xad, 0xbe, 0xef];
 
-        // Base64 roundtrip
         let b64_encoded = encode_content(&original, ContentEncoding::Base64);
         let (b64_decoded, b64_fmt) =
             decode_content(&b64_encoded, ContentEncoding::Base64, "test").unwrap();

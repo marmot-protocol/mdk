@@ -19,7 +19,7 @@ debug-examples = []
 
 [dependencies]
 hex = { workspace = true, features = ["std"] }
-nostr = { workspace = true, features = ["std", "nip44"] }
+nostr = { workspace = true, features = ["std"] }
 mdk-storage-traits.workspace = true
 openmls.workspace = true
 openmls_basic_credential.workspace = true
@@ -30,7 +30,8 @@ tls_codec.workspace = true
 tracing = { workspace = true, features = ["std"] }
 thiserror.workspace = true
 
-# Crypto dependencies for MIP-01 (group image encryption) - mandatory
+# Crypto dependencies for MIP-01 (group image encryption) and MIP-03 message encryption - mandatory
+base64.workspace = true
 chacha20poly1305.workspace = true
 hkdf.workspace = true
 sha2.workspace = true

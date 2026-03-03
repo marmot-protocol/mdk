@@ -540,8 +540,8 @@ mod tests {
     use super::*;
     use crate::test_util::*;
     use crate::tests::create_test_mdk;
-    use nostr::base64::Engine;
-    use nostr::base64::engine::general_purpose::STANDARD as BASE64;
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD as BASE64;
     use nostr::{Keys, Kind, TagKind};
 
     /// Test that Welcome event structure matches Marmot spec (MIP-02)

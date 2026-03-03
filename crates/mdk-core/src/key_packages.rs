@@ -699,10 +699,10 @@ where
 
 #[cfg(test)]
 mod tests {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD as BASE64;
     use nostr::EventBuilder;
     use nostr::Keys;
-    use nostr::base64::Engine;
-    use nostr::base64::engine::general_purpose::STANDARD as BASE64;
 
     use super::*;
     use crate::constant::DEFAULT_CIPHERSUITE;

@@ -824,7 +824,7 @@ impl MdkSqliteStorage {
     ) -> Result<(), Error> {
         let mut stmt = conn
             .prepare(
-                "SELECT mls_group_id, epoch, secret FROM group_exporter_secrets WHERE mls_group_id = ?",
+                "SELECT mls_group_id, epoch, label, secret FROM group_exporter_secrets WHERE mls_group_id = ?",
             )
             .map_err(|e| Error::Database(e.to_string()))?;
         let mut rows = stmt
@@ -834,8 +834,9 @@ impl MdkSqliteStorage {
         while let Some(row) = rows.next().map_err(|e| Error::Database(e.to_string()))? {
             let mls_group_id: Vec<u8> = row.get(0).map_err(|e| Error::Database(e.to_string()))?;
             let epoch: i64 = row.get(1).map_err(|e| Error::Database(e.to_string()))?;
-            let secret: Vec<u8> = row.get(2).map_err(|e| Error::Database(e.to_string()))?;
-            let row_key = serde_json::to_vec(&(&mls_group_id, epoch))
+            let label: String = row.get(2).map_err(|e| Error::Database(e.to_string()))?;
+            let secret: Vec<u8> = row.get(3).map_err(|e| Error::Database(e.to_string()))?;
+            let row_key = serde_json::to_vec(&(&mls_group_id, epoch, &label))
                 .map_err(|e| Error::Database(e.to_string()))?;
             insert_stmt
                 .execute(rusqlite::params![
@@ -1105,11 +1106,19 @@ impl MdkSqliteStorage {
                         .map_err(|e| Error::Database(e.to_string()))?;
                     }
                     "group_exporter_secrets" => {
-                        let (mls_group_id, epoch): (Vec<u8>, i64) = serde_json::from_slice(row_key)
-                            .map_err(|e| Error::Database(e.to_string()))?;
+                        let (mls_group_id, epoch, label): (Vec<u8>, i64, String) =
+                            match serde_json::from_slice(row_key) {
+                                Ok(v) => v,
+                                Err(_) => {
+                                    let (mls_group_id, epoch): (Vec<u8>, i64) =
+                                        serde_json::from_slice(row_key)
+                                            .map_err(|e| Error::Database(e.to_string()))?;
+                                    (mls_group_id, epoch, "group-event".to_string())
+                                }
+                            };
                         conn.execute(
-                            "INSERT INTO group_exporter_secrets (mls_group_id, epoch, secret) VALUES (?, ?, ?)",
-                            rusqlite::params![mls_group_id, epoch, row_data],
+                            "INSERT INTO group_exporter_secrets (mls_group_id, epoch, label, secret) VALUES (?, ?, ?, ?)",
+                            rusqlite::params![mls_group_id, epoch, label, row_data],
                         )
                         .map_err(|e| Error::Database(e.to_string()))?;
                     }
@@ -2003,6 +2012,26 @@ mod tests {
             assert!(table_names.contains(&"openmls_signature_keys".to_string()));
             assert!(table_names.contains(&"openmls_encryption_keys".to_string()));
             assert!(table_names.contains(&"openmls_epoch_key_pairs".to_string()));
+
+            // Ensure migration V005 rebuilt PK to include label
+            let mut pk_stmt = conn
+                .prepare("PRAGMA table_info(group_exporter_secrets)")
+                .unwrap();
+            let pk_columns: Vec<(String, i64)> = pk_stmt
+                .query_map([], |row| Ok((row.get(1)?, row.get(5)?)))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .filter(|(_, pk_pos)| *pk_pos > 0)
+                .collect();
+
+            assert_eq!(
+                pk_columns,
+                vec![
+                    ("mls_group_id".to_string(), 1),
+                    ("epoch".to_string(), 2),
+                    ("label".to_string(), 3),
+                ]
+            );
         });
 
         // Drop explicitly to release all resources
@@ -2050,12 +2079,21 @@ mod tests {
             secret: Secret::new([0u8; 32]),
         };
 
+        let mip04_secret_epoch_1 = GroupExporterSecret {
+            mls_group_id: mls_group_id.clone(),
+            epoch: 1,
+            secret: Secret::new([7u8; 32]),
+        };
+
         // Save the exporter secrets
         storage
             .save_group_exporter_secret(secret_epoch_0.clone())
             .unwrap();
         storage
             .save_group_exporter_secret(secret_epoch_1.clone())
+            .unwrap();
+        storage
+            .save_group_mip04_exporter_secret(mip04_secret_epoch_1.clone())
             .unwrap();
 
         // Test retrieving exporter secrets
@@ -2068,6 +2106,13 @@ mod tests {
         assert!(retrieved_secret_1.is_some());
         let retrieved_secret_1 = retrieved_secret_1.unwrap();
         assert_eq!(retrieved_secret_1, secret_epoch_1);
+
+        let retrieved_mip04_secret_1 = storage
+            .get_group_mip04_exporter_secret(&mls_group_id, 1)
+            .unwrap();
+        assert!(retrieved_mip04_secret_1.is_some());
+        let retrieved_mip04_secret_1 = retrieved_mip04_secret_1.unwrap();
+        assert_eq!(retrieved_mip04_secret_1, mip04_secret_epoch_1);
 
         // Test non-existent epoch
         let non_existent_epoch = storage
@@ -2095,6 +2140,26 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(retrieved_updated_secret, updated_secret_0);
+
+        // Updating one label must not overwrite the other label at same epoch
+        let updated_mip04_secret_1 = GroupExporterSecret {
+            mls_group_id: mls_group_id.clone(),
+            epoch: 1,
+            secret: Secret::new([9u8; 32]),
+        };
+        storage
+            .save_group_mip04_exporter_secret(updated_mip04_secret_1.clone())
+            .unwrap();
+        let still_group_event_1 = storage
+            .get_group_exporter_secret(&mls_group_id, 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(still_group_event_1, secret_epoch_1);
+        let now_mip04_1 = storage
+            .get_group_mip04_exporter_secret(&mls_group_id, 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(now_mip04_1, updated_mip04_secret_1);
 
         // Test trying to save a secret for a non-existent group
         let invalid_secret = GroupExporterSecret {
@@ -3424,6 +3489,142 @@ mod tests {
             // Epoch 0 secret should still exist
             let epoch_0 = storage.get_group_exporter_secret(&group_id, 0).unwrap();
             assert!(epoch_0.is_some());
+        }
+
+        #[test]
+        fn test_snapshot_rollback_preserves_exporter_secret_labels() {
+            let storage = MdkSqliteStorage::new_in_memory().unwrap();
+
+            let group = create_test_group(33);
+            let group_id = group.mls_group_id.clone();
+            storage.save_group(group).unwrap();
+
+            let initial_group_event = GroupExporterSecret {
+                mls_group_id: group_id.clone(),
+                epoch: 0,
+                secret: Secret::new([10u8; 32]),
+            };
+            let initial_mip04 = GroupExporterSecret {
+                mls_group_id: group_id.clone(),
+                epoch: 0,
+                secret: Secret::new([20u8; 32]),
+            };
+
+            storage
+                .save_group_exporter_secret(initial_group_event.clone())
+                .unwrap();
+            storage
+                .save_group_mip04_exporter_secret(initial_mip04.clone())
+                .unwrap();
+
+            storage
+                .create_group_snapshot(&group_id, "snap_labels")
+                .unwrap();
+
+            let mutated_group_event = GroupExporterSecret {
+                mls_group_id: group_id.clone(),
+                epoch: 0,
+                secret: Secret::new([30u8; 32]),
+            };
+            let mutated_mip04 = GroupExporterSecret {
+                mls_group_id: group_id.clone(),
+                epoch: 0,
+                secret: Secret::new([40u8; 32]),
+            };
+
+            storage
+                .save_group_exporter_secret(mutated_group_event)
+                .unwrap();
+            storage
+                .save_group_mip04_exporter_secret(mutated_mip04)
+                .unwrap();
+
+            storage
+                .rollback_group_to_snapshot(&group_id, "snap_labels")
+                .unwrap();
+
+            let restored_group_event = storage
+                .get_group_exporter_secret(&group_id, 0)
+                .unwrap()
+                .unwrap();
+            let restored_mip04 = storage
+                .get_group_mip04_exporter_secret(&group_id, 0)
+                .unwrap()
+                .unwrap();
+
+            assert_eq!(restored_group_event, initial_group_event);
+            assert_eq!(restored_mip04, initial_mip04);
+        }
+
+        #[test]
+        fn test_snapshot_rollback_legacy_unlabeled_exporter_secret_row_key_regression() {
+            let storage = MdkSqliteStorage::new_in_memory().unwrap();
+
+            let group = create_test_group(34);
+            let group_id = group.mls_group_id.clone();
+            storage.save_group(group).unwrap();
+
+            let initial_group_event = GroupExporterSecret {
+                mls_group_id: group_id.clone(),
+                epoch: 7,
+                secret: Secret::new([55u8; 32]),
+            };
+            storage
+                .save_group_exporter_secret(initial_group_event.clone())
+                .unwrap();
+
+            storage
+                .create_group_snapshot(&group_id, "snap_legacy_unlabeled_key")
+                .unwrap();
+
+            // Rewrite snapshot row_key into legacy 2-tuple format: (mls_group_id, epoch)
+            // so rollback exercises the fallback parser branch that defaults label to
+            // "group-event".
+            let legacy_row_key =
+                serde_json::to_vec(&(group_id.as_slice().to_vec(), 7_i64)).unwrap();
+            storage
+                .with_connection(|conn| {
+                    conn.execute(
+                        "UPDATE group_state_snapshots SET row_key = ? WHERE snapshot_name = ? AND group_id = ? AND table_name = 'group_exporter_secrets'",
+                        rusqlite::params![
+                            legacy_row_key,
+                            "snap_legacy_unlabeled_key",
+                            group_id.as_slice()
+                        ],
+                    )
+                    .map_err(|e| Error::Database(e.to_string()))?;
+                    Ok::<(), Error>(())
+                })
+                .unwrap();
+
+            // Mutate current state so rollback has to restore from the snapshot.
+            storage
+                .save_group_exporter_secret(GroupExporterSecret {
+                    mls_group_id: group_id.clone(),
+                    epoch: 7,
+                    secret: Secret::new([99u8; 32]),
+                })
+                .unwrap();
+
+            storage
+                .rollback_group_to_snapshot(&group_id, "snap_legacy_unlabeled_key")
+                .unwrap();
+
+            let restored_group_event = storage
+                .get_group_exporter_secret(&group_id, 7)
+                .unwrap()
+                .unwrap();
+            assert_eq!(restored_group_event.mls_group_id, group_id);
+            assert_eq!(restored_group_event.epoch, 7);
+            assert_eq!(restored_group_event, initial_group_event);
+
+            let restored_mip04 = storage
+                .get_group_mip04_exporter_secret(&group_id, 7)
+                .unwrap();
+            assert!(
+                restored_mip04.is_none(),
+                "Legacy unlabeled row_key should restore as label='group-event', not MIP-04"
+            );
         }
 
         #[test]

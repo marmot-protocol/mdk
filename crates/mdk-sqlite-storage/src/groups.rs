@@ -351,7 +351,7 @@ impl GroupStorage for MdkSqliteStorage {
         self.with_connection(|conn| {
             let mut stmt = conn
                 .prepare(
-                    "SELECT * FROM group_exporter_secrets WHERE mls_group_id = ? AND epoch = ?",
+                    "SELECT * FROM group_exporter_secrets WHERE mls_group_id = ? AND epoch = ? AND label = 'group-event'",
                 )
                 .map_err(into_group_err)?;
 
@@ -377,8 +377,76 @@ impl GroupStorage for MdkSqliteStorage {
 
         self.with_connection(|conn| {
             conn.execute(
-                "INSERT OR REPLACE INTO group_exporter_secrets (mls_group_id, epoch, secret) VALUES (?, ?, ?)",
+                "INSERT OR REPLACE INTO group_exporter_secrets (mls_group_id, epoch, secret, label) VALUES (?, ?, ?, 'group-event')",
                 params![&group_exporter_secret.mls_group_id.as_slice(), &group_exporter_secret.epoch, group_exporter_secret.secret.as_ref()],
+            )
+            .map_err(into_group_err)?;
+
+            Ok(())
+        })
+    }
+
+    fn get_group_mip04_exporter_secret(
+        &self,
+        mls_group_id: &GroupId,
+        epoch: u64,
+    ) -> Result<Option<GroupExporterSecret>, GroupError> {
+        // First verify the group exists
+        if self.find_group_by_mls_group_id(mls_group_id)?.is_none() {
+            return Err(GroupError::InvalidParameters("Group not found".to_string()));
+        }
+
+        self.with_connection(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT * FROM group_exporter_secrets WHERE mls_group_id = ? AND epoch = ? AND label = 'encrypted-media'",
+                )
+                .map_err(into_group_err)?;
+
+            stmt.query_row(
+                params![mls_group_id.as_slice(), epoch],
+                db::row_to_group_exporter_secret,
+            )
+            .optional()
+            .map_err(into_group_err)
+        })
+    }
+
+    fn save_group_mip04_exporter_secret(
+        &self,
+        group_exporter_secret: GroupExporterSecret,
+    ) -> Result<(), GroupError> {
+        if self
+            .find_group_by_mls_group_id(&group_exporter_secret.mls_group_id)?
+            .is_none()
+        {
+            return Err(GroupError::InvalidParameters("Group not found".to_string()));
+        }
+
+        self.with_connection(|conn| {
+            conn.execute(
+                "INSERT OR REPLACE INTO group_exporter_secrets (mls_group_id, epoch, secret, label) VALUES (?, ?, ?, 'encrypted-media')",
+                params![&group_exporter_secret.mls_group_id.as_slice(), &group_exporter_secret.epoch, group_exporter_secret.secret.as_ref()],
+            )
+            .map_err(into_group_err)?;
+
+            Ok(())
+        })
+    }
+
+    fn prune_group_exporter_secrets_before_epoch(
+        &self,
+        group_id: &GroupId,
+        min_epoch_to_keep: u64,
+    ) -> Result<(), GroupError> {
+        if self.find_group_by_mls_group_id(group_id)?.is_none() {
+            return Err(GroupError::InvalidParameters("Group not found".to_string()));
+        }
+
+        self.with_connection(|conn| {
+            conn.execute(
+                "DELETE FROM group_exporter_secrets WHERE mls_group_id = ? AND epoch < ?",
+                params![group_id.as_slice(), min_epoch_to_keep],
             )
             .map_err(into_group_err)?;
 
