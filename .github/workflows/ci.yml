@@ -6,6 +6,10 @@ on:
   pull_request:
     branches: [ master ]
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
@@ -13,9 +17,40 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # ── Change Detection ────────────────────────────────────────────────
+  changes:
+    name: Detect Changed Paths
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      rust: ${{ steps.filter.outputs.rust }}
+      ci: ${{ steps.filter.outputs.ci }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Detect changes
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            rust:
+              - '**/*.rs'
+              - '**/Cargo.toml'
+              - 'Cargo.lock'
+              - 'rustfmt.toml'
+              - 'justfile'
+              - 'scripts/**'
+            ci:
+              - '.github/workflows/**'
+
+  # ── Quick checks that fail fast ─────────────────────────────────────
   format:
     runs-on: ubuntu-latest
     name: Format
+    needs: changes
+    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.ci == 'true'
 
     steps:
     - name: Checkout code
@@ -29,12 +64,15 @@ jobs:
     - name: Check formatting
       run: cargo fmt --all -- --check
 
+  # ── Clippy ──────────────────────────────────────────────────────────
+  # On PRs: stable only (3 feature combos)
+  # On master push: stable + MSRV (6 combos — full compatibility check)
   lint:
-    needs: format
+    needs: [format, changes]
     strategy:
       fail-fast: false
       matrix:
-        rust: ["1.90.0", "stable"]
+        rust: ${{ fromJson(github.event_name == 'push' && '["1.90.0", "stable"]' || '["stable"]') }}
         features:
           - name: "all-features"
             flags: "--all-features"
@@ -45,6 +83,7 @@ jobs:
 
     runs-on: ubuntu-latest
     name: Lint (${{ matrix.rust }}, ${{ matrix.features.name }})
+    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.ci == 'true'
 
     steps:
     - name: Checkout code
@@ -67,15 +106,19 @@ jobs:
     - name: Run clippy
       run: cargo +${{ matrix.rust }} clippy --all-targets ${{ matrix.features.flags }} --no-deps -- -D warnings
 
+  # ── Documentation ───────────────────────────────────────────────────
+  # On PRs: stable only
+  # On master push: stable + MSRV
   docs:
-    needs: format
+    needs: [format, changes]
     strategy:
       fail-fast: false
       matrix:
-        rust: ["1.90.0", "stable"]
+        rust: ${{ fromJson(github.event_name == 'push' && '["1.90.0", "stable"]' || '["stable"]') }}
 
     runs-on: ubuntu-latest
     name: Documentation (${{ matrix.rust }})
+    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.ci == 'true'
 
     steps:
     - name: Checkout code
@@ -98,3 +141,47 @@ jobs:
       run: cargo +${{ matrix.rust }} doc --all-features --no-deps --document-private-items
       env:
         RUSTDOCFLAGS: "-D warnings"
+
+  # ── Fast test lane ──────────────────────────────────────────────────
+  # Runs all 3 feature combos with cargo-nextest for parallel execution
+  test:
+    needs: [format, changes]
+    strategy:
+      fail-fast: false
+      matrix:
+        features:
+          - name: "all-features"
+            flags: "--all-features"
+          - name: "no-features"
+            flags: "--no-default-features"
+          - name: "mip04-only"
+            flags: "--no-default-features --features mip04"
+
+    runs-on: ubuntu-latest
+    name: Test (${{ matrix.features.name }})
+    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.ci == 'true'
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Rust (stable)
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Cache Rust dependencies
+      uses: Swatinem/rust-cache@v2
+      with:
+        key: test-${{ matrix.features.name }}
+
+    - name: Install cargo-nextest
+      uses: taiki-e/install-action@cargo-nextest
+
+    - name: Install system dependencies
+      run: sudo apt-get update && sudo apt-get install -y pkg-config
+
+    - name: Run tests
+      run: cargo nextest run --all-targets ${{ matrix.features.flags }}
+
+    - name: Doc tests
+      if: matrix.features.name == 'all-features'
+      run: cargo test --all-features --doc
