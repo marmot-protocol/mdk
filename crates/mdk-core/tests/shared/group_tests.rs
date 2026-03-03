@@ -235,6 +235,67 @@ where
     assert_eq!(got_mip04_final, updated_mip04);
 }
 
+pub fn test_exporter_secret_pruning_by_epoch<S>(storage: S)
+where
+    S: GroupStorage,
+{
+    let mls_group_id = GroupId::from_slice(&[1, 2, 3, 72]);
+    let group = create_test_group(mls_group_id.clone());
+    storage.save_group(group).unwrap();
+
+    for epoch in 0..=4_u64 {
+        storage
+            .save_group_exporter_secret(GroupExporterSecret {
+                mls_group_id: mls_group_id.clone(),
+                epoch,
+                secret: mdk_storage_traits::Secret::new([epoch as u8; 32]),
+            })
+            .unwrap();
+
+        storage
+            .save_group_mip04_exporter_secret(GroupExporterSecret {
+                mls_group_id: mls_group_id.clone(),
+                epoch,
+                secret: mdk_storage_traits::Secret::new([(epoch as u8) + 10; 32]),
+            })
+            .unwrap();
+    }
+
+    storage
+        .prune_group_exporter_secrets_before_epoch(&mls_group_id, 3)
+        .unwrap();
+
+    for epoch in 0..=2_u64 {
+        assert!(
+            storage
+                .get_group_exporter_secret(&mls_group_id, epoch)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            storage
+                .get_group_mip04_exporter_secret(&mls_group_id, epoch)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    for epoch in 3..=4_u64 {
+        assert!(
+            storage
+                .get_group_exporter_secret(&mls_group_id, epoch)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            storage
+                .get_group_mip04_exporter_secret(&mls_group_id, epoch)
+                .unwrap()
+                .is_some()
+        );
+    }
+}
+
 /// Test basic group relay functionality (not the comprehensive replace tests)
 pub fn test_basic_group_relays<S>(storage: S)
 where

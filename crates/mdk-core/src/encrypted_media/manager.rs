@@ -466,6 +466,12 @@ mod tests {
         MDK::new(MdkMemoryStorage::default())
     }
 
+    fn create_test_mdk_with_config(config: crate::MdkConfig) -> MDK<MdkMemoryStorage> {
+        MDK::builder(MdkMemoryStorage::default())
+            .with_config(config)
+            .build()
+    }
+
     /// Create a group, merge its pending commit, and return the MDK instance,
     /// group ID, and the creator's keys.
     fn setup_group() -> (MDK<MdkMemoryStorage>, GroupId, Keys) {
@@ -1570,6 +1576,112 @@ mod tests {
             .decrypt_from_download(&upload.encrypted_data, &media_ref)
             .unwrap();
         assert_eq!(decrypted, data);
+    }
+
+    #[test]
+    fn test_decrypt_from_download_cross_epoch_respects_lookback_cleanup() {
+        use mdk_storage_traits::groups::GroupStorage;
+
+        let config = crate::MdkConfig {
+            max_past_epochs: 2,
+            ..Default::default()
+        };
+        let mdk = create_test_mdk_with_config(config);
+        let alice_keys = Keys::generate();
+        let admins = vec![alice_keys.public_key()];
+        let create_result = mdk
+            .create_group(
+                &alice_keys.public_key(),
+                vec![],
+                create_nostr_group_config_data(admins),
+            )
+            .unwrap();
+        let group_id = create_result.group.mls_group_id;
+        mdk.merge_pending_commit(&group_id).unwrap();
+
+        // Encrypt at epoch 0 and store hint message.
+        let manager = mdk.media_manager(group_id.clone());
+        let old_data = b"old media at epoch 0";
+        let old_upload = manager
+            .encrypt_for_upload(old_data, "text/plain", "old.txt")
+            .unwrap();
+        let old_ref =
+            manager.create_media_reference(&old_upload, "https://example.com/old".to_string());
+        let old_epoch = store_imeta_message(
+            &mdk,
+            &group_id,
+            &old_upload,
+            alice_keys.public_key(),
+            "https://example.com/old",
+        );
+        assert_eq!(old_epoch, 0);
+
+        // Advance to epoch 2, then encrypt newer media at epoch 2.
+        for _ in 0..2 {
+            mdk.self_update(&group_id).unwrap();
+            mdk.merge_pending_commit(&group_id).unwrap();
+        }
+
+        let manager = mdk.media_manager(group_id.clone());
+        let recent_data = b"recent media at epoch 2";
+        let recent_upload = manager
+            .encrypt_for_upload(recent_data, "text/plain", "recent.txt")
+            .unwrap();
+        let recent_ref = manager
+            .create_media_reference(&recent_upload, "https://example.com/recent".to_string());
+        let recent_epoch = store_imeta_message(
+            &mdk,
+            &group_id,
+            &recent_upload,
+            alice_keys.public_key(),
+            "https://example.com/recent",
+        );
+        assert_eq!(recent_epoch, 2);
+
+        // Advance to epoch 4. With max_past_epochs = 2, keep epochs >= 2.
+        for _ in 0..2 {
+            mdk.self_update(&group_id).unwrap();
+            mdk.merge_pending_commit(&group_id).unwrap();
+        }
+
+        let current_epoch = mdk.get_group(&group_id).unwrap().unwrap().epoch;
+        assert_eq!(current_epoch, 4);
+
+        let secret_epoch_0 = mdk
+            .storage()
+            .get_group_mip04_exporter_secret(&group_id, 0)
+            .unwrap();
+        let secret_epoch_1 = mdk
+            .storage()
+            .get_group_mip04_exporter_secret(&group_id, 1)
+            .unwrap();
+        let secret_epoch_2 = mdk
+            .storage()
+            .get_group_mip04_exporter_secret(&group_id, 2)
+            .unwrap();
+
+        assert!(secret_epoch_0.is_none(), "Epoch 0 key should be pruned");
+        assert!(secret_epoch_1.is_none(), "Epoch 1 key should be pruned");
+        assert!(secret_epoch_2.is_some(), "Epoch 2 key should be retained");
+
+        let manager = mdk.media_manager(group_id.clone());
+
+        // Media from pruned epoch should no longer decrypt.
+        let old_result = manager.decrypt_from_download(&old_upload.encrypted_data, &old_ref);
+        assert!(
+            matches!(
+                old_result,
+                Err(EncryptedMediaError::DecryptionFailed { .. })
+            ),
+            "Expected old media decryption to fail after lookback cleanup, got: {:?}",
+            old_result
+        );
+
+        // Media from retained epoch should still decrypt via stored epoch hint secret.
+        let recent_decrypted = manager
+            .decrypt_from_download(&recent_upload.encrypted_data, &recent_ref)
+            .unwrap();
+        assert_eq!(recent_decrypted, recent_data);
     }
 
     /// Verifies that media encrypted after processing an incoming commit (remote epoch

@@ -252,6 +252,16 @@ pub trait GroupStorage {
         group_exporter_secret: GroupExporterSecret,
     ) -> Result<(), GroupError>;
 
+    /// Prune exporter secrets older than `min_epoch_to_keep` for the group.
+    ///
+    /// Implementations must remove both MIP-03 (`group-event`) and MIP-04
+    /// (`encrypted-media`) exporter secrets with `epoch < min_epoch_to_keep`.
+    fn prune_group_exporter_secrets_before_epoch(
+        &self,
+        group_id: &GroupId,
+        min_epoch_to_keep: u64,
+    ) -> Result<(), GroupError>;
+
     /// Returns active groups that need a self-update: either because
     /// `self_update_state` is [`SelfUpdateState::Required`] (post-join
     /// requirement per MIP-02) or because the last self-update is older than

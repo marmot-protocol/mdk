@@ -97,6 +97,14 @@ where
                 .map_err(|e| Error::Group(e.to_string()))?;
         }
 
+        let min_epoch_to_keep = mls_group
+            .epoch()
+            .as_u64()
+            .saturating_sub(self.config.max_past_epochs as u64);
+        self.storage()
+            .prune_group_exporter_secrets_before_epoch(&group_id, min_epoch_to_keep)
+            .map_err(|_| Error::Group("Failed to prune exporter secrets".to_string()))?;
+
         // Sync the stored group metadata with the updated MLS group state
         self.sync_group_metadata_from_mls(&group_id)?;
 

@@ -331,6 +331,54 @@ impl GroupStorage for MdkMemoryStorage {
 
         Ok(())
     }
+
+    fn prune_group_exporter_secrets_before_epoch(
+        &self,
+        group_id: &GroupId,
+        min_epoch_to_keep: u64,
+    ) -> Result<(), GroupError> {
+        let mut inner = self.inner.write();
+
+        if inner.groups_cache.peek(group_id).is_none() {
+            return Err(GroupError::InvalidParameters("Group not found".to_string()));
+        }
+
+        let group_event_keys: Vec<(GroupId, u64)> = inner
+            .group_exporter_secrets_cache
+            .iter()
+            .filter_map(|(k, _)| {
+                let (gid, epoch) = k;
+                if gid == group_id && *epoch < min_epoch_to_keep {
+                    Some((gid.clone(), *epoch))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for key in group_event_keys {
+            inner.group_exporter_secrets_cache.pop(&key);
+        }
+
+        let mip04_keys: Vec<(GroupId, u64)> = inner
+            .group_mip04_exporter_secrets_cache
+            .iter()
+            .filter_map(|(k, _)| {
+                let (gid, epoch) = k;
+                if gid == group_id && *epoch < min_epoch_to_keep {
+                    Some((gid.clone(), *epoch))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for key in mip04_keys {
+            inner.group_mip04_exporter_secrets_cache.pop(&key);
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]

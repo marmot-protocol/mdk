@@ -433,6 +433,26 @@ impl GroupStorage for MdkSqliteStorage {
             Ok(())
         })
     }
+
+    fn prune_group_exporter_secrets_before_epoch(
+        &self,
+        group_id: &GroupId,
+        min_epoch_to_keep: u64,
+    ) -> Result<(), GroupError> {
+        if self.find_group_by_mls_group_id(group_id)?.is_none() {
+            return Err(GroupError::InvalidParameters("Group not found".to_string()));
+        }
+
+        self.with_connection(|conn| {
+            conn.execute(
+                "DELETE FROM group_exporter_secrets WHERE mls_group_id = ? AND epoch < ?",
+                params![group_id.as_slice(), min_epoch_to_keep],
+            )
+            .map_err(into_group_err)?;
+
+            Ok(())
+        })
+    }
 }
 
 #[cfg(test)]

@@ -287,3 +287,83 @@ fn test_exporter_secret_label_isolation_consistency() {
     assert_eq!(sqlite_group_event_after, group_event);
     assert_eq!(sqlite_mip04_after, updated_mip04);
 }
+
+#[test]
+fn test_exporter_secret_pruning_consistency() {
+    let harness = StorageTestHarness::new();
+    let mls_group_id = GroupId::from_slice(&[1, 2, 3, 8]);
+    let mut nostr_group_id = [0u8; 32];
+    nostr_group_id[0..12].copy_from_slice(b"prune_consis");
+
+    let group = create_test_group_for_cross_storage(&mls_group_id, nostr_group_id);
+    harness.assert_consistent_save_group(group);
+
+    for epoch in 0..=4_u64 {
+        let group_event = GroupExporterSecret {
+            mls_group_id: mls_group_id.clone(),
+            epoch,
+            secret: Secret::new([epoch as u8; 32]),
+        };
+        let mip04 = GroupExporterSecret {
+            mls_group_id: mls_group_id.clone(),
+            epoch,
+            secret: Secret::new([(epoch as u8) + 10; 32]),
+        };
+
+        harness
+            .sqlite
+            .save_group_exporter_secret(group_event.clone())
+            .unwrap();
+        harness
+            .memory
+            .save_group_exporter_secret(group_event)
+            .unwrap();
+        harness
+            .sqlite
+            .save_group_mip04_exporter_secret(mip04.clone())
+            .unwrap();
+        harness
+            .memory
+            .save_group_mip04_exporter_secret(mip04)
+            .unwrap();
+    }
+
+    harness
+        .sqlite
+        .prune_group_exporter_secrets_before_epoch(&mls_group_id, 3)
+        .unwrap();
+    harness
+        .memory
+        .prune_group_exporter_secrets_before_epoch(&mls_group_id, 3)
+        .unwrap();
+
+    for epoch in 0..=4_u64 {
+        let sqlite_group_event = harness
+            .sqlite
+            .get_group_exporter_secret(&mls_group_id, epoch)
+            .unwrap();
+        let memory_group_event = harness
+            .memory
+            .get_group_exporter_secret(&mls_group_id, epoch)
+            .unwrap();
+        assert_eq!(sqlite_group_event, memory_group_event);
+
+        let sqlite_mip04 = harness
+            .sqlite
+            .get_group_mip04_exporter_secret(&mls_group_id, epoch)
+            .unwrap();
+        let memory_mip04 = harness
+            .memory
+            .get_group_mip04_exporter_secret(&mls_group_id, epoch)
+            .unwrap();
+        assert_eq!(sqlite_mip04, memory_mip04);
+
+        if epoch < 3 {
+            assert!(sqlite_group_event.is_none());
+            assert!(sqlite_mip04.is_none());
+        } else {
+            assert!(sqlite_group_event.is_some());
+            assert!(sqlite_mip04.is_some());
+        }
+    }
+}

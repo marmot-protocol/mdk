@@ -39,6 +39,11 @@ test_sqlite_storage!(
 );
 
 test_sqlite_storage!(
+    test_exporter_secret_pruning_by_epoch_sqlite,
+    shared::group_tests::test_exporter_secret_pruning_by_epoch
+);
+
+test_sqlite_storage!(
     test_basic_group_relays_sqlite,
     shared::group_tests::test_basic_group_relays
 );
