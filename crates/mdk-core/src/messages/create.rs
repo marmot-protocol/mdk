@@ -313,23 +313,39 @@ mod tests {
             "Content should be encrypted, not plaintext"
         );
 
-        // 3. Verify exactly 1 tag (h tag with group ID)
+        // 3. Verify tags include h + encoding(base64)
         assert_eq!(
             message_event.tags.len(),
-            1,
-            "Message event must have exactly 1 tag per MIP-03"
+            2,
+            "Message event must have exactly 2 tags: h and encoding"
         );
 
-        // 4. Verify tag is h tag
-        let tags_vec: Vec<&nostr::Tag> = message_event.tags.iter().collect();
-        let group_id_tag = tags_vec[0];
+        // 4. Verify h tag
+        let group_id_tag = message_event
+            .tags
+            .iter()
+            .find(|t| t.kind() == TagKind::h())
+            .expect("Message event should have h tag");
         assert_eq!(
             group_id_tag.kind(),
             TagKind::h(),
             "Tag must be 'h' (group ID) tag"
         );
 
-        // 5. Verify h tag is valid 32-byte hex
+        // 5. Verify encoding tag is base64
+        let encoding_tag = message_event
+            .tags
+            .iter()
+            .find(|t| t.kind() == TagKind::Custom("encoding".into()))
+            .expect("Message event should have encoding tag");
+        assert_eq!(
+            encoding_tag
+                .content()
+                .expect("encoding tag should have content"),
+            "base64"
+        );
+
+        // 6. Verify h tag is valid 32-byte hex
         let group_id_hex = group_id_tag.content().expect("h tag should have content");
         assert_eq!(
             group_id_hex.len(),
@@ -345,13 +361,13 @@ mod tests {
             "Group ID should decode to 32 bytes"
         );
 
-        // 6. Verify event is signed (has valid signature)
+        // 7. Verify event is signed (has valid signature)
         assert!(
             message_event.verify().is_ok(),
             "Message event must be properly signed"
         );
 
-        // 7. Verify pubkey is NOT the creator's real pubkey (ephemeral key)
+        // 8. Verify pubkey is NOT the creator's real pubkey (ephemeral key)
         assert_ne!(
             message_event.pubkey,
             creator.public_key(),
@@ -435,15 +451,29 @@ mod tests {
         // 2. Verify commit event structure matches regular messages
         assert_eq!(
             commit_event.tags.len(),
-            1,
-            "Commit event should have exactly 1 tag"
+            2,
+            "Commit event should have exactly 2 tags: h and encoding"
         );
 
         let commit_tags: Vec<&nostr::Tag> = commit_event.tags.iter().collect();
         assert_eq!(
-            commit_tags[0].kind(),
+            commit_tags
+                .iter()
+                .find(|t| t.kind() == TagKind::h())
+                .expect("Commit event should have h tag")
+                .kind(),
             TagKind::h(),
             "Commit event should have h tag"
+        );
+        let commit_encoding_tag = commit_tags
+            .iter()
+            .find(|t| t.kind() == TagKind::Custom("encoding".into()))
+            .expect("Commit event should have encoding tag");
+        assert_eq!(
+            commit_encoding_tag
+                .content()
+                .expect("encoding tag should have content"),
+            "base64"
         );
 
         // 3. Verify commit uses ephemeral pubkey
@@ -649,10 +679,15 @@ mod tests {
             .expect("Failed to send first message");
 
         assert_eq!(msg_event1.kind, Kind::MlsGroupMessage);
-        assert_eq!(msg_event1.tags.len(), 1);
+        assert_eq!(msg_event1.tags.len(), 2);
 
-        let msg1_tags: Vec<&nostr::Tag> = msg_event1.tags.iter().collect();
-        assert_eq!(msg1_tags[0].kind(), TagKind::h());
+        assert!(msg_event1.tags.iter().any(|t| t.kind() == TagKind::h()));
+        assert!(
+            msg_event1
+                .tags
+                .iter()
+                .any(|t| t.kind() == TagKind::Custom("encoding".into()))
+        );
 
         let pubkey1 = msg_event1.pubkey;
 
@@ -664,7 +699,14 @@ mod tests {
 
         let commit_event = &add_result.evolution_event;
         assert_eq!(commit_event.kind, Kind::MlsGroupMessage);
-        assert_eq!(commit_event.tags.len(), 1);
+        assert_eq!(commit_event.tags.len(), 2);
+        assert!(commit_event.tags.iter().any(|t| t.kind() == TagKind::h()));
+        assert!(
+            commit_event
+                .tags
+                .iter()
+                .any(|t| t.kind() == TagKind::Custom("encoding".into()))
+        );
         assert_ne!(
             commit_event.pubkey,
             creator.public_key(),
