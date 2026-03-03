@@ -1518,7 +1518,7 @@ where
             let mip04_secret = self.mip04_exporter_secret(group_id)?;
             self.storage()
                 .save_group_mip04_exporter_secret(mip04_secret)
-                .map_err(|e| Error::Group(e.to_string()))?;
+                .map_err(|_| Error::Group("Failed to save MIP-04 exporter secret".to_string()))?;
         }
 
         let min_epoch_to_keep = mls_group
@@ -1704,9 +1704,11 @@ where
         let ephemeral_nostr_keys: Keys = Keys::generate();
 
         let tag: Tag = Tag::custom(TagKind::h(), [hex::encode(group.nostr_group_id)]);
+        let encoding_tag: Tag = Tag::custom(TagKind::Custom("encoding".into()), ["base64"]);
 
         let event = EventBuilder::new(Kind::MlsGroupMessage, encrypted_content)
             .tag(tag)
+            .tag(encoding_tag)
             .sign_with_keys(&ephemeral_nostr_keys)?;
 
         Ok(event)

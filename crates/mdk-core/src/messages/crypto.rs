@@ -25,7 +25,9 @@ pub(crate) fn encrypt_message_with_exporter_secret(
         .map_err(|_| Error::Message("Failed to create cipher from exporter secret".to_string()))?;
 
     let mut nonce_bytes = [0u8; 12];
-    OsRng.fill_bytes(&mut nonce_bytes);
+    OsRng
+        .try_fill_bytes(&mut nonce_bytes)
+        .map_err(|_| Error::Message("Failed to generate random nonce".to_string()))?;
     let nonce = Nonce::from_slice(&nonce_bytes);
 
     let ciphertext = cipher

@@ -88,13 +88,13 @@ pub(crate) fn encode_content(bytes: &[u8], encoding: ContentEncoding) -> String 
 pub(crate) fn decode_content(
     content: &str,
     encoding: ContentEncoding,
-    label: &str,
+    _label: &str,
 ) -> Result<(Vec<u8>, &'static str), String> {
     match encoding {
         ContentEncoding::Base64 => BASE64
             .decode(content)
             .map(|bytes| (bytes, "base64"))
-            .map_err(|e| format!("Failed to decode {} as base64: {}", label, e)),
+            .map_err(|e| format!("Failed to decode input as base64: {}", e)),
     }
 }
 
