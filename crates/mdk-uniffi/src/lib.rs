@@ -1488,15 +1488,17 @@ pub struct MediaProcessingOptionsInput {
     pub max_filename_length: Option<u64>,
 }
 
-impl From<MediaProcessingOptionsInput> for MediaProcessingOptions {
-    fn from(o: MediaProcessingOptionsInput) -> Self {
-        Self {
+impl TryFrom<MediaProcessingOptionsInput> for MediaProcessingOptions {
+    type Error = std::num::TryFromIntError;
+
+    fn try_from(o: MediaProcessingOptionsInput) -> Result<Self, Self::Error> {
+        Ok(Self {
             sanitize_exif: o.sanitize_exif,
             generate_blurhash: o.generate_blurhash,
             max_dimension: o.max_dimension,
-            max_file_size: o.max_file_size.map(|v| v as usize),
-            max_filename_length: o.max_filename_length.map(|v| v as usize),
-        }
+            max_file_size: o.max_file_size.map(usize::try_from).transpose()?,
+            max_filename_length: o.max_filename_length.map(usize::try_from).transpose()?,
+        })
     }
 }
 
@@ -1675,7 +1677,8 @@ impl Mdk {
         options: MediaProcessingOptionsInput,
     ) -> Result<EncryptedMediaUploadResult, MdkUniffiError> {
         let group_id = parse_group_id(&mls_group_id)?;
-        let core_options = MediaProcessingOptions::from(options);
+        let core_options = MediaProcessingOptions::try_from(options)
+            .map_err(|e| MdkUniffiError::InvalidInput(e.to_string()))?;
         let mdk = self.lock()?;
         let upload = mdk
             .media_manager(group_id)
@@ -1761,10 +1764,12 @@ impl Mdk {
     ) -> Result<MediaReferenceRecord, MdkUniffiError> {
         let group_id = parse_group_id(&mls_group_id)?;
         let tags = parse_tags(imeta_tag)?;
-        let tag = tags
-            .into_iter()
-            .next()
-            .ok_or_else(|| MdkUniffiError::InvalidInput("Expected one IMETA tag".to_string()))?;
+        if tags.len() != 1 {
+            return Err(MdkUniffiError::InvalidInput(
+                "Expected exactly one IMETA tag".to_string(),
+            ));
+        }
+        let tag = tags.into_iter().next().unwrap();
         let mdk = self.lock()?;
         let reference = mdk
             .media_manager(group_id)
