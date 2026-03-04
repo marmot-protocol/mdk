@@ -543,4 +543,93 @@ mod tests {
         assert!(result.is_ok());
         assert!(result.unwrap().is_none());
     }
+
+    #[test]
+    fn vec_to_array_12_correct_size() {
+        let result = vec_to_array::<12>(Some(vec![0xBB; 12]));
+        assert!(result.is_ok());
+        let arr = result.unwrap().unwrap();
+        assert_eq!(arr, [0xBB; 12]);
+    }
+
+    #[test]
+    fn vec_to_array_12_wrong_size() {
+        let result = vec_to_array::<12>(Some(vec![0xBB; 8]));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn vec_to_array_12_none_returns_none() {
+        let result = vec_to_array::<12>(None);
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
+    }
+
+    #[test]
+    fn deserialize_group_data_update_all_fields() {
+        let json = r#"{
+            "name": "Test Group",
+            "description": "A test group",
+            "image_hash": [1,2,3],
+            "image_key": [4,5,6],
+            "image_nonce": [7,8,9],
+            "relays": ["wss://relay.example.com"],
+            "admins": ["aabb"]
+        }"#;
+        let update: GroupDataUpdateJson = serde_json::from_str(json).unwrap();
+        assert_eq!(update.name.as_deref(), Some("Test Group"));
+        assert_eq!(update.description.as_deref(), Some("A test group"));
+        assert!(update.image_hash.is_some());
+        assert!(update.relays.is_some());
+        assert_eq!(update.relays.as_ref().unwrap().len(), 1);
+        assert!(update.admins.is_some());
+    }
+
+    #[test]
+    fn deserialize_group_data_update_partial() {
+        let json = r#"{"name": "New Name"}"#;
+        let update: GroupDataUpdateJson = serde_json::from_str(json).unwrap();
+        assert_eq!(update.name.as_deref(), Some("New Name"));
+        // Absent fields should be None (don't change)
+        assert!(update.description.is_none());
+        assert!(update.image_hash.is_none());
+        assert!(update.image_key.is_none());
+        assert!(update.image_nonce.is_none());
+        assert!(update.relays.is_none());
+        assert!(update.admins.is_none());
+    }
+
+    #[test]
+    fn deserialize_group_data_update_null_image_fields() {
+        // JSON null on Option<Option<T>> without special serde attribute
+        // deserializes as None (field treated as absent).
+        // This verifies the actual behaviour of the struct.
+        let json = r#"{"image_hash": null, "image_key": null, "image_nonce": null}"#;
+        let update: GroupDataUpdateJson = serde_json::from_str(json).unwrap();
+        assert!(update.image_hash.is_none());
+        assert!(update.image_key.is_none());
+        assert!(update.image_nonce.is_none());
+    }
+
+    #[test]
+    fn deserialize_group_data_update_empty_object() {
+        let json = "{}";
+        let update: GroupDataUpdateJson = serde_json::from_str(json).unwrap();
+        assert!(update.name.is_none());
+        assert!(update.description.is_none());
+        assert!(update.image_hash.is_none());
+        assert!(update.relays.is_none());
+        assert!(update.admins.is_none());
+    }
+
+    #[test]
+    fn serialize_create_group_result_json() {
+        let result = CreateGroupResultJson {
+            group: serde_json::json!({"id": "abc"}),
+            welcome_rumors: vec![serde_json::json!({"kind": 444})],
+        };
+        let val = serde_json::to_value(&result).unwrap();
+        assert_eq!(val["group"]["id"], "abc");
+        assert_eq!(val["welcome_rumors"][0]["kind"], 444);
+    }
 }

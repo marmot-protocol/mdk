@@ -327,3 +327,91 @@ pub unsafe extern "C" fn mdk_get_last_message(
         unsafe { write_cstring_to(out_json, json) }
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn serialize_process_message_result_application_message() {
+        let obj = ProcessMessageResultJson {
+            result_type: "ApplicationMessage".to_string(),
+            message: Some(serde_json::json!({"content": "hello"})),
+            result: None,
+            mls_group_id: None,
+            reason: None,
+        };
+        let val = serde_json::to_value(&obj).unwrap();
+        assert_eq!(val["type"], "ApplicationMessage");
+        assert_eq!(val["message"]["content"], "hello");
+        // Optional None fields should be absent (skip_serializing_if)
+        assert!(val.get("result").is_none());
+        assert!(val.get("mls_group_id").is_none());
+        assert!(val.get("reason").is_none());
+    }
+
+    #[test]
+    fn serialize_process_message_result_pending_proposal() {
+        let obj = ProcessMessageResultJson {
+            result_type: "PendingProposal".to_string(),
+            message: None,
+            result: None,
+            mls_group_id: Some("aabbccdd".to_string()),
+            reason: None,
+        };
+        let val = serde_json::to_value(&obj).unwrap();
+        assert_eq!(val["type"], "PendingProposal");
+        assert_eq!(val["mls_group_id"], "aabbccdd");
+        assert!(val.get("message").is_none());
+        assert!(val.get("result").is_none());
+        assert!(val.get("reason").is_none());
+    }
+
+    #[test]
+    fn serialize_process_message_result_ignored_proposal() {
+        let obj = ProcessMessageResultJson {
+            result_type: "IgnoredProposal".to_string(),
+            message: None,
+            result: None,
+            mls_group_id: Some("ff00".to_string()),
+            reason: Some("stale epoch".to_string()),
+        };
+        let val = serde_json::to_value(&obj).unwrap();
+        assert_eq!(val["type"], "IgnoredProposal");
+        assert_eq!(val["mls_group_id"], "ff00");
+        assert_eq!(val["reason"], "stale epoch");
+    }
+
+    #[test]
+    fn serialize_process_message_result_previously_failed() {
+        let obj = ProcessMessageResultJson {
+            result_type: "PreviouslyFailed".to_string(),
+            message: None,
+            result: None,
+            mls_group_id: None,
+            reason: None,
+        };
+        let val = serde_json::to_value(&obj).unwrap();
+        assert_eq!(val["type"], "PreviouslyFailed");
+        // All optional fields absent
+        assert!(val.get("message").is_none());
+        assert!(val.get("result").is_none());
+        assert!(val.get("mls_group_id").is_none());
+        assert!(val.get("reason").is_none());
+    }
+
+    #[test]
+    fn serialize_process_message_result_with_result() {
+        let obj = ProcessMessageResultJson {
+            result_type: "Proposal".to_string(),
+            message: None,
+            result: Some(serde_json::json!({"evolution_event": {}})),
+            mls_group_id: None,
+            reason: None,
+        };
+        let val = serde_json::to_value(&obj).unwrap();
+        assert_eq!(val["type"], "Proposal");
+        assert!(val.get("result").is_some());
+        assert!(val.get("message").is_none());
+    }
+}

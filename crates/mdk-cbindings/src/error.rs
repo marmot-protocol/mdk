@@ -124,6 +124,8 @@ pub(crate) fn null_pointer(param: &str) -> MdkError {
 mod tests {
     use std::ffi::CStr;
 
+    use mdk_sqlite_storage::error::Error as StorageError;
+
     use super::*;
 
     #[test]
@@ -181,6 +183,64 @@ mod tests {
         assert!(!ptr.is_null());
         let msg = unsafe { CStr::from_ptr(ptr) }.to_str().unwrap();
         assert_eq!(msg, "Null pointer: my_param");
+        drop(unsafe { CString::from_raw(ptr) });
+    }
+
+    #[test]
+    fn set_last_error_interior_null_byte() {
+        set_last_error("before\0after");
+        let ptr = unsafe { mdk_last_error_message() };
+        assert!(!ptr.is_null());
+        let msg = unsafe { CStr::from_ptr(ptr) }.to_str().unwrap();
+        assert_eq!(msg, "(error message contained an interior null byte)");
+        drop(unsafe { CString::from_raw(ptr) });
+    }
+
+    #[test]
+    fn set_last_error_overwrites_previous() {
+        set_last_error("first");
+        set_last_error("second");
+        let ptr = unsafe { mdk_last_error_message() };
+        assert!(!ptr.is_null());
+        let msg = unsafe { CStr::from_ptr(ptr) }.to_str().unwrap();
+        assert_eq!(msg, "second");
+        drop(unsafe { CString::from_raw(ptr) });
+    }
+
+    #[test]
+    fn mdk_error_repr_values() {
+        assert_eq!(MdkError::Ok as i32, 0);
+        assert_eq!(MdkError::Storage as i32, 1);
+        assert_eq!(MdkError::Mdk as i32, 2);
+        assert_eq!(MdkError::InvalidInput as i32, 3);
+        assert_eq!(MdkError::NullPointer as i32, 4);
+    }
+
+    #[test]
+    fn from_storage_error_sets_generic_message() {
+        let err = StorageError::Database("secret internal detail".to_string());
+        let code = from_storage_error(err);
+        assert_eq!(code, MdkError::Storage);
+
+        let ptr = unsafe { mdk_last_error_message() };
+        assert!(!ptr.is_null());
+        let msg = unsafe { CStr::from_ptr(ptr) }.to_str().unwrap();
+        assert_eq!(msg, "Storage error: internal");
+        // Verify the original detail is NOT leaked
+        assert!(!msg.contains("secret"));
+        drop(unsafe { CString::from_raw(ptr) });
+    }
+
+    #[test]
+    fn from_mdk_error_sets_generic_message() {
+        let err = CoreMdkError::Hex(hex::FromHexError::InvalidHexCharacter { c: 'z', index: 0 });
+        let code = from_mdk_error(err);
+        assert_eq!(code, MdkError::Mdk);
+
+        let ptr = unsafe { mdk_last_error_message() };
+        assert!(!ptr.is_null());
+        let msg = unsafe { CStr::from_ptr(ptr) }.to_str().unwrap();
+        assert_eq!(msg, "MDK error: internal");
         drop(unsafe { CString::from_raw(ptr) });
     }
 }

@@ -280,6 +280,7 @@ pub(crate) fn parse_sort_order(
 #[allow(unsafe_code)]
 mod tests {
     use std::ffi::CString;
+    use std::panic::panic_any;
 
     use super::*;
 
@@ -429,6 +430,122 @@ mod tests {
     fn ffi_try_unwind_safe_catches_panic() {
         let result = ffi_try_unwind_safe(|| panic!("test panic"));
         assert_eq!(result, MdkError::Mdk);
+    }
+
+    #[test]
+    fn ffi_try_unwind_safe_catches_string_panic() {
+        let result = ffi_try_unwind_safe(|| panic_any("owned string panic".to_string()));
+        assert_eq!(result, MdkError::Mdk);
+        // Verify the error message was stored
+        let ptr = unsafe { crate::error::mdk_last_error_message() };
+        assert!(!ptr.is_null());
+        let msg = unsafe { std::ffi::CStr::from_ptr(ptr) }.to_str().unwrap();
+        assert!(msg.contains("owned string panic"));
+        drop(unsafe { CString::from_raw(ptr) });
+    }
+
+    #[test]
+    fn ffi_try_unwind_safe_catches_non_string_panic() {
+        let result = ffi_try_unwind_safe(|| panic_any(42i32));
+        assert_eq!(result, MdkError::Mdk);
+        let ptr = unsafe { crate::error::mdk_last_error_message() };
+        assert!(!ptr.is_null());
+        let msg = unsafe { std::ffi::CStr::from_ptr(ptr) }.to_str().unwrap();
+        assert!(msg.contains("unknown panic"));
+        drop(unsafe { CString::from_raw(ptr) });
+    }
+
+    #[test]
+    fn parse_event_id_valid() {
+        let hex = "0000000000000000000000000000000000000000000000000000000000000001";
+        let result = parse_event_id(hex);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn parse_event_id_invalid_hex() {
+        let result = parse_event_id("not-hex!");
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            MdkError::InvalidInput => {}
+            other => panic!("Expected InvalidInput, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_event_id_short() {
+        let result = parse_event_id("aabb");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_public_keys_valid() {
+        let json = r#"["0000000000000000000000000000000000000000000000000000000000000001"]"#;
+        let result = parse_public_keys(json);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn parse_public_keys_invalid_key() {
+        let json = r#"["not-a-key"]"#;
+        let result = parse_public_keys(json);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_public_keys_invalid_json() {
+        let result = parse_public_keys("not json");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_public_keys_empty_array() {
+        let result = parse_public_keys("[]");
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_empty());
+    }
+
+    #[test]
+    fn parse_sort_order_processed_at_first() {
+        let cs = CString::new("processed_at_first").unwrap();
+        let result = parse_sort_order(cs.as_ptr());
+        assert!(result.is_ok());
+        assert_eq!(
+            result.unwrap().unwrap(),
+            mdk_storage_traits::groups::MessageSortOrder::ProcessedAtFirst
+        );
+    }
+
+    #[test]
+    fn cstr_to_str_empty_string() {
+        let cs = CString::new("").unwrap();
+        let result = unsafe { cstr_to_str(cs.as_ptr()) };
+        assert_eq!(result.unwrap(), "");
+    }
+
+    #[test]
+    fn write_cstring_empty_string() {
+        let mut out: *mut std::os::raw::c_char = std::ptr::null_mut();
+        let result = unsafe { write_cstring_to(&mut out, String::new()) };
+        assert!(result.is_ok());
+        assert!(!out.is_null());
+        let s = unsafe { std::ffi::CStr::from_ptr(out) }.to_str().unwrap();
+        assert_eq!(s, "");
+        drop(unsafe { CString::from_raw(out) });
+    }
+
+    #[test]
+    fn parse_relay_urls_empty_array() {
+        let result = parse_relay_urls("[]");
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_empty());
+    }
+
+    #[test]
+    fn parse_relay_urls_invalid_json() {
+        let result = parse_relay_urls("not json");
+        assert!(result.is_err());
     }
 
     #[test]

@@ -892,6 +892,333 @@ mod tests {
 
     // ── Error message tests ─────────────────────────────────────────────
 
+    // ── Additional null-pointer / input validation tests ─────────────────
+
+    // Groups
+    #[test]
+    fn get_groups_null_out() {
+        let (handle, _dir) = test_handle();
+        let code = unsafe { groups::mdk_get_groups(handle, std::ptr::null_mut()) };
+        assert_eq!(code, MdkError::NullPointer);
+        unsafe { mdk_free(handle) };
+    }
+
+    #[test]
+    fn get_group_null_handle() {
+        let gid = CString::new("aa").unwrap();
+        let mut out: *mut std::os::raw::c_char = std::ptr::null_mut();
+        let code = unsafe { groups::mdk_get_group(std::ptr::null_mut(), gid.as_ptr(), &mut out) };
+        assert_eq!(code, MdkError::NullPointer);
+    }
+
+    #[test]
+    fn get_members_null_handle() {
+        let gid = CString::new("aa").unwrap();
+        let mut out: *mut std::os::raw::c_char = std::ptr::null_mut();
+        let code = unsafe { groups::mdk_get_members(std::ptr::null_mut(), gid.as_ptr(), &mut out) };
+        assert_eq!(code, MdkError::NullPointer);
+    }
+
+    #[test]
+    fn get_relays_null_handle() {
+        let gid = CString::new("aa").unwrap();
+        let mut out: *mut std::os::raw::c_char = std::ptr::null_mut();
+        let code = unsafe { groups::mdk_get_relays(std::ptr::null_mut(), gid.as_ptr(), &mut out) };
+        assert_eq!(code, MdkError::NullPointer);
+    }
+
+    #[test]
+    fn get_relays_null_out() {
+        let (handle, _dir) = test_handle();
+        let gid = CString::new("aa").unwrap();
+        let code = unsafe { groups::mdk_get_relays(handle, gid.as_ptr(), std::ptr::null_mut()) };
+        assert_eq!(code, MdkError::NullPointer);
+        unsafe { mdk_free(handle) };
+    }
+
+    #[test]
+    fn groups_needing_self_update_null_handle() {
+        let mut out: *mut std::os::raw::c_char = std::ptr::null_mut();
+        let code =
+            unsafe { groups::mdk_groups_needing_self_update(std::ptr::null_mut(), 3600, &mut out) };
+        assert_eq!(code, MdkError::NullPointer);
+    }
+
+    #[test]
+    fn groups_needing_self_update_null_out() {
+        let (handle, _dir) = test_handle();
+        let code =
+            unsafe { groups::mdk_groups_needing_self_update(handle, 3600, std::ptr::null_mut()) };
+        assert_eq!(code, MdkError::NullPointer);
+        unsafe { mdk_free(handle) };
+    }
+
+    #[test]
+    fn self_update_null_out() {
+        let (handle, _dir) = test_handle();
+        let gid = CString::new("aa").unwrap();
+        let code = unsafe { groups::mdk_self_update(handle, gid.as_ptr(), std::ptr::null_mut()) };
+        assert_eq!(code, MdkError::NullPointer);
+        unsafe { mdk_free(handle) };
+    }
+
+    #[test]
+    fn leave_group_null_out() {
+        let (handle, _dir) = test_handle();
+        let gid = CString::new("aa").unwrap();
+        let code = unsafe { groups::mdk_leave_group(handle, gid.as_ptr(), std::ptr::null_mut()) };
+        assert_eq!(code, MdkError::NullPointer);
+        unsafe { mdk_free(handle) };
+    }
+
+    #[test]
+    fn add_members_null_out() {
+        let (handle, _dir) = test_handle();
+        let gid = CString::new("aa").unwrap();
+        let kp = CString::new("[]").unwrap();
+        let code = unsafe {
+            groups::mdk_add_members(handle, gid.as_ptr(), kp.as_ptr(), std::ptr::null_mut())
+        };
+        assert_eq!(code, MdkError::NullPointer);
+        unsafe { mdk_free(handle) };
+    }
+
+    #[test]
+    fn remove_members_null_out() {
+        let (handle, _dir) = test_handle();
+        let gid = CString::new("aa").unwrap();
+        let pks = CString::new("[]").unwrap();
+        let code = unsafe {
+            groups::mdk_remove_members(handle, gid.as_ptr(), pks.as_ptr(), std::ptr::null_mut())
+        };
+        assert_eq!(code, MdkError::NullPointer);
+        unsafe { mdk_free(handle) };
+    }
+
+    #[test]
+    fn update_group_data_null_out() {
+        let (handle, _dir) = test_handle();
+        let gid = CString::new("aa").unwrap();
+        let upd = CString::new("{}").unwrap();
+        let code = unsafe {
+            groups::mdk_update_group_data(handle, gid.as_ptr(), upd.as_ptr(), std::ptr::null_mut())
+        };
+        assert_eq!(code, MdkError::NullPointer);
+        unsafe { mdk_free(handle) };
+    }
+
+    // Messages
+    #[test]
+    fn create_message_null_handle() {
+        let gid = CString::new("aa").unwrap();
+        let pk = CString::new("bb").unwrap();
+        let content = CString::new("hello").unwrap();
+        let mut out: *mut std::os::raw::c_char = std::ptr::null_mut();
+        let code = unsafe {
+            messages::mdk_create_message(
+                std::ptr::null_mut(),
+                gid.as_ptr(),
+                pk.as_ptr(),
+                content.as_ptr(),
+                1,
+                std::ptr::null(),
+                &mut out,
+            )
+        };
+        assert_eq!(code, MdkError::NullPointer);
+    }
+
+    #[test]
+    fn get_message_null_handle() {
+        let gid = CString::new("aa").unwrap();
+        let eid = CString::new("bb").unwrap();
+        let mut out: *mut std::os::raw::c_char = std::ptr::null_mut();
+        let code = unsafe {
+            messages::mdk_get_message(std::ptr::null_mut(), gid.as_ptr(), eid.as_ptr(), &mut out)
+        };
+        assert_eq!(code, MdkError::NullPointer);
+    }
+
+    #[test]
+    fn get_last_message_null_handle() {
+        let gid = CString::new("aa").unwrap();
+        let sort = CString::new("created_at_first").unwrap();
+        let mut out: *mut std::os::raw::c_char = std::ptr::null_mut();
+        let code = unsafe {
+            messages::mdk_get_last_message(
+                std::ptr::null_mut(),
+                gid.as_ptr(),
+                sort.as_ptr(),
+                &mut out,
+            )
+        };
+        assert_eq!(code, MdkError::NullPointer);
+    }
+
+    #[test]
+    fn get_last_message_null_out() {
+        let (handle, _dir) = test_handle();
+        let gid = CString::new("aa").unwrap();
+        let sort = CString::new("created_at_first").unwrap();
+        let code = unsafe {
+            messages::mdk_get_last_message(
+                handle,
+                gid.as_ptr(),
+                sort.as_ptr(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(code, MdkError::NullPointer);
+        unsafe { mdk_free(handle) };
+    }
+
+    #[test]
+    fn process_message_null_handle() {
+        let ev = CString::new("{}").unwrap();
+        let mut out: *mut std::os::raw::c_char = std::ptr::null_mut();
+        let code =
+            unsafe { messages::mdk_process_message(std::ptr::null_mut(), ev.as_ptr(), &mut out) };
+        assert_eq!(code, MdkError::NullPointer);
+    }
+
+    // Key packages
+    #[test]
+    fn create_key_package_with_options_null_handle() {
+        let pk = CString::new("aa").unwrap();
+        let relays = CString::new(r#"["wss://relay.example.com"]"#).unwrap();
+        let mut out: *mut std::os::raw::c_char = std::ptr::null_mut();
+        let code = unsafe {
+            key_packages::mdk_create_key_package_with_options(
+                std::ptr::null_mut(),
+                pk.as_ptr(),
+                relays.as_ptr(),
+                false,
+                &mut out,
+            )
+        };
+        assert_eq!(code, MdkError::NullPointer);
+    }
+
+    #[test]
+    fn create_key_package_with_options_null_out() {
+        let (handle, _dir) = test_handle();
+        let pk = CString::new("aa").unwrap();
+        let relays = CString::new(r#"["wss://relay.example.com"]"#).unwrap();
+        let code = unsafe {
+            key_packages::mdk_create_key_package_with_options(
+                handle,
+                pk.as_ptr(),
+                relays.as_ptr(),
+                false,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(code, MdkError::NullPointer);
+        unsafe { mdk_free(handle) };
+    }
+
+    #[test]
+    fn parse_key_package_null_handle() {
+        let ev = CString::new("{}").unwrap();
+        let mut out: *mut std::os::raw::c_char = std::ptr::null_mut();
+        let code = unsafe {
+            key_packages::mdk_parse_key_package(std::ptr::null_mut(), ev.as_ptr(), &mut out)
+        };
+        assert_eq!(code, MdkError::NullPointer);
+    }
+
+    // Welcomes
+    #[test]
+    fn process_welcome_null_handle() {
+        let wid = CString::new("aa").unwrap();
+        let rumor = CString::new("{}").unwrap();
+        let mut out: *mut std::os::raw::c_char = std::ptr::null_mut();
+        let code = unsafe {
+            welcomes::mdk_process_welcome(
+                std::ptr::null_mut(),
+                wid.as_ptr(),
+                rumor.as_ptr(),
+                &mut out,
+            )
+        };
+        assert_eq!(code, MdkError::NullPointer);
+    }
+
+    #[test]
+    fn accept_welcome_null_handle() {
+        let w = CString::new("{}").unwrap();
+        let code = unsafe { welcomes::mdk_accept_welcome(std::ptr::null_mut(), w.as_ptr()) };
+        assert_eq!(code, MdkError::NullPointer);
+    }
+
+    #[test]
+    fn decline_welcome_null_handle() {
+        let w = CString::new("{}").unwrap();
+        let code = unsafe { welcomes::mdk_decline_welcome(std::ptr::null_mut(), w.as_ptr()) };
+        assert_eq!(code, MdkError::NullPointer);
+    }
+
+    // Constructor null-pointer tests
+    #[test]
+    fn mdk_new_unencrypted_null_db_path() {
+        let mut handle: *mut MdkHandle = std::ptr::null_mut();
+        let code = unsafe { mdk_new_unencrypted(std::ptr::null(), std::ptr::null(), &mut handle) };
+        assert_eq!(code, MdkError::NullPointer);
+        assert!(handle.is_null());
+    }
+
+    #[test]
+    fn mdk_new_with_key_null_out() {
+        let c_path = CString::new("/tmp/test.db").unwrap();
+        let key = [0x42u8; 32];
+        let code = unsafe {
+            mdk_new_with_key(
+                c_path.as_ptr(),
+                key.as_ptr(),
+                key.len(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(code, MdkError::NullPointer);
+    }
+
+    #[test]
+    fn mdk_new_with_key_null_key() {
+        let c_path = CString::new("/tmp/test.db").unwrap();
+        let mut handle: *mut MdkHandle = std::ptr::null_mut();
+        let code = unsafe {
+            mdk_new_with_key(
+                c_path.as_ptr(),
+                std::ptr::null(),
+                32,
+                std::ptr::null(),
+                &mut handle,
+            )
+        };
+        assert_eq!(code, MdkError::NullPointer);
+        assert!(handle.is_null());
+    }
+
+    #[test]
+    fn mdk_new_with_key_null_db_path() {
+        let key = [0x42u8; 32];
+        let mut handle: *mut MdkHandle = std::ptr::null_mut();
+        let code = unsafe {
+            mdk_new_with_key(
+                std::ptr::null(),
+                key.as_ptr(),
+                key.len(),
+                std::ptr::null(),
+                &mut handle,
+            )
+        };
+        assert_eq!(code, MdkError::NullPointer);
+        assert!(handle.is_null());
+    }
+
+    // ── Error message tests ─────────────────────────────────────────────
+
     #[test]
     fn error_message_after_invalid_input() {
         let (handle, _dir) = test_handle();

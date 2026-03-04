@@ -135,3 +135,38 @@ pub unsafe extern "C" fn mdk_parse_key_package(
         unsafe { write_cstring_to(out, event.content.clone()) }
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn serialize_key_package_result_json() {
+        let result = KeyPackageResultJson {
+            key_package: "deadbeef".to_string(),
+            tags: vec![
+                vec!["p".to_string(), "aabb".to_string()],
+                vec!["e".to_string(), "ccdd".to_string()],
+            ],
+            hash_ref: vec![0x01, 0x02, 0x03],
+        };
+        let val = serde_json::to_value(&result).unwrap();
+        assert_eq!(val["key_package"], "deadbeef");
+        assert_eq!(val["tags"][0][0], "p");
+        assert_eq!(val["tags"][0][1], "aabb");
+        assert_eq!(val["tags"][1][0], "e");
+        assert_eq!(val["hash_ref"], serde_json::json!([1, 2, 3]));
+    }
+
+    #[test]
+    fn serialize_key_package_result_empty_tags() {
+        let result = KeyPackageResultJson {
+            key_package: "ff".to_string(),
+            tags: vec![],
+            hash_ref: vec![],
+        };
+        let val = serde_json::to_value(&result).unwrap();
+        assert_eq!(val["tags"], serde_json::json!([]));
+        assert_eq!(val["hash_ref"], serde_json::json!([]));
+    }
+}
