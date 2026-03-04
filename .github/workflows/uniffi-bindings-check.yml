@@ -1,0 +1,154 @@
+name: UniFFI Bindings Check
+
+on:
+  pull_request:
+    branches: [master]
+
+concurrency:
+  group: uniffi-check-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ── Change Detection ────────────────────────────────────────────────
+  changes:
+    name: Detect Changed Paths
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      should_run: ${{ steps.filter.outputs.rust }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Detect changes
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            rust:
+              - 'crates/mdk-core/src/**'
+              - 'crates/mdk-uniffi/src/**'
+              - 'crates/mdk-uniffi/unbound-methods.txt'
+              - 'scripts/check-uniffi-bindings.ts'
+              - '.github/workflows/uniffi-bindings-check.yml'
+
+  # ── Check UniFFI binding coverage ───────────────────────────────────
+  check-bindings:
+    name: Check Bindings
+    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.should_run == 'true'
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: uniffi-check
+
+      - name: Generate rustdoc JSON for mdk-core
+        run: |
+          RUSTDOCFLAGS='-Z unstable-options --output-format json' \
+            cargo +nightly doc -p mdk-core --no-deps --all-features
+
+      - name: Generate rustdoc JSON for mdk-uniffi
+        run: |
+          RUSTDOCFLAGS='-Z unstable-options --output-format json' \
+            cargo +nightly doc -p mdk-uniffi --no-deps --all-features
+
+      - name: Check UniFFI binding coverage
+        id: check
+        run: bun scripts/check-uniffi-bindings.ts
+
+      - name: Comment on PR
+        if: steps.check.outcome == 'success' && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const commentMarker = '<!-- uniffi-bindings-check -->';
+
+            // Skip commenting on PRs from forks
+            const isFork = context.payload.pull_request.head.repo.full_name
+              !== context.payload.repository.full_name;
+            if (isFork) {
+              console.log('Skipping PR comment: PR is from a fork');
+              return;
+            }
+
+            // Check if there are unbound methods to report
+            let body;
+            try {
+              body = fs.readFileSync('/tmp/uniffi-check-comment.md', 'utf-8');
+            } catch (e) {
+              body = null;
+            }
+
+            // Find existing comment from a previous run
+            const { data: comments } = await github.rest.issues.listComments({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+            });
+
+            const existing = comments.find(c =>
+              c.body.includes(commentMarker) && c.user.type === 'Bot'
+            );
+
+            try {
+              if (!body) {
+                // All methods covered — delete stale comment if one exists
+                if (existing) {
+                  await github.rest.issues.deleteComment({
+                    comment_id: existing.id,
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                  });
+                }
+                return;
+              }
+
+              body = commentMarker + '\n' + body;
+
+              if (existing) {
+                await github.rest.issues.updateComment({
+                  comment_id: existing.id,
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  body: body,
+                });
+              } else {
+                await github.rest.issues.createComment({
+                  issue_number: context.issue.number,
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  body: body,
+                });
+              }
+            } catch (error) {
+              if (error.status === 403) {
+                console.log('Unable to comment on PR (likely from fork):', error.message);
+              } else {
+                throw error;
+              }
+            }
