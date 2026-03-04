@@ -2,6 +2,8 @@
 
 Cross-platform language bindings for [mdk-core](../mdk-core) using [UniFFI](https://mozilla.github.io/uniffi-rs/). This crate wraps MDK's secure group messaging functionality with SQLite storage, exposing it to Kotlin, Swift, Python, and Ruby.
 
+These bindings include all features in mdk, if you'd like smaller bindings without features such as MIP-04, or you'd like bindings for other languages, please let us know by opening an issue!
+
 ## Supported Platforms
 
 - **Kotlin/JVM** (Android)

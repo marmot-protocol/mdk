@@ -23,7 +23,7 @@ name = "mdk_uniffi"
 crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
-mdk-core = { workspace = true, default-features = false }
+mdk-core = { workspace = true, default-features = false, features = ["mip04"] }
 mdk-sqlite-storage = { workspace = true, default-features = false }
 mdk-storage-traits = { workspace = true, default-features = false }
 nostr = { workspace = true, features = ["std", "nip44"] }
@@ -36,7 +36,7 @@ uniffi = { version = "0.31", features = ["cli"] }
 uniffi_macros = "0.31"
 
 [features]
-default = []
+default = ["mip04"]
 mip04 = ["mdk-core/mip04"]
 
 [dev-dependencies]

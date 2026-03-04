@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Mutex;
 
+use mdk_core::encrypted_media::{EncryptedMediaUpload, MediaProcessingOptions, MediaReference};
 use mdk_core::{
     Error as MdkError, MDK, MdkConfig as CoreMdkConfig,
     extension::group_image::{
@@ -1466,6 +1467,356 @@ pub fn derive_upload_keypair(image_key: Vec<u8>, version: u16) -> Result<String,
     Ok(keys.secret_key().to_secret_hex())
 }
 
+// ── MIP-04: Encrypted Media ──────────────────────────────────────────────────
+
+/// Options for controlling media processing during encryption
+///
+/// All fields are optional and fall back to sensible, privacy-first defaults
+/// when `None`. Pass `None` for the whole struct to use `encrypt_media_for_upload`
+/// instead, which uses these defaults automatically.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct MediaProcessingOptionsInput {
+    /// Strip EXIF and other metadata from images for privacy (default: `true`)
+    pub sanitize_exif: bool,
+    /// Generate a blurhash preview string for images (default: `true`)
+    pub generate_blurhash: bool,
+    /// Maximum allowed image dimension in pixels (default: 16384)
+    pub max_dimension: Option<u32>,
+    /// Maximum allowed file size in bytes (default: 100 MiB)
+    pub max_file_size: Option<u64>,
+    /// Maximum allowed filename length in characters (default: 210)
+    pub max_filename_length: Option<u64>,
+}
+
+impl From<MediaProcessingOptionsInput> for MediaProcessingOptions {
+    fn from(o: MediaProcessingOptionsInput) -> Self {
+        Self {
+            sanitize_exif: o.sanitize_exif,
+            generate_blurhash: o.generate_blurhash,
+            max_dimension: o.max_dimension,
+            max_file_size: o.max_file_size.map(|v| v as usize),
+            max_filename_length: o.max_filename_length.map(|v| v as usize),
+        }
+    }
+}
+
+/// Result of encrypting media for upload
+///
+/// Contains the encrypted bytes ready for upload to a Blossom server, along
+/// with the metadata required to build the IMETA tag and later decrypt the file.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct EncryptedMediaUploadResult {
+    /// Encrypted media bytes — upload these to your Blossom server
+    pub encrypted_data: Vec<u8>,
+    /// SHA-256 hash of the original (pre-encryption, post-sanitization) data
+    pub original_hash: Vec<u8>,
+    /// SHA-256 hash of the encrypted data — verify against the Blossom server response
+    pub encrypted_hash: Vec<u8>,
+    /// Canonical MIME type of the original media (e.g. `"image/webp"`)
+    pub mime_type: String,
+    /// Original filename
+    pub filename: String,
+    /// Size of the original data in bytes
+    pub original_size: u64,
+    /// Size of the encrypted data in bytes
+    pub encrypted_size: u64,
+    /// Image dimensions `[width, height]` if the media is an image, otherwise `None`
+    pub dimensions: Option<Vec<u32>>,
+    /// Blurhash preview string if generated, otherwise `None`
+    pub blurhash: Option<String>,
+    /// 12-byte ChaCha20-Poly1305 nonce used for encryption
+    pub nonce: Vec<u8>,
+}
+
+impl TryFrom<EncryptedMediaUpload> for EncryptedMediaUploadResult {
+    type Error = MdkUniffiError;
+
+    fn try_from(u: EncryptedMediaUpload) -> Result<Self, Self::Error> {
+        Ok(Self {
+            encrypted_data: u.encrypted_data,
+            original_hash: u.original_hash.to_vec(),
+            encrypted_hash: u.encrypted_hash.to_vec(),
+            mime_type: u.mime_type,
+            filename: u.filename,
+            original_size: u.original_size,
+            encrypted_size: u.encrypted_size,
+            dimensions: u.dimensions.map(|(w, h)| vec![w, h]),
+            blurhash: u.blurhash,
+            nonce: u.nonce.to_vec(),
+        })
+    }
+}
+
+/// A reference to an encrypted media file stored on a Blossom server
+///
+/// This is parsed from an IMETA tag (via `parse_media_imeta_tag`) and passed
+/// to `decrypt_media_from_download` to retrieve the original file.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct MediaReferenceRecord {
+    /// URL where the encrypted file is stored
+    pub url: String,
+    /// SHA-256 hash of the original (pre-encryption) data — 32 bytes
+    pub original_hash: Vec<u8>,
+    /// MIME type of the original media
+    pub mime_type: String,
+    /// Original filename
+    pub filename: String,
+    /// Image dimensions `[width, height]` if the media is an image, otherwise `None`
+    pub dimensions: Option<Vec<u32>>,
+    /// Encryption scheme version (e.g. `"mip04-v2"`)
+    pub scheme_version: String,
+    /// 12-byte ChaCha20-Poly1305 nonce — 12 bytes
+    pub nonce: Vec<u8>,
+}
+
+impl TryFrom<MediaReferenceRecord> for MediaReference {
+    type Error = MdkUniffiError;
+
+    fn try_from(r: MediaReferenceRecord) -> Result<Self, Self::Error> {
+        let original_hash: [u8; 32] = r.original_hash.try_into().map_err(|_| {
+            MdkUniffiError::InvalidInput("original_hash must be 32 bytes".to_string())
+        })?;
+        let nonce: [u8; 12] = r
+            .nonce
+            .try_into()
+            .map_err(|_| MdkUniffiError::InvalidInput("nonce must be 12 bytes".to_string()))?;
+        let dimensions = r
+            .dimensions
+            .map(|d| {
+                if d.len() == 2 {
+                    Ok((d[0], d[1]))
+                } else {
+                    Err(MdkUniffiError::InvalidInput(
+                        "dimensions must be a two-element array [width, height]".to_string(),
+                    ))
+                }
+            })
+            .transpose()?;
+        Ok(MediaReference {
+            url: r.url,
+            original_hash,
+            mime_type: r.mime_type,
+            filename: r.filename,
+            dimensions,
+            scheme_version: r.scheme_version,
+            nonce,
+        })
+    }
+}
+
+impl From<MediaReference> for MediaReferenceRecord {
+    fn from(r: MediaReference) -> Self {
+        Self {
+            url: r.url,
+            original_hash: r.original_hash.to_vec(),
+            mime_type: r.mime_type,
+            filename: r.filename,
+            dimensions: r.dimensions.map(|(w, h)| vec![w, h]),
+            scheme_version: r.scheme_version,
+            nonce: r.nonce.to_vec(),
+        }
+    }
+}
+
+// ── MIP-04 methods on Mdk ────────────────────────────────────────────────────
+
+#[uniffi::export]
+impl Mdk {
+    /// Encrypt media for upload using default processing options
+    ///
+    /// Encrypts the supplied media file with the group's current MLS epoch key,
+    /// producing ciphertext ready to upload to a Blossom server. Images are
+    /// automatically EXIF-sanitized and a blurhash preview is generated.
+    ///
+    /// After uploading the encrypted bytes, call `create_media_imeta_tag` with
+    /// the returned result and the Blossom URL to build the IMETA tag to attach
+    /// to the group message.
+    ///
+    /// # Arguments
+    ///
+    /// * `mls_group_id` - Hex-encoded MLS group ID
+    /// * `data` - Raw media file bytes
+    /// * `mime_type` - MIME type of the media (e.g. `"image/jpeg"`)
+    /// * `filename` - Original filename (used as AAD in the encryption)
+    pub fn encrypt_media_for_upload(
+        &self,
+        mls_group_id: String,
+        data: Vec<u8>,
+        mime_type: String,
+        filename: String,
+    ) -> Result<EncryptedMediaUploadResult, MdkUniffiError> {
+        let group_id = parse_group_id(&mls_group_id)?;
+        let mdk = self.lock()?;
+        let upload = mdk
+            .media_manager(group_id)
+            .encrypt_for_upload(&data, &mime_type, &filename)
+            .map_err(|e| MdkUniffiError::Mdk(e.to_string()))?;
+        EncryptedMediaUploadResult::try_from(upload)
+    }
+
+    /// Encrypt media for upload with custom processing options
+    ///
+    /// Same as `encrypt_media_for_upload` but lets you override EXIF sanitization,
+    /// blurhash generation, and size/dimension limits.
+    ///
+    /// # Arguments
+    ///
+    /// * `mls_group_id` - Hex-encoded MLS group ID
+    /// * `data` - Raw media file bytes
+    /// * `mime_type` - MIME type of the media (e.g. `"image/jpeg"`)
+    /// * `filename` - Original filename (used as AAD in the encryption)
+    /// * `options` - Custom processing options
+    pub fn encrypt_media_for_upload_with_options(
+        &self,
+        mls_group_id: String,
+        data: Vec<u8>,
+        mime_type: String,
+        filename: String,
+        options: MediaProcessingOptionsInput,
+    ) -> Result<EncryptedMediaUploadResult, MdkUniffiError> {
+        let group_id = parse_group_id(&mls_group_id)?;
+        let core_options = MediaProcessingOptions::from(options);
+        let mdk = self.lock()?;
+        let upload = mdk
+            .media_manager(group_id)
+            .encrypt_for_upload_with_options(&data, &mime_type, &filename, &core_options)
+            .map_err(|e| MdkUniffiError::Mdk(e.to_string()))?;
+        EncryptedMediaUploadResult::try_from(upload)
+    }
+
+    /// Decrypt media downloaded from a Blossom server
+    ///
+    /// Decrypts the encrypted bytes using the key derived from the group's MLS
+    /// epoch that was active when the file was encrypted (looked up automatically
+    /// via the epoch hint stored alongside the message). Falls back to the current
+    /// epoch if no hint is available.
+    ///
+    /// The `reference` parameter is typically obtained by calling
+    /// `parse_media_imeta_tag` on the IMETA tag attached to the message.
+    ///
+    /// # Arguments
+    ///
+    /// * `mls_group_id` - Hex-encoded MLS group ID
+    /// * `encrypted_data` - Encrypted bytes downloaded from the Blossom server
+    /// * `reference` - Parsed media reference (from `parse_media_imeta_tag`)
+    pub fn decrypt_media_from_download(
+        &self,
+        mls_group_id: String,
+        encrypted_data: Vec<u8>,
+        reference: MediaReferenceRecord,
+    ) -> Result<Vec<u8>, MdkUniffiError> {
+        let group_id = parse_group_id(&mls_group_id)?;
+        let core_reference = MediaReference::try_from(reference)?;
+        let mdk = self.lock()?;
+        mdk.media_manager(group_id)
+            .decrypt_from_download(&encrypted_data, &core_reference)
+            .map_err(|e| MdkUniffiError::Mdk(e.to_string()))
+    }
+
+    /// Build an IMETA tag for an encrypted media upload
+    ///
+    /// Creates the IMETA Nostr tag per the MIP-04 specification. Attach this tag
+    /// to the group message event after uploading the encrypted bytes to Blossom.
+    ///
+    /// Returns the tag as a `Vec<Vec<String>>` (the standard UniFFI tag format).
+    ///
+    /// # Arguments
+    ///
+    /// * `mls_group_id` - Hex-encoded MLS group ID
+    /// * `upload` - The result returned by `encrypt_media_for_upload`
+    /// * `uploaded_url` - The URL returned by the Blossom server after upload
+    pub fn create_media_imeta_tag(
+        &self,
+        mls_group_id: String,
+        upload: EncryptedMediaUploadResult,
+        uploaded_url: String,
+    ) -> Result<Vec<Vec<String>>, MdkUniffiError> {
+        let group_id = parse_group_id(&mls_group_id)?;
+        let core_upload = EncryptedMediaUpload::try_from(upload)?;
+        let mdk = self.lock()?;
+        let tag = mdk
+            .media_manager(group_id)
+            .create_imeta_tag(&core_upload, &uploaded_url);
+        Ok(vec![tag.as_slice().to_vec()])
+    }
+
+    /// Parse an IMETA tag into a `MediaReferenceRecord` for decryption
+    ///
+    /// Validates and decodes the IMETA tag fields according to the MIP-04
+    /// specification. The returned record can be passed directly to
+    /// `decrypt_media_from_download`.
+    ///
+    /// The tag must be provided as a single-element `Vec<Vec<String>>` — the
+    /// same format returned by `create_media_imeta_tag` and the standard UniFFI
+    /// tag wire format.
+    ///
+    /// # Arguments
+    ///
+    /// * `mls_group_id` - Hex-encoded MLS group ID
+    /// * `imeta_tag` - IMETA tag as `Vec<Vec<String>>`
+    pub fn parse_media_imeta_tag(
+        &self,
+        mls_group_id: String,
+        imeta_tag: Vec<Vec<String>>,
+    ) -> Result<MediaReferenceRecord, MdkUniffiError> {
+        let group_id = parse_group_id(&mls_group_id)?;
+        let tags = parse_tags(imeta_tag)?;
+        let tag = tags
+            .into_iter()
+            .next()
+            .ok_or_else(|| MdkUniffiError::InvalidInput("Expected one IMETA tag".to_string()))?;
+        let mdk = self.lock()?;
+        let reference = mdk
+            .media_manager(group_id)
+            .parse_imeta_tag(&tag)
+            .map_err(|e| MdkUniffiError::Mdk(e.to_string()))?;
+        Ok(MediaReferenceRecord::from(reference))
+    }
+}
+
+// ── MIP-04 TryFrom for EncryptedMediaUpload (reverse direction for imeta tag) ─
+
+impl TryFrom<EncryptedMediaUploadResult> for EncryptedMediaUpload {
+    type Error = MdkUniffiError;
+
+    fn try_from(r: EncryptedMediaUploadResult) -> Result<Self, Self::Error> {
+        let original_hash: [u8; 32] = r.original_hash.try_into().map_err(|_| {
+            MdkUniffiError::InvalidInput("original_hash must be 32 bytes".to_string())
+        })?;
+        let encrypted_hash: [u8; 32] = r.encrypted_hash.try_into().map_err(|_| {
+            MdkUniffiError::InvalidInput("encrypted_hash must be 32 bytes".to_string())
+        })?;
+        let nonce: [u8; 12] = r
+            .nonce
+            .try_into()
+            .map_err(|_| MdkUniffiError::InvalidInput("nonce must be 12 bytes".to_string()))?;
+        let dimensions = r
+            .dimensions
+            .map(|d| {
+                if d.len() == 2 {
+                    Ok((d[0], d[1]))
+                } else {
+                    Err(MdkUniffiError::InvalidInput(
+                        "dimensions must be a two-element array [width, height]".to_string(),
+                    ))
+                }
+            })
+            .transpose()?;
+        Ok(EncryptedMediaUpload {
+            encrypted_data: r.encrypted_data,
+            original_hash,
+            encrypted_hash,
+            mime_type: r.mime_type,
+            filename: r.filename,
+            original_size: r.original_size,
+            encrypted_size: r.encrypted_size,
+            dimensions,
+            blurhash: r.blurhash,
+            nonce,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2474,5 +2825,208 @@ mod tests {
         let result = parse_tags(tags);
         assert!(result.is_ok());
         assert_eq!(result.unwrap().len(), 0);
+    }
+
+    // ── MIP-04 encrypted media tests ─────────────────────────────────────────
+
+    mod mip04 {
+        use nostr::{EventBuilder, Keys, Kind, Tag};
+
+        use super::*;
+
+        /// Small binary test payload — used as a stand-in for any file type that
+        /// does NOT trigger image-specific metadata extraction (we use application/octet-stream).
+        const TEST_PAYLOAD: &[u8] = b"hello encrypted media round-trip test payload";
+
+        fn create_test_group(mdk: &Mdk) -> String {
+            let creator_keys = Keys::generate();
+            let member_keys = Keys::generate();
+            let relays = vec!["wss://relay.example.com".to_string()];
+
+            let key_package_result = mdk
+                .create_key_package_for_event(member_keys.public_key().to_hex(), relays.clone())
+                .unwrap();
+
+            let key_package_event =
+                EventBuilder::new(Kind::MlsKeyPackage, key_package_result.key_package)
+                    .tags(
+                        key_package_result
+                            .tags
+                            .iter()
+                            .map(|t| Tag::parse(t.clone()).unwrap())
+                            .collect::<Vec<_>>(),
+                    )
+                    .sign_with_keys(&member_keys)
+                    .unwrap();
+
+            let result = mdk
+                .create_group(
+                    creator_keys.public_key().to_hex(),
+                    vec![serde_json::to_string(&key_package_event).unwrap()],
+                    "Test Group".to_string(),
+                    "Test Description".to_string(),
+                    relays,
+                    vec![creator_keys.public_key().to_hex()],
+                )
+                .unwrap();
+
+            result.group.mls_group_id
+        }
+
+        #[test]
+        fn test_decrypt_media_invalid_nonce_length() {
+            let mdk = create_test_mdk();
+            let group_id = create_test_group(&mdk);
+
+            let bad_reference = MediaReferenceRecord {
+                url: "https://blossom.example.com/abc.jpg".to_string(),
+                original_hash: vec![0u8; 32],
+                mime_type: "image/jpeg".to_string(),
+                filename: "test.jpg".to_string(),
+                dimensions: None,
+                scheme_version: "mip04-v2".to_string(),
+                nonce: vec![0u8; 8], // wrong length — should be 12
+            };
+
+            let result = mdk.decrypt_media_from_download(group_id, vec![0u8; 64], bad_reference);
+            assert!(matches!(result, Err(MdkUniffiError::InvalidInput(_))));
+        }
+
+        #[test]
+        fn test_encrypt_media_for_upload_returns_encrypted_data() {
+            let mdk = create_test_mdk();
+            let group_id = create_test_group(&mdk);
+
+            let result = mdk.encrypt_media_for_upload(
+                group_id,
+                TEST_PAYLOAD.to_vec(),
+                "application/octet-stream".to_string(),
+                "test.bin".to_string(),
+            );
+
+            assert!(
+                result.is_ok(),
+                "encrypt_media_for_upload failed: {result:?}"
+            );
+            let upload = result.unwrap();
+            assert!(!upload.encrypted_data.is_empty());
+            assert_eq!(upload.original_hash.len(), 32);
+            assert_eq!(upload.encrypted_hash.len(), 32);
+            assert_eq!(upload.nonce.len(), 12);
+            assert_eq!(upload.mime_type, "application/octet-stream");
+            assert_eq!(upload.filename, "test.bin");
+        }
+
+        #[test]
+        fn test_encrypt_decrypt_round_trip() {
+            let mdk = create_test_mdk();
+            let group_id = create_test_group(&mdk);
+
+            let upload = mdk
+                .encrypt_media_for_upload(
+                    group_id.clone(),
+                    TEST_PAYLOAD.to_vec(),
+                    "application/octet-stream".to_string(),
+                    "payload.bin".to_string(),
+                )
+                .unwrap();
+
+            // Build a MediaReferenceRecord directly from the upload result
+            let reference = MediaReferenceRecord {
+                url: "https://blossom.example.com/abc123.bin".to_string(),
+                original_hash: upload.original_hash.clone(),
+                mime_type: upload.mime_type.clone(),
+                filename: upload.filename.clone(),
+                dimensions: upload.dimensions.clone(),
+                scheme_version: "mip04-v2".to_string(),
+                nonce: upload.nonce.clone(),
+            };
+
+            let decrypted = mdk
+                .decrypt_media_from_download(group_id, upload.encrypted_data.clone(), reference)
+                .unwrap();
+
+            // Decrypted data must not be empty and must not equal the ciphertext
+            assert!(!decrypted.is_empty());
+            assert_ne!(decrypted, upload.encrypted_data);
+            assert_eq!(decrypted, TEST_PAYLOAD);
+        }
+
+        #[test]
+        fn test_create_and_parse_imeta_tag_round_trip() {
+            let mdk = create_test_mdk();
+            let group_id = create_test_group(&mdk);
+
+            let upload = mdk
+                .encrypt_media_for_upload(
+                    group_id.clone(),
+                    TEST_PAYLOAD.to_vec(),
+                    "application/octet-stream".to_string(),
+                    "payload.bin".to_string(),
+                )
+                .unwrap();
+
+            let uploaded_url = "https://blossom.example.com/abc123.bin".to_string();
+            let imeta_tag = mdk
+                .create_media_imeta_tag(group_id.clone(), upload.clone(), uploaded_url.clone())
+                .unwrap();
+
+            assert_eq!(imeta_tag.len(), 1, "Expected exactly one tag");
+            let tag_inner = &imeta_tag[0];
+            assert_eq!(tag_inner[0], "imeta");
+
+            // Round-trip: parse the tag back into a MediaReferenceRecord
+            let reference = mdk
+                .parse_media_imeta_tag(group_id.clone(), imeta_tag)
+                .unwrap();
+
+            assert_eq!(reference.url, uploaded_url);
+            assert_eq!(reference.mime_type, "application/octet-stream");
+            assert_eq!(reference.filename, "payload.bin");
+            assert_eq!(reference.original_hash, upload.original_hash);
+            assert_eq!(reference.nonce, upload.nonce);
+            assert_eq!(reference.scheme_version, "mip04-v2");
+        }
+
+        #[test]
+        fn test_encrypt_with_options_no_blurhash() {
+            let mdk = create_test_mdk();
+            let group_id = create_test_group(&mdk);
+
+            let options = MediaProcessingOptionsInput {
+                sanitize_exif: true,
+                generate_blurhash: false,
+                max_dimension: None,
+                max_file_size: None,
+                max_filename_length: None,
+            };
+
+            let result = mdk.encrypt_media_for_upload_with_options(
+                group_id,
+                TEST_PAYLOAD.to_vec(),
+                "application/octet-stream".to_string(),
+                "test.bin".to_string(),
+                options,
+            );
+
+            assert!(result.is_ok(), "{result:?}");
+            let upload = result.unwrap();
+            assert!(
+                upload.blurhash.is_none(),
+                "Expected no blurhash when generate_blurhash = false"
+            );
+        }
+
+        #[test]
+        fn test_encrypt_media_invalid_group_id() {
+            let mdk = create_test_mdk();
+            let result = mdk.encrypt_media_for_upload(
+                "not_valid_hex".to_string(),
+                TEST_PAYLOAD.to_vec(),
+                "application/octet-stream".to_string(),
+                "test.bin".to_string(),
+            );
+            assert!(matches!(result, Err(MdkUniffiError::InvalidInput(_))));
+        }
     }
 }
