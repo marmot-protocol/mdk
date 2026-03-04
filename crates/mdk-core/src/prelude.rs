@@ -29,8 +29,8 @@ pub use mdk_storage_traits::GroupId;
 pub use crate::extension::NostrGroupDataExtension;
 /// Group operation results
 pub use crate::groups::{
-    GroupResult, NostrGroupConfigData, NostrGroupDataUpdate, PendingMemberChanges,
-    UpdateGroupResult,
+    GroupResult, LeafNodeInfo, NostrGroupConfigData, NostrGroupDataUpdate, PendingMemberChanges,
+    RatchetTreeInfo, UpdateGroupResult,
 };
 /// Message processing result variants
 pub use crate::messages::MessageProcessingResult;

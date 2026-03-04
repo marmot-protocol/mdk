@@ -37,6 +37,17 @@
 
 ### Deprecated
 
+## [0.7.0] - 2026-03-04
+
+### Breaking changes
+
+- `GroupScopedSnapshot` has a new `group_mip04_exporter_secrets` field. Any code constructing this struct directly must be updated. ([#208](https://github.com/marmot-protocol/mdk/pull/208))
+- `MemoryStorageSnapshot` has a new `group_mip04_exporter_secrets` field. Any code constructing this struct directly must be updated. ([#208](https://github.com/marmot-protocol/mdk/pull/208))
+
+### Added
+
+- Implemented `GroupStorage::get_group_mip04_exporter_secret` and `GroupStorage::save_group_mip04_exporter_secret` using a separate `group_mip04_exporter_secrets_cache` LRU cache. ([#208](https://github.com/marmot-protocol/mdk/pull/208))
+
 ## [0.6.0] - 2026-02-18
 
 ### Breaking changes

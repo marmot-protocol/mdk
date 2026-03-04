@@ -7,7 +7,6 @@
 use std::string::FromUtf8Error;
 use std::{fmt, str};
 
-use nostr::nips::nip44;
 use nostr::types::url;
 use nostr::{Kind, SignerError, event, key};
 use openmls::credentials::errors::BasicCredentialError;
@@ -41,9 +40,6 @@ pub enum Error {
     /// Nostr Signer error
     #[error(transparent)]
     Signer(#[from] SignerError),
-    /// NIP44 error
-    #[error(transparent)]
-    NIP44(#[from] nip44::Error),
     /// Relay URL error
     #[error(transparent)]
     RelayUrl(#[from] url::Error),

@@ -150,7 +150,12 @@ _build-uniffi-ios TARGET:
         exit 1
     fi
 
-    cargo build --release --lib -p mdk-uniffi --target {{TARGET}}
+    # Set the deployment target so C dependencies (sqlite3-sys, secp256k1-sys) compile
+    # against the same iOS version as the Swift package minimum (iOS 15). Without this,
+    # the system Clang defaults to the current SDK version (e.g. 18.5), which emits
+    # symbols like ___chkstk_darwin that are unavailable at the linker's deployment target,
+    # causing "undefined symbol" link errors.
+    IPHONEOS_DEPLOYMENT_TARGET=15.0 cargo build --release --lib -p mdk-uniffi --target {{TARGET}}
 
 _build-uniffi-android TARGET CLANG_PREFIX:
     #!/usr/bin/env bash

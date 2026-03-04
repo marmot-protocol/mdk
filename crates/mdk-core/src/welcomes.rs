@@ -412,6 +412,7 @@ where
         let mls_group_config = MlsGroupJoinConfig::builder()
             .use_ratchet_tree_extension(true)
             .sender_ratchet_configuration(sender_ratchet_config)
+            .max_past_epochs(self.config.max_past_epochs)
             .build();
 
         let staged_welcome =
@@ -539,8 +540,8 @@ mod tests {
     use super::*;
     use crate::test_util::*;
     use crate::tests::create_test_mdk;
-    use nostr::base64::Engine;
-    use nostr::base64::engine::general_purpose::STANDARD as BASE64;
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD as BASE64;
     use nostr::{Keys, Kind, TagKind};
 
     /// Test that Welcome event structure matches Marmot spec (MIP-02)

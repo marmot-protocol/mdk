@@ -219,8 +219,28 @@ where
                     };
                 }
 
-                // Save exporter secret for the new epoch
+                // Save MIP-03 and MIP-04 exporter secrets for the new epoch
                 self.exporter_secret(&group.mls_group_id)?;
+                #[cfg(feature = "mip04")]
+                {
+                    let mip04_secret = self.mip04_exporter_secret(&group.mls_group_id)?;
+                    self.storage()
+                        .save_group_mip04_exporter_secret(mip04_secret)
+                        .map_err(|_| {
+                            Error::Group("Failed to save MIP-04 exporter secret".to_string())
+                        })?;
+                }
+
+                let min_epoch_to_keep = mls_group
+                    .epoch()
+                    .as_u64()
+                    .saturating_sub(self.config.max_past_epochs as u64);
+                self.storage()
+                    .prune_group_exporter_secrets_before_epoch(
+                        &group.mls_group_id,
+                        min_epoch_to_keep,
+                    )
+                    .map_err(|_| Error::Group("Failed to prune exporter secrets".to_string()))?;
 
                 // Sync the stored group metadata with the updated MLS group state
                 self.sync_group_metadata_from_mls(&group.mls_group_id)?;

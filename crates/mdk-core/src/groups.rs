@@ -22,9 +22,12 @@ use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
 use tls_codec::Serialize as TlsSerialize;
 
+use sha2::{Digest, Sha256};
+
 use super::MDK;
 use super::extension::NostrGroupDataExtension;
 use crate::error::Error;
+use crate::messages::crypto::encrypt_message_with_exporter_secret;
 use crate::util::{ContentEncoding, encode_content};
 
 /// Result of creating a new MLS group
@@ -96,6 +99,47 @@ pub struct PendingMemberChanges {
     pub additions: Vec<PublicKey>,
     /// Public keys of members that will be removed when proposals are committed
     pub removals: Vec<PublicKey>,
+}
+
+/// Public information about a leaf node in the ratchet tree
+///
+/// Contains only public information (encryption key, signature key, credential
+/// identity). No secret key material is included.
+///
+/// # Security Note
+///
+/// The ratchet tree holds public keys and tree structure, not secrets.
+/// The MLS spec assumes this data can be shared (e.g. in Welcome messages).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeafNodeInfo {
+    /// The leaf index in the ratchet tree
+    pub index: u32,
+    /// The member's public HPKE encryption key (hex-encoded)
+    pub encryption_key: String,
+    /// The member's public signature key (hex-encoded)
+    pub signature_key: String,
+    /// The member's credential identity (hex-encoded, typically a Nostr public key)
+    pub credential_identity: String,
+}
+
+/// Public information about the ratchet tree of an MLS group
+///
+/// Provides a view into the MLS group's tree structure.
+/// Contains only public information — no secrets or private key material.
+///
+/// # Security Note
+///
+/// The ratchet tree holds public keys and tree structure, not secrets.
+/// The MLS spec assumes this data can be shared (e.g. in Welcome messages).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RatchetTreeInfo {
+    /// SHA-256 fingerprint of the TLS-serialized ratchet tree (hex-encoded).
+    /// Useful for comparing tree state across clients.
+    pub tree_hash: String,
+    /// The full ratchet tree serialized via TLS encoding (hex-encoded)
+    pub serialized_tree: String,
+    /// Leaf nodes with their indices and public keys
+    pub leaf_nodes: Vec<LeafNodeInfo>,
 }
 
 impl NostrGroupConfigData {
@@ -332,9 +376,10 @@ where
         self.load_mls_group_impl(group_id)
     }
 
-    /// Exports the current epoch's secret key from an MLS group (internal version)
+    /// Exports the current epoch's secret key from an MLS group for MIP-03 message encryption.
     ///
-    /// This secret is used for NIP-44 message encryption in Group Message Events (kind:445).
+    /// Uses `MLS-Exporter("marmot", "group-event", 32)` per MIP-03. The secret is the
+    /// ChaCha20-Poly1305 encryption key for kind:445 Group Message Events.
     /// The secret is cached in storage to avoid re-exporting it for each message.
     ///
     /// # Arguments
@@ -360,7 +405,7 @@ where
             // If it's not already in the storage, export the secret and save it
             None => {
                 let export_secret: [u8; 32] = group
-                    .export_secret(self.provider.crypto(), "nostr", b"nostr", 32)?
+                    .export_secret(self.provider.crypto(), "marmot", b"group-event", 32)?
                     .try_into()
                     .map_err(|_| {
                         Error::Group("Failed to convert export secret to [u8; 32]".to_string())
@@ -378,6 +423,41 @@ where
                 Ok(group_exporter_secret)
             }
         }
+    }
+
+    /// Exports the current epoch's secret key from an MLS group for MIP-04 encrypted media.
+    ///
+    /// Uses `MLS-Exporter("marmot", "encrypted-media", 32)` per MIP-04. This is a separate
+    /// exporter from [`Self::exporter_secret`] (which uses `"group-event"` for MIP-03).
+    /// The result is used as HKDF input keying material for per-file encryption key derivation.
+    ///
+    /// # Arguments
+    ///
+    /// * `group_id` - The MLS group ID
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(GroupExporterSecret)` - The exported secret
+    /// * `Err(Error)` - If the group is not found or there is an error exporting the secret
+    #[cfg(feature = "mip04")]
+    pub(crate) fn mip04_exporter_secret(
+        &self,
+        group_id: &crate::GroupId,
+    ) -> Result<group_types::GroupExporterSecret, Error> {
+        let group = self.load_mls_group(group_id)?.ok_or(Error::GroupNotFound)?;
+
+        let export_secret: [u8; 32] = group
+            .export_secret(self.provider.crypto(), "marmot", b"encrypted-media", 32)?
+            .try_into()
+            .map_err(|_| {
+                Error::Group("Failed to convert MIP-04 export secret to [u8; 32]".to_string())
+            })?;
+
+        Ok(group_types::GroupExporterSecret {
+            mls_group_id: group_id.clone(),
+            epoch: group.epoch().as_u64(),
+            secret: mdk_storage_traits::Secret::new(export_secret),
+        })
     }
 
     /// Retrieves a MDK group by its MLS group ID
@@ -448,6 +528,68 @@ where
             let public_key = self.parse_credential_identity(identity_bytes)?;
             acc.insert(public_key);
             Ok(acc)
+        })
+    }
+
+    /// Returns public information about the ratchet tree of an MLS group
+    ///
+    /// This includes a SHA-256 fingerprint of the TLS-serialized ratchet tree,
+    /// the full serialized tree as hex, and a list of leaf nodes with their
+    /// indices and public keys.
+    ///
+    /// # Security Note
+    ///
+    /// The ratchet tree holds public keys and tree structure, not secrets.
+    /// Per the MLS spec, ratchet tree data is public information that can be
+    /// shared (e.g., in Welcome messages).
+    ///
+    /// # Arguments
+    ///
+    /// * `group_id` - The MLS group ID
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(RatchetTreeInfo)` - Public information about the ratchet tree
+    /// * `Err(Error)` - If the group is not found or there is an error accessing the tree
+    pub fn get_ratchet_tree_info(&self, group_id: &GroupId) -> Result<RatchetTreeInfo, Error> {
+        let mls_group = self.load_mls_group(group_id)?.ok_or(Error::GroupNotFound)?;
+
+        // Export and TLS-serialize the ratchet tree
+        let ratchet_tree = mls_group.export_ratchet_tree();
+        let serialized_bytes = ratchet_tree.tls_serialize_detached()?;
+
+        // Compute SHA-256 fingerprint of the serialized tree for easy comparison
+        let tree_hash = hex::encode(Sha256::digest(&serialized_bytes));
+        let serialized_tree = hex::encode(&serialized_bytes);
+
+        // Extract leaf nodes with their public keys
+        let leaf_nodes: Vec<LeafNodeInfo> = mls_group
+            .members()
+            .map(|member| {
+                let index = member.index.u32();
+                let basic_cred = BasicCredential::try_from(member.credential).map_err(|e| {
+                    tracing::warn!(
+                        leaf_index = index,
+                        error = %e,
+                        "Failed to parse credential for leaf node in ratchet tree"
+                    );
+                    Error::Group(format!("invalid credential at leaf index {index}: {e}"))
+                })?;
+                let credential_identity = hex::encode(basic_cred.identity());
+
+                Ok(LeafNodeInfo {
+                    index,
+                    encryption_key: hex::encode(&member.encryption_key),
+                    signature_key: hex::encode(&member.signature_key),
+                    credential_identity,
+                })
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+
+        Ok(RatchetTreeInfo {
+            tree_hash,
+            serialized_tree,
+            leaf_nodes,
         })
     }
 
@@ -1018,6 +1160,7 @@ where
             .capabilities(capabilities)
             .with_group_context_extensions(extensions)
             .sender_ratchet_configuration(sender_ratchet_config)
+            .max_past_epochs(self.config.max_past_epochs)
             .build();
 
         let mut mls_group =
@@ -1368,6 +1511,24 @@ where
 
         mls_group.merge_pending_commit(&self.provider)?;
 
+        // Save MIP-03 and MIP-04 exporter secrets for the new epoch
+        self.exporter_secret(group_id)?;
+        #[cfg(feature = "mip04")]
+        {
+            let mip04_secret = self.mip04_exporter_secret(group_id)?;
+            self.storage()
+                .save_group_mip04_exporter_secret(mip04_secret)
+                .map_err(|_| Error::Group("Failed to save MIP-04 exporter secret".to_string()))?;
+        }
+
+        let min_epoch_to_keep = mls_group
+            .epoch()
+            .as_u64()
+            .saturating_sub(self.config.max_past_epochs as u64);
+        self.storage()
+            .prune_group_exporter_secrets_before_epoch(group_id, min_epoch_to_keep)
+            .map_err(|_| Error::Group("Failed to prune exporter secrets".to_string()))?;
+
         // Sync the stored group metadata with the updated MLS group state
         self.sync_group_metadata_from_mls(group_id)?;
 
@@ -1523,7 +1684,11 @@ where
         Ok(())
     }
 
-    /// Creates a NIP-44 encrypted message event Kind: 445 signing with an ephemeral keypair.
+    /// Creates a ChaCha20-Poly1305 encrypted message event Kind: 445 signed with an ephemeral keypair.
+    ///
+    /// Per MIP-03, the encryption key is derived via `MLS-Exporter("marmot", "group-event", 32)`,
+    /// a random 12-byte nonce is generated per event. No AAD is used per MIP-03.
+    /// The content format is `base64(nonce || ciphertext)`.
     pub(crate) fn build_message_event(
         &self,
         group_id: &GroupId,
@@ -1531,30 +1696,19 @@ where
     ) -> Result<Event, Error> {
         let group = self.get_group(group_id)?.ok_or(Error::GroupNotFound)?;
 
-        // Export secret
+        // Derive the encryption key via MLS exporter (stable per epoch)
         let secret: group_types::GroupExporterSecret = self.exporter_secret(group_id)?;
+        let encrypted_content = encrypt_message_with_exporter_secret(&secret, &serialized_content)?;
 
-        // Convert that secret to nostr keys
-        let secret_key: SecretKey = SecretKey::from_slice(secret.secret.as_ref())?;
-        let export_nostr_keys: Keys = Keys::new(secret_key);
-
-        // Encrypt the message content
-        // At some group size this will become too large for NIP44 encryption or relay event size limits.
-        // We're not sure yet what size, but it's something to be aware of.
-        let encrypted_content: String = nip44::encrypt(
-            export_nostr_keys.secret_key(),
-            &export_nostr_keys.public_key,
-            &serialized_content,
-            nip44::Version::default(),
-        )?;
-
-        // Generate ephemeral key
+        // Generate ephemeral key for signing (MUST NOT be reused across events)
         let ephemeral_nostr_keys: Keys = Keys::generate();
 
         let tag: Tag = Tag::custom(TagKind::h(), [hex::encode(group.nostr_group_id)]);
+        let encoding_tag: Tag = Tag::custom(TagKind::Custom("encoding".into()), ["base64"]);
 
         let event = EventBuilder::new(Kind::MlsGroupMessage, encrypted_content)
             .tag(tag)
+            .tag(encoding_tag)
             .sign_with_keys(&ephemeral_nostr_keys)?;
 
         Ok(event)
@@ -5123,5 +5277,137 @@ mod tests {
             active_signer.is_some(),
             "active signer keypair must be present in storage after successful retry"
         );
+    }
+
+    #[test]
+    fn test_get_ratchet_tree_info() {
+        let creator_mdk = create_test_mdk();
+        let (creator, initial_members, admins) = create_test_group_members();
+        let creator_pk = creator.public_key();
+
+        let mut initial_key_package_events = Vec::new();
+        for member_keys in &initial_members {
+            let key_package_event = create_key_package_event(&creator_mdk, member_keys);
+            initial_key_package_events.push(key_package_event);
+        }
+
+        let create_result = creator_mdk
+            .create_group(
+                &creator_pk,
+                initial_key_package_events,
+                create_nostr_group_config_data(admins),
+            )
+            .expect("Failed to create group");
+
+        let group_id = &create_result.group.mls_group_id;
+
+        creator_mdk
+            .merge_pending_commit(group_id)
+            .expect("Failed to merge pending commit");
+
+        let debug_info = creator_mdk
+            .get_ratchet_tree_info(group_id)
+            .expect("Failed to get ratchet tree info");
+
+        // tree_hash should be a 64-character hex string (SHA-256 = 32 bytes)
+        assert_eq!(debug_info.tree_hash.len(), 64);
+        assert!(
+            debug_info.tree_hash.chars().all(|c| c.is_ascii_hexdigit()),
+            "tree_hash should be valid hex"
+        );
+
+        // serialized_tree should be non-empty hex
+        assert!(
+            !debug_info.serialized_tree.is_empty(),
+            "serialized tree should not be empty"
+        );
+        assert!(
+            debug_info
+                .serialized_tree
+                .chars()
+                .all(|c| c.is_ascii_hexdigit()),
+            "serialized tree should be valid hex"
+        );
+
+        // Should have 3 leaf nodes: creator + 2 members
+        assert_eq!(
+            debug_info.leaf_nodes.len(),
+            3,
+            "should have 3 leaf nodes (creator + 2 members)"
+        );
+
+        // Each leaf node should have valid data
+        for leaf in &debug_info.leaf_nodes {
+            assert!(
+                !leaf.encryption_key.is_empty(),
+                "encryption key should not be empty"
+            );
+            assert!(
+                !leaf.signature_key.is_empty(),
+                "signature key should not be empty"
+            );
+            // Credential identity should be a 32-byte hex pubkey (64 hex chars)
+            assert_eq!(
+                leaf.credential_identity.len(),
+                64,
+                "credential identity should be a 32-byte hex pubkey"
+            );
+        }
+
+        // Verify the creator's pubkey is among the leaf nodes
+        let creator_hex = creator_pk.to_hex();
+        assert!(
+            debug_info
+                .leaf_nodes
+                .iter()
+                .any(|l| l.credential_identity == creator_hex),
+            "creator pubkey should be in leaf nodes"
+        );
+    }
+
+    #[test]
+    fn test_get_ratchet_tree_info_nonexistent_group() {
+        let mdk = create_test_mdk();
+        let fake_group_id = mdk_storage_traits::GroupId::from_slice(&[0u8; 32]);
+
+        let result = mdk.get_ratchet_tree_info(&fake_group_id);
+        assert!(result.is_err(), "should error for nonexistent group");
+    }
+
+    #[test]
+    fn test_get_ratchet_tree_info_deterministic() {
+        let creator_mdk = create_test_mdk();
+        let (creator, initial_members, admins) = create_test_group_members();
+        let creator_pk = creator.public_key();
+
+        let mut initial_key_package_events = Vec::new();
+        for member_keys in &initial_members {
+            let key_package_event = create_key_package_event(&creator_mdk, member_keys);
+            initial_key_package_events.push(key_package_event);
+        }
+
+        let create_result = creator_mdk
+            .create_group(
+                &creator_pk,
+                initial_key_package_events,
+                create_nostr_group_config_data(admins),
+            )
+            .expect("Failed to create group");
+
+        let group_id = &create_result.group.mls_group_id;
+
+        creator_mdk
+            .merge_pending_commit(group_id)
+            .expect("Failed to merge pending commit");
+
+        // Call twice — should return identical results
+        let info1 = creator_mdk
+            .get_ratchet_tree_info(group_id)
+            .expect("first call");
+        let info2 = creator_mdk
+            .get_ratchet_tree_info(group_id)
+            .expect("second call");
+
+        assert_eq!(info1, info2, "ratchet tree info should be deterministic");
     }
 }
