@@ -1,5 +1,9 @@
 # 🦫 MDK - Marmot Development Kit
 
+<p align="center">
+  <img src="https://blossom.primal.net/2b3aea4e6b4d646f4e5589d62bd8edd3495a532319f8ecbdf29ef027d4fed86e.png" alt="The Grand Marmot guards the mountain" width="400" />
+</p>
+
 **A Rust implementation of the Marmot Protocol for secure, decentralized group messaging**
 
 ![CI](https://github.com/marmot-protocol/mdk/actions/workflows/ci.yml/badge.svg)
@@ -9,6 +13,10 @@
 MDK is a Rust library that implements the [Marmot Protocol](https://github.com/marmot-protocol/marmot), bringing together the [MLS (Messaging Layer Security) Protocol](https://www.rfc-editor.org/rfc/rfc9420.html) with [Nostr's](https://github.com/nostr-protocol/nostr) decentralized network to enable secure group messaging without centralized servers.
 
 ## 🚀 Features
+
+<p align="center">
+  <img src="https://blossom.primal.net/ef4168ed947944669532d7e3d55e080234008e955eb0830e96ff671a3f3df4e2.png" alt="Marmot powering up with shields and lightning" width="300" />
+</p>
 
 - **🔒 End-to-End Encryption**: Messages encrypted using the MLS protocol with forward secrecy and post-compromise security
 - **🌐 Decentralized**: Built on Nostr's distributed relay network - no central servers required
@@ -20,6 +28,10 @@ MDK is a Rust library that implements the [Marmot Protocol](https://github.com/m
 - **⚡ Performance**: Efficient cryptographic operations and message processing
 
 ## 📦 Architecture
+
+<p align="center">
+  <img src="https://blossom.primal.net/b3728461c8cb89ccc0940e691b6297bfe2e4837ea9b77c4e3d8d114591f18799.png" alt="Marmot architect with burrow blueprints" width="300" />
+</p>
 
 MDK is organized into several crates for modularity and flexibility:
 
@@ -34,6 +46,10 @@ MDK is organized into several crates for modularity and flexibility:
 - **`mdk-sqlite-storage`**: SQLite-based persistent storage with migrations
 
 ## 🔐 OpenMLS Integration
+
+<p align="center">
+  <img src="https://blossom.primal.net/535325c7c90bef1f6e6dcd9ae53ccb2b54af2c65a9e1b65cc33421804c3ca984.png" alt="Scholarly marmot studying cryptographic runes" width="300" />
+</p>
 
 MDK is built on top of [OpenMLS](https://github.com/openmls/openmls), a robust Rust implementation of the MLS protocol. OpenMLS provides the cryptographic foundation while MDK adds Nostr-specific functionality and abstractions.
 
@@ -94,6 +110,10 @@ This ensures all MDK groups use compatible cryptography and include necessary No
 
 ## 🔧 Installation
 
+<p align="center">
+  <img src="https://blossom.primal.net/edb92010020abc9331a04b8a6333b845f90f015d4ffb505e0790d32df7df1d6d.png" alt="Marmot shopkeeper with crate potions" width="300" />
+</p>
+
 Add MDK to your `Cargo.toml`:
 
 ```toml
@@ -114,6 +134,10 @@ mdk-core = { version = "0.6.0", features = ["mip04"] }
 ```
 
 ## 🚀 Quick Start
+
+<p align="center">
+  <img src="https://blossom.primal.net/4bebb05ec32493500448a7fdb3d39507424242db15ca99c38bb138741ac56ed2.png" alt="Marmot launching with a big START button" width="300" />
+</p>
 
 Here's a basic example of creating a group and sending messages:
 
@@ -188,6 +212,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## 💾 Storage Options
 
+<p align="center">
+  <img src="https://blossom.primal.net/629e9ab45f49eaa7097cf12b6fef0a909c4285817e6ce502ce772f22d86960e8.png" alt="Marmot organizing Memory and SQLite filing cabinets" width="300" />
+</p>
+
 ### In-Memory Storage (Development)
 
 ```rust
@@ -253,6 +281,10 @@ impl MdkStorageProvider for MyCustomStorage {
 
 ## 🖼️ Encrypted Media (MIP-04)
 
+<p align="center">
+  <img src="https://blossom.primal.net/1fc6be91ba7bb61e43c8223ad676b493fa11be28be21c9600b68962dfe2192ec.png" alt="Marmot spy with encrypted envelopes" width="300" />
+</p>
+
 Enable the `mip04` feature for encrypted media support:
 
 ```rust
@@ -265,6 +297,10 @@ let encrypted_media = media_manager.encrypt_image(&image_bytes)?;
 ```
 
 ## 🔍 Examples
+
+<p align="center">
+  <img src="https://blossom.primal.net/0d99c1c2d9b9587e23df0bdc04805885871004671964e24e556f068aaf86e9ed.png" alt="Marmot explorer discovering glowing example scrolls" width="300" />
+</p>
 
 Check out the [`examples/`](crates/mdk-core/examples/) directory for complete working examples:
 
@@ -279,6 +315,10 @@ cargo run --example mls_sqlite
 ```
 
 ## 🧪 Testing
+
+<p align="center">
+  <img src="https://blossom.primal.net/12520e88937384211321634f3f4648bd888ecd20e745407b85e43d46beac383b.png" alt="Marmot scientist running tests in a lab" width="300" />
+</p>
 
 We recommend using [just](https://github.com/casey/just) for running tests and development tasks:
 
@@ -325,6 +365,10 @@ See [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md#test-coverage) for detailed covera
 
 ## 📚 Documentation
 
+<p align="center">
+  <img src="https://blossom.primal.net/829360e11e6e5df179535fe125a34ad0c30329d31dd460c0638fef29947dda95.png" alt="Marmot librarian with protocol scrolls" width="300" />
+</p>
+
 - **API Documentation**: [docs.rs/mdk-core](https://docs.rs/mdk-core)
 - **Marmot Protocol**: [github.com/marmot-protocol/marmot](https://github.com/marmot-protocol/marmot)
 - **MLS Specification**: [RFC 9420](https://www.rfc-editor.org/rfc/rfc9420.html)
@@ -332,6 +376,10 @@ See [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md#test-coverage) for detailed covera
 - **Nostr Protocol**: [github.com/nostr-protocol/nostr](https://github.com/nostr-protocol/nostr)
 
 ## 🛠️ Development
+
+<p align="center">
+  <img src="https://blossom.primal.net/64b8bac2ba016c625875ec6a1db82fdeeb6b349f6c232de7629ca02adb892e4a.png" alt="Marmot construction worker building infrastructure" width="300" />
+</p>
 
 ### Prerequisites
 
@@ -387,6 +435,10 @@ The justfile ensures consistent testing across different feature combinations, w
 
 ## 🤝 Contributing
 
+<p align="center">
+  <img src="https://blossom.primal.net/db65f13fc316a99dbc21739ddb78c4e6a190cfadc36271cd9e24e6a2256bf60a.png" alt="Two marmots doing a pull-request fist-bump" width="300" />
+</p>
+
 We welcome contributions! Please see our [contributing guidelines](CONTRIBUTING.md) and:
 
 1. Fork the repository
@@ -415,6 +467,10 @@ For security issues, please email **<j@ipf.dev>** instead of opening a public is
 
 ## ⚠️ Status
 
+<p align="center">
+  <img src="https://blossom.primal.net/b6c47d0926cf5c342001ccc446a577625749e9b122d66b27eb3653222a047c35.png" alt="Cautious marmot with ALPHA warning sign" width="300" />
+</p>
+
 **MDK is currently in ALPHA status.** While functional, the API may change in breaking ways. Use in production is not recommended until the library reaches stable status.
 
 Current implementations are suitable for:
@@ -428,6 +484,10 @@ Current implementations are suitable for:
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
 ## 🙏 Acknowledgments
+
+<p align="center">
+  <img src="https://blossom.primal.net/6ea66b594f69b728221e0d6184e0d2325354b339611539c6284b8497ff845f0b.png" alt="Marmots celebrating with a trophy" width="300" />
+</p>
 
 - **[OpenMLS](https://github.com/openmls/openmls)**: The robust MLS protocol implementation that powers MDK's cryptographic operations
 - **[rust-nostr](https://github.com/rust-nostr/nostr)**: Comprehensive Nostr protocol support and event handling
