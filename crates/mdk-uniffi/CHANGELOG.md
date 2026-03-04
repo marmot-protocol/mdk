@@ -29,6 +29,20 @@
 
 ### Changed
 
+### Added
+
+### Fixed
+
+### Removed
+
+### Deprecated
+
+## [0.7.0] - 2026-03-04
+
+### Breaking changes
+
+### Changed
+
 - `MdkConfig` now includes a `max_past_epochs: Option<u32>` field (defaults to `5` when `None`) that controls how many past MLS epoch message secrets are retained for late message decryption. ([#207](https://github.com/marmot-protocol/mdk/pull/207))
 
 ### Added

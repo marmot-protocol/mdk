@@ -27,6 +27,20 @@
 
 ### Breaking changes
 
+### Changed
+
+### Added
+
+### Fixed
+
+### Removed
+
+### Deprecated
+
+## [0.7.0] - 2026-03-04
+
+### Breaking changes
+
 - New SQLite migration `V005` adds a `label` column (`'group-event'` or `'encrypted-media'`) to the `group_exporter_secrets` table. Existing rows are migrated to `label = 'group-event'`. The primary key now includes `label`, allowing both MIP-03 and MIP-04 exporter secrets to coexist for the same `(mls_group_id, epoch)` pair. ([#208](https://github.com/marmot-protocol/mdk/pull/208))
 
 ### Added

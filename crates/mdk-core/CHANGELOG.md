@@ -25,6 +25,20 @@
 
 ### Breaking changes
 
+### Changed
+
+### Added
+
+### Fixed
+
+### Removed
+
+### Deprecated
+
+## [0.7.0] - 2026-03-04
+
+### Breaking changes
+
 - **MIP-03**: kind:445 Group Message Event content format changed from NIP-44 to `base64(nonce || ChaCha20-Poly1305-ciphertext)`. The encryption key is now derived via `MLS-Exporter("marmot", "group-event", 32)` instead of being used as a NIP-44 secp256k1 private key. All implementations must update simultaneously; old and new formats are mutually incompatible. ([#208](https://github.com/marmot-protocol/mdk/pull/208))
 - **MIP-04**: MLS exporter label for encrypted media changed from `("nostr", "nostr")` to `("marmot", "encrypted-media")`. Encrypted media produced with the old label cannot be decrypted with this version. ([#208](https://github.com/marmot-protocol/mdk/pull/208))
 

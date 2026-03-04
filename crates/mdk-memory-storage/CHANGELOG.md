@@ -27,6 +27,20 @@
 
 ### Breaking changes
 
+### Changed
+
+### Added
+
+### Fixed
+
+### Removed
+
+### Deprecated
+
+## [0.7.0] - 2026-03-04
+
+### Breaking changes
+
 - `GroupScopedSnapshot` has a new `group_mip04_exporter_secrets` field. Any code constructing this struct directly must be updated. ([#208](https://github.com/marmot-protocol/mdk/pull/208))
 - `MemoryStorageSnapshot` has a new `group_mip04_exporter_secrets` field. Any code constructing this struct directly must be updated. ([#208](https://github.com/marmot-protocol/mdk/pull/208))
 
