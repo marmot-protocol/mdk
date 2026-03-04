@@ -453,6 +453,84 @@ impl GroupStorage for MdkSqliteStorage {
             Ok(())
         })
     }
+
+    fn search_messages(
+        &self,
+        query: &str,
+        group_id: Option<&GroupId>,
+        limit: usize,
+    ) -> Result<Vec<Message>, GroupError> {
+        if query.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let limit = limit.min(MAX_MESSAGE_LIMIT);
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        // Build an FTS5 query: quote each token and append * for prefix matching.
+        // Quoting with double-quotes escapes special FTS5 characters.
+        let fts_query: String = query
+            .split_whitespace()
+            .filter(|t| !t.is_empty())
+            .map(|token| {
+                let escaped = token.replace('"', "\"\"");
+                format!("\"{escaped}\"*")
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        if fts_query.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        self.with_connection(|conn| {
+            let (sql, boxed_params): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = match group_id
+            {
+                Some(gid) => (
+                    "SELECT m.* FROM messages m \
+                         JOIN messages_fts fts ON m.rowid = fts.rowid \
+                         WHERE messages_fts MATCH ?1 \
+                           AND m.mls_group_id = ?2 \
+                           AND m.kind = 1 \
+                           AND m.state = 'processed' \
+                         ORDER BY m.created_at DESC \
+                         LIMIT ?3"
+                        .to_string(),
+                    vec![
+                        Box::new(fts_query),
+                        Box::new(gid.as_slice().to_vec()),
+                        Box::new(limit as i64),
+                    ],
+                ),
+                None => (
+                    "SELECT m.* FROM messages m \
+                         JOIN messages_fts fts ON m.rowid = fts.rowid \
+                         WHERE messages_fts MATCH ?1 \
+                           AND m.kind = 1 \
+                           AND m.state = 'processed' \
+                         ORDER BY m.created_at DESC \
+                         LIMIT ?2"
+                        .to_string(),
+                    vec![Box::new(fts_query), Box::new(limit as i64)],
+                ),
+            };
+
+            let mut stmt = conn.prepare(&sql).map_err(into_group_err)?;
+            let params_refs: Vec<&dyn rusqlite::types::ToSql> =
+                boxed_params.iter().map(|b| b.as_ref()).collect();
+            let rows = stmt
+                .query_map(params_refs.as_slice(), db::row_to_message)
+                .map_err(into_group_err)?;
+
+            let mut messages = Vec::new();
+            for row in rows {
+                messages.push(row.map_err(into_group_err)?);
+            }
+            Ok(messages)
+        })
+    }
 }
 
 #[cfg(test)]
@@ -808,6 +886,287 @@ mod tests {
 
         assert_eq!(*retrieved_secret1.secret, [0u8; 32]);
         assert_eq!(*retrieved_secret2.secret, [0u8; 32]);
+    }
+
+    /// Helper: create a processed chat message in a group.
+    fn save_chat_msg(
+        storage: &MdkSqliteStorage,
+        group_id: &GroupId,
+        index: u8,
+        content: &str,
+        ts: u64,
+    ) {
+        let pubkey = PublicKey::from_slice(&[1u8; 32]).unwrap();
+        let mut id_bytes = [0u8; 32];
+        id_bytes[0] = index;
+        let event_id = EventId::from_slice(&id_bytes).unwrap();
+        let mut wrapper_bytes = [0u8; 32];
+        wrapper_bytes[0] = 200u8.wrapping_add(index);
+        let wrapper_event_id = EventId::from_slice(&wrapper_bytes).unwrap();
+        let timestamp = Timestamp::from(ts);
+
+        let message = Message {
+            id: event_id,
+            pubkey,
+            kind: Kind::from(1u16),
+            mls_group_id: group_id.clone(),
+            created_at: timestamp,
+            processed_at: timestamp,
+            content: content.to_string(),
+            tags: Tags::new(),
+            event: UnsignedEvent::new(
+                pubkey,
+                timestamp,
+                Kind::from(9u16),
+                vec![],
+                content.to_string(),
+            ),
+            wrapper_event_id,
+            state: MessageState::Processed,
+            epoch: Some(1),
+        };
+
+        storage.save_message(message).unwrap();
+    }
+
+    /// Helper: create a test group and save it.
+    fn create_and_save_group(
+        storage: &MdkSqliteStorage,
+        id_bytes: &[u8],
+        nostr_bytes: [u8; 32],
+        name: &str,
+    ) -> GroupId {
+        let mls_group_id = GroupId::from_slice(id_bytes);
+        let group = Group {
+            mls_group_id: mls_group_id.clone(),
+            nostr_group_id: nostr_bytes,
+            name: name.to_string(),
+            description: "".to_string(),
+            admin_pubkeys: BTreeSet::new(),
+            last_message_id: None,
+            last_message_at: None,
+            last_message_processed_at: None,
+            epoch: 0,
+            state: GroupState::Active,
+            image_hash: None,
+            image_key: None,
+            image_nonce: None,
+            self_update_state: SelfUpdateState::Required,
+        };
+        storage.save_group(group).unwrap();
+        mls_group_id
+    }
+
+    #[test]
+    fn test_search_messages_per_group() {
+        let storage = MdkSqliteStorage::new_in_memory().unwrap();
+        let gid = create_and_save_group(&storage, &[1, 2, 3, 4], [1u8; 32], "G1");
+
+        save_chat_msg(&storage, &gid, 1, "hello world", 1000);
+        save_chat_msg(&storage, &gid, 2, "goodbye world", 1001);
+        save_chat_msg(&storage, &gid, 3, "hello again", 1002);
+        save_chat_msg(&storage, &gid, 4, "unrelated", 1003);
+
+        let results = storage.search_messages("hello", Some(&gid), 100).unwrap();
+        assert_eq!(results.len(), 2);
+        // Newest first
+        assert_eq!(results[0].content, "hello again");
+        assert_eq!(results[1].content, "hello world");
+    }
+
+    #[test]
+    fn test_search_messages_global() {
+        let storage = MdkSqliteStorage::new_in_memory().unwrap();
+        let g1 = create_and_save_group(&storage, &[1, 2, 3, 4], [1u8; 32], "G1");
+        let g2 = create_and_save_group(&storage, &[5, 6, 7, 8], [2u8; 32], "G2");
+
+        save_chat_msg(&storage, &g1, 1, "alpha hello", 1000);
+        save_chat_msg(&storage, &g2, 2, "beta hello", 1001);
+        save_chat_msg(&storage, &g1, 3, "no match", 1002);
+
+        let results = storage.search_messages("hello", None, 100).unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].content, "beta hello");
+        assert_eq!(results[1].content, "alpha hello");
+    }
+
+    #[test]
+    fn test_search_messages_case_insensitive() {
+        let storage = MdkSqliteStorage::new_in_memory().unwrap();
+        let gid = create_and_save_group(&storage, &[1, 2, 3, 4], [1u8; 32], "G1");
+
+        save_chat_msg(&storage, &gid, 1, "Hello World", 1000);
+        save_chat_msg(&storage, &gid, 2, "HELLO WORLD", 1001);
+        save_chat_msg(&storage, &gid, 3, "hello world", 1002);
+
+        let results = storage.search_messages("hello", Some(&gid), 100).unwrap();
+        assert_eq!(results.len(), 3);
+    }
+
+    #[test]
+    fn test_search_messages_prefix_matching() {
+        let storage = MdkSqliteStorage::new_in_memory().unwrap();
+        let gid = create_and_save_group(&storage, &[1, 2, 3, 4], [1u8; 32], "G1");
+
+        save_chat_msg(&storage, &gid, 1, "hello world", 1000);
+        save_chat_msg(&storage, &gid, 2, "help me", 1001);
+        save_chat_msg(&storage, &gid, 3, "unrelated", 1002);
+
+        // Prefix "hel" should match both "hello" and "help"
+        let results = storage.search_messages("hel", Some(&gid), 100).unwrap();
+        assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn test_search_messages_multi_word_query() {
+        let storage = MdkSqliteStorage::new_in_memory().unwrap();
+        let gid = create_and_save_group(&storage, &[1, 2, 3, 4], [1u8; 32], "G1");
+
+        save_chat_msg(&storage, &gid, 1, "hello world", 1000);
+        save_chat_msg(&storage, &gid, 2, "hello there", 1001);
+        save_chat_msg(&storage, &gid, 3, "world peace", 1002);
+
+        // Both tokens must match
+        let results = storage
+            .search_messages("hello world", Some(&gid), 100)
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].content, "hello world");
+    }
+
+    #[test]
+    fn test_search_messages_empty_query() {
+        let storage = MdkSqliteStorage::new_in_memory().unwrap();
+        let gid = create_and_save_group(&storage, &[1, 2, 3, 4], [1u8; 32], "G1");
+        save_chat_msg(&storage, &gid, 1, "hello", 1000);
+
+        let results = storage.search_messages("", Some(&gid), 100).unwrap();
+        assert_eq!(results.len(), 0);
+    }
+
+    #[test]
+    fn test_search_messages_no_matches() {
+        let storage = MdkSqliteStorage::new_in_memory().unwrap();
+        let gid = create_and_save_group(&storage, &[1, 2, 3, 4], [1u8; 32], "G1");
+        save_chat_msg(&storage, &gid, 1, "hello world", 1000);
+
+        let results = storage.search_messages("zzzzz", Some(&gid), 100).unwrap();
+        assert_eq!(results.len(), 0);
+    }
+
+    #[test]
+    fn test_search_messages_limit() {
+        let storage = MdkSqliteStorage::new_in_memory().unwrap();
+        let gid = create_and_save_group(&storage, &[1, 2, 3, 4], [1u8; 32], "G1");
+
+        for i in 0..10 {
+            save_chat_msg(&storage, &gid, i, &format!("hello {}", i), 1000 + i as u64);
+        }
+
+        let results = storage.search_messages("hello", Some(&gid), 3).unwrap();
+        assert_eq!(results.len(), 3);
+        // Newest first
+        assert_eq!(results[0].content, "hello 9");
+    }
+
+    #[test]
+    fn test_search_messages_skips_non_chat_and_non_processed() {
+        let storage = MdkSqliteStorage::new_in_memory().unwrap();
+        let gid = create_and_save_group(&storage, &[1, 2, 3, 4], [1u8; 32], "G1");
+
+        // Save a processed chat message (should match)
+        save_chat_msg(&storage, &gid, 1, "hello processed", 1000);
+
+        // Save a non-processed message (state = Created, should not match)
+        let pubkey = PublicKey::from_slice(&[1u8; 32]).unwrap();
+        let event_id = EventId::from_slice(&[2u8; 32]).unwrap();
+        let wrapper_id = EventId::from_slice(&[202u8; 32]).unwrap();
+        let ts = Timestamp::from(1001u64);
+        let msg = Message {
+            id: event_id,
+            pubkey,
+            kind: Kind::from(1u16),
+            mls_group_id: gid.clone(),
+            created_at: ts,
+            processed_at: ts,
+            content: "hello created".to_string(),
+            tags: Tags::new(),
+            event: UnsignedEvent::new(pubkey, ts, Kind::from(9u16), vec![], "hello created"),
+            wrapper_event_id: wrapper_id,
+            state: MessageState::Created,
+            epoch: Some(1),
+        };
+        storage.save_message(msg).unwrap();
+
+        // Save a reaction (kind 7, should not match)
+        let event_id = EventId::from_slice(&[3u8; 32]).unwrap();
+        let wrapper_id = EventId::from_slice(&[203u8; 32]).unwrap();
+        let ts = Timestamp::from(1002u64);
+        let msg = Message {
+            id: event_id,
+            pubkey,
+            kind: Kind::from(7u16),
+            mls_group_id: gid.clone(),
+            created_at: ts,
+            processed_at: ts,
+            content: "hello reaction".to_string(),
+            tags: Tags::new(),
+            event: UnsignedEvent::new(pubkey, ts, Kind::from(9u16), vec![], "hello reaction"),
+            wrapper_event_id: wrapper_id,
+            state: MessageState::Processed,
+            epoch: Some(1),
+        };
+        storage.save_message(msg).unwrap();
+
+        let results = storage.search_messages("hello", Some(&gid), 100).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].content, "hello processed");
+    }
+
+    #[test]
+    fn test_search_messages_fts_stays_in_sync() {
+        let storage = MdkSqliteStorage::new_in_memory().unwrap();
+        let gid = create_and_save_group(&storage, &[1, 2, 3, 4], [1u8; 32], "G1");
+
+        // Insert a message and verify it's searchable.
+        save_chat_msg(&storage, &gid, 1, "hello world", 1000);
+        let results = storage.search_messages("hello", Some(&gid), 100).unwrap();
+        assert_eq!(results.len(), 1);
+
+        // Update the message by re-saving with different content (ON CONFLICT DO UPDATE).
+        // The FTS index should reflect the new content.
+        let pubkey = PublicKey::from_slice(&[1u8; 32]).unwrap();
+        let mut id_bytes = [0u8; 32];
+        id_bytes[0] = 1; // same id as above
+        let event_id = EventId::from_slice(&id_bytes).unwrap();
+        let mut wrapper_bytes = [0u8; 32];
+        wrapper_bytes[0] = 201;
+        let wrapper_event_id = EventId::from_slice(&wrapper_bytes).unwrap();
+        let ts = Timestamp::from(1000u64);
+        let msg = Message {
+            id: event_id,
+            pubkey,
+            kind: Kind::from(1u16),
+            mls_group_id: gid.clone(),
+            created_at: ts,
+            processed_at: ts,
+            content: "goodbye planet".to_string(),
+            tags: Tags::new(),
+            event: UnsignedEvent::new(pubkey, ts, Kind::from(9u16), vec![], "goodbye planet"),
+            wrapper_event_id,
+            state: MessageState::Processed,
+            epoch: Some(1),
+        };
+        storage.save_message(msg).unwrap();
+
+        // Old content should no longer match.
+        let results = storage.search_messages("hello", Some(&gid), 100).unwrap();
+        assert_eq!(results.len(), 0);
+
+        // New content should match.
+        let results = storage.search_messages("goodbye", Some(&gid), 100).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].content, "goodbye planet");
     }
 
     #[test]

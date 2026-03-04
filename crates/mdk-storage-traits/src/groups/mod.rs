@@ -262,6 +262,32 @@ pub trait GroupStorage {
         min_epoch_to_keep: u64,
     ) -> Result<(), GroupError>;
 
+    /// Search messages using full-text search with prefix matching.
+    ///
+    /// Uses FTS5 to find messages whose content matches the query tokens.
+    /// Each word in the query is treated as a prefix, so searching "hel"
+    /// matches "hello". Multiple words are AND-ed together.
+    /// Only messages with `kind = 1` (ChatMessage) and `state = 'processed'`
+    /// are included.
+    ///
+    /// # Arguments
+    /// * `query` - The search string. Each whitespace-separated token is
+    ///   matched as a prefix against the FTS index.
+    /// * `group_id` - If `Some`, restrict the search to a single group.
+    ///   If `None`, search across all groups.
+    /// * `limit` - Maximum number of results to return. Values exceeding
+    ///   [`MAX_MESSAGE_LIMIT`] are silently clamped.
+    ///
+    /// # Returns
+    ///
+    /// Matching messages ordered by `created_at DESC`.
+    fn search_messages(
+        &self,
+        query: &str,
+        group_id: Option<&GroupId>,
+        limit: usize,
+    ) -> Result<Vec<Message>, GroupError>;
+
     /// Returns active groups that need a self-update: either because
     /// `self_update_state` is [`SelfUpdateState::Required`] (post-join
     /// requirement per MIP-02) or because the last self-update is older than

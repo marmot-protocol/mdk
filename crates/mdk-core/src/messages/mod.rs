@@ -228,6 +228,27 @@ where
             .map_err(|_e| Error::Message("Storage error while getting messages".to_string()))
     }
 
+    /// Search messages using full-text search with prefix matching.
+    ///
+    /// Each word in the query is matched as a prefix against the FTS index.
+    /// Only chat messages (`kind = 1`) in `Processed` state are searched.
+    ///
+    /// # Arguments
+    ///
+    /// * `query` - Search string (each token is prefix-matched)
+    /// * `mls_group_id` - If `Some`, restrict to one group; if `None`, search all groups
+    /// * `limit` - Maximum results to return
+    pub fn search_messages(
+        &self,
+        query: &str,
+        mls_group_id: Option<&GroupId>,
+        limit: usize,
+    ) -> Result<Vec<message_types::Message>> {
+        self.storage()
+            .search_messages(query, mls_group_id, limit)
+            .map_err(|_e| Error::Message("Storage error while searching messages".to_string()))
+    }
+
     /// Returns the most recent message in a group according to the given sort order.
     ///
     /// This is useful for clients that use [`MessageSortOrder::ProcessedAtFirst`] and
