@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## Unreleased
 
+### Removed
+
+- Removed JavaScript bindings (`mdk-js` crate and `publish-js` CI job); JS is no longer a supported binding target
+
 ### Added
 
 - Initial C ABI bindings for mdk-core with SQLite storage

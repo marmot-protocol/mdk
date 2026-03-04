@@ -24,7 +24,6 @@ env:
   KOTLIN_PACKAGE_REPO: "marmot-protocol/mdk-kotlin"
   CBINDINGS_REPO: "marmot-protocol/mdk-cbindings"
   ZIG_REPO: "marmot-protocol/mdk-zig"
-  JS_REPO: "marmot-protocol/mdk-js"
 
 jobs:
   package-swift:
@@ -951,101 +950,4 @@ jobs:
           git push origin "v${VERSION}"
         fi
 
-  publish-js:
-    needs: build-ffi-native
-    runs-on: ubuntu-latest
-    name: Publish JS Bindings
-
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-      with:
-        fetch-depth: 0
-
-    - name: Download all native artifacts
-      uses: actions/download-artifact@v4
-      with:
-        path: ffi-native-all
-        pattern: ffi-native-*
-        merge-multiple: false
-
-    - name: Extract version
-      id: cargo_version
-      shell: bash
-      run: |
-        VERSION=$(grep -E '^version\s*=' crates/mdk-cbindings/Cargo.toml | head -1 | sed -E 's/version\s*=\s*"([^"]+)"/\1/')
-        if [ -z "$VERSION" ]; then
-          echo "ERROR: Could not extract version from Cargo.toml" >&2
-          exit 1
-        fi
-        echo "version=$VERSION" >> $GITHUB_OUTPUT
-
-    - name: Assemble JS package
-      shell: bash
-      run: |
-        mkdir -p js-package/native/linux-x86_64
-        mkdir -p js-package/native/macos-aarch64
-        mkdir -p js-package/native/macos-x86_64
-        mkdir -p js-package/native/windows-x86_64
-        mkdir -p js-package/include
-
-        cp -R crates/mdk-js/src js-package/
-        cp ffi-native-all/ffi-native-ubuntu-latest/mdk.h js-package/include/
-        cp ffi-native-all/ffi-native-ubuntu-latest/libmdk.so js-package/native/linux-x86_64/
-        cp ffi-native-all/ffi-native-macos-latest/libmdk.dylib js-package/native/macos-aarch64/
-        cp ffi-native-all/ffi-native-macos-15-intel/libmdk.dylib js-package/native/macos-x86_64/
-        cp ffi-native-all/ffi-native-windows-latest/mdk.dll js-package/native/windows-x86_64/
-
-        echo "${{ steps.cargo_version.outputs.version }}" > js-package/VERSION
-        echo "✓ JS package assembled"
-
-    - name: Checkout JS package repo
-      uses: actions/checkout@v4
-      with:
-        repository: ${{ env.JS_REPO }}
-        path: js-repo
-        token: ${{ secrets.BINDINGS_PACKAGE_PAT }}
-        lfs: true
-
-    - name: Configure Git
-      run: |
-        git config --global user.name "github-actions[bot]"
-        git config --global user.email "github-actions[bot]@users.noreply.github.com"
-
-    - name: Copy package to repo
-      shell: bash
-      run: |
-        find js-repo -mindepth 1 -maxdepth 1 ! -name '.git' ! -iname 'README.md' -exec rm -rf {} +
-        cp -R js-package/* js-repo/
-        cd js-repo
-        git lfs install
-        git lfs track "*.so" "*.dylib" "*.dll"
-        git add .gitattributes
-        git add -A
-
-    - name: Commit and push
-      shell: bash
-      run: |
-        cd js-repo
-        if git diff --staged --quiet; then
-          echo "No changes to commit"
-        else
-          git commit -m "Update JS package from mdk@${GITHUB_SHA:0:7}"
-          git remote set-url origin https://x-access-token:${{ secrets.BINDINGS_PACKAGE_PAT }}@github.com/${{ env.JS_REPO }}.git
-          git push origin HEAD
-        fi
-
-    - name: Create version tag
-      if: startsWith(github.ref, 'refs/tags/v')
-      shell: bash
-      run: |
-        cd js-repo
-        VERSION="${{ steps.cargo_version.outputs.version }}"
-        git remote set-url origin https://x-access-token:${{ secrets.BINDINGS_PACKAGE_PAT }}@github.com/${{ env.JS_REPO }}.git
-        if git ls-remote --tags origin "v${VERSION}" | grep -q "v${VERSION}"; then
-          echo "Tag v${VERSION} already exists on remote, skipping"
-        else
-          git tag -a "v${VERSION}" -m "Release v${VERSION}"
-          git push origin "v${VERSION}"
-        fi
 
