@@ -721,6 +721,201 @@ pub const Mdk = struct {
         const h = try self.liveHandle();
         try check(raw.mdk_decline_welcome(h, c_json));
     }
+
+    // ── Encrypted Media (MIP-04) ────────────────────────────────────────
+
+    /// Result of an encrypt operation: encrypted bytes + JSON metadata.
+    pub const EncryptResult = struct {
+        /// Encrypted media bytes — call `deinitData()` when done.
+        data: CBytes,
+        /// JSON string with encryption metadata (hashes, nonce, MIME type, etc.).
+        /// Call `deinitMeta()` when done.
+        meta: CString,
+
+        pub fn deinit(self: EncryptResult) void {
+            self.data.deinit();
+            self.meta.deinit();
+        }
+    };
+
+    /// Encrypt media for upload using default processing options.
+    ///
+    /// Returns encrypted bytes and a JSON metadata string.
+    /// The metadata is needed for `createImetaTag` and `createMediaReference`.
+    pub fn encryptMedia(
+        self: *const Mdk,
+        mls_group_id: []const u8,
+        data: []const u8,
+        mime: []const u8,
+        filename: []const u8,
+    ) (Error || std.mem.Allocator.Error)!EncryptResult {
+        const c_gid = try sliceToC(self.allocator, mls_group_id);
+        defer freeCStr(self.allocator, c_gid, mls_group_id.len);
+        const c_mime = try sliceToC(self.allocator, mime);
+        defer freeCStr(self.allocator, c_mime, mime.len);
+        const c_fname = try sliceToC(self.allocator, filename);
+        defer freeCStr(self.allocator, c_fname, filename.len);
+
+        var out_data: [*c]u8 = null;
+        var out_data_len: usize = 0;
+        var out_meta: [*c]u8 = null;
+
+        const h = try self.liveHandle();
+        try check(raw.mdk_encrypt_media(
+            h,
+            c_gid,
+            data.ptr,
+            data.len,
+            c_mime,
+            c_fname,
+            &out_data,
+            &out_data_len,
+            &out_meta,
+        ));
+        if (out_data == null) return Error.NullPointer;
+        return .{
+            .data = CBytes{ .ptr = out_data, .len = out_data_len },
+            .meta = try CString.fromRaw(out_meta),
+        };
+    }
+
+    /// Encrypt media for upload with custom processing options.
+    ///
+    /// Pass `null` for `options_json` to use defaults.
+    pub fn encryptMediaWithOptions(
+        self: *const Mdk,
+        mls_group_id: []const u8,
+        data: []const u8,
+        mime: []const u8,
+        filename: []const u8,
+        options_json: ?[]const u8,
+    ) (Error || std.mem.Allocator.Error)!EncryptResult {
+        const c_gid = try sliceToC(self.allocator, mls_group_id);
+        defer freeCStr(self.allocator, c_gid, mls_group_id.len);
+        const c_mime = try sliceToC(self.allocator, mime);
+        defer freeCStr(self.allocator, c_mime, mime.len);
+        const c_fname = try sliceToC(self.allocator, filename);
+        defer freeCStr(self.allocator, c_fname, filename.len);
+        const c_opts = try optSliceToC(self.allocator, options_json);
+        defer freeOptCStr(self.allocator, c_opts, options_json);
+
+        var out_data: [*c]u8 = null;
+        var out_data_len: usize = 0;
+        var out_meta: [*c]u8 = null;
+
+        const h = try self.liveHandle();
+        try check(raw.mdk_encrypt_media_with_options(
+            h,
+            c_gid,
+            data.ptr,
+            data.len,
+            c_mime,
+            c_fname,
+            c_opts,
+            &out_data,
+            &out_data_len,
+            &out_meta,
+        ));
+        if (out_data == null) return Error.NullPointer;
+        return .{
+            .data = CBytes{ .ptr = out_data, .len = out_data_len },
+            .meta = try CString.fromRaw(out_meta),
+        };
+    }
+
+    /// Decrypt downloaded encrypted media.
+    ///
+    /// Returns the decrypted bytes (caller frees with `deinit()`).
+    pub fn decryptMedia(
+        self: *const Mdk,
+        mls_group_id: []const u8,
+        data: []const u8,
+        reference_json: []const u8,
+    ) (Error || std.mem.Allocator.Error)!CBytes {
+        const c_gid = try sliceToC(self.allocator, mls_group_id);
+        defer freeCStr(self.allocator, c_gid, mls_group_id.len);
+        const c_ref = try sliceToC(self.allocator, reference_json);
+        defer freeCStr(self.allocator, c_ref, reference_json.len);
+
+        var out_ptr: [*c]u8 = null;
+        var out_len: usize = 0;
+
+        const h = try self.liveHandle();
+        try check(raw.mdk_decrypt_media(
+            h,
+            c_gid,
+            data.ptr,
+            data.len,
+            c_ref,
+            &out_ptr,
+            &out_len,
+        ));
+        if (out_ptr == null) return Error.NullPointer;
+        return CBytes{ .ptr = out_ptr, .len = out_len };
+    }
+
+    /// Create an IMETA tag for encrypted media after upload.
+    ///
+    /// Returns the IMETA tag as a JSON array string.
+    pub fn createImetaTag(
+        self: *const Mdk,
+        mls_group_id: []const u8,
+        meta_json: []const u8,
+        uploaded_url: []const u8,
+    ) (Error || std.mem.Allocator.Error)!CString {
+        const c_gid = try sliceToC(self.allocator, mls_group_id);
+        defer freeCStr(self.allocator, c_gid, mls_group_id.len);
+        const c_meta = try sliceToC(self.allocator, meta_json);
+        defer freeCStr(self.allocator, c_meta, meta_json.len);
+        const c_url = try sliceToC(self.allocator, uploaded_url);
+        defer freeCStr(self.allocator, c_url, uploaded_url.len);
+
+        var out: [*c]u8 = null;
+        const h = try self.liveHandle();
+        try check(raw.mdk_create_imeta_tag(h, c_gid, c_meta, c_url, &out));
+        return CString.fromRaw(out);
+    }
+
+    /// Create a media reference from upload metadata.
+    ///
+    /// Returns a JSON object with all fields needed for later decryption.
+    pub fn createMediaReference(
+        self: *const Mdk,
+        mls_group_id: []const u8,
+        meta_json: []const u8,
+        uploaded_url: []const u8,
+    ) (Error || std.mem.Allocator.Error)!CString {
+        const c_gid = try sliceToC(self.allocator, mls_group_id);
+        defer freeCStr(self.allocator, c_gid, mls_group_id.len);
+        const c_meta = try sliceToC(self.allocator, meta_json);
+        defer freeCStr(self.allocator, c_meta, meta_json.len);
+        const c_url = try sliceToC(self.allocator, uploaded_url);
+        defer freeCStr(self.allocator, c_url, uploaded_url.len);
+
+        var out: [*c]u8 = null;
+        const h = try self.liveHandle();
+        try check(raw.mdk_create_media_reference(h, c_gid, c_meta, c_url, &out));
+        return CString.fromRaw(out);
+    }
+
+    /// Parse an IMETA tag to extract a media reference for decryption.
+    ///
+    /// `imeta_tag_json` should be a JSON array (e.g. `["imeta", "url ...", ...]`).
+    pub fn parseImetaTag(
+        self: *const Mdk,
+        mls_group_id: []const u8,
+        imeta_tag_json: []const u8,
+    ) (Error || std.mem.Allocator.Error)!CString {
+        const c_gid = try sliceToC(self.allocator, mls_group_id);
+        defer freeCStr(self.allocator, c_gid, mls_group_id.len);
+        const c_tag = try sliceToC(self.allocator, imeta_tag_json);
+        defer freeCStr(self.allocator, c_tag, imeta_tag_json.len);
+
+        var out: [*c]u8 = null;
+        const h = try self.liveHandle();
+        try check(raw.mdk_parse_imeta_tag(h, c_gid, c_tag, &out));
+        return CString.fromRaw(out);
+    }
 };
 
 // ── Free functions (media) ──────────────────────────────────────────────────

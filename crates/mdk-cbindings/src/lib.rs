@@ -18,6 +18,8 @@ use std::sync::Mutex;
 use mdk_core::{MDK, MdkConfig as CoreMdkConfig};
 use mdk_sqlite_storage::{EncryptionConfig, MdkSqliteStorage};
 
+#[cfg(feature = "mip04")]
+mod encrypted_media;
 mod error;
 mod free;
 mod groups;
