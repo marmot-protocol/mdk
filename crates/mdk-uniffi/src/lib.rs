@@ -1471,15 +1471,18 @@ pub fn derive_upload_keypair(image_key: Vec<u8>, version: u16) -> Result<String,
 
 /// Options for controlling media processing during encryption
 ///
-/// All fields are optional and fall back to sensible, privacy-first defaults
-/// when `None`. Pass `None` for the whole struct to use `encrypt_media_for_upload`
-/// instead, which uses these defaults automatically.
+/// `max_dimension`, `max_file_size`, and `max_filename_length` are optional and
+/// fall back to sensible, privacy-first defaults when `None`.
+/// `sanitize_exif` and `generate_blurhash` are explicit toggles; pass `None` to
+/// accept the privacy-first defaults (`true` for both).
+/// To use all defaults without constructing this struct, call
+/// `encrypt_media_for_upload`.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct MediaProcessingOptionsInput {
     /// Strip EXIF and other metadata from images for privacy (default: `true`)
-    pub sanitize_exif: bool,
+    pub sanitize_exif: Option<bool>,
     /// Generate a blurhash preview string for images (default: `true`)
-    pub generate_blurhash: bool,
+    pub generate_blurhash: Option<bool>,
     /// Maximum allowed image dimension in pixels (default: 16384)
     pub max_dimension: Option<u32>,
     /// Maximum allowed file size in bytes (default: 100 MiB)
@@ -1493,8 +1496,8 @@ impl TryFrom<MediaProcessingOptionsInput> for MediaProcessingOptions {
 
     fn try_from(o: MediaProcessingOptionsInput) -> Result<Self, Self::Error> {
         Ok(Self {
-            sanitize_exif: o.sanitize_exif,
-            generate_blurhash: o.generate_blurhash,
+            sanitize_exif: o.sanitize_exif.unwrap_or(true),
+            generate_blurhash: o.generate_blurhash.unwrap_or(true),
             max_dimension: o.max_dimension,
             max_file_size: o.max_file_size.map(usize::try_from).transpose()?,
             max_filename_length: o.max_filename_length.map(usize::try_from).transpose()?,
@@ -1594,7 +1597,7 @@ impl TryFrom<MediaReferenceRecord> for MediaReference {
                 }
             })
             .transpose()?;
-        Ok(MediaReference {
+        Ok(Self {
             url: r.url,
             original_hash,
             mime_type: r.mime_type,
@@ -1809,7 +1812,7 @@ impl TryFrom<EncryptedMediaUploadResult> for EncryptedMediaUpload {
                 }
             })
             .transpose()?;
-        Ok(EncryptedMediaUpload {
+        Ok(Self {
             encrypted_data: r.encrypted_data,
             original_hash,
             encrypted_hash,
@@ -3002,8 +3005,8 @@ mod tests {
             let group_id = create_test_group(&mdk);
 
             let options = MediaProcessingOptionsInput {
-                sanitize_exif: true,
-                generate_blurhash: false,
+                sanitize_exif: Some(true),
+                generate_blurhash: Some(false),
                 max_dimension: None,
                 max_file_size: None,
                 max_filename_length: None,
