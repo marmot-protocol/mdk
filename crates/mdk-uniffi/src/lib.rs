@@ -1769,7 +1769,9 @@ impl Mdk {
                 "Expected exactly one IMETA tag".to_string(),
             ));
         }
-        let tag = tags.into_iter().next().unwrap();
+        let tag = tags.into_iter().next().ok_or_else(|| {
+            MdkUniffiError::InvalidInput("Expected exactly one IMETA tag".to_string())
+        })?;
         let mdk = self.lock()?;
         let reference = mdk
             .media_manager(group_id)
@@ -2834,6 +2836,7 @@ mod tests {
 
     // ── MIP-04 encrypted media tests ─────────────────────────────────────────
 
+    #[cfg(feature = "mip04")]
     mod mip04 {
         use nostr::{EventBuilder, Keys, Kind, Tag};
 
