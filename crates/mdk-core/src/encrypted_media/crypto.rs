@@ -132,7 +132,11 @@ pub(crate) fn derive_encryption_key_with_secret(
     let scheme_label = get_scheme_label(scheme_version)?;
     let context = build_hkdf_context(scheme_label, original_hash, mime_type, filename, b"key");
 
-    let hk = Hkdf::<Sha256>::new(None, exporter_secret.as_ref());
+    let hk = Hkdf::<Sha256>::from_prk(exporter_secret.as_ref()).map_err(|e| {
+        EncryptedMediaError::EncryptionFailed {
+            reason: format!("Invalid HKDF PRK: {}", e),
+        }
+    })?;
     let mut key = [0u8; 32];
     hk.expand(&context, &mut key)
         .map_err(|e| EncryptedMediaError::EncryptionFailed {
@@ -322,6 +326,42 @@ mod tests {
 
         // Verify decrypted data matches original
         assert_eq!(decrypted_data.as_slice(), original_data);
+    }
+
+    #[test]
+    fn test_mip04_file_key_uses_hkdf_expand_with_exporter_secret_as_prk() {
+        let exporter_secret = Secret::new([0x11u8; 32]);
+        let file_hash = [0x22u8; 32];
+        let mime_type = "image/jpeg";
+        let filename = "photo.jpg";
+
+        let derived = derive_encryption_key_with_secret(
+            &exporter_secret,
+            DEFAULT_SCHEME_VERSION,
+            &file_hash,
+            mime_type,
+            filename,
+        )
+        .expect("MIP-04 key derivation should succeed");
+
+        let scheme_label = get_scheme_label(DEFAULT_SCHEME_VERSION).unwrap();
+        let context = build_hkdf_context(scheme_label, &file_hash, mime_type, filename, b"key");
+
+        let hk_expand_only = Hkdf::<Sha256>::from_prk(exporter_secret.as_ref())
+            .expect("32-byte exporter secret must be a valid HKDF PRK");
+        let mut expected = [0u8; 32];
+        hk_expand_only
+            .expand(&context, &mut expected)
+            .expect("HKDF expand-only should succeed");
+
+        let hk_extract_then_expand = Hkdf::<Sha256>::new(None, exporter_secret.as_ref());
+        let mut old_style = [0u8; 32];
+        hk_extract_then_expand
+            .expand(&context, &mut old_style)
+            .expect("HKDF extract+expand should succeed");
+
+        assert_eq!(*derived, expected);
+        assert_ne!(expected, old_style);
     }
 
     #[test]
