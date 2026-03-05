@@ -1,6 +1,6 @@
 [package]
 name = "mdk-memory-storage"
-version = "0.7.0"
+version = "0.7.1"
 edition = "2024"
 description = "In-memory database for MDK that implements the MdkStorageProvider trait"
 authors = ["Jeff Gardner <j@jeffg.me>", "Yuki Kishimoto <yukikishimoto@protonmail.com>", "MDK Developers"]

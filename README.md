@@ -98,10 +98,10 @@ Add MDK to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-mdk-core = "0.7.0"
-mdk-memory-storage = "0.7.0"  # For in-memory storage
+mdk-core = "0.7.1"
+mdk-memory-storage = "0.7.1"  # For in-memory storage
 # OR
-mdk-sqlite-storage = "0.7.0"  # For persistent SQLite storage
+mdk-sqlite-storage = "0.7.1"  # For persistent SQLite storage
 ```
 
 ### Feature Flags
@@ -110,7 +110,7 @@ mdk-sqlite-storage = "0.7.0"  # For persistent SQLite storage
 
 ```toml
 [dependencies]
-mdk-core = { version = "0.7.0", features = ["mip04"] }
+mdk-core = { version = "0.7.1", features = ["mip04"] }
 ```
 
 ## 🚀 Quick Start

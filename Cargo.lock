@@ -1621,7 +1621,7 @@ dependencies = [
 
 [[package]]
 name = "mdk-core"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "base64",
  "blurhash",
@@ -1650,7 +1650,7 @@ dependencies = [
 
 [[package]]
 name = "mdk-memory-storage"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "lru",
  "mdk-storage-traits",
@@ -1664,7 +1664,7 @@ dependencies = [
 
 [[package]]
 name = "mdk-sqlite-storage"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "getrandom 0.4.1",
  "hex",
@@ -1685,7 +1685,7 @@ dependencies = [
 
 [[package]]
 name = "mdk-storage-traits"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "nostr",
  "openmls",
@@ -1699,7 +1699,7 @@ dependencies = [
 
 [[package]]
 name = "mdk-uniffi"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "hex",
  "mdk-core",

@@ -17,8 +17,6 @@
 
 ### Fixed
 
-- **MIP-04 HKDF derivation alignment**: Encrypted-media file keys now use HKDF expand-only semantics (`HKDF-Expand(exporter_secret, context, 32)`) by treating the MLS exporter secret as the PRK, matching the MIP-04 spec exactly and preventing cross-implementation key mismatches. ([#217](https://github.com/marmot-protocol/mdk/pull/217))
-
 ### Removed
 
 ### Deprecated -->
@@ -36,6 +34,12 @@
 ### Removed
 
 ### Deprecated
+
+## [0.7.1] - 2026-03-05
+
+### Fixed
+
+- **MIP-04 HKDF derivation alignment**: Encrypted-media file keys now use HKDF expand-only semantics (`HKDF-Expand(exporter_secret, context, 32)`) by treating the MLS exporter secret as the PRK, matching the MIP-04 spec exactly and preventing cross-implementation key mismatches. ([#217](https://github.com/marmot-protocol/mdk/pull/217))
 
 ## [0.7.0] - 2026-03-04
 
