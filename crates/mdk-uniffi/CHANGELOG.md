@@ -48,6 +48,7 @@
 ### Added
 
 - `max_past_epochs` field to the `MdkConfig` UniFFI record, allowing callers to configure past-epoch message decryption tolerance. ([#207](https://github.com/marmot-protocol/mdk/pull/207))
+- MIP-04 encrypted media support: five new methods on `Mdk` — `encrypt_media_for_upload`, `encrypt_media_for_upload_with_options`, `decrypt_media_from_download`, `create_media_imeta_tag`, and `parse_media_imeta_tag` — plus three new UniFFI records: `EncryptedMediaUploadResult`, `MediaReferenceRecord`, and `MediaProcessingOptionsInput`. The `mip04` feature is now always active in the UniFFI crate. ([#215](https://github.com/marmot-protocol/mdk/pull/215))
 
 ### Fixed
 

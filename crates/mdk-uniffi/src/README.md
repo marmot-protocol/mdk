@@ -3,7 +3,7 @@
 
 # MDK Bindings for {{lang}}
 
-Language bindings for the *Marmot Development Kit* - bringing decentralized, encrypted group messaging to your favorite language.
+Language bindings for the *Marmot Development Kit* - bringing decentralized, encrypted group messaging to your favorite language. These bindings include all features in mdk, if you'd like smaller bindings without features such as MIP-04, or you'd like bindings for other languages, please let us know by opening an issue!
 
 ## What is MDK?
 
