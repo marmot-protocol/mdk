@@ -72,7 +72,5 @@ tempfile = "3.20"
 
 [profile.release.package.mdk-uniffi]
 opt-level = "z"      # Optimize for size
-lto = true           # Link-time optimization across all crate boundaries
 codegen-units = 1    # Single codegen unit (required to maximize LTO effectiveness)
-panic = "abort"      # No unwinding machinery (safe at UniFFI FFI boundary)
 strip = true         # Strip all symbols from the binary
