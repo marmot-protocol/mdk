@@ -29,6 +29,8 @@
 
 ### Changed
 
+- Release profile now optimizes for binary size: `opt-level = "z"`, fat LTO, single codegen unit, `panic = "abort"`, and symbol stripping. Expected ~40-60% reduction in `.so` size for Android/iOS bindings.
+
 ### Added
 
 ### Fixed
