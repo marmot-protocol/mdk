@@ -430,17 +430,22 @@ where
         let group_exporter_secret =
             self.derive_exporter_secret_for_group(group_id, &group, "marmot", b"group-event")?;
 
-        if let Some(stored_secret) = stored_secret
-            && stored_secret.secret != group_exporter_secret.secret
-        {
-            self.storage()
-                .save_group_legacy_exporter_secret(stored_secret)
-                .map_err(|e| Error::Group(e.to_string()))?;
-        }
-
         self.storage()
             .save_group_exporter_secret(group_exporter_secret.clone())
             .map_err(|e| Error::Group(e.to_string()))?;
+
+        if let Some(stored_secret) = stored_secret
+            && stored_secret.secret != group_exporter_secret.secret
+            && let Err(e) = self
+                .storage()
+                .save_group_legacy_exporter_secret(stored_secret)
+        {
+            tracing::warn!(
+                target: "mdk_core::groups::exporter_secret",
+                "Failed to preserve legacy exporter secret for compatibility: {}",
+                e
+            );
+        }
 
         Ok(group_exporter_secret)
     }

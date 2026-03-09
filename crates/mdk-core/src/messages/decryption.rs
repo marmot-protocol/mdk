@@ -190,7 +190,7 @@ where
                             Ok(decrypted_bytes) => {
                                 tracing::debug!(
                                     target: "mdk_core::messages::try_decrypt_with_past_epochs",
-                                    "Successfully decrypted message with legacy epoch {}",
+                                    "Successfully decrypted message with legacy exporter secret for epoch {}",
                                     epoch
                                 );
                                 return Ok(decrypted_bytes);
@@ -198,7 +198,7 @@ where
                             Err(e) => {
                                 tracing::trace!(
                                     target: "mdk_core::messages::try_decrypt_with_past_epochs",
-                                    "Failed to decrypt with legacy epoch {}: {:?}",
+                                    "Failed to decrypt with legacy exporter secret for epoch {}: {:?}",
                                     epoch,
                                     e
                                 );
