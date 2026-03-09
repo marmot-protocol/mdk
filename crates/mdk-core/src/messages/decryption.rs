@@ -13,10 +13,10 @@ use crate::messages::crypto::decrypt_message_with_any_supported_format;
 
 use super::{DEFAULT_EPOCH_LOOKBACK, Result};
 
-/// Untagged NIP-44 wrappers are accepted only until June 4, 2026 00:00:00 UTC.
-/// This keeps the `0.6.x -> 0.7.x` migration path available temporarily
-/// without leaving legacy wrapper fallback open-ended.
-const LEGACY_NIP44_WRAPPER_MIGRATION_DEADLINE: u64 = 1_780_531_200;
+/// Legacy exporter-secret compatibility is accepted only until June 4, 2026
+/// 00:00:00 UTC. This keeps the `0.6.x -> 0.7.x` migration path available
+/// temporarily without leaving fallback decryption open-ended.
+const LEGACY_EXPORTER_SECRET_MIGRATION_DEADLINE: u64 = 1_780_531_200;
 
 impl<Storage> MDK<Storage>
 where
@@ -58,13 +58,26 @@ where
             .map_err(|_e| Error::Group("Storage error while loading MLS group".to_string()))?
             .ok_or(Error::GroupNotFound)?;
 
+        let allow_legacy_exporter_secret = self.allow_legacy_exporter_secret_fallback();
         let allow_legacy_nip44 = self.allow_legacy_nip44_wrapper_fallback(event);
 
         // Try to decrypt message with recent exporter secrets (fallback across epochs)
-        let message_bytes: Vec<u8> =
-            self.try_decrypt_with_recent_epochs(&mls_group, &event.content, allow_legacy_nip44)?;
+        let message_bytes: Vec<u8> = self.try_decrypt_with_recent_epochs(
+            &mls_group,
+            &event.content,
+            allow_legacy_exporter_secret,
+            allow_legacy_nip44,
+        )?;
 
         Ok((group, mls_group, message_bytes))
+    }
+
+    fn allow_legacy_exporter_secret_fallback(&self) -> bool {
+        Self::allow_legacy_exporter_secret_fallback_at(nostr::Timestamp::now().as_secs())
+    }
+
+    fn allow_legacy_exporter_secret_fallback_at(current_time: u64) -> bool {
+        current_time <= LEGACY_EXPORTER_SECRET_MIGRATION_DEADLINE
     }
 
     fn allow_legacy_nip44_wrapper_fallback(&self, event: &Event) -> bool {
@@ -80,7 +93,7 @@ where
             return false;
         }
 
-        current_time <= LEGACY_NIP44_WRAPPER_MIGRATION_DEADLINE
+        Self::allow_legacy_exporter_secret_fallback_at(current_time)
     }
 
     /// Tries to decrypt a message using exporter secrets from multiple recent epochs excluding the current one
@@ -105,6 +118,7 @@ where
         mls_group: &MlsGroup,
         encrypted_content: &str,
         max_epoch_lookback: u64,
+        allow_legacy_exporter_secret: bool,
         allow_legacy_nip44: bool,
     ) -> Result<Vec<u8>> {
         let group_id: GroupId = mls_group.group_id().into();
@@ -162,49 +176,57 @@ where
                 }
             }
 
-            match self
-                .storage()
-                .get_group_legacy_exporter_secret(&group_id, epoch)
-            {
-                Ok(Some(secret)) => {
-                    match decrypt_message_with_any_supported_format(
-                        &secret,
-                        encrypted_content,
-                        allow_legacy_nip44,
-                    ) {
-                        Ok(decrypted_bytes) => {
-                            tracing::debug!(
-                                target: "mdk_core::messages::try_decrypt_with_past_epochs",
-                                "Successfully decrypted message with legacy epoch {}",
-                                epoch
-                            );
-                            return Ok(decrypted_bytes);
-                        }
-                        Err(e) => {
-                            tracing::trace!(
-                                target: "mdk_core::messages::try_decrypt_with_past_epochs",
-                                "Failed to decrypt with legacy epoch {}: {:?}",
-                                epoch,
-                                e
-                            );
+            if allow_legacy_exporter_secret {
+                match self
+                    .storage()
+                    .get_group_legacy_exporter_secret(&group_id, epoch)
+                {
+                    Ok(Some(secret)) => {
+                        match decrypt_message_with_any_supported_format(
+                            &secret,
+                            encrypted_content,
+                            allow_legacy_nip44,
+                        ) {
+                            Ok(decrypted_bytes) => {
+                                tracing::debug!(
+                                    target: "mdk_core::messages::try_decrypt_with_past_epochs",
+                                    "Successfully decrypted message with legacy epoch {}",
+                                    epoch
+                                );
+                                return Ok(decrypted_bytes);
+                            }
+                            Err(e) => {
+                                tracing::trace!(
+                                    target: "mdk_core::messages::try_decrypt_with_past_epochs",
+                                    "Failed to decrypt with legacy epoch {}: {:?}",
+                                    epoch,
+                                    e
+                                );
+                            }
                         }
                     }
+                    Ok(None) if maybe_secret.is_none() => {
+                        tracing::trace!(
+                            target: "mdk_core::messages::try_decrypt_with_past_epochs",
+                            "No exporter secret found for epoch {}",
+                            epoch
+                        );
+                    }
+                    // A current-format secret existed for this epoch, but there is no preserved
+                    // legacy counterpart. Continue to the next epoch.
+                    Ok(None) => {}
+                    Err(_e) => {
+                        return Err(Error::Group(
+                            "Storage error while finding legacy exporter secret".to_string(),
+                        ));
+                    }
                 }
-                Ok(None) if maybe_secret.is_none() => {
-                    tracing::trace!(
-                        target: "mdk_core::messages::try_decrypt_with_past_epochs",
-                        "No exporter secret found for epoch {}",
-                        epoch
-                    );
-                }
-                // A current-format secret existed for this epoch, but there is no preserved
-                // legacy counterpart. Continue to the next epoch.
-                Ok(None) => {}
-                Err(_e) => {
-                    return Err(Error::Group(
-                        "Storage error while finding legacy exporter secret".to_string(),
-                    ));
-                }
+            } else {
+                tracing::trace!(
+                    target: "mdk_core::messages::try_decrypt_with_past_epochs",
+                    "Skipping legacy exporter-secret fallback for epoch {} because the migration deadline has passed",
+                    epoch
+                );
             }
         }
 
@@ -219,6 +241,7 @@ where
         &self,
         mls_group: &MlsGroup,
         encrypted_content: &str,
+        allow_legacy_exporter_secret: bool,
         allow_legacy_nip44: bool,
     ) -> Result<Vec<u8>> {
         let group_id: GroupId = mls_group.group_id().into();
@@ -234,30 +257,44 @@ where
                 Ok(decrypted_bytes)
             }
             Err(_) => {
-                let legacy_secret = self.legacy_exporter_secret(&group_id)?;
-                match decrypt_message_with_any_supported_format(
-                    &legacy_secret,
-                    encrypted_content,
-                    allow_legacy_nip44,
-                ) {
-                    Ok(decrypted_bytes) => {
-                        tracing::debug!(
-                            "Successfully decrypted message with legacy current exporter secret"
-                        );
-                        Ok(decrypted_bytes)
-                    }
-                    Err(_) => {
-                        tracing::debug!(
-                            "Failed to decrypt message with current epoch secrets. Trying past ones."
-                        );
+                if allow_legacy_exporter_secret {
+                    let legacy_secret = self.legacy_exporter_secret(&group_id)?;
+                    match decrypt_message_with_any_supported_format(
+                        &legacy_secret,
+                        encrypted_content,
+                        allow_legacy_nip44,
+                    ) {
+                        Ok(decrypted_bytes) => {
+                            tracing::debug!(
+                                "Successfully decrypted message with legacy current exporter secret"
+                            );
+                            Ok(decrypted_bytes)
+                        }
+                        Err(_) => {
+                            tracing::debug!(
+                                "Failed to decrypt message with current epoch secrets. Trying past ones."
+                            );
 
-                        self.try_decrypt_with_past_epochs(
-                            mls_group,
-                            encrypted_content,
-                            DEFAULT_EPOCH_LOOKBACK,
-                            allow_legacy_nip44,
-                        )
+                            self.try_decrypt_with_past_epochs(
+                                mls_group,
+                                encrypted_content,
+                                DEFAULT_EPOCH_LOOKBACK,
+                                allow_legacy_exporter_secret,
+                                allow_legacy_nip44,
+                            )
+                        }
                     }
+                } else {
+                    tracing::trace!(
+                        "Skipping legacy current exporter-secret fallback because the migration deadline has passed"
+                    );
+                    self.try_decrypt_with_past_epochs(
+                        mls_group,
+                        encrypted_content,
+                        DEFAULT_EPOCH_LOOKBACK,
+                        allow_legacy_exporter_secret,
+                        allow_legacy_nip44,
+                    )
                 }
             }
         }
@@ -337,7 +374,11 @@ mod tests {
     }
 
     fn fixed_pre_deadline_ts() -> u64 {
-        super::LEGACY_NIP44_WRAPPER_MIGRATION_DEADLINE.saturating_sub(1)
+        super::LEGACY_EXPORTER_SECRET_MIGRATION_DEADLINE.saturating_sub(1)
+    }
+
+    fn fixed_post_deadline_ts() -> u64 {
+        super::LEGACY_EXPORTER_SECRET_MIGRATION_DEADLINE.saturating_add(1)
     }
 
     /// Helper: run the past-epoch delivery scenario and return the result of Bob processing
@@ -498,7 +539,6 @@ mod tests {
     fn test_current_epoch_compat_decrypts_transition_aead_with_legacy_secret() {
         let (alice_mdk, bob_mdk, alice_keys, _bob_keys, group_id) = setup_two_member_group();
         let mut rumor = create_test_rumor(&alice_keys, "current epoch compat");
-        let rumor_id = rumor.id();
 
         let mut alice_group = alice_mdk
             .load_mls_group(&group_id)
@@ -514,27 +554,51 @@ mod tests {
             encrypt_message_with_exporter_secret(&legacy_secret, &serialized_message)
                 .expect("Legacy secret should still encrypt AEAD wrapper");
 
-        let group = alice_mdk
-            .get_group(&group_id)
-            .expect("Alice should load group")
-            .expect("Group should exist");
-        let event = build_wrapper_event(
-            group.nostr_group_id,
-            encrypted_content,
-            true,
-            Timestamp::now(),
+        let bob_group = bob_mdk
+            .load_mls_group(&group_id)
+            .expect("Bob should load MLS group")
+            .expect("Bob MLS group should exist");
+
+        let decrypted_bytes = bob_mdk
+            .try_decrypt_with_recent_epochs(&bob_group, &encrypted_content, true, false)
+            .expect("Current-epoch legacy AEAD fallback should work before the deadline");
+        assert_eq!(decrypted_bytes, serialized_message);
+    }
+
+    #[test]
+    fn test_current_epoch_legacy_aead_after_deadline_is_rejected() {
+        let (alice_mdk, bob_mdk, alice_keys, _bob_keys, group_id) = setup_two_member_group();
+        let mut rumor = create_test_rumor(&alice_keys, "current epoch compat");
+
+        let mut alice_group = alice_mdk
+            .load_mls_group(&group_id)
+            .expect("Alice should load MLS group")
+            .expect("Alice MLS group should exist");
+        let serialized_message = alice_mdk
+            .create_mls_message_payload(&mut alice_group, &mut rumor)
+            .expect("Alice should create MLS payload");
+        let legacy_secret = alice_mdk
+            .legacy_exporter_secret(&group_id)
+            .expect("Alice should derive legacy exporter secret");
+        let encrypted_content =
+            encrypt_message_with_exporter_secret(&legacy_secret, &serialized_message)
+                .expect("Legacy secret should still encrypt AEAD wrapper");
+
+        let bob_group = bob_mdk
+            .load_mls_group(&group_id)
+            .expect("Bob should load MLS group")
+            .expect("Bob MLS group should exist");
+
+        assert!(
+            !crate::MDK::<mdk_memory_storage::MdkMemoryStorage>::allow_legacy_exporter_secret_fallback_at(fixed_post_deadline_ts())
         );
 
-        let result = bob_mdk
-            .process_message(&event)
-            .expect("Bob should process transition-format event");
-        match result {
-            crate::messages::MessageProcessingResult::ApplicationMessage(message) => {
-                assert_eq!(message.id, rumor_id);
-                assert_eq!(message.content, "current epoch compat");
-            }
-            other => panic!("Expected ApplicationMessage, got {:?}", other),
-        }
+        let result =
+            bob_mdk.try_decrypt_with_recent_epochs(&bob_group, &encrypted_content, false, false);
+        assert!(
+            result.is_err(),
+            "Current-epoch legacy AEAD fallback must be skipped after the deadline"
+        );
     }
 
     #[test]
@@ -639,9 +703,63 @@ mod tests {
         assert!(
             !crate::MDK::<mdk_memory_storage::MdkMemoryStorage>::allow_legacy_nip44_wrapper_fallback_at(
                 &build_wrapper_event([7u8; 32], "ignored".to_string(), false, Timestamp::now()),
-                super::LEGACY_NIP44_WRAPPER_MIGRATION_DEADLINE.saturating_add(1),
+                fixed_post_deadline_ts(),
             ),
             "Legacy wrapper after deadline must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_past_epoch_legacy_aead_after_deadline_is_rejected() {
+        let (alice_mdk, bob_mdk, alice_keys, _bob_keys, group_id) = setup_two_member_group();
+        let mut rumor = create_test_rumor(&alice_keys, "late legacy aead");
+
+        let mut alice_group = alice_mdk
+            .load_mls_group(&group_id)
+            .expect("Alice should load MLS group")
+            .expect("Alice MLS group should exist");
+        let serialized_message = alice_mdk
+            .create_mls_message_payload(&mut alice_group, &mut rumor)
+            .expect("Alice should create MLS payload");
+        let legacy_secret = alice_mdk
+            .legacy_exporter_secret(&group_id)
+            .expect("Alice should derive legacy exporter secret");
+        let encrypted_content =
+            encrypt_message_with_exporter_secret(&legacy_secret, &serialized_message)
+                .expect("Legacy secret should still encrypt AEAD wrapper");
+
+        let update_result = alice_mdk
+            .self_update(&group_id)
+            .expect("Alice should self-update");
+        alice_mdk
+            .process_message(&update_result.evolution_event)
+            .expect("Alice should process her own self-update");
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("Alice should merge self-update");
+        bob_mdk
+            .process_message(&update_result.evolution_event)
+            .expect("Bob should process self-update");
+
+        let bob_group = bob_mdk
+            .load_mls_group(&group_id)
+            .expect("Bob should load MLS group")
+            .expect("Bob MLS group should exist");
+
+        assert!(
+            !crate::MDK::<mdk_memory_storage::MdkMemoryStorage>::allow_legacy_exporter_secret_fallback_at(fixed_post_deadline_ts())
+        );
+
+        let result = bob_mdk.try_decrypt_with_past_epochs(
+            &bob_group,
+            &encrypted_content,
+            super::DEFAULT_EPOCH_LOOKBACK,
+            false,
+            false,
+        );
+        assert!(
+            result.is_err(),
+            "Past-epoch legacy AEAD fallback must be skipped after the deadline"
         );
     }
 
@@ -820,6 +938,7 @@ mod tests {
             "invalid_encrypted_content",
             5, // normal lookback, but epoch 0 means no past epochs
             false,
+            false,
         );
 
         assert!(result.is_err(), "Should fail at epoch 0");
@@ -881,6 +1000,7 @@ mod tests {
             &mls_group,
             "invalid_encrypted_content",
             0, // zero lookback - should return early
+            false,
             false,
         );
 
