@@ -17,14 +17,6 @@ impl<Storage> MDK<Storage>
 where
     Storage: MdkStorageProvider,
 {
-    fn try_decrypt_with_secret(
-        &self,
-        secret: &group_types::GroupExporterSecret,
-        encrypted_content: &str,
-    ) -> Result<Vec<u8>> {
-        decrypt_message_with_any_supported_format(secret, encrypted_content)
-    }
-
     /// Loads the group and decrypts the message content
     ///
     /// This private method loads the group from storage using the Nostr group ID,
@@ -122,7 +114,7 @@ where
                 })?;
 
             if let Some(secret) = maybe_secret.as_ref() {
-                match self.try_decrypt_with_secret(secret, encrypted_content) {
+                match decrypt_message_with_any_supported_format(secret, encrypted_content) {
                     Ok(decrypted_bytes) => {
                         tracing::debug!(
                             target: "mdk_core::messages::try_decrypt_with_past_epochs",
@@ -147,7 +139,7 @@ where
                 .get_group_legacy_exporter_secret(&group_id, epoch)
             {
                 Ok(Some(secret)) => {
-                    match self.try_decrypt_with_secret(&secret, encrypted_content) {
+                    match decrypt_message_with_any_supported_format(&secret, encrypted_content) {
                         Ok(decrypted_bytes) => {
                             tracing::debug!(
                                 target: "mdk_core::messages::try_decrypt_with_past_epochs",
@@ -173,6 +165,8 @@ where
                         epoch
                     );
                 }
+                // A current-format secret existed for this epoch, but there is no preserved
+                // legacy counterpart. Continue to the next epoch.
                 Ok(None) => {}
                 Err(_e) => {
                     return Err(Error::Group(
@@ -197,14 +191,14 @@ where
         let group_id: GroupId = mls_group.group_id().into();
         let secret = self.exporter_secret(&group_id)?;
 
-        match self.try_decrypt_with_secret(&secret, encrypted_content) {
+        match decrypt_message_with_any_supported_format(&secret, encrypted_content) {
             Ok(decrypted_bytes) => {
                 tracing::debug!("Successfully decrypted message with current exporter secret");
                 Ok(decrypted_bytes)
             }
             Err(_) => {
                 let legacy_secret = self.legacy_exporter_secret(&group_id)?;
-                match self.try_decrypt_with_secret(&legacy_secret, encrypted_content) {
+                match decrypt_message_with_any_supported_format(&legacy_secret, encrypted_content) {
                     Ok(decrypted_bytes) => {
                         tracing::debug!(
                             "Successfully decrypted message with legacy current exporter secret"
@@ -236,7 +230,9 @@ mod tests {
     use openmls::prelude::MlsGroup;
 
     use crate::MdkConfig;
-    use crate::messages::crypto::encrypt_message_with_exporter_secret;
+    use crate::messages::crypto::{
+        decrypt_message_with_any_supported_format, encrypt_message_with_exporter_secret,
+    };
     use crate::test_util::{
         create_key_package_event, create_nostr_group_config_data, create_test_rumor,
     };
@@ -559,9 +555,9 @@ mod tests {
             .expect("Bob should load preserved legacy secret")
             .expect("Legacy exporter secret should be preserved separately");
         assert_eq!(stored_legacy_secret.secret, legacy_secret.secret);
-        let decrypted_bytes = bob_mdk
-            .try_decrypt_with_secret(&stored_legacy_secret, &encrypted_content)
-            .expect("Stored legacy secret should decrypt delayed wrapper directly");
+        let decrypted_bytes =
+            decrypt_message_with_any_supported_format(&stored_legacy_secret, &encrypted_content)
+                .expect("Stored legacy secret should decrypt delayed wrapper directly");
         assert_eq!(decrypted_bytes, serialized_message);
 
         let group = alice_mdk

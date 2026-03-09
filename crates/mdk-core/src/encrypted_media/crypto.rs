@@ -146,6 +146,11 @@ pub(crate) fn derive_encryption_key_with_secret(
     Ok(Secret::new(key))
 }
 
+/// Derive a compatibility-only pre-0.7.1 MIP-04 file key from an explicit exporter secret.
+///
+/// Unlike [`derive_encryption_key_with_secret`], this uses HKDF extract+expand
+/// (`Hkdf::new(None, ...)`) to match the legacy media derivation. Callers should only
+/// use this during the temporary migration window when attempting to read old media.
 pub(crate) fn derive_legacy_encryption_key_with_secret(
     exporter_secret: &Secret<[u8; 32]>,
     scheme_version: &str,

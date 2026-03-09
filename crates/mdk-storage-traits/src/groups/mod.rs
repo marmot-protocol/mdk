@@ -270,8 +270,9 @@ pub trait GroupStorage {
 
     /// Prune exporter secrets older than `min_epoch_to_keep` for the group.
     ///
-    /// Implementations must remove both MIP-03 (`group-event`) and MIP-04
-    /// (`encrypted-media`) exporter secrets with `epoch < min_epoch_to_keep`.
+    /// Implementations must remove MIP-03 (`group-event`), preserved legacy MIP-03
+    /// (`legacy-group-event`), and MIP-04 (`encrypted-media`) exporter secrets with
+    /// `epoch < min_epoch_to_keep`.
     fn prune_group_exporter_secrets_before_epoch(
         &self,
         group_id: &GroupId,
