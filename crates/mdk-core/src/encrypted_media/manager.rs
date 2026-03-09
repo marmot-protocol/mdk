@@ -9,8 +9,8 @@ use sha2::{Digest, Sha256};
 
 use crate::encrypted_media::crypto::{
     DEFAULT_SCHEME_VERSION, decrypt_data_with_aad, derive_encryption_key,
-    derive_encryption_key_with_secret, encrypt_data_with_aad, generate_encryption_nonce,
-    is_scheme_version_supported,
+    derive_encryption_key_with_secret, derive_legacy_encryption_key_with_secret,
+    encrypt_data_with_aad, generate_encryption_nonce, is_scheme_version_supported,
 };
 use crate::encrypted_media::metadata::extract_and_process_metadata;
 use crate::encrypted_media::types::{
@@ -18,6 +18,7 @@ use crate::encrypted_media::types::{
 };
 use crate::media_processing::validation;
 use crate::{GroupId, MDK};
+use mdk_storage_traits::groups::types::GroupExporterSecret;
 use mdk_storage_traits::{MdkStorageProvider, Secret};
 
 /// Manager for encrypted media operations
@@ -33,6 +34,58 @@ impl<'a, Storage> EncryptedMediaManager<'a, Storage>
 where
     Storage: MdkStorageProvider,
 {
+    fn try_decrypt_with_secret_compat(
+        encrypted_data: &[u8],
+        reference: &MediaReference,
+        secret: &GroupExporterSecret,
+    ) -> Result<Vec<u8>, EncryptedMediaError> {
+        let key = derive_encryption_key_with_secret(
+            &secret.secret,
+            &reference.scheme_version,
+            &reference.original_hash,
+            &reference.mime_type,
+            &reference.filename,
+        )?;
+
+        match Self::decrypt_and_verify(encrypted_data, &key, reference) {
+            Ok(data) => Ok(data),
+            Err(EncryptedMediaError::DecryptionFailed { .. }) => {
+                let legacy_key = derive_legacy_encryption_key_with_secret(
+                    &secret.secret,
+                    &reference.scheme_version,
+                    &reference.original_hash,
+                    &reference.mime_type,
+                    &reference.filename,
+                )?;
+                Self::decrypt_and_verify(encrypted_data, &legacy_key, reference)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn try_decrypt_with_current_epoch_compat(
+        &self,
+        encrypted_data: &[u8],
+        reference: &MediaReference,
+    ) -> Result<Vec<u8>, EncryptedMediaError> {
+        let mip04_secret = self
+            .mdk
+            .mip04_exporter_secret(&self.group_id)
+            .map_err(|_| EncryptedMediaError::GroupNotFound)?;
+
+        match Self::try_decrypt_with_secret_compat(encrypted_data, reference, &mip04_secret) {
+            Ok(data) => Ok(data),
+            Err(EncryptedMediaError::DecryptionFailed { .. }) => {
+                let legacy_secret = self
+                    .mdk
+                    .legacy_exporter_secret(&self.group_id)
+                    .map_err(|_| EncryptedMediaError::GroupNotFound)?;
+                Self::try_decrypt_with_secret_compat(encrypted_data, reference, &legacy_secret)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     /// Create a new encrypted media manager for a specific group
     pub fn new(mdk: &'a MDK<Storage>, group_id: GroupId) -> Self {
         Self { mdk, group_id }
@@ -150,15 +203,7 @@ where
                     target: "mdk_core::encrypted_media::manager",
                     "Epoch hint unavailable or failed, falling back to current epoch key",
                 );
-                let key = derive_encryption_key(
-                    self.mdk,
-                    &self.group_id,
-                    &reference.scheme_version,
-                    &reference.original_hash,
-                    &reference.mime_type,
-                    &reference.filename,
-                )?;
-                Self::decrypt_and_verify(encrypted_data, &key, reference)
+                self.try_decrypt_with_current_epoch_compat(encrypted_data, reference)
             }
             Err(e) => Err(e),
         }
@@ -214,28 +259,58 @@ where
                 reason: "No epoch hint found for media reference".to_string(),
             })?;
 
-        let secret = self
-            .mdk
-            .storage()
-            .get_group_mip04_exporter_secret(&self.group_id, epoch)
-            .map_err(|_| EncryptedMediaError::NoExporterSecretForEpoch(epoch))?
-            .ok_or(EncryptedMediaError::NoExporterSecretForEpoch(epoch))?;
-
-        let key = derive_encryption_key_with_secret(
-            &secret.secret,
-            &reference.scheme_version,
-            &reference.original_hash,
-            &reference.mime_type,
-            &reference.filename,
-        )?;
-
         tracing::debug!(
             target: "mdk_core::encrypted_media::manager",
             "Trying epoch hint: epoch {}",
             epoch
         );
 
-        Self::decrypt_and_verify(encrypted_data, &key, reference)
+        let mut found_secret = false;
+
+        if let Some(secret) = self
+            .mdk
+            .storage()
+            .get_group_mip04_exporter_secret(&self.group_id, epoch)
+            .map_err(|_| EncryptedMediaError::NoExporterSecretForEpoch(epoch))?
+        {
+            found_secret = true;
+            match Self::try_decrypt_with_secret_compat(encrypted_data, reference, &secret) {
+                Ok(data) => return Ok(data),
+                Err(EncryptedMediaError::DecryptionFailed { .. }) => {}
+                Err(e) => return Err(e),
+            }
+        }
+
+        if let Some(secret) = self
+            .mdk
+            .storage()
+            .get_group_exporter_secret(&self.group_id, epoch)
+            .map_err(|_| EncryptedMediaError::NoExporterSecretForEpoch(epoch))?
+        {
+            found_secret = true;
+            match Self::try_decrypt_with_secret_compat(encrypted_data, reference, &secret) {
+                Ok(data) => return Ok(data),
+                Err(EncryptedMediaError::DecryptionFailed { .. }) => {}
+                Err(e) => return Err(e),
+            }
+        }
+
+        if let Some(secret) = self
+            .mdk
+            .storage()
+            .get_group_legacy_exporter_secret(&self.group_id, epoch)
+            .map_err(|_| EncryptedMediaError::NoExporterSecretForEpoch(epoch))?
+        {
+            return Self::try_decrypt_with_secret_compat(encrypted_data, reference, &secret);
+        }
+
+        if found_secret {
+            Err(EncryptedMediaError::DecryptionFailed {
+                reason: "Failed to decrypt media with any compatibility secret".to_string(),
+            })
+        } else {
+            Err(EncryptedMediaError::NoExporterSecretForEpoch(epoch))
+        }
     }
 
     /// Create an imeta tag for encrypted media (after upload)
@@ -455,10 +530,14 @@ mod tests {
 
     use image::{ImageBuffer, Rgb};
     use mdk_memory_storage::MdkMemoryStorage;
+    use mdk_storage_traits::groups::{GroupStorage, types::GroupExporterSecret};
     use mdk_storage_traits::messages::MessageStorage;
     use mdk_storage_traits::messages::types::{Message, MessageState};
     use nostr::{EventId, Keys, Kind, Tags, Timestamp, UnsignedEvent};
 
+    use crate::encrypted_media::crypto::{
+        derive_legacy_encryption_key_with_secret, encrypt_data_with_aad, generate_encryption_nonce,
+    };
     use crate::media_processing::types::MediaProcessingError;
     use crate::test_util::{create_key_package_event, create_nostr_group_config_data};
 
@@ -1489,6 +1568,52 @@ mod tests {
         assert_eq!(decrypted, data);
     }
 
+    #[test]
+    fn test_decrypt_from_download_current_epoch_legacy_media_compat() {
+        let (mdk, group_id, _alice_keys) = setup_group();
+
+        let data = b"legacy current epoch media";
+        let original_hash: [u8; 32] = Sha256::digest(data).into();
+        let legacy_secret = mdk
+            .legacy_exporter_secret(&group_id)
+            .expect("Should derive legacy exporter secret");
+        let key = derive_legacy_encryption_key_with_secret(
+            &legacy_secret.secret,
+            DEFAULT_SCHEME_VERSION,
+            &original_hash,
+            "text/plain",
+            "legacy-current.txt",
+        )
+        .expect("Should derive legacy media key");
+        let nonce = generate_encryption_nonce();
+        let encrypted_data = encrypt_data_with_aad(
+            data,
+            &key,
+            &nonce,
+            DEFAULT_SCHEME_VERSION,
+            &original_hash,
+            "text/plain",
+            "legacy-current.txt",
+        )
+        .expect("Should encrypt legacy media");
+
+        let reference = MediaReference {
+            url: "https://example.com/legacy-current".to_string(),
+            original_hash,
+            mime_type: "text/plain".to_string(),
+            filename: "legacy-current.txt".to_string(),
+            dimensions: None,
+            scheme_version: DEFAULT_SCHEME_VERSION.to_string(),
+            nonce: *nonce,
+        };
+
+        let manager = mdk.media_manager(group_id);
+        let decrypted = manager
+            .decrypt_from_download(&encrypted_data, &reference)
+            .expect("Legacy current-epoch media should decrypt");
+        assert_eq!(decrypted, data);
+    }
+
     /// Verifies that non-recoverable errors from the epoch hint path propagate
     /// immediately without falling back to the current epoch key.
     #[test]
@@ -1575,6 +1700,74 @@ mod tests {
         let decrypted = manager
             .decrypt_from_download(&upload.encrypted_data, &media_ref)
             .unwrap();
+        assert_eq!(decrypted, data);
+    }
+
+    #[test]
+    fn test_decrypt_from_download_epoch_hint_legacy_media_compat() {
+        let (mdk, group_id, alice_keys) = setup_group();
+
+        let data = b"legacy hinted media";
+        let original_hash: [u8; 32] = Sha256::digest(data).into();
+        let legacy_secret = mdk
+            .legacy_exporter_secret(&group_id)
+            .expect("Should derive legacy exporter secret");
+        let key = derive_legacy_encryption_key_with_secret(
+            &legacy_secret.secret,
+            DEFAULT_SCHEME_VERSION,
+            &original_hash,
+            "text/plain",
+            "legacy-hint.txt",
+        )
+        .expect("Should derive legacy media key");
+        let nonce = generate_encryption_nonce();
+        let encrypted_data = encrypt_data_with_aad(
+            data,
+            &key,
+            &nonce,
+            DEFAULT_SCHEME_VERSION,
+            &original_hash,
+            "text/plain",
+            "legacy-hint.txt",
+        )
+        .expect("Should encrypt legacy media");
+        let encrypted_hash: [u8; 32] = Sha256::digest(&encrypted_data).into();
+        let upload = EncryptedMediaUpload {
+            encrypted_data: encrypted_data.clone(),
+            original_hash,
+            encrypted_hash,
+            mime_type: "text/plain".to_string(),
+            filename: "legacy-hint.txt".to_string(),
+            original_size: data.len() as u64,
+            encrypted_size: encrypted_data.len() as u64,
+            dimensions: None,
+            blurhash: None,
+            nonce: *nonce,
+        };
+        let media_ref = mdk
+            .media_manager(group_id.clone())
+            .create_media_reference(&upload, "https://example.com/legacy-hint".to_string());
+        let encryption_epoch = store_imeta_message(
+            &mdk,
+            &group_id,
+            &upload,
+            alice_keys.public_key(),
+            "https://example.com/legacy-hint",
+        );
+        mdk.storage()
+            .save_group_exporter_secret(GroupExporterSecret {
+                mls_group_id: group_id.clone(),
+                epoch: encryption_epoch,
+                secret: legacy_secret.secret.clone(),
+            })
+            .expect("Should persist legacy epoch secret");
+
+        advance_epochs(&mdk, &group_id, 2);
+
+        let manager = mdk.media_manager(group_id);
+        let decrypted = manager
+            .decrypt_from_download(&encrypted_data, &media_ref)
+            .expect("Legacy media referenced by epoch hint should decrypt");
         assert_eq!(decrypted, data);
     }
 

@@ -236,6 +236,22 @@ pub trait GroupStorage {
         group_exporter_secret: GroupExporterSecret,
     ) -> Result<(), GroupError>;
 
+    /// Get a legacy pre-0.7.0 group-event exporter secret for a group and epoch.
+    ///
+    /// Returns the secret derived via `MLS-Exporter("nostr", "nostr", 32)`,
+    /// retained only for migration-time read compatibility.
+    fn get_group_legacy_exporter_secret(
+        &self,
+        group_id: &GroupId,
+        epoch: u64,
+    ) -> Result<Option<GroupExporterSecret>, GroupError>;
+
+    /// Save a legacy pre-0.7.0 group-event exporter secret for a group and epoch.
+    fn save_group_legacy_exporter_secret(
+        &self,
+        group_exporter_secret: GroupExporterSecret,
+    ) -> Result<(), GroupError>;
+
     /// Get a MIP-04 encrypted-media exporter secret for a group and epoch.
     ///
     /// Returns the secret derived via `MLS-Exporter("marmot", "encrypted-media", 32)`,

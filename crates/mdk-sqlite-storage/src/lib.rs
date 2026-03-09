@@ -1113,7 +1113,7 @@ impl MdkSqliteStorage {
                                     let (mls_group_id, epoch): (Vec<u8>, i64) =
                                         serde_json::from_slice(row_key)
                                             .map_err(|e| Error::Database(e.to_string()))?;
-                                    (mls_group_id, epoch, "group-event".to_string())
+                                    (mls_group_id, epoch, "legacy-group-event".to_string())
                                 }
                             };
                         conn.execute(
@@ -3578,8 +3578,7 @@ mod tests {
                 .unwrap();
 
             // Rewrite snapshot row_key into legacy 2-tuple format: (mls_group_id, epoch)
-            // so rollback exercises the fallback parser branch that defaults label to
-            // "group-event".
+            // so rollback exercises the compatibility branch for unlabeled exporter secrets.
             let legacy_row_key =
                 serde_json::to_vec(&(group_id.as_slice().to_vec(), 7_i64)).unwrap();
             storage
@@ -3610,20 +3609,25 @@ mod tests {
                 .rollback_group_to_snapshot(&group_id, "snap_legacy_unlabeled_key")
                 .unwrap();
 
-            let restored_group_event = storage
-                .get_group_exporter_secret(&group_id, 7)
+            let restored_group_event = storage.get_group_exporter_secret(&group_id, 7).unwrap();
+            assert!(
+                restored_group_event.is_none(),
+                "Legacy unlabeled exporter-secret snapshots should not restore as current group-event"
+            );
+
+            let restored_legacy = storage
+                .get_group_legacy_exporter_secret(&group_id, 7)
                 .unwrap()
                 .unwrap();
-            assert_eq!(restored_group_event.mls_group_id, group_id);
-            assert_eq!(restored_group_event.epoch, 7);
-            assert_eq!(restored_group_event, initial_group_event);
-
-            let restored_mip04 = storage
-                .get_group_mip04_exporter_secret(&group_id, 7)
-                .unwrap();
+            assert_eq!(restored_legacy.mls_group_id, group_id);
+            assert_eq!(restored_legacy.epoch, 7);
+            assert_eq!(restored_legacy, initial_group_event);
             assert!(
-                restored_mip04.is_none(),
-                "Legacy unlabeled row_key should restore as label='group-event', not MIP-04"
+                storage
+                    .get_group_mip04_exporter_secret(&group_id, 7)
+                    .unwrap()
+                    .is_none(),
+                "Legacy unlabeled exporter-secret snapshots should not restore as MIP-04"
             );
         }
 

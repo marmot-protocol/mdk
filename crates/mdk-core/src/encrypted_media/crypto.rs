@@ -146,6 +146,26 @@ pub(crate) fn derive_encryption_key_with_secret(
     Ok(Secret::new(key))
 }
 
+pub(crate) fn derive_legacy_encryption_key_with_secret(
+    exporter_secret: &Secret<[u8; 32]>,
+    scheme_version: &str,
+    original_hash: &[u8; 32],
+    mime_type: &str,
+    filename: &str,
+) -> Result<Secret<[u8; 32]>, EncryptedMediaError> {
+    let scheme_label = get_scheme_label(scheme_version)?;
+    let context = build_hkdf_context(scheme_label, original_hash, mime_type, filename, b"key");
+
+    let hk = Hkdf::<Sha256>::new(None, exporter_secret.as_ref());
+    let mut key = [0u8; 32];
+    hk.expand(&context, &mut key)
+        .map_err(|e| EncryptedMediaError::EncryptionFailed {
+            reason: format!("Key derivation failed: {}", e),
+        })?;
+
+    Ok(Secret::new(key))
+}
+
 /// Generate a random encryption nonce
 ///
 /// This function generates a cryptographically secure random 96-bit (12-byte) nonce

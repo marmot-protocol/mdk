@@ -288,6 +288,48 @@ impl GroupStorage for MdkMemoryStorage {
         Ok(())
     }
 
+    fn get_group_legacy_exporter_secret(
+        &self,
+        mls_group_id: &GroupId,
+        epoch: u64,
+    ) -> Result<Option<GroupExporterSecret>, GroupError> {
+        let inner = self.inner.read();
+
+        if inner.groups_cache.peek(mls_group_id).is_none() {
+            return Err(GroupError::InvalidParameters("Group not found".to_string()));
+        }
+
+        Ok(inner
+            .group_legacy_exporter_secrets_cache
+            .peek(&(mls_group_id.clone(), epoch))
+            .cloned())
+    }
+
+    fn save_group_legacy_exporter_secret(
+        &self,
+        group_exporter_secret: GroupExporterSecret,
+    ) -> Result<(), GroupError> {
+        let mut inner = self.inner.write();
+
+        if inner
+            .groups_cache
+            .peek(&group_exporter_secret.mls_group_id)
+            .is_none()
+        {
+            return Err(GroupError::InvalidParameters("Group not found".to_string()));
+        }
+
+        let key = (
+            group_exporter_secret.mls_group_id.clone(),
+            group_exporter_secret.epoch,
+        );
+        inner
+            .group_legacy_exporter_secrets_cache
+            .put(key, group_exporter_secret);
+
+        Ok(())
+    }
+
     fn get_group_mip04_exporter_secret(
         &self,
         mls_group_id: &GroupId,
@@ -358,6 +400,23 @@ impl GroupStorage for MdkMemoryStorage {
 
         for key in group_event_keys {
             inner.group_exporter_secrets_cache.pop(&key);
+        }
+
+        let legacy_group_event_keys: Vec<(GroupId, u64)> = inner
+            .group_legacy_exporter_secrets_cache
+            .iter()
+            .filter_map(|(k, _)| {
+                let (gid, epoch) = k;
+                if gid == group_id && *epoch < min_epoch_to_keep {
+                    Some((gid.clone(), *epoch))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for key in legacy_group_event_keys {
+            inner.group_legacy_exporter_secrets_cache.pop(&key);
         }
 
         let mip04_keys: Vec<(GroupId, u64)> = inner

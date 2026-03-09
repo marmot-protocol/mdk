@@ -9,7 +9,7 @@ use openmls::prelude::MlsGroup;
 
 use crate::MDK;
 use crate::error::Error;
-use crate::messages::crypto::decrypt_message_with_exporter_secret;
+use crate::messages::crypto::decrypt_message_with_any_supported_format;
 
 use super::{DEFAULT_EPOCH_LOOKBACK, Result};
 
@@ -17,6 +17,14 @@ impl<Storage> MDK<Storage>
 where
     Storage: MdkStorageProvider,
 {
+    fn try_decrypt_with_secret(
+        &self,
+        secret: &group_types::GroupExporterSecret,
+        encrypted_content: &str,
+    ) -> Result<Vec<u8>> {
+        decrypt_message_with_any_supported_format(secret, encrypted_content)
+    }
+
     /// Loads the group and decrypts the message content
     ///
     /// This private method loads the group from storage using the Nostr group ID,
@@ -106,16 +114,44 @@ where
                 epoch
             );
 
-            // Try to get the exporter secret for this epoch
-            // Propagate storage errors instead of swallowing them
-            match self.storage().get_group_exporter_secret(&group_id, epoch) {
+            let maybe_secret = self
+                .storage()
+                .get_group_exporter_secret(&group_id, epoch)
+                .map_err(|_| {
+                    Error::Group("Storage error while finding exporter secret".to_string())
+                })?;
+
+            if let Some(secret) = maybe_secret.as_ref() {
+                match self.try_decrypt_with_secret(secret, encrypted_content) {
+                    Ok(decrypted_bytes) => {
+                        tracing::debug!(
+                            target: "mdk_core::messages::try_decrypt_with_past_epochs",
+                            "Successfully decrypted message with epoch {}",
+                            epoch
+                        );
+                        return Ok(decrypted_bytes);
+                    }
+                    Err(e) => {
+                        tracing::trace!(
+                            target: "mdk_core::messages::try_decrypt_with_past_epochs",
+                            "Failed to decrypt with epoch {}: {:?}",
+                            epoch,
+                            e
+                        );
+                    }
+                }
+            }
+
+            match self
+                .storage()
+                .get_group_legacy_exporter_secret(&group_id, epoch)
+            {
                 Ok(Some(secret)) => {
-                    // Try to decrypt with this epoch's secret
-                    match decrypt_message_with_exporter_secret(&secret, encrypted_content) {
+                    match self.try_decrypt_with_secret(&secret, encrypted_content) {
                         Ok(decrypted_bytes) => {
                             tracing::debug!(
                                 target: "mdk_core::messages::try_decrypt_with_past_epochs",
-                                "Successfully decrypted message with epoch {}",
+                                "Successfully decrypted message with legacy epoch {}",
                                 epoch
                             );
                             return Ok(decrypted_bytes);
@@ -123,24 +159,24 @@ where
                         Err(e) => {
                             tracing::trace!(
                                 target: "mdk_core::messages::try_decrypt_with_past_epochs",
-                                "Failed to decrypt with epoch {}: {:?}",
+                                "Failed to decrypt with legacy epoch {}: {:?}",
                                 epoch,
                                 e
                             );
-                            // Continue to next epoch
                         }
                     }
                 }
-                Ok(None) => {
+                Ok(None) if maybe_secret.is_none() => {
                     tracing::trace!(
                         target: "mdk_core::messages::try_decrypt_with_past_epochs",
                         "No exporter secret found for epoch {}",
                         epoch
                     );
                 }
+                Ok(None) => {}
                 Err(_e) => {
                     return Err(Error::Group(
-                        "Storage error while finding exporter secret".to_string(),
+                        "Storage error while finding legacy exporter secret".to_string(),
                     ));
                 }
             }
@@ -158,27 +194,35 @@ where
         mls_group: &MlsGroup,
         encrypted_content: &str,
     ) -> Result<Vec<u8>> {
-        // Get exporter secret for current epoch
-        let secret = self.exporter_secret(&mls_group.group_id().into())?;
+        let group_id: GroupId = mls_group.group_id().into();
+        let secret = self.exporter_secret(&group_id)?;
 
-        // Try to decrypt it for the current epoch
-        match decrypt_message_with_exporter_secret(&secret, encrypted_content) {
+        match self.try_decrypt_with_secret(&secret, encrypted_content) {
             Ok(decrypted_bytes) => {
                 tracing::debug!("Successfully decrypted message with current exporter secret");
                 Ok(decrypted_bytes)
             }
-            // Decryption failed using the current epoch exporter secret
             Err(_) => {
-                tracing::debug!(
-                    "Failed to decrypt message with current exporter secret. Trying with past ones."
-                );
+                let legacy_secret = self.legacy_exporter_secret(&group_id)?;
+                match self.try_decrypt_with_secret(&legacy_secret, encrypted_content) {
+                    Ok(decrypted_bytes) => {
+                        tracing::debug!(
+                            "Successfully decrypted message with legacy current exporter secret"
+                        );
+                        Ok(decrypted_bytes)
+                    }
+                    Err(_) => {
+                        tracing::debug!(
+                            "Failed to decrypt message with current epoch secrets. Trying past ones."
+                        );
 
-                // Try with past exporter secrets
-                self.try_decrypt_with_past_epochs(
-                    mls_group,
-                    encrypted_content,
-                    DEFAULT_EPOCH_LOOKBACK,
-                )
+                        self.try_decrypt_with_past_epochs(
+                            mls_group,
+                            encrypted_content,
+                            DEFAULT_EPOCH_LOOKBACK,
+                        )
+                    }
+                }
             }
         }
     }
@@ -186,14 +230,71 @@ where
 
 #[cfg(test)]
 mod tests {
-    use nostr::Keys;
+    use mdk_storage_traits::groups::{GroupStorage, types::GroupExporterSecret};
+    use nostr::nips::nip44;
+    use nostr::{Event, EventBuilder, Keys, Kind, SecretKey, Tag, TagKind};
     use openmls::prelude::MlsGroup;
 
     use crate::MdkConfig;
+    use crate::messages::crypto::encrypt_message_with_exporter_secret;
     use crate::test_util::{
         create_key_package_event, create_nostr_group_config_data, create_test_rumor,
     };
     use crate::tests::{create_test_mdk, create_test_mdk_with_config};
+
+    fn setup_two_member_group() -> (
+        crate::MDK<mdk_memory_storage::MdkMemoryStorage>,
+        crate::MDK<mdk_memory_storage::MdkMemoryStorage>,
+        Keys,
+        Keys,
+        crate::GroupId,
+    ) {
+        let alice_keys = Keys::generate();
+        let bob_keys = Keys::generate();
+        let alice_mdk = create_test_mdk();
+        let bob_mdk = create_test_mdk();
+        let admins = vec![alice_keys.public_key(), bob_keys.public_key()];
+        let bob_key_package = create_key_package_event(&bob_mdk, &bob_keys);
+
+        let create_result = alice_mdk
+            .create_group(
+                &alice_keys.public_key(),
+                vec![bob_key_package],
+                create_nostr_group_config_data(admins),
+            )
+            .expect("Alice should create group");
+        let group_id = create_result.group.mls_group_id.clone();
+
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("Alice should merge group creation commit");
+
+        let bob_welcome = bob_mdk
+            .process_welcome(
+                &nostr::EventId::all_zeros(),
+                &create_result.welcome_rumors[0],
+            )
+            .expect("Bob should process welcome");
+        bob_mdk
+            .accept_welcome(&bob_welcome)
+            .expect("Bob should accept welcome");
+
+        (alice_mdk, bob_mdk, alice_keys, bob_keys, group_id)
+    }
+
+    fn build_wrapper_event(
+        nostr_group_id: [u8; 32],
+        encrypted_content: String,
+        include_encoding_tag: bool,
+    ) -> Event {
+        let mut builder = EventBuilder::new(Kind::MlsGroupMessage, encrypted_content)
+            .tag(Tag::custom(TagKind::h(), [hex::encode(nostr_group_id)]));
+        if include_encoding_tag {
+            builder = builder.tag(Tag::custom(TagKind::Custom("encoding".into()), ["base64"]));
+        }
+
+        builder.sign_with_keys(&Keys::generate()).unwrap()
+    }
 
     /// Helper: run the past-epoch delivery scenario and return the result of Bob processing
     /// Alice's delayed epoch-N message after the group has advanced to epoch N+1.
@@ -346,6 +447,138 @@ mod tests {
                     other
                 );
             }
+        }
+    }
+
+    #[test]
+    fn test_current_epoch_compat_decrypts_transition_aead_with_legacy_secret() {
+        let (alice_mdk, bob_mdk, alice_keys, _bob_keys, group_id) = setup_two_member_group();
+        let mut rumor = create_test_rumor(&alice_keys, "current epoch compat");
+        let rumor_id = rumor.id();
+
+        let mut alice_group = alice_mdk
+            .load_mls_group(&group_id)
+            .expect("Alice should load MLS group")
+            .expect("Alice MLS group should exist");
+        let serialized_message = alice_mdk
+            .create_mls_message_payload(&mut alice_group, &mut rumor)
+            .expect("Alice should create MLS payload");
+        let legacy_secret = alice_mdk
+            .legacy_exporter_secret(&group_id)
+            .expect("Alice should derive legacy exporter secret");
+        let encrypted_content =
+            encrypt_message_with_exporter_secret(&legacy_secret, &serialized_message)
+                .expect("Legacy secret should still encrypt AEAD wrapper");
+
+        let group = alice_mdk
+            .get_group(&group_id)
+            .expect("Alice should load group")
+            .expect("Group should exist");
+        let event = build_wrapper_event(group.nostr_group_id, encrypted_content, true);
+
+        let result = bob_mdk
+            .process_message(&event)
+            .expect("Bob should process transition-format event");
+        match result {
+            crate::messages::MessageProcessingResult::ApplicationMessage(message) => {
+                assert_eq!(message.id, rumor_id);
+                assert_eq!(message.content, "current epoch compat");
+            }
+            other => panic!("Expected ApplicationMessage, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_past_epoch_compat_decrypts_legacy_nip44_with_stored_secret() {
+        let (alice_mdk, bob_mdk, alice_keys, _bob_keys, group_id) = setup_two_member_group();
+        let mut rumor = create_test_rumor(&alice_keys, "late legacy message");
+        let rumor_id = rumor.id();
+
+        let mut alice_group = alice_mdk
+            .load_mls_group(&group_id)
+            .expect("Alice should load MLS group")
+            .expect("Alice MLS group should exist");
+        let message_epoch = alice_group.epoch().as_u64();
+        let serialized_message = alice_mdk
+            .create_mls_message_payload(&mut alice_group, &mut rumor)
+            .expect("Alice should create MLS payload");
+        let legacy_secret = alice_mdk
+            .legacy_exporter_secret(&group_id)
+            .expect("Alice should derive legacy exporter secret");
+
+        let secret_key = SecretKey::from_slice(legacy_secret.secret.as_ref()).unwrap();
+        let export_nostr_keys = Keys::new(secret_key);
+        let encrypted_content = nip44::encrypt(
+            export_nostr_keys.secret_key(),
+            &export_nostr_keys.public_key,
+            &serialized_message,
+            nip44::Version::default(),
+        )
+        .expect("Alice should encrypt legacy NIP-44 wrapper");
+
+        bob_mdk
+            .storage()
+            .save_group_exporter_secret(GroupExporterSecret {
+                mls_group_id: group_id.clone(),
+                epoch: message_epoch,
+                secret: legacy_secret.secret.clone(),
+            })
+            .expect("Bob should persist migrated legacy secret");
+
+        let update_result = alice_mdk
+            .self_update(&group_id)
+            .expect("Alice should self-update");
+        alice_mdk
+            .process_message(&update_result.evolution_event)
+            .expect("Alice should process her own self-update");
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("Alice should merge self-update");
+        bob_mdk
+            .process_message(&update_result.evolution_event)
+            .expect("Bob should process self-update");
+
+        let direct_decrypted =
+            crate::messages::crypto::decrypt_message_with_legacy_exporter_secret(
+                &legacy_secret,
+                &encrypted_content,
+            )
+            .expect("Freshly encrypted legacy wrapper should round-trip");
+        assert_eq!(direct_decrypted, serialized_message);
+
+        let stored_secret = bob_mdk
+            .storage()
+            .get_group_exporter_secret(&group_id, message_epoch)
+            .expect("Bob should load stored legacy secret")
+            .expect("Current exporter secret should still exist");
+        assert_ne!(stored_secret.secret, legacy_secret.secret);
+
+        let stored_legacy_secret = bob_mdk
+            .storage()
+            .get_group_legacy_exporter_secret(&group_id, message_epoch)
+            .expect("Bob should load preserved legacy secret")
+            .expect("Legacy exporter secret should be preserved separately");
+        assert_eq!(stored_legacy_secret.secret, legacy_secret.secret);
+        let decrypted_bytes = bob_mdk
+            .try_decrypt_with_secret(&stored_legacy_secret, &encrypted_content)
+            .expect("Stored legacy secret should decrypt delayed wrapper directly");
+        assert_eq!(decrypted_bytes, serialized_message);
+
+        let group = alice_mdk
+            .get_group(&group_id)
+            .expect("Alice should load group")
+            .expect("Group should exist");
+        let event = build_wrapper_event(group.nostr_group_id, encrypted_content, false);
+
+        let result = bob_mdk
+            .process_message(&event)
+            .expect("Bob should process delayed legacy event");
+        match result {
+            crate::messages::MessageProcessingResult::ApplicationMessage(message) => {
+                assert_eq!(message.id, rumor_id);
+                assert_eq!(message.content, "late legacy message");
+            }
+            other => panic!("Expected ApplicationMessage, got {:?}", other),
         }
     }
 
