@@ -11,8 +11,6 @@
 
 ### Breaking changes
 
-- Added `GroupStorage::get_group_legacy_exporter_secret` and `GroupStorage::save_group_legacy_exporter_secret` so storage backends can preserve pre-0.7.0 exporter-secret bytes separately during the temporary migration-compatibility window. Storage implementations must add these methods. ([#222](https://github.com/marmot-protocol/mdk/pull/222))
-
 ### Changed
 
 ### Added
@@ -28,6 +26,8 @@
 ## Unreleased
 
 ### Breaking changes
+
+- Added `GroupStorage::get_group_legacy_exporter_secret` and `GroupStorage::save_group_legacy_exporter_secret` so storage backends can preserve pre-0.7.0 exporter-secret bytes separately during the temporary migration-compatibility window. Storage implementations must add these methods. ([#222](https://github.com/marmot-protocol/mdk/pull/222))
 
 ### Changed
 

@@ -15,8 +15,6 @@
 
 ### Added
 
-- Implemented legacy exporter-secret compatibility storage for the temporary `0.6.x -> 0.7.x` migration window, including read/write support for preserved pre-0.7.0 group-event secrets and snapshot rollback restoration into the legacy compatibility label. ([#222](https://github.com/marmot-protocol/mdk/pull/222))
-
 ### Fixed
 
 ### Removed
@@ -32,6 +30,8 @@
 ### Changed
 
 ### Added
+
+- Implemented legacy exporter-secret compatibility storage for the temporary `0.6.x -> 0.7.x` migration window, including read/write support for preserved pre-0.7.0 group-event secrets and snapshot rollback restoration into the legacy compatibility label. ([#222](https://github.com/marmot-protocol/mdk/pull/222))
 
 ### Fixed
 

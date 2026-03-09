@@ -92,10 +92,11 @@ pub(crate) fn decrypt_message_with_legacy_exporter_secret(
 pub(crate) fn decrypt_message_with_any_supported_format(
     secret: &GroupExporterSecret,
     encrypted_content: &str,
+    allow_legacy_nip44: bool,
 ) -> Result<Vec<u8>, Error> {
     match decrypt_message_with_exporter_secret(secret, encrypted_content) {
         Ok(decrypted_bytes) => Ok(decrypted_bytes),
-        Err(aead_error) => {
+        Err(aead_error) if allow_legacy_nip44 => {
             match decrypt_message_with_legacy_exporter_secret(secret, encrypted_content) {
                 Ok(decrypted_bytes) => Ok(decrypted_bytes),
                 Err(legacy_error) => {
@@ -108,6 +109,7 @@ pub(crate) fn decrypt_message_with_any_supported_format(
                 }
             }
         }
+        Err(aead_error) => Err(aead_error),
     }
 }
 
@@ -235,7 +237,8 @@ mod tests {
         )
         .unwrap();
 
-        let decrypted = decrypt_message_with_any_supported_format(&secret, &encrypted).unwrap();
+        let decrypted =
+            decrypt_message_with_any_supported_format(&secret, &encrypted, true).unwrap();
         assert_eq!(decrypted, b"legacy fallback");
     }
 }
