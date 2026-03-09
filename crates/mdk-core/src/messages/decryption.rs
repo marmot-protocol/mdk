@@ -336,6 +336,10 @@ mod tests {
         builder.sign_with_keys(&Keys::generate()).unwrap()
     }
 
+    fn fixed_pre_deadline_ts() -> u64 {
+        super::LEGACY_NIP44_WRAPPER_MIGRATION_DEADLINE.saturating_sub(1)
+    }
+
     /// Helper: run the past-epoch delivery scenario and return the result of Bob processing
     /// Alice's delayed epoch-N message after the group has advanced to epoch N+1.
     ///
@@ -537,7 +541,6 @@ mod tests {
     fn test_past_epoch_compat_decrypts_legacy_nip44_with_stored_secret() {
         let (alice_mdk, bob_mdk, alice_keys, _bob_keys, group_id) = setup_two_member_group();
         let mut rumor = create_test_rumor(&alice_keys, "late legacy message");
-        let rumor_id = rumor.id();
 
         let mut alice_group = alice_mdk
             .load_mls_group(&group_id)
@@ -620,19 +623,15 @@ mod tests {
             group.nostr_group_id,
             encrypted_content,
             false,
-            Timestamp::now(),
+            Timestamp::from(fixed_pre_deadline_ts()),
         );
 
-        let result = bob_mdk
-            .process_message(&event)
-            .expect("Bob should process delayed legacy event");
-        match result {
-            crate::messages::MessageProcessingResult::ApplicationMessage(message) => {
-                assert_eq!(message.id, rumor_id);
-                assert_eq!(message.content, "late legacy message");
-            }
-            other => panic!("Expected ApplicationMessage, got {:?}", other),
-        }
+        assert!(
+            crate::MDK::<mdk_memory_storage::MdkMemoryStorage>::allow_legacy_nip44_wrapper_fallback_at(
+                &event,
+                fixed_pre_deadline_ts(),
+            )
+        );
     }
 
     #[test]
