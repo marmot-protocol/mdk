@@ -31,6 +31,9 @@
 
 ### Fixed
 
+- **0.6.x/0.7.x migration compatibility**: Current-epoch MIP-03 exporter secrets now self-heal from live MLS state while preserving mismatched pre-0.7.0 bytes for temporary read compatibility. Message decryption temporarily accepts legacy NIP-44 wrappers, transition-era AEAD wrappers encrypted with old secrets, and preserved late-epoch legacy secrets during upgrade. ([#222](https://github.com/marmot-protocol/mdk/pull/222))
+- **Legacy media read compatibility**: MIP-04 download decryption now temporarily falls back across preserved legacy exporter secrets and the pre-0.7.1 HKDF derivation so more `0.6.x -> 0.7.x` media remains readable during migration. ([#222](https://github.com/marmot-protocol/mdk/pull/222))
+
 ### Removed
 
 ### Deprecated
