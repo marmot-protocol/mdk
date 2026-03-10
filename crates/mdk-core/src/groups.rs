@@ -804,7 +804,12 @@ where
 
     /// Remove members from a group
     ///
-    /// NOTE: This function doesn't merge the pending commit. Clients must call this function manually only after successful publish of the commit message to relays.
+    /// If any removed members are in the group's admin list, the admin list is
+    /// updated atomically within the same MLS commit.
+    ///
+    /// NOTE: This function doesn't merge the pending commit. Clients must call
+    /// this function manually only after successful publish of the commit
+    /// message to relays.
     ///
     /// # Arguments
     ///
@@ -850,9 +855,52 @@ where
 
         // TODO: Get a list of users to be added from any proposals and create welcome events for them
 
-        let (commit_message, welcome_option, _group_info) = mls_group
-            .remove_members(&self.provider, &signer, &leaf_indices)
+        // If any removed members are admins, prepare an updated extension to
+        // strip them from the admin list in the same MLS commit.
+        let group_data = NostrGroupDataExtension::from_group(&mls_group)?;
+        let has_admin_removals = pubkeys.iter().any(|pk| group_data.admins.contains(pk));
+
+        let updated_extensions = if has_admin_removals {
+            let mut updated_data = group_data;
+            for pk in pubkeys {
+                updated_data.remove_admin(pk);
+            }
+            let extension = Self::get_unknown_extension_from_group_data(&updated_data)?;
+            let mut extensions = mls_group.extensions().clone();
+            extensions.add_or_replace(extension)?;
+            Some(extensions)
+        } else {
+            None
+        };
+
+        // Build a single commit containing removal proposals and, if needed,
+        // a GroupContextExtensions proposal to update the admin list.
+        let builder = mls_group
+            .commit_builder()
+            .propose_removals(leaf_indices.iter().cloned());
+
+        let builder = match updated_extensions {
+            Some(ext) => builder
+                .propose_group_context_extensions(ext)
+                .map_err(|e| Error::Group(e.to_string()))?,
+            None => builder,
+        };
+
+        let bundle = builder
+            .load_psks(self.provider.storage())
+            .map_err(|e| Error::Group(e.to_string()))?
+            .build(
+                self.provider.rand(),
+                self.provider.crypto(),
+                &signer,
+                |_| true,
+            )
+            .map_err(|e| Error::Group(e.to_string()))?
+            .stage_commit(&self.provider)
             .map_err(|e| Error::Group(e.to_string()))?;
+
+        let welcome_option = bundle.to_welcome_msg();
+        let (commit_message, _, _group_info) = bundle.into_contents();
 
         let serialized_commit_message = commit_message
             .tls_serialize_detached()
@@ -2464,6 +2512,135 @@ mod tests {
             final_members.len(),
             2, // creator + 1 remaining member
             "Should have 2 total members after removal"
+        );
+    }
+
+    #[test]
+    fn test_remove_members_strips_admin_status() {
+        let creator_mdk = create_test_mdk();
+        let (creator, initial_members, admins) = create_test_group_members();
+        let creator_pk = creator.public_key();
+        let member1_pk = initial_members[0].public_key();
+
+        let mut initial_key_package_events = Vec::new();
+        for member_keys in &initial_members {
+            let key_package_event = create_key_package_event(&creator_mdk, member_keys);
+            initial_key_package_events.push(key_package_event);
+        }
+
+        // admins = [creator_pk, member1_pk]
+        let create_result = creator_mdk
+            .create_group(
+                &creator_pk,
+                initial_key_package_events,
+                create_nostr_group_config_data(admins),
+            )
+            .expect("Failed to create group");
+
+        let group_id = &create_result.group.mls_group_id.clone();
+
+        creator_mdk
+            .merge_pending_commit(group_id)
+            .expect("Failed to merge pending commit");
+
+        // Verify member1 is an admin before removal
+        let group_before = creator_mdk
+            .get_group(group_id)
+            .expect("Failed to get group")
+            .expect("Group should exist");
+        assert!(
+            group_before.admin_pubkeys.contains(&member1_pk),
+            "member1 should be admin before removal"
+        );
+
+        // Remove member1 (who is an admin)
+        creator_mdk
+            .remove_members(group_id, &[member1_pk])
+            .expect("Failed to remove member");
+
+        creator_mdk
+            .merge_pending_commit(group_id)
+            .expect("Failed to merge pending commit");
+
+        // Verify member1 is no longer an admin
+        let group_after = creator_mdk
+            .get_group(group_id)
+            .expect("Failed to get group")
+            .expect("Group should exist");
+
+        let expected_admins: BTreeSet<PublicKey> = std::iter::once(creator_pk).collect();
+        assert_eq!(
+            group_after.admin_pubkeys, expected_admins,
+            "Admin set should contain only the creator after removing admin member"
+        );
+    }
+
+    #[test]
+    fn test_remove_non_admin_member_preserves_admin_list() {
+        let creator_mdk = create_test_mdk();
+        let (creator, initial_members, _) = create_test_group_members();
+        let creator_pk = creator.public_key();
+        let member1_pk = initial_members[0].public_key();
+        let member2_pk = initial_members[1].public_key();
+
+        let mut initial_key_package_events = Vec::new();
+        for member_keys in &initial_members {
+            let key_package_event = create_key_package_event(&creator_mdk, member_keys);
+            initial_key_package_events.push(key_package_event);
+        }
+
+        // Only creator is admin
+        let create_result = creator_mdk
+            .create_group(
+                &creator_pk,
+                initial_key_package_events,
+                create_nostr_group_config_data(vec![creator_pk]),
+            )
+            .expect("Failed to create group");
+
+        let group_id = &create_result.group.mls_group_id.clone();
+
+        creator_mdk
+            .merge_pending_commit(group_id)
+            .expect("Failed to merge pending commit");
+
+        let admin_list_before = creator_mdk
+            .get_group(group_id)
+            .expect("Failed to get group")
+            .expect("Group should exist")
+            .admin_pubkeys
+            .clone();
+
+        // Remove member2 (non-admin)
+        creator_mdk
+            .remove_members(group_id, &[member2_pk])
+            .expect("Failed to remove member");
+
+        creator_mdk
+            .merge_pending_commit(group_id)
+            .expect("Failed to merge pending commit");
+
+        let group_after = creator_mdk
+            .get_group(group_id)
+            .expect("Failed to get group")
+            .expect("Group should exist");
+
+        assert_eq!(
+            group_after.admin_pubkeys, admin_list_before,
+            "Admin list should be unchanged when removing a non-admin member"
+        );
+
+        // Verify the member was actually removed
+        let members = creator_mdk
+            .get_members(group_id)
+            .expect("Failed to get members");
+        assert!(
+            !members.contains(&member2_pk),
+            "member2 should have been removed from the group"
+        );
+        assert!(
+            members.contains(&member1_pk),
+            "member1 should still be in the group"
         );
     }
 
