@@ -756,20 +756,7 @@ where
         let commit_event =
             self.build_message_event(&mls_group.group_id().into(), serialized_commit_message)?;
 
-        // Create processed_message to track state of message
-        let processed_message: message_types::ProcessedMessage = message_types::ProcessedMessage {
-            wrapper_event_id: commit_event.id,
-            message_event_id: None,
-            processed_at: Timestamp::now(),
-            epoch: Some(mls_group.epoch().as_u64()),
-            mls_group_id: Some(mls_group.group_id().into()),
-            state: message_types::ProcessedMessageState::ProcessedCommit,
-            failure_reason: None,
-        };
-
-        self.storage()
-            .save_processed_message(processed_message)
-            .map_err(|e| Error::Message(e.to_string()))?;
+        self.track_processed_commit(commit_event.id, &mls_group)?;
 
         let serialized_welcome_message = welcome_message
             .tls_serialize_detached()
@@ -819,7 +806,15 @@ where
     /// # Returns
     ///
     /// * `Ok(UpdateGroupResult)`
-    /// * `Err(Error)` - If there is an error removing members
+    ///
+    /// # Errors
+    ///
+    /// * `Error::GroupNotFound` - If the group does not exist
+    /// * `Error::OwnLeafNotFound` - If the caller's leaf node is missing
+    /// * `Error::Group` - If the caller is not an admin, no matching members are found,
+    ///   the caller attempts to remove themselves, or the removal would leave the group
+    ///   with no admins
+    /// * `Error::Extension` - If updating the admin list extension fails
     pub fn remove_members(
         &self,
         group_id: &GroupId,
@@ -834,6 +829,14 @@ where
         if !self.is_leaf_node_admin(group_id, own_leaf)? {
             return Err(Error::Group(
                 "Only group admins can remove members".to_string(),
+            ));
+        }
+
+        // Prevent self-removal — MLS does not allow a member to commit their own removal
+        let own_pubkey = self.get_own_pubkey(&mls_group)?;
+        if pubkeys.contains(&own_pubkey) {
+            return Err(Error::Group(
+                "Cannot remove yourself from the group".to_string(),
             ));
         }
 
@@ -865,6 +868,14 @@ where
             for pk in pubkeys {
                 updated_data.remove_admin(pk);
             }
+            // Defensive check: the self-removal guard above makes this
+            // unreachable when the caller is also an admin, but we protect
+            // against future code paths that might skip that guard.
+            if updated_data.admins.is_empty() {
+                return Err(Error::Group(
+                    "Cannot remove all admins from the group".to_string(),
+                ));
+            }
             let extension = Self::get_unknown_extension_from_group_data(&updated_data)?;
             let mut extensions = mls_group.extensions().clone();
             extensions.add_or_replace(extension)?;
@@ -875,17 +886,19 @@ where
 
         // Build a single commit containing removal proposals and, if needed,
         // a GroupContextExtensions proposal to update the admin list.
-        let builder = mls_group
+        let mut builder = mls_group
             .commit_builder()
             .propose_removals(leaf_indices.iter().cloned());
 
-        let builder = match updated_extensions {
-            Some(ext) => builder
+        if let Some(ext) = updated_extensions {
+            builder = builder
                 .propose_group_context_extensions(ext)
-                .map_err(|e| Error::Group(e.to_string()))?,
-            None => builder,
-        };
+                .map_err(|e| Error::Group(e.to_string()))?;
+        }
 
+        // The PSK validation callback accepts all PSKs unconditionally. This is
+        // safe here because this commit only contains removal and (optionally)
+        // GroupContextExtensions proposals — no external PSK proposals are involved.
         let bundle = builder
             .load_psks(self.provider.storage())
             .map_err(|e| Error::Group(e.to_string()))?
@@ -909,20 +922,7 @@ where
         let commit_event =
             self.build_message_event(&mls_group.group_id().into(), serialized_commit_message)?;
 
-        // Create processed_message to track state of message
-        let processed_message: message_types::ProcessedMessage = message_types::ProcessedMessage {
-            wrapper_event_id: commit_event.id,
-            message_event_id: None,
-            processed_at: Timestamp::now(),
-            epoch: Some(mls_group.epoch().as_u64()),
-            mls_group_id: Some(mls_group.group_id().into()),
-            state: message_types::ProcessedMessageState::ProcessedCommit,
-            failure_reason: None,
-        };
-
-        self.storage()
-            .save_processed_message(processed_message)
-            .map_err(|e| Error::Message(e.to_string()))?;
+        self.track_processed_commit(commit_event.id, &mls_group)?;
 
         // For now, if we find welcomes, throw an error.
         if welcome_option.is_some() {
@@ -980,20 +980,7 @@ where
             message_out.tls_serialize_detached()?,
         )?;
 
-        // Create processed_message to track state of message
-        let processed_message: message_types::ProcessedMessage = message_types::ProcessedMessage {
-            wrapper_event_id: commit_event.id,
-            message_event_id: None,
-            processed_at: Timestamp::now(),
-            epoch: Some(mls_group.epoch().as_u64()),
-            mls_group_id: Some(mls_group.group_id().into()),
-            state: message_types::ProcessedMessageState::ProcessedCommit,
-            failure_reason: None,
-        };
-
-        self.storage()
-            .save_processed_message(processed_message)
-            .map_err(|e| Error::Message(e.to_string()))?;
+        self.track_processed_commit(commit_event.id, mls_group)?;
 
         Ok(UpdateGroupResult {
             evolution_event: commit_event,
@@ -1383,20 +1370,7 @@ where
         let commit_event =
             self.build_message_event(&mls_group.group_id().into(), serialized_commit_message)?;
 
-        // Create processed_message to track state of message
-        let processed_message: message_types::ProcessedMessage = message_types::ProcessedMessage {
-            wrapper_event_id: commit_event.id,
-            message_event_id: None,
-            processed_at: Timestamp::now(),
-            epoch: Some(mls_group.epoch().as_u64()),
-            mls_group_id: Some(mls_group.group_id().into()),
-            state: message_types::ProcessedMessageState::ProcessedCommit,
-            failure_reason: None,
-        };
-
-        self.storage()
-            .save_processed_message(processed_message)
-            .map_err(|e| Error::Message(e.to_string()))?;
+        self.track_processed_commit(commit_event.id, &mls_group)?;
 
         let serialized_welcome_message = commit_message_bundle
             .welcome()
@@ -1449,20 +1423,7 @@ where
         let evolution_event =
             self.build_message_event(&group.group_id().into(), serialized_message_out)?;
 
-        // Create processed_message to track state of message
-        let processed_message: message_types::ProcessedMessage = message_types::ProcessedMessage {
-            wrapper_event_id: evolution_event.id,
-            message_event_id: None,
-            processed_at: Timestamp::now(),
-            epoch: Some(group.epoch().as_u64()),
-            mls_group_id: Some(group.group_id().into()),
-            state: message_types::ProcessedMessageState::ProcessedCommit,
-            failure_reason: None,
-        };
-
-        self.storage()
-            .save_processed_message(processed_message)
-            .map_err(|e| Error::Message(e.to_string()))?;
+        self.track_processed_commit(evolution_event.id, &group)?;
 
         Ok(UpdateGroupResult {
             evolution_event,
@@ -1732,6 +1693,22 @@ where
         Ok(())
     }
 
+    /// Records a processed commit so the client can track message state.
+    fn track_processed_commit(&self, event_id: EventId, mls_group: &MlsGroup) -> Result<(), Error> {
+        let processed_message = message_types::ProcessedMessage {
+            wrapper_event_id: event_id,
+            message_event_id: None,
+            processed_at: Timestamp::now(),
+            epoch: Some(mls_group.epoch().as_u64()),
+            mls_group_id: Some(mls_group.group_id().into()),
+            state: message_types::ProcessedMessageState::ProcessedCommit,
+            failure_reason: None,
+        };
+        self.storage()
+            .save_processed_message(processed_message)
+            .map_err(|e| Error::Message(e.to_string()))
+    }
+
     /// Creates a ChaCha20-Poly1305 encrypted message event Kind: 445 signed with an ephemeral keypair.
     ///
     /// Per MIP-03, the encryption key is derived via `MLS-Exporter("marmot", "group-event", 32)`,
@@ -1816,6 +1793,7 @@ where
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::iter::once;
 
     use mdk_memory_storage::MdkMemoryStorage;
     use mdk_storage_traits::groups::GroupStorage;
@@ -2568,7 +2546,7 @@ mod tests {
             .expect("Failed to get group")
             .expect("Group should exist");
 
-        let expected_admins: BTreeSet<PublicKey> = std::iter::once(creator_pk).collect();
+        let expected_admins: BTreeSet<PublicKey> = once(creator_pk).collect();
         assert_eq!(
             group_after.admin_pubkeys, expected_admins,
             "Admin set should contain only the creator after removing admin member"
@@ -2641,6 +2619,93 @@ mod tests {
         assert!(
             members.contains(&member1_pk),
             "member1 should still be in the group"
+        );
+    }
+
+    #[test]
+    fn test_remove_multiple_admins_strips_all() {
+        let creator_mdk = create_test_mdk();
+        let creator = Keys::generate();
+        let creator_pk = creator.public_key();
+        let member1 = Keys::generate();
+        let member1_pk = member1.public_key();
+        let member2 = Keys::generate();
+        let member2_pk = member2.public_key();
+        let member3 = Keys::generate();
+
+        let members = vec![&member1, &member2, &member3];
+        let mut key_package_events = Vec::new();
+        for m in &members {
+            key_package_events.push(create_key_package_event(&creator_mdk, m));
+        }
+
+        // Creator, member1, and member2 are admins; member3 is not
+        let create_result = creator_mdk
+            .create_group(
+                &creator_pk,
+                key_package_events,
+                create_nostr_group_config_data(vec![creator_pk, member1_pk, member2_pk]),
+            )
+            .expect("Failed to create group");
+
+        let group_id = &create_result.group.mls_group_id.clone();
+        creator_mdk
+            .merge_pending_commit(group_id)
+            .expect("Failed to merge pending commit");
+
+        // Remove both admin members in a single call
+        creator_mdk
+            .remove_members(group_id, &[member1_pk, member2_pk])
+            .expect("Failed to remove members");
+
+        creator_mdk
+            .merge_pending_commit(group_id)
+            .expect("Failed to merge pending commit");
+
+        let group_after = creator_mdk
+            .get_group(group_id)
+            .expect("Failed to get group")
+            .expect("Group should exist");
+
+        let expected_admins: BTreeSet<PublicKey> = once(creator_pk).collect();
+        assert_eq!(
+            group_after.admin_pubkeys, expected_admins,
+            "Only creator should remain as admin after bulk admin removal"
+        );
+    }
+
+    #[test]
+    fn test_remove_members_rejects_self_removal() {
+        let creator_mdk = create_test_mdk();
+        let (creator, initial_members, admins) = create_test_group_members();
+        let creator_pk = creator.public_key();
+
+        let mut key_package_events = Vec::new();
+        for m in &initial_members {
+            key_package_events.push(create_key_package_event(&creator_mdk, m));
+        }
+
+        let create_result = creator_mdk
+            .create_group(
+                &creator_pk,
+                key_package_events,
+                create_nostr_group_config_data(admins),
+            )
+            .expect("Failed to create group");
+
+        let group_id = &create_result.group.mls_group_id.clone();
+        creator_mdk
+            .merge_pending_commit(group_id)
+            .expect("Failed to merge pending commit");
+
+        let result = creator_mdk.remove_members(group_id, &[creator_pk]);
+        assert!(result.is_err(), "Self-removal should be rejected");
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Cannot remove yourself"),
+            "Error should mention self-removal"
         );
     }
 
