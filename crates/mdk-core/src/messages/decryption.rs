@@ -42,6 +42,15 @@ where
         nostr_group_id: [u8; 32],
         event: &Event,
     ) -> Result<(group_types::Group, MlsGroup, Vec<u8>)> {
+        self.decrypt_message_at(nostr_group_id, event, nostr::Timestamp::now().as_secs())
+    }
+
+    pub(super) fn decrypt_message_at(
+        &self,
+        nostr_group_id: [u8; 32],
+        event: &Event,
+        current_time: u64,
+    ) -> Result<(group_types::Group, MlsGroup, Vec<u8>)> {
         // Load groups by Nostr Group ID (Pattern B)
         // Used when processing incoming events which only have the Nostr group ID
         // from the h-tag. This is different from Pattern A (in create.rs) which
@@ -58,8 +67,9 @@ where
             .map_err(|_e| Error::Group("Storage error while loading MLS group".to_string()))?
             .ok_or(Error::GroupNotFound)?;
 
-        let allow_legacy_exporter_secret = self.allow_legacy_exporter_secret_fallback();
-        let allow_legacy_nip44 = self.allow_legacy_nip44_wrapper_fallback(event);
+        let allow_legacy_exporter_secret =
+            Self::allow_legacy_exporter_secret_fallback_at(current_time);
+        let allow_legacy_nip44 = Self::allow_legacy_nip44_wrapper_fallback_at(event, current_time);
 
         // Try to decrypt message with recent exporter secrets (fallback across epochs)
         let message_bytes: Vec<u8> = self.try_decrypt_with_recent_epochs(
@@ -72,16 +82,8 @@ where
         Ok((group, mls_group, message_bytes))
     }
 
-    fn allow_legacy_exporter_secret_fallback(&self) -> bool {
-        Self::allow_legacy_exporter_secret_fallback_at(nostr::Timestamp::now().as_secs())
-    }
-
     fn allow_legacy_exporter_secret_fallback_at(current_time: u64) -> bool {
         current_time <= LEGACY_EXPORTER_SECRET_MIGRATION_DEADLINE
-    }
-
-    fn allow_legacy_nip44_wrapper_fallback(&self, event: &Event) -> bool {
-        Self::allow_legacy_nip44_wrapper_fallback_at(event, nostr::Timestamp::now().as_secs())
     }
 
     fn allow_legacy_nip44_wrapper_fallback_at(event: &Event, current_time: u64) -> bool {
@@ -605,6 +607,7 @@ mod tests {
     fn test_past_epoch_compat_decrypts_legacy_nip44_with_stored_secret() {
         let (alice_mdk, bob_mdk, alice_keys, _bob_keys, group_id) = setup_two_member_group();
         let mut rumor = create_test_rumor(&alice_keys, "late legacy message");
+        let rumor_id = rumor.id();
 
         let mut alice_group = alice_mdk
             .load_mls_group(&group_id)
@@ -696,6 +699,17 @@ mod tests {
                 fixed_pre_deadline_ts(),
             )
         );
+
+        let result = bob_mdk
+            .process_message_at(&event, Timestamp::from(fixed_pre_deadline_ts()))
+            .expect("Bob should process delayed legacy event");
+        match result {
+            crate::messages::MessageProcessingResult::ApplicationMessage(message) => {
+                assert_eq!(message.id, rumor_id);
+                assert_eq!(message.content, "late legacy message");
+            }
+            other => panic!("Expected ApplicationMessage, got {:?}", other),
+        }
     }
 
     #[test]

@@ -18,6 +18,7 @@ use crate::encrypted_media::types::{
 };
 use crate::media_processing::validation;
 use crate::{GroupId, MDK};
+use mdk_storage_traits::groups::error::GroupError;
 use mdk_storage_traits::groups::types::GroupExporterSecret;
 use mdk_storage_traits::{MdkStorageProvider, Secret};
 
@@ -267,41 +268,34 @@ where
 
         let mut found_secret = false;
 
-        if let Some(secret) = self
-            .mdk
-            .storage()
-            .get_group_mip04_exporter_secret(&self.group_id, epoch)
-            .map_err(|_| EncryptedMediaError::NoExporterSecretForEpoch(epoch))?
-        {
-            found_secret = true;
-            match Self::try_decrypt_with_secret_compat(encrypted_data, reference, &secret) {
-                Ok(data) => return Ok(data),
-                Err(EncryptedMediaError::DecryptionFailed { .. }) => {}
-                Err(e) => return Err(e),
-            }
+        if let Some(data) = self.try_decrypt_with_epoch_secret_source(
+            epoch,
+            encrypted_data,
+            reference,
+            &mut found_secret,
+            |storage, group_id, epoch| storage.get_group_mip04_exporter_secret(group_id, epoch),
+        )? {
+            return Ok(data);
         }
 
-        if let Some(secret) = self
-            .mdk
-            .storage()
-            .get_group_exporter_secret(&self.group_id, epoch)
-            .map_err(|_| EncryptedMediaError::NoExporterSecretForEpoch(epoch))?
-        {
-            found_secret = true;
-            match Self::try_decrypt_with_secret_compat(encrypted_data, reference, &secret) {
-                Ok(data) => return Ok(data),
-                Err(EncryptedMediaError::DecryptionFailed { .. }) => {}
-                Err(e) => return Err(e),
-            }
+        if let Some(data) = self.try_decrypt_with_epoch_secret_source(
+            epoch,
+            encrypted_data,
+            reference,
+            &mut found_secret,
+            |storage, group_id, epoch| storage.get_group_exporter_secret(group_id, epoch),
+        )? {
+            return Ok(data);
         }
 
-        if let Some(secret) = self
-            .mdk
-            .storage()
-            .get_group_legacy_exporter_secret(&self.group_id, epoch)
-            .map_err(|_| EncryptedMediaError::NoExporterSecretForEpoch(epoch))?
-        {
-            return Self::try_decrypt_with_secret_compat(encrypted_data, reference, &secret);
+        if let Some(data) = self.try_decrypt_with_epoch_secret_source(
+            epoch,
+            encrypted_data,
+            reference,
+            &mut found_secret,
+            |storage, group_id, epoch| storage.get_group_legacy_exporter_secret(group_id, epoch),
+        )? {
+            return Ok(data);
         }
 
         if found_secret {
@@ -310,6 +304,33 @@ where
             })
         } else {
             Err(EncryptedMediaError::NoExporterSecretForEpoch(epoch))
+        }
+    }
+
+    fn try_decrypt_with_epoch_secret_source<F>(
+        &self,
+        epoch: u64,
+        encrypted_data: &[u8],
+        reference: &MediaReference,
+        found_secret: &mut bool,
+        load_secret: F,
+    ) -> Result<Option<Vec<u8>>, EncryptedMediaError>
+    where
+        F: FnOnce(&Storage, &GroupId, u64) -> Result<Option<GroupExporterSecret>, GroupError>,
+    {
+        let maybe_secret = load_secret(self.mdk.storage(), &self.group_id, epoch)
+            .map_err(|_| EncryptedMediaError::NoExporterSecretForEpoch(epoch))?;
+
+        let Some(secret) = maybe_secret else {
+            return Ok(None);
+        };
+
+        *found_secret = true;
+
+        match Self::try_decrypt_with_secret_compat(encrypted_data, reference, &secret) {
+            Ok(data) => Ok(Some(data)),
+            Err(EncryptedMediaError::DecryptionFailed { .. }) => Ok(None),
+            Err(e) => Err(e),
         }
     }
 
