@@ -876,6 +876,10 @@ impl MdkStorageProvider for MdkMemoryStorage {
         let pruned_count = initial_count - snapshots.len();
         Ok(pruned_count)
     }
+
+    fn has_key_packages(&self) -> Result<bool, MdkStorageError> {
+        Ok(!self.inner.read().mls_key_packages.data.is_empty())
+    }
 }
 
 // ============================================================================

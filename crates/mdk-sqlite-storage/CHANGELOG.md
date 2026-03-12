@@ -31,6 +31,8 @@
 
 ### Added
 
+- Implemented `MdkStorageProvider::has_key_packages` to support the new key package presence check. ([#226](https://github.com/marmot-protocol/mdk/pull/226))
+
 ### Fixed
 
 ### Removed

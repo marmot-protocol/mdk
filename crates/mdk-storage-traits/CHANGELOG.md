@@ -27,9 +27,13 @@
 
 ### Breaking changes
 
+- Added `has_key_packages` method to `MdkStorageProvider` trait. Implementors must provide this method. ([#226](https://github.com/marmot-protocol/mdk/pull/226))
+
 ### Changed
 
 ### Added
+
+- `MdkStorageProvider::has_key_packages` – returns `true` when at least one key package is present in storage, enabling callers to determine whether a new key package needs to be created and published. ([#226](https://github.com/marmot-protocol/mdk/pull/226))
 
 ### Fixed
 

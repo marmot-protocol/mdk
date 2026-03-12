@@ -127,6 +127,14 @@ pub trait MdkStorageProvider:
     ///
     /// The number of snapshots deleted, or an error.
     fn prune_expired_snapshots(&self, min_timestamp: u64) -> Result<usize, MdkStorageError>;
+
+    /// Returns `true` if there is at least one key package stored.
+    ///
+    /// This is used to determine whether the user needs to create and publish
+    /// a new key package. Key packages are consumed when a user joins a group,
+    /// so this check is needed both at login and while the user is already
+    /// logged in.
+    fn has_key_packages(&self) -> Result<bool, MdkStorageError>;
 }
 
 #[cfg(test)]
