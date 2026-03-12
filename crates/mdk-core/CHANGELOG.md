@@ -31,6 +31,9 @@
 
 ### Added
 
+- `MDK::handle_keypackage_relay_list_event` – processes a kind 10051 (MLS Key Package Relays) event and creates a new key package when none exists in storage. This enables the missing-key-package check to run not only at login but also while the user is already logged in (e.g. after a key package has been consumed by joining a group).
+- `KeyPackageEventData` type alias for the key package event tuple `(String, Vec<Tag>, Vec<u8>)`.
+
 ### Fixed
 
 ### Removed
