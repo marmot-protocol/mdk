@@ -7,7 +7,9 @@ use chacha20poly1305::{
     aead::{Aead, KeyInit},
 };
 use mdk_storage_traits::groups::types::GroupExporterSecret;
+use nostr::nips::nip44;
 use nostr::secp256k1::rand::{RngCore, rngs::OsRng};
+use nostr::{Keys, SecretKey};
 
 use crate::Error;
 
@@ -71,6 +73,46 @@ pub(crate) fn decrypt_message_with_exporter_secret(
     })
 }
 
+pub(crate) fn decrypt_message_with_legacy_exporter_secret(
+    secret: &GroupExporterSecret,
+    encrypted_content: &str,
+) -> Result<Vec<u8>, Error> {
+    let secret_key = SecretKey::from_slice(secret.secret.as_ref())
+        .map_err(|_| Error::Message("Failed to create NIP-44 secret key".to_string()))?;
+    let export_nostr_keys = Keys::new(secret_key);
+
+    nip44::decrypt_to_bytes(
+        export_nostr_keys.secret_key(),
+        &export_nostr_keys.public_key,
+        encrypted_content,
+    )
+    .map_err(|_| Error::Message("NIP-44 decryption failed".to_string()))
+}
+
+pub(crate) fn decrypt_message_with_any_supported_format(
+    secret: &GroupExporterSecret,
+    encrypted_content: &str,
+    allow_legacy_nip44: bool,
+) -> Result<Vec<u8>, Error> {
+    match decrypt_message_with_exporter_secret(secret, encrypted_content) {
+        Ok(decrypted_bytes) => Ok(decrypted_bytes),
+        Err(aead_error) if allow_legacy_nip44 => {
+            match decrypt_message_with_legacy_exporter_secret(secret, encrypted_content) {
+                Ok(decrypted_bytes) => Ok(decrypted_bytes),
+                Err(legacy_error) => {
+                    tracing::trace!(
+                        target: "mdk_core::messages::crypto",
+                        "Legacy NIP-44 fallback failed after AEAD failure: {:?}",
+                        legacy_error
+                    );
+                    Err(aead_error)
+                }
+            }
+        }
+        Err(aead_error) => Err(aead_error),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use base64::Engine;
@@ -80,6 +122,8 @@ mod tests {
         aead::{Aead, KeyInit},
     };
     use mdk_storage_traits::{GroupId, Secret};
+    use nostr::nips::nip44;
+    use nostr::{Keys, SecretKey};
 
     use super::*;
 
@@ -151,5 +195,50 @@ mod tests {
         assert!(
             matches!(result, Err(Error::Message(msg)) if msg.contains("nonce is shorter than 12 bytes"))
         );
+    }
+
+    #[test]
+    fn test_legacy_nip44_roundtrip() {
+        let secret = GroupExporterSecret {
+            mls_group_id: GroupId::from_slice(&[7, 7, 7]),
+            epoch: 0,
+            secret: Secret::new([0x24u8; 32]),
+        };
+        let secret_key = SecretKey::from_slice(secret.secret.as_ref()).unwrap();
+        let export_nostr_keys = Keys::new(secret_key);
+
+        let encrypted = nip44::encrypt(
+            export_nostr_keys.secret_key(),
+            &export_nostr_keys.public_key,
+            b"legacy wrapper",
+            nip44::Version::default(),
+        )
+        .unwrap();
+
+        let decrypted = decrypt_message_with_legacy_exporter_secret(&secret, &encrypted).unwrap();
+        assert_eq!(decrypted, b"legacy wrapper");
+    }
+
+    #[test]
+    fn test_any_supported_format_accepts_legacy_nip44() {
+        let secret = GroupExporterSecret {
+            mls_group_id: GroupId::from_slice(&[7, 7, 8]),
+            epoch: 0,
+            secret: Secret::new([0x25u8; 32]),
+        };
+        let secret_key = SecretKey::from_slice(secret.secret.as_ref()).unwrap();
+        let export_nostr_keys = Keys::new(secret_key);
+
+        let encrypted = nip44::encrypt(
+            export_nostr_keys.secret_key(),
+            &export_nostr_keys.public_key,
+            b"legacy fallback",
+            nip44::Version::default(),
+        )
+        .unwrap();
+
+        let decrypted =
+            decrypt_message_with_any_supported_format(&secret, &encrypted, true).unwrap();
+        assert_eq!(decrypted, b"legacy fallback");
     }
 }

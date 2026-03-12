@@ -364,6 +364,7 @@ struct MdkMemoryStorageInner {
     messages_by_group_cache: LruCache<GroupId, HashMap<EventId, Message>>,
     processed_messages_cache: LruCache<EventId, ProcessedMessage>,
     group_exporter_secrets_cache: LruCache<(GroupId, u64), GroupExporterSecret>,
+    group_legacy_exporter_secrets_cache: LruCache<(GroupId, u64), GroupExporterSecret>,
     group_mip04_exporter_secrets_cache: LruCache<(GroupId, u64), GroupExporterSecret>,
 }
 
@@ -443,6 +444,7 @@ impl MdkMemoryStorage {
             messages_by_group_cache: LruCache::new(cache_size),
             processed_messages_cache: LruCache::new(cache_size),
             group_exporter_secrets_cache: LruCache::new(cache_size),
+            group_legacy_exporter_secrets_cache: LruCache::new(cache_size),
             group_mip04_exporter_secrets_cache: LruCache::new(cache_size),
         };
 
@@ -486,6 +488,9 @@ impl MdkMemoryStorage {
             groups_by_nostr_id: inner.groups_by_nostr_id_cache.clone_to_hashmap(),
             group_relays: inner.group_relays_cache.clone_to_hashmap(),
             group_exporter_secrets: inner.group_exporter_secrets_cache.clone_to_hashmap(),
+            group_legacy_exporter_secrets: inner
+                .group_legacy_exporter_secrets_cache
+                .clone_to_hashmap(),
             group_mip04_exporter_secrets: inner
                 .group_mip04_exporter_secrets_cache
                 .clone_to_hashmap(),
@@ -543,6 +548,9 @@ impl MdkMemoryStorage {
         snapshot
             .group_exporter_secrets
             .restore_to_lru(&mut inner.group_exporter_secrets_cache);
+        snapshot
+            .group_legacy_exporter_secrets
+            .restore_to_lru(&mut inner.group_legacy_exporter_secrets_cache);
         snapshot
             .group_mip04_exporter_secrets
             .restore_to_lru(&mut inner.group_mip04_exporter_secrets_cache);
@@ -640,6 +648,13 @@ impl MdkMemoryStorage {
             .map(|((_, epoch), secret)| (*epoch, secret.clone()))
             .collect();
 
+        let group_legacy_exporter_secrets: HashMap<u64, GroupExporterSecret> = inner
+            .group_legacy_exporter_secrets_cache
+            .iter()
+            .filter(|((gid, _), _)| gid == group_id)
+            .map(|((_, epoch), secret)| (*epoch, secret.clone()))
+            .collect();
+
         let group_mip04_exporter_secrets: HashMap<u64, GroupExporterSecret> = inner
             .group_mip04_exporter_secrets_cache
             .iter()
@@ -663,6 +678,7 @@ impl MdkMemoryStorage {
             group,
             group_relays,
             group_exporter_secrets,
+            group_legacy_exporter_secrets,
             group_mip04_exporter_secrets,
         }
     }
@@ -733,6 +749,16 @@ impl MdkMemoryStorage {
             inner.group_exporter_secrets_cache.pop(&key);
         }
 
+        let legacy_keys_to_remove: Vec<_> = inner
+            .group_legacy_exporter_secrets_cache
+            .iter()
+            .filter(|((gid, _), _)| gid == group_id)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for key in legacy_keys_to_remove {
+            inner.group_legacy_exporter_secrets_cache.pop(&key);
+        }
+
         // Remove all MIP-04 exporter secrets for this group
         let mip04_keys_to_remove: Vec<_> = inner
             .group_mip04_exporter_secrets_cache
@@ -791,6 +817,12 @@ impl MdkMemoryStorage {
         for (epoch, secret) in snapshot.group_exporter_secrets {
             inner
                 .group_exporter_secrets_cache
+                .put((group_id.clone(), epoch), secret);
+        }
+
+        for (epoch, secret) in snapshot.group_legacy_exporter_secrets {
+            inner
+                .group_legacy_exporter_secrets_cache
                 .put((group_id.clone(), epoch), secret);
         }
 
@@ -3518,6 +3550,7 @@ mod tests {
                 group: None,
                 group_relays: std::collections::BTreeSet::new(),
                 group_exporter_secrets: std::collections::HashMap::new(),
+                group_legacy_exporter_secrets: std::collections::HashMap::new(),
                 group_mip04_exporter_secrets: std::collections::HashMap::new(),
             };
             let snap2 = crate::snapshot::GroupScopedSnapshot {
@@ -3567,6 +3600,7 @@ mod tests {
                 group: None,
                 group_relays: std::collections::BTreeSet::new(),
                 group_exporter_secrets: std::collections::HashMap::new(),
+                group_legacy_exporter_secrets: std::collections::HashMap::new(),
                 group_mip04_exporter_secrets: std::collections::HashMap::new(),
             };
             let snap2 = crate::snapshot::GroupScopedSnapshot {
@@ -3607,6 +3641,7 @@ mod tests {
                 group: None,
                 group_relays: std::collections::BTreeSet::new(),
                 group_exporter_secrets: std::collections::HashMap::new(),
+                group_legacy_exporter_secrets: std::collections::HashMap::new(),
                 group_mip04_exporter_secrets: std::collections::HashMap::new(),
             };
 
@@ -3654,6 +3689,7 @@ mod tests {
                 group: None,
                 group_relays: std::collections::BTreeSet::new(),
                 group_exporter_secrets: std::collections::HashMap::new(),
+                group_legacy_exporter_secrets: std::collections::HashMap::new(),
                 group_mip04_exporter_secrets: std::collections::HashMap::new(),
             };
 
@@ -3688,6 +3724,7 @@ mod tests {
                 group: None,
                 group_relays: std::collections::BTreeSet::new(),
                 group_exporter_secrets: std::collections::HashMap::new(),
+                group_legacy_exporter_secrets: std::collections::HashMap::new(),
                 group_mip04_exporter_secrets: std::collections::HashMap::new(),
             };
             let base_snap2 = crate::snapshot::GroupScopedSnapshot {

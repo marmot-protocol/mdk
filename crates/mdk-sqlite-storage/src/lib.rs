@@ -1113,7 +1113,7 @@ impl MdkSqliteStorage {
                                     let (mls_group_id, epoch): (Vec<u8>, i64) =
                                         serde_json::from_slice(row_key)
                                             .map_err(|e| Error::Database(e.to_string()))?;
-                                    (mls_group_id, epoch, "group-event".to_string())
+                                    (mls_group_id, epoch, "legacy-group-event".to_string())
                                 }
                             };
                         conn.execute(
@@ -2169,6 +2169,125 @@ mod tests {
         };
         let result = storage.save_group_exporter_secret(invalid_secret);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_prune_group_exporter_secrets_removes_all_labels() {
+        let storage = MdkSqliteStorage::new_in_memory().unwrap();
+
+        let mls_group_id = GroupId::from_slice(&[1, 2, 3, 4]);
+        let group = Group {
+            mls_group_id: mls_group_id.clone(),
+            nostr_group_id: [0u8; 32],
+            name: "Test Group".to_string(),
+            description: "A test group for exporter secret pruning".to_string(),
+            admin_pubkeys: BTreeSet::new(),
+            last_message_id: None,
+            last_message_at: None,
+            last_message_processed_at: None,
+            epoch: 0,
+            state: GroupState::Active,
+            image_hash: None,
+            image_key: None,
+            image_nonce: None,
+            self_update_state: SelfUpdateState::Required,
+        };
+        storage.save_group(group).unwrap();
+
+        let old_group_event_secret = GroupExporterSecret {
+            mls_group_id: mls_group_id.clone(),
+            epoch: 1,
+            secret: Secret::new([1u8; 32]),
+        };
+        let old_legacy_secret = GroupExporterSecret {
+            mls_group_id: mls_group_id.clone(),
+            epoch: 2,
+            secret: Secret::new([2u8; 32]),
+        };
+        let old_mip04_secret = GroupExporterSecret {
+            mls_group_id: mls_group_id.clone(),
+            epoch: 2,
+            secret: Secret::new([3u8; 32]),
+        };
+        let retained_group_event_secret = GroupExporterSecret {
+            mls_group_id: mls_group_id.clone(),
+            epoch: 3,
+            secret: Secret::new([4u8; 32]),
+        };
+        let retained_legacy_secret = GroupExporterSecret {
+            mls_group_id: mls_group_id.clone(),
+            epoch: 3,
+            secret: Secret::new([5u8; 32]),
+        };
+        let retained_mip04_secret = GroupExporterSecret {
+            mls_group_id: mls_group_id.clone(),
+            epoch: 4,
+            secret: Secret::new([6u8; 32]),
+        };
+
+        storage
+            .save_group_exporter_secret(old_group_event_secret.clone())
+            .unwrap();
+        storage
+            .save_group_legacy_exporter_secret(old_legacy_secret.clone())
+            .unwrap();
+        storage
+            .save_group_mip04_exporter_secret(old_mip04_secret.clone())
+            .unwrap();
+        storage
+            .save_group_exporter_secret(retained_group_event_secret.clone())
+            .unwrap();
+        storage
+            .save_group_legacy_exporter_secret(retained_legacy_secret.clone())
+            .unwrap();
+        storage
+            .save_group_mip04_exporter_secret(retained_mip04_secret.clone())
+            .unwrap();
+
+        storage
+            .prune_group_exporter_secrets_before_epoch(&mls_group_id, 3)
+            .unwrap();
+
+        assert!(
+            storage
+                .get_group_exporter_secret(&mls_group_id, old_group_event_secret.epoch)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            storage
+                .get_group_legacy_exporter_secret(&mls_group_id, old_legacy_secret.epoch)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            storage
+                .get_group_mip04_exporter_secret(&mls_group_id, old_mip04_secret.epoch)
+                .unwrap()
+                .is_none()
+        );
+
+        assert_eq!(
+            storage
+                .get_group_exporter_secret(&mls_group_id, retained_group_event_secret.epoch)
+                .unwrap()
+                .unwrap(),
+            retained_group_event_secret
+        );
+        assert_eq!(
+            storage
+                .get_group_legacy_exporter_secret(&mls_group_id, retained_legacy_secret.epoch)
+                .unwrap()
+                .unwrap(),
+            retained_legacy_secret
+        );
+        assert_eq!(
+            storage
+                .get_group_mip04_exporter_secret(&mls_group_id, retained_mip04_secret.epoch)
+                .unwrap()
+                .unwrap(),
+            retained_mip04_secret
+        );
     }
 
     // ========================================
@@ -3578,8 +3697,7 @@ mod tests {
                 .unwrap();
 
             // Rewrite snapshot row_key into legacy 2-tuple format: (mls_group_id, epoch)
-            // so rollback exercises the fallback parser branch that defaults label to
-            // "group-event".
+            // so rollback exercises the compatibility branch for unlabeled exporter secrets.
             let legacy_row_key =
                 serde_json::to_vec(&(group_id.as_slice().to_vec(), 7_i64)).unwrap();
             storage
@@ -3610,20 +3728,25 @@ mod tests {
                 .rollback_group_to_snapshot(&group_id, "snap_legacy_unlabeled_key")
                 .unwrap();
 
-            let restored_group_event = storage
-                .get_group_exporter_secret(&group_id, 7)
+            let restored_group_event = storage.get_group_exporter_secret(&group_id, 7).unwrap();
+            assert!(
+                restored_group_event.is_none(),
+                "Legacy unlabeled exporter-secret snapshots should not restore as current group-event"
+            );
+
+            let restored_legacy = storage
+                .get_group_legacy_exporter_secret(&group_id, 7)
                 .unwrap()
                 .unwrap();
-            assert_eq!(restored_group_event.mls_group_id, group_id);
-            assert_eq!(restored_group_event.epoch, 7);
-            assert_eq!(restored_group_event, initial_group_event);
-
-            let restored_mip04 = storage
-                .get_group_mip04_exporter_secret(&group_id, 7)
-                .unwrap();
+            assert_eq!(restored_legacy.mls_group_id, group_id);
+            assert_eq!(restored_legacy.epoch, 7);
+            assert_eq!(restored_legacy, initial_group_event);
             assert!(
-                restored_mip04.is_none(),
-                "Legacy unlabeled row_key should restore as label='group-event', not MIP-04"
+                storage
+                    .get_group_mip04_exporter_secret(&group_id, 7)
+                    .unwrap()
+                    .is_none(),
+                "Legacy unlabeled exporter-secret snapshots should not restore as MIP-04"
             );
         }
 

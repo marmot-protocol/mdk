@@ -19,7 +19,7 @@ debug-examples = []
 
 [dependencies]
 hex = { workspace = true, features = ["std"] }
-nostr = { workspace = true, features = ["std"] }
+nostr = { workspace = true, features = ["nip44", "std"] }
 mdk-storage-traits.workspace = true
 openmls.workspace = true
 openmls_basic_credential.workspace = true
