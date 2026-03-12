@@ -812,7 +812,8 @@ where
     /// * `Error::GroupNotFound` - If the group does not exist
     /// * `Error::OwnLeafNotFound` - If the caller's leaf node is missing
     /// * `Error::Group` - If the caller is not an admin, no matching members are found,
-    ///   or the caller attempts to remove themselves
+    ///   the caller attempts to remove themselves, or the removal would leave the group
+    ///   with no admins
     /// * `Error::Extension` - If updating the admin list extension fails
     pub fn remove_members(
         &self,
@@ -866,6 +867,14 @@ where
             let mut updated_data = group_data;
             for pk in pubkeys {
                 updated_data.remove_admin(pk);
+            }
+            // Defensive check: the self-removal guard above makes this
+            // unreachable when the caller is also an admin, but we protect
+            // against future code paths that might skip that guard.
+            if updated_data.admins.is_empty() {
+                return Err(Error::Group(
+                    "Cannot remove all admins from the group".to_string(),
+                ));
             }
             let extension = Self::get_unknown_extension_from_group_data(&updated_data)?;
             let mut extensions = mls_group.extensions().clone();
@@ -2541,6 +2550,32 @@ mod tests {
         assert_eq!(
             group_after.admin_pubkeys, expected_admins,
             "Admin set should contain only the creator after removing admin member"
+        );
+
+        // Re-add member1 with a fresh key package and verify they do NOT
+        // reappear as admin (regression test for issue #514).
+        let re_add_kp = create_key_package_event(&creator_mdk, &initial_members[0]);
+        creator_mdk
+            .add_members(group_id, &[re_add_kp])
+            .expect("Failed to re-add member");
+        creator_mdk
+            .merge_pending_commit(group_id)
+            .expect("Failed to merge pending commit after re-add");
+
+        let group_readded = creator_mdk
+            .get_group(group_id)
+            .expect("Failed to get group")
+            .expect("Group should exist");
+        assert_eq!(
+            group_readded.admin_pubkeys, expected_admins,
+            "Re-added member should NOT regain admin status"
+        );
+        assert!(
+            creator_mdk
+                .get_members(group_id)
+                .expect("Failed to get members")
+                .contains(&member1_pk),
+            "member1 should be back in the group"
         );
     }
 
