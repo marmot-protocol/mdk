@@ -444,6 +444,54 @@ impl Mdk {
         Ok(event.content)
     }
 
+    /// Handle a kind 10051 (MLS Key Package Relays) event.
+    ///
+    /// Checks whether the user already has a key package in local storage. If not,
+    /// creates a new one using the relay URLs advertised in the event and returns it
+    /// so the caller can sign and publish a kind 443 event.
+    ///
+    /// This should be called both at login time and whenever the user is already
+    /// logged in but may have consumed their key package (e.g. after joining a group).
+    ///
+    /// # Arguments
+    ///
+    /// * `public_key` - Hex-encoded Nostr public key of the user
+    /// * `event_json` - JSON-serialized kind 10051 event
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(Some(KeyPackageResult))` - A new key package was created; publish it.
+    /// * `Ok(None)` - A key package already exists; no action needed.
+    /// * `Err` - The event is not kind 10051 or key package creation failed.
+    pub fn handle_keypackage_relay_list_event(
+        &self,
+        public_key: String,
+        event_json: String,
+    ) -> Result<Option<KeyPackageResult>, MdkUniffiError> {
+        let pubkey = parse_public_key(&public_key)?;
+        let event: Event = parse_json(&event_json, "event JSON")?;
+
+        if event.pubkey != pubkey {
+            return Err(MdkUniffiError::InvalidInput(
+                "event signer does not match provided public key".to_string(),
+            ));
+        }
+
+        let mdk = self.lock()?;
+        match mdk.handle_keypackage_relay_list_event(&pubkey, &event)? {
+            None => Ok(None),
+            Some((key_package, tags, hash_ref)) => {
+                let tags: Vec<Vec<String>> =
+                    tags.iter().map(|tag| tag.as_slice().to_vec()).collect();
+                Ok(Some(KeyPackageResult {
+                    key_package,
+                    tags,
+                    hash_ref,
+                }))
+            }
+        }
+    }
+
     /// Get all groups
     pub fn get_groups(&self) -> Result<Vec<Group>, MdkUniffiError> {
         Ok(self
@@ -1830,7 +1878,7 @@ impl TryFrom<EncryptedMediaUploadResult> for EncryptedMediaUpload {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nostr::{EventBuilder, JsonUtil, Keys, Kind, Tag, UnsignedEvent};
+    use nostr::{EventBuilder, JsonUtil, Keys, Kind, Tag, TagKind, UnsignedEvent};
     use tempfile::TempDir;
 
     fn create_test_mdk() -> Mdk {
@@ -1988,6 +2036,89 @@ mod tests {
 
         let result = mdk.create_key_package_for_event(pubkey_hex, invalid_relays);
         assert!(matches!(result, Err(MdkUniffiError::InvalidInput(_))));
+    }
+
+    fn make_relay_list_event_json(keys: &Keys, relays: &[&str]) -> String {
+        let tags: Vec<Tag> = relays
+            .iter()
+            .map(|url| Tag::custom(TagKind::Custom("relay".into()), [*url]))
+            .collect();
+        let event = EventBuilder::new(Kind::Custom(10051), "")
+            .tags(tags)
+            .sign_with_keys(keys)
+            .unwrap();
+        serde_json::to_string(&event).unwrap()
+    }
+
+    #[test]
+    fn test_handle_keypackage_relay_list_creates_when_none_exists() {
+        let mdk = create_test_mdk();
+        let keys = Keys::generate();
+        let pubkey_hex = keys.public_key().to_hex();
+        let event_json = make_relay_list_event_json(&keys, &["wss://relay.example.com"]);
+
+        let result = mdk.handle_keypackage_relay_list_event(pubkey_hex, event_json);
+        assert!(result.is_ok(), "should succeed");
+        let kp = result.unwrap();
+        assert!(kp.is_some(), "should return a key package when none exists");
+        let kp = kp.unwrap();
+        assert!(!kp.key_package.is_empty());
+        assert!(!kp.tags.is_empty());
+        assert!(!kp.hash_ref.is_empty());
+    }
+
+    #[test]
+    fn test_handle_keypackage_relay_list_returns_none_when_exists() {
+        let mdk = create_test_mdk();
+        let keys = Keys::generate();
+        let pubkey_hex = keys.public_key().to_hex();
+
+        mdk.create_key_package_for_event(
+            pubkey_hex.clone(),
+            vec!["wss://relay.example.com".to_string()],
+        )
+        .unwrap();
+
+        let event_json = make_relay_list_event_json(&keys, &["wss://relay.example.com"]);
+        let result = mdk.handle_keypackage_relay_list_event(pubkey_hex, event_json);
+        assert!(result.is_ok(), "should succeed");
+        assert!(
+            result.unwrap().is_none(),
+            "should return None when key package already exists"
+        );
+    }
+
+    #[test]
+    fn test_handle_keypackage_relay_list_rejects_signer_mismatch() {
+        let mdk = create_test_mdk();
+        let keys = Keys::generate();
+        let other_keys = Keys::generate();
+        let pubkey_hex = keys.public_key().to_hex();
+        let event_json = make_relay_list_event_json(&other_keys, &["wss://relay.example.com"]);
+
+        let result = mdk.handle_keypackage_relay_list_event(pubkey_hex, event_json);
+        assert!(
+            matches!(result, Err(MdkUniffiError::InvalidInput(_))),
+            "should reject event signed by different key"
+        );
+    }
+
+    #[test]
+    fn test_handle_keypackage_relay_list_rejects_wrong_kind() {
+        let mdk = create_test_mdk();
+        let keys = Keys::generate();
+        let pubkey_hex = keys.public_key().to_hex();
+
+        let wrong_event = EventBuilder::new(Kind::TextNote, "hello")
+            .sign_with_keys(&keys)
+            .unwrap();
+        let event_json = serde_json::to_string(&wrong_event).unwrap();
+
+        let result = mdk.handle_keypackage_relay_list_event(pubkey_hex, event_json);
+        assert!(
+            matches!(result, Err(MdkUniffiError::Mdk(_))),
+            "should reject wrong kind event"
+        );
     }
 
     #[test]

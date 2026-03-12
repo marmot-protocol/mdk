@@ -14,6 +14,12 @@ use crate::constant::{DEFAULT_CIPHERSUITE, TAG_EXTENSIONS};
 use crate::error::Error;
 use crate::util::{ContentEncoding, NostrTagFormat, decode_content, encode_content};
 
+/// The data returned when creating a key package for a Nostr event.
+///
+/// Contains the base64-encoded key package content, the Nostr event tags,
+/// and the serialized `KeyPackageRef` bytes for lifecycle tracking.
+pub type KeyPackageEventData = (String, Vec<Tag>, Vec<u8>);
+
 impl<Storage> MDK<Storage>
 where
     Storage: MdkStorageProvider,
@@ -694,6 +700,97 @@ where
 
         PublicKey::from_slice(identity_bytes)
             .map_err(|e| Error::KeyPackage(format!("Invalid public key: {}", e)))
+    }
+
+    /// Handles a kind 10051 (MLS Key Package Relays) event.
+    ///
+    /// This function processes a Nostr event of kind 10051, which advertises the relays
+    /// where a user publishes their MLS key packages. It checks whether the user already
+    /// has a key package in local storage and, if not, creates a new one so the caller
+    /// can publish it to the advertised relays.
+    ///
+    /// This should be called both at login time and whenever the user is already logged
+    /// in but may have consumed their key package (e.g. after joining a group).
+    ///
+    /// # Arguments
+    ///
+    /// * `public_key` - The Nostr public key of the user
+    /// * `event` - A kind 10051 event listing the relays where key packages are published
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(Some((content, tags, hash_ref)))` - A new key package was created because
+    ///   none existed in storage. The caller should sign and publish a kind 443 event
+    ///   using the returned content and tags.
+    /// * `Ok(None)` - A key package already exists in storage; no action is needed.
+    /// * `Err(Error::UnexpectedEvent)` - The event is not of kind 10051.
+    /// * `Err(Error)` - Key package creation or storage access failed.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use mdk_core::MDK;
+    /// # use nostr::{Event, PublicKey};
+    /// # fn example(
+    /// #     mdk: &MDK<impl mdk_storage_traits::MdkStorageProvider>,
+    /// #     public_key: &PublicKey,
+    /// #     relay_list_event: &Event,
+    /// # ) -> Result<(), Box<dyn std::error::Error>> {
+    /// if let Some((content, tags, _hash_ref)) =
+    ///     mdk.handle_keypackage_relay_list_event(public_key, relay_list_event)?
+    /// {
+    ///     // Build and publish a kind 443 event with `content` and `tags`
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn handle_keypackage_relay_list_event(
+        &self,
+        public_key: &PublicKey,
+        event: &Event,
+    ) -> Result<Option<KeyPackageEventData>, Error> {
+        if event.kind != Kind::MlsKeyPackageRelays {
+            return Err(Error::UnexpectedEvent {
+                expected: Kind::MlsKeyPackageRelays,
+                received: event.kind,
+            });
+        }
+
+        if event.pubkey != *public_key {
+            return Err(Error::KeyPackageIdentityMismatch {
+                credential_identity: public_key.to_hex(),
+                event_signer: event.pubkey.to_hex(),
+            });
+        }
+
+        if self
+            .storage()
+            .has_key_packages()
+            .map_err(|e| Error::Provider(e.to_string()))?
+        {
+            return Ok(None);
+        }
+
+        let relay_urls: Vec<RelayUrl> = event
+            .tags
+            .iter()
+            .filter(|t| t.kind() == TagKind::Relay)
+            .map(|t| {
+                t.as_slice()
+                    .get(1)
+                    .ok_or_else(|| Error::KeyPackage("relay tag missing URL value".to_string()))
+                    .and_then(|url| RelayUrl::parse(url).map_err(Error::RelayUrl))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        if relay_urls.is_empty() {
+            return Err(Error::KeyPackage(
+                "at least one relay URL is required".to_string(),
+            ));
+        }
+
+        let result = self.create_key_package_for_event(public_key, relay_urls)?;
+        Ok(Some(result))
     }
 }
 
@@ -2608,6 +2705,162 @@ mod tests {
             error_msg.contains("must not be empty"),
             "Error should mention empty value, got: {}",
             error_msg
+        );
+    }
+
+    fn make_relay_list_event(keys: &Keys, relays: &[&str]) -> nostr::Event {
+        let tags: Vec<Tag> = relays
+            .iter()
+            .map(|url| Tag::custom(TagKind::Relay, [*url]))
+            .collect();
+        EventBuilder::new(Kind::MlsKeyPackageRelays, "")
+            .tags(tags)
+            .sign_with_keys(keys)
+            .unwrap()
+    }
+
+    /// When no key package exists, handle_keypackage_relay_list_event creates one.
+    #[test]
+    fn test_handle_relay_list_creates_key_package_when_none_exists() {
+        let mdk = create_test_mdk();
+        let keys = Keys::generate();
+        let event = make_relay_list_event(&keys, &["wss://relay.example.com"]);
+
+        let result = mdk
+            .handle_keypackage_relay_list_event(&keys.public_key(), &event)
+            .expect("should succeed");
+
+        assert!(
+            result.is_some(),
+            "should return a new key package when none exists"
+        );
+        let (content, tags, hash_ref) = result.unwrap();
+        assert!(
+            !content.is_empty(),
+            "key package content should not be empty"
+        );
+        assert!(!tags.is_empty(), "key package tags should not be empty");
+        assert!(!hash_ref.is_empty(), "hash_ref should not be empty");
+
+        let relay_tag = tags.iter().find(|t| t.kind() == TagKind::Relays);
+        assert!(relay_tag.is_some(), "relay tag should be present");
+    }
+
+    /// When a key package already exists, handle_keypackage_relay_list_event returns None.
+    #[test]
+    fn test_handle_relay_list_returns_none_when_key_package_exists() {
+        let mdk = create_test_mdk();
+        let keys = Keys::generate();
+
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").unwrap()];
+        mdk.create_key_package_for_event(&keys.public_key(), relays)
+            .expect("should create key package");
+
+        let event = make_relay_list_event(&keys, &["wss://relay.example.com"]);
+        let result = mdk
+            .handle_keypackage_relay_list_event(&keys.public_key(), &event)
+            .expect("should succeed");
+
+        assert!(
+            result.is_none(),
+            "should return None when a key package already exists"
+        );
+    }
+
+    /// handle_keypackage_relay_list_event rejects events that are not kind 10051.
+    #[test]
+    fn test_handle_relay_list_rejects_wrong_kind() {
+        let mdk = create_test_mdk();
+        let keys = Keys::generate();
+
+        let wrong_kind_event = EventBuilder::new(Kind::MlsKeyPackage, "")
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        let result = mdk.handle_keypackage_relay_list_event(&keys.public_key(), &wrong_kind_event);
+
+        assert!(result.is_err(), "should reject non-10051 events");
+        assert!(
+            matches!(result.unwrap_err(), Error::UnexpectedEvent { .. }),
+            "error should be UnexpectedEvent"
+        );
+    }
+
+    /// handle_keypackage_relay_list_event rejects events signed by a different key.
+    #[test]
+    fn test_handle_relay_list_rejects_signer_mismatch() {
+        let mdk = create_test_mdk();
+        let keys = Keys::generate();
+        let other_keys = Keys::generate();
+        let event = make_relay_list_event(&other_keys, &["wss://relay.example.com"]);
+
+        let result = mdk.handle_keypackage_relay_list_event(&keys.public_key(), &event);
+
+        assert!(
+            result.is_err(),
+            "should reject event signed by different key"
+        );
+        assert!(
+            matches!(
+                result.unwrap_err(),
+                Error::KeyPackageIdentityMismatch { .. }
+            ),
+            "error should be KeyPackageIdentityMismatch"
+        );
+    }
+
+    /// Relay URLs from the kind 10051 event are embedded in the created key package.
+    #[test]
+    fn test_handle_relay_list_uses_relays_from_event() {
+        let mdk = create_test_mdk();
+        let keys = Keys::generate();
+        let relay_url = "wss://my-relay.example.com";
+        let event = make_relay_list_event(&keys, &[relay_url]);
+
+        let result = mdk
+            .handle_keypackage_relay_list_event(&keys.public_key(), &event)
+            .expect("should succeed")
+            .expect("should return a key package");
+
+        let (_, tags, _) = result;
+        let relay_tag = tags
+            .iter()
+            .find(|t| t.kind() == TagKind::Relays)
+            .expect("relay tag should be present");
+        let relay_values = relay_tag.as_slice();
+        assert!(
+            relay_values.iter().any(|v| v.as_str() == relay_url),
+            "relay URL from kind 10051 event should appear in key package relay tag"
+        );
+    }
+
+    /// When the kind 10051 event has no relay tags, an error is returned.
+    #[test]
+    fn test_handle_relay_list_with_no_relays() {
+        let mdk = create_test_mdk();
+        let keys = Keys::generate();
+        let event = make_relay_list_event(&keys, &[]);
+
+        let result = mdk.handle_keypackage_relay_list_event(&keys.public_key(), &event);
+
+        assert!(
+            result.is_err(),
+            "should return an error when no relay URLs are provided"
+        );
+    }
+
+    /// When the kind 10051 event has a malformed relay tag, an error is returned.
+    #[test]
+    fn test_handle_relay_list_with_malformed_relay() {
+        let mdk = create_test_mdk();
+        let keys = Keys::generate();
+        let event = make_relay_list_event(&keys, &["not-a-valid-relay"]);
+
+        let result = mdk.handle_keypackage_relay_list_event(&keys.public_key(), &event);
+
+        assert!(
+            result.is_err(),
+            "should return an error when a relay URL is malformed"
         );
     }
 }
