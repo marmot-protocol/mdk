@@ -417,6 +417,18 @@ where
     Ok(())
 }
 
+/// Check whether at least one key package exists.
+pub(crate) fn has_key_packages(conn: &Connection) -> Result<bool, MdkStorageError> {
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM openmls_key_packages WHERE provider_version = ? LIMIT 1",
+            params![STORAGE_PROVIDER_VERSION],
+            |row| row.get(0),
+        )
+        .map_err(|e| MdkStorageError::Database(e.to_string()))?;
+    Ok(count > 0)
+}
+
 // ============================================================================
 // Signature Keys Operations
 // ============================================================================

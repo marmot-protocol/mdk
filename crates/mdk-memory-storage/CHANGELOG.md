@@ -31,6 +31,8 @@
 
 ### Added
 
+- Implemented `MdkStorageProvider::has_key_packages` to support the new key package presence check.
+
 ### Fixed
 
 ### Removed

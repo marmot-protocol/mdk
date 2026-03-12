@@ -1242,6 +1242,10 @@ impl MdkStorageProvider for MdkSqliteStorage {
             .map_err(|e| MdkStorageError::Database(e.to_string()))?;
         Ok(deleted)
     }
+
+    fn has_key_packages(&self) -> Result<bool, MdkStorageError> {
+        self.with_connection(mls_storage::has_key_packages)
+    }
 }
 
 // ============================================================================
