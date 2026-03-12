@@ -756,7 +756,11 @@ where
         let commit_event =
             self.build_message_event(&mls_group.group_id().into(), serialized_commit_message)?;
 
-        self.track_processed_commit(commit_event.id, &mls_group)?;
+        self.track_processed_message(
+            commit_event.id,
+            &mls_group,
+            message_types::ProcessedMessageState::ProcessedCommit,
+        )?;
 
         let serialized_welcome_message = welcome_message
             .tls_serialize_detached()
@@ -922,7 +926,11 @@ where
         let commit_event =
             self.build_message_event(&mls_group.group_id().into(), serialized_commit_message)?;
 
-        self.track_processed_commit(commit_event.id, &mls_group)?;
+        self.track_processed_message(
+            commit_event.id,
+            &mls_group,
+            message_types::ProcessedMessageState::ProcessedCommit,
+        )?;
 
         // For now, if we find welcomes, throw an error.
         if welcome_option.is_some() {
@@ -980,7 +988,11 @@ where
             message_out.tls_serialize_detached()?,
         )?;
 
-        self.track_processed_commit(commit_event.id, mls_group)?;
+        self.track_processed_message(
+            commit_event.id,
+            mls_group,
+            message_types::ProcessedMessageState::ProcessedCommit,
+        )?;
 
         Ok(UpdateGroupResult {
             evolution_event: commit_event,
@@ -1370,7 +1382,11 @@ where
         let commit_event =
             self.build_message_event(&mls_group.group_id().into(), serialized_commit_message)?;
 
-        self.track_processed_commit(commit_event.id, &mls_group)?;
+        self.track_processed_message(
+            commit_event.id,
+            &mls_group,
+            message_types::ProcessedMessageState::ProcessedCommit,
+        )?;
 
         let serialized_welcome_message = commit_message_bundle
             .welcome()
@@ -1423,7 +1439,11 @@ where
         let evolution_event =
             self.build_message_event(&group.group_id().into(), serialized_message_out)?;
 
-        self.track_processed_commit(evolution_event.id, &group)?;
+        self.track_processed_message(
+            evolution_event.id,
+            &group,
+            message_types::ProcessedMessageState::Processed,
+        )?;
 
         Ok(UpdateGroupResult {
             evolution_event,
@@ -1693,15 +1713,20 @@ where
         Ok(())
     }
 
-    /// Records a processed commit so the client can track message state.
-    fn track_processed_commit(&self, event_id: EventId, mls_group: &MlsGroup) -> Result<(), Error> {
+    /// Records a processed message so the client can track message state.
+    fn track_processed_message(
+        &self,
+        event_id: EventId,
+        mls_group: &MlsGroup,
+        state: message_types::ProcessedMessageState,
+    ) -> Result<(), Error> {
         let processed_message = message_types::ProcessedMessage {
             wrapper_event_id: event_id,
             message_event_id: None,
             processed_at: Timestamp::now(),
             epoch: Some(mls_group.epoch().as_u64()),
             mls_group_id: Some(mls_group.group_id().into()),
-            state: message_types::ProcessedMessageState::ProcessedCommit,
+            state,
             failure_reason: None,
         };
         self.storage()
