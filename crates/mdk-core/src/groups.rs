@@ -2761,6 +2761,51 @@ mod tests {
     }
 
     #[test]
+    fn test_leave_group_records_processed_state() {
+        let creator_mdk = create_test_mdk();
+        let (creator, initial_members, admins) = create_test_group_members();
+        let creator_pk = creator.public_key();
+
+        let mut key_package_events = Vec::new();
+        for m in &initial_members {
+            key_package_events.push(create_key_package_event(&creator_mdk, m));
+        }
+
+        let create_result = creator_mdk
+            .create_group(
+                &creator_pk,
+                key_package_events,
+                create_nostr_group_config_data(admins),
+            )
+            .expect("Failed to create group");
+
+        let group_id = &create_result.group.mls_group_id.clone();
+        creator_mdk
+            .merge_pending_commit(group_id)
+            .expect("Failed to merge pending commit");
+
+        let leave_result = creator_mdk
+            .leave_group(group_id)
+            .expect("Failed to leave group");
+
+        // Verify the processed message was recorded with Processed state
+        // (not ProcessedCommit), since leave_group creates a proposal.
+        let processed = creator_mdk
+            .storage()
+            .find_processed_message_by_event_id(&leave_result.evolution_event.id)
+            .expect("Failed to query processed message")
+            .expect("ProcessedMessage should exist");
+
+        assert_eq!(
+            processed.state,
+            message_types::ProcessedMessageState::Processed,
+            "leave_group should record Processed state, not ProcessedCommit"
+        );
+        assert_eq!(processed.wrapper_event_id, leave_result.evolution_event.id);
+        assert!(processed.failure_reason.is_none());
+    }
+
+    #[test]
     fn test_self_update_success() {
         let creator_mdk = create_test_mdk();
         let (creator, initial_members, admins) = create_test_group_members();
