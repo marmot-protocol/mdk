@@ -812,8 +812,7 @@ where
     /// * `Error::GroupNotFound` - If the group does not exist
     /// * `Error::OwnLeafNotFound` - If the caller's leaf node is missing
     /// * `Error::Group` - If the caller is not an admin, no matching members are found,
-    ///   the caller attempts to remove themselves, or the removal would leave the group
-    ///   with no admins
+    ///   or the caller attempts to remove themselves
     /// * `Error::Extension` - If updating the admin list extension fails
     pub fn remove_members(
         &self,
@@ -867,14 +866,6 @@ where
             let mut updated_data = group_data;
             for pk in pubkeys {
                 updated_data.remove_admin(pk);
-            }
-            // Defensive check: the self-removal guard above makes this
-            // unreachable when the caller is also an admin, but we protect
-            // against future code paths that might skip that guard.
-            if updated_data.admins.is_empty() {
-                return Err(Error::Group(
-                    "Cannot remove all admins from the group".to_string(),
-                ));
             }
             let extension = Self::get_unknown_extension_from_group_data(&updated_data)?;
             let mut extensions = mls_group.extensions().clone();
