@@ -33,6 +33,8 @@
 
 ### Fixed
 
+- `remove_members` now atomically strips removed members from the group admin list within the same MLS commit ([#225](https://github.com/marmot-protocol/mdk/pull/225))
+
 ### Removed
 
 ### Deprecated
