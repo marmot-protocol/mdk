@@ -31,6 +31,8 @@
 
 ### Added
 
+- `Mdk::handle_keypackage_relay_list_event` – processes a kind 10051 (MLS Key Package Relays) event and returns a `KeyPackageResult` when a new key package was created, or `None` when one already exists.
+
 ### Fixed
 
 ### Removed
