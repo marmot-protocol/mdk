@@ -121,7 +121,7 @@ _build-uniffi needs_android="false" needs_ios="false":
     #!/usr/bin/env bash
     set -euo pipefail
     echo "Building mdk-uniffi library..."
-    cargo build --release --lib -p mdk-uniffi
+    cargo build --profile release-size --lib -p mdk-uniffi
     if [ "{{needs_android}}" = "true" ]; then
         just _build-uniffi-android aarch64-linux-android aarch64-linux-android21-clang
         just _build-uniffi-android armv7-linux-androideabi armv7a-linux-androideabi21-clang
@@ -155,7 +155,7 @@ _build-uniffi-ios TARGET:
     # the system Clang defaults to the current SDK version (e.g. 18.5), which emits
     # symbols like ___chkstk_darwin that are unavailable at the linker's deployment target,
     # causing "undefined symbol" link errors.
-    IPHONEOS_DEPLOYMENT_TARGET=15.0 cargo build --release --lib -p mdk-uniffi --target {{TARGET}}
+    IPHONEOS_DEPLOYMENT_TARGET=15.0 cargo build --profile release-size --lib -p mdk-uniffi --target {{TARGET}}
 
 _build-uniffi-android TARGET CLANG_PREFIX:
     #!/usr/bin/env bash
@@ -292,7 +292,7 @@ _build-uniffi-android TARGET CLANG_PREFIX:
     # Tell openssl-sys to use static linking
     export OPENSSL_STATIC=1
 
-    cargo build --release --lib -p mdk-uniffi --target {{TARGET}}
+    cargo build --profile release-size --lib -p mdk-uniffi --target {{TARGET}}
 
 uniffi-bindgen: (gen-binding "python") gen-binding-kotlin gen-binding-ruby
     @if [ "{{os()}}" = "macos" ]; then just gen-binding-swift; fi
