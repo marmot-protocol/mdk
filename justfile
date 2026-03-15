@@ -310,9 +310,9 @@ gen-binding lang: (_build-uniffi "false" "false")
     @echo "Generating {{lang}} bindings..."
     cd crates/mdk-uniffi && cargo run --bin uniffi-bindgen generate \
         -l {{lang}} \
-        --library ../../target/release/{{lib_filename}} \
+        --library ../../target/release-size/{{lib_filename}} \
         --out-dir bindings/{{lang}}
-    cp target/release/{{lib_filename}} crates/mdk-uniffi/bindings/{{lang}}/{{lib_filename}}
+    cp target/release-size/{{lib_filename}} crates/mdk-uniffi/bindings/{{lang}}/{{lib_filename}}
     @echo "✓ Bindings generated in crates/mdk-uniffi/bindings/{{lang}}/"
 
 gen-binding-kotlin: (_build-uniffi "true") (gen-binding "kotlin")
@@ -325,12 +325,12 @@ gen-binding-kotlin: (_build-uniffi "true") (gen-binding "kotlin")
     mkdir -p "$PROJECT_DIR/src/main/jniLibs/armeabi-v7a"
     # mkdir -p "$PROJECT_DIR/src/main/jniLibs/x86-64"
 
-    test -f target/aarch64-linux-android/release/libmdk_uniffi.so || (echo "Error: aarch64 Android library not found. Did the build succeed?" && exit 1)
-    test -f target/armv7-linux-androideabi/release/libmdk_uniffi.so || (echo "Error: armv7 Android library not found. Did the build succeed?" && exit 1)
+    test -f target/aarch64-linux-android/release-size/libmdk_uniffi.so || (echo "Error: aarch64 Android library not found. Did the build succeed?" && exit 1)
+    test -f target/armv7-linux-androideabi/release-size/libmdk_uniffi.so || (echo "Error: armv7 Android library not found. Did the build succeed?" && exit 1)
 
-    cp target/aarch64-linux-android/release/libmdk_uniffi.so "$PROJECT_DIR/src/main/jniLibs/arm64-v8a/libmdk_uniffi.so"
-    cp target/armv7-linux-androideabi/release/libmdk_uniffi.so "$PROJECT_DIR/src/main/jniLibs/armeabi-v7a/libmdk_uniffi.so"
-    # cp target/x86_64-linux-android/release/libmdk_uniffi.so "$PROJECT_DIR/src/main/jniLibs/x86-64/libmdk_uniffi.so"
+    cp target/aarch64-linux-android/release-size/libmdk_uniffi.so "$PROJECT_DIR/src/main/jniLibs/arm64-v8a/libmdk_uniffi.so"
+    cp target/armv7-linux-androideabi/release-size/libmdk_uniffi.so "$PROJECT_DIR/src/main/jniLibs/armeabi-v7a/libmdk_uniffi.so"
+    # cp target/x86_64-linux-android/release-size/libmdk_uniffi.so "$PROJECT_DIR/src/main/jniLibs/x86-64/libmdk_uniffi.so"
     rm -f "$BINDINGS_DIR/libmdk_uniffi.so"
     echo "✓ Kotlin bindings generated and moved to Android project"
 
@@ -344,8 +344,8 @@ gen-binding-swift: (_build-uniffi "false" "true") (gen-binding "swift")
     mkdir -p ios-artifacts/headers
     cp crates/mdk-uniffi/bindings/swift/mdk_uniffiFFI.h ios-artifacts/headers/
     xcodebuild -create-xcframework \
-        -library target/aarch64-apple-ios/release/libmdk_uniffi.a -headers ios-artifacts/headers \
-        -library target/aarch64-apple-ios-sim/release/libmdk_uniffi.a -headers ios-artifacts/headers \
+        -library target/aarch64-apple-ios/release-size/libmdk_uniffi.a -headers ios-artifacts/headers \
+        -library target/aarch64-apple-ios-sim/release-size/libmdk_uniffi.a -headers ios-artifacts/headers \
         -output ios-artifacts/mdk_uniffi.xcframework
     @echo "✓ Swift bindings and xcframework ready"
 
