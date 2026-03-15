@@ -69,3 +69,11 @@ tracing-subscriber = "0.3"
 
 # Testing
 tempfile = "3.20"
+
+[profile.release-size]
+inherits = "release"
+opt-level = "z"      # Optimize for binary size over speed
+lto = true           # Fat LTO: cross-crate dead-code elimination
+codegen-units = 1    # Required for fat LTO to be effective
+panic = "abort"      # No unwinding machinery; safe at UniFFI FFI boundary
+strip = true         # Strip all symbols from the output binary

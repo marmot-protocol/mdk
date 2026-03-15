@@ -31,6 +31,8 @@
 
 ### Added
 
+- Added `[profile.release-size]` custom profile with `opt-level = "z"`, fat LTO, single codegen unit, `panic = "abort"`, and symbol stripping. Android binding builds now use `--profile release-size` and additionally run `llvm-strip` post-build. Measured ~40% reduction in `.so` size. ([`#221`](https://github.com/marmot-protocol/mdk/pull/221))
+
 ### Fixed
 
 ### Removed
