@@ -430,21 +430,30 @@ where
         let group_exporter_secret =
             self.derive_exporter_secret_for_group(group_id, &group, "marmot", b"group-event")?;
 
-        self.storage()
-            .save_group_exporter_secret(group_exporter_secret.clone())
-            .map_err(|e| Error::Group(e.to_string()))?;
+        // Only write back to storage when the value has changed (or is absent).
+        // This avoids an unconditional write on every message decryption in the steady state
+        // while still self-healing any stale pre-0.7.0 row that differs from live MLS state.
+        let secret_changed = stored_secret
+            .as_ref()
+            .map(|s| s.secret != group_exporter_secret.secret)
+            .unwrap_or(true);
 
-        if let Some(stored_secret) = stored_secret
-            && stored_secret.secret != group_exporter_secret.secret
-            && let Err(e) = self
-                .storage()
-                .save_group_legacy_exporter_secret(stored_secret)
-        {
-            tracing::warn!(
-                target: "mdk_core::groups::exporter_secret",
-                "Failed to preserve legacy exporter secret for compatibility: {}",
-                e
-            );
+        if secret_changed {
+            self.storage()
+                .save_group_exporter_secret(group_exporter_secret.clone())
+                .map_err(|e| Error::Group(e.to_string()))?;
+
+            if let Some(stored_secret) = stored_secret
+                && let Err(e) = self
+                    .storage()
+                    .save_group_legacy_exporter_secret(stored_secret)
+            {
+                tracing::warn!(
+                    target: "mdk_core::groups::exporter_secret",
+                    "Failed to preserve legacy exporter secret for compatibility: {}",
+                    e
+                );
+            }
         }
 
         Ok(group_exporter_secret)

@@ -87,11 +87,13 @@ where
     }
 
     fn allow_legacy_nip44_wrapper_fallback_at(event: &Event, current_time: u64) -> bool {
-        if event
-            .tags
-            .iter()
-            .any(|tag| tag.kind() == TagKind::Custom("encoding".into()))
-        {
+        // Events with an explicit `encoding=base64` tag were produced by the current AEAD
+        // format (post-0.7.0). Legacy NIP-44 events have no encoding tag at all.
+        // We check both kind and value to avoid accidentally blocking the fallback for
+        // future or alternative encoding tags whose values we don't recognise.
+        if event.tags.iter().any(|tag| {
+            tag.kind() == TagKind::Custom("encoding".into()) && tag.content() == Some("base64")
+        }) {
             return false;
         }
 

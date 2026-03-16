@@ -339,7 +339,7 @@ where
     /// # Arguments
     ///
     /// * `event` - The Nostr event to validate
-    pub(super) fn validate_created_at_at(&self, event: &Event, now: Timestamp) -> Result<()> {
+    pub(super) fn validate_created_at_with_now(&self, event: &Event, now: Timestamp) -> Result<()> {
         // Reject events from the future (allow configurable clock skew)
         if event.created_at.as_secs()
             > now
@@ -451,7 +451,7 @@ where
         }
 
         // 2. Verify timestamp is within acceptable bounds
-        self.validate_created_at_at(event, now)?;
+        self.validate_created_at_with_now(event, now)?;
 
         Ok(())
     }
