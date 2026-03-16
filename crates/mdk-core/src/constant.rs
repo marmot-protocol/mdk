@@ -1,4 +1,4 @@
-//! Nostr MLS constants
+//! MDK constants
 
 use openmls::extensions::ExtensionType;
 use openmls_traits::types::Ciphersuite;

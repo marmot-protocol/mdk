@@ -1,4 +1,4 @@
-//! Nostr MLS Welcomes
+//! MDK welcomes
 
 use nostr::{EventId, Kind, Tag, TagKind, Timestamp, UnsignedEvent};
 use openmls::prelude::*;
@@ -93,26 +93,27 @@ where
     /// # Validation Rules
     ///
     /// - Event kind must be 444 (MlsWelcome)
-    /// - Must have exactly 4 required tags: relays, e (event reference), client, and encoding
+    /// - Must have at least 3 required tags: relays, e (event reference), and encoding
+    /// - The `client` tag is optional per MIP-02 (informational only)
     /// - Tag order is not enforced (for interoperability with other implementations)
     /// - Tag values must be non-empty
-    /// - Encoding tag must be either "hex" or "base64"
+    /// - Encoding tag must be "base64"
     fn validate_welcome_event(event: &UnsignedEvent) -> Result<(), Error> {
         // 1. Validate kind is 444 (MlsWelcome)
         if event.kind != Kind::MlsWelcome {
             return Err(Error::InvalidWelcomeMessage);
         }
 
-        // 2. Validate minimum number of tags (at least 4: relays, e, client, encoding)
+        // 2. Validate minimum number of tags (at least 3: relays, e, encoding)
         let tags: Vec<&Tag> = event.tags.iter().collect();
-        if tags.len() < 4 {
+        if tags.len() < 3 {
             return Err(Error::InvalidWelcomeMessage);
         }
 
         // 3. Validate presence of required tags (order doesn't matter for interoperability)
+        // Note: `client` tag is optional per MIP-02 and not validated here
         let mut has_relays = false;
         let mut has_event_ref = false;
-        let mut has_client = false;
         let mut has_encoding = false;
 
         for tag in &tags {
@@ -137,9 +138,10 @@ where
                     }
                 }
                 TagKind::Client => {
-                    // Check that client tag has non-empty content
-                    if tag.content().is_some() && tag.content() != Some("") {
-                        has_client = true;
+                    // Client tag is optional, but if present its value must be non-empty
+                    match tag.content() {
+                        Some(value) if !value.is_empty() => {}
+                        _ => return Err(Error::InvalidWelcomeMessage),
                     }
                 }
                 TagKind::Custom(name) if name.as_ref() == "encoding" => {
@@ -163,9 +165,6 @@ where
             return Err(Error::InvalidWelcomeMessage);
         }
         if !has_event_ref {
-            return Err(Error::InvalidWelcomeMessage);
-        }
-        if !has_client {
             return Err(Error::InvalidWelcomeMessage);
         }
         if !has_encoding {
@@ -237,12 +236,14 @@ where
             admin_pubkeys: welcome_preview.nostr_group_data.admins.clone(),
             last_message_id: None,
             last_message_at: None,
+            last_message_processed_at: None,
             epoch: welcome_preview
                 .staged_welcome
                 .group_context()
                 .epoch()
                 .as_u64(),
             state: group_types::GroupState::Pending,
+            self_update_state: group_types::SelfUpdateState::Required,
         };
 
         let mls_group_id = group.mls_group_id.clone();
@@ -328,6 +329,8 @@ where
 
             // Update group state
             group.state = group_types::GroupState::Active;
+            // Flag that this group needs a post-join self-update (MIP-02)
+            group.self_update_state = group_types::SelfUpdateState::Required;
 
             // Save group
             self.storage().save_group(group).map_err(
@@ -409,10 +412,13 @@ where
         let mls_group_config = MlsGroupJoinConfig::builder()
             .use_ratchet_tree_extension(true)
             .sender_ratchet_configuration(sender_ratchet_config)
+            .max_past_epochs(self.config.max_past_epochs)
             .build();
 
         let staged_welcome =
-            StagedWelcome::new_from_welcome(&self.provider, &mls_group_config, welcome, None)?;
+            StagedWelcome::build_from_welcome(&self.provider, &mls_group_config, welcome)?
+                .replace_old_group()
+                .build()?;
 
         let nostr_group_data =
             NostrGroupDataExtension::from_group_context(staged_welcome.group_context())?;
@@ -534,15 +540,16 @@ mod tests {
     use super::*;
     use crate::test_util::*;
     use crate::tests::create_test_mdk;
-    use nostr::base64::Engine;
-    use nostr::base64::engine::general_purpose::STANDARD as BASE64;
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD as BASE64;
     use nostr::{Keys, Kind, TagKind};
 
     /// Test that Welcome event structure matches Marmot spec (MIP-02)
     /// Spec requires:
     /// - Kind: 444 (MlsWelcome)
     /// - Content: base64 encoded serialized MLSMessage
-    /// - Tags: exactly 4 tags (relays + event reference + client + encoding)
+    /// - Tags: at least 3 required tags (relays + event reference + encoding)
+    /// - Optional: client tag (informational only)
     /// - Must be unsigned (UnsignedEvent for NIP-59 gift wrapping)
     #[test]
     fn test_welcome_event_structure_mip02_compliance() {
@@ -589,11 +596,11 @@ mod tests {
                 decoded_content.len()
             );
 
-            // 3. Verify exactly 4 tags (relays + event reference + client + encoding)
-            assert_eq!(
-                welcome_rumor.tags.len(),
-                4,
-                "Welcome event must have exactly 4 tags"
+            // 3. Verify at least 3 required tags (relays + event reference + encoding)
+            // MDK also includes the optional client tag, so we expect 4
+            assert!(
+                welcome_rumor.tags.len() >= 3,
+                "Welcome event must have at least 3 tags (relays, e, encoding)"
             );
 
             // 4. Verify first tag is relays tag
@@ -625,18 +632,21 @@ mod tests {
                 "Event reference tag must have content (KeyPackage event ID)"
             );
 
-            // 6. Verify third tag is client tag
-            let client_tag = tags_vec[2];
-            assert_eq!(
-                client_tag.kind(),
-                TagKind::Client,
-                "Third tag must be 'client' tag"
-            );
-
-            // Verify client tag has content (MDK version)
+            // 6. Verify encoding tag is present with valid value
+            let encoding_tag = tags_vec
+                .iter()
+                .find(|t| matches!(t.kind(), TagKind::Custom(name) if name.as_ref() == "encoding"))
+                .expect("Welcome event must have an 'encoding' tag");
+            let encoding_value = encoding_tag
+                .content()
+                .expect("Encoding tag must have a value");
             assert!(
-                client_tag.content().is_some(),
-                "Client tag should contain MDK version"
+                !encoding_value.is_empty(),
+                "Encoding tag value must be non-empty"
+            );
+            assert_eq!(
+                encoding_value, "base64",
+                "Encoding tag value must be 'base64'"
             );
 
             // 7. Verify event is unsigned (UnsignedEvent - no sig field when serialized)
@@ -663,7 +673,7 @@ mod tests {
             RelayUrl::parse("wss://relay.example.com").unwrap(),
         ]));
         tags1.push(nostr::Tag::event(EventId::all_zeros()));
-        tags1.push(nostr::Tag::client("mdk".to_string()));
+        tags1.push(nostr::Tag::parse(&["encoding".to_string(), "base64".to_string()]).unwrap());
 
         let wrong_kind_event = UnsignedEvent {
             id: None,
@@ -695,14 +705,14 @@ mod tests {
         assert!(result.is_err(), "Should reject missing tags");
         assert!(matches!(result.unwrap_err(), Error::InvalidWelcomeMessage));
 
-        // Test 3: Missing encoding tag
+        // Test 3: Missing encoding tag (has 3 tags but encoding is replaced with client)
         let mut tags3 = nostr::Tags::new();
         tags3.push(nostr::Tag::relays(vec![
             RelayUrl::parse("wss://relay.example.com").unwrap(),
         ]));
         tags3.push(nostr::Tag::event(EventId::all_zeros()));
         tags3.push(nostr::Tag::client("mdk".to_string()));
-        // Missing encoding tag
+        // Missing encoding tag - client is not a substitute for encoding
 
         let missing_encoding_event = UnsignedEvent {
             id: None,
@@ -720,8 +730,7 @@ mod tests {
         let mut tags4 = nostr::Tags::new();
         tags4.push(nostr::Tag::relays(vec![])); // Empty relays
         tags4.push(nostr::Tag::event(EventId::all_zeros()));
-        tags4.push(nostr::Tag::client("mdk".to_string()));
-        tags4.push(nostr::Tag::parse(&["encoding".to_string(), "hex".to_string()]).unwrap());
+        tags4.push(nostr::Tag::parse(&["encoding".to_string(), "base64".to_string()]).unwrap());
 
         let empty_relays_event = UnsignedEvent {
             id: None,
@@ -741,8 +750,7 @@ mod tests {
             nostr::Tag::parse(&["relays".to_string(), "http://invalid.com".to_string()]).unwrap(),
         ); // Invalid protocol
         tags5.push(nostr::Tag::event(EventId::all_zeros()));
-        tags5.push(nostr::Tag::client("mdk".to_string()));
-        tags5.push(nostr::Tag::parse(&["encoding".to_string(), "hex".to_string()]).unwrap());
+        tags5.push(nostr::Tag::parse(&["encoding".to_string(), "base64".to_string()]).unwrap());
 
         let invalid_relay_url_event = UnsignedEvent {
             id: None,
@@ -760,8 +768,7 @@ mod tests {
         let mut tags6 = nostr::Tags::new();
         tags6.push(nostr::Tag::parse(&["relays".to_string(), "wss://".to_string()]).unwrap()); // No host after protocol
         tags6.push(nostr::Tag::event(EventId::all_zeros()));
-        tags6.push(nostr::Tag::client("mdk".to_string()));
-        tags6.push(nostr::Tag::parse(&["encoding".to_string(), "hex".to_string()]).unwrap());
+        tags6.push(nostr::Tag::parse(&["encoding".to_string(), "base64".to_string()]).unwrap());
 
         let incomplete_relay_url_event = UnsignedEvent {
             id: None,
@@ -781,8 +788,7 @@ mod tests {
             RelayUrl::parse("wss://relay.example.com").unwrap(),
         ]));
         tags7.push(nostr::Tag::parse(&["e".to_string(), "".to_string()]).unwrap()); // Empty event ID
-        tags7.push(nostr::Tag::client("mdk".to_string()));
-        tags7.push(nostr::Tag::parse(&["encoding".to_string(), "hex".to_string()]).unwrap());
+        tags7.push(nostr::Tag::parse(&["encoding".to_string(), "base64".to_string()]).unwrap());
 
         let empty_e_tag_event = UnsignedEvent {
             id: None,
@@ -796,16 +802,15 @@ mod tests {
         assert!(result.is_err(), "Should reject empty e tag content");
         assert!(matches!(result.unwrap_err(), Error::InvalidWelcomeMessage));
 
-        // Test 8: Empty client tag content
+        // Test 8: Invalid encoding value
         let mut tags8 = nostr::Tags::new();
         tags8.push(nostr::Tag::relays(vec![
             RelayUrl::parse("wss://relay.example.com").unwrap(),
         ]));
         tags8.push(nostr::Tag::event(EventId::all_zeros()));
-        tags8.push(nostr::Tag::parse(&["client".to_string(), "".to_string()]).unwrap()); // Empty client
-        tags8.push(nostr::Tag::parse(&["encoding".to_string(), "hex".to_string()]).unwrap());
+        tags8.push(nostr::Tag::parse(&["encoding".to_string(), "invalid".to_string()]).unwrap()); // Invalid encoding
 
-        let empty_client_tag_event = UnsignedEvent {
+        let invalid_encoding_event = UnsignedEvent {
             id: None,
             pubkey: Keys::generate().public_key(),
             created_at: Timestamp::now(),
@@ -813,20 +818,20 @@ mod tests {
             tags: tags8,
             content: "test".to_string(),
         };
-        let result = mdk.process_welcome(&wrapper_event_id, &empty_client_tag_event);
-        assert!(result.is_err(), "Should reject empty client tag content");
+        let result = mdk.process_welcome(&wrapper_event_id, &invalid_encoding_event);
+        assert!(result.is_err(), "Should reject invalid encoding value");
         assert!(matches!(result.unwrap_err(), Error::InvalidWelcomeMessage));
 
-        // Test 9: Invalid encoding value
+        // Test 9: Empty client tag content (client is optional but must be non-empty if present)
         let mut tags9 = nostr::Tags::new();
         tags9.push(nostr::Tag::relays(vec![
             RelayUrl::parse("wss://relay.example.com").unwrap(),
         ]));
         tags9.push(nostr::Tag::event(EventId::all_zeros()));
-        tags9.push(nostr::Tag::client("mdk".to_string()));
-        tags9.push(nostr::Tag::parse(&["encoding".to_string(), "invalid".to_string()]).unwrap()); // Invalid encoding
+        tags9.push(nostr::Tag::parse(&["client".to_string(), "".to_string()]).unwrap()); // Empty client
+        tags9.push(nostr::Tag::parse(&["encoding".to_string(), "base64".to_string()]).unwrap());
 
-        let invalid_encoding_event = UnsignedEvent {
+        let empty_client_tag_event = UnsignedEvent {
             id: None,
             pubkey: Keys::generate().public_key(),
             created_at: Timestamp::now(),
@@ -834,9 +839,70 @@ mod tests {
             tags: tags9,
             content: "test".to_string(),
         };
-        let result = mdk.process_welcome(&wrapper_event_id, &invalid_encoding_event);
-        assert!(result.is_err(), "Should reject invalid encoding value");
+        let result = mdk.process_welcome(&wrapper_event_id, &empty_client_tag_event);
+        assert!(
+            result.is_err(),
+            "Should reject empty client tag content when present"
+        );
         assert!(matches!(result.unwrap_err(), Error::InvalidWelcomeMessage));
+    }
+
+    /// Test that welcome validation accepts events without a client tag (MIP-02)
+    ///
+    /// The `client` tag is optional per MIP-02. A spec-compliant third-party
+    /// implementation that omits the `client` tag must not be rejected.
+    #[test]
+    fn test_welcome_validation_accepts_missing_client_tag() {
+        let mdk = create_test_mdk();
+        let (creator, members, admins) = create_test_group_members();
+
+        // Create a valid group to get a real welcome rumor
+        let member_kp_event = create_key_package_event(&mdk, &members[0]);
+        let create_result = mdk
+            .create_group(
+                &creator.public_key(),
+                vec![member_kp_event],
+                create_nostr_group_config_data(admins),
+            )
+            .expect("Failed to create group");
+
+        let original_welcome = &create_result.welcome_rumors[0];
+
+        // Rebuild the welcome without the client tag
+        let mut tags_without_client = nostr::Tags::new();
+        for tag in original_welcome.tags.iter() {
+            if tag.kind() != TagKind::Client {
+                tags_without_client.push(tag.clone());
+            }
+        }
+
+        // Verify we actually removed the client tag
+        assert!(
+            tags_without_client.len() < original_welcome.tags.len(),
+            "Should have fewer tags after removing client tag"
+        );
+
+        let welcome_without_client = UnsignedEvent {
+            id: original_welcome.id,
+            pubkey: original_welcome.pubkey,
+            created_at: original_welcome.created_at,
+            kind: original_welcome.kind,
+            tags: tags_without_client,
+            content: original_welcome.content.clone(),
+        };
+
+        // Processing should succeed without the client tag
+        let wrapper_event_id = EventId::all_zeros();
+        let result = mdk.process_welcome(&wrapper_event_id, &welcome_without_client);
+        assert!(
+            result.is_ok(),
+            "Welcome without client tag should be accepted, got: {:?}",
+            result.unwrap_err()
+        );
+
+        // Verify the welcome was stored correctly
+        let welcome = result.unwrap();
+        assert_eq!(welcome.state, welcome_types::WelcomeState::Pending);
     }
 
     /// Test that Welcome content is valid MLS Welcome structure
@@ -957,7 +1023,7 @@ mod tests {
         // Verify all welcomes have the same structure
         for welcome_rumor in &create_result.welcome_rumors {
             assert_eq!(welcome_rumor.kind, Kind::MlsWelcome);
-            assert_eq!(welcome_rumor.tags.len(), 4);
+            assert!(welcome_rumor.tags.len() >= 3);
             assert!(
                 BASE64.decode(&welcome_rumor.content).is_ok(),
                 "Welcome content should be valid base64"
@@ -1053,7 +1119,10 @@ mod tests {
             Kind::MlsWelcome,
             "Welcome should be kind 444"
         );
-        assert_eq!(welcome_rumor.tags.len(), 4, "Welcome should have 4 tags");
+        assert!(
+            welcome_rumor.tags.len() >= 3,
+            "Welcome should have at least 3 required tags"
+        );
     }
 
     /// Test that welcome event structure remains consistent across group operations
@@ -1310,7 +1379,10 @@ mod tests {
 
             // Verify welcome structure
             assert_eq!(welcome.kind, Kind::MlsWelcome);
-            assert_eq!(welcome.tags.len(), 4, "Welcome should have 4 tags");
+            assert!(
+                welcome.tags.len() >= 3,
+                "Welcome should have at least 3 required tags"
+            );
         }
 
         // Test size reporting for larger groups
@@ -1326,7 +1398,7 @@ mod tests {
         // - Welcome messages can be created for small-medium groups (5-20 members)
         // - Welcome sizes are measured and reported correctly
         // - Welcome messages are valid base64-encoded MLS messages
-        // - Welcome structure matches MIP-02 requirements (kind 444, 4 tags)
+        // - Welcome structure matches MIP-02 requirements (kind 444, 3+ tags)
         // - Size validation logic is in place
 
         // Note: (warning for groups approaching 150 members) would be

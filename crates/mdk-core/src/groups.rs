@@ -1,4 +1,4 @@
-//! Nostr MLS Group Management
+//! MDK groups
 //!
 //! This module provides functionality for managing MLS groups in Nostr:
 //! - Group creation and configuration
@@ -7,7 +7,7 @@
 //! - Group metadata handling
 //! - Group secret management
 //!
-//! Groups in Nostr MLS have both an MLS group ID and a Nostr group ID. The MLS group ID
+//! Groups in MDK have both an MLS group ID and a Nostr group ID. The MLS group ID
 //! is used internally by the MLS protocol, while the Nostr group ID is used for
 //! relay-based message routing and group discovery.
 
@@ -22,9 +22,12 @@ use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
 use tls_codec::Serialize as TlsSerialize;
 
+use sha2::{Digest, Sha256};
+
 use super::MDK;
 use super::extension::NostrGroupDataExtension;
 use crate::error::Error;
+use crate::messages::crypto::encrypt_message_with_exporter_secret;
 use crate::util::{ContentEncoding, encode_content};
 
 /// Result of creating a new MLS group
@@ -96,6 +99,47 @@ pub struct PendingMemberChanges {
     pub additions: Vec<PublicKey>,
     /// Public keys of members that will be removed when proposals are committed
     pub removals: Vec<PublicKey>,
+}
+
+/// Public information about a leaf node in the ratchet tree
+///
+/// Contains only public information (encryption key, signature key, credential
+/// identity). No secret key material is included.
+///
+/// # Security Note
+///
+/// The ratchet tree holds public keys and tree structure, not secrets.
+/// The MLS spec assumes this data can be shared (e.g. in Welcome messages).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeafNodeInfo {
+    /// The leaf index in the ratchet tree
+    pub index: u32,
+    /// The member's public HPKE encryption key (hex-encoded)
+    pub encryption_key: String,
+    /// The member's public signature key (hex-encoded)
+    pub signature_key: String,
+    /// The member's credential identity (hex-encoded, typically a Nostr public key)
+    pub credential_identity: String,
+}
+
+/// Public information about the ratchet tree of an MLS group
+///
+/// Provides a view into the MLS group's tree structure.
+/// Contains only public information — no secrets or private key material.
+///
+/// # Security Note
+///
+/// The ratchet tree holds public keys and tree structure, not secrets.
+/// The MLS spec assumes this data can be shared (e.g. in Welcome messages).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RatchetTreeInfo {
+    /// SHA-256 fingerprint of the TLS-serialized ratchet tree (hex-encoded).
+    /// Useful for comparing tree state across clients.
+    pub tree_hash: String,
+    /// The full ratchet tree serialized via TLS encoding (hex-encoded)
+    pub serialized_tree: String,
+    /// Leaf nodes with their indices and public keys
+    pub leaf_nodes: Vec<LeafNodeInfo>,
 }
 
 impl NostrGroupConfigData {
@@ -332,9 +376,10 @@ where
         self.load_mls_group_impl(group_id)
     }
 
-    /// Exports the current epoch's secret key from an MLS group (internal version)
+    /// Exports the current epoch's secret key from an MLS group for MIP-03 message encryption.
     ///
-    /// This secret is used for NIP-44 message encryption in Group Message Events (kind:445).
+    /// Uses `MLS-Exporter("marmot", "group-event", 32)` per MIP-03. The secret is the
+    /// ChaCha20-Poly1305 encryption key for kind:445 Group Message Events.
     /// The secret is cached in storage to avoid re-exporting it for each message.
     ///
     /// # Arguments
@@ -360,7 +405,7 @@ where
             // If it's not already in the storage, export the secret and save it
             None => {
                 let export_secret: [u8; 32] = group
-                    .export_secret(self.provider.crypto(), "nostr", b"nostr", 32)?
+                    .export_secret(self.provider.crypto(), "marmot", b"group-event", 32)?
                     .try_into()
                     .map_err(|_| {
                         Error::Group("Failed to convert export secret to [u8; 32]".to_string())
@@ -380,7 +425,42 @@ where
         }
     }
 
-    /// Retrieves a Nostr MLS group by its MLS group ID
+    /// Exports the current epoch's secret key from an MLS group for MIP-04 encrypted media.
+    ///
+    /// Uses `MLS-Exporter("marmot", "encrypted-media", 32)` per MIP-04. This is a separate
+    /// exporter from [`Self::exporter_secret`] (which uses `"group-event"` for MIP-03).
+    /// The result is used as HKDF input keying material for per-file encryption key derivation.
+    ///
+    /// # Arguments
+    ///
+    /// * `group_id` - The MLS group ID
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(GroupExporterSecret)` - The exported secret
+    /// * `Err(Error)` - If the group is not found or there is an error exporting the secret
+    #[cfg(feature = "mip04")]
+    pub(crate) fn mip04_exporter_secret(
+        &self,
+        group_id: &crate::GroupId,
+    ) -> Result<group_types::GroupExporterSecret, Error> {
+        let group = self.load_mls_group(group_id)?.ok_or(Error::GroupNotFound)?;
+
+        let export_secret: [u8; 32] = group
+            .export_secret(self.provider.crypto(), "marmot", b"encrypted-media", 32)?
+            .try_into()
+            .map_err(|_| {
+                Error::Group("Failed to convert MIP-04 export secret to [u8; 32]".to_string())
+            })?;
+
+        Ok(group_types::GroupExporterSecret {
+            mls_group_id: group_id.clone(),
+            epoch: group.epoch().as_u64(),
+            secret: mdk_storage_traits::Secret::new(export_secret),
+        })
+    }
+
+    /// Retrieves a MDK group by its MLS group ID
     ///
     /// # Arguments
     ///
@@ -397,7 +477,7 @@ where
             .map_err(|e| Error::Group(e.to_string()))
     }
 
-    /// Retrieves all Nostr MLS groups from storage
+    /// Retrieves all MDK groups from storage
     ///
     /// # Returns
     ///
@@ -406,6 +486,24 @@ where
     pub fn get_groups(&self) -> Result<Vec<group_types::Group>, Error> {
         self.storage()
             .all_groups()
+            .map_err(|e| Error::Group(e.to_string()))
+    }
+
+    /// Returns the group IDs of active groups that need a self-update.
+    ///
+    /// A group needs a self-update if:
+    /// - `self_update_state` is `SelfUpdateState::Required` (post-join requirement, MIP-02), or
+    /// - `self_update_state` is `SelfUpdateState::CompletedAt` and the timestamp is older than `threshold_secs` (periodic rotation, MIP-00)
+    ///
+    /// # Arguments
+    /// * `threshold_secs` - Maximum age in seconds before a group's key rotation is considered stale
+    ///
+    /// # Returns
+    /// * `Ok(Vec<GroupId>)` - Group IDs needing self-update
+    /// * `Err(Error)` - If there is an error accessing storage
+    pub fn groups_needing_self_update(&self, threshold_secs: u64) -> Result<Vec<GroupId>, Error> {
+        self.storage()
+            .groups_needing_self_update(threshold_secs)
             .map_err(|e| Error::Group(e.to_string()))
     }
 
@@ -430,6 +528,68 @@ where
             let public_key = self.parse_credential_identity(identity_bytes)?;
             acc.insert(public_key);
             Ok(acc)
+        })
+    }
+
+    /// Returns public information about the ratchet tree of an MLS group
+    ///
+    /// This includes a SHA-256 fingerprint of the TLS-serialized ratchet tree,
+    /// the full serialized tree as hex, and a list of leaf nodes with their
+    /// indices and public keys.
+    ///
+    /// # Security Note
+    ///
+    /// The ratchet tree holds public keys and tree structure, not secrets.
+    /// Per the MLS spec, ratchet tree data is public information that can be
+    /// shared (e.g., in Welcome messages).
+    ///
+    /// # Arguments
+    ///
+    /// * `group_id` - The MLS group ID
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(RatchetTreeInfo)` - Public information about the ratchet tree
+    /// * `Err(Error)` - If the group is not found or there is an error accessing the tree
+    pub fn get_ratchet_tree_info(&self, group_id: &GroupId) -> Result<RatchetTreeInfo, Error> {
+        let mls_group = self.load_mls_group(group_id)?.ok_or(Error::GroupNotFound)?;
+
+        // Export and TLS-serialize the ratchet tree
+        let ratchet_tree = mls_group.export_ratchet_tree();
+        let serialized_bytes = ratchet_tree.tls_serialize_detached()?;
+
+        // Compute SHA-256 fingerprint of the serialized tree for easy comparison
+        let tree_hash = hex::encode(Sha256::digest(&serialized_bytes));
+        let serialized_tree = hex::encode(&serialized_bytes);
+
+        // Extract leaf nodes with their public keys
+        let leaf_nodes: Vec<LeafNodeInfo> = mls_group
+            .members()
+            .map(|member| {
+                let index = member.index.u32();
+                let basic_cred = BasicCredential::try_from(member.credential).map_err(|e| {
+                    tracing::warn!(
+                        leaf_index = index,
+                        error = %e,
+                        "Failed to parse credential for leaf node in ratchet tree"
+                    );
+                    Error::Group(format!("invalid credential at leaf index {index}: {e}"))
+                })?;
+                let credential_identity = hex::encode(basic_cred.identity());
+
+                Ok(LeafNodeInfo {
+                    index,
+                    encryption_key: hex::encode(&member.encryption_key),
+                    signature_key: hex::encode(&member.signature_key),
+                    credential_identity,
+                })
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+
+        Ok(RatchetTreeInfo {
+            tree_hash,
+            serialized_tree,
+            leaf_nodes,
         })
     }
 
@@ -596,20 +756,11 @@ where
         let commit_event =
             self.build_message_event(&mls_group.group_id().into(), serialized_commit_message)?;
 
-        // Create processed_message to track state of message
-        let processed_message: message_types::ProcessedMessage = message_types::ProcessedMessage {
-            wrapper_event_id: commit_event.id,
-            message_event_id: None,
-            processed_at: Timestamp::now(),
-            epoch: Some(mls_group.epoch().as_u64()),
-            mls_group_id: Some(mls_group.group_id().into()),
-            state: message_types::ProcessedMessageState::ProcessedCommit,
-            failure_reason: None,
-        };
-
-        self.storage()
-            .save_processed_message(processed_message)
-            .map_err(|e| Error::Message(e.to_string()))?;
+        self.track_processed_message(
+            commit_event.id,
+            &mls_group,
+            message_types::ProcessedMessageState::ProcessedCommit,
+        )?;
 
         let serialized_welcome_message = welcome_message
             .tls_serialize_detached()
@@ -644,7 +795,12 @@ where
 
     /// Remove members from a group
     ///
-    /// NOTE: This function doesn't merge the pending commit. Clients must call this function manually only after successful publish of the commit message to relays.
+    /// If any removed members are in the group's admin list, the admin list is
+    /// updated atomically within the same MLS commit.
+    ///
+    /// NOTE: This function doesn't merge the pending commit. Clients must call
+    /// this function manually only after successful publish of the commit
+    /// message to relays.
     ///
     /// # Arguments
     ///
@@ -654,7 +810,15 @@ where
     /// # Returns
     ///
     /// * `Ok(UpdateGroupResult)`
-    /// * `Err(Error)` - If there is an error removing members
+    ///
+    /// # Errors
+    ///
+    /// * `Error::GroupNotFound` - If the group does not exist
+    /// * `Error::OwnLeafNotFound` - If the caller's leaf node is missing
+    /// * `Error::Group` - If the caller is not an admin, no matching members are found,
+    ///   the caller attempts to remove themselves, or the removal would leave the group
+    ///   with no admins
+    /// * `Error::Extension` - If updating the admin list extension fails
     pub fn remove_members(
         &self,
         group_id: &GroupId,
@@ -669,6 +833,14 @@ where
         if !self.is_leaf_node_admin(group_id, own_leaf)? {
             return Err(Error::Group(
                 "Only group admins can remove members".to_string(),
+            ));
+        }
+
+        // Prevent self-removal — MLS does not allow a member to commit their own removal
+        let own_pubkey = self.get_own_pubkey(&mls_group)?;
+        if pubkeys.contains(&own_pubkey) {
+            return Err(Error::Group(
+                "Cannot remove yourself from the group".to_string(),
             ));
         }
 
@@ -690,9 +862,62 @@ where
 
         // TODO: Get a list of users to be added from any proposals and create welcome events for them
 
-        let (commit_message, welcome_option, _group_info) = mls_group
-            .remove_members(&self.provider, &signer, &leaf_indices)
+        // If any removed members are admins, prepare an updated extension to
+        // strip them from the admin list in the same MLS commit.
+        let group_data = NostrGroupDataExtension::from_group(&mls_group)?;
+        let has_admin_removals = pubkeys.iter().any(|pk| group_data.admins.contains(pk));
+
+        let updated_extensions = if has_admin_removals {
+            let mut updated_data = group_data;
+            for pk in pubkeys {
+                updated_data.remove_admin(pk);
+            }
+            // Defensive check: the self-removal guard above makes this
+            // unreachable when the caller is also an admin, but we protect
+            // against future code paths that might skip that guard.
+            if updated_data.admins.is_empty() {
+                return Err(Error::Group(
+                    "Cannot remove all admins from the group".to_string(),
+                ));
+            }
+            let extension = Self::get_unknown_extension_from_group_data(&updated_data)?;
+            let mut extensions = mls_group.extensions().clone();
+            extensions.add_or_replace(extension)?;
+            Some(extensions)
+        } else {
+            None
+        };
+
+        // Build a single commit containing removal proposals and, if needed,
+        // a GroupContextExtensions proposal to update the admin list.
+        let mut builder = mls_group
+            .commit_builder()
+            .propose_removals(leaf_indices.iter().cloned());
+
+        if let Some(ext) = updated_extensions {
+            builder = builder
+                .propose_group_context_extensions(ext)
+                .map_err(|e| Error::Group(e.to_string()))?;
+        }
+
+        // The PSK validation callback accepts all PSKs unconditionally. This is
+        // safe here because this commit only contains removal and (optionally)
+        // GroupContextExtensions proposals — no external PSK proposals are involved.
+        let bundle = builder
+            .load_psks(self.provider.storage())
+            .map_err(|e| Error::Group(e.to_string()))?
+            .build(
+                self.provider.rand(),
+                self.provider.crypto(),
+                &signer,
+                |_| true,
+            )
+            .map_err(|e| Error::Group(e.to_string()))?
+            .stage_commit(&self.provider)
             .map_err(|e| Error::Group(e.to_string()))?;
+
+        let welcome_option = bundle.to_welcome_msg();
+        let (commit_message, _, _group_info) = bundle.into_contents();
 
         let serialized_commit_message = commit_message
             .tls_serialize_detached()
@@ -701,20 +926,11 @@ where
         let commit_event =
             self.build_message_event(&mls_group.group_id().into(), serialized_commit_message)?;
 
-        // Create processed_message to track state of message
-        let processed_message: message_types::ProcessedMessage = message_types::ProcessedMessage {
-            wrapper_event_id: commit_event.id,
-            message_event_id: None,
-            processed_at: Timestamp::now(),
-            epoch: Some(mls_group.epoch().as_u64()),
-            mls_group_id: Some(mls_group.group_id().into()),
-            state: message_types::ProcessedMessageState::ProcessedCommit,
-            failure_reason: None,
-        };
-
-        self.storage()
-            .save_processed_message(processed_message)
-            .map_err(|e| Error::Message(e.to_string()))?;
+        self.track_processed_message(
+            commit_event.id,
+            &mls_group,
+            message_types::ProcessedMessageState::ProcessedCommit,
+        )?;
 
         // For now, if we find welcomes, throw an error.
         if welcome_option.is_some() {
@@ -759,7 +975,7 @@ where
 
         let extension = Self::get_unknown_extension_from_group_data(group_data)?;
         let mut extensions = mls_group.extensions().clone();
-        extensions.add_or_replace(extension);
+        extensions.add_or_replace(extension)?;
 
         let signature_keypair = self.load_mls_signer(mls_group)?;
         let (message_out, _, _) = mls_group.update_group_context_extensions(
@@ -772,20 +988,11 @@ where
             message_out.tls_serialize_detached()?,
         )?;
 
-        // Create processed_message to track state of message
-        let processed_message: message_types::ProcessedMessage = message_types::ProcessedMessage {
-            wrapper_event_id: commit_event.id,
-            message_event_id: None,
-            processed_at: Timestamp::now(),
-            epoch: Some(mls_group.epoch().as_u64()),
-            mls_group_id: Some(mls_group.group_id().into()),
-            state: message_types::ProcessedMessageState::ProcessedCommit,
-            failure_reason: None,
-        };
-
-        self.storage()
-            .save_processed_message(processed_message)
-            .map_err(|e| Error::Message(e.to_string()))?;
+        self.track_processed_message(
+            commit_event.id,
+            mls_group,
+            message_types::ProcessedMessageState::ProcessedCommit,
+        )?;
 
         Ok(UpdateGroupResult {
             evolution_event: commit_event,
@@ -877,9 +1084,8 @@ where
         }
 
         if let Some(ref admins) = update.admins {
-            // Validate admin update against current membership before applying
-            self.validate_admin_update(group_id, admins)?;
-            group_data.admins = admins.iter().copied().collect();
+            // Prune non-members and validate at least one admin remains
+            group_data.admins = self.prune_and_validate_admin_update(group_id, admins)?;
         }
 
         if let Some(nostr_group_id) = update.nostr_group_id {
@@ -998,8 +1204,9 @@ where
             .ciphersuite(self.ciphersuite)
             .use_ratchet_tree_extension(true)
             .capabilities(capabilities)
-            .with_group_context_extensions(extensions)?
+            .with_group_context_extensions(extensions)
             .sender_ratchet_configuration(sender_ratchet_config)
+            .max_past_epochs(self.config.max_past_epochs)
             .build();
 
         let mut mls_group =
@@ -1073,11 +1280,13 @@ where
             admin_pubkeys: group_data.clone().admins,
             last_message_id: None,
             last_message_at: None,
+            last_message_processed_at: None,
             epoch: mls_group.epoch().as_u64(),
             state: group_types::GroupState::Active,
             image_hash: config.image_hash,
             image_key: config.image_key.map(mdk_storage_traits::Secret::new),
             image_nonce: config.image_nonce.map(mdk_storage_traits::Secret::new),
+            self_update_state: group_types::SelfUpdateState::CompletedAt(Timestamp::now()),
         };
 
         self.storage().save_group(group.clone()).map_err(
@@ -1156,7 +1365,7 @@ where
         let leaf_node_params = LeafNodeParameters::builder()
             .with_credential_with_key(new_credential_with_key)
             .with_capabilities(own_leaf.capabilities().clone())
-            .with_extensions(own_leaf.extensions().clone())?
+            .with_extensions(own_leaf.extensions().clone())
             .build();
 
         let commit_message_bundle = mls_group.self_update_with_new_signer(
@@ -1172,20 +1381,11 @@ where
         let commit_event =
             self.build_message_event(&mls_group.group_id().into(), serialized_commit_message)?;
 
-        // Create processed_message to track state of message
-        let processed_message: message_types::ProcessedMessage = message_types::ProcessedMessage {
-            wrapper_event_id: commit_event.id,
-            message_event_id: None,
-            processed_at: Timestamp::now(),
-            epoch: Some(mls_group.epoch().as_u64()),
-            mls_group_id: Some(mls_group.group_id().into()),
-            state: message_types::ProcessedMessageState::ProcessedCommit,
-            failure_reason: None,
-        };
-
-        self.storage()
-            .save_processed_message(processed_message)
-            .map_err(|e| Error::Message(e.to_string()))?;
+        self.track_processed_message(
+            commit_event.id,
+            &mls_group,
+            message_types::ProcessedMessageState::ProcessedCommit,
+        )?;
 
         let serialized_welcome_message = commit_message_bundle
             .welcome()
@@ -1238,26 +1438,74 @@ where
         let evolution_event =
             self.build_message_event(&group.group_id().into(), serialized_message_out)?;
 
-        // Create processed_message to track state of message
-        let processed_message: message_types::ProcessedMessage = message_types::ProcessedMessage {
-            wrapper_event_id: evolution_event.id,
-            message_event_id: None,
-            processed_at: Timestamp::now(),
-            epoch: Some(group.epoch().as_u64()),
-            mls_group_id: Some(group.group_id().into()),
-            state: message_types::ProcessedMessageState::ProcessedCommit,
-            failure_reason: None,
-        };
-
-        self.storage()
-            .save_processed_message(processed_message)
-            .map_err(|e| Error::Message(e.to_string()))?;
+        self.track_processed_message(
+            evolution_event.id,
+            &group,
+            message_types::ProcessedMessageState::Processed,
+        )?;
 
         Ok(UpdateGroupResult {
             evolution_event,
             welcome_rumors: None,
             mls_group_id: group_id.clone(),
         })
+    }
+
+    /// Clear (rollback) a pending commit without merging it.
+    ///
+    /// This should be called when the Kind:445 publish fails after creating a commit
+    /// via `add_members`, `remove_members`, or `self_update`. Without clearing, the
+    /// pending commit blocks all future group operations with "Can't execute operation
+    /// because a pending commit exists".
+    ///
+    /// The group returns to its pre-commit state — no epoch advance, no member changes.
+    ///
+    /// When the pending commit is a `self_update`, the new `SignatureKeyPair` that was
+    /// stored in the provider before creating the commit is deleted from storage, since
+    /// the group reverts to the previous signer.
+    ///
+    /// # Arguments
+    /// * `group_id` - the MlsGroup GroupId value
+    pub fn clear_pending_commit(&self, group_id: &GroupId) -> Result<(), Error> {
+        let mut mls_group = self.load_mls_group(group_id)?.ok_or(Error::GroupNotFound)?;
+
+        // Detect whether the pending commit is a self-update BEFORE clearing,
+        // since clear_pending_commit() consumes the staged commit.
+        // If it is, capture the new leaf's signature public key so we can delete
+        // the orphaned keypair from storage after the rollback.
+        let self_update_new_pubkey: Option<Vec<u8>> =
+            mls_group.pending_commit().and_then(|staged_commit| {
+                let has_update_signal = staged_commit.update_path_leaf_node().is_some()
+                    || staged_commit.update_proposals().next().is_some();
+                let no_non_update_proposals = staged_commit
+                    .queued_proposals()
+                    .all(|p| matches!(p.proposal(), Proposal::Update(_)));
+                if has_update_signal && no_non_update_proposals {
+                    staged_commit
+                        .update_path_leaf_node()
+                        .map(|leaf| leaf.signature_key().as_slice().to_vec())
+                } else {
+                    None
+                }
+            });
+
+        mls_group
+            .clear_pending_commit(self.provider.storage())
+            .map_err(|e| Error::Provider(e.to_string()))?;
+
+        // If this was a self-update, delete the orphaned new signature keypair.
+        // OpenMLS reverts to the old signer after clear_pending_commit; the new
+        // keypair was stored eagerly in self_update() and is now unreachable.
+        if let Some(pubkey_bytes) = self_update_new_pubkey {
+            SignatureKeyPair::delete(
+                self.provider.storage(),
+                &pubkey_bytes,
+                self.ciphersuite.signature_algorithm(),
+            )
+            .map_err(|e| Error::Provider(e.to_string()))?;
+        }
+
+        Ok(())
     }
 
     /// Merge any pending commits.
@@ -1271,10 +1519,59 @@ where
     /// * Err(GroupError) - if something goes wrong
     pub fn merge_pending_commit(&self, group_id: &GroupId) -> Result<(), Error> {
         let mut mls_group = self.load_mls_group(group_id)?.ok_or(Error::GroupNotFound)?;
+
+        // Detect whether the pending commit is a self-update BEFORE merging,
+        // since merge_pending_commit() consumes the staged commit.
+        let is_self_update = mls_group.pending_commit().is_some_and(|staged_commit| {
+            // Must contain at least one update signal
+            let has_update_signal = staged_commit.update_path_leaf_node().is_some()
+                || staged_commit.update_proposals().next().is_some();
+            // No non-update proposals present (add/remove/psk/etc.).
+            // Note: `all()` is vacuously true on an empty iterator, which is
+            // the expected case for path-based self-updates where the update
+            // comes via `update_path_leaf_node()` rather than explicit Update
+            // proposals in `queued_proposals()`.
+            let no_non_update_proposals = staged_commit
+                .queued_proposals()
+                .all(|p| matches!(p.proposal(), Proposal::Update(_)));
+            has_update_signal && no_non_update_proposals
+        });
+
         mls_group.merge_pending_commit(&self.provider)?;
+
+        // Save MIP-03 and MIP-04 exporter secrets for the new epoch
+        self.exporter_secret(group_id)?;
+        #[cfg(feature = "mip04")]
+        {
+            let mip04_secret = self.mip04_exporter_secret(group_id)?;
+            self.storage()
+                .save_group_mip04_exporter_secret(mip04_secret)
+                .map_err(|_| Error::Group("Failed to save MIP-04 exporter secret".to_string()))?;
+        }
+
+        let min_epoch_to_keep = mls_group
+            .epoch()
+            .as_u64()
+            .saturating_sub(self.config.max_past_epochs as u64);
+        self.storage()
+            .prune_group_exporter_secrets_before_epoch(group_id, min_epoch_to_keep)
+            .map_err(|_| Error::Group("Failed to prune exporter secrets".to_string()))?;
 
         // Sync the stored group metadata with the updated MLS group state
         self.sync_group_metadata_from_mls(group_id)?;
+
+        // If this was actually a self-update commit, record the timestamp.
+        // This correctly handles:
+        // - Post-join self-updates (transitions Required → CompletedAt)
+        // - Periodic rotation self-updates (updates CompletedAt timestamp)
+        // - Non-self-update commits (leaves self_update_state untouched)
+        if is_self_update {
+            let mut group = self.get_group(group_id)?.ok_or(Error::GroupNotFound)?;
+            group.self_update_state = group_types::SelfUpdateState::CompletedAt(Timestamp::now());
+            self.storage()
+                .save_group(group)
+                .map_err(|e| Error::Group(e.to_string()))?;
+        }
 
         Ok(())
     }
@@ -1369,53 +1666,59 @@ where
         Ok(true)
     }
 
-    /// Validates admin updates against current group membership
-    ///
-    /// # Arguments
-    /// * `group_id` - The MLS group ID
-    /// * `new_admins` - The proposed new admin set
-    ///
-    /// # Returns
-    /// * `Ok(())` if validation passes
-    /// * `Err(Error)` if validation fails
-    ///
-    /// # Validation Rules
-    /// - Admin set must not be empty
-    /// - All admins must be current group members
+    /// Prunes non-member public keys from the proposed admin list and validates
+    /// that at least one valid admin remains.
     ///
     /// # Errors
-    /// Returns `Error::Group` with descriptive message if:
-    /// - Admin set is empty
-    /// - Any admin is not a current group member
-    fn validate_admin_update(
+    /// Returns `Error::UpdateGroupContextExts` if no valid admins remain after pruning.
+    fn prune_and_validate_admin_update(
         &self,
         group_id: &GroupId,
         new_admins: &[PublicKey],
-    ) -> Result<(), Error> {
-        // Admin set must not be empty
-        if new_admins.is_empty() {
+    ) -> Result<BTreeSet<PublicKey>, Error> {
+        let current_members = self.get_members(group_id)?;
+
+        let valid_admins: BTreeSet<PublicKey> = new_admins
+            .iter()
+            .filter(|admin| current_members.contains(admin))
+            .copied()
+            .collect();
+
+        if valid_admins.is_empty() {
             return Err(Error::UpdateGroupContextExts(
                 "Admin set cannot be empty".to_string(),
             ));
         }
 
-        // Get current group members
-        let current_members = self.get_members(group_id)?;
-
-        // All admins must be current group members
-        for admin in new_admins {
-            if !current_members.contains(admin) {
-                return Err(Error::UpdateGroupContextExts(format!(
-                    "Admin {} is not a current group member",
-                    admin
-                )));
-            }
-        }
-
-        Ok(())
+        Ok(valid_admins)
     }
 
-    /// Creates a NIP-44 encrypted message event Kind: 445 signing with an ephemeral keypair.
+    /// Records a processed message so the client can track message state.
+    fn track_processed_message(
+        &self,
+        event_id: EventId,
+        mls_group: &MlsGroup,
+        state: message_types::ProcessedMessageState,
+    ) -> Result<(), Error> {
+        let processed_message = message_types::ProcessedMessage {
+            wrapper_event_id: event_id,
+            message_event_id: None,
+            processed_at: Timestamp::now(),
+            epoch: Some(mls_group.epoch().as_u64()),
+            mls_group_id: Some(mls_group.group_id().into()),
+            state,
+            failure_reason: None,
+        };
+        self.storage()
+            .save_processed_message(processed_message)
+            .map_err(|e| Error::Message(e.to_string()))
+    }
+
+    /// Creates a ChaCha20-Poly1305 encrypted message event Kind: 445 signed with an ephemeral keypair.
+    ///
+    /// Per MIP-03, the encryption key is derived via `MLS-Exporter("marmot", "group-event", 32)`,
+    /// a random 12-byte nonce is generated per event. No AAD is used per MIP-03.
+    /// The content format is `base64(nonce || ciphertext)`.
     pub(crate) fn build_message_event(
         &self,
         group_id: &GroupId,
@@ -1423,30 +1726,19 @@ where
     ) -> Result<Event, Error> {
         let group = self.get_group(group_id)?.ok_or(Error::GroupNotFound)?;
 
-        // Export secret
+        // Derive the encryption key via MLS exporter (stable per epoch)
         let secret: group_types::GroupExporterSecret = self.exporter_secret(group_id)?;
+        let encrypted_content = encrypt_message_with_exporter_secret(&secret, &serialized_content)?;
 
-        // Convert that secret to nostr keys
-        let secret_key: SecretKey = SecretKey::from_slice(secret.secret.as_ref())?;
-        let export_nostr_keys: Keys = Keys::new(secret_key);
-
-        // Encrypt the message content
-        // At some group size this will become too large for NIP44 encryption or relay event size limits.
-        // We're not sure yet what size, but it's something to be aware of.
-        let encrypted_content: String = nip44::encrypt(
-            export_nostr_keys.secret_key(),
-            &export_nostr_keys.public_key,
-            &serialized_content,
-            nip44::Version::default(),
-        )?;
-
-        // Generate ephemeral key
+        // Generate ephemeral key for signing (MUST NOT be reused across events)
         let ephemeral_nostr_keys: Keys = Keys::generate();
 
         let tag: Tag = Tag::custom(TagKind::h(), [hex::encode(group.nostr_group_id)]);
+        let encoding_tag: Tag = Tag::custom(TagKind::Custom("encoding".into()), ["base64"]);
 
         let event = EventBuilder::new(Kind::MlsGroupMessage, encrypted_content)
             .tag(tag)
+            .tag(encoding_tag)
             .sign_with_keys(&ephemeral_nostr_keys)?;
 
         Ok(event)
@@ -1506,12 +1798,14 @@ where
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::iter::once;
 
     use mdk_memory_storage::MdkMemoryStorage;
     use mdk_storage_traits::groups::GroupStorage;
     use mdk_storage_traits::messages::{MessageStorage, types as message_types};
     use nostr::{Keys, PublicKey};
     use openmls::prelude::BasicCredential;
+    use openmls_basic_credential::SignatureKeyPair;
 
     use super::NostrGroupDataExtension;
     use crate::constant::NOSTR_GROUP_DATA_EXTENSION_TYPE;
@@ -2205,6 +2499,293 @@ mod tests {
     }
 
     #[test]
+    fn test_remove_members_strips_admin_status() {
+        let creator_mdk = create_test_mdk();
+        let (creator, initial_members, admins) = create_test_group_members();
+        let creator_pk = creator.public_key();
+        let member1_pk = initial_members[0].public_key();
+
+        let mut initial_key_package_events = Vec::new();
+        for member_keys in &initial_members {
+            let key_package_event = create_key_package_event(&creator_mdk, member_keys);
+            initial_key_package_events.push(key_package_event);
+        }
+
+        // admins = [creator_pk, member1_pk]
+        let create_result = creator_mdk
+            .create_group(
+                &creator_pk,
+                initial_key_package_events,
+                create_nostr_group_config_data(admins),
+            )
+            .expect("Failed to create group");
+
+        let group_id = &create_result.group.mls_group_id.clone();
+
+        creator_mdk
+            .merge_pending_commit(group_id)
+            .expect("Failed to merge pending commit");
+
+        // Verify member1 is an admin before removal
+        let group_before = creator_mdk
+            .get_group(group_id)
+            .expect("Failed to get group")
+            .expect("Group should exist");
+        assert!(
+            group_before.admin_pubkeys.contains(&member1_pk),
+            "member1 should be admin before removal"
+        );
+
+        // Remove member1 (who is an admin)
+        creator_mdk
+            .remove_members(group_id, &[member1_pk])
+            .expect("Failed to remove member");
+
+        creator_mdk
+            .merge_pending_commit(group_id)
+            .expect("Failed to merge pending commit");
+
+        // Verify member1 is no longer an admin
+        let group_after = creator_mdk
+            .get_group(group_id)
+            .expect("Failed to get group")
+            .expect("Group should exist");
+
+        let expected_admins: BTreeSet<PublicKey> = once(creator_pk).collect();
+        assert_eq!(
+            group_after.admin_pubkeys, expected_admins,
+            "Admin set should contain only the creator after removing admin member"
+        );
+
+        // Re-add member1 with a fresh key package and verify they do NOT
+        // reappear as admin (regression test for issue #514).
+        let re_add_kp = create_key_package_event(&creator_mdk, &initial_members[0]);
+        creator_mdk
+            .add_members(group_id, &[re_add_kp])
+            .expect("Failed to re-add member");
+        creator_mdk
+            .merge_pending_commit(group_id)
+            .expect("Failed to merge pending commit after re-add");
+
+        let group_readded = creator_mdk
+            .get_group(group_id)
+            .expect("Failed to get group")
+            .expect("Group should exist");
+        assert_eq!(
+            group_readded.admin_pubkeys, expected_admins,
+            "Re-added member should NOT regain admin status"
+        );
+        assert!(
+            creator_mdk
+                .get_members(group_id)
+                .expect("Failed to get members")
+                .contains(&member1_pk),
+            "member1 should be back in the group"
+        );
+    }
+
+    #[test]
+    fn test_remove_non_admin_member_preserves_admin_list() {
+        let creator_mdk = create_test_mdk();
+        let (creator, initial_members, _) = create_test_group_members();
+        let creator_pk = creator.public_key();
+        let member1_pk = initial_members[0].public_key();
+        let member2_pk = initial_members[1].public_key();
+
+        let mut initial_key_package_events = Vec::new();
+        for member_keys in &initial_members {
+            let key_package_event = create_key_package_event(&creator_mdk, member_keys);
+            initial_key_package_events.push(key_package_event);
+        }
+
+        // Only creator is admin
+        let create_result = creator_mdk
+            .create_group(
+                &creator_pk,
+                initial_key_package_events,
+                create_nostr_group_config_data(vec![creator_pk]),
+            )
+            .expect("Failed to create group");
+
+        let group_id = &create_result.group.mls_group_id.clone();
+
+        creator_mdk
+            .merge_pending_commit(group_id)
+            .expect("Failed to merge pending commit");
+
+        let admin_list_before = creator_mdk
+            .get_group(group_id)
+            .expect("Failed to get group")
+            .expect("Group should exist")
+            .admin_pubkeys
+            .clone();
+
+        // Remove member2 (non-admin)
+        creator_mdk
+            .remove_members(group_id, &[member2_pk])
+            .expect("Failed to remove member");
+
+        creator_mdk
+            .merge_pending_commit(group_id)
+            .expect("Failed to merge pending commit");
+
+        let group_after = creator_mdk
+            .get_group(group_id)
+            .expect("Failed to get group")
+            .expect("Group should exist");
+
+        assert_eq!(
+            group_after.admin_pubkeys, admin_list_before,
+            "Admin list should be unchanged when removing a non-admin member"
+        );
+
+        // Verify the member was actually removed
+        let members = creator_mdk
+            .get_members(group_id)
+            .expect("Failed to get members");
+        assert!(
+            !members.contains(&member2_pk),
+            "member2 should have been removed from the group"
+        );
+        assert!(
+            members.contains(&member1_pk),
+            "member1 should still be in the group"
+        );
+    }
+
+    #[test]
+    fn test_remove_multiple_admins_strips_all() {
+        let creator_mdk = create_test_mdk();
+        let creator = Keys::generate();
+        let creator_pk = creator.public_key();
+        let member1 = Keys::generate();
+        let member1_pk = member1.public_key();
+        let member2 = Keys::generate();
+        let member2_pk = member2.public_key();
+        let member3 = Keys::generate();
+
+        let members = vec![&member1, &member2, &member3];
+        let mut key_package_events = Vec::new();
+        for m in &members {
+            key_package_events.push(create_key_package_event(&creator_mdk, m));
+        }
+
+        // Creator, member1, and member2 are admins; member3 is not
+        let create_result = creator_mdk
+            .create_group(
+                &creator_pk,
+                key_package_events,
+                create_nostr_group_config_data(vec![creator_pk, member1_pk, member2_pk]),
+            )
+            .expect("Failed to create group");
+
+        let group_id = &create_result.group.mls_group_id.clone();
+        creator_mdk
+            .merge_pending_commit(group_id)
+            .expect("Failed to merge pending commit");
+
+        // Remove both admin members in a single call
+        creator_mdk
+            .remove_members(group_id, &[member1_pk, member2_pk])
+            .expect("Failed to remove members");
+
+        creator_mdk
+            .merge_pending_commit(group_id)
+            .expect("Failed to merge pending commit");
+
+        let group_after = creator_mdk
+            .get_group(group_id)
+            .expect("Failed to get group")
+            .expect("Group should exist");
+
+        let expected_admins: BTreeSet<PublicKey> = once(creator_pk).collect();
+        assert_eq!(
+            group_after.admin_pubkeys, expected_admins,
+            "Only creator should remain as admin after bulk admin removal"
+        );
+    }
+
+    #[test]
+    fn test_remove_members_rejects_self_removal() {
+        let creator_mdk = create_test_mdk();
+        let (creator, initial_members, admins) = create_test_group_members();
+        let creator_pk = creator.public_key();
+
+        let mut key_package_events = Vec::new();
+        for m in &initial_members {
+            key_package_events.push(create_key_package_event(&creator_mdk, m));
+        }
+
+        let create_result = creator_mdk
+            .create_group(
+                &creator_pk,
+                key_package_events,
+                create_nostr_group_config_data(admins),
+            )
+            .expect("Failed to create group");
+
+        let group_id = &create_result.group.mls_group_id.clone();
+        creator_mdk
+            .merge_pending_commit(group_id)
+            .expect("Failed to merge pending commit");
+
+        let result = creator_mdk.remove_members(group_id, &[creator_pk]);
+        assert!(result.is_err(), "Self-removal should be rejected");
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Cannot remove yourself"),
+            "Error should mention self-removal"
+        );
+    }
+
+    #[test]
+    fn test_leave_group_records_processed_state() {
+        let creator_mdk = create_test_mdk();
+        let (creator, initial_members, admins) = create_test_group_members();
+        let creator_pk = creator.public_key();
+
+        let mut key_package_events = Vec::new();
+        for m in &initial_members {
+            key_package_events.push(create_key_package_event(&creator_mdk, m));
+        }
+
+        let create_result = creator_mdk
+            .create_group(
+                &creator_pk,
+                key_package_events,
+                create_nostr_group_config_data(admins),
+            )
+            .expect("Failed to create group");
+
+        let group_id = &create_result.group.mls_group_id.clone();
+        creator_mdk
+            .merge_pending_commit(group_id)
+            .expect("Failed to merge pending commit");
+
+        let leave_result = creator_mdk
+            .leave_group(group_id)
+            .expect("Failed to leave group");
+
+        // Verify the processed message was recorded with Processed state
+        // (not ProcessedCommit), since leave_group creates a proposal.
+        let processed = creator_mdk
+            .storage()
+            .find_processed_message_by_event_id(&leave_result.evolution_event.id)
+            .expect("Failed to query processed message")
+            .expect("ProcessedMessage should exist");
+
+        assert_eq!(
+            processed.state,
+            message_types::ProcessedMessageState::Processed,
+            "leave_group should record Processed state, not ProcessedCommit"
+        );
+        assert_eq!(processed.wrapper_event_id, leave_result.evolution_event.id);
+        assert!(processed.failure_reason.is_none());
+    }
+
+    #[test]
     fn test_self_update_success() {
         let creator_mdk = create_test_mdk();
         let (creator, initial_members, admins) = create_test_group_members();
@@ -2677,7 +3258,7 @@ mod tests {
             super::MDK::<MdkMemoryStorage>::get_unknown_extension_from_group_data(&new_group_data)
                 .unwrap();
         let mut extensions = mls_group.extensions().clone();
-        extensions.add_or_replace(extension);
+        extensions.add_or_replace(extension).unwrap();
 
         let signature_keypair = creator_mdk.load_mls_signer(&mls_group).unwrap();
         let (_message_out, _, _) = mls_group
@@ -2953,7 +3534,7 @@ mod tests {
 
         // Replace the group-data extension with the corrupted one
         let mut extensions = mls_group.extensions().clone();
-        extensions.add_or_replace(corrupted_extension);
+        extensions.add_or_replace(corrupted_extension).unwrap();
 
         let signature_keypair = creator_mdk.load_mls_signer(&mls_group).unwrap();
         let (_message_out, _, _) = mls_group
@@ -3573,9 +4154,50 @@ mod tests {
         );
     }
 
-    /// Test that admin update validation rejects non-member admins
+    /// Test that admin update errors when all proposed admins are non-members (pruned to empty)
     #[test]
-    fn test_admin_update_rejects_non_member_admins() {
+    fn test_admin_update_rejects_all_non_member_admins() {
+        let creator_mdk = create_test_mdk();
+        let (creator, initial_members, admins) = create_test_group_members();
+        let creator_pk = creator.public_key();
+
+        let mut initial_key_package_events = Vec::new();
+        for member_keys in &initial_members {
+            let key_package_event = create_key_package_event(&creator_mdk, member_keys);
+            initial_key_package_events.push(key_package_event);
+        }
+
+        let create_result = creator_mdk
+            .create_group(
+                &creator_pk,
+                initial_key_package_events,
+                create_nostr_group_config_data(admins),
+            )
+            .expect("Failed to create group");
+
+        let group_id = &create_result.group.mls_group_id.clone();
+
+        creator_mdk
+            .merge_pending_commit(group_id)
+            .expect("Failed to merge pending commit");
+
+        // All proposed admins are non-members - pruning leaves empty set
+        let non_member1 = Keys::generate().public_key();
+        let non_member2 = Keys::generate().public_key();
+        let all_non_members = vec![non_member1, non_member2];
+        let update = NostrGroupDataUpdate::new().admins(all_non_members);
+        let result = creator_mdk.update_group_data(group_id, update);
+
+        assert!(
+            matches!(result, Err(crate::Error::UpdateGroupContextExts(ref msg)) if msg.contains("Admin set cannot be empty")),
+            "Should error when all admins are pruned, got: {:?}",
+            result
+        );
+    }
+
+    /// Test that admin update prunes non-member admins
+    #[test]
+    fn test_admin_update_prunes_non_member_admins() {
         let creator_mdk = create_test_mdk();
         let (creator, initial_members, admins) = create_test_group_members();
         let creator_pk = creator.public_key();
@@ -3603,16 +4225,35 @@ mod tests {
             .merge_pending_commit(group_id)
             .expect("Failed to merge pending commit");
 
-        // Attempt to update with a non-member admin - should fail
+        // Attempt to update with a non-member admin - non-member should be pruned
         let non_member = Keys::generate().public_key();
-        let bad_admins = vec![creator_pk, non_member];
-        let update = NostrGroupDataUpdate::new().admins(bad_admins);
+        let admins_with_non_member = vec![creator_pk, non_member];
+        let update = NostrGroupDataUpdate::new().admins(admins_with_non_member);
         let result = creator_mdk.update_group_data(group_id, update);
 
         assert!(
-            matches!(result, Err(crate::Error::UpdateGroupContextExts(ref msg)) if msg.contains("is not a current group member")),
-            "Should error when admin is not a group member, got: {:?}",
+            result.is_ok(),
+            "Should succeed after pruning non-member admin, got: {:?}",
             result
+        );
+
+        // Merge and verify only the valid admin remains
+        creator_mdk
+            .merge_pending_commit(group_id)
+            .expect("Failed to merge pending commit");
+
+        let synced_group = creator_mdk
+            .get_group(group_id)
+            .expect("Failed to get group")
+            .expect("Group should exist");
+
+        assert!(
+            synced_group.admin_pubkeys.contains(&creator_pk),
+            "Creator should remain as admin"
+        );
+        assert!(
+            !synced_group.admin_pubkeys.contains(&non_member),
+            "Non-member should have been pruned from admin set"
         );
     }
 
@@ -3684,16 +4325,15 @@ mod tests {
         );
     }
 
-    /// Test that admin update only accepts existing members, not previously removed members
+    /// Test that admin update prunes previously removed members
     #[test]
-    fn test_admin_update_rejects_previously_removed_member() {
+    fn test_admin_update_prunes_previously_removed_member() {
         let creator_mdk = create_test_mdk();
         let (creator, initial_members, admins) = create_test_group_members();
         let creator_pk = creator.public_key();
 
         // Capture member public keys before they're used
         let member1_pk = initial_members[0].public_key();
-        let member2_pk = initial_members[1].public_key();
 
         // Create key package events for initial members
         let mut initial_key_package_events = Vec::new();
@@ -3727,26 +4367,34 @@ mod tests {
             .merge_pending_commit(group_id)
             .expect("Failed to merge pending commit");
 
-        // Attempt to make the removed member an admin - should fail
-        let bad_admins = vec![creator_pk, member1_pk];
-        let update = NostrGroupDataUpdate::new().admins(bad_admins);
-        let result = creator_mdk.update_group_data(group_id, update);
-
-        assert!(
-            matches!(result, Err(crate::Error::UpdateGroupContextExts(ref msg)) if msg.contains("is not a current group member")),
-            "Should error when trying to make removed member an admin, got: {:?}",
-            result
-        );
-
-        // But updating with remaining members should work
-        let good_admins = vec![creator_pk, member2_pk];
-        let update = NostrGroupDataUpdate::new().admins(good_admins);
+        // Attempt to make the removed member an admin - removed member should be pruned
+        let admins_with_removed = vec![creator_pk, member1_pk];
+        let update = NostrGroupDataUpdate::new().admins(admins_with_removed);
         let result = creator_mdk.update_group_data(group_id, update);
 
         assert!(
             result.is_ok(),
-            "Should succeed when all admins are current members, got: {:?}",
+            "Should succeed after pruning removed member, got: {:?}",
             result
+        );
+
+        // Merge and verify the removed member was pruned
+        creator_mdk
+            .merge_pending_commit(group_id)
+            .expect("Failed to merge pending commit");
+
+        let synced_group = creator_mdk
+            .get_group(group_id)
+            .expect("Failed to get group")
+            .expect("Group should exist");
+
+        assert!(
+            synced_group.admin_pubkeys.contains(&creator_pk),
+            "Creator should remain as admin"
+        );
+        assert!(
+            !synced_group.admin_pubkeys.contains(&member1_pk),
+            "Removed member should have been pruned from admin set"
         );
     }
 
@@ -4721,5 +5369,430 @@ mod tests {
 
         let result = alice_mdk.pending_member_changes(&fake_group_id);
         assert!(result.is_err(), "Should error for non-existent group");
+    }
+
+    /// Tests that `clear_pending_commit` rolls back a pending add-member commit,
+    /// allowing subsequent group operations to succeed.
+    #[test]
+    fn test_clear_pending_commit_after_failed_add() {
+        let mdk = create_test_mdk();
+        let (creator, members, admins) = create_test_group_members();
+        let group_id = create_test_group(&mdk, &creator, &members, &admins);
+
+        let initial_members = mdk.get_members(&group_id).expect("get members");
+        let initial_count = initial_members.len();
+
+        // Add a new member — creates a pending commit but do NOT merge
+        // (simulates a failed relay publish)
+        let new_member = Keys::generate();
+        let kp_event = create_key_package_event(&mdk, &new_member);
+        let _add_result = mdk
+            .add_members(&group_id, &[kp_event])
+            .expect("add_members should succeed");
+
+        // A second add_members should fail because there is already a pending commit
+        let another_member = Keys::generate();
+        let kp_event2 = create_key_package_event(&mdk, &another_member);
+        let err = mdk.add_members(&group_id, &[kp_event2]);
+        assert!(err.is_err(), "Should fail due to existing pending commit");
+
+        // Clear the pending commit (simulates cleanup after failed publish)
+        mdk.clear_pending_commit(&group_id)
+            .expect("clear_pending_commit should succeed");
+
+        // Verify the member was NOT added
+        let after_clear = mdk.get_members(&group_id).expect("get members");
+        assert_eq!(
+            after_clear.len(),
+            initial_count,
+            "Member count should be unchanged after clearing pending commit"
+        );
+        assert!(
+            !after_clear.contains(&new_member.public_key()),
+            "New member should not be in group after clearing pending commit"
+        );
+
+        // Verify the group is usable again — a new operation should succeed
+        let kp_event3 = create_key_package_event(&mdk, &another_member);
+        mdk.add_members(&group_id, &[kp_event3])
+            .expect("add_members should succeed after clearing pending commit");
+        mdk.merge_pending_commit(&group_id)
+            .expect("merge should succeed after clearing pending commit");
+
+        let final_members = mdk.get_members(&group_id).expect("get members");
+        assert_eq!(
+            final_members.len(),
+            initial_count + 1,
+            "Member should be added after clearing stale commit and retrying"
+        );
+        assert!(
+            final_members.contains(&another_member.public_key()),
+            "New member should be in group after successful retry"
+        );
+    }
+
+    /// Tests that `clear_pending_commit` rolls back a pending remove-member commit.
+    #[test]
+    fn test_clear_pending_commit_after_failed_remove() {
+        let mdk = create_test_mdk();
+        let (creator, members, admins) = create_test_group_members();
+        let group_id = create_test_group(&mdk, &creator, &members, &admins);
+
+        let initial_members = mdk.get_members(&group_id).expect("get members");
+        let initial_count = initial_members.len();
+        let member_to_remove = members[0].public_key();
+
+        // Remove a member — creates a pending commit but do NOT merge
+        let _remove_result = mdk
+            .remove_members(&group_id, &[member_to_remove])
+            .expect("remove_members should succeed");
+
+        // Clear the pending commit
+        mdk.clear_pending_commit(&group_id)
+            .expect("clear_pending_commit should succeed");
+
+        // Verify the member was NOT removed
+        let after_clear = mdk.get_members(&group_id).expect("get members");
+        assert_eq!(
+            after_clear.len(),
+            initial_count,
+            "Member count should be unchanged after clearing pending remove commit"
+        );
+        assert!(
+            after_clear.contains(&member_to_remove),
+            "Member should still be in group after clearing pending remove commit"
+        );
+
+        // Verify the group is usable again — retry the removal
+        mdk.remove_members(&group_id, &[member_to_remove])
+            .expect("remove_members should succeed after clearing pending commit");
+        mdk.merge_pending_commit(&group_id)
+            .expect("merge should succeed after clearing pending commit");
+
+        let final_members = mdk.get_members(&group_id).expect("get members");
+        assert_eq!(
+            final_members.len(),
+            initial_count - 1,
+            "Member should be removed after clearing stale commit and retrying"
+        );
+        assert!(
+            !final_members.contains(&member_to_remove),
+            "Removed member should not be in group after successful retry"
+        );
+    }
+
+    /// Tests that `clear_pending_commit` is a no-op when there is no pending commit.
+    #[test]
+    fn test_clear_pending_commit_no_pending() {
+        let mdk = create_test_mdk();
+        let (creator, members, admins) = create_test_group_members();
+        let group_id = create_test_group(&mdk, &creator, &members, &admins);
+
+        // Clearing when there's nothing pending should succeed (no-op)
+        mdk.clear_pending_commit(&group_id)
+            .expect("clear_pending_commit should succeed even with no pending commit");
+
+        // Group should still be functional
+        let member_count = mdk.get_members(&group_id).expect("get members").len();
+        assert!(member_count > 0, "Group should still have members");
+    }
+
+    /// Tests that `clear_pending_commit` returns an error for a non-existent group.
+    #[test]
+    fn test_clear_pending_commit_group_not_found() {
+        let mdk = create_test_mdk();
+        let fake_group_id = mdk_storage_traits::GroupId::from_slice(&[0u8; 16]);
+
+        let result = mdk.clear_pending_commit(&fake_group_id);
+        assert!(
+            result.is_err(),
+            "clear_pending_commit should error for non-existent group"
+        );
+    }
+
+    /// Tests that `self_update` followed by `merge_pending_commit` rotates the signing key and
+    /// leaves no orphaned keypairs in storage — the new key becomes the active signer.
+    #[test]
+    fn test_self_update_then_merge_no_orphan() {
+        let mdk = create_test_mdk();
+        let (creator, members, admins) = create_test_group_members();
+        let group_id = create_test_group(&mdk, &creator, &members, &admins);
+
+        // Capture the pre-update signature key so we can verify rotation.
+        let pre_update_mls_group = mdk
+            .load_mls_group(&group_id)
+            .expect("load mls group")
+            .expect("group exists");
+        let pre_update_pubkey = pre_update_mls_group
+            .own_leaf()
+            .expect("own leaf")
+            .signature_key()
+            .as_slice()
+            .to_vec();
+
+        // Perform self_update — stores the new keypair and creates a pending commit.
+        mdk.self_update(&group_id).expect("self_update");
+
+        // Capture the pending new public key before merging.
+        let pending_mls_group = mdk
+            .load_mls_group(&group_id)
+            .expect("load mls group")
+            .expect("group exists");
+        let new_pubkey = pending_mls_group
+            .pending_commit()
+            .expect("pending commit exists")
+            .update_path_leaf_node()
+            .expect("update path leaf node in self_update commit")
+            .signature_key()
+            .as_slice()
+            .to_vec();
+
+        // The new key should differ from the pre-update key.
+        assert_ne!(
+            pre_update_pubkey, new_pubkey,
+            "self_update should rotate the signature key"
+        );
+
+        // The new keypair must be in storage at this point (used by OpenMLS for the commit).
+        let stored_before_merge = SignatureKeyPair::read(
+            &mdk.provider.storage,
+            &new_pubkey,
+            mdk.ciphersuite.signature_algorithm(),
+        );
+        assert!(
+            stored_before_merge.is_some(),
+            "new keypair must be in storage before merge_pending_commit"
+        );
+
+        // Merge — advances the epoch and makes the new key the active signer.
+        mdk.merge_pending_commit(&group_id)
+            .expect("merge_pending_commit");
+
+        // After a successful merge the new key must still be in storage (it is now the active signer).
+        let stored_after_merge = SignatureKeyPair::read(
+            &mdk.provider.storage,
+            &new_pubkey,
+            mdk.ciphersuite.signature_algorithm(),
+        );
+        assert!(
+            stored_after_merge.is_some(),
+            "new keypair must remain in storage after successful merge (it is the active signer)"
+        );
+
+        // The group should still be functional.
+        let members_after = mdk.get_members(&group_id).expect("get members");
+        assert!(!members_after.is_empty(), "group should still have members");
+    }
+
+    /// Tests that `self_update` followed by `clear_pending_commit` rolls back the commit and
+    /// removes the orphaned new signature keypair from storage.
+    #[test]
+    fn test_self_update_then_clear_removes_orphaned_keypair() {
+        let mdk = create_test_mdk();
+        let (creator, members, admins) = create_test_group_members();
+        let group_id = create_test_group(&mdk, &creator, &members, &admins);
+
+        // Perform self_update — stores the new keypair and creates a pending commit.
+        mdk.self_update(&group_id).expect("self_update");
+
+        // Capture the new public key that was stored during self_update.
+        let pending_mls_group = mdk
+            .load_mls_group(&group_id)
+            .expect("load mls group")
+            .expect("group exists");
+        let new_pubkey = pending_mls_group
+            .pending_commit()
+            .expect("pending commit exists")
+            .update_path_leaf_node()
+            .expect("update path leaf node in self_update commit")
+            .signature_key()
+            .as_slice()
+            .to_vec();
+
+        // The new keypair must be present in storage before we clear.
+        let stored_before_clear = SignatureKeyPair::read(
+            &mdk.provider.storage,
+            &new_pubkey,
+            mdk.ciphersuite.signature_algorithm(),
+        );
+        assert!(
+            stored_before_clear.is_some(),
+            "new keypair must be in storage before clear_pending_commit"
+        );
+
+        // Clear — rolls back the MLS state and must delete the orphaned keypair.
+        mdk.clear_pending_commit(&group_id)
+            .expect("clear_pending_commit");
+
+        // The orphaned new keypair must now be gone from storage.
+        let stored_after_clear = SignatureKeyPair::read(
+            &mdk.provider.storage,
+            &new_pubkey,
+            mdk.ciphersuite.signature_algorithm(),
+        );
+        assert!(
+            stored_after_clear.is_none(),
+            "orphaned new keypair must be deleted from storage after clear_pending_commit"
+        );
+
+        // The group must be functional and able to perform a new self_update.
+        mdk.self_update(&group_id)
+            .expect("self_update should succeed after clearing pending commit");
+        mdk.merge_pending_commit(&group_id)
+            .expect("merge should succeed after retry");
+
+        // After the successful retry the active signer is the newly rotated key.
+        let final_mls_group = mdk
+            .load_mls_group(&group_id)
+            .expect("load mls group")
+            .expect("group exists");
+        let final_pubkey = final_mls_group
+            .own_leaf()
+            .expect("own leaf")
+            .signature_key()
+            .as_slice()
+            .to_vec();
+
+        let active_signer = SignatureKeyPair::read(
+            &mdk.provider.storage,
+            &final_pubkey,
+            mdk.ciphersuite.signature_algorithm(),
+        );
+        assert!(
+            active_signer.is_some(),
+            "active signer keypair must be present in storage after successful retry"
+        );
+    }
+
+    #[test]
+    fn test_get_ratchet_tree_info() {
+        let creator_mdk = create_test_mdk();
+        let (creator, initial_members, admins) = create_test_group_members();
+        let creator_pk = creator.public_key();
+
+        let mut initial_key_package_events = Vec::new();
+        for member_keys in &initial_members {
+            let key_package_event = create_key_package_event(&creator_mdk, member_keys);
+            initial_key_package_events.push(key_package_event);
+        }
+
+        let create_result = creator_mdk
+            .create_group(
+                &creator_pk,
+                initial_key_package_events,
+                create_nostr_group_config_data(admins),
+            )
+            .expect("Failed to create group");
+
+        let group_id = &create_result.group.mls_group_id;
+
+        creator_mdk
+            .merge_pending_commit(group_id)
+            .expect("Failed to merge pending commit");
+
+        let debug_info = creator_mdk
+            .get_ratchet_tree_info(group_id)
+            .expect("Failed to get ratchet tree info");
+
+        // tree_hash should be a 64-character hex string (SHA-256 = 32 bytes)
+        assert_eq!(debug_info.tree_hash.len(), 64);
+        assert!(
+            debug_info.tree_hash.chars().all(|c| c.is_ascii_hexdigit()),
+            "tree_hash should be valid hex"
+        );
+
+        // serialized_tree should be non-empty hex
+        assert!(
+            !debug_info.serialized_tree.is_empty(),
+            "serialized tree should not be empty"
+        );
+        assert!(
+            debug_info
+                .serialized_tree
+                .chars()
+                .all(|c| c.is_ascii_hexdigit()),
+            "serialized tree should be valid hex"
+        );
+
+        // Should have 3 leaf nodes: creator + 2 members
+        assert_eq!(
+            debug_info.leaf_nodes.len(),
+            3,
+            "should have 3 leaf nodes (creator + 2 members)"
+        );
+
+        // Each leaf node should have valid data
+        for leaf in &debug_info.leaf_nodes {
+            assert!(
+                !leaf.encryption_key.is_empty(),
+                "encryption key should not be empty"
+            );
+            assert!(
+                !leaf.signature_key.is_empty(),
+                "signature key should not be empty"
+            );
+            // Credential identity should be a 32-byte hex pubkey (64 hex chars)
+            assert_eq!(
+                leaf.credential_identity.len(),
+                64,
+                "credential identity should be a 32-byte hex pubkey"
+            );
+        }
+
+        // Verify the creator's pubkey is among the leaf nodes
+        let creator_hex = creator_pk.to_hex();
+        assert!(
+            debug_info
+                .leaf_nodes
+                .iter()
+                .any(|l| l.credential_identity == creator_hex),
+            "creator pubkey should be in leaf nodes"
+        );
+    }
+
+    #[test]
+    fn test_get_ratchet_tree_info_nonexistent_group() {
+        let mdk = create_test_mdk();
+        let fake_group_id = mdk_storage_traits::GroupId::from_slice(&[0u8; 32]);
+
+        let result = mdk.get_ratchet_tree_info(&fake_group_id);
+        assert!(result.is_err(), "should error for nonexistent group");
+    }
+
+    #[test]
+    fn test_get_ratchet_tree_info_deterministic() {
+        let creator_mdk = create_test_mdk();
+        let (creator, initial_members, admins) = create_test_group_members();
+        let creator_pk = creator.public_key();
+
+        let mut initial_key_package_events = Vec::new();
+        for member_keys in &initial_members {
+            let key_package_event = create_key_package_event(&creator_mdk, member_keys);
+            initial_key_package_events.push(key_package_event);
+        }
+
+        let create_result = creator_mdk
+            .create_group(
+                &creator_pk,
+                initial_key_package_events,
+                create_nostr_group_config_data(admins),
+            )
+            .expect("Failed to create group");
+
+        let group_id = &create_result.group.mls_group_id;
+
+        creator_mdk
+            .merge_pending_commit(group_id)
+            .expect("Failed to merge pending commit");
+
+        // Call twice — should return identical results
+        let info1 = creator_mdk
+            .get_ratchet_tree_info(group_id)
+            .expect("first call");
+        let info2 = creator_mdk
+            .get_ratchet_tree_info(group_id)
+            .expect("second call");
+
+        assert_eq!(info1, info2, "ratchet tree info should be deterministic");
     }
 }

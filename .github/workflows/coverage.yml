@@ -12,11 +12,39 @@ on:
         required: false
         default: "0"
 
+concurrency:
+  group: coverage-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # ── Change Detection ────────────────────────────────────────────────
+  changes:
+    name: Detect Changed Paths
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      rust: ${{ steps.filter.outputs.rust }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Detect changes
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            rust:
+              - '**/*.rs'
+              - '**/Cargo.toml'
+              - 'Cargo.lock'
+
   coverage:
+    needs: changes
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     name: Test Coverage
     permissions:

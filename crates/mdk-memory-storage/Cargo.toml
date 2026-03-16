@@ -1,8 +1,8 @@
 [package]
 name = "mdk-memory-storage"
-version = "0.5.1"
+version = "0.7.1"
 edition = "2024"
-description = "In-memory database for nostr-mls that implements the MdkStorageProvider Trait"
+description = "In-memory database for MDK that implements the MdkStorageProvider trait"
 authors = ["Jeff Gardner <j@jeffg.me>", "Yuki Kishimoto <yukikishimoto@protonmail.com>", "MDK Developers"]
 homepage.workspace = true
 repository.workspace = true
@@ -10,6 +10,7 @@ license.workspace = true
 readme = "README.md"
 rust-version = "1.90.0"
 keywords = ["nostr", "mls", "openmls", "memory"]
+categories = ["database", "caching"]
 
 [dependencies]
 lru.workspace = true

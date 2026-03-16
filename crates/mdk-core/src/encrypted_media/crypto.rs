@@ -88,9 +88,10 @@ fn build_aad(
     aad
 }
 
-/// Derive encryption key from MLS group secret according to Marmot protocol specification
+/// Derive encryption key from the current epoch's MLS group secret for MIP-04.
 ///
-/// As specified in Marmot protocol 04.md, the encryption key is derived using:
+/// Uses `MLS-Exporter("marmot", "encrypted-media", 32)` per MIP-04 and then derives
+/// a per-file key via HKDF:
 /// file_key = HKDF-Expand(exporter_secret, SCHEME_LABEL || 0x00 || file_hash_bytes || 0x00 || mime_type_bytes || 0x00 || filename_bytes || 0x00 || "key", 32)
 pub fn derive_encryption_key<Storage>(
     mdk: &MDK<Storage>,
@@ -103,21 +104,39 @@ pub fn derive_encryption_key<Storage>(
 where
     Storage: MdkStorageProvider,
 {
-    // Get the group's exporter secret
     let exporter_secret = mdk
-        .exporter_secret(group_id)
+        .mip04_exporter_secret(group_id)
         .map_err(|_| EncryptedMediaError::GroupNotFound)?;
 
-    // Get scheme label from version
-    let scheme_label = get_scheme_label(scheme_version)?;
+    derive_encryption_key_with_secret(
+        &exporter_secret.secret,
+        scheme_version,
+        original_hash,
+        mime_type,
+        filename,
+    )
+}
 
-    // Create context as specified in Marmot protocol 04.md:
-    // SCHEME_LABEL || 0x00 || file_hash_bytes || 0x00 || mime_type_bytes || 0x00 || filename_bytes || 0x00 || "key"
+/// Derive encryption key from an explicit exporter secret
+///
+/// This variant accepts a raw exporter secret instead of looking it up.
+/// Used by the epoch fallback logic in media decryption, which needs to try
+/// multiple historical epoch secrets when the current epoch's key doesn't work.
+pub(crate) fn derive_encryption_key_with_secret(
+    exporter_secret: &Secret<[u8; 32]>,
+    scheme_version: &str,
+    original_hash: &[u8; 32],
+    mime_type: &str,
+    filename: &str,
+) -> Result<Secret<[u8; 32]>, EncryptedMediaError> {
+    let scheme_label = get_scheme_label(scheme_version)?;
     let context = build_hkdf_context(scheme_label, original_hash, mime_type, filename, b"key");
 
-    // Use HKDF to derive encryption key with context
-    let hk = Hkdf::<Sha256>::new(None, exporter_secret.secret.as_ref());
-
+    let hk = Hkdf::<Sha256>::from_prk(exporter_secret.as_ref()).map_err(|e| {
+        EncryptedMediaError::EncryptionFailed {
+            reason: format!("Invalid HKDF PRK: {}", e),
+        }
+    })?;
     let mut key = [0u8; 32];
     hk.expand(&context, &mut key)
         .map_err(|e| EncryptedMediaError::EncryptionFailed {
@@ -307,6 +326,42 @@ mod tests {
 
         // Verify decrypted data matches original
         assert_eq!(decrypted_data.as_slice(), original_data);
+    }
+
+    #[test]
+    fn test_mip04_file_key_uses_hkdf_expand_with_exporter_secret_as_prk() {
+        let exporter_secret = Secret::new([0x11u8; 32]);
+        let file_hash = [0x22u8; 32];
+        let mime_type = "image/jpeg";
+        let filename = "photo.jpg";
+
+        let derived = derive_encryption_key_with_secret(
+            &exporter_secret,
+            DEFAULT_SCHEME_VERSION,
+            &file_hash,
+            mime_type,
+            filename,
+        )
+        .expect("MIP-04 key derivation should succeed");
+
+        let scheme_label = get_scheme_label(DEFAULT_SCHEME_VERSION).unwrap();
+        let context = build_hkdf_context(scheme_label, &file_hash, mime_type, filename, b"key");
+
+        let hk_expand_only = Hkdf::<Sha256>::from_prk(exporter_secret.as_ref())
+            .expect("32-byte exporter secret must be a valid HKDF PRK");
+        let mut expected = [0u8; 32];
+        hk_expand_only
+            .expand(&context, &mut expected)
+            .expect("HKDF expand-only should succeed");
+
+        let hk_extract_then_expand = Hkdf::<Sha256>::new(None, exporter_secret.as_ref());
+        let mut old_style = [0u8; 32];
+        hk_extract_then_expand
+            .expand(&context, &mut old_style)
+            .expect("HKDF extract+expand should succeed");
+
+        assert_eq!(*derived, expected);
+        assert_ne!(expected, old_style);
     }
 
     #[test]

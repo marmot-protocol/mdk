@@ -17,7 +17,7 @@
 // === Core MDK Types ===
 /// MDK error type
 pub use crate::Error;
-/// The main MDK struct for Nostr MLS operations
+/// The main MDK struct for Marmot protocol operations
 pub use crate::MDK;
 /// MDK provider for OpenMLS integration
 pub use crate::MdkProvider;
@@ -29,8 +29,8 @@ pub use mdk_storage_traits::GroupId;
 pub use crate::extension::NostrGroupDataExtension;
 /// Group operation results
 pub use crate::groups::{
-    GroupResult, NostrGroupConfigData, NostrGroupDataUpdate, PendingMemberChanges,
-    UpdateGroupResult,
+    GroupResult, LeafNodeInfo, NostrGroupConfigData, NostrGroupDataUpdate, PendingMemberChanges,
+    RatchetTreeInfo, UpdateGroupResult,
 };
 /// Message processing result variants
 pub use crate::messages::MessageProcessingResult;

@@ -1,9 +1,7 @@
-# Nostr Messaging Layer Security (MLS)
+# mdk-core
 
-## Description
-
-A simplified interface to build secure messaging apps on nostr with MLS ([RFC 9420](https://datatracker.ietf.org/doc/html/rfc9420)),
-according to [NIP-EE](https://github.com/nostr-protocol/nips/pull/1427).
+A simplified interface to build secure messaging apps on Nostr with MLS ([RFC 9420](https://www.rfc-editor.org/rfc/rfc9420.html)),
+implementing the [Marmot Protocol](https://github.com/marmot-protocol/marmot).
 
 ## Changelog
 
@@ -11,12 +9,8 @@ All notable changes to this library are documented in the [CHANGELOG.md](CHANGEL
 
 ## State
 
-**This library is in an ALPHA state**, things that are implemented generally work but the API will change in breaking ways.
-
-## Donations
-
-`rust-nostr` is free and open-source. This means we do not earn any revenue by selling it. Instead, we rely on your financial support. If you actively use any of the `rust-nostr` libs/software/services, then please [donate](https://rust-nostr.org/donate).
+**This library is in an ALPHA state.** Things that are implemented generally work, but the API may change in breaking ways.
 
 ## License
 
-This project is distributed under the MIT software license - see the [LICENSE](../../LICENSE) file for details
+This project is distributed under the MIT software license - see the [LICENSE](https://github.com/marmot-protocol/mdk/blob/master/LICENSE) file for details, or visit <https://opensource.org/licenses/MIT>.

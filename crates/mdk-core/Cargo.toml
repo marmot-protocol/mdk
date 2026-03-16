@@ -1,6 +1,6 @@
 [package]
 name = "mdk-core"
-version = "0.5.3"
+version = "0.7.1"
 edition = "2024"
 description = "A simplified interface to build secure messaging apps on nostr with MLS."
 authors = ["Jeff Gardner <j@jeffg.me>", "Yuki Kishimoto <yukikishimoto@protonmail.com>", "MDK Developers"]
@@ -10,6 +10,7 @@ license.workspace = true
 readme = "README.md"
 rust-version = "1.90.0"
 keywords = ["nostr", "mls", "openmls"]
+categories = ["cryptography", "network-programming"]
 
 [features]
 default = []
@@ -19,7 +20,7 @@ debug-examples = []
 
 [dependencies]
 hex = { workspace = true, features = ["std"] }
-nostr = { workspace = true, features = ["std", "nip44"] }
+nostr = { workspace = true, features = ["std"] }
 mdk-storage-traits.workspace = true
 openmls.workspace = true
 openmls_basic_credential.workspace = true
@@ -30,9 +31,10 @@ tls_codec.workspace = true
 tracing = { workspace = true, features = ["std"] }
 thiserror.workspace = true
 
-# Crypto dependencies for MIP-01 (group image encryption) - mandatory
+# Crypto dependencies for MIP-01 (group image encryption) and MIP-03 message encryption - mandatory
 aes.workspace = true
 aes-gcm.workspace = true
+base64.workspace = true
 chacha20poly1305.workspace = true
 hkdf.workspace = true
 sha2.workspace = true

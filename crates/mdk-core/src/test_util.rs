@@ -1,4 +1,4 @@
-//! Test utilities for the nostr-mls crate
+//! Test utilities for the mdk-core crate
 //!
 //! This module provides shared test utilities used across multiple test modules
 //! to avoid code duplication and ensure consistency in test setup.
@@ -35,12 +35,12 @@ where
     Storage: MdkStorageProvider,
 {
     let relays = vec![RelayUrl::parse("wss://test.relay").unwrap()];
-    let (key_package_hex, tags) = mdk
+    let (key_package_hex, tags, _hash_ref) = mdk
         .create_key_package_for_event(&member_keys.public_key(), relays)
         .expect("Failed to create key package");
 
     EventBuilder::new(Kind::MlsKeyPackage, key_package_hex)
-        .tags(tags.to_vec())
+        .tags(tags)
         .sign_with_keys(member_keys)
         .expect("Failed to sign event")
 }
@@ -58,12 +58,12 @@ where
     Storage: MdkStorageProvider,
 {
     let relays = vec![RelayUrl::parse("wss://test.relay").unwrap()];
-    let (key_package_hex, tags) = mdk
+    let (key_package_hex, tags, _hash_ref) = mdk
         .create_key_package_for_event(pubkey, relays)
         .expect("Failed to create key package");
 
     EventBuilder::new(Kind::MlsKeyPackage, key_package_hex)
-        .tags(tags.to_vec())
+        .tags(tags)
         .sign_with_keys(signing_keys)
         .expect("Failed to sign event")
 }

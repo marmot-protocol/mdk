@@ -1,5 +1,9 @@
 # 🦫 MDK - Marmot Development Kit
 
+<p align="center">
+  <img src="https://blossom.primal.net/2b3aea4e6b4d646f4e5589d62bd8edd3495a532319f8ecbdf29ef027d4fed86e.png" alt="The Grand Marmot guards the mountain" width="400" />
+</p>
+
 **A Rust implementation of the Marmot Protocol for secure, decentralized group messaging**
 
 ![CI](https://github.com/marmot-protocol/mdk/actions/workflows/ci.yml/badge.svg)
@@ -98,10 +102,10 @@ Add MDK to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-mdk-core = "0.5.0"
-mdk-memory-storage = "0.5.0"  # For in-memory storage
+mdk-core = "0.7.1"
+mdk-memory-storage = "0.7.1"  # For in-memory storage
 # OR
-mdk-sqlite-storage = "0.5.0"  # For persistent SQLite storage
+mdk-sqlite-storage = "0.7.1"  # For persistent SQLite storage
 ```
 
 ### Feature Flags
@@ -110,7 +114,7 @@ mdk-sqlite-storage = "0.5.0"  # For persistent SQLite storage
 
 ```toml
 [dependencies]
-mdk-core = { version = "0.5.0", features = ["mip04"] }
+mdk-core = { version = "0.7.1", features = ["mip04"] }
 ```
 
 ## 🚀 Quick Start
@@ -136,7 +140,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let relay_url = RelayUrl::parse("wss://relay.example.com")?;
 
     // Bob creates a key package
-    let (bob_key_package, tags) = bob_mdk
+    let (bob_key_package, tags, _hash_ref) = bob_mdk
         .create_key_package_for_event(&bob_keys.public_key(), [relay_url.clone()])?;
 
     let bob_key_package_event = EventBuilder::new(Kind::MlsKeyPackage, bob_key_package)

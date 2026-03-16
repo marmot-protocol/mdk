@@ -1,6 +1,6 @@
 [package]
 name = "mdk-uniffi"
-version = "0.5.2"
+version = "0.7.1"
 edition = "2024"
 description = "UniFFI bindings for mdk-core with SQLite storage"
 authors = [
@@ -14,13 +14,16 @@ repository.workspace = true
 license.workspace = true
 rust-version = "1.90.0"
 keywords = ["nostr", "mls", "openmls", "uniffi", "bindings"]
+categories = ["cryptography", "api-bindings"]
+readme = "README.md"
+publish = false
 
 [lib]
 name = "mdk_uniffi"
 crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
-mdk-core = { workspace = true, default-features = false }
+mdk-core = { workspace = true, default-features = false, features = ["mip04"] }
 mdk-sqlite-storage = { workspace = true, default-features = false }
 mdk-storage-traits = { workspace = true, default-features = false }
 nostr = { workspace = true, features = ["std", "nip44"] }
@@ -29,11 +32,11 @@ serde_json.workspace = true
 thiserror.workspace = true
 hex = { workspace = true, features = ["std"] }
 tracing = { workspace = true, features = ["std"] }
-uniffi = { version = "0.30", features = ["cli"] }
-uniffi_macros = "0.30"
+uniffi = { version = "0.31", features = ["cli"] }
+uniffi_macros = "0.31"
 
 [features]
-default = []
+default = ["mip04"]
 mip04 = ["mdk-core/mip04"]
 
 [dev-dependencies]

@@ -7,7 +7,6 @@
 use std::string::FromUtf8Error;
 use std::{fmt, str};
 
-use nostr::nips::nip44;
 use nostr::types::url;
 use nostr::{Kind, SignerError, event, key};
 use openmls::credentials::errors::BasicCredentialError;
@@ -23,7 +22,7 @@ use openmls::key_packages::errors::{KeyPackageNewError, KeyPackageVerifyError};
 use openmls::prelude::{MlsGroupStateError, ValidationError};
 use openmls_traits::types::CryptoError;
 
-/// Nostr MLS error
+/// MDK error
 #[derive(Debug, PartialEq, thiserror::Error)]
 pub enum Error {
     /// Hex error
@@ -41,9 +40,6 @@ pub enum Error {
     /// Nostr Signer error
     #[error(transparent)]
     Signer(#[from] SignerError),
-    /// NIP44 error
-    #[error(transparent)]
-    NIP44(#[from] nip44::Error),
     /// Relay URL error
     #[error(transparent)]
     RelayUrl(#[from] url::Error),

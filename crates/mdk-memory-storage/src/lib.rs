@@ -1,7 +1,7 @@
-//! Memory-based storage implementation for Nostr MLS.
+//! Memory-based storage implementation for MDK.
 //!
-//! This module provides a memory-based storage implementation for the Nostr MLS (Messaging Layer Security)
-//! crate. It implements the `MdkStorageProvider` trait, allowing it to be used within the Nostr MLS context.
+//! This module provides a memory-based storage implementation for MDK (Marmot Development Kit).
+//! It implements the `MdkStorageProvider` trait, allowing it to be used as an in-memory storage backend.
 //!
 //! Memory-based storage is non-persistent and will be cleared when the application terminates.
 //! It's useful for testing or ephemeral applications where persistence isn't required.
@@ -280,7 +280,7 @@ impl ValidationLimits {
     }
 }
 
-/// A memory-based storage implementation for Nostr MLS.
+/// A memory-based storage implementation for MDK.
 ///
 /// This struct implements both the OpenMLS `StorageProvider<1>` trait and MDK storage
 /// traits directly, providing unified storage for MLS cryptographic state and
@@ -364,6 +364,7 @@ struct MdkMemoryStorageInner {
     messages_by_group_cache: LruCache<GroupId, HashMap<EventId, Message>>,
     processed_messages_cache: LruCache<EventId, ProcessedMessage>,
     group_exporter_secrets_cache: LruCache<(GroupId, u64), GroupExporterSecret>,
+    group_mip04_exporter_secrets_cache: LruCache<(GroupId, u64), GroupExporterSecret>,
 }
 
 impl fmt::Debug for MdkMemoryStorage {
@@ -442,6 +443,7 @@ impl MdkMemoryStorage {
             messages_by_group_cache: LruCache::new(cache_size),
             processed_messages_cache: LruCache::new(cache_size),
             group_exporter_secrets_cache: LruCache::new(cache_size),
+            group_mip04_exporter_secrets_cache: LruCache::new(cache_size),
         };
 
         MdkMemoryStorage {
@@ -484,6 +486,9 @@ impl MdkMemoryStorage {
             groups_by_nostr_id: inner.groups_by_nostr_id_cache.clone_to_hashmap(),
             group_relays: inner.group_relays_cache.clone_to_hashmap(),
             group_exporter_secrets: inner.group_exporter_secrets_cache.clone_to_hashmap(),
+            group_mip04_exporter_secrets: inner
+                .group_mip04_exporter_secrets_cache
+                .clone_to_hashmap(),
             welcomes: inner.welcomes_cache.clone_to_hashmap(),
             processed_welcomes: inner.processed_welcomes_cache.clone_to_hashmap(),
             messages: inner.messages_cache.clone_to_hashmap(),
@@ -538,6 +543,9 @@ impl MdkMemoryStorage {
         snapshot
             .group_exporter_secrets
             .restore_to_lru(&mut inner.group_exporter_secrets_cache);
+        snapshot
+            .group_mip04_exporter_secrets
+            .restore_to_lru(&mut inner.group_mip04_exporter_secrets_cache);
         snapshot.welcomes.restore_to_lru(&mut inner.welcomes_cache);
         snapshot
             .processed_welcomes
@@ -576,9 +584,9 @@ impl MdkMemoryStorage {
     pub fn create_group_scoped_snapshot(&self, group_id: &GroupId) -> GroupScopedSnapshot {
         let inner = self.inner.read();
 
-        // MLS storage uses JSON serialization for group_id keys.
+        // MLS storage uses MlsCodec serialization for group_id keys.
         // We need to use the same serialization to match the stored keys.
-        let mls_group_id_bytes = mls_storage::JsonCodec::serialize(group_id.inner())
+        let mls_group_id_bytes = mls_storage::MlsCodec::serialize(group_id.inner())
             .expect("Failed to serialize group_id for MLS lookup");
 
         // Filter MLS group data by group_id
@@ -632,6 +640,13 @@ impl MdkMemoryStorage {
             .map(|((_, epoch), secret)| (*epoch, secret.clone()))
             .collect();
 
+        let group_mip04_exporter_secrets: HashMap<u64, GroupExporterSecret> = inner
+            .group_mip04_exporter_secrets_cache
+            .iter()
+            .filter(|((gid, _), _)| gid == group_id)
+            .map(|((_, epoch), secret)| (*epoch, secret.clone()))
+            .collect();
+
         // Get current Unix timestamp
         let created_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -648,6 +663,7 @@ impl MdkMemoryStorage {
             group,
             group_relays,
             group_exporter_secrets,
+            group_mip04_exporter_secrets,
         }
     }
 
@@ -668,9 +684,9 @@ impl MdkMemoryStorage {
         let mut inner = self.inner.write();
         let group_id = &snapshot.group_id;
 
-        // MLS storage uses JSON serialization for group_id keys.
+        // MLS storage uses MlsCodec serialization for group_id keys.
         // We need to use the same serialization to match the stored keys.
-        let mls_group_id_bytes = mls_storage::JsonCodec::serialize(group_id.inner())
+        let mls_group_id_bytes = mls_storage::MlsCodec::serialize(group_id.inner())
             .expect("Failed to serialize group_id for MLS lookup");
 
         // 1. Remove existing data for this group
@@ -706,7 +722,7 @@ impl MdkMemoryStorage {
 
         inner.group_relays_cache.pop(group_id);
 
-        // Remove all exporter secrets for this group
+        // Remove all MIP-03 exporter secrets for this group
         let keys_to_remove: Vec<_> = inner
             .group_exporter_secrets_cache
             .iter()
@@ -715,6 +731,17 @@ impl MdkMemoryStorage {
             .collect();
         for key in keys_to_remove {
             inner.group_exporter_secrets_cache.pop(&key);
+        }
+
+        // Remove all MIP-04 exporter secrets for this group
+        let mip04_keys_to_remove: Vec<_> = inner
+            .group_mip04_exporter_secrets_cache
+            .iter()
+            .filter(|((gid, _), _)| gid == group_id)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for key in mip04_keys_to_remove {
+            inner.group_mip04_exporter_secrets_cache.pop(&key);
         }
 
         // 2. Restore from snapshot
@@ -764,6 +791,12 @@ impl MdkMemoryStorage {
         for (epoch, secret) in snapshot.group_exporter_secrets {
             inner
                 .group_exporter_secrets_cache
+                .put((group_id.clone(), epoch), secret);
+        }
+
+        for (epoch, secret) in snapshot.group_mip04_exporter_secrets {
+            inner
+                .group_mip04_exporter_secrets_cache
                 .put((group_id.clone(), epoch), secret);
         }
     }
@@ -1547,16 +1580,17 @@ impl StorageProvider<STORAGE_PROVIDER_VERSION> for MdkMemoryStorage {
 mod tests {
     use std::collections::BTreeSet;
 
-    use mdk_storage_traits::GroupId;
-    use mdk_storage_traits::Secret;
     use mdk_storage_traits::groups::GroupStorage;
-    use mdk_storage_traits::groups::types::{Group, GroupExporterSecret, GroupState};
+    use mdk_storage_traits::groups::types::{
+        Group, GroupExporterSecret, GroupState, SelfUpdateState,
+    };
     use mdk_storage_traits::messages::MessageStorage;
     use mdk_storage_traits::messages::error::MessageError;
     use mdk_storage_traits::messages::types::{Message, MessageState, ProcessedMessageState};
     use mdk_storage_traits::test_utils::crypto_utils::generate_random_bytes;
     use mdk_storage_traits::welcomes::WelcomeStorage;
     use mdk_storage_traits::welcomes::types::{ProcessedWelcomeState, Welcome, WelcomeState};
+    use mdk_storage_traits::{GroupId, MdkStorageProvider, Secret};
     use nostr::{EventId, Kind, PublicKey, RelayUrl, Tags, Timestamp, UnsignedEvent};
 
     use super::*;
@@ -1624,11 +1658,13 @@ mod tests {
             admin_pubkeys: BTreeSet::new(),
             last_message_id: None,
             last_message_at: None,
+            last_message_processed_at: None,
             epoch: 0,
             state: GroupState::Active,
             image_hash,
             image_key,
             image_nonce,
+            self_update_state: SelfUpdateState::Required,
         };
         nostr_storage.save_group(group.clone()).unwrap();
         let found_group = nostr_storage
@@ -1667,11 +1703,13 @@ mod tests {
             admin_pubkeys: BTreeSet::new(),
             last_message_id: None,
             last_message_at: None,
+            last_message_processed_at: None,
             epoch: 0,
             state: GroupState::Active,
             image_hash,
             image_key,
             image_nonce,
+            self_update_state: SelfUpdateState::Required,
         };
         nostr_storage.save_group(group.clone()).unwrap();
         let relay_url1 = RelayUrl::parse("wss://relay1.example.com").unwrap();
@@ -1712,11 +1750,13 @@ mod tests {
             admin_pubkeys: BTreeSet::new(),
             last_message_id: None,
             last_message_at: None,
+            last_message_processed_at: None,
             epoch: 0,
             state: GroupState::Active,
             image_hash,
             image_key,
             image_nonce,
+            self_update_state: SelfUpdateState::Required,
         };
         nostr_storage.save_group(group.clone()).unwrap();
         let group_exporter_secret_0 = GroupExporterSecret {
@@ -1862,11 +1902,13 @@ mod tests {
             admin_pubkeys: BTreeSet::new(),
             last_message_id: None,
             last_message_at: None,
+            last_message_processed_at: None,
             epoch: 0,
             state: GroupState::Active,
             image_hash,
             image_key,
             image_nonce,
+            self_update_state: SelfUpdateState::Required,
         };
         nostr_storage.save_group(group.clone()).unwrap();
         let event_id = EventId::all_zeros();
@@ -1874,17 +1916,19 @@ mod tests {
         let pubkey =
             PublicKey::from_hex("aabbccddeeffaabbccddeeffaabbccddeeffaabbccddeeffaabbccddeeffaabb")
                 .unwrap();
+        let now = Timestamp::now();
         let message = Message {
             id: event_id,
             pubkey,
             kind: Kind::MlsGroupMessage,
             mls_group_id: mls_group_id.clone(),
-            created_at: Timestamp::now(),
+            created_at: now,
+            processed_at: now,
             content: "Hello, world!".to_string(),
             tags: Tags::new(),
             event: UnsignedEvent::new(
                 pubkey,
-                Timestamp::now(),
+                now,
                 Kind::MlsGroupMessage,
                 Tags::new(),
                 "Hello, world!".to_string(),
@@ -1953,17 +1997,19 @@ mod tests {
         let pubkey =
             PublicKey::from_hex("aabbccddeeffaabbccddeeffaabbccddeeffaabbccddeeffaabbccddeeffaabb")
                 .unwrap();
+        let now = Timestamp::now();
         let message = Message {
             id: event_id,
             pubkey,
             kind: Kind::MlsGroupMessage,
             mls_group_id: nonexistent_group_id.clone(),
-            created_at: Timestamp::now(),
+            created_at: now,
+            processed_at: now,
             content: "Hello, world!".to_string(),
             tags: Tags::new(),
             event: UnsignedEvent::new(
                 pubkey,
-                Timestamp::now(),
+                now,
                 Kind::MlsGroupMessage,
                 Tags::new(),
                 "Hello, world!".to_string(),
@@ -2004,11 +2050,13 @@ mod tests {
             admin_pubkeys: BTreeSet::new(),
             last_message_id: None,
             last_message_at: None,
+            last_message_processed_at: None,
             epoch: 0,
             state: GroupState::Active,
             image_hash: None,
             image_key: None,
             image_nonce: None,
+            self_update_state: SelfUpdateState::Required,
         };
         nostr_storage.save_group(group).unwrap();
 
@@ -2017,17 +2065,19 @@ mod tests {
         let pubkey =
             PublicKey::from_hex("aabbccddeeffaabbccddeeffaabbccddeeffaabbccddeeffaabbccddeeffaabb")
                 .unwrap();
+        let now = Timestamp::now();
         let original_message = Message {
             id: event_id,
             pubkey,
             kind: Kind::MlsGroupMessage,
             mls_group_id: mls_group_id.clone(),
-            created_at: Timestamp::now(),
+            created_at: now,
+            processed_at: now,
             content: "Original message".to_string(),
             tags: Tags::new(),
             event: UnsignedEvent::new(
                 pubkey,
-                Timestamp::now(),
+                now,
                 Kind::MlsGroupMessage,
                 Tags::new(),
                 "Original message".to_string(),
@@ -2097,11 +2147,13 @@ mod tests {
             admin_pubkeys: BTreeSet::new(),
             last_message_id: None,
             last_message_at: None,
+            last_message_processed_at: None,
             epoch: 0,
             state: GroupState::Active,
             image_hash: None,
             image_key: None,
             image_nonce: None,
+            self_update_state: SelfUpdateState::Required,
         };
         nostr_storage.save_group(group).unwrap();
 
@@ -2110,6 +2162,7 @@ mod tests {
                 .unwrap();
 
         // Create and save first message
+        let now = Timestamp::now();
         let event_id_1 =
             EventId::from_hex("0000000000000000000000000000000000000000000000000000000000000001")
                 .unwrap();
@@ -2119,12 +2172,13 @@ mod tests {
             pubkey,
             kind: Kind::MlsGroupMessage,
             mls_group_id: mls_group_id.clone(),
-            created_at: Timestamp::now(),
+            created_at: now,
+            processed_at: now,
             content: "First message".to_string(),
             tags: Tags::new(),
             event: UnsignedEvent::new(
                 pubkey,
-                Timestamp::now(),
+                now,
                 Kind::MlsGroupMessage,
                 Tags::new(),
                 "First message".to_string(),
@@ -2145,12 +2199,13 @@ mod tests {
             pubkey,
             kind: Kind::MlsGroupMessage,
             mls_group_id: mls_group_id.clone(),
-            created_at: Timestamp::now(),
+            created_at: now,
+            processed_at: now,
             content: "Second message".to_string(),
             tags: Tags::new(),
             event: UnsignedEvent::new(
                 pubkey,
-                Timestamp::now(),
+                now,
                 Kind::MlsGroupMessage,
                 Tags::new(),
                 "Second message".to_string(),
@@ -2212,26 +2267,30 @@ mod tests {
             admin_pubkeys: BTreeSet::new(),
             last_message_id: None,
             last_message_at: None,
+            last_message_processed_at: None,
             epoch: 0,
             state: GroupState::Active,
             image_hash: None,
             image_key: None,
             image_nonce: None,
+            self_update_state: SelfUpdateState::Required,
         };
         nostr_storage.save_group(group).unwrap();
 
         // Try to save a message for a non-existent group
+        let now = Timestamp::now();
         let message = Message {
             id: event_id,
             pubkey,
             kind: Kind::MlsGroupMessage,
             mls_group_id: nonexistent_group_id.clone(),
-            created_at: Timestamp::now(),
+            created_at: now,
+            processed_at: now,
             content: "Hello, world!".to_string(),
             tags: Tags::new(),
             event: UnsignedEvent::new(
                 pubkey,
-                Timestamp::now(),
+                now,
                 Kind::MlsGroupMessage,
                 Tags::new(),
                 "Hello, world!".to_string(),
@@ -2288,11 +2347,13 @@ mod tests {
             admin_pubkeys: BTreeSet::new(),
             last_message_id: None,
             last_message_at: None,
+            last_message_processed_at: None,
             epoch: 0,
             state: GroupState::Active,
             image_hash,
             image_key,
             image_nonce,
+            self_update_state: SelfUpdateState::Required,
         };
 
         // Save the group
@@ -2324,11 +2385,13 @@ mod tests {
             admin_pubkeys: BTreeSet::new(),
             last_message_id: None,
             last_message_at: None,
+            last_message_processed_at: None,
             epoch: 0,
             state: GroupState::Active,
             image_hash,
             image_key,
             image_nonce,
+            self_update_state: SelfUpdateState::Required,
         };
 
         // Save the group
@@ -2356,11 +2419,13 @@ mod tests {
             admin_pubkeys: BTreeSet::new(),
             last_message_id: None,
             last_message_at: None,
+            last_message_processed_at: None,
             epoch: 0,
             state: GroupState::Active,
             image_hash: None,
             image_key: None,
             image_nonce: None,
+            self_update_state: SelfUpdateState::Required,
         };
         storage.save_group(group.clone()).unwrap();
 
@@ -2410,11 +2475,13 @@ mod tests {
             admin_pubkeys: BTreeSet::new(),
             last_message_id: None,
             last_message_at: None,
+            last_message_processed_at: None,
             epoch: 0,
             state: GroupState::Active,
             image_hash: None,
             image_key: None,
             image_nonce: None,
+            self_update_state: SelfUpdateState::Required,
         };
         storage.save_group(group).unwrap();
 
@@ -2425,17 +2492,19 @@ mod tests {
         let event_id =
             EventId::from_hex("0000000000000000000000000000000000000000000000000000000000000001")
                 .unwrap();
+        let now = Timestamp::now();
         let message = Message {
             id: event_id,
             pubkey,
             kind: Kind::MlsGroupMessage,
             mls_group_id: mls_group_id.clone(),
-            created_at: Timestamp::now(),
+            created_at: now,
+            processed_at: now,
             content: "Original message".to_string(),
             tags: Tags::new(),
             event: UnsignedEvent::new(
                 pubkey,
-                Timestamp::now(),
+                now,
                 Kind::MlsGroupMessage,
                 Tags::new(),
                 "Original message".to_string(),
@@ -2458,12 +2527,13 @@ mod tests {
             pubkey,
             kind: Kind::MlsGroupMessage,
             mls_group_id: mls_group_id.clone(),
-            created_at: Timestamp::now(),
+            created_at: now,
+            processed_at: now,
             content: "Second message".to_string(),
             tags: Tags::new(),
             event: UnsignedEvent::new(
                 pubkey,
-                Timestamp::now(),
+                now,
                 Kind::MlsGroupMessage,
                 Tags::new(),
                 "Second message".to_string(),
@@ -2513,11 +2583,13 @@ mod tests {
             admin_pubkeys: BTreeSet::new(),
             last_message_id: None,
             last_message_at: None,
+            last_message_processed_at: None,
             epoch: 0,
             state: GroupState::Active,
             image_hash: None,
             image_key: None,
             image_nonce: None,
+            self_update_state: SelfUpdateState::Required,
         };
         storage.save_group(group).unwrap();
 
@@ -2548,11 +2620,13 @@ mod tests {
             admin_pubkeys: BTreeSet::new(),
             last_message_id: None,
             last_message_at: None,
+            last_message_processed_at: None,
             epoch: 1,
             state: GroupState::Active,
             image_hash: None,
             image_key: None,
             image_nonce: None,
+            self_update_state: SelfUpdateState::Required,
         };
         storage.save_group(group.clone()).unwrap();
 
@@ -2617,11 +2691,13 @@ mod tests {
             admin_pubkeys: BTreeSet::new(),
             last_message_id: None,
             last_message_at: None,
+            last_message_processed_at: None,
             epoch: 0,
             state: GroupState::Active,
             image_hash: None,
             image_key: None,
             image_nonce: None,
+            self_update_state: SelfUpdateState::Required,
         };
         storage.save_group(group).unwrap();
 
@@ -2667,11 +2743,13 @@ mod tests {
             admin_pubkeys: BTreeSet::new(),
             last_message_id: None,
             last_message_at: None,
+            last_message_processed_at: None,
             epoch: 0,
             state: GroupState::Active,
             image_hash: None,
             image_key: None,
             image_nonce: None,
+            self_update_state: SelfUpdateState::Required,
         };
         storage.save_group(group).unwrap();
 
@@ -2782,11 +2860,13 @@ mod tests {
             admin_pubkeys: BTreeSet::new(),
             last_message_id: None,
             last_message_at: None,
+            last_message_processed_at: None,
             epoch: 0,
             state: GroupState::Active,
             image_hash: None,
             image_key: None,
             image_nonce: None,
+            self_update_state: SelfUpdateState::Required,
         };
         storage.save_group(group1).unwrap();
 
@@ -2805,11 +2885,13 @@ mod tests {
             admin_pubkeys: BTreeSet::new(),
             last_message_id: None,
             last_message_at: None,
+            last_message_processed_at: None,
             epoch: 0,
             state: GroupState::Active,
             image_hash: None,
             image_key: None,
             image_nonce: None,
+            self_update_state: SelfUpdateState::Required,
         };
         storage.save_group(group2).unwrap();
 
@@ -2820,17 +2902,19 @@ mod tests {
         let event_id =
             EventId::from_hex("0000000000000000000000000000000000000000000000000000000000000099")
                 .unwrap();
+        let now = Timestamp::now();
         let message = Message {
             id: event_id,
             pubkey,
             kind: Kind::MlsGroupMessage,
             mls_group_id: mls_group_id_1.clone(),
-            created_at: Timestamp::now(),
+            created_at: now,
+            processed_at: now,
             content: "Test message".to_string(),
             tags: Tags::new(),
             event: UnsignedEvent::new(
                 pubkey,
-                Timestamp::now(),
+                now,
                 Kind::MlsGroupMessage,
                 Tags::new(),
                 "Test message".to_string(),
@@ -2850,11 +2934,13 @@ mod tests {
             admin_pubkeys: BTreeSet::new(),
             last_message_id: None,
             last_message_at: None,
+            last_message_processed_at: None,
             epoch: 5,
             state: GroupState::Active,
             image_hash: None,
             image_key: None,
             image_nonce: None,
+            self_update_state: SelfUpdateState::Required,
         };
         storage.save_group(modified_group1).unwrap();
 
@@ -2903,11 +2989,13 @@ mod tests {
             admin_pubkeys: BTreeSet::new(),
             last_message_id: None,
             last_message_at: None,
+            last_message_processed_at: None,
             epoch: 0,
             state: GroupState::Active,
             image_hash: None,
             image_key: None,
             image_nonce: None,
+            self_update_state: SelfUpdateState::Required,
         };
         storage.save_group(group.clone()).unwrap();
 
@@ -2971,8 +3059,6 @@ mod tests {
     /// When rolling back Group A's snapshot, Group B should be completely unaffected.
     #[test]
     fn test_snapshot_isolation_between_groups() {
-        use mdk_storage_traits::MdkStorageProvider;
-
         let storage = MdkMemoryStorage::default();
 
         // Create two independent groups
@@ -2989,11 +3075,13 @@ mod tests {
             admin_pubkeys: BTreeSet::new(),
             last_message_id: None,
             last_message_at: None,
+            last_message_processed_at: None,
             epoch: 5,
             state: GroupState::Active,
             image_hash: None,
             image_key: None,
             image_nonce: None,
+            self_update_state: SelfUpdateState::Required,
         };
 
         let group2 = Group {
@@ -3004,11 +3092,13 @@ mod tests {
             admin_pubkeys: BTreeSet::new(),
             last_message_id: None,
             last_message_at: None,
+            last_message_processed_at: None,
             epoch: 10,
             state: GroupState::Active,
             image_hash: None,
             image_key: None,
             image_nonce: None,
+            self_update_state: SelfUpdateState::Required,
         };
 
         storage.save_group(group1.clone()).unwrap();
@@ -3079,8 +3169,6 @@ mod tests {
     /// Test that group-scoped snapshots also isolate exporter secrets correctly.
     #[test]
     fn test_snapshot_isolation_with_exporter_secrets() {
-        use mdk_storage_traits::MdkStorageProvider;
-
         let storage = MdkMemoryStorage::default();
 
         // Create two groups
@@ -3097,11 +3185,13 @@ mod tests {
             admin_pubkeys: BTreeSet::new(),
             last_message_id: None,
             last_message_at: None,
+            last_message_processed_at: None,
             epoch: 1,
             state: GroupState::Active,
             image_hash: None,
             image_key: None,
             image_nonce: None,
+            self_update_state: SelfUpdateState::Required,
         };
 
         let group2 = Group {
@@ -3112,11 +3202,13 @@ mod tests {
             admin_pubkeys: BTreeSet::new(),
             last_message_id: None,
             last_message_at: None,
+            last_message_processed_at: None,
             epoch: 1,
             state: GroupState::Active,
             image_hash: None,
             image_key: None,
             image_nonce: None,
+            self_update_state: SelfUpdateState::Required,
         };
 
         storage.save_group(group1).unwrap();
@@ -3199,11 +3291,138 @@ mod tests {
         );
     }
 
+    /// Test that group-scoped snapshots also isolate MIP-04 exporter secrets correctly.
+    #[test]
+    fn test_snapshot_isolation_with_mip04_exporter_secrets() {
+        let storage = MdkMemoryStorage::default();
+
+        // Create two groups
+        let group1_id = GroupId::from_slice(&[33; 32]);
+        let group2_id = GroupId::from_slice(&[44; 32]);
+        let nostr_group_id_1: [u8; 32] = generate_random_bytes(32).try_into().unwrap();
+        let nostr_group_id_2: [u8; 32] = generate_random_bytes(32).try_into().unwrap();
+
+        let group1 = Group {
+            mls_group_id: group1_id.clone(),
+            nostr_group_id: nostr_group_id_1,
+            name: "Group 1".to_string(),
+            description: "".to_string(),
+            admin_pubkeys: BTreeSet::new(),
+            last_message_id: None,
+            last_message_at: None,
+            last_message_processed_at: None,
+            epoch: 1,
+            state: GroupState::Active,
+            image_hash: None,
+            image_key: None,
+            image_nonce: None,
+            self_update_state: SelfUpdateState::Required,
+        };
+
+        let group2 = Group {
+            mls_group_id: group2_id.clone(),
+            nostr_group_id: nostr_group_id_2,
+            name: "Group 2".to_string(),
+            description: "".to_string(),
+            admin_pubkeys: BTreeSet::new(),
+            last_message_id: None,
+            last_message_at: None,
+            last_message_processed_at: None,
+            epoch: 1,
+            state: GroupState::Active,
+            image_hash: None,
+            image_key: None,
+            image_nonce: None,
+            self_update_state: SelfUpdateState::Required,
+        };
+
+        storage.save_group(group1).unwrap();
+        storage.save_group(group2).unwrap();
+
+        // Add MIP-04 exporter secrets for both groups
+        let secret1_epoch0 = GroupExporterSecret {
+            mls_group_id: group1_id.clone(),
+            epoch: 0,
+            secret: Secret::new([3u8; 32]),
+        };
+        let secret2_epoch0 = GroupExporterSecret {
+            mls_group_id: group2_id.clone(),
+            epoch: 0,
+            secret: Secret::new([4u8; 32]),
+        };
+
+        storage
+            .save_group_mip04_exporter_secret(secret1_epoch0.clone())
+            .unwrap();
+        storage
+            .save_group_mip04_exporter_secret(secret2_epoch0.clone())
+            .unwrap();
+
+        // Snapshot Group 1
+        storage
+            .create_group_snapshot(&group1_id, "group1_mip04_secrets_snap")
+            .unwrap();
+
+        // Add new epoch MIP-04 secrets to BOTH groups
+        let secret1_epoch1 = GroupExporterSecret {
+            mls_group_id: group1_id.clone(),
+            epoch: 1,
+            secret: Secret::new([33u8; 32]),
+        };
+        let secret2_epoch1 = GroupExporterSecret {
+            mls_group_id: group2_id.clone(),
+            epoch: 1,
+            secret: Secret::new([44u8; 32]),
+        };
+
+        storage
+            .save_group_mip04_exporter_secret(secret1_epoch1)
+            .unwrap();
+        storage
+            .save_group_mip04_exporter_secret(secret2_epoch1)
+            .unwrap();
+
+        // Verify both groups have epoch 1 secrets
+        assert!(
+            storage
+                .get_group_mip04_exporter_secret(&group1_id, 1)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            storage
+                .get_group_mip04_exporter_secret(&group2_id, 1)
+                .unwrap()
+                .is_some()
+        );
+
+        // Rollback Group 1
+        storage
+            .rollback_group_to_snapshot(&group1_id, "group1_mip04_secrets_snap")
+            .unwrap();
+
+        // Group 1's epoch 1 secret should be gone
+        assert!(
+            storage
+                .get_group_mip04_exporter_secret(&group1_id, 1)
+                .unwrap()
+                .is_none(),
+            "Group 1's MIP-04 epoch 1 secret should be rolled back"
+        );
+
+        // Group 2's epoch 1 secret should STILL exist
+        assert!(
+            storage
+                .get_group_mip04_exporter_secret(&group2_id, 1)
+                .unwrap()
+                .is_some(),
+            "Group 2's MIP-04 epoch 1 secret should NOT be affected by Group 1's rollback"
+        );
+    }
+
     /// Test that rolling back to a nonexistent snapshot returns an error.
     #[test]
     fn test_rollback_nonexistent_snapshot_returns_error() {
-        use mdk_storage_traits::MdkStorageProvider;
-
         let storage = MdkMemoryStorage::default();
 
         let group_id = GroupId::from_slice(&[99; 32]);
@@ -3217,11 +3436,13 @@ mod tests {
             admin_pubkeys: BTreeSet::new(),
             last_message_id: None,
             last_message_at: None,
+            last_message_processed_at: None,
             epoch: 1,
             state: GroupState::Active,
             image_hash: None,
             image_key: None,
             image_nonce: None,
+            self_update_state: SelfUpdateState::Required,
         };
 
         storage.save_group(group).unwrap();
@@ -3246,8 +3467,6 @@ mod tests {
 
     #[test]
     fn test_list_group_snapshots_empty() {
-        use mdk_storage_traits::MdkStorageProvider;
-
         let storage = MdkMemoryStorage::default();
         let group_id = GroupId::from_slice(&[1, 2, 3, 4]);
 
@@ -3260,8 +3479,6 @@ mod tests {
 
     #[test]
     fn test_list_group_snapshots_returns_snapshots_sorted_by_created_at() {
-        use mdk_storage_traits::MdkStorageProvider;
-
         let storage = MdkMemoryStorage::default();
         let group_id = GroupId::from_slice(&[1, 2, 3, 4]);
         let nostr_group_id: [u8; 32] = generate_random_bytes(32).try_into().unwrap();
@@ -3275,11 +3492,13 @@ mod tests {
             admin_pubkeys: BTreeSet::new(),
             last_message_id: None,
             last_message_at: None,
+            last_message_processed_at: None,
             epoch: 1,
             state: GroupState::Active,
             image_hash: None,
             image_key: None,
             image_nonce: None,
+            self_update_state: SelfUpdateState::Required,
         };
         storage.save_group(group).unwrap();
 
@@ -3299,6 +3518,7 @@ mod tests {
                 group: None,
                 group_relays: std::collections::BTreeSet::new(),
                 group_exporter_secrets: std::collections::HashMap::new(),
+                group_mip04_exporter_secrets: std::collections::HashMap::new(),
             };
             let snap2 = crate::snapshot::GroupScopedSnapshot {
                 group_id: group_id.clone(),
@@ -3330,8 +3550,6 @@ mod tests {
 
     #[test]
     fn test_list_group_snapshots_only_returns_matching_group() {
-        use mdk_storage_traits::MdkStorageProvider;
-
         let storage = MdkMemoryStorage::default();
         let group1 = GroupId::from_slice(&[1, 1, 1, 1]);
         let group2 = GroupId::from_slice(&[2, 2, 2, 2]);
@@ -3349,6 +3567,7 @@ mod tests {
                 group: None,
                 group_relays: std::collections::BTreeSet::new(),
                 group_exporter_secrets: std::collections::HashMap::new(),
+                group_mip04_exporter_secrets: std::collections::HashMap::new(),
             };
             let snap2 = crate::snapshot::GroupScopedSnapshot {
                 group_id: group2.clone(),
@@ -3372,8 +3591,6 @@ mod tests {
 
     #[test]
     fn test_prune_expired_snapshots_removes_old_snapshots() {
-        use mdk_storage_traits::MdkStorageProvider;
-
         let storage = MdkMemoryStorage::default();
         let group_id = GroupId::from_slice(&[1, 2, 3, 4]);
 
@@ -3390,6 +3607,7 @@ mod tests {
                 group: None,
                 group_relays: std::collections::BTreeSet::new(),
                 group_exporter_secrets: std::collections::HashMap::new(),
+                group_mip04_exporter_secrets: std::collections::HashMap::new(),
             };
 
             // Old snapshot (should be pruned)
@@ -3420,8 +3638,6 @@ mod tests {
 
     #[test]
     fn test_prune_expired_snapshots_returns_zero_when_nothing_to_prune() {
-        use mdk_storage_traits::MdkStorageProvider;
-
         let storage = MdkMemoryStorage::default();
         let group_id = GroupId::from_slice(&[1, 2, 3, 4]);
 
@@ -3438,6 +3654,7 @@ mod tests {
                 group: None,
                 group_relays: std::collections::BTreeSet::new(),
                 group_exporter_secrets: std::collections::HashMap::new(),
+                group_mip04_exporter_secrets: std::collections::HashMap::new(),
             };
 
             snapshots.insert((group_id.clone(), "recent_snap".to_string()), snap);
@@ -3454,8 +3671,6 @@ mod tests {
 
     #[test]
     fn test_prune_expired_snapshots_across_multiple_groups() {
-        use mdk_storage_traits::MdkStorageProvider;
-
         let storage = MdkMemoryStorage::default();
         let group1 = GroupId::from_slice(&[1, 1, 1, 1]);
         let group2 = GroupId::from_slice(&[2, 2, 2, 2]);
@@ -3473,6 +3688,7 @@ mod tests {
                 group: None,
                 group_relays: std::collections::BTreeSet::new(),
                 group_exporter_secrets: std::collections::HashMap::new(),
+                group_mip04_exporter_secrets: std::collections::HashMap::new(),
             };
             let base_snap2 = crate::snapshot::GroupScopedSnapshot {
                 group_id: group2.clone(),
@@ -3501,5 +3717,378 @@ mod tests {
         assert_eq!(remaining1.len(), 1);
         assert_eq!(remaining1[0].0, "new_snap_g1");
         assert!(remaining2.is_empty());
+    }
+
+    // ========================================
+    // Snapshot tests for OpenMLS data
+    // ========================================
+    // These tests verify that group-scoped snapshots correctly capture and
+    // restore OpenMLS cryptographic state written through the MLS storage layer
+    // (which uses MlsCodec::serialize for group_id keys). This ensures the
+    // memory backend cannot regress to the same bug that affected the SQLite
+    // backend, where snapshots silently missed all OpenMLS rows due to a
+    // group_id encoding mismatch.
+
+    /// Snapshot must capture MLS group_data written through the storage layer.
+    #[test]
+    fn test_snapshot_captures_mls_group_data() {
+        let storage = MdkMemoryStorage::default();
+
+        let group_id = GroupId::from_slice(&[1; 32]);
+        let nostr_group_id: [u8; 32] = generate_random_bytes(32).try_into().unwrap();
+        let group = Group {
+            mls_group_id: group_id.clone(),
+            nostr_group_id,
+            name: "MLS Data Test".to_string(),
+            description: "".to_string(),
+            admin_pubkeys: BTreeSet::new(),
+            last_message_id: None,
+            last_message_at: None,
+            last_message_processed_at: None,
+            epoch: 5,
+            state: GroupState::Active,
+            image_hash: None,
+            image_key: None,
+            image_nonce: None,
+            self_update_state: SelfUpdateState::Required,
+        };
+        storage.save_group(group).unwrap();
+
+        // Write MLS group data via the internal MLS storage (uses MlsCodec)
+        {
+            let mut inner = storage.inner.write();
+            inner
+                .mls_group_data
+                .write(
+                    &group_id,
+                    mls_storage::GroupDataType::GroupState,
+                    &"epoch5_state".to_string(),
+                )
+                .unwrap();
+            inner
+                .mls_group_data
+                .write(
+                    &group_id,
+                    mls_storage::GroupDataType::Tree,
+                    &"epoch5_tree".to_string(),
+                )
+                .unwrap();
+        }
+
+        // Take a group-scoped snapshot
+        storage
+            .create_group_snapshot(&group_id, "snap_mls")
+            .unwrap();
+
+        // Modify MLS data (simulate advancing to epoch 6)
+        {
+            let mut inner = storage.inner.write();
+            inner
+                .mls_group_data
+                .write(
+                    &group_id,
+                    mls_storage::GroupDataType::GroupState,
+                    &"epoch6_state".to_string(),
+                )
+                .unwrap();
+            inner
+                .mls_group_data
+                .write(
+                    &group_id,
+                    mls_storage::GroupDataType::Tree,
+                    &"epoch6_tree".to_string(),
+                )
+                .unwrap();
+        }
+
+        // Verify we're at epoch 6 data
+        {
+            let inner = storage.inner.read();
+            let state: Option<String> = inner
+                .mls_group_data
+                .read(&group_id, mls_storage::GroupDataType::GroupState)
+                .unwrap();
+            assert_eq!(state.as_deref(), Some("epoch6_state"));
+        }
+
+        // Rollback
+        storage
+            .rollback_group_to_snapshot(&group_id, "snap_mls")
+            .unwrap();
+
+        // Verify MLS data was restored to epoch 5 state
+        {
+            let inner = storage.inner.read();
+            let state: Option<String> = inner
+                .mls_group_data
+                .read(&group_id, mls_storage::GroupDataType::GroupState)
+                .unwrap();
+            assert_eq!(
+                state.as_deref(),
+                Some("epoch5_state"),
+                "MLS group_data (GroupState) must be restored to snapshot state"
+            );
+
+            let tree: Option<String> = inner
+                .mls_group_data
+                .read(&group_id, mls_storage::GroupDataType::Tree)
+                .unwrap();
+            assert_eq!(
+                tree.as_deref(),
+                Some("epoch5_tree"),
+                "MLS group_data (Tree) must be restored to snapshot state"
+            );
+        }
+    }
+
+    /// Snapshot must capture MLS own_leaf_nodes written through the storage layer.
+    #[test]
+    fn test_snapshot_captures_mls_own_leaf_nodes() {
+        let storage = MdkMemoryStorage::default();
+
+        let group_id = GroupId::from_slice(&[2; 32]);
+        let nostr_group_id: [u8; 32] = generate_random_bytes(32).try_into().unwrap();
+        let group = Group {
+            mls_group_id: group_id.clone(),
+            nostr_group_id,
+            name: "Leaf Node Test".to_string(),
+            description: "".to_string(),
+            admin_pubkeys: BTreeSet::new(),
+            last_message_id: None,
+            last_message_at: None,
+            last_message_processed_at: None,
+            epoch: 0,
+            state: GroupState::Active,
+            image_hash: None,
+            image_key: None,
+            image_nonce: None,
+            self_update_state: SelfUpdateState::Required,
+        };
+        storage.save_group(group).unwrap();
+
+        // Write MLS leaf node
+        {
+            let mut inner = storage.inner.write();
+            inner
+                .mls_own_leaf_nodes
+                .append(&group_id, &"original_leaf".to_string())
+                .unwrap();
+        }
+
+        // Snapshot
+        storage
+            .create_group_snapshot(&group_id, "snap_leaf")
+            .unwrap();
+
+        // Add another leaf node after snapshot
+        {
+            let mut inner = storage.inner.write();
+            inner
+                .mls_own_leaf_nodes
+                .append(&group_id, &"added_after_snapshot".to_string())
+                .unwrap();
+        }
+
+        // Verify 2 leaf nodes exist
+        {
+            let inner = storage.inner.read();
+            let leaves: Vec<String> = inner.mls_own_leaf_nodes.read(&group_id).unwrap();
+            assert_eq!(leaves.len(), 2);
+        }
+
+        // Rollback
+        storage
+            .rollback_group_to_snapshot(&group_id, "snap_leaf")
+            .unwrap();
+
+        // Verify only original leaf node remains
+        {
+            let inner = storage.inner.read();
+            let leaves: Vec<String> = inner.mls_own_leaf_nodes.read(&group_id).unwrap();
+            assert_eq!(
+                leaves.len(),
+                1,
+                "Rollback must restore own_leaf_nodes to snapshot state (1 leaf, not 2)"
+            );
+            assert_eq!(leaves[0], "original_leaf");
+        }
+    }
+
+    /// Snapshot must capture MLS epoch_key_pairs written through the storage layer.
+    #[test]
+    fn test_snapshot_captures_mls_epoch_key_pairs() {
+        let storage = MdkMemoryStorage::default();
+
+        let group_id = GroupId::from_slice(&[3; 32]);
+        let nostr_group_id: [u8; 32] = generate_random_bytes(32).try_into().unwrap();
+        let group = Group {
+            mls_group_id: group_id.clone(),
+            nostr_group_id,
+            name: "Epoch Keys Test".to_string(),
+            description: "".to_string(),
+            admin_pubkeys: BTreeSet::new(),
+            last_message_id: None,
+            last_message_at: None,
+            last_message_processed_at: None,
+            epoch: 5,
+            state: GroupState::Active,
+            image_hash: None,
+            image_key: None,
+            image_nonce: None,
+            self_update_state: SelfUpdateState::Required,
+        };
+        storage.save_group(group).unwrap();
+
+        // Write epoch key pairs
+        let epoch_id = 5u64;
+        let leaf_index = 0u32;
+        {
+            let mut inner = storage.inner.write();
+            inner
+                .mls_epoch_key_pairs
+                .write(
+                    &group_id,
+                    &epoch_id,
+                    leaf_index,
+                    &["epoch5_key_pair".to_string()],
+                )
+                .unwrap();
+        }
+
+        // Snapshot
+        storage
+            .create_group_snapshot(&group_id, "snap_keys")
+            .unwrap();
+
+        // Modify key pairs (simulate epoch advance)
+        {
+            let mut inner = storage.inner.write();
+            inner
+                .mls_epoch_key_pairs
+                .write(
+                    &group_id,
+                    &epoch_id,
+                    leaf_index,
+                    &["epoch6_key_pair".to_string()],
+                )
+                .unwrap();
+        }
+
+        // Rollback
+        storage
+            .rollback_group_to_snapshot(&group_id, "snap_keys")
+            .unwrap();
+
+        // Verify epoch key pairs restored
+        {
+            let inner = storage.inner.read();
+            let key_pairs: Vec<String> = inner
+                .mls_epoch_key_pairs
+                .read(&group_id, &epoch_id, leaf_index)
+                .unwrap();
+            assert_eq!(
+                key_pairs,
+                vec!["epoch5_key_pair"],
+                "Rollback must restore epoch_key_pairs to snapshot state"
+            );
+        }
+    }
+
+    /// Full MIP-03 rollback simulation: metadata and crypto state must be
+    /// consistent after rollback.
+    ///
+    /// This is the regression guard — if the memory storage's MlsCodec
+    /// serialization for group_id filtering were ever removed or broken,
+    /// this test would catch the metadata/crypto split-brain condition.
+    #[test]
+    fn test_rollback_metadata_crypto_consistency() {
+        let storage = MdkMemoryStorage::default();
+
+        let group_id = GroupId::from_slice(&[4; 32]);
+        let nostr_group_id: [u8; 32] = generate_random_bytes(32).try_into().unwrap();
+        let group = Group {
+            mls_group_id: group_id.clone(),
+            nostr_group_id,
+            name: "Consistency Test".to_string(),
+            description: "".to_string(),
+            admin_pubkeys: BTreeSet::new(),
+            last_message_id: None,
+            last_message_at: None,
+            last_message_processed_at: None,
+            epoch: 5,
+            state: GroupState::Active,
+            image_hash: None,
+            image_key: None,
+            image_nonce: None,
+            self_update_state: SelfUpdateState::Required,
+        };
+        storage.save_group(group).unwrap();
+
+        // Write epoch 5 MLS state
+        {
+            let mut inner = storage.inner.write();
+            inner
+                .mls_group_data
+                .write(
+                    &group_id,
+                    mls_storage::GroupDataType::GroupState,
+                    &"epoch5_state".to_string(),
+                )
+                .unwrap();
+        }
+
+        // Snapshot at epoch 5
+        storage
+            .create_group_snapshot(&group_id, "snap_epoch5")
+            .unwrap();
+
+        // Advance to epoch 6: both MDK metadata and MLS crypto
+        {
+            let mut g = storage
+                .find_group_by_mls_group_id(&group_id)
+                .unwrap()
+                .unwrap();
+            g.epoch = 6;
+            storage.save_group(g).unwrap();
+        }
+        {
+            let mut inner = storage.inner.write();
+            inner
+                .mls_group_data
+                .write(
+                    &group_id,
+                    mls_storage::GroupDataType::GroupState,
+                    &"epoch6_state".to_string(),
+                )
+                .unwrap();
+        }
+
+        // MIP-03: rollback to epoch 5
+        storage
+            .rollback_group_to_snapshot(&group_id, "snap_epoch5")
+            .unwrap();
+
+        // Check MDK metadata
+        let group_after = storage
+            .find_group_by_mls_group_id(&group_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(group_after.epoch, 5, "MDK epoch should be 5 after rollback");
+
+        // Check MLS crypto state
+        let crypto_after: Option<String> = {
+            let inner = storage.inner.read();
+            inner
+                .mls_group_data
+                .read(&group_id, mls_storage::GroupDataType::GroupState)
+                .unwrap()
+        };
+        assert_eq!(
+            crypto_after.as_deref(),
+            Some("epoch5_state"),
+            "MLS crypto state must match MDK metadata epoch after rollback. \
+             groups.epoch=5 but crypto state is epoch6 means split-brain: \
+             MDK thinks epoch 5, MLS engine has epoch 6 keys."
+        );
     }
 }

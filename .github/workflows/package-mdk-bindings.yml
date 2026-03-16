@@ -13,6 +13,9 @@ on:
         type: boolean
         default: false
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   SWIFT_PACKAGE_REPO: "marmot-protocol/mdk-swift"
@@ -527,7 +530,6 @@ jobs:
         ndk-version: r27d
         add-to-path: false
         link-to-sdk: true
-        local-cache: true
 
     - name: Setup OpenSSL for Android
       id: setup-openssl

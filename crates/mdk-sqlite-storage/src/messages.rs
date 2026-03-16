@@ -48,12 +48,13 @@ impl MessageStorage for MdkSqliteStorage {
         self.with_connection(|conn| {
             conn.execute(
                 "INSERT INTO messages
-             (id, pubkey, kind, mls_group_id, created_at, content, tags, event, wrapper_event_id, epoch, state)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             (id, pubkey, kind, mls_group_id, created_at, processed_at, content, tags, event, wrapper_event_id, epoch, state)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(mls_group_id, id) DO UPDATE SET
                  pubkey = excluded.pubkey,
                  kind = excluded.kind,
                  created_at = excluded.created_at,
+                 processed_at = excluded.processed_at,
                  content = excluded.content,
                  tags = excluded.tags,
                  event = excluded.event,
@@ -66,6 +67,7 @@ impl MessageStorage for MdkSqliteStorage {
                     message.kind.as_u16(),
                     message.mls_group_id.as_slice(),
                     message.created_at.as_secs(),
+                    message.processed_at.as_secs(),
                     &message.content,
                     &tags_json,
                     &event_json,
@@ -315,6 +317,33 @@ impl MessageStorage for MdkSqliteStorage {
             Ok(())
         })
     }
+
+    fn find_message_epoch_by_tag_content(
+        &self,
+        group_id: &mdk_storage_traits::GroupId,
+        content_substring: &str,
+    ) -> Result<Option<u64>, MessageError> {
+        let escaped = content_substring
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let pattern = format!("%{}%", escaped);
+        self.with_connection(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT epoch FROM messages
+                     WHERE mls_group_id = ? AND tags LIKE ? ESCAPE '\\' AND epoch IS NOT NULL
+                     LIMIT 1",
+                )
+                .map_err(into_message_err)?;
+
+            stmt.query_row(params![group_id.as_slice(), &pattern], |row| {
+                row.get::<_, u64>(0)
+            })
+            .optional()
+            .map_err(into_message_err)
+        })
+    }
 }
 
 #[cfg(test)]
@@ -323,7 +352,7 @@ mod tests {
 
     use mdk_storage_traits::GroupId;
     use mdk_storage_traits::groups::GroupStorage;
-    use mdk_storage_traits::groups::types::{Group, GroupState};
+    use mdk_storage_traits::groups::types::{Group, GroupState, SelfUpdateState};
     use mdk_storage_traits::messages::types::{MessageState, ProcessedMessageState};
     use nostr::{EventId, Kind, PublicKey, Tags, Timestamp, UnsignedEvent};
 
@@ -346,11 +375,13 @@ mod tests {
             admin_pubkeys: BTreeSet::new(),
             last_message_id: None,
             last_message_at: None,
+            last_message_processed_at: None,
             epoch: 0,
             state: GroupState::Active,
             image_hash: None,
             image_key: None,
             image_nonce: None,
+            self_update_state: SelfUpdateState::Required,
         };
 
         // Save the group
@@ -368,21 +399,17 @@ mod tests {
             EventId::parse("3287abd422284bc3679812c373c52ed4aa0af4f7c57b9c63ec440f6c3ed6c3a2")
                 .unwrap();
 
+        let now = Timestamp::now();
         let message = Message {
             id: event_id,
             pubkey,
             kind: Kind::from(1u16),
             mls_group_id: mls_group_id.clone(),
-            created_at: Timestamp::now(),
+            created_at: now,
+            processed_at: now,
             content: "Test message content".to_string(),
             tags: Tags::new(),
-            event: UnsignedEvent::new(
-                pubkey,
-                Timestamp::now(),
-                Kind::from(9u16),
-                vec![],
-                "content".to_string(),
-            ),
+            event: UnsignedEvent::new(pubkey, now, Kind::from(9u16), vec![], "content".to_string()),
             wrapper_event_id,
             epoch: Some(1),
             state: MessageState::Created,
@@ -461,11 +488,13 @@ mod tests {
             admin_pubkeys: BTreeSet::new(),
             last_message_id: None,
             last_message_at: None,
+            last_message_processed_at: None,
             epoch: 0,
             state: GroupState::Active,
             image_hash: None,
             image_key: None,
             image_nonce: None,
+            self_update_state: SelfUpdateState::Required,
         };
         storage.save_group(group).unwrap();
 
@@ -478,21 +507,17 @@ mod tests {
             EventId::from_hex("1111111111111111111111111111111111111111111111111111111111111111")
                 .unwrap();
 
+        let now = Timestamp::now();
         let message = Message {
             id: event_id,
             pubkey,
             kind: Kind::from(1u16),
             mls_group_id: mls_group_id.clone(),
-            created_at: Timestamp::now(),
+            created_at: now,
+            processed_at: now,
             content: oversized_content,
             tags: Tags::new(),
-            event: UnsignedEvent::new(
-                pubkey,
-                Timestamp::now(),
-                Kind::from(9u16),
-                vec![],
-                "content".to_string(),
-            ),
+            event: UnsignedEvent::new(pubkey, now, Kind::from(9u16), vec![], "content".to_string()),
             wrapper_event_id,
             epoch: None,
             state: MessageState::Created,
@@ -526,11 +551,13 @@ mod tests {
             admin_pubkeys: BTreeSet::new(),
             last_message_id: None,
             last_message_at: None,
+            last_message_processed_at: None,
             epoch: 0,
             state: GroupState::Active,
             image_hash: None,
             image_key: None,
             image_nonce: None,
+            self_update_state: SelfUpdateState::Required,
         };
 
         let group_2 = Group {
@@ -541,11 +568,13 @@ mod tests {
             admin_pubkeys: BTreeSet::new(),
             last_message_id: None,
             last_message_at: None,
+            last_message_processed_at: None,
             epoch: 0,
             state: GroupState::Active,
             image_hash: None,
             image_key: None,
             image_nonce: None,
+            self_update_state: SelfUpdateState::Required,
         };
 
         storage.save_group(group_1).unwrap();
@@ -565,21 +594,17 @@ mod tests {
             EventId::parse("3287abd422284bc3679812c373c52ed4aa0af4f7c57b9c63ec440f6c3ed6c3a2")
                 .unwrap();
 
+        let now = Timestamp::now();
         let message_1 = Message {
             id: same_event_id,
             pubkey,
             kind: Kind::from(1u16),
             mls_group_id: mls_group_id_1.clone(),
-            created_at: Timestamp::now(),
+            created_at: now,
+            processed_at: now,
             content: "Message in group 1".to_string(),
             tags: Tags::new(),
-            event: UnsignedEvent::new(
-                pubkey,
-                Timestamp::now(),
-                Kind::from(9u16),
-                vec![],
-                "content".to_string(),
-            ),
+            event: UnsignedEvent::new(pubkey, now, Kind::from(9u16), vec![], "content".to_string()),
             wrapper_event_id: wrapper_event_id_1,
             epoch: Some(1),
             state: MessageState::Created,
@@ -590,16 +615,11 @@ mod tests {
             pubkey,
             kind: Kind::from(1u16),
             mls_group_id: mls_group_id_2.clone(),
-            created_at: Timestamp::now(),
+            created_at: now,
+            processed_at: now,
             content: "Message in group 2".to_string(),
             tags: Tags::new(),
-            event: UnsignedEvent::new(
-                pubkey,
-                Timestamp::now(),
-                Kind::from(9u16),
-                vec![],
-                "content".to_string(),
-            ),
+            event: UnsignedEvent::new(pubkey, now, Kind::from(9u16), vec![], "content".to_string()),
             wrapper_event_id: wrapper_event_id_2,
             epoch: Some(2),
             state: MessageState::Created,
@@ -737,5 +757,97 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(found.state, ProcessedMessageState::Processed);
+    }
+
+    /// Verifies that %, _, and \ in content_substring are treated as literal
+    /// characters and not as SQL LIKE wildcards.
+    #[test]
+    fn test_find_message_epoch_by_tag_content_escapes_like_wildcards() {
+        let storage = MdkSqliteStorage::new_in_memory().unwrap();
+
+        let group_id = GroupId::from_slice(&[1, 2, 3, 4]);
+        let mut nostr_group_id = [0u8; 32];
+        nostr_group_id[0..4].copy_from_slice(&[1, 2, 3, 4]);
+
+        let group = Group {
+            mls_group_id: group_id.clone(),
+            nostr_group_id,
+            name: "Test Group".to_string(),
+            description: "A test group".to_string(),
+            admin_pubkeys: BTreeSet::new(),
+            last_message_id: None,
+            last_message_at: None,
+            last_message_processed_at: None,
+            epoch: 0,
+            state: GroupState::Active,
+            image_hash: None,
+            image_key: None,
+            image_nonce: None,
+            self_update_state: SelfUpdateState::Required,
+        };
+        storage.save_group(group).unwrap();
+
+        let pubkey =
+            PublicKey::parse("79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
+                .unwrap();
+        let event_id = EventId::from_slice(&[10u8; 32]).unwrap();
+        let wrapper_event_id = EventId::from_slice(&[200u8; 32]).unwrap();
+
+        // Store a message with tags containing "x abc" (no wildcards)
+        let tags = Tags::parse(vec![vec!["imeta", "x abc"]]).unwrap();
+        let message = Message {
+            id: event_id,
+            pubkey,
+            kind: Kind::from(445u16),
+            mls_group_id: group_id.clone(),
+            created_at: Timestamp::from(1000u64),
+            processed_at: Timestamp::from(1000u64),
+            content: "".to_string(),
+            tags: tags.clone(),
+            event: UnsignedEvent::new(
+                pubkey,
+                Timestamp::from(1000u64),
+                Kind::from(445u16),
+                tags,
+                "".to_string(),
+            ),
+            wrapper_event_id,
+            epoch: Some(42),
+            state: MessageState::Processed,
+        };
+        storage.save_message(message).unwrap();
+
+        // Searching for exact content should find it
+        let result = storage
+            .find_message_epoch_by_tag_content(&group_id, "x abc")
+            .unwrap();
+        assert_eq!(result, Some(42), "Exact substring should match");
+
+        // Searching with SQL wildcard % should NOT match (treated literally)
+        let result = storage
+            .find_message_epoch_by_tag_content(&group_id, "x%abc")
+            .unwrap();
+        assert_eq!(
+            result, None,
+            "% must be treated as a literal, not a wildcard"
+        );
+
+        // Searching with SQL wildcard _ should NOT match (treated literally)
+        let result = storage
+            .find_message_epoch_by_tag_content(&group_id, "x_abc")
+            .unwrap();
+        assert_eq!(
+            result, None,
+            "_ must be treated as a literal, not a wildcard"
+        );
+
+        // Searching with backslash should NOT match (treated literally)
+        let result = storage
+            .find_message_epoch_by_tag_content(&group_id, "x\\abc")
+            .unwrap();
+        assert_eq!(
+            result, None,
+            "\\ must be treated as a literal, not an escape"
+        );
     }
 }

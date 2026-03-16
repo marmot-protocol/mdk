@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Mutex;
 
+use mdk_core::encrypted_media::{EncryptedMediaUpload, MediaProcessingOptions, MediaReference};
 use mdk_core::{
     Error as MdkError, MDK, MdkConfig as CoreMdkConfig,
     extension::group_image::{
@@ -23,7 +24,7 @@ use mdk_core::{
 use mdk_sqlite_storage::{EncryptionConfig, MdkSqliteStorage};
 use mdk_storage_traits::{
     GroupId,
-    groups::{Pagination as MessagePagination, types as group_types},
+    groups::{MessageSortOrder, Pagination as MessagePagination, types as group_types},
     messages::types as message_types,
     welcomes::{Pagination as WelcomePagination, types as welcome_types},
 };
@@ -61,6 +62,12 @@ pub struct MdkConfig {
     /// Default: 1000
     pub maximum_forward_distance: Option<u32>,
 
+    /// Number of past MLS epochs for which application messages can be decrypted.
+    /// When a commit advances the group to epoch N+1, messages from epoch N that arrive
+    /// late can still be decrypted if the epoch delta is within this window.
+    /// Default: 5
+    pub max_past_epochs: Option<u32>,
+
     /// Number of epoch snapshots to retain for rollback support.
     /// Default: 5
     pub epoch_snapshot_retention: Option<u32>,
@@ -87,6 +94,10 @@ impl From<MdkConfig> for CoreMdkConfig {
             maximum_forward_distance: config
                 .maximum_forward_distance
                 .unwrap_or(defaults.maximum_forward_distance),
+            max_past_epochs: config
+                .max_past_epochs
+                .map(|v| v as usize)
+                .unwrap_or(defaults.max_past_epochs),
             epoch_snapshot_retention: config
                 .epoch_snapshot_retention
                 .map(|v| v as usize)
@@ -171,6 +182,19 @@ fn vec_to_array<const N: usize>(vec: Option<Vec<u8>>) -> Result<Option<[u8; N]>,
             bytes.len()
         ))),
         None => Ok(None),
+    }
+}
+
+fn parse_message_sort_order(
+    sort_order: Option<&str>,
+) -> Result<Option<MessageSortOrder>, MdkUniffiError> {
+    match sort_order {
+        None => Ok(None),
+        Some("created_at_first") => Ok(Some(MessageSortOrder::CreatedAtFirst)),
+        Some("processed_at_first") => Ok(Some(MessageSortOrder::ProcessedAtFirst)),
+        Some(other) => Err(MdkUniffiError::InvalidInput(format!(
+            "Invalid sort order: {other}. Expected \"created_at_first\" or \"processed_at_first\""
+        ))),
     }
 }
 
@@ -356,6 +380,10 @@ pub fn new_mdk_unencrypted(
 #[uniffi::export]
 impl Mdk {
     /// Create a key package for a Nostr event
+    ///
+    /// This function does NOT add the NIP-70 protected tag, ensuring maximum relay
+    /// compatibility. Many popular relays (Damus, Primal, nos.lol) reject protected events.
+    /// If you need the protected tag, use `create_key_package_for_event_with_options` instead.
     pub fn create_key_package_for_event(
         &self,
         public_key: String,
@@ -365,13 +393,47 @@ impl Mdk {
         let relay_urls = parse_relay_urls(&relays)?;
 
         let mdk = self.lock()?;
-        let (key_package_hex, tags) = mdk.create_key_package_for_event(&pubkey, relay_urls)?;
+        let (key_package_hex, tags, hash_ref) =
+            mdk.create_key_package_for_event(&pubkey, relay_urls)?;
 
         let tags: Vec<Vec<String>> = tags.iter().map(|tag| tag.as_slice().to_vec()).collect();
 
         Ok(KeyPackageResult {
             key_package: key_package_hex,
             tags,
+            hash_ref,
+        })
+    }
+
+    /// Create a key package for a Nostr event with additional options
+    ///
+    /// # Arguments
+    ///
+    /// * `public_key` - The Nostr public key (hex) for the credential
+    /// * `relays` - Relay URLs where the key package will be published
+    /// * `protected` - Whether to add the NIP-70 protected tag. When `true`, relays that
+    ///   implement NIP-70 will reject republishing by third parties. However, many popular
+    ///   relays reject protected events entirely. Set to `false` for maximum relay
+    ///   compatibility.
+    pub fn create_key_package_for_event_with_options(
+        &self,
+        public_key: String,
+        relays: Vec<String>,
+        protected: bool,
+    ) -> Result<KeyPackageResult, MdkUniffiError> {
+        let pubkey = parse_public_key(&public_key)?;
+        let relay_urls = parse_relay_urls(&relays)?;
+
+        let mdk = self.lock()?;
+        let (key_package_hex, tags, hash_ref) =
+            mdk.create_key_package_for_event_with_options(&pubkey, relay_urls, protected)?;
+
+        let tags: Vec<Vec<String>> = tags.iter().map(|tag| tag.as_slice().to_vec()).collect();
+
+        Ok(KeyPackageResult {
+            key_package: key_package_hex,
+            tags,
+            hash_ref,
         })
     }
 
@@ -398,6 +460,19 @@ impl Mdk {
         Ok(self.lock()?.get_group(&group_id)?.map(Group::from))
     }
 
+    /// Get group IDs that need a self-update (post-join or stale rotation).
+    pub fn groups_needing_self_update(
+        &self,
+        threshold_secs: u64,
+    ) -> Result<Vec<String>, MdkUniffiError> {
+        Ok(self
+            .lock()?
+            .groups_needing_self_update(threshold_secs)?
+            .into_iter()
+            .map(|id| hex::encode(id.as_slice()))
+            .collect())
+    }
+
     /// Get members of a group
     pub fn get_members(&self, mls_group_id: String) -> Result<Vec<String>, MdkUniffiError> {
         let group_id = parse_group_id(&mls_group_id)?;
@@ -416,23 +491,28 @@ impl Mdk {
     /// * `mls_group_id` - Hex-encoded MLS group ID
     /// * `limit` - Optional maximum number of messages to return (defaults to 1000 if None)
     /// * `offset` - Optional number of messages to skip (defaults to 0 if None)
+    /// * `sort_order` - Optional sort order: `"created_at_first"` (default) or `"processed_at_first"`
     ///
     /// # Returns
     ///
-    /// Returns a vector of messages ordered by creation time
+    /// Returns a vector of messages in the requested sort order
     pub fn get_messages(
         &self,
         mls_group_id: String,
         limit: Option<u32>,
         offset: Option<u32>,
+        sort_order: Option<String>,
     ) -> Result<Vec<Message>, MdkUniffiError> {
         let group_id = parse_group_id(&mls_group_id)?;
-        let pagination = match (limit, offset) {
-            (None, None) => None,
-            _ => Some(MessagePagination::new(
-                limit.map(|l| l as usize),
-                offset.map(|o| o as usize),
-            )),
+        let sort = parse_message_sort_order(sort_order.as_deref())?;
+        let pagination = match (limit, offset, sort) {
+            (None, None, None) => None,
+            _ => {
+                let mut p =
+                    MessagePagination::new(limit.map(|l| l as usize), offset.map(|o| o as usize));
+                p.sort_order = sort;
+                Some(p)
+            }
         };
         Ok(self
             .lock()?
@@ -462,6 +542,34 @@ impl Mdk {
         Ok(self
             .lock()?
             .get_message(&group_id, &event_id)?
+            .map(Message::from))
+    }
+
+    /// Get the most recent message in a group according to the given sort order
+    ///
+    /// This is useful for clients that use `"processed_at_first"` sort order and need
+    /// a "last message" value that is consistent with their `get_messages()` ordering.
+    /// The cached `group.last_message_id` always reflects `"created_at_first"` ordering.
+    ///
+    /// # Arguments
+    ///
+    /// * `mls_group_id` - Hex-encoded MLS group ID
+    /// * `sort_order` - Sort order: `"created_at_first"` or `"processed_at_first"`
+    ///
+    /// # Returns
+    ///
+    /// Returns the most recent message under the given ordering, or None if the group has no messages
+    pub fn get_last_message(
+        &self,
+        mls_group_id: String,
+        sort_order: String,
+    ) -> Result<Option<Message>, MdkUniffiError> {
+        let group_id = parse_group_id(&mls_group_id)?;
+        let sort = parse_message_sort_order(Some(&sort_order))?
+            .ok_or_else(|| MdkUniffiError::InvalidInput("sort_order is required".to_string()))?;
+        Ok(self
+            .lock()?
+            .get_last_message(&group_id, sort)?
             .map(Message::from))
     }
 
@@ -696,6 +804,23 @@ impl Mdk {
     pub fn merge_pending_commit(&self, mls_group_id: String) -> Result<(), MdkUniffiError> {
         let group_id = parse_group_id(&mls_group_id)?;
         self.lock()?.merge_pending_commit(&group_id)?;
+        Ok(())
+    }
+
+    /// Clear pending commit for a group
+    ///
+    /// This rolls back the group to its pre-commit state — no epoch advance, no member changes.
+    /// Call this when publish exhausts retries to recover from failed relay publishes.
+    ///
+    /// # Arguments
+    /// * `mls_group_id` - The MLS group ID to clear the pending commit for (hex-encoded)
+    ///
+    /// # Returns
+    /// * `Ok(())` - if the pending commit was cleared successfully
+    /// * `Err` - if the group doesn't exist or another error occurs
+    pub fn clear_pending_commit(&self, mls_group_id: String) -> Result<(), MdkUniffiError> {
+        let group_id = parse_group_id(&mls_group_id)?;
+        self.lock()?.clear_pending_commit(&group_id)?;
         Ok(())
     }
 
@@ -958,6 +1083,8 @@ pub struct KeyPackageResult {
     pub key_package: String,
     /// JSON-encoded tags for the key package event
     pub tags: Vec<Vec<String>>,
+    /// Serialized hash_ref bytes for the key package (for lifecycle tracking)
+    pub hash_ref: Vec<u8>,
 }
 
 /// Result of creating a group
@@ -1068,12 +1195,22 @@ pub struct Group {
     pub admin_pubkeys: Vec<String>,
     /// Last message event ID (hex-encoded)
     pub last_message_id: Option<String>,
-    /// Timestamp of last message (Unix timestamp)
+    /// Timestamp of last message (Unix timestamp, sender's `created_at`)
     pub last_message_at: Option<u64>,
+    /// Timestamp when the last message was processed/received (Unix timestamp)
+    ///
+    /// This differs from `last_message_at` which reflects the sender's timestamp.
+    /// `last_message_processed_at` reflects when this client received the message,
+    /// which may differ due to network delays or clock skew.
+    pub last_message_processed_at: Option<u64>,
     /// Current epoch number
     pub epoch: u64,
     /// Group state (e.g., "active", "archived")
     pub state: String,
+    /// Self-update tracking state.
+    /// - `"required"`: Must perform a post-join self-update (MIP-02).
+    /// - `"completed_at:<unix_timestamp>"`: Last self-update merged at this time (MIP-00).
+    pub self_update_state: String,
 }
 
 impl From<group_types::Group> for Group {
@@ -1089,8 +1226,15 @@ impl From<group_types::Group> for Group {
             admin_pubkeys: g.admin_pubkeys.iter().map(|pk| pk.to_hex()).collect(),
             last_message_id: g.last_message_id.map(|id| id.to_hex()),
             last_message_at: g.last_message_at.map(|ts| ts.as_secs()),
+            last_message_processed_at: g.last_message_processed_at.map(|ts| ts.as_secs()),
             epoch: g.epoch,
             state: g.state.as_str().to_string(),
+            self_update_state: match g.self_update_state {
+                group_types::SelfUpdateState::Required => "required".to_string(),
+                group_types::SelfUpdateState::CompletedAt(ts) => {
+                    format!("completed_at:{}", ts.as_secs())
+                }
+            },
         }
     }
 }
@@ -1110,8 +1254,14 @@ pub struct Message {
     pub sender_pubkey: String,
     /// JSON representation of the event
     pub event_json: String,
-    /// Timestamp when message was created (Unix timestamp)
+    /// Timestamp when message was created by the sender (Unix timestamp).
+    /// Note: This timestamp comes from the sender's device and may differ
+    /// from `processed_at` due to clock skew between devices.
     pub created_at: u64,
+    /// Timestamp when this client processed/received the message (Unix timestamp).
+    /// This is useful for clients that want to display messages in the order
+    /// they were received locally, rather than in the order they were created.
+    pub processed_at: u64,
     /// Message kind
     pub kind: u16,
     /// Message state (e.g., "processed", "pending")
@@ -1142,6 +1292,7 @@ impl From<message_types::Message> for Message {
             sender_pubkey: m.pubkey.to_hex(),
             event_json,
             created_at: m.created_at.as_secs(),
+            processed_at: m.processed_at.as_secs(),
             kind: m.kind.as_u16(),
             state: m.state.as_str().to_string(),
         }
@@ -1316,6 +1467,366 @@ pub fn derive_upload_keypair(image_key: Vec<u8>, version: u16) -> Result<String,
     Ok(keys.secret_key().to_secret_hex())
 }
 
+// ── MIP-04: Encrypted Media ──────────────────────────────────────────────────
+
+/// Options for controlling media processing during encryption
+///
+/// `max_dimension`, `max_file_size`, and `max_filename_length` are optional and
+/// fall back to sensible, privacy-first defaults when `None`.
+/// `sanitize_exif` and `generate_blurhash` are explicit toggles; pass `None` to
+/// accept the privacy-first defaults (`true` for both).
+/// To use all defaults without constructing this struct, call
+/// `encrypt_media_for_upload`.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct MediaProcessingOptionsInput {
+    /// Strip EXIF and other metadata from images for privacy (default: `true`)
+    pub sanitize_exif: Option<bool>,
+    /// Generate a blurhash preview string for images (default: `true`)
+    pub generate_blurhash: Option<bool>,
+    /// Maximum allowed image dimension in pixels (default: 16384)
+    pub max_dimension: Option<u32>,
+    /// Maximum allowed file size in bytes (default: 100 MiB)
+    pub max_file_size: Option<u64>,
+    /// Maximum allowed filename length in characters (default: 210)
+    pub max_filename_length: Option<u64>,
+}
+
+impl TryFrom<MediaProcessingOptionsInput> for MediaProcessingOptions {
+    type Error = std::num::TryFromIntError;
+
+    fn try_from(o: MediaProcessingOptionsInput) -> Result<Self, Self::Error> {
+        Ok(Self {
+            sanitize_exif: o.sanitize_exif.unwrap_or(true),
+            generate_blurhash: o.generate_blurhash.unwrap_or(true),
+            max_dimension: o.max_dimension,
+            max_file_size: o.max_file_size.map(usize::try_from).transpose()?,
+            max_filename_length: o.max_filename_length.map(usize::try_from).transpose()?,
+        })
+    }
+}
+
+/// Result of encrypting media for upload
+///
+/// Contains the encrypted bytes ready for upload to a Blossom server, along
+/// with the metadata required to build the IMETA tag and later decrypt the file.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct EncryptedMediaUploadResult {
+    /// Encrypted media bytes — upload these to your Blossom server
+    pub encrypted_data: Vec<u8>,
+    /// SHA-256 hash of the original (pre-encryption, post-sanitization) data
+    pub original_hash: Vec<u8>,
+    /// SHA-256 hash of the encrypted data — verify against the Blossom server response
+    pub encrypted_hash: Vec<u8>,
+    /// Canonical MIME type of the original media (e.g. `"image/webp"`)
+    pub mime_type: String,
+    /// Original filename
+    pub filename: String,
+    /// Size of the original data in bytes
+    pub original_size: u64,
+    /// Size of the encrypted data in bytes
+    pub encrypted_size: u64,
+    /// Image dimensions `[width, height]` if the media is an image, otherwise `None`
+    pub dimensions: Option<Vec<u32>>,
+    /// Blurhash preview string if generated, otherwise `None`
+    pub blurhash: Option<String>,
+    /// 12-byte ChaCha20-Poly1305 nonce used for encryption
+    pub nonce: Vec<u8>,
+}
+
+impl TryFrom<EncryptedMediaUpload> for EncryptedMediaUploadResult {
+    type Error = MdkUniffiError;
+
+    fn try_from(u: EncryptedMediaUpload) -> Result<Self, Self::Error> {
+        Ok(Self {
+            encrypted_data: u.encrypted_data,
+            original_hash: u.original_hash.to_vec(),
+            encrypted_hash: u.encrypted_hash.to_vec(),
+            mime_type: u.mime_type,
+            filename: u.filename,
+            original_size: u.original_size,
+            encrypted_size: u.encrypted_size,
+            dimensions: u.dimensions.map(|(w, h)| vec![w, h]),
+            blurhash: u.blurhash,
+            nonce: u.nonce.to_vec(),
+        })
+    }
+}
+
+/// A reference to an encrypted media file stored on a Blossom server
+///
+/// This is parsed from an IMETA tag (via `parse_media_imeta_tag`) and passed
+/// to `decrypt_media_from_download` to retrieve the original file.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct MediaReferenceRecord {
+    /// URL where the encrypted file is stored
+    pub url: String,
+    /// SHA-256 hash of the original (pre-encryption) data — 32 bytes
+    pub original_hash: Vec<u8>,
+    /// MIME type of the original media
+    pub mime_type: String,
+    /// Original filename
+    pub filename: String,
+    /// Image dimensions `[width, height]` if the media is an image, otherwise `None`
+    pub dimensions: Option<Vec<u32>>,
+    /// Encryption scheme version (e.g. `"mip04-v2"`)
+    pub scheme_version: String,
+    /// 12-byte ChaCha20-Poly1305 nonce — 12 bytes
+    pub nonce: Vec<u8>,
+}
+
+impl TryFrom<MediaReferenceRecord> for MediaReference {
+    type Error = MdkUniffiError;
+
+    fn try_from(r: MediaReferenceRecord) -> Result<Self, Self::Error> {
+        let original_hash: [u8; 32] = r.original_hash.try_into().map_err(|_| {
+            MdkUniffiError::InvalidInput("original_hash must be 32 bytes".to_string())
+        })?;
+        let nonce: [u8; 12] = r
+            .nonce
+            .try_into()
+            .map_err(|_| MdkUniffiError::InvalidInput("nonce must be 12 bytes".to_string()))?;
+        let dimensions = r
+            .dimensions
+            .map(|d| {
+                if d.len() == 2 {
+                    Ok((d[0], d[1]))
+                } else {
+                    Err(MdkUniffiError::InvalidInput(
+                        "dimensions must be a two-element array [width, height]".to_string(),
+                    ))
+                }
+            })
+            .transpose()?;
+        Ok(Self {
+            url: r.url,
+            original_hash,
+            mime_type: r.mime_type,
+            filename: r.filename,
+            dimensions,
+            scheme_version: r.scheme_version,
+            nonce,
+        })
+    }
+}
+
+impl From<MediaReference> for MediaReferenceRecord {
+    fn from(r: MediaReference) -> Self {
+        Self {
+            url: r.url,
+            original_hash: r.original_hash.to_vec(),
+            mime_type: r.mime_type,
+            filename: r.filename,
+            dimensions: r.dimensions.map(|(w, h)| vec![w, h]),
+            scheme_version: r.scheme_version,
+            nonce: r.nonce.to_vec(),
+        }
+    }
+}
+
+// ── MIP-04 methods on Mdk ────────────────────────────────────────────────────
+
+#[uniffi::export]
+impl Mdk {
+    /// Encrypt media for upload using default processing options
+    ///
+    /// Encrypts the supplied media file with the group's current MLS epoch key,
+    /// producing ciphertext ready to upload to a Blossom server. Images are
+    /// automatically EXIF-sanitized and a blurhash preview is generated.
+    ///
+    /// After uploading the encrypted bytes, call `create_media_imeta_tag` with
+    /// the returned result and the Blossom URL to build the IMETA tag to attach
+    /// to the group message.
+    ///
+    /// # Arguments
+    ///
+    /// * `mls_group_id` - Hex-encoded MLS group ID
+    /// * `data` - Raw media file bytes
+    /// * `mime_type` - MIME type of the media (e.g. `"image/jpeg"`)
+    /// * `filename` - Original filename (used as AAD in the encryption)
+    pub fn encrypt_media_for_upload(
+        &self,
+        mls_group_id: String,
+        data: Vec<u8>,
+        mime_type: String,
+        filename: String,
+    ) -> Result<EncryptedMediaUploadResult, MdkUniffiError> {
+        let group_id = parse_group_id(&mls_group_id)?;
+        let mdk = self.lock()?;
+        let upload = mdk
+            .media_manager(group_id)
+            .encrypt_for_upload(&data, &mime_type, &filename)
+            .map_err(|e| MdkUniffiError::Mdk(e.to_string()))?;
+        EncryptedMediaUploadResult::try_from(upload)
+    }
+
+    /// Encrypt media for upload with custom processing options
+    ///
+    /// Same as `encrypt_media_for_upload` but lets you override EXIF sanitization,
+    /// blurhash generation, and size/dimension limits.
+    ///
+    /// # Arguments
+    ///
+    /// * `mls_group_id` - Hex-encoded MLS group ID
+    /// * `data` - Raw media file bytes
+    /// * `mime_type` - MIME type of the media (e.g. `"image/jpeg"`)
+    /// * `filename` - Original filename (used as AAD in the encryption)
+    /// * `options` - Custom processing options
+    pub fn encrypt_media_for_upload_with_options(
+        &self,
+        mls_group_id: String,
+        data: Vec<u8>,
+        mime_type: String,
+        filename: String,
+        options: MediaProcessingOptionsInput,
+    ) -> Result<EncryptedMediaUploadResult, MdkUniffiError> {
+        let group_id = parse_group_id(&mls_group_id)?;
+        let core_options = MediaProcessingOptions::try_from(options)
+            .map_err(|e| MdkUniffiError::InvalidInput(e.to_string()))?;
+        let mdk = self.lock()?;
+        let upload = mdk
+            .media_manager(group_id)
+            .encrypt_for_upload_with_options(&data, &mime_type, &filename, &core_options)
+            .map_err(|e| MdkUniffiError::Mdk(e.to_string()))?;
+        EncryptedMediaUploadResult::try_from(upload)
+    }
+
+    /// Decrypt media downloaded from a Blossom server
+    ///
+    /// Decrypts the encrypted bytes using the key derived from the group's MLS
+    /// epoch that was active when the file was encrypted (looked up automatically
+    /// via the epoch hint stored alongside the message). Falls back to the current
+    /// epoch if no hint is available.
+    ///
+    /// The `reference` parameter is typically obtained by calling
+    /// `parse_media_imeta_tag` on the IMETA tag attached to the message.
+    ///
+    /// # Arguments
+    ///
+    /// * `mls_group_id` - Hex-encoded MLS group ID
+    /// * `encrypted_data` - Encrypted bytes downloaded from the Blossom server
+    /// * `reference` - Parsed media reference (from `parse_media_imeta_tag`)
+    pub fn decrypt_media_from_download(
+        &self,
+        mls_group_id: String,
+        encrypted_data: Vec<u8>,
+        reference: MediaReferenceRecord,
+    ) -> Result<Vec<u8>, MdkUniffiError> {
+        let group_id = parse_group_id(&mls_group_id)?;
+        let core_reference = MediaReference::try_from(reference)?;
+        let mdk = self.lock()?;
+        mdk.media_manager(group_id)
+            .decrypt_from_download(&encrypted_data, &core_reference)
+            .map_err(|e| MdkUniffiError::Mdk(e.to_string()))
+    }
+
+    /// Build an IMETA tag for an encrypted media upload
+    ///
+    /// Creates the IMETA Nostr tag per the MIP-04 specification. Attach this tag
+    /// to the group message event after uploading the encrypted bytes to Blossom.
+    ///
+    /// Returns the tag as a `Vec<Vec<String>>` (the standard UniFFI tag format).
+    ///
+    /// # Arguments
+    ///
+    /// * `mls_group_id` - Hex-encoded MLS group ID
+    /// * `upload` - The result returned by `encrypt_media_for_upload`
+    /// * `uploaded_url` - The URL returned by the Blossom server after upload
+    pub fn create_media_imeta_tag(
+        &self,
+        mls_group_id: String,
+        upload: EncryptedMediaUploadResult,
+        uploaded_url: String,
+    ) -> Result<Vec<Vec<String>>, MdkUniffiError> {
+        let group_id = parse_group_id(&mls_group_id)?;
+        let core_upload = EncryptedMediaUpload::try_from(upload)?;
+        let mdk = self.lock()?;
+        let tag = mdk
+            .media_manager(group_id)
+            .create_imeta_tag(&core_upload, &uploaded_url);
+        Ok(vec![tag.as_slice().to_vec()])
+    }
+
+    /// Parse an IMETA tag into a `MediaReferenceRecord` for decryption
+    ///
+    /// Validates and decodes the IMETA tag fields according to the MIP-04
+    /// specification. The returned record can be passed directly to
+    /// `decrypt_media_from_download`.
+    ///
+    /// The tag must be provided as a single-element `Vec<Vec<String>>` — the
+    /// same format returned by `create_media_imeta_tag` and the standard UniFFI
+    /// tag wire format.
+    ///
+    /// # Arguments
+    ///
+    /// * `mls_group_id` - Hex-encoded MLS group ID
+    /// * `imeta_tag` - IMETA tag as `Vec<Vec<String>>`
+    pub fn parse_media_imeta_tag(
+        &self,
+        mls_group_id: String,
+        imeta_tag: Vec<Vec<String>>,
+    ) -> Result<MediaReferenceRecord, MdkUniffiError> {
+        let group_id = parse_group_id(&mls_group_id)?;
+        let tags = parse_tags(imeta_tag)?;
+        if tags.len() != 1 {
+            return Err(MdkUniffiError::InvalidInput(
+                "Expected exactly one IMETA tag".to_string(),
+            ));
+        }
+        let tag = tags.into_iter().next().ok_or_else(|| {
+            MdkUniffiError::InvalidInput("Expected exactly one IMETA tag".to_string())
+        })?;
+        let mdk = self.lock()?;
+        let reference = mdk
+            .media_manager(group_id)
+            .parse_imeta_tag(&tag)
+            .map_err(|e| MdkUniffiError::Mdk(e.to_string()))?;
+        Ok(MediaReferenceRecord::from(reference))
+    }
+}
+
+// ── MIP-04 TryFrom for EncryptedMediaUpload (reverse direction for imeta tag) ─
+
+impl TryFrom<EncryptedMediaUploadResult> for EncryptedMediaUpload {
+    type Error = MdkUniffiError;
+
+    fn try_from(r: EncryptedMediaUploadResult) -> Result<Self, Self::Error> {
+        let original_hash: [u8; 32] = r.original_hash.try_into().map_err(|_| {
+            MdkUniffiError::InvalidInput("original_hash must be 32 bytes".to_string())
+        })?;
+        let encrypted_hash: [u8; 32] = r.encrypted_hash.try_into().map_err(|_| {
+            MdkUniffiError::InvalidInput("encrypted_hash must be 32 bytes".to_string())
+        })?;
+        let nonce: [u8; 12] = r
+            .nonce
+            .try_into()
+            .map_err(|_| MdkUniffiError::InvalidInput("nonce must be 12 bytes".to_string()))?;
+        let dimensions = r
+            .dimensions
+            .map(|d| {
+                if d.len() == 2 {
+                    Ok((d[0], d[1]))
+                } else {
+                    Err(MdkUniffiError::InvalidInput(
+                        "dimensions must be a two-element array [width, height]".to_string(),
+                    ))
+                }
+            })
+            .transpose()?;
+        Ok(Self {
+            encrypted_data: r.encrypted_data,
+            original_hash,
+            encrypted_hash,
+            mime_type: r.mime_type,
+            filename: r.filename,
+            original_size: r.original_size,
+            encrypted_size: r.encrypted_size,
+            dimensions,
+            blurhash: r.blurhash,
+            nonce,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1382,6 +1893,7 @@ mod tests {
             max_future_skew_secs: Some(60),      // 1 minute
             out_of_order_tolerance: Some(50),    // 50 past messages
             maximum_forward_distance: Some(500), // 500 forward messages
+            max_past_epochs: Some(5),            // 5 past epochs
             epoch_snapshot_retention: Some(5),   // 5 snapshots
             snapshot_ttl_seconds: Some(604800),  // 1 week
         };
@@ -1404,6 +1916,7 @@ mod tests {
             max_future_skew_secs: None,
             out_of_order_tolerance: Some(200), // Only override this one
             maximum_forward_distance: None,
+            max_past_epochs: None,
             epoch_snapshot_retention: None,
             snapshot_ttl_seconds: None,
         };
@@ -1423,6 +1936,7 @@ mod tests {
             max_future_skew_secs: None,
             out_of_order_tolerance: None,
             maximum_forward_distance: None,
+            max_past_epochs: None,
             epoch_snapshot_retention: None,
             snapshot_ttl_seconds: None,
         };
@@ -1432,6 +1946,7 @@ mod tests {
         assert_eq!(core_config.max_future_skew_secs, 300);
         assert_eq!(core_config.out_of_order_tolerance, 100);
         assert_eq!(core_config.maximum_forward_distance, 1000);
+        assert_eq!(core_config.max_past_epochs, 5);
         assert_eq!(core_config.epoch_snapshot_retention, 5);
         assert_eq!(core_config.snapshot_ttl_seconds, 604800);
     }
@@ -1448,6 +1963,10 @@ mod tests {
         let key_package_result = result.unwrap();
         assert!(!key_package_result.key_package.is_empty());
         assert!(!key_package_result.tags.is_empty());
+        assert!(
+            !key_package_result.hash_ref.is_empty(),
+            "hash_ref should be non-empty"
+        );
     }
 
     #[test]
@@ -1508,7 +2027,7 @@ mod tests {
     fn test_get_messages_empty_group() {
         let mdk = create_test_mdk();
         let fake_group_id = hex::encode([0u8; 32]);
-        let result = mdk.get_messages(fake_group_id, None, None);
+        let result = mdk.get_messages(fake_group_id, None, None, None);
         // Should return error for non-existent group
         assert!(result.is_err());
     }
@@ -1565,13 +2084,18 @@ mod tests {
 
         // Test 1: Get with default pagination (None, None)
         let default_messages = mdk
-            .get_messages(create_result.group.mls_group_id.clone(), None, None)
+            .get_messages(create_result.group.mls_group_id.clone(), None, None, None)
             .unwrap();
         assert_eq!(default_messages.len(), 1, "Should have 1 message");
 
         // Test 2: Get with explicit limit and offset
         let paginated = mdk
-            .get_messages(create_result.group.mls_group_id.clone(), Some(10), Some(0))
+            .get_messages(
+                create_result.group.mls_group_id.clone(),
+                Some(10),
+                Some(0),
+                None,
+            )
             .unwrap();
         assert_eq!(paginated.len(), 1, "Should have 1 message with pagination");
 
@@ -1581,6 +2105,7 @@ mod tests {
                 create_result.group.mls_group_id.clone(),
                 Some(10),
                 Some(100),
+                None,
             )
             .unwrap();
         assert_eq!(
@@ -1591,7 +2116,12 @@ mod tests {
 
         // Test 4: Get with limit 1
         let limited = mdk
-            .get_messages(create_result.group.mls_group_id.clone(), Some(1), Some(0))
+            .get_messages(
+                create_result.group.mls_group_id.clone(),
+                Some(1),
+                Some(0),
+                None,
+            )
             .unwrap();
         assert_eq!(
             limited.len(),
@@ -2305,5 +2835,209 @@ mod tests {
         let result = parse_tags(tags);
         assert!(result.is_ok());
         assert_eq!(result.unwrap().len(), 0);
+    }
+
+    // ── MIP-04 encrypted media tests ─────────────────────────────────────────
+
+    #[cfg(feature = "mip04")]
+    mod mip04 {
+        use nostr::{EventBuilder, Keys, Kind, Tag};
+
+        use super::*;
+
+        /// Small binary test payload — used as a stand-in for any file type that
+        /// does NOT trigger image-specific metadata extraction (we use application/octet-stream).
+        const TEST_PAYLOAD: &[u8] = b"hello encrypted media round-trip test payload";
+
+        fn create_test_group(mdk: &Mdk) -> String {
+            let creator_keys = Keys::generate();
+            let member_keys = Keys::generate();
+            let relays = vec!["wss://relay.example.com".to_string()];
+
+            let key_package_result = mdk
+                .create_key_package_for_event(member_keys.public_key().to_hex(), relays.clone())
+                .unwrap();
+
+            let key_package_event =
+                EventBuilder::new(Kind::MlsKeyPackage, key_package_result.key_package)
+                    .tags(
+                        key_package_result
+                            .tags
+                            .iter()
+                            .map(|t| Tag::parse(t.clone()).unwrap())
+                            .collect::<Vec<_>>(),
+                    )
+                    .sign_with_keys(&member_keys)
+                    .unwrap();
+
+            let result = mdk
+                .create_group(
+                    creator_keys.public_key().to_hex(),
+                    vec![serde_json::to_string(&key_package_event).unwrap()],
+                    "Test Group".to_string(),
+                    "Test Description".to_string(),
+                    relays,
+                    vec![creator_keys.public_key().to_hex()],
+                )
+                .unwrap();
+
+            result.group.mls_group_id
+        }
+
+        #[test]
+        fn test_decrypt_media_invalid_nonce_length() {
+            let mdk = create_test_mdk();
+            let group_id = create_test_group(&mdk);
+
+            let bad_reference = MediaReferenceRecord {
+                url: "https://blossom.example.com/abc.jpg".to_string(),
+                original_hash: vec![0u8; 32],
+                mime_type: "image/jpeg".to_string(),
+                filename: "test.jpg".to_string(),
+                dimensions: None,
+                scheme_version: "mip04-v2".to_string(),
+                nonce: vec![0u8; 8], // wrong length — should be 12
+            };
+
+            let result = mdk.decrypt_media_from_download(group_id, vec![0u8; 64], bad_reference);
+            assert!(matches!(result, Err(MdkUniffiError::InvalidInput(_))));
+        }
+
+        #[test]
+        fn test_encrypt_media_for_upload_returns_encrypted_data() {
+            let mdk = create_test_mdk();
+            let group_id = create_test_group(&mdk);
+
+            let result = mdk.encrypt_media_for_upload(
+                group_id,
+                TEST_PAYLOAD.to_vec(),
+                "application/octet-stream".to_string(),
+                "test.bin".to_string(),
+            );
+
+            assert!(
+                result.is_ok(),
+                "encrypt_media_for_upload failed: {result:?}"
+            );
+            let upload = result.unwrap();
+            assert!(!upload.encrypted_data.is_empty());
+            assert_eq!(upload.original_hash.len(), 32);
+            assert_eq!(upload.encrypted_hash.len(), 32);
+            assert_eq!(upload.nonce.len(), 12);
+            assert_eq!(upload.mime_type, "application/octet-stream");
+            assert_eq!(upload.filename, "test.bin");
+        }
+
+        #[test]
+        fn test_encrypt_decrypt_round_trip() {
+            let mdk = create_test_mdk();
+            let group_id = create_test_group(&mdk);
+
+            let upload = mdk
+                .encrypt_media_for_upload(
+                    group_id.clone(),
+                    TEST_PAYLOAD.to_vec(),
+                    "application/octet-stream".to_string(),
+                    "payload.bin".to_string(),
+                )
+                .unwrap();
+
+            // Build a MediaReferenceRecord directly from the upload result
+            let reference = MediaReferenceRecord {
+                url: "https://blossom.example.com/abc123.bin".to_string(),
+                original_hash: upload.original_hash.clone(),
+                mime_type: upload.mime_type.clone(),
+                filename: upload.filename.clone(),
+                dimensions: upload.dimensions.clone(),
+                scheme_version: "mip04-v2".to_string(),
+                nonce: upload.nonce.clone(),
+            };
+
+            let decrypted = mdk
+                .decrypt_media_from_download(group_id, upload.encrypted_data.clone(), reference)
+                .unwrap();
+
+            // Decrypted data must not be empty and must not equal the ciphertext
+            assert!(!decrypted.is_empty());
+            assert_ne!(decrypted, upload.encrypted_data);
+            assert_eq!(decrypted, TEST_PAYLOAD);
+        }
+
+        #[test]
+        fn test_create_and_parse_imeta_tag_round_trip() {
+            let mdk = create_test_mdk();
+            let group_id = create_test_group(&mdk);
+
+            let upload = mdk
+                .encrypt_media_for_upload(
+                    group_id.clone(),
+                    TEST_PAYLOAD.to_vec(),
+                    "application/octet-stream".to_string(),
+                    "payload.bin".to_string(),
+                )
+                .unwrap();
+
+            let uploaded_url = "https://blossom.example.com/abc123.bin".to_string();
+            let imeta_tag = mdk
+                .create_media_imeta_tag(group_id.clone(), upload.clone(), uploaded_url.clone())
+                .unwrap();
+
+            assert_eq!(imeta_tag.len(), 1, "Expected exactly one tag");
+            let tag_inner = &imeta_tag[0];
+            assert_eq!(tag_inner[0], "imeta");
+
+            // Round-trip: parse the tag back into a MediaReferenceRecord
+            let reference = mdk
+                .parse_media_imeta_tag(group_id.clone(), imeta_tag)
+                .unwrap();
+
+            assert_eq!(reference.url, uploaded_url);
+            assert_eq!(reference.mime_type, "application/octet-stream");
+            assert_eq!(reference.filename, "payload.bin");
+            assert_eq!(reference.original_hash, upload.original_hash);
+            assert_eq!(reference.nonce, upload.nonce);
+            assert_eq!(reference.scheme_version, "mip04-v2");
+        }
+
+        #[test]
+        fn test_encrypt_with_options_no_blurhash() {
+            let mdk = create_test_mdk();
+            let group_id = create_test_group(&mdk);
+
+            let options = MediaProcessingOptionsInput {
+                sanitize_exif: Some(true),
+                generate_blurhash: Some(false),
+                max_dimension: None,
+                max_file_size: None,
+                max_filename_length: None,
+            };
+
+            let result = mdk.encrypt_media_for_upload_with_options(
+                group_id,
+                TEST_PAYLOAD.to_vec(),
+                "application/octet-stream".to_string(),
+                "test.bin".to_string(),
+                options,
+            );
+
+            assert!(result.is_ok(), "{result:?}");
+            let upload = result.unwrap();
+            assert!(
+                upload.blurhash.is_none(),
+                "Expected no blurhash when generate_blurhash = false"
+            );
+        }
+
+        #[test]
+        fn test_encrypt_media_invalid_group_id() {
+            let mdk = create_test_mdk();
+            let result = mdk.encrypt_media_for_upload(
+                "not_valid_hex".to_string(),
+                TEST_PAYLOAD.to_vec(),
+                "application/octet-stream".to_string(),
+                "test.bin".to_string(),
+            );
+            assert!(matches!(result, Err(MdkUniffiError::InvalidInput(_))));
+        }
     }
 }

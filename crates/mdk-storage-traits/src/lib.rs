@@ -1,4 +1,4 @@
-//! Nostr MLS storage - A set of storage provider traits and types for implementing MLS storage
+//! MDK storage - A set of storage provider traits and types for implementing MLS storage
 //! It is designed to be used in conjunction with the `openmls` crate.
 
 #![deny(unsafe_code)]
@@ -48,7 +48,7 @@ impl Backend {
     }
 }
 
-/// Storage provider for the Nostr MLS storage.
+/// Storage provider for MDK.
 ///
 /// This trait combines all MDK storage requirements with the OpenMLS
 /// `StorageProvider` trait, enabling unified storage implementations

@@ -29,6 +29,21 @@ test_sqlite_storage!(
 );
 
 test_sqlite_storage!(
+    test_group_mip04_exporter_secret_sqlite,
+    shared::group_tests::test_group_mip04_exporter_secret
+);
+
+test_sqlite_storage!(
+    test_exporter_secret_label_isolation_sqlite,
+    shared::group_tests::test_exporter_secret_label_isolation
+);
+
+test_sqlite_storage!(
+    test_exporter_secret_pruning_by_epoch_sqlite,
+    shared::group_tests::test_exporter_secret_pruning_by_epoch
+);
+
+test_sqlite_storage!(
     test_basic_group_relays_sqlite,
     shared::group_tests::test_basic_group_relays
 );
@@ -91,6 +106,26 @@ test_sqlite_storage!(
 test_sqlite_storage!(
     test_group_relays_error_for_nonexistent_group_sqlite,
     shared::group_tests::test_group_relays_error_for_nonexistent_group
+);
+
+test_sqlite_storage!(
+    test_messages_sort_order_sqlite,
+    shared::group_tests::test_messages_sort_order
+);
+
+test_sqlite_storage!(
+    test_messages_sort_order_pagination_sqlite,
+    shared::group_tests::test_messages_sort_order_pagination
+);
+
+test_sqlite_storage!(
+    test_last_message_sqlite,
+    shared::group_tests::test_last_message
+);
+
+test_sqlite_storage!(
+    test_groups_needing_self_update_sqlite,
+    shared::group_tests::test_groups_needing_self_update
 );
 
 // Welcome functionality tests

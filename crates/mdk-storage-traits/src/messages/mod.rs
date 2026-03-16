@@ -92,4 +92,22 @@ pub trait MessageStorage {
     /// Returns `Ok(())` if the message was successfully marked as retryable,
     /// or `Err(MessageError::NotFound)` if no failed message with that event ID exists.
     fn mark_processed_message_retryable(&self, event_id: &EventId) -> Result<(), MessageError>;
+
+    /// Find the epoch of a message whose tags contain the given substring.
+    ///
+    /// This is used by encrypted media decryption to look up the epoch at which
+    /// a file was originally shared, avoiding brute-force iteration over all
+    /// historical epoch secrets. The caller typically searches for the IMETA tag's
+    /// `x <hex_hash>` field which uniquely identifies the media file.
+    ///
+    /// `content_substring` is treated as a literal substring match. SQL backends
+    /// must escape `%` and `_` characters to prevent LIKE wildcard expansion.
+    ///
+    /// Returns `Ok(Some(epoch))` if a matching message with a non-null epoch is found,
+    /// `Ok(None)` if no match exists.
+    fn find_message_epoch_by_tag_content(
+        &self,
+        group_id: &GroupId,
+        content_substring: &str,
+    ) -> Result<Option<u64>, MessageError>;
 }

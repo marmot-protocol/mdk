@@ -5,7 +5,9 @@ use std::io::{Error as IoError, ErrorKind};
 use std::str::FromStr;
 
 use mdk_storage_traits::GroupId;
-use mdk_storage_traits::groups::types::{Group, GroupExporterSecret, GroupRelay, GroupState};
+use mdk_storage_traits::groups::types::{
+    Group, GroupExporterSecret, GroupRelay, GroupState, SelfUpdateState,
+};
 use mdk_storage_traits::messages::types::{
     Message, MessageState, ProcessedMessage, ProcessedMessageState,
 };
@@ -149,6 +151,7 @@ pub fn row_to_group(row: &Row) -> SqliteResult<Group> {
 
     let last_message_id_blob: Option<&[u8]> = row.get_ref("last_message_id")?.as_blob_or_null()?;
     let last_message_at: Option<u64> = row.get("last_message_at")?;
+    let last_message_processed_at: Option<u64> = row.get("last_message_processed_at")?;
     let last_message_id: Option<EventId> = match last_message_id_blob {
         Some(id_blob) => Some(
             EventId::from_slice(id_blob)
@@ -157,12 +160,19 @@ pub fn row_to_group(row: &Row) -> SqliteResult<Group> {
         None => None,
     };
     let last_message_at: Option<Timestamp> = last_message_at.map(Timestamp::from_secs);
+    let last_message_processed_at: Option<Timestamp> =
+        last_message_processed_at.map(Timestamp::from_secs);
 
     let state: &str = row.get_ref("state")?.as_str()?;
     let state: GroupState =
         GroupState::from_str(state).map_err(|_| map_invalid_text_data("Invalid group state"))?;
 
     let epoch: u64 = row.get("epoch")?;
+
+    let self_update_state: SelfUpdateState = match row.get::<_, u64>("last_self_update_at")? {
+        0 => SelfUpdateState::Required,
+        ts => SelfUpdateState::CompletedAt(Timestamp::from_secs(ts)),
+    };
 
     Ok(Group {
         mls_group_id,
@@ -172,11 +182,13 @@ pub fn row_to_group(row: &Row) -> SqliteResult<Group> {
         admin_pubkeys,
         last_message_id,
         last_message_at,
+        last_message_processed_at,
         epoch,
         state,
         image_hash,
         image_key,
         image_nonce,
+        self_update_state,
     })
 }
 
@@ -215,6 +227,8 @@ pub fn row_to_message(row: &Row) -> SqliteResult<Message> {
     let kind_value: u16 = row.get("kind")?;
     let mls_group_id: GroupId = GroupId::from_slice(row.get_ref("mls_group_id")?.as_blob()?);
     let created_at_value: u64 = row.get("created_at")?;
+    // processed_at may be NULL for rows created before the migration
+    let processed_at_value: Option<u64> = row.get("processed_at")?;
     let content: String = row.get("content")?;
     let tags_json: &str = row.get_ref("tags")?.as_str()?;
     let event_json: &str = row.get_ref("event")?.as_str()?;
@@ -231,6 +245,8 @@ pub fn row_to_message(row: &Row) -> SqliteResult<Message> {
 
     let kind: Kind = Kind::from(kind_value);
     let created_at: Timestamp = Timestamp::from(created_at_value);
+    // Fall back to created_at if processed_at is NULL (for backward compatibility)
+    let processed_at: Timestamp = Timestamp::from(processed_at_value.unwrap_or(created_at_value));
 
     let tags: Tags = serde_json::from_str(tags_json).map_err(map_to_text_boxed_error)?;
 
@@ -249,6 +265,7 @@ pub fn row_to_message(row: &Row) -> SqliteResult<Message> {
         kind,
         mls_group_id,
         created_at,
+        processed_at,
         content,
         tags,
         event,
@@ -418,8 +435,10 @@ mod tests {
                 admin_pubkeys TEXT NOT NULL,
                 last_message_id BLOB,
                 last_message_at INTEGER,
+                last_message_processed_at INTEGER,
                 epoch INTEGER NOT NULL,
-                state TEXT NOT NULL
+                state TEXT NOT NULL,
+                last_self_update_at INTEGER NOT NULL DEFAULT 0
             )",
         )
         .unwrap();
@@ -434,7 +453,7 @@ mod tests {
         let valid_event_id = [0xabu8; 32];
 
         conn.execute(
-            "INSERT INTO groups VALUES (?, ?, ?, ?, NULL, NULL, NULL, ?, ?, NULL, ?, ?)",
+            "INSERT INTO groups VALUES (?, ?, ?, ?, NULL, NULL, NULL, ?, ?, NULL, NULL, ?, ?, 0)",
             rusqlite::params![
                 &[1u8, 2, 3, 4][..], // mls_group_id
                 &[0u8; 32][..],      // nostr_group_id
@@ -461,7 +480,7 @@ mod tests {
         let conn = create_test_db();
 
         conn.execute(
-            "INSERT INTO groups VALUES (?, ?, ?, ?, NULL, NULL, NULL, ?, NULL, NULL, ?, ?)",
+            "INSERT INTO groups VALUES (?, ?, ?, ?, NULL, NULL, NULL, ?, NULL, NULL, NULL, ?, ?, 0)",
             rusqlite::params![
                 &[1u8, 2, 3, 4][..], // mls_group_id
                 &[0u8; 32][..],      // nostr_group_id
@@ -490,7 +509,7 @@ mod tests {
         let invalid_event_id = [0xabu8; 16];
 
         conn.execute(
-            "INSERT INTO groups VALUES (?, ?, ?, ?, NULL, NULL, NULL, ?, ?, NULL, ?, ?)",
+            "INSERT INTO groups VALUES (?, ?, ?, ?, NULL, NULL, NULL, ?, ?, NULL, NULL, ?, ?, 0)",
             rusqlite::params![
                 &[1u8, 2, 3, 4][..],   // mls_group_id
                 &[0u8; 32][..],        // nostr_group_id
@@ -525,7 +544,7 @@ mod tests {
         let empty_blob: [u8; 0] = [];
 
         conn.execute(
-            "INSERT INTO groups VALUES (?, ?, ?, ?, NULL, NULL, NULL, ?, ?, NULL, ?, ?)",
+            "INSERT INTO groups VALUES (?, ?, ?, ?, NULL, NULL, NULL, ?, ?, NULL, NULL, ?, ?, 0)",
             rusqlite::params![
                 &[1u8, 2, 3, 4][..], // mls_group_id
                 &[0u8; 32][..],      // nostr_group_id

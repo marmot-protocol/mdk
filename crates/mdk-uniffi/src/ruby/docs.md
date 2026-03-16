@@ -49,6 +49,7 @@ result = mdk.create_key_package_for_event(
 
 # result.key_package contains the hex-encoded key package
 # result.tags contains Nostr event tags (array of arrays)
+# result.hash_ref contains the serialized hash reference for lifecycle tracking
 # Publish as a Nostr event (kind 443) to your relays
 ```
 

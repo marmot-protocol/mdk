@@ -4,8 +4,8 @@ use std::collections::BTreeSet;
 
 use mdk_storage_traits::GroupId;
 use mdk_storage_traits::groups::error::GroupError;
-use mdk_storage_traits::groups::types::{Group, GroupExporterSecret, GroupRelay};
-use mdk_storage_traits::groups::{GroupStorage, MAX_MESSAGE_LIMIT, Pagination};
+use mdk_storage_traits::groups::types::{Group, GroupExporterSecret, GroupRelay, SelfUpdateState};
+use mdk_storage_traits::groups::{GroupStorage, MAX_MESSAGE_LIMIT, MessageSortOrder, Pagination};
 use mdk_storage_traits::messages::types::Message;
 use nostr::{PublicKey, RelayUrl};
 use rusqlite::{OptionalExtension, params};
@@ -114,13 +114,22 @@ impl GroupStorage for MdkSqliteStorage {
         let last_message_id: Option<&[u8; 32]> =
             group.last_message_id.as_ref().map(|id| id.as_bytes());
         let last_message_at: Option<u64> = group.last_message_at.as_ref().map(|ts| ts.as_secs());
+        let last_message_processed_at: Option<u64> = group
+            .last_message_processed_at
+            .as_ref()
+            .map(|ts| ts.as_secs());
+
+        let last_self_update_at: u64 = match group.self_update_state {
+            SelfUpdateState::Required => 0,
+            SelfUpdateState::CompletedAt(ts) => ts.as_secs(),
+        };
 
         self.with_connection(|conn| {
             conn.execute(
                 "INSERT INTO groups
              (mls_group_id, nostr_group_id, name, description, image_hash, image_key, image_nonce, admin_pubkeys, last_message_id,
-              last_message_at, epoch, state)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              last_message_at, last_message_processed_at, epoch, state, last_self_update_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(mls_group_id) DO UPDATE SET
                 nostr_group_id = excluded.nostr_group_id,
                 name = excluded.name,
@@ -131,8 +140,10 @@ impl GroupStorage for MdkSqliteStorage {
                 admin_pubkeys = excluded.admin_pubkeys,
                 last_message_id = excluded.last_message_id,
                 last_message_at = excluded.last_message_at,
+                last_message_processed_at = excluded.last_message_processed_at,
                 epoch = excluded.epoch,
-                state = excluded.state",
+                state = excluded.state,
+                last_self_update_at = excluded.last_self_update_at",
                 params![
                     &group.mls_group_id.as_slice(),
                     &group.nostr_group_id,
@@ -144,8 +155,10 @@ impl GroupStorage for MdkSqliteStorage {
                     &admin_pubkeys_json,
                     last_message_id,
                     &last_message_at,
+                    &last_message_processed_at,
                     &(group.epoch as i64),
-                    group.state.as_str()
+                    group.state.as_str(),
+                    &last_self_update_at
                 ],
             )
             .map_err(into_group_err)?;
@@ -176,12 +189,23 @@ impl GroupStorage for MdkSqliteStorage {
             return Err(GroupError::InvalidParameters("Group not found".to_string()));
         }
 
+        let sort_order = pagination.sort_order();
+
         self.with_connection(|conn| {
-            let mut stmt = conn
-                .prepare(
-                    "SELECT * FROM messages WHERE mls_group_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?",
-                )
-                .map_err(into_group_err)?;
+            let query = match sort_order {
+                MessageSortOrder::CreatedAtFirst => {
+                    "SELECT * FROM messages WHERE mls_group_id = ? \
+                     ORDER BY created_at DESC, processed_at DESC, id DESC \
+                     LIMIT ? OFFSET ?"
+                }
+                MessageSortOrder::ProcessedAtFirst => {
+                    "SELECT * FROM messages WHERE mls_group_id = ? \
+                     ORDER BY processed_at DESC, created_at DESC, id DESC \
+                     LIMIT ? OFFSET ?"
+                }
+            };
+
+            let mut stmt = conn.prepare(query).map_err(into_group_err)?;
 
             let messages_iter = stmt
                 .query_map(
@@ -198,6 +222,37 @@ impl GroupStorage for MdkSqliteStorage {
             }
 
             Ok(messages)
+        })
+    }
+
+    fn last_message(
+        &self,
+        mls_group_id: &GroupId,
+        sort_order: MessageSortOrder,
+    ) -> Result<Option<Message>, GroupError> {
+        if self.find_group_by_mls_group_id(mls_group_id)?.is_none() {
+            return Err(GroupError::InvalidParameters("Group not found".to_string()));
+        }
+
+        self.with_connection(|conn| {
+            let query = match sort_order {
+                MessageSortOrder::CreatedAtFirst => {
+                    "SELECT * FROM messages WHERE mls_group_id = ? \
+                     ORDER BY created_at DESC, processed_at DESC, id DESC \
+                     LIMIT 1"
+                }
+                MessageSortOrder::ProcessedAtFirst => {
+                    "SELECT * FROM messages WHERE mls_group_id = ? \
+                     ORDER BY processed_at DESC, created_at DESC, id DESC \
+                     LIMIT 1"
+                }
+            };
+
+            conn.prepare(query)
+                .map_err(into_group_err)?
+                .query_row(params![mls_group_id.as_slice()], db::row_to_message)
+                .optional()
+                .map_err(into_group_err)
         })
     }
 
@@ -296,7 +351,7 @@ impl GroupStorage for MdkSqliteStorage {
         self.with_connection(|conn| {
             let mut stmt = conn
                 .prepare(
-                    "SELECT * FROM group_exporter_secrets WHERE mls_group_id = ? AND epoch = ?",
+                    "SELECT * FROM group_exporter_secrets WHERE mls_group_id = ? AND epoch = ? AND label = 'group-event'",
                 )
                 .map_err(into_group_err)?;
 
@@ -322,8 +377,76 @@ impl GroupStorage for MdkSqliteStorage {
 
         self.with_connection(|conn| {
             conn.execute(
-                "INSERT OR REPLACE INTO group_exporter_secrets (mls_group_id, epoch, secret) VALUES (?, ?, ?)",
+                "INSERT OR REPLACE INTO group_exporter_secrets (mls_group_id, epoch, secret, label) VALUES (?, ?, ?, 'group-event')",
                 params![&group_exporter_secret.mls_group_id.as_slice(), &group_exporter_secret.epoch, group_exporter_secret.secret.as_ref()],
+            )
+            .map_err(into_group_err)?;
+
+            Ok(())
+        })
+    }
+
+    fn get_group_mip04_exporter_secret(
+        &self,
+        mls_group_id: &GroupId,
+        epoch: u64,
+    ) -> Result<Option<GroupExporterSecret>, GroupError> {
+        // First verify the group exists
+        if self.find_group_by_mls_group_id(mls_group_id)?.is_none() {
+            return Err(GroupError::InvalidParameters("Group not found".to_string()));
+        }
+
+        self.with_connection(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT * FROM group_exporter_secrets WHERE mls_group_id = ? AND epoch = ? AND label = 'encrypted-media'",
+                )
+                .map_err(into_group_err)?;
+
+            stmt.query_row(
+                params![mls_group_id.as_slice(), epoch],
+                db::row_to_group_exporter_secret,
+            )
+            .optional()
+            .map_err(into_group_err)
+        })
+    }
+
+    fn save_group_mip04_exporter_secret(
+        &self,
+        group_exporter_secret: GroupExporterSecret,
+    ) -> Result<(), GroupError> {
+        if self
+            .find_group_by_mls_group_id(&group_exporter_secret.mls_group_id)?
+            .is_none()
+        {
+            return Err(GroupError::InvalidParameters("Group not found".to_string()));
+        }
+
+        self.with_connection(|conn| {
+            conn.execute(
+                "INSERT OR REPLACE INTO group_exporter_secrets (mls_group_id, epoch, secret, label) VALUES (?, ?, ?, 'encrypted-media')",
+                params![&group_exporter_secret.mls_group_id.as_slice(), &group_exporter_secret.epoch, group_exporter_secret.secret.as_ref()],
+            )
+            .map_err(into_group_err)?;
+
+            Ok(())
+        })
+    }
+
+    fn prune_group_exporter_secrets_before_epoch(
+        &self,
+        group_id: &GroupId,
+        min_epoch_to_keep: u64,
+    ) -> Result<(), GroupError> {
+        if self.find_group_by_mls_group_id(group_id)?.is_none() {
+            return Err(GroupError::InvalidParameters("Group not found".to_string()));
+        }
+
+        self.with_connection(|conn| {
+            conn.execute(
+                "DELETE FROM group_exporter_secrets WHERE mls_group_id = ? AND epoch < ?",
+                params![group_id.as_slice(), min_epoch_to_keep],
             )
             .map_err(into_group_err)?;
 
@@ -364,11 +487,13 @@ mod tests {
             admin_pubkeys: BTreeSet::new(),
             last_message_id: None,
             last_message_at: None,
+            last_message_processed_at: None,
             epoch: 0,
             state: GroupState::Active,
             image_hash,
             image_key,
             image_nonce,
+            self_update_state: SelfUpdateState::Required,
         };
 
         // Save the group
@@ -410,11 +535,13 @@ mod tests {
             admin_pubkeys: BTreeSet::new(),
             last_message_id: None,
             last_message_at: None,
+            last_message_processed_at: None,
             epoch: 0,
             state: GroupState::Active,
             image_hash: None,
             image_key: None,
             image_nonce: None,
+            self_update_state: SelfUpdateState::Required,
         };
 
         // Should fail due to name length
@@ -444,11 +571,13 @@ mod tests {
             admin_pubkeys: BTreeSet::new(),
             last_message_id: None,
             last_message_at: None,
+            last_message_processed_at: None,
             epoch: 0,
             state: GroupState::Active,
             image_hash: None,
             image_key: None,
             image_nonce: None,
+            self_update_state: SelfUpdateState::Required,
         };
 
         // Should fail due to description length
@@ -481,11 +610,13 @@ mod tests {
             admin_pubkeys: BTreeSet::new(),
             last_message_id: None,
             last_message_at: None,
+            last_message_processed_at: None,
             epoch: 0,
             state: GroupState::Active,
             image_hash: None,
             image_key: None,
             image_nonce: None,
+            self_update_state: SelfUpdateState::Required,
         };
 
         storage.save_group(group).unwrap();
@@ -496,17 +627,19 @@ mod tests {
             let event_id = EventId::from_slice(&[i as u8; 32]).unwrap();
             let wrapper_event_id = EventId::from_slice(&[100 + i as u8; 32]).unwrap();
 
+            let ts = Timestamp::from((1000 + i) as u64);
             let message = Message {
                 id: event_id,
                 pubkey,
                 kind: Kind::from(1u16),
                 mls_group_id: mls_group_id.clone(),
-                created_at: Timestamp::from((1000 + i) as u64),
+                created_at: ts,
+                processed_at: ts,
                 content: format!("Message {}", i),
                 tags: Tags::new(),
                 event: UnsignedEvent::new(
                     pubkey,
-                    Timestamp::from((1000 + i) as u64),
+                    ts,
                     Kind::from(9u16),
                     vec![],
                     format!("content {}", i),
@@ -608,11 +741,13 @@ mod tests {
             admin_pubkeys: BTreeSet::new(),
             last_message_id: None,
             last_message_at: None,
+            last_message_processed_at: None,
             epoch: 0,
             state: GroupState::Active,
             image_hash: None,
             image_key: None,
             image_nonce: None,
+            self_update_state: SelfUpdateState::Required,
         };
 
         // Save the group
@@ -693,11 +828,13 @@ mod tests {
             admin_pubkeys: BTreeSet::new(),
             last_message_id: None,
             last_message_at: None,
+            last_message_processed_at: None,
             epoch: 0,
             state: GroupState::Active,
             image_hash: None,
             image_key: None,
             image_nonce: None,
+            self_update_state: SelfUpdateState::Required,
         };
         storage.save_group(group1).unwrap();
 
@@ -711,11 +848,13 @@ mod tests {
             admin_pubkeys: BTreeSet::new(),
             last_message_id: None,
             last_message_at: None,
+            last_message_processed_at: None,
             epoch: 0,
             state: GroupState::Active,
             image_hash: None,
             image_key: None,
             image_nonce: None,
+            self_update_state: SelfUpdateState::Required,
         };
         storage.save_group(group2).unwrap();
 

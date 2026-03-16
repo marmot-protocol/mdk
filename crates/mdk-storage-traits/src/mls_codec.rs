@@ -61,15 +61,20 @@ impl GroupDataType {
     }
 }
 
-/// JSON codec for serializing and deserializing OpenMLS types.
+/// Binary codec for serializing and deserializing OpenMLS types.
 ///
-/// This codec uses serde_json to serialize types to JSON byte arrays.
-/// It is used by both memory and SQLite storage implementations to ensure
-/// consistent serialization format across storage backends.
-pub struct JsonCodec;
+/// This codec uses `postcard` (a compact, no-std-compatible binary serde format)
+/// to serialize types to byte arrays. It is used by both memory and SQLite
+/// storage implementations to ensure a consistent serialization format across
+/// storage backends.
+///
+/// `postcard` produces much more compact output than JSON — a 32-byte group_id
+/// serializes to ~33 bytes instead of ~130 bytes with JSON — which reduces
+/// storage overhead and index size for database lookups.
+pub struct MlsCodec;
 
-impl JsonCodec {
-    /// Serialize a value to a JSON byte vector.
+impl MlsCodec {
+    /// Serialize a value to a binary byte vector.
     ///
     /// # Errors
     ///
@@ -79,10 +84,10 @@ impl JsonCodec {
     where
         T: Serialize,
     {
-        serde_json::to_vec(value).map_err(|e| MdkStorageError::Serialization(e.to_string()))
+        postcard::to_allocvec(value).map_err(|e| MdkStorageError::Serialization(e.to_string()))
     }
 
-    /// Deserialize a value from a JSON byte slice.
+    /// Deserialize a value from a binary byte slice.
     ///
     /// # Errors
     ///
@@ -92,7 +97,7 @@ impl JsonCodec {
     where
         T: DeserializeOwned,
     {
-        serde_json::from_slice(slice).map_err(|e| MdkStorageError::Deserialization(e.to_string()))
+        postcard::from_bytes(slice).map_err(|e| MdkStorageError::Deserialization(e.to_string()))
     }
 }
 
@@ -163,8 +168,8 @@ mod tests {
             bytes: vec![1, 2, 3, 4],
         };
 
-        let serialized = JsonCodec::serialize(&original).unwrap();
-        let deserialized: TestData = JsonCodec::deserialize(&serialized).unwrap();
+        let serialized = MlsCodec::serialize(&original).unwrap();
+        let deserialized: TestData = MlsCodec::deserialize(&serialized).unwrap();
 
         assert_eq!(original, deserialized);
     }
@@ -177,8 +182,8 @@ mod tests {
             bytes: vec![],
         };
 
-        let serialized = JsonCodec::serialize(&original).unwrap();
-        let deserialized: TestData = JsonCodec::deserialize(&serialized).unwrap();
+        let serialized = MlsCodec::serialize(&original).unwrap();
+        let deserialized: TestData = MlsCodec::deserialize(&serialized).unwrap();
 
         assert_eq!(original, deserialized);
     }
@@ -191,35 +196,40 @@ mod tests {
             bytes: vec![0xFFu8; 10000],
         };
 
-        let serialized = JsonCodec::serialize(&original).unwrap();
-        let deserialized: TestData = JsonCodec::deserialize(&serialized).unwrap();
+        let serialized = MlsCodec::serialize(&original).unwrap();
+        let deserialized: TestData = MlsCodec::deserialize(&serialized).unwrap();
 
         assert_eq!(original, deserialized);
     }
 
     #[test]
-    fn test_deserialize_invalid_json() {
-        let invalid = b"not valid json";
-        let result: Result<TestData, _> = JsonCodec::deserialize(invalid);
-
-        assert!(result.is_err());
-        match result {
-            Err(MdkStorageError::Deserialization(msg)) => {
-                assert!(msg.contains("expected"));
-            }
-            _ => panic!("Expected Deserialization error"),
-        }
-    }
-
-    #[test]
-    fn test_deserialize_wrong_type() {
-        let wrong_type = r#"{"wrong": "structure"}"#.as_bytes();
-        let result: Result<TestData, _> = JsonCodec::deserialize(wrong_type);
+    fn test_deserialize_invalid_data() {
+        let invalid = b"not valid data";
+        let result: Result<TestData, _> = MlsCodec::deserialize(invalid);
 
         assert!(result.is_err());
         match result {
             Err(MdkStorageError::Deserialization(_)) => {}
             _ => panic!("Expected Deserialization error"),
         }
+    }
+
+    #[test]
+    fn test_binary_is_more_compact_than_json() {
+        let data = TestData {
+            id: 42,
+            name: "test".to_string(),
+            bytes: vec![1, 2, 3, 4],
+        };
+
+        let binary = MlsCodec::serialize(&data).unwrap();
+        let json = serde_json::to_vec(&data).unwrap();
+
+        assert!(
+            binary.len() < json.len(),
+            "Binary format ({} bytes) should be more compact than JSON ({} bytes)",
+            binary.len(),
+            json.len()
+        );
     }
 }

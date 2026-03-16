@@ -1,0 +1,13 @@
+# Methods intentionally not bound in UniFFI
+#
+# Format: method_name # reason
+# Lines starting with # are comments. Blank lines are ignored.
+#
+# This file is read by scripts/check-uniffi-bindings.js during CI to suppress
+# warnings for methods that are deliberately excluded from the UniFFI bindings.
+
+builder # Wrapped by new_mdk(), new_mdk_with_key(), new_mdk_unencrypted() free functions
+new # Wrapped by new_mdk(), new_mdk_with_key(), new_mdk_unencrypted() free functions
+media_manager # Returns borrowed reference with lifetime — cannot cross FFI boundary
+load_mls_group # Only available behind debug-examples feature flag, not for production use
+migrate_group_image_v1_to_v2 # Migration utility for internal use only, not needed in client bindings

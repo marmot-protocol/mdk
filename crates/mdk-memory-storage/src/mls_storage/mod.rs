@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 
 use mdk_storage_traits::MdkStorageError;
-pub use mdk_storage_traits::mls_codec::{GroupDataType, JsonCodec};
+pub use mdk_storage_traits::mls_codec::{GroupDataType, MlsCodec};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
@@ -709,7 +709,7 @@ fn serialize_key<K>(key: &K) -> Result<Vec<u8>, MdkStorageError>
 where
     K: Serialize,
 {
-    JsonCodec::serialize(key)
+    MlsCodec::serialize(key)
 }
 
 /// Serialize an entity to bytes for storage.
@@ -717,7 +717,7 @@ fn serialize_entity<E>(entity: &E) -> Result<Vec<u8>, MdkStorageError>
 where
     E: Serialize,
 {
-    JsonCodec::serialize(entity)
+    MlsCodec::serialize(entity)
 }
 
 /// Deserialize an entity from bytes.
@@ -725,7 +725,7 @@ fn deserialize_entity<E>(bytes: &[u8]) -> Result<E, MdkStorageError>
 where
     E: DeserializeOwned,
 {
-    JsonCodec::deserialize(bytes)
+    MlsCodec::deserialize(bytes)
 }
 
 #[cfg(test)]
@@ -1301,8 +1301,8 @@ mod tests {
     }
 
     #[test]
-    fn test_deserialize_entity_invalid_json() {
-        let invalid = b"not valid json";
+    fn test_deserialize_entity_invalid_data() {
+        let invalid = b"not valid data";
         let result: Result<String, _> = deserialize_entity(invalid);
         assert!(result.is_err());
     }

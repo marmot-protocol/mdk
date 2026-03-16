@@ -1,7 +1,9 @@
-//! Nostr MLS Key Packages
+//! MDK Key Packages
 
 use mdk_storage_traits::MdkStorageProvider;
+use mdk_storage_traits::mls_codec::MlsCodec;
 use nostr::{Event, Kind, PublicKey, RelayUrl, Tag, TagKind};
+use openmls::ciphersuite::hash_ref::HashReference;
 use openmls::key_packages::KeyPackage;
 use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
@@ -24,18 +26,23 @@ where
     ///
     /// The key package contains the user's credential and capabilities required for MLS operations.
     ///
+    /// **Note**: This function does NOT add the NIP-70 protected tag, ensuring maximum relay
+    /// compatibility. Many popular relays (Damus, Primal, nos.lol) reject protected events.
+    /// If you need the protected tag, use `create_key_package_for_event_with_options` instead.
+    ///
     /// # Returns
     ///
     /// A tuple containing:
     /// * A base64-encoded string containing the serialized key package
-    /// * A fixed array of 7 tags for the Nostr event, in order:
+    /// * A vector of tags for the Nostr event:
     ///   - `mls_protocol_version` - MLS protocol version (e.g., "1.0")
     ///   - `mls_ciphersuite` - Ciphersuite identifier (e.g., "0x0001")
     ///   - `mls_extensions` - Required MLS extensions
     ///   - `relays` - Relay URLs for distribution
-    ///   - `protected` - Marks the event as protected
+    ///   - `i` - Hex-encoded KeyPackageRef for efficient relay queries (MIP-00)
     ///   - `client` - Client identifier and version
     ///   - `encoding` - The encoding format tag ("base64")
+    /// * The serialized hash_ref bytes for the key package (for lifecycle tracking)
     ///
     /// # Errors
     ///
@@ -47,7 +54,68 @@ where
         &self,
         public_key: &PublicKey,
         relays: I,
-    ) -> Result<(String, [Tag; 7]), Error>
+    ) -> Result<(String, Vec<Tag>, Vec<u8>), Error>
+    where
+        I: IntoIterator<Item = RelayUrl>,
+    {
+        self.create_key_package_for_event_internal(public_key, relays, false)
+    }
+
+    /// Creates a key package for a Nostr event with additional options.
+    ///
+    /// This is the same as `create_key_package_for_event` but allows specifying
+    /// whether to include the NIP-70 protected tag.
+    ///
+    /// # Arguments
+    ///
+    /// * `public_key` - The Nostr public key for the credential
+    /// * `relays` - Relay URLs where the key package will be published
+    /// * `protected` - Whether to add the NIP-70 protected tag (`["-"]`). When `true`, relays
+    ///   that implement NIP-70 will reject republishing by third parties. However, many popular
+    ///   relays (Damus, Primal, nos.lol) reject protected events entirely. Only set to `true`
+    ///   if publishing to relays known to accept NIP-70 protected events.
+    ///
+    /// # Returns
+    ///
+    /// A tuple containing:
+    /// * A base64-encoded string containing the serialized key package
+    /// * A vector of tags for the Nostr event
+    /// * The serialized hash_ref bytes for the key package (for lifecycle tracking)
+    ///
+    /// # Errors
+    ///
+    /// This function will return an error if:
+    /// * It fails to generate the credential and signature keypair
+    /// * It fails to build the key package
+    /// * It fails to serialize the key package
+    pub fn create_key_package_for_event_with_options<I>(
+        &self,
+        public_key: &PublicKey,
+        relays: I,
+        protected: bool,
+    ) -> Result<(String, Vec<Tag>, Vec<u8>), Error>
+    where
+        I: IntoIterator<Item = RelayUrl>,
+    {
+        self.create_key_package_for_event_internal(public_key, relays, protected)
+    }
+
+    /// Internal implementation for creating key packages.
+    ///
+    /// This is the shared implementation used by both `create_key_package_for_event` and
+    /// `create_key_package_for_event_with_options`. It generates an MLS key package with
+    /// the user's credential and builds the Nostr event tags.
+    ///
+    /// The `protected` parameter controls whether the NIP-70 protected tag (`["-"]`) is
+    /// included in the output tags. When `true`, the tag is inserted between the `i`
+    /// and `client` tags, resulting in 8 total tags. When `false`, the protected tag is
+    /// omitted, resulting in 7 total tags.
+    fn create_key_package_for_event_internal<I>(
+        &self,
+        public_key: &PublicKey,
+        relays: I,
+        protected: bool,
+    ) -> Result<(String, Vec<Tag>, Vec<u8>), Error>
     where
         I: IntoIterator<Item = RelayUrl>,
     {
@@ -65,6 +133,15 @@ where
                 credential,
             )?;
 
+        // Compute hash_ref while we have the KeyPackage available.
+        // This allows callers to track the key package for later cleanup
+        // without needing to re-parse it.
+        let hash_ref = key_package_bundle
+            .key_package()
+            .hash_ref(self.provider.crypto())?;
+        let hash_ref_bytes = MlsCodec::serialize(&hash_ref)
+            .map_err(|e| Error::Provider(format!("Failed to serialize hash_ref: {}", e)))?;
+
         let key_package_serialized = key_package_bundle.key_package().tls_serialize_detached()?;
 
         // SECURITY: Always use base64 encoding with explicit encoding tag per MIP-00/MIP-02.
@@ -75,24 +152,35 @@ where
 
         tracing::debug!(
             target: "mdk_core::key_packages",
-            "Encoded key package using {} format",
-            encoding.as_tag_value()
+            "Encoded key package using {} format (protected: {})",
+            encoding.as_tag_value(),
+            protected
         );
 
-        let tags = [
+        // Hex-encode the raw KeyPackageRef bytes for the `i` tag per MIP-00.
+        // This enables efficient relay queries by KeyPackageRef without downloading
+        // and decoding all KeyPackage events.
+        let key_package_ref_hex = hex::encode(hash_ref.as_slice());
+
+        let mut tags = vec![
             Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
             Tag::custom(TagKind::MlsCiphersuite, [self.ciphersuite_value()]),
             Tag::custom(TagKind::MlsExtensions, self.extensions_value()),
             Tag::relays(relays),
-            Tag::protected(),
-            Tag::client(format!("MDK/{}", env!("CARGO_PKG_VERSION"))),
-            Tag::custom(
-                TagKind::Custom("encoding".into()),
-                [encoding.as_tag_value()],
-            ),
+            Tag::custom(TagKind::i(), [key_package_ref_hex]),
         ];
 
-        Ok((encoded_content, tags))
+        if protected {
+            tags.push(Tag::protected());
+        }
+
+        tags.push(Tag::client(format!("MDK/{}", env!("CARGO_PKG_VERSION"))));
+        tags.push(Tag::custom(
+            TagKind::Custom("encoding".into()),
+            [encoding.as_tag_value()],
+        ));
+
+        Ok((encoded_content, tags, hash_ref_bytes))
     }
 
     /// Parses and validates a key package using base64 encoding.
@@ -135,13 +223,16 @@ where
 
     /// Parses and validates an MLS KeyPackage from a Nostr event.
     ///
-    /// This method performs comprehensive validation before deserializing the key package:
+    /// This method performs comprehensive validation:
     /// 1. Verifies the event is of kind `MlsKeyPackage` (Kind 443)
     /// 2. Validates all required tags are present and correctly formatted per MIP-00:
     ///    - `mls_protocol_version`: Protocol version (e.g., "1.0")
     ///    - `mls_ciphersuite`: Must be "0x0001" (MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519)
     ///    - `mls_extensions`: Must include all required extensions (0x000a, 0xf2ee), but not the default extensions (0x0003, 0x0002)
+    ///    - `i`: Hex-encoded KeyPackageRef, validated against computed value from content
     /// 3. Deserializes the TLS-encoded key package from the event content
+    /// 4. Verifies identity binding (credential identity matches event signer)
+    /// 5. Validates the `i` tag value matches the computed `KeyPackageRef` from the parsed content
     ///
     /// # Arguments
     ///
@@ -177,8 +268,9 @@ where
             });
         }
 
-        // Validate tags before parsing the key package
-        self.validate_key_package_tags(event)?;
+        // Validate tag format before parsing the key package content.
+        // This catches malformed tags early without the cost of deserialization.
+        self.validate_key_package_tags(event, None)?;
 
         // SECURITY: Require explicit encoding tag to prevent downgrade attacks and parsing ambiguity.
         // Per MIP-00/MIP-02, encoding tag must be present.
@@ -202,25 +294,36 @@ where
             });
         }
 
+        // SECURITY: Validate that the `i` tag value matches the computed KeyPackageRef.
+        // Now that we have the parsed key package, re-validate tags with content verification.
+        self.validate_key_package_tags(event, Some(&key_package))?;
+
         Ok(key_package)
     }
 
     /// Validates that key package event tags match MIP-00 specification.
     ///
     /// This function checks that:
-    /// - The event has the required tags (mls_protocol_version, mls_ciphersuite, mls_extensions, relays)
+    /// - The event has the required tags (mls_protocol_version, mls_ciphersuite, mls_extensions, relays, i)
     /// - Tag values are in the correct format and contain valid values
     /// - The relays tag contains at least one valid relay URL (mandatory per MIP-00)
+    /// - The `i` tag contains valid hex-encoded data (mandatory per MIP-00)
+    /// - If a parsed `KeyPackage` is provided, the `i` tag value matches the computed `KeyPackageRef`
     /// - Supports backward compatibility with legacy formats
     ///
     /// # Arguments
     ///
     /// * `event` - The key package event to validate
+    /// * `key_package` - Optional parsed key package for content-level `i` tag verification
     ///
     /// # Returns
     ///
     /// Ok(()) if validation succeeds, or an Error describing what's wrong
-    fn validate_key_package_tags(&self, event: &Event) -> Result<(), Error> {
+    fn validate_key_package_tags(
+        &self,
+        event: &Event,
+        key_package: Option<&KeyPackage>,
+    ) -> Result<(), Error> {
         let require = |pred: fn(&Self, &Tag) -> bool, name: &str| {
             event
                 .tags
@@ -233,11 +336,36 @@ where
         let cs = require(Self::is_ciphersuite_tag, "mls_ciphersuite")?;
         let ext = require(Self::is_extensions_tag, "mls_extensions")?;
         let relays = require(Self::is_relays_tag, "relays")?;
+        let i_tag = require(Self::is_key_package_ref_tag, "i")?;
 
         self.validate_protocol_version_tag(pv)?;
         self.validate_ciphersuite_tag(cs)?;
         self.validate_extensions_tag(ext)?;
         self.validate_relays_tag(relays)?;
+        self.validate_key_package_ref_tag(i_tag)?;
+
+        // SECURITY: When a parsed KeyPackage is available, validate that the `i` tag value
+        // matches the computed KeyPackageRef. This prevents an attacker from publishing a
+        // KeyPackage event with a fabricated `i` tag that doesn't correspond to the actual
+        // key package content, which could cause relay query results to return incorrect
+        // key packages.
+        if let Some(kp) = key_package {
+            let computed_ref = kp.hash_ref(self.provider.crypto())?;
+
+            let i_tag_value = i_tag
+                .as_slice()
+                .get(1)
+                .ok_or_else(|| Error::KeyPackage("Missing required i tag".to_string()))?;
+
+            let i_tag_bytes = hex::decode(i_tag_value.as_str())
+                .map_err(|_| Error::KeyPackage("Invalid i tag hex".to_string()))?;
+
+            if i_tag_bytes != computed_ref.as_slice() {
+                return Err(Error::KeyPackage(
+                    "KeyPackageRef in i tag does not match computed value from content".to_string(),
+                ));
+            }
+        }
 
         Ok(())
     }
@@ -268,6 +396,13 @@ where
     /// **SPEC-COMPLIANT**: "relays"
     fn is_relays_tag(&self, tag: &Tag) -> bool {
         matches!(tag.kind(), TagKind::Relays)
+    }
+
+    /// Checks if a tag is a KeyPackageRef `i` tag (MIP-00).
+    ///
+    /// **SPEC-COMPLIANT**: "i" tag containing hex-encoded KeyPackageRef
+    fn is_key_package_ref_tag(&self, tag: &Tag) -> bool {
+        tag.kind() == TagKind::i()
     }
 
     /// Validates protocol version tag format and value.
@@ -423,6 +558,37 @@ where
         Ok(())
     }
 
+    /// Validates the `i` tag format per MIP-00.
+    ///
+    /// The `i` tag must contain a single hex-encoded `KeyPackageRef` value.
+    /// Content validation (matching the computed `KeyPackageRef`) is performed
+    /// by `validate_key_package_tags` when a parsed `KeyPackage` is provided.
+    fn validate_key_package_ref_tag(&self, tag: &Tag) -> Result<(), Error> {
+        let slice = tag.as_slice();
+
+        // Tag slice includes the tag name at index 0, so exactly 2 elements means one value.
+        if slice.len() != 2 {
+            return Err(Error::KeyPackage(
+                "i tag must contain exactly one value".to_string(),
+            ));
+        }
+
+        let hex_value = &slice[1];
+
+        if hex_value.is_empty() {
+            return Err(Error::KeyPackage(
+                "i tag value must not be empty".to_string(),
+            ));
+        }
+
+        // Validate that the value is valid hex
+        hex::decode(hex_value.as_str()).map_err(|e| {
+            Error::KeyPackage(format!("i tag must contain valid hex-encoded data: {}", e))
+        })?;
+
+        Ok(())
+    }
+
     /// Deletes a key package from the MLS provider's storage.
     /// TODO: Do we need to delete the encryption keys from the MLS storage provider?
     ///
@@ -431,6 +597,25 @@ where
     /// * `key_package` - The key package to delete
     pub fn delete_key_package_from_storage(&self, key_package: &KeyPackage) -> Result<(), Error> {
         let hash_ref = key_package.hash_ref(self.provider.crypto())?;
+
+        self.provider
+            .storage()
+            .delete_key_package(&hash_ref)
+            .map_err(|e| Error::Provider(e.to_string()))?;
+
+        Ok(())
+    }
+
+    /// Deletes a key package from storage using previously serialized hash_ref bytes.
+    ///
+    /// The `hash_ref_bytes` should be the bytes returned as the third element of
+    /// [`create_key_package_for_event`](Self::create_key_package_for_event).
+    pub fn delete_key_package_from_storage_by_hash_ref(
+        &self,
+        hash_ref_bytes: &[u8],
+    ) -> Result<(), Error> {
+        let hash_ref: HashReference = MlsCodec::deserialize(hash_ref_bytes)
+            .map_err(|e| Error::Provider(format!("Failed to deserialize hash_ref: {}", e)))?;
 
         self.provider
             .storage()
@@ -514,12 +699,14 @@ where
 
 #[cfg(test)]
 mod tests {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD as BASE64;
     use nostr::EventBuilder;
-    use nostr::base64::Engine;
-    use nostr::base64::engine::general_purpose::STANDARD as BASE64;
+    use nostr::Keys;
 
     use super::*;
     use crate::constant::DEFAULT_CIPHERSUITE;
+    use crate::test_util::create_nostr_group_config_data;
     use crate::tests::create_test_mdk;
 
     #[test]
@@ -530,8 +717,8 @@ mod tests {
                 .unwrap();
         let relays = vec![RelayUrl::parse("wss://relay.example.com").unwrap()];
 
-        // Create key package
-        let (key_package_str, tags) = mdk
+        // Create key package without protected tag (default for maximum relay compatibility)
+        let (key_package_str, tags, _hash_ref) = mdk
             .create_key_package_for_event(&test_pubkey, relays.clone())
             .expect("Failed to create key package");
 
@@ -546,12 +733,13 @@ mod tests {
         // Verify the key package has the expected properties
         assert_eq!(key_package.ciphersuite(), DEFAULT_CIPHERSUITE);
 
+        // Without protected tag: 7 tags (3 MLS + relays + i + client + encoding)
         assert_eq!(tags.len(), 7);
         assert_eq!(tags[0].kind(), TagKind::MlsProtocolVersion);
         assert_eq!(tags[1].kind(), TagKind::MlsCiphersuite);
         assert_eq!(tags[2].kind(), TagKind::MlsExtensions);
         assert_eq!(tags[3].kind(), TagKind::Relays);
-        assert_eq!(tags[4].kind(), TagKind::Protected);
+        assert_eq!(tags[4].kind(), TagKind::i());
         assert_eq!(tags[5].kind(), TagKind::Client);
         assert_eq!(tags[6].kind(), TagKind::Custom("encoding".into()));
 
@@ -564,8 +752,11 @@ mod tests {
                 .join(",")
         );
 
-        // Verify protected tag is present
-        assert_eq!(tags[4].kind(), TagKind::Protected);
+        // Verify protected tag is NOT present when protected=false
+        assert!(
+            !tags.iter().any(|t| t.kind() == TagKind::Protected),
+            "Protected tag should not be present when protected=false"
+        );
 
         // Verify client tag contains version
         let client_tag = tags[5].content().unwrap();
@@ -589,7 +780,7 @@ mod tests {
                 .unwrap();
         let relays = vec![RelayUrl::parse("wss://relay.example.com").unwrap()];
 
-        let (_, tags) = mdk
+        let (_, tags, _) = mdk
             .create_key_package_for_event(&test_pubkey, relays)
             .expect("Failed to create key package");
 
@@ -626,7 +817,7 @@ mod tests {
                 .unwrap();
         let relays = vec![RelayUrl::parse("wss://relay.example.com").unwrap()];
 
-        let (_, tags) = mdk
+        let (_, tags, _) = mdk
             .create_key_package_for_event(&test_pubkey, relays)
             .expect("Failed to create key package");
 
@@ -707,7 +898,7 @@ mod tests {
                 .unwrap();
         let relays = vec![RelayUrl::parse("wss://relay.example.com").unwrap()];
 
-        let (_, tags) = mdk
+        let (_, tags, _) = mdk
             .create_key_package_for_event(&test_pubkey, relays)
             .expect("Failed to create key package");
 
@@ -725,10 +916,10 @@ mod tests {
         );
     }
 
-    /// Test complete tag structure matches Marmot spec (MIP-00)
+    /// Test complete tag structure matches Marmot spec (MIP-00) without protected tag
     /// This is an integration test ensuring all tags work together correctly
     #[test]
-    fn test_complete_tag_structure_mip00_compliance() {
+    fn test_complete_tag_structure_mip00_compliance_without_protected() {
         let mdk = create_test_mdk();
         let test_pubkey =
             PublicKey::from_hex("884704bd421671e01c13f854d2ce23ce2a5bfe9562f4f297ad2bc921ba30c3a6")
@@ -738,12 +929,17 @@ mod tests {
             RelayUrl::parse("wss://relay2.example.com").unwrap(),
         ];
 
-        let (_, tags) = mdk
+        let (_, tags, _) = mdk
             .create_key_package_for_event(&test_pubkey, relays.clone())
             .expect("Failed to create key package");
 
-        // Verify we have exactly 7 tags (3 MLS required + relays + protected + client + encoding)
-        assert_eq!(tags.len(), 7, "Should have exactly 7 tags");
+        // Verify we have exactly 7 tags (3 MLS required + relays + i + client + encoding)
+        // No protected tag when protected=false
+        assert_eq!(
+            tags.len(),
+            7,
+            "Should have exactly 7 tags without protected"
+        );
 
         // Verify tag order matches spec example
         assert_eq!(
@@ -768,13 +964,13 @@ mod tests {
         );
         assert_eq!(
             tags[4].kind(),
-            TagKind::Protected,
-            "Fifth tag should be protected"
+            TagKind::i(),
+            "Fifth tag should be i (KeyPackageRef)"
         );
         assert_eq!(
             tags[5].kind(),
             TagKind::Client,
-            "Sixth tag should be client"
+            "Sixth tag should be client (no protected tag)"
         );
         assert_eq!(
             tags[6].kind(),
@@ -801,8 +997,61 @@ mod tests {
             "Should contain relay2"
         );
 
-        // Verify protected tag is present
-        assert_eq!(tags[4].kind(), TagKind::Protected);
+        // Verify protected tag is NOT present
+        assert!(
+            !tags.iter().any(|t| t.kind() == TagKind::Protected),
+            "Protected tag should not be present when protected=false"
+        );
+    }
+
+    /// Test complete tag structure with protected tag (NIP-70)
+    #[test]
+    fn test_complete_tag_structure_with_protected() {
+        let mdk = create_test_mdk();
+        let test_pubkey =
+            PublicKey::from_hex("884704bd421671e01c13f854d2ce23ce2a5bfe9562f4f297ad2bc921ba30c3a6")
+                .unwrap();
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").unwrap()];
+
+        let (_, tags, hash_ref) = mdk
+            .create_key_package_for_event_with_options(&test_pubkey, relays, true)
+            .expect("Failed to create key package");
+
+        // Verify hash_ref is returned from the with_options variant too
+        assert!(
+            !hash_ref.is_empty(),
+            "hash_ref should be returned from create_key_package_for_event_with_options"
+        );
+
+        // Verify we have exactly 8 tags (3 MLS required + relays + i + protected + client + encoding)
+        assert_eq!(
+            tags.len(),
+            8,
+            "Should have exactly 8 tags with protected=true"
+        );
+
+        // Verify i tag is present at the correct position
+        assert_eq!(
+            tags[4].kind(),
+            TagKind::i(),
+            "Fifth tag should be i (KeyPackageRef)"
+        );
+        // Verify protected tag is present at the correct position
+        assert_eq!(
+            tags[5].kind(),
+            TagKind::Protected,
+            "Sixth tag should be protected"
+        );
+        assert_eq!(
+            tags[6].kind(),
+            TagKind::Client,
+            "Seventh tag should be client"
+        );
+        assert_eq!(
+            tags[7].kind(),
+            TagKind::Custom("encoding".into()),
+            "Eighth tag should be encoding"
+        );
     }
 
     #[test]
@@ -815,7 +1064,7 @@ mod tests {
         let relays = vec![RelayUrl::parse("wss://relay.example.com").unwrap()];
 
         // Create and parse key package
-        let (key_package_str, _) = mdk
+        let (key_package_str, _, _) = mdk
             .create_key_package_for_event(&test_pubkey, relays.clone())
             .expect("Failed to create key package");
 
@@ -829,6 +1078,31 @@ mod tests {
         deletion_mls
             .delete_key_package_from_storage(&key_package)
             .expect("Failed to delete key package");
+    }
+
+    #[test]
+    fn test_key_package_deletion_by_hash_ref() {
+        let mdk = create_test_mdk();
+        let test_pubkey =
+            PublicKey::from_hex("884704bd421671e01c13f854d2ce23ce2a5bfe9562f4f297ad2bc921ba30c3a6")
+                .unwrap();
+
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").unwrap()];
+
+        // hash_ref is returned directly from create_key_package_for_event
+        let (_, _, hash_ref) = mdk
+            .create_key_package_for_event(&test_pubkey, relays)
+            .expect("Failed to create key package");
+
+        assert!(!hash_ref.is_empty(), "hash_ref bytes should not be empty");
+
+        // Delete using the hash_ref bytes (simulates delayed cleanup)
+        mdk.delete_key_package_from_storage_by_hash_ref(&hash_ref)
+            .expect("Failed to delete key package by hash_ref");
+
+        // Deleting again should also succeed (idempotent, no-op)
+        mdk.delete_key_package_from_storage_by_hash_ref(&hash_ref)
+            .expect("Second deletion should succeed (idempotent)");
     }
 
     #[test]
@@ -952,7 +1226,7 @@ mod tests {
             PublicKey::from_hex("884704bd421671e01c13f854d2ce23ce2a5bfe9562f4f297ad2bc921ba30c3a6")
                 .unwrap();
 
-        let (key_package_hex, _) = mdk
+        let (key_package_hex, _, _) = mdk
             .create_key_package_for_event(&test_pubkey, vec![])
             .expect("Failed to create key package");
 
@@ -969,7 +1243,7 @@ mod tests {
                 .sign_with_keys(&nostr::Keys::generate())
                 .unwrap();
 
-            let result = mdk.validate_key_package_tags(&event);
+            let result = mdk.validate_key_package_tags(&event, None);
             assert!(
                 result.is_err(),
                 "Should reject event without protocol_version tag"
@@ -994,7 +1268,7 @@ mod tests {
                 .sign_with_keys(&nostr::Keys::generate())
                 .unwrap();
 
-            let result = mdk.validate_key_package_tags(&event);
+            let result = mdk.validate_key_package_tags(&event, None);
             assert!(
                 result.is_err(),
                 "Should reject event without ciphersuite tag"
@@ -1014,7 +1288,7 @@ mod tests {
                 .sign_with_keys(&nostr::Keys::generate())
                 .unwrap();
 
-            let result = mdk.validate_key_package_tags(&event);
+            let result = mdk.validate_key_package_tags(&event, None);
             assert!(
                 result.is_err(),
                 "Should reject event without extensions tag"
@@ -1038,7 +1312,7 @@ mod tests {
                 .sign_with_keys(&nostr::Keys::generate())
                 .unwrap();
 
-            let result = mdk.validate_key_package_tags(&event);
+            let result = mdk.validate_key_package_tags(&event, None);
             assert!(result.is_err(), "Should reject event without relays tag");
             assert!(result.unwrap_err().to_string().contains("relays"));
         }
@@ -1052,7 +1326,7 @@ mod tests {
             PublicKey::from_hex("884704bd421671e01c13f854d2ce23ce2a5bfe9562f4f297ad2bc921ba30c3a6")
                 .unwrap();
 
-        let (key_package_hex, _) = mdk
+        let (key_package_hex, _, _) = mdk
             .create_key_package_for_event(&test_pubkey, vec![])
             .expect("Failed to create key package");
 
@@ -1066,6 +1340,7 @@ mod tests {
                     ["0x0003", "0x000a", "0x0002", "0xf2ee"],
                 ),
                 Tag::relays(vec![]), // Empty relays tag
+                Tag::custom(TagKind::i(), [hex::encode([0xaa; 32])]),
             ];
 
             let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex.clone())
@@ -1073,7 +1348,7 @@ mod tests {
                 .sign_with_keys(&nostr::Keys::generate())
                 .unwrap();
 
-            let result = mdk.validate_key_package_tags(&event);
+            let result = mdk.validate_key_package_tags(&event, None);
             assert!(result.is_err(), "Should reject event with empty relays tag");
             let error_msg = result.unwrap_err().to_string();
             assert!(
@@ -1093,6 +1368,7 @@ mod tests {
                     ["0x0003", "0x000a", "0x0002", "0xf2ee"],
                 ),
                 Tag::custom(TagKind::Relays, ["not-a-valid-url"]),
+                Tag::custom(TagKind::i(), [hex::encode([0xaa; 32])]),
             ];
 
             let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex.clone())
@@ -1100,7 +1376,7 @@ mod tests {
                 .sign_with_keys(&nostr::Keys::generate())
                 .unwrap();
 
-            let result = mdk.validate_key_package_tags(&event);
+            let result = mdk.validate_key_package_tags(&event, None);
             assert!(
                 result.is_err(),
                 "Should reject event with invalid relay URL format"
@@ -1123,6 +1399,7 @@ mod tests {
                     ["0x0003", "0x000a", "0x0002", "0xf2ee"],
                 ),
                 Tag::custom(TagKind::Relays, ["wss://valid.relay.com", "invalid-url"]),
+                Tag::custom(TagKind::i(), [hex::encode([0xaa; 32])]),
             ];
 
             let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex.clone())
@@ -1130,7 +1407,7 @@ mod tests {
                 .sign_with_keys(&nostr::Keys::generate())
                 .unwrap();
 
-            let result = mdk.validate_key_package_tags(&event);
+            let result = mdk.validate_key_package_tags(&event, None);
             assert!(
                 result.is_err(),
                 "Should reject event with invalid relay URL in list"
@@ -1153,6 +1430,7 @@ mod tests {
                     ["0x0003", "0x000a", "0x0002", "0xf2ee"],
                 ),
                 Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
+                Tag::custom(TagKind::i(), [hex::encode([0xaa; 32])]),
             ];
 
             let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex.clone())
@@ -1160,7 +1438,7 @@ mod tests {
                 .sign_with_keys(&nostr::Keys::generate())
                 .unwrap();
 
-            let result = mdk.validate_key_package_tags(&event);
+            let result = mdk.validate_key_package_tags(&event, None);
             assert!(
                 result.is_ok(),
                 "Should accept event with single valid relay URL, got error: {:?}",
@@ -1182,6 +1460,7 @@ mod tests {
                     RelayUrl::parse("wss://relay2.example.com").unwrap(),
                     RelayUrl::parse("wss://relay3.example.com").unwrap(),
                 ]),
+                Tag::custom(TagKind::i(), [hex::encode([0xaa; 32])]),
             ];
 
             let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex)
@@ -1189,7 +1468,7 @@ mod tests {
                 .sign_with_keys(&nostr::Keys::generate())
                 .unwrap();
 
-            let result = mdk.validate_key_package_tags(&event);
+            let result = mdk.validate_key_package_tags(&event, None);
             assert!(
                 result.is_ok(),
                 "Should accept event with multiple valid relay URLs, got error: {:?}",
@@ -1206,7 +1485,7 @@ mod tests {
             PublicKey::from_hex("884704bd421671e01c13f854d2ce23ce2a5bfe9562f4f297ad2bc921ba30c3a6")
                 .unwrap();
 
-        let (key_package_hex, _) = mdk
+        let (key_package_hex, _, _) = mdk
             .create_key_package_for_event(&test_pubkey, vec![])
             .expect("Failed to create key package");
 
@@ -1217,6 +1496,7 @@ mod tests {
                 Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
                 Tag::custom(TagKind::MlsExtensions, ["0x0003", "0x000a"]),
                 Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
+                Tag::custom(TagKind::i(), [hex::encode([0xaa; 32])]),
             ];
 
             let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex.clone())
@@ -1224,7 +1504,7 @@ mod tests {
                 .sign_with_keys(&nostr::Keys::generate())
                 .unwrap();
 
-            let result = mdk.validate_key_package_tags(&event);
+            let result = mdk.validate_key_package_tags(&event, None);
             assert!(result.is_err(), "Should reject protocol version 2.0");
             let error_msg = result.unwrap_err().to_string();
             assert!(
@@ -1241,6 +1521,7 @@ mod tests {
                 Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
                 Tag::custom(TagKind::MlsExtensions, ["0x0003", "0x000a"]),
                 Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
+                Tag::custom(TagKind::i(), [hex::encode([0xaa; 32])]),
             ];
 
             let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex.clone())
@@ -1248,7 +1529,7 @@ mod tests {
                 .sign_with_keys(&nostr::Keys::generate())
                 .unwrap();
 
-            let result = mdk.validate_key_package_tags(&event);
+            let result = mdk.validate_key_package_tags(&event, None);
             assert!(result.is_err(), "Should reject protocol version 0.9");
             let error_msg = result.unwrap_err().to_string();
             assert!(
@@ -1265,6 +1546,7 @@ mod tests {
                 Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
                 Tag::custom(TagKind::MlsExtensions, ["0x0003", "0x000a"]),
                 Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
+                Tag::custom(TagKind::i(), [hex::encode([0xaa; 32])]),
             ];
 
             let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex)
@@ -1272,7 +1554,7 @@ mod tests {
                 .sign_with_keys(&nostr::Keys::generate())
                 .unwrap();
 
-            let result = mdk.validate_key_package_tags(&event);
+            let result = mdk.validate_key_package_tags(&event, None);
             assert!(
                 result.is_err(),
                 "Should reject protocol version tag without value"
@@ -1294,7 +1576,7 @@ mod tests {
             PublicKey::from_hex("884704bd421671e01c13f854d2ce23ce2a5bfe9562f4f297ad2bc921ba30c3a6")
                 .unwrap();
 
-        let (key_package_hex, _) = mdk
+        let (key_package_hex, _, _) = mdk
             .create_key_package_for_event(&test_pubkey, vec![])
             .expect("Failed to create key package");
 
@@ -1305,6 +1587,7 @@ mod tests {
                 Tag::custom(TagKind::MlsCiphersuite, ["0x01"]), // Too short
                 Tag::custom(TagKind::MlsExtensions, ["0x0003"]),
                 Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
+                Tag::custom(TagKind::i(), [hex::encode([0xaa; 32])]),
             ];
 
             let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex.clone())
@@ -1312,7 +1595,7 @@ mod tests {
                 .sign_with_keys(&nostr::Keys::generate())
                 .unwrap();
 
-            let result = mdk.validate_key_package_tags(&event);
+            let result = mdk.validate_key_package_tags(&event, None);
             assert!(
                 result.is_err(),
                 "Should reject ciphersuite with invalid hex length"
@@ -1327,6 +1610,7 @@ mod tests {
                 Tag::custom(TagKind::MlsCiphersuite, ["0xGGGG"]), // Invalid hex
                 Tag::custom(TagKind::MlsExtensions, ["0x0003"]),
                 Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
+                Tag::custom(TagKind::i(), [hex::encode([0xaa; 32])]),
             ];
 
             let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex.clone())
@@ -1334,7 +1618,7 @@ mod tests {
                 .sign_with_keys(&nostr::Keys::generate())
                 .unwrap();
 
-            let result = mdk.validate_key_package_tags(&event);
+            let result = mdk.validate_key_package_tags(&event, None);
             assert!(
                 result.is_err(),
                 "Should reject ciphersuite with invalid hex characters"
@@ -1349,6 +1633,7 @@ mod tests {
                 Tag::custom(TagKind::MlsCiphersuite, [""]), // Empty value
                 Tag::custom(TagKind::MlsExtensions, ["0x0003"]),
                 Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
+                Tag::custom(TagKind::i(), [hex::encode([0xaa; 32])]),
             ];
 
             let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex)
@@ -1356,7 +1641,7 @@ mod tests {
                 .sign_with_keys(&nostr::Keys::generate())
                 .unwrap();
 
-            let result = mdk.validate_key_package_tags(&event);
+            let result = mdk.validate_key_package_tags(&event, None);
             assert!(result.is_err(), "Should reject empty ciphersuite value");
             // Empty string fails hex format validation (must be 6 characters)
             assert!(result.unwrap_err().to_string().contains("6 characters"));
@@ -1371,7 +1656,7 @@ mod tests {
             PublicKey::from_hex("884704bd421671e01c13f854d2ce23ce2a5bfe9562f4f297ad2bc921ba30c3a6")
                 .unwrap();
 
-        let (key_package_hex, _) = mdk
+        let (key_package_hex, _, _) = mdk
             .create_key_package_for_event(&test_pubkey, vec![])
             .expect("Failed to create key package");
 
@@ -1382,6 +1667,7 @@ mod tests {
                 Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
                 Tag::custom(TagKind::MlsExtensions, ["0x03", "0x000a"]), // First one too short
                 Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
+                Tag::custom(TagKind::i(), [hex::encode([0xaa; 32])]),
             ];
 
             let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex.clone())
@@ -1389,7 +1675,7 @@ mod tests {
                 .sign_with_keys(&nostr::Keys::generate())
                 .unwrap();
 
-            let result = mdk.validate_key_package_tags(&event);
+            let result = mdk.validate_key_package_tags(&event, None);
             assert!(
                 result.is_err(),
                 "Should reject extension with invalid hex length"
@@ -1404,6 +1690,7 @@ mod tests {
                 Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
                 Tag::custom(TagKind::MlsExtensions, ["0x0003", "0xZZZZ"]), // Invalid hex
                 Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
+                Tag::custom(TagKind::i(), [hex::encode([0xaa; 32])]),
             ];
 
             let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex.clone())
@@ -1411,7 +1698,7 @@ mod tests {
                 .sign_with_keys(&nostr::Keys::generate())
                 .unwrap();
 
-            let result = mdk.validate_key_package_tags(&event);
+            let result = mdk.validate_key_package_tags(&event, None);
             assert!(
                 result.is_err(),
                 "Should reject extension with invalid hex characters"
@@ -1426,6 +1713,7 @@ mod tests {
                 Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
                 Tag::custom(TagKind::MlsExtensions, ["0x0003", ""]), // Empty value
                 Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
+                Tag::custom(TagKind::i(), [hex::encode([0xaa; 32])]),
             ];
 
             let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex)
@@ -1433,7 +1721,7 @@ mod tests {
                 .sign_with_keys(&nostr::Keys::generate())
                 .unwrap();
 
-            let result = mdk.validate_key_package_tags(&event);
+            let result = mdk.validate_key_package_tags(&event, None);
             assert!(result.is_err(), "Should reject empty extension value");
             // Empty string fails hex format validation (must be 6 characters)
             assert!(result.unwrap_err().to_string().contains("6 characters"));
@@ -1448,7 +1736,7 @@ mod tests {
             PublicKey::from_hex("884704bd421671e01c13f854d2ce23ce2a5bfe9562f4f297ad2bc921ba30c3a6")
                 .unwrap();
 
-        let (key_package_hex, _) = mdk
+        let (key_package_hex, _, _) = mdk
             .create_key_package_for_event(&test_pubkey, vec![])
             .expect("Failed to create key package");
 
@@ -1462,6 +1750,7 @@ mod tests {
                     ["0x0003", "0x000a", "0x0002", "0xf2ee"],
                 ),
                 Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
+                Tag::custom(TagKind::i(), [hex::encode([0xaa; 32])]),
             ];
 
             let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex.clone())
@@ -1469,7 +1758,7 @@ mod tests {
                 .sign_with_keys(&nostr::Keys::generate())
                 .unwrap();
 
-            let result = mdk.validate_key_package_tags(&event);
+            let result = mdk.validate_key_package_tags(&event, None);
             assert!(
                 result.is_err(),
                 "Should reject unsupported ciphersuite 0x0002"
@@ -1492,6 +1781,7 @@ mod tests {
                 ), // Invalid format (must be hex like 0x0001)
                 Tag::custom(TagKind::MlsExtensions, ["0x000a", "0xf2ee"]),
                 Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
+                Tag::custom(TagKind::i(), [hex::encode([0xaa; 32])]),
             ];
 
             let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex)
@@ -1499,7 +1789,7 @@ mod tests {
                 .sign_with_keys(&nostr::Keys::generate())
                 .unwrap();
 
-            let result = mdk.validate_key_package_tags(&event);
+            let result = mdk.validate_key_package_tags(&event, None);
             assert!(result.is_err(), "Should reject non-hex ciphersuite format");
             // Should fail on hex format validation, not legacy validation
             assert!(result.unwrap_err().to_string().contains("6 characters"));
@@ -1514,7 +1804,7 @@ mod tests {
             PublicKey::from_hex("884704bd421671e01c13f854d2ce23ce2a5bfe9562f4f297ad2bc921ba30c3a6")
                 .unwrap();
 
-        let (key_package_hex, _) = mdk
+        let (key_package_hex, _, _) = mdk
             .create_key_package_for_event(&test_pubkey, vec![])
             .expect("Failed to create key package");
 
@@ -1526,6 +1816,7 @@ mod tests {
                 Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
                 Tag::custom(TagKind::MlsExtensions, ["0xf2ee"]), // Missing 0x000a (LastResort)
                 Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
+                Tag::custom(TagKind::i(), [hex::encode([0xaa; 32])]),
             ];
 
             let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex.clone())
@@ -1533,7 +1824,7 @@ mod tests {
                 .sign_with_keys(&nostr::Keys::generate())
                 .unwrap();
 
-            let result = mdk.validate_key_package_tags(&event);
+            let result = mdk.validate_key_package_tags(&event, None);
             assert!(result.is_err(), "Should reject event missing LastResort");
             let error_msg = result.unwrap_err().to_string();
             assert!(
@@ -1553,6 +1844,7 @@ mod tests {
                 Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
                 Tag::custom(TagKind::MlsExtensions, ["0x000a"]), // Missing 0xf2ee (NostrGroupData)
                 Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
+                Tag::custom(TagKind::i(), [hex::encode([0xaa; 32])]),
             ];
 
             let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex)
@@ -1560,7 +1852,7 @@ mod tests {
                 .sign_with_keys(&nostr::Keys::generate())
                 .unwrap();
 
-            let result = mdk.validate_key_package_tags(&event);
+            let result = mdk.validate_key_package_tags(&event, None);
             assert!(
                 result.is_err(),
                 "Should reject event missing NostrGroupData"
@@ -1585,7 +1877,7 @@ mod tests {
             PublicKey::from_hex("884704bd421671e01c13f854d2ce23ce2a5bfe9562f4f297ad2bc921ba30c3a6")
                 .unwrap();
 
-        let (key_package_hex, _) = mdk
+        let (key_package_hex, _, _) = mdk
             .create_key_package_for_event(&test_pubkey, vec![])
             .expect("Failed to create key package");
 
@@ -1596,6 +1888,7 @@ mod tests {
                 Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
                 Tag::custom(TagKind::MlsExtensions, ["0x000A", "0xF2EE"]), // Uppercase hex digits
                 Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
+                Tag::custom(TagKind::i(), [hex::encode([0xaa; 32])]),
             ];
 
             let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex.clone())
@@ -1603,7 +1896,7 @@ mod tests {
                 .sign_with_keys(&nostr::Keys::generate())
                 .unwrap();
 
-            let result = mdk.validate_key_package_tags(&event);
+            let result = mdk.validate_key_package_tags(&event, None);
             assert!(
                 result.is_ok(),
                 "Should accept uppercase hex digits in extensions, got error: {:?}",
@@ -1618,6 +1911,7 @@ mod tests {
                 Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
                 Tag::custom(TagKind::MlsExtensions, ["0x000a", "0xF2Ee"]), // Mixed case
                 Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
+                Tag::custom(TagKind::i(), [hex::encode([0xaa; 32])]),
             ];
 
             let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex)
@@ -1625,7 +1919,7 @@ mod tests {
                 .sign_with_keys(&nostr::Keys::generate())
                 .unwrap();
 
-            let result = mdk.validate_key_package_tags(&event);
+            let result = mdk.validate_key_package_tags(&event, None);
             assert!(
                 result.is_ok(),
                 "Should accept mixed case hex digits in extensions, got error: {:?}",
@@ -1642,7 +1936,7 @@ mod tests {
             PublicKey::from_hex("884704bd421671e01c13f854d2ce23ce2a5bfe9562f4f297ad2bc921ba30c3a6")
                 .unwrap();
 
-        let (key_package_hex, _) = mdk
+        let (key_package_hex, _, _) = mdk
             .create_key_package_for_event(&test_pubkey, vec![])
             .expect("Failed to create key package");
 
@@ -1651,6 +1945,7 @@ mod tests {
             Tag::custom(TagKind::MlsCiphersuite, Vec::<&str>::new()), // No value
             Tag::custom(TagKind::MlsExtensions, ["0x000a", "0xf2ee"]),
             Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
+            Tag::custom(TagKind::i(), [hex::encode([0xaa; 32])]),
         ];
 
         let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex)
@@ -1658,7 +1953,7 @@ mod tests {
             .sign_with_keys(&nostr::Keys::generate())
             .unwrap();
 
-        let result = mdk.validate_key_package_tags(&event);
+        let result = mdk.validate_key_package_tags(&event, None);
         assert!(
             result.is_err(),
             "Should reject ciphersuite tag without value"
@@ -1679,7 +1974,7 @@ mod tests {
             PublicKey::from_hex("884704bd421671e01c13f854d2ce23ce2a5bfe9562f4f297ad2bc921ba30c3a6")
                 .unwrap();
 
-        let (key_package_hex, _) = mdk
+        let (key_package_hex, _, _) = mdk
             .create_key_package_for_event(&test_pubkey, vec![])
             .expect("Failed to create key package");
 
@@ -1688,6 +1983,7 @@ mod tests {
             Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
             Tag::custom(TagKind::MlsExtensions, Vec::<&str>::new()), // No values
             Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
+            Tag::custom(TagKind::i(), [hex::encode([0xaa; 32])]),
         ];
 
         let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex)
@@ -1695,7 +1991,7 @@ mod tests {
             .sign_with_keys(&nostr::Keys::generate())
             .unwrap();
 
-        let result = mdk.validate_key_package_tags(&event);
+        let result = mdk.validate_key_package_tags(&event, None);
         assert!(
             result.is_err(),
             "Should reject extensions tag without values"
@@ -1716,13 +2012,13 @@ mod tests {
         let keys = nostr::Keys::generate();
         let relays = vec![RelayUrl::parse("wss://relay.example.com").unwrap()];
 
-        let (key_package_str, tags) = mdk
+        let (key_package_str, tags, _hash_ref) = mdk
             .create_key_package_for_event(&keys.public_key(), relays)
             .expect("Failed to create key package");
 
         // Create an event signed by the same keys used in the credential
         let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_str)
-            .tags(tags.to_vec())
+            .tags(tags)
             .sign_with_keys(&keys)
             .unwrap();
 
@@ -1743,7 +2039,7 @@ mod tests {
             PublicKey::from_hex("884704bd421671e01c13f854d2ce23ce2a5bfe9562f4f297ad2bc921ba30c3a6")
                 .unwrap();
 
-        let (key_package_hex, _) = mdk
+        let (key_package_hex, _, _) = mdk
             .create_key_package_for_event(&test_pubkey, vec![])
             .expect("Failed to create key package");
 
@@ -1784,9 +2080,6 @@ mod tests {
     /// - Key rotation proposals can be created after joining
     #[test]
     fn test_last_resort_keypackage_lifecycle() {
-        use crate::test_util::create_nostr_group_config_data;
-        use nostr::{EventBuilder, Keys};
-
         // Setup: Create Bob who will be invited to a group
         let bob_keys = Keys::generate();
         let bob_mdk = create_test_mdk();
@@ -1799,7 +2092,7 @@ mod tests {
         // Step 1: Bob creates a KeyPackage with last_resort extension
         // Note: By default, MDK creates KeyPackages with last_resort extension enabled
         let relays = vec![RelayUrl::parse("wss://test.relay").unwrap()];
-        let (bob_key_package_hex, tags) = bob_mdk
+        let (bob_key_package_hex, tags, _hash_ref) = bob_mdk
             .create_key_package_for_event(&bob_pubkey, relays.clone())
             .expect("Failed to create key package");
 
@@ -1821,7 +2114,7 @@ mod tests {
 
         // Create the KeyPackage event
         let bob_key_package_event = EventBuilder::new(Kind::MlsKeyPackage, bob_key_package_hex)
-            .tags(tags.to_vec())
+            .tags(tags)
             .sign_with_keys(&bob_keys)
             .expect("Failed to sign event");
 
@@ -1898,7 +2191,7 @@ mod tests {
                 .unwrap();
         let relays = vec![RelayUrl::parse("wss://relay.example.com").unwrap()];
 
-        let (key_package_str, tags) = mdk
+        let (key_package_str, tags, _hash_ref) = mdk
             .create_key_package_for_event(&test_pubkey, relays)
             .expect("Failed to create key package");
 
@@ -1933,7 +2226,7 @@ mod tests {
                 .unwrap();
         let relays = vec![RelayUrl::parse("wss://relay.example.com").unwrap()];
 
-        let (base64_key_package, _) = mdk
+        let (base64_key_package, _, _) = mdk
             .create_key_package_for_event(&test_pubkey, relays)
             .expect("Failed to create base64 key package");
 
@@ -1968,13 +2261,13 @@ mod tests {
         let relays = vec![RelayUrl::parse("wss://relay.example.com").unwrap()];
 
         // Create a key package with the victim's public key in the credential
-        let (key_package_hex, tags) = mdk
+        let (key_package_hex, tags, _hash_ref) = mdk
             .create_key_package_for_event(&victim_keys.public_key(), relays)
             .expect("Failed to create key package");
 
         // Attacker signs the event with their own keys (NOT the victim's keys)
         let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex)
-            .tags(tags.to_vec())
+            .tags(tags)
             .sign_with_keys(&attacker_keys)
             .unwrap();
 
@@ -2021,13 +2314,13 @@ mod tests {
         let relays = vec![RelayUrl::parse("wss://relay.example.com").unwrap()];
 
         // Create a key package with the user's public key
-        let (key_package_hex, tags) = mdk
+        let (key_package_hex, tags, _hash_ref) = mdk
             .create_key_package_for_event(&keys.public_key(), relays)
             .expect("Failed to create key package");
 
         // Sign the event with the same keys (legitimate scenario)
         let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex)
-            .tags(tags.to_vec())
+            .tags(tags)
             .sign_with_keys(&keys)
             .unwrap();
 
@@ -2050,6 +2343,271 @@ mod tests {
             parsed_pubkey,
             keys.public_key(),
             "Parsed key package should have the correct identity"
+        );
+    }
+
+    /// Test that the `i` tag contains a valid hex-encoded KeyPackageRef that matches
+    /// the independently computed value from the key package content.
+    #[test]
+    fn test_i_tag_contains_valid_key_package_ref() {
+        let mdk = create_test_mdk();
+        let keys = nostr::Keys::generate();
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").unwrap()];
+
+        let (key_package_str, tags, _hash_ref) = mdk
+            .create_key_package_for_event(&keys.public_key(), relays)
+            .expect("Failed to create key package");
+
+        // Find the i tag
+        let i_tag = tags
+            .iter()
+            .find(|t| t.kind() == TagKind::i())
+            .expect("i tag not found");
+        let i_tag_value = i_tag.content().expect("i tag should have content");
+
+        // Verify it's valid hex
+        let i_tag_bytes = hex::decode(i_tag_value).expect("i tag value should be valid hex");
+        assert!(
+            !i_tag_bytes.is_empty(),
+            "i tag should contain non-empty hex data"
+        );
+
+        // Parse the key package and compute the KeyPackageRef independently
+        let key_package = mdk
+            .parse_serialized_key_package(&key_package_str, ContentEncoding::Base64)
+            .expect("Failed to parse key package");
+        let computed_ref = key_package
+            .hash_ref(mdk.provider.crypto())
+            .expect("Failed to compute hash_ref");
+        let computed_ref_hex = hex::encode(computed_ref.as_slice());
+
+        assert_eq!(
+            i_tag_value, computed_ref_hex,
+            "i tag value should match the computed KeyPackageRef"
+        );
+    }
+
+    /// Test that parse_key_package rejects events where the `i` tag value
+    /// does not match the computed KeyPackageRef from the content.
+    #[test]
+    fn test_parse_key_package_rejects_mismatched_i_tag() {
+        let mdk = create_test_mdk();
+        let keys = nostr::Keys::generate();
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").unwrap()];
+
+        let (key_package_str, mut tags, _hash_ref) = mdk
+            .create_key_package_for_event(&keys.public_key(), relays)
+            .expect("Failed to create key package");
+
+        // Replace the i tag with a fabricated (wrong) value
+        let i_tag_idx = tags
+            .iter()
+            .position(|t| t.kind() == TagKind::i())
+            .expect("i tag should exist");
+        tags[i_tag_idx] = Tag::custom(TagKind::i(), [hex::encode([0xff; 32])]);
+
+        let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_str)
+            .tags(tags)
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        let result = mdk.parse_key_package(&event);
+        assert!(
+            result.is_err(),
+            "Should reject key package with mismatched i tag"
+        );
+        let error_msg = result.unwrap_err().to_string();
+        assert!(
+            error_msg.contains("does not match"),
+            "Error should mention mismatch, got: {}",
+            error_msg
+        );
+    }
+
+    /// Test that validate_key_package_tags rejects events missing the `i` tag
+    #[test]
+    fn test_validate_missing_i_tag() {
+        let mdk = create_test_mdk();
+        let test_pubkey =
+            PublicKey::from_hex("884704bd421671e01c13f854d2ce23ce2a5bfe9562f4f297ad2bc921ba30c3a6")
+                .unwrap();
+
+        let (key_package_hex, _, _) = mdk
+            .create_key_package_for_event(&test_pubkey, vec![])
+            .expect("Failed to create key package");
+
+        // All required tags present EXCEPT i
+        let tags = vec![
+            Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
+            Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
+            Tag::custom(TagKind::MlsExtensions, ["0x000a", "0xf2ee"]),
+            Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
+        ];
+
+        let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex)
+            .tags(tags)
+            .sign_with_keys(&nostr::Keys::generate())
+            .unwrap();
+
+        let result = mdk.validate_key_package_tags(&event, None);
+        assert!(result.is_err(), "Should reject event without i tag");
+        let error_msg = result.unwrap_err().to_string();
+        assert!(
+            error_msg.contains("Missing required tag: i"),
+            "Error should mention missing i tag, got: {}",
+            error_msg
+        );
+    }
+
+    /// Test that validate_key_package_tags rejects events with invalid hex in the `i` tag
+    #[test]
+    fn test_validate_invalid_i_tag_hex() {
+        let mdk = create_test_mdk();
+        let test_pubkey =
+            PublicKey::from_hex("884704bd421671e01c13f854d2ce23ce2a5bfe9562f4f297ad2bc921ba30c3a6")
+                .unwrap();
+
+        let (key_package_hex, _, _) = mdk
+            .create_key_package_for_event(&test_pubkey, vec![])
+            .expect("Failed to create key package");
+
+        let tags = vec![
+            Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
+            Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
+            Tag::custom(TagKind::MlsExtensions, ["0x000a", "0xf2ee"]),
+            Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
+            Tag::custom(TagKind::i(), ["not-valid-hex!@#"]),
+        ];
+
+        let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex)
+            .tags(tags)
+            .sign_with_keys(&nostr::Keys::generate())
+            .unwrap();
+
+        let result = mdk.validate_key_package_tags(&event, None);
+        assert!(
+            result.is_err(),
+            "Should reject event with invalid hex in i tag"
+        );
+        let error_msg = result.unwrap_err().to_string();
+        assert!(
+            error_msg.contains("valid hex"),
+            "Error should mention invalid hex, got: {}",
+            error_msg
+        );
+    }
+
+    /// Test that validate_key_package_tags rejects events with empty `i` tag (no value)
+    #[test]
+    fn test_validate_empty_i_tag() {
+        let mdk = create_test_mdk();
+        let test_pubkey =
+            PublicKey::from_hex("884704bd421671e01c13f854d2ce23ce2a5bfe9562f4f297ad2bc921ba30c3a6")
+                .unwrap();
+
+        let (key_package_hex, _, _) = mdk
+            .create_key_package_for_event(&test_pubkey, vec![])
+            .expect("Failed to create key package");
+
+        let tags = vec![
+            Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
+            Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
+            Tag::custom(TagKind::MlsExtensions, ["0x000a", "0xf2ee"]),
+            Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
+            Tag::custom(TagKind::i(), Vec::<&str>::new()),
+        ];
+
+        let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex)
+            .tags(tags)
+            .sign_with_keys(&nostr::Keys::generate())
+            .unwrap();
+
+        let result = mdk.validate_key_package_tags(&event, None);
+        assert!(result.is_err(), "Should reject event with empty i tag");
+        let error_msg = result.unwrap_err().to_string();
+        assert!(
+            error_msg.contains("exactly one value"),
+            "Error should mention exactly one value, got: {}",
+            error_msg
+        );
+    }
+
+    /// Test that validate_key_package_tags rejects events with multi-value `i` tag
+    #[test]
+    fn test_validate_multi_value_i_tag() {
+        let mdk = create_test_mdk();
+        let test_pubkey =
+            PublicKey::from_hex("884704bd421671e01c13f854d2ce23ce2a5bfe9562f4f297ad2bc921ba30c3a6")
+                .unwrap();
+
+        let (key_package_hex, _, _) = mdk
+            .create_key_package_for_event(&test_pubkey, vec![])
+            .expect("Failed to create key package");
+
+        let tags = vec![
+            Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
+            Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
+            Tag::custom(TagKind::MlsExtensions, ["0x000a", "0xf2ee"]),
+            Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
+            Tag::custom(
+                TagKind::i(),
+                [hex::encode([0xaa; 32]), hex::encode([0xbb; 32])],
+            ),
+        ];
+
+        let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex)
+            .tags(tags)
+            .sign_with_keys(&nostr::Keys::generate())
+            .unwrap();
+
+        let result = mdk.validate_key_package_tags(&event, None);
+        assert!(
+            result.is_err(),
+            "Should reject event with multi-value i tag"
+        );
+        let error_msg = result.unwrap_err().to_string();
+        assert!(
+            error_msg.contains("exactly one value"),
+            "Error should mention exactly one value, got: {}",
+            error_msg
+        );
+    }
+
+    /// Test that validate_key_package_tags rejects events with empty string in `i` tag
+    #[test]
+    fn test_validate_empty_string_i_tag() {
+        let mdk = create_test_mdk();
+        let test_pubkey =
+            PublicKey::from_hex("884704bd421671e01c13f854d2ce23ce2a5bfe9562f4f297ad2bc921ba30c3a6")
+                .unwrap();
+
+        let (key_package_hex, _, _) = mdk
+            .create_key_package_for_event(&test_pubkey, vec![])
+            .expect("Failed to create key package");
+
+        let tags = vec![
+            Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
+            Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
+            Tag::custom(TagKind::MlsExtensions, ["0x000a", "0xf2ee"]),
+            Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
+            Tag::custom(TagKind::i(), [""]),
+        ];
+
+        let event = EventBuilder::new(Kind::MlsKeyPackage, key_package_hex)
+            .tags(tags)
+            .sign_with_keys(&nostr::Keys::generate())
+            .unwrap();
+
+        let result = mdk.validate_key_package_tags(&event, None);
+        assert!(
+            result.is_err(),
+            "Should reject event with empty string i tag value"
+        );
+        let error_msg = result.unwrap_err().to_string();
+        assert!(
+            error_msg.contains("must not be empty"),
+            "Error should mention empty value, got: {}",
+            error_msg
         );
     }
 }

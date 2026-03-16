@@ -5,10 +5,10 @@
 use mdk_storage_traits::MdkStorageProvider;
 use mdk_storage_traits::groups::types as group_types;
 use mdk_storage_traits::messages::types as message_types;
-use nostr::Event;
+use nostr::{Event, Timestamp};
 use openmls::group::{ProcessMessageError, ValidationError};
 use openmls::prelude::{
-    ContentType, MlsGroup, MlsMessageIn, ProcessedMessage, ProcessedMessageContent,
+    ContentType, MlsGroup, MlsMessageIn, ProcessedMessage, ProcessedMessageContent, Proposal,
 };
 use tls_codec::Deserialize as TlsDeserialize;
 
@@ -193,6 +193,16 @@ where
                     ));
                 }
 
+                // Detect self-update before merging (same logic as MDK::merge_pending_commit)
+                let is_self_update = mls_group.pending_commit().is_some_and(|staged_commit| {
+                    let has_update_signal = staged_commit.update_path_leaf_node().is_some()
+                        || staged_commit.update_proposals().next().is_some();
+                    let no_non_update_proposals = staged_commit
+                        .queued_proposals()
+                        .all(|p| matches!(p.proposal(), Proposal::Update(_)));
+                    has_update_signal && no_non_update_proposals
+                });
+
                 mls_group
                     .merge_pending_commit(&self.provider)
                     .map_err(|_e| Error::Message("Failed to merge pending commit".to_string()))?;
@@ -209,11 +219,43 @@ where
                     };
                 }
 
-                // Save exporter secret for the new epoch
+                // Save MIP-03 and MIP-04 exporter secrets for the new epoch
                 self.exporter_secret(&group.mls_group_id)?;
+                #[cfg(feature = "mip04")]
+                {
+                    let mip04_secret = self.mip04_exporter_secret(&group.mls_group_id)?;
+                    self.storage()
+                        .save_group_mip04_exporter_secret(mip04_secret)
+                        .map_err(|_| {
+                            Error::Group("Failed to save MIP-04 exporter secret".to_string())
+                        })?;
+                }
+
+                let min_epoch_to_keep = mls_group
+                    .epoch()
+                    .as_u64()
+                    .saturating_sub(self.config.max_past_epochs as u64);
+                self.storage()
+                    .prune_group_exporter_secrets_before_epoch(
+                        &group.mls_group_id,
+                        min_epoch_to_keep,
+                    )
+                    .map_err(|_| Error::Group("Failed to prune exporter secrets".to_string()))?;
 
                 // Sync the stored group metadata with the updated MLS group state
                 self.sync_group_metadata_from_mls(&group.mls_group_id)?;
+
+                // Update self-update tracking if this was a self-update commit
+                if is_self_update {
+                    let mut stored_group = self
+                        .get_group(&group.mls_group_id)?
+                        .ok_or(Error::GroupNotFound)?;
+                    stored_group.self_update_state =
+                        group_types::SelfUpdateState::CompletedAt(Timestamp::now());
+                    self.storage()
+                        .save_group(stored_group)
+                        .map_err(|e| Error::Group(e.to_string()))?;
+                }
 
                 // Save a processed message so we don't reprocess
                 let processed_message = super::create_processed_message_record(
@@ -387,6 +429,7 @@ mod tests {
     fn test_message_processing_result_variants() {
         // Test that MessageProcessingResult variants can be created and matched
         let test_group_id = GroupId::from_slice(&[1, 2, 3, 4]);
+        let now = Timestamp::now();
         let dummy_message = message_types::Message {
             id: EventId::all_zeros(),
             pubkey: PublicKey::from_hex(
@@ -395,7 +438,8 @@ mod tests {
             .unwrap(),
             kind: Kind::TextNote,
             mls_group_id: test_group_id.clone(),
-            created_at: Timestamp::now(),
+            created_at: now,
+            processed_at: now,
             content: "Test".to_string(),
             tags: Tags::new(),
             event: EventBuilder::new(Kind::TextNote, "Test").build(

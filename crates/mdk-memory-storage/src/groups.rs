@@ -1,11 +1,11 @@
-//! Memory-based storage implementation of the MdkStorageProvider trait for Nostr MLS groups
+//! Memory-based storage implementation of the MdkStorageProvider trait for MDK groups
 
 use std::collections::BTreeSet;
 
 use mdk_storage_traits::GroupId;
 use mdk_storage_traits::groups::error::GroupError;
 use mdk_storage_traits::groups::types::*;
-use mdk_storage_traits::groups::{GroupStorage, MAX_MESSAGE_LIMIT, Pagination};
+use mdk_storage_traits::groups::{GroupStorage, MAX_MESSAGE_LIMIT, MessageSortOrder, Pagination};
 use mdk_storage_traits::messages::types::Message;
 use nostr::{PublicKey, RelayUrl};
 
@@ -116,13 +116,23 @@ impl GroupStorage for MdkMemoryStorage {
             return Err(GroupError::InvalidParameters("Group not found".to_string()));
         }
 
+        let sort_order = pagination.sort_order();
+
         match inner.messages_by_group_cache.peek(mls_group_id) {
             Some(messages_map) => {
                 // Collect values from HashMap into a Vec for sorting
                 let mut messages: Vec<Message> = messages_map.values().cloned().collect();
 
-                // Sort by created_at DESC (newest first)
-                messages.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+                // Sort newest-first using the requested sort order.
+                // Both comparators are called with (b, a) to get DESC ordering.
+                match sort_order {
+                    MessageSortOrder::CreatedAtFirst => {
+                        messages.sort_by(|a, b| b.display_order_cmp(a));
+                    }
+                    MessageSortOrder::ProcessedAtFirst => {
+                        messages.sort_by(|a, b| b.processed_at_order_cmp(a));
+                    }
+                }
 
                 // Apply pagination
                 let start = offset.min(messages.len());
@@ -132,6 +142,35 @@ impl GroupStorage for MdkMemoryStorage {
             }
             // If not in cache but group exists, return empty vector
             None => Ok(Vec::new()),
+        }
+    }
+
+    fn last_message(
+        &self,
+        mls_group_id: &GroupId,
+        sort_order: MessageSortOrder,
+    ) -> Result<Option<Message>, GroupError> {
+        let inner = self.inner.read();
+
+        if inner.groups_cache.peek(mls_group_id).is_none() {
+            return Err(GroupError::InvalidParameters("Group not found".to_string()));
+        }
+
+        match inner.messages_by_group_cache.peek(mls_group_id) {
+            Some(messages_map) if !messages_map.is_empty() => {
+                // Find the maximum element under the requested ordering.
+                // Both comparators compare (b, a) to find the DESC-first element via max_by.
+                let winner = match sort_order {
+                    MessageSortOrder::CreatedAtFirst => {
+                        messages_map.values().max_by(|a, b| a.display_order_cmp(b))
+                    }
+                    MessageSortOrder::ProcessedAtFirst => messages_map
+                        .values()
+                        .max_by(|a, b| a.processed_at_order_cmp(b)),
+                };
+                Ok(winner.cloned())
+            }
+            _ => Ok(None),
         }
     }
 
@@ -248,6 +287,98 @@ impl GroupStorage for MdkMemoryStorage {
 
         Ok(())
     }
+
+    fn get_group_mip04_exporter_secret(
+        &self,
+        mls_group_id: &GroupId,
+        epoch: u64,
+    ) -> Result<Option<GroupExporterSecret>, GroupError> {
+        let inner = self.inner.read();
+
+        // Check if the group exists while holding the lock
+        if inner.groups_cache.peek(mls_group_id).is_none() {
+            return Err(GroupError::InvalidParameters("Group not found".to_string()));
+        }
+
+        Ok(inner
+            .group_mip04_exporter_secrets_cache
+            .peek(&(mls_group_id.clone(), epoch))
+            .cloned())
+    }
+
+    fn save_group_mip04_exporter_secret(
+        &self,
+        group_exporter_secret: GroupExporterSecret,
+    ) -> Result<(), GroupError> {
+        let mut inner = self.inner.write();
+
+        // Check if the group exists while holding the lock
+        if inner
+            .groups_cache
+            .peek(&group_exporter_secret.mls_group_id)
+            .is_none()
+        {
+            return Err(GroupError::InvalidParameters("Group not found".to_string()));
+        }
+
+        let key = (
+            group_exporter_secret.mls_group_id.clone(),
+            group_exporter_secret.epoch,
+        );
+        inner
+            .group_mip04_exporter_secrets_cache
+            .put(key, group_exporter_secret);
+
+        Ok(())
+    }
+
+    fn prune_group_exporter_secrets_before_epoch(
+        &self,
+        group_id: &GroupId,
+        min_epoch_to_keep: u64,
+    ) -> Result<(), GroupError> {
+        let mut inner = self.inner.write();
+
+        if inner.groups_cache.peek(group_id).is_none() {
+            return Err(GroupError::InvalidParameters("Group not found".to_string()));
+        }
+
+        let group_event_keys: Vec<(GroupId, u64)> = inner
+            .group_exporter_secrets_cache
+            .iter()
+            .filter_map(|(k, _)| {
+                let (gid, epoch) = k;
+                if gid == group_id && *epoch < min_epoch_to_keep {
+                    Some((gid.clone(), *epoch))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for key in group_event_keys {
+            inner.group_exporter_secrets_cache.pop(&key);
+        }
+
+        let mip04_keys: Vec<(GroupId, u64)> = inner
+            .group_mip04_exporter_secrets_cache
+            .iter()
+            .filter_map(|(k, _)| {
+                let (gid, epoch) = k;
+                if gid == group_id && *epoch < min_epoch_to_keep {
+                    Some((gid.clone(), *epoch))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for key in mip04_keys {
+            inner.group_mip04_exporter_secrets_cache.pop(&key);
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -272,11 +403,13 @@ mod tests {
             admin_pubkeys: BTreeSet::new(),
             last_message_id: None,
             last_message_at: None,
+            last_message_processed_at: None,
             epoch: 0,
             state: GroupState::Active,
             image_hash: None,
             image_key: None,
             image_nonce: None,
+            self_update_state: SelfUpdateState::Required,
         }
     }
 
@@ -430,11 +563,13 @@ mod tests {
             admin_pubkeys: BTreeSet::new(),
             last_message_id: None,
             last_message_at: None,
+            last_message_processed_at: None,
             epoch: 0,
             state: GroupState::Active,
             image_hash: None,
             image_key: None,
             image_nonce: None,
+            self_update_state: SelfUpdateState::Required,
         };
 
         storage.save_group(group).unwrap();
@@ -445,17 +580,19 @@ mod tests {
             let event_id = EventId::from_slice(&[i as u8; 32]).unwrap();
             let wrapper_event_id = EventId::from_slice(&[100 + i as u8; 32]).unwrap();
 
+            let ts = Timestamp::from((1000 + i) as u64);
             let message = Message {
                 id: event_id,
                 pubkey,
                 kind: Kind::from(1u16),
                 mls_group_id: mls_group_id.clone(),
-                created_at: Timestamp::from((1000 + i) as u64),
+                created_at: ts,
+                processed_at: ts,
                 content: format!("Message {}", i),
                 tags: Tags::new(),
                 event: UnsignedEvent::new(
                     pubkey,
-                    Timestamp::from((1000 + i) as u64),
+                    ts,
                     Kind::from(9u16),
                     vec![],
                     format!("content {}", i),
@@ -552,11 +689,13 @@ mod tests {
             admin_pubkeys: BTreeSet::new(),
             last_message_id: None,
             last_message_at: None,
+            last_message_processed_at: None,
             epoch: 0,
             state: GroupState::Active,
             image_hash: None,
             image_key: None,
             image_nonce: None,
+            self_update_state: SelfUpdateState::Required,
         };
         storage.save_group(empty_group).unwrap();
 
@@ -667,11 +806,13 @@ mod tests {
             admin_pubkeys: BTreeSet::new(),
             last_message_id: None,
             last_message_at: None,
+            last_message_processed_at: None,
             epoch: 0,
             state: GroupState::Active,
             image_hash: None,
             image_key: None,
             image_nonce: None,
+            self_update_state: SelfUpdateState::Required,
         };
 
         storage.save_group(group1).unwrap();
@@ -687,11 +828,13 @@ mod tests {
             admin_pubkeys: BTreeSet::new(),
             last_message_id: None,
             last_message_at: None,
+            last_message_processed_at: None,
             epoch: 0,
             state: GroupState::Active,
             image_hash: None,
             image_key: None,
             image_nonce: None,
+            self_update_state: SelfUpdateState::Required,
         };
 
         // This should fail because nostr_group_id is already used by a different group
@@ -730,11 +873,13 @@ mod tests {
             admin_pubkeys: BTreeSet::new(),
             last_message_id: None,
             last_message_at: None,
+            last_message_processed_at: None,
             epoch: 0,
             state: GroupState::Active,
             image_hash: None,
             image_key: None,
             image_nonce: None,
+            self_update_state: SelfUpdateState::Required,
         };
 
         storage.save_group(group).unwrap();
@@ -756,11 +901,13 @@ mod tests {
             admin_pubkeys: BTreeSet::new(),
             last_message_id: None,
             last_message_at: None,
+            last_message_processed_at: None,
             epoch: 1,
             state: GroupState::Active,
             image_hash: None,
             image_key: None,
             image_nonce: None,
+            self_update_state: SelfUpdateState::Required,
         };
 
         storage.save_group(updated_group).unwrap();
@@ -800,11 +947,13 @@ mod tests {
             admin_pubkeys: BTreeSet::new(),
             last_message_id: None,
             last_message_at: None,
+            last_message_processed_at: None,
             epoch: 0,
             state: GroupState::Active,
             image_hash: None,
             image_key: None,
             image_nonce: None,
+            self_update_state: SelfUpdateState::Required,
         };
 
         storage.save_group(group).unwrap();
@@ -818,11 +967,13 @@ mod tests {
             admin_pubkeys: BTreeSet::new(),
             last_message_id: None,
             last_message_at: None,
+            last_message_processed_at: None,
             epoch: 1,
             state: GroupState::Active,
             image_hash: None,
             image_key: None,
             image_nonce: None,
+            self_update_state: SelfUpdateState::Required,
         };
 
         // This should succeed - updating the same group

@@ -5,7 +5,7 @@
 use mdk_storage_traits::MdkStorageProvider;
 use mdk_storage_traits::groups::types as group_types;
 use mdk_storage_traits::messages::types as message_types;
-use nostr::{Event, EventId, JsonUtil, UnsignedEvent};
+use nostr::{Event, EventId, JsonUtil, Timestamp, UnsignedEvent};
 use openmls::prelude::ApplicationMessage;
 
 use crate::MDK;
@@ -63,12 +63,14 @@ where
             None,
         );
 
+        let now = Timestamp::now();
         let message = message_types::Message {
             id: rumor_id,
             pubkey: rumor.pubkey,
             kind: rumor.kind,
             mls_group_id: group.mls_group_id.clone(),
             created_at: rumor.created_at,
+            processed_at: now,
             content: rumor.content.clone(),
             tags: rumor.tags.clone(),
             event: rumor.clone(),
@@ -80,21 +82,11 @@ where
         self.save_message_record(message.clone())?;
         self.save_processed_message_record(processed_message.clone())?;
 
-        // Update last_message_at and last_message_id only if this message is newer
-        let should_update = match (group.last_message_at, group.last_message_id) {
-            (None, _) => true,
-            (Some(existing_at), _) if rumor.created_at > existing_at => true,
-            (Some(existing_at), Some(existing_id))
-                if rumor.created_at == existing_at && message.id > existing_id =>
-            {
-                true
-            }
-            _ => false,
-        };
-
-        if should_update {
-            group.last_message_at = Some(rumor.created_at);
-            group.last_message_id = Some(message.id);
+        // Update last_message_at, last_message_processed_at, and last_message_id only if this
+        // message should appear first in get_messages(). Delegates to the centralized
+        // Group::update_last_message_if_newer which uses the canonical display ordering
+        // (`created_at DESC, processed_at DESC, id DESC`).
+        if group.update_last_message_if_newer(&message) {
             self.save_group_record(group)?;
         }
 

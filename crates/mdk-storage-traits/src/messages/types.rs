@@ -1,9 +1,12 @@
 //! Types for the messages module
 
+use std::cmp::Ordering;
 use std::fmt;
 use std::str::FromStr;
 
 use crate::GroupId;
+#[allow(unused_imports)] // Referenced in doc links
+use crate::groups::types::Group;
 use nostr::event::Kind;
 use nostr::{EventId, PublicKey, Tags, Timestamp, UnsignedEvent};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -41,8 +44,13 @@ pub struct Message {
     pub kind: Kind,
     /// The MLS group id of the message
     pub mls_group_id: GroupId,
-    /// The created at timestamp of the message
+    /// The created at timestamp of the message (from the rumor event)
     pub created_at: Timestamp,
+    /// The timestamp when this message was processed/received by this client.
+    /// This is useful for clients that want to display messages in the order
+    /// they were received locally, rather than in the order they were created
+    /// (which may differ due to clock skew between devices).
+    pub processed_at: Timestamp,
     /// The content of the message
     pub content: String,
     /// The tags of the message
@@ -55,6 +63,96 @@ pub struct Message {
     pub epoch: Option<u64>,
     /// The state of the message
     pub state: MessageState,
+}
+
+impl Message {
+    /// Compares two messages for display ordering.
+    ///
+    /// Messages are sorted in descending order by:
+    /// 1. `created_at` (newest first)
+    /// 2. `processed_at` (most recently processed first, as a tiebreaker)
+    /// 3. `id` (largest ID first, for deterministic ordering)
+    ///
+    /// This ordering is the single source of truth used by all storage
+    /// implementations (both in-memory and SQLite) and by the last-message
+    /// update logic in `mdk-core`.
+    ///
+    /// Returns [`Ordering::Greater`] if `self` should appear **before** `other`
+    /// in a newest-first list.
+    pub fn display_order_cmp(&self, other: &Self) -> Ordering {
+        Self::compare_display_keys(
+            self.created_at,
+            self.processed_at,
+            self.id,
+            other.created_at,
+            other.processed_at,
+            other.id,
+        )
+    }
+
+    /// Compares display-order keys without requiring full [`Message`] structs.
+    ///
+    /// This is useful when the caller only has the raw fields (e.g. from
+    /// [`crate::groups::types::Group::last_message_at`] / [`crate::groups::types::Group::last_message_processed_at`] /
+    /// [`crate::groups::types::Group::last_message_id`]).
+    ///
+    /// Returns [`Ordering::Greater`] when the first set of keys (`a_*`) should
+    /// appear **before** the second set (`b_*`) in a newest-first list.
+    pub fn compare_display_keys(
+        a_created_at: Timestamp,
+        a_processed_at: Timestamp,
+        a_id: EventId,
+        b_created_at: Timestamp,
+        b_processed_at: Timestamp,
+        b_id: EventId,
+    ) -> Ordering {
+        a_created_at
+            .cmp(&b_created_at)
+            .then_with(|| a_processed_at.cmp(&b_processed_at))
+            .then_with(|| a_id.cmp(&b_id))
+    }
+
+    /// Compares two messages for processed-at-first ordering.
+    ///
+    /// Messages are sorted in descending order by:
+    /// 1. `processed_at` (most recently received first)
+    /// 2. `created_at` (newest first, as a tiebreaker)
+    /// 3. `id` (largest ID first, for deterministic ordering)
+    ///
+    /// This ordering prioritises local reception time, making it useful
+    /// when clients want to avoid visual reordering caused by clock skew
+    /// between senders.
+    ///
+    /// Returns [`Ordering::Greater`] if `self` should appear **before** `other`
+    /// in a newest-first list.
+    pub fn processed_at_order_cmp(&self, other: &Self) -> Ordering {
+        Self::compare_processed_at_keys(
+            self.processed_at,
+            self.created_at,
+            self.id,
+            other.processed_at,
+            other.created_at,
+            other.id,
+        )
+    }
+
+    /// Compares processed-at-first ordering keys without requiring full [`Message`] structs.
+    ///
+    /// Returns [`Ordering::Greater`] when the first set of keys (`a_*`) should
+    /// appear **before** the second set (`b_*`) in a newest-first list.
+    pub fn compare_processed_at_keys(
+        a_processed_at: Timestamp,
+        a_created_at: Timestamp,
+        a_id: EventId,
+        b_processed_at: Timestamp,
+        b_created_at: Timestamp,
+        b_id: EventId,
+    ) -> Ordering {
+        a_processed_at
+            .cmp(&b_processed_at)
+            .then_with(|| a_created_at.cmp(&b_created_at))
+            .then_with(|| a_id.cmp(&b_id))
+    }
 }
 
 /// The state of the message
@@ -205,9 +303,193 @@ impl<'de> Deserialize<'de> for ProcessedMessageState {
 
 #[cfg(test)]
 mod tests {
+    use std::cmp::Ordering;
+
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn test_compare_display_keys_created_at_wins() {
+        let id_a = EventId::from_slice(&[1u8; 32]).unwrap();
+        let id_b = EventId::from_slice(&[2u8; 32]).unwrap();
+
+        // Message a: created at t=200, processed at t=201
+        // Message b: created at t=100, processed at t=300 (received much later)
+        // a wins because created_at is the primary sort key
+        let result = Message::compare_display_keys(
+            Timestamp::from(200u64),
+            Timestamp::from(201u64),
+            id_a,
+            Timestamp::from(100u64),
+            Timestamp::from(300u64),
+            id_b,
+        );
+        assert_eq!(result, Ordering::Greater);
+    }
+
+    #[test]
+    fn test_compare_display_keys_processed_at_tiebreaker() {
+        let id_a = EventId::from_slice(&[1u8; 32]).unwrap();
+        let id_b = EventId::from_slice(&[2u8; 32]).unwrap();
+
+        // Both created at t=100, but a was processed later (t=120 vs t=105)
+        let result = Message::compare_display_keys(
+            Timestamp::from(100u64),
+            Timestamp::from(120u64),
+            id_a,
+            Timestamp::from(100u64),
+            Timestamp::from(105u64),
+            id_b,
+        );
+        assert_eq!(result, Ordering::Greater);
+    }
+
+    #[test]
+    fn test_compare_display_keys_id_tiebreaker() {
+        let id_small = EventId::from_slice(&[1u8; 32]).unwrap();
+        let id_large = EventId::from_slice(&[2u8; 32]).unwrap();
+
+        // Same created_at and processed_at, larger id wins
+        let result = Message::compare_display_keys(
+            Timestamp::from(100u64),
+            Timestamp::from(105u64),
+            id_large,
+            Timestamp::from(100u64),
+            Timestamp::from(105u64),
+            id_small,
+        );
+        assert_eq!(result, Ordering::Greater);
+    }
+
+    #[test]
+    fn test_compare_display_keys_equal() {
+        let id = EventId::from_slice(&[1u8; 32]).unwrap();
+
+        let result = Message::compare_display_keys(
+            Timestamp::from(100u64),
+            Timestamp::from(105u64),
+            id,
+            Timestamp::from(100u64),
+            Timestamp::from(105u64),
+            id,
+        );
+        assert_eq!(result, Ordering::Equal);
+    }
+
+    #[test]
+    fn test_compare_display_keys_scenario_from_review() {
+        // Scenario from PR review comment by erskingardner:
+        // Message A: created_at=100, processed_at=101, id=5
+        // Message B: created_at=100, processed_at=102, id=3
+        // B should win because processed_at=102 > processed_at=101
+        let id_a = EventId::from_slice(&[5u8; 32]).unwrap();
+        let id_b = EventId::from_slice(&[3u8; 32]).unwrap();
+
+        let result = Message::compare_display_keys(
+            Timestamp::from(100u64),
+            Timestamp::from(101u64),
+            id_a,
+            Timestamp::from(100u64),
+            Timestamp::from(102u64),
+            id_b,
+        );
+        assert_eq!(
+            result,
+            Ordering::Less,
+            "Message B should win: same created_at but higher processed_at"
+        );
+    }
+
+    #[test]
+    fn test_compare_processed_at_keys_processed_at_wins() {
+        let id_a = EventId::from_slice(&[1u8; 32]).unwrap();
+        let id_b = EventId::from_slice(&[2u8; 32]).unwrap();
+
+        // Message a: processed at t=300, created at t=100
+        // Message b: processed at t=200, created at t=200
+        // a wins because processed_at is the primary sort key
+        let result = Message::compare_processed_at_keys(
+            Timestamp::from(300u64),
+            Timestamp::from(100u64),
+            id_a,
+            Timestamp::from(200u64),
+            Timestamp::from(200u64),
+            id_b,
+        );
+        assert_eq!(result, Ordering::Greater);
+    }
+
+    #[test]
+    fn test_compare_processed_at_keys_created_at_tiebreaker() {
+        let id_a = EventId::from_slice(&[1u8; 32]).unwrap();
+        let id_b = EventId::from_slice(&[2u8; 32]).unwrap();
+
+        // Both processed at t=100, but a was created later (t=120 vs t=105)
+        let result = Message::compare_processed_at_keys(
+            Timestamp::from(100u64),
+            Timestamp::from(120u64),
+            id_a,
+            Timestamp::from(100u64),
+            Timestamp::from(105u64),
+            id_b,
+        );
+        assert_eq!(result, Ordering::Greater);
+    }
+
+    #[test]
+    fn test_compare_processed_at_keys_id_tiebreaker() {
+        let id_small = EventId::from_slice(&[1u8; 32]).unwrap();
+        let id_large = EventId::from_slice(&[2u8; 32]).unwrap();
+
+        // Same processed_at and created_at, larger id wins
+        let result = Message::compare_processed_at_keys(
+            Timestamp::from(100u64),
+            Timestamp::from(105u64),
+            id_large,
+            Timestamp::from(100u64),
+            Timestamp::from(105u64),
+            id_small,
+        );
+        assert_eq!(result, Ordering::Greater);
+    }
+
+    #[test]
+    fn test_compare_processed_at_keys_equal() {
+        let id = EventId::from_slice(&[1u8; 32]).unwrap();
+
+        let result = Message::compare_processed_at_keys(
+            Timestamp::from(100u64),
+            Timestamp::from(105u64),
+            id,
+            Timestamp::from(100u64),
+            Timestamp::from(105u64),
+            id,
+        );
+        assert_eq!(result, Ordering::Equal);
+    }
+
+    #[test]
+    fn test_compare_processed_at_keys_ignores_created_at_when_processed_at_differs() {
+        // Scenario: Message A has higher created_at but lower processed_at
+        // In processed_at-first ordering, B should win because it was processed later
+        let id_a = EventId::from_slice(&[5u8; 32]).unwrap();
+        let id_b = EventId::from_slice(&[3u8; 32]).unwrap();
+
+        let result = Message::compare_processed_at_keys(
+            Timestamp::from(100u64), // a processed_at
+            Timestamp::from(200u64), // a created_at (higher!)
+            id_a,
+            Timestamp::from(150u64), // b processed_at (higher)
+            Timestamp::from(50u64),  // b created_at (lower)
+            id_b,
+        );
+        assert_eq!(
+            result,
+            Ordering::Less,
+            "Message B should win: higher processed_at despite lower created_at"
+        );
+    }
 
     #[test]
     fn test_message_state_from_str() {
@@ -293,17 +575,19 @@ mod tests {
         let pubkey =
             PublicKey::from_hex("8a9de562cbbed225b6ea0118dd3997a02df92c0bffd2224f71081a7450c3e549")
                 .unwrap();
+        let now = Timestamp::now();
         let message = Message {
             id: EventId::all_zeros(),
             pubkey,
             kind: Kind::MlsGroupMessage,
             mls_group_id: GroupId::from_slice(&[1, 2, 3, 4]),
-            created_at: Timestamp::now(),
+            created_at: now,
+            processed_at: now,
             content: "Test message".to_string(),
             tags: Tags::new(),
             event: UnsignedEvent::new(
                 pubkey,
-                Timestamp::now(),
+                now,
                 Kind::MlsGroupMessage,
                 Tags::new(),
                 "Test message".to_string(),

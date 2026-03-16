@@ -8,8 +8,9 @@ use nostr::{Tag as NostrTag, TagKind};
 use sha2::{Digest, Sha256};
 
 use crate::encrypted_media::crypto::{
-    DEFAULT_SCHEME_VERSION, decrypt_data_with_aad, derive_encryption_key, encrypt_data_with_aad,
-    generate_encryption_nonce, is_scheme_version_supported,
+    DEFAULT_SCHEME_VERSION, decrypt_data_with_aad, derive_encryption_key,
+    derive_encryption_key_with_secret, encrypt_data_with_aad, generate_encryption_nonce,
+    is_scheme_version_supported,
 };
 use crate::encrypted_media::metadata::extract_and_process_metadata;
 use crate::encrypted_media::types::{
@@ -132,22 +133,49 @@ where
     ///
     /// The filename for AAD is taken from the MediaReference, which was parsed from the imeta tag.
     /// The scheme_version from MediaReference is used to select the correct encryption scheme.
+    ///
+    /// Looks up the encryption epoch from the stored message's IMETA tag (via the
+    /// `x <hash>` field), then decrypts with that epoch's exporter secret. This is
+    /// O(1) regardless of how many epoch advancements have occurred.
     pub fn decrypt_from_download(
         &self,
         encrypted_data: &[u8],
         reference: &MediaReference,
     ) -> Result<Vec<u8>, EncryptedMediaError> {
-        let encryption_key = derive_encryption_key(
-            self.mdk,
-            &self.group_id,
-            &reference.scheme_version,
-            &reference.original_hash,
-            &reference.mime_type,
-            &reference.filename,
-        )?;
+        match self.try_decrypt_with_epoch_hint(encrypted_data, reference) {
+            Ok(data) => Ok(data),
+            Err(EncryptedMediaError::NoExporterSecretForEpoch(_))
+            | Err(EncryptedMediaError::DecryptionFailed { .. }) => {
+                tracing::debug!(
+                    target: "mdk_core::encrypted_media::manager",
+                    "Epoch hint unavailable or failed, falling back to current epoch key",
+                );
+                let key = derive_encryption_key(
+                    self.mdk,
+                    &self.group_id,
+                    &reference.scheme_version,
+                    &reference.original_hash,
+                    &reference.mime_type,
+                    &reference.filename,
+                )?;
+                Self::decrypt_and_verify(encrypted_data, &key, reference)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Decrypt and verify media data using a pre-derived encryption key
+    ///
+    /// Performs ChaCha20-Poly1305 decryption with AAD, then verifies the SHA256 hash
+    /// of the decrypted data matches the original hash from the MediaReference.
+    fn decrypt_and_verify(
+        encrypted_data: &[u8],
+        key: &Secret<[u8; 32]>,
+        reference: &MediaReference,
+    ) -> Result<Vec<u8>, EncryptedMediaError> {
         let decrypted_data = decrypt_data_with_aad(
             encrypted_data,
-            &encryption_key,
+            key,
             &Secret::new(reference.nonce),
             &reference.scheme_version,
             &reference.original_hash,
@@ -161,6 +189,53 @@ where
         }
 
         Ok(decrypted_data)
+    }
+
+    /// Try to decrypt media using the epoch stored alongside the message's IMETA tag.
+    ///
+    /// Looks up the epoch from the `messages` table by searching for the IMETA tag's
+    /// `x <hex_hash>` field, then attempts decryption with that epoch's exporter secret.
+    /// This avoids brute-forcing all historical epochs in the common case.
+    fn try_decrypt_with_epoch_hint(
+        &self,
+        encrypted_data: &[u8],
+        reference: &MediaReference,
+    ) -> Result<Vec<u8>, EncryptedMediaError> {
+        let search_term = format!("x {}", hex::encode(reference.original_hash));
+
+        let epoch = self
+            .mdk
+            .storage()
+            .find_message_epoch_by_tag_content(&self.group_id, &search_term)
+            .map_err(|_| EncryptedMediaError::DecryptionFailed {
+                reason: "Failed to query message epoch hint".to_string(),
+            })?
+            .ok_or(EncryptedMediaError::DecryptionFailed {
+                reason: "No epoch hint found for media reference".to_string(),
+            })?;
+
+        let secret = self
+            .mdk
+            .storage()
+            .get_group_mip04_exporter_secret(&self.group_id, epoch)
+            .map_err(|_| EncryptedMediaError::NoExporterSecretForEpoch(epoch))?
+            .ok_or(EncryptedMediaError::NoExporterSecretForEpoch(epoch))?;
+
+        let key = derive_encryption_key_with_secret(
+            &secret.secret,
+            &reference.scheme_version,
+            &reference.original_hash,
+            &reference.mime_type,
+            &reference.filename,
+        )?;
+
+        tracing::debug!(
+            target: "mdk_core::encrypted_media::manager",
+            "Trying epoch hint: epoch {}",
+            epoch
+        );
+
+        Self::decrypt_and_verify(encrypted_data, &key, reference)
     }
 
     /// Create an imeta tag for encrypted media (after upload)
@@ -380,11 +455,94 @@ mod tests {
 
     use image::{ImageBuffer, Rgb};
     use mdk_memory_storage::MdkMemoryStorage;
+    use mdk_storage_traits::messages::MessageStorage;
+    use mdk_storage_traits::messages::types::{Message, MessageState};
+    use nostr::{EventId, Keys, Kind, Tags, Timestamp, UnsignedEvent};
 
     use crate::media_processing::types::MediaProcessingError;
+    use crate::test_util::{create_key_package_event, create_nostr_group_config_data};
 
     fn create_test_mdk() -> MDK<MdkMemoryStorage> {
         MDK::new(MdkMemoryStorage::default())
+    }
+
+    fn create_test_mdk_with_config(config: crate::MdkConfig) -> MDK<MdkMemoryStorage> {
+        MDK::builder(MdkMemoryStorage::default())
+            .with_config(config)
+            .build()
+    }
+
+    /// Create a group, merge its pending commit, and return the MDK instance,
+    /// group ID, and the creator's keys.
+    fn setup_group() -> (MDK<MdkMemoryStorage>, GroupId, Keys) {
+        let mdk = create_test_mdk();
+        let alice_keys = Keys::generate();
+        let admins = vec![alice_keys.public_key()];
+        let create_result = mdk
+            .create_group(
+                &alice_keys.public_key(),
+                vec![],
+                create_nostr_group_config_data(admins),
+            )
+            .unwrap();
+
+        let group_id = create_result.group.mls_group_id.clone();
+        mdk.merge_pending_commit(&group_id).unwrap();
+
+        (mdk, group_id, alice_keys)
+    }
+
+    /// Store a message with IMETA tags for the given upload, returning the epoch
+    /// at which the message was recorded.
+    fn store_imeta_message(
+        mdk: &MDK<MdkMemoryStorage>,
+        group_id: &GroupId,
+        upload: &EncryptedMediaUpload,
+        pubkey: nostr::PublicKey,
+        url: &str,
+    ) -> u64 {
+        let group = mdk.load_mls_group(group_id).unwrap().unwrap();
+        let encryption_epoch = group.epoch().as_u64();
+
+        let manager = mdk.media_manager(group_id.clone());
+        let imeta_tag = manager.create_imeta_tag(upload, url);
+        let mut tags = Tags::new();
+        tags.push(imeta_tag);
+
+        let event_id = EventId::all_zeros();
+        let wrapper_event_id = EventId::from_slice(&[1u8; 32]).unwrap();
+
+        let message = Message {
+            id: event_id,
+            pubkey,
+            kind: Kind::from(445u16),
+            mls_group_id: group_id.clone(),
+            created_at: Timestamp::now(),
+            processed_at: Timestamp::now(),
+            content: "".to_string(),
+            tags: tags.clone(),
+            event: UnsignedEvent::new(
+                pubkey,
+                Timestamp::now(),
+                Kind::from(445u16),
+                tags,
+                "".to_string(),
+            ),
+            wrapper_event_id,
+            epoch: Some(encryption_epoch),
+            state: MessageState::Processed,
+        };
+
+        mdk.storage().save_message(message).unwrap();
+        encryption_epoch
+    }
+
+    /// Advance the group epoch by performing self-updates.
+    fn advance_epochs(mdk: &MDK<MdkMemoryStorage>, group_id: &GroupId, count: usize) {
+        for _ in 0..count {
+            mdk.self_update(group_id).unwrap();
+            mdk.merge_pending_commit(group_id).unwrap();
+        }
     }
 
     #[test]
@@ -1216,12 +1374,7 @@ mod tests {
 
     #[test]
     fn test_decrypt_from_download_hash_verification_failure() {
-        use crate::test_util::create_nostr_group_config_data;
-        use nostr::Keys;
-
         let mdk = create_test_mdk();
-
-        // Create a group so we have secrets for encryption/decryption
         let alice_keys = Keys::generate();
         let admins = vec![alice_keys.public_key()];
         let create_result = mdk
@@ -1230,30 +1383,377 @@ mod tests {
                 vec![],
                 create_nostr_group_config_data(admins),
             )
-            .expect("Failed to create group");
+            .unwrap();
 
         let group_id = create_result.group.mls_group_id;
         let manager = mdk.media_manager(group_id);
 
-        // 1. Create a valid encryption
         let data = b"secret data";
         let upload = manager
             .encrypt_for_upload(data, "text/plain", "secret.txt")
             .unwrap();
 
-        // 2. Create a reference but tamper with the hash
+        // Tamper with the hash -- this changes the AAD, causing Poly1305 to fail
         let mut media_ref =
             manager.create_media_reference(&upload, "https://example.com".to_string());
-        media_ref.original_hash[0] ^= 0xFF; // Flip a bit in the hash
+        media_ref.original_hash[0] ^= 0xFF;
 
-        // 3. Attempt decryption
         let result = manager.decrypt_from_download(&upload.encrypted_data, &media_ref);
-
-        // Changing the hash changes the AAD, which causes Poly1305 verification to fail.
-        // So we expect DecryptionFailed, not HashVerificationFailed.
         assert!(matches!(
             result,
             Err(EncryptedMediaError::DecryptionFailed { .. })
         ));
+    }
+
+    /// Verifies that decrypt_from_download resolves via the epoch hint when the
+    /// current epoch has advanced past the encryption epoch.
+    #[test]
+    fn test_decrypt_from_download_epoch_fallback() {
+        let (mdk, group_id, alice_keys) = setup_group();
+
+        let manager = mdk.media_manager(group_id.clone());
+        let data = b"epoch fallback test data";
+        let upload = manager
+            .encrypt_for_upload(data, "text/plain", "fallback.txt")
+            .unwrap();
+        let media_ref =
+            manager.create_media_reference(&upload, "https://example.com/fallback".to_string());
+
+        store_imeta_message(
+            &mdk,
+            &group_id,
+            &upload,
+            alice_keys.public_key(),
+            "https://example.com/fallback",
+        );
+
+        advance_epochs(&mdk, &group_id, 3);
+
+        let manager = mdk.media_manager(group_id);
+        let decrypted = manager
+            .decrypt_from_download(&upload.encrypted_data, &media_ref)
+            .unwrap();
+        assert_eq!(decrypted, data);
+    }
+
+    /// Verifies that decrypt_from_download succeeds via the epoch hint path
+    /// after multiple epoch advancements.
+    #[test]
+    fn test_decrypt_from_download_epoch_hint() {
+        let (mdk, group_id, alice_keys) = setup_group();
+
+        let manager = mdk.media_manager(group_id.clone());
+        let data = b"epoch hint test data";
+        let upload = manager
+            .encrypt_for_upload(data, "text/plain", "hint.txt")
+            .unwrap();
+        let media_ref =
+            manager.create_media_reference(&upload, "https://example.com/hint".to_string());
+
+        store_imeta_message(
+            &mdk,
+            &group_id,
+            &upload,
+            alice_keys.public_key(),
+            "https://example.com/hint",
+        );
+
+        advance_epochs(&mdk, &group_id, 3);
+
+        let manager = mdk.media_manager(group_id);
+        let decrypted = manager
+            .decrypt_from_download(&upload.encrypted_data, &media_ref)
+            .unwrap();
+        assert_eq!(decrypted, data);
+    }
+
+    /// Verifies that decrypt_from_download falls back to the current epoch key
+    /// when no epoch hint message is stored (e.g., freshly downloaded media).
+    #[test]
+    fn test_decrypt_from_download_current_epoch_fallback() {
+        let (mdk, group_id, _alice_keys) = setup_group();
+
+        let manager = mdk.media_manager(group_id.clone());
+        let data = b"current epoch fallback test";
+        let upload = manager
+            .encrypt_for_upload(data, "text/plain", "fallback_current.txt")
+            .unwrap();
+        let media_ref = manager
+            .create_media_reference(&upload, "https://example.com/fallback_current".to_string());
+
+        // No message stored -- epoch hint will fail, triggering current-epoch fallback
+        let manager = mdk.media_manager(group_id);
+        let decrypted = manager
+            .decrypt_from_download(&upload.encrypted_data, &media_ref)
+            .unwrap();
+        assert_eq!(decrypted, data);
+    }
+
+    /// Verifies that non-recoverable errors from the epoch hint path propagate
+    /// immediately without falling back to the current epoch key.
+    #[test]
+    fn test_decrypt_from_download_non_recoverable_error_propagates() {
+        let (mdk, group_id, alice_keys) = setup_group();
+
+        let manager = mdk.media_manager(group_id.clone());
+        let data = b"non-recoverable error test";
+        let upload = manager
+            .encrypt_for_upload(data, "text/plain", "propagate.txt")
+            .unwrap();
+        let mut media_ref =
+            manager.create_media_reference(&upload, "https://example.com/propagate".to_string());
+
+        store_imeta_message(
+            &mdk,
+            &group_id,
+            &upload,
+            alice_keys.public_key(),
+            "https://example.com/propagate",
+        );
+
+        // Corrupt the scheme version -- epoch hint succeeds but key derivation
+        // fails with UnknownSchemeVersion, which must not be swallowed
+        media_ref.scheme_version = "invalid-scheme-v99".to_string();
+
+        let manager = mdk.media_manager(group_id);
+        let result = manager.decrypt_from_download(&upload.encrypted_data, &media_ref);
+        assert!(
+            matches!(result, Err(EncryptedMediaError::UnknownSchemeVersion(ref v)) if v == "invalid-scheme-v99"),
+            "Expected UnknownSchemeVersion to propagate, got: {:?}",
+            result
+        );
+    }
+
+    /// Verifies that the NoExporterSecretForEpoch fallback arm triggers when
+    /// the epoch hint finds an epoch but no exporter secret exists for it,
+    /// and decryption still succeeds via the current epoch key.
+    #[test]
+    fn test_decrypt_from_download_no_exporter_secret_fallback() {
+        let (mdk, group_id, alice_keys) = setup_group();
+
+        let manager = mdk.media_manager(group_id.clone());
+        let data = b"missing secret fallback test";
+        let upload = manager
+            .encrypt_for_upload(data, "text/plain", "missing_secret.txt")
+            .unwrap();
+        let media_ref = manager
+            .create_media_reference(&upload, "https://example.com/missing_secret".to_string());
+
+        // Store a message referencing a fake epoch that has no exporter secret.
+        // We manually construct the message with a non-existent epoch (9999).
+        let search_term = format!("x {}", hex::encode(upload.original_hash));
+        let tags = Tags::parse(vec![vec!["imeta", &search_term]]).unwrap();
+
+        let event_id = EventId::all_zeros();
+        let wrapper_event_id = EventId::from_slice(&[1u8; 32]).unwrap();
+
+        let message = Message {
+            id: event_id,
+            pubkey: alice_keys.public_key(),
+            kind: Kind::from(445u16),
+            mls_group_id: group_id.clone(),
+            created_at: Timestamp::now(),
+            processed_at: Timestamp::now(),
+            content: "".to_string(),
+            tags: tags.clone(),
+            event: UnsignedEvent::new(
+                alice_keys.public_key(),
+                Timestamp::now(),
+                Kind::from(445u16),
+                tags,
+                "".to_string(),
+            ),
+            wrapper_event_id,
+            epoch: Some(9999),
+            state: MessageState::Processed,
+        };
+        mdk.storage().save_message(message).unwrap();
+
+        // Epoch hint finds epoch 9999, but no secret exists for it.
+        // Should fall back to the current epoch key and succeed.
+        let manager = mdk.media_manager(group_id);
+        let decrypted = manager
+            .decrypt_from_download(&upload.encrypted_data, &media_ref)
+            .unwrap();
+        assert_eq!(decrypted, data);
+    }
+
+    #[test]
+    fn test_decrypt_from_download_cross_epoch_respects_lookback_cleanup() {
+        use mdk_storage_traits::groups::GroupStorage;
+
+        let config = crate::MdkConfig {
+            max_past_epochs: 2,
+            ..Default::default()
+        };
+        let mdk = create_test_mdk_with_config(config);
+        let alice_keys = Keys::generate();
+        let admins = vec![alice_keys.public_key()];
+        let create_result = mdk
+            .create_group(
+                &alice_keys.public_key(),
+                vec![],
+                create_nostr_group_config_data(admins),
+            )
+            .unwrap();
+        let group_id = create_result.group.mls_group_id;
+        mdk.merge_pending_commit(&group_id).unwrap();
+
+        // Encrypt at epoch 0 and store hint message.
+        let manager = mdk.media_manager(group_id.clone());
+        let old_data = b"old media at epoch 0";
+        let old_upload = manager
+            .encrypt_for_upload(old_data, "text/plain", "old.txt")
+            .unwrap();
+        let old_ref =
+            manager.create_media_reference(&old_upload, "https://example.com/old".to_string());
+        let old_epoch = store_imeta_message(
+            &mdk,
+            &group_id,
+            &old_upload,
+            alice_keys.public_key(),
+            "https://example.com/old",
+        );
+        assert_eq!(old_epoch, 0);
+
+        // Advance to epoch 2, then encrypt newer media at epoch 2.
+        for _ in 0..2 {
+            mdk.self_update(&group_id).unwrap();
+            mdk.merge_pending_commit(&group_id).unwrap();
+        }
+
+        let manager = mdk.media_manager(group_id.clone());
+        let recent_data = b"recent media at epoch 2";
+        let recent_upload = manager
+            .encrypt_for_upload(recent_data, "text/plain", "recent.txt")
+            .unwrap();
+        let recent_ref = manager
+            .create_media_reference(&recent_upload, "https://example.com/recent".to_string());
+        let recent_epoch = store_imeta_message(
+            &mdk,
+            &group_id,
+            &recent_upload,
+            alice_keys.public_key(),
+            "https://example.com/recent",
+        );
+        assert_eq!(recent_epoch, 2);
+
+        // Advance to epoch 4. With max_past_epochs = 2, keep epochs >= 2.
+        for _ in 0..2 {
+            mdk.self_update(&group_id).unwrap();
+            mdk.merge_pending_commit(&group_id).unwrap();
+        }
+
+        let current_epoch = mdk.get_group(&group_id).unwrap().unwrap().epoch;
+        assert_eq!(current_epoch, 4);
+
+        let secret_epoch_0 = mdk
+            .storage()
+            .get_group_mip04_exporter_secret(&group_id, 0)
+            .unwrap();
+        let secret_epoch_1 = mdk
+            .storage()
+            .get_group_mip04_exporter_secret(&group_id, 1)
+            .unwrap();
+        let secret_epoch_2 = mdk
+            .storage()
+            .get_group_mip04_exporter_secret(&group_id, 2)
+            .unwrap();
+
+        assert!(secret_epoch_0.is_none(), "Epoch 0 key should be pruned");
+        assert!(secret_epoch_1.is_none(), "Epoch 1 key should be pruned");
+        assert!(secret_epoch_2.is_some(), "Epoch 2 key should be retained");
+
+        let manager = mdk.media_manager(group_id.clone());
+
+        // Media from pruned epoch should no longer decrypt.
+        let old_result = manager.decrypt_from_download(&old_upload.encrypted_data, &old_ref);
+        assert!(
+            matches!(
+                old_result,
+                Err(EncryptedMediaError::DecryptionFailed { .. })
+            ),
+            "Expected old media decryption to fail after lookback cleanup, got: {:?}",
+            old_result
+        );
+
+        // Media from retained epoch should still decrypt via stored epoch hint secret.
+        let recent_decrypted = manager
+            .decrypt_from_download(&recent_upload.encrypted_data, &recent_ref)
+            .unwrap();
+        assert_eq!(recent_decrypted, recent_data);
+    }
+
+    /// Verifies that media encrypted after processing an incoming commit (remote epoch
+    /// advancement) can still be decrypted after further epoch changes. This ensures
+    /// the incoming commit path persisted the MIP-04 exporter secret for that epoch.
+    #[test]
+    fn test_decrypt_media_from_incoming_commit_epoch_after_epoch_advancement() {
+        let alice_keys = Keys::generate();
+        let bob_keys = Keys::generate();
+        let charlie_keys = Keys::generate();
+
+        let alice_mdk = create_test_mdk();
+        let bob_mdk = create_test_mdk();
+        let charlie_mdk = create_test_mdk();
+
+        let bob_key_package = create_key_package_event(&bob_mdk, &bob_keys);
+        let charlie_key_package = create_key_package_event(&charlie_mdk, &charlie_keys);
+
+        let create_result = alice_mdk
+            .create_group(
+                &alice_keys.public_key(),
+                vec![bob_key_package],
+                create_nostr_group_config_data(vec![alice_keys.public_key()]),
+            )
+            .unwrap();
+
+        let group_id = create_result.group.mls_group_id.clone();
+
+        alice_mdk.merge_pending_commit(&group_id).unwrap();
+
+        let bob_welcome = bob_mdk
+            .process_welcome(&EventId::all_zeros(), &create_result.welcome_rumors[0])
+            .unwrap();
+        bob_mdk.accept_welcome(&bob_welcome).unwrap();
+
+        let add_charlie_result = alice_mdk
+            .add_members(&group_id, &[charlie_key_package])
+            .unwrap();
+        alice_mdk.merge_pending_commit(&group_id).unwrap();
+
+        // Bob processes Alice's incoming commit: this exercises `process_commit`.
+        bob_mdk
+            .process_message(&add_charlie_result.evolution_event)
+            .unwrap();
+
+        // Encrypt media at Bob's current epoch (the epoch reached via incoming commit).
+        let manager = bob_mdk.media_manager(group_id.clone());
+        let data = b"media encrypted after incoming commit";
+        let upload = manager
+            .encrypt_for_upload(data, "text/plain", "incoming_epoch.txt")
+            .unwrap();
+        let media_ref = manager
+            .create_media_reference(&upload, "https://example.com/incoming-epoch".to_string());
+        let encryption_epoch = store_imeta_message(
+            &bob_mdk,
+            &group_id,
+            &upload,
+            bob_keys.public_key(),
+            "https://example.com/incoming-epoch",
+        );
+
+        // Advance to a later epoch so decryption must use stored epoch-hint secret.
+        bob_mdk.self_update(&group_id).unwrap();
+        bob_mdk.merge_pending_commit(&group_id).unwrap();
+
+        let bob_current_epoch = bob_mdk.get_group(&group_id).unwrap().unwrap().epoch;
+        assert!(bob_current_epoch > encryption_epoch);
+
+        let manager = bob_mdk.media_manager(group_id);
+        let decrypted = manager
+            .decrypt_from_download(&upload.encrypted_data, &media_ref)
+            .unwrap();
+        assert_eq!(decrypted, data);
     }
 }

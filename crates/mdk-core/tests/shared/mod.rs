@@ -8,7 +8,7 @@
 use std::collections::BTreeSet;
 
 use mdk_storage_traits::GroupId;
-use mdk_storage_traits::groups::types::{Group, GroupState};
+use mdk_storage_traits::groups::types::{Group, GroupState, SelfUpdateState};
 use mdk_storage_traits::messages::types::{
     Message, MessageState, ProcessedMessage, ProcessedMessageState,
 };
@@ -37,11 +37,13 @@ pub fn create_test_group(mls_group_id: GroupId) -> Group {
         admin_pubkeys: BTreeSet::new(),
         last_message_id: None,
         last_message_at: None,
+        last_message_processed_at: None,
         epoch: 0,
         state: GroupState::Active,
         image_hash: None,
         image_key: None,
         image_nonce: None,
+        self_update_state: SelfUpdateState::Required,
     }
 }
 
@@ -71,6 +73,7 @@ pub fn create_test_message(mls_group_id: GroupId, event_id: EventId) -> Message 
         kind: Kind::Custom(445),
         mls_group_id,
         created_at,
+        processed_at: created_at,
         content,
         tags,
         event,

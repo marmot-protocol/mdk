@@ -112,6 +112,10 @@ pub enum EncryptedMediaError {
         reason: String,
     },
 
+    /// No exporter secret found for the hinted epoch
+    #[error("No exporter secret found for epoch {0}")]
+    NoExporterSecretForEpoch(u64),
+
     /// Unknown encryption scheme version
     #[error("Unknown encryption scheme version: {0}")]
     UnknownSchemeVersion(String),
@@ -249,6 +253,8 @@ mod tests {
             EncryptedMediaError::InvalidImetaTag {
                 reason: "Test invalid tag".to_string(),
             },
+            EncryptedMediaError::NoExporterSecretForEpoch(42),
+            EncryptedMediaError::UnknownSchemeVersion("v99".to_string()),
         ];
 
         // Verify all errors can be formatted (tests Display implementation)

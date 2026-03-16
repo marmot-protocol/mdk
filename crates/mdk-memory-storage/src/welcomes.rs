@@ -1,4 +1,4 @@
-//! Memory-based storage implementation of the MdkStorageProvider trait for Nostr MLS welcomes
+//! Memory-based storage implementation of the MdkStorageProvider trait for MDK welcomes
 
 use mdk_storage_traits::welcomes::error::WelcomeError;
 use mdk_storage_traits::welcomes::types::*;

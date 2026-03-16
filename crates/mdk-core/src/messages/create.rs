@@ -5,7 +5,7 @@
 use mdk_storage_traits::groups::types as group_types;
 use mdk_storage_traits::messages::types as message_types;
 use mdk_storage_traits::{GroupId, MdkStorageProvider};
-use nostr::{Event, EventId, JsonUtil, UnsignedEvent};
+use nostr::{Event, EventId, JsonUtil, Timestamp, UnsignedEvent};
 use openmls::prelude::MlsGroup;
 use openmls_basic_credential::SignatureKeyPair;
 use tls_codec::Serialize as TlsSerialize;
@@ -103,12 +103,14 @@ where
         let event = self.build_message_event(mls_group_id, message)?;
 
         // Create message to save to storage
+        let now = Timestamp::now();
         let message: message_types::Message = message_types::Message {
             id: rumor_id,
             pubkey: rumor.pubkey,
             kind: rumor.kind,
             mls_group_id: mls_group_id.clone(),
             created_at: rumor.created_at,
+            processed_at: now,
             content: rumor.content.clone(),
             tags: rumor.tags.clone(),
             event: rumor.clone(),
@@ -131,9 +133,9 @@ where
         self.save_message_record(message.clone())?;
         self.save_processed_message_record(processed_message)?;
 
-        // Update last_message_at and last_message_id
-        group.last_message_at = Some(rumor.created_at);
-        group.last_message_id = Some(message.id);
+        // Update last_message_at, last_message_processed_at, and last_message_id using
+        // the canonical display-order comparison.
+        group.update_last_message_if_newer(&message);
         self.save_group_record(group)?;
 
         Ok(event)
@@ -311,23 +313,39 @@ mod tests {
             "Content should be encrypted, not plaintext"
         );
 
-        // 3. Verify exactly 1 tag (h tag with group ID)
+        // 3. Verify tags include h + encoding(base64)
         assert_eq!(
             message_event.tags.len(),
-            1,
-            "Message event must have exactly 1 tag per MIP-03"
+            2,
+            "Message event must have exactly 2 tags: h and encoding"
         );
 
-        // 4. Verify tag is h tag
-        let tags_vec: Vec<&nostr::Tag> = message_event.tags.iter().collect();
-        let group_id_tag = tags_vec[0];
+        // 4. Verify h tag
+        let group_id_tag = message_event
+            .tags
+            .iter()
+            .find(|t| t.kind() == TagKind::h())
+            .expect("Message event should have h tag");
         assert_eq!(
             group_id_tag.kind(),
             TagKind::h(),
             "Tag must be 'h' (group ID) tag"
         );
 
-        // 5. Verify h tag is valid 32-byte hex
+        // 5. Verify encoding tag is base64
+        let encoding_tag = message_event
+            .tags
+            .iter()
+            .find(|t| t.kind() == TagKind::Custom("encoding".into()))
+            .expect("Message event should have encoding tag");
+        assert_eq!(
+            encoding_tag
+                .content()
+                .expect("encoding tag should have content"),
+            "base64"
+        );
+
+        // 6. Verify h tag is valid 32-byte hex
         let group_id_hex = group_id_tag.content().expect("h tag should have content");
         assert_eq!(
             group_id_hex.len(),
@@ -343,13 +361,13 @@ mod tests {
             "Group ID should decode to 32 bytes"
         );
 
-        // 6. Verify event is signed (has valid signature)
+        // 7. Verify event is signed (has valid signature)
         assert!(
             message_event.verify().is_ok(),
             "Message event must be properly signed"
         );
 
-        // 7. Verify pubkey is NOT the creator's real pubkey (ephemeral key)
+        // 8. Verify pubkey is NOT the creator's real pubkey (ephemeral key)
         assert_ne!(
             message_event.pubkey,
             creator.public_key(),
@@ -433,15 +451,29 @@ mod tests {
         // 2. Verify commit event structure matches regular messages
         assert_eq!(
             commit_event.tags.len(),
-            1,
-            "Commit event should have exactly 1 tag"
+            2,
+            "Commit event should have exactly 2 tags: h and encoding"
         );
 
         let commit_tags: Vec<&nostr::Tag> = commit_event.tags.iter().collect();
         assert_eq!(
-            commit_tags[0].kind(),
+            commit_tags
+                .iter()
+                .find(|t| t.kind() == TagKind::h())
+                .expect("Commit event should have h tag")
+                .kind(),
             TagKind::h(),
             "Commit event should have h tag"
+        );
+        let commit_encoding_tag = commit_tags
+            .iter()
+            .find(|t| t.kind() == TagKind::Custom("encoding".into()))
+            .expect("Commit event should have encoding tag");
+        assert_eq!(
+            commit_encoding_tag
+                .content()
+                .expect("encoding tag should have content"),
+            "base64"
         );
 
         // 3. Verify commit uses ephemeral pubkey
@@ -555,7 +587,7 @@ mod tests {
         );
     }
 
-    /// Test message content encryption with NIP-44
+    /// Test message content encryption with ChaCha20-Poly1305 per MIP-03
     #[test]
     fn test_message_content_encryption_mip03() {
         let mdk = create_test_mdk();
@@ -581,11 +613,11 @@ mod tests {
             "Encrypted content should be longer than plaintext due to encryption overhead"
         );
 
-        // Verify content appears to be encrypted (not just hex-encoded plaintext)
-        // Encrypted NIP-44 content starts with specific markers
+        // Verify content appears to be encrypted (base64-encoded nonce || ciphertext)
+        // ChaCha20-Poly1305 with 12-byte nonce + 16-byte tag adds at least 28 bytes of overhead
         assert!(
-            message_event.content.len() > 100,
-            "NIP-44 encrypted content should be substantial"
+            message_event.content.len() > 40,
+            "ChaCha20-Poly1305 encrypted content should be substantial (base64-encoded)"
         );
     }
 
@@ -647,10 +679,15 @@ mod tests {
             .expect("Failed to send first message");
 
         assert_eq!(msg_event1.kind, Kind::MlsGroupMessage);
-        assert_eq!(msg_event1.tags.len(), 1);
+        assert_eq!(msg_event1.tags.len(), 2);
 
-        let msg1_tags: Vec<&nostr::Tag> = msg_event1.tags.iter().collect();
-        assert_eq!(msg1_tags[0].kind(), TagKind::h());
+        assert!(msg_event1.tags.iter().any(|t| t.kind() == TagKind::h()));
+        assert!(
+            msg_event1
+                .tags
+                .iter()
+                .any(|t| t.kind() == TagKind::Custom("encoding".into()))
+        );
 
         let pubkey1 = msg_event1.pubkey;
 
@@ -662,7 +699,14 @@ mod tests {
 
         let commit_event = &add_result.evolution_event;
         assert_eq!(commit_event.kind, Kind::MlsGroupMessage);
-        assert_eq!(commit_event.tags.len(), 1);
+        assert_eq!(commit_event.tags.len(), 2);
+        assert!(commit_event.tags.iter().any(|t| t.kind() == TagKind::h()));
+        assert!(
+            commit_event
+                .tags
+                .iter()
+                .any(|t| t.kind() == TagKind::Custom("encoding".into()))
+        );
         assert_ne!(
             commit_event.pubkey,
             creator.public_key(),

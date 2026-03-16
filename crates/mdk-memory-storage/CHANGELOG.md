@@ -25,14 +25,41 @@
 
 ## Unreleased
 
-### Added
-
-- **Retryable Message Support**: Updated storage implementation to handle `ProcessedMessageState::Retryable` transitions and persistence. ([#161](https://github.com/marmot-protocol/mdk/pull/161))
-
 ### Breaking changes
 
 ### Changed
 
+### Added
+
+### Fixed
+
+### Removed
+
+### Deprecated
+
+## [0.7.1] - 2026-03-05
+
+## [0.7.0] - 2026-03-04
+
+### Breaking changes
+
+- `GroupScopedSnapshot` has a new `group_mip04_exporter_secrets` field. Any code constructing this struct directly must be updated. ([#208](https://github.com/marmot-protocol/mdk/pull/208))
+- `MemoryStorageSnapshot` has a new `group_mip04_exporter_secrets` field. Any code constructing this struct directly must be updated. ([#208](https://github.com/marmot-protocol/mdk/pull/208))
+
+### Added
+
+- Implemented `GroupStorage::get_group_mip04_exporter_secret` and `GroupStorage::save_group_mip04_exporter_secret` using a separate `group_mip04_exporter_secrets_cache` LRU cache. ([#208](https://github.com/marmot-protocol/mdk/pull/208))
+
+## [0.6.0] - 2026-02-18
+
+### Breaking changes
+
+- **MLS codec switched from JSON to postcard**: MLS storage serialization now uses `MlsCodec` (postcard binary format) instead of the removed `JsonCodec` (serde_json). In-memory data is ephemeral so no migration is needed, but the serialized byte format has changed. ([#179](https://github.com/marmot-protocol/mdk/pull/179))
+
+### Changed
+
+- **OpenMLS 0.8.0 Upgrade**: Updated `openmls` to 0.8.0 and `openmls_traits` to 0.5. Updated `lru` to 0.16.3 to resolve a security advisory. ([#174](https://github.com/marmot-protocol/mdk/pull/174))
+- **Message Sorting**: The `messages()` method now sorts by `created_at DESC, processed_at DESC, id DESC`. The secondary sort by `processed_at` keeps messages in reception order when `created_at` is the same. The tertiary sort by `id` ensures deterministic ordering. ([#166](https://github.com/marmot-protocol/mdk/pull/166))
 - **Thread-Safe Snapshots**: Implemented atomic snapshot support using internal locking. `create_group_snapshot`, `rollback_group_to_snapshot`, and `release_group_snapshot` are now supported for testing and race resolution. ([#152](https://github.com/marmot-protocol/mdk/pull/152))
 - **Unified Storage Architecture**: `MdkMemoryStorage` now directly implements OpenMLS's `StorageProvider<1>` trait instead of wrapping `openmls_memory_storage`. This enables unified in-memory storage for both MLS and MDK state, consistent with the SQLite implementation. ([#148](https://github.com/marmot-protocol/mdk/pull/148))
   - Removed `openmls_memory_storage` dependency
@@ -46,8 +73,12 @@
 
 ### Added
 
+- **Custom Message Sort Order**: `messages()` now respects the `sort_order` field in `Pagination`, supporting both `CreatedAtFirst` (default) and `ProcessedAtFirst` orderings. ([#171](https://github.com/marmot-protocol/mdk/pull/171))
+- **Last Message by Sort Order**: Implemented `last_message()` to return the most recent message under a given sort order. ([#171](https://github.com/marmot-protocol/mdk/pull/171))
+- **Epoch Lookup by Tag Content**: Implemented `find_message_epoch_by_tag_content` for in-memory storage, scanning cached group messages and matching serialized tags. ([#167](https://github.com/marmot-protocol/mdk/pull/167))
+- **Retryable Message Support**: Updated storage implementation to handle `ProcessedMessageState::Retryable` transitions and persistence. ([#161](https://github.com/marmot-protocol/mdk/pull/161))
 - **MLS Storage Module**: New `mls_storage` module with complete `StorageProvider<1>` implementation for OpenMLS integration ([#148](https://github.com/marmot-protocol/mdk/pull/148))
-  - JSON codec for serializing/deserializing OpenMLS types
+  - Postcard codec (`MlsCodec`) for serializing/deserializing OpenMLS types ([#179](https://github.com/marmot-protocol/mdk/pull/179))
   - Support for all 53 `StorageProvider<1>` methods
   - In-memory storage using `HashMap` for all MLS data types
 - **Snapshot Support**: New `snapshot` module for creating and restoring storage snapshots, useful for testing rollback scenarios ([#148](https://github.com/marmot-protocol/mdk/pull/148))
@@ -74,8 +105,6 @@
 
 - Removed `openmls_memory_storage` dependency in favor of direct `StorageProvider<1>` implementation ([#148](https://github.com/marmot-protocol/mdk/pull/148))
 
-### Deprecated
-
 ## [0.5.1] - 2025-10-01
 
 ### Changed
@@ -98,12 +127,12 @@
 
 - Upgrade openmls to v0.7.0
 
-## v0.43.0 - 2025/07/28
+## [0.43.0] - 2025-07-28
 
 ### Changed
 
 - Bump lru from 0.14 to 0.16
 
-## v0.42.0 - 2025/05/20
+## [0.42.0] - 2025-05-20
 
 - First release ([#839](https://github.com/rust-nostr/nostr/pull/839))
