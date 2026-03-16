@@ -1050,9 +1050,8 @@ where
         }
 
         if let Some(ref admins) = update.admins {
-            // Validate admin update against current membership before applying
-            self.validate_admin_update(group_id, admins)?;
-            group_data.admins = admins.iter().copied().collect();
+            // Prune non-members and validate at least one admin remains
+            group_data.admins = self.prune_and_validate_admin_update(group_id, admins)?;
         }
 
         if let Some(nostr_group_id) = update.nostr_group_id {
@@ -1651,50 +1650,31 @@ where
         Ok(true)
     }
 
-    /// Validates admin updates against current group membership
-    ///
-    /// # Arguments
-    /// * `group_id` - The MLS group ID
-    /// * `new_admins` - The proposed new admin set
-    ///
-    /// # Returns
-    /// * `Ok(())` if validation passes
-    /// * `Err(Error)` if validation fails
-    ///
-    /// # Validation Rules
-    /// - Admin set must not be empty
-    /// - All admins must be current group members
+    /// Prunes non-member public keys from the proposed admin list and validates
+    /// that at least one valid admin remains.
     ///
     /// # Errors
-    /// Returns `Error::Group` with descriptive message if:
-    /// - Admin set is empty
-    /// - Any admin is not a current group member
-    fn validate_admin_update(
+    /// Returns `Error::UpdateGroupContextExts` if no valid admins remain after pruning.
+    fn prune_and_validate_admin_update(
         &self,
         group_id: &GroupId,
         new_admins: &[PublicKey],
-    ) -> Result<(), Error> {
-        // Admin set must not be empty
-        if new_admins.is_empty() {
+    ) -> Result<BTreeSet<PublicKey>, Error> {
+        let current_members = self.get_members(group_id)?;
+
+        let valid_admins: BTreeSet<PublicKey> = new_admins
+            .iter()
+            .filter(|admin| current_members.contains(admin))
+            .copied()
+            .collect();
+
+        if valid_admins.is_empty() {
             return Err(Error::UpdateGroupContextExts(
                 "Admin set cannot be empty".to_string(),
             ));
         }
 
-        // Get current group members
-        let current_members = self.get_members(group_id)?;
-
-        // All admins must be current group members
-        for admin in new_admins {
-            if !current_members.contains(admin) {
-                return Err(Error::UpdateGroupContextExts(format!(
-                    "Admin {} is not a current group member",
-                    admin
-                )));
-            }
-        }
-
-        Ok(())
+        Ok(valid_admins)
     }
 
     /// Creates a ChaCha20-Poly1305 encrypted message event Kind: 445 signed with an ephemeral keypair.
@@ -3882,9 +3862,50 @@ mod tests {
         );
     }
 
-    /// Test that admin update validation rejects non-member admins
+    /// Test that admin update errors when all proposed admins are non-members (pruned to empty)
     #[test]
-    fn test_admin_update_rejects_non_member_admins() {
+    fn test_admin_update_rejects_all_non_member_admins() {
+        let creator_mdk = create_test_mdk();
+        let (creator, initial_members, admins) = create_test_group_members();
+        let creator_pk = creator.public_key();
+
+        let mut initial_key_package_events = Vec::new();
+        for member_keys in &initial_members {
+            let key_package_event = create_key_package_event(&creator_mdk, member_keys);
+            initial_key_package_events.push(key_package_event);
+        }
+
+        let create_result = creator_mdk
+            .create_group(
+                &creator_pk,
+                initial_key_package_events,
+                create_nostr_group_config_data(admins),
+            )
+            .expect("Failed to create group");
+
+        let group_id = &create_result.group.mls_group_id.clone();
+
+        creator_mdk
+            .merge_pending_commit(group_id)
+            .expect("Failed to merge pending commit");
+
+        // All proposed admins are non-members - pruning leaves empty set
+        let non_member1 = Keys::generate().public_key();
+        let non_member2 = Keys::generate().public_key();
+        let all_non_members = vec![non_member1, non_member2];
+        let update = NostrGroupDataUpdate::new().admins(all_non_members);
+        let result = creator_mdk.update_group_data(group_id, update);
+
+        assert!(
+            matches!(result, Err(crate::Error::UpdateGroupContextExts(ref msg)) if msg.contains("Admin set cannot be empty")),
+            "Should error when all admins are pruned, got: {:?}",
+            result
+        );
+    }
+
+    /// Test that admin update prunes non-member admins
+    #[test]
+    fn test_admin_update_prunes_non_member_admins() {
         let creator_mdk = create_test_mdk();
         let (creator, initial_members, admins) = create_test_group_members();
         let creator_pk = creator.public_key();
@@ -3912,16 +3933,35 @@ mod tests {
             .merge_pending_commit(group_id)
             .expect("Failed to merge pending commit");
 
-        // Attempt to update with a non-member admin - should fail
+        // Attempt to update with a non-member admin - non-member should be pruned
         let non_member = Keys::generate().public_key();
-        let bad_admins = vec![creator_pk, non_member];
-        let update = NostrGroupDataUpdate::new().admins(bad_admins);
+        let admins_with_non_member = vec![creator_pk, non_member];
+        let update = NostrGroupDataUpdate::new().admins(admins_with_non_member);
         let result = creator_mdk.update_group_data(group_id, update);
 
         assert!(
-            matches!(result, Err(crate::Error::UpdateGroupContextExts(ref msg)) if msg.contains("is not a current group member")),
-            "Should error when admin is not a group member, got: {:?}",
+            result.is_ok(),
+            "Should succeed after pruning non-member admin, got: {:?}",
             result
+        );
+
+        // Merge and verify only the valid admin remains
+        creator_mdk
+            .merge_pending_commit(group_id)
+            .expect("Failed to merge pending commit");
+
+        let synced_group = creator_mdk
+            .get_group(group_id)
+            .expect("Failed to get group")
+            .expect("Group should exist");
+
+        assert!(
+            synced_group.admin_pubkeys.contains(&creator_pk),
+            "Creator should remain as admin"
+        );
+        assert!(
+            !synced_group.admin_pubkeys.contains(&non_member),
+            "Non-member should have been pruned from admin set"
         );
     }
 
@@ -3993,16 +4033,15 @@ mod tests {
         );
     }
 
-    /// Test that admin update only accepts existing members, not previously removed members
+    /// Test that admin update prunes previously removed members
     #[test]
-    fn test_admin_update_rejects_previously_removed_member() {
+    fn test_admin_update_prunes_previously_removed_member() {
         let creator_mdk = create_test_mdk();
         let (creator, initial_members, admins) = create_test_group_members();
         let creator_pk = creator.public_key();
 
         // Capture member public keys before they're used
         let member1_pk = initial_members[0].public_key();
-        let member2_pk = initial_members[1].public_key();
 
         // Create key package events for initial members
         let mut initial_key_package_events = Vec::new();
@@ -4036,26 +4075,34 @@ mod tests {
             .merge_pending_commit(group_id)
             .expect("Failed to merge pending commit");
 
-        // Attempt to make the removed member an admin - should fail
-        let bad_admins = vec![creator_pk, member1_pk];
-        let update = NostrGroupDataUpdate::new().admins(bad_admins);
-        let result = creator_mdk.update_group_data(group_id, update);
-
-        assert!(
-            matches!(result, Err(crate::Error::UpdateGroupContextExts(ref msg)) if msg.contains("is not a current group member")),
-            "Should error when trying to make removed member an admin, got: {:?}",
-            result
-        );
-
-        // But updating with remaining members should work
-        let good_admins = vec![creator_pk, member2_pk];
-        let update = NostrGroupDataUpdate::new().admins(good_admins);
+        // Attempt to make the removed member an admin - removed member should be pruned
+        let admins_with_removed = vec![creator_pk, member1_pk];
+        let update = NostrGroupDataUpdate::new().admins(admins_with_removed);
         let result = creator_mdk.update_group_data(group_id, update);
 
         assert!(
             result.is_ok(),
-            "Should succeed when all admins are current members, got: {:?}",
+            "Should succeed after pruning removed member, got: {:?}",
             result
+        );
+
+        // Merge and verify the removed member was pruned
+        creator_mdk
+            .merge_pending_commit(group_id)
+            .expect("Failed to merge pending commit");
+
+        let synced_group = creator_mdk
+            .get_group(group_id)
+            .expect("Failed to get group")
+            .expect("Group should exist");
+
+        assert!(
+            synced_group.admin_pubkeys.contains(&creator_pk),
+            "Creator should remain as admin"
+        );
+        assert!(
+            !synced_group.admin_pubkeys.contains(&member1_pk),
+            "Removed member should have been pruned from admin set"
         );
     }
 
