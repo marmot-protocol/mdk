@@ -35,6 +35,7 @@
 
 - **0.6.x/0.7.x migration compatibility**: Current-epoch MIP-03 exporter secrets now self-heal from live MLS state while preserving mismatched pre-0.7.0 bytes for temporary read compatibility. Message decryption temporarily accepts transition-era AEAD wrappers encrypted with old secrets, preserved late-epoch legacy secrets during upgrade, and untagged legacy NIP-44 wrappers only until June 4, 2026. ([#222](https://github.com/marmot-protocol/mdk/pull/222))
 - **Legacy media read compatibility**: MIP-04 download decryption now temporarily falls back across preserved legacy exporter secrets and the pre-0.7.1 HKDF derivation so more `0.6.x -> 0.7.x` media remains readable during migration. ([#222](https://github.com/marmot-protocol/mdk/pull/222))
+- `remove_members` now atomically strips removed members from the group admin list within the same MLS commit ([#225](https://github.com/marmot-protocol/mdk/pull/225))
 
 ### Removed
 
