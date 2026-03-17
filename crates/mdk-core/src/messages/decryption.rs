@@ -13,10 +13,10 @@ use crate::messages::crypto::decrypt_message_with_any_supported_format;
 
 use super::{DEFAULT_EPOCH_LOOKBACK, Result};
 
-/// Legacy exporter-secret compatibility is accepted only until June 4, 2026
+/// Legacy exporter-secret compatibility is accepted only until May 15, 2026
 /// 00:00:00 UTC. This keeps the `0.6.x -> 0.7.x` migration path available
 /// temporarily without leaving fallback decryption open-ended.
-const LEGACY_EXPORTER_SECRET_MIGRATION_DEADLINE: u64 = 1_780_531_200;
+const LEGACY_EXPORTER_SECRET_MIGRATION_DEADLINE: u64 = 1_778_803_200;
 
 impl<Storage> MDK<Storage>
 where
@@ -318,48 +318,9 @@ mod tests {
     };
     use crate::test_util::{
         create_key_package_event, create_nostr_group_config_data, create_test_rumor,
+        setup_two_member_group,
     };
     use crate::tests::{create_test_mdk, create_test_mdk_with_config};
-
-    fn setup_two_member_group() -> (
-        crate::MDK<mdk_memory_storage::MdkMemoryStorage>,
-        crate::MDK<mdk_memory_storage::MdkMemoryStorage>,
-        Keys,
-        Keys,
-        crate::GroupId,
-    ) {
-        let alice_keys = Keys::generate();
-        let bob_keys = Keys::generate();
-        let alice_mdk = create_test_mdk();
-        let bob_mdk = create_test_mdk();
-        let admins = vec![alice_keys.public_key(), bob_keys.public_key()];
-        let bob_key_package = create_key_package_event(&bob_mdk, &bob_keys);
-
-        let create_result = alice_mdk
-            .create_group(
-                &alice_keys.public_key(),
-                vec![bob_key_package],
-                create_nostr_group_config_data(admins),
-            )
-            .expect("Alice should create group");
-        let group_id = create_result.group.mls_group_id.clone();
-
-        alice_mdk
-            .merge_pending_commit(&group_id)
-            .expect("Alice should merge group creation commit");
-
-        let bob_welcome = bob_mdk
-            .process_welcome(
-                &nostr::EventId::all_zeros(),
-                &create_result.welcome_rumors[0],
-            )
-            .expect("Bob should process welcome");
-        bob_mdk
-            .accept_welcome(&bob_welcome)
-            .expect("Bob should accept welcome");
-
-        (alice_mdk, bob_mdk, alice_keys, bob_keys, group_id)
-    }
 
     fn build_wrapper_event(
         nostr_group_id: [u8; 32],

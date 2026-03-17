@@ -97,12 +97,17 @@ pub(crate) fn decrypt_message_with_any_supported_format(
     match decrypt_message_with_exporter_secret(secret, encrypted_content) {
         Ok(decrypted_bytes) => Ok(decrypted_bytes),
         Err(aead_error) if allow_legacy_nip44 => {
+            tracing::trace!(
+                target: "mdk_core::messages::crypto",
+                "AEAD decryption failed, attempting legacy NIP-44 fallback: {:?}",
+                aead_error
+            );
             match decrypt_message_with_legacy_exporter_secret(secret, encrypted_content) {
                 Ok(decrypted_bytes) => Ok(decrypted_bytes),
                 Err(legacy_error) => {
                     tracing::trace!(
                         target: "mdk_core::messages::crypto",
-                        "Legacy NIP-44 fallback failed after AEAD failure: {:?}",
+                        "Legacy NIP-44 fallback also failed: {:?}",
                         legacy_error
                     );
                     Err(aead_error)

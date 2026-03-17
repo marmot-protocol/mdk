@@ -28,6 +28,14 @@
 ### Changed
 
 - Admin updates now prune non-member public keys instead of rejecting the entire update. Only errors if no valid admins remain after pruning. ([#223](https://github.com/marmot-protocol/mdk/pull/223))
+- MIP-03 and MIP-04 legacy exporter-secret migration deadline moved from June 4, 2026 to May 15, 2026 00:00:00 UTC. ([#222](https://github.com/marmot-protocol/mdk/pull/222))
+- MIP-04 media decryption legacy key-derivation fallback (pre-0.7.1 HKDF extract+expand path) is now gated by the same May 15, 2026 deadline as the MIP-03 message fallback. Previously the legacy media path had no deadline. ([#222](https://github.com/marmot-protocol/mdk/pull/222))
+- `decrypt_from_download` now delegates to `decrypt_from_download_at` (pub(crate)) for deterministic testing of the migration deadline. ([#222](https://github.com/marmot-protocol/mdk/pull/222))
+
+### Fixed
+
+- Improved diagnostic logging: AEAD decryption failures in `decrypt_message_with_any_supported_format` are now traced before the NIP-44 fallback is attempted, making post-migration forensics easier. ([#222](https://github.com/marmot-protocol/mdk/pull/222))
+- `setup_two_member_group` test helper deduplicated from `messages::decryption` into `crate::test_util`. ([#222](https://github.com/marmot-protocol/mdk/pull/222))
 
 ### Added
 

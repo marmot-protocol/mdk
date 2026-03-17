@@ -4,7 +4,7 @@
 //! high-level API for encrypting, decrypting, and managing encrypted media
 //! within MLS groups on Nostr.
 
-use nostr::{Tag as NostrTag, TagKind};
+use nostr::{Tag as NostrTag, TagKind, Timestamp};
 use sha2::{Digest, Sha256};
 
 use crate::encrypted_media::crypto::{
@@ -22,6 +22,11 @@ use mdk_storage_traits::groups::error::GroupError;
 use mdk_storage_traits::groups::types::GroupExporterSecret;
 use mdk_storage_traits::{MdkStorageProvider, Secret};
 
+/// Legacy MIP-04 key-derivation compatibility is accepted only until May 15, 2026
+/// 00:00:00 UTC. This keeps the `0.6.x -> 0.7.x` media migration path available
+/// temporarily without leaving the legacy fallback open-ended.
+const LEGACY_MEDIA_MIGRATION_DEADLINE: u64 = 1_778_803_200;
+
 /// Manager for encrypted media operations
 pub struct EncryptedMediaManager<'a, Storage>
 where
@@ -35,10 +40,17 @@ impl<'a, Storage> EncryptedMediaManager<'a, Storage>
 where
     Storage: MdkStorageProvider,
 {
+    fn allow_legacy_media_fallback_at(current_time: u64) -> bool {
+        current_time <= LEGACY_MEDIA_MIGRATION_DEADLINE
+    }
+
+    /// Try to decrypt with a single exporter secret, falling back to the legacy
+    /// key-derivation path when `allow_legacy` is true and the primary attempt fails.
     fn try_decrypt_with_secret_compat(
         encrypted_data: &[u8],
         reference: &MediaReference,
         secret: &GroupExporterSecret,
+        allow_legacy: bool,
     ) -> Result<Vec<u8>, EncryptedMediaError> {
         let key = derive_encryption_key_with_secret(
             &secret.secret,
@@ -49,42 +61,58 @@ where
         )?;
 
         match Self::decrypt_and_verify(encrypted_data, &key, reference) {
-            Ok(data) => Ok(data),
-            Err(EncryptedMediaError::DecryptionFailed { .. }) => {
-                let legacy_key = derive_legacy_encryption_key_with_secret(
-                    &secret.secret,
-                    &reference.scheme_version,
-                    &reference.original_hash,
-                    &reference.mime_type,
-                    &reference.filename,
-                )?;
-                Self::decrypt_and_verify(encrypted_data, &legacy_key, reference)
+            Ok(data) => return Ok(data),
+            Err(EncryptedMediaError::DecryptionFailed { .. }) if allow_legacy => {
+                tracing::trace!(
+                    target: "mdk_core::encrypted_media::manager",
+                    "Current key derivation failed, attempting legacy key derivation fallback",
+                );
             }
-            Err(e) => Err(e),
+            Err(e) => return Err(e),
         }
+
+        let legacy_key = derive_legacy_encryption_key_with_secret(
+            &secret.secret,
+            &reference.scheme_version,
+            &reference.original_hash,
+            &reference.mime_type,
+            &reference.filename,
+        )?;
+        Self::decrypt_and_verify(encrypted_data, &legacy_key, reference)
     }
 
     fn try_decrypt_with_current_epoch_compat(
         &self,
         encrypted_data: &[u8],
         reference: &MediaReference,
+        allow_legacy: bool,
     ) -> Result<Vec<u8>, EncryptedMediaError> {
         let mip04_secret = self
             .mdk
             .mip04_exporter_secret(&self.group_id)
             .map_err(|_| EncryptedMediaError::GroupNotFound)?;
 
-        match Self::try_decrypt_with_secret_compat(encrypted_data, reference, &mip04_secret) {
-            Ok(data) => Ok(data),
-            Err(EncryptedMediaError::DecryptionFailed { .. }) => {
-                let legacy_secret = self
-                    .mdk
-                    .legacy_exporter_secret(&self.group_id)
-                    .map_err(|_| EncryptedMediaError::GroupNotFound)?;
-                Self::try_decrypt_with_secret_compat(encrypted_data, reference, &legacy_secret)
-            }
-            Err(e) => Err(e),
+        match Self::try_decrypt_with_secret_compat(
+            encrypted_data,
+            reference,
+            &mip04_secret,
+            allow_legacy,
+        ) {
+            Ok(data) => return Ok(data),
+            Err(EncryptedMediaError::DecryptionFailed { .. }) if allow_legacy => {}
+            Err(e) => return Err(e),
         }
+
+        let legacy_secret = self
+            .mdk
+            .legacy_exporter_secret(&self.group_id)
+            .map_err(|_| EncryptedMediaError::GroupNotFound)?;
+        Self::try_decrypt_with_secret_compat(
+            encrypted_data,
+            reference,
+            &legacy_secret,
+            allow_legacy,
+        )
     }
 
     /// Create a new encrypted media manager for a specific group
@@ -191,12 +219,28 @@ where
     /// Looks up the encryption epoch from the stored message's IMETA tag (via the
     /// `x <hash>` field), then decrypts with that epoch's exporter secret. This is
     /// O(1) regardless of how many epoch advancements have occurred.
+    ///
+    /// The legacy key-derivation fallback (pre-0.7.1 HKDF extract+expand path) is
+    /// permitted only until May 15, 2026 00:00:00 UTC.
     pub fn decrypt_from_download(
         &self,
         encrypted_data: &[u8],
         reference: &MediaReference,
     ) -> Result<Vec<u8>, EncryptedMediaError> {
-        match self.try_decrypt_with_epoch_hint(encrypted_data, reference) {
+        self.decrypt_from_download_at(encrypted_data, reference, Timestamp::now().as_secs())
+    }
+
+    /// Like [`Self::decrypt_from_download`] but accepts an explicit `current_time` (Unix
+    /// seconds) for deterministic testing of the migration deadline.
+    pub(crate) fn decrypt_from_download_at(
+        &self,
+        encrypted_data: &[u8],
+        reference: &MediaReference,
+        current_time: u64,
+    ) -> Result<Vec<u8>, EncryptedMediaError> {
+        let allow_legacy = Self::allow_legacy_media_fallback_at(current_time);
+
+        match self.try_decrypt_with_epoch_hint(encrypted_data, reference, allow_legacy) {
             Ok(data) => Ok(data),
             Err(EncryptedMediaError::NoExporterSecretForEpoch(_))
             | Err(EncryptedMediaError::DecryptionFailed { .. }) => {
@@ -204,7 +248,7 @@ where
                     target: "mdk_core::encrypted_media::manager",
                     "Epoch hint unavailable or failed, falling back to current epoch key",
                 );
-                self.try_decrypt_with_current_epoch_compat(encrypted_data, reference)
+                self.try_decrypt_with_current_epoch_compat(encrypted_data, reference, allow_legacy)
             }
             Err(e) => Err(e),
         }
@@ -246,6 +290,7 @@ where
         &self,
         encrypted_data: &[u8],
         reference: &MediaReference,
+        allow_legacy: bool,
     ) -> Result<Vec<u8>, EncryptedMediaError> {
         let search_term = format!("x {}", hex::encode(reference.original_hash));
 
@@ -273,6 +318,7 @@ where
             encrypted_data,
             reference,
             &mut found_secret,
+            allow_legacy,
             |storage, group_id, epoch| storage.get_group_mip04_exporter_secret(group_id, epoch),
         )? {
             return Ok(data);
@@ -283,6 +329,7 @@ where
             encrypted_data,
             reference,
             &mut found_secret,
+            allow_legacy,
             |storage, group_id, epoch| storage.get_group_exporter_secret(group_id, epoch),
         )? {
             return Ok(data);
@@ -293,6 +340,7 @@ where
             encrypted_data,
             reference,
             &mut found_secret,
+            allow_legacy,
             |storage, group_id, epoch| storage.get_group_legacy_exporter_secret(group_id, epoch),
         )? {
             return Ok(data);
@@ -313,6 +361,7 @@ where
         encrypted_data: &[u8],
         reference: &MediaReference,
         found_secret: &mut bool,
+        allow_legacy: bool,
         load_secret: F,
     ) -> Result<Option<Vec<u8>>, EncryptedMediaError>
     where
@@ -327,7 +376,8 @@ where
 
         *found_secret = true;
 
-        match Self::try_decrypt_with_secret_compat(encrypted_data, reference, &secret) {
+        match Self::try_decrypt_with_secret_compat(encrypted_data, reference, &secret, allow_legacy)
+        {
             Ok(data) => Ok(Some(data)),
             Err(EncryptedMediaError::DecryptionFailed { .. }) => Ok(None),
             Err(e) => Err(e),
@@ -643,6 +693,14 @@ mod tests {
             mdk.self_update(group_id).unwrap();
             mdk.merge_pending_commit(group_id).unwrap();
         }
+    }
+
+    fn fixed_pre_deadline_ts() -> u64 {
+        LEGACY_MEDIA_MIGRATION_DEADLINE.saturating_sub(1)
+    }
+
+    fn fixed_post_deadline_ts() -> u64 {
+        LEGACY_MEDIA_MIGRATION_DEADLINE.saturating_add(1)
     }
 
     #[test]
@@ -1969,5 +2027,168 @@ mod tests {
             .decrypt_from_download(&upload.encrypted_data, &media_ref)
             .unwrap();
         assert_eq!(decrypted, data);
+    }
+
+    /// Verifies that the legacy key-derivation fallback (pre-0.7.1 HKDF extract+expand)
+    /// is accepted before the migration deadline.
+    #[test]
+    fn test_legacy_media_key_derivation_accepted_before_deadline() {
+        let (mdk, group_id, alice_keys) = setup_group();
+
+        let data = b"legacy key derivation test";
+        let original_hash: [u8; 32] = sha2::Sha256::digest(data).into();
+        let legacy_secret = mdk
+            .legacy_exporter_secret(&group_id)
+            .expect("Should derive legacy exporter secret");
+        let key = derive_legacy_encryption_key_with_secret(
+            &legacy_secret.secret,
+            DEFAULT_SCHEME_VERSION,
+            &original_hash,
+            "text/plain",
+            "legacy.txt",
+        )
+        .expect("Should derive legacy media key");
+        let nonce = generate_encryption_nonce();
+        let encrypted_data = encrypt_data_with_aad(
+            data,
+            &key,
+            &nonce,
+            DEFAULT_SCHEME_VERSION,
+            &original_hash,
+            "text/plain",
+            "legacy.txt",
+        )
+        .expect("Should encrypt with legacy key");
+
+        let reference = MediaReference {
+            url: "https://example.com/legacy".to_string(),
+            original_hash,
+            mime_type: "text/plain".to_string(),
+            filename: "legacy.txt".to_string(),
+            dimensions: None,
+            scheme_version: DEFAULT_SCHEME_VERSION.to_string(),
+            nonce: *nonce,
+        };
+
+        let manager = mdk.media_manager(group_id.clone());
+        store_imeta_message(
+            &mdk,
+            &group_id,
+            &EncryptedMediaUpload {
+                encrypted_data: encrypted_data.clone(),
+                original_hash,
+                encrypted_hash: sha2::Sha256::digest(&encrypted_data).into(),
+                mime_type: "text/plain".to_string(),
+                filename: "legacy.txt".to_string(),
+                original_size: data.len() as u64,
+                encrypted_size: encrypted_data.len() as u64,
+                dimensions: None,
+                blurhash: None,
+                nonce: *nonce,
+            },
+            alice_keys.public_key(),
+            "https://example.com/legacy",
+        );
+
+        // Before the deadline the legacy key-derivation path must succeed.
+        let result =
+            manager.decrypt_from_download_at(&encrypted_data, &reference, fixed_pre_deadline_ts());
+        assert!(
+            result.is_ok(),
+            "Legacy media key derivation must be accepted before the deadline, got: {:?}",
+            result
+        );
+        assert_eq!(result.unwrap(), data);
+    }
+
+    /// Verifies that the legacy key-derivation fallback is rejected after the migration
+    /// deadline. Media that can only be decrypted with the pre-0.7.1 HKDF path must
+    /// fail once the deadline has passed.
+    #[test]
+    fn test_legacy_media_key_derivation_rejected_after_deadline() {
+        let (mdk, group_id, alice_keys) = setup_group();
+
+        let data = b"post-deadline legacy key derivation test";
+        let original_hash: [u8; 32] = sha2::Sha256::digest(data).into();
+        let legacy_secret = mdk
+            .legacy_exporter_secret(&group_id)
+            .expect("Should derive legacy exporter secret");
+        let key = derive_legacy_encryption_key_with_secret(
+            &legacy_secret.secret,
+            DEFAULT_SCHEME_VERSION,
+            &original_hash,
+            "text/plain",
+            "legacy-post.txt",
+        )
+        .expect("Should derive legacy media key");
+        let nonce = generate_encryption_nonce();
+        let encrypted_data = encrypt_data_with_aad(
+            data,
+            &key,
+            &nonce,
+            DEFAULT_SCHEME_VERSION,
+            &original_hash,
+            "text/plain",
+            "legacy-post.txt",
+        )
+        .expect("Should encrypt with legacy key");
+
+        let reference = MediaReference {
+            url: "https://example.com/legacy-post".to_string(),
+            original_hash,
+            mime_type: "text/plain".to_string(),
+            filename: "legacy-post.txt".to_string(),
+            dimensions: None,
+            scheme_version: DEFAULT_SCHEME_VERSION.to_string(),
+            nonce: *nonce,
+        };
+
+        let manager = mdk.media_manager(group_id.clone());
+        store_imeta_message(
+            &mdk,
+            &group_id,
+            &EncryptedMediaUpload {
+                encrypted_data: encrypted_data.clone(),
+                original_hash,
+                encrypted_hash: sha2::Sha256::digest(&encrypted_data).into(),
+                mime_type: "text/plain".to_string(),
+                filename: "legacy-post.txt".to_string(),
+                original_size: data.len() as u64,
+                encrypted_size: encrypted_data.len() as u64,
+                dimensions: None,
+                blurhash: None,
+                nonce: *nonce,
+            },
+            alice_keys.public_key(),
+            "https://example.com/legacy-post",
+        );
+
+        // After the deadline the legacy key-derivation fallback must be suppressed.
+        let result =
+            manager.decrypt_from_download_at(&encrypted_data, &reference, fixed_post_deadline_ts());
+        assert!(
+            result.is_err(),
+            "Legacy media key derivation must be rejected after the deadline"
+        );
+    }
+
+    /// Verifies that the allow_legacy_media_fallback_at gate functions correctly at
+    /// the boundary values.
+    #[test]
+    fn test_allow_legacy_media_fallback_at_boundary() {
+        type Manager<'a> = EncryptedMediaManager<'a, MdkMemoryStorage>;
+
+        assert!(
+            Manager::allow_legacy_media_fallback_at(LEGACY_MEDIA_MIGRATION_DEADLINE),
+            "Should allow legacy at exactly the deadline"
+        );
+        assert!(
+            Manager::allow_legacy_media_fallback_at(fixed_pre_deadline_ts()),
+            "Should allow legacy before the deadline"
+        );
+        assert!(
+            !Manager::allow_legacy_media_fallback_at(fixed_post_deadline_ts()),
+            "Should reject legacy after the deadline"
+        );
     }
 }
