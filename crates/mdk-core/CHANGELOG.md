@@ -33,7 +33,7 @@
 
 ### Fixed
 
-- Bumped `digest` lockfile entry from yanked `0.11.1` to `0.11.2`, resolving the `cargo audit` yanked-crate warning introduced transitively via `openmls_rust_crypto` → `hpke-rs-rust-crypto` → `x-wing` → `sha3`.
+- Bumped `digest` lockfile entry from yanked `0.11.1` to `0.11.2`, resolving the `cargo audit` yanked-crate warning introduced transitively via `openmls_rust_crypto` → `hpke-rs-rust-crypto` → `x-wing` → `sha3`. ([#229](https://github.com/marmot-protocol/mdk/pull/229))
 - Tightened the minimum-length check in `decrypt_message_with_exporter_secret` from 12 bytes to 28 bytes. The correct minimum is 12 (nonce) + 16 (Poly1305 tag) + 0 (empty plaintext) = 28 bytes; the previous check only validated that enough bytes existed to extract the nonce, silently passing structurally invalid ciphertexts to the AEAD layer. ([#230](https://github.com/marmot-protocol/mdk/pull/230))
 - MIP-03 and MIP-04 legacy exporter-secret migration deadline moved from June 4, 2026 to May 15, 2026 00:00:00 UTC. ([#222](https://github.com/marmot-protocol/mdk/pull/222))
 - MIP-04 media decryption legacy key-derivation fallback (pre-0.7.1 HKDF extract+expand path) is now gated by the same May 15, 2026 deadline as the MIP-03 message fallback. Previously the legacy media path had no deadline. ([#222](https://github.com/marmot-protocol/mdk/pull/222))
