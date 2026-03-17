@@ -42,12 +42,19 @@ pub(crate) fn encrypt_message_with_exporter_secret(
     Ok(BASE64.encode(&combined))
 }
 
+/// Minimum valid byte length of decoded `event.content`:
+/// 12-byte nonce + 16-byte Poly1305 authentication tag + 0 bytes of plaintext.
+const MIN_ENCRYPTED_CONTENT_LEN: usize = 28;
+
 /// Decrypts a kind:445 message content using ChaCha20-Poly1305 per MIP-03.
 ///
 /// The content format is `base64(nonce || ciphertext)` where:
 /// - `nonce` is 12 bytes
 /// - `ciphertext` includes the 16-byte Poly1305 authentication tag
 /// - No AAD is used per MIP-03
+///
+/// The minimum valid decoded length is 28 bytes:
+/// 12 (nonce) + 16 (Poly1305 tag) + 0 (empty plaintext).
 pub(crate) fn decrypt_message_with_exporter_secret(
     secret: &GroupExporterSecret,
     encrypted_content: &str,
@@ -56,9 +63,9 @@ pub(crate) fn decrypt_message_with_exporter_secret(
         Error::Message("Failed to decode message content: invalid base64".to_string())
     })?;
 
-    if combined.len() < 12 {
+    if combined.len() < MIN_ENCRYPTED_CONTENT_LEN {
         return Err(Error::Message(
-            "Malformed message content: nonce is shorter than 12 bytes".to_string(),
+            "Malformed message content: decoded content is fewer than 28 bytes (nonce + auth tag required)".to_string(),
         ));
     }
 
@@ -187,19 +194,23 @@ mod tests {
     }
 
     #[test]
-    fn test_decrypt_rejects_short_nonce() {
+    fn test_decrypt_rejects_too_short_content() {
         let secret = GroupExporterSecret {
             mls_group_id: GroupId::from_slice(&[9, 9, 8]),
             epoch: 0,
             secret: Secret::new([1u8; 32]),
         };
 
-        let too_short = BASE64.encode([0u8; 11]);
-        let result = decrypt_message_with_exporter_secret(&secret, &too_short);
-
-        assert!(
-            matches!(result, Err(Error::Message(msg)) if msg.contains("nonce is shorter than 12 bytes"))
-        );
+        // Any decoded length below 28 bytes must be rejected:
+        // 12 (nonce) + 16 (Poly1305 tag) + 0 (empty plaintext) = 28 bytes minimum.
+        for len in [0usize, 1, 11, 12, 13, 27] {
+            let too_short = BASE64.encode(vec![0u8; len]);
+            let result = decrypt_message_with_exporter_secret(&secret, &too_short);
+            assert!(
+                matches!(result, Err(Error::Message(ref msg)) if msg.contains("fewer than 28 bytes")),
+                "Expected rejection for decoded length {len}, got: {result:?}"
+            );
+        }
     }
 
     #[test]
