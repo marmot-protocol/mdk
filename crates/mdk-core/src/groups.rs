@@ -376,11 +376,39 @@ where
         self.load_mls_group_impl(group_id)
     }
 
+    fn derive_exporter_secret_for_group(
+        &self,
+        group_id: &crate::GroupId,
+        group: &MlsGroup,
+        exporter_label: &str,
+        exporter_context: &[u8],
+    ) -> Result<group_types::GroupExporterSecret, Error> {
+        let export_secret: [u8; 32] = group
+            .export_secret(self.provider.crypto(), exporter_label, exporter_context, 32)?
+            .try_into()
+            .map_err(|_| Error::Group("Failed to convert export secret to [u8; 32]".to_string()))?;
+
+        Ok(group_types::GroupExporterSecret {
+            mls_group_id: group_id.clone(),
+            epoch: group.epoch().as_u64(),
+            secret: mdk_storage_traits::Secret::new(export_secret),
+        })
+    }
+
+    pub(crate) fn legacy_exporter_secret(
+        &self,
+        group_id: &crate::GroupId,
+    ) -> Result<group_types::GroupExporterSecret, Error> {
+        let group = self.load_mls_group(group_id)?.ok_or(Error::GroupNotFound)?;
+        self.derive_exporter_secret_for_group(group_id, &group, "nostr", b"nostr")
+    }
+
     /// Exports the current epoch's secret key from an MLS group for MIP-03 message encryption.
     ///
     /// Uses `MLS-Exporter("marmot", "group-event", 32)` per MIP-03. The secret is the
     /// ChaCha20-Poly1305 encryption key for kind:445 Group Message Events.
-    /// The secret is cached in storage to avoid re-exporting it for each message.
+    /// The current epoch's secret is always re-derived from live MLS state before being
+    /// stored. This self-heals stale rows migrated from pre-0.7.0 caches.
     ///
     /// # Arguments
     ///
@@ -395,34 +423,40 @@ where
         group_id: &crate::GroupId,
     ) -> Result<group_types::GroupExporterSecret, Error> {
         let group = self.load_mls_group(group_id)?.ok_or(Error::GroupNotFound)?;
-
-        match self
+        let stored_secret = self
             .storage()
             .get_group_exporter_secret(group_id, group.epoch().as_u64())
-            .map_err(|e| Error::Group(e.to_string()))?
-        {
-            Some(group_exporter_secret) => Ok(group_exporter_secret),
-            // If it's not already in the storage, export the secret and save it
-            None => {
-                let export_secret: [u8; 32] = group
-                    .export_secret(self.provider.crypto(), "marmot", b"group-event", 32)?
-                    .try_into()
-                    .map_err(|_| {
-                        Error::Group("Failed to convert export secret to [u8; 32]".to_string())
-                    })?;
-                let group_exporter_secret = group_types::GroupExporterSecret {
-                    mls_group_id: group_id.clone(),
-                    epoch: group.epoch().as_u64(),
-                    secret: mdk_storage_traits::Secret::new(export_secret),
-                };
+            .map_err(|e| Error::Group(e.to_string()))?;
+        let group_exporter_secret =
+            self.derive_exporter_secret_for_group(group_id, &group, "marmot", b"group-event")?;
 
-                self.storage()
-                    .save_group_exporter_secret(group_exporter_secret.clone())
-                    .map_err(|e| Error::Group(e.to_string()))?;
+        // Only write back to storage when the value has changed (or is absent).
+        // This avoids an unconditional write on every message decryption in the steady state
+        // while still self-healing any stale pre-0.7.0 row that differs from live MLS state.
+        let secret_changed = stored_secret
+            .as_ref()
+            .map(|s| s.secret != group_exporter_secret.secret)
+            .unwrap_or(true);
 
-                Ok(group_exporter_secret)
+        if secret_changed {
+            self.storage()
+                .save_group_exporter_secret(group_exporter_secret.clone())
+                .map_err(|e| Error::Group(e.to_string()))?;
+
+            if let Some(stored_secret) = stored_secret
+                && let Err(e) = self
+                    .storage()
+                    .save_group_legacy_exporter_secret(stored_secret)
+            {
+                tracing::warn!(
+                    target: "mdk_core::groups::exporter_secret",
+                    "Failed to preserve legacy exporter secret for compatibility: {}",
+                    e
+                );
             }
         }
+
+        Ok(group_exporter_secret)
     }
 
     /// Exports the current epoch's secret key from an MLS group for MIP-04 encrypted media.
@@ -445,19 +479,7 @@ where
         group_id: &crate::GroupId,
     ) -> Result<group_types::GroupExporterSecret, Error> {
         let group = self.load_mls_group(group_id)?.ok_or(Error::GroupNotFound)?;
-
-        let export_secret: [u8; 32] = group
-            .export_secret(self.provider.crypto(), "marmot", b"encrypted-media", 32)?
-            .try_into()
-            .map_err(|_| {
-                Error::Group("Failed to convert MIP-04 export secret to [u8; 32]".to_string())
-            })?;
-
-        Ok(group_types::GroupExporterSecret {
-            mls_group_id: group_id.clone(),
-            epoch: group.epoch().as_u64(),
-            secret: mdk_storage_traits::Secret::new(export_secret),
-        })
+        self.derive_exporter_secret_for_group(group_id, &group, "marmot", b"encrypted-media")
     }
 
     /// Retrieves a MDK group by its MLS group ID
@@ -3039,6 +3061,39 @@ mod tests {
         assert_eq!(
             initial_secret.mls_group_id, final_secret.mls_group_id,
             "Group ID should remain the same"
+        );
+    }
+
+    #[test]
+    fn test_exporter_secret_rederives_current_epoch_instead_of_trusting_storage() {
+        let mdk = create_test_mdk();
+        let (creator, members, admins) = create_test_group_members();
+        let group_id = create_test_group(&mdk, &creator, &members, &admins);
+
+        let legacy_secret = mdk
+            .legacy_exporter_secret(&group_id)
+            .expect("Failed to derive legacy exporter secret");
+        mdk.storage()
+            .save_group_exporter_secret(legacy_secret.clone())
+            .expect("Failed to persist legacy exporter secret");
+
+        let refreshed_secret = mdk
+            .exporter_secret(&group_id)
+            .expect("Failed to derive refreshed exporter secret");
+
+        assert_ne!(
+            refreshed_secret.secret, legacy_secret.secret,
+            "Current exporter secret should ignore stale stored bytes"
+        );
+
+        let stored_secret = mdk
+            .storage()
+            .get_group_exporter_secret(&group_id, refreshed_secret.epoch)
+            .expect("Failed to load stored exporter secret")
+            .expect("Stored exporter secret should exist");
+        assert_eq!(
+            stored_secret.secret, refreshed_secret.secret,
+            "Storage should be healed to the freshly derived exporter secret"
         );
     }
 

@@ -270,6 +270,53 @@ where
     (new_mdk, group_id, creator, members)
 }
 
+/// Creates a two-member group (Alice + Bob) and returns both MDK instances,
+/// both key pairs, and the group ID.
+///
+/// Alice creates the group (with both as admins), merges her commit, then Bob
+/// processes and accepts the welcome. After this function returns both members
+/// are fully joined and at the same epoch.
+#[cfg(test)]
+pub fn setup_two_member_group() -> (
+    MDK<mdk_memory_storage::MdkMemoryStorage>,
+    MDK<mdk_memory_storage::MdkMemoryStorage>,
+    nostr::Keys,
+    nostr::Keys,
+    GroupId,
+) {
+    use mdk_memory_storage::MdkMemoryStorage;
+    use nostr::{EventId, Keys};
+
+    let alice_keys = Keys::generate();
+    let bob_keys = Keys::generate();
+    let alice_mdk = MDK::new(MdkMemoryStorage::default());
+    let bob_mdk = MDK::new(MdkMemoryStorage::default());
+    let admins = vec![alice_keys.public_key(), bob_keys.public_key()];
+    let bob_key_package = create_key_package_event(&bob_mdk, &bob_keys);
+
+    let create_result = alice_mdk
+        .create_group(
+            &alice_keys.public_key(),
+            vec![bob_key_package],
+            create_nostr_group_config_data(admins),
+        )
+        .expect("Alice should create group");
+    let group_id = create_result.group.mls_group_id.clone();
+
+    alice_mdk
+        .merge_pending_commit(&group_id)
+        .expect("Alice should merge group creation commit");
+
+    let bob_welcome = bob_mdk
+        .process_welcome(&EventId::all_zeros(), &create_result.welcome_rumors[0])
+        .expect("Bob should process welcome");
+    bob_mdk
+        .accept_welcome(&bob_welcome)
+        .expect("Bob should accept welcome");
+
+    (alice_mdk, bob_mdk, alice_keys, bob_keys, group_id)
+}
+
 /// Assert that two group states are equal
 ///
 /// This helper provides detailed error messages when group states don't match,

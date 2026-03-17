@@ -236,6 +236,22 @@ pub trait GroupStorage {
         group_exporter_secret: GroupExporterSecret,
     ) -> Result<(), GroupError>;
 
+    /// Get a legacy pre-0.7.0 group-event exporter secret for a group and epoch.
+    ///
+    /// Returns the secret derived via `MLS-Exporter("nostr", "nostr", 32)`,
+    /// retained only for migration-time read compatibility.
+    fn get_group_legacy_exporter_secret(
+        &self,
+        group_id: &GroupId,
+        epoch: u64,
+    ) -> Result<Option<GroupExporterSecret>, GroupError>;
+
+    /// Save a legacy pre-0.7.0 group-event exporter secret for a group and epoch.
+    fn save_group_legacy_exporter_secret(
+        &self,
+        group_exporter_secret: GroupExporterSecret,
+    ) -> Result<(), GroupError>;
+
     /// Get a MIP-04 encrypted-media exporter secret for a group and epoch.
     ///
     /// Returns the secret derived via `MLS-Exporter("marmot", "encrypted-media", 32)`,
@@ -254,8 +270,9 @@ pub trait GroupStorage {
 
     /// Prune exporter secrets older than `min_epoch_to_keep` for the group.
     ///
-    /// Implementations must remove both MIP-03 (`group-event`) and MIP-04
-    /// (`encrypted-media`) exporter secrets with `epoch < min_epoch_to_keep`.
+    /// Implementations must remove MIP-03 (`group-event`), preserved legacy MIP-03
+    /// (`legacy-group-event`), and MIP-04 (`encrypted-media`) exporter secrets with
+    /// `epoch < min_epoch_to_keep`.
     fn prune_group_exporter_secrets_before_epoch(
         &self,
         group_id: &GroupId,

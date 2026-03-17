@@ -339,14 +339,7 @@ where
     /// # Arguments
     ///
     /// * `event` - The Nostr event to validate
-    ///
-    /// # Returns
-    ///
-    /// * `Ok(())` - If timestamp is valid
-    /// * `Err(Error::InvalidTimestamp)` - If timestamp is outside acceptable bounds
-    pub(super) fn validate_created_at(&self, event: &Event) -> Result<()> {
-        let now = Timestamp::now();
-
+    pub(super) fn validate_created_at_with_now(&self, event: &Event, now: Timestamp) -> Result<()> {
         // Reject events from the future (allow configurable clock skew)
         if event.created_at.as_secs()
             > now
@@ -445,6 +438,10 @@ where
     /// * `Ok(())` - If the event passes validation
     /// * `Err(Error)` - If validation fails
     pub(super) fn validate_event(&self, event: &Event) -> Result<()> {
+        self.validate_event_at(event, Timestamp::now())
+    }
+
+    pub(super) fn validate_event_at(&self, event: &Event, now: Timestamp) -> Result<()> {
         // 1. Verify event kind
         if event.kind != Kind::MlsGroupMessage {
             return Err(Error::UnexpectedEvent {
@@ -454,7 +451,7 @@ where
         }
 
         // 2. Verify timestamp is within acceptable bounds
-        self.validate_created_at(event)?;
+        self.validate_created_at_with_now(event, now)?;
 
         Ok(())
     }

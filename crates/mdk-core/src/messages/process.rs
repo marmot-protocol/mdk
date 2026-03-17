@@ -299,6 +299,23 @@ where
     /// * `Ok(MessageProcessingResult)` - Result indicating the type of message processed
     /// * `Err(Error)` - If message processing fails
     pub fn process_message(&self, event: &Event) -> Result<MessageProcessingResult> {
+        self.process_message_inner(event, None)
+    }
+
+    #[cfg(test)]
+    pub(super) fn process_message_at(
+        &self,
+        event: &Event,
+        now: Timestamp,
+    ) -> Result<MessageProcessingResult> {
+        self.process_message_inner(event, Some(now))
+    }
+
+    fn process_message_inner(
+        &self,
+        event: &Event,
+        now: Option<Timestamp>,
+    ) -> Result<MessageProcessingResult> {
         // Step 0: Check if already processed (deduplication)
         if let Some(processed) = self
             .storage()
@@ -351,9 +368,11 @@ where
         }
 
         // Step 1: Validate event and extract group ID
-        let nostr_group_id = match self
-            .validate_event(event)
-            .and_then(|()| self.extract_nostr_group_id(event))
+        let validate_result = match now {
+            Some(now) => self.validate_event_at(event, now),
+            None => self.validate_event(event),
+        };
+        let nostr_group_id = match validate_result.and_then(|()| self.extract_nostr_group_id(event))
         {
             Ok(id) => id,
             Err(e) => {
@@ -370,34 +389,37 @@ where
         };
 
         // Step 2: Load group and decrypt message
-        let (group, mut mls_group, message_bytes) =
-            match self.decrypt_message(nostr_group_id, event) {
-                Ok(result) => result,
-                Err(e) => {
-                    // Save failed processing record to prevent reprocessing
-                    // Don't fail if we can't save the failure record - log and continue
-                    //
-                    // For decryption failures, we look up the group to get mls_group_id for
-                    // retry tracking, but we pass epoch=None because we don't know what
-                    // epoch the message was encrypted for. Messages with epoch=None and
-                    // state=Failed are candidates for retry after rollback.
-                    let mls_group_id = self
-                        .storage()
-                        .find_group_by_nostr_group_id(&nostr_group_id)
-                        .ok()
-                        .flatten()
-                        .map(|g| g.mls_group_id);
-                    if let Err(_save_err) =
-                        self.record_failure(event.id, &e, mls_group_id.as_ref(), None)
-                    {
-                        tracing::warn!(
-                            target: "mdk_core::messages::process_message",
-                            "Failed to persist failure record; error details redacted"
-                        );
-                    }
-                    return Err(e);
+        let decrypt_result = match now {
+            Some(now) => self.decrypt_message_at(nostr_group_id, event, now.as_secs()),
+            None => self.decrypt_message(nostr_group_id, event),
+        };
+        let (group, mut mls_group, message_bytes) = match decrypt_result {
+            Ok(result) => result,
+            Err(e) => {
+                // Save failed processing record to prevent reprocessing
+                // Don't fail if we can't save the failure record - log and continue
+                //
+                // For decryption failures, we look up the group to get mls_group_id for
+                // retry tracking, but we pass epoch=None because we don't know what
+                // epoch the message was encrypted for. Messages with epoch=None and
+                // state=Failed are candidates for retry after rollback.
+                let mls_group_id = self
+                    .storage()
+                    .find_group_by_nostr_group_id(&nostr_group_id)
+                    .ok()
+                    .flatten()
+                    .map(|g| g.mls_group_id);
+                if let Err(_save_err) =
+                    self.record_failure(event.id, &e, mls_group_id.as_ref(), None)
+                {
+                    tracing::warn!(
+                        target: "mdk_core::messages::process_message",
+                        "Failed to persist failure record; error details redacted"
+                    );
                 }
-            };
+                return Err(e);
+            }
+        };
 
         // Step 3: Process the decrypted message
         match self.dispatch_by_content_type(group.clone(), &mut mls_group, &message_bytes, event) {
