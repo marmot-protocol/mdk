@@ -185,3 +185,20 @@ jobs:
     - name: Doc tests
       if: matrix.features.name == 'all-features'
       run: cargo test --all-features --doc
+
+  # ── Security Audit ──────────────────────────────────────────────────
+  audit:
+    needs: [changes]
+    runs-on: ubuntu-latest
+    name: Security Audit
+    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.ci == 'true'
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Install cargo-audit
+      uses: taiki-e/install-action@cargo-audit
+
+    - name: Run cargo audit
+      run: cargo audit

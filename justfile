@@ -30,6 +30,14 @@ test-all:
     @just test-mip04
 
 # ==============================================================================
+# SECURITY AUDIT
+# ==============================================================================
+
+# Run cargo audit to check for known vulnerabilities and advisories
+audit:
+    cargo audit
+
+# ==============================================================================
 # LINTING & FORMATTING
 # ==============================================================================
 
@@ -68,6 +76,7 @@ precommit:
     @just _run-quiet "test"              "test (all features)"
     @just _run-quiet "test-no-features"  "test (no features)"
     @just _run-quiet "test-mip04"        "test (mip04)"
+    @just _run-quiet "audit"             "cargo audit"
     @echo "PRECOMMIT PASSED"
 
 # Pre-commit checks with verbose output (shows all command output)
@@ -84,6 +93,9 @@ precommit-verbose:
     @echo ""
     @echo "→ Running tests..."
     @just test-all
+    @echo ""
+    @echo "→ Running security audit..."
+    @just audit
     @echo ""
     @echo "=========================================="
     @echo "✓ All pre-commit checks passed!"
