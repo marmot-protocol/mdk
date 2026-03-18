@@ -47,7 +47,7 @@ pub struct WebRTCConfig {
 impl Default for WebRTCConfig {
     fn default() -> Self {
         Self {
-            ice_servers: vec!["stun:stun.l.google.com:19302".to_string()],
+            ice_servers: vec![],
             bundle: true,
             ice_transport_policy: IceTransportPolicy::All,
         }
@@ -283,18 +283,21 @@ impl WebRTCPeer {
     /// Wait until the peer connection reaches Connected state.
     /// Call this before starting to send audio frames.
     pub async fn wait_connected(&self) {
+        // Create Notified future BEFORE checking state to avoid TOCTOU race
+        let notified = self.connected_notify.notified();
         if self.connection.connection_state() == RTCPeerConnectionState::Connected {
             return;
         }
-        self.connected_notify.notified().await;
+        notified.await;
     }
 
     /// Wait until connected with a timeout. Returns true if connected.
     pub async fn wait_connected_timeout(&self, timeout: Duration) -> bool {
+        let notified = self.connected_notify.notified();
         if self.connection.connection_state() == RTCPeerConnectionState::Connected {
             return true;
         }
-        tokio::time::timeout(timeout, self.connected_notify.notified())
+        tokio::time::timeout(timeout, notified)
             .await
             .is_ok()
     }
@@ -481,9 +484,10 @@ fn sanitize_sdp(sdp: &str) -> String {
                     .expect("Failed to generate random hostname");
                 let random_hostname =
                     format!("marmot-{:08x}", u32::from_be_bytes(random_bytes));
+                // Replace both username and unicast-address to prevent hostname leakage
                 let new_line = format!(
-                    "o={} {} {} {} {} {}",
-                    random_hostname, parts[1], parts[2], parts[3], parts[4], parts[5]
+                    "o={} {} {} {} {} 0.0.0.0",
+                    random_hostname, parts[1], parts[2], parts[3], parts[4]
                 );
                 lines.push(new_line);
                 continue;
@@ -493,29 +497,53 @@ fn sanitize_sdp(sdp: &str) -> String {
         lines.push(line.to_string());
     }
 
-    lines.join("\r\n")
+    let mut sdp = lines.join("\r\n");
+    if !sdp.ends_with("\r\n") {
+        sdp.push_str("\r\n");
+    }
+    sdp
 }
 
-/// Check if a line contains a private IP address (RFC 1918)
+/// Check if an SDP candidate line contains a private/local IP address.
+///
+/// Parses the actual IP from the candidate line (field index 4 per RFC 8839)
+/// rather than doing substring matching, to avoid false positives on
+/// public IPs like 210.0.0.1 or 44.172.16.1.
 fn contains_private_ip(line: &str) -> bool {
-    line.contains("192.168.")
-        || line.contains("10.")
-        || line.contains("172.16.")
-        || line.contains("172.17.")
-        || line.contains("172.18.")
-        || line.contains("172.19.")
-        || line.contains("172.20.")
-        || line.contains("172.21.")
-        || line.contains("172.22.")
-        || line.contains("172.23.")
-        || line.contains("172.24.")
-        || line.contains("172.25.")
-        || line.contains("172.26.")
-        || line.contains("172.27.")
-        || line.contains("172.28.")
-        || line.contains("172.29.")
-        || line.contains("172.30.")
-        || line.contains("172.31.")
+    if line.starts_with("a=candidate:") {
+        // RFC 8839: a=candidate:<foundation> <component> <transport> <priority> <ip> <port> ...
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() >= 6 {
+            return is_private_ip(parts[4]);
+        }
+    }
+    // For non-candidate lines, check all whitespace-delimited tokens
+    for token in line.split_whitespace() {
+        if is_private_ip(token) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Check if an IP address string is private/local
+fn is_private_ip(ip: &str) -> bool {
+    use std::net::IpAddr;
+    match ip.parse::<IpAddr>() {
+        Ok(IpAddr::V4(v4)) => {
+            v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+        }
+        Ok(IpAddr::V6(v6)) => {
+            v6.is_loopback()
+                // fe80::/10 link-local
+                || (v6.segments()[0] & 0xffc0) == 0xfe80
+                // fc00::/7 unique local (ULA)
+                || (v6.segments()[0] & 0xfe00) == 0xfc00
+        }
+        Err(_) => false,
+    }
 }
 
 /// Manager for multiple WebRTC peer connections (one per participant)
@@ -545,16 +573,18 @@ impl WebRTCPeerManager {
     /// Add a new peer for a participant
     pub async fn add_peer(&self, leaf_index: u32) -> Result<Arc<WebRTCPeer>, MeshCallError> {
         let (peer_ice_tx, mut peer_ice_rx) = mpsc::unbounded_channel::<ICECandidate>();
-        let ice_tx = self.ice_tx.clone();
 
+        let peer = Arc::new(WebRTCPeer::new(&self.config, peer_ice_tx).await?);
+        self.peers.write().await.insert(leaf_index, peer.clone());
+
+        // Spawn ICE forwarding task only after peer creation succeeds
+        let ice_tx = self.ice_tx.clone();
         tokio::spawn(async move {
             while let Some(candidate) = peer_ice_rx.recv().await {
                 let _ = ice_tx.send((leaf_index, candidate));
             }
         });
 
-        let peer = Arc::new(WebRTCPeer::new(&self.config, peer_ice_tx).await?);
-        self.peers.write().await.insert(leaf_index, peer.clone());
         Ok(peer)
     }
 
@@ -610,11 +640,37 @@ mod tests {
 
     #[test]
     fn test_private_ip_detection() {
-        assert!(contains_private_ip("192.168.1.1"));
-        assert!(contains_private_ip("10.0.0.1"));
-        assert!(contains_private_ip("172.16.0.1"));
-        assert!(contains_private_ip("172.31.255.255"));
-        assert!(!contains_private_ip("203.0.113.1"));
-        assert!(!contains_private_ip("8.8.8.8"));
+        // RFC 1918
+        assert!(is_private_ip("192.168.1.1"));
+        assert!(is_private_ip("10.0.0.1"));
+        assert!(is_private_ip("172.16.0.1"));
+        assert!(is_private_ip("172.31.255.255"));
+        // Link-local
+        assert!(is_private_ip("169.254.1.1"));
+        // Loopback
+        assert!(is_private_ip("127.0.0.1"));
+        // IPv6
+        assert!(is_private_ip("::1"));
+        assert!(is_private_ip("fe80::1"));
+        assert!(is_private_ip("fc00::1"));
+        assert!(is_private_ip("fd12::1"));
+        // Public — must NOT match
+        assert!(!is_private_ip("203.0.113.1"));
+        assert!(!is_private_ip("8.8.8.8"));
+        assert!(!is_private_ip("2001:db8::1"));
+        // False positive cases from the review
+        assert!(!is_private_ip("210.0.0.1"));
+        assert!(!is_private_ip("44.172.16.1"));
+        assert!(!is_private_ip("110.0.0.1"));
+    }
+
+    #[test]
+    fn test_candidate_line_ip_extraction() {
+        // Private IP in candidate — should be detected
+        assert!(contains_private_ip("a=candidate:1 1 UDP 123 192.168.1.1 12345 typ host"));
+        assert!(contains_private_ip("a=candidate:2 1 UDP 124 10.0.0.1 12346 typ host"));
+        // Public IP that contains "10." as substring — must NOT be filtered
+        assert!(!contains_private_ip("a=candidate:3 1 UDP 125 210.0.0.1 12347 typ host"));
+        assert!(!contains_private_ip("a=candidate:4 1 UDP 126 44.172.16.1 12348 typ host"));
     }
 }

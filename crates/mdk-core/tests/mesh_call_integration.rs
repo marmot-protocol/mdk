@@ -61,8 +61,8 @@ fn test_sframe_key_salt_spec_vector() {
     base_key.copy_from_slice(&hex::decode(TV_SFRAME_BASE_KEY_AUDIO).unwrap());
 
     let sframe_key = derive_sframe_key(&base_key, TV_KID_AUDIO_LEAF3_EPOCH0).unwrap();
-    assert_eq!(hex::encode(sframe_key.key), TV_SFRAME_KEY);
-    assert_eq!(hex::encode(sframe_key.salt), TV_SFRAME_SALT);
+    assert_eq!(hex::encode(sframe_key.key()), TV_SFRAME_KEY);
+    assert_eq!(hex::encode(sframe_key.salt()), TV_SFRAME_SALT);
 }
 
 #[test]
@@ -70,15 +70,15 @@ fn test_kid_encoding_spec_vectors() {
     let bits = SFrameBits::default(); // E=4, S=6
 
     // leaf 3, audio, epoch 0 → KID = 0x0030
-    assert_eq!(bits.make_kid(MediaType::Audio, 3, 0), 0x0030);
+    assert_eq!(bits.make_kid(MediaType::Audio, 3, 0).unwrap(), 0x0030);
     // leaf 3, audio, epoch 14 → KID = 0x003e
-    assert_eq!(bits.make_kid(MediaType::Audio, 3, 14), 0x003e);
+    assert_eq!(bits.make_kid(MediaType::Audio, 3, 14).unwrap(), 0x003e);
     // leaf 3, video, epoch 14 → KID = 0x043e
-    assert_eq!(bits.make_kid(MediaType::Video, 3, 14), 0x043e);
+    assert_eq!(bits.make_kid(MediaType::Video, 3, 14).unwrap(), 0x043e);
     // leaf 3, screen, epoch 14 → KID = 0x083e
-    assert_eq!(bits.make_kid(MediaType::ScreenShare, 3, 14), 0x083e);
+    assert_eq!(bits.make_kid(MediaType::ScreenShare, 3, 14).unwrap(), 0x083e);
     // leaf 63, audio, epoch 15 → KID = 0x03ff
-    assert_eq!(bits.make_kid(MediaType::Audio, 63, 15), 0x03ff);
+    assert_eq!(bits.make_kid(MediaType::Audio, 63, 15).unwrap(), 0x03ff);
 }
 
 #[test]
@@ -88,8 +88,8 @@ fn test_kid_roundtrip() {
     for media in [MediaType::Audio, MediaType::Video, MediaType::ScreenShare] {
         for leaf in [0, 1, 3, 7, 31, 63] {
             for epoch in [0, 1, 7, 14, 15] {
-                let kid = bits.make_kid(media, leaf, epoch);
-                let (parsed_media, parsed_leaf, parsed_epoch) = bits.parse_kid(kid);
+                let kid = bits.make_kid(media, leaf, epoch).unwrap();
+                let (parsed_media, parsed_leaf, parsed_epoch) = bits.parse_kid(kid).unwrap();
                 assert_eq!(parsed_media, media, "media mismatch for {media:?} leaf={leaf} epoch={epoch}");
                 assert_eq!(parsed_leaf, leaf, "leaf mismatch for {media:?} leaf={leaf} epoch={epoch}");
                 assert_eq!(parsed_epoch, epoch, "epoch mismatch for {media:?} leaf={leaf} epoch={epoch}");
@@ -162,7 +162,7 @@ fn test_full_sframe_output_matches_spec() {
     let leaf = 3u32;
 
     let base_key = derive_sframe_base_key(&call_base_key, MediaType::Audio, leaf).unwrap();
-    let kid = bits.make_kid(MediaType::Audio, leaf, 0);
+    let kid = bits.make_kid(MediaType::Audio, leaf, 0).unwrap();
     let sframe_key = derive_sframe_key(&base_key, kid).unwrap();
 
     let mut ctx = SFrameContext::new(bits, leaf);
@@ -182,7 +182,7 @@ fn test_sframe_encrypt_decrypt_roundtrip() {
     // Sender context (leaf 0)
     let mut sender = SFrameContext::new(bits, 0);
     let base_key_s = derive_sframe_base_key(&call_base_key, MediaType::Audio, 0).unwrap();
-    let kid_s = bits.make_kid(MediaType::Audio, 0, 0);
+    let kid_s = bits.make_kid(MediaType::Audio, 0, 0).unwrap();
     let key_s = derive_sframe_key(&base_key_s, kid_s).unwrap();
     sender.set_key(MediaType::Audio, key_s.clone());
 
@@ -207,7 +207,7 @@ fn test_sframe_multiple_frames() {
 
     let mut sender = SFrameContext::new(bits, 0);
     let base_key = derive_sframe_base_key(&call_base_key, MediaType::Audio, 0).unwrap();
-    let kid = bits.make_kid(MediaType::Audio, 0, 0);
+    let kid = bits.make_kid(MediaType::Audio, 0, 0).unwrap();
     let key = derive_sframe_key(&base_key, kid).unwrap();
     sender.set_key(MediaType::Audio, key.clone());
 
@@ -233,7 +233,7 @@ fn test_replay_rejected() {
 
     let mut sender = SFrameContext::new(bits, 0);
     let base_key = derive_sframe_base_key(&call_base_key, MediaType::Audio, 0).unwrap();
-    let kid = bits.make_kid(MediaType::Audio, 0, 0);
+    let kid = bits.make_kid(MediaType::Audio, 0, 0).unwrap();
     let key = derive_sframe_key(&base_key, kid).unwrap();
     sender.set_key(MediaType::Audio, key.clone());
 
@@ -264,7 +264,7 @@ fn test_wrong_metadata_rejected() {
 
     let mut sender = SFrameContext::new(bits, 0);
     let base_key = derive_sframe_base_key(&call_base_key, MediaType::Audio, 0).unwrap();
-    let kid = bits.make_kid(MediaType::Audio, 0, 0);
+    let kid = bits.make_kid(MediaType::Audio, 0, 0).unwrap();
     let key = derive_sframe_key(&base_key, kid).unwrap();
     sender.set_key(MediaType::Audio, key.clone());
 
@@ -282,7 +282,7 @@ fn test_tampered_ciphertext_rejected() {
 
     let mut sender = SFrameContext::new(bits, 0);
     let base_key = derive_sframe_base_key(&call_base_key, MediaType::Audio, 0).unwrap();
-    let kid = bits.make_kid(MediaType::Audio, 0, 0);
+    let kid = bits.make_kid(MediaType::Audio, 0, 0).unwrap();
     let key = derive_sframe_key(&base_key, kid).unwrap();
     sender.set_key(MediaType::Audio, key.clone());
 
@@ -301,7 +301,7 @@ fn test_wrong_key_rejected() {
 
     let mut sender = SFrameContext::new(bits, 0);
     let base_key_s = derive_sframe_base_key(&[0x33u8; 32], MediaType::Audio, 0).unwrap();
-    let kid = bits.make_kid(MediaType::Audio, 0, 0);
+    let kid = bits.make_kid(MediaType::Audio, 0, 0).unwrap();
     let key_s = derive_sframe_key(&base_key_s, kid).unwrap();
     sender.set_key(MediaType::Audio, key_s);
 
@@ -326,7 +326,7 @@ fn test_epoch_transition_with_grace_period() {
 
     let mut ctx = SFrameContext::new(bits, 0);
     let base_key = derive_sframe_base_key(&call_base_key, MediaType::Audio, 0).unwrap();
-    let kid0 = bits.make_kid(MediaType::Audio, 0, 0);
+    let kid0 = bits.make_kid(MediaType::Audio, 0, 0).unwrap();
     let key0 = derive_sframe_key(&base_key, kid0).unwrap();
     ctx.set_key(MediaType::Audio, key0);
 
@@ -335,7 +335,7 @@ fn test_epoch_transition_with_grace_period() {
 
     // Epoch transition
     ctx.epoch_transition(1);
-    let kid1 = bits.make_kid(MediaType::Audio, 0, 1);
+    let kid1 = bits.make_kid(MediaType::Audio, 0, 1).unwrap();
     let key1 = derive_sframe_key(&base_key, kid1).unwrap();
     ctx.set_key(MediaType::Audio, key1);
 
@@ -356,7 +356,7 @@ fn test_epoch_resets_counters() {
 
     let mut ctx = SFrameContext::new(bits, 0);
     let base_key = derive_sframe_base_key(&call_base_key, MediaType::Audio, 0).unwrap();
-    let kid = bits.make_kid(MediaType::Audio, 0, 0);
+    let kid = bits.make_kid(MediaType::Audio, 0, 0).unwrap();
     let key = derive_sframe_key(&base_key, kid).unwrap();
     ctx.set_key(MediaType::Audio, key);
 
@@ -367,7 +367,7 @@ fn test_epoch_resets_counters() {
 
     // Epoch transition resets CTR to 0
     ctx.epoch_transition(1);
-    let kid1 = bits.make_kid(MediaType::Audio, 0, 1);
+    let kid1 = bits.make_kid(MediaType::Audio, 0, 1).unwrap();
     let key1 = derive_sframe_key(&base_key, kid1).unwrap();
     ctx.set_key(MediaType::Audio, key1.clone());
 
@@ -463,6 +463,7 @@ async fn test_call_answer_produces_signaling() {
     manager
         .answer_call(
             &call_id,
+            &group_id,
             CallAnswer::accept(),
             &callee_keys.public_key(),
             1,
@@ -619,7 +620,7 @@ fn test_empty_plaintext() {
     let bits = SFrameBits::default();
     let mut ctx = SFrameContext::new(bits, 0);
     let base_key = derive_sframe_base_key(&[0x11u8; 32], MediaType::Audio, 0).unwrap();
-    let kid = bits.make_kid(MediaType::Audio, 0, 0);
+    let kid = bits.make_kid(MediaType::Audio, 0, 0).unwrap();
     let key = derive_sframe_key(&base_key, kid).unwrap();
     ctx.set_key(MediaType::Audio, key.clone());
 
@@ -636,7 +637,7 @@ fn test_large_plaintext() {
     let bits = SFrameBits::default();
     let mut ctx = SFrameContext::new(bits, 0);
     let base_key = derive_sframe_base_key(&[0x22u8; 32], MediaType::Video, 0).unwrap();
-    let kid = bits.make_kid(MediaType::Video, 0, 0);
+    let kid = bits.make_kid(MediaType::Video, 0, 0).unwrap();
     let key = derive_sframe_key(&base_key, kid).unwrap();
     ctx.set_key(MediaType::Video, key.clone());
 

@@ -39,12 +39,33 @@ const NT: usize = 16;
 const DEFAULT_CTR_BUDGET: u64 = 1u64 << 32;
 
 /// SFrame key derived from MLS
-#[derive(Debug, Clone)]
+#[derive(Clone, zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
 pub struct SFrameKey {
     /// The encryption key (16 bytes)
-    pub key: [u8; NK],
+    pub(crate) key: [u8; NK],
     /// The salt for nonce derivation (12 bytes)
-    pub salt: [u8; NN],
+    pub(crate) salt: [u8; NN],
+}
+
+impl SFrameKey {
+    /// Borrow the encryption key
+    pub fn key(&self) -> &[u8; NK] {
+        &self.key
+    }
+
+    /// Borrow the salt
+    pub fn salt(&self) -> &[u8; NN] {
+        &self.salt
+    }
+}
+
+impl std::fmt::Debug for SFrameKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SFrameKey")
+            .field("key", &"[redacted]")
+            .field("salt", &"[redacted]")
+            .finish()
+    }
 }
 
 /// SFrame counter for a sender
@@ -113,10 +134,17 @@ pub struct SFrameContext {
     max_ctr_seen: std::collections::HashMap<(MediaType, u32, u8), u64>,
     /// Whether we have received a frame from each (media_type, sender, epoch)
     has_received: std::collections::HashMap<(MediaType, u32, u8), bool>,
-    /// Previous epoch keys (for 2-second grace period)
-    previous_keys: std::collections::HashMap<(MediaType, u8, u32), SFrameKey>,
-    /// Time when previous keys were stored
-    previous_keys_timestamp: Option<std::time::Instant>,
+    /// Previous epoch keys with replay state and timestamps (for 2-second grace period)
+    previous_epochs: std::collections::VecDeque<PreviousEpoch>,
+}
+
+/// State preserved for a previous epoch during grace period
+#[derive(Debug, Clone)]
+struct PreviousEpoch {
+    keys: std::collections::HashMap<(MediaType, u8, u32), SFrameKey>,
+    max_ctr_seen: std::collections::HashMap<(MediaType, u32, u8), u64>,
+    has_received: std::collections::HashMap<(MediaType, u32, u8), bool>,
+    timestamp: std::time::Instant,
 }
 
 impl SFrameContext {
@@ -130,8 +158,7 @@ impl SFrameContext {
             counters: std::collections::HashMap::new(),
             max_ctr_seen: std::collections::HashMap::new(),
             has_received: std::collections::HashMap::new(),
-            previous_keys: std::collections::HashMap::new(),
-            previous_keys_timestamp: None,
+            previous_epochs: std::collections::VecDeque::new(),
         }
     }
 
@@ -171,7 +198,7 @@ impl SFrameContext {
             .get(&key_tuple)
             .ok_or_else(|| MeshCallError::SFrameEncryption("Key not found".into()))?;
 
-        let kid = self.sframe_bits.make_kid(media_type, self.sender_leaf, self.epoch);
+        let kid = self.sframe_bits.make_kid(media_type, self.sender_leaf, self.epoch)?;
 
         // Encode header per RFC 9605 §4.3
         let header = encode_header(ctr, kid);
@@ -208,7 +235,7 @@ impl SFrameContext {
         let (header_len, ctr, kid) = parse_header(frame)?;
 
         // Parse KID into components
-        let (media_type, sender_leaf, epoch) = self.sframe_bits.parse_kid(kid);
+        let (media_type, sender_leaf, epoch) = self.sframe_bits.parse_kid(kid)?;
 
         // Replay protection: CTR must be strictly monotonically increasing per sender per epoch
         let recv_key = (media_type, sender_leaf, epoch);
@@ -222,32 +249,41 @@ impl SFrameContext {
             }
         }
 
-        // Find the right key - clone to avoid borrow conflict with &mut self
-        let sframe_key = if epoch == self.epoch {
-            self.keys
-                .get(&(media_type, epoch, sender_leaf))
-                .or_else(|| self.previous_keys.get(&(media_type, epoch, sender_leaf)))
-                .ok_or_else(|| MeshCallError::SFrameDecryption("Key not found".into()))?
-                .clone()
+        // Find the right key - check current keys first, then all previous epochs
+        let key_tuple = (media_type, epoch, sender_leaf);
+        let (sframe_key, from_previous) = if let Some(key) = self.keys.get(&key_tuple) {
+            (key.clone(), false)
         } else {
-            // Check if within grace period for previous epoch
-            let use_previous = self.previous_keys_timestamp
-                .map(|ts| ts.elapsed().as_secs() < 2)
-                .unwrap_or(false);
-
-            if use_previous {
-                self.previous_keys
-                    .get(&(media_type, epoch, sender_leaf))
-                    .ok_or(MeshCallError::EpochMismatch {
-                        expected: self.epoch,
-                        received: epoch,
-                    })?
-                    .clone()
-            } else {
+            // Search previous epochs (newest first) within grace period
+            let mut found = None;
+            for prev in self.previous_epochs.iter().rev() {
+                if prev.timestamp.elapsed().as_secs() >= 2 {
+                    break;
+                }
+                if let Some(key) = prev.keys.get(&key_tuple) {
+                    // Check replay protection from the previous epoch's state
+                    let prev_received = prev.has_received.get(&recv_key).copied().unwrap_or(false);
+                    if prev_received {
+                        let prev_max = prev.max_ctr_seen.get(&recv_key).copied().unwrap_or(0);
+                        if ctr <= prev_max {
+                            return Err(MeshCallError::SFrameDecryption(
+                                "Replay detected: CTR not monotonically increasing (previous epoch)".into(),
+                            ));
+                        }
+                    }
+                    found = Some(key.clone());
+                    break;
+                }
+            }
+            if let Some(key) = found {
+                (key, true)
+            } else if epoch != self.epoch {
                 return Err(MeshCallError::EpochMismatch {
                     expected: self.epoch,
                     received: epoch,
                 });
+            } else {
+                return Err(MeshCallError::SFrameDecryption("Key not found".into()));
             }
         };
 
@@ -272,21 +308,45 @@ impl SFrameContext {
             .map_err(|e| MeshCallError::SFrameDecryption(format!("Decryption failed: {}", e)))?;
 
         // Update replay protection state after successful decryption
-        self.has_received.insert(recv_key, true);
-        let max_entry = self.max_ctr_seen.entry(recv_key).or_insert(0);
-        if ctr > *max_entry {
-            *max_entry = ctr;
+        if from_previous {
+            // Update the previous epoch's replay state
+            for prev in self.previous_epochs.iter_mut().rev() {
+                if prev.keys.contains_key(&key_tuple) {
+                    prev.has_received.insert(recv_key, true);
+                    let max_entry = prev.max_ctr_seen.entry(recv_key).or_insert(0);
+                    if ctr > *max_entry {
+                        *max_entry = ctr;
+                    }
+                    break;
+                }
+            }
+        } else {
+            self.has_received.insert(recv_key, true);
+            let max_entry = self.max_ctr_seen.entry(recv_key).or_insert(0);
+            if ctr > *max_entry {
+                *max_entry = ctr;
+            }
         }
 
         Ok((media_type, plaintext))
     }
 
     /// Handle epoch transition
-    /// Moves current keys to previous keys, clears current keys, resets counters
+    /// Pushes current keys to the previous-epochs deque, clears current keys, resets counters.
+    /// Multiple rapid transitions preserve all previous epochs until pruned.
     pub fn epoch_transition(&mut self, new_epoch: u8) {
-        // Move current keys to previous
-        self.previous_keys = self.keys.clone();
-        self.previous_keys_timestamp = Some(std::time::Instant::now());
+        // Push current keys + replay state to previous epochs (cap at 4 to bound memory)
+        if !self.keys.is_empty() {
+            while self.previous_epochs.len() >= 4 {
+                self.previous_epochs.pop_front();
+            }
+            self.previous_epochs.push_back(PreviousEpoch {
+                keys: self.keys.clone(),
+                max_ctr_seen: self.max_ctr_seen.clone(),
+                has_received: self.has_received.clone(),
+                timestamp: std::time::Instant::now(),
+            });
+        }
 
         // Clear current keys, reset counters and replay state
         self.keys.clear();
@@ -299,12 +359,15 @@ impl SFrameContext {
         self.epoch = new_epoch;
     }
 
-    /// Clean up old keys after grace period
+    /// Clean up old keys after grace period (2 seconds per epoch).
+    /// Note: Uses `Instant::elapsed()` which may pause during system sleep on
+    /// some platforms, potentially extending the grace period across lid-close events.
     pub fn prune_old_keys(&mut self) {
-        if let Some(timestamp) = self.previous_keys_timestamp {
-            if timestamp.elapsed().as_secs() >= 2 {
-                self.previous_keys.clear();
-                self.previous_keys_timestamp = None;
+        while let Some(prev) = self.previous_epochs.front() {
+            if prev.timestamp.elapsed().as_secs() >= 2 {
+                self.previous_epochs.pop_front();
+            } else {
+                break;
             }
         }
     }
@@ -428,7 +491,7 @@ pub fn derive_sframe_base_key(
     call_base_key: &[u8; 32],
     media_type: MediaType,
     sender_leaf: u32,
-) -> Result<[u8; 16], MeshCallError> {
+) -> Result<zeroize::Zeroizing<[u8; 16]>, MeshCallError> {
     let hkdf = Hkdf::<Sha256>::from_prk(call_base_key)
         .map_err(|_| MeshCallError::KeyDerivation("Invalid PRK".into()))?;
 
@@ -437,8 +500,8 @@ pub fn derive_sframe_base_key(
     info.push(media_type.as_u8());
     info.extend_from_slice(&sender_leaf.to_be_bytes());
 
-    let mut okm = [0u8; 16];
-    hkdf.expand(&info, &mut okm)
+    let mut okm = zeroize::Zeroizing::new([0u8; 16]);
+    hkdf.expand(&info, okm.as_mut())
         .map_err(|e| MeshCallError::KeyDerivation(format!("HKDF expand failed: {}", e)))?;
 
     Ok(okm)
@@ -454,7 +517,7 @@ pub fn derive_sframe_key(
     kid: u64,
 ) -> Result<SFrameKey, MeshCallError> {
     // Extract with empty salt per RFC 9605 §4.4.2
-    let hkdf_extract = Hkdf::<Sha256>::new(Some(&[]), sframe_base_key);
+    let hkdf_extract = Hkdf::<Sha256>::new(Some(&[]), sframe_base_key.as_ref());
 
     let kid_bytes = kid.to_be_bytes();
     let cs_bytes = CIPHER_SUITE_AES_128_GCM_SHA256_128.to_be_bytes();
@@ -547,7 +610,7 @@ mod tests {
         let epoch = 0u8;
 
         let base_key = derive_sframe_base_key(&cbk, MediaType::Audio, leaf).unwrap();
-        let kid = bits.make_kid(MediaType::Audio, leaf, epoch);
+        let kid = bits.make_kid(MediaType::Audio, leaf, epoch).unwrap();
         assert_eq!(kid, 0x0030);
 
         let sframe_key = derive_sframe_key(&base_key, kid).unwrap();
@@ -612,7 +675,7 @@ mod tests {
         let mut receiver_ctx = SFrameContext::new(bits, 1); // different leaf for receiver
 
         let base_key = [0xABu8; 16];
-        let kid = bits.make_kid(MediaType::Audio, 0, 0);
+        let kid = bits.make_kid(MediaType::Audio, 0, 0).unwrap();
         let sframe_key = derive_sframe_key(&base_key, kid).unwrap();
 
         sender_ctx.set_key(MediaType::Audio, sframe_key.clone());
@@ -635,7 +698,7 @@ mod tests {
         let mut receiver_ctx = SFrameContext::new(bits, 1);
 
         let base_key = [0xABu8; 16];
-        let kid = bits.make_kid(MediaType::Audio, 0, 0);
+        let kid = bits.make_kid(MediaType::Audio, 0, 0).unwrap();
         let sframe_key = derive_sframe_key(&base_key, kid).unwrap();
 
         sender_ctx.set_key(MediaType::Audio, sframe_key.clone());
@@ -661,7 +724,7 @@ mod tests {
         let mut receiver_ctx = SFrameContext::new(bits, 1);
 
         let base_key = [0xABu8; 16];
-        let kid = bits.make_kid(MediaType::Audio, 0, 0);
+        let kid = bits.make_kid(MediaType::Audio, 0, 0).unwrap();
         let sframe_key = derive_sframe_key(&base_key, kid).unwrap();
 
         sender_ctx.set_key(MediaType::Audio, sframe_key.clone());
@@ -679,7 +742,7 @@ mod tests {
         let mut receiver_ctx = SFrameContext::new(bits, 1);
 
         let base_key = [0xABu8; 16];
-        let kid = bits.make_kid(MediaType::Audio, 0, 0);
+        let kid = bits.make_kid(MediaType::Audio, 0, 0).unwrap();
         let sframe_key = derive_sframe_key(&base_key, kid).unwrap();
 
         sender_ctx.set_key(MediaType::Audio, sframe_key.clone());
@@ -710,7 +773,7 @@ mod tests {
         let mut ctx = SFrameContext::new(bits, 0);
 
         let base_key = [0xABu8; 16];
-        let kid = bits.make_kid(MediaType::Audio, 0, 0);
+        let kid = bits.make_kid(MediaType::Audio, 0, 0).unwrap();
         let sframe_key = derive_sframe_key(&base_key, kid).unwrap();
         ctx.set_key(MediaType::Audio, sframe_key);
 
@@ -721,7 +784,7 @@ mod tests {
         ctx.epoch_transition(1);
 
         // Set up new key for new epoch
-        let new_kid = bits.make_kid(MediaType::Audio, 0, 1);
+        let new_kid = bits.make_kid(MediaType::Audio, 0, 1).unwrap();
         let new_sframe_key = derive_sframe_key(&base_key, new_kid).unwrap();
         ctx.set_key(MediaType::Audio, new_sframe_key);
 

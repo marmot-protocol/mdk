@@ -52,12 +52,14 @@ impl AudioConfig {
 
     /// Total samples per frame including all channels
     pub fn total_samples_per_frame(&self) -> usize {
-        self.samples_per_frame() * self.channels as usize
+        self.samples_per_frame().saturating_mul(self.channels as usize)
     }
 
-    /// RTP timestamp increment per frame
+    /// RTP timestamp increment per frame.
+    /// Uses saturating_mul to prevent overflow with extreme values.
+    /// Note: RTP timestamps intentionally wrap at u32::MAX per RFC 3550.
     pub fn rtp_timestamp_increment(&self) -> u32 {
-        self.sample_rate * self.frame_duration_ms / 1000
+        self.sample_rate.saturating_mul(self.frame_duration_ms) / 1000
     }
 }
 
@@ -289,7 +291,7 @@ mod tests {
 
         let mut sender_ctx = SFrameContext::new(bits, 0);
         let base_key = derive_sframe_base_key(&call_base_key, MediaType::Audio, 0).unwrap();
-        let kid = bits.make_kid(MediaType::Audio, 0, 0);
+        let kid = bits.make_kid(MediaType::Audio, 0, 0).unwrap();
         let key = derive_sframe_key(&base_key, kid).unwrap();
         sender_ctx.set_key(MediaType::Audio, key.clone());
 

@@ -18,8 +18,16 @@ pub const CALL_BASE_KEY_LENGTH: usize = 32;
 pub const SFU_AUTH_TOKEN_LENGTH: usize = 32;
 
 /// SFU authentication token
-#[derive(Debug, Clone)]
+#[derive(Clone, zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
 pub struct SfuAuthToken([u8; SFU_AUTH_TOKEN_LENGTH]);
+
+impl std::fmt::Debug for SfuAuthToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SfuAuthToken")
+            .field("0", &"[redacted]")
+            .finish()
+    }
+}
 
 impl SfuAuthToken {
     /// Create from bytes
@@ -44,7 +52,7 @@ impl SfuAuthToken {
 /// without directly accessing MLS internals.
 pub trait CallKeyDerivation: Send + Sync {
     /// Derive call base key for a group
-    fn derive_call_base_key(&self, call_id: &CallId) -> Result<[u8; 32], MeshCallError>;
+    fn derive_call_base_key(&self, call_id: &CallId) -> Result<zeroize::Zeroizing<[u8; 32]>, MeshCallError>;
     
     /// Derive SFU auth token for a group
     fn derive_sfu_auth_token(

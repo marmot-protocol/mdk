@@ -8,7 +8,7 @@ use nostr::{Kind, PublicKey, Timestamp};
 use serde::{Deserialize, Serialize};
 
 use super::types::{
-    CallAction, CallAnswerStatus, CallId, CallType, MeshCallError, SessionDescriptionType,
+    CallAction, CallAnswerStatus, CallId, CallType, MeshCallError, SFrameBits, SessionDescriptionType,
 };
 
 /// Kind 450: Call Initiation
@@ -53,7 +53,7 @@ impl CallInitiationEvent {
         caller_pubkey: &PublicKey,
         call_id: &CallId,
         call_type: CallType,
-        sframe_bits: u8,
+        sframe_bits: &SFrameBits,
         turn_uri: Option<&str>,
         turn_username: Option<&str>,
         turn_credential: Option<&str>,
@@ -64,11 +64,13 @@ impl CallInitiationEvent {
                 CallType::Audio => "audio".to_string(),
                 CallType::Video => "video".to_string(),
             }],
-            vec!["sframe_bits".to_string(), sframe_bits.to_string()],
+            vec!["sframe_bits".to_string(), sframe_bits.to_wire()],
             vec!["codec".to_string(), "audio/opus".to_string()],
             vec!["codec".to_string(), "video/vp8".to_string()],
         ];
 
+        // SECURITY: TURN credentials are sensitive. These tags travel inside encrypted
+        // MLS application messages (kind:445), but must never be logged in plaintext.
         if let (Some(uri), Some(username), Some(cred)) = (turn_uri, turn_username, turn_credential) {
             tags.push(vec!["turn".to_string(), uri.to_string(), username.to_string(), cred.to_string()]);
         }
@@ -106,15 +108,15 @@ impl CallInitiationEvent {
         Err(MeshCallError::Signaling("Missing call_type tag".into()))
     }
 
-    /// Get sframe bits from tags
-    pub fn get_sframe_bits(&self) -> Result<u8, MeshCallError> {
+    /// Get sframe bits from tags.
+    /// Supports both new format "epoch:sender" and legacy format (single u8 sum).
+    pub fn get_sframe_bits(&self) -> Result<SFrameBits, MeshCallError> {
         for tag in &self.tags {
             if tag.len() >= 2 && tag[0] == "sframe_bits" {
-                return tag[1].parse()
-                    .map_err(|_| MeshCallError::Signaling("Invalid sframe_bits".into()));
+                return SFrameBits::from_wire_str(&tag[1]);
             }
         }
-        Ok(6) // Default
+        Ok(SFrameBits::default())
     }
 }
 
@@ -466,11 +468,12 @@ mod tests {
         let keys = Keys::generate();
         let call_id = CallId::new();
 
+        let bits = SFrameBits::default();
         let event = CallInitiationEvent::new(
             &keys.public_key(),
             &call_id,
             CallType::Video,
-            6,
+            &bits,
             None,
             None,
             None,
@@ -480,7 +483,7 @@ mod tests {
         assert_eq!(event.pubkey, keys.public_key().to_hex());
         assert_eq!(event.get_call_id().unwrap(), call_id);
         assert!(matches!(event.get_call_type().unwrap(), CallType::Video));
-        assert_eq!(event.get_sframe_bits().unwrap(), 6);
+        assert_eq!(event.get_sframe_bits().unwrap(), bits);
     }
 
     #[test]

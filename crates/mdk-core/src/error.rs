@@ -373,7 +373,18 @@ impl From<crate::mesh_calls::MeshCallError> for Error {
             MeshCallError::SFrameDecryption(msg) => Self::SFrameDecryption(msg),
             MeshCallError::WebRTC(msg) => Self::WebRTC(msg),
             MeshCallError::KeyDerivation(msg) => Self::CallKeyDerivation(msg),
-            _ => Self::MeshCall(e.to_string()),
+            MeshCallError::GroupNotFound => Self::MeshCall("group not found".into()),
+            MeshCallError::NotGroupMember => Self::MeshCall("not a member of the group".into()),
+            MeshCallError::InvalidSFrameConfig => Self::MeshCall("invalid SFrame configuration".into()),
+            MeshCallError::TooManyParticipants(n) => Self::MeshCall(format!("too many participants for mesh topology: {}", n)),
+            MeshCallError::Signaling(msg) => Self::MeshCall(format!("signaling error: {}", msg)),
+            MeshCallError::InvalidMediaType => Self::MeshCall("invalid media type".into()),
+            MeshCallError::InvalidKid => Self::MeshCall("invalid KID".into()),
+            MeshCallError::EpochMismatch { expected, received } => Self::MeshCall(format!("epoch mismatch: expected {}, got {}", expected, received)),
+            MeshCallError::UnsupportedCodec(msg) => Self::MeshCall(format!("unsupported codec: {}", msg)),
+            MeshCallError::SdpParseError(msg) => Self::MeshCall(format!("SDP parsing error: {}", msg)),
+            MeshCallError::IceError(msg) => Self::MeshCall(format!("ICE error: {}", msg)),
+            MeshCallError::NotImplemented(msg) => Self::MeshCall(format!("not implemented: {}", msg)),
         }
     }
 }

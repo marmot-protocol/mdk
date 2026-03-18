@@ -108,47 +108,98 @@ impl MediaType {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SFrameBits {
     /// Number of bits for epoch (default: 4)
-    pub epoch_bits: u8,
+    pub(crate) epoch_bits: u8,
     /// Number of bits for sender leaf index (default: 6)
-    pub sender_bits: u8,
+    pub(crate) sender_bits: u8,
 }
 
 impl SFrameBits {
-    /// Create with default values (E=4, S=6)
-    pub fn default() -> Self {
+    /// Get epoch bits
+    pub fn epoch_bits(&self) -> u8 { self.epoch_bits }
+    /// Get sender bits
+    pub fn sender_bits(&self) -> u8 { self.sender_bits }
+}
+
+impl Default for SFrameBits {
+    fn default() -> Self {
         Self {
             epoch_bits: 4,
             sender_bits: 6,
         }
     }
+}
 
-    /// Create with custom values
-    pub fn new(epoch_bits: u8, sender_bits: u8) -> Self {
-        Self {
+impl SFrameBits {
+
+    /// Create with custom values.
+    /// Returns error if bits are out of range (both must be > 0, sum <= 62).
+    pub fn new(epoch_bits: u8, sender_bits: u8) -> Result<Self, MeshCallError> {
+        if epoch_bits == 0 || sender_bits == 0 {
+            return Err(MeshCallError::InvalidSFrameConfig);
+        }
+        if (epoch_bits as u16) + (sender_bits as u16) > 62 {
+            return Err(MeshCallError::InvalidSFrameConfig);
+        }
+        Ok(Self {
             epoch_bits,
             sender_bits,
+        })
+    }
+
+    /// Calculate KID from components.
+    /// Returns error if sender_leaf or epoch exceed their bit widths.
+    pub fn make_kid(&self, media_type: MediaType, sender_leaf: u32, epoch: u8) -> Result<u64, MeshCallError> {
+        let e = self.epoch_bits as u64;
+        let s = self.sender_bits as u64;
+        if sender_leaf as u64 >= (1u64 << s) {
+            return Err(MeshCallError::InvalidKid);
+        }
+        if epoch as u64 >= (1u64 << e) {
+            return Err(MeshCallError::InvalidKid);
+        }
+        let media = (media_type.as_u8() as u64) << (s + e);
+        let sender = (sender_leaf as u64) << e;
+        let epoch = epoch as u64;
+        Ok(media | sender | epoch)
+    }
+
+    /// Serialize to wire format "epoch:sender"
+    pub fn to_wire(&self) -> String {
+        format!("{}:{}", self.epoch_bits, self.sender_bits)
+    }
+
+    /// Parse from wire format. Supports "epoch:sender" and legacy single-value format.
+    pub fn from_wire_str(s: &str) -> Result<Self, MeshCallError> {
+        if let Some((epoch_str, sender_str)) = s.split_once(':') {
+            let epoch_bits: u8 = epoch_str.parse()
+                .map_err(|_| MeshCallError::Signaling("Invalid sframe_bits epoch".into()))?;
+            let sender_bits: u8 = sender_str.parse()
+                .map_err(|_| MeshCallError::Signaling("Invalid sframe_bits sender".into()))?;
+            Self::new(epoch_bits, sender_bits)
+        } else {
+            // Legacy: single value = epoch_bits(4) + sender_bits
+            let total: u8 = s.parse()
+                .map_err(|_| MeshCallError::Signaling("Invalid sframe_bits".into()))?;
+            let sender = total.saturating_sub(4);
+            if sender == 0 {
+                // Legacy value too small for valid config — use default
+                Ok(Self::default())
+            } else {
+                Self::new(4, sender)
+            }
         }
     }
 
-    /// Calculate KID from components
-    pub fn make_kid(&self, media_type: MediaType, sender_leaf: u32, epoch: u8) -> u64 {
-        let e = self.epoch_bits;
-        let s = self.sender_bits;
-        let media = (media_type.as_u8() as u64) << (s + e);
-        let sender = (sender_leaf as u64) << e;
-        let epoch = (epoch as u64) & ((1 << e) - 1);
-        media | sender | epoch
-    }
-
     /// Parse KID into components
-    pub fn parse_kid(&self, kid: u64) -> (MediaType, u32, u8) {
-        let e = self.epoch_bits;
-        let s = self.sender_bits;
-        let epoch = (kid & ((1 << e) - 1)) as u8;
-        let sender = ((kid >> e) & ((1 << s) - 1)) as u32;
+    pub fn parse_kid(&self, kid: u64) -> Result<(MediaType, u32, u8), MeshCallError> {
+        let e = self.epoch_bits as u64;
+        let s = self.sender_bits as u64;
+        let epoch = (kid & ((1u64 << e) - 1)) as u8;
+        let sender = ((kid >> e) & ((1u64 << s) - 1)) as u32;
         let media_byte = (kid >> (s + e)) as u8;
-        let media_type = MediaType::from_u8(media_byte).unwrap_or(MediaType::Audio);
-        (media_type, sender, epoch)
+        let media_type = MediaType::from_u8(media_byte)
+            .ok_or(MeshCallError::InvalidMediaType)?;
+        Ok((media_type, sender, epoch))
     }
 }
 
@@ -471,20 +522,24 @@ mod tests {
         let bits = SFrameBits::default(); // E=4, S=6
         
         // Test KID encoding (from MIP-06 test vectors)
-        let kid = bits.make_kid(MediaType::Audio, 3, 0);
+        let kid = bits.make_kid(MediaType::Audio, 3, 0).unwrap();
         assert_eq!(kid, 48); // 0x0030
 
-        let kid = bits.make_kid(MediaType::Audio, 3, 14);
+        let kid = bits.make_kid(MediaType::Audio, 3, 14).unwrap();
         assert_eq!(kid, 62); // 0x003e
 
-        let kid = bits.make_kid(MediaType::Video, 3, 14);
+        let kid = bits.make_kid(MediaType::Video, 3, 14).unwrap();
         assert_eq!(kid, 1086); // 0x043e
 
-        let kid = bits.make_kid(MediaType::ScreenShare, 3, 14);
+        let kid = bits.make_kid(MediaType::ScreenShare, 3, 14).unwrap();
         assert_eq!(kid, 2110); // 0x083e
 
-        let kid = bits.make_kid(MediaType::Audio, 63, 15);
+        let kid = bits.make_kid(MediaType::Audio, 63, 15).unwrap();
         assert_eq!(kid, 1023); // 0x03ff
+
+        // Overflow must fail
+        assert!(bits.make_kid(MediaType::Audio, 64, 0).is_err());
+        assert!(bits.make_kid(MediaType::Audio, 0, 16).is_err());
     }
 
     #[test]
@@ -492,19 +547,19 @@ mod tests {
         let bits = SFrameBits::default();
 
         // Parse KID=48 (0x0030)
-        let (media, sender, epoch) = bits.parse_kid(48);
+        let (media, sender, epoch) = bits.parse_kid(48).unwrap();
         assert_eq!(media, MediaType::Audio);
         assert_eq!(sender, 3);
         assert_eq!(epoch, 0);
 
         // Parse KID=1086 (0x043e)
-        let (media, sender, epoch) = bits.parse_kid(1086);
+        let (media, sender, epoch) = bits.parse_kid(1086).unwrap();
         assert_eq!(media, MediaType::Video);
         assert_eq!(sender, 3);
         assert_eq!(epoch, 14);
 
         // Parse KID=2110 (0x083e)
-        let (media, sender, epoch) = bits.parse_kid(2110);
+        let (media, sender, epoch) = bits.parse_kid(2110).unwrap();
         assert_eq!(media, MediaType::ScreenShare);
         assert_eq!(sender, 3);
         assert_eq!(epoch, 14);

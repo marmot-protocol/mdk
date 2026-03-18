@@ -13,11 +13,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use mdk_core::mesh_calls::{
-    derive_sframe_base_key, derive_sframe_key, CallInitiation, CallType, MediaType,
-    MeshCallManager, SFrameBits, SFrameContext,
+    derive_sframe_base_key, derive_sframe_key, CallInitiation,
+    MediaType, MeshCallManager, OutboundSignaling, SFrameBits, SFrameContext,
 };
+use mdk_core::mesh_calls::webrtc::{WebRTCConfig, WebRTCPeer};
+use mdk_core::mesh_calls::{CallAnswer, CallAnswerStatus};
 use mdk_core::GroupId;
 use nostr::Keys;
+use tokio::sync::mpsc;
 use tokio::time::timeout;
 
 /// Opus frame at 48kHz, 20ms, mono ≈ 160 bytes encoded
@@ -36,7 +39,7 @@ fn test_crypto_pipeline_throughput() {
 
     let mut sender = SFrameContext::new(bits, 0);
     let base_key_s = derive_sframe_base_key(&call_base_key, MediaType::Audio, 0).unwrap();
-    let kid_s = bits.make_kid(MediaType::Audio, 0, 0);
+    let kid_s = bits.make_kid(MediaType::Audio, 0, 0).unwrap();
     let key_s = derive_sframe_key(&base_key_s, kid_s).unwrap();
     sender.set_key(MediaType::Audio, key_s.clone());
 
@@ -130,7 +133,7 @@ fn test_crypto_pipeline_sustained_load() {
 
     let mut sender = SFrameContext::new(bits, 0);
     let base_key = derive_sframe_base_key(&call_base_key, MediaType::Audio, 0).unwrap();
-    let kid = bits.make_kid(MediaType::Audio, 0, 0);
+    let kid = bits.make_kid(MediaType::Audio, 0, 0).unwrap();
     let key = derive_sframe_key(&base_key, kid).unwrap();
     sender.set_key(MediaType::Audio, key.clone());
 
@@ -160,13 +163,13 @@ fn test_bidirectional_crypto() {
 
     let mut alice_sender = SFrameContext::new(bits, 0);
     let alice_base = derive_sframe_base_key(&call_base_key, MediaType::Audio, 0).unwrap();
-    let alice_kid = bits.make_kid(MediaType::Audio, 0, 0);
+    let alice_kid = bits.make_kid(MediaType::Audio, 0, 0).unwrap();
     let alice_key = derive_sframe_key(&alice_base, alice_kid).unwrap();
     alice_sender.set_key(MediaType::Audio, alice_key.clone());
 
     let mut bob_sender = SFrameContext::new(bits, 1);
     let bob_base = derive_sframe_base_key(&call_base_key, MediaType::Audio, 1).unwrap();
-    let bob_kid = bits.make_kid(MediaType::Audio, 1, 0);
+    let bob_kid = bits.make_kid(MediaType::Audio, 1, 0).unwrap();
     let bob_key = derive_sframe_key(&bob_base, bob_kid).unwrap();
     bob_sender.set_key(MediaType::Audio, bob_key.clone());
 
@@ -203,9 +206,6 @@ fn test_bidirectional_crypto() {
 
 #[tokio::test]
 async fn test_webrtc_loopback_with_sframe() {
-    use mdk_core::mesh_calls::webrtc::{WebRTCConfig, WebRTCPeer};
-    use tokio::sync::mpsc;
-
     let config = WebRTCConfig {
         ice_servers: vec![], // no STUN — local candidates only
         bundle: true,
@@ -267,7 +267,7 @@ async fn test_webrtc_loopback_with_sframe() {
 
     let mut sender_ctx = SFrameContext::new(bits, 0);
     let base_key = derive_sframe_base_key(&call_base_key, MediaType::Audio, 0).unwrap();
-    let kid = bits.make_kid(MediaType::Audio, 0, 0);
+    let kid = bits.make_kid(MediaType::Audio, 0, 0).unwrap();
     let key = derive_sframe_key(&base_key, kid).unwrap();
     sender_ctx.set_key(MediaType::Audio, key.clone());
 
@@ -408,8 +408,6 @@ async fn test_manager_encrypt_decrypt_throughput() {
 
 #[tokio::test]
 async fn test_full_1to1_call_lifecycle() {
-    use mdk_core::mesh_calls::{CallAnswer, CallAnswerStatus, OutboundSignaling};
-
     let alice_keys = Keys::generate();
     let bob_keys = Keys::generate();
     let group_id = GroupId::from_slice(&[10, 20, 30, 40]);

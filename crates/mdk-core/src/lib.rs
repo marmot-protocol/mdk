@@ -280,6 +280,8 @@ where
             config: self.config,
             epoch_snapshots,
             callback: self.callback,
+            #[cfg(feature = "mip06")]
+            mesh_call_mgr: std::sync::OnceLock::new(),
         }
     }
 }
@@ -310,6 +312,9 @@ where
     epoch_snapshots: Arc<EpochSnapshotManager>,
     /// Optional callback for events
     callback: Option<Arc<dyn MdkCallback>>,
+    /// Shared mesh call manager (lazily initialized)
+    #[cfg(feature = "mip06")]
+    mesh_call_mgr: std::sync::OnceLock<Arc<mesh_calls::MeshCallManager>>,
 }
 
 /// Provider implementation for OpenMLS that integrates with Nostr.
@@ -444,8 +449,10 @@ where
     /// let call_manager = mdk.mesh_call_manager();
     /// ```
     #[cfg(feature = "mip06")]
-    pub fn mesh_call_manager(&self) -> mesh_calls::MeshCallManager {
-        mesh_calls::MeshCallManager::new()
+    pub fn mesh_call_manager(&self) -> Arc<mesh_calls::MeshCallManager> {
+        self.mesh_call_mgr
+            .get_or_init(|| Arc::new(mesh_calls::MeshCallManager::new()))
+            .clone()
     }
 
     /// Derive a call base key from an MLS group's exporter secret.
@@ -457,11 +464,11 @@ where
         &self,
         group_id: &GroupId,
         call_id: &mesh_calls::CallId,
-    ) -> Result<[u8; 32], Error> {
+    ) -> Result<zeroize::Zeroizing<[u8; 32]>, Error> {
         let group = self.load_mls_group(group_id)?.ok_or(Error::GroupNotFound)?;
 
         let call_id_bytes = call_id.as_bytes();
-        let export_secret: Vec<u8> = group.export_secret(
+        let mut export_secret: Vec<u8> = group.export_secret(
             self.provider.crypto(),
             mesh_calls::keys::CALL_BASE_KEY_LABEL,
             call_id_bytes,
@@ -470,7 +477,8 @@ where
 
         let mut key = [0u8; 32];
         key.copy_from_slice(&export_secret);
-        Ok(key)
+        zeroize::Zeroize::zeroize(&mut export_secret);
+        Ok(zeroize::Zeroizing::new(key))
     }
 
     /// Get the local leaf index in an MLS group (needed for SFrame KID).

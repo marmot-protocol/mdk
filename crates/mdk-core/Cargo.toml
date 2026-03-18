@@ -38,6 +38,7 @@ base64.workspace = true
 chacha20poly1305.workspace = true
 hkdf.workspace = true
 sha2.workspace = true
+zeroize = { workspace = true, features = ["zeroize_derive"] }
 
 # Image processing dependencies - mandatory (used by both MIP-01 and MIP-04)
 image = { workspace = true, features = ["jpeg", "png", "webp", "gif"] }

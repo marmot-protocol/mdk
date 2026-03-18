@@ -34,7 +34,7 @@ tls_codec = "0.4"
 
 # Cryptography
 aes = "0.8"
-aes-gcm = "0.10"
+aes-gcm = ">=0.10.3, <0.11"
 base64 = "0.22"
 chacha20poly1305 = "0.10"
 hkdf = "0.12"
