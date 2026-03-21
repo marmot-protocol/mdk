@@ -26,6 +26,9 @@ pub mod error;
 pub mod extension;
 pub mod groups;
 pub mod key_packages;
+#[cfg(feature = "mip06")]
+#[cfg_attr(docsrs, doc(cfg(feature = "mip06")))]
+pub mod mesh_calls;
 pub mod media_processing;
 pub mod messages;
 pub mod prelude;
@@ -277,6 +280,8 @@ where
             config: self.config,
             epoch_snapshots,
             callback: self.callback,
+            #[cfg(feature = "mip06")]
+            mesh_call_mgr: std::sync::OnceLock::new(),
         }
     }
 }
@@ -307,6 +312,9 @@ where
     epoch_snapshots: Arc<EpochSnapshotManager>,
     /// Optional callback for events
     callback: Option<Arc<dyn MdkCallback>>,
+    /// Shared mesh call manager (lazily initialized)
+    #[cfg(feature = "mip06")]
+    mesh_call_mgr: std::sync::OnceLock<Arc<mesh_calls::MeshCallManager>>,
 }
 
 /// Provider implementation for OpenMLS that integrates with Nostr.
@@ -425,6 +433,59 @@ where
     /// Get the storage provider
     pub(crate) fn storage(&self) -> &Storage {
         &self.provider.storage
+    }
+
+    /// Create a mesh call manager for managing voice and video calls
+    ///
+    /// This method is only available when the `mip06` feature is enabled.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use mdk_core::MDK;
+    /// # use mdk_core::mesh_calls::MeshCallManager;
+    /// # use mdk_memory_storage::MdkMemoryStorage;
+    /// let mdk = MDK::new(MdkMemoryStorage::default());
+    /// let call_manager = mdk.mesh_call_manager();
+    /// ```
+    #[cfg(feature = "mip06")]
+    pub fn mesh_call_manager(&self) -> Arc<mesh_calls::MeshCallManager> {
+        self.mesh_call_mgr
+            .get_or_init(|| Arc::new(mesh_calls::MeshCallManager::new()))
+            .clone()
+    }
+
+    /// Derive a call base key from an MLS group's exporter secret.
+    ///
+    /// Uses `MLS-Exporter("marmot-call-v1", call_id, 32)` per MIP-06.
+    /// The result is a 32-byte key used to derive per-sender SFrame keys.
+    #[cfg(feature = "mip06")]
+    pub fn derive_call_base_key(
+        &self,
+        group_id: &GroupId,
+        call_id: &mesh_calls::CallId,
+    ) -> Result<zeroize::Zeroizing<[u8; 32]>, Error> {
+        let group = self.load_mls_group(group_id)?.ok_or(Error::GroupNotFound)?;
+
+        let call_id_bytes = call_id.as_bytes();
+        let mut export_secret: Vec<u8> = group.export_secret(
+            self.provider.crypto(),
+            mesh_calls::keys::CALL_BASE_KEY_LABEL,
+            call_id_bytes,
+            mesh_calls::keys::CALL_BASE_KEY_LENGTH,
+        )?;
+
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&export_secret);
+        zeroize::Zeroize::zeroize(&mut export_secret);
+        Ok(zeroize::Zeroizing::new(key))
+    }
+
+    /// Get the local leaf index in an MLS group (needed for SFrame KID).
+    #[cfg(feature = "mip06")]
+    pub fn own_leaf_index(&self, group_id: &GroupId) -> Result<u32, Error> {
+        let group = self.load_mls_group(group_id)?.ok_or(Error::GroupNotFound)?;
+        Ok(group.own_leaf_index().u32())
     }
 }
 

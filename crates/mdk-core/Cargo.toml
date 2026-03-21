@@ -15,6 +15,7 @@ categories = ["cryptography", "network-programming"]
 [features]
 default = []
 mip04 = []
+mip06 = ["dep:webrtc", "dep:tokio", "dep:getrandom"]
 debug-examples = []
 
 [dependencies]
@@ -31,23 +32,32 @@ tracing = { workspace = true, features = ["std"] }
 thiserror.workspace = true
 
 # Crypto dependencies for MIP-01 (group image encryption) and MIP-03 message encryption - mandatory
+aes.workspace = true
+aes-gcm.workspace = true
 base64.workspace = true
 chacha20poly1305.workspace = true
 hkdf.workspace = true
 sha2.workspace = true
+zeroize = { workspace = true, features = ["zeroize_derive"] }
 
 # Image processing dependencies - mandatory (used by both MIP-01 and MIP-04)
 image = { workspace = true, features = ["jpeg", "png", "webp", "gif"] }
 blurhash.workspace = true
 kamadak-exif.workspace = true  # EXIF stripping for privacy (used by both MIP-01 and MIP-04)
 
+# WebRTC for MIP-06 (mesh calls)
+webrtc = { version = "0.14", optional = true }
+tokio = { workspace = true, optional = true }
+getrandom = { workspace = true, optional = true }
+
+
 [dev-dependencies]
 mdk-storage-traits = { workspace = true, features = ["test-utils"] }
 mdk-memory-storage.workspace = true
-mdk-sqlite-storage.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
+futures = "0.3"
 
 [[example]]
 name = "mls_memory"

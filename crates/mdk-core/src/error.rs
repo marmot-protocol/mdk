@@ -227,6 +227,30 @@ pub enum Error {
     /// Failed to create epoch snapshot for commit race resolution
     #[error("failed to create epoch snapshot: {0}")]
     SnapshotCreationFailed(String),
+    /// Invalid call ID
+    #[error("invalid call ID")]
+    InvalidCallId,
+    /// Call not found
+    #[error("call not found")]
+    CallNotFound,
+    /// Call already exists
+    #[error("call already exists")]
+    CallAlreadyExists,
+    /// Mesh call error
+    #[error("mesh call error: {0}")]
+    MeshCall(String),
+    /// SFrame encryption error
+    #[error("SFrame encryption error: {0}")]
+    SFrameEncryption(String),
+    /// SFrame decryption error
+    #[error("SFrame decryption error: {0}")]
+    SFrameDecryption(String),
+    /// WebRTC error
+    #[error("WebRTC error: {0}")]
+    WebRTC(String),
+    /// Call key derivation error
+    #[error("call key derivation error: {0}")]
+    CallKeyDerivation(String),
 }
 
 impl From<FromUtf8Error> for Error {
@@ -333,6 +357,34 @@ where
                 _ => Self::ProcessMessageOther(group_state_error.to_string()),
             },
             _ => Self::ProcessMessageOther(e.to_string()),
+        }
+    }
+}
+
+#[cfg(feature = "mip06")]
+impl From<crate::mesh_calls::MeshCallError> for Error {
+    fn from(e: crate::mesh_calls::MeshCallError) -> Self {
+        use crate::mesh_calls::MeshCallError;
+        match e {
+            MeshCallError::InvalidCallId => Self::InvalidCallId,
+            MeshCallError::CallNotFound => Self::CallNotFound,
+            MeshCallError::CallAlreadyExists => Self::CallAlreadyExists,
+            MeshCallError::SFrameEncryption(msg) => Self::SFrameEncryption(msg),
+            MeshCallError::SFrameDecryption(msg) => Self::SFrameDecryption(msg),
+            MeshCallError::WebRTC(msg) => Self::WebRTC(msg),
+            MeshCallError::KeyDerivation(msg) => Self::CallKeyDerivation(msg),
+            MeshCallError::GroupNotFound => Self::MeshCall("group not found".into()),
+            MeshCallError::NotGroupMember => Self::MeshCall("not a member of the group".into()),
+            MeshCallError::InvalidSFrameConfig => Self::MeshCall("invalid SFrame configuration".into()),
+            MeshCallError::TooManyParticipants(n) => Self::MeshCall(format!("too many participants for mesh topology: {}", n)),
+            MeshCallError::Signaling(msg) => Self::MeshCall(format!("signaling error: {}", msg)),
+            MeshCallError::InvalidMediaType => Self::MeshCall("invalid media type".into()),
+            MeshCallError::InvalidKid => Self::MeshCall("invalid KID".into()),
+            MeshCallError::EpochMismatch { expected, received } => Self::MeshCall(format!("epoch mismatch: expected {}, got {}", expected, received)),
+            MeshCallError::UnsupportedCodec(msg) => Self::MeshCall(format!("unsupported codec: {}", msg)),
+            MeshCallError::SdpParseError(msg) => Self::MeshCall(format!("SDP parsing error: {}", msg)),
+            MeshCallError::IceError(msg) => Self::MeshCall(format!("ICE error: {}", msg)),
+            MeshCallError::NotImplemented(msg) => Self::MeshCall(format!("not implemented: {}", msg)),
         }
     }
 }
