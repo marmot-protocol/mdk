@@ -73,7 +73,7 @@ tempfile = "3.20"
 [profile.release-size]
 inherits = "release"
 opt-level = "z"      # Optimize for binary size over speed
-lto = true           # Fat LTO: cross-crate dead-code elimination
+lto = "thin"         # Thin LTO: cross-crate optimization without embedding full IR in .a archives
 codegen-units = 1    # Required for fat LTO to be effective
 panic = "abort"      # No unwinding machinery; safe at UniFFI FFI boundary
 strip = true         # Strip all symbols from the output binary
