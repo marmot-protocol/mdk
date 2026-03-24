@@ -27,6 +27,8 @@
 
 ### Breaking changes
 
+- **`KeyPackageResult` now includes `d_tag`**: The `KeyPackageResult` struct returned by `create_key_package_for_event` and `create_key_package_for_event_with_options` now includes a `d_tag: String` field containing the 32-byte hex identifier for the KeyPackage slot. This enables callers to reuse the same `d` value when rotating KeyPackages so that relays automatically replace the old event. The tags vector also includes the `d` tag. All test event builders updated to use `kind:30443`. ([#233](https://github.com/marmot-protocol/mdk/pull/233))
+
 ### Changed
 
 ### Added

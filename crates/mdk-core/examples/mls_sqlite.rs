@@ -40,10 +40,10 @@ async fn main() -> Result<(), Error> {
 
     // Create key package for Bob
     // This would be published to the Nostr network for other users to find
-    let (bob_key_package_encoded, tags, _) =
+    let (bob_key_package_encoded, tags, _, _) =
         bob_mdk.create_key_package_for_event(&bob_keys.public_key(), [relay_url.clone()])?;
 
-    let bob_key_package_event = EventBuilder::new(Kind::MlsKeyPackage, bob_key_package_encoded)
+    let bob_key_package_event = EventBuilder::new(Kind::Custom(30443), bob_key_package_encoded)
         .tags(tags)
         .build(bob_keys.public_key())
         .sign(&bob_keys)
@@ -254,11 +254,11 @@ async fn main() -> Result<(), Error> {
     tracing::info!("Charlie identity generated");
 
     // Create key package for Charlie
-    let (charlie_key_package_encoded, charlie_tags, _) = charlie_mdk
+    let (charlie_key_package_encoded, charlie_tags, _, _) = charlie_mdk
         .create_key_package_for_event(&charlie_keys.public_key(), [relay_url.clone()])?;
 
     let charlie_key_package_event =
-        EventBuilder::new(Kind::MlsKeyPackage, charlie_key_package_encoded)
+        EventBuilder::new(Kind::Custom(30443), charlie_key_package_encoded)
             .tags(charlie_tags)
             .build(charlie_keys.public_key())
             .sign(&charlie_keys)
