@@ -133,7 +133,7 @@ _build-uniffi needs_android="false" needs_ios="false":
     #!/usr/bin/env bash
     set -euo pipefail
     echo "Building mdk-uniffi library..."
-    cargo build --profile release-size --lib -p mdk-uniffi
+    cargo build --release --lib -p mdk-uniffi
     if [ "{{needs_android}}" = "true" ]; then
         just _build-uniffi-android aarch64-linux-android aarch64-linux-android21-clang
         just _build-uniffi-android armv7-linux-androideabi armv7a-linux-androideabi21-clang
@@ -167,7 +167,7 @@ _build-uniffi-ios TARGET:
     # the system Clang defaults to the current SDK version (e.g. 18.5), which emits
     # symbols like ___chkstk_darwin that are unavailable at the linker's deployment target,
     # causing "undefined symbol" link errors.
-    IPHONEOS_DEPLOYMENT_TARGET=15.0 cargo build --profile release-size --lib -p mdk-uniffi --target {{TARGET}}
+    IPHONEOS_DEPLOYMENT_TARGET=15.0 cargo build --release --lib -p mdk-uniffi --target {{TARGET}}
 
 _build-uniffi-android TARGET CLANG_PREFIX:
     #!/usr/bin/env bash
@@ -304,7 +304,9 @@ _build-uniffi-android TARGET CLANG_PREFIX:
     # Tell openssl-sys to use static linking
     export OPENSSL_STATIC=1
 
-    cargo build --profile release-size --lib -p mdk-uniffi --target {{TARGET}}
+    # Fat LTO for Android: maximum binary size reduction; .a archive bloat
+    # doesn't matter since Android ships .so files only
+    CARGO_PROFILE_RELEASE_LTO=fat cargo build --release --lib -p mdk-uniffi --target {{TARGET}}
 
 uniffi-bindgen: (gen-binding "python") gen-binding-kotlin gen-binding-ruby
     @if [ "{{os()}}" = "macos" ]; then just gen-binding-swift; fi
@@ -322,9 +324,9 @@ gen-binding lang: (_build-uniffi "false" "false")
     @echo "Generating {{lang}} bindings..."
     cd crates/mdk-uniffi && cargo run --bin uniffi-bindgen generate \
         -l {{lang}} \
-        --library ../../target/release-size/{{lib_filename}} \
+        --library ../../target/release/{{lib_filename}} \
         --out-dir bindings/{{lang}}
-    cp target/release-size/{{lib_filename}} crates/mdk-uniffi/bindings/{{lang}}/{{lib_filename}}
+    cp target/release/{{lib_filename}} crates/mdk-uniffi/bindings/{{lang}}/{{lib_filename}}
     @echo "✓ Bindings generated in crates/mdk-uniffi/bindings/{{lang}}/"
 
 gen-binding-kotlin: (_build-uniffi "true") (gen-binding "kotlin")
@@ -337,12 +339,12 @@ gen-binding-kotlin: (_build-uniffi "true") (gen-binding "kotlin")
     mkdir -p "$PROJECT_DIR/src/main/jniLibs/armeabi-v7a"
     # mkdir -p "$PROJECT_DIR/src/main/jniLibs/x86-64"
 
-    test -f target/aarch64-linux-android/release-size/libmdk_uniffi.so || (echo "Error: aarch64 Android library not found. Did the build succeed?" && exit 1)
-    test -f target/armv7-linux-androideabi/release-size/libmdk_uniffi.so || (echo "Error: armv7 Android library not found. Did the build succeed?" && exit 1)
+    test -f target/aarch64-linux-android/release/libmdk_uniffi.so || (echo "Error: aarch64 Android library not found. Did the build succeed?" && exit 1)
+    test -f target/armv7-linux-androideabi/release/libmdk_uniffi.so || (echo "Error: armv7 Android library not found. Did the build succeed?" && exit 1)
 
-    cp target/aarch64-linux-android/release-size/libmdk_uniffi.so "$PROJECT_DIR/src/main/jniLibs/arm64-v8a/libmdk_uniffi.so"
-    cp target/armv7-linux-androideabi/release-size/libmdk_uniffi.so "$PROJECT_DIR/src/main/jniLibs/armeabi-v7a/libmdk_uniffi.so"
-    # cp target/x86_64-linux-android/release-size/libmdk_uniffi.so "$PROJECT_DIR/src/main/jniLibs/x86-64/libmdk_uniffi.so"
+    cp target/aarch64-linux-android/release/libmdk_uniffi.so "$PROJECT_DIR/src/main/jniLibs/arm64-v8a/libmdk_uniffi.so"
+    cp target/armv7-linux-androideabi/release/libmdk_uniffi.so "$PROJECT_DIR/src/main/jniLibs/armeabi-v7a/libmdk_uniffi.so"
+    # cp target/x86_64-linux-android/release/libmdk_uniffi.so "$PROJECT_DIR/src/main/jniLibs/x86-64/libmdk_uniffi.so"
     rm -f "$BINDINGS_DIR/libmdk_uniffi.so"
     echo "✓ Kotlin bindings generated and moved to Android project"
 
@@ -356,8 +358,8 @@ gen-binding-swift: (_build-uniffi "false" "true") (gen-binding "swift")
     mkdir -p ios-artifacts/headers
     cp crates/mdk-uniffi/bindings/swift/mdk_uniffiFFI.h ios-artifacts/headers/
     xcodebuild -create-xcframework \
-        -library target/aarch64-apple-ios/release-size/libmdk_uniffi.a -headers ios-artifacts/headers \
-        -library target/aarch64-apple-ios-sim/release-size/libmdk_uniffi.a -headers ios-artifacts/headers \
+        -library target/aarch64-apple-ios/release/libmdk_uniffi.a -headers ios-artifacts/headers \
+        -library target/aarch64-apple-ios-sim/release/libmdk_uniffi.a -headers ios-artifacts/headers \
         -output ios-artifacts/mdk_uniffi.xcframework
     @echo "✓ Swift bindings and xcframework ready"
 
