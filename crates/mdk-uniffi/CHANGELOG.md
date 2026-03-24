@@ -31,12 +31,9 @@
 
 ### Added
 
-- Moved binary size optimizations (`opt-level = "z"`, thin LTO, single codegen unit, `panic = "abort"`, symbol stripping) into `[profile.release]` directly. Android builds override to fat LTO via `CARGO_PROFILE_RELEASE_LTO=fat` for maximum `.so` reduction; iOS uses thin LTO to avoid `.a` archive bloat. ([`#221`](https://github.com/marmot-protocol/mdk/pull/221), [`#232`](https://github.com/marmot-protocol/mdk/pull/232))
+- Added `[profile.release-size]` custom profile with `opt-level = "z"`, fat LTO, single codegen unit, `panic = "abort"`, and symbol stripping. Android binding builds now use `--profile release-size` and additionally run `llvm-strip` post-build. Measured ~40% reduction in `.so` size. ([`#221`](https://github.com/marmot-protocol/mdk/pull/221))
 
 ### Fixed
-
-- Removed redundant `cargo build` steps from Swift, Python, and Ruby binding CI jobs that duplicated work already done by `_build-uniffi`. ([`#232`](https://github.com/marmot-protocol/mdk/pull/232))
-- Fixed stale `release-size` artifact paths in Kotlin and Swift binding generation recipes. ([`#232`](https://github.com/marmot-protocol/mdk/pull/232))
 
 ### Removed
 

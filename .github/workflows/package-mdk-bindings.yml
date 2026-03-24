@@ -49,6 +49,9 @@ jobs:
         just _build-uniffi-ios aarch64-apple-ios
         just _build-uniffi-ios aarch64-apple-ios-sim
 
+    - name: Build host library
+      run: cargo build --release --lib -p mdk-uniffi
+
     - name: Generate Swift bindings
       run: just gen-binding-swift
 
@@ -142,8 +145,14 @@ jobs:
       with:
         python-version: '3.11'
 
+    - name: Build host library (debug for bindgen)
+      run: cargo build --lib -p mdk-uniffi
+
     - name: Generate Python bindings
       run: just gen-binding "python"
+
+    - name: Build release library
+      run: cargo build --lib -p mdk-uniffi --release
 
     - name: Determine library filename
       id: lib_filename
@@ -347,8 +356,14 @@ jobs:
       with:
         ruby-version: '3.2'
 
+    - name: Build host library (debug for bindgen)
+      run: cargo build --lib -p mdk-uniffi
+
     - name: Generate Ruby bindings
       run: just gen-binding "ruby"
+
+    - name: Build release library
+      run: cargo build --lib -p mdk-uniffi --release
 
     - name: Determine library filename
       id: lib_filename
