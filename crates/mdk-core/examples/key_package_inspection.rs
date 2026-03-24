@@ -42,11 +42,8 @@ async fn main() -> Result<(), Error> {
     println!("=== Creating Key Package ===\n");
 
     // Create key package with protected=true to demonstrate NIP-70 tag
-    let (key_package_encoded, tags, _hash_ref) = mdk.create_key_package_for_event_with_options(
-        &keys.public_key(),
-        [relay_url.clone()],
-        true,
-    )?;
+    let (key_package_encoded, tags, _hash_ref, _d_value) = mdk
+        .create_key_package_for_event_with_options(&keys.public_key(), [relay_url.clone()], true)?;
 
     println!("Key Package Created Successfully!");
     println!("  Encoded length: {} bytes", key_package_encoded.len());
@@ -76,7 +73,7 @@ async fn main() -> Result<(), Error> {
     // ====================================
     println!("=== Creating Nostr Event ===\n");
 
-    let key_package_event = EventBuilder::new(Kind::MlsKeyPackage, key_package_encoded.clone())
+    let key_package_event = EventBuilder::new(Kind::Custom(30443), key_package_encoded.clone())
         .tags(tags)
         .build(keys.public_key())
         .sign(&keys)

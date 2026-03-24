@@ -1,8 +1,22 @@
 //! MDK constants
 
+use nostr::Kind;
 use openmls::extensions::ExtensionType;
 use openmls::prelude::ProposalType;
 use openmls_traits::types::Ciphersuite;
+
+/// Nostr event kind for MLS KeyPackage events (addressable, NIP-33).
+///
+/// Per MIP-00, KeyPackages use kind 30443 (addressable event) so relays automatically
+/// replace old versions when a new event with the same `(kind, pubkey, d)` tuple is published.
+/// This enables rotation without explicit deletion.
+pub const MLS_KEY_PACKAGE_KIND: Kind = Kind::Custom(30443);
+
+/// Legacy Nostr event kind for MLS KeyPackage events (regular, non-replaceable).
+///
+/// Earlier versions of the Marmot spec used kind 443. Clients SHOULD accept this kind
+/// during the migration period (until May 1, 2026) but MUST publish using kind 30443.
+pub const MLS_KEY_PACKAGE_KIND_LEGACY: Kind = Kind::Custom(443);
 
 /// Nostr Group Data extension type
 pub const NOSTR_GROUP_DATA_EXTENSION_TYPE: u16 = 0xF2EE; // Be FREE
