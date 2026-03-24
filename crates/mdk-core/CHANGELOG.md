@@ -33,6 +33,7 @@
 
 ### Fixed
 
+- Bumped `hpke-rs` from `0.6.0` to `0.6.1`, resolving two high-severity advisories in the transitive `libcrux` chain: [RUSTSEC-2026-0073](https://rustsec.org/advisories/RUSTSEC-2026-0073) (panic in `libcrux-poly1305` standalone MAC operations) and [RUSTSEC-2026-0074](https://rustsec.org/advisories/RUSTSEC-2026-0074) (incorrect SHAKE output in `libcrux-sha3`). `Cargo.lock` only — no `Cargo.toml` changes required. ([#234](https://github.com/marmot-protocol/mdk/pull/234))
 - Bumped `digest` lockfile entry from yanked `0.11.1` to `0.11.2`, resolving the `cargo audit` yanked-crate warning introduced transitively via `openmls_rust_crypto` → `hpke-rs-rust-crypto` → `x-wing` → `sha3`. ([#229](https://github.com/marmot-protocol/mdk/pull/229))
 - Tightened the minimum-length check in `decrypt_message_with_exporter_secret` from 12 bytes to 28 bytes. The correct minimum is 12 (nonce) + 16 (Poly1305 tag) + 0 (empty plaintext) = 28 bytes; the previous check only validated that enough bytes existed to extract the nonce, silently passing structurally invalid ciphertexts to the AEAD layer. ([#230](https://github.com/marmot-protocol/mdk/pull/230))
 - MIP-03 and MIP-04 legacy exporter-secret migration deadline moved from June 4, 2026 to May 15, 2026 00:00:00 UTC. ([#222](https://github.com/marmot-protocol/mdk/pull/222))
