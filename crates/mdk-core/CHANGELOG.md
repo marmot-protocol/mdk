@@ -31,9 +31,14 @@
 ### Changed
 
 - Admin updates now prune non-member public keys instead of rejecting the entire update. Only errors if no valid admins remain after pruning. ([#223](https://github.com/marmot-protocol/mdk/pull/223))
+- New groups now use `MIXED_CIPHERTEXT` wire format policy (outgoing: ciphertext, incoming: mixed) instead of the OpenMLS default `PURE_CIPHERTEXT`. Regular messages remain `PrivateMessage`; the mixed incoming policy is required to accept `PublicMessage` SelfRemove proposals from departing members.
+- `leave_group` now sends a SelfRemove proposal (MLS Extensions draft, type `0x000a`) instead of a Remove proposal. Falls back to Remove for legacy groups created with `PURE_CIPHERTEXT`. SelfRemove proposals are auto-committed by any member, removing the requirement for an admin to be online.
+- Non-admin members can now create SelfRemove-only Commits in addition to self-update Commits. These two commit types must not be combined.
 
 ### Added
 
+- SelfRemove proposal type (`0x000a`) added to client capabilities, group required capabilities, and KeyPackage `mls_proposals` tag per MIP-03.
+- Admin depletion validation: SelfRemove proposals and commits are rejected if they would leave the group with zero admins.
 - Added feature-gated MIP-05 notification request builders that group token tags by notification server, preserve relay hints, chunk requests at 100 tokens per server, and return ready-to-publish gift-wrapped notification batches for `kind:446` delivery. ([#238](https://github.com/marmot-protocol/mdk/pull/238))
 
 ### Fixed
