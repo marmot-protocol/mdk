@@ -454,6 +454,66 @@ mod tests {
         );
     }
 
+    /// Tests that SelfRemove from the sole admin is rejected to prevent admin depletion.
+    ///
+    /// Per MIP-03, SelfRemove proposals MUST be rejected if the resulting admin_pubkeys
+    /// set would be empty. This prevents groups from becoming leaderless.
+    #[test]
+    fn test_self_remove_sole_admin_rejected() {
+        let alice_keys = Keys::generate();
+        let bob_keys = Keys::generate();
+
+        let alice_mdk = create_test_mdk();
+        let bob_mdk = create_test_mdk();
+
+        // Alice is the only admin
+        let admins = vec![alice_keys.public_key()];
+
+        let bob_key_package = create_key_package_event(&bob_mdk, &bob_keys);
+
+        let create_result = alice_mdk
+            .create_group(
+                &alice_keys.public_key(),
+                vec![bob_key_package],
+                create_nostr_group_config_data(admins),
+            )
+            .expect("Alice should create group");
+
+        let group_id = create_result.group.mls_group_id.clone();
+
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("Alice should merge commit");
+
+        let bob_welcome = &create_result.welcome_rumors[0];
+        let bob_welcome_preview = bob_mdk
+            .process_welcome(&nostr::EventId::all_zeros(), bob_welcome)
+            .expect("Bob should process welcome");
+        bob_mdk
+            .accept_welcome(&bob_welcome_preview)
+            .expect("Bob should accept welcome");
+
+        // Alice (sole admin) tries to leave
+        let alice_leave_result = alice_mdk
+            .leave_group(&group_id)
+            .expect("Alice should create leave proposal");
+
+        // Bob processes Alice's SelfRemove — should be rejected (would leave zero admins)
+        let process_result = bob_mdk
+            .process_message(&alice_leave_result.evolution_event)
+            .expect("Bob should process without error");
+
+        assert!(
+            matches!(
+                &process_result,
+                MessageProcessingResult::IgnoredProposal { reason, .. }
+                if reason.contains("no admins")
+            ),
+            "Sole admin's SelfRemove should be rejected, got: {:?}",
+            process_result
+        );
+    }
+
     /// Test that self-update commits from non-admin members are ALLOWED (Issue #44, #59)
     ///
     /// Per the Marmot protocol specification, any member can create a self-update
