@@ -410,6 +410,7 @@ where
             self.config.maximum_forward_distance,
         );
         let mls_group_config = MlsGroupJoinConfig::builder()
+            .wire_format_policy(MIXED_CIPHERTEXT_WIRE_FORMAT_POLICY)
             .use_ratchet_tree_extension(true)
             .sender_ratchet_configuration(sender_ratchet_config)
             .max_past_epochs(self.config.max_past_epochs)

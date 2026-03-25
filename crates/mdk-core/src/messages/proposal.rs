@@ -146,6 +146,34 @@ where
                                     reason: "Extension proposals not allowed - admins should create commits directly".to_string(),
                                 })
                             }
+                            Proposal::SelfRemove => {
+                                // SelfRemove: any member can commit, so auto-commit
+                                // regardless of admin status.
+                                if let Err(e) =
+                                    self.validate_admin_depletion(mls_group, &[*sender_leaf_index])
+                                {
+                                    tracing::warn!(
+                                        target: "mdk_core::messages::process_proposal",
+                                        "Rejecting SelfRemove: {}", e
+                                    );
+                                    self.mark_processed(
+                                        event,
+                                        &group_id,
+                                        mls_group.epoch().as_u64(),
+                                    )?;
+                                    return Ok(MessageProcessingResult::IgnoredProposal {
+                                        mls_group_id: group_id,
+                                        reason: format!("SelfRemove rejected: {}", e),
+                                    });
+                                }
+
+                                self.auto_commit_proposal(
+                                    mls_group,
+                                    event,
+                                    staged_proposal,
+                                    &group_id,
+                                )
+                            }
                             _ => {
                                 // Other proposal types (PreSharedKey, ReInit, ExternalInit, etc.)
                                 tracing::warn!(
@@ -357,10 +385,12 @@ mod tests {
         assert!(pending.is_empty(), "No pending removals after merge");
     }
 
-    /// Tests that self-leave proposals are stored as pending when processed by a non-admin.
-    /// Non-admin members cannot commit, so they store the proposal for later admin approval.
+    /// Tests that SelfRemove proposals are auto-committed by any member, including non-admins.
+    ///
+    /// With SelfRemove (new protocol), any member can commit the proposal — not just admins.
+    /// This is the key behavioral difference from the legacy Remove-based self-leave.
     #[test]
-    fn test_self_leave_proposal_stored_pending_by_non_admin() {
+    fn test_self_remove_proposal_auto_committed_by_non_admin() {
         // Setup: Alice (admin), Bob (non-admin), Charlie (non-admin)
         let alice_keys = Keys::generate();
         let bob_keys = Keys::generate();
@@ -408,34 +438,19 @@ mod tests {
             .accept_welcome(&charlie_welcome_preview)
             .expect("Charlie should accept welcome");
 
-        // Bob leaves (creates proposal)
+        // Bob leaves (sends SelfRemove proposal)
         let bob_leave_result = bob_mdk.leave_group(&group_id).expect("Bob should leave");
 
-        // Charlie (non-admin) processes the leave proposal
-        // This should store as pending and return PendingProposal variant
+        // Charlie (non-admin) processes Bob's SelfRemove proposal
+        // With SelfRemove, any member auto-commits — no admin required
         let process_result = charlie_mdk
             .process_message(&bob_leave_result.evolution_event)
-            .expect("Charlie should process leave");
+            .expect("Charlie should process Bob's SelfRemove");
 
-        // Verify it returns PendingProposal (indicating it was stored, not committed)
         assert!(
-            matches!(
-                process_result,
-                MessageProcessingResult::PendingProposal { .. }
-            ),
-            "Non-admin processing self-leave should return PendingProposal, got: {:?}",
+            matches!(process_result, MessageProcessingResult::Proposal(_)),
+            "Non-admin processing SelfRemove should auto-commit, got: {:?}",
             process_result
-        );
-
-        // Verify the proposal is now pending
-        let pending = charlie_mdk
-            .pending_removed_members_pubkeys(&group_id)
-            .expect("Should get pending");
-        assert_eq!(pending.len(), 1, "Bob should be in pending removals");
-        assert_eq!(
-            pending[0],
-            bob_keys.public_key(),
-            "Pending removal should be Bob"
         );
     }
 

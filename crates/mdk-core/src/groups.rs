@@ -1224,6 +1224,7 @@ where
         );
         let group_config = MlsGroupCreateConfig::builder()
             .ciphersuite(self.ciphersuite)
+            .wire_format_policy(MIXED_CIPHERTEXT_WIRE_FORMAT_POLICY)
             .use_ratchet_tree_extension(true)
             .capabilities(capabilities)
             .with_group_context_extensions(extensions)
@@ -1431,12 +1432,79 @@ where
         })
     }
 
+    /// Attempts to create a SelfRemove proposal, falling back to Remove for legacy groups.
+    ///
+    /// SelfRemove proposals MUST be sent as MLS PublicMessage per the MLS Extensions draft.
+    /// Since groups default to MIXED_CIPHERTEXT (outgoing: ciphertext), this method
+    /// temporarily switches the wire format policy to allow the PublicMessage, then
+    /// restores it. This preserves PrivateMessage for all other group operations.
+    ///
+    /// For legacy groups (PURE_CIPHERTEXT, created before SelfRemove support), falls
+    /// back to a Remove proposal where sender == removed member.
+    fn try_self_remove(
+        &self,
+        group: &mut MlsGroup,
+        signer: &SignatureKeyPair,
+    ) -> Result<MlsMessageOut, Error> {
+        let sender_ratchet_config = SenderRatchetConfiguration::new(
+            self.config.out_of_order_tolerance,
+            self.config.maximum_forward_distance,
+        );
+
+        // Temporarily allow plaintext outgoing for the SelfRemove proposal.
+        // SelfRemove MUST be sent as PublicMessage per the MLS Extensions draft.
+        let plaintext_config = MlsGroupJoinConfig::builder()
+            .wire_format_policy(MIXED_PLAINTEXT_WIRE_FORMAT_POLICY)
+            .use_ratchet_tree_extension(true)
+            .sender_ratchet_configuration(sender_ratchet_config)
+            .max_past_epochs(self.config.max_past_epochs)
+            .build();
+
+        let ciphertext_config = MlsGroupJoinConfig::builder()
+            .wire_format_policy(MIXED_CIPHERTEXT_WIRE_FORMAT_POLICY)
+            .use_ratchet_tree_extension(true)
+            .sender_ratchet_configuration(sender_ratchet_config)
+            .max_past_epochs(self.config.max_past_epochs)
+            .build();
+
+        group
+            .set_configuration(self.storage(), &plaintext_config)
+            .map_err(|e| Error::Group(format!("Failed to switch wire format: {e}")))?;
+
+        let result = group.leave_group_via_self_remove(&self.provider, signer);
+
+        // Always restore ciphertext mode so the group stays encrypted if the
+        // member doesn't actually depart (e.g., SelfRemove isn't committed).
+        if let Err(e) = group.set_configuration(self.storage(), &ciphertext_config) {
+            tracing::error!(
+                target: "mdk_core::groups::leave_group",
+                "Failed to restore ciphertext wire format after SelfRemove: {e}"
+            );
+        }
+
+        match result {
+            Ok(msg) => Ok(msg),
+            Err(openmls::group::LeaveGroupError::CannotSelfRemoveWithPureCiphertext) => {
+                // This shouldn't happen after the config switch, but handle it defensively
+                // for legacy groups that might have been created with PURE_CIPHERTEXT.
+                tracing::debug!(
+                    target: "mdk_core::groups::leave_group",
+                    "SelfRemove unavailable (legacy group), falling back to Remove proposal"
+                );
+                group
+                    .leave_group(&self.provider, signer)
+                    .map_err(|e| Error::Group(e.to_string()))
+            }
+            Err(e) => Err(Error::Group(e.to_string())),
+        }
+    }
+
     /// Create a proposal to leave the group
     ///
-    /// This creates a leave proposal that must be committed by another member (typically an admin).
-    /// The member cannot unilaterally leave because they cannot commit themselves out of the tree.
-    /// The member remains in the group and can continue participating until another member
-    /// processes and commits this proposal.
+    /// Sends a SelfRemove proposal (new protocol) if the group supports it, otherwise
+    /// falls back to a Remove proposal for legacy groups using PURE_CIPHERTEXT policy.
+    /// The proposal must be committed by another member — the departing member cannot
+    /// commit their own removal.
     ///
     /// # Arguments
     ///
@@ -1449,9 +1517,7 @@ where
 
         let signer: SignatureKeyPair = self.load_mls_signer(&group)?;
 
-        let leave_message = group
-            .leave_group(&self.provider, &signer)
-            .map_err(|e| Error::Group(e.to_string()))?;
+        let leave_message = self.try_self_remove(&mut group, &signer)?;
 
         let serialized_message_out = leave_message
             .tls_serialize_detached()
@@ -5213,10 +5279,14 @@ mod tests {
         );
     }
 
-    /// Tests that pending_removed_members_pubkeys shows members pending removal
-    /// when a self-leave proposal is received by a non-admin member.
+    /// Tests that SelfRemove proposals are auto-committed by non-admin receivers,
+    /// so no pending removals accumulate.
+    ///
+    /// With SelfRemove (new protocol), any member auto-commits the departure.
+    /// The proposal never enters a "pending" state.
     #[test]
-    fn test_pending_removed_members_from_self_leave_proposal() {
+    fn test_self_remove_auto_committed_no_pending_removals() {
+        use crate::messages::MessageProcessingResult;
         use crate::test_util::create_key_package_event;
 
         // Setup: Alice (admin), Bob (non-admin), Charlie (non-admin)
@@ -5231,11 +5301,9 @@ mod tests {
         // Only Alice is admin
         let admins = vec![alice_keys.public_key()];
 
-        // Create key packages
         let bob_key_package = create_key_package_event(&bob_mdk, &bob_keys);
         let charlie_key_package = create_key_package_event(&charlie_mdk, &charlie_keys);
 
-        // Alice creates the group with Bob and Charlie
         let create_result = alice_mdk
             .create_group(
                 &alice_keys.public_key(),
@@ -5267,39 +5335,29 @@ mod tests {
             .accept_welcome(&charlie_welcome_preview)
             .expect("Charlie should accept welcome");
 
-        // Initially, Charlie has no pending removals
-        let pending_before = charlie_mdk
-            .pending_removed_members_pubkeys(&group_id)
-            .expect("Should get pending removed members");
-        assert!(pending_before.is_empty(), "No pending removals initially");
-
-        // Bob leaves the group (creates a leave proposal)
+        // Bob leaves (sends SelfRemove proposal)
         let bob_leave_result = bob_mdk
             .leave_group(&group_id)
             .expect("Bob should be able to leave");
 
-        // Charlie (non-admin) processes Bob's leave proposal
-        // This should store the proposal as pending (not auto-commit since Charlie is not admin)
-        let process_result = charlie_mdk.process_message(&bob_leave_result.evolution_event);
+        // Charlie (non-admin) processes Bob's SelfRemove — auto-commits it
+        let process_result = charlie_mdk
+            .process_message(&bob_leave_result.evolution_event)
+            .expect("Charlie should process Bob's SelfRemove");
+
         assert!(
-            process_result.is_ok(),
-            "Charlie should be able to process Bob's leave: {:?}",
-            process_result.err()
+            matches!(process_result, MessageProcessingResult::Proposal(_)),
+            "SelfRemove should be auto-committed by non-admin, got: {:?}",
+            process_result
         );
 
-        // Now Charlie should have Bob in pending removals
-        let pending_after = charlie_mdk
+        // No pending removals — the proposal was committed immediately
+        let pending = charlie_mdk
             .pending_removed_members_pubkeys(&group_id)
             .expect("Should get pending removed members");
-        assert_eq!(
-            pending_after.len(),
-            1,
-            "Should have one pending removal (Bob)"
-        );
-        assert_eq!(
-            pending_after[0],
-            bob_keys.public_key(),
-            "Pending removal should be Bob"
+        assert!(
+            pending.is_empty(),
+            "No pending removals after SelfRemove auto-commit"
         );
     }
 
@@ -5339,9 +5397,12 @@ mod tests {
         assert!(changes.removals.is_empty(), "No pending removals");
     }
 
-    /// Tests that pending_member_changes shows pending removal from leave proposal.
+    /// Tests that SelfRemove auto-commit leaves no pending member changes.
+    ///
+    /// With SelfRemove, the departure is committed immediately by any member,
+    /// so pending_member_changes should show no pending removals.
     #[test]
-    fn test_pending_member_changes_with_leave_proposal() {
+    fn test_no_pending_member_changes_after_self_remove() {
         use crate::test_util::create_key_package_event;
 
         // Setup: Alice (admin), Bob (non-admin), Charlie (non-admin)
@@ -5389,24 +5450,22 @@ mod tests {
             .accept_welcome(&charlie_welcome_preview)
             .expect("Charlie should accept welcome");
 
-        // Bob leaves (creates proposal)
+        // Bob leaves (SelfRemove)
         let bob_leave_result = bob_mdk.leave_group(&group_id).expect("Bob should leave");
 
-        // Charlie (non-admin) processes the leave proposal
+        // Charlie (non-admin) auto-commits Bob's SelfRemove
         charlie_mdk
             .process_message(&bob_leave_result.evolution_event)
-            .expect("Charlie should process leave");
+            .expect("Charlie should process Bob's SelfRemove");
 
-        // Charlie should see Bob in pending removals
+        // No pending changes — SelfRemove was committed immediately
         let changes = charlie_mdk
             .pending_member_changes(&group_id)
             .expect("Should get pending member changes");
         assert!(changes.additions.is_empty(), "No pending additions");
-        assert_eq!(changes.removals.len(), 1, "Should have one pending removal");
-        assert_eq!(
-            changes.removals[0],
-            bob_keys.public_key(),
-            "Pending removal should be Bob"
+        assert!(
+            changes.removals.is_empty(),
+            "No pending removals after SelfRemove auto-commit"
         );
     }
 
