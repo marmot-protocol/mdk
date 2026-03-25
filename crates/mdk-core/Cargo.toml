@@ -15,6 +15,7 @@ categories = ["cryptography", "network-programming"]
 [features]
 default = []
 mip04 = []
+mip05 = []
 debug-examples = []
 
 [dependencies]
