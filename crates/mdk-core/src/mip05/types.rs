@@ -2,6 +2,7 @@ use std::fmt;
 
 use base64::Engine;
 use nostr::{EventId, PublicKey, RelayUrl};
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use super::{ENCRYPTED_TOKEN_LEN, Mip05Error, TOKEN_PLAINTEXT_LEN};
 
@@ -52,8 +53,9 @@ impl fmt::Debug for NotificationPlatform {
 }
 
 /// Parsed MIP-05 token plaintext.
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash, Zeroize, ZeroizeOnDrop)]
 pub struct PushTokenPlaintext {
+    #[zeroize(skip)]
     platform: NotificationPlatform,
     device_token: Vec<u8>,
 }
@@ -127,7 +129,7 @@ impl fmt::Debug for PushTokenPlaintext {
 }
 
 /// Fixed-size encrypted MIP-05 token.
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash, Zeroize, ZeroizeOnDrop)]
 pub struct EncryptedToken([u8; ENCRYPTED_TOKEN_LEN]);
 
 impl EncryptedToken {
@@ -212,13 +214,6 @@ pub struct TokenListResponse {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct TokenRemoval;
 
-/// Typed representation of a `kind:446` notification request rumor.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NotificationRequestRumor {
-    /// The concatenated encrypted tokens carried by the rumor.
-    pub encrypted_tokens: Vec<EncryptedToken>,
-}
-
 /// Typed representation of MIP-05 MLS application-message rumors.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mip05GroupMessage {
@@ -283,5 +278,24 @@ mod tests {
 
         assert_eq!(leaf_token_tag.token_tag, token_tag);
         assert_eq!(leaf_token_tag.leaf_index, 4);
+    }
+
+    #[test]
+    fn test_push_token_plaintext_zeroize_clears_device_token() {
+        let mut plaintext =
+            PushTokenPlaintext::new(NotificationPlatform::Fcm, vec![7u8; 10]).unwrap();
+
+        plaintext.zeroize();
+
+        assert!(plaintext.device_token().is_empty());
+    }
+
+    #[test]
+    fn test_encrypted_token_zeroize_clears_bytes() {
+        let mut token = EncryptedToken::from([5u8; ENCRYPTED_TOKEN_LEN]);
+
+        token.zeroize();
+
+        assert_eq!(token.as_bytes(), &[0u8; ENCRYPTED_TOKEN_LEN]);
     }
 }

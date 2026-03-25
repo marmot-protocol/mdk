@@ -560,6 +560,9 @@ where
     }
 
     /// Returns the current active MLS leaf positions and their bound Nostr public keys.
+    ///
+    /// Removed-member tree holes are omitted by design. Callers should not
+    /// expect every index in a contiguous `0..n` range to be present.
     pub fn group_leaf_map(&self, group_id: &GroupId) -> Result<BTreeMap<u32, PublicKey>, Error> {
         let group = self.load_mls_group(group_id)?.ok_or(Error::GroupNotFound)?;
 

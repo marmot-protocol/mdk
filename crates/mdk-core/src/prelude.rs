@@ -41,8 +41,7 @@ pub use crate::messages::{
 #[cfg_attr(docsrs, doc(cfg(feature = "mip05")))]
 pub use crate::mip05::{
     EncryptedToken, LeafTokenTag, Mip05Error, Mip05GroupMessage, NotificationPlatform,
-    NotificationRequestRumor, PushTokenPlaintext, TokenListResponse, TokenRemoval, TokenRequest,
-    TokenTag,
+    PushTokenPlaintext, TokenListResponse, TokenRemoval, TokenRequest, TokenTag,
 };
 /// Welcome operation results
 pub use crate::welcomes::{JoinedGroupResult, WelcomePreview};

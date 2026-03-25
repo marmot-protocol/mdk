@@ -1,7 +1,7 @@
-//! MIP-05 push-notification primitives and helpers.
+//! MIP-05 push-token exchange primitives and helpers.
 //!
 //! This module provides the protocol-level MIP-05 building blocks that clients
-//! need for interoperable token exchange and notification triggering.
+//! need for interoperable token exchange.
 
 mod crypto;
 mod error;
@@ -15,13 +15,10 @@ pub use self::rumors::{
     parse_group_message, parse_group_message_rumor,
 };
 pub use self::types::{
-    EncryptedToken, LeafTokenTag, Mip05GroupMessage, NotificationPlatform,
-    NotificationRequestRumor, PushTokenPlaintext, TokenListResponse, TokenRemoval, TokenRequest,
-    TokenTag,
+    EncryptedToken, LeafTokenTag, Mip05GroupMessage, NotificationPlatform, PushTokenPlaintext,
+    TokenListResponse, TokenRemoval, TokenRequest, TokenTag,
 };
 
-/// MIP-05 `kind:446` notification request rumor.
-pub const NOTIFICATION_REQUEST_KIND: u16 = 446;
 /// MIP-05 `kind:447` token request rumor.
 pub const TOKEN_REQUEST_KIND: u16 = 447;
 /// MIP-05 `kind:448` token list response rumor.

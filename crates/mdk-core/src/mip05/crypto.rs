@@ -11,6 +11,10 @@ use super::{
 };
 use super::{EncryptedToken, PushTokenPlaintext};
 
+const EPHEMERAL_PUBKEY_LEN: usize = 32;
+const NONCE_LEN: usize = 12;
+const CIPHERTEXT_OFFSET: usize = EPHEMERAL_PUBKEY_LEN + NONCE_LEN;
+
 /// Encrypt a validated push token using the MIP-05 wire format.
 pub fn encrypt_push_token(
     server_pubkey: &PublicKey,
@@ -41,12 +45,12 @@ pub fn decrypt_push_token(
     encrypted_token: &EncryptedToken,
 ) -> Result<PushTokenPlaintext, Mip05Error> {
     let bytes = encrypted_token.as_bytes();
-    let ephemeral_pubkey = PublicKey::from_slice(&bytes[..32])
+    let ephemeral_pubkey = PublicKey::from_slice(&bytes[..EPHEMERAL_PUBKEY_LEN])
         .map_err(|_| Mip05Error::InvalidEncryptedTokenPublicKey)?;
-    let nonce_bytes: [u8; 12] = bytes[32..44]
+    let nonce_bytes: [u8; NONCE_LEN] = bytes[EPHEMERAL_PUBKEY_LEN..CIPHERTEXT_OFFSET]
         .try_into()
         .map_err(|_| Mip05Error::InvalidEncryptedTokenNonce)?;
-    let ciphertext = &bytes[44..];
+    let ciphertext = &bytes[CIPHERTEXT_OFFSET..];
 
     let key = derive_encryption_key(server_secret_key, &ephemeral_pubkey)?;
     let cipher = ChaCha20Poly1305::new((&key).into());
@@ -97,14 +101,14 @@ fn encrypt_push_token_with_materials(
         )
         .map_err(|_| Mip05Error::EncryptionFailed)?;
 
-    if ciphertext.len() != ENCRYPTED_TOKEN_LEN - 32 - 12 {
+    if ciphertext.len() != ENCRYPTED_TOKEN_LEN - EPHEMERAL_PUBKEY_LEN - NONCE_LEN {
         return Err(Mip05Error::InvalidCiphertextLength);
     }
 
     let mut bytes = [0u8; ENCRYPTED_TOKEN_LEN];
-    bytes[..32].copy_from_slice(ephemeral_keys.public_key().as_bytes());
-    bytes[32..44].copy_from_slice(&nonce_bytes);
-    bytes[44..].copy_from_slice(&ciphertext);
+    bytes[..EPHEMERAL_PUBKEY_LEN].copy_from_slice(ephemeral_keys.public_key().as_bytes());
+    bytes[EPHEMERAL_PUBKEY_LEN..CIPHERTEXT_OFFSET].copy_from_slice(&nonce_bytes);
+    bytes[CIPHERTEXT_OFFSET..].copy_from_slice(&ciphertext);
 
     Ok(EncryptedToken::from(bytes))
 }
@@ -166,10 +170,13 @@ mod tests {
         let ephemeral_keys = Keys::new(ephemeral_secret_key);
 
         assert_eq!(
-            &encrypted.as_bytes()[..32],
+            &encrypted.as_bytes()[..EPHEMERAL_PUBKEY_LEN],
             ephemeral_keys.public_key().as_bytes()
         );
-        assert_eq!(&encrypted.as_bytes()[32..44], &nonce);
+        assert_eq!(
+            &encrypted.as_bytes()[EPHEMERAL_PUBKEY_LEN..CIPHERTEXT_OFFSET],
+            &nonce
+        );
         assert_eq!(encrypted.as_bytes().len(), ENCRYPTED_TOKEN_LEN);
 
         let decrypted = decrypt_push_token(server_keys.secret_key(), &encrypted).unwrap();
@@ -235,9 +242,9 @@ mod tests {
             )
             .map_err(|_| Mip05Error::EncryptionFailed)?;
         let mut bytes = [0u8; ENCRYPTED_TOKEN_LEN];
-        bytes[..32].copy_from_slice(ephemeral_keys.public_key().as_bytes());
-        bytes[32..44].copy_from_slice(&nonce_bytes);
-        bytes[44..].copy_from_slice(&ciphertext);
+        bytes[..EPHEMERAL_PUBKEY_LEN].copy_from_slice(ephemeral_keys.public_key().as_bytes());
+        bytes[EPHEMERAL_PUBKEY_LEN..CIPHERTEXT_OFFSET].copy_from_slice(&nonce_bytes);
+        bytes[CIPHERTEXT_OFFSET..].copy_from_slice(&ciphertext);
         Ok(EncryptedToken::from(bytes))
     }
 }
