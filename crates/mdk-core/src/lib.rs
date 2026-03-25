@@ -39,7 +39,8 @@ pub mod welcomes;
 
 use self::callback::{MdkCallback, RollbackInfo};
 use self::constant::{
-    DEFAULT_CIPHERSUITE, GROUP_CONTEXT_REQUIRED_EXTENSIONS, SUPPORTED_EXTENSIONS,
+    DEFAULT_CIPHERSUITE, GROUP_CONTEXT_REQUIRED_EXTENSIONS, GROUP_CONTEXT_REQUIRED_PROPOSALS,
+    SUPPORTED_EXTENSIONS, SUPPORTED_PROPOSALS, TAG_PROPOSALS,
 };
 use self::epoch_snapshots::EpochSnapshotManager;
 pub use self::error::Error;
@@ -399,7 +400,7 @@ where
             None,
             Some(&[self.ciphersuite]),
             Some(&self.extensions),
-            None,
+            Some(&SUPPORTED_PROPOSALS),
             None,
         )
         .with_grease(&self.provider.crypto)
@@ -410,7 +411,7 @@ where
     pub(crate) fn required_capabilities_extension(&self) -> Extension {
         Extension::RequiredCapabilities(RequiredCapabilitiesExtension::new(
             &GROUP_CONTEXT_REQUIRED_EXTENSIONS,
-            &[],
+            &GROUP_CONTEXT_REQUIRED_PROPOSALS,
             &[],
         ))
     }
@@ -423,6 +424,11 @@ where
     /// Get the extensions value formatted for Nostr tags (array of hex values)
     pub(crate) fn extensions_value(&self) -> Vec<String> {
         self.extensions.iter().map(|e| e.to_nostr_tag()).collect()
+    }
+
+    /// Get the proposal types formatted for Nostr tags (array of hex values)
+    pub(crate) fn proposals_value(&self) -> Vec<String> {
+        TAG_PROPOSALS.iter().map(|p| p.to_nostr_tag()).collect()
     }
 
     /// Get the storage provider
