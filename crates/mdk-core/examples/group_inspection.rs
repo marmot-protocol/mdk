@@ -63,8 +63,11 @@ async fn main() -> Result<(), Error> {
     let relay_url = RelayUrl::parse("wss://relay.example.com").unwrap();
 
     // Create key packages for members (not creator)
-    let (member1_kp_encoded, member1_tags, _, _) =
-        mdk.create_key_package_for_event(&member1_keys.public_key(), [relay_url.clone()])?;
+    let mdk_core::key_packages::KeyPackageEventData {
+        content: member1_kp_encoded,
+        tags_30443: member1_tags,
+        ..
+    } = mdk.create_key_package_for_event(&member1_keys.public_key(), [relay_url.clone()])?;
 
     let member1_event =
         nostr::event::builder::EventBuilder::new(nostr::Kind::Custom(30443), member1_kp_encoded)
@@ -73,8 +76,11 @@ async fn main() -> Result<(), Error> {
             .sign(&member1_keys)
             .await?;
 
-    let (member2_kp_encoded, member2_tags, _, _) =
-        mdk.create_key_package_for_event(&member2_keys.public_key(), [relay_url.clone()])?;
+    let mdk_core::key_packages::KeyPackageEventData {
+        content: member2_kp_encoded,
+        tags_30443: member2_tags,
+        ..
+    } = mdk.create_key_package_for_event(&member2_keys.public_key(), [relay_url.clone()])?;
 
     let member2_event =
         nostr::event::builder::EventBuilder::new(nostr::Kind::Custom(30443), member2_kp_encoded)

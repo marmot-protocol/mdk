@@ -25,7 +25,7 @@
 
 ### Breaking changes
 
-- **MIP-00 KeyPackage event kind migrated from `kind:443` to `kind:30443`**: KeyPackage events are now addressable (NIP-33) instead of regular events. A `d` tag with a random 32-byte hex identifier is included in every KeyPackage event, enabling relay-side replacement for rotation without explicit NIP-09 deletion. `create_key_package_for_event` and `create_key_package_for_event_with_options` now return a 4-tuple `(content, tags, hash_ref, d_tag)` instead of a 3-tuple — callers must update destructuring and should store the `d_tag` value for reuse when rotating. `parse_key_package` accepts both `kind:30443` (new) and `kind:443` (legacy) during the migration period until May 1, 2026. ([#233](https://github.com/marmot-protocol/mdk/pull/233))
+- **MIP-00 KeyPackage event kind migrated from `kind:443` to `kind:30443`**: KeyPackage events are now addressable (NIP-33) instead of regular events. A `d` tag with a random 32-byte hex identifier is included in every KeyPackage event, enabling relay-side replacement for rotation without explicit NIP-09 deletion. `create_key_package_for_event` and `create_key_package_for_event_with_options` now return a `KeyPackageEventData` struct instead of a tuple. This struct contains both `tags_30443` (for current spec) and `tags_443` (for legacy clients) to facilitate dual-publishing during the migration period. Callers must update destructuring and should publish both event kinds until May 1, 2026. `parse_key_package` accepts both `kind:30443` (new) and `kind:443` (legacy) during the migration period. ([#233](https://github.com/marmot-protocol/mdk/pull/233))
 
 ### Changed
 
