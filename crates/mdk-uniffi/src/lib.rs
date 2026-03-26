@@ -427,14 +427,22 @@ impl Mdk {
         let relay_urls = parse_relay_urls(&relays)?;
 
         let mdk = self.lock()?;
-        let (key_package_hex, tags, hash_ref, d_tag) =
-            mdk.create_key_package_for_event(&pubkey, relay_urls)?;
+        let mdk_core::key_packages::KeyPackageEventData {
+            content: key_package_hex,
+            tags_30443: tags,
+            tags_443,
+            hash_ref,
+            d_tag,
+        } = mdk.create_key_package_for_event(&pubkey, relay_urls)?;
 
         let tags: Vec<Vec<String>> = tags.iter().map(|tag| tag.as_slice().to_vec()).collect();
+        let tags_legacy: Vec<Vec<String>> =
+            tags_443.iter().map(|tag| tag.as_slice().to_vec()).collect();
 
         Ok(KeyPackageResult {
             key_package: key_package_hex,
             tags,
+            tags_legacy,
             hash_ref,
             d_tag,
         })
@@ -460,14 +468,22 @@ impl Mdk {
         let relay_urls = parse_relay_urls(&relays)?;
 
         let mdk = self.lock()?;
-        let (key_package_hex, tags, hash_ref, d_tag) =
-            mdk.create_key_package_for_event_with_options(&pubkey, relay_urls, protected)?;
+        let mdk_core::key_packages::KeyPackageEventData {
+            content: key_package_hex,
+            tags_30443: tags,
+            tags_443,
+            hash_ref,
+            d_tag,
+        } = mdk.create_key_package_for_event_with_options(&pubkey, relay_urls, protected)?;
 
         let tags: Vec<Vec<String>> = tags.iter().map(|tag| tag.as_slice().to_vec()).collect();
+        let tags_legacy: Vec<Vec<String>> =
+            tags_443.iter().map(|tag| tag.as_slice().to_vec()).collect();
 
         Ok(KeyPackageResult {
             key_package: key_package_hex,
             tags,
+            tags_legacy,
             hash_ref,
             d_tag,
         })
@@ -982,8 +998,10 @@ impl Mdk {
 pub struct KeyPackageResult {
     /// Base64-encoded key package content
     pub key_package: String,
-    /// Tags for the key package event in UniFFI wire format (includes the `d` tag)
+    /// Tags for the kind:30443 key package event in UniFFI wire format (includes the `d` tag)
     pub tags: Vec<Vec<String>>,
+    /// Tags for the legacy kind:443 event (omits the `d` tag)
+    pub tags_legacy: Vec<Vec<String>>,
     /// Serialized hash_ref bytes for the key package (for lifecycle tracking)
     pub hash_ref: Vec<u8>,
     /// The `d` tag value (32-byte hex string) for this KeyPackage slot.

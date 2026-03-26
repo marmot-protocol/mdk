@@ -36,7 +36,13 @@ where
     Storage: MdkStorageProvider,
 {
     let relays = vec![RelayUrl::parse("wss://test.relay").unwrap()];
-    let (key_package_hex, tags, _hash_ref, _d_value) = mdk
+    let crate::key_packages::KeyPackageEventData {
+        content: key_package_hex,
+        tags_30443: tags,
+        hash_ref: _hash_ref,
+        d_tag: _d_value,
+        ..
+    } = mdk
         .create_key_package_for_event(&member_keys.public_key(), relays)
         .expect("Failed to create key package");
 
@@ -59,7 +65,13 @@ where
     Storage: MdkStorageProvider,
 {
     let relays = vec![RelayUrl::parse("wss://test.relay").unwrap()];
-    let (key_package_hex, tags, _hash_ref, _d_value) = mdk
+    let crate::key_packages::KeyPackageEventData {
+        content: key_package_hex,
+        tags_30443: tags,
+        hash_ref: _hash_ref,
+        d_tag: _d_value,
+        ..
+    } = mdk
         .create_key_package_for_event(pubkey, relays)
         .expect("Failed to create key package");
 
