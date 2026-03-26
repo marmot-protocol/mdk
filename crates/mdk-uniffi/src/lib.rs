@@ -982,13 +982,14 @@ impl Mdk {
 pub struct KeyPackageResult {
     /// Base64-encoded key package content
     pub key_package: String,
-    /// JSON-encoded tags for the key package event (includes `d` tag)
+    /// Tags for the key package event in UniFFI wire format (includes the `d` tag)
     pub tags: Vec<Vec<String>>,
     /// Serialized hash_ref bytes for the key package (for lifecycle tracking)
     pub hash_ref: Vec<u8>,
     /// The `d` tag value (32-byte hex string) for this KeyPackage slot.
-    /// Callers SHOULD store this and reuse it when rotating the KeyPackage
-    /// so that relays automatically replace the old event.
+    /// Callers SHOULD store this and, when rotating, replace the generated
+    /// `["d", ...]` entry in `tags` with the stored value before signing.
+    /// Reusing the same `(kind, pubkey, d)` tuple lets relays replace the old event.
     pub d_tag: String,
 }
 

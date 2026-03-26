@@ -2647,6 +2647,100 @@ mod tests {
         );
     }
 
+    /// Regression: parse_key_package accepts kind:443 (legacy) events until May 2026
+    ///
+    /// TODO: Remove this test together with MLS_KEY_PACKAGE_KIND_LEGACY acceptance after May 1, 2026
+    #[test]
+    fn test_parse_key_package_accepts_legacy_kind_443() {
+        let mdk = create_test_mdk();
+        let keys = nostr::Keys::generate();
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").unwrap()];
+
+        // Create a valid key package using the current kind so all tags are correct
+        let (key_package_str, tags, _hash_ref, _d_value) = mdk
+            .create_key_package_for_event(&keys.public_key(), relays)
+            .expect("Failed to create key package");
+
+        // Re-publish the same content under the legacy kind:443
+        let event = EventBuilder::new(MLS_KEY_PACKAGE_KIND_LEGACY, key_package_str)
+            .tags(tags)
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        let result = mdk.parse_key_package(&event);
+        assert!(
+            result.is_ok(),
+            "Should accept legacy kind:443 KeyPackage event until May 2026, got: {:?}",
+            result
+        );
+    }
+
+    /// Regression: parse_key_package rejects kind:30443 events missing the `d` tag
+    #[test]
+    fn test_parse_key_package_rejects_kind_30443_missing_d_tag() {
+        let mdk = create_test_mdk();
+        let keys = nostr::Keys::generate();
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").unwrap()];
+
+        let (key_package_str, tags, _hash_ref, _d_value) = mdk
+            .create_key_package_for_event(&keys.public_key(), relays)
+            .expect("Failed to create key package");
+
+        // Strip the `d` tag from the tag list
+        let tags_without_d: Vec<Tag> = tags
+            .into_iter()
+            .filter(|t| t.kind() != TagKind::d())
+            .collect();
+
+        let event = EventBuilder::new(MLS_KEY_PACKAGE_KIND, key_package_str)
+            .tags(tags_without_d)
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        let result = mdk.parse_key_package(&event);
+        assert!(
+            matches!(result, Err(Error::KeyPackage(_))),
+            "Should reject kind:30443 event with missing d tag, got: {:?}",
+            result
+        );
+    }
+
+    /// Regression: parse_key_package rejects kind:30443 events with an empty `d` tag value
+    #[test]
+    fn test_parse_key_package_rejects_kind_30443_empty_d_tag() {
+        let mdk = create_test_mdk();
+        let keys = nostr::Keys::generate();
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").unwrap()];
+
+        let (key_package_str, tags, _hash_ref, _d_value) = mdk
+            .create_key_package_for_event(&keys.public_key(), relays)
+            .expect("Failed to create key package");
+
+        // Replace the `d` tag with one that has an empty value
+        let tags_with_empty_d: Vec<Tag> = tags
+            .into_iter()
+            .map(|t| {
+                if t.kind() == TagKind::d() {
+                    Tag::identifier("")
+                } else {
+                    t
+                }
+            })
+            .collect();
+
+        let event = EventBuilder::new(MLS_KEY_PACKAGE_KIND, key_package_str)
+            .tags(tags_with_empty_d)
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        let result = mdk.parse_key_package(&event);
+        assert!(
+            matches!(result, Err(Error::KeyPackage(_))),
+            "Should reject kind:30443 event with empty d tag value, got: {:?}",
+            result
+        );
+    }
+
     /// Test that validate_key_package_tags rejects events with empty string in `i` tag
     #[test]
     fn test_validate_empty_string_i_tag() {
