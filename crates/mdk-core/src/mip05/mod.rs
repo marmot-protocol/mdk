@@ -31,6 +31,14 @@ pub const TOKEN_PLAINTEXT_LEN: usize = 220;
 /// MIP-05 encrypted token length.
 pub const ENCRYPTED_TOKEN_LEN: usize = 280;
 
+pub(crate) const EPHEMERAL_PUBKEY_LEN: usize = 32;
+pub(crate) const NONCE_LEN: usize = 12;
+// ChaCha20-Poly1305 authentication tag length.
+pub(crate) const AEAD_TAG_LEN: usize = 16;
+pub(crate) const TOKEN_CIPHERTEXT_LEN: usize = TOKEN_PLAINTEXT_LEN + AEAD_TAG_LEN;
+
+const _: [(); ENCRYPTED_TOKEN_LEN] = [(); EPHEMERAL_PUBKEY_LEN + NONCE_LEN + TOKEN_CIPHERTEXT_LEN];
+
 pub(crate) const TOKEN_TAG_NAME: &str = "token";
 pub(crate) const TOKEN_ENCRYPTION_SALT: &[u8] = b"mip05-v1";
 pub(crate) const TOKEN_ENCRYPTION_INFO: &[u8] = b"mip05-token-encryption";

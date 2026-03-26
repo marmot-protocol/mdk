@@ -9,6 +9,7 @@ use nostr::{Event, Timestamp};
 use openmls::group::{ProcessMessageError, ValidationError};
 use openmls::prelude::{
     ContentType, MlsGroup, MlsMessageIn, ProcessedMessage, ProcessedMessageContent, Proposal,
+    Sender,
 };
 use tls_codec::Deserialize as TlsDeserialize;
 
@@ -107,7 +108,7 @@ where
     ///
     /// # Returns
     ///
-    /// * `Ok(MessageProcessingResult)` - The result based on message type
+    /// * `Ok(MessageProcessingOutcome)` - The result plus transient sender context
     /// * `Err(Error)` - If message processing fails
     pub(super) fn dispatch_by_content_type_with_context(
         &self,
@@ -284,10 +285,11 @@ where
 
                 self.save_processed_message_record(processed_message)?;
 
-                Ok(MessageProcessingOutcome::without_context(
+                Ok(MessageProcessingOutcome::new(
                     MessageProcessingResult::Commit {
                         mls_group_id: group.mls_group_id.clone(),
                     },
+                    Some(mls_group.own_leaf_index().u32()),
                 ))
             }
             Err(e) => Err(e),
@@ -458,18 +460,18 @@ where
             event,
         ) {
             Ok(outcome) => Ok(outcome),
-            Err(error) => {
-                // Step 4: Handle errors with specialized recovery logic
-                self.handle_processing_error(error, event, &group)
-                    .map(MessageProcessingOutcome::without_context)
-            }
+            Err(error) => self.handle_processing_error(error, event, &group),
         }
     }
 }
 
-fn sender_leaf_index(sender: &openmls::prelude::Sender) -> Option<u32> {
+/// Return the MLS sender leaf index for member-authored messages.
+///
+/// External senders and new-member proposal/commit senders do not map to a
+/// current group leaf, so they return `None`.
+fn sender_leaf_index(sender: &Sender) -> Option<u32> {
     match sender {
-        openmls::prelude::Sender::Member(index) => Some(index.u32()),
+        Sender::Member(index) => Some(index.u32()),
         _ => None,
     }
 }
@@ -615,6 +617,52 @@ mod tests {
             }
             _ => panic!("Expected ApplicationMessage result"),
         }
+    }
+
+    #[test]
+    fn test_process_message_with_context_returns_own_sender_leaf_index_for_cached_message() {
+        let (alice_mdk, _bob_mdk, alice_keys, _bob_keys, group_id) = setup_two_member_group();
+        let rumor = create_test_rumor(&alice_keys, "Hello from Alice");
+        let event = alice_mdk
+            .create_message(&group_id, rumor)
+            .expect("Alice should create message");
+
+        let outcome = alice_mdk
+            .process_message_with_context(&event)
+            .expect("Alice should recover her own cached message");
+
+        assert_eq!(outcome.context.sender_leaf_index, Some(0));
+
+        match outcome.result {
+            MessageProcessingResult::ApplicationMessage(message) => {
+                assert_eq!(message.content, "Hello from Alice");
+            }
+            _ => panic!("Expected ApplicationMessage result"),
+        }
+    }
+
+    #[test]
+    fn test_process_message_with_context_returns_own_sender_leaf_index_for_pending_commit() {
+        let mdk = create_test_mdk();
+        let (creator, members, admins) = create_test_group_members();
+        let group_id = create_test_group(&mdk, &creator, &members, &admins);
+
+        let update_result = mdk
+            .update_group_data(
+                &group_id,
+                NostrGroupDataUpdate::new().name("Updated via pending commit".to_string()),
+            )
+            .expect("Failed to update group name");
+
+        let outcome = mdk
+            .process_message_with_context(&update_result.evolution_event)
+            .expect("Failed to process own pending commit");
+
+        assert_eq!(outcome.context.sender_leaf_index, Some(0));
+        assert!(matches!(
+            outcome.result,
+            MessageProcessingResult::Commit { .. }
+        ));
     }
 
     #[test]
@@ -833,13 +881,14 @@ mod tests {
         assert_eq!(out_of_sync_group.epoch, initial_epoch);
 
         // Process our own commit message - this should trigger sync even though it's marked as ProcessedCommit
-        let message_result = mdk
-            .process_message(&update_result.evolution_event)
+        let outcome = mdk
+            .process_message_with_context(&update_result.evolution_event)
             .expect("Failed to process own commit message");
 
         // Verify it returns Commit result (our fix should handle epoch mismatch errors)
+        assert_eq!(outcome.context.sender_leaf_index, Some(0));
         assert!(matches!(
-            message_result,
+            outcome.result,
             MessageProcessingResult::Commit { .. }
         ));
 

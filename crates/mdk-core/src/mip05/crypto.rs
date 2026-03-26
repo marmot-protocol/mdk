@@ -1,18 +1,17 @@
 use chacha20poly1305::aead::{Aead, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce};
 use hkdf::Hkdf;
+use mdk_storage_traits::Secret;
 use nostr::secp256k1::rand::{RngCore, rngs::OsRng};
 use nostr::{Keys, PublicKey, SecretKey};
 use sha2::Sha256;
 
 use super::{
-    ENCRYPTED_TOKEN_LEN, Mip05Error, TOKEN_ENCRYPTION_INFO, TOKEN_ENCRYPTION_SALT,
-    TOKEN_PLAINTEXT_LEN,
+    ENCRYPTED_TOKEN_LEN, EPHEMERAL_PUBKEY_LEN, Mip05Error, NONCE_LEN, TOKEN_CIPHERTEXT_LEN,
+    TOKEN_ENCRYPTION_INFO, TOKEN_ENCRYPTION_SALT, TOKEN_PLAINTEXT_LEN,
 };
 use super::{EncryptedToken, PushTokenPlaintext};
 
-const EPHEMERAL_PUBKEY_LEN: usize = 32;
-const NONCE_LEN: usize = 12;
 const CIPHERTEXT_OFFSET: usize = EPHEMERAL_PUBKEY_LEN + NONCE_LEN;
 
 /// Encrypt a validated push token using the MIP-05 wire format.
@@ -53,31 +52,38 @@ pub fn decrypt_push_token(
     let ciphertext = &bytes[CIPHERTEXT_OFFSET..];
 
     let key = derive_encryption_key(server_secret_key, &ephemeral_pubkey)?;
-    let cipher = ChaCha20Poly1305::new((&key).into());
-    let plaintext = cipher
-        .decrypt(
-            Nonce::from_slice(&nonce_bytes),
-            Payload {
-                msg: ciphertext,
-                aad: b"",
-            },
-        )
-        .map_err(|_| Mip05Error::DecryptionFailed)?;
+    let cipher = ChaCha20Poly1305::new(key.as_ref().into());
+    let plaintext = Secret::new(
+        cipher
+            .decrypt(
+                Nonce::from_slice(&nonce_bytes),
+                Payload {
+                    msg: ciphertext,
+                    aad: b"",
+                },
+            )
+            .map_err(|_| Mip05Error::DecryptionFailed)?,
+    );
 
-    PushTokenPlaintext::from_padded_slice(&plaintext)
+    PushTokenPlaintext::from_padded_slice(plaintext.as_ref())
 }
 
 fn derive_encryption_key(
     secret_key: &SecretKey,
     public_key: &PublicKey,
-) -> Result<[u8; 32], Mip05Error> {
-    let shared_x = nostr::util::generate_shared_key(secret_key, public_key)
-        .map_err(|_| Mip05Error::KeyDerivationFailed)?;
-    let hkdf = Hkdf::<Sha256>::new(Some(TOKEN_ENCRYPTION_SALT), &shared_x);
+) -> Result<Secret<[u8; 32]>, Mip05Error> {
+    // `nostr::util::generate_shared_key` currently returns the raw 32-byte shared
+    // x-coordinate for normalized x-only Nostr pubkeys. The regression test below
+    // pins that contract so upstream dependency changes fail loudly.
+    let shared_x = Secret::new(
+        nostr::util::generate_shared_key(secret_key, public_key)
+            .map_err(|_| Mip05Error::KeyDerivationFailed)?,
+    );
+    let hkdf = Hkdf::<Sha256>::new(Some(TOKEN_ENCRYPTION_SALT), shared_x.as_ref());
     let mut encryption_key = [0u8; 32];
     hkdf.expand(TOKEN_ENCRYPTION_INFO, &mut encryption_key)
         .map_err(|_| Mip05Error::KeyDerivationFailed)?;
-    Ok(encryption_key)
+    Ok(Secret::new(encryption_key))
 }
 
 fn encrypt_push_token_with_materials(
@@ -89,19 +95,19 @@ fn encrypt_push_token_with_materials(
 ) -> Result<EncryptedToken, Mip05Error> {
     let ephemeral_keys = Keys::new(ephemeral_secret_key);
     let key = derive_encryption_key(ephemeral_keys.secret_key(), server_pubkey)?;
-    let cipher = ChaCha20Poly1305::new((&key).into());
-    let padded_plaintext = plaintext.encode_padded(padding)?;
+    let cipher = ChaCha20Poly1305::new(key.as_ref().into());
+    let padded_plaintext = Secret::new(plaintext.encode_padded(padding)?);
     let ciphertext = cipher
         .encrypt(
             Nonce::from_slice(&nonce_bytes),
             Payload {
-                msg: &padded_plaintext,
+                msg: padded_plaintext.as_ref(),
                 aad: b"",
             },
         )
         .map_err(|_| Mip05Error::EncryptionFailed)?;
 
-    if ciphertext.len() != ENCRYPTED_TOKEN_LEN - EPHEMERAL_PUBKEY_LEN - NONCE_LEN {
+    if ciphertext.len() != TOKEN_CIPHERTEXT_LEN {
         return Err(Mip05Error::InvalidCiphertextLength);
     }
 
@@ -115,6 +121,7 @@ fn encrypt_push_token_with_materials(
 
 #[cfg(test)]
 mod tests {
+    use nostr::secp256k1::{Parity, PublicKey as SecpPublicKey, ecdh};
     use nostr::{Keys, SecretKey};
 
     use super::*;
@@ -184,6 +191,29 @@ mod tests {
     }
 
     #[test]
+    fn test_derive_encryption_key_matches_manual_shared_point_x_coordinate() {
+        let server_secret_key =
+            SecretKey::parse("1111111111111111111111111111111111111111111111111111111111111111")
+                .unwrap();
+        let peer_secret_key =
+            SecretKey::parse("2222222222222222222222222222222222222222222222222222222222222222")
+                .unwrap();
+        let peer_public_key = Keys::new(peer_secret_key).public_key();
+
+        let derived = derive_encryption_key(&server_secret_key, &peer_public_key).unwrap();
+        let xonly = peer_public_key.xonly().unwrap();
+        let normalized_public_key = SecpPublicKey::from_x_only_public_key(xonly, Parity::Even);
+        let shared_point = ecdh::shared_secret_point(&normalized_public_key, &server_secret_key);
+
+        let mut expected = [0u8; 32];
+        Hkdf::<Sha256>::new(Some(TOKEN_ENCRYPTION_SALT), &shared_point[..32])
+            .expand(TOKEN_ENCRYPTION_INFO, &mut expected)
+            .unwrap();
+
+        assert_eq!(derived.as_ref(), &expected);
+    }
+
+    #[test]
     fn test_decrypt_push_token_rejects_tampering() {
         let server_keys = Keys::generate();
         let plaintext =
@@ -231,7 +261,7 @@ mod tests {
     ) -> Result<EncryptedToken, Mip05Error> {
         let ephemeral_keys = Keys::new(ephemeral_secret_key);
         let key = derive_encryption_key(ephemeral_keys.secret_key(), server_pubkey)?;
-        let cipher = ChaCha20Poly1305::new((&key).into());
+        let cipher = ChaCha20Poly1305::new(key.as_ref().into());
         let ciphertext = cipher
             .encrypt(
                 Nonce::from_slice(&nonce_bytes),

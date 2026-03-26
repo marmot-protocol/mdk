@@ -57,6 +57,8 @@ pub fn build_token_list_response_rumor(
 }
 
 /// Build an unsigned `kind:449` MIP-05 token removal rumor.
+///
+/// This builder is infallible because `kind:449` carries empty content and no tags.
 pub fn build_token_removal_rumor(pubkey: nostr::PublicKey, created_at: Timestamp) -> UnsignedEvent {
     let mut rumor = UnsignedEvent::new(
         pubkey,
@@ -101,6 +103,7 @@ fn parse_token_request_rumor(event: &UnsignedEvent) -> Result<TokenRequest, Mip0
             TagKind::Custom(name) if name.as_ref() == TOKEN_TAG_NAME => {
                 tokens.push(parse_token_tag(tag)?);
             }
+            // Intentionally reject unknown tags to match the current MIP-05 draft exactly.
             _ => return Err(Mip05Error::UnsupportedTokenRequestTags),
         }
     }
@@ -129,6 +132,7 @@ fn parse_token_list_response_rumor(event: &UnsignedEvent) -> Result<TokenListRes
                 }
                 request_event_id = Some(parse_event_reference(tag)?);
             }
+            // Intentionally reject unknown tags to match the current MIP-05 draft exactly.
             _ => return Err(Mip05Error::UnsupportedTokenListResponseTags),
         }
     }
