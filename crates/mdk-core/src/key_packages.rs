@@ -214,6 +214,7 @@ where
             Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
             Tag::custom(TagKind::MlsCiphersuite, [self.ciphersuite_value()]),
             Tag::custom(TagKind::MlsExtensions, self.extensions_value()),
+            Tag::custom(TagKind::Custom("mls_proposals".into()), ["0x000a"]),
             Tag::relays(relays),
             Tag::custom(TagKind::i(), [key_package_ref_hex]),
         ];
@@ -423,14 +424,38 @@ where
         let pv = require(Self::is_protocol_version_tag, "mls_protocol_version")?;
         let cs = require(Self::is_ciphersuite_tag, "mls_ciphersuite")?;
         let ext = require(Self::is_extensions_tag, "mls_extensions")?;
+
+        // mls_proposals tag is strictly required per MIP-00
+        let prop = event
+            .tags
+            .iter()
+            .find(|t| t.as_slice().first() == Some(&"mls_proposals".to_string()))
+            .ok_or_else(|| Error::KeyPackage("Missing required tag: mls_proposals".to_string()))?;
+        if prop.as_slice().get(1).map(|s| s.as_str()) != Some("0x000a") {
+            return Err(Error::KeyPackage(
+                "Invalid mls_proposals tag value, expected 0x000a".to_string(),
+            ));
+        }
+
         let relays = require(Self::is_relays_tag, "relays")?;
-        let i_tag = require(Self::is_key_package_ref_tag, "i")?;
+
+        // i tag is required for kind:30443, but optional for kind:443 backward compat
+        let i_tag = event
+            .tags
+            .iter()
+            .find(|t| Self::is_key_package_ref_tag(self, t));
+        if event.kind == MLS_KEY_PACKAGE_KIND && i_tag.is_none() {
+            return Err(Error::KeyPackage("Missing required tag: i".to_string()));
+        }
 
         self.validate_protocol_version_tag(pv)?;
         self.validate_ciphersuite_tag(cs)?;
         self.validate_extensions_tag(ext)?;
         self.validate_relays_tag(relays)?;
-        self.validate_key_package_ref_tag(i_tag)?;
+
+        if let Some(i_t) = i_tag {
+            self.validate_key_package_ref_tag(i_t)?;
+        }
 
         // SECURITY: When a parsed KeyPackage is available, validate that the `i` tag value
         // matches the computed KeyPackageRef. This prevents an attacker from publishing a
@@ -440,18 +465,21 @@ where
         if let Some(kp) = key_package {
             let computed_ref = kp.hash_ref(self.provider.crypto())?;
 
-            let i_tag_value = i_tag
-                .as_slice()
-                .get(1)
-                .ok_or_else(|| Error::KeyPackage("Missing required i tag".to_string()))?;
+            if let Some(i_t) = i_tag {
+                let i_tag_value = i_t
+                    .as_slice()
+                    .get(1)
+                    .ok_or_else(|| Error::KeyPackage("Missing required i tag value".to_string()))?;
 
-            let i_tag_bytes = hex::decode(i_tag_value.as_str())
-                .map_err(|_| Error::KeyPackage("Invalid i tag hex".to_string()))?;
+                let i_tag_bytes = hex::decode(i_tag_value.as_str())
+                    .map_err(|_| Error::KeyPackage("Invalid i tag hex".to_string()))?;
 
-            if i_tag_bytes != computed_ref.as_slice() {
-                return Err(Error::KeyPackage(
-                    "KeyPackageRef in i tag does not match computed value from content".to_string(),
-                ));
+                if i_tag_bytes != computed_ref.as_slice() {
+                    return Err(Error::KeyPackage(
+                        "KeyPackageRef in i tag does not match computed value from content"
+                            .to_string(),
+                    ));
+                }
             }
         }
 
@@ -828,16 +856,17 @@ mod tests {
         // Verify the key package has the expected properties
         assert_eq!(key_package.ciphersuite(), DEFAULT_CIPHERSUITE);
 
-        // Without protected tag: 8 tags (d + 3 MLS + relays + i + client + encoding)
-        assert_eq!(tags.len(), 8);
+        // Without protected tag: 9 tags (d + 4 MLS + relays + i + client + encoding)
+        assert_eq!(tags.len(), 9);
         assert_eq!(tags[0].kind(), TagKind::d());
         assert_eq!(tags[1].kind(), TagKind::MlsProtocolVersion);
         assert_eq!(tags[2].kind(), TagKind::MlsCiphersuite);
         assert_eq!(tags[3].kind(), TagKind::MlsExtensions);
-        assert_eq!(tags[4].kind(), TagKind::Relays);
-        assert_eq!(tags[5].kind(), TagKind::i());
-        assert_eq!(tags[6].kind(), TagKind::Client);
-        assert_eq!(tags[7].kind(), TagKind::Custom("encoding".into()));
+        assert_eq!(tags[4].kind(), TagKind::Custom("mls_proposals".into()));
+        assert_eq!(tags[5].kind(), TagKind::Relays);
+        assert_eq!(tags[6].kind(), TagKind::i());
+        assert_eq!(tags[7].kind(), TagKind::Client);
+        assert_eq!(tags[8].kind(), TagKind::Custom("encoding".into()));
 
         // Verify d tag value is a 64-char hex string
         assert_eq!(d_value.len(), 64);
@@ -845,7 +874,7 @@ mod tests {
         assert_eq!(tags[0].content().unwrap(), d_value);
 
         assert_eq!(
-            tags[4].content().unwrap(),
+            tags[5].content().unwrap(),
             relays
                 .iter()
                 .map(|r| r.to_string())
@@ -860,7 +889,7 @@ mod tests {
         );
 
         // Verify client tag contains version
-        let client_tag = tags[6].content().unwrap();
+        let client_tag = tags[7].content().unwrap();
         assert!(
             client_tag.starts_with("MDK/"),
             "Client tag should start with MDK/"
@@ -1058,12 +1087,12 @@ mod tests {
             .create_key_package_for_event(&test_pubkey, relays.clone())
             .expect("Failed to create key package");
 
-        // Verify we have exactly 8 tags (d + 3 MLS required + relays + i + client + encoding)
+        // Verify we have exactly 9 tags (d + 4 MLS required + relays + i + client + encoding)
         // No protected tag when protected=false
         assert_eq!(
             tags.len(),
-            8,
-            "Should have exactly 8 tags without protected"
+            9,
+            "Should have exactly 9 tags without protected"
         );
 
         // Verify tag order matches spec example
@@ -1089,27 +1118,32 @@ mod tests {
         );
         assert_eq!(
             tags[4].kind(),
-            TagKind::Relays,
-            "Fifth tag should be relays"
+            TagKind::Custom("mls_proposals".into()),
+            "Fifth tag should be mls_proposals"
         );
         assert_eq!(
             tags[5].kind(),
-            TagKind::i(),
-            "Sixth tag should be i (KeyPackageRef)"
+            TagKind::Relays,
+            "Sixth tag should be relays"
         );
         assert_eq!(
             tags[6].kind(),
-            TagKind::Client,
-            "Seventh tag should be client (no protected tag)"
+            TagKind::i(),
+            "Seventh tag should be i (KeyPackageRef)"
         );
         assert_eq!(
             tags[7].kind(),
+            TagKind::Client,
+            "Eighth tag should be client (no protected tag)"
+        );
+        assert_eq!(
+            tags[8].kind(),
             TagKind::Custom("encoding".into()),
-            "Eighth tag should be encoding"
+            "Ninth tag should be encoding"
         );
 
         // Verify relays tag format
-        let relays_tag = &tags[4];
+        let relays_tag = &tags[5];
         let relays_values: Vec<String> = relays_tag
             .as_slice()
             .iter()
@@ -1159,11 +1193,11 @@ mod tests {
             "hash_ref should be returned from create_key_package_for_event_with_options"
         );
 
-        // Verify we have exactly 9 tags (d + 3 MLS required + relays + i + protected + client + encoding)
+        // Verify we have exactly 10 tags (d + 4 MLS required + relays + i + protected + client + encoding)
         assert_eq!(
             tags.len(),
-            9,
-            "Should have exactly 9 tags with protected=true"
+            10,
+            "Should have exactly 10 tags with protected=true"
         );
 
         // Verify d tag is present at the first position
@@ -1174,25 +1208,25 @@ mod tests {
         );
         // Verify i tag is present at the correct position
         assert_eq!(
-            tags[5].kind(),
+            tags[6].kind(),
             TagKind::i(),
-            "Sixth tag should be i (KeyPackageRef)"
+            "Seventh tag should be i (KeyPackageRef)"
         );
         // Verify protected tag is present at the correct position
         assert_eq!(
-            tags[6].kind(),
-            TagKind::Protected,
-            "Seventh tag should be protected"
-        );
-        assert_eq!(
             tags[7].kind(),
-            TagKind::Client,
-            "Eighth tag should be client"
+            TagKind::Protected,
+            "Eighth tag should be protected"
         );
         assert_eq!(
             tags[8].kind(),
+            TagKind::Client,
+            "Ninth tag should be client"
+        );
+        assert_eq!(
+            tags[9].kind(),
             TagKind::Custom("encoding".into()),
-            "Ninth tag should be encoding"
+            "Tenth tag should be encoding"
         );
     }
 
@@ -1395,6 +1429,7 @@ mod tests {
             let tags = vec![
                 Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
                 Tag::custom(TagKind::MlsExtensions, ["0x0003", "0x000a"]),
+                Tag::custom(TagKind::Custom("mls_proposals".into()), ["0x000a"]),
                 Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
             ];
 
@@ -1420,6 +1455,7 @@ mod tests {
         {
             let tags = vec![
                 Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
+                Tag::custom(TagKind::Custom("mls_proposals".into()), ["0x000a"]),
                 Tag::custom(TagKind::MlsExtensions, ["0x0003", "0x000a"]),
             ];
 
@@ -1440,6 +1476,7 @@ mod tests {
         {
             let tags = vec![
                 Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
+                Tag::custom(TagKind::Custom("mls_proposals".into()), ["0x000a"]),
                 Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
             ];
 
@@ -1460,6 +1497,7 @@ mod tests {
         {
             let tags = vec![
                 Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
+                Tag::custom(TagKind::Custom("mls_proposals".into()), ["0x000a"]),
                 Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
                 Tag::custom(
                     TagKind::MlsExtensions,
@@ -1500,6 +1538,7 @@ mod tests {
         {
             let tags = vec![
                 Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
+                Tag::custom(TagKind::Custom("mls_proposals".into()), ["0x000a"]),
                 Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
                 Tag::custom(
                     TagKind::MlsExtensions,
@@ -1528,6 +1567,7 @@ mod tests {
         {
             let invalid_tags = vec![
                 Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
+                Tag::custom(TagKind::Custom("mls_proposals".into()), ["0x000a"]),
                 Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
                 Tag::custom(
                     TagKind::MlsExtensions,
@@ -1559,6 +1599,7 @@ mod tests {
         {
             let invalid_tags = vec![
                 Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
+                Tag::custom(TagKind::Custom("mls_proposals".into()), ["0x000a"]),
                 Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
                 Tag::custom(
                     TagKind::MlsExtensions,
@@ -1590,6 +1631,7 @@ mod tests {
         {
             let tags = vec![
                 Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
+                Tag::custom(TagKind::Custom("mls_proposals".into()), ["0x000a"]),
                 Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
                 Tag::custom(
                     TagKind::MlsExtensions,
@@ -1616,6 +1658,7 @@ mod tests {
         {
             let tags = vec![
                 Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
+                Tag::custom(TagKind::Custom("mls_proposals".into()), ["0x000a"]),
                 Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
                 Tag::custom(
                     TagKind::MlsExtensions,
@@ -1667,6 +1710,7 @@ mod tests {
                 Tag::custom(TagKind::MlsProtocolVersion, ["2.0"]),
                 Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
                 Tag::custom(TagKind::MlsExtensions, ["0x0003", "0x000a"]),
+                Tag::custom(TagKind::Custom("mls_proposals".into()), ["0x000a"]),
                 Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
                 Tag::custom(TagKind::i(), [hex::encode([0xaa; 32])]),
             ];
@@ -1692,6 +1736,7 @@ mod tests {
                 Tag::custom(TagKind::MlsProtocolVersion, ["0.9"]),
                 Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
                 Tag::custom(TagKind::MlsExtensions, ["0x0003", "0x000a"]),
+                Tag::custom(TagKind::Custom("mls_proposals".into()), ["0x000a"]),
                 Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
                 Tag::custom(TagKind::i(), [hex::encode([0xaa; 32])]),
             ];
@@ -1715,8 +1760,10 @@ mod tests {
         {
             let tags = vec![
                 Tag::custom(TagKind::MlsProtocolVersion, Vec::<&str>::new()), // No value
+                Tag::custom(TagKind::Custom("mls_proposals".into()), ["0x000a"]),
                 Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
                 Tag::custom(TagKind::MlsExtensions, ["0x0003", "0x000a"]),
+                Tag::custom(TagKind::Custom("mls_proposals".into()), ["0x000a"]),
                 Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
                 Tag::custom(TagKind::i(), [hex::encode([0xaa; 32])]),
             ];
@@ -1762,6 +1809,7 @@ mod tests {
         {
             let tags = vec![
                 Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
+                Tag::custom(TagKind::Custom("mls_proposals".into()), ["0x000a"]),
                 Tag::custom(TagKind::MlsCiphersuite, ["0x01"]), // Too short
                 Tag::custom(TagKind::MlsExtensions, ["0x0003"]),
                 Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
@@ -1785,6 +1833,7 @@ mod tests {
         {
             let tags = vec![
                 Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
+                Tag::custom(TagKind::Custom("mls_proposals".into()), ["0x000a"]),
                 Tag::custom(TagKind::MlsCiphersuite, ["0xGGGG"]), // Invalid hex
                 Tag::custom(TagKind::MlsExtensions, ["0x0003"]),
                 Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
@@ -1808,6 +1857,7 @@ mod tests {
         {
             let tags = vec![
                 Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
+                Tag::custom(TagKind::Custom("mls_proposals".into()), ["0x000a"]),
                 Tag::custom(TagKind::MlsCiphersuite, [""]), // Empty value
                 Tag::custom(TagKind::MlsExtensions, ["0x0003"]),
                 Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
@@ -1848,6 +1898,7 @@ mod tests {
         {
             let tags = vec![
                 Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
+                Tag::custom(TagKind::Custom("mls_proposals".into()), ["0x000a"]),
                 Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
                 Tag::custom(TagKind::MlsExtensions, ["0x03", "0x000a"]), // First one too short
                 Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
@@ -1871,6 +1922,7 @@ mod tests {
         {
             let tags = vec![
                 Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
+                Tag::custom(TagKind::Custom("mls_proposals".into()), ["0x000a"]),
                 Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
                 Tag::custom(TagKind::MlsExtensions, ["0x0003", "0xZZZZ"]), // Invalid hex
                 Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
@@ -1894,6 +1946,7 @@ mod tests {
         {
             let tags = vec![
                 Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
+                Tag::custom(TagKind::Custom("mls_proposals".into()), ["0x000a"]),
                 Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
                 Tag::custom(TagKind::MlsExtensions, ["0x0003", ""]), // Empty value
                 Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
@@ -1934,6 +1987,7 @@ mod tests {
         {
             let tags = vec![
                 Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
+                Tag::custom(TagKind::Custom("mls_proposals".into()), ["0x000a"]),
                 Tag::custom(TagKind::MlsCiphersuite, ["0x0002"]), // Unsupported ciphersuite
                 Tag::custom(
                     TagKind::MlsExtensions,
@@ -1965,6 +2019,7 @@ mod tests {
         {
             let tags = vec![
                 Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
+                Tag::custom(TagKind::Custom("mls_proposals".into()), ["0x000a"]),
                 Tag::custom(
                     TagKind::MlsCiphersuite,
                     ["MLS_256_DHKEMX448_CHACHA20POLY1305_SHA512_Ed448"],
@@ -2009,6 +2064,7 @@ mod tests {
         {
             let tags = vec![
                 Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
+                Tag::custom(TagKind::Custom("mls_proposals".into()), ["0x000a"]),
                 Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
                 Tag::custom(TagKind::MlsExtensions, ["0xf2ee"]), // Missing 0x000a (LastResort)
                 Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
@@ -2037,6 +2093,7 @@ mod tests {
         {
             let tags = vec![
                 Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
+                Tag::custom(TagKind::Custom("mls_proposals".into()), ["0x000a"]),
                 Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
                 Tag::custom(TagKind::MlsExtensions, ["0x000a"]), // Missing 0xf2ee (NostrGroupData)
                 Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
@@ -2087,6 +2144,7 @@ mod tests {
         {
             let tags = vec![
                 Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
+                Tag::custom(TagKind::Custom("mls_proposals".into()), ["0x000a"]),
                 Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
                 Tag::custom(TagKind::MlsExtensions, ["0x000A", "0xF2EE"]), // Uppercase hex digits
                 Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
@@ -2110,6 +2168,7 @@ mod tests {
         {
             let tags = vec![
                 Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
+                Tag::custom(TagKind::Custom("mls_proposals".into()), ["0x000a"]),
                 Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
                 Tag::custom(TagKind::MlsExtensions, ["0x000a", "0xF2Ee"]), // Mixed case
                 Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
@@ -2150,6 +2209,7 @@ mod tests {
 
         let tags = vec![
             Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
+            Tag::custom(TagKind::Custom("mls_proposals".into()), ["0x000a"]),
             Tag::custom(TagKind::MlsCiphersuite, Vec::<&str>::new()), // No value
             Tag::custom(TagKind::MlsExtensions, ["0x000a", "0xf2ee"]),
             Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
@@ -2194,6 +2254,7 @@ mod tests {
 
         let tags = vec![
             Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
+            Tag::custom(TagKind::Custom("mls_proposals".into()), ["0x000a"]),
             Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
             Tag::custom(TagKind::MlsExtensions, Vec::<&str>::new()), // No values
             Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
@@ -2273,6 +2334,7 @@ mod tests {
         let incomplete_tags = vec![
             Tag::identifier("deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"),
             Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
+            Tag::custom(TagKind::Custom("mls_proposals".into()), ["0x000a"]),
             // Missing ciphersuite and extensions
         ];
 
@@ -2714,6 +2776,7 @@ mod tests {
         // All required tags present EXCEPT i
         let tags = vec![
             Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
+            Tag::custom(TagKind::Custom("mls_proposals".into()), ["0x000a"]),
             Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
             Tag::custom(TagKind::MlsExtensions, ["0x000a", "0xf2ee"]),
             Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
@@ -2754,6 +2817,7 @@ mod tests {
 
         let tags = vec![
             Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
+            Tag::custom(TagKind::Custom("mls_proposals".into()), ["0x000a"]),
             Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
             Tag::custom(TagKind::MlsExtensions, ["0x000a", "0xf2ee"]),
             Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
@@ -2798,6 +2862,7 @@ mod tests {
 
         let tags = vec![
             Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
+            Tag::custom(TagKind::Custom("mls_proposals".into()), ["0x000a"]),
             Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
             Tag::custom(TagKind::MlsExtensions, ["0x000a", "0xf2ee"]),
             Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
@@ -2839,6 +2904,7 @@ mod tests {
 
         let tags = vec![
             Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
+            Tag::custom(TagKind::Custom("mls_proposals".into()), ["0x000a"]),
             Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
             Tag::custom(TagKind::MlsExtensions, ["0x000a", "0xf2ee"]),
             Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
@@ -2998,6 +3064,7 @@ mod tests {
 
         let tags = vec![
             Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
+            Tag::custom(TagKind::Custom("mls_proposals".into()), ["0x000a"]),
             Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
             Tag::custom(TagKind::MlsExtensions, ["0x000a", "0xf2ee"]),
             Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
@@ -3019,6 +3086,42 @@ mod tests {
             error_msg.contains("must not be empty"),
             "Error should mention empty value, got: {}",
             error_msg
+        );
+    }
+
+    /// Test that parse_key_package accepts bare kind:443 event without d tag and without i tag
+    #[test]
+    fn test_parse_key_package_accepts_bare_legacy_kind_443() {
+        let mdk = create_test_mdk();
+        let keys = nostr::Keys::generate();
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").unwrap()];
+
+        let KeyPackageEventData {
+            content: key_package_str,
+            tags_443: tags,
+            hash_ref: _hash_ref,
+            d_tag: _d_value,
+            ..
+        } = mdk
+            .create_key_package_for_event(&keys.public_key(), relays)
+            .expect("Failed to create key package");
+
+        // Remove i tag for bare kind:443 (d tag is already removed in tags_443)
+        let bare_tags: Vec<Tag> = tags
+            .into_iter()
+            .filter(|t| t.kind() != TagKind::i())
+            .collect();
+
+        let event = EventBuilder::new(MLS_KEY_PACKAGE_KIND_LEGACY, key_package_str)
+            .tags(bare_tags)
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        let result = mdk.parse_key_package(&event);
+        assert!(
+            result.is_ok(),
+            "Should accept bare legacy kind:443 KeyPackage event without d and i tags, got: {:?}",
+            result
         );
     }
 }

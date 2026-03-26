@@ -27,7 +27,7 @@
 
 ### Breaking changes
 
-- **`KeyPackageResult` now includes `d_tag` and `tags_legacy`**: The `KeyPackageResult` struct returned by `create_key_package_for_event` and `create_key_package_for_event_with_options` now includes a `d_tag: String` field containing the 32-byte hex identifier for the KeyPackage slot. This enables callers to reuse the same `d` value when rotating KeyPackages so that relays automatically replace the old event. It also includes `tags_legacy`, which provides the tags without the `d` tag for publishing legacy `kind:443` key packages during the transition period. All test event builders updated to use `kind:30443`. ([#233](https://github.com/marmot-protocol/mdk/pull/233))
+- **`KeyPackageResult` now includes `d_tag` and `tags_legacy`**: The `KeyPackageResult` struct returned by `create_key_package_for_event` and `create_key_package_for_event_with_options` now includes a `d_tag: String` field containing the 32-byte hex identifier for the KeyPackage slot. This enables callers to reuse the same `d` value when rotating KeyPackages so that relays automatically replace the old event. It also includes `tags_legacy`, which provides the tags without the `d` tag. Callers MUST dual-publish both `kind:30443` (using `tags`) and `kind:443` (using `tags_legacy`) until May 1, 2026 so that legacy clients can still discover new key packages. All test event builders updated to use `kind:30443`. ([#233](https://github.com/marmot-protocol/mdk/pull/233))
 
 ### Changed
 
