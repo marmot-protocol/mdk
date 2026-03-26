@@ -1439,20 +1439,40 @@ where
     /// temporarily switches the wire format policy to allow the PublicMessage, then
     /// restores it. This preserves PrivateMessage for all other group operations.
     ///
-    /// For legacy groups (PURE_CIPHERTEXT, created before SelfRemove support), falls
-    /// back to a Remove proposal where sender == removed member.
+    /// For legacy groups (PURE_CIPHERTEXT, created before SelfRemove support), peers
+    /// reject PublicMessage on the incoming side. These groups fall back to a Remove
+    /// proposal where sender == removed member.
     fn try_self_remove(
         &self,
         group: &mut MlsGroup,
         signer: &SignatureKeyPair,
     ) -> Result<MlsMessageOut, Error> {
+        // Legacy groups (PURE_CIPHERTEXT) have AlwaysCiphertext incoming on all peers.
+        // A PublicMessage SelfRemove would be rejected with IncompatibleWireFormat.
+        // Fall back to Remove immediately — don't bother switching config.
+        //
+        // MIXED_CIPHERTEXT groups also have AlwaysCiphertext outgoing but Mixed
+        // incoming — they CAN accept PublicMessage SelfRemove.
+        if matches!(
+            group.configuration().wire_format_policy().incoming(),
+            IncomingWireFormatPolicy::AlwaysCiphertext
+        ) {
+            tracing::debug!(
+                target: "mdk_core::groups::leave_group",
+                "SelfRemove unavailable (legacy group with PURE_CIPHERTEXT), \
+                 falling back to Remove proposal"
+            );
+            return group
+                .leave_group(&self.provider, signer)
+                .map_err(|e| Error::Group(e.to_string()));
+        }
+
+        // MIXED_CIPHERTEXT groups: temporarily switch to plaintext for SelfRemove.
         let sender_ratchet_config = SenderRatchetConfiguration::new(
             self.config.out_of_order_tolerance,
             self.config.maximum_forward_distance,
         );
 
-        // Temporarily allow plaintext outgoing for the SelfRemove proposal.
-        // SelfRemove MUST be sent as PublicMessage per the MLS Extensions draft.
         let plaintext_config = MlsGroupJoinConfig::builder()
             .wire_format_policy(MIXED_PLAINTEXT_WIRE_FORMAT_POLICY)
             .use_ratchet_tree_extension(true)
@@ -1482,21 +1502,7 @@ where
             );
         }
 
-        match result {
-            Ok(msg) => Ok(msg),
-            Err(openmls::group::LeaveGroupError::CannotSelfRemoveWithPureCiphertext) => {
-                // This shouldn't happen after the config switch, but handle it defensively
-                // for legacy groups that might have been created with PURE_CIPHERTEXT.
-                tracing::debug!(
-                    target: "mdk_core::groups::leave_group",
-                    "SelfRemove unavailable (legacy group), falling back to Remove proposal"
-                );
-                group
-                    .leave_group(&self.provider, signer)
-                    .map_err(|e| Error::Group(e.to_string()))
-            }
-            Err(e) => Err(Error::Group(e.to_string())),
-        }
+        result.map_err(|e| Error::Group(e.to_string()))
     }
 
     /// Create a proposal to leave the group
@@ -5359,6 +5365,135 @@ mod tests {
             pending.is_empty(),
             "No pending removals after SelfRemove auto-commit"
         );
+
+        // After merging, Bob should no longer be in the group from Charlie's POV
+        charlie_mdk
+            .merge_pending_commit(&group_id)
+            .expect("Charlie should merge pending commit");
+
+        let members = charlie_mdk
+            .get_members(&group_id)
+            .expect("Should get members");
+        assert!(
+            !members.contains(&bob_keys.public_key()),
+            "Bob should no longer be in the group after SelfRemove"
+        );
+    }
+
+    /// Tests that SelfRemove works end-to-end with multiple members and the group
+    /// remains functional afterward.
+    ///
+    /// Models the realistic relay flow: Bob sends SelfRemove, Charlie auto-commits
+    /// (first to the relay), Alice and Dave process Charlie's commit. All remaining
+    /// members converge and can exchange messages.
+    #[test]
+    fn test_self_remove_group_remains_functional() {
+        use crate::messages::MessageProcessingResult;
+        use crate::test_util::create_key_package_event;
+
+        let alice_keys = Keys::generate();
+        let bob_keys = Keys::generate();
+        let charlie_keys = Keys::generate();
+        let dave_keys = Keys::generate();
+
+        let alice_mdk = create_test_mdk();
+        let bob_mdk = create_test_mdk();
+        let charlie_mdk = create_test_mdk();
+        let dave_mdk = create_test_mdk();
+
+        let admins = vec![alice_keys.public_key()];
+
+        let bob_kp = create_key_package_event(&bob_mdk, &bob_keys);
+        let charlie_kp = create_key_package_event(&charlie_mdk, &charlie_keys);
+        let dave_kp = create_key_package_event(&dave_mdk, &dave_keys);
+
+        let create_result = alice_mdk
+            .create_group(
+                &alice_keys.public_key(),
+                vec![bob_kp, charlie_kp, dave_kp],
+                create_nostr_group_config_data(admins),
+            )
+            .expect("Alice should create group");
+
+        let group_id = create_result.group.mls_group_id.clone();
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("Alice should merge commit");
+
+        for (mdk, keys, idx) in [
+            (&bob_mdk, &bob_keys, 0),
+            (&charlie_mdk, &charlie_keys, 1),
+            (&dave_mdk, &dave_keys, 2),
+        ] {
+            let welcome = &create_result.welcome_rumors[idx];
+            let preview = mdk
+                .process_welcome(&nostr::EventId::all_zeros(), welcome)
+                .unwrap_or_else(|_| panic!("{:?} should process welcome", keys.public_key()));
+            mdk.accept_welcome(&preview)
+                .unwrap_or_else(|_| panic!("{:?} should accept welcome", keys.public_key()));
+        }
+
+        // Bob sends SelfRemove
+        let bob_leave = bob_mdk.leave_group(&group_id).expect("Bob should leave");
+
+        // Charlie is first online — auto-commits Bob's SelfRemove
+        let charlie_result = charlie_mdk
+            .process_message(&bob_leave.evolution_event)
+            .expect("Charlie should process SelfRemove");
+
+        let charlie_commit = match charlie_result {
+            MessageProcessingResult::Proposal(update) => update.evolution_event,
+            other => panic!("Charlie should auto-commit, got: {:?}", other),
+        };
+
+        charlie_mdk
+            .merge_pending_commit(&group_id)
+            .expect("Charlie should merge commit");
+
+        // Alice and Dave receive Charlie's commit from the relay.
+        // They process Bob's SelfRemove proposal first (needed to resolve the
+        // reference in Charlie's commit), then the commit itself.
+        for (name, mdk) in [("Alice", &alice_mdk), ("Dave", &dave_mdk)] {
+            // Process Bob's proposal (stores it; will auto-commit but Charlie's
+            // commit supersedes our auto-commit when we process it next)
+            let _ = mdk.process_message(&bob_leave.evolution_event);
+
+            // Process Charlie's commit — this is the "winning" commit from the relay
+            let commit_result = mdk.process_message(&charlie_commit);
+            assert!(
+                commit_result.is_ok(),
+                "{name} should process Charlie's commit: {:?}",
+                commit_result.err()
+            );
+        }
+
+        // All members agree: Bob is gone
+        for (name, mdk) in [
+            ("Alice", &alice_mdk),
+            ("Charlie", &charlie_mdk),
+            ("Dave", &dave_mdk),
+        ] {
+            let members = mdk.get_members(&group_id).expect("Should get members");
+            assert!(
+                !members.contains(&bob_keys.public_key()),
+                "Bob should be removed from {name}'s group"
+            );
+        }
+
+        // Group is still functional: Charlie sends, Alice and Dave can read
+        let rumor = crate::test_util::create_test_rumor(&charlie_keys, "post-departure message");
+        let charlie_msg = charlie_mdk
+            .create_message(&group_id, rumor)
+            .expect("Charlie should send a message after SelfRemove");
+
+        for (name, mdk) in [("Alice", &alice_mdk), ("Dave", &dave_mdk)] {
+            let result = mdk.process_message(&charlie_msg);
+            assert!(
+                result.is_ok(),
+                "{name} should read Charlie's post-departure message: {:?}",
+                result.err()
+            );
+        }
     }
 
     /// Tests that pending_member_changes returns empty when there are no pending proposals.
