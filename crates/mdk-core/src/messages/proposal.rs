@@ -24,7 +24,8 @@ where
     /// This internal function handles MLS proposal messages according to the Marmot protocol:
     ///
     /// - **Add/Remove member proposals**: Always stored as pending for admin approval via manual commit
-    /// - **Self-remove (leave) proposals**: Auto-committed if receiver is admin, otherwise pending
+    /// - **Self-remove (leave) proposals**: Legacy Remove-based: auto-committed by admins, pending for non-admins
+    /// - **SelfRemove proposals**: Auto-committed by any member (new protocol, MLS Extensions draft)
     /// - **Extension/ciphersuite proposals**: Ignored with warning (admins should create commits directly)
     /// - **Update proposals**: Out of scope (see issue #59)
     ///
@@ -261,7 +262,7 @@ where
         self.save_processed_message_record(processed_message)
     }
 
-    /// Stores a proposal and immediately auto-commits it (for self-remove by admin)
+    /// Stores a proposal and immediately auto-commits it
     pub(super) fn auto_commit_proposal(
         &self,
         mls_group: &mut MlsGroup,
@@ -290,7 +291,7 @@ where
 
         tracing::debug!(
             target: "mdk_core::messages::process_proposal",
-            "Admin auto-committed self-remove proposal"
+            "Auto-committed self-remove proposal"
         );
 
         Ok(MessageProcessingResult::Proposal(UpdateGroupResult {

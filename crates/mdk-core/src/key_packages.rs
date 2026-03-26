@@ -38,6 +38,7 @@ where
     ///   - `mls_protocol_version` - MLS protocol version (e.g., "1.0")
     ///   - `mls_ciphersuite` - Ciphersuite identifier (e.g., "0x0001")
     ///   - `mls_extensions` - Required MLS extensions
+    ///   - `mls_proposals` - Supported proposal types (e.g., "0x000a")
     ///   - `relays` - Relay URLs for distribution
     ///   - `i` - Hex-encoded KeyPackageRef for efficient relay queries (MIP-00)
     ///   - `client` - Client identifier and version
@@ -108,8 +109,8 @@ where
     ///
     /// The `protected` parameter controls whether the NIP-70 protected tag (`["-"]`) is
     /// included in the output tags. When `true`, the tag is inserted between the `i`
-    /// and `client` tags, resulting in 8 total tags. When `false`, the protected tag is
-    /// omitted, resulting in 7 total tags.
+    /// and `client` tags, resulting in 9 total tags. When `false`, the protected tag is
+    /// omitted, resulting in 8 total tags.
     fn create_key_package_for_event_internal<I>(
         &self,
         public_key: &PublicKey,
