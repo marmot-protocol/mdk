@@ -26,7 +26,3 @@ Plans/
 
 # Android build artifacts
 **/jniLibs/
-
-# Git worktrees
-/trees/*
-!/trees/.gitkeep
