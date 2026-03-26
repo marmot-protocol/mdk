@@ -45,6 +45,7 @@ async fn main() -> Result<(), Error> {
     let mdk_core::key_packages::KeyPackageEventData {
         content: key_package_encoded,
         tags_30443: tags,
+        tags_443: legacy_tags,
         ..
     } = mdk.create_key_package_for_event_with_options(
         &keys.public_key(),
@@ -86,8 +87,16 @@ async fn main() -> Result<(), Error> {
         .sign(&keys)
         .await?;
 
+    let legacy_key_package_event =
+        EventBuilder::new(Kind::Custom(443), key_package_encoded.clone())
+            .tags(legacy_tags)
+            .build(keys.public_key())
+            .sign(&keys)
+            .await?;
+
     println!("Event Details:");
     println!("  Event ID: {}", key_package_event.id);
+    println!("  Legacy Event ID: {}", legacy_key_package_event.id);
     println!("  Kind: {:?}", key_package_event.kind);
     println!("  Author: {}", key_package_event.pubkey);
     println!("  Created at: {}", key_package_event.created_at);
