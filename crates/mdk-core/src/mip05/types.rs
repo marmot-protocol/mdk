@@ -7,7 +7,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 use super::{ENCRYPTED_TOKEN_LEN, Mip05Error, TOKEN_PLAINTEXT_LEN};
 
 /// Supported push-notification platforms for MIP-05.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum NotificationPlatform {
     /// Apple Push Notification service.
     Apns,
@@ -39,15 +39,6 @@ impl NotificationPlatform {
             Self::Fcm if (1..=200).contains(&len) => Ok(()),
             Self::Apns => Err(Mip05Error::InvalidApnsTokenLength),
             Self::Fcm => Err(Mip05Error::InvalidFcmTokenLength),
-        }
-    }
-}
-
-impl fmt::Debug for NotificationPlatform {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Apns => f.write_str("Apns"),
-            Self::Fcm => f.write_str("Fcm"),
         }
     }
 }

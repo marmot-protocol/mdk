@@ -57,10 +57,7 @@ pub fn build_token_list_response_rumor(
 }
 
 /// Build an unsigned `kind:449` MIP-05 token removal rumor.
-pub fn build_token_removal_rumor(
-    pubkey: nostr::PublicKey,
-    created_at: Timestamp,
-) -> Result<UnsignedEvent, Mip05Error> {
+pub fn build_token_removal_rumor(pubkey: nostr::PublicKey, created_at: Timestamp) -> UnsignedEvent {
     let mut rumor = UnsignedEvent::new(
         pubkey,
         created_at,
@@ -69,7 +66,7 @@ pub fn build_token_removal_rumor(
         String::new(),
     );
     rumor.ensure_id();
-    Ok(rumor)
+    rumor
 }
 
 /// Parse an MIP-05 rumor from a stored processed message.
@@ -96,7 +93,6 @@ pub fn parse_group_message_rumor(event: &UnsignedEvent) -> Result<Mip05GroupMess
 }
 
 fn parse_token_request_rumor(event: &UnsignedEvent) -> Result<TokenRequest, Mip05Error> {
-    validate_exact_kind(event, TOKEN_REQUEST_KIND)?;
     validate_empty_content(event)?;
 
     let mut tokens = Vec::new();
@@ -117,7 +113,6 @@ fn parse_token_request_rumor(event: &UnsignedEvent) -> Result<TokenRequest, Mip0
 }
 
 fn parse_token_list_response_rumor(event: &UnsignedEvent) -> Result<TokenListResponse, Mip05Error> {
-    validate_exact_kind(event, TOKEN_LIST_RESPONSE_KIND)?;
     validate_empty_content(event)?;
 
     let mut tokens = Vec::new();
@@ -152,7 +147,6 @@ fn parse_token_list_response_rumor(event: &UnsignedEvent) -> Result<TokenListRes
 }
 
 fn parse_token_removal_rumor(event: &UnsignedEvent) -> Result<TokenRemoval, Mip05Error> {
-    validate_exact_kind(event, TOKEN_REMOVAL_KIND)?;
     validate_empty_content(event)?;
 
     if !event.tags.is_empty() {
@@ -243,13 +237,6 @@ fn validate_empty_content(event: &UnsignedEvent) -> Result<(), Mip05Error> {
     Ok(())
 }
 
-fn validate_exact_kind(event: &UnsignedEvent, expected_kind: u16) -> Result<(), Mip05Error> {
-    if event.kind != Kind::from(expected_kind) {
-        return Err(Mip05Error::UnexpectedRumorKind);
-    }
-    Ok(())
-}
-
 fn validate_unique_leaf_indices(tokens: &[LeafTokenTag]) -> Result<(), Mip05Error> {
     let unique_leaf_indices: BTreeSet<u32> = tokens.iter().map(|token| token.leaf_index).collect();
     if unique_leaf_indices.len() != tokens.len() {
@@ -328,7 +315,7 @@ mod tests {
     fn test_parse_group_message_from_stored_message() {
         let sender_keys = Keys::generate();
         let mut rumor =
-            build_token_removal_rumor(sender_keys.public_key(), Timestamp::from(789u64)).unwrap();
+            build_token_removal_rumor(sender_keys.public_key(), Timestamp::from(789u64));
         let message = message_types::Message {
             id: rumor.id(),
             pubkey: rumor.pubkey,

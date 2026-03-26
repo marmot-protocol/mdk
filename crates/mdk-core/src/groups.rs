@@ -5914,8 +5914,6 @@ mod tests {
 
     #[test]
     fn test_group_leaf_map_preserves_tree_holes() {
-        use crate::test_util::create_key_package_event;
-
         let alice_keys = Keys::generate();
         let bob_keys = Keys::generate();
         let charlie_keys = Keys::generate();
