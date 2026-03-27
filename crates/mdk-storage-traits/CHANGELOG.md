@@ -31,6 +31,12 @@
 
 ### Changed
 
+- Replaced hand-written `Display`, `FromStr`, `Serialize`, and `Deserialize` impls on `GroupState`, `MessageState`, `WelcomeState`, `ProcessedMessageState`, and `ProcessedWelcomeState` with a declarative `string_enum!` macro.
+- Replaced hand-written `Pagination` structs and limit-validation functions in groups, messages, and welcomes modules with a `bounded_pagination!` macro.
+- Replaced manual `Error` + `Display` impls on `GroupError`, `MessageError`, and `WelcomeError` with a `storage_error!` macro backed by `thiserror`.
+- Extracted shared group and welcome validation logic into `groups::validation` and `welcomes::validation` modules.
+- Removed ~700 lines of duplicated test functions from `test_utils::cross_storage` that had already been migrated to `mdk-core/tests/shared/`.
+
 ### Added
 
 - `GroupStorage::get_group_legacy_exporter_secret` and `GroupStorage::save_group_legacy_exporter_secret` store and retrieve preserved pre-0.7.0 exporter-secret bytes for the temporary migration-compatibility window, returning a group-scoped secret when one was preserved for that epoch. ([#222](https://github.com/marmot-protocol/mdk/pull/222))
