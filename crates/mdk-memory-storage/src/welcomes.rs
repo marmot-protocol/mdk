@@ -2,6 +2,7 @@
 
 use mdk_storage_traits::welcomes::error::WelcomeError;
 use mdk_storage_traits::welcomes::types::*;
+use mdk_storage_traits::welcomes::validation::validate_welcome_fields;
 use mdk_storage_traits::welcomes::{Pagination, WelcomeStorage, validate_pending_welcomes_limit};
 use nostr::EventId;
 
@@ -9,33 +10,13 @@ use crate::MdkMemoryStorage;
 
 impl WelcomeStorage for MdkMemoryStorage {
     fn save_welcome(&self, welcome: Welcome) -> Result<(), WelcomeError> {
-        // Validate relay count to prevent memory exhaustion
-        if welcome.group_relays.len() > self.limits.max_relays_per_welcome {
-            return Err(WelcomeError::InvalidParameters(format!(
-                "Welcome relay count exceeds maximum of {} (got {})",
-                self.limits.max_relays_per_welcome,
-                welcome.group_relays.len()
-            )));
-        }
-
-        // Validate individual relay URL lengths
-        for relay in &welcome.group_relays {
-            if relay.as_str().len() > self.limits.max_relay_url_length {
-                return Err(WelcomeError::InvalidParameters(format!(
-                    "Relay URL exceeds maximum length of {} bytes",
-                    self.limits.max_relay_url_length
-                )));
-            }
-        }
-
-        // Validate admin pubkeys count to prevent memory exhaustion
-        if welcome.group_admin_pubkeys.len() > self.limits.max_admins_per_welcome {
-            return Err(WelcomeError::InvalidParameters(format!(
-                "Welcome admin count exceeds maximum of {} (got {})",
-                self.limits.max_admins_per_welcome,
-                welcome.group_admin_pubkeys.len()
-            )));
-        }
+        validate_welcome_fields(
+            &welcome.group_relays,
+            welcome.group_admin_pubkeys.len(),
+            self.limits.max_relays_per_welcome,
+            self.limits.max_relay_url_length,
+            self.limits.max_admins_per_welcome,
+        )?;
 
         let mut inner = self.inner.write();
         inner.welcomes_cache.put(welcome.id, welcome);

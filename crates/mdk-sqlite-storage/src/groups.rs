@@ -5,6 +5,7 @@ use std::collections::BTreeSet;
 use mdk_storage_traits::GroupId;
 use mdk_storage_traits::groups::error::GroupError;
 use mdk_storage_traits::groups::types::{Group, GroupExporterSecret, GroupRelay, SelfUpdateState};
+use mdk_storage_traits::groups::validation::validate_group_fields;
 use mdk_storage_traits::groups::{
     GroupStorage, MessageSortOrder, Pagination, group_not_found, validate_message_limit,
 };
@@ -15,7 +16,7 @@ use rusqlite::{OptionalExtension, params};
 use crate::db::{Hash32, Nonce12};
 use crate::validation::{
     MAX_ADMIN_PUBKEYS_JSON_SIZE, MAX_GROUP_DESCRIPTION_LENGTH, MAX_GROUP_NAME_LENGTH,
-    validate_size, validate_string_length,
+    validate_size,
 };
 use crate::{MdkSqliteStorage, db};
 
@@ -127,16 +128,12 @@ impl GroupStorage for MdkSqliteStorage {
     }
 
     fn save_group(&self, group: Group) -> Result<(), GroupError> {
-        // Validate group name and description lengths
-        validate_string_length(&group.name, MAX_GROUP_NAME_LENGTH, "Group name")
-            .map_err(|e| GroupError::InvalidParameters(e.to_string()))?;
-
-        validate_string_length(
-            &group.description,
+        validate_group_fields(
+            &group,
+            MAX_GROUP_NAME_LENGTH,
             MAX_GROUP_DESCRIPTION_LENGTH,
-            "Group description",
-        )
-        .map_err(|e| GroupError::InvalidParameters(e.to_string()))?;
+            usize::MAX, // admin count checked via JSON size below
+        )?;
 
         let admin_pubkeys_json: String =
             serde_json::to_string(&group.admin_pubkeys).map_err(|e| {

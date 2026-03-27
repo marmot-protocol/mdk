@@ -17,7 +17,7 @@ db_error_fn!(into_welcome_err, WelcomeError);
 
 impl WelcomeStorage for MdkSqliteStorage {
     fn save_welcome(&self, welcome: Welcome) -> Result<(), WelcomeError> {
-        // Validate group name and description lengths
+        // Validate domain constraints (shared across backends)
         validate_string_length(&welcome.group_name, MAX_GROUP_NAME_LENGTH, "Group name")
             .map_err(|e| WelcomeError::InvalidParameters(e.to_string()))?;
 
@@ -34,7 +34,7 @@ impl WelcomeStorage for MdkSqliteStorage {
                 WelcomeError::DatabaseError(format!("Failed to serialize admin pubkeys: {}", e))
             })?;
 
-        // Validate admin pubkeys JSON size
+        // Validate serialized sizes (SQLite-specific)
         validate_size(
             group_admin_pubkeys_json.as_bytes(),
             MAX_ADMIN_PUBKEYS_JSON_SIZE,

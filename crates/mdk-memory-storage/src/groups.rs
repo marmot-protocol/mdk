@@ -5,6 +5,7 @@ use std::collections::BTreeSet;
 use mdk_storage_traits::GroupId;
 use mdk_storage_traits::groups::error::GroupError;
 use mdk_storage_traits::groups::types::*;
+use mdk_storage_traits::groups::validation::{validate_group_fields, validate_relay_set};
 use mdk_storage_traits::groups::{
     GroupStorage, MessageSortOrder, Pagination, group_not_found, validate_message_limit,
 };
@@ -38,32 +39,12 @@ fn newest_message<'a>(
 
 impl GroupStorage for MdkMemoryStorage {
     fn save_group(&self, group: Group) -> Result<(), GroupError> {
-        // Validate group name length
-        if group.name.len() > self.limits.max_group_name_length {
-            return Err(GroupError::InvalidParameters(format!(
-                "Group name exceeds maximum length of {} bytes (got {} bytes)",
-                self.limits.max_group_name_length,
-                group.name.len()
-            )));
-        }
-
-        // Validate group description length
-        if group.description.len() > self.limits.max_group_description_length {
-            return Err(GroupError::InvalidParameters(format!(
-                "Group description exceeds maximum length of {} bytes (got {} bytes)",
-                self.limits.max_group_description_length,
-                group.description.len()
-            )));
-        }
-
-        // Validate admin pubkeys count
-        if group.admin_pubkeys.len() > self.limits.max_admins_per_group {
-            return Err(GroupError::InvalidParameters(format!(
-                "Group admin count exceeds maximum of {} (got {})",
-                self.limits.max_admins_per_group,
-                group.admin_pubkeys.len()
-            )));
-        }
+        validate_group_fields(
+            &group,
+            self.limits.max_group_name_length,
+            self.limits.max_group_description_length,
+            self.limits.max_admins_per_group,
+        )?;
 
         // Acquire lock on inner storage
         let mut guard = self.inner.write();
@@ -203,24 +184,11 @@ impl GroupStorage for MdkMemoryStorage {
         group_id: &GroupId,
         relays: BTreeSet<RelayUrl>,
     ) -> Result<(), GroupError> {
-        // Validate relay count to prevent memory exhaustion
-        if relays.len() > self.limits.max_relays_per_group {
-            return Err(GroupError::InvalidParameters(format!(
-                "Relay count exceeds maximum of {} (got {})",
-                self.limits.max_relays_per_group,
-                relays.len()
-            )));
-        }
-
-        // Validate individual relay URL lengths
-        for relay in &relays {
-            if relay.as_str().len() > self.limits.max_relay_url_length {
-                return Err(GroupError::InvalidParameters(format!(
-                    "Relay URL exceeds maximum length of {} bytes",
-                    self.limits.max_relay_url_length
-                )));
-            }
-        }
+        validate_relay_set(
+            &relays,
+            self.limits.max_relays_per_group,
+            self.limits.max_relay_url_length,
+        )?;
 
         let mut inner = self.inner.write();
 

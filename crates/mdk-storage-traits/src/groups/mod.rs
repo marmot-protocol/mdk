@@ -14,6 +14,7 @@ use nostr::{PublicKey, RelayUrl, Timestamp};
 
 pub mod error;
 pub mod types;
+pub mod validation;
 
 use self::error::GroupError;
 use self::types::*;

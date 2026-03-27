@@ -11,6 +11,7 @@ use nostr::EventId;
 
 pub mod error;
 pub mod types;
+pub mod validation;
 
 use self::error::WelcomeError;
 use self::types::*;
