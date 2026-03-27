@@ -7,6 +7,72 @@
 
 use openmls_traits::storage::StorageProvider;
 
+macro_rules! string_enum {
+    (
+        $(#[$enum_meta:meta])*
+        $vis:vis enum $name:ident => $error_ty:ty, $invalid_message:literal {
+            $(
+                $(#[$variant_meta:meta])*
+                $variant:ident => $value:literal
+            ),+ $(,)?
+        }
+    ) => {
+        $(#[$enum_meta])*
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        $vis enum $name {
+            $(
+                $(#[$variant_meta])*
+                $variant,
+            )+
+        }
+
+        impl $name {
+            /// Get as `&str`
+            pub fn as_str(&self) -> &str {
+                match self {
+                    $(Self::$variant => $value,)+
+                }
+            }
+        }
+
+        impl std::fmt::Display for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "{}", self.as_str())
+            }
+        }
+
+        impl std::str::FromStr for $name {
+            type Err = $error_ty;
+
+            fn from_str(s: &str) -> Result<Self, Self::Err> {
+                match s {
+                    $($value => Ok(Self::$variant),)+
+                    _ => Err(<$error_ty>::InvalidParameters(format!($invalid_message, s))),
+                }
+            }
+        }
+
+        impl serde::Serialize for $name {
+            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                serializer.serialize_str(self.as_str())
+            }
+        }
+
+        impl<'de> serde::Deserialize<'de> for $name {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                let s: String = String::deserialize(deserializer)?;
+                Self::from_str(&s).map_err(serde::de::Error::custom)
+            }
+        }
+    };
+}
+
 pub mod error;
 pub mod group_id;
 pub mod groups;

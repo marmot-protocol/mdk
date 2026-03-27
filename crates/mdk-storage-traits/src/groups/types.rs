@@ -1,7 +1,6 @@
 //! Types for the groups module
 
 use std::collections::BTreeSet;
-use std::fmt;
 use std::str::FromStr;
 
 use crate::messages::types::Message;
@@ -56,66 +55,15 @@ impl<'de> Deserialize<'de> for SelfUpdateState {
     }
 }
 
-/// The state of the group, this matches the MLS group state
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum GroupState {
-    /// The group is active
-    Active,
-    /// The group is inactive, this is used for groups that users have left or for welcome messages that have been declined
-    Inactive,
-    /// The group is pending, this is used for groups that users are invited to but haven't joined yet
-    Pending,
-}
-
-impl fmt::Display for GroupState {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.as_str())
-    }
-}
-
-impl GroupState {
-    /// Get as `&str`
-    pub fn as_str(&self) -> &str {
-        match self {
-            Self::Active => "active",
-            Self::Inactive => "inactive",
-            Self::Pending => "pending",
-        }
-    }
-}
-
-impl FromStr for GroupState {
-    type Err = GroupError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "active" => Ok(Self::Active),
-            "inactive" => Ok(Self::Inactive),
-            "pending" => Ok(Self::Pending),
-            _ => Err(GroupError::InvalidParameters(format!(
-                "Invalid group state: {}",
-                s
-            ))),
-        }
-    }
-}
-
-impl Serialize for GroupState {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(self.as_str())
-    }
-}
-
-impl<'de> Deserialize<'de> for GroupState {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let s: String = String::deserialize(deserializer)?;
-        Self::from_str(&s).map_err(serde::de::Error::custom)
+string_enum! {
+    /// The state of the group, this matches the MLS group state
+    pub enum GroupState => GroupError, "Invalid group state: {}" {
+        /// The group is active
+        Active => "active",
+        /// The group is inactive, this is used for groups that users have left or for welcome messages that have been declined
+        Inactive => "inactive",
+        /// The group is pending, this is used for groups that users are invited to but haven't joined yet
+        Pending => "pending",
     }
 }
 

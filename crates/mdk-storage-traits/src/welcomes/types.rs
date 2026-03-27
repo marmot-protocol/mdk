@@ -1,12 +1,11 @@
 //! Types for the welcomes module
 
 use std::collections::BTreeSet;
-use std::fmt;
 use std::str::FromStr;
 
 use crate::{GroupId, Secret};
 use nostr::{EventId, PublicKey, RelayUrl, Timestamp, UnsignedEvent};
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Serialize};
 
 use super::error::WelcomeError;
 
@@ -60,129 +59,27 @@ pub struct Welcome {
     pub wrapper_event_id: EventId,
 }
 
-/// The processing state of a welcome
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum ProcessedWelcomeState {
-    /// The welcome was successfully processed and stored in the database
-    Processed,
-    /// The welcome failed to be processed and stored in the database
-    Failed,
-}
-
-impl fmt::Display for ProcessedWelcomeState {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.as_str())
+string_enum! {
+    /// The processing state of a welcome
+    pub enum ProcessedWelcomeState => WelcomeError, "Invalid processed welcome state: {}" {
+        /// The welcome was successfully processed and stored in the database
+        Processed => "processed",
+        /// The welcome failed to be processed and stored in the database
+        Failed => "failed",
     }
 }
 
-impl ProcessedWelcomeState {
-    /// Get as `&str`
-    pub fn as_str(&self) -> &str {
-        match self {
-            Self::Processed => "processed",
-            Self::Failed => "failed",
-        }
-    }
-}
-
-impl FromStr for ProcessedWelcomeState {
-    type Err = WelcomeError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "processed" => Ok(Self::Processed),
-            "failed" => Ok(Self::Failed),
-            _ => Err(WelcomeError::InvalidParameters(format!(
-                "Invalid processed welcome state: {}",
-                s
-            ))),
-        }
-    }
-}
-
-impl Serialize for ProcessedWelcomeState {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(self.as_str())
-    }
-}
-
-impl<'de> Deserialize<'de> for ProcessedWelcomeState {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let s: String = String::deserialize(deserializer)?;
-        Self::from_str(&s).map_err(serde::de::Error::custom)
-    }
-}
-
-/// The state of a welcome
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum WelcomeState {
-    /// The welcome is pending
-    Pending,
-    /// The welcome was accepted
-    Accepted,
-    /// The welcome was declined
-    Declined,
-    /// The welcome was ignored
-    Ignored,
-}
-
-impl fmt::Display for WelcomeState {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.as_str())
-    }
-}
-
-impl WelcomeState {
-    /// Get as `&str`
-    pub fn as_str(&self) -> &str {
-        match self {
-            Self::Pending => "pending",
-            Self::Accepted => "accepted",
-            Self::Declined => "declined",
-            Self::Ignored => "ignored",
-        }
-    }
-}
-
-impl FromStr for WelcomeState {
-    type Err = WelcomeError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "pending" => Ok(Self::Pending),
-            "accepted" => Ok(Self::Accepted),
-            "declined" => Ok(Self::Declined),
-            "ignored" => Ok(Self::Ignored),
-            _ => Err(WelcomeError::InvalidParameters(format!(
-                "Invalid welcome state: {}",
-                s
-            ))),
-        }
-    }
-}
-
-impl Serialize for WelcomeState {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(self.as_str())
-    }
-}
-
-impl<'de> Deserialize<'de> for WelcomeState {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let s: String = String::deserialize(deserializer)?;
-        Self::from_str(&s).map_err(serde::de::Error::custom)
+string_enum! {
+    /// The state of a welcome
+    pub enum WelcomeState => WelcomeError, "Invalid welcome state: {}" {
+        /// The welcome is pending
+        Pending => "pending",
+        /// The welcome was accepted
+        Accepted => "accepted",
+        /// The welcome was declined
+        Declined => "declined",
+        /// The welcome was ignored
+        Ignored => "ignored",
     }
 }
 
