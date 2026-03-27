@@ -117,167 +117,86 @@ pub const DEFAULT_MAX_ADMINS_PER_WELCOME: usize = 100;
 /// This prevents oversized relay URLs from consuming excessive memory.
 pub const DEFAULT_MAX_RELAY_URL_LENGTH: usize = 512;
 
-/// Configurable validation limits for memory storage.
-///
-/// This struct allows customization of the various limits used to prevent
-/// memory exhaustion attacks. All limits have sensible defaults that can
-/// be overridden using the builder pattern.
-///
-/// # Example
-///
-/// ```rust
-/// use mdk_memory_storage::ValidationLimits;
-///
-/// let limits = ValidationLimits::default()
-///     .with_cache_size(2000)
-///     .with_max_messages_per_group(5000)
-///     .with_max_relays_per_group(50);
-/// ```
-#[derive(Debug, Clone, Copy)]
-pub struct ValidationLimits {
-    /// Maximum number of items in each LRU cache
-    pub cache_size: usize,
-    /// Maximum number of relays allowed per group
-    pub max_relays_per_group: usize,
-    /// Maximum number of messages stored per group
-    pub max_messages_per_group: usize,
-    /// Maximum length of a group name in bytes
-    pub max_group_name_length: usize,
-    /// Maximum length of a group description in bytes
-    pub max_group_description_length: usize,
-    /// Maximum number of admin pubkeys per group
-    pub max_admins_per_group: usize,
-    /// Maximum number of relays in a welcome message
-    pub max_relays_per_welcome: usize,
-    /// Maximum number of admin pubkeys in a welcome message
-    pub max_admins_per_welcome: usize,
-    /// Maximum length of a relay URL in bytes
-    pub max_relay_url_length: usize,
-}
-
-impl Default for ValidationLimits {
-    fn default() -> Self {
-        Self {
-            cache_size: DEFAULT_CACHE_SIZE.get(),
-            max_relays_per_group: DEFAULT_MAX_RELAYS_PER_GROUP,
-            max_messages_per_group: DEFAULT_MAX_MESSAGES_PER_GROUP,
-            max_group_name_length: DEFAULT_MAX_GROUP_NAME_LENGTH,
-            max_group_description_length: DEFAULT_MAX_GROUP_DESCRIPTION_LENGTH,
-            max_admins_per_group: DEFAULT_MAX_ADMINS_PER_GROUP,
-            max_relays_per_welcome: DEFAULT_MAX_RELAYS_PER_WELCOME,
-            max_admins_per_welcome: DEFAULT_MAX_ADMINS_PER_WELCOME,
-            max_relay_url_length: DEFAULT_MAX_RELAY_URL_LENGTH,
+/// Declares the `ValidationLimits` struct, its `Default` impl, and `with_*`
+/// builder methods from a single field table.
+macro_rules! validation_limits {
+    ($(
+        $(#[doc = $doc:expr])*
+        $field:ident => $default:expr
+    ),+ $(,)?) => {
+        /// Configurable validation limits for memory storage.
+        ///
+        /// This struct allows customization of the various limits used to prevent
+        /// memory exhaustion attacks. All limits have sensible defaults that can
+        /// be overridden using the builder pattern.
+        ///
+        /// # Example
+        ///
+        /// ```rust
+        /// use mdk_memory_storage::ValidationLimits;
+        ///
+        /// let limits = ValidationLimits::default()
+        ///     .with_cache_size(2000)
+        ///     .with_max_messages_per_group(5000)
+        ///     .with_max_relays_per_group(50);
+        /// ```
+        #[derive(Debug, Clone, Copy)]
+        pub struct ValidationLimits {
+            $(
+                $(#[doc = $doc])*
+                pub $field: usize,
+            )+
         }
-    }
+
+        impl Default for ValidationLimits {
+            fn default() -> Self {
+                Self {
+                    $($field: $default,)+
+                }
+            }
+        }
+
+        impl ValidationLimits {
+            /// Creates a new `ValidationLimits` with default values.
+            pub fn new() -> Self {
+                Self::default()
+            }
+
+            $(
+                pastey::paste! {
+                    /// # Panics
+                    ///
+                    /// Panics if `limit` is 0.
+                    pub fn [<with_ $field>](mut self, limit: usize) -> Self {
+                        assert!(limit > 0, concat!(stringify!($field), " must be greater than 0"));
+                        self.$field = limit;
+                        self
+                    }
+                }
+            )+
+        }
+    };
 }
 
-impl ValidationLimits {
-    /// Creates a new `ValidationLimits` with default values.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Sets the maximum number of items in each LRU cache.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `size` is 0.
-    pub fn with_cache_size(mut self, size: usize) -> Self {
-        assert!(size > 0, "cache_size must be greater than 0");
-        self.cache_size = size;
-        self
-    }
-
-    /// Sets the maximum number of relays allowed per group.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `limit` is 0.
-    pub fn with_max_relays_per_group(mut self, limit: usize) -> Self {
-        assert!(limit > 0, "max_relays_per_group must be greater than 0");
-        self.max_relays_per_group = limit;
-        self
-    }
-
-    /// Sets the maximum number of messages stored per group.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `limit` is 0.
-    pub fn with_max_messages_per_group(mut self, limit: usize) -> Self {
-        assert!(limit > 0, "max_messages_per_group must be greater than 0");
-        self.max_messages_per_group = limit;
-        self
-    }
-
-    /// Sets the maximum length of a group name in bytes.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `limit` is 0.
-    pub fn with_max_group_name_length(mut self, limit: usize) -> Self {
-        assert!(limit > 0, "max_group_name_length must be greater than 0");
-        self.max_group_name_length = limit;
-        self
-    }
-
-    /// Sets the maximum length of a group description in bytes.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `limit` is 0.
-    pub fn with_max_group_description_length(mut self, limit: usize) -> Self {
-        assert!(
-            limit > 0,
-            "max_group_description_length must be greater than 0"
-        );
-        self.max_group_description_length = limit;
-        self
-    }
-
-    /// Sets the maximum number of admin pubkeys per group.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `limit` is 0.
-    pub fn with_max_admins_per_group(mut self, limit: usize) -> Self {
-        assert!(limit > 0, "max_admins_per_group must be greater than 0");
-        self.max_admins_per_group = limit;
-        self
-    }
-
-    /// Sets the maximum number of relays in a welcome message.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `limit` is 0.
-    pub fn with_max_relays_per_welcome(mut self, limit: usize) -> Self {
-        assert!(limit > 0, "max_relays_per_welcome must be greater than 0");
-        self.max_relays_per_welcome = limit;
-        self
-    }
-
-    /// Sets the maximum number of admin pubkeys in a welcome message.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `limit` is 0.
-    pub fn with_max_admins_per_welcome(mut self, limit: usize) -> Self {
-        assert!(limit > 0, "max_admins_per_welcome must be greater than 0");
-        self.max_admins_per_welcome = limit;
-        self
-    }
-
-    /// Sets the maximum length of a relay URL in bytes.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `limit` is 0.
-    pub fn with_max_relay_url_length(mut self, limit: usize) -> Self {
-        assert!(limit > 0, "max_relay_url_length must be greater than 0");
-        self.max_relay_url_length = limit;
-        self
-    }
+validation_limits! {
+    /// Maximum number of items in each LRU cache
+    cache_size => DEFAULT_CACHE_SIZE.get(),
+    /// Maximum number of relays allowed per group
+    max_relays_per_group => DEFAULT_MAX_RELAYS_PER_GROUP,
+    /// Maximum number of messages stored per group
+    max_messages_per_group => DEFAULT_MAX_MESSAGES_PER_GROUP,
+    /// Maximum length of a group name in bytes
+    max_group_name_length => DEFAULT_MAX_GROUP_NAME_LENGTH,
+    /// Maximum length of a group description in bytes
+    max_group_description_length => DEFAULT_MAX_GROUP_DESCRIPTION_LENGTH,
+    /// Maximum number of admin pubkeys per group
+    max_admins_per_group => DEFAULT_MAX_ADMINS_PER_GROUP,
+    /// Maximum number of relays in a welcome message
+    max_relays_per_welcome => DEFAULT_MAX_RELAYS_PER_WELCOME,
+    /// Maximum number of admin pubkeys in a welcome message
+    max_admins_per_welcome => DEFAULT_MAX_ADMINS_PER_WELCOME,
+    /// Maximum length of a relay URL in bytes
+    max_relay_url_length => DEFAULT_MAX_RELAY_URL_LENGTH,
 }
 
 /// A memory-based storage implementation for MDK.

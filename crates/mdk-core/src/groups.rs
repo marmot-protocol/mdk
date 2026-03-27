@@ -165,71 +165,63 @@ impl NostrGroupConfigData {
     }
 }
 
+macro_rules! update_setter {
+    // Into<String> variant
+    (into_string: $name:ident, $doc:expr) => {
+        #[doc = $doc]
+        pub fn $name<T>(mut self, $name: T) -> Self
+        where
+            T: Into<String>,
+        {
+            self.$name = Some($name.into());
+            self
+        }
+    };
+    // Direct value variant
+    ($name:ident, $ty:ty, $doc:expr) => {
+        #[doc = $doc]
+        pub fn $name(mut self, $name: $ty) -> Self {
+            self.$name = Some($name);
+            self
+        }
+    };
+}
+
 impl NostrGroupDataUpdate {
     /// Creates a new empty update configuration
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Sets the name to be updated
-    pub fn name<T>(mut self, name: T) -> Self
-    where
-        T: Into<String>,
-    {
-        self.name = Some(name.into());
-        self
-    }
-
-    /// Sets the description to be updated
-    pub fn description<T>(mut self, description: T) -> Self
-    where
-        T: Into<String>,
-    {
-        self.description = Some(description.into());
-        self
-    }
-
-    /// Sets the image URL to be updated
-    pub fn image_hash(mut self, image_hash: Option<[u8; 32]>) -> Self {
-        self.image_hash = Some(image_hash);
-        self
-    }
-
-    /// Sets the image key to be updated
-    pub fn image_key(mut self, image_key: Option<[u8; 32]>) -> Self {
-        self.image_key = Some(image_key);
-        self
-    }
-
-    /// Sets the image key to be updated
-    pub fn image_nonce(mut self, image_nonce: Option<[u8; 12]>) -> Self {
-        self.image_nonce = Some(image_nonce);
-        self
-    }
-
-    /// Sets the image upload key to be updated
-    pub fn image_upload_key(mut self, image_upload_key: Option<[u8; 32]>) -> Self {
-        self.image_upload_key = Some(image_upload_key);
-        self
-    }
-
-    /// Sets the relays to be updated
-    pub fn relays(mut self, relays: Vec<RelayUrl>) -> Self {
-        self.relays = Some(relays);
-        self
-    }
-
-    /// Sets the admins to be updated
-    pub fn admins(mut self, admins: Vec<PublicKey>) -> Self {
-        self.admins = Some(admins);
-        self
-    }
-
-    /// Sets the nostr_group_id to be updated (for ID rotation per MIP-01)
-    pub fn nostr_group_id(mut self, nostr_group_id: [u8; 32]) -> Self {
-        self.nostr_group_id = Some(nostr_group_id);
-        self
-    }
+    update_setter!(into_string: name, "Sets the name to be updated");
+    update_setter!(into_string: description, "Sets the description to be updated");
+    update_setter!(
+        image_hash,
+        Option<[u8; 32]>,
+        "Sets the image hash to be updated"
+    );
+    update_setter!(
+        image_key,
+        Option<[u8; 32]>,
+        "Sets the image key to be updated"
+    );
+    update_setter!(
+        image_nonce,
+        Option<[u8; 12]>,
+        "Sets the image nonce to be updated"
+    );
+    update_setter!(
+        image_upload_key,
+        Option<[u8; 32]>,
+        "Sets the image upload key to be updated"
+    );
+    update_setter!(relays, Vec<RelayUrl>, "Sets the relays to be updated");
+    update_setter!(admins, Vec<PublicKey>, "Sets the admins to be updated");
+    update_setter!(
+        nostr_group_id,
+        [u8; 32],
+        "Sets the nostr_group_id to be updated (for ID rotation per MIP-01)"
+    );
 }
 
 impl<Storage> MDK<Storage>

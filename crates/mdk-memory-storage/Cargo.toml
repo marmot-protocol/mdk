@@ -19,6 +19,7 @@ nostr = { workspace = true, features = ["std"] }
 openmls.workspace = true
 openmls_traits.workspace = true
 parking_lot.workspace = true
+pastey.workspace = true
 serde = { workspace = true, features = ["std", "derive"] }
 serde_json.workspace = true
 
