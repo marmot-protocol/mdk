@@ -73,6 +73,118 @@ macro_rules! string_enum {
     };
 }
 
+/// Generate a `Pagination` struct with bounded limit/offset and a validation function.
+///
+/// Produces:
+/// - `pub struct Pagination` with `limit`, `offset`, and any extra fields
+/// - `new(limit, offset)` constructor
+/// - `limit()` / `offset()` accessors with defaults
+/// - `Default` impl
+/// - A public `$validate` function that checks `1..=$max`
+///
+/// Extra fields are wrapped in `Option` and default to `None`.
+macro_rules! bounded_pagination {
+    (
+        $(#[$struct_meta:meta])*
+        default_limit: $default:expr,
+        max_limit: $max:expr,
+        error_type: $err:ty,
+        validate_fn: $validate:ident
+        $(, extra {
+            $( $(#[$field_meta:meta])* $field:ident : $field_ty:ty ),+ $(,)?
+        })?
+    ) => {
+        $(#[$struct_meta])*
+        #[derive(Debug, Clone, Copy)]
+        pub struct Pagination {
+            /// Maximum number of items to return
+            pub limit: Option<usize>,
+            /// Number of items to skip
+            pub offset: Option<usize>,
+            $( $(
+                $(#[$field_meta])*
+                pub $field: Option<$field_ty>,
+            )+ )?
+        }
+
+        impl Pagination {
+            /// Create a new Pagination with specified limit and offset
+            pub fn new(limit: Option<usize>, offset: Option<usize>) -> Self {
+                Self {
+                    limit,
+                    offset,
+                    $( $( $field: None, )+ )?
+                }
+            }
+
+            /// Get the limit value, using default if not specified
+            pub fn limit(&self) -> usize {
+                self.limit.unwrap_or($default)
+            }
+
+            /// Get the offset value, using 0 if not specified
+            pub fn offset(&self) -> usize {
+                self.offset.unwrap_or(0)
+            }
+        }
+
+        impl Default for Pagination {
+            fn default() -> Self {
+                Self {
+                    limit: Some($default),
+                    offset: Some(0),
+                    $( $( $field: None, )+ )?
+                }
+            }
+        }
+
+        /// Validate that a limit is within the allowed range.
+        ///
+        /// Returns `Ok(())` if `limit` is between 1 and the maximum (inclusive),
+        /// or an error otherwise.
+        #[inline]
+        pub fn $validate(limit: usize) -> Result<(), $err> {
+            if (1..=$max).contains(&limit) {
+                Ok(())
+            } else {
+                Err(<$err>::InvalidParameters(format!(
+                    "Limit must be between 1 and {}, got {}",
+                    $max, limit
+                )))
+            }
+        }
+    };
+}
+
+/// Generate a storage error enum with common `InvalidParameters(String)` and
+/// `DatabaseError(String)` variants, plus any module-specific extras.
+macro_rules! storage_error {
+    (
+        $(#[$enum_meta:meta])*
+        $vis:vis enum $name:ident {
+            $(
+                $(#[$extra_meta:meta])*
+                $extra_variant:ident $( ($extra_inner:ty) )?
+            ),* $(,)?
+        }
+    ) => {
+        $(#[$enum_meta])*
+        #[derive(Debug, thiserror::Error)]
+        $vis enum $name {
+            /// Invalid parameters
+            #[error("Invalid parameters: {0}")]
+            InvalidParameters(String),
+            /// Database error
+            #[error("Database error: {0}")]
+            DatabaseError(String),
+            $(
+                $(#[$extra_meta])*
+                $extra_variant $( ($extra_inner) )?,
+            )*
+        }
+    };
+}
+
 pub mod error;
 pub mod group_id;
 pub mod groups;

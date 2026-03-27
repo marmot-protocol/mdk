@@ -1,7 +1,6 @@
 //! Error types for the groups module
 
 use std::fmt;
-use thiserror::Error;
 
 /// Invalid group state
 #[derive(Debug, PartialEq, Eq)]
@@ -21,18 +20,13 @@ impl fmt::Display for InvalidGroupState {
     }
 }
 
-/// Error types for the groups module
-#[derive(Debug, Error)]
-pub enum GroupError {
-    /// Invalid parameters
-    #[error("Invalid parameters: {0}")]
-    InvalidParameters(String),
-    /// Database error
-    #[error("Database error: {0}")]
-    DatabaseError(String),
-    /// Invalid state
-    #[error("Invalid state: {0}")]
-    InvalidState(InvalidGroupState),
+storage_error! {
+    /// Error types for the groups module
+    pub enum GroupError {
+        /// Invalid state
+        #[error("Invalid state: {0}")]
+        InvalidState(InvalidGroupState),
+    }
 }
 
 #[cfg(test)]

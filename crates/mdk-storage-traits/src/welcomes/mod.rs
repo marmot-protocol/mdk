@@ -22,55 +22,12 @@ pub const DEFAULT_PENDING_WELCOMES_LIMIT: usize = 1000;
 /// Maximum allowed limit for pending welcomes queries to prevent resource exhaustion
 pub const MAX_PENDING_WELCOMES_LIMIT: usize = 10000;
 
-/// Pagination parameters for querying pending welcomes
-#[derive(Debug, Clone, Copy)]
-pub struct Pagination {
-    /// Maximum number of welcomes to return
-    pub limit: Option<usize>,
-    /// Number of welcomes to skip
-    pub offset: Option<usize>,
-}
-
-impl Pagination {
-    /// Create a new Pagination with specified limit and offset
-    pub fn new(limit: Option<usize>, offset: Option<usize>) -> Self {
-        Self { limit, offset }
-    }
-
-    /// Get the limit value, using default if not specified
-    pub fn limit(&self) -> usize {
-        self.limit.unwrap_or(DEFAULT_PENDING_WELCOMES_LIMIT)
-    }
-
-    /// Get the offset value, using 0 if not specified
-    pub fn offset(&self) -> usize {
-        self.offset.unwrap_or(0)
-    }
-}
-
-impl Default for Pagination {
-    fn default() -> Self {
-        Self {
-            limit: Some(DEFAULT_PENDING_WELCOMES_LIMIT),
-            offset: Some(0),
-        }
-    }
-}
-
-/// Validate that a pending-welcomes limit is within the allowed range.
-///
-/// Returns `Ok(())` if `limit` is between 1 and [`MAX_PENDING_WELCOMES_LIMIT`] (inclusive),
-/// or a [`WelcomeError::InvalidParameters`] otherwise.
-#[inline]
-pub fn validate_pending_welcomes_limit(limit: usize) -> Result<(), WelcomeError> {
-    if (1..=MAX_PENDING_WELCOMES_LIMIT).contains(&limit) {
-        Ok(())
-    } else {
-        Err(WelcomeError::InvalidParameters(format!(
-            "Limit must be between 1 and {}, got {}",
-            MAX_PENDING_WELCOMES_LIMIT, limit
-        )))
-    }
+bounded_pagination! {
+    /// Pagination parameters for querying pending welcomes
+    default_limit: DEFAULT_PENDING_WELCOMES_LIMIT,
+    max_limit: MAX_PENDING_WELCOMES_LIMIT,
+    error_type: WelcomeError,
+    validate_fn: validate_pending_welcomes_limit
 }
 
 /// Storage traits for the welcomes module
