@@ -2,6 +2,7 @@
 
 use mdk_storage_traits::MdkStorageProvider;
 use mdk_storage_traits::mls_codec::MlsCodec;
+use nostr::secp256k1::rand::{RngCore, rngs::OsRng};
 use nostr::{Event, PublicKey, RelayUrl, Tag, TagKind};
 use openmls::ciphersuite::hash_ref::HashReference;
 use openmls::key_packages::KeyPackage;
@@ -205,7 +206,6 @@ where
         // This makes the event addressable (kind 30443, NIP-33): relays automatically
         // replace events sharing the same (kind, pubkey, d) tuple.
         // Callers SHOULD store and reuse this value when rotating the KeyPackage.
-        use nostr::secp256k1::rand::{RngCore, rngs::OsRng};
         let mut d_bytes = [0u8; 32];
         OsRng.fill_bytes(&mut d_bytes);
         let d_value = hex::encode(d_bytes);
@@ -236,7 +236,7 @@ where
         // Create legacy tags by filtering out the `d` tag
         let tags_443: Vec<Tag> = tags_30443
             .iter()
-            .filter(|t| t.as_slice().first().map(|s| s.as_str()) != Some("d"))
+            .filter(|t| t.kind() != TagKind::d())
             .cloned()
             .collect();
 
@@ -340,10 +340,7 @@ where
         // For addressable kind:30443 events, the `d` tag is mandatory and must be non-empty.
         // Legacy kind:443 events do not have a `d` tag.
         if event.kind == MLS_KEY_PACKAGE_KIND {
-            let d_tag = event
-                .tags
-                .iter()
-                .find(|t| t.as_slice().first().map(|s| s.as_str()) == Some("d"));
+            let d_tag = event.tags.iter().find(|t| t.kind() == TagKind::d());
             match d_tag {
                 None => {
                     return Err(Error::KeyPackage(
@@ -430,11 +427,7 @@ where
         let ext = require(Self::is_extensions_tag, "mls_extensions")?;
 
         // mls_proposals tag is strictly required per MIP-00
-        let prop = event
-            .tags
-            .iter()
-            .find(|t| t.as_slice().first() == Some(&"mls_proposals".to_string()))
-            .ok_or_else(|| Error::KeyPackage("Missing required tag: mls_proposals".to_string()))?;
+        let prop = require(Self::is_proposals_tag, "mls_proposals")?;
         if prop.as_slice().get(1).map(|s| s.as_str()) != Some("0x000a") {
             return Err(Error::KeyPackage(
                 "Invalid mls_proposals tag value, expected 0x000a".to_string(),
@@ -529,6 +522,11 @@ where
     fn tag_first_value<'a>(tag: &'a Tag, missing_msg: &str) -> Result<&'a str, Error> {
         tag.content()
             .ok_or_else(|| Error::KeyPackage(missing_msg.to_string()))
+    }
+
+    /// Checks if a tag is an `mls_proposals` tag (MIP-00).
+    fn is_proposals_tag(&self, tag: &Tag) -> bool {
+        matches!(tag.kind(), TagKind::Custom(ref s) if s == "mls_proposals")
     }
 
     /// Validates protocol version tag format and value.
@@ -1762,7 +1760,6 @@ mod tests {
                 Tag::custom(TagKind::Custom("mls_proposals".into()), ["0x000a"]),
                 Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
                 Tag::custom(TagKind::MlsExtensions, ["0x0003", "0x000a"]),
-                Tag::custom(TagKind::Custom("mls_proposals".into()), ["0x000a"]),
                 Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
                 Tag::custom(TagKind::i(), [hex::encode([0xaa; 32])]),
             ];
