@@ -29,8 +29,8 @@
 
 ### Changed
 
-- Extracted `update_group_result_to_uniffi()` and `mdk_from_storage()` helpers to eliminate duplicated serialization and constructor logic across multiple exported functions.
-- Simplified iterator collection patterns to use `.collect::<Result<_, _>>()` instead of two-step collect-then-unwrap.
+- Extracted `update_group_result_to_uniffi()` and `mdk_from_storage()` helpers to eliminate duplicated serialization and constructor logic across multiple exported functions. ([`#239`](https://github.com/marmot-protocol/mdk/pull/239))
+- Simplified iterator collection patterns to use `.collect::<Result<_, _>>()` instead of two-step collect-then-unwrap. ([`#239`](https://github.com/marmot-protocol/mdk/pull/239))
 
 ### Added
 

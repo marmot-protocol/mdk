@@ -29,8 +29,8 @@
 
 ### Changed
 
-- Replaced 6 identical MLS storage struct definitions and their `Debug`/`new`/`clone_data`/`restore_data` impls with `mls_store_base!` and `mls_single_key_ops!` macros, reducing `mls_storage/mod.rs` by ~400 lines.
-- Migrated group and welcome storage to use shared validation functions from `mdk-storage-traits`.
+- Replaced 6 identical MLS storage struct definitions and their `Debug`/`new`/`clone_data`/`restore_data` impls with `mls_store_base!` and `mls_single_key_ops!` macros, reducing `mls_storage/mod.rs` by ~400 lines. ([`#239`](https://github.com/marmot-protocol/mdk/pull/239))
+- Migrated group and welcome storage to use shared validation functions from `mdk-storage-traits`. ([`#239`](https://github.com/marmot-protocol/mdk/pull/239))
 
 ### Added
 
