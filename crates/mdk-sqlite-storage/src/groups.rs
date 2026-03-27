@@ -15,8 +15,7 @@ use rusqlite::{OptionalExtension, params};
 
 use crate::db::{Hash32, Nonce12};
 use crate::validation::{
-    MAX_ADMIN_PUBKEYS_JSON_SIZE, MAX_GROUP_DESCRIPTION_LENGTH, MAX_GROUP_NAME_LENGTH,
-    validate_size,
+    MAX_ADMIN_PUBKEYS_JSON_SIZE, MAX_GROUP_DESCRIPTION_LENGTH, MAX_GROUP_NAME_LENGTH, validate_size,
 };
 use crate::{MdkSqliteStorage, db};
 
