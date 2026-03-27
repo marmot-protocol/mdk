@@ -1,7 +1,7 @@
 use std::fmt;
 
 use base64::Engine;
-use nostr::{EventId, PublicKey, RelayUrl};
+use nostr::{Event, EventId, PublicKey, RelayUrl};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use super::{ENCRYPTED_TOKEN_LEN, Mip05Error, TOKEN_PLAINTEXT_LEN};
@@ -214,6 +214,24 @@ pub enum Mip05GroupMessage {
     TokenListResponse(TokenListResponse),
     /// A `kind:449` token removal.
     TokenRemoval(TokenRemoval),
+}
+
+/// Typed representation of a `kind:446` notification request rumor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotificationRequest {
+    /// Concatenated encrypted push tokens carried by the rumor.
+    pub tokens: Vec<EncryptedToken>,
+}
+
+/// Ready-to-publish notification requests for a single notification server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotificationEventBatch {
+    /// The notification server receiving these requests.
+    pub server_pubkey: PublicKey,
+    /// Relay hints seen on the source token tags for this server.
+    pub relay_hints: Vec<RelayUrl>,
+    /// Gift-wrapped `kind:1059` events ready to publish.
+    pub events: Vec<Event>,
 }
 
 #[cfg(test)]
