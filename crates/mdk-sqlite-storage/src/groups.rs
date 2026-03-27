@@ -17,13 +17,7 @@ use crate::validation::{
 };
 use crate::{MdkSqliteStorage, db};
 
-#[inline]
-fn into_group_err<T>(e: T) -> GroupError
-where
-    T: std::error::Error,
-{
-    GroupError::DatabaseError(e.to_string())
-}
+db_error_fn!(into_group_err, GroupError);
 
 #[inline]
 fn group_not_found() -> GroupError {

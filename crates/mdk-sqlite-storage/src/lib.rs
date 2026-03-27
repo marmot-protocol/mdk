@@ -73,6 +73,17 @@ use openmls_traits::storage::{StorageProvider, traits};
 use rusqlite::Connection;
 use std::sync::Mutex;
 
+/// Generates a function that converts any `std::error::Error` into the given
+/// storage error type's `DatabaseError` variant.
+macro_rules! db_error_fn {
+    ($fn_name:ident, $error_type:ty) => {
+        #[inline]
+        fn $fn_name<T: std::error::Error>(e: T) -> $error_type {
+            <$error_type>::DatabaseError(e.to_string())
+        }
+    };
+}
+
 mod db;
 pub mod encryption;
 pub mod error;

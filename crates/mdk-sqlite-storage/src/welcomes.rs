@@ -13,13 +13,7 @@ use crate::validation::{
 };
 use crate::{MdkSqliteStorage, db};
 
-#[inline]
-fn into_welcome_err<T>(e: T) -> WelcomeError
-where
-    T: std::error::Error,
-{
-    WelcomeError::DatabaseError(e.to_string())
-}
+db_error_fn!(into_welcome_err, WelcomeError);
 
 impl WelcomeStorage for MdkSqliteStorage {
     fn save_welcome(&self, welcome: Welcome) -> Result<(), WelcomeError> {

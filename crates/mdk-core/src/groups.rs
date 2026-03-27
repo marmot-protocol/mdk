@@ -228,6 +228,12 @@ impl<Storage> MDK<Storage>
 where
     Storage: MdkStorageProvider,
 {
+    /// Extracts a public key from an MLS credential.
+    fn pubkey_from_credential(&self, credential: &Credential) -> Result<PublicKey, Error> {
+        let basic = BasicCredential::try_from(credential.clone())?;
+        self.parse_credential_identity(basic.identity())
+    }
+
     /// Gets the current user's public key from an MLS group
     ///
     /// # Arguments
@@ -240,10 +246,7 @@ where
     /// * `Err(Error)` - If the user's leaf node is not found or there is an error extracting the public key
     pub(crate) fn get_own_pubkey(&self, group: &MlsGroup) -> Result<PublicKey, Error> {
         let own_leaf = group.own_leaf().ok_or(Error::OwnLeafNotFound)?;
-        let credentials: BasicCredential =
-            BasicCredential::try_from(own_leaf.credential().clone())?;
-        let identity_bytes: &[u8] = credentials.identity();
-        self.parse_credential_identity(identity_bytes)
+        self.pubkey_from_credential(own_leaf.credential())
     }
 
     /// Checks if the LeafNode is an admin of an MLS group
@@ -280,10 +283,7 @@ where
     /// * `Ok(PublicKey)` - The public key extracted from the leaf node
     /// * `Err(Error)` - If the credential cannot be converted or the public key cannot be extracted
     pub(crate) fn pubkey_for_leaf_node(&self, leaf_node: &LeafNode) -> Result<PublicKey, Error> {
-        let credentials: BasicCredential =
-            BasicCredential::try_from(leaf_node.credential().clone())?;
-        let identity_bytes: &[u8] = credentials.identity();
-        self.parse_credential_identity(identity_bytes)
+        self.pubkey_from_credential(leaf_node.credential())
     }
 
     /// Extracts the public key from a member
@@ -297,9 +297,7 @@ where
     /// * `Ok(PublicKey)` - The public key extracted from the member
     /// * `Err(Error)` - If the public key cannot be extracted or there is an error converting the public key to hex
     pub(crate) fn pubkey_for_member(&self, member: &Member) -> Result<PublicKey, Error> {
-        let credentials: BasicCredential = BasicCredential::try_from(member.credential.clone())?;
-        let identity_bytes: &[u8] = credentials.identity();
-        self.parse_credential_identity(identity_bytes)
+        self.pubkey_from_credential(&member.credential)
     }
 
     /// Loads the signature key pair for the current member in an MLS group
@@ -1288,10 +1286,10 @@ where
         // Save the NostrMLS Group
         let group = group_types::Group {
             mls_group_id: mls_group.group_id().clone().into(),
-            nostr_group_id: group_data.clone().nostr_group_id,
-            name: group_data.clone().name,
-            description: group_data.clone().description,
-            admin_pubkeys: group_data.clone().admins,
+            nostr_group_id: group_data.nostr_group_id,
+            name: group_data.name,
+            description: group_data.description,
+            admin_pubkeys: group_data.admins,
             last_message_id: None,
             last_message_at: None,
             last_message_processed_at: None,
