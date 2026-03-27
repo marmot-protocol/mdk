@@ -83,12 +83,26 @@ impl From<MdkConfig> for CoreMdkConfig {
         let d = CoreMdkConfig::default();
         Self {
             max_event_age_secs: config.max_event_age_secs.unwrap_or(d.max_event_age_secs),
-            max_future_skew_secs: config.max_future_skew_secs.unwrap_or(d.max_future_skew_secs),
-            out_of_order_tolerance: config.out_of_order_tolerance.unwrap_or(d.out_of_order_tolerance),
-            maximum_forward_distance: config.maximum_forward_distance.unwrap_or(d.maximum_forward_distance),
-            max_past_epochs: config.max_past_epochs.map(|v| v as usize).unwrap_or(d.max_past_epochs),
-            epoch_snapshot_retention: config.epoch_snapshot_retention.map(|v| v as usize).unwrap_or(d.epoch_snapshot_retention),
-            snapshot_ttl_seconds: config.snapshot_ttl_seconds.unwrap_or(d.snapshot_ttl_seconds),
+            max_future_skew_secs: config
+                .max_future_skew_secs
+                .unwrap_or(d.max_future_skew_secs),
+            out_of_order_tolerance: config
+                .out_of_order_tolerance
+                .unwrap_or(d.out_of_order_tolerance),
+            maximum_forward_distance: config
+                .maximum_forward_distance
+                .unwrap_or(d.maximum_forward_distance),
+            max_past_epochs: config
+                .max_past_epochs
+                .map(|v| v as usize)
+                .unwrap_or(d.max_past_epochs),
+            epoch_snapshot_retention: config
+                .epoch_snapshot_retention
+                .map(|v| v as usize)
+                .unwrap_or(d.epoch_snapshot_retention),
+            snapshot_ttl_seconds: config
+                .snapshot_ttl_seconds
+                .unwrap_or(d.snapshot_ttl_seconds),
         }
     }
 }

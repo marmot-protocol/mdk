@@ -21,7 +21,6 @@ use crate::{MdkSqliteStorage, db};
 
 db_error_fn!(into_group_err, GroupError);
 
-
 #[inline]
 fn ensure_group_exists(
     storage: &MdkSqliteStorage,

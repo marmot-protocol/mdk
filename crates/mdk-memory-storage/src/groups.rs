@@ -13,7 +13,6 @@ use nostr::{PublicKey, RelayUrl};
 
 use crate::MdkMemoryStorage;
 
-
 #[inline]
 fn sort_messages(messages: &mut [Message], sort_order: MessageSortOrder) {
     match sort_order {

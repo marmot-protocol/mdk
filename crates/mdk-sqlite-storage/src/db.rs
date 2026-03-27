@@ -198,9 +198,11 @@ pub fn row_to_group(row: &Row) -> SqliteResult<Group> {
         .get::<_, Option<Nonce12>>("image_nonce")?
         .map(|n| mdk_storage_traits::Secret::new(n.into()));
     let admin_pubkeys: BTreeSet<PublicKey> = text_to_json(row, "admin_pubkeys")?;
-    let last_message_id = blob_to_optional_event_id(row, "last_message_id", "Invalid last message ID")?;
-    let last_message_at: Option<Timestamp> =
-        row.get::<_, Option<u64>>("last_message_at")?.map(Timestamp::from_secs);
+    let last_message_id =
+        blob_to_optional_event_id(row, "last_message_id", "Invalid last message ID")?;
+    let last_message_at: Option<Timestamp> = row
+        .get::<_, Option<u64>>("last_message_at")?
+        .map(Timestamp::from_secs);
     let last_message_processed_at: Option<Timestamp> = row
         .get::<_, Option<u64>>("last_message_processed_at")?
         .map(Timestamp::from_secs);
@@ -353,11 +355,7 @@ pub fn row_to_welcome(row: &Row) -> SqliteResult<Welcome> {
 /// Convert a row to a ProcessedWelcome struct
 pub fn row_to_processed_welcome(row: &Row) -> SqliteResult<ProcessedWelcome> {
     Ok(ProcessedWelcome {
-        wrapper_event_id: blob_to_event_id(
-            row,
-            "wrapper_event_id",
-            "Invalid wrapper event ID",
-        )?,
+        wrapper_event_id: blob_to_event_id(row, "wrapper_event_id", "Invalid wrapper event ID")?,
         welcome_event_id: blob_to_optional_event_id(
             row,
             "welcome_event_id",
