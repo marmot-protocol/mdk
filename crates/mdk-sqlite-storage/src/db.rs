@@ -11,9 +11,7 @@ use mdk_storage_traits::groups::types::{
 use mdk_storage_traits::messages::types::{
     Message, MessageState, ProcessedMessage, ProcessedMessageState,
 };
-use mdk_storage_traits::welcomes::types::{
-    ProcessedWelcome, ProcessedWelcomeState, Welcome, WelcomeState,
-};
+use mdk_storage_traits::welcomes::types::{ProcessedWelcome, Welcome, WelcomeState};
 use nostr::{EventId, JsonUtil, Kind, PublicKey, RelayUrl, Tags, Timestamp, UnsignedEvent};
 use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ToSql, ToSqlOutput, Type, ValueRef};
 use rusqlite::{Error, Result as SqliteResult, Row};
@@ -128,9 +126,65 @@ fn map_invalid_blob_data(msg: &str) -> Error {
     )
 }
 
+// ============================================================================
+// Row extraction helpers
+// ============================================================================
+
+/// Extract a `GroupId` from a blob column.
+fn blob_to_group_id(row: &Row, col: &str) -> SqliteResult<GroupId> {
+    Ok(GroupId::from_slice(row.get_ref(col)?.as_blob()?))
+}
+
+/// Extract an `EventId` from a blob column.
+fn blob_to_event_id(row: &Row, col: &str, label: &str) -> SqliteResult<EventId> {
+    let blob = row.get_ref(col)?.as_blob()?;
+    EventId::from_slice(blob).map_err(|_| map_invalid_blob_data(label))
+}
+
+/// Extract an optional `EventId` from a nullable blob column.
+fn blob_to_optional_event_id(row: &Row, col: &str, label: &str) -> SqliteResult<Option<EventId>> {
+    match row.get_ref(col)?.as_blob_or_null()? {
+        Some(blob) => Ok(Some(
+            EventId::from_slice(blob).map_err(|_| map_invalid_blob_data(label))?,
+        )),
+        None => Ok(None),
+    }
+}
+
+/// Extract a `PublicKey` from a blob column.
+fn blob_to_pubkey(row: &Row, col: &str, label: &str) -> SqliteResult<PublicKey> {
+    let blob = row.get_ref(col)?.as_blob()?;
+    PublicKey::from_slice(blob).map_err(|_| map_invalid_blob_data(label))
+}
+
+/// Parse a text column via `FromStr` with a standard "Invalid state" error.
+fn text_to_state<T: FromStr>(row: &Row, col: &str) -> SqliteResult<T> {
+    let s = row.get_ref(col)?.as_str()?;
+    T::from_str(s).map_err(|_| map_invalid_text_data("Invalid state"))
+}
+
+/// Deserialize a JSON text column via serde.
+fn text_to_json<T: serde::de::DeserializeOwned>(row: &Row, col: &str) -> SqliteResult<T> {
+    let s = row.get_ref(col)?.as_str()?;
+    serde_json::from_str(s).map_err(map_to_text_boxed_error)
+}
+
+/// Parse a text column via a custom parser function.
+fn text_to_parsed<T, E>(
+    row: &Row,
+    col: &str,
+    parser: impl FnOnce(&str) -> Result<T, E>,
+) -> SqliteResult<T>
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    let s = row.get_ref(col)?.as_str()?;
+    parser(s).map_err(map_to_text_boxed_error)
+}
+
 /// Convert a row to a Group struct
 pub fn row_to_group(row: &Row) -> SqliteResult<Group> {
-    let mls_group_id: GroupId = GroupId::from_slice(row.get_ref("mls_group_id")?.as_blob()?);
+    let mls_group_id = blob_to_group_id(row, "mls_group_id")?;
     let nostr_group_id: [u8; 32] = row.get("nostr_group_id")?;
     let name: String = row.get("name")?;
     let description: String = row.get("description")?;
@@ -143,33 +197,16 @@ pub fn row_to_group(row: &Row) -> SqliteResult<Group> {
     let image_nonce: Option<mdk_storage_traits::Secret<[u8; 12]>> = row
         .get::<_, Option<Nonce12>>("image_nonce")?
         .map(|n| mdk_storage_traits::Secret::new(n.into()));
-
-    // Parse admin pubkeys from JSON
-    let admin_pubkeys_json: &str = row.get_ref("admin_pubkeys")?.as_str()?;
-    let admin_pubkeys: BTreeSet<PublicKey> =
-        serde_json::from_str(admin_pubkeys_json).map_err(map_to_text_boxed_error)?;
-
-    let last_message_id_blob: Option<&[u8]> = row.get_ref("last_message_id")?.as_blob_or_null()?;
-    let last_message_at: Option<u64> = row.get("last_message_at")?;
-    let last_message_processed_at: Option<u64> = row.get("last_message_processed_at")?;
-    let last_message_id: Option<EventId> = match last_message_id_blob {
-        Some(id_blob) => Some(
-            EventId::from_slice(id_blob)
-                .map_err(|_| map_invalid_blob_data("Invalid last message ID"))?,
-        ),
-        None => None,
-    };
-    let last_message_at: Option<Timestamp> = last_message_at.map(Timestamp::from_secs);
-    let last_message_processed_at: Option<Timestamp> =
-        last_message_processed_at.map(Timestamp::from_secs);
-
-    let state: &str = row.get_ref("state")?.as_str()?;
-    let state: GroupState =
-        GroupState::from_str(state).map_err(|_| map_invalid_text_data("Invalid group state"))?;
-
+    let admin_pubkeys: BTreeSet<PublicKey> = text_to_json(row, "admin_pubkeys")?;
+    let last_message_id = blob_to_optional_event_id(row, "last_message_id", "Invalid last message ID")?;
+    let last_message_at: Option<Timestamp> =
+        row.get::<_, Option<u64>>("last_message_at")?.map(Timestamp::from_secs);
+    let last_message_processed_at: Option<Timestamp> = row
+        .get::<_, Option<u64>>("last_message_processed_at")?
+        .map(Timestamp::from_secs);
+    let state: GroupState = text_to_state(row, "state")?;
     let epoch: u64 = row.get("epoch")?;
-
-    let self_update_state: SelfUpdateState = match row.get::<_, u64>("last_self_update_at")? {
+    let self_update_state = match row.get::<_, u64>("last_self_update_at")? {
         0 => SelfUpdateState::Required,
         ts => SelfUpdateState::CompletedAt(Timestamp::from_secs(ts)),
     };
@@ -194,70 +231,40 @@ pub fn row_to_group(row: &Row) -> SqliteResult<Group> {
 
 /// Convert a row to a GroupRelay struct
 pub fn row_to_group_relay(row: &Row) -> SqliteResult<GroupRelay> {
-    let mls_group_id: GroupId = GroupId::from_slice(row.get_ref("mls_group_id")?.as_blob()?);
-    let relay_url: &str = row.get_ref("relay_url")?.as_str()?;
-
-    // Parse relay URL
-    let relay_url: RelayUrl =
-        RelayUrl::parse(relay_url).map_err(|_| map_invalid_text_data("Invalid relay URL"))?;
-
     Ok(GroupRelay {
-        mls_group_id,
-        relay_url,
+        mls_group_id: blob_to_group_id(row, "mls_group_id")?,
+        relay_url: text_to_parsed(row, "relay_url", RelayUrl::parse)?,
     })
 }
 
 /// Convert a row to a GroupExporterSecret struct
 pub fn row_to_group_exporter_secret(row: &Row) -> SqliteResult<GroupExporterSecret> {
-    let mls_group_id: GroupId = GroupId::from_slice(row.get_ref("mls_group_id")?.as_blob()?);
-    let epoch: u64 = row.get("epoch")?;
-    let secret: [u8; 32] = row.get("secret")?;
-
     Ok(GroupExporterSecret {
-        mls_group_id,
-        epoch,
-        secret: mdk_storage_traits::Secret::new(secret),
+        mls_group_id: blob_to_group_id(row, "mls_group_id")?,
+        epoch: row.get("epoch")?,
+        secret: mdk_storage_traits::Secret::new(row.get("secret")?),
     })
 }
 
 /// Convert a row to a Message struct
 pub fn row_to_message(row: &Row) -> SqliteResult<Message> {
-    let id_blob: &[u8] = row.get_ref("id")?.as_blob()?;
-    let pubkey_blob: &[u8] = row.get_ref("pubkey")?.as_blob()?;
-    let kind_value: u16 = row.get("kind")?;
-    let mls_group_id: GroupId = GroupId::from_slice(row.get_ref("mls_group_id")?.as_blob()?);
+    let id = blob_to_event_id(row, "id", "Invalid event ID")?;
+    let pubkey = blob_to_pubkey(row, "pubkey", "Invalid public key")?;
+    let kind = Kind::from(row.get::<_, u16>("kind")?);
+    let mls_group_id = blob_to_group_id(row, "mls_group_id")?;
     let created_at_value: u64 = row.get("created_at")?;
     // processed_at may be NULL for rows created before the migration
     let processed_at_value: Option<u64> = row.get("processed_at")?;
     let content: String = row.get("content")?;
-    let tags_json: &str = row.get_ref("tags")?.as_str()?;
-    let event_json: &str = row.get_ref("event")?.as_str()?;
-    let wrapper_event_id_blob: &[u8] = row.get_ref("wrapper_event_id")?.as_blob()?;
+    let tags: Tags = text_to_json(row, "tags")?;
+    let event = text_to_parsed(row, "event", |s| UnsignedEvent::from_json(s))?;
+    let wrapper_event_id = blob_to_event_id(row, "wrapper_event_id", "Invalid wrapper event ID")?;
     let epoch: Option<u64> = row.get("epoch")?;
-    let state_str: &str = row.get_ref("state")?.as_str()?;
+    let state: MessageState = text_to_state(row, "state")?;
 
-    // Parse values
-    let id: EventId =
-        EventId::from_slice(id_blob).map_err(|_| map_invalid_blob_data("Invalid event ID"))?;
-
-    let pubkey: PublicKey = PublicKey::from_slice(pubkey_blob)
-        .map_err(|_| map_invalid_blob_data("Invalid public key"))?;
-
-    let kind: Kind = Kind::from(kind_value);
-    let created_at: Timestamp = Timestamp::from(created_at_value);
+    let created_at = Timestamp::from(created_at_value);
     // Fall back to created_at if processed_at is NULL (for backward compatibility)
-    let processed_at: Timestamp = Timestamp::from(processed_at_value.unwrap_or(created_at_value));
-
-    let tags: Tags = serde_json::from_str(tags_json).map_err(map_to_text_boxed_error)?;
-
-    let event: UnsignedEvent =
-        UnsignedEvent::from_json(event_json).map_err(map_to_text_boxed_error)?;
-
-    let wrapper_event_id: EventId = EventId::from_slice(wrapper_event_id_blob)
-        .map_err(|_| map_invalid_blob_data("Invalid wrapper event ID"))?;
-
-    let state: MessageState =
-        MessageState::from_str(state_str).map_err(|_| map_invalid_text_data("Invalid state"))?;
+    let processed_at = Timestamp::from(processed_at_value.unwrap_or(created_at_value));
 
     Ok(Message {
         id,
@@ -277,32 +284,17 @@ pub fn row_to_message(row: &Row) -> SqliteResult<Message> {
 
 /// Convert a row to a ProcessedMessage struct
 pub fn row_to_processed_message(row: &Row) -> SqliteResult<ProcessedMessage> {
-    let wrapper_event_id_blob: &[u8] = row.get_ref("wrapper_event_id")?.as_blob()?;
-    let message_event_id_blob: Option<&[u8]> =
-        row.get_ref("message_event_id")?.as_blob_or_null()?;
-    let processed_at_value: u64 = row.get("processed_at")?;
+    let wrapper_event_id = blob_to_event_id(row, "wrapper_event_id", "Invalid wrapper event ID")?;
+    let message_event_id =
+        blob_to_optional_event_id(row, "message_event_id", "Invalid message event ID")?;
+    let processed_at = Timestamp::from_secs(row.get("processed_at")?);
     let epoch: Option<u64> = row.get("epoch")?;
-    let mls_group_id_blob: Option<&[u8]> = row.get_ref("mls_group_id")?.as_blob_or_null()?;
-    let state_str: &str = row.get_ref("state")?.as_str()?;
+    let mls_group_id: Option<GroupId> = row
+        .get_ref("mls_group_id")?
+        .as_blob_or_null()?
+        .map(GroupId::from_slice);
+    let state: ProcessedMessageState = text_to_state(row, "state")?;
     let failure_reason: Option<String> = row.get("failure_reason")?;
-
-    // Parse values
-    let wrapper_event_id: EventId = EventId::from_slice(wrapper_event_id_blob)
-        .map_err(|_| map_invalid_blob_data("Invalid wrapper event ID"))?;
-
-    let message_event_id: Option<EventId> = match message_event_id_blob {
-        Some(id_blob) => Some(
-            EventId::from_slice(id_blob)
-                .map_err(|_| map_invalid_blob_data("Invalid message event ID"))?,
-        ),
-        None => None,
-    };
-
-    let mls_group_id: Option<GroupId> = mls_group_id_blob.map(GroupId::from_slice);
-
-    let processed_at: Timestamp = Timestamp::from_secs(processed_at_value);
-    let state: ProcessedMessageState = ProcessedMessageState::from_str(state_str)
-        .map_err(|_| map_invalid_text_data("Invalid state"))?;
 
     Ok(ProcessedMessage {
         wrapper_event_id,
@@ -317,9 +309,9 @@ pub fn row_to_processed_message(row: &Row) -> SqliteResult<ProcessedMessage> {
 
 /// Convert a row to a Welcome struct
 pub fn row_to_welcome(row: &Row) -> SqliteResult<Welcome> {
-    let id_blob: &[u8] = row.get_ref("id")?.as_blob()?;
-    let event_json: &str = row.get_ref("event")?.as_str()?;
-    let mls_group_id: GroupId = GroupId::from_slice(row.get_ref("mls_group_id")?.as_blob()?);
+    let id = blob_to_event_id(row, "id", "Invalid event ID")?;
+    let event = text_to_parsed(row, "event", |s| UnsignedEvent::from_json(s))?;
+    let mls_group_id = blob_to_group_id(row, "mls_group_id")?;
     let nostr_group_id: [u8; 32] = row.get("nostr_group_id")?;
     let group_name: String = row.get("group_name")?;
     let group_description: String = row.get("group_description")?;
@@ -332,34 +324,12 @@ pub fn row_to_welcome(row: &Row) -> SqliteResult<Welcome> {
     let group_image_nonce: Option<mdk_storage_traits::Secret<[u8; 12]>> = row
         .get::<_, Option<Nonce12>>("group_image_nonce")?
         .map(|n| mdk_storage_traits::Secret::new(n.into()));
-    let group_admin_pubkeys_json: &str = row.get_ref("group_admin_pubkeys")?.as_str()?;
-    let group_relays_json: &str = row.get_ref("group_relays")?.as_str()?;
-    let welcomer_blob: &[u8] = row.get_ref("welcomer")?.as_blob()?;
+    let group_admin_pubkeys: BTreeSet<PublicKey> = text_to_json(row, "group_admin_pubkeys")?;
+    let group_relays: BTreeSet<RelayUrl> = text_to_json(row, "group_relays")?;
+    let welcomer = blob_to_pubkey(row, "welcomer", "Invalid welcomer public key")?;
     let member_count: u64 = row.get("member_count")?;
-    let state_str: &str = row.get_ref("state")?.as_str()?;
-    let wrapper_event_id_blob: &[u8] = row.get_ref("wrapper_event_id")?.as_blob()?;
-
-    // Parse values
-    let id: EventId =
-        EventId::from_slice(id_blob).map_err(|_| map_invalid_blob_data("Invalid event ID"))?;
-
-    let event: UnsignedEvent =
-        UnsignedEvent::from_json(event_json).map_err(map_to_text_boxed_error)?;
-
-    let group_admin_pubkeys: BTreeSet<PublicKey> =
-        serde_json::from_str(group_admin_pubkeys_json).map_err(map_to_text_boxed_error)?;
-
-    let group_relays: BTreeSet<RelayUrl> =
-        serde_json::from_str(group_relays_json).map_err(map_to_text_boxed_error)?;
-
-    let welcomer: PublicKey = PublicKey::from_slice(welcomer_blob)
-        .map_err(|_| map_invalid_blob_data("Invalid welcomer public key"))?;
-
-    let wrapper_event_id: EventId = EventId::from_slice(wrapper_event_id_blob)
-        .map_err(|_| map_invalid_blob_data("Invalid wrapper event ID"))?;
-
-    let state: WelcomeState =
-        WelcomeState::from_str(state_str).map_err(|_| map_invalid_text_data("Invalid state"))?;
+    let state: WelcomeState = text_to_state(row, "state")?;
+    let wrapper_event_id = blob_to_event_id(row, "wrapper_event_id", "Invalid wrapper event ID")?;
 
     Ok(Welcome {
         id,
@@ -382,35 +352,20 @@ pub fn row_to_welcome(row: &Row) -> SqliteResult<Welcome> {
 
 /// Convert a row to a ProcessedWelcome struct
 pub fn row_to_processed_welcome(row: &Row) -> SqliteResult<ProcessedWelcome> {
-    let wrapper_event_id_blob: &[u8] = row.get_ref("wrapper_event_id")?.as_blob()?;
-    let welcome_event_id_blob: Option<&[u8]> =
-        row.get_ref("welcome_event_id")?.as_blob_or_null()?;
-    let processed_at_value: u64 = row.get("processed_at")?;
-    let state_str: &str = row.get_ref("state")?.as_str()?;
-    let failure_reason: Option<String> = row.get("failure_reason")?;
-
-    // Parse values
-    let wrapper_event_id: EventId = EventId::from_slice(wrapper_event_id_blob)
-        .map_err(|_| map_invalid_blob_data("Invalid wrapper event ID"))?;
-
-    let welcome_event_id: Option<EventId> = match welcome_event_id_blob {
-        Some(id_blob) => Some(
-            EventId::from_slice(id_blob)
-                .map_err(|_| map_invalid_blob_data("Invalid welcome event ID"))?,
-        ),
-        None => None,
-    };
-
-    let processed_at: Timestamp = Timestamp::from_secs(processed_at_value);
-    let state: ProcessedWelcomeState = ProcessedWelcomeState::from_str(state_str)
-        .map_err(|_| map_invalid_text_data("Invalid state"))?;
-
     Ok(ProcessedWelcome {
-        wrapper_event_id,
-        welcome_event_id,
-        processed_at,
-        state,
-        failure_reason,
+        wrapper_event_id: blob_to_event_id(
+            row,
+            "wrapper_event_id",
+            "Invalid wrapper event ID",
+        )?,
+        welcome_event_id: blob_to_optional_event_id(
+            row,
+            "welcome_event_id",
+            "Invalid welcome event ID",
+        )?,
+        processed_at: Timestamp::from_secs(row.get("processed_at")?),
+        state: text_to_state(row, "state")?,
+        failure_reason: row.get("failure_reason")?,
     })
 }
 
