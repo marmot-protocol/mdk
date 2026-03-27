@@ -66,6 +66,35 @@ pub(crate) fn create_processed_message_record(
 /// Default number of epochs to look back when trying to decrypt messages with older exporter secrets
 pub(crate) const DEFAULT_EPOCH_LOOKBACK: u64 = 5;
 
+/// Additional context captured while processing an MLS message.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MessageProcessingContext {
+    /// The MLS sender leaf index when the sender is a group member.
+    pub sender_leaf_index: Option<u32>,
+}
+
+/// Message-processing result paired with transient MLS context.
+#[derive(Debug)]
+pub struct MessageProcessingOutcome {
+    /// The primary processing result.
+    pub result: MessageProcessingResult,
+    /// Additional transient context captured during processing.
+    pub context: MessageProcessingContext,
+}
+
+impl MessageProcessingOutcome {
+    pub(crate) fn new(result: MessageProcessingResult, sender_leaf_index: Option<u32>) -> Self {
+        Self {
+            result,
+            context: MessageProcessingContext { sender_leaf_index },
+        }
+    }
+
+    pub(crate) fn without_context(result: MessageProcessingResult) -> Self {
+        Self::new(result, None)
+    }
+}
+
 /// MessageProcessingResult covers the full spectrum of responses that we can get back from attempting to process a message
 pub enum MessageProcessingResult {
     /// An application message (this is usually a message in a chat)

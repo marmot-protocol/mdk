@@ -11,7 +11,7 @@
 //! is used internally by the MLS protocol, while the Nostr group ID is used for
 //! relay-based message routing and group discovery.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use mdk_storage_traits::GroupId;
 use mdk_storage_traits::MdkStorageProvider;
@@ -551,6 +551,30 @@ where
             acc.insert(public_key);
             Ok(acc)
         })
+    }
+
+    /// Returns the local member's current MLS leaf index for a group.
+    pub fn own_leaf_index(&self, group_id: &GroupId) -> Result<u32, Error> {
+        let group = self.load_mls_group(group_id)?.ok_or(Error::GroupNotFound)?;
+        Ok(group.own_leaf_index().u32())
+    }
+
+    /// Returns the current active MLS leaf positions and their bound Nostr public keys.
+    ///
+    /// Removed-member tree holes are omitted by design. Callers should not
+    /// expect every index in a contiguous `0..n` range to be present.
+    pub fn group_leaf_map(&self, group_id: &GroupId) -> Result<BTreeMap<u32, PublicKey>, Error> {
+        let group = self.load_mls_group(group_id)?.ok_or(Error::GroupNotFound)?;
+
+        group
+            .members()
+            .try_fold(BTreeMap::new(), |mut acc, member| {
+                let credentials: BasicCredential = BasicCredential::try_from(member.credential)?;
+                let identity_bytes: &[u8] = credentials.identity();
+                let public_key = self.parse_credential_identity(identity_bytes)?;
+                acc.insert(member.index.u32(), public_key);
+                Ok(acc)
+            })
     }
 
     /// Returns public information about the ratchet tree of an MLS group
@@ -5849,5 +5873,84 @@ mod tests {
             .expect("second call");
 
         assert_eq!(info1, info2, "ratchet tree info should be deterministic");
+    }
+
+    #[test]
+    fn test_own_leaf_index_and_group_leaf_map() {
+        let alice_mdk = create_test_mdk();
+        let bob_mdk = create_test_mdk();
+        let alice_keys = Keys::generate();
+        let bob_keys = Keys::generate();
+        let bob_key_package = create_key_package_event(&bob_mdk, &bob_keys);
+
+        let create_result = alice_mdk
+            .create_group(
+                &alice_keys.public_key(),
+                vec![bob_key_package],
+                create_nostr_group_config_data(vec![alice_keys.public_key()]),
+            )
+            .expect("Alice should create group");
+
+        let group_id = create_result.group.mls_group_id.clone();
+        let bob_welcome_rumor = &create_result.welcome_rumors[0];
+        let bob_welcome = bob_mdk
+            .process_welcome(&nostr::EventId::all_zeros(), bob_welcome_rumor)
+            .expect("Bob should process welcome");
+
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("Alice should merge commit");
+        bob_mdk
+            .accept_welcome(&bob_welcome)
+            .expect("Bob should accept welcome");
+
+        assert_eq!(alice_mdk.own_leaf_index(&group_id).unwrap(), 0);
+        assert_eq!(bob_mdk.own_leaf_index(&group_id).unwrap(), 1);
+
+        let leaf_map = alice_mdk.group_leaf_map(&group_id).unwrap();
+        assert_eq!(leaf_map.get(&0), Some(&alice_keys.public_key()));
+        assert_eq!(leaf_map.get(&1), Some(&bob_keys.public_key()));
+    }
+
+    #[test]
+    fn test_group_leaf_map_preserves_tree_holes() {
+        let alice_keys = Keys::generate();
+        let bob_keys = Keys::generate();
+        let charlie_keys = Keys::generate();
+        let dave_keys = Keys::generate();
+
+        let alice_mdk = create_test_mdk();
+        let bob_mdk = create_test_mdk();
+        let charlie_mdk = create_test_mdk();
+        let dave_mdk = create_test_mdk();
+
+        let create_result = alice_mdk
+            .create_group(
+                &alice_keys.public_key(),
+                vec![
+                    create_key_package_event(&bob_mdk, &bob_keys),
+                    create_key_package_event(&charlie_mdk, &charlie_keys),
+                    create_key_package_event(&dave_mdk, &dave_keys),
+                ],
+                create_nostr_group_config_data(vec![alice_keys.public_key()]),
+            )
+            .expect("Alice should create group");
+
+        let group_id = create_result.group.mls_group_id.clone();
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("Alice should merge commit");
+        alice_mdk
+            .remove_members(&group_id, &[charlie_keys.public_key()])
+            .expect("Should remove Charlie");
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("Should merge Charlie removal");
+
+        let leaf_map = alice_mdk.group_leaf_map(&group_id).unwrap();
+        assert_eq!(leaf_map.get(&0), Some(&alice_keys.public_key()));
+        assert_eq!(leaf_map.get(&1), Some(&bob_keys.public_key()));
+        assert_eq!(leaf_map.get(&3), Some(&dave_keys.public_key()));
+        assert!(!leaf_map.contains_key(&2));
     }
 }

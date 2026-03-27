@@ -28,6 +28,9 @@ pub mod groups;
 pub mod key_packages;
 pub mod media_processing;
 pub mod messages;
+#[cfg(feature = "mip05")]
+#[cfg_attr(docsrs, doc(cfg(feature = "mip05")))]
+pub mod mip05;
 pub mod prelude;
 #[cfg(test)]
 pub mod test_util;

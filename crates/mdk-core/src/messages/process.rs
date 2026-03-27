@@ -9,13 +9,14 @@ use nostr::{Event, Timestamp};
 use openmls::group::{ProcessMessageError, ValidationError};
 use openmls::prelude::{
     ContentType, MlsGroup, MlsMessageIn, ProcessedMessage, ProcessedMessageContent, Proposal,
+    Sender,
 };
 use tls_codec::Deserialize as TlsDeserialize;
 
 use crate::MDK;
 use crate::error::Error;
 
-use super::{MessageProcessingResult, Result};
+use super::{MessageProcessingOutcome, MessageProcessingResult, Result};
 
 impl<Storage> MDK<Storage>
 where
@@ -107,41 +108,51 @@ where
     ///
     /// # Returns
     ///
-    /// * `Ok(MessageProcessingResult)` - The result based on message type
+    /// * `Ok(MessageProcessingOutcome)` - The result plus transient sender context
     /// * `Err(Error)` - If message processing fails
-    pub(super) fn dispatch_by_content_type(
+    pub(super) fn dispatch_by_content_type_with_context(
         &self,
         group: group_types::Group,
         mls_group: &mut MlsGroup,
         message_bytes: &[u8],
         event: &Event,
-    ) -> Result<MessageProcessingResult> {
+    ) -> Result<MessageProcessingOutcome> {
         match self.process_mls_message(mls_group, message_bytes) {
             Ok(processed_mls_message) => {
                 // Clone the sender's credential and sender for validation before consuming
                 let sender_credential = processed_mls_message.credential().clone();
                 let message_sender = processed_mls_message.sender().clone();
+                let sender_leaf_index = sender_leaf_index(&message_sender);
 
                 match processed_mls_message.into_content() {
                     ProcessedMessageContent::ApplicationMessage(application_message) => {
-                        Ok(MessageProcessingResult::ApplicationMessage(
-                            self.process_application_message(
-                                group,
-                                mls_group.epoch().as_u64(),
-                                event,
-                                application_message,
-                                sender_credential,
-                            )?,
+                        Ok(MessageProcessingOutcome::new(
+                            MessageProcessingResult::ApplicationMessage(
+                                self.process_application_message(
+                                    group,
+                                    mls_group.epoch().as_u64(),
+                                    event,
+                                    application_message,
+                                    sender_credential,
+                                )?,
+                            ),
+                            sender_leaf_index,
                         ))
                     }
                     ProcessedMessageContent::ProposalMessage(staged_proposal) => {
-                        self.process_proposal(mls_group, event, *staged_proposal)
+                        Ok(MessageProcessingOutcome::new(
+                            self.process_proposal(mls_group, event, *staged_proposal)?,
+                            sender_leaf_index,
+                        ))
                     }
                     ProcessedMessageContent::StagedCommitMessage(staged_commit) => {
                         self.process_commit(mls_group, event, *staged_commit, &message_sender)?;
-                        Ok(MessageProcessingResult::Commit {
-                            mls_group_id: group.mls_group_id.clone(),
-                        })
+                        Ok(MessageProcessingOutcome::new(
+                            MessageProcessingResult::Commit {
+                                mls_group_id: group.mls_group_id.clone(),
+                            },
+                            sender_leaf_index,
+                        ))
                     }
                     ProcessedMessageContent::ExternalJoinProposalMessage(
                         _external_join_proposal,
@@ -158,9 +169,12 @@ where
 
                         self.save_processed_message_record(processed_message)?;
 
-                        Ok(MessageProcessingResult::ExternalJoinProposal {
-                            mls_group_id: group.mls_group_id.clone(),
-                        })
+                        Ok(MessageProcessingOutcome::new(
+                            MessageProcessingResult::ExternalJoinProposal {
+                                mls_group_id: group.mls_group_id.clone(),
+                            },
+                            sender_leaf_index,
+                        ))
                     }
                 }
             }
@@ -212,9 +226,11 @@ where
                 // Check if the local member was removed by this commit
                 if mls_group.own_leaf().is_none() {
                     return match self.handle_local_member_eviction(&group.mls_group_id, event) {
-                        Ok(_) => Ok(MessageProcessingResult::Commit {
-                            mls_group_id: group.mls_group_id.clone(),
-                        }),
+                        Ok(_) => Ok(MessageProcessingOutcome::without_context(
+                            MessageProcessingResult::Commit {
+                                mls_group_id: group.mls_group_id.clone(),
+                            },
+                        )),
                         Err(e) => Err(e),
                     };
                 }
@@ -269,9 +285,12 @@ where
 
                 self.save_processed_message_record(processed_message)?;
 
-                Ok(MessageProcessingResult::Commit {
-                    mls_group_id: group.mls_group_id.clone(),
-                })
+                Ok(MessageProcessingOutcome::new(
+                    MessageProcessingResult::Commit {
+                        mls_group_id: group.mls_group_id.clone(),
+                    },
+                    Some(mls_group.own_leaf_index().u32()),
+                ))
             }
             Err(e) => Err(e),
         }
@@ -299,7 +318,14 @@ where
     /// * `Ok(MessageProcessingResult)` - Result indicating the type of message processed
     /// * `Err(Error)` - If message processing fails
     pub fn process_message(&self, event: &Event) -> Result<MessageProcessingResult> {
-        self.process_message_inner(event, None)
+        self.process_message_with_context_inner(event, None)
+            .map(|outcome| outcome.result)
+    }
+
+    /// Processes an incoming encrypted Nostr event and returns the result plus
+    /// transient MLS context such as sender leaf index.
+    pub fn process_message_with_context(&self, event: &Event) -> Result<MessageProcessingOutcome> {
+        self.process_message_with_context_inner(event, None)
     }
 
     #[cfg(test)]
@@ -308,14 +334,15 @@ where
         event: &Event,
         now: Timestamp,
     ) -> Result<MessageProcessingResult> {
-        self.process_message_inner(event, Some(now))
+        self.process_message_with_context_inner(event, Some(now))
+            .map(|outcome| outcome.result)
     }
 
-    fn process_message_inner(
+    fn process_message_with_context_inner(
         &self,
         event: &Event,
         now: Option<Timestamp>,
-    ) -> Result<MessageProcessingResult> {
+    ) -> Result<MessageProcessingOutcome> {
         // Step 0: Check if already processed (deduplication)
         if let Some(processed) = self
             .storage()
@@ -344,14 +371,18 @@ where
                             target: "mdk_core::messages::process_message",
                             "Returning Unprocessable for previously failed/invalidated message with extracted group_id"
                         );
-                        return Ok(MessageProcessingResult::Unprocessable { mls_group_id });
+                        return Ok(MessageProcessingOutcome::without_context(
+                            MessageProcessingResult::Unprocessable { mls_group_id },
+                        ));
                     }
                     None => {
                         tracing::debug!(
                             target: "mdk_core::messages::process_message",
                             "Returning PreviouslyFailed for message without extractable group_id"
                         );
-                        return Ok(MessageProcessingResult::PreviouslyFailed);
+                        return Ok(MessageProcessingOutcome::without_context(
+                            MessageProcessingResult::PreviouslyFailed,
+                        ));
                     }
                 }
             }
@@ -422,13 +453,26 @@ where
         };
 
         // Step 3: Process the decrypted message
-        match self.dispatch_by_content_type(group.clone(), &mut mls_group, &message_bytes, event) {
-            Ok(result) => Ok(result),
-            Err(error) => {
-                // Step 4: Handle errors with specialized recovery logic
-                self.handle_processing_error(error, event, &group)
-            }
+        match self.dispatch_by_content_type_with_context(
+            group.clone(),
+            &mut mls_group,
+            &message_bytes,
+            event,
+        ) {
+            Ok(outcome) => Ok(outcome),
+            Err(error) => self.handle_processing_error(error, event, &group),
         }
+    }
+}
+
+/// Return the MLS sender leaf index for member-authored messages.
+///
+/// External senders and new-member proposal/commit senders do not map to a
+/// current group leaf, so they return `None`.
+fn sender_leaf_index(sender: &Sender) -> Option<u32> {
+    match sender {
+        Sender::Member(index) => Some(index.u32()),
+        _ => None,
     }
 }
 
@@ -522,6 +566,103 @@ mod tests {
             MessageProcessingResult::PreviouslyFailed => {}
             _ => panic!("Expected PreviouslyFailed variant"),
         }
+    }
+
+    #[test]
+    fn test_process_message_with_context_returns_sender_leaf_index() {
+        let alice_mdk = create_test_mdk();
+        let bob_mdk = create_test_mdk();
+        let alice_keys = Keys::generate();
+        let bob_keys = Keys::generate();
+        let bob_key_package = create_key_package_event(&bob_mdk, &bob_keys);
+
+        let create_result = alice_mdk
+            .create_group(
+                &alice_keys.public_key(),
+                vec![bob_key_package],
+                create_nostr_group_config_data(vec![alice_keys.public_key()]),
+            )
+            .expect("Alice should create group");
+
+        let group_id = create_result.group.mls_group_id.clone();
+
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("Alice should merge initial commit");
+
+        let bob_welcome = bob_mdk
+            .process_welcome(
+                &nostr::EventId::all_zeros(),
+                &create_result.welcome_rumors[0],
+            )
+            .expect("Bob should process welcome");
+        bob_mdk
+            .accept_welcome(&bob_welcome)
+            .expect("Bob should accept welcome");
+
+        let rumor = create_test_rumor(&alice_keys, "Hello from Alice");
+        let event = alice_mdk
+            .create_message(&group_id, rumor)
+            .expect("Alice should create message");
+
+        let outcome = bob_mdk
+            .process_message_with_context(&event)
+            .expect("Bob should process Alice's message");
+
+        assert_eq!(outcome.context.sender_leaf_index, Some(0));
+
+        match outcome.result {
+            MessageProcessingResult::ApplicationMessage(message) => {
+                assert_eq!(message.content, "Hello from Alice");
+            }
+            _ => panic!("Expected ApplicationMessage result"),
+        }
+    }
+
+    #[test]
+    fn test_process_message_with_context_returns_own_sender_leaf_index_for_cached_message() {
+        let (alice_mdk, _bob_mdk, alice_keys, _bob_keys, group_id) = setup_two_member_group();
+        let rumor = create_test_rumor(&alice_keys, "Hello from Alice");
+        let event = alice_mdk
+            .create_message(&group_id, rumor)
+            .expect("Alice should create message");
+
+        let outcome = alice_mdk
+            .process_message_with_context(&event)
+            .expect("Alice should recover her own cached message");
+
+        assert_eq!(outcome.context.sender_leaf_index, Some(0));
+
+        match outcome.result {
+            MessageProcessingResult::ApplicationMessage(message) => {
+                assert_eq!(message.content, "Hello from Alice");
+            }
+            _ => panic!("Expected ApplicationMessage result"),
+        }
+    }
+
+    #[test]
+    fn test_process_message_with_context_returns_own_sender_leaf_index_for_pending_commit() {
+        let mdk = create_test_mdk();
+        let (creator, members, admins) = create_test_group_members();
+        let group_id = create_test_group(&mdk, &creator, &members, &admins);
+
+        let update_result = mdk
+            .update_group_data(
+                &group_id,
+                NostrGroupDataUpdate::new().name("Updated via pending commit".to_string()),
+            )
+            .expect("Failed to update group name");
+
+        let outcome = mdk
+            .process_message_with_context(&update_result.evolution_event)
+            .expect("Failed to process own pending commit");
+
+        assert_eq!(outcome.context.sender_leaf_index, Some(0));
+        assert!(matches!(
+            outcome.result,
+            MessageProcessingResult::Commit { .. }
+        ));
     }
 
     #[test]
@@ -740,13 +881,14 @@ mod tests {
         assert_eq!(out_of_sync_group.epoch, initial_epoch);
 
         // Process our own commit message - this should trigger sync even though it's marked as ProcessedCommit
-        let message_result = mdk
-            .process_message(&update_result.evolution_event)
+        let outcome = mdk
+            .process_message_with_context(&update_result.evolution_event)
             .expect("Failed to process own commit message");
 
         // Verify it returns Commit result (our fix should handle epoch mismatch errors)
+        assert_eq!(outcome.context.sender_leaf_index, Some(0));
         assert!(matches!(
-            message_result,
+            outcome.result,
             MessageProcessingResult::Commit { .. }
         ));
 

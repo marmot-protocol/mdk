@@ -10,7 +10,7 @@ use nostr::{Event, EventId, Timestamp};
 use crate::MDK;
 use crate::error::Error;
 
-use super::{MessageProcessingResult, Result};
+use super::{MessageProcessingContext, MessageProcessingOutcome, MessageProcessingResult, Result};
 
 impl<Storage> MDK<Storage>
 where
@@ -132,7 +132,7 @@ where
     pub(super) fn return_own_commit(
         &self,
         group: &group_types::Group,
-    ) -> Result<MessageProcessingResult> {
+    ) -> Result<MessageProcessingOutcome> {
         if let Err(_e) = self.sync_group_metadata_from_mls(&group.mls_group_id) {
             tracing::warn!(
                 target: "mdk_core::messages::return_own_commit",
@@ -141,9 +141,29 @@ where
             return Err(Error::Message("Failed to sync group metadata".to_string()));
         }
 
-        Ok(MessageProcessingResult::Commit {
-            mls_group_id: group.mls_group_id.clone(),
-        })
+        Ok(self.own_message_outcome(
+            group,
+            MessageProcessingResult::Commit {
+                mls_group_id: group.mls_group_id.clone(),
+            },
+        ))
+    }
+
+    fn own_message_context(&self, group: &group_types::Group) -> MessageProcessingContext {
+        MessageProcessingContext {
+            sender_leaf_index: self.own_leaf_index(&group.mls_group_id).ok(),
+        }
+    }
+
+    fn own_message_outcome(
+        &self,
+        group: &group_types::Group,
+        result: MessageProcessingResult,
+    ) -> MessageProcessingOutcome {
+        MessageProcessingOutcome {
+            result,
+            context: self.own_message_context(group),
+        }
     }
 
     /// Handles processing errors with specific error recovery logic
@@ -160,14 +180,14 @@ where
     ///
     /// # Returns
     ///
-    /// * `Ok(MessageProcessingResult)` - Recovery result or unprocessable status
+    /// * `Ok(MessageProcessingOutcome)` - Recovery result or unprocessable status
     /// * `Err(Error)` - If error handling itself fails
     pub(super) fn handle_processing_error(
         &self,
         error: Error,
         event: &Event,
         group: &group_types::Group,
-    ) -> Result<MessageProcessingResult> {
+    ) -> Result<MessageProcessingOutcome> {
         match error {
             Error::CannotDecryptOwnMessage => {
                 tracing::debug!(target: "mdk_core::messages::process_message", "Cannot decrypt own message, checking for cached message");
@@ -210,7 +230,10 @@ where
                         let message = self
                             .get_message(&group.mls_group_id, &message_event_id)?
                             .ok_or(Error::MessageNotFound)?;
-                        Ok(MessageProcessingResult::ApplicationMessage(message))
+                        Ok(self.own_message_outcome(
+                            group,
+                            MessageProcessingResult::ApplicationMessage(message),
+                        ))
                     }
                     message_types::ProcessedMessageState::Retryable => {
                         // Retryable messages are ones that previously failed due to wrong epoch keys
@@ -260,8 +283,9 @@ where
                                             )
                                         })?
                                         .ok_or(Error::MessageNotFound)?;
-                                    return Ok(MessageProcessingResult::ApplicationMessage(
-                                        message,
+                                    return Ok(self.own_message_outcome(
+                                        group,
+                                        MessageProcessingResult::ApplicationMessage(message),
                                     ));
                                 }
                                 None => {
@@ -276,9 +300,11 @@ where
                             target: "mdk_core::messages::process_message",
                             "Retryable own message has no cached content - cannot recover"
                         );
-                        Ok(MessageProcessingResult::Unprocessable {
-                            mls_group_id: group.mls_group_id.clone(),
-                        })
+                        Ok(MessageProcessingOutcome::without_context(
+                            MessageProcessingResult::Unprocessable {
+                                mls_group_id: group.mls_group_id.clone(),
+                            },
+                        ))
                     }
                     message_types::ProcessedMessageState::ProcessedCommit => {
                         tracing::debug!(target: "mdk_core::messages::process_message", "Message already processed as a commit");
@@ -288,9 +314,11 @@ where
                     | message_types::ProcessedMessageState::Failed
                     | message_types::ProcessedMessageState::EpochInvalidated => {
                         tracing::debug!(target: "mdk_core::messages::process_message", "Message cannot be processed (already processed, failed, or epoch invalidated)");
-                        Ok(MessageProcessingResult::Unprocessable {
-                            mls_group_id: group.mls_group_id.clone(),
-                        })
+                        Ok(MessageProcessingOutcome::without_context(
+                            MessageProcessingResult::Unprocessable {
+                                mls_group_id: group.mls_group_id.clone(),
+                            },
+                        ))
                     }
                 }
             }
@@ -365,7 +393,7 @@ where
 
                             // Recursively call process_message now that state is rolled back.
                             // This will reload the group and apply the new commit.
-                            return self.process_message(event);
+                            return self.process_message_with_context(event);
                         }
                         Err(_) => {
                             tracing::error!("Rollback failed");
@@ -387,14 +415,17 @@ where
                 // Not our own commit - this is a genuine error
                 tracing::error!(target: "mdk_core::messages::process_message", "Epoch mismatch for message that is not our own commit");
                 self.fail_unprocessable(event.id, &error, group)
+                    .map(MessageProcessingOutcome::without_context)
             }
             Error::ProcessMessageWrongGroupId => {
                 tracing::error!(target: "mdk_core::messages::process_message", "Group ID mismatch");
                 self.fail_unprocessable(event.id, &error, group)
+                    .map(MessageProcessingOutcome::without_context)
             }
             Error::ProcessMessageUseAfterEviction => {
                 tracing::error!(target: "mdk_core::messages::process_message", "Attempted to use group after eviction");
                 self.fail_unprocessable(event.id, &error, group)
+                    .map(MessageProcessingOutcome::without_context)
             }
             Error::CommitFromNonAdmin => {
                 // Authorization errors should propagate as errors, not be silently swallowed
@@ -415,6 +446,7 @@ where
             _ => {
                 tracing::error!(target: "mdk_core::messages::process_message", "Unexpected error processing message");
                 self.fail_unprocessable(event.id, &error, group)
+                    .map(MessageProcessingOutcome::without_context)
             }
         }
     }

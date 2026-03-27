@@ -15,6 +15,7 @@ categories = ["cryptography", "network-programming"]
 [features]
 default = []
 mip04 = []
+mip05 = []
 debug-examples = []
 
 [dependencies]
@@ -29,6 +30,7 @@ serde = { workspace = true, features = ["derive"] }
 tls_codec.workspace = true
 tracing = { workspace = true, features = ["std"] }
 thiserror.workspace = true
+zeroize.workspace = true
 
 # Crypto dependencies for MIP-01 (group image encryption) and MIP-03 message encryption - mandatory
 base64.workspace = true

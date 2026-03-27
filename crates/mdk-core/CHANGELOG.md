@@ -15,6 +15,9 @@
 
 ### Added
 
+- Added feature-gated `mip05` protocol primitives in `mdk-core`, including typed token payloads, strict token encryption/decryption helpers, and rumor build/parse helpers for MIP-05 `kind:447`, `kind:448`, and `kind:449`. ([#235](https://github.com/marmot-protocol/mdk/pull/235))
+- Added public MLS leaf-index helpers via `process_message_with_context`, `own_leaf_index`, and `group_leaf_map` so clients can access sender, local, and active group leaf positions without ratchet-tree workarounds. ([#235](https://github.com/marmot-protocol/mdk/pull/235))
+
 ### Fixed
 
 ### Removed
