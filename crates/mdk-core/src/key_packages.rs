@@ -1514,6 +1514,95 @@ mod tests {
         }
     }
 
+    /// Regression test: missing mls_proposals tag is rejected by is_proposals_tag / require flow.
+    ///
+    /// If the `require(Self::is_proposals_tag, "mls_proposals")` line at key_packages.rs:426
+    /// is removed or the helper is broken, this test will fail.
+    #[test]
+    fn test_validate_missing_mls_proposals_tag() {
+        let mdk = create_test_mdk();
+        let test_pubkey =
+            PublicKey::from_hex("884704bd421671e01c13f854d2ce23ce2a5bfe9562f4f297ad2bc921ba30c3a6")
+                .unwrap();
+
+        let KeyPackageEventData {
+            content: key_package_hex,
+            ..
+        } = mdk
+            .create_key_package_for_event(&test_pubkey, vec![])
+            .expect("Failed to create key package");
+
+        // All required tags present except mls_proposals
+        let tags = vec![
+            Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
+            Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
+            Tag::custom(TagKind::MlsExtensions, ["0x000a", "0xf2ee"]),
+            Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
+            Tag::custom(TagKind::i(), [hex::encode([0xaa; 32])]),
+        ];
+
+        let event = EventBuilder::new(MLS_KEY_PACKAGE_KIND, key_package_hex)
+            .tags(tags)
+            .sign_with_keys(&nostr::Keys::generate())
+            .unwrap();
+
+        let result = mdk.validate_key_package_tags(&event, None);
+        assert!(
+            result.is_err(),
+            "Should reject event without mls_proposals tag"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("mls_proposals"),
+            "Error should name the missing tag, got: {err}"
+        );
+    }
+
+    /// Regression test: mls_proposals tag with wrong value is rejected.
+    ///
+    /// If the value-check branch at key_packages.rs:427-431
+    /// (`"Invalid mls_proposals tag value, expected 0x000a"`) is removed, this test fails.
+    #[test]
+    fn test_validate_wrong_mls_proposals_value() {
+        let mdk = create_test_mdk();
+        let test_pubkey =
+            PublicKey::from_hex("884704bd421671e01c13f854d2ce23ce2a5bfe9562f4f297ad2bc921ba30c3a6")
+                .unwrap();
+
+        let KeyPackageEventData {
+            content: key_package_hex,
+            ..
+        } = mdk
+            .create_key_package_for_event(&test_pubkey, vec![])
+            .expect("Failed to create key package");
+
+        // mls_proposals present but with an unrecognised value
+        let tags = vec![
+            Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
+            Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
+            Tag::custom(TagKind::MlsExtensions, ["0x000a", "0xf2ee"]),
+            Tag::custom(TagKind::Custom("mls_proposals".into()), ["0x0001"]), // wrong value
+            Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
+            Tag::custom(TagKind::i(), [hex::encode([0xaa; 32])]),
+        ];
+
+        let event = EventBuilder::new(MLS_KEY_PACKAGE_KIND, key_package_hex)
+            .tags(tags)
+            .sign_with_keys(&nostr::Keys::generate())
+            .unwrap();
+
+        let result = mdk.validate_key_package_tags(&event, None);
+        assert!(
+            matches!(result, Err(Error::KeyPackage(_))),
+            "Should return KeyPackage error for wrong mls_proposals value"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("Invalid mls_proposals tag value"),
+            "Error should identify the invalid value, got: {err}"
+        );
+    }
+
     /// Test that relays tag validation works correctly
     #[test]
     fn test_validate_relays_tag() {
