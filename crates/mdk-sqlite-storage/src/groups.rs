@@ -25,6 +25,67 @@ where
     GroupError::DatabaseError(e.to_string())
 }
 
+#[inline]
+fn group_not_found() -> GroupError {
+    GroupError::InvalidParameters("Group not found".to_string())
+}
+
+#[inline]
+fn validate_message_limit(limit: usize) -> Result<(), GroupError> {
+    if (1..=MAX_MESSAGE_LIMIT).contains(&limit) {
+        Ok(())
+    } else {
+        Err(GroupError::InvalidParameters(format!(
+            "Limit must be between 1 and {}, got {}",
+            MAX_MESSAGE_LIMIT, limit
+        )))
+    }
+}
+
+#[inline]
+fn ensure_group_exists(
+    storage: &MdkSqliteStorage,
+    mls_group_id: &GroupId,
+) -> Result<(), GroupError> {
+    if storage.find_group_by_mls_group_id(mls_group_id)?.is_some() {
+        Ok(())
+    } else {
+        Err(group_not_found())
+    }
+}
+
+#[inline]
+fn messages_query(sort_order: MessageSortOrder) -> &'static str {
+    match sort_order {
+        MessageSortOrder::CreatedAtFirst => {
+            "SELECT * FROM messages WHERE mls_group_id = ? \
+             ORDER BY created_at DESC, processed_at DESC, id DESC \
+             LIMIT ? OFFSET ?"
+        }
+        MessageSortOrder::ProcessedAtFirst => {
+            "SELECT * FROM messages WHERE mls_group_id = ? \
+             ORDER BY processed_at DESC, created_at DESC, id DESC \
+             LIMIT ? OFFSET ?"
+        }
+    }
+}
+
+#[inline]
+fn last_message_query(sort_order: MessageSortOrder) -> &'static str {
+    match sort_order {
+        MessageSortOrder::CreatedAtFirst => {
+            "SELECT * FROM messages WHERE mls_group_id = ? \
+             ORDER BY created_at DESC, processed_at DESC, id DESC \
+             LIMIT 1"
+        }
+        MessageSortOrder::ProcessedAtFirst => {
+            "SELECT * FROM messages WHERE mls_group_id = ? \
+             ORDER BY processed_at DESC, created_at DESC, id DESC \
+             LIMIT 1"
+        }
+    }
+}
+
 impl GroupStorage for MdkSqliteStorage {
     fn all_groups(&self) -> Result<Vec<Group>, GroupError> {
         self.with_connection(|conn| {
@@ -176,36 +237,16 @@ impl GroupStorage for MdkSqliteStorage {
         let limit = pagination.limit();
         let offset = pagination.offset();
 
-        // Validate limit is within allowed range
-        if !(1..=MAX_MESSAGE_LIMIT).contains(&limit) {
-            return Err(GroupError::InvalidParameters(format!(
-                "Limit must be between 1 and {}, got {}",
-                MAX_MESSAGE_LIMIT, limit
-            )));
-        }
+        validate_message_limit(limit)?;
 
-        // First verify the group exists
-        if self.find_group_by_mls_group_id(mls_group_id)?.is_none() {
-            return Err(GroupError::InvalidParameters("Group not found".to_string()));
-        }
+        ensure_group_exists(self, mls_group_id)?;
 
         let sort_order = pagination.sort_order();
 
         self.with_connection(|conn| {
-            let query = match sort_order {
-                MessageSortOrder::CreatedAtFirst => {
-                    "SELECT * FROM messages WHERE mls_group_id = ? \
-                     ORDER BY created_at DESC, processed_at DESC, id DESC \
-                     LIMIT ? OFFSET ?"
-                }
-                MessageSortOrder::ProcessedAtFirst => {
-                    "SELECT * FROM messages WHERE mls_group_id = ? \
-                     ORDER BY processed_at DESC, created_at DESC, id DESC \
-                     LIMIT ? OFFSET ?"
-                }
-            };
-
-            let mut stmt = conn.prepare(query).map_err(into_group_err)?;
+            let mut stmt = conn
+                .prepare(messages_query(sort_order))
+                .map_err(into_group_err)?;
 
             let messages_iter = stmt
                 .query_map(
@@ -230,25 +271,10 @@ impl GroupStorage for MdkSqliteStorage {
         mls_group_id: &GroupId,
         sort_order: MessageSortOrder,
     ) -> Result<Option<Message>, GroupError> {
-        if self.find_group_by_mls_group_id(mls_group_id)?.is_none() {
-            return Err(GroupError::InvalidParameters("Group not found".to_string()));
-        }
+        ensure_group_exists(self, mls_group_id)?;
 
         self.with_connection(|conn| {
-            let query = match sort_order {
-                MessageSortOrder::CreatedAtFirst => {
-                    "SELECT * FROM messages WHERE mls_group_id = ? \
-                     ORDER BY created_at DESC, processed_at DESC, id DESC \
-                     LIMIT 1"
-                }
-                MessageSortOrder::ProcessedAtFirst => {
-                    "SELECT * FROM messages WHERE mls_group_id = ? \
-                     ORDER BY processed_at DESC, created_at DESC, id DESC \
-                     LIMIT 1"
-                }
-            };
-
-            conn.prepare(query)
+            conn.prepare(last_message_query(sort_order))
                 .map_err(into_group_err)?
                 .query_row(params![mls_group_id.as_slice()], db::row_to_message)
                 .optional()
@@ -260,15 +286,12 @@ impl GroupStorage for MdkSqliteStorage {
         // Get the group which contains the admin_pubkeys
         match self.find_group_by_mls_group_id(mls_group_id)? {
             Some(group) => Ok(group.admin_pubkeys),
-            None => Err(GroupError::InvalidParameters("Group not found".to_string())),
+            None => Err(group_not_found()),
         }
     }
 
     fn group_relays(&self, mls_group_id: &GroupId) -> Result<BTreeSet<GroupRelay>, GroupError> {
-        // First verify the group exists
-        if self.find_group_by_mls_group_id(mls_group_id)?.is_none() {
-            return Err(GroupError::InvalidParameters("Group not found".to_string()));
-        }
+        ensure_group_exists(self, mls_group_id)?;
 
         self.with_connection(|conn| {
             let mut stmt = conn
@@ -295,10 +318,7 @@ impl GroupStorage for MdkSqliteStorage {
         group_id: &GroupId,
         relays: BTreeSet<RelayUrl>,
     ) -> Result<(), GroupError> {
-        // First verify the group exists
-        if self.find_group_by_mls_group_id(group_id)?.is_none() {
-            return Err(GroupError::InvalidParameters("Group not found".to_string()));
-        }
+        ensure_group_exists(self, group_id)?;
 
         self.with_connection(|conn| {
             // Use a savepoint for atomicity (works both inside/outside an existing transaction).
@@ -343,10 +363,7 @@ impl GroupStorage for MdkSqliteStorage {
         mls_group_id: &GroupId,
         epoch: u64,
     ) -> Result<Option<GroupExporterSecret>, GroupError> {
-        // First verify the group exists
-        if self.find_group_by_mls_group_id(mls_group_id)?.is_none() {
-            return Err(GroupError::InvalidParameters("Group not found".to_string()));
-        }
+        ensure_group_exists(self, mls_group_id)?;
 
         self.with_connection(|conn| {
             let mut stmt = conn
@@ -368,12 +385,7 @@ impl GroupStorage for MdkSqliteStorage {
         &self,
         group_exporter_secret: GroupExporterSecret,
     ) -> Result<(), GroupError> {
-        if self
-            .find_group_by_mls_group_id(&group_exporter_secret.mls_group_id)?
-            .is_none()
-        {
-            return Err(GroupError::InvalidParameters("Group not found".to_string()));
-        }
+        ensure_group_exists(self, &group_exporter_secret.mls_group_id)?;
 
         self.with_connection(|conn| {
             conn.execute(
@@ -391,9 +403,7 @@ impl GroupStorage for MdkSqliteStorage {
         mls_group_id: &GroupId,
         epoch: u64,
     ) -> Result<Option<GroupExporterSecret>, GroupError> {
-        if self.find_group_by_mls_group_id(mls_group_id)?.is_none() {
-            return Err(GroupError::InvalidParameters("Group not found".to_string()));
-        }
+        ensure_group_exists(self, mls_group_id)?;
 
         self.with_connection(|conn| {
             let mut stmt = conn
@@ -415,12 +425,7 @@ impl GroupStorage for MdkSqliteStorage {
         &self,
         group_exporter_secret: GroupExporterSecret,
     ) -> Result<(), GroupError> {
-        if self
-            .find_group_by_mls_group_id(&group_exporter_secret.mls_group_id)?
-            .is_none()
-        {
-            return Err(GroupError::InvalidParameters("Group not found".to_string()));
-        }
+        ensure_group_exists(self, &group_exporter_secret.mls_group_id)?;
 
         self.with_connection(|conn| {
             conn.execute(
@@ -438,10 +443,7 @@ impl GroupStorage for MdkSqliteStorage {
         mls_group_id: &GroupId,
         epoch: u64,
     ) -> Result<Option<GroupExporterSecret>, GroupError> {
-        // First verify the group exists
-        if self.find_group_by_mls_group_id(mls_group_id)?.is_none() {
-            return Err(GroupError::InvalidParameters("Group not found".to_string()));
-        }
+        ensure_group_exists(self, mls_group_id)?;
 
         self.with_connection(|conn| {
             let mut stmt = conn
@@ -463,12 +465,7 @@ impl GroupStorage for MdkSqliteStorage {
         &self,
         group_exporter_secret: GroupExporterSecret,
     ) -> Result<(), GroupError> {
-        if self
-            .find_group_by_mls_group_id(&group_exporter_secret.mls_group_id)?
-            .is_none()
-        {
-            return Err(GroupError::InvalidParameters("Group not found".to_string()));
-        }
+        ensure_group_exists(self, &group_exporter_secret.mls_group_id)?;
 
         self.with_connection(|conn| {
             conn.execute(
@@ -486,9 +483,7 @@ impl GroupStorage for MdkSqliteStorage {
         group_id: &GroupId,
         min_epoch_to_keep: u64,
     ) -> Result<(), GroupError> {
-        if self.find_group_by_mls_group_id(group_id)?.is_none() {
-            return Err(GroupError::InvalidParameters("Group not found".to_string()));
-        }
+        ensure_group_exists(self, group_id)?;
 
         self.with_connection(|conn| {
             conn.execute(

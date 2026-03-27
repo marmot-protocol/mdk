@@ -11,6 +11,46 @@ use nostr::{PublicKey, RelayUrl};
 
 use crate::MdkMemoryStorage;
 
+#[inline]
+fn group_not_found() -> GroupError {
+    GroupError::InvalidParameters("Group not found".to_string())
+}
+
+#[inline]
+fn validate_message_limit(limit: usize) -> Result<(), GroupError> {
+    if (1..=MAX_MESSAGE_LIMIT).contains(&limit) {
+        Ok(())
+    } else {
+        Err(GroupError::InvalidParameters(format!(
+            "Limit must be between 1 and {}, got {}",
+            MAX_MESSAGE_LIMIT, limit
+        )))
+    }
+}
+
+#[inline]
+fn sort_messages(messages: &mut [Message], sort_order: MessageSortOrder) {
+    match sort_order {
+        MessageSortOrder::CreatedAtFirst => {
+            messages.sort_by(|a, b| b.display_order_cmp(a));
+        }
+        MessageSortOrder::ProcessedAtFirst => {
+            messages.sort_by(|a, b| b.processed_at_order_cmp(a));
+        }
+    }
+}
+
+#[inline]
+fn newest_message<'a>(
+    messages: impl Iterator<Item = &'a Message>,
+    sort_order: MessageSortOrder,
+) -> Option<&'a Message> {
+    match sort_order {
+        MessageSortOrder::CreatedAtFirst => messages.max_by(|a, b| a.display_order_cmp(b)),
+        MessageSortOrder::ProcessedAtFirst => messages.max_by(|a, b| a.processed_at_order_cmp(b)),
+    }
+}
+
 impl GroupStorage for MdkMemoryStorage {
     fn save_group(&self, group: Group) -> Result<(), GroupError> {
         // Validate group name length
@@ -101,19 +141,13 @@ impl GroupStorage for MdkMemoryStorage {
         let limit = pagination.limit();
         let offset = pagination.offset();
 
-        // Validate limit is within allowed range
-        if !(1..=MAX_MESSAGE_LIMIT).contains(&limit) {
-            return Err(GroupError::InvalidParameters(format!(
-                "Limit must be between 1 and {}, got {}",
-                MAX_MESSAGE_LIMIT, limit
-            )));
-        }
+        validate_message_limit(limit)?;
 
         let inner = self.inner.read();
 
         // Check if the group exists while holding the lock
         if inner.groups_cache.peek(mls_group_id).is_none() {
-            return Err(GroupError::InvalidParameters("Group not found".to_string()));
+            return Err(group_not_found());
         }
 
         let sort_order = pagination.sort_order();
@@ -124,15 +158,7 @@ impl GroupStorage for MdkMemoryStorage {
                 let mut messages: Vec<Message> = messages_map.values().cloned().collect();
 
                 // Sort newest-first using the requested sort order.
-                // Both comparators are called with (b, a) to get DESC ordering.
-                match sort_order {
-                    MessageSortOrder::CreatedAtFirst => {
-                        messages.sort_by(|a, b| b.display_order_cmp(a));
-                    }
-                    MessageSortOrder::ProcessedAtFirst => {
-                        messages.sort_by(|a, b| b.processed_at_order_cmp(a));
-                    }
-                }
+                sort_messages(&mut messages, sort_order);
 
                 // Apply pagination
                 let start = offset.min(messages.len());
@@ -153,21 +179,12 @@ impl GroupStorage for MdkMemoryStorage {
         let inner = self.inner.read();
 
         if inner.groups_cache.peek(mls_group_id).is_none() {
-            return Err(GroupError::InvalidParameters("Group not found".to_string()));
+            return Err(group_not_found());
         }
 
         match inner.messages_by_group_cache.peek(mls_group_id) {
             Some(messages_map) if !messages_map.is_empty() => {
-                // Find the maximum element under the requested ordering.
-                // Both comparators compare (b, a) to find the DESC-first element via max_by.
-                let winner = match sort_order {
-                    MessageSortOrder::CreatedAtFirst => {
-                        messages_map.values().max_by(|a, b| a.display_order_cmp(b))
-                    }
-                    MessageSortOrder::ProcessedAtFirst => messages_map
-                        .values()
-                        .max_by(|a, b| a.processed_at_order_cmp(b)),
-                };
+                let winner = newest_message(messages_map.values(), sort_order);
                 Ok(winner.cloned())
             }
             _ => Ok(None),
@@ -177,7 +194,7 @@ impl GroupStorage for MdkMemoryStorage {
     fn admins(&self, mls_group_id: &GroupId) -> Result<BTreeSet<PublicKey>, GroupError> {
         match self.find_group_by_mls_group_id(mls_group_id)? {
             Some(group) => Ok(group.admin_pubkeys.clone()),
-            None => Err(GroupError::InvalidParameters("Group not found".to_string())),
+            None => Err(group_not_found()),
         }
     }
 
@@ -186,7 +203,7 @@ impl GroupStorage for MdkMemoryStorage {
 
         // Check if the group exists while holding the lock
         if inner.groups_cache.peek(mls_group_id).is_none() {
-            return Err(GroupError::InvalidParameters("Group not found".to_string()));
+            return Err(group_not_found());
         }
 
         match inner.group_relays_cache.peek(mls_group_id).cloned() {
@@ -224,7 +241,7 @@ impl GroupStorage for MdkMemoryStorage {
 
         // Check if the group exists while holding the lock
         if inner.groups_cache.peek(group_id).is_none() {
-            return Err(GroupError::InvalidParameters("Group not found".to_string()));
+            return Err(group_not_found());
         }
 
         // Convert RelayUrl set to GroupRelay set
@@ -251,7 +268,7 @@ impl GroupStorage for MdkMemoryStorage {
 
         // Check if the group exists while holding the lock
         if inner.groups_cache.peek(mls_group_id).is_none() {
-            return Err(GroupError::InvalidParameters("Group not found".to_string()));
+            return Err(group_not_found());
         }
 
         // Use tuple (GroupId, epoch) as key
@@ -273,7 +290,7 @@ impl GroupStorage for MdkMemoryStorage {
             .peek(&group_exporter_secret.mls_group_id)
             .is_none()
         {
-            return Err(GroupError::InvalidParameters("Group not found".to_string()));
+            return Err(group_not_found());
         }
 
         // Use tuple (GroupId, epoch) as key
@@ -296,7 +313,7 @@ impl GroupStorage for MdkMemoryStorage {
         let inner = self.inner.read();
 
         if inner.groups_cache.peek(mls_group_id).is_none() {
-            return Err(GroupError::InvalidParameters("Group not found".to_string()));
+            return Err(group_not_found());
         }
 
         Ok(inner
@@ -316,7 +333,7 @@ impl GroupStorage for MdkMemoryStorage {
             .peek(&group_exporter_secret.mls_group_id)
             .is_none()
         {
-            return Err(GroupError::InvalidParameters("Group not found".to_string()));
+            return Err(group_not_found());
         }
 
         let key = (
@@ -339,7 +356,7 @@ impl GroupStorage for MdkMemoryStorage {
 
         // Check if the group exists while holding the lock
         if inner.groups_cache.peek(mls_group_id).is_none() {
-            return Err(GroupError::InvalidParameters("Group not found".to_string()));
+            return Err(group_not_found());
         }
 
         Ok(inner
@@ -360,7 +377,7 @@ impl GroupStorage for MdkMemoryStorage {
             .peek(&group_exporter_secret.mls_group_id)
             .is_none()
         {
-            return Err(GroupError::InvalidParameters("Group not found".to_string()));
+            return Err(group_not_found());
         }
 
         let key = (
@@ -382,7 +399,7 @@ impl GroupStorage for MdkMemoryStorage {
         let mut inner = self.inner.write();
 
         if inner.groups_cache.peek(group_id).is_none() {
-            return Err(GroupError::InvalidParameters("Group not found".to_string()));
+            return Err(group_not_found());
         }
 
         let group_event_keys: Vec<(GroupId, u64)> = inner
