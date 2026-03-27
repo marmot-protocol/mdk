@@ -31,6 +31,8 @@
 ### Changed
 
 - Admin updates now prune non-member public keys instead of rejecting the entire update. Only errors if no valid admins remain after pruning. ([#223](https://github.com/marmot-protocol/mdk/pull/223))
+- Replaced ~15 identical `From<...> for Error` impls with `impl_from_display_error!` and `impl_from_generic_display_error!` macros. ([`#239`](https://github.com/marmot-protocol/mdk/pull/239))
+- Consolidated duplicate test wiring between memory and sqlite storage test binaries into a `storage_backend_tests!` macro. ([`#239`](https://github.com/marmot-protocol/mdk/pull/239))
 
 ### Added
 

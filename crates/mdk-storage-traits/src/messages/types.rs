@@ -1,7 +1,6 @@
 //! Types for the messages module
 
 use std::cmp::Ordering;
-use std::fmt;
 use std::str::FromStr;
 
 use crate::GroupId;
@@ -9,7 +8,7 @@ use crate::GroupId;
 use crate::groups::types::Group;
 use nostr::event::Kind;
 use nostr::{EventId, PublicKey, Tags, Timestamp, UnsignedEvent};
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Serialize};
 
 use super::error::MessageError;
 
@@ -155,149 +154,39 @@ impl Message {
     }
 }
 
-/// The state of the message
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum MessageState {
-    /// The message was created successfully and stored but we don't yet know if it was published to relays.
-    Created,
-    /// The message was successfully processed and stored in the database
-    Processed,
-    /// The message was deleted by the original sender - via a delete event
-    Deleted,
-    /// The epoch was rolled back, content may be invalid and needs reprocessing
-    EpochInvalidated,
-}
-
-impl fmt::Display for MessageState {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.as_str())
+string_enum! {
+    /// The state of the message
+    pub enum MessageState => MessageError, "Invalid message state: {}" {
+        /// The message was created successfully and stored but we don't yet know if it was published to relays.
+        Created => "created",
+        /// The message was successfully processed and stored in the database
+        Processed => "processed",
+        /// The message was deleted by the original sender - via a delete event
+        Deleted => "deleted",
+        /// The epoch was rolled back, content may be invalid and needs reprocessing
+        EpochInvalidated => "epoch_invalidated",
     }
 }
 
-impl MessageState {
-    /// Get as `&str`
-    pub fn as_str(&self) -> &str {
-        match self {
-            Self::Created => "created",
-            Self::Processed => "processed",
-            Self::Deleted => "deleted",
-            Self::EpochInvalidated => "epoch_invalidated",
-        }
-    }
-}
-
-impl FromStr for MessageState {
-    type Err = MessageError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "created" => Ok(Self::Created),
-            "processed" => Ok(Self::Processed),
-            "deleted" => Ok(Self::Deleted),
-            "epoch_invalidated" => Ok(Self::EpochInvalidated),
-            _ => Err(MessageError::InvalidParameters(format!(
-                "Invalid message state: {}",
-                s
-            ))),
-        }
-    }
-}
-
-impl Serialize for MessageState {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(self.as_str())
-    }
-}
-
-impl<'de> Deserialize<'de> for MessageState {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let s: String = String::deserialize(deserializer)?;
-        Self::from_str(&s).map_err(serde::de::Error::custom)
-    }
-}
-
-/// The Processing State of the message,
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum ProcessedMessageState {
-    /// The processed message (and message) was created successfully and stored but we don't yet know if it was published to relays.
-    /// This state only happens when you are sending a message. Since we can't decrypt messages from ourselves in MLS groups,
-    /// once we see this message we mark it as processed but skip the rest of the processing.
-    Created,
-    /// The message was successfully processed and stored in the database
-    Processed,
-    /// The message was a commit message and we have already processed it. We can't decrypt messages from ourselves in MLS groups so we need to skip this processing.
-    ProcessedCommit,
-    /// The message failed to be processed and stored in the database
-    Failed,
-    /// The epoch was rolled back, message needs reprocessing
-    EpochInvalidated,
-    /// The message previously failed but is now eligible for retry after a rollback.
-    /// This state is set by the rollback flow when group state has been corrected,
-    /// allowing messages that failed due to stale epoch keys to be reprocessed.
-    Retryable,
-}
-
-impl fmt::Display for ProcessedMessageState {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.as_str())
-    }
-}
-
-impl ProcessedMessageState {
-    /// Get as `&str`
-    pub fn as_str(&self) -> &str {
-        match self {
-            Self::Created => "created",
-            Self::Processed => "processed",
-            Self::ProcessedCommit => "processed_commit",
-            Self::Failed => "failed",
-            Self::EpochInvalidated => "epoch_invalidated",
-            Self::Retryable => "retryable",
-        }
-    }
-}
-
-impl FromStr for ProcessedMessageState {
-    type Err = MessageError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "created" => Ok(Self::Created),
-            "processed" => Ok(Self::Processed),
-            "processed_commit" => Ok(Self::ProcessedCommit),
-            "failed" => Ok(Self::Failed),
-            "epoch_invalidated" => Ok(Self::EpochInvalidated),
-            "retryable" => Ok(Self::Retryable),
-            _ => Err(MessageError::InvalidParameters(format!(
-                "Invalid processed message state: {}",
-                s
-            ))),
-        }
-    }
-}
-
-impl Serialize for ProcessedMessageState {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(self.as_str())
-    }
-}
-
-impl<'de> Deserialize<'de> for ProcessedMessageState {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let s: String = String::deserialize(deserializer)?;
-        Self::from_str(&s).map_err(serde::de::Error::custom)
+string_enum! {
+    /// The Processing State of the message,
+    pub enum ProcessedMessageState => MessageError, "Invalid processed message state: {}" {
+        /// The processed message (and message) was created successfully and stored but we don't yet know if it was published to relays.
+        /// This state only happens when you are sending a message. Since we can't decrypt messages from ourselves in MLS groups,
+        /// once we see this message we mark it as processed but skip the rest of the processing.
+        Created => "created",
+        /// The message was successfully processed and stored in the database
+        Processed => "processed",
+        /// The message was a commit message and we have already processed it. We can't decrypt messages from ourselves in MLS groups so we need to skip this processing.
+        ProcessedCommit => "processed_commit",
+        /// The message failed to be processed and stored in the database
+        Failed => "failed",
+        /// The epoch was rolled back, message needs reprocessing
+        EpochInvalidated => "epoch_invalidated",
+        /// The message previously failed but is now eligible for retry after a rollback.
+        /// This state is set by the rollback flow when group state has been corrected,
+        /// allowing messages that failed due to stale epoch keys to be reprocessed.
+        Retryable => "retryable",
     }
 }
 

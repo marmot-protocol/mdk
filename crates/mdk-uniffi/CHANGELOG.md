@@ -29,6 +29,9 @@
 
 ### Changed
 
+- Extracted `update_group_result_to_uniffi()` and `mdk_from_storage()` helpers to eliminate duplicated serialization and constructor logic across multiple exported functions. ([`#239`](https://github.com/marmot-protocol/mdk/pull/239))
+- Simplified iterator collection patterns to use `.collect::<Result<_, _>>()` instead of two-step collect-then-unwrap. ([`#239`](https://github.com/marmot-protocol/mdk/pull/239))
+
 ### Added
 
 - Moved binary size optimizations (`opt-level = "z"`, thin LTO, single codegen unit, `panic = "abort"`, symbol stripping) into `[profile.release]` directly. Android builds override to fat LTO via `CARGO_PROFILE_RELEASE_LTO=fat` for maximum `.so` reduction; iOS uses thin LTO to avoid `.a` archive bloat. ([`#221`](https://github.com/marmot-protocol/mdk/pull/221), [`#232`](https://github.com/marmot-protocol/mdk/pull/232))

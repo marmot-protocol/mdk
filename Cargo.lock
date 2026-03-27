@@ -1538,6 +1538,7 @@ dependencies = [
  "openmls",
  "openmls_traits",
  "parking_lot",
+ "pastey",
  "serde",
  "serde_json",
 ]

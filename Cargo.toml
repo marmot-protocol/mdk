@@ -57,6 +57,7 @@ keyring-core = "0.7"
 hex = { version = "0.4", default-features = false }
 lru = { version = "0.16", default-features = false }
 parking_lot = "0.12"
+pastey = "0.2"
 thiserror = "2"
 zeroize = { version = "1.8", features = ["zeroize_derive"] }
 

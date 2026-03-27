@@ -243,84 +243,50 @@ impl From<FromUtf8Error> for Error {
     }
 }
 
-impl From<ProtocolMessageError> for Error {
-    fn from(e: ProtocolMessageError) -> Self {
-        Self::ProtocolMessage(e.to_string())
-    }
+/// Convert a concrete error type to an `Error` variant via `to_string()`.
+macro_rules! impl_from_display_error {
+    ($($source:ty => $variant:ident),+ $(,)?) => {
+        $(
+            impl From<$source> for Error {
+                fn from(e: $source) -> Self {
+                    Self::$variant(e.to_string())
+                }
+            }
+        )+
+    };
 }
 
-impl From<KeyPackageNewError> for Error {
-    fn from(e: KeyPackageNewError) -> Self {
-        Self::KeyPackage(e.to_string())
-    }
+/// Convert a generic `ErrorType<T: Display>` to an `Error` variant via `to_string()`.
+macro_rules! impl_from_generic_display_error {
+    ($($source:ident => $variant:ident),+ $(,)?) => {
+        $(
+            impl<T: fmt::Display> From<$source<T>> for Error {
+                fn from(e: $source<T>) -> Self {
+                    Self::$variant(e.to_string())
+                }
+            }
+        )+
+    };
 }
 
-impl From<KeyPackageVerifyError> for Error {
-    fn from(e: KeyPackageVerifyError) -> Self {
-        Self::KeyPackage(e.to_string())
-    }
+impl_from_display_error! {
+    ProtocolMessageError => ProtocolMessage,
+    KeyPackageNewError   => KeyPackage,
+    KeyPackageVerifyError => KeyPackage,
 }
 
-impl<T> From<NewGroupError<T>> for Error
-where
-    T: fmt::Display,
-{
-    fn from(e: NewGroupError<T>) -> Self {
-        Self::Group(e.to_string())
-    }
+impl_from_generic_display_error! {
+    NewGroupError                      => Group,
+    AddMembersError                    => Group,
+    MergePendingCommitError            => MergePendingCommit,
+    SelfUpdateError                    => SelfUpdate,
+    WelcomeError                       => Welcome,
+    CreateGroupContextExtProposalError => UpdateGroupContextExts,
 }
 
-impl<T> From<AddMembersError<T>> for Error
-where
-    T: fmt::Display,
-{
-    fn from(e: AddMembersError<T>) -> Self {
-        Self::Group(e.to_string())
-    }
-}
-
-impl<T> From<MergePendingCommitError<T>> for Error
-where
-    T: fmt::Display,
-{
-    fn from(e: MergePendingCommitError<T>) -> Self {
-        Self::MergePendingCommit(e.to_string())
-    }
-}
-
-impl<T> From<CommitToPendingProposalsError<T>> for Error
-where
-    T: fmt::Display,
-{
+impl<T: fmt::Display> From<CommitToPendingProposalsError<T>> for Error {
     fn from(_e: CommitToPendingProposalsError<T>) -> Self {
         Self::CommitToPendingProposalsError
-    }
-}
-
-impl<T> From<SelfUpdateError<T>> for Error
-where
-    T: fmt::Display,
-{
-    fn from(e: SelfUpdateError<T>) -> Self {
-        Self::SelfUpdate(e.to_string())
-    }
-}
-
-impl<T> From<WelcomeError<T>> for Error
-where
-    T: fmt::Display,
-{
-    fn from(e: WelcomeError<T>) -> Self {
-        Self::Welcome(e.to_string())
-    }
-}
-
-impl<T> From<CreateGroupContextExtProposalError<T>> for Error
-where
-    T: fmt::Display,
-{
-    fn from(e: CreateGroupContextExtProposalError<T>) -> Self {
-        Self::UpdateGroupContextExts(e.to_string())
     }
 }
 

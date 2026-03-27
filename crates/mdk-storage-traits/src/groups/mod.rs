@@ -14,6 +14,7 @@ use nostr::{PublicKey, RelayUrl, Timestamp};
 
 pub mod error;
 pub mod types;
+pub mod validation;
 
 use self::error::GroupError;
 use self::types::*;
@@ -47,27 +48,19 @@ pub enum MessageSortOrder {
     ProcessedAtFirst,
 }
 
-/// Pagination parameters for querying messages
-#[derive(Debug, Clone, Copy)]
-pub struct Pagination {
-    /// Maximum number of messages to return
-    pub limit: Option<usize>,
-    /// Number of messages to skip
-    pub offset: Option<usize>,
-    /// Sort order for the query results. Defaults to [`MessageSortOrder::CreatedAtFirst`].
-    pub sort_order: Option<MessageSortOrder>,
+bounded_pagination! {
+    /// Pagination parameters for querying messages
+    default_limit: DEFAULT_MESSAGE_LIMIT,
+    max_limit: MAX_MESSAGE_LIMIT,
+    error_type: GroupError,
+    validate_fn: validate_message_limit,
+    extra {
+        /// Sort order for the query results. Defaults to [`MessageSortOrder::CreatedAtFirst`].
+        sort_order: MessageSortOrder,
+    }
 }
 
 impl Pagination {
-    /// Create a new Pagination with specified limit and offset
-    pub fn new(limit: Option<usize>, offset: Option<usize>) -> Self {
-        Self {
-            limit,
-            offset,
-            sort_order: None,
-        }
-    }
-
     /// Create a new Pagination with specified limit, offset, and sort order
     pub fn with_sort_order(
         limit: Option<usize>,
@@ -81,30 +74,18 @@ impl Pagination {
         }
     }
 
-    /// Get the limit value, using default if not specified
-    pub fn limit(&self) -> usize {
-        self.limit.unwrap_or(DEFAULT_MESSAGE_LIMIT)
-    }
-
-    /// Get the offset value, using 0 if not specified
-    pub fn offset(&self) -> usize {
-        self.offset.unwrap_or(0)
-    }
-
     /// Get the sort order, using default if not specified
     pub fn sort_order(&self) -> MessageSortOrder {
         self.sort_order.unwrap_or_default()
     }
 }
 
-impl Default for Pagination {
-    fn default() -> Self {
-        Self {
-            limit: Some(DEFAULT_MESSAGE_LIMIT),
-            offset: Some(0),
-            sort_order: None,
-        }
-    }
+/// Construct a "Group not found" error.
+///
+/// Shared helper used by all storage backends when a group lookup fails.
+#[inline]
+pub fn group_not_found() -> GroupError {
+    GroupError::InvalidParameters("Group not found".to_string())
 }
 
 /// Storage traits for the groups module
