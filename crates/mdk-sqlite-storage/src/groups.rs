@@ -5,7 +5,9 @@ use std::collections::BTreeSet;
 use mdk_storage_traits::GroupId;
 use mdk_storage_traits::groups::error::GroupError;
 use mdk_storage_traits::groups::types::{Group, GroupExporterSecret, GroupRelay, SelfUpdateState};
-use mdk_storage_traits::groups::{GroupStorage, MAX_MESSAGE_LIMIT, MessageSortOrder, Pagination};
+use mdk_storage_traits::groups::{
+    GroupStorage, MessageSortOrder, Pagination, group_not_found, validate_message_limit,
+};
 use mdk_storage_traits::messages::types::Message;
 use nostr::{PublicKey, RelayUrl};
 use rusqlite::{OptionalExtension, params};
@@ -19,22 +21,6 @@ use crate::{MdkSqliteStorage, db};
 
 db_error_fn!(into_group_err, GroupError);
 
-#[inline]
-fn group_not_found() -> GroupError {
-    GroupError::InvalidParameters("Group not found".to_string())
-}
-
-#[inline]
-fn validate_message_limit(limit: usize) -> Result<(), GroupError> {
-    if (1..=MAX_MESSAGE_LIMIT).contains(&limit) {
-        Ok(())
-    } else {
-        Err(GroupError::InvalidParameters(format!(
-            "Limit must be between 1 and {}, got {}",
-            MAX_MESSAGE_LIMIT, limit
-        )))
-    }
-}
 
 #[inline]
 fn ensure_group_exists(

@@ -2,7 +2,7 @@
 
 use mdk_storage_traits::welcomes::error::WelcomeError;
 use mdk_storage_traits::welcomes::types::{ProcessedWelcome, Welcome};
-use mdk_storage_traits::welcomes::{MAX_PENDING_WELCOMES_LIMIT, Pagination, WelcomeStorage};
+use mdk_storage_traits::welcomes::{Pagination, WelcomeStorage, validate_pending_welcomes_limit};
 use nostr::{EventId, JsonUtil};
 use rusqlite::{OptionalExtension, params};
 
@@ -115,13 +115,7 @@ impl WelcomeStorage for MdkSqliteStorage {
         let limit = pagination.limit();
         let offset = pagination.offset();
 
-        // Validate limit is within allowed range
-        if !(1..=MAX_PENDING_WELCOMES_LIMIT).contains(&limit) {
-            return Err(WelcomeError::InvalidParameters(format!(
-                "Limit must be between 1 and {}, got {}",
-                MAX_PENDING_WELCOMES_LIMIT, limit
-            )));
-        }
+        validate_pending_welcomes_limit(limit)?;
 
         self.with_connection(|conn| {
             let mut stmt = conn

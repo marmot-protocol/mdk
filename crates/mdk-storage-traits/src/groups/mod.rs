@@ -107,6 +107,30 @@ impl Default for Pagination {
     }
 }
 
+/// Construct a "Group not found" error.
+///
+/// Shared helper used by all storage backends when a group lookup fails.
+#[inline]
+pub fn group_not_found() -> GroupError {
+    GroupError::InvalidParameters("Group not found".to_string())
+}
+
+/// Validate that a message limit is within the allowed range.
+///
+/// Returns `Ok(())` if `limit` is between 1 and [`MAX_MESSAGE_LIMIT`] (inclusive),
+/// or an [`GroupError::InvalidParameters`] otherwise.
+#[inline]
+pub fn validate_message_limit(limit: usize) -> Result<(), GroupError> {
+    if (1..=MAX_MESSAGE_LIMIT).contains(&limit) {
+        Ok(())
+    } else {
+        Err(GroupError::InvalidParameters(format!(
+            "Limit must be between 1 and {}, got {}",
+            MAX_MESSAGE_LIMIT, limit
+        )))
+    }
+}
+
 /// Storage traits for the groups module
 pub trait GroupStorage {
     /// Get all groups

@@ -682,15 +682,15 @@ impl Mdk {
     ) -> Result<CreateGroupResult, MdkUniffiError> {
         let creator_pubkey = parse_public_key(&creator_public_key)?;
         let relay_urls = parse_relay_urls(&relays)?;
-        let admin_pubkeys: Result<Vec<PublicKey>, _> =
-            admins.iter().map(|a| parse_public_key(a)).collect();
-        let admin_pubkeys = admin_pubkeys?;
+        let admin_pubkeys: Vec<PublicKey> = admins
+            .iter()
+            .map(|a| parse_public_key(a))
+            .collect::<Result<_, _>>()?;
 
-        let member_key_package_events: Result<Vec<Event>, _> = member_key_package_events_json
+        let member_key_package_events: Vec<Event> = member_key_package_events_json
             .iter()
             .map(|json| parse_json(json, "key package event JSON"))
-            .collect();
-        let member_key_package_events = member_key_package_events?;
+            .collect::<Result<_, _>>()?;
 
         let config = NostrGroupConfigData::new(
             name,
@@ -729,11 +729,10 @@ impl Mdk {
     ) -> Result<UpdateGroupResult, MdkUniffiError> {
         let group_id = parse_group_id(&mls_group_id)?;
 
-        let key_package_events: Result<Vec<Event>, _> = key_package_events_json
+        let key_package_events: Vec<Event> = key_package_events_json
             .iter()
             .map(|json| parse_json(json, "key package event JSON"))
-            .collect();
-        let key_package_events = key_package_events?;
+            .collect::<Result<_, _>>()?;
 
         let mdk = self.lock()?;
         let result = mdk.add_members(&group_id, &key_package_events)?;
@@ -748,11 +747,10 @@ impl Mdk {
     ) -> Result<UpdateGroupResult, MdkUniffiError> {
         let group_id = parse_group_id(&mls_group_id)?;
 
-        let pubkeys: Result<Vec<PublicKey>, _> = member_public_keys
+        let pubkeys: Vec<PublicKey> = member_public_keys
             .iter()
             .map(|pk| parse_public_key(pk))
-            .collect();
-        let pubkeys = pubkeys?;
+            .collect::<Result<_, _>>()?;
 
         let mdk = self.lock()?;
         let result = mdk.remove_members(&group_id, &pubkeys)?;
@@ -872,9 +870,10 @@ impl Mdk {
         }
 
         if let Some(admins) = update.admins {
-            let admin_pubkeys: Result<Vec<PublicKey>, _> =
-                admins.iter().map(|a| parse_public_key(a)).collect();
-            let admin_pubkeys = admin_pubkeys?;
+            let admin_pubkeys: Vec<PublicKey> = admins
+                .iter()
+                .map(|a| parse_public_key(a))
+                .collect::<Result<_, _>>()?;
             group_update = group_update.admins(admin_pubkeys);
         }
 

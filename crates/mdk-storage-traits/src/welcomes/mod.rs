@@ -56,6 +56,22 @@ impl Default for Pagination {
     }
 }
 
+/// Validate that a pending-welcomes limit is within the allowed range.
+///
+/// Returns `Ok(())` if `limit` is between 1 and [`MAX_PENDING_WELCOMES_LIMIT`] (inclusive),
+/// or a [`WelcomeError::InvalidParameters`] otherwise.
+#[inline]
+pub fn validate_pending_welcomes_limit(limit: usize) -> Result<(), WelcomeError> {
+    if (1..=MAX_PENDING_WELCOMES_LIMIT).contains(&limit) {
+        Ok(())
+    } else {
+        Err(WelcomeError::InvalidParameters(format!(
+            "Limit must be between 1 and {}, got {}",
+            MAX_PENDING_WELCOMES_LIMIT, limit
+        )))
+    }
+}
+
 /// Storage traits for the welcomes module
 pub trait WelcomeStorage {
     /// Save a welcome
