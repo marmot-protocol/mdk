@@ -2,6 +2,36 @@
 
 use std::collections::BTreeSet;
 
+/// Implements `get_group_*_exporter_secret` for the memory backend.
+///
+/// Both the read lock acquisition and the `groups_cache` existence check are
+/// identical across all three label variants; only the cache field name differs.
+macro_rules! group_exporter_secret_get {
+    ($self:ident, $mls_group_id:ident, $epoch:ident, $cache:ident) => {{
+        let inner = $self.inner.read();
+        if inner.groups_cache.peek($mls_group_id).is_none() {
+            return Err(group_not_found());
+        }
+        Ok(inner.$cache.peek(&($mls_group_id.clone(), $epoch)).cloned())
+    }};
+}
+
+/// Implements `save_group_*_exporter_secret` for the memory backend.
+///
+/// The write lock, existence guard, and key construction are identical across
+/// all three label variants; only the cache field name differs.
+macro_rules! group_exporter_secret_save {
+    ($self:ident, $secret:ident, $cache:ident) => {{
+        let mut inner = $self.inner.write();
+        if inner.groups_cache.peek(&$secret.mls_group_id).is_none() {
+            return Err(group_not_found());
+        }
+        let key = ($secret.mls_group_id.clone(), $secret.epoch);
+        inner.$cache.put(key, $secret);
+        Ok(())
+    }};
+}
+
 use mdk_storage_traits::GroupId;
 use mdk_storage_traits::groups::error::GroupError;
 use mdk_storage_traits::groups::types::*;
@@ -217,45 +247,14 @@ impl GroupStorage for MdkMemoryStorage {
         mls_group_id: &GroupId,
         epoch: u64,
     ) -> Result<Option<GroupExporterSecret>, GroupError> {
-        let inner = self.inner.read();
-
-        // Check if the group exists while holding the lock
-        if inner.groups_cache.peek(mls_group_id).is_none() {
-            return Err(group_not_found());
-        }
-
-        // Use tuple (GroupId, epoch) as key
-        Ok(inner
-            .group_exporter_secrets_cache
-            .peek(&(mls_group_id.clone(), epoch))
-            .cloned())
+        group_exporter_secret_get!(self, mls_group_id, epoch, group_exporter_secrets_cache)
     }
 
     fn save_group_exporter_secret(
         &self,
         group_exporter_secret: GroupExporterSecret,
     ) -> Result<(), GroupError> {
-        let mut inner = self.inner.write();
-
-        // Check if the group exists while holding the lock
-        if inner
-            .groups_cache
-            .peek(&group_exporter_secret.mls_group_id)
-            .is_none()
-        {
-            return Err(group_not_found());
-        }
-
-        // Use tuple (GroupId, epoch) as key
-        let key = (
-            group_exporter_secret.mls_group_id.clone(),
-            group_exporter_secret.epoch,
-        );
-        inner
-            .group_exporter_secrets_cache
-            .put(key, group_exporter_secret);
-
-        Ok(())
+        group_exporter_secret_save!(self, group_exporter_secret, group_exporter_secrets_cache)
     }
 
     fn get_group_legacy_exporter_secret(
@@ -263,41 +262,23 @@ impl GroupStorage for MdkMemoryStorage {
         mls_group_id: &GroupId,
         epoch: u64,
     ) -> Result<Option<GroupExporterSecret>, GroupError> {
-        let inner = self.inner.read();
-
-        if inner.groups_cache.peek(mls_group_id).is_none() {
-            return Err(group_not_found());
-        }
-
-        Ok(inner
-            .group_legacy_exporter_secrets_cache
-            .peek(&(mls_group_id.clone(), epoch))
-            .cloned())
+        group_exporter_secret_get!(
+            self,
+            mls_group_id,
+            epoch,
+            group_legacy_exporter_secrets_cache
+        )
     }
 
     fn save_group_legacy_exporter_secret(
         &self,
         group_exporter_secret: GroupExporterSecret,
     ) -> Result<(), GroupError> {
-        let mut inner = self.inner.write();
-
-        if inner
-            .groups_cache
-            .peek(&group_exporter_secret.mls_group_id)
-            .is_none()
-        {
-            return Err(group_not_found());
-        }
-
-        let key = (
-            group_exporter_secret.mls_group_id.clone(),
-            group_exporter_secret.epoch,
-        );
-        inner
-            .group_legacy_exporter_secrets_cache
-            .put(key, group_exporter_secret);
-
-        Ok(())
+        group_exporter_secret_save!(
+            self,
+            group_exporter_secret,
+            group_legacy_exporter_secrets_cache
+        )
     }
 
     fn get_group_mip04_exporter_secret(
@@ -305,43 +286,23 @@ impl GroupStorage for MdkMemoryStorage {
         mls_group_id: &GroupId,
         epoch: u64,
     ) -> Result<Option<GroupExporterSecret>, GroupError> {
-        let inner = self.inner.read();
-
-        // Check if the group exists while holding the lock
-        if inner.groups_cache.peek(mls_group_id).is_none() {
-            return Err(group_not_found());
-        }
-
-        Ok(inner
-            .group_mip04_exporter_secrets_cache
-            .peek(&(mls_group_id.clone(), epoch))
-            .cloned())
+        group_exporter_secret_get!(
+            self,
+            mls_group_id,
+            epoch,
+            group_mip04_exporter_secrets_cache
+        )
     }
 
     fn save_group_mip04_exporter_secret(
         &self,
         group_exporter_secret: GroupExporterSecret,
     ) -> Result<(), GroupError> {
-        let mut inner = self.inner.write();
-
-        // Check if the group exists while holding the lock
-        if inner
-            .groups_cache
-            .peek(&group_exporter_secret.mls_group_id)
-            .is_none()
-        {
-            return Err(group_not_found());
-        }
-
-        let key = (
-            group_exporter_secret.mls_group_id.clone(),
-            group_exporter_secret.epoch,
-        );
-        inner
-            .group_mip04_exporter_secrets_cache
-            .put(key, group_exporter_secret);
-
-        Ok(())
+        group_exporter_secret_save!(
+            self,
+            group_exporter_secret,
+            group_mip04_exporter_secrets_cache
+        )
     }
 
     fn prune_group_exporter_secrets_before_epoch(

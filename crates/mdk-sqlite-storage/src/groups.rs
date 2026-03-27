@@ -2,6 +2,61 @@
 
 use std::collections::BTreeSet;
 
+/// Implements `get_group_*_exporter_secret` for the SQLite backend.
+///
+/// The `ensure_group_exists` guard, `with_connection` wrapper, query structure,
+/// and row mapper are identical for all label variants; only the SQL label
+/// string literal differs.
+macro_rules! group_exporter_secret_get {
+    ($self:ident, $mls_group_id:ident, $epoch:ident, $label:literal) => {{
+        ensure_group_exists($self, $mls_group_id)?;
+        $self.with_connection(|conn| {
+            let mut stmt = conn
+                .prepare(concat!(
+                    "SELECT * FROM group_exporter_secrets \
+                     WHERE mls_group_id = ? AND epoch = ? AND label = '",
+                    $label,
+                    "'"
+                ))
+                .map_err(into_group_err)?;
+            stmt.query_row(
+                params![$mls_group_id.as_slice(), $epoch],
+                db::row_to_group_exporter_secret,
+            )
+            .optional()
+            .map_err(into_group_err)
+        })
+    }};
+}
+
+/// Implements `save_group_*_exporter_secret` for the SQLite backend.
+///
+/// The `ensure_group_exists` guard, `with_connection` wrapper, and INSERT
+/// structure are identical for all label variants; only the SQL label string
+/// literal differs.
+macro_rules! group_exporter_secret_save {
+    ($self:ident, $secret:ident, $label:literal) => {{
+        ensure_group_exists($self, &$secret.mls_group_id)?;
+        $self.with_connection(|conn| {
+            conn.execute(
+                concat!(
+                    "INSERT OR REPLACE INTO group_exporter_secrets \
+                     (mls_group_id, epoch, secret, label) VALUES (?, ?, ?, '",
+                    $label,
+                    "')"
+                ),
+                params![
+                    &$secret.mls_group_id.as_slice(),
+                    &$secret.epoch,
+                    $secret.secret.as_ref()
+                ],
+            )
+            .map_err(into_group_err)?;
+            Ok(())
+        })
+    }};
+}
+
 use mdk_storage_traits::GroupId;
 use mdk_storage_traits::groups::error::GroupError;
 use mdk_storage_traits::groups::types::{Group, GroupExporterSecret, GroupRelay, SelfUpdateState};
@@ -338,39 +393,14 @@ impl GroupStorage for MdkSqliteStorage {
         mls_group_id: &GroupId,
         epoch: u64,
     ) -> Result<Option<GroupExporterSecret>, GroupError> {
-        ensure_group_exists(self, mls_group_id)?;
-
-        self.with_connection(|conn| {
-            let mut stmt = conn
-                .prepare(
-                    "SELECT * FROM group_exporter_secrets WHERE mls_group_id = ? AND epoch = ? AND label = 'group-event'",
-                )
-                .map_err(into_group_err)?;
-
-            stmt.query_row(
-                params![mls_group_id.as_slice(), epoch],
-                db::row_to_group_exporter_secret,
-            )
-            .optional()
-            .map_err(into_group_err)
-        })
+        group_exporter_secret_get!(self, mls_group_id, epoch, "group-event")
     }
 
     fn save_group_exporter_secret(
         &self,
         group_exporter_secret: GroupExporterSecret,
     ) -> Result<(), GroupError> {
-        ensure_group_exists(self, &group_exporter_secret.mls_group_id)?;
-
-        self.with_connection(|conn| {
-            conn.execute(
-                "INSERT OR REPLACE INTO group_exporter_secrets (mls_group_id, epoch, secret, label) VALUES (?, ?, ?, 'group-event')",
-                params![&group_exporter_secret.mls_group_id.as_slice(), &group_exporter_secret.epoch, group_exporter_secret.secret.as_ref()],
-            )
-            .map_err(into_group_err)?;
-
-            Ok(())
-        })
+        group_exporter_secret_save!(self, group_exporter_secret, "group-event")
     }
 
     fn get_group_legacy_exporter_secret(
@@ -378,39 +408,14 @@ impl GroupStorage for MdkSqliteStorage {
         mls_group_id: &GroupId,
         epoch: u64,
     ) -> Result<Option<GroupExporterSecret>, GroupError> {
-        ensure_group_exists(self, mls_group_id)?;
-
-        self.with_connection(|conn| {
-            let mut stmt = conn
-                .prepare(
-                    "SELECT * FROM group_exporter_secrets WHERE mls_group_id = ? AND epoch = ? AND label = 'legacy-group-event'",
-                )
-                .map_err(into_group_err)?;
-
-            stmt.query_row(
-                params![mls_group_id.as_slice(), epoch],
-                db::row_to_group_exporter_secret,
-            )
-            .optional()
-            .map_err(into_group_err)
-        })
+        group_exporter_secret_get!(self, mls_group_id, epoch, "legacy-group-event")
     }
 
     fn save_group_legacy_exporter_secret(
         &self,
         group_exporter_secret: GroupExporterSecret,
     ) -> Result<(), GroupError> {
-        ensure_group_exists(self, &group_exporter_secret.mls_group_id)?;
-
-        self.with_connection(|conn| {
-            conn.execute(
-                "INSERT OR REPLACE INTO group_exporter_secrets (mls_group_id, epoch, secret, label) VALUES (?, ?, ?, 'legacy-group-event')",
-                params![&group_exporter_secret.mls_group_id.as_slice(), &group_exporter_secret.epoch, group_exporter_secret.secret.as_ref()],
-            )
-            .map_err(into_group_err)?;
-
-            Ok(())
-        })
+        group_exporter_secret_save!(self, group_exporter_secret, "legacy-group-event")
     }
 
     fn get_group_mip04_exporter_secret(
@@ -418,39 +423,14 @@ impl GroupStorage for MdkSqliteStorage {
         mls_group_id: &GroupId,
         epoch: u64,
     ) -> Result<Option<GroupExporterSecret>, GroupError> {
-        ensure_group_exists(self, mls_group_id)?;
-
-        self.with_connection(|conn| {
-            let mut stmt = conn
-                .prepare(
-                    "SELECT * FROM group_exporter_secrets WHERE mls_group_id = ? AND epoch = ? AND label = 'encrypted-media'",
-                )
-                .map_err(into_group_err)?;
-
-            stmt.query_row(
-                params![mls_group_id.as_slice(), epoch],
-                db::row_to_group_exporter_secret,
-            )
-            .optional()
-            .map_err(into_group_err)
-        })
+        group_exporter_secret_get!(self, mls_group_id, epoch, "encrypted-media")
     }
 
     fn save_group_mip04_exporter_secret(
         &self,
         group_exporter_secret: GroupExporterSecret,
     ) -> Result<(), GroupError> {
-        ensure_group_exists(self, &group_exporter_secret.mls_group_id)?;
-
-        self.with_connection(|conn| {
-            conn.execute(
-                "INSERT OR REPLACE INTO group_exporter_secrets (mls_group_id, epoch, secret, label) VALUES (?, ?, ?, 'encrypted-media')",
-                params![&group_exporter_secret.mls_group_id.as_slice(), &group_exporter_secret.epoch, group_exporter_secret.secret.as_ref()],
-            )
-            .map_err(into_group_err)?;
-
-            Ok(())
-        })
+        group_exporter_secret_save!(self, group_exporter_secret, "encrypted-media")
     }
 
     fn prune_group_exporter_secrets_before_epoch(

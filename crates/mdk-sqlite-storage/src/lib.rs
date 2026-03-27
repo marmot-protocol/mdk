@@ -98,6 +98,123 @@ mod test_utils;
 mod validation;
 mod welcomes;
 
+/// Generates a `StorageProvider` write method that delegates to
+/// `self.with_connection(|conn| mls_storage::write_group_data(conn, group_id, GroupDataType::$variant, value))`.
+///
+/// Two arms handle the two generic-parameter orderings in the OpenMLS trait:
+///
+/// - Normal `<GroupId, ValueType>`: all write methods except `write_group_state`.
+/// - Swapped `<ValueType, GroupId>`: `write_group_state` only.
+///
+/// Usage:
+/// ```ignore
+/// write_group_data_method!(write_tree, GroupId, TreeSync, Tree);
+/// write_group_data_method!(swapped write_group_state, GroupState, GroupId, GroupState);
+/// ```
+macro_rules! write_group_data_method {
+    // Normal generic order: fn name<GroupId, ValueType>
+    ($fn_name:ident, $gid_trait:ident, $val_type:ident, $variant:ident) => {
+        fn $fn_name<GroupId, $val_type>(
+            &self,
+            group_id: &GroupId,
+            value: &$val_type,
+        ) -> Result<(), Self::Error>
+        where
+            GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
+            $val_type: traits::$val_type<STORAGE_PROVIDER_VERSION>,
+        {
+            self.with_connection(|conn| {
+                mls_storage::write_group_data(conn, group_id, GroupDataType::$variant, value)
+            })
+        }
+    };
+    // Swapped generic order: fn name<ValueType, GroupId>
+    (swapped $fn_name:ident, $val_type:ident, $gid_trait:ident, $variant:ident) => {
+        fn $fn_name<$val_type, GroupId>(
+            &self,
+            group_id: &GroupId,
+            value: &$val_type,
+        ) -> Result<(), Self::Error>
+        where
+            $val_type: traits::$val_type<STORAGE_PROVIDER_VERSION>,
+            GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
+        {
+            self.with_connection(|conn| {
+                mls_storage::write_group_data(conn, group_id, GroupDataType::$variant, value)
+            })
+        }
+    };
+}
+
+/// Generates a `StorageProvider` read method that delegates to
+/// `self.with_connection(|conn| mls_storage::read_group_data(conn, group_id, GroupDataType::$variant))`.
+///
+/// Two arms handle the two generic-parameter orderings (same split as
+/// `write_group_data_method!`).
+///
+/// Usage:
+/// ```ignore
+/// read_group_data_method!(tree, GroupId, TreeSync, Tree);
+/// read_group_data_method!(swapped group_state, GroupState, GroupId, GroupState);
+/// ```
+macro_rules! read_group_data_method {
+    // Normal generic order: fn name<GroupId, ValueType>
+    ($fn_name:ident, $gid_trait:ident, $val_type:ident, $variant:ident) => {
+        fn $fn_name<GroupId, $val_type>(
+            &self,
+            group_id: &GroupId,
+        ) -> Result<Option<$val_type>, Self::Error>
+        where
+            GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
+            $val_type: traits::$val_type<STORAGE_PROVIDER_VERSION>,
+        {
+            self.with_connection(|conn| {
+                mls_storage::read_group_data(conn, group_id, GroupDataType::$variant)
+            })
+        }
+    };
+    // Swapped generic order: fn name<ValueType, GroupId>
+    (swapped $fn_name:ident, $val_type:ident, $gid_trait:ident, $variant:ident) => {
+        fn $fn_name<$val_type, GroupId>(
+            &self,
+            group_id: &GroupId,
+        ) -> Result<Option<$val_type>, Self::Error>
+        where
+            $val_type: traits::$val_type<STORAGE_PROVIDER_VERSION>,
+            GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
+        {
+            self.with_connection(|conn| {
+                mls_storage::read_group_data(conn, group_id, GroupDataType::$variant)
+            })
+        }
+    };
+}
+
+/// Generates a `StorageProvider` delete method that delegates to
+/// `self.with_connection(|conn| mls_storage::delete_group_data(conn, group_id, GroupDataType::$variant))`.
+///
+/// Every method in the contiguous run from `delete_group_config` through
+/// `delete_group_epoch_secrets` is structurally identical; only the trait
+/// method name and the `GroupDataType` variant differ.  This macro encodes
+/// that shape once so adding a new data type requires a single line.
+///
+/// Usage:
+/// ```ignore
+/// delete_group_data_method!(delete_group_config, JoinGroupConfig);
+/// ```
+macro_rules! delete_group_data_method {
+    ($fn_name:ident, $variant:ident) => {
+        fn $fn_name<GroupId>(&self, group_id: &GroupId) -> Result<(), Self::Error>
+        where
+            GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
+        {
+            self.with_connection(|conn| {
+                mls_storage::delete_group_data(conn, group_id, GroupDataType::$variant)
+            })
+        }
+    };
+}
+
 pub use self::encryption::EncryptionConfig;
 use self::error::Error;
 use self::mls_storage::{GroupDataType, STORAGE_PROVIDER_VERSION};
@@ -1266,19 +1383,12 @@ impl StorageProvider<STORAGE_PROVIDER_VERSION> for MdkSqliteStorage {
     // Write Methods
     // ========================================================================
 
-    fn write_mls_join_config<GroupId, MlsGroupJoinConfig>(
-        &self,
-        group_id: &GroupId,
-        config: &MlsGroupJoinConfig,
-    ) -> Result<(), Self::Error>
-    where
-        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
-        MlsGroupJoinConfig: traits::MlsGroupJoinConfig<STORAGE_PROVIDER_VERSION>,
-    {
-        self.with_connection(|conn| {
-            mls_storage::write_group_data(conn, group_id, GroupDataType::JoinGroupConfig, config)
-        })
-    }
+    write_group_data_method!(
+        write_mls_join_config,
+        GroupId,
+        MlsGroupJoinConfig,
+        JoinGroupConfig
+    );
 
     fn append_own_leaf_node<GroupId, LeafNode>(
         &self,
@@ -1308,161 +1418,40 @@ impl StorageProvider<STORAGE_PROVIDER_VERSION> for MdkSqliteStorage {
         })
     }
 
-    fn write_tree<GroupId, TreeSync>(
-        &self,
-        group_id: &GroupId,
-        tree: &TreeSync,
-    ) -> Result<(), Self::Error>
-    where
-        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
-        TreeSync: traits::TreeSync<STORAGE_PROVIDER_VERSION>,
-    {
-        self.with_connection(|conn| {
-            mls_storage::write_group_data(conn, group_id, GroupDataType::Tree, tree)
-        })
-    }
-
-    fn write_interim_transcript_hash<GroupId, InterimTranscriptHash>(
-        &self,
-        group_id: &GroupId,
-        interim_transcript_hash: &InterimTranscriptHash,
-    ) -> Result<(), Self::Error>
-    where
-        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
-        InterimTranscriptHash: traits::InterimTranscriptHash<STORAGE_PROVIDER_VERSION>,
-    {
-        self.with_connection(|conn| {
-            mls_storage::write_group_data(
-                conn,
-                group_id,
-                GroupDataType::InterimTranscriptHash,
-                interim_transcript_hash,
-            )
-        })
-    }
-
-    fn write_context<GroupId, GroupContext>(
-        &self,
-        group_id: &GroupId,
-        group_context: &GroupContext,
-    ) -> Result<(), Self::Error>
-    where
-        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
-        GroupContext: traits::GroupContext<STORAGE_PROVIDER_VERSION>,
-    {
-        self.with_connection(|conn| {
-            mls_storage::write_group_data(conn, group_id, GroupDataType::Context, group_context)
-        })
-    }
-
-    fn write_confirmation_tag<GroupId, ConfirmationTag>(
-        &self,
-        group_id: &GroupId,
-        confirmation_tag: &ConfirmationTag,
-    ) -> Result<(), Self::Error>
-    where
-        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
-        ConfirmationTag: traits::ConfirmationTag<STORAGE_PROVIDER_VERSION>,
-    {
-        self.with_connection(|conn| {
-            mls_storage::write_group_data(
-                conn,
-                group_id,
-                GroupDataType::ConfirmationTag,
-                confirmation_tag,
-            )
-        })
-    }
-
-    fn write_group_state<GroupState, GroupId>(
-        &self,
-        group_id: &GroupId,
-        group_state: &GroupState,
-    ) -> Result<(), Self::Error>
-    where
-        GroupState: traits::GroupState<STORAGE_PROVIDER_VERSION>,
-        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
-    {
-        self.with_connection(|conn| {
-            mls_storage::write_group_data(conn, group_id, GroupDataType::GroupState, group_state)
-        })
-    }
-
-    fn write_message_secrets<GroupId, MessageSecrets>(
-        &self,
-        group_id: &GroupId,
-        message_secrets: &MessageSecrets,
-    ) -> Result<(), Self::Error>
-    where
-        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
-        MessageSecrets: traits::MessageSecrets<STORAGE_PROVIDER_VERSION>,
-    {
-        self.with_connection(|conn| {
-            mls_storage::write_group_data(
-                conn,
-                group_id,
-                GroupDataType::MessageSecrets,
-                message_secrets,
-            )
-        })
-    }
-
-    fn write_resumption_psk_store<GroupId, ResumptionPskStore>(
-        &self,
-        group_id: &GroupId,
-        resumption_psk_store: &ResumptionPskStore,
-    ) -> Result<(), Self::Error>
-    where
-        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
-        ResumptionPskStore: traits::ResumptionPskStore<STORAGE_PROVIDER_VERSION>,
-    {
-        self.with_connection(|conn| {
-            mls_storage::write_group_data(
-                conn,
-                group_id,
-                GroupDataType::ResumptionPskStore,
-                resumption_psk_store,
-            )
-        })
-    }
-
-    fn write_own_leaf_index<GroupId, LeafNodeIndex>(
-        &self,
-        group_id: &GroupId,
-        own_leaf_index: &LeafNodeIndex,
-    ) -> Result<(), Self::Error>
-    where
-        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
-        LeafNodeIndex: traits::LeafNodeIndex<STORAGE_PROVIDER_VERSION>,
-    {
-        self.with_connection(|conn| {
-            mls_storage::write_group_data(
-                conn,
-                group_id,
-                GroupDataType::OwnLeafIndex,
-                own_leaf_index,
-            )
-        })
-    }
-
-    fn write_group_epoch_secrets<GroupId, GroupEpochSecrets>(
-        &self,
-        group_id: &GroupId,
-        group_epoch_secrets: &GroupEpochSecrets,
-    ) -> Result<(), Self::Error>
-    where
-        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
-        GroupEpochSecrets: traits::GroupEpochSecrets<STORAGE_PROVIDER_VERSION>,
-    {
-        self.with_connection(|conn| {
-            mls_storage::write_group_data(
-                conn,
-                group_id,
-                GroupDataType::GroupEpochSecrets,
-                group_epoch_secrets,
-            )
-        })
-    }
+    write_group_data_method!(write_tree, GroupId, TreeSync, Tree);
+    write_group_data_method!(
+        write_interim_transcript_hash,
+        GroupId,
+        InterimTranscriptHash,
+        InterimTranscriptHash
+    );
+    write_group_data_method!(write_context, GroupId, GroupContext, Context);
+    write_group_data_method!(
+        write_confirmation_tag,
+        GroupId,
+        ConfirmationTag,
+        ConfirmationTag
+    );
+    write_group_data_method!(swapped write_group_state, GroupState, GroupId, GroupState);
+    write_group_data_method!(
+        write_message_secrets,
+        GroupId,
+        MessageSecrets,
+        MessageSecrets
+    );
+    write_group_data_method!(
+        write_resumption_psk_store,
+        GroupId,
+        ResumptionPskStore,
+        ResumptionPskStore
+    );
+    write_group_data_method!(write_own_leaf_index, GroupId, LeafNodeIndex, OwnLeafIndex);
+    write_group_data_method!(
+        write_group_epoch_secrets,
+        GroupId,
+        GroupEpochSecrets,
+        GroupEpochSecrets
+    );
 
     fn write_signature_key_pair<SignaturePublicKey, SignatureKeyPair>(
         &self,
@@ -1539,18 +1528,12 @@ impl StorageProvider<STORAGE_PROVIDER_VERSION> for MdkSqliteStorage {
     // Read Methods
     // ========================================================================
 
-    fn mls_group_join_config<GroupId, MlsGroupJoinConfig>(
-        &self,
-        group_id: &GroupId,
-    ) -> Result<Option<MlsGroupJoinConfig>, Self::Error>
-    where
-        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
-        MlsGroupJoinConfig: traits::MlsGroupJoinConfig<STORAGE_PROVIDER_VERSION>,
-    {
-        self.with_connection(|conn| {
-            mls_storage::read_group_data(conn, group_id, GroupDataType::JoinGroupConfig)
-        })
-    }
+    read_group_data_method!(
+        mls_group_join_config,
+        GroupId,
+        MlsGroupJoinConfig,
+        JoinGroupConfig
+    );
 
     fn own_leaf_nodes<GroupId, LeafNode>(
         &self,
@@ -1586,119 +1569,30 @@ impl StorageProvider<STORAGE_PROVIDER_VERSION> for MdkSqliteStorage {
         self.with_connection(|conn| mls_storage::read_queued_proposals(conn, group_id))
     }
 
-    fn tree<GroupId, TreeSync>(&self, group_id: &GroupId) -> Result<Option<TreeSync>, Self::Error>
-    where
-        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
-        TreeSync: traits::TreeSync<STORAGE_PROVIDER_VERSION>,
-    {
-        self.with_connection(|conn| {
-            mls_storage::read_group_data(conn, group_id, GroupDataType::Tree)
-        })
-    }
-
-    fn group_context<GroupId, GroupContext>(
-        &self,
-        group_id: &GroupId,
-    ) -> Result<Option<GroupContext>, Self::Error>
-    where
-        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
-        GroupContext: traits::GroupContext<STORAGE_PROVIDER_VERSION>,
-    {
-        self.with_connection(|conn| {
-            mls_storage::read_group_data(conn, group_id, GroupDataType::Context)
-        })
-    }
-
-    fn interim_transcript_hash<GroupId, InterimTranscriptHash>(
-        &self,
-        group_id: &GroupId,
-    ) -> Result<Option<InterimTranscriptHash>, Self::Error>
-    where
-        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
-        InterimTranscriptHash: traits::InterimTranscriptHash<STORAGE_PROVIDER_VERSION>,
-    {
-        self.with_connection(|conn| {
-            mls_storage::read_group_data(conn, group_id, GroupDataType::InterimTranscriptHash)
-        })
-    }
-
-    fn confirmation_tag<GroupId, ConfirmationTag>(
-        &self,
-        group_id: &GroupId,
-    ) -> Result<Option<ConfirmationTag>, Self::Error>
-    where
-        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
-        ConfirmationTag: traits::ConfirmationTag<STORAGE_PROVIDER_VERSION>,
-    {
-        self.with_connection(|conn| {
-            mls_storage::read_group_data(conn, group_id, GroupDataType::ConfirmationTag)
-        })
-    }
-
-    fn group_state<GroupState, GroupId>(
-        &self,
-        group_id: &GroupId,
-    ) -> Result<Option<GroupState>, Self::Error>
-    where
-        GroupState: traits::GroupState<STORAGE_PROVIDER_VERSION>,
-        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
-    {
-        self.with_connection(|conn| {
-            mls_storage::read_group_data(conn, group_id, GroupDataType::GroupState)
-        })
-    }
-
-    fn message_secrets<GroupId, MessageSecrets>(
-        &self,
-        group_id: &GroupId,
-    ) -> Result<Option<MessageSecrets>, Self::Error>
-    where
-        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
-        MessageSecrets: traits::MessageSecrets<STORAGE_PROVIDER_VERSION>,
-    {
-        self.with_connection(|conn| {
-            mls_storage::read_group_data(conn, group_id, GroupDataType::MessageSecrets)
-        })
-    }
-
-    fn resumption_psk_store<GroupId, ResumptionPskStore>(
-        &self,
-        group_id: &GroupId,
-    ) -> Result<Option<ResumptionPskStore>, Self::Error>
-    where
-        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
-        ResumptionPskStore: traits::ResumptionPskStore<STORAGE_PROVIDER_VERSION>,
-    {
-        self.with_connection(|conn| {
-            mls_storage::read_group_data(conn, group_id, GroupDataType::ResumptionPskStore)
-        })
-    }
-
-    fn own_leaf_index<GroupId, LeafNodeIndex>(
-        &self,
-        group_id: &GroupId,
-    ) -> Result<Option<LeafNodeIndex>, Self::Error>
-    where
-        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
-        LeafNodeIndex: traits::LeafNodeIndex<STORAGE_PROVIDER_VERSION>,
-    {
-        self.with_connection(|conn| {
-            mls_storage::read_group_data(conn, group_id, GroupDataType::OwnLeafIndex)
-        })
-    }
-
-    fn group_epoch_secrets<GroupId, GroupEpochSecrets>(
-        &self,
-        group_id: &GroupId,
-    ) -> Result<Option<GroupEpochSecrets>, Self::Error>
-    where
-        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
-        GroupEpochSecrets: traits::GroupEpochSecrets<STORAGE_PROVIDER_VERSION>,
-    {
-        self.with_connection(|conn| {
-            mls_storage::read_group_data(conn, group_id, GroupDataType::GroupEpochSecrets)
-        })
-    }
+    read_group_data_method!(tree, GroupId, TreeSync, Tree);
+    read_group_data_method!(group_context, GroupId, GroupContext, Context);
+    read_group_data_method!(
+        interim_transcript_hash,
+        GroupId,
+        InterimTranscriptHash,
+        InterimTranscriptHash
+    );
+    read_group_data_method!(confirmation_tag, GroupId, ConfirmationTag, ConfirmationTag);
+    read_group_data_method!(swapped group_state, GroupState, GroupId, GroupState);
+    read_group_data_method!(message_secrets, GroupId, MessageSecrets, MessageSecrets);
+    read_group_data_method!(
+        resumption_psk_store,
+        GroupId,
+        ResumptionPskStore,
+        ResumptionPskStore
+    );
+    read_group_data_method!(own_leaf_index, GroupId, LeafNodeIndex, OwnLeafIndex);
+    read_group_data_method!(
+        group_epoch_secrets,
+        GroupId,
+        GroupEpochSecrets,
+        GroupEpochSecrets
+    );
 
     fn signature_key_pair<SignaturePublicKey, SignatureKeyPair>(
         &self,
@@ -1780,98 +1674,16 @@ impl StorageProvider<STORAGE_PROVIDER_VERSION> for MdkSqliteStorage {
         self.with_connection(|conn| mls_storage::delete_own_leaf_nodes(conn, group_id))
     }
 
-    fn delete_group_config<GroupId>(&self, group_id: &GroupId) -> Result<(), Self::Error>
-    where
-        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
-    {
-        self.with_connection(|conn| {
-            mls_storage::delete_group_data(conn, group_id, GroupDataType::JoinGroupConfig)
-        })
-    }
-
-    fn delete_tree<GroupId>(&self, group_id: &GroupId) -> Result<(), Self::Error>
-    where
-        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
-    {
-        self.with_connection(|conn| {
-            mls_storage::delete_group_data(conn, group_id, GroupDataType::Tree)
-        })
-    }
-
-    fn delete_confirmation_tag<GroupId>(&self, group_id: &GroupId) -> Result<(), Self::Error>
-    where
-        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
-    {
-        self.with_connection(|conn| {
-            mls_storage::delete_group_data(conn, group_id, GroupDataType::ConfirmationTag)
-        })
-    }
-
-    fn delete_group_state<GroupId>(&self, group_id: &GroupId) -> Result<(), Self::Error>
-    where
-        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
-    {
-        self.with_connection(|conn| {
-            mls_storage::delete_group_data(conn, group_id, GroupDataType::GroupState)
-        })
-    }
-
-    fn delete_context<GroupId>(&self, group_id: &GroupId) -> Result<(), Self::Error>
-    where
-        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
-    {
-        self.with_connection(|conn| {
-            mls_storage::delete_group_data(conn, group_id, GroupDataType::Context)
-        })
-    }
-
-    fn delete_interim_transcript_hash<GroupId>(&self, group_id: &GroupId) -> Result<(), Self::Error>
-    where
-        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
-    {
-        self.with_connection(|conn| {
-            mls_storage::delete_group_data(conn, group_id, GroupDataType::InterimTranscriptHash)
-        })
-    }
-
-    fn delete_message_secrets<GroupId>(&self, group_id: &GroupId) -> Result<(), Self::Error>
-    where
-        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
-    {
-        self.with_connection(|conn| {
-            mls_storage::delete_group_data(conn, group_id, GroupDataType::MessageSecrets)
-        })
-    }
-
-    fn delete_all_resumption_psk_secrets<GroupId>(
-        &self,
-        group_id: &GroupId,
-    ) -> Result<(), Self::Error>
-    where
-        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
-    {
-        self.with_connection(|conn| {
-            mls_storage::delete_group_data(conn, group_id, GroupDataType::ResumptionPskStore)
-        })
-    }
-
-    fn delete_own_leaf_index<GroupId>(&self, group_id: &GroupId) -> Result<(), Self::Error>
-    where
-        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
-    {
-        self.with_connection(|conn| {
-            mls_storage::delete_group_data(conn, group_id, GroupDataType::OwnLeafIndex)
-        })
-    }
-
-    fn delete_group_epoch_secrets<GroupId>(&self, group_id: &GroupId) -> Result<(), Self::Error>
-    where
-        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
-    {
-        self.with_connection(|conn| {
-            mls_storage::delete_group_data(conn, group_id, GroupDataType::GroupEpochSecrets)
-        })
-    }
+    delete_group_data_method!(delete_group_config, JoinGroupConfig);
+    delete_group_data_method!(delete_tree, Tree);
+    delete_group_data_method!(delete_confirmation_tag, ConfirmationTag);
+    delete_group_data_method!(delete_group_state, GroupState);
+    delete_group_data_method!(delete_context, Context);
+    delete_group_data_method!(delete_interim_transcript_hash, InterimTranscriptHash);
+    delete_group_data_method!(delete_message_secrets, MessageSecrets);
+    delete_group_data_method!(delete_all_resumption_psk_secrets, ResumptionPskStore);
+    delete_group_data_method!(delete_own_leaf_index, OwnLeafIndex);
+    delete_group_data_method!(delete_group_epoch_secrets, GroupEpochSecrets);
 
     fn clear_proposal_queue<GroupId, ProposalRef>(
         &self,
