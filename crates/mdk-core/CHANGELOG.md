@@ -34,6 +34,8 @@
 
 ### Added
 
+- Added feature-gated MIP-05 notification request builders that group token tags by notification server, preserve relay hints, chunk requests at 100 tokens per server, and return ready-to-publish gift-wrapped notification batches for `kind:446` delivery. ([#238](https://github.com/marmot-protocol/mdk/pull/238))
+
 ### Fixed
 
 - Bumped `hpke-rs` from `0.6.0` to `0.6.1`, resolving two high-severity advisories in the transitive `libcrux` chain: [RUSTSEC-2026-0073](https://rustsec.org/advisories/RUSTSEC-2026-0073) (panic in `libcrux-poly1305` standalone MAC operations) and [RUSTSEC-2026-0074](https://rustsec.org/advisories/RUSTSEC-2026-0074) (incorrect SHAKE output in `libcrux-sha3`). `Cargo.lock` only — no `Cargo.toml` changes required. ([#234](https://github.com/marmot-protocol/mdk/pull/234))

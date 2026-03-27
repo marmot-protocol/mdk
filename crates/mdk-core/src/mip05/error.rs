@@ -94,4 +94,37 @@ pub enum Mip05Error {
     /// Event reference tag was malformed.
     #[error("invalid event reference")]
     InvalidEventReference,
+    /// `kind:446` must include at least one encrypted token.
+    #[error("notification request must include at least one token")]
+    NotificationRequestMustIncludeToken,
+    /// `kind:446` content was not valid base64.
+    #[error("invalid notification request base64 content")]
+    InvalidNotificationRequestBase64,
+    /// `kind:446` content did not split cleanly into encrypted tokens.
+    #[error("invalid notification request content length")]
+    InvalidNotificationRequestContentLength,
+    /// `kind:446` was missing the required version tag.
+    #[error("missing notification request version tag")]
+    MissingNotificationRequestVersionTag,
+    /// `kind:446` used an unsupported version tag value.
+    #[error("invalid notification request version tag")]
+    InvalidNotificationRequestVersionTag,
+    /// `kind:446` was missing the required encoding tag.
+    #[error("missing notification request encoding tag")]
+    MissingNotificationRequestEncodingTag,
+    /// `kind:446` used an unsupported encoding tag value.
+    #[error("invalid notification request encoding tag")]
+    InvalidNotificationRequestEncodingTag,
+    /// `kind:446` contained unsupported tags.
+    #[error("notification request contains unsupported tags")]
+    UnsupportedNotificationRequestTags,
+    /// NIP-44 encryption for the notification request failed.
+    #[error("failed to encrypt notification request")]
+    NotificationRequestEncryptionFailed,
+    /// The intermediate NIP-59 seal could not be signed.
+    #[error("failed to sign notification request seal")]
+    NotificationRequestSealFailed,
+    /// The outer gift wrap event could not be constructed.
+    #[error("failed to build notification request gift wrap")]
+    NotificationRequestGiftWrapFailed,
 }
