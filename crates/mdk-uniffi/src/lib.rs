@@ -258,6 +258,38 @@ fn welcome_from_uniffi(w: Welcome) -> Result<welcome_types::Welcome, MdkUniffiEr
     })
 }
 
+/// Convert a core [`mdk_core::groups::UpdateGroupResult`] into the UniFFI-exported
+/// [`UpdateGroupResult`], serializing the evolution event and welcome rumors to JSON.
+fn update_group_result_to_uniffi(
+    result: mdk_core::groups::UpdateGroupResult,
+) -> Result<UpdateGroupResult, MdkUniffiError> {
+    let evolution_event_json = serde_json::to_string(&result.evolution_event).map_err(|e| {
+        MdkUniffiError::InvalidInput(format!("Failed to serialize evolution event: {e}"))
+    })?;
+
+    let welcome_rumors_json: Option<Vec<String>> = result
+        .welcome_rumors
+        .map(|rumors| {
+            rumors
+                .iter()
+                .map(|rumor| {
+                    serde_json::to_string(rumor).map_err(|e| {
+                        MdkUniffiError::InvalidInput(format!(
+                            "Failed to serialize welcome rumor: {e}"
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .transpose()?;
+
+    Ok(UpdateGroupResult {
+        evolution_event_json,
+        welcome_rumors_json,
+        mls_group_id: hex::encode(result.mls_group_id.as_slice()),
+    })
+}
+
 impl Mdk {
     /// Lock the internal MDK instance for exclusive access.
     /// Returns an error if the mutex is poisoned.
@@ -268,6 +300,17 @@ impl Mdk {
                 "MDK mutex poisoned. This indicates a critical internal error. Using MDK correctly (do NOT share memory across threads) should never result in a poisoned mutex.".to_string(),
             )
         })
+    }
+}
+
+/// Wrap a storage backend and optional config into a [`Mdk`] instance.
+fn mdk_from_storage(storage: MdkSqliteStorage, config: Option<MdkConfig>) -> Mdk {
+    let mdk = match config {
+        Some(c) => MDK::builder(storage).with_config(c.into()).build(),
+        None => MDK::new(storage),
+    };
+    Mdk {
+        mdk: Mutex::new(mdk),
     }
 }
 
@@ -308,13 +351,7 @@ pub fn new_mdk(
     config: Option<MdkConfig>,
 ) -> Result<Mdk, MdkUniffiError> {
     let storage = MdkSqliteStorage::new(PathBuf::from(db_path), &service_id, &db_key_id)?;
-    let mdk = match config {
-        Some(c) => MDK::builder(storage).with_config(c.into()).build(),
-        None => MDK::new(storage),
-    };
-    Ok(Mdk {
-        mdk: Mutex::new(mdk),
-    })
+    Ok(mdk_from_storage(storage, config))
 }
 
 /// Create a new MDK instance with encrypted SQLite storage using a directly provided key.
@@ -341,13 +378,7 @@ pub fn new_mdk_with_key(
     let encryption_config = EncryptionConfig::from_slice(&encryption_key)
         .map_err(|e| MdkUniffiError::InvalidInput(format!("Invalid encryption key: {}", e)))?;
     let storage = MdkSqliteStorage::new_with_key(PathBuf::from(db_path), encryption_config)?;
-    let mdk = match config {
-        Some(c) => MDK::builder(storage).with_config(c.into()).build(),
-        None => MDK::new(storage),
-    };
-    Ok(Mdk {
-        mdk: Mutex::new(mdk),
-    })
+    Ok(mdk_from_storage(storage, config))
 }
 
 /// Create a new MDK instance with unencrypted SQLite storage.
@@ -368,13 +399,7 @@ pub fn new_mdk_unencrypted(
     config: Option<MdkConfig>,
 ) -> Result<Mdk, MdkUniffiError> {
     let storage = MdkSqliteStorage::new_unencrypted(PathBuf::from(db_path))?;
-    let mdk = match config {
-        Some(c) => MDK::builder(storage).with_config(c.into()).build(),
-        None => MDK::new(storage),
-    };
-    Ok(Mdk {
-        mdk: Mutex::new(mdk),
-    })
+    Ok(mdk_from_storage(storage, config))
 }
 
 #[uniffi::export]
@@ -728,32 +753,7 @@ impl Mdk {
 
         let mdk = self.lock()?;
         let result = mdk.add_members(&group_id, &key_package_events)?;
-
-        let evolution_event_json = serde_json::to_string(&result.evolution_event).map_err(|e| {
-            MdkUniffiError::InvalidInput(format!("Failed to serialize evolution event: {e}"))
-        })?;
-
-        let welcome_rumors_json: Option<Vec<String>> = result
-            .welcome_rumors
-            .map(|rumors| {
-                rumors
-                    .iter()
-                    .map(|rumor| {
-                        serde_json::to_string(rumor).map_err(|e| {
-                            MdkUniffiError::InvalidInput(format!(
-                                "Failed to serialize welcome rumor: {e}"
-                            ))
-                        })
-                    })
-                    .collect::<Result<Vec<_>, _>>()
-            })
-            .transpose()?;
-
-        Ok(UpdateGroupResult {
-            evolution_event_json,
-            welcome_rumors_json,
-            mls_group_id: hex::encode(result.mls_group_id.as_slice()),
-        })
+        update_group_result_to_uniffi(result)
     }
 
     /// Remove members from a group
@@ -772,32 +772,7 @@ impl Mdk {
 
         let mdk = self.lock()?;
         let result = mdk.remove_members(&group_id, &pubkeys)?;
-
-        let evolution_event_json = serde_json::to_string(&result.evolution_event).map_err(|e| {
-            MdkUniffiError::InvalidInput(format!("Failed to serialize evolution event: {e}"))
-        })?;
-
-        let welcome_rumors_json: Option<Vec<String>> = result
-            .welcome_rumors
-            .map(|rumors| {
-                rumors
-                    .iter()
-                    .map(|rumor| {
-                        serde_json::to_string(rumor).map_err(|e| {
-                            MdkUniffiError::InvalidInput(format!(
-                                "Failed to serialize welcome rumor: {e}"
-                            ))
-                        })
-                    })
-                    .collect::<Result<Vec<_>, _>>()
-            })
-            .transpose()?;
-
-        Ok(UpdateGroupResult {
-            evolution_event_json,
-            welcome_rumors_json,
-            mls_group_id: hex::encode(result.mls_group_id.as_slice()),
-        })
+        update_group_result_to_uniffi(result)
     }
 
     /// Merge pending commit for a group
@@ -866,32 +841,7 @@ impl Mdk {
         let group_id = parse_group_id(&mls_group_id)?;
         let mdk = self.lock()?;
         let result = mdk.self_update(&group_id)?;
-
-        let evolution_event_json = serde_json::to_string(&result.evolution_event).map_err(|e| {
-            MdkUniffiError::InvalidInput(format!("Failed to serialize evolution event: {e}"))
-        })?;
-
-        let welcome_rumors_json: Option<Vec<String>> = result
-            .welcome_rumors
-            .map(|rumors| {
-                rumors
-                    .iter()
-                    .map(|rumor| {
-                        serde_json::to_string(rumor).map_err(|e| {
-                            MdkUniffiError::InvalidInput(format!(
-                                "Failed to serialize welcome rumor: {e}"
-                            ))
-                        })
-                    })
-                    .collect::<Result<Vec<_>, _>>()
-            })
-            .transpose()?;
-
-        Ok(UpdateGroupResult {
-            evolution_event_json,
-            welcome_rumors_json,
-            mls_group_id: hex::encode(result.mls_group_id.as_slice()),
-        })
+        update_group_result_to_uniffi(result)
     }
 
     /// Create a proposal to leave the group
@@ -899,32 +849,7 @@ impl Mdk {
         let group_id = parse_group_id(&mls_group_id)?;
         let mdk = self.lock()?;
         let result = mdk.leave_group(&group_id)?;
-
-        let evolution_event_json = serde_json::to_string(&result.evolution_event).map_err(|e| {
-            MdkUniffiError::InvalidInput(format!("Failed to serialize evolution event: {e}"))
-        })?;
-
-        let welcome_rumors_json: Option<Vec<String>> = result
-            .welcome_rumors
-            .map(|rumors| {
-                rumors
-                    .iter()
-                    .map(|rumor| {
-                        serde_json::to_string(rumor).map_err(|e| {
-                            MdkUniffiError::InvalidInput(format!(
-                                "Failed to serialize welcome rumor: {e}"
-                            ))
-                        })
-                    })
-                    .collect::<Result<Vec<_>, _>>()
-            })
-            .transpose()?;
-
-        Ok(UpdateGroupResult {
-            evolution_event_json,
-            welcome_rumors_json,
-            mls_group_id: hex::encode(result.mls_group_id.as_slice()),
-        })
+        update_group_result_to_uniffi(result)
     }
 
     /// Update group data (name, description, image, relays, admins)
@@ -971,32 +896,7 @@ impl Mdk {
 
         let mdk = self.lock()?;
         let result = mdk.update_group_data(&group_id, group_update)?;
-
-        let evolution_event_json = serde_json::to_string(&result.evolution_event).map_err(|e| {
-            MdkUniffiError::InvalidInput(format!("Failed to serialize evolution event: {e}"))
-        })?;
-
-        let welcome_rumors_json: Option<Vec<String>> = result
-            .welcome_rumors
-            .map(|rumors| {
-                rumors
-                    .iter()
-                    .map(|rumor| {
-                        serde_json::to_string(rumor).map_err(|e| {
-                            MdkUniffiError::InvalidInput(format!(
-                                "Failed to serialize welcome rumor: {e}"
-                            ))
-                        })
-                    })
-                    .collect::<Result<Vec<_>, _>>()
-            })
-            .transpose()?;
-
-        Ok(UpdateGroupResult {
-            evolution_event_json,
-            welcome_rumors_json,
-            mls_group_id: hex::encode(result.mls_group_id.as_slice()),
-        })
+        update_group_result_to_uniffi(result)
     }
 
     /// Process an incoming MLS message
@@ -1014,38 +914,9 @@ impl Mdk {
                     message: Message::from(message),
                 }
             }
-            MessageProcessingResult::Proposal(update_result) => {
-                let evolution_event_json = serde_json::to_string(&update_result.evolution_event)
-                    .map_err(|e| {
-                        MdkUniffiError::InvalidInput(format!(
-                            "Failed to serialize evolution event: {e}"
-                        ))
-                    })?;
-
-                let welcome_rumors_json: Option<Vec<String>> = update_result
-                    .welcome_rumors
-                    .map(|rumors| {
-                        rumors
-                            .iter()
-                            .map(|rumor| {
-                                serde_json::to_string(rumor).map_err(|e| {
-                                    MdkUniffiError::InvalidInput(format!(
-                                        "Failed to serialize welcome rumor: {e}"
-                                    ))
-                                })
-                            })
-                            .collect::<Result<Vec<_>, _>>()
-                    })
-                    .transpose()?;
-
-                ProcessMessageResult::Proposal {
-                    result: UpdateGroupResult {
-                        evolution_event_json,
-                        welcome_rumors_json,
-                        mls_group_id: hex::encode(update_result.mls_group_id.as_slice()),
-                    },
-                }
-            }
+            MessageProcessingResult::Proposal(update_result) => ProcessMessageResult::Proposal {
+                result: update_group_result_to_uniffi(update_result)?,
+            },
             MessageProcessingResult::PendingProposal { mls_group_id } => {
                 ProcessMessageResult::PendingProposal {
                     mls_group_id: hex::encode(mls_group_id.as_slice()),
