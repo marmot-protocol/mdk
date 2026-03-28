@@ -229,12 +229,26 @@ where
     /// Per MIP-03, a Commit containing SelfRemove proposals MUST be rejected
     /// if the resulting admin_pubkeys set would be empty. This checks the
     /// cumulative effect of all departures, not each one individually.
+    ///
+    /// Admin count is cross-referenced against actual group membership to ignore
+    /// stale entries in `admin_pubkeys` (e.g., from admins who departed without
+    /// a corresponding GroupContextExtensions update).
     pub(super) fn validate_admin_depletion(
         &self,
         mls_group: &MlsGroup,
         departing_leaf_indices: &[LeafNodeIndex],
     ) -> Result<()> {
         let group_data = crate::extension::NostrGroupDataExtension::from_group(mls_group)?;
+
+        // Count only admins who are actual group members (ignores stale entries)
+        let active_admin_count = mls_group
+            .members()
+            .filter_map(|member| {
+                let basic_cred = BasicCredential::try_from(member.credential).ok()?;
+                let pubkey = self.parse_credential_identity(basic_cred.identity()).ok()?;
+                group_data.admins.contains(&pubkey).then_some(pubkey)
+            })
+            .count();
 
         let mut departing_admin_count = 0usize;
         for &leaf_index in departing_leaf_indices {
@@ -249,7 +263,7 @@ where
             }
         }
 
-        if departing_admin_count >= group_data.admins.len() {
+        if departing_admin_count >= active_admin_count {
             return Err(Error::Group("Would leave group with no admins".to_string()));
         }
 
