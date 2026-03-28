@@ -5,7 +5,7 @@
 use mdk_storage_traits::messages::types as message_types;
 use mdk_storage_traits::{GroupId, MdkStorageProvider};
 use nostr::Event;
-use openmls::prelude::{MlsGroup, Proposal, QueuedProposal, Sender};
+use openmls::prelude::{BasicCredential, MlsGroup, Proposal, QueuedProposal, Sender};
 use openmls_traits::OpenMlsProvider;
 use tls_codec::Serialize as TlsSerialize;
 
@@ -148,8 +148,38 @@ where
                                 })
                             }
                             Proposal::SelfRemove => {
-                                // SelfRemove: any member can commit, so auto-commit
-                                // regardless of admin status.
+                                // Per MIP-03, admins MUST NOT send SelfRemove.
+                                // Reject proposals from admin senders.
+                                let sender_member = mls_group
+                                    .member_at(*sender_leaf_index)
+                                    .ok_or(Error::MessageFromNonMember)?;
+                                let sender_cred =
+                                    BasicCredential::try_from(sender_member.credential)?;
+                                let sender_pubkey =
+                                    self.parse_credential_identity(sender_cred.identity())?;
+                                let group_data =
+                                    crate::extension::NostrGroupDataExtension::from_group(
+                                        mls_group,
+                                    )?;
+
+                                if group_data.admins.contains(&sender_pubkey) {
+                                    tracing::warn!(
+                                        target: "mdk_core::messages::process_proposal",
+                                        "Rejecting SelfRemove from admin — must self-demote first"
+                                    );
+                                    self.mark_processed(
+                                        event,
+                                        &group_id,
+                                        mls_group.epoch().as_u64(),
+                                    )?;
+                                    return Ok(MessageProcessingResult::IgnoredProposal {
+                                        mls_group_id: group_id,
+                                        reason: "SelfRemove rejected: sender is an admin"
+                                            .to_string(),
+                                    });
+                                }
+
+                                // Non-admin SelfRemove: any member can commit, so auto-commit.
                                 if let Err(e) =
                                     self.validate_admin_depletion(mls_group, &[*sender_leaf_index])
                                 {
@@ -455,19 +485,18 @@ mod tests {
         );
     }
 
-    /// Tests that SelfRemove from the sole admin is rejected to prevent admin depletion.
+    /// Tests that admins are blocked from calling leave_group.
     ///
-    /// Per MIP-03, SelfRemove proposals MUST be rejected if the resulting admin_pubkeys
-    /// set would be empty. This prevents groups from becoming leaderless.
+    /// Per MIP-03, admins MUST self-demote before sending a SelfRemove.
+    /// leave_group enforces this on the sending side.
     #[test]
-    fn test_self_remove_sole_admin_rejected() {
+    fn test_admin_leave_group_rejected() {
         let alice_keys = Keys::generate();
         let bob_keys = Keys::generate();
 
         let alice_mdk = create_test_mdk();
         let bob_mdk = create_test_mdk();
 
-        // Alice is the only admin
         let admins = vec![alice_keys.public_key()];
 
         let bob_key_package = create_key_package_event(&bob_mdk, &bob_keys);
@@ -486,32 +515,15 @@ mod tests {
             .merge_pending_commit(&group_id)
             .expect("Alice should merge commit");
 
-        let bob_welcome = &create_result.welcome_rumors[0];
-        let bob_welcome_preview = bob_mdk
-            .process_welcome(&nostr::EventId::all_zeros(), bob_welcome)
-            .expect("Bob should process welcome");
-        bob_mdk
-            .accept_welcome(&bob_welcome_preview)
-            .expect("Bob should accept welcome");
-
-        // Alice (sole admin) tries to leave
-        let alice_leave_result = alice_mdk
-            .leave_group(&group_id)
-            .expect("Alice should create leave proposal");
-
-        // Bob processes Alice's SelfRemove — should be rejected (would leave zero admins)
-        let process_result = bob_mdk
-            .process_message(&alice_leave_result.evolution_event)
-            .expect("Bob should process without error");
-
+        // Alice (admin) tries to leave without self-demoting — should fail
+        let result = alice_mdk.leave_group(&group_id);
         assert!(
-            matches!(
-                &process_result,
-                MessageProcessingResult::IgnoredProposal { reason, .. }
-                if reason.contains("no admins")
-            ),
-            "Sole admin's SelfRemove should be rejected, got: {:?}",
-            process_result
+            result.is_err(),
+            "Admin should not be able to leave without self-demoting admin status"
+        );
+        assert!(
+            result.unwrap_err().to_string().contains("self-demote"),
+            "Error should mention self-demotion"
         );
     }
 

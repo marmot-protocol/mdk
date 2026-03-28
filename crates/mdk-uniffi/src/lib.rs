@@ -927,6 +927,26 @@ impl Mdk {
         })
     }
 
+    /// Self-demote from admin status before leaving a group.
+    ///
+    /// Per MIP-03, admins must call this before leave_group(). If the caller is
+    /// the last admin, they must designate a successor via update_group_data first.
+    pub fn self_demote(&self, mls_group_id: String) -> Result<UpdateGroupResult, MdkUniffiError> {
+        let group_id = parse_group_id(&mls_group_id)?;
+        let mdk = self.lock()?;
+        let result = mdk.self_demote(&group_id)?;
+
+        let evolution_event_json = serde_json::to_string(&result.evolution_event).map_err(|e| {
+            MdkUniffiError::InvalidInput(format!("Failed to serialize evolution event: {e}"))
+        })?;
+
+        Ok(UpdateGroupResult {
+            evolution_event_json,
+            welcome_rumors_json: None,
+            mls_group_id: hex::encode(result.mls_group_id.as_slice()),
+        })
+    }
+
     /// Update group data (name, description, image, relays, admins)
     pub fn update_group_data(
         &self,

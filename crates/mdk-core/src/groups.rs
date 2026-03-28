@@ -1505,6 +1505,44 @@ where
         result.map_err(|e| Error::Group(e.to_string()))
     }
 
+    /// Self-demote from admin status in a group.
+    ///
+    /// Per MIP-03, admins MUST demote themselves before sending a SelfRemove
+    /// proposal. This method removes the caller's public key from `admin_pubkeys`
+    /// via a GroupContextExtensions commit.
+    ///
+    /// If the caller is the last admin, they MUST designate a successor first using
+    /// `update_group_data` to add another admin before calling this method.
+    ///
+    /// After this method succeeds and the commit is merged, the caller can use
+    /// `leave_group` to send a SelfRemove proposal.
+    pub fn self_demote(&self, group_id: &GroupId) -> Result<UpdateGroupResult, Error> {
+        let mls_group = self.load_mls_group(group_id)?.ok_or(Error::GroupNotFound)?;
+        let own_leaf = mls_group.own_leaf().ok_or(Error::OwnLeafNotFound)?;
+        let own_pubkey = self.pubkey_for_leaf_node(own_leaf)?;
+        let group_data = NostrGroupDataExtension::from_group(&mls_group)?;
+
+        if !group_data.admins.contains(&own_pubkey) {
+            return Err(Error::Group("Cannot self-demote: not an admin".to_string()));
+        }
+
+        if group_data.admins.len() <= 1 {
+            return Err(Error::Group(
+                "Cannot self-demote: last admin. \
+                 Designate another admin first using update_group_data."
+                    .to_string(),
+            ));
+        }
+
+        let new_admins: Vec<_> = group_data
+            .admins
+            .into_iter()
+            .filter(|pk| pk != &own_pubkey)
+            .collect();
+
+        self.update_group_data(group_id, NostrGroupDataUpdate::new().admins(new_admins))
+    }
+
     /// Create a proposal to leave the group
     ///
     /// Sends a SelfRemove proposal (new protocol) if the group supports it, otherwise
@@ -1520,6 +1558,17 @@ where
     /// * `Ok(UpdateGroupResult)` - Contains the leave proposal event that must be processed by another member
     pub fn leave_group(&self, group_id: &GroupId) -> Result<UpdateGroupResult, Error> {
         let mut group = self.load_mls_group(group_id)?.ok_or(Error::GroupNotFound)?;
+
+        // Per MIP-03, admins MUST self-demote before SelfRemoving.
+        // Use self_demote() first, then call leave_group() again.
+        let own_leaf = group.own_leaf().ok_or(Error::OwnLeafNotFound)?;
+        if self.is_leaf_node_admin(group_id, own_leaf)? {
+            return Err(Error::Group(
+                "Admins must self-demote before leaving. \
+                 Use self_demote() first."
+                    .to_string(),
+            ));
+        }
 
         let signer: SignatureKeyPair = self.load_mls_signer(&group)?;
 
@@ -2858,12 +2907,21 @@ mod tests {
             .merge_pending_commit(group_id)
             .expect("Failed to merge pending commit");
 
+        // Admin must self-demote before leaving (per MIP-03)
+        creator_mdk
+            .self_demote(group_id)
+            .expect("Failed to self-demote");
+        creator_mdk
+            .merge_pending_commit(group_id)
+            .expect("Failed to merge self-demote commit");
+
         let leave_result = creator_mdk
             .leave_group(group_id)
             .expect("Failed to leave group");
 
         // Verify the processed message was recorded with Processed state
         // (not ProcessedCommit), since leave_group creates a proposal.
+        // Note: Check the leave event, not the self-demote event.
         let processed = creator_mdk
             .storage()
             .find_processed_message_by_event_id(&leave_result.evolution_event.id)
