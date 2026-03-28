@@ -4,7 +4,7 @@
 
 use mdk_storage_traits::MdkStorageProvider;
 use nostr::{Event, Kind, TagKind, Timestamp};
-use openmls::prelude::{BasicCredential, MlsGroup, Proposal, Sender, StagedCommit};
+use openmls::prelude::{BasicCredential, LeafNodeIndex, MlsGroup, Proposal, Sender, StagedCommit};
 
 use crate::MDK;
 use crate::error::Error;
@@ -203,6 +203,73 @@ where
             .all(|p| matches!(p.sender(), Sender::Member(idx) if idx == sender_leaf_index))
     }
 
+    /// Checks if a staged commit contains only SelfRemove proposals.
+    ///
+    /// Per MIP-03, non-admin members can create SelfRemove-only Commits.
+    /// These commits MUST contain only SelfRemove proposals — no other types.
+    ///
+    /// Note: SelfRemove commits also include an update path (the committer's
+    /// leaf update, required by MLS). This is normal MLS behavior and does NOT
+    /// make it a self-update commit.
+    pub(super) fn is_self_remove_only_commit(&self, staged_commit: &StagedCommit) -> bool {
+        let mut has_self_remove = false;
+
+        for queued in staged_commit.queued_proposals() {
+            match queued.proposal() {
+                Proposal::SelfRemove => has_self_remove = true,
+                _ => return false,
+            }
+        }
+
+        has_self_remove
+    }
+
+    /// Validates that removing the specified members would not deplete all admins.
+    ///
+    /// Per MIP-03, a Commit containing SelfRemove proposals MUST be rejected
+    /// if the resulting admin_pubkeys set would be empty. This checks the
+    /// cumulative effect of all departures, not each one individually.
+    ///
+    /// Admin count is cross-referenced against actual group membership to ignore
+    /// stale entries in `admin_pubkeys` (e.g., from admins who departed without
+    /// a corresponding GroupContextExtensions update).
+    pub(super) fn validate_admin_depletion(
+        &self,
+        mls_group: &MlsGroup,
+        departing_leaf_indices: &[LeafNodeIndex],
+    ) -> Result<()> {
+        let group_data = crate::extension::NostrGroupDataExtension::from_group(mls_group)?;
+
+        // Count only admins who are actual group members (ignores stale entries)
+        let active_admin_count = mls_group
+            .members()
+            .filter_map(|member| {
+                let basic_cred = BasicCredential::try_from(member.credential).ok()?;
+                let pubkey = self.parse_credential_identity(basic_cred.identity()).ok()?;
+                group_data.admins.contains(&pubkey).then_some(pubkey)
+            })
+            .count();
+
+        let mut departing_admin_count = 0usize;
+        for &leaf_index in departing_leaf_indices {
+            let member = mls_group
+                .member_at(leaf_index)
+                .ok_or(Error::MessageFromNonMember)?;
+            let basic_cred = BasicCredential::try_from(member.credential.clone())?;
+            let pubkey = self.parse_credential_identity(basic_cred.identity())?;
+
+            if group_data.admins.contains(&pubkey) {
+                departing_admin_count += 1;
+            }
+        }
+
+        if departing_admin_count >= active_admin_count {
+            return Err(Error::Group("Would leave group with no admins".to_string()));
+        }
+
+        Ok(())
+    }
+
     /// Validates that a staged commit does not attempt to change any member's identity
     ///
     /// This function checks all Update proposals within a staged commit to ensure
@@ -267,20 +334,11 @@ where
 
     /// Validates that the commit sender is authorized to create this commit.
     ///
-    /// Admins can create any commit. Non-admins can only create pure self-update commits
-    /// (commits that only update their own leaf node with no add/remove proposals).
+    /// Admins can create any commit. Non-admins can only create:
+    /// - Pure self-update commits (updating their own leaf node)
+    /// - SelfRemove-only commits (processing pending SelfRemove proposals)
     ///
-    /// # Arguments
-    ///
-    /// * `mls_group` - The MLS group to check authorization against
-    /// * `staged_commit` - The staged commit to validate
-    /// * `commit_sender` - The MLS sender of the commit
-    ///
-    /// # Returns
-    ///
-    /// * `Ok(())` - If the sender is authorized
-    /// * `Err(Error::CommitFromNonAdmin)` - If a non-admin tries to create a non-self-update commit
-    /// * `Err(Error::MessageFromNonMember)` - If the sender is not a member
+    /// These two non-admin commit types MUST NOT be combined.
     pub(super) fn validate_commit_authorization(
         &self,
         mls_group: &MlsGroup,
@@ -298,28 +356,49 @@ where
                 let group_data = crate::extension::NostrGroupDataExtension::from_group(mls_group)?;
                 let sender_is_admin = group_data.admins.contains(&sender_pubkey);
 
-                let is_pure_self_update =
-                    self.is_pure_self_update_commit(staged_commit, leaf_index);
-
-                match (sender_is_admin, is_pure_self_update) {
-                    (true, _) => Ok(()),
-                    (false, true) => {
-                        tracing::debug!(
-                            target: "mdk_core::messages::process_commit",
-                            "Allowing self-update commit from non-admin member at leaf index {:?}",
-                            leaf_index
-                        );
-                        Ok(())
-                    }
-                    (false, false) => {
-                        tracing::warn!(
-                            target: "mdk_core::messages::process_commit",
-                            "Received non-self-update commit from non-admin member at leaf index {:?}",
-                            leaf_index
-                        );
-                        Err(Error::CommitFromNonAdmin)
-                    }
+                if sender_is_admin {
+                    return Ok(());
                 }
+
+                // Non-admin path: only self-update and SelfRemove-only commits are allowed
+
+                if self.is_pure_self_update_commit(staged_commit, leaf_index) {
+                    tracing::debug!(
+                        target: "mdk_core::messages::process_commit",
+                        "Allowing self-update commit from non-admin member at leaf index {:?}",
+                        leaf_index
+                    );
+                    return Ok(());
+                }
+
+                if self.is_self_remove_only_commit(staged_commit) {
+                    tracing::debug!(
+                        target: "mdk_core::messages::process_commit",
+                        "Allowing SelfRemove-only commit from non-admin member at leaf index {:?}",
+                        leaf_index
+                    );
+
+                    // Admin depletion check: the cumulative effect of all SelfRemove
+                    // proposals must not leave the group with zero admins.
+                    let departing_leaves: Vec<LeafNodeIndex> = staged_commit
+                        .queued_proposals()
+                        .filter_map(|queued| match queued.sender() {
+                            Sender::Member(leaf) => Some(*leaf),
+                            _ => None,
+                        })
+                        .collect();
+
+                    self.validate_admin_depletion(mls_group, &departing_leaves)?;
+
+                    return Ok(());
+                }
+
+                tracing::warn!(
+                    target: "mdk_core::messages::process_commit",
+                    "Received non-self-update commit from non-admin member at leaf index {:?}",
+                    leaf_index
+                );
+                Err(Error::CommitFromNonAdmin)
             }
             _ => {
                 tracing::warn!(

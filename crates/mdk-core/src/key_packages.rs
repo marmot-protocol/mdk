@@ -38,6 +38,7 @@ where
     ///   - `mls_protocol_version` - MLS protocol version (e.g., "1.0")
     ///   - `mls_ciphersuite` - Ciphersuite identifier (e.g., "0x0001")
     ///   - `mls_extensions` - Required MLS extensions
+    ///   - `mls_proposals` - Supported proposal types (e.g., "0x000a")
     ///   - `relays` - Relay URLs for distribution
     ///   - `i` - Hex-encoded KeyPackageRef for efficient relay queries (MIP-00)
     ///   - `client` - Client identifier and version
@@ -108,8 +109,8 @@ where
     ///
     /// The `protected` parameter controls whether the NIP-70 protected tag (`["-"]`) is
     /// included in the output tags. When `true`, the tag is inserted between the `i`
-    /// and `client` tags, resulting in 8 total tags. When `false`, the protected tag is
-    /// omitted, resulting in 7 total tags.
+    /// and `client` tags, resulting in 9 total tags. When `false`, the protected tag is
+    /// omitted, resulting in 8 total tags.
     fn create_key_package_for_event_internal<I>(
         &self,
         public_key: &PublicKey,
@@ -166,6 +167,10 @@ where
             Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
             Tag::custom(TagKind::MlsCiphersuite, [self.ciphersuite_value()]),
             Tag::custom(TagKind::MlsExtensions, self.extensions_value()),
+            Tag::custom(
+                TagKind::Custom("mls_proposals".into()),
+                self.proposals_value(),
+            ),
             Tag::relays(relays),
             Tag::custom(TagKind::i(), [key_package_ref_hex]),
         ];
@@ -733,18 +738,19 @@ mod tests {
         // Verify the key package has the expected properties
         assert_eq!(key_package.ciphersuite(), DEFAULT_CIPHERSUITE);
 
-        // Without protected tag: 7 tags (3 MLS + relays + i + client + encoding)
-        assert_eq!(tags.len(), 7);
+        // Without protected tag: 8 tags (3 MLS + mls_proposals + relays + i + client + encoding)
+        assert_eq!(tags.len(), 8);
         assert_eq!(tags[0].kind(), TagKind::MlsProtocolVersion);
         assert_eq!(tags[1].kind(), TagKind::MlsCiphersuite);
         assert_eq!(tags[2].kind(), TagKind::MlsExtensions);
-        assert_eq!(tags[3].kind(), TagKind::Relays);
-        assert_eq!(tags[4].kind(), TagKind::i());
-        assert_eq!(tags[5].kind(), TagKind::Client);
-        assert_eq!(tags[6].kind(), TagKind::Custom("encoding".into()));
+        assert_eq!(tags[3].kind(), TagKind::Custom("mls_proposals".into()));
+        assert_eq!(tags[4].kind(), TagKind::Relays);
+        assert_eq!(tags[5].kind(), TagKind::i());
+        assert_eq!(tags[6].kind(), TagKind::Client);
+        assert_eq!(tags[7].kind(), TagKind::Custom("encoding".into()));
 
         assert_eq!(
-            tags[3].content().unwrap(),
+            tags[4].content().unwrap(),
             relays
                 .iter()
                 .map(|r| r.to_string())
@@ -759,7 +765,7 @@ mod tests {
         );
 
         // Verify client tag contains version
-        let client_tag = tags[5].content().unwrap();
+        let client_tag = tags[6].content().unwrap();
         assert!(
             client_tag.starts_with("MDK/"),
             "Client tag should start with MDK/"
@@ -933,12 +939,12 @@ mod tests {
             .create_key_package_for_event(&test_pubkey, relays.clone())
             .expect("Failed to create key package");
 
-        // Verify we have exactly 7 tags (3 MLS required + relays + i + client + encoding)
+        // Verify we have exactly 8 tags (3 MLS required + mls_proposals + relays + i + client + encoding)
         // No protected tag when protected=false
         assert_eq!(
             tags.len(),
-            7,
-            "Should have exactly 7 tags without protected"
+            8,
+            "Should have exactly 8 tags without protected"
         );
 
         // Verify tag order matches spec example
@@ -959,27 +965,32 @@ mod tests {
         );
         assert_eq!(
             tags[3].kind(),
-            TagKind::Relays,
-            "Fourth tag should be relays"
+            TagKind::Custom("mls_proposals".into()),
+            "Fourth tag should be mls_proposals"
         );
         assert_eq!(
             tags[4].kind(),
-            TagKind::i(),
-            "Fifth tag should be i (KeyPackageRef)"
+            TagKind::Relays,
+            "Fifth tag should be relays"
         );
         assert_eq!(
             tags[5].kind(),
-            TagKind::Client,
-            "Sixth tag should be client (no protected tag)"
+            TagKind::i(),
+            "Sixth tag should be i (KeyPackageRef)"
         );
         assert_eq!(
             tags[6].kind(),
+            TagKind::Client,
+            "Seventh tag should be client (no protected tag)"
+        );
+        assert_eq!(
+            tags[7].kind(),
             TagKind::Custom("encoding".into()),
-            "Seventh tag should be encoding"
+            "Eighth tag should be encoding"
         );
 
         // Verify relays tag format
-        let relays_tag = &tags[3];
+        let relays_tag = &tags[4];
         let relays_values: Vec<String> = relays_tag
             .as_slice()
             .iter()
@@ -1023,34 +1034,34 @@ mod tests {
             "hash_ref should be returned from create_key_package_for_event_with_options"
         );
 
-        // Verify we have exactly 8 tags (3 MLS required + relays + i + protected + client + encoding)
+        // Verify we have exactly 9 tags (3 MLS required + mls_proposals + relays + i + protected + client + encoding)
         assert_eq!(
             tags.len(),
-            8,
-            "Should have exactly 8 tags with protected=true"
+            9,
+            "Should have exactly 9 tags with protected=true"
         );
 
         // Verify i tag is present at the correct position
         assert_eq!(
-            tags[4].kind(),
+            tags[5].kind(),
             TagKind::i(),
-            "Fifth tag should be i (KeyPackageRef)"
+            "Sixth tag should be i (KeyPackageRef)"
         );
         // Verify protected tag is present at the correct position
         assert_eq!(
-            tags[5].kind(),
-            TagKind::Protected,
-            "Sixth tag should be protected"
-        );
-        assert_eq!(
             tags[6].kind(),
-            TagKind::Client,
-            "Seventh tag should be client"
+            TagKind::Protected,
+            "Seventh tag should be protected"
         );
         assert_eq!(
             tags[7].kind(),
+            TagKind::Client,
+            "Eighth tag should be client"
+        );
+        assert_eq!(
+            tags[8].kind(),
             TagKind::Custom("encoding".into()),
-            "Eighth tag should be encoding"
+            "Ninth tag should be encoding"
         );
     }
 

@@ -463,13 +463,22 @@ mod tests {
         // This should fail because the epoch has advanced
         let bob_process_own = bob_mdk.process_message(&bob_commit_result.evolution_event);
 
-        // Bob's commit is now outdated since Alice's commit advanced the epoch
-        // The exact error depends on implementation, but it should not succeed
-        // or should be detected as stale
+        // Bob's commit is now outdated since Alice's commit advanced the epoch.
+        // Valid outcomes:
+        // - Err: message processing failed outright (wrong epoch, can't decrypt own message)
+        // - Ok(Unprocessable): detected as stale and handled (may trigger epoch rollback)
+        // - Epoch advanced: the stale commit was somehow processed (shouldn't happen, but safe)
+        let is_handled = bob_process_own.is_err()
+            || matches!(
+                &bob_process_own,
+                Ok(MessageProcessingResult::Unprocessable { .. })
+            )
+            || bob_mdk.get_group(&group_id).unwrap().unwrap().epoch > bob_epoch;
+
         assert!(
-            bob_process_own.is_err()
-                || bob_mdk.get_group(&group_id).unwrap().unwrap().epoch > bob_epoch,
-            "Bob's commit should be rejected or epoch should have advanced"
+            is_handled,
+            "Bob's stale commit should be rejected, unprocessable, or epoch should have advanced, got: {:?}",
+            bob_process_own
         );
 
         // Step 6: Verify final state - Alice's commit won the race

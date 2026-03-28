@@ -1,6 +1,6 @@
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use openmls::prelude::{Ciphersuite, ExtensionType};
+use openmls::prelude::{Ciphersuite, ExtensionType, ProposalType};
 
 /// Trait for formatting MLS types as Nostr tag values
 ///
@@ -19,6 +19,12 @@ impl NostrTagFormat for Ciphersuite {
 }
 
 impl NostrTagFormat for ExtensionType {
+    fn to_nostr_tag(&self) -> String {
+        format!("0x{:04x}", u16::from(*self))
+    }
+}
+
+impl NostrTagFormat for ProposalType {
     fn to_nostr_tag(&self) -> String {
         format!("0x{:04x}", u16::from(*self))
     }
