@@ -5,7 +5,9 @@ use mdk_storage_traits::groups::GroupStorage;
 use mdk_storage_traits::welcomes::WelcomeStorage;
 use nostr::EventId;
 
-use super::{create_test_group, create_test_processed_welcome, create_test_welcome};
+use mdk_storage_traits::test_utils::cross_storage::{
+    create_test_group, create_test_processed_welcome, create_test_welcome,
+};
 
 /// Test welcome storage functionality
 pub fn test_save_and_find_welcome<S>(storage: S)

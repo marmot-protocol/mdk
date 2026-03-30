@@ -5,7 +5,9 @@ use mdk_storage_traits::groups::GroupStorage;
 use mdk_storage_traits::messages::MessageStorage;
 use nostr::EventId;
 
-use super::{create_test_group, create_test_message, create_test_processed_message};
+use mdk_storage_traits::test_utils::cross_storage::{
+    create_test_group, create_test_message, create_test_processed_message,
+};
 
 /// Test message storage functionality
 pub fn test_save_and_find_message<S>(storage: S)

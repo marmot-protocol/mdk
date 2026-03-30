@@ -11,7 +11,7 @@ use mdk_storage_traits::messages::MessageStorage;
 use mdk_storage_traits::messages::types::{Message, MessageState};
 use nostr::{EventId, Kind, PublicKey, RelayUrl, Tags, Timestamp, UnsignedEvent};
 
-use super::create_test_group;
+use mdk_storage_traits::test_utils::cross_storage::create_test_group;
 
 /// Test basic group save and find functionality
 pub fn test_save_and_find_group<S>(storage: S)
