@@ -1509,6 +1509,7 @@ dependencies = [
  "hkdf",
  "image",
  "kamadak-exif",
+ "mdk-macros",
  "mdk-memory-storage",
  "mdk-sqlite-storage",
  "mdk-storage-traits",
@@ -1526,6 +1527,10 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
 ]
+
+[[package]]
+name = "mdk-macros"
+version = "0.7.1"
 
 [[package]]
 name = "mdk-memory-storage"

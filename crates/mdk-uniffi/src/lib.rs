@@ -135,20 +135,31 @@ impl From<MdkError> for MdkUniffiError {
 
 // Helper functions
 
-fn parse_group_id(hex: &str) -> Result<GroupId, MdkUniffiError> {
-    hex::decode(hex)
-        .map_err(|e| MdkUniffiError::InvalidInput(format!("Invalid group ID hex: {e}")))
-        .map(|bytes| GroupId::from_slice(&bytes))
+/// Generates parsing helper functions that map errors to `MdkUniffiError::InvalidInput`.
+macro_rules! parse_with_invalid_input {
+    ($(
+        $(#[$meta:meta])*
+        $fn_name:ident($input:ident) -> $ret:ty = $parse:expr, $msg:literal
+    );* $(;)?) => {
+        $(
+            $(#[$meta])*
+            fn $fn_name($input: &str) -> Result<$ret, MdkUniffiError> {
+                $parse.map_err(|e| MdkUniffiError::InvalidInput(format!(concat!($msg, ": {}"), e)))
+            }
+        )*
+    };
 }
 
-fn parse_event_id(hex: &str) -> Result<EventId, MdkUniffiError> {
-    EventId::from_hex(hex)
-        .map_err(|e| MdkUniffiError::InvalidInput(format!("Invalid event ID: {e}")))
-}
-
-fn parse_public_key(hex: &str) -> Result<PublicKey, MdkUniffiError> {
-    PublicKey::from_hex(hex)
-        .map_err(|e| MdkUniffiError::InvalidInput(format!("Invalid public key: {e}")))
+parse_with_invalid_input! {
+    parse_group_id(hex) -> GroupId =
+        hex::decode(hex).map(|bytes| GroupId::from_slice(&bytes)),
+        "Invalid group ID hex";
+    parse_event_id(hex) -> EventId =
+        EventId::from_hex(hex),
+        "Invalid event ID";
+    parse_public_key(hex) -> PublicKey =
+        PublicKey::from_hex(hex),
+        "Invalid public key";
 }
 
 fn parse_relay_urls(relays: &[String]) -> Result<Vec<RelayUrl>, MdkUniffiError> {

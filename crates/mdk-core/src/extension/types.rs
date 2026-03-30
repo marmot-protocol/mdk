@@ -305,13 +305,19 @@ impl NostrGroupDataExtension {
         Self::EXTENSION_TYPE
     }
 
-    /// Sets the group ID using a 32-byte array.
-    ///
-    /// # Arguments
-    ///
-    /// * `nostr_group_id` - The new 32-byte group ID
-    pub fn set_nostr_group_id(&mut self, nostr_group_id: [u8; 32]) {
-        self.nostr_group_id = nostr_group_id;
+    mdk_macros::mut_setters! {
+        /// Sets the group ID using a 32-byte array.
+        set_nostr_group_id<direct> -> nostr_group_id: [u8; 32];
+        /// Sets the group name.
+        set_name<direct> -> name: String;
+        /// Sets the group description.
+        set_description<direct> -> description: String;
+        /// Sets the group image hash.
+        set_image_hash<direct> -> image_hash: Option<[u8; 32]>;
+        /// Sets the group image key.
+        set_image_key<direct> -> image_key: Option<[u8; 32]>;
+        /// Sets the group image nonce.
+        set_image_nonce<direct> -> image_nonce: Option<[u8; 12]>;
     }
 
     /// Returns the group name as a UTF-8 string.
@@ -319,27 +325,9 @@ impl NostrGroupDataExtension {
         self.name.as_str()
     }
 
-    /// Sets the group name.
-    ///
-    /// # Arguments
-    ///
-    /// * `name` - The new group name
-    pub fn set_name(&mut self, name: String) {
-        self.name = name;
-    }
-
     /// Returns the group description as a UTF-8 string.
     pub fn description(&self) -> &str {
         self.description.as_str()
-    }
-
-    /// Sets the group description.
-    ///
-    /// # Arguments
-    ///
-    /// * `description` - The new group description
-    pub fn set_description(&mut self, description: String) {
-        self.description = description;
     }
 
     /// Adds a new admin identity to the list.
@@ -362,46 +350,13 @@ impl NostrGroupDataExtension {
         self.relays.remove(relay);
     }
 
-    /// Returns the group image URL.
-    pub fn image_hash(&self) -> Option<&[u8; 32]> {
-        self.image_hash.as_ref()
-    }
-
-    /// Sets the group image URL.
-    ///
-    /// # Arguments
-    ///
-    /// * `image` - The new image URL (optional)
-    pub fn set_image_hash(&mut self, image_hash: Option<[u8; 32]>) {
-        self.image_hash = image_hash;
-    }
-
-    /// Returns the group image key.
-    pub fn image_key(&self) -> Option<&[u8; 32]> {
-        self.image_key.as_ref()
-    }
-
-    /// Returns the group image nonce
-    pub fn image_nonce(&self) -> Option<&[u8; 12]> {
-        self.image_nonce.as_ref()
-    }
-
-    /// Sets the group image key.
-    ///
-    /// # Arguments
-    ///
-    /// * `image_key` - The new image encryption key (optional)
-    pub fn set_image_key(&mut self, image_key: Option<[u8; 32]>) {
-        self.image_key = image_key;
-    }
-
-    /// Sets the group image nonce.
-    ///
-    /// # Arguments
-    ///
-    /// * `image_nonce` - The new image encryption key (optional)
-    pub fn set_image_nonce(&mut self, image_nonce: Option<[u8; 12]>) {
-        self.image_nonce = image_nonce;
+    mdk_macros::ref_getters! {
+        /// Returns the group image hash.
+        image_hash: [u8; 32];
+        /// Returns the group image key.
+        image_key: [u8; 32];
+        /// Returns the group image nonce.
+        image_nonce: [u8; 12];
     }
 
     /// Migrate extension to version 2 format

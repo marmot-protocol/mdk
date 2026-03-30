@@ -18,6 +18,7 @@ mip04 = []
 debug-examples = []
 
 [dependencies]
+mdk-macros.workspace = true
 hex = { workspace = true, features = ["std"] }
 nostr = { workspace = true, features = ["nip44", "std"] }
 mdk-storage-traits.workspace = true

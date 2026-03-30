@@ -1,0 +1,10 @@
+[package]
+name = "mdk-macros"
+version = "0.7.1"
+edition = "2021"
+description = "Shared declarative macros for the MDK workspace"
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+rust-version.workspace = true

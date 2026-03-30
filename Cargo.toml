@@ -16,6 +16,7 @@ mdk-memory-storage = { version = "0.7.1", path = "./crates/mdk-memory-storage", 
 mdk-sqlite-storage = { version = "0.7.1", path = "./crates/mdk-sqlite-storage", default-features = false }
 mdk-storage-traits = { version = "0.7.1", path = "./crates/mdk-storage-traits", default-features = false }
 mdk-core = { version = "0.7.1", path = "./crates/mdk-core", default-features = false }
+mdk-macros = { version = "0.7.1", path = "./crates/mdk-macros" }
 
 # OpenMLS family
 openmls = { version = "0.8.1", default-features = false }

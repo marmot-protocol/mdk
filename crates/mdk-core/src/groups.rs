@@ -165,63 +165,32 @@ impl NostrGroupConfigData {
     }
 }
 
-macro_rules! update_setter {
-    // Into<String> variant
-    (into_string: $name:ident, $doc:expr) => {
-        #[doc = $doc]
-        pub fn $name<T>(mut self, $name: T) -> Self
-        where
-            T: Into<String>,
-        {
-            self.$name = Some($name.into());
-            self
-        }
-    };
-    // Direct value variant
-    ($name:ident, $ty:ty, $doc:expr) => {
-        #[doc = $doc]
-        pub fn $name(mut self, $name: $ty) -> Self {
-            self.$name = Some($name);
-            self
-        }
-    };
-}
-
 impl NostrGroupDataUpdate {
     /// Creates a new empty update configuration
     pub fn new() -> Self {
         Self::default()
     }
 
-    update_setter!(into_string: name, "Sets the name to be updated");
-    update_setter!(into_string: description, "Sets the description to be updated");
-    update_setter!(
-        image_hash,
-        Option<[u8; 32]>,
-        "Sets the image hash to be updated"
-    );
-    update_setter!(
-        image_key,
-        Option<[u8; 32]>,
-        "Sets the image key to be updated"
-    );
-    update_setter!(
-        image_nonce,
-        Option<[u8; 12]>,
-        "Sets the image nonce to be updated"
-    );
-    update_setter!(
-        image_upload_key,
-        Option<[u8; 32]>,
-        "Sets the image upload key to be updated"
-    );
-    update_setter!(relays, Vec<RelayUrl>, "Sets the relays to be updated");
-    update_setter!(admins, Vec<PublicKey>, "Sets the admins to be updated");
-    update_setter!(
-        nostr_group_id,
-        [u8; 32],
-        "Sets the nostr_group_id to be updated (for ID rotation per MIP-01)"
-    );
+    mdk_macros::setters! {
+        /// Sets the name to be updated
+        name: impl Into<String>;
+        /// Sets the description to be updated
+        description: impl Into<String>;
+        /// Sets the image hash to be updated
+        image_hash: Option<[u8; 32]>;
+        /// Sets the image key to be updated
+        image_key: Option<[u8; 32]>;
+        /// Sets the image nonce to be updated
+        image_nonce: Option<[u8; 12]>;
+        /// Sets the image upload key to be updated
+        image_upload_key: Option<[u8; 32]>;
+        /// Sets the relays to be updated
+        relays: Vec<RelayUrl>;
+        /// Sets the admins to be updated
+        admins: Vec<PublicKey>;
+        /// Sets the nostr_group_id to be updated (for ID rotation per MIP-01)
+        nostr_group_id: [u8; 32];
+    }
 }
 
 impl<Storage> MDK<Storage>
