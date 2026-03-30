@@ -83,8 +83,8 @@ impl Pagination {
 /// Helper macro to generate exporter secret CRUD methods for a storage backend
 ///
 /// This macro expects two backend-specific macros:
-/// - `$backend_get!(self, group_id, epoch, label)`
-/// - `$backend_save!(self, secret, label)`
+/// - `$backend_get!(self, group_id, epoch, label, cache_ident)`
+/// - `$backend_save!(self, secret, label, cache_ident)`
 ///
 /// It generates the 6 trait methods required for MIP-03 and MIP-04 exporter secrets.
 #[macro_export]
@@ -98,14 +98,25 @@ macro_rules! impl_exporter_secret_methods {
             Option<$crate::groups::types::GroupExporterSecret>,
             $crate::groups::error::GroupError,
         > {
-            $backend_get!(self, group_id, epoch, "group-event")
+            $backend_get!(
+                self,
+                group_id,
+                epoch,
+                "group-event",
+                group_exporter_secrets_cache
+            )
         }
 
         fn save_group_exporter_secret(
             &self,
             group_exporter_secret: $crate::groups::types::GroupExporterSecret,
         ) -> Result<(), $crate::groups::error::GroupError> {
-            $backend_save!(self, group_exporter_secret, "group-event")
+            $backend_save!(
+                self,
+                group_exporter_secret,
+                "group-event",
+                group_exporter_secrets_cache
+            )
         }
 
         fn get_group_legacy_exporter_secret(
@@ -116,14 +127,25 @@ macro_rules! impl_exporter_secret_methods {
             Option<$crate::groups::types::GroupExporterSecret>,
             $crate::groups::error::GroupError,
         > {
-            $backend_get!(self, group_id, epoch, "legacy-group-event")
+            $backend_get!(
+                self,
+                group_id,
+                epoch,
+                "legacy-group-event",
+                group_legacy_exporter_secrets_cache
+            )
         }
 
         fn save_group_legacy_exporter_secret(
             &self,
             group_exporter_secret: $crate::groups::types::GroupExporterSecret,
         ) -> Result<(), $crate::groups::error::GroupError> {
-            $backend_save!(self, group_exporter_secret, "legacy-group-event")
+            $backend_save!(
+                self,
+                group_exporter_secret,
+                "legacy-group-event",
+                group_legacy_exporter_secrets_cache
+            )
         }
 
         fn get_group_mip04_exporter_secret(
@@ -134,14 +156,25 @@ macro_rules! impl_exporter_secret_methods {
             Option<$crate::groups::types::GroupExporterSecret>,
             $crate::groups::error::GroupError,
         > {
-            $backend_get!(self, group_id, epoch, "encrypted-media")
+            $backend_get!(
+                self,
+                group_id,
+                epoch,
+                "encrypted-media",
+                group_mip04_exporter_secrets_cache
+            )
         }
 
         fn save_group_mip04_exporter_secret(
             &self,
             group_exporter_secret: $crate::groups::types::GroupExporterSecret,
         ) -> Result<(), $crate::groups::error::GroupError> {
-            $backend_save!(self, group_exporter_secret, "encrypted-media")
+            $backend_save!(
+                self,
+                group_exporter_secret,
+                "encrypted-media",
+                group_mip04_exporter_secrets_cache
+            )
         }
     };
 }

@@ -8,7 +8,7 @@ use std::collections::BTreeSet;
 /// and row mapper are identical for all label variants; only the SQL label
 /// string literal differs.
 macro_rules! group_exporter_secret_get {
-    ($self:ident, $mls_group_id:ident, $epoch:ident, $label:literal) => {{
+    ($self:ident, $mls_group_id:ident, $epoch:ident, $label:literal, $cache:ident) => {{
         ensure_group_exists($self, $mls_group_id)?;
         $self.with_connection(|conn| {
             let mut stmt = conn
@@ -35,7 +35,7 @@ macro_rules! group_exporter_secret_get {
 /// structure are identical for all label variants; only the SQL label string
 /// literal differs.
 macro_rules! group_exporter_secret_save {
-    ($self:ident, $secret:ident, $label:literal) => {{
+    ($self:ident, $secret:ident, $label:literal, $cache:ident) => {{
         ensure_group_exists($self, &$secret.mls_group_id)?;
         $self.with_connection(|conn| {
             conn.execute(
