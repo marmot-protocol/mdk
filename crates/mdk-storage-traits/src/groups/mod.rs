@@ -80,6 +80,72 @@ impl Pagination {
     }
 }
 
+/// Helper macro to generate exporter secret CRUD methods for a storage backend
+///
+/// This macro expects two backend-specific macros:
+/// - `$backend_get!(self, group_id, epoch, label)`
+/// - `$backend_save!(self, secret, label)`
+///
+/// It generates the 6 trait methods required for MIP-03 and MIP-04 exporter secrets.
+#[macro_export]
+macro_rules! impl_exporter_secret_methods {
+    ($backend_get:ident, $backend_save:ident) => {
+        fn get_group_exporter_secret(
+            &self,
+            group_id: &$crate::GroupId,
+            epoch: u64,
+        ) -> Result<
+            Option<$crate::groups::types::GroupExporterSecret>,
+            $crate::groups::error::GroupError,
+        > {
+            $backend_get!(self, group_id, epoch, "group-event")
+        }
+
+        fn save_group_exporter_secret(
+            &self,
+            group_exporter_secret: $crate::groups::types::GroupExporterSecret,
+        ) -> Result<(), $crate::groups::error::GroupError> {
+            $backend_save!(self, group_exporter_secret, "group-event")
+        }
+
+        fn get_group_legacy_exporter_secret(
+            &self,
+            group_id: &$crate::GroupId,
+            epoch: u64,
+        ) -> Result<
+            Option<$crate::groups::types::GroupExporterSecret>,
+            $crate::groups::error::GroupError,
+        > {
+            $backend_get!(self, group_id, epoch, "legacy-group-event")
+        }
+
+        fn save_group_legacy_exporter_secret(
+            &self,
+            group_exporter_secret: $crate::groups::types::GroupExporterSecret,
+        ) -> Result<(), $crate::groups::error::GroupError> {
+            $backend_save!(self, group_exporter_secret, "legacy-group-event")
+        }
+
+        fn get_group_mip04_exporter_secret(
+            &self,
+            group_id: &$crate::GroupId,
+            epoch: u64,
+        ) -> Result<
+            Option<$crate::groups::types::GroupExporterSecret>,
+            $crate::groups::error::GroupError,
+        > {
+            $backend_get!(self, group_id, epoch, "encrypted-media")
+        }
+
+        fn save_group_mip04_exporter_secret(
+            &self,
+            group_exporter_secret: $crate::groups::types::GroupExporterSecret,
+        ) -> Result<(), $crate::groups::error::GroupError> {
+            $backend_save!(self, group_exporter_secret, "encrypted-media")
+        }
+    };
+}
+
 /// Construct a "Group not found" error.
 ///
 /// Shared helper used by all storage backends when a group lookup fails.

@@ -59,7 +59,7 @@ macro_rules! group_exporter_secret_save {
 
 use mdk_storage_traits::GroupId;
 use mdk_storage_traits::groups::error::GroupError;
-use mdk_storage_traits::groups::types::{Group, GroupExporterSecret, GroupRelay, SelfUpdateState};
+use mdk_storage_traits::groups::types::{Group, GroupRelay, SelfUpdateState};
 use mdk_storage_traits::groups::validation::validate_group_fields;
 use mdk_storage_traits::groups::{
     GroupStorage, MessageSortOrder, Pagination, group_not_found, validate_message_limit,
@@ -388,50 +388,10 @@ impl GroupStorage for MdkSqliteStorage {
         })
     }
 
-    fn get_group_exporter_secret(
-        &self,
-        mls_group_id: &GroupId,
-        epoch: u64,
-    ) -> Result<Option<GroupExporterSecret>, GroupError> {
-        group_exporter_secret_get!(self, mls_group_id, epoch, "group-event")
-    }
-
-    fn save_group_exporter_secret(
-        &self,
-        group_exporter_secret: GroupExporterSecret,
-    ) -> Result<(), GroupError> {
-        group_exporter_secret_save!(self, group_exporter_secret, "group-event")
-    }
-
-    fn get_group_legacy_exporter_secret(
-        &self,
-        mls_group_id: &GroupId,
-        epoch: u64,
-    ) -> Result<Option<GroupExporterSecret>, GroupError> {
-        group_exporter_secret_get!(self, mls_group_id, epoch, "legacy-group-event")
-    }
-
-    fn save_group_legacy_exporter_secret(
-        &self,
-        group_exporter_secret: GroupExporterSecret,
-    ) -> Result<(), GroupError> {
-        group_exporter_secret_save!(self, group_exporter_secret, "legacy-group-event")
-    }
-
-    fn get_group_mip04_exporter_secret(
-        &self,
-        mls_group_id: &GroupId,
-        epoch: u64,
-    ) -> Result<Option<GroupExporterSecret>, GroupError> {
-        group_exporter_secret_get!(self, mls_group_id, epoch, "encrypted-media")
-    }
-
-    fn save_group_mip04_exporter_secret(
-        &self,
-        group_exporter_secret: GroupExporterSecret,
-    ) -> Result<(), GroupError> {
-        group_exporter_secret_save!(self, group_exporter_secret, "encrypted-media")
-    }
+    mdk_storage_traits::impl_exporter_secret_methods!(
+        group_exporter_secret_get,
+        group_exporter_secret_save
+    );
 
     fn prune_group_exporter_secrets_before_epoch(
         &self,
@@ -455,6 +415,7 @@ impl GroupStorage for MdkSqliteStorage {
 #[cfg(test)]
 mod tests {
     use mdk_storage_traits::Secret;
+    use mdk_storage_traits::groups::types::GroupExporterSecret;
     use mdk_storage_traits::groups::types::GroupState;
     use mdk_storage_traits::messages::MessageStorage;
     use mdk_storage_traits::messages::types::MessageState;

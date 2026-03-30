@@ -7,12 +7,27 @@ use std::collections::BTreeSet;
 /// Both the read lock acquisition and the `groups_cache` existence check are
 /// identical across all three label variants; only the cache field name differs.
 macro_rules! group_exporter_secret_get {
-    ($self:ident, $mls_group_id:ident, $epoch:ident, $cache:ident) => {{
+    ($self:ident, $mls_group_id:ident, $epoch:ident, $label:expr) => {{
         let inner = $self.inner.read();
         if inner.groups_cache.peek($mls_group_id).is_none() {
             return Err(group_not_found());
         }
-        Ok(inner.$cache.peek(&($mls_group_id.clone(), $epoch)).cloned())
+        let secret = match $label {
+            "group-event" => inner
+                .group_exporter_secrets_cache
+                .peek(&($mls_group_id.clone(), $epoch))
+                .cloned(),
+            "legacy-group-event" => inner
+                .group_legacy_exporter_secrets_cache
+                .peek(&($mls_group_id.clone(), $epoch))
+                .cloned(),
+            "encrypted-media" => inner
+                .group_mip04_exporter_secrets_cache
+                .peek(&($mls_group_id.clone(), $epoch))
+                .cloned(),
+            _ => None,
+        };
+        Ok(secret)
     }};
 }
 
@@ -21,13 +36,24 @@ macro_rules! group_exporter_secret_get {
 /// The write lock, existence guard, and key construction are identical across
 /// all three label variants; only the cache field name differs.
 macro_rules! group_exporter_secret_save {
-    ($self:ident, $secret:ident, $cache:ident) => {{
+    ($self:ident, $secret:ident, $label:expr) => {{
         let mut inner = $self.inner.write();
         if inner.groups_cache.peek(&$secret.mls_group_id).is_none() {
             return Err(group_not_found());
         }
         let key = ($secret.mls_group_id.clone(), $secret.epoch);
-        inner.$cache.put(key, $secret);
+        match $label {
+            "group-event" => {
+                inner.group_exporter_secrets_cache.put(key, $secret);
+            }
+            "legacy-group-event" => {
+                inner.group_legacy_exporter_secrets_cache.put(key, $secret);
+            }
+            "encrypted-media" => {
+                inner.group_mip04_exporter_secrets_cache.put(key, $secret);
+            }
+            _ => (),
+        };
         Ok(())
     }};
 }
@@ -242,68 +268,10 @@ impl GroupStorage for MdkMemoryStorage {
         Ok(())
     }
 
-    fn get_group_exporter_secret(
-        &self,
-        mls_group_id: &GroupId,
-        epoch: u64,
-    ) -> Result<Option<GroupExporterSecret>, GroupError> {
-        group_exporter_secret_get!(self, mls_group_id, epoch, group_exporter_secrets_cache)
-    }
-
-    fn save_group_exporter_secret(
-        &self,
-        group_exporter_secret: GroupExporterSecret,
-    ) -> Result<(), GroupError> {
-        group_exporter_secret_save!(self, group_exporter_secret, group_exporter_secrets_cache)
-    }
-
-    fn get_group_legacy_exporter_secret(
-        &self,
-        mls_group_id: &GroupId,
-        epoch: u64,
-    ) -> Result<Option<GroupExporterSecret>, GroupError> {
-        group_exporter_secret_get!(
-            self,
-            mls_group_id,
-            epoch,
-            group_legacy_exporter_secrets_cache
-        )
-    }
-
-    fn save_group_legacy_exporter_secret(
-        &self,
-        group_exporter_secret: GroupExporterSecret,
-    ) -> Result<(), GroupError> {
-        group_exporter_secret_save!(
-            self,
-            group_exporter_secret,
-            group_legacy_exporter_secrets_cache
-        )
-    }
-
-    fn get_group_mip04_exporter_secret(
-        &self,
-        mls_group_id: &GroupId,
-        epoch: u64,
-    ) -> Result<Option<GroupExporterSecret>, GroupError> {
-        group_exporter_secret_get!(
-            self,
-            mls_group_id,
-            epoch,
-            group_mip04_exporter_secrets_cache
-        )
-    }
-
-    fn save_group_mip04_exporter_secret(
-        &self,
-        group_exporter_secret: GroupExporterSecret,
-    ) -> Result<(), GroupError> {
-        group_exporter_secret_save!(
-            self,
-            group_exporter_secret,
-            group_mip04_exporter_secrets_cache
-        )
-    }
+    mdk_storage_traits::impl_exporter_secret_methods!(
+        group_exporter_secret_get,
+        group_exporter_secret_save
+    );
 
     fn prune_group_exporter_secrets_before_epoch(
         &self,

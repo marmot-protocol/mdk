@@ -372,8 +372,13 @@ macro_rules! mls_single_key_table_ops {
 
             conn.execute(
                 concat!(
-                    "INSERT OR REPLACE INTO ", $table,
-                    " (", $key_col, ", ", $val_col, ", provider_version) VALUES (?, ?, ?)"
+                    "INSERT OR REPLACE INTO ",
+                    $table,
+                    " (",
+                    $key_col,
+                    ", ",
+                    $val_col,
+                    ", provider_version) VALUES (?, ?, ?)"
                 ),
                 params![key_bytes, value_bytes, STORAGE_PROVIDER_VERSION],
             )
@@ -395,8 +400,13 @@ macro_rules! mls_single_key_table_ops {
             let result: Option<Vec<u8>> = conn
                 .query_row(
                     concat!(
-                        "SELECT ", $val_col, " FROM ", $table,
-                        " WHERE ", $key_col, " = ? AND provider_version = ?"
+                        "SELECT ",
+                        $val_col,
+                        " FROM ",
+                        $table,
+                        " WHERE ",
+                        $key_col,
+                        " = ? AND provider_version = ?"
                     ),
                     params![key_bytes, STORAGE_PROVIDER_VERSION],
                     |row| row.get(0),
@@ -410,10 +420,7 @@ macro_rules! mls_single_key_table_ops {
             }
         }
 
-        pub(crate) fn $delete_fn<K>(
-            conn: &Connection,
-            key: &K,
-        ) -> Result<(), MdkStorageError>
+        pub(crate) fn $delete_fn<K>(conn: &Connection, key: &K) -> Result<(), MdkStorageError>
         where
             K: Key<STORAGE_PROVIDER_VERSION>,
         {
@@ -421,8 +428,11 @@ macro_rules! mls_single_key_table_ops {
 
             conn.execute(
                 concat!(
-                    "DELETE FROM ", $table,
-                    " WHERE ", $key_col, " = ? AND provider_version = ?"
+                    "DELETE FROM ",
+                    $table,
+                    " WHERE ",
+                    $key_col,
+                    " = ? AND provider_version = ?"
                 ),
                 params![key_bytes, STORAGE_PROVIDER_VERSION],
             )
