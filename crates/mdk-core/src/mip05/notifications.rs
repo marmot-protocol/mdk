@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::collections::HashSet;
 use std::ops::Range;
 
 use base64::Engine;
@@ -13,9 +14,14 @@ use super::{
     NotificationRequest, TokenTag, VERSION_TAG_NAME,
 };
 
+// NIP-59 recommends randomizing wrapper timestamps across a two-day window.
 const RANGE_RANDOM_TIMESTAMP_TWEAK: Range<u64> = 0..172800;
 
 /// Build an unsigned `kind:446` MIP-05 notification request rumor.
+///
+/// The `pubkey` should be a fresh ephemeral key for the request. Callers that
+/// want MDK to handle the ephemeral-key lifecycle should prefer
+/// [`build_notification_batches`].
 pub fn build_notification_request_rumor(
     pubkey: PublicKey,
     created_at: Timestamp,
@@ -62,17 +68,30 @@ pub fn parse_notification_request_rumor(
         let values = tag.as_slice();
         match values.first().map(String::as_str) {
             Some(VERSION_TAG_NAME) => {
+                if version_tag_seen {
+                    return Err(Mip05Error::DuplicateNotificationRequestVersionTag);
+                }
+                if values.len() != 2 {
+                    return Err(Mip05Error::InvalidNotificationRequestVersionTag);
+                }
                 if values.get(1).map(String::as_str) != Some(NOTIFICATION_REQUEST_VERSION) {
                     return Err(Mip05Error::InvalidNotificationRequestVersionTag);
                 }
                 version_tag_seen = true;
             }
             Some(ENCODING_TAG_NAME) => {
+                if encoding_tag_seen {
+                    return Err(Mip05Error::DuplicateNotificationRequestEncodingTag);
+                }
+                if values.len() != 2 {
+                    return Err(Mip05Error::InvalidNotificationRequestEncodingTag);
+                }
                 if values.get(1).map(String::as_str) != Some(BASE64_ENCODING) {
                     return Err(Mip05Error::InvalidNotificationRequestEncodingTag);
                 }
                 encoding_tag_seen = true;
             }
+            // Intentionally reject unknown tags to match the current MIP-05 draft exactly.
             _ => return Err(Mip05Error::UnsupportedNotificationRequestTags),
         }
     }
@@ -141,6 +160,7 @@ fn build_notification_batch_for_server(
     server_pubkey: PublicKey,
     server_tokens: Vec<TokenTag>,
 ) -> Result<NotificationEventBatch, Mip05Error> {
+    validate_unique_encrypted_tokens(&server_tokens)?;
     let relay_hints = collect_relay_hints(&server_tokens);
     let events = server_tokens
         .chunks(MAX_NOTIFICATION_REQUEST_TOKENS)
@@ -158,6 +178,18 @@ fn build_notification_batch_for_server(
         relay_hints,
         events,
     })
+}
+
+fn validate_unique_encrypted_tokens(tokens: &[TokenTag]) -> Result<(), Mip05Error> {
+    let mut unique_tokens = HashSet::with_capacity(tokens.len());
+
+    for token in tokens {
+        if !unique_tokens.insert(token.encrypted_token.clone()) {
+            return Err(Mip05Error::DuplicateEncryptedToken);
+        }
+    }
+
+    Ok(())
 }
 
 fn collect_relay_hints(tokens: &[TokenTag]) -> Vec<nostr::RelayUrl> {
@@ -261,6 +293,75 @@ mod tests {
         assert_eq!(
             parse_notification_request_rumor(&rumor).unwrap_err(),
             Mip05Error::InvalidNotificationRequestContentLength
+        );
+    }
+
+    #[test]
+    fn test_parse_notification_request_rejects_duplicate_version_tag() {
+        let mut rumor = UnsignedEvent::new(
+            Keys::generate().public_key(),
+            Timestamp::from(123u64),
+            Kind::from(NOTIFICATION_REQUEST_KIND),
+            [
+                Tag::custom(
+                    TagKind::Custom(VERSION_TAG_NAME.into()),
+                    [NOTIFICATION_REQUEST_VERSION],
+                ),
+                Tag::custom(
+                    TagKind::Custom(VERSION_TAG_NAME.into()),
+                    [NOTIFICATION_REQUEST_VERSION],
+                ),
+                Tag::custom(TagKind::Custom(ENCODING_TAG_NAME.into()), [BASE64_ENCODING]),
+            ],
+            base64::engine::general_purpose::STANDARD.encode([1u8; ENCRYPTED_TOKEN_LEN]),
+        );
+        rumor.ensure_id();
+
+        assert_eq!(
+            parse_notification_request_rumor(&rumor).unwrap_err(),
+            Mip05Error::DuplicateNotificationRequestVersionTag
+        );
+    }
+
+    #[test]
+    fn test_parse_notification_request_rejects_extra_tag_values() {
+        let mut rumor = UnsignedEvent::new(
+            Keys::generate().public_key(),
+            Timestamp::from(123u64),
+            Kind::from(NOTIFICATION_REQUEST_KIND),
+            [
+                Tag::custom(
+                    TagKind::Custom(VERSION_TAG_NAME.into()),
+                    [NOTIFICATION_REQUEST_VERSION, "extra"],
+                ),
+                Tag::custom(TagKind::Custom(ENCODING_TAG_NAME.into()), [BASE64_ENCODING]),
+            ],
+            base64::engine::general_purpose::STANDARD.encode([1u8; ENCRYPTED_TOKEN_LEN]),
+        );
+        rumor.ensure_id();
+
+        assert_eq!(
+            parse_notification_request_rumor(&rumor).unwrap_err(),
+            Mip05Error::InvalidNotificationRequestVersionTag
+        );
+    }
+
+    #[test]
+    fn test_build_notification_batches_rejects_empty_input() {
+        assert_eq!(
+            build_notification_batches(vec![]).unwrap_err(),
+            Mip05Error::NotificationRequestMustIncludeToken
+        );
+    }
+
+    #[test]
+    fn test_build_notification_batches_rejects_duplicate_tokens_per_server() {
+        let server_keys = Keys::generate();
+        let token = make_token_tag(server_keys.public_key(), "wss://relay.example.com", 7);
+
+        assert_eq!(
+            build_notification_batches(vec![token.clone(), token]).unwrap_err(),
+            Mip05Error::DuplicateEncryptedToken
         );
     }
 

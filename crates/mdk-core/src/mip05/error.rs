@@ -109,15 +109,24 @@ pub enum Mip05Error {
     /// `kind:446` used an unsupported version tag value.
     #[error("invalid notification request version tag")]
     InvalidNotificationRequestVersionTag,
+    /// `kind:446` contained more than one version tag.
+    #[error("duplicate notification request version tag")]
+    DuplicateNotificationRequestVersionTag,
     /// `kind:446` was missing the required encoding tag.
     #[error("missing notification request encoding tag")]
     MissingNotificationRequestEncodingTag,
     /// `kind:446` used an unsupported encoding tag value.
     #[error("invalid notification request encoding tag")]
     InvalidNotificationRequestEncodingTag,
+    /// `kind:446` contained more than one encoding tag.
+    #[error("duplicate notification request encoding tag")]
+    DuplicateNotificationRequestEncodingTag,
     /// `kind:446` contained unsupported tags.
     #[error("notification request contains unsupported tags")]
     UnsupportedNotificationRequestTags,
+    /// A notification request batch contained duplicate encrypted tokens.
+    #[error("duplicate encrypted token in notification request batch")]
+    DuplicateEncryptedToken,
     /// NIP-44 encryption for the notification request failed.
     #[error("failed to encrypt notification request")]
     NotificationRequestEncryptionFailed,
