@@ -16,89 +16,54 @@ use nostr::{EventId, JsonUtil, Kind, PublicKey, RelayUrl, Tags, Timestamp, Unsig
 use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ToSql, ToSqlOutput, Type, ValueRef};
 use rusqlite::{Error, Result as SqliteResult, Row};
 
-/// Wrapper for [u8; 32] to implement rusqlite traits
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Hash32([u8; 32]);
+/// Generates a fixed-size byte array newtype with `From`, `ToSql`, and `FromSql` impls.
+macro_rules! sqlite_blob_newtype {
+    ($name:ident, $len:expr) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub struct $name([u8; $len]);
 
-impl From<[u8; 32]> for Hash32 {
-    fn from(arr: [u8; 32]) -> Self {
-        Hash32(arr)
-    }
-}
+        impl From<[u8; $len]> for $name {
+            fn from(arr: [u8; $len]) -> Self {
+                $name(arr)
+            }
+        }
 
-impl From<Hash32> for [u8; 32] {
-    fn from(hash: Hash32) -> Self {
-        hash.0
-    }
-}
+        impl From<$name> for [u8; $len] {
+            fn from(val: $name) -> Self {
+                val.0
+            }
+        }
 
-impl ToSql for Hash32 {
-    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
-        Ok(ToSqlOutput::from(self.0.as_slice()))
-    }
-}
+        impl ToSql for $name {
+            fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+                Ok(ToSqlOutput::from(self.0.as_slice()))
+            }
+        }
 
-impl FromSql for Hash32 {
-    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
-        match value {
-            ValueRef::Blob(blob) => {
-                if blob.len() == 32 {
-                    let mut arr = [0u8; 32];
-                    arr.copy_from_slice(blob);
-                    Ok(Hash32(arr))
-                } else {
-                    Err(FromSqlError::InvalidBlobSize {
-                        expected_size: 32,
-                        blob_size: blob.len(),
-                    })
+        impl FromSql for $name {
+            fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+                match value {
+                    ValueRef::Blob(blob) => {
+                        if blob.len() == $len {
+                            let mut arr = [0u8; $len];
+                            arr.copy_from_slice(blob);
+                            Ok($name(arr))
+                        } else {
+                            Err(FromSqlError::InvalidBlobSize {
+                                expected_size: $len,
+                                blob_size: blob.len(),
+                            })
+                        }
+                    }
+                    _ => Err(FromSqlError::InvalidType),
                 }
             }
-            _ => Err(FromSqlError::InvalidType),
         }
-    }
+    };
 }
 
-/// Wrapper for [u8; 12] to implement rusqlite traits
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Nonce12([u8; 12]);
-
-impl From<[u8; 12]> for Nonce12 {
-    fn from(arr: [u8; 12]) -> Self {
-        Nonce12(arr)
-    }
-}
-
-impl From<Nonce12> for [u8; 12] {
-    fn from(nonce: Nonce12) -> Self {
-        nonce.0
-    }
-}
-
-impl ToSql for Nonce12 {
-    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
-        Ok(ToSqlOutput::from(self.0.as_slice()))
-    }
-}
-
-impl FromSql for Nonce12 {
-    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
-        match value {
-            ValueRef::Blob(blob) => {
-                if blob.len() == 12 {
-                    let mut arr = [0u8; 12];
-                    arr.copy_from_slice(blob);
-                    Ok(Nonce12(arr))
-                } else {
-                    Err(FromSqlError::InvalidBlobSize {
-                        expected_size: 12,
-                        blob_size: blob.len(),
-                    })
-                }
-            }
-            _ => Err(FromSqlError::InvalidType),
-        }
-    }
-}
+sqlite_blob_newtype!(Hash32, 32);
+sqlite_blob_newtype!(Nonce12, 12);
 
 #[inline]
 fn map_to_text_boxed_error<T>(e: T) -> Error

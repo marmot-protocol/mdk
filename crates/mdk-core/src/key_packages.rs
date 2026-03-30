@@ -407,9 +407,7 @@ where
 
     /// Extracts the first value from a tag (index 1, after the tag name).
     fn tag_first_value<'a>(tag: &'a Tag, missing_msg: &str) -> Result<&'a str, Error> {
-        tag.as_slice()
-            .get(1)
-            .map(|s| s.as_str())
+        tag.content()
             .ok_or_else(|| Error::KeyPackage(missing_msg.to_string()))
     }
 

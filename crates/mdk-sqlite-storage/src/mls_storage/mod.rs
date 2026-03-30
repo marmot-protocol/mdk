@@ -344,225 +344,120 @@ where
 }
 
 // ============================================================================
-// Key Packages Operations
+// Single-Key Table Operations (macro-generated)
 // ============================================================================
 
-/// Write a key package.
-pub(crate) fn write_key_package<HashReference, KeyPackage>(
-    conn: &Connection,
-    hash_ref: &HashReference,
-    key_package: &KeyPackage,
-) -> Result<(), MdkStorageError>
-where
-    HashReference: Key<STORAGE_PROVIDER_VERSION>,
-    KeyPackage: Entity<STORAGE_PROVIDER_VERSION>,
-{
-    let hash_ref_bytes = serialize_key(hash_ref)?;
-    let key_package_bytes = serialize_entity(key_package)?;
+/// Generates write/read/delete functions for MLS tables that store a single
+/// key-value pair per row (plus `provider_version`).
+macro_rules! mls_single_key_table_ops {
+    (
+        table: $table:expr,
+        key_col: $key_col:expr,
+        val_col: $val_col:expr,
+        write_fn: $write_fn:ident,
+        read_fn: $read_fn:ident,
+        delete_fn: $delete_fn:ident $(,)?
+    ) => {
+        pub(crate) fn $write_fn<K, V>(
+            conn: &Connection,
+            key: &K,
+            value: &V,
+        ) -> Result<(), MdkStorageError>
+        where
+            K: Key<STORAGE_PROVIDER_VERSION>,
+            V: Entity<STORAGE_PROVIDER_VERSION>,
+        {
+            let key_bytes = serialize_key(key)?;
+            let value_bytes = serialize_entity(value)?;
 
-    conn.execute(
-        "INSERT OR REPLACE INTO openmls_key_packages (key_package_ref, key_package, provider_version)
-         VALUES (?, ?, ?)",
-        params![hash_ref_bytes, key_package_bytes, STORAGE_PROVIDER_VERSION],
-    )
-    .map_err(|e| MdkStorageError::Database(e.to_string()))?;
+            conn.execute(
+                concat!(
+                    "INSERT OR REPLACE INTO ", $table,
+                    " (", $key_col, ", ", $val_col, ", provider_version) VALUES (?, ?, ?)"
+                ),
+                params![key_bytes, value_bytes, STORAGE_PROVIDER_VERSION],
+            )
+            .map_err(|e| MdkStorageError::Database(e.to_string()))?;
 
-    Ok(())
+            Ok(())
+        }
+
+        pub(crate) fn $read_fn<K, V>(
+            conn: &Connection,
+            key: &K,
+        ) -> Result<Option<V>, MdkStorageError>
+        where
+            K: Key<STORAGE_PROVIDER_VERSION>,
+            V: Entity<STORAGE_PROVIDER_VERSION>,
+        {
+            let key_bytes = serialize_key(key)?;
+
+            let result: Option<Vec<u8>> = conn
+                .query_row(
+                    concat!(
+                        "SELECT ", $val_col, " FROM ", $table,
+                        " WHERE ", $key_col, " = ? AND provider_version = ?"
+                    ),
+                    params![key_bytes, STORAGE_PROVIDER_VERSION],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|e| MdkStorageError::Database(e.to_string()))?;
+
+            match result {
+                Some(bytes) => Ok(Some(deserialize_entity(&bytes)?)),
+                None => Ok(None),
+            }
+        }
+
+        pub(crate) fn $delete_fn<K>(
+            conn: &Connection,
+            key: &K,
+        ) -> Result<(), MdkStorageError>
+        where
+            K: Key<STORAGE_PROVIDER_VERSION>,
+        {
+            let key_bytes = serialize_key(key)?;
+
+            conn.execute(
+                concat!(
+                    "DELETE FROM ", $table,
+                    " WHERE ", $key_col, " = ? AND provider_version = ?"
+                ),
+                params![key_bytes, STORAGE_PROVIDER_VERSION],
+            )
+            .map_err(|e| MdkStorageError::Database(e.to_string()))?;
+
+            Ok(())
+        }
+    };
 }
 
-/// Read a key package.
-pub(crate) fn read_key_package<HashReference, KeyPackage>(
-    conn: &Connection,
-    hash_ref: &HashReference,
-) -> Result<Option<KeyPackage>, MdkStorageError>
-where
-    HashReference: Key<STORAGE_PROVIDER_VERSION>,
-    KeyPackage: Entity<STORAGE_PROVIDER_VERSION>,
-{
-    let hash_ref_bytes = serialize_key(hash_ref)?;
-
-    let result: Option<Vec<u8>> = conn
-        .query_row(
-            "SELECT key_package FROM openmls_key_packages
-             WHERE key_package_ref = ? AND provider_version = ?",
-            params![hash_ref_bytes, STORAGE_PROVIDER_VERSION],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(|e| MdkStorageError::Database(e.to_string()))?;
-
-    match result {
-        Some(bytes) => Ok(Some(deserialize_entity(&bytes)?)),
-        None => Ok(None),
-    }
+mls_single_key_table_ops! {
+    table: "openmls_key_packages",
+    key_col: "key_package_ref",
+    val_col: "key_package",
+    write_fn: write_key_package,
+    read_fn: read_key_package,
+    delete_fn: delete_key_package,
 }
 
-/// Delete a key package.
-pub(crate) fn delete_key_package<HashReference>(
-    conn: &Connection,
-    hash_ref: &HashReference,
-) -> Result<(), MdkStorageError>
-where
-    HashReference: Key<STORAGE_PROVIDER_VERSION>,
-{
-    let hash_ref_bytes = serialize_key(hash_ref)?;
-
-    conn.execute(
-        "DELETE FROM openmls_key_packages
-         WHERE key_package_ref = ? AND provider_version = ?",
-        params![hash_ref_bytes, STORAGE_PROVIDER_VERSION],
-    )
-    .map_err(|e| MdkStorageError::Database(e.to_string()))?;
-
-    Ok(())
+mls_single_key_table_ops! {
+    table: "openmls_signature_keys",
+    key_col: "public_key",
+    val_col: "signature_key",
+    write_fn: write_signature_key_pair,
+    read_fn: read_signature_key_pair,
+    delete_fn: delete_signature_key_pair,
 }
 
-// ============================================================================
-// Signature Keys Operations
-// ============================================================================
-
-/// Write a signature key pair.
-pub(crate) fn write_signature_key_pair<SignaturePublicKey, SignatureKeyPair>(
-    conn: &Connection,
-    public_key: &SignaturePublicKey,
-    signature_key_pair: &SignatureKeyPair,
-) -> Result<(), MdkStorageError>
-where
-    SignaturePublicKey: Key<STORAGE_PROVIDER_VERSION>,
-    SignatureKeyPair: Entity<STORAGE_PROVIDER_VERSION>,
-{
-    let public_key_bytes = serialize_key(public_key)?;
-    let key_pair_bytes = serialize_entity(signature_key_pair)?;
-
-    conn.execute(
-        "INSERT OR REPLACE INTO openmls_signature_keys (public_key, signature_key, provider_version)
-         VALUES (?, ?, ?)",
-        params![public_key_bytes, key_pair_bytes, STORAGE_PROVIDER_VERSION],
-    )
-    .map_err(|e| MdkStorageError::Database(e.to_string()))?;
-
-    Ok(())
-}
-
-/// Read a signature key pair.
-pub(crate) fn read_signature_key_pair<SignaturePublicKey, SignatureKeyPair>(
-    conn: &Connection,
-    public_key: &SignaturePublicKey,
-) -> Result<Option<SignatureKeyPair>, MdkStorageError>
-where
-    SignaturePublicKey: Key<STORAGE_PROVIDER_VERSION>,
-    SignatureKeyPair: Entity<STORAGE_PROVIDER_VERSION>,
-{
-    let public_key_bytes = serialize_key(public_key)?;
-
-    let result: Option<Vec<u8>> = conn
-        .query_row(
-            "SELECT signature_key FROM openmls_signature_keys
-             WHERE public_key = ? AND provider_version = ?",
-            params![public_key_bytes, STORAGE_PROVIDER_VERSION],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(|e| MdkStorageError::Database(e.to_string()))?;
-
-    match result {
-        Some(bytes) => Ok(Some(deserialize_entity(&bytes)?)),
-        None => Ok(None),
-    }
-}
-
-/// Delete a signature key pair.
-pub(crate) fn delete_signature_key_pair<SignaturePublicKey>(
-    conn: &Connection,
-    public_key: &SignaturePublicKey,
-) -> Result<(), MdkStorageError>
-where
-    SignaturePublicKey: Key<STORAGE_PROVIDER_VERSION>,
-{
-    let public_key_bytes = serialize_key(public_key)?;
-
-    conn.execute(
-        "DELETE FROM openmls_signature_keys
-         WHERE public_key = ? AND provider_version = ?",
-        params![public_key_bytes, STORAGE_PROVIDER_VERSION],
-    )
-    .map_err(|e| MdkStorageError::Database(e.to_string()))?;
-
-    Ok(())
-}
-
-// ============================================================================
-// Encryption Keys Operations
-// ============================================================================
-
-/// Write an encryption key pair.
-pub(crate) fn write_encryption_key_pair<EncryptionKey, HpkeKeyPair>(
-    conn: &Connection,
-    public_key: &EncryptionKey,
-    key_pair: &HpkeKeyPair,
-) -> Result<(), MdkStorageError>
-where
-    EncryptionKey: Key<STORAGE_PROVIDER_VERSION>,
-    HpkeKeyPair: Entity<STORAGE_PROVIDER_VERSION>,
-{
-    let public_key_bytes = serialize_key(public_key)?;
-    let key_pair_bytes = serialize_entity(key_pair)?;
-
-    conn.execute(
-        "INSERT OR REPLACE INTO openmls_encryption_keys (public_key, key_pair, provider_version)
-         VALUES (?, ?, ?)",
-        params![public_key_bytes, key_pair_bytes, STORAGE_PROVIDER_VERSION],
-    )
-    .map_err(|e| MdkStorageError::Database(e.to_string()))?;
-
-    Ok(())
-}
-
-/// Read an encryption key pair.
-pub(crate) fn read_encryption_key_pair<EncryptionKey, HpkeKeyPair>(
-    conn: &Connection,
-    public_key: &EncryptionKey,
-) -> Result<Option<HpkeKeyPair>, MdkStorageError>
-where
-    EncryptionKey: Key<STORAGE_PROVIDER_VERSION>,
-    HpkeKeyPair: Entity<STORAGE_PROVIDER_VERSION>,
-{
-    let public_key_bytes = serialize_key(public_key)?;
-
-    let result: Option<Vec<u8>> = conn
-        .query_row(
-            "SELECT key_pair FROM openmls_encryption_keys
-             WHERE public_key = ? AND provider_version = ?",
-            params![public_key_bytes, STORAGE_PROVIDER_VERSION],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(|e| MdkStorageError::Database(e.to_string()))?;
-
-    match result {
-        Some(bytes) => Ok(Some(deserialize_entity(&bytes)?)),
-        None => Ok(None),
-    }
-}
-
-/// Delete an encryption key pair.
-pub(crate) fn delete_encryption_key_pair<EncryptionKey>(
-    conn: &Connection,
-    public_key: &EncryptionKey,
-) -> Result<(), MdkStorageError>
-where
-    EncryptionKey: Key<STORAGE_PROVIDER_VERSION>,
-{
-    let public_key_bytes = serialize_key(public_key)?;
-
-    conn.execute(
-        "DELETE FROM openmls_encryption_keys
-         WHERE public_key = ? AND provider_version = ?",
-        params![public_key_bytes, STORAGE_PROVIDER_VERSION],
-    )
-    .map_err(|e| MdkStorageError::Database(e.to_string()))?;
-
-    Ok(())
+mls_single_key_table_ops! {
+    table: "openmls_encryption_keys",
+    key_col: "public_key",
+    val_col: "key_pair",
+    write_fn: write_encryption_key_pair,
+    read_fn: read_encryption_key_pair,
+    delete_fn: delete_encryption_key_pair,
 }
 
 // ============================================================================
@@ -661,75 +556,13 @@ where
     Ok(())
 }
 
-// ============================================================================
-// PSK Operations
-// ============================================================================
-
-/// Write a PSK bundle.
-pub(crate) fn write_psk<PskId, PskBundle>(
-    conn: &Connection,
-    psk_id: &PskId,
-    psk: &PskBundle,
-) -> Result<(), MdkStorageError>
-where
-    PskId: Key<STORAGE_PROVIDER_VERSION>,
-    PskBundle: Entity<STORAGE_PROVIDER_VERSION>,
-{
-    let psk_id_bytes = serialize_key(psk_id)?;
-    let psk_bytes = serialize_entity(psk)?;
-
-    conn.execute(
-        "INSERT OR REPLACE INTO openmls_psks (psk_id, psk_bundle, provider_version)
-         VALUES (?, ?, ?)",
-        params![psk_id_bytes, psk_bytes, STORAGE_PROVIDER_VERSION],
-    )
-    .map_err(|e| MdkStorageError::Database(e.to_string()))?;
-
-    Ok(())
-}
-
-/// Read a PSK bundle.
-pub(crate) fn read_psk<PskId, PskBundle>(
-    conn: &Connection,
-    psk_id: &PskId,
-) -> Result<Option<PskBundle>, MdkStorageError>
-where
-    PskId: Key<STORAGE_PROVIDER_VERSION>,
-    PskBundle: Entity<STORAGE_PROVIDER_VERSION>,
-{
-    let psk_id_bytes = serialize_key(psk_id)?;
-
-    let result: Option<Vec<u8>> = conn
-        .query_row(
-            "SELECT psk_bundle FROM openmls_psks
-             WHERE psk_id = ? AND provider_version = ?",
-            params![psk_id_bytes, STORAGE_PROVIDER_VERSION],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(|e| MdkStorageError::Database(e.to_string()))?;
-
-    match result {
-        Some(bytes) => Ok(Some(deserialize_entity(&bytes)?)),
-        None => Ok(None),
-    }
-}
-
-/// Delete a PSK bundle.
-pub(crate) fn delete_psk<PskId>(conn: &Connection, psk_id: &PskId) -> Result<(), MdkStorageError>
-where
-    PskId: Key<STORAGE_PROVIDER_VERSION>,
-{
-    let psk_id_bytes = serialize_key(psk_id)?;
-
-    conn.execute(
-        "DELETE FROM openmls_psks
-         WHERE psk_id = ? AND provider_version = ?",
-        params![psk_id_bytes, STORAGE_PROVIDER_VERSION],
-    )
-    .map_err(|e| MdkStorageError::Database(e.to_string()))?;
-
-    Ok(())
+mls_single_key_table_ops! {
+    table: "openmls_psks",
+    key_col: "psk_id",
+    val_col: "psk_bundle",
+    write_fn: write_psk,
+    read_fn: read_psk,
+    delete_fn: delete_psk,
 }
 
 #[cfg(test)]
