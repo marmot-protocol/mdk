@@ -1517,12 +1517,16 @@ where
 
         let result = group.leave_group_via_self_remove(&self.provider, signer);
 
-        // Always restore ciphertext mode so the group stays encrypted if the
-        // member doesn't actually depart (e.g., SelfRemove isn't committed).
+        // Restore ciphertext mode. set_configuration updates in-memory state
+        // unconditionally (always succeeds) and then persists to storage (can fail).
+        // If the persist fails, the in-memory config is still correct for this
+        // session. The stale persisted config would only matter after an app restart
+        // where the member is still in the group (SelfRemove wasn't committed).
         if let Err(e) = group.set_configuration(self.storage(), &ciphertext_config) {
             tracing::error!(
                 target: "mdk_core::groups::leave_group",
-                "Failed to restore ciphertext wire format after SelfRemove: {e}"
+                "Failed to persist restored ciphertext wire format: {e}. \
+                 In-memory config is correct; persisted config may be stale."
             );
         }
 
@@ -1550,16 +1554,30 @@ where
             return Err(Error::Group("Cannot self-demote: not an admin".to_string()));
         }
 
-        if group_data.admins.len() <= 1 {
+        // Count only admins who are actual group members (ignores stale entries
+        // from admins who departed without a GroupContextExtensions update).
+        let active_admins: Vec<_> = group_data
+            .admins
+            .into_iter()
+            .filter(|pk| {
+                mls_group.members().any(|member| {
+                    BasicCredential::try_from(member.credential)
+                        .ok()
+                        .and_then(|cred| self.parse_credential_identity(cred.identity()).ok())
+                        .is_some_and(|member_pk| &member_pk == pk)
+                })
+            })
+            .collect();
+
+        if active_admins.len() <= 1 {
             return Err(Error::Group(
-                "Cannot self-demote: last admin. \
+                "Cannot self-demote: last active admin. \
                  Designate another admin first using update_group_data."
                     .to_string(),
             ));
         }
 
-        let new_admins: Vec<_> = group_data
-            .admins
+        let new_admins: Vec<_> = active_admins
             .into_iter()
             .filter(|pk| pk != &own_pubkey)
             .collect();

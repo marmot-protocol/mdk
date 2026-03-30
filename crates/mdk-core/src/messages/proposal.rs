@@ -292,7 +292,12 @@ where
         self.save_processed_message_record(processed_message)
     }
 
-    /// Stores a proposal and immediately auto-commits it
+    /// Stores a proposal and immediately auto-commits it.
+    ///
+    /// Uses the commit builder with a SelfRemove-only filter to ensure no other
+    /// pending proposals (Add, Remove, etc.) are accidentally included in the
+    /// commit. This prevents non-admin committers from creating commits that
+    /// violate MIP-03 authorization rules.
     pub(super) fn auto_commit_proposal(
         &self,
         mls_group: &mut MlsGroup,
@@ -306,10 +311,24 @@ where
 
         let mls_signer = self.load_mls_signer(mls_group)?;
 
-        // Self-remove proposals never generate welcomes (only Add proposals do),
-        // so we can safely ignore the welcome output here
-        let (commit_message, _welcomes, _group_info) =
-            mls_group.commit_to_pending_proposals(&self.provider, &mls_signer)?;
+        // Build a commit containing ONLY SelfRemove proposals from the pending store.
+        // Other pending proposals (Add, Remove, etc.) are excluded to prevent
+        // non-admin committers from bundling unauthorized proposals.
+        let (commit_message, _welcomes, _group_info) = mls_group
+            .commit_builder()
+            .consume_proposal_store(true)
+            .load_psks(self.provider.storage())
+            .map_err(|e| Error::Group(e.to_string()))?
+            .build(
+                self.provider.rand(),
+                self.provider.crypto(),
+                &mls_signer,
+                |queued| matches!(queued.proposal(), Proposal::SelfRemove),
+            )
+            .map_err(|e| Error::Group(e.to_string()))?
+            .stage_commit(&self.provider)
+            .map_err(|e| Error::Group(e.to_string()))?
+            .into_contents();
 
         let serialized_commit_message = commit_message
             .tls_serialize_detached()
@@ -524,6 +543,108 @@ mod tests {
         assert!(
             result.unwrap_err().to_string().contains("self-demote"),
             "Error should mention self-demotion"
+        );
+    }
+
+    /// Tests that the receiving side rejects SelfRemove from an admin sender.
+    ///
+    /// Simulates a non-compliant client: an admin bypasses the sending-side check
+    /// and sends a SelfRemove without self-demoting. The receiver sees the sender
+    /// is in admin_pubkeys and rejects the proposal per MIP-03.
+    #[test]
+    fn test_receiving_side_rejects_admin_self_remove() {
+        use openmls::prelude::{
+            MIXED_CIPHERTEXT_WIRE_FORMAT_POLICY, MIXED_PLAINTEXT_WIRE_FORMAT_POLICY,
+            MlsGroupJoinConfig, SenderRatchetConfiguration,
+        };
+        use tls_codec::Serialize as TlsSerialize;
+
+        let alice_keys = Keys::generate();
+        let bob_keys = Keys::generate();
+
+        let alice_mdk = create_test_mdk();
+        let bob_mdk = create_test_mdk();
+
+        // Alice is the sole admin
+        let admins = vec![alice_keys.public_key()];
+
+        let bob_key_package = create_key_package_event(&bob_mdk, &bob_keys);
+
+        let create_result = alice_mdk
+            .create_group(
+                &alice_keys.public_key(),
+                vec![bob_key_package],
+                create_nostr_group_config_data(admins),
+            )
+            .expect("Alice should create group");
+
+        let group_id = create_result.group.mls_group_id.clone();
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("Alice should merge commit");
+
+        let bob_preview = bob_mdk
+            .process_welcome(
+                &nostr::EventId::all_zeros(),
+                &create_result.welcome_rumors[0],
+            )
+            .expect("Bob should process welcome");
+        bob_mdk
+            .accept_welcome(&bob_preview)
+            .expect("Bob should accept welcome");
+
+        // Simulate non-compliant client: Alice (admin) sends SelfRemove
+        // by bypassing leave_group's admin check and using internal APIs.
+        let mut mls_group = alice_mdk
+            .load_mls_group(&group_id)
+            .expect("load group")
+            .expect("group exists");
+
+        let signer = alice_mdk.load_mls_signer(&mls_group).expect("load signer");
+
+        // Temporarily switch to plaintext for SelfRemove
+        let plaintext_config = MlsGroupJoinConfig::builder()
+            .wire_format_policy(MIXED_PLAINTEXT_WIRE_FORMAT_POLICY)
+            .use_ratchet_tree_extension(true)
+            .sender_ratchet_configuration(SenderRatchetConfiguration::default())
+            .build();
+
+        mls_group
+            .set_configuration(alice_mdk.storage(), &plaintext_config)
+            .expect("switch config");
+
+        let leave_msg = mls_group
+            .leave_group_via_self_remove(&alice_mdk.provider, &signer)
+            .expect("SelfRemove should succeed at MLS level");
+
+        // Restore config
+        let ciphertext_config = MlsGroupJoinConfig::builder()
+            .wire_format_policy(MIXED_CIPHERTEXT_WIRE_FORMAT_POLICY)
+            .use_ratchet_tree_extension(true)
+            .sender_ratchet_configuration(SenderRatchetConfiguration::default())
+            .build();
+
+        let _ = mls_group.set_configuration(alice_mdk.storage(), &ciphertext_config);
+
+        let serialized = leave_msg.tls_serialize_detached().expect("serialize");
+
+        let event = alice_mdk
+            .build_message_event(&group_id, serialized)
+            .expect("build event");
+
+        // Bob processes Alice's SelfRemove — should reject because Alice is admin
+        let result = bob_mdk
+            .process_message(&event)
+            .expect("Bob should process without panic");
+
+        assert!(
+            matches!(
+                &result,
+                MessageProcessingResult::IgnoredProposal { reason, .. }
+                if reason.contains("sender is an admin")
+            ),
+            "Receiver should reject SelfRemove from admin, got: {:?}",
+            result
         );
     }
 
