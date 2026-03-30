@@ -215,8 +215,14 @@ fn build_notification_event_chunk(
         encrypted_tokens,
     )?;
     let seal = build_notification_request_seal(&sender_keys, server_pubkey, rumor)?;
-    EventBuilder::gift_wrap_from_seal(server_pubkey, &seal, [])
-        .map_err(|_| Mip05Error::NotificationRequestGiftWrapFailed)
+    EventBuilder::gift_wrap_from_seal(server_pubkey, &seal, []).map_err(|e| {
+        tracing::warn!(
+            target: "mdk_core::mip05::notifications",
+            error = %e,
+            "Failed to gift-wrap notification request"
+        );
+        Mip05Error::NotificationRequestGiftWrapFailed
+    })
 }
 
 fn build_notification_request_seal(
@@ -230,12 +236,26 @@ fn build_notification_request_seal(
         rumor.as_json(),
         nip44::Version::default(),
     )
-    .map_err(|_| Mip05Error::NotificationRequestEncryptionFailed)?;
+    .map_err(|e| {
+        tracing::warn!(
+            target: "mdk_core::mip05::notifications",
+            error = %e,
+            "Failed to encrypt notification request"
+        );
+        Mip05Error::NotificationRequestEncryptionFailed
+    })?;
 
     EventBuilder::new(Kind::Seal, content)
         .custom_created_at(Timestamp::tweaked(RANGE_RANDOM_TIMESTAMP_TWEAK))
         .sign_with_keys(sender_keys)
-        .map_err(|_| Mip05Error::NotificationRequestSealFailed)
+        .map_err(|e| {
+            tracing::warn!(
+                target: "mdk_core::mip05::notifications",
+                error = %e,
+                "Failed to sign notification request seal"
+            );
+            Mip05Error::NotificationRequestSealFailed
+        })
 }
 
 #[cfg(test)]
