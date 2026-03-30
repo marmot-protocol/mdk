@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 /// Generates fluent builder-pattern setter methods in batch.
 ///
 /// Each entry produces a `pub fn name(mut self, ...) -> Self` method.
