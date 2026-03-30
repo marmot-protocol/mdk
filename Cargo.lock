@@ -1575,6 +1575,7 @@ dependencies = [
  "nostr",
  "openmls",
  "openmls_traits",
+ "pastey",
  "postcard",
  "serde",
  "serde_json",

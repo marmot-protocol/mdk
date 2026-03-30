@@ -327,49 +327,6 @@ mod tests {
     }
 
     #[test]
-    fn test_group_state_from_str() {
-        assert_eq!(GroupState::from_str("active").unwrap(), GroupState::Active);
-        assert_eq!(
-            GroupState::from_str("inactive").unwrap(),
-            GroupState::Inactive
-        );
-
-        let err = GroupState::from_str("invalid").unwrap_err();
-        match err {
-            GroupError::InvalidParameters(msg) => {
-                assert!(msg.contains("Invalid group state: invalid"));
-            }
-            _ => panic!("Expected InvalidParameters error"),
-        }
-    }
-
-    #[test]
-    fn test_group_state_to_string() {
-        assert_eq!(GroupState::Active.to_string(), "active");
-        assert_eq!(GroupState::Inactive.to_string(), "inactive");
-    }
-
-    #[test]
-    fn test_group_state_serialization() {
-        let active = GroupState::Active;
-        let serialized = serde_json::to_string(&active).unwrap();
-        assert_eq!(serialized, r#""active""#);
-
-        let inactive = GroupState::Inactive;
-        let serialized = serde_json::to_string(&inactive).unwrap();
-        assert_eq!(serialized, r#""inactive""#);
-    }
-
-    #[test]
-    fn test_group_state_deserialization() {
-        let active: GroupState = serde_json::from_str(r#""active""#).unwrap();
-        assert_eq!(active, GroupState::Active);
-
-        let inactive: GroupState = serde_json::from_str(r#""inactive""#).unwrap();
-        assert_eq!(inactive, GroupState::Inactive);
-    }
-
-    #[test]
     fn test_group_serialization() {
         // Simple test to ensure Group can be serialized
         let group = Group {

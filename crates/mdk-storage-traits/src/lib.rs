@@ -70,6 +70,52 @@ macro_rules! string_enum {
                 Self::from_str(&s).map_err(serde::de::Error::custom)
             }
         }
+
+        pastey::paste! {
+            #[cfg(test)]
+            mod [<$name:snake _string_enum_tests>] {
+                use super::*;
+                use std::str::FromStr;
+
+                #[test]
+                fn from_str_valid() {
+                    $(
+                        assert_eq!(
+                            $name::from_str($value).unwrap(),
+                            $name::$variant,
+                        );
+                    )+
+                }
+
+                #[test]
+                fn from_str_invalid() {
+                    assert!($name::from_str("__invalid_test_value__").is_err());
+                }
+
+                #[test]
+                fn to_string_matches_value() {
+                    $(
+                        assert_eq!($name::$variant.to_string(), $value);
+                    )+
+                }
+
+                #[test]
+                fn serde_roundtrip() {
+                    $(
+                        let serialized = serde_json::to_string(&$name::$variant).unwrap();
+                        assert_eq!(serialized, format!("\"{}\"", $value));
+                        let deserialized: $name = serde_json::from_str(&serialized).unwrap();
+                        assert_eq!(deserialized, $name::$variant);
+                    )+
+                }
+
+                #[test]
+                fn serde_invalid() {
+                    let result = serde_json::from_str::<$name>(r#""__invalid_test_value__""#);
+                    assert!(result.is_err());
+                }
+            }
+        }
     };
 }
 
