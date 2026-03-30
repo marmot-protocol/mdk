@@ -24,7 +24,7 @@ macro_rules! sqlite_blob_newtype {
 
         impl From<[u8; $len]> for $name {
             fn from(arr: [u8; $len]) -> Self {
-                $name(arr)
+                Self(arr)
             }
         }
 
@@ -47,7 +47,7 @@ macro_rules! sqlite_blob_newtype {
                         if blob.len() == $len {
                             let mut arr = [0u8; $len];
                             arr.copy_from_slice(blob);
-                            Ok($name(arr))
+                            Ok(Self(arr))
                         } else {
                             Err(FromSqlError::InvalidBlobSize {
                                 expected_size: $len,
