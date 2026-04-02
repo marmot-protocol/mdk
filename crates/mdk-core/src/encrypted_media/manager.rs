@@ -388,10 +388,12 @@ where
     /// Create an imeta tag for encrypted media (after upload)
     ///
     /// Creates IMETA tag according to Marmot protocol 04.md specification:
-    /// imeta url \<storage_url\> m \<mime_type\> filename \<original_filename\> [dim \<dimensions\>] [thumbhash \<thumbhash\>] x \<file_hash_hex\> n \<nonce_hex\> v \<version\>
+    /// imeta url \<storage_url\> m \<mime_type\> filename \<original_filename\>
+    /// [dim \<dimensions\>] [blurhash \<blurhash\>] [thumbhash \<thumbhash\>]
+    /// x \<file_hash_hex\> n \<nonce_hex\> v \<version\>
     ///
-    /// Thumbhash is emitted when present. Blurhash remains available in the API
-    /// for compatibility, but new IMETA tags prefer thumbhash.
+    /// New IMETA tags prefer thumbhash when available. If only a legacy blurhash
+    /// was generated, it is emitted as a compatibility fallback.
     pub fn create_imeta_tag(&self, upload: &EncryptedMediaUpload, uploaded_url: &str) -> NostrTag {
         let mut tag_values = vec![
             format!("url {}", uploaded_url),
@@ -405,6 +407,8 @@ where
 
         if let Some(ref thumbhash) = upload.thumbhash {
             tag_values.push(format!("thumbhash {}", thumbhash));
+        } else if let Some(ref blurhash) = upload.blurhash {
+            tag_values.push(format!("blurhash {}", blurhash));
         }
 
         // x field contains SHA256 hash of original file content (hex-encoded)
@@ -762,6 +766,37 @@ mod tests {
                 .any(|v| v.starts_with(&format!("n {}", hex::encode([0xAA; 12]))))
         );
         assert!(values.iter().any(|v| v.starts_with("v mip04-v2")));
+    }
+
+    #[test]
+    fn test_create_imeta_tag_falls_back_to_blurhash() {
+        let mdk = create_test_mdk();
+        let group_id = GroupId::from_slice(&[1, 2, 3, 4]);
+        let manager = mdk.media_manager(group_id);
+
+        let upload = EncryptedMediaUpload {
+            encrypted_data: vec![1, 2, 3, 4],
+            original_hash: [0x42; 32],
+            encrypted_hash: [0x43; 32],
+            mime_type: "image/jpeg".to_string(),
+            filename: "test.jpg".to_string(),
+            original_size: 1000,
+            encrypted_size: 1004,
+            dimensions: Some((1920, 1080)),
+            blurhash: Some("LKO2?U%2Tw=w]~RBVZRi};RPxuwH".to_string()),
+            thumbhash: None,
+            nonce: [0xAA; 12],
+        };
+
+        let tag = manager.create_imeta_tag(&upload, "https://example.com/file.jpg");
+        let values = tag.to_vec();
+
+        assert!(
+            values
+                .iter()
+                .any(|v| v.starts_with("blurhash LKO2?U%2Tw=w]~RBVZRi};RPxuwH"))
+        );
+        assert!(!values.iter().any(|v| v.starts_with("thumbhash ")));
     }
 
     #[test]
