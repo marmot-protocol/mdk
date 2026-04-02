@@ -186,14 +186,14 @@ For most deployments, the default configuration with MDK's runtime PRAGMA is suf
 - [ ] Initialize platform keyring store before creating MDK storage
 - [ ] Use `MdkSqliteStorage::new()` or `new_mdk()` (encrypted by default)
 - [ ] Store databases in app-private directories
-- [ ] Never use `new_unencrypted()` in production
 - [ ] Ensure database backups are also encrypted or stored securely
 
 ### Development / Testing
 
-- `MdkSqliteStorage::new_unencrypted()` is available but logs a warning
+- `MdkSqliteStorage::new_unencrypted()` is gated behind the `test-utils` feature flag and unavailable in production builds
 - In-memory databases (`:memory:`) are not encrypted (appropriate for tests)
 - Use `new_with_key()` if you need to test with a specific key
+- Enable `test-utils` in dev-dependencies to access unencrypted constructors
 
 ## Current Limitations
 

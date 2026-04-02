@@ -47,7 +47,7 @@ kamadak-exif.workspace = true  # EXIF stripping for privacy (used by both MIP-01
 [dev-dependencies]
 mdk-storage-traits = { workspace = true, features = ["test-utils"] }
 mdk-memory-storage.workspace = true
-mdk-sqlite-storage.workspace = true
+mdk-sqlite-storage = { workspace = true, features = ["test-utils"] }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }

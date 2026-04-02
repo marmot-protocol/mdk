@@ -512,6 +512,7 @@ impl MdkSqliteStorage {
     /// let storage = MdkSqliteStorage::new_unencrypted("/path/to/db.sqlite")?;
     /// # Ok::<(), mdk_sqlite_storage::error::Error>(())
     /// ```
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn new_unencrypted<P>(file_path: P) -> Result<Self, Error>
     where
         P: AsRef<Path>,
@@ -641,7 +642,7 @@ impl MdkSqliteStorage {
     /// # Returns
     ///
     /// A Result containing a new in-memory instance of [`MdkSqliteStorage`] or an error.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn new_in_memory() -> Result<Self, Error> {
         // Create an in-memory SQLite database
         let mut connection = Connection::open_in_memory()?;

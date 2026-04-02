@@ -402,6 +402,7 @@ pub fn new_mdk_with_key(
 ///
 /// * `db_path` - Path to the SQLite database file
 /// * `config` - Optional MDK configuration. If None, uses default configuration.
+#[cfg(any(test, feature = "test-utils"))]
 #[uniffi::export]
 pub fn new_mdk_unencrypted(
     db_path: String,

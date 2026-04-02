@@ -39,12 +39,15 @@ let config = EncryptionConfig::new(key);
 let storage = MdkSqliteStorage::new_with_key("path/to/database.db", config)?;
 ```
 
-### Unencrypted (development only)
+### Unencrypted (testing only — requires `test-utils` feature)
 
 ```rust
+// In Cargo.toml dev-dependencies:
+// mdk-sqlite-storage = { version = "...", features = ["test-utils"] }
+
 use mdk_sqlite_storage::MdkSqliteStorage;
 
-// ⚠️ WARNING: unencrypted — for development/testing only
+// ⚠️ Only available with the `test-utils` feature flag
 let storage = MdkSqliteStorage::new_unencrypted("path/to/database.db")?;
 ```
 
