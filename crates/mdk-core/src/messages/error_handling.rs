@@ -6,6 +6,7 @@ use mdk_storage_traits::groups::types as group_types;
 use mdk_storage_traits::messages::types as message_types;
 use mdk_storage_traits::{GroupId, MdkStorageProvider};
 use nostr::{Event, EventId, Timestamp};
+use sha2::{Digest, Sha256};
 
 use crate::MDK;
 use crate::error::Error;
@@ -324,12 +325,14 @@ where
             }
             Error::ProcessMessageWrongEpoch(msg_epoch) => {
                 // Check if this commit is "better" than what we have for this epoch
+                let content_hash: [u8; 32] = Sha256::digest(event.content.as_bytes()).into();
                 let is_better = self.epoch_snapshots.is_better_candidate(
                     self.storage(),
                     &group.mls_group_id,
                     msg_epoch,
                     event.created_at.as_secs(),
                     &event.id,
+                    &content_hash,
                 );
 
                 if is_better {

@@ -11,6 +11,7 @@ use openmls::prelude::{
     ContentType, MlsGroup, MlsMessageIn, ProcessedMessage, ProcessedMessageContent, Proposal,
     Sender,
 };
+use sha2::{Digest, Sha256};
 use tls_codec::Deserialize as TlsDeserialize;
 
 use crate::MDK;
@@ -187,6 +188,7 @@ where
                 );
 
                 // Snapshot current state before applying commit (for rollback support)
+                let content_hash: [u8; 32] = Sha256::digest(event.content.as_bytes()).into();
                 if self
                     .epoch_snapshots
                     .create_snapshot(
@@ -195,6 +197,7 @@ where
                         mls_group.epoch().as_u64(),
                         &event.id,
                         event.created_at.as_secs(),
+                        &content_hash,
                     )
                     .is_err()
                 {
