@@ -732,7 +732,7 @@ mod tests {
             encrypted_size: 1004,
             dimensions: Some((1920, 1080)),
             blurhash: Some("LKO2?U%2Tw=w]~RBVZRi};RPxuwH".to_string()),
-            thumbhash: Some("LKO2?U%2Tw=w]~RBVZRi};RPxuwH".to_string()),
+            thumbhash: Some("}U#WoBrZy#_/qQ8PC,N]q7m}6X".to_string()),
             nonce: [0xAA; 12],
         };
 
@@ -759,7 +759,7 @@ mod tests {
         assert!(
             values
                 .iter()
-                .any(|v| v.starts_with("thumbhash LKO2?U%2Tw=w]~RBVZRi};RPxuwH"))
+                .any(|v| v.starts_with("thumbhash }U#WoBrZy#_/qQ8PC,N]q7m}6X"))
         );
         assert!(
             values
