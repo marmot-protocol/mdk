@@ -38,8 +38,10 @@ uniffi_macros = "0.31"
 [features]
 default = ["mip04"]
 mip04 = ["mdk-core/mip04"]
+test-utils = ["mdk-sqlite-storage/test-utils"]
 
 [dev-dependencies]
+mdk-sqlite-storage = { workspace = true, features = ["test-utils"] }
 tempfile.workspace = true
 
 [[bin]]

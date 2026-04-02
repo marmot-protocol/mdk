@@ -3,7 +3,7 @@
 
 use mdk_core::prelude::*;
 use mdk_core::{Error, messages::MessageProcessingResult};
-use mdk_sqlite_storage::MdkSqliteStorage;
+use mdk_sqlite_storage::{EncryptionConfig, MdkSqliteStorage};
 use mdk_storage_traits::test_utils::crypto_utils::generate_random_bytes;
 use nostr::event::builder::EventBuilder;
 use nostr::{EventId, Keys, Kind, RelayUrl, TagKind};
@@ -19,7 +19,11 @@ fn generate_identity() -> (Keys, MDK<MdkSqliteStorage>, TempDir) {
     let keys = Keys::generate();
     let temp_dir = TempDir::new().expect("Failed to create temp directory");
     let db_path = temp_dir.path().join("mls.db");
-    let mdk = MDK::new(MdkSqliteStorage::new_unencrypted(db_path).unwrap());
+    let encryption_key: [u8; 32] = generate_random_bytes(32)
+        .try_into()
+        .expect("Failed to generate encryption key");
+    let config = EncryptionConfig::new(encryption_key);
+    let mdk = MDK::new(MdkSqliteStorage::new_with_key(db_path, config).unwrap());
     (keys, mdk, temp_dir)
 }
 

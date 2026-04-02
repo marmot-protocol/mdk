@@ -234,10 +234,11 @@ let mdk = MDK::new(storage);
 For development/testing only (unencrypted):
 
 ```rust
-use mdk_sqlite_storage::MdkSqliteStorage;
+use mdk_sqlite_storage::{EncryptionConfig, MdkSqliteStorage};
 
-// ⚠️ WARNING: Unencrypted - for development only
-let storage = MdkSqliteStorage::new_unencrypted("path/to/database.db")?;
+let key = [0u8; 32]; // Use a securely generated/stored key
+let config = EncryptionConfig::new(key);
+let storage = MdkSqliteStorage::new_with_key("path/to/database.db", config)?;
 let mdk = MDK::new(storage);
 ```
 
