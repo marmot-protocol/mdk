@@ -27,12 +27,11 @@
 
 ### Breaking changes
 
-- **`GroupImageUpload.blurhash` renamed to `thumbhash`**: The `blurhash` field in `GroupImageUpload` (returned by `prepare_group_image_for_upload`) has been renamed to `thumbhash` to reflect the switch from BlurHash to ThumbHash for image preview generation. ([#195](https://github.com/marmot-protocol/mdk/pull/195))
-
 ### Changed
 
 ### Added
 
+- Added optional `thumbhash` fields alongside the existing `blurhash` UniFFI records for group-image and encrypted-media uploads, plus a `generate_thumbhash` option in `MediaProcessingOptionsInput`. ([#195](https://github.com/marmot-protocol/mdk/pull/195))
 - Moved binary size optimizations (`opt-level = "z"`, thin LTO, single codegen unit, `panic = "abort"`, symbol stripping) into `[profile.release]` directly. Android builds override to fat LTO via `CARGO_PROFILE_RELEASE_LTO=fat` for maximum `.so` reduction; iOS uses thin LTO to avoid `.a` archive bloat. ([`#221`](https://github.com/marmot-protocol/mdk/pull/221), [`#232`](https://github.com/marmot-protocol/mdk/pull/232))
 
 ### Fixed

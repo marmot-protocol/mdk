@@ -2,7 +2,7 @@
 //!
 //! This module handles extraction and processing of metadata from media files,
 //! with a focus on privacy and security. It strips EXIF data from images
-//! by default and includes thumbhash generation for previews.
+//! by default and includes blurhash and thumbhash generation for previews.
 
 use crate::encrypted_media::types::{EncryptedMediaError, MediaMetadata, MediaProcessingOptions};
 
@@ -34,6 +34,7 @@ pub fn extract_and_process_metadata(
     let mut metadata = MediaMetadata {
         mime_type: mime_type.to_string(),
         dimensions: None,
+        blurhash: None,
         thumbhash: None,
         original_size: data.len() as u64,
     };
@@ -63,10 +64,12 @@ pub fn extract_and_process_metadata(
                                 let image_metadata = crate::media_processing::metadata::extract_metadata_from_decoded_image(
                                     &decoded_img,
                                     options,
+                                    options.generate_blurhash,
                                     options.generate_thumbhash,
                                 )?;
 
                                 metadata.dimensions = image_metadata.dimensions;
+                                metadata.blurhash = image_metadata.blurhash;
                                 metadata.thumbhash = image_metadata.thumbhash;
                                 processed_data = cleaned_data;
                             }
@@ -81,10 +84,12 @@ pub fn extract_and_process_metadata(
                                 let image_metadata = crate::media_processing::metadata::extract_metadata_from_encoded_image(
                                     data,
                                     options,
+                                    options.generate_blurhash,
                                     options.generate_thumbhash,
                                 )?;
 
                                 metadata.dimensions = image_metadata.dimensions;
+                                metadata.blurhash = image_metadata.blurhash;
                                 metadata.thumbhash = image_metadata.thumbhash;
                                 processed_data = data.to_vec();
                             }
@@ -113,10 +118,12 @@ pub fn extract_and_process_metadata(
                     crate::media_processing::metadata::extract_metadata_from_encoded_image(
                         data,
                         options,
+                        options.generate_blurhash,
                         options.generate_thumbhash,
                     )?;
 
                 metadata.dimensions = image_metadata.dimensions;
+                metadata.blurhash = image_metadata.blurhash;
                 metadata.thumbhash = image_metadata.thumbhash;
                 processed_data = data.to_vec();
             }
@@ -126,10 +133,12 @@ pub fn extract_and_process_metadata(
                 crate::media_processing::metadata::extract_metadata_from_encoded_image(
                     data,
                     options,
+                    options.generate_blurhash,
                     options.generate_thumbhash,
                 )?;
 
             metadata.dimensions = image_metadata.dimensions;
+            metadata.blurhash = image_metadata.blurhash;
             metadata.thumbhash = image_metadata.thumbhash;
             processed_data = data.to_vec();
         }
@@ -164,6 +173,7 @@ mod tests {
         ];
 
         let options = MediaProcessingOptions {
+            generate_blurhash: false,
             generate_thumbhash: false,
             sanitize_exif: true, // Request sanitization
             max_dimension: Some(100),
@@ -213,6 +223,7 @@ mod tests {
         ];
 
         let options = MediaProcessingOptions {
+            generate_blurhash: false,
             generate_thumbhash: false,
             sanitize_exif: false, // Don't sanitize
             max_dimension: Some(100),
@@ -255,6 +266,7 @@ mod tests {
             b"<svg xmlns=\"http://www.w3.org/2000/svg\"><rect width=\"10\" height=\"10\"/></svg>";
 
         let options = MediaProcessingOptions {
+            generate_blurhash: false,
             generate_thumbhash: false,
             sanitize_exif: true, // Request sanitization (should be skipped for SVG)
             max_dimension: Some(100),
@@ -299,6 +311,7 @@ mod tests {
         ];
 
         let options = MediaProcessingOptions {
+            generate_blurhash: false,
             generate_thumbhash: false,
             sanitize_exif: true,
             max_dimension: Some(16384), // Standard max dimension

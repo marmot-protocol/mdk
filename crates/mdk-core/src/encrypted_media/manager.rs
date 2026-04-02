@@ -206,6 +206,7 @@ where
             original_size: processed_data.len() as u64,
             encrypted_size,
             dimensions: metadata.dimensions,
+            blurhash: metadata.blurhash,
             thumbhash: metadata.thumbhash,
             nonce: *nonce,
         })
@@ -388,6 +389,9 @@ where
     ///
     /// Creates IMETA tag according to Marmot protocol 04.md specification:
     /// imeta url \<storage_url\> m \<mime_type\> filename \<original_filename\> [dim \<dimensions\>] [thumbhash \<thumbhash\>] x \<file_hash_hex\> n \<nonce_hex\> v \<version\>
+    ///
+    /// Thumbhash is emitted when present. Blurhash remains available in the API
+    /// for compatibility, but new IMETA tags prefer thumbhash.
     pub fn create_imeta_tag(&self, upload: &EncryptedMediaUpload, uploaded_url: &str) -> NostrTag {
         let mut tag_values = vec![
             format!("url {}", uploaded_url),
@@ -434,7 +438,9 @@ where
 
     /// Parse an IMETA tag to create a MediaReference for decryption
     ///
-    /// Expected IMETA format per MIP-04: url \<storage_url\> m \<mime_type\> filename \<filename\> [dim \<dimensions\>] [thumbhash \<thumbhash\>] x \<file_hash_hex\> n \<nonce_hex\> v \<version\>
+    /// Expected IMETA format per MIP-04: url \<storage_url\> m \<mime_type\>
+    /// filename \<filename\> [dim \<dimensions\>] [blurhash \<blurhash\>]
+    /// [thumbhash \<thumbhash\>] x \<file_hash_hex\> n \<nonce_hex\> v \<version\>
     pub fn parse_imeta_tag(
         &self,
         imeta_tag: &NostrTag,
@@ -533,8 +539,9 @@ where
                     }
                 },
                 "v" => version = Some(parts[1].to_string()),
-                "thumbhash" => {
-                    // Thumbhash is optional and not needed for decryption
+                "blurhash" | "thumbhash" => {
+                    // Preview hashes are optional and not needed for decryption.
+                    // Parsers that expose both should prefer thumbhash when present.
                 }
                 _ => {
                     // Ignore unknown fields for forward compatibility
@@ -718,6 +725,7 @@ mod tests {
             original_size: 1000,
             encrypted_size: 1004,
             dimensions: Some((1920, 1080)),
+            blurhash: Some("LKO2?U%2Tw=w]~RBVZRi};RPxuwH".to_string()),
             thumbhash: Some("LKO2?U%2Tw=w]~RBVZRi};RPxuwH".to_string()),
             nonce: [0xAA; 12],
         };
@@ -742,6 +750,7 @@ mod tests {
                 .iter()
                 .any(|v| v.starts_with("thumbhash LKO2?U%2Tw=w]~RBVZRi};RPxuwH"))
         );
+        assert!(!values.iter().any(|v| v.starts_with("blurhash ")));
         assert!(
             values
                 .iter()
@@ -787,6 +796,61 @@ mod tests {
         assert_eq!(media_ref.dimensions, Some((1920, 1080)));
         assert_eq!(media_ref.scheme_version, "mip04-v2");
         assert_eq!(media_ref.nonce, test_nonce);
+    }
+
+    #[test]
+    fn test_parse_imeta_tag_accepts_legacy_blurhash() {
+        let mdk = create_test_mdk();
+        let group_id = GroupId::from_slice(&[1, 2, 3, 4]);
+        let manager = mdk.media_manager(group_id);
+
+        let test_nonce = [0xBC; 12];
+        let tag_values = vec![
+            "url https://example.com/encrypted.jpg".to_string(),
+            "m image/jpeg".to_string(),
+            "filename photo.jpg".to_string(),
+            "dim 1920x1080".to_string(),
+            "blurhash LKO2?U%2Tw=w]~RBVZRi};RPxuwH".to_string(),
+            format!("x {}", hex::encode([0x42; 32])),
+            format!("n {}", hex::encode(test_nonce)),
+            "v mip04-v2".to_string(),
+        ];
+
+        let imeta_tag = NostrTag::custom(TagKind::Custom("imeta".into()), tag_values);
+        let result = manager.parse_imeta_tag(&imeta_tag);
+
+        assert!(result.is_ok(), "legacy blurhash tag should be accepted");
+        let media_ref = result.unwrap();
+        assert_eq!(media_ref.url, "https://example.com/encrypted.jpg");
+        assert_eq!(media_ref.nonce, test_nonce);
+    }
+
+    #[test]
+    fn test_parse_imeta_tag_accepts_both_preview_hashes() {
+        let mdk = create_test_mdk();
+        let group_id = GroupId::from_slice(&[1, 2, 3, 4]);
+        let manager = mdk.media_manager(group_id);
+
+        let test_nonce = [0xBD; 12];
+        let tag_values = vec![
+            "url https://example.com/encrypted.jpg".to_string(),
+            "m image/jpeg".to_string(),
+            "filename photo.jpg".to_string(),
+            "dim 1920x1080".to_string(),
+            "blurhash LKO2?U%2Tw=w]~RBVZRi};RPxuwH".to_string(),
+            "thumbhash }U#WoBrZy#_/qQ8PC,N]q7m}6X".to_string(),
+            format!("x {}", hex::encode([0x42; 32])),
+            format!("n {}", hex::encode(test_nonce)),
+            "v mip04-v2".to_string(),
+        ];
+
+        let imeta_tag = NostrTag::custom(TagKind::Custom("imeta".into()), tag_values);
+        let result = manager.parse_imeta_tag(&imeta_tag);
+
+        assert!(
+            result.is_ok(),
+            "IMETA tags with both preview hashes should be accepted"
+        );
     }
 
     #[test]
@@ -841,6 +905,7 @@ mod tests {
             original_size: 2000,
             encrypted_size: 2004,
             dimensions: Some((800, 600)),
+            blurhash: None,
             thumbhash: None,
             nonce: test_nonce,
         };
@@ -868,6 +933,7 @@ mod tests {
         // Use options that skip metadata extraction for images to avoid format errors
         let options = MediaProcessingOptions {
             sanitize_exif: true,
+            generate_blurhash: false,
             generate_thumbhash: false,
             max_dimension: None,
             max_file_size: None,
@@ -909,6 +975,7 @@ mod tests {
         let test_data = vec![0u8; 1000];
         let options = MediaProcessingOptions {
             sanitize_exif: true,
+            generate_blurhash: false,
             generate_thumbhash: false,
             max_dimension: None,
             max_file_size: None,
@@ -954,6 +1021,7 @@ mod tests {
         let test_data = vec![0x42u8; 1000];
         let options = MediaProcessingOptions {
             sanitize_exif: true,
+            generate_blurhash: false,
             generate_thumbhash: false,
             max_dimension: None,
             max_file_size: None,
@@ -1009,6 +1077,7 @@ mod tests {
 
         let options = MediaProcessingOptions {
             sanitize_exif: true,
+            generate_blurhash: false,
             generate_thumbhash: false,
             max_dimension: None,
             max_file_size: None,
@@ -1821,6 +1890,7 @@ mod tests {
             encrypted_size: encrypted_data.len() as u64,
             dimensions: None,
             blurhash: None,
+            thumbhash: None,
             nonce: *nonce,
         };
         let media_ref = mdk
@@ -2084,6 +2154,7 @@ mod tests {
                 encrypted_size: encrypted_data.len() as u64,
                 dimensions: None,
                 blurhash: None,
+                thumbhash: None,
                 nonce: *nonce,
             },
             alice_keys.public_key(),
@@ -2157,6 +2228,7 @@ mod tests {
                 encrypted_size: encrypted_data.len() as u64,
                 dimensions: None,
                 blurhash: None,
+                thumbhash: None,
                 nonce: *nonce,
             },
             alice_keys.public_key(),

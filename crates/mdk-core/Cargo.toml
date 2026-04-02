@@ -40,6 +40,7 @@ sha2.workspace = true
 
 # Image processing dependencies - mandatory (used by both MIP-01 and MIP-04)
 image = { workspace = true, features = ["jpeg", "png", "webp", "gif"] }
+blurhash.workspace = true
 fast-thumbhash.workspace = true
 kamadak-exif.workspace = true
 
