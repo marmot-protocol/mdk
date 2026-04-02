@@ -11,7 +11,6 @@ use openmls::prelude::{
     ContentType, MlsGroup, MlsMessageIn, ProcessedMessage, ProcessedMessageContent, Proposal,
     Sender,
 };
-use sha2::{Digest, Sha256};
 use tls_codec::Deserialize as TlsDeserialize;
 
 use crate::MDK;
@@ -67,7 +66,10 @@ where
         let processed_message = match group.process_message(&self.provider, protocol_message) {
             Ok(processed_message) => processed_message,
             Err(ProcessMessageError::ValidationError(ValidationError::WrongEpoch)) => {
-                return Err(Error::ProcessMessageWrongEpoch(msg_epoch));
+                return Err(Error::ProcessMessageWrongEpoch(
+                    msg_epoch,
+                    content_type == ContentType::Commit,
+                ));
             }
             Err(ProcessMessageError::ValidationError(ValidationError::CannotDecryptOwnMessage)) => {
                 // If this is a commit message and we have a pending commit, it might be our own commit
@@ -188,7 +190,7 @@ where
                 );
 
                 // Snapshot current state before applying commit (for rollback support)
-                let content_hash: [u8; 32] = Sha256::digest(event.content.as_bytes()).into();
+                let content_hash = super::content_hash(&event.content);
                 if self
                     .epoch_snapshots
                     .create_snapshot(

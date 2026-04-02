@@ -74,8 +74,13 @@ pub enum Error {
     #[error(transparent)]
     BasicCredential(#[from] BasicCredentialError),
     /// Process message error - epoch mismatch
+    ///
+    /// Fields: `(msg_epoch, is_commit)`. The `is_commit` flag indicates whether
+    /// the stale message was a Commit (true) or a non-commit type such as a
+    /// Proposal or ApplicationMessage (false). Only commits should trigger the
+    /// rollback/`is_better_candidate` path.
     #[error("Message epoch differs from the group's epoch")]
-    ProcessMessageWrongEpoch(u64),
+    ProcessMessageWrongEpoch(u64, bool),
     /// Process message error - wrong group ID
     #[error("Wrong group ID")]
     ProcessMessageWrongGroupId,
@@ -354,7 +359,7 @@ mod tests {
     #[test]
     fn test_error_display_messages() {
         // Test simple message errors
-        let error = Error::ProcessMessageWrongEpoch(5);
+        let error = Error::ProcessMessageWrongEpoch(5, true);
         assert_eq!(
             error.to_string(),
             "Message epoch differs from the group's epoch"
@@ -568,14 +573,14 @@ mod tests {
     #[test]
     fn test_process_message_wrong_epoch() {
         // Epoch value is preserved for internal rollback logic but not exposed in message
-        let error = Error::ProcessMessageWrongEpoch(42);
+        let error = Error::ProcessMessageWrongEpoch(42, true);
         assert_eq!(
             error.to_string(),
             "Message epoch differs from the group's epoch"
         );
 
         // Different epoch values produce same message (epoch used internally only)
-        let error2 = Error::ProcessMessageWrongEpoch(100);
+        let error2 = Error::ProcessMessageWrongEpoch(100, false);
         assert_eq!(error.to_string(), error2.to_string());
     }
 

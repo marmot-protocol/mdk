@@ -6,7 +6,6 @@ use mdk_storage_traits::groups::types as group_types;
 use mdk_storage_traits::messages::types as message_types;
 use mdk_storage_traits::{GroupId, MdkStorageProvider};
 use nostr::{Event, EventId, Timestamp};
-use sha2::{Digest, Sha256};
 
 use crate::MDK;
 use crate::error::Error;
@@ -323,17 +322,21 @@ where
                     }
                 }
             }
-            Error::ProcessMessageWrongEpoch(msg_epoch) => {
-                // Check if this commit is "better" than what we have for this epoch
-                let content_hash: [u8; 32] = Sha256::digest(event.content.as_bytes()).into();
-                let is_better = self.epoch_snapshots.is_better_candidate(
-                    self.storage(),
-                    &group.mls_group_id,
-                    msg_epoch,
-                    event.created_at.as_secs(),
-                    &event.id,
-                    &content_hash,
-                );
+            Error::ProcessMessageWrongEpoch(msg_epoch, is_commit) => {
+                // Only commits participate in MIP-03 race resolution.  Stale
+                // proposals or application messages from an old epoch must not
+                // trigger rollback/invalidation — they simply cannot be applied.
+                let is_better = is_commit && {
+                    let content_hash = super::content_hash(&event.content);
+                    self.epoch_snapshots.is_better_candidate(
+                        self.storage(),
+                        &group.mls_group_id,
+                        msg_epoch,
+                        event.created_at.as_secs(),
+                        &event.id,
+                        &content_hash,
+                    )
+                };
 
                 if is_better {
                     tracing::info!("Found better commit for epoch {}. Rolling back.", msg_epoch);
@@ -1098,7 +1101,9 @@ mod tests {
         );
 
         assert_eq!(
-            MDK::<MdkMemoryStorage>::sanitize_error_reason(&Error::ProcessMessageWrongEpoch(5)),
+            MDK::<MdkMemoryStorage>::sanitize_error_reason(&Error::ProcessMessageWrongEpoch(
+                5, true
+            )),
             "processing_failed"
         );
     }

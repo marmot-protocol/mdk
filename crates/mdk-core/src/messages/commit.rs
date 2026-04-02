@@ -7,7 +7,6 @@ use mdk_storage_traits::messages::types as message_types;
 use mdk_storage_traits::{GroupId, MdkStorageProvider};
 use nostr::Event;
 use openmls::prelude::{MlsGroup, Sender, StagedCommit};
-use sha2::{Digest, Sha256};
 
 use crate::MDK;
 use crate::error::Error;
@@ -61,7 +60,7 @@ where
         // Snapshot current state before applying commit (for rollback support).
         // Fail if snapshot fails - without it we can't guarantee MIP-03 convergence.
         let current_epoch = mls_group.epoch().as_u64();
-        let content_hash: [u8; 32] = Sha256::digest(event.content.as_bytes()).into();
+        let content_hash = super::content_hash(&event.content);
         if let Err(_e) = self.epoch_snapshots.create_snapshot(
             self.storage(),
             &group_id,
