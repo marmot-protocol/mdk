@@ -231,17 +231,6 @@ let storage = MdkSqliteStorage::new_with_key("path/to/database.db", config)?;
 let mdk = MDK::new(storage);
 ```
 
-For development/testing only (unencrypted):
-
-```rust
-use mdk_sqlite_storage::{EncryptionConfig, MdkSqliteStorage};
-
-let key = [0u8; 32]; // Use a securely generated/stored key
-let config = EncryptionConfig::new(key);
-let storage = MdkSqliteStorage::new_with_key("path/to/database.db", config)?;
-let mdk = MDK::new(storage);
-```
-
 ### Custom Storage
 
 Implement the `MdkStorageProvider` trait for custom storage backends:
