@@ -426,12 +426,22 @@ where
         let cs = require(Self::is_ciphersuite_tag, "mls_ciphersuite")?;
         let ext = require(Self::is_extensions_tag, "mls_extensions")?;
 
-        // mls_proposals tag is strictly required per MIP-00
-        let prop = require(Self::is_proposals_tag, "mls_proposals")?;
-        if prop.as_slice().get(1).map(|s| s.as_str()) != Some("0x000a") {
+        // mls_proposals tag is required for kind:30443, but optional for kind:443 backward compat
+        let prop_tag = event
+            .tags
+            .iter()
+            .find(|t| Self::is_proposals_tag(self, t));
+        if event.kind == MLS_KEY_PACKAGE_KIND && prop_tag.is_none() {
             return Err(Error::KeyPackage(
-                "Invalid mls_proposals tag value, expected 0x000a".to_string(),
+                "Missing required tag: mls_proposals".to_string(),
             ));
+        }
+        if let Some(prop) = prop_tag {
+            if prop.as_slice().get(1).map(|s| s.as_str()) != Some("0x000a") {
+                return Err(Error::KeyPackage(
+                    "Invalid mls_proposals tag value, expected 0x000a".to_string(),
+                ));
+            }
         }
 
         let relays = require(Self::is_relays_tag, "relays")?;
