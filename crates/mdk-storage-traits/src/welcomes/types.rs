@@ -1,12 +1,11 @@
 //! Types for the welcomes module
 
 use std::collections::BTreeSet;
-use std::fmt;
 use std::str::FromStr;
 
 use crate::{GroupId, Secret};
 use nostr::{EventId, PublicKey, RelayUrl, Timestamp, UnsignedEvent};
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Serialize};
 
 use super::error::WelcomeError;
 
@@ -60,129 +59,27 @@ pub struct Welcome {
     pub wrapper_event_id: EventId,
 }
 
-/// The processing state of a welcome
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum ProcessedWelcomeState {
-    /// The welcome was successfully processed and stored in the database
-    Processed,
-    /// The welcome failed to be processed and stored in the database
-    Failed,
-}
-
-impl fmt::Display for ProcessedWelcomeState {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.as_str())
+string_enum! {
+    /// The processing state of a welcome
+    pub enum ProcessedWelcomeState => WelcomeError, "Invalid processed welcome state: {}" {
+        /// The welcome was successfully processed and stored in the database
+        Processed => "processed",
+        /// The welcome failed to be processed and stored in the database
+        Failed => "failed",
     }
 }
 
-impl ProcessedWelcomeState {
-    /// Get as `&str`
-    pub fn as_str(&self) -> &str {
-        match self {
-            Self::Processed => "processed",
-            Self::Failed => "failed",
-        }
-    }
-}
-
-impl FromStr for ProcessedWelcomeState {
-    type Err = WelcomeError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "processed" => Ok(Self::Processed),
-            "failed" => Ok(Self::Failed),
-            _ => Err(WelcomeError::InvalidParameters(format!(
-                "Invalid processed welcome state: {}",
-                s
-            ))),
-        }
-    }
-}
-
-impl Serialize for ProcessedWelcomeState {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(self.as_str())
-    }
-}
-
-impl<'de> Deserialize<'de> for ProcessedWelcomeState {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let s: String = String::deserialize(deserializer)?;
-        Self::from_str(&s).map_err(serde::de::Error::custom)
-    }
-}
-
-/// The state of a welcome
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum WelcomeState {
-    /// The welcome is pending
-    Pending,
-    /// The welcome was accepted
-    Accepted,
-    /// The welcome was declined
-    Declined,
-    /// The welcome was ignored
-    Ignored,
-}
-
-impl fmt::Display for WelcomeState {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.as_str())
-    }
-}
-
-impl WelcomeState {
-    /// Get as `&str`
-    pub fn as_str(&self) -> &str {
-        match self {
-            Self::Pending => "pending",
-            Self::Accepted => "accepted",
-            Self::Declined => "declined",
-            Self::Ignored => "ignored",
-        }
-    }
-}
-
-impl FromStr for WelcomeState {
-    type Err = WelcomeError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "pending" => Ok(Self::Pending),
-            "accepted" => Ok(Self::Accepted),
-            "declined" => Ok(Self::Declined),
-            "ignored" => Ok(Self::Ignored),
-            _ => Err(WelcomeError::InvalidParameters(format!(
-                "Invalid welcome state: {}",
-                s
-            ))),
-        }
-    }
-}
-
-impl Serialize for WelcomeState {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(self.as_str())
-    }
-}
-
-impl<'de> Deserialize<'de> for WelcomeState {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let s: String = String::deserialize(deserializer)?;
-        Self::from_str(&s).map_err(serde::de::Error::custom)
+string_enum! {
+    /// The state of a welcome
+    pub enum WelcomeState => WelcomeError, "Invalid welcome state: {}" {
+        /// The welcome is pending
+        Pending => "pending",
+        /// The welcome was accepted
+        Accepted => "accepted",
+        /// The welcome was declined
+        Declined => "declined",
+        /// The welcome was ignored
+        Ignored => "ignored",
     }
 }
 
@@ -191,122 +88,6 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-
-    #[test]
-    fn test_processed_welcome_state_from_str() {
-        assert_eq!(
-            ProcessedWelcomeState::from_str("processed").unwrap(),
-            ProcessedWelcomeState::Processed
-        );
-        assert_eq!(
-            ProcessedWelcomeState::from_str("failed").unwrap(),
-            ProcessedWelcomeState::Failed
-        );
-
-        let err = ProcessedWelcomeState::from_str("invalid").unwrap_err();
-        match err {
-            WelcomeError::InvalidParameters(msg) => {
-                assert!(msg.contains("Invalid processed welcome state: invalid"));
-            }
-            _ => panic!("Expected InvalidParameters error"),
-        }
-    }
-
-    #[test]
-    fn test_processed_welcome_state_to_string() {
-        assert_eq!(ProcessedWelcomeState::Processed.to_string(), "processed");
-        assert_eq!(ProcessedWelcomeState::Failed.to_string(), "failed");
-    }
-
-    #[test]
-    fn test_processed_welcome_state_serialization() {
-        let processed = ProcessedWelcomeState::Processed;
-        let serialized = serde_json::to_string(&processed).unwrap();
-        assert_eq!(serialized, r#""processed""#);
-
-        let failed = ProcessedWelcomeState::Failed;
-        let serialized = serde_json::to_string(&failed).unwrap();
-        assert_eq!(serialized, r#""failed""#);
-    }
-
-    #[test]
-    fn test_processed_welcome_state_deserialization() {
-        let processed: ProcessedWelcomeState = serde_json::from_str(r#""processed""#).unwrap();
-        assert_eq!(processed, ProcessedWelcomeState::Processed);
-
-        let failed: ProcessedWelcomeState = serde_json::from_str(r#""failed""#).unwrap();
-        assert_eq!(failed, ProcessedWelcomeState::Failed);
-    }
-
-    #[test]
-    fn test_welcome_state_from_str() {
-        assert_eq!(
-            WelcomeState::from_str("pending").unwrap(),
-            WelcomeState::Pending
-        );
-        assert_eq!(
-            WelcomeState::from_str("accepted").unwrap(),
-            WelcomeState::Accepted
-        );
-        assert_eq!(
-            WelcomeState::from_str("declined").unwrap(),
-            WelcomeState::Declined
-        );
-        assert_eq!(
-            WelcomeState::from_str("ignored").unwrap(),
-            WelcomeState::Ignored
-        );
-
-        let err = WelcomeState::from_str("invalid").unwrap_err();
-        match err {
-            WelcomeError::InvalidParameters(msg) => {
-                assert!(msg.contains("Invalid welcome state: invalid"));
-            }
-            _ => panic!("Expected InvalidParameters error"),
-        }
-    }
-
-    #[test]
-    fn test_welcome_state_to_string() {
-        assert_eq!(WelcomeState::Pending.to_string(), "pending");
-        assert_eq!(WelcomeState::Accepted.to_string(), "accepted");
-        assert_eq!(WelcomeState::Declined.to_string(), "declined");
-        assert_eq!(WelcomeState::Ignored.to_string(), "ignored");
-    }
-
-    #[test]
-    fn test_welcome_state_serialization() {
-        let pending = WelcomeState::Pending;
-        let serialized = serde_json::to_string(&pending).unwrap();
-        assert_eq!(serialized, r#""pending""#);
-
-        let accepted = WelcomeState::Accepted;
-        let serialized = serde_json::to_string(&accepted).unwrap();
-        assert_eq!(serialized, r#""accepted""#);
-
-        let declined = WelcomeState::Declined;
-        let serialized = serde_json::to_string(&declined).unwrap();
-        assert_eq!(serialized, r#""declined""#);
-
-        let ignored = WelcomeState::Ignored;
-        let serialized = serde_json::to_string(&ignored).unwrap();
-        assert_eq!(serialized, r#""ignored""#);
-    }
-
-    #[test]
-    fn test_welcome_state_deserialization() {
-        let pending: WelcomeState = serde_json::from_str(r#""pending""#).unwrap();
-        assert_eq!(pending, WelcomeState::Pending);
-
-        let accepted: WelcomeState = serde_json::from_str(r#""accepted""#).unwrap();
-        assert_eq!(accepted, WelcomeState::Accepted);
-
-        let declined: WelcomeState = serde_json::from_str(r#""declined""#).unwrap();
-        assert_eq!(declined, WelcomeState::Declined);
-
-        let ignored: WelcomeState = serde_json::from_str(r#""ignored""#).unwrap();
-        assert_eq!(ignored, WelcomeState::Ignored);
-    }
 
     #[test]
     fn test_processed_welcome_serialization() {

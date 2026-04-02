@@ -410,19 +410,19 @@ where
         tag.kind() == TagKind::i()
     }
 
+    /// Extracts the first value from a tag (index 1, after the tag name).
+    fn tag_first_value<'a>(tag: &'a Tag, missing_msg: &str) -> Result<&'a str, Error> {
+        tag.content()
+            .ok_or_else(|| Error::KeyPackage(missing_msg.to_string()))
+    }
+
     /// Validates protocol version tag format and value.
     ///
     /// **SPEC-COMPLIANT**: Per MIP-00, only "1.0" is currently supported.
     fn validate_protocol_version_tag(&self, tag: &Tag) -> Result<(), Error> {
-        let values: Vec<&str> = tag.as_slice().iter().map(|s| s.as_str()).collect();
+        let version_value = Self::tag_first_value(tag, "Protocol version tag must have a value")?;
 
-        // Skip the tag name (first element) and get the value
-        let version_value = values.get(1).ok_or_else(|| {
-            Error::KeyPackage("Protocol version tag must have a value".to_string())
-        })?;
-
-        // Validate the version value
-        if *version_value != "1.0" {
+        if version_value != "1.0" {
             return Err(Error::KeyPackage(format!(
                 "Unsupported protocol version: {}. Only version 1.0 is supported per MIP-00",
                 version_value
@@ -436,12 +436,7 @@ where
     ///
     /// Currently only accepts: "0x0001" (MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519)
     fn validate_ciphersuite_tag(&self, tag: &Tag) -> Result<(), Error> {
-        let values: Vec<&str> = tag.as_slice().iter().map(|s| s.as_str()).collect();
-
-        // Skip the tag name (first element) and get the value
-        let ciphersuite_value = values
-            .get(1)
-            .ok_or_else(|| Error::KeyPackage("Ciphersuite tag must have a value".to_string()))?;
+        let ciphersuite_value = Self::tag_first_value(tag, "Ciphersuite tag must have a value")?;
 
         // Validate length
         if ciphersuite_value.len() != 6 {
@@ -480,10 +475,10 @@ where
     /// - 0x000a (LastResort)
     /// - 0xf2ee (NostrGroupData)
     fn validate_extensions_tag(&self, tag: &Tag) -> Result<(), Error> {
-        let values: Vec<&str> = tag.as_slice().iter().map(|s| s.as_str()).collect();
+        let slice = tag.as_slice();
 
         // Skip the tag name (first element) and get extension values
-        let extension_values: Vec<&str> = values.iter().skip(1).copied().collect();
+        let extension_values: Vec<&str> = slice.iter().skip(1).map(|s| s.as_str()).collect();
 
         if extension_values.is_empty() {
             return Err(Error::KeyPackage(
@@ -541,17 +536,17 @@ where
     /// **SPEC-COMPLIANT**: Per MIP-00, the relays tag is mandatory and must contain
     /// at least one valid relay URL. This ensures key packages are routable.
     fn validate_relays_tag(&self, tag: &Tag) -> Result<(), Error> {
-        let relay_slice = tag.as_slice();
+        let slice = tag.as_slice();
 
         // Check that relays tag has at least one relay URL (first element is tag name)
-        if relay_slice.len() <= 1 {
+        if slice.len() <= 1 {
             return Err(Error::KeyPackage(
                 "Relays tag must have at least one relay URL".to_string(),
             ));
         }
 
         // Validate that each relay URL is properly formatted and parses as a RelayUrl
-        for (idx, relay_url_str) in relay_slice.iter().skip(1).enumerate() {
+        for (idx, relay_url_str) in slice.iter().skip(1).enumerate() {
             RelayUrl::parse(relay_url_str).map_err(|e| {
                 Error::KeyPackage(format!(
                     "Invalid relay URL at index {}: {} ({})",
@@ -578,7 +573,7 @@ where
             ));
         }
 
-        let hex_value = &slice[1];
+        let hex_value = Self::tag_first_value(tag, "Missing required i tag")?;
 
         if hex_value.is_empty() {
             return Err(Error::KeyPackage(
@@ -587,7 +582,7 @@ where
         }
 
         // Validate that the value is valid hex
-        hex::decode(hex_value.as_str()).map_err(|e| {
+        hex::decode(hex_value).map_err(|e| {
             Error::KeyPackage(format!("i tag must contain valid hex-encoded data: {}", e))
         })?;
 

@@ -7,6 +7,230 @@
 
 use openmls_traits::storage::StorageProvider;
 
+macro_rules! string_enum {
+    (
+        $(#[$enum_meta:meta])*
+        $vis:vis enum $name:ident => $error_ty:ty, $invalid_message:literal {
+            $(
+                $(#[$variant_meta:meta])*
+                $variant:ident => $value:literal
+            ),+ $(,)?
+        }
+    ) => {
+        $(#[$enum_meta])*
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        $vis enum $name {
+            $(
+                $(#[$variant_meta])*
+                $variant,
+            )+
+        }
+
+        impl $name {
+            /// Get as `&str`
+            pub fn as_str(&self) -> &str {
+                match self {
+                    $(Self::$variant => $value,)+
+                }
+            }
+        }
+
+        impl std::fmt::Display for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "{}", self.as_str())
+            }
+        }
+
+        impl std::str::FromStr for $name {
+            type Err = $error_ty;
+
+            fn from_str(s: &str) -> Result<Self, Self::Err> {
+                match s {
+                    $($value => Ok(Self::$variant),)+
+                    _ => Err(<$error_ty>::InvalidParameters(format!($invalid_message, s))),
+                }
+            }
+        }
+
+        impl serde::Serialize for $name {
+            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                serializer.serialize_str(self.as_str())
+            }
+        }
+
+        impl<'de> serde::Deserialize<'de> for $name {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                let s: String = String::deserialize(deserializer)?;
+                Self::from_str(&s).map_err(serde::de::Error::custom)
+            }
+        }
+
+        pastey::paste! {
+            #[cfg(test)]
+            mod [<$name:snake _string_enum_tests>] {
+                use super::*;
+                use std::str::FromStr;
+
+                #[test]
+                fn from_str_valid() {
+                    $(
+                        assert_eq!(
+                            $name::from_str($value).unwrap(),
+                            $name::$variant,
+                        );
+                    )+
+                }
+
+                #[test]
+                fn from_str_invalid() {
+                    assert!($name::from_str("__invalid_test_value__").is_err());
+                }
+
+                #[test]
+                fn to_string_matches_value() {
+                    $(
+                        assert_eq!($name::$variant.to_string(), $value);
+                    )+
+                }
+
+                #[test]
+                fn serde_roundtrip() {
+                    $(
+                        let serialized = serde_json::to_string(&$name::$variant).unwrap();
+                        assert_eq!(serialized, format!("\"{}\"", $value));
+                        let deserialized: $name = serde_json::from_str(&serialized).unwrap();
+                        assert_eq!(deserialized, $name::$variant);
+                    )+
+                }
+
+                #[test]
+                fn serde_invalid() {
+                    let result = serde_json::from_str::<$name>(r#""__invalid_test_value__""#);
+                    assert!(result.is_err());
+                }
+            }
+        }
+    };
+}
+
+/// Generate a `Pagination` struct with bounded limit/offset and a validation function.
+///
+/// Produces:
+/// - `pub struct Pagination` with `limit`, `offset`, and any extra fields
+/// - `new(limit, offset)` constructor
+/// - `limit()` / `offset()` accessors with defaults
+/// - `Default` impl
+/// - A public `$validate` function that checks `1..=$max`
+///
+/// Extra fields are wrapped in `Option` and default to `None`.
+macro_rules! bounded_pagination {
+    (
+        $(#[$struct_meta:meta])*
+        default_limit: $default:expr,
+        max_limit: $max:expr,
+        error_type: $err:ty,
+        validate_fn: $validate:ident
+        $(, extra {
+            $( $(#[$field_meta:meta])* $field:ident : $field_ty:ty ),+ $(,)?
+        })?
+    ) => {
+        $(#[$struct_meta])*
+        #[derive(Debug, Clone, Copy)]
+        pub struct Pagination {
+            /// Maximum number of items to return
+            pub limit: Option<usize>,
+            /// Number of items to skip
+            pub offset: Option<usize>,
+            $( $(
+                $(#[$field_meta])*
+                pub $field: Option<$field_ty>,
+            )+ )?
+        }
+
+        impl Pagination {
+            /// Create a new Pagination with specified limit and offset
+            pub fn new(limit: Option<usize>, offset: Option<usize>) -> Self {
+                Self {
+                    limit,
+                    offset,
+                    $( $( $field: None, )+ )?
+                }
+            }
+
+            /// Get the limit value, using default if not specified
+            pub fn limit(&self) -> usize {
+                self.limit.unwrap_or($default)
+            }
+
+            /// Get the offset value, using 0 if not specified
+            pub fn offset(&self) -> usize {
+                self.offset.unwrap_or(0)
+            }
+        }
+
+        impl Default for Pagination {
+            fn default() -> Self {
+                Self {
+                    limit: Some($default),
+                    offset: Some(0),
+                    $( $( $field: None, )+ )?
+                }
+            }
+        }
+
+        /// Validate that a limit is within the allowed range.
+        ///
+        /// Returns `Ok(())` if `limit` is between 1 and the maximum (inclusive),
+        /// or an error otherwise.
+        #[inline]
+        pub fn $validate(limit: usize) -> Result<(), $err> {
+            if (1..=$max).contains(&limit) {
+                Ok(())
+            } else {
+                Err(<$err>::InvalidParameters(format!(
+                    "Limit must be between 1 and {}, got {}",
+                    $max, limit
+                )))
+            }
+        }
+    };
+}
+
+/// Generate a storage error enum with common `InvalidParameters(String)` and
+/// `DatabaseError(String)` variants, plus any module-specific extras.
+macro_rules! storage_error {
+    (
+        $(#[$enum_meta:meta])*
+        $vis:vis enum $name:ident {
+            $(
+                $(#[$extra_meta:meta])*
+                $extra_variant:ident $( ($extra_inner:ty) )?
+            ),* $(,)?
+        }
+    ) => {
+        $(#[$enum_meta])*
+        #[derive(Debug, thiserror::Error)]
+        $vis enum $name {
+            /// Invalid parameters
+            #[error("Invalid parameters: {0}")]
+            InvalidParameters(String),
+            /// Database error
+            #[error("Database error: {0}")]
+            DatabaseError(String),
+            $(
+                $(#[$extra_meta])*
+                $extra_variant $( ($extra_inner) )?,
+            )*
+        }
+    };
+}
+
 pub mod error;
 pub mod group_id;
 pub mod groups;

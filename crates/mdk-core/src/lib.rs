@@ -224,27 +224,22 @@ where
         }
     }
 
-    /// Set a custom configuration
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// # use mdk_core::{MDK, MdkConfig};
-    /// # use mdk_memory_storage::MdkMemoryStorage;
-    /// let config = MdkConfig::new();
-    /// let mdk = MDK::builder(MdkMemoryStorage::default())
-    ///     .with_config(config)
-    ///     .build();
-    /// ```
-    pub fn with_config(mut self, config: MdkConfig) -> Self {
-        self.config = config;
-        self
-    }
-
-    /// Set a callback for MDK events
-    pub fn with_callback(mut self, callback: Arc<dyn MdkCallback>) -> Self {
-        self.callback = Some(callback);
-        self
+    mdk_macros::setters! {
+        /// Set a custom configuration
+        ///
+        /// # Example
+        ///
+        /// ```no_run
+        /// # use mdk_core::{MDK, MdkConfig};
+        /// # use mdk_memory_storage::MdkMemoryStorage;
+        /// let config = MdkConfig::new();
+        /// let mdk = MDK::builder(MdkMemoryStorage::default())
+        ///     .with_config(config)
+        ///     .build();
+        /// ```
+        with_config<direct> -> config: MdkConfig;
+        /// Set a callback for MDK events
+        with_callback -> callback: Arc<dyn MdkCallback>;
     }
 
     /// Build the MDK instance with the configured settings

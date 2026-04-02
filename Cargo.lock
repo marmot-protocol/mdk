@@ -1509,6 +1509,7 @@ dependencies = [
  "hkdf",
  "image",
  "kamadak-exif",
+ "mdk-macros",
  "mdk-memory-storage",
  "mdk-sqlite-storage",
  "mdk-storage-traits",
@@ -1529,6 +1530,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "mdk-macros"
+version = "0.7.1"
+
+[[package]]
 name = "mdk-memory-storage"
 version = "0.7.1"
 dependencies = [
@@ -1538,6 +1543,7 @@ dependencies = [
  "openmls",
  "openmls_traits",
  "parking_lot",
+ "pastey",
  "serde",
  "serde_json",
 ]
@@ -1570,6 +1576,7 @@ dependencies = [
  "nostr",
  "openmls",
  "openmls_traits",
+ "pastey",
  "postcard",
  "serde",
  "serde_json",

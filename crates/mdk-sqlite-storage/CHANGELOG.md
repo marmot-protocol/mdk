@@ -29,6 +29,9 @@
 
 ### Changed
 
+- Extracted row-parsing helpers (`blob_to_group_id`, `blob_to_event_id`, `blob_to_pubkey`, `text_to_state`, `text_to_json`, `text_to_parsed`) to replace repetitive inline column extraction across `row_to_group`, `row_to_group_relay`, `row_to_group_exporter_secret`, `row_to_message`, and `row_to_welcome`. ([`#239`](https://github.com/marmot-protocol/mdk/pull/239))
+- Migrated group and welcome storage to use shared validation functions from `mdk-storage-traits`. ([`#239`](https://github.com/marmot-protocol/mdk/pull/239))
+
 ### Added
 
 - Implemented legacy exporter-secret compatibility storage for the temporary `0.6.x -> 0.7.x` migration window, including read/write support for preserved pre-0.7.0 group-event secrets and snapshot rollback restoration into the legacy compatibility label. ([#222](https://github.com/marmot-protocol/mdk/pull/222))

@@ -73,6 +73,17 @@ use openmls_traits::storage::{StorageProvider, traits};
 use rusqlite::Connection;
 use std::sync::Mutex;
 
+/// Generates a function that converts any `std::error::Error` into the given
+/// storage error type's `DatabaseError` variant.
+macro_rules! db_error_fn {
+    ($fn_name:ident, $error_type:ty) => {
+        #[inline]
+        fn $fn_name<T: std::error::Error>(e: T) -> $error_type {
+            <$error_type>::DatabaseError(e.to_string())
+        }
+    };
+}
+
 mod db;
 pub mod encryption;
 pub mod error;
@@ -86,6 +97,123 @@ mod permissions;
 mod test_utils;
 mod validation;
 mod welcomes;
+
+/// Generates a `StorageProvider` write method that delegates to
+/// `self.with_connection(|conn| mls_storage::write_group_data(conn, group_id, GroupDataType::$variant, value))`.
+///
+/// Two arms handle the two generic-parameter orderings in the OpenMLS trait:
+///
+/// - Normal `<GroupId, ValueType>`: all write methods except `write_group_state`.
+/// - Swapped `<ValueType, GroupId>`: `write_group_state` only.
+///
+/// Usage:
+/// ```ignore
+/// write_group_data_method!(write_tree, GroupId, TreeSync, Tree);
+/// write_group_data_method!(swapped write_group_state, GroupState, GroupId, GroupState);
+/// ```
+macro_rules! write_group_data_method {
+    // Normal generic order: fn name<GroupId, ValueType>
+    ($fn_name:ident, $gid_trait:ident, $val_type:ident, $variant:ident) => {
+        fn $fn_name<GroupId, $val_type>(
+            &self,
+            group_id: &GroupId,
+            value: &$val_type,
+        ) -> Result<(), Self::Error>
+        where
+            GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
+            $val_type: traits::$val_type<STORAGE_PROVIDER_VERSION>,
+        {
+            self.with_connection(|conn| {
+                mls_storage::write_group_data(conn, group_id, GroupDataType::$variant, value)
+            })
+        }
+    };
+    // Swapped generic order: fn name<ValueType, GroupId>
+    (swapped $fn_name:ident, $val_type:ident, $gid_trait:ident, $variant:ident) => {
+        fn $fn_name<$val_type, GroupId>(
+            &self,
+            group_id: &GroupId,
+            value: &$val_type,
+        ) -> Result<(), Self::Error>
+        where
+            $val_type: traits::$val_type<STORAGE_PROVIDER_VERSION>,
+            GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
+        {
+            self.with_connection(|conn| {
+                mls_storage::write_group_data(conn, group_id, GroupDataType::$variant, value)
+            })
+        }
+    };
+}
+
+/// Generates a `StorageProvider` read method that delegates to
+/// `self.with_connection(|conn| mls_storage::read_group_data(conn, group_id, GroupDataType::$variant))`.
+///
+/// Two arms handle the two generic-parameter orderings (same split as
+/// `write_group_data_method!`).
+///
+/// Usage:
+/// ```ignore
+/// read_group_data_method!(tree, GroupId, TreeSync, Tree);
+/// read_group_data_method!(swapped group_state, GroupState, GroupId, GroupState);
+/// ```
+macro_rules! read_group_data_method {
+    // Normal generic order: fn name<GroupId, ValueType>
+    ($fn_name:ident, $gid_trait:ident, $val_type:ident, $variant:ident) => {
+        fn $fn_name<GroupId, $val_type>(
+            &self,
+            group_id: &GroupId,
+        ) -> Result<Option<$val_type>, Self::Error>
+        where
+            GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
+            $val_type: traits::$val_type<STORAGE_PROVIDER_VERSION>,
+        {
+            self.with_connection(|conn| {
+                mls_storage::read_group_data(conn, group_id, GroupDataType::$variant)
+            })
+        }
+    };
+    // Swapped generic order: fn name<ValueType, GroupId>
+    (swapped $fn_name:ident, $val_type:ident, $gid_trait:ident, $variant:ident) => {
+        fn $fn_name<$val_type, GroupId>(
+            &self,
+            group_id: &GroupId,
+        ) -> Result<Option<$val_type>, Self::Error>
+        where
+            $val_type: traits::$val_type<STORAGE_PROVIDER_VERSION>,
+            GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
+        {
+            self.with_connection(|conn| {
+                mls_storage::read_group_data(conn, group_id, GroupDataType::$variant)
+            })
+        }
+    };
+}
+
+/// Generates a `StorageProvider` delete method that delegates to
+/// `self.with_connection(|conn| mls_storage::delete_group_data(conn, group_id, GroupDataType::$variant))`.
+///
+/// Every method in the contiguous run from `delete_group_config` through
+/// `delete_group_epoch_secrets` is structurally identical; only the trait
+/// method name and the `GroupDataType` variant differ.  This macro encodes
+/// that shape once so adding a new data type requires a single line.
+///
+/// Usage:
+/// ```ignore
+/// delete_group_data_method!(delete_group_config, JoinGroupConfig);
+/// ```
+macro_rules! delete_group_data_method {
+    ($fn_name:ident, $variant:ident) => {
+        fn $fn_name<GroupId>(&self, group_id: &GroupId) -> Result<(), Self::Error>
+        where
+            GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
+        {
+            self.with_connection(|conn| {
+                mls_storage::delete_group_data(conn, group_id, GroupDataType::$variant)
+            })
+        }
+    };
+}
 
 pub use self::encryption::EncryptionConfig;
 use self::error::Error;
@@ -128,6 +256,88 @@ use self::permissions::{
 pub struct MdkSqliteStorage {
     /// The unified SQLite connection for both MLS and MDK state
     connection: Arc<Mutex<Connection>>,
+}
+
+macro_rules! snapshot_helper {
+    (
+            $fn_name:ident,
+            $table_name:expr,
+            $query:expr,
+            mls_group_id_bytes,
+            | $row:ident | $body:block
+        ) => {
+        fn $fn_name(
+            conn: &rusqlite::Connection,
+            insert_stmt: &mut rusqlite::CachedStatement<'_>,
+            snapshot_name: &str,
+            group_id_bytes: &[u8],
+            mls_group_id_bytes: &[u8],
+            now: i64,
+        ) -> Result<(), Error> {
+            let mut stmt = conn
+                .prepare($query)
+                .map_err(|e| Error::Database(e.to_string()))?;
+            let mut rows = stmt
+                .query([mls_group_id_bytes])
+                .map_err(|e| Error::Database(e.to_string()))?;
+
+            while let Some($row) = rows.next().map_err(|e| Error::Database(e.to_string()))? {
+                let (row_key, row_data): (Vec<u8>, Vec<u8>) =
+                    (|| -> Result<(Vec<u8>, Vec<u8>), Error> { $body })()?;
+
+                insert_stmt
+                    .execute(rusqlite::params![
+                        snapshot_name,
+                        group_id_bytes,
+                        $table_name,
+                        row_key,
+                        row_data,
+                        now
+                    ])
+                    .map_err(|e| Error::Database(e.to_string()))?;
+            }
+            Ok(())
+        }
+    };
+    (
+            $fn_name:ident,
+            $table_name:expr,
+            $query:expr,
+            group_id_bytes,
+            | $row:ident | $body:block
+        ) => {
+        fn $fn_name(
+            conn: &rusqlite::Connection,
+            insert_stmt: &mut rusqlite::CachedStatement<'_>,
+            snapshot_name: &str,
+            group_id_bytes: &[u8],
+            now: i64,
+        ) -> Result<(), Error> {
+            let mut stmt = conn
+                .prepare($query)
+                .map_err(|e| Error::Database(e.to_string()))?;
+            let mut rows = stmt
+                .query([group_id_bytes])
+                .map_err(|e| Error::Database(e.to_string()))?;
+
+            while let Some($row) = rows.next().map_err(|e| Error::Database(e.to_string()))? {
+                let (row_key, row_data): (Vec<u8>, Vec<u8>) =
+                    (|| -> Result<(Vec<u8>, Vec<u8>), Error> { $body })()?;
+
+                insert_stmt
+                    .execute(rusqlite::params![
+                        snapshot_name,
+                        group_id_bytes,
+                        $table_name,
+                        row_key,
+                        row_data,
+                        now
+                    ])
+                    .map_err(|e| Error::Database(e.to_string()))?;
+            }
+            Ok(())
+        }
+    };
 }
 
 impl MdkSqliteStorage {
@@ -547,309 +757,134 @@ impl MdkSqliteStorage {
         }
     }
 
-    /// Snapshot helper: openmls_group_data table
-    fn snapshot_openmls_group_data(
-        conn: &rusqlite::Connection,
-        insert_stmt: &mut rusqlite::CachedStatement<'_>,
-        snapshot_name: &str,
-        group_id_bytes: &[u8],
-        mls_group_id_bytes: &[u8],
-        now: i64,
-    ) -> Result<(), Error> {
-        let mut stmt = conn
-            .prepare(
-                "SELECT group_id, data_type, group_data FROM openmls_group_data WHERE group_id = ?",
-            )
-            .map_err(|e| Error::Database(e.to_string()))?;
-        let mut rows = stmt
-            .query([mls_group_id_bytes])
-            .map_err(|e| Error::Database(e.to_string()))?;
-
-        while let Some(row) = rows.next().map_err(|e| Error::Database(e.to_string()))? {
+    snapshot_helper! {
+        snapshot_openmls_group_data,
+        "openmls_group_data",
+        "SELECT group_id, data_type, group_data FROM openmls_group_data WHERE group_id = ?",
+        mls_group_id_bytes,
+        |row| {
             let gid: Vec<u8> = row.get(0).map_err(|e| Error::Database(e.to_string()))?;
             let data_type: String = row.get(1).map_err(|e| Error::Database(e.to_string()))?;
             let data: Vec<u8> = row.get(2).map_err(|e| Error::Database(e.to_string()))?;
             let row_key = serde_json::to_vec(&(&gid, &data_type))
                 .map_err(|e| Error::Database(e.to_string()))?;
-            insert_stmt
-                .execute(rusqlite::params![
-                    snapshot_name,
-                    group_id_bytes,
-                    "openmls_group_data",
-                    row_key,
-                    data,
-                    now
-                ])
-                .map_err(|e| Error::Database(e.to_string()))?;
+            Ok((row_key, data))
         }
-        Ok(())
     }
 
-    /// Snapshot helper: openmls_proposals table
-    fn snapshot_openmls_proposals(
-        conn: &rusqlite::Connection,
-        insert_stmt: &mut rusqlite::CachedStatement<'_>,
-        snapshot_name: &str,
-        group_id_bytes: &[u8],
-        mls_group_id_bytes: &[u8],
-        now: i64,
-    ) -> Result<(), Error> {
-        let mut stmt = conn
-            .prepare(
-                "SELECT group_id, proposal_ref, proposal FROM openmls_proposals WHERE group_id = ?",
-            )
-            .map_err(|e| Error::Database(e.to_string()))?;
-        let mut rows = stmt
-            .query([mls_group_id_bytes])
-            .map_err(|e| Error::Database(e.to_string()))?;
-
-        while let Some(row) = rows.next().map_err(|e| Error::Database(e.to_string()))? {
+    snapshot_helper! {
+        snapshot_openmls_proposals,
+        "openmls_proposals",
+        "SELECT group_id, proposal_ref, proposal FROM openmls_proposals WHERE group_id = ?",
+        mls_group_id_bytes,
+        |row| {
             let gid: Vec<u8> = row.get(0).map_err(|e| Error::Database(e.to_string()))?;
             let proposal_ref: Vec<u8> = row.get(1).map_err(|e| Error::Database(e.to_string()))?;
             let proposal: Vec<u8> = row.get(2).map_err(|e| Error::Database(e.to_string()))?;
             let row_key = serde_json::to_vec(&(&gid, &proposal_ref))
                 .map_err(|e| Error::Database(e.to_string()))?;
-            insert_stmt
-                .execute(rusqlite::params![
-                    snapshot_name,
-                    group_id_bytes,
-                    "openmls_proposals",
-                    row_key,
-                    proposal,
-                    now
-                ])
-                .map_err(|e| Error::Database(e.to_string()))?;
+            Ok((row_key, proposal))
         }
-        Ok(())
     }
 
-    /// Snapshot helper: openmls_own_leaf_nodes table
-    fn snapshot_openmls_own_leaf_nodes(
-        conn: &rusqlite::Connection,
-        insert_stmt: &mut rusqlite::CachedStatement<'_>,
-        snapshot_name: &str,
-        group_id_bytes: &[u8],
-        mls_group_id_bytes: &[u8],
-        now: i64,
-    ) -> Result<(), Error> {
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, group_id, leaf_node FROM openmls_own_leaf_nodes WHERE group_id = ?",
-            )
-            .map_err(|e| Error::Database(e.to_string()))?;
-        let mut rows = stmt
-            .query([mls_group_id_bytes])
-            .map_err(|e| Error::Database(e.to_string()))?;
-
-        while let Some(row) = rows.next().map_err(|e| Error::Database(e.to_string()))? {
+    snapshot_helper! {
+        snapshot_openmls_own_leaf_nodes,
+        "openmls_own_leaf_nodes",
+        "SELECT id, group_id, leaf_node FROM openmls_own_leaf_nodes WHERE group_id = ?",
+        mls_group_id_bytes,
+        |row| {
             let id: i64 = row.get(0).map_err(|e| Error::Database(e.to_string()))?;
             let gid: Vec<u8> = row.get(1).map_err(|e| Error::Database(e.to_string()))?;
             let leaf_node: Vec<u8> = row.get(2).map_err(|e| Error::Database(e.to_string()))?;
             let row_key = serde_json::to_vec(&id).map_err(|e| Error::Database(e.to_string()))?;
             let row_data = serde_json::to_vec(&(&gid, &leaf_node))
                 .map_err(|e| Error::Database(e.to_string()))?;
-            insert_stmt
-                .execute(rusqlite::params![
-                    snapshot_name,
-                    group_id_bytes,
-                    "openmls_own_leaf_nodes",
-                    row_key,
-                    row_data,
-                    now
-                ])
-                .map_err(|e| Error::Database(e.to_string()))?;
+            Ok((row_key, row_data))
         }
-        Ok(())
     }
 
-    /// Snapshot helper: openmls_epoch_key_pairs table
-    fn snapshot_openmls_epoch_key_pairs(
-        conn: &rusqlite::Connection,
-        insert_stmt: &mut rusqlite::CachedStatement<'_>,
-        snapshot_name: &str,
-        group_id_bytes: &[u8],
-        mls_group_id_bytes: &[u8],
-        now: i64,
-    ) -> Result<(), Error> {
-        let mut stmt = conn
-            .prepare(
-                "SELECT group_id, epoch_id, leaf_index, key_pairs
-                 FROM openmls_epoch_key_pairs WHERE group_id = ?",
-            )
-            .map_err(|e| Error::Database(e.to_string()))?;
-        let mut rows = stmt
-            .query([mls_group_id_bytes])
-            .map_err(|e| Error::Database(e.to_string()))?;
-
-        while let Some(row) = rows.next().map_err(|e| Error::Database(e.to_string()))? {
+    snapshot_helper! {
+        snapshot_openmls_epoch_key_pairs,
+        "openmls_epoch_key_pairs",
+        "SELECT group_id, epoch_id, leaf_index, key_pairs FROM openmls_epoch_key_pairs WHERE group_id = ?",
+        mls_group_id_bytes,
+        |row| {
             let gid: Vec<u8> = row.get(0).map_err(|e| Error::Database(e.to_string()))?;
             let epoch_id: Vec<u8> = row.get(1).map_err(|e| Error::Database(e.to_string()))?;
             let leaf_index: i64 = row.get(2).map_err(|e| Error::Database(e.to_string()))?;
             let key_pairs: Vec<u8> = row.get(3).map_err(|e| Error::Database(e.to_string()))?;
             let row_key = serde_json::to_vec(&(&gid, &epoch_id, leaf_index))
                 .map_err(|e| Error::Database(e.to_string()))?;
-            insert_stmt
-                .execute(rusqlite::params![
-                    snapshot_name,
-                    group_id_bytes,
-                    "openmls_epoch_key_pairs",
-                    row_key,
-                    key_pairs,
-                    now
-                ])
-                .map_err(|e| Error::Database(e.to_string()))?;
+            Ok((row_key, key_pairs))
         }
-        Ok(())
     }
 
-    /// Snapshot helper: groups table (MDK)
-    fn snapshot_groups_table(
-        conn: &rusqlite::Connection,
-        insert_stmt: &mut rusqlite::CachedStatement<'_>,
-        snapshot_name: &str,
-        group_id_bytes: &[u8],
-        now: i64,
-    ) -> Result<(), Error> {
-        let mut stmt = conn
-            .prepare(
-                "SELECT mls_group_id, nostr_group_id, name, description, admin_pubkeys,
-                        last_message_id, last_message_at, last_message_processed_at, epoch, state,
-                        image_hash, image_key, image_nonce, last_self_update_at
-                 FROM groups WHERE mls_group_id = ?",
-            )
-            .map_err(|e| Error::Database(e.to_string()))?;
-        let mut rows = stmt
-            .query([group_id_bytes])
-            .map_err(|e| Error::Database(e.to_string()))?;
-
-        while let Some(row) = rows.next().map_err(|e| Error::Database(e.to_string()))? {
+    snapshot_helper! {
+        snapshot_groups_table,
+        "groups",
+        "SELECT mls_group_id, nostr_group_id, name, description, admin_pubkeys,
+                last_message_id, last_message_at, last_message_processed_at, epoch, state,
+                image_hash, image_key, image_nonce, last_self_update_at
+         FROM groups WHERE mls_group_id = ?",
+        group_id_bytes,
+        |row| {
             let mls_group_id: Vec<u8> = row.get(0).map_err(|e| Error::Database(e.to_string()))?;
             let nostr_group_id: Vec<u8> = row.get(1).map_err(|e| Error::Database(e.to_string()))?;
             let name_val: String = row.get(2).map_err(|e| Error::Database(e.to_string()))?;
             let description: String = row.get(3).map_err(|e| Error::Database(e.to_string()))?;
             let admin_pubkeys: String = row.get(4).map_err(|e| Error::Database(e.to_string()))?;
-            let last_message_id: Option<Vec<u8>> =
-                row.get(5).map_err(|e| Error::Database(e.to_string()))?;
-            let last_message_at: Option<i64> =
-                row.get(6).map_err(|e| Error::Database(e.to_string()))?;
-            let last_message_processed_at: Option<i64> =
-                row.get(7).map_err(|e| Error::Database(e.to_string()))?;
+            let last_message_id: Option<Vec<u8>> = row.get(5).map_err(|e| Error::Database(e.to_string()))?;
+            let last_message_at: Option<i64> = row.get(6).map_err(|e| Error::Database(e.to_string()))?;
+            let last_message_processed_at: Option<i64> = row.get(7).map_err(|e| Error::Database(e.to_string()))?;
             let epoch: i64 = row.get(8).map_err(|e| Error::Database(e.to_string()))?;
             let state: String = row.get(9).map_err(|e| Error::Database(e.to_string()))?;
-            let image_hash: Option<Vec<u8>> =
-                row.get(10).map_err(|e| Error::Database(e.to_string()))?;
-            let image_key: Option<Vec<u8>> =
-                row.get(11).map_err(|e| Error::Database(e.to_string()))?;
-            let image_nonce: Option<Vec<u8>> =
-                row.get(12).map_err(|e| Error::Database(e.to_string()))?;
-            let last_self_update_at: i64 =
-                row.get(13).map_err(|e| Error::Database(e.to_string()))?;
+            let image_hash: Option<Vec<u8>> = row.get(10).map_err(|e| Error::Database(e.to_string()))?;
+            let image_key: Option<Vec<u8>> = row.get(11).map_err(|e| Error::Database(e.to_string()))?;
+            let image_nonce: Option<Vec<u8>> = row.get(12).map_err(|e| Error::Database(e.to_string()))?;
+            let last_self_update_at: i64 = row.get(13).map_err(|e| Error::Database(e.to_string()))?;
 
-            let row_key =
-                serde_json::to_vec(&mls_group_id).map_err(|e| Error::Database(e.to_string()))?;
+            let row_key = serde_json::to_vec(&mls_group_id).map_err(|e| Error::Database(e.to_string()))?;
             let row_data = serde_json::to_vec(&(
-                &nostr_group_id,
-                &name_val,
-                &description,
-                &admin_pubkeys,
-                &last_message_id,
-                &last_message_at,
-                &last_message_processed_at,
-                epoch,
-                &state,
-                &image_hash,
-                &image_key,
-                &image_nonce,
+                &nostr_group_id, &name_val, &description, &admin_pubkeys,
+                &last_message_id, &last_message_at, &last_message_processed_at,
+                epoch, &state, &image_hash, &image_key, &image_nonce,
                 &last_self_update_at,
             ))
             .map_err(|e| Error::Database(e.to_string()))?;
-
-            insert_stmt
-                .execute(rusqlite::params![
-                    snapshot_name,
-                    group_id_bytes,
-                    "groups",
-                    row_key,
-                    row_data,
-                    now
-                ])
-                .map_err(|e| Error::Database(e.to_string()))?;
+            Ok((row_key, row_data))
         }
-        Ok(())
     }
 
-    /// Snapshot helper: group_relays table
-    fn snapshot_group_relays(
-        conn: &rusqlite::Connection,
-        insert_stmt: &mut rusqlite::CachedStatement<'_>,
-        snapshot_name: &str,
-        group_id_bytes: &[u8],
-        now: i64,
-    ) -> Result<(), Error> {
-        let mut stmt = conn
-            .prepare("SELECT id, mls_group_id, relay_url FROM group_relays WHERE mls_group_id = ?")
-            .map_err(|e| Error::Database(e.to_string()))?;
-        let mut rows = stmt
-            .query([group_id_bytes])
-            .map_err(|e| Error::Database(e.to_string()))?;
-
-        while let Some(row) = rows.next().map_err(|e| Error::Database(e.to_string()))? {
+    snapshot_helper! {
+        snapshot_group_relays,
+        "group_relays",
+        "SELECT id, mls_group_id, relay_url FROM group_relays WHERE mls_group_id = ?",
+        group_id_bytes,
+        |row| {
             let id: i64 = row.get(0).map_err(|e| Error::Database(e.to_string()))?;
             let mls_group_id: Vec<u8> = row.get(1).map_err(|e| Error::Database(e.to_string()))?;
             let relay_url: String = row.get(2).map_err(|e| Error::Database(e.to_string()))?;
             let row_key = serde_json::to_vec(&id).map_err(|e| Error::Database(e.to_string()))?;
             let row_data = serde_json::to_vec(&(&mls_group_id, &relay_url))
                 .map_err(|e| Error::Database(e.to_string()))?;
-            insert_stmt
-                .execute(rusqlite::params![
-                    snapshot_name,
-                    group_id_bytes,
-                    "group_relays",
-                    row_key,
-                    row_data,
-                    now
-                ])
-                .map_err(|e| Error::Database(e.to_string()))?;
+            Ok((row_key, row_data))
         }
-        Ok(())
     }
 
-    /// Snapshot helper: group_exporter_secrets table
-    fn snapshot_group_exporter_secrets(
-        conn: &rusqlite::Connection,
-        insert_stmt: &mut rusqlite::CachedStatement<'_>,
-        snapshot_name: &str,
-        group_id_bytes: &[u8],
-        now: i64,
-    ) -> Result<(), Error> {
-        let mut stmt = conn
-            .prepare(
-                "SELECT mls_group_id, epoch, label, secret FROM group_exporter_secrets WHERE mls_group_id = ?",
-            )
-            .map_err(|e| Error::Database(e.to_string()))?;
-        let mut rows = stmt
-            .query([group_id_bytes])
-            .map_err(|e| Error::Database(e.to_string()))?;
-
-        while let Some(row) = rows.next().map_err(|e| Error::Database(e.to_string()))? {
+    snapshot_helper! {
+        snapshot_group_exporter_secrets,
+        "group_exporter_secrets",
+        "SELECT mls_group_id, epoch, label, secret FROM group_exporter_secrets WHERE mls_group_id = ?",
+        group_id_bytes,
+        |row| {
             let mls_group_id: Vec<u8> = row.get(0).map_err(|e| Error::Database(e.to_string()))?;
             let epoch: i64 = row.get(1).map_err(|e| Error::Database(e.to_string()))?;
             let label: String = row.get(2).map_err(|e| Error::Database(e.to_string()))?;
             let secret: Vec<u8> = row.get(3).map_err(|e| Error::Database(e.to_string()))?;
             let row_key = serde_json::to_vec(&(&mls_group_id, epoch, &label))
                 .map_err(|e| Error::Database(e.to_string()))?;
-            insert_stmt
-                .execute(rusqlite::params![
-                    snapshot_name,
-                    group_id_bytes,
-                    "group_exporter_secrets",
-                    row_key,
-                    secret,
-                    now
-                ])
-                .map_err(|e| Error::Database(e.to_string()))?;
+            Ok((row_key, secret))
         }
-        Ok(())
     }
 
     /// Restores a group's state from a snapshot by deleting current rows
@@ -1255,19 +1290,12 @@ impl StorageProvider<STORAGE_PROVIDER_VERSION> for MdkSqliteStorage {
     // Write Methods
     // ========================================================================
 
-    fn write_mls_join_config<GroupId, MlsGroupJoinConfig>(
-        &self,
-        group_id: &GroupId,
-        config: &MlsGroupJoinConfig,
-    ) -> Result<(), Self::Error>
-    where
-        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
-        MlsGroupJoinConfig: traits::MlsGroupJoinConfig<STORAGE_PROVIDER_VERSION>,
-    {
-        self.with_connection(|conn| {
-            mls_storage::write_group_data(conn, group_id, GroupDataType::JoinGroupConfig, config)
-        })
-    }
+    write_group_data_method!(
+        write_mls_join_config,
+        GroupId,
+        MlsGroupJoinConfig,
+        JoinGroupConfig
+    );
 
     fn append_own_leaf_node<GroupId, LeafNode>(
         &self,
@@ -1297,161 +1325,40 @@ impl StorageProvider<STORAGE_PROVIDER_VERSION> for MdkSqliteStorage {
         })
     }
 
-    fn write_tree<GroupId, TreeSync>(
-        &self,
-        group_id: &GroupId,
-        tree: &TreeSync,
-    ) -> Result<(), Self::Error>
-    where
-        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
-        TreeSync: traits::TreeSync<STORAGE_PROVIDER_VERSION>,
-    {
-        self.with_connection(|conn| {
-            mls_storage::write_group_data(conn, group_id, GroupDataType::Tree, tree)
-        })
-    }
-
-    fn write_interim_transcript_hash<GroupId, InterimTranscriptHash>(
-        &self,
-        group_id: &GroupId,
-        interim_transcript_hash: &InterimTranscriptHash,
-    ) -> Result<(), Self::Error>
-    where
-        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
-        InterimTranscriptHash: traits::InterimTranscriptHash<STORAGE_PROVIDER_VERSION>,
-    {
-        self.with_connection(|conn| {
-            mls_storage::write_group_data(
-                conn,
-                group_id,
-                GroupDataType::InterimTranscriptHash,
-                interim_transcript_hash,
-            )
-        })
-    }
-
-    fn write_context<GroupId, GroupContext>(
-        &self,
-        group_id: &GroupId,
-        group_context: &GroupContext,
-    ) -> Result<(), Self::Error>
-    where
-        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
-        GroupContext: traits::GroupContext<STORAGE_PROVIDER_VERSION>,
-    {
-        self.with_connection(|conn| {
-            mls_storage::write_group_data(conn, group_id, GroupDataType::Context, group_context)
-        })
-    }
-
-    fn write_confirmation_tag<GroupId, ConfirmationTag>(
-        &self,
-        group_id: &GroupId,
-        confirmation_tag: &ConfirmationTag,
-    ) -> Result<(), Self::Error>
-    where
-        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
-        ConfirmationTag: traits::ConfirmationTag<STORAGE_PROVIDER_VERSION>,
-    {
-        self.with_connection(|conn| {
-            mls_storage::write_group_data(
-                conn,
-                group_id,
-                GroupDataType::ConfirmationTag,
-                confirmation_tag,
-            )
-        })
-    }
-
-    fn write_group_state<GroupState, GroupId>(
-        &self,
-        group_id: &GroupId,
-        group_state: &GroupState,
-    ) -> Result<(), Self::Error>
-    where
-        GroupState: traits::GroupState<STORAGE_PROVIDER_VERSION>,
-        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
-    {
-        self.with_connection(|conn| {
-            mls_storage::write_group_data(conn, group_id, GroupDataType::GroupState, group_state)
-        })
-    }
-
-    fn write_message_secrets<GroupId, MessageSecrets>(
-        &self,
-        group_id: &GroupId,
-        message_secrets: &MessageSecrets,
-    ) -> Result<(), Self::Error>
-    where
-        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
-        MessageSecrets: traits::MessageSecrets<STORAGE_PROVIDER_VERSION>,
-    {
-        self.with_connection(|conn| {
-            mls_storage::write_group_data(
-                conn,
-                group_id,
-                GroupDataType::MessageSecrets,
-                message_secrets,
-            )
-        })
-    }
-
-    fn write_resumption_psk_store<GroupId, ResumptionPskStore>(
-        &self,
-        group_id: &GroupId,
-        resumption_psk_store: &ResumptionPskStore,
-    ) -> Result<(), Self::Error>
-    where
-        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
-        ResumptionPskStore: traits::ResumptionPskStore<STORAGE_PROVIDER_VERSION>,
-    {
-        self.with_connection(|conn| {
-            mls_storage::write_group_data(
-                conn,
-                group_id,
-                GroupDataType::ResumptionPskStore,
-                resumption_psk_store,
-            )
-        })
-    }
-
-    fn write_own_leaf_index<GroupId, LeafNodeIndex>(
-        &self,
-        group_id: &GroupId,
-        own_leaf_index: &LeafNodeIndex,
-    ) -> Result<(), Self::Error>
-    where
-        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
-        LeafNodeIndex: traits::LeafNodeIndex<STORAGE_PROVIDER_VERSION>,
-    {
-        self.with_connection(|conn| {
-            mls_storage::write_group_data(
-                conn,
-                group_id,
-                GroupDataType::OwnLeafIndex,
-                own_leaf_index,
-            )
-        })
-    }
-
-    fn write_group_epoch_secrets<GroupId, GroupEpochSecrets>(
-        &self,
-        group_id: &GroupId,
-        group_epoch_secrets: &GroupEpochSecrets,
-    ) -> Result<(), Self::Error>
-    where
-        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
-        GroupEpochSecrets: traits::GroupEpochSecrets<STORAGE_PROVIDER_VERSION>,
-    {
-        self.with_connection(|conn| {
-            mls_storage::write_group_data(
-                conn,
-                group_id,
-                GroupDataType::GroupEpochSecrets,
-                group_epoch_secrets,
-            )
-        })
-    }
+    write_group_data_method!(write_tree, GroupId, TreeSync, Tree);
+    write_group_data_method!(
+        write_interim_transcript_hash,
+        GroupId,
+        InterimTranscriptHash,
+        InterimTranscriptHash
+    );
+    write_group_data_method!(write_context, GroupId, GroupContext, Context);
+    write_group_data_method!(
+        write_confirmation_tag,
+        GroupId,
+        ConfirmationTag,
+        ConfirmationTag
+    );
+    write_group_data_method!(swapped write_group_state, GroupState, GroupId, GroupState);
+    write_group_data_method!(
+        write_message_secrets,
+        GroupId,
+        MessageSecrets,
+        MessageSecrets
+    );
+    write_group_data_method!(
+        write_resumption_psk_store,
+        GroupId,
+        ResumptionPskStore,
+        ResumptionPskStore
+    );
+    write_group_data_method!(write_own_leaf_index, GroupId, LeafNodeIndex, OwnLeafIndex);
+    write_group_data_method!(
+        write_group_epoch_secrets,
+        GroupId,
+        GroupEpochSecrets,
+        GroupEpochSecrets
+    );
 
     fn write_signature_key_pair<SignaturePublicKey, SignatureKeyPair>(
         &self,
@@ -1528,18 +1435,12 @@ impl StorageProvider<STORAGE_PROVIDER_VERSION> for MdkSqliteStorage {
     // Read Methods
     // ========================================================================
 
-    fn mls_group_join_config<GroupId, MlsGroupJoinConfig>(
-        &self,
-        group_id: &GroupId,
-    ) -> Result<Option<MlsGroupJoinConfig>, Self::Error>
-    where
-        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
-        MlsGroupJoinConfig: traits::MlsGroupJoinConfig<STORAGE_PROVIDER_VERSION>,
-    {
-        self.with_connection(|conn| {
-            mls_storage::read_group_data(conn, group_id, GroupDataType::JoinGroupConfig)
-        })
-    }
+    read_group_data_method!(
+        mls_group_join_config,
+        GroupId,
+        MlsGroupJoinConfig,
+        JoinGroupConfig
+    );
 
     fn own_leaf_nodes<GroupId, LeafNode>(
         &self,
@@ -1575,119 +1476,30 @@ impl StorageProvider<STORAGE_PROVIDER_VERSION> for MdkSqliteStorage {
         self.with_connection(|conn| mls_storage::read_queued_proposals(conn, group_id))
     }
 
-    fn tree<GroupId, TreeSync>(&self, group_id: &GroupId) -> Result<Option<TreeSync>, Self::Error>
-    where
-        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
-        TreeSync: traits::TreeSync<STORAGE_PROVIDER_VERSION>,
-    {
-        self.with_connection(|conn| {
-            mls_storage::read_group_data(conn, group_id, GroupDataType::Tree)
-        })
-    }
-
-    fn group_context<GroupId, GroupContext>(
-        &self,
-        group_id: &GroupId,
-    ) -> Result<Option<GroupContext>, Self::Error>
-    where
-        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
-        GroupContext: traits::GroupContext<STORAGE_PROVIDER_VERSION>,
-    {
-        self.with_connection(|conn| {
-            mls_storage::read_group_data(conn, group_id, GroupDataType::Context)
-        })
-    }
-
-    fn interim_transcript_hash<GroupId, InterimTranscriptHash>(
-        &self,
-        group_id: &GroupId,
-    ) -> Result<Option<InterimTranscriptHash>, Self::Error>
-    where
-        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
-        InterimTranscriptHash: traits::InterimTranscriptHash<STORAGE_PROVIDER_VERSION>,
-    {
-        self.with_connection(|conn| {
-            mls_storage::read_group_data(conn, group_id, GroupDataType::InterimTranscriptHash)
-        })
-    }
-
-    fn confirmation_tag<GroupId, ConfirmationTag>(
-        &self,
-        group_id: &GroupId,
-    ) -> Result<Option<ConfirmationTag>, Self::Error>
-    where
-        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
-        ConfirmationTag: traits::ConfirmationTag<STORAGE_PROVIDER_VERSION>,
-    {
-        self.with_connection(|conn| {
-            mls_storage::read_group_data(conn, group_id, GroupDataType::ConfirmationTag)
-        })
-    }
-
-    fn group_state<GroupState, GroupId>(
-        &self,
-        group_id: &GroupId,
-    ) -> Result<Option<GroupState>, Self::Error>
-    where
-        GroupState: traits::GroupState<STORAGE_PROVIDER_VERSION>,
-        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
-    {
-        self.with_connection(|conn| {
-            mls_storage::read_group_data(conn, group_id, GroupDataType::GroupState)
-        })
-    }
-
-    fn message_secrets<GroupId, MessageSecrets>(
-        &self,
-        group_id: &GroupId,
-    ) -> Result<Option<MessageSecrets>, Self::Error>
-    where
-        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
-        MessageSecrets: traits::MessageSecrets<STORAGE_PROVIDER_VERSION>,
-    {
-        self.with_connection(|conn| {
-            mls_storage::read_group_data(conn, group_id, GroupDataType::MessageSecrets)
-        })
-    }
-
-    fn resumption_psk_store<GroupId, ResumptionPskStore>(
-        &self,
-        group_id: &GroupId,
-    ) -> Result<Option<ResumptionPskStore>, Self::Error>
-    where
-        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
-        ResumptionPskStore: traits::ResumptionPskStore<STORAGE_PROVIDER_VERSION>,
-    {
-        self.with_connection(|conn| {
-            mls_storage::read_group_data(conn, group_id, GroupDataType::ResumptionPskStore)
-        })
-    }
-
-    fn own_leaf_index<GroupId, LeafNodeIndex>(
-        &self,
-        group_id: &GroupId,
-    ) -> Result<Option<LeafNodeIndex>, Self::Error>
-    where
-        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
-        LeafNodeIndex: traits::LeafNodeIndex<STORAGE_PROVIDER_VERSION>,
-    {
-        self.with_connection(|conn| {
-            mls_storage::read_group_data(conn, group_id, GroupDataType::OwnLeafIndex)
-        })
-    }
-
-    fn group_epoch_secrets<GroupId, GroupEpochSecrets>(
-        &self,
-        group_id: &GroupId,
-    ) -> Result<Option<GroupEpochSecrets>, Self::Error>
-    where
-        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
-        GroupEpochSecrets: traits::GroupEpochSecrets<STORAGE_PROVIDER_VERSION>,
-    {
-        self.with_connection(|conn| {
-            mls_storage::read_group_data(conn, group_id, GroupDataType::GroupEpochSecrets)
-        })
-    }
+    read_group_data_method!(tree, GroupId, TreeSync, Tree);
+    read_group_data_method!(group_context, GroupId, GroupContext, Context);
+    read_group_data_method!(
+        interim_transcript_hash,
+        GroupId,
+        InterimTranscriptHash,
+        InterimTranscriptHash
+    );
+    read_group_data_method!(confirmation_tag, GroupId, ConfirmationTag, ConfirmationTag);
+    read_group_data_method!(swapped group_state, GroupState, GroupId, GroupState);
+    read_group_data_method!(message_secrets, GroupId, MessageSecrets, MessageSecrets);
+    read_group_data_method!(
+        resumption_psk_store,
+        GroupId,
+        ResumptionPskStore,
+        ResumptionPskStore
+    );
+    read_group_data_method!(own_leaf_index, GroupId, LeafNodeIndex, OwnLeafIndex);
+    read_group_data_method!(
+        group_epoch_secrets,
+        GroupId,
+        GroupEpochSecrets,
+        GroupEpochSecrets
+    );
 
     fn signature_key_pair<SignaturePublicKey, SignatureKeyPair>(
         &self,
@@ -1769,98 +1581,16 @@ impl StorageProvider<STORAGE_PROVIDER_VERSION> for MdkSqliteStorage {
         self.with_connection(|conn| mls_storage::delete_own_leaf_nodes(conn, group_id))
     }
 
-    fn delete_group_config<GroupId>(&self, group_id: &GroupId) -> Result<(), Self::Error>
-    where
-        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
-    {
-        self.with_connection(|conn| {
-            mls_storage::delete_group_data(conn, group_id, GroupDataType::JoinGroupConfig)
-        })
-    }
-
-    fn delete_tree<GroupId>(&self, group_id: &GroupId) -> Result<(), Self::Error>
-    where
-        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
-    {
-        self.with_connection(|conn| {
-            mls_storage::delete_group_data(conn, group_id, GroupDataType::Tree)
-        })
-    }
-
-    fn delete_confirmation_tag<GroupId>(&self, group_id: &GroupId) -> Result<(), Self::Error>
-    where
-        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
-    {
-        self.with_connection(|conn| {
-            mls_storage::delete_group_data(conn, group_id, GroupDataType::ConfirmationTag)
-        })
-    }
-
-    fn delete_group_state<GroupId>(&self, group_id: &GroupId) -> Result<(), Self::Error>
-    where
-        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
-    {
-        self.with_connection(|conn| {
-            mls_storage::delete_group_data(conn, group_id, GroupDataType::GroupState)
-        })
-    }
-
-    fn delete_context<GroupId>(&self, group_id: &GroupId) -> Result<(), Self::Error>
-    where
-        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
-    {
-        self.with_connection(|conn| {
-            mls_storage::delete_group_data(conn, group_id, GroupDataType::Context)
-        })
-    }
-
-    fn delete_interim_transcript_hash<GroupId>(&self, group_id: &GroupId) -> Result<(), Self::Error>
-    where
-        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
-    {
-        self.with_connection(|conn| {
-            mls_storage::delete_group_data(conn, group_id, GroupDataType::InterimTranscriptHash)
-        })
-    }
-
-    fn delete_message_secrets<GroupId>(&self, group_id: &GroupId) -> Result<(), Self::Error>
-    where
-        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
-    {
-        self.with_connection(|conn| {
-            mls_storage::delete_group_data(conn, group_id, GroupDataType::MessageSecrets)
-        })
-    }
-
-    fn delete_all_resumption_psk_secrets<GroupId>(
-        &self,
-        group_id: &GroupId,
-    ) -> Result<(), Self::Error>
-    where
-        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
-    {
-        self.with_connection(|conn| {
-            mls_storage::delete_group_data(conn, group_id, GroupDataType::ResumptionPskStore)
-        })
-    }
-
-    fn delete_own_leaf_index<GroupId>(&self, group_id: &GroupId) -> Result<(), Self::Error>
-    where
-        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
-    {
-        self.with_connection(|conn| {
-            mls_storage::delete_group_data(conn, group_id, GroupDataType::OwnLeafIndex)
-        })
-    }
-
-    fn delete_group_epoch_secrets<GroupId>(&self, group_id: &GroupId) -> Result<(), Self::Error>
-    where
-        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
-    {
-        self.with_connection(|conn| {
-            mls_storage::delete_group_data(conn, group_id, GroupDataType::GroupEpochSecrets)
-        })
-    }
+    delete_group_data_method!(delete_group_config, JoinGroupConfig);
+    delete_group_data_method!(delete_tree, Tree);
+    delete_group_data_method!(delete_confirmation_tag, ConfirmationTag);
+    delete_group_data_method!(delete_group_state, GroupState);
+    delete_group_data_method!(delete_context, Context);
+    delete_group_data_method!(delete_interim_transcript_hash, InterimTranscriptHash);
+    delete_group_data_method!(delete_message_secrets, MessageSecrets);
+    delete_group_data_method!(delete_all_resumption_psk_secrets, ResumptionPskStore);
+    delete_group_data_method!(delete_own_leaf_index, OwnLeafIndex);
+    delete_group_data_method!(delete_group_epoch_secrets, GroupEpochSecrets);
 
     fn clear_proposal_queue<GroupId, ProposalRef>(
         &self,

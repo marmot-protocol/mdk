@@ -12,13 +12,7 @@ use crate::validation::{
 };
 use crate::{MdkSqliteStorage, db};
 
-#[inline]
-fn into_message_err<T>(e: T) -> MessageError
-where
-    T: std::error::Error,
-{
-    MessageError::DatabaseError(e.to_string())
-}
+db_error_fn!(into_message_err, MessageError);
 
 impl MessageStorage for MdkSqliteStorage {
     fn save_message(&self, message: Message) -> Result<(), MessageError> {

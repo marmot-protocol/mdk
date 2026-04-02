@@ -2,43 +2,79 @@
 
 use std::collections::BTreeSet;
 
+/// Implements `get_group_*_exporter_secret` for the memory backend.
+///
+/// Both the read lock acquisition and the `groups_cache` existence check are
+/// identical across all three label variants; only the cache field name differs.
+macro_rules! group_exporter_secret_get {
+    ($self:ident, $mls_group_id:ident, $epoch:ident, $label:literal, $cache:ident) => {{
+        let inner = $self.inner.read();
+        if inner.groups_cache.peek($mls_group_id).is_none() {
+            return Err(group_not_found());
+        }
+        Ok(inner.$cache.peek(&($mls_group_id.clone(), $epoch)).cloned())
+    }};
+}
+
+/// Implements `save_group_*_exporter_secret` for the memory backend.
+///
+/// The write lock, existence guard, and key construction are identical across
+/// all three label variants; only the cache field name differs.
+macro_rules! group_exporter_secret_save {
+    ($self:ident, $secret:ident, $label:literal, $cache:ident) => {{
+        let mut inner = $self.inner.write();
+        if inner.groups_cache.peek(&$secret.mls_group_id).is_none() {
+            return Err(group_not_found());
+        }
+        let key = ($secret.mls_group_id.clone(), $secret.epoch);
+        inner.$cache.put(key, $secret);
+        Ok(())
+    }};
+}
+
 use mdk_storage_traits::GroupId;
 use mdk_storage_traits::groups::error::GroupError;
 use mdk_storage_traits::groups::types::*;
-use mdk_storage_traits::groups::{GroupStorage, MAX_MESSAGE_LIMIT, MessageSortOrder, Pagination};
+use mdk_storage_traits::groups::validation::{validate_group_fields, validate_relay_set};
+use mdk_storage_traits::groups::{
+    GroupStorage, MessageSortOrder, Pagination, group_not_found, validate_message_limit,
+};
 use mdk_storage_traits::messages::types::Message;
 use nostr::{PublicKey, RelayUrl};
 
 use crate::MdkMemoryStorage;
 
+#[inline]
+fn sort_messages(messages: &mut [Message], sort_order: MessageSortOrder) {
+    match sort_order {
+        MessageSortOrder::CreatedAtFirst => {
+            messages.sort_by(|a, b| b.display_order_cmp(a));
+        }
+        MessageSortOrder::ProcessedAtFirst => {
+            messages.sort_by(|a, b| b.processed_at_order_cmp(a));
+        }
+    }
+}
+
+#[inline]
+fn newest_message<'a>(
+    messages: impl Iterator<Item = &'a Message>,
+    sort_order: MessageSortOrder,
+) -> Option<&'a Message> {
+    match sort_order {
+        MessageSortOrder::CreatedAtFirst => messages.max_by(|a, b| a.display_order_cmp(b)),
+        MessageSortOrder::ProcessedAtFirst => messages.max_by(|a, b| a.processed_at_order_cmp(b)),
+    }
+}
+
 impl GroupStorage for MdkMemoryStorage {
     fn save_group(&self, group: Group) -> Result<(), GroupError> {
-        // Validate group name length
-        if group.name.len() > self.limits.max_group_name_length {
-            return Err(GroupError::InvalidParameters(format!(
-                "Group name exceeds maximum length of {} bytes (got {} bytes)",
-                self.limits.max_group_name_length,
-                group.name.len()
-            )));
-        }
-
-        // Validate group description length
-        if group.description.len() > self.limits.max_group_description_length {
-            return Err(GroupError::InvalidParameters(format!(
-                "Group description exceeds maximum length of {} bytes (got {} bytes)",
-                self.limits.max_group_description_length,
-                group.description.len()
-            )));
-        }
-
-        // Validate admin pubkeys count
-        if group.admin_pubkeys.len() > self.limits.max_admins_per_group {
-            return Err(GroupError::InvalidParameters(format!(
-                "Group admin count exceeds maximum of {} (got {})",
-                self.limits.max_admins_per_group,
-                group.admin_pubkeys.len()
-            )));
-        }
+        validate_group_fields(
+            &group,
+            self.limits.max_group_name_length,
+            self.limits.max_group_description_length,
+            self.limits.max_admins_per_group,
+        )?;
 
         // Acquire lock on inner storage
         let mut guard = self.inner.write();
@@ -101,19 +137,13 @@ impl GroupStorage for MdkMemoryStorage {
         let limit = pagination.limit();
         let offset = pagination.offset();
 
-        // Validate limit is within allowed range
-        if !(1..=MAX_MESSAGE_LIMIT).contains(&limit) {
-            return Err(GroupError::InvalidParameters(format!(
-                "Limit must be between 1 and {}, got {}",
-                MAX_MESSAGE_LIMIT, limit
-            )));
-        }
+        validate_message_limit(limit)?;
 
         let inner = self.inner.read();
 
         // Check if the group exists while holding the lock
         if inner.groups_cache.peek(mls_group_id).is_none() {
-            return Err(GroupError::InvalidParameters("Group not found".to_string()));
+            return Err(group_not_found());
         }
 
         let sort_order = pagination.sort_order();
@@ -124,15 +154,7 @@ impl GroupStorage for MdkMemoryStorage {
                 let mut messages: Vec<Message> = messages_map.values().cloned().collect();
 
                 // Sort newest-first using the requested sort order.
-                // Both comparators are called with (b, a) to get DESC ordering.
-                match sort_order {
-                    MessageSortOrder::CreatedAtFirst => {
-                        messages.sort_by(|a, b| b.display_order_cmp(a));
-                    }
-                    MessageSortOrder::ProcessedAtFirst => {
-                        messages.sort_by(|a, b| b.processed_at_order_cmp(a));
-                    }
-                }
+                sort_messages(&mut messages, sort_order);
 
                 // Apply pagination
                 let start = offset.min(messages.len());
@@ -153,21 +175,12 @@ impl GroupStorage for MdkMemoryStorage {
         let inner = self.inner.read();
 
         if inner.groups_cache.peek(mls_group_id).is_none() {
-            return Err(GroupError::InvalidParameters("Group not found".to_string()));
+            return Err(group_not_found());
         }
 
         match inner.messages_by_group_cache.peek(mls_group_id) {
             Some(messages_map) if !messages_map.is_empty() => {
-                // Find the maximum element under the requested ordering.
-                // Both comparators compare (b, a) to find the DESC-first element via max_by.
-                let winner = match sort_order {
-                    MessageSortOrder::CreatedAtFirst => {
-                        messages_map.values().max_by(|a, b| a.display_order_cmp(b))
-                    }
-                    MessageSortOrder::ProcessedAtFirst => messages_map
-                        .values()
-                        .max_by(|a, b| a.processed_at_order_cmp(b)),
-                };
+                let winner = newest_message(messages_map.values(), sort_order);
                 Ok(winner.cloned())
             }
             _ => Ok(None),
@@ -177,7 +190,7 @@ impl GroupStorage for MdkMemoryStorage {
     fn admins(&self, mls_group_id: &GroupId) -> Result<BTreeSet<PublicKey>, GroupError> {
         match self.find_group_by_mls_group_id(mls_group_id)? {
             Some(group) => Ok(group.admin_pubkeys.clone()),
-            None => Err(GroupError::InvalidParameters("Group not found".to_string())),
+            None => Err(group_not_found()),
         }
     }
 
@@ -186,7 +199,7 @@ impl GroupStorage for MdkMemoryStorage {
 
         // Check if the group exists while holding the lock
         if inner.groups_cache.peek(mls_group_id).is_none() {
-            return Err(GroupError::InvalidParameters("Group not found".to_string()));
+            return Err(group_not_found());
         }
 
         match inner.group_relays_cache.peek(mls_group_id).cloned() {
@@ -201,30 +214,17 @@ impl GroupStorage for MdkMemoryStorage {
         group_id: &GroupId,
         relays: BTreeSet<RelayUrl>,
     ) -> Result<(), GroupError> {
-        // Validate relay count to prevent memory exhaustion
-        if relays.len() > self.limits.max_relays_per_group {
-            return Err(GroupError::InvalidParameters(format!(
-                "Relay count exceeds maximum of {} (got {})",
-                self.limits.max_relays_per_group,
-                relays.len()
-            )));
-        }
-
-        // Validate individual relay URL lengths
-        for relay in &relays {
-            if relay.as_str().len() > self.limits.max_relay_url_length {
-                return Err(GroupError::InvalidParameters(format!(
-                    "Relay URL exceeds maximum length of {} bytes",
-                    self.limits.max_relay_url_length
-                )));
-            }
-        }
+        validate_relay_set(
+            &relays,
+            self.limits.max_relays_per_group,
+            self.limits.max_relay_url_length,
+        )?;
 
         let mut inner = self.inner.write();
 
         // Check if the group exists while holding the lock
         if inner.groups_cache.peek(group_id).is_none() {
-            return Err(GroupError::InvalidParameters("Group not found".to_string()));
+            return Err(group_not_found());
         }
 
         // Convert RelayUrl set to GroupRelay set
@@ -242,137 +242,10 @@ impl GroupStorage for MdkMemoryStorage {
         Ok(())
     }
 
-    fn get_group_exporter_secret(
-        &self,
-        mls_group_id: &GroupId,
-        epoch: u64,
-    ) -> Result<Option<GroupExporterSecret>, GroupError> {
-        let inner = self.inner.read();
-
-        // Check if the group exists while holding the lock
-        if inner.groups_cache.peek(mls_group_id).is_none() {
-            return Err(GroupError::InvalidParameters("Group not found".to_string()));
-        }
-
-        // Use tuple (GroupId, epoch) as key
-        Ok(inner
-            .group_exporter_secrets_cache
-            .peek(&(mls_group_id.clone(), epoch))
-            .cloned())
-    }
-
-    fn save_group_exporter_secret(
-        &self,
-        group_exporter_secret: GroupExporterSecret,
-    ) -> Result<(), GroupError> {
-        let mut inner = self.inner.write();
-
-        // Check if the group exists while holding the lock
-        if inner
-            .groups_cache
-            .peek(&group_exporter_secret.mls_group_id)
-            .is_none()
-        {
-            return Err(GroupError::InvalidParameters("Group not found".to_string()));
-        }
-
-        // Use tuple (GroupId, epoch) as key
-        let key = (
-            group_exporter_secret.mls_group_id.clone(),
-            group_exporter_secret.epoch,
-        );
-        inner
-            .group_exporter_secrets_cache
-            .put(key, group_exporter_secret);
-
-        Ok(())
-    }
-
-    fn get_group_legacy_exporter_secret(
-        &self,
-        mls_group_id: &GroupId,
-        epoch: u64,
-    ) -> Result<Option<GroupExporterSecret>, GroupError> {
-        let inner = self.inner.read();
-
-        if inner.groups_cache.peek(mls_group_id).is_none() {
-            return Err(GroupError::InvalidParameters("Group not found".to_string()));
-        }
-
-        Ok(inner
-            .group_legacy_exporter_secrets_cache
-            .peek(&(mls_group_id.clone(), epoch))
-            .cloned())
-    }
-
-    fn save_group_legacy_exporter_secret(
-        &self,
-        group_exporter_secret: GroupExporterSecret,
-    ) -> Result<(), GroupError> {
-        let mut inner = self.inner.write();
-
-        if inner
-            .groups_cache
-            .peek(&group_exporter_secret.mls_group_id)
-            .is_none()
-        {
-            return Err(GroupError::InvalidParameters("Group not found".to_string()));
-        }
-
-        let key = (
-            group_exporter_secret.mls_group_id.clone(),
-            group_exporter_secret.epoch,
-        );
-        inner
-            .group_legacy_exporter_secrets_cache
-            .put(key, group_exporter_secret);
-
-        Ok(())
-    }
-
-    fn get_group_mip04_exporter_secret(
-        &self,
-        mls_group_id: &GroupId,
-        epoch: u64,
-    ) -> Result<Option<GroupExporterSecret>, GroupError> {
-        let inner = self.inner.read();
-
-        // Check if the group exists while holding the lock
-        if inner.groups_cache.peek(mls_group_id).is_none() {
-            return Err(GroupError::InvalidParameters("Group not found".to_string()));
-        }
-
-        Ok(inner
-            .group_mip04_exporter_secrets_cache
-            .peek(&(mls_group_id.clone(), epoch))
-            .cloned())
-    }
-
-    fn save_group_mip04_exporter_secret(
-        &self,
-        group_exporter_secret: GroupExporterSecret,
-    ) -> Result<(), GroupError> {
-        let mut inner = self.inner.write();
-
-        // Check if the group exists while holding the lock
-        if inner
-            .groups_cache
-            .peek(&group_exporter_secret.mls_group_id)
-            .is_none()
-        {
-            return Err(GroupError::InvalidParameters("Group not found".to_string()));
-        }
-
-        let key = (
-            group_exporter_secret.mls_group_id.clone(),
-            group_exporter_secret.epoch,
-        );
-        inner
-            .group_mip04_exporter_secrets_cache
-            .put(key, group_exporter_secret);
-
-        Ok(())
-    }
+    mdk_storage_traits::impl_exporter_secret_methods!(
+        group_exporter_secret_get,
+        group_exporter_secret_save
+    );
 
     fn prune_group_exporter_secrets_before_epoch(
         &self,
@@ -382,7 +255,7 @@ impl GroupStorage for MdkMemoryStorage {
         let mut inner = self.inner.write();
 
         if inner.groups_cache.peek(group_id).is_none() {
-            return Err(GroupError::InvalidParameters("Group not found".to_string()));
+            return Err(group_not_found());
         }
 
         let group_event_keys: Vec<(GroupId, u64)> = inner

@@ -1,7 +1,6 @@
 //! Types for the groups module
 
 use std::collections::BTreeSet;
-use std::fmt;
 use std::str::FromStr;
 
 use crate::messages::types::Message;
@@ -56,66 +55,15 @@ impl<'de> Deserialize<'de> for SelfUpdateState {
     }
 }
 
-/// The state of the group, this matches the MLS group state
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum GroupState {
-    /// The group is active
-    Active,
-    /// The group is inactive, this is used for groups that users have left or for welcome messages that have been declined
-    Inactive,
-    /// The group is pending, this is used for groups that users are invited to but haven't joined yet
-    Pending,
-}
-
-impl fmt::Display for GroupState {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.as_str())
-    }
-}
-
-impl GroupState {
-    /// Get as `&str`
-    pub fn as_str(&self) -> &str {
-        match self {
-            Self::Active => "active",
-            Self::Inactive => "inactive",
-            Self::Pending => "pending",
-        }
-    }
-}
-
-impl FromStr for GroupState {
-    type Err = GroupError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "active" => Ok(Self::Active),
-            "inactive" => Ok(Self::Inactive),
-            "pending" => Ok(Self::Pending),
-            _ => Err(GroupError::InvalidParameters(format!(
-                "Invalid group state: {}",
-                s
-            ))),
-        }
-    }
-}
-
-impl Serialize for GroupState {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(self.as_str())
-    }
-}
-
-impl<'de> Deserialize<'de> for GroupState {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let s: String = String::deserialize(deserializer)?;
-        Self::from_str(&s).map_err(serde::de::Error::custom)
+string_enum! {
+    /// The state of the group, this matches the MLS group state
+    pub enum GroupState => GroupError, "Invalid group state: {}" {
+        /// The group is active
+        Active => "active",
+        /// The group is inactive, this is used for groups that users have left or for welcome messages that have been declined
+        Inactive => "inactive",
+        /// The group is pending, this is used for groups that users are invited to but haven't joined yet
+        Pending => "pending",
     }
 }
 
@@ -376,49 +324,6 @@ mod tests {
             "Message B should win: higher processed_at"
         );
         assert_eq!(group.last_message_id, Some(msg_b.id));
-    }
-
-    #[test]
-    fn test_group_state_from_str() {
-        assert_eq!(GroupState::from_str("active").unwrap(), GroupState::Active);
-        assert_eq!(
-            GroupState::from_str("inactive").unwrap(),
-            GroupState::Inactive
-        );
-
-        let err = GroupState::from_str("invalid").unwrap_err();
-        match err {
-            GroupError::InvalidParameters(msg) => {
-                assert!(msg.contains("Invalid group state: invalid"));
-            }
-            _ => panic!("Expected InvalidParameters error"),
-        }
-    }
-
-    #[test]
-    fn test_group_state_to_string() {
-        assert_eq!(GroupState::Active.to_string(), "active");
-        assert_eq!(GroupState::Inactive.to_string(), "inactive");
-    }
-
-    #[test]
-    fn test_group_state_serialization() {
-        let active = GroupState::Active;
-        let serialized = serde_json::to_string(&active).unwrap();
-        assert_eq!(serialized, r#""active""#);
-
-        let inactive = GroupState::Inactive;
-        let serialized = serde_json::to_string(&inactive).unwrap();
-        assert_eq!(serialized, r#""inactive""#);
-    }
-
-    #[test]
-    fn test_group_state_deserialization() {
-        let active: GroupState = serde_json::from_str(r#""active""#).unwrap();
-        assert_eq!(active, GroupState::Active);
-
-        let inactive: GroupState = serde_json::from_str(r#""inactive""#).unwrap();
-        assert_eq!(inactive, GroupState::Inactive);
     }
 
     #[test]

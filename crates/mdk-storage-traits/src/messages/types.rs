@@ -1,7 +1,6 @@
 //! Types for the messages module
 
 use std::cmp::Ordering;
-use std::fmt;
 use std::str::FromStr;
 
 use crate::GroupId;
@@ -9,7 +8,7 @@ use crate::GroupId;
 use crate::groups::types::Group;
 use nostr::event::Kind;
 use nostr::{EventId, PublicKey, Tags, Timestamp, UnsignedEvent};
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Serialize};
 
 use super::error::MessageError;
 
@@ -155,149 +154,39 @@ impl Message {
     }
 }
 
-/// The state of the message
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum MessageState {
-    /// The message was created successfully and stored but we don't yet know if it was published to relays.
-    Created,
-    /// The message was successfully processed and stored in the database
-    Processed,
-    /// The message was deleted by the original sender - via a delete event
-    Deleted,
-    /// The epoch was rolled back, content may be invalid and needs reprocessing
-    EpochInvalidated,
-}
-
-impl fmt::Display for MessageState {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.as_str())
+string_enum! {
+    /// The state of the message
+    pub enum MessageState => MessageError, "Invalid message state: {}" {
+        /// The message was created successfully and stored but we don't yet know if it was published to relays.
+        Created => "created",
+        /// The message was successfully processed and stored in the database
+        Processed => "processed",
+        /// The message was deleted by the original sender - via a delete event
+        Deleted => "deleted",
+        /// The epoch was rolled back, content may be invalid and needs reprocessing
+        EpochInvalidated => "epoch_invalidated",
     }
 }
 
-impl MessageState {
-    /// Get as `&str`
-    pub fn as_str(&self) -> &str {
-        match self {
-            Self::Created => "created",
-            Self::Processed => "processed",
-            Self::Deleted => "deleted",
-            Self::EpochInvalidated => "epoch_invalidated",
-        }
-    }
-}
-
-impl FromStr for MessageState {
-    type Err = MessageError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "created" => Ok(Self::Created),
-            "processed" => Ok(Self::Processed),
-            "deleted" => Ok(Self::Deleted),
-            "epoch_invalidated" => Ok(Self::EpochInvalidated),
-            _ => Err(MessageError::InvalidParameters(format!(
-                "Invalid message state: {}",
-                s
-            ))),
-        }
-    }
-}
-
-impl Serialize for MessageState {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(self.as_str())
-    }
-}
-
-impl<'de> Deserialize<'de> for MessageState {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let s: String = String::deserialize(deserializer)?;
-        Self::from_str(&s).map_err(serde::de::Error::custom)
-    }
-}
-
-/// The Processing State of the message,
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum ProcessedMessageState {
-    /// The processed message (and message) was created successfully and stored but we don't yet know if it was published to relays.
-    /// This state only happens when you are sending a message. Since we can't decrypt messages from ourselves in MLS groups,
-    /// once we see this message we mark it as processed but skip the rest of the processing.
-    Created,
-    /// The message was successfully processed and stored in the database
-    Processed,
-    /// The message was a commit message and we have already processed it. We can't decrypt messages from ourselves in MLS groups so we need to skip this processing.
-    ProcessedCommit,
-    /// The message failed to be processed and stored in the database
-    Failed,
-    /// The epoch was rolled back, message needs reprocessing
-    EpochInvalidated,
-    /// The message previously failed but is now eligible for retry after a rollback.
-    /// This state is set by the rollback flow when group state has been corrected,
-    /// allowing messages that failed due to stale epoch keys to be reprocessed.
-    Retryable,
-}
-
-impl fmt::Display for ProcessedMessageState {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.as_str())
-    }
-}
-
-impl ProcessedMessageState {
-    /// Get as `&str`
-    pub fn as_str(&self) -> &str {
-        match self {
-            Self::Created => "created",
-            Self::Processed => "processed",
-            Self::ProcessedCommit => "processed_commit",
-            Self::Failed => "failed",
-            Self::EpochInvalidated => "epoch_invalidated",
-            Self::Retryable => "retryable",
-        }
-    }
-}
-
-impl FromStr for ProcessedMessageState {
-    type Err = MessageError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "created" => Ok(Self::Created),
-            "processed" => Ok(Self::Processed),
-            "processed_commit" => Ok(Self::ProcessedCommit),
-            "failed" => Ok(Self::Failed),
-            "epoch_invalidated" => Ok(Self::EpochInvalidated),
-            "retryable" => Ok(Self::Retryable),
-            _ => Err(MessageError::InvalidParameters(format!(
-                "Invalid processed message state: {}",
-                s
-            ))),
-        }
-    }
-}
-
-impl Serialize for ProcessedMessageState {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(self.as_str())
-    }
-}
-
-impl<'de> Deserialize<'de> for ProcessedMessageState {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let s: String = String::deserialize(deserializer)?;
-        Self::from_str(&s).map_err(serde::de::Error::custom)
+string_enum! {
+    /// The Processing State of the message,
+    pub enum ProcessedMessageState => MessageError, "Invalid processed message state: {}" {
+        /// The processed message (and message) was created successfully and stored but we don't yet know if it was published to relays.
+        /// This state only happens when you are sending a message. Since we can't decrypt messages from ourselves in MLS groups,
+        /// once we see this message we mark it as processed but skip the rest of the processing.
+        Created => "created",
+        /// The message was successfully processed and stored in the database
+        Processed => "processed",
+        /// The message was a commit message and we have already processed it. We can't decrypt messages from ourselves in MLS groups so we need to skip this processing.
+        ProcessedCommit => "processed_commit",
+        /// The message failed to be processed and stored in the database
+        Failed => "failed",
+        /// The epoch was rolled back, message needs reprocessing
+        EpochInvalidated => "epoch_invalidated",
+        /// The message previously failed but is now eligible for retry after a rollback.
+        /// This state is set by the rollback flow when group state has been corrected,
+        /// allowing messages that failed due to stale epoch keys to be reprocessed.
+        Retryable => "retryable",
     }
 }
 
@@ -492,84 +381,6 @@ mod tests {
     }
 
     #[test]
-    fn test_message_state_from_str() {
-        assert_eq!(
-            MessageState::from_str("created").unwrap(),
-            MessageState::Created
-        );
-        assert_eq!(
-            MessageState::from_str("processed").unwrap(),
-            MessageState::Processed
-        );
-        assert_eq!(
-            MessageState::from_str("deleted").unwrap(),
-            MessageState::Deleted
-        );
-        assert_eq!(
-            MessageState::from_str("epoch_invalidated").unwrap(),
-            MessageState::EpochInvalidated
-        );
-
-        let err = MessageState::from_str("invalid").unwrap_err();
-        match err {
-            MessageError::InvalidParameters(msg) => {
-                assert!(msg.contains("Invalid message state: invalid"));
-            }
-            _ => panic!("Expected InvalidParameters error"),
-        }
-    }
-
-    #[test]
-    fn test_message_state_to_string() {
-        assert_eq!(MessageState::Created.to_string(), "created");
-        assert_eq!(MessageState::Processed.to_string(), "processed");
-        assert_eq!(MessageState::Deleted.to_string(), "deleted");
-        assert_eq!(
-            MessageState::EpochInvalidated.to_string(),
-            "epoch_invalidated"
-        );
-    }
-
-    #[test]
-    fn test_message_state_serialization() {
-        let created = MessageState::Created;
-        let serialized = serde_json::to_string(&created).unwrap();
-        assert_eq!(serialized, r#""created""#);
-
-        let processed = MessageState::Processed;
-        let serialized = serde_json::to_string(&processed).unwrap();
-        assert_eq!(serialized, r#""processed""#);
-
-        let deleted = MessageState::Deleted;
-        let serialized = serde_json::to_string(&deleted).unwrap();
-        assert_eq!(serialized, r#""deleted""#);
-
-        let epoch_invalidated = MessageState::EpochInvalidated;
-        let serialized = serde_json::to_string(&epoch_invalidated).unwrap();
-        assert_eq!(serialized, r#""epoch_invalidated""#);
-    }
-
-    #[test]
-    fn test_message_state_deserialization() {
-        let created: MessageState = serde_json::from_str(r#""created""#).unwrap();
-        assert_eq!(created, MessageState::Created);
-
-        let processed: MessageState = serde_json::from_str(r#""processed""#).unwrap();
-        assert_eq!(processed, MessageState::Processed);
-
-        let deleted: MessageState = serde_json::from_str(r#""deleted""#).unwrap();
-        assert_eq!(deleted, MessageState::Deleted);
-
-        let epoch_invalidated: MessageState =
-            serde_json::from_str(r#""epoch_invalidated""#).unwrap();
-        assert_eq!(epoch_invalidated, MessageState::EpochInvalidated);
-
-        // Test invalid state
-        let result = serde_json::from_str::<MessageState>(r#""invalid""#);
-        assert!(result.is_err());
-    }
-
-    #[test]
     fn test_message_serialization() {
         // Create a message to test serialization
         let pubkey =
@@ -601,112 +412,6 @@ mod tests {
         assert_eq!(serialized["state"], json!("created"));
         assert_eq!(serialized["content"], json!("Test message"));
         assert_eq!(serialized["epoch"], json!(5));
-    }
-
-    #[test]
-    fn test_processed_message_state_from_str() {
-        assert_eq!(
-            ProcessedMessageState::from_str("created").unwrap(),
-            ProcessedMessageState::Created
-        );
-        assert_eq!(
-            ProcessedMessageState::from_str("processed").unwrap(),
-            ProcessedMessageState::Processed
-        );
-        assert_eq!(
-            ProcessedMessageState::from_str("processed_commit").unwrap(),
-            ProcessedMessageState::ProcessedCommit
-        );
-        assert_eq!(
-            ProcessedMessageState::from_str("failed").unwrap(),
-            ProcessedMessageState::Failed
-        );
-        assert_eq!(
-            ProcessedMessageState::from_str("epoch_invalidated").unwrap(),
-            ProcessedMessageState::EpochInvalidated
-        );
-        assert_eq!(
-            ProcessedMessageState::from_str("retryable").unwrap(),
-            ProcessedMessageState::Retryable
-        );
-
-        let err = ProcessedMessageState::from_str("invalid").unwrap_err();
-        match err {
-            MessageError::InvalidParameters(msg) => {
-                assert!(msg.contains("Invalid processed message state: invalid"));
-            }
-            _ => panic!("Expected InvalidParameters error"),
-        }
-    }
-
-    #[test]
-    fn test_processed_message_state_to_string() {
-        assert_eq!(ProcessedMessageState::Created.to_string(), "created");
-        assert_eq!(ProcessedMessageState::Processed.to_string(), "processed");
-        assert_eq!(
-            ProcessedMessageState::ProcessedCommit.to_string(),
-            "processed_commit"
-        );
-        assert_eq!(ProcessedMessageState::Failed.to_string(), "failed");
-        assert_eq!(
-            ProcessedMessageState::EpochInvalidated.to_string(),
-            "epoch_invalidated"
-        );
-        assert_eq!(ProcessedMessageState::Retryable.to_string(), "retryable");
-    }
-
-    #[test]
-    fn test_processed_message_state_serialization() {
-        let created = ProcessedMessageState::Created;
-        let serialized = serde_json::to_string(&created).unwrap();
-        assert_eq!(serialized, r#""created""#);
-
-        let processed = ProcessedMessageState::Processed;
-        let serialized = serde_json::to_string(&processed).unwrap();
-        assert_eq!(serialized, r#""processed""#);
-
-        let processed_commit = ProcessedMessageState::ProcessedCommit;
-        let serialized = serde_json::to_string(&processed_commit).unwrap();
-        assert_eq!(serialized, r#""processed_commit""#);
-
-        let failed = ProcessedMessageState::Failed;
-        let serialized = serde_json::to_string(&failed).unwrap();
-        assert_eq!(serialized, r#""failed""#);
-
-        let epoch_invalidated = ProcessedMessageState::EpochInvalidated;
-        let serialized = serde_json::to_string(&epoch_invalidated).unwrap();
-        assert_eq!(serialized, r#""epoch_invalidated""#);
-
-        let retryable = ProcessedMessageState::Retryable;
-        let serialized = serde_json::to_string(&retryable).unwrap();
-        assert_eq!(serialized, r#""retryable""#);
-    }
-
-    #[test]
-    fn test_processed_message_state_deserialization() {
-        let created: ProcessedMessageState = serde_json::from_str(r#""created""#).unwrap();
-        assert_eq!(created, ProcessedMessageState::Created);
-
-        let processed: ProcessedMessageState = serde_json::from_str(r#""processed""#).unwrap();
-        assert_eq!(processed, ProcessedMessageState::Processed);
-
-        let processed_commit: ProcessedMessageState =
-            serde_json::from_str(r#""processed_commit""#).unwrap();
-        assert_eq!(processed_commit, ProcessedMessageState::ProcessedCommit);
-
-        let failed: ProcessedMessageState = serde_json::from_str(r#""failed""#).unwrap();
-        assert_eq!(failed, ProcessedMessageState::Failed);
-
-        let epoch_invalidated: ProcessedMessageState =
-            serde_json::from_str(r#""epoch_invalidated""#).unwrap();
-        assert_eq!(epoch_invalidated, ProcessedMessageState::EpochInvalidated);
-
-        let retryable: ProcessedMessageState = serde_json::from_str(r#""retryable""#).unwrap();
-        assert_eq!(retryable, ProcessedMessageState::Retryable);
-
-        // Test invalid state
-        let result = serde_json::from_str::<ProcessedMessageState>(r#""invalid""#);
-        assert!(result.is_err());
     }
 
     #[test]
