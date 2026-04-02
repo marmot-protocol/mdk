@@ -433,12 +433,13 @@ where
                 "Missing required tag: mls_proposals".to_string(),
             ));
         }
-        if let Some(prop) = prop_tag
-            && prop.as_slice().get(1).map(|s| s.as_str()) != Some("0x000a")
-        {
-            return Err(Error::KeyPackage(
-                "Invalid mls_proposals tag value, expected 0x000a".to_string(),
-            ));
+        if let Some(prop) = prop_tag {
+            let slice = prop.as_slice();
+            if slice.len() != 2 || slice[1].as_str() != "0x000a" {
+                return Err(Error::KeyPackage(
+                    "Invalid mls_proposals tag value, expected 0x000a".to_string(),
+                ));
+            }
         }
 
         let relays = require(Self::is_relays_tag, "relays")?;
