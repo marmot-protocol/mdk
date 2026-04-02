@@ -31,7 +31,7 @@
 
 ### Added
 
-- Added optional `thumbhash` fields alongside the existing `blurhash` UniFFI records for group-image and encrypted-media uploads, plus a `generate_thumbhash` option in `MediaProcessingOptionsInput`. ([#195](https://github.com/marmot-protocol/mdk/pull/195))
+- Added optional `thumbhash` fields alongside the existing `blurhash` UniFFI records for group-image and encrypted-media uploads, plus a `generate_thumbhash` option in `MediaProcessingOptionsInput`. ([#244](https://github.com/marmot-protocol/mdk/pull/244))
 - Moved binary size optimizations (`opt-level = "z"`, thin LTO, single codegen unit, `panic = "abort"`, symbol stripping) into `[profile.release]` directly. Android builds override to fat LTO via `CARGO_PROFILE_RELEASE_LTO=fat` for maximum `.so` reduction; iOS uses thin LTO to avoid `.a` archive bloat. ([`#221`](https://github.com/marmot-protocol/mdk/pull/221), [`#232`](https://github.com/marmot-protocol/mdk/pull/232))
 
 ### Fixed
