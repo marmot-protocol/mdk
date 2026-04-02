@@ -27,6 +27,8 @@
 
 ### Breaking changes
 
+- `new_unencrypted()` and `new_in_memory()` are now gated behind the `test-utils` feature flag. Downstream crates that call these methods must add `features = ["test-utils"]` to their `mdk-sqlite-storage` dependency. ([#245](https://github.com/marmot-protocol/mdk/pull/245))
+
 ### Changed
 
 ### Added
