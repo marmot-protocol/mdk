@@ -392,8 +392,9 @@ where
     /// [dim \<dimensions\>] [blurhash \<blurhash\>] [thumbhash \<thumbhash\>]
     /// x \<file_hash_hex\> n \<nonce_hex\> v \<version\>
     ///
-    /// New IMETA tags prefer thumbhash when available. If only a legacy blurhash
-    /// was generated, it is emitted as a compatibility fallback.
+    /// During migration, IMETA tags emit both preview hashes when available.
+    /// Consumers that understand both should prefer thumbhash. If only one hash
+    /// was generated, only that hash is emitted.
     pub fn create_imeta_tag(&self, upload: &EncryptedMediaUpload, uploaded_url: &str) -> NostrTag {
         let mut tag_values = vec![
             format!("url {}", uploaded_url),
@@ -405,10 +406,11 @@ where
             tag_values.push(format!("dim {}x{}", width, height));
         }
 
+        if let Some(ref blurhash) = upload.blurhash {
+            tag_values.push(format!("blurhash {}", blurhash));
+        }
         if let Some(ref thumbhash) = upload.thumbhash {
             tag_values.push(format!("thumbhash {}", thumbhash));
-        } else if let Some(ref blurhash) = upload.blurhash {
-            tag_values.push(format!("blurhash {}", blurhash));
         }
 
         // x field contains SHA256 hash of original file content (hex-encoded)
@@ -752,9 +754,13 @@ mod tests {
         assert!(
             values
                 .iter()
+                .any(|v| v.starts_with("blurhash LKO2?U%2Tw=w]~RBVZRi};RPxuwH"))
+        );
+        assert!(
+            values
+                .iter()
                 .any(|v| v.starts_with("thumbhash LKO2?U%2Tw=w]~RBVZRi};RPxuwH"))
         );
-        assert!(!values.iter().any(|v| v.starts_with("blurhash ")));
         assert!(
             values
                 .iter()
@@ -797,6 +803,37 @@ mod tests {
                 .any(|v| v.starts_with("blurhash LKO2?U%2Tw=w]~RBVZRi};RPxuwH"))
         );
         assert!(!values.iter().any(|v| v.starts_with("thumbhash ")));
+    }
+
+    #[test]
+    fn test_create_imeta_tag_emits_thumbhash_when_only_thumbhash_exists() {
+        let mdk = create_test_mdk();
+        let group_id = GroupId::from_slice(&[1, 2, 3, 4]);
+        let manager = mdk.media_manager(group_id);
+
+        let upload = EncryptedMediaUpload {
+            encrypted_data: vec![1, 2, 3, 4],
+            original_hash: [0x42; 32],
+            encrypted_hash: [0x43; 32],
+            mime_type: "image/jpeg".to_string(),
+            filename: "test.jpg".to_string(),
+            original_size: 1000,
+            encrypted_size: 1004,
+            dimensions: Some((1920, 1080)),
+            blurhash: None,
+            thumbhash: Some("}U#WoBrZy#_/qQ8PC,N]q7m}6X".to_string()),
+            nonce: [0xAA; 12],
+        };
+
+        let tag = manager.create_imeta_tag(&upload, "https://example.com/file.jpg");
+        let values = tag.to_vec();
+
+        assert!(!values.iter().any(|v| v.starts_with("blurhash ")));
+        assert!(
+            values
+                .iter()
+                .any(|v| v.starts_with("thumbhash }U#WoBrZy#_/qQ8PC,N]q7m}6X"))
+        );
     }
 
     #[test]
