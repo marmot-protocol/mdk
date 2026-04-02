@@ -15,6 +15,9 @@
 
 ### Added
 
+- Added feature-gated `mip05` protocol primitives in `mdk-core`, including typed token payloads, strict token encryption/decryption helpers, and rumor build/parse helpers for MIP-05 `kind:447`, `kind:448`, and `kind:449`. ([#235](https://github.com/marmot-protocol/mdk/pull/235))
+- Added public MLS leaf-index helpers via `process_message_with_context`, `own_leaf_index`, and `group_leaf_map` so clients can access sender, local, and active group leaf positions without ratchet-tree workarounds. ([#235](https://github.com/marmot-protocol/mdk/pull/235))
+
 ### Fixed
 
 ### Removed
@@ -30,8 +33,15 @@
 - Admin updates now prune non-member public keys instead of rejecting the entire update. Only errors if no valid admins remain after pruning. ([#223](https://github.com/marmot-protocol/mdk/pull/223))
 - Replaced ~15 identical `From<...> for Error` impls with `impl_from_display_error!` and `impl_from_generic_display_error!` macros. ([`#239`](https://github.com/marmot-protocol/mdk/pull/239))
 - Consolidated duplicate test wiring between memory and sqlite storage test binaries into a `storage_backend_tests!` macro. ([`#239`](https://github.com/marmot-protocol/mdk/pull/239))
+- New groups now use `MIXED_CIPHERTEXT` wire format policy (outgoing: ciphertext, incoming: mixed) instead of the OpenMLS default `PURE_CIPHERTEXT`. Regular messages remain `PrivateMessage`; the mixed incoming policy is required to accept `PublicMessage` SelfRemove proposals from departing members.
+- `leave_group` now sends a SelfRemove proposal (MLS Extensions draft, type `0x000a`) instead of a Remove proposal. Falls back to Remove for legacy groups created with `PURE_CIPHERTEXT`. SelfRemove proposals are auto-committed by any member, removing the requirement for an admin to be online.
+- Non-admin members can now create SelfRemove-only Commits in addition to self-update Commits. These two commit types must not be combined.
 
 ### Added
+
+- SelfRemove proposal type (`0x000a`) added to client capabilities, group required capabilities, and KeyPackage `mls_proposals` tag per MIP-03.
+- Admin depletion validation: SelfRemove proposals and commits are rejected if they would leave the group with zero admins.
+- Added feature-gated MIP-05 notification request builders that group token tags by notification server, preserve relay hints, chunk requests at 100 tokens per server, and return ready-to-publish gift-wrapped notification batches for `kind:446` delivery. ([#238](https://github.com/marmot-protocol/mdk/pull/238))
 
 ### Fixed
 

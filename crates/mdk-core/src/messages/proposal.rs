@@ -5,7 +5,7 @@
 use mdk_storage_traits::messages::types as message_types;
 use mdk_storage_traits::{GroupId, MdkStorageProvider};
 use nostr::Event;
-use openmls::prelude::{MlsGroup, Proposal, QueuedProposal, Sender};
+use openmls::prelude::{BasicCredential, MlsGroup, Proposal, QueuedProposal, Sender};
 use openmls_traits::OpenMlsProvider;
 use tls_codec::Serialize as TlsSerialize;
 
@@ -24,7 +24,8 @@ where
     /// This internal function handles MLS proposal messages according to the Marmot protocol:
     ///
     /// - **Add/Remove member proposals**: Always stored as pending for admin approval via manual commit
-    /// - **Self-remove (leave) proposals**: Auto-committed if receiver is admin, otherwise pending
+    /// - **Self-remove (leave) proposals**: Legacy Remove-based: auto-committed by admins, pending for non-admins
+    /// - **SelfRemove proposals**: Auto-committed by any member (new protocol, MLS Extensions draft)
     /// - **Extension/ciphersuite proposals**: Ignored with warning (admins should create commits directly)
     /// - **Update proposals**: Out of scope (see issue #59)
     ///
@@ -146,6 +147,64 @@ where
                                     reason: "Extension proposals not allowed - admins should create commits directly".to_string(),
                                 })
                             }
+                            Proposal::SelfRemove => {
+                                // Per MIP-03, admins MUST NOT send SelfRemove.
+                                // Reject proposals from admin senders.
+                                let sender_member = mls_group
+                                    .member_at(*sender_leaf_index)
+                                    .ok_or(Error::MessageFromNonMember)?;
+                                let sender_cred =
+                                    BasicCredential::try_from(sender_member.credential)?;
+                                let sender_pubkey =
+                                    self.parse_credential_identity(sender_cred.identity())?;
+                                let group_data =
+                                    crate::extension::NostrGroupDataExtension::from_group(
+                                        mls_group,
+                                    )?;
+
+                                if group_data.admins.contains(&sender_pubkey) {
+                                    tracing::warn!(
+                                        target: "mdk_core::messages::process_proposal",
+                                        "Rejecting SelfRemove from admin — must self-demote first"
+                                    );
+                                    self.mark_processed(
+                                        event,
+                                        &group_id,
+                                        mls_group.epoch().as_u64(),
+                                    )?;
+                                    return Ok(MessageProcessingResult::IgnoredProposal {
+                                        mls_group_id: group_id,
+                                        reason: "SelfRemove rejected: sender is an admin"
+                                            .to_string(),
+                                    });
+                                }
+
+                                // Non-admin SelfRemove: any member can commit, so auto-commit.
+                                if let Err(e) =
+                                    self.validate_admin_depletion(mls_group, &[*sender_leaf_index])
+                                {
+                                    tracing::warn!(
+                                        target: "mdk_core::messages::process_proposal",
+                                        "Rejecting SelfRemove: {}", e
+                                    );
+                                    self.mark_processed(
+                                        event,
+                                        &group_id,
+                                        mls_group.epoch().as_u64(),
+                                    )?;
+                                    return Ok(MessageProcessingResult::IgnoredProposal {
+                                        mls_group_id: group_id,
+                                        reason: format!("SelfRemove rejected: {}", e),
+                                    });
+                                }
+
+                                self.auto_commit_proposal(
+                                    mls_group,
+                                    event,
+                                    staged_proposal,
+                                    &group_id,
+                                )
+                            }
                             _ => {
                                 // Other proposal types (PreSharedKey, ReInit, ExternalInit, etc.)
                                 tracing::warn!(
@@ -233,7 +292,12 @@ where
         self.save_processed_message_record(processed_message)
     }
 
-    /// Stores a proposal and immediately auto-commits it (for self-remove by admin)
+    /// Stores a proposal and immediately auto-commits it.
+    ///
+    /// Uses the commit builder with a SelfRemove-only filter to ensure no other
+    /// pending proposals (Add, Remove, etc.) are accidentally included in the
+    /// commit. This prevents non-admin committers from creating commits that
+    /// violate MIP-03 authorization rules.
     pub(super) fn auto_commit_proposal(
         &self,
         mls_group: &mut MlsGroup,
@@ -247,10 +311,24 @@ where
 
         let mls_signer = self.load_mls_signer(mls_group)?;
 
-        // Self-remove proposals never generate welcomes (only Add proposals do),
-        // so we can safely ignore the welcome output here
-        let (commit_message, _welcomes, _group_info) =
-            mls_group.commit_to_pending_proposals(&self.provider, &mls_signer)?;
+        // Build a commit containing ONLY SelfRemove proposals from the pending store.
+        // Other pending proposals (Add, Remove, etc.) are excluded to prevent
+        // non-admin committers from bundling unauthorized proposals.
+        let (commit_message, _welcomes, _group_info) = mls_group
+            .commit_builder()
+            .consume_proposal_store(true)
+            .load_psks(self.provider.storage())
+            .map_err(|e| Error::Group(e.to_string()))?
+            .build(
+                self.provider.rand(),
+                self.provider.crypto(),
+                &mls_signer,
+                |queued| matches!(queued.proposal(), Proposal::SelfRemove),
+            )
+            .map_err(|e| Error::Group(e.to_string()))?
+            .stage_commit(&self.provider)
+            .map_err(|e| Error::Group(e.to_string()))?
+            .into_contents();
 
         let serialized_commit_message = commit_message
             .tls_serialize_detached()
@@ -262,7 +340,7 @@ where
 
         tracing::debug!(
             target: "mdk_core::messages::process_proposal",
-            "Admin auto-committed self-remove proposal"
+            "Auto-committed self-remove proposal"
         );
 
         Ok(MessageProcessingResult::Proposal(UpdateGroupResult {
@@ -357,10 +435,12 @@ mod tests {
         assert!(pending.is_empty(), "No pending removals after merge");
     }
 
-    /// Tests that self-leave proposals are stored as pending when processed by a non-admin.
-    /// Non-admin members cannot commit, so they store the proposal for later admin approval.
+    /// Tests that SelfRemove proposals are auto-committed by any member, including non-admins.
+    ///
+    /// With SelfRemove (new protocol), any member can commit the proposal — not just admins.
+    /// This is the key behavioral difference from the legacy Remove-based self-leave.
     #[test]
-    fn test_self_leave_proposal_stored_pending_by_non_admin() {
+    fn test_self_remove_proposal_auto_committed_by_non_admin() {
         // Setup: Alice (admin), Bob (non-admin), Charlie (non-admin)
         let alice_keys = Keys::generate();
         let bob_keys = Keys::generate();
@@ -408,34 +488,163 @@ mod tests {
             .accept_welcome(&charlie_welcome_preview)
             .expect("Charlie should accept welcome");
 
-        // Bob leaves (creates proposal)
+        // Bob leaves (sends SelfRemove proposal)
         let bob_leave_result = bob_mdk.leave_group(&group_id).expect("Bob should leave");
 
-        // Charlie (non-admin) processes the leave proposal
-        // This should store as pending and return PendingProposal variant
+        // Charlie (non-admin) processes Bob's SelfRemove proposal
+        // With SelfRemove, any member auto-commits — no admin required
         let process_result = charlie_mdk
             .process_message(&bob_leave_result.evolution_event)
-            .expect("Charlie should process leave");
+            .expect("Charlie should process Bob's SelfRemove");
 
-        // Verify it returns PendingProposal (indicating it was stored, not committed)
         assert!(
-            matches!(
-                process_result,
-                MessageProcessingResult::PendingProposal { .. }
-            ),
-            "Non-admin processing self-leave should return PendingProposal, got: {:?}",
+            matches!(process_result, MessageProcessingResult::Proposal(_)),
+            "Non-admin processing SelfRemove should auto-commit, got: {:?}",
             process_result
         );
+    }
 
-        // Verify the proposal is now pending
-        let pending = charlie_mdk
-            .pending_removed_members_pubkeys(&group_id)
-            .expect("Should get pending");
-        assert_eq!(pending.len(), 1, "Bob should be in pending removals");
-        assert_eq!(
-            pending[0],
-            bob_keys.public_key(),
-            "Pending removal should be Bob"
+    /// Tests that admins are blocked from calling leave_group.
+    ///
+    /// Per MIP-03, admins MUST self-demote before sending a SelfRemove.
+    /// leave_group enforces this on the sending side.
+    #[test]
+    fn test_admin_leave_group_rejected() {
+        let alice_keys = Keys::generate();
+        let bob_keys = Keys::generate();
+
+        let alice_mdk = create_test_mdk();
+        let bob_mdk = create_test_mdk();
+
+        let admins = vec![alice_keys.public_key()];
+
+        let bob_key_package = create_key_package_event(&bob_mdk, &bob_keys);
+
+        let create_result = alice_mdk
+            .create_group(
+                &alice_keys.public_key(),
+                vec![bob_key_package],
+                create_nostr_group_config_data(admins),
+            )
+            .expect("Alice should create group");
+
+        let group_id = create_result.group.mls_group_id.clone();
+
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("Alice should merge commit");
+
+        // Alice (admin) tries to leave without self-demoting — should fail
+        let result = alice_mdk.leave_group(&group_id);
+        assert!(
+            result.is_err(),
+            "Admin should not be able to leave without self-demoting admin status"
+        );
+        assert!(
+            result.unwrap_err().to_string().contains("self-demote"),
+            "Error should mention self-demotion"
+        );
+    }
+
+    /// Tests that the receiving side rejects SelfRemove from an admin sender.
+    ///
+    /// Simulates a non-compliant client: an admin bypasses the sending-side check
+    /// and sends a SelfRemove without self-demoting. The receiver sees the sender
+    /// is in admin_pubkeys and rejects the proposal per MIP-03.
+    #[test]
+    fn test_receiving_side_rejects_admin_self_remove() {
+        use openmls::prelude::{
+            MIXED_CIPHERTEXT_WIRE_FORMAT_POLICY, MIXED_PLAINTEXT_WIRE_FORMAT_POLICY,
+            MlsGroupJoinConfig, SenderRatchetConfiguration,
+        };
+        use tls_codec::Serialize as TlsSerialize;
+
+        let alice_keys = Keys::generate();
+        let bob_keys = Keys::generate();
+
+        let alice_mdk = create_test_mdk();
+        let bob_mdk = create_test_mdk();
+
+        // Alice is the sole admin
+        let admins = vec![alice_keys.public_key()];
+
+        let bob_key_package = create_key_package_event(&bob_mdk, &bob_keys);
+
+        let create_result = alice_mdk
+            .create_group(
+                &alice_keys.public_key(),
+                vec![bob_key_package],
+                create_nostr_group_config_data(admins),
+            )
+            .expect("Alice should create group");
+
+        let group_id = create_result.group.mls_group_id.clone();
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("Alice should merge commit");
+
+        let bob_preview = bob_mdk
+            .process_welcome(
+                &nostr::EventId::all_zeros(),
+                &create_result.welcome_rumors[0],
+            )
+            .expect("Bob should process welcome");
+        bob_mdk
+            .accept_welcome(&bob_preview)
+            .expect("Bob should accept welcome");
+
+        // Simulate non-compliant client: Alice (admin) sends SelfRemove
+        // by bypassing leave_group's admin check and using internal APIs.
+        let mut mls_group = alice_mdk
+            .load_mls_group(&group_id)
+            .expect("load group")
+            .expect("group exists");
+
+        let signer = alice_mdk.load_mls_signer(&mls_group).expect("load signer");
+
+        // Temporarily switch to plaintext for SelfRemove
+        let plaintext_config = MlsGroupJoinConfig::builder()
+            .wire_format_policy(MIXED_PLAINTEXT_WIRE_FORMAT_POLICY)
+            .use_ratchet_tree_extension(true)
+            .sender_ratchet_configuration(SenderRatchetConfiguration::default())
+            .build();
+
+        mls_group
+            .set_configuration(alice_mdk.storage(), &plaintext_config)
+            .expect("switch config");
+
+        let leave_msg = mls_group
+            .leave_group_via_self_remove(&alice_mdk.provider, &signer)
+            .expect("SelfRemove should succeed at MLS level");
+
+        // Restore config
+        let ciphertext_config = MlsGroupJoinConfig::builder()
+            .wire_format_policy(MIXED_CIPHERTEXT_WIRE_FORMAT_POLICY)
+            .use_ratchet_tree_extension(true)
+            .sender_ratchet_configuration(SenderRatchetConfiguration::default())
+            .build();
+
+        let _ = mls_group.set_configuration(alice_mdk.storage(), &ciphertext_config);
+
+        let serialized = leave_msg.tls_serialize_detached().expect("serialize");
+
+        let event = alice_mdk
+            .build_message_event(&group_id, serialized)
+            .expect("build event");
+
+        // Bob processes Alice's SelfRemove — should reject because Alice is admin
+        let result = bob_mdk
+            .process_message(&event)
+            .expect("Bob should process without panic");
+
+        assert!(
+            matches!(
+                &result,
+                MessageProcessingResult::IgnoredProposal { reason, .. }
+                if reason.contains("sender is an admin")
+            ),
+            "Receiver should reject SelfRemove from admin, got: {:?}",
+            result
         );
     }
 

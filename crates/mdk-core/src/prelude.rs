@@ -33,7 +33,17 @@ pub use crate::groups::{
     RatchetTreeInfo, UpdateGroupResult,
 };
 /// Message processing result variants
-pub use crate::messages::MessageProcessingResult;
+pub use crate::messages::{
+    MessageProcessingContext, MessageProcessingOutcome, MessageProcessingResult,
+};
+/// MIP-05 primitives and helpers
+#[cfg(feature = "mip05")]
+#[cfg_attr(docsrs, doc(cfg(feature = "mip05")))]
+pub use crate::mip05::{
+    EncryptedToken, LeafTokenTag, Mip05Error, Mip05GroupMessage, NotificationEventBatch,
+    NotificationPlatform, NotificationRequest, PushTokenPlaintext, TokenListResponse, TokenRemoval,
+    TokenRequest, TokenTag,
+};
 /// Welcome operation results
 pub use crate::welcomes::{JoinedGroupResult, WelcomePreview};
 

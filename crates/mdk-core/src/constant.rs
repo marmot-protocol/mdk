@@ -1,6 +1,7 @@
 //! MDK constants
 
 use openmls::extensions::ExtensionType;
+use openmls::prelude::ProposalType;
 use openmls_traits::types::Ciphersuite;
 
 /// Nostr Group Data extension type
@@ -35,17 +36,31 @@ pub const GROUP_CONTEXT_REQUIRED_EXTENSIONS: [ExtensionType; 1] = [
     ExtensionType::Unknown(NOSTR_GROUP_DATA_EXTENSION_TYPE), // 0xF2EE - NostrGroupData
 ];
 
-/// Extensions that are advertised in Nostr event tags (mls_extensions tag).
+/// Extensions advertised in Nostr event tags (mls_extensions tag).
 ///
-/// This MUST match SUPPORTED_EXTENSIONS to accurately advertise what the
-/// KeyPackage capabilities contain. This allows other clients to validate
-/// compatibility before attempting to add this user to a group.
+/// Derived from SUPPORTED_EXTENSIONS to guarantee the tags accurately advertise
+/// what the KeyPackage capabilities contain. GREASE values are excluded — they
+/// are injected dynamically at runtime (see `MDK::capabilities()`).
+pub const TAG_EXTENSIONS: [ExtensionType; 2] = SUPPORTED_EXTENSIONS;
+
+/// Non-default proposal types that clients advertise support for.
 ///
-/// Note: GREASE values are NOT included here. GREASE is injected dynamically
-/// into Capabilities at runtime (see `MDK::capabilities()`) but should not be
-/// advertised in tags since they are meant for extensibility testing only and
-/// will vary between clients/invocations.
-pub const TAG_EXTENSIONS: [ExtensionType; 2] = [
-    ExtensionType::LastResort, // 0x000A - Required in capabilities
-    ExtensionType::Unknown(NOSTR_GROUP_DATA_EXTENSION_TYPE), // 0xF2EE - NostrGroupData
+/// Per the MLS Extensions draft, SelfRemove (0x000a) is not a default
+/// proposal type and MUST be explicitly listed in capabilities.
+///
+/// Note: SelfRemove (0x000a) and LastResort (0x000a) share the same numeric
+/// value but belong to different IANA registries (Proposal Types vs Extension
+/// Types), so there is no conflict.
+pub const SUPPORTED_PROPOSALS: [ProposalType; 1] = [
+    ProposalType::SelfRemove, // 0x000A
 ];
+
+/// Proposal types required in the GroupContext RequiredCapabilities.
+/// All group members must support these proposal types.
+pub const GROUP_CONTEXT_REQUIRED_PROPOSALS: [ProposalType; 1] = [
+    ProposalType::SelfRemove, // 0x000A
+];
+
+/// Proposal types advertised in Nostr event tags (mls_proposals tag).
+/// Derived from SUPPORTED_PROPOSALS to guarantee consistency.
+pub const TAG_PROPOSALS: [ProposalType; 1] = SUPPORTED_PROPOSALS;

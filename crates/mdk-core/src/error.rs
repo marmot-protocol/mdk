@@ -22,6 +22,9 @@ use openmls::key_packages::errors::{KeyPackageNewError, KeyPackageVerifyError};
 use openmls::prelude::{MlsGroupStateError, ValidationError};
 use openmls_traits::types::CryptoError;
 
+#[cfg(feature = "mip05")]
+use crate::mip05::Mip05Error;
+
 /// MDK error
 #[derive(Debug, PartialEq, thiserror::Error)]
 pub enum Error {
@@ -97,6 +100,11 @@ pub enum Error {
     /// Message error
     #[error("{0}")]
     Message(String),
+    /// MIP-05 error
+    #[cfg(feature = "mip05")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "mip05")))]
+    #[error(transparent)]
+    Mip05(#[from] Mip05Error),
     /// Cannot decrypt own message
     #[error("cannot decrypt own message")]
     CannotDecryptOwnMessage,
