@@ -1809,21 +1809,42 @@ mod tests {
             let applied_ts = 1000u64;
 
             // Create a snapshot
-            let _ = manager.create_snapshot(&storage, &group_id, 0, &applied_commit_id, applied_ts, &[1u8; 32]);
+            let _ = manager.create_snapshot(
+                &storage,
+                &group_id,
+                0,
+                &applied_commit_id,
+                applied_ts,
+                &[1u8; 32],
+            );
 
             // Test: earlier timestamp should be better
             let candidate_id = EventId::from_slice(&[1u8; 32]).unwrap();
             let earlier_ts = 999u64;
 
             assert!(
-                manager.is_better_candidate(&storage, &group_id, 0, earlier_ts, &candidate_id, &[2u8; 32]),
+                manager.is_better_candidate(
+                    &storage,
+                    &group_id,
+                    0,
+                    earlier_ts,
+                    &candidate_id,
+                    &[2u8; 32]
+                ),
                 "Earlier timestamp should be better"
             );
 
             // Test: later timestamp should NOT be better
             let later_ts = 1001u64;
             assert!(
-                !manager.is_better_candidate(&storage, &group_id, 0, later_ts, &candidate_id, &[2u8; 32]),
+                !manager.is_better_candidate(
+                    &storage,
+                    &group_id,
+                    0,
+                    later_ts,
+                    &candidate_id,
+                    &[2u8; 32]
+                ),
                 "Later timestamp should not be better"
             );
         }
@@ -1838,7 +1859,8 @@ mod tests {
             let applied_commit_id = EventId::from_slice(&[0x80u8; 32]).unwrap();
             let ts = 1000u64;
 
-            let _ = manager.create_snapshot(&storage, &group_id, 0, &applied_commit_id, ts, &[1u8; 32]);
+            let _ =
+                manager.create_snapshot(&storage, &group_id, 0, &applied_commit_id, ts, &[1u8; 32]);
 
             // Test: smaller ID (same timestamp) should be better
             let smaller_id = EventId::from_slice(&[0x70u8; 32]).unwrap();
@@ -1865,12 +1887,20 @@ mod tests {
             let ts = 1000u64;
 
             // Create snapshot for epoch 0
-            let _ = manager.create_snapshot(&storage, &group_id, 0, &applied_commit_id, ts, &[1u8; 32]);
+            let _ =
+                manager.create_snapshot(&storage, &group_id, 0, &applied_commit_id, ts, &[1u8; 32]);
 
             // Check epoch 1 (no snapshot exists) - should return false
             let candidate_id = EventId::from_slice(&[1u8; 32]).unwrap();
             assert!(
-                !manager.is_better_candidate(&storage, &group_id, 1, 999, &candidate_id, &[2u8; 32]),
+                !manager.is_better_candidate(
+                    &storage,
+                    &group_id,
+                    1,
+                    999,
+                    &candidate_id,
+                    &[2u8; 32]
+                ),
                 "Should return false for epoch with no snapshot"
             );
         }
@@ -1885,8 +1915,14 @@ mod tests {
             // Create snapshots for epochs 0, 1, 2
             for epoch in 0..3 {
                 let commit_id = EventId::from_slice(&[epoch as u8; 32]).unwrap();
-                let _ =
-                    manager.create_snapshot(&storage, &group_id, epoch, &commit_id, 1000 + epoch, &[1u8; 32]);
+                let _ = manager.create_snapshot(
+                    &storage,
+                    &group_id,
+                    epoch,
+                    &commit_id,
+                    1000 + epoch,
+                    &[1u8; 32],
+                );
             }
 
             // Rollback to epoch 1
@@ -1897,7 +1933,14 @@ mod tests {
             // Check by trying to see if epoch 2 candidate comparison works
             let candidate_id = EventId::from_slice(&[0xFFu8; 32]).unwrap();
             assert!(
-                !manager.is_better_candidate(&storage, &group_id, 2, 999, &candidate_id, &[2u8; 32]),
+                !manager.is_better_candidate(
+                    &storage,
+                    &group_id,
+                    2,
+                    999,
+                    &candidate_id,
+                    &[2u8; 32]
+                ),
                 "Epoch 2 snapshot should have been removed after rollback to epoch 1"
             );
         }
@@ -1912,11 +1955,19 @@ mod tests {
             let applied_commit_id = EventId::from_slice(&[0x50u8; 32]).unwrap();
             let ts = 1000u64;
 
-            let _ = manager.create_snapshot(&storage, &group_id, 0, &applied_commit_id, ts, &[1u8; 32]);
+            let _ =
+                manager.create_snapshot(&storage, &group_id, 0, &applied_commit_id, ts, &[1u8; 32]);
 
             // Same ID, same timestamp - should NOT be better
             assert!(
-                !manager.is_better_candidate(&storage, &group_id, 0, ts, &applied_commit_id, &[2u8; 32]),
+                !manager.is_better_candidate(
+                    &storage,
+                    &group_id,
+                    0,
+                    ts,
+                    &applied_commit_id,
+                    &[2u8; 32]
+                ),
                 "Same event ID should not be considered better than itself"
             );
         }
@@ -2004,8 +2055,14 @@ mod tests {
             // Create 5 snapshots (epochs 0-4)
             for epoch in 0..5u64 {
                 let commit_id = EventId::from_slice(&[epoch as u8; 32]).unwrap();
-                let _ =
-                    manager.create_snapshot(&storage, &group_id, epoch, &commit_id, 1000 + epoch, &[1u8; 32]);
+                let _ = manager.create_snapshot(
+                    &storage,
+                    &group_id,
+                    epoch,
+                    &commit_id,
+                    1000 + epoch,
+                    &[1u8; 32],
+                );
             }
 
             // Epochs 0 and 1 should have been pruned (only 3 kept: 2, 3, 4)

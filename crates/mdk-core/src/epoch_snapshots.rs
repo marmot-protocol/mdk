@@ -420,7 +420,14 @@ mod tests {
         // Candidate with earlier timestamp (999 < 1000) should be better
         let candidate_id =
             test_event_id("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
-        assert!(manager.is_better_candidate(&storage, &group_id, 10, 999, &candidate_id, &[2u8; 32]));
+        assert!(manager.is_better_candidate(
+            &storage,
+            &group_id,
+            10,
+            999,
+            &candidate_id,
+            &[2u8; 32]
+        ));
     }
 
     #[test]
@@ -452,7 +459,14 @@ mod tests {
         // Candidate with later timestamp (1001 > 1000) should NOT be better
         let candidate_id =
             test_event_id("0000000000000000000000000000000000000000000000000000000000000000");
-        assert!(!manager.is_better_candidate(&storage, &group_id, 10, 1001, &candidate_id, &[2u8; 32]));
+        assert!(!manager.is_better_candidate(
+            &storage,
+            &group_id,
+            10,
+            1001,
+            &candidate_id,
+            &[2u8; 32]
+        ));
     }
 
     #[test]
@@ -485,7 +499,14 @@ mod tests {
         // Candidate with same timestamp but smaller ID ('a' < 'b') should be better
         let candidate_id =
             test_event_id("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
-        assert!(manager.is_better_candidate(&storage, &group_id, 10, 1000, &candidate_id, &[2u8; 32]));
+        assert!(manager.is_better_candidate(
+            &storage,
+            &group_id,
+            10,
+            1000,
+            &candidate_id,
+            &[2u8; 32]
+        ));
     }
 
     #[test]
@@ -518,7 +539,14 @@ mod tests {
         // Candidate with same timestamp but larger ID ('c' > 'a') should NOT be better
         let candidate_id =
             test_event_id("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc");
-        assert!(!manager.is_better_candidate(&storage, &group_id, 10, 1000, &candidate_id, &[2u8; 32]));
+        assert!(!manager.is_better_candidate(
+            &storage,
+            &group_id,
+            10,
+            1000,
+            &candidate_id,
+            &[2u8; 32]
+        ));
     }
 
     #[test]
@@ -548,7 +576,14 @@ mod tests {
         }
 
         // Same ID and timestamp should NOT be better (it's the same commit)
-        assert!(!manager.is_better_candidate(&storage, &group_id, 10, 1000, &applied_id, &[2u8; 32]));
+        assert!(!manager.is_better_candidate(
+            &storage,
+            &group_id,
+            10,
+            1000,
+            &applied_id,
+            &[2u8; 32]
+        ));
     }
 
     #[test]
@@ -580,7 +615,14 @@ mod tests {
         // Even with earlier timestamp, wrong epoch should return false
         let candidate_id =
             test_event_id("0000000000000000000000000000000000000000000000000000000000000000");
-        assert!(!manager.is_better_candidate(&storage, &group_id, 11, 999, &candidate_id, &[2u8; 32])); // epoch 11 != 10
+        assert!(!manager.is_better_candidate(
+            &storage,
+            &group_id,
+            11,
+            999,
+            &candidate_id,
+            &[2u8; 32]
+        )); // epoch 11 != 10
     }
 
     #[test]
@@ -592,7 +634,14 @@ mod tests {
             test_event_id("0000000000000000000000000000000000000000000000000000000000000000");
 
         // No snapshots for this group, should return false
-        assert!(!manager.is_better_candidate(&storage, &unknown_group_id, 10, 999, &candidate_id, &[2u8; 32]));
+        assert!(!manager.is_better_candidate(
+            &storage,
+            &unknown_group_id,
+            10,
+            999,
+            &candidate_id,
+            &[2u8; 32]
+        ));
     }
 
     #[test]
@@ -631,7 +680,14 @@ mod tests {
         let candidate_id =
             test_event_id("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
         assert!(
-            !manager.is_better_candidate(&storage, &group_id, 10, 999, &candidate_id, &content_hash),
+            !manager.is_better_candidate(
+                &storage,
+                &group_id,
+                10,
+                999,
+                &candidate_id,
+                &content_hash
+            ),
             "Same content hash should be rejected even with earlier timestamp and smaller ID"
         );
 
@@ -639,7 +695,14 @@ mod tests {
         // timestamp and smaller ID should still win
         let different_hash = [0xCDu8; 32];
         assert!(
-            manager.is_better_candidate(&storage, &group_id, 10, 999, &candidate_id, &different_hash),
+            manager.is_better_candidate(
+                &storage,
+                &group_id,
+                10,
+                999,
+                &candidate_id,
+                &different_hash
+            ),
             "Different content hash with earlier timestamp should be accepted"
         );
     }
@@ -706,7 +769,14 @@ mod tests {
         assert!(manager.is_better_candidate(&storage, &group1, 10, 999, &candidate_id, &[2u8; 32]));
 
         // Group2 should NOT find any snapshot
-        assert!(!manager.is_better_candidate(&storage, &group2, 10, 999, &candidate_id, &[2u8; 32]));
+        assert!(!manager.is_better_candidate(
+            &storage,
+            &group2,
+            10,
+            999,
+            &candidate_id,
+            &[2u8; 32]
+        ));
     }
 
     #[test]
@@ -740,7 +810,14 @@ mod tests {
         // Create 3 snapshots
         for epoch in 0..3 {
             let commit_id = test_event_id(&format!("{:064x}", epoch + 1));
-            let _ = manager.create_snapshot(&storage, &group_id, epoch, &commit_id, 1000 + epoch, &[1u8; 32]);
+            let _ = manager.create_snapshot(
+                &storage,
+                &group_id,
+                epoch,
+                &commit_id,
+                1000 + epoch,
+                &[1u8; 32],
+            );
         }
 
         // With retention of 2, only epochs 1 and 2 should remain
@@ -783,7 +860,14 @@ mod tests {
         for epoch in 0..4 {
             let commit_id = test_event_id(&format!("{:064x}", epoch + 1));
             manager
-                .create_snapshot(&storage, &group_id, epoch, &commit_id, 1000 + epoch, &[1u8; 32])
+                .create_snapshot(
+                    &storage,
+                    &group_id,
+                    epoch,
+                    &commit_id,
+                    1000 + epoch,
+                    &[1u8; 32],
+                )
                 .unwrap();
         }
 
@@ -961,7 +1045,8 @@ mod tests {
         // no hydration occurs and there are no snapshots
         let candidate_id =
             test_event_id("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
-        let result = manager.is_better_candidate(&storage, &group_id, 5, 999, &candidate_id, &[2u8; 32]);
+        let result =
+            manager.is_better_candidate(&storage, &group_id, 5, 999, &candidate_id, &[2u8; 32]);
 
         // Should return false since there are no snapshots and no hydration
         assert!(
