@@ -262,10 +262,10 @@ impl EpochSnapshotManager {
         // Ensure we have loaded any existing snapshots from storage
         self.ensure_hydrated(storage, group_id);
 
-        let inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap();
 
-        if let Some(queue) = inner.snapshots.get(group_id)
-            && let Some(snapshot) = queue.iter().find(|s| s.epoch == candidate_epoch)
+        if let Some(queue) = inner.snapshots.get_mut(group_id)
+            && let Some(snapshot) = queue.iter_mut().find(|s| s.epoch == candidate_epoch)
         {
             // Skip comparison for hydrated snapshots (applied_commit_ts == 0) since
             // we don't have the original timestamp info after restart
@@ -273,16 +273,29 @@ impl EpochSnapshotManager {
                 return false;
             }
 
-            // Reject re-wrapped events: if the ciphertext is identical to the commit
-            // we already applied, this is a replay — not a genuinely different commit.
+            // Same ciphertext in a different wrapper: this is a replay, not a
+            // genuinely different commit, so we never trigger a rollback.  However,
+            // we must still converge on a canonical ordering key so that every
+            // client compares future (genuinely different) commits against the same
+            // anchor.  Apply MIP-03 rules to pick the "best" wrapper metadata we
+            // have seen for this ciphertext.
             if snapshot.applied_commit_content_hash != [0u8; 32]
                 && candidate_content_hash == &snapshot.applied_commit_content_hash
             {
-                tracing::debug!(
-                    target: "mdk_core::epoch_snapshots",
-                    "Rejecting candidate commit for epoch {}: identical ciphertext (re-wrapped event)",
-                    candidate_epoch,
-                );
+                let candidate_is_better_wrapper = candidate_ts < snapshot.applied_commit_ts
+                    || (candidate_ts == snapshot.applied_commit_ts
+                        && candidate_id.to_hex() < snapshot.applied_commit_id.to_hex());
+
+                if candidate_is_better_wrapper {
+                    tracing::debug!(
+                        target: "mdk_core::epoch_snapshots",
+                        "Updating canonical ordering key for epoch {} (same ciphertext, better wrapper metadata)",
+                        candidate_epoch,
+                    );
+                    snapshot.applied_commit_ts = candidate_ts;
+                    snapshot.applied_commit_id = *candidate_id;
+                }
+
                 return false;
             }
 
@@ -691,6 +704,41 @@ mod tests {
             "Same content hash should be rejected even with earlier timestamp and smaller ID"
         );
 
+        // The snapshot's ordering key should have been updated to the better
+        // wrapper metadata so all clients converge on the same canonical anchor
+        {
+            let inner = manager.inner.lock().unwrap();
+            let snapshot = inner.snapshots.get(&group_id).unwrap().front().unwrap();
+            assert_eq!(
+                snapshot.applied_commit_ts, 999,
+                "Snapshot ts should be updated to the earlier wrapper"
+            );
+            assert_eq!(
+                snapshot.applied_commit_id, candidate_id,
+                "Snapshot id should be updated to the smaller wrapper id"
+            );
+        }
+
+        // A worse wrapper (later ts) with same content hash should NOT update the anchor
+        let worse_id =
+            test_event_id("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc");
+        assert!(!manager.is_better_candidate(
+            &storage,
+            &group_id,
+            10,
+            2000,
+            &worse_id,
+            &content_hash
+        ));
+        {
+            let inner = manager.inner.lock().unwrap();
+            let snapshot = inner.snapshots.get(&group_id).unwrap().front().unwrap();
+            assert_eq!(
+                snapshot.applied_commit_ts, 999,
+                "Snapshot ts should remain at the canonical minimum"
+            );
+        }
+
         // But a genuinely different commit (different content hash) with the same
         // timestamp and smaller ID should still win
         let different_hash = [0xCDu8; 32];
@@ -699,7 +747,7 @@ mod tests {
                 &storage,
                 &group_id,
                 10,
-                999,
+                998,
                 &candidate_id,
                 &different_hash
             ),
