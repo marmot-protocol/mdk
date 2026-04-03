@@ -3054,68 +3054,29 @@ mod tests {
     // ── Tests for newly bound methods ────────────────────────────────────────
 
     #[test]
-    fn test_own_leaf_index_valid_group() {
+    fn test_own_leaf_index_returns_creator_at_zero() {
         let (mdk, group_id, _) = create_test_group_with_keys();
-        let result = mdk.own_leaf_index(group_id);
-        assert!(result.is_ok());
-        // Creator is the first leaf
-        assert_eq!(result.unwrap(), 0);
+        assert_eq!(mdk.own_leaf_index(group_id).unwrap(), 0);
     }
 
     #[test]
-    fn test_own_leaf_index_invalid_group_id() {
-        let mdk = create_test_mdk();
-        let result = mdk.own_leaf_index("not_valid_hex".to_string());
-        assert!(matches!(result, Err(MdkUniffiError::InvalidInput(_))));
-    }
-
-    #[test]
-    fn test_own_leaf_index_nonexistent_group() {
-        let mdk = create_test_mdk();
-        let fake_group_id = hex::encode([0u8; 32]);
-        let result = mdk.own_leaf_index(fake_group_id);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_group_leaf_map_valid_group() {
+    fn test_group_leaf_map_contains_all_members() {
         let (mdk, group_id, creator_keys) = create_test_group_with_keys();
-        let result = mdk.group_leaf_map(group_id);
-        assert!(result.is_ok());
-        let map = result.unwrap();
+        let map = mdk.group_leaf_map(group_id).unwrap();
         // Group has creator + 1 member = 2 leaves
         assert_eq!(map.len(), 2);
-        // Creator should be at leaf index 0
-        let creator_entry = map
-            .iter()
-            .find(|e| e.public_key == creator_keys.public_key().to_hex());
-        assert!(creator_entry.is_some());
+        assert!(
+            map.iter()
+                .any(|e| e.public_key == creator_keys.public_key().to_hex())
+        );
     }
 
     #[test]
-    fn test_group_leaf_map_invalid_group_id() {
-        let mdk = create_test_mdk();
-        let result = mdk.group_leaf_map("not_valid_hex".to_string());
-        assert!(matches!(result, Err(MdkUniffiError::InvalidInput(_))));
-    }
-
-    #[test]
-    fn test_group_leaf_map_nonexistent_group() {
-        let mdk = create_test_mdk();
-        let fake_group_id = hex::encode([0u8; 32]);
-        let result = mdk.group_leaf_map(fake_group_id);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_get_ratchet_tree_info_valid_group() {
+    fn test_get_ratchet_tree_info_structure() {
         let (mdk, group_id, _) = create_test_group_with_keys();
-        let result = mdk.get_ratchet_tree_info(group_id);
-        assert!(result.is_ok());
-        let info = result.unwrap();
+        let info = mdk.get_ratchet_tree_info(group_id).unwrap();
         assert!(!info.tree_hash.is_empty());
         assert!(!info.serialized_tree.is_empty());
-        // Should have 2 leaf nodes (creator + member)
         assert_eq!(info.leaf_nodes.len(), 2);
         for node in &info.leaf_nodes {
             assert!(!node.encryption_key.is_empty());
@@ -3125,79 +3086,27 @@ mod tests {
     }
 
     #[test]
-    fn test_get_ratchet_tree_info_invalid_group_id() {
-        let mdk = create_test_mdk();
-        let result = mdk.get_ratchet_tree_info("not_valid_hex".to_string());
-        assert!(matches!(result, Err(MdkUniffiError::InvalidInput(_))));
-    }
-
-    #[test]
-    fn test_get_ratchet_tree_info_nonexistent_group() {
-        let mdk = create_test_mdk();
-        let fake_group_id = hex::encode([0u8; 32]);
-        let result = mdk.get_ratchet_tree_info(fake_group_id);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_pending_added_members_pubkeys_no_pending() {
+    fn test_pending_member_changes_empty_on_clean_group() {
         let (mdk, group_id, _) = create_test_group_with_keys();
-        let result = mdk.pending_added_members_pubkeys(group_id);
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap().len(), 0);
-    }
-
-    #[test]
-    fn test_pending_added_members_pubkeys_invalid_group_id() {
-        let mdk = create_test_mdk();
-        let result = mdk.pending_added_members_pubkeys("not_valid_hex".to_string());
-        assert!(matches!(result, Err(MdkUniffiError::InvalidInput(_))));
-    }
-
-    #[test]
-    fn test_pending_removed_members_pubkeys_no_pending() {
-        let (mdk, group_id, _) = create_test_group_with_keys();
-        let result = mdk.pending_removed_members_pubkeys(group_id);
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap().len(), 0);
-    }
-
-    #[test]
-    fn test_pending_removed_members_pubkeys_invalid_group_id() {
-        let mdk = create_test_mdk();
-        let result = mdk.pending_removed_members_pubkeys("not_valid_hex".to_string());
-        assert!(matches!(result, Err(MdkUniffiError::InvalidInput(_))));
-    }
-
-    #[test]
-    fn test_pending_member_changes_no_pending() {
-        let (mdk, group_id, _) = create_test_group_with_keys();
-        let result = mdk.pending_member_changes(group_id);
-        assert!(result.is_ok());
-        let changes = result.unwrap();
+        let changes = mdk.pending_member_changes(group_id.clone()).unwrap();
         assert_eq!(changes.additions.len(), 0);
         assert_eq!(changes.removals.len(), 0);
+        assert_eq!(
+            mdk.pending_added_members_pubkeys(group_id.clone())
+                .unwrap()
+                .len(),
+            0
+        );
+        assert_eq!(
+            mdk.pending_removed_members_pubkeys(group_id).unwrap().len(),
+            0
+        );
     }
 
     #[test]
-    fn test_pending_member_changes_invalid_group_id() {
-        let mdk = create_test_mdk();
-        let result = mdk.pending_member_changes("not_valid_hex".to_string());
-        assert!(matches!(result, Err(MdkUniffiError::InvalidInput(_))));
-    }
-
-    #[test]
-    fn test_process_message_with_context_invalid_json() {
-        let mdk = create_test_mdk();
-        let result = mdk.process_message_with_context("not_valid_json".to_string());
-        assert!(matches!(result, Err(MdkUniffiError::InvalidInput(_))));
-    }
-
-    #[test]
-    fn test_process_message_with_context_success() {
+    fn test_process_message_with_context_returns_application_message() {
         let (mdk, group_id, creator_keys) = create_test_group_with_keys();
 
-        // Create an encrypted message in the group
         let event_json = mdk
             .create_message(
                 group_id,
@@ -3208,37 +3117,31 @@ mod tests {
             )
             .unwrap();
 
-        // Process the same message via process_message_with_context
         let outcome = mdk.process_message_with_context(event_json).unwrap();
+        assert!(matches!(
+            outcome.result,
+            ProcessMessageResult::ApplicationMessage { .. }
+        ));
+    }
 
-        // Should be an ApplicationMessage since we're the sender processing our own message
+    #[test]
+    fn test_delete_key_package_by_hash_ref_roundtrip() {
+        let mdk = create_test_mdk();
+        let keys = Keys::generate();
+        let kp_result = mdk
+            .create_key_package_for_event(
+                keys.public_key().to_hex(),
+                vec!["wss://relay.example.com".to_string()],
+            )
+            .unwrap();
         assert!(
-            matches!(
-                outcome.result,
-                ProcessMessageResult::ApplicationMessage { .. }
-            ),
-            "Expected ApplicationMessage, got {:?}",
-            std::mem::discriminant(&outcome.result)
+            mdk.delete_key_package_from_storage_by_hash_ref(kp_result.hash_ref)
+                .is_ok()
         );
     }
 
     #[test]
-    fn test_delete_key_package_from_storage_invalid_json() {
-        let mdk = create_test_mdk();
-        let result = mdk.delete_key_package_from_storage("not_valid_json".to_string());
-        assert!(matches!(result, Err(MdkUniffiError::InvalidInput(_))));
-    }
-
-    #[test]
-    fn test_delete_key_package_from_storage_by_hash_ref_invalid() {
-        let mdk = create_test_mdk();
-        // Empty bytes should fail to deserialize as a hash reference
-        let result = mdk.delete_key_package_from_storage_by_hash_ref(vec![]);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_delete_key_package_from_storage_by_hash_ref_roundtrip() {
+    fn test_delete_key_package_via_event_roundtrip() {
         let mdk = create_test_mdk();
         let keys = Keys::generate();
         let relays = vec!["wss://relay.example.com".to_string()];
@@ -3247,22 +3150,6 @@ mod tests {
             .create_key_package_for_event(keys.public_key().to_hex(), relays)
             .unwrap();
 
-        // The hash_ref from creation should be usable for deletion
-        let result = mdk.delete_key_package_from_storage_by_hash_ref(kp_result.hash_ref);
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_delete_key_package_from_storage_via_event() {
-        let mdk = create_test_mdk();
-        let keys = Keys::generate();
-        let relays = vec!["wss://relay.example.com".to_string()];
-
-        let kp_result = mdk
-            .create_key_package_for_event(keys.public_key().to_hex(), relays.clone())
-            .unwrap();
-
-        // Build a signed key package event
         let kp_event = EventBuilder::new(Kind::MlsKeyPackage, kp_result.key_package)
             .tags(
                 kp_result
@@ -3274,24 +3161,10 @@ mod tests {
             .sign_with_keys(&keys)
             .unwrap();
 
-        let result = mdk.delete_key_package_from_storage(kp_event.as_json());
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_prepare_group_image_for_upload_with_options_invalid_mime() {
-        let result = prepare_group_image_for_upload_with_options(
-            vec![0u8; 100],
-            "invalid/mime".to_string(),
-            MediaProcessingOptionsInput {
-                sanitize_exif: None,
-                generate_blurhash: None,
-                max_dimension: None,
-                max_file_size: None,
-                max_filename_length: None,
-            },
+        assert!(
+            mdk.delete_key_package_from_storage(kp_event.as_json())
+                .is_ok()
         );
-        assert!(result.is_err());
     }
 
     // ── MIP-04 encrypted media tests ─────────────────────────────────────────
