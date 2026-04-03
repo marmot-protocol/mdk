@@ -3106,6 +3106,9 @@ mod tests {
             ),
         };
         assert_eq!(message.sender_pubkey, alice_keys.public_key().to_hex());
+        // Verify the message content survives the UniFFI boundary
+        let event: serde_json::Value = serde_json::from_str(&message.event_json).unwrap();
+        assert_eq!(event["content"].as_str().unwrap(), "Hello Bob!");
 
         // Alice is leaf 0 (group creator)
         assert_eq!(outcome.sender_leaf_index, Some(0));
@@ -3131,6 +3134,8 @@ mod tests {
             ),
         };
         assert_eq!(message.sender_pubkey, bob_keys.public_key().to_hex());
+        let event: serde_json::Value = serde_json::from_str(&message.event_json).unwrap();
+        assert_eq!(event["content"].as_str().unwrap(), "Hello Alice!");
         // Bob is leaf 1
         assert_eq!(outcome.sender_leaf_index, Some(1));
     }
@@ -3175,14 +3180,39 @@ mod tests {
         assert_eq!(tree_info.leaf_nodes.len(), 2);
 
         // Each leaf node should have non-empty crypto material and a credential
-        // that maps to one of our known pubkeys
+        // identity that corresponds to one of the known group members
+        let known_pubkeys: std::collections::HashSet<String> = [
+            alice_keys.public_key().to_hex(),
+            bob_keys.public_key().to_hex(),
+        ]
+        .into_iter()
+        .collect();
+
         for node in &tree_info.leaf_nodes {
             assert!(!node.encryption_key.is_empty());
             assert!(!node.signature_key.is_empty());
-            assert!(!node.credential_identity.is_empty());
+            assert!(
+                known_pubkeys.contains(&node.credential_identity),
+                "credential_identity {} doesn't match any known member pubkey",
+                node.credential_identity
+            );
         }
+        // Verify both members are represented (no duplicates, no missing)
+        let tree_identities: std::collections::HashSet<&str> = tree_info
+            .leaf_nodes
+            .iter()
+            .map(|n| n.credential_identity.as_str())
+            .collect();
+        assert_eq!(
+            tree_identities.len(),
+            2,
+            "ratchet tree should contain exactly 2 distinct member identities"
+        );
 
-        // pending_member_changes: clean group should have no pending proposals
+        // pending_member_changes: clean group has no pending proposals.
+        // Note: non-empty pending proposals are structurally unreachable through
+        // the UniFFI API because MDK always creates commits (not standalone
+        // proposals), and SelfRemove proposals are auto-committed by receivers.
         let changes = alice_mdk.pending_member_changes(group_id.clone()).unwrap();
         assert!(changes.additions.is_empty());
         assert!(changes.removals.is_empty());
