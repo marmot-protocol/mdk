@@ -110,4 +110,13 @@ pub trait MessageStorage {
         group_id: &GroupId,
         content_substring: &str,
     ) -> Result<Option<u64>, MessageError>;
+
+    /// Delete all stored messages for a group.
+    ///
+    /// Removes decrypted message content from local storage. Does not affect
+    /// processed message records, the group's MLS state, or epoch secrets.
+    ///
+    /// Returns the number of messages deleted. Deleting messages for a group
+    /// with no messages returns `Ok(0)`.
+    fn delete_messages_for_group(&self, group_id: &GroupId) -> Result<usize, MessageError>;
 }

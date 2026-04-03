@@ -952,6 +952,95 @@ impl MdkStorageProvider for MdkMemoryStorage {
         let pruned_count = initial_count - snapshots.len();
         Ok(pruned_count)
     }
+
+    fn delete_group(&self, group_id: &GroupId) -> Result<(), MdkStorageError> {
+        {
+            let mut guard = self.inner.write();
+            let inner = &mut *guard;
+
+            // Messages (inlined for atomicity — avoids releasing/reacquiring lock)
+            if let Some(group_messages) = inner.messages_by_group_cache.pop(group_id) {
+                for event_id in group_messages.keys() {
+                    inner.messages_cache.pop(event_id);
+                }
+            }
+
+            // Group metadata
+            if let Some(group) = inner.groups_cache.pop(group_id) {
+                inner.groups_by_nostr_id_cache.pop(&group.nostr_group_id);
+            }
+
+            // Group relays
+            inner.group_relays_cache.pop(group_id);
+
+            // Exporter secrets (keyed by (GroupId, u64) — must iterate)
+            let secret_keys: Vec<(GroupId, u64)> = inner
+                .group_exporter_secrets_cache
+                .iter()
+                .filter(|((gid, _), _)| gid == group_id)
+                .map(|(k, _)| k.clone())
+                .collect();
+            for key in &secret_keys {
+                inner.group_exporter_secrets_cache.pop(key);
+            }
+
+            let legacy_keys: Vec<(GroupId, u64)> = inner
+                .group_legacy_exporter_secrets_cache
+                .iter()
+                .filter(|((gid, _), _)| gid == group_id)
+                .map(|(k, _)| k.clone())
+                .collect();
+            for key in &legacy_keys {
+                inner.group_legacy_exporter_secrets_cache.pop(key);
+            }
+
+            let mip04_keys: Vec<(GroupId, u64)> = inner
+                .group_mip04_exporter_secrets_cache
+                .iter()
+                .filter(|((gid, _), _)| gid == group_id)
+                .map(|(k, _)| k.clone())
+                .collect();
+            for key in &mip04_keys {
+                inner.group_mip04_exporter_secrets_cache.pop(key);
+            }
+
+            // Processed messages (keyed by EventId — must iterate for group match)
+            let pm_keys: Vec<nostr::EventId> = inner
+                .processed_messages_cache
+                .iter()
+                .filter(|(_, pm)| pm.mls_group_id.as_ref() == Some(group_id))
+                .map(|(k, _)| *k)
+                .collect();
+            for key in &pm_keys {
+                inner.processed_messages_cache.pop(key);
+            }
+
+            // OpenMLS data (typed methods handle key serialization)
+            inner
+                .mls_group_data
+                .clear_group(group_id)
+                .map_err(|e| MdkStorageError::Serialization(e.to_string()))?;
+            inner
+                .mls_own_leaf_nodes
+                .delete(group_id)
+                .map_err(|e| MdkStorageError::Serialization(e.to_string()))?;
+            inner
+                .mls_proposals
+                .clear(group_id)
+                .map_err(|e| MdkStorageError::Serialization(e.to_string()))?;
+            inner
+                .mls_epoch_key_pairs
+                .clear_group(group_id)
+                .map_err(|e| MdkStorageError::Serialization(e.to_string()))?;
+        }
+
+        // Snapshots (separate RwLock on outer struct)
+        self.group_snapshots
+            .write()
+            .retain(|(gid, _), _| gid != group_id);
+
+        Ok(())
+    }
 }
 
 // ============================================================================
@@ -3860,5 +3949,145 @@ mod tests {
              groups.epoch=5 but crypto state is epoch6 means split-brain: \
              MDK thinks epoch 5, MLS engine has epoch 6 keys."
         );
+    }
+
+    mod delete_group_tests {
+        use mdk_storage_traits::MdkStorageProvider;
+        use mdk_storage_traits::groups::GroupStorage;
+        use mdk_storage_traits::groups::types::{Group, GroupState, SelfUpdateState};
+        use mdk_storage_traits::messages::MessageStorage;
+        use mdk_storage_traits::messages::types::{
+            Message, MessageState, ProcessedMessage, ProcessedMessageState,
+        };
+        use nostr::{EventId, Keys, Kind, Tags, Timestamp, UnsignedEvent};
+        use std::collections::BTreeSet;
+
+        use super::*;
+
+        fn create_group(id_bytes: &[u8]) -> Group {
+            let group_id = GroupId::from_slice(id_bytes);
+            let mut nostr_group_id = [0u8; 32];
+            nostr_group_id[..id_bytes.len().min(32)]
+                .copy_from_slice(&id_bytes[..id_bytes.len().min(32)]);
+            Group {
+                mls_group_id: group_id,
+                nostr_group_id,
+                name: "Test".to_string(),
+                description: "".to_string(),
+                admin_pubkeys: BTreeSet::new(),
+                last_message_id: None,
+                last_message_at: None,
+                last_message_processed_at: None,
+                epoch: 1,
+                state: GroupState::Active,
+                image_hash: None,
+                image_key: None,
+                image_nonce: None,
+                self_update_state: SelfUpdateState::Required,
+            }
+        }
+
+        fn create_message(group_id: &GroupId, eid_bytes: &[u8; 32]) -> Message {
+            let pubkey = Keys::generate().public_key();
+            let now = Timestamp::now();
+            Message {
+                id: EventId::from_slice(eid_bytes).unwrap(),
+                pubkey,
+                kind: Kind::from(1u16),
+                mls_group_id: group_id.clone(),
+                created_at: now,
+                processed_at: now,
+                content: "test".to_string(),
+                tags: Tags::new(),
+                event: UnsignedEvent::new(
+                    pubkey,
+                    now,
+                    Kind::from(9u16),
+                    vec![],
+                    "test".to_string(),
+                ),
+                wrapper_event_id: EventId::all_zeros(),
+                epoch: Some(1),
+                state: MessageState::Created,
+            }
+        }
+
+        #[test]
+        fn delete_group_removes_all_state() {
+            let storage = MdkMemoryStorage::default();
+            let group_id = GroupId::from_slice(&[10, 20, 30]);
+            storage.save_group(create_group(&[10, 20, 30])).unwrap();
+            storage
+                .save_message(create_message(&group_id, &[1u8; 32]))
+                .unwrap();
+            let pm = ProcessedMessage {
+                wrapper_event_id: EventId::from_slice(&[0xFFu8; 32]).unwrap(),
+                message_event_id: None,
+                processed_at: Timestamp::now(),
+                epoch: Some(1),
+                mls_group_id: Some(group_id.clone()),
+                state: ProcessedMessageState::Processed,
+                failure_reason: None,
+            };
+            storage.save_processed_message(pm).unwrap();
+
+            storage.delete_group(&group_id).unwrap();
+
+            assert!(
+                storage
+                    .find_group_by_mls_group_id(&group_id)
+                    .unwrap()
+                    .is_none()
+            );
+            // Processed messages cleaned
+            assert!(
+                storage
+                    .find_processed_message_by_event_id(
+                        &EventId::from_slice(&[0xFFu8; 32]).unwrap()
+                    )
+                    .unwrap()
+                    .is_none()
+            );
+        }
+
+        #[test]
+        fn delete_group_is_idempotent() {
+            let storage = MdkMemoryStorage::default();
+            let group_id = GroupId::from_slice(&[99, 99, 99]);
+
+            let result = storage.delete_group(&group_id);
+            assert!(result.is_ok());
+        }
+
+        #[test]
+        fn delete_group_does_not_affect_other_groups() {
+            let storage = MdkMemoryStorage::default();
+            let group_a = GroupId::from_slice(&[1, 1, 1]);
+            let group_b = GroupId::from_slice(&[2, 2, 2]);
+            storage.save_group(create_group(&[1, 1, 1])).unwrap();
+            storage.save_group(create_group(&[2, 2, 2])).unwrap();
+            storage
+                .save_message(create_message(&group_a, &[0xAAu8; 32]))
+                .unwrap();
+            storage
+                .save_message(create_message(&group_b, &[0xBBu8; 32]))
+                .unwrap();
+
+            storage.delete_group(&group_a).unwrap();
+
+            assert!(
+                storage
+                    .find_group_by_mls_group_id(&group_a)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                storage
+                    .find_group_by_mls_group_id(&group_b)
+                    .unwrap()
+                    .is_some()
+            );
+            assert_eq!(storage.messages(&group_b, None).unwrap().len(), 1);
+        }
     }
 }

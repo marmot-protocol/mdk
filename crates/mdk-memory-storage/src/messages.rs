@@ -271,6 +271,25 @@ impl MessageStorage for MdkMemoryStorage {
 
         Ok(None)
     }
+
+    fn delete_messages_for_group(&self, group_id: &GroupId) -> Result<usize, MessageError> {
+        let mut guard = self.inner.write();
+        let inner = &mut *guard;
+
+        let event_ids: Vec<EventId> = inner
+            .messages_by_group_cache
+            .pop(group_id)
+            .map(|msgs| msgs.into_keys().collect())
+            .unwrap_or_default();
+
+        let count = event_ids.len();
+
+        for event_id in &event_ids {
+            inner.messages_cache.pop(event_id);
+        }
+
+        Ok(count)
+    }
 }
 
 #[cfg(test)]
@@ -998,5 +1017,73 @@ mod tests {
             .unwrap();
 
         assert_eq!(result, None);
+    }
+
+    #[test]
+    fn delete_messages_removes_all_messages_for_group() {
+        let storage = MdkMemoryStorage::default();
+        let group_id = GroupId::from_slice(&[10, 20, 30]);
+        storage
+            .save_group(create_test_group(group_id.clone()))
+            .unwrap();
+        let eid1 = EventId::from_slice(&[1u8; 32]).unwrap();
+        let eid2 = EventId::from_slice(&[2u8; 32]).unwrap();
+        storage
+            .save_message(create_test_message(eid1, group_id.clone(), "msg1", 100))
+            .unwrap();
+        storage
+            .save_message(create_test_message(eid2, group_id.clone(), "msg2", 101))
+            .unwrap();
+
+        let deleted = storage.delete_messages_for_group(&group_id).unwrap();
+
+        assert_eq!(deleted, 2);
+        assert!(storage.messages(&group_id, None).unwrap().is_empty());
+        // Group still exists
+        assert!(
+            storage
+                .find_group_by_mls_group_id(&group_id)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn delete_messages_is_idempotent_on_empty_group() {
+        let storage = MdkMemoryStorage::default();
+        let group_id = GroupId::from_slice(&[11, 22, 33]);
+        storage
+            .save_group(create_test_group(group_id.clone()))
+            .unwrap();
+
+        let deleted = storage.delete_messages_for_group(&group_id).unwrap();
+
+        assert_eq!(deleted, 0);
+    }
+
+    #[test]
+    fn delete_messages_does_not_affect_other_groups() {
+        let storage = MdkMemoryStorage::default();
+        let group_a = GroupId::from_slice(&[1, 1, 1]);
+        let group_b = GroupId::from_slice(&[2, 2, 2]);
+        storage
+            .save_group(create_test_group(group_a.clone()))
+            .unwrap();
+        storage
+            .save_group(create_test_group(group_b.clone()))
+            .unwrap();
+        let eid_a = EventId::from_slice(&[0xAAu8; 32]).unwrap();
+        let eid_b = EventId::from_slice(&[0xBBu8; 32]).unwrap();
+        storage
+            .save_message(create_test_message(eid_a, group_a.clone(), "a", 100))
+            .unwrap();
+        storage
+            .save_message(create_test_message(eid_b, group_b.clone(), "b", 100))
+            .unwrap();
+
+        storage.delete_messages_for_group(&group_a).unwrap();
+
+        assert!(storage.messages(&group_a, None).unwrap().is_empty());
+        assert_eq!(storage.messages(&group_b, None).unwrap().len(), 1);
     }
 }

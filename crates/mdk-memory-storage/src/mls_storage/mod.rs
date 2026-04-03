@@ -162,6 +162,16 @@ impl MlsGroupData {
         self.data.remove(&(group_id_bytes, data_type));
         Ok(())
     }
+
+    /// Clear all data for a group.
+    pub fn clear_group<GroupId>(&mut self, group_id: &GroupId) -> Result<(), MdkStorageError>
+    where
+        GroupId: Serialize,
+    {
+        let group_id_bytes = serialize_key(group_id)?;
+        self.data.retain(|(gid, _), _| *gid != group_id_bytes);
+        Ok(())
+    }
 }
 
 mls_store_base!(
@@ -380,6 +390,16 @@ impl MlsEpochKeyPairs {
         let group_id_bytes = serialize_key(group_id)?;
         let epoch_bytes = serialize_key(epoch)?;
         self.data.remove(&(group_id_bytes, epoch_bytes, leaf_index));
+        Ok(())
+    }
+
+    /// Clear all epoch key pairs for a group.
+    pub fn clear_group<GroupId>(&mut self, group_id: &GroupId) -> Result<(), MdkStorageError>
+    where
+        GroupId: Serialize,
+    {
+        let group_id_bytes = serialize_key(group_id)?;
+        self.data.retain(|(gid, _, _), _| *gid != group_id_bytes);
         Ok(())
     }
 }

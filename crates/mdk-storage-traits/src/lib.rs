@@ -351,6 +351,19 @@ pub trait MdkStorageProvider:
     ///
     /// The number of snapshots deleted, or an error.
     fn prune_expired_snapshots(&self, min_timestamp: u64) -> Result<usize, MdkStorageError>;
+
+    /// Delete all local state for a group.
+    ///
+    /// Removes the group, its messages, processed message records, MLS tree state,
+    /// epoch secrets, key material, proposals, and snapshots from local storage.
+    ///
+    /// This is irreversible. After deletion, the group cannot receive or decrypt
+    /// new messages. Call `leave_group()` before this method to notify other members.
+    ///
+    /// Idempotent: deleting a nonexistent group returns `Ok(())`.
+    ///
+    /// This is a local-only operation with no protocol-level side effects.
+    fn delete_group(&self, group_id: &GroupId) -> Result<(), MdkStorageError>;
 }
 
 #[cfg(test)]

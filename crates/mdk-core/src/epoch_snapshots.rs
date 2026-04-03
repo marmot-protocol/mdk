@@ -99,6 +99,16 @@ impl EpochSnapshotManager {
         }
     }
 
+    /// Remove all snapshot state for a group.
+    ///
+    /// Clears both the snapshot queue and the hydration tracking for the group.
+    /// Called when a group is deleted from storage.
+    pub fn remove_group(&self, group_id: &GroupId) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.snapshots.remove(group_id);
+        inner.hydrated_groups.remove(group_id);
+    }
+
     /// Ensure a group's snapshots have been loaded from storage.
     ///
     /// For persistent backends (SQLite), this loads existing snapshots into memory
@@ -1182,5 +1192,60 @@ mod tests {
         // parts[1] is the group_id hex, parts[3] is the commit_id hex
         assert_eq!(parts[1].len(), 64, "Group ID hex should be 64 chars");
         assert_eq!(parts[3].len(), 64, "Commit ID hex should be 64 chars");
+    }
+
+    #[test]
+    fn test_remove_group_clears_state() {
+        let manager = EpochSnapshotManager::new(5);
+        let group_id = test_group_id(1);
+
+        // Directly populate the manager's inner state
+        {
+            let mut inner = manager.inner.lock().unwrap();
+            inner
+                .snapshots
+                .entry(group_id.clone())
+                .or_default()
+                .push_back(EpochSnapshot {
+                    group_id: group_id.clone(),
+                    epoch: 5,
+                    applied_commit_id: test_event_id(
+                        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    ),
+                    applied_commit_ts: 999,
+                    applied_commit_content_hash: [0u8; 32],
+                    created_at: std::time::Instant::now(),
+                    snapshot_name: "snap_test".to_string(),
+                });
+            inner.hydrated_groups.insert(group_id.clone());
+        }
+
+        // Verify state exists
+        {
+            let inner = manager.inner.lock().unwrap();
+            assert!(inner.snapshots.contains_key(&group_id));
+            assert!(inner.hydrated_groups.contains(&group_id));
+        }
+
+        manager.remove_group(&group_id);
+
+        // Both maps cleaned
+        {
+            let inner = manager.inner.lock().unwrap();
+            assert!(!inner.snapshots.contains_key(&group_id));
+            assert!(!inner.hydrated_groups.contains(&group_id));
+        }
+    }
+
+    #[test]
+    fn test_remove_group_is_idempotent() {
+        let manager = EpochSnapshotManager::new(5);
+        let group_id = test_group_id(42);
+
+        // Removing a nonexistent group is a no-op
+        manager.remove_group(&group_id);
+
+        let inner = manager.inner.lock().unwrap();
+        assert!(!inner.snapshots.contains_key(&group_id));
     }
 }
