@@ -270,6 +270,47 @@ fn welcome_from_uniffi(w: Welcome) -> Result<welcome_types::Welcome, MdkUniffiEr
 
 /// Convert a core [`mdk_core::groups::UpdateGroupResult`] into the UniFFI-exported
 /// [`UpdateGroupResult`], serializing the evolution event and welcome rumors to JSON.
+fn message_processing_result_to_uniffi(
+    result: MessageProcessingResult,
+) -> Result<ProcessMessageResult, MdkUniffiError> {
+    Ok(match result {
+        MessageProcessingResult::ApplicationMessage(message) => {
+            ProcessMessageResult::ApplicationMessage {
+                message: Message::from(message),
+            }
+        }
+        MessageProcessingResult::Proposal(update_result) => ProcessMessageResult::Proposal {
+            result: update_group_result_to_uniffi(update_result)?,
+        },
+        MessageProcessingResult::PendingProposal { mls_group_id } => {
+            ProcessMessageResult::PendingProposal {
+                mls_group_id: hex::encode(mls_group_id.as_slice()),
+            }
+        }
+        MessageProcessingResult::ExternalJoinProposal { mls_group_id } => {
+            ProcessMessageResult::ExternalJoinProposal {
+                mls_group_id: hex::encode(mls_group_id.as_slice()),
+            }
+        }
+        MessageProcessingResult::Commit { mls_group_id } => ProcessMessageResult::Commit {
+            mls_group_id: hex::encode(mls_group_id.as_slice()),
+        },
+        MessageProcessingResult::Unprocessable { mls_group_id } => {
+            ProcessMessageResult::Unprocessable {
+                mls_group_id: hex::encode(mls_group_id.as_slice()),
+            }
+        }
+        MessageProcessingResult::IgnoredProposal {
+            mls_group_id,
+            reason,
+        } => ProcessMessageResult::IgnoredProposal {
+            mls_group_id: hex::encode(mls_group_id.as_slice()),
+            reason,
+        },
+        MessageProcessingResult::PreviouslyFailed => ProcessMessageResult::PreviouslyFailed,
+    })
+}
+
 fn update_group_result_to_uniffi(
     result: mdk_core::groups::UpdateGroupResult,
 ) -> Result<UpdateGroupResult, MdkUniffiError> {
@@ -937,43 +978,7 @@ impl Mdk {
         let event: Event = parse_json(&event_json, "event JSON")?;
         let mdk = self.lock()?;
         let result = mdk.process_message(&event)?;
-
-        Ok(match result {
-            MessageProcessingResult::ApplicationMessage(message) => {
-                ProcessMessageResult::ApplicationMessage {
-                    message: Message::from(message),
-                }
-            }
-            MessageProcessingResult::Proposal(update_result) => ProcessMessageResult::Proposal {
-                result: update_group_result_to_uniffi(update_result)?,
-            },
-            MessageProcessingResult::PendingProposal { mls_group_id } => {
-                ProcessMessageResult::PendingProposal {
-                    mls_group_id: hex::encode(mls_group_id.as_slice()),
-                }
-            }
-            MessageProcessingResult::ExternalJoinProposal { mls_group_id } => {
-                ProcessMessageResult::ExternalJoinProposal {
-                    mls_group_id: hex::encode(mls_group_id.as_slice()),
-                }
-            }
-            MessageProcessingResult::Commit { mls_group_id } => ProcessMessageResult::Commit {
-                mls_group_id: hex::encode(mls_group_id.as_slice()),
-            },
-            MessageProcessingResult::Unprocessable { mls_group_id } => {
-                ProcessMessageResult::Unprocessable {
-                    mls_group_id: hex::encode(mls_group_id.as_slice()),
-                }
-            }
-            MessageProcessingResult::IgnoredProposal {
-                mls_group_id,
-                reason,
-            } => ProcessMessageResult::IgnoredProposal {
-                mls_group_id: hex::encode(mls_group_id.as_slice()),
-                reason,
-            },
-            MessageProcessingResult::PreviouslyFailed => ProcessMessageResult::PreviouslyFailed,
-        })
+        message_processing_result_to_uniffi(result)
     }
 
     /// Process an incoming MLS message and return the result with additional MLS context
@@ -989,45 +994,8 @@ impl Mdk {
         let mdk = self.lock()?;
         let outcome = mdk.process_message_with_context(&event)?;
 
-        let result = match outcome.result {
-            MessageProcessingResult::ApplicationMessage(message) => {
-                ProcessMessageResult::ApplicationMessage {
-                    message: Message::from(message),
-                }
-            }
-            MessageProcessingResult::Proposal(update_result) => ProcessMessageResult::Proposal {
-                result: update_group_result_to_uniffi(update_result)?,
-            },
-            MessageProcessingResult::PendingProposal { mls_group_id } => {
-                ProcessMessageResult::PendingProposal {
-                    mls_group_id: hex::encode(mls_group_id.as_slice()),
-                }
-            }
-            MessageProcessingResult::ExternalJoinProposal { mls_group_id } => {
-                ProcessMessageResult::ExternalJoinProposal {
-                    mls_group_id: hex::encode(mls_group_id.as_slice()),
-                }
-            }
-            MessageProcessingResult::Commit { mls_group_id } => ProcessMessageResult::Commit {
-                mls_group_id: hex::encode(mls_group_id.as_slice()),
-            },
-            MessageProcessingResult::Unprocessable { mls_group_id } => {
-                ProcessMessageResult::Unprocessable {
-                    mls_group_id: hex::encode(mls_group_id.as_slice()),
-                }
-            }
-            MessageProcessingResult::IgnoredProposal {
-                mls_group_id,
-                reason,
-            } => ProcessMessageResult::IgnoredProposal {
-                mls_group_id: hex::encode(mls_group_id.as_slice()),
-                reason,
-            },
-            MessageProcessingResult::PreviouslyFailed => ProcessMessageResult::PreviouslyFailed,
-        };
-
         Ok(ProcessMessageWithContextResult {
-            result,
+            result: message_processing_result_to_uniffi(outcome.result)?,
             sender_leaf_index: outcome.context.sender_leaf_index,
         })
     }
