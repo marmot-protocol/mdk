@@ -17,6 +17,7 @@ use mdk_core::{
         decrypt_group_image as core_decrypt_group_image,
         derive_upload_keypair as core_derive_upload_keypair,
         prepare_group_image_for_upload as core_prepare_group_image_for_upload,
+        prepare_group_image_for_upload_with_options as core_prepare_group_image_for_upload_with_options,
     },
     groups::{NostrGroupConfigData, NostrGroupDataUpdate},
     messages::MessageProcessingResult,
@@ -974,6 +975,222 @@ impl Mdk {
             MessageProcessingResult::PreviouslyFailed => ProcessMessageResult::PreviouslyFailed,
         })
     }
+
+    /// Process an incoming MLS message and return the result with additional MLS context
+    ///
+    /// Unlike `process_message`, this method also returns transient MLS context
+    /// such as the sender's leaf index, which is useful for UI display or
+    /// verification purposes.
+    pub fn process_message_with_context(
+        &self,
+        event_json: String,
+    ) -> Result<ProcessMessageWithContextResult, MdkUniffiError> {
+        let event: Event = parse_json(&event_json, "event JSON")?;
+        let mdk = self.lock()?;
+        let outcome = mdk.process_message_with_context(&event)?;
+
+        let result = match outcome.result {
+            MessageProcessingResult::ApplicationMessage(message) => {
+                ProcessMessageResult::ApplicationMessage {
+                    message: Message::from(message),
+                }
+            }
+            MessageProcessingResult::Proposal(update_result) => ProcessMessageResult::Proposal {
+                result: update_group_result_to_uniffi(update_result)?,
+            },
+            MessageProcessingResult::PendingProposal { mls_group_id } => {
+                ProcessMessageResult::PendingProposal {
+                    mls_group_id: hex::encode(mls_group_id.as_slice()),
+                }
+            }
+            MessageProcessingResult::ExternalJoinProposal { mls_group_id } => {
+                ProcessMessageResult::ExternalJoinProposal {
+                    mls_group_id: hex::encode(mls_group_id.as_slice()),
+                }
+            }
+            MessageProcessingResult::Commit { mls_group_id } => ProcessMessageResult::Commit {
+                mls_group_id: hex::encode(mls_group_id.as_slice()),
+            },
+            MessageProcessingResult::Unprocessable { mls_group_id } => {
+                ProcessMessageResult::Unprocessable {
+                    mls_group_id: hex::encode(mls_group_id.as_slice()),
+                }
+            }
+            MessageProcessingResult::IgnoredProposal {
+                mls_group_id,
+                reason,
+            } => ProcessMessageResult::IgnoredProposal {
+                mls_group_id: hex::encode(mls_group_id.as_slice()),
+                reason,
+            },
+            MessageProcessingResult::PreviouslyFailed => ProcessMessageResult::PreviouslyFailed,
+        };
+
+        Ok(ProcessMessageWithContextResult {
+            result,
+            sender_leaf_index: outcome.context.sender_leaf_index,
+        })
+    }
+
+    /// Delete a key package from MLS storage using a key package Nostr event
+    ///
+    /// Parses the key package from the given kind-443 event and removes it
+    /// from the MLS provider's storage.
+    ///
+    /// # Arguments
+    ///
+    /// * `key_package_event_json` - JSON-encoded Nostr key package event (kind 443)
+    pub fn delete_key_package_from_storage(
+        &self,
+        key_package_event_json: String,
+    ) -> Result<(), MdkUniffiError> {
+        let event: Event = parse_json(&key_package_event_json, "key package event JSON")?;
+        let mdk = self.lock()?;
+        let key_package = mdk.parse_key_package(&event)?;
+        mdk.delete_key_package_from_storage(&key_package)?;
+        Ok(())
+    }
+
+    /// Delete a key package from storage using previously serialized hash_ref bytes
+    ///
+    /// The `hash_ref` should be the bytes returned as the third element of
+    /// `create_key_package_for_event`.
+    ///
+    /// # Arguments
+    ///
+    /// * `hash_ref` - Serialized hash reference bytes from key package creation
+    pub fn delete_key_package_from_storage_by_hash_ref(
+        &self,
+        hash_ref: Vec<u8>,
+    ) -> Result<(), MdkUniffiError> {
+        let mdk = self.lock()?;
+        mdk.delete_key_package_from_storage_by_hash_ref(&hash_ref)?;
+        Ok(())
+    }
+
+    /// Get public information about the ratchet tree of an MLS group
+    ///
+    /// This includes a SHA-256 fingerprint of the TLS-serialized ratchet tree,
+    /// the full serialized tree as hex, and a list of leaf nodes with their
+    /// indices and public keys.
+    ///
+    /// # Arguments
+    ///
+    /// * `group_id_hex` - Hex-encoded MLS group ID
+    pub fn get_ratchet_tree_info(
+        &self,
+        group_id_hex: String,
+    ) -> Result<UniffiRatchetTreeInfo, MdkUniffiError> {
+        let group_id = parse_group_id(&group_id_hex)?;
+        let mdk = self.lock()?;
+        let info = mdk.get_ratchet_tree_info(&group_id)?;
+
+        Ok(UniffiRatchetTreeInfo {
+            tree_hash: info.tree_hash,
+            serialized_tree: info.serialized_tree,
+            leaf_nodes: info
+                .leaf_nodes
+                .into_iter()
+                .map(|n| UniffiLeafNodeInfo {
+                    index: n.index,
+                    encryption_key: n.encryption_key,
+                    signature_key: n.signature_key,
+                    credential_identity: n.credential_identity,
+                })
+                .collect(),
+        })
+    }
+
+    /// Returns the current active MLS leaf positions and their bound Nostr public keys
+    ///
+    /// Returns a list of (leaf_index, public_key_hex) pairs. Removed-member tree
+    /// holes are omitted.
+    ///
+    /// # Arguments
+    ///
+    /// * `group_id_hex` - Hex-encoded MLS group ID
+    pub fn group_leaf_map(
+        &self,
+        group_id_hex: String,
+    ) -> Result<Vec<LeafMapEntry>, MdkUniffiError> {
+        let group_id = parse_group_id(&group_id_hex)?;
+        let mdk = self.lock()?;
+        let map = mdk.group_leaf_map(&group_id)?;
+
+        Ok(map
+            .into_iter()
+            .map(|(index, pubkey)| LeafMapEntry {
+                leaf_index: index,
+                public_key: pubkey.to_hex(),
+            })
+            .collect())
+    }
+
+    /// Returns the local member's current MLS leaf index for a group
+    ///
+    /// # Arguments
+    ///
+    /// * `group_id_hex` - Hex-encoded MLS group ID
+    pub fn own_leaf_index(&self, group_id_hex: String) -> Result<u32, MdkUniffiError> {
+        let group_id = parse_group_id(&group_id_hex)?;
+        let mdk = self.lock()?;
+        Ok(mdk.own_leaf_index(&group_id)?)
+    }
+
+    /// Gets the public keys of members that will be added from pending proposals
+    ///
+    /// Returns hex-encoded public keys of members in pending Add proposals.
+    ///
+    /// # Arguments
+    ///
+    /// * `group_id_hex` - Hex-encoded MLS group ID
+    pub fn pending_added_members_pubkeys(
+        &self,
+        group_id_hex: String,
+    ) -> Result<Vec<String>, MdkUniffiError> {
+        let group_id = parse_group_id(&group_id_hex)?;
+        let mdk = self.lock()?;
+        let pubkeys = mdk.pending_added_members_pubkeys(&group_id)?;
+        Ok(pubkeys.iter().map(|pk| pk.to_hex()).collect())
+    }
+
+    /// Gets all pending member changes (additions and removals) from pending proposals
+    ///
+    /// Returns a combined view of all pending member changes in a group.
+    ///
+    /// # Arguments
+    ///
+    /// * `group_id_hex` - Hex-encoded MLS group ID
+    pub fn pending_member_changes(
+        &self,
+        group_id_hex: String,
+    ) -> Result<UniffiPendingMemberChanges, MdkUniffiError> {
+        let group_id = parse_group_id(&group_id_hex)?;
+        let mdk = self.lock()?;
+        let changes = mdk.pending_member_changes(&group_id)?;
+
+        Ok(UniffiPendingMemberChanges {
+            additions: changes.additions.iter().map(|pk| pk.to_hex()).collect(),
+            removals: changes.removals.iter().map(|pk| pk.to_hex()).collect(),
+        })
+    }
+
+    /// Gets the public keys of members that will be removed from pending proposals
+    ///
+    /// Returns hex-encoded public keys of members in pending Remove proposals.
+    ///
+    /// # Arguments
+    ///
+    /// * `group_id_hex` - Hex-encoded MLS group ID
+    pub fn pending_removed_members_pubkeys(
+        &self,
+        group_id_hex: String,
+    ) -> Result<Vec<String>, MdkUniffiError> {
+        let group_id = parse_group_id(&group_id_hex)?;
+        let mdk = self.lock()?;
+        let pubkeys = mdk.pending_removed_members_pubkeys(&group_id)?;
+        Ok(pubkeys.iter().map(|pk| pk.to_hex()).collect())
+    }
 }
 
 /// Result of creating a key package
@@ -1072,6 +1289,57 @@ pub enum ProcessMessageResult {
     /// failed. Unlike throwing an error, this allows clients to handle the
     /// case gracefully without crashing.
     PreviouslyFailed,
+}
+
+/// Result of processing a message with additional MLS context
+#[derive(uniffi::Record)]
+pub struct ProcessMessageWithContextResult {
+    /// The primary processing result
+    pub result: ProcessMessageResult,
+    /// The MLS sender leaf index, if the sender is a group member
+    pub sender_leaf_index: Option<u32>,
+}
+
+/// An entry in the group leaf map
+#[derive(uniffi::Record)]
+pub struct LeafMapEntry {
+    /// The leaf index in the ratchet tree
+    pub leaf_index: u32,
+    /// Hex-encoded Nostr public key bound to this leaf
+    pub public_key: String,
+}
+
+/// Public information about a leaf node in the ratchet tree
+#[derive(uniffi::Record)]
+pub struct UniffiLeafNodeInfo {
+    /// The leaf index in the ratchet tree
+    pub index: u32,
+    /// The member's public HPKE encryption key (hex-encoded)
+    pub encryption_key: String,
+    /// The member's public signature key (hex-encoded)
+    pub signature_key: String,
+    /// The member's credential identity (hex-encoded, typically a Nostr public key)
+    pub credential_identity: String,
+}
+
+/// Public information about the ratchet tree of an MLS group
+#[derive(uniffi::Record)]
+pub struct UniffiRatchetTreeInfo {
+    /// SHA-256 fingerprint of the TLS-serialized ratchet tree (hex-encoded)
+    pub tree_hash: String,
+    /// The full ratchet tree serialized via TLS encoding (hex-encoded)
+    pub serialized_tree: String,
+    /// Leaf nodes with their indices and public keys
+    pub leaf_nodes: Vec<UniffiLeafNodeInfo>,
+}
+
+/// Pending member changes from proposals that need admin approval
+#[derive(uniffi::Record)]
+pub struct UniffiPendingMemberChanges {
+    /// Hex-encoded public keys of members that will be added when proposals are committed
+    pub additions: Vec<String>,
+    /// Hex-encoded public keys of members that will be removed when proposals are committed
+    pub removals: Vec<String>,
 }
 
 /// Group representation
@@ -1303,6 +1571,40 @@ pub fn prepare_group_image_for_upload(
 ) -> Result<GroupImageUpload, MdkUniffiError> {
     let prepared = core_prepare_group_image_for_upload(&image_data, &mime_type)
         .map_err(|e| MdkUniffiError::Mdk(e.to_string()))?;
+
+    Ok(GroupImageUpload {
+        encrypted_data: prepared.encrypted_data.as_ref().clone(),
+        encrypted_hash: prepared.encrypted_hash.to_vec(),
+        image_key: prepared.image_key.as_ref().to_vec(),
+        image_nonce: prepared.image_nonce.as_ref().to_vec(),
+        upload_secret_key: prepared.upload_keypair.secret_key().to_secret_hex(),
+        original_size: prepared.original_size as u64,
+        encrypted_size: prepared.encrypted_size as u64,
+        mime_type: prepared.mime_type.clone(),
+        dimensions: prepared.dimensions.map(|(w, h)| ImageDimensions {
+            width: w,
+            height: h,
+        }),
+        blurhash: prepared.blurhash.clone(),
+    })
+}
+
+/// Prepare group image for upload with custom processing options
+///
+/// Like `prepare_group_image_for_upload`, but allows customizing validation
+/// and processing behavior such as EXIF stripping, blurhash generation,
+/// and size limits.
+#[uniffi::export]
+pub fn prepare_group_image_for_upload_with_options(
+    image_data: Vec<u8>,
+    mime_type: String,
+    options: MediaProcessingOptionsInput,
+) -> Result<GroupImageUpload, MdkUniffiError> {
+    let core_options = MediaProcessingOptions::try_from(options)
+        .map_err(|e| MdkUniffiError::InvalidInput(format!("Invalid processing options: {e}")))?;
+    let prepared =
+        core_prepare_group_image_for_upload_with_options(&image_data, &mime_type, &core_options)
+            .map_err(|e| MdkUniffiError::Mdk(e.to_string()))?;
 
     Ok(GroupImageUpload {
         encrypted_data: prepared.encrypted_data.as_ref().clone(),
