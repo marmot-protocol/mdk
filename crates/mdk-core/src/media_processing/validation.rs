@@ -417,6 +417,7 @@ mod tests {
         let custom_options = MediaProcessingOptions {
             sanitize_exif: false,
             generate_blurhash: false,
+            generate_thumbhash: false,
             max_file_size: Some(500),
             ..Default::default()
         };
@@ -533,6 +534,7 @@ mod tests {
         let no_limit_options = MediaProcessingOptions {
             sanitize_exif: false,
             generate_blurhash: false,
+            generate_thumbhash: false,
             max_dimension: None,
             ..Default::default()
         };
@@ -550,6 +552,7 @@ mod tests {
         let custom_options = MediaProcessingOptions {
             sanitize_exif: false,
             generate_blurhash: false,
+            generate_thumbhash: false,
             max_dimension: Some(1024),
             ..Default::default()
         };
@@ -565,6 +568,7 @@ mod tests {
         let options = MediaProcessingOptions {
             sanitize_exif: false,
             generate_blurhash: false,
+            generate_thumbhash: false,
             max_dimension: None, // No individual dimension limit
             ..Default::default()
         };

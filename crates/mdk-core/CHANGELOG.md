@@ -39,6 +39,7 @@
 
 ### Added
 
+- Added ThumbHash preview generation alongside existing BlurHash support. `MediaProcessingOptions` now includes `generate_thumbhash`, `ImageMetadata`, `MediaMetadata`, `EncryptedMediaUpload`, and `GroupImageUpload` expose optional `thumbhash`, and encrypted-media IMETA writing emits `thumbhash` while parsing accepts both `blurhash` and `thumbhash` tags for compatibility. ([#244](https://github.com/marmot-protocol/mdk/pull/244))
 - SelfRemove proposal type (`0x000a`) added to client capabilities, group required capabilities, and KeyPackage `mls_proposals` tag per MIP-03.
 - Admin depletion validation: SelfRemove proposals and commits are rejected if they would leave the group with zero admins.
 - Added feature-gated MIP-05 notification request builders that group token tags by notification server, preserve relay hints, chunk requests at 100 tokens per server, and return ready-to-publish gift-wrapped notification batches for `kind:446` delivery. ([#238](https://github.com/marmot-protocol/mdk/pull/238))

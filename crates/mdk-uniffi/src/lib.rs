@@ -1524,6 +1524,8 @@ pub struct GroupImageUpload {
     pub dimensions: Option<ImageDimensions>,
     /// Blurhash for preview if generated
     pub blurhash: Option<String>,
+    /// Thumbhash for preview if generated
+    pub thumbhash: Option<String>,
 }
 
 /// Image dimensions
@@ -1558,6 +1560,7 @@ pub fn prepare_group_image_for_upload(
             height: h,
         }),
         blurhash: prepared.blurhash.clone(),
+        thumbhash: prepared.thumbhash.clone(),
     })
 }
 
@@ -1592,6 +1595,7 @@ pub fn prepare_group_image_for_upload_with_options(
             height: h,
         }),
         blurhash: prepared.blurhash.clone(),
+        thumbhash: prepared.thumbhash.clone(),
     })
 }
 
@@ -1647,8 +1651,9 @@ pub fn derive_upload_keypair(image_key: Vec<u8>, version: u16) -> Result<String,
 ///
 /// `max_dimension`, `max_file_size`, and `max_filename_length` are optional and
 /// fall back to sensible, privacy-first defaults when `None`.
-/// `sanitize_exif` and `generate_blurhash` are explicit toggles; pass `None` to
-/// accept the privacy-first defaults (`true` for both).
+/// `sanitize_exif`, `generate_blurhash`, and `generate_thumbhash` are explicit
+/// toggles; pass `None` to accept the privacy-first defaults (`true` for all
+/// preview hashes).
 /// To use all defaults without constructing this struct, call
 /// `encrypt_media_for_upload`.
 #[derive(Debug, Clone, uniffi::Record)]
@@ -1657,6 +1662,8 @@ pub struct MediaProcessingOptionsInput {
     pub sanitize_exif: Option<bool>,
     /// Generate a blurhash preview string for images (default: `true`)
     pub generate_blurhash: Option<bool>,
+    /// Generate a thumbhash preview string for images (default: `true`)
+    pub generate_thumbhash: Option<bool>,
     /// Maximum allowed image dimension in pixels (default: 16384)
     pub max_dimension: Option<u32>,
     /// Maximum allowed file size in bytes (default: 100 MiB)
@@ -1672,6 +1679,7 @@ impl TryFrom<MediaProcessingOptionsInput> for MediaProcessingOptions {
         Ok(Self {
             sanitize_exif: o.sanitize_exif.unwrap_or(true),
             generate_blurhash: o.generate_blurhash.unwrap_or(true),
+            generate_thumbhash: o.generate_thumbhash.unwrap_or(true),
             max_dimension: o.max_dimension,
             max_file_size: o.max_file_size.map(usize::try_from).transpose()?,
             max_filename_length: o.max_filename_length.map(usize::try_from).transpose()?,
@@ -1703,6 +1711,8 @@ pub struct EncryptedMediaUploadResult {
     pub dimensions: Option<Vec<u32>>,
     /// Blurhash preview string if generated, otherwise `None`
     pub blurhash: Option<String>,
+    /// Thumbhash preview string if generated, otherwise `None`
+    pub thumbhash: Option<String>,
     /// 12-byte ChaCha20-Poly1305 nonce used for encryption
     pub nonce: Vec<u8>,
 }
@@ -1721,6 +1731,7 @@ impl TryFrom<EncryptedMediaUpload> for EncryptedMediaUploadResult {
             encrypted_size: u.encrypted_size,
             dimensions: u.dimensions.map(|(w, h)| vec![w, h]),
             blurhash: u.blurhash,
+            thumbhash: u.thumbhash,
             nonce: u.nonce.to_vec(),
         })
     }
@@ -1805,7 +1816,8 @@ impl Mdk {
     ///
     /// Encrypts the supplied media file with the group's current MLS epoch key,
     /// producing ciphertext ready to upload to a Blossom server. Images are
-    /// automatically EXIF-sanitized and a blurhash preview is generated.
+    /// automatically EXIF-sanitized and blurhash/thumbhash preview hashes are
+    /// generated.
     ///
     /// After uploading the encrypted bytes, call `create_media_imeta_tag` with
     /// the returned result and the Blossom URL to build the IMETA tag to attach
@@ -1835,8 +1847,8 @@ impl Mdk {
 
     /// Encrypt media for upload with custom processing options
     ///
-    /// Same as `encrypt_media_for_upload` but lets you override EXIF sanitization,
-    /// blurhash generation, and size/dimension limits.
+    /// Same as `encrypt_media_for_upload` but lets you override EXIF
+    /// sanitization, preview hash generation, and size/dimension limits.
     ///
     /// # Arguments
     ///
@@ -1996,6 +2008,7 @@ impl TryFrom<EncryptedMediaUploadResult> for EncryptedMediaUpload {
             encrypted_size: r.encrypted_size,
             dimensions,
             blurhash: r.blurhash,
+            thumbhash: r.thumbhash,
             nonce,
         })
     }
@@ -3280,13 +3293,14 @@ mod tests {
         }
 
         #[test]
-        fn test_encrypt_with_options_no_blurhash() {
+        fn test_encrypt_with_options_no_preview_hashes() {
             let mdk = create_test_mdk();
             let group_id = create_test_group(&mdk);
 
             let options = MediaProcessingOptionsInput {
                 sanitize_exif: Some(true),
                 generate_blurhash: Some(false),
+                generate_thumbhash: Some(false),
                 max_dimension: None,
                 max_file_size: None,
                 max_filename_length: None,
@@ -3305,6 +3319,10 @@ mod tests {
             assert!(
                 upload.blurhash.is_none(),
                 "Expected no blurhash when generate_blurhash = false"
+            );
+            assert!(
+                upload.thumbhash.is_none(),
+                "Expected no thumbhash when generate_thumbhash = false"
             );
         }
 
