@@ -958,16 +958,30 @@ impl MdkStorageProvider for MdkMemoryStorage {
             let mut guard = self.inner.write();
             let inner = &mut *guard;
 
-            // Messages (inlined for atomicity — avoids releasing/reacquiring lock)
-            if let Some(group_messages) = inner.messages_by_group_cache.pop(group_id) {
-                for event_id in group_messages.keys() {
-                    inner.messages_cache.pop(event_id);
-                }
+            // Messages — scan messages_cache directly since the two LRU caches
+            // can diverge (per-group entry evicted while individual messages remain)
+            inner.messages_by_group_cache.pop(group_id);
+            let orphaned_msgs: Vec<nostr::EventId> = inner
+                .messages_cache
+                .iter()
+                .filter(|(_, msg)| &msg.mls_group_id == group_id)
+                .map(|(eid, _)| *eid)
+                .collect();
+            for eid in &orphaned_msgs {
+                inner.messages_cache.pop(eid);
             }
 
-            // Group metadata
-            if let Some(group) = inner.groups_cache.pop(group_id) {
-                inner.groups_by_nostr_id_cache.pop(&group.nostr_group_id);
+            // Group metadata — scan nostr index independently since the two
+            // group caches can diverge under LRU eviction
+            inner.groups_cache.pop(group_id);
+            let nostr_ids: Vec<[u8; 32]> = inner
+                .groups_by_nostr_id_cache
+                .iter()
+                .filter(|(_, group)| &group.mls_group_id == group_id)
+                .map(|(nid, _)| *nid)
+                .collect();
+            for nid in &nostr_ids {
+                inner.groups_by_nostr_id_cache.pop(nid);
             }
 
             // Group relays

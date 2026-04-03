@@ -276,15 +276,20 @@ impl MessageStorage for MdkMemoryStorage {
         let mut guard = self.inner.write();
         let inner = &mut *guard;
 
-        let event_ids: Vec<EventId> = inner
-            .messages_by_group_cache
-            .pop(group_id)
-            .map(|msgs| msgs.into_keys().collect())
-            .unwrap_or_default();
+        // Remove the per-group index entry
+        inner.messages_by_group_cache.pop(group_id);
 
-        let count = event_ids.len();
+        // Scan messages_cache directly — the two LRU caches can diverge if the
+        // per-group entry was evicted while individual messages remain.
+        let orphaned: Vec<EventId> = inner
+            .messages_cache
+            .iter()
+            .filter(|(_, msg)| &msg.mls_group_id == group_id)
+            .map(|(eid, _)| *eid)
+            .collect();
 
-        for event_id in &event_ids {
+        let count = orphaned.len();
+        for event_id in &orphaned {
             inner.messages_cache.pop(event_id);
         }
 
@@ -1085,5 +1090,39 @@ mod tests {
 
         assert!(storage.messages(&group_a, None).unwrap().is_empty());
         assert_eq!(storage.messages(&group_b, None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn delete_messages_handles_lru_divergence() {
+        // Directly manipulate the inner caches to simulate LRU divergence:
+        // messages_cache has an entry for group_a, but messages_by_group_cache
+        // does not (simulating eviction of the per-group index).
+        let storage = MdkMemoryStorage::default();
+        let group_id = GroupId::from_slice(&[1, 1, 1]);
+        storage
+            .save_group(create_test_group(group_id.clone()))
+            .unwrap();
+
+        let eid = EventId::from_slice(&[0xAAu8; 32]).unwrap();
+        storage
+            .save_message(create_test_message(eid, group_id.clone(), "orphan", 100))
+            .unwrap();
+
+        // Simulate LRU eviction: remove the per-group index but leave the
+        // individual message in messages_cache
+        {
+            let mut guard = storage.inner.write();
+            guard.messages_by_group_cache.pop(&group_id);
+        }
+
+        // delete_messages_for_group must still find and remove the orphaned message
+        let deleted = storage.delete_messages_for_group(&group_id).unwrap();
+        assert_eq!(deleted, 1);
+        assert!(
+            storage
+                .find_message_by_event_id(&group_id, &eid)
+                .unwrap()
+                .is_none()
+        );
     }
 }
