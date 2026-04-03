@@ -3194,6 +3194,35 @@ mod tests {
     }
 
     #[test]
+    fn test_process_message_with_context_success() {
+        let (mdk, group_id, creator_keys) = create_test_group_with_keys();
+
+        // Create an encrypted message in the group
+        let event_json = mdk
+            .create_message(
+                group_id,
+                creator_keys.public_key().to_hex(),
+                "Hello from context test".to_string(),
+                1,
+                None,
+            )
+            .unwrap();
+
+        // Process the same message via process_message_with_context
+        let outcome = mdk.process_message_with_context(event_json).unwrap();
+
+        // Should be an ApplicationMessage since we're the sender processing our own message
+        assert!(
+            matches!(
+                outcome.result,
+                ProcessMessageResult::ApplicationMessage { .. }
+            ),
+            "Expected ApplicationMessage, got {:?}",
+            std::mem::discriminant(&outcome.result)
+        );
+    }
+
+    #[test]
     fn test_delete_key_package_from_storage_invalid_json() {
         let mdk = create_test_mdk();
         let result = mdk.delete_key_package_from_storage("not_valid_json".to_string());
