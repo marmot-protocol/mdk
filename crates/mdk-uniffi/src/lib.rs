@@ -986,6 +986,10 @@ impl Mdk {
     /// Unlike `process_message`, this method also returns transient MLS context
     /// such as the sender's leaf index, which is useful for UI display or
     /// verification purposes.
+    ///
+    /// # Arguments
+    ///
+    /// * `event_json` - JSON-encoded Nostr event containing the MLS message
     pub fn process_message_with_context(
         &self,
         event_json: String,
