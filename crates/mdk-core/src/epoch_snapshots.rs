@@ -31,6 +31,11 @@ pub struct EpochSnapshot {
     pub applied_commit_id: EventId,
     /// The timestamp of the applied commit (for MIP-03 comparison)
     pub applied_commit_ts: u64,
+    /// SHA-256 hash of the outer event content (the `base64(nonce || ciphertext)` string).
+    /// Used to detect re-wrapped events carrying the same ciphertext — if a candidate
+    /// commit has the same content hash as the applied commit, it is a replay and must
+    /// not trigger a rollback regardless of its outer timestamp or event ID.
+    pub applied_commit_content_hash: [u8; 32],
     /// When the snapshot was created
     pub created_at: Instant,
     /// The unique name of the snapshot in storage
@@ -179,6 +184,7 @@ impl EpochSnapshotManager {
             epoch,
             applied_commit_id: commit_id,
             applied_commit_ts: 0, // Unknown after restart - hydrated snapshots should not be used for is_better_candidate
+            applied_commit_content_hash: [0u8; 32], // Unknown after restart
             created_at: Instant::now(), // Placeholder - not used for comparisons
             snapshot_name: snapshot_name.to_string(),
         })
@@ -192,6 +198,7 @@ impl EpochSnapshotManager {
         current_epoch: u64,
         commit_id: &EventId,
         commit_ts: u64,
+        content_hash: &[u8; 32],
     ) -> Result<String, Error> {
         // Ensure we have loaded any existing snapshots from storage
         self.ensure_hydrated(storage, group_id);
@@ -215,6 +222,7 @@ impl EpochSnapshotManager {
             epoch: current_epoch,
             applied_commit_id: *commit_id,
             applied_commit_ts: commit_ts,
+            applied_commit_content_hash: *content_hash,
             created_at: Instant::now(),
             snapshot_name: snapshot_name.clone(),
         };
@@ -238,6 +246,10 @@ impl EpochSnapshotManager {
 
     /// Check if a candidate commit is "better" than the one we applied for this epoch.
     /// Returns true if we should rollback.
+    ///
+    /// `candidate_content_hash` is the SHA-256 hash of the outer event content. If it
+    /// matches the hash of the already-applied commit, the candidate is a re-wrapped
+    /// copy of the same ciphertext and is rejected regardless of timestamp or event ID.
     pub fn is_better_candidate<S: MdkStorageProvider>(
         &self,
         storage: &S,
@@ -245,20 +257,48 @@ impl EpochSnapshotManager {
         candidate_epoch: u64,
         candidate_ts: u64,
         candidate_id: &EventId,
+        candidate_content_hash: &[u8; 32],
     ) -> bool {
         // Ensure we have loaded any existing snapshots from storage
         self.ensure_hydrated(storage, group_id);
 
-        let inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap();
 
-        if let Some(queue) = inner.snapshots.get(group_id)
-            && let Some(snapshot) = queue.iter().find(|s| s.epoch == candidate_epoch)
+        if let Some(queue) = inner.snapshots.get_mut(group_id)
+            && let Some(snapshot) = queue.iter_mut().find(|s| s.epoch == candidate_epoch)
         {
             // Skip comparison for hydrated snapshots (applied_commit_ts == 0) since
             // we don't have the original timestamp info after restart
             if snapshot.applied_commit_ts == 0 {
                 return false;
             }
+
+            // Same ciphertext in a different wrapper: this is a replay, not a
+            // genuinely different commit, so we never trigger a rollback.  However,
+            // we must still converge on a canonical ordering key so that every
+            // client compares future (genuinely different) commits against the same
+            // anchor.  Apply MIP-03 rules to pick the "best" wrapper metadata we
+            // have seen for this ciphertext.
+            if snapshot.applied_commit_content_hash != [0u8; 32]
+                && candidate_content_hash == &snapshot.applied_commit_content_hash
+            {
+                let candidate_is_better_wrapper = candidate_ts < snapshot.applied_commit_ts
+                    || (candidate_ts == snapshot.applied_commit_ts
+                        && candidate_id.to_hex() < snapshot.applied_commit_id.to_hex());
+
+                if candidate_is_better_wrapper {
+                    tracing::debug!(
+                        target: "mdk_core::epoch_snapshots",
+                        "Updating canonical ordering key for epoch {} (same ciphertext, better wrapper metadata)",
+                        candidate_epoch,
+                    );
+                    snapshot.applied_commit_ts = candidate_ts;
+                    snapshot.applied_commit_id = *candidate_id;
+                }
+
+                return false;
+            }
+
             // Compare according to MIP-03
             // 1. Earliest timestamp wins
             if candidate_ts < snapshot.applied_commit_ts {
@@ -379,6 +419,7 @@ mod tests {
                 epoch: 10,
                 applied_commit_id: applied_id,
                 applied_commit_ts: 1000, // Applied at timestamp 1000
+                applied_commit_content_hash: [1u8; 32],
                 created_at: Instant::now(),
                 snapshot_name: "test_snap".to_string(),
             };
@@ -392,7 +433,14 @@ mod tests {
         // Candidate with earlier timestamp (999 < 1000) should be better
         let candidate_id =
             test_event_id("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
-        assert!(manager.is_better_candidate(&storage, &group_id, 10, 999, &candidate_id));
+        assert!(manager.is_better_candidate(
+            &storage,
+            &group_id,
+            10,
+            999,
+            &candidate_id,
+            &[2u8; 32]
+        ));
     }
 
     #[test]
@@ -410,6 +458,7 @@ mod tests {
                 epoch: 10,
                 applied_commit_id: applied_id,
                 applied_commit_ts: 1000,
+                applied_commit_content_hash: [1u8; 32],
                 created_at: Instant::now(),
                 snapshot_name: "test_snap".to_string(),
             };
@@ -423,7 +472,14 @@ mod tests {
         // Candidate with later timestamp (1001 > 1000) should NOT be better
         let candidate_id =
             test_event_id("0000000000000000000000000000000000000000000000000000000000000000");
-        assert!(!manager.is_better_candidate(&storage, &group_id, 10, 1001, &candidate_id));
+        assert!(!manager.is_better_candidate(
+            &storage,
+            &group_id,
+            10,
+            1001,
+            &candidate_id,
+            &[2u8; 32]
+        ));
     }
 
     #[test]
@@ -442,6 +498,7 @@ mod tests {
                 epoch: 10,
                 applied_commit_id: applied_id,
                 applied_commit_ts: 1000,
+                applied_commit_content_hash: [1u8; 32],
                 created_at: Instant::now(),
                 snapshot_name: "test_snap".to_string(),
             };
@@ -455,7 +512,14 @@ mod tests {
         // Candidate with same timestamp but smaller ID ('a' < 'b') should be better
         let candidate_id =
             test_event_id("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
-        assert!(manager.is_better_candidate(&storage, &group_id, 10, 1000, &candidate_id));
+        assert!(manager.is_better_candidate(
+            &storage,
+            &group_id,
+            10,
+            1000,
+            &candidate_id,
+            &[2u8; 32]
+        ));
     }
 
     #[test]
@@ -474,6 +538,7 @@ mod tests {
                 epoch: 10,
                 applied_commit_id: applied_id,
                 applied_commit_ts: 1000,
+                applied_commit_content_hash: [1u8; 32],
                 created_at: Instant::now(),
                 snapshot_name: "test_snap".to_string(),
             };
@@ -487,7 +552,14 @@ mod tests {
         // Candidate with same timestamp but larger ID ('c' > 'a') should NOT be better
         let candidate_id =
             test_event_id("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc");
-        assert!(!manager.is_better_candidate(&storage, &group_id, 10, 1000, &candidate_id));
+        assert!(!manager.is_better_candidate(
+            &storage,
+            &group_id,
+            10,
+            1000,
+            &candidate_id,
+            &[2u8; 32]
+        ));
     }
 
     #[test]
@@ -505,6 +577,7 @@ mod tests {
                 epoch: 10,
                 applied_commit_id: applied_id,
                 applied_commit_ts: 1000,
+                applied_commit_content_hash: [1u8; 32],
                 created_at: Instant::now(),
                 snapshot_name: "test_snap".to_string(),
             };
@@ -516,7 +589,14 @@ mod tests {
         }
 
         // Same ID and timestamp should NOT be better (it's the same commit)
-        assert!(!manager.is_better_candidate(&storage, &group_id, 10, 1000, &applied_id));
+        assert!(!manager.is_better_candidate(
+            &storage,
+            &group_id,
+            10,
+            1000,
+            &applied_id,
+            &[2u8; 32]
+        ));
     }
 
     #[test]
@@ -534,6 +614,7 @@ mod tests {
                 epoch: 10,
                 applied_commit_id: applied_id,
                 applied_commit_ts: 1000,
+                applied_commit_content_hash: [1u8; 32],
                 created_at: Instant::now(),
                 snapshot_name: "test_snap".to_string(),
             };
@@ -547,7 +628,14 @@ mod tests {
         // Even with earlier timestamp, wrong epoch should return false
         let candidate_id =
             test_event_id("0000000000000000000000000000000000000000000000000000000000000000");
-        assert!(!manager.is_better_candidate(&storage, &group_id, 11, 999, &candidate_id)); // epoch 11 != 10
+        assert!(!manager.is_better_candidate(
+            &storage,
+            &group_id,
+            11,
+            999,
+            &candidate_id,
+            &[2u8; 32]
+        )); // epoch 11 != 10
     }
 
     #[test]
@@ -559,7 +647,112 @@ mod tests {
             test_event_id("0000000000000000000000000000000000000000000000000000000000000000");
 
         // No snapshots for this group, should return false
-        assert!(!manager.is_better_candidate(&storage, &unknown_group_id, 10, 999, &candidate_id));
+        assert!(!manager.is_better_candidate(
+            &storage,
+            &unknown_group_id,
+            10,
+            999,
+            &candidate_id,
+            &[2u8; 32]
+        ));
+    }
+
+    #[test]
+    fn test_is_better_candidate_same_content_hash_returns_false() {
+        // A re-wrapped event carrying the same ciphertext (same content hash)
+        // should never be considered "better", even if it has an earlier timestamp
+        // or smaller event ID. This prevents replay attacks where an attacker
+        // copies the encrypted payload into a new outer wrapper.
+        let manager = EpochSnapshotManager::new(5);
+        let storage = mdk_memory_storage::MdkMemoryStorage::default();
+        let group_id = test_group_id(1);
+        let applied_id =
+            test_event_id("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        let content_hash = [0xABu8; 32];
+
+        {
+            let mut inner = manager.inner.lock().unwrap();
+            let snapshot = EpochSnapshot {
+                group_id: group_id.clone(),
+                epoch: 10,
+                applied_commit_id: applied_id,
+                applied_commit_ts: 1000,
+                applied_commit_content_hash: content_hash,
+                created_at: Instant::now(),
+                snapshot_name: "test_snap".to_string(),
+            };
+            inner
+                .snapshots
+                .entry(group_id.clone())
+                .or_default()
+                .push_back(snapshot);
+        }
+
+        // Candidate with earlier timestamp AND smaller ID but same content hash
+        // should be rejected — it's a re-wrapped copy of the same ciphertext
+        let candidate_id =
+            test_event_id("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        assert!(
+            !manager.is_better_candidate(
+                &storage,
+                &group_id,
+                10,
+                999,
+                &candidate_id,
+                &content_hash
+            ),
+            "Same content hash should be rejected even with earlier timestamp and smaller ID"
+        );
+
+        // The snapshot's ordering key should have been updated to the better
+        // wrapper metadata so all clients converge on the same canonical anchor
+        {
+            let inner = manager.inner.lock().unwrap();
+            let snapshot = inner.snapshots.get(&group_id).unwrap().front().unwrap();
+            assert_eq!(
+                snapshot.applied_commit_ts, 999,
+                "Snapshot ts should be updated to the earlier wrapper"
+            );
+            assert_eq!(
+                snapshot.applied_commit_id, candidate_id,
+                "Snapshot id should be updated to the smaller wrapper id"
+            );
+        }
+
+        // A worse wrapper (later ts) with same content hash should NOT update the anchor
+        let worse_id =
+            test_event_id("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc");
+        assert!(!manager.is_better_candidate(
+            &storage,
+            &group_id,
+            10,
+            2000,
+            &worse_id,
+            &content_hash
+        ));
+        {
+            let inner = manager.inner.lock().unwrap();
+            let snapshot = inner.snapshots.get(&group_id).unwrap().front().unwrap();
+            assert_eq!(
+                snapshot.applied_commit_ts, 999,
+                "Snapshot ts should remain at the canonical minimum"
+            );
+        }
+
+        // But a genuinely different commit (different content hash) with the same
+        // timestamp and smaller ID should still win
+        let different_hash = [0xCDu8; 32];
+        assert!(
+            manager.is_better_candidate(
+                &storage,
+                &group_id,
+                10,
+                998,
+                &candidate_id,
+                &different_hash
+            ),
+            "Different content hash with earlier timestamp should be accepted"
+        );
     }
 
     #[test]
@@ -606,6 +799,7 @@ mod tests {
                 epoch: 10,
                 applied_commit_id: applied_id,
                 applied_commit_ts: 1000,
+                applied_commit_content_hash: [1u8; 32],
                 created_at: Instant::now(),
                 snapshot_name: "test_snap".to_string(),
             };
@@ -620,10 +814,17 @@ mod tests {
             test_event_id("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
 
         // Group1 should find the snapshot
-        assert!(manager.is_better_candidate(&storage, &group1, 10, 999, &candidate_id));
+        assert!(manager.is_better_candidate(&storage, &group1, 10, 999, &candidate_id, &[2u8; 32]));
 
         // Group2 should NOT find any snapshot
-        assert!(!manager.is_better_candidate(&storage, &group2, 10, 999, &candidate_id));
+        assert!(!manager.is_better_candidate(
+            &storage,
+            &group2,
+            10,
+            999,
+            &candidate_id,
+            &[2u8; 32]
+        ));
     }
 
     #[test]
@@ -657,7 +858,14 @@ mod tests {
         // Create 3 snapshots
         for epoch in 0..3 {
             let commit_id = test_event_id(&format!("{:064x}", epoch + 1));
-            let _ = manager.create_snapshot(&storage, &group_id, epoch, &commit_id, 1000 + epoch);
+            let _ = manager.create_snapshot(
+                &storage,
+                &group_id,
+                epoch,
+                &commit_id,
+                1000 + epoch,
+                &[1u8; 32],
+            );
         }
 
         // With retention of 2, only epochs 1 and 2 should remain
@@ -700,7 +908,14 @@ mod tests {
         for epoch in 0..4 {
             let commit_id = test_event_id(&format!("{:064x}", epoch + 1));
             manager
-                .create_snapshot(&storage, &group_id, epoch, &commit_id, 1000 + epoch)
+                .create_snapshot(
+                    &storage,
+                    &group_id,
+                    epoch,
+                    &commit_id,
+                    1000 + epoch,
+                    &[1u8; 32],
+                )
                 .unwrap();
         }
 
@@ -738,6 +953,7 @@ mod tests {
             epoch: 10,
             applied_commit_id: event_id,
             applied_commit_ts: 1000,
+            applied_commit_content_hash: [1u8; 32],
             created_at: Instant::now(),
             snapshot_name: "snap_abc123".to_string(),
         };
@@ -782,6 +998,7 @@ mod tests {
                     epoch,
                     applied_commit_id: event_id,
                     applied_commit_ts: 1000,
+                    applied_commit_content_hash: [1u8; 32],
                     created_at: Instant::now(),
                     snapshot_name: format!("snap_{}", epoch),
                 };
@@ -798,6 +1015,7 @@ mod tests {
                 epoch: 0,
                 applied_commit_id: event_id,
                 applied_commit_ts: 1000,
+                applied_commit_content_hash: [1u8; 32],
                 created_at: Instant::now(),
                 snapshot_name: "snap_0".to_string(),
             };
@@ -849,7 +1067,7 @@ mod tests {
             test_event_id("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
 
         let name = manager
-            .create_snapshot(&storage, &group_id, 5, &commit_id, 1000)
+            .create_snapshot(&storage, &group_id, 5, &commit_id, 1000, &[1u8; 32])
             .unwrap();
 
         // Name should contain group_id hex, epoch, and commit_id
@@ -875,7 +1093,8 @@ mod tests {
         // no hydration occurs and there are no snapshots
         let candidate_id =
             test_event_id("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
-        let result = manager.is_better_candidate(&storage, &group_id, 5, 999, &candidate_id);
+        let result =
+            manager.is_better_candidate(&storage, &group_id, 5, 999, &candidate_id, &[2u8; 32]);
 
         // Should return false since there are no snapshots and no hydration
         assert!(
@@ -904,7 +1123,7 @@ mod tests {
 
         let candidate_id =
             test_event_id("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
-        let _ = manager.is_better_candidate(&storage, &group_id, 5, 999, &candidate_id);
+        let _ = manager.is_better_candidate(&storage, &group_id, 5, 999, &candidate_id, &[2u8; 32]);
 
         // For memory storage, hydrated_groups won't be marked (hydration is skipped entirely)
         {
@@ -952,7 +1171,7 @@ mod tests {
         let epoch = 7u64;
 
         let name = manager
-            .create_snapshot(&storage, &group_id, epoch, &commit_id, 1000)
+            .create_snapshot(&storage, &group_id, epoch, &commit_id, 1000, &[1u8; 32])
             .unwrap();
 
         // Verify the format

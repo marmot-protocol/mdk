@@ -66,7 +66,10 @@ where
         let processed_message = match group.process_message(&self.provider, protocol_message) {
             Ok(processed_message) => processed_message,
             Err(ProcessMessageError::ValidationError(ValidationError::WrongEpoch)) => {
-                return Err(Error::ProcessMessageWrongEpoch(msg_epoch));
+                return Err(Error::ProcessMessageWrongEpoch(
+                    msg_epoch,
+                    content_type == ContentType::Commit,
+                ));
             }
             Err(ProcessMessageError::ValidationError(ValidationError::CannotDecryptOwnMessage)) => {
                 // If this is a commit message and we have a pending commit, it might be our own commit
@@ -187,6 +190,7 @@ where
                 );
 
                 // Snapshot current state before applying commit (for rollback support)
+                let content_hash = super::content_hash(&event.content);
                 if self
                     .epoch_snapshots
                     .create_snapshot(
@@ -195,6 +199,7 @@ where
                         mls_group.epoch().as_u64(),
                         &event.id,
                         event.created_at.as_secs(),
+                        &content_hash,
                     )
                     .is_err()
                 {

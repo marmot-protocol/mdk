@@ -322,15 +322,21 @@ where
                     }
                 }
             }
-            Error::ProcessMessageWrongEpoch(msg_epoch) => {
-                // Check if this commit is "better" than what we have for this epoch
-                let is_better = self.epoch_snapshots.is_better_candidate(
-                    self.storage(),
-                    &group.mls_group_id,
-                    msg_epoch,
-                    event.created_at.as_secs(),
-                    &event.id,
-                );
+            Error::ProcessMessageWrongEpoch(msg_epoch, is_commit) => {
+                // Only commits participate in MIP-03 race resolution.  Stale
+                // proposals or application messages from an old epoch must not
+                // trigger rollback/invalidation — they simply cannot be applied.
+                let is_better = is_commit && {
+                    let content_hash = super::content_hash(&event.content);
+                    self.epoch_snapshots.is_better_candidate(
+                        self.storage(),
+                        &group.mls_group_id,
+                        msg_epoch,
+                        event.created_at.as_secs(),
+                        &event.id,
+                        &content_hash,
+                    )
+                };
 
                 if is_better {
                     tracing::info!("Found better commit for epoch {}. Rolling back.", msg_epoch);
@@ -412,10 +418,17 @@ where
                     return self.return_own_commit(group);
                 }
 
-                // Not our own commit - this is a genuine error
+                // Not our own commit - this is a genuine error.
+                // Record with msg_epoch (the message's epoch), not group.epoch
+                // (the group's current epoch), so retry/rollback bookkeeping
+                // references the correct epoch.
                 tracing::error!(target: "mdk_core::messages::process_message", "Epoch mismatch for message that is not our own commit");
-                self.fail_unprocessable(event.id, &error, group)
-                    .map(MessageProcessingOutcome::without_context)
+                self.record_failure(event.id, &error, Some(&group.mls_group_id), Some(msg_epoch))?;
+                Ok(MessageProcessingOutcome::without_context(
+                    MessageProcessingResult::Unprocessable {
+                        mls_group_id: group.mls_group_id.clone(),
+                    },
+                ))
             }
             Error::ProcessMessageWrongGroupId => {
                 tracing::error!(target: "mdk_core::messages::process_message", "Group ID mismatch");
@@ -1095,7 +1108,9 @@ mod tests {
         );
 
         assert_eq!(
-            MDK::<MdkMemoryStorage>::sanitize_error_reason(&Error::ProcessMessageWrongEpoch(5)),
+            MDK::<MdkMemoryStorage>::sanitize_error_reason(&Error::ProcessMessageWrongEpoch(
+                5, true
+            )),
             "processing_failed"
         );
     }

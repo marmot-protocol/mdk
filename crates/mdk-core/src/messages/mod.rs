@@ -28,12 +28,22 @@ use mdk_storage_traits::messages::types as message_types;
 use mdk_storage_traits::{GroupId, MdkStorageProvider};
 use nostr::{EventId, Timestamp};
 
+use sha2::{Digest, Sha256};
+
 use crate::MDK;
 use crate::error::Error;
 use crate::groups::UpdateGroupResult;
 
 // Internal Result type alias for this module
 pub(crate) type Result<T> = std::result::Result<T, Error>;
+
+/// Compute the SHA-256 hash of the outer event content for ciphertext deduplication.
+///
+/// Used by the epoch snapshot system to detect re-wrapped kind:445 events that
+/// carry identical ciphertext in different outer wrappers.
+pub(crate) fn content_hash(content: &str) -> [u8; 32] {
+    Sha256::digest(content.as_bytes()).into()
+}
 
 // =============================================================================
 // Helper Functions for ProcessedMessage Creation
