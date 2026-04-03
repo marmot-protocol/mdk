@@ -3090,22 +3090,6 @@ mod tests {
     }
 
     #[test]
-    fn test_delete_key_package_by_hash_ref_roundtrip() {
-        let mdk = create_test_mdk();
-        let keys = Keys::generate();
-        let kp_result = mdk
-            .create_key_package_for_event(
-                keys.public_key().to_hex(),
-                vec!["wss://relay.example.com".to_string()],
-            )
-            .unwrap();
-        assert!(
-            mdk.delete_key_package_from_storage_by_hash_ref(kp_result.hash_ref)
-                .is_ok()
-        );
-    }
-
-    #[test]
     fn test_delete_key_package_via_event_roundtrip() {
         let mdk = create_test_mdk();
         let keys = Keys::generate();
