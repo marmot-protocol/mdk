@@ -3167,6 +3167,105 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_prepare_group_image_for_upload_with_options_roundtrip() {
+        // Minimal valid 1×1 red PNG (67 bytes), hand-assembled from the PNG spec
+        let png: Vec<u8> = {
+            let mut v = Vec::new();
+            // PNG signature
+            v.extend_from_slice(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
+            // IHDR chunk: width=1, height=1, bit_depth=8, color_type=2 (RGB)
+            let ihdr_data: [u8; 13] = [
+                0, 0, 0, 1, // width
+                0, 0, 0, 1, // height
+                8, // bit depth
+                2, // color type (RGB)
+                0, // compression
+                0, // filter
+                0, // interlace
+            ];
+            v.extend_from_slice(&(ihdr_data.len() as u32).to_be_bytes());
+            v.extend_from_slice(b"IHDR");
+            v.extend_from_slice(&ihdr_data);
+            let mut crc_input = Vec::new();
+            crc_input.extend_from_slice(b"IHDR");
+            crc_input.extend_from_slice(&ihdr_data);
+            let crc = crc32(&crc_input);
+            v.extend_from_slice(&crc.to_be_bytes());
+            // IDAT chunk: zlib-compressed single row (filter_none + 3 bytes RGB)
+            // zlib stream for [0x00, 0xFF, 0x00, 0x00] (filter=none, R=255, G=0, B=0)
+            let raw_row: [u8; 4] = [0x00, 0xFF, 0x00, 0x00]; // filter_none, R, G, B
+            let adler = adler32(&raw_row);
+            let mut idat_zlib = Vec::new();
+            idat_zlib.extend_from_slice(&[0x78, 0x01]); // zlib header
+            idat_zlib.push(0x01); // BFINAL=1, BTYPE=00 (stored)
+            idat_zlib.extend_from_slice(&(raw_row.len() as u16).to_le_bytes()); // LEN
+            idat_zlib.extend_from_slice(&(!(raw_row.len() as u16)).to_le_bytes()); // NLEN
+            idat_zlib.extend_from_slice(&raw_row);
+            idat_zlib.extend_from_slice(&adler.to_be_bytes());
+            v.extend_from_slice(&(idat_zlib.len() as u32).to_be_bytes());
+            v.extend_from_slice(b"IDAT");
+            v.extend_from_slice(&idat_zlib);
+            let mut crc_input = Vec::new();
+            crc_input.extend_from_slice(b"IDAT");
+            crc_input.extend_from_slice(&idat_zlib);
+            let crc = crc32(&crc_input);
+            v.extend_from_slice(&crc.to_be_bytes());
+            // IEND chunk
+            v.extend_from_slice(&0u32.to_be_bytes());
+            v.extend_from_slice(b"IEND");
+            let crc = crc32(b"IEND");
+            v.extend_from_slice(&crc.to_be_bytes());
+            v
+        };
+
+        let options = MediaProcessingOptionsInput {
+            sanitize_exif: Some(true),
+            generate_blurhash: Some(false),
+            max_dimension: None,
+            max_file_size: None,
+            max_filename_length: None,
+        };
+
+        let result =
+            prepare_group_image_for_upload_with_options(png, "image/png".into(), options).unwrap();
+
+        assert_eq!(result.mime_type, "image/png");
+        assert!(!result.encrypted_data.is_empty());
+        assert!(!result.image_key.is_empty());
+        assert!(!result.image_nonce.is_empty());
+        let dims = result.dimensions.expect("dimensions should be present");
+        assert_eq!(dims.width, 1);
+        assert_eq!(dims.height, 1);
+    }
+
+    /// CRC-32 (ISO 3309 / PNG) — only used in test PNG construction
+    fn crc32(data: &[u8]) -> u32 {
+        let mut crc: u32 = 0xFFFF_FFFF;
+        for &byte in data {
+            crc ^= byte as u32;
+            for _ in 0..8 {
+                if crc & 1 != 0 {
+                    crc = (crc >> 1) ^ 0xEDB8_8320;
+                } else {
+                    crc >>= 1;
+                }
+            }
+        }
+        !crc
+    }
+
+    /// Adler-32 checksum — only used in test PNG construction
+    fn adler32(data: &[u8]) -> u32 {
+        let mut a: u32 = 1;
+        let mut b: u32 = 0;
+        for &byte in data {
+            a = (a + byte as u32) % 65521;
+            b = (b + a) % 65521;
+        }
+        (b << 16) | a
+    }
+
     // ── MIP-04 encrypted media tests ─────────────────────────────────────────
 
     #[cfg(feature = "mip04")]
