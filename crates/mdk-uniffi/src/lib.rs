@@ -17,6 +17,7 @@ use mdk_core::{
         decrypt_group_image as core_decrypt_group_image,
         derive_upload_keypair as core_derive_upload_keypair,
         prepare_group_image_for_upload as core_prepare_group_image_for_upload,
+        prepare_group_image_for_upload_with_options as core_prepare_group_image_for_upload_with_options,
     },
     groups::{NostrGroupConfigData, NostrGroupDataUpdate},
     messages::MessageProcessingResult,
@@ -269,6 +270,47 @@ fn welcome_from_uniffi(w: Welcome) -> Result<welcome_types::Welcome, MdkUniffiEr
 
 /// Convert a core [`mdk_core::groups::UpdateGroupResult`] into the UniFFI-exported
 /// [`UpdateGroupResult`], serializing the evolution event and welcome rumors to JSON.
+fn message_processing_result_to_uniffi(
+    result: MessageProcessingResult,
+) -> Result<ProcessMessageResult, MdkUniffiError> {
+    Ok(match result {
+        MessageProcessingResult::ApplicationMessage(message) => {
+            ProcessMessageResult::ApplicationMessage {
+                message: Message::from(message),
+            }
+        }
+        MessageProcessingResult::Proposal(update_result) => ProcessMessageResult::Proposal {
+            result: update_group_result_to_uniffi(update_result)?,
+        },
+        MessageProcessingResult::PendingProposal { mls_group_id } => {
+            ProcessMessageResult::PendingProposal {
+                mls_group_id: hex::encode(mls_group_id.as_slice()),
+            }
+        }
+        MessageProcessingResult::ExternalJoinProposal { mls_group_id } => {
+            ProcessMessageResult::ExternalJoinProposal {
+                mls_group_id: hex::encode(mls_group_id.as_slice()),
+            }
+        }
+        MessageProcessingResult::Commit { mls_group_id } => ProcessMessageResult::Commit {
+            mls_group_id: hex::encode(mls_group_id.as_slice()),
+        },
+        MessageProcessingResult::Unprocessable { mls_group_id } => {
+            ProcessMessageResult::Unprocessable {
+                mls_group_id: hex::encode(mls_group_id.as_slice()),
+            }
+        }
+        MessageProcessingResult::IgnoredProposal {
+            mls_group_id,
+            reason,
+        } => ProcessMessageResult::IgnoredProposal {
+            mls_group_id: hex::encode(mls_group_id.as_slice()),
+            reason,
+        },
+        MessageProcessingResult::PreviouslyFailed => ProcessMessageResult::PreviouslyFailed,
+    })
+}
+
 fn update_group_result_to_uniffi(
     result: mdk_core::groups::UpdateGroupResult,
 ) -> Result<UpdateGroupResult, MdkUniffiError> {
@@ -936,43 +978,190 @@ impl Mdk {
         let event: Event = parse_json(&event_json, "event JSON")?;
         let mdk = self.lock()?;
         let result = mdk.process_message(&event)?;
+        message_processing_result_to_uniffi(result)
+    }
 
-        Ok(match result {
-            MessageProcessingResult::ApplicationMessage(message) => {
-                ProcessMessageResult::ApplicationMessage {
-                    message: Message::from(message),
-                }
-            }
-            MessageProcessingResult::Proposal(update_result) => ProcessMessageResult::Proposal {
-                result: update_group_result_to_uniffi(update_result)?,
-            },
-            MessageProcessingResult::PendingProposal { mls_group_id } => {
-                ProcessMessageResult::PendingProposal {
-                    mls_group_id: hex::encode(mls_group_id.as_slice()),
-                }
-            }
-            MessageProcessingResult::ExternalJoinProposal { mls_group_id } => {
-                ProcessMessageResult::ExternalJoinProposal {
-                    mls_group_id: hex::encode(mls_group_id.as_slice()),
-                }
-            }
-            MessageProcessingResult::Commit { mls_group_id } => ProcessMessageResult::Commit {
-                mls_group_id: hex::encode(mls_group_id.as_slice()),
-            },
-            MessageProcessingResult::Unprocessable { mls_group_id } => {
-                ProcessMessageResult::Unprocessable {
-                    mls_group_id: hex::encode(mls_group_id.as_slice()),
-                }
-            }
-            MessageProcessingResult::IgnoredProposal {
-                mls_group_id,
-                reason,
-            } => ProcessMessageResult::IgnoredProposal {
-                mls_group_id: hex::encode(mls_group_id.as_slice()),
-                reason,
-            },
-            MessageProcessingResult::PreviouslyFailed => ProcessMessageResult::PreviouslyFailed,
+    /// Process an incoming MLS message and return the result with additional MLS context
+    ///
+    /// Unlike `process_message`, this method also returns transient MLS context
+    /// such as the sender's leaf index, which is useful for UI display or
+    /// verification purposes.
+    ///
+    /// # Arguments
+    ///
+    /// * `event_json` - JSON-encoded Nostr event containing the MLS message
+    pub fn process_message_with_context(
+        &self,
+        event_json: String,
+    ) -> Result<ProcessMessageWithContextResult, MdkUniffiError> {
+        let event: Event = parse_json(&event_json, "event JSON")?;
+        let mdk = self.lock()?;
+        let outcome = mdk.process_message_with_context(&event)?;
+
+        Ok(ProcessMessageWithContextResult {
+            result: message_processing_result_to_uniffi(outcome.result)?,
+            sender_leaf_index: outcome.context.sender_leaf_index,
         })
+    }
+
+    /// Delete a key package from MLS storage using a key package Nostr event
+    ///
+    /// Parses the key package from the given kind-443 event and removes it
+    /// from the MLS provider's storage.
+    ///
+    /// # Arguments
+    ///
+    /// * `key_package_event_json` - JSON-encoded Nostr key package event (kind 443)
+    pub fn delete_key_package_from_storage(
+        &self,
+        key_package_event_json: String,
+    ) -> Result<(), MdkUniffiError> {
+        let event: Event = parse_json(&key_package_event_json, "key package event JSON")?;
+        let mdk = self.lock()?;
+        let key_package = mdk.parse_key_package(&event)?;
+        mdk.delete_key_package_from_storage(&key_package)?;
+        Ok(())
+    }
+
+    /// Delete a key package from storage using previously serialized hash_ref bytes
+    ///
+    /// The `hash_ref` should be the bytes returned as the third element of
+    /// `create_key_package_for_event`.
+    ///
+    /// # Arguments
+    ///
+    /// * `hash_ref` - Serialized hash reference bytes from key package creation
+    pub fn delete_key_package_from_storage_by_hash_ref(
+        &self,
+        hash_ref: Vec<u8>,
+    ) -> Result<(), MdkUniffiError> {
+        let mdk = self.lock()?;
+        mdk.delete_key_package_from_storage_by_hash_ref(&hash_ref)?;
+        Ok(())
+    }
+
+    /// Get public information about the ratchet tree of an MLS group
+    ///
+    /// This includes a SHA-256 fingerprint of the TLS-serialized ratchet tree,
+    /// the full serialized tree as hex, and a list of leaf nodes with their
+    /// indices and public keys.
+    ///
+    /// # Arguments
+    ///
+    /// * `group_id_hex` - Hex-encoded MLS group ID
+    pub fn get_ratchet_tree_info(
+        &self,
+        group_id_hex: String,
+    ) -> Result<UniffiRatchetTreeInfo, MdkUniffiError> {
+        let group_id = parse_group_id(&group_id_hex)?;
+        let mdk = self.lock()?;
+        let info = mdk.get_ratchet_tree_info(&group_id)?;
+
+        Ok(UniffiRatchetTreeInfo {
+            tree_hash: info.tree_hash,
+            serialized_tree: info.serialized_tree,
+            leaf_nodes: info
+                .leaf_nodes
+                .into_iter()
+                .map(|n| UniffiLeafNodeInfo {
+                    index: n.index,
+                    encryption_key: n.encryption_key,
+                    signature_key: n.signature_key,
+                    credential_identity: n.credential_identity,
+                })
+                .collect(),
+        })
+    }
+
+    /// Returns the current active MLS leaf positions and their bound Nostr public keys
+    ///
+    /// Returns a list of (leaf_index, public_key_hex) pairs. Removed-member tree
+    /// holes are omitted.
+    ///
+    /// # Arguments
+    ///
+    /// * `group_id_hex` - Hex-encoded MLS group ID
+    pub fn group_leaf_map(
+        &self,
+        group_id_hex: String,
+    ) -> Result<Vec<LeafMapEntry>, MdkUniffiError> {
+        let group_id = parse_group_id(&group_id_hex)?;
+        let mdk = self.lock()?;
+        let map = mdk.group_leaf_map(&group_id)?;
+
+        Ok(map
+            .into_iter()
+            .map(|(index, pubkey)| LeafMapEntry {
+                leaf_index: index,
+                public_key: pubkey.to_hex(),
+            })
+            .collect())
+    }
+
+    /// Returns the local member's current MLS leaf index for a group
+    ///
+    /// # Arguments
+    ///
+    /// * `group_id_hex` - Hex-encoded MLS group ID
+    pub fn own_leaf_index(&self, group_id_hex: String) -> Result<u32, MdkUniffiError> {
+        let group_id = parse_group_id(&group_id_hex)?;
+        let mdk = self.lock()?;
+        Ok(mdk.own_leaf_index(&group_id)?)
+    }
+
+    /// Gets the public keys of members that will be added from pending proposals
+    ///
+    /// Returns hex-encoded public keys of members in pending Add proposals.
+    ///
+    /// # Arguments
+    ///
+    /// * `group_id_hex` - Hex-encoded MLS group ID
+    pub fn pending_added_members_pubkeys(
+        &self,
+        group_id_hex: String,
+    ) -> Result<Vec<String>, MdkUniffiError> {
+        let group_id = parse_group_id(&group_id_hex)?;
+        let mdk = self.lock()?;
+        let pubkeys = mdk.pending_added_members_pubkeys(&group_id)?;
+        Ok(pubkeys.iter().map(|pk| pk.to_hex()).collect())
+    }
+
+    /// Gets all pending member changes (additions and removals) from pending proposals
+    ///
+    /// Returns a combined view of all pending member changes in a group.
+    ///
+    /// # Arguments
+    ///
+    /// * `group_id_hex` - Hex-encoded MLS group ID
+    pub fn pending_member_changes(
+        &self,
+        group_id_hex: String,
+    ) -> Result<UniffiPendingMemberChanges, MdkUniffiError> {
+        let group_id = parse_group_id(&group_id_hex)?;
+        let mdk = self.lock()?;
+        let changes = mdk.pending_member_changes(&group_id)?;
+
+        Ok(UniffiPendingMemberChanges {
+            additions: changes.additions.iter().map(|pk| pk.to_hex()).collect(),
+            removals: changes.removals.iter().map(|pk| pk.to_hex()).collect(),
+        })
+    }
+
+    /// Gets the public keys of members that will be removed from pending proposals
+    ///
+    /// Returns hex-encoded public keys of members in pending Remove proposals.
+    ///
+    /// # Arguments
+    ///
+    /// * `group_id_hex` - Hex-encoded MLS group ID
+    pub fn pending_removed_members_pubkeys(
+        &self,
+        group_id_hex: String,
+    ) -> Result<Vec<String>, MdkUniffiError> {
+        let group_id = parse_group_id(&group_id_hex)?;
+        let mdk = self.lock()?;
+        let pubkeys = mdk.pending_removed_members_pubkeys(&group_id)?;
+        Ok(pubkeys.iter().map(|pk| pk.to_hex()).collect())
     }
 }
 
@@ -1072,6 +1261,57 @@ pub enum ProcessMessageResult {
     /// failed. Unlike throwing an error, this allows clients to handle the
     /// case gracefully without crashing.
     PreviouslyFailed,
+}
+
+/// Result of processing a message with additional MLS context
+#[derive(uniffi::Record)]
+pub struct ProcessMessageWithContextResult {
+    /// The primary processing result
+    pub result: ProcessMessageResult,
+    /// The MLS sender leaf index, if the sender is a group member
+    pub sender_leaf_index: Option<u32>,
+}
+
+/// An entry in the group leaf map
+#[derive(uniffi::Record)]
+pub struct LeafMapEntry {
+    /// The leaf index in the ratchet tree
+    pub leaf_index: u32,
+    /// Hex-encoded Nostr public key bound to this leaf
+    pub public_key: String,
+}
+
+/// Public information about a leaf node in the ratchet tree
+#[derive(uniffi::Record)]
+pub struct UniffiLeafNodeInfo {
+    /// The leaf index in the ratchet tree
+    pub index: u32,
+    /// The member's public HPKE encryption key (hex-encoded)
+    pub encryption_key: String,
+    /// The member's public signature key (hex-encoded)
+    pub signature_key: String,
+    /// The member's credential identity (hex-encoded, typically a Nostr public key)
+    pub credential_identity: String,
+}
+
+/// Public information about the ratchet tree of an MLS group
+#[derive(uniffi::Record)]
+pub struct UniffiRatchetTreeInfo {
+    /// SHA-256 fingerprint of the TLS-serialized ratchet tree (hex-encoded)
+    pub tree_hash: String,
+    /// The full ratchet tree serialized via TLS encoding (hex-encoded)
+    pub serialized_tree: String,
+    /// Leaf nodes with their indices and public keys
+    pub leaf_nodes: Vec<UniffiLeafNodeInfo>,
+}
+
+/// Pending member changes from proposals that need admin approval
+#[derive(uniffi::Record)]
+pub struct UniffiPendingMemberChanges {
+    /// Hex-encoded public keys of members that will be added when proposals are committed
+    pub additions: Vec<String>,
+    /// Hex-encoded public keys of members that will be removed when proposals are committed
+    pub removals: Vec<String>,
 }
 
 /// Group representation
@@ -1305,6 +1545,41 @@ pub fn prepare_group_image_for_upload(
 ) -> Result<GroupImageUpload, MdkUniffiError> {
     let prepared = core_prepare_group_image_for_upload(&image_data, &mime_type)
         .map_err(|e| MdkUniffiError::Mdk(e.to_string()))?;
+
+    Ok(GroupImageUpload {
+        encrypted_data: prepared.encrypted_data.as_ref().clone(),
+        encrypted_hash: prepared.encrypted_hash.to_vec(),
+        image_key: prepared.image_key.as_ref().to_vec(),
+        image_nonce: prepared.image_nonce.as_ref().to_vec(),
+        upload_secret_key: prepared.upload_keypair.secret_key().to_secret_hex(),
+        original_size: prepared.original_size as u64,
+        encrypted_size: prepared.encrypted_size as u64,
+        mime_type: prepared.mime_type.clone(),
+        dimensions: prepared.dimensions.map(|(w, h)| ImageDimensions {
+            width: w,
+            height: h,
+        }),
+        blurhash: prepared.blurhash.clone(),
+        thumbhash: prepared.thumbhash.clone(),
+    })
+}
+
+/// Prepare group image for upload with custom processing options
+///
+/// Like `prepare_group_image_for_upload`, but allows customizing validation
+/// and processing behavior such as EXIF stripping, blurhash generation,
+/// and size limits.
+#[uniffi::export]
+pub fn prepare_group_image_for_upload_with_options(
+    image_data: Vec<u8>,
+    mime_type: String,
+    options: MediaProcessingOptionsInput,
+) -> Result<GroupImageUpload, MdkUniffiError> {
+    let core_options = MediaProcessingOptions::try_from(options)
+        .map_err(|e| MdkUniffiError::InvalidInput(format!("Invalid processing options: {e}")))?;
+    let prepared =
+        core_prepare_group_image_for_upload_with_options(&image_data, &mime_type, &core_options)
+            .map_err(|e| MdkUniffiError::Mdk(e.to_string()))?;
 
     Ok(GroupImageUpload {
         encrypted_data: prepared.encrypted_data.as_ref().clone(),
@@ -2747,6 +3022,453 @@ mod tests {
         let result = parse_tags(tags);
         assert!(result.is_ok());
         assert_eq!(result.unwrap().len(), 0);
+    }
+
+    // ── Helpers for multi-party tests ──────────────────────────────────────
+
+    /// Create a two-party group (Alice + Bob) across separate Mdk instances.
+    /// Returns (alice_mdk, bob_mdk, group_id, alice_keys, bob_keys).
+    fn create_two_party_group() -> (Mdk, Mdk, String, Keys, Keys) {
+        let alice_mdk = create_test_mdk();
+        let bob_mdk = create_test_mdk();
+        let alice_keys = Keys::generate();
+        let bob_keys = Keys::generate();
+        let relays = vec!["wss://relay.example.com".to_string()];
+
+        // Bob creates a key package on his own Mdk
+        let bob_kp = bob_mdk
+            .create_key_package_for_event(bob_keys.public_key().to_hex(), relays.clone())
+            .unwrap();
+        let bob_kp_event = EventBuilder::new(Kind::MlsKeyPackage, bob_kp.key_package)
+            .tags(
+                bob_kp
+                    .tags
+                    .into_iter()
+                    .map(|t| Tag::parse(&t).unwrap())
+                    .collect::<Vec<_>>(),
+            )
+            .sign_with_keys(&bob_keys)
+            .unwrap();
+
+        // Alice creates the group containing Bob
+        let create_result = alice_mdk
+            .create_group(
+                alice_keys.public_key().to_hex(),
+                vec![bob_kp_event.as_json()],
+                "Test Group".to_string(),
+                "Test Description".to_string(),
+                relays,
+                vec![alice_keys.public_key().to_hex()],
+            )
+            .unwrap();
+
+        let group_id = create_result.group.mls_group_id.clone();
+        alice_mdk.merge_pending_commit(group_id.clone()).unwrap();
+
+        // Bob joins via welcome
+        let welcome = bob_mdk
+            .process_welcome(
+                EventId::all_zeros().to_hex(),
+                create_result.welcome_rumors_json[0].clone(),
+            )
+            .unwrap();
+        bob_mdk.accept_welcome(welcome).unwrap();
+
+        (alice_mdk, bob_mdk, group_id, alice_keys, bob_keys)
+    }
+
+    // ── Scenario A: Two-party message processing with context ────────────
+
+    #[test]
+    fn test_process_message_with_context_two_party() {
+        let (alice_mdk, bob_mdk, group_id, alice_keys, bob_keys) = create_two_party_group();
+
+        // Alice sends a message
+        let alice_msg = alice_mdk
+            .create_message(
+                group_id.clone(),
+                alice_keys.public_key().to_hex(),
+                "Hello Bob!".to_string(),
+                1,
+                None,
+            )
+            .unwrap();
+
+        // Bob processes Alice's message through the UniFFI boundary
+        let outcome = bob_mdk.process_message_with_context(alice_msg).unwrap();
+
+        // Verify the result variant and message content
+        let message = match &outcome.result {
+            ProcessMessageResult::ApplicationMessage { message } => message,
+            other => panic!(
+                "Expected ApplicationMessage, got {:?}",
+                std::mem::discriminant(other)
+            ),
+        };
+        assert_eq!(message.sender_pubkey, alice_keys.public_key().to_hex());
+        // Verify the message content survives the UniFFI boundary
+        let event: serde_json::Value = serde_json::from_str(&message.event_json).unwrap();
+        assert_eq!(event["content"].as_str().unwrap(), "Hello Bob!");
+
+        // Alice is leaf 0 (group creator)
+        assert_eq!(outcome.sender_leaf_index, Some(0));
+
+        // Now Bob sends a message back
+        let bob_msg = bob_mdk
+            .create_message(
+                group_id,
+                bob_keys.public_key().to_hex(),
+                "Hello Alice!".to_string(),
+                1,
+                None,
+            )
+            .unwrap();
+
+        let outcome = alice_mdk.process_message_with_context(bob_msg).unwrap();
+
+        let message = match &outcome.result {
+            ProcessMessageResult::ApplicationMessage { message } => message,
+            other => panic!(
+                "Expected ApplicationMessage, got {:?}",
+                std::mem::discriminant(other)
+            ),
+        };
+        assert_eq!(message.sender_pubkey, bob_keys.public_key().to_hex());
+        let event: serde_json::Value = serde_json::from_str(&message.event_json).unwrap();
+        assert_eq!(event["content"].as_str().unwrap(), "Hello Alice!");
+        // Bob is leaf 1
+        assert_eq!(outcome.sender_leaf_index, Some(1));
+    }
+
+    // ── Scenario B: Topology inspection ──────────────────────────────────
+
+    #[test]
+    fn test_topology_inspection_two_party() {
+        let (alice_mdk, bob_mdk, group_id, alice_keys, bob_keys) = create_two_party_group();
+
+        // own_leaf_index: Alice is the creator → leaf 0
+        assert_eq!(alice_mdk.own_leaf_index(group_id.clone()).unwrap(), 0);
+        // Bob joined second → leaf 1
+        assert_eq!(bob_mdk.own_leaf_index(group_id.clone()).unwrap(), 1);
+
+        // group_leaf_map: verify both members at correct indices with correct pubkeys
+        let leaf_map = alice_mdk.group_leaf_map(group_id.clone()).unwrap();
+        assert_eq!(leaf_map.len(), 2);
+
+        let alice_entry = leaf_map.iter().find(|e| e.leaf_index == 0).unwrap();
+        assert_eq!(alice_entry.public_key, alice_keys.public_key().to_hex());
+
+        let bob_entry = leaf_map.iter().find(|e| e.leaf_index == 1).unwrap();
+        assert_eq!(bob_entry.public_key, bob_keys.public_key().to_hex());
+
+        // Bob sees the same topology
+        let bob_leaf_map = bob_mdk.group_leaf_map(group_id.clone()).unwrap();
+        assert_eq!(bob_leaf_map.len(), 2);
+        assert_eq!(
+            bob_leaf_map
+                .iter()
+                .find(|e| e.leaf_index == 0)
+                .unwrap()
+                .public_key,
+            alice_keys.public_key().to_hex()
+        );
+
+        // get_ratchet_tree_info: verify structure and leaf count
+        let tree_info = alice_mdk.get_ratchet_tree_info(group_id.clone()).unwrap();
+        assert!(!tree_info.tree_hash.is_empty());
+        assert!(!tree_info.serialized_tree.is_empty());
+        assert_eq!(tree_info.leaf_nodes.len(), 2);
+
+        // Each leaf node should have non-empty crypto material and a credential
+        // identity that corresponds to one of the known group members
+        let known_pubkeys: std::collections::HashSet<String> = [
+            alice_keys.public_key().to_hex(),
+            bob_keys.public_key().to_hex(),
+        ]
+        .into_iter()
+        .collect();
+
+        for node in &tree_info.leaf_nodes {
+            assert!(!node.encryption_key.is_empty());
+            assert!(!node.signature_key.is_empty());
+            assert!(
+                known_pubkeys.contains(&node.credential_identity),
+                "credential_identity {} doesn't match any known member pubkey",
+                node.credential_identity
+            );
+        }
+        // Verify both members are represented (no duplicates, no missing)
+        let tree_identities: std::collections::HashSet<&str> = tree_info
+            .leaf_nodes
+            .iter()
+            .map(|n| n.credential_identity.as_str())
+            .collect();
+        assert_eq!(
+            tree_identities.len(),
+            2,
+            "ratchet tree should contain exactly 2 distinct member identities"
+        );
+
+        // pending_member_changes: clean group has no pending proposals.
+        // Note: non-empty pending proposals are structurally unreachable through
+        // the UniFFI API because MDK always creates commits (not standalone
+        // proposals), and SelfRemove proposals are auto-committed by receivers.
+        let changes = alice_mdk.pending_member_changes(group_id.clone()).unwrap();
+        assert!(changes.additions.is_empty());
+        assert!(changes.removals.is_empty());
+
+        assert!(
+            alice_mdk
+                .pending_added_members_pubkeys(group_id.clone())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            alice_mdk
+                .pending_removed_members_pubkeys(group_id)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    // ── Scenario C: Key package lifecycle (deletion has observable effect) ─
+
+    #[test]
+    fn test_key_package_deletion_prevents_welcome_processing() {
+        let alice_mdk = create_test_mdk();
+        let bob_mdk = create_test_mdk();
+        let alice_keys = Keys::generate();
+        let bob_keys = Keys::generate();
+        let relays = vec!["wss://relay.example.com".to_string()];
+
+        // Bob creates a key package
+        let bob_kp = bob_mdk
+            .create_key_package_for_event(bob_keys.public_key().to_hex(), relays.clone())
+            .unwrap();
+        let bob_kp_event = EventBuilder::new(Kind::MlsKeyPackage, bob_kp.key_package)
+            .tags(
+                bob_kp
+                    .tags
+                    .into_iter()
+                    .map(|t| Tag::parse(&t).unwrap())
+                    .collect::<Vec<_>>(),
+            )
+            .sign_with_keys(&bob_keys)
+            .unwrap();
+
+        // Delete Bob's key package by hash_ref BEFORE the group is created
+        bob_mdk
+            .delete_key_package_from_storage_by_hash_ref(bob_kp.hash_ref)
+            .unwrap();
+
+        // Alice creates a group referencing Bob's (now-deleted) key package
+        let create_result = alice_mdk
+            .create_group(
+                alice_keys.public_key().to_hex(),
+                vec![bob_kp_event.as_json()],
+                "Test Group".to_string(),
+                "Test Description".to_string(),
+                relays,
+                vec![alice_keys.public_key().to_hex()],
+            )
+            .unwrap();
+        alice_mdk
+            .merge_pending_commit(create_result.group.mls_group_id.clone())
+            .unwrap();
+
+        // Bob tries to process the welcome — should fail because the private
+        // key material was deleted from storage
+        let welcome_result = bob_mdk.process_welcome(
+            EventId::all_zeros().to_hex(),
+            create_result.welcome_rumors_json[0].clone(),
+        );
+        assert!(
+            welcome_result.is_err(),
+            "Welcome should fail after key package deletion, but got: {:?}",
+            welcome_result.unwrap().group_name
+        );
+    }
+
+    #[test]
+    fn test_delete_key_package_via_event_prevents_welcome() {
+        let alice_mdk = create_test_mdk();
+        let bob_mdk = create_test_mdk();
+        let alice_keys = Keys::generate();
+        let bob_keys = Keys::generate();
+        let relays = vec!["wss://relay.example.com".to_string()];
+
+        // Bob creates a key package
+        let bob_kp = bob_mdk
+            .create_key_package_for_event(bob_keys.public_key().to_hex(), relays.clone())
+            .unwrap();
+        let bob_kp_event = EventBuilder::new(Kind::MlsKeyPackage, bob_kp.key_package)
+            .tags(
+                bob_kp
+                    .tags
+                    .into_iter()
+                    .map(|t| Tag::parse(&t).unwrap())
+                    .collect::<Vec<_>>(),
+            )
+            .sign_with_keys(&bob_keys)
+            .unwrap();
+
+        // Delete via event JSON (tests the JSON→Event→KeyPackage parsing path)
+        bob_mdk
+            .delete_key_package_from_storage(bob_kp_event.as_json())
+            .unwrap();
+
+        // Alice creates a group referencing Bob's deleted key package
+        let create_result = alice_mdk
+            .create_group(
+                alice_keys.public_key().to_hex(),
+                vec![bob_kp_event.as_json()],
+                "Test Group".to_string(),
+                "Test Description".to_string(),
+                relays,
+                vec![alice_keys.public_key().to_hex()],
+            )
+            .unwrap();
+        alice_mdk
+            .merge_pending_commit(create_result.group.mls_group_id.clone())
+            .unwrap();
+
+        // Bob can't process the welcome — private key material is gone
+        let welcome_result = bob_mdk.process_welcome(
+            EventId::all_zeros().to_hex(),
+            create_result.welcome_rumors_json[0].clone(),
+        );
+        assert!(
+            welcome_result.is_err(),
+            "Welcome should fail after event-based key package deletion"
+        );
+    }
+
+    // ── Scenario D: Group image option mapping ───────────────────────────
+
+    #[test]
+    fn test_prepare_group_image_options_mapping() {
+        // Minimal valid 1×1 red PNG, hand-assembled from the PNG spec
+        let png = build_minimal_png();
+
+        // With blurhash/thumbhash disabled: verify None fields
+        let result_no_hashes = prepare_group_image_for_upload_with_options(
+            png.clone(),
+            "image/png".into(),
+            MediaProcessingOptionsInput {
+                sanitize_exif: Some(true),
+                generate_blurhash: Some(false),
+                generate_thumbhash: Some(false),
+                max_dimension: None,
+                max_file_size: None,
+                max_filename_length: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result_no_hashes.mime_type, "image/png");
+        assert!(
+            result_no_hashes.blurhash.is_none(),
+            "blurhash should be None when disabled"
+        );
+        assert!(
+            result_no_hashes.thumbhash.is_none(),
+            "thumbhash should be None when disabled"
+        );
+        assert!(!result_no_hashes.encrypted_data.is_empty());
+        assert!(!result_no_hashes.image_key.is_empty());
+        assert!(!result_no_hashes.image_nonce.is_empty());
+        assert!(result_no_hashes.encrypted_size > 0);
+        assert!(result_no_hashes.original_size > 0);
+
+        // Dimensions should be 1×1
+        let dims = result_no_hashes
+            .dimensions
+            .expect("dimensions should be present for a valid PNG");
+        assert_eq!(dims.width, 1);
+        assert_eq!(dims.height, 1);
+
+        // With thumbhash enabled: verify it's populated
+        let result_with_thumbhash = prepare_group_image_for_upload_with_options(
+            png,
+            "image/png".into(),
+            MediaProcessingOptionsInput {
+                sanitize_exif: Some(true),
+                generate_blurhash: Some(false),
+                generate_thumbhash: Some(true),
+                max_dimension: None,
+                max_file_size: None,
+                max_filename_length: None,
+            },
+        )
+        .unwrap();
+
+        assert!(
+            result_with_thumbhash.thumbhash.is_some(),
+            "thumbhash should be present when enabled"
+        );
+
+        // Both calls should produce different encrypted data (different random keys)
+        assert_ne!(
+            result_no_hashes.encrypted_data, result_with_thumbhash.encrypted_data,
+            "each call should use fresh encryption keys"
+        );
+    }
+
+    /// Build a minimal valid 1×1 red PNG from raw bytes.
+    fn build_minimal_png() -> Vec<u8> {
+        fn crc32(data: &[u8]) -> u32 {
+            let mut crc: u32 = 0xFFFF_FFFF;
+            for &b in data {
+                crc ^= b as u32;
+                for _ in 0..8 {
+                    crc = if crc & 1 != 0 {
+                        (crc >> 1) ^ 0xEDB8_8320
+                    } else {
+                        crc >> 1
+                    };
+                }
+            }
+            !crc
+        }
+        fn adler32(data: &[u8]) -> u32 {
+            let (mut a, mut b): (u32, u32) = (1, 0);
+            for &byte in data {
+                a = (a + byte as u32) % 65521;
+                b = (b + a) % 65521;
+            }
+            (b << 16) | a
+        }
+
+        let mut v = Vec::new();
+        v.extend_from_slice(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
+        // IHDR
+        let ihdr: [u8; 13] = [0, 0, 0, 1, 0, 0, 0, 1, 8, 2, 0, 0, 0];
+        v.extend_from_slice(&(ihdr.len() as u32).to_be_bytes());
+        v.extend_from_slice(b"IHDR");
+        v.extend_from_slice(&ihdr);
+        let mut buf = Vec::from(&b"IHDR"[..]);
+        buf.extend_from_slice(&ihdr);
+        v.extend_from_slice(&crc32(&buf).to_be_bytes());
+        // IDAT
+        let row: [u8; 4] = [0x00, 0xFF, 0x00, 0x00];
+        let adler = adler32(&row);
+        let mut zlib = Vec::new();
+        zlib.extend_from_slice(&[0x78, 0x01, 0x01]);
+        zlib.extend_from_slice(&(row.len() as u16).to_le_bytes());
+        zlib.extend_from_slice(&(!(row.len() as u16)).to_le_bytes());
+        zlib.extend_from_slice(&row);
+        zlib.extend_from_slice(&adler.to_be_bytes());
+        v.extend_from_slice(&(zlib.len() as u32).to_be_bytes());
+        v.extend_from_slice(b"IDAT");
+        v.extend_from_slice(&zlib);
+        let mut buf = Vec::from(&b"IDAT"[..]);
+        buf.extend_from_slice(&zlib);
+        v.extend_from_slice(&crc32(&buf).to_be_bytes());
+        // IEND
+        v.extend_from_slice(&0u32.to_be_bytes());
+        v.extend_from_slice(b"IEND");
+        v.extend_from_slice(&crc32(b"IEND").to_be_bytes());
+        v
     }
 
     // ── MIP-04 encrypted media tests ─────────────────────────────────────────

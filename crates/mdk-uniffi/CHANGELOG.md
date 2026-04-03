@@ -36,6 +36,7 @@
 
 ### Added
 
+- Added UniFFI bindings for 10 previously unbound methods: `delete_key_package_from_storage`, `delete_key_package_from_storage_by_hash_ref`, `get_ratchet_tree_info`, `group_leaf_map`, `own_leaf_index`, `pending_added_members_pubkeys`, `pending_member_changes`, `pending_removed_members_pubkeys`, `prepare_group_image_for_upload_with_options`, and `process_message_with_context`. ([#249](https://github.com/marmot-protocol/mdk/pull/249))
 - Added optional `thumbhash` fields alongside the existing `blurhash` UniFFI records for group-image and encrypted-media uploads, plus a `generate_thumbhash` option in `MediaProcessingOptionsInput`. ([#244](https://github.com/marmot-protocol/mdk/pull/244))
 - Moved binary size optimizations (`opt-level = "z"`, thin LTO, single codegen unit, `panic = "abort"`, symbol stripping) into `[profile.release]` directly. Android builds override to fat LTO via `CARGO_PROFILE_RELEASE_LTO=fat` for maximum `.so` reduction; iOS uses thin LTO to avoid `.a` archive bloat. ([`#221`](https://github.com/marmot-protocol/mdk/pull/221), [`#232`](https://github.com/marmot-protocol/mdk/pull/232))
 
