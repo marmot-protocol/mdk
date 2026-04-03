@@ -3114,7 +3114,9 @@ mod tests {
         // Group has creator + 1 member = 2 leaves
         assert_eq!(map.len(), 2);
         // Creator should be at leaf index 0
-        let creator_entry = map.iter().find(|e| e.public_key == creator_keys.public_key().to_hex());
+        let creator_entry = map
+            .iter()
+            .find(|e| e.public_key == creator_keys.public_key().to_hex());
         assert!(creator_entry.is_some());
     }
 
