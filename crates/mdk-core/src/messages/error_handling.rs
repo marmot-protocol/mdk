@@ -418,10 +418,17 @@ where
                     return self.return_own_commit(group);
                 }
 
-                // Not our own commit - this is a genuine error
+                // Not our own commit - this is a genuine error.
+                // Record with msg_epoch (the message's epoch), not group.epoch
+                // (the group's current epoch), so retry/rollback bookkeeping
+                // references the correct epoch.
                 tracing::error!(target: "mdk_core::messages::process_message", "Epoch mismatch for message that is not our own commit");
-                self.fail_unprocessable(event.id, &error, group)
-                    .map(MessageProcessingOutcome::without_context)
+                self.record_failure(event.id, &error, Some(&group.mls_group_id), Some(msg_epoch))?;
+                Ok(MessageProcessingOutcome::without_context(
+                    MessageProcessingResult::Unprocessable {
+                        mls_group_id: group.mls_group_id.clone(),
+                    },
+                ))
             }
             Error::ProcessMessageWrongGroupId => {
                 tracing::error!(target: "mdk_core::messages::process_message", "Group ID mismatch");
