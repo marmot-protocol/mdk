@@ -8,6 +8,7 @@ use mdk_storage_traits::MdkStorageProvider;
 use nostr::{Event, EventBuilder, Keys, Kind, PublicKey, RelayUrl};
 
 use crate::MDK;
+use crate::constant::MLS_KEY_PACKAGE_KIND;
 use crate::groups::NostrGroupConfigData;
 
 /// Creates test group members with standard configuration
@@ -35,11 +36,17 @@ where
     Storage: MdkStorageProvider,
 {
     let relays = vec![RelayUrl::parse("wss://test.relay").unwrap()];
-    let (key_package_hex, tags, _hash_ref) = mdk
+    let crate::key_packages::KeyPackageEventData {
+        content: key_package_hex,
+        tags_30443: tags,
+        hash_ref: _hash_ref,
+        d_tag: _d_value,
+        ..
+    } = mdk
         .create_key_package_for_event(&member_keys.public_key(), relays)
         .expect("Failed to create key package");
 
-    EventBuilder::new(Kind::MlsKeyPackage, key_package_hex)
+    EventBuilder::new(MLS_KEY_PACKAGE_KIND, key_package_hex)
         .tags(tags)
         .sign_with_keys(member_keys)
         .expect("Failed to sign event")
@@ -58,11 +65,17 @@ where
     Storage: MdkStorageProvider,
 {
     let relays = vec![RelayUrl::parse("wss://test.relay").unwrap()];
-    let (key_package_hex, tags, _hash_ref) = mdk
+    let crate::key_packages::KeyPackageEventData {
+        content: key_package_hex,
+        tags_30443: tags,
+        hash_ref: _hash_ref,
+        d_tag: _d_value,
+        ..
+    } = mdk
         .create_key_package_for_event(pubkey, relays)
         .expect("Failed to create key package");
 
-    EventBuilder::new(Kind::MlsKeyPackage, key_package_hex)
+    EventBuilder::new(MLS_KEY_PACKAGE_KIND, key_package_hex)
         .tags(tags)
         .sign_with_keys(signing_keys)
         .expect("Failed to sign event")

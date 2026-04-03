@@ -63,22 +63,48 @@ async fn main() -> Result<(), Error> {
     let relay_url = RelayUrl::parse("wss://relay.example.com").unwrap();
 
     // Create key packages for members (not creator)
-    let (member1_kp_encoded, member1_tags, _) =
-        mdk.create_key_package_for_event(&member1_keys.public_key(), [relay_url.clone()])?;
+    let mdk_core::key_packages::KeyPackageEventData {
+        content: member1_kp_encoded,
+        tags_30443: member1_tags,
+        tags_443: member1_tags_443,
+        ..
+    } = mdk.create_key_package_for_event(&member1_keys.public_key(), [relay_url.clone()])?;
 
-    let member1_event =
-        nostr::event::builder::EventBuilder::new(nostr::Kind::MlsKeyPackage, member1_kp_encoded)
-            .tags(member1_tags)
+    let member1_event = nostr::event::builder::EventBuilder::new(
+        nostr::Kind::Custom(30443),
+        member1_kp_encoded.clone(),
+    )
+    .tags(member1_tags)
+    .build(member1_keys.public_key())
+    .sign(&member1_keys)
+    .await?;
+
+    let _member1_legacy_event =
+        nostr::event::builder::EventBuilder::new(nostr::Kind::Custom(443), member1_kp_encoded)
+            .tags(member1_tags_443)
             .build(member1_keys.public_key())
             .sign(&member1_keys)
             .await?;
 
-    let (member2_kp_encoded, member2_tags, _) =
-        mdk.create_key_package_for_event(&member2_keys.public_key(), [relay_url.clone()])?;
+    let mdk_core::key_packages::KeyPackageEventData {
+        content: member2_kp_encoded,
+        tags_30443: member2_tags,
+        tags_443: member2_tags_443,
+        ..
+    } = mdk.create_key_package_for_event(&member2_keys.public_key(), [relay_url.clone()])?;
 
-    let member2_event =
-        nostr::event::builder::EventBuilder::new(nostr::Kind::MlsKeyPackage, member2_kp_encoded)
-            .tags(member2_tags)
+    let member2_event = nostr::event::builder::EventBuilder::new(
+        nostr::Kind::Custom(30443),
+        member2_kp_encoded.clone(),
+    )
+    .tags(member2_tags)
+    .build(member2_keys.public_key())
+    .sign(&member2_keys)
+    .await?;
+
+    let _member2_legacy_event =
+        nostr::event::builder::EventBuilder::new(nostr::Kind::Custom(443), member2_kp_encoded)
+            .tags(member2_tags_443)
             .build(member2_keys.public_key())
             .sign(&member2_keys)
             .await?;
