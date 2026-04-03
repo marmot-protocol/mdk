@@ -337,7 +337,8 @@ where
             });
         }
 
-        // For addressable kind:30443 events, the `d` tag is mandatory and must be non-empty.
+        // For addressable kind:30443 events, the `d` tag is mandatory and must be
+        // a 64-character hex string (32 random bytes, hex-encoded per MIP-00).
         // Legacy kind:443 events do not have a `d` tag.
         if event.kind == MLS_KEY_PACKAGE_KIND {
             let d_tag = event.tags.iter().find(|t| t.kind() == TagKind::d());
@@ -354,6 +355,17 @@ where
                             "d tag value must not be empty".to_string(),
                         ));
                     }
+                    if d_value.len() != 64 {
+                        return Err(Error::KeyPackage(
+                            "d tag must be exactly 64 hex characters (32 bytes)".to_string(),
+                        ));
+                    }
+                    hex::decode(d_value).map_err(|e| {
+                        Error::KeyPackage(format!(
+                            "d tag must contain valid hex-encoded data: {}",
+                            e
+                        ))
+                    })?;
                 }
             }
         }
@@ -3133,6 +3145,92 @@ mod tests {
         assert!(
             matches!(result, Err(Error::KeyPackage(_))),
             "Should reject kind:30443 event with empty d tag value, got: {:?}",
+            result
+        );
+    }
+
+    /// Regression: parse_key_package rejects kind:30443 events with a non-hex `d` tag value
+    #[test]
+    fn test_parse_key_package_rejects_kind_30443_invalid_hex_d_tag() {
+        let mdk = create_test_mdk();
+        let keys = nostr::Keys::generate();
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").unwrap()];
+
+        let KeyPackageEventData {
+            content: key_package_str,
+            tags_30443: tags,
+            hash_ref: _hash_ref,
+            d_tag: _d_value,
+            ..
+        } = mdk
+            .create_key_package_for_event(&keys.public_key(), relays)
+            .expect("Failed to create key package");
+
+        // Replace the `d` tag with one containing non-hex characters (correct length, invalid chars)
+        let tags_with_invalid_hex_d: Vec<Tag> = tags
+            .into_iter()
+            .map(|t| {
+                if t.kind() == TagKind::d() {
+                    Tag::identifier(
+                        "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+                    )
+                } else {
+                    t
+                }
+            })
+            .collect();
+
+        let event = EventBuilder::new(MLS_KEY_PACKAGE_KIND, key_package_str)
+            .tags(tags_with_invalid_hex_d)
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        let result = mdk.parse_key_package(&event);
+        assert!(
+            matches!(result, Err(Error::KeyPackage(_))),
+            "Should reject kind:30443 event with non-hex d tag value, got: {:?}",
+            result
+        );
+    }
+
+    /// Regression: parse_key_package rejects kind:30443 events with a too-short `d` tag value
+    #[test]
+    fn test_parse_key_package_rejects_kind_30443_wrong_length_d_tag() {
+        let mdk = create_test_mdk();
+        let keys = nostr::Keys::generate();
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").unwrap()];
+
+        let KeyPackageEventData {
+            content: key_package_str,
+            tags_30443: tags,
+            hash_ref: _hash_ref,
+            d_tag: _d_value,
+            ..
+        } = mdk
+            .create_key_package_for_event(&keys.public_key(), relays)
+            .expect("Failed to create key package");
+
+        // Replace the `d` tag with a valid hex value that is too short
+        let tags_with_short_d: Vec<Tag> = tags
+            .into_iter()
+            .map(|t| {
+                if t.kind() == TagKind::d() {
+                    Tag::identifier("abcd1234")
+                } else {
+                    t
+                }
+            })
+            .collect();
+
+        let event = EventBuilder::new(MLS_KEY_PACKAGE_KIND, key_package_str)
+            .tags(tags_with_short_d)
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        let result = mdk.parse_key_package(&event);
+        assert!(
+            matches!(result, Err(Error::KeyPackage(_))),
+            "Should reject kind:30443 event with wrong-length d tag value, got: {:?}",
             result
         );
     }
