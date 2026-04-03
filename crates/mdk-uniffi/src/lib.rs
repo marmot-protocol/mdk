@@ -3085,6 +3085,8 @@ mod tests {
             outcome.result,
             ProcessMessageResult::ApplicationMessage { .. }
         ));
+        // The creator sent the message, so sender_leaf_index should be 0
+        assert_eq!(outcome.sender_leaf_index, Some(0));
     }
 
     #[test]
