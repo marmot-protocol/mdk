@@ -3024,96 +3024,421 @@ mod tests {
         assert_eq!(result.unwrap().len(), 0);
     }
 
-    // ── Helper: create a group and return (mdk, group_id, creator_keys) ──────
+    // ── Helpers for multi-party tests ──────────────────────────────────────
 
-    fn create_test_group_with_keys() -> (Mdk, String, Keys) {
-        let mdk = create_test_mdk();
-        let creator_keys = Keys::generate();
-        let member_keys = Keys::generate();
+    /// Create a two-party group (Alice + Bob) across separate Mdk instances.
+    /// Returns (alice_mdk, bob_mdk, group_id, alice_keys, bob_keys).
+    fn create_two_party_group() -> (Mdk, Mdk, String, Keys, Keys) {
+        let alice_mdk = create_test_mdk();
+        let bob_mdk = create_test_mdk();
+        let alice_keys = Keys::generate();
+        let bob_keys = Keys::generate();
         let relays = vec!["wss://relay.example.com".to_string()];
 
-        let kp_result = mdk
-            .create_key_package_for_event(member_keys.public_key().to_hex(), relays.clone())
+        // Bob creates a key package on his own Mdk
+        let bob_kp = bob_mdk
+            .create_key_package_for_event(bob_keys.public_key().to_hex(), relays.clone())
             .unwrap();
-
-        let kp_event = EventBuilder::new(Kind::MlsKeyPackage, kp_result.key_package)
+        let bob_kp_event = EventBuilder::new(Kind::MlsKeyPackage, bob_kp.key_package)
             .tags(
-                kp_result
+                bob_kp
                     .tags
                     .into_iter()
                     .map(|t| Tag::parse(&t).unwrap())
                     .collect::<Vec<_>>(),
             )
-            .sign_with_keys(&member_keys)
+            .sign_with_keys(&bob_keys)
             .unwrap();
 
-        let create_result = mdk
+        // Alice creates the group containing Bob
+        let create_result = alice_mdk
             .create_group(
-                creator_keys.public_key().to_hex(),
-                vec![kp_event.as_json()],
+                alice_keys.public_key().to_hex(),
+                vec![bob_kp_event.as_json()],
                 "Test Group".to_string(),
                 "Test Description".to_string(),
                 relays,
-                vec![creator_keys.public_key().to_hex()],
+                vec![alice_keys.public_key().to_hex()],
             )
             .unwrap();
 
-        mdk.merge_pending_commit(create_result.group.mls_group_id.clone())
-            .unwrap();
+        let group_id = create_result.group.mls_group_id.clone();
+        alice_mdk.merge_pending_commit(group_id.clone()).unwrap();
 
-        (mdk, create_result.group.mls_group_id, creator_keys)
+        // Bob joins via welcome
+        let welcome = bob_mdk
+            .process_welcome(
+                EventId::all_zeros().to_hex(),
+                create_result.welcome_rumors_json[0].clone(),
+            )
+            .unwrap();
+        bob_mdk.accept_welcome(welcome).unwrap();
+
+        (alice_mdk, bob_mdk, group_id, alice_keys, bob_keys)
     }
 
-    // ── Tests for newly bound methods ────────────────────────────────────────
+    // ── Scenario A: Two-party message processing with context ────────────
 
     #[test]
-    fn test_process_message_with_context_returns_application_message() {
-        let (mdk, group_id, creator_keys) = create_test_group_with_keys();
+    fn test_process_message_with_context_two_party() {
+        let (alice_mdk, bob_mdk, group_id, alice_keys, bob_keys) = create_two_party_group();
 
-        let event_json = mdk
+        // Alice sends a message
+        let alice_msg = alice_mdk
             .create_message(
-                group_id,
-                creator_keys.public_key().to_hex(),
-                "Hello from context test".to_string(),
+                group_id.clone(),
+                alice_keys.public_key().to_hex(),
+                "Hello Bob!".to_string(),
                 1,
                 None,
             )
             .unwrap();
 
-        let outcome = mdk.process_message_with_context(event_json).unwrap();
-        assert!(matches!(
-            outcome.result,
-            ProcessMessageResult::ApplicationMessage { .. }
-        ));
-        // The creator sent the message, so sender_leaf_index should be 0
+        // Bob processes Alice's message through the UniFFI boundary
+        let outcome = bob_mdk.process_message_with_context(alice_msg).unwrap();
+
+        // Verify the result variant and message content
+        let message = match &outcome.result {
+            ProcessMessageResult::ApplicationMessage { message } => message,
+            other => panic!(
+                "Expected ApplicationMessage, got {:?}",
+                std::mem::discriminant(other)
+            ),
+        };
+        assert_eq!(message.sender_pubkey, alice_keys.public_key().to_hex());
+
+        // Alice is leaf 0 (group creator)
         assert_eq!(outcome.sender_leaf_index, Some(0));
-    }
 
-    #[test]
-    fn test_delete_key_package_via_event_roundtrip() {
-        let mdk = create_test_mdk();
-        let keys = Keys::generate();
-        let relays = vec!["wss://relay.example.com".to_string()];
-
-        let kp_result = mdk
-            .create_key_package_for_event(keys.public_key().to_hex(), relays)
+        // Now Bob sends a message back
+        let bob_msg = bob_mdk
+            .create_message(
+                group_id,
+                bob_keys.public_key().to_hex(),
+                "Hello Alice!".to_string(),
+                1,
+                None,
+            )
             .unwrap();
 
-        let kp_event = EventBuilder::new(Kind::MlsKeyPackage, kp_result.key_package)
+        let outcome = alice_mdk.process_message_with_context(bob_msg).unwrap();
+
+        let message = match &outcome.result {
+            ProcessMessageResult::ApplicationMessage { message } => message,
+            other => panic!(
+                "Expected ApplicationMessage, got {:?}",
+                std::mem::discriminant(other)
+            ),
+        };
+        assert_eq!(message.sender_pubkey, bob_keys.public_key().to_hex());
+        // Bob is leaf 1
+        assert_eq!(outcome.sender_leaf_index, Some(1));
+    }
+
+    // ── Scenario B: Topology inspection ──────────────────────────────────
+
+    #[test]
+    fn test_topology_inspection_two_party() {
+        let (alice_mdk, bob_mdk, group_id, alice_keys, bob_keys) = create_two_party_group();
+
+        // own_leaf_index: Alice is the creator → leaf 0
+        assert_eq!(alice_mdk.own_leaf_index(group_id.clone()).unwrap(), 0);
+        // Bob joined second → leaf 1
+        assert_eq!(bob_mdk.own_leaf_index(group_id.clone()).unwrap(), 1);
+
+        // group_leaf_map: verify both members at correct indices with correct pubkeys
+        let leaf_map = alice_mdk.group_leaf_map(group_id.clone()).unwrap();
+        assert_eq!(leaf_map.len(), 2);
+
+        let alice_entry = leaf_map.iter().find(|e| e.leaf_index == 0).unwrap();
+        assert_eq!(alice_entry.public_key, alice_keys.public_key().to_hex());
+
+        let bob_entry = leaf_map.iter().find(|e| e.leaf_index == 1).unwrap();
+        assert_eq!(bob_entry.public_key, bob_keys.public_key().to_hex());
+
+        // Bob sees the same topology
+        let bob_leaf_map = bob_mdk.group_leaf_map(group_id.clone()).unwrap();
+        assert_eq!(bob_leaf_map.len(), 2);
+        assert_eq!(
+            bob_leaf_map
+                .iter()
+                .find(|e| e.leaf_index == 0)
+                .unwrap()
+                .public_key,
+            alice_keys.public_key().to_hex()
+        );
+
+        // get_ratchet_tree_info: verify structure and leaf count
+        let tree_info = alice_mdk.get_ratchet_tree_info(group_id.clone()).unwrap();
+        assert!(!tree_info.tree_hash.is_empty());
+        assert!(!tree_info.serialized_tree.is_empty());
+        assert_eq!(tree_info.leaf_nodes.len(), 2);
+
+        // Each leaf node should have non-empty crypto material and a credential
+        // that maps to one of our known pubkeys
+        for node in &tree_info.leaf_nodes {
+            assert!(!node.encryption_key.is_empty());
+            assert!(!node.signature_key.is_empty());
+            assert!(!node.credential_identity.is_empty());
+        }
+
+        // pending_member_changes: clean group should have no pending proposals
+        let changes = alice_mdk.pending_member_changes(group_id.clone()).unwrap();
+        assert!(changes.additions.is_empty());
+        assert!(changes.removals.is_empty());
+
+        assert!(
+            alice_mdk
+                .pending_added_members_pubkeys(group_id.clone())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            alice_mdk
+                .pending_removed_members_pubkeys(group_id)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    // ── Scenario C: Key package lifecycle (deletion has observable effect) ─
+
+    #[test]
+    fn test_key_package_deletion_prevents_welcome_processing() {
+        let alice_mdk = create_test_mdk();
+        let bob_mdk = create_test_mdk();
+        let alice_keys = Keys::generate();
+        let bob_keys = Keys::generate();
+        let relays = vec!["wss://relay.example.com".to_string()];
+
+        // Bob creates a key package
+        let bob_kp = bob_mdk
+            .create_key_package_for_event(bob_keys.public_key().to_hex(), relays.clone())
+            .unwrap();
+        let bob_kp_event = EventBuilder::new(Kind::MlsKeyPackage, bob_kp.key_package)
             .tags(
-                kp_result
+                bob_kp
                     .tags
                     .into_iter()
                     .map(|t| Tag::parse(&t).unwrap())
                     .collect::<Vec<_>>(),
             )
-            .sign_with_keys(&keys)
+            .sign_with_keys(&bob_keys)
             .unwrap();
 
-        assert!(
-            mdk.delete_key_package_from_storage(kp_event.as_json())
-                .is_ok()
+        // Delete Bob's key package by hash_ref BEFORE the group is created
+        bob_mdk
+            .delete_key_package_from_storage_by_hash_ref(bob_kp.hash_ref)
+            .unwrap();
+
+        // Alice creates a group referencing Bob's (now-deleted) key package
+        let create_result = alice_mdk
+            .create_group(
+                alice_keys.public_key().to_hex(),
+                vec![bob_kp_event.as_json()],
+                "Test Group".to_string(),
+                "Test Description".to_string(),
+                relays,
+                vec![alice_keys.public_key().to_hex()],
+            )
+            .unwrap();
+        alice_mdk
+            .merge_pending_commit(create_result.group.mls_group_id.clone())
+            .unwrap();
+
+        // Bob tries to process the welcome — should fail because the private
+        // key material was deleted from storage
+        let welcome_result = bob_mdk.process_welcome(
+            EventId::all_zeros().to_hex(),
+            create_result.welcome_rumors_json[0].clone(),
         );
+        assert!(
+            welcome_result.is_err(),
+            "Welcome should fail after key package deletion, but got: {:?}",
+            welcome_result.unwrap().group_name
+        );
+    }
+
+    #[test]
+    fn test_delete_key_package_via_event_prevents_welcome() {
+        let alice_mdk = create_test_mdk();
+        let bob_mdk = create_test_mdk();
+        let alice_keys = Keys::generate();
+        let bob_keys = Keys::generate();
+        let relays = vec!["wss://relay.example.com".to_string()];
+
+        // Bob creates a key package
+        let bob_kp = bob_mdk
+            .create_key_package_for_event(bob_keys.public_key().to_hex(), relays.clone())
+            .unwrap();
+        let bob_kp_event = EventBuilder::new(Kind::MlsKeyPackage, bob_kp.key_package)
+            .tags(
+                bob_kp
+                    .tags
+                    .into_iter()
+                    .map(|t| Tag::parse(&t).unwrap())
+                    .collect::<Vec<_>>(),
+            )
+            .sign_with_keys(&bob_keys)
+            .unwrap();
+
+        // Delete via event JSON (tests the JSON→Event→KeyPackage parsing path)
+        bob_mdk
+            .delete_key_package_from_storage(bob_kp_event.as_json())
+            .unwrap();
+
+        // Alice creates a group referencing Bob's deleted key package
+        let create_result = alice_mdk
+            .create_group(
+                alice_keys.public_key().to_hex(),
+                vec![bob_kp_event.as_json()],
+                "Test Group".to_string(),
+                "Test Description".to_string(),
+                relays,
+                vec![alice_keys.public_key().to_hex()],
+            )
+            .unwrap();
+        alice_mdk
+            .merge_pending_commit(create_result.group.mls_group_id.clone())
+            .unwrap();
+
+        // Bob can't process the welcome — private key material is gone
+        let welcome_result = bob_mdk.process_welcome(
+            EventId::all_zeros().to_hex(),
+            create_result.welcome_rumors_json[0].clone(),
+        );
+        assert!(
+            welcome_result.is_err(),
+            "Welcome should fail after event-based key package deletion"
+        );
+    }
+
+    // ── Scenario D: Group image option mapping ───────────────────────────
+
+    #[test]
+    fn test_prepare_group_image_options_mapping() {
+        // Minimal valid 1×1 red PNG, hand-assembled from the PNG spec
+        let png = build_minimal_png();
+
+        // With blurhash/thumbhash disabled: verify None fields
+        let result_no_hashes = prepare_group_image_for_upload_with_options(
+            png.clone(),
+            "image/png".into(),
+            MediaProcessingOptionsInput {
+                sanitize_exif: Some(true),
+                generate_blurhash: Some(false),
+                generate_thumbhash: Some(false),
+                max_dimension: None,
+                max_file_size: None,
+                max_filename_length: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result_no_hashes.mime_type, "image/png");
+        assert!(
+            result_no_hashes.blurhash.is_none(),
+            "blurhash should be None when disabled"
+        );
+        assert!(
+            result_no_hashes.thumbhash.is_none(),
+            "thumbhash should be None when disabled"
+        );
+        assert!(!result_no_hashes.encrypted_data.is_empty());
+        assert!(!result_no_hashes.image_key.is_empty());
+        assert!(!result_no_hashes.image_nonce.is_empty());
+        assert!(result_no_hashes.encrypted_size > 0);
+        assert!(result_no_hashes.original_size > 0);
+
+        // Dimensions should be 1×1
+        let dims = result_no_hashes
+            .dimensions
+            .expect("dimensions should be present for a valid PNG");
+        assert_eq!(dims.width, 1);
+        assert_eq!(dims.height, 1);
+
+        // With thumbhash enabled: verify it's populated
+        let result_with_thumbhash = prepare_group_image_for_upload_with_options(
+            png,
+            "image/png".into(),
+            MediaProcessingOptionsInput {
+                sanitize_exif: Some(true),
+                generate_blurhash: Some(false),
+                generate_thumbhash: Some(true),
+                max_dimension: None,
+                max_file_size: None,
+                max_filename_length: None,
+            },
+        )
+        .unwrap();
+
+        assert!(
+            result_with_thumbhash.thumbhash.is_some(),
+            "thumbhash should be present when enabled"
+        );
+
+        // Both calls should produce different encrypted data (different random keys)
+        assert_ne!(
+            result_no_hashes.encrypted_data, result_with_thumbhash.encrypted_data,
+            "each call should use fresh encryption keys"
+        );
+    }
+
+    /// Build a minimal valid 1×1 red PNG from raw bytes.
+    fn build_minimal_png() -> Vec<u8> {
+        fn crc32(data: &[u8]) -> u32 {
+            let mut crc: u32 = 0xFFFF_FFFF;
+            for &b in data {
+                crc ^= b as u32;
+                for _ in 0..8 {
+                    crc = if crc & 1 != 0 {
+                        (crc >> 1) ^ 0xEDB8_8320
+                    } else {
+                        crc >> 1
+                    };
+                }
+            }
+            !crc
+        }
+        fn adler32(data: &[u8]) -> u32 {
+            let (mut a, mut b): (u32, u32) = (1, 0);
+            for &byte in data {
+                a = (a + byte as u32) % 65521;
+                b = (b + a) % 65521;
+            }
+            (b << 16) | a
+        }
+
+        let mut v = Vec::new();
+        v.extend_from_slice(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
+        // IHDR
+        let ihdr: [u8; 13] = [0, 0, 0, 1, 0, 0, 0, 1, 8, 2, 0, 0, 0];
+        v.extend_from_slice(&(ihdr.len() as u32).to_be_bytes());
+        v.extend_from_slice(b"IHDR");
+        v.extend_from_slice(&ihdr);
+        let mut buf = Vec::from(&b"IHDR"[..]);
+        buf.extend_from_slice(&ihdr);
+        v.extend_from_slice(&crc32(&buf).to_be_bytes());
+        // IDAT
+        let row: [u8; 4] = [0x00, 0xFF, 0x00, 0x00];
+        let adler = adler32(&row);
+        let mut zlib = Vec::new();
+        zlib.extend_from_slice(&[0x78, 0x01, 0x01]);
+        zlib.extend_from_slice(&(row.len() as u16).to_le_bytes());
+        zlib.extend_from_slice(&(!(row.len() as u16)).to_le_bytes());
+        zlib.extend_from_slice(&row);
+        zlib.extend_from_slice(&adler.to_be_bytes());
+        v.extend_from_slice(&(zlib.len() as u32).to_be_bytes());
+        v.extend_from_slice(b"IDAT");
+        v.extend_from_slice(&zlib);
+        let mut buf = Vec::from(&b"IDAT"[..]);
+        buf.extend_from_slice(&zlib);
+        v.extend_from_slice(&crc32(&buf).to_be_bytes());
+        // IEND
+        v.extend_from_slice(&0u32.to_be_bytes());
+        v.extend_from_slice(b"IEND");
+        v.extend_from_slice(&crc32(b"IEND").to_be_bytes());
+        v
     }
 
     // ── MIP-04 encrypted media tests ─────────────────────────────────────────
