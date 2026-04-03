@@ -3039,6 +3039,258 @@ mod tests {
         assert_eq!(result.unwrap().len(), 0);
     }
 
+    // ── Helper: create a group and return (mdk, group_id, creator_keys) ──────
+
+    fn create_test_group_with_keys() -> (Mdk, String, Keys) {
+        let mdk = create_test_mdk();
+        let creator_keys = Keys::generate();
+        let member_keys = Keys::generate();
+        let relays = vec!["wss://relay.example.com".to_string()];
+
+        let kp_result = mdk
+            .create_key_package_for_event(member_keys.public_key().to_hex(), relays.clone())
+            .unwrap();
+
+        let kp_event = EventBuilder::new(Kind::MlsKeyPackage, kp_result.key_package)
+            .tags(
+                kp_result
+                    .tags
+                    .into_iter()
+                    .map(|t| Tag::parse(&t).unwrap())
+                    .collect::<Vec<_>>(),
+            )
+            .sign_with_keys(&member_keys)
+            .unwrap();
+
+        let create_result = mdk
+            .create_group(
+                creator_keys.public_key().to_hex(),
+                vec![kp_event.as_json()],
+                "Test Group".to_string(),
+                "Test Description".to_string(),
+                relays,
+                vec![creator_keys.public_key().to_hex()],
+            )
+            .unwrap();
+
+        mdk.merge_pending_commit(create_result.group.mls_group_id.clone())
+            .unwrap();
+
+        (mdk, create_result.group.mls_group_id, creator_keys)
+    }
+
+    // ── Tests for newly bound methods ────────────────────────────────────────
+
+    #[test]
+    fn test_own_leaf_index_valid_group() {
+        let (mdk, group_id, _) = create_test_group_with_keys();
+        let result = mdk.own_leaf_index(group_id);
+        assert!(result.is_ok());
+        // Creator is the first leaf
+        assert_eq!(result.unwrap(), 0);
+    }
+
+    #[test]
+    fn test_own_leaf_index_invalid_group_id() {
+        let mdk = create_test_mdk();
+        let result = mdk.own_leaf_index("not_valid_hex".to_string());
+        assert!(matches!(result, Err(MdkUniffiError::InvalidInput(_))));
+    }
+
+    #[test]
+    fn test_own_leaf_index_nonexistent_group() {
+        let mdk = create_test_mdk();
+        let fake_group_id = hex::encode([0u8; 32]);
+        let result = mdk.own_leaf_index(fake_group_id);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_group_leaf_map_valid_group() {
+        let (mdk, group_id, creator_keys) = create_test_group_with_keys();
+        let result = mdk.group_leaf_map(group_id);
+        assert!(result.is_ok());
+        let map = result.unwrap();
+        // Group has creator + 1 member = 2 leaves
+        assert_eq!(map.len(), 2);
+        // Creator should be at leaf index 0
+        let creator_entry = map.iter().find(|e| e.public_key == creator_keys.public_key().to_hex());
+        assert!(creator_entry.is_some());
+    }
+
+    #[test]
+    fn test_group_leaf_map_invalid_group_id() {
+        let mdk = create_test_mdk();
+        let result = mdk.group_leaf_map("not_valid_hex".to_string());
+        assert!(matches!(result, Err(MdkUniffiError::InvalidInput(_))));
+    }
+
+    #[test]
+    fn test_group_leaf_map_nonexistent_group() {
+        let mdk = create_test_mdk();
+        let fake_group_id = hex::encode([0u8; 32]);
+        let result = mdk.group_leaf_map(fake_group_id);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_get_ratchet_tree_info_valid_group() {
+        let (mdk, group_id, _) = create_test_group_with_keys();
+        let result = mdk.get_ratchet_tree_info(group_id);
+        assert!(result.is_ok());
+        let info = result.unwrap();
+        assert!(!info.tree_hash.is_empty());
+        assert!(!info.serialized_tree.is_empty());
+        // Should have 2 leaf nodes (creator + member)
+        assert_eq!(info.leaf_nodes.len(), 2);
+        for node in &info.leaf_nodes {
+            assert!(!node.encryption_key.is_empty());
+            assert!(!node.signature_key.is_empty());
+            assert!(!node.credential_identity.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_get_ratchet_tree_info_invalid_group_id() {
+        let mdk = create_test_mdk();
+        let result = mdk.get_ratchet_tree_info("not_valid_hex".to_string());
+        assert!(matches!(result, Err(MdkUniffiError::InvalidInput(_))));
+    }
+
+    #[test]
+    fn test_get_ratchet_tree_info_nonexistent_group() {
+        let mdk = create_test_mdk();
+        let fake_group_id = hex::encode([0u8; 32]);
+        let result = mdk.get_ratchet_tree_info(fake_group_id);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_pending_added_members_pubkeys_no_pending() {
+        let (mdk, group_id, _) = create_test_group_with_keys();
+        let result = mdk.pending_added_members_pubkeys(group_id);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_pending_added_members_pubkeys_invalid_group_id() {
+        let mdk = create_test_mdk();
+        let result = mdk.pending_added_members_pubkeys("not_valid_hex".to_string());
+        assert!(matches!(result, Err(MdkUniffiError::InvalidInput(_))));
+    }
+
+    #[test]
+    fn test_pending_removed_members_pubkeys_no_pending() {
+        let (mdk, group_id, _) = create_test_group_with_keys();
+        let result = mdk.pending_removed_members_pubkeys(group_id);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_pending_removed_members_pubkeys_invalid_group_id() {
+        let mdk = create_test_mdk();
+        let result = mdk.pending_removed_members_pubkeys("not_valid_hex".to_string());
+        assert!(matches!(result, Err(MdkUniffiError::InvalidInput(_))));
+    }
+
+    #[test]
+    fn test_pending_member_changes_no_pending() {
+        let (mdk, group_id, _) = create_test_group_with_keys();
+        let result = mdk.pending_member_changes(group_id);
+        assert!(result.is_ok());
+        let changes = result.unwrap();
+        assert_eq!(changes.additions.len(), 0);
+        assert_eq!(changes.removals.len(), 0);
+    }
+
+    #[test]
+    fn test_pending_member_changes_invalid_group_id() {
+        let mdk = create_test_mdk();
+        let result = mdk.pending_member_changes("not_valid_hex".to_string());
+        assert!(matches!(result, Err(MdkUniffiError::InvalidInput(_))));
+    }
+
+    #[test]
+    fn test_process_message_with_context_invalid_json() {
+        let mdk = create_test_mdk();
+        let result = mdk.process_message_with_context("not_valid_json".to_string());
+        assert!(matches!(result, Err(MdkUniffiError::InvalidInput(_))));
+    }
+
+    #[test]
+    fn test_delete_key_package_from_storage_invalid_json() {
+        let mdk = create_test_mdk();
+        let result = mdk.delete_key_package_from_storage("not_valid_json".to_string());
+        assert!(matches!(result, Err(MdkUniffiError::InvalidInput(_))));
+    }
+
+    #[test]
+    fn test_delete_key_package_from_storage_by_hash_ref_invalid() {
+        let mdk = create_test_mdk();
+        // Empty bytes should fail to deserialize as a hash reference
+        let result = mdk.delete_key_package_from_storage_by_hash_ref(vec![]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_delete_key_package_from_storage_by_hash_ref_roundtrip() {
+        let mdk = create_test_mdk();
+        let keys = Keys::generate();
+        let relays = vec!["wss://relay.example.com".to_string()];
+
+        let kp_result = mdk
+            .create_key_package_for_event(keys.public_key().to_hex(), relays)
+            .unwrap();
+
+        // The hash_ref from creation should be usable for deletion
+        let result = mdk.delete_key_package_from_storage_by_hash_ref(kp_result.hash_ref);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_delete_key_package_from_storage_via_event() {
+        let mdk = create_test_mdk();
+        let keys = Keys::generate();
+        let relays = vec!["wss://relay.example.com".to_string()];
+
+        let kp_result = mdk
+            .create_key_package_for_event(keys.public_key().to_hex(), relays.clone())
+            .unwrap();
+
+        // Build a signed key package event
+        let kp_event = EventBuilder::new(Kind::MlsKeyPackage, kp_result.key_package)
+            .tags(
+                kp_result
+                    .tags
+                    .into_iter()
+                    .map(|t| Tag::parse(&t).unwrap())
+                    .collect::<Vec<_>>(),
+            )
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        let result = mdk.delete_key_package_from_storage(kp_event.as_json());
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_prepare_group_image_for_upload_with_options_invalid_mime() {
+        let result = prepare_group_image_for_upload_with_options(
+            vec![0u8; 100],
+            "invalid/mime".to_string(),
+            MediaProcessingOptionsInput {
+                sanitize_exif: None,
+                generate_blurhash: None,
+                max_dimension: None,
+                max_file_size: None,
+                max_filename_length: None,
+            },
+        );
+        assert!(result.is_err());
+    }
+
     // ── MIP-04 encrypted media tests ─────────────────────────────────────────
 
     #[cfg(feature = "mip04")]
