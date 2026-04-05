@@ -29,6 +29,7 @@
 
 - **`KeyPackageResult` now includes `d_tag` and `tags_legacy`**: The `KeyPackageResult` struct returned by `create_key_package_for_event` and `create_key_package_for_event_with_options` now includes a `d_tag: String` field containing the 32-byte hex identifier for the KeyPackage slot. This enables callers to reuse the same `d` value when rotating KeyPackages so that relays automatically replace the old event. It also includes `tags_legacy`, which provides the tags without the `d` tag. Callers MUST dual-publish both `kind:30443` (using `tags`) and `kind:443` (using `tags_legacy`) until May 1, 2026 so that legacy clients can still discover new key packages. All test event builders updated to use `kind:30443`. ([#233](https://github.com/marmot-protocol/mdk/pull/233))
 - `new_mdk_unencrypted()` is now gated behind the `test-utils` feature flag. Downstream consumers must enable the `test-utils` feature to access this function. ([#245](https://github.com/marmot-protocol/mdk/pull/245))
+- `create_message` now takes an additional `event_tags` parameter (`Option<Vec<Vec<String>>>`) for appending allow-listed tags (e.g. NIP-40 `expiration`) to the outer kind:445 wrapper event. Pass `None` to preserve existing behavior. ([#248](https://github.com/marmot-protocol/mdk/pull/248))
 
 ### Changed
 

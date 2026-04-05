@@ -32,6 +32,8 @@ pub use crate::groups::{
     GroupResult, LeafNodeInfo, NostrGroupConfigData, NostrGroupDataUpdate, PendingMemberChanges,
     RatchetTreeInfo, UpdateGroupResult,
 };
+/// Allowed tags for the outer kind:445 wrapper event
+pub use crate::messages::EventTag;
 /// Message processing result variants
 pub use crate::messages::{
     MessageProcessingContext, MessageProcessingOutcome, MessageProcessingResult,

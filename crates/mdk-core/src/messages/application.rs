@@ -119,7 +119,7 @@ mod tests {
         let rumor_id = rumor.id();
 
         let event = mdk
-            .create_message(&group_id, rumor)
+            .create_message(&group_id, rumor, None)
             .expect("Failed to create message");
 
         // Verify initial state
@@ -156,7 +156,7 @@ mod tests {
         let mut rumor = create_test_rumor(&creator, "Test message");
         let rumor_id = rumor.id();
         let _event = mdk
-            .create_message(&group_id, rumor)
+            .create_message(&group_id, rumor, None)
             .expect("Failed to create message");
 
         // Check initial state
@@ -193,7 +193,7 @@ mod tests {
         // Try to create a message (this would fail at the MLS level)
         // In practice, a non-member wouldn't have the group loaded
         let non_member_mdk = create_test_mdk();
-        let result = non_member_mdk.create_message(&group_id, rumor);
+        let result = non_member_mdk.create_message(&group_id, rumor, None);
 
         // Should fail because the group doesn't exist for this user
         assert!(
@@ -265,7 +265,7 @@ mod tests {
         // Charlie (non-member) attempts to send a message to the group
         // This should fail because Charlie doesn't have the group loaded
         let charlie_rumor = create_test_rumor(&charlie_keys, "Unauthorized message");
-        let charlie_message_result = charlie_mdk.create_message(&group_id, charlie_rumor);
+        let charlie_message_result = charlie_mdk.create_message(&group_id, charlie_rumor, None);
 
         assert!(
             charlie_message_result.is_err(),
@@ -347,7 +347,7 @@ mod tests {
         // Step 2: Alice sends a message in epoch 0
         let rumor1 = create_test_rumor(&alice_keys, "Hello from Alice");
         let msg_event1 = alice_mdk
-            .create_message(&group_id, rumor1)
+            .create_message(&group_id, rumor1, None)
             .expect("Alice should be able to send message");
 
         assert_eq!(msg_event1.kind, Kind::MlsGroupMessage);
@@ -386,7 +386,7 @@ mod tests {
         // Step 4: Alice sends message in new epoch
         let rumor2 = create_test_rumor(&alice_keys, "Message in epoch 1");
         let msg_event2 = alice_mdk
-            .create_message(&group_id, rumor2)
+            .create_message(&group_id, rumor2, None)
             .expect("Alice should send message in new epoch");
 
         // Bob processes message from new epoch
@@ -404,7 +404,7 @@ mod tests {
         // Step 5: Bob sends a message
         let rumor3 = create_test_rumor(&bob_keys, "Hello from Bob");
         let msg_event3 = bob_mdk
-            .create_message(&group_id, rumor3)
+            .create_message(&group_id, rumor3, None)
             .expect("Bob should be able to send message");
 
         // Alice processes Bob's message

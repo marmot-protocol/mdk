@@ -2556,7 +2556,7 @@ mod tests {
         // Step 4: Verify Bob can send messages (validates signing key is retained)
         let group = &bob_groups[0];
         let rumor = crate::test_util::create_test_rumor(&bob_keys, "Test message");
-        let message_result = bob_mdk.create_message(&group.mls_group_id, rumor);
+        let message_result = bob_mdk.create_message(&group.mls_group_id, rumor, None);
         assert!(
             message_result.is_ok(),
             "Bob should be able to send messages (signing key retained)"

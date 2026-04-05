@@ -20,7 +20,7 @@ use mdk_core::{
         prepare_group_image_for_upload_with_options as core_prepare_group_image_for_upload_with_options,
     },
     groups::{NostrGroupConfigData, NostrGroupDataUpdate},
-    messages::MessageProcessingResult,
+    messages::{EventTag, MessageProcessingResult},
 };
 use mdk_sqlite_storage::{EncryptionConfig, MdkSqliteStorage};
 use mdk_storage_traits::{
@@ -213,6 +213,36 @@ fn parse_tags(tags: Vec<Vec<String>>) -> Result<Vec<Tag>, MdkUniffiError> {
         .map(|tag_vec| {
             Tag::parse(tag_vec)
                 .map_err(|e| MdkUniffiError::InvalidInput(format!("Failed to parse tag: {e}")))
+        })
+        .collect()
+}
+
+fn parse_event_tags(tags: Vec<Vec<String>>) -> Result<Vec<EventTag>, MdkUniffiError> {
+    tags.into_iter()
+        .map(|tag_vec| {
+            let kind = tag_vec
+                .first()
+                .ok_or_else(|| MdkUniffiError::InvalidInput("Empty tag".to_string()))?
+                .as_str();
+
+            match kind {
+                "expiration" => {
+                    let value = tag_vec.get(1).ok_or_else(|| {
+                        MdkUniffiError::InvalidInput(
+                            "expiration tag requires a timestamp value".to_string(),
+                        )
+                    })?;
+                    let timestamp: u64 = value.parse().map_err(|_| {
+                        MdkUniffiError::InvalidInput(format!(
+                            "Invalid expiration timestamp: {value}"
+                        ))
+                    })?;
+                    Ok(EventTag::expiration(nostr::Timestamp::from(timestamp)))
+                }
+                other => Err(MdkUniffiError::InvalidInput(format!(
+                    "Tag '{other}' is not allowed on wrapper events. Allowed: expiration"
+                ))),
+            }
         })
         .collect()
 }
@@ -874,7 +904,12 @@ impl Mdk {
         Ok(())
     }
 
-    /// Create a message in a group
+    /// Create a message in a group.
+    ///
+    /// `tags` are appended to the rumor and therefore are encrypted.
+    ///
+    /// `event_tags` are appended to the outer kind:445 wrapper event. Only a subset
+    /// of tags are allowed; see [`EventTag`] for the full list.
     pub fn create_message(
         &self,
         mls_group_id: String,
@@ -882,6 +917,7 @@ impl Mdk {
         content: String,
         kind: u16,
         tags: Option<Vec<Vec<String>>>,
+        event_tags: Option<Vec<Vec<String>>>,
     ) -> Result<String, MdkUniffiError> {
         let group_id = parse_group_id(&mls_group_id)?;
         let sender_pubkey = parse_public_key(&sender_public_key)?;
@@ -894,9 +930,11 @@ impl Mdk {
             builder = builder.tags(parsed_tags);
         }
 
+        let parsed_event_tags = event_tags.map(parse_event_tags).transpose()?;
+
         let rumor = builder.build(sender_pubkey);
 
-        let event = mdk.create_message(&group_id, rumor)?;
+        let event = mdk.create_message(&group_id, rumor, parsed_event_tags)?;
 
         let event_json = serde_json::to_string(&event)
             .map_err(|e| MdkUniffiError::InvalidInput(format!("Failed to serialize event: {e}")))?;
@@ -2291,6 +2329,7 @@ mod tests {
             "Test message".to_string(),
             1,
             None,
+            None,
         )
         .unwrap();
 
@@ -2885,6 +2924,7 @@ mod tests {
             "Hello".to_string(),
             1,
             None,
+            None,
         );
         assert!(matches!(result, Err(MdkUniffiError::InvalidInput(_))));
     }
@@ -2899,8 +2939,102 @@ mod tests {
             "Hello".to_string(),
             1,
             None,
+            None,
         );
         assert!(matches!(result, Err(MdkUniffiError::InvalidInput(_))));
+    }
+
+    #[test]
+    fn test_create_message_with_event_tags() {
+        let mdk = create_test_mdk();
+        let creator_keys = Keys::generate();
+        let member_keys = Keys::generate();
+
+        let member_pubkey_hex = member_keys.public_key().to_hex();
+        let relays = vec!["wss://relay.example.com".to_string()];
+
+        let kp_result = mdk
+            .create_key_package_for_event(member_pubkey_hex.clone(), relays.clone())
+            .unwrap();
+
+        let kp_event = EventBuilder::new(Kind::Custom(443), kp_result.key_package)
+            .tags(
+                kp_result
+                    .tags
+                    .into_iter()
+                    .map(|t| Tag::parse(&t).unwrap())
+                    .collect::<Vec<_>>(),
+            )
+            .sign_with_keys(&member_keys)
+            .unwrap();
+
+        let create_result = mdk
+            .create_group(
+                creator_keys.public_key().to_hex(),
+                vec![kp_event.as_json()],
+                "Test Group".to_string(),
+                "Test Description".to_string(),
+                relays,
+                vec![creator_keys.public_key().to_hex()],
+            )
+            .unwrap();
+
+        mdk.merge_pending_commit(create_result.group.mls_group_id.clone())
+            .unwrap();
+
+        let event_json = mdk
+            .create_message(
+                create_result.group.mls_group_id,
+                creator_keys.public_key().to_hex(),
+                "Ephemeral update".to_string(),
+                1,
+                None,
+                Some(vec![vec![
+                    "expiration".to_string(),
+                    "1231006505".to_string(),
+                ]]),
+            )
+            .unwrap();
+
+        let event: Event =
+            serde_json::from_str(&event_json).expect("returned JSON should be valid");
+
+        assert!(
+            event.tags.iter().any(|t| t.kind() == TagKind::Expiration),
+            "Wrapper event must contain the expiration tag"
+        );
+
+        let exp_tag = event
+            .tags
+            .iter()
+            .find(|t| t.kind() == TagKind::Expiration)
+            .unwrap();
+        assert_eq!(
+            exp_tag.content().unwrap(),
+            "1231006505",
+            "Expiration value must match"
+        );
+    }
+
+    #[test]
+    fn test_create_message_with_invalid_event_tag() {
+        let mdk = create_test_mdk();
+        let keys = Keys::generate();
+        let fake_group_id = hex::encode([0u8; 32]);
+
+        let result = mdk.create_message(
+            fake_group_id,
+            keys.public_key().to_hex(),
+            "Hello".to_string(),
+            1,
+            None,
+            Some(vec![vec!["p".to_string(), "abc".to_string()]]),
+        );
+
+        assert!(
+            matches!(result, Err(MdkUniffiError::InvalidInput(ref msg)) if msg.contains("not allowed")),
+            "Disallowed tag should be rejected"
+        );
     }
 
     #[test]
@@ -3116,6 +3250,7 @@ mod tests {
                 "Hello Bob!".to_string(),
                 1,
                 None,
+                None,
             )
             .unwrap();
 
@@ -3145,6 +3280,7 @@ mod tests {
                 bob_keys.public_key().to_hex(),
                 "Hello Alice!".to_string(),
                 1,
+                None,
                 None,
             )
             .unwrap();

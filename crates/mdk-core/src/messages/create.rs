@@ -5,7 +5,7 @@
 use mdk_storage_traits::groups::types as group_types;
 use mdk_storage_traits::messages::types as message_types;
 use mdk_storage_traits::{GroupId, MdkStorageProvider};
-use nostr::{Event, EventId, JsonUtil, Timestamp, UnsignedEvent};
+use nostr::{Event, EventId, JsonUtil, Tag, Timestamp, UnsignedEvent};
 use openmls::prelude::MlsGroup;
 use openmls_basic_credential::SignatureKeyPair;
 use tls_codec::Serialize as TlsSerialize;
@@ -14,6 +14,36 @@ use crate::MDK;
 use crate::error::Error;
 
 use super::Result;
+
+/// Allowed tags for the outer kind:445 wrapper event.
+///
+/// Arbitrary tags on wrapper events are visible to relays in plaintext
+/// and can fingerprint the application or reveal information about the
+/// encrypted content.
+///
+/// MDK enforces a subset of tags to minimize risk of fingerprinting. The
+/// downstreams should still be aware of the visibility of the tag on the
+/// kind:445 wrapper event, and include it in their threat model.
+///
+/// Construct via the provided methods (e.g. [`EventTag::expiration`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventTag(Tag);
+
+impl EventTag {
+    /// NIP-40 expiration timestamp.
+    ///
+    /// Signals to relays that the event can be discarded after the given time.
+    /// Note that the relay might choose to not honor the signal, and retain the event
+    /// past the expiration timestamp. The applications and/or users should use
+    /// relays which are known to honor the expiration tag.
+    pub fn expiration(timestamp: Timestamp) -> Self {
+        Self(Tag::expiration(timestamp))
+    }
+
+    pub(crate) fn into_tag(self) -> Tag {
+        self.0
+    }
+}
 
 impl<Storage> MDK<Storage>
 where
@@ -58,7 +88,7 @@ where
         Ok(serialized_message)
     }
 
-    /// Creates a complete encrypted Nostr event for an MLS group message
+    /// Creates a complete encrypted Nostr event for an MLS group message.
     ///
     /// This is the main entry point for creating group messages. The function:
     /// 1. Loads the MLS group and its metadata
@@ -71,6 +101,7 @@ where
     ///
     /// * `mls_group_id` - The MLS group ID
     /// * `rumor` - The unsigned Nostr event to encrypt and send
+    /// * `tags` - Optional allow-listed tags appended to the outer kind:445 wrapper event.
     ///
     /// # Returns
     ///
@@ -80,6 +111,7 @@ where
         &self,
         mls_group_id: &GroupId,
         mut rumor: UnsignedEvent,
+        tags: Option<Vec<EventTag>>,
     ) -> Result<Event> {
         // Load groups by MLS Group ID (Pattern A)
         // Used when we already have the MLS group ID (e.g., from API calls).
@@ -100,7 +132,7 @@ where
         // Get the rumor ID
         let rumor_id: EventId = rumor.id();
 
-        let event = self.build_message_event(mls_group_id, message)?;
+        let event = self.build_message_event(mls_group_id, message, tags)?;
 
         // Create message to save to storage
         let now = Timestamp::now();
@@ -149,6 +181,7 @@ mod tests {
     use nostr::{Keys, Kind, TagKind, Timestamp};
 
     use crate::error::Error;
+    use crate::messages::EventTag;
     use crate::test_util::*;
     use crate::tests::create_test_mdk;
 
@@ -162,7 +195,7 @@ mod tests {
         let mut rumor = create_test_rumor(&creator, "Hello, world!");
         let rumor_id = rumor.id();
 
-        let result = mdk.create_message(&group_id, rumor);
+        let result = mdk.create_message(&group_id, rumor, None);
         assert!(result.is_ok());
 
         let event = result.unwrap();
@@ -187,7 +220,7 @@ mod tests {
         let rumor = create_test_rumor(&creator, "Hello, world!");
         let non_existent_group_id = GroupId::from_slice(&[1, 2, 3, 4]);
 
-        let result = mdk.create_message(&non_existent_group_id, rumor);
+        let result = mdk.create_message(&non_existent_group_id, rumor, None);
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), Error::GroupNotFound));
     }
@@ -212,7 +245,7 @@ mod tests {
         let rumor_timestamp = rumor.created_at;
 
         let _event = mdk
-            .create_message(&group_id, rumor)
+            .create_message(&group_id, rumor, None)
             .expect("Failed to create message");
 
         // Verify group metadata was updated
@@ -245,7 +278,7 @@ mod tests {
             let rumor_id = rumor.id();
 
             let _event = mdk
-                .create_message(&group_id, rumor)
+                .create_message(&group_id, rumor, None)
                 .expect("Failed to create message");
 
             let stored_message = mdk
@@ -267,7 +300,7 @@ mod tests {
         // Create a rumor - EventBuilder.build() ensures the ID is set
         let rumor = create_test_rumor(&creator, "Test message");
 
-        let result = mdk.create_message(&group_id, rumor);
+        let result = mdk.create_message(&group_id, rumor, None);
         assert!(result.is_ok());
 
         // The message should have been stored with a valid ID
@@ -290,7 +323,7 @@ mod tests {
         let rumor = create_test_rumor(&creator, "Test message for MIP-03 compliance");
 
         let message_event = mdk
-            .create_message(&group_id, rumor)
+            .create_message(&group_id, rumor, None)
             .expect("Failed to create message");
 
         // 1. Verify kind is 445 (MlsGroupMessage)
@@ -388,13 +421,13 @@ mod tests {
         let rumor3 = create_test_rumor(&creator, "Third message");
 
         let event1 = mdk
-            .create_message(&group_id, rumor1)
+            .create_message(&group_id, rumor1, None)
             .expect("Failed to create first message");
         let event2 = mdk
-            .create_message(&group_id, rumor2)
+            .create_message(&group_id, rumor2, None)
             .expect("Failed to create second message");
         let event3 = mdk
-            .create_message(&group_id, rumor3)
+            .create_message(&group_id, rumor3, None)
             .expect("Failed to create third message");
 
         // Collect all ephemeral pubkeys
@@ -514,7 +547,7 @@ mod tests {
         // Send a message
         let rumor = create_test_rumor(&creator, "Test message");
         let message_event = mdk
-            .create_message(&group_id, rumor)
+            .create_message(&group_id, rumor, None)
             .expect("Failed to create message");
 
         // Extract group ID from h tag
@@ -542,13 +575,13 @@ mod tests {
 
         // Send multiple messages
         let event1 = mdk
-            .create_message(&group_id, create_test_rumor(&creator, "Message 1"))
+            .create_message(&group_id, create_test_rumor(&creator, "Message 1"), None)
             .expect("Failed to create message 1");
         let event2 = mdk
-            .create_message(&group_id, create_test_rumor(&creator, "Message 2"))
+            .create_message(&group_id, create_test_rumor(&creator, "Message 2"), None)
             .expect("Failed to create message 2");
         let event3 = mdk
-            .create_message(&group_id, create_test_rumor(&creator, "Message 3"))
+            .create_message(&group_id, create_test_rumor(&creator, "Message 3"), None)
             .expect("Failed to create message 3");
 
         // Extract group IDs from all messages
@@ -598,7 +631,7 @@ mod tests {
         let rumor = create_test_rumor(&creator, plaintext);
 
         let message_event = mdk
-            .create_message(&group_id, rumor)
+            .create_message(&group_id, rumor, None)
             .expect("Failed to create message");
 
         // Verify content is encrypted (doesn't contain plaintext)
@@ -634,10 +667,10 @@ mod tests {
         let rumor2 = create_test_rumor(&creator, plaintext);
 
         let event1 = mdk
-            .create_message(&group_id, rumor1)
+            .create_message(&group_id, rumor1, None)
             .expect("Failed to create first message");
         let event2 = mdk
-            .create_message(&group_id, rumor2)
+            .create_message(&group_id, rumor2, None)
             .expect("Failed to create second message");
 
         // Verify encrypted contents are different (nonce/IV makes each encryption unique)
@@ -675,7 +708,7 @@ mod tests {
         // 2. Send message -> verify message event structure
         let rumor1 = create_test_rumor(&creator, "First message");
         let msg_event1 = mdk
-            .create_message(&group_id, rumor1)
+            .create_message(&group_id, rumor1, None)
             .expect("Failed to send first message");
 
         assert_eq!(msg_event1.kind, Kind::MlsGroupMessage);
@@ -719,7 +752,7 @@ mod tests {
 
         let rumor2 = create_test_rumor(&creator, "Second message after member add");
         let msg_event2 = mdk
-            .create_message(&group_id, rumor2)
+            .create_message(&group_id, rumor2, None)
             .expect("Failed to send second message");
 
         let pubkey2 = msg_event2.pubkey;
@@ -766,7 +799,7 @@ mod tests {
 
         let rumor = create_test_rumor(&creator, "Validation test message");
         let message_event = mdk
-            .create_message(&group_id, rumor)
+            .create_message(&group_id, rumor, None)
             .expect("Failed to create message");
 
         // Verify event passes Nostr signature validation
@@ -805,7 +838,7 @@ mod tests {
         let rumor = create_test_rumor(&creator, "Hello");
 
         let non_existent_group_id = GroupId::from_slice(&[1, 2, 3, 4, 5]);
-        let result = mdk.create_message(&non_existent_group_id, rumor);
+        let result = mdk.create_message(&non_existent_group_id, rumor, None);
 
         assert!(
             matches!(result, Err(Error::GroupNotFound)),
@@ -822,7 +855,7 @@ mod tests {
 
         // Create a message with empty content
         let rumor = create_test_rumor(&creator, "");
-        let result = mdk.create_message(&group_id, rumor);
+        let result = mdk.create_message(&group_id, rumor, None);
 
         // Should succeed - empty messages are valid
         assert!(result.is_ok(), "Empty message should be valid");
@@ -838,12 +871,40 @@ mod tests {
         // Create a message with very long content (10KB)
         let long_content = "a".repeat(10000);
         let rumor = create_test_rumor(&creator, &long_content);
-        let result = mdk.create_message(&group_id, rumor);
+        let result = mdk.create_message(&group_id, rumor, None);
 
         // Should succeed - long messages are valid
         assert!(result.is_ok(), "Long message should be valid");
 
         let event = result.unwrap();
         assert_eq!(event.kind, Kind::MlsGroupMessage);
+    }
+
+    #[test]
+    fn test_create_message_with_tags() {
+        let mdk = create_test_mdk();
+        let (creator, members, admins) = create_test_group_members();
+        let group_id = create_test_group(&mdk, &creator, &members, &admins);
+
+        let expiration = EventTag::expiration(Timestamp::from(1_231_006_505));
+        let rumor = create_test_rumor(&creator, "Ephemeral location update");
+
+        let event = mdk
+            .create_message(&group_id, rumor, Some(vec![expiration]))
+            .expect("Failed to create message with extra tags");
+
+        assert_eq!(event.tags.len(), 3, "Should have h + encoding + expiration");
+
+        assert!(event.tags.iter().any(|t| t.kind() == TagKind::h()));
+        assert!(
+            event
+                .tags
+                .iter()
+                .any(|t| t.kind() == TagKind::Custom("encoding".into()))
+        );
+        assert!(
+            event.tags.iter().any(|t| t.kind() == TagKind::Expiration),
+            "Expiration tag should be present on the wrapper event"
+        );
     }
 }

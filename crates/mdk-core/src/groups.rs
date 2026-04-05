@@ -27,6 +27,7 @@ use sha2::{Digest, Sha256};
 use super::MDK;
 use super::extension::NostrGroupDataExtension;
 use crate::error::Error;
+use crate::messages::EventTag;
 use crate::messages::crypto::encrypt_message_with_exporter_secret;
 use crate::util::{ContentEncoding, encode_content};
 
@@ -758,8 +759,11 @@ where
             .tls_serialize_detached()
             .map_err(|e| Error::Group(e.to_string()))?;
 
-        let commit_event =
-            self.build_message_event(&mls_group.group_id().into(), serialized_commit_message)?;
+        let commit_event = self.build_message_event(
+            &mls_group.group_id().into(),
+            serialized_commit_message,
+            None,
+        )?;
 
         self.track_processed_message(
             commit_event.id,
@@ -928,8 +932,11 @@ where
             .tls_serialize_detached()
             .map_err(|e| Error::Group(e.to_string()))?;
 
-        let commit_event =
-            self.build_message_event(&mls_group.group_id().into(), serialized_commit_message)?;
+        let commit_event = self.build_message_event(
+            &mls_group.group_id().into(),
+            serialized_commit_message,
+            None,
+        )?;
 
         self.track_processed_message(
             commit_event.id,
@@ -991,6 +998,7 @@ where
         let commit_event = self.build_message_event(
             &mls_group.group_id().into(),
             message_out.tls_serialize_detached()?,
+            None,
         )?;
 
         self.track_processed_message(
@@ -1384,8 +1392,11 @@ where
         // Serialize the message
         let serialized_commit_message = commit_message_bundle.commit().tls_serialize_detached()?;
 
-        let commit_event =
-            self.build_message_event(&mls_group.group_id().into(), serialized_commit_message)?;
+        let commit_event = self.build_message_event(
+            &mls_group.group_id().into(),
+            serialized_commit_message,
+            None,
+        )?;
 
         self.track_processed_message(
             commit_event.id,
@@ -1580,7 +1591,7 @@ where
             .map_err(|e| Error::Group(e.to_string()))?;
 
         let evolution_event =
-            self.build_message_event(&group.group_id().into(), serialized_message_out)?;
+            self.build_message_event(&group.group_id().into(), serialized_message_out, None)?;
 
         self.track_processed_message(
             evolution_event.id,
@@ -1867,6 +1878,7 @@ where
         &self,
         group_id: &GroupId,
         serialized_content: Vec<u8>,
+        tags: Option<Vec<EventTag>>,
     ) -> Result<Event, Error> {
         let group = self.get_group(group_id)?.ok_or(Error::GroupNotFound)?;
 
@@ -1880,10 +1892,15 @@ where
         let tag: Tag = Tag::custom(TagKind::h(), [hex::encode(group.nostr_group_id)]);
         let encoding_tag: Tag = Tag::custom(TagKind::Custom("encoding".into()), ["base64"]);
 
-        let event = EventBuilder::new(Kind::MlsGroupMessage, encrypted_content)
+        let mut builder = EventBuilder::new(Kind::MlsGroupMessage, encrypted_content)
             .tag(tag)
-            .tag(encoding_tag)
-            .sign_with_keys(&ephemeral_nostr_keys)?;
+            .tag(encoding_tag);
+
+        if let Some(tags) = tags {
+            builder = builder.tags(tags.into_iter().map(|t| t.into_tag()));
+        }
+
+        let event = builder.sign_with_keys(&ephemeral_nostr_keys)?;
 
         Ok(event)
     }
@@ -5542,7 +5559,7 @@ mod tests {
         // Group is still functional: Charlie sends, Alice and Dave can read
         let rumor = crate::test_util::create_test_rumor(&charlie_keys, "post-departure message");
         let charlie_msg = charlie_mdk
-            .create_message(&group_id, rumor)
+            .create_message(&group_id, rumor, None)
             .expect("Charlie should send a message after SelfRemove");
 
         for (name, mdk) in [("Alice", &alice_mdk), ("Dave", &dave_mdk)] {

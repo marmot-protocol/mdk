@@ -111,7 +111,7 @@ async fn main() -> Result<(), Error> {
     // Now, let's also try sending a message to the group (using an unsigned Kind: 9 event)
     // We don't have to wait for Bob to join the group before we send our first message.
     let rumor = EventBuilder::new(Kind::Custom(9), "Hi Bob!").build(alice_keys.public_key());
-    let message_event = alice_mdk.create_message(&alice_group.mls_group_id, rumor.clone())?;
+    let message_event = alice_mdk.create_message(&alice_group.mls_group_id, rumor.clone(), None)?;
     // Alice would now publish the message_event to the Nostr network.
     tracing::info!("Message inner event created: {:?}", rumor);
     tracing::debug!("Message wrapper event created: {:?}", message_event);

@@ -15,6 +15,7 @@
 mod application;
 mod commit;
 mod create;
+pub use create::EventTag;
 pub(crate) mod crypto;
 mod decryption;
 mod error_handling;
@@ -369,7 +370,7 @@ mod tests {
         // Create 15 messages
         for i in 0..15 {
             let rumor = create_test_rumor(&creator, &format!("Message {}", i));
-            mdk.create_message(&group_id, rumor)
+            mdk.create_message(&group_id, rumor, None)
                 .expect("Failed to create message");
         }
 
@@ -430,10 +431,10 @@ mod tests {
         let rumor2 = create_test_rumor(&creator, "Second message");
 
         let _event1 = mdk
-            .create_message(&group_id, rumor1)
+            .create_message(&group_id, rumor1, None)
             .expect("Failed to create first message");
         let _event2 = mdk
-            .create_message(&group_id, rumor2)
+            .create_message(&group_id, rumor2, None)
             .expect("Failed to create second message");
 
         // Get all messages for the group
