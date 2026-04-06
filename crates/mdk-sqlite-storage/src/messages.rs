@@ -338,6 +338,19 @@ impl MessageStorage for MdkSqliteStorage {
             .map_err(into_message_err)
         })
     }
+
+    fn delete_messages_for_group(
+        &self,
+        group_id: &mdk_storage_traits::GroupId,
+    ) -> Result<usize, MessageError> {
+        self.with_connection(|conn| {
+            conn.execute(
+                "DELETE FROM messages WHERE mls_group_id = ?",
+                params![group_id.as_slice()],
+            )
+            .map_err(into_message_err)
+        })
+    }
 }
 
 #[cfg(test)]
@@ -843,5 +856,162 @@ mod tests {
             result, None,
             "\\ must be treated as a literal, not an escape"
         );
+    }
+
+    /// Create a test group and save it to storage, returning its GroupId.
+    fn create_test_group(storage: &MdkSqliteStorage, id_bytes: &[u8]) -> GroupId {
+        let group_id = GroupId::from_slice(id_bytes);
+        let mut nostr_group_id = [0u8; 32];
+        nostr_group_id[..id_bytes.len().min(32)]
+            .copy_from_slice(&id_bytes[..id_bytes.len().min(32)]);
+        let group = Group {
+            mls_group_id: group_id.clone(),
+            nostr_group_id,
+            name: "Test Group".to_string(),
+            description: "".to_string(),
+            admin_pubkeys: BTreeSet::new(),
+            last_message_id: None,
+            last_message_at: None,
+            last_message_processed_at: None,
+            epoch: 0,
+            state: GroupState::Active,
+            image_hash: None,
+            image_key: None,
+            image_nonce: None,
+            self_update_state: SelfUpdateState::Required,
+        };
+        storage.save_group(group).unwrap();
+        group_id
+    }
+
+    /// Create and save a test message for the given group, returning its EventId.
+    fn create_test_message(
+        storage: &MdkSqliteStorage,
+        group_id: &GroupId,
+        event_id_hex: &str,
+    ) -> EventId {
+        let event_id = EventId::parse(event_id_hex).unwrap();
+        let pubkey =
+            PublicKey::parse("79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
+                .unwrap();
+        let wrapper_event_id = EventId::all_zeros();
+        let now = Timestamp::now();
+        let message = Message {
+            id: event_id,
+            pubkey,
+            kind: Kind::from(1u16),
+            mls_group_id: group_id.clone(),
+            created_at: now,
+            processed_at: now,
+            content: "test".to_string(),
+            tags: Tags::new(),
+            event: UnsignedEvent::new(pubkey, now, Kind::from(9u16), vec![], "test".to_string()),
+            wrapper_event_id,
+            epoch: Some(1),
+            state: MessageState::Created,
+        };
+        storage.save_message(message).unwrap();
+        event_id
+    }
+
+    #[test]
+    fn delete_messages_removes_all_messages_for_group() {
+        let storage = MdkSqliteStorage::new_in_memory().unwrap();
+        let group_id = create_test_group(&storage, &[10, 20, 30]);
+        create_test_message(
+            &storage,
+            &group_id,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        );
+        create_test_message(
+            &storage,
+            &group_id,
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        );
+        create_test_message(
+            &storage,
+            &group_id,
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        );
+
+        let deleted = storage.delete_messages_for_group(&group_id).unwrap();
+
+        assert_eq!(deleted, 3);
+        let messages = storage.messages(&group_id, None).unwrap();
+        assert!(messages.is_empty());
+        // Group itself still exists
+        assert!(
+            storage
+                .find_group_by_mls_group_id(&group_id)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn delete_messages_is_idempotent_on_empty_group() {
+        let storage = MdkSqliteStorage::new_in_memory().unwrap();
+        let group_id = create_test_group(&storage, &[11, 22, 33]);
+
+        let deleted = storage.delete_messages_for_group(&group_id).unwrap();
+
+        assert_eq!(deleted, 0);
+    }
+
+    #[test]
+    fn delete_messages_preserves_processed_messages() {
+        let storage = MdkSqliteStorage::new_in_memory().unwrap();
+        let group_id = create_test_group(&storage, &[44, 55, 66]);
+        create_test_message(
+            &storage,
+            &group_id,
+            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        );
+
+        let wrapper_eid =
+            EventId::parse("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee")
+                .unwrap();
+        let pm = mdk_storage_traits::messages::types::ProcessedMessage {
+            wrapper_event_id: wrapper_eid,
+            message_event_id: None,
+            processed_at: Timestamp::now(),
+            epoch: Some(1),
+            mls_group_id: Some(group_id.clone()),
+            state: ProcessedMessageState::Processed,
+            failure_reason: None,
+        };
+        storage.save_processed_message(pm).unwrap();
+
+        storage.delete_messages_for_group(&group_id).unwrap();
+
+        // Processed message still exists
+        assert!(
+            storage
+                .find_processed_message_by_event_id(&wrapper_eid)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn delete_messages_does_not_affect_other_groups() {
+        let storage = MdkSqliteStorage::new_in_memory().unwrap();
+        let group_a = create_test_group(&storage, &[1, 1, 1]);
+        let group_b = create_test_group(&storage, &[2, 2, 2]);
+        create_test_message(
+            &storage,
+            &group_a,
+            "1111111111111111111111111111111111111111111111111111111111111111",
+        );
+        create_test_message(
+            &storage,
+            &group_b,
+            "2222222222222222222222222222222222222222222222222222222222222222",
+        );
+
+        storage.delete_messages_for_group(&group_a).unwrap();
+
+        assert!(storage.messages(&group_a, None).unwrap().is_empty());
+        assert_eq!(storage.messages(&group_b, None).unwrap().len(), 1);
     }
 }

@@ -958,6 +958,22 @@ impl Mdk {
         update_group_result_to_uniffi(result)
     }
 
+    /// Delete all locally stored messages for a group.
+    pub fn delete_messages_for_group(&self, mls_group_id: String) -> Result<u32, MdkUniffiError> {
+        let group_id = parse_group_id(&mls_group_id)?;
+        let mdk = self.lock()?;
+        let count = mdk.delete_messages_for_group(&group_id)?;
+        Ok(count as u32)
+    }
+
+    /// Delete all local state for a group.
+    pub fn delete_group(&self, mls_group_id: String) -> Result<(), MdkUniffiError> {
+        let group_id = parse_group_id(&mls_group_id)?;
+        let mdk = self.lock()?;
+        mdk.delete_group(&group_id)?;
+        Ok(())
+    }
+
     /// Self-demote from admin status before leaving a group.
     ///
     /// Per MIP-03, admins must call this before leave_group(). If the caller is

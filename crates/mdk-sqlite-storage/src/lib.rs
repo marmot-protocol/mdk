@@ -1278,6 +1278,91 @@ impl MdkStorageProvider for MdkSqliteStorage {
             .map_err(|e| MdkStorageError::Database(e.to_string()))?;
         Ok(deleted)
     }
+
+    fn delete_group(&self, group_id: &GroupId) -> Result<(), MdkStorageError> {
+        let conn = self.connection.lock().unwrap();
+        let group_id_bytes = group_id.as_slice();
+        let mls_group_id_bytes = mls_storage::MlsCodec::serialize(group_id)
+            .map_err(|e| MdkStorageError::Serialization(e.to_string()))?;
+
+        conn.execute("BEGIN IMMEDIATE", [])
+            .map_err(|e| MdkStorageError::Database(e.to_string()))?;
+
+        let result = (|| -> Result<(), MdkStorageError> {
+            // OpenMLS tables (MlsCodec-serialized group_id)
+            conn.execute(
+                "DELETE FROM openmls_group_data WHERE group_id = ?",
+                [&mls_group_id_bytes],
+            )
+            .map_err(|e| MdkStorageError::Database(e.to_string()))?;
+
+            conn.execute(
+                "DELETE FROM openmls_proposals WHERE group_id = ?",
+                [&mls_group_id_bytes],
+            )
+            .map_err(|e| MdkStorageError::Database(e.to_string()))?;
+
+            conn.execute(
+                "DELETE FROM openmls_own_leaf_nodes WHERE group_id = ?",
+                [&mls_group_id_bytes],
+            )
+            .map_err(|e| MdkStorageError::Database(e.to_string()))?;
+
+            conn.execute(
+                "DELETE FROM openmls_epoch_key_pairs WHERE group_id = ?",
+                [&mls_group_id_bytes],
+            )
+            .map_err(|e| MdkStorageError::Database(e.to_string()))?;
+
+            // MDK tables (raw group_id bytes) — explicit deletes before groups
+            conn.execute(
+                "DELETE FROM group_exporter_secrets WHERE mls_group_id = ?",
+                [group_id_bytes],
+            )
+            .map_err(|e| MdkStorageError::Database(e.to_string()))?;
+
+            conn.execute(
+                "DELETE FROM group_relays WHERE mls_group_id = ?",
+                [group_id_bytes],
+            )
+            .map_err(|e| MdkStorageError::Database(e.to_string()))?;
+
+            // processed_messages has no FK to groups — needs explicit delete
+            conn.execute(
+                "DELETE FROM processed_messages WHERE mls_group_id = ?",
+                [group_id_bytes],
+            )
+            .map_err(|e| MdkStorageError::Database(e.to_string()))?;
+
+            // welcomes has no FK to groups — needs explicit delete
+            conn.execute(
+                "DELETE FROM welcomes WHERE mls_group_id = ?",
+                [group_id_bytes],
+            )
+            .map_err(|e| MdkStorageError::Database(e.to_string()))?;
+
+            // groups last — CASCADE handles messages and snapshots as safety net
+            conn.execute(
+                "DELETE FROM groups WHERE mls_group_id = ?",
+                [group_id_bytes],
+            )
+            .map_err(|e| MdkStorageError::Database(e.to_string()))?;
+
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                conn.execute("COMMIT", [])
+                    .map_err(|e| MdkStorageError::Database(e.to_string()))?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK", []);
+                Err(e)
+            }
+        }
+    }
 }
 
 // ============================================================================
@@ -4544,6 +4629,229 @@ mod tests {
                  row. More than 1 means the DELETE used the wrong key format and \
                  failed to remove the stale OpenMLS row before re-inserting from \
                  snapshot."
+            );
+        }
+    }
+
+    mod delete_group_tests {
+        use mdk_storage_traits::MdkStorageProvider;
+        use mdk_storage_traits::messages::MessageStorage;
+        use mdk_storage_traits::messages::types::{
+            Message, MessageState, ProcessedMessage, ProcessedMessageState,
+        };
+        use mdk_storage_traits::welcomes::WelcomeStorage;
+        use mdk_storage_traits::welcomes::types::{Welcome, WelcomeState};
+        use nostr::{EventId, Kind, PublicKey, Tags, Timestamp, UnsignedEvent};
+        use rusqlite::params;
+
+        use super::*;
+
+        /// Returns (group_id, wrapper_event_id) for verification after deletion.
+        fn setup_group_with_data(
+            storage: &MdkSqliteStorage,
+            id_bytes: &[u8],
+        ) -> (GroupId, EventId) {
+            let group_id = GroupId::from_slice(id_bytes);
+            let mut nostr_group_id = [0u8; 32];
+            nostr_group_id[..id_bytes.len().min(32)]
+                .copy_from_slice(&id_bytes[..id_bytes.len().min(32)]);
+            let group = Group {
+                mls_group_id: group_id.clone(),
+                nostr_group_id,
+                name: "Test Group".to_string(),
+                description: "".to_string(),
+                admin_pubkeys: BTreeSet::new(),
+                last_message_id: None,
+                last_message_at: None,
+                last_message_processed_at: None,
+                epoch: 1,
+                state: GroupState::Active,
+                image_hash: None,
+                image_key: None,
+                image_nonce: None,
+                self_update_state: SelfUpdateState::Required,
+            };
+            storage.save_group(group).unwrap();
+
+            // Add a message
+            let pubkey = PublicKey::parse(
+                "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+            )
+            .unwrap();
+            let now = Timestamp::now();
+            let mut event_bytes = [0u8; 32];
+            event_bytes[..id_bytes.len().min(32)]
+                .copy_from_slice(&id_bytes[..id_bytes.len().min(32)]);
+            let event_id = EventId::from_slice(&event_bytes).unwrap();
+            let message = Message {
+                id: event_id,
+                pubkey,
+                kind: Kind::from(1u16),
+                mls_group_id: group_id.clone(),
+                created_at: now,
+                processed_at: now,
+                content: "test".to_string(),
+                tags: Tags::new(),
+                event: UnsignedEvent::new(
+                    pubkey,
+                    now,
+                    Kind::from(9u16),
+                    vec![],
+                    "test".to_string(),
+                ),
+                wrapper_event_id: EventId::all_zeros(),
+                epoch: Some(1),
+                state: MessageState::Created,
+            };
+            storage.save_message(message).unwrap();
+
+            // Add a processed message
+            let mut wrapper_bytes = [0xFFu8; 32];
+            wrapper_bytes[..id_bytes.len().min(32)]
+                .copy_from_slice(&id_bytes[..id_bytes.len().min(32)]);
+            let wrapper_eid = EventId::from_slice(&wrapper_bytes).unwrap();
+            let pm = ProcessedMessage {
+                wrapper_event_id: wrapper_eid,
+                message_event_id: Some(event_id),
+                processed_at: now,
+                epoch: Some(1),
+                mls_group_id: Some(group_id.clone()),
+                state: ProcessedMessageState::Processed,
+                failure_reason: None,
+            };
+            storage.save_processed_message(pm).unwrap();
+
+            // Add an exporter secret
+            let secret = GroupExporterSecret {
+                mls_group_id: group_id.clone(),
+                epoch: 1,
+                secret: Secret::new([42u8; 32]),
+            };
+            storage.save_group_exporter_secret(secret).unwrap();
+
+            // Add a welcome
+            let mut welcome_bytes = [0xEEu8; 32];
+            welcome_bytes[..id_bytes.len().min(32)]
+                .copy_from_slice(&id_bytes[..id_bytes.len().min(32)]);
+            let welcome_eid = EventId::from_slice(&welcome_bytes).unwrap();
+            let welcome = Welcome {
+                id: welcome_eid,
+                event: UnsignedEvent::new(
+                    pubkey,
+                    now,
+                    Kind::from(444u16),
+                    vec![],
+                    "welcome".to_string(),
+                ),
+                mls_group_id: group_id.clone(),
+                nostr_group_id,
+                group_name: "Test".to_string(),
+                group_description: "".to_string(),
+                group_image_hash: None,
+                group_image_key: None,
+                group_image_nonce: None,
+                group_admin_pubkeys: BTreeSet::new(),
+                group_relays: BTreeSet::new(),
+                welcomer: pubkey,
+                member_count: 2,
+                state: WelcomeState::Pending,
+                wrapper_event_id: EventId::all_zeros(),
+            };
+            storage.save_welcome(welcome).unwrap();
+
+            (group_id, wrapper_eid)
+        }
+
+        #[test]
+        fn delete_group_removes_all_state() {
+            let storage = MdkSqliteStorage::new_in_memory().unwrap();
+            let (group_id, wrapper_eid) = setup_group_with_data(&storage, &[10, 20, 30, 40]);
+
+            storage.delete_group(&group_id).unwrap();
+
+            // Group gone
+            assert!(
+                storage
+                    .find_group_by_mls_group_id(&group_id)
+                    .unwrap()
+                    .is_none()
+            );
+            // Processed messages gone (no FK to groups, explicitly deleted)
+            assert!(
+                storage
+                    .find_processed_message_by_event_id(&wrapper_eid)
+                    .unwrap()
+                    .is_none()
+            );
+            // Verify no orphaned rows via direct SQL
+            storage.with_connection(|conn| {
+                let count: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM messages WHERE mls_group_id = ?",
+                        params![group_id.as_slice()],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(count, 0, "messages should be deleted");
+
+                let count: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM group_exporter_secrets WHERE mls_group_id = ?",
+                        params![group_id.as_slice()],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(count, 0, "exporter secrets should be deleted");
+
+                let count: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM welcomes WHERE mls_group_id = ?",
+                        params![group_id.as_slice()],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(count, 0, "welcomes should be deleted");
+            });
+        }
+
+        #[test]
+        fn delete_group_is_idempotent() {
+            let storage = MdkSqliteStorage::new_in_memory().unwrap();
+            let group_id = GroupId::from_slice(&[99, 99, 99]);
+
+            // Deleting a nonexistent group is a no-op
+            let result = storage.delete_group(&group_id);
+            assert!(result.is_ok());
+        }
+
+        #[test]
+        fn delete_group_does_not_affect_other_groups() {
+            let storage = MdkSqliteStorage::new_in_memory().unwrap();
+            let (group_a, _) = setup_group_with_data(&storage, &[1, 1, 1, 1]);
+            let (group_b, _) = setup_group_with_data(&storage, &[2, 2, 2, 2]);
+
+            storage.delete_group(&group_a).unwrap();
+
+            // Group A gone
+            assert!(
+                storage
+                    .find_group_by_mls_group_id(&group_a)
+                    .unwrap()
+                    .is_none()
+            );
+            // Group B intact
+            assert!(
+                storage
+                    .find_group_by_mls_group_id(&group_b)
+                    .unwrap()
+                    .is_some()
+            );
+            assert_eq!(storage.messages(&group_b, None).unwrap().len(), 1);
+            assert!(
+                storage
+                    .get_group_exporter_secret(&group_b, 1)
+                    .unwrap()
+                    .is_some()
             );
         }
     }

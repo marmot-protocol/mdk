@@ -1606,6 +1606,42 @@ where
         })
     }
 
+    /// Delete all locally stored messages for a group.
+    ///
+    /// Removes decrypted message content from storage. The group remains
+    /// active and can continue to receive new messages. Processing records
+    /// are preserved to prevent re-processing of already-seen events.
+    ///
+    /// Returns the number of messages deleted.
+    ///
+    /// This is a local-only operation — no MLS proposals or Nostr events
+    /// are published.
+    pub fn delete_messages_for_group(&self, group_id: &GroupId) -> Result<usize, Error> {
+        self.storage()
+            .delete_messages_for_group(group_id)
+            .map_err(|e| Error::Group(e.to_string()))
+    }
+
+    /// Delete all local state for a group.
+    ///
+    /// Removes everything MDK stores for this group: messages, processed
+    /// message records, MLS tree state, epoch secrets, key material, relay
+    /// associations, proposals, and snapshots.
+    ///
+    /// After deletion, the group cannot receive or decrypt new messages.
+    /// Call `leave_group()` first if you want to notify other members of
+    /// your departure before cleaning up local state.
+    ///
+    /// Idempotent: deleting a nonexistent group is a no-op.
+    ///
+    /// This is a local-only operation — no MLS proposals or Nostr events
+    /// are published.
+    pub fn delete_group(&self, group_id: &GroupId) -> Result<(), Error> {
+        self.storage().delete_group(group_id)?;
+        self.epoch_snapshots.remove_group(group_id);
+        Ok(())
+    }
+
     /// Clear (rollback) a pending commit without merging it.
     ///
     /// This should be called when the Kind:445 publish fails after creating a commit
