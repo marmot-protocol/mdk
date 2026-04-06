@@ -607,7 +607,7 @@ mod tests {
 
         let rumor = create_test_rumor(&alice_keys, "Hello from Alice");
         let event = alice_mdk
-            .create_message(&group_id, rumor)
+            .create_message(&group_id, rumor, None)
             .expect("Alice should create message");
 
         let outcome = bob_mdk
@@ -629,7 +629,7 @@ mod tests {
         let (alice_mdk, _bob_mdk, alice_keys, _bob_keys, group_id) = setup_two_member_group();
         let rumor = create_test_rumor(&alice_keys, "Hello from Alice");
         let event = alice_mdk
-            .create_message(&group_id, rumor)
+            .create_message(&group_id, rumor, None)
             .expect("Alice should create message");
 
         let outcome = alice_mdk
@@ -947,7 +947,7 @@ mod tests {
         // Create a message
         let rumor = create_test_rumor(&creator, "Test idempotency");
         let event = creator_mdk
-            .create_message(&group_id, rumor)
+            .create_message(&group_id, rumor, None)
             .expect("Failed to create message");
 
         // Process the message once
@@ -987,7 +987,7 @@ mod tests {
         // Create a message
         let rumor = create_test_rumor(&creator, "Test message");
         let message_event = mdk
-            .create_message(&group_id, rumor)
+            .create_message(&group_id, rumor, None)
             .expect("Failed to create message");
 
         // Process the message for the first time
@@ -1041,17 +1041,17 @@ mod tests {
         // Create three messages in order
         let rumor1 = create_test_rumor(&creator, "Message 1");
         let message1 = mdk
-            .create_message(&group_id, rumor1)
+            .create_message(&group_id, rumor1, None)
             .expect("Failed to create message 1");
 
         let rumor2 = create_test_rumor(&creator, "Message 2");
         let message2 = mdk
-            .create_message(&group_id, rumor2)
+            .create_message(&group_id, rumor2, None)
             .expect("Failed to create message 2");
 
         let rumor3 = create_test_rumor(&creator, "Message 3");
         let message3 = mdk
-            .create_message(&group_id, rumor3)
+            .create_message(&group_id, rumor3, None)
             .expect("Failed to create message 3");
 
         // Process messages in different order: 3, 1, 2
@@ -1100,7 +1100,7 @@ mod tests {
         for i in 1..=5 {
             let rumor = create_test_rumor(&creator, &format!("Message {}", i));
             let message_event = mdk
-                .create_message(&group_id, rumor)
+                .create_message(&group_id, rumor, None)
                 .unwrap_or_else(|_| panic!("Failed to create message {}", i));
             messages_created.push((i, message_event));
         }
@@ -1165,7 +1165,7 @@ mod tests {
         for i in 0..5 {
             let rumor = create_test_rumor(&alice_keys, &format!("Message {} while Bob offline", i));
             let message_event = alice_mdk
-                .create_message(&group_id, rumor)
+                .create_message(&group_id, rumor, None)
                 .expect("Alice should create message");
             alice_messages.push(message_event);
         }
@@ -1262,7 +1262,7 @@ mod tests {
         // Alice device 1 sends a message
         let rumor1 = create_test_rumor(&alice_keys, "Message from device 1");
         let message1 = alice_device1
-            .create_message(&group_id, rumor1)
+            .create_message(&group_id, rumor1, None)
             .expect("Alice device 1 should create message");
 
         // Bob processes the message
@@ -1366,7 +1366,7 @@ mod tests {
         // Alice sends message in epoch 0
         let rumor0 = create_test_rumor(&alice_keys, "Message in epoch 0");
         let message0 = alice_mdk
-            .create_message(&group_id, rumor0)
+            .create_message(&group_id, rumor0, None)
             .expect("Alice should create message in epoch 0");
 
         // Advance epoch by adding Charlie
@@ -1393,7 +1393,7 @@ mod tests {
         // Alice sends message in epoch 1
         let rumor1 = create_test_rumor(&alice_keys, "Message in epoch 1");
         let message1 = alice_mdk
-            .create_message(&group_id, rumor1)
+            .create_message(&group_id, rumor1, None)
             .expect("Alice should create message in epoch 1");
 
         // Bob processes message from epoch 0

@@ -334,7 +334,7 @@ where
             .tls_serialize_detached()
             .map_err(|_e| Error::Group("Failed to serialize commit message".to_string()))?;
 
-        let commit_event = self.build_message_event(group_id, serialized_commit_message)?;
+        let commit_event = self.build_message_event(group_id, serialized_commit_message, None)?;
 
         self.mark_processed(event, group_id, mls_group.epoch().as_u64())?;
 
@@ -629,7 +629,7 @@ mod tests {
         let serialized = leave_msg.tls_serialize_detached().expect("serialize");
 
         let event = alice_mdk
-            .build_message_event(&group_id, serialized)
+            .build_message_event(&group_id, serialized, None)
             .expect("build event");
 
         // Bob processes Alice's SelfRemove — should reject because Alice is admin

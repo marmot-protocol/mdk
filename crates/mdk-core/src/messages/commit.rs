@@ -2423,7 +2423,7 @@ mod tests {
         let mut rumor = create_test_rumor(&alice_keys, "Message at wrong epoch");
         let rumor_id = rumor.id(); // Get the rumor ID before it's consumed
         let _message_event = alice_mdk
-            .create_message(&group_id, rumor)
+            .create_message(&group_id, rumor, None)
             .expect("Alice should create message");
 
         let message_id = rumor_id; // Use the rumor ID, not the wrapper event ID

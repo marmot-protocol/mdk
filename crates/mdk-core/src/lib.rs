@@ -701,7 +701,7 @@ pub mod tests {
             for i in 0..num_messages {
                 let rumor = create_test_rumor(&alice_keys, &format!("Message {}", i));
                 let msg_event = alice_mdk
-                    .create_message(&group_id, rumor)
+                    .create_message(&group_id, rumor, None)
                     .expect("Alice should send message");
                 message_events.push(msg_event);
             }
@@ -781,7 +781,7 @@ pub mod tests {
             for i in 0..num_messages {
                 let rumor = create_test_rumor(&alice_keys, &format!("Message {}", i));
                 let msg_event = alice_mdk
-                    .create_message(&group_id, rumor)
+                    .create_message(&group_id, rumor, None)
                     .expect("Alice should send message");
                 message_events.push(msg_event);
             }

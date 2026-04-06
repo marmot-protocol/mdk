@@ -1058,7 +1058,7 @@ mod tests {
         // Test 1: Valid message - Alice sends with her correct pubkey
         let valid_rumor = create_test_rumor(&alice_keys, "Hello from Alice");
         let valid_msg = alice_mdk
-            .create_message(&group_id, valid_rumor)
+            .create_message(&group_id, valid_rumor, None)
             .expect("Alice should be able to send a valid message");
 
         // Bob processes Alice's valid message - should succeed

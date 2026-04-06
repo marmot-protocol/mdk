@@ -991,7 +991,7 @@ mod tests {
         // Create a test message event
         let rumor = create_test_rumor(&creator, "Test message");
         let event = mdk
-            .create_message(&group_id, rumor)
+            .create_message(&group_id, rumor, None)
             .expect("Failed to create message");
 
         // Manually mark the message as failed in storage
@@ -1283,7 +1283,7 @@ mod tests {
 
         let bob_message_rumor = create_test_rumor(&bob_keys, "Message from Bob after his commit");
         let bob_message_event = bob_mdk
-            .create_message(&group_id, bob_message_rumor)
+            .create_message(&group_id, bob_message_rumor, None)
             .expect("Bob should create message with his epoch 2 keys");
 
         // =========================================================================

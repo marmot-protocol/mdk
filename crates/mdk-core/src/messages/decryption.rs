@@ -389,7 +389,7 @@ mod tests {
         // Alice sends a message at epoch 1 — held back from Bob
         let rumor = create_test_rumor(&alice_keys, "message from the past epoch");
         let past_epoch_msg = alice_mdk
-            .create_message(&group_id, rumor)
+            .create_message(&group_id, rumor, None)
             .expect("Alice should create message");
 
         // Alice self-updates → epoch 2; both process the commit
@@ -792,7 +792,7 @@ mod tests {
         // Save this message to test lookback limit later
         let rumor_epoch1 = create_test_rumor(&alice_keys, "Message in epoch 1");
         let msg_epoch1 = alice_mdk
-            .create_message(&group_id, rumor_epoch1)
+            .create_message(&group_id, rumor_epoch1, None)
             .expect("Alice should send message in epoch 1");
 
         // Verify Bob can process it initially
@@ -824,7 +824,7 @@ mod tests {
             // Send a message in this epoch to verify it works
             let rumor = create_test_rumor(&alice_keys, &format!("Message in epoch {}", i + 1));
             let msg = alice_mdk
-                .create_message(&group_id, rumor)
+                .create_message(&group_id, rumor, None)
                 .expect("Alice should send message");
 
             // Bob should be able to process recent messages
