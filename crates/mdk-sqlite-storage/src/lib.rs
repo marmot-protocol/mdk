@@ -1334,6 +1334,13 @@ impl MdkStorageProvider for MdkSqliteStorage {
             )
             .map_err(|e| MdkStorageError::Database(e.to_string()))?;
 
+            // welcomes has no FK to groups — needs explicit delete
+            conn.execute(
+                "DELETE FROM welcomes WHERE mls_group_id = ?",
+                [group_id_bytes],
+            )
+            .map_err(|e| MdkStorageError::Database(e.to_string()))?;
+
             // groups last — CASCADE handles messages and snapshots as safety net
             conn.execute(
                 "DELETE FROM groups WHERE mls_group_id = ?",
@@ -4632,6 +4639,8 @@ mod tests {
         use mdk_storage_traits::messages::types::{
             Message, MessageState, ProcessedMessage, ProcessedMessageState,
         };
+        use mdk_storage_traits::welcomes::WelcomeStorage;
+        use mdk_storage_traits::welcomes::types::{Welcome, WelcomeState};
         use nostr::{EventId, Kind, PublicKey, Tags, Timestamp, UnsignedEvent};
         use rusqlite::params;
 
@@ -4720,6 +4729,36 @@ mod tests {
             };
             storage.save_group_exporter_secret(secret).unwrap();
 
+            // Add a welcome
+            let mut welcome_bytes = [0xEEu8; 32];
+            welcome_bytes[..id_bytes.len().min(32)]
+                .copy_from_slice(&id_bytes[..id_bytes.len().min(32)]);
+            let welcome_eid = EventId::from_slice(&welcome_bytes).unwrap();
+            let welcome = Welcome {
+                id: welcome_eid,
+                event: UnsignedEvent::new(
+                    pubkey,
+                    now,
+                    Kind::from(444u16),
+                    vec![],
+                    "welcome".to_string(),
+                ),
+                mls_group_id: group_id.clone(),
+                nostr_group_id,
+                group_name: "Test".to_string(),
+                group_description: "".to_string(),
+                group_image_hash: None,
+                group_image_key: None,
+                group_image_nonce: None,
+                group_admin_pubkeys: BTreeSet::new(),
+                group_relays: BTreeSet::new(),
+                welcomer: pubkey,
+                member_count: 2,
+                state: WelcomeState::Pending,
+                wrapper_event_id: EventId::all_zeros(),
+            };
+            storage.save_welcome(welcome).unwrap();
+
             (group_id, wrapper_eid)
         }
 
@@ -4763,6 +4802,15 @@ mod tests {
                     )
                     .unwrap();
                 assert_eq!(count, 0, "exporter secrets should be deleted");
+
+                let count: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM welcomes WHERE mls_group_id = ?",
+                        params![group_id.as_slice()],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(count, 0, "welcomes should be deleted");
             });
         }
 

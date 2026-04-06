@@ -1029,6 +1029,17 @@ impl MdkStorageProvider for MdkMemoryStorage {
                 inner.processed_messages_cache.pop(key);
             }
 
+            // Welcomes (keyed by EventId — must iterate for group match)
+            let welcome_keys: Vec<nostr::EventId> = inner
+                .welcomes_cache
+                .iter()
+                .filter(|(_, w)| &w.mls_group_id == group_id)
+                .map(|(k, _)| *k)
+                .collect();
+            for key in &welcome_keys {
+                inner.welcomes_cache.pop(key);
+            }
+
             // OpenMLS data (typed methods handle key serialization)
             inner
                 .mls_group_data
