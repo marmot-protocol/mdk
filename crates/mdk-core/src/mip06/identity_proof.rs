@@ -168,13 +168,7 @@ pub fn verify_identity_proof(
     serialized_leaf_node: &[u8],
     serialized_group_context: &[u8],
 ) -> Result<(), Error> {
-    if proof.version() != NostrIdentityProof::CURRENT_VERSION {
-        return Err(Error::IdentityProofError(format!(
-            "unsupported proof version: {}",
-            proof.version()
-        )));
-    }
-
+    // Version is already validated by from_authenticated_data() and hardcoded by new()
     let challenge = compute_challenge(serialized_leaf_node, serialized_group_context);
     verify_canonical_proof_event(pubkey, &challenge, proof.signature_bytes())
 }

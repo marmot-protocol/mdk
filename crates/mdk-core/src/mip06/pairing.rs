@@ -10,6 +10,15 @@ use tls_codec::{DeserializeBytes, TlsDeserialize, TlsDeserializeBytes, TlsSerial
 
 use crate::error::Error;
 
+/// Validate the pairing protocol version field.
+fn validate_pairing_version(version: u16) -> Result<(), Error> {
+    match version {
+        0 => Err(Error::PairingError("version 0 is reserved".to_string())),
+        1 => Ok(()),
+        v => Err(Error::PairingError(format!("unsupported version: {v}"))),
+    }
+}
+
 /// Data sent from the new device to the existing device (Phase 1).
 ///
 /// Contains a single KeyPackage that the existing device will use to add
@@ -52,11 +61,8 @@ impl DevicePairingRequest {
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, Error> {
         let (req, _) = Self::tls_deserialize_bytes(bytes)
             .map_err(|e| Error::PairingError(format!("failed to deserialize pairing request: {e}")))?;
-        match req.version {
-            0 => Err(Error::PairingError("version 0 is reserved".to_string())),
-            1 => Ok(req),
-            v => Err(Error::PairingError(format!("unsupported version: {v}"))),
-        }
+        validate_pairing_version(req.version)?;
+        Ok(req)
     }
 }
 
@@ -137,11 +143,8 @@ impl DevicePairingResponse {
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, Error> {
         let (resp, _) = Self::tls_deserialize_bytes(bytes)
             .map_err(|e| Error::PairingError(format!("failed to deserialize pairing response: {e}")))?;
-        match resp.version {
-            0 => Err(Error::PairingError("version 0 is reserved".to_string())),
-            1 => Ok(resp),
-            v => Err(Error::PairingError(format!("unsupported version: {v}"))),
-        }
+        validate_pairing_version(resp.version)?;
+        Ok(resp)
     }
 }
 
