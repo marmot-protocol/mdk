@@ -404,6 +404,12 @@ impl Mdk {
 fn ensure_keyring_store() -> Result<(), MdkUniffiError> {
     static INIT: OnceLock<Result<(), String>> = OnceLock::new();
     let result = INIT.get_or_init(|| {
+        // If the host application already configured a store (e.g. via
+        // keyring_core::set_default_store()), respect it and skip auto-init.
+        if keyring_core::get_default_store().is_some() {
+            return Ok(());
+        }
+
         // Test builds use the in-memory mock store — no platform entitlements needed.
         #[cfg(any(test, feature = "test-utils"))]
         {
