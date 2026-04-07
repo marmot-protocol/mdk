@@ -522,13 +522,10 @@ where
         &self,
         group_id: &GroupId,
     ) -> Result<BTreeMap<PublicKey, Vec<u32>>, Error> {
-        let group = self.load_mls_group(group_id)?.ok_or(Error::GroupNotFound)?;
-
+        let leaf_map = self.group_leaf_map(group_id)?;
         let mut result: BTreeMap<PublicKey, Vec<u32>> = BTreeMap::new();
-        for member in group.members() {
-            let credentials = BasicCredential::try_from(member.credential)?;
-            let public_key = self.parse_credential_identity(credentials.identity())?;
-            result.entry(public_key).or_default().push(member.index.u32());
+        for (index, pubkey) in leaf_map {
+            result.entry(pubkey).or_default().push(index);
         }
         Ok(result)
     }
@@ -541,16 +538,8 @@ where
     ) -> Result<Vec<u32>, Error> {
         let group = self.load_mls_group(group_id)?.ok_or(Error::GroupNotFound)?;
         let own_pubkey = self.get_own_pubkey(&group)?;
-
-        let mut leaves = Vec::new();
-        for member in group.members() {
-            let credentials = BasicCredential::try_from(member.credential)?;
-            let member_pubkey = self.parse_credential_identity(credentials.identity())?;
-            if member_pubkey == own_pubkey {
-                leaves.push(member.index.u32());
-            }
-        }
-        Ok(leaves)
+        let mut coalesced = self.coalesced_members(group_id)?;
+        Ok(coalesced.remove(&own_pubkey).unwrap_or_default())
     }
 
     /// Returns the local member's current MLS leaf index for a group.
@@ -1218,144 +1207,18 @@ where
         member_key_package_events: Vec<Event>,
         config: NostrGroupConfigData,
     ) -> Result<GroupResult, Error> {
-        // Get member pubkeys
-        let member_pubkeys = member_key_package_events
-            .clone()
-            .into_iter()
-            .map(|e| e.pubkey)
-            .collect::<Vec<PublicKey>>();
-
-        let admins = config.admins.clone();
-
-        // Validate group members
-        self.validate_group_members(creator_public_key, &member_pubkeys, &admins)?;
-
-        let (credential, signer) = self.generate_credential_with_key(creator_public_key)?;
-
-        let group_data = NostrGroupDataExtension::new(
-            config.name,
-            config.description,
-            admins,
-            config.relays.clone(),
-            config.image_hash,
-            config.image_key,
-            config.image_nonce,
-            None, // image_upload_key - will be set when image is uploaded
-        );
-
+        let group_data = Self::build_group_data_from_config(&config)?;
         let extension = Self::get_unknown_extension_from_group_data(&group_data)?;
-        let required_capabilities_extension = self.required_capabilities_extension();
-        let extensions = Extensions::from_vec(vec![extension, required_capabilities_extension])?;
+        let required_caps = self.required_capabilities_extension();
+        let extensions = Extensions::from_vec(vec![extension, required_caps])?;
 
-        // Build the group config
-        let capabilities = self.capabilities();
-        let sender_ratchet_config = SenderRatchetConfiguration::new(
-            self.config.out_of_order_tolerance,
-            self.config.maximum_forward_distance,
-        );
-        let group_config = MlsGroupCreateConfig::builder()
-            .ciphersuite(self.ciphersuite)
-            .wire_format_policy(MIXED_CIPHERTEXT_WIRE_FORMAT_POLICY)
-            .use_ratchet_tree_extension(true)
-            .capabilities(capabilities)
-            .with_group_context_extensions(extensions)
-            .sender_ratchet_configuration(sender_ratchet_config)
-            .max_past_epochs(self.config.max_past_epochs)
-            .build();
-
-        let mut mls_group =
-            MlsGroup::new(&self.provider, &signer, &group_config, credential.clone())?;
-
-        let mut key_packages_vec: Vec<KeyPackage> = Vec::new();
-        for event in &member_key_package_events {
-            // TODO: Error handling for failure here
-            let key_package: KeyPackage = self.parse_key_package(event)?;
-            key_packages_vec.push(key_package);
-        }
-
-        // Handle member addition and welcome message creation
-        // For single-member groups (no additional members), we skip adding members
-        // and return an empty welcome_rumors vec
-        let welcome_rumors = if key_packages_vec.is_empty() {
-            // Single-member group: no members to add, no welcome messages needed
-            Vec::new()
-        } else {
-            // Add members to the group
-            let (_, welcome_out, _group_info) =
-                mls_group.add_members(&self.provider, &signer, &key_packages_vec)?;
-
-            // IMPORTANT: Privacy-preserving group creation
-            //
-            // We intentionally DO NOT publish the initial commit to relays. Instead, we:
-            // 1. Merge the pending commit locally (immediately below)
-            // 2. Send Welcome messages directly to invited members
-            //
-            // This differs from the MLS specification (RFC 9420), which recommends waiting
-            // for Delivery Service confirmation before applying commits. However, that
-            // guidance assumes a centralized Delivery Service model.
-            //
-            // For initial group creation with Nostr relays, not publishing the commit is
-            // the correct choice for security and privacy reasons:
-            //
-            // - PRIVACY: Publishing the commit would expose additional metadata on relays
-            //   (timing, event patterns, correlation opportunities) with no functional benefit
-            // - SECURITY: Invited members receive complete group state via Welcome messages;
-            //   they do not need the commit to join the group
-            // - NO RACE CONDITIONS: At creation time, only the creator exists in the group,
-            //   so there are no other members who need to process this commit
-            //
-            // This approach minimizes observable events on relays while maintaining full
-            // MLS security properties. The Welcome messages contain all cryptographic
-            // material needed for invitees to participate in the group.
-            //
-            // NOTE: This is specific to initial group creation. For commits in established
-            // groups (adding/removing members, updates), commits MUST be published to relays
-            // so existing members can process them and stay in sync.
-            mls_group.merge_pending_commit(&self.provider)?;
-
-            // Serialize the welcome message and send it to the members
-            let serialized_welcome_message = welcome_out.tls_serialize_detached()?;
-
-            self.build_welcome_rumors_for_key_packages(
-                &mls_group,
-                serialized_welcome_message,
-                member_key_package_events,
-                &config.relays,
-            )?
-            .ok_or(Error::Welcome("Error creating welcome rumors".to_string()))?
-        };
-
-        // Save the NostrMLS Group
-        let group = group_types::Group {
-            mls_group_id: mls_group.group_id().clone().into(),
-            nostr_group_id: group_data.nostr_group_id,
-            name: group_data.name,
-            description: group_data.description,
-            admin_pubkeys: group_data.admins,
-            last_message_id: None,
-            last_message_at: None,
-            last_message_processed_at: None,
-            epoch: mls_group.epoch().as_u64(),
-            state: group_types::GroupState::Active,
-            image_hash: config.image_hash,
-            image_key: config.image_key.map(mdk_storage_traits::Secret::new),
-            image_nonce: config.image_nonce.map(mdk_storage_traits::Secret::new),
-            self_update_state: group_types::SelfUpdateState::CompletedAt(Timestamp::now()),
-        };
-
-        self.storage().save_group(group.clone()).map_err(
-            |e: mdk_storage_traits::groups::error::GroupError| Error::Group(e.to_string()),
-        )?;
-
-        // Save the group relays after saving the group
-        self.storage()
-            .replace_group_relays(&group.mls_group_id, config.relays.into_iter().collect())
-            .map_err(|e| Error::Group(e.to_string()))?;
-
-        Ok(GroupResult {
-            group,
-            welcome_rumors,
-        })
+        self.create_group_inner(
+            creator_public_key,
+            member_key_package_events,
+            config,
+            group_data,
+            extensions,
+        )
     }
 
     /// Create a group with MIP-06 multi-device support enabled from the start.
@@ -1372,33 +1235,57 @@ where
     ) -> Result<GroupResult, Error> {
         use crate::mip06::MarmotMultiDevice;
 
-        let member_pubkeys = member_key_package_events
-            .clone()
-            .into_iter()
-            .map(|e| e.pubkey)
-            .collect::<Vec<PublicKey>>();
+        let group_data = Self::build_group_data_from_config(&config)?;
+        let nostr_ext = Self::get_unknown_extension_from_group_data(&group_data)?;
+        let multi_device_ext = MarmotMultiDevice::new().as_extension()?;
+        let required_caps = self.required_capabilities_extension_with_multi_device();
+        let extensions =
+            Extensions::from_vec(vec![nostr_ext, multi_device_ext, required_caps])?;
 
-        let admins = config.admins.clone();
-        self.validate_group_members(creator_public_key, &member_pubkeys, &admins)?;
+        self.create_group_inner(
+            creator_public_key,
+            member_key_package_events,
+            config,
+            group_data,
+            extensions,
+        )
+    }
 
-        let (credential, signer) = self.generate_credential_with_key(creator_public_key)?;
-
-        let group_data = NostrGroupDataExtension::new(
-            config.name,
-            config.description,
-            admins,
+    /// Build a `NostrGroupDataExtension` from config (shared by create_group variants).
+    fn build_group_data_from_config(
+        config: &NostrGroupConfigData,
+    ) -> Result<NostrGroupDataExtension, Error> {
+        Ok(NostrGroupDataExtension::new(
+            config.name.clone(),
+            config.description.clone(),
+            config.admins.clone(),
             config.relays.clone(),
             config.image_hash,
             config.image_key,
             config.image_nonce,
             None,
-        );
+        ))
+    }
 
-        let nostr_group_data_ext = Self::get_unknown_extension_from_group_data(&group_data)?;
-        let multi_device_ext = MarmotMultiDevice::new().as_extension()?;
-        let required_caps = self.required_capabilities_extension_with_multi_device();
-        let extensions =
-            Extensions::from_vec(vec![nostr_group_data_ext, multi_device_ext, required_caps])?;
+    /// Shared group creation logic used by both `create_group` and
+    /// `create_group_with_multi_device`.
+    fn create_group_inner(
+        &self,
+        creator_public_key: &PublicKey,
+        member_key_package_events: Vec<Event>,
+        config: NostrGroupConfigData,
+        group_data: NostrGroupDataExtension,
+        extensions: Extensions<openmls::prelude::GroupContext>,
+    ) -> Result<GroupResult, Error> {
+        let member_pubkeys: Vec<PublicKey> = member_key_package_events
+            .iter()
+            .map(|e| e.pubkey)
+            .collect();
+
+        let admins = config.admins.clone();
+        self.validate_group_members(creator_public_key, &member_pubkeys, &admins)?;
+
+        let (credential, signer) = self.generate_credential_with_key(creator_public_key)?;
 
         let capabilities = self.capabilities();
         let sender_ratchet_config = SenderRatchetConfiguration::new(
@@ -1430,7 +1317,9 @@ where
             let (_, welcome_out, _group_info) =
                 mls_group.add_members(&self.provider, &signer, &key_packages_vec)?;
 
-            // See create_group for privacy rationale on not publishing initial commit
+            // Privacy-preserving: don't publish initial commit to relays.
+            // Invited members get full state via Welcome messages.
+            // See create_group doc comment for detailed rationale.
             mls_group.merge_pending_commit(&self.provider)?;
 
             let serialized_welcome = welcome_out.tls_serialize_detached()?;
@@ -1543,7 +1432,7 @@ where
 
         for group_id in group_ids {
             // Use the existing add_members flow — same as adding any member
-            let result = self.add_members(group_id, &[key_package_event.clone()])?;
+            let result = self.add_members(group_id, std::slice::from_ref(key_package_event))?;
 
             // Serialize the commit event
             let commit_event_json = result.evolution_event.as_json().into_bytes();
