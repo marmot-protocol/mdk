@@ -51,6 +51,7 @@ refinery = "0.9"
 
 # Random number generation
 getrandom = "0.4"
+x25519-dalek = { version = "2.0", default-features = false, features = ["static_secrets"] }
 
 # Secure credential storage (v4 architecture - see https://github.com/open-source-cooperative/keyring-rs/issues/259)
 keyring-core = "0.7"

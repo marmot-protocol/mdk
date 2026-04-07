@@ -513,6 +513,46 @@ where
         })
     }
 
+    /// Returns members coalesced by Nostr identity, grouping all leaf indices
+    /// belonging to the same pubkey (multi-device).
+    ///
+    /// Each entry maps a Nostr pubkey to all its leaf indices in the group.
+    #[cfg(feature = "mip06")]
+    pub fn coalesced_members(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<BTreeMap<PublicKey, Vec<u32>>, Error> {
+        let group = self.load_mls_group(group_id)?.ok_or(Error::GroupNotFound)?;
+
+        let mut result: BTreeMap<PublicKey, Vec<u32>> = BTreeMap::new();
+        for member in group.members() {
+            let credentials = BasicCredential::try_from(member.credential)?;
+            let public_key = self.parse_credential_identity(credentials.identity())?;
+            result.entry(public_key).or_default().push(member.index.u32());
+        }
+        Ok(result)
+    }
+
+    /// Returns all leaf indices in the group that share the local user's Nostr pubkey.
+    #[cfg(feature = "mip06")]
+    pub fn own_device_leaves(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<Vec<u32>, Error> {
+        let group = self.load_mls_group(group_id)?.ok_or(Error::GroupNotFound)?;
+        let own_pubkey = self.get_own_pubkey(&group)?;
+
+        let mut leaves = Vec::new();
+        for member in group.members() {
+            let credentials = BasicCredential::try_from(member.credential)?;
+            let member_pubkey = self.parse_credential_identity(credentials.identity())?;
+            if member_pubkey == own_pubkey {
+                leaves.push(member.index.u32());
+            }
+        }
+        Ok(leaves)
+    }
+
     /// Returns the local member's current MLS leaf index for a group.
     pub fn own_leaf_index(&self, group_id: &GroupId) -> Result<u32, Error> {
         let group = self.load_mls_group(group_id)?.ok_or(Error::GroupNotFound)?;
@@ -1316,6 +1356,212 @@ where
             group,
             welcome_rumors,
         })
+    }
+
+    /// Create a group with MIP-06 multi-device support enabled from the start.
+    ///
+    /// This adds the `marmot_multi_device` extension (`0xF2F0`) to GroupContext.extensions
+    /// and includes `0xF2F0` in required_capabilities. All members added at creation time
+    /// must advertise `0xF2F0` in their KeyPackage capabilities.
+    #[cfg(feature = "mip06")]
+    pub fn create_group_with_multi_device(
+        &self,
+        creator_public_key: &PublicKey,
+        member_key_package_events: Vec<Event>,
+        config: NostrGroupConfigData,
+    ) -> Result<GroupResult, Error> {
+        use crate::mip06::MarmotMultiDevice;
+
+        let member_pubkeys = member_key_package_events
+            .clone()
+            .into_iter()
+            .map(|e| e.pubkey)
+            .collect::<Vec<PublicKey>>();
+
+        let admins = config.admins.clone();
+        self.validate_group_members(creator_public_key, &member_pubkeys, &admins)?;
+
+        let (credential, signer) = self.generate_credential_with_key(creator_public_key)?;
+
+        let group_data = NostrGroupDataExtension::new(
+            config.name,
+            config.description,
+            admins,
+            config.relays.clone(),
+            config.image_hash,
+            config.image_key,
+            config.image_nonce,
+            None,
+        );
+
+        let nostr_group_data_ext = Self::get_unknown_extension_from_group_data(&group_data)?;
+        let multi_device_ext = MarmotMultiDevice::new().as_extension()?;
+        let required_caps = self.required_capabilities_extension_with_multi_device();
+        let extensions =
+            Extensions::from_vec(vec![nostr_group_data_ext, multi_device_ext, required_caps])?;
+
+        let capabilities = self.capabilities();
+        let sender_ratchet_config = SenderRatchetConfiguration::new(
+            self.config.out_of_order_tolerance,
+            self.config.maximum_forward_distance,
+        );
+        let group_config = MlsGroupCreateConfig::builder()
+            .ciphersuite(self.ciphersuite)
+            .wire_format_policy(MIXED_CIPHERTEXT_WIRE_FORMAT_POLICY)
+            .use_ratchet_tree_extension(true)
+            .capabilities(capabilities)
+            .with_group_context_extensions(extensions)
+            .sender_ratchet_configuration(sender_ratchet_config)
+            .max_past_epochs(self.config.max_past_epochs)
+            .build();
+
+        let mut mls_group =
+            MlsGroup::new(&self.provider, &signer, &group_config, credential.clone())?;
+
+        let mut key_packages_vec: Vec<KeyPackage> = Vec::new();
+        for event in &member_key_package_events {
+            let key_package: KeyPackage = self.parse_key_package(event)?;
+            key_packages_vec.push(key_package);
+        }
+
+        let welcome_rumors = if key_packages_vec.is_empty() {
+            Vec::new()
+        } else {
+            let (_, welcome_out, _group_info) =
+                mls_group.add_members(&self.provider, &signer, &key_packages_vec)?;
+
+            // See create_group for privacy rationale on not publishing initial commit
+            mls_group.merge_pending_commit(&self.provider)?;
+
+            let serialized_welcome = welcome_out.tls_serialize_detached()?;
+
+            self.build_welcome_rumors_for_key_packages(
+                &mls_group,
+                serialized_welcome,
+                member_key_package_events,
+                &config.relays,
+            )?
+            .ok_or(Error::Welcome("Error creating welcome rumors".to_string()))?
+        };
+
+        let group = group_types::Group {
+            mls_group_id: mls_group.group_id().clone().into(),
+            nostr_group_id: group_data.nostr_group_id,
+            name: group_data.name,
+            description: group_data.description,
+            admin_pubkeys: group_data.admins,
+            last_message_id: None,
+            last_message_at: None,
+            last_message_processed_at: None,
+            epoch: mls_group.epoch().as_u64(),
+            state: group_types::GroupState::Active,
+            image_hash: config.image_hash,
+            image_key: config.image_key.map(mdk_storage_traits::Secret::new),
+            image_nonce: config.image_nonce.map(mdk_storage_traits::Secret::new),
+            self_update_state: group_types::SelfUpdateState::CompletedAt(Timestamp::now()),
+        };
+
+        self.storage().save_group(group.clone()).map_err(
+            |e: mdk_storage_traits::groups::error::GroupError| Error::Group(e.to_string()),
+        )?;
+
+        self.storage()
+            .replace_group_relays(&group.mls_group_id, config.relays.into_iter().collect())
+            .map_err(|e| Error::Group(e.to_string()))?;
+
+        Ok(GroupResult {
+            group,
+            welcome_rumors,
+        })
+    }
+
+    /// Enable MIP-06 multi-device support on an existing group.
+    ///
+    /// This is a staged operation: all current members must already advertise `0xF2F0`
+    /// in their LeafNode capabilities before calling this. The caller (admin) commits
+    /// a GroupContextExtensions proposal that adds `marmot_multi_device` and requires
+    /// `0xF2F0`.
+    ///
+    /// NOTE: Does not merge the pending commit. Clients must call `merge_pending_commit`
+    /// after publishing the commit to relays.
+    #[cfg(feature = "mip06")]
+    pub fn enable_multi_device(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<Event, Error> {
+        use crate::mip06::MarmotMultiDevice;
+
+        let mut mls_group = self
+            .load_mls_group(group_id)?
+            .ok_or(Error::GroupNotFound)?;
+        let signer = self.load_mls_signer(&mls_group)?;
+
+        // Verify MIP-06 is not already enabled
+        if crate::mip06::is_multi_device_enabled(&mls_group) {
+            return Err(Error::Group(
+                "multi-device is already enabled for this group".to_string(),
+            ));
+        }
+
+        // Build new extensions: preserve existing NostrGroupData + add multi-device
+        let mut extensions = mls_group.extensions().clone();
+        let multi_device_ext = MarmotMultiDevice::new().as_extension()?;
+        extensions.add_or_replace(multi_device_ext)?;
+        extensions.add_or_replace(self.required_capabilities_extension_with_multi_device())?;
+
+        // Create GroupContextExtensions proposal + commit
+        let (commit_message, _, _group_info) = mls_group
+            .update_group_context_extensions(&self.provider, extensions, &signer)?;
+
+        let serialized_commit = commit_message.tls_serialize_detached()?;
+        let commit_event = self.build_message_event(group_id, serialized_commit)?;
+
+        Ok(commit_event)
+    }
+
+    /// Add a new device to multiple groups (existing device, Phase 2 of pairing).
+    ///
+    /// For each group ID, the existing device:
+    /// 1. Adds the new device's KeyPackage via standard `add_members()`
+    /// 2. Collects the Welcome message and commit event
+    ///
+    /// Returns a `DevicePairingResponse` containing Welcome data for each group,
+    /// plus the commit events that should be published to relays.
+    ///
+    /// NOTE: This does NOT merge pending commits. The caller must publish the
+    /// commit events and call `merge_pending_commit()` for each group after
+    /// successful relay publish.
+    #[cfg(feature = "mip06")]
+    pub fn add_device_to_groups(
+        &self,
+        group_ids: &[GroupId],
+        key_package_event: &Event,
+    ) -> Result<crate::mip06::DevicePairingResponse, Error> {
+        use crate::mip06::GroupWelcomeData;
+
+        let mut group_welcomes = Vec::with_capacity(group_ids.len());
+
+        for group_id in group_ids {
+            // Use the existing add_members flow — same as adding any member
+            let result = self.add_members(group_id, &[key_package_event.clone()])?;
+
+            // Serialize the commit event
+            let commit_event_json = result.evolution_event.as_json().into_bytes();
+
+            // Get the first (and only) Welcome rumor
+            let welcome_rumor = result
+                .welcome_rumors
+                .and_then(|rumors| rumors.into_iter().next())
+                .ok_or_else(|| {
+                    Error::PairingError("add_members produced no Welcome rumor".to_string())
+                })?;
+
+            let welcome_rumor_json = welcome_rumor.as_json().into_bytes();
+
+            group_welcomes.push(GroupWelcomeData::new(welcome_rumor_json, commit_event_json));
+        }
+
+        Ok(crate::mip06::DevicePairingResponse::new(group_welcomes))
     }
 
     /// Updates the current member's leaf node in an MLS group.

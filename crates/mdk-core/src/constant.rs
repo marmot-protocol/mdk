@@ -21,6 +21,14 @@ pub const MLS_KEY_PACKAGE_KIND_LEGACY: Kind = Kind::Custom(443);
 /// Nostr Group Data extension type
 pub const NOSTR_GROUP_DATA_EXTENSION_TYPE: u16 = 0xF2EE; // Be FREE
 
+/// MIP-06: Multi-Device extension type
+#[cfg(feature = "mip06")]
+pub const MULTI_DEVICE_EXTENSION_TYPE: u16 = 0xF2F0;
+
+/// MIP-06: Device Name extension type (optional per-leaf metadata)
+#[cfg(feature = "mip06")]
+pub const DEVICE_NAME_EXTENSION_TYPE: u16 = 0xF2EF;
+
 /// Default ciphersuite for Nostr Groups.
 /// This is also the only required ciphersuite for Nostr Groups.
 pub const DEFAULT_CIPHERSUITE: Ciphersuite =
@@ -36,9 +44,19 @@ pub const DEFAULT_CIPHERSUITE: Ciphersuite =
 /// Note: LastResort (0x000a) is included here because OpenMLS requires KeyPackage-level
 /// extensions to be declared in capabilities for validation, even though per the MLS
 /// Extensions draft it's technically just a KeyPackage marker.
+#[cfg(not(feature = "mip06"))]
 pub const SUPPORTED_EXTENSIONS: [ExtensionType; 2] = [
     ExtensionType::LastResort, // 0x000A - Required by OpenMLS validation
     ExtensionType::Unknown(NOSTR_GROUP_DATA_EXTENSION_TYPE), // 0xF2EE - NostrGroupData
+];
+
+/// When MIP-06 is enabled, additionally advertise multi-device and device-name support.
+#[cfg(feature = "mip06")]
+pub const SUPPORTED_EXTENSIONS: [ExtensionType; 4] = [
+    ExtensionType::LastResort,                               // 0x000A
+    ExtensionType::Unknown(NOSTR_GROUP_DATA_EXTENSION_TYPE), // 0xF2EE
+    ExtensionType::Unknown(DEVICE_NAME_EXTENSION_TYPE),      // 0xF2EF
+    ExtensionType::Unknown(MULTI_DEVICE_EXTENSION_TYPE),     // 0xF2F0
 ];
 
 /// Extensions that are required in the GroupContext RequiredCapabilities extension.
@@ -55,7 +73,11 @@ pub const GROUP_CONTEXT_REQUIRED_EXTENSIONS: [ExtensionType; 1] = [
 /// Derived from SUPPORTED_EXTENSIONS to guarantee the tags accurately advertise
 /// what the KeyPackage capabilities contain. GREASE values are excluded — they
 /// are injected dynamically at runtime (see `MDK::capabilities()`).
+#[cfg(not(feature = "mip06"))]
 pub const TAG_EXTENSIONS: [ExtensionType; 2] = SUPPORTED_EXTENSIONS;
+
+#[cfg(feature = "mip06")]
+pub const TAG_EXTENSIONS: [ExtensionType; 4] = SUPPORTED_EXTENSIONS;
 
 /// Non-default proposal types that clients advertise support for.
 ///
