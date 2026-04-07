@@ -38,6 +38,7 @@ uniffi_macros = "0.31"
 [features]
 default = ["mip04"]
 mip04 = ["mdk-core/mip04"]
+mip06 = ["mdk-core/mip06"]
 test-utils = ["mdk-sqlite-storage/test-utils"]
 
 [dev-dependencies]
