@@ -51,9 +51,32 @@ where
         event: &Event,
         staged_commit: StagedCommit,
         commit_sender: &Sender,
+        authenticated_data: &[u8],
     ) -> Result<()> {
         self.validate_commit_authorization(mls_group, &staged_commit, commit_sender)?;
         self.validate_commit_identities(mls_group, &staged_commit, commit_sender)?;
+
+        // MIP-06: verify Nostr identity proof for External Commits
+        #[cfg(feature = "mip06")]
+        if matches!(commit_sender, Sender::NewMemberCommit) {
+            self.validate_external_commit_identity_proof(
+                mls_group,
+                &staged_commit,
+                authenticated_data,
+            )?;
+        }
+
+        // For non-MIP-06 commits, authenticated_data MUST be empty per MIP-06 spec.
+        #[cfg(feature = "mip06")]
+        if !matches!(commit_sender, Sender::NewMemberCommit) && !authenticated_data.is_empty() {
+            tracing::warn!(
+                target: "mdk_core::messages::process_commit",
+                "Non-External Commit has non-empty authenticated_data ({} bytes)",
+                authenticated_data.len()
+            );
+        }
+
+        let _ = authenticated_data; // suppress unused warning when mip06 feature is off
 
         let group_id: GroupId = mls_group.group_id().into();
 

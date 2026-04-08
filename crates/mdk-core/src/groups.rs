@@ -1392,6 +1392,21 @@ where
             ));
         }
 
+        // MIP-06 §Enabling MIP-06 in Existing Groups, step 3:
+        // "Admins MUST NOT add marmot_multi_device to GroupContext.extensions or
+        //  add 0xF2F0 to required_capabilities until every current leaf in the
+        //  ratchet tree advertises 0xF2F0 in LeafNode.capabilities.extensions."
+        //
+        // OpenMLS enforces required_capabilities at commit time: if any member
+        // doesn't advertise 0xF2F0, the update_group_context_extensions call below
+        // will fail with a validation error. We verify the group has at least one
+        // member as a sanity check.
+        if mls_group.members().next().is_none() {
+            return Err(Error::Group(
+                "cannot enable MIP-06: group has no members".to_string(),
+            ));
+        }
+
         // Build new extensions: preserve existing NostrGroupData + add multi-device
         let mut extensions = mls_group.extensions().clone();
         let multi_device_ext = MarmotMultiDevice::new().as_extension()?;
@@ -1403,7 +1418,7 @@ where
             .update_group_context_extensions(&self.provider, extensions, &signer)?;
 
         let serialized_commit = commit_message.tls_serialize_detached()?;
-        let commit_event = self.build_message_event(group_id, serialized_commit)?;
+        let commit_event = self.build_message_event(group_id, serialized_commit, None)?;
 
         Ok(commit_event)
     }
@@ -1451,6 +1466,112 @@ where
         }
 
         Ok(crate::mip06::DevicePairingResponse::new(group_welcomes))
+    }
+
+    /// Build a spec-compliant MIP-06 `PairingPayload` for the given groups.
+    ///
+    /// For each group, extracts:
+    /// - `GroupInfo` (with `external_pub` and `ratchet_tree` extensions)
+    /// - Current epoch `group_event_key` (MIP-03 outer encryption key)
+    /// - Current epoch `resumption_psk`
+    ///
+    /// The returned payload is the plaintext to be encrypted via the pairing
+    /// crypto channel before transfer to the new device.
+    #[cfg(feature = "mip06")]
+    pub fn build_pairing_payload(
+        &self,
+        group_ids: &[GroupId],
+    ) -> Result<crate::mip06::PairingPayload, Error> {
+        use crate::mip06::GroupPairingDataV1;
+        use tls_codec::Serialize as TlsSerializeExt;
+
+        let mut groups = Vec::with_capacity(group_ids.len());
+
+        for group_id in group_ids {
+            let mls_group = self
+                .load_mls_group(group_id)?
+                .ok_or(Error::GroupNotFound)?;
+            let signer = self.load_mls_signer(&mls_group)?;
+
+            // Verify MIP-06 is enabled for this group
+            if !crate::mip06::is_multi_device_enabled(&mls_group) {
+                return Err(Error::MultiDeviceNotEnabled);
+            }
+
+            // Export GroupInfo with ratchet_tree extension
+            let group_info_msg = mls_group
+                .export_group_info(self.provider.crypto(), &signer, true)
+                .map_err(|e| {
+                    Error::PairingError(format!("failed to export GroupInfo: {e}"))
+                })?;
+            let group_info_bytes = group_info_msg.tls_serialize_detached()
+                .map_err(|e| {
+                    Error::PairingError(format!("failed to serialize GroupInfo: {e}"))
+                })?;
+
+            // Export group_event_key (MIP-03 outer encryption key)
+            let exporter_secret = self.derive_exporter_secret_for_group(
+                group_id,
+                &mls_group,
+                "marmot",
+                b"group-event",
+            )?;
+            let group_event_key: [u8; 32] = *exporter_secret.secret.as_ref();
+
+            // Export resumption PSK for current epoch
+            let resumption_psk = mls_group.resumption_psk_secret();
+            let resumption_psk_bytes = resumption_psk.as_slice().to_vec();
+
+            groups.push(GroupPairingDataV1::new(
+                group_event_key,
+                resumption_psk_bytes,
+                group_info_bytes,
+            )?);
+        }
+
+        Ok(crate::mip06::PairingPayload::new(groups))
+    }
+
+    /// Join a group via MIP-06 External Commit using data from a pairing payload.
+    ///
+    /// The new device:
+    /// 1. Parses GroupInfo from the pairing data
+    /// 2. Constructs an External Commit with ExternalInit + Resumption PSK
+    /// 3. Includes a Nostr identity proof in `authenticated_data`
+    /// 4. Returns the serialized External Commit for publication as `kind: 445`
+    ///
+    /// # Known OpenMLS 0.8.1 blockers
+    ///
+    /// This function cannot be fully implemented until two upstream issues are resolved:
+    ///
+    /// 1. **Resumption PSK injection**: `ResumptionPskStore` is `pub(crate)` in
+    ///    OpenMLS 0.8.1, so the new device cannot inject the pairing-provided PSK
+    ///    value into the store before `load_psks()` runs during commit finalization.
+    ///
+    /// 2. **Identity proof AAD ordering**: `ExternalCommitBuilder::with_aad()` must
+    ///    be called before `build_group()`, but the proof challenge requires the
+    ///    UpdatePath LeafNode which is only created during `build_group()`. The API
+    ///    needs to support setting AAD after group creation but before finalization.
+    #[cfg(feature = "mip06")]
+    pub fn join_group_via_external_commit(
+        &self,
+        _pairing_data: &crate::mip06::GroupPairingDataV1,
+        _nostr_keys: &nostr::Keys,
+    ) -> Result<(), Error> {
+        // Scaffolded — blocked by OpenMLS API limitations described above.
+        //
+        // When unblocked, this will:
+        // 1. Deserialize GroupInfo from pairing_data.group_info()
+        // 2. Inject resumption_psk into the PSK store
+        // 3. Build ExternalCommit via ExternalCommitBuilder
+        // 4. Set authenticated_data to NostrIdentityProof
+        // 5. Finalize and return serialized commit + group_event_key for outer encryption
+        Err(Error::NotImplemented(
+            "join_group_via_external_commit blocked by OpenMLS 0.8.1 API limitations: \
+             ResumptionPskStore is pub(crate) and ExternalCommitBuilder AAD ordering \
+             prevents identity proof construction. See MIP-06 implementation notes."
+                .to_string(),
+        ))
     }
 
     /// Updates the current member's leaf node in an MLS group.

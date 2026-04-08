@@ -17,9 +17,12 @@ mod pairing_crypto;
 
 pub use self::device_name::EncryptedDeviceName;
 pub use self::extension::{MarmotMultiDevice, is_multi_device_enabled};
-pub use self::identity_proof::NostrIdentityProof;
+pub use self::identity_proof::{
+    NostrIdentityProof, compute_challenge, construct_identity_proof, verify_identity_proof,
+};
 pub use self::pairing::{
-    DevicePairingRequest, DevicePairingResponse, GroupWelcomeData,
+    DevicePairingRequest, DevicePairingResponse, GroupPairingDataV1, GroupWelcomeData,
+    PairingPayload,
 };
 pub use self::pairing_crypto::{PairingMessage, decrypt_pairing_message, encrypt_pairing_message};
 
@@ -272,5 +275,75 @@ mod integration_tests {
 
         let mls_group = alice_mdk.load_mls_group(&group_id).unwrap().unwrap();
         assert!(super::is_multi_device_enabled(&mls_group));
+    }
+
+    /// Test build_pairing_payload extracts valid data for each group
+    #[test]
+    fn test_build_pairing_payload() {
+        let alice_keys = Keys::generate();
+        let bob_keys = Keys::generate();
+
+        let alice_mdk = create_test_mdk();
+        let bob_mdk = create_test_mdk();
+
+        let admins = vec![alice_keys.public_key(), bob_keys.public_key()];
+        let bob_kp = create_key_package_event(&bob_mdk, &bob_keys);
+
+        let create_result = alice_mdk
+            .create_group_with_multi_device(
+                &alice_keys.public_key(),
+                vec![bob_kp],
+                create_nostr_group_config_data(admins),
+            )
+            .expect("Should create group");
+
+        let group_id = create_result.group.mls_group_id.clone();
+        alice_mdk.merge_pending_commit(&group_id).unwrap();
+
+        // Build pairing payload
+        let payload = alice_mdk
+            .build_pairing_payload(&[group_id])
+            .expect("Should build pairing payload");
+
+        assert_eq!(payload.groups().len(), 1);
+
+        let group_data = &payload.groups()[0];
+        assert_ne!(group_data.group_event_key(), &[0u8; 32]);
+        assert!(!group_data.resumption_psk().is_empty());
+        assert!(!group_data.group_info().is_empty());
+
+        // Verify roundtrip serialization
+        let bytes = payload.to_bytes().unwrap();
+        let decoded = super::PairingPayload::from_bytes(&bytes).unwrap();
+        assert_eq!(payload, decoded);
+    }
+
+    /// Test build_pairing_payload rejects groups without MIP-06
+    #[test]
+    fn test_build_pairing_payload_rejects_non_multi_device_group() {
+        let alice_keys = Keys::generate();
+        let alice_mdk = create_test_mdk();
+
+        let create_result = alice_mdk
+            .create_group(
+                &alice_keys.public_key(),
+                vec![],
+                create_nostr_group_config_data(vec![alice_keys.public_key()]),
+            )
+            .unwrap();
+
+        let result = alice_mdk.build_pairing_payload(&[create_result.group.mls_group_id]);
+        assert!(result.is_err());
+    }
+
+    /// Test join_group_via_external_commit returns NotImplemented (blocked by OpenMLS)
+    #[test]
+    fn test_join_group_via_external_commit_blocked() {
+        let mdk = create_test_mdk();
+        let keys = Keys::generate();
+        let data = super::GroupPairingDataV1::new([1; 32], vec![2; 32], vec![3; 100]).unwrap();
+
+        let result = mdk.join_group_via_external_commit(&data, &keys);
+        assert!(result.is_err());
     }
 }
