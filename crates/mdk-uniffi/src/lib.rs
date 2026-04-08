@@ -3962,5 +3962,40 @@ mod tests {
             );
             assert!(matches!(result, Err(MdkUniffiError::InvalidInput(_))));
         }
+
+    // -----------------------------------------------------------------
+    // Keyring auto-initialization (ensure_keyring_store / init_keyring_store)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_ensure_keyring_store_idempotent() {
+        // Calling ensure_keyring_store() multiple times must succeed —
+        // the OnceLock ensures only the first call performs initialization.
+        assert!(ensure_keyring_store().is_ok());
+        assert!(ensure_keyring_store().is_ok());
+        assert!(ensure_keyring_store().is_ok());
+    }
+
+    #[test]
+    fn test_init_keyring_store_exported() {
+        // The UniFFI-exported wrapper must also succeed and be idempotent.
+        assert!(init_keyring_store().is_ok());
+        assert!(init_keyring_store().is_ok());
+    }
+
+    #[test]
+    fn test_new_mdk_auto_inits_keyring() {
+        // new_mdk() should succeed without the caller having to manually
+        // call set_default_store() — ensure_keyring_store() handles it.
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("auto_init_test.db");
+        let result = new_mdk(
+            db_path.to_string_lossy().to_string(),
+            "org.test.keyring".to_string(),
+            "test.db.key".to_string(),
+            None,
+        );
+        assert!(result.is_ok(), "new_mdk() should auto-init the keyring store");
+    }
     }
 }
