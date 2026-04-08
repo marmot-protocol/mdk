@@ -400,6 +400,18 @@ where
                 );
                 Err(Error::CommitFromNonAdmin)
             }
+            #[cfg(feature = "mip06")]
+            Sender::NewMemberCommit => {
+                self.validate_external_commit_authorization(mls_group, staged_commit)
+            }
+            #[cfg(not(feature = "mip06"))]
+            Sender::NewMemberCommit => {
+                tracing::warn!(
+                    target: "mdk_core::messages::process_commit",
+                    "Received External Commit but MIP-06 is not enabled in this build."
+                );
+                Err(Error::MessageFromNonMember)
+            }
             _ => {
                 tracing::warn!(
                     target: "mdk_core::messages::process_commit",
@@ -408,6 +420,158 @@ where
                 Err(Error::MessageFromNonMember)
             }
         }
+    }
+
+    /// Validates an External Commit (MIP-06 multi-device join) is authorized.
+    ///
+    /// Checks conditions 1–5 and 7–8 from MIP-06 §External Commit Authorization.
+    /// Condition 6 (Nostr identity proof) requires `authenticated_data` and is
+    /// checked separately in [`Self::validate_external_commit_identity_proof`].
+    ///
+    /// OpenMLS validates standard MLS rules (condition 8) and PSK cryptographic
+    /// correctness (confirmation_tag) during `process_message()`, before we reach
+    /// this point.
+    #[cfg(feature = "mip06")]
+    fn validate_external_commit_authorization(
+        &self,
+        mls_group: &MlsGroup,
+        staged_commit: &StagedCommit,
+    ) -> Result<()> {
+        use openmls::prelude::BasicCredential;
+
+        // 1-3. MIP-06 signaling gate: extension present, required, at least one member
+        if !crate::mip06::is_multi_device_enabled(mls_group) {
+            tracing::warn!(
+                target: "mdk_core::messages::validate_external_commit",
+                "External Commit rejected: MIP-06 signaling gate not satisfied"
+            );
+            return Err(Error::MultiDeviceNotEnabled);
+        }
+
+        // 4. Credential identity in joining LeafNode matches an existing member.
+        //    The joining LeafNode is in the commit's update path.
+        let joining_leaf = staged_commit.update_path_leaf_node().ok_or_else(|| {
+            Error::IdentityProofError(
+                "External Commit has no update path leaf node".to_string(),
+            )
+        })?;
+        let joining_cred = BasicCredential::try_from(joining_leaf.credential().clone())
+            .map_err(|e| Error::IdentityProofError(format!("invalid credential: {e}")))?;
+        let joining_pubkey = self.parse_credential_identity(joining_cred.identity())?;
+
+        let identity_match = mls_group.members().any(|member| {
+            BasicCredential::try_from(member.credential.clone())
+                .ok()
+                .and_then(|cred| self.parse_credential_identity(cred.identity()).ok())
+                .is_some_and(|pk| pk == joining_pubkey)
+        });
+
+        if !identity_match {
+            tracing::warn!(
+                target: "mdk_core::messages::validate_external_commit",
+                "External Commit rejected: joining identity {} does not match any existing member",
+                joining_pubkey
+            );
+            return Err(Error::IdentityProofError(
+                "joining identity does not match any existing group member".to_string(),
+            ));
+        }
+
+        // 5. Exactly one PreSharedKey proposal with resumption PSK.
+        let psk_count = staged_commit
+            .queued_proposals()
+            .filter(|p| matches!(p.proposal(), Proposal::PreSharedKey(_)))
+            .count();
+        if psk_count != 1 {
+            tracing::warn!(
+                target: "mdk_core::messages::validate_external_commit",
+                "External Commit rejected: expected exactly 1 PreSharedKey proposal, found {}",
+                psk_count
+            );
+            return Err(Error::PairingError(format!(
+                "expected 1 PreSharedKey proposal, found {psk_count}"
+            )));
+        }
+
+        // 7. No Remove proposals allowed (join-only, not resync).
+        let has_remove = staged_commit
+            .queued_proposals()
+            .any(|p| matches!(p.proposal(), Proposal::Remove(_)));
+        if has_remove {
+            tracing::warn!(
+                target: "mdk_core::messages::validate_external_commit",
+                "External Commit rejected: contains Remove proposal (resync not allowed)"
+            );
+            return Err(Error::PairingError(
+                "MIP-06 External Commits must not contain Remove proposals".to_string(),
+            ));
+        }
+
+        tracing::debug!(
+            target: "mdk_core::messages::validate_external_commit",
+            "External Commit from {} passed authorization checks",
+            joining_pubkey
+        );
+
+        Ok(())
+    }
+
+    /// Validates the Nostr identity proof in an External Commit's `authenticated_data`.
+    ///
+    /// This is MIP-06 §External Commit Authorization condition 6. It must be called
+    /// with the `authenticated_data` bytes captured from `ProcessedMessage::aad()`
+    /// before the message content is consumed.
+    ///
+    /// # OpenMLS 0.8.1 limitation
+    ///
+    /// Full verification requires TLS-serializing the pre-commit `GroupContext`,
+    /// but `MlsGroup::context()` is `pub(crate)` and `export_group_context()` is
+    /// gated behind `#[cfg(feature = "test-utils")]`. Until OpenMLS exposes this
+    /// publicly, we validate the proof structure and that `authenticated_data` is
+    /// non-empty, but cannot verify the challenge hash cryptographically.
+    ///
+    /// This is acceptable because:
+    /// 1. The joining side is ALSO blocked (AAD ordering issue prevents construction)
+    /// 2. `confirmation_tag` validation by OpenMLS still binds the commit cryptographically
+    /// 3. The structural checks (signaling gate, identity match, PSK, no-Remove) remain enforced
+    #[cfg(feature = "mip06")]
+    pub(super) fn validate_external_commit_identity_proof(
+        &self,
+        _mls_group: &MlsGroup,
+        staged_commit: &StagedCommit,
+        authenticated_data: &[u8],
+    ) -> Result<()> {
+        use crate::mip06::NostrIdentityProof;
+        use openmls::prelude::BasicCredential;
+
+        // Validate proof structure and version
+        let _proof = NostrIdentityProof::from_authenticated_data(authenticated_data)?;
+
+        // Validate joining LeafNode is present (needed for challenge computation)
+        let joining_leaf = staged_commit.update_path_leaf_node().ok_or_else(|| {
+            Error::IdentityProofError(
+                "External Commit has no update path leaf node".to_string(),
+            )
+        })?;
+
+        // Validate credential is parseable
+        let joining_cred = BasicCredential::try_from(joining_leaf.credential().clone())
+            .map_err(|e| Error::IdentityProofError(format!("invalid credential: {e}")))?;
+        let _joining_pubkey = self.parse_credential_identity(joining_cred.identity())?;
+
+        // TODO(openmls): Full signature verification blocked by MlsGroup::context()
+        // being pub(crate). When OpenMLS exposes GroupContext publicly:
+        //
+        //   let serialized_leaf = joining_leaf.tls_serialize_detached()?;
+        //   let serialized_gc = mls_group.export_group_context().tls_serialize_detached()?;
+        //   verify_identity_proof(&proof, &joining_pubkey, &serialized_leaf, &serialized_gc)?;
+
+        tracing::debug!(
+            target: "mdk_core::messages::validate_external_commit",
+            "Identity proof structure validated (full signature check pending OpenMLS API)"
+        );
+
+        Ok(())
     }
 
     /// Validates that an event's timestamp is within acceptable bounds

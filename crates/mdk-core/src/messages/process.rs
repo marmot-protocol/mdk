@@ -126,6 +126,9 @@ where
                 let sender_credential = processed_mls_message.credential().clone();
                 let message_sender = processed_mls_message.sender().clone();
                 let sender_leaf_index = sender_leaf_index(&message_sender);
+                // Capture authenticated_data for MIP-06 External Commit identity proof
+                // verification. Must be read before into_content() consumes the message.
+                let authenticated_data = processed_mls_message.aad().to_vec();
 
                 match processed_mls_message.into_content() {
                     ProcessedMessageContent::ApplicationMessage(application_message) => {
@@ -149,7 +152,13 @@ where
                         ))
                     }
                     ProcessedMessageContent::StagedCommitMessage(staged_commit) => {
-                        self.process_commit(mls_group, event, *staged_commit, &message_sender)?;
+                        self.process_commit(
+                            mls_group,
+                            event,
+                            *staged_commit,
+                            &message_sender,
+                            &authenticated_data,
+                        )?;
                         Ok(MessageProcessingOutcome::new(
                             MessageProcessingResult::Commit {
                                 mls_group_id: group.mls_group_id.clone(),
