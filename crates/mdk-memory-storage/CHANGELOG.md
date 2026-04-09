@@ -34,6 +34,7 @@
 
 ### Added
 
+- Propagated `disappearing_message_duration_secs` field through all `Group` construction sites for the new disappearing messages feature. ([#253](https://github.com/marmot-protocol/mdk/pull/253))
 - Implemented `delete_messages_for_group` and `delete_group` for local "clear chat" and "delete chat" operations. Added `clear_group` methods to `MlsGroupData` and `MlsEpochKeyPairs` for bulk group-scoped MLS state cleanup. ([#250](https://github.com/marmot-protocol/mdk/pull/250))
 - Implemented legacy exporter-secret compatibility storage for the temporary `0.6.x -> 0.7.x` migration window, including snapshot and restore support for preserved pre-0.7.0 group-event secrets. ([#222](https://github.com/marmot-protocol/mdk/pull/222))
 

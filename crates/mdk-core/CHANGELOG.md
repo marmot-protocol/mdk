@@ -28,6 +28,8 @@
 
 ### Breaking changes
 
+- **Extension version bumped from 2 to 3**: `NostrGroupDataExtension::CURRENT_VERSION` is now `3`. The new version adds a `disappearing_message_duration_secs` field to the TLS-serialized group data extension. Existing v1/v2 groups are forward-compatible (the field deserializes as `None`). `NostrGroupConfigData::new` now takes an additional `disappearing_message_duration_secs: Option<u64>` parameter. ([#253](https://github.com/marmot-protocol/mdk/pull/253))
+
 - **MIP-00 KeyPackage event kind migrated from `kind:443` to `kind:30443`**: KeyPackage events are now addressable (NIP-33) instead of regular events. A `d` tag with a random 32-byte hex identifier is included in every KeyPackage event, enabling relay-side replacement for rotation without explicit NIP-09 deletion. `create_key_package_for_event` and `create_key_package_for_event_with_options` now return a `KeyPackageEventData` struct instead of a tuple. This struct contains both `tags_30443` (for current spec) and `tags_443` (for legacy clients) to facilitate dual-publishing during the migration period. Callers must update destructuring. Callers MUST dual-publish both `kind:30443` (using `tags_30443`) and `kind:443` (using `tags_443`) until May 1, 2026 so that legacy clients can still discover new key packages. `parse_key_package` accepts both `kind:30443` (new) and `kind:443` (legacy) during the migration period. ([#233](https://github.com/marmot-protocol/mdk/pull/233))
 
 ### Changed
@@ -41,6 +43,7 @@
 
 ### Added
 
+- Added `disappearing_message_duration_secs: Option<u64>` field to `NostrGroupDataExtension`, `NostrGroupConfigData`, and `NostrGroupDataUpdate` for configuring disappearing messages on groups. `None` means messages persist forever; `Some(n)` means messages expire `n` seconds after creation. Duration of `0` is rejected with a validation error. The field is propagated through group creation, group updates, and welcome processing. ([#253](https://github.com/marmot-protocol/mdk/pull/253))
 - Added `delete_messages_for_group` and `delete_group` public methods on `MDK` for local "clear chat" and "delete chat" operations. `delete_group` also cleans up `EpochSnapshotManager` in-memory state. Neither operation publishes MLS proposals or Nostr events. ([#250](https://github.com/marmot-protocol/mdk/pull/250))
 - Added ThumbHash preview generation alongside existing BlurHash support. `MediaProcessingOptions` now includes `generate_thumbhash`, `ImageMetadata`, `MediaMetadata`, `EncryptedMediaUpload`, and `GroupImageUpload` expose optional `thumbhash`, and encrypted-media IMETA writing emits `thumbhash` while parsing accepts both `blurhash` and `thumbhash` tags for compatibility. ([#244](https://github.com/marmot-protocol/mdk/pull/244))
 - SelfRemove proposal type (`0x000a`) added to client capabilities, group required capabilities, and KeyPackage `mls_proposals` tag per MIP-03.
