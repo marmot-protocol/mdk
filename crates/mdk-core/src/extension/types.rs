@@ -47,13 +47,15 @@ pub(crate) struct TlsNostrGroupDataExtension {
     pub image_key: Vec<u8>,        // Use Vec<u8> to allow empty for None
     pub image_nonce: Vec<u8>,      // Use Vec<u8> to allow empty for None
     pub image_upload_key: Vec<u8>, // Use Vec<u8> to allow empty for None (v2 only)
+    pub disappearing_message_duration_secs: Vec<u8>, // Use Vec<u8>: empty for None, 8 bytes for Some(u64) (v3 only)
 }
 
 /// This is an MLS Group Context extension used to store the group's name,
 /// description, ID, admin identities, image URL, and image encryption key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NostrGroupDataExtension {
-    /// Extension format version (current: 2)
+    /// Extension format version (current: 3)
+    /// Version 3: Adds disappearing_message_duration_secs field
     /// Version 2: image_key field contains image_seed, image_upload_key contains upload_seed
     /// Version 1: image_key field contains encryption key directly (deprecated)
     pub version: u16,
@@ -84,6 +86,11 @@ pub struct NostrGroupDataExtension {
     /// In v2, the upload keypair is derived from this seed (cryptographically independent from image_key).
     /// In v1, the upload keypair was derived from image_key (now deprecated).
     pub image_upload_key: Option<[u8; 32]>,
+    /// Disappearing message duration in seconds (v3 only)
+    ///
+    /// - `None`: Messages persist forever (disabled)
+    /// - `Some(n)`: Messages expire `n` seconds after creation (`n > 0`)
+    pub disappearing_message_duration_secs: Option<u64>,
 }
 
 impl NostrGroupDataExtension {
@@ -91,9 +98,10 @@ impl NostrGroupDataExtension {
     pub const EXTENSION_TYPE: u16 = NOSTR_GROUP_DATA_EXTENSION_TYPE;
 
     /// Current extension format version (MIP-01)
+    /// Version 3: Adds disappearing_message_duration_secs field
     /// Version 2: Uses image_seed (stored in image_key field) with HKDF derivation
     /// Version 1: Uses image_key directly as encryption key (deprecated)
-    pub const CURRENT_VERSION: u16 = 2;
+    pub const CURRENT_VERSION: u16 = 3;
 
     /// Creates a new NostrGroupDataExtension with the given parameters.
     ///
@@ -119,6 +127,7 @@ impl NostrGroupDataExtension {
         image_key: Option<[u8; 32]>,
         image_nonce: Option<[u8; 12]>,
         image_upload_key: Option<[u8; 32]>,
+        disappearing_message_duration_secs: Option<u64>,
     ) -> Self
     where
         T1: Into<String>,
@@ -142,6 +151,7 @@ impl NostrGroupDataExtension {
             image_key,
             image_nonce,
             image_upload_key,
+            disappearing_message_duration_secs,
         }
     }
 
@@ -236,6 +246,23 @@ impl NostrGroupDataExtension {
             )
         };
 
+        // Backward compatibility: v1/v2 groups don't have this field, so empty Vec maps to None
+        let disappearing_message_duration_secs =
+            if raw.disappearing_message_duration_secs.is_empty() {
+                None
+            } else {
+                let bytes: [u8; 8] =
+                    raw.disappearing_message_duration_secs
+                        .try_into()
+                        .map_err(|_| {
+                            Error::ExtensionFormatError(
+                            "Invalid disappearing_message_duration_secs length (expected 8 bytes)"
+                                .to_string(),
+                        )
+                        })?;
+                Some(u64::from_be_bytes(bytes))
+            };
+
         Ok(Self {
             version: raw.version,
             nostr_group_id: raw.nostr_group_id,
@@ -247,6 +274,7 @@ impl NostrGroupDataExtension {
             image_key,
             image_nonce,
             image_upload_key,
+            disappearing_message_duration_secs,
         })
     }
 
@@ -419,7 +447,7 @@ impl NostrGroupDataExtension {
                 "Migrating from v1 to v2 without new image_seed and image_upload_seed - existing image_key will be treated as seed, which may cause issues since v1 image_key is a direct encryption key, not a seed"
             );
         }
-        self.version = Self::CURRENT_VERSION; // Set to version 2
+        self.version = Self::CURRENT_VERSION;
         if let Some(hash) = new_image_hash {
             self.image_hash = Some(hash);
         }
@@ -494,6 +522,9 @@ impl NostrGroupDataExtension {
             image_upload_key: self
                 .image_upload_key
                 .map_or_else(Vec::new, |key| key.to_vec()),
+            disappearing_message_duration_secs: self
+                .disappearing_message_duration_secs
+                .map_or_else(Vec::new, |d| d.to_be_bytes().to_vec()),
         }
     }
 }
@@ -529,6 +560,7 @@ mod tests {
             Some(image_key),
             Some(image_nonce),
             Some(generate_random_bytes(32).try_into().unwrap()), // image_upload_key for v2
+            None, // disappearing_message_duration_secs
         )
     }
 
@@ -701,6 +733,7 @@ mod tests {
             Some(test_key),
             Some(test_nonce),
             Some([4u8; 32]), // image_upload_key
+            None,            // disappearing_message_duration_secs
         );
 
         // Create extension with None values
@@ -713,6 +746,7 @@ mod tests {
             None,
             None,
             None, // image_upload_key
+            None, // disappearing_message_duration_secs
         );
 
         // Serialize both to measure size
@@ -757,6 +791,7 @@ mod tests {
             None,
             None,
             None,
+            None, // disappearing_message_duration_secs
         );
 
         // Verify version is set to current version
@@ -803,6 +838,7 @@ mod tests {
             image_key: Vec::new(),
             image_nonce: Vec::new(),
             image_upload_key: Vec::new(),
+            disappearing_message_duration_secs: Vec::new(),
         };
 
         let result = NostrGroupDataExtension::from_raw(raw_v0);
@@ -823,6 +859,7 @@ mod tests {
             image_key: Vec::new(),
             image_nonce: Vec::new(),
             image_upload_key: Vec::new(),
+            disappearing_message_duration_secs: Vec::new(),
         };
 
         let result = NostrGroupDataExtension::from_raw(raw_v1);
@@ -841,6 +878,7 @@ mod tests {
             image_key: Vec::new(),
             image_nonce: Vec::new(),
             image_upload_key: Vec::new(),
+            disappearing_message_duration_secs: Vec::new(),
         };
 
         let result = NostrGroupDataExtension::from_raw(raw_v99);
@@ -899,6 +937,10 @@ mod tests {
         assert_eq!(deserialized.image_key, extension.image_key);
         assert_eq!(deserialized.image_nonce, extension.image_nonce);
         assert_eq!(deserialized.image_upload_key, extension.image_upload_key);
+        assert_eq!(
+            deserialized.disappearing_message_duration_secs,
+            extension.disappearing_message_duration_secs
+        );
     }
 
     /// Test that deserialize_bytes returns an error for invalid data
@@ -959,6 +1001,7 @@ mod tests {
             Some([2u8; 32]),
             Some([3u8; 12]),
             None, // v1 doesn't use image_upload_key
+            None, // disappearing_message_duration_secs
         );
 
         assert_eq!(extension.version, NostrGroupDataExtension::CURRENT_VERSION);
@@ -996,6 +1039,7 @@ mod tests {
             Some([2u8; 32]),
             Some([3u8; 12]),
             None,
+            None, // disappearing_message_duration_secs
         );
         extension2.version = 1;
 
@@ -1024,6 +1068,7 @@ mod tests {
             Some([2u8; 32]),
             Some([3u8; 12]),
             Some([4u8; 32]), // image_upload_key for v2
+            None,            // disappearing_message_duration_secs
         );
 
         assert_eq!(extension.version, NostrGroupDataExtension::CURRENT_VERSION);
@@ -1063,6 +1108,7 @@ mod tests {
             Some([2u8; 32]),
             Some([3u8; 12]),
             None,
+            None, // disappearing_message_duration_secs
         );
         extension.version = 1;
 

@@ -68,6 +68,8 @@ pub struct NostrGroupConfigData {
     pub relays: Vec<RelayUrl>,
     /// Group admins
     pub admins: Vec<PublicKey>,
+    /// Disappearing message duration in seconds (None = disabled, Some(n) = n seconds)
+    pub disappearing_message_duration_secs: Option<u64>,
 }
 
 /// Configuration for updating group data with optional fields
@@ -91,6 +93,8 @@ pub struct NostrGroupDataUpdate {
     pub admins: Option<Vec<PublicKey>>,
     /// Nostr group ID for message routing (optional, for rotation per MIP-01)
     pub nostr_group_id: Option<[u8; 32]>,
+    /// Disappearing message duration in seconds (optional, use Some(None) to disable)
+    pub disappearing_message_duration_secs: Option<Option<u64>>,
 }
 
 /// Pending member changes from proposals that need admin approval
@@ -145,6 +149,7 @@ pub struct RatchetTreeInfo {
 
 impl NostrGroupConfigData {
     /// Creates NostrGroupConfigData
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         name: String,
         description: String,
@@ -153,6 +158,7 @@ impl NostrGroupConfigData {
         image_nonce: Option<[u8; 12]>,
         relays: Vec<RelayUrl>,
         admins: Vec<PublicKey>,
+        disappearing_message_duration_secs: Option<u64>,
     ) -> Self {
         Self {
             name,
@@ -162,6 +168,7 @@ impl NostrGroupConfigData {
             image_nonce,
             relays,
             admins,
+            disappearing_message_duration_secs,
         }
     }
 }
@@ -191,6 +198,8 @@ impl NostrGroupDataUpdate {
         admins: Vec<PublicKey>;
         /// Sets the nostr_group_id to be updated (for ID rotation per MIP-01)
         nostr_group_id: [u8; 32];
+        /// Sets the disappearing message duration (use None to disable)
+        disappearing_message_duration_secs: Option<u64>;
     }
 }
 
@@ -1057,6 +1066,13 @@ where
         group_id: &GroupId,
         update: NostrGroupDataUpdate,
     ) -> Result<UpdateGroupResult, Error> {
+        // Validate disappearing message duration: Some(0) is not allowed
+        if let Some(Some(0)) = update.disappearing_message_duration_secs {
+            return Err(Error::Group(
+                "Disappearing message duration must be greater than 0 seconds".to_string(),
+            ));
+        }
+
         let mut mls_group = self.load_mls_group(group_id)?.ok_or(Error::GroupNotFound)?;
 
         let mut group_data = NostrGroupDataExtension::from_group(&mls_group)?;
@@ -1103,6 +1119,10 @@ where
 
         if let Some(nostr_group_id) = update.nostr_group_id {
             group_data.nostr_group_id = nostr_group_id;
+        }
+
+        if let Some(duration) = update.disappearing_message_duration_secs {
+            group_data.disappearing_message_duration_secs = duration;
         }
 
         self.update_group_data_extension(&mut mls_group, group_id, &group_data)
@@ -1178,6 +1198,13 @@ where
         member_key_package_events: Vec<Event>,
         config: NostrGroupConfigData,
     ) -> Result<GroupResult, Error> {
+        // Validate disappearing message duration: Some(0) is not allowed
+        if config.disappearing_message_duration_secs == Some(0) {
+            return Err(Error::Group(
+                "Disappearing message duration must be greater than 0 seconds".to_string(),
+            ));
+        }
+
         // Get member pubkeys
         let member_pubkeys = member_key_package_events
             .clone()
@@ -1201,6 +1228,7 @@ where
             config.image_key,
             config.image_nonce,
             None, // image_upload_key - will be set when image is uploaded
+            config.disappearing_message_duration_secs,
         );
 
         let extension = Self::get_unknown_extension_from_group_data(&group_data)?;
@@ -1301,6 +1329,7 @@ where
             image_key: config.image_key.map(mdk_storage_traits::Secret::new),
             image_nonce: config.image_nonce.map(mdk_storage_traits::Secret::new),
             self_update_state: group_types::SelfUpdateState::CompletedAt(Timestamp::now()),
+            disappearing_message_duration_secs: group_data.disappearing_message_duration_secs,
         };
 
         self.storage().save_group(group.clone()).map_err(
@@ -1797,6 +1826,8 @@ where
         stored_group.image_nonce = group_data.image_nonce.map(mdk_storage_traits::Secret::new);
         stored_group.admin_pubkeys = group_data.admins;
         stored_group.nostr_group_id = group_data.nostr_group_id;
+        stored_group.disappearing_message_duration_secs =
+            group_data.disappearing_message_duration_secs;
 
         // Sync relays atomically - replace entire relay set with current extension data
         self.storage()

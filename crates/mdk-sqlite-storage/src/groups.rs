@@ -219,8 +219,8 @@ impl GroupStorage for MdkSqliteStorage {
             conn.execute(
                 "INSERT INTO groups
              (mls_group_id, nostr_group_id, name, description, image_hash, image_key, image_nonce, admin_pubkeys, last_message_id,
-              last_message_at, last_message_processed_at, epoch, state, last_self_update_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              last_message_at, last_message_processed_at, epoch, state, last_self_update_at, disappearing_message_duration_secs)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(mls_group_id) DO UPDATE SET
                 nostr_group_id = excluded.nostr_group_id,
                 name = excluded.name,
@@ -234,7 +234,8 @@ impl GroupStorage for MdkSqliteStorage {
                 last_message_processed_at = excluded.last_message_processed_at,
                 epoch = excluded.epoch,
                 state = excluded.state,
-                last_self_update_at = excluded.last_self_update_at",
+                last_self_update_at = excluded.last_self_update_at,
+                disappearing_message_duration_secs = excluded.disappearing_message_duration_secs",
                 params![
                     &group.mls_group_id.as_slice(),
                     &group.nostr_group_id,
@@ -249,7 +250,8 @@ impl GroupStorage for MdkSqliteStorage {
                     &last_message_processed_at,
                     &(group.epoch as i64),
                     group.state.as_str(),
-                    &last_self_update_at
+                    &last_self_update_at,
+                    &group.disappearing_message_duration_secs.map(|d| d as i64)
                 ],
             )
             .map_err(into_group_err)?;
@@ -452,6 +454,7 @@ mod tests {
             image_key,
             image_nonce,
             self_update_state: SelfUpdateState::Required,
+            disappearing_message_duration_secs: None,
         };
 
         // Save the group
@@ -500,6 +503,7 @@ mod tests {
             image_key: None,
             image_nonce: None,
             self_update_state: SelfUpdateState::Required,
+            disappearing_message_duration_secs: None,
         };
 
         // Should fail due to name length
@@ -536,6 +540,7 @@ mod tests {
             image_key: None,
             image_nonce: None,
             self_update_state: SelfUpdateState::Required,
+            disappearing_message_duration_secs: None,
         };
 
         // Should fail due to description length
@@ -575,6 +580,7 @@ mod tests {
             image_key: None,
             image_nonce: None,
             self_update_state: SelfUpdateState::Required,
+            disappearing_message_duration_secs: None,
         };
 
         storage.save_group(group).unwrap();
@@ -706,6 +712,7 @@ mod tests {
             image_key: None,
             image_nonce: None,
             self_update_state: SelfUpdateState::Required,
+            disappearing_message_duration_secs: None,
         };
 
         // Save the group
@@ -793,6 +800,7 @@ mod tests {
             image_key: None,
             image_nonce: None,
             self_update_state: SelfUpdateState::Required,
+            disappearing_message_duration_secs: None,
         };
         storage.save_group(group1).unwrap();
 
@@ -813,6 +821,7 @@ mod tests {
             image_key: None,
             image_nonce: None,
             self_update_state: SelfUpdateState::Required,
+            disappearing_message_duration_secs: None,
         };
         storage.save_group(group2).unwrap();
 
