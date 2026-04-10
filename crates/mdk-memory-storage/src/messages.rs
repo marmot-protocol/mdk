@@ -3,9 +3,9 @@
 use std::collections::HashMap;
 
 use mdk_storage_traits::GroupId;
-use nostr::EventId;
+use nostr::{EventId, Timestamp};
 #[cfg(test)]
-use nostr::{Kind, Tags, Timestamp, UnsignedEvent};
+use nostr::{Kind, Tags, UnsignedEvent};
 
 use mdk_storage_traits::groups::GroupStorage;
 use mdk_storage_traits::messages::MessageStorage;
@@ -295,6 +295,107 @@ impl MessageStorage for MdkMemoryStorage {
 
         Ok(count)
     }
+
+    fn delete_message(&self, group_id: &GroupId, event_id: &EventId) -> Result<bool, MessageError> {
+        let mut guard = self.inner.write();
+        let inner = &mut *guard;
+
+        // Remove from per-group index
+        let mut found = false;
+        if let Some(group_messages) = inner.messages_by_group_cache.get_mut(group_id) {
+            found = group_messages.remove(event_id).is_some();
+        }
+
+        // Remove from messages_cache only if the entry belongs to the same group
+        // (prevents evicting another group's message with a coincident EventId).
+        let belongs_to_group = inner
+            .messages_cache
+            .get(event_id)
+            .is_some_and(|msg| &msg.mls_group_id == group_id);
+
+        if belongs_to_group {
+            inner.messages_cache.pop(event_id);
+            found = true;
+        }
+
+        Ok(found)
+    }
+
+    fn delete_messages_before_timestamp(
+        &self,
+        group_id: &GroupId,
+        before: Timestamp,
+    ) -> Result<usize, MessageError> {
+        let mut guard = self.inner.write();
+        let inner = &mut *guard;
+
+        // Collect event IDs of messages to remove from the per-group index
+        let to_remove: Vec<EventId> =
+            if let Some(group_messages) = inner.messages_by_group_cache.get_mut(group_id) {
+                group_messages
+                    .iter()
+                    .filter(|(_, msg)| msg.created_at < before)
+                    .map(|(eid, _)| *eid)
+                    .collect()
+            } else {
+                Vec::new()
+            };
+
+        // Also scan messages_cache for orphaned entries (LRU divergence)
+        let orphaned: Vec<EventId> = inner
+            .messages_cache
+            .iter()
+            .filter(|(_, msg)| &msg.mls_group_id == group_id && msg.created_at < before)
+            .map(|(eid, _)| *eid)
+            .collect();
+
+        // Merge both sets, dedup via a small set
+        let mut all_ids: std::collections::HashSet<EventId> = to_remove.iter().copied().collect();
+        all_ids.extend(orphaned.iter().copied());
+
+        // Remove from per-group index
+        if let Some(group_messages) = inner.messages_by_group_cache.get_mut(group_id) {
+            for eid in &all_ids {
+                group_messages.remove(eid);
+            }
+        }
+
+        // Remove from messages_cache only when the entry belongs to this group
+        // (prevents evicting another group's entry with a coincident EventId).
+        for eid in &all_ids {
+            let belongs = inner
+                .messages_cache
+                .get(eid)
+                .is_some_and(|msg| &msg.mls_group_id == group_id);
+            if belongs {
+                inner.messages_cache.pop(eid);
+            }
+        }
+
+        Ok(all_ids.len())
+    }
+
+    fn delete_processed_messages_for_group(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<usize, MessageError> {
+        let mut guard = self.inner.write();
+        let inner = &mut *guard;
+
+        let to_remove: Vec<EventId> = inner
+            .processed_messages_cache
+            .iter()
+            .filter(|(_, pm)| pm.mls_group_id.as_ref() == Some(group_id))
+            .map(|(eid, _)| *eid)
+            .collect();
+
+        let count = to_remove.len();
+        for event_id in &to_remove {
+            inner.processed_messages_cache.pop(event_id);
+        }
+
+        Ok(count)
+    }
 }
 
 #[cfg(test)]
@@ -329,6 +430,7 @@ mod tests {
             image_key: None,
             image_nonce: None,
             self_update_state: SelfUpdateState::Required,
+            disappearing_message_duration_secs: None,
         }
     }
 
@@ -1123,6 +1225,217 @@ mod tests {
                 .find_message_by_event_id(&group_id, &eid)
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn delete_messages_for_group_preserves_processed_messages() {
+        use mdk_storage_traits::messages::types::{ProcessedMessage, ProcessedMessageState};
+
+        let storage = MdkMemoryStorage::default();
+        let group_id = GroupId::from_slice(&[10, 20, 30]);
+        storage
+            .save_group(create_test_group(group_id.clone()))
+            .unwrap();
+
+        let eid = EventId::from_slice(&[1u8; 32]).unwrap();
+        storage
+            .save_message(create_test_message(eid, group_id.clone(), "msg", 100))
+            .unwrap();
+
+        let wrapper_eid = EventId::from_slice(&[0xEEu8; 32]).unwrap();
+        let pm = ProcessedMessage {
+            wrapper_event_id: wrapper_eid,
+            message_event_id: None,
+            processed_at: Timestamp::from(100u64),
+            epoch: Some(1),
+            mls_group_id: Some(group_id.clone()),
+            state: ProcessedMessageState::Processed,
+            failure_reason: None,
+        };
+        storage.save_processed_message(pm).unwrap();
+
+        storage.delete_messages_for_group(&group_id).unwrap();
+
+        // Processed message is preserved (deduplication guard)
+        assert!(
+            storage
+                .find_processed_message_by_event_id(&wrapper_eid)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn delete_single_message() {
+        let storage = MdkMemoryStorage::default();
+        let group_id = GroupId::from_slice(&[10, 20, 30]);
+        storage
+            .save_group(create_test_group(group_id.clone()))
+            .unwrap();
+
+        let eid1 = EventId::from_slice(&[1u8; 32]).unwrap();
+        let eid2 = EventId::from_slice(&[2u8; 32]).unwrap();
+        storage
+            .save_message(create_test_message(eid1, group_id.clone(), "msg1", 100))
+            .unwrap();
+        storage
+            .save_message(create_test_message(eid2, group_id.clone(), "msg2", 101))
+            .unwrap();
+
+        let deleted = storage.delete_message(&group_id, &eid1).unwrap();
+        assert!(deleted);
+
+        // eid1 is gone, eid2 remains
+        assert!(
+            storage
+                .find_message_by_event_id(&group_id, &eid1)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            storage
+                .find_message_by_event_id(&group_id, &eid2)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn delete_single_message_not_found() {
+        let storage = MdkMemoryStorage::default();
+        let group_id = GroupId::from_slice(&[10, 20, 30]);
+        storage
+            .save_group(create_test_group(group_id.clone()))
+            .unwrap();
+
+        let missing_eid = EventId::from_slice(&[0xFFu8; 32]).unwrap();
+        let deleted = storage.delete_message(&group_id, &missing_eid).unwrap();
+        assert!(!deleted);
+    }
+
+    #[test]
+    fn delete_messages_before_timestamp() {
+        let storage = MdkMemoryStorage::default();
+        let group_id = GroupId::from_slice(&[10, 20, 30]);
+        storage
+            .save_group(create_test_group(group_id.clone()))
+            .unwrap();
+
+        // Create messages at timestamps 100, 200, 300
+        let eid1 = EventId::from_slice(&[1u8; 32]).unwrap();
+        let eid2 = EventId::from_slice(&[2u8; 32]).unwrap();
+        let eid3 = EventId::from_slice(&[3u8; 32]).unwrap();
+        storage
+            .save_message(create_test_message(eid1, group_id.clone(), "old", 100))
+            .unwrap();
+        storage
+            .save_message(create_test_message(eid2, group_id.clone(), "mid", 200))
+            .unwrap();
+        storage
+            .save_message(create_test_message(eid3, group_id.clone(), "new", 300))
+            .unwrap();
+
+        // Delete messages created before timestamp 250
+        let deleted = storage
+            .delete_messages_before_timestamp(&group_id, Timestamp::from(250u64))
+            .unwrap();
+        assert_eq!(deleted, 2);
+
+        // Only the newest message remains
+        assert!(
+            storage
+                .find_message_by_event_id(&group_id, &eid1)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            storage
+                .find_message_by_event_id(&group_id, &eid2)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            storage
+                .find_message_by_event_id(&group_id, &eid3)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn delete_messages_before_timestamp_none_match() {
+        let storage = MdkMemoryStorage::default();
+        let group_id = GroupId::from_slice(&[10, 20, 30]);
+        storage
+            .save_group(create_test_group(group_id.clone()))
+            .unwrap();
+
+        let eid = EventId::from_slice(&[1u8; 32]).unwrap();
+        storage
+            .save_message(create_test_message(eid, group_id.clone(), "msg", 500))
+            .unwrap();
+
+        // Before = 100, but message is at 500 — nothing deleted
+        let deleted = storage
+            .delete_messages_before_timestamp(&group_id, Timestamp::from(100u64))
+            .unwrap();
+        assert_eq!(deleted, 0);
+        assert!(
+            storage
+                .find_message_by_event_id(&group_id, &eid)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn delete_processed_messages_for_group() {
+        use mdk_storage_traits::messages::types::{ProcessedMessage, ProcessedMessageState};
+
+        let storage = MdkMemoryStorage::default();
+        let group_a = GroupId::from_slice(&[1, 1, 1]);
+        let group_b = GroupId::from_slice(&[2, 2, 2]);
+
+        let pm_a = ProcessedMessage {
+            wrapper_event_id: EventId::from_slice(&[0xAAu8; 32]).unwrap(),
+            message_event_id: None,
+            processed_at: Timestamp::from(100u64),
+            epoch: Some(1),
+            mls_group_id: Some(group_a.clone()),
+            state: ProcessedMessageState::Processed,
+            failure_reason: None,
+        };
+        let pm_b = ProcessedMessage {
+            wrapper_event_id: EventId::from_slice(&[0xBBu8; 32]).unwrap(),
+            message_event_id: None,
+            processed_at: Timestamp::from(100u64),
+            epoch: Some(1),
+            mls_group_id: Some(group_b.clone()),
+            state: ProcessedMessageState::Processed,
+            failure_reason: None,
+        };
+        storage.save_processed_message(pm_a).unwrap();
+        storage.save_processed_message(pm_b).unwrap();
+
+        let deleted = storage
+            .delete_processed_messages_for_group(&group_a)
+            .unwrap();
+        assert_eq!(deleted, 1);
+
+        // group_a's processed message is gone
+        assert!(
+            storage
+                .find_processed_message_by_event_id(&EventId::from_slice(&[0xAAu8; 32]).unwrap())
+                .unwrap()
+                .is_none()
+        );
+        // group_b's processed message still exists
+        assert!(
+            storage
+                .find_processed_message_by_event_id(&EventId::from_slice(&[0xBBu8; 32]).unwrap())
+                .unwrap()
+                .is_some()
         );
     }
 }

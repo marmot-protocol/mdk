@@ -816,6 +816,7 @@ impl Mdk {
             None, // image_nonce
             relay_urls,
             admin_pubkeys,
+            None, // disappearing_message_duration_secs
         );
 
         let mdk = self.lock()?;
@@ -959,10 +960,57 @@ impl Mdk {
     }
 
     /// Delete all locally stored messages for a group.
+    ///
+    /// Processed message records are preserved to prevent reprocessing.
     pub fn delete_messages_for_group(&self, mls_group_id: String) -> Result<u32, MdkUniffiError> {
         let group_id = parse_group_id(&mls_group_id)?;
         let mdk = self.lock()?;
         let count = mdk.delete_messages_for_group(&group_id)?;
+        Ok(count as u32)
+    }
+
+    /// Delete a single message by event ID within a group.
+    ///
+    /// Returns true if the message was found and deleted, false if not found.
+    pub fn delete_message(
+        &self,
+        mls_group_id: String,
+        event_id: String,
+    ) -> Result<bool, MdkUniffiError> {
+        let group_id = parse_group_id(&mls_group_id)?;
+        let eid = nostr::EventId::parse(&event_id)
+            .map_err(|e| MdkUniffiError::InvalidInput(e.to_string()))?;
+        let mdk = self.lock()?;
+        let deleted = mdk.delete_message(&group_id, &eid)?;
+        Ok(deleted)
+    }
+
+    /// Delete all messages in a group created before the given Unix timestamp.
+    ///
+    /// Intended for disappearing-message cleanup. Returns the number of
+    /// messages deleted.
+    pub fn delete_messages_before_timestamp(
+        &self,
+        mls_group_id: String,
+        before_secs: u64,
+    ) -> Result<u32, MdkUniffiError> {
+        let group_id = parse_group_id(&mls_group_id)?;
+        let before = nostr::Timestamp::from(before_secs);
+        let mdk = self.lock()?;
+        let count = mdk.delete_messages_before_timestamp(&group_id, before)?;
+        Ok(count as u32)
+    }
+
+    /// Delete all processed message records for a group.
+    ///
+    /// Returns the number of records deleted.
+    pub fn delete_processed_messages_for_group(
+        &self,
+        mls_group_id: String,
+    ) -> Result<u32, MdkUniffiError> {
+        let group_id = parse_group_id(&mls_group_id)?;
+        let mdk = self.lock()?;
+        let count = mdk.delete_processed_messages_for_group(&group_id)?;
         Ok(count as u32)
     }
 
@@ -1035,6 +1083,10 @@ impl Mdk {
                 .map(|a| parse_public_key(a))
                 .collect::<Result<_, _>>()?;
             group_update = group_update.admins(admin_pubkeys);
+        }
+
+        if let Some(duration) = update.disappearing_message_duration.to_core() {
+            group_update = group_update.disappearing_message_duration_secs(duration);
         }
 
         let mdk = self.lock()?;
@@ -1275,6 +1327,38 @@ pub struct UpdateGroupResult {
     pub mls_group_id: String,
 }
 
+/// Tri-state for the disappearing message duration field in group updates.
+///
+/// This replaces `Option<Option<u64>>` which UniFFI flattens in Kotlin/Swift,
+/// making the "not changing" vs "disabling" distinction impossible.
+#[derive(uniffi::Enum)]
+pub enum DisappearingMessageDuration {
+    /// Do not change the current setting (field absent from the update).
+    Unchanged,
+    /// Disable disappearing messages (set to `None`).
+    Disabled,
+    /// Enable disappearing messages with the given duration in seconds (`n > 0`).
+    Enabled {
+        /// Duration in seconds after which messages expire.
+        duration_secs: u64,
+    },
+}
+
+impl DisappearingMessageDuration {
+    /// Converts to the nested-`Option` representation used by the core API.
+    ///
+    /// - `Unchanged` → `None` (outer: field not being updated)
+    /// - `Disabled`  → `Some(None)` (set to disabled)
+    /// - `Enabled`   → `Some(Some(n))`
+    fn to_core(&self) -> Option<Option<u64>> {
+        match self {
+            Self::Unchanged => None,
+            Self::Disabled => Some(None),
+            Self::Enabled { duration_secs } => Some(Some(*duration_secs)),
+        }
+    }
+}
+
 /// Configuration for updating group data with optional fields
 #[derive(uniffi::Record)]
 pub struct GroupDataUpdate {
@@ -1292,6 +1376,8 @@ pub struct GroupDataUpdate {
     pub relays: Option<Vec<String>>,
     /// Group admins (optional)
     pub admins: Option<Vec<String>>,
+    /// Disappearing message duration setting
+    pub disappearing_message_duration: DisappearingMessageDuration,
 }
 
 /// Result of processing a message
@@ -1430,6 +1516,11 @@ pub struct Group {
     /// - `"required"`: Must perform a post-join self-update (MIP-02).
     /// - `"completed_at:<unix_timestamp>"`: Last self-update merged at this time (MIP-00).
     pub self_update_state: String,
+    /// Disappearing message duration in seconds
+    ///
+    /// - `None`: Messages persist forever (disabled)
+    /// - `Some(n)`: Messages expire `n` seconds after creation (`n > 0`)
+    pub disappearing_message_duration_secs: Option<u64>,
 }
 
 impl From<group_types::Group> for Group {
@@ -1454,6 +1545,7 @@ impl From<group_types::Group> for Group {
                     format!("completed_at:{}", ts.as_secs())
                 }
             },
+            disappearing_message_duration_secs: g.disappearing_message_duration_secs,
         }
     }
 }
@@ -3072,6 +3164,7 @@ mod tests {
             image_nonce: None,
             relays: None,
             admins: None,
+            disappearing_message_duration: DisappearingMessageDuration::Unchanged,
         };
         let result = mdk.update_group_data(invalid_group_id, update);
         assert!(matches!(result, Err(MdkUniffiError::InvalidInput(_))));
@@ -3089,6 +3182,7 @@ mod tests {
             image_nonce: None,
             relays: Some(vec!["not_a_valid_url".to_string()]),
             admins: None,
+            disappearing_message_duration: DisappearingMessageDuration::Unchanged,
         };
         let result = mdk.update_group_data(fake_group_id, update);
         assert!(matches!(result, Err(MdkUniffiError::InvalidInput(_))));
@@ -3106,6 +3200,7 @@ mod tests {
             image_nonce: None,
             relays: None,
             admins: Some(vec!["not_valid_hex".to_string()]),
+            disappearing_message_duration: DisappearingMessageDuration::Unchanged,
         };
         let result = mdk.update_group_data(fake_group_id, update);
         assert!(matches!(result, Err(MdkUniffiError::InvalidInput(_))));

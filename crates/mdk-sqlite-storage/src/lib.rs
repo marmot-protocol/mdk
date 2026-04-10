@@ -579,6 +579,10 @@ impl MdkSqliteStorage {
         // Enable foreign keys (after encryption is set up)
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
 
+        // Overwrite deleted content with zeros so that forensic recovery of
+        // expired/deleted messages from the database file is not possible.
+        conn.execute_batch("PRAGMA secure_delete = ON;")?;
+
         Ok(conn)
     }
 
@@ -649,6 +653,10 @@ impl MdkSqliteStorage {
 
         // Enable foreign keys
         connection.execute_batch("PRAGMA foreign_keys = ON;")?;
+
+        // Overwrite deleted content with zeros so that forensic recovery of
+        // expired/deleted messages from the database file is not possible.
+        connection.execute_batch("PRAGMA secure_delete = ON;")?;
 
         // Run all migrations (both OpenMLS tables and MDK tables)
         migrations::run_migrations(&mut connection)?;
@@ -1877,6 +1885,7 @@ mod tests {
             image_key: None,
             image_nonce: None,
             self_update_state: SelfUpdateState::Required,
+            disappearing_message_duration_secs: None,
         };
 
         // Save the group
@@ -2007,6 +2016,7 @@ mod tests {
             image_key: None,
             image_nonce: None,
             self_update_state: SelfUpdateState::Required,
+            disappearing_message_duration_secs: None,
         };
         storage.save_group(group).unwrap();
 
@@ -2247,6 +2257,7 @@ mod tests {
                     image_key: None,
                     image_nonce: None,
                     self_update_state: SelfUpdateState::Required,
+                    disappearing_message_duration_secs: None,
                 };
 
                 storage.save_group(group).unwrap();
@@ -2415,6 +2426,7 @@ mod tests {
                     image_key: None,
                     image_nonce: None,
                     self_update_state: SelfUpdateState::Required,
+                    disappearing_message_duration_secs: None,
                 };
                 storage.save_group(group).unwrap();
 
@@ -3290,6 +3302,7 @@ mod tests {
                 image_key: None,
                 image_nonce: None,
                 self_update_state: SelfUpdateState::Required,
+                disappearing_message_duration_secs: None,
             }
         }
 
@@ -3768,6 +3781,7 @@ mod tests {
                 image_key: None,
                 image_nonce: None,
                 self_update_state: SelfUpdateState::Required,
+                disappearing_message_duration_secs: None,
             };
             storage.save_group(group).unwrap();
 
@@ -3823,6 +3837,7 @@ mod tests {
                 image_key: None,
                 image_nonce: None,
                 self_update_state: SelfUpdateState::Required,
+                disappearing_message_duration_secs: None,
             };
             let g2 = Group {
                 mls_group_id: group2.clone(),
@@ -3872,6 +3887,7 @@ mod tests {
                 image_key: None,
                 image_nonce: None,
                 self_update_state: SelfUpdateState::Required,
+                disappearing_message_duration_secs: None,
             };
             storage.save_group(group).unwrap();
 
@@ -3918,6 +3934,7 @@ mod tests {
                 image_key: None,
                 image_nonce: None,
                 self_update_state: SelfUpdateState::Required,
+                disappearing_message_duration_secs: None,
             };
             storage.save_group(group).unwrap();
 
@@ -3962,6 +3979,7 @@ mod tests {
                 image_key: None,
                 image_nonce: None,
                 self_update_state: SelfUpdateState::Required,
+                disappearing_message_duration_secs: None,
             };
             storage.save_group(group).unwrap();
 
@@ -4027,6 +4045,7 @@ mod tests {
                 image_key: None,
                 image_nonce: None,
                 self_update_state: SelfUpdateState::Required,
+                disappearing_message_duration_secs: None,
             }
         }
 
@@ -4670,6 +4689,7 @@ mod tests {
                 image_key: None,
                 image_nonce: None,
                 self_update_state: SelfUpdateState::Required,
+                disappearing_message_duration_secs: None,
             };
             storage.save_group(group).unwrap();
 

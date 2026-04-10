@@ -244,6 +244,9 @@ where
                 .as_u64(),
             state: group_types::GroupState::Pending,
             self_update_state: group_types::SelfUpdateState::Required,
+            disappearing_message_duration_secs: welcome_preview
+                .nostr_group_data
+                .disappearing_message_duration_secs,
         };
 
         let mls_group_id = group.mls_group_id.clone();
