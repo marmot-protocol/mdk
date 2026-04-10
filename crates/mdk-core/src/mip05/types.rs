@@ -33,14 +33,11 @@ impl NotificationPlatform {
         }
     }
 
-    pub(crate) fn validate_device_token_len(self, len: usize) -> Result<(), Mip05Error> {
-        match self {
-            Self::Apns if len == 32 => Ok(()),
-            Self::Fcm if (1..=200).contains(&len) => Ok(()),
-            Self::Apns => Err(Mip05Error::InvalidApnsTokenLength),
-            Self::Fcm => Err(Mip05Error::InvalidFcmTokenLength),
-        }
-    }
+    /// Maximum device token length that fits the MIP-05 wire format.
+    ///
+    /// Equal to `TOKEN_PLAINTEXT_LEN` minus the 3-byte header (1 byte platform
+    /// + 2 bytes length).
+    pub const MAX_DEVICE_TOKEN_LEN: usize = super::TOKEN_PLAINTEXT_LEN - 3;
 }
 
 /// Parsed MIP-05 token plaintext.
@@ -53,8 +50,15 @@ pub struct PushTokenPlaintext {
 
 impl PushTokenPlaintext {
     /// Construct a validated token plaintext.
+    ///
+    /// Device tokens are treated as opaque bytes. The only requirement is that
+    /// the token is non-empty and fits within the MIP-05 wire format.
     pub fn new(platform: NotificationPlatform, device_token: Vec<u8>) -> Result<Self, Mip05Error> {
-        platform.validate_device_token_len(device_token.len())?;
+        if device_token.is_empty()
+            || device_token.len() > NotificationPlatform::MAX_DEVICE_TOKEN_LEN
+        {
+            return Err(Mip05Error::InvalidDeviceTokenLength);
+        }
         Ok(Self {
             platform,
             device_token,
@@ -99,8 +103,6 @@ impl PushTokenPlaintext {
 
         let platform = NotificationPlatform::from_byte(bytes[0])?;
         let token_len = usize::from(u16::from_be_bytes([bytes[1], bytes[2]]));
-        platform.validate_device_token_len(token_len)?;
-
         let token_end = 3 + token_len;
         if token_end > TOKEN_PLAINTEXT_LEN {
             return Err(Mip05Error::InvalidTokenLength);
@@ -241,14 +243,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_push_token_plaintext_validates_platform_lengths() {
-        assert!(PushTokenPlaintext::new(NotificationPlatform::Apns, vec![0u8; 32]).is_ok());
-        assert!(PushTokenPlaintext::new(NotificationPlatform::Fcm, vec![0u8; 1]).is_ok());
-        assert!(PushTokenPlaintext::new(NotificationPlatform::Fcm, vec![0u8; 200]).is_ok());
+    fn test_push_token_plaintext_validates_device_token_length() {
+        const MAX: usize = NotificationPlatform::MAX_DEVICE_TOKEN_LEN;
 
-        assert!(PushTokenPlaintext::new(NotificationPlatform::Apns, vec![0u8; 31]).is_err());
-        assert!(PushTokenPlaintext::new(NotificationPlatform::Fcm, vec![]).is_err());
-        assert!(PushTokenPlaintext::new(NotificationPlatform::Fcm, vec![0u8; 201]).is_err());
+        // All platforms accept any non-empty token that fits the wire format.
+        for platform in [NotificationPlatform::Apns, NotificationPlatform::Fcm] {
+            assert!(PushTokenPlaintext::new(platform, vec![0u8; 1]).is_ok());
+            assert!(PushTokenPlaintext::new(platform, vec![0u8; 32]).is_ok());
+            assert!(PushTokenPlaintext::new(platform, vec![0u8; 200]).is_ok());
+            assert!(PushTokenPlaintext::new(platform, vec![0u8; 500]).is_ok());
+            assert!(PushTokenPlaintext::new(platform, vec![0u8; MAX]).is_ok());
+
+            // Empty tokens are rejected.
+            assert_eq!(
+                PushTokenPlaintext::new(platform, vec![]).unwrap_err(),
+                Mip05Error::InvalidDeviceTokenLength,
+            );
+
+            // Tokens exceeding the wire-format capacity are rejected.
+            assert_eq!(
+                PushTokenPlaintext::new(platform, vec![0u8; MAX + 1]).unwrap_err(),
+                Mip05Error::InvalidDeviceTokenLength,
+            );
+        }
     }
 
     #[test]
