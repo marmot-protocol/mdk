@@ -251,7 +251,7 @@ impl GroupStorage for MdkSqliteStorage {
                     &(group.epoch as i64),
                     group.state.as_str(),
                     &last_self_update_at,
-                    &group.disappearing_message_duration_secs.map(|d| d as i64)
+                    &group.disappearing_message_duration_secs.and_then(|d| i64::try_from(d).ok())
                 ],
             )
             .map_err(into_group_err)?;
