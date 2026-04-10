@@ -16,7 +16,7 @@ use tls_codec::{
 use crate::constant::NOSTR_GROUP_DATA_EXTENSION_TYPE;
 use crate::error::Error;
 
-/// TLS-serializable representation of Nostr Group Data Extension.
+/// TLS-serializable representation of Nostr Group Data Extension (v3+).
 ///
 /// This struct is used exclusively for TLS codec serialization/deserialization
 /// when the extension is transmitted over the MLS protocol. It uses `Vec<u8>`
@@ -48,6 +48,54 @@ pub(crate) struct TlsNostrGroupDataExtension {
     pub image_nonce: Vec<u8>,      // Use Vec<u8> to allow empty for None
     pub image_upload_key: Vec<u8>, // Use Vec<u8> to allow empty for None (v2 only)
     pub disappearing_message_duration_secs: Vec<u8>, // Use Vec<u8>: empty for None, 8 bytes for Some(u64) (v3 only)
+}
+
+/// TLS-serializable representation for v1/v2 payloads (before disappearing messages).
+///
+/// Legacy groups serialized without the `disappearing_message_duration_secs` field
+/// use this struct for deserialization. The missing field is synthesized as an empty
+/// Vec (mapping to `None`) when converting to `TlsNostrGroupDataExtension`.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    TlsSerialize,
+    TlsDeserialize,
+    TlsSerializeBytes,
+    TlsDeserializeBytes,
+    TlsSize,
+)]
+struct TlsNostrGroupDataExtensionV1V2 {
+    pub version: u16,
+    pub nostr_group_id: [u8; 32],
+    pub name: Vec<u8>,
+    pub description: Vec<u8>,
+    pub admin_pubkeys: Vec<[u8; 32]>,
+    pub relays: Vec<Vec<u8>>,
+    pub image_hash: Vec<u8>,
+    pub image_key: Vec<u8>,
+    pub image_nonce: Vec<u8>,
+    pub image_upload_key: Vec<u8>,
+}
+
+impl TlsNostrGroupDataExtensionV1V2 {
+    /// Promote to the v3 struct with the missing field defaulted to empty.
+    fn into_v3(self) -> TlsNostrGroupDataExtension {
+        TlsNostrGroupDataExtension {
+            version: self.version,
+            nostr_group_id: self.nostr_group_id,
+            name: self.name,
+            description: self.description,
+            admin_pubkeys: self.admin_pubkeys,
+            relays: self.relays,
+            image_hash: self.image_hash,
+            image_key: self.image_key,
+            image_nonce: self.image_nonce,
+            image_upload_key: self.image_upload_key,
+            disappearing_message_duration_secs: Vec::new(),
+        }
+    }
 }
 
 /// This is an MLS Group Context extension used to store the group's name,
@@ -166,13 +214,29 @@ impl NostrGroupDataExtension {
     /// * `Ok(NostrGroupDataExtension)` - Successfully deserialized extension
     /// * `Err(Error)` - Failed to deserialize
     fn deserialize_bytes(bytes: &[u8]) -> Result<Self, Error> {
-        let (deserialized, remainder) = TlsNostrGroupDataExtension::tls_deserialize_bytes(bytes)?;
-        if !remainder.is_empty() {
-            return Err(Error::ExtensionFormatError(
-                "Trailing bytes in NostrGroupDataExtension".to_string(),
-            ));
+        // Try the v3 struct first (includes disappearing_message_duration_secs).
+        // If that fails (e.g., legacy v1/v2 payload missing the trailing field),
+        // fall back to the v1/v2 struct and synthesize the missing field as None.
+        match TlsNostrGroupDataExtension::tls_deserialize_bytes(bytes) {
+            Ok((deserialized, remainder)) => {
+                if !remainder.is_empty() {
+                    return Err(Error::ExtensionFormatError(
+                        "Trailing bytes in NostrGroupDataExtension".to_string(),
+                    ));
+                }
+                Self::from_raw(deserialized)
+            }
+            Err(_v3_err) => {
+                let (v1v2, remainder) =
+                    TlsNostrGroupDataExtensionV1V2::tls_deserialize_bytes(bytes)?;
+                if !remainder.is_empty() {
+                    return Err(Error::ExtensionFormatError(
+                        "Trailing bytes in NostrGroupDataExtension".to_string(),
+                    ));
+                }
+                Self::from_raw(v1v2.into_v3())
+            }
         }
-        Self::from_raw(deserialized)
     }
 
     pub(crate) fn from_raw(raw: TlsNostrGroupDataExtension) -> Result<Self, Error> {
@@ -387,29 +451,33 @@ impl NostrGroupDataExtension {
         image_nonce: [u8; 12];
     }
 
-    /// Migrate extension to version 2 format
+    /// Migrate extension to the current version (v3).
     ///
-    /// Updates the extension version to 2. This should be called after migrating
-    /// the group image from v1 to v2 format using `migrate_group_image_v1_to_v2`.
+    /// Updates the extension version to `CURRENT_VERSION` (3). This should be
+    /// called after migrating the group image from v1 to v2 format using
+    /// `migrate_group_image_v1_to_v2`, or when bumping any older extension to
+    /// the latest version.
     ///
     /// # Arguments
     ///
     /// * `new_image_hash` - The new image hash (SHA256 of v2 encrypted image)
-    /// * `new_image_seed` - The new image seed (32 bytes, stored in image_key field for v2)
-    ///   **REQUIRED** when migrating from v1 to v2, as v1 image_key is a direct encryption key,
-    ///   not a seed. Optional when updating an already-v2 extension.
+    /// * `new_image_seed` - The new image seed (32 bytes, stored in image_key field for v2+)
+    ///   **REQUIRED** when migrating from v1, as v1 image_key is a direct encryption key,
+    ///   not a seed. Optional when updating an already-v2+ extension.
     /// * `new_image_nonce` - The new image nonce (12 bytes)
+    /// * `new_image_upload_seed` - The new image upload seed (32 bytes)
     ///
     /// # Warning
     ///
-    /// Migrating from v1 to v2 without providing `new_image_seed` creates a semantic mismatch:
-    /// the version will be set to 2 (expecting seed-based derivation), but the existing
-    /// `image_key` is in v1 format (direct encryption key). This pattern should only be used
-    /// when updating image data for an already-v2 extension.
+    /// Migrating from v1 without providing `new_image_seed` creates a semantic
+    /// mismatch: the version will be set to 3 (expecting seed-based derivation),
+    /// but the existing `image_key` is in v1 format (direct encryption key).
+    /// This pattern should only be used when updating image data for an
+    /// already-v2+ extension.
     ///
     /// # Example
     /// ```ignore
-    /// // Migrate image from v1 to v2
+    /// // Migrate image from v1 to v2+
     /// let v2_prepared = migrate_group_image_v1_to_v2(
     ///     &encrypted_v1_data,
     ///     &v1_extension.image_key.unwrap(),
@@ -423,14 +491,14 @@ impl NostrGroupDataExtension {
     ///     &v2_prepared.upload_keypair
     /// ).await?;
     ///
-    /// // Migrate extension to v2 (MUST provide new seed when migrating from v1)
-    /// extension.migrate_to_v2(
+    /// // Migrate extension to current version (MUST provide new seed when migrating from v1)
+    /// extension.migrate_to_v3(
     ///     Some(new_hash),
-    ///     Some(v2_prepared.image_key), // This is the seed in v2
+    ///     Some(v2_prepared.image_key), // This is the seed in v2+
     ///     Some(v2_prepared.image_nonce)
     /// );
     /// ```
-    pub fn migrate_to_v2(
+    pub fn migrate_to_v3(
         &mut self,
         new_image_hash: Option<[u8; 32]>,
         new_image_seed: Option<[u8; 32]>,
@@ -444,7 +512,7 @@ impl NostrGroupDataExtension {
         {
             tracing::warn!(
                 target: "mdk_core::extension::types",
-                "Migrating from v1 to v2 without new image_seed and image_upload_seed - existing image_key will be treated as seed, which may cause issues since v1 image_key is a direct encryption key, not a seed"
+                "Migrating from v1 to v3 without new image_seed and image_upload_seed - existing image_key will be treated as seed, which may cause issues since v1 image_key is a direct encryption key, not a seed"
             );
         }
         self.version = Self::CURRENT_VERSION;
@@ -985,9 +1053,9 @@ mod tests {
         );
     }
 
-    /// Test migration to version 2
+    /// Test migration to current version (v3)
     #[test]
-    fn test_migrate_to_v2() {
+    fn test_migrate_to_v3() {
         let pk1 = PublicKey::parse(ADMIN_1).unwrap();
         let relay1 = RelayUrl::parse(RELAY_1).unwrap();
 
@@ -1016,14 +1084,14 @@ mod tests {
         let new_nonce = [30u8; 12];
         let new_upload_seed = [40u8; 32];
 
-        extension.migrate_to_v2(
+        extension.migrate_to_v3(
             Some(new_hash),
             Some(new_seed),
             Some(new_nonce),
             Some(new_upload_seed),
         );
 
-        // Verify version is now 2
+        // Verify version is now current
         assert_eq!(extension.version, NostrGroupDataExtension::CURRENT_VERSION);
         assert_eq!(extension.image_hash, Some(new_hash));
         assert_eq!(extension.image_key, Some(new_seed));
@@ -1043,7 +1111,7 @@ mod tests {
         );
         extension2.version = 1;
 
-        extension2.migrate_to_v2(Some(new_hash), None, None, None);
+        extension2.migrate_to_v3(Some(new_hash), None, None, None);
 
         // Version should be updated, but only hash should change
         assert_eq!(extension2.version, NostrGroupDataExtension::CURRENT_VERSION);
@@ -1052,9 +1120,9 @@ mod tests {
         assert_eq!(extension2.image_nonce, Some([3u8; 12])); // Unchanged
     }
 
-    /// Test that migrating an already-v2 extension updates fields correctly
+    /// Test that migrating an already-current extension updates fields correctly
     #[test]
-    fn test_migrate_to_v2_already_v2() {
+    fn test_migrate_to_v3_already_current() {
         let pk1 = PublicKey::parse(ADMIN_1).unwrap();
         let relay1 = RelayUrl::parse(RELAY_1).unwrap();
 
@@ -1073,20 +1141,20 @@ mod tests {
 
         assert_eq!(extension.version, NostrGroupDataExtension::CURRENT_VERSION);
 
-        // Migrate to v2 again (should still work, just update fields)
+        // Migrate again (should still work, just update fields)
         let new_hash = [10u8; 32];
         let new_seed = [20u8; 32];
         let new_nonce = [30u8; 12];
         let new_upload_seed = [40u8; 32];
 
-        extension.migrate_to_v2(
+        extension.migrate_to_v3(
             Some(new_hash),
             Some(new_seed),
             Some(new_nonce),
             Some(new_upload_seed),
         );
 
-        // Version should remain 2, fields should be updated
+        // Version should remain current, fields should be updated
         assert_eq!(extension.version, NostrGroupDataExtension::CURRENT_VERSION);
         assert_eq!(extension.image_hash, Some(new_hash));
         assert_eq!(extension.image_key, Some(new_seed));
@@ -1095,7 +1163,7 @@ mod tests {
 
     /// Test migration with all None values (just version bump)
     #[test]
-    fn test_migrate_to_v2_all_none() {
+    fn test_migrate_to_v3_all_none() {
         let pk1 = PublicKey::parse(ADMIN_1).unwrap();
         let relay1 = RelayUrl::parse(RELAY_1).unwrap();
 
@@ -1113,12 +1181,82 @@ mod tests {
         extension.version = 1;
 
         // Migrate with all None (just version bump)
-        extension.migrate_to_v2(None, None, None, None);
+        extension.migrate_to_v3(None, None, None, None);
 
         // Version should be updated, but fields unchanged
         assert_eq!(extension.version, NostrGroupDataExtension::CURRENT_VERSION);
         assert_eq!(extension.image_hash, Some([1u8; 32]));
         assert_eq!(extension.image_key, Some([2u8; 32]));
         assert_eq!(extension.image_nonce, Some([3u8; 12]));
+    }
+
+    /// Test that legacy v1/v2 TLS payloads (without disappearing_message_duration_secs)
+    /// deserialize successfully with the field defaulting to None.
+    #[test]
+    fn test_deserialize_legacy_v1v2_payload_without_disappearing_field() {
+        use tls_codec::Serialize as TlsSerialize;
+
+        let pk1 = PublicKey::parse(ADMIN_1).unwrap();
+        let relay1 = RelayUrl::parse(RELAY_1).unwrap();
+
+        // Serialize a v1/v2 payload directly — no disappearing_message_duration_secs field.
+        let v2_raw = TlsNostrGroupDataExtensionV1V2 {
+            version: 2,
+            nostr_group_id: [42u8; 32],
+            name: b"Legacy Group".to_vec(),
+            description: b"A v2 group".to_vec(),
+            admin_pubkeys: vec![*pk1.as_bytes()],
+            relays: vec![relay1.to_string().into_bytes()],
+            image_hash: Vec::new(),
+            image_key: Vec::new(),
+            image_nonce: Vec::new(),
+            image_upload_key: Vec::new(),
+        };
+
+        let v2_bytes = v2_raw.tls_serialize_detached().unwrap();
+
+        // Now deserialize — this should succeed via the v1/v2 fallback path.
+        let extension = NostrGroupDataExtension::deserialize_bytes(&v2_bytes).unwrap();
+
+        assert_eq!(extension.version, 2);
+        assert_eq!(extension.name, "Legacy Group");
+        assert_eq!(extension.description, "A v2 group");
+        assert!(extension.admins.contains(&pk1));
+        assert!(extension.relays.contains(&relay1));
+        assert_eq!(
+            extension.disappearing_message_duration_secs, None,
+            "Legacy v2 payload should default to None"
+        );
+    }
+
+    /// Test that v3 payloads with disappearing_message_duration_secs round-trip correctly.
+    #[test]
+    fn test_deserialize_v3_payload_with_disappearing_duration() {
+        use tls_codec::Serialize as TlsSerialize;
+
+        let pk1 = PublicKey::parse(ADMIN_1).unwrap();
+        let relay1 = RelayUrl::parse(RELAY_1).unwrap();
+
+        let extension = NostrGroupDataExtension::new(
+            "v3 Group",
+            "Has disappearing messages",
+            [pk1],
+            [relay1],
+            None,
+            None,
+            None,
+            None,
+            Some(3600),
+        );
+
+        let raw = extension.as_raw();
+        let bytes = raw.tls_serialize_detached().unwrap();
+
+        let deserialized = NostrGroupDataExtension::deserialize_bytes(&bytes).unwrap();
+        assert_eq!(
+            deserialized.version,
+            NostrGroupDataExtension::CURRENT_VERSION
+        );
+        assert_eq!(deserialized.disappearing_message_duration_secs, Some(3600));
     }
 }

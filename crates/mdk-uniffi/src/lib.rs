@@ -1085,7 +1085,7 @@ impl Mdk {
             group_update = group_update.admins(admin_pubkeys);
         }
 
-        if let Some(duration) = update.disappearing_message_duration_secs {
+        if let Some(duration) = update.disappearing_message_duration.to_core() {
             group_update = group_update.disappearing_message_duration_secs(duration);
         }
 
@@ -1327,6 +1327,38 @@ pub struct UpdateGroupResult {
     pub mls_group_id: String,
 }
 
+/// Tri-state for the disappearing message duration field in group updates.
+///
+/// This replaces `Option<Option<u64>>` which UniFFI flattens in Kotlin/Swift,
+/// making the "not changing" vs "disabling" distinction impossible.
+#[derive(uniffi::Enum)]
+pub enum DisappearingMessageDuration {
+    /// Do not change the current setting (field absent from the update).
+    Unchanged,
+    /// Disable disappearing messages (set to `None`).
+    Disabled,
+    /// Enable disappearing messages with the given duration in seconds (`n > 0`).
+    Enabled {
+        /// Duration in seconds after which messages expire.
+        duration_secs: u64,
+    },
+}
+
+impl DisappearingMessageDuration {
+    /// Converts to the nested-`Option` representation used by the core API.
+    ///
+    /// - `Unchanged` → `None` (outer: field not being updated)
+    /// - `Disabled`  → `Some(None)` (set to disabled)
+    /// - `Enabled`   → `Some(Some(n))`
+    fn to_core(&self) -> Option<Option<u64>> {
+        match self {
+            Self::Unchanged => None,
+            Self::Disabled => Some(None),
+            Self::Enabled { duration_secs } => Some(Some(*duration_secs)),
+        }
+    }
+}
+
 /// Configuration for updating group data with optional fields
 #[derive(uniffi::Record)]
 pub struct GroupDataUpdate {
@@ -1344,8 +1376,8 @@ pub struct GroupDataUpdate {
     pub relays: Option<Vec<String>>,
     /// Group admins (optional)
     pub admins: Option<Vec<String>>,
-    /// Disappearing message duration in seconds (optional, use Some(None) to disable)
-    pub disappearing_message_duration_secs: Option<Option<u64>>,
+    /// Disappearing message duration setting
+    pub disappearing_message_duration: DisappearingMessageDuration,
 }
 
 /// Result of processing a message
@@ -3132,7 +3164,7 @@ mod tests {
             image_nonce: None,
             relays: None,
             admins: None,
-            disappearing_message_duration_secs: None,
+            disappearing_message_duration: DisappearingMessageDuration::Unchanged,
         };
         let result = mdk.update_group_data(invalid_group_id, update);
         assert!(matches!(result, Err(MdkUniffiError::InvalidInput(_))));
@@ -3150,7 +3182,7 @@ mod tests {
             image_nonce: None,
             relays: Some(vec!["not_a_valid_url".to_string()]),
             admins: None,
-            disappearing_message_duration_secs: None,
+            disappearing_message_duration: DisappearingMessageDuration::Unchanged,
         };
         let result = mdk.update_group_data(fake_group_id, update);
         assert!(matches!(result, Err(MdkUniffiError::InvalidInput(_))));
@@ -3168,7 +3200,7 @@ mod tests {
             image_nonce: None,
             relays: None,
             admins: Some(vec!["not_valid_hex".to_string()]),
-            disappearing_message_duration_secs: None,
+            disappearing_message_duration: DisappearingMessageDuration::Unchanged,
         };
         let result = mdk.update_group_data(fake_group_id, update);
         assert!(matches!(result, Err(MdkUniffiError::InvalidInput(_))));

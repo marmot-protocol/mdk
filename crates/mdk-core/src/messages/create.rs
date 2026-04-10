@@ -40,6 +40,11 @@ impl EventTag {
         Self(Tag::expiration(timestamp))
     }
 
+    /// Returns `true` if this is a NIP-40 expiration tag.
+    pub fn is_expiration(&self) -> bool {
+        self.0.kind() == nostr::TagKind::Expiration
+    }
+
     pub(crate) fn into_tag(self) -> Tag {
         self.0
     }
@@ -132,13 +137,16 @@ where
         // Get the rumor ID
         let rumor_id: EventId = rumor.id();
 
-        // Auto-apply NIP-40 expiration tag when group has disappearing messages enabled
+        // Auto-apply NIP-40 expiration tag when group has disappearing messages enabled.
+        // Any caller-supplied expiration tag is replaced by the auto-computed one
+        // to prevent conflicting expiration values on the wrapper event.
         let tags = match group.disappearing_message_duration_secs {
             Some(duration_secs) => {
                 let expiration =
                     Timestamp::from(rumor.created_at.as_secs().saturating_add(duration_secs));
                 let expiration_tag = EventTag::expiration(expiration);
                 let mut all_tags = tags.unwrap_or_default();
+                all_tags.retain(|t| !t.is_expiration());
                 all_tags.push(expiration_tag);
                 Some(all_tags)
             }
@@ -191,9 +199,10 @@ where
 mod tests {
     use mdk_storage_traits::GroupId;
     use mdk_storage_traits::messages::types as message_types;
-    use nostr::{Keys, Kind, TagKind, Timestamp};
+    use nostr::{Keys, Kind, RelayUrl, TagKind, Timestamp};
 
     use crate::error::Error;
+    use crate::groups::NostrGroupConfigData;
     use crate::messages::EventTag;
     use crate::test_util::*;
     use crate::tests::create_test_mdk;
@@ -925,10 +934,6 @@ mod tests {
     /// group has disappearing_message_duration_secs set.
     #[test]
     fn test_create_message_auto_nip40_expiration_tag() {
-        use nostr::RelayUrl;
-
-        use crate::groups::NostrGroupConfigData;
-
         let mdk = create_test_mdk();
         let (creator, members, admins) = create_test_group_members();
 
@@ -1025,18 +1030,15 @@ mod tests {
         );
     }
 
-    /// Test that caller-provided expiration tag and auto-applied expiration tag
-    /// coexist when both are present.
+    /// Test that the auto-applied expiration tag replaces any caller-provided
+    /// expiration tag when the group has disappearing messages enabled.
     #[test]
-    fn test_create_message_explicit_and_auto_expiration_tags() {
-        use nostr::RelayUrl;
-
-        use crate::groups::NostrGroupConfigData;
-
+    fn test_create_message_auto_expiration_replaces_explicit() {
         let mdk = create_test_mdk();
         let (creator, members, admins) = create_test_group_members();
 
-        // Create group with disappearing messages
+        // Create group with disappearing messages (1 hour)
+        let duration_secs = 3600u64;
         let relays = vec![RelayUrl::parse("wss://test.relay").unwrap()];
         let config = NostrGroupConfigData::new(
             "Disappearing Group".to_string(),
@@ -1046,7 +1048,7 @@ mod tests {
             None,
             relays,
             admins.clone(),
-            Some(3600),
+            Some(duration_secs),
         );
 
         let creator_pk = creator.public_key();
@@ -1061,14 +1063,21 @@ mod tests {
         let group_id = create_result.group.mls_group_id.clone();
         mdk.merge_pending_commit(&group_id).unwrap();
 
-        // Pass an explicit expiration tag AND let the auto-tag kick in
+        // Pass an explicit (wrong) expiration tag — it should be replaced
         let explicit_expiration = EventTag::expiration(Timestamp::from(9999u64));
-        let rumor = create_test_rumor(&creator, "Double expiration test");
+        let rumor = create_test_rumor(&creator, "Replaced expiration test");
+        let rumor_created_at = rumor.created_at;
         let event = mdk
             .create_message(&group_id, rumor, Some(vec![explicit_expiration]))
             .expect("Failed to create message");
 
-        // Should have 4 tags: h + encoding + explicit expiration + auto expiration
+        // Should have exactly 3 tags: h + encoding + auto expiration (not 4)
+        assert_eq!(
+            event.tags.len(),
+            3,
+            "Should have h + encoding + single expiration"
+        );
+
         let expiration_tags: Vec<_> = event
             .tags
             .iter()
@@ -1076,8 +1085,16 @@ mod tests {
             .collect();
         assert_eq!(
             expiration_tags.len(),
-            2,
-            "Should have both explicit and auto-applied expiration tags"
+            1,
+            "Auto-computed expiration should replace the explicit one"
+        );
+
+        // Verify it's the auto-computed value, not the explicit 9999
+        let actual: u64 = expiration_tags[0].content().unwrap().parse().unwrap();
+        let expected = rumor_created_at.as_secs() + duration_secs;
+        assert_eq!(
+            actual, expected,
+            "Expiration should be created_at + duration"
         );
     }
 }

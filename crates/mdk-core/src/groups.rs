@@ -2078,13 +2078,14 @@ mod tests {
     use mdk_memory_storage::MdkMemoryStorage;
     use mdk_storage_traits::groups::GroupStorage;
     use mdk_storage_traits::messages::{MessageStorage, types as message_types};
-    use nostr::{Keys, PublicKey};
+    use nostr::{Keys, PublicKey, RelayUrl, Timestamp};
     use openmls::prelude::BasicCredential;
     use openmls_basic_credential::SignatureKeyPair;
 
     use super::NostrGroupDataExtension;
     use crate::constant::NOSTR_GROUP_DATA_EXTENSION_TYPE;
-    use crate::groups::NostrGroupDataUpdate;
+    use crate::error::Error;
+    use crate::groups::{NostrGroupConfigData, NostrGroupDataUpdate};
     use crate::test_util::*;
     use crate::tests::create_test_mdk;
 
@@ -6316,11 +6317,6 @@ mod tests {
 
     #[test]
     fn test_create_group_rejects_zero_disappearing_duration() {
-        use nostr::RelayUrl;
-
-        use crate::error::Error;
-        use crate::groups::NostrGroupConfigData;
-
         let mdk = create_test_mdk();
         let (creator, members, admins) = create_test_group_members();
 
@@ -6352,10 +6348,6 @@ mod tests {
 
     #[test]
     fn test_create_group_allows_none_disappearing_duration() {
-        use nostr::RelayUrl;
-
-        use crate::groups::NostrGroupConfigData;
-
         let mdk = create_test_mdk();
         let (creator, members, admins) = create_test_group_members();
 
@@ -6376,15 +6368,17 @@ mod tests {
             .collect();
 
         let result = mdk.create_group(&creator.public_key(), key_packages, config);
-        assert!(result.is_ok());
+        let group_result = result.expect("create_group with None duration should succeed");
+        let group_id = group_result.group.mls_group_id.clone();
+        mdk.merge_pending_commit(&group_id).unwrap();
+
+        // Round-trip: verify the stored value
+        let stored = mdk.get_group(&group_id).unwrap().unwrap();
+        assert_eq!(stored.disappearing_message_duration_secs, None);
     }
 
     #[test]
     fn test_create_group_allows_positive_disappearing_duration() {
-        use nostr::RelayUrl;
-
-        use crate::groups::NostrGroupConfigData;
-
         let mdk = create_test_mdk();
         let (creator, members, admins) = create_test_group_members();
 
@@ -6405,13 +6399,17 @@ mod tests {
             .collect();
 
         let result = mdk.create_group(&creator.public_key(), key_packages, config);
-        assert!(result.is_ok());
+        let group_result = result.expect("create_group with positive duration should succeed");
+        let group_id = group_result.group.mls_group_id.clone();
+        mdk.merge_pending_commit(&group_id).unwrap();
+
+        // Round-trip: verify the stored value
+        let stored = mdk.get_group(&group_id).unwrap().unwrap();
+        assert_eq!(stored.disappearing_message_duration_secs, Some(3600));
     }
 
     #[test]
     fn test_update_group_data_rejects_zero_disappearing_duration() {
-        use crate::error::Error;
-
         let mdk = create_test_mdk();
         let (creator, members, admins) = create_test_group_members();
         let group_id = create_test_group(&mdk, &creator, &members, &admins);
@@ -6434,11 +6432,22 @@ mod tests {
         let (creator, members, admins) = create_test_group_members();
         let group_id = create_test_group(&mdk, &creator, &members, &admins);
 
-        // Some(None) means "set to disabled"
-        let update = NostrGroupDataUpdate::new().disappearing_message_duration_secs(None);
+        // First enable disappearing messages
+        let enable = NostrGroupDataUpdate::new().disappearing_message_duration_secs(Some(7200));
+        mdk.update_group_data(&group_id, enable).unwrap();
+        mdk.merge_pending_commit(&group_id).unwrap();
 
-        let result = mdk.update_group_data(&group_id, update);
-        assert!(result.is_ok());
+        let stored = mdk.get_group(&group_id).unwrap().unwrap();
+        assert_eq!(stored.disappearing_message_duration_secs, Some(7200));
+
+        // Now disable (Some(None) means "set to disabled")
+        let disable = NostrGroupDataUpdate::new().disappearing_message_duration_secs(None);
+        mdk.update_group_data(&group_id, disable).unwrap();
+        mdk.merge_pending_commit(&group_id).unwrap();
+
+        // Round-trip: verify it transitioned to None
+        let stored = mdk.get_group(&group_id).unwrap().unwrap();
+        assert_eq!(stored.disappearing_message_duration_secs, None);
     }
 
     #[test]
@@ -6448,8 +6457,125 @@ mod tests {
         let group_id = create_test_group(&mdk, &creator, &members, &admins);
 
         let update = NostrGroupDataUpdate::new().disappearing_message_duration_secs(Some(86400));
+        mdk.update_group_data(&group_id, update).unwrap();
+        mdk.merge_pending_commit(&group_id).unwrap();
 
-        let result = mdk.update_group_data(&group_id, update);
-        assert!(result.is_ok());
+        // Round-trip: verify the stored value
+        let stored = mdk.get_group(&group_id).unwrap().unwrap();
+        assert_eq!(stored.disappearing_message_duration_secs, Some(86400));
+    }
+
+    #[test]
+    fn test_delete_message_success() {
+        let mdk = create_test_mdk();
+        let (creator, members, admins) = create_test_group_members();
+        let group_id = create_test_group(&mdk, &creator, &members, &admins);
+
+        let rumor = create_test_rumor(&creator, "To be deleted");
+        let event = mdk.create_message(&group_id, rumor, None).unwrap();
+
+        // Get the stored message's rumor ID
+        let messages = mdk.get_messages(&group_id, None).unwrap();
+        assert_eq!(messages.len(), 1);
+        let msg_id = messages[0].id;
+
+        let deleted = mdk.delete_message(&group_id, &msg_id).unwrap();
+        assert!(deleted);
+
+        // Verify it's gone
+        assert!(mdk.get_message(&group_id, &msg_id).unwrap().is_none());
+
+        // Verify other storage is unaffected — the wrapper event processed record
+        // should still exist (delete_message doesn't touch processed_messages)
+        // and the group itself should still exist.
+        assert!(mdk.get_group(&group_id).unwrap().is_some());
+        let _ = event; // suppress unused warning
+    }
+
+    #[test]
+    fn test_delete_message_not_found() {
+        let mdk = create_test_mdk();
+        let (creator, members, admins) = create_test_group_members();
+        let group_id = create_test_group(&mdk, &creator, &members, &admins);
+
+        let missing = nostr::EventId::all_zeros();
+        let deleted = mdk.delete_message(&group_id, &missing).unwrap();
+        assert!(!deleted);
+    }
+
+    #[test]
+    fn test_delete_messages_before_timestamp() {
+        let mdk = create_test_mdk();
+        let (creator, members, admins) = create_test_group_members();
+        let group_id = create_test_group(&mdk, &creator, &members, &admins);
+
+        // Create several messages
+        for i in 0..5 {
+            let rumor = create_test_rumor(&creator, &format!("msg {}", i));
+            mdk.create_message(&group_id, rumor, None).unwrap();
+        }
+
+        let messages = mdk.get_messages(&group_id, None).unwrap();
+        assert_eq!(messages.len(), 5);
+
+        // Delete with a timestamp far in the future — should remove all
+        let far_future = Timestamp::from(u64::MAX / 2);
+        let count = mdk
+            .delete_messages_before_timestamp(&group_id, far_future)
+            .unwrap();
+        assert_eq!(count, 5);
+
+        let remaining = mdk.get_messages(&group_id, None).unwrap();
+        assert!(remaining.is_empty());
+    }
+
+    #[test]
+    fn test_delete_messages_before_timestamp_none_match() {
+        let mdk = create_test_mdk();
+        let (creator, members, admins) = create_test_group_members();
+        let group_id = create_test_group(&mdk, &creator, &members, &admins);
+
+        let rumor = create_test_rumor(&creator, "a message");
+        mdk.create_message(&group_id, rumor, None).unwrap();
+
+        // Before = 0 means nothing should be older
+        let count = mdk
+            .delete_messages_before_timestamp(&group_id, nostr::Timestamp::from(0u64))
+            .unwrap();
+        assert_eq!(count, 0);
+
+        // Message should still exist
+        assert_eq!(mdk.get_messages(&group_id, None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_delete_processed_messages_for_group() {
+        let mdk = create_test_mdk();
+        let (creator, members, admins) = create_test_group_members();
+        let group_id = create_test_group(&mdk, &creator, &members, &admins);
+
+        // Create a message (this also creates a processed_message record)
+        let rumor = create_test_rumor(&creator, "tracked message");
+        let event = mdk.create_message(&group_id, rumor, None).unwrap();
+
+        // Delete processed records
+        let count = mdk.delete_processed_messages_for_group(&group_id).unwrap();
+        assert!(count > 0, "Should have deleted at least 1 processed record");
+
+        // Idempotent: second call returns 0
+        let count2 = mdk.delete_processed_messages_for_group(&group_id).unwrap();
+        assert_eq!(count2, 0);
+
+        let _ = event;
+    }
+
+    #[test]
+    fn test_delete_processed_messages_empty_group() {
+        let mdk = create_test_mdk();
+        let (creator, members, admins) = create_test_group_members();
+        let group_id = create_test_group(&mdk, &creator, &members, &admins);
+
+        let count = mdk.delete_processed_messages_for_group(&group_id).unwrap();
+        assert_eq!(count, 0);
     }
 }

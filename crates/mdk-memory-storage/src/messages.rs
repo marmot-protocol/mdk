@@ -306,8 +306,15 @@ impl MessageStorage for MdkMemoryStorage {
             found = group_messages.remove(event_id).is_some();
         }
 
-        // Remove from messages_cache (handles LRU divergence)
-        if inner.messages_cache.pop(event_id).is_some() {
+        // Remove from messages_cache only if the entry belongs to the same group
+        // (prevents evicting another group's message with a coincident EventId).
+        let belongs_to_group = inner
+            .messages_cache
+            .get(event_id)
+            .is_some_and(|msg| &msg.mls_group_id == group_id);
+
+        if belongs_to_group {
+            inner.messages_cache.pop(event_id);
             found = true;
         }
 
@@ -353,9 +360,16 @@ impl MessageStorage for MdkMemoryStorage {
             }
         }
 
-        // Remove from messages_cache
+        // Remove from messages_cache only when the entry belongs to this group
+        // (prevents evicting another group's entry with a coincident EventId).
         for eid in &all_ids {
-            inner.messages_cache.pop(eid);
+            let belongs = inner
+                .messages_cache
+                .get(eid)
+                .is_some_and(|msg| &msg.mls_group_id == group_id);
+            if belongs {
+                inner.messages_cache.pop(eid);
+            }
         }
 
         Ok(all_ids.len())
