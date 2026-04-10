@@ -56,7 +56,6 @@ pub(crate) struct TlsNostrGroupDataExtension {
 /// use this struct for deserialization. The missing field is synthesized as an empty
 /// Vec (mapping to `None`) when converting to `TlsNostrGroupDataExtension`.
 #[derive(
-    Debug,
     Clone,
     PartialEq,
     Eq,
