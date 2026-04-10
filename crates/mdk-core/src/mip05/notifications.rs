@@ -388,7 +388,9 @@ mod tests {
     #[test]
     fn test_build_notification_batches_chunks_tokens_per_server() {
         let server_keys = Keys::generate();
-        let tokens = (0..201)
+        // Generate more tokens than MAX_NOTIFICATION_REQUEST_TOKENS to verify chunking.
+        let count = MAX_NOTIFICATION_REQUEST_TOKENS + 1;
+        let tokens = (0..count)
             .map(|index| {
                 make_token_tag(
                     server_keys.public_key(),
@@ -402,7 +404,7 @@ mod tests {
 
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].server_pubkey, server_keys.public_key());
-        assert_eq!(batches[0].events.len(), 3);
+        assert_eq!(batches[0].events.len(), 2);
         assert_eq!(batches[0].relay_hints.len(), 1);
     }
 
