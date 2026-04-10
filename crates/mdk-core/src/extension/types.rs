@@ -323,7 +323,13 @@ impl NostrGroupDataExtension {
                                 .to_string(),
                         )
                         })?;
-                Some(u64::from_be_bytes(bytes))
+                let duration = u64::from_be_bytes(bytes);
+                if duration == 0 {
+                    return Err(Error::ExtensionFormatError(
+                        "disappearing_message_duration_secs cannot be zero".to_string(),
+                    ));
+                }
+                Some(duration)
             };
 
         Ok(Self {
@@ -1257,5 +1263,34 @@ mod tests {
             NostrGroupDataExtension::CURRENT_VERSION
         );
         assert_eq!(deserialized.disappearing_message_duration_secs, Some(3600));
+    }
+
+    /// Test that a zero-valued disappearing_message_duration_secs is rejected during parsing.
+    #[test]
+    fn test_from_raw_rejects_zero_disappearing_duration() {
+        let pk1 = PublicKey::parse(ADMIN_1).unwrap();
+        let relay1 = RelayUrl::parse(RELAY_1).unwrap();
+
+        let raw = TlsNostrGroupDataExtension {
+            version: 3,
+            nostr_group_id: [0u8; 32],
+            name: b"Test".to_vec(),
+            description: b"Desc".to_vec(),
+            admin_pubkeys: vec![*pk1.as_bytes()],
+            relays: vec![relay1.to_string().into_bytes()],
+            image_hash: Vec::new(),
+            image_key: Vec::new(),
+            image_nonce: Vec::new(),
+            image_upload_key: Vec::new(),
+            disappearing_message_duration_secs: 0u64.to_be_bytes().to_vec(),
+        };
+
+        let result = NostrGroupDataExtension::from_raw(raw);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("cannot be zero"),
+            "Expected zero-duration rejection, got: {err}"
+        );
     }
 }
