@@ -3,7 +3,7 @@
 use mdk_storage_traits::messages::MessageStorage;
 use mdk_storage_traits::messages::error::MessageError;
 use mdk_storage_traits::messages::types::{Message, ProcessedMessage};
-use nostr::{EventId, JsonUtil};
+use nostr::{EventId, JsonUtil, Timestamp};
 use rusqlite::{OptionalExtension, params};
 
 use crate::validation::{
@@ -346,6 +346,50 @@ impl MessageStorage for MdkSqliteStorage {
         self.with_connection(|conn| {
             conn.execute(
                 "DELETE FROM messages WHERE mls_group_id = ?",
+                params![group_id.as_slice()],
+            )
+            .map_err(into_message_err)
+        })
+    }
+
+    fn delete_message(
+        &self,
+        group_id: &mdk_storage_traits::GroupId,
+        event_id: &EventId,
+    ) -> Result<bool, MessageError> {
+        self.with_connection(|conn| {
+            let rows = conn
+                .execute(
+                    "DELETE FROM messages WHERE mls_group_id = ? AND id = ?",
+                    params![group_id.as_slice(), event_id.as_bytes()],
+                )
+                .map_err(into_message_err)?;
+
+            Ok(rows > 0)
+        })
+    }
+
+    fn delete_messages_before_timestamp(
+        &self,
+        group_id: &mdk_storage_traits::GroupId,
+        before: Timestamp,
+    ) -> Result<usize, MessageError> {
+        self.with_connection(|conn| {
+            conn.execute(
+                "DELETE FROM messages WHERE mls_group_id = ? AND created_at < ?",
+                params![group_id.as_slice(), before.as_secs()],
+            )
+            .map_err(into_message_err)
+        })
+    }
+
+    fn delete_processed_messages_for_group(
+        &self,
+        group_id: &mdk_storage_traits::GroupId,
+    ) -> Result<usize, MessageError> {
+        self.with_connection(|conn| {
+            conn.execute(
+                "DELETE FROM processed_messages WHERE mls_group_id = ?",
                 params![group_id.as_slice()],
             )
             .map_err(into_message_err)
@@ -990,7 +1034,7 @@ mod tests {
 
         storage.delete_messages_for_group(&group_id).unwrap();
 
-        // Processed message still exists
+        // Processed messages are preserved (deduplication guard)
         assert!(
             storage
                 .find_processed_message_by_event_id(&wrapper_eid)
@@ -1019,5 +1063,188 @@ mod tests {
 
         assert!(storage.messages(&group_a, None).unwrap().is_empty());
         assert_eq!(storage.messages(&group_b, None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn delete_single_message() {
+        let storage = MdkSqliteStorage::new_in_memory().unwrap();
+        let group_id = create_test_group(&storage, &[10, 20, 30]);
+        let eid1 = create_test_message(
+            &storage,
+            &group_id,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        );
+        let eid2 = create_test_message(
+            &storage,
+            &group_id,
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        );
+
+        let deleted = storage.delete_message(&group_id, &eid1).unwrap();
+        assert!(deleted);
+
+        // eid1 is gone, eid2 remains
+        assert!(
+            storage
+                .find_message_by_event_id(&group_id, &eid1)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            storage
+                .find_message_by_event_id(&group_id, &eid2)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn delete_single_message_not_found() {
+        let storage = MdkSqliteStorage::new_in_memory().unwrap();
+        let group_id = create_test_group(&storage, &[10, 20, 30]);
+
+        let missing_eid =
+            EventId::parse("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+                .unwrap();
+        let deleted = storage.delete_message(&group_id, &missing_eid).unwrap();
+        assert!(!deleted);
+    }
+
+    #[test]
+    fn delete_messages_before_timestamp() {
+        let storage = MdkSqliteStorage::new_in_memory().unwrap();
+        let group_id = create_test_group(&storage, &[10, 20, 30]);
+
+        // Create messages with specific timestamps
+        let pubkey =
+            PublicKey::parse("79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
+                .unwrap();
+        let wrapper_event_id = EventId::all_zeros();
+
+        let eid1 =
+            EventId::parse("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+                .unwrap();
+        let eid2 =
+            EventId::parse("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+                .unwrap();
+        let eid3 =
+            EventId::parse("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc")
+                .unwrap();
+
+        for (eid, ts) in [(eid1, 100u64), (eid2, 200), (eid3, 300)] {
+            let now = Timestamp::from(ts);
+            let message = Message {
+                id: eid,
+                pubkey,
+                kind: Kind::from(1u16),
+                mls_group_id: group_id.clone(),
+                created_at: now,
+                processed_at: now,
+                content: "test".to_string(),
+                tags: Tags::new(),
+                event: UnsignedEvent::new(
+                    pubkey,
+                    now,
+                    Kind::from(9u16),
+                    vec![],
+                    "test".to_string(),
+                ),
+                wrapper_event_id,
+                epoch: Some(1),
+                state: MessageState::Created,
+            };
+            storage.save_message(message).unwrap();
+        }
+
+        // Delete messages created before timestamp 250
+        let deleted = storage
+            .delete_messages_before_timestamp(&group_id, Timestamp::from(250u64))
+            .unwrap();
+        assert_eq!(deleted, 2);
+
+        // Only the newest message remains
+        assert!(
+            storage
+                .find_message_by_event_id(&group_id, &eid1)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            storage
+                .find_message_by_event_id(&group_id, &eid2)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            storage
+                .find_message_by_event_id(&group_id, &eid3)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn delete_processed_messages_for_group() {
+        let storage = MdkSqliteStorage::new_in_memory().unwrap();
+        let group_a = create_test_group(&storage, &[1, 1, 1]);
+        let group_b = create_test_group(&storage, &[2, 2, 2]);
+
+        let pm_a_eid =
+            EventId::parse("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+                .unwrap();
+        let pm_b_eid =
+            EventId::parse("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+                .unwrap();
+
+        let pm_a = ProcessedMessage {
+            wrapper_event_id: pm_a_eid,
+            message_event_id: None,
+            processed_at: Timestamp::now(),
+            epoch: Some(1),
+            mls_group_id: Some(group_a.clone()),
+            state: ProcessedMessageState::Processed,
+            failure_reason: None,
+        };
+        let pm_b = ProcessedMessage {
+            wrapper_event_id: pm_b_eid,
+            message_event_id: None,
+            processed_at: Timestamp::now(),
+            epoch: Some(1),
+            mls_group_id: Some(group_b.clone()),
+            state: ProcessedMessageState::Processed,
+            failure_reason: None,
+        };
+        storage.save_processed_message(pm_a).unwrap();
+        storage.save_processed_message(pm_b).unwrap();
+
+        let deleted = storage
+            .delete_processed_messages_for_group(&group_a)
+            .unwrap();
+        assert_eq!(deleted, 1);
+
+        // group_a's processed message is gone
+        assert!(
+            storage
+                .find_processed_message_by_event_id(&pm_a_eid)
+                .unwrap()
+                .is_none()
+        );
+        // group_b's processed message still exists
+        assert!(
+            storage
+                .find_processed_message_by_event_id(&pm_b_eid)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn secure_delete_pragma_is_enabled() {
+        let storage = MdkSqliteStorage::new_in_memory().unwrap();
+        let value: i64 = storage.with_connection(|conn| {
+            conn.query_row("PRAGMA secure_delete", [], |row| row.get(0))
+                .unwrap()
+        });
+        assert_eq!(value, 1, "PRAGMA secure_delete should be ON (1)");
     }
 }

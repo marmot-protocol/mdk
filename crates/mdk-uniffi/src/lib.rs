@@ -960,10 +960,57 @@ impl Mdk {
     }
 
     /// Delete all locally stored messages for a group.
+    ///
+    /// Processed message records are preserved to prevent reprocessing.
     pub fn delete_messages_for_group(&self, mls_group_id: String) -> Result<u32, MdkUniffiError> {
         let group_id = parse_group_id(&mls_group_id)?;
         let mdk = self.lock()?;
         let count = mdk.delete_messages_for_group(&group_id)?;
+        Ok(count as u32)
+    }
+
+    /// Delete a single message by event ID within a group.
+    ///
+    /// Returns true if the message was found and deleted, false if not found.
+    pub fn delete_message(
+        &self,
+        mls_group_id: String,
+        event_id: String,
+    ) -> Result<bool, MdkUniffiError> {
+        let group_id = parse_group_id(&mls_group_id)?;
+        let eid = nostr::EventId::parse(&event_id)
+            .map_err(|e| MdkUniffiError::InvalidInput(e.to_string()))?;
+        let mdk = self.lock()?;
+        let deleted = mdk.delete_message(&group_id, &eid)?;
+        Ok(deleted)
+    }
+
+    /// Delete all messages in a group created before the given Unix timestamp.
+    ///
+    /// Intended for disappearing-message cleanup. Returns the number of
+    /// messages deleted.
+    pub fn delete_messages_before_timestamp(
+        &self,
+        mls_group_id: String,
+        before_secs: u64,
+    ) -> Result<u32, MdkUniffiError> {
+        let group_id = parse_group_id(&mls_group_id)?;
+        let before = nostr::Timestamp::from(before_secs);
+        let mdk = self.lock()?;
+        let count = mdk.delete_messages_before_timestamp(&group_id, before)?;
+        Ok(count as u32)
+    }
+
+    /// Delete all processed message records for a group.
+    ///
+    /// Returns the number of records deleted.
+    pub fn delete_processed_messages_for_group(
+        &self,
+        mls_group_id: String,
+    ) -> Result<u32, MdkUniffiError> {
+        let group_id = parse_group_id(&mls_group_id)?;
+        let mdk = self.lock()?;
+        let count = mdk.delete_processed_messages_for_group(&group_id)?;
         Ok(count as u32)
     }
 

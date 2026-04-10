@@ -579,6 +579,10 @@ impl MdkSqliteStorage {
         // Enable foreign keys (after encryption is set up)
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
 
+        // Overwrite deleted content with zeros so that forensic recovery of
+        // expired/deleted messages from the database file is not possible.
+        conn.execute_batch("PRAGMA secure_delete = ON;")?;
+
         Ok(conn)
     }
 
@@ -649,6 +653,10 @@ impl MdkSqliteStorage {
 
         // Enable foreign keys
         connection.execute_batch("PRAGMA foreign_keys = ON;")?;
+
+        // Overwrite deleted content with zeros so that forensic recovery of
+        // expired/deleted messages from the database file is not possible.
+        connection.execute_batch("PRAGMA secure_delete = ON;")?;
 
         // Run all migrations (both OpenMLS tables and MDK tables)
         migrations::run_migrations(&mut connection)?;

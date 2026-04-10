@@ -1638,8 +1638,8 @@ where
     /// Delete all locally stored messages for a group.
     ///
     /// Removes decrypted message content from storage. The group remains
-    /// active and can continue to receive new messages. Processing records
-    /// are preserved to prevent re-processing of already-seen events.
+    /// active and can continue to receive new messages. Processed message
+    /// records are preserved to prevent reprocessing of already-seen events.
     ///
     /// Returns the number of messages deleted.
     ///
@@ -1648,6 +1648,53 @@ where
     pub fn delete_messages_for_group(&self, group_id: &GroupId) -> Result<usize, Error> {
         self.storage()
             .delete_messages_for_group(group_id)
+            .map_err(|e| Error::Group(e.to_string()))
+    }
+
+    /// Delete a single message by event ID within a group.
+    ///
+    /// Removes the decrypted message content from storage. Does not affect
+    /// processed message records.
+    ///
+    /// Returns `Ok(true)` if the message was found and deleted, `Ok(false)`
+    /// if no message with the given event ID exists in the group.
+    ///
+    /// This is a local-only operation.
+    pub fn delete_message(&self, group_id: &GroupId, event_id: &EventId) -> Result<bool, Error> {
+        self.storage()
+            .delete_message(group_id, event_id)
+            .map_err(|e| Error::Group(e.to_string()))
+    }
+
+    /// Delete all messages in a group created before the given timestamp.
+    ///
+    /// Intended for disappearing-message cleanup: compute
+    /// `now - disappearing_message_duration_secs` and pass it as `before`.
+    ///
+    /// Returns the number of messages deleted.
+    ///
+    /// This is a local-only operation.
+    pub fn delete_messages_before_timestamp(
+        &self,
+        group_id: &GroupId,
+        before: Timestamp,
+    ) -> Result<usize, Error> {
+        self.storage()
+            .delete_messages_before_timestamp(group_id, before)
+            .map_err(|e| Error::Group(e.to_string()))
+    }
+
+    /// Delete all processed message records for a group.
+    ///
+    /// Removes tracking metadata from local storage. Previously-seen events
+    /// may be reprocessed if encountered again.
+    ///
+    /// Returns the number of records deleted.
+    ///
+    /// This is a local-only operation.
+    pub fn delete_processed_messages_for_group(&self, group_id: &GroupId) -> Result<usize, Error> {
+        self.storage()
+            .delete_processed_messages_for_group(group_id)
             .map_err(|e| Error::Group(e.to_string()))
     }
 
@@ -6265,5 +6312,144 @@ mod tests {
         assert_eq!(leaf_map.get(&1), Some(&bob_keys.public_key()));
         assert_eq!(leaf_map.get(&3), Some(&dave_keys.public_key()));
         assert!(!leaf_map.contains_key(&2));
+    }
+
+    #[test]
+    fn test_create_group_rejects_zero_disappearing_duration() {
+        use nostr::RelayUrl;
+
+        use crate::error::Error;
+        use crate::groups::NostrGroupConfigData;
+
+        let mdk = create_test_mdk();
+        let (creator, members, admins) = create_test_group_members();
+
+        let config = NostrGroupConfigData::new(
+            "Disappearing Group".to_string(),
+            "Test".to_string(),
+            None,
+            None,
+            None,
+            vec![RelayUrl::parse("wss://test.relay").unwrap()],
+            admins.clone(),
+            Some(0), // zero duration — should be rejected
+        );
+
+        let key_packages: Vec<nostr::Event> = members
+            .iter()
+            .map(|m| create_key_package_event(&mdk, m))
+            .collect();
+
+        let result = mdk.create_group(&creator.public_key(), key_packages, config);
+        assert!(result.is_err());
+
+        let err = result.unwrap_err();
+        assert!(
+            matches!(&err, Error::Group(msg) if msg.contains("greater than 0")),
+            "Expected zero-duration rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_create_group_allows_none_disappearing_duration() {
+        use nostr::RelayUrl;
+
+        use crate::groups::NostrGroupConfigData;
+
+        let mdk = create_test_mdk();
+        let (creator, members, admins) = create_test_group_members();
+
+        let config = NostrGroupConfigData::new(
+            "Normal Group".to_string(),
+            "Test".to_string(),
+            None,
+            None,
+            None,
+            vec![RelayUrl::parse("wss://test.relay").unwrap()],
+            admins.clone(),
+            None, // disabled — should be accepted
+        );
+
+        let key_packages: Vec<nostr::Event> = members
+            .iter()
+            .map(|m| create_key_package_event(&mdk, m))
+            .collect();
+
+        let result = mdk.create_group(&creator.public_key(), key_packages, config);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_create_group_allows_positive_disappearing_duration() {
+        use nostr::RelayUrl;
+
+        use crate::groups::NostrGroupConfigData;
+
+        let mdk = create_test_mdk();
+        let (creator, members, admins) = create_test_group_members();
+
+        let config = NostrGroupConfigData::new(
+            "Ephemeral Group".to_string(),
+            "Test".to_string(),
+            None,
+            None,
+            None,
+            vec![RelayUrl::parse("wss://test.relay").unwrap()],
+            admins.clone(),
+            Some(3600), // 1 hour — should be accepted
+        );
+
+        let key_packages: Vec<nostr::Event> = members
+            .iter()
+            .map(|m| create_key_package_event(&mdk, m))
+            .collect();
+
+        let result = mdk.create_group(&creator.public_key(), key_packages, config);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_update_group_data_rejects_zero_disappearing_duration() {
+        use crate::error::Error;
+
+        let mdk = create_test_mdk();
+        let (creator, members, admins) = create_test_group_members();
+        let group_id = create_test_group(&mdk, &creator, &members, &admins);
+
+        let update = NostrGroupDataUpdate::new().disappearing_message_duration_secs(Some(0));
+
+        let result = mdk.update_group_data(&group_id, update);
+        assert!(result.is_err());
+
+        let err = result.unwrap_err();
+        assert!(
+            matches!(&err, Error::Group(msg) if msg.contains("greater than 0")),
+            "Expected zero-duration rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_update_group_data_allows_disabling_disappearing_messages() {
+        let mdk = create_test_mdk();
+        let (creator, members, admins) = create_test_group_members();
+        let group_id = create_test_group(&mdk, &creator, &members, &admins);
+
+        // Some(None) means "set to disabled"
+        let update = NostrGroupDataUpdate::new().disappearing_message_duration_secs(None);
+
+        let result = mdk.update_group_data(&group_id, update);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_update_group_data_allows_positive_disappearing_duration() {
+        let mdk = create_test_mdk();
+        let (creator, members, admins) = create_test_group_members();
+        let group_id = create_test_group(&mdk, &creator, &members, &admins);
+
+        let update = NostrGroupDataUpdate::new().disappearing_message_duration_secs(Some(86400));
+
+        let result = mdk.update_group_data(&group_id, update);
+        assert!(result.is_ok());
     }
 }
