@@ -34,12 +34,15 @@ pub const TOKEN_LIST_RESPONSE_KIND: u16 = 448;
 pub const TOKEN_REMOVAL_KIND: u16 = 449;
 
 /// Recommended maximum number of encrypted tokens per notification request.
-pub const MAX_NOTIFICATION_REQUEST_TOKENS: usize = 100;
+///
+/// Capped to stay within the NIP-44 plaintext limit (65,535 bytes) once the
+/// rumor content is base64-encoded and JSON-serialized.
+pub const MAX_NOTIFICATION_REQUEST_TOKENS: usize = 25;
 
 /// MIP-05 padded token plaintext length.
-pub const TOKEN_PLAINTEXT_LEN: usize = 220;
+pub const TOKEN_PLAINTEXT_LEN: usize = 1024;
 /// MIP-05 encrypted token length.
-pub const ENCRYPTED_TOKEN_LEN: usize = 280;
+pub const ENCRYPTED_TOKEN_LEN: usize = 1084;
 
 pub(crate) const EPHEMERAL_PUBKEY_LEN: usize = 32;
 pub(crate) const NONCE_LEN: usize = 12;
