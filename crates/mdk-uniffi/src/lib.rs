@@ -423,20 +423,23 @@ fn ensure_keyring_store() -> Result<(), MdkUniffiError> {
         {
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             {
-                let store = apple_native_keyring_store::protected::Store::new()
-                    .map_err(|e| format!("Failed to create macOS protected-data credential store: {e}"))?;
+                let store = apple_native_keyring_store::protected::Store::new().map_err(|e| {
+                    format!("Failed to create macOS protected-data credential store: {e}")
+                })?;
                 keyring_core::set_default_store(store);
             }
             #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
             {
-                let store = apple_native_keyring_store::keychain::Store::new()
-                    .map_err(|e| format!("Failed to create macOS Keychain credential store: {e}"))?;
+                let store = apple_native_keyring_store::keychain::Store::new().map_err(|e| {
+                    format!("Failed to create macOS Keychain credential store: {e}")
+                })?;
                 keyring_core::set_default_store(store);
             }
             #[cfg(target_os = "ios")]
             {
-                let store = apple_native_keyring_store::protected::Store::new()
-                    .map_err(|e| format!("Failed to create iOS protected-data credential store: {e}"))?;
+                let store = apple_native_keyring_store::protected::Store::new().map_err(|e| {
+                    format!("Failed to create iOS protected-data credential store: {e}")
+                })?;
                 keyring_core::set_default_store(store);
             }
             #[cfg(target_os = "android")]
@@ -453,8 +456,9 @@ fn ensure_keyring_store() -> Result<(), MdkUniffiError> {
             }
             #[cfg(target_os = "linux")]
             {
-                let store = linux_keyutils_keyring_store::Store::new()
-                    .map_err(|e| format!("Failed to create Linux keyutils credential store: {e}"))?;
+                let store = linux_keyutils_keyring_store::Store::new().map_err(|e| {
+                    format!("Failed to create Linux keyutils credential store: {e}")
+                })?;
                 keyring_core::set_default_store(store);
             }
             #[cfg(not(any(
@@ -513,9 +517,8 @@ fn mdk_from_storage(storage: MdkSqliteStorage, config: Option<MdkConfig>) -> Mdk
 /// is automatically retrieved from (or generated and stored in) the platform's native
 /// keyring (Keychain on macOS/iOS, Keystore on Android, etc.).
 ///
-/// The platform keyring store is initialized automatically on the first call via
-/// [`ensure_keyring_store`]. Callers no longer need to call
-/// `keyring_core::set_default_store()` manually.
+/// The platform keyring store is initialized automatically on the first call.
+/// Callers no longer need to call `keyring_core::set_default_store()` manually.
 ///
 /// # Arguments
 ///
@@ -3963,39 +3966,42 @@ mod tests {
             assert!(matches!(result, Err(MdkUniffiError::InvalidInput(_))));
         }
 
-    // -----------------------------------------------------------------
-    // Keyring auto-initialization (ensure_keyring_store / init_keyring_store)
-    // -----------------------------------------------------------------
+        // -----------------------------------------------------------------
+        // Keyring auto-initialization (ensure_keyring_store / init_keyring_store)
+        // -----------------------------------------------------------------
 
-    #[test]
-    fn test_ensure_keyring_store_idempotent() {
-        // Calling ensure_keyring_store() multiple times must succeed —
-        // the OnceLock ensures only the first call performs initialization.
-        assert!(ensure_keyring_store().is_ok());
-        assert!(ensure_keyring_store().is_ok());
-        assert!(ensure_keyring_store().is_ok());
-    }
+        #[test]
+        fn test_ensure_keyring_store_idempotent() {
+            // Calling ensure_keyring_store() multiple times must succeed —
+            // the OnceLock ensures only the first call performs initialization.
+            assert!(ensure_keyring_store().is_ok());
+            assert!(ensure_keyring_store().is_ok());
+            assert!(ensure_keyring_store().is_ok());
+        }
 
-    #[test]
-    fn test_init_keyring_store_exported() {
-        // The UniFFI-exported wrapper must also succeed and be idempotent.
-        assert!(init_keyring_store().is_ok());
-        assert!(init_keyring_store().is_ok());
-    }
+        #[test]
+        fn test_init_keyring_store_exported() {
+            // The UniFFI-exported wrapper must also succeed and be idempotent.
+            assert!(init_keyring_store().is_ok());
+            assert!(init_keyring_store().is_ok());
+        }
 
-    #[test]
-    fn test_new_mdk_auto_inits_keyring() {
-        // new_mdk() should succeed without the caller having to manually
-        // call set_default_store() — ensure_keyring_store() handles it.
-        let temp_dir = TempDir::new().unwrap();
-        let db_path = temp_dir.path().join("auto_init_test.db");
-        let result = new_mdk(
-            db_path.to_string_lossy().to_string(),
-            "org.test.keyring".to_string(),
-            "test.db.key".to_string(),
-            None,
-        );
-        assert!(result.is_ok(), "new_mdk() should auto-init the keyring store");
-    }
+        #[test]
+        fn test_new_mdk_auto_inits_keyring() {
+            // new_mdk() should succeed without the caller having to manually
+            // call set_default_store() — ensure_keyring_store() handles it.
+            let temp_dir = TempDir::new().unwrap();
+            let db_path = temp_dir.path().join("auto_init_test.db");
+            let result = new_mdk(
+                db_path.to_string_lossy().to_string(),
+                "org.test.keyring".to_string(),
+                "test.db.key".to_string(),
+                None,
+            );
+            assert!(
+                result.is_ok(),
+                "new_mdk() should auto-init the keyring store"
+            );
+        }
     }
 }
