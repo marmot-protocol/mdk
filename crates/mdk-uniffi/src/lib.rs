@@ -396,8 +396,9 @@ impl Mdk {
 /// `keyring_core::set_default_store()` before any `Entry` operations.
 ///
 /// This function is safe to call multiple times; only the first call has an effect
-/// (`OnceLock`-guarded). It is called automatically by [`new_mdk`] and
-/// [`new_mdk_with_key`], so most consumers never need to call it explicitly.
+/// (`OnceLock`-guarded). It is called automatically by [`new_mdk`], so most consumers
+/// never need to call it explicitly. [`new_mdk_with_key`] bypasses the keyring entirely
+/// because the caller supplies the encryption key directly.
 ///
 /// In test builds the mock (in-memory) store is used so that `cargo test` does
 /// not require real platform keychain entitlements.
