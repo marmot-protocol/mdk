@@ -117,7 +117,8 @@ impl fmt::Debug for EncryptionConfig {
 /// 1. Setting the encryption key (PRAGMA key) - must be first operation
 /// 2. Pinning SQLCipher 4.x compatibility mode
 /// 3. Forcing in-memory temporary storage to avoid plaintext temp file spill
-/// 4. Validating the key by reading from sqlite_master
+/// 4. Verifying that SQLCipher is active in the linked SQLite provider
+/// 5. Validating the key by reading from sqlite_master
 ///
 /// # Arguments
 ///
@@ -142,11 +143,27 @@ pub fn apply_encryption(conn: &Connection, config: &EncryptionConfig) -> Result<
     // Force in-memory temporary storage to prevent plaintext temp file spill
     conn.execute_batch("PRAGMA temp_store = MEMORY;")?;
 
+    // Plain SQLite accepts unknown PRAGMAs, so verify that SQLCipher is really linked.
+    validate_sqlcipher_available(conn)?;
+
     // Validate the key by attempting to read from the database
     // This will fail if the key is wrong or the database is not encrypted
     validate_encryption_key(conn)?;
 
     Ok(())
+}
+
+/// Validates that the active SQLite provider is SQLCipher-capable.
+///
+/// Plain SQLite silently ignores SQLCipher-specific PRAGMAs such as `key`.
+/// Requiring a non-empty `cipher_version` result catches builds or link graphs
+/// that resolved MDK's SQLite calls to a provider without SQLCipher support.
+fn validate_sqlcipher_available(conn: &Connection) -> Result<(), Error> {
+    match conn.query_row("PRAGMA cipher_version;", [], |row| row.get::<_, String>(0)) {
+        Ok(version) if !version.trim().is_empty() => Ok(()),
+        Ok(_) | Err(rusqlite::Error::QueryReturnedNoRows) => Err(Error::SqlCipherUnavailable),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Validates that the encryption key is correct by attempting to read from the database.
@@ -190,7 +207,7 @@ where
 {
     let path = path.as_ref();
 
-    if !path.exists() {
+    if is_special_sqlite_path(path) || !path.exists() {
         // New database, not encrypted yet
         return Ok(false);
     }
@@ -210,6 +227,33 @@ where
         }
         Err(e) => Err(e.into()),
     }
+}
+
+/// Verifies that a file-backed database has an encrypted file header.
+///
+/// This is intended as a post-write guard after migrations have created the
+/// schema. In-memory databases and special SQLite paths are skipped because
+/// they do not have a durable file header to inspect.
+pub fn verify_database_file_encrypted<P>(path: P) -> Result<(), Error>
+where
+    P: AsRef<Path>,
+{
+    let path = path.as_ref();
+
+    if is_special_sqlite_path(path) {
+        return Ok(());
+    }
+
+    if is_database_encrypted(path)? {
+        Ok(())
+    } else {
+        Err(Error::UnencryptedDatabaseWithEncryption)
+    }
+}
+
+fn is_special_sqlite_path(path: &Path) -> bool {
+    let path_str = path.to_string_lossy();
+    path_str.is_empty() || path_str == ":memory:" || path_str.starts_with(':')
 }
 
 #[cfg(test)]
@@ -310,6 +354,12 @@ mod tests {
     }
 
     #[test]
+    fn test_verify_database_file_encrypted_skips_memory_path() {
+        let result = verify_database_file_encrypted(":memory:");
+        assert!(result.is_ok());
+    }
+
+    #[test]
     fn test_is_database_encrypted_empty_file() {
         let temp_dir = tempfile::tempdir().unwrap();
         let db_path = temp_dir.path().join("empty.db");
@@ -352,6 +402,23 @@ mod tests {
     }
 
     #[test]
+    fn test_verify_database_file_encrypted_rejects_plain_sqlite() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("plain.db");
+
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch("CREATE TABLE test (id INTEGER);")
+            .unwrap();
+        drop(conn);
+
+        let result = verify_database_file_encrypted(&db_path);
+        assert!(matches!(
+            result,
+            Err(Error::UnencryptedDatabaseWithEncryption)
+        ));
+    }
+
+    #[test]
     fn test_is_database_encrypted_encrypted_sqlite() {
         let temp_dir = tempfile::tempdir().unwrap();
         let db_path = temp_dir.path().join("encrypted.db");
@@ -367,6 +434,9 @@ mod tests {
         // Encrypted database should be detected as encrypted
         let result = is_database_encrypted(&db_path);
         assert!(matches!(result, Ok(true)));
+
+        // Post-write verification should accept the encrypted database.
+        assert!(verify_database_file_encrypted(&db_path).is_ok());
     }
 
     #[test]
@@ -380,6 +450,8 @@ mod tests {
         // Apply encryption should succeed on new database
         let result = apply_encryption(&conn, &config);
         assert!(result.is_ok());
+
+        assert!(validate_sqlcipher_available(&conn).is_ok());
 
         // Should be able to create tables and use the database
         conn.execute_batch("CREATE TABLE test (id INTEGER);")

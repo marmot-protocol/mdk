@@ -556,6 +556,10 @@ impl MdkSqliteStorage {
         // Apply all migrations (both OpenMLS tables and MDK tables)
         migrations::run_migrations(&mut connection)?;
 
+        if encryption_config.is_some() {
+            encryption::verify_database_file_encrypted(file_path)?;
+        }
+
         // Ensure secure permissions on the database file and any sidecar files
         Self::apply_secure_permissions(file_path)?;
 

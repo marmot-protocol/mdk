@@ -297,7 +297,7 @@ A given `Mdk` instance must be confined to a single thread and must not be share
 
 ## iOS Integration
 
-The Swift package includes an XCFramework that supports both iOS device and simulator. The package automatically links against `sqlite3` and `c++` as required.
+The Swift package includes an XCFramework that supports both iOS device and simulator. The package bundles SQLCipher and automatically links the required native frameworks and C++ runtime.
 
 ## Example: Complete Workflow
 
@@ -341,4 +341,3 @@ for message in messages {
     // Note: To extract decrypted content, parse the eventJson and extract the content field
 }
 ```
-

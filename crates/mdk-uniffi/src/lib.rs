@@ -2206,9 +2206,11 @@ impl TryFrom<EncryptedMediaUploadResult> for EncryptedMediaUpload {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use mdk_sqlite_storage::encryption::is_database_encrypted;
     use nostr::{EventBuilder, JsonUtil, Keys, Kind, Tag, UnsignedEvent};
     use tempfile::TempDir;
+
+    use super::*;
 
     fn create_test_mdk() -> Mdk {
         new_mdk_unencrypted(":memory:".to_string(), None).unwrap()
@@ -2227,6 +2229,7 @@ mod tests {
         // Should be able to get groups (empty initially)
         let groups = mdk.get_groups().unwrap();
         assert_eq!(groups.len(), 0);
+        assert!(is_database_encrypted(&db_path).unwrap());
     }
 
     #[test]
