@@ -25,6 +25,31 @@ fn validate_pairing_version(version: u16) -> Result<(), Error> {
     }
 }
 
+/// Generate `to_bytes()` and `from_bytes()` for a TLS-serializable versioned pairing type.
+macro_rules! impl_versioned_pairing_bytes {
+    ($ty:ty, $label:literal) => {
+        impl $ty {
+            /// Serialize to bytes.
+            pub fn to_bytes(&self) -> Result<Vec<u8>, Error> {
+                use tls_codec::Serialize;
+                let mut buf = Vec::new();
+                self.tls_serialize(&mut buf)
+                    .map_err(|e| Error::PairingError(e.to_string()))?;
+                Ok(buf)
+            }
+
+            /// Deserialize from bytes with version validation.
+            pub fn from_bytes(bytes: &[u8]) -> Result<Self, Error> {
+                let (val, _) = Self::tls_deserialize_bytes(bytes).map_err(|e| {
+                    Error::PairingError(format!(concat!("failed to deserialize ", $label, ": {e}"), e = e))
+                })?;
+                validate_pairing_version(val.version)?;
+                Ok(val)
+            }
+        }
+    };
+}
+
 // ── Spec-compliant External Commit types ────────────────────────────────
 
 /// Per-group data for External Commit–based joining (MIP-06 spec §Pairing Payload).
@@ -132,25 +157,9 @@ impl PairingPayload {
     pub fn into_groups(self) -> Vec<GroupPairingDataV1> {
         self.groups
     }
-
-    /// Serialize to bytes.
-    pub fn to_bytes(&self) -> Result<Vec<u8>, Error> {
-        use tls_codec::Serialize;
-        let mut buf = Vec::new();
-        self.tls_serialize(&mut buf)
-            .map_err(|e| Error::PairingError(e.to_string()))?;
-        Ok(buf)
-    }
-
-    /// Deserialize from bytes with version validation.
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, Error> {
-        let (payload, _) = Self::tls_deserialize_bytes(bytes).map_err(|e| {
-            Error::PairingError(format!("failed to deserialize pairing payload: {e}"))
-        })?;
-        validate_pairing_version(payload.version)?;
-        Ok(payload)
-    }
 }
+
+impl_versioned_pairing_bytes!(PairingPayload, "pairing payload");
 
 // ── Add-based workaround types (pending OpenMLS External Commit support) ─
 
@@ -184,25 +193,9 @@ impl DevicePairingRequest {
     pub fn key_package_bytes(&self) -> &[u8] {
         &self.key_package
     }
-
-    /// Serialize to bytes.
-    pub fn to_bytes(&self) -> Result<Vec<u8>, Error> {
-        use tls_codec::Serialize;
-        let mut buf = Vec::new();
-        self.tls_serialize(&mut buf)
-            .map_err(|e| Error::PairingError(e.to_string()))?;
-        Ok(buf)
-    }
-
-    /// Deserialize from bytes with version validation.
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, Error> {
-        let (req, _) = Self::tls_deserialize_bytes(bytes).map_err(|e| {
-            Error::PairingError(format!("failed to deserialize pairing request: {e}"))
-        })?;
-        validate_pairing_version(req.version)?;
-        Ok(req)
-    }
 }
+
+impl_versioned_pairing_bytes!(DevicePairingRequest, "pairing request");
 
 /// Per-group Welcome data sent from existing device to new device (Add-based workaround).
 #[derive(
@@ -271,25 +264,9 @@ impl DevicePairingResponse {
     pub fn into_groups(self) -> Vec<GroupWelcomeData> {
         self.groups
     }
-
-    /// Serialize to bytes.
-    pub fn to_bytes(&self) -> Result<Vec<u8>, Error> {
-        use tls_codec::Serialize;
-        let mut buf = Vec::new();
-        self.tls_serialize(&mut buf)
-            .map_err(|e| Error::PairingError(e.to_string()))?;
-        Ok(buf)
-    }
-
-    /// Deserialize from bytes with version validation.
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, Error> {
-        let (resp, _) = Self::tls_deserialize_bytes(bytes).map_err(|e| {
-            Error::PairingError(format!("failed to deserialize pairing response: {e}"))
-        })?;
-        validate_pairing_version(resp.version)?;
-        Ok(resp)
-    }
 }
+
+impl_versioned_pairing_bytes!(DevicePairingResponse, "pairing response");
 
 #[cfg(test)]
 mod tests {

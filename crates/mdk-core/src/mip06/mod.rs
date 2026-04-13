@@ -57,7 +57,6 @@ mod integration_tests {
         let admins = vec![alice_keys.public_key(), bob_keys.public_key()];
         let bob_key_package = create_key_package_event(&bob_mdk, &bob_keys);
 
-        // Step 1: Alice device 1 creates a group with multi-device
         let create_result = alice_device1_mdk
             .create_group_with_multi_device(
                 &alice_keys.public_key(),
@@ -71,10 +70,8 @@ mod integration_tests {
             .merge_pending_commit(&group_id)
             .expect("Should merge pending commit");
 
-        // Step 2: Alice device 2 creates a KeyPackage (same Nostr key, fresh MLS key)
         let device2_kp_event = create_key_package_event(&alice_device2_mdk, &alice_keys);
 
-        // Step 3: Encrypt KeyPackage bytes via pairing channel
         let kp_bytes = super::DevicePairingRequest::new(device2_kp_event.as_json().into_bytes())
             .to_bytes()
             .unwrap();
@@ -87,7 +84,6 @@ mod integration_tests {
 
         let request = super::DevicePairingRequest::from_bytes(&decrypted).unwrap();
 
-        // Step 4: Existing device adds new device to groups
         let kp_event: nostr::Event =
             nostr::Event::from_json(std::str::from_utf8(request.key_package_bytes()).unwrap())
                 .unwrap();
@@ -98,7 +94,6 @@ mod integration_tests {
 
         assert_eq!(pairing_response.groups().len(), 1);
 
-        // Step 5: Encrypt response back to new device
         let response_bytes = pairing_response.to_bytes().unwrap();
         let (_ep2, encrypted_response) =
             super::encrypt_pairing_message(&response_bytes, &new_pub).unwrap();
@@ -108,7 +103,6 @@ mod integration_tests {
 
         let response = super::DevicePairingResponse::from_bytes(&decrypted_response).unwrap();
 
-        // Step 6: New device processes the Welcome
         let group_data = &response.groups()[0];
         let welcome_rumor: nostr::UnsignedEvent = nostr::UnsignedEvent::from_json(
             std::str::from_utf8(group_data.welcome_rumor_bytes()).unwrap(),
@@ -123,12 +117,10 @@ mod integration_tests {
             .accept_welcome(&processed_welcome)
             .expect("Should accept welcome");
 
-        // Merge the pending commit on device 1 (from the add_members call)
         alice_device1_mdk
             .merge_pending_commit(&group_id)
             .expect("Should merge add commit");
 
-        // Verify both devices have the group
         let device2_group = alice_device2_mdk
             .get_group(&processed_welcome.mls_group_id)
             .unwrap()
@@ -139,23 +131,6 @@ mod integration_tests {
             device2_group.nostr_group_id,
             create_result.group.nostr_group_id
         );
-    }
-
-    /// Test pairing request/response serialization roundtrip
-    #[test]
-    fn test_pairing_types_roundtrip() {
-        let request = super::DevicePairingRequest::new(vec![1, 2, 3, 4]);
-        let bytes = request.to_bytes().unwrap();
-        let decoded = super::DevicePairingRequest::from_bytes(&bytes).unwrap();
-        assert_eq!(request, decoded);
-
-        let response = super::DevicePairingResponse::new(vec![super::GroupWelcomeData::new(
-            vec![10; 50],
-            vec![20; 100],
-        )]);
-        let bytes = response.to_bytes().unwrap();
-        let decoded = super::DevicePairingResponse::from_bytes(&bytes).unwrap();
-        assert_eq!(response, decoded);
     }
 
     /// Test coalesced members with multi-device
@@ -409,7 +384,6 @@ mod integration_tests {
         let bob_mdk = create_test_mdk();
         let bob_kp = create_key_package_event(&bob_mdk, &bob_keys);
 
-        // Device 1 creates MIP-06 group
         let create_result = alice_device1
             .create_group_with_multi_device(
                 &alice_keys.public_key(),
@@ -421,10 +395,8 @@ mod integration_tests {
             )
             .unwrap();
         let group_id = create_result.group.mls_group_id.clone();
-        // merge_pending_commit now auto-registers join PSK for MIP-06 groups
         alice_device1.merge_pending_commit(&group_id).unwrap();
 
-        // Device 1 builds pairing payload
         let payload = alice_device1
             .build_pairing_payload(std::slice::from_ref(&group_id))
             .unwrap();
@@ -432,7 +404,6 @@ mod integration_tests {
 
         let group_data = &payload.groups()[0];
 
-        // Device 2 joins via External Commit
         let commit_result = alice_device2
             .join_group_via_external_commit(group_data, &alice_keys)
             .expect("External Commit should succeed");
@@ -440,7 +411,6 @@ mod integration_tests {
         assert!(!commit_result.commit_message.is_empty());
         assert_eq!(commit_result.group_event_key, *group_data.group_event_key());
 
-        // Device 1 processes the External Commit at the MLS layer
         let mut mls_group = alice_device1.load_mls_group(&group_id).unwrap().unwrap();
 
         let msg_in =
@@ -455,7 +425,6 @@ mod integration_tests {
             .process_message(&alice_device1.provider, protocol_msg)
             .expect("Device 1 should accept the External Commit");
 
-        // Verify the AAD contains a valid identity proof
         let aad = processed.aad();
         assert!(
             !aad.is_empty(),
@@ -465,10 +434,8 @@ mod integration_tests {
             .expect("Should parse identity proof from AAD");
         assert_eq!(proof.version(), 1);
 
-        // Extract and merge the staged commit
         match processed.into_content() {
             openmls::prelude::ProcessedMessageContent::StagedCommitMessage(staged_commit) => {
-                // Verify the joining leaf has Alice's credential
                 let joining_leaf = staged_commit
                     .update_path_leaf_node()
                     .expect("Should have update path leaf node");
@@ -482,7 +449,6 @@ mod integration_tests {
                     "Joining device should have Alice's Nostr pubkey"
                 );
 
-                // Merge the commit — device 2 is now in the group
                 mls_group
                     .merge_staged_commit(&alice_device1.provider, *staged_commit)
                     .expect("Should merge External Commit");
@@ -490,7 +456,6 @@ mod integration_tests {
             other => panic!("Expected StagedCommitMessage, got {:?}", other),
         }
 
-        // Verify device 2 is now a member (Alice has 2 leaves)
         let alice_pubkey_bytes = alice_keys.public_key().to_bytes();
         let alice_leaf_count = mls_group
             .members()

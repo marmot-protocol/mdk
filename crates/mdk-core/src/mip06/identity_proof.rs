@@ -113,31 +113,22 @@ pub fn compute_challenge(
     hasher.finalize().into()
 }
 
-/// Build the canonical proof event and sign it, returning the signed `Event`.
-///
-/// The event is:
-/// ```json
-/// {
-///   "kind": 450,
-///   "created_at": 0,
-///   "pubkey": "<joining user's nostr pubkey>",
-///   "tags": [["m", "marmot-external-commit-auth-v1"]],
-///   "content": "<hex-encoded challenge>"
-/// }
-/// ```
-fn sign_canonical_proof_event(keys: &Keys, challenge: &[u8; 32]) -> Result<nostr::Event, Error> {
+/// Build the canonical proof EventBuilder for the given challenge.
+fn canonical_proof_event_builder(challenge: &[u8; 32]) -> EventBuilder {
     let content = hex::encode(challenge);
-
-    let event = EventBuilder::new(Kind::Custom(PROOF_EVENT_KIND), &content)
+    EventBuilder::new(Kind::Custom(PROOF_EVENT_KIND), &content)
         .custom_created_at(Timestamp::from(0))
         .tag(Tag::custom(
             TagKind::SingleLetter(nostr::SingleLetterTag::lowercase(nostr::Alphabet::M)),
             vec![PROOF_EVENT_MARKER],
         ))
-        .sign_with_keys(keys)
-        .map_err(|e| Error::IdentityProofError(format!("failed to sign proof event: {e}")))?;
+}
 
-    Ok(event)
+/// Build the canonical proof event and sign it, returning the signed `Event`.
+fn sign_canonical_proof_event(keys: &Keys, challenge: &[u8; 32]) -> Result<nostr::Event, Error> {
+    canonical_proof_event_builder(challenge)
+        .sign_with_keys(keys)
+        .map_err(|e| Error::IdentityProofError(format!("failed to sign proof event: {e}")))
 }
 
 /// Reconstruct the canonical unsigned event for verification, then verify the signature.
@@ -146,18 +137,8 @@ fn verify_canonical_proof_event(
     challenge: &[u8; 32],
     sig_bytes: &[u8; 64],
 ) -> Result<(), Error> {
-    let content = hex::encode(challenge);
+    let unsigned = canonical_proof_event_builder(challenge).build(*pubkey);
 
-    // Build the unsigned event to get the event ID (hash of canonical JSON)
-    let unsigned = EventBuilder::new(Kind::Custom(PROOF_EVENT_KIND), &content)
-        .custom_created_at(Timestamp::from(0))
-        .tag(Tag::custom(
-            TagKind::SingleLetter(nostr::SingleLetterTag::lowercase(nostr::Alphabet::M)),
-            vec![PROOF_EVENT_MARKER],
-        ))
-        .build(*pubkey);
-
-    // Verify the Schnorr signature over the event id
     let event_id = unsigned
         .id
         .ok_or_else(|| Error::IdentityProofError("failed to compute proof event id".to_string()))?;

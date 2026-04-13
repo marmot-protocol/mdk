@@ -449,13 +449,7 @@ where
         }
 
         // 4. Credential identity in joining LeafNode matches an existing member.
-        //    The joining LeafNode is in the commit's update path.
-        let joining_leaf = staged_commit.update_path_leaf_node().ok_or_else(|| {
-            Error::IdentityProofError("External Commit has no update path leaf node".to_string())
-        })?;
-        let joining_cred = BasicCredential::try_from(joining_leaf.credential().clone())
-            .map_err(|e| Error::IdentityProofError(format!("invalid credential: {e}")))?;
-        let joining_pubkey = self.parse_credential_identity(joining_cred.identity())?;
+        let joining_pubkey = self.extract_joining_pubkey(staged_commit)?;
 
         let identity_match = mls_group.members().any(|member| {
             BasicCredential::try_from(member.credential.clone())
@@ -519,15 +513,28 @@ where
         Ok(())
     }
 
+    /// Extract the Nostr pubkey from the joining LeafNode in an External Commit.
+    #[cfg(feature = "mip06")]
+    fn extract_joining_pubkey(
+        &self,
+        staged_commit: &StagedCommit,
+    ) -> Result<nostr::PublicKey> {
+        use openmls::prelude::BasicCredential;
+
+        let joining_leaf = staged_commit.update_path_leaf_node().ok_or_else(|| {
+            Error::IdentityProofError("External Commit has no update path leaf node".to_string())
+        })?;
+        let joining_cred = BasicCredential::try_from(joining_leaf.credential().clone())
+            .map_err(|e| Error::IdentityProofError(format!("invalid credential: {e}")))?;
+        self.parse_credential_identity(joining_cred.identity())
+    }
+
     /// Validates the Nostr identity proof in an External Commit's `authenticated_data`.
     ///
-    /// This is MIP-06 §External Commit Authorization condition 6. It must be called
-    /// with the `authenticated_data` bytes captured from `ProcessedMessage::aad()`
-    /// before the message content is consumed.
-    ///
-    /// Full cryptographic verification: extracts credential_identity and signature_key
-    /// from the joining LeafNode, exports the pre-commit GroupContext, recomputes the
-    /// challenge hash, and verifies the Schnorr signature.
+    /// This is MIP-06 §External Commit Authorization condition 6. Full cryptographic
+    /// verification: extracts credential_identity and signature_key from the joining
+    /// LeafNode, exports the pre-commit GroupContext, recomputes the challenge hash,
+    /// and verifies the Schnorr signature.
     #[cfg(feature = "mip06")]
     pub(super) fn validate_external_commit_identity_proof(
         &self,
@@ -538,32 +545,24 @@ where
         use crate::mip06::{NostrIdentityProof, verify_identity_proof};
         use openmls::prelude::BasicCredential;
 
-        // Validate proof structure and version
         let proof = NostrIdentityProof::from_authenticated_data(authenticated_data)?;
 
-        // Extract joining LeafNode from the commit's update path
         let joining_leaf = staged_commit.update_path_leaf_node().ok_or_else(|| {
             Error::IdentityProofError("External Commit has no update path leaf node".to_string())
         })?;
-
-        // Extract credential identity (raw Nostr pubkey bytes) and signature key
         let joining_cred = BasicCredential::try_from(joining_leaf.credential().clone())
             .map_err(|e| Error::IdentityProofError(format!("invalid credential: {e}")))?;
         let joining_pubkey = self.parse_credential_identity(joining_cred.identity())?;
-        let credential_identity = joining_cred.identity();
-        let signature_key = joining_leaf.signature_key().as_slice();
 
-        // Export the pre-commit GroupContext for challenge computation
         let gc_bytes = self.export_group_context_bytes(mls_group).map_err(|e| {
             Error::IdentityProofError(format!("failed to export GroupContext: {e}"))
         })?;
 
-        // Full cryptographic verification
         verify_identity_proof(
             &proof,
             &joining_pubkey,
-            credential_identity,
-            signature_key,
+            joining_cred.identity(),
+            joining_leaf.signature_key().as_slice(),
             &gc_bytes,
         )?;
 
