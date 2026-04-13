@@ -2049,6 +2049,213 @@ impl Mdk {
     }
 }
 
+// ── MIP-06 Multi-Device methods on Mdk ──────────────────────────────────────
+
+#[cfg(feature = "mip06")]
+#[uniffi::export]
+impl Mdk {
+    /// Create a group with MIP-06 multi-device support enabled.
+    pub fn create_group_with_multi_device(
+        &self,
+        creator_public_key: String,
+        member_key_package_events_json: Vec<String>,
+        name: String,
+        description: String,
+        relays: Vec<String>,
+        admins: Vec<String>,
+    ) -> Result<CreateGroupResult, MdkUniffiError> {
+        let creator_pubkey = parse_public_key(&creator_public_key)?;
+        let relay_urls = parse_relay_urls(&relays)?;
+        let admin_pubkeys: Vec<PublicKey> = admins
+            .iter()
+            .map(|a| parse_public_key(a))
+            .collect::<Result<_, _>>()?;
+
+        let member_key_package_events: Vec<Event> = member_key_package_events_json
+            .iter()
+            .map(|json| parse_json(json, "key package event JSON"))
+            .collect::<Result<_, _>>()?;
+
+        let config = NostrGroupConfigData::new(
+            name,
+            description,
+            None,
+            None,
+            None,
+            relay_urls,
+            admin_pubkeys,
+        );
+
+        let mdk = self.lock()?;
+        let result =
+            mdk.create_group_with_multi_device(&creator_pubkey, member_key_package_events, config)?;
+
+        let welcome_rumors_json: Vec<String> = result
+            .welcome_rumors
+            .iter()
+            .map(|rumor| {
+                serde_json::to_string(rumor).map_err(|e| {
+                    MdkUniffiError::InvalidInput(format!("Failed to serialize welcome rumor: {e}"))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(CreateGroupResult {
+            group: Group::from(result.group),
+            welcome_rumors_json,
+        })
+    }
+
+    /// Enable MIP-06 multi-device support on an existing group.
+    ///
+    /// Returns the commit event JSON to publish to relays.
+    pub fn enable_multi_device(&self, mls_group_id: String) -> Result<String, MdkUniffiError> {
+        let group_id = parse_group_id(&mls_group_id)?;
+        let mdk = self.lock()?;
+        let event = mdk.enable_multi_device(&group_id)?;
+        serde_json::to_string(&event)
+            .map_err(|e| MdkUniffiError::InvalidInput(format!("Failed to serialize event: {e}")))
+    }
+
+    /// Add a new device to multiple groups (existing device, Phase 2 of pairing).
+    ///
+    /// Takes the new device's KeyPackage event JSON and group IDs to add it to.
+    /// Returns TLS-serialized DevicePairingResponse bytes containing Welcome data.
+    ///
+    /// NOTE: Caller must publish commit events and call merge_pending_commit for each group.
+    pub fn add_device_to_groups(
+        &self,
+        mls_group_ids: Vec<String>,
+        key_package_event_json: String,
+    ) -> Result<Vec<u8>, MdkUniffiError> {
+        let group_ids: Vec<GroupId> = mls_group_ids
+            .iter()
+            .map(|id| parse_group_id(id))
+            .collect::<Result<_, _>>()?;
+
+        let kp_event: Event = parse_json(&key_package_event_json, "key package event JSON")?;
+
+        let mdk = self.lock()?;
+        let response = mdk.add_device_to_groups(&group_ids, &kp_event)?;
+        response
+            .to_bytes()
+            .map_err(|e| MdkUniffiError::Mdk(e.to_string()))
+    }
+
+    /// Get members coalesced by Nostr identity (multi-device aware).
+    ///
+    /// Returns a map of hex-encoded Nostr pubkeys to their leaf indices.
+    pub fn coalesced_members(
+        &self,
+        mls_group_id: String,
+    ) -> Result<Vec<CoalescedMember>, MdkUniffiError> {
+        let group_id = parse_group_id(&mls_group_id)?;
+        let mdk = self.lock()?;
+        let members = mdk.coalesced_members(&group_id)?;
+
+        Ok(members
+            .into_iter()
+            .map(|(pubkey, leaves)| CoalescedMember {
+                pubkey: pubkey.to_hex(),
+                leaf_indices: leaves,
+            })
+            .collect())
+    }
+
+    /// Get all leaf indices belonging to the local user in a group.
+    pub fn own_device_leaves(&self, mls_group_id: String) -> Result<Vec<u32>, MdkUniffiError> {
+        let group_id = parse_group_id(&mls_group_id)?;
+        let mdk = self.lock()?;
+        Ok(mdk.own_device_leaves(&group_id)?)
+    }
+
+    /// Build a spec-compliant MIP-06 pairing payload for the given groups.
+    ///
+    /// Returns TLS-serialized PairingPayload bytes containing GroupInfo,
+    /// group_event_key, and join_psk for each group.
+    pub fn build_pairing_payload(
+        &self,
+        mls_group_ids: Vec<String>,
+    ) -> Result<Vec<u8>, MdkUniffiError> {
+        let group_ids: Vec<GroupId> = mls_group_ids
+            .iter()
+            .map(|id| parse_group_id(id))
+            .collect::<Result<_, _>>()?;
+
+        let mdk = self.lock()?;
+        let payload = mdk.build_pairing_payload(&group_ids)?;
+        payload
+            .to_bytes()
+            .map_err(|e| MdkUniffiError::Mdk(e.to_string()))
+    }
+
+    /// Join groups via MIP-06 External Commit using a pairing payload.
+    ///
+    /// `pairing_payload_bytes`: TLS-serialized PairingPayload (from build_pairing_payload)
+    /// `nostr_secret_key_hex`: hex-encoded Nostr secret key
+    ///
+    /// Returns one ExternalCommitJoinResult per group.
+    pub fn join_groups_via_external_commit(
+        &self,
+        pairing_payload_bytes: Vec<u8>,
+        nostr_secret_key_hex: String,
+    ) -> Result<Vec<ExternalCommitJoinResult>, MdkUniffiError> {
+        use mdk_core::mip06::PairingPayload;
+
+        let payload = PairingPayload::from_bytes(&pairing_payload_bytes).map_err(|e| {
+            MdkUniffiError::Mdk(format!("failed to deserialize pairing payload: {e}"))
+        })?;
+
+        let secret_key = nostr::SecretKey::parse(&nostr_secret_key_hex)
+            .map_err(|e| MdkUniffiError::InvalidInput(format!("invalid secret key: {e}")))?;
+        let keys = nostr::Keys::new(secret_key);
+
+        let mdk = self.lock()?;
+        let mut results = Vec::new();
+        for group_data in payload.groups() {
+            let result = mdk.join_group_via_external_commit(group_data, &keys)?;
+            results.push(ExternalCommitJoinResult {
+                commit_message: result.commit_message,
+                mls_group_id: hex::encode(result.group_id.as_slice()),
+                group_event_key: result.group_event_key.to_vec(),
+            });
+        }
+        Ok(results)
+    }
+
+    /// Register the MIP-06 join PSK for a group's current epoch.
+    ///
+    /// Normally called automatically after epoch changes, but can be called
+    /// manually to ensure the PSK is registered before processing External Commits.
+    pub fn register_join_psk(&self, mls_group_id: String) -> Result<(), MdkUniffiError> {
+        let group_id = parse_group_id(&mls_group_id)?;
+        let mdk = self.lock()?;
+        Ok(mdk.register_join_psk(&group_id)?)
+    }
+}
+
+/// Result of joining a group via MIP-06 External Commit.
+#[cfg(feature = "mip06")]
+#[derive(uniffi::Record)]
+pub struct ExternalCommitJoinResult {
+    /// TLS-serialized External Commit message for publication as kind:445.
+    pub commit_message: Vec<u8>,
+    /// Hex-encoded MLS group ID that was joined.
+    pub mls_group_id: String,
+    /// 32-byte MIP-03 group_event_key for outer encryption of the commit event.
+    pub group_event_key: Vec<u8>,
+}
+
+/// A member identity with all its leaf indices (multi-device)
+#[cfg(feature = "mip06")]
+#[derive(uniffi::Record)]
+pub struct CoalescedMember {
+    /// Hex-encoded Nostr public key
+    pub pubkey: String,
+    /// Leaf indices in the ratchet tree belonging to this identity
+    pub leaf_indices: Vec<u32>,
+}
+
 // ── MIP-04 TryFrom for EncryptedMediaUpload (reverse direction for imeta tag) ─
 
 impl TryFrom<EncryptedMediaUploadResult> for EncryptedMediaUpload {

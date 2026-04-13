@@ -1,0 +1,404 @@
+//! MIP-06 pairing payload types.
+//!
+//! Two payload formats exist:
+//!
+//! ## Spec-compliant (External Commit flow)
+//! `PairingPayload` / `GroupPairingDataV1`: the new device receives GroupInfo,
+//! group_event_key, and join_psk (exporter-derived External PSK), then self-joins
+//! via External Commit.
+//!
+//! ## Add-based workaround
+//! `DevicePairingRequest` / `DevicePairingResponse`: used while OpenMLS blockers
+//! prevent the External Commit path. The existing device adds the new device via
+//! standard Add proposals and sends back Welcome messages.
+
+use tls_codec::{DeserializeBytes, TlsDeserialize, TlsDeserializeBytes, TlsSerialize, TlsSize};
+
+use crate::error::Error;
+
+/// Validate the pairing protocol version field.
+fn validate_pairing_version(version: u16) -> Result<(), Error> {
+    match version {
+        0 => Err(Error::PairingError("version 0 is reserved".to_string())),
+        1 => Ok(()),
+        v => Err(Error::PairingError(format!("unsupported version: {v}"))),
+    }
+}
+
+// ── Spec-compliant External Commit types ────────────────────────────────
+
+/// Per-group data for External Commit–based joining (MIP-06 spec §Pairing Payload).
+///
+/// Contains everything a new device needs to construct an External Commit for one group.
+///
+/// ```tls
+/// struct {
+///     opaque group_event_key[32];
+///     opaque join_psk<1..255>;
+///     opaque group_info<1..2^32-1>;
+/// } GroupPairingDataV1;
+/// ```
+#[derive(
+    Debug, Clone, PartialEq, Eq, TlsSerialize, TlsDeserialize, TlsDeserializeBytes, TlsSize,
+)]
+pub struct GroupPairingDataV1 {
+    /// Exact 32-byte outer encryption key for `kind: 445` group-event encryption (MIP-03).
+    group_event_key: [u8; 32],
+    /// Exporter-derived External PSK for MIP-06 join authorization.
+    /// Length MUST equal `KDF.Nh` for the group ciphersuite.
+    /// Derived via `MLS-Exporter("marmot-mip06-join-psk-v1", join_psk_id, KDF.Nh)`.
+    join_psk: Vec<u8>,
+    /// TLS-serialized `GroupInfo` for current epoch. MUST include `external_pub` and
+    /// `ratchet_tree` extensions.
+    group_info: Vec<u8>,
+}
+
+impl GroupPairingDataV1 {
+    /// Create a new per-group pairing entry.
+    pub fn new(
+        group_event_key: [u8; 32],
+        join_psk: Vec<u8>,
+        group_info: Vec<u8>,
+    ) -> Result<Self, Error> {
+        if join_psk.is_empty() {
+            return Err(Error::PairingError(
+                "join_psk must not be empty".to_string(),
+            ));
+        }
+        if group_info.is_empty() {
+            return Err(Error::PairingError(
+                "group_info must not be empty".to_string(),
+            ));
+        }
+        Ok(Self {
+            group_event_key,
+            join_psk,
+            group_info,
+        })
+    }
+
+    /// The 32-byte outer encryption key.
+    pub fn group_event_key(&self) -> &[u8; 32] {
+        &self.group_event_key
+    }
+
+    /// The exporter-derived External PSK bytes.
+    pub fn join_psk(&self) -> &[u8] {
+        &self.join_psk
+    }
+
+    /// The TLS-serialized `GroupInfo` bytes.
+    pub fn group_info(&self) -> &[u8] {
+        &self.group_info
+    }
+}
+
+/// TLS-serialized pairing payload (MIP-06 spec §Pairing Payload Specification).
+///
+/// ```tls
+/// struct {
+///     uint16 version;
+///     GroupPairingDataV1 groups<1..2^32-1>;
+/// } PairingPayload;
+/// ```
+#[derive(
+    Debug, Clone, PartialEq, Eq, TlsSerialize, TlsDeserialize, TlsDeserializeBytes, TlsSize,
+)]
+pub struct PairingPayload {
+    /// Payload format version. Current: 1. Version 0 is reserved.
+    version: u16,
+    /// One entry per target group.
+    groups: Vec<GroupPairingDataV1>,
+}
+
+impl PairingPayload {
+    /// Current version.
+    pub const CURRENT_VERSION: u16 = 1;
+
+    /// Create a new pairing payload.
+    pub fn new(groups: Vec<GroupPairingDataV1>) -> Self {
+        Self {
+            version: Self::CURRENT_VERSION,
+            groups,
+        }
+    }
+
+    /// The per-group pairing data entries.
+    pub fn groups(&self) -> &[GroupPairingDataV1] {
+        &self.groups
+    }
+
+    /// Consume and return the group entries.
+    pub fn into_groups(self) -> Vec<GroupPairingDataV1> {
+        self.groups
+    }
+
+    /// Serialize to bytes.
+    pub fn to_bytes(&self) -> Result<Vec<u8>, Error> {
+        use tls_codec::Serialize;
+        let mut buf = Vec::new();
+        self.tls_serialize(&mut buf)
+            .map_err(|e| Error::PairingError(e.to_string()))?;
+        Ok(buf)
+    }
+
+    /// Deserialize from bytes with version validation.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, Error> {
+        let (payload, _) = Self::tls_deserialize_bytes(bytes).map_err(|e| {
+            Error::PairingError(format!("failed to deserialize pairing payload: {e}"))
+        })?;
+        validate_pairing_version(payload.version)?;
+        Ok(payload)
+    }
+}
+
+// ── Add-based workaround types (pending OpenMLS External Commit support) ─
+
+/// Data sent from the new device to the existing device (Phase 1, Add-based workaround).
+///
+/// Contains a single KeyPackage that the existing device will use to add
+/// the new device to groups via standard MLS Add proposals.
+#[derive(
+    Debug, Clone, PartialEq, Eq, TlsSerialize, TlsDeserialize, TlsDeserializeBytes, TlsSize,
+)]
+pub struct DevicePairingRequest {
+    /// Version of the pairing request format.
+    version: u16,
+    /// TLS-serialized MLS KeyPackage for the new device.
+    key_package: Vec<u8>,
+}
+
+impl DevicePairingRequest {
+    /// Current version.
+    pub const CURRENT_VERSION: u16 = 1;
+
+    /// Create a new pairing request.
+    pub fn new(key_package: Vec<u8>) -> Self {
+        Self {
+            version: Self::CURRENT_VERSION,
+            key_package,
+        }
+    }
+
+    /// The KeyPackage bytes.
+    pub fn key_package_bytes(&self) -> &[u8] {
+        &self.key_package
+    }
+
+    /// Serialize to bytes.
+    pub fn to_bytes(&self) -> Result<Vec<u8>, Error> {
+        use tls_codec::Serialize;
+        let mut buf = Vec::new();
+        self.tls_serialize(&mut buf)
+            .map_err(|e| Error::PairingError(e.to_string()))?;
+        Ok(buf)
+    }
+
+    /// Deserialize from bytes with version validation.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, Error> {
+        let (req, _) = Self::tls_deserialize_bytes(bytes).map_err(|e| {
+            Error::PairingError(format!("failed to deserialize pairing request: {e}"))
+        })?;
+        validate_pairing_version(req.version)?;
+        Ok(req)
+    }
+}
+
+/// Per-group Welcome data sent from existing device to new device (Add-based workaround).
+#[derive(
+    Debug, Clone, PartialEq, Eq, TlsSerialize, TlsDeserialize, TlsDeserializeBytes, TlsSize,
+)]
+pub struct GroupWelcomeData {
+    /// The Welcome rumor (unsigned event JSON bytes) for this group.
+    welcome_rumor: Vec<u8>,
+    /// The commit event (signed event JSON bytes) the existing device published.
+    /// The new device does NOT need to process this — it joins via Welcome.
+    /// Included so the new device can track the event ID if needed.
+    commit_event: Vec<u8>,
+}
+
+impl GroupWelcomeData {
+    /// Create a new per-group welcome entry.
+    pub fn new(welcome_rumor: Vec<u8>, commit_event: Vec<u8>) -> Self {
+        Self {
+            welcome_rumor,
+            commit_event,
+        }
+    }
+
+    /// The Welcome rumor bytes (JSON-serialized UnsignedEvent).
+    pub fn welcome_rumor_bytes(&self) -> &[u8] {
+        &self.welcome_rumor
+    }
+
+    /// The commit event bytes (JSON-serialized Event).
+    pub fn commit_event_bytes(&self) -> &[u8] {
+        &self.commit_event
+    }
+}
+
+/// Response sent from existing device to new device (Add-based workaround).
+///
+/// Contains Welcome messages for each group the new device was added to.
+#[derive(
+    Debug, Clone, PartialEq, Eq, TlsSerialize, TlsDeserialize, TlsDeserializeBytes, TlsSize,
+)]
+pub struct DevicePairingResponse {
+    /// Version of the pairing response format.
+    version: u16,
+    /// One entry per group the new device was added to.
+    groups: Vec<GroupWelcomeData>,
+}
+
+impl DevicePairingResponse {
+    /// Current version.
+    pub const CURRENT_VERSION: u16 = 1;
+
+    /// Create a new pairing response.
+    pub fn new(groups: Vec<GroupWelcomeData>) -> Self {
+        Self {
+            version: Self::CURRENT_VERSION,
+            groups,
+        }
+    }
+
+    /// The per-group Welcome data.
+    pub fn groups(&self) -> &[GroupWelcomeData] {
+        &self.groups
+    }
+
+    /// Consume and return the group entries.
+    pub fn into_groups(self) -> Vec<GroupWelcomeData> {
+        self.groups
+    }
+
+    /// Serialize to bytes.
+    pub fn to_bytes(&self) -> Result<Vec<u8>, Error> {
+        use tls_codec::Serialize;
+        let mut buf = Vec::new();
+        self.tls_serialize(&mut buf)
+            .map_err(|e| Error::PairingError(e.to_string()))?;
+        Ok(buf)
+    }
+
+    /// Deserialize from bytes with version validation.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, Error> {
+        let (resp, _) = Self::tls_deserialize_bytes(bytes).map_err(|e| {
+            Error::PairingError(format!("failed to deserialize pairing response: {e}"))
+        })?;
+        validate_pairing_version(resp.version)?;
+        Ok(resp)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_pairing_request_roundtrip() {
+        let req = DevicePairingRequest::new(vec![1, 2, 3, 4, 5]);
+        let bytes = req.to_bytes().unwrap();
+        let decoded = DevicePairingRequest::from_bytes(&bytes).unwrap();
+        assert_eq!(req, decoded);
+    }
+
+    #[test]
+    fn test_pairing_response_roundtrip() {
+        let groups = vec![
+            GroupWelcomeData::new(vec![10; 50], vec![20; 100]),
+            GroupWelcomeData::new(vec![30; 80], vec![40; 200]),
+        ];
+        let resp = DevicePairingResponse::new(groups);
+        let bytes = resp.to_bytes().unwrap();
+        let decoded = DevicePairingResponse::from_bytes(&bytes).unwrap();
+        assert_eq!(resp, decoded);
+    }
+
+    #[test]
+    fn test_request_version_0_rejected() {
+        let req = DevicePairingRequest {
+            version: 0,
+            key_package: vec![],
+        };
+        let bytes = req.to_bytes().unwrap();
+        assert!(DevicePairingRequest::from_bytes(&bytes).is_err());
+    }
+
+    #[test]
+    fn test_response_version_99_rejected() {
+        let resp = DevicePairingResponse {
+            version: 99,
+            groups: vec![],
+        };
+        let bytes = resp.to_bytes().unwrap();
+        assert!(DevicePairingResponse::from_bytes(&bytes).is_err());
+    }
+
+    // ── Spec-compliant payload tests ────────────────────────────────
+
+    #[test]
+    fn test_group_pairing_data_v1_roundtrip() {
+        use tls_codec::{DeserializeBytes, Serialize};
+
+        let data = GroupPairingDataV1::new(
+            [0xAA; 32],
+            vec![0xBB; 32],  // join_psk (KDF.Nh = 32 for ciphersuite 0x0001)
+            vec![0xCC; 200], // group_info
+        )
+        .unwrap();
+
+        let mut bytes = Vec::new();
+        data.tls_serialize(&mut bytes).unwrap();
+        let (decoded, _) = GroupPairingDataV1::tls_deserialize_bytes(&bytes).unwrap();
+        assert_eq!(data, decoded);
+        assert_eq!(data.group_event_key(), &[0xAA; 32]);
+        assert_eq!(data.join_psk().len(), 32);
+        assert_eq!(data.group_info().len(), 200);
+    }
+
+    #[test]
+    fn test_group_pairing_data_v1_rejects_empty_psk() {
+        let result = GroupPairingDataV1::new([0; 32], vec![], vec![1, 2, 3]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_group_pairing_data_v1_rejects_empty_group_info() {
+        let result = GroupPairingDataV1::new([0; 32], vec![1], vec![]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_pairing_payload_roundtrip() {
+        let groups = vec![
+            GroupPairingDataV1::new([1; 32], vec![2; 32], vec![3; 100]).unwrap(),
+            GroupPairingDataV1::new([4; 32], vec![5; 32], vec![6; 150]).unwrap(),
+        ];
+        let payload = PairingPayload::new(groups);
+        let bytes = payload.to_bytes().unwrap();
+        let decoded = PairingPayload::from_bytes(&bytes).unwrap();
+        assert_eq!(payload, decoded);
+        assert_eq!(decoded.groups().len(), 2);
+    }
+
+    #[test]
+    fn test_pairing_payload_version_0_rejected() {
+        let payload = PairingPayload {
+            version: 0,
+            groups: vec![],
+        };
+        let bytes = payload.to_bytes().unwrap();
+        assert!(PairingPayload::from_bytes(&bytes).is_err());
+    }
+
+    #[test]
+    fn test_pairing_payload_version_99_rejected() {
+        let payload = PairingPayload {
+            version: 99,
+            groups: vec![],
+        };
+        let bytes = payload.to_bytes().unwrap();
+        assert!(PairingPayload::from_bytes(&bytes).is_err());
+    }
+}

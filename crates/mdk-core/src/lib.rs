@@ -31,6 +31,9 @@ pub mod messages;
 #[cfg(feature = "mip05")]
 #[cfg_attr(docsrs, doc(cfg(feature = "mip05")))]
 pub mod mip05;
+#[cfg(feature = "mip06")]
+#[cfg_attr(docsrs, doc(cfg(feature = "mip06")))]
+pub mod mip06;
 pub mod prelude;
 #[cfg(test)]
 pub mod test_util;
@@ -424,6 +427,22 @@ where
     /// Get the proposal types formatted for Nostr tags (array of hex values)
     pub(crate) fn proposals_value(&self) -> Vec<String> {
         TAG_PROPOSALS.iter().map(|p| p.to_nostr_tag()).collect()
+    }
+
+    /// Get the group's required capabilities extension including MIP-06 multi-device.
+    #[cfg(feature = "mip06")]
+    #[inline]
+    pub(crate) fn required_capabilities_extension_with_multi_device(&self) -> Extension {
+        use crate::constant::MULTI_DEVICE_EXTENSION_TYPE;
+
+        let mut required_exts = GROUP_CONTEXT_REQUIRED_EXTENSIONS.to_vec();
+        required_exts.push(ExtensionType::Unknown(MULTI_DEVICE_EXTENSION_TYPE));
+
+        Extension::RequiredCapabilities(RequiredCapabilitiesExtension::new(
+            &required_exts,
+            &GROUP_CONTEXT_REQUIRED_PROPOSALS,
+            &[],
+        ))
     }
 
     /// Get the storage provider
