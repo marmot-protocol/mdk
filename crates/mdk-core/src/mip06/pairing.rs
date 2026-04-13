@@ -12,7 +12,10 @@
 //! prevent the External Commit path. The existing device adds the new device via
 //! standard Add proposals and sends back Welcome messages.
 
+use std::fmt;
+
 use tls_codec::{DeserializeBytes, TlsDeserialize, TlsDeserializeBytes, TlsSerialize, TlsSize};
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::error::Error;
 
@@ -26,6 +29,10 @@ fn validate_pairing_version(version: u16) -> Result<(), Error> {
 }
 
 /// Generate `to_bytes()` and `from_bytes()` for a TLS-serializable versioned pairing type.
+///
+/// Each type MUST implement `fn validate(&self) -> Result<(), Error>` for semantic
+/// validation (e.g., non-empty groups, correct PSK length). `from_bytes` calls
+/// `validate()` after version checking so deserialized data is always well-formed.
 macro_rules! impl_versioned_pairing_bytes {
     ($ty:ty, $label:literal) => {
         impl $ty {
@@ -38,7 +45,7 @@ macro_rules! impl_versioned_pairing_bytes {
                 Ok(buf)
             }
 
-            /// Deserialize from bytes with version validation.
+            /// Deserialize from bytes with version and semantic validation.
             pub fn from_bytes(bytes: &[u8]) -> Result<Self, Error> {
                 let (val, remainder) = Self::tls_deserialize_bytes(bytes).map_err(|e| {
                     Error::PairingError(format!(
@@ -50,6 +57,7 @@ macro_rules! impl_versioned_pairing_bytes {
                     return Err(Error::PairingError(format!("trailing bytes in {}", $label)));
                 }
                 validate_pairing_version(val.version)?;
+                val.validate()?;
                 Ok(val)
             }
         }
@@ -70,7 +78,8 @@ macro_rules! impl_versioned_pairing_bytes {
 /// } GroupPairingDataV1;
 /// ```
 #[derive(
-    Debug, Clone, PartialEq, Eq, TlsSerialize, TlsDeserialize, TlsDeserializeBytes, TlsSize,
+    Clone, PartialEq, Eq, Zeroize, ZeroizeOnDrop, TlsSerialize, TlsDeserialize,
+    TlsDeserializeBytes, TlsSize,
 )]
 pub struct GroupPairingDataV1 {
     /// Exact 32-byte outer encryption key for `kind: 445` group-event encryption (MIP-03).
@@ -81,7 +90,18 @@ pub struct GroupPairingDataV1 {
     join_psk: Vec<u8>,
     /// TLS-serialized `GroupInfo` for current epoch. MUST include `external_pub` and
     /// `ratchet_tree` extensions.
+    #[zeroize(skip)]
     group_info: Vec<u8>,
+}
+
+impl fmt::Debug for GroupPairingDataV1 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GroupPairingDataV1")
+            .field("group_event_key", &"[REDACTED]")
+            .field("join_psk", &"[REDACTED]")
+            .field("group_info", &format_args!("[{} bytes]", self.group_info.len()))
+            .finish()
+    }
 }
 
 impl GroupPairingDataV1 {
@@ -91,19 +111,28 @@ impl GroupPairingDataV1 {
         join_psk: Vec<u8>,
         group_info: Vec<u8>,
     ) -> Result<Self, Error> {
-        if join_psk.len() != 32 {
-            return Err(Error::PairingError("join_psk must be 32 bytes".to_string()));
+        let val = Self {
+            group_event_key,
+            join_psk,
+            group_info,
+        };
+        val.validate()?;
+        Ok(val)
+    }
+
+    /// Semantic validation: join_psk must be 32 bytes and group_info non-empty.
+    fn validate(&self) -> Result<(), Error> {
+        if self.join_psk.len() != 32 {
+            return Err(Error::PairingError(
+                "join_psk must be 32 bytes".to_string(),
+            ));
         }
-        if group_info.is_empty() {
+        if self.group_info.is_empty() {
             return Err(Error::PairingError(
                 "group_info must not be empty".to_string(),
             ));
         }
-        Ok(Self {
-            group_event_key,
-            join_psk,
-            group_info,
-        })
+        Ok(())
     }
 
     /// The 32-byte outer encryption key.
@@ -146,16 +175,25 @@ impl PairingPayload {
 
     /// Create a new pairing payload.
     pub fn new(groups: Vec<GroupPairingDataV1>) -> Result<Self, Error> {
-        if groups.is_empty() {
+        let val = Self {
+            version: Self::CURRENT_VERSION,
+            groups,
+        };
+        val.validate()?;
+        Ok(val)
+    }
+
+    /// Semantic validation: must contain at least one group, each group valid.
+    fn validate(&self) -> Result<(), Error> {
+        if self.groups.is_empty() {
             return Err(Error::PairingError(
                 "pairing payload must contain at least one group".to_string(),
             ));
         }
-
-        Ok(Self {
-            version: Self::CURRENT_VERSION,
-            groups,
-        })
+        for group in &self.groups {
+            group.validate()?;
+        }
+        Ok(())
     }
 
     /// The per-group pairing data entries.
@@ -199,6 +237,11 @@ impl DevicePairingRequest {
             version: Self::CURRENT_VERSION,
             key_package_event_json,
         }
+    }
+
+    /// Semantic validation (version already checked by from_bytes).
+    fn validate(&self) -> Result<(), Error> {
+        Ok(())
     }
 
     /// The JSON-serialized Nostr Event bytes containing the KeyPackage.
@@ -265,6 +308,11 @@ impl DevicePairingResponse {
             version: Self::CURRENT_VERSION,
             groups,
         }
+    }
+
+    /// Semantic validation (version already checked by from_bytes).
+    fn validate(&self) -> Result<(), Error> {
+        Ok(())
     }
 
     /// The per-group Welcome data.

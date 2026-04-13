@@ -5,7 +5,7 @@
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 use hkdf::Hkdf;
-use nostr::secp256k1::rand::{RngCore, rngs::OsRng};
+use mdk_storage_traits::Secret;
 use sha2::Sha256;
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 use zeroize::Zeroize;
@@ -125,7 +125,12 @@ pub fn encrypt_pairing_message(
     ),
     Error,
 > {
-    let existing_secret = StaticSecret::random_from_rng(OsRng);
+    let mut secret_bytes = [0u8; 32];
+    getrandom::fill(&mut secret_bytes)
+        .map_err(|e| Error::PairingError(format!("getrandom failed: {e}")))?;
+    let existing_secret = StaticSecret::from(secret_bytes);
+    secret_bytes.zeroize();
+
     let existing_pubkey = X25519PublicKey::from(&existing_secret);
     let existing_pubkey_bytes: [u8; 32] = existing_pubkey.to_bytes();
 
@@ -145,7 +150,8 @@ pub fn encrypt_pairing_message(
 
     // Generate random nonce
     let mut nonce_bytes = [0u8; 12];
-    OsRng.fill_bytes(&mut nonce_bytes);
+    getrandom::fill(&mut nonce_bytes)
+        .map_err(|e| Error::PairingError(format!("getrandom failed: {e}")))?;
 
     let aad = build_aad(new_ephemeral_pubkey, &existing_pubkey_bytes);
 
@@ -176,14 +182,17 @@ pub fn encrypt_pairing_message(
 ///
 /// The new device:
 /// 1. Extracts `existing_ephemeral_pubkey` from the message
-/// 2. Computes `shared_secret = X25519(new_priv, existing_pub)`
-/// 3. Derives decryption key via HKDF-SHA256
-/// 4. Decrypts and verifies with ChaCha20-Poly1305 and AAD
+/// 2. Derives `new_ephemeral_pubkey` from the private key
+/// 3. Computes `shared_secret = X25519(new_priv, existing_pub)`
+/// 4. Derives decryption key via HKDF-SHA256
+/// 5. Decrypts and verifies with ChaCha20-Poly1305 and AAD
 pub fn decrypt_pairing_message(
     message: &PairingMessage,
-    new_ephemeral_privkey: &StaticSecret,
-    new_ephemeral_pubkey: &[u8; 32],
+    new_ephemeral_privkey: &Secret<StaticSecret>,
 ) -> Result<Vec<u8>, Error> {
+    let new_ephemeral_pubkey = X25519PublicKey::from(new_ephemeral_privkey.as_ref());
+    let new_ephemeral_pubkey_bytes = new_ephemeral_pubkey.to_bytes();
+
     let existing_pubkey = X25519PublicKey::from(message.existing_ephemeral_pubkey);
     let shared_secret = new_ephemeral_privkey.diffie_hellman(&existing_pubkey);
     if !shared_secret.was_contributory() {
@@ -198,7 +207,7 @@ pub fn decrypt_pairing_message(
     let mut key = derive_key(&shared_secret)?;
     shared_secret.zeroize();
 
-    let aad = build_aad(new_ephemeral_pubkey, &message.existing_ephemeral_pubkey);
+    let aad = build_aad(&new_ephemeral_pubkey_bytes, &message.existing_ephemeral_pubkey);
 
     let cipher = ChaCha20Poly1305::new((&key).into());
     key.zeroize();
@@ -219,12 +228,15 @@ pub fn decrypt_pairing_message(
 
 /// Generate a fresh X25519 keypair for the new device's pairing session.
 ///
-/// Returns `(private_key, public_key_bytes)`.
-/// The caller MUST securely delete the private key after the pairing session.
-pub fn generate_new_device_keypair() -> (StaticSecret, [u8; 32]) {
-    let secret = StaticSecret::random_from_rng(OsRng);
+/// Returns `(Secret<private_key>, public_key_bytes)`.
+/// The private key is wrapped in `Secret` and zeroized on drop.
+pub fn generate_new_device_keypair() -> (Secret<StaticSecret>, [u8; 32]) {
+    let mut secret_bytes = [0u8; 32];
+    getrandom::fill(&mut secret_bytes).expect("getrandom failed");
+    let secret = StaticSecret::from(secret_bytes);
+    secret_bytes.zeroize();
     let pubkey = X25519PublicKey::from(&secret);
-    (secret, pubkey.to_bytes())
+    (Secret::new(secret), pubkey.to_bytes())
 }
 
 #[cfg(test)]
@@ -238,24 +250,20 @@ mod tests {
 
         let (_existing_pub, message) = encrypt_pairing_message(plaintext, &new_pub).unwrap();
 
-        let decrypted = decrypt_pairing_message(&message, &new_priv, &new_pub).unwrap();
+        let decrypted = decrypt_pairing_message(&message, &new_priv).unwrap();
         assert_eq!(decrypted, plaintext);
     }
 
     #[test]
     fn test_wrong_key_fails() {
-        let (new_priv, new_pub) = generate_new_device_keypair();
-        let (wrong_priv, wrong_pub) = generate_new_device_keypair();
+        let (_new_priv, new_pub) = generate_new_device_keypair();
+        let (wrong_priv, _wrong_pub) = generate_new_device_keypair();
         let plaintext = b"secret data";
 
         let (_existing_pub, message) = encrypt_pairing_message(plaintext, &new_pub).unwrap();
 
-        // Decrypt with wrong private key should fail
-        let result = decrypt_pairing_message(&message, &wrong_priv, &new_pub);
-        assert!(result.is_err());
-
-        // Decrypt with wrong pubkey in AAD should also fail
-        let result = decrypt_pairing_message(&message, &new_priv, &wrong_pub);
+        // Decrypt with wrong private key should fail (wrong shared secret + wrong AAD)
+        let result = decrypt_pairing_message(&message, &wrong_priv);
         assert!(result.is_err());
     }
 
@@ -271,7 +279,7 @@ mod tests {
             *byte ^= 0xFF;
         }
 
-        let result = decrypt_pairing_message(&message, &new_priv, &new_pub);
+        let result = decrypt_pairing_message(&message, &new_priv);
         assert!(result.is_err());
     }
 
@@ -293,7 +301,7 @@ mod tests {
         assert_eq!(parsed.ciphertext, message.ciphertext);
 
         // Decrypt the parsed message
-        let decrypted = decrypt_pairing_message(&parsed, &new_priv, &new_pub).unwrap();
+        let decrypted = decrypt_pairing_message(&parsed, &new_priv).unwrap();
         assert_eq!(decrypted, plaintext);
     }
 

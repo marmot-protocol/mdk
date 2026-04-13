@@ -2208,12 +2208,14 @@ impl Mdk {
     /// `pairing_payload_bytes`: TLS-serialized PairingPayload (from build_pairing_payload)
     /// `nostr_secret_key_hex`: hex-encoded Nostr secret key
     ///
-    /// Returns one ExternalCommitJoinResult per group.
+    /// Returns one `ExternalCommitGroupOutcome` per group. Each outcome is either
+    /// `Success` with the commit data or `Failure` with an error message. Prior
+    /// successes are preserved even if later groups fail.
     pub fn join_groups_via_external_commit(
         &self,
         pairing_payload_bytes: Vec<u8>,
         nostr_secret_key_hex: String,
-    ) -> Result<Vec<ExternalCommitJoinResult>, MdkUniffiError> {
+    ) -> Result<Vec<ExternalCommitGroupOutcome>, MdkUniffiError> {
         use mdk_core::mip06::PairingPayload;
 
         let payload = PairingPayload::from_bytes(&pairing_payload_bytes).map_err(|e| {
@@ -2225,14 +2227,22 @@ impl Mdk {
         let keys = nostr::Keys::new(secret_key);
 
         let mdk = self.lock()?;
-        let mut results = Vec::new();
+        let mut results = Vec::with_capacity(payload.groups().len());
         for group_data in payload.groups() {
-            let result = mdk.join_group_via_external_commit(group_data, &keys)?;
-            results.push(ExternalCommitJoinResult {
-                commit_message: result.commit_message,
-                mls_group_id: hex::encode(result.group_id.as_slice()),
-                group_event_key: result.group_event_key.as_ref().to_vec(),
-            });
+            match mdk.join_group_via_external_commit(group_data, &keys) {
+                Ok(result) => {
+                    results.push(ExternalCommitGroupOutcome::Success {
+                        commit_message: result.commit_message,
+                        mls_group_id: hex::encode(result.group_id.as_slice()),
+                        group_event_key: result.group_event_key.as_ref().to_vec(),
+                    });
+                }
+                Err(e) => {
+                    results.push(ExternalCommitGroupOutcome::Failure {
+                        error: e.to_string(),
+                    });
+                }
+            }
         }
         Ok(results)
     }
@@ -2246,6 +2256,31 @@ impl Mdk {
         let mdk = self.lock()?;
         Ok(mdk.register_join_psk(&group_id)?)
     }
+}
+
+/// Per-group outcome of joining via MIP-06 External Commit.
+///
+/// Each group in the pairing payload produces either a `Success` with the
+/// commit data needed for publication, or a `Failure` with an error message.
+/// This allows callers to see which groups succeeded without losing prior
+/// successes when a later group fails.
+#[cfg(feature = "mip06")]
+#[derive(uniffi::Enum)]
+pub enum ExternalCommitGroupOutcome {
+    /// Successfully joined this group.
+    Success {
+        /// TLS-serialized External Commit message for publication as kind:445.
+        commit_message: Vec<u8>,
+        /// Hex-encoded MLS group ID that was joined.
+        mls_group_id: String,
+        /// 32-byte MIP-03 group_event_key for outer encryption of the commit event.
+        group_event_key: Vec<u8>,
+    },
+    /// Failed to join this group.
+    Failure {
+        /// Human-readable error message.
+        error: String,
+    },
 }
 
 /// Result of joining a group via MIP-06 External Commit.

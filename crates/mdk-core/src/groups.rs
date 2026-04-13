@@ -24,9 +24,14 @@ use mdk_storage_traits::messages::types as message_types;
 use nostr::prelude::*;
 use openmls::prelude::*;
 #[cfg(feature = "mip06")]
+use openmls::schedule::psk::{ExternalPsk, PreSharedKeyId, Psk};
+#[cfg(feature = "mip06")]
 use openmls::treesync::LeafNodeSource;
 use openmls_basic_credential::SignatureKeyPair;
 use tls_codec::Serialize as TlsSerialize;
+
+#[cfg(feature = "mip06")]
+use crate::mip06::{GroupPairingDataV1, GroupWelcomeData, MarmotMultiDevice};
 
 use sha2::{Digest, Sha256};
 
@@ -483,8 +488,6 @@ where
         &self,
         mls_group: &MlsGroup,
     ) -> Result<Vec<u8>, Error> {
-        use tls_codec::{DeserializeBytes as _, Serialize as _};
-
         let signer = self.load_mls_signer(mls_group)?;
         let group_info_msg = mls_group
             .export_group_info(self.provider.crypto(), &signer, false)
@@ -1372,8 +1375,6 @@ where
         member_key_package_events: Vec<Event>,
         config: NostrGroupConfigData,
     ) -> Result<GroupResult, Error> {
-        use crate::mip06::MarmotMultiDevice;
-
         let group_data = Self::build_group_data_from_config(&config)?;
         let nostr_ext = Self::get_unknown_extension_from_group_data(&group_data)?;
         let multi_device_ext = MarmotMultiDevice::new().as_extension()?;
@@ -1522,8 +1523,6 @@ where
     /// same lifecycle as `add_members` and `remove_members`.
     #[cfg(feature = "mip06")]
     pub fn enable_multi_device(&self, group_id: &GroupId) -> Result<Event, Error> {
-        use crate::mip06::MarmotMultiDevice;
-
         let mut mls_group = self.load_mls_group(group_id)?.ok_or(Error::GroupNotFound)?;
         let signer = self.load_mls_signer(&mls_group)?;
 
@@ -1560,6 +1559,12 @@ where
         let serialized_commit = commit_message.tls_serialize_detached()?;
         let commit_event = self.build_message_event(group_id, serialized_commit, None)?;
 
+        self.track_processed_message(
+            commit_event.id,
+            &mls_group,
+            message_types::ProcessedMessageState::ProcessedCommit,
+        )?;
+
         Ok(commit_event)
     }
 
@@ -1581,8 +1586,6 @@ where
         group_ids: &[GroupId],
         key_package_event: &Event,
     ) -> Result<crate::mip06::DevicePairingResponse, Error> {
-        use crate::mip06::GroupWelcomeData;
-
         let mut group_welcomes = Vec::with_capacity(group_ids.len());
         let mut successful_group_ids = Vec::with_capacity(group_ids.len());
 
@@ -1627,8 +1630,6 @@ where
     /// If the group does not have MIP-06 enabled, this is a no-op.
     #[cfg(feature = "mip06")]
     pub fn register_join_psk(&self, group_id: &GroupId) -> Result<(), Error> {
-        use openmls::schedule::psk::{ExternalPsk, PreSharedKeyId, Psk};
-
         let mls_group = self.load_mls_group(group_id)?.ok_or(Error::GroupNotFound)?;
 
         if !crate::mip06::is_multi_device_enabled(&mls_group) {
@@ -1637,6 +1638,12 @@ where
 
         let (join_psk_id, join_psk_bytes) = self.derive_join_psk_with_id(&mls_group)?;
         let join_psk_id_bytes = join_psk_id.to_bytes()?;
+
+        // Delete any existing PSK with this ID to prevent accumulation on re-registration.
+        let _ = self
+            .provider
+            .storage()
+            .delete_psk(&Psk::External(ExternalPsk::new(join_psk_id_bytes.clone())));
 
         let psk = Psk::External(ExternalPsk::new(join_psk_id_bytes));
         let psk_id = PreSharedKeyId::new(mls_group.ciphersuite(), self.provider.rand(), psk)
@@ -1669,9 +1676,6 @@ where
         &self,
         group_ids: &[GroupId],
     ) -> Result<crate::mip06::PairingPayload, Error> {
-        use crate::mip06::GroupPairingDataV1;
-        use tls_codec::Serialize as TlsSerializeExt;
-
         let mut groups = Vec::with_capacity(group_ids.len());
 
         for group_id in group_ids {
@@ -1723,8 +1727,6 @@ where
         pairing_data: &crate::mip06::GroupPairingDataV1,
         nostr_keys: &nostr::Keys,
     ) -> Result<ExternalCommitResult, Error> {
-        use openmls::schedule::psk::{ExternalPsk, PreSharedKeyId, Psk};
-
         let gi_bytes = pairing_data.group_info();
         let (msg_in, remainder) =
             <MlsMessageIn as tls_codec::DeserializeBytes>::tls_deserialize_bytes(gi_bytes)
@@ -1862,68 +1864,123 @@ where
         let join_psk_id = crate::mip06::JoinPskId::from_group_context_bytes(gc_bytes);
         let join_psk_id_bytes = join_psk_id.to_bytes()?;
 
-        let psk = Psk::External(ExternalPsk::new(join_psk_id_bytes));
+        // Delete any existing PSK with this ID to prevent accumulation
+        let _ = self
+            .provider
+            .storage()
+            .delete_psk(&Psk::External(ExternalPsk::new(join_psk_id_bytes.clone())));
+
+        let psk = Psk::External(ExternalPsk::new(join_psk_id_bytes.clone()));
         let psk_id = PreSharedKeyId::new(ciphersuite, self.provider.rand(), psk)
             .map_err(|e| Error::PairingError(format!("failed to create PreSharedKeyId: {e}")))?;
+
         psk_id
             .store(&self.provider, pairing_data.join_psk())
             .map_err(|e| Error::PairingError(format!("failed to store join PSK: {e}")))?;
 
-        let (credential, signer) = self.generate_credential_with_key(&nostr_keys.public_key())?;
+        // Keep bytes for PSK cleanup if subsequent operations fail
+        let psk_cleanup_bytes = join_psk_id_bytes;
 
-        // Identity proof must be constructed before build_group() — the challenge
-        // binds to credential_identity + signature_key, both known at this point.
-        let credential_identity = nostr_keys.public_key().to_bytes().to_vec();
-        let signature_key_bytes = credential.signature_key.as_slice().to_vec();
+        let result: Result<ExternalCommitResult, Error> = (|| {
+            let (credential, signer) =
+                self.generate_credential_with_key(&nostr_keys.public_key())?;
 
-        let identity_proof = crate::mip06::construct_identity_proof(
-            nostr_keys,
-            &credential_identity,
-            &signature_key_bytes,
-            gc_bytes,
-        )?;
-        let aad = identity_proof.to_authenticated_data()?;
+            // Identity proof must be constructed before build_group() — the challenge
+            // binds to credential_identity + signature_key, both known at this point.
+            let credential_identity = nostr_keys.public_key().to_bytes().to_vec();
+            let signature_key_bytes = credential.signature_key.as_slice().to_vec();
 
-        let leaf_params = LeafNodeParameters::builder()
-            .with_capabilities(self.capabilities())
-            .build();
+            let identity_proof = crate::mip06::construct_identity_proof(
+                nostr_keys,
+                &credential_identity,
+                &signature_key_bytes,
+                gc_bytes,
+            )?;
+            let aad = identity_proof.to_authenticated_data()?;
 
-        let commit_builder = MlsGroup::external_commit_builder()
-            .with_aad(aad)
-            .build_group(&self.provider, vgi, credential)
-            .map_err(|e| {
-                Error::PairingError(format!("failed to build external commit group: {e}"))
-            })?
-            .leaf_node_parameters(leaf_params);
+            let leaf_params = LeafNodeParameters::builder()
+                .with_capabilities(self.capabilities())
+                .build();
 
-        let psk_proposal = openmls::messages::proposals::PreSharedKeyProposal::new(psk_id);
+            let commit_builder = MlsGroup::external_commit_builder()
+                .with_aad(aad)
+                .build_group(&self.provider, vgi, credential)
+                .map_err(|e| {
+                    Error::PairingError(format!("failed to build external commit group: {e}"))
+                })?
+                .leaf_node_parameters(leaf_params);
 
-        let (mls_group, commit_bundle) = commit_builder
-            .add_psk_proposal(psk_proposal)
-            .load_psks(self.provider.storage())
-            .map_err(|e| Error::PairingError(format!("failed to load PSKs: {e}")))?
-            .build(
-                self.provider.rand(),
-                self.provider.crypto(),
-                &signer,
-                |_| true,
-            )
-            .map_err(|e| Error::PairingError(format!("failed to build external commit: {e}")))?
-            .finalize(&self.provider)
-            .map_err(|e| Error::PairingError(format!("failed to finalize external commit: {e}")))?;
+            let psk_proposal = openmls::messages::proposals::PreSharedKeyProposal::new(psk_id);
 
-        let (commit_msg_out, _welcome, _group_info) = commit_bundle.into_messages();
-        let commit_msg = commit_msg_out
-            .tls_serialize_detached()
-            .map_err(|e| Error::PairingError(format!("failed to serialize commit message: {e}")))?;
+            let (mls_group, commit_bundle) = commit_builder
+                .add_psk_proposal(psk_proposal)
+                .load_psks(self.provider.storage())
+                .map_err(|e| Error::PairingError(format!("failed to load PSKs: {e}")))?
+                .build(
+                    self.provider.rand(),
+                    self.provider.crypto(),
+                    &signer,
+                    |_| true,
+                )
+                .map_err(|e| {
+                    Error::PairingError(format!("failed to build external commit: {e}"))
+                })?
+                .finalize(&self.provider)
+                .map_err(|e| {
+                    Error::PairingError(format!("failed to finalize external commit: {e}"))
+                })?;
 
-        let group_id = mdk_storage_traits::GroupId::from(mls_group.group_id());
+            let (commit_msg_out, _welcome, _group_info) = commit_bundle.into_messages();
+            let commit_msg = commit_msg_out.tls_serialize_detached().map_err(|e| {
+                Error::PairingError(format!("failed to serialize commit message: {e}"))
+            })?;
 
-        Ok(ExternalCommitResult {
-            commit_message: commit_msg,
-            group_id,
-            group_event_key: Secret::new(*pairing_data.group_event_key()),
-        })
+            let group_id = mdk_storage_traits::GroupId::from(mls_group.group_id());
+
+            // Persist the group to MDK storage so merge_pending_commit / sync_group_metadata_from_mls
+            // can find it.
+            let group_data = NostrGroupDataExtension::from_group(&mls_group)?;
+            let group = group_types::Group {
+                mls_group_id: group_id.clone(),
+                nostr_group_id: group_data.nostr_group_id,
+                name: group_data.name,
+                description: group_data.description,
+                admin_pubkeys: group_data.admins,
+                last_message_id: None,
+                last_message_at: None,
+                last_message_processed_at: None,
+                epoch: mls_group.epoch().as_u64(),
+                state: group_types::GroupState::Active,
+                image_hash: group_data.image_hash,
+                image_key: group_data.image_key.map(mdk_storage_traits::Secret::new),
+                image_nonce: group_data.image_nonce.map(mdk_storage_traits::Secret::new),
+                self_update_state: group_types::SelfUpdateState::Required,
+            };
+
+            self.storage()
+                .save_group(group)
+                .map_err(|e| Error::Group(e.to_string()))?;
+
+            self.storage()
+                .replace_group_relays(&group_id, group_data.relays)
+                .map_err(|e| Error::Group(e.to_string()))?;
+
+            Ok(ExternalCommitResult {
+                commit_message: commit_msg,
+                group_id,
+                group_event_key: Secret::new(*pairing_data.group_event_key()),
+            })
+        })();
+
+        // Clean up stored PSK if subsequent operations failed
+        if result.is_err() {
+            let _ = self
+                .provider
+                .storage()
+                .delete_psk(&Psk::External(ExternalPsk::new(psk_cleanup_bytes)));
+        }
+
+        result
     }
 
     /// Updates the current member's leaf node in an MLS group.

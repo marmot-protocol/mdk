@@ -98,7 +98,7 @@ mod integration_tests {
         let (_existing_pub, encrypted) =
             super::encrypt_pairing_message(&kp_bytes, &new_pub).unwrap();
 
-        let decrypted = super::decrypt_pairing_message(&encrypted, &new_priv, &new_pub).unwrap();
+        let decrypted = super::decrypt_pairing_message(&encrypted, &new_priv).unwrap();
 
         let request = super::DevicePairingRequest::from_bytes(&decrypted).unwrap();
 
@@ -118,7 +118,7 @@ mod integration_tests {
             super::encrypt_pairing_message(&response_bytes, &new_pub).unwrap();
 
         let decrypted_response =
-            super::decrypt_pairing_message(&encrypted_response, &new_priv, &new_pub).unwrap();
+            super::decrypt_pairing_message(&encrypted_response, &new_priv).unwrap();
 
         let response = super::DevicePairingResponse::from_bytes(&decrypted_response).unwrap();
 
