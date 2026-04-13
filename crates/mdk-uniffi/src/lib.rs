@@ -2109,10 +2109,7 @@ impl Mdk {
     /// Enable MIP-06 multi-device support on an existing group.
     ///
     /// Returns the commit event JSON to publish to relays.
-    pub fn enable_multi_device(
-        &self,
-        mls_group_id: String,
-    ) -> Result<String, MdkUniffiError> {
+    pub fn enable_multi_device(&self, mls_group_id: String) -> Result<String, MdkUniffiError> {
         let group_id = parse_group_id(&mls_group_id)?;
         let mdk = self.lock()?;
         let event = mdk.enable_multi_device(&group_id)?;
@@ -2166,10 +2163,7 @@ impl Mdk {
     }
 
     /// Get all leaf indices belonging to the local user in a group.
-    pub fn own_device_leaves(
-        &self,
-        mls_group_id: String,
-    ) -> Result<Vec<u32>, MdkUniffiError> {
+    pub fn own_device_leaves(&self, mls_group_id: String) -> Result<Vec<u32>, MdkUniffiError> {
         let group_id = parse_group_id(&mls_group_id)?;
         let mdk = self.lock()?;
         Ok(mdk.own_device_leaves(&group_id)?)
@@ -2208,8 +2202,9 @@ impl Mdk {
     ) -> Result<Vec<ExternalCommitJoinResult>, MdkUniffiError> {
         use mdk_core::mip06::PairingPayload;
 
-        let payload = PairingPayload::from_bytes(&pairing_payload_bytes)
-            .map_err(|e| MdkUniffiError::Mdk(format!("failed to deserialize pairing payload: {e}")))?;
+        let payload = PairingPayload::from_bytes(&pairing_payload_bytes).map_err(|e| {
+            MdkUniffiError::Mdk(format!("failed to deserialize pairing payload: {e}"))
+        })?;
 
         let secret_key = nostr::SecretKey::parse(&nostr_secret_key_hex)
             .map_err(|e| MdkUniffiError::InvalidInput(format!("invalid secret key: {e}")))?;
@@ -2232,10 +2227,7 @@ impl Mdk {
     ///
     /// Normally called automatically after epoch changes, but can be called
     /// manually to ensure the PSK is registered before processing External Commits.
-    pub fn register_join_psk(
-        &self,
-        mls_group_id: String,
-    ) -> Result<(), MdkUniffiError> {
+    pub fn register_join_psk(&self, mls_group_id: String) -> Result<(), MdkUniffiError> {
         let group_id = parse_group_id(&mls_group_id)?;
         let mdk = self.lock()?;
         Ok(mdk.register_join_psk(&group_id)?)

@@ -31,7 +31,9 @@ const PROOF_EVENT_KIND: u16 = 450;
 ///     opaque nostr_event_sig[64];      // Nostr signature over canonical proof event id
 /// } NostrIdentityProof;
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq, TlsSerialize, TlsDeserialize, TlsDeserializeBytes, TlsSize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, TlsSerialize, TlsDeserialize, TlsDeserializeBytes, TlsSize,
+)]
 pub struct NostrIdentityProof {
     version: u16,
     nostr_event_sig: [u8; 64],
@@ -123,10 +125,7 @@ pub fn compute_challenge(
 ///   "content": "<hex-encoded challenge>"
 /// }
 /// ```
-fn sign_canonical_proof_event(
-    keys: &Keys,
-    challenge: &[u8; 32],
-) -> Result<nostr::Event, Error> {
+fn sign_canonical_proof_event(keys: &Keys, challenge: &[u8; 32]) -> Result<nostr::Event, Error> {
     let content = hex::encode(challenge);
 
     let event = EventBuilder::new(Kind::Custom(PROOF_EVENT_KIND), &content)
@@ -159,9 +158,9 @@ fn verify_canonical_proof_event(
         .build(*pubkey);
 
     // Verify the Schnorr signature over the event id
-    let event_id = unsigned.id.ok_or_else(|| {
-        Error::IdentityProofError("failed to compute proof event id".to_string())
-    })?;
+    let event_id = unsigned
+        .id
+        .ok_or_else(|| Error::IdentityProofError("failed to compute proof event id".to_string()))?;
     let event_id_bytes: [u8; 32] = event_id.to_bytes();
     let sig = nostr::secp256k1::schnorr::Signature::from_slice(sig_bytes)
         .map_err(|e| Error::IdentityProofError(format!("invalid signature format: {e}")))?;
@@ -270,8 +269,7 @@ mod tests {
 
         let proof = construct_identity_proof(&keys, cred, sig_key, gc).unwrap();
 
-        let result =
-            verify_identity_proof(&proof, &keys.public_key(), b"wrong-cred", sig_key, gc);
+        let result = verify_identity_proof(&proof, &keys.public_key(), b"wrong-cred", sig_key, gc);
         assert!(result.is_err());
     }
 
@@ -284,8 +282,7 @@ mod tests {
 
         let proof = construct_identity_proof(&keys, cred, sig_key, gc).unwrap();
 
-        let result =
-            verify_identity_proof(&proof, &keys.public_key(), cred, b"wrong-sigkey", gc);
+        let result = verify_identity_proof(&proof, &keys.public_key(), cred, b"wrong-sigkey", gc);
         assert!(result.is_err());
     }
 

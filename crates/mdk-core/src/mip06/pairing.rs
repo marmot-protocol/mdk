@@ -38,7 +38,9 @@ fn validate_pairing_version(version: u16) -> Result<(), Error> {
 ///     opaque group_info<1..2^32-1>;
 /// } GroupPairingDataV1;
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq, TlsSerialize, TlsDeserialize, TlsDeserializeBytes, TlsSize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, TlsSerialize, TlsDeserialize, TlsDeserializeBytes, TlsSize,
+)]
 pub struct GroupPairingDataV1 {
     /// Exact 32-byte outer encryption key for `kind: 445` group-event encryption (MIP-03).
     group_event_key: [u8; 32],
@@ -99,7 +101,9 @@ impl GroupPairingDataV1 {
 ///     GroupPairingDataV1 groups<1..2^32-1>;
 /// } PairingPayload;
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq, TlsSerialize, TlsDeserialize, TlsDeserializeBytes, TlsSize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, TlsSerialize, TlsDeserialize, TlsDeserializeBytes, TlsSize,
+)]
 pub struct PairingPayload {
     /// Payload format version. Current: 1. Version 0 is reserved.
     version: u16,
@@ -140,8 +144,9 @@ impl PairingPayload {
 
     /// Deserialize from bytes with version validation.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, Error> {
-        let (payload, _) = Self::tls_deserialize_bytes(bytes)
-            .map_err(|e| Error::PairingError(format!("failed to deserialize pairing payload: {e}")))?;
+        let (payload, _) = Self::tls_deserialize_bytes(bytes).map_err(|e| {
+            Error::PairingError(format!("failed to deserialize pairing payload: {e}"))
+        })?;
         validate_pairing_version(payload.version)?;
         Ok(payload)
     }
@@ -153,7 +158,9 @@ impl PairingPayload {
 ///
 /// Contains a single KeyPackage that the existing device will use to add
 /// the new device to groups via standard MLS Add proposals.
-#[derive(Debug, Clone, PartialEq, Eq, TlsSerialize, TlsDeserialize, TlsDeserializeBytes, TlsSize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, TlsSerialize, TlsDeserialize, TlsDeserializeBytes, TlsSize,
+)]
 pub struct DevicePairingRequest {
     /// Version of the pairing request format.
     version: u16,
@@ -189,15 +196,18 @@ impl DevicePairingRequest {
 
     /// Deserialize from bytes with version validation.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, Error> {
-        let (req, _) = Self::tls_deserialize_bytes(bytes)
-            .map_err(|e| Error::PairingError(format!("failed to deserialize pairing request: {e}")))?;
+        let (req, _) = Self::tls_deserialize_bytes(bytes).map_err(|e| {
+            Error::PairingError(format!("failed to deserialize pairing request: {e}"))
+        })?;
         validate_pairing_version(req.version)?;
         Ok(req)
     }
 }
 
 /// Per-group Welcome data sent from existing device to new device (Add-based workaround).
-#[derive(Debug, Clone, PartialEq, Eq, TlsSerialize, TlsDeserialize, TlsDeserializeBytes, TlsSize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, TlsSerialize, TlsDeserialize, TlsDeserializeBytes, TlsSize,
+)]
 pub struct GroupWelcomeData {
     /// The Welcome rumor (unsigned event JSON bytes) for this group.
     welcome_rumor: Vec<u8>,
@@ -230,7 +240,9 @@ impl GroupWelcomeData {
 /// Response sent from existing device to new device (Add-based workaround).
 ///
 /// Contains Welcome messages for each group the new device was added to.
-#[derive(Debug, Clone, PartialEq, Eq, TlsSerialize, TlsDeserialize, TlsDeserializeBytes, TlsSize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, TlsSerialize, TlsDeserialize, TlsDeserializeBytes, TlsSize,
+)]
 pub struct DevicePairingResponse {
     /// Version of the pairing response format.
     version: u16,
@@ -271,8 +283,9 @@ impl DevicePairingResponse {
 
     /// Deserialize from bytes with version validation.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, Error> {
-        let (resp, _) = Self::tls_deserialize_bytes(bytes)
-            .map_err(|e| Error::PairingError(format!("failed to deserialize pairing response: {e}")))?;
+        let (resp, _) = Self::tls_deserialize_bytes(bytes).map_err(|e| {
+            Error::PairingError(format!("failed to deserialize pairing response: {e}"))
+        })?;
         validate_pairing_version(resp.version)?;
         Ok(resp)
     }
@@ -304,14 +317,20 @@ mod tests {
 
     #[test]
     fn test_request_version_0_rejected() {
-        let req = DevicePairingRequest { version: 0, key_package: vec![] };
+        let req = DevicePairingRequest {
+            version: 0,
+            key_package: vec![],
+        };
         let bytes = req.to_bytes().unwrap();
         assert!(DevicePairingRequest::from_bytes(&bytes).is_err());
     }
 
     #[test]
     fn test_response_version_99_rejected() {
-        let resp = DevicePairingResponse { version: 99, groups: vec![] };
+        let resp = DevicePairingResponse {
+            version: 99,
+            groups: vec![],
+        };
         let bytes = resp.to_bytes().unwrap();
         assert!(DevicePairingResponse::from_bytes(&bytes).is_err());
     }
@@ -320,11 +339,11 @@ mod tests {
 
     #[test]
     fn test_group_pairing_data_v1_roundtrip() {
-        use tls_codec::{Serialize, DeserializeBytes};
+        use tls_codec::{DeserializeBytes, Serialize};
 
         let data = GroupPairingDataV1::new(
             [0xAA; 32],
-            vec![0xBB; 32], // join_psk (KDF.Nh = 32 for ciphersuite 0x0001)
+            vec![0xBB; 32],  // join_psk (KDF.Nh = 32 for ciphersuite 0x0001)
             vec![0xCC; 200], // group_info
         )
         .unwrap();
@@ -365,14 +384,20 @@ mod tests {
 
     #[test]
     fn test_pairing_payload_version_0_rejected() {
-        let payload = PairingPayload { version: 0, groups: vec![] };
+        let payload = PairingPayload {
+            version: 0,
+            groups: vec![],
+        };
         let bytes = payload.to_bytes().unwrap();
         assert!(PairingPayload::from_bytes(&bytes).is_err());
     }
 
     #[test]
     fn test_pairing_payload_version_99_rejected() {
-        let payload = PairingPayload { version: 99, groups: vec![] };
+        let payload = PairingPayload {
+            version: 99,
+            groups: vec![],
+        };
         let bytes = payload.to_bytes().unwrap();
         assert!(PairingPayload::from_bytes(&bytes).is_err());
     }

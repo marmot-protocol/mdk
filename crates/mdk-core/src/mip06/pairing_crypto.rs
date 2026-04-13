@@ -76,10 +76,7 @@ impl PairingMessage {
 /// Build the AAD for pairing encryption.
 ///
 /// `aad = "marmot-pairing-v1" || new_ephemeral_pubkey || existing_ephemeral_pubkey`
-fn build_aad(
-    new_ephemeral_pubkey: &[u8; 32],
-    existing_ephemeral_pubkey: &[u8; 32],
-) -> Vec<u8> {
+fn build_aad(new_ephemeral_pubkey: &[u8; 32], existing_ephemeral_pubkey: &[u8; 32]) -> Vec<u8> {
     let mut aad = Vec::with_capacity(AAD_PREFIX.len() + 32 + 32);
     aad.extend_from_slice(AAD_PREFIX);
     aad.extend_from_slice(new_ephemeral_pubkey);
@@ -118,8 +115,14 @@ fn reject_zero_shared_secret(shared_secret: &[u8; 32]) -> Result<(), Error> {
 pub fn encrypt_pairing_message(
     plaintext: &[u8],
     new_ephemeral_pubkey: &[u8; 32],
-) -> Result<(/* existing_ephemeral_pubkey */ [u8; 32], PairingMessage), Error> {
-    let existing_secret = StaticSecret::random_from_rng(&mut OsRng);
+) -> Result<
+    (
+        /* existing_ephemeral_pubkey */ [u8; 32],
+        PairingMessage,
+    ),
+    Error,
+> {
+    let existing_secret = StaticSecret::random_from_rng(OsRng);
     let existing_pubkey = X25519PublicKey::from(&existing_secret);
     let existing_pubkey_bytes: [u8; 32] = existing_pubkey.to_bytes();
 
@@ -206,7 +209,7 @@ pub fn decrypt_pairing_message(
 /// Returns `(private_key, public_key_bytes)`.
 /// The caller MUST securely delete the private key after the pairing session.
 pub fn generate_new_device_keypair() -> (StaticSecret, [u8; 32]) {
-    let secret = StaticSecret::random_from_rng(&mut OsRng);
+    let secret = StaticSecret::random_from_rng(OsRng);
     let pubkey = X25519PublicKey::from(&secret);
     (secret, pubkey.to_bytes())
 }
@@ -269,7 +272,10 @@ mod tests {
         let wire_bytes = message.to_bytes();
         let parsed = PairingMessage::from_bytes(&wire_bytes).unwrap();
 
-        assert_eq!(parsed.existing_ephemeral_pubkey, message.existing_ephemeral_pubkey);
+        assert_eq!(
+            parsed.existing_ephemeral_pubkey,
+            message.existing_ephemeral_pubkey
+        );
         assert_eq!(parsed.nonce, message.nonce);
         assert_eq!(parsed.ciphertext, message.ciphertext);
 

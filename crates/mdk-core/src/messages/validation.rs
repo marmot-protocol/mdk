@@ -451,9 +451,7 @@ where
         // 4. Credential identity in joining LeafNode matches an existing member.
         //    The joining LeafNode is in the commit's update path.
         let joining_leaf = staged_commit.update_path_leaf_node().ok_or_else(|| {
-            Error::IdentityProofError(
-                "External Commit has no update path leaf node".to_string(),
-            )
+            Error::IdentityProofError("External Commit has no update path leaf node".to_string())
         })?;
         let joining_cred = BasicCredential::try_from(joining_leaf.credential().clone())
             .map_err(|e| Error::IdentityProofError(format!("invalid credential: {e}")))?;
@@ -545,9 +543,7 @@ where
 
         // Extract joining LeafNode from the commit's update path
         let joining_leaf = staged_commit.update_path_leaf_node().ok_or_else(|| {
-            Error::IdentityProofError(
-                "External Commit has no update path leaf node".to_string(),
-            )
+            Error::IdentityProofError("External Commit has no update path leaf node".to_string())
         })?;
 
         // Extract credential identity (raw Nostr pubkey bytes) and signature key

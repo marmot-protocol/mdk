@@ -3,8 +3,8 @@
 //! Device names are NIP-44 encrypted with the user's own Nostr keypair
 //! so only the owner can read them.
 
-use nostr::nips::nip44;
 use nostr::Keys;
+use nostr::nips::nip44;
 use tls_codec::{TlsDeserialize, TlsDeserializeBytes, TlsSerialize, TlsSize};
 
 use crate::error::Error;
@@ -16,7 +16,9 @@ use crate::error::Error;
 ///     opaque encrypted_device_name<1..2^16-1>;  // NIP-44 ciphertext
 /// } EncryptedDeviceName;
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq, TlsSerialize, TlsDeserialize, TlsDeserializeBytes, TlsSize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, TlsSerialize, TlsDeserialize, TlsDeserializeBytes, TlsSize,
+)]
 pub struct EncryptedDeviceName {
     encrypted_device_name: Vec<u8>,
 }
