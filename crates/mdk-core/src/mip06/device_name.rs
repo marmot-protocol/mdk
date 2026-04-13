@@ -76,6 +76,8 @@ impl EncryptedDeviceName {
 
 #[cfg(test)]
 mod tests {
+    use tls_codec::{DeserializeBytes, Serialize};
+
     use super::*;
 
     #[test]
@@ -115,8 +117,6 @@ mod tests {
 
     #[test]
     fn test_tls_roundtrip() {
-        use tls_codec::{DeserializeBytes, Serialize};
-
         let keys = Keys::generate();
         let encrypted = EncryptedDeviceName::encrypt(&keys, "Laptop").unwrap();
 

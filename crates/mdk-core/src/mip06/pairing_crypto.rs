@@ -130,7 +130,13 @@ pub fn encrypt_pairing_message(
     let existing_pubkey_bytes: [u8; 32] = existing_pubkey.to_bytes();
 
     let new_pubkey = X25519PublicKey::from(*new_ephemeral_pubkey);
-    let mut shared_secret: [u8; 32] = existing_secret.diffie_hellman(&new_pubkey).to_bytes();
+    let shared_secret = existing_secret.diffie_hellman(&new_pubkey);
+    if !shared_secret.was_contributory() {
+        return Err(Error::PairingError(
+            "X25519 shared secret is non-contributory".to_string(),
+        ));
+    }
+    let mut shared_secret: [u8; 32] = shared_secret.to_bytes();
 
     reject_zero_shared_secret(&shared_secret)?;
 
@@ -179,9 +185,13 @@ pub fn decrypt_pairing_message(
     new_ephemeral_pubkey: &[u8; 32],
 ) -> Result<Vec<u8>, Error> {
     let existing_pubkey = X25519PublicKey::from(message.existing_ephemeral_pubkey);
-    let mut shared_secret: [u8; 32] = new_ephemeral_privkey
-        .diffie_hellman(&existing_pubkey)
-        .to_bytes();
+    let shared_secret = new_ephemeral_privkey.diffie_hellman(&existing_pubkey);
+    if !shared_secret.was_contributory() {
+        return Err(Error::PairingError(
+            "X25519 shared secret is non-contributory".to_string(),
+        ));
+    }
+    let mut shared_secret: [u8; 32] = shared_secret.to_bytes();
 
     reject_zero_shared_secret(&shared_secret)?;
 

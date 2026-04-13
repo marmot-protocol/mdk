@@ -40,12 +40,15 @@ macro_rules! impl_versioned_pairing_bytes {
 
             /// Deserialize from bytes with version validation.
             pub fn from_bytes(bytes: &[u8]) -> Result<Self, Error> {
-                let (val, _) = Self::tls_deserialize_bytes(bytes).map_err(|e| {
+                let (val, remainder) = Self::tls_deserialize_bytes(bytes).map_err(|e| {
                     Error::PairingError(format!(
                         concat!("failed to deserialize ", $label, ": {e}"),
                         e = e
                     ))
                 })?;
+                if !remainder.is_empty() {
+                    return Err(Error::PairingError(format!("trailing bytes in {}", $label)));
+                }
                 validate_pairing_version(val.version)?;
                 Ok(val)
             }
@@ -88,10 +91,8 @@ impl GroupPairingDataV1 {
         join_psk: Vec<u8>,
         group_info: Vec<u8>,
     ) -> Result<Self, Error> {
-        if join_psk.is_empty() {
-            return Err(Error::PairingError(
-                "join_psk must not be empty".to_string(),
-            ));
+        if join_psk.len() != 32 {
+            return Err(Error::PairingError("join_psk must be 32 bytes".to_string()));
         }
         if group_info.is_empty() {
             return Err(Error::PairingError(
@@ -144,11 +145,17 @@ impl PairingPayload {
     pub const CURRENT_VERSION: u16 = 1;
 
     /// Create a new pairing payload.
-    pub fn new(groups: Vec<GroupPairingDataV1>) -> Self {
-        Self {
+    pub fn new(groups: Vec<GroupPairingDataV1>) -> Result<Self, Error> {
+        if groups.is_empty() {
+            return Err(Error::PairingError(
+                "pairing payload must contain at least one group".to_string(),
+            ));
+        }
+
+        Ok(Self {
             version: Self::CURRENT_VERSION,
             groups,
-        }
+        })
     }
 
     /// The per-group pairing data entries.
@@ -346,6 +353,15 @@ mod tests {
     }
 
     #[test]
+    fn test_group_pairing_data_v1_rejects_non_32_byte_psk() {
+        let result = GroupPairingDataV1::new([0; 32], vec![1; 31], vec![1, 2, 3]);
+        assert!(matches!(
+            result,
+            Err(Error::PairingError(ref msg)) if msg.contains("join_psk must be 32 bytes")
+        ));
+    }
+
+    #[test]
     fn test_group_pairing_data_v1_rejects_empty_group_info() {
         let result = GroupPairingDataV1::new([0; 32], vec![1], vec![]);
         assert!(result.is_err());
@@ -357,11 +373,36 @@ mod tests {
             GroupPairingDataV1::new([1; 32], vec![2; 32], vec![3; 100]).unwrap(),
             GroupPairingDataV1::new([4; 32], vec![5; 32], vec![6; 150]).unwrap(),
         ];
-        let payload = PairingPayload::new(groups);
+        let payload = PairingPayload::new(groups).unwrap();
         let bytes = payload.to_bytes().unwrap();
         let decoded = PairingPayload::from_bytes(&bytes).unwrap();
         assert_eq!(payload, decoded);
         assert_eq!(decoded.groups().len(), 2);
+    }
+
+    #[test]
+    fn test_pairing_payload_rejects_empty_groups() {
+        let result = PairingPayload::new(vec![]);
+        assert!(matches!(
+            result,
+            Err(Error::PairingError(ref msg)) if msg.contains("at least one group")
+        ));
+    }
+
+    #[test]
+    fn test_pairing_payload_rejects_trailing_bytes() {
+        let payload = PairingPayload::new(vec![
+            GroupPairingDataV1::new([1; 32], vec![2; 32], vec![3; 100]).unwrap(),
+        ])
+        .unwrap();
+        let mut bytes = payload.to_bytes().unwrap();
+        bytes.extend_from_slice(&[0xDE, 0xAD]);
+
+        let result = PairingPayload::from_bytes(&bytes);
+        assert!(matches!(
+            result,
+            Err(Error::PairingError(ref msg)) if msg.contains("trailing bytes")
+        ));
     }
 
     #[test]

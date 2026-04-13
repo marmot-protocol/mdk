@@ -77,8 +77,13 @@ impl NostrIdentityProof {
                 "authenticated_data is empty".to_string(),
             ));
         }
-        let (proof, _remainder) = Self::tls_deserialize_bytes(bytes)
+        let (proof, remainder) = Self::tls_deserialize_bytes(bytes)
             .map_err(|e| Error::IdentityProofError(e.to_string()))?;
+        if !remainder.is_empty() {
+            return Err(Error::IdentityProofError(
+                "trailing bytes in authenticated_data".to_string(),
+            ));
+        }
         if proof.version != Self::CURRENT_VERSION {
             return Err(Error::IdentityProofError(format!(
                 "unsupported proof version: {}",
@@ -168,6 +173,14 @@ pub fn verify_identity_proof(
     signature_key: &[u8],
     serialized_group_context: &[u8],
 ) -> Result<(), Error> {
+    let credential_pubkey = PublicKey::from_slice(credential_identity)
+        .map_err(|e| Error::IdentityProofError(format!("invalid credential identity: {e}")))?;
+    if credential_pubkey != *pubkey {
+        return Err(Error::IdentityProofError(
+            "credential identity does not match proof signer".to_string(),
+        ));
+    }
+
     let challenge = compute_challenge(credential_identity, signature_key, serialized_group_context);
     verify_canonical_proof_event(pubkey, &challenge, proof.signature_bytes())
 }
@@ -196,6 +209,10 @@ pub fn construct_identity_proof(
 mod tests {
     use super::*;
 
+    fn credential_identity(keys: &Keys) -> [u8; 32] {
+        keys.public_key().to_bytes()
+    }
+
     #[test]
     fn test_proof_roundtrip() {
         let sig = [0xABu8; 64];
@@ -209,18 +226,18 @@ mod tests {
     #[test]
     fn test_construct_and_verify() {
         let keys = Keys::generate();
-        let credential_identity = b"fake-nostr-pubkey-32-bytes------";
+        let credential_identity = credential_identity(&keys);
         let signature_key = b"fake-mls-signature-key-bytes----";
         let group_context = b"fake-group-context-tls-bytes";
 
         let proof =
-            construct_identity_proof(&keys, credential_identity, signature_key, group_context)
+            construct_identity_proof(&keys, &credential_identity, signature_key, group_context)
                 .unwrap();
 
         verify_identity_proof(
             &proof,
             &keys.public_key(),
-            credential_identity,
+            &credential_identity,
             signature_key,
             group_context,
         )
@@ -231,39 +248,41 @@ mod tests {
     fn test_wrong_pubkey_fails_verification() {
         let keys = Keys::generate();
         let other_keys = Keys::generate();
-        let cred = b"cred";
+        let cred = credential_identity(&keys);
         let sig_key = b"sigkey";
         let gc = b"context";
 
-        let proof = construct_identity_proof(&keys, cred, sig_key, gc).unwrap();
+        let proof = construct_identity_proof(&keys, &cred, sig_key, gc).unwrap();
 
-        let result = verify_identity_proof(&proof, &other_keys.public_key(), cred, sig_key, gc);
+        let result = verify_identity_proof(&proof, &other_keys.public_key(), &cred, sig_key, gc);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_wrong_challenge_fails_verification() {
         let keys = Keys::generate();
-        let cred = b"cred";
+        let cred = credential_identity(&keys);
+        let other_keys = Keys::generate();
+        let wrong_cred = credential_identity(&other_keys);
         let sig_key = b"sigkey";
         let gc = b"context";
 
-        let proof = construct_identity_proof(&keys, cred, sig_key, gc).unwrap();
+        let proof = construct_identity_proof(&keys, &cred, sig_key, gc).unwrap();
 
-        let result = verify_identity_proof(&proof, &keys.public_key(), b"wrong-cred", sig_key, gc);
+        let result = verify_identity_proof(&proof, &keys.public_key(), &wrong_cred, sig_key, gc);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_wrong_signature_key_fails_verification() {
         let keys = Keys::generate();
-        let cred = b"cred";
+        let cred = credential_identity(&keys);
         let sig_key = b"sigkey";
         let gc = b"context";
 
-        let proof = construct_identity_proof(&keys, cred, sig_key, gc).unwrap();
+        let proof = construct_identity_proof(&keys, &cred, sig_key, gc).unwrap();
 
-        let result = verify_identity_proof(&proof, &keys.public_key(), cred, b"wrong-sigkey", gc);
+        let result = verify_identity_proof(&proof, &keys.public_key(), &cred, b"wrong-sigkey", gc);
         assert!(result.is_err());
     }
 
@@ -274,6 +293,19 @@ mod tests {
     }
 
     #[test]
+    fn test_trailing_authenticated_data_rejected() {
+        let proof = NostrIdentityProof::new([0xAB; 64]);
+        let mut bytes = proof.to_authenticated_data().unwrap();
+        bytes.extend_from_slice(&[0xDE, 0xAD]);
+
+        let result = NostrIdentityProof::from_authenticated_data(&bytes);
+        assert!(matches!(
+            result,
+            Err(Error::IdentityProofError(ref msg)) if msg.contains("trailing bytes")
+        ));
+    }
+
+    #[test]
     fn test_challenge_is_deterministic() {
         let c1 = compute_challenge(b"cred", b"sigkey", b"ctx");
         let c2 = compute_challenge(b"cred", b"sigkey", b"ctx");
@@ -281,5 +313,23 @@ mod tests {
 
         let c3 = compute_challenge(b"different", b"sigkey", b"ctx");
         assert_ne!(c1, c3);
+    }
+
+    #[test]
+    fn test_credential_identity_must_match_proof_signer() {
+        let keys = Keys::generate();
+        let other_keys = Keys::generate();
+        let cred = credential_identity(&keys);
+        let wrong_cred = credential_identity(&other_keys);
+        let sig_key = b"sigkey";
+        let gc = b"context";
+
+        let proof = construct_identity_proof(&keys, &cred, sig_key, gc).unwrap();
+
+        let result = verify_identity_proof(&proof, &keys.public_key(), &wrong_cred, sig_key, gc);
+        assert!(matches!(
+            result,
+            Err(Error::IdentityProofError(ref msg)) if msg.contains("credential identity")
+        ));
     }
 }

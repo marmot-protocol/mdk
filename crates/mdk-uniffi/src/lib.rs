@@ -2120,14 +2120,14 @@ impl Mdk {
     /// Add a new device to multiple groups (existing device, Phase 2 of pairing).
     ///
     /// Takes the new device's KeyPackage event JSON and group IDs to add it to.
-    /// Returns TLS-serialized DevicePairingResponse bytes containing Welcome data.
+    /// Returns one structured welcome/commit entry per group.
     ///
     /// NOTE: Caller must publish commit events and call merge_pending_commit for each group.
     pub fn add_device_to_groups(
         &self,
         mls_group_ids: Vec<String>,
         key_package_event_json: String,
-    ) -> Result<Vec<u8>, MdkUniffiError> {
+    ) -> Result<Vec<DevicePairingGroupResult>, MdkUniffiError> {
         let group_ids: Vec<GroupId> = mls_group_ids
             .iter()
             .map(|id| parse_group_id(id))
@@ -2137,9 +2137,23 @@ impl Mdk {
 
         let mdk = self.lock()?;
         let response = mdk.add_device_to_groups(&group_ids, &kp_event)?;
-        response
-            .to_bytes()
-            .map_err(|e| MdkUniffiError::Mdk(e.to_string()))
+        if response.groups().len() != group_ids.len() {
+            return Err(MdkUniffiError::Mdk(format!(
+                "expected {} pairing entries, got {}",
+                group_ids.len(),
+                response.groups().len()
+            )));
+        }
+
+        Ok(group_ids
+            .iter()
+            .zip(response.groups().iter())
+            .map(|(group_id, group_data)| DevicePairingGroupResult {
+                mls_group_id: hex::encode(group_id.as_slice()),
+                welcome_rumor: group_data.welcome_rumor_bytes().to_vec(),
+                commit_event: group_data.commit_event_bytes().to_vec(),
+            })
+            .collect())
     }
 
     /// Get members coalesced by Nostr identity (multi-device aware).
@@ -2203,7 +2217,7 @@ impl Mdk {
         use mdk_core::mip06::PairingPayload;
 
         let payload = PairingPayload::from_bytes(&pairing_payload_bytes).map_err(|e| {
-            MdkUniffiError::Mdk(format!("failed to deserialize pairing payload: {e}"))
+            MdkUniffiError::InvalidInput(format!("failed to deserialize pairing payload: {e}"))
         })?;
 
         let secret_key = nostr::SecretKey::parse(&nostr_secret_key_hex)
@@ -2217,7 +2231,7 @@ impl Mdk {
             results.push(ExternalCommitJoinResult {
                 commit_message: result.commit_message,
                 mls_group_id: hex::encode(result.group_id.as_slice()),
-                group_event_key: result.group_event_key.to_vec(),
+                group_event_key: result.group_event_key.as_ref().to_vec(),
             });
         }
         Ok(results)
@@ -2244,6 +2258,18 @@ pub struct ExternalCommitJoinResult {
     pub mls_group_id: String,
     /// 32-byte MIP-03 group_event_key for outer encryption of the commit event.
     pub group_event_key: Vec<u8>,
+}
+
+/// Per-group result for the add-based pairing response flow.
+#[cfg(feature = "mip06")]
+#[derive(uniffi::Record)]
+pub struct DevicePairingGroupResult {
+    /// Hex-encoded MLS group ID.
+    pub mls_group_id: String,
+    /// JSON-serialized unsigned Welcome rumor bytes for this group.
+    pub welcome_rumor: Vec<u8>,
+    /// JSON-serialized commit event bytes for this group.
+    pub commit_event: Vec<u8>,
 }
 
 /// A member identity with all its leaf indices (multi-device)
@@ -2399,6 +2425,15 @@ mod tests {
         let mdk = result.unwrap();
         let groups = mdk.get_groups().unwrap();
         assert_eq!(groups.len(), 0);
+    }
+
+    #[cfg(feature = "mip06")]
+    #[test]
+    fn test_join_groups_via_external_commit_rejects_invalid_pairing_payload_as_invalid_input() {
+        let mdk = create_test_mdk();
+        let result = mdk.join_groups_via_external_commit(vec![0xFF, 0x00], "deadbeef".to_string());
+
+        assert!(matches!(result, Err(MdkUniffiError::InvalidInput(_))));
     }
 
     #[test]

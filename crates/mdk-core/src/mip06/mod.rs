@@ -45,7 +45,8 @@ pub use self::pairing_crypto::{
 #[cfg(test)]
 mod integration_tests {
     use nostr::{EventId, JsonUtil, Keys};
-    use tls_codec::Deserialize as _;
+    use openmls_traits::OpenMlsProvider;
+    use tls_codec::{Deserialize as _, Serialize as _};
 
     use crate::test_util::{create_key_package_event, create_nostr_group_config_data};
     use crate::tests::create_test_mdk;
@@ -205,10 +206,11 @@ mod integration_tests {
     #[test]
     fn test_identity_proof_standalone() {
         let keys = Keys::generate();
+        let credential_identity = keys.public_key().to_bytes();
 
         let proof = super::identity_proof::construct_identity_proof(
             &keys,
-            b"credential-identity",
+            &credential_identity,
             b"signature-key",
             b"group-context",
         )
@@ -220,7 +222,7 @@ mod integration_tests {
         super::identity_proof::verify_identity_proof(
             &decoded,
             &keys.public_key(),
-            b"credential-identity",
+            &credential_identity,
             b"signature-key",
             b"group-context",
         )
@@ -232,12 +234,54 @@ mod integration_tests {
             super::identity_proof::verify_identity_proof(
                 &decoded,
                 &other.public_key(),
-                b"credential-identity",
+                &credential_identity,
                 b"signature-key",
                 b"group-context",
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn test_join_group_via_external_commit_rejects_missing_ratchet_tree_extension() {
+        let alice_keys = Keys::generate();
+        let alice_device1 = create_test_mdk();
+        let alice_device2 = create_test_mdk();
+
+        let create_result = alice_device1
+            .create_group_with_multi_device(
+                &alice_keys.public_key(),
+                vec![],
+                create_nostr_group_config_data(vec![alice_keys.public_key()]),
+            )
+            .unwrap();
+        let group_id = create_result.group.mls_group_id.clone();
+        alice_device1.merge_pending_commit(&group_id).unwrap();
+
+        let payload = alice_device1
+            .build_pairing_payload(std::slice::from_ref(&group_id))
+            .unwrap();
+        let group_data = &payload.groups()[0];
+
+        let mls_group = alice_device1.load_mls_group(&group_id).unwrap().unwrap();
+        let signer = alice_device1.load_mls_signer(&mls_group).unwrap();
+        let group_info_msg = mls_group
+            .export_group_info(alice_device1.provider.crypto(), &signer, false)
+            .unwrap();
+        let group_info_bytes = group_info_msg.tls_serialize_detached().unwrap();
+
+        let invalid_data = super::GroupPairingDataV1::new(
+            *group_data.group_event_key(),
+            group_data.join_psk().to_vec(),
+            group_info_bytes,
+        )
+        .unwrap();
+
+        let result = alice_device2.join_group_via_external_commit(&invalid_data, &alice_keys);
+        assert!(matches!(
+            result,
+            Err(crate::Error::PairingError(ref msg)) if msg.contains("ratchet_tree")
+        ));
     }
 
     /// Test device name encryption roundtrip
@@ -428,7 +472,10 @@ mod integration_tests {
             .expect("External Commit should succeed");
         assert_eq!(commit_result.group_id, group_id);
         assert!(!commit_result.commit_message.is_empty());
-        assert_eq!(commit_result.group_event_key, *group_data.group_event_key());
+        assert_eq!(
+            commit_result.group_event_key.as_ref(),
+            group_data.group_event_key()
+        );
 
         let mut mls_group = alice_device1.load_mls_group(&group_id).unwrap().unwrap();
 

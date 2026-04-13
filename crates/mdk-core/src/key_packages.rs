@@ -844,8 +844,8 @@ mod tests {
     use crate::tests::create_test_mdk;
 
     /// Returns the extension tag values that include all required extensions
-    /// for the current feature configuration. Includes GREASE-like values
-    /// that OpenMLS injects (0x0002, 0x0003).
+    /// for the current feature configuration. Includes the default MLS
+    /// extension IDs injected by OpenMLS (0x0002, 0x0003).
     fn valid_extensions_tag_values() -> Vec<&'static str> {
         #[cfg(not(feature = "mip06"))]
         {
