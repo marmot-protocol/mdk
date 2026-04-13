@@ -703,6 +703,7 @@ mod tests {
     use mdk_memory_storage::MdkMemoryStorage;
     use nostr::{EventBuilder, Keys, Kind, Tag, TagKind};
     use openmls::prelude::BasicCredential;
+    #[cfg(feature = "mip06")]
     use tls_codec::Deserialize as _;
     use tls_codec::Serialize as TlsSerialize;
 
