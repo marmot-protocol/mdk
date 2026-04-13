@@ -1922,9 +1922,7 @@ where
                     &signer,
                     |_| true,
                 )
-                .map_err(|e| {
-                    Error::PairingError(format!("failed to build external commit: {e}"))
-                })?
+                .map_err(|e| Error::PairingError(format!("failed to build external commit: {e}")))?
                 .finalize(&self.provider)
                 .map_err(|e| {
                     Error::PairingError(format!("failed to finalize external commit: {e}"))

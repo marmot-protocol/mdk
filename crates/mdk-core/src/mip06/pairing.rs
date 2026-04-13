@@ -78,8 +78,15 @@ macro_rules! impl_versioned_pairing_bytes {
 /// } GroupPairingDataV1;
 /// ```
 #[derive(
-    Clone, PartialEq, Eq, Zeroize, ZeroizeOnDrop, TlsSerialize, TlsDeserialize,
-    TlsDeserializeBytes, TlsSize,
+    Clone,
+    PartialEq,
+    Eq,
+    Zeroize,
+    ZeroizeOnDrop,
+    TlsSerialize,
+    TlsDeserialize,
+    TlsDeserializeBytes,
+    TlsSize,
 )]
 pub struct GroupPairingDataV1 {
     /// Exact 32-byte outer encryption key for `kind: 445` group-event encryption (MIP-03).
@@ -99,7 +106,10 @@ impl fmt::Debug for GroupPairingDataV1 {
         f.debug_struct("GroupPairingDataV1")
             .field("group_event_key", &"[REDACTED]")
             .field("join_psk", &"[REDACTED]")
-            .field("group_info", &format_args!("[{} bytes]", self.group_info.len()))
+            .field(
+                "group_info",
+                &format_args!("[{} bytes]", self.group_info.len()),
+            )
             .finish()
     }
 }
@@ -123,9 +133,7 @@ impl GroupPairingDataV1 {
     /// Semantic validation: join_psk must be 32 bytes and group_info non-empty.
     fn validate(&self) -> Result<(), Error> {
         if self.join_psk.len() != 32 {
-            return Err(Error::PairingError(
-                "join_psk must be 32 bytes".to_string(),
-            ));
+            return Err(Error::PairingError("join_psk must be 32 bytes".to_string()));
         }
         if self.group_info.is_empty() {
             return Err(Error::PairingError(

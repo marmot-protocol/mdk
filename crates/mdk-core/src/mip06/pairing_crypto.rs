@@ -207,7 +207,10 @@ pub fn decrypt_pairing_message(
     let mut key = derive_key(&shared_secret)?;
     shared_secret.zeroize();
 
-    let aad = build_aad(&new_ephemeral_pubkey_bytes, &message.existing_ephemeral_pubkey);
+    let aad = build_aad(
+        &new_ephemeral_pubkey_bytes,
+        &message.existing_ephemeral_pubkey,
+    );
 
     let cipher = ChaCha20Poly1305::new((&key).into());
     key.zeroize();
