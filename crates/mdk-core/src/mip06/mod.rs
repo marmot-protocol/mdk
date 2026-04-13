@@ -31,6 +31,7 @@ pub use self::pairing_crypto::{PairingMessage, decrypt_pairing_message, encrypt_
 #[cfg(test)]
 mod integration_tests {
     use nostr::{EventId, JsonUtil, Keys};
+    use tls_codec::Deserialize as _;
 
     use crate::test_util::{create_key_package_event, create_nostr_group_config_data};
     use crate::tests::create_test_mdk;
@@ -422,10 +423,8 @@ mod integration_tests {
             )
             .unwrap();
         let group_id = create_result.group.mls_group_id.clone();
+        // merge_pending_commit now auto-registers join PSK for MIP-06 groups
         alice_device1.merge_pending_commit(&group_id).unwrap();
-
-        // Device 1 registers join PSK (so it can process the incoming External Commit)
-        alice_device1.register_join_psk(&group_id).unwrap();
 
         // Device 1 builds pairing payload
         let payload = alice_device1
@@ -436,16 +435,78 @@ mod integration_tests {
         let group_data = &payload.groups()[0];
 
         // Device 2 joins via External Commit
-        let result = alice_device2
-            .join_group_via_external_commit(group_data, &alice_keys);
-
-        // This should succeed — PSK blocker is resolved
-        let commit_result = result.expect("External Commit should succeed");
+        let commit_result = alice_device2
+            .join_group_via_external_commit(group_data, &alice_keys)
+            .expect("External Commit should succeed");
         assert_eq!(commit_result.group_id, group_id);
         assert!(!commit_result.commit_message.is_empty());
         assert_eq!(
             commit_result.group_event_key,
             *group_data.group_event_key()
         );
+
+        // Device 1 processes the External Commit at the MLS layer
+        let mut mls_group = alice_device1
+            .load_mls_group(&group_id)
+            .unwrap()
+            .unwrap();
+
+        let msg_in = openmls::prelude::MlsMessageIn::tls_deserialize_exact(
+            &commit_result.commit_message,
+        )
+        .expect("Should deserialize commit message");
+
+        let protocol_msg = msg_in
+            .try_into_protocol_message()
+            .expect("Should be a protocol message");
+
+        let processed = mls_group
+            .process_message(&alice_device1.provider, protocol_msg)
+            .expect("Device 1 should accept the External Commit");
+
+        // Verify the AAD contains a valid identity proof
+        let aad = processed.aad();
+        assert!(!aad.is_empty(), "authenticated_data should contain identity proof");
+        let proof = super::NostrIdentityProof::from_authenticated_data(aad)
+            .expect("Should parse identity proof from AAD");
+        assert_eq!(proof.version(), 1);
+
+        // Extract and merge the staged commit
+        match processed.into_content() {
+            openmls::prelude::ProcessedMessageContent::StagedCommitMessage(staged_commit) => {
+                // Verify the joining leaf has Alice's credential
+                let joining_leaf = staged_commit
+                    .update_path_leaf_node()
+                    .expect("Should have update path leaf node");
+                let joining_cred =
+                    openmls::prelude::BasicCredential::try_from(joining_leaf.credential().clone())
+                        .unwrap();
+                let joining_pubkey_bytes = joining_cred.identity();
+                assert_eq!(
+                    joining_pubkey_bytes,
+                    alice_keys.public_key().to_bytes().as_slice(),
+                    "Joining device should have Alice's Nostr pubkey"
+                );
+
+                // Merge the commit — device 2 is now in the group
+                mls_group
+                    .merge_staged_commit(&alice_device1.provider, *staged_commit)
+                    .expect("Should merge External Commit");
+            }
+            other => panic!("Expected StagedCommitMessage, got {:?}", other),
+        }
+
+        // Verify device 2 is now a member (Alice has 2 leaves)
+        let alice_pubkey_bytes = alice_keys.public_key().to_bytes();
+        let alice_leaf_count = mls_group
+            .members()
+            .filter(|m| {
+                openmls::prelude::BasicCredential::try_from(m.credential.clone())
+                    .ok()
+                    .map(|c| c.identity() == alice_pubkey_bytes.as_slice())
+                    .unwrap_or(false)
+            })
+            .count();
+        assert_eq!(alice_leaf_count, 2, "Alice should have 2 leaves (2 devices)");
     }
 }

@@ -275,6 +275,12 @@ where
                 // Sync the stored group metadata with the updated MLS group state
                 self.sync_group_metadata_from_mls(&group.mls_group_id)?;
 
+                // Register MIP-06 join PSK for the new epoch
+                #[cfg(feature = "mip06")]
+                {
+                    self.register_join_psk(&group.mls_group_id)?;
+                }
+
                 // Update self-update tracking if this was a self-update commit
                 if is_self_update {
                     let mut stored_group = self

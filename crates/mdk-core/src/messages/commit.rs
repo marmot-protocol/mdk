@@ -135,6 +135,12 @@ where
         // Sync the stored group metadata with the updated MLS group state
         self.sync_group_metadata_from_mls(&group_id)?;
 
+        // Register MIP-06 join PSK for the new epoch so we can process incoming External Commits
+        #[cfg(feature = "mip06")]
+        {
+            self.register_join_psk(&group_id)?;
+        }
+
         // Save a processed message so we don't reprocess
         let processed_message = super::create_processed_message_record(
             event.id,
