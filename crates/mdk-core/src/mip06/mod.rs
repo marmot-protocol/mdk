@@ -21,12 +21,14 @@ pub use self::extension::{MarmotMultiDevice, is_multi_device_enabled};
 pub use self::identity_proof::{
     NostrIdentityProof, compute_challenge, construct_identity_proof, verify_identity_proof,
 };
-pub use self::join_psk::{JoinPskId, JOIN_PSK_EXPORTER_LABEL, JOIN_PSK_LABEL};
+pub use self::join_psk::{JOIN_PSK_EXPORTER_LABEL, JOIN_PSK_LABEL, JoinPskId};
 pub use self::pairing::{
     DevicePairingRequest, DevicePairingResponse, GroupPairingDataV1, GroupWelcomeData,
     PairingPayload,
 };
-pub use self::pairing_crypto::{PairingMessage, decrypt_pairing_message, encrypt_pairing_message};
+pub use self::pairing_crypto::{
+    PairingMessage, decrypt_pairing_message, encrypt_pairing_message, generate_new_device_keypair,
+};
 
 #[cfg(test)]
 mod integration_tests {
@@ -73,22 +75,15 @@ mod integration_tests {
         let device2_kp_event = create_key_package_event(&alice_device2_mdk, &alice_keys);
 
         // Step 3: Encrypt KeyPackage bytes via pairing channel
-        let kp_bytes = super::DevicePairingRequest::new(
-            device2_kp_event.as_json().into_bytes(),
-        )
-        .to_bytes()
-        .unwrap();
+        let kp_bytes = super::DevicePairingRequest::new(device2_kp_event.as_json().into_bytes())
+            .to_bytes()
+            .unwrap();
 
         let (new_priv, new_pub) = super::pairing_crypto::generate_new_device_keypair();
         let (_existing_pub, encrypted) =
             super::encrypt_pairing_message(&kp_bytes, &new_pub).unwrap();
 
-        let decrypted = super::decrypt_pairing_message(
-            &encrypted,
-            &new_priv,
-            &new_pub,
-        )
-        .unwrap();
+        let decrypted = super::decrypt_pairing_message(&encrypted, &new_priv, &new_pub).unwrap();
 
         let request = super::DevicePairingRequest::from_bytes(&decrypted).unwrap();
 
@@ -98,7 +93,7 @@ mod integration_tests {
                 .unwrap();
 
         let pairing_response = alice_device1_mdk
-            .add_device_to_groups(&[group_id.clone()], &kp_event)
+            .add_device_to_groups(std::slice::from_ref(&group_id), &kp_event)
             .expect("Should add device to groups");
 
         assert_eq!(pairing_response.groups().len(), 1);
@@ -154,9 +149,10 @@ mod integration_tests {
         let decoded = super::DevicePairingRequest::from_bytes(&bytes).unwrap();
         assert_eq!(request, decoded);
 
-        let response = super::DevicePairingResponse::new(vec![
-            super::GroupWelcomeData::new(vec![10; 50], vec![20; 100]),
-        ]);
+        let response = super::DevicePairingResponse::new(vec![super::GroupWelcomeData::new(
+            vec![10; 50],
+            vec![20; 100],
+        )]);
         let bytes = response.to_bytes().unwrap();
         let decoded = super::DevicePairingResponse::from_bytes(&bytes).unwrap();
         assert_eq!(response, decoded);
@@ -238,14 +234,16 @@ mod integration_tests {
 
         // Wrong key fails
         let other = Keys::generate();
-        assert!(super::identity_proof::verify_identity_proof(
-            &decoded,
-            &other.public_key(),
-            b"credential-identity",
-            b"signature-key",
-            b"group-context",
-        )
-        .is_err());
+        assert!(
+            super::identity_proof::verify_identity_proof(
+                &decoded,
+                &other.public_key(),
+                b"credential-identity",
+                b"signature-key",
+                b"group-context",
+            )
+            .is_err()
+        );
     }
 
     /// Test device name encryption roundtrip
@@ -428,7 +426,7 @@ mod integration_tests {
 
         // Device 1 builds pairing payload
         let payload = alice_device1
-            .build_pairing_payload(&[group_id.clone()])
+            .build_pairing_payload(std::slice::from_ref(&group_id))
             .unwrap();
         assert_eq!(payload.groups().len(), 1);
 
@@ -440,21 +438,14 @@ mod integration_tests {
             .expect("External Commit should succeed");
         assert_eq!(commit_result.group_id, group_id);
         assert!(!commit_result.commit_message.is_empty());
-        assert_eq!(
-            commit_result.group_event_key,
-            *group_data.group_event_key()
-        );
+        assert_eq!(commit_result.group_event_key, *group_data.group_event_key());
 
         // Device 1 processes the External Commit at the MLS layer
-        let mut mls_group = alice_device1
-            .load_mls_group(&group_id)
-            .unwrap()
-            .unwrap();
+        let mut mls_group = alice_device1.load_mls_group(&group_id).unwrap().unwrap();
 
-        let msg_in = openmls::prelude::MlsMessageIn::tls_deserialize_exact(
-            &commit_result.commit_message,
-        )
-        .expect("Should deserialize commit message");
+        let msg_in =
+            openmls::prelude::MlsMessageIn::tls_deserialize_exact(&commit_result.commit_message)
+                .expect("Should deserialize commit message");
 
         let protocol_msg = msg_in
             .try_into_protocol_message()
@@ -466,7 +457,10 @@ mod integration_tests {
 
         // Verify the AAD contains a valid identity proof
         let aad = processed.aad();
-        assert!(!aad.is_empty(), "authenticated_data should contain identity proof");
+        assert!(
+            !aad.is_empty(),
+            "authenticated_data should contain identity proof"
+        );
         let proof = super::NostrIdentityProof::from_authenticated_data(aad)
             .expect("Should parse identity proof from AAD");
         assert_eq!(proof.version(), 1);
@@ -507,6 +501,9 @@ mod integration_tests {
                     .unwrap_or(false)
             })
             .count();
-        assert_eq!(alice_leaf_count, 2, "Alice should have 2 leaves (2 devices)");
+        assert_eq!(
+            alice_leaf_count, 2,
+            "Alice should have 2 leaves (2 devices)"
+        );
     }
 }

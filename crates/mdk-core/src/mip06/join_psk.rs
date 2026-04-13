@@ -70,8 +70,7 @@ impl JoinPskId {
         if &self.label != JOIN_PSK_LABEL {
             return Err(Error::PairingError(format!(
                 "invalid JoinPskId label: expected {:?}, got {:?}",
-                JOIN_PSK_LABEL,
-                &self.label
+                JOIN_PSK_LABEL, &self.label
             )));
         }
         Ok(())

@@ -463,7 +463,10 @@ where
     /// GroupInfoTBS body, where GroupInfoTBS starts with GroupContext. So we parse
     /// GroupContext from offset 4.
     #[cfg(feature = "mip06")]
-    pub(crate) fn export_group_context_bytes(&self, mls_group: &MlsGroup) -> Result<Vec<u8>, Error> {
+    pub(crate) fn export_group_context_bytes(
+        &self,
+        mls_group: &MlsGroup,
+    ) -> Result<Vec<u8>, Error> {
         use tls_codec::{DeserializeBytes as _, Serialize as _};
 
         let signer = self.load_mls_signer(mls_group)?;
@@ -478,16 +481,18 @@ where
         // MlsMessage header: version (2 bytes) + wire_format (2 bytes) = 4 bytes.
         // GroupInfoTBS starts at offset 4, and its first field is GroupContext.
         if gi_bytes.len() < 5 {
-            return Err(Error::PairingError("GroupInfo message too short".to_string()));
+            return Err(Error::PairingError(
+                "GroupInfo message too short".to_string(),
+            ));
         }
         let (group_context, _) =
             GroupContext::tls_deserialize_bytes(&gi_bytes[4..]).map_err(|e| {
                 Error::PairingError(format!("failed to parse GroupContext from GroupInfo: {e}"))
             })?;
 
-        group_context.tls_serialize_detached().map_err(|e| {
-            Error::PairingError(format!("failed to serialize GroupContext: {e}"))
-        })
+        group_context
+            .tls_serialize_detached()
+            .map_err(|e| Error::PairingError(format!("failed to serialize GroupContext: {e}")))
     }
 
     /// Derives and returns the MIP-06 join PSK ID and raw PSK bytes for a group.
@@ -514,9 +519,7 @@ where
                 &join_psk_id_bytes,
                 kdf_nh,
             )
-            .map_err(|e| {
-                Error::PairingError(format!("failed to derive join PSK: {e}"))
-            })?;
+            .map_err(|e| Error::PairingError(format!("failed to derive join PSK: {e}")))?;
 
         Ok((join_psk_id, join_psk.to_vec()))
     }
@@ -617,10 +620,7 @@ where
 
     /// Returns all leaf indices in the group that share the local user's Nostr pubkey.
     #[cfg(feature = "mip06")]
-    pub fn own_device_leaves(
-        &self,
-        group_id: &GroupId,
-    ) -> Result<Vec<u32>, Error> {
+    pub fn own_device_leaves(&self, group_id: &GroupId) -> Result<Vec<u32>, Error> {
         let group = self.load_mls_group(group_id)?.ok_or(Error::GroupNotFound)?;
         let own_pubkey = self.get_own_pubkey(&group)?;
         let mut coalesced = self.coalesced_members(group_id)?;
@@ -1324,8 +1324,7 @@ where
         let nostr_ext = Self::get_unknown_extension_from_group_data(&group_data)?;
         let multi_device_ext = MarmotMultiDevice::new().as_extension()?;
         let required_caps = self.required_capabilities_extension_with_multi_device();
-        let extensions =
-            Extensions::from_vec(vec![nostr_ext, multi_device_ext, required_caps])?;
+        let extensions = Extensions::from_vec(vec![nostr_ext, multi_device_ext, required_caps])?;
 
         self.create_group_inner(
             creator_public_key,
@@ -1362,10 +1361,8 @@ where
         group_data: NostrGroupDataExtension,
         extensions: Extensions<openmls::prelude::GroupContext>,
     ) -> Result<GroupResult, Error> {
-        let member_pubkeys: Vec<PublicKey> = member_key_package_events
-            .iter()
-            .map(|e| e.pubkey)
-            .collect();
+        let member_pubkeys: Vec<PublicKey> =
+            member_key_package_events.iter().map(|e| e.pubkey).collect();
 
         let admins = config.admins.clone();
         self.validate_group_members(creator_public_key, &member_pubkeys, &admins)?;
@@ -1459,15 +1456,10 @@ where
     /// NOTE: Does not merge the pending commit. Clients must call `merge_pending_commit`
     /// after publishing the commit to relays.
     #[cfg(feature = "mip06")]
-    pub fn enable_multi_device(
-        &self,
-        group_id: &GroupId,
-    ) -> Result<Event, Error> {
+    pub fn enable_multi_device(&self, group_id: &GroupId) -> Result<Event, Error> {
         use crate::mip06::MarmotMultiDevice;
 
-        let mut mls_group = self
-            .load_mls_group(group_id)?
-            .ok_or(Error::GroupNotFound)?;
+        let mut mls_group = self.load_mls_group(group_id)?.ok_or(Error::GroupNotFound)?;
         let signer = self.load_mls_signer(&mls_group)?;
 
         // Verify MIP-06 is not already enabled
@@ -1499,8 +1491,8 @@ where
         extensions.add_or_replace(self.required_capabilities_extension_with_multi_device())?;
 
         // Create GroupContextExtensions proposal + commit
-        let (commit_message, _, _group_info) = mls_group
-            .update_group_context_extensions(&self.provider, extensions, &signer)?;
+        let (commit_message, _, _group_info) =
+            mls_group.update_group_context_extensions(&self.provider, extensions, &signer)?;
 
         let serialized_commit = commit_message.tls_serialize_detached()?;
         let commit_event = self.build_message_event(group_id, serialized_commit, None)?;
@@ -1565,9 +1557,7 @@ where
     pub fn register_join_psk(&self, group_id: &GroupId) -> Result<(), Error> {
         use openmls::schedule::psk::{ExternalPsk, PreSharedKeyId, Psk};
 
-        let mls_group = self
-            .load_mls_group(group_id)?
-            .ok_or(Error::GroupNotFound)?;
+        let mls_group = self.load_mls_group(group_id)?.ok_or(Error::GroupNotFound)?;
 
         if !crate::mip06::is_multi_device_enabled(&mls_group) {
             return Ok(());
@@ -1578,12 +1568,8 @@ where
 
         // Build OpenMLS PreSharedKeyId for an external PSK
         let psk = Psk::External(ExternalPsk::new(join_psk_id_bytes));
-        let psk_id = PreSharedKeyId::new(
-            mls_group.ciphersuite(),
-            self.provider.rand(),
-            psk,
-        )
-        .map_err(|e| Error::PairingError(format!("failed to create PreSharedKeyId: {e}")))?;
+        let psk_id = PreSharedKeyId::new(mls_group.ciphersuite(), self.provider.rand(), psk)
+            .map_err(|e| Error::PairingError(format!("failed to create PreSharedKeyId: {e}")))?;
 
         // Store in provider so load_psks() finds it during process_message()
         psk_id
@@ -1620,9 +1606,7 @@ where
         let mut groups = Vec::with_capacity(group_ids.len());
 
         for group_id in group_ids {
-            let mls_group = self
-                .load_mls_group(group_id)?
-                .ok_or(Error::GroupNotFound)?;
+            let mls_group = self.load_mls_group(group_id)?.ok_or(Error::GroupNotFound)?;
             let signer = self.load_mls_signer(&mls_group)?;
 
             // Verify MIP-06 is enabled for this group
@@ -1633,13 +1617,10 @@ where
             // Export GroupInfo with ratchet_tree extension
             let group_info_msg = mls_group
                 .export_group_info(self.provider.crypto(), &signer, true)
-                .map_err(|e| {
-                    Error::PairingError(format!("failed to export GroupInfo: {e}"))
-                })?;
-            let group_info_bytes = group_info_msg.tls_serialize_detached()
-                .map_err(|e| {
-                    Error::PairingError(format!("failed to serialize GroupInfo: {e}"))
-                })?;
+                .map_err(|e| Error::PairingError(format!("failed to export GroupInfo: {e}")))?;
+            let group_info_bytes = group_info_msg
+                .tls_serialize_detached()
+                .map_err(|e| Error::PairingError(format!("failed to serialize GroupInfo: {e}")))?;
 
             // Export group_event_key (MIP-03 outer encryption key)
             let exporter_secret = self.derive_exporter_secret_for_group(
@@ -1681,16 +1662,15 @@ where
 
         // 1. Deserialize GroupInfo from pairing data
         let gi_bytes = pairing_data.group_info();
-        let msg_in =
-            <MlsMessageIn as tls_codec::DeserializeBytes>::tls_deserialize_bytes(gi_bytes)
-                .map_err(|e| Error::PairingError(format!("failed to deserialize GroupInfo: {e}")))?
-                .0;
+        let msg_in = <MlsMessageIn as tls_codec::DeserializeBytes>::tls_deserialize_bytes(gi_bytes)
+            .map_err(|e| Error::PairingError(format!("failed to deserialize GroupInfo: {e}")))?
+            .0;
         let vgi = match msg_in.extract() {
             MlsMessageBodyIn::GroupInfo(vgi) => vgi,
             _ => {
                 return Err(Error::PairingError(
                     "pairing data does not contain GroupInfo".to_string(),
-                ))
+                ));
             }
         };
 
@@ -1705,15 +1685,12 @@ where
         let (group_context_parsed, _) =
             <GroupContext as tls_codec::DeserializeBytes>::tls_deserialize_bytes(&gi_bytes[4..])
                 .map_err(|e| {
-                    Error::PairingError(format!(
-                        "failed to parse GroupContext from GroupInfo: {e}"
-                    ))
+                    Error::PairingError(format!("failed to parse GroupContext from GroupInfo: {e}"))
                 })?;
-        let gc_bytes =
-            <GroupContext as tls_codec::Serialize>::tls_serialize_detached(&group_context_parsed)
-                .map_err(|e| {
-                    Error::PairingError(format!("failed to serialize GroupContext: {e}"))
-                })?;
+        let gc_bytes = <GroupContext as tls_codec::Serialize>::tls_serialize_detached(
+            &group_context_parsed,
+        )
+        .map_err(|e| Error::PairingError(format!("failed to serialize GroupContext: {e}")))?;
         let join_psk_id = crate::mip06::JoinPskId::from_group_context_bytes(&gc_bytes);
         let join_psk_id_bytes = join_psk_id.to_bytes()?;
 
@@ -1726,8 +1703,7 @@ where
             .map_err(|e| Error::PairingError(format!("failed to store join PSK: {e}")))?;
 
         // 4. Build credential for this device
-        let (credential, signer) =
-            self.generate_credential_with_key(&nostr_keys.public_key())?;
+        let (credential, signer) = self.generate_credential_with_key(&nostr_keys.public_key())?;
 
         // 5. Construct identity proof BEFORE build_group().
         //    The challenge binds to credential_identity + signature_key, both of
@@ -1756,34 +1732,27 @@ where
             })?
             .leaf_node_parameters(leaf_params);
 
-        let psk_proposal =
-            openmls::messages::proposals::PreSharedKeyProposal::new(psk_id);
+        let psk_proposal = openmls::messages::proposals::PreSharedKeyProposal::new(psk_id);
 
         let (mls_group, commit_bundle) = commit_builder
             .add_psk_proposal(psk_proposal)
             .load_psks(self.provider.storage())
-            .map_err(|e| {
-                Error::PairingError(format!("failed to load PSKs: {e}"))
-            })?
+            .map_err(|e| Error::PairingError(format!("failed to load PSKs: {e}")))?
             .build(
                 self.provider.rand(),
                 self.provider.crypto(),
                 &signer,
                 |_| true,
             )
-            .map_err(|e| {
-                Error::PairingError(format!("failed to build external commit: {e}"))
-            })?
+            .map_err(|e| Error::PairingError(format!("failed to build external commit: {e}")))?
             .finalize(&self.provider)
-            .map_err(|e| {
-                Error::PairingError(format!("failed to finalize external commit: {e}"))
-            })?;
+            .map_err(|e| Error::PairingError(format!("failed to finalize external commit: {e}")))?;
 
         // 7. Serialize the commit message for publication
         let (commit_msg_out, _welcome, _group_info) = commit_bundle.into_messages();
-        let commit_msg = commit_msg_out.tls_serialize_detached().map_err(|e| {
-            Error::PairingError(format!("failed to serialize commit message: {e}"))
-        })?;
+        let commit_msg = commit_msg_out
+            .tls_serialize_detached()
+            .map_err(|e| Error::PairingError(format!("failed to serialize commit message: {e}")))?;
 
         let group_id = mdk_storage_traits::GroupId::from(mls_group.group_id());
 

@@ -19,14 +19,7 @@ use crate::error::Error;
 /// } MarmotMultiDevice;
 /// ```
 #[derive(
-    Debug,
-    Clone,
-    PartialEq,
-    Eq,
-    TlsSerialize,
-    TlsDeserialize,
-    TlsDeserializeBytes,
-    TlsSize,
+    Debug, Clone, PartialEq, Eq, TlsSerialize, TlsDeserialize, TlsDeserializeBytes, TlsSize,
 )]
 pub struct MarmotMultiDevice {
     version: u16,
@@ -87,16 +80,17 @@ impl Default for MarmotMultiDevice {
 }
 
 /// Extract and validate a `MarmotMultiDevice` from an `Extensions` set.
-fn from_extensions(extensions: &Extensions<GroupContext>) -> Result<Option<MarmotMultiDevice>, Error> {
+fn from_extensions(
+    extensions: &Extensions<GroupContext>,
+) -> Result<Option<MarmotMultiDevice>, Error> {
     for ext in extensions.iter() {
-        if let Extension::Unknown(ext_type, data) = ext {
-            if *ext_type == MULTI_DEVICE_EXTENSION_TYPE {
-                let (parsed, _) =
-                    MarmotMultiDevice::tls_deserialize_bytes(data.0.as_slice())
-                        .map_err(|e| Error::ExtensionFormatError(e.to_string()))?;
-                parsed.validate()?;
-                return Ok(Some(parsed));
-            }
+        if let Extension::Unknown(ext_type, data) = ext
+            && *ext_type == MULTI_DEVICE_EXTENSION_TYPE
+        {
+            let (parsed, _) = MarmotMultiDevice::tls_deserialize_bytes(data.0.as_slice())
+                .map_err(|e| Error::ExtensionFormatError(e.to_string()))?;
+            parsed.validate()?;
+            return Ok(Some(parsed));
         }
     }
     Ok(None)
