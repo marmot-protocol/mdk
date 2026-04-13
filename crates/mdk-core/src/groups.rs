@@ -623,7 +623,20 @@ where
     pub fn own_device_leaves(&self, group_id: &GroupId) -> Result<Vec<u32>, Error> {
         let group = self.load_mls_group(group_id)?.ok_or(Error::GroupNotFound)?;
         let own_pubkey = self.get_own_pubkey(&group)?;
-        let mut coalesced = self.coalesced_members(group_id)?;
+
+        // Build the coalesced map inline from the already-loaded group to avoid
+        // a redundant storage round-trip through coalesced_members → group_leaf_map.
+        let mut coalesced: BTreeMap<PublicKey, Vec<u32>> = BTreeMap::new();
+        for member in group.members() {
+            let credentials: BasicCredential = BasicCredential::try_from(member.credential)?;
+            let identity_bytes: &[u8] = credentials.identity();
+            let public_key = self.parse_credential_identity(identity_bytes)?;
+            coalesced
+                .entry(public_key)
+                .or_default()
+                .push(member.index.u32());
+        }
+
         Ok(coalesced.remove(&own_pubkey).unwrap_or_default())
     }
 
@@ -1453,14 +1466,33 @@ where
     /// a GroupContextExtensions proposal that adds `marmot_multi_device` and requires
     /// `0xF2F0`.
     ///
-    /// NOTE: Does not merge the pending commit. Clients must call `merge_pending_commit`
-    /// after publishing the commit to relays.
+    /// # Pending Commit Lifecycle
+    ///
+    /// This method generates a pending commit but does **not** merge it. The caller
+    /// must follow this sequence:
+    ///
+    /// 1. Publish the returned `Event` to relays.
+    /// 2. Call [`merge_pending_commit`](Self::merge_pending_commit) to advance local state.
+    ///
+    /// The pending commit is persisted through the OpenMLS provider, so it survives
+    /// crashes. If the process restarts before step 2, call `merge_pending_commit`
+    /// on recovery. **No other group operations should be performed between steps 1
+    /// and 2** — they will fail because a pending commit is outstanding. This is the
+    /// same lifecycle as `add_members` and `remove_members`.
     #[cfg(feature = "mip06")]
     pub fn enable_multi_device(&self, group_id: &GroupId) -> Result<Event, Error> {
         use crate::mip06::MarmotMultiDevice;
 
         let mut mls_group = self.load_mls_group(group_id)?.ok_or(Error::GroupNotFound)?;
         let signer = self.load_mls_signer(&mls_group)?;
+
+        // Check if current user is an admin
+        let own_leaf = mls_group.own_leaf().ok_or(Error::OwnLeafNotFound)?;
+        if !self.is_leaf_node_admin(&mls_group.group_id().into(), own_leaf)? {
+            return Err(Error::Group(
+                "Only group admins can enable multi-device".to_string(),
+            ));
+        }
 
         if crate::mip06::is_multi_device_enabled(&mls_group) {
             return Err(Error::Group(

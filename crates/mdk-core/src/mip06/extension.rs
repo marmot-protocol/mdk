@@ -103,11 +103,15 @@ fn from_extensions(
 /// The gate requires all three of:
 /// 1. `GroupContext.extensions` contains a valid `marmot_multi_device` (`0xF2F0`)
 /// 2. `required_capabilities` requires `0xF2F0`
-/// 3. At least one existing member advertises `0xF2F0` in capabilities
+/// 3. All members advertise `0xF2F0` in their leaf-node capabilities
 ///
-/// For condition 3: when `required_capabilities` mandates `0xF2F0`, MLS validation
-/// ensures all members must advertise it. Conditions 1+2 therefore imply condition 3
-/// for groups in a valid state that have at least one member.
+/// Condition 3 is inferred, not verified per-leaf: when `required_capabilities`
+/// mandates `0xF2F0`, OpenMLS enforces that every leaf advertises it at commit
+/// time, so conditions 1+2 imply condition 3 for groups in a valid MLS state.
+/// If the group was deserialized from a partial write (e.g., crash recovery),
+/// this inference may not hold. A `debug_assert!` on the own leaf is included
+/// to catch violations in development; a full per-leaf check is not possible
+/// through OpenMLS's public `members()` API.
 pub fn is_multi_device_enabled(group: &MlsGroup) -> bool {
     // 1. Extension present and valid
     let ext_present = matches!(MarmotMultiDevice::from_group(group), Ok(Some(_)));
@@ -118,7 +122,24 @@ pub fn is_multi_device_enabled(group: &MlsGroup) -> bool {
     // 3. At least one member (implied by conditions 1+2 + MLS required_capabilities enforcement)
     let has_members = group.members().next().is_some();
 
-    ext_present && required && has_members
+    let enabled = ext_present && required && has_members;
+
+    // Spot-check: verify our own leaf advertises 0xF2F0 when the gate is enabled.
+    // This catches corruption visible to the local node; per-member checks would
+    // require internal tree access not exposed by OpenMLS.
+    if enabled {
+        debug_assert!(
+            group.own_leaf().is_some_and(|leaf| {
+                leaf.capabilities()
+                    .extensions()
+                    .contains(&ExtensionType::Unknown(MULTI_DEVICE_EXTENSION_TYPE))
+            }),
+            "MIP-06 gate is enabled but own leaf does not advertise 0xF2F0 — \
+             possible corrupt group state from partial write"
+        );
+    }
+
+    enabled
 }
 
 /// Check if `required_capabilities` includes `0xF2F0`.

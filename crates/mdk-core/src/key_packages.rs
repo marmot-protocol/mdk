@@ -2305,7 +2305,26 @@ mod tests {
                 Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
                 Tag::custom(TagKind::Custom("mls_proposals".into()), ["0x000a"]),
                 Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
-                Tag::custom(TagKind::MlsExtensions, minimal_extensions_tag_values()), // Mixed case
+                Tag::custom(TagKind::MlsExtensions, {
+                    // Mix case: lowercase first char, uppercase second (e.g. "0x000A", "0xF2eE")
+                    let v: Vec<String> = minimal_extensions_tag_values()
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, s)| {
+                            let hex_part = &s[2..];
+                            if i % 2 == 0 {
+                                // Even index: uppercase last char
+                                let (head, tail) = hex_part.split_at(hex_part.len() - 1);
+                                format!("0x{}{}", head, tail.to_uppercase())
+                            } else {
+                                // Odd index: uppercase first char, lowercase rest
+                                let (head, tail) = hex_part.split_at(1);
+                                format!("0x{}{}", head.to_uppercase(), tail.to_lowercase())
+                            }
+                        })
+                        .collect();
+                    v
+                }),
                 Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
                 Tag::custom(TagKind::i(), [hex::encode([0xaa; 32])]),
             ];

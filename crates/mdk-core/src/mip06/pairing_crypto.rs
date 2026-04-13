@@ -35,7 +35,10 @@ pub struct PairingMessage {
 }
 
 impl PairingMessage {
-    /// Minimum message size: 32 (pubkey) + 12 (nonce) + 16 (tag) = 60 bytes.
+    /// Minimum structural size: 32 (pubkey) + 12 (nonce) + 16 (AEAD tag) = 60 bytes.
+    /// A 60-byte message parses successfully but has zero-length plaintext
+    /// (ciphertext contains only the AEAD tag). Decryption of real payloads
+    /// requires > 60 bytes.
     const MIN_SIZE: usize = 32 + 12 + 16;
 
     /// Serialize to wire format.

@@ -62,7 +62,7 @@ macro_rules! impl_versioned_pairing_bytes {
 /// ```tls
 /// struct {
 ///     opaque group_event_key[32];
-///     opaque join_psk<1..255>;
+///     opaque join_psk<0..2^32-1>;
 ///     opaque group_info<1..2^32-1>;
 /// } GroupPairingDataV1;
 /// ```
@@ -168,33 +168,35 @@ impl_versioned_pairing_bytes!(PairingPayload, "pairing payload");
 
 /// Data sent from the new device to the existing device (Phase 1, Add-based workaround).
 ///
-/// Contains a single KeyPackage that the existing device will use to add
-/// the new device to groups via standard MLS Add proposals.
+/// Contains a JSON-serialized Nostr Event wrapping an MLS KeyPackage that the existing
+/// device will use to add the new device to groups via standard MLS Add proposals.
 #[derive(
     Debug, Clone, PartialEq, Eq, TlsSerialize, TlsDeserialize, TlsDeserializeBytes, TlsSize,
 )]
 pub struct DevicePairingRequest {
     /// Version of the pairing request format.
     version: u16,
-    /// TLS-serialized MLS KeyPackage for the new device.
-    key_package: Vec<u8>,
+    /// JSON-serialized Nostr Event containing the new device's MLS KeyPackage.
+    /// Callers produce this via `event.as_json().into_bytes()` and consume it
+    /// via `nostr::Event::from_json(std::str::from_utf8(bytes))`.
+    key_package_event_json: Vec<u8>,
 }
 
 impl DevicePairingRequest {
     /// Current version.
     pub const CURRENT_VERSION: u16 = 1;
 
-    /// Create a new pairing request.
-    pub fn new(key_package: Vec<u8>) -> Self {
+    /// Create a new pairing request from the JSON-serialized KeyPackage Nostr Event.
+    pub fn new(key_package_event_json: Vec<u8>) -> Self {
         Self {
             version: Self::CURRENT_VERSION,
-            key_package,
+            key_package_event_json,
         }
     }
 
-    /// The KeyPackage bytes.
-    pub fn key_package_bytes(&self) -> &[u8] {
-        &self.key_package
+    /// The JSON-serialized Nostr Event bytes containing the KeyPackage.
+    pub fn key_package_event_json(&self) -> &[u8] {
+        &self.key_package_event_json
     }
 }
 
@@ -299,7 +301,7 @@ mod tests {
     fn test_request_version_0_rejected() {
         let req = DevicePairingRequest {
             version: 0,
-            key_package: vec![],
+            key_package_event_json: vec![],
         };
         let bytes = req.to_bytes().unwrap();
         assert!(DevicePairingRequest::from_bytes(&bytes).is_err());

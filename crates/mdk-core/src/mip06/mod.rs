@@ -2,12 +2,24 @@
 //!
 //! This module implements the multi-device protocol for Marmot, allowing a single
 //! Nostr identity to participate in MLS groups from multiple independent devices.
-//! Each device is an independent MLS leaf node that joins existing groups via
-//! standard Add proposals, authorized through an out-of-band device pairing flow.
+//! Each device is an independent MLS leaf node that joins existing groups, authorized
+//! through an out-of-band device pairing flow.
 //!
-//! The pairing flow is a two-phase encrypted exchange:
-//! 1. New device → Existing device: KeyPackage
-//! 2. Existing device → New device: Welcome messages (one per group)
+//! ## Joining Flows
+//!
+//! **External Commit (spec-compliant, primary):** The new device receives a
+//! `PairingPayload` containing `GroupInfo` + join PSK for each group, then
+//! constructs an External Commit with a Nostr identity proof in
+//! `authenticated_data`. The existing device validates the commit through the
+//! standard message pipeline (`validate_external_commit_authorization`,
+//! `validate_external_commit_identity_proof`).
+//!
+//! **Add-based (workaround):** Used while OpenMLS External Commit support has
+//! limitations. The new device sends a KeyPackage to the existing device, which
+//! adds the new device via standard MLS Add proposals and returns Welcome
+//! messages. This is a two-phase encrypted exchange:
+//! 1. New device -> Existing device: KeyPackage (via `DevicePairingRequest`)
+//! 2. Existing device -> New device: Welcome messages (via `DevicePairingResponse`)
 
 mod device_name;
 mod extension;
@@ -66,10 +78,15 @@ mod integration_tests {
             .expect("Should create group");
 
         let group_id = create_result.group.mls_group_id.clone();
+
+        // create_group_with_multi_device internally calls create_group_inner which
+        // merges the initial group-creation commit (privacy-preserving). The pending
+        // commit here is the add-members commit that invited Bob.
         alice_device1_mdk
             .merge_pending_commit(&group_id)
-            .expect("Should merge pending commit");
+            .expect("Should merge the add-members commit from group creation");
 
+        // Phase 1: New device → Existing device (encrypted DevicePairingRequest)
         let device2_kp_event = create_key_package_event(&alice_device2_mdk, &alice_keys);
 
         let kp_bytes = super::DevicePairingRequest::new(device2_kp_event.as_json().into_bytes())
@@ -85,9 +102,10 @@ mod integration_tests {
         let request = super::DevicePairingRequest::from_bytes(&decrypted).unwrap();
 
         let kp_event: nostr::Event =
-            nostr::Event::from_json(std::str::from_utf8(request.key_package_bytes()).unwrap())
+            nostr::Event::from_json(std::str::from_utf8(request.key_package_event_json()).unwrap())
                 .unwrap();
 
+        // Phase 2: Existing device → New device (encrypted DevicePairingResponse)
         let pairing_response = alice_device1_mdk
             .add_device_to_groups(std::slice::from_ref(&group_id), &kp_event)
             .expect("Should add device to groups");
@@ -117,9 +135,10 @@ mod integration_tests {
             .accept_welcome(&processed_welcome)
             .expect("Should accept welcome");
 
+        // Merge the add-device commit produced by add_device_to_groups above.
         alice_device1_mdk
             .merge_pending_commit(&group_id)
-            .expect("Should merge add commit");
+            .expect("Should merge the add-device commit from pairing");
 
         let device2_group = alice_device2_mdk
             .get_group(&processed_welcome.mls_group_id)
@@ -421,6 +440,10 @@ mod integration_tests {
             .try_into_protocol_message()
             .expect("Should be a protocol message");
 
+        // NOTE: This calls OpenMLS directly (not MDK::process_message) because the
+        // commit bytes are not wrapped in an encrypted Nostr event. The MDK validation
+        // pipeline (validate_external_commit_authorization, validate_external_commit_identity_proof)
+        // is exercised in messages::validation::tests::test_external_commit_validation_pipeline.
         let processed = mls_group
             .process_message(&alice_device1.provider, protocol_msg)
             .expect("Device 1 should accept the External Commit");

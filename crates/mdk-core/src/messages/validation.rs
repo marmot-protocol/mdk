@@ -703,6 +703,7 @@ mod tests {
     use mdk_memory_storage::MdkMemoryStorage;
     use nostr::{EventBuilder, Keys, Kind, Tag, TagKind};
     use openmls::prelude::BasicCredential;
+    use tls_codec::Deserialize as _;
     use tls_codec::Serialize as TlsSerialize;
 
     use crate::MDK;
@@ -2299,6 +2300,84 @@ mod tests {
                 assert_eq!(orig, original_identity.to_hex());
                 assert_eq!(new, attacker_identity.to_hex());
             }
+        }
+    }
+
+    /// End-to-end test that External Commit validation functions are exercised.
+    ///
+    /// This test constructs an External Commit via the MIP-06 pairing flow, processes
+    /// it through OpenMLS, and then calls `validate_external_commit_authorization` and
+    /// `validate_external_commit_identity_proof` — the same functions invoked by
+    /// `process_commit` in production — to verify both accept a legitimate join.
+    #[cfg(feature = "mip06")]
+    #[test]
+    fn test_external_commit_validation_pipeline() {
+        use openmls::prelude::ProcessedMessageContent;
+
+        let alice_keys = Keys::generate();
+        let bob_keys = Keys::generate();
+
+        let alice_device1 = create_test_mdk();
+        let alice_device2 = create_test_mdk();
+        let bob_mdk = create_test_mdk();
+        let bob_kp = create_key_package_event(&bob_mdk, &bob_keys);
+
+        // Create group with MIP-06 enabled
+        let create_result = alice_device1
+            .create_group_with_multi_device(
+                &alice_keys.public_key(),
+                vec![bob_kp],
+                create_nostr_group_config_data(vec![
+                    alice_keys.public_key(),
+                    bob_keys.public_key(),
+                ]),
+            )
+            .unwrap();
+        let group_id = create_result.group.mls_group_id.clone();
+        alice_device1.merge_pending_commit(&group_id).unwrap();
+
+        // Device 2 joins via External Commit
+        let payload = alice_device1
+            .build_pairing_payload(std::slice::from_ref(&group_id))
+            .unwrap();
+        let group_data = &payload.groups()[0];
+
+        let commit_result = alice_device2
+            .join_group_via_external_commit(group_data, &alice_keys)
+            .expect("External Commit should succeed");
+
+        // Process the commit through OpenMLS on device 1
+        let mut mls_group = alice_device1.load_mls_group(&group_id).unwrap().unwrap();
+        let msg_in =
+            openmls::prelude::MlsMessageIn::tls_deserialize_exact(&commit_result.commit_message)
+                .expect("Should deserialize");
+        let protocol_msg = msg_in
+            .try_into_protocol_message()
+            .expect("Should be protocol message");
+
+        let processed = mls_group
+            .process_message(&alice_device1.provider, protocol_msg)
+            .expect("OpenMLS should accept the External Commit");
+
+        let aad = processed.aad().to_vec();
+
+        match processed.into_content() {
+            ProcessedMessageContent::StagedCommitMessage(staged_commit) => {
+                // Exercise validate_external_commit_authorization (conditions 1-5, 7-8)
+                alice_device1
+                    .validate_external_commit_authorization(&mls_group, &staged_commit)
+                    .expect("Authorization validation should pass for legitimate join");
+
+                // Exercise validate_external_commit_identity_proof (condition 6)
+                alice_device1
+                    .validate_external_commit_identity_proof(&mls_group, &staged_commit, &aad)
+                    .expect("Identity proof validation should pass for legitimate join");
+
+                mls_group
+                    .merge_staged_commit(&alice_device1.provider, *staged_commit)
+                    .expect("Should merge External Commit");
+            }
+            other => panic!("Expected StagedCommitMessage, got {:?}", other),
         }
     }
 }
