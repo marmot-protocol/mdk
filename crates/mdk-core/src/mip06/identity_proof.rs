@@ -3,6 +3,10 @@
 //! Binds an External Commit to the Nostr private key of the joining user via a
 //! canonical unsigned Nostr proof event (`kind: 450`) placed in
 //! `FramedContent.authenticated_data`.
+//!
+//! The challenge hash binds to the credential identity (Nostr pubkey) and MLS
+//! signature key — both known before `ExternalCommitBuilder::build_group()` — so
+//! the proof can be constructed as AAD without needing the full LeafNode.
 
 use nostr::{EventBuilder, Keys, Kind, PublicKey, Tag, TagKind, Timestamp};
 use sha2::{Digest, Sha256};
@@ -84,14 +88,25 @@ impl NostrIdentityProof {
 }
 
 /// Compute the challenge hash per MIP-06:
-/// `SHA-256("marmot-external-commit-v1" || serialized_LeafNode || serialized_GroupContext)`
+///
+/// ```text
+/// SHA-256("marmot-external-commit-v1" || credential_identity || signature_key || serialized_GroupContext)
+/// ```
+///
+/// The challenge binds to the identity-relevant fields (Nostr pubkey from the
+/// credential and the MLS signature public key) rather than the full serialized
+/// LeafNode. This allows the proof to be constructed before the External Commit's
+/// LeafNode exists, since both values are supplied by the application via
+/// `CredentialWithKey` before `build_group()`.
 pub fn compute_challenge(
-    serialized_leaf_node: &[u8],
+    credential_identity: &[u8],
+    signature_key: &[u8],
     serialized_group_context: &[u8],
 ) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(CHALLENGE_PREFIX);
-    hasher.update(serialized_leaf_node);
+    hasher.update(credential_identity);
+    hasher.update(signature_key);
     hasher.update(serialized_group_context);
     hasher.finalize().into()
 }
@@ -161,28 +176,37 @@ fn verify_canonical_proof_event(
         .map_err(|e| Error::IdentityProofError(format!("signature verification failed: {e}")))
 }
 
-/// Verify a Nostr identity proof against a reconstructed canonical event.
+/// Verify a Nostr identity proof.
+///
+/// The verifier extracts `credential_identity` and `signature_key` from the
+/// joining LeafNode in the staged commit, and `serialized_group_context` from
+/// the pre-commit group state.
 pub fn verify_identity_proof(
     proof: &NostrIdentityProof,
     pubkey: &PublicKey,
-    serialized_leaf_node: &[u8],
+    credential_identity: &[u8],
+    signature_key: &[u8],
     serialized_group_context: &[u8],
 ) -> Result<(), Error> {
-    // Version is already validated by from_authenticated_data() and hardcoded by new()
-    let challenge = compute_challenge(serialized_leaf_node, serialized_group_context);
+    let challenge = compute_challenge(credential_identity, signature_key, serialized_group_context);
     verify_canonical_proof_event(pubkey, &challenge, proof.signature_bytes())
 }
 
 /// Construct an identity proof by signing the canonical proof event.
+///
+/// The joiner supplies `credential_identity` (raw Nostr pubkey bytes from the
+/// `BasicCredential`) and `signature_key` (MLS signature public key bytes from
+/// the `CredentialWithKey`), both of which are known before
+/// `ExternalCommitBuilder::build_group()`.
 pub fn construct_identity_proof(
     keys: &Keys,
-    serialized_leaf_node: &[u8],
+    credential_identity: &[u8],
+    signature_key: &[u8],
     serialized_group_context: &[u8],
 ) -> Result<NostrIdentityProof, Error> {
-    let challenge = compute_challenge(serialized_leaf_node, serialized_group_context);
+    let challenge = compute_challenge(credential_identity, signature_key, serialized_group_context);
     let event = sign_canonical_proof_event(keys, &challenge)?;
 
-    // Extract the 64-byte Schnorr signature from the signed event
     let sig_bytes: [u8; 64] = event.sig.serialize();
 
     Ok(NostrIdentityProof::new(sig_bytes))
@@ -205,38 +229,63 @@ mod tests {
     #[test]
     fn test_construct_and_verify() {
         let keys = Keys::generate();
-        let leaf_node = b"fake-leaf-node-tls-bytes";
+        let credential_identity = b"fake-nostr-pubkey-32-bytes------";
+        let signature_key = b"fake-mls-signature-key-bytes----";
         let group_context = b"fake-group-context-tls-bytes";
 
-        let proof = construct_identity_proof(&keys, leaf_node, group_context).unwrap();
+        let proof =
+            construct_identity_proof(&keys, credential_identity, signature_key, group_context)
+                .unwrap();
 
-        verify_identity_proof(&proof, &keys.public_key(), leaf_node, group_context).unwrap();
+        verify_identity_proof(
+            &proof,
+            &keys.public_key(),
+            credential_identity,
+            signature_key,
+            group_context,
+        )
+        .unwrap();
     }
 
     #[test]
     fn test_wrong_pubkey_fails_verification() {
         let keys = Keys::generate();
         let other_keys = Keys::generate();
-        let leaf_node = b"leaf";
-        let group_context = b"context";
+        let cred = b"cred";
+        let sig_key = b"sigkey";
+        let gc = b"context";
 
-        let proof = construct_identity_proof(&keys, leaf_node, group_context).unwrap();
+        let proof = construct_identity_proof(&keys, cred, sig_key, gc).unwrap();
 
-        let result =
-            verify_identity_proof(&proof, &other_keys.public_key(), leaf_node, group_context);
+        let result = verify_identity_proof(&proof, &other_keys.public_key(), cred, sig_key, gc);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_wrong_challenge_fails_verification() {
         let keys = Keys::generate();
-        let leaf_node = b"leaf";
-        let group_context = b"context";
+        let cred = b"cred";
+        let sig_key = b"sigkey";
+        let gc = b"context";
 
-        let proof = construct_identity_proof(&keys, leaf_node, group_context).unwrap();
+        let proof = construct_identity_proof(&keys, cred, sig_key, gc).unwrap();
 
         let result =
-            verify_identity_proof(&proof, &keys.public_key(), b"wrong-leaf", group_context);
+            verify_identity_proof(&proof, &keys.public_key(), b"wrong-cred", sig_key, gc);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_wrong_signature_key_fails_verification() {
+        let keys = Keys::generate();
+        let cred = b"cred";
+        let sig_key = b"sigkey";
+        let gc = b"context";
+
+        let proof = construct_identity_proof(&keys, cred, sig_key, gc).unwrap();
+
+        let result =
+            verify_identity_proof(&proof, &keys.public_key(), cred, b"wrong-sigkey", gc);
         assert!(result.is_err());
     }
 
@@ -248,11 +297,11 @@ mod tests {
 
     #[test]
     fn test_challenge_is_deterministic() {
-        let c1 = compute_challenge(b"leaf", b"ctx");
-        let c2 = compute_challenge(b"leaf", b"ctx");
+        let c1 = compute_challenge(b"cred", b"sigkey", b"ctx");
+        let c2 = compute_challenge(b"cred", b"sigkey", b"ctx");
         assert_eq!(c1, c2);
 
-        let c3 = compute_challenge(b"different", b"ctx");
+        let c3 = compute_challenge(b"different", b"sigkey", b"ctx");
         assert_ne!(c1, c3);
     }
 }

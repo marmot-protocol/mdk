@@ -4,7 +4,8 @@
 //!
 //! ## Spec-compliant (External Commit flow)
 //! `PairingPayload` / `GroupPairingDataV1`: the new device receives GroupInfo,
-//! group_event_key, and resumption_psk, then self-joins via External Commit.
+//! group_event_key, and join_psk (exporter-derived External PSK), then self-joins
+//! via External Commit.
 //!
 //! ## Add-based workaround
 //! `DevicePairingRequest` / `DevicePairingResponse`: used while OpenMLS blockers
@@ -33,7 +34,7 @@ fn validate_pairing_version(version: u16) -> Result<(), Error> {
 /// ```tls
 /// struct {
 ///     opaque group_event_key[32];
-///     opaque resumption_psk<1..255>;
+///     opaque join_psk<1..255>;
 ///     opaque group_info<1..2^32-1>;
 /// } GroupPairingDataV1;
 /// ```
@@ -41,8 +42,10 @@ fn validate_pairing_version(version: u16) -> Result<(), Error> {
 pub struct GroupPairingDataV1 {
     /// Exact 32-byte outer encryption key for `kind: 445` group-event encryption (MIP-03).
     group_event_key: [u8; 32],
-    /// Current epoch resumption PSK. Length MUST equal `KDF.Nh` for the group ciphersuite.
-    resumption_psk: Vec<u8>,
+    /// Exporter-derived External PSK for MIP-06 join authorization.
+    /// Length MUST equal `KDF.Nh` for the group ciphersuite.
+    /// Derived via `MLS-Exporter("marmot-mip06-join-psk-v1", join_psk_id, KDF.Nh)`.
+    join_psk: Vec<u8>,
     /// TLS-serialized `GroupInfo` for current epoch. MUST include `external_pub` and
     /// `ratchet_tree` extensions.
     group_info: Vec<u8>,
@@ -52,12 +55,12 @@ impl GroupPairingDataV1 {
     /// Create a new per-group pairing entry.
     pub fn new(
         group_event_key: [u8; 32],
-        resumption_psk: Vec<u8>,
+        join_psk: Vec<u8>,
         group_info: Vec<u8>,
     ) -> Result<Self, Error> {
-        if resumption_psk.is_empty() {
+        if join_psk.is_empty() {
             return Err(Error::PairingError(
-                "resumption_psk must not be empty".to_string(),
+                "join_psk must not be empty".to_string(),
             ));
         }
         if group_info.is_empty() {
@@ -67,7 +70,7 @@ impl GroupPairingDataV1 {
         }
         Ok(Self {
             group_event_key,
-            resumption_psk,
+            join_psk,
             group_info,
         })
     }
@@ -77,9 +80,9 @@ impl GroupPairingDataV1 {
         &self.group_event_key
     }
 
-    /// The resumption PSK bytes.
-    pub fn resumption_psk(&self) -> &[u8] {
-        &self.resumption_psk
+    /// The exporter-derived External PSK bytes.
+    pub fn join_psk(&self) -> &[u8] {
+        &self.join_psk
     }
 
     /// The TLS-serialized `GroupInfo` bytes.
@@ -321,7 +324,7 @@ mod tests {
 
         let data = GroupPairingDataV1::new(
             [0xAA; 32],
-            vec![0xBB; 32], // resumption_psk (KDF.Nh = 32 for ciphersuite 0x0001)
+            vec![0xBB; 32], // join_psk (KDF.Nh = 32 for ciphersuite 0x0001)
             vec![0xCC; 200], // group_info
         )
         .unwrap();
@@ -331,7 +334,7 @@ mod tests {
         let (decoded, _) = GroupPairingDataV1::tls_deserialize_bytes(&bytes).unwrap();
         assert_eq!(data, decoded);
         assert_eq!(data.group_event_key(), &[0xAA; 32]);
-        assert_eq!(data.resumption_psk().len(), 32);
+        assert_eq!(data.join_psk().len(), 32);
         assert_eq!(data.group_info().len(), 200);
     }
 
