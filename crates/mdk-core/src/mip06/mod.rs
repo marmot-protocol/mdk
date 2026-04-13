@@ -12,6 +12,7 @@
 mod device_name;
 mod extension;
 mod identity_proof;
+mod join_psk;
 mod pairing;
 mod pairing_crypto;
 
@@ -20,6 +21,7 @@ pub use self::extension::{MarmotMultiDevice, is_multi_device_enabled};
 pub use self::identity_proof::{
     NostrIdentityProof, compute_challenge, construct_identity_proof, verify_identity_proof,
 };
+pub use self::join_psk::{JoinPskId, JOIN_PSK_EXPORTER_LABEL, JOIN_PSK_LABEL};
 pub use self::pairing::{
     DevicePairingRequest, DevicePairingResponse, GroupPairingDataV1, GroupWelcomeData,
     PairingPayload,
@@ -215,7 +217,8 @@ mod integration_tests {
 
         let proof = super::identity_proof::construct_identity_proof(
             &keys,
-            b"leaf-node",
+            b"credential-identity",
+            b"signature-key",
             b"group-context",
         )
         .unwrap();
@@ -226,7 +229,8 @@ mod integration_tests {
         super::identity_proof::verify_identity_proof(
             &decoded,
             &keys.public_key(),
-            b"leaf-node",
+            b"credential-identity",
+            b"signature-key",
             b"group-context",
         )
         .unwrap();
@@ -236,7 +240,8 @@ mod integration_tests {
         assert!(super::identity_proof::verify_identity_proof(
             &decoded,
             &other.public_key(),
-            b"leaf-node",
+            b"credential-identity",
+            b"signature-key",
             b"group-context",
         )
         .is_err());
@@ -309,7 +314,7 @@ mod integration_tests {
 
         let group_data = &payload.groups()[0];
         assert_ne!(group_data.group_event_key(), &[0u8; 32]);
-        assert!(!group_data.resumption_psk().is_empty());
+        assert!(!group_data.join_psk().is_empty());
         assert!(!group_data.group_info().is_empty());
 
         // Verify roundtrip serialization
@@ -336,14 +341,111 @@ mod integration_tests {
         assert!(result.is_err());
     }
 
-    /// Test join_group_via_external_commit returns NotImplemented (blocked by OpenMLS)
+    /// Test join_group_via_external_commit rejects invalid GroupInfo bytes.
     #[test]
-    fn test_join_group_via_external_commit_blocked() {
+    fn test_join_group_via_external_commit_rejects_invalid_group_info() {
         let mdk = create_test_mdk();
         let keys = Keys::generate();
         let data = super::GroupPairingDataV1::new([1; 32], vec![2; 32], vec![3; 100]).unwrap();
 
         let result = mdk.join_group_via_external_commit(&data, &keys);
         assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("GroupInfo"),
+            "Expected GroupInfo-related error, got: {err_msg}"
+        );
+    }
+
+    /// Test register_join_psk succeeds for MIP-06-enabled groups and is a no-op for others.
+    #[test]
+    fn test_register_join_psk() {
+        let alice_keys = Keys::generate();
+        let bob_keys = Keys::generate();
+
+        let alice_mdk = create_test_mdk();
+        let bob_mdk = create_test_mdk();
+        let bob_kp = create_key_package_event(&bob_mdk, &bob_keys);
+
+        // MIP-06 group: register should succeed
+        let create_result = alice_mdk
+            .create_group_with_multi_device(
+                &alice_keys.public_key(),
+                vec![bob_kp],
+                create_nostr_group_config_data(vec![
+                    alice_keys.public_key(),
+                    bob_keys.public_key(),
+                ]),
+            )
+            .unwrap();
+        let group_id = create_result.group.mls_group_id.clone();
+        alice_mdk.merge_pending_commit(&group_id).unwrap();
+
+        alice_mdk
+            .register_join_psk(&group_id)
+            .expect("Should register join PSK for MIP-06 group");
+
+        // Non-MIP-06 group: register should be a no-op
+        let non_mip06_result = alice_mdk
+            .create_group(
+                &alice_keys.public_key(),
+                vec![],
+                create_nostr_group_config_data(vec![alice_keys.public_key()]),
+            )
+            .unwrap();
+        alice_mdk
+            .register_join_psk(&non_mip06_result.group.mls_group_id)
+            .expect("Should be no-op for non-MIP-06 group");
+    }
+
+    /// Test full External Commit flow: existing device builds pairing payload,
+    /// new device joins via External Commit with join PSK.
+    #[test]
+    fn test_external_commit_join_flow() {
+        let alice_keys = Keys::generate();
+        let bob_keys = Keys::generate();
+
+        let alice_device1 = create_test_mdk();
+        let alice_device2 = create_test_mdk();
+        let bob_mdk = create_test_mdk();
+        let bob_kp = create_key_package_event(&bob_mdk, &bob_keys);
+
+        // Device 1 creates MIP-06 group
+        let create_result = alice_device1
+            .create_group_with_multi_device(
+                &alice_keys.public_key(),
+                vec![bob_kp],
+                create_nostr_group_config_data(vec![
+                    alice_keys.public_key(),
+                    bob_keys.public_key(),
+                ]),
+            )
+            .unwrap();
+        let group_id = create_result.group.mls_group_id.clone();
+        alice_device1.merge_pending_commit(&group_id).unwrap();
+
+        // Device 1 registers join PSK (so it can process the incoming External Commit)
+        alice_device1.register_join_psk(&group_id).unwrap();
+
+        // Device 1 builds pairing payload
+        let payload = alice_device1
+            .build_pairing_payload(&[group_id.clone()])
+            .unwrap();
+        assert_eq!(payload.groups().len(), 1);
+
+        let group_data = &payload.groups()[0];
+
+        // Device 2 joins via External Commit
+        let result = alice_device2
+            .join_group_via_external_commit(group_data, &alice_keys);
+
+        // This should succeed — PSK blocker is resolved
+        let commit_result = result.expect("External Commit should succeed");
+        assert_eq!(commit_result.group_id, group_id);
+        assert!(!commit_result.commit_message.is_empty());
+        assert_eq!(
+            commit_result.group_event_key,
+            *group_data.group_event_key()
+        );
     }
 }

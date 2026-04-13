@@ -477,7 +477,12 @@ where
             ));
         }
 
-        // 5. Exactly one PreSharedKey proposal with resumption PSK.
+        // 5. Exactly one PreSharedKey proposal with external join PSK.
+        //    The proposal must use psktype=external with a MarmotMultiDeviceJoinPskId.
+        //    OpenMLS validates the PSK cryptographically via confirmation_tag during
+        //    process_message(), so if the PSK is wrong the commit is rejected before
+        //    we reach this point. We verify the count here; full PSK ID inspection is
+        //    blocked by PreSharedKeyProposal::into_psk_id() being pub(crate) in OpenMLS.
         let psk_count = staged_commit
             .queued_proposals()
             .filter(|p| matches!(p.proposal(), Proposal::PreSharedKey(_)))
@@ -522,53 +527,54 @@ where
     /// with the `authenticated_data` bytes captured from `ProcessedMessage::aad()`
     /// before the message content is consumed.
     ///
-    /// # OpenMLS 0.8.1 limitation
-    ///
-    /// Full verification requires TLS-serializing the pre-commit `GroupContext`,
-    /// but `MlsGroup::context()` is `pub(crate)` and `export_group_context()` is
-    /// gated behind `#[cfg(feature = "test-utils")]`. Until OpenMLS exposes this
-    /// publicly, we validate the proof structure and that `authenticated_data` is
-    /// non-empty, but cannot verify the challenge hash cryptographically.
-    ///
-    /// This is acceptable because:
-    /// 1. The joining side is ALSO blocked (AAD ordering issue prevents construction)
-    /// 2. `confirmation_tag` validation by OpenMLS still binds the commit cryptographically
-    /// 3. The structural checks (signaling gate, identity match, PSK, no-Remove) remain enforced
+    /// Full cryptographic verification: extracts credential_identity and signature_key
+    /// from the joining LeafNode, exports the pre-commit GroupContext, recomputes the
+    /// challenge hash, and verifies the Schnorr signature.
     #[cfg(feature = "mip06")]
     pub(super) fn validate_external_commit_identity_proof(
         &self,
-        _mls_group: &MlsGroup,
+        mls_group: &MlsGroup,
         staged_commit: &StagedCommit,
         authenticated_data: &[u8],
     ) -> Result<()> {
-        use crate::mip06::NostrIdentityProof;
+        use crate::mip06::{NostrIdentityProof, verify_identity_proof};
         use openmls::prelude::BasicCredential;
 
         // Validate proof structure and version
-        let _proof = NostrIdentityProof::from_authenticated_data(authenticated_data)?;
+        let proof = NostrIdentityProof::from_authenticated_data(authenticated_data)?;
 
-        // Validate joining LeafNode is present (needed for challenge computation)
+        // Extract joining LeafNode from the commit's update path
         let joining_leaf = staged_commit.update_path_leaf_node().ok_or_else(|| {
             Error::IdentityProofError(
                 "External Commit has no update path leaf node".to_string(),
             )
         })?;
 
-        // Validate credential is parseable
+        // Extract credential identity (raw Nostr pubkey bytes) and signature key
         let joining_cred = BasicCredential::try_from(joining_leaf.credential().clone())
             .map_err(|e| Error::IdentityProofError(format!("invalid credential: {e}")))?;
-        let _joining_pubkey = self.parse_credential_identity(joining_cred.identity())?;
+        let joining_pubkey = self.parse_credential_identity(joining_cred.identity())?;
+        let credential_identity = joining_cred.identity();
+        let signature_key = joining_leaf.signature_key().as_slice();
 
-        // TODO(openmls): Full signature verification blocked by MlsGroup::context()
-        // being pub(crate). When OpenMLS exposes GroupContext publicly:
-        //
-        //   let serialized_leaf = joining_leaf.tls_serialize_detached()?;
-        //   let serialized_gc = mls_group.export_group_context().tls_serialize_detached()?;
-        //   verify_identity_proof(&proof, &joining_pubkey, &serialized_leaf, &serialized_gc)?;
+        // Export the pre-commit GroupContext for challenge computation
+        let gc_bytes = self.export_group_context_bytes(mls_group).map_err(|e| {
+            Error::IdentityProofError(format!("failed to export GroupContext: {e}"))
+        })?;
+
+        // Full cryptographic verification
+        verify_identity_proof(
+            &proof,
+            &joining_pubkey,
+            credential_identity,
+            signature_key,
+            &gc_bytes,
+        )?;
 
         tracing::debug!(
             target: "mdk_core::messages::validate_external_commit",
-            "Identity proof structure validated (full signature check pending OpenMLS API)"
+            "External Commit identity proof verified for {}",
+            joining_pubkey
         );
 
         Ok(())
