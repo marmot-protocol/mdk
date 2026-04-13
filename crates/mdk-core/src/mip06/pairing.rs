@@ -41,7 +41,10 @@ macro_rules! impl_versioned_pairing_bytes {
             /// Deserialize from bytes with version validation.
             pub fn from_bytes(bytes: &[u8]) -> Result<Self, Error> {
                 let (val, _) = Self::tls_deserialize_bytes(bytes).map_err(|e| {
-                    Error::PairingError(format!(concat!("failed to deserialize ", $label, ": {e}"), e = e))
+                    Error::PairingError(format!(
+                        concat!("failed to deserialize ", $label, ": {e}"),
+                        e = e
+                    ))
                 })?;
                 validate_pairing_version(val.version)?;
                 Ok(val)

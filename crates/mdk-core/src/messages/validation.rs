@@ -515,10 +515,7 @@ where
 
     /// Extract the Nostr pubkey from the joining LeafNode in an External Commit.
     #[cfg(feature = "mip06")]
-    fn extract_joining_pubkey(
-        &self,
-        staged_commit: &StagedCommit,
-    ) -> Result<nostr::PublicKey> {
+    fn extract_joining_pubkey(&self, staged_commit: &StagedCommit) -> Result<nostr::PublicKey> {
         use openmls::prelude::BasicCredential;
 
         let joining_leaf = staged_commit.update_path_leaf_node().ok_or_else(|| {

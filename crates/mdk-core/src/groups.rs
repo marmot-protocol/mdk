@@ -1688,7 +1688,7 @@ where
             nostr_keys,
             &credential_identity,
             &signature_key_bytes,
-            &gc_bytes,
+            gc_bytes,
         )?;
         let aad = identity_proof.to_authenticated_data()?;
 
