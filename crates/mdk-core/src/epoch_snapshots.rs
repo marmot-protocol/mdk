@@ -862,6 +862,7 @@ mod tests {
             image_nonce: None,
             state: GroupState::Active,
             self_update_state: SelfUpdateState::Required,
+            disappearing_message_secs: None,
         };
         storage.save_group(group).unwrap();
 
@@ -911,6 +912,7 @@ mod tests {
             image_nonce: None,
             state: GroupState::Active,
             self_update_state: SelfUpdateState::Required,
+            disappearing_message_secs: None,
         };
         storage.save_group(group).unwrap();
 
@@ -1070,6 +1072,7 @@ mod tests {
             image_nonce: None,
             state: GroupState::Active,
             self_update_state: SelfUpdateState::Required,
+            disappearing_message_secs: None,
         };
         storage.save_group(group).unwrap();
 
@@ -1173,6 +1176,7 @@ mod tests {
             image_nonce: None,
             state: GroupState::Active,
             self_update_state: SelfUpdateState::Required,
+            disappearing_message_secs: None,
         };
         storage.save_group(group).unwrap();
 

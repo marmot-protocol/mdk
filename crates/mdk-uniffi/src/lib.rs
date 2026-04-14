@@ -816,6 +816,7 @@ impl Mdk {
             None, // image_nonce
             relay_urls,
             admin_pubkeys,
+            None, // disappearing_message_secs
         );
 
         let mdk = self.lock()?;

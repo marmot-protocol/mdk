@@ -27,6 +27,7 @@
 
 ### Breaking changes
 
+- Added `disappearing_message_secs: Option<u64>` field to the `Group` struct. All code that constructs `Group` structs must now provide this field. `None` means messages persist forever; `Some(n)` means messages expire after `n` seconds. ([#253](https://github.com/marmot-protocol/mdk/pull/253))
 - Added `MessageStorage::delete_messages_for_group` and `MdkStorageProvider::delete_group` for local "clear chat" and "delete chat" operations. Storage implementations must add these methods. ([#250](https://github.com/marmot-protocol/mdk/pull/250))
 - Added `GroupStorage::get_group_legacy_exporter_secret` and `GroupStorage::save_group_legacy_exporter_secret` so storage backends can preserve pre-0.7.0 exporter-secret bytes separately during the temporary migration-compatibility window. Storage implementations must add these methods. ([#222](https://github.com/marmot-protocol/mdk/pull/222))
 
