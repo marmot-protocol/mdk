@@ -177,8 +177,7 @@ pub fn row_to_group(row: &Row) -> SqliteResult<Group> {
         0 => SelfUpdateState::Required,
         ts => SelfUpdateState::CompletedAt(Timestamp::from_secs(ts)),
     };
-    let disappearing_message_duration_secs: Option<u64> =
-        row.get("disappearing_message_duration_secs")?;
+    let disappearing_message_secs: Option<u64> = row.get("disappearing_message_secs")?;
 
     Ok(Group {
         mls_group_id,
@@ -195,7 +194,7 @@ pub fn row_to_group(row: &Row) -> SqliteResult<Group> {
         image_key,
         image_nonce,
         self_update_state,
-        disappearing_message_duration_secs,
+        disappearing_message_secs,
     })
 }
 
@@ -360,7 +359,7 @@ mod tests {
                 epoch INTEGER NOT NULL,
                 state TEXT NOT NULL,
                 last_self_update_at INTEGER NOT NULL DEFAULT 0,
-                disappearing_message_duration_secs INTEGER
+                disappearing_message_secs INTEGER
             )",
         )
         .unwrap();

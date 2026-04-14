@@ -36,7 +36,7 @@
 
 ### Added
 
-- Added V006 migration adding `disappearing_message_duration_secs INTEGER` column to the `groups` table for disappearing message support. `NULL` means disabled; a positive integer means messages expire after that many seconds. `row_to_group` updated to read the new column. ([#253](https://github.com/marmot-protocol/mdk/pull/253))
+- Added V006 migration adding `disappearing_message_secs INTEGER` column to the `groups` table for disappearing message support. `NULL` means disabled; a positive integer means messages expire after that many seconds. `row_to_group` updated to read the new column. ([#253](https://github.com/marmot-protocol/mdk/pull/253))
 - Implemented `delete_messages_for_group` and `delete_group` for local "clear chat" and "delete chat" operations. `delete_group` runs all deletes in a single `BEGIN IMMEDIATE` transaction covering OpenMLS tables, MDK tables, and `processed_messages`. ([#250](https://github.com/marmot-protocol/mdk/pull/250))
 - Implemented `delete_message`, `delete_messages_before_timestamp`, and `delete_processed_messages_for_group` for per-message and bulk expiry-based deletion.
 - Enabled `PRAGMA secure_delete = ON` so that deleted data (including expired disappearing messages) is overwritten with zeros on disk, preventing forensic recovery from the database file.

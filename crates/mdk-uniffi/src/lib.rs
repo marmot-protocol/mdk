@@ -816,7 +816,7 @@ impl Mdk {
             None, // image_nonce
             relay_urls,
             admin_pubkeys,
-            None, // disappearing_message_duration_secs
+            None, // disappearing_message_secs
         );
 
         let mdk = self.lock()?;
@@ -1086,7 +1086,7 @@ impl Mdk {
         }
 
         if let Some(duration) = update.disappearing_message_duration.to_core() {
-            group_update = group_update.disappearing_message_duration_secs(duration);
+            group_update = group_update.disappearing_message_secs(duration);
         }
 
         let mdk = self.lock()?;
@@ -1520,7 +1520,7 @@ pub struct Group {
     ///
     /// - `None`: Messages persist forever (disabled)
     /// - `Some(n)`: Messages expire `n` seconds after creation (`n > 0`)
-    pub disappearing_message_duration_secs: Option<u64>,
+    pub disappearing_message_secs: Option<u64>,
 }
 
 impl From<group_types::Group> for Group {
@@ -1545,7 +1545,7 @@ impl From<group_types::Group> for Group {
                     format!("completed_at:{}", ts.as_secs())
                 }
             },
-            disappearing_message_duration_secs: g.disappearing_message_duration_secs,
+            disappearing_message_secs: g.disappearing_message_secs,
         }
     }
 }
@@ -3090,6 +3090,8 @@ mod tests {
         mdk.merge_pending_commit(create_result.group.mls_group_id.clone())
             .unwrap();
 
+        // Pass an expiration tag to a non-disappearing group — it should be stripped,
+        // because expiration is fully determined by group state (MIP-01/MIP-03).
         let event_json = mdk
             .create_message(
                 create_result.group.mls_group_id,
@@ -3108,19 +3110,8 @@ mod tests {
             serde_json::from_str(&event_json).expect("returned JSON should be valid");
 
         assert!(
-            event.tags.iter().any(|t| t.kind() == TagKind::Expiration),
-            "Wrapper event must contain the expiration tag"
-        );
-
-        let exp_tag = event
-            .tags
-            .iter()
-            .find(|t| t.kind() == TagKind::Expiration)
-            .unwrap();
-        assert_eq!(
-            exp_tag.content().unwrap(),
-            "1231006505",
-            "Expiration value must match"
+            !event.tags.iter().any(|t| t.kind() == TagKind::Expiration),
+            "Caller-supplied expiration tag must be stripped for non-disappearing groups"
         );
     }
 

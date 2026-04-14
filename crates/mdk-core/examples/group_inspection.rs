@@ -125,7 +125,7 @@ async fn main() -> Result<(), Error> {
         image_nonce: None,
         relays: vec![relay_url.clone()],
         admins: vec![creator_keys.public_key()], // Creator is admin
-        disappearing_message_duration_secs: None,
+        disappearing_message_secs: None,
     };
 
     let group_result = mdk.create_group(

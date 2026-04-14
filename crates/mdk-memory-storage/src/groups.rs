@@ -342,7 +342,7 @@ mod tests {
             image_key: None,
             image_nonce: None,
             self_update_state: SelfUpdateState::Required,
-            disappearing_message_duration_secs: None,
+            disappearing_message_secs: None,
         }
     }
 
@@ -503,7 +503,7 @@ mod tests {
             image_key: None,
             image_nonce: None,
             self_update_state: SelfUpdateState::Required,
-            disappearing_message_duration_secs: None,
+            disappearing_message_secs: None,
         };
 
         storage.save_group(group).unwrap();
@@ -630,7 +630,7 @@ mod tests {
             image_key: None,
             image_nonce: None,
             self_update_state: SelfUpdateState::Required,
-            disappearing_message_duration_secs: None,
+            disappearing_message_secs: None,
         };
         storage.save_group(empty_group).unwrap();
 
@@ -748,7 +748,7 @@ mod tests {
             image_key: None,
             image_nonce: None,
             self_update_state: SelfUpdateState::Required,
-            disappearing_message_duration_secs: None,
+            disappearing_message_secs: None,
         };
 
         storage.save_group(group1).unwrap();
@@ -771,7 +771,7 @@ mod tests {
             image_key: None,
             image_nonce: None,
             self_update_state: SelfUpdateState::Required,
-            disappearing_message_duration_secs: None,
+            disappearing_message_secs: None,
         };
 
         // This should fail because nostr_group_id is already used by a different group
@@ -817,7 +817,7 @@ mod tests {
             image_key: None,
             image_nonce: None,
             self_update_state: SelfUpdateState::Required,
-            disappearing_message_duration_secs: None,
+            disappearing_message_secs: None,
         };
 
         storage.save_group(group).unwrap();
@@ -846,7 +846,7 @@ mod tests {
             image_key: None,
             image_nonce: None,
             self_update_state: SelfUpdateState::Required,
-            disappearing_message_duration_secs: None,
+            disappearing_message_secs: None,
         };
 
         storage.save_group(updated_group).unwrap();
@@ -893,7 +893,7 @@ mod tests {
             image_key: None,
             image_nonce: None,
             self_update_state: SelfUpdateState::Required,
-            disappearing_message_duration_secs: None,
+            disappearing_message_secs: None,
         };
 
         storage.save_group(group).unwrap();
@@ -914,7 +914,7 @@ mod tests {
             image_key: None,
             image_nonce: None,
             self_update_state: SelfUpdateState::Required,
-            disappearing_message_duration_secs: None,
+            disappearing_message_secs: None,
         };
 
         // This should succeed - updating the same group

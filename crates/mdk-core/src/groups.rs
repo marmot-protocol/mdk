@@ -69,7 +69,7 @@ pub struct NostrGroupConfigData {
     /// Group admins
     pub admins: Vec<PublicKey>,
     /// Disappearing message duration in seconds (None = disabled, Some(n) = n seconds)
-    pub disappearing_message_duration_secs: Option<u64>,
+    pub disappearing_message_secs: Option<u64>,
 }
 
 /// Configuration for updating group data with optional fields
@@ -94,7 +94,7 @@ pub struct NostrGroupDataUpdate {
     /// Nostr group ID for message routing (optional, for rotation per MIP-01)
     pub nostr_group_id: Option<[u8; 32]>,
     /// Disappearing message duration in seconds (optional, use Some(None) to disable)
-    pub disappearing_message_duration_secs: Option<Option<u64>>,
+    pub disappearing_message_secs: Option<Option<u64>>,
 }
 
 /// Pending member changes from proposals that need admin approval
@@ -158,7 +158,7 @@ impl NostrGroupConfigData {
         image_nonce: Option<[u8; 12]>,
         relays: Vec<RelayUrl>,
         admins: Vec<PublicKey>,
-        disappearing_message_duration_secs: Option<u64>,
+        disappearing_message_secs: Option<u64>,
     ) -> Self {
         Self {
             name,
@@ -168,7 +168,7 @@ impl NostrGroupConfigData {
             image_nonce,
             relays,
             admins,
-            disappearing_message_duration_secs,
+            disappearing_message_secs,
         }
     }
 }
@@ -199,7 +199,7 @@ impl NostrGroupDataUpdate {
         /// Sets the nostr_group_id to be updated (for ID rotation per MIP-01)
         nostr_group_id: [u8; 32];
         /// Sets the disappearing message duration (use None to disable)
-        disappearing_message_duration_secs: Option<u64>;
+        disappearing_message_secs: Option<u64>;
     }
 }
 
@@ -1067,7 +1067,7 @@ where
         update: NostrGroupDataUpdate,
     ) -> Result<UpdateGroupResult, Error> {
         // Validate disappearing message duration: Some(0) is not allowed
-        if let Some(Some(0)) = update.disappearing_message_duration_secs {
+        if let Some(Some(0)) = update.disappearing_message_secs {
             return Err(Error::Group(
                 "Disappearing message duration must be greater than 0 seconds".to_string(),
             ));
@@ -1121,8 +1121,8 @@ where
             group_data.nostr_group_id = nostr_group_id;
         }
 
-        if let Some(duration) = update.disappearing_message_duration_secs {
-            group_data.disappearing_message_duration_secs = duration;
+        if let Some(duration) = update.disappearing_message_secs {
+            group_data.disappearing_message_secs = duration;
         }
 
         self.update_group_data_extension(&mut mls_group, group_id, &group_data)
@@ -1199,7 +1199,7 @@ where
         config: NostrGroupConfigData,
     ) -> Result<GroupResult, Error> {
         // Validate disappearing message duration: Some(0) is not allowed
-        if config.disappearing_message_duration_secs == Some(0) {
+        if config.disappearing_message_secs == Some(0) {
             return Err(Error::Group(
                 "Disappearing message duration must be greater than 0 seconds".to_string(),
             ));
@@ -1228,7 +1228,7 @@ where
             config.image_key,
             config.image_nonce,
             None, // image_upload_key - will be set when image is uploaded
-            config.disappearing_message_duration_secs,
+            config.disappearing_message_secs,
         );
 
         let extension = Self::get_unknown_extension_from_group_data(&group_data)?;
@@ -1329,7 +1329,7 @@ where
             image_key: config.image_key.map(mdk_storage_traits::Secret::new),
             image_nonce: config.image_nonce.map(mdk_storage_traits::Secret::new),
             self_update_state: group_types::SelfUpdateState::CompletedAt(Timestamp::now()),
-            disappearing_message_duration_secs: group_data.disappearing_message_duration_secs,
+            disappearing_message_secs: group_data.disappearing_message_secs,
         };
 
         self.storage().save_group(group.clone()).map_err(
@@ -1669,7 +1669,7 @@ where
     /// Delete all messages in a group created before the given timestamp.
     ///
     /// Intended for disappearing-message cleanup: compute
-    /// `now - disappearing_message_duration_secs` and pass it as `before`.
+    /// `now - disappearing_message_secs` and pass it as `before`.
     ///
     /// Returns the number of messages deleted.
     ///
@@ -1873,8 +1873,7 @@ where
         stored_group.image_nonce = group_data.image_nonce.map(mdk_storage_traits::Secret::new);
         stored_group.admin_pubkeys = group_data.admins;
         stored_group.nostr_group_id = group_data.nostr_group_id;
-        stored_group.disappearing_message_duration_secs =
-            group_data.disappearing_message_duration_secs;
+        stored_group.disappearing_message_secs = group_data.disappearing_message_secs;
 
         // Sync relays atomically - replace entire relay set with current extension data
         self.storage()
@@ -6374,7 +6373,7 @@ mod tests {
 
         // Round-trip: verify the stored value
         let stored = mdk.get_group(&group_id).unwrap().unwrap();
-        assert_eq!(stored.disappearing_message_duration_secs, None);
+        assert_eq!(stored.disappearing_message_secs, None);
     }
 
     #[test]
@@ -6405,7 +6404,7 @@ mod tests {
 
         // Round-trip: verify the stored value
         let stored = mdk.get_group(&group_id).unwrap().unwrap();
-        assert_eq!(stored.disappearing_message_duration_secs, Some(3600));
+        assert_eq!(stored.disappearing_message_secs, Some(3600));
     }
 
     #[test]
@@ -6414,7 +6413,7 @@ mod tests {
         let (creator, members, admins) = create_test_group_members();
         let group_id = create_test_group(&mdk, &creator, &members, &admins);
 
-        let update = NostrGroupDataUpdate::new().disappearing_message_duration_secs(Some(0));
+        let update = NostrGroupDataUpdate::new().disappearing_message_secs(Some(0));
 
         let result = mdk.update_group_data(&group_id, update);
         assert!(result.is_err());
@@ -6433,21 +6432,21 @@ mod tests {
         let group_id = create_test_group(&mdk, &creator, &members, &admins);
 
         // First enable disappearing messages
-        let enable = NostrGroupDataUpdate::new().disappearing_message_duration_secs(Some(7200));
+        let enable = NostrGroupDataUpdate::new().disappearing_message_secs(Some(7200));
         mdk.update_group_data(&group_id, enable).unwrap();
         mdk.merge_pending_commit(&group_id).unwrap();
 
         let stored = mdk.get_group(&group_id).unwrap().unwrap();
-        assert_eq!(stored.disappearing_message_duration_secs, Some(7200));
+        assert_eq!(stored.disappearing_message_secs, Some(7200));
 
         // Now disable (Some(None) means "set to disabled")
-        let disable = NostrGroupDataUpdate::new().disappearing_message_duration_secs(None);
+        let disable = NostrGroupDataUpdate::new().disappearing_message_secs(None);
         mdk.update_group_data(&group_id, disable).unwrap();
         mdk.merge_pending_commit(&group_id).unwrap();
 
         // Round-trip: verify it transitioned to None
         let stored = mdk.get_group(&group_id).unwrap().unwrap();
-        assert_eq!(stored.disappearing_message_duration_secs, None);
+        assert_eq!(stored.disappearing_message_secs, None);
     }
 
     #[test]
@@ -6456,13 +6455,13 @@ mod tests {
         let (creator, members, admins) = create_test_group_members();
         let group_id = create_test_group(&mdk, &creator, &members, &admins);
 
-        let update = NostrGroupDataUpdate::new().disappearing_message_duration_secs(Some(86400));
+        let update = NostrGroupDataUpdate::new().disappearing_message_secs(Some(86400));
         mdk.update_group_data(&group_id, update).unwrap();
         mdk.merge_pending_commit(&group_id).unwrap();
 
         // Round-trip: verify the stored value
         let stored = mdk.get_group(&group_id).unwrap().unwrap();
-        assert_eq!(stored.disappearing_message_duration_secs, Some(86400));
+        assert_eq!(stored.disappearing_message_secs, Some(86400));
     }
 
     #[test]

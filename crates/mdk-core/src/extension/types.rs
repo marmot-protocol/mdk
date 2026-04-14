@@ -47,12 +47,12 @@ pub(crate) struct TlsNostrGroupDataExtension {
     pub image_key: Vec<u8>,        // Use Vec<u8> to allow empty for None
     pub image_nonce: Vec<u8>,      // Use Vec<u8> to allow empty for None
     pub image_upload_key: Vec<u8>, // Use Vec<u8> to allow empty for None (v2 only)
-    pub disappearing_message_duration_secs: Vec<u8>, // Use Vec<u8>: empty for None, 8 bytes for Some(u64) (v3 only)
+    pub disappearing_message_secs: Vec<u8>, // Use Vec<u8>: empty for None, 8 bytes for Some(u64) (v3 only)
 }
 
 /// TLS-serializable representation for v1/v2 payloads (before disappearing messages).
 ///
-/// Legacy groups serialized without the `disappearing_message_duration_secs` field
+/// Legacy groups serialized without the `disappearing_message_secs` field
 /// use this struct for deserialization. The missing field is synthesized as an empty
 /// Vec (mapping to `None`) when converting to `TlsNostrGroupDataExtension`.
 #[derive(
@@ -92,7 +92,7 @@ impl TlsNostrGroupDataExtensionV1V2 {
             image_key: self.image_key,
             image_nonce: self.image_nonce,
             image_upload_key: self.image_upload_key,
-            disappearing_message_duration_secs: Vec::new(),
+            disappearing_message_secs: Vec::new(),
         }
     }
 }
@@ -102,7 +102,7 @@ impl TlsNostrGroupDataExtensionV1V2 {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NostrGroupDataExtension {
     /// Extension format version (current: 3)
-    /// Version 3: Adds disappearing_message_duration_secs field
+    /// Version 3: Adds disappearing_message_secs field
     /// Version 2: image_key field contains image_seed, image_upload_key contains upload_seed
     /// Version 1: image_key field contains encryption key directly (deprecated)
     pub version: u16,
@@ -137,7 +137,7 @@ pub struct NostrGroupDataExtension {
     ///
     /// - `None`: Messages persist forever (disabled)
     /// - `Some(n)`: Messages expire `n` seconds after creation (`n > 0`)
-    pub disappearing_message_duration_secs: Option<u64>,
+    pub disappearing_message_secs: Option<u64>,
 }
 
 impl NostrGroupDataExtension {
@@ -145,7 +145,7 @@ impl NostrGroupDataExtension {
     pub const EXTENSION_TYPE: u16 = NOSTR_GROUP_DATA_EXTENSION_TYPE;
 
     /// Current extension format version (MIP-01)
-    /// Version 3: Adds disappearing_message_duration_secs field
+    /// Version 3: Adds disappearing_message_secs field
     /// Version 2: Uses image_seed (stored in image_key field) with HKDF derivation
     /// Version 1: Uses image_key directly as encryption key (deprecated)
     pub const CURRENT_VERSION: u16 = 3;
@@ -174,7 +174,7 @@ impl NostrGroupDataExtension {
         image_key: Option<[u8; 32]>,
         image_nonce: Option<[u8; 12]>,
         image_upload_key: Option<[u8; 32]>,
-        disappearing_message_duration_secs: Option<u64>,
+        disappearing_message_secs: Option<u64>,
     ) -> Self
     where
         T1: Into<String>,
@@ -198,7 +198,7 @@ impl NostrGroupDataExtension {
             image_key,
             image_nonce,
             image_upload_key,
-            disappearing_message_duration_secs,
+            disappearing_message_secs,
         }
     }
 
@@ -213,28 +213,32 @@ impl NostrGroupDataExtension {
     /// * `Ok(NostrGroupDataExtension)` - Successfully deserialized extension
     /// * `Err(Error)` - Failed to deserialize
     fn deserialize_bytes(bytes: &[u8]) -> Result<Self, Error> {
-        // Try the v3 struct first (includes disappearing_message_duration_secs).
-        // If that fails (e.g., legacy v1/v2 payload missing the trailing field),
-        // fall back to the v1/v2 struct and synthesize the missing field as None.
-        match TlsNostrGroupDataExtension::tls_deserialize_bytes(bytes) {
-            Ok((deserialized, remainder)) => {
-                if !remainder.is_empty() {
-                    return Err(Error::ExtensionFormatError(
-                        "Trailing bytes in NostrGroupDataExtension".to_string(),
-                    ));
-                }
-                Self::from_raw(deserialized)
+        // Dispatch on the version field (first 2 bytes, big-endian u16) so that
+        // a corrupt v3 payload can never silently fall through to the v1/v2 parser.
+        if bytes.len() < 2 {
+            return Err(Error::ExtensionFormatError(
+                "Extension payload too short to contain a version".to_string(),
+            ));
+        }
+        let version = u16::from_be_bytes([bytes[0], bytes[1]]);
+
+        if version >= 3 {
+            let (deserialized, remainder) =
+                TlsNostrGroupDataExtension::tls_deserialize_bytes(bytes)?;
+            if !remainder.is_empty() {
+                return Err(Error::ExtensionFormatError(
+                    "Trailing bytes in NostrGroupDataExtension".to_string(),
+                ));
             }
-            Err(_v3_err) => {
-                let (v1v2, remainder) =
-                    TlsNostrGroupDataExtensionV1V2::tls_deserialize_bytes(bytes)?;
-                if !remainder.is_empty() {
-                    return Err(Error::ExtensionFormatError(
-                        "Trailing bytes in NostrGroupDataExtension".to_string(),
-                    ));
-                }
-                Self::from_raw(v1v2.into_v3())
+            Self::from_raw(deserialized)
+        } else {
+            let (v1v2, remainder) = TlsNostrGroupDataExtensionV1V2::tls_deserialize_bytes(bytes)?;
+            if !remainder.is_empty() {
+                return Err(Error::ExtensionFormatError(
+                    "Trailing bytes in NostrGroupDataExtension".to_string(),
+                ));
             }
+            Self::from_raw(v1v2.into_v3())
         }
     }
 
@@ -310,27 +314,22 @@ impl NostrGroupDataExtension {
         };
 
         // Backward compatibility: v1/v2 groups don't have this field, so empty Vec maps to None
-        let disappearing_message_duration_secs =
-            if raw.disappearing_message_duration_secs.is_empty() {
-                None
-            } else {
-                let bytes: [u8; 8] =
-                    raw.disappearing_message_duration_secs
-                        .try_into()
-                        .map_err(|_| {
-                            Error::ExtensionFormatError(
-                            "Invalid disappearing_message_duration_secs length (expected 8 bytes)"
-                                .to_string(),
-                        )
-                        })?;
-                let duration = u64::from_be_bytes(bytes);
-                if duration == 0 {
-                    return Err(Error::ExtensionFormatError(
-                        "disappearing_message_duration_secs cannot be zero".to_string(),
-                    ));
-                }
-                Some(duration)
-            };
+        let disappearing_message_secs = if raw.disappearing_message_secs.is_empty() {
+            None
+        } else {
+            let bytes: [u8; 8] = raw.disappearing_message_secs.try_into().map_err(|_| {
+                Error::ExtensionFormatError(
+                    "Invalid disappearing_message_secs length (expected 8 bytes)".to_string(),
+                )
+            })?;
+            let duration = u64::from_be_bytes(bytes);
+            if duration == 0 {
+                return Err(Error::ExtensionFormatError(
+                    "disappearing_message_secs cannot be zero".to_string(),
+                ));
+            }
+            Some(duration)
+        };
 
         Ok(Self {
             version: raw.version,
@@ -343,7 +342,7 @@ impl NostrGroupDataExtension {
             image_key,
             image_nonce,
             image_upload_key,
-            disappearing_message_duration_secs,
+            disappearing_message_secs,
         })
     }
 
@@ -595,8 +594,8 @@ impl NostrGroupDataExtension {
             image_upload_key: self
                 .image_upload_key
                 .map_or_else(Vec::new, |key| key.to_vec()),
-            disappearing_message_duration_secs: self
-                .disappearing_message_duration_secs
+            disappearing_message_secs: self
+                .disappearing_message_secs
                 .map_or_else(Vec::new, |d| d.to_be_bytes().to_vec()),
         }
     }
@@ -633,7 +632,7 @@ mod tests {
             Some(image_key),
             Some(image_nonce),
             Some(generate_random_bytes(32).try_into().unwrap()), // image_upload_key for v2
-            None, // disappearing_message_duration_secs
+            None,                                                // disappearing_message_secs
         )
     }
 
@@ -806,7 +805,7 @@ mod tests {
             Some(test_key),
             Some(test_nonce),
             Some([4u8; 32]), // image_upload_key
-            None,            // disappearing_message_duration_secs
+            None,            // disappearing_message_secs
         );
 
         // Create extension with None values
@@ -819,7 +818,7 @@ mod tests {
             None,
             None,
             None, // image_upload_key
-            None, // disappearing_message_duration_secs
+            None, // disappearing_message_secs
         );
 
         // Serialize both to measure size
@@ -864,7 +863,7 @@ mod tests {
             None,
             None,
             None,
-            None, // disappearing_message_duration_secs
+            None, // disappearing_message_secs
         );
 
         // Verify version is set to current version
@@ -911,7 +910,7 @@ mod tests {
             image_key: Vec::new(),
             image_nonce: Vec::new(),
             image_upload_key: Vec::new(),
-            disappearing_message_duration_secs: Vec::new(),
+            disappearing_message_secs: Vec::new(),
         };
 
         let result = NostrGroupDataExtension::from_raw(raw_v0);
@@ -932,7 +931,7 @@ mod tests {
             image_key: Vec::new(),
             image_nonce: Vec::new(),
             image_upload_key: Vec::new(),
-            disappearing_message_duration_secs: Vec::new(),
+            disappearing_message_secs: Vec::new(),
         };
 
         let result = NostrGroupDataExtension::from_raw(raw_v1);
@@ -951,7 +950,7 @@ mod tests {
             image_key: Vec::new(),
             image_nonce: Vec::new(),
             image_upload_key: Vec::new(),
-            disappearing_message_duration_secs: Vec::new(),
+            disappearing_message_secs: Vec::new(),
         };
 
         let result = NostrGroupDataExtension::from_raw(raw_v99);
@@ -1011,8 +1010,8 @@ mod tests {
         assert_eq!(deserialized.image_nonce, extension.image_nonce);
         assert_eq!(deserialized.image_upload_key, extension.image_upload_key);
         assert_eq!(
-            deserialized.disappearing_message_duration_secs,
-            extension.disappearing_message_duration_secs
+            deserialized.disappearing_message_secs,
+            extension.disappearing_message_secs
         );
     }
 
@@ -1074,7 +1073,7 @@ mod tests {
             Some([2u8; 32]),
             Some([3u8; 12]),
             None, // v1 doesn't use image_upload_key
-            None, // disappearing_message_duration_secs
+            None, // disappearing_message_secs
         );
 
         assert_eq!(extension.version, NostrGroupDataExtension::CURRENT_VERSION);
@@ -1112,7 +1111,7 @@ mod tests {
             Some([2u8; 32]),
             Some([3u8; 12]),
             None,
-            None, // disappearing_message_duration_secs
+            None, // disappearing_message_secs
         );
         extension2.version = 1;
 
@@ -1141,7 +1140,7 @@ mod tests {
             Some([2u8; 32]),
             Some([3u8; 12]),
             Some([4u8; 32]), // image_upload_key for v2
-            None,            // disappearing_message_duration_secs
+            None,            // disappearing_message_secs
         );
 
         assert_eq!(extension.version, NostrGroupDataExtension::CURRENT_VERSION);
@@ -1181,7 +1180,7 @@ mod tests {
             Some([2u8; 32]),
             Some([3u8; 12]),
             None,
-            None, // disappearing_message_duration_secs
+            None, // disappearing_message_secs
         );
         extension.version = 1;
 
@@ -1195,7 +1194,7 @@ mod tests {
         assert_eq!(extension.image_nonce, Some([3u8; 12]));
     }
 
-    /// Test that legacy v1/v2 TLS payloads (without disappearing_message_duration_secs)
+    /// Test that legacy v1/v2 TLS payloads (without disappearing_message_secs)
     /// deserialize successfully with the field defaulting to None.
     #[test]
     fn test_deserialize_legacy_v1v2_payload_without_disappearing_field() {
@@ -1204,7 +1203,7 @@ mod tests {
         let pk1 = PublicKey::parse(ADMIN_1).unwrap();
         let relay1 = RelayUrl::parse(RELAY_1).unwrap();
 
-        // Serialize a v1/v2 payload directly — no disappearing_message_duration_secs field.
+        // Serialize a v1/v2 payload directly — no disappearing_message_secs field.
         let v2_raw = TlsNostrGroupDataExtensionV1V2 {
             version: 2,
             nostr_group_id: [42u8; 32],
@@ -1229,12 +1228,12 @@ mod tests {
         assert!(extension.admins.contains(&pk1));
         assert!(extension.relays.contains(&relay1));
         assert_eq!(
-            extension.disappearing_message_duration_secs, None,
+            extension.disappearing_message_secs, None,
             "Legacy v2 payload should default to None"
         );
     }
 
-    /// Test that v3 payloads with disappearing_message_duration_secs round-trip correctly.
+    /// Test that v3 payloads with disappearing_message_secs round-trip correctly.
     #[test]
     fn test_deserialize_v3_payload_with_disappearing_duration() {
         use tls_codec::Serialize as TlsSerialize;
@@ -1262,10 +1261,10 @@ mod tests {
             deserialized.version,
             NostrGroupDataExtension::CURRENT_VERSION
         );
-        assert_eq!(deserialized.disappearing_message_duration_secs, Some(3600));
+        assert_eq!(deserialized.disappearing_message_secs, Some(3600));
     }
 
-    /// Test that a zero-valued disappearing_message_duration_secs is rejected during parsing.
+    /// Test that a zero-valued disappearing_message_secs is rejected during parsing.
     #[test]
     fn test_from_raw_rejects_zero_disappearing_duration() {
         let pk1 = PublicKey::parse(ADMIN_1).unwrap();
@@ -1282,7 +1281,7 @@ mod tests {
             image_key: Vec::new(),
             image_nonce: Vec::new(),
             image_upload_key: Vec::new(),
-            disappearing_message_duration_secs: 0u64.to_be_bytes().to_vec(),
+            disappearing_message_secs: 0u64.to_be_bytes().to_vec(),
         };
 
         let result = NostrGroupDataExtension::from_raw(raw);
@@ -1291,6 +1290,41 @@ mod tests {
         assert!(
             err.to_string().contains("cannot be zero"),
             "Expected zero-duration rejection, got: {err}"
+        );
+    }
+
+    /// Test that a v3 header with a v1/v2 body (missing the disappearing_message_secs
+    /// field) is rejected rather than silently falling back to the v1/v2 parser.
+    #[test]
+    fn test_deserialize_rejects_v3_header_with_v1v2_body() {
+        use tls_codec::Serialize as TlsSerialize;
+
+        let pk1 = PublicKey::parse(ADMIN_1).unwrap();
+        let relay1 = RelayUrl::parse(RELAY_1).unwrap();
+
+        // Serialize a v1/v2 payload (no disappearing_message_secs field)
+        // but with version = 3 — this is corrupt.
+        let corrupt = TlsNostrGroupDataExtensionV1V2 {
+            version: 3,
+            nostr_group_id: [42u8; 32],
+            name: b"Corrupt Group".to_vec(),
+            description: b"v3 header but v1v2 body".to_vec(),
+            admin_pubkeys: vec![*pk1.as_bytes()],
+            relays: vec![relay1.to_string().into_bytes()],
+            image_hash: Vec::new(),
+            image_key: Vec::new(),
+            image_nonce: Vec::new(),
+            image_upload_key: Vec::new(),
+        };
+
+        let bytes = corrupt.tls_serialize_detached().unwrap();
+
+        // With version-based dispatch, this should be routed to the v3 parser
+        // which will fail because the payload is too short (missing field).
+        let result = NostrGroupDataExtension::deserialize_bytes(&bytes);
+        assert!(
+            result.is_err(),
+            "Corrupt v3-header + v1v2-body should fail, not silently parse"
         );
     }
 }

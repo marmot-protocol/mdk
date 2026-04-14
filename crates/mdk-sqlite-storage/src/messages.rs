@@ -433,7 +433,7 @@ mod tests {
             image_key: None,
             image_nonce: None,
             self_update_state: SelfUpdateState::Required,
-            disappearing_message_duration_secs: None,
+            disappearing_message_secs: None,
         };
 
         // Save the group
@@ -547,7 +547,7 @@ mod tests {
             image_key: None,
             image_nonce: None,
             self_update_state: SelfUpdateState::Required,
-            disappearing_message_duration_secs: None,
+            disappearing_message_secs: None,
         };
         storage.save_group(group).unwrap();
 
@@ -611,7 +611,7 @@ mod tests {
             image_key: None,
             image_nonce: None,
             self_update_state: SelfUpdateState::Required,
-            disappearing_message_duration_secs: None,
+            disappearing_message_secs: None,
         };
 
         let group_2 = Group {
@@ -629,7 +629,7 @@ mod tests {
             image_key: None,
             image_nonce: None,
             self_update_state: SelfUpdateState::Required,
-            disappearing_message_duration_secs: None,
+            disappearing_message_secs: None,
         };
 
         storage.save_group(group_1).unwrap();
@@ -839,7 +839,7 @@ mod tests {
             image_key: None,
             image_nonce: None,
             self_update_state: SelfUpdateState::Required,
-            disappearing_message_duration_secs: None,
+            disappearing_message_secs: None,
         };
         storage.save_group(group).unwrap();
 
@@ -928,7 +928,7 @@ mod tests {
             image_key: None,
             image_nonce: None,
             self_update_state: SelfUpdateState::Required,
-            disappearing_message_duration_secs: None,
+            disappearing_message_secs: None,
         };
         storage.save_group(group).unwrap();
         group_id

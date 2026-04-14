@@ -109,7 +109,7 @@ pub struct Group {
     ///
     /// - `None`: Messages persist forever (disabled)
     /// - `Some(n)`: Messages expire `n` seconds after creation (`n > 0`)
-    pub disappearing_message_duration_secs: Option<u64>,
+    pub disappearing_message_secs: Option<u64>,
 }
 
 impl Group {
@@ -202,7 +202,7 @@ mod tests {
             epoch: 0,
             state: GroupState::Active,
             self_update_state: SelfUpdateState::Required,
-            disappearing_message_duration_secs: None,
+            disappearing_message_secs: None,
         }
     }
 
@@ -350,7 +350,7 @@ mod tests {
             epoch: 0,
             state: GroupState::Active,
             self_update_state: SelfUpdateState::Required,
-            disappearing_message_duration_secs: None,
+            disappearing_message_secs: None,
         };
 
         let serialized = serde_json::to_value(&group).unwrap();

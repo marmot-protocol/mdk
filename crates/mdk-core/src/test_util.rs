@@ -105,7 +105,7 @@ pub fn create_nostr_group_config_data(admins: Vec<PublicKey>) -> NostrGroupConfi
         Some(image_nonce),
         relays,
         admins,
-        None, // disappearing_message_duration_secs
+        None, // disappearing_message_secs
     )
 }
 
