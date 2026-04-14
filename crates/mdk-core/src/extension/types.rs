@@ -503,8 +503,9 @@ impl NostrGroupDataExtension {
     /// // Migrate extension to current version (MUST provide new seed when migrating from v1)
     /// extension.migrate_to_v3(
     ///     Some(new_hash),
-    ///     Some(v2_prepared.image_key), // This is the seed in v2+
-    ///     Some(v2_prepared.image_nonce)
+    ///     Some(v2_prepared.image_key),    // This is the seed in v2+
+    ///     Some(v2_prepared.image_nonce),
+    ///     Some(v2_prepared.upload_seed),  // Upload seed (independent from image_key in v2+)
     /// );
     /// ```
     pub fn migrate_to_v3(
