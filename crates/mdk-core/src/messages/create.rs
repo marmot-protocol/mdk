@@ -137,28 +137,20 @@ where
         // Get the rumor ID
         let rumor_id: EventId = rumor.id();
 
+        // Strip any caller-supplied expiration tags — on-wire expiration
+        // is fully determined by group state, not the caller.
+        let mut tags = tags.map(|mut t| {
+            t.retain(|tag| !tag.is_expiration());
+            t
+        });
+
         // Auto-apply NIP-40 expiration tag when group has disappearing messages enabled.
-        // Any caller-supplied expiration tag is replaced by the auto-computed one
-        // to prevent conflicting expiration values on the wrapper event.
-        let tags = match group.disappearing_message_secs {
-            Some(duration_secs) => {
-                let expiration =
-                    Timestamp::from(rumor.created_at.as_secs().saturating_add(duration_secs));
-                let expiration_tag = EventTag::expiration(expiration);
-                let mut all_tags = tags.unwrap_or_default();
-                all_tags.retain(|t| !t.is_expiration());
-                all_tags.push(expiration_tag);
-                Some(all_tags)
-            }
-            None => {
-                // Strip any caller-supplied expiration tags so the on-wire
-                // behavior is fully determined by group state.
-                tags.map(|mut t| {
-                    t.retain(|tag| !tag.is_expiration());
-                    t
-                })
-            }
-        };
+        if let Some(duration_secs) = group.disappearing_message_secs {
+            let expiration =
+                Timestamp::from(rumor.created_at.as_secs().saturating_add(duration_secs));
+            tags.get_or_insert_with(Vec::new)
+                .push(EventTag::expiration(expiration));
+        }
 
         let event = self.build_message_event(mls_group_id, message, tags)?;
 

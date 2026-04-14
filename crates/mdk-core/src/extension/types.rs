@@ -222,7 +222,7 @@ impl NostrGroupDataExtension {
         }
         let version = u16::from_be_bytes([bytes[0], bytes[1]]);
 
-        if version >= 3 {
+        let raw = if version >= 3 {
             let (deserialized, remainder) =
                 TlsNostrGroupDataExtension::tls_deserialize_bytes(bytes)?;
             if !remainder.is_empty() {
@@ -230,7 +230,7 @@ impl NostrGroupDataExtension {
                     "Trailing bytes in NostrGroupDataExtension".to_string(),
                 ));
             }
-            Self::from_raw(deserialized)
+            deserialized
         } else {
             let (v1v2, remainder) = TlsNostrGroupDataExtensionV1V2::tls_deserialize_bytes(bytes)?;
             if !remainder.is_empty() {
@@ -238,12 +238,13 @@ impl NostrGroupDataExtension {
                     "Trailing bytes in NostrGroupDataExtension".to_string(),
                 ));
             }
-            Self::from_raw(v1v2.into_v3())
-        }
+            v1v2.into_v3()
+        };
+        Self::from_raw(raw)
     }
 
     pub(crate) fn from_raw(raw: TlsNostrGroupDataExtension) -> Result<Self, Error> {
-        // Validate version - we support versions 1 and 2
+        // Validate version - we support versions 1, 2, and 3
         // Future versions should be handled with forward compatibility
         if raw.version == 0 {
             return Err(Error::InvalidExtensionVersion(raw.version));
