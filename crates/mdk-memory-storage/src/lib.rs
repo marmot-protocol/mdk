@@ -19,7 +19,7 @@
 //! ## Memory Exhaustion Protection
 //!
 //! This implementation includes input validation to prevent memory exhaustion attacks.
-//! The following limits are enforced (with configurable defaults via [`ValidationLimits`]):
+//! The following configurable limits are enforced via [`ValidationLimits`]:
 //!
 //! - [`DEFAULT_MAX_RELAYS_PER_GROUP`]: Maximum number of relays per group
 //! - [`DEFAULT_MAX_MESSAGES_PER_GROUP`]: Maximum messages stored per group in the cache
@@ -29,6 +29,10 @@
 //! - [`DEFAULT_MAX_RELAYS_PER_WELCOME`]: Maximum number of relays in a welcome message
 //! - [`DEFAULT_MAX_ADMINS_PER_WELCOME`]: Maximum number of admin pubkeys in a welcome message
 //! - [`DEFAULT_MAX_RELAY_URL_LENGTH`]: Maximum length of a relay URL in bytes
+//!
+//! Message payloads also enforce the same fixed size limits as the SQLite backend:
+//! 1 MiB for message content, 100 KiB for serialized tags JSON, and 100 KiB for
+//! serialized event JSON.
 //!
 //! ## Customizing Limits
 //!
