@@ -877,8 +877,7 @@ mod tests {
 
         assert!(
             matches!(result, Ok(MessageProcessingResult::Unprocessable { .. })),
-            "Admin-depleting commit should be rejected as unprocessable, got: {:?}",
-            result
+            "Admin-depleting commit should be rejected as unprocessable"
         );
 
         let bob_group = bob_mdk
