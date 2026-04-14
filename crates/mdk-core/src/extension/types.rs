@@ -187,6 +187,10 @@ impl NostrGroupDataExtension {
         let mut random_bytes = [0u8; 32];
         rng.fill(&mut random_bytes);
 
+        // Normalize Some(0) to None — zero means "no expiration" and from_raw()
+        // rejects it on the read path, so the write path must not produce it.
+        let disappearing_message_secs = disappearing_message_secs.filter(|&d| d != 0);
+
         Self {
             version: Self::CURRENT_VERSION,
             nostr_group_id: random_bytes,
@@ -597,6 +601,7 @@ impl NostrGroupDataExtension {
                 .map_or_else(Vec::new, |key| key.to_vec()),
             disappearing_message_secs: self
                 .disappearing_message_secs
+                .filter(|&d| d != 0)
                 .map_or_else(Vec::new, |d| d.to_be_bytes().to_vec()),
         }
     }

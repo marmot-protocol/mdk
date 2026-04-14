@@ -491,4 +491,29 @@ mod tests {
             err
         );
     }
+
+    #[test]
+    fn test_row_to_group_with_non_null_disappearing_message_secs() {
+        let conn = create_test_db();
+
+        conn.execute(
+            "INSERT INTO groups VALUES (?, ?, ?, ?, NULL, NULL, NULL, ?, NULL, NULL, NULL, ?, ?, 0, ?)",
+            rusqlite::params![
+                &[1u8, 2, 3, 4][..], // mls_group_id
+                &[0u8; 32][..],      // nostr_group_id
+                "Ephemeral Group",   // name
+                "Description",       // description
+                "[]",                // admin_pubkeys
+                0i64,                // epoch
+                "active",            // state
+                3600i64,             // disappearing_message_secs = 1 hour
+            ],
+        )
+        .unwrap();
+
+        let mut stmt = conn.prepare("SELECT * FROM groups").unwrap();
+        let group = stmt.query_row([], row_to_group).unwrap();
+
+        assert_eq!(group.disappearing_message_secs, Some(3600));
+    }
 }

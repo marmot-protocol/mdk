@@ -481,6 +481,62 @@ mod tests {
     }
 
     #[test]
+    fn test_group_roundtrip_with_disappearing_message_secs() {
+        let storage = MdkSqliteStorage::new_in_memory().unwrap();
+
+        let mls_group_id = GroupId::from_slice(&[10, 20, 30, 40]);
+        let nostr_group_id = generate_random_bytes(32).try_into().unwrap();
+
+        let group = Group {
+            mls_group_id: mls_group_id.clone(),
+            nostr_group_id,
+            name: "Ephemeral Group".to_string(),
+            description: "Messages vanish".to_string(),
+            admin_pubkeys: BTreeSet::new(),
+            last_message_id: None,
+            last_message_at: None,
+            last_message_processed_at: None,
+            epoch: 0,
+            state: GroupState::Active,
+            image_hash: None,
+            image_key: None,
+            image_nonce: None,
+            self_update_state: SelfUpdateState::Required,
+            disappearing_message_secs: Some(3600),
+        };
+
+        storage.save_group(group).unwrap();
+
+        let loaded = storage
+            .find_group_by_mls_group_id(&mls_group_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.disappearing_message_secs, Some(3600));
+
+        // Update to a different value via upsert
+        let mut updated = loaded;
+        updated.disappearing_message_secs = Some(86400);
+        storage.save_group(updated).unwrap();
+
+        let reloaded = storage
+            .find_group_by_mls_group_id(&mls_group_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(reloaded.disappearing_message_secs, Some(86400));
+
+        // Clear back to None
+        let mut cleared = reloaded;
+        cleared.disappearing_message_secs = None;
+        storage.save_group(cleared).unwrap();
+
+        let final_group = storage
+            .find_group_by_mls_group_id(&mls_group_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(final_group.disappearing_message_secs, None);
+    }
+
+    #[test]
     fn test_group_name_length_validation() {
         let storage = MdkSqliteStorage::new_in_memory().unwrap();
 
