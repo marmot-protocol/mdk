@@ -332,4 +332,112 @@ mod tests {
             Err(Error::IdentityProofError(ref msg)) if msg.contains("credential identity")
         ));
     }
+
+    #[test]
+    fn test_proof_version_0_rejected() {
+        let proof = NostrIdentityProof {
+            version: 0,
+            nostr_event_sig: [0xAB; 64],
+        };
+        let bytes = proof.to_authenticated_data().unwrap();
+        assert!(matches!(
+            NostrIdentityProof::from_authenticated_data(&bytes),
+            Err(Error::IdentityProofError(ref msg)) if msg.contains("unsupported proof version")
+        ));
+    }
+
+    #[test]
+    fn test_proof_version_2_rejected() {
+        let proof = NostrIdentityProof {
+            version: 2,
+            nostr_event_sig: [0xAB; 64],
+        };
+        let bytes = proof.to_authenticated_data().unwrap();
+        assert!(matches!(
+            NostrIdentityProof::from_authenticated_data(&bytes),
+            Err(Error::IdentityProofError(ref msg)) if msg.contains("unsupported proof version")
+        ));
+    }
+
+    #[test]
+    fn test_proof_getters() {
+        let sig = [0x42u8; 64];
+        let proof = NostrIdentityProof::new(sig);
+        assert_eq!(proof.version(), 1);
+        assert_eq!(proof.signature_bytes(), &sig);
+    }
+
+    #[test]
+    fn test_proof_tls_serialized_size() {
+        let proof = NostrIdentityProof::new([0; 64]);
+        let bytes = proof.to_authenticated_data().unwrap();
+        // 2 (version u16) + 64 (signature) = 66 bytes
+        assert_eq!(bytes.len(), 66);
+    }
+
+    #[test]
+    fn test_truncated_authenticated_data_rejected() {
+        let proof = NostrIdentityProof::new([0xAB; 64]);
+        let bytes = proof.to_authenticated_data().unwrap();
+        // Truncate to less than full size
+        assert!(NostrIdentityProof::from_authenticated_data(&bytes[..10]).is_err());
+    }
+
+    #[test]
+    fn test_wrong_group_context_fails_verification() {
+        let keys = Keys::generate();
+        let cred = credential_identity(&keys);
+        let sig_key = b"sigkey";
+
+        let proof = construct_identity_proof(&keys, &cred, sig_key, b"context-A").unwrap();
+
+        let result =
+            verify_identity_proof(&proof, &keys.public_key(), &cred, sig_key, b"context-B");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_challenge_different_inputs_produce_different_hashes() {
+        let base = compute_challenge(b"cred", b"sigkey", b"ctx");
+
+        // Different credential
+        assert_ne!(base, compute_challenge(b"other-cred", b"sigkey", b"ctx"));
+        // Different sig key
+        assert_ne!(base, compute_challenge(b"cred", b"other-sigkey", b"ctx"));
+        // Different context
+        assert_ne!(base, compute_challenge(b"cred", b"sigkey", b"other-ctx"));
+        // All different
+        assert_ne!(base, compute_challenge(b"x", b"y", b"z"));
+    }
+
+    #[test]
+    fn test_construct_proof_both_verify() {
+        let keys = Keys::generate();
+        let cred = credential_identity(&keys);
+        let sig_key = b"sigkey";
+        let gc = b"context";
+
+        // Schnorr signing uses aux randomness, so signatures differ each time.
+        // Both should still verify successfully.
+        let proof1 = construct_identity_proof(&keys, &cred, sig_key, gc).unwrap();
+        let proof2 = construct_identity_proof(&keys, &cred, sig_key, gc).unwrap();
+
+        verify_identity_proof(&proof1, &keys.public_key(), &cred, sig_key, gc).unwrap();
+        verify_identity_proof(&proof2, &keys.public_key(), &cred, sig_key, gc).unwrap();
+    }
+
+    #[test]
+    fn test_different_keys_produce_different_proofs() {
+        let keys1 = Keys::generate();
+        let keys2 = Keys::generate();
+        let cred1 = credential_identity(&keys1);
+        let cred2 = credential_identity(&keys2);
+        let sig_key = b"sigkey";
+        let gc = b"context";
+
+        let proof1 = construct_identity_proof(&keys1, &cred1, sig_key, gc).unwrap();
+        let proof2 = construct_identity_proof(&keys2, &cred2, sig_key, gc).unwrap();
+
+        assert_ne!(proof1.signature_bytes(), proof2.signature_bytes());
+    }
 }

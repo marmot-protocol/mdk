@@ -129,4 +129,75 @@ mod tests {
         let decrypted = decoded.decrypt(&keys).unwrap();
         assert_eq!(decrypted, "Laptop");
     }
+
+    #[test]
+    fn test_empty_name_rejected() {
+        let keys = Keys::generate();
+        // NIP-44 rejects empty plaintext
+        assert!(EncryptedDeviceName::encrypt(&keys, "").is_err());
+    }
+
+    #[test]
+    fn test_unicode_name() {
+        let keys = Keys::generate();
+        let name = "📱 Danny's iPhone 日本語";
+        let encrypted = EncryptedDeviceName::encrypt(&keys, name).unwrap();
+        let decrypted = encrypted.decrypt(&keys).unwrap();
+        assert_eq!(decrypted, name);
+    }
+
+    #[test]
+    fn test_max_length_unicode() {
+        let keys = Keys::generate();
+        // 64 multi-byte characters (each emoji is 1 char)
+        let name: String = "🔑".repeat(64);
+        assert_eq!(name.chars().count(), 64);
+        let encrypted = EncryptedDeviceName::encrypt(&keys, &name).unwrap();
+        let decrypted = encrypted.decrypt(&keys).unwrap();
+        assert_eq!(decrypted, name);
+    }
+
+    #[test]
+    fn test_65_chars_rejected_unicode() {
+        let keys = Keys::generate();
+        let name: String = "🔑".repeat(65);
+        assert_eq!(name.chars().count(), 65);
+        assert!(EncryptedDeviceName::encrypt(&keys, &name).is_err());
+    }
+
+    #[test]
+    fn test_encrypted_bytes_non_empty() {
+        let keys = Keys::generate();
+        let encrypted = EncryptedDeviceName::encrypt(&keys, "Test").unwrap();
+        assert!(!encrypted.encrypted_bytes().is_empty());
+    }
+
+    #[test]
+    fn test_same_name_different_keys_different_ciphertext() {
+        let keys1 = Keys::generate();
+        let keys2 = Keys::generate();
+        let name = "Shared Name";
+
+        let encrypted1 = EncryptedDeviceName::encrypt(&keys1, name).unwrap();
+        let encrypted2 = EncryptedDeviceName::encrypt(&keys2, name).unwrap();
+
+        assert_ne!(encrypted1.encrypted_bytes(), encrypted2.encrypted_bytes());
+    }
+
+    #[test]
+    fn test_same_name_same_keys_different_ciphertext() {
+        // NIP-44 uses random padding, so two encryptions should differ
+        let keys = Keys::generate();
+        let name = "Determinism Check";
+
+        let encrypted1 = EncryptedDeviceName::encrypt(&keys, name).unwrap();
+        let encrypted2 = EncryptedDeviceName::encrypt(&keys, name).unwrap();
+
+        // NIP-44 is probabilistic; ciphertexts should (almost certainly) differ
+        assert_ne!(encrypted1.encrypted_bytes(), encrypted2.encrypted_bytes());
+
+        // But both decrypt to the same name
+        assert_eq!(encrypted1.decrypt(&keys).unwrap(), name);
+        assert_eq!(encrypted2.decrypt(&keys).unwrap(), name);
+    }
 }

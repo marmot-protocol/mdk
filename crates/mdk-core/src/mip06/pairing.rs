@@ -521,4 +521,195 @@ mod tests {
         let bytes = payload.to_bytes().unwrap();
         assert!(PairingPayload::from_bytes(&bytes).is_err());
     }
+
+    // ── Additional edge case tests ─────────────────────────────────────
+
+    #[test]
+    fn test_request_trailing_bytes_rejected() {
+        let req = DevicePairingRequest::new(vec![1, 2, 3]);
+        let mut bytes = req.to_bytes().unwrap();
+        bytes.push(0xFF);
+        assert!(matches!(
+            DevicePairingRequest::from_bytes(&bytes),
+            Err(Error::PairingError(ref msg)) if msg.contains("trailing bytes")
+        ));
+    }
+
+    #[test]
+    fn test_response_trailing_bytes_rejected() {
+        let resp = DevicePairingResponse::new(vec![GroupWelcomeData::new(vec![1], vec![2])]);
+        let mut bytes = resp.to_bytes().unwrap();
+        bytes.push(0xFF);
+        assert!(matches!(
+            DevicePairingResponse::from_bytes(&bytes),
+            Err(Error::PairingError(ref msg)) if msg.contains("trailing bytes")
+        ));
+    }
+
+    #[test]
+    fn test_request_empty_key_package_json_roundtrip() {
+        let req = DevicePairingRequest::new(vec![]);
+        let bytes = req.to_bytes().unwrap();
+        let decoded = DevicePairingRequest::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.key_package_event_json(), &[] as &[u8]);
+    }
+
+    #[test]
+    fn test_group_welcome_data_roundtrip_and_getters() {
+        use tls_codec::{DeserializeBytes, Serialize};
+
+        let welcome = vec![10u8; 50];
+        let commit = vec![20u8; 100];
+        let data = GroupWelcomeData::new(welcome.clone(), commit.clone());
+
+        assert_eq!(data.welcome_rumor_bytes(), &welcome[..]);
+        assert_eq!(data.commit_event_bytes(), &commit[..]);
+
+        // TLS roundtrip
+        let mut bytes = Vec::new();
+        data.tls_serialize(&mut bytes).unwrap();
+        let (decoded, _) = GroupWelcomeData::tls_deserialize_bytes(&bytes).unwrap();
+        assert_eq!(data, decoded);
+    }
+
+    #[test]
+    fn test_response_into_groups_consumes() {
+        let groups = vec![
+            GroupWelcomeData::new(vec![1], vec![2]),
+            GroupWelcomeData::new(vec![3], vec![4]),
+        ];
+        let resp = DevicePairingResponse::new(groups.clone());
+        let consumed = resp.into_groups();
+        assert_eq!(consumed.len(), 2);
+        assert_eq!(consumed[0].welcome_rumor_bytes(), &[1]);
+        assert_eq!(consumed[1].commit_event_bytes(), &[4]);
+    }
+
+    #[test]
+    fn test_payload_into_groups_consumes() {
+        let groups = vec![
+            GroupPairingDataV1::new([1; 32], vec![2; 32], vec![3; 100]).unwrap(),
+        ];
+        let payload = PairingPayload::new(groups).unwrap();
+        let consumed = payload.into_groups();
+        assert_eq!(consumed.len(), 1);
+        assert_eq!(consumed[0].group_event_key(), &[1; 32]);
+    }
+
+    #[test]
+    fn test_payload_with_invalid_inner_group_rejected() {
+        // Build a payload where one of the inner groups has invalid join_psk length.
+        // We construct manually to bypass GroupPairingDataV1::new() validation.
+        use tls_codec::Serialize;
+
+        let valid_group = GroupPairingDataV1::new([1; 32], vec![2; 32], vec![3; 50]).unwrap();
+        let mut payload = PairingPayload {
+            version: 1,
+            groups: vec![valid_group],
+        };
+        // Corrupt the first group's join_psk to be wrong length
+        payload.groups[0].join_psk = mdk_storage_traits::Secret::new(vec![0xFF; 16]);
+
+        // Serializing is fine (no validation on serialize)
+        let bytes = payload.to_bytes().unwrap();
+        // But deserializing should fail because validate() runs on from_bytes
+        assert!(PairingPayload::from_bytes(&bytes).is_err());
+    }
+
+    #[test]
+    fn test_request_version_2_rejected() {
+        let req = DevicePairingRequest {
+            version: 2,
+            key_package_event_json: vec![1, 2],
+        };
+        let bytes = req.to_bytes().unwrap();
+        assert!(matches!(
+            DevicePairingRequest::from_bytes(&bytes),
+            Err(Error::PairingError(ref msg)) if msg.contains("unsupported version: 2")
+        ));
+    }
+
+    #[test]
+    fn test_response_version_0_rejected() {
+        let resp = DevicePairingResponse {
+            version: 0,
+            groups: vec![],
+        };
+        let bytes = resp.to_bytes().unwrap();
+        assert!(matches!(
+            DevicePairingResponse::from_bytes(&bytes),
+            Err(Error::PairingError(ref msg)) if msg.contains("version 0 is reserved")
+        ));
+    }
+
+    #[test]
+    fn test_group_pairing_data_v1_rejects_oversized_psk() {
+        let result = GroupPairingDataV1::new([0; 32], vec![1; 33], vec![1, 2, 3]);
+        assert!(matches!(
+            result,
+            Err(Error::PairingError(ref msg)) if msg.contains("join_psk must be 32 bytes")
+        ));
+    }
+
+    #[test]
+    fn test_group_pairing_data_v1_getters() {
+        let data =
+            GroupPairingDataV1::new([0xAA; 32], vec![0xBB; 32], vec![0xCC; 10]).unwrap();
+        assert_eq!(data.group_event_key(), &[0xAA; 32]);
+        assert_eq!(data.join_psk(), &[0xBB; 32]);
+        assert_eq!(data.group_info(), &[0xCC; 10]);
+    }
+
+    #[test]
+    fn test_group_pairing_data_v1_debug_redacts_secrets() {
+        let data =
+            GroupPairingDataV1::new([0xAA; 32], vec![0xBB; 32], vec![0xCC; 10]).unwrap();
+        let debug_str = format!("{:?}", data);
+        assert!(debug_str.contains("[REDACTED]"));
+        assert!(!debug_str.contains("0xAA"));
+        assert!(!debug_str.contains("0xBB"));
+        assert!(debug_str.contains("10 bytes"));
+    }
+
+    #[test]
+    fn test_response_empty_groups() {
+        let resp = DevicePairingResponse::new(vec![]);
+        let bytes = resp.to_bytes().unwrap();
+        let decoded = DevicePairingResponse::from_bytes(&bytes).unwrap();
+        assert!(decoded.groups().is_empty());
+    }
+
+    #[test]
+    fn test_validate_pairing_version_boundaries() {
+        assert!(validate_pairing_version(0).is_err());
+        assert!(validate_pairing_version(1).is_ok());
+        assert!(validate_pairing_version(2).is_err());
+        assert!(validate_pairing_version(u16::MAX).is_err());
+    }
+
+    #[test]
+    fn test_request_large_key_package_json() {
+        let large_json = vec![0xAB; 10_000];
+        let req = DevicePairingRequest::new(large_json.clone());
+        let bytes = req.to_bytes().unwrap();
+        let decoded = DevicePairingRequest::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.key_package_event_json(), &large_json[..]);
+    }
+
+    #[test]
+    fn test_payload_multiple_groups_order_preserved() {
+        let groups = vec![
+            GroupPairingDataV1::new([1; 32], vec![11; 32], vec![21; 50]).unwrap(),
+            GroupPairingDataV1::new([2; 32], vec![12; 32], vec![22; 60]).unwrap(),
+            GroupPairingDataV1::new([3; 32], vec![13; 32], vec![23; 70]).unwrap(),
+        ];
+        let payload = PairingPayload::new(groups).unwrap();
+        let bytes = payload.to_bytes().unwrap();
+        let decoded = PairingPayload::from_bytes(&bytes).unwrap();
+
+        assert_eq!(decoded.groups().len(), 3);
+        assert_eq!(decoded.groups()[0].group_event_key(), &[1; 32]);
+        assert_eq!(decoded.groups()[1].group_event_key(), &[2; 32]);
+        assert_eq!(decoded.groups()[2].group_event_key(), &[3; 32]);
+    }
 }

@@ -126,4 +126,64 @@ mod tests {
         id.label[0] = b'X'; // corrupt label
         assert!(id.validate().is_err());
     }
+
+    #[test]
+    fn test_join_psk_id_empty_context() {
+        let id = JoinPskId::from_group_context_bytes(b"");
+        assert!(id.validate().is_ok());
+        // Even empty context should produce a valid hash
+        assert_eq!(
+            id.group_context_hash(),
+            &<[u8; 32]>::from(Sha256::digest(b""))
+        );
+    }
+
+    #[test]
+    fn test_join_psk_id_large_context() {
+        let large_ctx = vec![0xAB; 100_000];
+        let id = JoinPskId::from_group_context_bytes(&large_ctx);
+        assert!(id.validate().is_ok());
+
+        let bytes = id.to_bytes().unwrap();
+        let decoded = JoinPskId::from_bytes(&bytes).unwrap();
+        assert_eq!(id, decoded);
+    }
+
+    #[test]
+    fn test_join_psk_id_label_matches_constant() {
+        let id = JoinPskId::from_group_context_bytes(b"anything");
+        assert_eq!(&id.label, JOIN_PSK_LABEL);
+        assert_eq!(&id.label, b"marmot-mip06-join-psk-v1");
+    }
+
+    #[test]
+    fn test_join_psk_id_from_bytes_validates_label() {
+        let mut id = JoinPskId::from_group_context_bytes(b"ctx");
+        id.label = [0xFF; 24]; // completely corrupt label
+
+        let bytes = id.to_bytes().unwrap();
+        assert!(matches!(
+            JoinPskId::from_bytes(&bytes),
+            Err(Error::PairingError(ref msg)) if msg.contains("invalid JoinPskId label")
+        ));
+    }
+
+    #[test]
+    fn test_join_psk_id_truncated_bytes_rejected() {
+        let id = JoinPskId::from_group_context_bytes(b"ctx");
+        let bytes = id.to_bytes().unwrap();
+
+        // Truncate to less than 56 bytes
+        assert!(JoinPskId::from_bytes(&bytes[..30]).is_err());
+    }
+
+    #[test]
+    fn test_join_psk_id_different_contexts_different_hashes() {
+        let id1 = JoinPskId::from_group_context_bytes(b"context-alpha");
+        let id2 = JoinPskId::from_group_context_bytes(b"context-beta");
+
+        assert_ne!(id1.group_context_hash(), id2.group_context_hash());
+        // But labels should be the same
+        assert_eq!(id1.label, id2.label);
+    }
 }

@@ -1347,6 +1347,189 @@ mod tests {
         );
     }
 
+    // ── validate_created_at_with_now boundary tests ───────────────────
+
+    /// Test that a timestamp exactly at the future boundary is accepted
+    #[test]
+    fn test_validate_created_at_exactly_at_future_boundary() {
+        use crate::tests::create_test_mdk;
+
+        let mdk = create_test_mdk();
+        let creator = Keys::generate();
+        let now = nostr::Timestamp::from(1_000_000u64);
+
+        // Exactly at the boundary (now + max_future_skew_secs) should pass
+        let boundary_time = now.as_secs() + mdk.config.max_future_skew_secs;
+        let event = EventBuilder::new(Kind::MlsGroupMessage, "test")
+            .custom_created_at(nostr::Timestamp::from(boundary_time))
+            .sign_with_keys(&creator)
+            .unwrap();
+
+        assert!(mdk.validate_created_at_with_now(&event, now).is_ok());
+    }
+
+    /// Test that a timestamp one second past the future boundary is rejected
+    #[test]
+    fn test_validate_created_at_one_past_future_boundary() {
+        use crate::tests::create_test_mdk;
+
+        let mdk = create_test_mdk();
+        let creator = Keys::generate();
+        let now = nostr::Timestamp::from(1_000_000u64);
+
+        let over_boundary = now.as_secs() + mdk.config.max_future_skew_secs + 1;
+        let event = EventBuilder::new(Kind::MlsGroupMessage, "test")
+            .custom_created_at(nostr::Timestamp::from(over_boundary))
+            .sign_with_keys(&creator)
+            .unwrap();
+
+        assert!(matches!(
+            mdk.validate_created_at_with_now(&event, now),
+            Err(Error::InvalidTimestamp(_))
+        ));
+    }
+
+    /// Test that a timestamp exactly at the past boundary is accepted
+    #[test]
+    fn test_validate_created_at_exactly_at_past_boundary() {
+        use crate::tests::create_test_mdk;
+
+        let mdk = create_test_mdk();
+        let creator = Keys::generate();
+        let now = nostr::Timestamp::from(10_000_000u64);
+
+        // Exactly at the boundary (now - max_event_age_secs) should pass
+        let boundary_time = now.as_secs() - mdk.config.max_event_age_secs;
+        let event = EventBuilder::new(Kind::MlsGroupMessage, "test")
+            .custom_created_at(nostr::Timestamp::from(boundary_time))
+            .sign_with_keys(&creator)
+            .unwrap();
+
+        assert!(mdk.validate_created_at_with_now(&event, now).is_ok());
+    }
+
+    /// Test that a timestamp one second before the past boundary is rejected
+    #[test]
+    fn test_validate_created_at_one_past_age_boundary() {
+        use crate::tests::create_test_mdk;
+
+        let mdk = create_test_mdk();
+        let creator = Keys::generate();
+        let now = nostr::Timestamp::from(10_000_000u64);
+
+        let over_boundary = now.as_secs() - mdk.config.max_event_age_secs - 1;
+        let event = EventBuilder::new(Kind::MlsGroupMessage, "test")
+            .custom_created_at(nostr::Timestamp::from(over_boundary))
+            .sign_with_keys(&creator)
+            .unwrap();
+
+        assert!(matches!(
+            mdk.validate_created_at_with_now(&event, now),
+            Err(Error::InvalidTimestamp(_))
+        ));
+    }
+
+    /// Test timestamp validation with custom config (tight skew)
+    #[test]
+    fn test_validate_created_at_with_custom_config() {
+        use crate::MdkConfig;
+        use crate::tests::create_test_mdk_with_config;
+
+        let config = MdkConfig {
+            max_future_skew_secs: 10,
+            max_event_age_secs: 60,
+            ..Default::default()
+        };
+        let mdk = create_test_mdk_with_config(config);
+        let creator = Keys::generate();
+        let now = nostr::Timestamp::from(1_000_000u64);
+
+        // 11 seconds in the future should be rejected with tight config
+        let event = EventBuilder::new(Kind::MlsGroupMessage, "test")
+            .custom_created_at(nostr::Timestamp::from(now.as_secs() + 11))
+            .sign_with_keys(&creator)
+            .unwrap();
+        assert!(mdk.validate_created_at_with_now(&event, now).is_err());
+
+        // 61 seconds in the past should be rejected with tight config
+        let event = EventBuilder::new(Kind::MlsGroupMessage, "test")
+            .custom_created_at(nostr::Timestamp::from(now.as_secs() - 61))
+            .sign_with_keys(&creator)
+            .unwrap();
+        assert!(mdk.validate_created_at_with_now(&event, now).is_err());
+
+        // 5 seconds in the future should be fine
+        let event = EventBuilder::new(Kind::MlsGroupMessage, "test")
+            .custom_created_at(nostr::Timestamp::from(now.as_secs() + 5))
+            .sign_with_keys(&creator)
+            .unwrap();
+        assert!(mdk.validate_created_at_with_now(&event, now).is_ok());
+    }
+
+    /// Test that validate_event_at rejects wrong kind even with valid timestamp
+    #[test]
+    fn test_validate_event_at_wrong_kind() {
+        let mdk = create_test_mdk();
+        let creator = Keys::generate();
+
+        let event = EventBuilder::new(Kind::TextNote, "test")
+            .sign_with_keys(&creator)
+            .unwrap();
+
+        assert!(matches!(
+            mdk.validate_event_at(&event, nostr::Timestamp::now()),
+            Err(Error::UnexpectedEvent { .. })
+        ));
+    }
+
+    /// Test that validate_event_at accepts valid event with current timestamp
+    #[test]
+    fn test_validate_event_at_valid() {
+        let mdk = create_test_mdk();
+        let creator = Keys::generate();
+        let now = nostr::Timestamp::now();
+
+        let event = EventBuilder::new(Kind::MlsGroupMessage, "test")
+            .custom_created_at(now)
+            .sign_with_keys(&creator)
+            .unwrap();
+
+        assert!(mdk.validate_event_at(&event, now).is_ok());
+    }
+
+    // ── extract_nostr_group_id edge cases ──────────────────────────────
+
+    /// Test that extract_nostr_group_id handles h-tag with empty content
+    #[test]
+    fn test_extract_group_id_empty_h_tag_content() {
+        let mdk = create_test_mdk();
+        let creator = Keys::generate();
+
+        let event = EventBuilder::new(Kind::MlsGroupMessage, "test")
+            .tag(Tag::custom(TagKind::h(), [""])) // empty string content
+            .sign_with_keys(&creator)
+            .unwrap();
+
+        let result = mdk.extract_nostr_group_id(&event);
+        assert!(result.is_err());
+    }
+
+    /// Test that extract_nostr_group_id handles exactly 64 hex chars with correct bytes
+    #[test]
+    fn test_extract_group_id_specific_value() {
+        let mdk = create_test_mdk();
+        let creator = Keys::generate();
+        let expected_id = [0x42u8; 32];
+
+        let event = EventBuilder::new(Kind::MlsGroupMessage, "test")
+            .tag(Tag::custom(TagKind::h(), [hex::encode(expected_id)]))
+            .sign_with_keys(&creator)
+            .unwrap();
+
+        let result = mdk.extract_nostr_group_id(&event).unwrap();
+        assert_eq!(result, expected_id);
+    }
+
     /// Test that identity parsing works correctly for validation
     ///
     /// This test verifies the components used in identity validation work correctly:

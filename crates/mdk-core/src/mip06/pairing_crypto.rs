@@ -313,4 +313,100 @@ mod tests {
         assert!(PairingMessage::from_bytes(&[0u8; 59]).is_err());
         assert!(PairingMessage::from_bytes(&[0u8; 60]).is_ok());
     }
+
+    #[test]
+    fn test_empty_plaintext_roundtrip() {
+        let (new_priv, new_pub) = generate_new_device_keypair();
+        let plaintext = b"";
+
+        let (_existing_pub, message) = encrypt_pairing_message(plaintext, &new_pub).unwrap();
+        let decrypted = decrypt_pairing_message(&message, &new_priv).unwrap();
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn test_large_plaintext_roundtrip() {
+        let (new_priv, new_pub) = generate_new_device_keypair();
+        let plaintext = vec![0xAB; 100_000];
+
+        let (_existing_pub, message) = encrypt_pairing_message(&plaintext, &new_pub).unwrap();
+        let decrypted = decrypt_pairing_message(&message, &new_priv).unwrap();
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn test_tampered_nonce_fails() {
+        let (new_priv, new_pub) = generate_new_device_keypair();
+        let plaintext = b"nonce-tamper test";
+
+        let (_existing_pub, mut message) = encrypt_pairing_message(plaintext, &new_pub).unwrap();
+        message.nonce[0] ^= 0xFF;
+
+        let result = decrypt_pairing_message(&message, &new_priv);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_tampered_pubkey_fails() {
+        let (new_priv, new_pub) = generate_new_device_keypair();
+        let plaintext = b"pubkey-tamper test";
+
+        let (_existing_pub, mut message) = encrypt_pairing_message(plaintext, &new_pub).unwrap();
+        message.existing_ephemeral_pubkey[0] ^= 0xFF;
+
+        let result = decrypt_pairing_message(&message, &new_priv);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_generate_keypair_produces_unique_keys() {
+        let (_, pub1) = generate_new_device_keypair();
+        let (_, pub2) = generate_new_device_keypair();
+        assert_ne!(pub1, pub2);
+    }
+
+    #[test]
+    fn test_wire_format_size() {
+        let (_, new_pub) = generate_new_device_keypair();
+        let plaintext = b"size test";
+
+        let (_, message) = encrypt_pairing_message(plaintext, &new_pub).unwrap();
+        let wire = message.to_bytes();
+
+        // 32 (pubkey) + 12 (nonce) + len(plaintext) + 16 (AEAD tag)
+        assert_eq!(wire.len(), 32 + 12 + plaintext.len() + 16);
+    }
+
+    #[test]
+    fn test_message_exactly_min_size_parses() {
+        // 60 bytes = 32 pubkey + 12 nonce + 16 tag (zero-length ciphertext body)
+        let msg = PairingMessage::from_bytes(&[0u8; 60]).unwrap();
+        assert_eq!(msg.existing_ephemeral_pubkey, [0u8; 32]);
+        assert_eq!(msg.nonce, [0u8; 12]);
+        assert_eq!(msg.ciphertext.len(), 16); // just the AEAD tag
+    }
+
+    #[test]
+    fn test_message_zero_bytes_rejected() {
+        assert!(PairingMessage::from_bytes(&[]).is_err());
+    }
+
+    #[test]
+    fn test_message_one_byte_rejected() {
+        assert!(PairingMessage::from_bytes(&[0x42]).is_err());
+    }
+
+    #[test]
+    fn test_two_messages_from_same_sender_differ() {
+        let (_, new_pub) = generate_new_device_keypair();
+        let plaintext = b"determinism check";
+
+        let (_, msg1) = encrypt_pairing_message(plaintext, &new_pub).unwrap();
+        let (_, msg2) = encrypt_pairing_message(plaintext, &new_pub).unwrap();
+
+        // Different ephemeral keys and nonces each time
+        assert_ne!(msg1.existing_ephemeral_pubkey, msg2.existing_ephemeral_pubkey);
+        assert_ne!(msg1.nonce, msg2.nonce);
+        assert_ne!(msg1.ciphertext, msg2.ciphertext);
+    }
 }

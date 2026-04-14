@@ -200,4 +200,88 @@ mod tests {
             _ => panic!("Expected Unknown extension"),
         }
     }
+
+    #[test]
+    fn test_default_creates_current_version() {
+        let ext = MarmotMultiDevice::default();
+        assert_eq!(ext.version(), MarmotMultiDevice::CURRENT_VERSION);
+        assert!(ext.validate().is_ok());
+    }
+
+    #[test]
+    fn test_version_u16_max_rejected() {
+        let ext = MarmotMultiDevice {
+            version: u16::MAX,
+        };
+        assert!(matches!(
+            ext.validate(),
+            Err(crate::error::Error::InvalidExtensionVersion(v)) if v == u16::MAX
+        ));
+    }
+
+    #[test]
+    fn test_version_2_rejected() {
+        let ext = MarmotMultiDevice { version: 2 };
+        assert!(matches!(
+            ext.validate(),
+            Err(crate::error::Error::InvalidExtensionVersion(2))
+        ));
+    }
+
+    #[test]
+    fn test_as_extension_roundtrip_through_from_extensions() {
+        use openmls::prelude::GroupContext;
+
+        // Build the extension
+        let ext = MarmotMultiDevice::new();
+        let openmls_ext = ext.as_extension().unwrap();
+
+        // Put it in an Extensions set and extract it back
+        let extensions: Extensions<GroupContext> =
+            Extensions::single(openmls_ext).expect("should build extensions");
+        let extracted = from_extensions(&extensions).unwrap();
+        assert!(extracted.is_some());
+        assert_eq!(extracted.unwrap(), ext);
+    }
+
+    #[test]
+    fn test_from_extensions_returns_none_when_absent() {
+        use openmls::prelude::GroupContext;
+
+        let extensions: Extensions<GroupContext> = Extensions::empty();
+        let result = from_extensions(&extensions).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_from_extensions_rejects_invalid_version() {
+        use openmls::prelude::GroupContext;
+        use tls_codec::Serialize;
+
+        // Manually construct an extension with version 0
+        let bad_ext = MarmotMultiDevice { version: 0 };
+        let mut bytes = Vec::new();
+        bad_ext.tls_serialize(&mut bytes).unwrap();
+
+        let openmls_ext = Extension::Unknown(
+            MULTI_DEVICE_EXTENSION_TYPE,
+            openmls::extensions::UnknownExtension(bytes),
+        );
+        let extensions: Extensions<GroupContext> =
+            Extensions::single(openmls_ext).expect("should build extensions");
+
+        let result = from_extensions(&extensions);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_tls_serialization_size() {
+        use tls_codec::Serialize;
+
+        let ext = MarmotMultiDevice::new();
+        let mut bytes = Vec::new();
+        ext.tls_serialize(&mut bytes).unwrap();
+        // version is a u16 = 2 bytes
+        assert_eq!(bytes.len(), 2);
+    }
 }
