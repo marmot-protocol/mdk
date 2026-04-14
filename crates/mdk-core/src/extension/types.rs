@@ -581,7 +581,9 @@ impl NostrGroupDataExtension {
 
     pub(crate) fn as_raw(&self) -> TlsNostrGroupDataExtension {
         TlsNostrGroupDataExtension {
-            version: self.version,
+            // Always write the current version — the body shape is always v3
+            // (includes disappearing_message_secs), so the header must match.
+            version: Self::CURRENT_VERSION,
             nostr_group_id: self.nostr_group_id,
             name: self.name.as_bytes().to_vec(),
             description: self.description.as_bytes().to_vec(),
