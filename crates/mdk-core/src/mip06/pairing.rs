@@ -14,8 +14,8 @@
 
 use std::fmt;
 
+use mdk_storage_traits::Secret;
 use tls_codec::{DeserializeBytes, TlsDeserialize, TlsDeserializeBytes, TlsSerialize, TlsSize};
-use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::error::Error;
 
@@ -77,27 +77,18 @@ macro_rules! impl_versioned_pairing_bytes {
 ///     opaque group_info<1..2^32-1>;
 /// } GroupPairingDataV1;
 /// ```
-#[derive(
-    Clone,
-    PartialEq,
-    Eq,
-    Zeroize,
-    ZeroizeOnDrop,
-    TlsSerialize,
-    TlsDeserialize,
-    TlsDeserializeBytes,
-    TlsSize,
-)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct GroupPairingDataV1 {
     /// Exact 32-byte outer encryption key for `kind: 445` group-event encryption (MIP-03).
-    group_event_key: [u8; 32],
+    /// Wrapped in `Secret` for zeroize-on-drop and redacted Debug.
+    group_event_key: Secret<[u8; 32]>,
     /// Exporter-derived External PSK for MIP-06 join authorization.
     /// Length MUST equal `KDF.Nh` for the group ciphersuite.
     /// Derived via `MLS-Exporter("marmot-mip06-join-psk-v1", join_psk_id, KDF.Nh)`.
-    join_psk: Vec<u8>,
+    /// Wrapped in `Secret` for zeroize-on-drop and redacted Debug.
+    join_psk: Secret<Vec<u8>>,
     /// TLS-serialized `GroupInfo` for current epoch. MUST include `external_pub` and
     /// `ratchet_tree` extensions.
-    #[zeroize(skip)]
     group_info: Vec<u8>,
 }
 
@@ -114,6 +105,56 @@ impl fmt::Debug for GroupPairingDataV1 {
     }
 }
 
+// ── Manual TLS codec impls (Secret<T> is not TLS-derivable) ──────────
+
+impl tls_codec::Size for GroupPairingDataV1 {
+    fn tls_serialized_len(&self) -> usize {
+        self.group_event_key.as_ref().tls_serialized_len()
+            + self.join_psk.as_ref().tls_serialized_len()
+            + self.group_info.tls_serialized_len()
+    }
+}
+
+impl tls_codec::Serialize for GroupPairingDataV1 {
+    fn tls_serialize<W: std::io::Write>(&self, writer: &mut W) -> Result<usize, tls_codec::Error> {
+        let mut written = self.group_event_key.as_ref().tls_serialize(writer)?;
+        written += self.join_psk.as_ref().tls_serialize(writer)?;
+        written += self.group_info.tls_serialize(writer)?;
+        Ok(written)
+    }
+}
+
+impl tls_codec::DeserializeBytes for GroupPairingDataV1 {
+    fn tls_deserialize_bytes(bytes: &[u8]) -> Result<(Self, &[u8]), tls_codec::Error> {
+        let (group_event_key, bytes) = <[u8; 32]>::tls_deserialize_bytes(bytes)?;
+        let (join_psk, bytes) = <Vec<u8>>::tls_deserialize_bytes(bytes)?;
+        let (group_info, bytes) = <Vec<u8>>::tls_deserialize_bytes(bytes)?;
+        Ok((
+            Self {
+                group_event_key: Secret::new(group_event_key),
+                join_psk: Secret::new(join_psk),
+                group_info,
+            },
+            bytes,
+        ))
+    }
+}
+
+impl tls_codec::Deserialize for GroupPairingDataV1 {
+    fn tls_deserialize<R: std::io::Read>(bytes: &mut R) -> Result<Self, tls_codec::Error> {
+        let group_event_key = <[u8; 32]>::tls_deserialize(bytes)?;
+        let join_psk = <Vec<u8>>::tls_deserialize(bytes)?;
+        let group_info = <Vec<u8>>::tls_deserialize(bytes)?;
+        Ok(Self {
+            group_event_key: Secret::new(group_event_key),
+            join_psk: Secret::new(join_psk),
+            group_info,
+        })
+    }
+}
+
+// ── Public API ───────────────────────────────────────────────────────
+
 impl GroupPairingDataV1 {
     /// Create a new per-group pairing entry.
     pub fn new(
@@ -122,8 +163,8 @@ impl GroupPairingDataV1 {
         group_info: Vec<u8>,
     ) -> Result<Self, Error> {
         let val = Self {
-            group_event_key,
-            join_psk,
+            group_event_key: Secret::new(group_event_key),
+            join_psk: Secret::new(join_psk),
             group_info,
         };
         val.validate()?;
@@ -145,12 +186,12 @@ impl GroupPairingDataV1 {
 
     /// The 32-byte outer encryption key.
     pub fn group_event_key(&self) -> &[u8; 32] {
-        &self.group_event_key
+        self.group_event_key.as_ref()
     }
 
     /// The exporter-derived External PSK bytes.
     pub fn join_psk(&self) -> &[u8] {
-        &self.join_psk
+        self.join_psk.as_ref()
     }
 
     /// The TLS-serialized `GroupInfo` bytes.
