@@ -2,12 +2,15 @@
 //!
 //! This module handles validation of Nostr events and MLS identity verification.
 
+use std::collections::BTreeSet;
+
 use mdk_storage_traits::MdkStorageProvider;
-use nostr::{Event, Kind, TagKind, Timestamp};
+use nostr::{Event, Kind, PublicKey, TagKind, Timestamp};
 use openmls::prelude::{BasicCredential, LeafNodeIndex, MlsGroup, Proposal, Sender, StagedCommit};
 
 use crate::MDK;
 use crate::error::Error;
+use crate::extension::NostrGroupDataExtension;
 
 use super::Result;
 
@@ -270,6 +273,87 @@ where
         Ok(())
     }
 
+    /// Validates that the current MLS group contains at least one active admin.
+    ///
+    /// The admin set is checked against live MLS members so stale admin entries
+    /// do not satisfy the invariant.
+    pub(crate) fn validate_active_admins_in_group(
+        &self,
+        mls_group: &MlsGroup,
+        admins: &BTreeSet<PublicKey>,
+    ) -> Result<()> {
+        for member in mls_group.members() {
+            let basic_cred = BasicCredential::try_from(member.credential)?;
+            let pubkey = self.parse_credential_identity(basic_cred.identity())?;
+            if admins.contains(&pubkey) {
+                return Ok(());
+            }
+        }
+
+        Err(Error::Group("Would leave group with no admins".to_string()))
+    }
+
+    /// Validates that a staged commit leaves at least one active admin.
+    ///
+    /// This checks the post-commit group-data extension from the staged commit
+    /// together with the post-commit membership implied by Remove, SelfRemove,
+    /// and Add proposals.
+    pub(super) fn validate_post_commit_admin_invariant(
+        &self,
+        mls_group: &MlsGroup,
+        staged_commit: &StagedCommit,
+    ) -> Result<()> {
+        let staged_group_data =
+            NostrGroupDataExtension::from_group_context(staged_commit.group_context())?;
+        let departing_leaf_indices = Self::departing_leaf_indices(staged_commit);
+
+        for member in mls_group.members() {
+            if departing_leaf_indices.contains(&member.index) {
+                continue;
+            }
+
+            let basic_cred = BasicCredential::try_from(member.credential)?;
+            let pubkey = self.parse_credential_identity(basic_cred.identity())?;
+            if staged_group_data.admins.contains(&pubkey) {
+                return Ok(());
+            }
+        }
+
+        for add_proposal in staged_commit.add_proposals() {
+            let credential = add_proposal
+                .add_proposal()
+                .key_package()
+                .leaf_node()
+                .credential()
+                .clone();
+            let basic_cred = BasicCredential::try_from(credential)?;
+            let pubkey = self.parse_credential_identity(basic_cred.identity())?;
+            if staged_group_data.admins.contains(&pubkey) {
+                return Ok(());
+            }
+        }
+
+        Err(Error::Group("Would leave group with no admins".to_string()))
+    }
+
+    fn departing_leaf_indices(staged_commit: &StagedCommit) -> Vec<LeafNodeIndex> {
+        let mut departing_leaf_indices = Vec::new();
+
+        for queued in staged_commit.queued_proposals() {
+            match queued.proposal() {
+                Proposal::Remove(remove) => departing_leaf_indices.push(remove.removed()),
+                Proposal::SelfRemove => {
+                    if let Sender::Member(leaf_index) = queued.sender() {
+                        departing_leaf_indices.push(*leaf_index);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        departing_leaf_indices
+    }
+
     /// Validates that a staged commit does not attempt to change any member's identity
     ///
     /// This function checks all Update proposals within a staged commit to ensure
@@ -357,6 +441,7 @@ where
                 let sender_is_admin = group_data.admins.contains(&sender_pubkey);
 
                 if sender_is_admin {
+                    self.validate_post_commit_admin_invariant(mls_group, staged_commit)?;
                     return Ok(());
                 }
 
@@ -389,6 +474,7 @@ where
                         .collect();
 
                     self.validate_admin_depletion(mls_group, &departing_leaves)?;
+                    self.validate_post_commit_admin_invariant(mls_group, staged_commit)?;
 
                     return Ok(());
                 }

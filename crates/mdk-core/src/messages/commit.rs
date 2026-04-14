@@ -190,7 +190,10 @@ mod tests {
     use mdk_storage_traits::groups::GroupStorage;
     use mdk_storage_traits::groups::types as group_types;
     use nostr::{EventBuilder, EventId, Keys, Kind};
+    use openmls::prelude::{Extension, UnknownExtension};
+    use tls_codec::Serialize as TlsSerialize;
 
+    use crate::extension::NostrGroupDataExtension;
     use crate::messages::MessageProcessingResult;
     use crate::test_util::*;
     use crate::tests::create_test_mdk;
@@ -793,6 +796,99 @@ mod tests {
         assert_eq!(
             group_state.name, "Updated Group Name",
             "Group name should be updated"
+        );
+    }
+
+    /// Test that an admin-authored commit cannot empty the admin set.
+    ///
+    /// This bypasses MDK's creating-side group-data guard and uses OpenMLS
+    /// directly to create the receiver-side shape reported in issue #29.
+    #[test]
+    fn test_admin_extension_update_cannot_deplete_all_admins() {
+        let alice_keys = Keys::generate();
+        let bob_keys = Keys::generate();
+
+        let alice_mdk = create_test_mdk();
+        let bob_mdk = create_test_mdk();
+
+        let admins = vec![alice_keys.public_key()];
+        let bob_key_package = create_key_package_event(&bob_mdk, &bob_keys);
+
+        let create_result = alice_mdk
+            .create_group(
+                &alice_keys.public_key(),
+                vec![bob_key_package],
+                create_nostr_group_config_data(admins.clone()),
+            )
+            .expect("Failed to create group");
+
+        let group_id = create_result.group.mls_group_id.clone();
+
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("Failed to merge pending commit");
+
+        let bob_welcome_rumor = &create_result.welcome_rumors[0];
+        let bob_welcome = bob_mdk
+            .process_welcome(&EventId::all_zeros(), bob_welcome_rumor)
+            .expect("Bob should process welcome");
+        bob_mdk
+            .accept_welcome(&bob_welcome)
+            .expect("Bob should accept welcome");
+
+        let mut alice_mls_group = alice_mdk
+            .load_mls_group(&group_id)
+            .expect("Failed to load Alice MLS group")
+            .expect("Alice MLS group should exist");
+        let mut group_data = NostrGroupDataExtension::from_group(&alice_mls_group)
+            .expect("Alice MLS group should have group data");
+        group_data.admins.clear();
+
+        let serialized_group_data = group_data
+            .as_raw()
+            .tls_serialize_detached()
+            .expect("Failed to serialize group-data extension");
+        let extension = Extension::Unknown(
+            group_data.extension_type(),
+            UnknownExtension(serialized_group_data),
+        );
+        let mut extensions = alice_mls_group.extensions().clone();
+        extensions
+            .add_or_replace(extension)
+            .expect("Failed to replace group-data extension");
+
+        let signature_keypair = alice_mdk
+            .load_mls_signer(&alice_mls_group)
+            .expect("Failed to load Alice signer");
+        let (message_out, _, _) = alice_mls_group
+            .update_group_context_extensions(&alice_mdk.provider, extensions, &signature_keypair)
+            .expect("OpenMLS should create the extension update commit");
+        let malicious_commit_event = alice_mdk
+            .build_message_event(
+                &group_id,
+                message_out
+                    .tls_serialize_detached()
+                    .expect("Failed to serialize malicious commit"),
+                None,
+            )
+            .expect("Failed to build malicious commit event");
+
+        let result = bob_mdk.process_message(&malicious_commit_event);
+
+        assert!(
+            matches!(result, Ok(MessageProcessingResult::Unprocessable { .. })),
+            "Admin-depleting commit should be rejected as unprocessable, got: {:?}",
+            result
+        );
+
+        let bob_group = bob_mdk
+            .get_group(&group_id)
+            .expect("Failed to get Bob's group")
+            .expect("Bob's group should exist");
+        assert_eq!(
+            bob_group.admin_pubkeys,
+            admins.into_iter().collect(),
+            "Rejected commit should not alter Bob's stored admin set"
         );
     }
 

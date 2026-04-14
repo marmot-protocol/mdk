@@ -1786,6 +1786,7 @@ where
         // Validate the mandatory group-data extension FIRST before making any state changes
         // This ensures we don't update stored_group if the extension is missing, invalid, or unsupported
         let group_data = NostrGroupDataExtension::from_group(&mls_group)?;
+        self.validate_active_admins_in_group(&mls_group, &group_data.admins)?;
         // Only after successful validation, update epoch and metadata from MLS group
         stored_group.epoch = mls_group.epoch().as_u64();
 
@@ -3556,6 +3557,61 @@ mod tests {
             initial_stored_group.last_message_at
         );
         assert_eq!(synced_stored_group.state, initial_stored_group.state);
+    }
+
+    #[test]
+    fn test_sync_group_metadata_rejects_adminless_group_data() {
+        let creator_mdk = create_test_mdk();
+        let (creator, initial_members, admins) = create_test_group_members();
+        let group_id = create_test_group(&creator_mdk, &creator, &initial_members, &admins);
+
+        let initial_stored_group = creator_mdk
+            .get_group(&group_id)
+            .expect("Failed to get initial stored group")
+            .expect("Stored group should exist");
+
+        let mut mls_group = creator_mdk
+            .load_mls_group(&group_id)
+            .expect("Failed to load MLS group")
+            .expect("MLS group should exist");
+        let mut group_data =
+            NostrGroupDataExtension::from_group(&mls_group).expect("Group data should parse");
+        group_data.admins.clear();
+
+        let extension =
+            super::MDK::<MdkMemoryStorage>::get_unknown_extension_from_group_data(&group_data)
+                .expect("Failed to build adminless group-data extension");
+        let mut extensions = mls_group.extensions().clone();
+        extensions
+            .add_or_replace(extension)
+            .expect("Failed to replace group-data extension");
+
+        let signature_keypair = creator_mdk
+            .load_mls_signer(&mls_group)
+            .expect("Failed to load signer");
+        let (_message_out, _, _) = mls_group
+            .update_group_context_extensions(&creator_mdk.provider, extensions, &signature_keypair)
+            .expect("OpenMLS should allow the adminless extension update");
+        mls_group
+            .merge_pending_commit(&creator_mdk.provider)
+            .expect("OpenMLS should merge the adminless extension update");
+
+        let result = creator_mdk.sync_group_metadata_from_mls(&group_id);
+
+        assert!(
+            matches!(result, Err(crate::Error::Group(ref msg)) if msg.contains("no admins")),
+            "sync should reject adminless group data, got: {:?}",
+            result
+        );
+
+        let stored_group = creator_mdk
+            .get_group(&group_id)
+            .expect("Failed to reload stored group")
+            .expect("Stored group should still exist");
+        assert_eq!(
+            stored_group.admin_pubkeys, initial_stored_group.admin_pubkeys,
+            "Rejected sync should not alter stored admins"
+        );
     }
 
     #[test]
