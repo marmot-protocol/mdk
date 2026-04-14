@@ -613,6 +613,7 @@ impl NostrGroupDataExtension {
 #[cfg(test)]
 mod tests {
     use mdk_storage_traits::test_utils::crypto_utils::generate_random_bytes;
+    use tls_codec::Serialize as TlsSerialize;
 
     use super::*;
 
@@ -861,7 +862,7 @@ mod tests {
     /// Test that version field is properly serialized at the beginning of the structure (MIP-01)
     #[test]
     fn test_version_field_serialization() {
-        use tls_codec::Serialize as TlsSerialize;
+
 
         let extension = NostrGroupDataExtension::new(
             "Test Group",
@@ -996,7 +997,7 @@ mod tests {
     /// Test that deserialize_bytes correctly deserializes TLS-encoded extension data
     #[test]
     fn test_deserialize_bytes() {
-        use tls_codec::Serialize as TlsSerialize;
+
 
         let extension = create_test_extension();
 
@@ -1043,7 +1044,7 @@ mod tests {
     /// Test that deserialize_bytes rejects data with trailing bytes
     #[test]
     fn test_deserialize_bytes_rejects_trailing_bytes() {
-        use tls_codec::Serialize as TlsSerialize;
+
 
         let extension = create_test_extension();
 
@@ -1207,7 +1208,7 @@ mod tests {
     /// deserialize successfully with the field defaulting to None.
     #[test]
     fn test_deserialize_legacy_v1v2_payload_without_disappearing_field() {
-        use tls_codec::Serialize as TlsSerialize;
+
 
         let pk1 = PublicKey::parse(ADMIN_1).unwrap();
         let relay1 = RelayUrl::parse(RELAY_1).unwrap();
@@ -1245,7 +1246,7 @@ mod tests {
     /// Test that v3 payloads with disappearing_message_secs round-trip correctly.
     #[test]
     fn test_deserialize_v3_payload_with_disappearing_duration() {
-        use tls_codec::Serialize as TlsSerialize;
+
 
         let pk1 = PublicKey::parse(ADMIN_1).unwrap();
         let relay1 = RelayUrl::parse(RELAY_1).unwrap();
@@ -1306,7 +1307,7 @@ mod tests {
     /// field) is rejected rather than silently falling back to the v1/v2 parser.
     #[test]
     fn test_deserialize_rejects_v3_header_with_v1v2_body() {
-        use tls_codec::Serialize as TlsSerialize;
+
 
         let pk1 = PublicKey::parse(ADMIN_1).unwrap();
         let relay1 = RelayUrl::parse(RELAY_1).unwrap();
