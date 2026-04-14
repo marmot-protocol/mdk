@@ -541,4 +541,436 @@ mod integration_tests {
             "Alice should have 2 leaves (2 devices)"
         );
     }
+
+    /// Test that calling `enable_multi_device` on a group that already has it
+    /// enabled returns the "already enabled" error.
+    #[test]
+    fn test_enable_multi_device_already_enabled() {
+        let alice_keys = Keys::generate();
+        let alice_mdk = create_test_mdk();
+
+        let create_result = alice_mdk
+            .create_group_with_multi_device(
+                &alice_keys.public_key(),
+                vec![],
+                create_nostr_group_config_data(vec![alice_keys.public_key()]),
+            )
+            .expect("Should create group with multi-device");
+
+        let group_id = create_result.group.mls_group_id.clone();
+
+        // The group was created with multi-device already enabled.
+        // Trying to enable it again should fail.
+        let result = alice_mdk.enable_multi_device(&group_id);
+        assert!(
+            matches!(
+                result,
+                Err(crate::Error::Group(ref msg)) if msg.contains("already enabled")
+            ),
+            "Expected 'already enabled' error, got: {:?}",
+            result
+        );
+    }
+
+    /// Test that a non-admin member cannot enable multi-device on a group.
+    #[test]
+    fn test_enable_multi_device_non_admin() {
+        let alice_keys = Keys::generate();
+        let bob_keys = Keys::generate();
+
+        let alice_mdk = create_test_mdk();
+        let bob_mdk = create_test_mdk();
+
+        // Only Alice is an admin; Bob is a regular member.
+        let admins = vec![alice_keys.public_key()];
+        let bob_kp = create_key_package_event(&bob_mdk, &bob_keys);
+
+        let create_result = alice_mdk
+            .create_group(
+                &alice_keys.public_key(),
+                vec![bob_kp],
+                create_nostr_group_config_data(admins),
+            )
+            .expect("Alice should create group");
+
+        let group_id = create_result.group.mls_group_id.clone();
+
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("Alice should merge group creation commit");
+
+        // Bob processes the welcome and joins the group.
+        let bob_welcome = bob_mdk
+            .process_welcome(&EventId::all_zeros(), &create_result.welcome_rumors[0])
+            .expect("Bob should process welcome");
+        bob_mdk
+            .accept_welcome(&bob_welcome)
+            .expect("Bob should accept welcome");
+
+        // Bob (non-admin) tries to enable multi-device -> should fail.
+        let result = bob_mdk.enable_multi_device(&bob_welcome.mls_group_id);
+        assert!(
+            matches!(
+                result,
+                Err(crate::Error::Group(ref msg)) if msg.contains("Only group admins")
+            ),
+            "Expected 'Only group admins' error, got: {:?}",
+            result
+        );
+    }
+
+    /// Test that `join_group_via_external_commit` rejects a pairing payload
+    /// whose group_info has trailing bytes after the TLS-deserialized GroupInfo.
+    #[test]
+    fn test_join_group_via_external_commit_rejects_trailing_bytes() {
+        let alice_keys = Keys::generate();
+        let alice_device1 = create_test_mdk();
+        let alice_device2 = create_test_mdk();
+
+        let create_result = alice_device1
+            .create_group_with_multi_device(
+                &alice_keys.public_key(),
+                vec![],
+                create_nostr_group_config_data(vec![alice_keys.public_key()]),
+            )
+            .unwrap();
+        let group_id = create_result.group.mls_group_id.clone();
+        alice_device1.merge_pending_commit(&group_id).unwrap();
+
+        let payload = alice_device1
+            .build_pairing_payload(std::slice::from_ref(&group_id))
+            .unwrap();
+        let group_data = &payload.groups()[0];
+
+        // Append trailing bytes to the valid group_info.
+        let mut tampered_gi = group_data.group_info().to_vec();
+        tampered_gi.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+
+        let tampered_data = super::GroupPairingDataV1::new(
+            *group_data.group_event_key(),
+            group_data.join_psk().to_vec(),
+            tampered_gi,
+        )
+        .unwrap();
+
+        let result = alice_device2.join_group_via_external_commit(&tampered_data, &alice_keys);
+        assert!(
+            matches!(
+                result,
+                Err(crate::Error::PairingError(ref msg)) if msg.contains("trailing bytes")
+            ),
+            "Expected 'trailing bytes' error, got: {:?}",
+            result
+        );
+    }
+
+    /// Test that `join_group_via_external_commit` rejects a group_info that is
+    /// too short to be a valid MLS GroupInfo (< 5 bytes triggers deserialization
+    /// failure before the length check, so we expect a deserialization error).
+    #[test]
+    fn test_join_group_via_external_commit_rejects_short_group_info() {
+        let mdk = create_test_mdk();
+        let keys = Keys::generate();
+
+        // 4 bytes is too short for a valid GroupInfo.
+        let data = super::GroupPairingDataV1::new([1; 32], vec![2; 32], vec![0, 0, 0, 1]).unwrap();
+        let result = mdk.join_group_via_external_commit(&data, &keys);
+        assert!(
+            result.is_err(),
+            "Expected error for 4-byte group_info, got: {:?}",
+            result
+        );
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("GroupInfo") || err_msg.contains("deserialize"),
+            "Expected GroupInfo/deserialization error, got: {err_msg}"
+        );
+    }
+
+    /// Test that `join_group_via_external_commit` rejects GroupInfo from a
+    /// non-MIP-06 group (one created with `create_group` instead of
+    /// `create_group_with_multi_device`).
+    ///
+    /// The GroupInfo will be well-formed but missing the `marmot_multi_device`
+    /// extension in the GroupContext. This exercises the signaling gate check
+    /// at the beginning of `join_group_via_external_commit`.
+    #[test]
+    fn test_join_group_via_external_commit_rejects_non_mip06_group_info() {
+        let alice_keys = Keys::generate();
+        let alice_device1 = create_test_mdk();
+        let alice_device2 = create_test_mdk();
+
+        // Create a regular (non-MIP06) group
+        let create_result = alice_device1
+            .create_group(
+                &alice_keys.public_key(),
+                vec![],
+                create_nostr_group_config_data(vec![alice_keys.public_key()]),
+            )
+            .unwrap();
+        let group_id = create_result.group.mls_group_id.clone();
+
+        // Export GroupInfo WITH ratchet_tree from this non-MIP06 group
+        let mls_group = alice_device1.load_mls_group(&group_id).unwrap().unwrap();
+        let signer = alice_device1.load_mls_signer(&mls_group).unwrap();
+        let group_info_msg = mls_group
+            .export_group_info(alice_device1.provider.crypto(), &signer, true)
+            .unwrap();
+        let group_info_bytes = group_info_msg.tls_serialize_detached().unwrap();
+
+        // Build pairing data with this non-MIP06 GroupInfo
+        let data =
+            super::GroupPairingDataV1::new([0xAA; 32], vec![0xBB; 32], group_info_bytes).unwrap();
+
+        let result = alice_device2.join_group_via_external_commit(&data, &alice_keys);
+        assert!(
+            matches!(
+                result,
+                Err(crate::Error::PairingError(ref msg)) if msg.contains("marmot_multi_device signaling")
+            ),
+            "Expected missing signaling error, got: {:?}",
+            result
+        );
+    }
+
+    /// Test that `join_group_via_external_commit` rejects when the group_info
+    /// bytes have a corrupted wire format tag (not a GroupInfo MLS message type).
+    #[test]
+    fn test_join_group_via_external_commit_rejects_non_group_info_wire_format() {
+        let alice_keys = Keys::generate();
+        let alice_mdk = create_test_mdk();
+        let device2 = create_test_mdk();
+
+        let create_result = alice_mdk
+            .create_group_with_multi_device(
+                &alice_keys.public_key(),
+                vec![],
+                create_nostr_group_config_data(vec![alice_keys.public_key()]),
+            )
+            .unwrap();
+        let group_id = create_result.group.mls_group_id.clone();
+        alice_mdk.merge_pending_commit(&group_id).unwrap();
+
+        let mls_group = alice_mdk.load_mls_group(&group_id).unwrap().unwrap();
+        let signer = alice_mdk.load_mls_signer(&mls_group).unwrap();
+        let gi_msg = mls_group
+            .export_group_info(alice_mdk.provider.crypto(), &signer, true)
+            .unwrap();
+        let mut gi_bytes = gi_msg.tls_serialize_detached().unwrap();
+
+        // Corrupt the MLS wire format tag (bytes 2-3 after the version u16).
+        // GroupInfo wire_format = 4. Change to 3 (Welcome) to trigger
+        // deserialization failure or non-GroupInfo extraction.
+        if gi_bytes.len() > 3 {
+            gi_bytes[3] ^= 0xFF; // corrupt wire format byte
+        }
+
+        let data = super::GroupPairingDataV1::new([1; 32], vec![2; 32], gi_bytes).unwrap();
+
+        let result = device2.join_group_via_external_commit(&data, &alice_keys);
+        assert!(result.is_err(), "Expected error for corrupted wire format");
+    }
+
+    /// Test that `join_group_via_external_commit` validates GroupInfo `required_capabilities`.
+    ///
+    /// Exports a valid MIP-06 GroupInfo, then corrupts the required_capabilities
+    /// extension to remove the 0xF2F0 type. This exercises the check that
+    /// required_capabilities includes the multi-device extension type.
+    #[test]
+    fn test_join_group_via_external_commit_rejects_missing_external_pub() {
+        let alice_keys = Keys::generate();
+        let alice_device1 = create_test_mdk();
+        let alice_device2 = create_test_mdk();
+
+        let create_result = alice_device1
+            .create_group_with_multi_device(
+                &alice_keys.public_key(),
+                vec![],
+                create_nostr_group_config_data(vec![alice_keys.public_key()]),
+            )
+            .unwrap();
+        let group_id = create_result.group.mls_group_id.clone();
+        alice_device1.merge_pending_commit(&group_id).unwrap();
+
+        // Export GroupInfo WITHOUT ratchet_tree or external_pub
+        let mls_group = alice_device1.load_mls_group(&group_id).unwrap().unwrap();
+        let signer = alice_device1.load_mls_signer(&mls_group).unwrap();
+        let group_info_msg = mls_group
+            .export_group_info(alice_device1.provider.crypto(), &signer, false) // no extensions
+            .unwrap();
+        let group_info_bytes = group_info_msg.tls_serialize_detached().unwrap();
+
+        let payload = alice_device1
+            .build_pairing_payload(std::slice::from_ref(&group_id))
+            .unwrap();
+        let good_data = &payload.groups()[0];
+
+        // Use the GroupInfo without extensions, but with the original PSK
+        let data = super::GroupPairingDataV1::new(
+            *good_data.group_event_key(),
+            good_data.join_psk().to_vec(),
+            group_info_bytes,
+        )
+        .unwrap();
+
+        let result = alice_device2.join_group_via_external_commit(&data, &alice_keys);
+        // Should fail with "missing ratchet_tree" (checked before external_pub)
+        assert!(
+            matches!(
+                result,
+                Err(crate::Error::PairingError(ref msg)) if msg.contains("ratchet_tree")
+            ),
+            "Expected ratchet_tree error, got: {:?}",
+            result
+        );
+    }
+
+    /// Test multiple groups in `build_pairing_payload` all get valid data.
+    #[test]
+    fn test_build_pairing_payload_multiple_groups() {
+        let alice_keys = Keys::generate();
+        let alice_mdk = create_test_mdk();
+
+        let mut group_ids = Vec::new();
+        for _ in 0..3 {
+            let result = alice_mdk
+                .create_group_with_multi_device(
+                    &alice_keys.public_key(),
+                    vec![],
+                    create_nostr_group_config_data(vec![alice_keys.public_key()]),
+                )
+                .unwrap();
+            let gid = result.group.mls_group_id.clone();
+            alice_mdk.merge_pending_commit(&gid).unwrap();
+            group_ids.push(gid);
+        }
+
+        let payload = alice_mdk.build_pairing_payload(&group_ids).unwrap();
+        assert_eq!(payload.groups().len(), 3);
+
+        for group_data in payload.groups() {
+            assert_ne!(group_data.group_event_key(), &[0u8; 32]);
+            assert_eq!(group_data.join_psk().len(), 32);
+            assert!(!group_data.group_info().is_empty());
+        }
+    }
+
+    /// Test `register_join_psk` is idempotent (can be called multiple times).
+    #[test]
+    fn test_register_join_psk_idempotent() {
+        let alice_keys = Keys::generate();
+        let alice_mdk = create_test_mdk();
+
+        let create_result = alice_mdk
+            .create_group_with_multi_device(
+                &alice_keys.public_key(),
+                vec![],
+                create_nostr_group_config_data(vec![alice_keys.public_key()]),
+            )
+            .unwrap();
+        let group_id = create_result.group.mls_group_id.clone();
+        alice_mdk.merge_pending_commit(&group_id).unwrap();
+
+        // First registration
+        alice_mdk.register_join_psk(&group_id).unwrap();
+        // Second registration (should succeed, overwriting the first)
+        alice_mdk.register_join_psk(&group_id).unwrap();
+    }
+
+    /// Test that `build_pairing_payload` for a non-existent group returns GroupNotFound.
+    #[test]
+    fn test_build_pairing_payload_nonexistent_group() {
+        let alice_mdk = create_test_mdk();
+        let fake_id = mdk_storage_traits::GroupId::from_slice(&[0xFF; 16]);
+        let result = alice_mdk.build_pairing_payload(&[fake_id]);
+        assert!(matches!(result, Err(crate::Error::GroupNotFound)));
+    }
+
+    /// Test `enable_multi_device` on a non-existent group returns GroupNotFound.
+    #[test]
+    fn test_enable_multi_device_nonexistent_group() {
+        let alice_mdk = create_test_mdk();
+        let fake_id = mdk_storage_traits::GroupId::from_slice(&[0xFF; 16]);
+        let result = alice_mdk.enable_multi_device(&fake_id);
+        assert!(matches!(result, Err(crate::Error::GroupNotFound)));
+    }
+
+    /// Test `register_join_psk` on a non-existent group returns GroupNotFound.
+    #[test]
+    fn test_register_join_psk_nonexistent_group() {
+        let alice_mdk = create_test_mdk();
+        let fake_id = mdk_storage_traits::GroupId::from_slice(&[0xFF; 16]);
+        let result = alice_mdk.register_join_psk(&fake_id);
+        assert!(matches!(result, Err(crate::Error::GroupNotFound)));
+    }
+
+    /// Test `add_device_to_groups` with an empty group list returns an empty response.
+    #[test]
+    fn test_add_device_to_groups_empty_list() {
+        let alice_keys = Keys::generate();
+        let alice_mdk = create_test_mdk();
+        let device2_mdk = create_test_mdk();
+        let device2_kp = create_key_package_event(&device2_mdk, &alice_keys);
+
+        let result = alice_mdk.add_device_to_groups(&[], &device2_kp);
+        assert!(result.is_ok());
+        assert!(result.unwrap().groups().is_empty());
+    }
+
+    /// Test `coalesced_members` with multiple members (not just the creator).
+    #[test]
+    fn test_coalesced_members_with_multiple_users() {
+        let alice_keys = Keys::generate();
+        let bob_keys = Keys::generate();
+        let alice_mdk = create_test_mdk();
+        let bob_mdk = create_test_mdk();
+
+        let bob_kp = create_key_package_event(&bob_mdk, &bob_keys);
+        let create_result = alice_mdk
+            .create_group_with_multi_device(
+                &alice_keys.public_key(),
+                vec![bob_kp],
+                create_nostr_group_config_data(vec![
+                    alice_keys.public_key(),
+                    bob_keys.public_key(),
+                ]),
+            )
+            .unwrap();
+        let group_id = create_result.group.mls_group_id.clone();
+        alice_mdk.merge_pending_commit(&group_id).unwrap();
+
+        let members = alice_mdk.coalesced_members(&group_id).unwrap();
+        assert_eq!(members.len(), 2);
+
+        // Check both pubkeys are present
+        assert!(members.contains_key(&alice_keys.public_key()));
+        assert!(members.contains_key(&bob_keys.public_key()));
+
+        // Each user has exactly 1 leaf
+        for leaves in members.values() {
+            assert_eq!(leaves.len(), 1);
+        }
+    }
+
+    /// Test `own_device_leaves` returns correct leaf indices.
+    #[test]
+    fn test_own_device_leaves_returns_leaf_index() {
+        let alice_keys = Keys::generate();
+        let alice_mdk = create_test_mdk();
+
+        let create_result = alice_mdk
+            .create_group_with_multi_device(
+                &alice_keys.public_key(),
+                vec![],
+                create_nostr_group_config_data(vec![alice_keys.public_key()]),
+            )
+            .unwrap();
+        let group_id = create_result.group.mls_group_id.clone();
+        alice_mdk.merge_pending_commit(&group_id).unwrap();
+
+        let own_leaves = alice_mdk.own_device_leaves(&group_id).unwrap();
+        assert_eq!(own_leaves.len(), 1);
+        // Leaf index 0 is the creator
+        assert_eq!(own_leaves[0], 0);
+    }
 }

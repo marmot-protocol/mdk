@@ -397,6 +397,22 @@ mod tests {
     }
 
     #[test]
+    fn test_encrypt_with_low_order_point_rejected() {
+        let zero_pubkey = [0u8; 32]; // low-order point
+        let result = encrypt_pairing_message(b"test", &zero_pubkey);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_decrypt_with_low_order_pubkey_rejected() {
+        let (new_priv, new_pub) = generate_new_device_keypair();
+        let (_, mut message) = encrypt_pairing_message(b"test", &new_pub).unwrap();
+        message.existing_ephemeral_pubkey = [0u8; 32]; // low-order point
+        let result = decrypt_pairing_message(&message, &new_priv);
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn test_two_messages_from_same_sender_differ() {
         let (_, new_pub) = generate_new_device_keypair();
         let plaintext = b"determinism check";

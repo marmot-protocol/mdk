@@ -2564,4 +2564,103 @@ mod tests {
             other => panic!("Expected StagedCommitMessage, got {:?}", other),
         }
     }
+
+    /// Full end-to-end test exercising the External Commit through the complete
+    /// `process_message` pipeline (decrypt -> OpenMLS process -> validate_commit_authorization
+    /// -> validate_external_commit_identity_proof -> merge).
+    ///
+    /// Unlike `test_external_commit_validation_pipeline` which calls the validation
+    /// functions directly on a staged commit, this test routes the External Commit
+    /// bytes through a Nostr event encrypted with the group's exporter secret,
+    /// exercising `process_message` -> `decrypt_message` -> `dispatch_by_content_type`
+    /// -> `process_commit` -> `validate_commit_authorization` (NewMemberCommit branch)
+    /// -> `validate_external_commit_authorization` -> `validate_external_commit_identity_proof`.
+    #[cfg(feature = "mip06")]
+    #[test]
+    fn test_external_commit_full_pipeline_through_process_message() {
+        let alice_keys = Keys::generate();
+        let bob_keys = Keys::generate();
+
+        let alice_device1 = create_test_mdk();
+        let alice_device2 = create_test_mdk();
+        let bob_mdk = create_test_mdk();
+        let bob_kp = create_key_package_event(&bob_mdk, &bob_keys);
+
+        // Alice device1 creates a MIP-06 group with Bob
+        let create_result = alice_device1
+            .create_group_with_multi_device(
+                &alice_keys.public_key(),
+                vec![bob_kp],
+                create_nostr_group_config_data(vec![
+                    alice_keys.public_key(),
+                    bob_keys.public_key(),
+                ]),
+            )
+            .unwrap();
+        let group_id = create_result.group.mls_group_id.clone();
+        alice_device1.merge_pending_commit(&group_id).unwrap();
+
+        // Device2 joins via External Commit (produces raw MLS commit bytes)
+        let payload = alice_device1
+            .build_pairing_payload(std::slice::from_ref(&group_id))
+            .unwrap();
+        let commit_result = alice_device2
+            .join_group_via_external_commit(&payload.groups()[0], &alice_keys)
+            .expect("External Commit should succeed");
+
+        // Wrap device2's External Commit bytes in a Nostr event encrypted with
+        // device1's exporter secret. This is valid because device2's External Commit
+        // targets device1's current epoch — the same epoch whose exporter secret
+        // device1 uses for encryption/decryption.
+        let event = alice_device1
+            .build_message_event(&group_id, commit_result.commit_message, None)
+            .expect("Should build encrypted message event from External Commit bytes");
+
+        // Route the event through the FULL process_message pipeline on device1.
+        // This exercises:
+        //   validate_event -> extract_nostr_group_id -> decrypt_message ->
+        //   process_mls_message -> dispatch (StagedCommitMessage) ->
+        //   process_commit -> validate_commit_authorization (NewMemberCommit) ->
+        //   validate_external_commit_authorization (conditions 1-5, 7-8) ->
+        //   validate_external_commit_identity_proof (condition 6) ->
+        //   merge_staged_commit
+        let result = alice_device1.process_message(&event);
+
+        match result {
+            Ok(MessageProcessingResult::Commit { mls_group_id }) => {
+                assert_eq!(
+                    mls_group_id, group_id,
+                    "Commit result should reference the same group"
+                );
+            }
+            Ok(other) => {
+                panic!(
+                    "Expected Commit result from External Commit pipeline, got: {:?}",
+                    other
+                );
+            }
+            Err(e) => {
+                panic!(
+                    "process_message should handle External Commit through full pipeline, got error: {e}"
+                );
+            }
+        }
+
+        // Verify device2 was actually added: Alice should now have 2 leaves
+        let mls_group = alice_device1.load_mls_group(&group_id).unwrap().unwrap();
+        let alice_pubkey_bytes = alice_keys.public_key().to_bytes();
+        let alice_leaf_count = mls_group
+            .members()
+            .filter(|m| {
+                openmls::prelude::BasicCredential::try_from(m.credential.clone())
+                    .ok()
+                    .map(|c| c.identity() == alice_pubkey_bytes.as_slice())
+                    .unwrap_or(false)
+            })
+            .count();
+        assert_eq!(
+            alice_leaf_count, 2,
+            "Alice should have 2 leaves after External Commit (device1 + device2)"
+        );
+    }
 }

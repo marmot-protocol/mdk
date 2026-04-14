@@ -691,6 +691,20 @@ mod tests {
     }
 
     #[test]
+    fn test_group_pairing_data_v1_stream_deserialize_roundtrip() {
+        use std::io::Cursor;
+        use tls_codec::{Deserialize, Serialize};
+
+        let data = GroupPairingDataV1::new([0xAA; 32], vec![0xBB; 32], vec![0xCC; 200]).unwrap();
+        let mut bytes = Vec::new();
+        data.tls_serialize(&mut bytes).unwrap();
+
+        let mut cursor = Cursor::new(&bytes);
+        let decoded = GroupPairingDataV1::tls_deserialize(&mut cursor).unwrap();
+        assert_eq!(data, decoded);
+    }
+
+    #[test]
     fn test_payload_multiple_groups_order_preserved() {
         let groups = vec![
             GroupPairingDataV1::new([1; 32], vec![11; 32], vec![21; 50]).unwrap(),
