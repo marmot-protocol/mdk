@@ -587,9 +587,7 @@ mod tests {
 
     #[test]
     fn test_payload_into_groups_consumes() {
-        let groups = vec![
-            GroupPairingDataV1::new([1; 32], vec![2; 32], vec![3; 100]).unwrap(),
-        ];
+        let groups = vec![GroupPairingDataV1::new([1; 32], vec![2; 32], vec![3; 100]).unwrap()];
         let payload = PairingPayload::new(groups).unwrap();
         let consumed = payload.into_groups();
         assert_eq!(consumed.len(), 1);
@@ -600,8 +598,6 @@ mod tests {
     fn test_payload_with_invalid_inner_group_rejected() {
         // Build a payload where one of the inner groups has invalid join_psk length.
         // We construct manually to bypass GroupPairingDataV1::new() validation.
-        use tls_codec::Serialize;
-
         let valid_group = GroupPairingDataV1::new([1; 32], vec![2; 32], vec![3; 50]).unwrap();
         let mut payload = PairingPayload {
             version: 1,
@@ -653,8 +649,7 @@ mod tests {
 
     #[test]
     fn test_group_pairing_data_v1_getters() {
-        let data =
-            GroupPairingDataV1::new([0xAA; 32], vec![0xBB; 32], vec![0xCC; 10]).unwrap();
+        let data = GroupPairingDataV1::new([0xAA; 32], vec![0xBB; 32], vec![0xCC; 10]).unwrap();
         assert_eq!(data.group_event_key(), &[0xAA; 32]);
         assert_eq!(data.join_psk(), &[0xBB; 32]);
         assert_eq!(data.group_info(), &[0xCC; 10]);
@@ -662,8 +657,7 @@ mod tests {
 
     #[test]
     fn test_group_pairing_data_v1_debug_redacts_secrets() {
-        let data =
-            GroupPairingDataV1::new([0xAA; 32], vec![0xBB; 32], vec![0xCC; 10]).unwrap();
+        let data = GroupPairingDataV1::new([0xAA; 32], vec![0xBB; 32], vec![0xCC; 10]).unwrap();
         let debug_str = format!("{:?}", data);
         assert!(debug_str.contains("[REDACTED]"));
         assert!(!debug_str.contains("0xAA"));

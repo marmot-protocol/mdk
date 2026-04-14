@@ -210,9 +210,7 @@ mod tests {
 
     #[test]
     fn test_version_u16_max_rejected() {
-        let ext = MarmotMultiDevice {
-            version: u16::MAX,
-        };
+        let ext = MarmotMultiDevice { version: u16::MAX };
         assert!(matches!(
             ext.validate(),
             Err(crate::error::Error::InvalidExtensionVersion(v)) if v == u16::MAX

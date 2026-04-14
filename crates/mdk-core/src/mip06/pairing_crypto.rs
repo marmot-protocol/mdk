@@ -405,7 +405,10 @@ mod tests {
         let (_, msg2) = encrypt_pairing_message(plaintext, &new_pub).unwrap();
 
         // Different ephemeral keys and nonces each time
-        assert_ne!(msg1.existing_ephemeral_pubkey, msg2.existing_ephemeral_pubkey);
+        assert_ne!(
+            msg1.existing_ephemeral_pubkey,
+            msg2.existing_ephemeral_pubkey
+        );
         assert_ne!(msg1.nonce, msg2.nonce);
         assert_ne!(msg1.ciphertext, msg2.ciphertext);
     }
