@@ -199,7 +199,10 @@ where
     Storage: MdkStorageProvider,
 {
     /// Extracts a public key from an MLS credential.
-    fn pubkey_from_credential(&self, credential: &Credential) -> Result<PublicKey, Error> {
+    pub(crate) fn pubkey_from_credential(
+        &self,
+        credential: &Credential,
+    ) -> Result<PublicKey, Error> {
         let basic = BasicCredential::try_from(credential.clone())?;
         self.parse_credential_identity(basic.identity())
     }
@@ -501,16 +504,7 @@ where
     /// * `Err(Error)` - If the group is not found or there is an error accessing member data
     pub fn get_members(&self, group_id: &GroupId) -> Result<BTreeSet<PublicKey>, Error> {
         let group = self.load_mls_group(group_id)?.ok_or(Error::GroupNotFound)?;
-
-        // Store members in a variable to extend its lifetime
-        let mut members = group.members();
-        members.try_fold(BTreeSet::new(), |mut acc, m| {
-            let credentials: BasicCredential = BasicCredential::try_from(m.credential)?;
-            let identity_bytes: &[u8] = credentials.identity();
-            let public_key = self.parse_credential_identity(identity_bytes)?;
-            acc.insert(public_key);
-            Ok(acc)
-        })
+        self.member_pubkeys(&group)
     }
 
     /// Returns the local member's current MLS leaf index for a group.

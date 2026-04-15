@@ -32,6 +32,7 @@ pub mod messages;
 #[cfg_attr(docsrs, doc(cfg(feature = "mip05")))]
 pub mod mip05;
 pub mod prelude;
+mod state_validation;
 #[cfg(test)]
 pub mod test_util;
 mod util;

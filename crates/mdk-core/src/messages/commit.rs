@@ -802,7 +802,7 @@ mod tests {
     /// Test that an admin-authored commit cannot empty the admin set.
     ///
     /// This bypasses MDK's creating-side group-data guard and uses OpenMLS
-    /// directly to create the receiver-side shape reported in issue #29.
+    /// directly to create the receiver-side shape reported in marmot-security#29.
     #[test]
     fn test_admin_extension_update_cannot_deplete_all_admins() {
         let alice_keys = Keys::generate();
@@ -835,6 +835,11 @@ mod tests {
         bob_mdk
             .accept_welcome(&bob_welcome)
             .expect("Bob should accept welcome");
+        let bob_epoch_before = bob_mdk
+            .get_group(&group_id)
+            .expect("Failed to get Bob's group before malicious commit")
+            .expect("Bob's group should exist before malicious commit")
+            .epoch;
 
         let mut alice_mls_group = alice_mdk
             .load_mls_group(&group_id)
@@ -884,6 +889,10 @@ mod tests {
             .get_group(&group_id)
             .expect("Failed to get Bob's group")
             .expect("Bob's group should exist");
+        assert_eq!(
+            bob_group.epoch, bob_epoch_before,
+            "Rejected commit should not advance Bob's stored epoch"
+        );
         assert_eq!(
             bob_group.admin_pubkeys,
             admins.into_iter().collect(),
