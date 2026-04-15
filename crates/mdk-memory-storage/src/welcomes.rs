@@ -91,8 +91,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        ValidationLimits, DEFAULT_MAX_ADMINS_PER_WELCOME, DEFAULT_MAX_RELAY_URL_LENGTH,
-        DEFAULT_MAX_RELAYS_PER_WELCOME,
+        DEFAULT_MAX_ADMINS_PER_WELCOME, DEFAULT_MAX_RELAY_URL_LENGTH,
+        DEFAULT_MAX_RELAYS_PER_WELCOME, ValidationLimits,
     };
 
     fn create_welcome_with_relays(
