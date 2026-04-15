@@ -17,6 +17,8 @@
 
 ### Fixed
 
+- Fixed `MdkMemoryStorage::save_message` to reject oversized message content, serialized tags JSON, and serialized event JSON before caching messages, matching SQLite backend payload bounds. ([#257](https://github.com/marmot-protocol/mdk/pull/257))
+
 ### Removed
 
 ### Deprecated
