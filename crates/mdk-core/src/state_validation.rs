@@ -3,6 +3,10 @@
 //! Keep state-transition checks here when they compare current MLS state with
 //! staged post-commit state. Broader proposal and group evolution validation can
 //! move here incrementally as follow-up work.
+//!
+//! These helpers model membership by Nostr identity, not by MLS leaf count.
+//! Multiple MLS leaves may legitimately carry the same Nostr identity, so the
+//! `BTreeSet<PublicKey>` return values intentionally deduplicate identities.
 
 use std::collections::BTreeSet;
 
@@ -18,7 +22,7 @@ impl<Storage> MDK<Storage>
 where
     Storage: MdkStorageProvider,
 {
-    /// Returns the Nostr public keys for the live members of an MLS group.
+    /// Returns the Nostr identities represented by live members of an MLS group.
     pub(crate) fn member_pubkeys(
         &self,
         mls_group: &MlsGroup,
@@ -29,7 +33,7 @@ where
             .collect()
     }
 
-    /// Returns the Nostr public keys for members after applying a staged commit.
+    /// Returns the Nostr identities represented after applying a staged commit.
     pub(crate) fn post_commit_member_pubkeys(
         &self,
         mls_group: &MlsGroup,
@@ -53,6 +57,10 @@ where
 
     /// Validates that removing the specified members would not deplete all admins.
     ///
+    /// This is for proposal-time checks where no staged commit exists yet, so it
+    /// reads the admin set from the current MLS group extension. Commit-time
+    /// validation should use `validate_admin_invariant_after_commit` instead.
+    ///
     /// The admin set is checked against post-departure live MLS members so stale
     /// admin entries do not satisfy the invariant.
     pub(crate) fn validate_admin_depletion(
@@ -67,7 +75,7 @@ where
         Self::validate_active_admins(&group_data.admins, &member_pubkeys)
     }
 
-    /// Validates that an admin set contains at least one live member.
+    /// Validates that at least one admin identity is represented by a live member.
     pub(crate) fn validate_active_admins(
         admins: &BTreeSet<PublicKey>,
         member_pubkeys: &BTreeSet<PublicKey>,
@@ -79,7 +87,7 @@ where
         Ok(())
     }
 
-    /// Validates that the current MLS group contains at least one active admin.
+    /// Validates that the current MLS group contains at least one active admin identity.
     pub(crate) fn validate_active_admins_in_group(
         &self,
         mls_group: &MlsGroup,
@@ -89,7 +97,7 @@ where
         Self::validate_active_admins(admins, &member_pubkeys)
     }
 
-    /// Validates that a staged commit leaves at least one active admin.
+    /// Validates that a staged commit leaves at least one active admin identity.
     pub(crate) fn validate_admin_invariant_after_commit(
         &self,
         mls_group: &MlsGroup,

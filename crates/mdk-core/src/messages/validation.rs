@@ -333,6 +333,9 @@ where
                         leaf_index
                     );
 
+                    // The staged invariant uses the post-commit group context,
+                    // so extension changes and all SelfRemove effects are
+                    // checked together before merge.
                     self.validate_admin_invariant_after_commit(mls_group, staged_commit)?;
 
                     return Ok(());

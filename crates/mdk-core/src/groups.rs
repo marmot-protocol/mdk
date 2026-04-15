@@ -1777,8 +1777,9 @@ where
         let mls_group = self.load_mls_group(group_id)?.ok_or(Error::GroupNotFound)?;
         let mut stored_group = self.get_group(group_id)?.ok_or(Error::GroupNotFound)?;
 
-        // Validate the mandatory group-data extension FIRST before making any state changes
-        // This ensures we don't update stored_group if the extension is missing, invalid, or unsupported
+        // Validate the mandatory group-data extension FIRST before making any state changes.
+        // Receiver-side commits are checked before merge; this guard covers local merge
+        // and storage-sync paths so invalid MLS metadata is not copied into storage.
         let group_data = NostrGroupDataExtension::from_group(&mls_group)?;
         self.validate_active_admins_in_group(&mls_group, &group_data.admins)?;
         // Only after successful validation, update epoch and metadata from MLS group
@@ -3590,6 +3591,8 @@ mod tests {
             .merge_pending_commit(&creator_mdk.provider)
             .expect("OpenMLS should merge the adminless extension update");
 
+        // This guard does not roll back the mutated MLS group. It prevents the
+        // invalid extension from being copied into stored group metadata.
         let result = creator_mdk.sync_group_metadata_from_mls(&group_id);
 
         assert!(
