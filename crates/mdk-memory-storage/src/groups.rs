@@ -12,7 +12,7 @@ macro_rules! group_exporter_secret_get {
         if inner.groups_cache.peek($mls_group_id).is_none() {
             return Err(group_not_found());
         }
-        Ok(inner.$cache.peek(&($mls_group_id.clone(), $epoch)).cloned())
+        Ok(inner.$cache.get(&($mls_group_id.clone(), $epoch)).cloned())
     }};
 }
 
@@ -27,7 +27,7 @@ macro_rules! group_exporter_secret_save {
             return Err(group_not_found());
         }
         let key = ($secret.mls_group_id.clone(), $secret.epoch);
-        inner.$cache.put(key, $secret);
+        inner.$cache.insert(key, $secret);
         Ok(())
     }};
 }
@@ -272,7 +272,7 @@ impl GroupStorage for MdkMemoryStorage {
             .collect();
 
         for key in group_event_keys {
-            inner.group_exporter_secrets_cache.pop(&key);
+            inner.group_exporter_secrets_cache.remove(&key);
         }
 
         let legacy_group_event_keys: Vec<(GroupId, u64)> = inner
@@ -289,7 +289,7 @@ impl GroupStorage for MdkMemoryStorage {
             .collect();
 
         for key in legacy_group_event_keys {
-            inner.group_legacy_exporter_secrets_cache.pop(&key);
+            inner.group_legacy_exporter_secrets_cache.remove(&key);
         }
 
         let mip04_keys: Vec<(GroupId, u64)> = inner
@@ -306,7 +306,7 @@ impl GroupStorage for MdkMemoryStorage {
             .collect();
 
         for key in mip04_keys {
-            inner.group_mip04_exporter_secrets_cache.pop(&key);
+            inner.group_mip04_exporter_secrets_cache.remove(&key);
         }
 
         Ok(())
@@ -318,6 +318,7 @@ mod tests {
     use mdk_storage_traits::groups::types::GroupState;
     use mdk_storage_traits::messages::MessageStorage;
     use mdk_storage_traits::messages::types::{Message, MessageState};
+    use mdk_storage_traits::secret::Secret;
     use nostr::{EventId, Keys, Kind, Tags, Timestamp, UnsignedEvent};
 
     use super::*;
@@ -919,5 +920,51 @@ mod tests {
             .unwrap();
         assert_eq!(found.name, "Updated Group Name");
         assert_eq!(found.epoch, 1);
+    }
+
+    /// Regression test for marmot-security#12:
+    /// exporter secrets must not be evicted by cache pressure.
+    ///
+    /// Exporter secrets are used for decryption of historical messages. If they
+    /// are evicted from an LRU cache by traffic volume, historical messages
+    /// become permanently undecryptable. Using HashMap instead of LruCache
+    /// prevents this.
+    #[test]
+    fn test_exporter_secrets_not_evicted_under_cache_pressure() {
+        // Small cache size to trigger pressure quickly
+        let limits = crate::ValidationLimits::default().with_cache_size(5);
+        let storage = MdkMemoryStorage::with_limits(limits);
+
+        let group_id = GroupId::from_slice(&[99u8; 4]);
+        let nostr_group_id = [99u8; 32];
+        let group = create_test_group(group_id.clone(), nostr_group_id);
+        storage.save_group(group).unwrap();
+
+        // Save an exporter secret at epoch 0
+        let early_secret = GroupExporterSecret {
+            mls_group_id: group_id.clone(),
+            epoch: 0,
+            secret: Secret::new([0xABu8; 32]),
+        };
+        storage.save_group_exporter_secret(early_secret).unwrap();
+
+        // Flood with many more epoch secrets on the same group to exceed cache_size many times over.
+        // Using the same group avoids evicting it from groups_cache (which is still LRU-bounded)
+        // and focuses the pressure on the exporter secrets cache itself.
+        for epoch in 1u64..=50 {
+            let secret = GroupExporterSecret {
+                mls_group_id: group_id.clone(),
+                epoch,
+                secret: Secret::new([epoch as u8; 32]),
+            };
+            storage.save_group_exporter_secret(secret).unwrap();
+        }
+
+        // The early secret at epoch 0 must still be present
+        let found = storage.get_group_exporter_secret(&group_id, 0).unwrap();
+        assert!(
+            found.is_some(),
+            "exporter secret was evicted under cache pressure — historical decryption broken"
+        );
     }
 }

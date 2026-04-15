@@ -126,7 +126,7 @@ pub struct MemoryStorageSnapshot {
     pub(crate) mls_encryption_keys: HashMap<Vec<u8>, Vec<u8>>,
     pub(crate) mls_epoch_key_pairs: HashMap<(Vec<u8>, Vec<u8>, u32), Vec<u8>>,
 
-    // MDK data - cloned from LRU caches
+    // MDK data - hot caches (LruCache) and security-critical maps (HashMap)
     pub(crate) groups: HashMap<GroupId, Group>,
     pub(crate) groups_by_nostr_id: HashMap<[u8; 32], Group>,
     pub(crate) group_relays: HashMap<GroupId, BTreeSet<GroupRelay>>,

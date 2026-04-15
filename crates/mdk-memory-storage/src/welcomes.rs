@@ -66,7 +66,7 @@ impl WelcomeStorage for MdkMemoryStorage {
         let mut inner = self.inner.write();
         inner
             .processed_welcomes_cache
-            .put(processed_welcome.wrapper_event_id, processed_welcome);
+            .insert(processed_welcome.wrapper_event_id, processed_welcome);
 
         Ok(())
     }
@@ -76,7 +76,7 @@ impl WelcomeStorage for MdkMemoryStorage {
         event_id: &EventId,
     ) -> Result<Option<ProcessedWelcome>, WelcomeError> {
         let inner = self.inner.read();
-        Ok(inner.processed_welcomes_cache.peek(event_id).cloned())
+        Ok(inner.processed_welcomes_cache.get(event_id).cloned())
     }
 }
 
@@ -86,11 +86,12 @@ mod tests {
 
     use mdk_storage_traits::GroupId;
     use mdk_storage_traits::test_utils::cross_storage::create_test_welcome;
+    use mdk_storage_traits::welcomes::types::{ProcessedWelcome, ProcessedWelcomeState};
     use nostr::{EventId, Keys, Kind, PublicKey, RelayUrl, Tags, Timestamp, UnsignedEvent};
 
     use super::*;
     use crate::{
-        DEFAULT_MAX_ADMINS_PER_WELCOME, DEFAULT_MAX_RELAY_URL_LENGTH,
+        ValidationLimits, DEFAULT_MAX_ADMINS_PER_WELCOME, DEFAULT_MAX_RELAY_URL_LENGTH,
         DEFAULT_MAX_RELAYS_PER_WELCOME,
     };
 
@@ -365,11 +366,55 @@ mod tests {
         assert_eq!(empty.len(), 0);
     }
 
+    /// Regression test for marmot-security#12:
+    /// processed_welcomes must not be evicted by cache pressure.
+    ///
+    /// Processed welcome records serve as deduplication guards. If evicted from
+    /// an LRU cache, the same welcome event could be re-processed, potentially
+    /// allowing a user to be added to a group twice or bypassing replay protections.
+    #[test]
+    fn test_processed_welcomes_not_evicted_under_cache_pressure() {
+        // Small cache size so pressure is easy to trigger
+        let limits = crate::ValidationLimits::default().with_cache_size(5);
+        let storage = MdkMemoryStorage::with_limits(limits);
+
+        // Save one processed welcome that must survive cache pressure
+        let early_wrapper_id = EventId::from_slice(&[1u8; 32]).unwrap();
+        let pw = ProcessedWelcome {
+            wrapper_event_id: early_wrapper_id,
+            welcome_event_id: None,
+            processed_at: nostr::Timestamp::from(1000u64),
+            state: ProcessedWelcomeState::Processed,
+            failure_reason: None,
+        };
+        storage.save_processed_welcome(pw).unwrap();
+
+        // Flood with many more processed welcomes to exceed cache_size (5) many times over
+        for i in 2u8..=50 {
+            let wrapper_id = EventId::from_slice(&[i; 32]).unwrap();
+            let pw = ProcessedWelcome {
+                wrapper_event_id: wrapper_id,
+                welcome_event_id: None,
+                processed_at: nostr::Timestamp::from(1000u64 + u64::from(i)),
+                state: ProcessedWelcomeState::Processed,
+                failure_reason: None,
+            };
+            storage.save_processed_welcome(pw).unwrap();
+        }
+
+        // The early record must still be present — it must not have been evicted
+        let found = storage
+            .find_processed_welcome_by_event_id(&early_wrapper_id)
+            .unwrap();
+        assert!(
+            found.is_some(),
+            "processed welcome was evicted under cache pressure — replay dedup broken"
+        );
+    }
+
     /// Test that custom validation limits work correctly for welcomes
     #[test]
     fn test_custom_welcome_limits() {
-        use crate::ValidationLimits;
-
         // Create storage with custom smaller limits
         let limits = ValidationLimits::default()
             .with_max_relays_per_welcome(2)

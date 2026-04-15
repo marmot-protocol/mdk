@@ -150,7 +150,7 @@ impl MessageStorage for MdkMemoryStorage {
         event_id: &EventId,
     ) -> Result<Option<ProcessedMessage>, MessageError> {
         let inner = self.inner.read();
-        Ok(inner.processed_messages_cache.peek(event_id).cloned())
+        Ok(inner.processed_messages_cache.get(event_id).cloned())
     }
 
     fn save_processed_message(
@@ -160,7 +160,7 @@ impl MessageStorage for MdkMemoryStorage {
         let mut inner = self.inner.write();
         inner
             .processed_messages_cache
-            .put(processed_message.wrapper_event_id, processed_message);
+            .insert(processed_message.wrapper_event_id, processed_message);
 
         Ok(())
     }
@@ -359,6 +359,7 @@ mod tests {
 
     use mdk_storage_traits::groups::GroupStorage;
     use mdk_storage_traits::groups::types::{Group, GroupState, SelfUpdateState};
+    use mdk_storage_traits::messages::types::{ProcessedMessage, ProcessedMessageState};
     use nostr::Keys;
 
     use super::*;
@@ -1274,6 +1275,60 @@ mod tests {
                 .find_message_by_event_id(&group_id, &eid)
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    /// Regression test for marmot-security#12:
+    /// processed_messages must not be evicted by cache pressure.
+    ///
+    /// An attacker flooding with unique event IDs fills the LRU cache so that
+    /// earlier deduplication records are evicted, allowing replays of already-
+    /// processed messages. Using a HashMap instead of LruCache prevents this.
+    #[test]
+    fn test_processed_messages_not_evicted_under_cache_pressure() {
+        // Create storage with a very small cache so pressure is easy to trigger
+        let limits = crate::ValidationLimits::default().with_cache_size(5);
+        let storage = MdkMemoryStorage::with_limits(limits);
+
+        let group_id = GroupId::from_slice(&[42u8; 4]);
+        let group = create_test_group(group_id.clone());
+        storage.save_group(group).unwrap();
+
+        // Save one processed message that should survive cache pressure
+        let early_wrapper_id = EventId::from_slice(&[1u8; 32]).unwrap();
+        let pm = ProcessedMessage {
+            wrapper_event_id: early_wrapper_id,
+            message_event_id: None,
+            processed_at: Timestamp::from(1000u64),
+            epoch: Some(0),
+            mls_group_id: Some(group_id.clone()),
+            state: ProcessedMessageState::Processed,
+            failure_reason: None,
+        };
+        storage.save_processed_message(pm).unwrap();
+
+        // Flood with many more processed messages to exceed cache_size (5) many times over
+        for i in 2u8..=50 {
+            let wrapper_id = EventId::from_slice(&[i; 32]).unwrap();
+            let pm = ProcessedMessage {
+                wrapper_event_id: wrapper_id,
+                message_event_id: None,
+                processed_at: Timestamp::from(1000u64 + u64::from(i)),
+                epoch: Some(u64::from(i)),
+                mls_group_id: Some(group_id.clone()),
+                state: ProcessedMessageState::Processed,
+                failure_reason: None,
+            };
+            storage.save_processed_message(pm).unwrap();
+        }
+
+        // The early record must still be present — it must not have been evicted
+        let found = storage
+            .find_processed_message_by_event_id(&early_wrapper_id)
+            .unwrap();
+        assert!(
+            found.is_some(),
+            "processed message was evicted under cache pressure — replay dedup broken"
         );
     }
 }
