@@ -492,7 +492,7 @@ where
             .map_err(|e| Error::Group(e.to_string()))
     }
 
-    /// Gets the public keys of all members in an MLS group
+    /// Gets the Nostr identities represented by all live members in an MLS group
     ///
     /// # Arguments
     ///
@@ -500,11 +500,11 @@ where
     ///
     /// # Returns
     ///
-    /// * `Ok(BTreeSet<PublicKey>)` - Set of member public keys
+    /// * `Ok(BTreeSet<PublicKey>)` - Set of represented member identities
     /// * `Err(Error)` - If the group is not found or there is an error accessing member data
     pub fn get_members(&self, group_id: &GroupId) -> Result<BTreeSet<PublicKey>, Error> {
         let group = self.load_mls_group(group_id)?.ok_or(Error::GroupNotFound)?;
-        self.member_pubkeys(&group)
+        self.live_member_identities(&group)
     }
 
     /// Returns the local member's current MLS leaf index for a group.

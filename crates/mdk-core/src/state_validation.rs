@@ -23,7 +23,11 @@ where
     Storage: MdkStorageProvider,
 {
     /// Returns the Nostr identities represented by live members of an MLS group.
-    pub(crate) fn member_pubkeys(
+    ///
+    /// This is the in-memory `MlsGroup` variant used by state validation. Public
+    /// callers that only have a `GroupId` should use `get_members`, which loads
+    /// the group and delegates here.
+    pub(crate) fn live_member_identities(
         &self,
         mls_group: &MlsGroup,
     ) -> Result<BTreeSet<PublicKey>, Error> {
@@ -34,14 +38,14 @@ where
     }
 
     /// Returns the Nostr identities represented after applying a staged commit.
-    pub(crate) fn post_commit_member_pubkeys(
+    pub(crate) fn post_commit_member_identities(
         &self,
         mls_group: &MlsGroup,
         staged_commit: &StagedCommit,
     ) -> Result<BTreeSet<PublicKey>, Error> {
         let departing_leaf_indices = Self::departing_leaf_indices(staged_commit);
-        let mut member_pubkeys =
-            self.member_pubkeys_after_departures(mls_group, &departing_leaf_indices)?;
+        let mut member_identities =
+            self.live_member_identities_after_departures(mls_group, &departing_leaf_indices)?;
 
         for add_proposal in staged_commit.add_proposals() {
             let credential = add_proposal
@@ -49,10 +53,10 @@ where
                 .key_package()
                 .leaf_node()
                 .credential();
-            member_pubkeys.insert(self.pubkey_from_credential(credential)?);
+            member_identities.insert(self.pubkey_from_credential(credential)?);
         }
 
-        Ok(member_pubkeys)
+        Ok(member_identities)
     }
 
     /// Validates that removing the specified members would not deplete all admins.
@@ -70,17 +74,17 @@ where
     ) -> Result<(), Error> {
         let group_data = NostrGroupDataExtension::from_group(mls_group)?;
         let departing_leaf_indices = departing_leaf_indices.iter().copied().collect();
-        let member_pubkeys =
-            self.member_pubkeys_after_departures(mls_group, &departing_leaf_indices)?;
-        Self::validate_active_admins(&group_data.admins, &member_pubkeys)
+        let member_identities =
+            self.live_member_identities_after_departures(mls_group, &departing_leaf_indices)?;
+        Self::validate_active_admins(&group_data.admins, &member_identities)
     }
 
     /// Validates that at least one admin identity is represented by a live member.
     pub(crate) fn validate_active_admins(
         admins: &BTreeSet<PublicKey>,
-        member_pubkeys: &BTreeSet<PublicKey>,
+        member_identities: &BTreeSet<PublicKey>,
     ) -> Result<(), Error> {
-        if admins.is_disjoint(member_pubkeys) {
+        if admins.is_disjoint(member_identities) {
             return Err(Error::Group("Would leave group with no admins".to_string()));
         }
 
@@ -93,8 +97,8 @@ where
         mls_group: &MlsGroup,
         admins: &BTreeSet<PublicKey>,
     ) -> Result<(), Error> {
-        let member_pubkeys = self.member_pubkeys(mls_group)?;
-        Self::validate_active_admins(admins, &member_pubkeys)
+        let member_identities = self.live_member_identities(mls_group)?;
+        Self::validate_active_admins(admins, &member_identities)
     }
 
     /// Validates that a staged commit leaves at least one active admin identity.
@@ -105,11 +109,11 @@ where
     ) -> Result<(), Error> {
         let group_data =
             NostrGroupDataExtension::from_group_context(staged_commit.group_context())?;
-        let member_pubkeys = self.post_commit_member_pubkeys(mls_group, staged_commit)?;
-        Self::validate_active_admins(&group_data.admins, &member_pubkeys)
+        let member_identities = self.post_commit_member_identities(mls_group, staged_commit)?;
+        Self::validate_active_admins(&group_data.admins, &member_identities)
     }
 
-    fn member_pubkeys_after_departures(
+    fn live_member_identities_after_departures(
         &self,
         mls_group: &MlsGroup,
         departing_leaf_indices: &BTreeSet<LeafNodeIndex>,
