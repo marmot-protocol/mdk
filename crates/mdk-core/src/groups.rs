@@ -199,7 +199,10 @@ where
     Storage: MdkStorageProvider,
 {
     /// Extracts a public key from an MLS credential.
-    fn pubkey_from_credential(&self, credential: &Credential) -> Result<PublicKey, Error> {
+    pub(crate) fn pubkey_from_credential(
+        &self,
+        credential: &Credential,
+    ) -> Result<PublicKey, Error> {
         let basic = BasicCredential::try_from(credential.clone())?;
         self.parse_credential_identity(basic.identity())
     }
@@ -489,7 +492,7 @@ where
             .map_err(|e| Error::Group(e.to_string()))
     }
 
-    /// Gets the public keys of all members in an MLS group
+    /// Gets the Nostr identities represented by all live members in an MLS group
     ///
     /// # Arguments
     ///
@@ -497,20 +500,11 @@ where
     ///
     /// # Returns
     ///
-    /// * `Ok(BTreeSet<PublicKey>)` - Set of member public keys
+    /// * `Ok(BTreeSet<PublicKey>)` - Set of represented member identities
     /// * `Err(Error)` - If the group is not found or there is an error accessing member data
     pub fn get_members(&self, group_id: &GroupId) -> Result<BTreeSet<PublicKey>, Error> {
         let group = self.load_mls_group(group_id)?.ok_or(Error::GroupNotFound)?;
-
-        // Store members in a variable to extend its lifetime
-        let mut members = group.members();
-        members.try_fold(BTreeSet::new(), |mut acc, m| {
-            let credentials: BasicCredential = BasicCredential::try_from(m.credential)?;
-            let identity_bytes: &[u8] = credentials.identity();
-            let public_key = self.parse_credential_identity(identity_bytes)?;
-            acc.insert(public_key);
-            Ok(acc)
-        })
+        self.live_member_identities(&group)
     }
 
     /// Returns the local member's current MLS leaf index for a group.
@@ -1783,9 +1777,11 @@ where
         let mls_group = self.load_mls_group(group_id)?.ok_or(Error::GroupNotFound)?;
         let mut stored_group = self.get_group(group_id)?.ok_or(Error::GroupNotFound)?;
 
-        // Validate the mandatory group-data extension FIRST before making any state changes
-        // This ensures we don't update stored_group if the extension is missing, invalid, or unsupported
+        // Validate the mandatory group-data extension FIRST before making any state changes.
+        // Receiver-side commits are checked before merge; this guard covers local merge
+        // and storage-sync paths so invalid MLS metadata is not copied into storage.
         let group_data = NostrGroupDataExtension::from_group(&mls_group)?;
+        self.validate_active_admins_in_group(&mls_group, &group_data.admins)?;
         // Only after successful validation, update epoch and metadata from MLS group
         stored_group.epoch = mls_group.epoch().as_u64();
 
@@ -3556,6 +3552,63 @@ mod tests {
             initial_stored_group.last_message_at
         );
         assert_eq!(synced_stored_group.state, initial_stored_group.state);
+    }
+
+    #[test]
+    fn test_sync_group_metadata_rejects_adminless_group_data() {
+        let creator_mdk = create_test_mdk();
+        let (creator, initial_members, admins) = create_test_group_members();
+        let group_id = create_test_group(&creator_mdk, &creator, &initial_members, &admins);
+
+        let initial_stored_group = creator_mdk
+            .get_group(&group_id)
+            .expect("Failed to get initial stored group")
+            .expect("Stored group should exist");
+
+        let mut mls_group = creator_mdk
+            .load_mls_group(&group_id)
+            .expect("Failed to load MLS group")
+            .expect("MLS group should exist");
+        let mut group_data =
+            NostrGroupDataExtension::from_group(&mls_group).expect("Group data should parse");
+        group_data.admins.clear();
+
+        let extension =
+            super::MDK::<MdkMemoryStorage>::get_unknown_extension_from_group_data(&group_data)
+                .expect("Failed to build adminless group-data extension");
+        let mut extensions = mls_group.extensions().clone();
+        extensions
+            .add_or_replace(extension)
+            .expect("Failed to replace group-data extension");
+
+        let signature_keypair = creator_mdk
+            .load_mls_signer(&mls_group)
+            .expect("Failed to load signer");
+        let (_message_out, _, _) = mls_group
+            .update_group_context_extensions(&creator_mdk.provider, extensions, &signature_keypair)
+            .expect("OpenMLS should allow the adminless extension update");
+        mls_group
+            .merge_pending_commit(&creator_mdk.provider)
+            .expect("OpenMLS should merge the adminless extension update");
+
+        // This guard does not roll back the mutated MLS group. It prevents the
+        // invalid extension from being copied into stored group metadata.
+        let result = creator_mdk.sync_group_metadata_from_mls(&group_id);
+
+        assert!(
+            matches!(result, Err(crate::Error::Group(ref msg)) if msg.contains("no admins")),
+            "sync should reject adminless group data, got: {:?}",
+            result
+        );
+
+        let stored_group = creator_mdk
+            .get_group(&group_id)
+            .expect("Failed to reload stored group")
+            .expect("Stored group should still exist");
+        assert_eq!(
+            stored_group.admin_pubkeys, initial_stored_group.admin_pubkeys,
+            "Rejected sync should not alter stored admins"
+        );
     }
 
     #[test]
