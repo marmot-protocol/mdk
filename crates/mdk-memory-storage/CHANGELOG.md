@@ -41,6 +41,8 @@
 
 ### Fixed
 
+- Converted `processed_messages_cache`, `processed_welcomes_cache`, and all three `group_*_exporter_secrets_cache` fields from `LruCache` to `HashMap` to prevent silent eviction of security-critical deduplication records and decryption keys under cache pressure (fixes [marmot-security#12](https://github.com/marmot-protocol/marmot-security/issues/12)) ([#259](https://github.com/marmot-protocol/mdk/pull/259)).
+
 ### Removed
 
 ### Deprecated
