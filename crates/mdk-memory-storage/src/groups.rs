@@ -260,9 +260,8 @@ impl GroupStorage for MdkMemoryStorage {
 
         let group_event_keys: Vec<(GroupId, u64)> = inner
             .group_exporter_secrets_cache
-            .iter()
-            .filter_map(|(k, _)| {
-                let (gid, epoch) = k;
+            .keys()
+            .filter_map(|(gid, epoch)| {
                 if gid == group_id && *epoch < min_epoch_to_keep {
                     Some((gid.clone(), *epoch))
                 } else {
@@ -277,9 +276,8 @@ impl GroupStorage for MdkMemoryStorage {
 
         let legacy_group_event_keys: Vec<(GroupId, u64)> = inner
             .group_legacy_exporter_secrets_cache
-            .iter()
-            .filter_map(|(k, _)| {
-                let (gid, epoch) = k;
+            .keys()
+            .filter_map(|(gid, epoch)| {
                 if gid == group_id && *epoch < min_epoch_to_keep {
                     Some((gid.clone(), *epoch))
                 } else {
@@ -294,9 +292,8 @@ impl GroupStorage for MdkMemoryStorage {
 
         let mip04_keys: Vec<(GroupId, u64)> = inner
             .group_mip04_exporter_secrets_cache
-            .iter()
-            .filter_map(|(k, _)| {
-                let (gid, epoch) = k;
+            .keys()
+            .filter_map(|(gid, epoch)| {
                 if gid == group_id && *epoch < min_epoch_to_keep {
                     Some((gid.clone(), *epoch))
                 } else {

@@ -43,7 +43,7 @@ impl WelcomeStorage for MdkMemoryStorage {
             .collect();
 
         // Sort by ID (descending) for consistent ordering
-        welcomes.sort_by(|a, b| b.id.cmp(&a.id));
+        welcomes.sort_by_key(|w| std::cmp::Reverse(w.id));
 
         // Apply pagination
         let welcomes: Vec<Welcome> = welcomes.into_iter().skip(offset).take(limit).collect();

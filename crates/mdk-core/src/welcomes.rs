@@ -131,11 +131,8 @@ where
                         has_relays = true;
                     }
                 }
-                kind if kind == TagKind::e() => {
-                    // Check that e tag has non-empty content
-                    if tag.content().is_some() && tag.content() != Some("") {
-                        has_event_ref = true;
-                    }
+                kind if kind == TagKind::e() && tag.content().is_some_and(|c| !c.is_empty()) => {
+                    has_event_ref = true;
                 }
                 TagKind::Client => {
                     // Client tag is optional, but if present its value must be non-empty
