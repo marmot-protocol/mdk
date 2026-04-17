@@ -1155,7 +1155,7 @@ where
     fn get_unknown_extension_from_group_data(
         group_data: &NostrGroupDataExtension,
     ) -> Result<Extension, Error> {
-        let serialized_group_data = group_data.as_raw().tls_serialize_detached()?;
+        let serialized_group_data = group_data.to_tls_bytes()?;
 
         Ok(Extension::Unknown(
             group_data.extension_type(),

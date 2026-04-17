@@ -10,7 +10,8 @@ use nostr::{PublicKey, RelayUrl};
 use openmls::extensions::{Extension, ExtensionType};
 use openmls::group::{GroupContext, MlsGroup};
 use tls_codec::{
-    DeserializeBytes, TlsDeserialize, TlsDeserializeBytes, TlsSerialize, TlsSerializeBytes, TlsSize,
+    DeserializeBytes, Serialize as TlsSerializeTrait, TlsDeserialize, TlsDeserializeBytes,
+    TlsSerialize, TlsSerializeBytes, TlsSize,
 };
 
 use crate::constant::NOSTR_GROUP_DATA_EXTENSION_TYPE;
@@ -191,8 +192,18 @@ impl NostrGroupDataExtension {
         // rejects it on the read path, so the write path must not produce it.
         let disappearing_message_secs = disappearing_message_secs.filter(|&d| d != 0);
 
+        // Version tracks protocol capabilities: v3 when disappearing messages
+        // are active, v2 otherwise. The wire format in to_tls_bytes() uses this
+        // to decide whether to emit the v3 struct (with the extra field) or the
+        // v1/v2 struct (backward-compatible with older clients).
+        let version = if disappearing_message_secs.is_some() {
+            Self::CURRENT_VERSION
+        } else {
+            2
+        };
+
         Self {
-            version: Self::CURRENT_VERSION,
+            version,
             nostr_group_id: random_bytes,
             name: name.into(),
             description: description.into(),
@@ -460,33 +471,27 @@ impl NostrGroupDataExtension {
         image_nonce: [u8; 12];
     }
 
-    /// Migrate extension to the current version (v3).
+    /// Migrate extension image semantics from v1 to v2.
     ///
-    /// Updates the extension version to `CURRENT_VERSION` (3). This should be
-    /// called after migrating the group image from v1 to v2 format using
-    /// `migrate_group_image_v1_to_v2`, or when bumping any older extension to
-    /// the latest version.
+    /// In v1 the `image_key` field holds the encryption key directly.
+    /// In v2+ it holds a seed used for HKDF derivation, and `image_upload_key`
+    /// holds an independent upload seed.
+    ///
+    /// This method updates the image fields and bumps the version to 2.
+    /// A separate v2→v3 migration is not needed: the wire format automatically
+    /// upgrades to v3 when `disappearing_message_secs` is set (see
+    /// [`to_tls_bytes`]).
     ///
     /// # Arguments
     ///
     /// * `new_image_hash` - The new image hash (SHA256 of v2 encrypted image)
     /// * `new_image_seed` - The new image seed (32 bytes, stored in image_key field for v2+)
-    ///   **REQUIRED** when migrating from v1, as v1 image_key is a direct encryption key,
-    ///   not a seed. Optional when updating an already-v2+ extension.
     /// * `new_image_nonce` - The new image nonce (12 bytes)
-    /// * `new_image_upload_seed` - The new image upload seed (32 bytes)
-    ///
-    /// # Warning
-    ///
-    /// Migrating from v1 without providing `new_image_seed` creates a semantic
-    /// mismatch: the version will be set to 3 (expecting seed-based derivation),
-    /// but the existing `image_key` is in v1 format (direct encryption key).
-    /// This pattern should only be used when updating image data for an
-    /// already-v2+ extension.
+    /// * `new_image_upload_seed` - The new upload seed (32 bytes)
     ///
     /// # Example
     /// ```ignore
-    /// // Migrate image from v1 to v2+
+    /// // Migrate image from v1 to v2
     /// let v2_prepared = migrate_group_image_v1_to_v2(
     ///     &encrypted_v1_data,
     ///     &v1_extension.image_key.unwrap(),
@@ -500,44 +505,26 @@ impl NostrGroupDataExtension {
     ///     &v2_prepared.upload_keypair
     /// ).await?;
     ///
-    /// // Migrate extension to current version (MUST provide new seed when migrating from v1)
-    /// extension.migrate_to_v3(
-    ///     Some(new_hash),
-    ///     Some(v2_prepared.image_key),    // This is the seed in v2+
-    ///     Some(v2_prepared.image_nonce),
-    ///     Some(v2_prepared.upload_seed),  // Upload seed (independent from image_key in v2+)
+    /// // Migrate extension from v1 to v2
+    /// extension.migrate_v1_to_v2(
+    ///     new_hash,
+    ///     v2_prepared.image_key,
+    ///     v2_prepared.image_nonce,
+    ///     v2_prepared.upload_seed,
     /// );
     /// ```
-    pub fn migrate_to_v3(
+    pub fn migrate_v1_to_v2(
         &mut self,
-        new_image_hash: Option<[u8; 32]>,
-        new_image_seed: Option<[u8; 32]>,
-        new_image_nonce: Option<[u8; 12]>,
-        new_image_upload_seed: Option<[u8; 32]>,
+        new_image_hash: [u8; 32],
+        new_image_seed: [u8; 32],
+        new_image_nonce: [u8; 12],
+        new_image_upload_seed: [u8; 32],
     ) {
-        // Warn if migrating from v1 without providing new seeds
-        if self.version == 1
-            && (new_image_seed.is_none() || new_image_upload_seed.is_none())
-            && self.image_key.is_some()
-        {
-            tracing::warn!(
-                target: "mdk_core::extension::types",
-                "Migrating from v1 to v3 without new image_seed and image_upload_seed - existing image_key will be treated as seed, which may cause issues since v1 image_key is a direct encryption key, not a seed"
-            );
-        }
-        self.version = Self::CURRENT_VERSION;
-        if let Some(hash) = new_image_hash {
-            self.image_hash = Some(hash);
-        }
-        if let Some(seed) = new_image_seed {
-            self.image_key = Some(seed);
-        }
-        if let Some(nonce) = new_image_nonce {
-            self.image_nonce = Some(nonce);
-        }
-        if let Some(upload_seed) = new_image_upload_seed {
-            self.image_upload_key = Some(upload_seed);
-        }
+        self.version = 2;
+        self.image_hash = Some(new_image_hash);
+        self.image_key = Some(new_image_seed);
+        self.image_nonce = Some(new_image_nonce);
+        self.image_upload_key = Some(new_image_upload_seed);
     }
 
     /// Get group image encryption data if all required fields are set
@@ -582,9 +569,7 @@ impl NostrGroupDataExtension {
 
     pub(crate) fn as_raw(&self) -> TlsNostrGroupDataExtension {
         TlsNostrGroupDataExtension {
-            // Always write the current version — the body shape is always v3
-            // (includes disappearing_message_secs), so the header must match.
-            version: Self::CURRENT_VERSION,
+            version: self.version,
             nostr_group_id: self.nostr_group_id,
             name: self.name.as_bytes().to_vec(),
             description: self.description.as_bytes().to_vec(),
@@ -602,10 +587,47 @@ impl NostrGroupDataExtension {
             image_upload_key: self
                 .image_upload_key
                 .map_or_else(Vec::new, |key| key.to_vec()),
+            // Zero normalization is enforced by new() and from_raw(); no re-check here.
             disappearing_message_secs: self
                 .disappearing_message_secs
-                .filter(|&d| d != 0)
                 .map_or_else(Vec::new, |d| d.to_be_bytes().to_vec()),
+        }
+    }
+
+    /// Serialize the extension to TLS wire bytes with version gating.
+    ///
+    /// When `disappearing_message_secs` is active the v3 wire format is used
+    /// (includes the extra field). Otherwise the v1/v2 struct is emitted so
+    /// that older clients can still parse the extension.
+    pub(crate) fn to_tls_bytes(&self) -> Result<Vec<u8>, tls_codec::Error> {
+        if self.disappearing_message_secs.is_some() {
+            // v3 wire format — includes disappearing_message_secs
+            let mut raw = self.as_raw();
+            raw.version = 3;
+            raw.tls_serialize_detached()
+        } else {
+            // v1/v2 wire format — omits disappearing_message_secs for backward compat
+            let raw = TlsNostrGroupDataExtensionV1V2 {
+                version: self.version.min(2),
+                nostr_group_id: self.nostr_group_id,
+                name: self.name.as_bytes().to_vec(),
+                description: self.description.as_bytes().to_vec(),
+                admin_pubkeys: self.admins.iter().map(|pk| *pk.as_bytes()).collect(),
+                relays: self
+                    .relays
+                    .iter()
+                    .map(|url| url.to_string().into_bytes())
+                    .collect(),
+                image_hash: self.image_hash.map_or_else(Vec::new, |hash| hash.to_vec()),
+                image_key: self.image_key.map_or_else(Vec::new, |key| key.to_vec()),
+                image_nonce: self
+                    .image_nonce
+                    .map_or_else(Vec::new, |nonce| nonce.to_vec()),
+                image_upload_key: self
+                    .image_upload_key
+                    .map_or_else(Vec::new, |key| key.to_vec()),
+            };
+            raw.tls_serialize_detached()
         }
     }
 }
@@ -862,7 +884,8 @@ mod tests {
     /// Test that version field is properly serialized at the beginning of the structure (MIP-01)
     #[test]
     fn test_version_field_serialization() {
-        let extension = NostrGroupDataExtension::new(
+        // Without disappearing messages → version 2
+        let ext_v2 = NostrGroupDataExtension::new(
             "Test Group",
             "Test Description",
             [PublicKey::parse(ADMIN_1).unwrap()],
@@ -871,32 +894,37 @@ mod tests {
             None,
             None,
             None,
-            None, // disappearing_message_secs
+            None,
         );
+        assert_eq!(ext_v2.version, 2);
 
-        // Verify version is set to current version
+        let bytes_v2 = ext_v2.to_tls_bytes().unwrap();
+        assert!(bytes_v2.len() >= 2);
+        let wire_version_v2 = u16::from_be_bytes([bytes_v2[0], bytes_v2[1]]);
         assert_eq!(
-            extension.version,
-            NostrGroupDataExtension::CURRENT_VERSION,
-            "Version should be set to CURRENT_VERSION (1)"
+            wire_version_v2, 2,
+            "Wire version should be 2 when no disappearing messages"
         );
 
-        // Serialize and verify version field is at the beginning
-        let raw = extension.as_raw();
-        let serialized = raw.tls_serialize_detached().unwrap();
-
-        // The first 2 bytes should be the version field (u16 in big-endian)
-        assert!(
-            serialized.len() >= 2,
-            "Serialized data should be at least 2 bytes"
+        // With disappearing messages → version 3
+        let ext_v3 = NostrGroupDataExtension::new(
+            "Test Group",
+            "Test Description",
+            [PublicKey::parse(ADMIN_1).unwrap()],
+            [RelayUrl::parse(RELAY_1).unwrap()],
+            None,
+            None,
+            None,
+            None,
+            Some(3600),
         );
-        let version_bytes = &serialized[0..2];
-        let version_from_bytes = u16::from_be_bytes([version_bytes[0], version_bytes[1]]);
+        assert_eq!(ext_v3.version, NostrGroupDataExtension::CURRENT_VERSION);
 
+        let bytes_v3 = ext_v3.to_tls_bytes().unwrap();
+        let wire_version_v3 = u16::from_be_bytes([bytes_v3[0], bytes_v3[1]]);
         assert_eq!(
-            version_from_bytes,
-            NostrGroupDataExtension::CURRENT_VERSION,
-            "First 2 bytes of serialized data should contain version field"
+            wire_version_v3, 3,
+            "Wire version should be 3 when disappearing messages set"
         );
     }
 
@@ -973,22 +1001,20 @@ mod tests {
         );
     }
 
-    /// Test that version field is preserved through serialization round-trip
+    /// Test that version field is preserved through as_raw/from_raw round-trip
     #[test]
     fn test_version_field_roundtrip() {
         let extension = create_test_extension();
 
-        // Verify initial version
-        assert_eq!(extension.version, NostrGroupDataExtension::CURRENT_VERSION);
+        // create_test_extension() has no disappearing messages → version 2
+        assert_eq!(extension.version, 2);
 
-        // Serialize and deserialize
+        // as_raw/from_raw preserves version
         let raw = extension.as_raw();
         let reconstructed = NostrGroupDataExtension::from_raw(raw).unwrap();
-
-        // Verify version is preserved
         assert_eq!(
             reconstructed.version, extension.version,
-            "Version should be preserved through serialization round-trip"
+            "Version should be preserved through as_raw/from_raw round-trip"
         );
     }
 
@@ -997,9 +1023,8 @@ mod tests {
     fn test_deserialize_bytes() {
         let extension = create_test_extension();
 
-        // Serialize to bytes
-        let raw = extension.as_raw();
-        let serialized_bytes = raw.tls_serialize_detached().unwrap();
+        // Serialize using to_tls_bytes (version-gated wire format)
+        let serialized_bytes = extension.to_tls_bytes().unwrap();
 
         // Deserialize using deserialize_bytes
         let deserialized = NostrGroupDataExtension::deserialize_bytes(&serialized_bytes).unwrap();
@@ -1042,9 +1067,8 @@ mod tests {
     fn test_deserialize_bytes_rejects_trailing_bytes() {
         let extension = create_test_extension();
 
-        // Serialize to bytes
-        let raw = extension.as_raw();
-        let mut serialized_bytes = raw.tls_serialize_detached().unwrap();
+        // Serialize using to_tls_bytes (version-gated wire format)
+        let mut serialized_bytes = extension.to_tls_bytes().unwrap();
 
         // Append trailing garbage bytes
         serialized_bytes.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
@@ -1061,28 +1085,24 @@ mod tests {
         );
     }
 
-    /// Test migration to current version (v3)
+    /// Test v1→v2 image semantic migration
     #[test]
-    fn test_migrate_to_v3() {
+    fn test_migrate_v1_to_v2() {
         let pk1 = PublicKey::parse(ADMIN_1).unwrap();
         let relay1 = RelayUrl::parse(RELAY_1).unwrap();
 
-        // Create a version 1 extension with image data
+        // Create a v1 extension with image data
         let mut extension = NostrGroupDataExtension::new(
             "Test Group",
             "Test Description",
             [pk1],
-            [relay1.clone()],
+            [relay1],
             Some([1u8; 32]),
             Some([2u8; 32]),
             Some([3u8; 12]),
             None, // v1 doesn't use image_upload_key
-            None, // disappearing_message_secs
+            None,
         );
-
-        assert_eq!(extension.version, NostrGroupDataExtension::CURRENT_VERSION);
-
-        // Manually set to version 1 for testing
         extension.version = 1;
         assert_eq!(extension.version, 1);
 
@@ -1092,86 +1112,72 @@ mod tests {
         let new_nonce = [30u8; 12];
         let new_upload_seed = [40u8; 32];
 
-        extension.migrate_to_v3(
-            Some(new_hash),
-            Some(new_seed),
-            Some(new_nonce),
-            Some(new_upload_seed),
-        );
+        extension.migrate_v1_to_v2(new_hash, new_seed, new_nonce, new_upload_seed);
 
-        // Verify version is now current
-        assert_eq!(extension.version, NostrGroupDataExtension::CURRENT_VERSION);
+        // Version should be 2, all image fields updated
+        assert_eq!(extension.version, 2);
         assert_eq!(extension.image_hash, Some(new_hash));
         assert_eq!(extension.image_key, Some(new_seed));
         assert_eq!(extension.image_nonce, Some(new_nonce));
-
-        // Test partial migration (only updating some fields)
-        let mut extension2 = NostrGroupDataExtension::new(
-            "Test Group 2",
-            "Test Description 2",
-            [pk1],
-            [relay1],
-            Some([1u8; 32]),
-            Some([2u8; 32]),
-            Some([3u8; 12]),
-            None,
-            None, // disappearing_message_secs
-        );
-        extension2.version = 1;
-
-        extension2.migrate_to_v3(Some(new_hash), None, None, None);
-
-        // Version should be updated, but only hash should change
-        assert_eq!(extension2.version, NostrGroupDataExtension::CURRENT_VERSION);
-        assert_eq!(extension2.image_hash, Some(new_hash));
-        assert_eq!(extension2.image_key, Some([2u8; 32])); // Unchanged
-        assert_eq!(extension2.image_nonce, Some([3u8; 12])); // Unchanged
+        assert_eq!(extension.image_upload_key, Some(new_upload_seed));
     }
 
-    /// Test that migrating an already-current extension updates fields correctly
+    /// Test that to_tls_bytes gates the version: v2 wire format when no
+    /// disappearing messages, v3 when disappearing messages are set.
     #[test]
-    fn test_migrate_to_v3_already_current() {
+    fn test_to_tls_bytes_version_gating() {
         let pk1 = PublicKey::parse(ADMIN_1).unwrap();
         let relay1 = RelayUrl::parse(RELAY_1).unwrap();
 
-        // Create v2 extension
-        let mut extension = NostrGroupDataExtension::new(
-            "Test Group",
-            "Test Description",
+        // Without disappearing messages → v2 wire format
+        let ext_no_dm = NostrGroupDataExtension::new(
+            "Test",
+            "Desc",
             [pk1],
             [relay1.clone()],
-            Some([1u8; 32]),
-            Some([2u8; 32]),
-            Some([3u8; 12]),
-            Some([4u8; 32]), // image_upload_key for v2
-            None,            // disappearing_message_secs
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let bytes = ext_no_dm.to_tls_bytes().unwrap();
+        let wire_version = u16::from_be_bytes([bytes[0], bytes[1]]);
+        assert_eq!(wire_version, 2, "No disappearing messages → v2 wire format");
+
+        // Round-trip should work through v1v2 parser
+        let rt = NostrGroupDataExtension::deserialize_bytes(&bytes).unwrap();
+        assert_eq!(rt.version, 2);
+        assert_eq!(rt.disappearing_message_secs, None);
+
+        // With disappearing messages → v3 wire format
+        let ext_dm = NostrGroupDataExtension::new(
+            "Test",
+            "Desc",
+            [pk1],
+            [relay1],
+            None,
+            None,
+            None,
+            None,
+            Some(3600),
+        );
+        let bytes = ext_dm.to_tls_bytes().unwrap();
+        let wire_version = u16::from_be_bytes([bytes[0], bytes[1]]);
+        assert_eq!(
+            wire_version, 3,
+            "Disappearing messages set → v3 wire format"
         );
 
-        assert_eq!(extension.version, NostrGroupDataExtension::CURRENT_VERSION);
-
-        // Migrate again (should still work, just update fields)
-        let new_hash = [10u8; 32];
-        let new_seed = [20u8; 32];
-        let new_nonce = [30u8; 12];
-        let new_upload_seed = [40u8; 32];
-
-        extension.migrate_to_v3(
-            Some(new_hash),
-            Some(new_seed),
-            Some(new_nonce),
-            Some(new_upload_seed),
-        );
-
-        // Version should remain current, fields should be updated
-        assert_eq!(extension.version, NostrGroupDataExtension::CURRENT_VERSION);
-        assert_eq!(extension.image_hash, Some(new_hash));
-        assert_eq!(extension.image_key, Some(new_seed));
-        assert_eq!(extension.image_nonce, Some(new_nonce));
+        // Round-trip should work through v3 parser
+        let rt = NostrGroupDataExtension::deserialize_bytes(&bytes).unwrap();
+        assert_eq!(rt.version, 3);
+        assert_eq!(rt.disappearing_message_secs, Some(3600));
     }
 
-    /// Test migration with all None values (just version bump)
+    /// Test that a v1 group without disappearing messages preserves v1 on the wire
     #[test]
-    fn test_migrate_to_v3_all_none() {
+    fn test_to_tls_bytes_preserves_v1_for_legacy_groups() {
         let pk1 = PublicKey::parse(ADMIN_1).unwrap();
         let relay1 = RelayUrl::parse(RELAY_1).unwrap();
 
@@ -1184,18 +1190,20 @@ mod tests {
             Some([2u8; 32]),
             Some([3u8; 12]),
             None,
-            None, // disappearing_message_secs
+            None,
         );
         extension.version = 1;
 
-        // Migrate with all None (just version bump)
-        extension.migrate_to_v3(None, None, None, None);
+        let bytes = extension.to_tls_bytes().unwrap();
+        let wire_version = u16::from_be_bytes([bytes[0], bytes[1]]);
+        assert_eq!(
+            wire_version, 1,
+            "v1 group without disappearing messages should stay v1 on wire"
+        );
 
-        // Version should be updated, but fields unchanged
-        assert_eq!(extension.version, NostrGroupDataExtension::CURRENT_VERSION);
-        assert_eq!(extension.image_hash, Some([1u8; 32]));
-        assert_eq!(extension.image_key, Some([2u8; 32]));
-        assert_eq!(extension.image_nonce, Some([3u8; 12]));
+        let rt = NostrGroupDataExtension::deserialize_bytes(&bytes).unwrap();
+        assert_eq!(rt.version, 1);
+        assert_eq!(rt.image_hash, Some([1u8; 32]));
     }
 
     /// Test that legacy v1/v2 TLS payloads (without disappearing_message_secs)
@@ -1253,8 +1261,7 @@ mod tests {
             Some(3600),
         );
 
-        let raw = extension.as_raw();
-        let bytes = raw.tls_serialize_detached().unwrap();
+        let bytes = extension.to_tls_bytes().unwrap();
 
         let deserialized = NostrGroupDataExtension::deserialize_bytes(&bytes).unwrap();
         assert_eq!(
