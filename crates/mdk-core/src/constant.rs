@@ -69,12 +69,6 @@ pub const SUPPORTED_PROPOSALS: [ProposalType; 1] = [
     ProposalType::SelfRemove, // 0x000A
 ];
 
-/// Proposal types required in the GroupContext RequiredCapabilities.
-/// All group members must support these proposal types.
-pub const GROUP_CONTEXT_REQUIRED_PROPOSALS: [ProposalType; 1] = [
-    ProposalType::SelfRemove, // 0x000A
-];
-
 /// Proposal types advertised in Nostr event tags (mls_proposals tag).
 /// Derived from SUPPORTED_PROPOSALS to guarantee consistency.
 pub const TAG_PROPOSALS: [ProposalType; 1] = SUPPORTED_PROPOSALS;
