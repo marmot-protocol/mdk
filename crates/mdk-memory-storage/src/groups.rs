@@ -258,6 +258,7 @@ impl GroupStorage for MdkMemoryStorage {
             return Err(group_not_found());
         }
 
+        #[allow(clippy::iter_kv_map)]
         let group_event_keys: Vec<(GroupId, u64)> = inner
             .group_exporter_secrets_cache
             .keys()
@@ -274,6 +275,7 @@ impl GroupStorage for MdkMemoryStorage {
             inner.group_exporter_secrets_cache.remove(&key);
         }
 
+        #[allow(clippy::iter_kv_map)]
         let legacy_group_event_keys: Vec<(GroupId, u64)> = inner
             .group_legacy_exporter_secrets_cache
             .keys()
@@ -290,6 +292,7 @@ impl GroupStorage for MdkMemoryStorage {
             inner.group_legacy_exporter_secrets_cache.remove(&key);
         }
 
+        #[allow(clippy::iter_kv_map)]
         let mip04_keys: Vec<(GroupId, u64)> = inner
             .group_mip04_exporter_secrets_cache
             .keys()

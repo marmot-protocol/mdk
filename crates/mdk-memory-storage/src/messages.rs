@@ -242,6 +242,7 @@ impl MessageStorage for MdkMemoryStorage {
     ) -> Result<Vec<ProcessedMessage>, MessageError> {
         let inner = self.inner.read();
 
+        #[allow(clippy::iter_kv_map)]
         let invalidated: Vec<ProcessedMessage> = inner
             .processed_messages_cache
             .values()

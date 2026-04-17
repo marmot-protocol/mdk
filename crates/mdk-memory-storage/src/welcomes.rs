@@ -35,6 +35,7 @@ impl WelcomeStorage for MdkMemoryStorage {
         validate_pending_welcomes_limit(limit)?;
 
         let inner = self.inner.read();
+        #[allow(clippy::iter_kv_map)]
         let mut welcomes: Vec<Welcome> = inner
             .welcomes_cache
             .iter()
