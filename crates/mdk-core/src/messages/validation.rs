@@ -348,6 +348,18 @@ where
                 );
                 Err(Error::CommitFromNonAdmin)
             }
+            #[cfg(feature = "mip06")]
+            Sender::NewMemberCommit => {
+                self.validate_external_commit_authorization(mls_group, staged_commit)
+            }
+            #[cfg(not(feature = "mip06"))]
+            Sender::NewMemberCommit => {
+                tracing::warn!(
+                    target: "mdk_core::messages::process_commit",
+                    "Received External Commit but MIP-06 is not enabled in this build."
+                );
+                Err(Error::MessageFromNonMember)
+            }
             _ => {
                 tracing::warn!(
                     target: "mdk_core::messages::process_commit",
@@ -356,6 +368,156 @@ where
                 Err(Error::MessageFromNonMember)
             }
         }
+    }
+
+    /// Validates an External Commit (MIP-06 multi-device join) is authorized.
+    ///
+    /// Checks conditions 1–5 and 7–8 from MIP-06 §External Commit Authorization.
+    /// Condition 6 (Nostr identity proof) requires `authenticated_data` and is
+    /// checked separately in [`Self::validate_external_commit_identity_proof`].
+    ///
+    /// OpenMLS validates standard MLS rules (condition 8) and PSK cryptographic
+    /// correctness (confirmation_tag) during `process_message()`, before we reach
+    /// this point.
+    #[cfg(feature = "mip06")]
+    fn validate_external_commit_authorization(
+        &self,
+        mls_group: &MlsGroup,
+        staged_commit: &StagedCommit,
+    ) -> Result<()> {
+        use openmls::prelude::BasicCredential;
+
+        // 1-3. MIP-06 signaling gate: extension present, required, at least one member
+        if !crate::mip06::is_multi_device_enabled(mls_group) {
+            tracing::warn!(
+                target: "mdk_core::messages::validate_external_commit",
+                "External Commit rejected: MIP-06 signaling gate not satisfied"
+            );
+            return Err(Error::MultiDeviceNotEnabled);
+        }
+
+        // 4. Credential identity in joining LeafNode matches an existing member.
+        let joining_pubkey = self.extract_joining_pubkey(staged_commit)?;
+
+        let identity_match = mls_group.members().any(|member| {
+            BasicCredential::try_from(member.credential.clone())
+                .ok()
+                .and_then(|cred| self.parse_credential_identity(cred.identity()).ok())
+                .is_some_and(|pk| pk == joining_pubkey)
+        });
+
+        if !identity_match {
+            tracing::warn!(
+                target: "mdk_core::messages::validate_external_commit",
+                "External Commit rejected: joining identity {} does not match any existing member",
+                joining_pubkey
+            );
+            return Err(Error::IdentityProofError(
+                "joining identity does not match any existing group member".to_string(),
+            ));
+        }
+
+        // 5. Exactly one PreSharedKey proposal with external join PSK.
+        //    The proposal must use psktype=external with a MarmotMultiDeviceJoinPskId.
+        //    OpenMLS validates the PSK cryptographically via confirmation_tag during
+        //    process_message(), so if the PSK is wrong the commit is rejected before
+        //    we reach this point. We verify the count here; full PSK ID inspection is
+        //    blocked by PreSharedKeyProposal::into_psk_id() being pub(crate) in OpenMLS.
+        let psk_count = staged_commit
+            .queued_proposals()
+            .filter(|p| matches!(p.proposal(), Proposal::PreSharedKey(_)))
+            .count();
+        if psk_count != 1 {
+            tracing::warn!(
+                target: "mdk_core::messages::validate_external_commit",
+                "External Commit rejected: expected exactly 1 PreSharedKey proposal, found {}",
+                psk_count
+            );
+            return Err(Error::PairingError(format!(
+                "expected 1 PreSharedKey proposal, found {psk_count}"
+            )));
+        }
+
+        // 7. No Remove proposals allowed (join-only, not resync).
+        let has_remove = staged_commit
+            .queued_proposals()
+            .any(|p| matches!(p.proposal(), Proposal::Remove(_)));
+        if has_remove {
+            tracing::warn!(
+                target: "mdk_core::messages::validate_external_commit",
+                "External Commit rejected: contains Remove proposal (resync not allowed)"
+            );
+            return Err(Error::PairingError(
+                "MIP-06 External Commits must not contain Remove proposals".to_string(),
+            ));
+        }
+
+        tracing::debug!(
+            target: "mdk_core::messages::validate_external_commit",
+            "External Commit from {} passed authorization checks",
+            joining_pubkey
+        );
+
+        Ok(())
+    }
+
+    /// Extract the Nostr pubkey from the joining LeafNode in an External Commit.
+    #[cfg(feature = "mip06")]
+    fn extract_joining_pubkey(&self, staged_commit: &StagedCommit) -> Result<nostr::PublicKey> {
+        use openmls::prelude::BasicCredential;
+
+        let joining_leaf = staged_commit.update_path_leaf_node().ok_or_else(|| {
+            Error::IdentityProofError("External Commit has no update path leaf node".to_string())
+        })?;
+        let joining_cred = BasicCredential::try_from(joining_leaf.credential().clone())
+            .map_err(|e| Error::IdentityProofError(format!("invalid credential: {e}")))?;
+        self.parse_credential_identity(joining_cred.identity())
+    }
+
+    /// Validates the Nostr identity proof in an External Commit's `authenticated_data`.
+    ///
+    /// This is MIP-06 §External Commit Authorization condition 6. Full cryptographic
+    /// verification: extracts credential_identity and signature_key from the joining
+    /// LeafNode, exports the pre-commit GroupContext, recomputes the challenge hash,
+    /// and verifies the Schnorr signature.
+    #[cfg(feature = "mip06")]
+    pub(super) fn validate_external_commit_identity_proof(
+        &self,
+        mls_group: &MlsGroup,
+        staged_commit: &StagedCommit,
+        authenticated_data: &[u8],
+    ) -> Result<()> {
+        use crate::mip06::{NostrIdentityProof, verify_identity_proof};
+        use openmls::prelude::BasicCredential;
+
+        let proof = NostrIdentityProof::from_authenticated_data(authenticated_data)?;
+
+        let joining_leaf = staged_commit.update_path_leaf_node().ok_or_else(|| {
+            Error::IdentityProofError("External Commit has no update path leaf node".to_string())
+        })?;
+        let joining_cred = BasicCredential::try_from(joining_leaf.credential().clone())
+            .map_err(|e| Error::IdentityProofError(format!("invalid credential: {e}")))?;
+        let joining_pubkey = self.parse_credential_identity(joining_cred.identity())?;
+
+        let gc_bytes = self.export_group_context_bytes(mls_group).map_err(|e| {
+            Error::IdentityProofError(format!("failed to export GroupContext: {e}"))
+        })?;
+
+        verify_identity_proof(
+            &proof,
+            &joining_pubkey,
+            joining_cred.identity(),
+            joining_leaf.signature_key().as_slice(),
+            &gc_bytes,
+        )?;
+
+        tracing::debug!(
+            target: "mdk_core::messages::validate_external_commit",
+            "External Commit identity proof verified for {}",
+            joining_pubkey
+        );
+
+        Ok(())
     }
 
     /// Validates that an event's timestamp is within acceptable bounds
@@ -489,6 +651,8 @@ mod tests {
     use mdk_memory_storage::MdkMemoryStorage;
     use nostr::{EventBuilder, Keys, Kind, Tag, TagKind};
     use openmls::prelude::BasicCredential;
+    #[cfg(feature = "mip06")]
+    use tls_codec::Deserialize as _;
     use tls_codec::Serialize as TlsSerialize;
 
     use crate::MDK;
@@ -1129,6 +1293,189 @@ mod tests {
             update_result.mls_group_id, group_id,
             "Update result should have the same group ID"
         );
+    }
+
+    // ── validate_created_at_with_now boundary tests ───────────────────
+
+    /// Test that a timestamp exactly at the future boundary is accepted
+    #[test]
+    fn test_validate_created_at_exactly_at_future_boundary() {
+        use crate::tests::create_test_mdk;
+
+        let mdk = create_test_mdk();
+        let creator = Keys::generate();
+        let now = nostr::Timestamp::from(1_000_000u64);
+
+        // Exactly at the boundary (now + max_future_skew_secs) should pass
+        let boundary_time = now.as_secs() + mdk.config.max_future_skew_secs;
+        let event = EventBuilder::new(Kind::MlsGroupMessage, "test")
+            .custom_created_at(nostr::Timestamp::from(boundary_time))
+            .sign_with_keys(&creator)
+            .unwrap();
+
+        assert!(mdk.validate_created_at_with_now(&event, now).is_ok());
+    }
+
+    /// Test that a timestamp one second past the future boundary is rejected
+    #[test]
+    fn test_validate_created_at_one_past_future_boundary() {
+        use crate::tests::create_test_mdk;
+
+        let mdk = create_test_mdk();
+        let creator = Keys::generate();
+        let now = nostr::Timestamp::from(1_000_000u64);
+
+        let over_boundary = now.as_secs() + mdk.config.max_future_skew_secs + 1;
+        let event = EventBuilder::new(Kind::MlsGroupMessage, "test")
+            .custom_created_at(nostr::Timestamp::from(over_boundary))
+            .sign_with_keys(&creator)
+            .unwrap();
+
+        assert!(matches!(
+            mdk.validate_created_at_with_now(&event, now),
+            Err(Error::InvalidTimestamp(_))
+        ));
+    }
+
+    /// Test that a timestamp exactly at the past boundary is accepted
+    #[test]
+    fn test_validate_created_at_exactly_at_past_boundary() {
+        use crate::tests::create_test_mdk;
+
+        let mdk = create_test_mdk();
+        let creator = Keys::generate();
+        let now = nostr::Timestamp::from(10_000_000u64);
+
+        // Exactly at the boundary (now - max_event_age_secs) should pass
+        let boundary_time = now.as_secs() - mdk.config.max_event_age_secs;
+        let event = EventBuilder::new(Kind::MlsGroupMessage, "test")
+            .custom_created_at(nostr::Timestamp::from(boundary_time))
+            .sign_with_keys(&creator)
+            .unwrap();
+
+        assert!(mdk.validate_created_at_with_now(&event, now).is_ok());
+    }
+
+    /// Test that a timestamp one second before the past boundary is rejected
+    #[test]
+    fn test_validate_created_at_one_past_age_boundary() {
+        use crate::tests::create_test_mdk;
+
+        let mdk = create_test_mdk();
+        let creator = Keys::generate();
+        let now = nostr::Timestamp::from(10_000_000u64);
+
+        let over_boundary = now.as_secs() - mdk.config.max_event_age_secs - 1;
+        let event = EventBuilder::new(Kind::MlsGroupMessage, "test")
+            .custom_created_at(nostr::Timestamp::from(over_boundary))
+            .sign_with_keys(&creator)
+            .unwrap();
+
+        assert!(matches!(
+            mdk.validate_created_at_with_now(&event, now),
+            Err(Error::InvalidTimestamp(_))
+        ));
+    }
+
+    /// Test timestamp validation with custom config (tight skew)
+    #[test]
+    fn test_validate_created_at_with_custom_config() {
+        use crate::MdkConfig;
+        use crate::tests::create_test_mdk_with_config;
+
+        let config = MdkConfig {
+            max_future_skew_secs: 10,
+            max_event_age_secs: 60,
+            ..Default::default()
+        };
+        let mdk = create_test_mdk_with_config(config);
+        let creator = Keys::generate();
+        let now = nostr::Timestamp::from(1_000_000u64);
+
+        // 11 seconds in the future should be rejected with tight config
+        let event = EventBuilder::new(Kind::MlsGroupMessage, "test")
+            .custom_created_at(nostr::Timestamp::from(now.as_secs() + 11))
+            .sign_with_keys(&creator)
+            .unwrap();
+        assert!(mdk.validate_created_at_with_now(&event, now).is_err());
+
+        // 61 seconds in the past should be rejected with tight config
+        let event = EventBuilder::new(Kind::MlsGroupMessage, "test")
+            .custom_created_at(nostr::Timestamp::from(now.as_secs() - 61))
+            .sign_with_keys(&creator)
+            .unwrap();
+        assert!(mdk.validate_created_at_with_now(&event, now).is_err());
+
+        // 5 seconds in the future should be fine
+        let event = EventBuilder::new(Kind::MlsGroupMessage, "test")
+            .custom_created_at(nostr::Timestamp::from(now.as_secs() + 5))
+            .sign_with_keys(&creator)
+            .unwrap();
+        assert!(mdk.validate_created_at_with_now(&event, now).is_ok());
+    }
+
+    /// Test that validate_event_at rejects wrong kind even with valid timestamp
+    #[test]
+    fn test_validate_event_at_wrong_kind() {
+        let mdk = create_test_mdk();
+        let creator = Keys::generate();
+
+        let event = EventBuilder::new(Kind::TextNote, "test")
+            .sign_with_keys(&creator)
+            .unwrap();
+
+        assert!(matches!(
+            mdk.validate_event_at(&event, nostr::Timestamp::now()),
+            Err(Error::UnexpectedEvent { .. })
+        ));
+    }
+
+    /// Test that validate_event_at accepts valid event with current timestamp
+    #[test]
+    fn test_validate_event_at_valid() {
+        let mdk = create_test_mdk();
+        let creator = Keys::generate();
+        let now = nostr::Timestamp::now();
+
+        let event = EventBuilder::new(Kind::MlsGroupMessage, "test")
+            .custom_created_at(now)
+            .sign_with_keys(&creator)
+            .unwrap();
+
+        assert!(mdk.validate_event_at(&event, now).is_ok());
+    }
+
+    // ── extract_nostr_group_id edge cases ──────────────────────────────
+
+    /// Test that extract_nostr_group_id handles h-tag with empty content
+    #[test]
+    fn test_extract_group_id_empty_h_tag_content() {
+        let mdk = create_test_mdk();
+        let creator = Keys::generate();
+
+        let event = EventBuilder::new(Kind::MlsGroupMessage, "test")
+            .tag(Tag::custom(TagKind::h(), [""])) // empty string content
+            .sign_with_keys(&creator)
+            .unwrap();
+
+        let result = mdk.extract_nostr_group_id(&event);
+        assert!(result.is_err());
+    }
+
+    /// Test that extract_nostr_group_id handles exactly 64 hex chars with correct bytes
+    #[test]
+    fn test_extract_group_id_specific_value() {
+        let mdk = create_test_mdk();
+        let creator = Keys::generate();
+        let expected_id = [0x42u8; 32];
+
+        let event = EventBuilder::new(Kind::MlsGroupMessage, "test")
+            .tag(Tag::custom(TagKind::h(), [hex::encode(expected_id)]))
+            .sign_with_keys(&creator)
+            .unwrap();
+
+        let result = mdk.extract_nostr_group_id(&event).unwrap();
+        assert_eq!(result, expected_id);
     }
 
     /// Test that identity parsing works correctly for validation
@@ -2086,5 +2433,182 @@ mod tests {
                 assert_eq!(new, attacker_identity.to_hex());
             }
         }
+    }
+
+    /// End-to-end test that External Commit validation functions are exercised.
+    ///
+    /// This test constructs an External Commit via the MIP-06 pairing flow, processes
+    /// it through OpenMLS, and then calls `validate_external_commit_authorization` and
+    /// `validate_external_commit_identity_proof` — the same functions invoked by
+    /// `process_commit` in production — to verify both accept a legitimate join.
+    #[cfg(feature = "mip06")]
+    #[test]
+    fn test_external_commit_validation_pipeline() {
+        use openmls::prelude::ProcessedMessageContent;
+
+        let alice_keys = Keys::generate();
+        let bob_keys = Keys::generate();
+
+        let alice_device1 = create_test_mdk();
+        let alice_device2 = create_test_mdk();
+        let bob_mdk = create_test_mdk();
+        let bob_kp = create_key_package_event(&bob_mdk, &bob_keys);
+
+        // Create group with MIP-06 enabled
+        let create_result = alice_device1
+            .create_group_with_multi_device(
+                &alice_keys.public_key(),
+                vec![bob_kp],
+                create_nostr_group_config_data(vec![
+                    alice_keys.public_key(),
+                    bob_keys.public_key(),
+                ]),
+            )
+            .unwrap();
+        let group_id = create_result.group.mls_group_id.clone();
+        alice_device1.merge_pending_commit(&group_id).unwrap();
+
+        // Device 2 joins via External Commit
+        let payload = alice_device1
+            .build_pairing_payload(std::slice::from_ref(&group_id))
+            .unwrap();
+        let group_data = &payload.groups()[0];
+
+        let commit_result = alice_device2
+            .join_group_via_external_commit(group_data, &alice_keys)
+            .expect("External Commit should succeed");
+
+        // Process the commit through OpenMLS on device 1
+        let mut mls_group = alice_device1.load_mls_group(&group_id).unwrap().unwrap();
+        let msg_in =
+            openmls::prelude::MlsMessageIn::tls_deserialize_exact(&commit_result.commit_message)
+                .expect("Should deserialize");
+        let protocol_msg = msg_in
+            .try_into_protocol_message()
+            .expect("Should be protocol message");
+
+        let processed = mls_group
+            .process_message(&alice_device1.provider, protocol_msg)
+            .expect("OpenMLS should accept the External Commit");
+
+        let aad = processed.aad().to_vec();
+
+        match processed.into_content() {
+            ProcessedMessageContent::StagedCommitMessage(staged_commit) => {
+                // Exercise validate_external_commit_authorization (conditions 1-5, 7-8)
+                alice_device1
+                    .validate_external_commit_authorization(&mls_group, &staged_commit)
+                    .expect("Authorization validation should pass for legitimate join");
+
+                // Exercise validate_external_commit_identity_proof (condition 6)
+                alice_device1
+                    .validate_external_commit_identity_proof(&mls_group, &staged_commit, &aad)
+                    .expect("Identity proof validation should pass for legitimate join");
+
+                mls_group
+                    .merge_staged_commit(&alice_device1.provider, *staged_commit)
+                    .expect("Should merge External Commit");
+            }
+            other => panic!("Expected StagedCommitMessage, got {:?}", other),
+        }
+    }
+
+    /// Full end-to-end test exercising the External Commit through the complete
+    /// `process_message` pipeline (decrypt -> OpenMLS process -> validate_commit_authorization
+    /// -> validate_external_commit_identity_proof -> merge).
+    ///
+    /// Unlike `test_external_commit_validation_pipeline` which calls the validation
+    /// functions directly on a staged commit, this test routes the External Commit
+    /// bytes through a Nostr event encrypted with the group's exporter secret,
+    /// exercising `process_message` -> `decrypt_message` -> `dispatch_by_content_type`
+    /// -> `process_commit` -> `validate_commit_authorization` (NewMemberCommit branch)
+    /// -> `validate_external_commit_authorization` -> `validate_external_commit_identity_proof`.
+    #[cfg(feature = "mip06")]
+    #[test]
+    fn test_external_commit_full_pipeline_through_process_message() {
+        let alice_keys = Keys::generate();
+        let bob_keys = Keys::generate();
+
+        let alice_device1 = create_test_mdk();
+        let alice_device2 = create_test_mdk();
+        let bob_mdk = create_test_mdk();
+        let bob_kp = create_key_package_event(&bob_mdk, &bob_keys);
+
+        // Alice device1 creates a MIP-06 group with Bob
+        let create_result = alice_device1
+            .create_group_with_multi_device(
+                &alice_keys.public_key(),
+                vec![bob_kp],
+                create_nostr_group_config_data(vec![
+                    alice_keys.public_key(),
+                    bob_keys.public_key(),
+                ]),
+            )
+            .unwrap();
+        let group_id = create_result.group.mls_group_id.clone();
+        alice_device1.merge_pending_commit(&group_id).unwrap();
+
+        // Device2 joins via External Commit (produces raw MLS commit bytes)
+        let payload = alice_device1
+            .build_pairing_payload(std::slice::from_ref(&group_id))
+            .unwrap();
+        let commit_result = alice_device2
+            .join_group_via_external_commit(&payload.groups()[0], &alice_keys)
+            .expect("External Commit should succeed");
+
+        // Wrap device2's External Commit bytes in a Nostr event encrypted with
+        // device1's exporter secret. This is valid because device2's External Commit
+        // targets device1's current epoch — the same epoch whose exporter secret
+        // device1 uses for encryption/decryption.
+        let event = alice_device1
+            .build_message_event(&group_id, commit_result.commit_message, None)
+            .expect("Should build encrypted message event from External Commit bytes");
+
+        // Route the event through the FULL process_message pipeline on device1.
+        // This exercises:
+        //   validate_event -> extract_nostr_group_id -> decrypt_message ->
+        //   process_mls_message -> dispatch (StagedCommitMessage) ->
+        //   process_commit -> validate_commit_authorization (NewMemberCommit) ->
+        //   validate_external_commit_authorization (conditions 1-5, 7-8) ->
+        //   validate_external_commit_identity_proof (condition 6) ->
+        //   merge_staged_commit
+        let result = alice_device1.process_message(&event);
+
+        match result {
+            Ok(MessageProcessingResult::Commit { mls_group_id }) => {
+                assert_eq!(
+                    mls_group_id, group_id,
+                    "Commit result should reference the same group"
+                );
+            }
+            Ok(other) => {
+                panic!(
+                    "Expected Commit result from External Commit pipeline, got: {:?}",
+                    other
+                );
+            }
+            Err(e) => {
+                panic!(
+                    "process_message should handle External Commit through full pipeline, got error: {e}"
+                );
+            }
+        }
+
+        // Verify device2 was actually added: Alice should now have 2 leaves
+        let mls_group = alice_device1.load_mls_group(&group_id).unwrap().unwrap();
+        let alice_pubkey_bytes = alice_keys.public_key().to_bytes();
+        let alice_leaf_count = mls_group
+            .members()
+            .filter(|m| {
+                openmls::prelude::BasicCredential::try_from(m.credential.clone())
+                    .ok()
+                    .map(|c| c.identity() == alice_pubkey_bytes.as_slice())
+                    .unwrap_or(false)
+            })
+            .count();
+        assert_eq!(
+            alice_leaf_count, 2,
+            "Alice should have 2 leaves after External Commit (device1 + device2)"
+        );
     }
 }

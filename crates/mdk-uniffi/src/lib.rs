@@ -2049,6 +2049,274 @@ impl Mdk {
     }
 }
 
+// ── MIP-06 Multi-Device methods on Mdk ──────────────────────────────────────
+
+#[cfg(feature = "mip06")]
+#[uniffi::export]
+impl Mdk {
+    /// Create a group with MIP-06 multi-device support enabled.
+    pub fn create_group_with_multi_device(
+        &self,
+        creator_public_key: String,
+        member_key_package_events_json: Vec<String>,
+        name: String,
+        description: String,
+        relays: Vec<String>,
+        admins: Vec<String>,
+    ) -> Result<CreateGroupResult, MdkUniffiError> {
+        let creator_pubkey = parse_public_key(&creator_public_key)?;
+        let relay_urls = parse_relay_urls(&relays)?;
+        let admin_pubkeys: Vec<PublicKey> = admins
+            .iter()
+            .map(|a| parse_public_key(a))
+            .collect::<Result<_, _>>()?;
+
+        let member_key_package_events: Vec<Event> = member_key_package_events_json
+            .iter()
+            .map(|json| parse_json(json, "key package event JSON"))
+            .collect::<Result<_, _>>()?;
+
+        let config = NostrGroupConfigData::new(
+            name,
+            description,
+            None,
+            None,
+            None,
+            relay_urls,
+            admin_pubkeys,
+        );
+
+        let mdk = self.lock()?;
+        let result =
+            mdk.create_group_with_multi_device(&creator_pubkey, member_key_package_events, config)?;
+
+        let welcome_rumors_json: Vec<String> = result
+            .welcome_rumors
+            .iter()
+            .map(|rumor| {
+                serde_json::to_string(rumor).map_err(|e| {
+                    MdkUniffiError::InvalidInput(format!("Failed to serialize welcome rumor: {e}"))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(CreateGroupResult {
+            group: Group::from(result.group),
+            welcome_rumors_json,
+        })
+    }
+
+    /// Enable MIP-06 multi-device support on an existing group.
+    ///
+    /// Returns the commit event JSON to publish to relays.
+    pub fn enable_multi_device(&self, mls_group_id: String) -> Result<String, MdkUniffiError> {
+        let group_id = parse_group_id(&mls_group_id)?;
+        let mdk = self.lock()?;
+        let event = mdk.enable_multi_device(&group_id)?;
+        serde_json::to_string(&event)
+            .map_err(|e| MdkUniffiError::InvalidInput(format!("Failed to serialize event: {e}")))
+    }
+
+    /// Add a new device to multiple groups (existing device, Phase 2 of pairing).
+    ///
+    /// Takes the new device's KeyPackage event JSON and group IDs to add it to.
+    /// Returns one structured welcome/commit entry per group.
+    ///
+    /// NOTE: Caller must publish commit events and call merge_pending_commit for each group.
+    pub fn add_device_to_groups(
+        &self,
+        mls_group_ids: Vec<String>,
+        key_package_event_json: String,
+    ) -> Result<Vec<DevicePairingGroupResult>, MdkUniffiError> {
+        let group_ids: Vec<GroupId> = mls_group_ids
+            .iter()
+            .map(|id| parse_group_id(id))
+            .collect::<Result<_, _>>()?;
+
+        let kp_event: Event = parse_json(&key_package_event_json, "key package event JSON")?;
+
+        let mdk = self.lock()?;
+        let response = mdk.add_device_to_groups(&group_ids, &kp_event)?;
+        if response.groups().len() != group_ids.len() {
+            return Err(MdkUniffiError::Mdk(format!(
+                "expected {} pairing entries, got {}",
+                group_ids.len(),
+                response.groups().len()
+            )));
+        }
+
+        Ok(group_ids
+            .iter()
+            .zip(response.groups().iter())
+            .map(|(group_id, group_data)| DevicePairingGroupResult {
+                mls_group_id: hex::encode(group_id.as_slice()),
+                welcome_rumor: group_data.welcome_rumor_bytes().to_vec(),
+                commit_event: group_data.commit_event_bytes().to_vec(),
+            })
+            .collect())
+    }
+
+    /// Get members coalesced by Nostr identity (multi-device aware).
+    ///
+    /// Returns a map of hex-encoded Nostr pubkeys to their leaf indices.
+    pub fn coalesced_members(
+        &self,
+        mls_group_id: String,
+    ) -> Result<Vec<CoalescedMember>, MdkUniffiError> {
+        let group_id = parse_group_id(&mls_group_id)?;
+        let mdk = self.lock()?;
+        let members = mdk.coalesced_members(&group_id)?;
+
+        Ok(members
+            .into_iter()
+            .map(|(pubkey, leaves)| CoalescedMember {
+                pubkey: pubkey.to_hex(),
+                leaf_indices: leaves,
+            })
+            .collect())
+    }
+
+    /// Get all leaf indices belonging to the local user in a group.
+    pub fn own_device_leaves(&self, mls_group_id: String) -> Result<Vec<u32>, MdkUniffiError> {
+        let group_id = parse_group_id(&mls_group_id)?;
+        let mdk = self.lock()?;
+        Ok(mdk.own_device_leaves(&group_id)?)
+    }
+
+    /// Build a spec-compliant MIP-06 pairing payload for the given groups.
+    ///
+    /// Returns TLS-serialized PairingPayload bytes containing GroupInfo,
+    /// group_event_key, and join_psk for each group.
+    pub fn build_pairing_payload(
+        &self,
+        mls_group_ids: Vec<String>,
+    ) -> Result<Vec<u8>, MdkUniffiError> {
+        let group_ids: Vec<GroupId> = mls_group_ids
+            .iter()
+            .map(|id| parse_group_id(id))
+            .collect::<Result<_, _>>()?;
+
+        let mdk = self.lock()?;
+        let payload = mdk.build_pairing_payload(&group_ids)?;
+        payload
+            .to_bytes()
+            .map_err(|e| MdkUniffiError::Mdk(e.to_string()))
+    }
+
+    /// Join groups via MIP-06 External Commit using a pairing payload.
+    ///
+    /// `pairing_payload_bytes`: TLS-serialized PairingPayload (from build_pairing_payload)
+    /// `nostr_secret_key_hex`: hex-encoded Nostr secret key
+    ///
+    /// Returns one `ExternalCommitGroupOutcome` per group. Each outcome is either
+    /// `Success` with the commit data or `Failure` with an error message. Prior
+    /// successes are preserved even if later groups fail.
+    pub fn join_groups_via_external_commit(
+        &self,
+        pairing_payload_bytes: Vec<u8>,
+        nostr_secret_key_hex: String,
+    ) -> Result<Vec<ExternalCommitGroupOutcome>, MdkUniffiError> {
+        use mdk_core::mip06::PairingPayload;
+
+        let payload = PairingPayload::from_bytes(&pairing_payload_bytes).map_err(|e| {
+            MdkUniffiError::InvalidInput(format!("failed to deserialize pairing payload: {e}"))
+        })?;
+
+        let secret_key = nostr::SecretKey::parse(&nostr_secret_key_hex)
+            .map_err(|e| MdkUniffiError::InvalidInput(format!("invalid secret key: {e}")))?;
+        let keys = nostr::Keys::new(secret_key);
+
+        let mdk = self.lock()?;
+        let mut results = Vec::with_capacity(payload.groups().len());
+        for group_data in payload.groups() {
+            match mdk.join_group_via_external_commit(group_data, &keys) {
+                Ok(result) => {
+                    results.push(ExternalCommitGroupOutcome::Success {
+                        commit_message: result.commit_message,
+                        mls_group_id: hex::encode(result.group_id.as_slice()),
+                        group_event_key: result.group_event_key.as_ref().to_vec(),
+                    });
+                }
+                Err(e) => {
+                    results.push(ExternalCommitGroupOutcome::Failure {
+                        error: e.to_string(),
+                    });
+                }
+            }
+        }
+        Ok(results)
+    }
+
+    /// Register the MIP-06 join PSK for a group's current epoch.
+    ///
+    /// Normally called automatically after epoch changes, but can be called
+    /// manually to ensure the PSK is registered before processing External Commits.
+    pub fn register_join_psk(&self, mls_group_id: String) -> Result<(), MdkUniffiError> {
+        let group_id = parse_group_id(&mls_group_id)?;
+        let mdk = self.lock()?;
+        Ok(mdk.register_join_psk(&group_id)?)
+    }
+}
+
+/// Per-group outcome of joining via MIP-06 External Commit.
+///
+/// Each group in the pairing payload produces either a `Success` with the
+/// commit data needed for publication, or a `Failure` with an error message.
+/// This allows callers to see which groups succeeded without losing prior
+/// successes when a later group fails.
+#[cfg(feature = "mip06")]
+#[derive(uniffi::Enum)]
+pub enum ExternalCommitGroupOutcome {
+    /// Successfully joined this group.
+    Success {
+        /// TLS-serialized External Commit message for publication as kind:445.
+        commit_message: Vec<u8>,
+        /// Hex-encoded MLS group ID that was joined.
+        mls_group_id: String,
+        /// 32-byte MIP-03 group_event_key for outer encryption of the commit event.
+        group_event_key: Vec<u8>,
+    },
+    /// Failed to join this group.
+    Failure {
+        /// Human-readable error message.
+        error: String,
+    },
+}
+
+/// Result of joining a group via MIP-06 External Commit.
+#[cfg(feature = "mip06")]
+#[derive(uniffi::Record)]
+pub struct ExternalCommitJoinResult {
+    /// TLS-serialized External Commit message for publication as kind:445.
+    pub commit_message: Vec<u8>,
+    /// Hex-encoded MLS group ID that was joined.
+    pub mls_group_id: String,
+    /// 32-byte MIP-03 group_event_key for outer encryption of the commit event.
+    pub group_event_key: Vec<u8>,
+}
+
+/// Per-group result for the add-based pairing response flow.
+#[cfg(feature = "mip06")]
+#[derive(uniffi::Record)]
+pub struct DevicePairingGroupResult {
+    /// Hex-encoded MLS group ID.
+    pub mls_group_id: String,
+    /// JSON-serialized unsigned Welcome rumor bytes for this group.
+    pub welcome_rumor: Vec<u8>,
+    /// JSON-serialized commit event bytes for this group.
+    pub commit_event: Vec<u8>,
+}
+
+/// A member identity with all its leaf indices (multi-device)
+#[cfg(feature = "mip06")]
+#[derive(uniffi::Record)]
+pub struct CoalescedMember {
+    /// Hex-encoded Nostr public key
+    pub pubkey: String,
+    /// Leaf indices in the ratchet tree belonging to this identity
+    pub leaf_indices: Vec<u32>,
+}
+
 // ── MIP-04 TryFrom for EncryptedMediaUpload (reverse direction for imeta tag) ─
 
 impl TryFrom<EncryptedMediaUploadResult> for EncryptedMediaUpload {
@@ -2192,6 +2460,15 @@ mod tests {
         let mdk = result.unwrap();
         let groups = mdk.get_groups().unwrap();
         assert_eq!(groups.len(), 0);
+    }
+
+    #[cfg(feature = "mip06")]
+    #[test]
+    fn test_join_groups_via_external_commit_rejects_invalid_pairing_payload_as_invalid_input() {
+        let mdk = create_test_mdk();
+        let result = mdk.join_groups_via_external_commit(vec![0xFF, 0x00], "deadbeef".to_string());
+
+        assert!(matches!(result, Err(MdkUniffiError::InvalidInput(_))));
     }
 
     #[test]
@@ -3854,6 +4131,336 @@ mod tests {
                 "test.bin".to_string(),
             );
             assert!(matches!(result, Err(MdkUniffiError::InvalidInput(_))));
+        }
+    }
+
+    // ── MIP-06 multi-device binding tests ────────────────────────────────────
+
+    #[cfg(feature = "mip06")]
+    mod mip06_tests {
+        use nostr::{EventBuilder, JsonUtil, Keys, Kind, Tag};
+
+        use super::*;
+
+        /// Helper: create an MIP-06 group through the UniFFI binding layer.
+        ///
+        /// Returns `(group_id_hex, creator_keys, member_keys)`.
+        fn create_mip06_group(mdk: &Mdk) -> (String, Keys, Keys) {
+            let creator_keys = Keys::generate();
+            let member_keys = Keys::generate();
+            let relays = vec!["wss://relay.example.com".to_string()];
+
+            let kp_result = mdk
+                .create_key_package_for_event(member_keys.public_key().to_hex(), relays.clone())
+                .unwrap();
+
+            let kp_event = EventBuilder::new(Kind::Custom(30443), kp_result.key_package)
+                .tags(
+                    kp_result
+                        .tags
+                        .into_iter()
+                        .map(|t| Tag::parse(&t).unwrap())
+                        .collect::<Vec<_>>(),
+                )
+                .sign_with_keys(&member_keys)
+                .unwrap();
+
+            let result = mdk
+                .create_group_with_multi_device(
+                    creator_keys.public_key().to_hex(),
+                    vec![kp_event.as_json()],
+                    "MIP-06 Test Group".to_string(),
+                    "MIP-06 Test Description".to_string(),
+                    relays,
+                    vec![creator_keys.public_key().to_hex()],
+                )
+                .unwrap();
+
+            // create_group_with_multi_device produces a pending add-members commit
+            // that must be merged before using the group.
+            mdk.merge_pending_commit(result.group.mls_group_id.clone())
+                .unwrap();
+
+            (result.group.mls_group_id, creator_keys, member_keys)
+        }
+
+        /// Helper: create a regular (non-MIP-06) group through the UniFFI binding layer.
+        ///
+        /// Returns `(group_id_hex, creator_keys)`.
+        fn create_regular_group(mdk: &Mdk) -> (String, Keys) {
+            let creator_keys = Keys::generate();
+            let member_keys = Keys::generate();
+            let relays = vec!["wss://relay.example.com".to_string()];
+
+            let kp_result = mdk
+                .create_key_package_for_event(member_keys.public_key().to_hex(), relays.clone())
+                .unwrap();
+
+            let kp_event = EventBuilder::new(Kind::Custom(30443), kp_result.key_package)
+                .tags(
+                    kp_result
+                        .tags
+                        .into_iter()
+                        .map(|t| Tag::parse(&t).unwrap())
+                        .collect::<Vec<_>>(),
+                )
+                .sign_with_keys(&member_keys)
+                .unwrap();
+
+            let result = mdk
+                .create_group(
+                    creator_keys.public_key().to_hex(),
+                    vec![kp_event.as_json()],
+                    "Regular Group".to_string(),
+                    "Regular Description".to_string(),
+                    relays,
+                    vec![creator_keys.public_key().to_hex()],
+                )
+                .unwrap();
+
+            mdk.merge_pending_commit(result.group.mls_group_id.clone())
+                .unwrap();
+
+            (result.group.mls_group_id, creator_keys)
+        }
+
+        #[test]
+        fn test_create_group_with_multi_device() {
+            let mdk = create_test_mdk();
+            let creator_keys = Keys::generate();
+            let member_keys = Keys::generate();
+            let relays = vec!["wss://relay.example.com".to_string()];
+
+            let kp_result = mdk
+                .create_key_package_for_event(member_keys.public_key().to_hex(), relays.clone())
+                .unwrap();
+
+            let kp_event = EventBuilder::new(Kind::Custom(30443), kp_result.key_package)
+                .tags(
+                    kp_result
+                        .tags
+                        .into_iter()
+                        .map(|t| Tag::parse(&t).unwrap())
+                        .collect::<Vec<_>>(),
+                )
+                .sign_with_keys(&member_keys)
+                .unwrap();
+
+            let result = mdk.create_group_with_multi_device(
+                creator_keys.public_key().to_hex(),
+                vec![kp_event.as_json()],
+                "MIP-06 Group".to_string(),
+                "Multi-device enabled".to_string(),
+                relays,
+                vec![creator_keys.public_key().to_hex()],
+            );
+
+            assert!(result.is_ok(), "create_group_with_multi_device failed");
+            let create_result = result.unwrap();
+            assert!(!create_result.group.mls_group_id.is_empty());
+            assert_eq!(create_result.group.name, "MIP-06 Group");
+            assert_eq!(create_result.group.description, "Multi-device enabled");
+            assert!(!create_result.welcome_rumors_json.is_empty());
+
+            // Merge the pending add-members commit so we can query group state.
+            mdk.merge_pending_commit(create_result.group.mls_group_id.clone())
+                .unwrap();
+
+            // Verify the creator and member are both visible via coalesced_members.
+            let members = mdk
+                .coalesced_members(create_result.group.mls_group_id)
+                .unwrap();
+            assert_eq!(members.len(), 2, "Should have creator + member");
+        }
+
+        #[test]
+        fn test_enable_multi_device() {
+            let mdk = create_test_mdk();
+            let (group_id, _creator_keys) = create_regular_group(&mdk);
+
+            let result = mdk.enable_multi_device(group_id);
+            assert!(result.is_ok(), "enable_multi_device failed: {result:?}");
+
+            let event_json = result.unwrap();
+            // The returned JSON should parse as a valid Nostr event.
+            let event: nostr::Event = serde_json::from_str(&event_json)
+                .expect("enable_multi_device should return valid event JSON");
+            assert_eq!(event.kind, Kind::Custom(445));
+        }
+
+        #[test]
+        fn test_coalesced_members() {
+            let mdk = create_test_mdk();
+            let (group_id, creator_keys, member_keys) = create_mip06_group(&mdk);
+
+            let members = mdk.coalesced_members(group_id).unwrap();
+
+            assert_eq!(members.len(), 2, "Should have 2 distinct identities");
+
+            // Verify both keys appear in the results.
+            let pubkeys: Vec<&str> = members.iter().map(|m| m.pubkey.as_str()).collect();
+            assert!(
+                pubkeys.contains(&creator_keys.public_key().to_hex().as_str()),
+                "Creator should be in coalesced members"
+            );
+            assert!(
+                pubkeys.contains(&member_keys.public_key().to_hex().as_str()),
+                "Member should be in coalesced members"
+            );
+
+            // Each identity has exactly one leaf (one device each).
+            for member in &members {
+                assert_eq!(
+                    member.leaf_indices.len(),
+                    1,
+                    "Each identity should have 1 leaf"
+                );
+            }
+        }
+
+        #[test]
+        fn test_own_device_leaves() {
+            let mdk = create_test_mdk();
+            let creator_keys = Keys::generate();
+            let relays = vec!["wss://relay.example.com".to_string()];
+
+            // Create a group with no additional members so the creator is at leaf 0.
+            let result = mdk
+                .create_group_with_multi_device(
+                    creator_keys.public_key().to_hex(),
+                    vec![],
+                    "Solo Group".to_string(),
+                    "Just the creator".to_string(),
+                    relays,
+                    vec![creator_keys.public_key().to_hex()],
+                )
+                .unwrap();
+
+            let own_leaves = mdk.own_device_leaves(result.group.mls_group_id).unwrap();
+            assert_eq!(own_leaves, vec![0], "Creator should be at leaf index 0");
+        }
+
+        #[test]
+        fn test_build_pairing_payload() {
+            let mdk = create_test_mdk();
+            let (group_id, _creator_keys, _member_keys) = create_mip06_group(&mdk);
+
+            let payload_bytes = mdk.build_pairing_payload(vec![group_id]).unwrap();
+            assert!(
+                !payload_bytes.is_empty(),
+                "Pairing payload should be non-empty"
+            );
+        }
+
+        #[test]
+        fn test_register_join_psk() {
+            let mdk = create_test_mdk();
+            let (group_id, _creator_keys, _member_keys) = create_mip06_group(&mdk);
+
+            // register_join_psk should succeed on a MIP-06-enabled group.
+            let result = mdk.register_join_psk(group_id);
+            assert!(result.is_ok(), "register_join_psk failed: {result:?}");
+        }
+
+        #[test]
+        fn test_register_join_psk_non_mip06_group() {
+            let mdk = create_test_mdk();
+            let (group_id, _creator_keys) = create_regular_group(&mdk);
+
+            // register_join_psk on a non-MIP-06 group is a no-op: should return Ok.
+            let result = mdk.register_join_psk(group_id);
+            assert!(
+                result.is_ok(),
+                "register_join_psk should be a no-op on non-MIP-06 groups: {result:?}"
+            );
+        }
+
+        #[test]
+        fn test_join_groups_via_external_commit() {
+            let device1 = create_test_mdk();
+            let device2 = create_test_mdk();
+            let (group_id, creator_keys, _member_keys) = create_mip06_group(&device1);
+
+            // Device 1 builds the pairing payload.
+            let payload_bytes = device1
+                .build_pairing_payload(vec![group_id.clone()])
+                .unwrap();
+
+            // Device 2 joins via External Commit using the creator's secret key.
+            let outcomes = device2
+                .join_groups_via_external_commit(
+                    payload_bytes,
+                    creator_keys.secret_key().to_secret_hex(),
+                )
+                .unwrap();
+
+            assert_eq!(outcomes.len(), 1, "Should have one outcome per group");
+            match &outcomes[0] {
+                ExternalCommitGroupOutcome::Success {
+                    commit_message,
+                    mls_group_id,
+                    group_event_key,
+                } => {
+                    assert!(
+                        !commit_message.is_empty(),
+                        "Commit message should be non-empty"
+                    );
+                    assert_eq!(
+                        mls_group_id, &group_id,
+                        "Joined group ID should match the original"
+                    );
+                    assert_eq!(
+                        group_event_key.len(),
+                        32,
+                        "group_event_key should be 32 bytes"
+                    );
+                }
+                ExternalCommitGroupOutcome::Failure { error } => {
+                    panic!("Expected Success, got Failure: {error}");
+                }
+            }
+        }
+
+        #[test]
+        fn test_add_device_to_groups() {
+            let mdk = create_test_mdk();
+            let (group_id, creator_keys, _member_keys) = create_mip06_group(&mdk);
+
+            // Create a key package for the "new device" (same identity as creator).
+            let new_device_mdk = create_test_mdk();
+            let relays = vec!["wss://relay.example.com".to_string()];
+            let kp_result = new_device_mdk
+                .create_key_package_for_event(creator_keys.public_key().to_hex(), relays)
+                .unwrap();
+
+            let kp_event = EventBuilder::new(Kind::Custom(30443), kp_result.key_package)
+                .tags(
+                    kp_result
+                        .tags
+                        .into_iter()
+                        .map(|t| Tag::parse(&t).unwrap())
+                        .collect::<Vec<_>>(),
+                )
+                .sign_with_keys(&creator_keys)
+                .unwrap();
+
+            let results = mdk
+                .add_device_to_groups(vec![group_id.clone()], kp_event.as_json())
+                .unwrap();
+
+            assert_eq!(results.len(), 1, "Should have one result per group");
+            assert_eq!(
+                results[0].mls_group_id, group_id,
+                "Result group ID should match"
+            );
+            assert!(
+                !results[0].welcome_rumor.is_empty(),
+                "Welcome rumor bytes should be non-empty"
+            );
+            assert!(
+                !results[0].commit_event.is_empty(),
+                "Commit event bytes should be non-empty"
+            );
         }
     }
 }

@@ -1512,6 +1512,7 @@ dependencies = [
  "blurhash",
  "chacha20poly1305",
  "fast-thumbhash",
+ "getrandom 0.4.1",
  "hex",
  "hkdf",
  "image",
@@ -1533,6 +1534,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "x25519-dalek",
  "zeroize",
 ]
 

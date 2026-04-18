@@ -240,6 +240,21 @@ pub enum Error {
     /// Failed to create epoch snapshot for commit race resolution
     #[error("failed to create epoch snapshot: {0}")]
     SnapshotCreationFailed(String),
+    /// MIP-06: Multi-device signaling gate not satisfied
+    #[cfg(feature = "mip06")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "mip06")))]
+    #[error("multi-device not enabled for this group")]
+    MultiDeviceNotEnabled,
+    /// MIP-06: Device pairing error
+    #[cfg(feature = "mip06")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "mip06")))]
+    #[error("pairing error: {0}")]
+    PairingError(String),
+    /// MIP-06: Nostr identity proof error
+    #[cfg(feature = "mip06")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "mip06")))]
+    #[error("identity proof error: {0}")]
+    IdentityProofError(String),
 }
 
 impl From<FromUtf8Error> for Error {

@@ -843,6 +843,33 @@ mod tests {
     use crate::test_util::create_nostr_group_config_data;
     use crate::tests::create_test_mdk;
 
+    /// Returns the extension tag values that `create_key_package_for_event()`
+    /// advertises via `TAG_EXTENSIONS`. GREASE/default extension IDs (e.g.,
+    /// 0x0002, 0x0003) are excluded — they are injected at runtime and never
+    /// appear in the emitted mls_extensions tag.
+    fn valid_extensions_tag_values() -> Vec<&'static str> {
+        #[cfg(not(feature = "mip06"))]
+        {
+            vec!["0x000a", "0xf2ee"]
+        }
+        #[cfg(feature = "mip06")]
+        {
+            vec!["0x000a", "0xf2ee", "0xf2ef", "0xf2f0"]
+        }
+    }
+
+    /// Returns minimal extension tag values (without GREASE) for manually crafted test events.
+    fn minimal_extensions_tag_values() -> Vec<&'static str> {
+        #[cfg(not(feature = "mip06"))]
+        {
+            vec!["0x000a", "0xf2ee"]
+        }
+        #[cfg(feature = "mip06")]
+        {
+            vec!["0x000a", "0xf2ee", "0xf2ef", "0xf2f0"]
+        }
+    }
+
     #[test]
     fn test_key_package_creation_and_parsing() {
         let mdk = create_test_mdk();
@@ -1038,13 +1065,31 @@ mod tests {
             "Should contain NostrGroupData (0xf2ee)"
         );
 
-        // Verify we have exactly 2 non-default extensions in tags
+        // Verify we have the expected number of non-default extensions in tags
+        #[cfg(not(feature = "mip06"))]
         assert_eq!(
             extension_ids.len(),
             2,
             "Should have 2 extensions in tags (0x000a, 0xf2ee), found: {:?}",
             extension_ids
         );
+        #[cfg(feature = "mip06")]
+        {
+            assert_eq!(
+                extension_ids.len(),
+                4,
+                "Should have 4 extensions in tags (0x000a, 0xf2ee, 0xf2ef, 0xf2f0), found: {:?}",
+                extension_ids
+            );
+            assert!(
+                extension_ids.contains(&"0xf2ef".to_string()),
+                "Should contain DeviceName (0xf2ef)"
+            );
+            assert!(
+                extension_ids.contains(&"0xf2f0".to_string()),
+                "Should contain MultiDevice (0xf2f0)"
+            );
+        }
     }
 
     /// Test that protocol version tag matches Marmot spec (MIP-00)
@@ -1516,10 +1561,7 @@ mod tests {
                 Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
                 Tag::custom(TagKind::Custom("mls_proposals".into()), ["0x000a"]),
                 Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
-                Tag::custom(
-                    TagKind::MlsExtensions,
-                    ["0x0003", "0x000a", "0x0002", "0xf2ee"],
-                ),
+                Tag::custom(TagKind::MlsExtensions, valid_extensions_tag_values()),
             ];
 
             let event = EventBuilder::new(MLS_KEY_PACKAGE_KIND, key_package_hex)
@@ -1555,7 +1597,7 @@ mod tests {
         let tags = vec![
             Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
             Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
-            Tag::custom(TagKind::MlsExtensions, ["0x000a", "0xf2ee"]),
+            Tag::custom(TagKind::MlsExtensions, minimal_extensions_tag_values()),
             Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
             Tag::custom(TagKind::i(), [hex::encode([0xaa; 32])]),
         ];
@@ -1599,7 +1641,7 @@ mod tests {
         let tags = vec![
             Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
             Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
-            Tag::custom(TagKind::MlsExtensions, ["0x000a", "0xf2ee"]),
+            Tag::custom(TagKind::MlsExtensions, minimal_extensions_tag_values()),
             Tag::custom(TagKind::Custom("mls_proposals".into()), ["0x0001"]), // wrong value
             Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
             Tag::custom(TagKind::i(), [hex::encode([0xaa; 32])]),
@@ -1646,10 +1688,7 @@ mod tests {
                 Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
                 Tag::custom(TagKind::Custom("mls_proposals".into()), ["0x000a"]),
                 Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
-                Tag::custom(
-                    TagKind::MlsExtensions,
-                    ["0x0003", "0x000a", "0x0002", "0xf2ee"],
-                ),
+                Tag::custom(TagKind::MlsExtensions, valid_extensions_tag_values()),
                 Tag::relays(vec![]), // Empty relays tag
                 Tag::custom(TagKind::i(), [hex::encode([0xaa; 32])]),
             ];
@@ -1675,10 +1714,7 @@ mod tests {
                 Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
                 Tag::custom(TagKind::Custom("mls_proposals".into()), ["0x000a"]),
                 Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
-                Tag::custom(
-                    TagKind::MlsExtensions,
-                    ["0x0003", "0x000a", "0x0002", "0xf2ee"],
-                ),
+                Tag::custom(TagKind::MlsExtensions, valid_extensions_tag_values()),
                 Tag::custom(TagKind::Relays, ["not-a-valid-url"]),
                 Tag::custom(TagKind::i(), [hex::encode([0xaa; 32])]),
             ];
@@ -1707,10 +1743,7 @@ mod tests {
                 Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
                 Tag::custom(TagKind::Custom("mls_proposals".into()), ["0x000a"]),
                 Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
-                Tag::custom(
-                    TagKind::MlsExtensions,
-                    ["0x0003", "0x000a", "0x0002", "0xf2ee"],
-                ),
+                Tag::custom(TagKind::MlsExtensions, valid_extensions_tag_values()),
                 Tag::custom(TagKind::Relays, ["wss://valid.relay.com", "invalid-url"]),
                 Tag::custom(TagKind::i(), [hex::encode([0xaa; 32])]),
             ];
@@ -1739,10 +1772,7 @@ mod tests {
                 Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
                 Tag::custom(TagKind::Custom("mls_proposals".into()), ["0x000a"]),
                 Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
-                Tag::custom(
-                    TagKind::MlsExtensions,
-                    ["0x0003", "0x000a", "0x0002", "0xf2ee"],
-                ),
+                Tag::custom(TagKind::MlsExtensions, valid_extensions_tag_values()),
                 Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
                 Tag::custom(TagKind::i(), [hex::encode([0xaa; 32])]),
             ];
@@ -1766,10 +1796,7 @@ mod tests {
                 Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
                 Tag::custom(TagKind::Custom("mls_proposals".into()), ["0x000a"]),
                 Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
-                Tag::custom(
-                    TagKind::MlsExtensions,
-                    ["0x0003", "0x000a", "0x0002", "0xf2ee"],
-                ),
+                Tag::custom(TagKind::MlsExtensions, valid_extensions_tag_values()),
                 Tag::relays(vec![
                     RelayUrl::parse("wss://relay1.example.com").unwrap(),
                     RelayUrl::parse("wss://relay2.example.com").unwrap(),
@@ -2094,10 +2121,7 @@ mod tests {
                 Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
                 Tag::custom(TagKind::Custom("mls_proposals".into()), ["0x000a"]),
                 Tag::custom(TagKind::MlsCiphersuite, ["0x0002"]), // Unsupported ciphersuite
-                Tag::custom(
-                    TagKind::MlsExtensions,
-                    ["0x0003", "0x000a", "0x0002", "0xf2ee"],
-                ),
+                Tag::custom(TagKind::MlsExtensions, valid_extensions_tag_values()),
                 Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
                 Tag::custom(TagKind::i(), [hex::encode([0xaa; 32])]),
             ];
@@ -2129,7 +2153,7 @@ mod tests {
                     TagKind::MlsCiphersuite,
                     ["MLS_256_DHKEMX448_CHACHA20POLY1305_SHA512_Ed448"],
                 ), // Invalid format (must be hex like 0x0001)
-                Tag::custom(TagKind::MlsExtensions, ["0x000a", "0xf2ee"]),
+                Tag::custom(TagKind::MlsExtensions, minimal_extensions_tag_values()),
                 Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
                 Tag::custom(TagKind::i(), [hex::encode([0xaa; 32])]),
             ];
@@ -2251,7 +2275,14 @@ mod tests {
                 Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
                 Tag::custom(TagKind::Custom("mls_proposals".into()), ["0x000a"]),
                 Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
-                Tag::custom(TagKind::MlsExtensions, ["0x000A", "0xF2EE"]), // Uppercase hex digits
+                Tag::custom(TagKind::MlsExtensions, {
+                    // Uppercase just the hex part: "0x000a" -> "0x000A"
+                    let v: Vec<String> = minimal_extensions_tag_values()
+                        .into_iter()
+                        .map(|s| format!("0x{}", &s[2..].to_uppercase()))
+                        .collect();
+                    v
+                }),
                 Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
                 Tag::custom(TagKind::i(), [hex::encode([0xaa; 32])]),
             ];
@@ -2275,7 +2306,26 @@ mod tests {
                 Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
                 Tag::custom(TagKind::Custom("mls_proposals".into()), ["0x000a"]),
                 Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
-                Tag::custom(TagKind::MlsExtensions, ["0x000a", "0xF2Ee"]), // Mixed case
+                Tag::custom(TagKind::MlsExtensions, {
+                    // Mix case: lowercase first char, uppercase second (e.g. "0x000A", "0xF2eE")
+                    let v: Vec<String> = minimal_extensions_tag_values()
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, s)| {
+                            let hex_part = &s[2..];
+                            if i % 2 == 0 {
+                                // Even index: uppercase last char
+                                let (head, tail) = hex_part.split_at(hex_part.len() - 1);
+                                format!("0x{}{}", head, tail.to_uppercase())
+                            } else {
+                                // Odd index: uppercase first char, lowercase rest
+                                let (head, tail) = hex_part.split_at(1);
+                                format!("0x{}{}", head.to_uppercase(), tail.to_lowercase())
+                            }
+                        })
+                        .collect();
+                    v
+                }),
                 Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
                 Tag::custom(TagKind::i(), [hex::encode([0xaa; 32])]),
             ];
@@ -2316,7 +2366,7 @@ mod tests {
             Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
             Tag::custom(TagKind::Custom("mls_proposals".into()), ["0x000a"]),
             Tag::custom(TagKind::MlsCiphersuite, Vec::<&str>::new()), // No value
-            Tag::custom(TagKind::MlsExtensions, ["0x000a", "0xf2ee"]),
+            Tag::custom(TagKind::MlsExtensions, minimal_extensions_tag_values()),
             Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
             Tag::custom(TagKind::i(), [hex::encode([0xaa; 32])]),
         ];
@@ -2883,7 +2933,7 @@ mod tests {
             Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
             Tag::custom(TagKind::Custom("mls_proposals".into()), ["0x000a"]),
             Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
-            Tag::custom(TagKind::MlsExtensions, ["0x000a", "0xf2ee"]),
+            Tag::custom(TagKind::MlsExtensions, minimal_extensions_tag_values()),
             Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
         ];
 
@@ -2924,7 +2974,7 @@ mod tests {
             Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
             Tag::custom(TagKind::Custom("mls_proposals".into()), ["0x000a"]),
             Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
-            Tag::custom(TagKind::MlsExtensions, ["0x000a", "0xf2ee"]),
+            Tag::custom(TagKind::MlsExtensions, minimal_extensions_tag_values()),
             Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
             Tag::custom(TagKind::i(), ["not-valid-hex!@#"]),
         ];
@@ -2969,7 +3019,7 @@ mod tests {
             Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
             Tag::custom(TagKind::Custom("mls_proposals".into()), ["0x000a"]),
             Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
-            Tag::custom(TagKind::MlsExtensions, ["0x000a", "0xf2ee"]),
+            Tag::custom(TagKind::MlsExtensions, minimal_extensions_tag_values()),
             Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
             Tag::custom(TagKind::i(), Vec::<&str>::new()),
         ];
@@ -3011,7 +3061,7 @@ mod tests {
             Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
             Tag::custom(TagKind::Custom("mls_proposals".into()), ["0x000a"]),
             Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
-            Tag::custom(TagKind::MlsExtensions, ["0x000a", "0xf2ee"]),
+            Tag::custom(TagKind::MlsExtensions, minimal_extensions_tag_values()),
             Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
             Tag::custom(
                 TagKind::i(),
@@ -3257,7 +3307,7 @@ mod tests {
             Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
             Tag::custom(TagKind::Custom("mls_proposals".into()), ["0x000a"]),
             Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
-            Tag::custom(TagKind::MlsExtensions, ["0x000a", "0xf2ee"]),
+            Tag::custom(TagKind::MlsExtensions, minimal_extensions_tag_values()),
             Tag::relays(vec![RelayUrl::parse("wss://relay.example.com").unwrap()]),
             Tag::custom(TagKind::i(), [""]),
         ];

@@ -51,9 +51,32 @@ where
         event: &Event,
         staged_commit: StagedCommit,
         commit_sender: &Sender,
+        authenticated_data: &[u8],
     ) -> Result<()> {
         self.validate_commit_authorization(mls_group, &staged_commit, commit_sender)?;
         self.validate_commit_identities(mls_group, &staged_commit, commit_sender)?;
+
+        // MIP-06: verify Nostr identity proof for External Commits
+        #[cfg(feature = "mip06")]
+        if matches!(commit_sender, Sender::NewMemberCommit) {
+            self.validate_external_commit_identity_proof(
+                mls_group,
+                &staged_commit,
+                authenticated_data,
+            )?;
+        }
+
+        // For non-MIP-06 commits, authenticated_data MUST be empty per MIP-06 spec.
+        #[cfg(feature = "mip06")]
+        if !matches!(commit_sender, Sender::NewMemberCommit) && !authenticated_data.is_empty() {
+            tracing::warn!(
+                target: "mdk_core::messages::process_commit",
+                "Non-External Commit has non-empty authenticated_data ({} bytes)",
+                authenticated_data.len()
+            );
+        }
+
+        let _ = authenticated_data; // suppress unused warning when mip06 feature is off
 
         let group_id: GroupId = mls_group.group_id().into();
 
@@ -111,6 +134,12 @@ where
 
         // Sync the stored group metadata with the updated MLS group state
         self.sync_group_metadata_from_mls(&group_id)?;
+
+        // Register MIP-06 join PSK for the new epoch so we can process incoming External Commits
+        #[cfg(feature = "mip06")]
+        {
+            self.register_join_psk(&group_id)?;
+        }
 
         // Save a processed message so we don't reprocess
         let processed_message = super::create_processed_message_record(

@@ -12,15 +12,26 @@
 //! relay-based message routing and group discovery.
 
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(feature = "mip06")]
+use std::fmt;
 
 use mdk_storage_traits::GroupId;
 use mdk_storage_traits::MdkStorageProvider;
+#[cfg(feature = "mip06")]
+use mdk_storage_traits::Secret;
 use mdk_storage_traits::groups::types as group_types;
 use mdk_storage_traits::messages::types as message_types;
 use nostr::prelude::*;
 use openmls::prelude::*;
+#[cfg(feature = "mip06")]
+use openmls::schedule::psk::{ExternalPsk, PreSharedKeyId, Psk};
+#[cfg(feature = "mip06")]
+use openmls::treesync::LeafNodeSource;
 use openmls_basic_credential::SignatureKeyPair;
 use tls_codec::Serialize as TlsSerialize;
+
+#[cfg(feature = "mip06")]
+use crate::mip06::{GroupPairingDataV1, GroupWelcomeData, MarmotMultiDevice};
 
 use sha2::{Digest, Sha256};
 
@@ -49,6 +60,28 @@ pub struct UpdateGroupResult {
     pub welcome_rumors: Option<Vec<UnsignedEvent>>,
     /// The MLS group ID this update applies to
     pub mls_group_id: GroupId,
+}
+
+/// Result of joining a group via MIP-06 External Commit.
+#[cfg(feature = "mip06")]
+pub struct ExternalCommitResult {
+    /// TLS-serialized External Commit message for publication as `kind: 445`.
+    pub commit_message: Vec<u8>,
+    /// The MLS group ID that was joined.
+    pub group_id: GroupId,
+    /// The 32-byte MIP-03 group_event_key for outer encryption of the commit event.
+    pub group_event_key: Secret<[u8; 32]>,
+}
+
+#[cfg(feature = "mip06")]
+impl fmt::Debug for ExternalCommitResult {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ExternalCommitResult")
+            .field("commit_message", &self.commit_message)
+            .field("group_id", &"<redacted>")
+            .field("group_event_key", &"<redacted>")
+            .finish()
+    }
 }
 
 /// Configuration data for the Group
@@ -445,6 +478,105 @@ where
         self.derive_exporter_secret_for_group(group_id, &group, "marmot", b"encrypted-media")
     }
 
+    /// Extract TLS-serialized GroupContext from an MLS group via the GroupInfo path.
+    ///
+    /// OpenMLS does not expose `GroupContext` directly (it's behind `test-utils`),
+    /// so we export GroupInfo, then TLS-deserialize GroupContext from it.
+    ///
+    /// The MlsMessage wire format is: version (u16) + wire_format discriminant (u16) +
+    /// GroupInfoTBS body, where GroupInfoTBS starts with GroupContext. So we parse
+    /// GroupContext from offset 4.
+    #[cfg(feature = "mip06")]
+    pub(crate) fn export_group_context_bytes(
+        &self,
+        mls_group: &MlsGroup,
+    ) -> Result<Vec<u8>, Error> {
+        let signer = self.load_mls_signer(mls_group)?;
+        let group_info_msg = mls_group
+            .export_group_info(self.provider.crypto(), &signer, false)
+            .map_err(|e| Error::PairingError(format!("failed to export GroupInfo: {e}")))?;
+
+        let gi_bytes = group_info_msg.tls_serialize_detached().map_err(|e| {
+            Error::PairingError(format!("failed to serialize GroupInfo message: {e}"))
+        })?;
+
+        // MlsMessage header: version (2 bytes) + wire_format (2 bytes) = 4 bytes.
+        // GroupInfoTBS starts at offset 4, and its first field is GroupContext.
+        if gi_bytes.len() < 5 {
+            return Err(Error::PairingError(
+                "GroupInfo message too short".to_string(),
+            ));
+        }
+        let (group_context, _) =
+            GroupContext::tls_deserialize_bytes(&gi_bytes[4..]).map_err(|e| {
+                Error::PairingError(format!("failed to parse GroupContext from GroupInfo: {e}"))
+            })?;
+
+        group_context
+            .tls_serialize_detached()
+            .map_err(|e| Error::PairingError(format!("failed to serialize GroupContext: {e}")))
+    }
+
+    /// Derives and returns the MIP-06 join PSK ID and raw PSK bytes for a group.
+    ///
+    /// ```text
+    /// join_psk_id = TLS-serialize(MarmotMultiDeviceJoinPskId { label, SHA-256(GroupContext) })
+    /// join_psk = MLS-Exporter("marmot-mip06-join-psk-v1", join_psk_id, KDF.Nh)
+    /// ```
+    #[cfg(feature = "mip06")]
+    fn derive_join_psk_with_id(
+        &self,
+        mls_group: &MlsGroup,
+    ) -> Result<(crate::mip06::JoinPskId, Vec<u8>), Error> {
+        let group_context_bytes = self.export_group_context_bytes(mls_group)?;
+        let join_psk_id = crate::mip06::JoinPskId::from_group_context_bytes(&group_context_bytes);
+        let join_psk_id_bytes = join_psk_id.to_bytes()?;
+
+        let kdf_nh = mls_group.ciphersuite().hash_length();
+
+        let join_psk = mls_group
+            .export_secret(
+                self.provider.crypto(),
+                crate::mip06::JOIN_PSK_EXPORTER_LABEL,
+                &join_psk_id_bytes,
+                kdf_nh,
+            )
+            .map_err(|e| Error::PairingError(format!("failed to derive join PSK: {e}")))?;
+
+        Ok((join_psk_id, join_psk.to_vec()))
+    }
+
+    /// Derives the MIP-06 join PSK for an MLS group (raw bytes only).
+    #[cfg(feature = "mip06")]
+    fn derive_join_psk(&self, mls_group: &MlsGroup) -> Result<Vec<u8>, Error> {
+        self.derive_join_psk_with_id(mls_group).map(|(_, psk)| psk)
+    }
+
+    #[cfg(feature = "mip06")]
+    fn rollback_pairing_group_adds(
+        &self,
+        successful_group_ids: &[GroupId],
+        original_error: Error,
+    ) -> Error {
+        let mut cleanup_errors = Vec::new();
+
+        for group_id in successful_group_ids.iter().rev() {
+            if let Err(err) = self.clear_pending_commit(group_id) {
+                cleanup_errors.push(err.to_string());
+            }
+        }
+
+        if cleanup_errors.is_empty() {
+            original_error
+        } else {
+            Error::PairingError(format!(
+                "add_device_to_groups failed and rollback failed: {}; original error: {}",
+                cleanup_errors.join("; "),
+                original_error
+            ))
+        }
+    }
+
     /// Retrieves a MDK group by its MLS group ID
     ///
     /// # Arguments
@@ -505,6 +637,45 @@ where
     pub fn get_members(&self, group_id: &GroupId) -> Result<BTreeSet<PublicKey>, Error> {
         let group = self.load_mls_group(group_id)?.ok_or(Error::GroupNotFound)?;
         self.live_member_identities(&group)
+    }
+
+    /// Returns members coalesced by Nostr identity, grouping all leaf indices
+    /// belonging to the same pubkey (multi-device).
+    ///
+    /// Each entry maps a Nostr pubkey to all its leaf indices in the group.
+    #[cfg(feature = "mip06")]
+    pub fn coalesced_members(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<BTreeMap<PublicKey, Vec<u32>>, Error> {
+        let leaf_map = self.group_leaf_map(group_id)?;
+        let mut result: BTreeMap<PublicKey, Vec<u32>> = BTreeMap::new();
+        for (index, pubkey) in leaf_map {
+            result.entry(pubkey).or_default().push(index);
+        }
+        Ok(result)
+    }
+
+    /// Returns all leaf indices in the group that share the local user's Nostr pubkey.
+    #[cfg(feature = "mip06")]
+    pub fn own_device_leaves(&self, group_id: &GroupId) -> Result<Vec<u32>, Error> {
+        let group = self.load_mls_group(group_id)?.ok_or(Error::GroupNotFound)?;
+        let own_pubkey = self.get_own_pubkey(&group)?;
+
+        // Build the coalesced map inline from the already-loaded group to avoid
+        // a redundant storage round-trip through coalesced_members → group_leaf_map.
+        let mut coalesced: BTreeMap<PublicKey, Vec<u32>> = BTreeMap::new();
+        for member in group.members() {
+            let credentials: BasicCredential = BasicCredential::try_from(member.credential)?;
+            let identity_bytes: &[u8] = credentials.identity();
+            let public_key = self.parse_credential_identity(identity_bytes)?;
+            coalesced
+                .entry(public_key)
+                .or_default()
+                .push(member.index.u32());
+        }
+
+        Ok(coalesced.remove(&own_pubkey).unwrap_or_default())
     }
 
     /// Returns the local member's current MLS leaf index for a group.
@@ -1172,36 +1343,81 @@ where
         member_key_package_events: Vec<Event>,
         config: NostrGroupConfigData,
     ) -> Result<GroupResult, Error> {
-        // Get member pubkeys
-        let member_pubkeys = member_key_package_events
-            .clone()
-            .into_iter()
-            .map(|e| e.pubkey)
-            .collect::<Vec<PublicKey>>();
+        let group_data = Self::build_group_data_from_config(&config)?;
+        let extension = Self::get_unknown_extension_from_group_data(&group_data)?;
+        let required_caps = self.required_capabilities_extension();
+        let extensions = Extensions::from_vec(vec![extension, required_caps])?;
 
-        let admins = config.admins.clone();
+        self.create_group_inner(
+            creator_public_key,
+            member_key_package_events,
+            config,
+            group_data,
+            extensions,
+        )
+    }
 
-        // Validate group members
-        self.validate_group_members(creator_public_key, &member_pubkeys, &admins)?;
+    /// Create a group with MIP-06 multi-device support enabled from the start.
+    ///
+    /// This adds the `marmot_multi_device` extension (`0xF2F0`) to GroupContext.extensions
+    /// and includes `0xF2F0` in required_capabilities. All members added at creation time
+    /// must advertise `0xF2F0` in their KeyPackage capabilities.
+    #[cfg(feature = "mip06")]
+    pub fn create_group_with_multi_device(
+        &self,
+        creator_public_key: &PublicKey,
+        member_key_package_events: Vec<Event>,
+        config: NostrGroupConfigData,
+    ) -> Result<GroupResult, Error> {
+        let group_data = Self::build_group_data_from_config(&config)?;
+        let nostr_ext = Self::get_unknown_extension_from_group_data(&group_data)?;
+        let multi_device_ext = MarmotMultiDevice::new().as_extension()?;
+        let required_caps = self.required_capabilities_extension_with_multi_device();
+        let extensions = Extensions::from_vec(vec![nostr_ext, multi_device_ext, required_caps])?;
 
-        let (credential, signer) = self.generate_credential_with_key(creator_public_key)?;
+        self.create_group_inner(
+            creator_public_key,
+            member_key_package_events,
+            config,
+            group_data,
+            extensions,
+        )
+    }
 
-        let group_data = NostrGroupDataExtension::new(
-            config.name,
-            config.description,
-            admins,
+    /// Build a `NostrGroupDataExtension` from config (shared by create_group variants).
+    fn build_group_data_from_config(
+        config: &NostrGroupConfigData,
+    ) -> Result<NostrGroupDataExtension, Error> {
+        Ok(NostrGroupDataExtension::new(
+            config.name.clone(),
+            config.description.clone(),
+            config.admins.clone(),
             config.relays.clone(),
             config.image_hash,
             config.image_key,
             config.image_nonce,
-            None, // image_upload_key - will be set when image is uploaded
-        );
+            None,
+        ))
+    }
 
-        let extension = Self::get_unknown_extension_from_group_data(&group_data)?;
-        let required_capabilities_extension = self.required_capabilities_extension();
-        let extensions = Extensions::from_vec(vec![extension, required_capabilities_extension])?;
+    /// Shared group creation logic used by both `create_group` and
+    /// `create_group_with_multi_device`.
+    fn create_group_inner(
+        &self,
+        creator_public_key: &PublicKey,
+        member_key_package_events: Vec<Event>,
+        config: NostrGroupConfigData,
+        group_data: NostrGroupDataExtension,
+        extensions: Extensions<openmls::prelude::GroupContext>,
+    ) -> Result<GroupResult, Error> {
+        let member_pubkeys: Vec<PublicKey> =
+            member_key_package_events.iter().map(|e| e.pubkey).collect();
 
-        // Build the group config
+        let admins = config.admins.clone();
+        self.validate_group_members(creator_public_key, &member_pubkeys, &admins)?;
+
+        let (credential, signer) = self.generate_credential_with_key(creator_public_key)?;
+
         let capabilities = self.capabilities();
         let sender_ratchet_config = SenderRatchetConfiguration::new(
             self.config.out_of_order_tolerance,
@@ -1222,64 +1438,32 @@ where
 
         let mut key_packages_vec: Vec<KeyPackage> = Vec::new();
         for event in &member_key_package_events {
-            // TODO: Error handling for failure here
             let key_package: KeyPackage = self.parse_key_package(event)?;
             key_packages_vec.push(key_package);
         }
 
-        // Handle member addition and welcome message creation
-        // For single-member groups (no additional members), we skip adding members
-        // and return an empty welcome_rumors vec
         let welcome_rumors = if key_packages_vec.is_empty() {
-            // Single-member group: no members to add, no welcome messages needed
             Vec::new()
         } else {
-            // Add members to the group
             let (_, welcome_out, _group_info) =
                 mls_group.add_members(&self.provider, &signer, &key_packages_vec)?;
 
-            // IMPORTANT: Privacy-preserving group creation
-            //
-            // We intentionally DO NOT publish the initial commit to relays. Instead, we:
-            // 1. Merge the pending commit locally (immediately below)
-            // 2. Send Welcome messages directly to invited members
-            //
-            // This differs from the MLS specification (RFC 9420), which recommends waiting
-            // for Delivery Service confirmation before applying commits. However, that
-            // guidance assumes a centralized Delivery Service model.
-            //
-            // For initial group creation with Nostr relays, not publishing the commit is
-            // the correct choice for security and privacy reasons:
-            //
-            // - PRIVACY: Publishing the commit would expose additional metadata on relays
-            //   (timing, event patterns, correlation opportunities) with no functional benefit
-            // - SECURITY: Invited members receive complete group state via Welcome messages;
-            //   they do not need the commit to join the group
-            // - NO RACE CONDITIONS: At creation time, only the creator exists in the group,
-            //   so there are no other members who need to process this commit
-            //
-            // This approach minimizes observable events on relays while maintaining full
-            // MLS security properties. The Welcome messages contain all cryptographic
-            // material needed for invitees to participate in the group.
-            //
-            // NOTE: This is specific to initial group creation. For commits in established
-            // groups (adding/removing members, updates), commits MUST be published to relays
-            // so existing members can process them and stay in sync.
+            // Privacy-preserving: don't publish initial commit to relays.
+            // Invited members get full state via Welcome messages.
+            // See create_group doc comment for detailed rationale.
             mls_group.merge_pending_commit(&self.provider)?;
 
-            // Serialize the welcome message and send it to the members
-            let serialized_welcome_message = welcome_out.tls_serialize_detached()?;
+            let serialized_welcome = welcome_out.tls_serialize_detached()?;
 
             self.build_welcome_rumors_for_key_packages(
                 &mls_group,
-                serialized_welcome_message,
+                serialized_welcome,
                 member_key_package_events,
                 &config.relays,
             )?
             .ok_or(Error::Welcome("Error creating welcome rumors".to_string()))?
         };
 
-        // Save the NostrMLS Group
         let group = group_types::Group {
             mls_group_id: mls_group.group_id().clone().into(),
             nostr_group_id: group_data.nostr_group_id,
@@ -1301,7 +1485,6 @@ where
             |e: mdk_storage_traits::groups::error::GroupError| Error::Group(e.to_string()),
         )?;
 
-        // Save the group relays after saving the group
         self.storage()
             .replace_group_relays(&group.mls_group_id, config.relays.into_iter().collect())
             .map_err(|e| Error::Group(e.to_string()))?;
@@ -1310,6 +1493,486 @@ where
             group,
             welcome_rumors,
         })
+    }
+
+    /// Enable MIP-06 multi-device support on an existing group.
+    ///
+    /// This is a staged operation: all current members must already advertise `0xF2F0`
+    /// in their LeafNode capabilities before calling this. The caller (admin) commits
+    /// a GroupContextExtensions proposal that adds `marmot_multi_device` and requires
+    /// `0xF2F0`.
+    ///
+    /// # Pending Commit Lifecycle
+    ///
+    /// This method generates a pending commit but does **not** merge it. The caller
+    /// must follow this sequence:
+    ///
+    /// 1. Publish the returned `Event` to relays.
+    /// 2. Call [`merge_pending_commit`](Self::merge_pending_commit) to advance local state.
+    ///
+    /// The pending commit is persisted through the OpenMLS provider, so it survives
+    /// crashes. If the process restarts before step 2, call `merge_pending_commit`
+    /// on recovery. **No other group operations should be performed between steps 1
+    /// and 2** — they will fail because a pending commit is outstanding. This is the
+    /// same lifecycle as `add_members` and `remove_members`.
+    #[cfg(feature = "mip06")]
+    pub fn enable_multi_device(&self, group_id: &GroupId) -> Result<Event, Error> {
+        let mut mls_group = self.load_mls_group(group_id)?.ok_or(Error::GroupNotFound)?;
+        let signer = self.load_mls_signer(&mls_group)?;
+
+        // Check if current user is an admin
+        let own_leaf = mls_group.own_leaf().ok_or(Error::OwnLeafNotFound)?;
+        if !self.is_leaf_node_admin(&mls_group.group_id().into(), own_leaf)? {
+            return Err(Error::Group(
+                "Only group admins can enable multi-device".to_string(),
+            ));
+        }
+
+        if crate::mip06::is_multi_device_enabled(&mls_group) {
+            return Err(Error::Group(
+                "multi-device is already enabled for this group".to_string(),
+            ));
+        }
+
+        // OpenMLS enforces required_capabilities at commit time — if any member
+        // doesn't advertise 0xF2F0, update_group_context_extensions will fail.
+        if mls_group.members().next().is_none() {
+            return Err(Error::Group(
+                "cannot enable MIP-06: group has no members".to_string(),
+            ));
+        }
+
+        let mut extensions = mls_group.extensions().clone();
+        let multi_device_ext = MarmotMultiDevice::new().as_extension()?;
+        extensions.add_or_replace(multi_device_ext)?;
+        extensions.add_or_replace(self.required_capabilities_extension_with_multi_device())?;
+
+        let (commit_message, _, _group_info) =
+            mls_group.update_group_context_extensions(&self.provider, extensions, &signer)?;
+
+        let serialized_commit = commit_message.tls_serialize_detached()?;
+        let commit_event = self.build_message_event(group_id, serialized_commit, None)?;
+
+        self.track_processed_message(
+            commit_event.id,
+            &mls_group,
+            message_types::ProcessedMessageState::ProcessedCommit,
+        )?;
+
+        Ok(commit_event)
+    }
+
+    /// Add a new device to multiple groups (existing device, Phase 2 of pairing).
+    ///
+    /// For each group ID, the existing device:
+    /// 1. Adds the new device's KeyPackage via standard `add_members()`
+    /// 2. Collects the Welcome message and commit event
+    ///
+    /// Returns a `DevicePairingResponse` containing Welcome data for each group,
+    /// plus the commit events that should be published to relays.
+    ///
+    /// NOTE: This does NOT merge pending commits. The caller must publish the
+    /// commit events and call `merge_pending_commit()` for each group after
+    /// successful relay publish.
+    #[cfg(feature = "mip06")]
+    pub fn add_device_to_groups(
+        &self,
+        group_ids: &[GroupId],
+        key_package_event: &Event,
+    ) -> Result<crate::mip06::DevicePairingResponse, Error> {
+        let mut group_welcomes = Vec::with_capacity(group_ids.len());
+        let mut successful_group_ids = Vec::with_capacity(group_ids.len());
+
+        for group_id in group_ids {
+            let result = match self.add_members(group_id, std::slice::from_ref(key_package_event)) {
+                Ok(result) => result,
+                Err(err) => {
+                    return Err(self.rollback_pairing_group_adds(&successful_group_ids, err));
+                }
+            };
+            successful_group_ids.push(group_id.clone());
+
+            let commit_event_json = result.evolution_event.as_json().into_bytes();
+            let welcome_rumor = match result
+                .welcome_rumors
+                .and_then(|rumors| rumors.into_iter().next())
+            {
+                Some(welcome_rumor) => welcome_rumor,
+                None => {
+                    return Err(self.rollback_pairing_group_adds(
+                        &successful_group_ids,
+                        Error::PairingError("add_members produced no Welcome rumor".to_string()),
+                    ));
+                }
+            };
+
+            let welcome_rumor_json = welcome_rumor.as_json().into_bytes();
+
+            group_welcomes.push(GroupWelcomeData::new(welcome_rumor_json, commit_event_json));
+        }
+
+        Ok(crate::mip06::DevicePairingResponse::new(group_welcomes))
+    }
+
+    /// Register the MIP-06 join PSK for a group as an External PSK in the provider.
+    ///
+    /// Existing members must call this after every epoch change in MIP-06-enabled groups
+    /// so that OpenMLS can verify External Commits from new devices. The PSK is derived
+    /// from the current epoch's exporter secret and registered under a deterministic ID
+    /// built from the GroupContext hash.
+    ///
+    /// If the group does not have MIP-06 enabled, this is a no-op.
+    #[cfg(feature = "mip06")]
+    pub fn register_join_psk(&self, group_id: &GroupId) -> Result<(), Error> {
+        let mls_group = self.load_mls_group(group_id)?.ok_or(Error::GroupNotFound)?;
+
+        if !crate::mip06::is_multi_device_enabled(&mls_group) {
+            return Ok(());
+        }
+
+        let (join_psk_id, join_psk_bytes) = self.derive_join_psk_with_id(&mls_group)?;
+        let join_psk_id_bytes = join_psk_id.to_bytes()?;
+
+        // Delete any existing PSK with this ID to prevent accumulation on re-registration.
+        let _ = self
+            .provider
+            .storage()
+            .delete_psk(&Psk::External(ExternalPsk::new(join_psk_id_bytes.clone())));
+
+        let psk = Psk::External(ExternalPsk::new(join_psk_id_bytes));
+        let psk_id = PreSharedKeyId::new(mls_group.ciphersuite(), self.provider.rand(), psk)
+            .map_err(|e| Error::PairingError(format!("failed to create PreSharedKeyId: {e}")))?;
+
+        psk_id
+            .store(&self.provider, &join_psk_bytes)
+            .map_err(|e| Error::PairingError(format!("failed to store join PSK: {e}")))?;
+
+        tracing::debug!(
+            target: "mdk_core::groups::register_join_psk",
+            epoch = mls_group.epoch().as_u64(),
+            "Registered MIP-06 join PSK for epoch"
+        );
+
+        Ok(())
+    }
+
+    /// Build a spec-compliant MIP-06 `PairingPayload` for the given groups.
+    ///
+    /// For each group, extracts:
+    /// - `GroupInfo` (with `external_pub` and `ratchet_tree` extensions)
+    /// - Current epoch `group_event_key` (MIP-03 outer encryption key)
+    /// - Current epoch `join_psk` (exporter-derived External PSK)
+    ///
+    /// The returned payload is the plaintext to be encrypted via the pairing
+    /// crypto channel before transfer to the new device.
+    #[cfg(feature = "mip06")]
+    pub fn build_pairing_payload(
+        &self,
+        group_ids: &[GroupId],
+    ) -> Result<crate::mip06::PairingPayload, Error> {
+        let mut groups = Vec::with_capacity(group_ids.len());
+
+        for group_id in group_ids {
+            let mls_group = self.load_mls_group(group_id)?.ok_or(Error::GroupNotFound)?;
+            let signer = self.load_mls_signer(&mls_group)?;
+
+            if !crate::mip06::is_multi_device_enabled(&mls_group) {
+                return Err(Error::MultiDeviceNotEnabled);
+            }
+
+            let group_info_msg = mls_group
+                .export_group_info(self.provider.crypto(), &signer, true)
+                .map_err(|e| Error::PairingError(format!("failed to export GroupInfo: {e}")))?;
+            let group_info_bytes = group_info_msg
+                .tls_serialize_detached()
+                .map_err(|e| Error::PairingError(format!("failed to serialize GroupInfo: {e}")))?;
+
+            let exporter_secret = self.derive_exporter_secret_for_group(
+                group_id,
+                &mls_group,
+                "marmot",
+                b"group-event",
+            )?;
+            let group_event_key: [u8; 32] = *exporter_secret.secret.as_ref();
+
+            let join_psk_bytes = self.derive_join_psk(&mls_group)?;
+
+            groups.push(GroupPairingDataV1::new(
+                group_event_key,
+                join_psk_bytes,
+                group_info_bytes,
+            )?);
+        }
+
+        crate::mip06::PairingPayload::new(groups)
+    }
+
+    /// Join a group via MIP-06 External Commit using data from a pairing payload.
+    ///
+    /// The new device:
+    /// 1. Parses GroupInfo from the pairing data
+    /// 2. Registers the join PSK as an External PSK
+    /// 3. Constructs a Nostr identity proof and sets it as AAD
+    /// 4. Constructs an External Commit with ExternalInit + join PSK proposal
+    /// 5. Returns the commit message bundle and group_event_key
+    #[cfg(feature = "mip06")]
+    pub fn join_group_via_external_commit(
+        &self,
+        pairing_data: &crate::mip06::GroupPairingDataV1,
+        nostr_keys: &nostr::Keys,
+    ) -> Result<ExternalCommitResult, Error> {
+        let gi_bytes = pairing_data.group_info();
+        let (msg_in, remainder) =
+            <MlsMessageIn as tls_codec::DeserializeBytes>::tls_deserialize_bytes(gi_bytes)
+                .map_err(|e| {
+                    Error::PairingError(format!("failed to deserialize GroupInfo: {e}"))
+                })?;
+        if !remainder.is_empty() {
+            return Err(Error::PairingError(
+                "trailing bytes after GroupInfo".to_string(),
+            ));
+        }
+        let vgi = match msg_in.extract() {
+            MlsMessageBodyIn::GroupInfo(vgi) => vgi,
+            _ => {
+                return Err(Error::PairingError(
+                    "pairing data does not contain GroupInfo".to_string(),
+                ));
+            }
+        };
+
+        let ciphersuite = vgi.ciphersuite();
+
+        // Extract GroupContext from GroupInfo: MlsMessage header is 4 bytes,
+        // then GroupInfoTBS starts with GroupContext.
+        if gi_bytes.len() < 5 {
+            return Err(Error::PairingError("GroupInfo too short".to_string()));
+        }
+        let gc_payload = &gi_bytes[4..];
+        let (group_context, remainder) =
+            <GroupContext as tls_codec::DeserializeBytes>::tls_deserialize_bytes(gc_payload)
+                .map_err(|e| {
+                    Error::PairingError(format!("failed to parse GroupContext from GroupInfo: {e}"))
+                })?;
+        // Slice out the consumed GroupContext bytes directly — avoids re-serialization.
+        let gc_bytes = &gc_payload[..gc_payload.len() - remainder.len()];
+
+        if crate::mip06::MarmotMultiDevice::from_group_context(&group_context)?.is_none() {
+            return Err(Error::PairingError(
+                "GroupInfo is missing marmot_multi_device signaling".to_string(),
+            ));
+        }
+
+        let multi_device_ext = ExtensionType::Unknown(crate::constant::MULTI_DEVICE_EXTENSION_TYPE);
+        let required_caps = group_context
+            .extensions()
+            .required_capabilities()
+            .ok_or_else(|| {
+                Error::PairingError("GroupInfo is missing required_capabilities".to_string())
+            })?;
+        if !required_caps.extension_types().contains(&multi_device_ext) {
+            return Err(Error::PairingError(
+                "required_capabilities must include 0xF2F0".to_string(),
+            ));
+        }
+
+        let ratchet_tree = vgi.extensions().ratchet_tree().ok_or_else(|| {
+            Error::PairingError("GroupInfo is missing ratchet_tree extension".to_string())
+        })?;
+        let _external_pub = vgi.extensions().external_pub().ok_or_else(|| {
+            Error::PairingError("GroupInfo is missing external_pub extension".to_string())
+        })?;
+
+        #[derive(tls_codec::TlsDeserialize, tls_codec::TlsDeserializeBytes, tls_codec::TlsSize)]
+        struct LeafNodeView {
+            encryption_key: tls_codec::VLBytes,
+            signature_key: tls_codec::VLBytes,
+            credential: Credential,
+            capabilities: Capabilities,
+            leaf_node_source: LeafNodeSource,
+            extensions: Extensions<LeafNode>,
+            signature: tls_codec::VLBytes,
+        }
+
+        #[derive(tls_codec::TlsDeserialize, tls_codec::TlsDeserializeBytes, tls_codec::TlsSize)]
+        struct ParentNodeView {
+            encryption_key: tls_codec::VLBytes,
+            parent_hash: tls_codec::VLBytes,
+            unmerged_leaves: Vec<LeafNodeIndex>,
+        }
+
+        #[derive(tls_codec::TlsDeserialize, tls_codec::TlsDeserializeBytes, tls_codec::TlsSize)]
+        #[repr(u8)]
+        enum RatchetNodeView {
+            #[tls_codec(discriminant = 1)]
+            LeafNode(Box<LeafNodeView>),
+            #[tls_codec(discriminant = 2)]
+            ParentNode(Box<ParentNodeView>),
+        }
+
+        let verified_tree = ratchet_tree
+            .ratchet_tree()
+            .clone()
+            .into_verified(
+                ciphersuite,
+                self.provider.crypto(),
+                group_context.group_id(),
+            )
+            .map_err(|e| Error::PairingError(format!("invalid ratchet_tree in GroupInfo: {e}")))?;
+        let verified_tree_bytes = verified_tree
+            .tls_serialize_detached()
+            .map_err(|e| Error::PairingError(format!("failed to serialize ratchet_tree: {e}")))?;
+        let (verified_nodes, verified_tree_remainder) =
+            <Vec<Option<RatchetNodeView>> as tls_codec::DeserializeBytes>::tls_deserialize_bytes(
+                &verified_tree_bytes,
+            )
+            .map_err(|e| Error::PairingError(format!("failed to parse ratchet_tree: {e}")))?;
+        debug_assert!(verified_tree_remainder.is_empty());
+        if verified_nodes.is_empty() {
+            return Err(Error::PairingError(
+                "GroupInfo ratchet_tree must contain at least one node".to_string(),
+            ));
+        }
+
+        for node in verified_nodes.into_iter().flatten() {
+            if let RatchetNodeView::LeafNode(leaf_node) = node
+                && !leaf_node
+                    .capabilities
+                    .extensions()
+                    .contains(&multi_device_ext)
+            {
+                return Err(Error::PairingError(
+                    "ratchet_tree leaf missing required multi-device capability".to_string(),
+                ));
+            }
+        }
+
+        let expected_join_psk_len = ciphersuite.hash_length();
+        if pairing_data.join_psk().len() != expected_join_psk_len {
+            return Err(Error::PairingError(format!(
+                "join_psk must be {} bytes",
+                expected_join_psk_len
+            )));
+        }
+
+        let join_psk_id = crate::mip06::JoinPskId::from_group_context_bytes(gc_bytes);
+        let join_psk_id_bytes = join_psk_id.to_bytes()?;
+
+        // Delete any existing PSK with this ID to prevent accumulation
+        let _ = self
+            .provider
+            .storage()
+            .delete_psk(&Psk::External(ExternalPsk::new(join_psk_id_bytes.clone())));
+
+        let psk = Psk::External(ExternalPsk::new(join_psk_id_bytes.clone()));
+        let psk_id = PreSharedKeyId::new(ciphersuite, self.provider.rand(), psk)
+            .map_err(|e| Error::PairingError(format!("failed to create PreSharedKeyId: {e}")))?;
+
+        psk_id
+            .store(&self.provider, pairing_data.join_psk())
+            .map_err(|e| Error::PairingError(format!("failed to store join PSK: {e}")))?;
+
+        // Keep bytes for PSK cleanup if subsequent operations fail
+        let psk_cleanup_bytes = join_psk_id_bytes;
+
+        let result: Result<ExternalCommitResult, Error> = (|| {
+            let (credential, signer) =
+                self.generate_credential_with_key(&nostr_keys.public_key())?;
+
+            // Identity proof must be constructed before build_group() — the challenge
+            // binds to credential_identity + signature_key, both known at this point.
+            let credential_identity = nostr_keys.public_key().to_bytes().to_vec();
+            let signature_key_bytes = credential.signature_key.as_slice().to_vec();
+
+            let identity_proof = crate::mip06::construct_identity_proof(
+                nostr_keys,
+                &credential_identity,
+                &signature_key_bytes,
+                gc_bytes,
+            )?;
+            let aad = identity_proof.to_authenticated_data()?;
+
+            let leaf_params = LeafNodeParameters::builder()
+                .with_capabilities(self.capabilities())
+                .build();
+
+            let commit_builder = MlsGroup::external_commit_builder()
+                .with_aad(aad)
+                .build_group(&self.provider, vgi, credential)
+                .map_err(|e| {
+                    Error::PairingError(format!("failed to build external commit group: {e}"))
+                })?
+                .leaf_node_parameters(leaf_params);
+
+            let psk_proposal = openmls::messages::proposals::PreSharedKeyProposal::new(psk_id);
+
+            let (mls_group, commit_bundle) = commit_builder
+                .add_psk_proposal(psk_proposal)
+                .load_psks(self.provider.storage())
+                .map_err(|e| Error::PairingError(format!("failed to load PSKs: {e}")))?
+                .build(
+                    self.provider.rand(),
+                    self.provider.crypto(),
+                    &signer,
+                    |_| true,
+                )
+                .map_err(|e| Error::PairingError(format!("failed to build external commit: {e}")))?
+                .finalize(&self.provider)
+                .map_err(|e| {
+                    Error::PairingError(format!("failed to finalize external commit: {e}"))
+                })?;
+
+            let (commit_msg_out, _welcome, _group_info) = commit_bundle.into_messages();
+            let commit_msg = commit_msg_out.tls_serialize_detached().map_err(|e| {
+                Error::PairingError(format!("failed to serialize commit message: {e}"))
+            })?;
+
+            let group_id = mdk_storage_traits::GroupId::from(mls_group.group_id());
+
+            // Persist the group to MDK storage so merge_pending_commit / sync_group_metadata_from_mls
+            // can find it.
+            let group_data = NostrGroupDataExtension::from_group(&mls_group)?;
+            let group = group_types::Group {
+                mls_group_id: group_id.clone(),
+                nostr_group_id: group_data.nostr_group_id,
+                name: group_data.name,
+                description: group_data.description,
+                admin_pubkeys: group_data.admins,
+                last_message_id: None,
+                last_message_at: None,
+                last_message_processed_at: None,
+                epoch: mls_group.epoch().as_u64(),
+                state: group_types::GroupState::Active,
+                image_hash: group_data.image_hash,
+                image_key: group_data.image_key.map(mdk_storage_traits::Secret::new),
+                image_nonce: group_data.image_nonce.map(mdk_storage_traits::Secret::new),
+                self_update_state: group_types::SelfUpdateState::Required,
+            };
+
+            self.storage()
+                .save_group(group)
+                .map_err(|e| Error::Group(e.to_string()))?;
+
+            self.storage()
+                .replace_group_relays(&group_id, group_data.relays)
+                .map_err(|e| Error::Group(e.to_string()))?;
+
+            Ok(ExternalCommitResult {
+                commit_message: commit_msg,
+                group_id,
+                group_event_key: Secret::new(*pairing_data.group_event_key()),
+            })
+        })();
+
+        // Clean up stored PSK if subsequent operations failed
+        if result.is_err() {
+            let _ = self
+                .provider
+                .storage()
+                .delete_psk(&Psk::External(ExternalPsk::new(psk_cleanup_bytes)));
+        }
+
+        result
     }
 
     /// Updates the current member's leaf node in an MLS group.
@@ -1745,6 +2408,12 @@ where
         // Sync the stored group metadata with the updated MLS group state
         self.sync_group_metadata_from_mls(group_id)?;
 
+        // Register MIP-06 join PSK for the new epoch so we can process incoming External Commits
+        #[cfg(feature = "mip06")]
+        {
+            self.register_join_psk(group_id)?;
+        }
+
         // If this was actually a self-update commit, record the timestamp.
         // This correctly handles:
         // - Post-join self-updates (transitions Required → CompletedAt)
@@ -1993,7 +2662,11 @@ mod tests {
     use std::collections::BTreeSet;
     use std::iter::once;
 
+    #[cfg(feature = "mip06")]
+    use crate::groups::ExternalCommitResult;
     use mdk_memory_storage::MdkMemoryStorage;
+    #[cfg(feature = "mip06")]
+    use mdk_storage_traits::Secret;
     use mdk_storage_traits::groups::GroupStorage;
     use mdk_storage_traits::messages::{MessageStorage, types as message_types};
     use nostr::{Keys, PublicKey};
@@ -5922,6 +6595,52 @@ mod tests {
             result.is_err(),
             "clear_pending_commit should error for non-existent group"
         );
+    }
+
+    #[cfg(feature = "mip06")]
+    #[test]
+    fn test_add_device_to_groups_rolls_back_prior_successes_on_error() {
+        let mdk = create_test_mdk();
+        let (creator, members, admins) = create_test_group_members();
+        let group_id = create_test_group(&mdk, &creator, &members, &admins);
+        let fake_group_id = mdk_storage_traits::GroupId::from_slice(&[0xAB; 16]);
+
+        let new_device = Keys::generate();
+        let kp_event = create_key_package_event(&mdk, &new_device);
+
+        let result = mdk.add_device_to_groups(&[group_id.clone(), fake_group_id], &kp_event);
+        assert!(result.is_err(), "second group failure should bubble up");
+
+        let mls_group = mdk
+            .load_mls_group(&group_id)
+            .expect("load mls group")
+            .expect("group exists");
+        assert!(
+            mls_group.pending_commit().is_none(),
+            "successful earlier groups must be rolled back on later failure"
+        );
+
+        let retry_device = Keys::generate();
+        let retry_event = create_key_package_event(&mdk, &retry_device);
+        mdk.add_members(&group_id, &[retry_event])
+            .expect("group should be usable again after rollback");
+        mdk.merge_pending_commit(&group_id)
+            .expect("retry commit should still be mergeable");
+    }
+
+    #[cfg(feature = "mip06")]
+    #[test]
+    fn test_external_commit_result_debug_redacts_sensitive_fields() {
+        let result = ExternalCommitResult {
+            commit_message: vec![1, 2, 3],
+            group_id: mdk_storage_traits::GroupId::from_slice(&[0x11, 0x22, 0x33, 0x44]),
+            group_event_key: Secret::new([0xAA; 32]),
+        };
+
+        let rendered = format!("{result:?}");
+        assert!(rendered.contains("<redacted>"));
+        assert!(!rendered.contains("11223344"));
+        assert!(!rendered.contains("170"));
     }
 
     /// Tests that `self_update` followed by `merge_pending_commit` rotates the signing key and
