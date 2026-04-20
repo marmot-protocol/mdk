@@ -39,6 +39,8 @@
 - New groups now use `MIXED_CIPHERTEXT` wire format policy (outgoing: ciphertext, incoming: mixed) instead of the OpenMLS default `PURE_CIPHERTEXT`. Regular messages remain `PrivateMessage`; the mixed incoming policy is required to accept `PublicMessage` SelfRemove proposals from departing members.
 - `leave_group` now sends a SelfRemove proposal (MLS Extensions draft, type `0x000a`) instead of a Remove proposal. Falls back to Remove for legacy groups created with `PURE_CIPHERTEXT`. SelfRemove proposals are auto-committed by any member, removing the requirement for an admin to be online.
 - Non-admin members can now create SelfRemove-only Commits in addition to self-update Commits. These two commit types must not be combined.
+- **`create_group` now computes the group's `RequiredCapabilities` as a least-common-denominator (LCD) intersection of `SUPPORTED_PROPOSALS` with every invitee's advertised proposals**, instead of requiring `SelfRemove` unconditionally. An all-modern invitee set still produces `RequiredCapabilities = [SelfRemove]`; any legacy invitee strips `SelfRemove` from the required set. Empty-invitee (single-member / "message to self") groups stay permissive with `RequiredCapabilities = []` so a later `add_members` call can admit legacy key packages. This unblocks two call patterns that previously failed OpenMLS's admission check with `Error::Group("Proposals are not acceptable")`: `create_group` with at least one legacy invitee, and `add_members` of a legacy invitee into a group that was created mixed (`RequiredCapabilities = []`). Resolves [whitenoise-rs #749](https://github.com/marmot-protocol/whitenoise-rs/issues/749) via [#261](https://github.com/marmot-protocol/mdk/pull/261).
+- `leave_group` now consults the group's `RequiredCapabilities` before emitting a `SelfRemove` proposal. If the group's `RequiredCapabilities` does not include `SelfRemove` (i.e. any mixed/legacy group), the leave falls back to a legacy `Remove` proposal that only admins can commit. Complements the existing `PURE_CIPHERTEXT` wire-format fallback. ([#261](https://github.com/marmot-protocol/mdk/pull/261))
 
 ### Added
 
@@ -52,6 +54,7 @@
 ### Fixed
 
 - Rejected receiver-side commits that would leave a group with no active admins, including admin-authored group-data extension updates that bypass MDK's creating-side guards. ([#256](https://github.com/marmot-protocol/mdk/pull/256))
+- `self_update` now injects `MDK::capabilities()` into the rotated leaf's `LeafNodeParameters` instead of cloning the leaf's existing (possibly stale) capabilities. Previously, a leaf added before MDK's capability set last changed would continue re-advertising stale capabilities across every rotation; with this change, every self-update advances the leaf toward MDK's current set. Changes semantics for callers relying on self-update preserving legacy leaf capabilities; all in-tree `self_update` tests continue to pass. Resolves [whitenoise-rs #749](https://github.com/marmot-protocol/whitenoise-rs/issues/749) via [#261](https://github.com/marmot-protocol/mdk/pull/261).
 - Added ciphertext deduplication to commit race resolution. Epoch snapshots now store a SHA-256 hash of the outer event content; re-wrapped events carrying identical ciphertext are rejected before the MIP-03 timestamp/ID comparison, preventing replay-triggered rollbacks. ([#246](https://github.com/marmot-protocol/mdk/pull/246))
 - Bumped `hpke-rs` from `0.6.0` to `0.6.1`, resolving two high-severity advisories in the transitive `libcrux` chain: [RUSTSEC-2026-0073](https://rustsec.org/advisories/RUSTSEC-2026-0073) (panic in `libcrux-poly1305` standalone MAC operations) and [RUSTSEC-2026-0074](https://rustsec.org/advisories/RUSTSEC-2026-0074) (incorrect SHAKE output in `libcrux-sha3`). `Cargo.lock` only — no `Cargo.toml` changes required. ([#234](https://github.com/marmot-protocol/mdk/pull/234))
 - Bumped `digest` lockfile entry from yanked `0.11.1` to `0.11.2`, resolving the `cargo audit` yanked-crate warning introduced transitively via `openmls_rust_crypto` → `hpke-rs-rust-crypto` → `x-wing` → `sha3`. ([#229](https://github.com/marmot-protocol/mdk/pull/229))
@@ -66,6 +69,8 @@
 - `remove_members` now atomically strips removed members from the group admin list within the same MLS commit ([#225](https://github.com/marmot-protocol/mdk/pull/225))
 
 ### Removed
+
+- Dead constant `GROUP_CONTEXT_REQUIRED_PROPOSALS` and the `MDK::required_capabilities_extension()` helper. Superseded by the per-group LCD intersection inlined at the `create_group` call site. ([#261](https://github.com/marmot-protocol/mdk/pull/261))
 
 ### Deprecated
 

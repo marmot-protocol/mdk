@@ -26,6 +26,7 @@ use sha2::{Digest, Sha256};
 
 use super::MDK;
 use super::extension::NostrGroupDataExtension;
+use crate::constant::{GROUP_CONTEXT_REQUIRED_EXTENSIONS, SUPPORTED_PROPOSALS};
 use crate::error::Error;
 use crate::messages::EventTag;
 use crate::messages::crypto::encrypt_message_with_exporter_secret;
@@ -1197,8 +1198,48 @@ where
             None, // image_upload_key - will be set when image is uploaded
         );
 
+        // Parse invitee KeyPackages up front — the LCD intersection below
+        // needs their advertised capabilities to compute the group's
+        // `RequiredCapabilities`.
+        let key_packages_vec: Vec<KeyPackage> = member_key_package_events
+            .iter()
+            .map(|event| self.parse_key_package(event))
+            .collect::<Result<_, _>>()?;
+
+        // LCD: require only proposals every invitee's leaf can satisfy. An
+        // all-modern group keeps [SelfRemove]; any legacy invitee strips it.
+        // MDK itself supports every entry in SUPPORTED_PROPOSALS by
+        // construction, so the creator's own leaf never needs an explicit
+        // intersection term.
+        //
+        // Empty-invitee groups (single-member setup / "message to self") stay
+        // permissive: `Iterator::all` is vacuously true over an empty set, so
+        // a naive intersection would freeze in SUPPORTED_PROPOSALS and close
+        // the group to later legacy `add_members` calls. We don't know the
+        // future composition yet, and `RequiredCapabilities` is immutable
+        // until a `GroupContextExtensions` upgrade ships, so empty stays
+        // empty.
+        let required_proposals: Vec<ProposalType> = if key_packages_vec.is_empty() {
+            Vec::new()
+        } else {
+            SUPPORTED_PROPOSALS
+                .iter()
+                .copied()
+                .filter(|pt| {
+                    key_packages_vec
+                        .iter()
+                        .all(|kp| kp.leaf_node().capabilities().proposals().contains(pt))
+                })
+                .collect()
+        };
+
         let extension = Self::get_unknown_extension_from_group_data(&group_data)?;
-        let required_capabilities_extension = self.required_capabilities_extension();
+        let required_capabilities_extension =
+            Extension::RequiredCapabilities(RequiredCapabilitiesExtension::new(
+                &GROUP_CONTEXT_REQUIRED_EXTENSIONS,
+                &required_proposals,
+                &[],
+            ));
         let extensions = Extensions::from_vec(vec![extension, required_capabilities_extension])?;
 
         // Build the group config
@@ -1219,13 +1260,6 @@ where
 
         let mut mls_group =
             MlsGroup::new(&self.provider, &signer, &group_config, credential.clone())?;
-
-        let mut key_packages_vec: Vec<KeyPackage> = Vec::new();
-        for event in &member_key_package_events {
-            // TODO: Error handling for failure here
-            let key_package: KeyPackage = self.parse_key_package(event)?;
-            key_packages_vec.push(key_package);
-        }
 
         // Handle member addition and welcome message creation
         // For single-member groups (no additional members), we skip adding members
@@ -1372,7 +1406,7 @@ where
 
         let leaf_node_params = LeafNodeParameters::builder()
             .with_credential_with_key(new_credential_with_key)
-            .with_capabilities(own_leaf.capabilities().clone())
+            .with_capabilities(self.capabilities())
             .with_extensions(own_leaf.extensions().clone())
             .build();
 
@@ -1435,19 +1469,28 @@ where
         group: &mut MlsGroup,
         signer: &SignatureKeyPair,
     ) -> Result<MlsMessageOut, Error> {
-        // Legacy groups (PURE_CIPHERTEXT) have AlwaysCiphertext incoming on all peers.
-        // A PublicMessage SelfRemove would be rejected with IncompatibleWireFormat.
-        // Fall back to Remove immediately — don't bother switching config.
-        //
-        // MIXED_CIPHERTEXT groups also have AlwaysCiphertext outgoing but Mixed
-        // incoming — they CAN accept PublicMessage SelfRemove.
-        if matches!(
-            group.configuration().wire_format_policy().incoming(),
-            IncomingWireFormatPolicy::AlwaysCiphertext
-        ) {
+        // RequiredCapabilities gate. RFC 9420 §7.2 guarantees every leaf's
+        // advertised proposals cover RequiredCapabilities, so if SelfRemove
+        // is required, OpenMLS's commit-time validate_proposal_type_support
+        // is guaranteed to accept it on every peer. If SelfRemove is NOT
+        // required, fall back to legacy Remove — a mixed-composition group's
+        // non-admin-committable SelfRemove path would orphan on at least one
+        // peer. This is also our wire-format guarantee: modern groups are
+        // born with `RequiredCapabilities = [SelfRemove]` and
+        // `MIXED_CIPHERTEXT` in lockstep (PR #236), and legacy groups have
+        // neither, so this single check covers both invariants in practice.
+        // Sound but over-conservative for formerly-mixed groups that became
+        // all-modern: `RequiredCapabilities` is frozen at creation and only
+        // a `GroupContextExtensions` commit can mutate it.
+        let self_remove_required = group
+            .extensions()
+            .required_capabilities()
+            .is_some_and(|rc| rc.proposal_types().contains(&ProposalType::SelfRemove));
+
+        if !self_remove_required {
             tracing::debug!(
                 target: "mdk_core::groups::leave_group",
-                "SelfRemove unavailable (legacy group with PURE_CIPHERTEXT), \
+                "SelfRemove not in group's RequiredCapabilities, \
                  falling back to Remove proposal"
             );
             return group
@@ -6287,5 +6330,638 @@ mod tests {
         assert_eq!(leaf_map.get(&1), Some(&bob_keys.public_key()));
         assert_eq!(leaf_map.get(&3), Some(&dave_keys.public_key()));
         assert!(!leaf_map.contains_key(&2));
+    }
+
+    // ============================================================================
+    // LCD admission at create_group.
+    //
+    // These tests pin the observable group-context shape resulting from the
+    // least-common-denominator intersection across invitee KeyPackage
+    // capabilities. All three assertions are against
+    // `MlsGroup::extensions().required_capabilities().proposal_types()` as
+    // read back from persistent storage via `load_mls_group`.
+    // ============================================================================
+
+    /// All-modern invitees: the resulting group's `RequiredCapabilities`
+    /// MUST contain `SelfRemove`. LCD should preserve the #7.2 guarantee
+    /// whenever every invitee can honour it.
+    #[test]
+    fn test_create_group_all_modern_invitees_requires_self_remove() {
+        use openmls::prelude::ProposalType;
+
+        let creator_mdk = create_test_mdk();
+        let alice_mdk = create_test_mdk();
+        let bob_mdk = create_test_mdk();
+        let creator = Keys::generate();
+        let alice = Keys::generate();
+        let bob = Keys::generate();
+        let creator_pk = creator.public_key();
+
+        let alice_kp = create_key_package_event(&alice_mdk, &alice);
+        let bob_kp = create_key_package_event(&bob_mdk, &bob);
+
+        let create_result = creator_mdk
+            .create_group(
+                &creator_pk,
+                vec![alice_kp, bob_kp],
+                create_nostr_group_config_data(vec![creator_pk]),
+            )
+            .expect("all-modern group creation should succeed");
+
+        let group_id = create_result.group.mls_group_id.clone();
+        let mls_group = creator_mdk
+            .load_mls_group(&group_id)
+            .expect("load ok")
+            .expect("group exists");
+
+        let proposal_types: Vec<ProposalType> = mls_group
+            .extensions()
+            .required_capabilities()
+            .map(|rc| rc.proposal_types().to_vec())
+            .unwrap_or_default();
+
+        assert!(
+            proposal_types.contains(&ProposalType::SelfRemove),
+            "all-modern group should require SelfRemove (got {:?})",
+            proposal_types
+        );
+    }
+
+    /// Empty-invitee setup groups (single-member / "message to self") must
+    /// NOT freeze in `RequiredCapabilities = [SelfRemove]`. A naive LCD
+    /// over an empty invitee set is vacuously true, which would pin
+    /// `SUPPORTED_PROPOSALS` and close the group to any later legacy
+    /// `add_members()` call. This test pins the empty-stays-empty
+    /// permissive default and guards against someone "simplifying" the
+    /// `is_empty()` branch out of `create_group`.
+    #[test]
+    fn test_create_group_empty_invitees_yields_empty_required_capabilities() {
+        let creator_mdk = create_test_mdk();
+        let creator = Keys::generate();
+        let creator_pk = creator.public_key();
+
+        let create_result = creator_mdk
+            .create_group(
+                &creator_pk,
+                Vec::new(),
+                create_nostr_group_config_data(vec![creator_pk]),
+            )
+            .expect("single-member group creation should succeed");
+
+        let group_id = create_result.group.mls_group_id.clone();
+        let mls_group = creator_mdk
+            .load_mls_group(&group_id)
+            .expect("load ok")
+            .expect("group exists");
+
+        let proposal_types = mls_group
+            .extensions()
+            .required_capabilities()
+            .map(|rc| rc.proposal_types().to_vec())
+            .unwrap_or_default();
+
+        assert!(
+            proposal_types.is_empty(),
+            "empty-invitee group must stay permissive (got {:?})",
+            proposal_types
+        );
+    }
+
+    /// Admin-leave demotion flow in a mixed group. Admins cannot leave
+    /// directly; they must `self_demote()` first, have the demotion
+    /// committed, then leave. In a mixed group, the subsequent leave must
+    /// follow the legacy-Remove fallback (observable: a non-admin receiver
+    /// sees `PendingProposal`, not `Proposal`).
+    #[test]
+    fn test_admin_in_mixed_group_demotes_then_leaves_legacy() {
+        use crate::messages::MessageProcessingResult;
+
+        // Two admins so self-demote is allowed (not last-admin).
+        // Charlie is a modern non-admin observer; a legacy invitee forces
+        // LCD → RequiredCapabilities = [].
+        let alice_mdk = create_test_mdk(); // admin leaving
+        let bob_mdk = create_test_mdk(); // admin who stays
+        let charlie_mdk = create_test_mdk(); // non-admin modern observer
+        let alice_keys = Keys::generate();
+        let bob_keys = Keys::generate();
+        let charlie_keys = Keys::generate();
+        let legacy_keys = Keys::generate();
+
+        let bob_kp = create_key_package_event(&bob_mdk, &bob_keys);
+        let charlie_kp = create_key_package_event(&charlie_mdk, &charlie_keys);
+        let legacy_kp = create_legacy_key_package_event(&alice_mdk, &legacy_keys);
+
+        let create_result = alice_mdk
+            .create_group(
+                &alice_keys.public_key(),
+                vec![bob_kp, charlie_kp, legacy_kp],
+                create_nostr_group_config_data(vec![
+                    alice_keys.public_key(),
+                    bob_keys.public_key(),
+                ]),
+            )
+            .expect("alice creates mixed group with two admins");
+        let group_id = create_result.group.mls_group_id.clone();
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("alice merges creation");
+
+        let bob_welcome = bob_mdk
+            .process_welcome(
+                &nostr::EventId::all_zeros(),
+                &create_result.welcome_rumors[0],
+            )
+            .expect("bob processes welcome");
+        bob_mdk.accept_welcome(&bob_welcome).expect("bob accepts");
+        let charlie_welcome = charlie_mdk
+            .process_welcome(
+                &nostr::EventId::all_zeros(),
+                &create_result.welcome_rumors[1],
+            )
+            .expect("charlie processes welcome");
+        charlie_mdk
+            .accept_welcome(&charlie_welcome)
+            .expect("charlie accepts");
+
+        // Step 1: Alice (admin) cannot leave directly.
+        let direct_err = alice_mdk
+            .leave_group(&group_id)
+            .expect_err("admin cannot leave without demoting");
+        assert!(
+            direct_err.to_string().contains("self-demote"),
+            "expected demotion-required error substring; got: {direct_err}"
+        );
+
+        // Step 2: Alice self-demotes; the demotion commit must propagate
+        // to Charlie (so his group state reflects Alice's non-admin status
+        // when he later processes her leave).
+        let demote_result = alice_mdk
+            .self_demote(&group_id)
+            .expect("alice self-demotes");
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("alice merges her demotion");
+        charlie_mdk
+            .process_message(&demote_result.evolution_event)
+            .expect("charlie processes demotion commit");
+
+        // Step 3: Alice (now non-admin) leaves. Mixed group → legacy Remove
+        // fallback → non-admin receiver sees PendingProposal.
+        let alice_leave = alice_mdk
+            .leave_group(&group_id)
+            .expect("alice leaves after demotion");
+
+        let result = charlie_mdk
+            .process_message(&alice_leave.evolution_event)
+            .expect("charlie processes alice's leave");
+        assert!(
+            matches!(result, MessageProcessingResult::PendingProposal { .. }),
+            "demoted-admin leave in a mixed group should fall back to legacy Remove \
+             (non-admin receiver sees PendingProposal); got {:?}",
+            result
+        );
+    }
+
+    /// `self_update()` must inject `MDK::capabilities()` into the new leaf,
+    /// not clone the (possibly stale) capabilities already there. A member
+    /// whose leaf currently advertises an empty proposals set must, after a
+    /// self-update, advertise MDK's full set (which includes `SelfRemove`).
+    #[test]
+    fn test_self_update_refreshes_leaf_capabilities() {
+        use openmls::prelude::ProposalType;
+
+        let alice_mdk = create_test_mdk();
+        let charlie_mdk = create_test_mdk();
+        let alice_keys = Keys::generate();
+        let charlie_keys = Keys::generate();
+
+        // Alice invites Charlie using a capability-poor KeyPackage. Charlie's
+        // leaf on entry therefore advertises NO proposals (no SelfRemove).
+        // The group's RequiredCapabilities will also end up empty (LCD).
+        let legacy_kp = create_legacy_key_package_event(&charlie_mdk, &charlie_keys);
+
+        let create_result = alice_mdk
+            .create_group(
+                &alice_keys.public_key(),
+                vec![legacy_kp],
+                create_nostr_group_config_data(vec![alice_keys.public_key()]),
+            )
+            .expect("alice creates mixed group");
+        let group_id = create_result.group.mls_group_id.clone();
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("alice merges");
+
+        let charlie_welcome = charlie_mdk
+            .process_welcome(
+                &nostr::EventId::all_zeros(),
+                &create_result.welcome_rumors[0],
+            )
+            .expect("charlie processes welcome");
+        charlie_mdk
+            .accept_welcome(&charlie_welcome)
+            .expect("charlie accepts");
+
+        // Precondition: Charlie's leaf advertises NO proposals.
+        let pre = charlie_mdk
+            .load_mls_group(&group_id)
+            .expect("load pre")
+            .expect("group pre");
+        let pre_proposals: Vec<ProposalType> = pre
+            .own_leaf()
+            .expect("own leaf pre")
+            .capabilities()
+            .proposals()
+            .to_vec();
+        assert!(
+            pre_proposals.is_empty(),
+            "sanity: capability-poor leaf starts with NO proposals; got {:?}",
+            pre_proposals
+        );
+
+        // Run a self-update and commit.
+        charlie_mdk
+            .self_update(&group_id)
+            .expect("self-update succeeds");
+        charlie_mdk
+            .merge_pending_commit(&group_id)
+            .expect("charlie merges self-update");
+
+        // Postcondition: leaf now advertises MDK's modern proposals set,
+        // which includes SelfRemove. This is the bug fix.
+        let post = charlie_mdk
+            .load_mls_group(&group_id)
+            .expect("load post")
+            .expect("group post");
+        let post_proposals: Vec<ProposalType> = post
+            .own_leaf()
+            .expect("own leaf post")
+            .capabilities()
+            .proposals()
+            .to_vec();
+        assert!(
+            post_proposals.contains(&ProposalType::SelfRemove),
+            "self_update should refresh leaf proposals to current MDK capabilities; \
+             expected SelfRemove, got {:?}",
+            post_proposals
+        );
+    }
+
+    /// Documents accepted over-conservatism. A group created mixed
+    /// (RequiredCapabilities = []) keeps that value forever in MDK's
+    /// stable-0.8.1 world, so any subsequent modern-member leaves fall back
+    /// to legacy `Remove` even after every legacy member has been
+    /// admin-removed. This test pins the accepted wrong behavior so somebody
+    /// doesn't "optimize" the Guard 2 check by reading the tree without also
+    /// shipping a GCE-upgrade path that makes the optimization correct.
+    // TODO(gce-upgrade): delete/invert when GCE-upgrade ships. At that
+    // point the group should regain SelfRemove UX automatically after
+    // legacy members depart, and this assertion becomes wrong.
+    #[test]
+    fn test_mixed_group_stays_legacy_after_legacy_members_leave_over_conservative() {
+        use crate::messages::MessageProcessingResult;
+
+        // Alice (admin), Bob (modern non-admin), plus a legacy invitee.
+        let alice_mdk = create_test_mdk();
+        let bob_mdk = create_test_mdk();
+        let charlie_mdk = create_test_mdk();
+        let alice_keys = Keys::generate();
+        let bob_keys = Keys::generate();
+        let charlie_keys = Keys::generate();
+        let legacy_keys = Keys::generate();
+
+        let bob_kp = create_key_package_event(&bob_mdk, &bob_keys);
+        let charlie_kp = create_key_package_event(&charlie_mdk, &charlie_keys);
+        let legacy_kp = create_legacy_key_package_event(&alice_mdk, &legacy_keys);
+
+        let create_result = alice_mdk
+            .create_group(
+                &alice_keys.public_key(),
+                vec![bob_kp, charlie_kp, legacy_kp],
+                create_nostr_group_config_data(vec![alice_keys.public_key()]),
+            )
+            .expect("mixed group creation");
+        let group_id = create_result.group.mls_group_id.clone();
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("alice merges");
+
+        let bob_welcome = bob_mdk
+            .process_welcome(
+                &nostr::EventId::all_zeros(),
+                &create_result.welcome_rumors[0],
+            )
+            .expect("bob processes welcome");
+        bob_mdk.accept_welcome(&bob_welcome).expect("bob accepts");
+        let charlie_welcome = charlie_mdk
+            .process_welcome(
+                &nostr::EventId::all_zeros(),
+                &create_result.welcome_rumors[1],
+            )
+            .expect("charlie processes welcome");
+        charlie_mdk
+            .accept_welcome(&charlie_welcome)
+            .expect("charlie accepts");
+
+        // Alice admin-removes the legacy member.
+        alice_mdk
+            .remove_members(&group_id, &[legacy_keys.public_key()])
+            .expect("alice removes legacy");
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("alice merges removal");
+
+        // The stored RequiredCapabilities is still [] — MDK does not upgrade
+        // it on its own. Bob (still modern) leaves; Charlie (non-admin
+        // receiver) should still see a legacy Remove => PendingProposal.
+        let bob_leave = bob_mdk
+            .leave_group(&group_id)
+            .expect("bob leaves the now-all-modern group");
+
+        let result = charlie_mdk
+            .process_message(&bob_leave.evolution_event)
+            .expect("charlie processes bob's leave");
+
+        assert!(
+            matches!(result, MessageProcessingResult::PendingProposal { .. }),
+            "formerly-mixed-now-all-modern group should still fall back to legacy Remove \
+             until GCE-upgrade ships; got {:?}",
+            result
+        );
+    }
+
+    /// Leave-path: after a modern SelfRemove send, the group's wire-format
+    /// policy must be back to MIXED_CIPHERTEXT in persistent storage.
+    /// Reloading from storage is load-bearing — in-memory state alone does
+    /// not prove the persist-side restoration worked.
+    #[test]
+    fn test_self_remove_restores_ciphertext_config_on_disk() {
+        use openmls::prelude::{IncomingWireFormatPolicy, OutgoingWireFormatPolicy};
+
+        // All-modern 3-member group so RequiredCapabilities = [SelfRemove].
+        let alice_mdk = create_test_mdk();
+        let bob_mdk = create_test_mdk();
+        let charlie_mdk = create_test_mdk();
+        let alice_keys = Keys::generate();
+        let bob_keys = Keys::generate();
+        let charlie_keys = Keys::generate();
+
+        let bob_kp = create_key_package_event(&bob_mdk, &bob_keys);
+        let charlie_kp = create_key_package_event(&charlie_mdk, &charlie_keys);
+
+        let create_result = alice_mdk
+            .create_group(
+                &alice_keys.public_key(),
+                vec![bob_kp, charlie_kp],
+                create_nostr_group_config_data(vec![alice_keys.public_key()]),
+            )
+            .expect("alice creates group");
+        let group_id = create_result.group.mls_group_id.clone();
+
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("alice merges creation commit");
+
+        let bob_welcome = bob_mdk
+            .process_welcome(
+                &nostr::EventId::all_zeros(),
+                &create_result.welcome_rumors[0],
+            )
+            .expect("bob processes welcome");
+        bob_mdk.accept_welcome(&bob_welcome).expect("bob accepts");
+
+        // Bob sends the SelfRemove. Internally `try_self_remove` flips to
+        // plaintext, sends, then restores ciphertext.
+        bob_mdk
+            .leave_group(&group_id)
+            .expect("bob sends SelfRemove");
+
+        // Reload from storage and assert restoration.
+        let reloaded = bob_mdk
+            .load_mls_group(&group_id)
+            .expect("reload ok")
+            .expect("group still exists for bob");
+        let policy = reloaded.configuration().wire_format_policy();
+        assert_eq!(
+            policy.outgoing(),
+            OutgoingWireFormatPolicy::AlwaysCiphertext,
+            "outgoing policy should be restored to AlwaysCiphertext"
+        );
+        assert_eq!(
+            policy.incoming(),
+            IncomingWireFormatPolicy::Mixed,
+            "incoming policy should be restored to Mixed (MIXED_CIPHERTEXT)"
+        );
+    }
+
+    /// Leave-path: a mixed group (RequiredCapabilities = []) must fall back
+    /// to legacy `Remove` when a modern non-admin member leaves. Observable
+    /// via the receiver — a non-admin receiver sees `PendingProposal`
+    /// (waiting for an admin to commit), NOT `Proposal` (the SelfRemove
+    /// auto-commit signature).
+    #[test]
+    fn test_leave_mixed_group_falls_back_to_legacy_remove() {
+        use crate::messages::MessageProcessingResult;
+
+        let alice_mdk = create_test_mdk(); // admin
+        let bob_mdk = create_test_mdk(); // non-admin, the leaver, modern
+        let charlie_mdk = create_test_mdk(); // non-admin receiver, modern
+        let alice_keys = Keys::generate();
+        let bob_keys = Keys::generate();
+        let charlie_keys = Keys::generate();
+        let legacy_keys = Keys::generate();
+        let admins = vec![alice_keys.public_key()];
+
+        // Mixed group: bob + charlie are modern, one capability-poor invitee
+        // poisons LCD into RequiredCapabilities = [].
+        let bob_kp = create_key_package_event(&bob_mdk, &bob_keys);
+        let charlie_kp = create_key_package_event(&charlie_mdk, &charlie_keys);
+        let legacy_kp = create_legacy_key_package_event(&alice_mdk, &legacy_keys);
+
+        let create_result = alice_mdk
+            .create_group(
+                &alice_keys.public_key(),
+                vec![bob_kp, charlie_kp, legacy_kp],
+                create_nostr_group_config_data(admins),
+            )
+            .expect("mixed group creation should succeed");
+        let group_id = create_result.group.mls_group_id.clone();
+
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("alice merges creation commit");
+
+        // Bob + Charlie join via welcomes (legacy invitee does not participate;
+        // the capability-poor KP fixture bypasses MDK's welcome flow anyway).
+        let bob_welcome = bob_mdk
+            .process_welcome(
+                &nostr::EventId::all_zeros(),
+                &create_result.welcome_rumors[0],
+            )
+            .expect("bob processes welcome");
+        bob_mdk.accept_welcome(&bob_welcome).expect("bob accepts");
+
+        let charlie_welcome = charlie_mdk
+            .process_welcome(
+                &nostr::EventId::all_zeros(),
+                &create_result.welcome_rumors[1],
+            )
+            .expect("charlie processes welcome");
+        charlie_mdk
+            .accept_welcome(&charlie_welcome)
+            .expect("charlie accepts");
+
+        // Bob leaves the mixed group.
+        let bob_leave = bob_mdk.leave_group(&group_id).expect("Bob should leave");
+
+        // Charlie (non-admin) processing a legacy Remove: it goes into the
+        // pending store (needs admin commit). For SelfRemove it would
+        // auto-commit on any member (MessageProcessingResult::Proposal).
+        let result = charlie_mdk
+            .process_message(&bob_leave.evolution_event)
+            .expect("charlie processes bob's leave");
+
+        assert!(
+            matches!(result, MessageProcessingResult::PendingProposal { .. }),
+            "mixed-group leave must fall back to legacy Remove and surface as PendingProposal \
+             for a non-admin receiver; got {:?}",
+            result
+        );
+    }
+
+    /// Admission: after an all-modern group is created, adding a member
+    /// whose KeyPackage omits `SelfRemove` must be rejected. The rejection
+    /// surfaces as `Error::Group(String)` via the flat-string wrapping in
+    /// `add_members` (`.map_err(|e| Error::Group(e.to_string()))`); the
+    /// substring below was
+    /// observed empirically — openmls 0.8.1 wraps the leaf-node validation
+    /// failure into its `ProposalValidationError` whose `Display` is
+    /// "Proposals are not acceptable." This matches the exact error the
+    /// original #749 bug surfaced before the LCD fix, confirming this
+    /// branch is the upstream-enforced proposal-type gate.
+    #[test]
+    fn test_add_members_rejects_legacy_kp_in_all_modern_group() {
+        let creator_mdk = create_test_mdk();
+        let alice_mdk = create_test_mdk();
+        let legacy_mdk = create_test_mdk();
+        let creator = Keys::generate();
+        let alice = Keys::generate();
+        let legacy = Keys::generate();
+        let creator_pk = creator.public_key();
+
+        // All-modern bootstrap — RequiredCapabilities will contain SelfRemove.
+        let alice_kp = create_key_package_event(&alice_mdk, &alice);
+        let create_result = creator_mdk
+            .create_group(
+                &creator_pk,
+                vec![alice_kp],
+                create_nostr_group_config_data(vec![creator_pk]),
+            )
+            .expect("all-modern group creation should succeed");
+        let group_id = create_result.group.mls_group_id.clone();
+        creator_mdk
+            .merge_pending_commit(&group_id)
+            .expect("merge creation commit");
+
+        // Attempting to add a capability-poor invitee must fail.
+        let legacy_kp = create_legacy_key_package_event(&legacy_mdk, &legacy);
+        let err = creator_mdk
+            .add_members(&group_id, &[legacy_kp])
+            .expect_err("adding capability-poor KP to all-modern group must fail");
+
+        // MDK flattens openmls errors into Error::Group(String).
+        // Substring is the literal Display of openmls's ProposalValidationError.
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Proposals are not acceptable"),
+            "expected openmls proposal-rejection substring; got: {msg}"
+        );
+    }
+
+    /// All-legacy invitees: creation still succeeds and the resulting
+    /// group's `RequiredCapabilities` is empty. Degenerate case proving
+    /// that LCD does not blow up when no invitee advertises anything in
+    /// `SUPPORTED_PROPOSALS`.
+    #[test]
+    fn test_create_group_all_legacy_invitees_yields_empty_required_capabilities() {
+        let creator_mdk = create_test_mdk();
+        let creator = Keys::generate();
+        let legacy1 = Keys::generate();
+        let legacy2 = Keys::generate();
+        let creator_pk = creator.public_key();
+
+        let kp1 = create_legacy_key_package_event(&creator_mdk, &legacy1);
+        let kp2 = create_legacy_key_package_event(&creator_mdk, &legacy2);
+
+        let create_result = creator_mdk
+            .create_group(
+                &creator_pk,
+                vec![kp1, kp2],
+                create_nostr_group_config_data(vec![creator_pk]),
+            )
+            .expect("all-legacy group creation should succeed");
+
+        let group_id = create_result.group.mls_group_id.clone();
+        let mls_group = creator_mdk
+            .load_mls_group(&group_id)
+            .expect("load ok")
+            .expect("group exists");
+
+        let proposal_types = mls_group
+            .extensions()
+            .required_capabilities()
+            .map(|rc| rc.proposal_types().to_vec())
+            .unwrap_or_default();
+
+        assert!(
+            proposal_types.is_empty(),
+            "all-legacy group should have empty RequiredCapabilities.proposal_types (got {:?})",
+            proposal_types
+        );
+    }
+
+    /// Tracer for whitenoise-rs#749: creating a group whose invitee set
+    /// contains a capability-poor (legacy) KeyPackage must succeed AND the
+    /// resulting group's `RequiredCapabilities` must NOT advertise
+    /// `SelfRemove`. This is the core #749 regression guard.
+    #[test]
+    fn test_create_group_mixed_invitees_drops_self_remove_requirement() {
+        use openmls::prelude::ProposalType;
+
+        let creator_mdk = create_test_mdk();
+        let modern_mdk = create_test_mdk();
+        let creator = Keys::generate();
+        let modern_member = Keys::generate();
+        let legacy_member = Keys::generate();
+        let creator_pk = creator.public_key();
+
+        let modern_kp = create_key_package_event(&modern_mdk, &modern_member);
+        let legacy_kp = create_legacy_key_package_event(&creator_mdk, &legacy_member);
+
+        let create_result = creator_mdk
+            .create_group(
+                &creator_pk,
+                vec![modern_kp, legacy_kp],
+                create_nostr_group_config_data(vec![creator_pk]),
+            )
+            .expect("mixed-invitee group creation should succeed");
+
+        let group_id = create_result.group.mls_group_id.clone();
+        let mls_group = creator_mdk
+            .load_mls_group(&group_id)
+            .expect("load ok")
+            .expect("group exists");
+
+        let proposal_types: Vec<ProposalType> = mls_group
+            .extensions()
+            .required_capabilities()
+            .map(|rc| rc.proposal_types().to_vec())
+            .unwrap_or_default();
+
+        assert!(
+            !proposal_types.contains(&ProposalType::SelfRemove),
+            "mixed group must not require SelfRemove (got {:?})",
+            proposal_types
+        );
     }
 }

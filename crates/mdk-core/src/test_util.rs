@@ -5,11 +5,19 @@
 
 use mdk_storage_traits::GroupId;
 use mdk_storage_traits::MdkStorageProvider;
-use nostr::{Event, EventBuilder, Keys, Kind, PublicKey, RelayUrl};
+use nostr::{Event, EventBuilder, Keys, Kind, PublicKey, RelayUrl, Tag, TagKind};
+use openmls::key_packages::KeyPackage;
+use openmls::prelude::{BasicCredential, Capabilities, CredentialWithKey};
+use openmls_basic_credential::SignatureKeyPair;
+use openmls_traits::OpenMlsProvider;
+use tls_codec::Serialize as TlsSerialize;
 
 use crate::MDK;
-use crate::constant::MLS_KEY_PACKAGE_KIND;
+use crate::constant::{
+    DEFAULT_CIPHERSUITE, MLS_KEY_PACKAGE_KIND, MLS_KEY_PACKAGE_KIND_LEGACY, SUPPORTED_EXTENSIONS,
+};
 use crate::groups::NostrGroupConfigData;
+use crate::util::{ContentEncoding, encode_content};
 
 /// Creates test group members with standard configuration
 ///
@@ -79,6 +87,103 @@ where
         .tags(tags)
         .sign_with_keys(signing_keys)
         .expect("Failed to sign event")
+}
+
+/// Creates a legacy (capability-poor) KeyPackage event for a member.
+///
+/// The produced KeyPackage's `LeafNode.capabilities.proposals` is explicitly
+/// empty (no `SelfRemove`), simulating an older client that predates MIP-03.
+/// This is packaged inside a kind:443 (legacy, pre-May-2026) Nostr event
+/// because the stricter kind:30443 validator requires the `mls_proposals`
+/// tag and an `i` (KeyPackageRef) tag we do not compute here.
+///
+/// `mdk` is only a storage host for the signer; `member_keys` is the signing
+/// identity for the resulting KeyPackage. Tests typically pass a neighbor's
+/// MDK here — the "legacy" party never loads from its own storage.
+///
+/// # Important
+///
+/// This builds the KeyPackage directly via `openmls::KeyPackage::builder()` —
+/// not via `MDK::create_key_package_for_event`, which unconditionally injects
+/// `self.capabilities()` (which advertises `SelfRemove`). Passing `None` for
+/// `Capabilities::new`'s `proposals` argument is also a trap — it falls back
+/// to `Capabilities::default()`, which advertises `SelfRemove`. We pass
+/// `Some(&[])` explicitly.
+pub fn create_legacy_key_package_event<Storage>(mdk: &MDK<Storage>, member_keys: &Keys) -> Event
+where
+    Storage: MdkStorageProvider,
+{
+    let public_key = member_keys.public_key();
+    let public_key_bytes: Vec<u8> = public_key.to_bytes().to_vec();
+
+    // Credential + signer built directly (no capability-injecting helper).
+    let credential = BasicCredential::new(public_key_bytes);
+    let signature_keypair = SignatureKeyPair::new(DEFAULT_CIPHERSUITE.signature_algorithm())
+        .expect("Failed to generate signature keypair");
+    signature_keypair
+        .store(mdk.provider.storage())
+        .expect("Failed to store signature keypair");
+
+    let credential_with_key = CredentialWithKey {
+        credential: credential.into(),
+        signature_key: signature_keypair.public().into(),
+    };
+
+    // Capability-poor leaf: no proposals advertised (no SelfRemove).
+    // Extensions mirror the modern set so the event's mls_extensions tag
+    // remains well-formed and the tag-level validator accepts the event.
+    let capabilities = Capabilities::new(
+        None,
+        Some(&[DEFAULT_CIPHERSUITE]),
+        Some(&SUPPORTED_EXTENSIONS),
+        Some(&[]), // explicit empty: NO SelfRemove
+        None,
+    );
+
+    let key_package_bundle = KeyPackage::builder()
+        .leaf_node_capabilities(capabilities)
+        .mark_as_last_resort()
+        .build(
+            DEFAULT_CIPHERSUITE,
+            &mdk.provider,
+            &signature_keypair,
+            credential_with_key,
+        )
+        .expect("Failed to build legacy key package");
+
+    let serialized = key_package_bundle
+        .key_package()
+        .tls_serialize_detached()
+        .expect("Failed to serialize key package");
+    let content = encode_content(&serialized, ContentEncoding::Base64);
+
+    // Build kind:443 (legacy) event tags. Match the kind:443 shape produced
+    // by MDK's own helper (see `tags_443` in KeyPackageEventData): no `d`,
+    // no `mls_proposals` requirement at parse time.
+    let extensions_hex: Vec<String> = SUPPORTED_EXTENSIONS
+        .iter()
+        .map(|e| format!("0x{:04x}", u16::from(*e)))
+        .collect();
+    let relays = vec![RelayUrl::parse("wss://test.relay").unwrap()];
+    let tags = vec![
+        Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
+        Tag::custom(
+            TagKind::MlsCiphersuite,
+            [format!("0x{:04x}", u16::from(DEFAULT_CIPHERSUITE))],
+        ),
+        Tag::custom(TagKind::MlsExtensions, extensions_hex),
+        Tag::relays(relays),
+        Tag::client(format!("legacy-test/{}", env!("CARGO_PKG_VERSION"))),
+        Tag::custom(
+            TagKind::Custom("encoding".into()),
+            [ContentEncoding::Base64.as_tag_value()],
+        ),
+    ];
+
+    EventBuilder::new(MLS_KEY_PACKAGE_KIND_LEGACY, content)
+        .tags(tags)
+        .sign_with_keys(member_keys)
+        .expect("Failed to sign legacy key package event")
 }
 
 /// Creates standard test group configuration data

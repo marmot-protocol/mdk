@@ -40,8 +40,7 @@ pub mod welcomes;
 
 use self::callback::{MdkCallback, RollbackInfo};
 use self::constant::{
-    DEFAULT_CIPHERSUITE, GROUP_CONTEXT_REQUIRED_EXTENSIONS, GROUP_CONTEXT_REQUIRED_PROPOSALS,
-    SUPPORTED_EXTENSIONS, SUPPORTED_PROPOSALS, TAG_PROPOSALS,
+    DEFAULT_CIPHERSUITE, SUPPORTED_EXTENSIONS, SUPPORTED_PROPOSALS, TAG_PROPOSALS,
 };
 use self::epoch_snapshots::EpochSnapshotManager;
 pub use self::error::Error;
@@ -400,16 +399,6 @@ where
             None,
         )
         .with_grease(&self.provider.crypto)
-    }
-
-    /// Get the group's required capabilities extension
-    #[inline]
-    pub(crate) fn required_capabilities_extension(&self) -> Extension {
-        Extension::RequiredCapabilities(RequiredCapabilitiesExtension::new(
-            &GROUP_CONTEXT_REQUIRED_EXTENSIONS,
-            &GROUP_CONTEXT_REQUIRED_PROPOSALS,
-            &[],
-        ))
     }
 
     /// Get the ciphersuite value formatted for Nostr tags (hex with 0x prefix)

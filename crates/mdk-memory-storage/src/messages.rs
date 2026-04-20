@@ -244,8 +244,8 @@ impl MessageStorage for MdkMemoryStorage {
 
         let invalidated: Vec<ProcessedMessage> = inner
             .processed_messages_cache
-            .iter()
-            .filter_map(|(_, pm)| {
+            .values()
+            .filter_map(|pm| {
                 if let Some(ref msg_group_id) = pm.mls_group_id
                     && msg_group_id == group_id
                     && pm.state == ProcessedMessageState::EpochInvalidated
