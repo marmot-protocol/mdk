@@ -856,6 +856,18 @@ impl MdkMemoryStorage {
     pub fn limits(&self) -> &ValidationLimits {
         &self.limits
     }
+
+    /// Number of MLS signature key pairs currently stored.
+    ///
+    /// Gated behind the `test-utils` feature: this is invariant-probe
+    /// scaffolding for tests that need to observe signer-store growth
+    /// when the fresh signer's public key is generated inside the call
+    /// under test (so `SignatureKeyPair::read` point-lookups cannot
+    /// observe it). Not part of the production API surface.
+    #[cfg(feature = "test-utils")]
+    pub fn signature_key_count(&self) -> usize {
+        self.inner.read().mls_signature_keys.data.len()
+    }
 }
 
 /// Implementation of `MdkStorageProvider` for memory-based storage.

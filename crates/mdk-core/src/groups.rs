@@ -1185,8 +1185,6 @@ where
         // Validate group members
         self.validate_group_members(creator_public_key, &member_pubkeys, &admins)?;
 
-        let (credential, signer) = self.generate_credential_with_key(creator_public_key)?;
-
         let group_data = NostrGroupDataExtension::new(
             config.name,
             config.description,
@@ -1257,6 +1255,14 @@ where
             .sender_ratchet_configuration(sender_ratchet_config)
             .max_past_epochs(self.config.max_past_epochs)
             .build();
+
+        // Generate the creator's signer last, right before it is handed to
+        // OpenMLS. `generate_credential_with_key` persists the fresh signer
+        // into provider storage as a side effect, so any preflight failure
+        // above (member validation, KeyPackage parse, extension build) must
+        // happen before this line — otherwise an early error would leave an
+        // orphan signer in storage.
+        let (credential, signer) = self.generate_credential_with_key(creator_public_key)?;
 
         let mut mls_group =
             MlsGroup::new(&self.provider, &signer, &group_config, credential.clone())?;
@@ -6118,6 +6124,44 @@ mod tests {
         assert!(
             active_signer.is_some(),
             "active signer keypair must be present in storage after successful retry"
+        );
+    }
+
+    /// A `create_group` call that fails while parsing an invitee KeyPackage must
+    /// not leave the creator's signer behind in provider storage. The signer is
+    /// only useful paired with the group we failed to build; persisting it on
+    /// the error path is leaked state.
+    #[test]
+    fn test_create_group_with_invalid_invitee_kp_does_not_persist_signer() {
+        let creator_mdk = create_test_mdk();
+        let (creator, members, admins) = create_test_group_members();
+        let creator_pk = creator.public_key();
+
+        // One good invitee and one malformed event: the malformed KP declares
+        // `members[1]`'s identity in its credential but is signed by an
+        // unrelated key, which `parse_key_package` rejects with
+        // `KeyPackageIdentityMismatch`.
+        let good_kp = create_key_package_event(&creator_mdk, &members[0]);
+        let impostor = Keys::generate();
+        let malformed_kp =
+            create_key_package_event_with_key(&creator_mdk, &members[1].public_key(), &impostor);
+
+        let signers_before = creator_mdk.provider.storage.signature_key_count();
+
+        let result = creator_mdk.create_group(
+            &creator_pk,
+            vec![good_kp, malformed_kp],
+            create_nostr_group_config_data(admins),
+        );
+        assert!(
+            result.is_err(),
+            "create_group must reject a malformed invitee KeyPackage"
+        );
+
+        let signers_after = creator_mdk.provider.storage.signature_key_count();
+        assert_eq!(
+            signers_before, signers_after,
+            "failed create_group must not persist a signer (orphan signer leaked)"
         );
     }
 
