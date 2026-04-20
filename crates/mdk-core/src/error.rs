@@ -99,6 +99,13 @@ pub enum Error {
     /// Group error
     #[error("{0}")]
     Group(String),
+    /// An invitee's KeyPackage advertises a `LeafNode.capabilities.proposals`
+    /// set that does not cover the group's `RequiredCapabilities`. OpenMLS
+    /// rejects the add at leaf-node validation; MDK surfaces it as this
+    /// typed variant so callers can distinguish legacy-joiner rejection
+    /// from other `add_members` failures.
+    #[error("invitee KeyPackage is missing a proposal type required by the group")]
+    InviteeMissingRequiredProposal,
     /// Group exporter secret not found
     #[error("group exporter secret not found")]
     GroupExporterSecretNotFound,
