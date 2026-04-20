@@ -47,7 +47,7 @@ kamadak-exif.workspace = true
 
 [dev-dependencies]
 mdk-storage-traits = { workspace = true, features = ["test-utils"] }
-mdk-memory-storage.workspace = true
+mdk-memory-storage = { workspace = true, features = ["test-utils"] }
 mdk-sqlite-storage = { workspace = true, features = ["test-utils"] }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
