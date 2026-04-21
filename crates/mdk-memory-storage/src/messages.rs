@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 
 use mdk_storage_traits::GroupId;
-use nostr::EventId;
+use nostr::{EventId, JsonUtil};
 #[cfg(test)]
 use nostr::{Kind, Tags, Timestamp, UnsignedEvent};
 
@@ -13,6 +13,60 @@ use mdk_storage_traits::messages::error::MessageError;
 use mdk_storage_traits::messages::types::*;
 
 use crate::MdkMemoryStorage;
+
+/// Maximum size for message content, matching the SQLite backend.
+const MAX_MESSAGE_CONTENT_SIZE: usize = 1024 * 1024;
+
+/// Maximum size for serialized tags JSON, matching the SQLite backend.
+const MAX_TAGS_JSON_SIZE: usize = 100 * 1024;
+
+/// Maximum size for serialized event JSON, matching the SQLite backend.
+const MAX_EVENT_JSON_SIZE: usize = 100 * 1024;
+
+fn validate_size(data: &[u8], max_size: usize, field_name: &str) -> Result<(), MessageError> {
+    if data.len() > max_size {
+        return Err(MessageError::InvalidParameters(format!(
+            "{} exceeds maximum length of {} bytes (got {} bytes)",
+            field_name,
+            max_size,
+            data.len()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_string_length(
+    s: &str,
+    max_length: usize,
+    field_name: &str,
+) -> Result<(), MessageError> {
+    if s.len() > max_length {
+        return Err(MessageError::InvalidParameters(format!(
+            "{} exceeds maximum length of {} bytes (got {} bytes)",
+            field_name,
+            max_length,
+            s.len()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_message_payload(message: &Message) -> Result<(), MessageError> {
+    validate_string_length(
+        &message.content,
+        MAX_MESSAGE_CONTENT_SIZE,
+        "Message content",
+    )?;
+
+    let tags_json = serde_json::to_string(&message.tags)
+        .map_err(|e| MessageError::DatabaseError(format!("Failed to serialize tags: {}", e)))?;
+    validate_size(tags_json.as_bytes(), MAX_TAGS_JSON_SIZE, "Tags JSON")?;
+
+    let event_json = message.event.as_json();
+    validate_size(event_json.as_bytes(), MAX_EVENT_JSON_SIZE, "Event JSON")?;
+
+    Ok(())
+}
 
 impl MessageStorage for MdkMemoryStorage {
     fn save_message(&self, message: Message) -> Result<(), MessageError> {
@@ -33,6 +87,8 @@ impl MessageStorage for MdkMemoryStorage {
                 )));
             }
         }
+
+        validate_message_payload(&message)?;
 
         // Acquire lock on inner storage
         let mut guard = self.inner.write();
@@ -94,7 +150,7 @@ impl MessageStorage for MdkMemoryStorage {
         event_id: &EventId,
     ) -> Result<Option<ProcessedMessage>, MessageError> {
         let inner = self.inner.read();
-        Ok(inner.processed_messages_cache.peek(event_id).cloned())
+        Ok(inner.processed_messages_cache.get(event_id).cloned())
     }
 
     fn save_processed_message(
@@ -104,7 +160,7 @@ impl MessageStorage for MdkMemoryStorage {
         let mut inner = self.inner.write();
         inner
             .processed_messages_cache
-            .put(processed_message.wrapper_event_id, processed_message);
+            .insert(processed_message.wrapper_event_id, processed_message);
 
         Ok(())
     }
@@ -188,8 +244,8 @@ impl MessageStorage for MdkMemoryStorage {
 
         let invalidated: Vec<ProcessedMessage> = inner
             .processed_messages_cache
-            .iter()
-            .filter_map(|(_, pm)| {
+            .values()
+            .filter_map(|pm| {
                 if let Some(ref msg_group_id) = pm.mls_group_id
                     && msg_group_id == group_id
                     && pm.state == ProcessedMessageState::EpochInvalidated
@@ -303,6 +359,7 @@ mod tests {
 
     use mdk_storage_traits::groups::GroupStorage;
     use mdk_storage_traits::groups::types::{Group, GroupState, SelfUpdateState};
+    use mdk_storage_traits::messages::types::{ProcessedMessage, ProcessedMessageState};
     use nostr::Keys;
 
     use super::*;
@@ -366,6 +423,101 @@ mod tests {
             epoch,
             state: MessageState::Created,
         }
+    }
+
+    fn assert_save_message_invalid_parameters(result: Result<(), MessageError>, expected: &str) {
+        match result {
+            Err(MessageError::InvalidParameters(message)) => {
+                assert!(
+                    message.contains(expected),
+                    "expected error containing '{expected}', got '{message}'"
+                );
+            }
+            Err(err) => panic!("expected InvalidParameters error, got {err:?}"),
+            Ok(()) => panic!("expected save_message to reject invalid payload"),
+        }
+    }
+
+    #[test]
+    fn test_save_message_rejects_oversized_content() {
+        let storage = MdkMemoryStorage::new();
+        let group_id = GroupId::from_slice(&[1, 2, 3, 4]);
+        let event_id = EventId::from_slice(&[10u8; 32]).unwrap();
+
+        storage
+            .save_group(create_test_group(group_id.clone()))
+            .unwrap();
+
+        let oversized_content = "a".repeat(MAX_MESSAGE_CONTENT_SIZE + 1);
+        let message = create_test_message(event_id, group_id.clone(), &oversized_content, 1000);
+
+        let result = storage.save_message(message);
+
+        assert_save_message_invalid_parameters(result, "Message content exceeds maximum length");
+        assert!(
+            storage
+                .find_message_by_event_id(&group_id, &event_id)
+                .unwrap()
+                .is_none(),
+            "oversized message content must not be cached"
+        );
+    }
+
+    #[test]
+    fn test_save_message_rejects_oversized_tags_json() {
+        let storage = MdkMemoryStorage::new();
+        let group_id = GroupId::from_slice(&[1, 2, 3, 4]);
+        let event_id = EventId::from_slice(&[11u8; 32]).unwrap();
+
+        storage
+            .save_group(create_test_group(group_id.clone()))
+            .unwrap();
+
+        let oversized_tag_value = "a".repeat(MAX_TAGS_JSON_SIZE);
+        let mut message = create_test_message(event_id, group_id.clone(), "content", 1000);
+        message.tags = Tags::parse(vec![vec!["imeta", oversized_tag_value.as_str()]]).unwrap();
+
+        let result = storage.save_message(message);
+
+        assert_save_message_invalid_parameters(result, "Tags JSON exceeds maximum length");
+        assert!(
+            storage
+                .find_message_by_event_id(&group_id, &event_id)
+                .unwrap()
+                .is_none(),
+            "message with oversized tags must not be cached"
+        );
+    }
+
+    #[test]
+    fn test_save_message_rejects_oversized_event_json() {
+        let storage = MdkMemoryStorage::new();
+        let group_id = GroupId::from_slice(&[1, 2, 3, 4]);
+        let event_id = EventId::from_slice(&[12u8; 32]).unwrap();
+
+        storage
+            .save_group(create_test_group(group_id.clone()))
+            .unwrap();
+
+        let mut message = create_test_message(event_id, group_id.clone(), "content", 1000);
+        message.event = UnsignedEvent::new(
+            message.pubkey,
+            message.created_at,
+            message.kind,
+            Tags::new(),
+            "a".repeat(MAX_EVENT_JSON_SIZE),
+        );
+
+        let result = storage.save_message(message);
+
+        assert_save_message_invalid_parameters(result, "Event JSON exceeds maximum length");
+        assert!(
+            storage
+                .find_message_by_event_id(&group_id, &event_id)
+                .unwrap()
+                .is_none(),
+            "message with oversized event JSON must not be cached"
+        );
     }
 
     /// Test that saving a message with the same EventId updates the existing message
@@ -1123,6 +1275,60 @@ mod tests {
                 .find_message_by_event_id(&group_id, &eid)
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    /// Regression test for marmot-security#12:
+    /// processed_messages must not be evicted by cache pressure.
+    ///
+    /// An attacker flooding with unique event IDs fills the LRU cache so that
+    /// earlier deduplication records are evicted, allowing replays of already-
+    /// processed messages. Using a HashMap instead of LruCache prevents this.
+    #[test]
+    fn test_processed_messages_not_evicted_under_cache_pressure() {
+        // Create storage with a very small cache so pressure is easy to trigger
+        let limits = crate::ValidationLimits::default().with_cache_size(5);
+        let storage = MdkMemoryStorage::with_limits(limits);
+
+        let group_id = GroupId::from_slice(&[42u8; 4]);
+        let group = create_test_group(group_id.clone());
+        storage.save_group(group).unwrap();
+
+        // Save one processed message that should survive cache pressure
+        let early_wrapper_id = EventId::from_slice(&[1u8; 32]).unwrap();
+        let pm = ProcessedMessage {
+            wrapper_event_id: early_wrapper_id,
+            message_event_id: None,
+            processed_at: Timestamp::from(1000u64),
+            epoch: Some(0),
+            mls_group_id: Some(group_id.clone()),
+            state: ProcessedMessageState::Processed,
+            failure_reason: None,
+        };
+        storage.save_processed_message(pm).unwrap();
+
+        // Flood with many more processed messages to exceed cache_size (5) many times over
+        for i in 2u8..=50 {
+            let wrapper_id = EventId::from_slice(&[i; 32]).unwrap();
+            let pm = ProcessedMessage {
+                wrapper_event_id: wrapper_id,
+                message_event_id: None,
+                processed_at: Timestamp::from(1000u64 + u64::from(i)),
+                epoch: Some(u64::from(i)),
+                mls_group_id: Some(group_id.clone()),
+                state: ProcessedMessageState::Processed,
+                failure_reason: None,
+            };
+            storage.save_processed_message(pm).unwrap();
+        }
+
+        // The early record must still be present — it must not have been evicted
+        let found = storage
+            .find_processed_message_by_event_id(&early_wrapper_id)
+            .unwrap();
+        assert!(
+            found.is_some(),
+            "processed message was evicted under cache pressure — replay dedup broken"
         );
     }
 }

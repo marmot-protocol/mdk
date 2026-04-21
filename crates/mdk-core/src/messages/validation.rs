@@ -4,7 +4,7 @@
 
 use mdk_storage_traits::MdkStorageProvider;
 use nostr::{Event, Kind, TagKind, Timestamp};
-use openmls::prelude::{BasicCredential, LeafNodeIndex, MlsGroup, Proposal, Sender, StagedCommit};
+use openmls::prelude::{BasicCredential, MlsGroup, Proposal, Sender, StagedCommit};
 
 use crate::MDK;
 use crate::error::Error;
@@ -224,52 +224,6 @@ where
         has_self_remove
     }
 
-    /// Validates that removing the specified members would not deplete all admins.
-    ///
-    /// Per MIP-03, a Commit containing SelfRemove proposals MUST be rejected
-    /// if the resulting admin_pubkeys set would be empty. This checks the
-    /// cumulative effect of all departures, not each one individually.
-    ///
-    /// Admin count is cross-referenced against actual group membership to ignore
-    /// stale entries in `admin_pubkeys` (e.g., from admins who departed without
-    /// a corresponding GroupContextExtensions update).
-    pub(super) fn validate_admin_depletion(
-        &self,
-        mls_group: &MlsGroup,
-        departing_leaf_indices: &[LeafNodeIndex],
-    ) -> Result<()> {
-        let group_data = crate::extension::NostrGroupDataExtension::from_group(mls_group)?;
-
-        // Count only admins who are actual group members (ignores stale entries)
-        let active_admin_count = mls_group
-            .members()
-            .filter_map(|member| {
-                let basic_cred = BasicCredential::try_from(member.credential).ok()?;
-                let pubkey = self.parse_credential_identity(basic_cred.identity()).ok()?;
-                group_data.admins.contains(&pubkey).then_some(pubkey)
-            })
-            .count();
-
-        let mut departing_admin_count = 0usize;
-        for &leaf_index in departing_leaf_indices {
-            let member = mls_group
-                .member_at(leaf_index)
-                .ok_or(Error::MessageFromNonMember)?;
-            let basic_cred = BasicCredential::try_from(member.credential.clone())?;
-            let pubkey = self.parse_credential_identity(basic_cred.identity())?;
-
-            if group_data.admins.contains(&pubkey) {
-                departing_admin_count += 1;
-            }
-        }
-
-        if departing_admin_count >= active_admin_count {
-            return Err(Error::Group("Would leave group with no admins".to_string()));
-        }
-
-        Ok(())
-    }
-
     /// Validates that a staged commit does not attempt to change any member's identity
     ///
     /// This function checks all Update proposals within a staged commit to ensure
@@ -357,6 +311,7 @@ where
                 let sender_is_admin = group_data.admins.contains(&sender_pubkey);
 
                 if sender_is_admin {
+                    self.validate_admin_invariant_after_commit(mls_group, staged_commit)?;
                     return Ok(());
                 }
 
@@ -378,17 +333,10 @@ where
                         leaf_index
                     );
 
-                    // Admin depletion check: the cumulative effect of all SelfRemove
-                    // proposals must not leave the group with zero admins.
-                    let departing_leaves: Vec<LeafNodeIndex> = staged_commit
-                        .queued_proposals()
-                        .filter_map(|queued| match queued.sender() {
-                            Sender::Member(leaf) => Some(*leaf),
-                            _ => None,
-                        })
-                        .collect();
-
-                    self.validate_admin_depletion(mls_group, &departing_leaves)?;
+                    // The staged invariant uses the post-commit group context,
+                    // so extension changes and all SelfRemove effects are
+                    // checked together before merge.
+                    self.validate_admin_invariant_after_commit(mls_group, staged_commit)?;
 
                     return Ok(());
                 }

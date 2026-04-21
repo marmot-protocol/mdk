@@ -19,7 +19,7 @@
 //! ## Memory Exhaustion Protection
 //!
 //! This implementation includes input validation to prevent memory exhaustion attacks.
-//! The following limits are enforced (with configurable defaults via [`ValidationLimits`]):
+//! The following configurable limits are enforced via [`ValidationLimits`]:
 //!
 //! - [`DEFAULT_MAX_RELAYS_PER_GROUP`]: Maximum number of relays per group
 //! - [`DEFAULT_MAX_MESSAGES_PER_GROUP`]: Maximum messages stored per group in the cache
@@ -29,6 +29,10 @@
 //! - [`DEFAULT_MAX_RELAYS_PER_WELCOME`]: Maximum number of relays in a welcome message
 //! - [`DEFAULT_MAX_ADMINS_PER_WELCOME`]: Maximum number of admin pubkeys in a welcome message
 //! - [`DEFAULT_MAX_RELAY_URL_LENGTH`]: Maximum length of a relay URL in bytes
+//!
+//! Message payloads also enforce the same fixed size limits as the SQLite backend:
+//! 1 MiB for message content, 100 KiB for serialized tags JSON, and 100 KiB for
+//! serialized event JSON.
 //!
 //! ## Customizing Limits
 //!
@@ -403,13 +407,16 @@ struct MdkMemoryStorageInner {
     groups_by_nostr_id_cache: LruCache<[u8; 32], Group>,
     group_relays_cache: LruCache<GroupId, BTreeSet<GroupRelay>>,
     welcomes_cache: LruCache<EventId, Welcome>,
-    processed_welcomes_cache: LruCache<EventId, ProcessedWelcome>,
+    // Security-critical: must not be evicted — use HashMap instead of LruCache
+    processed_welcomes_cache: HashMap<EventId, ProcessedWelcome>,
     messages_cache: LruCache<EventId, Message>,
     messages_by_group_cache: LruCache<GroupId, HashMap<EventId, Message>>,
-    processed_messages_cache: LruCache<EventId, ProcessedMessage>,
-    group_exporter_secrets_cache: LruCache<(GroupId, u64), GroupExporterSecret>,
-    group_legacy_exporter_secrets_cache: LruCache<(GroupId, u64), GroupExporterSecret>,
-    group_mip04_exporter_secrets_cache: LruCache<(GroupId, u64), GroupExporterSecret>,
+    // Security-critical: must not be evicted — use HashMap instead of LruCache
+    processed_messages_cache: HashMap<EventId, ProcessedMessage>,
+    // Security-critical: must not be evicted — use HashMap instead of LruCache
+    group_exporter_secrets_cache: HashMap<(GroupId, u64), GroupExporterSecret>,
+    group_legacy_exporter_secrets_cache: HashMap<(GroupId, u64), GroupExporterSecret>,
+    group_mip04_exporter_secrets_cache: HashMap<(GroupId, u64), GroupExporterSecret>,
 }
 
 impl fmt::Debug for MdkMemoryStorage {
@@ -483,13 +490,13 @@ impl MdkMemoryStorage {
             groups_by_nostr_id_cache: LruCache::new(cache_size),
             group_relays_cache: LruCache::new(cache_size),
             welcomes_cache: LruCache::new(cache_size),
-            processed_welcomes_cache: LruCache::new(cache_size),
+            processed_welcomes_cache: HashMap::new(),
             messages_cache: LruCache::new(cache_size),
             messages_by_group_cache: LruCache::new(cache_size),
-            processed_messages_cache: LruCache::new(cache_size),
-            group_exporter_secrets_cache: LruCache::new(cache_size),
-            group_legacy_exporter_secrets_cache: LruCache::new(cache_size),
-            group_mip04_exporter_secrets_cache: LruCache::new(cache_size),
+            processed_messages_cache: HashMap::new(),
+            group_exporter_secrets_cache: HashMap::new(),
+            group_legacy_exporter_secrets_cache: HashMap::new(),
+            group_mip04_exporter_secrets_cache: HashMap::new(),
         };
 
         MdkMemoryStorage {
@@ -531,18 +538,14 @@ impl MdkMemoryStorage {
             groups: inner.groups_cache.clone_to_hashmap(),
             groups_by_nostr_id: inner.groups_by_nostr_id_cache.clone_to_hashmap(),
             group_relays: inner.group_relays_cache.clone_to_hashmap(),
-            group_exporter_secrets: inner.group_exporter_secrets_cache.clone_to_hashmap(),
-            group_legacy_exporter_secrets: inner
-                .group_legacy_exporter_secrets_cache
-                .clone_to_hashmap(),
-            group_mip04_exporter_secrets: inner
-                .group_mip04_exporter_secrets_cache
-                .clone_to_hashmap(),
+            group_exporter_secrets: inner.group_exporter_secrets_cache.clone(),
+            group_legacy_exporter_secrets: inner.group_legacy_exporter_secrets_cache.clone(),
+            group_mip04_exporter_secrets: inner.group_mip04_exporter_secrets_cache.clone(),
             welcomes: inner.welcomes_cache.clone_to_hashmap(),
-            processed_welcomes: inner.processed_welcomes_cache.clone_to_hashmap(),
+            processed_welcomes: inner.processed_welcomes_cache.clone(),
             messages: inner.messages_cache.clone_to_hashmap(),
             messages_by_group: inner.messages_by_group_cache.clone_to_hashmap(),
-            processed_messages: inner.processed_messages_cache.clone_to_hashmap(),
+            processed_messages: inner.processed_messages_cache.clone(),
         }
     }
 
@@ -589,26 +592,16 @@ impl MdkMemoryStorage {
         snapshot
             .group_relays
             .restore_to_lru(&mut inner.group_relays_cache);
-        snapshot
-            .group_exporter_secrets
-            .restore_to_lru(&mut inner.group_exporter_secrets_cache);
-        snapshot
-            .group_legacy_exporter_secrets
-            .restore_to_lru(&mut inner.group_legacy_exporter_secrets_cache);
-        snapshot
-            .group_mip04_exporter_secrets
-            .restore_to_lru(&mut inner.group_mip04_exporter_secrets_cache);
+        inner.group_exporter_secrets_cache = snapshot.group_exporter_secrets;
+        inner.group_legacy_exporter_secrets_cache = snapshot.group_legacy_exporter_secrets;
+        inner.group_mip04_exporter_secrets_cache = snapshot.group_mip04_exporter_secrets;
         snapshot.welcomes.restore_to_lru(&mut inner.welcomes_cache);
-        snapshot
-            .processed_welcomes
-            .restore_to_lru(&mut inner.processed_welcomes_cache);
+        inner.processed_welcomes_cache = snapshot.processed_welcomes;
         snapshot.messages.restore_to_lru(&mut inner.messages_cache);
         snapshot
             .messages_by_group
             .restore_to_lru(&mut inner.messages_by_group_cache);
-        snapshot
-            .processed_messages
-            .restore_to_lru(&mut inner.processed_messages_cache);
+        inner.processed_messages_cache = snapshot.processed_messages;
     }
 
     // ========================================================================
@@ -783,36 +776,18 @@ impl MdkMemoryStorage {
         inner.group_relays_cache.pop(group_id);
 
         // Remove all MIP-03 exporter secrets for this group
-        let keys_to_remove: Vec<_> = inner
+        inner
             .group_exporter_secrets_cache
-            .iter()
-            .filter(|((gid, _), _)| gid == group_id)
-            .map(|(k, _)| k.clone())
-            .collect();
-        for key in keys_to_remove {
-            inner.group_exporter_secrets_cache.pop(&key);
-        }
+            .retain(|(gid, _), _| gid != group_id);
 
-        let legacy_keys_to_remove: Vec<_> = inner
+        inner
             .group_legacy_exporter_secrets_cache
-            .iter()
-            .filter(|((gid, _), _)| gid == group_id)
-            .map(|(k, _)| k.clone())
-            .collect();
-        for key in legacy_keys_to_remove {
-            inner.group_legacy_exporter_secrets_cache.pop(&key);
-        }
+            .retain(|(gid, _), _| gid != group_id);
 
         // Remove all MIP-04 exporter secrets for this group
-        let mip04_keys_to_remove: Vec<_> = inner
+        inner
             .group_mip04_exporter_secrets_cache
-            .iter()
-            .filter(|((gid, _), _)| gid == group_id)
-            .map(|(k, _)| k.clone())
-            .collect();
-        for key in mip04_keys_to_remove {
-            inner.group_mip04_exporter_secrets_cache.pop(&key);
-        }
+            .retain(|(gid, _), _| gid != group_id);
 
         // 2. Restore from snapshot
 
@@ -861,25 +836,37 @@ impl MdkMemoryStorage {
         for (epoch, secret) in snapshot.group_exporter_secrets {
             inner
                 .group_exporter_secrets_cache
-                .put((group_id.clone(), epoch), secret);
+                .insert((group_id.clone(), epoch), secret);
         }
 
         for (epoch, secret) in snapshot.group_legacy_exporter_secrets {
             inner
                 .group_legacy_exporter_secrets_cache
-                .put((group_id.clone(), epoch), secret);
+                .insert((group_id.clone(), epoch), secret);
         }
 
         for (epoch, secret) in snapshot.group_mip04_exporter_secrets {
             inner
                 .group_mip04_exporter_secrets_cache
-                .put((group_id.clone(), epoch), secret);
+                .insert((group_id.clone(), epoch), secret);
         }
     }
 
     /// Returns the current validation limits.
     pub fn limits(&self) -> &ValidationLimits {
         &self.limits
+    }
+
+    /// Number of MLS signature key pairs currently stored.
+    ///
+    /// Gated behind the `test-utils` feature: this is invariant-probe
+    /// scaffolding for tests that need to observe signer-store growth
+    /// when the fresh signer's public key is generated inside the call
+    /// under test (so `SignatureKeyPair::read` point-lookups cannot
+    /// observe it). Not part of the production API surface.
+    #[cfg(feature = "test-utils")]
+    pub fn signature_key_count(&self) -> usize {
+        self.inner.read().mls_signature_keys.data.len()
     }
 }
 
@@ -988,46 +975,22 @@ impl MdkStorageProvider for MdkMemoryStorage {
             inner.group_relays_cache.pop(group_id);
 
             // Exporter secrets (keyed by (GroupId, u64) — must iterate)
-            let secret_keys: Vec<(GroupId, u64)> = inner
+            inner
                 .group_exporter_secrets_cache
-                .iter()
-                .filter(|((gid, _), _)| gid == group_id)
-                .map(|(k, _)| k.clone())
-                .collect();
-            for key in &secret_keys {
-                inner.group_exporter_secrets_cache.pop(key);
-            }
+                .retain(|(gid, _), _| gid != group_id);
 
-            let legacy_keys: Vec<(GroupId, u64)> = inner
+            inner
                 .group_legacy_exporter_secrets_cache
-                .iter()
-                .filter(|((gid, _), _)| gid == group_id)
-                .map(|(k, _)| k.clone())
-                .collect();
-            for key in &legacy_keys {
-                inner.group_legacy_exporter_secrets_cache.pop(key);
-            }
+                .retain(|(gid, _), _| gid != group_id);
 
-            let mip04_keys: Vec<(GroupId, u64)> = inner
+            inner
                 .group_mip04_exporter_secrets_cache
-                .iter()
-                .filter(|((gid, _), _)| gid == group_id)
-                .map(|(k, _)| k.clone())
-                .collect();
-            for key in &mip04_keys {
-                inner.group_mip04_exporter_secrets_cache.pop(key);
-            }
+                .retain(|(gid, _), _| gid != group_id);
 
             // Processed messages (keyed by EventId — must iterate for group match)
-            let pm_keys: Vec<nostr::EventId> = inner
+            inner
                 .processed_messages_cache
-                .iter()
-                .filter(|(_, pm)| pm.mls_group_id.as_ref() == Some(group_id))
-                .map(|(k, _)| *k)
-                .collect();
-            for key in &pm_keys {
-                inner.processed_messages_cache.pop(key);
-            }
+                .retain(|_, pm| pm.mls_group_id.as_ref() != Some(group_id));
 
             // Welcomes (keyed by EventId — must iterate for group match)
             let welcome_keys: Vec<nostr::EventId> = inner
@@ -1673,9 +1636,9 @@ mod tests {
         {
             let inner = nostr_storage.inner.read();
             let cache = &inner.group_exporter_secrets_cache;
-            assert!(cache.contains(&(mls_group_id.clone(), 0)));
-            assert!(cache.contains(&(mls_group_id.clone(), 1)));
-            assert!(!cache.contains(&(mls_group_id.clone(), 999)));
+            assert!(cache.contains_key(&(mls_group_id.clone(), 0)));
+            assert!(cache.contains_key(&(mls_group_id.clone(), 1)));
+            assert!(!cache.contains_key(&(mls_group_id.clone(), 999)));
         }
     }
 
@@ -1761,7 +1724,7 @@ mod tests {
         {
             let inner = nostr_storage.inner.read();
             let cache = &inner.processed_welcomes_cache;
-            assert!(cache.contains(&wrapper_id));
+            assert!(cache.contains_key(&wrapper_id));
         }
     }
 
@@ -1863,7 +1826,7 @@ mod tests {
         {
             let inner = nostr_storage.inner.read();
             let cache = &inner.processed_messages_cache;
-            assert!(cache.contains(&wrapper_id));
+            assert!(cache.contains_key(&wrapper_id));
         }
     }
 

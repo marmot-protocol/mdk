@@ -7,25 +7,22 @@ pub enum Mip05Error {
     /// Notification platform byte is not recognized.
     #[error("invalid notification platform")]
     InvalidNotificationPlatform,
-    /// APNs device tokens must be exactly 32 bytes.
-    #[error("APNs tokens must be exactly 32 bytes")]
-    InvalidApnsTokenLength,
-    /// FCM device tokens must be between 1 and 200 bytes.
-    #[error("FCM tokens must be between 1 and 200 bytes")]
-    InvalidFcmTokenLength,
+    /// Device token is empty or exceeds the MIP-05 wire-format capacity.
+    #[error("invalid device token length")]
+    InvalidDeviceTokenLength,
     /// Padded plaintext or caller-provided padding length is invalid.
     #[error("invalid MIP-05 token padding length")]
     InvalidTokenPaddingLength,
     /// Device token length cannot fit the encoded wire format.
     #[error("device token is too large")]
     DeviceTokenTooLarge,
-    /// Padded token plaintext is not 220 bytes.
+    /// Padded token plaintext is not 1024 bytes.
     #[error("invalid MIP-05 token plaintext length")]
     InvalidTokenPlaintextLength,
     /// Token length field is invalid for the declared platform.
     #[error("invalid MIP-05 token length")]
     InvalidTokenLength,
-    /// Encrypted token is not the required 280-byte size.
+    /// Encrypted token is not the required 1084-byte size.
     #[error("invalid encrypted token length")]
     InvalidEncryptedTokenLength,
     /// Encrypted token base64 is malformed.

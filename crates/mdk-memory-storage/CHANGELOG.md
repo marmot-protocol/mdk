@@ -17,6 +17,8 @@
 
 ### Fixed
 
+- Fixed `MdkMemoryStorage::save_message` to reject oversized message content, serialized tags JSON, and serialized event JSON before caching messages, matching SQLite backend payload bounds. ([#257](https://github.com/marmot-protocol/mdk/pull/257))
+
 ### Removed
 
 ### Deprecated
@@ -34,10 +36,14 @@
 
 ### Added
 
+- Added a `test-utils` feature, matching the convention in `mdk-storage-traits` and `mdk-sqlite-storage`, to gate test-only introspection helpers behind an explicit opt-in. ([#262](https://github.com/marmot-protocol/mdk/pull/262))
+- Added `MdkMemoryStorage::signature_key_count` under the `test-utils` feature. Cardinality probe over the signer store for invariant tests that need to observe store growth when the fresh signer's public key is generated internally and therefore cannot be rediscovered via `SignatureKeyPair::read`. ([#262](https://github.com/marmot-protocol/mdk/pull/262))
 - Implemented `delete_messages_for_group` and `delete_group` for local "clear chat" and "delete chat" operations. Added `clear_group` methods to `MlsGroupData` and `MlsEpochKeyPairs` for bulk group-scoped MLS state cleanup. ([#250](https://github.com/marmot-protocol/mdk/pull/250))
 - Implemented legacy exporter-secret compatibility storage for the temporary `0.6.x -> 0.7.x` migration window, including snapshot and restore support for preserved pre-0.7.0 group-event secrets. ([#222](https://github.com/marmot-protocol/mdk/pull/222))
 
 ### Fixed
+
+- Converted `processed_messages_cache`, `processed_welcomes_cache`, and all three `group_*_exporter_secrets_cache` fields from `LruCache` to `HashMap` to prevent silent eviction of security-critical deduplication records and decryption keys under cache pressure (fixes [marmot-security#12](https://github.com/marmot-protocol/marmot-security/issues/12)) ([#259](https://github.com/marmot-protocol/mdk/pull/259)).
 
 ### Removed
 
