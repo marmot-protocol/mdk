@@ -1441,6 +1441,8 @@ where
             leaf_node_params,
         )?;
 
+        self.ensure_mixed_wire_format(&mut mls_group);
+
         // Serialize the message
         let serialized_commit_message = commit_message_bundle.commit().tls_serialize_detached()?;
 
@@ -1476,6 +1478,66 @@ where
             welcome_rumors: None, // serialized_group_info,
             mls_group_id: group_id.clone(),
         })
+    }
+
+    /// Converges a member's local wire-format policy to
+    /// `MIXED_CIPHERTEXT_WIRE_FORMAT_POLICY`, MDK's current default.
+    ///
+    /// Called from commit-emitting operations as a piggy-backed hygiene step:
+    /// every rotation brings a member's local state forward so that a future
+    /// `GroupContextExtensions` upgrade adding `SelfRemove` to the group's
+    /// `RequiredCapabilities` finds members already able to accept SelfRemove
+    /// `PublicMessage` proposals. No-op when the policy is already converged,
+    /// so it's cheap to call unconditionally.
+    ///
+    /// Failures to persist the updated configuration are logged at `warn` and
+    /// swallowed. The in-memory config is still correct for the current
+    /// session; the next rotation will retry. The caller's primary operation
+    /// is not affected.
+    ///
+    /// # Note on full-config rebuild
+    ///
+    /// `MlsGroup::set_configuration` replaces the entire `MlsGroupJoinConfig`.
+    /// Ideally we would preserve every non-wire-format field from the group's
+    /// stored config, but openmls 0.8.1 only exposes getters for three of the
+    /// six fields (`wire_format_policy`, `padding_size`,
+    /// `sender_ratchet_configuration`). Falling back to builder defaults for
+    /// the hidden fields would regress known MDK settings
+    /// (`max_past_epochs`, `use_ratchet_tree_extension`). MDK's existing
+    /// invariant — every site that writes an `MlsGroupJoinConfig`
+    /// (`create_group`, `join_group_from_welcome`, `try_self_remove`) rebuilds
+    /// it from `self.config` — keeps the stored config in sync with the
+    /// current MDK instance, so rebuilding here matches expectations for
+    /// the other fields.
+    fn ensure_mixed_wire_format(&self, mls_group: &mut MlsGroup) {
+        if mls_group.configuration().wire_format_policy() == MIXED_CIPHERTEXT_WIRE_FORMAT_POLICY {
+            return;
+        }
+
+        let sender_ratchet_config = SenderRatchetConfiguration::new(
+            self.config.out_of_order_tolerance,
+            self.config.maximum_forward_distance,
+        );
+        let converged_config = MlsGroupJoinConfig::builder()
+            .wire_format_policy(MIXED_CIPHERTEXT_WIRE_FORMAT_POLICY)
+            .use_ratchet_tree_extension(true)
+            .sender_ratchet_configuration(sender_ratchet_config)
+            .max_past_epochs(self.config.max_past_epochs)
+            .build();
+
+        tracing::debug!(
+            target: "mdk_core::groups::ensure_mixed_wire_format",
+            "Converging local wire-format policy to MIXED_CIPHERTEXT"
+        );
+
+        if let Err(e) = mls_group.set_configuration(self.storage(), &converged_config) {
+            tracing::warn!(
+                target: "mdk_core::groups::ensure_mixed_wire_format",
+                "Failed to persist converged wire-format policy: {e}. \
+                 In-memory config is correct for this session; \
+                 persisted config may be stale."
+            );
+        }
     }
 
     /// Attempts to create a SelfRemove proposal, falling back to Remove for legacy groups.
@@ -6667,6 +6729,63 @@ mod tests {
             "self_update should refresh leaf proposals to current MDK capabilities; \
              expected SelfRemove, got {:?}",
             post_proposals
+        );
+    }
+
+    /// Convergence: `self_update` normalises a stale PURE_CIPHERTEXT local
+    /// policy to `MIXED_CIPHERTEXT_WIRE_FORMAT_POLICY`. The PURE precondition
+    /// simulates persisted state from pre-MIXED-welcomes MDK builds — today's
+    /// welcome-processing creates MIXED, but local storage from older
+    /// installations can still carry PURE. Bringing members forward on
+    /// rotation reduces the wire-format reconciliation burden at a future
+    /// `GroupContextExtensions`-upgrade event.
+    #[test]
+    fn test_self_update_converges_wire_format_to_mixed_ciphertext() {
+        use openmls::prelude::{
+            MIXED_CIPHERTEXT_WIRE_FORMAT_POLICY, MlsGroupJoinConfig,
+            PURE_CIPHERTEXT_WIRE_FORMAT_POLICY,
+        };
+
+        let mdk = create_test_mdk();
+        let (creator, members, admins) = create_test_group_members();
+        let group_id = create_test_group(&mdk, &creator, &members, &admins);
+
+        // Force the creator's local policy to PURE_CIPHERTEXT, simulating
+        // persisted state from an older MDK build that defaulted to PURE.
+        let mut mls_group = mdk
+            .load_mls_group(&group_id)
+            .expect("load for setup")
+            .expect("group exists");
+        let pure_config = MlsGroupJoinConfig::builder()
+            .wire_format_policy(PURE_CIPHERTEXT_WIRE_FORMAT_POLICY)
+            .build();
+        mls_group
+            .set_configuration(&mdk.provider.storage, &pure_config)
+            .expect("force PURE wire format");
+        drop(mls_group);
+
+        // Sanity: the stale precondition is actually persisted.
+        let pre = mdk
+            .load_mls_group(&group_id)
+            .expect("load pre")
+            .expect("group pre");
+        assert_eq!(
+            pre.configuration().wire_format_policy(),
+            PURE_CIPHERTEXT_WIRE_FORMAT_POLICY,
+            "sanity: member starts on stale PURE wire format"
+        );
+        drop(pre);
+
+        mdk.self_update(&group_id).expect("self_update");
+
+        let post = mdk
+            .load_mls_group(&group_id)
+            .expect("load post")
+            .expect("group post");
+        assert_eq!(
+            post.configuration().wire_format_policy(),
+            MIXED_CIPHERTEXT_WIRE_FORMAT_POLICY,
+            "self_update should converge wire format to MIXED_CIPHERTEXT"
         );
     }
 
