@@ -219,8 +219,8 @@ impl GroupStorage for MdkSqliteStorage {
             conn.execute(
                 "INSERT INTO groups
              (mls_group_id, nostr_group_id, name, description, image_hash, image_key, image_nonce, admin_pubkeys, last_message_id,
-              last_message_at, last_message_processed_at, epoch, state, last_self_update_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              last_message_at, last_message_processed_at, epoch, state, last_self_update_at, disappearing_message_secs)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(mls_group_id) DO UPDATE SET
                 nostr_group_id = excluded.nostr_group_id,
                 name = excluded.name,
@@ -234,7 +234,8 @@ impl GroupStorage for MdkSqliteStorage {
                 last_message_processed_at = excluded.last_message_processed_at,
                 epoch = excluded.epoch,
                 state = excluded.state,
-                last_self_update_at = excluded.last_self_update_at",
+                last_self_update_at = excluded.last_self_update_at,
+                disappearing_message_secs = excluded.disappearing_message_secs",
                 params![
                     &group.mls_group_id.as_slice(),
                     &group.nostr_group_id,
@@ -249,7 +250,8 @@ impl GroupStorage for MdkSqliteStorage {
                     &last_message_processed_at,
                     &(group.epoch as i64),
                     group.state.as_str(),
-                    &last_self_update_at
+                    &last_self_update_at,
+                    &group.disappearing_message_secs.and_then(|d| i64::try_from(d).ok())
                 ],
             )
             .map_err(into_group_err)?;
@@ -452,6 +454,7 @@ mod tests {
             image_key,
             image_nonce,
             self_update_state: SelfUpdateState::Required,
+            disappearing_message_secs: None,
         };
 
         // Save the group
@@ -478,6 +481,62 @@ mod tests {
     }
 
     #[test]
+    fn test_group_roundtrip_with_disappearing_message_secs() {
+        let storage = MdkSqliteStorage::new_in_memory().unwrap();
+
+        let mls_group_id = GroupId::from_slice(&[10, 20, 30, 40]);
+        let nostr_group_id = generate_random_bytes(32).try_into().unwrap();
+
+        let group = Group {
+            mls_group_id: mls_group_id.clone(),
+            nostr_group_id,
+            name: "Ephemeral Group".to_string(),
+            description: "Messages vanish".to_string(),
+            admin_pubkeys: BTreeSet::new(),
+            last_message_id: None,
+            last_message_at: None,
+            last_message_processed_at: None,
+            epoch: 0,
+            state: GroupState::Active,
+            image_hash: None,
+            image_key: None,
+            image_nonce: None,
+            self_update_state: SelfUpdateState::Required,
+            disappearing_message_secs: Some(3600),
+        };
+
+        storage.save_group(group).unwrap();
+
+        let loaded = storage
+            .find_group_by_mls_group_id(&mls_group_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.disappearing_message_secs, Some(3600));
+
+        // Update to a different value via upsert
+        let mut updated = loaded;
+        updated.disappearing_message_secs = Some(86400);
+        storage.save_group(updated).unwrap();
+
+        let reloaded = storage
+            .find_group_by_mls_group_id(&mls_group_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(reloaded.disappearing_message_secs, Some(86400));
+
+        // Clear back to None
+        let mut cleared = reloaded;
+        cleared.disappearing_message_secs = None;
+        storage.save_group(cleared).unwrap();
+
+        let final_group = storage
+            .find_group_by_mls_group_id(&mls_group_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(final_group.disappearing_message_secs, None);
+    }
+
+    #[test]
     fn test_group_name_length_validation() {
         let storage = MdkSqliteStorage::new_in_memory().unwrap();
 
@@ -500,6 +559,7 @@ mod tests {
             image_key: None,
             image_nonce: None,
             self_update_state: SelfUpdateState::Required,
+            disappearing_message_secs: None,
         };
 
         // Should fail due to name length
@@ -536,6 +596,7 @@ mod tests {
             image_key: None,
             image_nonce: None,
             self_update_state: SelfUpdateState::Required,
+            disappearing_message_secs: None,
         };
 
         // Should fail due to description length
@@ -575,6 +636,7 @@ mod tests {
             image_key: None,
             image_nonce: None,
             self_update_state: SelfUpdateState::Required,
+            disappearing_message_secs: None,
         };
 
         storage.save_group(group).unwrap();
@@ -706,6 +768,7 @@ mod tests {
             image_key: None,
             image_nonce: None,
             self_update_state: SelfUpdateState::Required,
+            disappearing_message_secs: None,
         };
 
         // Save the group
@@ -793,6 +856,7 @@ mod tests {
             image_key: None,
             image_nonce: None,
             self_update_state: SelfUpdateState::Required,
+            disappearing_message_secs: None,
         };
         storage.save_group(group1).unwrap();
 
@@ -813,6 +877,7 @@ mod tests {
             image_key: None,
             image_nonce: None,
             self_update_state: SelfUpdateState::Required,
+            disappearing_message_secs: None,
         };
         storage.save_group(group2).unwrap();
 

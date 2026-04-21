@@ -36,6 +36,7 @@
 
 ### Added
 
+- Added V006 migration adding `disappearing_message_secs INTEGER` column to the `groups` table for disappearing message support. `NULL` means disabled; a positive integer means messages expire after that many seconds. `row_to_group` updated to read the new column. ([#258](https://github.com/marmot-protocol/mdk/pull/258))
 - Implemented `delete_messages_for_group` and `delete_group` for local "clear chat" and "delete chat" operations. `delete_group` runs all deletes in a single `BEGIN IMMEDIATE` transaction covering OpenMLS tables, MDK tables, and `processed_messages`. ([#250](https://github.com/marmot-protocol/mdk/pull/250))
 - Implemented legacy exporter-secret compatibility storage for the temporary `0.6.x -> 0.7.x` migration window, including read/write support for preserved pre-0.7.0 group-event secrets and snapshot rollback restoration into the legacy compatibility label. ([#222](https://github.com/marmot-protocol/mdk/pull/222))
 

@@ -258,6 +258,7 @@ impl GroupStorage for MdkMemoryStorage {
             return Err(group_not_found());
         }
 
+        #[allow(clippy::iter_kv_map)]
         let group_event_keys: Vec<(GroupId, u64)> = inner
             .group_exporter_secrets_cache
             .keys()
@@ -274,6 +275,7 @@ impl GroupStorage for MdkMemoryStorage {
             inner.group_exporter_secrets_cache.remove(&key);
         }
 
+        #[allow(clippy::iter_kv_map)]
         let legacy_group_event_keys: Vec<(GroupId, u64)> = inner
             .group_legacy_exporter_secrets_cache
             .keys()
@@ -290,6 +292,7 @@ impl GroupStorage for MdkMemoryStorage {
             inner.group_legacy_exporter_secrets_cache.remove(&key);
         }
 
+        #[allow(clippy::iter_kv_map)]
         let mip04_keys: Vec<(GroupId, u64)> = inner
             .group_mip04_exporter_secrets_cache
             .keys()
@@ -340,6 +343,7 @@ mod tests {
             image_key: None,
             image_nonce: None,
             self_update_state: SelfUpdateState::Required,
+            disappearing_message_secs: None,
         }
     }
 
@@ -500,6 +504,7 @@ mod tests {
             image_key: None,
             image_nonce: None,
             self_update_state: SelfUpdateState::Required,
+            disappearing_message_secs: None,
         };
 
         storage.save_group(group).unwrap();
@@ -626,6 +631,7 @@ mod tests {
             image_key: None,
             image_nonce: None,
             self_update_state: SelfUpdateState::Required,
+            disappearing_message_secs: None,
         };
         storage.save_group(empty_group).unwrap();
 
@@ -743,6 +749,7 @@ mod tests {
             image_key: None,
             image_nonce: None,
             self_update_state: SelfUpdateState::Required,
+            disappearing_message_secs: None,
         };
 
         storage.save_group(group1).unwrap();
@@ -765,6 +772,7 @@ mod tests {
             image_key: None,
             image_nonce: None,
             self_update_state: SelfUpdateState::Required,
+            disappearing_message_secs: None,
         };
 
         // This should fail because nostr_group_id is already used by a different group
@@ -810,6 +818,7 @@ mod tests {
             image_key: None,
             image_nonce: None,
             self_update_state: SelfUpdateState::Required,
+            disappearing_message_secs: None,
         };
 
         storage.save_group(group).unwrap();
@@ -838,6 +847,7 @@ mod tests {
             image_key: None,
             image_nonce: None,
             self_update_state: SelfUpdateState::Required,
+            disappearing_message_secs: None,
         };
 
         storage.save_group(updated_group).unwrap();
@@ -884,6 +894,7 @@ mod tests {
             image_key: None,
             image_nonce: None,
             self_update_state: SelfUpdateState::Required,
+            disappearing_message_secs: None,
         };
 
         storage.save_group(group).unwrap();
@@ -904,6 +915,7 @@ mod tests {
             image_key: None,
             image_nonce: None,
             self_update_state: SelfUpdateState::Required,
+            disappearing_message_secs: None,
         };
 
         // This should succeed - updating the same group
