@@ -41,6 +41,12 @@ pub enum Error {
     )]
     UnencryptedDatabaseWithEncryption,
 
+    /// SQLCipher support is not active in the linked SQLite provider
+    #[error(
+        "SQLCipher support is not active in the linked SQLite provider; encrypted storage cannot be used"
+    )]
+    SqlCipherUnavailable,
+
     /// Failed to generate random key
     #[error("Failed to generate encryption key: {0}")]
     KeyGeneration(String),
@@ -139,6 +145,14 @@ mod tests {
         let err = Error::UnencryptedDatabaseWithEncryption;
         let msg = err.to_string();
         assert!(msg.contains("unencrypted database"));
+    }
+
+    #[test]
+    fn test_error_display_sqlcipher_unavailable() {
+        let err = Error::SqlCipherUnavailable;
+        let msg = err.to_string();
+        assert!(msg.contains("SQLCipher"));
+        assert!(msg.contains("not active"));
     }
 
     #[test]

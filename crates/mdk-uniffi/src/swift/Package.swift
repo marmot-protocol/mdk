@@ -8,6 +8,15 @@ let package = Package(
     targets: [
         .binaryTarget(name: "mdk_uniffiLib", path: "Binary/mdk_uniffi.xcframework"),
         .target(name: "mdk_uniffiFFI", dependencies: ["mdk_uniffiLib"], path: "Sources/mdk_uniffiFFI", publicHeadersPath: "include"),
-        .target(name: "MDKBindings", dependencies: ["mdk_uniffiFFI"], path: "Sources/MDKBindings", linkerSettings: [.linkedLibrary("sqlite3"), .linkedLibrary("c++")])
+        .target(
+            name: "MDKBindings",
+            dependencies: ["mdk_uniffiFFI"],
+            path: "Sources/MDKBindings",
+            linkerSettings: [
+                .linkedFramework("Security"),
+                .linkedFramework("CoreFoundation"),
+                .linkedLibrary("c++")
+            ]
+        )
     ]
 )

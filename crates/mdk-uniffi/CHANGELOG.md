@@ -47,6 +47,7 @@
 
 ### Fixed
 
+- Removed the Swift package's explicit system `sqlite3` link and linked the native frameworks required by the bundled SQLCipher provider instead. ([#252](https://github.com/marmot-protocol/mdk/pull/252))
 - Removed redundant `cargo build` steps from Swift, Python, and Ruby binding CI jobs that duplicated work already done by `_build-uniffi`. ([`#232`](https://github.com/marmot-protocol/mdk/pull/232))
 - Fixed stale `release-size` artifact paths in Kotlin and Swift binding generation recipes. ([`#232`](https://github.com/marmot-protocol/mdk/pull/232))
 
