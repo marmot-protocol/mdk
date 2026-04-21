@@ -19,6 +19,7 @@ use mdk_storage_traits::groups::types as group_types;
 use mdk_storage_traits::messages::types as message_types;
 use nostr::prelude::*;
 use openmls::prelude::*;
+use openmls::treesync::errors::LeafNodeValidationError;
 use openmls_basic_credential::SignatureKeyPair;
 use tls_codec::Serialize as TlsSerialize;
 
@@ -746,9 +747,26 @@ where
             key_packages_vec.push(key_package);
         }
 
+        // Distinguish the specific "invitee KP advertises too few proposals"
+        // failure from other add_members errors so callers can react to it
+        // programmatically. At runtime (openmls 0.8.1) the capability
+        // mismatch travels as
+        // `AddMembersError::CreateCommitError(CreateCommitError::ProposalValidationError(
+        // ProposalValidationError::LeafNodeValidation(LeafNodeValidationError::UnsupportedProposals)))`.
+        // If a future openmls version re-routes the leaf-node validation
+        // error into `CreateCommitError::LeafNodeValidation(...)` directly
+        // (a sibling variant exists), add that arm too. Anything else keeps
+        // its flat-string shape.
         let (commit_message, welcome_message, _group_info) = mls_group
             .add_members(&self.provider, &mls_signer, &key_packages_vec)
-            .map_err(|e| Error::Group(e.to_string()))?;
+            .map_err(|e| match e {
+                AddMembersError::CreateCommitError(CreateCommitError::ProposalValidationError(
+                    ProposalValidationError::LeafNodeValidation(
+                        LeafNodeValidationError::UnsupportedProposals,
+                    ),
+                )) => Error::InviteeMissingRequiredProposal,
+                other => Error::Group(other.to_string()),
+            })?;
 
         let serialized_commit_message = commit_message
             .tls_serialize_detached()
@@ -2050,6 +2068,7 @@ mod tests {
     use openmls_basic_credential::SignatureKeyPair;
 
     use super::NostrGroupDataExtension;
+    use crate::Error;
     use crate::constant::NOSTR_GROUP_DATA_EXTENSION_TYPE;
     use crate::groups::NostrGroupDataUpdate;
     use crate::test_util::*;
@@ -6874,15 +6893,14 @@ mod tests {
     }
 
     /// Admission: after an all-modern group is created, adding a member
-    /// whose KeyPackage omits `SelfRemove` must be rejected. The rejection
-    /// surfaces as `Error::Group(String)` via the flat-string wrapping in
-    /// `add_members` (`.map_err(|e| Error::Group(e.to_string()))`); the
-    /// substring below was
-    /// observed empirically — openmls 0.8.1 wraps the leaf-node validation
-    /// failure into its `ProposalValidationError` whose `Display` is
-    /// "Proposals are not acceptable." This matches the exact error the
-    /// original #749 bug surfaced before the LCD fix, confirming this
-    /// branch is the upstream-enforced proposal-type gate.
+    /// whose KeyPackage omits `SelfRemove` must be rejected and surface as
+    /// the typed `Error::InviteeMissingRequiredProposal`. The underlying
+    /// openmls chain is `AddMembersError::CreateCommitError(
+    /// CreateCommitError::LeafNodeValidation(
+    /// LeafNodeValidationError::UnsupportedProposals))`; the typed MDK
+    /// variant lets callers distinguish legacy-joiner rejection from
+    /// other add-member failures without substring-matching openmls's
+    /// `Display` output.
     #[test]
     fn test_add_members_rejects_legacy_kp_in_all_modern_group() {
         let creator_mdk = create_test_mdk();
@@ -6913,12 +6931,9 @@ mod tests {
             .add_members(&group_id, &[legacy_kp])
             .expect_err("adding capability-poor KP to all-modern group must fail");
 
-        // MDK flattens openmls errors into Error::Group(String).
-        // Substring is the literal Display of openmls's ProposalValidationError.
-        let msg = err.to_string();
         assert!(
-            msg.contains("Proposals are not acceptable"),
-            "expected openmls proposal-rejection substring; got: {msg}"
+            matches!(err, Error::InviteeMissingRequiredProposal),
+            "expected typed InviteeMissingRequiredProposal; got: {err:?}"
         );
     }
 
