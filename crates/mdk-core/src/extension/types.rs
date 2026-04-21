@@ -480,7 +480,7 @@ impl NostrGroupDataExtension {
     /// This method updates the image fields and bumps the version to 2.
     /// A separate v2→v3 migration is not needed: the wire format automatically
     /// upgrades to v3 when `disappearing_message_secs` is set (see
-    /// [`to_tls_bytes`]).
+    /// `to_tls_bytes`).
     ///
     /// # Arguments
     ///
