@@ -38,6 +38,7 @@
 
 ### Added
 
+- Added UniFFI bindings for `group_required_proposals` and a mirror enum `MdkProposalType` covering `SelfRemove` and a forward-compat `Unknown` catch-all. Lets mobile consumers branch UI on per-group capability state (e.g. whether `SelfRemove` is available) without taking a direct `openmls` dependency on the binding side. Result order is deterministic (`Vec<MdkProposalType>` built from the underlying `BTreeSet`). The `From<ProposalType>` mapping enumerates every openmls variant explicitly — no wildcard arm — so an openmls bump that adds a proposal type fails to compile rather than silently collapsing to `Unknown`. ([#265](https://github.com/marmot-protocol/mdk/pull/265))
 - Added UniFFI bindings for `delete_messages_for_group` and `delete_group` for local "clear chat" and "delete chat" operations. ([#250](https://github.com/marmot-protocol/mdk/pull/250))
 - Added UniFFI bindings for 10 previously unbound methods: `delete_key_package_from_storage`, `delete_key_package_from_storage_by_hash_ref`, `get_ratchet_tree_info`, `group_leaf_map`, `own_leaf_index`, `pending_added_members_pubkeys`, `pending_member_changes`, `pending_removed_members_pubkeys`, `prepare_group_image_for_upload_with_options`, and `process_message_with_context`. ([#249](https://github.com/marmot-protocol/mdk/pull/249))
 - Added optional `thumbhash` fields alongside the existing `blurhash` UniFFI records for group-image and encrypted-media uploads, plus a `generate_thumbhash` option in `MediaProcessingOptionsInput`. ([#244](https://github.com/marmot-protocol/mdk/pull/244))
