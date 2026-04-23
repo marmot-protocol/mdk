@@ -18,11 +18,13 @@ mdk-storage-traits = { version = "0.7.1", path = "./crates/mdk-storage-traits", 
 mdk-core = { version = "0.7.1", path = "./crates/mdk-core", default-features = false }
 mdk-macros = { version = "0.7.1", path = "./crates/mdk-macros" }
 
-# OpenMLS family
-openmls = { version = "0.8.1", default-features = false }
-openmls_traits = { version = "0.5", default-features = false }
-openmls_basic_credential = { version = "0.5", default-features = false }
-openmls_rust_crypto = { version = "0.5.1", default-features = false }
+# OpenMLS family — pinned to a post-#1959 rev for public
+# `MlsGroup::treesync().full_leaves()` (merged upstream 2026-02-16).
+# All four crates must move in lockstep on the same rev.
+openmls = { git = "https://github.com/openmls/openmls", rev = "04c50d7fb12d52f4f9aee26de5f5234f3df29fa8", default-features = false }
+openmls_traits = { git = "https://github.com/openmls/openmls", rev = "04c50d7fb12d52f4f9aee26de5f5234f3df29fa8", default-features = false }
+openmls_basic_credential = { git = "https://github.com/openmls/openmls", rev = "04c50d7fb12d52f4f9aee26de5f5234f3df29fa8", default-features = false }
+openmls_rust_crypto = { git = "https://github.com/openmls/openmls", rev = "04c50d7fb12d52f4f9aee26de5f5234f3df29fa8", default-features = false }
 
 # Nostr
 nostr = { version = "0.44", default-features = false }
