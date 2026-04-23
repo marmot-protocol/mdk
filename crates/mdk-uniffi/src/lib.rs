@@ -720,6 +720,35 @@ impl Mdk {
             .collect())
     }
 
+    /// Returns the proposal types required of every member of this group.
+    ///
+    /// Branch UI on this set — e.g. when `SelfRemove` is present, a
+    /// non-admin member can leave the group without an admin commit.
+    /// An empty vector means the group has no required proposals
+    /// (the LCD outcome for mixed or empty-invitee groups); a missing
+    /// group is reported as an error instead.
+    ///
+    /// Result order is deterministic (sorted by the underlying
+    /// `BTreeSet` iteration order) so diffing across calls is stable.
+    ///
+    /// # Arguments
+    ///
+    /// * `group_id_hex` - Hex-encoded MLS group ID
+    pub fn group_required_proposals(
+        &self,
+        group_id_hex: String,
+    ) -> Result<Vec<MdkProposalType>, MdkUniffiError> {
+        let group_id = parse_group_id(&group_id_hex)?;
+        let required = self.lock()?.group_required_proposals(&group_id)?;
+        // BTreeSet collapses any distinct source variants that map to the
+        // same mirror variant (e.g. several non-SelfRemove types all
+        // mapping to `Unknown`) into a single entry, so `Vec` cardinality
+        // reflects distinct *mirror* values, not distinct source values.
+        let deduped: BTreeSet<MdkProposalType> =
+            required.into_iter().map(MdkProposalType::from).collect();
+        Ok(deduped.into_iter().collect())
+    }
+
     /// Get messages for a group with optional pagination
     ///
     /// # Arguments
@@ -1469,6 +1498,47 @@ pub struct LeafMapEntry {
     pub leaf_index: u32,
     /// Hex-encoded Nostr public key bound to this leaf
     pub public_key: String,
+}
+
+/// Uniffi-friendly mirror of `openmls::prelude::ProposalType`.
+///
+/// Exists because uniffi cannot express a foreign-crate enum directly.
+/// Kept minimal: mobile consumers today only branch on whether
+/// `SelfRemove` is present; anything else collapses to `Unknown`.
+/// If that changes — e.g. a future MIP makes another proposal type
+/// observable to UIs — add a variant here and a matching arm in the
+/// `From` impl below.
+#[derive(uniffi::Enum, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum MdkProposalType {
+    /// Member-initiated voluntary departure (MLS Extensions draft,
+    /// `0x000a`). When a group's required-capabilities set contains
+    /// `SelfRemove`, non-admin members can leave without an admin commit.
+    SelfRemove,
+    /// Any proposal type the mobile API does not distinguish today.
+    Unknown,
+}
+
+impl From<mdk_core::prelude::ProposalType> for MdkProposalType {
+    fn from(pt: mdk_core::prelude::ProposalType) -> Self {
+        // Intentionally no wildcard arm. `openmls::prelude::ProposalType`
+        // is a closed enum (not `#[non_exhaustive]`), so listing every
+        // current variant means a future openmls bump that adds one
+        // fails to compile here — forcing a conscious decision rather
+        // than a silent collapse into `Unknown`.
+        use mdk_core::prelude::ProposalType;
+        match pt {
+            ProposalType::SelfRemove => Self::SelfRemove,
+            ProposalType::Add
+            | ProposalType::Update
+            | ProposalType::Remove
+            | ProposalType::PreSharedKey
+            | ProposalType::Reinit
+            | ProposalType::ExternalInit
+            | ProposalType::GroupContextExtensions
+            | ProposalType::Grease(_)
+            | ProposalType::Custom(_) => Self::Unknown,
+        }
+    }
 }
 
 /// Public information about a leaf node in the ratchet tree
@@ -2401,6 +2471,79 @@ mod tests {
         let result = mdk.get_members(fake_group_id);
         // Should return error for non-existent group
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_group_required_proposals_all_modern() {
+        let mdk = create_test_mdk();
+        let creator_keys = Keys::generate();
+        let member_keys = Keys::generate();
+        let relays = vec!["wss://relay.example.com".to_string()];
+
+        let kp_result = mdk
+            .create_key_package_for_event(member_keys.public_key().to_hex(), relays.clone())
+            .unwrap();
+        let kp_event = EventBuilder::new(Kind::Custom(30443), kp_result.key_package)
+            .tags(
+                kp_result
+                    .tags
+                    .into_iter()
+                    .map(|t| Tag::parse(&t).unwrap())
+                    .collect::<Vec<_>>(),
+            )
+            .sign_with_keys(&member_keys)
+            .unwrap();
+
+        let create_result = mdk
+            .create_group(
+                creator_keys.public_key().to_hex(),
+                vec![kp_event.as_json()],
+                "Test Group".to_string(),
+                "Test Description".to_string(),
+                relays,
+                vec![creator_keys.public_key().to_hex()],
+            )
+            .unwrap();
+
+        let required = mdk
+            .group_required_proposals(create_result.group.mls_group_id)
+            .unwrap();
+
+        assert_eq!(required, vec![MdkProposalType::SelfRemove]);
+    }
+
+    #[test]
+    fn test_group_required_proposals_nonexistent_group() {
+        let mdk = create_test_mdk();
+        let fake_group_id = hex::encode([0u8; 32]);
+        let result = mdk.group_required_proposals(fake_group_id);
+        assert!(result.is_err());
+    }
+
+    /// Multiple distinct `openmls::prelude::ProposalType` variants collapse
+    /// into `MdkProposalType::Unknown`. The wrapper must return a set — not
+    /// a bag — so a consumer counting `vec.len()` sees distinct mirror
+    /// values, not distinct source values. MDK itself never writes such a
+    /// RequiredCapabilities set today (it only writes `SUPPORTED_PROPOSALS`
+    /// or `[]`), so there's no public-API path to forge the input; exercise
+    /// the `From` + `BTreeSet` collect pipeline directly, which is where
+    /// the dedup contract lives.
+    #[test]
+    fn test_mdk_proposal_type_collapses_unknown_duplicates() {
+        use mdk_core::prelude::ProposalType;
+
+        let source: BTreeSet<ProposalType> = [
+            ProposalType::Add,
+            ProposalType::Remove,
+            ProposalType::Custom(0x100),
+        ]
+        .into_iter()
+        .collect();
+
+        let mapped: BTreeSet<MdkProposalType> =
+            source.into_iter().map(MdkProposalType::from).collect();
+
+        assert_eq!(mapped, BTreeSet::from([MdkProposalType::Unknown]));
     }
 
     #[test]

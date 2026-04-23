@@ -1,8 +1,10 @@
 //! MDK Public Prelude
 //!
 //! This module provides the essential types that MDK users need to work with the library.
-//! It only includes the core MDK types and storage traits - external dependencies
-//! (like `nostr` and `openmls`) should be imported directly by users.
+//! It includes MDK's own types, storage traits, and a narrow slice of dependency types
+//! that appear in MDK's public API (e.g., `GroupId`, `ProposalType`). Dependencies
+//! needed only for advanced use cases (custom providers, raw MLS inspection, direct
+//! `nostr` event construction) should still be imported directly by users.
 //!
 //! ## Usage
 //!
@@ -56,3 +58,12 @@ pub use mdk_storage_traits::{Backend, MdkStorageProvider};
 pub use mdk_storage_traits::groups::types as group_types;
 pub use mdk_storage_traits::messages::types as message_types;
 pub use mdk_storage_traits::welcomes::types as welcome_types;
+
+// === Dependency types surfaced in MDK's public API ===
+// A dependency type belongs here only if it appears in the signature of an
+// MDK public method or public struct field. Types used only internally, or
+// only by advanced callers (custom providers, raw MLS inspection, KeyPackage
+// construction), stay behind a direct `openmls` dependency.
+
+/// MLS proposal-type registry. Returned by `MDK::group_required_proposals`.
+pub use openmls::prelude::ProposalType;
