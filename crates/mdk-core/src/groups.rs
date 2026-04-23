@@ -53,6 +53,59 @@ pub struct UpdateGroupResult {
     pub mls_group_id: GroupId,
 }
 
+/// Upgrade readiness of a single proposal type — whether adding it to
+/// the group's `RequiredCapabilities` via
+/// [`MDK::upgrade_group_capabilities`] would be safe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProposalUpgradability {
+    /// Already in the group's `RequiredCapabilities`. Not an upgrade
+    /// candidate.
+    AlreadyRequired,
+    /// Every current leaf advertises this proposal. Safe to add.
+    Available,
+    /// One or more members' leaves don't advertise this proposal. The
+    /// `blockers` list names them. The missing proposal itself is
+    /// implicit from the containing entry.
+    Blocked {
+        /// Nostr public keys of members whose leaves don't advertise
+        /// the containing proposal type.
+        blockers: Vec<PublicKey>,
+    },
+}
+
+/// Per-proposal-type upgrade readiness for a group's
+/// `RequiredCapabilities`. Returned by
+/// [`MDK::group_capability_upgrade_status`].
+///
+/// `per_proposal` contains one entry per proposal type in MDK's
+/// `SUPPORTED_PROPOSALS`, in the order that constant declares them.
+/// Ordering is stable across calls at the same epoch.
+#[derive(Debug, Clone)]
+pub struct CapabilityUpgradeStatus {
+    /// One (proposal, status) pair per proposal type MDK advertises.
+    pub per_proposal: Vec<(ProposalType, ProposalUpgradability)>,
+}
+
+/// Snapshot of a single group member's advertised MLS capabilities.
+///
+/// Returned by [`MDK::group_member_capabilities`]. Capabilities are the
+/// proposal types, extension types, and ciphersuites the member's current
+/// leaf advertises support for, as well as whether the member is an admin
+/// per MDK's group-data extension.
+#[derive(Debug, Clone)]
+pub struct MemberCapabilities {
+    /// The member's Nostr public key.
+    pub member: PublicKey,
+    /// Whether the member is currently an admin of the group.
+    pub is_admin: bool,
+    /// Proposal types this member's leaf advertises.
+    pub proposals: Vec<ProposalType>,
+    /// Extension types this member's leaf advertises.
+    pub extensions: Vec<ExtensionType>,
+    /// Ciphersuites this member's leaf advertises.
+    pub ciphersuites: Vec<VerifiableCiphersuite>,
+}
+
 /// Configuration data for the Group
 #[derive(Debug, Clone)]
 pub struct NostrGroupConfigData {
@@ -538,6 +591,219 @@ where
         Ok(match group.extensions().required_capabilities() {
             Some(rc) => rc.proposal_types().iter().copied().collect(),
             None => BTreeSet::new(),
+        })
+    }
+
+    /// Returns per-member advertised capabilities for every active leaf
+    /// in the group.
+    ///
+    /// Any member may call this — it reads public leaf state only. Useful
+    /// for client UIs that want to show "who supports what" or diagnose
+    /// which members are blocking a pending
+    /// [`MDK::upgrade_group_capabilities`] request.
+    ///
+    /// # Arguments
+    ///
+    /// * `group_id` - The MLS group ID
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(Vec<MemberCapabilities>)` - One entry per active leaf, ordered
+    ///   by leaf index (stable for a given epoch)
+    /// * `Err(Error::GroupNotFound)` - If no MLS record exists for `group_id`
+    pub fn group_member_capabilities(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<Vec<MemberCapabilities>, Error> {
+        let group = self.load_mls_group(group_id)?.ok_or(Error::GroupNotFound)?;
+        let group_data = NostrGroupDataExtension::from_group(&group)?;
+        group
+            .treesync()
+            .full_leaves()
+            .map(|(_, leaf)| {
+                let member = self.pubkey_for_leaf_node(leaf)?;
+                let capabilities = leaf.capabilities();
+                Ok(MemberCapabilities {
+                    is_admin: group_data.admins.contains(&member),
+                    member,
+                    proposals: capabilities.proposals().to_vec(),
+                    extensions: capabilities.extensions().to_vec(),
+                    ciphersuites: capabilities.ciphersuites().to_vec(),
+                })
+            })
+            .collect()
+    }
+
+    /// Returns per-proposal upgrade readiness for the group's
+    /// `RequiredCapabilities`. Any member may call this.
+    ///
+    /// For each proposal type in MDK's `SUPPORTED_PROPOSALS`, the result
+    /// reports whether the proposal is already required, could be added
+    /// safely (every leaf advertises it), or is blocked (and which
+    /// members are blocking).
+    ///
+    /// See [`MDK::upgrade_group_capabilities`] to act on an `Available`
+    /// proposal.
+    ///
+    /// # Arguments
+    ///
+    /// * `group_id` - The MLS group ID
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(CapabilityUpgradeStatus)` with `per_proposal` ordered the same as
+    ///   `SUPPORTED_PROPOSALS`
+    /// * `Err(Error::GroupNotFound)` - If no MLS record exists for `group_id`
+    pub fn group_capability_upgrade_status(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<CapabilityUpgradeStatus, Error> {
+        let group = self.load_mls_group(group_id)?.ok_or(Error::GroupNotFound)?;
+        let currently_required: Vec<ProposalType> = group
+            .extensions()
+            .required_capabilities()
+            .map(|rc| rc.proposal_types().to_vec())
+            .unwrap_or_default();
+
+        let per_proposal = SUPPORTED_PROPOSALS
+            .iter()
+            .copied()
+            .map(|pt| {
+                if currently_required.contains(&pt) {
+                    return Ok((pt, ProposalUpgradability::AlreadyRequired));
+                }
+                let blockers: Vec<PublicKey> = group
+                    .treesync()
+                    .full_leaves()
+                    .filter(|(_, leaf)| !leaf.capabilities().proposals().contains(&pt))
+                    .map(|(_, leaf)| self.pubkey_for_leaf_node(leaf))
+                    .collect::<Result<_, _>>()?;
+                Ok(if blockers.is_empty() {
+                    (pt, ProposalUpgradability::Available)
+                } else {
+                    (pt, ProposalUpgradability::Blocked { blockers })
+                })
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+
+        Ok(CapabilityUpgradeStatus { per_proposal })
+    }
+
+    /// Proposes a `GroupContextExtensions` commit that adds each of
+    /// `proposals_to_add` to the group's `RequiredCapabilities`.
+    ///
+    /// Admin-only. One MLS commit, all-or-nothing: if any requested
+    /// proposal fails re-validation at send time (e.g. another admin
+    /// upgraded concurrently, or a new blocker joined), the whole call
+    /// errors with the relevant per-proposal variant and no commit is
+    /// sent.
+    ///
+    /// See [`MDK::group_capability_upgrade_status`] to discover which
+    /// proposal types are currently `Available`.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::EmptyUpgradeSet`] if `proposals_to_add` is empty.
+    /// - [`Error::ProposalNotInSupportedSet`] if any requested proposal
+    ///   is not in MDK's `SUPPORTED_PROPOSALS`.
+    /// - [`Error::NotAdmin`] if the current member is not an admin.
+    /// - [`Error::ProposalAlreadyRequired`] if a requested proposal is
+    ///   already in `RequiredCapabilities` (typically concurrent
+    ///   upgrade).
+    /// - [`Error::ProposalNotAvailableForUpgrade`] if a requested
+    ///   proposal is blocked at send time, with the blocker identities.
+    pub fn upgrade_group_capabilities(
+        &self,
+        group_id: &GroupId,
+        proposals_to_add: &[ProposalType],
+    ) -> Result<UpdateGroupResult, Error> {
+        // Cheap input validation before any storage access.
+        if proposals_to_add.is_empty() {
+            return Err(Error::EmptyUpgradeSet);
+        }
+        for pt in proposals_to_add {
+            if !SUPPORTED_PROPOSALS.contains(pt) {
+                return Err(Error::ProposalNotInSupportedSet(*pt));
+            }
+        }
+
+        let mut mls_group = self.load_mls_group(group_id)?.ok_or(Error::GroupNotFound)?;
+
+        // Admin authority is the same gate `remove_members` uses.
+        let own_leaf = mls_group.own_leaf().ok_or(Error::OwnLeafNotFound)?;
+        if !self.is_leaf_node_admin(group_id, own_leaf)? {
+            return Err(Error::NotAdmin);
+        }
+
+        // Per-proposal re-check at send time. Iterate the requested set
+        // and error out with the most specific variant for the first
+        // failing proposal — no partial commit is ever sent.
+        let currently_required: Vec<ProposalType> = mls_group
+            .extensions()
+            .required_capabilities()
+            .map(|rc| rc.proposal_types().to_vec())
+            .unwrap_or_default();
+        for pt in proposals_to_add {
+            if currently_required.contains(pt) {
+                return Err(Error::ProposalAlreadyRequired(*pt));
+            }
+            let blockers: Vec<PublicKey> = mls_group
+                .treesync()
+                .full_leaves()
+                .filter(|(_, leaf)| !leaf.capabilities().proposals().contains(pt))
+                .map(|(_, leaf)| self.pubkey_for_leaf_node(leaf))
+                .collect::<Result<_, _>>()?;
+            if !blockers.is_empty() {
+                return Err(Error::ProposalNotAvailableForUpgrade {
+                    proposal: *pt,
+                    blockers,
+                });
+            }
+        }
+
+        // Build the upgraded extensions by cloning the current set and
+        // replacing the `RequiredCapabilities` entry with the union of
+        // the current required set and the caller's additions.
+        let mut new_required = currently_required.clone();
+        for pt in proposals_to_add {
+            new_required.push(*pt);
+        }
+        let required_capabilities_extension =
+            Extension::RequiredCapabilities(RequiredCapabilitiesExtension::new(
+                &GROUP_CONTEXT_REQUIRED_EXTENSIONS,
+                &new_required,
+                &[],
+            ));
+        let mut upgraded_extensions = mls_group.extensions().clone();
+        upgraded_extensions.add_or_replace(required_capabilities_extension)?;
+
+        let signer: SignatureKeyPair = self.load_mls_signer(&mls_group)?;
+        let (commit_message, _welcome, _group_info) = mls_group
+            .update_group_context_extensions(&self.provider, upgraded_extensions, &signer)
+            .map_err(|e| Error::Group(e.to_string()))?;
+
+        let serialized_commit = commit_message
+            .tls_serialize_detached()
+            .map_err(|e| Error::Group(e.to_string()))?;
+        let commit_event =
+            self.build_message_event(&mls_group.group_id().into(), serialized_commit, None)?;
+
+        self.track_processed_message(
+            commit_event.id,
+            &mls_group,
+            message_types::ProcessedMessageState::ProcessedCommit,
+        )?;
+
+        tracing::info!(
+            target: "mdk_core::groups::upgrade_group_capabilities",
+            added = ?proposals_to_add,
+            "Proposed GroupContextExtensions commit adding proposal types to RequiredCapabilities"
+        );
+
+        Ok(UpdateGroupResult {
+            evolution_event: commit_event,
+            welcome_rumors: None,
+            mls_group_id: group_id.clone(),
         })
     }
 
@@ -6722,6 +6988,711 @@ mod tests {
         );
     }
 
+    // ============================================================================
+    // `MDK::group_member_capabilities` inspection API.
+    //
+    // Reports per-member advertised capabilities. Any member may call it —
+    // read-only access to public leaf state.
+    // ============================================================================
+
+    /// Roster shape: one entry per live leaf, admin flag reflects group
+    /// data, proposal advertisements reflect leaf capabilities.
+    #[test]
+    fn test_group_member_capabilities_reports_per_member() {
+        use crate::groups::MemberCapabilities;
+        use openmls::prelude::ProposalType;
+
+        let creator_mdk = create_test_mdk();
+        let alice_mdk = create_test_mdk();
+        let creator = Keys::generate();
+        let alice = Keys::generate();
+        let legacy = Keys::generate();
+
+        let alice_kp = create_key_package_event(&alice_mdk, &alice);
+        let legacy_kp = create_legacy_key_package_event(&creator_mdk, &legacy);
+
+        let create_result = creator_mdk
+            .create_group(
+                &creator.public_key(),
+                vec![alice_kp, legacy_kp],
+                create_nostr_group_config_data(vec![creator.public_key()]),
+            )
+            .expect("create group");
+        let group_id = create_result.group.mls_group_id;
+
+        let roster: Vec<MemberCapabilities> = creator_mdk
+            .group_member_capabilities(&group_id)
+            .expect("roster");
+        assert_eq!(roster.len(), 3, "three live leaves expected");
+
+        let entry_for = |pk: &PublicKey| -> &MemberCapabilities {
+            roster.iter().find(|m| m.member == *pk).unwrap_or_else(|| {
+                panic!("no roster entry for {pk:?}");
+            })
+        };
+
+        let creator_entry = entry_for(&creator.public_key());
+        assert!(creator_entry.is_admin, "creator is admin");
+        assert!(
+            creator_entry.proposals.contains(&ProposalType::SelfRemove),
+            "modern creator advertises SelfRemove"
+        );
+
+        let alice_entry = entry_for(&alice.public_key());
+        assert!(!alice_entry.is_admin, "alice is non-admin");
+        assert!(
+            alice_entry.proposals.contains(&ProposalType::SelfRemove),
+            "modern alice advertises SelfRemove"
+        );
+
+        let legacy_entry = entry_for(&legacy.public_key());
+        assert!(!legacy_entry.is_admin, "legacy is non-admin");
+        assert!(
+            !legacy_entry.proposals.contains(&ProposalType::SelfRemove),
+            "capability-poor legacy leaf does not advertise SelfRemove"
+        );
+    }
+
+    /// The inspection method is callable by non-admins. Denying reads
+    /// to non-admins would force UIs to guess at affordances.
+    #[test]
+    fn test_group_member_capabilities_is_callable_by_non_admins() {
+        let creator_mdk = create_test_mdk();
+        let alice_mdk = create_test_mdk();
+        let creator = Keys::generate();
+        let alice = Keys::generate();
+
+        let alice_kp = create_key_package_event(&alice_mdk, &alice);
+        let create_result = creator_mdk
+            .create_group(
+                &creator.public_key(),
+                vec![alice_kp],
+                create_nostr_group_config_data(vec![creator.public_key()]),
+            )
+            .expect("create group");
+        let group_id = create_result.group.mls_group_id.clone();
+        creator_mdk
+            .merge_pending_commit(&group_id)
+            .expect("creator merges");
+
+        let alice_welcome = alice_mdk
+            .process_welcome(
+                &nostr::EventId::all_zeros(),
+                &create_result.welcome_rumors[0],
+            )
+            .expect("alice processes welcome");
+        alice_mdk
+            .accept_welcome(&alice_welcome)
+            .expect("alice accepts");
+
+        // Alice is the non-admin caller.
+        let roster = alice_mdk
+            .group_member_capabilities(&group_id)
+            .expect("non-admin may read");
+        assert_eq!(roster.len(), 2);
+    }
+
+    // ============================================================================
+    // `MDK::group_capability_upgrade_status` inspection API.
+    //
+    // Per-proposal upgrade readiness. Any member may call it.
+    // ============================================================================
+
+    /// All-modern group: `RequiredCapabilities = [SelfRemove]` via LCD.
+    /// The status call must report every `SUPPORTED_PROPOSALS` entry as
+    /// `AlreadyRequired` — there's nothing to offer the admin.
+    #[test]
+    fn test_upgrade_status_all_required_for_all_modern_group() {
+        use crate::constant::SUPPORTED_PROPOSALS;
+        use crate::groups::ProposalUpgradability;
+
+        let creator_mdk = create_test_mdk();
+        let alice_mdk = create_test_mdk();
+        let creator = Keys::generate();
+        let alice = Keys::generate();
+
+        let alice_kp = create_key_package_event(&alice_mdk, &alice);
+        let create_result = creator_mdk
+            .create_group(
+                &creator.public_key(),
+                vec![alice_kp],
+                create_nostr_group_config_data(vec![creator.public_key()]),
+            )
+            .expect("all-modern group creation");
+        let group_id = create_result.group.mls_group_id;
+
+        let status = creator_mdk
+            .group_capability_upgrade_status(&group_id)
+            .expect("status call succeeds");
+        assert_eq!(
+            status.per_proposal.len(),
+            SUPPORTED_PROPOSALS.len(),
+            "one entry per SUPPORTED_PROPOSALS"
+        );
+        for (_, upgradability) in &status.per_proposal {
+            assert!(
+                matches!(upgradability, ProposalUpgradability::AlreadyRequired),
+                "all-modern group should report AlreadyRequired, got {upgradability:?}"
+            );
+        }
+    }
+
+    /// Mixed group that becomes all-modern: status flips from `Blocked`
+    /// to `Available` once the legacy member leaves and remaining members
+    /// have refreshed their leaf capabilities.
+    #[test]
+    fn test_upgrade_status_available_after_legacy_member_leaves() {
+        use crate::groups::ProposalUpgradability;
+        use openmls::prelude::ProposalType;
+
+        let alice_mdk = create_test_mdk();
+        let bob_mdk = create_test_mdk();
+        let alice = Keys::generate();
+        let bob = Keys::generate();
+        let legacy = Keys::generate();
+
+        let bob_kp = create_key_package_event(&bob_mdk, &bob);
+        let legacy_kp = create_legacy_key_package_event(&alice_mdk, &legacy);
+
+        let create_result = alice_mdk
+            .create_group(
+                &alice.public_key(),
+                vec![bob_kp, legacy_kp],
+                create_nostr_group_config_data(vec![alice.public_key()]),
+            )
+            .expect("mixed group creation");
+        let group_id = create_result.group.mls_group_id.clone();
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("alice merges creation");
+
+        let bob_welcome = bob_mdk
+            .process_welcome(
+                &nostr::EventId::all_zeros(),
+                &create_result.welcome_rumors[0],
+            )
+            .expect("bob processes welcome");
+        bob_mdk.accept_welcome(&bob_welcome).expect("bob accepts");
+
+        // Alice removes the legacy member; merge + propagate to Bob.
+        let remove_result = alice_mdk
+            .remove_members(&group_id, &[legacy.public_key()])
+            .expect("alice removes legacy");
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("alice merges removal");
+        bob_mdk
+            .process_message(&remove_result.evolution_event)
+            .expect("bob processes removal commit");
+
+        let status = alice_mdk
+            .group_capability_upgrade_status(&group_id)
+            .expect("status call succeeds");
+
+        let self_remove_entry = status
+            .per_proposal
+            .iter()
+            .find(|(pt, _)| *pt == ProposalType::SelfRemove)
+            .expect("SelfRemove entry present");
+        assert!(
+            matches!(self_remove_entry.1, ProposalUpgradability::Available),
+            "formerly-mixed group should now be Available, got {:?}",
+            self_remove_entry.1
+        );
+    }
+
+    /// Mixed group with legacy member still present: status reports the
+    /// specific legacy member as the blocker for `SelfRemove`.
+    #[test]
+    fn test_upgrade_status_blocked_names_blocker() {
+        use crate::groups::ProposalUpgradability;
+        use openmls::prelude::ProposalType;
+
+        let alice_mdk = create_test_mdk();
+        let bob_mdk = create_test_mdk();
+        let alice = Keys::generate();
+        let bob = Keys::generate();
+        let legacy = Keys::generate();
+
+        let bob_kp = create_key_package_event(&bob_mdk, &bob);
+        let legacy_kp = create_legacy_key_package_event(&alice_mdk, &legacy);
+
+        let create_result = alice_mdk
+            .create_group(
+                &alice.public_key(),
+                vec![bob_kp, legacy_kp],
+                create_nostr_group_config_data(vec![alice.public_key()]),
+            )
+            .expect("mixed group");
+        let group_id = create_result.group.mls_group_id;
+
+        let status = alice_mdk
+            .group_capability_upgrade_status(&group_id)
+            .expect("status call succeeds");
+
+        let self_remove_entry = status
+            .per_proposal
+            .iter()
+            .find(|(pt, _)| *pt == ProposalType::SelfRemove)
+            .expect("SelfRemove entry present");
+        match &self_remove_entry.1 {
+            ProposalUpgradability::Blocked { blockers } => {
+                assert_eq!(
+                    blockers,
+                    &vec![legacy.public_key()],
+                    "legacy member is the sole blocker"
+                );
+            }
+            other => panic!("expected Blocked, got {other:?}"),
+        }
+    }
+
+    /// Status call is available to non-admin callers: read-only, no
+    /// authorization required.
+    #[test]
+    fn test_upgrade_status_is_callable_by_non_admins() {
+        let creator_mdk = create_test_mdk();
+        let alice_mdk = create_test_mdk();
+        let creator = Keys::generate();
+        let alice = Keys::generate();
+
+        let alice_kp = create_key_package_event(&alice_mdk, &alice);
+        let create_result = creator_mdk
+            .create_group(
+                &creator.public_key(),
+                vec![alice_kp],
+                create_nostr_group_config_data(vec![creator.public_key()]),
+            )
+            .expect("create");
+        let group_id = create_result.group.mls_group_id.clone();
+        creator_mdk
+            .merge_pending_commit(&group_id)
+            .expect("creator merges");
+
+        let alice_welcome = alice_mdk
+            .process_welcome(
+                &nostr::EventId::all_zeros(),
+                &create_result.welcome_rumors[0],
+            )
+            .expect("alice welcome");
+        alice_mdk
+            .accept_welcome(&alice_welcome)
+            .expect("alice accepts");
+
+        alice_mdk
+            .group_capability_upgrade_status(&group_id)
+            .expect("non-admin may call status");
+    }
+
+    // ============================================================================
+    // `MDK::upgrade_group_capabilities` action. Admin-only.
+    // ============================================================================
+
+    /// Happy path: mixed → legacy member removed → admin upgrades →
+    /// `RequiredCapabilities` now contains `SelfRemove` on every peer,
+    /// and a subsequent non-admin leave uses the modern SelfRemove path
+    /// (receiver observes `MessageProcessingResult::Proposal`, not
+    /// `PendingProposal`).
+    #[test]
+    fn test_upgrade_group_capabilities_happy_path() {
+        use crate::messages::MessageProcessingResult;
+        use openmls::prelude::ProposalType;
+
+        // Alice (admin), Bob (non-admin leaver), plus one legacy invitee
+        // who gets removed before the upgrade.
+        let alice_mdk = create_test_mdk();
+        let bob_mdk = create_test_mdk();
+        let alice = Keys::generate();
+        let bob = Keys::generate();
+        let legacy = Keys::generate();
+
+        let bob_kp = create_key_package_event(&bob_mdk, &bob);
+        let legacy_kp = create_legacy_key_package_event(&alice_mdk, &legacy);
+
+        let create_result = alice_mdk
+            .create_group(
+                &alice.public_key(),
+                vec![bob_kp, legacy_kp],
+                create_nostr_group_config_data(vec![alice.public_key()]),
+            )
+            .expect("mixed creation");
+        let group_id = create_result.group.mls_group_id.clone();
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("alice merges creation");
+
+        let bob_welcome = bob_mdk
+            .process_welcome(
+                &nostr::EventId::all_zeros(),
+                &create_result.welcome_rumors[0],
+            )
+            .expect("bob welcome");
+        bob_mdk.accept_welcome(&bob_welcome).expect("bob accepts");
+
+        // Remove legacy member; propagate.
+        let remove_result = alice_mdk
+            .remove_members(&group_id, &[legacy.public_key()])
+            .expect("alice removes legacy");
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("alice merges removal");
+        bob_mdk
+            .process_message(&remove_result.evolution_event)
+            .expect("bob processes removal");
+
+        // Sanity: pre-upgrade admin count.
+        let pre_admins = NostrGroupDataExtension::from_group(
+            &alice_mdk.load_mls_group(&group_id).unwrap().unwrap(),
+        )
+        .unwrap()
+        .admins
+        .len();
+
+        // Upgrade.
+        let upgrade_result = alice_mdk
+            .upgrade_group_capabilities(&group_id, &[ProposalType::SelfRemove])
+            .expect("admin upgrade succeeds");
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("alice merges upgrade");
+        bob_mdk
+            .process_message(&upgrade_result.evolution_event)
+            .expect("bob processes upgrade");
+
+        // Post-upgrade: admin count unchanged (sanity check against
+        // depletion-validation interaction).
+        let post_admins = NostrGroupDataExtension::from_group(
+            &alice_mdk.load_mls_group(&group_id).unwrap().unwrap(),
+        )
+        .unwrap()
+        .admins
+        .len();
+        assert_eq!(pre_admins, post_admins, "admin count unchanged");
+
+        // Both peers reflect the upgraded RequiredCapabilities.
+        assert!(
+            alice_mdk
+                .group_required_proposals(&group_id)
+                .unwrap()
+                .contains(&ProposalType::SelfRemove),
+            "alice sees SelfRemove now required"
+        );
+        assert!(
+            bob_mdk
+                .group_required_proposals(&group_id)
+                .unwrap()
+                .contains(&ProposalType::SelfRemove),
+            "bob sees SelfRemove now required"
+        );
+
+        // Modern SelfRemove path: Bob (non-admin) leaves; Alice (admin)
+        // receives an auto-committable `Proposal`, not a
+        // `PendingProposal`.
+        let bob_leave = bob_mdk.leave_group(&group_id).expect("bob leaves modern");
+        let observed = alice_mdk
+            .process_message(&bob_leave.evolution_event)
+            .expect("alice processes bob's leave");
+        assert!(
+            matches!(observed, MessageProcessingResult::Proposal { .. }),
+            "post-upgrade leave must be modern SelfRemove (Proposal auto-commit), got {observed:?}"
+        );
+    }
+
+    /// Empty `proposals_to_add` is a caller bug, surfaced explicitly.
+    #[test]
+    fn test_upgrade_group_capabilities_rejects_empty_set() {
+        let alice_mdk = create_test_mdk();
+        let alice = Keys::generate();
+        let create_result = alice_mdk
+            .create_group(
+                &alice.public_key(),
+                vec![],
+                create_nostr_group_config_data(vec![alice.public_key()]),
+            )
+            .expect("single-member group");
+        let group_id = create_result.group.mls_group_id;
+
+        assert!(matches!(
+            alice_mdk.upgrade_group_capabilities(&group_id, &[]),
+            Err(Error::EmptyUpgradeSet)
+        ));
+    }
+
+    /// Non-admin callers are rejected before any state mutation.
+    #[test]
+    fn test_upgrade_group_capabilities_rejects_non_admin() {
+        use openmls::prelude::ProposalType;
+
+        let alice_mdk = create_test_mdk();
+        let bob_mdk = create_test_mdk();
+        let alice = Keys::generate();
+        let bob = Keys::generate();
+        let legacy = Keys::generate();
+
+        let bob_kp = create_key_package_event(&bob_mdk, &bob);
+        let legacy_kp = create_legacy_key_package_event(&alice_mdk, &legacy);
+        let create_result = alice_mdk
+            .create_group(
+                &alice.public_key(),
+                vec![bob_kp, legacy_kp],
+                create_nostr_group_config_data(vec![alice.public_key()]),
+            )
+            .expect("mixed");
+        let group_id = create_result.group.mls_group_id.clone();
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("alice merges");
+        let bob_welcome = bob_mdk
+            .process_welcome(
+                &nostr::EventId::all_zeros(),
+                &create_result.welcome_rumors[0],
+            )
+            .expect("welcome");
+        bob_mdk.accept_welcome(&bob_welcome).expect("accept");
+
+        // Remove legacy so the SelfRemove upgrade would otherwise be `Available`.
+        let remove = alice_mdk
+            .remove_members(&group_id, &[legacy.public_key()])
+            .expect("remove");
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("alice merges removal");
+        bob_mdk
+            .process_message(&remove.evolution_event)
+            .expect("bob processes removal");
+
+        // Bob (non-admin) tries to upgrade.
+        assert!(matches!(
+            bob_mdk.upgrade_group_capabilities(&group_id, &[ProposalType::SelfRemove]),
+            Err(Error::NotAdmin)
+        ));
+
+        // RequiredCapabilities unchanged.
+        assert!(
+            !bob_mdk
+                .group_required_proposals(&group_id)
+                .unwrap()
+                .contains(&ProposalType::SelfRemove),
+            "group still permissive"
+        );
+    }
+
+    /// Requesting a `Blocked` proposal surfaces blocker identities on
+    /// the error payload, not just a generic rejection.
+    #[test]
+    fn test_upgrade_group_capabilities_surfaces_blocker_identities() {
+        use openmls::prelude::ProposalType;
+
+        let alice_mdk = create_test_mdk();
+        let bob_mdk = create_test_mdk();
+        let alice = Keys::generate();
+        let bob = Keys::generate();
+        let legacy = Keys::generate();
+
+        let bob_kp = create_key_package_event(&bob_mdk, &bob);
+        let legacy_kp = create_legacy_key_package_event(&alice_mdk, &legacy);
+        let create_result = alice_mdk
+            .create_group(
+                &alice.public_key(),
+                vec![bob_kp, legacy_kp],
+                create_nostr_group_config_data(vec![alice.public_key()]),
+            )
+            .expect("mixed");
+        let group_id = create_result.group.mls_group_id;
+
+        match alice_mdk.upgrade_group_capabilities(&group_id, &[ProposalType::SelfRemove]) {
+            Err(Error::ProposalNotAvailableForUpgrade { proposal, blockers }) => {
+                assert_eq!(proposal, ProposalType::SelfRemove);
+                assert_eq!(blockers, vec![legacy.public_key()]);
+            }
+            other => panic!("expected ProposalNotAvailableForUpgrade, got {other:?}"),
+        }
+    }
+
+    /// Requesting an `AlreadyRequired` proposal is a caller bug.
+    #[test]
+    fn test_upgrade_group_capabilities_rejects_already_required() {
+        use openmls::prelude::ProposalType;
+
+        let alice_mdk = create_test_mdk();
+        let bob_mdk = create_test_mdk();
+        let alice = Keys::generate();
+        let bob = Keys::generate();
+
+        let bob_kp = create_key_package_event(&bob_mdk, &bob);
+        let create_result = alice_mdk
+            .create_group(
+                &alice.public_key(),
+                vec![bob_kp],
+                create_nostr_group_config_data(vec![alice.public_key()]),
+            )
+            .expect("all-modern");
+        let group_id = create_result.group.mls_group_id;
+
+        assert!(matches!(
+            alice_mdk.upgrade_group_capabilities(&group_id, &[ProposalType::SelfRemove]),
+            Err(Error::ProposalAlreadyRequired(ProposalType::SelfRemove))
+        ));
+    }
+
+    /// TOCTOU: another admin upgrades concurrently before this one can.
+    /// The second admin's attempt sees `RequiredCapabilities` already
+    /// contains the proposal and errors with `ProposalAlreadyRequired`,
+    /// not a generic "no longer available."
+    #[test]
+    fn test_upgrade_group_capabilities_toctou_already_required() {
+        use openmls::prelude::ProposalType;
+
+        let alice_mdk = create_test_mdk();
+        let bob_mdk = create_test_mdk();
+        let charlie_mdk = create_test_mdk();
+        let alice = Keys::generate();
+        let bob = Keys::generate();
+        let legacy = Keys::generate();
+
+        // Two admins so both can trigger the upgrade.
+        let bob_kp = create_key_package_event(&bob_mdk, &bob);
+        let legacy_kp = create_legacy_key_package_event(&alice_mdk, &legacy);
+        let create_result = alice_mdk
+            .create_group(
+                &alice.public_key(),
+                vec![bob_kp, legacy_kp],
+                create_nostr_group_config_data(vec![alice.public_key(), bob.public_key()]),
+            )
+            .expect("mixed group with two admins");
+        let group_id = create_result.group.mls_group_id.clone();
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("alice merges creation");
+
+        let bob_welcome = bob_mdk
+            .process_welcome(
+                &nostr::EventId::all_zeros(),
+                &create_result.welcome_rumors[0],
+            )
+            .expect("bob welcome");
+        bob_mdk.accept_welcome(&bob_welcome).expect("bob accepts");
+
+        // Remove legacy; propagate.
+        let remove = alice_mdk
+            .remove_members(&group_id, &[legacy.public_key()])
+            .expect("remove legacy");
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("alice merges removal");
+        bob_mdk
+            .process_message(&remove.evolution_event)
+            .expect("bob processes removal");
+
+        // Sanity: both admins see Available.
+        let _ = charlie_mdk; // reserved for potential non-admin observer
+
+        // Bob (admin B) upgrades first; alice processes.
+        let b_result = bob_mdk
+            .upgrade_group_capabilities(&group_id, &[ProposalType::SelfRemove])
+            .expect("bob upgrades");
+        bob_mdk
+            .merge_pending_commit(&group_id)
+            .expect("bob merges upgrade");
+        alice_mdk
+            .process_message(&b_result.evolution_event)
+            .expect("alice processes bob's upgrade");
+
+        // Alice now tries — should surface AlreadyRequired.
+        assert!(matches!(
+            alice_mdk.upgrade_group_capabilities(&group_id, &[ProposalType::SelfRemove]),
+            Err(Error::ProposalAlreadyRequired(ProposalType::SelfRemove))
+        ));
+    }
+
+    /// Concurrent admins: both propose from the same pre-upgrade epoch.
+    /// MLS commit ordering admits one; the other admin's local state
+    /// recovers through the existing epoch-divergence machinery (the
+    /// losing admin's upgrade call succeeded locally but merge fails
+    /// when a conflicting commit lands, mirroring any other race like
+    /// concurrent `add_members`).
+    ///
+    /// The invariant we pin: the committed transcript contains exactly
+    /// one `GroupContextExtensions` commit adding `SelfRemove`, not two.
+    /// After convergence, `RequiredCapabilities` includes `SelfRemove`
+    /// exactly once.
+    #[test]
+    fn test_upgrade_group_capabilities_concurrent_admins_converge() {
+        use openmls::prelude::ProposalType;
+
+        let alice_mdk = create_test_mdk();
+        let bob_mdk = create_test_mdk();
+        let alice = Keys::generate();
+        let bob = Keys::generate();
+        let legacy = Keys::generate();
+
+        let bob_kp = create_key_package_event(&bob_mdk, &bob);
+        let legacy_kp = create_legacy_key_package_event(&alice_mdk, &legacy);
+        let create_result = alice_mdk
+            .create_group(
+                &alice.public_key(),
+                vec![bob_kp, legacy_kp],
+                create_nostr_group_config_data(vec![alice.public_key(), bob.public_key()]),
+            )
+            .expect("mixed group with two admins");
+        let group_id = create_result.group.mls_group_id.clone();
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("alice merges creation");
+
+        let bob_welcome = bob_mdk
+            .process_welcome(
+                &nostr::EventId::all_zeros(),
+                &create_result.welcome_rumors[0],
+            )
+            .expect("bob welcome");
+        bob_mdk.accept_welcome(&bob_welcome).expect("bob accepts");
+
+        let remove = alice_mdk
+            .remove_members(&group_id, &[legacy.public_key()])
+            .expect("remove");
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("alice merges removal");
+        bob_mdk
+            .process_message(&remove.evolution_event)
+            .expect("bob processes removal");
+
+        // Both admins independently propose the upgrade from the same
+        // epoch. Each local call succeeds (they don't see each other's
+        // pending state).
+        let alice_upgrade = alice_mdk
+            .upgrade_group_capabilities(&group_id, &[ProposalType::SelfRemove])
+            .expect("alice proposes upgrade");
+        let _bob_upgrade = bob_mdk
+            .upgrade_group_capabilities(&group_id, &[ProposalType::SelfRemove])
+            .expect("bob proposes upgrade");
+
+        // Alice's commit wins: she merges hers; bob processes alice's
+        // event, which forces his pending commit to be dropped in
+        // favor of alice's committed epoch.
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("alice merges her upgrade");
+        bob_mdk
+            .process_message(&alice_upgrade.evolution_event)
+            .expect("bob adopts alice's upgrade commit");
+
+        // Both now see SelfRemove required, exactly once.
+        let alice_required = alice_mdk.group_required_proposals(&group_id).unwrap();
+        let bob_required = bob_mdk.group_required_proposals(&group_id).unwrap();
+        assert!(alice_required.contains(&ProposalType::SelfRemove));
+        assert!(bob_required.contains(&ProposalType::SelfRemove));
+        let alice_count = alice_required
+            .iter()
+            .filter(|p| **p == ProposalType::SelfRemove)
+            .count();
+        assert_eq!(
+            alice_count, 1,
+            "exactly one SelfRemove entry after convergence"
+        );
+    }
+
     /// Admin-leave demotion flow in a mixed group. Admins cannot leave
     /// directly; they must `self_demote()` first, have the demotion
     /// committed, then leave. In a mixed group, the subsequent leave must
@@ -6959,21 +7930,23 @@ mod tests {
         );
     }
 
-    /// Documents accepted over-conservatism. A group created mixed
-    /// (RequiredCapabilities = []) keeps that value forever in MDK's
-    /// stable-0.8.1 world, so any subsequent modern-member leaves fall back
-    /// to legacy `Remove` even after every legacy member has been
-    /// admin-removed. This test pins the accepted wrong behavior so somebody
-    /// doesn't "optimize" the Guard 2 check by reading the tree without also
-    /// shipping a GCE-upgrade path that makes the optimization correct.
-    // TODO(gce-upgrade): delete/invert when GCE-upgrade ships. At that
-    // point the group should regain SelfRemove UX automatically after
-    // legacy members depart, and this assertion becomes wrong.
+    /// A formerly-mixed group can regain modern `SelfRemove` UX once
+    /// every legacy member has left and an admin opts in by calling
+    /// [`MDK::upgrade_group_capabilities`]. This test documents the
+    /// end-to-end UX: pre-upgrade a modern leave falls back to legacy
+    /// `Remove`; after the admin's upgrade commit lands on every peer,
+    /// the same leave uses the modern auto-committable path.
+    ///
+    /// Replaces the old `test_mixed_group_stays_legacy_after_legacy_members_leave_over_conservative`
+    /// which pinned the accepted over-conservatism before the
+    /// `GroupContextExtensions` upgrade path was available.
     #[test]
-    fn test_mixed_group_stays_legacy_after_legacy_members_leave_over_conservative() {
+    fn test_formerly_mixed_group_can_be_upgraded_after_legacy_members_leave() {
         use crate::messages::MessageProcessingResult;
+        use openmls::prelude::ProposalType;
 
-        // Alice (admin), Bob (modern non-admin), plus a legacy invitee.
+        // Alice (admin), Bob and Charlie (modern non-admins), plus a
+        // legacy invitee who gets removed before the upgrade.
         let alice_mdk = create_test_mdk();
         let bob_mdk = create_test_mdk();
         let charlie_mdk = create_test_mdk();
@@ -7015,30 +7988,55 @@ mod tests {
             .accept_welcome(&charlie_welcome)
             .expect("charlie accepts");
 
-        // Alice admin-removes the legacy member.
-        alice_mdk
+        // Alice admin-removes the legacy member; propagate to peers so
+        // every member's local state reflects the all-modern composition.
+        let remove = alice_mdk
             .remove_members(&group_id, &[legacy_keys.public_key()])
             .expect("alice removes legacy");
         alice_mdk
             .merge_pending_commit(&group_id)
             .expect("alice merges removal");
+        bob_mdk
+            .process_message(&remove.evolution_event)
+            .expect("bob processes removal");
+        charlie_mdk
+            .process_message(&remove.evolution_event)
+            .expect("charlie processes removal");
 
-        // The stored RequiredCapabilities is still [] — MDK does not upgrade
-        // it on its own. Bob (still modern) leaves; Charlie (non-admin
-        // receiver) should still see a legacy Remove => PendingProposal.
-        let bob_leave = bob_mdk
-            .leave_group(&group_id)
-            .expect("bob leaves the now-all-modern group");
+        // Alice performs the upgrade; propagate.
+        let upgrade = alice_mdk
+            .upgrade_group_capabilities(&group_id, &[ProposalType::SelfRemove])
+            .expect("alice upgrades");
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("alice merges upgrade");
+        bob_mdk
+            .process_message(&upgrade.evolution_event)
+            .expect("bob processes upgrade");
+        charlie_mdk
+            .process_message(&upgrade.evolution_event)
+            .expect("charlie processes upgrade");
 
-        let result = charlie_mdk
+        // Every peer sees SelfRemove required.
+        for mdk in [&alice_mdk, &bob_mdk, &charlie_mdk] {
+            assert!(
+                mdk.group_required_proposals(&group_id)
+                    .unwrap()
+                    .contains(&ProposalType::SelfRemove),
+                "peer sees SelfRemove in RequiredCapabilities post-upgrade"
+            );
+        }
+
+        // Bob (non-admin) leaves; Charlie processes. Post-upgrade this
+        // uses the modern `SelfRemove` auto-commit path — receiver sees
+        // `Proposal { .. }`, not `PendingProposal { .. }`.
+        let bob_leave = bob_mdk.leave_group(&group_id).expect("bob leaves");
+        let observed = charlie_mdk
             .process_message(&bob_leave.evolution_event)
             .expect("charlie processes bob's leave");
-
         assert!(
-            matches!(result, MessageProcessingResult::PendingProposal { .. }),
-            "formerly-mixed-now-all-modern group should still fall back to legacy Remove \
-             until GCE-upgrade ships; got {:?}",
-            result
+            matches!(observed, MessageProcessingResult::Proposal { .. }),
+            "post-upgrade leave uses modern SelfRemove (Proposal auto-commit), got {observed:?}"
         );
     }
 

@@ -106,6 +106,34 @@ pub enum Error {
     /// from other `add_members` failures.
     #[error("invitee KeyPackage is missing a proposal type required by the group")]
     InviteeMissingRequiredProposal,
+    /// Caller tried an admin-only operation without admin rights.
+    #[error("only admins can perform this operation")]
+    NotAdmin,
+    /// Caller passed an empty slice where at least one proposal type was
+    /// expected (e.g. `upgrade_group_capabilities` with nothing to add).
+    #[error("upgrade requires at least one proposal type")]
+    EmptyUpgradeSet,
+    /// Caller requested a proposal type that MDK does not advertise in
+    /// `SUPPORTED_PROPOSALS`.
+    #[error("proposal type {0:?} is not in SUPPORTED_PROPOSALS")]
+    ProposalNotInSupportedSet(openmls::prelude::ProposalType),
+    /// Caller requested adding a proposal type that is already in the
+    /// group's `RequiredCapabilities`. Usually means the client's cached
+    /// status is stale because another admin upgraded the group first.
+    #[error("proposal type {0:?} is already required by this group")]
+    ProposalAlreadyRequired(openmls::prelude::ProposalType),
+    /// Caller requested adding a proposal type that is no longer safe to
+    /// require: at least one member's leaf doesn't advertise it. The
+    /// `blockers` list identifies them so the client can update its UI
+    /// without re-fetching status.
+    #[error("proposal type {proposal:?} can't be upgraded: blocked by {blockers:?}")]
+    ProposalNotAvailableForUpgrade {
+        /// The blocking proposal type.
+        proposal: openmls::prelude::ProposalType,
+        /// Nostr public keys of members whose leaves don't advertise the
+        /// proposal.
+        blockers: Vec<nostr::PublicKey>,
+    },
     /// Group exporter secret not found
     #[error("group exporter secret not found")]
     GroupExporterSecretNotFound,
