@@ -782,15 +782,9 @@ mod tests {
             crate::groups::NostrGroupDataUpdate::new().name("Hacked Group Name".to_string());
         let result = bob_mdk.update_group_data(&group_id, update);
 
-        // This should fail at the client level with a permission error
         assert!(
-            result.is_err(),
-            "Non-admin should not be able to update group data"
-        );
-        // The error is Error::Group with a message about admin permissions
-        assert!(
-            matches!(result.as_ref().unwrap_err(), crate::Error::Group(msg) if msg.contains("Only group admins")),
-            "Error should indicate admin permission required, got: {:?}",
+            matches!(result, Err(crate::Error::NotAdmin)),
+            "Error should be typed admin permission denial, got: {:?}",
             result
         );
     }
