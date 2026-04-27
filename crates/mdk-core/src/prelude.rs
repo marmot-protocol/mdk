@@ -31,8 +31,9 @@ pub use mdk_storage_traits::GroupId;
 pub use crate::extension::NostrGroupDataExtension;
 /// Group operation results
 pub use crate::groups::{
-    GroupResult, LeafNodeInfo, NostrGroupConfigData, NostrGroupDataUpdate, PendingMemberChanges,
-    RatchetTreeInfo, UpdateGroupResult,
+    CapabilityUpgradeStatus, GroupResult, LeafNodeInfo, MemberCapabilities, NostrGroupConfigData,
+    NostrGroupDataUpdate, PendingMemberChanges, ProposalUpgradability, RatchetTreeInfo,
+    UpdateGroupResult,
 };
 /// Allowed tags for the outer kind:445 wrapper event
 pub use crate::messages::EventTag;
@@ -65,5 +66,10 @@ pub use mdk_storage_traits::welcomes::types as welcome_types;
 // only by advanced callers (custom providers, raw MLS inspection, KeyPackage
 // construction), stay behind a direct `openmls` dependency.
 
-/// MLS proposal-type registry. Returned by `MDK::group_required_proposals`.
+/// MLS extension-type registry. Carried on `MemberCapabilities`.
+pub use openmls::prelude::ExtensionType;
+/// MLS proposal-type registry. Returned by `MDK::group_required_proposals`
+/// and carried on `MemberCapabilities`.
 pub use openmls::prelude::ProposalType;
+/// MLS ciphersuite registry. Carried on `MemberCapabilities`.
+pub use openmls::prelude::VerifiableCiphersuite;
