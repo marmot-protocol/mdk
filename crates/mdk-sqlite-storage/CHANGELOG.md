@@ -41,6 +41,8 @@
 
 ### Fixed
 
+- Added runtime SQLCipher verification and a post-migration file header check so encrypted storage fails closed if linked against a SQLite provider without active SQLCipher support. ([#252](https://github.com/marmot-protocol/mdk/pull/252))
+
 ### Removed
 
 ### Deprecated

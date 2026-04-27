@@ -8,7 +8,7 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use mdk_core::encrypted_media::{EncryptedMediaUpload, MediaProcessingOptions, MediaReference};
 use mdk_core::{
@@ -384,6 +384,123 @@ impl Mdk {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Keyring store auto-initialization
+// ---------------------------------------------------------------------------
+
+/// Initialize the platform-native keyring-core credential store.
+///
+/// `mdk-sqlite-storage` uses `keyring-core` to store database encryption keys.
+/// Unlike the legacy `keyring` crate (v3), `keyring-core` does **not** auto-detect
+/// a platform backend — callers must register one via
+/// `keyring_core::set_default_store()` before any `Entry` operations.
+///
+/// This function is safe to call multiple times; only the first call has an effect
+/// (`OnceLock`-guarded). It is called automatically by [`new_mdk`], so most consumers
+/// never need to call it explicitly. [`new_mdk_with_key`] bypasses the keyring entirely
+/// because the caller supplies the encryption key directly.
+///
+/// In test builds the mock (in-memory) store is used so that `cargo test` does
+/// not require real platform keychain entitlements.
+fn ensure_keyring_store() -> Result<(), MdkUniffiError> {
+    static INIT: OnceLock<Result<(), String>> = OnceLock::new();
+    let result = INIT.get_or_init(|| {
+        // If the host application already configured a store (e.g. via
+        // keyring_core::set_default_store()), respect it and skip auto-init.
+        if keyring_core::get_default_store().is_some() {
+            return Ok(());
+        }
+
+        // Test builds use the in-memory mock store — no platform entitlements needed.
+        #[cfg(any(test, feature = "test-utils"))]
+        {
+            keyring_core::set_default_store(
+                keyring_core::mock::Store::new()
+                    .map_err(|e| format!("Failed to create mock credential store: {e}"))?,
+            );
+        }
+
+        #[cfg(all(not(test), not(feature = "test-utils")))]
+        {
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            {
+                let store = apple_native_keyring_store::protected::Store::new().map_err(|e| {
+                    format!("Failed to create macOS protected-data credential store: {e}")
+                })?;
+                keyring_core::set_default_store(store);
+            }
+            #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+            {
+                let store = apple_native_keyring_store::keychain::Store::new().map_err(|e| {
+                    format!("Failed to create macOS Keychain credential store: {e}")
+                })?;
+                keyring_core::set_default_store(store);
+            }
+            #[cfg(target_os = "ios")]
+            {
+                let store = apple_native_keyring_store::protected::Store::new().map_err(|e| {
+                    format!("Failed to create iOS protected-data credential store: {e}")
+                })?;
+                keyring_core::set_default_store(store);
+            }
+            #[cfg(target_os = "android")]
+            {
+                let store = android_native_keyring_store::Store::new()
+                    .map_err(|e| format!("Failed to create Android credential store: {e}"))?;
+                keyring_core::set_default_store(store);
+            }
+            #[cfg(target_os = "windows")]
+            {
+                let store = windows_native_keyring_store::Store::new()
+                    .map_err(|e| format!("Failed to create Windows credential store: {e}"))?;
+                keyring_core::set_default_store(store);
+            }
+            #[cfg(target_os = "linux")]
+            {
+                let store = linux_keyutils_keyring_store::Store::new().map_err(|e| {
+                    format!("Failed to create Linux keyutils credential store: {e}")
+                })?;
+                keyring_core::set_default_store(store);
+            }
+            #[cfg(not(any(
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "android",
+                target_os = "windows",
+                target_os = "linux",
+            )))]
+            {
+                compile_error!(
+                    "No keyring-core credential store available for this target OS. \
+                     Add a platform-specific store crate to Cargo.toml and handle it \
+                     in ensure_keyring_store()."
+                );
+            }
+        }
+
+        Ok(())
+    });
+    result
+        .as_ref()
+        .map(|_| ())
+        .map_err(|e| MdkUniffiError::Storage(e.clone()))
+}
+
+/// Explicitly initialize the platform keyring store.
+///
+/// Most consumers do not need this — [`new_mdk`] calls it automatically.
+/// Use this if you need the keyring store initialized before constructing
+/// an MDK instance (e.g. for direct `keyring_core::Entry` access).
+///
+/// Safe to call multiple times; only the first call has an effect.
+/// If the host application has already called `keyring_core::set_default_store()`
+/// before this function, the `OnceLock` guard means this is a no-op — the
+/// caller's store is preserved.
+#[uniffi::export]
+pub fn init_keyring_store() -> Result<(), MdkUniffiError> {
+    ensure_keyring_store()
+}
+
 /// Wrap a storage backend and optional config into a [`Mdk`] instance.
 fn mdk_from_storage(storage: MdkSqliteStorage, config: Option<MdkConfig>) -> Mdk {
     let mdk = match config {
@@ -401,15 +518,8 @@ fn mdk_from_storage(storage: MdkSqliteStorage, config: Option<MdkConfig>) -> Mdk
 /// is automatically retrieved from (or generated and stored in) the platform's native
 /// keyring (Keychain on macOS/iOS, Keystore on Android, etc.).
 ///
-/// # Prerequisites
-///
-/// The host application must initialize a platform-specific keyring store before calling
-/// this function:
-///
-/// - **macOS/iOS**: `keyring_core::set_default_store(AppleStore::new())`
-/// - **Android**: Initialize from Kotlin (see Android documentation)
-/// - **Windows**: `keyring_core::set_default_store(WindowsStore::new())`
-/// - **Linux**: `keyring_core::set_default_store(KeyutilsStore::new())`
+/// The platform keyring store is initialized automatically on the first call.
+/// Callers no longer need to call `keyring_core::set_default_store()` manually.
 ///
 /// # Arguments
 ///
@@ -431,6 +541,7 @@ pub fn new_mdk(
     db_key_id: String,
     config: Option<MdkConfig>,
 ) -> Result<Mdk, MdkUniffiError> {
+    ensure_keyring_store()?;
     let storage = MdkSqliteStorage::new(PathBuf::from(db_path), &service_id, &db_key_id)?;
     Ok(mdk_from_storage(storage, config))
 }
@@ -2165,9 +2276,11 @@ impl TryFrom<EncryptedMediaUploadResult> for EncryptedMediaUpload {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use mdk_sqlite_storage::encryption::is_database_encrypted;
     use nostr::{EventBuilder, JsonUtil, Keys, Kind, Tag, UnsignedEvent};
     use tempfile::TempDir;
+
+    use super::*;
 
     fn create_test_mdk() -> Mdk {
         new_mdk_unencrypted(":memory:".to_string(), None).unwrap()
@@ -2186,6 +2299,7 @@ mod tests {
         // Should be able to get groups (empty initially)
         let groups = mdk.get_groups().unwrap();
         assert_eq!(groups.len(), 0);
+        assert!(is_database_encrypted(&db_path).unwrap());
     }
 
     #[test]
@@ -3997,6 +4111,44 @@ mod tests {
                 "test.bin".to_string(),
             );
             assert!(matches!(result, Err(MdkUniffiError::InvalidInput(_))));
+        }
+
+        // -----------------------------------------------------------------
+        // Keyring auto-initialization (ensure_keyring_store / init_keyring_store)
+        // -----------------------------------------------------------------
+
+        #[test]
+        fn test_ensure_keyring_store_idempotent() {
+            // Calling ensure_keyring_store() multiple times must succeed —
+            // the OnceLock ensures only the first call performs initialization.
+            assert!(ensure_keyring_store().is_ok());
+            assert!(ensure_keyring_store().is_ok());
+            assert!(ensure_keyring_store().is_ok());
+        }
+
+        #[test]
+        fn test_init_keyring_store_exported() {
+            // The UniFFI-exported wrapper must also succeed and be idempotent.
+            assert!(init_keyring_store().is_ok());
+            assert!(init_keyring_store().is_ok());
+        }
+
+        #[test]
+        fn test_new_mdk_auto_inits_keyring() {
+            // new_mdk() should succeed without the caller having to manually
+            // call set_default_store() — ensure_keyring_store() handles it.
+            let temp_dir = TempDir::new().unwrap();
+            let db_path = temp_dir.path().join("auto_init_test.db");
+            let result = new_mdk(
+                db_path.to_string_lossy().to_string(),
+                "org.test.keyring".to_string(),
+                "test.db.key".to_string(),
+                None,
+            );
+            assert!(
+                result.is_ok(),
+                "new_mdk() should auto-init the keyring store"
+            );
         }
     }
 }

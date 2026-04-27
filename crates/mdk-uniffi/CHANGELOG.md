@@ -38,6 +38,8 @@
 
 ### Added
 
+- `new_mdk()` now auto-initializes the platform-native keyring-core credential store on first call (`OnceLock`-guarded). Callers no longer need to call `keyring_core::set_default_store()` manually. Platform stores: iOS (protected), macOS ARM (protected), macOS x86 (keychain), Android, Windows, Linux; mock store in test builds. ([#252](https://github.com/marmot-protocol/mdk/pull/252))
+- Exported `init_keyring_store()` via UniFFI for consumers who need early keyring initialization before constructing an MDK instance. ([#252](https://github.com/marmot-protocol/mdk/pull/252))
 - Added UniFFI bindings for `group_required_proposals` and a mirror enum `MdkProposalType` covering `SelfRemove` and a forward-compat `Unknown` catch-all. Lets mobile consumers branch UI on per-group capability state (e.g. whether `SelfRemove` is available) without taking a direct `openmls` dependency on the binding side. Result order is deterministic (`Vec<MdkProposalType>` built from the underlying `BTreeSet`). The `From<ProposalType>` mapping enumerates every openmls variant explicitly — no wildcard arm — so an openmls bump that adds a proposal type fails to compile rather than silently collapsing to `Unknown`. ([#265](https://github.com/marmot-protocol/mdk/pull/265))
 - Added UniFFI bindings for `delete_messages_for_group` and `delete_group` for local "clear chat" and "delete chat" operations. ([#250](https://github.com/marmot-protocol/mdk/pull/250))
 - Added UniFFI bindings for 10 previously unbound methods: `delete_key_package_from_storage`, `delete_key_package_from_storage_by_hash_ref`, `get_ratchet_tree_info`, `group_leaf_map`, `own_leaf_index`, `pending_added_members_pubkeys`, `pending_member_changes`, `pending_removed_members_pubkeys`, `prepare_group_image_for_upload_with_options`, and `process_message_with_context`. ([#249](https://github.com/marmot-protocol/mdk/pull/249))
@@ -46,6 +48,7 @@
 
 ### Fixed
 
+- Removed the Swift package's explicit system `sqlite3` link and linked the native frameworks required by the bundled SQLCipher provider instead. ([#252](https://github.com/marmot-protocol/mdk/pull/252))
 - Removed redundant `cargo build` steps from Swift, Python, and Ruby binding CI jobs that duplicated work already done by `_build-uniffi`. ([`#232`](https://github.com/marmot-protocol/mdk/pull/232))
 - Fixed stale `release-size` artifact paths in Kotlin and Swift binding generation recipes. ([`#232`](https://github.com/marmot-protocol/mdk/pull/232))
 
