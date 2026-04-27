@@ -797,6 +797,8 @@ where
             &signer,
         )?;
 
+        self.ensure_mixed_wire_format(&mut mls_group);
+
         let serialized_commit = commit_message.tls_serialize_detached()?;
         let commit_event =
             self.build_message_event(&mls_group.group_id().into(), serialized_commit, None)?;
@@ -1042,12 +1044,9 @@ where
         let mut mls_group = self.load_mls_group(group_id)?.ok_or(Error::GroupNotFound)?;
         let mls_signer: SignatureKeyPair = self.load_mls_signer(&mls_group)?;
 
-        // Check if current user is an admin
         let own_leaf = mls_group.own_leaf().ok_or(Error::OwnLeafNotFound)?;
         if !self.is_leaf_node_admin(&mls_group.group_id().into(), own_leaf)? {
-            return Err(Error::Group(
-                "Only group admins can add members".to_string(),
-            ));
+            return Err(Error::NotAdmin);
         }
 
         // Parse key packages from events
@@ -1148,9 +1147,9 @@ where
     ///
     /// * `Error::GroupNotFound` - If the group does not exist
     /// * `Error::OwnLeafNotFound` - If the caller's leaf node is missing
-    /// * `Error::Group` - If the caller is not an admin, no matching members are found,
-    ///   the caller attempts to remove themselves, or the removal would leave the group
-    ///   with no admins
+    /// * `Error::NotAdmin` - If the caller is not an admin
+    /// * `Error::Group` - If no matching members are found, the caller attempts to
+    ///   remove themselves, or the removal would leave the group with no admins
     /// * `Error::Extension` - If updating the admin list extension fails
     pub fn remove_members(
         &self,
@@ -1161,12 +1160,9 @@ where
 
         let signer: SignatureKeyPair = self.load_mls_signer(&mls_group)?;
 
-        // Check if current user is an admin
         let own_leaf = mls_group.own_leaf().ok_or(Error::OwnLeafNotFound)?;
         if !self.is_leaf_node_admin(group_id, own_leaf)? {
-            return Err(Error::Group(
-                "Only group admins can remove members".to_string(),
-            ));
+            return Err(Error::NotAdmin);
         }
 
         // Prevent self-removal — MLS does not allow a member to commit their own removal
@@ -1301,12 +1297,9 @@ where
         group_id: &GroupId,
         group_data: &NostrGroupDataExtension,
     ) -> Result<UpdateGroupResult, Error> {
-        // Check if current user is an admin
         let own_leaf = mls_group.own_leaf().ok_or(Error::OwnLeafNotFound)?;
         if !self.is_leaf_node_admin(group_id, own_leaf)? {
-            return Err(Error::Group(
-                "Only group admins can update group context extensions".to_string(),
-            ));
+            return Err(Error::NotAdmin);
         }
 
         let extension = Self::get_unknown_extension_from_group_data(group_data)?;
@@ -1955,7 +1948,7 @@ where
         let group_data = NostrGroupDataExtension::from_group(&mls_group)?;
 
         if !group_data.admins.contains(&own_pubkey) {
-            return Err(Error::Group("Cannot self-demote: not an admin".to_string()));
+            return Err(Error::NotAdmin);
         }
 
         // Count only admins who are actual group members (ignores stale entries
@@ -4568,8 +4561,6 @@ mod tests {
     /// Test that non-admins cannot add members to a group
     #[test]
     fn test_non_admin_cannot_add_members() {
-        use crate::test_util::create_key_package_event;
-
         let creator_mdk = create_test_mdk();
         let creator = Keys::generate();
         let non_admin_keys = Keys::generate();
@@ -4623,14 +4614,9 @@ mod tests {
 
         let result = non_admin_mdk.add_members(&group_id, &[new_member_key_package]);
 
-        // Should fail with permission error, not GroupNotFound
         assert!(
-            result.is_err(),
-            "Non-admin should not be able to add members"
-        );
-        assert!(
-            matches!(result, Err(crate::Error::Group(ref msg)) if msg.contains("Only group admins can add members")),
-            "Should fail with admin permission error, got: {:?}",
+            matches!(result, Err(Error::NotAdmin)),
+            "Should fail with typed admin permission error, got: {:?}",
             result
         );
 
@@ -4648,8 +4634,6 @@ mod tests {
     /// Test that non-admins cannot remove members from a group
     #[test]
     fn test_non_admin_cannot_remove_members() {
-        use crate::test_util::create_key_package_event;
-
         let creator_mdk = create_test_mdk();
         let creator = Keys::generate();
         let non_admin_keys = Keys::generate();
@@ -4698,14 +4682,9 @@ mod tests {
         // Try to have the non-admin remove another member
         let result = non_admin_mdk.remove_members(&group_id, &[other_member_keys.public_key()]);
 
-        // Should fail with permission error, not GroupNotFound
         assert!(
-            result.is_err(),
-            "Non-admin should not be able to remove members"
-        );
-        assert!(
-            matches!(result, Err(crate::Error::Group(ref msg)) if msg.contains("Only group admins can remove members")),
-            "Should fail with admin permission error, got: {:?}",
+            matches!(result, Err(Error::NotAdmin)),
+            "Should fail with typed admin permission error, got: {:?}",
             result
         );
 
@@ -4732,8 +4711,6 @@ mod tests {
     /// Test that non-admins cannot update group extensions
     #[test]
     fn test_non_admin_cannot_update_group_extensions() {
-        use crate::test_util::create_key_package_event;
-
         let creator_mdk = create_test_mdk();
         let creator = Keys::generate();
         let non_admin_keys = Keys::generate();
@@ -4781,14 +4758,9 @@ mod tests {
         let update = NostrGroupDataUpdate::new().name("Hacked Name".to_string());
         let result = non_admin_mdk.update_group_data(&group_id, update);
 
-        // Should fail with permission error, not GroupNotFound
         assert!(
-            result.is_err(),
-            "Non-admin should not be able to update group extensions"
-        );
-        assert!(
-            matches!(result, Err(crate::Error::Group(ref msg)) if msg.contains("Only group admins")),
-            "Should fail with admin permission error, got: {:?}",
+            matches!(result, Err(Error::NotAdmin)),
+            "Should fail with typed admin permission error, got: {:?}",
             result
         );
 
@@ -4805,6 +4777,48 @@ mod tests {
         assert_eq!(
             initial_description, final_group.description,
             "Group description should not change when non-admin attempts to update"
+        );
+    }
+
+    /// Test that non-admins cannot self-demote.
+    #[test]
+    fn test_non_admin_cannot_self_demote() {
+        let creator_mdk = create_test_mdk();
+        let creator = Keys::generate();
+        let non_admin_keys = Keys::generate();
+
+        let non_admin_mdk = create_test_mdk();
+        let non_admin_key_package = create_key_package_event(&non_admin_mdk, &non_admin_keys);
+
+        let create_result = creator_mdk
+            .create_group(
+                &creator.public_key(),
+                vec![non_admin_key_package],
+                create_nostr_group_config_data(vec![creator.public_key()]),
+            )
+            .expect("Failed to create group");
+
+        let group_id = create_result.group.mls_group_id.clone();
+        creator_mdk
+            .merge_pending_commit(&group_id)
+            .expect("Failed to merge commit");
+
+        let non_admin_welcome = non_admin_mdk
+            .process_welcome(
+                &nostr::EventId::all_zeros(),
+                &create_result.welcome_rumors[0],
+            )
+            .expect("Non-admin should process welcome");
+        non_admin_mdk
+            .accept_welcome(&non_admin_welcome)
+            .expect("Non-admin should accept welcome");
+
+        let result = non_admin_mdk.self_demote(&group_id);
+
+        assert!(
+            matches!(result, Err(Error::NotAdmin)),
+            "Should fail with typed admin permission error, got: {:?}",
+            result
         );
     }
 
@@ -7408,6 +7422,102 @@ mod tests {
         assert!(
             matches!(observed, MessageProcessingResult::Proposal { .. }),
             "post-upgrade leave must be modern SelfRemove (Proposal auto-commit), got {observed:?}"
+        );
+    }
+
+    /// Convergence: `upgrade_group_capabilities` normalises a stale
+    /// PURE_CIPHERTEXT local policy to `MIXED_CIPHERTEXT_WIRE_FORMAT_POLICY`.
+    /// Same hygiene as `self_update`: an admin upgrading a formerly-mixed
+    /// group whose own persisted state still carries PURE (e.g. from an
+    /// older MDK build) must end up able to receive `PublicMessage`
+    /// SelfRemove proposals from departing members on the upgraded group.
+    /// Reload-from-storage is load-bearing — in-memory state alone does
+    /// not prove the persist-side convergence worked.
+    #[test]
+    fn test_upgrade_group_capabilities_converges_wire_format_to_mixed_ciphertext() {
+        use openmls::prelude::{
+            MIXED_CIPHERTEXT_WIRE_FORMAT_POLICY, MlsGroupJoinConfig,
+            PURE_CIPHERTEXT_WIRE_FORMAT_POLICY,
+        };
+
+        // Mixed group → legacy invitee removed → SelfRemove now Available.
+        let alice_mdk = create_test_mdk();
+        let bob_mdk = create_test_mdk();
+        let alice = Keys::generate();
+        let bob = Keys::generate();
+        let legacy = Keys::generate();
+
+        let bob_kp = create_key_package_event(&bob_mdk, &bob);
+        let legacy_kp = create_legacy_key_package_event(&alice_mdk, &legacy);
+
+        let create_result = alice_mdk
+            .create_group(
+                &alice.public_key(),
+                vec![bob_kp, legacy_kp],
+                create_nostr_group_config_data(vec![alice.public_key()]),
+            )
+            .expect("mixed creation");
+        let group_id = create_result.group.mls_group_id.clone();
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("alice merges creation");
+
+        let bob_welcome = bob_mdk
+            .process_welcome(
+                &nostr::EventId::all_zeros(),
+                &create_result.welcome_rumors[0],
+            )
+            .expect("bob welcome");
+        bob_mdk.accept_welcome(&bob_welcome).expect("bob accepts");
+
+        let remove_result = alice_mdk
+            .remove_members(&group_id, &[legacy.public_key()])
+            .expect("alice removes legacy");
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("alice merges removal");
+        bob_mdk
+            .process_message(&remove_result.evolution_event)
+            .expect("bob processes removal");
+
+        // Force alice's local policy to PURE_CIPHERTEXT, simulating
+        // persisted state from an older MDK build that defaulted to PURE.
+        let mut mls_group = alice_mdk
+            .load_mls_group(&group_id)
+            .expect("load for setup")
+            .expect("group exists");
+        let pure_config = MlsGroupJoinConfig::builder()
+            .wire_format_policy(PURE_CIPHERTEXT_WIRE_FORMAT_POLICY)
+            .build();
+        mls_group
+            .set_configuration(&alice_mdk.provider.storage, &pure_config)
+            .expect("force PURE wire format");
+        drop(mls_group);
+
+        // Sanity: the stale precondition is actually persisted.
+        let pre = alice_mdk
+            .load_mls_group(&group_id)
+            .expect("load pre")
+            .expect("group pre");
+        assert_eq!(
+            pre.configuration().wire_format_policy(),
+            PURE_CIPHERTEXT_WIRE_FORMAT_POLICY,
+            "sanity: upgrader starts on stale PURE wire format"
+        );
+        drop(pre);
+
+        alice_mdk
+            .upgrade_group_capabilities(&group_id, &BTreeSet::from([ProposalType::SelfRemove]))
+            .expect("admin upgrade succeeds");
+
+        let post = alice_mdk
+            .load_mls_group(&group_id)
+            .expect("load post")
+            .expect("group post");
+        assert_eq!(
+            post.configuration().wire_format_policy(),
+            MIXED_CIPHERTEXT_WIRE_FORMAT_POLICY,
+            "upgrade_group_capabilities should converge wire format to MIXED_CIPHERTEXT"
         );
     }
 
