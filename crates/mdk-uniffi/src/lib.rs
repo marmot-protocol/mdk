@@ -457,8 +457,8 @@ fn ensure_keyring_store() -> Result<(), MdkUniffiError> {
             }
             #[cfg(target_os = "linux")]
             {
-                let store = linux_keyutils_keyring_store::Store::new().map_err(|e| {
-                    format!("Failed to create Linux keyutils credential store: {e}")
+                let store = zbus_secret_service_keyring_store::Store::new().map_err(|e| {
+                    format!("Failed to create Linux Secret Service credential store: {e}")
                 })?;
                 keyring_core::set_default_store(store);
             }
