@@ -253,7 +253,7 @@ where
 
 fn is_special_sqlite_path(path: &Path) -> bool {
     let path_str = path.to_string_lossy();
-    path_str.is_empty() || path_str == ":memory:" || path_str.starts_with(':')
+    path_str.is_empty() || path_str == ":memory:"
 }
 
 #[cfg(test)]
@@ -412,6 +412,25 @@ mod tests {
         drop(conn);
 
         let result = verify_database_file_encrypted(&db_path);
+        assert!(matches!(
+            result,
+            Err(Error::UnencryptedDatabaseWithEncryption)
+        ));
+    }
+
+    #[test]
+    fn test_verify_database_file_encrypted_rejects_colon_prefixed_plain_file() {
+        let db_path = format!(":plain-{}.db", std::process::id());
+        let _ = std::fs::remove_file(&db_path);
+
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch("CREATE TABLE test (id INTEGER);")
+            .unwrap();
+        drop(conn);
+
+        let result = verify_database_file_encrypted(&db_path);
+        let _ = std::fs::remove_file(&db_path);
+
         assert!(matches!(
             result,
             Err(Error::UnencryptedDatabaseWithEncryption)

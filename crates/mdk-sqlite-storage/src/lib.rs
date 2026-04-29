@@ -614,7 +614,7 @@ impl MdkSqliteStorage {
     fn apply_secure_permissions(db_path: &Path) -> Result<(), Error> {
         // Skip special SQLite paths (in-memory databases, etc.)
         let path_str = db_path.to_string_lossy();
-        if path_str.is_empty() || path_str == ":memory:" || path_str.starts_with(':') {
+        if path_str.is_empty() || path_str == ":memory:" {
             return Ok(());
         }
 

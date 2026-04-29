@@ -395,95 +395,142 @@ impl Mdk {
 /// a platform backend — callers must register one via
 /// `keyring_core::set_default_store()` before any `Entry` operations.
 ///
-/// This function is safe to call multiple times; only the first call has an effect
-/// (`OnceLock`-guarded). It is called automatically by [`new_mdk`], so most consumers
-/// never need to call it explicitly. [`new_mdk_with_key`] bypasses the keyring entirely
-/// because the caller supplies the encryption key directly.
+/// This function is safe to call multiple times. Successful initialization is cached,
+/// while failed attempts can be retried. It is called automatically by [`new_mdk`],
+/// so most consumers never need to call it explicitly. [`new_mdk_with_key`] bypasses
+/// the keyring entirely because the caller supplies the encryption key directly.
 ///
 /// In test builds the mock (in-memory) store is used so that `cargo test` does
 /// not require real platform keychain entitlements.
 fn ensure_keyring_store() -> Result<(), MdkUniffiError> {
-    static INIT: OnceLock<Result<(), String>> = OnceLock::new();
-    let result = INIT.get_or_init(|| {
-        // If the host application already configured a store (e.g. via
-        // keyring_core::set_default_store()), respect it and skip auto-init.
-        if keyring_core::get_default_store().is_some() {
-            return Ok(());
-        }
+    static INIT: KeyringInitState = KeyringInitState::new();
+    ensure_keyring_store_with(
+        &INIT,
+        || keyring_core::get_default_store().is_some(),
+        initialize_platform_keyring_store,
+    )
+}
 
-        // Test builds use the in-memory mock store — no platform entitlements needed.
-        #[cfg(any(test, feature = "test-utils"))]
+struct KeyringInitState {
+    initialized: OnceLock<()>,
+    lock: Mutex<()>,
+}
+
+impl KeyringInitState {
+    const fn new() -> Self {
+        Self {
+            initialized: OnceLock::new(),
+            lock: Mutex::new(()),
+        }
+    }
+}
+
+fn ensure_keyring_store_with<DefaultStoreExists, InitializeStore>(
+    state: &KeyringInitState,
+    default_store_exists: DefaultStoreExists,
+    initialize_store: InitializeStore,
+) -> Result<(), MdkUniffiError>
+where
+    DefaultStoreExists: Fn() -> bool,
+    InitializeStore: FnOnce() -> Result<(), String>,
+{
+    if state.initialized.get().is_some() {
+        return Ok(());
+    }
+
+    // If the host application already configured a store (e.g. via
+    // keyring_core::set_default_store()), respect it and skip auto-init.
+    if default_store_exists() {
+        let _ = state.initialized.set(());
+        return Ok(());
+    }
+
+    let _guard = state.lock.lock().map_err(|_| {
+        MdkUniffiError::Storage("Keyring initialization mutex poisoned".to_string())
+    })?;
+
+    if state.initialized.get().is_some() {
+        return Ok(());
+    }
+
+    if default_store_exists() {
+        let _ = state.initialized.set(());
+        return Ok(());
+    }
+
+    initialize_store().map_err(MdkUniffiError::Storage)?;
+    let _ = state.initialized.set(());
+    Ok(())
+}
+
+fn initialize_platform_keyring_store() -> Result<(), String> {
+    // Test builds use the in-memory mock store — no platform entitlements needed.
+    #[cfg(any(test, feature = "test-utils"))]
+    {
+        keyring_core::set_default_store(
+            keyring_core::mock::Store::new()
+                .map_err(|e| format!("Failed to create mock credential store: {e}"))?,
+        );
+    }
+
+    #[cfg(all(not(test), not(feature = "test-utils")))]
+    {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
-            keyring_core::set_default_store(
-                keyring_core::mock::Store::new()
-                    .map_err(|e| format!("Failed to create mock credential store: {e}"))?,
+            let store = apple_native_keyring_store::protected::Store::new().map_err(|e| {
+                format!("Failed to create macOS protected-data credential store: {e}")
+            })?;
+            keyring_core::set_default_store(store);
+        }
+        #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+        {
+            let store = apple_native_keyring_store::keychain::Store::new()
+                .map_err(|e| format!("Failed to create macOS Keychain credential store: {e}"))?;
+            keyring_core::set_default_store(store);
+        }
+        #[cfg(target_os = "ios")]
+        {
+            let store = apple_native_keyring_store::protected::Store::new().map_err(|e| {
+                format!("Failed to create iOS protected-data credential store: {e}")
+            })?;
+            keyring_core::set_default_store(store);
+        }
+        #[cfg(target_os = "android")]
+        {
+            let store = android_native_keyring_store::Store::new()
+                .map_err(|e| format!("Failed to create Android credential store: {e}"))?;
+            keyring_core::set_default_store(store);
+        }
+        #[cfg(target_os = "windows")]
+        {
+            let store = windows_native_keyring_store::Store::new()
+                .map_err(|e| format!("Failed to create Windows credential store: {e}"))?;
+            keyring_core::set_default_store(store);
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let store = zbus_secret_service_keyring_store::Store::new().map_err(|e| {
+                format!("Failed to create Linux Secret Service credential store: {e}")
+            })?;
+            keyring_core::set_default_store(store);
+        }
+        #[cfg(not(any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android",
+            target_os = "windows",
+            target_os = "linux",
+        )))]
+        {
+            compile_error!(
+                "No keyring-core credential store available for this target OS. \
+                 Add a platform-specific store crate to Cargo.toml and handle it \
+                 in ensure_keyring_store()."
             );
         }
+    }
 
-        #[cfg(all(not(test), not(feature = "test-utils")))]
-        {
-            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-            {
-                let store = apple_native_keyring_store::protected::Store::new().map_err(|e| {
-                    format!("Failed to create macOS protected-data credential store: {e}")
-                })?;
-                keyring_core::set_default_store(store);
-            }
-            #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
-            {
-                let store = apple_native_keyring_store::keychain::Store::new().map_err(|e| {
-                    format!("Failed to create macOS Keychain credential store: {e}")
-                })?;
-                keyring_core::set_default_store(store);
-            }
-            #[cfg(target_os = "ios")]
-            {
-                let store = apple_native_keyring_store::protected::Store::new().map_err(|e| {
-                    format!("Failed to create iOS protected-data credential store: {e}")
-                })?;
-                keyring_core::set_default_store(store);
-            }
-            #[cfg(target_os = "android")]
-            {
-                let store = android_native_keyring_store::Store::new()
-                    .map_err(|e| format!("Failed to create Android credential store: {e}"))?;
-                keyring_core::set_default_store(store);
-            }
-            #[cfg(target_os = "windows")]
-            {
-                let store = windows_native_keyring_store::Store::new()
-                    .map_err(|e| format!("Failed to create Windows credential store: {e}"))?;
-                keyring_core::set_default_store(store);
-            }
-            #[cfg(target_os = "linux")]
-            {
-                let store = zbus_secret_service_keyring_store::Store::new().map_err(|e| {
-                    format!("Failed to create Linux Secret Service credential store: {e}")
-                })?;
-                keyring_core::set_default_store(store);
-            }
-            #[cfg(not(any(
-                target_os = "macos",
-                target_os = "ios",
-                target_os = "android",
-                target_os = "windows",
-                target_os = "linux",
-            )))]
-            {
-                compile_error!(
-                    "No keyring-core credential store available for this target OS. \
-                     Add a platform-specific store crate to Cargo.toml and handle it \
-                     in ensure_keyring_store()."
-                );
-            }
-        }
-
-        Ok(())
-    });
-    result
-        .as_ref()
-        .map(|_| ())
-        .map_err(|e| MdkUniffiError::Storage(e.clone()))
+    Ok(())
 }
 
 /// Explicitly initialize the platform keyring store.
@@ -492,10 +539,9 @@ fn ensure_keyring_store() -> Result<(), MdkUniffiError> {
 /// Use this if you need the keyring store initialized before constructing
 /// an MDK instance (e.g. for direct `keyring_core::Entry` access).
 ///
-/// Safe to call multiple times; only the first call has an effect.
+/// Safe to call multiple times; successful initialization is cached.
 /// If the host application has already called `keyring_core::set_default_store()`
-/// before this function, the `OnceLock` guard means this is a no-op — the
-/// caller's store is preserved.
+/// before this function, this is a no-op — the caller's store is preserved.
 #[uniffi::export]
 pub fn init_keyring_store() -> Result<(), MdkUniffiError> {
     ensure_keyring_store()
@@ -531,7 +577,7 @@ fn mdk_from_storage(storage: MdkSqliteStorage, config: Option<MdkConfig>) -> Mdk
 /// # Errors
 ///
 /// Returns an error if:
-/// - No keyring store has been initialized
+/// - The platform keyring store cannot be initialized
 /// - The keyring is unavailable or inaccessible
 /// - The database cannot be opened or created
 #[uniffi::export]
@@ -2276,6 +2322,8 @@ impl TryFrom<EncryptedMediaUploadResult> for EncryptedMediaUpload {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
     use mdk_sqlite_storage::encryption::is_database_encrypted;
     use nostr::{EventBuilder, JsonUtil, Keys, Kind, Tag, UnsignedEvent};
     use tempfile::TempDir;
@@ -2284,6 +2332,40 @@ mod tests {
 
     fn create_test_mdk() -> Mdk {
         new_mdk_unencrypted(":memory:".to_string(), None).unwrap()
+    }
+
+    #[test]
+    fn test_keyring_init_failure_does_not_poison_future_host_store() {
+        let state = KeyringInitState::new();
+        let host_store_exists = AtomicBool::new(false);
+        let init_attempts = AtomicUsize::new(0);
+
+        let first = ensure_keyring_store_with(
+            &state,
+            || host_store_exists.load(Ordering::SeqCst),
+            || {
+                init_attempts.fetch_add(1, Ordering::SeqCst);
+                Err("transient keyring failure".to_string())
+            },
+        );
+
+        assert!(matches!(
+            first,
+            Err(MdkUniffiError::Storage(message)) if message == "transient keyring failure"
+        ));
+
+        host_store_exists.store(true, Ordering::SeqCst);
+        let second = ensure_keyring_store_with(
+            &state,
+            || host_store_exists.load(Ordering::SeqCst),
+            || {
+                init_attempts.fetch_add(1, Ordering::SeqCst);
+                panic!("host-installed store should skip platform initialization")
+            },
+        );
+
+        assert!(second.is_ok());
+        assert_eq!(init_attempts.load(Ordering::SeqCst), 1);
     }
 
     #[test]

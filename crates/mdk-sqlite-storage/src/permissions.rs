@@ -123,7 +123,7 @@ where
 
     // Skip special SQLite paths (in-memory databases, empty paths)
     let path_str = path.to_string_lossy();
-    if path_str.is_empty() || path_str == ":memory:" || path_str.starts_with(':') {
+    if path_str.is_empty() || path_str == ":memory:" {
         return Ok(FileCreationOutcome::Skipped);
     }
 
@@ -322,13 +322,20 @@ mod tests {
         let result = precreate_secure_database_file(":memory:");
         assert_eq!(result.unwrap(), FileCreationOutcome::Skipped);
 
-        // Other special SQLite paths
-        let result = precreate_secure_database_file(":temp:");
-        assert_eq!(result.unwrap(), FileCreationOutcome::Skipped);
-
         // Empty path
         let result = precreate_secure_database_file("");
         assert_eq!(result.unwrap(), FileCreationOutcome::Skipped);
+    }
+
+    #[test]
+    fn test_precreate_handles_colon_prefixed_filename() {
+        let db_path = format!(":precreate-{}.db", std::process::id());
+        let _ = std::fs::remove_file(&db_path);
+
+        let result = precreate_secure_database_file(&db_path);
+        let _ = std::fs::remove_file(&db_path);
+
+        assert_eq!(result.unwrap(), FileCreationOutcome::Created);
     }
 
     #[test]
