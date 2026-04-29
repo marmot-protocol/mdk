@@ -52,6 +52,8 @@
 - Removed the Swift package's explicit system `sqlite3` link and linked the native frameworks required by the bundled SQLCipher provider instead. ([#252](https://github.com/marmot-protocol/mdk/pull/252))
 - Removed redundant `cargo build` steps from Swift, Python, and Ruby binding CI jobs that duplicated work already done by `_build-uniffi`. ([`#232`](https://github.com/marmot-protocol/mdk/pull/232))
 - Fixed stale `release-size` artifact paths in Kotlin and Swift binding generation recipes. ([`#232`](https://github.com/marmot-protocol/mdk/pull/232))
+- Unbroke binding builds on Linux: switched `[profile.release].strip` from `true` to `"debuginfo"` so `uniffi-bindgen --library` can still read `UNIFFI_META_*` symbols from the cdylib's `.symtab` (GNU strip's `--strip-all` was removing them, which silently produced empty Kotlin/Ruby/Python binding output). DWARF debug info is still stripped, so the binary-size cost is small. ([`#267`](https://github.com/marmot-protocol/mdk/pull/267))
+- Switched iOS bindings to fat LTO (`CARGO_PROFILE_RELEASE_LTO=fat`, mirroring Android) so the static `.a` archives no longer embed per-module thin-LTO bitcode. This shrinks `libmdk_uniffi.a` back below GitHub's 100 MB push limit. The Swift package workflow also configures `git lfs track "*.a"` as a defensive safety net. ([`#267`](https://github.com/marmot-protocol/mdk/pull/267))
 
 ### Removed
 
