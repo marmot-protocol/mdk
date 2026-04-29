@@ -85,6 +85,14 @@ jobs:
         # Copy package contents
         cp -R swift/MDKPackage/* swift-package-repo/
         cd swift-package-repo
+
+        # Track .a archives via Git LFS — iOS static archives can exceed GitHub's
+        # 100 MB hard push limit even with fat LTO + strip. Configure LFS before
+        # adding files so they're staged through LFS, not as raw blobs.
+        git lfs install
+        git lfs track "*.a"
+        git add .gitattributes
+
         git add -A
 
     - name: Commit and push

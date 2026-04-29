@@ -167,7 +167,10 @@ _build-uniffi-ios TARGET:
     # the system Clang defaults to the current SDK version (e.g. 18.5), which emits
     # symbols like ___chkstk_darwin that are unavailable at the linker's deployment target,
     # causing "undefined symbol" link errors.
-    IPHONEOS_DEPLOYMENT_TARGET=15.0 cargo build --release --lib -p mdk-uniffi --target {{TARGET}}
+    #
+    # Fat LTO for iOS: avoids embedding per-module bitcode in the static .a archive,
+    # which would otherwise push it past GitHub's 100 MB push limit. Mirrors Android.
+    IPHONEOS_DEPLOYMENT_TARGET=15.0 CARGO_PROFILE_RELEASE_LTO=fat cargo build --release --lib -p mdk-uniffi --target {{TARGET}}
 
 _build-uniffi-android TARGET CLANG_PREFIX:
     #!/usr/bin/env bash
