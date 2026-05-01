@@ -17,6 +17,7 @@ default = []
 mip04 = []
 mip05 = ["nostr/nip59"]
 debug-examples = []
+test-utils = ["mdk-storage-traits/test-utils"]
 
 [dependencies]
 mdk-macros.workspace = true

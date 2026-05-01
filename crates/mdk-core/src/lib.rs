@@ -33,7 +33,8 @@ pub mod messages;
 pub mod mip05;
 pub mod prelude;
 mod state_validation;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-utils"))]
+#[cfg_attr(docsrs, doc(cfg(feature = "test-utils")))]
 pub mod test_util;
 mod util;
 pub mod welcomes;

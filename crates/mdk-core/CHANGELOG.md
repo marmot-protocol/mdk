@@ -47,6 +47,7 @@
 
 ### Added
 
+- Added `test-utils` Cargo feature on `mdk-core` exposing the existing `test_util` module (notably `create_legacy_key_package_event`) so downstream crates can build legacy-LeafNode fixtures without a `cfg(test)` workaround. ([#269](https://github.com/marmot-protocol/mdk/pull/269))
 - **GroupContextExtensions upgrade path.** Three new public methods on `MDK` let client UX prompt an admin to upgrade a mixed group that has since become all-modern:
   - `group_member_capabilities(&GroupId) -> Result<Vec<MemberCapabilities>, Error>` — per-member advertised proposal types, extension types, ciphersuites, and admin flag. Proposal and extension capabilities are returned as `BTreeSet`s. Any member may call it.
   - `group_capability_upgrade_status(&GroupId) -> Result<CapabilityUpgradeStatus, Error>` — per-proposal upgrade readiness. Each entry in `SUPPORTED_PROPOSALS` is reported as `AlreadyRequired`, `Available`, or `Blocked { blockers: Vec<PublicKey> }`. Any member may call it.
