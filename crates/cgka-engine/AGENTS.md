@@ -66,7 +66,7 @@ These are the load-bearing departures from the original plan. Each is also docum
 
 ## Open structural items
 
-None in the engine core. Remaining work is around observability and production backends: recovery trace observations for portable vectors, SQLite snapshot retention/pruning, transport adapters, and KeyPackage refresh scheduling. See [`../../plans/2026-04-22-cgka-engine-production-refactor-v1.md`](../../plans/2026-04-22-cgka-engine-production-refactor-v1.md).
+None in the engine core. Remaining work is around production backends and packaging: external vector fixtures/runners, SQLite snapshot retention/pruning, transport adapters, and KeyPackage refresh scheduling. See [`../../plans/2026-04-22-cgka-engine-production-refactor-v1.md`](../../plans/2026-04-22-cgka-engine-production-refactor-v1.md).
 
 ### Done — Task 4.2 `update_group_data` (2026-04-25)
 
@@ -80,7 +80,7 @@ OpenMLS 0.8.1 surface used: `MlsGroup::pending_commit() -> Option<&StagedCommit>
 
 ### Done — ForkRecoveryManager (2026-05-04)
 
-`crates/cgka-engine/src/fork_recovery.rs` owns deterministic same-epoch commit recovery. The ordering key is `(TransportMessage::timestamp, MessageId bytes)`. Local and inbound commits create pre-commit snapshots; a better late candidate rolls storage back and replays, while a losing candidate is marked stale. `EngineError::ForkedEpoch` is now the fallback for missing snapshots or unrecoverable shapes. Tests: `tests/fork_detection.rs` plus the harness `deliberate_fork_via_harness`.
+`crates/cgka-engine/src/fork_recovery.rs` owns deterministic same-epoch commit recovery. The ordering key is `(TransportMessage::timestamp, MessageId bytes)`. Local and inbound commits create pre-commit snapshots; a better late candidate rolls storage back and replays, while a losing candidate is marked stale. Successful rollback emits `GroupEvent::ForkRecovered` so harness vectors can compare recovery trace, not just final state. `EngineError::ForkedEpoch` is now the fallback for missing snapshots or unrecoverable shapes. Tests: `tests/fork_detection.rs` plus the harness `deliberate_fork_via_harness`.
 
 ## Conventions in this crate
 

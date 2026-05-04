@@ -41,7 +41,7 @@ cargo test -p cgka-engine
 
 | File | Owns |
 |---|---|
-| `canonical_scenarios.rs` | Phase 6.4–6.7 scripted: 3-client happy path, welcome-before-commit, SelfRemove convergence, deliberate fork |
+| `canonical_scenarios.rs` | Phase 6.4–6.7 scripted: 3-client happy path, welcome-before-commit, SelfRemove convergence, deliberate fork with recovery observation |
 | `proptest_invariants.rs` | Phase 6.9 — convergence + event conservation under random `SendIntent` sequences |
 
 Quick CI run (24 proptest cases, ~1 s):

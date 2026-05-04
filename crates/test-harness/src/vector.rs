@@ -5,7 +5,7 @@
 //! should produce after running the same scripted scenario.
 
 use crate::HarnessClient;
-use cgka_traits::engine::GroupEvent;
+use cgka_traits::engine::{CommitOrderingKey, GroupEvent};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -21,6 +21,21 @@ pub struct ClientObservation {
     pub member_count: usize,
     pub received_payloads: Vec<String>,
     pub removed_members: Vec<String>,
+    pub recoveries: Vec<ForkRecoveryObservation>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForkRecoveryObservation {
+    pub source_epoch: u64,
+    pub recovered_epoch: u64,
+    pub winner: RecoveryOrderingKeyObservation,
+    pub invalidated: RecoveryOrderingKeyObservation,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveryOrderingKeyObservation {
+    pub timestamp: u64,
+    pub message_id: String,
 }
 
 pub fn observe_client(label: impl Into<String>, client: &mut HarnessClient) -> ClientObservation {
@@ -47,5 +62,30 @@ pub fn observe_client(label: impl Into<String>, client: &mut HarnessClient) -> C
                 _ => None,
             })
             .collect(),
+        recoveries: events
+            .iter()
+            .filter_map(|e| match e {
+                GroupEvent::ForkRecovered {
+                    source_epoch,
+                    recovered_epoch,
+                    winner,
+                    invalidated,
+                    ..
+                } => Some(ForkRecoveryObservation {
+                    source_epoch: source_epoch.0,
+                    recovered_epoch: recovered_epoch.0,
+                    winner: observe_key(winner),
+                    invalidated: observe_key(invalidated),
+                }),
+                _ => None,
+            })
+            .collect(),
+    }
+}
+
+fn observe_key(key: &CommitOrderingKey) -> RecoveryOrderingKeyObservation {
+    RecoveryOrderingKeyObservation {
+        timestamp: key.timestamp.0,
+        message_id: hex::encode(key.message_id.as_slice()),
     }
 }

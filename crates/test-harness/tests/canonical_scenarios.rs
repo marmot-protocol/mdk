@@ -147,6 +147,7 @@ async fn three_client_message_exchange_vector_is_stable() {
                     member_count: 3,
                     received_payloads: vec!["bob:hello".into(), "carol:hello".into()],
                     removed_members: vec![],
+                    recoveries: vec![],
                 },
                 test_harness::ClientObservation {
                     client: "bob".into(),
@@ -154,6 +155,7 @@ async fn three_client_message_exchange_vector_is_stable() {
                     member_count: 3,
                     received_payloads: vec!["alice:hello".into(), "carol:hello".into()],
                     removed_members: vec![],
+                    recoveries: vec![],
                 },
                 test_harness::ClientObservation {
                     client: "carol".into(),
@@ -161,6 +163,7 @@ async fn three_client_message_exchange_vector_is_stable() {
                     member_count: 3,
                     received_payloads: vec!["alice:hello".into(), "bob:hello".into()],
                     removed_members: vec![],
+                    recoveries: vec![],
                 },
             ],
         }
@@ -275,6 +278,35 @@ async fn deliberate_fork_via_harness() {
     let alice_members = alice.members();
     let bob_members = bob.members();
     assert_eq!(alice_members, bob_members);
+    let trace = ScenarioTrace {
+        name: "deliberate-fork-recovery/v1".into(),
+        observations: vec![
+            observe_client("alice", &mut alice),
+            observe_client("bob", &mut bob),
+        ],
+    };
+    let recoveries: Vec<_> = trace
+        .observations
+        .iter()
+        .flat_map(|o| o.recoveries.iter())
+        .collect();
+    assert_eq!(
+        recoveries.len(),
+        1,
+        "exactly one peer should roll back to the deterministic winner: {trace:#?}"
+    );
+    assert_eq!(recoveries[0].source_epoch, 1);
+    assert_eq!(recoveries[0].recovered_epoch, 2);
+    assert_ne!(recoveries[0].winner, recoveries[0].invalidated);
+    assert!(
+        (
+            recoveries[0].winner.timestamp,
+            recoveries[0].winner.message_id.as_str()
+        ) < (
+            recoveries[0].invalidated.timestamp,
+            recoveries[0].invalidated.message_id.as_str()
+        )
+    );
     let has_david = alice_members
         .iter()
         .any(|m| m.id == MemberId::new(pad32(b"david")));

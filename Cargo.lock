@@ -1754,6 +1754,7 @@ dependencies = [
  "async-trait",
  "cgka-engine",
  "cgka-traits",
+ "hex",
  "proptest",
  "rand 0.8.6",
  "serde",

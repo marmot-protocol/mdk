@@ -23,7 +23,10 @@ pub use capabilities::{
     Capability, CapabilityRequirement, Feature, FeatureStatus, GroupCapabilities, RequirementLevel,
     TransportKind,
 };
-pub use engine::{CgkaEngine, CreateGroupRequest, GroupEvent, KeyPackage, SendIntent, SendResult};
+pub use engine::{
+    CgkaEngine, CommitOrderingKey, CreateGroupRequest, GroupEvent, KeyPackage, SendIntent,
+    SendResult,
+};
 pub use engine_state::{
     EpochState, InvalidTransition, Merging, PendingPublish, PendingStateRef, PendingWelcomeState,
     Recovering, StagedCommitHandle, WelcomeState,

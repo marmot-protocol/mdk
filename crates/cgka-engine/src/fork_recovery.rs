@@ -7,56 +7,29 @@
 //! the candidate against the correct MLS epoch.
 
 use crate::engine::Engine;
+use cgka_traits::engine::CommitOrderingKey;
 use cgka_traits::engine_state::PendingStateRef;
 use cgka_traits::error::EngineError;
 use cgka_traits::message::MessageState;
 use cgka_traits::storage::{StorageError, StorageProvider};
-use cgka_traits::transport::{Timestamp, TransportMessage};
-use cgka_traits::types::{EpochId, GroupId, MessageId};
-use std::cmp::Ordering;
+use cgka_traits::transport::TransportMessage;
+use cgka_traits::types::{EpochId, GroupId};
 use std::collections::HashMap;
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct CommitOrderingKey {
-    timestamp: Timestamp,
-    message_id: MessageId,
-}
-
-impl CommitOrderingKey {
-    fn from_message(msg: &TransportMessage) -> Self {
-        Self {
-            timestamp: msg.timestamp,
-            message_id: msg.id.clone(),
-        }
-    }
-}
-
-impl Ord for CommitOrderingKey {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.timestamp
-            .cmp(&other.timestamp)
-            .then_with(|| self.message_id.as_slice().cmp(other.message_id.as_slice()))
-    }
-}
-
-impl PartialOrd for CommitOrderingKey {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
 
 #[derive(Clone, Debug)]
 struct CommitRecoveryRecord {
     group_id: GroupId,
     source_epoch: EpochId,
     ordering_key: CommitOrderingKey,
-    message_id: MessageId,
     snapshot_name: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ForkResolution {
-    CandidateWins { invalidated: MessageId },
+    CandidateWins {
+        winner: CommitOrderingKey,
+        invalidated: CommitOrderingKey,
+    },
     IncumbentWins,
     MissingSnapshot,
 }
@@ -104,8 +77,7 @@ impl ForkRecoveryManager {
             CommitRecoveryRecord {
                 group_id,
                 source_epoch,
-                ordering_key: CommitOrderingKey::from_message(msg),
-                message_id: msg.id.clone(),
+                ordering_key: CommitOrderingKey::from_transport_message(msg),
                 snapshot_name,
             },
         );
@@ -139,7 +111,7 @@ impl ForkRecoveryManager {
             return Ok(ForkResolution::MissingSnapshot);
         };
 
-        let candidate_key = CommitOrderingKey::from_message(candidate);
+        let candidate_key = CommitOrderingKey::from_transport_message(candidate);
         if candidate_key >= incumbent.ordering_key {
             return Ok(ForkResolution::IncumbentWins);
         }
@@ -152,7 +124,8 @@ impl ForkRecoveryManager {
         self.incumbents.remove(&key);
 
         Ok(ForkResolution::CandidateWins {
-            invalidated: incumbent.message_id,
+            winner: candidate_key,
+            invalidated: incumbent.ordering_key,
         })
     }
 }
@@ -208,8 +181,7 @@ impl<S: StorageProvider> Engine<S> {
         self.fork_recovery.record_applied(CommitRecoveryRecord {
             group_id,
             source_epoch,
-            ordering_key: CommitOrderingKey::from_message(msg),
-            message_id: msg.id.clone(),
+            ordering_key: CommitOrderingKey::from_transport_message(msg),
             snapshot_name,
         });
     }
@@ -223,12 +195,12 @@ impl<S: StorageProvider> Engine<S> {
         let resolution = self
             .fork_recovery
             .resolve(&self.storage, group_id, source_epoch, msg)?;
-        if let ForkResolution::CandidateWins { invalidated } = &resolution {
+        if let ForkResolution::CandidateWins { invalidated, .. } = &resolution {
             self.epoch_manager
                 .set_stable(group_id.clone(), source_epoch);
             match self
                 .storage
-                .update_message_state(invalidated, MessageState::EpochInvalidated)
+                .update_message_state(&invalidated.message_id, MessageState::EpochInvalidated)
             {
                 Ok(()) | Err(StorageError::NotFound) => {}
                 Err(e) => return Err(EngineError::Storage(e)),

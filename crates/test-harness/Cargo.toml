@@ -21,3 +21,4 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }
 tracing.workspace = true
 rand.workspace = true
 proptest.workspace = true
+hex.workspace = true

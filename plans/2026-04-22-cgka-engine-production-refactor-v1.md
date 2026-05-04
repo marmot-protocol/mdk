@@ -10,7 +10,7 @@ Replace the spike code with a well-tested, well-commented CGKA engine built arou
 - Centralizes capability negotiation in a runtime `FeatureRegistry` + `CapabilityStorage`.
 - Is exercised by an in-process multi-client test harness plus property-based invariants and fixture-driven unit tests.
 
-Out of scope for this plan: `TransportAdapter` implementations, concrete `NostrMlsPeeler`, `whitenoise-core`, CLI, SQLite storage, KeyPackage expiry scheduling, recovery trace observations for portable test vectors, public/external API stability.
+Out of scope for this plan: `TransportAdapter` implementations, concrete `NostrMlsPeeler`, `whitenoise-core`, CLI, SQLite storage, KeyPackage expiry scheduling, external vector fixture packaging, public/external API stability.
 
 Decisions captured from the clarifying round (reference only — not tasks):
 
@@ -29,16 +29,16 @@ Decisions captured from the clarifying round (reference only — not tasks):
 
 ## Current Status (2026-05-04)
 
-**Workspace state:** 100 tests passing, 0 failing. `cargo clippy --workspace --all-targets -- -D warnings` green. `cargo fmt --all --check` clean. Slow harness gate (`cargo test -p test-harness --features harness-slow`) green. Spike workspace at `spike/` builds independently with known deprecation/dead-code warnings. **All original tasks in the plan are closed; recovery trace observations are the next follow-on.**
+**Workspace state:** 100 tests passing, 0 failing. `cargo clippy --workspace --all-targets -- -D warnings` green. `cargo fmt --all --check` clean. Slow harness gate (`cargo test -p test-harness --features harness-slow`) green. Spike workspace at `spike/` builds independently with known deprecation/dead-code warnings. **All original tasks in the plan are closed; recovery trace observations have a first implementation via `GroupEvent::ForkRecovered` + `ScenarioTrace::recoveries`.**
 
 **Crate inventory (all at 0.1.0, root workspace):**
 
 | Crate | Role | Status |
 |---|---|---|
-| `cgka-traits` (`crates/traits/`) | Shared trait surface + value types | Stable; insta snapshots locked |
+| `cgka-traits` (`crates/traits/`) | Shared trait surface + value types | Stable; insta snapshots locked, including `ForkRecovered` event shape |
 | `cgka-engine` (`crates/cgka-engine/`) | OpenMLS-backed engine | Functional; publish-before-apply plus same-epoch fork recovery landed. |
 | `storage-memory` (`crates/storage-memory/`) | In-memory backend | Done; snapshots include OpenMLS memory state for recovery tests. |
-| `test-harness` (`crates/test-harness/`) | Multi-client simulator + proptest | Done; scripted fork scenario now asserts recovery convergence. |
+| `test-harness` (`crates/test-harness/`) | Multi-client simulator + proptest | Done; scripted fork scenario now asserts convergence and recovery trace emission. |
 
 **Phase summary:**
 
@@ -50,7 +50,7 @@ Decisions captured from the clarifying round (reference only — not tasks):
 | 3 — State-machine types | ✅ | All in `cgka-traits`; `Box<dyn CgkaEngine + Send + Sync>` witness compiles |
 | 4 — Engine impl | ✅ | All 14 original tasks landed, plus `ForkRecoveryManager` for same-epoch commit races. |
 | 5 — Unit tests | ✅ | 5.1 trybuild deferred per plan edit; 5.4 **full 36-cell capability matrix landed** as a single parametrized test in `tests/capabilities.rs::capability_matrix_36_cells`; 5.7 witness compiles; 5.8 insta snapshots locked. |
-| 6 — Test harness | ✅ | Bus + client + 4 scripted scenarios green. Proptest depth: 4 properties — (a) true same-id replay via `bus.inject`; (b) convergence under Send+Leave intents; (b') convergence under varied `DeliveryProfile` (FIFO / Reverse / SeededRandom); (c) confirm-vs-fail rollback round trip. Slow gate (`--features harness-slow`) lifts case counts to 200–1000. Fork scenario asserts deterministic convergence after recovery. |
+| 6 — Test harness | ✅ | Bus + client + 4 scripted scenarios green. Proptest depth: 4 properties — (a) true same-id replay via `bus.inject`; (b) convergence under Send+Leave intents; (b') convergence under varied `DeliveryProfile` (FIFO / Reverse / SeededRandom); (c) confirm-vs-fail rollback round trip. Slow gate (`--features harness-slow`) lifts case counts to 200–1000. Fork scenario asserts deterministic convergence and records the rollback trace. |
 | 7 — Docs + hygiene | ✅ | Per-crate `README.md` + `AGENTS.md` pair (cgka-engine, test-harness) plus thin `README.md` for traits + storage-memory. `tests/AGENTS.md` documents the three-tier test layout. `docs/learnings.md` 2026-04-25 entry added. Clippy/fmt CI gates passing. |
 
 **Phase 4 detail (every task):**
@@ -134,7 +134,7 @@ Internal subsystems per `cgka-engine-design.md:214-233`. Each is a module inside
   *Status:* `create_group`, `join_welcome`, `invite`, `leave`, and `update_group_data` all done with tests.
 - [x] Task 4.3. Build `MessageProcessor` module — inbound path (`peel → classify → apply-via-EpochManager → emit GroupEvent`) and outbound path (`SendIntent → validate via EpochState → encrypt → wrap → SendResult`). Rationale: matches `cgka-engine-design.md:221-223` and the design-doc ingest pipeline at `target-architecture.md:137-152`.
 - [x] Task 4.4. Build `EpochManager` module owning the `EpochState` transitions + snapshot/rollback glue. Only this module may construct non-`Stable` variants. Rationale: keeps the state machine's integrity in one file.
-- [x] Task 4.5. Implement fork detection and first-pass recovery. When a same-epoch competing commit arrives, `ForkRecoveryManager` compares `(timestamp, message_id)` ordering keys. A better candidate rolls storage back to the pre-commit snapshot and replays; a losing candidate is marked stale. `EngineError::ForkedEpoch` remains for unrecoverable cases, usually missing snapshots. Rationale: commit races must converge deterministically for portable CGKA test vectors.
+- [x] Task 4.5. Implement fork detection and first-pass recovery. When a same-epoch competing commit arrives, `ForkRecoveryManager` compares `(timestamp, message_id)` ordering keys. A better candidate rolls storage back to the pre-commit snapshot and replays; a losing candidate is marked stale. Successful rollback emits `GroupEvent::ForkRecovered`, which the harness records in `ScenarioTrace::recoveries`. `EngineError::ForkedEpoch` remains for unrecoverable cases, usually missing snapshots. Rationale: commit races must converge deterministically for portable CGKA test vectors.
 - [x] Task 4.6. Build `CapabilityManager` module — `FeatureRegistry` construction, `feature_status`, `constructable_capabilities`, `upgradeable_capabilities`, `upgrade_group_capabilities`. Primary source of truth for a member's advertised capabilities is `LeafNode::capabilities()` via `group.public_group().leaf(idx)` (public API — see Risk #1 correction). `CapabilityStorage` layers on top as an optimization: avoids repeated tree walks, retains historical capabilities for removed members (useful for audit/replay), and gives `feature_status` a cheap local lookup. Rationale: the spike's `pub(crate)` claim was wrong; with capabilities readable directly, the cache is a clean optimization rather than a workaround.
 - [x] Task 4.7. Populate `CapabilityStorage` on every `ingest` where a KeyPackage is consumed (group creation, invites, welcome acceptance). Write-through pattern: read capabilities from the validated `LeafNode`, store under `(group_id, member)`. Rationale: keeps the cache consistent with the tree state, enables capability lookup for members who subsequently leave, and avoids re-walking `public_group()` on every `feature_status` call.
 - [x] Task 4.8. Build `KeyPackageManager` module — `fresh_key_package` only, with correct `Capabilities` derivation from the `FeatureRegistry`. No expiry scheduling per question-7 decision. Rationale: scheduler is a higher-layer concern.
@@ -240,19 +240,19 @@ Internal subsystems per `cgka-engine-design.md:214-233`. Each is a module inside
 | ~~Task 4.2 `update_group_data` impl~~ | ~~1 hr~~ | DONE | Landed 2026-04-25 in `crates/cgka-engine/src/update_group_data.rs`. 5 tests in `tests/update_group_data.rs`. |
 | ~~Task 2.2 snapshot/rollback wiring into engine~~ | n/a | DONE | Publish rollback still uses `MlsGroup::clear_pending_commit`; fork recovery uses `MessageStorage` snapshots. |
 | ~~Task 6.10 broader slow gate~~ | n/a | DONE 2026-04-25 | `--features harness-slow` runs 200–1000 cases per property; ~28 s wall time. |
-| Recovery observations in test vectors | 1-2 hr | NEXT | Add explicit trace entries for candidate/ incumbent ordering, rollback decision, invalidated message, and post-recovery state so future implementations can compare the recovery path, not just final convergence. |
+| ~~Recovery observations in test vectors~~ | ~~1-2 hr~~ | DONE 2026-05-04 | `GroupEvent::ForkRecovered` + `ScenarioTrace::recoveries` capture winner/incumbent ordering keys, invalidated message, source epoch, and recovered epoch. |
 
-**Status as of 2026-05-04:** every original task in this plan is closed. Future-roadmap items (SQLite storage, KeyPackage refresh scheduling, recovery trace observations, transport adapters, FFI) live in their own plans or the next implementation slice.
+**Status as of 2026-05-04:** every original task in this plan is closed. Future-roadmap items (SQLite storage, KeyPackage refresh scheduling, external vector fixture packaging, transport adapters, FFI) live in their own plans or the next implementation slice.
 
 ### What's left
 
-1. **Recovery observations for portable test vectors.** The engine now converges after same-epoch commit races, but `ScenarioTrace` only records final observations. Add a traceable recovery event/outcome shape that captures ordering keys, winner/loser, rollback decision, invalidated message id, and post-recovery state.
+1. **External vector fixture packaging.** `ScenarioTrace` now records recovery observations, but vectors still live as Rust tests. Next step is a language-neutral fixture format plus a runner contract.
 2. **Production snapshot backend.** `storage-memory` snapshots the full OpenMLS memory map. A SQLite backend should snapshot the group-scoped OpenMLS rows and CGKA metadata atomically, with retention/pruning modeled after the MDK snapshot manager.
 3. **Transport ordering key receipt.** The current winner key is `(TransportMessage::timestamp, MessageId)`. Real adapters must define whether those values come from pre-publish wrapping or post-publish transport receipt, then persist the final key for restart-safe recovery.
 
 ### What's solid (don't churn)
 
-- **State-machine types in `cgka-traits`.** `EpochState`, `WelcomeState`, all the value types — the contract is locked. 11 snapshot tests in `crates/traits/tests/snapshots.rs` will fail loudly on accidental shape drift.
+- **State-machine types in `cgka-traits`.** `EpochState`, `WelcomeState`, all the value types — the contract is locked. Snapshot tests in `crates/traits/tests/snapshots.rs` will fail loudly on accidental shape drift, including the `ForkRecovered` event shape.
 - **Storage trait surface.** Five traits + accessor for OpenMLS storage. 18 round-trip + concurrency tests. SQLite backend follows the same shape — single new crate, no trait changes.
 - **Engine subsystems boundaries.** `epoch_manager`, `capability_manager`, `auto_committer`, `group_lifecycle`, `message_processor`, `key_package`, `upgrade`, `group_data`, `wire_format`, `provider`, `identity` — each has a single responsibility documented at the top of its file.
 - **Test tier organization.** `crates/cgka-engine/tests/AGENTS.md` documents the three tiers (cgka-traits unit, cgka-engine integration, test-harness scenarios+proptest). `cargo test --workspace` is the canonical command.

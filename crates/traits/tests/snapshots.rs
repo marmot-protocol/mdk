@@ -12,7 +12,9 @@ use cgka_traits::capabilities::{
     Capability, CapabilityRequirement, Feature, FeatureStatus, GroupCapabilities, RequirementLevel,
     TransportKind,
 };
-use cgka_traits::engine::{CreateGroupRequest, GroupEvent, KeyPackage, SendIntent, SendResult};
+use cgka_traits::engine::{
+    CommitOrderingKey, CreateGroupRequest, GroupEvent, KeyPackage, SendIntent, SendResult,
+};
 use cgka_traits::engine_state::PendingStateRef;
 use cgka_traits::group::{Group, Member};
 use cgka_traits::ingest::{IngestOutcome, PeeledContent, PeeledMessage, StaleReason};
@@ -229,6 +231,22 @@ fn snapshot_group_events() {
             group_id: gid(),
             from: EpochId(1),
             to: EpochId(2),
+        }
+    );
+    insta::assert_json_snapshot!(
+        "event_fork_recovered",
+        GroupEvent::ForkRecovered {
+            group_id: gid(),
+            source_epoch: EpochId(1),
+            recovered_epoch: EpochId(2),
+            winner: CommitOrderingKey {
+                timestamp: Timestamp(10),
+                message_id: MessageId::new(vec![1]),
+            },
+            invalidated: CommitOrderingKey {
+                timestamp: Timestamp(11),
+                message_id: MessageId::new(vec![2]),
+            },
         }
     );
 }

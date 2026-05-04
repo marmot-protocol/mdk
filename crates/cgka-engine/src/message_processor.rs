@@ -13,7 +13,7 @@ use crate::engine::Engine;
 use crate::fork_recovery::ForkResolution;
 use crate::group_lifecycle::{self};
 use crate::provider::EngineOpenMlsProvider;
-use cgka_traits::engine::{GroupEvent, SendIntent, SendResult};
+use cgka_traits::engine::{CommitOrderingKey, GroupEvent, SendIntent, SendResult};
 use cgka_traits::engine_state::EpochState;
 use cgka_traits::error::{EngineError, PeelerError};
 use cgka_traits::ingest::{IngestOutcome, PeeledContent, StaleReason};
@@ -25,8 +25,8 @@ use cgka_traits::transport::{
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
 use openmls::group::{MlsGroup, ProcessMessageError};
 use openmls::prelude::{
-    BasicCredential, MlsMessageBodyIn, MlsMessageIn, MlsMessageOut, ProcessedMessageContent,
-    Proposal, ProtocolMessage, Sender, ValidationError,
+    BasicCredential, ContentType, MlsMessageBodyIn, MlsMessageIn, MlsMessageOut,
+    ProcessedMessageContent, Proposal, ProtocolMessage, Sender, ValidationError,
 };
 use tls_codec::{Deserialize as _, Serialize as _};
 
@@ -146,6 +146,7 @@ impl<S: StorageProvider> Engine<S> {
         // A real peeler/adapter may map via a local index; we'll carry that
         // indirection when the Nostr peeler lands.
         let group_id = GroupId::new(transport_group_id.clone());
+        let mut pending_recovery: Option<(EpochId, CommitOrderingKey, CommitOrderingKey)> = None;
 
         loop {
             // Load MlsGroup from storage.
@@ -232,6 +233,7 @@ impl<S: StorageProvider> Engine<S> {
             };
 
             let msg_epoch = EpochId(proto.epoch().as_u64());
+            let msg_content_type = proto.content_type();
 
             // Process via MLS.
             let processed = match mls_group.process_message(&provider, proto) {
@@ -243,11 +245,16 @@ impl<S: StorageProvider> Engine<S> {
                     // advanced from the inbound commit's source epoch, ask
                     // ForkRecoveryManager whether the inbound branch wins
                     // and should be replayed from the pre-commit snapshot.
-                    if self.epoch_manager.we_committed_from(&group_id, msg_epoch)
+                    if msg_content_type == ContentType::Commit
+                        && self.epoch_manager.we_committed_from(&group_id, msg_epoch)
                         && current > msg_epoch
                     {
                         match self.resolve_fork_candidate(&group_id, msg_epoch, msg)? {
-                            ForkResolution::CandidateWins { .. } => {
+                            ForkResolution::CandidateWins {
+                                winner,
+                                invalidated,
+                            } => {
+                                pending_recovery = Some((msg_epoch, winner, invalidated));
                                 continue;
                             }
                             ForkResolution::IncumbentWins => {
@@ -354,6 +361,15 @@ impl<S: StorageProvider> Engine<S> {
                         self.identity.self_id(),
                     )?;
 
+                    if let Some((source_epoch, winner, invalidated)) = pending_recovery.take() {
+                        self.events_buf.push_back(GroupEvent::ForkRecovered {
+                            group_id: group_id.clone(),
+                            source_epoch,
+                            recovered_epoch: after,
+                            winner,
+                            invalidated,
+                        });
+                    }
                     self.events_buf.push_back(GroupEvent::EpochChanged {
                         group_id: group_id.clone(),
                         from: before,

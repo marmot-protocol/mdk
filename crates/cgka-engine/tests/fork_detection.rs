@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use cgka_engine::EngineBuilder;
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
-use cgka_traits::engine::{CgkaEngine, CreateGroupRequest, SendIntent, SendResult};
+use cgka_traits::engine::{CgkaEngine, CreateGroupRequest, GroupEvent, SendIntent, SendResult};
 use cgka_traits::error::PeelerError;
 use cgka_traits::group_context::GroupContextSnapshot;
 use cgka_traits::ingest::{PeeledContent, PeeledMessage};
@@ -206,6 +206,26 @@ async fn concurrent_invites_recover_to_deterministic_winner() {
         ..bob_commit
     };
     alice.ingest(routed).await.unwrap();
+    let events = alice.drain_events();
+    let (source_epoch, recovered_epoch, winner, invalidated) = events
+        .iter()
+        .find_map(|event| match event {
+            GroupEvent::ForkRecovered {
+                group_id: event_group,
+                source_epoch,
+                recovered_epoch,
+                winner,
+                invalidated,
+            } if event_group == &group_id => {
+                Some((*source_epoch, *recovered_epoch, winner, invalidated))
+            }
+            _ => None,
+        })
+        .expect("alice should emit ForkRecovered after rolling back to Bob's commit");
+    assert_eq!(source_epoch.0, 1);
+    assert_eq!(recovered_epoch.0, 2);
+    assert_eq!(winner.message_id, MessageId::new(vec![0]));
+    assert!(winner < invalidated);
 
     let alice_members = alice.members(&group_id).unwrap();
     assert_eq!(alice.epoch(&group_id).unwrap().0, 2);

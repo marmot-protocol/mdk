@@ -21,7 +21,7 @@ Key corrections to earlier spike claims surfaced during implementation:
 - §3.2 of `spike-findings.md` (and learnings entry #8 above): the spike said per-leaf `Capabilities` access was blocked by `MlsGroup::member_at`. Implementation revealed the deeper truth: `LeafNode::capabilities()` IS public, but `MlsGroup::public_group()` is `pub(crate)`. The cache (`CapabilityStorage`) is **load-bearing for correctness**, populated from KeyPackages we directly handle (invite path, ingested commits' Add proposals) plus `MlsGroup::own_leaf_node()` for self.
 - The creator's commit at `create_group` has no consumer — every other initial member lands via welcome with the post-commit state. Dropped from the engine output; new `SendResult::GroupCreated { welcomes, pending }` variant. Side-benefit: the welcome-before-commit `AlreadyAtEpoch` bounce that this learnings file cataloged earlier no longer fires for initial creation (still fires for invites, where existing members do need the commit).
 
-Now landed after this checkpoint: publish-before-apply, MIP-03 admin guards, and first-pass deterministic fork recovery. Remaining recovery work is productionizing snapshot retention and adding richer recovery observations for applications/test vectors.
+Now landed after this checkpoint: publish-before-apply, MIP-03 admin guards, first-pass deterministic fork recovery, and recovery observations in the canonical trace surface. Remaining recovery work is productionizing snapshot retention and packaging portable vectors beyond Rust tests.
 
 See `crates/cgka-engine/tests/AGENTS.md` for the test-tier map and `crates/cgka-engine/AGENTS.md` for the per-subsystem responsibility map.
 
@@ -33,7 +33,7 @@ The first working `ForkRecoveryManager` is in `crates/cgka-engine/src/fork_recov
 
 Storage snapshots are now part of engine correctness, not a dormant hook. `storage-memory` snapshots the full OpenMLS memory map as a pragmatic harness backend. A production backend should snapshot group-scoped OpenMLS rows plus CGKA metadata atomically, add retention/pruning, and persist enough ordering metadata to recover after restart.
 
-The next gap is observability. Final convergence is proven by tests, but cross-implementation vectors need to record recovery decisions: candidate/incumbent ordering keys, whether rollback happened, which message was invalidated, and the post-recovery epoch/member state. Add those to `ScenarioTrace` before treating fork recovery vectors as portable.
+Follow-up: recovery observability now has a first contract. `cgka_traits::GroupEvent::ForkRecovered` records the source epoch, recovered epoch, winner ordering key, and invalidated incumbent ordering key. `test-harness::ScenarioTrace` exposes that as `ClientObservation::recoveries` with hex message ids, and the deliberate fork scenario asserts that exactly one peer rolls back to the deterministic winner. The next portability step is not more engine plumbing; it is turning these scripted scenarios into explicit external vector fixtures/runners.
 
 ---
 

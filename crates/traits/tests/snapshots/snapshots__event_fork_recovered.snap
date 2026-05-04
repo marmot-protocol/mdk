@@ -1,0 +1,28 @@
+---
+source: crates/traits/tests/snapshots.rs
+expression: "GroupEvent::ForkRecovered\n{\n    group_id: gid(), source_epoch: EpochId(1), recovered_epoch: EpochId(2),\n    winner: CommitOrderingKey\n    { timestamp: Timestamp(10), message_id: MessageId::new(vec![1]), },\n    invalidated: CommitOrderingKey\n    { timestamp: Timestamp(11), message_id: MessageId::new(vec![2]), },\n}"
+---
+{
+  "ForkRecovered": {
+    "group_id": [
+      170,
+      170,
+      170,
+      170
+    ],
+    "source_epoch": 1,
+    "recovered_epoch": 2,
+    "winner": {
+      "timestamp": 10,
+      "message_id": [
+        1
+      ]
+    },
+    "invalidated": {
+      "timestamp": 11,
+      "message_id": [
+        2
+      ]
+    }
+  }
+}

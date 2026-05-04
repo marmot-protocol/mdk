@@ -24,10 +24,11 @@ use crate::error::EngineError;
 use crate::group::Member;
 use crate::group_context::GroupContext;
 use crate::ingest::IngestOutcome;
-use crate::transport::TransportMessage;
+use crate::transport::{Timestamp, TransportMessage};
 use crate::types::{EpochId, GroupId, MemberId, MessageId};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::cmp::Ordering;
 
 // ── Value types on the trait surface ────────────────────────────────────────
 
@@ -93,6 +94,38 @@ pub enum SendResult {
     },
 }
 
+/// Deterministic transport ordering key used to resolve same-epoch commit
+/// races. Lower keys win: first by transport timestamp, then by message id
+/// bytes as the stable tie-breaker.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommitOrderingKey {
+    pub timestamp: Timestamp,
+    pub message_id: MessageId,
+}
+
+impl CommitOrderingKey {
+    pub fn from_transport_message(msg: &TransportMessage) -> Self {
+        Self {
+            timestamp: msg.timestamp,
+            message_id: msg.id.clone(),
+        }
+    }
+}
+
+impl Ord for CommitOrderingKey {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.timestamp
+            .cmp(&other.timestamp)
+            .then_with(|| self.message_id.as_slice().cmp(other.message_id.as_slice()))
+    }
+}
+
+impl PartialOrd for CommitOrderingKey {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 /// Ordered, decrypted output the application should render / act on.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GroupEvent {
@@ -120,6 +153,13 @@ pub enum GroupEvent {
         group_id: GroupId,
         from: EpochId,
         to: EpochId,
+    },
+    ForkRecovered {
+        group_id: GroupId,
+        source_epoch: EpochId,
+        recovered_epoch: EpochId,
+        winner: CommitOrderingKey,
+        invalidated: CommitOrderingKey,
     },
 }
 

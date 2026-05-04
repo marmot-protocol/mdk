@@ -23,4 +23,7 @@ pub mod vector;
 pub use bus::{ClientId, DeliveryPolicy, TransportBus};
 pub use client::{ClientBuilder, HarnessClient};
 pub use peeler::MockPeeler;
-pub use vector::{ClientObservation, ScenarioTrace, observe_client};
+pub use vector::{
+    ClientObservation, ForkRecoveryObservation, RecoveryOrderingKeyObservation, ScenarioTrace,
+    observe_client,
+};
