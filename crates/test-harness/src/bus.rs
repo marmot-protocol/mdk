@@ -61,6 +61,7 @@ struct Inner {
     mailboxes: HashMap<ClientId, Vec<TransportMessage>>,
     /// If Some, only deliver to clients in this allowlist (partition).
     partition_allowed: Option<std::collections::HashSet<ClientId>>,
+    delayed: HashMap<String, Vec<InFlight>>,
 }
 
 impl TransportBus {
@@ -79,6 +80,7 @@ impl TransportBus {
                 policy,
                 mailboxes: HashMap::new(),
                 partition_allowed: None,
+                delayed: HashMap::new(),
             })),
         }
     }
@@ -185,6 +187,69 @@ impl TransportBus {
     /// Number of queued (not yet delivered) messages.
     pub fn queued_len(&self) -> usize {
         self.inner.lock().unwrap().queue.len()
+    }
+
+    /// Drop one queued message by its current queue index.
+    pub fn drop_queued(&self, index: usize) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        if index >= inner.queue.len() {
+            return false;
+        }
+        inner.queue.remove(index);
+        true
+    }
+
+    /// Duplicate one queued message, inserting the copy immediately after the
+    /// original so FIFO delivery observes the duplicate next.
+    pub fn duplicate_queued(&self, index: usize) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        let Some(msg) = inner.queue.get(index).cloned() else {
+            return false;
+        };
+        inner.queue.insert(index + 1, msg);
+        true
+    }
+
+    /// Remove one queued message and hold it under a scenario-visible label.
+    pub fn delay_queued(&self, index: usize, delayed: impl Into<String>) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        if index >= inner.queue.len() {
+            return false;
+        }
+        let msg = inner.queue.remove(index);
+        inner.delayed.entry(delayed.into()).or_default().push(msg);
+        true
+    }
+
+    /// Release delayed messages back to the end of the queue.
+    pub fn release_delayed(&self, delayed: &str) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        let Some(mut messages) = inner.delayed.remove(delayed) else {
+            return false;
+        };
+        inner.queue.append(&mut messages);
+        true
+    }
+
+    /// Reorder the entire queue. `order` is a permutation of current queue
+    /// indices; each entry names which old queue slot moves into the next
+    /// position.
+    pub fn reorder_queued(&self, order: &[usize]) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        if order.len() != inner.queue.len() {
+            return false;
+        }
+        let mut seen = vec![false; inner.queue.len()];
+        let mut reordered = Vec::with_capacity(inner.queue.len());
+        for index in order {
+            if *index >= inner.queue.len() || seen[*index] {
+                return false;
+            }
+            seen[*index] = true;
+            reordered.push(inner.queue[*index].clone());
+        }
+        inner.queue = reordered;
+        true
     }
 
     /// Reorder the queue per the current policy without delivering. Useful

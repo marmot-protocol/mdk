@@ -59,10 +59,102 @@ pub enum ScenarioStep {
     Observe {
         clients: Vec<String>,
     },
+    DropQueued {
+        index: usize,
+    },
+    DuplicateQueued {
+        index: usize,
+    },
+    DelayQueued {
+        index: usize,
+        delayed: String,
+    },
+    ReleaseDelayed {
+        delayed: String,
+    },
+    ReorderQueued {
+        order: Vec<usize>,
+    },
     SetPartition {
         allow: Vec<String>,
     },
     ClearPartition,
+}
+
+impl ScenarioStep {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            ScenarioStep::CreateGroup { .. } => "create_group",
+            ScenarioStep::InviteMembers { .. } => "invite_members",
+            ScenarioStep::ConfirmPending { .. } => "confirm_pending",
+            ScenarioStep::FailPending { .. } => "fail_pending",
+            ScenarioStep::SendAppMessage { .. } => "send_app_message",
+            ScenarioStep::Leave { .. } => "leave",
+            ScenarioStep::DeliverAll => "deliver_all",
+            ScenarioStep::Tick { .. } => "tick",
+            ScenarioStep::Observe { .. } => "observe",
+            ScenarioStep::DropQueued { .. } => "drop_queued",
+            ScenarioStep::DuplicateQueued { .. } => "duplicate_queued",
+            ScenarioStep::DelayQueued { .. } => "delay_queued",
+            ScenarioStep::ReleaseDelayed { .. } => "release_delayed",
+            ScenarioStep::ReorderQueued { .. } => "reorder_queued",
+            ScenarioStep::SetPartition { .. } => "set_partition",
+            ScenarioStep::ClearPartition => "clear_partition",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScenarioReport {
+    pub metadata: ScenarioReportMetadata,
+    pub expected_trace: Option<ScenarioTrace>,
+    pub observed_trace: Option<ScenarioTrace>,
+    pub step_log: Vec<ScenarioStepLogEntry>,
+    pub recovery_observations: Vec<crate::ForkRecoveryObservation>,
+    pub invariant_failures: Vec<InvariantFailure>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScenarioReportMetadata {
+    pub scenario_name: String,
+    pub spec_version: String,
+    pub step_count: usize,
+    pub generated: Option<GeneratedScenarioMetadata>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GeneratedScenarioMetadata {
+    pub family_name: String,
+    pub generator_version: String,
+    pub seed: u64,
+    pub case_index: u64,
+    pub minimized_case: Option<ScenarioSpec>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScenarioStepLogEntry {
+    pub step_index: usize,
+    pub step_type: String,
+    pub status: ScenarioStepStatus,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ScenarioStepStatus {
+    Completed,
+    Failed { message: String },
+}
+
+impl ScenarioStepStatus {
+    pub fn is_completed(&self) -> bool {
+        matches!(self, ScenarioStepStatus::Completed)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InvariantFailure {
+    pub kind: String,
+    pub message: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -83,6 +175,16 @@ impl fmt::Display for ScenarioRunError {
 impl std::error::Error for ScenarioRunError {}
 
 pub async fn run_scenario_spec(spec: &ScenarioSpec) -> Result<ScenarioTrace, ScenarioRunError> {
+    let report = run_scenario_report(spec, None).await?;
+    Ok(report
+        .observed_trace
+        .expect("successful report always includes an observed trace"))
+}
+
+pub async fn run_scenario_report(
+    spec: &ScenarioSpec,
+    expected_trace: Option<ScenarioTrace>,
+) -> Result<ScenarioReport, ScenarioRunError> {
     if spec.spec_version != "1" {
         return Err(ScenarioRunError {
             step_index: None,
@@ -107,6 +209,7 @@ pub async fn run_scenario_spec(spec: &ScenarioSpec) -> Result<ScenarioTrace, Sce
 
     let mut pending_refs = HashMap::new();
     let mut observations = Vec::new();
+    let mut step_log = Vec::new();
 
     for (step_index, step) in spec.steps.iter().enumerate() {
         match step {
@@ -167,6 +270,46 @@ pub async fn run_scenario_spec(spec: &ScenarioSpec) -> Result<ScenarioTrace, Sce
                     observations.push(observe_client(label.clone(), client));
                 }
             }
+            ScenarioStep::DropQueued { index } => {
+                if !bus.drop_queued(*index) {
+                    return Err(err(
+                        step_index,
+                        format!("queued message index {index} does not exist"),
+                    ));
+                }
+            }
+            ScenarioStep::DuplicateQueued { index } => {
+                if !bus.duplicate_queued(*index) {
+                    return Err(err(
+                        step_index,
+                        format!("queued message index {index} does not exist"),
+                    ));
+                }
+            }
+            ScenarioStep::DelayQueued { index, delayed } => {
+                if !bus.delay_queued(*index, delayed.clone()) {
+                    return Err(err(
+                        step_index,
+                        format!("queued message index {index} does not exist"),
+                    ));
+                }
+            }
+            ScenarioStep::ReleaseDelayed { delayed } => {
+                if !bus.release_delayed(delayed) {
+                    return Err(err(
+                        step_index,
+                        format!("delayed queue label {delayed} does not exist"),
+                    ));
+                }
+            }
+            ScenarioStep::ReorderQueued { order } => {
+                if !bus.reorder_queued(order) {
+                    return Err(err(
+                        step_index,
+                        format!("invalid queue reorder permutation {order:?}"),
+                    ));
+                }
+            }
             ScenarioStep::SetPartition { allow } => {
                 let mut allowed = Vec::with_capacity(allow.len());
                 for label in allow {
@@ -176,11 +319,36 @@ pub async fn run_scenario_spec(spec: &ScenarioSpec) -> Result<ScenarioTrace, Sce
             }
             ScenarioStep::ClearPartition => bus.set_partition(None),
         }
+        step_log.push(ScenarioStepLogEntry {
+            step_index,
+            step_type: step.kind().into(),
+            status: ScenarioStepStatus::Completed,
+        });
     }
 
-    Ok(ScenarioTrace {
+    let observed_trace = ScenarioTrace {
         name: spec.name.clone(),
         observations,
+    };
+    let recovery_observations = observed_trace
+        .observations
+        .iter()
+        .flat_map(|observation| observation.recoveries.clone())
+        .collect();
+    let invariant_failures = invariant_failures(expected_trace.as_ref(), &observed_trace);
+
+    Ok(ScenarioReport {
+        metadata: ScenarioReportMetadata {
+            scenario_name: spec.name.clone(),
+            spec_version: spec.spec_version.clone(),
+            step_count: spec.steps.len(),
+            generated: None,
+        },
+        expected_trace,
+        observed_trace: Some(observed_trace),
+        step_log,
+        recovery_observations,
+        invariant_failures,
     })
 }
 
@@ -280,4 +448,23 @@ fn err(step_index: usize, message: String) -> ScenarioRunError {
         step_index: Some(step_index),
         message,
     }
+}
+
+fn invariant_failures(
+    expected_trace: Option<&ScenarioTrace>,
+    observed_trace: &ScenarioTrace,
+) -> Vec<InvariantFailure> {
+    let Some(expected_trace) = expected_trace else {
+        return vec![];
+    };
+    if expected_trace == observed_trace {
+        return vec![];
+    }
+    vec![InvariantFailure {
+        kind: "trace_mismatch".into(),
+        message: format!(
+            "expected trace for {} did not match observed trace",
+            observed_trace.name
+        ),
+    }]
 }

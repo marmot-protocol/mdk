@@ -51,12 +51,56 @@ steps are:
 - `deliver_all`
 - `tick`
 - `observe`
+- `drop_queued`
+- `duplicate_queued`
+- `delay_queued`
+- `release_delayed`
+- `reorder_queued`
 - `set_partition`
 - `clear_partition`
 
 Pending operations are referenced by string labels chosen inside the scenario.
 Client labels are stable logical names; the Rust harness maps them to padded
-32-byte test identities.
+32-byte test identities. Queue fault steps select messages by the current
+zero-based queue index at that step. `reorder_queued.order` is a full
+permutation of current queue indices; each entry names which old queue slot
+moves into the next position. `delay_queued` stores selected messages under a
+string label, and `release_delayed` returns that label's messages to the end
+of the queue.
+
+## Generated scenario families
+
+`generate_send_leave_family(seed, cases)` produces deterministic
+`GeneratedScenarioCase` values. Each case records:
+
+- `family_name`
+- `generator_version`
+- `seed`
+- `case_index`
+- `scenario`
+
+The generated `scenario` is a normal `ScenarioSpec`, so a failing generated
+case can be serialized and promoted into a fixed fixture without inventing a
+separate execution path.
+
+## Report artifacts
+
+`run_scenario_report(spec, expected_trace)` executes a scenario and returns a
+serializable `ScenarioReport` with:
+
+- `metadata` — scenario name, spec version, step count, and optional generated
+  case metadata.
+- `expected_trace` — the trace being checked, when supplied.
+- `observed_trace` — the trace produced by the scenario runner.
+- `step_log` — one entry per completed scenario step.
+- `recovery_observations` — flattened fork-recovery events from all client
+  observations.
+- `invariant_failures` — currently records `trace_mismatch` when expected and
+  observed traces differ.
+
+`run_generated_case_report(case, expected_trace)` adds generated-family
+metadata: family name, generator version, seed, case index, and an optional
+`minimized_case` field for future shrink results.
 
 ## When to use the harness vs. integration tests
 

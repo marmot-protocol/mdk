@@ -55,17 +55,25 @@ Current fixture coverage:
 - External JSON fixtures live in `crates/test-harness/vectors/`.
 - Each fixture includes a runnable `ScenarioSpec` input and expected
   `ScenarioTrace` output.
+- `ScenarioSpec` includes fixture-visible queue faults for drop, duplicate,
+  delay/release, reorder, partition, and heal.
+- `generate_send_leave_family` emits deterministic generated cases with
+  family name, generator version, seed, case index, and runnable
+  `ScenarioSpec`.
+- `run_scenario_report` emits serializable metadata, expected trace, observed
+  trace, step log, recovery observations, and invariant failures.
+- `run_generated_case_report` adds generated-family metadata and a future
+  `minimized_case` field.
 - `three-client-message-exchange/v1` is captured as a fixture.
 - `deliberate-fork-recovery/v1` is captured as a fixture and includes
   `ForkRecoveryObservation`.
 - Fixture-loading tests regenerate both traces and compare them exactly.
 
-Current gaps after Phase 2:
+Current gaps after Phase 5 initial slice:
 
-- Scheduled delivery faults are not fixture-visible yet.
-- Generated scenarios are proptest-only and do not produce reusable artifacts.
-- Partition behavior is scripted in one test and is not part of a generated
-  delivery profile.
+- Queue faults are fixed-script operations, not generated delivery profiles.
+- Generated family coverage is limited to send/leave traffic.
+- Generated failures do not yet run a shrinker to populate minimized cases.
 
 ## Ideas Borrowed From FIPS Chaos
 
@@ -160,6 +168,8 @@ Faults to support first:
 Every fault must be step-indexed and fixture-visible. No hidden randomness in
 fixture execution.
 
+Status: complete for first-pass queue-level scheduled faults.
+
 ### Phase 4 - Add Seeded Scenario Families
 
 Add generated scenario families that record their seed and generator version.
@@ -174,6 +184,8 @@ Start with small families:
 
 Generated failures should be convertible into fixed fixtures.
 
+Status: initial `send-leave/v1` family complete.
+
 ### Phase 5 - Add Analysis and Failure Minimization
 
 Add a harness report that writes:
@@ -187,6 +199,9 @@ Add a harness report that writes:
 
 For generated scenarios, store the seed, generator parameters, and minimized
 case if shrinking found one.
+
+Status: report artifacts complete; shrinking/minimization algorithm remains
+future work.
 
 ### Phase 6 - System-Level Chaos Runner Later
 

@@ -8,9 +8,10 @@ Read [`README.md`](README.md) for the human framing. This file is the agent-faci
 |---|---|
 | `src/bus.rs` | `TransportBus` — in-memory bus. Owns delivery policy, the queue, partition state, and the address book that maps `MemberId → ClientId` (for welcome routing). |
 | `src/client.rs` | `HarnessClient` + `ClientBuilder`. Wraps an `Engine<MemoryStorage>` and the bus handle. `tick().await` drains pending inbound for one client. `confirm(pending).await` finishes a `GroupEvolution`. |
+| `src/family.rs` | Deterministic generated scenario families. `generate_send_leave_family` records family name, generator version, seed, case index, and a runnable `ScenarioSpec`. `run_generated_case_report` adds generated metadata to report artifacts. |
 | `src/peeler.rs` | `MockPeeler` — pass-through. Group messages and welcomes go through distinct methods (matches the real `TransportPeeler` four-method shape from spike-findings §1.3) but the body is just length-prefixed framing, no encryption. Transport ids/timestamps are deterministic per client so vector traces stay stable despite OpenMLS randomness. |
 | `src/proptest_support.rs` | `intent_seq(n_clients, range)` proptest strategy. Generates `HarnessIntent::Send` and `HarnessIntent::Leave`; `delivery_profile()` covers FIFO, reverse, and seeded-random delivery. |
-| `src/scenario.rs` | Serializable `ScenarioSpec` v1 plus `run_scenario_spec`. Drives ordered client operations from JSON-shaped scenario data and returns a `ScenarioTrace`. |
+| `src/scenario.rs` | Serializable `ScenarioSpec` v1 plus `run_scenario_spec` / `run_scenario_report`. Drives ordered client operations from JSON-shaped scenario data and returns either a `ScenarioTrace` or a serializable report with metadata, step log, recoveries, and invariant failures. |
 | `src/vector.rs` | `ScenarioTrace` and observations. Records final epoch/member/payload facts plus `ForkRecoveryObservation` entries from `GroupEvent::ForkRecovered`. |
 | `vectors/` | External JSON `VectorFixture` files. Each fixture carries both input `scenario` and output `expected_trace`. |
 
@@ -26,6 +27,11 @@ Delivery policies (`DeliveryPolicy`):
 - `partition` — drop messages whose recipient is in the partition set.
 
 The bus knows about welcomes vs. group messages so welcomes can be routed to a specific recipient without requiring it to be a group member yet.
+
+`ScenarioSpec` queue faults are explicit steps. They mutate the bus queue
+before delivery by zero-based queue index: `drop_queued`, `duplicate_queued`,
+`delay_queued`, `release_delayed`, and `reorder_queued`. `set_partition` and
+`clear_partition` remain the partition/heal operations.
 
 ## How to add a new scripted scenario
 
@@ -49,7 +55,8 @@ These are tracked in [`../../plans/2026-04-22-cgka-engine-production-refactor-v1
 
 - **`HarnessIntent` does not generate Invite / UpgradeCapabilities / UpdateGroupData.** Invite needs client minting inside a strategy; the scripted tests cover it today.
 - **Partition policy is scripted, not strategy-driven.** The bus supports partitions; proptest currently drives FIFO / Reverse / SeededRandom.
-- **Scheduled delivery faults do not exist yet.** `ScenarioSpec` covers deterministic scripted steps, but drop/duplicate/delay/reorder actions are still future Phase 3 work.
+- **Only one generated family exists.** `send-leave/v1` records replay metadata; invite races, group-data updates, and publish confirm/fail families are still future work.
+- **Failure minimization is represented but not implemented.** Reports expose `minimized_case`, but there is no shrinker yet.
 
 ## Conventions
 

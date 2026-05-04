@@ -10,7 +10,8 @@ use cgka_traits::engine::GroupEvent;
 use cgka_traits::types::MemberId;
 use test_harness::{
     ClientBuilder, ScenarioSpec, ScenarioStep, ScenarioTrace, TransportBus, VectorFixture,
-    observe_client, run_scenario_spec,
+    generate_send_leave_family, observe_client, run_generated_case_report, run_scenario_report,
+    run_scenario_spec,
 };
 
 fn pad32(name: &[u8]) -> Vec<u8> {
@@ -318,6 +319,232 @@ async fn scenario_spec_supports_leave_and_clear_partition() {
     assert_eq!(alice.client, "alice");
     assert_eq!(alice.member_count, 1);
     assert_eq!(alice.received_payloads, vec!["bob:visible"]);
+}
+
+#[tokio::test]
+async fn scenario_spec_can_drop_queued_message() {
+    let spec = ScenarioSpec {
+        name: "drop-queued/v1".into(),
+        spec_version: "1".into(),
+        clients: vec!["alice".into(), "bob".into()],
+        steps: vec![
+            ScenarioStep::CreateGroup {
+                creator: "alice".into(),
+                name: "drop".into(),
+                invitees: vec!["bob".into()],
+                required_features: vec![],
+                pending: "create".into(),
+            },
+            ScenarioStep::ConfirmPending {
+                client: "alice".into(),
+                pending: "create".into(),
+            },
+            ScenarioStep::DeliverAll,
+            ScenarioStep::Tick {
+                clients: vec!["bob".into()],
+            },
+            ScenarioStep::SendAppMessage {
+                sender: "bob".into(),
+                payload: "bob:dropped".into(),
+            },
+            ScenarioStep::DropQueued { index: 0 },
+            ScenarioStep::DeliverAll,
+            ScenarioStep::Tick {
+                clients: vec!["alice".into()],
+            },
+            ScenarioStep::Observe {
+                clients: vec!["alice".into()],
+            },
+        ],
+    };
+
+    let trace = run_scenario_spec(&spec).await.expect("scenario runs");
+
+    assert_eq!(
+        trace.observations[0].received_payloads,
+        Vec::<String>::new()
+    );
+}
+
+#[tokio::test]
+async fn scenario_spec_can_duplicate_delay_and_reorder_queued_messages() {
+    let spec = ScenarioSpec {
+        name: "queue-faults/v1".into(),
+        spec_version: "1".into(),
+        clients: vec!["alice".into(), "bob".into(), "carol".into()],
+        steps: vec![
+            ScenarioStep::CreateGroup {
+                creator: "alice".into(),
+                name: "faults".into(),
+                invitees: vec!["bob".into(), "carol".into()],
+                required_features: vec![],
+                pending: "create".into(),
+            },
+            ScenarioStep::ConfirmPending {
+                client: "alice".into(),
+                pending: "create".into(),
+            },
+            ScenarioStep::DeliverAll,
+            ScenarioStep::Tick {
+                clients: vec!["bob".into(), "carol".into()],
+            },
+            ScenarioStep::SendAppMessage {
+                sender: "bob".into(),
+                payload: "bob:first".into(),
+            },
+            ScenarioStep::SendAppMessage {
+                sender: "carol".into(),
+                payload: "carol:second".into(),
+            },
+            ScenarioStep::DuplicateQueued { index: 0 },
+            ScenarioStep::DelayQueued {
+                index: 1,
+                delayed: "delayed-copy".into(),
+            },
+            ScenarioStep::ReorderQueued { order: vec![1, 0] },
+            ScenarioStep::DeliverAll,
+            ScenarioStep::Tick {
+                clients: vec!["alice".into()],
+            },
+            ScenarioStep::ReleaseDelayed {
+                delayed: "delayed-copy".into(),
+            },
+            ScenarioStep::DeliverAll,
+            ScenarioStep::Tick {
+                clients: vec!["alice".into()],
+            },
+            ScenarioStep::Observe {
+                clients: vec!["alice".into()],
+            },
+        ],
+    };
+
+    let trace = run_scenario_spec(&spec).await.expect("scenario runs");
+
+    assert_eq!(
+        trace.observations[0].received_payloads,
+        vec!["carol:second", "bob:first"]
+    );
+}
+
+#[tokio::test]
+async fn send_leave_family_records_seed_and_runs_generated_cases() {
+    let cases = generate_send_leave_family(42, 3);
+
+    assert_eq!(cases, generate_send_leave_family(42, 3));
+    assert_eq!(cases.len(), 3);
+    for (case_index, case) in cases.iter().enumerate() {
+        assert_eq!(case.family_name, "send-leave/v1");
+        assert_eq!(case.generator_version, "1");
+        assert_eq!(case.seed, 42);
+        assert_eq!(case.case_index, case_index as u64);
+
+        let trace = run_scenario_spec(&case.scenario)
+            .await
+            .expect("generated scenario runs");
+        assert_eq!(trace.name, case.scenario.name);
+        assert!(!trace.observations.is_empty());
+    }
+
+    let json = serde_json::to_value(&cases[0]).expect("case serializes");
+    assert_eq!(json["seed"], 42);
+    assert_eq!(json["generator_version"], "1");
+}
+
+#[tokio::test]
+async fn scenario_report_records_trace_log_recoveries_and_failures() {
+    let fixture: VectorFixture =
+        serde_json::from_str(include_str!("../vectors/deliberate-fork-recovery.v1.json"))
+            .expect("fixture JSON parses");
+
+    let report = run_scenario_report(&fixture.scenario, Some(fixture.expected_trace.clone()))
+        .await
+        .expect("scenario reports");
+
+    assert_eq!(report.metadata.scenario_name, "deliberate-fork-recovery/v1");
+    assert_eq!(report.metadata.step_count, fixture.scenario.steps.len());
+    assert_eq!(report.expected_trace, Some(fixture.expected_trace.clone()));
+    assert_eq!(report.observed_trace, Some(fixture.expected_trace));
+    assert_eq!(report.step_log.len(), fixture.scenario.steps.len());
+    assert!(
+        report
+            .step_log
+            .iter()
+            .all(|entry| entry.status.is_completed())
+    );
+    assert_eq!(report.recovery_observations.len(), 1);
+    assert!(report.invariant_failures.is_empty());
+
+    let json = serde_json::to_value(&report).expect("report serializes");
+    assert_eq!(
+        json["metadata"]["scenario_name"],
+        "deliberate-fork-recovery/v1"
+    );
+    assert!(
+        json["step_log"]
+            .as_array()
+            .is_some_and(|steps| !steps.is_empty())
+    );
+}
+
+#[tokio::test]
+async fn scenario_report_records_mismatch_as_invariant_failure() {
+    let spec = ScenarioSpec {
+        name: "report-mismatch/v1".into(),
+        spec_version: "1".into(),
+        clients: vec!["alice".into(), "bob".into()],
+        steps: vec![
+            ScenarioStep::CreateGroup {
+                creator: "alice".into(),
+                name: "report-mismatch".into(),
+                invitees: vec!["bob".into()],
+                required_features: vec![],
+                pending: "create".into(),
+            },
+            ScenarioStep::ConfirmPending {
+                client: "alice".into(),
+                pending: "create".into(),
+            },
+            ScenarioStep::DeliverAll,
+            ScenarioStep::Tick {
+                clients: vec!["bob".into()],
+            },
+            ScenarioStep::Observe {
+                clients: vec!["alice".into()],
+            },
+        ],
+    };
+    let expected = ScenarioTrace {
+        name: spec.name.clone(),
+        observations: vec![],
+    };
+
+    let report = run_scenario_report(&spec, Some(expected))
+        .await
+        .expect("scenario reports");
+
+    assert_eq!(report.invariant_failures.len(), 1);
+    assert_eq!(report.invariant_failures[0].kind, "trace_mismatch");
+}
+
+#[tokio::test]
+async fn generated_case_report_records_generator_metadata() {
+    let case = generate_send_leave_family(7, 1).remove(0);
+
+    let report = run_generated_case_report(&case, None)
+        .await
+        .expect("generated case reports");
+    let generated = report
+        .metadata
+        .generated
+        .as_ref()
+        .expect("generated metadata");
+
+    assert_eq!(generated.family_name, "send-leave/v1");
+    assert_eq!(generated.generator_version, "1");
+    assert_eq!(generated.seed, 7);
+    assert_eq!(generated.case_index, 0);
+    assert!(generated.minimized_case.is_none());
 }
 
 async fn three_client_message_exchange_trace() -> ScenarioTrace {

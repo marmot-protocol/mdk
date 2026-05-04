@@ -16,6 +16,7 @@
 
 pub mod bus;
 pub mod client;
+pub mod family;
 pub mod peeler;
 pub mod proptest_support;
 pub mod scenario;
@@ -23,8 +24,13 @@ pub mod vector;
 
 pub use bus::{ClientId, DeliveryPolicy, TransportBus};
 pub use client::{ClientBuilder, HarnessClient};
+pub use family::{GeneratedScenarioCase, generate_send_leave_family, run_generated_case_report};
 pub use peeler::MockPeeler;
-pub use scenario::{ScenarioRunError, ScenarioSpec, ScenarioStep, run_scenario_spec};
+pub use scenario::{
+    GeneratedScenarioMetadata, InvariantFailure, ScenarioReport, ScenarioReportMetadata,
+    ScenarioRunError, ScenarioSpec, ScenarioStep, ScenarioStepLogEntry, ScenarioStepStatus,
+    run_scenario_report, run_scenario_spec,
+};
 pub use vector::{
     ClientObservation, ForkRecoveryObservation, RecoveryOrderingKeyObservation, ScenarioTrace,
     VectorFixture, observe_client,
