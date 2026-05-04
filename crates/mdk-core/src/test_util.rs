@@ -93,7 +93,7 @@ where
 ///
 /// The produced KeyPackage's `LeafNode.capabilities.proposals` is explicitly
 /// empty (no `SelfRemove`), simulating an older client that predates MIP-03.
-/// This is packaged inside a kind:443 (legacy, pre-May-2026) Nostr event
+/// This is packaged inside a kind:443 (legacy through May 31, 2026) Nostr event
 /// because the stricter kind:30443 validator requires the `mls_proposals`
 /// tag and an `i` (KeyPackageRef) tag we do not compute here.
 ///

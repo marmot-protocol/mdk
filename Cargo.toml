@@ -12,11 +12,11 @@ rust-version = "1.90.0"
 
 [workspace.dependencies]
 # Internal crates
-mdk-memory-storage = { version = "0.7.1", path = "./crates/mdk-memory-storage", default-features = false }
-mdk-sqlite-storage = { version = "0.7.1", path = "./crates/mdk-sqlite-storage", default-features = false }
-mdk-storage-traits = { version = "0.7.1", path = "./crates/mdk-storage-traits", default-features = false }
-mdk-core = { version = "0.7.1", path = "./crates/mdk-core", default-features = false }
-mdk-macros = { version = "0.7.1", path = "./crates/mdk-macros" }
+mdk-memory-storage = { version = "0.8.0", path = "./crates/mdk-memory-storage", default-features = false }
+mdk-sqlite-storage = { version = "0.8.0", path = "./crates/mdk-sqlite-storage", default-features = false }
+mdk-storage-traits = { version = "0.8.0", path = "./crates/mdk-storage-traits", default-features = false }
+mdk-core = { version = "0.8.0", path = "./crates/mdk-core", default-features = false }
+mdk-macros = { version = "0.8.0", path = "./crates/mdk-macros" }
 
 # OpenMLS family — pinned to a post-#1959 rev for public
 # `MlsGroup::treesync().full_leaves()` (merged upstream 2026-02-16).

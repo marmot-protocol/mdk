@@ -1875,7 +1875,7 @@ dependencies = [
 
 [[package]]
 name = "mdk-core"
-version = "0.7.1"
+version = "0.8.0"
 dependencies = [
  "base64",
  "blurhash",
@@ -1907,11 +1907,11 @@ dependencies = [
 
 [[package]]
 name = "mdk-macros"
-version = "0.7.1"
+version = "0.8.0"
 
 [[package]]
 name = "mdk-memory-storage"
-version = "0.7.1"
+version = "0.8.0"
 dependencies = [
  "lru",
  "mdk-storage-traits",
@@ -1926,7 +1926,7 @@ dependencies = [
 
 [[package]]
 name = "mdk-sqlite-storage"
-version = "0.7.1"
+version = "0.8.0"
 dependencies = [
  "base64",
  "getrandom 0.4.2",
@@ -1948,7 +1948,7 @@ dependencies = [
 
 [[package]]
 name = "mdk-storage-traits"
-version = "0.7.1"
+version = "0.8.0"
 dependencies = [
  "nostr",
  "openmls",
@@ -1963,7 +1963,7 @@ dependencies = [
 
 [[package]]
 name = "mdk-uniffi"
-version = "0.7.1"
+version = "0.8.0"
 dependencies = [
  "android-native-keyring-store",
  "apple-native-keyring-store",

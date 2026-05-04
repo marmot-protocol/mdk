@@ -32,7 +32,7 @@ pub struct KeyPackageEventData {
 
     /// Tags for the legacy kind:443 event.
     /// Same as `tags_30443` but with the `d` tag removed.
-    /// Use with `Kind::Custom(443)` during the transition period (until May 1, 2026).
+    /// Use with `Kind::Custom(443)` during the transition period (through May 31, 2026).
     pub tags_443: Vec<Tag>,
 
     /// Serialized `KeyPackageRef` bytes for lifecycle tracking.
@@ -328,8 +328,8 @@ where
     /// # }
     /// ```
     pub fn parse_key_package(&self, event: &Event) -> Result<KeyPackage, Error> {
-        // Accept both kind:30443 (current spec) and kind:443 (legacy, pre-May 2026).
-        // TODO: Remove MLS_KEY_PACKAGE_KIND_LEGACY acceptance after May 1, 2026
+        // Accept both kind:30443 (current spec) and kind:443 (legacy, through May 31, 2026).
+        // TODO: Remove MLS_KEY_PACKAGE_KIND_LEGACY acceptance after May 31, 2026
         if event.kind != MLS_KEY_PACKAGE_KIND && event.kind != MLS_KEY_PACKAGE_KIND_LEGACY {
             return Err(Error::UnexpectedEvent {
                 expected: MLS_KEY_PACKAGE_KIND,
@@ -3037,9 +3037,9 @@ mod tests {
         );
     }
 
-    /// Regression: parse_key_package accepts kind:443 (legacy) events until May 2026
+    /// Regression: parse_key_package accepts kind:443 (legacy) events through May 31, 2026
     ///
-    /// TODO: Remove this test together with MLS_KEY_PACKAGE_KIND_LEGACY acceptance after May 1, 2026
+    /// TODO: Remove this test together with MLS_KEY_PACKAGE_KIND_LEGACY acceptance after May 31, 2026
     #[test]
     fn test_parse_key_package_accepts_legacy_kind_443() {
         let mdk = create_test_mdk();
@@ -3066,7 +3066,7 @@ mod tests {
         let result = mdk.parse_key_package(&event);
         assert!(
             result.is_ok(),
-            "Should accept legacy kind:443 KeyPackage event until May 2026, got: {:?}",
+            "Should accept legacy kind:443 KeyPackage event through May 31, 2026, got: {:?}",
             result
         );
     }

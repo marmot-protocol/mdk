@@ -1,6 +1,6 @@
 [package]
 name = "mdk-macros"
-version = "0.7.1"
+version = "0.8.0"
 edition = "2021"
 description = "Shared declarative macros for the MDK workspace"
 authors.workspace = true

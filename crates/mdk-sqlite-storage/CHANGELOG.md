@@ -27,12 +27,26 @@
 
 ### Breaking changes
 
+### Changed
+
+### Added
+
+### Fixed
+
+### Removed
+
+### Deprecated
+
+## [0.8.0] - 2026-05-04
+
+### Breaking changes
+
 - `new_unencrypted()` and `new_in_memory()` are now gated behind the `test-utils` feature flag. Downstream crates that call these methods must add `features = ["test-utils"]` to their `mdk-sqlite-storage` dependency. ([#245](https://github.com/marmot-protocol/mdk/pull/245))
 
 ### Changed
 
-- Extracted row-parsing helpers (`blob_to_group_id`, `blob_to_event_id`, `blob_to_pubkey`, `text_to_state`, `text_to_json`, `text_to_parsed`) to replace repetitive inline column extraction across `row_to_group`, `row_to_group_relay`, `row_to_group_exporter_secret`, `row_to_message`, and `row_to_welcome`. ([`#239`](https://github.com/marmot-protocol/mdk/pull/239))
-- Migrated group and welcome storage to use shared validation functions from `mdk-storage-traits`. ([`#239`](https://github.com/marmot-protocol/mdk/pull/239))
+- Extracted row-parsing helpers (`blob_to_group_id`, `blob_to_event_id`, `blob_to_pubkey`, `text_to_state`, `text_to_json`, `text_to_parsed`) to replace repetitive inline column extraction across `row_to_group`, `row_to_group_relay`, `row_to_group_exporter_secret`, `row_to_message`, and `row_to_welcome`. ([#239](https://github.com/marmot-protocol/mdk/pull/239))
+- Migrated group and welcome storage to use shared validation functions from `mdk-storage-traits`. ([#239](https://github.com/marmot-protocol/mdk/pull/239))
 
 ### Added
 

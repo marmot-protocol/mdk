@@ -27,14 +27,28 @@
 
 ### Breaking changes
 
-- **`KeyPackageResult` now includes `d_tag` and `tags_legacy`**: The `KeyPackageResult` struct returned by `create_key_package_for_event` and `create_key_package_for_event_with_options` now includes a `d_tag: String` field containing the 32-byte hex identifier for the KeyPackage slot. This enables callers to reuse the same `d` value when rotating KeyPackages so that relays automatically replace the old event. It also includes `tags_legacy`, which provides the tags without the `d` tag. Callers MUST dual-publish both `kind:30443` (using `tags`) and `kind:443` (using `tags_legacy`) until May 1, 2026 so that legacy clients can still discover new key packages. All test event builders updated to use `kind:30443`. ([#233](https://github.com/marmot-protocol/mdk/pull/233))
+### Changed
+
+### Added
+
+### Fixed
+
+### Removed
+
+### Deprecated
+
+## [0.8.0] - 2026-05-04
+
+### Breaking changes
+
+- **`KeyPackageResult` now includes `d_tag` and `tags_legacy`**: The `KeyPackageResult` struct returned by `create_key_package_for_event` and `create_key_package_for_event_with_options` now includes a `d_tag: String` field containing the 32-byte hex identifier for the KeyPackage slot. This enables callers to reuse the same `d` value when rotating KeyPackages so that relays automatically replace the old event. It also includes `tags_legacy`, which provides the tags without the `d` tag. Callers MUST dual-publish both `kind:30443` (using `tags`) and `kind:443` (using `tags_legacy`) through May 31, 2026 so that legacy clients can still discover new key packages. All test event builders updated to use `kind:30443`. ([#233](https://github.com/marmot-protocol/mdk/pull/233))
 - `new_mdk_unencrypted()` is now gated behind the `test-utils` feature flag. Downstream consumers must enable the `test-utils` feature to access this function. ([#245](https://github.com/marmot-protocol/mdk/pull/245))
 - `create_message` now takes an additional `event_tags` parameter (`Option<Vec<Vec<String>>>`) for appending allow-listed tags (e.g. NIP-40 `expiration`) to the outer kind:445 wrapper event. Pass `None` to preserve existing behavior. ([#248](https://github.com/marmot-protocol/mdk/pull/248))
 
 ### Changed
 
-- Extracted `update_group_result_to_uniffi()` and `mdk_from_storage()` helpers to eliminate duplicated serialization and constructor logic across multiple exported functions. ([`#239`](https://github.com/marmot-protocol/mdk/pull/239))
-- Simplified iterator collection patterns to use `.collect::<Result<_, _>>()` instead of two-step collect-then-unwrap. ([`#239`](https://github.com/marmot-protocol/mdk/pull/239))
+- Extracted `update_group_result_to_uniffi()` and `mdk_from_storage()` helpers to eliminate duplicated serialization and constructor logic across multiple exported functions. ([#239](https://github.com/marmot-protocol/mdk/pull/239))
+- Simplified iterator collection patterns to use `.collect::<Result<_, _>>()` instead of two-step collect-then-unwrap. ([#239](https://github.com/marmot-protocol/mdk/pull/239))
 
 ### Added
 
@@ -44,16 +58,16 @@
 - Added UniFFI bindings for `delete_messages_for_group` and `delete_group` for local "clear chat" and "delete chat" operations. ([#250](https://github.com/marmot-protocol/mdk/pull/250))
 - Added UniFFI bindings for 10 previously unbound methods: `delete_key_package_from_storage`, `delete_key_package_from_storage_by_hash_ref`, `get_ratchet_tree_info`, `group_leaf_map`, `own_leaf_index`, `pending_added_members_pubkeys`, `pending_member_changes`, `pending_removed_members_pubkeys`, `prepare_group_image_for_upload_with_options`, and `process_message_with_context`. ([#249](https://github.com/marmot-protocol/mdk/pull/249))
 - Added optional `thumbhash` fields alongside the existing `blurhash` UniFFI records for group-image and encrypted-media uploads, plus a `generate_thumbhash` option in `MediaProcessingOptionsInput`. ([#244](https://github.com/marmot-protocol/mdk/pull/244))
-- Moved binary size optimizations (`opt-level = "z"`, thin LTO, single codegen unit, `panic = "abort"`, symbol stripping) into `[profile.release]` directly. Android builds override to fat LTO via `CARGO_PROFILE_RELEASE_LTO=fat` for maximum `.so` reduction; iOS uses thin LTO to avoid `.a` archive bloat. ([`#221`](https://github.com/marmot-protocol/mdk/pull/221), [`#232`](https://github.com/marmot-protocol/mdk/pull/232))
+- Moved binary size optimizations (`opt-level = "z"`, thin LTO, single codegen unit, `panic = "abort"`, symbol stripping) into `[profile.release]` directly. Android builds override to fat LTO via `CARGO_PROFILE_RELEASE_LTO=fat` for maximum `.so` reduction; iOS uses thin LTO to avoid `.a` archive bloat. ([#221](https://github.com/marmot-protocol/mdk/pull/221), [#232](https://github.com/marmot-protocol/mdk/pull/232))
 
 ### Fixed
 
 - Allowed failed platform keyring auto-initialization attempts to be retried, so a transient keyring failure does not permanently block `new_mdk()` in the current process. ([#252](https://github.com/marmot-protocol/mdk/pull/252))
 - Removed the Swift package's explicit system `sqlite3` link and linked the native frameworks required by the bundled SQLCipher provider instead. ([#252](https://github.com/marmot-protocol/mdk/pull/252))
-- Removed redundant `cargo build` steps from Swift, Python, and Ruby binding CI jobs that duplicated work already done by `_build-uniffi`. ([`#232`](https://github.com/marmot-protocol/mdk/pull/232))
-- Fixed stale `release-size` artifact paths in Kotlin and Swift binding generation recipes. ([`#232`](https://github.com/marmot-protocol/mdk/pull/232))
-- Unbroke binding builds on Linux: switched `[profile.release].strip` from `true` to `"debuginfo"` so `uniffi-bindgen --library` can still read `UNIFFI_META_*` symbols from the cdylib's `.symtab` (GNU strip's `--strip-all` was removing them, which silently produced empty Kotlin/Ruby/Python binding output). DWARF debug info is still stripped, so the binary-size cost is small. ([`#267`](https://github.com/marmot-protocol/mdk/pull/267))
-- Switched iOS bindings to fat LTO (`CARGO_PROFILE_RELEASE_LTO=fat`, mirroring Android) so the static `.a` archives no longer embed per-module thin-LTO bitcode. This shrinks `libmdk_uniffi.a` back below GitHub's 100 MB push limit. The Swift package workflow also configures `git lfs track "*.a"` as a defensive safety net. ([`#267`](https://github.com/marmot-protocol/mdk/pull/267))
+- Removed redundant `cargo build` steps from Swift, Python, and Ruby binding CI jobs that duplicated work already done by `_build-uniffi`. ([#232](https://github.com/marmot-protocol/mdk/pull/232))
+- Fixed stale `release-size` artifact paths in Kotlin and Swift binding generation recipes. ([#232](https://github.com/marmot-protocol/mdk/pull/232))
+- Unbroke binding builds on Linux: switched `[profile.release].strip` from `true` to `"debuginfo"` so `uniffi-bindgen --library` can still read `UNIFFI_META_*` symbols from the cdylib's `.symtab` (GNU strip's `--strip-all` was removing them, which silently produced empty Kotlin/Ruby/Python binding output). DWARF debug info is still stripped, so the binary-size cost is small. ([#267](https://github.com/marmot-protocol/mdk/pull/267))
+- Switched iOS bindings to fat LTO (`CARGO_PROFILE_RELEASE_LTO=fat`, mirroring Android) so the static `.a` archives no longer embed per-module thin-LTO bitcode. This shrinks `libmdk_uniffi.a` back below GitHub's 100 MB push limit. The Swift package workflow also configures `git lfs track "*.a"` as a defensive safety net. ([#267](https://github.com/marmot-protocol/mdk/pull/267))
 
 ### Removed
 
@@ -88,14 +102,14 @@
 - **`KeyPackageResult` now includes `hash_ref`**: The `KeyPackageResult` struct returned by `create_key_package_for_event` and `create_key_package_for_event_with_options` now includes a `hash_ref: Vec<u8>` field containing the serialized hash reference of the key package. This enables callers to track key packages for lifecycle management without re-parsing. ([#178](https://github.com/marmot-protocol/mdk/pull/178))
 - **`create_key_package_for_event` No Longer Adds Protected Tag**: The `create_key_package_for_event()` function no longer adds the NIP-70 protected tag by default. This is a behavioral change - existing code that relied on the protected tag being present will now produce key packages without it. Key packages can now be republished by third parties to any relay. For users who need the protected tag, use the new `create_key_package_for_event_with_options()` function with `protected: true`. ([#173](https://github.com/marmot-protocol/mdk/pull/173), related: [#168](https://github.com/marmot-protocol/mdk/issues/168))
 - **Security (Audit Issue M)**: Changed `get_message()` to require both `mls_group_id` and `event_id` parameters. This prevents messages from different groups from overwriting each other by scoping lookups to a specific group. ([#124](https://github.com/marmot-protocol/mdk/pull/124))
-- Renamed `Message.processed_at` to `Message.created_at` for semantic accuracy. The field represents when a message was created, not when it was processed by the system. ([`#163`](https://github.com/marmot-protocol/mdk/pull/163))
+- Renamed `Message.processed_at` to `Message.created_at` for semantic accuracy. The field represents when a message was created, not when it was processed by the system. ([#163](https://github.com/marmot-protocol/mdk/pull/163))
 
 ### Changed
 
 - Upgraded `nostr` dependency from 0.43 to 0.44, replacing deprecated `Timestamp::as_u64()` calls with `Timestamp::as_secs()` ([#162](https://github.com/marmot-protocol/mdk/pull/162))
 - Changed `get_messages()` to accept optional `limit` and `offset` parameters for pagination control. Existing calls must be updated to pass `None, None` for default behavior (limit: 1000, offset: 0), or specify values for custom pagination. ([#111](https://github.com/marmot-protocol/mdk/pull/111))
 - Changed `get_pending_welcomes()` to accept optional `limit` and `offset` parameters for pagination control. Existing calls must be updated to pass `None, None` for default behavior (limit: 1000, offset: 0), or specify values for custom pagination. ([#119](https://github.com/marmot-protocol/mdk/pull/119))
-- Changed `new_mdk()`, `new_mdk_with_key()`, and `new_mdk_unencrypted()` to accept an optional `MdkConfig` parameter for customizing MDK behavior. Existing calls must be updated to pass `None` for default behavior. ([`#155`](https://github.com/marmot-protocol/mdk/pull/155))
+- Changed `new_mdk()`, `new_mdk_with_key()`, and `new_mdk_unencrypted()` to accept an optional `MdkConfig` parameter for customizing MDK behavior. Existing calls must be updated to pass `None` for default behavior. ([#155](https://github.com/marmot-protocol/mdk/pull/155))
 
 ### Added
 
@@ -107,7 +121,7 @@
 - **Group `last_message_processed_at` Field**: The `Group` record now includes an optional `last_message_processed_at: u64` field (Unix timestamp) indicating when the last message was received/processed by this client. This complements `last_message_at` (sender's timestamp) and ensures `last_message_id` is consistent with the first message returned by `get_messages()`. ([#166](https://github.com/marmot-protocol/mdk/pull/166))
 - **Message `processed_at` Field**: The `Message` record now includes a `processed_at: u64` field (Unix timestamp) indicating when this client received/processed the message. This complements the existing `created_at` field (sender's timestamp) and helps clients handle clock skew between devices - messages can now be displayed in reception order if desired. ([#166](https://github.com/marmot-protocol/mdk/pull/166))
 - **`PreviouslyFailed` Result Variant**: Added `ProcessMessageResult.PreviouslyFailed` enum variant to handle cases where a previously failed message arrives again but the MLS group ID cannot be extracted. This prevents crashes in client applications (fixes [#153](https://github.com/marmot-protocol/mdk/issues/153)) by returning a result instead of throwing an exception. ([#165](https://github.com/marmot-protocol/mdk/pull/165), fixes [#154](https://github.com/marmot-protocol/mdk/issues/154), [#159](https://github.com/marmot-protocol/mdk/issues/159))
-- Added `MdkConfig` record for configuring MDK behavior, including `out_of_order_tolerance` and `maximum_forward_distance` settings for MLS sender ratchet configuration. All fields are optional and default to sensible values. ([`#155`](https://github.com/marmot-protocol/mdk/pull/155))
+- Added `MdkConfig` record for configuring MDK behavior, including `out_of_order_tolerance` and `maximum_forward_distance` settings for MLS sender ratchet configuration. All fields are optional and default to sensible values. ([#155](https://github.com/marmot-protocol/mdk/pull/155))
 - Exposed pagination control for `get_messages()` to foreign language bindings via optional `limit` and `offset` parameters. ([#111](https://github.com/marmot-protocol/mdk/pull/111))
 - Exposed pagination control for `get_pending_welcomes()` to foreign language bindings via optional `limit` and `offset` parameters. ([#119](https://github.com/marmot-protocol/mdk/pull/119))
 

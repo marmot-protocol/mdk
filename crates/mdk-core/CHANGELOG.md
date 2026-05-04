@@ -15,9 +15,6 @@
 
 ### Added
 
-- Added feature-gated `mip05` protocol primitives in `mdk-core`, including typed token payloads, strict token encryption/decryption helpers, and rumor build/parse helpers for MIP-05 `kind:447`, `kind:448`, and `kind:449`. ([#235](https://github.com/marmot-protocol/mdk/pull/235))
-- Added public MLS leaf-index helpers via `process_message_with_context`, `own_leaf_index`, and `group_leaf_map` so clients can access sender, local, and active group leaf positions without ratchet-tree workarounds. ([#235](https://github.com/marmot-protocol/mdk/pull/235))
-
 ### Fixed
 
 ### Removed
@@ -28,18 +25,32 @@
 
 ### Breaking changes
 
-- **MIP-05 push token wire format enlarged and validation relaxed**: `TOKEN_PLAINTEXT_LEN` increased from 220 to 1024 bytes (`ENCRYPTED_TOKEN_LEN` from 280 to 1084) to accommodate real-world FCM tokens (observed up to ~312 bytes) and future UnifiedPush endpoints (spec max 1000 bytes). Device tokens are now treated as opaque variable-length bytes with no per-platform length constraints — only non-empty and within wire-format capacity. `InvalidApnsTokenLength` and `InvalidFcmTokenLength` error variants replaced by a single `InvalidDeviceTokenLength`. `MAX_NOTIFICATION_REQUEST_TOKENS` reduced from 100 to 25 to stay within the NIP-44 plaintext limit at the larger token size.
-- **MIP-00 KeyPackage event kind migrated from `kind:443` to `kind:30443`**: KeyPackage events are now addressable (NIP-33) instead of regular events. A `d` tag with a random 32-byte hex identifier is included in every KeyPackage event, enabling relay-side replacement for rotation without explicit NIP-09 deletion. `create_key_package_for_event` and `create_key_package_for_event_with_options` now return a `KeyPackageEventData` struct instead of a tuple. This struct contains both `tags_30443` (for current spec) and `tags_443` (for legacy clients) to facilitate dual-publishing during the migration period. Callers must update destructuring. Callers MUST dual-publish both `kind:30443` (using `tags_30443`) and `kind:443` (using `tags_443`) until May 1, 2026 so that legacy clients can still discover new key packages. `parse_key_package` accepts both `kind:30443` (new) and `kind:443` (legacy) during the migration period. ([#233](https://github.com/marmot-protocol/mdk/pull/233))
+### Changed
+
+### Added
+
+### Fixed
+
+### Removed
+
+### Deprecated
+
+## [0.8.0] - 2026-05-04
+
+### Breaking changes
+
+- **MIP-05 push token wire format enlarged and validation relaxed**: `TOKEN_PLAINTEXT_LEN` increased from 220 to 1024 bytes (`ENCRYPTED_TOKEN_LEN` from 280 to 1084) to accommodate real-world FCM tokens (observed up to ~312 bytes) and future UnifiedPush endpoints (spec max 1000 bytes). Device tokens are now treated as opaque variable-length bytes with no per-platform length constraints — only non-empty and within wire-format capacity. `InvalidApnsTokenLength` and `InvalidFcmTokenLength` error variants replaced by a single `InvalidDeviceTokenLength`. `MAX_NOTIFICATION_REQUEST_TOKENS` reduced from 100 to 25 to stay within the NIP-44 plaintext limit at the larger token size. ([#254](https://github.com/marmot-protocol/mdk/pull/254))
+- **MIP-00 KeyPackage event kind migrated from `kind:443` to `kind:30443`**: KeyPackage events are now addressable (NIP-33) instead of regular events. A `d` tag with a random 32-byte hex identifier is included in every KeyPackage event, enabling relay-side replacement for rotation without explicit NIP-09 deletion. `create_key_package_for_event` and `create_key_package_for_event_with_options` now return a `KeyPackageEventData` struct instead of a tuple. This struct contains both `tags_30443` (for current spec) and `tags_443` (for legacy clients) to facilitate dual-publishing during the migration period. Callers must update destructuring. Callers MUST dual-publish both `kind:30443` (using `tags_30443`) and `kind:443` (using `tags_443`) through May 31, 2026 so that legacy clients can still discover new key packages. `parse_key_package` accepts both `kind:30443` (new) and `kind:443` (legacy) during the migration period. ([#233](https://github.com/marmot-protocol/mdk/pull/233))
 
 ### Changed
 
-- `add_members`, `remove_members`, `update_group_data`, and `self_demote` now return typed `Error::NotAdmin` for local caller authorization failures instead of stringly `Error::Group` values.
+- `add_members`, `remove_members`, `update_group_data`, and `self_demote` now return typed `Error::NotAdmin` for local caller authorization failures instead of stringly `Error::Group` values. ([#266](https://github.com/marmot-protocol/mdk/pull/266))
 - Admin updates now prune non-member public keys instead of rejecting the entire update. Only errors if no valid admins remain after pruning. ([#223](https://github.com/marmot-protocol/mdk/pull/223))
-- Replaced ~15 identical `From<...> for Error` impls with `impl_from_display_error!` and `impl_from_generic_display_error!` macros. ([`#239`](https://github.com/marmot-protocol/mdk/pull/239))
-- Consolidated duplicate test wiring between memory and sqlite storage test binaries into a `storage_backend_tests!` macro. ([`#239`](https://github.com/marmot-protocol/mdk/pull/239))
-- New groups now use `MIXED_CIPHERTEXT` wire format policy (outgoing: ciphertext, incoming: mixed) instead of the OpenMLS default `PURE_CIPHERTEXT`. Regular messages remain `PrivateMessage`; the mixed incoming policy is required to accept `PublicMessage` SelfRemove proposals from departing members.
-- `leave_group` now sends a SelfRemove proposal (MLS Extensions draft, type `0x000a`) instead of a Remove proposal. Falls back to Remove for legacy groups created with `PURE_CIPHERTEXT`. SelfRemove proposals are auto-committed by any member, removing the requirement for an admin to be online.
-- Non-admin members can now create SelfRemove-only Commits in addition to self-update Commits. These two commit types must not be combined.
+- Replaced ~15 identical `From<...> for Error` impls with `impl_from_display_error!` and `impl_from_generic_display_error!` macros. ([#239](https://github.com/marmot-protocol/mdk/pull/239))
+- Consolidated duplicate test wiring between memory and sqlite storage test binaries into a `storage_backend_tests!` macro. ([#239](https://github.com/marmot-protocol/mdk/pull/239))
+- New groups now use `MIXED_CIPHERTEXT` wire format policy (outgoing: ciphertext, incoming: mixed) instead of the OpenMLS default `PURE_CIPHERTEXT`. Regular messages remain `PrivateMessage`; the mixed incoming policy is required to accept `PublicMessage` SelfRemove proposals from departing members. ([#236](https://github.com/marmot-protocol/mdk/pull/236))
+- `leave_group` now sends a SelfRemove proposal (MLS Extensions draft, type `0x000a`) instead of a Remove proposal. Falls back to Remove for legacy groups created with `PURE_CIPHERTEXT`. SelfRemove proposals are auto-committed by any member, removing the requirement for an admin to be online. ([#236](https://github.com/marmot-protocol/mdk/pull/236))
+- Non-admin members can now create SelfRemove-only Commits in addition to self-update Commits. These two commit types must not be combined. ([#236](https://github.com/marmot-protocol/mdk/pull/236))
 - **`create_group` now computes the group's `RequiredCapabilities` as a least-common-denominator (LCD) intersection of `SUPPORTED_PROPOSALS` with every invitee's advertised proposals**, instead of requiring `SelfRemove` unconditionally. An all-modern invitee set still produces `RequiredCapabilities = [SelfRemove]`; any legacy invitee strips `SelfRemove` from the required set. Empty-invitee (single-member / "message to self") groups stay permissive with `RequiredCapabilities = []` so a later `add_members` call can admit legacy key packages. This unblocks two call patterns that previously failed OpenMLS's admission check with `Error::Group("Proposals are not acceptable")`: `create_group` with at least one legacy invitee, and `add_members` of a legacy invitee into a group that was created mixed (`RequiredCapabilities = []`). Resolves [whitenoise-rs #749](https://github.com/marmot-protocol/whitenoise-rs/issues/749) via [#261](https://github.com/marmot-protocol/mdk/pull/261).
 - `leave_group` now consults the group's `RequiredCapabilities` before emitting a `SelfRemove` proposal. If the group's `RequiredCapabilities` does not include `SelfRemove` (i.e. any mixed/legacy group), the leave falls back to a legacy `Remove` proposal that only admins can commit. Complements the existing `PURE_CIPHERTEXT` wire-format fallback. ([#261](https://github.com/marmot-protocol/mdk/pull/261))
 - `add_members` now returns the typed `Error::InviteeMissingRequiredProposal` when OpenMLS rejects a KeyPackage whose `LeafNode.capabilities.proposals` does not cover the group's `RequiredCapabilities`, instead of flat-stringing the OpenMLS error through `Error::Group`. Callers can distinguish legacy-joiner rejection from other `add_members` failures without substring-matching OpenMLS's `Display` output. **New `Error` variant**: exhaustive matchers on `Error` need an additional arm. Follow-up to [#261](https://github.com/marmot-protocol/mdk/pull/261). ([#263](https://github.com/marmot-protocol/mdk/pull/263))
@@ -48,6 +59,8 @@
 ### Added
 
 - Added `test-utils` Cargo feature on `mdk-core` exposing the existing `test_util` module (notably `create_legacy_key_package_event`) so downstream crates can build legacy-LeafNode fixtures without a `cfg(test)` workaround. ([#269](https://github.com/marmot-protocol/mdk/pull/269))
+- Added feature-gated `mip05` protocol primitives in `mdk-core`, including typed token payloads, strict token encryption/decryption helpers, and rumor build/parse helpers for MIP-05 `kind:447`, `kind:448`, and `kind:449`. ([#235](https://github.com/marmot-protocol/mdk/pull/235))
+- Added public MLS leaf-index helpers via `process_message_with_context`, `own_leaf_index`, and `group_leaf_map` so clients can access sender, local, and active group leaf positions without ratchet-tree workarounds. ([#235](https://github.com/marmot-protocol/mdk/pull/235))
 - **GroupContextExtensions upgrade path.** Three new public methods on `MDK` let client UX prompt an admin to upgrade a mixed group that has since become all-modern:
   - `group_member_capabilities(&GroupId) -> Result<Vec<MemberCapabilities>, Error>` — per-member advertised proposal types, extension types, ciphersuites, and admin flag. Proposal and extension capabilities are returned as `BTreeSet`s. Any member may call it.
   - `group_capability_upgrade_status(&GroupId) -> Result<CapabilityUpgradeStatus, Error>` — per-proposal upgrade readiness. Each entry in `SUPPORTED_PROPOSALS` is reported as `AlreadyRequired`, `Available`, or `Blocked { blockers: Vec<PublicKey> }`. Any member may call it.
@@ -56,8 +69,8 @@
 - Re-exported `openmls::prelude::ProposalType` through `mdk_core::prelude` so consumers can name the return type of `group_required_proposals` without adding a direct `openmls` dependency. Prelude module doc comment updated to reflect the actual policy: dependency types that appear in MDK's public API surface are re-exported (as was already true for `GroupId`). ([#265](https://github.com/marmot-protocol/mdk/pull/265))
 - Added `delete_messages_for_group` and `delete_group` public methods on `MDK` for local "clear chat" and "delete chat" operations. `delete_group` also cleans up `EpochSnapshotManager` in-memory state. Neither operation publishes MLS proposals or Nostr events. ([#250](https://github.com/marmot-protocol/mdk/pull/250))
 - Added ThumbHash preview generation alongside existing BlurHash support. `MediaProcessingOptions` now includes `generate_thumbhash`, `ImageMetadata`, `MediaMetadata`, `EncryptedMediaUpload`, and `GroupImageUpload` expose optional `thumbhash`, and encrypted-media IMETA writing emits `thumbhash` while parsing accepts both `blurhash` and `thumbhash` tags for compatibility. ([#244](https://github.com/marmot-protocol/mdk/pull/244))
-- SelfRemove proposal type (`0x000a`) added to client capabilities, group required capabilities, and KeyPackage `mls_proposals` tag per MIP-03.
-- Admin depletion validation: SelfRemove proposals and commits are rejected if they would leave the group with zero admins.
+- SelfRemove proposal type (`0x000a`) added to client capabilities, group required capabilities, and KeyPackage `mls_proposals` tag per MIP-03. ([#236](https://github.com/marmot-protocol/mdk/pull/236))
+- Admin depletion validation: SelfRemove proposals and commits are rejected if they would leave the group with zero admins. ([#236](https://github.com/marmot-protocol/mdk/pull/236))
 - Added feature-gated MIP-05 notification request builders that group token tags by notification server, preserve relay hints, chunk requests at 100 tokens per server, and return ready-to-publish gift-wrapped notification batches for `kind:446` delivery. ([#238](https://github.com/marmot-protocol/mdk/pull/238))
 - `create_message` now accepts an optional `tags` parameter of type `Vec<EventTag>` for appending allow-listed tags (e.g. NIP-40 `expiration`) to the outer kind:445 wrapper event. The `EventTag` enum enforces at compile time which tags are permitted. ([#248](https://github.com/marmot-protocol/mdk/pull/248))
 
@@ -75,7 +88,7 @@
 - `decrypt_from_download` now delegates to `decrypt_from_download_at` (pub(crate)) for deterministic testing of the migration deadline. ([#222](https://github.com/marmot-protocol/mdk/pull/222))
 - Improved diagnostic logging: AEAD decryption failures in `decrypt_message_with_any_supported_format` are now traced before the NIP-44 fallback is attempted, making post-migration forensics easier. ([#222](https://github.com/marmot-protocol/mdk/pull/222))
 - `setup_two_member_group` test helper deduplicated from `messages::decryption` into `crate::test_util`. ([#222](https://github.com/marmot-protocol/mdk/pull/222))
-- **0.6.x/0.7.x migration compatibility**: Current-epoch MIP-03 exporter secrets now self-heal from live MLS state while preserving mismatched pre-0.7.0 bytes for temporary read compatibility. Message decryption temporarily accepts transition-era AEAD wrappers encrypted with old secrets, preserved late-epoch legacy secrets during upgrade, and untagged legacy NIP-44 wrappers only until June 4, 2026. ([#222](https://github.com/marmot-protocol/mdk/pull/222))
+- **0.6.x/0.7.x migration compatibility**: Current-epoch MIP-03 exporter secrets now self-heal from live MLS state while preserving mismatched pre-0.7.0 bytes for temporary read compatibility. Message decryption temporarily accepts transition-era AEAD wrappers encrypted with old secrets, preserved late-epoch legacy secrets during upgrade, and untagged legacy NIP-44 wrappers only until May 15, 2026 00:00:00 UTC. ([#222](https://github.com/marmot-protocol/mdk/pull/222))
 - **Legacy media read compatibility**: MIP-04 download decryption now temporarily falls back across preserved legacy exporter secrets and the pre-0.7.1 HKDF derivation so more `0.6.x -> 0.7.x` media remains readable during migration. ([#222](https://github.com/marmot-protocol/mdk/pull/222))
 - `remove_members` now atomically strips removed members from the group admin list within the same MLS commit ([#225](https://github.com/marmot-protocol/mdk/pull/225))
 
@@ -190,7 +203,7 @@
 - **MIP-04 Epoch Fallback for Media Decryption**: `decrypt_from_download` now resolves the correct decryption key via an O(1) epoch hint lookup instead of only using the current epoch's exporter secret. Added `NoExporterSecretForEpoch` variant to `EncryptedMediaError` for programmatic error matching. ([#167](https://github.com/marmot-protocol/mdk/pull/167))
 - **`PreviouslyFailed` Result Variant**: Added `MessageProcessingResult::PreviouslyFailed` variant to handle cases where a previously failed message arrives again but the MLS group ID cannot be extracted. This prevents crashes in client applications by returning a result instead of throwing an error. ([#165](https://github.com/marmot-protocol/mdk/pull/165), fixes [#154](https://github.com/marmot-protocol/mdk/issues/154), [#159](https://github.com/marmot-protocol/mdk/issues/159))
 - **Message Retry Support**: Implemented better handling for retryable message states. When a message fails processing, it now preserves the `message_event_id` and other context. Added logic to allow reprocessing of messages marked as `Retryable`, with automatic state recovery to `Processed` upon success. ([#161](https://github.com/marmot-protocol/mdk/pull/161))
-- Configurable `out_of_order_tolerance` and `maximum_forward_distance` in `MdkConfig` for MLS sender ratchet settings. Default `out_of_order_tolerance` increased from 5 to 100 for better handling of out-of-order message delivery on Nostr relays. ([`#155`](https://github.com/marmot-protocol/mdk/pull/155))
+- Configurable `out_of_order_tolerance` and `maximum_forward_distance` in `MdkConfig` for MLS sender ratchet settings. Default `out_of_order_tolerance` increased from 5 to 100 for better handling of out-of-order message delivery on Nostr relays. ([#155](https://github.com/marmot-protocol/mdk/pull/155))
 - **Epoch Snapshots & Rollback**: Added `EpochSnapshotManager` to maintain historical epoch states for rollback. ([#152](https://github.com/marmot-protocol/mdk/pull/152))
 - **Configuration**: Added `epoch_snapshot_retention` to `MdkConfig` (default: 5) to control how many past epochs are retained for rollback support. ([#152](https://github.com/marmot-protocol/mdk/pull/152))
 - **Rollback Callback**: Added `MdkCallback` trait and `MdkBuilder::with_callback()` to allow applications to react to rollback events (e.g., to refresh UI). ([#152](https://github.com/marmot-protocol/mdk/pull/152))

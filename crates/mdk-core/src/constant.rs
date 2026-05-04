@@ -15,7 +15,7 @@ pub const MLS_KEY_PACKAGE_KIND: Kind = Kind::Custom(30443);
 /// Legacy Nostr event kind for MLS KeyPackage events (regular, non-replaceable).
 ///
 /// Earlier versions of the Marmot spec used kind 443. Clients SHOULD accept this kind
-/// during the migration period (until May 1, 2026) but MUST publish using kind 30443.
+/// during the migration period (through May 31, 2026) but MUST publish using kind 30443.
 pub const MLS_KEY_PACKAGE_KIND_LEGACY: Kind = Kind::Custom(443);
 
 /// Nostr Group Data extension type

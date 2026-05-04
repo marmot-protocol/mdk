@@ -27,16 +27,30 @@
 
 ### Breaking changes
 
+### Changed
+
+### Added
+
+### Fixed
+
+### Removed
+
+### Deprecated
+
+## [0.8.0] - 2026-05-04
+
+### Breaking changes
+
 - Added `MessageStorage::delete_messages_for_group` and `MdkStorageProvider::delete_group` for local "clear chat" and "delete chat" operations. Storage implementations must add these methods. ([#250](https://github.com/marmot-protocol/mdk/pull/250))
 - Added `GroupStorage::get_group_legacy_exporter_secret` and `GroupStorage::save_group_legacy_exporter_secret` so storage backends can preserve pre-0.7.0 exporter-secret bytes separately during the temporary migration-compatibility window. Storage implementations must add these methods. ([#222](https://github.com/marmot-protocol/mdk/pull/222))
 
 ### Changed
 
-- Replaced hand-written `Display`, `FromStr`, `Serialize`, and `Deserialize` impls on `GroupState`, `MessageState`, `WelcomeState`, `ProcessedMessageState`, and `ProcessedWelcomeState` with a declarative `string_enum!` macro. ([`#239`](https://github.com/marmot-protocol/mdk/pull/239))
-- Replaced hand-written `Pagination` structs and limit-validation functions in groups, messages, and welcomes modules with a `bounded_pagination!` macro. ([`#239`](https://github.com/marmot-protocol/mdk/pull/239))
-- Replaced manual `Error` + `Display` impls on `GroupError`, `MessageError`, and `WelcomeError` with a `storage_error!` macro backed by `thiserror`. ([`#239`](https://github.com/marmot-protocol/mdk/pull/239))
-- Extracted shared group and welcome validation logic into `groups::validation` and `welcomes::validation` modules. ([`#239`](https://github.com/marmot-protocol/mdk/pull/239))
-- Removed ~700 lines of duplicated test functions from `test_utils::cross_storage` that had already been migrated to `mdk-core/tests/shared/`. ([`#239`](https://github.com/marmot-protocol/mdk/pull/239))
+- Replaced hand-written `Display`, `FromStr`, `Serialize`, and `Deserialize` impls on `GroupState`, `MessageState`, `WelcomeState`, `ProcessedMessageState`, and `ProcessedWelcomeState` with a declarative `string_enum!` macro. ([#239](https://github.com/marmot-protocol/mdk/pull/239))
+- Replaced hand-written `Pagination` structs and limit-validation functions in groups, messages, and welcomes modules with a `bounded_pagination!` macro. ([#239](https://github.com/marmot-protocol/mdk/pull/239))
+- Replaced manual `Error` + `Display` impls on `GroupError`, `MessageError`, and `WelcomeError` with a `storage_error!` macro backed by `thiserror`. ([#239](https://github.com/marmot-protocol/mdk/pull/239))
+- Extracted shared group and welcome validation logic into `groups::validation` and `welcomes::validation` modules. ([#239](https://github.com/marmot-protocol/mdk/pull/239))
+- Removed ~700 lines of duplicated test functions from `test_utils::cross_storage` that had already been migrated to `mdk-core/tests/shared/`. ([#239](https://github.com/marmot-protocol/mdk/pull/239))
 
 ### Added
 

@@ -17,8 +17,6 @@
 
 ### Fixed
 
-- Fixed `MdkMemoryStorage::save_message` to reject oversized message content, serialized tags JSON, and serialized event JSON before caching messages, matching SQLite backend payload bounds. ([#257](https://github.com/marmot-protocol/mdk/pull/257))
-
 ### Removed
 
 ### Deprecated
@@ -31,8 +29,22 @@
 
 ### Changed
 
-- Replaced 6 identical MLS storage struct definitions and their `Debug`/`new`/`clone_data`/`restore_data` impls with `mls_store_base!` and `mls_single_key_ops!` macros, reducing `mls_storage/mod.rs` by ~400 lines. ([`#239`](https://github.com/marmot-protocol/mdk/pull/239))
-- Migrated group and welcome storage to use shared validation functions from `mdk-storage-traits`. ([`#239`](https://github.com/marmot-protocol/mdk/pull/239))
+### Added
+
+### Fixed
+
+### Removed
+
+### Deprecated
+
+## [0.8.0] - 2026-05-04
+
+### Breaking changes
+
+### Changed
+
+- Replaced 6 identical MLS storage struct definitions and their `Debug`/`new`/`clone_data`/`restore_data` impls with `mls_store_base!` and `mls_single_key_ops!` macros, reducing `mls_storage/mod.rs` by ~400 lines. ([#239](https://github.com/marmot-protocol/mdk/pull/239))
+- Migrated group and welcome storage to use shared validation functions from `mdk-storage-traits`. ([#239](https://github.com/marmot-protocol/mdk/pull/239))
 
 ### Added
 
@@ -43,6 +55,7 @@
 
 ### Fixed
 
+- Fixed `MdkMemoryStorage::save_message` to reject oversized message content, serialized tags JSON, and serialized event JSON before caching messages, matching SQLite backend payload bounds. ([#257](https://github.com/marmot-protocol/mdk/pull/257))
 - Converted `processed_messages_cache`, `processed_welcomes_cache`, and all three `group_*_exporter_secrets_cache` fields from `LruCache` to `HashMap` to prevent silent eviction of security-critical deduplication records and decryption keys under cache pressure (fixes [marmot-security#12](https://github.com/marmot-protocol/marmot-security/issues/12)) ([#259](https://github.com/marmot-protocol/mdk/pull/259)).
 
 ### Removed
