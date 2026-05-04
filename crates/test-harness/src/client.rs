@@ -48,7 +48,7 @@ impl ClientBuilder {
         let engine = EngineBuilder::new(MemoryStorage::new())
             .identity(self.identity.clone())
             .feature_registry(self.registry)
-            .peeler(Box::new(MockPeeler))
+            .peeler(Box::new(MockPeeler::new(self.identity.clone())))
             .build()
             .expect("engine builds");
         let bus_id = bus.attach(MemberId::new(self.identity));

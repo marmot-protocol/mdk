@@ -8,9 +8,11 @@ Read [`README.md`](README.md) for the human framing. This file is the agent-faci
 |---|---|
 | `src/bus.rs` | `TransportBus` — in-memory bus. Owns delivery policy, the queue, partition state, and the address book that maps `MemberId → ClientId` (for welcome routing). |
 | `src/client.rs` | `HarnessClient` + `ClientBuilder`. Wraps an `Engine<MemoryStorage>` and the bus handle. `tick().await` drains pending inbound for one client. `confirm(pending).await` finishes a `GroupEvolution`. |
-| `src/peeler.rs` | `MockPeeler` — pass-through. Group messages and welcomes go through distinct methods (matches the real `TransportPeeler` four-method shape from spike-findings §1.3) but the body is just length-prefixed framing, no encryption. |
+| `src/peeler.rs` | `MockPeeler` — pass-through. Group messages and welcomes go through distinct methods (matches the real `TransportPeeler` four-method shape from spike-findings §1.3) but the body is just length-prefixed framing, no encryption. Transport ids/timestamps are deterministic per client so vector traces stay stable despite OpenMLS randomness. |
 | `src/proptest_support.rs` | `intent_seq(n_clients, range)` proptest strategy. Generates `HarnessIntent::Send` and `HarnessIntent::Leave`; `delivery_profile()` covers FIFO, reverse, and seeded-random delivery. |
+| `src/scenario.rs` | Serializable `ScenarioSpec` v1 plus `run_scenario_spec`. Drives ordered client operations from JSON-shaped scenario data and returns a `ScenarioTrace`. |
 | `src/vector.rs` | `ScenarioTrace` and observations. Records final epoch/member/payload facts plus `ForkRecoveryObservation` entries from `GroupEvent::ForkRecovered`. |
+| `vectors/` | External JSON `VectorFixture` files. Each fixture carries both input `scenario` and output `expected_trace`. |
 
 ## Bus model
 
@@ -47,7 +49,7 @@ These are tracked in [`../../plans/2026-04-22-cgka-engine-production-refactor-v1
 
 - **`HarnessIntent` does not generate Invite / UpgradeCapabilities / UpdateGroupData.** Invite needs client minting inside a strategy; the scripted tests cover it today.
 - **Partition policy is scripted, not strategy-driven.** The bus supports partitions; proptest currently drives FIFO / Reverse / SeededRandom.
-- **External vector files do not exist yet.** `ScenarioTrace` is serializable and includes recovery observations, but canonical traces are still embedded in Rust tests.
+- **Scheduled delivery faults do not exist yet.** `ScenarioSpec` covers deterministic scripted steps, but drop/duplicate/delay/reorder actions are still future Phase 3 work.
 
 ## Conventions
 

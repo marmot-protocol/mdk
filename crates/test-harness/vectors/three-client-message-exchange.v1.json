@@ -1,0 +1,115 @@
+{
+  "scenario_name": "three-client-message-exchange/v1",
+  "vector_version": "1",
+  "harness_version": "0.1.0",
+  "seed": null,
+  "scenario": {
+    "name": "three-client-message-exchange/v1",
+    "spec_version": "1",
+    "clients": [
+      "alice",
+      "bob",
+      "carol"
+    ],
+    "steps": [
+      {
+        "type": "create_group",
+        "creator": "alice",
+        "name": "vector-smoke",
+        "invitees": [
+          "bob",
+          "carol"
+        ],
+        "required_features": [],
+        "pending": "create"
+      },
+      {
+        "type": "confirm_pending",
+        "client": "alice",
+        "pending": "create"
+      },
+      {
+        "type": "deliver_all"
+      },
+      {
+        "type": "tick",
+        "clients": [
+          "bob",
+          "carol"
+        ]
+      },
+      {
+        "type": "send_app_message",
+        "sender": "alice",
+        "payload": "alice:hello"
+      },
+      {
+        "type": "send_app_message",
+        "sender": "bob",
+        "payload": "bob:hello"
+      },
+      {
+        "type": "send_app_message",
+        "sender": "carol",
+        "payload": "carol:hello"
+      },
+      {
+        "type": "deliver_all"
+      },
+      {
+        "type": "tick",
+        "clients": [
+          "alice",
+          "bob",
+          "carol"
+        ]
+      },
+      {
+        "type": "observe",
+        "clients": [
+          "alice",
+          "bob",
+          "carol"
+        ]
+      }
+    ]
+  },
+  "expected_trace": {
+    "name": "three-client-message-exchange/v1",
+    "observations": [
+      {
+        "client": "alice",
+        "epoch": 1,
+        "member_count": 3,
+        "received_payloads": [
+          "bob:hello",
+          "carol:hello"
+        ],
+        "removed_members": [],
+        "recoveries": []
+      },
+      {
+        "client": "bob",
+        "epoch": 1,
+        "member_count": 3,
+        "received_payloads": [
+          "alice:hello",
+          "carol:hello"
+        ],
+        "removed_members": [],
+        "recoveries": []
+      },
+      {
+        "client": "carol",
+        "epoch": 1,
+        "member_count": 3,
+        "received_payloads": [
+          "alice:hello",
+          "bob:hello"
+        ],
+        "removed_members": [],
+        "recoveries": []
+      }
+    ]
+  }
+}

@@ -50,11 +50,19 @@ Current trace surface:
 - `ForkRecoveryObservation` records source epoch, recovered epoch, winner
   ordering key, and invalidated ordering key.
 
-Current gaps:
+Current fixture coverage:
 
-- Canonical vectors live inside Rust tests.
-- There is no external fixture directory or fixture loader.
-- There is no input-side `ScenarioSpec`.
+- External JSON fixtures live in `crates/test-harness/vectors/`.
+- Each fixture includes a runnable `ScenarioSpec` input and expected
+  `ScenarioTrace` output.
+- `three-client-message-exchange/v1` is captured as a fixture.
+- `deliberate-fork-recovery/v1` is captured as a fixture and includes
+  `ForkRecoveryObservation`.
+- Fixture-loading tests regenerate both traces and compare them exactly.
+
+Current gaps after Phase 2:
+
+- Scheduled delivery faults are not fixture-visible yet.
 - Generated scenarios are proptest-only and do not produce reusable artifacts.
 - Partition behavior is scripted in one test and is not part of a generated
   delivery profile.
@@ -113,6 +121,8 @@ Add a Rust test that regenerates each fixture from the current harness and
 compares the trace exactly. Failure output must include the fixture name and
 the observed trace.
 
+Status: complete for the initial two fixtures.
+
 ### Phase 2 - Add a Minimal ScenarioSpec
 
 Add a serializable input contract for deterministic scripted scenarios.
@@ -131,6 +141,8 @@ The v1 shape should cover only what the current harness already does:
 - Optional partition allowlist and clear-partition actions.
 
 Keep `ScenarioTrace` as the v1 output contract.
+
+Status: complete for the current canonical fixture surface.
 
 ### Phase 3 - Add Scheduled Delivery Faults
 

@@ -4,9 +4,19 @@
 //! ids. They capture the deterministic observable outcome a conforming engine
 //! should produce after running the same scripted scenario.
 
-use crate::HarnessClient;
+use crate::{HarnessClient, ScenarioSpec};
 use cgka_traits::engine::{CommitOrderingKey, GroupEvent};
 use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VectorFixture {
+    pub scenario_name: String,
+    pub vector_version: String,
+    pub harness_version: String,
+    pub seed: Option<u64>,
+    pub scenario: ScenarioSpec,
+    pub expected_trace: ScenarioTrace,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScenarioTrace {

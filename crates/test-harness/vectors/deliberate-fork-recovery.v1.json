@@ -1,0 +1,126 @@
+{
+  "scenario_name": "deliberate-fork-recovery/v1",
+  "vector_version": "1",
+  "harness_version": "0.1.0",
+  "seed": null,
+  "scenario": {
+    "name": "deliberate-fork-recovery/v1",
+    "spec_version": "1",
+    "clients": [
+      "alice",
+      "bob",
+      "david",
+      "eve"
+    ],
+    "steps": [
+      {
+        "type": "create_group",
+        "creator": "alice",
+        "name": "fork",
+        "invitees": [
+          "bob"
+        ],
+        "required_features": [],
+        "pending": "create"
+      },
+      {
+        "type": "confirm_pending",
+        "client": "alice",
+        "pending": "create"
+      },
+      {
+        "type": "deliver_all"
+      },
+      {
+        "type": "tick",
+        "clients": [
+          "bob"
+        ]
+      },
+      {
+        "type": "set_partition",
+        "allow": [
+          "alice",
+          "bob"
+        ]
+      },
+      {
+        "type": "invite_members",
+        "inviter": "alice",
+        "invitees": [
+          "david"
+        ],
+        "pending": "alice-invite"
+      },
+      {
+        "type": "invite_members",
+        "inviter": "bob",
+        "invitees": [
+          "eve"
+        ],
+        "pending": "bob-invite"
+      },
+      {
+        "type": "confirm_pending",
+        "client": "alice",
+        "pending": "alice-invite"
+      },
+      {
+        "type": "confirm_pending",
+        "client": "bob",
+        "pending": "bob-invite"
+      },
+      {
+        "type": "deliver_all"
+      },
+      {
+        "type": "tick",
+        "clients": [
+          "alice",
+          "bob"
+        ]
+      },
+      {
+        "type": "observe",
+        "clients": [
+          "alice",
+          "bob"
+        ]
+      }
+    ]
+  },
+  "expected_trace": {
+    "name": "deliberate-fork-recovery/v1",
+    "observations": [
+      {
+        "client": "alice",
+        "epoch": 2,
+        "member_count": 3,
+        "received_payloads": [],
+        "removed_members": [],
+        "recoveries": [
+          {
+            "source_epoch": 1,
+            "recovered_epoch": 2,
+            "winner": {
+              "timestamp": 0,
+              "message_id": "4ff4b6081b5132f5"
+            },
+            "invalidated": {
+              "timestamp": 1,
+              "message_id": "7b167c93a3cd2417"
+            }
+          }
+        ]
+      },
+      {
+        "client": "bob",
+        "epoch": 2,
+        "member_count": 3,
+        "received_payloads": [],
+        "removed_members": [],
+        "recoveries": []
+      }
+    ]
+  }
+}

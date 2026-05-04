@@ -16,6 +16,7 @@ cgka-traits.workspace = true
 cgka-engine.workspace = true
 storage-memory.workspace = true
 serde = { workspace = true }
+serde_json.workspace = true
 async-trait.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }
 tracing.workspace = true

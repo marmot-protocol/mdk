@@ -8,7 +8,10 @@ use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
 use cgka_traits::engine::GroupEvent;
 use cgka_traits::types::MemberId;
-use test_harness::{ClientBuilder, ScenarioTrace, TransportBus, observe_client};
+use test_harness::{
+    ClientBuilder, ScenarioSpec, ScenarioStep, ScenarioTrace, TransportBus, VectorFixture,
+    observe_client, run_scenario_spec,
+};
 
 fn pad32(name: &[u8]) -> Vec<u8> {
     // MIP-01 admin pubkeys MUST be 32 bytes. Test identities get
@@ -171,6 +174,196 @@ async fn three_client_message_exchange_vector_is_stable() {
 }
 
 #[tokio::test]
+async fn scenario_spec_runs_three_client_message_exchange() {
+    let spec = ScenarioSpec {
+        name: "three-client-message-exchange/v1".into(),
+        spec_version: "1".into(),
+        clients: vec!["alice".into(), "bob".into(), "carol".into()],
+        steps: vec![
+            ScenarioStep::CreateGroup {
+                creator: "alice".into(),
+                name: "vector-smoke".into(),
+                invitees: vec!["bob".into(), "carol".into()],
+                required_features: vec![],
+                pending: "create".into(),
+            },
+            ScenarioStep::ConfirmPending {
+                client: "alice".into(),
+                pending: "create".into(),
+            },
+            ScenarioStep::DeliverAll,
+            ScenarioStep::Tick {
+                clients: vec!["bob".into(), "carol".into()],
+            },
+            ScenarioStep::SendAppMessage {
+                sender: "alice".into(),
+                payload: "alice:hello".into(),
+            },
+            ScenarioStep::SendAppMessage {
+                sender: "bob".into(),
+                payload: "bob:hello".into(),
+            },
+            ScenarioStep::SendAppMessage {
+                sender: "carol".into(),
+                payload: "carol:hello".into(),
+            },
+            ScenarioStep::DeliverAll,
+            ScenarioStep::Tick {
+                clients: vec!["alice".into(), "bob".into(), "carol".into()],
+            },
+            ScenarioStep::Observe {
+                clients: vec!["alice".into(), "bob".into(), "carol".into()],
+            },
+        ],
+    };
+
+    let trace = run_scenario_spec(&spec).await.expect("scenario runs");
+
+    assert_eq!(trace, three_client_message_exchange_trace().await);
+}
+
+#[tokio::test]
+async fn scenario_spec_supports_publish_fail() {
+    let spec = ScenarioSpec {
+        name: "publish-fail/v1".into(),
+        spec_version: "1".into(),
+        clients: vec!["alice".into(), "bob".into()],
+        steps: vec![
+            ScenarioStep::CreateGroup {
+                creator: "alice".into(),
+                name: "publish-fail".into(),
+                invitees: vec!["bob".into()],
+                required_features: vec![],
+                pending: "create".into(),
+            },
+            ScenarioStep::FailPending {
+                client: "alice".into(),
+                pending: "create".into(),
+            },
+            ScenarioStep::Observe {
+                clients: vec!["alice".into()],
+            },
+        ],
+    };
+
+    let trace = run_scenario_spec(&spec).await.expect("scenario runs");
+
+    assert_eq!(trace.observations[0].client, "alice");
+    assert_eq!(trace.observations[0].epoch, 0);
+    assert_eq!(trace.observations[0].member_count, 1);
+}
+
+#[tokio::test]
+async fn scenario_spec_supports_leave_and_clear_partition() {
+    let spec = ScenarioSpec {
+        name: "leave-and-clear-partition/v1".into(),
+        spec_version: "1".into(),
+        clients: vec!["alice".into(), "bob".into()],
+        steps: vec![
+            ScenarioStep::CreateGroup {
+                creator: "alice".into(),
+                name: "partition".into(),
+                invitees: vec!["bob".into()],
+                required_features: vec![],
+                pending: "create".into(),
+            },
+            ScenarioStep::ConfirmPending {
+                client: "alice".into(),
+                pending: "create".into(),
+            },
+            ScenarioStep::DeliverAll,
+            ScenarioStep::Tick {
+                clients: vec!["bob".into()],
+            },
+            ScenarioStep::SetPartition {
+                allow: vec!["bob".into()],
+            },
+            ScenarioStep::SendAppMessage {
+                sender: "bob".into(),
+                payload: "bob:hidden".into(),
+            },
+            ScenarioStep::DeliverAll,
+            ScenarioStep::Tick {
+                clients: vec!["alice".into()],
+            },
+            ScenarioStep::ClearPartition,
+            ScenarioStep::SendAppMessage {
+                sender: "bob".into(),
+                payload: "bob:visible".into(),
+            },
+            ScenarioStep::DeliverAll,
+            ScenarioStep::Tick {
+                clients: vec!["alice".into()],
+            },
+            ScenarioStep::Leave {
+                client: "bob".into(),
+            },
+            ScenarioStep::DeliverAll,
+            ScenarioStep::Tick {
+                clients: vec!["alice".into()],
+            },
+            ScenarioStep::DeliverAll,
+            ScenarioStep::Tick {
+                clients: vec!["bob".into()],
+            },
+            ScenarioStep::Observe {
+                clients: vec!["alice".into()],
+            },
+        ],
+    };
+
+    let trace = run_scenario_spec(&spec).await.expect("scenario runs");
+    let alice = &trace.observations[0];
+
+    assert_eq!(alice.client, "alice");
+    assert_eq!(alice.member_count, 1);
+    assert_eq!(alice.received_payloads, vec!["bob:visible"]);
+}
+
+async fn three_client_message_exchange_trace() -> ScenarioTrace {
+    let bus = TransportBus::ordered();
+    let mut alice = ClientBuilder::new(pad32(b"alice"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+    let mut bob = ClientBuilder::new(pad32(b"bob"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+    let mut carol = ClientBuilder::new(pad32(b"carol"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+
+    let bob_kp = bob.fresh_key_package().await;
+    let carol_kp = carol.fresh_key_package().await;
+    let (_gid, pending) = alice
+        .create_group("vector-smoke", vec![bob_kp, carol_kp], vec![])
+        .await;
+    alice.confirm(pending).await;
+    bus.deliver_all();
+    bob.tick().await;
+    carol.tick().await;
+    for client in [&mut alice, &mut bob, &mut carol] {
+        client.drain_events();
+    }
+
+    alice.send_app(b"alice:hello".to_vec()).await;
+    bob.send_app(b"bob:hello".to_vec()).await;
+    carol.send_app(b"carol:hello".to_vec()).await;
+    bus.deliver_all();
+    alice.tick().await;
+    bob.tick().await;
+    carol.tick().await;
+
+    ScenarioTrace {
+        name: "three-client-message-exchange/v1".into(),
+        observations: vec![
+            observe_client("alice", &mut alice),
+            observe_client("bob", &mut bob),
+            observe_client("carol", &mut carol),
+        ],
+    }
+}
+
+#[tokio::test]
 async fn add_then_self_remove_via_harness() {
     // Task 6.6 echo (post-§149) — alice creates with bob+carol; bob (non-
     // admin) leaves; alice (admin) auto-commits.
@@ -315,6 +508,56 @@ async fn deliberate_fork_via_harness() {
         .any(|m| m.id == MemberId::new(pad32(b"eve")));
     assert_ne!(has_david, has_eve);
     let _ = group_id;
+}
+
+#[tokio::test]
+async fn canonical_vector_fixtures_match_generated_traces() {
+    let fixtures = [
+        (
+            "three-client-message-exchange.v1.json",
+            include_str!("../vectors/three-client-message-exchange.v1.json"),
+        ),
+        (
+            "deliberate-fork-recovery.v1.json",
+            include_str!("../vectors/deliberate-fork-recovery.v1.json"),
+        ),
+    ];
+
+    for (fixture_name, contents) in fixtures {
+        let fixture: VectorFixture = serde_json::from_str(contents).expect("fixture JSON parses");
+        let observed_trace = run_scenario_spec(&fixture.scenario)
+            .await
+            .expect("fixture scenario runs");
+        assert_vector_fixture_matches(fixture_name, &fixture, observed_trace);
+    }
+}
+
+fn assert_vector_fixture_matches(
+    fixture_name: &str,
+    fixture: &VectorFixture,
+    observed_trace: ScenarioTrace,
+) {
+    assert_eq!(
+        fixture.harness_version,
+        env!("CARGO_PKG_VERSION"),
+        "fixture {fixture_name} has stale harness_version"
+    );
+    assert_eq!(
+        fixture.scenario_name, fixture.expected_trace.name,
+        "fixture {fixture_name} metadata scenario_name must match expected_trace.name"
+    );
+    assert_eq!(
+        fixture.scenario_name, fixture.scenario.name,
+        "fixture {fixture_name} metadata scenario_name must match scenario.name"
+    );
+    assert_eq!(
+        fixture.expected_trace,
+        observed_trace,
+        "fixture {fixture_name} mismatch\nseed: {:?}\nexpected trace:\n{}\nobserved trace:\n{}",
+        fixture.seed,
+        serde_json::to_string_pretty(&fixture.expected_trace).expect("expected trace JSON"),
+        serde_json::to_string_pretty(&observed_trace).expect("observed trace JSON"),
+    );
 }
 
 #[tokio::test]

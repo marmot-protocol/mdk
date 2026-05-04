@@ -18,12 +18,14 @@ pub mod bus;
 pub mod client;
 pub mod peeler;
 pub mod proptest_support;
+pub mod scenario;
 pub mod vector;
 
 pub use bus::{ClientId, DeliveryPolicy, TransportBus};
 pub use client::{ClientBuilder, HarnessClient};
 pub use peeler::MockPeeler;
+pub use scenario::{ScenarioRunError, ScenarioSpec, ScenarioStep, run_scenario_spec};
 pub use vector::{
     ClientObservation, ForkRecoveryObservation, RecoveryOrderingKeyObservation, ScenarioTrace,
-    observe_client,
+    VectorFixture, observe_client,
 };

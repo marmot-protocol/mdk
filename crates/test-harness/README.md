@@ -19,6 +19,45 @@ cargo test -p test-harness
 cargo test -p test-harness --features harness-slow
 ```
 
+## Canonical vector fixtures
+
+Canonical conformance fixtures live in [`vectors/`](vectors/). Each file is a
+JSON `VectorFixture` envelope:
+
+- `scenario_name` — stable logical scenario id, currently including `/v1`.
+- `vector_version` — fixture schema version, currently `"1"`.
+- `harness_version` — `test-harness` crate version that produced the fixture.
+- `seed` — `null` for hand-authored deterministic scenarios.
+- `scenario` — the input-side `ScenarioSpec` to execute.
+- `expected_trace` — the `ScenarioTrace` a conforming implementation must
+  produce.
+
+Non-Rust implementations should read the JSON file, run the named scenario
+from `scenario`, serialize their observed trace into the same shape, and
+compare `expected_trace` by value. The trace intentionally avoids OpenMLS
+internals, but it does include `ForkRecoveryObservation` entries so an
+implementation that reaches the same final membership through a different
+recovery path fails the vector.
+
+`ScenarioSpec` v1 contains ordered client labels and ordered steps. Supported
+steps are:
+
+- `create_group`
+- `invite_members`
+- `confirm_pending`
+- `fail_pending`
+- `send_app_message`
+- `leave`
+- `deliver_all`
+- `tick`
+- `observe`
+- `set_partition`
+- `clear_partition`
+
+Pending operations are referenced by string labels chosen inside the scenario.
+Client labels are stable logical names; the Rust harness maps them to padded
+32-byte test identities.
+
 ## When to use the harness vs. integration tests
 
 | Question | Where to put the test |
