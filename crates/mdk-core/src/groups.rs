@@ -25,6 +25,9 @@ use tls_codec::Serialize as TlsSerialize;
 
 use sha2::{Digest, Sha256};
 
+mod openmls_compat;
+
+use self::openmls_compat::exported_leaf_capabilities;
 use super::MDK;
 use super::extension::NostrGroupDataExtension;
 use crate::constant::{GROUP_CONTEXT_REQUIRED_EXTENSIONS, SUPPORTED_PROPOSALS};
@@ -620,15 +623,20 @@ where
     ) -> Result<Vec<MemberCapabilities>, Error> {
         let group = self.load_mls_group(group_id)?.ok_or(Error::GroupNotFound)?;
         let group_data = NostrGroupDataExtension::from_group(&group)?;
+        let capabilities_by_leaf = exported_leaf_capabilities(&group)?;
         group
-            .treesync()
-            .full_leaves()
-            .map(|(_, leaf)| {
-                let member = self.pubkey_for_leaf_node(leaf)?;
-                let capabilities = leaf.capabilities();
+            .members()
+            .map(|member| {
+                let public_key = self.pubkey_for_member(&member)?;
+                let capabilities = capabilities_by_leaf.get(&member.index).ok_or_else(|| {
+                    Error::Group(format!(
+                        "missing capabilities for leaf index {}",
+                        member.index.u32()
+                    ))
+                })?;
                 Ok(MemberCapabilities {
-                    is_admin: group_data.admins.contains(&member),
-                    member,
+                    is_admin: group_data.admins.contains(&public_key),
+                    member: public_key,
                     proposals: capabilities.proposals().iter().copied().collect(),
                     extensions: capabilities.extensions().iter().copied().collect(),
                     ciphersuites: capabilities.ciphersuites().to_vec(),
@@ -642,11 +650,13 @@ where
         group: &MlsGroup,
         proposal: ProposalType,
     ) -> Result<Vec<PublicKey>, Error> {
+        let capabilities_by_leaf = exported_leaf_capabilities(group)?;
         group
-            .treesync()
-            .full_leaves()
-            .filter(|(_, leaf)| !leaf.capabilities().proposals().contains(&proposal))
-            .map(|(_, leaf)| self.pubkey_for_leaf_node(leaf))
+            .members()
+            .filter_map(|member| match capabilities_by_leaf.get(&member.index) {
+                Some(capabilities) if capabilities.proposals().contains(&proposal) => None,
+                _ => Some(self.pubkey_for_member(&member)),
+            })
             .collect()
     }
 
