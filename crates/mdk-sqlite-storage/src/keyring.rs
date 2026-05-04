@@ -48,6 +48,7 @@ use crate::error::Error;
 /// simultaneously, only one will generate and store it.
 static KEY_GENERATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
+// v1 stores the raw 32-byte SQLCipher key as RFC 4648 base64.
 const DB_KEY_KEYRING_PREFIX: &str = "mdk-sqlite-key-v1:";
 
 enum DecodedDbKey {
@@ -59,6 +60,8 @@ fn encode_db_key_for_keyring(config: &EncryptionConfig) -> Vec<u8> {
     format!("{DB_KEY_KEYRING_PREFIX}{}", BASE64.encode(config.key())).into_bytes()
 }
 
+/// Decode current prefixed payloads first; non-UTF-8 payloads and UTF-8 payloads
+/// without the prefix are both handled by the legacy raw-key path.
 fn decode_db_key_from_keyring(secret: &[u8]) -> Result<DecodedDbKey, Error> {
     match std::str::from_utf8(secret) {
         Ok(secret_text) => match secret_text.strip_prefix(DB_KEY_KEYRING_PREFIX) {
@@ -96,7 +99,7 @@ fn decode_legacy_db_key(secret: &[u8]) -> Result<DecodedDbKey, Error> {
     }
 }
 
-fn store_db_key(entry: &Entry, config: &EncryptionConfig) -> Result<(), Error> {
+fn save_db_key(entry: &Entry, config: &EncryptionConfig) -> Result<(), Error> {
     let payload = encode_db_key_for_keyring(config);
     entry.set_secret(&payload).map_err(|e| match e {
         KeyringError::NoStorageAccess(err) => Error::KeyringNotInitialized(err.to_string()),
@@ -180,7 +183,7 @@ pub fn get_or_create_db_key(service_id: &str, db_key_id: &str) -> Result<Encrypt
         ))
     })?;
 
-    store_db_key(&entry, &config)?;
+    save_db_key(&entry, &config)?;
 
     Ok(config)
 }
@@ -214,7 +217,7 @@ pub fn get_db_key(service_id: &str, db_key_id: &str) -> Result<Option<Encryption
             let config = match decode_db_key_from_keyring(&secret)? {
                 DecodedDbKey::Current(config) => config,
                 DecodedDbKey::LegacyRaw(config) => {
-                    if let Err(e) = store_db_key(&entry, &config) {
+                    if let Err(e) = save_db_key(&entry, &config) {
                         tracing::warn!(
                             error = %e,
                             "Failed to migrate legacy database encryption key to encoded keyring payload"
@@ -370,6 +373,10 @@ mod tests {
         let stored_payload_text = str::from_utf8(&stored_payload).unwrap();
         assert_ne!(stored_payload.as_slice(), &legacy_key);
         assert!(stored_payload_text.starts_with(DB_KEY_KEYRING_PREFIX));
+
+        let migrated = get_db_key(service_id, db_key_id).unwrap().unwrap();
+        assert_eq!(migrated.key(), &legacy_key);
+        assert_eq!(entry.get_secret().unwrap(), stored_payload);
 
         delete_db_key(service_id, db_key_id).unwrap();
     }
@@ -592,7 +599,7 @@ mod tests {
         // Clean up any existing key
         let _ = delete_db_key(service_id, db_key_id);
 
-        // Manually store an invalid key (wrong length) in the keyring
+        // Manually store an invalid legacy payload with no prefix and the wrong length.
         let entry = Entry::new(service_id, db_key_id).unwrap();
         entry.set_secret(b"short_key").unwrap(); // Only 9 bytes, not 32
 
@@ -609,7 +616,7 @@ mod tests {
     }
 
     #[test]
-    fn test_get_db_key_with_invalid_key_in_keyring_returns_error() {
+    fn test_get_db_key_with_invalid_legacy_key_length_returns_error() {
         ensure_mock_store();
 
         let service_id = "test.mdk.storage.invalidget";
@@ -618,11 +625,9 @@ mod tests {
         // Clean up any existing key
         let _ = delete_db_key(service_id, db_key_id);
 
-        // Manually store an invalid key (wrong length) in the keyring
+        // Manually store an invalid legacy payload with no prefix and the wrong length.
         let entry = Entry::new(service_id, db_key_id).unwrap();
-        entry
-            .set_secret(b"this_is_too_long_a_key_for_our_32_byte_requirement")
-            .unwrap();
+        entry.set_secret(&[0x42u8; 33]).unwrap();
 
         // get_db_key should fail because the stored key is invalid
         let result = get_db_key(service_id, db_key_id);
