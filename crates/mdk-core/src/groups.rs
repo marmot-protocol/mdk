@@ -628,12 +628,9 @@ where
             .members()
             .map(|member| {
                 let public_key = self.pubkey_for_member(&member)?;
-                let capabilities = capabilities_by_leaf.get(&member.index).ok_or_else(|| {
-                    Error::Group(format!(
-                        "missing capabilities for leaf index {}",
-                        member.index.u32()
-                    ))
-                })?;
+                let capabilities = capabilities_by_leaf
+                    .get(&member.index)
+                    .ok_or_else(|| missing_leaf_capabilities_error(member.index.u32()))?;
                 Ok(MemberCapabilities {
                     is_admin: group_data.admins.contains(&public_key),
                     member: public_key,
@@ -653,11 +650,17 @@ where
         let capabilities_by_leaf = exported_leaf_capabilities(group)?;
         group
             .members()
-            .filter_map(|member| match capabilities_by_leaf.get(&member.index) {
-                Some(capabilities) if capabilities.proposals().contains(&proposal) => None,
-                _ => Some(self.pubkey_for_member(&member)),
+            .try_fold(Vec::new(), |mut blockers, member| {
+                let capabilities = capabilities_by_leaf
+                    .get(&member.index)
+                    .ok_or_else(|| missing_leaf_capabilities_error(member.index.u32()))?;
+
+                if !capabilities.proposals().contains(&proposal) {
+                    blockers.push(self.pubkey_for_member(&member)?);
+                }
+
+                Ok(blockers)
             })
-            .collect()
     }
 
     /// Returns per-proposal upgrade readiness for the group's
@@ -2429,6 +2432,10 @@ where
 
         Ok(welcome_rumors)
     }
+}
+
+fn missing_leaf_capabilities_error(leaf_index: u32) -> Error {
+    Error::Group(format!("missing capabilities for leaf index {leaf_index}"))
 }
 
 #[cfg(test)]
