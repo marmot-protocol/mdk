@@ -3,6 +3,7 @@ name: Publish to crates.io
 on:
   release:
     types: [published]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -11,6 +12,27 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  publish-macros:
+    runs-on: ubuntu-latest
+    name: Publish mdk-macros
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Rust (stable)
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Cache Rust dependencies
+      uses: Swatinem/rust-cache@v2
+      with:
+        key: publish-macros
+
+    - name: Publish mdk-macros
+      run: cargo publish -p mdk-macros
+      env:
+        CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
   publish-storage-traits:
     runs-on: ubuntu-latest
     name: Publish mdk-storage-traits
@@ -92,7 +114,7 @@ jobs:
         CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
   publish-core:
-    needs: [publish-memory-storage, publish-sqlite-storage]
+    needs: [publish-macros, publish-memory-storage, publish-sqlite-storage]
     runs-on: ubuntu-latest
     name: Publish mdk-core
 
