@@ -1928,6 +1928,7 @@ dependencies = [
 name = "mdk-sqlite-storage"
 version = "0.7.1"
 dependencies = [
+ "base64",
  "getrandom 0.4.2",
  "hex",
  "keyring-core",

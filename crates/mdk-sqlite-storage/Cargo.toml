@@ -17,6 +17,7 @@ default = []
 test-utils = []
 
 [dependencies]
+base64.workspace = true
 getrandom.workspace = true
 hex = { workspace = true, features = ["std"] }
 keyring-core.workspace = true

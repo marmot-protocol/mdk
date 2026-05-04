@@ -35,6 +35,8 @@
 
 use std::sync::{Mutex, OnceLock};
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use keyring_core::{Entry, Error as KeyringError};
 
 use crate::encryption::EncryptionConfig;
@@ -46,10 +48,73 @@ use crate::error::Error;
 /// simultaneously, only one will generate and store it.
 static KEY_GENERATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
+const DB_KEY_KEYRING_PREFIX: &str = "mdk-sqlite-key-v1:";
+
+enum DecodedDbKey {
+    Current(EncryptionConfig),
+    LegacyRaw(EncryptionConfig),
+}
+
+fn encode_db_key_for_keyring(config: &EncryptionConfig) -> Vec<u8> {
+    format!("{DB_KEY_KEYRING_PREFIX}{}", BASE64.encode(config.key())).into_bytes()
+}
+
+fn decode_db_key_from_keyring(secret: &[u8]) -> Result<DecodedDbKey, Error> {
+    match std::str::from_utf8(secret) {
+        Ok(secret_text) => match secret_text.strip_prefix(DB_KEY_KEYRING_PREFIX) {
+            Some(encoded_key) => decode_current_db_key(encoded_key),
+            None => decode_legacy_db_key(secret),
+        },
+        Err(_) => decode_legacy_db_key(secret),
+    }
+}
+
+fn decode_current_db_key(encoded_key: &str) -> Result<DecodedDbKey, Error> {
+    let key = BASE64.decode(encoded_key).map_err(|_| {
+        Error::Keyring("Stored key has invalid encoded keyring payload".to_string())
+    })?;
+    let config = EncryptionConfig::from_slice(&key).map_err(|e| {
+        Error::Keyring(format!(
+            "Stored key has invalid length after decoding encoded keyring payload: {}",
+            e
+        ))
+    })?;
+    Ok(DecodedDbKey::Current(config))
+}
+
+fn decode_legacy_db_key(secret: &[u8]) -> Result<DecodedDbKey, Error> {
+    match secret.len() {
+        32 => {
+            let config = EncryptionConfig::from_slice(secret)
+                .map_err(|e| Error::Keyring(format!("Stored key has invalid length: {}", e)))?;
+            Ok(DecodedDbKey::LegacyRaw(config))
+        }
+        len => Err(Error::Keyring(format!(
+            "Stored key has invalid length (expected encoded keyring payload or 32-byte legacy key, got {} bytes)",
+            len
+        ))),
+    }
+}
+
+fn store_db_key(entry: &Entry, config: &EncryptionConfig) -> Result<(), Error> {
+    let payload = encode_db_key_for_keyring(config);
+    entry.set_secret(&payload).map_err(|e| match e {
+        KeyringError::NoStorageAccess(err) => Error::KeyringNotInitialized(err.to_string()),
+        other => Error::Keyring(format!(
+            "Failed to store encryption key in keyring: {}",
+            other
+        )),
+    })
+}
+
 /// Gets an existing database encryption key or generates and stores a new one.
 ///
 /// This function uses the `keyring-core` API to securely store encryption keys
 /// in the platform's native credential store (Keychain, Keystore, etc.).
+/// New keys are stored as UTF-8-safe, version-prefixed base64 payloads. Existing
+/// raw 32-byte keyring payloads are still accepted and migrated after a successful
+/// read. If that legacy rewrite fails, the existing key is returned and the
+/// migration failure is logged so callers are not locked out of readable databases.
 ///
 /// # Arguments
 ///
@@ -115,13 +180,7 @@ pub fn get_or_create_db_key(service_id: &str, db_key_id: &str) -> Result<Encrypt
         ))
     })?;
 
-    entry.set_secret(config.key()).map_err(|e| match e {
-        KeyringError::NoStorageAccess(err) => Error::KeyringNotInitialized(err.to_string()),
-        other => Error::Keyring(format!(
-            "Failed to store encryption key in keyring: {}",
-            other
-        )),
-    })?;
+    store_db_key(&entry, &config)?;
 
     Ok(config)
 }
@@ -152,12 +211,18 @@ pub fn get_db_key(service_id: &str, db_key_id: &str) -> Result<Option<Encryption
     match entry.get_secret() {
         Ok(secret) => {
             // Key exists, validate and return it
-            let config = EncryptionConfig::from_slice(&secret).map_err(|e| {
-                Error::Keyring(format!(
-                    "Stored key has invalid length (expected 32 bytes): {}",
-                    e
-                ))
-            })?;
+            let config = match decode_db_key_from_keyring(&secret)? {
+                DecodedDbKey::Current(config) => config,
+                DecodedDbKey::LegacyRaw(config) => {
+                    if let Err(e) = store_db_key(&entry, &config) {
+                        tracing::warn!(
+                            error = %e,
+                            "Failed to migrate legacy database encryption key to encoded keyring payload"
+                        );
+                    }
+                    config
+                }
+            };
             Ok(Some(config))
         }
         Err(KeyringError::NoEntry) => Ok(None),
@@ -221,10 +286,17 @@ pub fn delete_db_key(service_id: &str, db_key_id: &str) -> Result<(), Error> {
 
 #[cfg(test)]
 mod tests {
-    use std::thread;
+    use std::{str, thread};
+
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD as BASE64;
 
     use super::*;
     use crate::test_utils::ensure_mock_store;
+
+    fn encoded_payload_for_key(key: &[u8; 32]) -> Vec<u8> {
+        format!("{DB_KEY_KEYRING_PREFIX}{}", BASE64.encode(key)).into_bytes()
+    }
 
     #[test]
     fn test_get_or_create_generates_key_if_missing() {
@@ -240,12 +312,113 @@ mod tests {
         let config1 = get_or_create_db_key(service_id, db_key_id).unwrap();
         assert_eq!(config1.key().len(), 32);
 
+        let stored_payload = Entry::new(service_id, db_key_id)
+            .unwrap()
+            .get_secret()
+            .unwrap();
+        let stored_payload_text = str::from_utf8(&stored_payload).unwrap();
+        assert_ne!(stored_payload.as_slice(), config1.key());
+        assert_ne!(stored_payload.len(), 32);
+        assert!(stored_payload_text.starts_with(DB_KEY_KEYRING_PREFIX));
+
         // Calling again should return the same key
         let config2 = get_or_create_db_key(service_id, db_key_id).unwrap();
         assert_eq!(config1.key(), config2.key());
 
         // Clean up
         delete_db_key(service_id, db_key_id).unwrap();
+    }
+
+    #[test]
+    fn test_get_db_key_reads_encoded_keyring_payload() {
+        ensure_mock_store();
+
+        let service_id = "test.mdk.storage.encoded";
+        let db_key_id = "test.key.encoded";
+        let config = EncryptionConfig::new([0x42u8; 32]);
+
+        let _ = delete_db_key(service_id, db_key_id);
+
+        let entry = Entry::new(service_id, db_key_id).unwrap();
+        entry
+            .set_secret(&encoded_payload_for_key(config.key()))
+            .unwrap();
+
+        let retrieved = get_db_key(service_id, db_key_id).unwrap().unwrap();
+        assert_eq!(retrieved.key(), config.key());
+
+        delete_db_key(service_id, db_key_id).unwrap();
+    }
+
+    #[test]
+    fn test_get_db_key_migrates_legacy_raw_keyring_payload() {
+        ensure_mock_store();
+
+        let service_id = "test.mdk.storage.legacy";
+        let db_key_id = "test.key.legacy";
+        let legacy_key = [0x7bu8; 32];
+
+        let _ = delete_db_key(service_id, db_key_id);
+
+        let entry = Entry::new(service_id, db_key_id).unwrap();
+        entry.set_secret(&legacy_key).unwrap();
+
+        let retrieved = get_db_key(service_id, db_key_id).unwrap().unwrap();
+        assert_eq!(retrieved.key(), &legacy_key);
+
+        let stored_payload = entry.get_secret().unwrap();
+        let stored_payload_text = str::from_utf8(&stored_payload).unwrap();
+        assert_ne!(stored_payload.as_slice(), &legacy_key);
+        assert!(stored_payload_text.starts_with(DB_KEY_KEYRING_PREFIX));
+
+        delete_db_key(service_id, db_key_id).unwrap();
+    }
+
+    #[test]
+    fn test_get_or_create_with_invalid_encoded_payload_returns_error_without_replacement() {
+        ensure_mock_store();
+
+        let service_id = "test.mdk.storage.invalidencoded";
+        let db_key_id = "test.key.invalidencoded";
+        let invalid_payload = b"mdk-sqlite-key-v1:not-valid-base64!!!";
+
+        let _ = delete_db_key(service_id, db_key_id);
+
+        let entry = Entry::new(service_id, db_key_id).unwrap();
+        entry.set_secret(invalid_payload).unwrap();
+
+        let result = get_or_create_db_key(service_id, db_key_id);
+        assert!(
+            result.is_err(),
+            "Should fail when keyring contains invalid encoded key"
+        );
+        assert!(result.unwrap_err().to_string().contains("encoded"));
+        assert_eq!(entry.get_secret().unwrap(), invalid_payload);
+
+        let _ = delete_db_key(service_id, db_key_id);
+    }
+
+    #[test]
+    fn test_get_db_key_with_invalid_encoded_key_length_returns_error() {
+        ensure_mock_store();
+
+        let service_id = "test.mdk.storage.invalidencodedlength";
+        let db_key_id = "test.key.invalidencodedlength";
+        let invalid_payload = format!("{DB_KEY_KEYRING_PREFIX}{}", BASE64.encode([0x9au8; 31]));
+
+        let _ = delete_db_key(service_id, db_key_id);
+
+        let entry = Entry::new(service_id, db_key_id).unwrap();
+        entry.set_secret(invalid_payload.as_bytes()).unwrap();
+
+        let result = get_db_key(service_id, db_key_id);
+        assert!(
+            result.is_err(),
+            "Should fail when encoded keyring payload decodes to wrong length"
+        );
+        assert!(result.unwrap_err().to_string().contains("invalid length"));
+
+        let _ = delete_db_key(service_id, db_key_id);
     }
 
     #[test]
