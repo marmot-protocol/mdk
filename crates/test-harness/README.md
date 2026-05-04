@@ -6,6 +6,10 @@ In-process multi-client simulator for the CGKA engine. Lets us replay scripted s
 
 - `TransportBus` — an in-memory message bus with seeded scheduling, partition support, broadcast and addressed delivery (for welcomes), and replay hooks.
 - `HarnessClient` — wraps `Engine<MemoryStorage>` + a `MockPeeler` (skips encryption so tests can assert on inner payloads directly).
+- `ScenarioSpec` — a serializable v1 input contract for deterministic scripted scenarios, including explicit queue faults and partitions.
+- `VectorFixture` — portable JSON fixtures pairing runnable scenario input with expected `ScenarioTrace` output.
+- `ScenarioReport` — serializable run artifacts with metadata, expected/observed traces, step logs, recoveries, and invariant failures.
+- `harness-report` — a small CLI that runs generated `send-leave/v1` cases and writes JSON reports.
 - `proptest_support` — strategies that generate arbitrary typed `SendIntent` sequences for property-based tests.
 - `MockPeeler` — a deliberately trivial `TransportPeeler` impl. Distinguishes the group-message vs welcome paths but performs no encryption.
 
@@ -123,5 +127,7 @@ Reports are written as one file per case, for example
 | "Do N engines converge under FIFO delivery?" | `test-harness/tests/canonical_scenarios.rs` |
 | "Does this hold for *any* sequence of N intents?" | `test-harness/tests/proptest_invariants.rs` |
 | "What happens under reorder / partition / replay?" | New scripted scenario; consider extending the proptest strategies once the case is concrete |
+| "Can another implementation reproduce this behavior?" | Add or update a JSON fixture in `vectors/` |
+| "Do generated scenarios produce useful artifacts?" | Run `cargo run -p test-harness --bin harness-report -- ...` |
 
 See [`AGENTS.md`](AGENTS.md) for the agent-facing map (bus model, scheduler policies, how to add a scenario).

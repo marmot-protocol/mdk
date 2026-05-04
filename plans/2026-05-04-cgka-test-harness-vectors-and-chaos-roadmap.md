@@ -222,7 +222,7 @@ the in-process harness remains the reference conformance layer.
 
 - `ScenarioTrace` remains the v1 output contract.
 - JSON is the fixture format for v1.
-- `ScenarioSpec` is the future input contract.
+- `ScenarioSpec` is the v1 input contract.
 - Seeded chaos must be replayable from fixture metadata.
 - Quick CI runs fixed fixtures and small generated suites.
 - Slow CI runs larger generated suites behind an explicit feature or command.

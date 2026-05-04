@@ -41,7 +41,7 @@ cargo test -p cgka-engine
 
 | File | Owns |
 |---|---|
-| `canonical_scenarios.rs` | Phase 6.4–6.7 scripted: 3-client happy path, welcome-before-commit, SelfRemove convergence, deliberate fork with recovery observation |
+| `canonical_scenarios.rs` | Scripted + portable harness scenarios: 3-client happy path, welcome-before-commit, SelfRemove convergence, deliberate fork with recovery observation, `ScenarioSpec`, vector fixtures, scheduled faults, generated-family reports |
 | `proptest_invariants.rs` | Phase 6.9 — convergence + event conservation under random `SendIntent` sequences |
 
 Quick CI run (24 proptest cases, ~1 s):
@@ -69,6 +69,7 @@ Expected today: 100 passing, 0 failing.
 - New capability requirement type → extend `tests/capabilities.rs`; the matrix is partial today (`Required/Optional/TransportRequired` × coverage × member-count), parametrize when adding rows.
 - New MIP-03 rule → add to `tests/mip03_guards.rs`. These tests assert at the engine boundary, not via the harness.
 - Multi-client convergence question → harness scenario in `crates/test-harness/tests/canonical_scenarios.rs`. If it should hold for *any* sequence of intents, encode as a proptest in `proptest_invariants.rs`.
+- Cross-implementation or reportable scenario → prefer `ScenarioSpec` / JSON fixtures in `crates/test-harness/vectors/`, and use `harness-report` for generated report artifacts.
 
 ## Why no in-crate `#[cfg(test)]` modules
 

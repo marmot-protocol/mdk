@@ -36,12 +36,33 @@ before delivery by zero-based queue index: `drop_queued`, `duplicate_queued`,
 
 ## How to add a new scripted scenario
 
-1. New file or test fn in `tests/canonical_scenarios.rs`.
-2. Build N clients with `ClientBuilder::new(pad32(b"alice")).registry(registry()).attach(&bus)`.
-3. Drive the scenario with `client.send_*` / `bus.deliver_all()` / `client.tick().await`.
-4. Assert on `client.epoch()`, `client.members()`, or `observe_client(...)` when the scenario should become a portable trace.
+1. Prefer a `ScenarioSpec` when the case should become portable or reportable.
+2. For narrow engine-harness behavior, add a test fn in `tests/canonical_scenarios.rs`.
+3. Build N clients with `ClientBuilder::new(pad32(b"alice")).registry(registry()).attach(&bus)` only when the test needs lower-level harness control.
+4. Drive manual scenarios with `client.send_*` / `bus.deliver_all()` / `client.tick().await`.
+5. Assert on `client.epoch()`, `client.members()`, `observe_client(...)`, or `run_scenario_report(...)` depending on the test surface.
 
 Look at `three_client_happy_path_via_harness` for the canonical shape.
+
+## How to add or update a vector fixture
+
+1. Encode the runnable input as `ScenarioSpec` JSON in `vectors/*.json`.
+2. Include `scenario_name`, `vector_version`, `harness_version`, `seed`, `scenario`, and `expected_trace`.
+3. Keep `ScenarioTrace` free of MLS bytes and Rust-only internals.
+4. Make recovery behavior observable through `ForkRecoveryObservation`, not just final membership.
+5. Run `cargo test -p test-harness canonical_vector_fixtures_match_generated_traces`.
+
+## How to run generated reports
+
+Use the CLI when you want JSON artifacts:
+
+```sh
+cargo run -p test-harness --bin harness-report -- \
+  --family send-leave/v1 \
+  --seed 42 \
+  --cases 10 \
+  --out target/harness-reports
+```
 
 ## How to add a new proptest invariant
 
@@ -52,7 +73,7 @@ Look at `three_client_happy_path_via_harness` for the canonical shape.
 
 ## Coverage gaps
 
-These are tracked in [`../../plans/2026-04-22-cgka-engine-production-refactor-v1.md`](../../plans/2026-04-22-cgka-engine-production-refactor-v1.md). If you're filling one of these in, update the plan's status row in the same change.
+These are tracked in [`../../plans/2026-05-04-cgka-test-harness-vectors-and-chaos-roadmap.md`](../../plans/2026-05-04-cgka-test-harness-vectors-and-chaos-roadmap.md). If you're filling one of these in, update the plan's status row in the same change.
 
 - **`HarnessIntent` does not generate Invite / UpgradeCapabilities / UpdateGroupData.** Invite needs client minting inside a strategy; the scripted tests cover it today.
 - **Partition policy is scripted, not strategy-driven.** The bus supports partitions; proptest currently drives FIFO / Reverse / SeededRandom.
