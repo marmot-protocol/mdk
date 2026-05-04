@@ -23,10 +23,10 @@ mdk-macros = { version = "0.8.0", path = "./crates/mdk-macros" }
 # All four crates must move in lockstep on the same rev.
 # Do not move to upstream tip until openmls #1972's MessageSecretsStore
 # shape has a postcard-compatible storage path, or MDK migrates codecs.
-openmls = { git = "https://github.com/openmls/openmls", rev = "04c50d7fb12d52f4f9aee26de5f5234f3df29fa8", default-features = false }
-openmls_traits = { git = "https://github.com/openmls/openmls", rev = "04c50d7fb12d52f4f9aee26de5f5234f3df29fa8", default-features = false }
-openmls_basic_credential = { git = "https://github.com/openmls/openmls", rev = "04c50d7fb12d52f4f9aee26de5f5234f3df29fa8", default-features = false }
-openmls_rust_crypto = { git = "https://github.com/openmls/openmls", rev = "04c50d7fb12d52f4f9aee26de5f5234f3df29fa8", default-features = false }
+openmls = { version = "0.8.1", git = "https://github.com/openmls/openmls", rev = "04c50d7fb12d52f4f9aee26de5f5234f3df29fa8", default-features = false }
+openmls_traits = { version = "0.5.0", git = "https://github.com/openmls/openmls", rev = "04c50d7fb12d52f4f9aee26de5f5234f3df29fa8", default-features = false }
+openmls_basic_credential = { version = "0.5.0", git = "https://github.com/openmls/openmls", rev = "04c50d7fb12d52f4f9aee26de5f5234f3df29fa8", default-features = false }
+openmls_rust_crypto = { version = "0.5.1", git = "https://github.com/openmls/openmls", rev = "04c50d7fb12d52f4f9aee26de5f5234f3df29fa8", default-features = false }
 
 # Nostr
 nostr = { version = "0.44", default-features = false }
