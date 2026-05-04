@@ -31,6 +31,8 @@
 
 ### Fixed
 
+- Fixed `mdk-core` crates.io package verification against OpenMLS 0.8.1 by using a temporary exported-ratchet-tree compatibility shim until crates.io OpenMLS exposes the upstream full-leaf iterator. ([#273](https://github.com/marmot-protocol/mdk/pull/273))
+
 ### Removed
 
 ### Deprecated
