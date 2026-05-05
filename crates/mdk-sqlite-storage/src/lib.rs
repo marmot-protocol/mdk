@@ -258,6 +258,20 @@ pub struct MdkSqliteStorage {
     connection: Arc<Mutex<Connection>>,
 }
 
+fn remove_precreated_database_file(file_path: &Path) {
+    match std::fs::remove_file(file_path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            tracing::warn!(
+                db_path = %file_path.display(),
+                error = %e,
+                "Failed to remove precreated database file after keyring rotation failure"
+            );
+        }
+    }
+}
+
 macro_rules! snapshot_helper {
     (
             $fn_name:ident,
@@ -362,9 +376,15 @@ impl MdkSqliteStorage {
     ///
     /// # Key Management
     ///
-    /// - If no key exists for the given identifiers, a new 32-byte key is generated using
-    ///   cryptographically secure randomness and stored in the keyring.
-    /// - On subsequent calls with the same identifiers, the existing key is retrieved.
+    /// - If the database file is newly created, any pre-existing keyring entry for
+    ///   the given identifiers is replaced before database initialization. This
+    ///   ensures app reinstall or data-wipe flows start with a fresh key and do
+    ///   not reuse key material from a previous database lifecycle.
+    /// - If no key exists for a new database file or special SQLite path, a new
+    ///   32-byte key is generated using cryptographically secure randomness and
+    ///   stored in the keyring.
+    /// - On subsequent calls for an existing database, the existing key is
+    ///   retrieved. A missing key for an existing encrypted database is an error.
     ///
     /// # Errors
     ///
@@ -405,7 +425,13 @@ impl MdkSqliteStorage {
                 // We created the file, so this is a new database lifecycle.
                 // Replace any stale keyring value left behind by an app reinstall
                 // or host-level data wipe before writing the new encrypted database.
-                keyring::create_fresh_db_key(service_id, db_key_id)?
+                match keyring::create_fresh_db_key(service_id, db_key_id) {
+                    Ok(config) => config,
+                    Err(e) => {
+                        remove_precreated_database_file(file_path);
+                        return Err(e);
+                    }
+                }
             }
             FileCreationOutcome::Skipped => {
                 // Special paths like :memory: do not have a file lifecycle to compare
@@ -2125,6 +2151,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         use std::thread;
 
+        use keyring_core::{Entry, Error as KeyringError};
         use mdk_storage_traits::Secret;
         use mdk_storage_traits::groups::GroupStorage;
         use mdk_storage_traits::groups::types::{Group, GroupExporterSecret, GroupState};
@@ -2137,6 +2164,17 @@ mod tests {
 
         use super::*;
         use crate::test_utils::ensure_mock_store;
+
+        struct KeyringCleanup<'a> {
+            service_id: &'a str,
+            db_key_id: &'a str,
+        }
+
+        impl Drop for KeyringCleanup<'_> {
+            fn drop(&mut self) {
+                let _ = keyring::delete_db_key(self.service_id, self.db_key_id);
+            }
+        }
 
         #[test]
         fn test_encrypted_storage_creation() {
@@ -2925,6 +2963,10 @@ mod tests {
 
             let service_id = "test.mdk.storage.stalekey";
             let db_key_id = "test.key.stalekeytest";
+            let _cleanup = KeyringCleanup {
+                service_id,
+                db_key_id,
+            };
 
             let _ = keyring::delete_db_key(service_id, db_key_id);
 
@@ -2964,8 +3006,45 @@ mod tests {
                 encryption::is_database_encrypted(&db_path).unwrap(),
                 "Database should be encrypted"
             );
+        }
 
-            keyring::delete_db_key(service_id, db_key_id).unwrap();
+        /// Test that a keyring rotation failure does not strand an empty database file.
+        #[test]
+        fn test_new_db_removes_precreated_file_when_key_rotation_fails() {
+            ensure_mock_store();
+
+            let temp_dir = tempdir().unwrap();
+            let db_path = temp_dir.path().join("new_db_keyring_failure.db");
+
+            let service_id = "test.mdk.storage.rotationfailure";
+            let db_key_id = "test.key.rotationfailuretest";
+            let _cleanup = KeyringCleanup {
+                service_id,
+                db_key_id,
+            };
+
+            let _ = keyring::delete_db_key(service_id, db_key_id);
+            keyring::get_or_create_db_key(service_id, db_key_id).unwrap();
+
+            let entry = Entry::new(service_id, db_key_id).unwrap();
+            let credential = entry
+                .as_any()
+                .downcast_ref::<keyring_core::mock::Cred>()
+                .expect("Mock keyring store should provide mock credentials");
+            credential.set_error(KeyringError::NoStorageAccess(Box::new(
+                std::io::Error::new(std::io::ErrorKind::PermissionDenied, "delete denied"),
+            )));
+
+            let result = MdkSqliteStorage::new(&db_path, service_id, db_key_id);
+            assert!(
+                matches!(result, Err(error::Error::KeyringNotInitialized(_))),
+                "Keyring rotation failure should be returned"
+            );
+
+            assert!(
+                !db_path.exists(),
+                "Precreated database file should be removed after key rotation failure"
+            );
         }
 
         /// Test that reopening a database with keyring works when the key is present.

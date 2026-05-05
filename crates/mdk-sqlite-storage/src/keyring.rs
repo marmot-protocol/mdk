@@ -188,6 +188,21 @@ pub fn get_or_create_db_key(service_id: &str, db_key_id: &str) -> Result<Encrypt
     Ok(config)
 }
 
+/// Creates a fresh database encryption key, replacing any existing keyring entry.
+///
+/// This is used only after the caller has created a new database file and is
+/// starting a new database lifecycle. If this function returns an error, callers
+/// should remove any precreated empty database file before returning so a retry
+/// can attempt fresh creation again rather than treating the orphan file as an
+/// existing database.
+///
+/// # Thread Safety
+///
+/// This function uses the same in-process mutex as [`get_or_create_db_key`] to
+/// coordinate key creation with other threads in this process. Cross-process
+/// coordination is not provided, and keyring replacement is delete-then-save
+/// rather than an atomic keyring operation. A process crash between those
+/// operations can leave no key in the keyring.
 pub(crate) fn create_fresh_db_key(
     service_id: &str,
     db_key_id: &str,
