@@ -2935,6 +2935,7 @@ mod tests {
 
             let storage = MdkSqliteStorage::new(&db_path, service_id, db_key_id);
             assert!(storage.is_ok(), "Should create database successfully");
+            drop(storage);
 
             let current_config = keyring::get_db_key(service_id, db_key_id)
                 .unwrap()
@@ -2945,12 +2946,25 @@ mod tests {
                 "Fresh database creation should replace stale keyring entries"
             );
 
+            let stale_result =
+                MdkSqliteStorage::new_with_key(&db_path, EncryptionConfig::new(stale_key));
+            assert!(
+                matches!(stale_result, Err(error::Error::WrongEncryptionKey)),
+                "Stale key should not decrypt the fresh database"
+            );
+
+            let current_result = MdkSqliteStorage::new_with_key(&db_path, current_config);
+            assert!(
+                current_result.is_ok(),
+                "Current keyring key should decrypt the fresh database"
+            );
+            drop(current_result);
+
             assert!(
                 encryption::is_database_encrypted(&db_path).unwrap(),
                 "Database should be encrypted"
             );
 
-            drop(storage);
             keyring::delete_db_key(service_id, db_key_id).unwrap();
         }
 
