@@ -401,9 +401,15 @@ impl MdkSqliteStorage {
         let creation_outcome = precreate_secure_database_file(file_path)?;
 
         let config = match creation_outcome {
-            FileCreationOutcome::Created | FileCreationOutcome::Skipped => {
-                // We created the file (or it's a special path like :memory:).
-                // Safe to generate a new key since we own this database.
+            FileCreationOutcome::Created => {
+                // We created the file, so this is a new database lifecycle.
+                // Replace any stale keyring value left behind by an app reinstall
+                // or host-level data wipe before writing the new encrypted database.
+                keyring::create_fresh_db_key(service_id, db_key_id)?
+            }
+            FileCreationOutcome::Skipped => {
+                // Special paths like :memory: do not have a file lifecycle to compare
+                // against the keyring entry, so preserve the existing get-or-create behavior.
                 keyring::get_or_create_db_key(service_id, db_key_id)?
             }
             FileCreationOutcome::AlreadyExisted => {
@@ -2905,6 +2911,45 @@ mod tests {
             );
 
             // Clean up
+            drop(storage);
+            keyring::delete_db_key(service_id, db_key_id).unwrap();
+        }
+
+        /// Test that a stale keyring entry is not reused for a new database lifecycle.
+        #[test]
+        fn test_new_db_replaces_stale_keyring_entry() {
+            ensure_mock_store();
+
+            let temp_dir = tempdir().unwrap();
+            let db_path = temp_dir.path().join("new_db_stale_keyring.db");
+
+            let service_id = "test.mdk.storage.stalekey";
+            let db_key_id = "test.key.stalekeytest";
+
+            let _ = keyring::delete_db_key(service_id, db_key_id);
+
+            let stale_config = keyring::get_or_create_db_key(service_id, db_key_id).unwrap();
+            let stale_key = *stale_config.key();
+
+            assert!(!db_path.exists(), "Database should not exist yet");
+
+            let storage = MdkSqliteStorage::new(&db_path, service_id, db_key_id);
+            assert!(storage.is_ok(), "Should create database successfully");
+
+            let current_config = keyring::get_db_key(service_id, db_key_id)
+                .unwrap()
+                .expect("Key should be stored in keyring");
+            assert_ne!(
+                current_config.key(),
+                &stale_key,
+                "Fresh database creation should replace stale keyring entries"
+            );
+
+            assert!(
+                encryption::is_database_encrypted(&db_path).unwrap(),
+                "Database should be encrypted"
+            );
+
             drop(storage);
             keyring::delete_db_key(service_id, db_key_id).unwrap();
         }

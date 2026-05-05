@@ -188,6 +188,54 @@ pub fn get_or_create_db_key(service_id: &str, db_key_id: &str) -> Result<Encrypt
     Ok(config)
 }
 
+pub(crate) fn create_fresh_db_key(
+    service_id: &str,
+    db_key_id: &str,
+) -> Result<EncryptionConfig, Error> {
+    let lock = KEY_GENERATION_LOCK.get_or_init(|| Mutex::new(()));
+    let _guard = lock
+        .lock()
+        .map_err(|e| Error::Keyring(format!("Failed to acquire key generation lock: {}", e)))?;
+
+    let entry = Entry::new(service_id, db_key_id).map_err(|e| {
+        Error::Keyring(format!(
+            "Failed to create keyring entry for service='{}', key='{}': {}",
+            service_id, db_key_id, e
+        ))
+    })?;
+
+    match entry.delete_credential() {
+        Ok(()) => {
+            tracing::info!(
+                service_id = service_id,
+                db_key_id = db_key_id,
+                "Deleted stale database encryption key from keyring before fresh database creation"
+            );
+        }
+        Err(KeyringError::NoEntry) => {}
+        Err(KeyringError::NoStorageAccess(err)) => {
+            return Err(Error::KeyringNotInitialized(err.to_string()));
+        }
+        Err(e) => {
+            return Err(Error::Keyring(format!(
+                "Failed to delete stale encryption key from keyring: {}",
+                e
+            )));
+        }
+    }
+
+    tracing::info!(
+        service_id = service_id,
+        db_key_id = db_key_id,
+        "Generating new database encryption key"
+    );
+
+    let config = EncryptionConfig::generate()?;
+    save_db_key(&entry, &config)?;
+
+    Ok(config)
+}
+
 /// Gets an existing database encryption key from the keyring.
 ///
 /// Unlike [`get_or_create_db_key`], this function does NOT generate a new key if one
