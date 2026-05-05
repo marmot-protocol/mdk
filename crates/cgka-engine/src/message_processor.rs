@@ -19,9 +19,7 @@ use cgka_traits::error::{EngineError, PeelerError};
 use cgka_traits::ingest::{IngestOutcome, PeeledContent, StaleReason};
 use cgka_traits::message::{MessageRecord, MessageState};
 use cgka_traits::storage::{StorageError, StorageProvider};
-use cgka_traits::transport::{
-    EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
-};
+use cgka_traits::transport::{EncryptedPayload, TransportEnvelope, TransportMessage};
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
 use openmls::group::{MlsGroup, ProcessMessageError};
 use openmls::prelude::{
@@ -942,10 +940,4 @@ impl<S: StorageProvider> Engine<S> {
         }
         Ok(())
     }
-}
-
-// Silence unused warnings until all `SendIntent` variants are wired.
-#[allow(dead_code)]
-fn _unused_timestamp_source() -> (Timestamp, TransportSource) {
-    (Timestamp(0), TransportSource(String::new()))
 }

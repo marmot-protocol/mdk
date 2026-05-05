@@ -15,7 +15,7 @@ use cgka_traits::capabilities::{Feature, FeatureStatus, GroupCapabilities};
 use cgka_traits::engine::{
     CgkaEngine, CreateGroupRequest, GroupEvent, KeyPackage, SendIntent, SendResult,
 };
-use cgka_traits::engine_state::{PendingStateRef, WelcomeState};
+use cgka_traits::engine_state::PendingStateRef;
 use cgka_traits::error::EngineError;
 use cgka_traits::group::Member;
 use cgka_traits::group_context::GroupContext;
@@ -27,7 +27,7 @@ use cgka_traits::types::MessageId;
 use cgka_traits::types::{EpochId, GroupId, MemberId};
 use openmls_rust_crypto::RustCrypto;
 use openmls_traits::types::Ciphersuite;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashSet, VecDeque};
 
 /// Default ciphersuite. MLS-1.0 mandatory-to-implement; TLS-ish naming.
 pub const DEFAULT_CIPHERSUITE: Ciphersuite =
@@ -49,13 +49,6 @@ pub struct Engine<S: StorageProvider> {
 
     /// Snapshot + ordering metadata for same-epoch competing commits.
     pub(crate) fork_recovery: crate::fork_recovery::ForkRecoveryManager,
-
-    /// Pending welcomes keyed by origin group id.
-    ///
-    /// Currently unused (welcomes auto-accept via `do_join_welcome`); reserved
-    /// for the user-driven decline UI when that lands.
-    #[allow(dead_code)]
-    pub(crate) welcome_states: HashMap<GroupId, WelcomeState>,
 
     pub(crate) events_buf: VecDeque<GroupEvent>,
     pub(crate) auto_publish_buf: VecDeque<TransportMessage>,
@@ -130,7 +123,6 @@ impl<S: StorageProvider> EngineBuilder<S> {
             ciphersuite: self.ciphersuite,
             epoch_manager: crate::epoch_manager::EpochManager::new(),
             fork_recovery: crate::fork_recovery::ForkRecoveryManager::default(),
-            welcome_states: HashMap::new(),
             events_buf: VecDeque::new(),
             auto_publish_buf: VecDeque::new(),
             seen_message_ids: HashSet::new(),

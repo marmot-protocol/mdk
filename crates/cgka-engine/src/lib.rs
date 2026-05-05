@@ -61,10 +61,4 @@ pub use wire_format::{
 
 // ── Compile-time witnesses ──────────────────────────────────────────────────
 
-#[allow(dead_code)]
-fn _assert_engine_object_safety() {
-    fn is_box_dyn_engine(_: Box<dyn cgka_traits::CgkaEngine + Send + Sync>) {}
-    fn _go<S: cgka_traits::StorageProvider + 'static>(e: Engine<S>) {
-        is_box_dyn_engine(Box::new(e));
-    }
-}
+const _: fn(Box<dyn cgka_traits::CgkaEngine + Send + Sync>) = |_| {};

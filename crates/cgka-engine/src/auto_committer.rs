@@ -35,8 +35,6 @@
 //! tuples and add an `auto_publish_failed` callback — that's a trait
 //! API change and not in scope for 0.1.0.
 
-use cgka_traits::transport::{Timestamp, TransportSource};
-use cgka_traits::types::MessageId;
 use openmls::framing::Sender;
 use openmls::group::MlsGroup;
 use openmls::prelude::{LeafNodeIndex, Proposal, QueuedProposal};
@@ -138,7 +136,3 @@ fn pubkey_at_leaf_index(
 // The commit-and-apply work happens in `message_processor::ingest_group_message`
 // directly — the `MlsGroup` holding the pending proposal must be the same
 // instance, and reloading from storage loses the in-memory proposal queue.
-
-// Touch types so imports stay live.
-#[allow(dead_code)]
-fn _touches(_id: MessageId, _ts: Timestamp, _src: TransportSource) {}

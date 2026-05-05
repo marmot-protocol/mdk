@@ -15,15 +15,15 @@
 //!   app-message delivery counts; the generated properties below focus on
 //!   convergence across larger send/leave schedules.
 
+use cgka_conformance::bus::DeliveryPolicy;
+use cgka_conformance::proptest_support::{
+    ConfirmOutcome, DeliveryProfile, HarnessIntent, confirm_outcome, delivery_profile, intent_seq,
+};
+use cgka_conformance::{ClientBuilder, HarnessClient, TransportBus};
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
 use cgka_traits::ingest::{IngestOutcome, StaleReason};
 use proptest::prelude::*;
-use test_harness::bus::DeliveryPolicy;
-use test_harness::proptest_support::{
-    ConfirmOutcome, DeliveryProfile, HarnessIntent, confirm_outcome, delivery_profile, intent_seq,
-};
-use test_harness::{ClientBuilder, HarnessClient, TransportBus};
 
 const REACTIONS_PROPOSAL: u16 = 0xF210;
 
@@ -208,7 +208,7 @@ fn convergence_with_event_conservation(intents: Vec<HarnessIntent>) {
 
 proptest! {
     #![proptest_config(ProptestConfig {
-        cases: if cfg!(feature = "harness-slow") { 1000 } else { 24 },
+        cases: if cfg!(feature = "conformance-slow") { 1000 } else { 24 },
         .. ProptestConfig::default()
     })]
 
@@ -260,7 +260,7 @@ fn convergence_under_profile(intents: Vec<HarnessIntent>, profile: DeliveryProfi
 
 proptest! {
     #![proptest_config(ProptestConfig {
-        cases: if cfg!(feature = "harness-slow") { 500 } else { 12 },
+        cases: if cfg!(feature = "conformance-slow") { 500 } else { 12 },
         .. ProptestConfig::default()
     })]
 
@@ -328,7 +328,7 @@ fn true_same_id_replay(payload: Vec<u8>) {
 
 proptest! {
     #![proptest_config(ProptestConfig {
-        cases: if cfg!(feature = "harness-slow") { 500 } else { 16 },
+        cases: if cfg!(feature = "conformance-slow") { 500 } else { 16 },
         .. ProptestConfig::default()
     })]
 
@@ -379,7 +379,7 @@ fn rollback_property(outcome: ConfirmOutcome) {
 
 proptest! {
     #![proptest_config(ProptestConfig {
-        cases: if cfg!(feature = "harness-slow") { 200 } else { 8 },
+        cases: if cfg!(feature = "conformance-slow") { 200 } else { 8 },
         .. ProptestConfig::default()
     })]
 

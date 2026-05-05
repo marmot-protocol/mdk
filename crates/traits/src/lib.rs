@@ -53,11 +53,5 @@ pub use welcome::PendingWelcome;
 // `CgkaEngine` trait (the spike's E0195 regression — see
 // `docs/learnings.md:44`), this constant will fail to compile because the
 // trait object becomes non-Send.
-#[allow(dead_code)]
-fn _assert_engine_is_object_safe() {
-    fn is_box_dyn(_: Box<dyn CgkaEngine + Send + Sync>) {}
-    let _ = is_box_dyn;
-
-    fn is_box_dyn_peeler(_: Box<dyn TransportPeeler + Send + Sync>) {}
-    let _ = is_box_dyn_peeler;
-}
+const _: fn(Box<dyn CgkaEngine + Send + Sync>) = |_| {};
+const _: fn(Box<dyn TransportPeeler + Send + Sync>) = |_| {};

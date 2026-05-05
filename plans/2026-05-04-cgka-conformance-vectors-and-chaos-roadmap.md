@@ -1,8 +1,8 @@
-# CGKA Test Harness, Vectors, and Chaos Roadmap
+# CGKA Conformance, Vectors, and Chaos Roadmap
 
 ## Objective
 
-Build the test harness into conformance machinery for CGKA implementations.
+Build `cgka-conformance` into conformance machinery for CGKA implementations.
 Any implementation should be able to consume the same scenario inputs, run the
 same logical events, and produce the same trace outputs.
 
@@ -10,13 +10,13 @@ The target is deterministic final state plus deterministic recovery trace. A
 client that reaches the same member set by taking a different fork-recovery
 path should fail the relevant vector.
 
-This plan covers harness and vector direction. It does not cover Nostr
+This plan covers conformance and vector direction. It does not cover Nostr
 transport work, Docker or system-level simulation, SQLite storage, or a
 production deployment runner.
 
 ## Current State
 
-The harness in `crates/test-harness` is an in-process simulator. It uses
+The harness in `crates/cgka-conformance` is an in-process simulator. It uses
 `Engine<MemoryStorage>` instances, a pass-through `MockPeeler`, and a
 deterministic `TransportBus`.
 
@@ -52,7 +52,7 @@ Current trace surface:
 
 Current fixture coverage:
 
-- External JSON fixtures live in `crates/test-harness/vectors/`.
+- External JSON fixtures live in `crates/cgka-conformance/vectors/`.
 - Each fixture includes a runnable `ScenarioSpec` input and expected
   `ScenarioTrace` output.
 - `ScenarioSpec` includes fixture-visible queue faults for drop, duplicate,
@@ -64,7 +64,7 @@ Current fixture coverage:
   trace, step log, recovery observations, and invariant failures.
 - `run_generated_case_report` adds generated-family metadata and a future
   `minimized_case` field.
-- `harness-report` writes generated `send-leave/v1` scenario reports as JSON
+- `cgka-conformance-report` writes generated `send-leave/v1` scenario reports as JSON
   artifacts from seed and case-count CLI arguments.
 - `three-client-message-exchange/v1` is captured as a fixture.
 - `deliberate-fork-recovery/v1` is captured as a fixture and includes
@@ -112,7 +112,7 @@ CGKA-specific interpretation:
 
 ### Phase 1 - Externalize Canonical Vectors
 
-Create `crates/test-harness/vectors/`.
+Create `crates/cgka-conformance/vectors/`.
 
 Add JSON fixtures for:
 
@@ -123,11 +123,11 @@ Each fixture should include:
 
 - Scenario name.
 - Vector version.
-- Harness version or crate version.
+- Conformance crate version.
 - Seed when applicable.
 - Expected `ScenarioTrace`.
 
-Add a Rust test that regenerates each fixture from the current harness and
+Add a Rust test that regenerates each fixture from the current conformance runner and
 compares the trace exactly. Failure output must include the fixture name and
 the observed trace.
 
@@ -137,7 +137,7 @@ Status: complete for the initial two fixtures.
 
 Add a serializable input contract for deterministic scripted scenarios.
 
-The v1 shape should cover only what the current harness already does:
+The v1 shape should cover only what the current conformance runner already does:
 
 - Client labels.
 - Initial group creation.
@@ -190,7 +190,7 @@ Status: initial `send-leave/v1` family complete.
 
 ### Phase 5 - Add Analysis and Failure Minimization
 
-Add a harness report that writes:
+Add a conformance report that writes:
 
 - Scenario metadata.
 - Expected trace.
@@ -216,7 +216,7 @@ After real transports exist, consider a separate runner inspired by FIPS:
 - Artifact collection from each process.
 
 This phase should consume the same scenario and trace ideas where possible, so
-the in-process harness remains the reference conformance layer.
+the in-process conformance runner remains the reference conformance layer.
 
 ## Interface Decisions
 
@@ -244,10 +244,10 @@ The roadmap is complete when:
 
 ## Suggested First Implementation Slice
 
-1. Add `crates/test-harness/vectors/`.
+1. Add `crates/cgka-conformance/vectors/`.
 2. Add JSON fixtures for the message-exchange and fork-recovery scenarios.
 3. Add a fixture-loading test that regenerates each `ScenarioTrace`.
-4. Add fixture metadata fields: scenario name, vector version, harness version,
+4. Add fixture metadata fields: scenario name, vector version, conformance version,
    and seed.
 5. Document how another implementation should consume fixtures and compare
    observations.
@@ -258,5 +258,5 @@ The roadmap is complete when:
 - FIPS scenario model: <https://raw.githubusercontent.com/jmcorgan/fips/master/testing/chaos/sim/scenario.py>
 - FIPS runner lifecycle: <https://raw.githubusercontent.com/jmcorgan/fips/master/testing/chaos/sim/runner.py>
 - FIPS churn example: <https://raw.githubusercontent.com/jmcorgan/fips/master/testing/chaos/scenarios/churn-mixed.yaml>
-- Local harness map: `crates/test-harness/AGENTS.md`
+- Local harness map: `crates/cgka-conformance/AGENTS.md`
 - Current production refactor plan: `plans/2026-04-22-cgka-engine-production-refactor-v1.md`

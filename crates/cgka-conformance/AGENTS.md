@@ -1,4 +1,4 @@
-# AGENTS.md — test-harness
+# AGENTS.md — cgka-conformance
 
 Read [`README.md`](README.md) for the human framing. This file is the agent-facing model.
 
@@ -13,7 +13,7 @@ Read [`README.md`](README.md) for the human framing. This file is the agent-faci
 | `src/proptest_support.rs` | `intent_seq(n_clients, range)` proptest strategy. Generates `HarnessIntent::Send` and `HarnessIntent::Leave`; `delivery_profile()` covers FIFO, reverse, and seeded-random delivery. |
 | `src/scenario.rs` | Serializable `ScenarioSpec` v1 plus `run_scenario_spec` / `run_scenario_report`. Drives ordered client operations from JSON-shaped scenario data and returns either a `ScenarioTrace` or a serializable report with metadata, step log, recoveries, and invariant failures. |
 | `src/vector.rs` | `ScenarioTrace` and observations. Records final epoch/member/payload facts plus `ForkRecoveryObservation` entries from `GroupEvent::ForkRecovered`. |
-| `src/bin/harness-report.rs` | Tiny report writer CLI. Runs `send-leave/v1` cases with `--seed`, `--cases`, and `--out`, then writes one JSON `ScenarioReport` per generated case. |
+| `src/bin/cgka-conformance-report.rs` | Tiny report writer CLI. Runs `send-leave/v1` cases with `--seed`, `--cases`, and `--out`, then writes one JSON `ScenarioReport` per generated case. |
 | `vectors/` | External JSON `VectorFixture` files. Each fixture carries both input `scenario` and output `expected_trace`. |
 
 ## Bus model
@@ -47,21 +47,21 @@ Look at `three_client_happy_path_via_harness` for the canonical shape.
 ## How to add or update a vector fixture
 
 1. Encode the runnable input as `ScenarioSpec` JSON in `vectors/*.json`.
-2. Include `scenario_name`, `vector_version`, `harness_version`, `seed`, `scenario`, and `expected_trace`.
+2. Include `scenario_name`, `vector_version`, `conformance_version`, `seed`, `scenario`, and `expected_trace`.
 3. Keep `ScenarioTrace` free of MLS bytes and Rust-only internals.
 4. Make recovery behavior observable through `ForkRecoveryObservation`, not just final membership.
-5. Run `cargo test -p test-harness canonical_vector_fixtures_match_generated_traces`.
+5. Run `cargo test -p cgka-conformance canonical_vector_fixtures_match_generated_traces`.
 
 ## How to run generated reports
 
 Use the CLI when you want JSON artifacts:
 
 ```sh
-cargo run -p test-harness --bin harness-report -- \
+cargo run -p cgka-conformance --bin cgka-conformance-report -- \
   --family send-leave/v1 \
   --seed 42 \
   --cases 10 \
-  --out target/harness-reports
+  --out target/cgka-conformance-reports
 ```
 
 ## How to add a new proptest invariant
@@ -69,11 +69,11 @@ cargo run -p test-harness --bin harness-report -- \
 1. New `proptest!` block in `tests/proptest_invariants.rs`.
 2. If you need new intent kinds, extend `HarnessIntent` in `src/proptest_support.rs` and the matching strategy fn.
 3. Encode the invariant as `prop_assert_unique(actual, expected, msg)` — the helper panics on mismatch so shrinking works.
-4. Default `cases` is 24; the `harness-slow` feature lifts it to 1000. Don't hand-tune per-test counts.
+4. Default `cases` is 24; the `conformance-slow` feature lifts it to 1000. Don't hand-tune per-test counts.
 
 ## Coverage gaps
 
-These are tracked in [`../../plans/2026-05-04-cgka-test-harness-vectors-and-chaos-roadmap.md`](../../plans/2026-05-04-cgka-test-harness-vectors-and-chaos-roadmap.md). If you're filling one of these in, update the plan's status row in the same change.
+These are tracked in [`../../plans/2026-05-04-cgka-conformance-vectors-and-chaos-roadmap.md`](../../plans/2026-05-04-cgka-conformance-vectors-and-chaos-roadmap.md). If you're filling one of these in, update the plan's status row in the same change.
 
 - **`HarnessIntent` does not generate Invite / UpgradeCapabilities / UpdateGroupData.** Invite needs client minting inside a strategy; the scripted tests cover it today.
 - **Partition policy is scripted, not strategy-driven.** The bus supports partitions; proptest currently drives FIFO / Reverse / SeededRandom.

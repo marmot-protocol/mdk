@@ -13,7 +13,7 @@ The CGKA engine production refactor (`plans/2026-04-22-cgka-engine-production-re
 - `crates/traits` — shared trait surface + value types (zero Nostr leakage; verified by grep)
 - `crates/cgka-engine` — OpenMLS-backed `CgkaEngine` impl
 - `crates/storage-memory` — `Arc<RwLock>`-cloneable in-memory backend
-- `crates/test-harness` — multi-client `TransportBus` + `HarnessClient` + proptest
+- `crates/cgka-conformance` — multi-client `TransportBus` + `HarnessClient` + proptest
 
 Test totals at this checkpoint: ~80 tests across the workspace, 0 failing.
 
@@ -33,7 +33,7 @@ The first working `ForkRecoveryManager` is in `crates/cgka-engine/src/fork_recov
 
 Storage snapshots are now part of engine correctness, not a dormant hook. `storage-memory` snapshots the full OpenMLS memory map as a pragmatic harness backend. A production backend should snapshot group-scoped OpenMLS rows plus CGKA metadata atomically, add retention/pruning, and persist enough ordering metadata to recover after restart.
 
-Follow-up: recovery observability now has a first contract. `cgka_traits::GroupEvent::ForkRecovered` records the source epoch, recovered epoch, winner ordering key, and invalidated incumbent ordering key. `test-harness::ScenarioTrace` exposes that as `ClientObservation::recoveries` with hex message ids, and the deliberate fork scenario asserts that exactly one peer rolls back to the deterministic winner. The next portability step is not more engine plumbing; it is turning these scripted scenarios into explicit external vector fixtures/runners.
+Follow-up: recovery observability now has a first contract. `cgka_traits::GroupEvent::ForkRecovered` records the source epoch, recovered epoch, winner ordering key, and invalidated incumbent ordering key. `cgka-conformance::ScenarioTrace` exposes that as `ClientObservation::recoveries` with hex message ids, and the deliberate fork scenario asserts that exactly one peer rolls back to the deterministic winner. The next portability step is not more engine plumbing; it is turning these scripted scenarios into explicit external vector fixtures/runners.
 
 ---
 

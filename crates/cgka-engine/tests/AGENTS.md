@@ -37,7 +37,7 @@ cargo test -p cgka-engine
 
 ## Tier 3 — Harness scenarios + proptest
 
-**Where:** `crates/test-harness/tests/`. Multi-client convergence under a deterministic in-memory bus.
+**Where:** `crates/cgka-conformance/tests/`. Multi-client convergence under a deterministic in-memory bus.
 
 | File | Owns |
 |---|---|
@@ -46,12 +46,12 @@ cargo test -p cgka-engine
 
 Quick CI run (24 proptest cases, ~1 s):
 ```sh
-cargo test -p test-harness
+cargo test -p cgka-conformance
 ```
 
 Slow exhaustive run (1000 cases per property; pre-release validation):
 ```sh
-cargo test -p test-harness --features harness-slow
+cargo test -p cgka-conformance --features conformance-slow
 ```
 
 ## Workspace-wide
@@ -68,8 +68,8 @@ Expected today: 100 passing, 0 failing.
 - New `StaleReason` variant → add a case to `tests/ingest.rs` and a dedicated assertion that the typed variant fires.
 - New capability requirement type → extend `tests/capabilities.rs`; the matrix is partial today (`Required/Optional/TransportRequired` × coverage × member-count), parametrize when adding rows.
 - New MIP-03 rule → add to `tests/mip03_guards.rs`. These tests assert at the engine boundary, not via the harness.
-- Multi-client convergence question → harness scenario in `crates/test-harness/tests/canonical_scenarios.rs`. If it should hold for *any* sequence of intents, encode as a proptest in `proptest_invariants.rs`.
-- Cross-implementation or reportable scenario → prefer `ScenarioSpec` / JSON fixtures in `crates/test-harness/vectors/`, and use `harness-report` for generated report artifacts.
+- Multi-client convergence question → harness scenario in `crates/cgka-conformance/tests/canonical_scenarios.rs`. If it should hold for *any* sequence of intents, encode as a proptest in `proptest_invariants.rs`.
+- Cross-implementation or reportable scenario → prefer `ScenarioSpec` / JSON fixtures in `crates/cgka-conformance/vectors/`, and use `cgka-conformance-report` for generated report artifacts.
 
 ## Why no in-crate `#[cfg(test)]` modules
 

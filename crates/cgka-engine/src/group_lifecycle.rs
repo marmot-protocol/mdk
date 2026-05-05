@@ -26,10 +26,8 @@ use cgka_traits::engine::{CreateGroupRequest, SendResult};
 use cgka_traits::error::EngineError;
 use cgka_traits::group::{Group, Member};
 use cgka_traits::storage::StorageProvider;
-use cgka_traits::transport::{
-    EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
-};
-use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
+use cgka_traits::transport::{EncryptedPayload, TransportEnvelope, TransportMessage};
+use cgka_traits::types::{EpochId, GroupId, MemberId};
 use openmls::group::{MlsGroup, MlsGroupCreateConfig, StagedWelcome};
 use openmls::prelude::{BasicCredential, Extension, Extensions, MlsMessageBodyIn, MlsMessageIn};
 use tls_codec::{Deserialize as _, Serialize as _};
@@ -491,33 +489,5 @@ pub(crate) fn mirror_group_data_into_record(
     if let Ok(Some(data)) = crate::group_data::read_from_group(mls_group) {
         record.name = String::from_utf8_lossy(data.name.as_slice()).into_owned();
         record.description = String::from_utf8_lossy(data.description.as_slice()).into_owned();
-    }
-}
-
-// Silence unused warnings for the message-id helper that create_group will
-// need once we stop relying on the peeler to assign ids.
-#[allow(dead_code)]
-fn next_transport_msg_id(ciphertext: &[u8]) -> MessageId {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut h = DefaultHasher::new();
-    ciphertext.hash(&mut h);
-    let v = h.finish().to_be_bytes().to_vec();
-    MessageId::new(v)
-}
-
-#[allow(dead_code)]
-fn make_group_transport_message(
-    payload: EncryptedPayload,
-    transport_group_id: Vec<u8>,
-) -> TransportMessage {
-    let id = next_transport_msg_id(&payload.ciphertext);
-    TransportMessage {
-        id,
-        payload: payload.ciphertext,
-        timestamp: Timestamp(0),
-        causal_deps: vec![],
-        source: TransportSource("engine".into()),
-        envelope: TransportEnvelope::GroupMessage { transport_group_id },
     }
 }

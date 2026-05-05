@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 pub struct VectorFixture {
     pub scenario_name: String,
     pub vector_version: String,
-    pub harness_version: String,
+    pub conformance_version: String,
     pub seed: Option<u64>,
     pub scenario: ScenarioSpec,
     pub expected_trace: ScenarioTrace,

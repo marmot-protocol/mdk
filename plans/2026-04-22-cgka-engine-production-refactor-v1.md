@@ -29,7 +29,7 @@ Decisions captured from the clarifying round (reference only — not tasks):
 
 ## Current Status (2026-05-04)
 
-**Workspace state:** 100 tests passing, 0 failing. `cargo clippy --workspace --all-targets -- -D warnings` green. `cargo fmt --all --check` clean. Slow harness gate (`cargo test -p test-harness --features harness-slow`) green. Spike workspace at `spike/` builds independently with known deprecation/dead-code warnings. **All original tasks in the plan are closed; recovery trace observations have a first implementation via `GroupEvent::ForkRecovered` + `ScenarioTrace::recoveries`.**
+**Workspace state:** 100 tests passing, 0 failing. `cargo clippy --workspace --all-targets -- -D warnings` green. `cargo fmt --all --check` clean. Slow harness gate (`cargo test -p cgka-conformance --features conformance-slow`) green. Spike workspace at `spike/` builds independently with known deprecation/dead-code warnings. **All original tasks in the plan are closed; recovery trace observations have a first implementation via `GroupEvent::ForkRecovered` + `ScenarioTrace::recoveries`.**
 
 **Crate inventory (all at 0.1.0, root workspace):**
 
@@ -38,7 +38,7 @@ Decisions captured from the clarifying round (reference only — not tasks):
 | `cgka-traits` (`crates/traits/`) | Shared trait surface + value types | Stable; insta snapshots locked, including `ForkRecovered` event shape |
 | `cgka-engine` (`crates/cgka-engine/`) | OpenMLS-backed engine | Functional; publish-before-apply plus same-epoch fork recovery landed. |
 | `storage-memory` (`crates/storage-memory/`) | In-memory backend | Done; snapshots include OpenMLS memory state for recovery tests. |
-| `test-harness` (`crates/test-harness/`) | Multi-client simulator + proptest | Done; scripted fork scenario now asserts convergence and recovery trace emission. |
+| `cgka-conformance` (`crates/cgka-conformance/`) | Multi-client simulator + proptest | Done; scripted fork scenario now asserts convergence and recovery trace emission. |
 
 **Phase summary:**
 
@@ -50,8 +50,8 @@ Decisions captured from the clarifying round (reference only — not tasks):
 | 3 — State-machine types | ✅ | All in `cgka-traits`; `Box<dyn CgkaEngine + Send + Sync>` witness compiles |
 | 4 — Engine impl | ✅ | All 14 original tasks landed, plus `ForkRecoveryManager` for same-epoch commit races. |
 | 5 — Unit tests | ✅ | 5.1 trybuild deferred per plan edit; 5.4 **full 36-cell capability matrix landed** as a single parametrized test in `tests/capabilities.rs::capability_matrix_36_cells`; 5.7 witness compiles; 5.8 insta snapshots locked. |
-| 6 — Test harness | ✅ | Bus + client + 4 scripted scenarios green. Proptest depth: 4 properties — (a) true same-id replay via `bus.inject`; (b) convergence under Send+Leave intents; (b') convergence under varied `DeliveryProfile` (FIFO / Reverse / SeededRandom); (c) confirm-vs-fail rollback round trip. Slow gate (`--features harness-slow`) lifts case counts to 200–1000. Fork scenario asserts deterministic convergence and records the rollback trace. |
-| 7 — Docs + hygiene | ✅ | Per-crate `README.md` + `AGENTS.md` pair (cgka-engine, test-harness) plus thin `README.md` for traits + storage-memory. `tests/AGENTS.md` documents the three-tier test layout. `docs/learnings.md` 2026-04-25 entry added. Clippy/fmt CI gates passing. |
+| 6 — Test harness | ✅ | Bus + client + 4 scripted scenarios green. Proptest depth: 4 properties — (a) true same-id replay via `bus.inject`; (b) convergence under Send+Leave intents; (b') convergence under varied `DeliveryProfile` (FIFO / Reverse / SeededRandom); (c) confirm-vs-fail rollback round trip. Slow gate (`--features conformance-slow`) lifts case counts to 200–1000. Fork scenario asserts deterministic convergence and records the rollback trace. |
+| 7 — Docs + hygiene | ✅ | Per-crate `README.md` + `AGENTS.md` pair (cgka-engine, cgka-conformance) plus thin `README.md` for traits + storage-memory. `tests/AGENTS.md` documents the three-tier test layout. `docs/learnings.md` 2026-04-25 entry added. Clippy/fmt CI gates passing. |
 
 **Phase 4 detail (every task):**
 
@@ -98,7 +98,7 @@ Decisions captured from the clarifying round (reference only — not tasks):
 - [x] Task 1.1. Create `crates/traits/` as the shared-traits crate. Initially contains the `CgkaEngine` trait, the `TransportPeeler` trait, the storage traits, the `GroupContext` trait, and all cross-boundary value types (`TransportMessage`, `TransportEnvelope`, `PeeledMessage`, `EncryptedPayload`, `SendIntent`, `SendResult`, `GroupEvent`, `IngestOutcome`, `StaleReason`, `EngineError`, `PendingStateRef`, `MessageId`, `GroupId`, `MemberId`, `EpochId`, etc). Rationale: one crate to import for anything that crosses a seam, as clarified in question 8. Growth room for future non-CGKA traits.
 - [x] Task 1.2. Create `crates/cgka-engine/` as the OpenMLS-backed implementation crate. Takes a type-parameter `S: StorageProvider` (see Phase 2) — no dyn-storage dispatch. Rationale: matches the design-doc decision `crates/cgka-engine/src/lib.rs` analogue that generics beat trait objects for storage.
 - [x] Task 1.3. Create `crates/storage-memory/` as the in-memory backend. Implements every storage trait from `crates/traits`. Rationale: zero-dependency backend suitable for tests and ephemeral scenarios.
-- [x] Task 1.4. Create `crates/test-harness/` for the multi-client simulator + shared fixtures. Depends on `traits`, `cgka-engine`, `storage-memory`. Rationale: isolates test-only code so it doesn't bloat the production crates.
+- [x] Task 1.4. Create `crates/cgka-conformance/` for the multi-client simulator + shared fixtures. Depends on `traits`, `cgka-engine`, `storage-memory`. Rationale: isolates test-only code so it doesn't bloat the production crates.
 - [x] Task 1.5. Wire the four crates into the root `[workspace]` members and define `[workspace.dependencies]` (openmls family pinned per `docs/learnings.md:32`, thiserror, tracing, tokio, async-trait, rand, hex, serde, proptest, insta or similar snapshot tool, test-log). Rationale: version pinning is non-negotiable per the spike learning about silent companion-crate skew.
 - [x] Task 1.6. Add a `rust-toolchain.toml` pinning `channel = "1.85.0"` (or a newer stable). Edition 2024 requires rustc ≥ 1.85. Document MSRV in the root README. Rationale: reproducibility of tests; avoids surprise when a contributor runs on an older toolchain.
 
@@ -163,8 +163,8 @@ Internal subsystems per `cgka-engine-design.md:214-233`. Each is a module inside
 
 ### Phase 6 — Test harness
 
-- [x] Task 6.1. Build `crates/test-harness/src/bus.rs` — an in-memory `TransportBus` that N engine clients attach to. Supports: ordered delivery, reverse-ordered delivery, random delivery (seeded), partitioning (drop messages to subset), duplication (same MessageId twice), delay injection. No actual network. Rationale: multi-client harness per question-6 option (a); seed control makes every scenario deterministic.
-- [x] Task 6.2. Build `crates/test-harness/src/client.rs` — a `HarnessClient` wrapping `Engine<MemoryStorage>` + a `MockPeeler` that performs trivial ChaCha-free framing. The mock peeler still distinguishes group-message vs welcome paths but skips actual encryption so tests can assert on inner payloads directly. Rationale: mock peeler per question-6 option (e); keeps tests fast and lets invariants target engine behavior not crypto.
+- [x] Task 6.1. Build `crates/cgka-conformance/src/bus.rs` — an in-memory `TransportBus` that N engine clients attach to. Supports: ordered delivery, reverse-ordered delivery, random delivery (seeded), partitioning (drop messages to subset), duplication (same MessageId twice), delay injection. No actual network. Rationale: multi-client harness per question-6 option (a); seed control makes every scenario deterministic.
+- [x] Task 6.2. Build `crates/cgka-conformance/src/client.rs` — a `HarnessClient` wrapping `Engine<MemoryStorage>` + a `MockPeeler` that performs trivial ChaCha-free framing. The mock peeler still distinguishes group-message vs welcome paths but skips actual encryption so tests can assert on inner payloads directly. Rationale: mock peeler per question-6 option (e); keeps tests fast and lets invariants target engine behavior not crypto.
 - [x] Task 6.3. Build scripted scenario helpers: `HarnessClient::send(...)`, `HarnessClient::tick()` (drain events), `TransportBus::step(n)` (deliver next N messages under the current scheduler). Rationale: makes scenario code imperative and readable without needing a DSL layer yet.
 - [x] Task 6.4. Write the canonical 3-client happy-path scenario (A creates group with B, C; each sends one message; asserts all three converge on same epoch + same received messages) as the harness's first smoke test. Rationale: replicates `docs/learnings.md:62` end-to-end result without touching Nostr.
 - [x] Task 6.5. Write the welcome-before-commit scenario reproducing `docs/learnings.md:66-70` — deliver welcome, then commit — and assert the commit is categorised as `StaleReason::AlreadyAtEpoch`, not an error. Rationale: validates the typed-outcome plumbing against the exact bug class the spike found.
@@ -176,7 +176,7 @@ Internal subsystems per `cgka-engine-design.md:214-233`. Each is a module inside
   - **(b) Convergence** — `prop_convergence_under_send_leave_sequence` + `prop_convergence_under_varied_delivery`: undisturbed clients agree on epoch after any sequence of Send+Leave intents, under any `DeliveryProfile`.
   - **(c) Rollback** — `prop_upgrade_confirm_or_fail_round_trip`: `upgrade_group_capabilities` followed by random `confirm_published` / `publish_failed` choice; assert epoch advances on confirm, rolls back on fail, and a post-rollback retry succeeds.
   - **(d) Event conservation** — folded into (b) via the convergence harness.
-- [x] Task 6.10. **[DONE 2026-04-25]** `cargo test -p test-harness --features harness-slow` lifts proptest case counts to 200–1000 per property. With the richer 6.8/6.9 surface in place, the slow run actually has new ground to cover (Send+Leave under three delivery profiles, true replay, rollback round trips). Confirmed runtime: ~28 s for the slow profile.
+- [x] Task 6.10. **[DONE 2026-04-25]** `cargo test -p cgka-conformance --features conformance-slow` lifts proptest case counts to 200–1000 per property. With the richer 6.8/6.9 surface in place, the slow run actually has new ground to cover (Send+Leave under three delivery profiles, true replay, rollback round trips). Confirmed runtime: ~28 s for the slow profile.
 
 ### Phase 7 — Documentation + loose ends
 
@@ -194,7 +194,7 @@ Internal subsystems per `cgka-engine-design.md:214-233`. Each is a module inside
 - `spike/` workspace independently `cargo check`-s green.
 - Every `EpochState` transition, every `StaleReason` variant, and every `EngineError` variant is exercised by at least one unit test.
 - The 3-client happy-path harness scenario passes. The welcome-before-commit scenario reproduces `StaleReason::AlreadyAtEpoch`. The SelfRemove scenario converges without `ForkedEpoch`. The concurrent-invite scenario recovers to one deterministic winner and leaves both active clients at the same epoch/member set.
-- Proptest suite runs default (small-case) in < 30s and passes in CI; the `--features harness-slow` suite (1000+ cases) passes locally.
+- Proptest suite runs default (small-case) in < 30s and passes in CI; the `--features conformance-slow` suite (1000+ cases) passes locally.
 - `feature_status()` returns `Available` / `Upgradeable` / `Unavailable` correctly differentiated for a group with mixed-capability members (validating the `CapabilityStorage` cache closes the OpenMLS pub(crate) gap from `docs/learnings.md:125`).
 - `invite()` with a KeyPackage missing a required capability returns `EngineError::MissingRequiredCapabilities { required, had }` with populated sets — no stringly-typed error leaks.
 - No Nostr types appear anywhere in `crates/traits/`, `crates/cgka-engine/`, or `crates/storage-memory/`. (grep for `nostr` in those crates returns zero hits outside of test names / comments.)
@@ -239,7 +239,7 @@ Internal subsystems per `cgka-engine-design.md:214-233`. Each is a module inside
 | ~~Task 5.4 exhaustive capability matrix~~ | ~~1 hr~~ | DONE 2026-04-25 | `capability_matrix_36_cells` in `tests/capabilities.rs`. |
 | ~~Task 4.2 `update_group_data` impl~~ | ~~1 hr~~ | DONE | Landed 2026-04-25 in `crates/cgka-engine/src/update_group_data.rs`. 5 tests in `tests/update_group_data.rs`. |
 | ~~Task 2.2 snapshot/rollback wiring into engine~~ | n/a | DONE | Publish rollback still uses `MlsGroup::clear_pending_commit`; fork recovery uses `MessageStorage` snapshots. |
-| ~~Task 6.10 broader slow gate~~ | n/a | DONE 2026-04-25 | `--features harness-slow` runs 200–1000 cases per property; ~28 s wall time. |
+| ~~Task 6.10 broader slow gate~~ | n/a | DONE 2026-04-25 | `--features conformance-slow` runs 200–1000 cases per property; ~28 s wall time. |
 | ~~Recovery observations in test vectors~~ | ~~1-2 hr~~ | DONE 2026-05-04 | `GroupEvent::ForkRecovered` + `ScenarioTrace::recoveries` capture winner/incumbent ordering keys, invalidated message, source epoch, and recovered epoch. |
 
 **Status as of 2026-05-04:** every original task in this plan is closed. Future-roadmap items (SQLite storage, KeyPackage refresh scheduling, external vector fixture packaging, transport adapters, FFI) live in their own plans or the next implementation slice.
@@ -255,7 +255,7 @@ Internal subsystems per `cgka-engine-design.md:214-233`. Each is a module inside
 - **State-machine types in `cgka-traits`.** `EpochState`, `WelcomeState`, all the value types — the contract is locked. Snapshot tests in `crates/traits/tests/snapshots.rs` will fail loudly on accidental shape drift, including the `ForkRecovered` event shape.
 - **Storage trait surface.** Five traits + accessor for OpenMLS storage. 18 round-trip + concurrency tests. SQLite backend follows the same shape — single new crate, no trait changes.
 - **Engine subsystems boundaries.** `epoch_manager`, `capability_manager`, `auto_committer`, `group_lifecycle`, `message_processor`, `key_package`, `upgrade`, `group_data`, `wire_format`, `provider`, `identity` — each has a single responsibility documented at the top of its file.
-- **Test tier organization.** `crates/cgka-engine/tests/AGENTS.md` documents the three tiers (cgka-traits unit, cgka-engine integration, test-harness scenarios+proptest). `cargo test --workspace` is the canonical command.
+- **Test tier organization.** `crates/cgka-engine/tests/AGENTS.md` documents the three tiers (cgka-traits unit, cgka-engine integration, cgka-conformance scenarios+proptest). `cargo test --workspace` is the canonical command.
 
 ### Where to look for context
 
@@ -263,7 +263,7 @@ Internal subsystems per `cgka-engine-design.md:214-233`. Each is a module inside
 - **Spike learnings + corrections:** `docs/learnings.md` (2026-04-25 entry summarizes the refactor).
 - **Spike findings (architectural):** `docs/marmot-architecture/further-context/spike-findings.md` (some claims annotated as "Corrected 2026-04-22" — read both the original and correction).
 - **Test layout:** `crates/cgka-engine/tests/AGENTS.md`.
-- **Per-crate maps:** `crates/cgka-engine/AGENTS.md` (subsystem map + design deviations), `crates/test-harness/AGENTS.md` (bus model + scenario authoring).
+- **Per-crate maps:** `crates/cgka-engine/AGENTS.md` (subsystem map + design deviations), `crates/cgka-conformance/AGENTS.md` (bus model + scenario authoring).
 - **MIP-01 wire format:** the canonical reference is the spec; our `crates/cgka-engine/src/group_data.rs` is the implementation.
 
 ### Memory files relevant to this work

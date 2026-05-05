@@ -1,19 +1,23 @@
 use std::error::Error;
 use std::path::PathBuf;
 
-use test_harness::{generate_send_leave_family, run_generated_case_report};
+use crate::{generate_send_leave_family, run_generated_case_report};
 
-#[derive(Debug)]
-struct Args {
-    family: String,
-    seed: u64,
-    cases: usize,
-    out: PathBuf,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReportArgs {
+    pub family: String,
+    pub seed: u64,
+    pub cases: usize,
+    pub out: PathBuf,
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
-    let args = parse_args(std::env::args().skip(1))?;
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReportCommand {
+    Run(ReportArgs),
+    Help,
+}
+
+pub async fn run_report(args: &ReportArgs) -> Result<(), Box<dyn Error>> {
     std::fs::create_dir_all(&args.out)?;
 
     let cases = match args.family.as_str() {
@@ -35,11 +39,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, Box<dyn Error>> {
+pub fn parse_report_command(
+    args: impl IntoIterator<Item = String>,
+) -> Result<ReportCommand, Box<dyn Error>> {
     let mut family = "send-leave/v1".to_string();
     let mut seed = 0u64;
     let mut cases = 1usize;
-    let mut out = PathBuf::from("target/harness-reports");
+    let mut out = PathBuf::from("target/cgka-conformance-reports");
 
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
@@ -48,20 +54,17 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, Box<dyn Er
             "--seed" => seed = next_value(&mut args, "--seed")?.parse()?,
             "--cases" => cases = next_value(&mut args, "--cases")?.parse()?,
             "--out" => out = PathBuf::from(next_value(&mut args, "--out")?),
-            "--help" | "-h" => {
-                print_usage();
-                std::process::exit(0);
-            }
+            "--help" | "-h" => return Ok(ReportCommand::Help),
             other => return Err(format!("unknown argument {other}").into()),
         }
     }
 
-    Ok(Args {
+    Ok(ReportCommand::Run(ReportArgs {
         family,
         seed,
         cases,
         out,
-    })
+    }))
 }
 
 fn next_value(
@@ -72,6 +75,6 @@ fn next_value(
         .ok_or_else(|| format!("missing value for {flag}").into())
 }
 
-fn print_usage() {
-    println!("Usage: harness-report [--family send-leave/v1] [--seed N] [--cases N] [--out DIR]");
+pub fn report_usage() -> &'static str {
+    "Usage: cgka-conformance-report [--family send-leave/v1] [--seed N] [--cases N] [--out DIR]"
 }

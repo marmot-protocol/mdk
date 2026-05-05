@@ -4,15 +4,15 @@
 //! plan. These are the tests the proptest layer (Phase 6.8-6.9) generalizes
 //! into seeded random sequences.
 
-use cgka_engine::feature_registry::FeatureRegistry;
-use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
-use cgka_traits::engine::GroupEvent;
-use cgka_traits::types::MemberId;
-use test_harness::{
+use cgka_conformance::{
     ClientBuilder, ScenarioSpec, ScenarioStep, ScenarioTrace, TransportBus, VectorFixture,
     generate_send_leave_family, observe_client, run_generated_case_report, run_scenario_report,
     run_scenario_spec,
 };
+use cgka_engine::feature_registry::FeatureRegistry;
+use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
+use cgka_traits::engine::GroupEvent;
+use cgka_traits::types::MemberId;
 
 fn pad32(name: &[u8]) -> Vec<u8> {
     // MIP-01 admin pubkeys MUST be 32 bytes. Test identities get
@@ -82,7 +82,7 @@ async fn three_client_happy_path_via_harness() {
     let _ = (alice.tick().await, bob.tick().await, carol.tick().await);
 
     // Each has received 2 application messages (everyone else's).
-    fn count_app_msgs(c: &mut test_harness::HarnessClient) -> usize {
+    fn count_app_msgs(c: &mut cgka_conformance::HarnessClient) -> usize {
         c.drain_events()
             .into_iter()
             .filter(|e| matches!(e, GroupEvent::MessageReceived { .. }))
@@ -145,7 +145,7 @@ async fn three_client_message_exchange_vector_is_stable() {
         ScenarioTrace {
             name: "three-client-message-exchange/v1".into(),
             observations: vec![
-                test_harness::ClientObservation {
+                cgka_conformance::ClientObservation {
                     client: "alice".into(),
                     epoch: 1,
                     member_count: 3,
@@ -153,7 +153,7 @@ async fn three_client_message_exchange_vector_is_stable() {
                     removed_members: vec![],
                     recoveries: vec![],
                 },
-                test_harness::ClientObservation {
+                cgka_conformance::ClientObservation {
                     client: "bob".into(),
                     epoch: 1,
                     member_count: 3,
@@ -161,7 +161,7 @@ async fn three_client_message_exchange_vector_is_stable() {
                     removed_members: vec![],
                     recoveries: vec![],
                 },
-                test_harness::ClientObservation {
+                cgka_conformance::ClientObservation {
                     client: "carol".into(),
                     epoch: 1,
                     member_count: 3,
@@ -765,9 +765,9 @@ fn assert_vector_fixture_matches(
     observed_trace: ScenarioTrace,
 ) {
     assert_eq!(
-        fixture.harness_version,
+        fixture.conformance_version,
         env!("CARGO_PKG_VERSION"),
-        "fixture {fixture_name} has stale harness_version"
+        "fixture {fixture_name} has stale conformance_version"
     );
     assert_eq!(
         fixture.scenario_name, fixture.expected_trace.name,

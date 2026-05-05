@@ -1,7 +1,7 @@
 {
   "scenario_name": "deliberate-fork-recovery/v1",
   "vector_version": "1",
-  "harness_version": "0.1.0",
+  "conformance_version": "0.1.0",
   "seed": null,
   "scenario": {
     "name": "deliberate-fork-recovery/v1",

@@ -1,4 +1,4 @@
-//! # test-harness
+//! # cgka-conformance
 //!
 //! In-process multi-client simulator + shared test fixtures for the CGKA
 //! engine.
@@ -19,6 +19,7 @@ pub mod client;
 pub mod family;
 pub mod peeler;
 pub mod proptest_support;
+pub mod report;
 pub mod scenario;
 pub mod vector;
 
@@ -26,6 +27,7 @@ pub use bus::{ClientId, DeliveryPolicy, TransportBus};
 pub use client::{ClientBuilder, HarnessClient};
 pub use family::{GeneratedScenarioCase, generate_send_leave_family, run_generated_case_report};
 pub use peeler::MockPeeler;
+pub use report::{ReportArgs, ReportCommand, parse_report_command, report_usage, run_report};
 pub use scenario::{
     GeneratedScenarioMetadata, InvariantFailure, ScenarioReport, ScenarioReportMetadata,
     ScenarioRunError, ScenarioSpec, ScenarioStep, ScenarioStepLogEntry, ScenarioStepStatus,

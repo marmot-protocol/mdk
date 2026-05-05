@@ -3,7 +3,7 @@
 //!
 //! ## What's generated
 //!
-//! [`HarnessIntent`] enumerates the test-harness-friendly subset of
+//! [`HarnessIntent`] enumerates the cgka-conformance-friendly subset of
 //! `SendIntent`:
 //! - `Send { sender_idx, payload }` — application message.
 //! - `Leave { sender_idx }` — MIP-03 SelfRemove from a non-admin client
