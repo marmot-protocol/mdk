@@ -17,6 +17,8 @@
 
 ### Fixed
 
+- Rotated stale keyring entries when creating a fresh encrypted SQLite database, so app reinstall or data-wipe flows do not reuse a key from a previous database lifecycle. ([#275](https://github.com/marmot-protocol/mdk/pull/275))
+
 ### Removed
 
 ### Deprecated

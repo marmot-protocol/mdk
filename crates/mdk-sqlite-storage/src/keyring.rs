@@ -188,6 +188,69 @@ pub fn get_or_create_db_key(service_id: &str, db_key_id: &str) -> Result<Encrypt
     Ok(config)
 }
 
+/// Creates a fresh database encryption key, replacing any existing keyring entry.
+///
+/// This is used only after the caller has created a new database file and is
+/// starting a new database lifecycle. If this function returns an error, callers
+/// should remove any precreated empty database file before returning so a retry
+/// can attempt fresh creation again rather than treating the orphan file as an
+/// existing database.
+///
+/// # Thread Safety
+///
+/// This function uses the same in-process mutex as [`get_or_create_db_key`] to
+/// coordinate key creation with other threads in this process. Cross-process
+/// coordination is not provided, and keyring replacement is delete-then-save
+/// rather than an atomic keyring operation. A process crash between those
+/// operations can leave no key in the keyring.
+pub(crate) fn create_fresh_db_key(
+    service_id: &str,
+    db_key_id: &str,
+) -> Result<EncryptionConfig, Error> {
+    let lock = KEY_GENERATION_LOCK.get_or_init(|| Mutex::new(()));
+    let _guard = lock
+        .lock()
+        .map_err(|e| Error::Keyring(format!("Failed to acquire key generation lock: {}", e)))?;
+
+    let entry = Entry::new(service_id, db_key_id).map_err(|e| {
+        Error::Keyring(format!(
+            "Failed to create keyring entry for service='{}', key='{}': {}",
+            service_id, db_key_id, e
+        ))
+    })?;
+
+    match entry.delete_credential() {
+        Ok(()) => {
+            tracing::info!(
+                service_id = service_id,
+                db_key_id = db_key_id,
+                "Deleted stale database encryption key from keyring before fresh database creation"
+            );
+        }
+        Err(KeyringError::NoEntry) => {}
+        Err(KeyringError::NoStorageAccess(err)) => {
+            return Err(Error::KeyringNotInitialized(err.to_string()));
+        }
+        Err(e) => {
+            return Err(Error::Keyring(format!(
+                "Failed to delete stale encryption key from keyring: {}",
+                e
+            )));
+        }
+    }
+
+    tracing::info!(
+        service_id = service_id,
+        db_key_id = db_key_id,
+        "Generating new database encryption key"
+    );
+
+    let config = EncryptionConfig::generate()?;
+    save_db_key(&entry, &config)?;
+
+    Ok(config)
+}
+
 /// Gets an existing database encryption key from the keyring.
 ///
 /// Unlike [`get_or_create_db_key`], this function does NOT generate a new key if one
