@@ -39,4 +39,16 @@ mod tests {
         assert_eq!(InvalidGroupState::NoRelays, InvalidGroupState::NoRelays);
         assert_ne!(InvalidGroupState::NoAdmins, InvalidGroupState::NoRelays);
     }
+
+    #[test]
+    fn test_invalid_group_state_display() {
+        assert_eq!(
+            InvalidGroupState::NoAdmins.to_string(),
+            "group has no admins"
+        );
+        assert_eq!(
+            InvalidGroupState::NoRelays.to_string(),
+            "group has no relays"
+        );
+    }
 }
