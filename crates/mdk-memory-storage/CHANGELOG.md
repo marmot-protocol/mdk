@@ -33,6 +33,8 @@
 
 ### Fixed
 
+- Fixed `MdkMemoryStorage::save_welcome` to reject oversized welcome group metadata and serialized event JSON before caching welcomes, matching SQLite backend payload bounds. ([#276](https://github.com/marmot-protocol/mdk/pull/276))
+
 ### Removed
 
 ### Deprecated

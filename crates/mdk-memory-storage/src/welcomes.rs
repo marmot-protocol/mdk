@@ -4,9 +4,62 @@ use mdk_storage_traits::welcomes::error::WelcomeError;
 use mdk_storage_traits::welcomes::types::*;
 use mdk_storage_traits::welcomes::validation::validate_welcome_fields;
 use mdk_storage_traits::welcomes::{Pagination, WelcomeStorage, validate_pending_welcomes_limit};
-use nostr::EventId;
+use nostr::{EventId, JsonUtil};
 
 use crate::MdkMemoryStorage;
+
+/// Maximum size for serialized welcome event JSON, matching the SQLite backend.
+const MAX_WELCOME_EVENT_JSON_SIZE: usize = 100 * 1024;
+
+fn validate_size(data: &[u8], max_size: usize, field_name: &str) -> Result<(), WelcomeError> {
+    if data.len() > max_size {
+        return Err(WelcomeError::InvalidParameters(format!(
+            "{} exceeds maximum length of {} bytes (got {} bytes)",
+            field_name,
+            max_size,
+            data.len()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_string_length(
+    s: &str,
+    max_length: usize,
+    field_name: &str,
+) -> Result<(), WelcomeError> {
+    if s.len() > max_length {
+        return Err(WelcomeError::InvalidParameters(format!(
+            "{} exceeds maximum length of {} bytes (got {} bytes)",
+            field_name,
+            max_length,
+            s.len()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_welcome_payload(
+    welcome: &Welcome,
+    max_group_name_length: usize,
+    max_group_description_length: usize,
+) -> Result<(), WelcomeError> {
+    validate_string_length(&welcome.group_name, max_group_name_length, "Group name")?;
+    validate_string_length(
+        &welcome.group_description,
+        max_group_description_length,
+        "Group description",
+    )?;
+
+    let event_json = welcome.event.as_json();
+    validate_size(
+        event_json.as_bytes(),
+        MAX_WELCOME_EVENT_JSON_SIZE,
+        "Event JSON",
+    )?;
+
+    Ok(())
+}
 
 impl WelcomeStorage for MdkMemoryStorage {
     fn save_welcome(&self, welcome: Welcome) -> Result<(), WelcomeError> {
@@ -16,6 +69,12 @@ impl WelcomeStorage for MdkMemoryStorage {
             self.limits.max_relays_per_welcome,
             self.limits.max_relay_url_length,
             self.limits.max_admins_per_welcome,
+        )?;
+
+        validate_welcome_payload(
+            &welcome,
+            self.limits.max_group_name_length,
+            self.limits.max_group_description_length,
         )?;
 
         let mut inner = self.inner.write();
@@ -91,7 +150,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        DEFAULT_MAX_ADMINS_PER_WELCOME, DEFAULT_MAX_RELAY_URL_LENGTH,
+        DEFAULT_MAX_ADMINS_PER_WELCOME, DEFAULT_MAX_GROUP_DESCRIPTION_LENGTH,
+        DEFAULT_MAX_GROUP_NAME_LENGTH, DEFAULT_MAX_RELAY_URL_LENGTH,
         DEFAULT_MAX_RELAYS_PER_WELCOME, ValidationLimits,
     };
 
@@ -277,6 +337,120 @@ mod tests {
     }
 
     #[test]
+    fn test_save_welcome_group_name_length_validation() {
+        let storage = MdkMemoryStorage::new();
+        let mls_group_id = GroupId::from_slice(&[1, 2, 3, 4]);
+        let event_id = EventId::from_hex(&format!("{:064x}", 1)).unwrap();
+
+        let mut welcome = create_test_welcome(mls_group_id, event_id);
+        welcome.group_name = "a".repeat(DEFAULT_MAX_GROUP_NAME_LENGTH + 1);
+
+        let result = storage.save_welcome(welcome);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Group name exceeds maximum length")
+        );
+    }
+
+    #[test]
+    fn test_save_welcome_group_name_at_limit() {
+        let storage = MdkMemoryStorage::new();
+        let mls_group_id = GroupId::from_slice(&[1, 2, 3, 4]);
+        let event_id = EventId::from_hex(&format!("{:064x}", 1)).unwrap();
+
+        let mut welcome = create_test_welcome(mls_group_id, event_id);
+        welcome.group_name = "a".repeat(DEFAULT_MAX_GROUP_NAME_LENGTH);
+
+        storage.save_welcome(welcome).unwrap();
+
+        let stored = storage
+            .find_welcome_by_event_id(&event_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.group_name.len(), DEFAULT_MAX_GROUP_NAME_LENGTH);
+    }
+
+    #[test]
+    fn test_save_welcome_group_description_length_validation() {
+        let storage = MdkMemoryStorage::new();
+        let mls_group_id = GroupId::from_slice(&[1, 2, 3, 4]);
+        let event_id = EventId::from_hex(&format!("{:064x}", 1)).unwrap();
+
+        let mut welcome = create_test_welcome(mls_group_id, event_id);
+        welcome.group_description = "a".repeat(DEFAULT_MAX_GROUP_DESCRIPTION_LENGTH + 1);
+
+        let result = storage.save_welcome(welcome);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Group description exceeds maximum length")
+        );
+    }
+
+    #[test]
+    fn test_save_welcome_group_description_at_limit() {
+        let storage = MdkMemoryStorage::new();
+        let mls_group_id = GroupId::from_slice(&[1, 2, 3, 4]);
+        let event_id = EventId::from_hex(&format!("{:064x}", 1)).unwrap();
+
+        let mut welcome = create_test_welcome(mls_group_id, event_id);
+        welcome.group_description = "a".repeat(DEFAULT_MAX_GROUP_DESCRIPTION_LENGTH);
+
+        storage.save_welcome(welcome).unwrap();
+
+        let stored = storage
+            .find_welcome_by_event_id(&event_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.group_description.len(),
+            DEFAULT_MAX_GROUP_DESCRIPTION_LENGTH
+        );
+    }
+
+    #[test]
+    fn test_save_welcome_event_json_size_validation() {
+        let storage = MdkMemoryStorage::new();
+        let mls_group_id = GroupId::from_slice(&[1, 2, 3, 4]);
+        let event_id = EventId::from_hex(&format!("{:064x}", 1)).unwrap();
+
+        let mut welcome = create_test_welcome(mls_group_id, event_id);
+        welcome.event.content = "a".repeat(100 * 1024);
+
+        let result = storage.save_welcome(welcome);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Event JSON exceeds maximum length")
+        );
+    }
+
+    #[test]
+    fn test_save_welcome_event_json_under_limit() {
+        let storage = MdkMemoryStorage::new();
+        let mls_group_id = GroupId::from_slice(&[1, 2, 3, 4]);
+        let event_id = EventId::from_hex(&format!("{:064x}", 1)).unwrap();
+
+        let mut welcome = create_test_welcome(mls_group_id, event_id);
+        welcome.event.content = "a".repeat(99 * 1024);
+
+        storage.save_welcome(welcome).unwrap();
+
+        let stored = storage
+            .find_welcome_by_event_id(&event_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.event.content.len(), 99 * 1024);
+    }
+
+    #[test]
     fn test_pending_welcomes_pagination_memory() {
         let storage = MdkMemoryStorage::new();
 
@@ -419,7 +593,9 @@ mod tests {
         let limits = ValidationLimits::default()
             .with_max_relays_per_welcome(2)
             .with_max_admins_per_welcome(3)
-            .with_max_relay_url_length(50);
+            .with_max_relay_url_length(50)
+            .with_max_group_name_length(10)
+            .with_max_group_description_length(20);
 
         let storage = MdkMemoryStorage::with_limits(limits);
 
@@ -427,6 +603,8 @@ mod tests {
         assert_eq!(storage.limits().max_relays_per_welcome, 2);
         assert_eq!(storage.limits().max_admins_per_welcome, 3);
         assert_eq!(storage.limits().max_relay_url_length, 50);
+        assert_eq!(storage.limits().max_group_name_length, 10);
+        assert_eq!(storage.limits().max_group_description_length, 20);
 
         let mls_group_id = GroupId::from_slice(&[1, 2, 3, 4]);
 
@@ -472,5 +650,33 @@ mod tests {
         let result = storage.save_welcome(welcome);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("50 bytes"));
+
+        // Test group name at custom limit
+        let event_id = EventId::from_hex(&format!("{:064x}", 7)).unwrap();
+        let mut welcome = create_test_welcome(mls_group_id.clone(), event_id);
+        welcome.group_name = "a".repeat(10);
+        assert!(storage.save_welcome(welcome).is_ok());
+
+        // Test group name length with custom limit
+        let event_id = EventId::from_hex(&format!("{:064x}", 8)).unwrap();
+        let mut welcome = create_test_welcome(mls_group_id.clone(), event_id);
+        welcome.group_name = "a".repeat(11);
+        let result = storage.save_welcome(welcome);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("10 bytes"));
+
+        // Test group description at custom limit
+        let event_id = EventId::from_hex(&format!("{:064x}", 9)).unwrap();
+        let mut welcome = create_test_welcome(mls_group_id.clone(), event_id);
+        welcome.group_description = "a".repeat(20);
+        assert!(storage.save_welcome(welcome).is_ok());
+
+        // Test group description length with custom limit
+        let event_id = EventId::from_hex(&format!("{:064x}", 10)).unwrap();
+        let mut welcome = create_test_welcome(mls_group_id, event_id);
+        welcome.group_description = "a".repeat(21);
+        let result = storage.save_welcome(welcome);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("20 bytes"));
     }
 }

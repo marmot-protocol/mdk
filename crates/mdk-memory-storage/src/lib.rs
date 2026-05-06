@@ -34,6 +34,9 @@
 //! 1 MiB for message content, 100 KiB for serialized tags JSON, and 100 KiB for
 //! serialized event JSON.
 //!
+//! Welcome payloads also enforce the same fixed 100 KiB serialized event JSON
+//! limit as the SQLite backend.
+//!
 //! ## Customizing Limits
 //!
 //! You can customize these limits using [`ValidationLimits`] and the builder pattern:
@@ -1451,6 +1454,56 @@ mod tests {
     fn test_default() {
         let nostr_storage = MdkMemoryStorage::default();
         assert_eq!(nostr_storage.backend(), Backend::Memory);
+    }
+
+    #[test]
+    fn test_validation_limits_new_matches_default() {
+        let limits = ValidationLimits::new();
+        let default_limits = ValidationLimits::default();
+
+        assert_eq!(limits.cache_size, default_limits.cache_size);
+        assert_eq!(
+            limits.max_relays_per_group,
+            default_limits.max_relays_per_group
+        );
+        assert_eq!(
+            limits.max_messages_per_group,
+            default_limits.max_messages_per_group
+        );
+        assert_eq!(
+            limits.max_group_name_length,
+            default_limits.max_group_name_length
+        );
+        assert_eq!(
+            limits.max_group_description_length,
+            default_limits.max_group_description_length
+        );
+        assert_eq!(
+            limits.max_admins_per_group,
+            default_limits.max_admins_per_group
+        );
+        assert_eq!(
+            limits.max_relays_per_welcome,
+            default_limits.max_relays_per_welcome
+        );
+        assert_eq!(
+            limits.max_admins_per_welcome,
+            default_limits.max_admins_per_welcome
+        );
+        assert_eq!(
+            limits.max_relay_url_length,
+            default_limits.max_relay_url_length
+        );
+    }
+
+    #[test]
+    fn test_debug_redacts_inner_storage() {
+        let debug = format!("{:?}", MdkMemoryStorage::new());
+
+        assert!(debug.contains("MdkMemoryStorage"));
+        assert!(debug.contains("limits"));
+        assert!(debug.contains("RwLock<MdkMemoryStorageInner>"));
+        assert!(!debug.contains("welcomes_cache"));
     }
 
     #[test]
