@@ -28,13 +28,13 @@ jobs:
       rust: ${{ steps.filter.outputs.rust }}
       ci: ${{ steps.filter.outputs.ci }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           fetch-depth: 2
 
       - name: Detect changes
         id: filter
-        uses: dorny/paths-filter@v3
+        uses: dorny/paths-filter@d1c1ffe0248fe513906c8e24db8ea791d46f8590 # v3.0.3
         with:
           filters: |
             rust:
@@ -46,6 +46,21 @@ jobs:
               - 'scripts/**'
             ci:
               - '.github/workflows/**'
+              - 'scripts/check-github-actions-pinned.sh'
+
+  # ── GitHub Actions supply-chain guard ───────────────────────────────
+  actions-pinned:
+    runs-on: ubuntu-latest
+    name: GitHub Actions Pins
+    needs: changes
+    if: github.event_name == 'push' || needs.changes.outputs.ci == 'true'
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+    - name: Check GitHub Actions pins
+      run: bash scripts/check-github-actions-pinned.sh
 
   # ── Quick checks that fail fast ─────────────────────────────────────
   format:
@@ -56,11 +71,12 @@ jobs:
 
     steps:
     - name: Checkout code
-      uses: actions/checkout@v4
+      uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
     - name: Setup Rust (stable)
-      uses: dtolnay/rust-toolchain@stable
+      uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # pinned from master
       with:
+        toolchain: stable
         components: rustfmt
 
     - name: Check formatting
@@ -88,16 +104,16 @@ jobs:
 
     steps:
     - name: Checkout code
-      uses: actions/checkout@v4
+      uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
     - name: Setup Rust (${{ matrix.rust }})
-      uses: dtolnay/rust-toolchain@master
+      uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # pinned from master
       with:
         toolchain: ${{ matrix.rust }}
         components: clippy
 
     - name: Cache Rust dependencies
-      uses: Swatinem/rust-cache@v2
+      uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       with:
         key: ${{ matrix.rust }}-${{ matrix.features.name }}
 
@@ -122,15 +138,15 @@ jobs:
 
     steps:
     - name: Checkout code
-      uses: actions/checkout@v4
+      uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
     - name: Setup Rust (${{ matrix.rust }})
-      uses: dtolnay/rust-toolchain@master
+      uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # pinned from master
       with:
         toolchain: ${{ matrix.rust }}
 
     - name: Cache Rust dependencies
-      uses: Swatinem/rust-cache@v2
+      uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       with:
         key: ${{ matrix.rust }}-docs
 
@@ -163,18 +179,22 @@ jobs:
 
     steps:
     - name: Checkout code
-      uses: actions/checkout@v4
+      uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
     - name: Setup Rust (stable)
-      uses: dtolnay/rust-toolchain@stable
+      uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # pinned from master
+      with:
+        toolchain: stable
 
     - name: Cache Rust dependencies
-      uses: Swatinem/rust-cache@v2
+      uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       with:
         key: test-${{ matrix.features.name }}
 
     - name: Install cargo-nextest
-      uses: taiki-e/install-action@cargo-nextest
+      uses: taiki-e/install-action@cca35edeb1d01366c2843b68fc3ca441446d73d3 # v2.77.1
+      with:
+        tool: cargo-nextest
 
     - name: Install system dependencies
       run: sudo apt-get update && sudo apt-get install -y pkg-config
@@ -195,10 +215,12 @@ jobs:
 
     steps:
     - name: Checkout code
-      uses: actions/checkout@v4
+      uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
     - name: Install cargo-audit
-      uses: taiki-e/install-action@cargo-audit
+      uses: taiki-e/install-action@cca35edeb1d01366c2843b68fc3ca441446d73d3 # v2.77.1
+      with:
+        tool: cargo-audit
 
     - name: Run cargo audit
       run: cargo audit

@@ -13,13 +13,13 @@ jobs:
       issues: write
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           fetch-depth: 0
 
       - name: Get PR information
         id: pr_info
-        uses: actions/github-script@v7
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
         with:
           script: |
             const pr = await github.rest.pulls.get({
@@ -73,8 +73,8 @@ jobs:
           echo "Reason: PR has skip label or title contains [skip-changelog]"
 
       - name: Comment on PR if changelog is missing
-        if: steps.check_changelog.outputs.changed == 'false' && steps.pr_info.outputs.skip != 'true'
-        uses: actions/github-script@v7
+        if: always() && steps.check_changelog.outputs.changed == 'false' && steps.pr_info.outputs.skip != 'true'
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
         with:
           script: |
             const comment = `## ❌ Changelog Check Failed
@@ -91,10 +91,9 @@ jobs:
 
             To skip this check, add the \`skip-changelog\` label or include \`[skip-changelog]\` in the PR title.`;
 
-            github.rest.issues.createComment({
+            await github.rest.issues.createComment({
               issue_number: context.issue.number,
               owner: context.repo.owner,
               repo: context.repo.repo,
               body: comment
             });
-

@@ -30,18 +30,20 @@ jobs:
 
     steps:
     - name: Checkout code
-      uses: actions/checkout@v4
+      uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       with:
         fetch-depth: 0
 
     - name: Setup Rust
-      uses: dtolnay/rust-toolchain@stable
+      uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # pinned from master
+      with:
+        toolchain: stable
 
     - name: Cache Rust dependencies
-      uses: Swatinem/rust-cache@v2
+      uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
     - name: Install just
-      uses: extractions/setup-just@v2
+      uses: extractions/setup-just@dd310ad5a97d8e7b41793f8ef055398d51ad4de6 # v2.0.0
 
     - name: Build iOS targets
       run: |
@@ -66,7 +68,7 @@ jobs:
         echo "✓ Swift package assembled"
 
     - name: Checkout Swift package repo
-      uses: actions/checkout@v4
+      uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       with:
         repository: ${{ env.SWIFT_PACKAGE_REPO }}
         path: swift-package-repo
@@ -116,12 +118,14 @@ jobs:
 
     steps:
     - name: Checkout code
-      uses: actions/checkout@v4
+      uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       with:
         fetch-depth: 0
 
     - name: Setup Rust
-      uses: dtolnay/rust-toolchain@stable
+      uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # pinned from master
+      with:
+        toolchain: stable
 
     - name: Add aarch64-apple-ios target if matrix.os is macos-latest
       if: matrix.os == 'macos-latest'
@@ -140,13 +144,13 @@ jobs:
         echo "OPENSSL_STATIC=1" >> $env:GITHUB_ENV
 
     - name: Cache Rust dependencies
-      uses: Swatinem/rust-cache@v2
+      uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
     - name: Install just
-      uses: extractions/setup-just@v2
+      uses: extractions/setup-just@dd310ad5a97d8e7b41793f8ef055398d51ad4de6 # v2.0.0
 
     - name: Setup Python
-      uses: actions/setup-python@v5
+      uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
       with:
         python-version: '3.11'
 
@@ -179,7 +183,7 @@ jobs:
         echo "✓ Python artifacts prepared for ${{ runner.os }}"
 
     - name: Upload Python artifacts
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
       with:
         name: python-artifacts-${{ matrix.os }}
         path: python-artifacts/
@@ -196,12 +200,12 @@ jobs:
 
     steps:
     - name: Checkout code
-      uses: actions/checkout@v4
+      uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       with:
         fetch-depth: 0
 
     - name: Download all Python artifacts
-      uses: actions/download-artifact@v4
+      uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
       with:
         path: python-artifacts-all
         pattern: python-artifacts-*
@@ -247,7 +251,7 @@ jobs:
         ls -la python-package/mdk/
 
     - name: Checkout Python package repo
-      uses: actions/checkout@v4
+      uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       with:
         repository: ${{ env.PYTHON_PACKAGE_REPO }}
         path: python-package-repo
@@ -280,7 +284,7 @@ jobs:
 
     - name: Setup Python for package publishing
       if: startsWith(github.ref, 'refs/tags/v') || inputs.publish_test_pypi == true
-      uses: actions/setup-python@v5
+      uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
       with:
         python-version: '3.11'
 
@@ -300,14 +304,14 @@ jobs:
 
     - name: Publish to TestPyPI
       if: inputs.publish_test_pypi == true
-      uses: pypa/gh-action-pypi-publish@release/v1
+      uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # v1.14.0
       with:
         packages-dir: python-package/dist/
         repository-url: https://test.pypi.org/legacy/
 
     - name: Publish to PyPI
       if: startsWith(github.ref, 'refs/tags/v')
-      uses: pypa/gh-action-pypi-publish@release/v1
+      uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # v1.14.0
       with:
         packages-dir: python-package/dist/
 
@@ -321,12 +325,14 @@ jobs:
 
     steps:
     - name: Checkout code
-      uses: actions/checkout@v4
+      uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       with:
         fetch-depth: 0
 
     - name: Setup Rust
-      uses: dtolnay/rust-toolchain@stable
+      uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # pinned from master
+      with:
+        toolchain: stable
 
     - name: Add aarch64-apple-ios target if matrix.os is macos-latest
       if: matrix.os == 'macos-latest'
@@ -345,13 +351,13 @@ jobs:
         echo "OPENSSL_STATIC=1" >> $env:GITHUB_ENV
 
     - name: Cache Rust dependencies
-      uses: Swatinem/rust-cache@v2
+      uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
     - name: Install just
-      uses: extractions/setup-just@v2
+      uses: extractions/setup-just@dd310ad5a97d8e7b41793f8ef055398d51ad4de6 # v2.0.0
 
     - name: Setup Ruby
-      uses: ruby/setup-ruby@v1
+      uses: ruby/setup-ruby@c4e5b1316158f92e3d49443a9d58b31d25ac0f8f # v1.306.0
       with:
         ruby-version: '3.2'
 
@@ -381,7 +387,7 @@ jobs:
         echo "✓ Ruby artifacts prepared for ${{ runner.os }}"
 
     - name: Upload Ruby artifacts
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
       with:
         name: ruby-artifacts-${{ matrix.os }}
         path: ruby-artifacts/
@@ -398,12 +404,12 @@ jobs:
 
     steps:
     - name: Checkout code
-      uses: actions/checkout@v4
+      uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       with:
         fetch-depth: 0
 
     - name: Download all Ruby artifacts
-      uses: actions/download-artifact@v4
+      uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
       with:
         path: ruby-artifacts-all
         pattern: ruby-artifacts-*
@@ -436,7 +442,7 @@ jobs:
         echo "✓ Complete Ruby gem assembled with all platform libraries"
 
     - name: Checkout Ruby package repo
-      uses: actions/checkout@v4
+      uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       with:
         repository: ${{ env.RUBY_PACKAGE_REPO }}
         path: ruby-package-repo
@@ -469,13 +475,13 @@ jobs:
 
     - name: Setup Ruby for gem publishing
       if: startsWith(github.ref, 'refs/tags/v')
-      uses: ruby/setup-ruby@v1
+      uses: ruby/setup-ruby@c4e5b1316158f92e3d49443a9d58b31d25ac0f8f # v1.306.0
       with:
         ruby-version: '3.2'
 
     - name: Configure RubyGems Trusted Publishing credentials
       if: startsWith(github.ref, 'refs/tags/v')
-      uses: rubygems/configure-rubygems-credentials@v1.0.0
+      uses: rubygems/configure-rubygems-credentials@bc6dd217f8a4f919d6835fcfefd470ef821f5c44 # v1.0.0
 
     - name: Build and publish gem to RubyGems.org
       if: startsWith(github.ref, 'refs/tags/v')
@@ -490,7 +496,7 @@ jobs:
 
     steps:
     - name: Checkout code
-      uses: actions/checkout@v4
+      uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       with:
         fetch-depth: 0
 
@@ -499,26 +505,28 @@ jobs:
         rm -rf /opt/hostedtoolcache
 
     - name: Setup Rust
-      uses: dtolnay/rust-toolchain@stable
+      uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # pinned from master
+      with:
+        toolchain: stable
 
     - name: Cache Rust dependencies
-      uses: Swatinem/rust-cache@v2
+      uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
     - name: Install just
-      uses: extractions/setup-just@v2
+      uses: extractions/setup-just@dd310ad5a97d8e7b41793f8ef055398d51ad4de6 # v2.0.0
 
     - name: Setup Java
-      uses: actions/setup-java@v4
+      uses: actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9 # v4.8.0
       with:
         distribution: 'temurin'
         java-version: '17'
 
     - name: Setup Android SDK
-      uses: android-actions/setup-android@v3
+      uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3.2.2
 
     - name: Setup Android NDK
       id: setup-ndk
-      uses: nttld/setup-ndk@v1
+      uses: nttld/setup-ndk@ed92fe6cadad69be94a966a7ee3271275e62f779 # v1.6.0
       with:
         ndk-version: r27d
         add-to-path: false
@@ -598,7 +606,7 @@ jobs:
         echo "Updated gradle.properties with version: $VERSION"
 
     - name: Checkout Kotlin package repo
-      uses: actions/checkout@v6
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       with:
         repository: ${{ env.KOTLIN_PACKAGE_REPO }}
         path: kotlin-package-repo
@@ -686,4 +694,3 @@ jobs:
         # Force push to update remote tag if it exists
         git push origin "$TAG" --force
         echo "Created/updated and pushed tag: $TAG"
-

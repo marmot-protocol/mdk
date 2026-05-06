@@ -30,11 +30,11 @@ jobs:
     outputs:
       rust: ${{ steps.filter.outputs.rust }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
       - name: Detect changes
         id: filter
-        uses: dorny/paths-filter@v3
+        uses: dorny/paths-filter@d1c1ffe0248fe513906c8e24db8ea791d46f8590 # v3.0.3
         with:
           filters: |
             rust:
@@ -53,13 +53,15 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
       - name: Setup Rust (stable)
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # pinned from master
+        with:
+          toolchain: stable
 
       - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           key: coverage
 
@@ -67,7 +69,9 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y pkg-config
 
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@cargo-llvm-cov
+        uses: taiki-e/install-action@cca35edeb1d01366c2843b68fc3ca441446d73d3 # v2.77.1
+        with:
+          tool: cargo-llvm-cov
 
       - name: Generate coverage
         run: |
@@ -172,7 +176,7 @@ jobs:
 
       - name: Comment PR with coverage change
         if: always() && github.event_name == 'pull_request' && steps.master_coverage.outputs.baseline != '0'
-        uses: actions/github-script@v7
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
         with:
           script: |
             const current = parseFloat('${{ steps.coverage.outputs.percentage }}');
@@ -180,9 +184,10 @@ jobs:
             const diff = (current - baseline).toFixed(2);
 
             let emoji = current > baseline ? '✅' : current < baseline ? '❌' : '⚠️';
+            const commentMarker = '<!-- coverage-comment -->';
 
             // Build the message (with markdown header for comments, without for logs)
-            const commentBody = `## ${emoji} Coverage: ${baseline}% → ${current}% (${diff > 0 ? '+' : ''}${diff}%)`;
+            const commentBody = `${commentMarker}\n## ${emoji} Coverage: ${baseline}% → ${current}% (${diff > 0 ? '+' : ''}${diff}%)`;
             const logMessage = `${emoji} Coverage: ${baseline}% → ${current}% (${diff > 0 ? '+' : ''}${diff}%)`;
 
             // Skip commenting on PRs from forks (they don't have write permissions)
@@ -194,12 +199,31 @@ jobs:
             }
 
             try {
-              await github.rest.issues.createComment({
+              const { data: comments } = await github.rest.issues.listComments({
                 issue_number: context.issue.number,
                 owner: context.repo.owner,
-                repo: context.repo.repo,
-                body: commentBody
+                repo: context.repo.repo
               });
+
+              const existing = comments.find(c =>
+                c.body.includes(commentMarker) && c.user.type === 'Bot'
+              );
+
+              if (existing) {
+                await github.rest.issues.updateComment({
+                  comment_id: existing.id,
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  body: commentBody
+                });
+              } else {
+                await github.rest.issues.createComment({
+                  issue_number: context.issue.number,
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  body: commentBody
+                });
+              }
             } catch (error) {
               // Gracefully handle permission errors (e.g., from forks)
               if (error.status === 403) {
@@ -219,28 +243,28 @@ jobs:
 
       - name: Upload coverage baseline (master only)
         if: github.ref == 'refs/heads/master' && github.event_name == 'push'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: coverage-baseline
           path: coverage-baseline/coverage-baseline.txt
           retention-days: 90
 
       - name: Upload HTML coverage report
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: coverage-report-html
           path: coverage/html/
           retention-days: 90
 
       - name: Upload lcov coverage report
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: coverage-report-lcov
           path: coverage/lcov.info
           retention-days: 90
 
       - name: Upload coverage summary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: coverage-summary
           path: coverage/summary.txt

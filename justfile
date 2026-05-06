@@ -61,6 +61,10 @@ fmt:
 docs:
     @bash scripts/check-docs.sh
 
+# Check that GitHub Actions references are SHA-pinned
+actions-pinned:
+    @bash scripts/check-github-actions-pinned.sh
+
 # ==============================================================================
 # PRE-COMMIT CHECKS
 # ==============================================================================
@@ -68,6 +72,7 @@ docs:
 # Pre-commit checks: quiet mode with minimal output (recommended for agents/CI)
 precommit:
     @just _run-quiet "fmt"               "fmt (stable)"
+    @just _run-quiet "actions-pinned"    "actions pinned"
     @just _run-quiet "docs"              "docs (stable)"
     @just _run-quiet "lint"              "clippy (stable)"
     @just _run-quiet "_fmt-msrv"         "fmt (msrv)"
@@ -84,6 +89,9 @@ precommit-verbose:
     @echo "=========================================="
     @echo "Running pre-commit checks (stable + MSRV)"
     @echo "=========================================="
+    @echo ""
+    @echo "→ Checking GitHub Actions pins..."
+    @just actions-pinned
     @echo ""
     @echo "→ Checking with stable Rust..."
     @bash scripts/check-all.sh stable
@@ -461,4 +469,3 @@ _run-quiet recipe label:
         cat "$TMPFILE"
         exit 1
     fi
-
