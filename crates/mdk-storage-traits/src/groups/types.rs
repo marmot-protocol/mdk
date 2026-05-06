@@ -444,7 +444,7 @@ mod tests {
         let secret = GroupExporterSecret {
             mls_group_id: GroupId::from_slice(&[1, 2, 3]),
             epoch: 42,
-            secret: Secret::new([0u8; 32]),
+            secret: Secret::new([0xABu8; 32]),
         };
 
         let err = serde_json::to_value(&secret)
@@ -452,7 +452,7 @@ mod tests {
         let err = err.to_string();
 
         assert!(err.contains("Secret values cannot be serialized"));
-        assert!(!err.contains("[0"));
+        assert!(!err.contains("171"));
     }
 
     #[test]

@@ -21,6 +21,7 @@ where
     ///
     /// This is intentionally opt-in so accidental serde exports of `Secret<T>`
     /// fail instead of leaking wrapped key material.
+    #[must_use = "PlaintextSecret is only useful when passed to a serializer"]
     pub fn expose_for_serialization(&self) -> PlaintextSecret<'_, T> {
         PlaintextSecret(&self.0)
     }
@@ -75,6 +76,12 @@ where
 
 /// Explicit opt-in wrapper for serializing the plaintext value inside a [`Secret`].
 pub struct PlaintextSecret<'a, T>(&'a T);
+
+impl<T> fmt::Debug for PlaintextSecret<'_, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "PlaintextSecret(***)")
+    }
+}
 
 impl<T> Serialize for Secret<T>
 where
@@ -168,5 +175,35 @@ mod tests {
         let serialized = serde_json::to_value(secret.expose_for_serialization()).unwrap();
 
         assert_eq!(serialized, serde_json::json!([222, 173, 190, 239]));
+    }
+
+    #[test]
+    fn test_optional_plaintext_secret_serialization_is_explicit() {
+        let secret = Some(Secret::new([222u8, 173, 190, 239]));
+        let missing_secret: Option<Secret<[u8; 4]>> = None;
+
+        let serialized =
+            serde_json::to_value(secret.as_ref().map(Secret::expose_for_serialization)).unwrap();
+        let serialized_missing = serde_json::to_value(
+            missing_secret
+                .as_ref()
+                .map(Secret::expose_for_serialization),
+        )
+        .unwrap();
+
+        assert_eq!(serialized, serde_json::json!([222, 173, 190, 239]));
+        assert_eq!(serialized_missing, serde_json::Value::Null);
+    }
+
+    #[test]
+    fn test_plaintext_secret_debug_redacts_value() {
+        let secret = Secret::new([222u8, 173, 190, 239]);
+        let debug_str = format!("{:?}", secret.expose_for_serialization());
+
+        assert_eq!(debug_str, "PlaintextSecret(***)");
+        assert!(!debug_str.contains("222"));
+        assert!(!debug_str.contains("173"));
+        assert!(!debug_str.contains("190"));
+        assert!(!debug_str.contains("239"));
     }
 }
