@@ -110,18 +110,7 @@ pub struct Group {
 
 impl fmt::Debug for Group {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Group")
-            .field("has_image_hash", &self.image_hash.is_some())
-            .field("has_image_key", &self.image_key.is_some())
-            .field("has_image_nonce", &self.image_nonce.is_some())
-            .field("admin_pubkeys_count", &self.admin_pubkeys.len())
-            .field("last_message_id", &self.last_message_id)
-            .field("last_message_at", &self.last_message_at)
-            .field("last_message_processed_at", &self.last_message_processed_at)
-            .field("epoch", &self.epoch)
-            .field("state", &self.state)
-            .field("self_update_state", &self.self_update_state)
-            .finish()
+        f.debug_struct("Group").finish_non_exhaustive()
     }
 }
 
@@ -182,9 +171,7 @@ pub struct GroupRelay {
 
 impl fmt::Debug for GroupRelay {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("GroupRelay")
-            .field("relay_url", &self.relay_url)
-            .finish()
+        f.debug_struct("GroupRelay").finish_non_exhaustive()
     }
 }
 
@@ -202,9 +189,7 @@ pub struct GroupExporterSecret {
 impl fmt::Debug for GroupExporterSecret {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("GroupExporterSecret")
-            .field("epoch", &self.epoch)
-            .field("secret", &"[REDACTED]")
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -461,7 +446,7 @@ mod tests {
 
         let debug_str = format!("{:?}", secret);
 
-        assert!(debug_str.contains("epoch"));
+        assert!(debug_str.contains("GroupExporterSecret"));
         assert!(!debug_str.contains("mls_group_id"));
         assert!(!debug_str.contains("GroupId"));
         assert!(!debug_str.contains("deadbeef"));
@@ -496,7 +481,7 @@ mod tests {
 
         let debug_str = format!("{:?}", relay);
 
-        assert!(debug_str.contains("relay_url"));
+        assert!(debug_str.contains("GroupRelay"));
         assert!(!debug_str.contains("mls_group_id"));
         assert!(!debug_str.contains("GroupId"));
         assert!(!debug_str.contains("deadbeef"));

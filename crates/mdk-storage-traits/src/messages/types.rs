@@ -34,14 +34,7 @@ pub struct ProcessedMessage {
 
 impl fmt::Debug for ProcessedMessage {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ProcessedMessage")
-            .field("wrapper_event_id", &self.wrapper_event_id)
-            .field("message_event_id", &self.message_event_id)
-            .field("processed_at", &self.processed_at)
-            .field("epoch", &self.epoch)
-            .field("state", &self.state)
-            .field("has_failure_reason", &self.failure_reason.is_some())
-            .finish()
+        f.debug_struct("ProcessedMessage").finish_non_exhaustive()
     }
 }
 
@@ -80,19 +73,7 @@ pub struct Message {
 
 impl fmt::Debug for Message {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Message")
-            .field("id", &self.id)
-            .field("pubkey", &self.pubkey)
-            .field("kind", &self.kind)
-            .field("created_at", &self.created_at)
-            .field("processed_at", &self.processed_at)
-            .field("content", &"[REDACTED]")
-            .field("tags", &"[REDACTED]")
-            .field("event", &"[REDACTED]")
-            .field("wrapper_event_id", &self.wrapper_event_id)
-            .field("epoch", &self.epoch)
-            .field("state", &self.state)
-            .finish()
+        f.debug_struct("Message").finish_non_exhaustive()
     }
 }
 

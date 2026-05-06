@@ -27,13 +27,7 @@ pub struct ProcessedWelcome {
 
 impl fmt::Debug for ProcessedWelcome {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ProcessedWelcome")
-            .field("wrapper_event_id", &self.wrapper_event_id)
-            .field("welcome_event_id", &self.welcome_event_id)
-            .field("processed_at", &self.processed_at)
-            .field("state", &self.state)
-            .field("has_failure_reason", &self.failure_reason.is_some())
-            .finish()
+        f.debug_struct("ProcessedWelcome").finish_non_exhaustive()
     }
 }
 
@@ -74,18 +68,7 @@ pub struct Welcome {
 
 impl fmt::Debug for Welcome {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Welcome")
-            .field("id", &self.id)
-            .field("event", &"[REDACTED]")
-            .field("has_group_image_hash", &self.group_image_hash.is_some())
-            .field("has_group_image_key", &self.group_image_key.is_some())
-            .field("has_group_image_nonce", &self.group_image_nonce.is_some())
-            .field("group_admin_pubkeys_count", &self.group_admin_pubkeys.len())
-            .field("group_relays_count", &self.group_relays.len())
-            .field("member_count", &self.member_count)
-            .field("state", &self.state)
-            .field("wrapper_event_id", &self.wrapper_event_id)
-            .finish()
+        f.debug_struct("Welcome").finish_non_exhaustive()
     }
 }
 
