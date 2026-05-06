@@ -119,6 +119,45 @@ mod tests {
     }
 
     #[test]
+    fn test_welcome_serialization_with_secret_is_rejected() {
+        let pubkey =
+            PublicKey::from_hex("8a9de562cbbed225b6ea0118dd3997a02df92c0bffd2224f71081a7450c3e549")
+                .unwrap();
+        let now = Timestamp::now();
+        let welcome = Welcome {
+            id: EventId::all_zeros(),
+            event: UnsignedEvent::new(
+                pubkey,
+                now,
+                nostr::Kind::MlsWelcome,
+                nostr::Tags::new(),
+                "private welcome event body".to_string(),
+            ),
+            mls_group_id: GroupId::from_slice(&[1, 2, 3]),
+            nostr_group_id: [0u8; 32],
+            group_name: "Private Group".to_string(),
+            group_description: "Private Description".to_string(),
+            group_image_hash: Some([8u8; 32]),
+            group_image_key: Some(Secret::new([7u8; 32])),
+            group_image_nonce: Some(Secret::new([6u8; 12])),
+            group_admin_pubkeys: BTreeSet::new(),
+            group_relays: BTreeSet::new(),
+            welcomer: pubkey,
+            member_count: 3,
+            state: WelcomeState::Pending,
+            wrapper_event_id: EventId::all_zeros(),
+        };
+
+        let err = serde_json::to_value(&welcome)
+            .expect_err("Welcome serialization should fail when secrets are present");
+        let err = err.to_string();
+
+        assert!(err.contains("Secret values cannot be serialized"));
+        assert!(!err.contains("[7"));
+        assert!(!err.contains("[6"));
+    }
+
+    #[test]
     fn test_processed_welcome_debug_redacts_sensitive_values() {
         let processed_welcome = ProcessedWelcome {
             wrapper_event_id: EventId::all_zeros(),

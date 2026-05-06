@@ -16,6 +16,14 @@ where
     pub fn new(value: T) -> Self {
         Self(value)
     }
+
+    /// Return an explicit plaintext serialization wrapper for this secret.
+    ///
+    /// This is intentionally opt-in so accidental serde exports of `Secret<T>`
+    /// fail instead of leaking wrapped key material.
+    pub fn expose_for_serialization(&self) -> PlaintextSecret<'_, T> {
+        PlaintextSecret(&self.0)
+    }
 }
 
 impl<T> AsMut<T> for Secret<T>
@@ -65,10 +73,26 @@ where
     }
 }
 
-// Serialization support
+/// Explicit opt-in wrapper for serializing the plaintext value inside a [`Secret`].
+pub struct PlaintextSecret<'a, T>(&'a T);
+
 impl<T> Serialize for Secret<T>
 where
-    T: zeroize::Zeroize + Serialize,
+    T: zeroize::Zeroize,
+{
+    fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        Err(serde::ser::Error::custom(
+            "Secret values cannot be serialized",
+        ))
+    }
+}
+
+impl<T> Serialize for PlaintextSecret<'_, T>
+where
+    T: Serialize,
 {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -120,5 +144,29 @@ mod tests {
         assert!(!debug_str.contains("173"));
         assert!(!debug_str.contains("190"));
         assert!(!debug_str.contains("239"));
+    }
+
+    #[test]
+    fn test_secret_serialization_is_rejected() {
+        let secret = Secret::new([222u8, 173, 190, 239]);
+
+        let err = serde_json::to_value(&secret)
+            .expect_err("Secret serialization should not expose plaintext");
+        let err = err.to_string();
+
+        assert!(err.contains("Secret values cannot be serialized"));
+        assert!(!err.contains("222"));
+        assert!(!err.contains("173"));
+        assert!(!err.contains("190"));
+        assert!(!err.contains("239"));
+    }
+
+    #[test]
+    fn test_plaintext_secret_serialization_is_explicit() {
+        let secret = Secret::new([222u8, 173, 190, 239]);
+
+        let serialized = serde_json::to_value(secret.expose_for_serialization()).unwrap();
+
+        assert_eq!(serialized, serde_json::json!([222, 173, 190, 239]));
     }
 }

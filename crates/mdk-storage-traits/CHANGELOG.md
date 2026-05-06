@@ -27,6 +27,8 @@
 
 ### Breaking changes
 
+- Changed default serde serialization for `Secret<T>` to fail instead of emitting wrapped secret values. Use `Secret::expose_for_serialization()` for deliberate plaintext exports. ([#280](https://github.com/marmot-protocol/mdk/pull/280))
+
 ### Changed
 
 ### Added
@@ -34,6 +36,7 @@
 ### Fixed
 
 - Redacted sensitive MLS/Nostr group identifiers and private payload fields from storage-domain `Debug` output. ([#277](https://github.com/marmot-protocol/mdk/pull/277))
+- Prevented serde-based exports of storage-domain structs from leaking image keys, nonces, and exporter secrets in plaintext. ([#280](https://github.com/marmot-protocol/mdk/pull/280))
 
 ### Removed
 

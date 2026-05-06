@@ -381,6 +381,34 @@ mod tests {
     }
 
     #[test]
+    fn test_group_serialization_with_secret_is_rejected() {
+        let group = Group {
+            mls_group_id: GroupId::from_slice(&[1, 2, 3]),
+            nostr_group_id: [0u8; 32],
+            name: "Test Group".to_string(),
+            description: "Test Description".to_string(),
+            image_hash: Some([8u8; 32]),
+            image_key: Some(Secret::new([7u8; 32])),
+            image_nonce: Some(Secret::new([6u8; 12])),
+            admin_pubkeys: BTreeSet::new(),
+            last_message_id: None,
+            last_message_at: None,
+            last_message_processed_at: None,
+            epoch: 0,
+            state: GroupState::Active,
+            self_update_state: SelfUpdateState::Required,
+        };
+
+        let err = serde_json::to_value(&group)
+            .expect_err("Group serialization should fail when secrets are present");
+        let err = err.to_string();
+
+        assert!(err.contains("Secret values cannot be serialized"));
+        assert!(!err.contains("[7"));
+        assert!(!err.contains("[6"));
+    }
+
+    #[test]
     fn test_group_debug_redacts_sensitive_values() {
         let group = Group {
             mls_group_id: GroupId::from_slice(&[222, 173, 190, 239]),
@@ -412,25 +440,36 @@ mod tests {
     }
 
     #[test]
-    fn test_group_exporter_secret_serialization() {
+    fn test_group_exporter_secret_serialization_is_rejected() {
         let secret = GroupExporterSecret {
             mls_group_id: GroupId::from_slice(&[1, 2, 3]),
             epoch: 42,
             secret: Secret::new([0u8; 32]),
         };
 
-        let serialized = serde_json::to_value(&secret).unwrap();
-        assert_eq!(serialized["mls_group_id"]["value"]["vec"], json!([1, 2, 3]));
-        assert_eq!(serialized["epoch"], json!(42));
-        assert_eq!(
-            serialized["secret"],
-            json!([
-                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                0, 0, 0, 0
-            ])
-        );
+        let err = serde_json::to_value(&secret)
+            .expect_err("Group exporter secret serialization should not expose plaintext");
+        let err = err.to_string();
 
-        // Test deserialization
+        assert!(err.contains("Secret values cannot be serialized"));
+        assert!(!err.contains("[0"));
+    }
+
+    #[test]
+    fn test_group_exporter_secret_deserialization() {
+        let serialized = json!({
+            "mls_group_id": {
+                "value": {
+                    "vec": [1, 2, 3]
+                }
+            },
+            "epoch": 42,
+            "secret": [
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0
+            ]
+        });
+
         let deserialized: GroupExporterSecret = serde_json::from_value(serialized).unwrap();
         assert_eq!(deserialized.epoch, 42);
         assert_eq!(*deserialized.secret, [0u8; 32]);
