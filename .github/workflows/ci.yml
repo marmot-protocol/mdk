@@ -46,6 +46,7 @@ jobs:
               - 'scripts/**'
             ci:
               - '.github/workflows/**'
+              - 'scripts/check-workflow-policy.sh'
 
   # ── Workflow policy ─────────────────────────────────────────────────
   workflow-policy:

@@ -93,11 +93,11 @@ precommit-verbose:
     @echo "→ Checking with stable Rust..."
     @bash scripts/check-all.sh stable
     @echo ""
-    @echo "→ Checking GitHub workflow policy..."
-    @just workflow-policy
-    @echo ""
     @echo "→ Checking with MSRV (1.90.0)..."
     @bash scripts/check-msrv.sh
+    @echo ""
+    @echo "→ Checking GitHub workflow policy..."
+    @just workflow-policy
     @echo ""
     @echo "→ Running tests..."
     @just test-all
