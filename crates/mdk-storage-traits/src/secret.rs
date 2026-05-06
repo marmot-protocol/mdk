@@ -92,7 +92,7 @@ where
         S: serde::Serializer,
     {
         Err(serde::ser::Error::custom(
-            "Secret values cannot be serialized",
+            "Secret values cannot be serialized; use Secret::expose_for_serialization() for deliberate plaintext export",
         ))
     }
 }
@@ -162,6 +162,7 @@ mod tests {
         let err = err.to_string();
 
         assert!(err.contains("Secret values cannot be serialized"));
+        assert!(err.contains("Secret::expose_for_serialization()"));
         assert!(!err.contains("222"));
         assert!(!err.contains("173"));
         assert!(!err.contains("190"));

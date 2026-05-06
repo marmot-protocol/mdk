@@ -158,6 +158,65 @@ mod tests {
     }
 
     #[test]
+    fn test_welcome_deserialization_with_secret_fields_is_accepted() {
+        let pubkey =
+            PublicKey::from_hex("8a9de562cbbed225b6ea0118dd3997a02df92c0bffd2224f71081a7450c3e549")
+                .unwrap();
+        let now = Timestamp::from_secs(1_677_721_600);
+        let event = UnsignedEvent::new(
+            pubkey,
+            now,
+            nostr::Kind::MlsWelcome,
+            nostr::Tags::new(),
+            "private welcome event body".to_string(),
+        );
+        let mls_group_id = GroupId::from_slice(&[1, 2, 3]);
+        let nostr_group_id = [0u8; 32];
+        let image_hash = [8u8; 32];
+        let image_key = [7u8; 32];
+        let image_nonce = [6u8; 12];
+        let mut group_admin_pubkeys = BTreeSet::new();
+        group_admin_pubkeys.insert(pubkey);
+        let mut group_relays = BTreeSet::new();
+        group_relays.insert(RelayUrl::from_str("wss://relay.example.com").unwrap());
+
+        let serialized = json!({
+            "id": EventId::all_zeros(),
+            "event": event,
+            "mls_group_id": mls_group_id,
+            "nostr_group_id": nostr_group_id,
+            "group_name": "Private Group",
+            "group_description": "Private Description",
+            "group_image_hash": image_hash,
+            "group_image_key": image_key,
+            "group_image_nonce": image_nonce,
+            "group_admin_pubkeys": group_admin_pubkeys,
+            "group_relays": group_relays,
+            "welcomer": pubkey,
+            "member_count": 3,
+            "state": "pending",
+            "wrapper_event_id": EventId::all_zeros(),
+        });
+
+        let welcome: Welcome = serde_json::from_value(serialized).unwrap();
+
+        assert_eq!(
+            welcome
+                .group_image_key
+                .as_ref()
+                .map(|secret| secret.as_ref()),
+            Some(&image_key)
+        );
+        assert_eq!(
+            welcome
+                .group_image_nonce
+                .as_ref()
+                .map(|secret| secret.as_ref()),
+            Some(&image_nonce)
+        );
+    }
+
+    #[test]
     fn test_processed_welcome_debug_redacts_sensitive_values() {
         let processed_welcome = ProcessedWelcome {
             wrapper_event_id: EventId::all_zeros(),
