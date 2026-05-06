@@ -1,16 +1,17 @@
 //! Types for the welcomes module
 
 use std::collections::BTreeSet;
+use std::fmt;
 use std::str::FromStr;
 
-use crate::{GroupId, Secret};
 use nostr::{EventId, PublicKey, RelayUrl, Timestamp, UnsignedEvent};
 use serde::{Deserialize, Serialize};
 
 use super::error::WelcomeError;
+use crate::{GroupId, Secret};
 
 /// A processed welcome, this stores data about whether we have processed a welcome or not
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ProcessedWelcome {
     /// The event id of the processed welcome
     pub wrapper_event_id: EventId,
@@ -24,8 +25,14 @@ pub struct ProcessedWelcome {
     pub failure_reason: Option<String>,
 }
 
+impl fmt::Debug for ProcessedWelcome {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProcessedWelcome").finish_non_exhaustive()
+    }
+}
+
 /// A welcome message
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct Welcome {
     /// The event id of the kind 444 welcome
     pub id: EventId,
@@ -57,6 +64,12 @@ pub struct Welcome {
     pub state: WelcomeState,
     /// The event id of the 1059 event that contained the welcome
     pub wrapper_event_id: EventId,
+}
+
+impl fmt::Debug for Welcome {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Welcome").finish_non_exhaustive()
+    }
 }
 
 string_enum! {
@@ -103,5 +116,67 @@ mod tests {
         let serialized = serde_json::to_value(&processed_welcome).unwrap();
         assert_eq!(serialized["state"], json!("processed"));
         assert_eq!(serialized["failure_reason"], json!(null));
+    }
+
+    #[test]
+    fn test_processed_welcome_debug_redacts_sensitive_values() {
+        let processed_welcome = ProcessedWelcome {
+            wrapper_event_id: EventId::all_zeros(),
+            welcome_event_id: Some(EventId::all_zeros()),
+            processed_at: Timestamp::now(),
+            state: ProcessedWelcomeState::Failed,
+            failure_reason: Some("failure with private context".to_string()),
+        };
+
+        let debug_str = format!("{:?}", processed_welcome);
+
+        assert!(!debug_str.contains("failure with private context"));
+    }
+
+    #[test]
+    fn test_welcome_debug_redacts_sensitive_values() {
+        let pubkey =
+            PublicKey::from_hex("8a9de562cbbed225b6ea0118dd3997a02df92c0bffd2224f71081a7450c3e549")
+                .unwrap();
+        let now = Timestamp::now();
+        let mut group_relays = BTreeSet::new();
+        group_relays.insert(RelayUrl::from_str("wss://relay.example.com").unwrap());
+        let welcome = Welcome {
+            id: EventId::all_zeros(),
+            event: UnsignedEvent::new(
+                pubkey,
+                now,
+                nostr::Kind::MlsWelcome,
+                nostr::Tags::new(),
+                "private welcome event body".to_string(),
+            ),
+            mls_group_id: GroupId::from_slice(&[222, 173, 190, 239]),
+            nostr_group_id: [9u8; 32],
+            group_name: "Private Group".to_string(),
+            group_description: "Private Description".to_string(),
+            group_image_hash: Some([8u8; 32]),
+            group_image_key: Some(Secret::new([7u8; 32])),
+            group_image_nonce: Some(Secret::new([6u8; 12])),
+            group_admin_pubkeys: BTreeSet::new(),
+            group_relays,
+            welcomer: pubkey,
+            member_count: 3,
+            state: WelcomeState::Pending,
+            wrapper_event_id: EventId::all_zeros(),
+        };
+
+        let debug_str = format!("{:?}", welcome);
+
+        assert!(!debug_str.contains("mls_group_id"));
+        assert!(!debug_str.contains("nostr_group_id"));
+        assert!(!debug_str.contains("GroupId"));
+        assert!(!debug_str.contains("deadbeef"));
+        assert!(!debug_str.contains("[9, 9"));
+        assert!(!debug_str.contains("Private Group"));
+        assert!(!debug_str.contains("Private Description"));
+        assert!(!debug_str.contains("private welcome event body"));
+        assert!(!debug_str.contains("[8, 8"));
+        assert!(!debug_str.contains("[7, 7"));
+        assert!(!debug_str.contains("[6, 6"));
     }
 }

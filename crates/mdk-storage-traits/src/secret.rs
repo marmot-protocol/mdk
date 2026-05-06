@@ -92,3 +92,33 @@ where
 
 // Re-export Zeroize trait from zeroize crate for convenience
 pub use zeroize::Zeroize;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_secret_accessors_and_mutation() {
+        let mut secret = Secret::new([1u8, 2, 3, 4]);
+
+        assert_eq!(secret.as_ref(), &[1u8, 2, 3, 4]);
+
+        secret.as_mut()[0] = 5;
+        assert_eq!(*secret, [5u8, 2, 3, 4]);
+
+        secret[1] = 6;
+        assert_eq!(*secret, [5u8, 6, 3, 4]);
+    }
+
+    #[test]
+    fn test_secret_debug_redacts_value() {
+        let secret = Secret::new([222u8, 173, 190, 239]);
+        let debug_str = format!("{:?}", secret);
+
+        assert_eq!(debug_str, "Secret(***)");
+        assert!(!debug_str.contains("222"));
+        assert!(!debug_str.contains("173"));
+        assert!(!debug_str.contains("190"));
+        assert!(!debug_str.contains("239"));
+    }
+}

@@ -1,19 +1,20 @@
 //! Types for the messages module
 
 use std::cmp::Ordering;
+use std::fmt;
 use std::str::FromStr;
 
-use crate::GroupId;
-#[allow(unused_imports)] // Referenced in doc links
-use crate::groups::types::Group;
 use nostr::event::Kind;
 use nostr::{EventId, PublicKey, Tags, Timestamp, UnsignedEvent};
 use serde::{Deserialize, Serialize};
 
 use super::error::MessageError;
+use crate::GroupId;
+#[allow(unused_imports)] // Referenced in doc links
+use crate::groups::types::Group;
 
 /// A processed message, this stores data about whether we have processed a message or not
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ProcessedMessage {
     /// The event id of the processed message
     pub wrapper_event_id: EventId,
@@ -31,9 +32,15 @@ pub struct ProcessedMessage {
     pub failure_reason: Option<String>,
 }
 
+impl fmt::Debug for ProcessedMessage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProcessedMessage").finish_non_exhaustive()
+    }
+}
+
 /// This is the processed rumor message that represents a message in a group
 /// We store the deconstructed messages but also the UnsignedEvent.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct Message {
     /// The event id of the message
     pub id: EventId,
@@ -62,6 +69,12 @@ pub struct Message {
     pub epoch: Option<u64>,
     /// The state of the message
     pub state: MessageState,
+}
+
+impl fmt::Debug for Message {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Message").finish_non_exhaustive()
+    }
 }
 
 impl Message {
@@ -415,6 +428,42 @@ mod tests {
     }
 
     #[test]
+    fn test_message_debug_redacts_sensitive_values() {
+        let pubkey =
+            PublicKey::from_hex("8a9de562cbbed225b6ea0118dd3997a02df92c0bffd2224f71081a7450c3e549")
+                .unwrap();
+        let now = Timestamp::now();
+        let message = Message {
+            id: EventId::all_zeros(),
+            pubkey,
+            kind: Kind::MlsGroupMessage,
+            mls_group_id: GroupId::from_slice(&[222, 173, 190, 239]),
+            created_at: now,
+            processed_at: now,
+            content: "private message body".to_string(),
+            tags: Tags::new(),
+            event: UnsignedEvent::new(
+                pubkey,
+                now,
+                Kind::MlsGroupMessage,
+                Tags::new(),
+                "private unsigned event body".to_string(),
+            ),
+            wrapper_event_id: EventId::all_zeros(),
+            epoch: Some(5),
+            state: MessageState::Created,
+        };
+
+        let debug_str = format!("{:?}", message);
+
+        assert!(!debug_str.contains("mls_group_id"));
+        assert!(!debug_str.contains("GroupId"));
+        assert!(!debug_str.contains("deadbeef"));
+        assert!(!debug_str.contains("private message body"));
+        assert!(!debug_str.contains("private unsigned event body"));
+    }
+
+    #[test]
     fn test_processed_message_serialization() {
         // Create a processed message to test serialization
         let processed_message = ProcessedMessage {
@@ -447,6 +496,26 @@ mod tests {
         assert_eq!(serialized["state"], json!("failed"));
         assert_eq!(serialized["failure_reason"], json!("Decryption failed"));
         assert!(serialized["message_event_id"].is_string());
+    }
+
+    #[test]
+    fn test_processed_message_debug_redacts_sensitive_values() {
+        let processed_message = ProcessedMessage {
+            wrapper_event_id: EventId::all_zeros(),
+            message_event_id: Some(EventId::all_zeros()),
+            processed_at: Timestamp::now(),
+            epoch: Some(5),
+            mls_group_id: Some(GroupId::from_slice(&[222, 173, 190, 239])),
+            state: ProcessedMessageState::Failed,
+            failure_reason: Some("failure with private context".to_string()),
+        };
+
+        let debug_str = format!("{:?}", processed_message);
+
+        assert!(!debug_str.contains("mls_group_id"));
+        assert!(!debug_str.contains("GroupId"));
+        assert!(!debug_str.contains("deadbeef"));
+        assert!(!debug_str.contains("failure with private context"));
     }
 
     #[test]

@@ -1,10 +1,18 @@
 //! GroupId wrapper around OpenMLS GroupId
 
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 
 /// MDK Group ID wrapper around OpenMLS GroupId
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct GroupId(openmls::group::GroupId);
+
+impl fmt::Debug for GroupId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("GroupId([REDACTED])")
+    }
+}
 
 impl GroupId {
     /// Create a new GroupId from a byte slice
@@ -105,6 +113,19 @@ mod tests {
         let group_id = GroupId::from_slice(&bytes);
         let debug_str = format!("{:?}", group_id);
         assert!(debug_str.contains("GroupId"));
+    }
+
+    #[test]
+    fn test_group_id_debug_redacts_value() {
+        let bytes = [222u8, 173, 190, 239];
+        let group_id = GroupId::from_slice(&bytes);
+        let debug_str = format!("{:?}", group_id);
+
+        assert_eq!(debug_str, "GroupId([REDACTED])");
+        assert!(!debug_str.contains("222"));
+        assert!(!debug_str.contains("173"));
+        assert!(!debug_str.contains("190"));
+        assert!(!debug_str.contains("239"));
     }
 
     #[test]
