@@ -11,6 +11,7 @@ use crate::MdkMemoryStorage;
 /// Maximum size for serialized welcome event JSON, matching the SQLite backend.
 const MAX_WELCOME_EVENT_JSON_SIZE: usize = 100 * 1024;
 
+/// Rejects welcome payload data that exceeds a fixed byte limit.
 fn validate_size(data: &[u8], max_size: usize, field_name: &str) -> Result<(), WelcomeError> {
     if data.len() > max_size {
         return Err(WelcomeError::InvalidParameters(format!(
@@ -23,6 +24,7 @@ fn validate_size(data: &[u8], max_size: usize, field_name: &str) -> Result<(), W
     Ok(())
 }
 
+/// Applies configurable byte-length bounds to welcome metadata fields.
 fn validate_string_length(
     s: &str,
     max_length: usize,
@@ -39,6 +41,7 @@ fn validate_string_length(
     Ok(())
 }
 
+/// Validates welcome metadata and serialized event JSON before caching.
 fn validate_welcome_payload(
     welcome: &Welcome,
     max_group_name_length: usize,
