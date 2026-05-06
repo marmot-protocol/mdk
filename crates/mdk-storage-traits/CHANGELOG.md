@@ -17,8 +17,6 @@
 
 ### Fixed
 
-- Redacted sensitive MLS/Nostr group identifiers and private payload fields from storage-domain `Debug` output. ([#277](https://github.com/marmot-protocol/mdk/pull/277))
-
 ### Removed
 
 ### Deprecated
@@ -34,6 +32,8 @@
 ### Added
 
 ### Fixed
+
+- Redacted sensitive MLS/Nostr group identifiers and private payload fields from storage-domain `Debug` output. ([#277](https://github.com/marmot-protocol/mdk/pull/277))
 
 ### Removed
 
