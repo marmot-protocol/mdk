@@ -1,14 +1,15 @@
 //! Types for the groups module
 
 use std::collections::BTreeSet;
+use std::fmt;
 use std::str::FromStr;
 
-use crate::messages::types::Message;
-use crate::{GroupId, Secret};
 use nostr::{EventId, PublicKey, RelayUrl, Timestamp};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use super::error::GroupError;
+use crate::messages::types::Message;
+use crate::{GroupId, Secret};
 
 /// Tracks whether and when a self-update (key rotation) is needed or was
 /// last performed for this group.
@@ -70,7 +71,7 @@ string_enum! {
 /// An MDK group
 ///
 /// Stores metadata about the group
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct Group {
     /// This is the MLS group ID, this will serve as the PK in the DB and doesn't change
     pub mls_group_id: GroupId,
@@ -105,6 +106,23 @@ pub struct Group {
     ///
     /// See [`SelfUpdateState`] for the possible values and their meanings.
     pub self_update_state: SelfUpdateState,
+}
+
+impl fmt::Debug for Group {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Group")
+            .field("has_image_hash", &self.image_hash.is_some())
+            .field("has_image_key", &self.image_key.is_some())
+            .field("has_image_nonce", &self.image_nonce.is_some())
+            .field("admin_pubkeys_count", &self.admin_pubkeys.len())
+            .field("last_message_id", &self.last_message_id)
+            .field("last_message_at", &self.last_message_at)
+            .field("last_message_processed_at", &self.last_message_processed_at)
+            .field("epoch", &self.epoch)
+            .field("state", &self.state)
+            .field("self_update_state", &self.self_update_state)
+            .finish()
+    }
 }
 
 impl Group {
@@ -154,7 +172,7 @@ impl Group {
 /// An MDK group relay
 ///
 /// Stores a relay URL and the MLS group ID it belongs to
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct GroupRelay {
     /// The relay URL
     pub relay_url: RelayUrl,
@@ -162,8 +180,16 @@ pub struct GroupRelay {
     pub mls_group_id: GroupId,
 }
 
+impl fmt::Debug for GroupRelay {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GroupRelay")
+            .field("relay_url", &self.relay_url)
+            .finish()
+    }
+}
+
 /// Exporter secrets for each epoch of a group
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct GroupExporterSecret {
     /// The MLS group ID
     pub mls_group_id: GroupId,
@@ -171,6 +197,15 @@ pub struct GroupExporterSecret {
     pub epoch: u64,
     /// The secret
     pub secret: Secret<[u8; 32]>,
+}
+
+impl fmt::Debug for GroupExporterSecret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GroupExporterSecret")
+            .field("epoch", &self.epoch)
+            .field("secret", &"[REDACTED]")
+            .finish()
+    }
 }
 
 #[cfg(test)]
@@ -361,6 +396,37 @@ mod tests {
     }
 
     #[test]
+    fn test_group_debug_redacts_sensitive_values() {
+        let group = Group {
+            mls_group_id: GroupId::from_slice(&[222, 173, 190, 239]),
+            nostr_group_id: [9u8; 32],
+            name: "Private Group".to_string(),
+            description: "Private Description".to_string(),
+            image_hash: Some([8u8; 32]),
+            image_key: Some(Secret::new([7u8; 32])),
+            image_nonce: Some(Secret::new([6u8; 12])),
+            admin_pubkeys: BTreeSet::new(),
+            last_message_id: None,
+            last_message_at: None,
+            last_message_processed_at: None,
+            epoch: 3,
+            state: GroupState::Active,
+            self_update_state: SelfUpdateState::Required,
+        };
+
+        let debug_str = format!("{:?}", group);
+
+        assert!(!debug_str.contains("mls_group_id"));
+        assert!(!debug_str.contains("nostr_group_id"));
+        assert!(!debug_str.contains("Private Group"));
+        assert!(!debug_str.contains("Private Description"));
+        assert!(!debug_str.contains("[9, 9"));
+        assert!(!debug_str.contains("[8, 8"));
+        assert!(!debug_str.contains("[7, 7"));
+        assert!(!debug_str.contains("[6, 6"));
+    }
+
+    #[test]
     fn test_group_exporter_secret_serialization() {
         let secret = GroupExporterSecret {
             mls_group_id: GroupId::from_slice(&[1, 2, 3]),
@@ -386,6 +452,23 @@ mod tests {
     }
 
     #[test]
+    fn test_group_exporter_secret_debug_redacts_sensitive_values() {
+        let secret = GroupExporterSecret {
+            mls_group_id: GroupId::from_slice(&[222, 173, 190, 239]),
+            epoch: 42,
+            secret: Secret::new([7u8; 32]),
+        };
+
+        let debug_str = format!("{:?}", secret);
+
+        assert!(debug_str.contains("epoch"));
+        assert!(!debug_str.contains("mls_group_id"));
+        assert!(!debug_str.contains("GroupId"));
+        assert!(!debug_str.contains("deadbeef"));
+        assert!(!debug_str.contains("[7, 7"));
+    }
+
+    #[test]
     fn test_group_relay_serialization() {
         let relay = GroupRelay {
             relay_url: RelayUrl::from_str("wss://relay.example.com").unwrap(),
@@ -402,6 +485,21 @@ mod tests {
             deserialized.relay_url.to_string(),
             "wss://relay.example.com"
         );
+    }
+
+    #[test]
+    fn test_group_relay_debug_redacts_mls_group_id() {
+        let relay = GroupRelay {
+            relay_url: RelayUrl::from_str("wss://relay.example.com").unwrap(),
+            mls_group_id: GroupId::from_slice(&[222, 173, 190, 239]),
+        };
+
+        let debug_str = format!("{:?}", relay);
+
+        assert!(debug_str.contains("relay_url"));
+        assert!(!debug_str.contains("mls_group_id"));
+        assert!(!debug_str.contains("GroupId"));
+        assert!(!debug_str.contains("deadbeef"));
     }
 
     #[test]
