@@ -46,6 +46,21 @@ jobs:
               - 'scripts/**'
             ci:
               - '.github/workflows/**'
+              - 'scripts/check-workflow-policy.sh'
+
+  # ── Workflow policy ─────────────────────────────────────────────────
+  workflow-policy:
+    runs-on: ubuntu-latest
+    name: Workflow Policy
+    needs: changes
+    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.ci == 'true'
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Check GitHub workflow policy
+      run: bash scripts/check-workflow-policy.sh
 
   # ── Quick checks that fail fast ─────────────────────────────────────
   format:
