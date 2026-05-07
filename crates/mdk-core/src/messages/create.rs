@@ -76,6 +76,7 @@ where
 
         // Ensure rumor ID
         rumor.ensure_id();
+        rumor.verify_id()?;
 
         // Serialize as JSON
         let json: String = rumor.as_json();
@@ -178,7 +179,8 @@ where
 mod tests {
     use mdk_storage_traits::GroupId;
     use mdk_storage_traits::messages::types as message_types;
-    use nostr::{Keys, Kind, TagKind, Timestamp};
+    use nostr::event::Error as NostrEventError;
+    use nostr::{EventId, Keys, Kind, TagKind, Timestamp};
 
     use crate::error::Error;
     use crate::messages::EventTag;
@@ -223,6 +225,36 @@ mod tests {
         let result = mdk.create_message(&non_existent_group_id, rumor, None);
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), Error::GroupNotFound));
+    }
+
+    #[test]
+    fn test_create_message_rejects_mismatched_rumor_id() {
+        let mdk = create_test_mdk();
+        let (creator, members, admins) = create_test_group_members();
+        let group_id = create_test_group(&mdk, &creator, &members, &admins);
+        let mut rumor = create_test_rumor(&creator, "Forged local rumor ID");
+        let canonical_id = rumor.id();
+        let forged_id = EventId::all_zeros();
+        assert_ne!(canonical_id, forged_id);
+
+        rumor.id = Some(forged_id);
+
+        let result = mdk.create_message(&group_id, rumor, None);
+
+        assert!(matches!(
+            result,
+            Err(Error::Event(NostrEventError::InvalidId))
+        ));
+        assert!(
+            mdk.get_message(&group_id, &forged_id)
+                .expect("Storage lookup should succeed")
+                .is_none()
+        );
+        assert!(
+            mdk.get_message(&group_id, &canonical_id)
+                .expect("Storage lookup should succeed")
+                .is_none()
+        );
     }
 
     #[test]
