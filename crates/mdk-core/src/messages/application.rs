@@ -50,6 +50,7 @@ where
         let bytes = application_message.into_bytes();
         let mut rumor: UnsignedEvent = UnsignedEvent::from_json(bytes)?;
 
+        rumor.verify_id()?;
         self.verify_rumor_author(&rumor.pubkey, sender_credential)?;
 
         let rumor_id: EventId = rumor.id();
@@ -102,7 +103,8 @@ where
 mod tests {
     use mdk_storage_traits::messages::MessageStorage;
     use mdk_storage_traits::messages::types as message_types;
-    use nostr::{Keys, Kind};
+    use nostr::{EventId, JsonUtil, Keys, Kind};
+    use tls_codec::Serialize as TlsSerialize;
 
     use crate::messages::MessageProcessingResult;
     use crate::test_util::*;
@@ -175,6 +177,55 @@ mod tests {
         // For this test, we verify the state tracking works
         assert_eq!(message.content, "Test message");
         assert_eq!(message.pubkey, creator.public_key());
+    }
+
+    #[test]
+    fn test_process_message_rejects_mismatched_rumor_id() {
+        let (alice_mdk, bob_mdk, alice_keys, _bob_keys, group_id) = setup_two_member_group();
+        let mut rumor = create_test_rumor(&alice_keys, "Forged rumor ID");
+        let canonical_id = rumor.id();
+        let forged_id = EventId::all_zeros();
+        assert_ne!(canonical_id, forged_id);
+
+        rumor.id = Some(forged_id);
+
+        let mut alice_group = alice_mdk
+            .load_mls_group(&group_id)
+            .expect("Alice should load MLS group")
+            .expect("Alice MLS group should exist");
+        let signer = alice_mdk
+            .load_mls_signer(&alice_group)
+            .expect("Alice should load MLS signer");
+        let json = rumor.as_json();
+        let message_out = alice_group
+            .create_message(&alice_mdk.provider, &signer, json.as_bytes())
+            .expect("Alice should create MLS message");
+        let serialized_message = message_out
+            .tls_serialize_detached()
+            .expect("MLS message should serialize");
+        let event = alice_mdk
+            .build_message_event(&group_id, serialized_message, None)
+            .expect("Alice should build wrapper event");
+
+        let result = bob_mdk.process_message(&event);
+
+        assert!(matches!(
+            result,
+            Ok(MessageProcessingResult::Unprocessable { mls_group_id })
+                if mls_group_id == group_id
+        ));
+        assert!(
+            bob_mdk
+                .get_message(&group_id, &forged_id)
+                .expect("Storage lookup should succeed")
+                .is_none()
+        );
+        assert!(
+            bob_mdk
+                .get_message(&group_id, &canonical_id)
+                .expect("Storage lookup should succeed")
+                .is_none()
+        );
     }
 
     /// Test message from non-member
