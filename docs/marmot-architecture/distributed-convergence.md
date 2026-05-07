@@ -230,6 +230,29 @@ Initial lemmas:
    `max_witness_override_depth` commits.
 4. **Spam resistance:** multiple app witnesses from the same sender in one
    epoch count once.
+5. **Outbound gate:** outbound intents queue while convergence is syncing and
+   release only after the stability gate opens.
+6. **Three-branch convergence:** clients that enumerate the same three
+   candidate branches in different orders select the same winner.
+7. **Late withheld commit rejection:** a branch published after the retained
+   anchor is rejected when its rewind distance exceeds policy.
+8. **Bounded policy seeds:** generated-family seed cases select the expected
+   winner and reason.
+
+The v0 model currently verifies deterministic selection, eligible-only
+selection, score-order justifications, stale-rewind rejection derived from
+anchor/distance facts, sender/epoch witness dedupe, queued outbound gating,
+three-branch permutations, late withheld publication after anchor, generated
+bounded seed cases, and executable traces for each modeled scenario.
+The bounded seed source is
+[`formal/tamarin/policy_cases.json`](../../formal/tamarin/policy_cases.json);
+`cgka-policy-casegen` emits matching Tamarin seed rules from the same file that
+Rust selector tests consume.
+
+The proof-to-test workflow is documented in
+[`formal/tamarin/README.md`](../../formal/tamarin/README.md). Tamarin captures
+the abstract convergence design; Rust unit, property, and scenario tests check
+that the implementation follows it.
 
 Leave full MLS cryptography abstract in the first model. Tamarin should reason
 about ordering, eligibility, and adversarial message scheduling. The Rust tests

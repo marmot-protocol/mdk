@@ -1,0 +1,109 @@
+[
+  {
+    "name": "depth_priority",
+    "scenario": "generated_depth_priority",
+    "current_tip_epoch": 4,
+    "policy": {
+      "max_rewind_commits": 5,
+      "witness_quorum_senders_per_epoch": 10,
+      "witness_quorum_epochs": 2,
+      "max_witness_override_depth": 0
+    },
+    "expected": {
+      "branch": "deep",
+      "reason": "effective_depth"
+    },
+    "branches": [
+      {
+        "id": "deep",
+        "fork_epoch": 0,
+        "tip_epoch": 4,
+        "tip_digest": "ff",
+        "app_witnesses": []
+      },
+      {
+        "id": "chatty",
+        "fork_epoch": 0,
+        "tip_epoch": 3,
+        "tip_digest": "00",
+        "app_witnesses": [
+          { "epoch": 2, "sender": "alice" },
+          { "epoch": 2, "sender": "bob" },
+          { "epoch": 2, "sender": "carol" }
+        ]
+      }
+    ]
+  },
+  {
+    "name": "witness_priority",
+    "scenario": "generated_witness_priority",
+    "current_tip_epoch": 2,
+    "policy": {
+      "max_rewind_commits": 5,
+      "witness_quorum_senders_per_epoch": 10,
+      "witness_quorum_epochs": 2,
+      "max_witness_override_depth": 0
+    },
+    "expected": {
+      "branch": "chatty",
+      "reason": "witness_score_tie"
+    },
+    "branches": [
+      {
+        "id": "chatty",
+        "fork_epoch": 0,
+        "tip_epoch": 2,
+        "tip_digest": "ff",
+        "app_witnesses": [
+          { "epoch": 2, "sender": "alice" },
+          { "epoch": 2, "sender": "bob" },
+          { "epoch": 2, "sender": "carol" }
+        ]
+      },
+      {
+        "id": "quiet",
+        "fork_epoch": 0,
+        "tip_epoch": 2,
+        "tip_digest": "00",
+        "app_witnesses": [
+          { "epoch": 2, "sender": "alice" }
+        ]
+      }
+    ]
+  },
+  {
+    "name": "digest_priority",
+    "scenario": "generated_digest_priority",
+    "current_tip_epoch": 2,
+    "policy": {
+      "max_rewind_commits": 5,
+      "witness_quorum_senders_per_epoch": 10,
+      "witness_quorum_epochs": 2,
+      "max_witness_override_depth": 0
+    },
+    "expected": {
+      "branch": "low_digest",
+      "reason": "digest_tie"
+    },
+    "branches": [
+      {
+        "id": "low_digest",
+        "fork_epoch": 0,
+        "tip_epoch": 2,
+        "tip_digest": "00",
+        "app_witnesses": [
+          { "epoch": 2, "sender": "alice" }
+        ]
+      },
+      {
+        "id": "high_digest",
+        "fork_epoch": 0,
+        "tip_epoch": 2,
+        "tip_digest": "ff",
+        "app_witnesses": [
+          { "epoch": 2, "sender": "alice" }
+        ]
+      }
+    ]
+  }
+]

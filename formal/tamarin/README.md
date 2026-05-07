@@ -14,9 +14,25 @@ It models only the selector boundary:
 - witness quorum can only act through a bounded override rule.
 - score comparison follows the same priority order as the Rust conformance
   selector.
+- branches beyond the rewind horizon are ineligible even when they have higher
+  raw depth.
+- duplicate app witnesses from the same sender in the same epoch do not inflate
+  witness score.
+- stale rewind status is derived from retained anchor, branch fork epoch,
+  rewind distance, configured limit, and the distance ordering fact.
+- outbound intents are queued while convergence is syncing and released after
+  the stability gate opens.
+- three-branch candidate sets converge even when clients enumerate branches in
+  different orders.
+- late withheld commits published after the retained anchor are rejected when
+  their rewind distance exceeds policy.
+- bounded generator seed cases preserve the expected selection reason.
 
 The starting model is
 [`distributed_convergence_v0.spthy`](distributed_convergence_v0.spthy).
+Bounded generated-family seeds live in
+[`policy_cases.json`](policy_cases.json). The Rust selector test and the
+Tamarin seed-rule generator both read that file.
 
 ## Targets
 
@@ -25,6 +41,8 @@ The starting model is
   runs print the full prover output.
 - `just tamarin-interactive` opens the model in Tamarin's interactive UI and
   requires `tamarin-prover` on `PATH`.
+- `just policy-casegen` emits Tamarin seed rules and executable lemmas from
+  `policy_cases.json`.
 
 ## Install
 
@@ -32,6 +50,12 @@ Install Tamarin separately, then run:
 
 ```sh
 just tamarin
+```
+
+To inspect generated policy-case output:
+
+```sh
+just policy-casegen
 ```
 
 The command-line shape follows the official Tamarin manual: a `.spthy` file can
@@ -54,7 +78,7 @@ same valid input set + same negotiated policy => same selected branch
 ```
 
 That keeps the formal model aligned with the Rust conformance model in
-`crates/cgka-conformance/src/convergence.rs`.
+`crates/cgka-engine/src/convergence.rs`.
 
 The v0 model now uses bounded symbolic score classes instead of an opaque
 `ScoreCase` fact:
@@ -74,9 +98,59 @@ The derivation rules mirror the selector order:
 4. higher app-witness score,
 5. lower digest rank.
 
+## How Proofs Map To Tests
+
+Tamarin is the design model for the convergence properties in scope. It proves
+claims about the abstract rules in `distributed_convergence_v0.spthy`. Rust
+tests then check that the implementation follows those rules with real data
+structures, OpenMLS objects, storage, and scenario harnesses.
+
+If behavior is outside the model, Tamarin says nothing about it. That behavior
+can still be specified in prose and tested in Rust, but it has no formal proof
+until the model includes it.
+
+| Tamarin artifact | What it means | Rust counterpart |
+| --- | --- | --- |
+| `Init_*` rule | A named abstract scenario. | A named fixture or setup in an integration/scenario test. |
+| `exists-trace` lemma | The scenario is reachable in the model. | A minimum end-to-end scenario the implementation should handle. |
+| `Derive_*` rule | One policy step, such as score comparison or stale derivation. | Unit tests for the selector/comparator and its selected reason. |
+| all-traces lemma | An invariant that must hold in every modeled trace. | Property tests, invariant assertions, or both. |
+| `*_requires_*` lemma | A selected outcome must have matching evidence. | Debug assertions or tests that inspect selection reasons and evidence. |
+| model assumption | A fact the model accepts as already validated. | Tests or review at the layer that owns the assumption. |
+
+Keep names aligned across the proof and tests. If the Tamarin scenario is
+`quorum_override`, the Rust test or fixture should use the same phrase. Grep
+should connect the formal model, the unit/property test, and the integration
+scenario.
+
+For bounded policy seeds, update `policy_cases.json` first. Then check both
+consumers:
+
+```sh
+cargo test -p cgka-conformance --test generated_policy_cases
+cargo run -p cgka-conformance --bin cgka-policy-casegen -- --format tamarin formal/tamarin/policy_cases.json
+```
+
+Use the executable lemmas as a fixture catalog. Each one says "this situation
+exists and the system must handle it." Use the universal lemmas as property-test
+targets. For example, `same_input_set_converges` maps to generated branch sets
+fed through the real selector from different client enumeration orders.
+
+Use Tamarin for behavior where local reasoning is weak: cross-client
+convergence, adversarial scheduling, branch eligibility, commit ordering, and
+state handoff between subsystems. Prefer Rust tests for storage behavior, wire
+parsing, serialization, and pure input-to-output functions.
+
+The model has done its job for this subsystem when the lemmas answer the
+convergence questions under the stated assumptions. If someone asks what happens
+in a case and there is no lemma, scenario, or explicit assumption to point at,
+that is a model gap.
+
 Next refinements:
 
-1. Add explicit duplicate app witnesses and prove sender-per-epoch dedupe.
-2. Add a stale branch case for the rewind horizon.
-3. Add three-or-more-branch delivery permutations for the same message bag.
-4. Generate broader bounded scenario families from the Rust policy model.
+1. Generate broader bounded scenario families from the Rust policy model.
+2. Replace symbolic score classes with generated bounded numeric families.
+3. Add a code-generation path that emits both Tamarin seed scenarios and Rust
+   property-test cases from one policy-case source.
+4. Add handoff scenarios for welcome processing and commit application during
+   convergence selection.

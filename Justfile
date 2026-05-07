@@ -32,6 +32,9 @@ tamarin-interactive:
     @command -v tamarin-prover >/dev/null || { echo "error: tamarin-prover not found on PATH"; exit 127; }
     @make -C formal/tamarin interactive
 
+policy-casegen:
+    @cargo run -p cgka-conformance --bin cgka-policy-casegen -- --format tamarin formal/tamarin/policy_cases.json
+
 coverage:
     just coverage-traits
     just coverage-storage

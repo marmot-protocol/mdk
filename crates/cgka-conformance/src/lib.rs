@@ -24,6 +24,7 @@ pub mod bus;
 pub mod client;
 pub mod family;
 pub mod peeler;
+pub mod policy_cases;
 pub mod proptest_support;
 pub mod report;
 pub mod scenario;

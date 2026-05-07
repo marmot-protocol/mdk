@@ -13,6 +13,8 @@
     g00/gff: digest rank class, where lower rank wins final ties
 
   The ordering facts are scenario-local so this model stays small and focused.
+  Branch eligibility is also scenario-local: a branch beyond the rewind horizon
+  may have a higher raw depth, but it must not be selected.
 */
 
 theory distributed_convergence_v0
@@ -144,6 +146,317 @@ rule Init_Digest_Tie:
     !DigestLtState(~run, 'g00', 'gff')
   ]
 
+/*
+  Scenario 5:
+
+  A late withheld branch has more raw/effective depth than the online branch,
+  but its fork point is farther behind the retained anchor than policy permits.
+  Eligibility wins before scoring: clients select the eligible online branch
+  and never select the stale branch.
+*/
+rule Init_Stale_Rewind:
+  [ Fr(~run) ]
+--[
+    Scenario(~run, 'stale_rewind'),
+    SameInputSet(~run, 'alice'),
+    SameInputSet(~run, 'bob'),
+    Eligible(~run, 'online'),
+    RetainedAnchor(~run, 'e5'),
+    BranchForkEpoch(~run, 'late', 'e0'),
+    RewindDistance(~run, 'late', 'd7'),
+    RewindLimit(~run, 'd5'),
+    RewindTooDeep(~run, 'd7', 'd5'),
+    Score(~run, 'online', 'd3', 'd3', 'qno', 'w2', 'gff'),
+    Score(~run, 'late', 'd7', 'd7', 'qno', 'w0', 'g00'),
+    ScoreGreater(~run, 'd7', 'd3')
+  ]->
+  [
+    Compare(~run, 'online', 'late'),
+    Compare(~run, 'late', 'online'),
+    View(~run, 'alice', 'online', 'late'),
+    View(~run, 'bob', 'late', 'online'),
+    !EligibleState(~run, 'online'),
+    !RetainedAnchorState(~run, 'e5'),
+    !BranchForkEpochState(~run, 'late', 'e0'),
+    !RewindDistanceState(~run, 'late', 'd7'),
+    !RewindLimitState(~run, 'd5'),
+    !RewindTooDeepState(~run, 'd7', 'd5'),
+    !ScoreState(~run, 'online', 'd3', 'd3', 'qno', 'w2', 'gff'),
+    !ScoreState(~run, 'late', 'd7', 'd7', 'qno', 'w0', 'g00'),
+    !GtState(~run, 'd7', 'd3')
+  ]
+
+/*
+  Scenario 6:
+
+  The used branch has three app messages, but two are from Alice in the same
+  epoch. Witness scoring counts distinct sender/epoch pairs, so the branch has
+  score w2, not w3, and still beats the quiet branch's w1.
+*/
+rule Init_Duplicate_Witness_Dedupe:
+  [ Fr(~run) ]
+--[
+    Scenario(~run, 'duplicate_witness_dedupe'),
+    SameInputSet(~run, 'alice'),
+    SameInputSet(~run, 'bob'),
+    Eligible(~run, 'used'),
+    Eligible(~run, 'quiet'),
+    AppWitness(~run, 'used', 'e2', 'alice', 'app_a1'),
+    AppWitness(~run, 'used', 'e2', 'alice', 'app_a2'),
+    AppWitness(~run, 'used', 'e2', 'bob', 'app_b1'),
+    DistinctWitness(~run, 'used', 'e2', 'alice'),
+    DistinctWitness(~run, 'used', 'e2', 'bob'),
+    DuplicateWitnessIgnored(~run, 'used', 'e2', 'alice'),
+    WitnessScore(~run, 'used', 'w2'),
+    WitnessScore(~run, 'quiet', 'w1'),
+    Score(~run, 'used', 'd2', 'd2', 'qno', 'w2', 'gff'),
+    Score(~run, 'quiet', 'd2', 'd2', 'qno', 'w1', 'g00'),
+    ScoreGreater(~run, 'w2', 'w1')
+  ]->
+  [
+    Compare(~run, 'used', 'quiet'),
+    Compare(~run, 'quiet', 'used'),
+    View(~run, 'alice', 'used', 'quiet'),
+    View(~run, 'bob', 'quiet', 'used'),
+    !EligibleState(~run, 'used'),
+    !EligibleState(~run, 'quiet'),
+    !WitnessScoreState(~run, 'used', 'w2'),
+    !WitnessScoreState(~run, 'quiet', 'w1'),
+    !ScoreState(~run, 'used', 'd2', 'd2', 'qno', 'w2', 'gff'),
+    !ScoreState(~run, 'quiet', 'd2', 'd2', 'qno', 'w1', 'g00'),
+    !GtState(~run, 'w2', 'w1')
+  ]
+
+/*
+  Scenario 7:
+
+  A client wants to send while convergence is still syncing. The outbound intent
+  is queued, then released only after the stability gate opens.
+*/
+rule Init_Outbound_While_Syncing:
+  [ Fr(~run) ]
+--[
+    Scenario(~run, 'outbound_queued_until_stable'),
+    OutboundWanted(~run, 'alice', 'app_msg'),
+    SyncState(~run, 'alice', 'syncing')
+  ]->
+  [
+    OutboundIntent(~run, 'alice', 'app_msg'),
+    SyncingState(~run, 'alice')
+  ]
+
+/*
+  Scenario 8:
+
+  A client that is already stable can publish the outbound intent directly.
+*/
+rule Init_Outbound_While_Stable:
+  [ Fr(~run) ]
+--[
+    Scenario(~run, 'outbound_published_when_stable'),
+    OutboundWanted(~run, 'alice', 'app_msg'),
+    SyncState(~run, 'alice', 'stable')
+  ]->
+  [
+    OutboundIntent(~run, 'alice', 'app_msg'),
+    StableState(~run, 'alice')
+  ]
+
+/*
+  Scenario 9:
+
+  Three eligible branches are presented to clients in different orders. The best
+  branch beats both alternatives, so every permutation selects the same branch.
+*/
+rule Init_Three_Branch_Permutation:
+  [ Fr(~run) ]
+--[
+    Scenario(~run, 'three_branch_permutation'),
+    SameInputSet(~run, 'alice'),
+    SameInputSet(~run, 'bob'),
+    SameInputSet(~run, 'carol'),
+    Eligible(~run, 'best'),
+    Eligible(~run, 'mid'),
+    Eligible(~run, 'low'),
+    Score(~run, 'best', 'd4', 'd4', 'qno', 'w1', 'gff'),
+    Score(~run, 'mid', 'd3', 'd3', 'qno', 'w9', 'g00'),
+    Score(~run, 'low', 'd2', 'd2', 'qno', 'w9', 'g00'),
+    ScoreGreater(~run, 'd4', 'd3'),
+    ScoreGreater(~run, 'd4', 'd2')
+  ]->
+  [
+    Compare(~run, 'best', 'mid'),
+    Compare(~run, 'best', 'low'),
+    ThreeView(~run, 'alice', 'best', 'mid', 'low'),
+    ThreeView(~run, 'bob', 'low', 'mid', 'best'),
+    ThreeView(~run, 'carol', 'mid', 'best', 'low'),
+    !EligibleState(~run, 'best'),
+    !EligibleState(~run, 'mid'),
+    !EligibleState(~run, 'low'),
+    !ScoreState(~run, 'best', 'd4', 'd4', 'qno', 'w1', 'gff'),
+    !ScoreState(~run, 'mid', 'd3', 'd3', 'qno', 'w9', 'g00'),
+    !ScoreState(~run, 'low', 'd2', 'd2', 'qno', 'w9', 'g00'),
+    !GtState(~run, 'd4', 'd3'),
+    !GtState(~run, 'd4', 'd2')
+  ]
+
+/*
+  Scenario 10:
+
+  An actor creates a branch while offline, the online group advances the retained
+  anchor, and the withheld branch is published later. The late branch may have
+  more raw depth, but it is stale because its fork point is past the rollback
+  policy horizon.
+*/
+rule Init_Withheld_Published_After_Anchor:
+  [ Fr(~run) ]
+--[
+    Scenario(~run, 'withheld_published_after_anchor'),
+    SameInputSet(~run, 'alice'),
+    SameInputSet(~run, 'bob'),
+    Eligible(~run, 'online'),
+    CommitCreatedOffline(~run, 'mallory', 'late', 'local_t0'),
+    OnlineBranchObserved(~run, 'online', 'network_t1'),
+    AnchorAdvanced(~run, 'e5'),
+    WithheldPublished(~run, 'late', 'network_t9'),
+    WithheldPublishedAfterAnchor(~run, 'late', 'e5'),
+    RetainedAnchor(~run, 'e5'),
+    BranchForkEpoch(~run, 'late', 'e0'),
+    RewindDistance(~run, 'late', 'd7'),
+    RewindLimit(~run, 'd5'),
+    RewindTooDeep(~run, 'd7', 'd5'),
+    Score(~run, 'online', 'd3', 'd3', 'qno', 'w2', 'gff'),
+    Score(~run, 'late', 'd7', 'd7', 'qno', 'w0', 'g00'),
+    ScoreGreater(~run, 'd7', 'd3')
+  ]->
+  [
+    Compare(~run, 'online', 'late'),
+    Compare(~run, 'late', 'online'),
+    View(~run, 'alice', 'online', 'late'),
+    View(~run, 'bob', 'late', 'online'),
+    !EligibleState(~run, 'online'),
+    !WithheldPublishedAfterAnchorState(~run, 'late', 'e5'),
+    !RetainedAnchorState(~run, 'e5'),
+    !BranchForkEpochState(~run, 'late', 'e0'),
+    !RewindDistanceState(~run, 'late', 'd7'),
+    !RewindLimitState(~run, 'd5'),
+    !RewindTooDeepState(~run, 'd7', 'd5'),
+    !ScoreState(~run, 'online', 'd3', 'd3', 'qno', 'w2', 'gff'),
+    !ScoreState(~run, 'late', 'd7', 'd7', 'qno', 'w0', 'g00'),
+    !GtState(~run, 'd7', 'd3')
+  ]
+
+/*
+  Scenario family 11:
+
+  These are hand-written seeds for the bounded cases we eventually want to
+  generate from the Rust policy model. Each case names the expected winner and
+  reason.
+*/
+rule Init_Generated_Family_DepthPriority:
+  [ Fr(~run) ]
+--[
+    Scenario(~run, 'generated_depth_priority'),
+    GeneratedBoundedCase(~run, 'depth_priority'),
+    GeneratedExpectedSelection(~run, 'deep', 'effective_depth'),
+    SameInputSet(~run, 'alice'),
+    SameInputSet(~run, 'bob'),
+    Eligible(~run, 'deep'),
+    Eligible(~run, 'chatty'),
+    Score(~run, 'deep', 'd4', 'd4', 'qno', 'w0', 'gff'),
+    Score(~run, 'chatty', 'd3', 'd3', 'qno', 'w3', 'g00'),
+    ScoreGreater(~run, 'd4', 'd3')
+  ]->
+  [
+    Compare(~run, 'deep', 'chatty'),
+    Compare(~run, 'chatty', 'deep'),
+    View(~run, 'alice', 'deep', 'chatty'),
+    View(~run, 'bob', 'chatty', 'deep'),
+    !EligibleState(~run, 'deep'),
+    !EligibleState(~run, 'chatty'),
+    !ScoreState(~run, 'deep', 'd4', 'd4', 'qno', 'w0', 'gff'),
+    !ScoreState(~run, 'chatty', 'd3', 'd3', 'qno', 'w3', 'g00'),
+    !GtState(~run, 'd4', 'd3')
+  ]
+
+rule Init_Generated_Family_WitnessPriority:
+  [ Fr(~run) ]
+--[
+    Scenario(~run, 'generated_witness_priority'),
+    GeneratedBoundedCase(~run, 'witness_priority'),
+    GeneratedExpectedSelection(~run, 'chatty', 'witness_score_tie'),
+    SameInputSet(~run, 'alice'),
+    SameInputSet(~run, 'bob'),
+    Eligible(~run, 'chatty'),
+    Eligible(~run, 'quiet'),
+    Score(~run, 'chatty', 'd2', 'd2', 'qno', 'w3', 'gff'),
+    Score(~run, 'quiet', 'd2', 'd2', 'qno', 'w1', 'g00'),
+    ScoreGreater(~run, 'w3', 'w1')
+  ]->
+  [
+    Compare(~run, 'chatty', 'quiet'),
+    Compare(~run, 'quiet', 'chatty'),
+    View(~run, 'alice', 'chatty', 'quiet'),
+    View(~run, 'bob', 'quiet', 'chatty'),
+    !EligibleState(~run, 'chatty'),
+    !EligibleState(~run, 'quiet'),
+    !ScoreState(~run, 'chatty', 'd2', 'd2', 'qno', 'w3', 'gff'),
+    !ScoreState(~run, 'quiet', 'd2', 'd2', 'qno', 'w1', 'g00'),
+    !GtState(~run, 'w3', 'w1')
+  ]
+
+rule Init_Generated_Family_DigestPriority:
+  [ Fr(~run) ]
+--[
+    Scenario(~run, 'generated_digest_priority'),
+    GeneratedBoundedCase(~run, 'digest_priority'),
+    GeneratedExpectedSelection(~run, 'low_digest', 'digest_tie'),
+    SameInputSet(~run, 'alice'),
+    SameInputSet(~run, 'bob'),
+    Eligible(~run, 'low_digest'),
+    Eligible(~run, 'high_digest'),
+    Score(~run, 'low_digest', 'd2', 'd2', 'qno', 'w1', 'g00'),
+    Score(~run, 'high_digest', 'd2', 'd2', 'qno', 'w1', 'gff'),
+    DigestLower(~run, 'g00', 'gff')
+  ]->
+  [
+    Compare(~run, 'low_digest', 'high_digest'),
+    Compare(~run, 'high_digest', 'low_digest'),
+    View(~run, 'alice', 'low_digest', 'high_digest'),
+    View(~run, 'bob', 'high_digest', 'low_digest'),
+    !EligibleState(~run, 'low_digest'),
+    !EligibleState(~run, 'high_digest'),
+    !ScoreState(~run, 'low_digest', 'd2', 'd2', 'qno', 'w1', 'g00'),
+    !ScoreState(~run, 'high_digest', 'd2', 'd2', 'qno', 'w1', 'gff'),
+    !DigestLtState(~run, 'g00', 'gff')
+  ]
+
+rule Derive_Stale_Beyond_Rewind:
+  [
+    !RetainedAnchorState(run, anchor),
+    !BranchForkEpochState(run, branch, fork_epoch),
+    !RewindDistanceState(run, branch, distance),
+    !RewindLimitState(run, limit),
+    !RewindTooDeepState(run, distance, limit)
+  ]
+--[
+    StaleBeyondRewind(run, branch),
+    StaleDerivedFromAnchor(run, branch, anchor, fork_epoch, distance, limit)
+  ]->
+  [
+    !StaleState(run, branch)
+  ]
+
+rule Derive_Late_Withheld_Rejection:
+  [
+    !WithheldPublishedAfterAnchorState(run, branch, anchor),
+    !StaleState(run, branch)
+  ]
+--[
+    LateWithheldRejected(run, branch, anchor)
+  ]->
+  []
+
 rule Derive_Better_By_Effective_Depth:
   [
     Compare(run, winner, loser),
@@ -212,6 +525,112 @@ rule Derive_Better_By_Digest_Tie:
   ]->
   [
     !BetterState(run, winner, loser, 'digest_tie')
+  ]
+
+rule Queue_Outbound_While_Syncing:
+  [
+    OutboundIntent(run, client, intent),
+    SyncingState(run, client)
+  ]
+--[
+    QueuedOutbound(run, client, intent),
+    NotPublishedWhileSyncing(run, client, intent)
+  ]->
+  [
+    QueuedState(run, client, intent),
+    StableReady(run, client)
+  ]
+
+rule Release_Queued_Outbound_When_Stable:
+  [
+    QueuedState(run, client, intent),
+    StableReady(run, client)
+  ]
+--[
+    ConvergenceStable(run, client),
+    ReleasedQueuedOutbound(run, client, intent)
+  ]->
+  []
+
+rule Publish_Outbound_When_Stable:
+  [
+    OutboundIntent(run, client, intent),
+    StableState(run, client)
+  ]
+--[
+    PublishedOutbound(run, client, intent)
+  ]->
+  []
+
+rule Select_Three_First:
+  [
+    ThreeView(run, client, winner, second, third),
+    !BetterState(run, winner, second, reason_second),
+    !BetterState(run, winner, third, reason_third),
+    !EligibleState(run, winner)
+  ]
+--[
+    ThreeCandidateDominates(run, client, winner, second, third),
+    Selected(run, client, winner, 'three_branch_max')
+  ]->
+  [
+    Done(run, client, winner)
+  ]
+
+rule Select_Three_Second:
+  [
+    ThreeView(run, client, first, winner, third),
+    !BetterState(run, winner, first, reason_first),
+    !BetterState(run, winner, third, reason_third),
+    !EligibleState(run, winner)
+  ]
+--[
+    ThreeCandidateDominates(run, client, winner, first, third),
+    Selected(run, client, winner, 'three_branch_max')
+  ]->
+  [
+    Done(run, client, winner)
+  ]
+
+rule Select_Three_Third:
+  [
+    ThreeView(run, client, first, second, winner),
+    !BetterState(run, winner, first, reason_first),
+    !BetterState(run, winner, second, reason_second),
+    !EligibleState(run, winner)
+  ]
+--[
+    ThreeCandidateDominates(run, client, winner, first, second),
+    Selected(run, client, winner, 'three_branch_max')
+  ]->
+  [
+    Done(run, client, winner)
+  ]
+
+rule Select_Left_When_Right_Ineligible:
+  [
+    View(run, client, left, right),
+    !EligibleState(run, left),
+    !StaleState(run, right)
+  ]
+--[
+    Selected(run, client, left, 'opponent_ineligible')
+  ]->
+  [
+    Done(run, client, left)
+  ]
+
+rule Select_Right_When_Left_Ineligible:
+  [
+    View(run, client, left, right),
+    !EligibleState(run, right),
+    !StaleState(run, left)
+  ]
+--[
+    Selected(run, client, right, 'opponent_ineligible')
+  ]->
+  [
+    Done(run, client, right)
   ]
 
 rule Select_Left:
@@ -290,7 +709,101 @@ lemma digest_tie_selection_requires_lower_digest:
           Score(run, branch, raw, effective, quorum, witness, digest_b) @ #j
         & Score(run, loser, raw, effective, quorum, witness, digest_l) @ #k
         & DigestLower(run, digest_b, digest_l) @ #m
+	    )"
+
+lemma stale_rewind_is_derived_from_anchor_and_distance:
+  "All run branch #i.
+      StaleBeyondRewind(run, branch) @ #i
+    ==> (
+      Ex anchor fork_epoch distance limit #j #k #l #m #n.
+          RetainedAnchor(run, anchor) @ #j
+        & BranchForkEpoch(run, branch, fork_epoch) @ #k
+        & RewindDistance(run, branch, distance) @ #l
+        & RewindLimit(run, limit) @ #m
+        & RewindTooDeep(run, distance, limit) @ #n
     )"
+
+lemma stale_branches_are_never_selected:
+  "All run client branch reason #i #j.
+      StaleBeyondRewind(run, branch) @ #i
+    & Selected(run, client, branch, reason) @ #j
+    ==> F"
+
+lemma opponent_ineligible_selection_requires_stale_opponent:
+  "All run client branch #i.
+      Selected(run, client, branch, 'opponent_ineligible') @ #i
+    ==> (
+      Ex stale #j #k.
+          Eligible(run, branch) @ #j
+        & StaleBeyondRewind(run, stale) @ #k
+    )"
+
+lemma duplicate_witness_dedupe_selection_uses_distinct_sender_epochs:
+  "All run client branch #i #s.
+      Scenario(run, 'duplicate_witness_dedupe') @ #s
+    & Selected(run, client, branch, 'witness_score_tie') @ #i
+    ==> (
+      Ex #j #k #m #n.
+          DistinctWitness(run, branch, 'e2', 'alice') @ #j
+        & DistinctWitness(run, branch, 'e2', 'bob') @ #k
+        & DuplicateWitnessIgnored(run, branch, 'e2', 'alice') @ #m
+        & WitnessScore(run, branch, 'w2') @ #n
+	    )"
+
+lemma queued_outbound_requires_syncing:
+  "All run client intent #i.
+      QueuedOutbound(run, client, intent) @ #i
+    ==> (
+      Ex #j #k.
+          OutboundWanted(run, client, intent) @ #j
+        & SyncState(run, client, 'syncing') @ #k
+    )"
+
+lemma released_queued_outbound_requires_prior_queue:
+  "All run client intent #i.
+      ReleasedQueuedOutbound(run, client, intent) @ #i
+    ==> (
+      ConvergenceStable(run, client) @ #i
+      & (Ex #j. QueuedOutbound(run, client, intent) @ #j & #j < #i)
+    )"
+
+lemma syncing_outbound_is_never_published_directly:
+  "All run client intent #i #j.
+      SyncState(run, client, 'syncing') @ #i
+    & PublishedOutbound(run, client, intent) @ #j
+    ==> F"
+
+lemma stable_publish_requires_stable_state:
+  "All run client intent #i.
+      PublishedOutbound(run, client, intent) @ #i
+    ==> (
+      Ex #j #k.
+          OutboundWanted(run, client, intent) @ #j
+        & SyncState(run, client, 'stable') @ #k
+    )"
+
+lemma three_branch_selection_requires_dominance:
+  "All run client branch #i.
+      Selected(run, client, branch, 'three_branch_max') @ #i
+    ==> (
+      Ex other_a other_b #j.
+          ThreeCandidateDominates(run, client, branch, other_a, other_b) @ #j
+    )"
+
+lemma late_withheld_rejection_requires_publish_after_anchor_and_stale:
+  "All run branch anchor #i.
+      LateWithheldRejected(run, branch, anchor) @ #i
+    ==> (
+      Ex #j #k.
+          WithheldPublishedAfterAnchor(run, branch, anchor) @ #j
+        & StaleBeyondRewind(run, branch) @ #k
+    )"
+
+lemma generated_bounded_case_selection_matches_expected_reason:
+  "All run client branch expected_reason selected_reason #i #j.
+      GeneratedExpectedSelection(run, branch, expected_reason) @ #i
+    & Selected(run, client, branch, selected_reason) @ #j
+    ==> selected_reason = expected_reason"
 
 lemma no_conflicting_better_for_same_run:
   "All run left right reason_a reason_b #i #j.
@@ -318,8 +831,66 @@ lemma witness_score_tie_executable:
 
 lemma digest_tie_executable:
   exists-trace
+	  "Ex run #i #j.
+	      Scenario(run, 'digest_tie') @ #i
+	    & Selected(run, 'alice', 'lower_digest', 'digest_tie') @ #j"
+
+lemma stale_rewind_executable:
+  exists-trace
   "Ex run #i #j.
-      Scenario(run, 'digest_tie') @ #i
-    & Selected(run, 'alice', 'lower_digest', 'digest_tie') @ #j"
+      Scenario(run, 'stale_rewind') @ #i
+    & Selected(run, 'alice', 'online', 'opponent_ineligible') @ #j"
+
+lemma duplicate_witness_dedupe_executable:
+  exists-trace
+  "Ex run #i #j.
+      Scenario(run, 'duplicate_witness_dedupe') @ #i
+    & Selected(run, 'alice', 'used', 'witness_score_tie') @ #j"
+
+lemma outbound_queue_release_executable:
+  exists-trace
+  "Ex run #i #j #k.
+      Scenario(run, 'outbound_queued_until_stable') @ #i
+    & QueuedOutbound(run, 'alice', 'app_msg') @ #j
+    & ReleasedQueuedOutbound(run, 'alice', 'app_msg') @ #k"
+
+lemma outbound_stable_publish_executable:
+  exists-trace
+  "Ex run #i #j.
+      Scenario(run, 'outbound_published_when_stable') @ #i
+    & PublishedOutbound(run, 'alice', 'app_msg') @ #j"
+
+lemma three_branch_permutation_executable:
+  exists-trace
+  "Ex run #i #j #k #l.
+      Scenario(run, 'three_branch_permutation') @ #i
+    & Selected(run, 'alice', 'best', 'three_branch_max') @ #j
+    & Selected(run, 'bob', 'best', 'three_branch_max') @ #k
+    & Selected(run, 'carol', 'best', 'three_branch_max') @ #l"
+
+lemma withheld_published_after_anchor_executable:
+  exists-trace
+  "Ex run #i #j #k.
+      Scenario(run, 'withheld_published_after_anchor') @ #i
+    & LateWithheldRejected(run, 'late', 'e5') @ #j
+    & Selected(run, 'alice', 'online', 'opponent_ineligible') @ #k"
+
+lemma generated_depth_priority_executable:
+  exists-trace
+  "Ex run #i #j.
+      GeneratedBoundedCase(run, 'depth_priority') @ #i
+    & Selected(run, 'alice', 'deep', 'effective_depth') @ #j"
+
+lemma generated_witness_priority_executable:
+  exists-trace
+  "Ex run #i #j.
+      GeneratedBoundedCase(run, 'witness_priority') @ #i
+    & Selected(run, 'alice', 'chatty', 'witness_score_tie') @ #j"
+
+lemma generated_digest_priority_executable:
+  exists-trace
+  "Ex run #i #j.
+      GeneratedBoundedCase(run, 'digest_priority') @ #i
+    & Selected(run, 'alice', 'low_digest', 'digest_tie') @ #j"
 
 end
