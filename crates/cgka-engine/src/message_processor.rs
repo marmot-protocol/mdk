@@ -589,6 +589,12 @@ impl<S: StorageProvider> Engine<S> {
         group_id: &GroupId,
         now_ms: u64,
     ) -> Result<Vec<SendResult>, EngineError> {
+        if let Some(state) = self.epoch_manager.state(group_id)
+            && !matches!(state, EpochState::Stable { .. })
+        {
+            return Ok(Vec::new());
+        }
+
         if self.has_unresolved_convergence_inputs(group_id)? {
             let result = self
                 .converge_stored_openmls_messages(group_id, now_ms)

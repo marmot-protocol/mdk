@@ -72,6 +72,12 @@ intents. App-message intents are encrypted after sync against the selected
 canonical state. Commit intents are regenerated after sync because any pending
 MLS state created before sync may have been based on a stale epoch.
 
+The application drives this lifecycle through `advance_convergence(group_id)`.
+That call runs the convergence pass against the engine's monotonic clock and,
+when the group is stable, returns regenerated `SendResult`s for queued local
+work. A regenerated group evolution pauses draining until its publish lifecycle
+is resolved; timer ticks in that pending-publish window return no work.
+
 ## Branch Selection
 
 Only eligible branches are scored.

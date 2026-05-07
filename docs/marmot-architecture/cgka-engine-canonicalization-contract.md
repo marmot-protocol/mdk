@@ -343,9 +343,20 @@ SendResult::Queued {
 }
 ```
 
-`intent_id` identifies the durable queued intent. When the group reaches
-`Stable`, the engine regenerates publishable messages from the selected
-canonical state and removes the queued intent after regeneration succeeds.
+`intent_id` identifies the durable queued intent. Applications drive the
+release path with:
+
+```text
+advance_convergence(group_id) -> Vec<SendResult>
+```
+
+When the group reaches `Stable`, the engine regenerates publishable messages
+from the selected canonical state and removes each queued intent after
+regeneration succeeds. If regeneration creates a commit, the engine returns
+that one `SendResult::GroupEvolution` and pauses further draining until the
+application reports `confirm_published` or `publish_failed`. Calling
+`advance_convergence` during that pending-publish window returns no publishable
+work.
 
 ## Result
 

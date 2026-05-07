@@ -1,7 +1,7 @@
 //! Engine integration for stored-message distributed convergence.
 
 use async_trait::async_trait;
-use cgka_engine::canonicalization::SyncState;
+use cgka_engine::canonicalization::{CanonicalizationPolicy, SyncState};
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::openmls_projection::project_mls_message;
 use cgka_engine::{Engine, EngineBuilder};
@@ -12,7 +12,9 @@ use cgka_traits::group_context::GroupContextSnapshot;
 use cgka_traits::ingest::{PeeledContent, PeeledMessage};
 use cgka_traits::message::MessageState;
 use cgka_traits::peeler::TransportPeeler;
-use cgka_traits::storage::{GroupStorage, MessageStorage, OutboundIntentStorage};
+use cgka_traits::storage::{
+    GroupStorage, MessageStorage, OutboundIntentStorage, QueuedOutboundIntent,
+};
 use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };
@@ -773,6 +775,227 @@ async fn engine_queues_group_evolution_until_convergence_is_stable() {
     );
     assert!(
         carol_storage
+            .list_queued_outbound_intents(&group_id)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn trait_advance_convergence_drains_queued_outbound_intent() {
+    let (mut alice, _alice_storage) = build_client(b"alice");
+    let (mut bob, _bob_storage) = build_client(b"bob");
+    let (mut carol, carol_storage) = build_client(b"carol");
+    let (mut david, _david_storage) = build_client(b"david");
+
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "trait-advance-convergence".into(),
+            description: "".into(),
+            members: vec![bob_kp, carol_kp],
+            required_features: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    carol
+        .join_welcome(welcome_for(&welcomes, b"carol"))
+        .await
+        .unwrap();
+
+    let david_kp = david.fresh_key_package().await.unwrap();
+    let invite = alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![david_kp],
+        })
+        .await
+        .unwrap();
+    let (commit, _pending) = evolution(invite);
+    let commit = route(commit, &group_id);
+    assert!(matches!(
+        carol.ingest(commit.clone()).await.unwrap(),
+        cgka_traits::ingest::IngestOutcome::Buffered { .. }
+    ));
+
+    let queued = carol
+        .send(SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload: b"queued through trait lifecycle".to_vec(),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(queued, SendResult::Queued { .. }));
+
+    let policy = CanonicalizationPolicy {
+        stable_quiescence_ms: 0,
+        ..CanonicalizationPolicy::default()
+    };
+    carol.set_convergence_policy(policy);
+
+    let mut engine: Box<dyn CgkaEngine> = Box::new(carol);
+    let drained = engine.advance_convergence(&group_id).await.unwrap();
+
+    assert_eq!(drained.len(), 1);
+    let sent_app = match &drained[0] {
+        SendResult::ApplicationMessage { msg } => route(msg.clone(), &group_id),
+        other => panic!("expected ApplicationMessage, got {other:?}"),
+    };
+    assert_eq!(engine.epoch(&group_id).unwrap(), EpochId(2));
+    assert_message_state(&carol_storage, &commit, MessageState::Processed);
+    assert_eq!(
+        project_mls_message(&sent_app.payload)
+            .expect("trait-drained app projects")
+            .source_epoch,
+        Some(2)
+    );
+    assert!(
+        carol_storage
+            .list_queued_outbound_intents(&group_id)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn advance_convergence_retains_queued_intent_when_regeneration_fails() {
+    let (mut alice, alice_storage) = build_client(b"alice");
+
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "failed-regeneration".into(),
+            description: "".into(),
+            members: vec![],
+            required_features: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let pending = match create {
+        SendResult::GroupCreated { pending, .. } => pending,
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+
+    let intent_id = MessageId::new(b"invalid-update".to_vec());
+    alice_storage
+        .put_queued_outbound_intent(&QueuedOutboundIntent {
+            id: intent_id.clone(),
+            group_id: group_id.clone(),
+            intent: SendIntent::UpdateGroupData {
+                group_id: group_id.clone(),
+                name: None,
+                description: None,
+            },
+            created_at_ms: 0,
+        })
+        .unwrap();
+
+    let err = alice.advance_convergence(&group_id).await.err().unwrap();
+    assert!(
+        matches!(err, cgka_traits::EngineError::Other(ref msg) if msg.contains("no fields")),
+        "expected validation error from queued intent regeneration, got {err:?}"
+    );
+    let queued = alice_storage
+        .list_queued_outbound_intents(&group_id)
+        .unwrap();
+    assert_eq!(queued.len(), 1);
+    assert_eq!(queued[0].id, intent_id);
+}
+
+#[tokio::test]
+async fn queued_group_evolution_pauses_later_queued_intents_until_publish_resolves() {
+    let (mut alice, alice_storage) = build_client(b"alice");
+    let (mut bob, _bob_storage) = build_client(b"bob");
+    let (mut carol, _carol_storage) = build_client(b"carol");
+
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "queued-evolution-pause".into(),
+            description: "".into(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let pending = match create {
+        SendResult::GroupCreated { pending, .. } => pending,
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    alice_storage
+        .put_queued_outbound_intent(&QueuedOutboundIntent {
+            id: MessageId::new(b"invite-carol".to_vec()),
+            group_id: group_id.clone(),
+            intent: SendIntent::Invite {
+                group_id: group_id.clone(),
+                key_packages: vec![carol_kp],
+            },
+            created_at_ms: 0,
+        })
+        .unwrap();
+    alice_storage
+        .put_queued_outbound_intent(&QueuedOutboundIntent {
+            id: MessageId::new(b"later-app".to_vec()),
+            group_id: group_id.clone(),
+            intent: SendIntent::AppMessage {
+                group_id: group_id.clone(),
+                payload: b"after invite publish resolves".to_vec(),
+            },
+            created_at_ms: 1,
+        })
+        .unwrap();
+
+    let drained = alice.advance_convergence(&group_id).await.unwrap();
+    assert_eq!(drained.len(), 1);
+    let pending_invite = match &drained[0] {
+        SendResult::GroupEvolution { pending, .. } => *pending,
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    };
+    assert_eq!(
+        alice_storage
+            .list_queued_outbound_intents(&group_id)
+            .unwrap()
+            .len(),
+        1
+    );
+
+    let paused = alice.advance_convergence(&group_id).await.unwrap();
+    assert!(
+        paused.is_empty(),
+        "pending publish should pause queued lifecycle, got {paused:?}"
+    );
+    assert_eq!(
+        alice_storage
+            .list_queued_outbound_intents(&group_id)
+            .unwrap()
+            .len(),
+        1
+    );
+
+    alice.publish_failed(pending_invite).await.unwrap();
+    let drained_after_failure = alice.advance_convergence(&group_id).await.unwrap();
+    assert_eq!(drained_after_failure.len(), 1);
+    assert!(
+        matches!(
+            drained_after_failure[0],
+            SendResult::ApplicationMessage { .. }
+        ),
+        "expected later app intent after publish failure, got {drained_after_failure:?}"
+    );
+    assert!(
+        alice_storage
             .list_queued_outbound_intents(&group_id)
             .unwrap()
             .is_empty()

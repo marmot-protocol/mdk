@@ -243,6 +243,25 @@ pub trait CgkaEngine: Send + Sync {
     /// `PendingPublish` / `Merging`.
     async fn send(&mut self, intent: SendIntent) -> Result<SendResult, EngineError>;
 
+    /// Advance convergence for a group and release any queued outbound work
+    /// that is now safe to regenerate from the selected canonical state.
+    ///
+    /// Applications should call this after relay sync batches, reconnect
+    /// catch-up, or a convergence timer tick. The engine uses its local
+    /// monotonic lifecycle clock to decide whether the quiescence window has
+    /// elapsed.
+    ///
+    /// Returns publishable [`SendResult`] values. If a queued group evolution
+    /// is regenerated, the engine stops after that result because the group
+    /// enters `PendingPublish` until the application reports
+    /// [`Self::confirm_published`] or [`Self::publish_failed`]. Calls made
+    /// while the group is already in `PendingPublish` / `Merging` return no
+    /// publishable work.
+    async fn advance_convergence(
+        &mut self,
+        group_id: &GroupId,
+    ) -> Result<Vec<SendResult>, EngineError>;
+
     /// Confirm that a [`SendResult::GroupEvolution`] (or
     /// [`SendResult::GroupCreated`]) was successfully published to the
     /// transport. The engine applies the staged commit to local MLS state,
