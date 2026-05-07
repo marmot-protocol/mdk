@@ -2,7 +2,7 @@ name: Package MDK Bindings
 
 on:
   push:
-    branches: [ master, uniffi-bindings ]
+    branches: [ master ]
     tags:
       - 'v*'
   workflow_dispatch:

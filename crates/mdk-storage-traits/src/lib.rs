@@ -246,7 +246,7 @@ pub mod welcomes;
 // Re-export GroupId for convenience
 pub use error::MdkStorageError;
 pub use group_id::GroupId;
-pub use secret::{Secret, Zeroize};
+pub use secret::{PlaintextSecret, Secret, Zeroize};
 
 use self::groups::GroupStorage;
 use self::messages::MessageStorage;

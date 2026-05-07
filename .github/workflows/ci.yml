@@ -47,11 +47,12 @@ jobs:
             ci:
               - '.github/workflows/**'
               - 'scripts/check-github-actions-pinned.sh'
+              - 'scripts/check-workflow-policy.sh'
 
-  # ── GitHub Actions supply-chain guard ───────────────────────────────
-  actions-pinned:
+  # ── Workflow policy ─────────────────────────────────────────────────
+  workflow-policy:
     runs-on: ubuntu-latest
-    name: GitHub Actions Pins
+    name: Workflow Policy
     needs: changes
     if: github.event_name == 'push' || needs.changes.outputs.ci == 'true'
 
@@ -59,8 +60,8 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
-    - name: Check GitHub Actions pins
-      run: bash scripts/check-github-actions-pinned.sh
+    - name: Check GitHub workflow policy
+      run: bash scripts/check-workflow-policy.sh
 
   # ── Quick checks that fail fast ─────────────────────────────────────
   format:

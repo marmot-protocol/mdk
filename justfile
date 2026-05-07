@@ -65,6 +65,10 @@ docs:
 actions-pinned:
     @bash scripts/check-github-actions-pinned.sh
 
+# Check GitHub workflow policy
+workflow-policy:
+    @bash scripts/check-workflow-policy.sh
+
 # ==============================================================================
 # PRE-COMMIT CHECKS
 # ==============================================================================
@@ -72,7 +76,7 @@ actions-pinned:
 # Pre-commit checks: quiet mode with minimal output (recommended for agents/CI)
 precommit:
     @just _run-quiet "fmt"               "fmt (stable)"
-    @just _run-quiet "actions-pinned"    "actions pinned"
+    @just _run-quiet "workflow-policy"   "workflow policy"
     @just _run-quiet "docs"              "docs (stable)"
     @just _run-quiet "lint"              "clippy (stable)"
     @just _run-quiet "_fmt-msrv"         "fmt (msrv)"
@@ -90,14 +94,14 @@ precommit-verbose:
     @echo "Running pre-commit checks (stable + MSRV)"
     @echo "=========================================="
     @echo ""
-    @echo "→ Checking GitHub Actions pins..."
-    @just actions-pinned
-    @echo ""
     @echo "→ Checking with stable Rust..."
     @bash scripts/check-all.sh stable
     @echo ""
     @echo "→ Checking with MSRV (1.90.0)..."
     @bash scripts/check-msrv.sh
+    @echo ""
+    @echo "→ Checking GitHub workflow policy..."
+    @just workflow-policy
     @echo ""
     @echo "→ Running tests..."
     @just test-all
@@ -112,6 +116,7 @@ precommit-verbose:
 # Quick check with stable (fast for local development)
 check:
     @bash scripts/check-all.sh
+    @just workflow-policy
     @just test-all
 
 # Full comprehensive check including all feature combinations (same as check for now)
