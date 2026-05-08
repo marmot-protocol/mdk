@@ -8291,6 +8291,14 @@ mod tests {
             .accept_welcome(&charlie_welcome)
             .expect("charlie accepts");
 
+        let required_proposals = bob_mdk
+            .group_required_proposals(&group_id)
+            .expect("bob reads required proposals");
+        assert!(
+            !required_proposals.contains(&ProposalType::SelfRemove),
+            "mixed group must not require SelfRemove before Bob's legacy fallback leave"
+        );
+
         // Bob leaves the mixed group.
         let bob_leave = bob_mdk.leave_group(&group_id).expect("Bob should leave");
 
@@ -8360,6 +8368,14 @@ mod tests {
                 .count(),
             3,
             "alice starts with alice, bob, and charlie"
+        );
+
+        let required_proposals = charlie_mdk
+            .group_required_proposals(&group_id)
+            .expect("charlie reads required proposals");
+        assert!(
+            !required_proposals.contains(&ProposalType::SelfRemove),
+            "mixed group must not require SelfRemove before Charlie's legacy fallback leave"
         );
 
         let charlie_leave = charlie_mdk
