@@ -19,6 +19,8 @@ use nostr::EventId;
 
 use crate::Error;
 
+const PENDING_SNAPSHOT_PREFIX: &str = "pending_";
+
 /// Metadata about a snapshot taken before applying a commit
 #[derive(Clone)]
 pub struct EpochSnapshot {
@@ -53,9 +55,16 @@ impl fmt::Debug for EpochSnapshot {
     }
 }
 
+struct PendingEpochSnapshot {
+    snapshot: EpochSnapshot,
+    marker_snapshot_name: String,
+}
+
 struct EpochSnapshotManagerInner {
     /// Snapshots per group, ordered by epoch (oldest first)
     snapshots: HashMap<GroupId, VecDeque<EpochSnapshot>>,
+    /// Pre-merge snapshots for locally created pending commits.
+    pending_snapshots: HashMap<GroupId, PendingEpochSnapshot>,
     /// Groups that have been hydrated from storage (only relevant for persistent backends)
     hydrated_groups: HashSet<GroupId>,
 }
@@ -65,9 +74,10 @@ impl fmt::Debug for EpochSnapshotManagerInner {
         let total_snapshots: usize = self.snapshots.values().map(|q| q.len()).sum();
         write!(
             f,
-            "EpochSnapshotManagerInner {{ groups: {}, total_snapshots: {} }}",
+            "EpochSnapshotManagerInner {{ groups: {}, total_snapshots: {}, pending_snapshots: {} }}",
             self.snapshots.len(),
-            total_snapshots
+            total_snapshots,
+            self.pending_snapshots.len()
         )
     }
 }
@@ -93,6 +103,7 @@ impl EpochSnapshotManager {
         Self {
             inner: Mutex::new(EpochSnapshotManagerInner {
                 snapshots: HashMap::new(),
+                pending_snapshots: HashMap::new(),
                 hydrated_groups: HashSet::new(),
             }),
             retention_count,
@@ -106,6 +117,7 @@ impl EpochSnapshotManager {
     pub fn remove_group(&self, group_id: &GroupId) {
         let mut inner = self.inner.lock().unwrap();
         inner.snapshots.remove(group_id);
+        inner.pending_snapshots.remove(group_id);
         inner.hydrated_groups.remove(group_id);
     }
 
@@ -141,28 +153,33 @@ impl EpochSnapshotManager {
             }
         };
 
-        // Parse snapshot names and populate the queue
-        // Format: "snap_{group_id_hex}_{epoch}_{commit_id_hex}"
-        let queue = inner.snapshots.entry(group_id.clone()).or_default();
+        let pending_snapshot_names: HashSet<String> = stored_snapshots
+            .iter()
+            .filter_map(|(snapshot_name, _)| Self::snapshot_name_from_pending_marker(snapshot_name))
+            .collect();
 
         for (snapshot_name, created_at_unix) in stored_snapshots {
+            if pending_snapshot_names.contains(&snapshot_name)
+                || Self::snapshot_name_from_pending_marker(&snapshot_name).is_some()
+            {
+                continue;
+            }
+
             if let Some(snapshot) =
                 Self::parse_snapshot_name(&snapshot_name, group_id, created_at_unix)
             {
+                let queue = inner.snapshots.entry(group_id.clone()).or_default();
                 queue.push_back(snapshot);
             } else {
                 tracing::warn!(
-                    "Failed to parse snapshot name during hydration: {}",
-                    snapshot_name
+                    "Failed to parse snapshot name during hydration; snapshot name redacted"
                 );
             }
         }
 
         // Enforce retention limit after hydration
-        while queue.len() > self.retention_count {
-            if let Some(old_snap) = queue.pop_front() {
-                let _ = storage.release_group_snapshot(&old_snap.group_id, &old_snap.snapshot_name);
-            }
+        if let Some(queue) = inner.snapshots.get_mut(group_id) {
+            Self::prune_queue(storage, queue, self.retention_count);
         }
 
         inner.hydrated_groups.insert(group_id.clone());
@@ -200,7 +217,92 @@ impl EpochSnapshotManager {
         })
     }
 
-    /// Create a snapshot before applying a commit
+    fn build_snapshot_name(group_id: &GroupId, current_epoch: u64, commit_id: &EventId) -> String {
+        format!(
+            "snap_{}_{}_{}",
+            hex::encode(group_id.as_slice()),
+            current_epoch,
+            commit_id.to_hex()
+        )
+    }
+
+    fn pending_marker_snapshot_name(snapshot_name: &str) -> String {
+        format!("{PENDING_SNAPSHOT_PREFIX}{snapshot_name}")
+    }
+
+    fn snapshot_name_from_pending_marker(snapshot_name: &str) -> Option<String> {
+        snapshot_name
+            .strip_prefix(PENDING_SNAPSHOT_PREFIX)
+            .map(str::to_string)
+    }
+
+    fn build_snapshot<S: MdkStorageProvider>(
+        storage: &S,
+        group_id: &GroupId,
+        current_epoch: u64,
+        commit_id: &EventId,
+        commit_ts: u64,
+        content_hash: &[u8; 32],
+    ) -> Result<EpochSnapshot, Error> {
+        // Generate a unique snapshot name
+        let snapshot_name = Self::build_snapshot_name(group_id, current_epoch, commit_id);
+
+        // Create the snapshot in storage
+        storage
+            .create_group_snapshot(group_id, &snapshot_name)
+            .map_err(Error::Storage)?;
+
+        Ok(EpochSnapshot {
+            group_id: group_id.clone(),
+            epoch: current_epoch,
+            applied_commit_id: *commit_id,
+            applied_commit_ts: commit_ts,
+            applied_commit_content_hash: *content_hash,
+            created_at: Instant::now(),
+            snapshot_name,
+        })
+    }
+
+    fn release_pending_snapshot_record<S: MdkStorageProvider>(
+        storage: &S,
+        pending: PendingEpochSnapshot,
+    ) -> Result<(), Error> {
+        let group_id = &pending.snapshot.group_id;
+        let mut release_error = None;
+
+        for snapshot_name in [
+            &pending.snapshot.snapshot_name,
+            &pending.marker_snapshot_name,
+        ] {
+            if let Err(e) = storage.release_group_snapshot(group_id, snapshot_name)
+                && release_error.is_none()
+            {
+                release_error = Some(e);
+            }
+        }
+
+        match release_error {
+            Some(e) => Err(Error::Storage(e)),
+            None => Ok(()),
+        }
+    }
+
+    fn prune_queue<S: MdkStorageProvider>(
+        storage: &S,
+        queue: &mut VecDeque<EpochSnapshot>,
+        retention_count: usize,
+    ) {
+        // We prune strictly greater than retention count.
+        // If retention is 5, we keep 5 snapshots.
+        while queue.len() > retention_count {
+            if let Some(old_snap) = queue.pop_front() {
+                // Best effort release
+                let _ = storage.release_group_snapshot(&old_snap.group_id, &old_snap.snapshot_name);
+            }
+        }
+    }
+
+    /// Create a snapshot before applying a received commit.
     pub fn create_snapshot<S: MdkStorageProvider>(
         &self,
         storage: &S,
@@ -213,45 +315,219 @@ impl EpochSnapshotManager {
         // Ensure we have loaded any existing snapshots from storage
         self.ensure_hydrated(storage, group_id);
 
-        // Generate a unique snapshot name
-        let snapshot_name = format!(
-            "snap_{}_{}_{}",
-            hex::encode(group_id.as_slice()),
+        let snapshot = Self::build_snapshot(
+            storage,
+            group_id,
             current_epoch,
-            commit_id.to_hex()
-        );
+            commit_id,
+            commit_ts,
+            content_hash,
+        )?;
+        let snapshot_name = snapshot.snapshot_name.clone();
 
-        // Create the snapshot in storage
-        storage
-            .create_group_snapshot(group_id, &snapshot_name)
-            .map_err(Error::Storage)?;
+        let mut inner = self.inner.lock().unwrap();
+        let queue = inner.snapshots.entry(group_id.clone()).or_default();
+        queue.push_back(snapshot);
+        Self::prune_queue(storage, queue, self.retention_count);
 
-        // Record metadata
-        let snapshot = EpochSnapshot {
-            group_id: group_id.clone(),
-            epoch: current_epoch,
-            applied_commit_id: *commit_id,
-            applied_commit_ts: commit_ts,
-            applied_commit_content_hash: *content_hash,
-            created_at: Instant::now(),
-            snapshot_name: snapshot_name.clone(),
+        Ok(snapshot_name)
+    }
+
+    /// Create a dormant snapshot for a locally created pending commit.
+    ///
+    /// The snapshot is not considered for race resolution until
+    /// [`Self::activate_pending_snapshot`] is called after the pending commit is
+    /// merged. This avoids treating unpublished or cleared local commits as the
+    /// incumbent branch while still preserving the pre-merge state needed if a
+    /// better same-epoch commit arrives later.
+    pub fn create_pending_snapshot<S: MdkStorageProvider>(
+        &self,
+        storage: &S,
+        group_id: &GroupId,
+        current_epoch: u64,
+        commit_id: &EventId,
+        commit_ts: u64,
+        content_hash: &[u8; 32],
+    ) -> Result<String, Error> {
+        self.ensure_hydrated(storage, group_id);
+
+        let snapshot = Self::build_snapshot(
+            storage,
+            group_id,
+            current_epoch,
+            commit_id,
+            commit_ts,
+            content_hash,
+        )?;
+        let marker_snapshot_name = Self::pending_marker_snapshot_name(&snapshot.snapshot_name);
+
+        if let Err(e) = storage.create_group_snapshot(group_id, &marker_snapshot_name) {
+            let _ = storage.release_group_snapshot(group_id, &snapshot.snapshot_name);
+            return Err(Error::Storage(e));
+        }
+
+        let snapshot_name = snapshot.snapshot_name.clone();
+
+        let previous = {
+            let mut inner = self.inner.lock().unwrap();
+            inner.pending_snapshots.insert(
+                group_id.clone(),
+                PendingEpochSnapshot {
+                    snapshot,
+                    marker_snapshot_name,
+                },
+            )
+        };
+
+        if let Some(old_snap) = previous {
+            let _ = Self::release_pending_snapshot_record(storage, old_snap);
+        }
+
+        Ok(snapshot_name)
+    }
+
+    /// Check whether a pending snapshot exists for a locally staged commit.
+    pub fn has_pending_snapshot<S: MdkStorageProvider>(
+        &self,
+        storage: &S,
+        group_id: &GroupId,
+        current_epoch: u64,
+        commit_id: &EventId,
+    ) -> bool {
+        self.ensure_hydrated(storage, group_id);
+
+        {
+            let inner = self.inner.lock().unwrap();
+            if let Some(pending) = inner.pending_snapshots.get(group_id)
+                && pending.snapshot.epoch == current_epoch
+                && pending.snapshot.applied_commit_id == *commit_id
+            {
+                return true;
+            }
+        }
+
+        let snapshot_name = Self::build_snapshot_name(group_id, current_epoch, commit_id);
+        let marker_snapshot_name = Self::pending_marker_snapshot_name(&snapshot_name);
+        match storage.list_group_snapshots(group_id) {
+            Ok(snapshots) => snapshots
+                .iter()
+                .any(|(stored_name, _)| stored_name == &marker_snapshot_name),
+            Err(_) => false,
+        }
+    }
+
+    /// Promote a locally created pending-commit snapshot after the commit merges.
+    pub fn activate_pending_snapshot<S: MdkStorageProvider>(
+        &self,
+        storage: &S,
+        group_id: &GroupId,
+    ) -> bool {
+        self.ensure_hydrated(storage, group_id);
+
+        let mut inner = self.inner.lock().unwrap();
+        let Some(pending) = inner.pending_snapshots.remove(group_id) else {
+            return false;
+        };
+        let _ = storage.release_group_snapshot(group_id, &pending.marker_snapshot_name);
+
+        let queue = inner.snapshots.entry(group_id.clone()).or_default();
+        queue.push_back(pending.snapshot);
+        Self::prune_queue(storage, queue, self.retention_count);
+
+        true
+    }
+
+    /// Promote a pending snapshot for a specific local commit after the commit merges.
+    pub fn activate_pending_snapshot_for_commit<S: MdkStorageProvider>(
+        &self,
+        storage: &S,
+        group_id: &GroupId,
+        current_epoch: u64,
+        commit_id: &EventId,
+        commit_ts: u64,
+        content_hash: &[u8; 32],
+    ) -> bool {
+        self.ensure_hydrated(storage, group_id);
+
+        let snapshot_name = Self::build_snapshot_name(group_id, current_epoch, commit_id);
+        let marker_snapshot_name = Self::pending_marker_snapshot_name(&snapshot_name);
+        let snapshot = {
+            let mut inner = self.inner.lock().unwrap();
+            let pending_matches = inner
+                .pending_snapshots
+                .get(group_id)
+                .map(|pending| pending.snapshot.snapshot_name == snapshot_name);
+
+            match pending_matches {
+                Some(true) => {
+                    let pending = inner
+                        .pending_snapshots
+                        .remove(group_id)
+                        .expect("matching pending snapshot must exist");
+                    drop(inner);
+
+                    let _ = storage.release_group_snapshot(group_id, &pending.marker_snapshot_name);
+                    pending.snapshot
+                }
+                Some(false) => return false,
+                None => {
+                    drop(inner);
+
+                    let marker_exists = storage
+                        .list_group_snapshots(group_id)
+                        .map(|snapshots| {
+                            snapshots
+                                .iter()
+                                .any(|(stored_name, _)| stored_name == &marker_snapshot_name)
+                        })
+                        .unwrap_or(false);
+
+                    if !marker_exists {
+                        return false;
+                    }
+
+                    let _ = storage.release_group_snapshot(group_id, &marker_snapshot_name);
+                    EpochSnapshot {
+                        group_id: group_id.clone(),
+                        epoch: current_epoch,
+                        applied_commit_id: *commit_id,
+                        applied_commit_ts: commit_ts,
+                        applied_commit_content_hash: *content_hash,
+                        created_at: Instant::now(),
+                        snapshot_name,
+                    }
+                }
+            }
         };
 
         let mut inner = self.inner.lock().unwrap();
         let queue = inner.snapshots.entry(group_id.clone()).or_default();
         queue.push_back(snapshot);
+        Self::prune_queue(storage, queue, self.retention_count);
 
-        // Prune if needed (deferred slightly, or do it now)
-        // We prune strictly greater than retention count.
-        // If retention is 5, we keep 5 snapshots.
-        while queue.len() > self.retention_count {
-            if let Some(old_snap) = queue.pop_front() {
-                // Best effort release
-                let _ = storage.release_group_snapshot(&old_snap.group_id, &old_snap.snapshot_name);
+        true
+    }
+
+    /// Release a dormant snapshot when the local pending commit is cleared.
+    pub fn release_pending_snapshot<S: MdkStorageProvider>(
+        &self,
+        storage: &S,
+        group_id: &GroupId,
+    ) -> Result<bool, Error> {
+        self.ensure_hydrated(storage, group_id);
+
+        let snapshot = {
+            let mut inner = self.inner.lock().unwrap();
+            inner.pending_snapshots.remove(group_id)
+        };
+
+        match snapshot {
+            Some(snapshot) => {
+                Self::release_pending_snapshot_record(storage, snapshot)?;
+                Ok(true)
             }
+            None => Ok(false),
         }
-
-        Ok(snapshot_name)
     }
 
     /// Check if a candidate commit is "better" than the one we applied for this epoch.
@@ -391,6 +667,35 @@ mod tests {
     /// Helper to create a test event ID from a hex string
     fn test_event_id(hex: &str) -> EventId {
         EventId::from_str(hex).unwrap()
+    }
+
+    fn test_group(group_id: GroupId) -> Group {
+        let admin_pk = PublicKey::from_slice(&[2u8; 32]).unwrap();
+        let mut admin_pubkeys = BTreeSet::new();
+        admin_pubkeys.insert(admin_pk);
+        Group {
+            mls_group_id: group_id,
+            nostr_group_id: [0u8; 32],
+            name: "Test Group".to_string(),
+            description: "Test".to_string(),
+            admin_pubkeys,
+            epoch: 0,
+            last_message_at: None,
+            last_message_processed_at: None,
+            last_message_id: None,
+            image_hash: None,
+            image_key: None,
+            image_nonce: None,
+            state: GroupState::Active,
+            self_update_state: SelfUpdateState::Required,
+        }
+    }
+
+    fn save_test_group<S>(storage: &S, group_id: &GroupId)
+    where
+        S: GroupStorage,
+    {
+        storage.save_group(test_group(group_id.clone())).unwrap();
     }
 
     // ========================================
@@ -1192,6 +1497,222 @@ mod tests {
         // parts[1] is the group_id hex, parts[3] is the commit_id hex
         assert_eq!(parts[1].len(), 64, "Group ID hex should be 64 chars");
         assert_eq!(parts[3].len(), 64, "Commit ID hex should be 64 chars");
+    }
+
+    #[test]
+    fn test_pending_snapshot_marker_excludes_snapshot_from_hydration() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("pending_snapshot.db");
+        let storage = mdk_sqlite_storage::MdkSqliteStorage::new_unencrypted(&db_path).unwrap();
+        let manager = EpochSnapshotManager::new(5);
+        let group_id = test_group_id(7);
+        let admin_pk = PublicKey::from_slice(&[2u8; 32]).unwrap();
+        let mut admin_pubkeys = BTreeSet::new();
+        admin_pubkeys.insert(admin_pk);
+        let group = Group {
+            mls_group_id: group_id.clone(),
+            nostr_group_id: [0u8; 32],
+            name: "Test Group".to_string(),
+            description: "Test".to_string(),
+            admin_pubkeys,
+            epoch: 5,
+            last_message_at: None,
+            last_message_processed_at: None,
+            last_message_id: None,
+            image_hash: None,
+            image_key: None,
+            image_nonce: None,
+            state: GroupState::Active,
+            self_update_state: SelfUpdateState::Required,
+        };
+        storage.save_group(group).unwrap();
+
+        let commit_id =
+            test_event_id("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc");
+        let snapshot_name = manager
+            .create_pending_snapshot(&storage, &group_id, 5, &commit_id, 1000, &[1u8; 32])
+            .unwrap();
+        let marker_name = EpochSnapshotManager::pending_marker_snapshot_name(&snapshot_name);
+        let stored_names: BTreeSet<String> = storage
+            .list_group_snapshots(&group_id)
+            .unwrap()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert!(stored_names.contains(&snapshot_name));
+        assert!(stored_names.contains(&marker_name));
+
+        let hydrated_manager = EpochSnapshotManager::new(5);
+        let candidate_id =
+            test_event_id("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        assert!(!hydrated_manager.is_better_candidate(
+            &storage,
+            &group_id,
+            5,
+            999,
+            &candidate_id,
+            &[2u8; 32]
+        ));
+        assert!(hydrated_manager.has_pending_snapshot(&storage, &group_id, 5, &commit_id));
+
+        let inner = hydrated_manager.inner.lock().unwrap();
+        assert!(
+            !inner.snapshots.contains_key(&group_id)
+                || inner.snapshots.get(&group_id).unwrap().is_empty(),
+            "Pending snapshots should not hydrate as active rollback snapshots"
+        );
+    }
+
+    #[test]
+    fn test_pending_snapshot_lifecycle_activates_snapshot() {
+        let manager = EpochSnapshotManager::new(5);
+        let storage = mdk_memory_storage::MdkMemoryStorage::default();
+        let group_id = test_group_id(8);
+        save_test_group(&storage, &group_id);
+        let commit_id =
+            test_event_id("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let better_id =
+            test_event_id("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+
+        manager
+            .create_pending_snapshot(&storage, &group_id, 3, &commit_id, 1000, &[1u8; 32])
+            .unwrap();
+        assert!(manager.has_pending_snapshot(&storage, &group_id, 3, &commit_id));
+        assert!(!manager.is_better_candidate(&storage, &group_id, 3, 999, &better_id, &[2u8; 32]));
+
+        assert!(manager.activate_pending_snapshot(&storage, &group_id));
+        assert!(!manager.has_pending_snapshot(&storage, &group_id, 3, &commit_id));
+        assert!(manager.is_better_candidate(&storage, &group_id, 3, 999, &better_id, &[2u8; 32]));
+    }
+
+    #[test]
+    fn test_release_pending_snapshot_removes_pending_state() {
+        let manager = EpochSnapshotManager::new(5);
+        let storage = mdk_memory_storage::MdkMemoryStorage::default();
+        let group_id = test_group_id(9);
+        save_test_group(&storage, &group_id);
+        let commit_id =
+            test_event_id("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let snapshot_name = manager
+            .create_pending_snapshot(&storage, &group_id, 3, &commit_id, 1000, &[1u8; 32])
+            .unwrap();
+        let marker_name = EpochSnapshotManager::pending_marker_snapshot_name(&snapshot_name);
+
+        assert!(
+            manager
+                .release_pending_snapshot(&storage, &group_id)
+                .unwrap()
+        );
+        assert!(
+            !manager
+                .release_pending_snapshot(&storage, &group_id)
+                .unwrap()
+        );
+        assert!(!manager.has_pending_snapshot(&storage, &group_id, 3, &commit_id));
+        let stored_names: BTreeSet<String> = storage
+            .list_group_snapshots(&group_id)
+            .unwrap()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert!(!stored_names.contains(&snapshot_name));
+        assert!(!stored_names.contains(&marker_name));
+    }
+
+    #[test]
+    fn test_pending_snapshot_replacement_releases_previous_snapshot() {
+        let manager = EpochSnapshotManager::new(5);
+        let storage = mdk_memory_storage::MdkMemoryStorage::default();
+        let group_id = test_group_id(10);
+        save_test_group(&storage, &group_id);
+        let first_commit_id =
+            test_event_id("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let second_commit_id =
+            test_event_id("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        let first_snapshot_name = manager
+            .create_pending_snapshot(&storage, &group_id, 3, &first_commit_id, 1000, &[1u8; 32])
+            .unwrap();
+        let first_marker_name =
+            EpochSnapshotManager::pending_marker_snapshot_name(&first_snapshot_name);
+        let second_snapshot_name = manager
+            .create_pending_snapshot(&storage, &group_id, 3, &second_commit_id, 1001, &[2u8; 32])
+            .unwrap();
+        let second_marker_name =
+            EpochSnapshotManager::pending_marker_snapshot_name(&second_snapshot_name);
+
+        let stored_names: BTreeSet<String> = storage
+            .list_group_snapshots(&group_id)
+            .unwrap()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert!(!stored_names.contains(&first_snapshot_name));
+        assert!(!stored_names.contains(&first_marker_name));
+        assert!(stored_names.contains(&second_snapshot_name));
+        assert!(stored_names.contains(&second_marker_name));
+        assert!(!manager.has_pending_snapshot(&storage, &group_id, 3, &first_commit_id));
+        assert!(manager.has_pending_snapshot(&storage, &group_id, 3, &second_commit_id));
+    }
+
+    #[test]
+    fn test_activate_pending_snapshot_for_commit_uses_persisted_marker() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("pending_snapshot_activate.db");
+        let storage = mdk_sqlite_storage::MdkSqliteStorage::new_unencrypted(&db_path).unwrap();
+        let manager = EpochSnapshotManager::new(5);
+        let group_id = test_group_id(11);
+        save_test_group(&storage, &group_id);
+        let commit_id =
+            test_event_id("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let better_id =
+            test_event_id("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        let snapshot_name = manager
+            .create_pending_snapshot(&storage, &group_id, 4, &commit_id, 1000, &[1u8; 32])
+            .unwrap();
+        let marker_name = EpochSnapshotManager::pending_marker_snapshot_name(&snapshot_name);
+
+        let restarted_manager = EpochSnapshotManager::new(5);
+        assert!(restarted_manager.has_pending_snapshot(&storage, &group_id, 4, &commit_id));
+        assert!(restarted_manager.activate_pending_snapshot_for_commit(
+            &storage, &group_id, 4, &commit_id, 1000, &[1u8; 32]
+        ));
+        assert!(
+            restarted_manager
+                .is_better_candidate(&storage, &group_id, 4, 999, &better_id, &[2u8; 32])
+        );
+        let stored_names: BTreeSet<String> = storage
+            .list_group_snapshots(&group_id)
+            .unwrap()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert!(stored_names.contains(&snapshot_name));
+        assert!(!stored_names.contains(&marker_name));
+    }
+
+    #[test]
+    fn test_activate_pending_snapshot_for_commit_keeps_unmatched_pending_snapshot() {
+        let manager = EpochSnapshotManager::new(5);
+        let storage = mdk_memory_storage::MdkMemoryStorage::default();
+        let group_id = test_group_id(12);
+        save_test_group(&storage, &group_id);
+        let pending_commit_id =
+            test_event_id("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let other_commit_id =
+            test_event_id("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+
+        manager
+            .create_pending_snapshot(&storage, &group_id, 4, &pending_commit_id, 1000, &[1u8; 32])
+            .unwrap();
+        assert!(!manager.activate_pending_snapshot_for_commit(
+            &storage,
+            &group_id,
+            4,
+            &other_commit_id,
+            999,
+            &[2u8; 32]
+        ));
+        assert!(manager.has_pending_snapshot(&storage, &group_id, 4, &pending_commit_id));
     }
 
     #[test]

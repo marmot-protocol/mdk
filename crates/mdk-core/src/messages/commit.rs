@@ -1699,6 +1699,93 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_own_admin_update_can_roll_back_to_better_competing_admin_update() {
+        let alice_keys = Keys::generate();
+        let bob_keys = Keys::generate();
+        let callback = std::sync::Arc::new(TestCallback::new());
+
+        let alice_mdk = crate::MDK::builder(mdk_memory_storage::MdkMemoryStorage::default())
+            .with_callback(callback.clone())
+            .build();
+        let bob_mdk = crate::MDK::builder(mdk_memory_storage::MdkMemoryStorage::default())
+            .with_callback(callback.clone())
+            .build();
+
+        let admins = vec![alice_keys.public_key(), bob_keys.public_key()];
+        let bob_key_package = create_key_package_event(&bob_mdk, &bob_keys);
+        let create_result = alice_mdk
+            .create_group(
+                &alice_keys.public_key(),
+                vec![bob_key_package],
+                create_nostr_group_config_data(admins),
+            )
+            .expect("Alice should create group");
+        let group_id = create_result.group.mls_group_id.clone();
+
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("Alice should merge creation");
+        let bob_welcome = bob_mdk
+            .process_welcome(&EventId::all_zeros(), &create_result.welcome_rumors[0])
+            .expect("Bob should process welcome");
+        bob_mdk
+            .accept_welcome(&bob_welcome)
+            .expect("Bob should accept welcome");
+
+        let alice_update = alice_mdk
+            .update_group_data(
+                &group_id,
+                crate::groups::NostrGroupDataUpdate::new().admins(vec![alice_keys.public_key()]),
+            )
+            .expect("Alice should create admin update");
+        let bob_update = bob_mdk
+            .update_group_data(
+                &group_id,
+                crate::groups::NostrGroupDataUpdate::new().admins(vec![bob_keys.public_key()]),
+            )
+            .expect("Bob should create admin update");
+
+        let (better_event, worse_event) =
+            order_events_by_mip03(&alice_update.evolution_event, &bob_update.evolution_event);
+
+        let (partitioned_mdk, expected_admin) = if worse_event.id == alice_update.evolution_event.id
+        {
+            (&alice_mdk, bob_keys.public_key())
+        } else {
+            (&bob_mdk, alice_keys.public_key())
+        };
+
+        let own_result = partitioned_mdk.process_message(worse_event);
+        assert!(
+            matches!(own_result, Ok(MessageProcessingResult::Commit { .. })),
+            "Relay echo of own pending admin update should merge the pending commit, got: {:?}",
+            own_result
+        );
+
+        let result = partitioned_mdk.process_message(better_event);
+        assert!(
+            matches!(result, Ok(MessageProcessingResult::Commit { .. })),
+            "Better competing admin update should be applied after rollback, got: {:?}",
+            result
+        );
+
+        assert!(
+            callback.rollback_count() > 0,
+            "Processing the better competing admin update should trigger rollback"
+        );
+
+        let group = partitioned_mdk
+            .get_group(&group_id)
+            .expect("Group lookup should succeed")
+            .expect("Group should exist");
+        assert_eq!(
+            group.admin_pubkeys,
+            [expected_admin].into_iter().collect(),
+            "Partitioned client should converge on the better commit's admin set"
+        );
+    }
+
     /// Test that epoch snapshots are properly pruned based on retention count
     #[test]
     fn test_epoch_snapshot_retention_pruning() {
