@@ -77,6 +77,7 @@ fn print_tamarin(cases: &[PolicyCase]) {
         );
         println!("    SameInputSet(~run, 'alice'),");
         println!("    SameInputSet(~run, 'bob'),");
+        println!("    PolicyLoaded(~run, 'group', 'generated_policy'),");
         for candidate in &candidates {
             println!("    Eligible(~run, '{}'),", candidate.id);
         }
@@ -120,6 +121,7 @@ fn print_tamarin(cases: &[PolicyCase]) {
         println!("    Compare(~run, '{}', '{}'),", loser.id, winner.id);
         println!("    View(~run, 'alice', '{}', '{}'),", winner.id, loser.id);
         println!("    View(~run, 'bob', '{}', '{}'),", loser.id, winner.id);
+        println!("    !PolicyLoadedState(~run),");
         for candidate in &candidates {
             println!("    !EligibleState(~run, '{}'),", candidate.id);
         }

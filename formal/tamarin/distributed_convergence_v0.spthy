@@ -1,9 +1,11 @@
 /*
   Marmot distributed convergence, v0.
 
-  This model starts at the selector boundary. MLS validation, signatures,
-  encryption, and transport provenance are abstracted away. The input to this
-  model is a candidate set that has already been validated by protocol replay.
+  This model starts at the engine convergence boundary. MLS validation,
+  signatures, encryption, and transport provenance are abstracted away. The
+  input to this model is a candidate set that has already been validated by
+  protocol replay, plus the engine lifecycle facts that bound replay: loaded
+  convergence policy, retained anchors, and canonicalization dispositions.
 
   Scores are represented as bounded symbolic classes:
 
@@ -14,7 +16,9 @@
 
   The ordering facts are scenario-local so this model stays small and focused.
   Branch eligibility is also scenario-local: a branch beyond the rewind horizon
-  may have a higher raw depth, but it must not be selected.
+  may have a higher raw depth, but it must not be selected. Retained-anchor
+  availability is modeled as a separate lifecycle gate because the Rust engine
+  must not mutate OpenMLS group state when a required anchor snapshot is gone.
 */
 
 theory distributed_convergence_v0
@@ -32,6 +36,7 @@ rule Init_Quorum_Override:
     Scenario(~run, 'quorum_override'),
     SameInputSet(~run, 'alice'),
     SameInputSet(~run, 'bob'),
+    PolicyLoaded(~run, 'group', 'default_policy'),
     Eligible(~run, 'online'),
     Eligible(~run, 'withheld'),
     QuorumMet(~run, 'online'),
@@ -44,6 +49,7 @@ rule Init_Quorum_Override:
     Compare(~run, 'withheld', 'online'),
     View(~run, 'alice', 'online', 'withheld'),
     View(~run, 'bob', 'withheld', 'online'),
+    !PolicyLoadedState(~run),
     !EligibleState(~run, 'online'),
     !EligibleState(~run, 'withheld'),
     !QuorumState(~run, 'online'),
@@ -64,6 +70,7 @@ rule Init_Raw_Depth_Lead:
     Scenario(~run, 'raw_depth_lead'),
     SameInputSet(~run, 'alice'),
     SameInputSet(~run, 'bob'),
+    PolicyLoaded(~run, 'group', 'default_policy'),
     Eligible(~run, 'online'),
     Eligible(~run, 'withheld'),
     QuorumMet(~run, 'online'),
@@ -77,6 +84,7 @@ rule Init_Raw_Depth_Lead:
     Compare(~run, 'withheld', 'online'),
     View(~run, 'alice', 'online', 'withheld'),
     View(~run, 'bob', 'withheld', 'online'),
+    !PolicyLoadedState(~run),
     !EligibleState(~run, 'online'),
     !EligibleState(~run, 'withheld'),
     !QuorumState(~run, 'online'),
@@ -98,6 +106,7 @@ rule Init_Witness_Score_Tie:
     Scenario(~run, 'witness_score_tie'),
     SameInputSet(~run, 'alice'),
     SameInputSet(~run, 'bob'),
+    PolicyLoaded(~run, 'group', 'default_policy'),
     Eligible(~run, 'used'),
     Eligible(~run, 'quiet'),
     Score(~run, 'used', 'd2', 'd2', 'qno', 'w3', 'gff'),
@@ -109,6 +118,7 @@ rule Init_Witness_Score_Tie:
     Compare(~run, 'quiet', 'used'),
     View(~run, 'alice', 'used', 'quiet'),
     View(~run, 'bob', 'quiet', 'used'),
+    !PolicyLoadedState(~run),
     !EligibleState(~run, 'used'),
     !EligibleState(~run, 'quiet'),
     !ScoreState(~run, 'used', 'd2', 'd2', 'qno', 'w3', 'gff'),
@@ -128,6 +138,7 @@ rule Init_Digest_Tie:
     Scenario(~run, 'digest_tie'),
     SameInputSet(~run, 'alice'),
     SameInputSet(~run, 'bob'),
+    PolicyLoaded(~run, 'group', 'default_policy'),
     Eligible(~run, 'lower_digest'),
     Eligible(~run, 'higher_digest'),
     Score(~run, 'lower_digest', 'd2', 'd2', 'qno', 'w1', 'g00'),
@@ -139,6 +150,7 @@ rule Init_Digest_Tie:
     Compare(~run, 'higher_digest', 'lower_digest'),
     View(~run, 'alice', 'lower_digest', 'higher_digest'),
     View(~run, 'bob', 'higher_digest', 'lower_digest'),
+    !PolicyLoadedState(~run),
     !EligibleState(~run, 'lower_digest'),
     !EligibleState(~run, 'higher_digest'),
     !ScoreState(~run, 'lower_digest', 'd2', 'd2', 'qno', 'w1', 'g00'),
@@ -160,6 +172,7 @@ rule Init_Stale_Rewind:
     Scenario(~run, 'stale_rewind'),
     SameInputSet(~run, 'alice'),
     SameInputSet(~run, 'bob'),
+    PolicyLoaded(~run, 'group', 'default_policy'),
     Eligible(~run, 'online'),
     RetainedAnchor(~run, 'e5'),
     BranchForkEpoch(~run, 'late', 'e0'),
@@ -175,6 +188,7 @@ rule Init_Stale_Rewind:
     Compare(~run, 'late', 'online'),
     View(~run, 'alice', 'online', 'late'),
     View(~run, 'bob', 'late', 'online'),
+    !PolicyLoadedState(~run),
     !EligibleState(~run, 'online'),
     !RetainedAnchorState(~run, 'e5'),
     !BranchForkEpochState(~run, 'late', 'e0'),
@@ -199,6 +213,7 @@ rule Init_Duplicate_Witness_Dedupe:
     Scenario(~run, 'duplicate_witness_dedupe'),
     SameInputSet(~run, 'alice'),
     SameInputSet(~run, 'bob'),
+    PolicyLoaded(~run, 'group', 'default_policy'),
     Eligible(~run, 'used'),
     Eligible(~run, 'quiet'),
     AppWitness(~run, 'used', 'e2', 'alice', 'app_a1'),
@@ -218,6 +233,7 @@ rule Init_Duplicate_Witness_Dedupe:
     Compare(~run, 'quiet', 'used'),
     View(~run, 'alice', 'used', 'quiet'),
     View(~run, 'bob', 'quiet', 'used'),
+    !PolicyLoadedState(~run),
     !EligibleState(~run, 'used'),
     !EligibleState(~run, 'quiet'),
     !WitnessScoreState(~run, 'used', 'w2'),
@@ -275,6 +291,7 @@ rule Init_Three_Branch_Permutation:
     SameInputSet(~run, 'alice'),
     SameInputSet(~run, 'bob'),
     SameInputSet(~run, 'carol'),
+    PolicyLoaded(~run, 'group', 'default_policy'),
     Eligible(~run, 'best'),
     Eligible(~run, 'mid'),
     Eligible(~run, 'low'),
@@ -290,6 +307,7 @@ rule Init_Three_Branch_Permutation:
     ThreeView(~run, 'alice', 'best', 'mid', 'low'),
     ThreeView(~run, 'bob', 'low', 'mid', 'best'),
     ThreeView(~run, 'carol', 'mid', 'best', 'low'),
+    !PolicyLoadedState(~run),
     !EligibleState(~run, 'best'),
     !EligibleState(~run, 'mid'),
     !EligibleState(~run, 'low'),
@@ -314,6 +332,7 @@ rule Init_Withheld_Published_After_Anchor:
     Scenario(~run, 'withheld_published_after_anchor'),
     SameInputSet(~run, 'alice'),
     SameInputSet(~run, 'bob'),
+    PolicyLoaded(~run, 'group', 'default_policy'),
     Eligible(~run, 'online'),
     CommitCreatedOffline(~run, 'mallory', 'late', 'local_t0'),
     OnlineBranchObserved(~run, 'online', 'network_t1'),
@@ -334,6 +353,7 @@ rule Init_Withheld_Published_After_Anchor:
     Compare(~run, 'late', 'online'),
     View(~run, 'alice', 'online', 'late'),
     View(~run, 'bob', 'late', 'online'),
+    !PolicyLoadedState(~run),
     !EligibleState(~run, 'online'),
     !WithheldPublishedAfterAnchorState(~run, 'late', 'e5'),
     !RetainedAnchorState(~run, 'e5'),
@@ -361,6 +381,7 @@ rule Init_Generated_Family_QuorumOverride:
     GeneratedExpectedSelection(~run, 'online', 'quorum_tie'),
     SameInputSet(~run, 'alice'),
     SameInputSet(~run, 'bob'),
+    PolicyLoaded(~run, 'group', 'generated_policy'),
     Eligible(~run, 'online'),
     Eligible(~run, 'withheld'),
     QuorumMet(~run, 'online'),
@@ -374,6 +395,7 @@ rule Init_Generated_Family_QuorumOverride:
     Compare(~run, 'withheld', 'online'),
     View(~run, 'alice', 'online', 'withheld'),
     View(~run, 'bob', 'withheld', 'online'),
+    !PolicyLoadedState(~run),
     !EligibleState(~run, 'online'),
     !EligibleState(~run, 'withheld'),
     !BoostAllowedState(~run, 'online'),
@@ -390,6 +412,7 @@ rule Init_Generated_Family_QuorumCappedByDepth:
     GeneratedExpectedSelection(~run, 'withheld', 'effective_depth'),
     SameInputSet(~run, 'alice'),
     SameInputSet(~run, 'bob'),
+    PolicyLoaded(~run, 'group', 'generated_policy'),
     Eligible(~run, 'online'),
     Eligible(~run, 'withheld'),
     Score(~run, 'online', 'd3', 'd5', 'qyes', 'w6', 'gff'),
@@ -401,6 +424,7 @@ rule Init_Generated_Family_QuorumCappedByDepth:
     Compare(~run, 'online', 'withheld'),
     View(~run, 'alice', 'withheld', 'online'),
     View(~run, 'bob', 'online', 'withheld'),
+    !PolicyLoadedState(~run),
     !EligibleState(~run, 'online'),
     !EligibleState(~run, 'withheld'),
     !ScoreState(~run, 'online', 'd3', 'd5', 'qyes', 'w6', 'gff'),
@@ -416,6 +440,7 @@ rule Init_Generated_Family_DepthPriority:
     GeneratedExpectedSelection(~run, 'deep', 'effective_depth'),
     SameInputSet(~run, 'alice'),
     SameInputSet(~run, 'bob'),
+    PolicyLoaded(~run, 'group', 'generated_policy'),
     Eligible(~run, 'deep'),
     Eligible(~run, 'chatty'),
     Score(~run, 'deep', 'd4', 'd4', 'qno', 'w0', 'gff'),
@@ -427,6 +452,7 @@ rule Init_Generated_Family_DepthPriority:
     Compare(~run, 'chatty', 'deep'),
     View(~run, 'alice', 'deep', 'chatty'),
     View(~run, 'bob', 'chatty', 'deep'),
+    !PolicyLoadedState(~run),
     !EligibleState(~run, 'deep'),
     !EligibleState(~run, 'chatty'),
     !ScoreState(~run, 'deep', 'd4', 'd4', 'qno', 'w0', 'gff'),
@@ -442,6 +468,7 @@ rule Init_Generated_Family_WitnessPriority:
     GeneratedExpectedSelection(~run, 'chatty', 'witness_score_tie'),
     SameInputSet(~run, 'alice'),
     SameInputSet(~run, 'bob'),
+    PolicyLoaded(~run, 'group', 'generated_policy'),
     Eligible(~run, 'chatty'),
     Eligible(~run, 'quiet'),
     Score(~run, 'chatty', 'd2', 'd2', 'qno', 'w3', 'gff'),
@@ -453,6 +480,7 @@ rule Init_Generated_Family_WitnessPriority:
     Compare(~run, 'quiet', 'chatty'),
     View(~run, 'alice', 'chatty', 'quiet'),
     View(~run, 'bob', 'quiet', 'chatty'),
+    !PolicyLoadedState(~run),
     !EligibleState(~run, 'chatty'),
     !EligibleState(~run, 'quiet'),
     !ScoreState(~run, 'chatty', 'd2', 'd2', 'qno', 'w3', 'gff'),
@@ -468,6 +496,7 @@ rule Init_Generated_Family_DigestPriority:
     GeneratedExpectedSelection(~run, 'low_digest', 'digest_tie'),
     SameInputSet(~run, 'alice'),
     SameInputSet(~run, 'bob'),
+    PolicyLoaded(~run, 'group', 'generated_policy'),
     Eligible(~run, 'low_digest'),
     Eligible(~run, 'high_digest'),
     Score(~run, 'low_digest', 'd2', 'd2', 'qno', 'w1', 'g00'),
@@ -479,11 +508,123 @@ rule Init_Generated_Family_DigestPriority:
     Compare(~run, 'high_digest', 'low_digest'),
     View(~run, 'alice', 'low_digest', 'high_digest'),
     View(~run, 'bob', 'high_digest', 'low_digest'),
+    !PolicyLoadedState(~run),
     !EligibleState(~run, 'low_digest'),
     !EligibleState(~run, 'high_digest'),
     !ScoreState(~run, 'low_digest', 'd2', 'd2', 'qno', 'w1', 'g00'),
     !ScoreState(~run, 'high_digest', 'd2', 'd2', 'qno', 'w1', 'gff'),
     !DigestLtState(~run, 'g00', 'gff')
+  ]
+
+/*
+  Scenario 12:
+
+  After restart, the engine loads the persisted group policy before computing
+  the retained anchor. A late branch whose source epoch is still at or after
+  the retained anchor can be replayed from that anchor and selected normally.
+*/
+rule Init_Retained_Anchor_Within_Horizon:
+  [ Fr(~run) ]
+--[
+    Scenario(~run, 'retained_anchor_within_horizon'),
+    RestartedEngine(~run, 'group'),
+    PersistedPolicy(~run, 'group', 'one_rewind_policy'),
+    PolicyLoaded(~run, 'group', 'one_rewind_policy'),
+    CurrentTip(~run, 'group', 'e2'),
+    MaxRewindFromPolicy(~run, 'one_rewind_policy', 'd1'),
+    ComputedRetainedAnchor(~run, 'group', 'e1'),
+    RetainedAnchor(~run, 'e1'),
+    RetainedAnchorAvailable(~run, 'group', 'e1'),
+    BranchSourceEpoch(~run, 'late', 'e1'),
+    BranchAtOrAfterAnchor(~run, 'late', 'e1'),
+    SameInputSet(~run, 'alice'),
+    SameInputSet(~run, 'bob'),
+    Eligible(~run, 'online'),
+    Eligible(~run, 'late'),
+    Score(~run, 'online', 'd2', 'd2', 'qno', 'w1', 'gff'),
+    Score(~run, 'late', 'd2', 'd2', 'qno', 'w1', 'g00'),
+    DigestLower(~run, 'g00', 'gff')
+  ]->
+  [
+    Compare(~run, 'late', 'online'),
+    Compare(~run, 'online', 'late'),
+    View(~run, 'alice', 'online', 'late'),
+    View(~run, 'bob', 'late', 'online'),
+    !PolicyLoadedState(~run),
+    !PersistedPolicyState(~run, 'group', 'one_rewind_policy'),
+    !MaxRewindFromPolicyState(~run, 'one_rewind_policy', 'd1'),
+    !ComputedRetainedAnchorState(~run, 'group', 'e1'),
+    !RetainedAnchorState(~run, 'e1'),
+    !RetainedAnchorAvailableState(~run, 'group', 'e1'),
+    !BranchAtOrAfterAnchorState(~run, 'late', 'e1'),
+    !EligibleState(~run, 'online'),
+    !EligibleState(~run, 'late'),
+    !ScoreState(~run, 'online', 'd2', 'd2', 'qno', 'w1', 'gff'),
+    !ScoreState(~run, 'late', 'd2', 'd2', 'qno', 'w1', 'g00'),
+    !DigestLtState(~run, 'g00', 'gff')
+  ]
+
+/*
+  Scenario 13:
+
+  A late commit is still within the policy horizon, but the retained snapshot
+  needed to replay it is missing. The engine reports MissingRetainedAnchor and
+  leaves OpenMLS group state untouched.
+*/
+rule Init_Missing_Retained_Anchor:
+  [ Fr(~run) ]
+--[
+    Scenario(~run, 'missing_retained_anchor'),
+    PersistedPolicy(~run, 'group', 'one_rewind_policy'),
+    PolicyLoaded(~run, 'group', 'one_rewind_policy'),
+    MaxRewindFromPolicy(~run, 'one_rewind_policy', 'd1'),
+    ComputedRetainedAnchor(~run, 'group', 'e1'),
+    RetainedAnchor(~run, 'e1'),
+    RetainedAnchorMissing(~run, 'group', 'e1'),
+    BranchSourceEpoch(~run, 'late', 'e1'),
+    BranchAtOrAfterAnchor(~run, 'late', 'e1'),
+    CandidateNeedsRetainedAnchor(~run, 'group', 'late', 'e1')
+  ]->
+  [
+    MissingAnchorInput(~run, 'group', 'late', 'e1'),
+    !PolicyLoadedState(~run),
+    !PersistedPolicyState(~run, 'group', 'one_rewind_policy'),
+    !MaxRewindFromPolicyState(~run, 'one_rewind_policy', 'd1'),
+    !ComputedRetainedAnchorState(~run, 'group', 'e1'),
+    !RetainedAnchorState(~run, 'e1'),
+    !RetainedAnchorMissingState(~run, 'group', 'e1'),
+    !BranchAtOrAfterAnchorState(~run, 'late', 'e1'),
+    !CandidateNeedsRetainedAnchorState(~run, 'group', 'late', 'e1')
+  ]
+
+/*
+  Scenario 14:
+
+  A commit whose source epoch is older than the retained anchor is not a replay
+  candidate. The engine persists it as invalidated with BeyondAnchor instead of
+  trying to roll OpenMLS state back before the retained horizon.
+*/
+rule Init_Beyond_Anchor_Invalidation:
+  [ Fr(~run) ]
+--[
+    Scenario(~run, 'beyond_anchor_invalidated'),
+    PersistedPolicy(~run, 'group', 'one_rewind_policy'),
+    PolicyLoaded(~run, 'group', 'one_rewind_policy'),
+    CurrentTip(~run, 'group', 'e3'),
+    MaxRewindFromPolicy(~run, 'one_rewind_policy', 'd1'),
+    ComputedRetainedAnchor(~run, 'group', 'e2'),
+    RetainedAnchor(~run, 'e2'),
+    BranchSourceEpoch(~run, 'stale', 'e1'),
+    SourceEpochBeforeAnchor(~run, 'stale', 'e1', 'e2')
+  ]->
+  [
+    BeyondAnchorInput(~run, 'group', 'stale', 'e2'),
+    !PolicyLoadedState(~run),
+    !PersistedPolicyState(~run, 'group', 'one_rewind_policy'),
+    !MaxRewindFromPolicyState(~run, 'one_rewind_policy', 'd1'),
+    !ComputedRetainedAnchorState(~run, 'group', 'e2'),
+    !RetainedAnchorState(~run, 'e2'),
+    !SourceEpochBeforeAnchorState(~run, 'stale', 'e1', 'e2')
   ]
 
 rule Derive_Stale_Beyond_Rewind:
@@ -617,11 +758,52 @@ rule Publish_Outbound_When_Stable:
   ]->
   []
 
+rule Replay_From_Retained_Anchor:
+  [
+    !PolicyLoadedState(run),
+    !RetainedAnchorState(run, anchor),
+    !RetainedAnchorAvailableState(run, group, anchor),
+    !BranchAtOrAfterAnchorState(run, branch, anchor)
+  ]
+--[
+    ReplayedFromRetainedAnchor(run, group, branch, anchor)
+  ]->
+  [
+    !ReplayableFromRetainedAnchorState(run, group, branch, anchor)
+  ]
+
+rule Report_Missing_Retained_Anchor:
+  [
+    MissingAnchorInput(run, group, branch, anchor),
+    !PolicyLoadedState(run),
+    !RetainedAnchorMissingState(run, group, anchor),
+    !CandidateNeedsRetainedAnchorState(run, group, branch, anchor)
+  ]
+--[
+    MissingRetainedAnchor(run, group, branch, anchor),
+    NoMutation(run, group, 'missing_retained_anchor')
+  ]->
+  []
+
+rule Invalidate_Commit_Beyond_Anchor:
+  [
+    BeyondAnchorInput(run, group, branch, anchor),
+    !PolicyLoadedState(run),
+    !RetainedAnchorState(run, anchor),
+    !SourceEpochBeforeAnchorState(run, branch, source_epoch, anchor)
+  ]
+--[
+    InvalidatedBeyondAnchor(run, group, branch, anchor),
+    NotApplied(run, group, branch, 'beyond_anchor')
+  ]->
+  []
+
 rule Select_Three_First:
   [
     ThreeView(run, client, winner, second, third),
     !BetterState(run, winner, second, reason_second),
     !BetterState(run, winner, third, reason_third),
+    !PolicyLoadedState(run),
     !EligibleState(run, winner)
   ]
 --[
@@ -637,6 +819,7 @@ rule Select_Three_Second:
     ThreeView(run, client, first, winner, third),
     !BetterState(run, winner, first, reason_first),
     !BetterState(run, winner, third, reason_third),
+    !PolicyLoadedState(run),
     !EligibleState(run, winner)
   ]
 --[
@@ -652,6 +835,7 @@ rule Select_Three_Third:
     ThreeView(run, client, first, second, winner),
     !BetterState(run, winner, first, reason_first),
     !BetterState(run, winner, second, reason_second),
+    !PolicyLoadedState(run),
     !EligibleState(run, winner)
   ]
 --[
@@ -665,6 +849,7 @@ rule Select_Three_Third:
 rule Select_Left_When_Right_Ineligible:
   [
     View(run, client, left, right),
+    !PolicyLoadedState(run),
     !EligibleState(run, left),
     !StaleState(run, right)
   ]
@@ -678,6 +863,7 @@ rule Select_Left_When_Right_Ineligible:
 rule Select_Right_When_Left_Ineligible:
   [
     View(run, client, left, right),
+    !PolicyLoadedState(run),
     !EligibleState(run, right),
     !StaleState(run, left)
   ]
@@ -692,6 +878,7 @@ rule Select_Left:
   [
     View(run, client, left, right),
     !BetterState(run, left, right, reason),
+    !PolicyLoadedState(run),
     !EligibleState(run, left)
   ]
 --[
@@ -705,6 +892,7 @@ rule Select_Right:
   [
     View(run, client, left, right),
     !BetterState(run, right, left, reason),
+    !PolicyLoadedState(run),
     !EligibleState(run, right)
   ]
 --[
@@ -713,6 +901,16 @@ rule Select_Right:
   [
     Done(run, client, right)
   ]
+
+rule Apply_Selected_Canonical_Branch:
+  [
+    Done(run, client, branch),
+    !PolicyLoadedState(run)
+  ]
+--[
+    AppliedCanonicalBranch(run, client, branch)
+  ]->
+  []
 
 lemma same_input_set_converges:
   "All run client_a client_b branch_a branch_b reason_a reason_b #i #j.
@@ -724,6 +922,23 @@ lemma selected_branches_are_eligible:
   "All run client branch reason #i.
       Selected(run, client, branch, reason) @ #i
     ==> (Ex #j. Eligible(run, branch) @ #j)"
+
+lemma selected_branches_require_loaded_policy:
+  "All run client branch reason #i.
+      Selected(run, client, branch, reason) @ #i
+    ==> (
+      Ex group policy #j.
+          PolicyLoaded(run, group, policy) @ #j
+    )"
+
+lemma applied_branch_requires_prior_selection:
+  "All run client branch #i.
+      AppliedCanonicalBranch(run, client, branch) @ #i
+    ==> (
+      Ex reason #j.
+          Selected(run, client, branch, reason) @ #j
+        & #j < #i
+    )"
 
 lemma effective_depth_selection_requires_score_order:
   "All run client branch #i.
@@ -765,6 +980,64 @@ lemma digest_tie_selection_requires_lower_digest:
         & Score(run, loser, raw, effective, quorum, witness, digest_l) @ #k
         & DigestLower(run, digest_b, digest_l) @ #m
 	    )"
+
+lemma computed_anchor_requires_loaded_policy_rewind:
+  "All run group anchor #i.
+      ComputedRetainedAnchor(run, group, anchor) @ #i
+    ==> (
+      Ex policy rewind #j #k.
+          PolicyLoaded(run, group, policy) @ #j
+        & MaxRewindFromPolicy(run, policy, rewind) @ #k
+    )"
+
+lemma retained_anchor_replay_requires_available_anchor_and_policy:
+  "All run group branch anchor #i.
+      ReplayedFromRetainedAnchor(run, group, branch, anchor) @ #i
+    ==> (
+      Ex policy #j #k #m #n.
+          PolicyLoaded(run, group, policy) @ #j
+        & RetainedAnchor(run, anchor) @ #k
+        & RetainedAnchorAvailable(run, group, anchor) @ #m
+        & BranchAtOrAfterAnchor(run, branch, anchor) @ #n
+    )"
+
+lemma missing_retained_anchor_requires_missing_snapshot_and_policy:
+  "All run group branch anchor #i.
+      MissingRetainedAnchor(run, group, branch, anchor) @ #i
+    ==> (
+      Ex policy #j #k #m.
+          PolicyLoaded(run, group, policy) @ #j
+        & RetainedAnchorMissing(run, group, anchor) @ #k
+        & CandidateNeedsRetainedAnchor(run, group, branch, anchor) @ #m
+    )"
+
+lemma missing_retained_anchor_does_not_apply:
+  "All run group branch anchor client applied_branch #i #j.
+      MissingRetainedAnchor(run, group, branch, anchor) @ #i
+    & AppliedCanonicalBranch(run, client, applied_branch) @ #j
+    ==> F"
+
+lemma beyond_anchor_invalidation_requires_source_before_anchor:
+  "All run group branch anchor #i.
+      InvalidatedBeyondAnchor(run, group, branch, anchor) @ #i
+    ==> (
+      Ex policy source_epoch #j #k #m.
+          PolicyLoaded(run, group, policy) @ #j
+        & RetainedAnchor(run, anchor) @ #k
+        & SourceEpochBeforeAnchor(run, branch, source_epoch, anchor) @ #m
+    )"
+
+lemma beyond_anchor_invalidated_commits_are_never_selected:
+  "All run group branch anchor client reason #i #j.
+      InvalidatedBeyondAnchor(run, group, branch, anchor) @ #i
+    & Selected(run, client, branch, reason) @ #j
+    ==> F"
+
+lemma beyond_anchor_invalidated_commits_are_never_applied:
+  "All run group branch anchor client #i #j.
+      InvalidatedBeyondAnchor(run, group, branch, anchor) @ #i
+    & AppliedCanonicalBranch(run, client, branch) @ #j
+    ==> F"
 
 lemma stale_rewind_is_derived_from_anchor_and_distance:
   "All run branch #i.
@@ -929,6 +1202,28 @@ lemma withheld_published_after_anchor_executable:
       Scenario(run, 'withheld_published_after_anchor') @ #i
     & LateWithheldRejected(run, 'late', 'e5') @ #j
     & Selected(run, 'alice', 'online', 'opponent_ineligible') @ #k"
+
+lemma retained_anchor_within_horizon_executable:
+  exists-trace
+  "Ex run #i #j #k #l.
+      Scenario(run, 'retained_anchor_within_horizon') @ #i
+    & ReplayedFromRetainedAnchor(run, 'group', 'late', 'e1') @ #j
+    & Selected(run, 'alice', 'late', 'digest_tie') @ #k
+    & AppliedCanonicalBranch(run, 'alice', 'late') @ #l"
+
+lemma missing_retained_anchor_executable:
+  exists-trace
+  "Ex run #i #j #k.
+      Scenario(run, 'missing_retained_anchor') @ #i
+    & MissingRetainedAnchor(run, 'group', 'late', 'e1') @ #j
+    & NoMutation(run, 'group', 'missing_retained_anchor') @ #k"
+
+lemma beyond_anchor_invalidated_executable:
+  exists-trace
+  "Ex run #i #j #k.
+      Scenario(run, 'beyond_anchor_invalidated') @ #i
+    & InvalidatedBeyondAnchor(run, 'group', 'stale', 'e2') @ #j
+    & NotApplied(run, 'group', 'stale', 'beyond_anchor') @ #k"
 
 lemma generated_quorum_override_executable:
   exists-trace

@@ -288,12 +288,23 @@ Initial lemmas:
    anchor is rejected when its rewind distance exceeds policy.
 8. **Bounded policy seeds:** generated-family seed cases select the expected
    winner and reason.
+9. **Loaded policy boundary:** selected and applied branches require a loaded
+   convergence policy, and retained anchors are computed from that policy's
+   rewind value.
+10. **Retained-anchor replay:** a branch at or after an available retained
+    anchor can be replayed and applied from that anchor.
+11. **Anchor failure dispositions:** missing retained anchors report
+    `MissingRetainedAnchor` without applying, while commits older than the
+    retained anchor are invalidated with `BeyondAnchor` and are never selected
+    or applied.
 
 The v0 model currently verifies deterministic selection, eligible-only
 selection, score-order justifications, stale-rewind rejection derived from
 anchor/distance facts, sender/epoch witness dedupe, queued outbound gating,
-three-branch permutations, late withheld publication after anchor, generated
-bounded seed cases, and executable traces for each modeled scenario.
+three-branch permutations, late withheld publication after anchor, loaded-policy
+requirements, retained-anchor replay, missing-anchor no-mutation, `BeyondAnchor`
+invalidation, generated bounded seed cases, and executable traces for each
+modeled scenario.
 The bounded seed source is
 [`formal/tamarin/policy_cases.json`](../../formal/tamarin/policy_cases.json);
 `cgka-policy-casegen` emits matching Tamarin seed rules from the same file that

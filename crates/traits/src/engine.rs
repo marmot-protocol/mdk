@@ -245,6 +245,8 @@ pub trait CgkaEngine: Send + Sync {
 
     /// Advance convergence for a group and release any queued outbound work
     /// that is now safe to regenerate from the selected canonical state.
+    /// Accepted inbound application messages from the canonical branch are
+    /// appended to [`Self::drain_events`] as [`GroupEvent::MessageReceived`].
     ///
     /// Applications should call this after relay sync batches, reconnect
     /// catch-up, or a convergence timer tick. The engine uses its local

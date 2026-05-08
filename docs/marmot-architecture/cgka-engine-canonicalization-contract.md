@@ -330,6 +330,9 @@ Rules:
 
 - An app message that decrypts against the selected branch and is within the
   MLS past-epoch decryption limit is accepted.
+- Accepted app messages MUST become application-visible
+  `GroupEvent::MessageReceived` outputs after the selected canonical commit
+  path has been applied.
 - An app message that decrypts against multiple candidate states is accepted
   only if one matching state is on the selected branch. If no matching state is
   selected, it is invalidated.

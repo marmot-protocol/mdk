@@ -5,10 +5,11 @@ convergence.
 
 The v0 model is intentionally abstract. It does not model MLS internals,
 transport timestamps, relay receipts, Nostr event ids, or OpenMLS serialization.
-It models only the selector boundary:
+It models only the convergence boundary:
 
 - two honest clients see the same valid candidate set,
 - those clients may enumerate the candidate pair in different orders,
+- the engine loads a convergence policy before selecting or applying a branch,
 - a deterministic policy chooses one branch,
 - a branch outside policy evidence cannot be selected,
 - witness quorum can only act through a bounded override rule.
@@ -16,6 +17,13 @@ It models only the selector boundary:
   selector.
 - branches beyond the rewind horizon are ineligible even when they have higher
   raw depth.
+- the retained anchor is computed from the loaded policy's rewind value.
+- a branch at or after an available retained anchor can be replayed from that
+  anchor.
+- a missing retained anchor reports `MissingRetainedAnchor` and does not apply
+  any canonical branch.
+- a commit older than the retained anchor is invalidated with `BeyondAnchor`
+  and is never selected or applied.
 - duplicate app witnesses from the same sender in the same epoch do not inflate
   witness score.
 - stale rewind status is derived from retained anchor, branch fork epoch,
@@ -77,8 +85,19 @@ and OpenMLS. The useful first slice is:
 same valid input set + same negotiated policy => same selected branch
 ```
 
-That keeps the formal model aligned with the Rust conformance model in
-`crates/cgka-engine/src/convergence.rs`.
+That keeps the selector part of the formal model aligned with the Rust
+conformance model in `crates/cgka-engine/src/convergence.rs`.
+
+The current engine-lifecycle proof slice is:
+
+```text
+loaded group policy + retained anchor state => replay, invalidation, or
+no-mutation error follows the same boundary as engine ingest
+```
+
+That keeps the lifecycle part aligned with
+`crates/cgka-engine/src/distributed_convergence.rs` and
+`crates/cgka-engine/src/openmls_projection.rs`.
 
 The v0 model now uses bounded symbolic score classes instead of an opaque
 `ScoreCase` fact:
@@ -116,6 +135,7 @@ until the model includes it.
 | `Derive_*` rule | One policy step, such as score comparison or stale derivation. | Unit tests for the selector/comparator and its selected reason. |
 | all-traces lemma | An invariant that must hold in every modeled trace. | Property tests, invariant assertions, or both. |
 | `*_requires_*` lemma | A selected outcome must have matching evidence. | Debug assertions or tests that inspect selection reasons and evidence. |
+| lifecycle lemma | A canonicalization handoff, such as policy load, retained replay, missing anchor, or `BeyondAnchor`, has the required evidence and mutation boundary. | Engine integration tests in `crates/cgka-engine/tests/distributed_convergence.rs` and OpenMLS replay tests in `crates/cgka-conformance/tests/openmls_replay_probe.rs`. |
 | model assumption | A fact the model accepts as already validated. | Tests or review at the layer that owns the assumption. |
 
 Keep names aligned across the proof and tests. If the Tamarin scenario is
@@ -137,9 +157,10 @@ targets. For example, `same_input_set_converges` maps to generated branch sets
 fed through the real selector from different client enumeration orders.
 
 Use Tamarin for behavior where local reasoning is weak: cross-client
-convergence, adversarial scheduling, branch eligibility, commit ordering, and
-state handoff between subsystems. Prefer Rust tests for storage behavior, wire
-parsing, serialization, and pure input-to-output functions.
+convergence, adversarial scheduling, branch eligibility, commit ordering,
+retained-anchor lifecycle, and state handoff between subsystems. Prefer Rust
+tests for storage behavior, wire parsing, serialization, and pure
+input-to-output functions.
 
 The model has done its job for this subsystem when the lemmas answer the
 convergence questions under the stated assumptions. If someone asks what happens
@@ -154,3 +175,5 @@ Next refinements:
    property-test cases from one policy-case source.
 4. Add handoff scenarios for welcome processing and commit application during
    convergence selection.
+5. Add generated lifecycle cases once retained-anchor policy families move
+   beyond the current one-rewind hand-written scenarios.

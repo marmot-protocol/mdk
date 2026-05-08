@@ -7,8 +7,9 @@ use crate::canonicalization::{
 };
 use crate::engine::Engine;
 use crate::openmls_projection::{
-    OpenMlsContentKind, OpenMlsProjectionError, apply_openmls_canonicalization_result,
-    canonicalize_stored_openmls_messages, project_mls_message,
+    OpenMlsContentKind, OpenMlsProjectionError, OpenMlsReplayObservation,
+    apply_openmls_canonicalization_result, canonicalize_stored_openmls_messages,
+    project_mls_message,
 };
 use cgka_traits::engine::GroupEvent;
 use cgka_traits::message::{MessageRecord, MessageState};
@@ -135,7 +136,7 @@ impl<S: StorageProvider> Engine<S> {
             return Ok(result);
         }
 
-        apply_openmls_canonicalization_result(
+        let observations = apply_openmls_canonicalization_result(
             &self.storage,
             group_id,
             &result,
@@ -153,6 +154,7 @@ impl<S: StorageProvider> Engine<S> {
                 selected_tip,
             )?;
         }
+        self.emit_application_replay_events(group_id, &observations);
 
         self.remember_canonicalization_result_messages(&result);
         Ok(result)
@@ -203,6 +205,26 @@ impl<S: StorageProvider> Engine<S> {
         }
 
         Ok(())
+    }
+
+    fn emit_application_replay_events(
+        &mut self,
+        group_id: &GroupId,
+        observations: &[OpenMlsReplayObservation],
+    ) {
+        for observation in observations {
+            let OpenMlsReplayObservation::ApplicationProcessed {
+                sender, payload, ..
+            } = observation
+            else {
+                continue;
+            };
+            self.events_buf.push_back(GroupEvent::MessageReceived {
+                group_id: group_id.clone(),
+                sender: MemberId::new(sender.clone()),
+                payload: payload.clone(),
+            });
+        }
     }
 
     fn remember_canonicalization_result_messages(&mut self, result: &CanonicalizationResult) {

@@ -154,6 +154,7 @@ pub enum OpenMlsReplayObservation {
         message_id: String,
         source_epoch: u64,
         sender: Vec<u8>,
+        payload: Vec<u8>,
         decrypted_payload_ref: String,
     },
     Ignored {
@@ -1063,6 +1064,7 @@ fn app_messages_by_id(
                 source_epoch,
                 sender,
                 decrypted_payload_ref,
+                ..
             } = observation
             else {
                 continue;
@@ -1217,6 +1219,7 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                     message_id,
                     source_epoch,
                     sender,
+                    payload: payload.clone(),
                     decrypted_payload_ref: format!(
                         "sha256:{}",
                         hex::encode(message_digest(payload.as_slice()))

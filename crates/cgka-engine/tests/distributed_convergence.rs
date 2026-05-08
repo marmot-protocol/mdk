@@ -2,14 +2,15 @@
 
 use async_trait::async_trait;
 use cgka_engine::canonicalization::{
-    CanonicalizationError, CanonicalizationPolicy, DroppedMessageReason, MessageKind, SyncState,
+    CanonicalizationError, CanonicalizationPolicy, DroppedMessageReason,
+    InvalidatedAppMessageReason, MessageKind, SyncState,
 };
 use cgka_engine::convergence::ConvergencePolicy;
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::openmls_projection::project_mls_message;
 use cgka_engine::{Engine, EngineBuilder};
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
-use cgka_traits::engine::{CgkaEngine, CreateGroupRequest, SendIntent, SendResult};
+use cgka_traits::engine::{CgkaEngine, CreateGroupRequest, GroupEvent, SendIntent, SendResult};
 use cgka_traits::error::PeelerError;
 use cgka_traits::group_context::GroupContextSnapshot;
 use cgka_traits::ingest::{PeeledContent, PeeledMessage};
@@ -432,7 +433,14 @@ async fn engine_materializes_multi_commit_path_from_stored_commits() {
         })
         .await
         .unwrap();
-    let (commit_eve, _pending_eve) = evolution(invite_eve);
+    let (commit_eve, pending_eve) = evolution(invite_eve);
+    alice.confirm_published(pending_eve).await.unwrap();
+    let app_msg = send_app(
+        &mut alice,
+        &group_id,
+        b"multi commit canonical payload".to_vec(),
+    )
+    .await;
 
     let commit_eve = route(commit_eve, &group_id);
     let commit_david = route(commit_david, &group_id);
@@ -442,6 +450,9 @@ async fn engine_materializes_multi_commit_path_from_stored_commits() {
     carol
         .buffer_openmls_convergence_message(&group_id, commit_david.clone(), 1_000)
         .expect("parent commit buffered second");
+    carol
+        .buffer_openmls_convergence_message(&group_id, app_msg.clone(), 1_000)
+        .expect("app message buffered after child and parent");
 
     let result = carol
         .converge_stored_openmls_messages(&group_id, 1_000_000)
@@ -456,11 +467,27 @@ async fn engine_materializes_multi_commit_path_from_stored_commits() {
             hex::encode(commit_eve.id.as_slice())
         ]
     );
+    assert_eq!(
+        result.accepted_app_messages,
+        vec![hex::encode(app_msg.id.as_slice())]
+    );
     assert_message_state(&carol_storage, &commit_david, MessageState::Processed);
     assert_message_state(&carol_storage, &commit_eve, MessageState::Processed);
+    assert_message_state(&carol_storage, &app_msg, MessageState::Processed);
     let members = carol.members(&group_id).unwrap();
     assert!(members.iter().any(|member| member.id == david.self_id()));
     assert!(members.iter().any(|member| member.id == eve.self_id()));
+    let events = carol.drain_events();
+    assert!(
+        events.iter().any(|event| {
+            matches!(
+                event,
+                GroupEvent::MessageReceived { group_id: event_group, payload, .. }
+                    if *event_group == group_id && payload == b"multi commit canonical payload"
+            )
+        }),
+        "expected multi-commit canonical app payload event, got {events:?}"
+    );
 }
 
 #[tokio::test]
@@ -1236,6 +1263,213 @@ async fn engine_ingest_buffers_future_epoch_app_message_as_convergence_witness()
         vec![hex::encode(app_msg.id.as_slice())]
     );
     assert_message_state(&carol_storage, &app_msg, MessageState::Processed);
+
+    let events = carol.drain_events();
+    assert!(
+        events.iter().any(|event| {
+            matches!(
+                event,
+                GroupEvent::MessageReceived { group_id: event_group, payload, .. }
+                    if *event_group == group_id && payload == b"future epoch witness"
+            )
+        }),
+        "expected accepted app message event after canonical convergence, got {events:?}"
+    );
+}
+
+#[tokio::test]
+async fn engine_emits_only_canonical_branch_app_messages_after_convergence() {
+    let (mut alice, _alice_storage) = build_client(b"alice");
+    let (mut bob, _bob_storage) = build_client(b"bob");
+    let (mut carol, carol_storage) = build_client(b"carol");
+    let (mut david, _david_storage) = build_client(b"david");
+    let (mut eve, _eve_storage) = build_client(b"eve");
+
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "engine-canonical-app-output".into(),
+            description: "".into(),
+            members: vec![bob_kp, carol_kp],
+            required_features: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(welcome_for(&welcomes, b"bob"))
+        .await
+        .unwrap();
+    carol
+        .join_welcome(welcome_for(&welcomes, b"carol"))
+        .await
+        .unwrap();
+    carol.drain_events();
+
+    let david_kp = david.fresh_key_package().await.unwrap();
+    let eve_kp = eve.fresh_key_package().await.unwrap();
+    let alice_invite = alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![david_kp],
+        })
+        .await
+        .unwrap();
+    let bob_invite = bob
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![eve_kp],
+        })
+        .await
+        .unwrap();
+    let (alice_commit, alice_pending) = evolution(alice_invite);
+    let (bob_commit, bob_pending) = evolution(bob_invite);
+    let commit_messages = vec![
+        route(alice_commit.clone(), &group_id),
+        route(bob_commit.clone(), &group_id),
+    ];
+
+    alice.confirm_published(alice_pending).await.unwrap();
+    bob.confirm_published(bob_pending).await.unwrap();
+    let alice_app = send_app(&mut alice, &group_id, b"alice branch payload".to_vec()).await;
+    let bob_app = send_app(&mut bob, &group_id, b"bob branch payload".to_vec()).await;
+    let app_messages = [alice_app, bob_app];
+
+    let first_digest = project_mls_message(&commit_messages[0].payload)
+        .expect("first commit projects")
+        .message_digest;
+    let second_digest = project_mls_message(&commit_messages[1].payload)
+        .expect("second commit projects")
+        .message_digest;
+    let selected_index = if first_digest < second_digest { 0 } else { 1 };
+    let losing_index = 1 - selected_index;
+
+    for message in commit_messages.iter().chain(app_messages.iter()) {
+        carol
+            .buffer_openmls_convergence_message(&group_id, message.clone(), 1_000)
+            .expect("message buffered");
+    }
+
+    let result = carol
+        .converge_stored_openmls_messages(&group_id, 1_000_000)
+        .expect("stored OpenMLS messages converge");
+
+    assert_eq!(result.sync_state, SyncState::Stable);
+    assert_eq!(
+        result.accepted_app_messages,
+        vec![hex::encode(app_messages[selected_index].id.as_slice())]
+    );
+    assert!(result.invalidated_app_messages.iter().any(|invalidated| {
+        invalidated.message_id == hex::encode(app_messages[losing_index].id.as_slice())
+            && invalidated.reason == InvalidatedAppMessageReason::LosingBranch
+    }));
+    assert_message_state(
+        &carol_storage,
+        &app_messages[selected_index],
+        MessageState::Processed,
+    );
+    assert_message_state(
+        &carol_storage,
+        &app_messages[losing_index],
+        MessageState::EpochInvalidated,
+    );
+
+    let events = carol.drain_events();
+    let received_payloads: Vec<Vec<u8>> = events
+        .iter()
+        .filter_map(|event| match event {
+            GroupEvent::MessageReceived { payload, .. } => Some(payload.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        received_payloads,
+        vec![if selected_index == 0 {
+            b"alice branch payload".to_vec()
+        } else {
+            b"bob branch payload".to_vec()
+        }]
+    );
+}
+
+#[tokio::test]
+async fn rebuilt_engine_emits_canonical_app_message_after_convergence() {
+    let (mut alice, _alice_storage) = build_client(b"alice");
+    let (mut carol, carol_storage) = build_client(b"carol");
+    let (mut david, _david_storage) = build_client(b"david");
+
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "engine-restart-app-output".into(),
+            description: "".into(),
+            members: vec![carol_kp],
+            required_features: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    carol
+        .join_welcome(welcome_for(&welcomes, b"carol"))
+        .await
+        .unwrap();
+
+    let david_kp = david.fresh_key_package().await.unwrap();
+    let invite = alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![david_kp],
+        })
+        .await
+        .unwrap();
+    let (commit, pending) = evolution(invite);
+    alice.confirm_published(pending).await.unwrap();
+    let app_msg = send_app(&mut alice, &group_id, b"restart canonical payload".to_vec()).await;
+
+    carol
+        .ingest(app_msg.clone())
+        .await
+        .expect("future app message is stored");
+    carol
+        .ingest(route(commit, &group_id))
+        .await
+        .expect("commit is stored");
+
+    let mut restarted = EngineBuilder::new(carol_storage.clone())
+        .identity(pad32(b"carol"))
+        .feature_registry(selfremove_registry())
+        .peeler(Box::new(MockPeeler))
+        .build()
+        .unwrap();
+
+    let result = restarted
+        .converge_stored_openmls_messages(&group_id, 2_000)
+        .expect("rebuilt engine converges stored OpenMLS messages");
+
+    assert_eq!(result.sync_state, SyncState::Stable);
+    assert_eq!(restarted.epoch(&group_id).unwrap(), EpochId(2));
+    assert_message_state(&carol_storage, &app_msg, MessageState::Processed);
+    let events = restarted.drain_events();
+    assert!(
+        events.iter().any(|event| {
+            matches!(
+                event,
+                GroupEvent::MessageReceived { group_id: event_group, payload, .. }
+                    if *event_group == group_id && payload == b"restart canonical payload"
+            )
+        }),
+        "expected rebuilt engine to emit canonical app payload, got {events:?}"
+    );
 }
 
 #[tokio::test]
