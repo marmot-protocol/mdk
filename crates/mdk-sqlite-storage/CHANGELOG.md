@@ -35,7 +35,7 @@
 
 ### Fixed
 
-- `delete_group` now scrubs `processed_welcomes` rows for the group via a join through `welcomes` on `wrapper_event_id`, ordered before the existing `welcomes` delete. Previously these rows survived deletion, leaking `wrapper_event_id`, `welcome_event_id`, `processed_at`, `state`, and unsanitized `failure_reason` linkable to the deleted group, and tripping the welcome dedup path on re-processing. Closes [marmot-protocol/marmot-security#68](https://github.com/marmot-protocol/marmot-security/issues/68).
+- `delete_group` now scrubs `processed_welcomes` rows for the group via a join through `welcomes` on `wrapper_event_id`, ordered before the existing `welcomes` delete. Previously these rows survived deletion, leaking `wrapper_event_id`, `welcome_event_id`, `processed_at`, `state`, and unsanitized `failure_reason` linkable to the deleted group, and tripping the welcome dedup path on re-processing. Closes [marmot-protocol/marmot-security#68](https://github.com/marmot-protocol/marmot-security/issues/68). ([#293](https://github.com/marmot-protocol/mdk/pull/293))
 
 ### Removed
 

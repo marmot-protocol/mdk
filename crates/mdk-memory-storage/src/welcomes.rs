@@ -81,6 +81,12 @@ impl WelcomeStorage for MdkMemoryStorage {
         )?;
 
         let mut inner = self.inner.write();
+        // Maintain non-evicting wrapper -> group index so delete_group can
+        // still scrub processed_welcomes for this group after the welcomes
+        // LRU cache evicts the welcome.
+        inner
+            .welcome_group_index
+            .insert(welcome.wrapper_event_id, welcome.mls_group_id.clone());
         inner.welcomes_cache.put(welcome.id, welcome);
 
         Ok(())

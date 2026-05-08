@@ -412,6 +412,11 @@ struct MdkMemoryStorageInner {
     welcomes_cache: LruCache<EventId, Welcome>,
     // Security-critical: must not be evicted — use HashMap instead of LruCache
     processed_welcomes_cache: HashMap<EventId, ProcessedWelcome>,
+    // Non-evicting `wrapper_event_id -> mls_group_id` index. Required because
+    // `welcomes_cache` is LRU-evictable while `processed_welcomes_cache` is
+    // not: without this index, an evicted welcome would strand its
+    // processed_welcomes entry, defeating delete_group cleanup.
+    welcome_group_index: HashMap<EventId, GroupId>,
     messages_cache: LruCache<EventId, Message>,
     messages_by_group_cache: LruCache<GroupId, HashMap<EventId, Message>>,
     // Security-critical: must not be evicted — use HashMap instead of LruCache
@@ -494,6 +499,7 @@ impl MdkMemoryStorage {
             group_relays_cache: LruCache::new(cache_size),
             welcomes_cache: LruCache::new(cache_size),
             processed_welcomes_cache: HashMap::new(),
+            welcome_group_index: HashMap::new(),
             messages_cache: LruCache::new(cache_size),
             messages_by_group_cache: LruCache::new(cache_size),
             processed_messages_cache: HashMap::new(),
@@ -546,6 +552,7 @@ impl MdkMemoryStorage {
             group_mip04_exporter_secrets: inner.group_mip04_exporter_secrets_cache.clone(),
             welcomes: inner.welcomes_cache.clone_to_hashmap(),
             processed_welcomes: inner.processed_welcomes_cache.clone(),
+            welcome_group_index: inner.welcome_group_index.clone(),
             messages: inner.messages_cache.clone_to_hashmap(),
             messages_by_group: inner.messages_by_group_cache.clone_to_hashmap(),
             processed_messages: inner.processed_messages_cache.clone(),
@@ -600,6 +607,7 @@ impl MdkMemoryStorage {
         inner.group_mip04_exporter_secrets_cache = snapshot.group_mip04_exporter_secrets;
         snapshot.welcomes.restore_to_lru(&mut inner.welcomes_cache);
         inner.processed_welcomes_cache = snapshot.processed_welcomes;
+        inner.welcome_group_index = snapshot.welcome_group_index;
         snapshot.messages.restore_to_lru(&mut inner.messages_cache);
         snapshot
             .messages_by_group
@@ -996,27 +1004,30 @@ impl MdkStorageProvider for MdkMemoryStorage {
                 .retain(|_, pm| pm.mls_group_id.as_ref() != Some(group_id));
 
             // Welcomes (keyed by EventId — must iterate for group match).
-            // Capture each welcome's wrapper_event_id so we can scrub matching
-            // processed_welcomes_cache entries below (that cache has no
-            // mls_group_id key and would otherwise leak group-linkable rows).
-            let mut welcome_keys: Vec<nostr::EventId> = Vec::new();
-            let mut welcome_wrapper_ids: Vec<nostr::EventId> = Vec::new();
-            for (k, w) in inner.welcomes_cache.iter() {
-                if &w.mls_group_id == group_id {
-                    welcome_keys.push(*k);
-                    welcome_wrapper_ids.push(w.wrapper_event_id);
-                }
-            }
+            let welcome_keys: Vec<nostr::EventId> = inner
+                .welcomes_cache
+                .iter()
+                .filter(|(_, w)| &w.mls_group_id == group_id)
+                .map(|(k, _)| *k)
+                .collect();
             for key in &welcome_keys {
                 inner.welcomes_cache.pop(key);
             }
 
             // Processed welcomes (keyed by wrapper_event_id — has no
-            // mls_group_id, so we link via the welcomes we just collected).
-            // The cache is a HashMap (security-critical: must not be evicted),
-            // so use HashMap::remove rather than LruCache::pop.
-            for wid in &welcome_wrapper_ids {
+            // mls_group_id). We use the non-evicting welcome_group_index
+            // rather than scanning welcomes_cache, because welcomes_cache is
+            // LRU-evictable: an evicted welcome would otherwise strand its
+            // processed_welcomes entry past delete_group.
+            let stale_wrapper_ids: Vec<nostr::EventId> = inner
+                .welcome_group_index
+                .iter()
+                .filter(|(_, gid)| *gid == group_id)
+                .map(|(wid, _)| *wid)
+                .collect();
+            for wid in &stale_wrapper_ids {
                 inner.processed_welcomes_cache.remove(wid);
+                inner.welcome_group_index.remove(wid);
             }
 
             // OpenMLS data (typed methods handle key serialization)
@@ -4241,6 +4252,92 @@ mod tests {
                     .unwrap()
                     .is_none(),
                 "processed_welcomes_cache entry survived delete_group"
+            );
+        }
+
+        #[test]
+        fn delete_group_scrubs_processed_welcomes_after_lru_eviction() {
+            // welcomes_cache is LRU-evictable while processed_welcomes_cache is
+            // not (post-#259). Without the wrapper_event_id -> mls_group_id
+            // index, an evicted welcome would strand its processed_welcomes
+            // entry past delete_group. This test exercises that window.
+            let cache_size = std::num::NonZeroUsize::new(2).unwrap();
+            let storage = MdkMemoryStorage::with_cache_size(cache_size);
+            let group_id = GroupId::from_slice(&[88, 88, 88]);
+            storage.save_group(create_group(&[88, 88, 88])).unwrap();
+
+            let pubkey = Keys::generate().public_key();
+            let now = Timestamp::now();
+            let target_wrapper = EventId::from_slice(&[0xAAu8; 32]).unwrap();
+            let target_welcome_eid = EventId::from_slice(&[0xBBu8; 32]).unwrap();
+
+            let make_welcome = |wid: EventId, weid: EventId| Welcome {
+                id: weid,
+                event: UnsignedEvent::new(pubkey, now, Kind::from(444u16), vec![], "w".to_string()),
+                mls_group_id: group_id.clone(),
+                nostr_group_id: [88u8; 32],
+                group_name: "Test".to_string(),
+                group_description: "".to_string(),
+                group_image_hash: None,
+                group_image_key: None,
+                group_image_nonce: None,
+                group_admin_pubkeys: BTreeSet::new(),
+                group_relays: BTreeSet::new(),
+                welcomer: pubkey,
+                member_count: 2,
+                state: WelcomeState::Pending,
+                wrapper_event_id: wid,
+            };
+
+            storage
+                .save_welcome(make_welcome(target_wrapper, target_welcome_eid))
+                .unwrap();
+            let pw = ProcessedWelcome {
+                wrapper_event_id: target_wrapper,
+                welcome_event_id: Some(target_welcome_eid),
+                processed_at: now,
+                state: ProcessedWelcomeState::Processed,
+                failure_reason: None,
+            };
+            storage.save_processed_welcome(pw).unwrap();
+
+            // Evict the target welcome from the LRU by saving cache_size + 1
+            // unrelated welcomes for the same group.
+            for i in 0..3u8 {
+                let mut wid_bytes = [0u8; 32];
+                wid_bytes[0] = 0xC0 | i;
+                let mut weid_bytes = [0u8; 32];
+                weid_bytes[0] = 0xD0 | i;
+                storage
+                    .save_welcome(make_welcome(
+                        EventId::from_slice(&wid_bytes).unwrap(),
+                        EventId::from_slice(&weid_bytes).unwrap(),
+                    ))
+                    .unwrap();
+            }
+
+            // Confirm the welcome was evicted from welcomes_cache, but the
+            // processed_welcome (HashMap) is still there.
+            {
+                let inner = storage.inner.read();
+                assert!(
+                    !inner.welcomes_cache.contains(&target_welcome_eid),
+                    "test setup: target welcome should have been LRU-evicted"
+                );
+                assert!(
+                    inner.processed_welcomes_cache.contains_key(&target_wrapper),
+                    "test setup: processed_welcome should still be present"
+                );
+            }
+
+            storage.delete_group(&group_id).unwrap();
+
+            assert!(
+                storage
+                    .find_processed_welcome_by_event_id(&target_wrapper)
+                    .unwrap()
+                    .is_none(),
+                "processed_welcomes_cache entry survived delete_group after welcomes_cache eviction"
             );
         }
     }
