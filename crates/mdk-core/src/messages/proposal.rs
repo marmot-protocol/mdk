@@ -5,7 +5,9 @@
 use mdk_storage_traits::messages::types as message_types;
 use mdk_storage_traits::{GroupId, MdkStorageProvider};
 use nostr::Event;
-use openmls::prelude::{BasicCredential, MlsGroup, Proposal, QueuedProposal, Sender};
+use openmls::prelude::{
+    BasicCredential, LeafNodeIndex, MlsGroup, Proposal, QueuedProposal, Sender,
+};
 use openmls_traits::OpenMlsProvider;
 use tls_codec::Serialize as TlsSerialize;
 
@@ -83,11 +85,13 @@ where
                                 let is_self_remove = *sender_leaf_index == removed_leaf_index;
 
                                 if is_self_remove && receiver_is_admin {
-                                    // Self-remove proposal + admin receiver: auto-commit
-                                    self.auto_commit_proposal(
+                                    // Legacy Remove(self) proposal + admin receiver:
+                                    // auto-commit an admin-authored removal for the
+                                    // departing leaf.
+                                    self.auto_commit_legacy_self_remove(
                                         mls_group,
                                         event,
-                                        staged_proposal,
+                                        removed_leaf_index,
                                         &group_id,
                                     )
                                 } else {
@@ -198,7 +202,7 @@ where
                                     });
                                 }
 
-                                self.auto_commit_proposal(
+                                self.auto_commit_self_remove_proposal(
                                     mls_group,
                                     event,
                                     staged_proposal,
@@ -292,13 +296,13 @@ where
         self.save_processed_message_record(processed_message)
     }
 
-    /// Stores a proposal and immediately auto-commits it.
+    /// Stores a `SelfRemove` proposal and immediately auto-commits it.
     ///
     /// Uses the commit builder with a SelfRemove-only filter to ensure no other
     /// pending proposals (Add, Remove, etc.) are accidentally included in the
     /// commit. This prevents non-admin committers from creating commits that
     /// violate MIP-03 authorization rules.
-    pub(super) fn auto_commit_proposal(
+    pub(super) fn auto_commit_self_remove_proposal(
         &self,
         mls_group: &mut MlsGroup,
         event: &Event,
@@ -341,6 +345,58 @@ where
         tracing::debug!(
             target: "mdk_core::messages::process_proposal",
             "Auto-committed self-remove proposal"
+        );
+
+        Ok(MessageProcessingResult::Proposal(UpdateGroupResult {
+            evolution_event: commit_event,
+            welcome_rumors: None,
+            mls_group_id: group_id.clone(),
+        }))
+    }
+
+    /// Auto-commits a legacy `Remove(self)` leave proposal received by an admin.
+    ///
+    /// The original proposal is already validated before this method is called.
+    /// Unlike `SelfRemove`, legacy `Remove` is not committable by arbitrary
+    /// non-admin receivers, so the admin commits an equivalent removal directly
+    /// instead of routing it through the SelfRemove-only proposal-store filter.
+    pub(super) fn auto_commit_legacy_self_remove(
+        &self,
+        mls_group: &mut MlsGroup,
+        event: &Event,
+        removed_leaf_index: LeafNodeIndex,
+        group_id: &GroupId,
+    ) -> Result<MessageProcessingResult> {
+        let mls_signer = self.load_mls_signer(mls_group)?;
+
+        let (commit_message, _welcomes, _group_info) = mls_group
+            .commit_builder()
+            .consume_proposal_store(false)
+            .propose_removals([removed_leaf_index])
+            .load_psks(self.provider.storage())
+            .map_err(|e| Error::Group(e.to_string()))?
+            .build(
+                self.provider.rand(),
+                self.provider.crypto(),
+                &mls_signer,
+                |_| true,
+            )
+            .map_err(|e| Error::Group(e.to_string()))?
+            .stage_commit(&self.provider)
+            .map_err(|e| Error::Group(e.to_string()))?
+            .into_contents();
+
+        let serialized_commit_message = commit_message
+            .tls_serialize_detached()
+            .map_err(|_e| Error::Group("Failed to serialize commit message".to_string()))?;
+
+        let commit_event = self.build_message_event(group_id, serialized_commit_message, None)?;
+
+        self.mark_processed(event, group_id, mls_group.epoch().as_u64())?;
+
+        tracing::debug!(
+            target: "mdk_core::messages::process_proposal",
+            "Auto-committed legacy self-remove proposal"
         );
 
         Ok(MessageProcessingResult::Proposal(UpdateGroupResult {
