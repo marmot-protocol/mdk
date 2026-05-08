@@ -28,9 +28,10 @@ Tests are split into three tiers (unit, in-crate integration, multi-client harne
 ## Reading order for a new contributor
 
 1. [`../../docs/marmot-architecture/overview/target-architecture.md`](../../docs/marmot-architecture/overview/target-architecture.md) — what the engine fits into
-2. [`../../docs/marmot-architecture/cgka-engine-canonicalization-contract.md`](../../docs/marmot-architecture/cgka-engine-canonicalization-contract.md) — the post-peeling engine contract
-3. [`../../docs/marmot-architecture/distributed-convergence.md`](../../docs/marmot-architecture/distributed-convergence.md) — the branch-selection and convergence model
-4. [`AGENTS.md`](AGENTS.md) — module-by-module map of this crate, design deviations, where to look for what
+2. [`../../docs/marmot-architecture/cgka-engine-spec.md`](../../docs/marmot-architecture/cgka-engine-spec.md) — the current engine spec
+3. [`../../docs/marmot-architecture/cgka-engine-canonicalization-contract.md`](../../docs/marmot-architecture/cgka-engine-canonicalization-contract.md) — the detailed post-peeling contract
+4. [`../../docs/marmot-architecture/distributed-convergence.md`](../../docs/marmot-architecture/distributed-convergence.md) — the branch-selection and convergence model
+5. [`AGENTS.md`](AGENTS.md) — module-by-module map of this crate, design deviations, where to look for what
 
 ## Status
 

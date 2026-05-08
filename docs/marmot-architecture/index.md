@@ -47,6 +47,7 @@ These are longer working documents. Go here when you need depth, not orientation
 
 | Doc | What it covers |
 |---|---|
+| [`cgka-engine-spec.md`](./cgka-engine-spec.md) | Draft normative CGKA engine spec: boundary, state, convergence, storage, conformance requirements. |
 | [`cgka-engine-canonicalization-contract.md`](./cgka-engine-canonicalization-contract.md) | Draft CGKA engine canonicalization contract: post-peeling inputs, candidate-state graph, sync state, outputs, storage, conformance scenarios. |
 | [`distributed-convergence.md`](./distributed-convergence.md) | Draft convergence model for selecting one MLS branch from unordered multi-relay input. |
 | [`further-context/target-architecture.md`](./further-context/target-architecture.md) | Older long-form target architecture with illustrative trait sketches. Current orientation lives in `overview/target-architecture.md`. |
