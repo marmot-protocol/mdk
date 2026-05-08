@@ -416,6 +416,9 @@ struct MdkMemoryStorageInner {
     // `welcomes_cache` is LRU-evictable while `processed_welcomes_cache` is
     // not: without this index, an evicted welcome would strand its
     // processed_welcomes entry, defeating delete_group cleanup.
+    // Populated only by `save_processed_welcome` (not `save_welcome`), so the
+    // index is bounded at the same rate as `processed_welcomes_cache` rather
+    // than every welcome ever cached.
     welcome_group_index: HashMap<EventId, GroupId>,
     messages_cache: LruCache<EventId, Message>,
     messages_by_group_cache: LruCache<GroupId, HashMap<EventId, Message>>,

@@ -81,12 +81,6 @@ impl WelcomeStorage for MdkMemoryStorage {
         )?;
 
         let mut inner = self.inner.write();
-        // Maintain non-evicting wrapper -> group index so delete_group can
-        // still scrub processed_welcomes for this group after the welcomes
-        // LRU cache evicts the welcome.
-        inner
-            .welcome_group_index
-            .insert(welcome.wrapper_event_id, welcome.mls_group_id.clone());
         inner.welcomes_cache.put(welcome.id, welcome);
 
         Ok(())
@@ -133,6 +127,19 @@ impl WelcomeStorage for MdkMemoryStorage {
         processed_welcome: ProcessedWelcome,
     ) -> Result<(), WelcomeError> {
         let mut inner = self.inner.write();
+        // Capture the wrapper -> group association from the just-saved welcome
+        // so delete_group can still scrub this processed_welcomes entry after
+        // welcomes_cache LRU-evicts the welcome. Bound at the same rate as
+        // processed_welcomes_cache itself; failure-state entries (no
+        // welcome_event_id) cannot be linked to a group and are skipped.
+        if let Some(welcome_eid) = processed_welcome.welcome_event_id
+            && let Some(welcome) = inner.welcomes_cache.peek(&welcome_eid)
+        {
+            let group_id = welcome.mls_group_id.clone();
+            inner
+                .welcome_group_index
+                .insert(processed_welcome.wrapper_event_id, group_id);
+        }
         inner
             .processed_welcomes_cache
             .insert(processed_welcome.wrapper_event_id, processed_welcome);
