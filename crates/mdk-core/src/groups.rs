@@ -1101,12 +1101,6 @@ where
             None,
         )?;
 
-        self.track_processed_message(
-            commit_event.id,
-            &mls_group,
-            message_types::ProcessedMessageState::ProcessedCommit,
-        )?;
-
         let serialized_welcome_message = welcome_message
             .tls_serialize_detached()
             .map_err(|e| Error::Group(e.to_string()))?;
@@ -1122,6 +1116,12 @@ where
             serialized_welcome_message,
             key_package_events.to_vec(),
             &group_relays,
+        )?;
+
+        self.track_processed_message(
+            commit_event.id,
+            &mls_group,
+            message_types::ProcessedMessageState::ProcessedCommit,
         )?;
 
         // let serialized_group_info = group_info
@@ -1271,18 +1271,18 @@ where
             None,
         )?;
 
-        self.track_processed_message(
-            commit_event.id,
-            &mls_group,
-            message_types::ProcessedMessageState::ProcessedCommit,
-        )?;
-
         // For now, if we find welcomes, throw an error.
         if welcome_option.is_some() {
             return Err(Error::Group(
                 "Found welcomes when removing users".to_string(),
             ));
         }
+
+        self.track_processed_message(
+            commit_event.id,
+            &mls_group,
+            message_types::ProcessedMessageState::ProcessedCommit,
+        )?;
         // let serialized_welcome_message = welcome_option
         //     .map(|w| {
         //         w.tls_serialize_detached()
@@ -1309,6 +1309,7 @@ where
         mls_group: &mut MlsGroup,
         group_id: &GroupId,
         group_data: &NostrGroupDataExtension,
+        track_pending_snapshot: bool,
     ) -> Result<UpdateGroupResult, Error> {
         let own_leaf = mls_group.own_leaf().ok_or(Error::OwnLeafNotFound)?;
         if !self.is_leaf_node_admin(group_id, own_leaf)? {
@@ -1331,11 +1332,15 @@ where
             None,
         )?;
 
-        self.track_processed_message(
-            commit_event.id,
-            mls_group,
-            message_types::ProcessedMessageState::ProcessedCommit,
-        )?;
+        if track_pending_snapshot {
+            self.track_pending_commit_message(mls_group, &commit_event)?;
+        } else {
+            self.track_processed_message(
+                commit_event.id,
+                mls_group,
+                message_types::ProcessedMessageState::ProcessedCommit,
+            )?;
+        }
 
         Ok(UpdateGroupResult {
             evolution_event: commit_event,
@@ -1390,6 +1395,7 @@ where
         let mut mls_group = self.load_mls_group(group_id)?.ok_or(Error::GroupNotFound)?;
 
         let mut group_data = NostrGroupDataExtension::from_group(&mls_group)?;
+        let updates_admins = update.admins.is_some();
 
         // Apply updates only for fields that are specified
         if let Some(name) = update.name {
@@ -1435,7 +1441,7 @@ where
             group_data.nostr_group_id = nostr_group_id;
         }
 
-        self.update_group_data_extension(&mut mls_group, group_id, &group_data)
+        self.update_group_data_extension(&mut mls_group, group_id, &group_data, updates_admins)
     }
 
     /// Retrieves the set of relay URLs associated with an MLS group
@@ -1769,12 +1775,6 @@ where
             None,
         )?;
 
-        self.track_processed_message(
-            commit_event.id,
-            &mls_group,
-            message_types::ProcessedMessageState::ProcessedCommit,
-        )?;
-
         let serialized_welcome_message = commit_message_bundle
             .welcome()
             .map(|w| {
@@ -1789,6 +1789,12 @@ where
                 "Found welcomes when performing a self update".to_string(),
             ));
         }
+
+        self.track_processed_message(
+            commit_event.id,
+            &mls_group,
+            message_types::ProcessedMessageState::ProcessedCommit,
+        )?;
 
         Ok(UpdateGroupResult {
             evolution_event: commit_event,
@@ -2124,6 +2130,9 @@ where
             .clear_pending_commit(self.provider.storage())
             .map_err(|e| Error::Provider(e.to_string()))?;
 
+        self.epoch_snapshots
+            .release_pending_snapshot(self.storage(), group_id)?;
+
         // If this was a self-update, delete the orphaned new signature keypair.
         // OpenMLS reverts to the old signer after clear_pending_commit; the new
         // keypair was stored eagerly in self_update() and is now unreachable.
@@ -2169,6 +2178,8 @@ where
         });
 
         mls_group.merge_pending_commit(&self.provider)?;
+        self.epoch_snapshots
+            .activate_pending_snapshot(self.storage(), group_id);
 
         // Save MIP-03 and MIP-04 exporter secrets for the new epoch
         self.exporter_secret(group_id)?;
@@ -2324,6 +2335,37 @@ where
         }
 
         Ok(valid_admins)
+    }
+
+    /// Records rollback metadata for a locally created commit before it is merged.
+    fn track_pending_commit_message(
+        &self,
+        mls_group: &MlsGroup,
+        commit_event: &Event,
+    ) -> Result<(), Error> {
+        let group_id: GroupId = mls_group.group_id().into();
+        let content_hash = crate::messages::content_hash(&commit_event.content);
+        self.epoch_snapshots.create_pending_snapshot(
+            self.storage(),
+            &group_id,
+            mls_group.epoch().as_u64(),
+            &commit_event.id,
+            commit_event.created_at.as_secs(),
+            &content_hash,
+        )?;
+
+        if let Err(e) = self.track_processed_message(
+            commit_event.id,
+            mls_group,
+            message_types::ProcessedMessageState::ProcessedCommit,
+        ) {
+            let _ = self
+                .epoch_snapshots
+                .release_pending_snapshot(self.storage(), &group_id);
+            return Err(e);
+        }
+
+        Ok(())
     }
 
     /// Records a processed message so the client can track message state.

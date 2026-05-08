@@ -31,7 +31,11 @@
 
 ### Fixed
 
+<<<<<<< codex/fix-marmot-security-98
 - Fixed admin auto-commit of legacy `Remove(self)` leaves in mixed/legacy groups so departing members are actually removed instead of silently remaining in the MLS group. ([#288](https://github.com/marmot-protocol/mdk/pull/288))
+=======
+- Recorded rollback snapshots for locally merged admin-list updates so clients can converge on the MIP-03 winner when competing admins concurrently mutate `admin_pubkeys`. ([#289](https://github.com/marmot-protocol/mdk/pull/289))
+>>>>>>> master
 - Verified unsigned application-message rumor IDs before accepting or sending them, preventing caller-supplied IDs from being trusted when they do not match the canonical event hash. ([#287](https://github.com/marmot-protocol/mdk/pull/287))
 - Fixed `mdk-core` crates.io package verification against OpenMLS 0.8.1 by using a temporary exported-ratchet-tree compatibility shim until crates.io OpenMLS exposes the upstream full-leaf iterator. ([#273](https://github.com/marmot-protocol/mdk/pull/273))
 

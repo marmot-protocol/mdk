@@ -68,6 +68,7 @@
 - Fixed stale `release-size` artifact paths in Kotlin and Swift binding generation recipes. ([#232](https://github.com/marmot-protocol/mdk/pull/232))
 - Unbroke binding builds on Linux: switched `[profile.release].strip` from `true` to `"debuginfo"` so `uniffi-bindgen --library` can still read `UNIFFI_META_*` symbols from the cdylib's `.symtab` (GNU strip's `--strip-all` was removing them, which silently produced empty Kotlin/Ruby/Python binding output). DWARF debug info is still stripped, so the binary-size cost is small. ([#267](https://github.com/marmot-protocol/mdk/pull/267))
 - Switched iOS bindings to fat LTO (`CARGO_PROFILE_RELEASE_LTO=fat`, mirroring Android) so the static `.a` archives no longer embed per-module thin-LTO bitcode. This shrinks `libmdk_uniffi.a` back below GitHub's 100 MB push limit. The Swift package workflow also configures `git lfs track "*.a"` as a defensive safety net. ([#267](https://github.com/marmot-protocol/mdk/pull/267))
+- **Security**: `scripts/build-openssl-android.sh` now verifies the upstream OpenSSL release tarball against a pinned SHA-256 before extraction, and aborts when no hash is recorded for the requested version. Without this check, a tampered tarball (poisoned CDN, MITM, or compromised GitHub release) would have been linked into the `mdk-uniffi` Android shared library. ([#290](https://github.com/marmot-protocol/mdk/pull/290))
 
 ### Removed
 
