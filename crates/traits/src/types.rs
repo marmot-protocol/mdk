@@ -91,6 +91,6 @@ impl fmt::Display for EpochId {
 pub enum Backend {
     /// Ephemeral, process-local storage. See `storage-memory`.
     InMemory,
-    /// Reserved for the future SQLite backend (not yet implemented).
+    /// SQLCipher-backed SQLite persistence. See `storage-sqlite`.
     Sqlite,
 }

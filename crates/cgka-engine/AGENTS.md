@@ -36,7 +36,7 @@ Each module has a one-paragraph rustdoc at the top explaining its responsibility
 | `epoch_manager.rs` | only place that mutates `EpochState`; owns `PendingMeta` (group_id + prior_epoch + kind), `committed_from`, fork detection state |
 | `fork_recovery.rs` | deterministic same-epoch commit ordering, pre-commit snapshot metadata, rollback-to-winner recovery |
 | `publish.rs` | `do_confirm_published` (merges staged commit + mirrors Marmot/cache post-merge) and `do_publish_failed` (`MlsGroup::clear_pending_commit` + Marmot re-derive). The publish-before-apply contract lives here. |
-| `auto_committer.rs` | `LowestIndexAutoCommitter` policy for SelfRemove (pluggable seam) |
+| `auto_committer.rs` | `LowestIndexAutoCommitter` policy for SelfRemove (future policy hook) |
 | `upgrade.rs` | `do_upgrade_group_capabilities` — the only GCE-commit construction site today |
 | `group_data.rs` | MIP-01 `marmot_group_data` (`0xF2EE`) extension construction |
 | `group_context_view.rs` | snapshot view of `GroupContext` for trait callers |
@@ -66,7 +66,10 @@ These are the load-bearing departures from the original plan. Each is also docum
 
 ## Open structural items
 
-None in the engine core. Remaining work is around production backends and packaging: external vector fixtures/runners, SQLite snapshot retention/pruning, transport adapters, and KeyPackage refresh scheduling. See [`../../plans/2026-04-22-cgka-engine-production-refactor-v1.md`](../../plans/2026-04-22-cgka-engine-production-refactor-v1.md).
+None in the engine core. Remaining work is around production packaging and
+adjacent layers: transport adapters, app key-management integration, external
+vector fixtures/runners, WAL checkpoint/rekey policy, and KeyPackage refresh
+scheduling.
 
 ### Done — Task 4.2 `update_group_data` (2026-04-25)
 
@@ -85,7 +88,7 @@ OpenMLS 0.8.1 surface used: `MlsGroup::pending_commit() -> Option<&StagedCommit>
 ## Conventions in this crate
 
 - **Only `EpochManager` may construct non-`Stable` `EpochState` variants.** This is enforced by visibility — the variants' fields are private. Don't add a public constructor for `Recovering` etc. somewhere else.
-- **No Nostr types anywhere.** Grep test: `grep -ri nostr crates/cgka-engine/src/` returns zero hits. Same for `crates/traits/`, `crates/storage-memory/`.
+- **No Nostr types anywhere.** Grep test: `grep -ri nostr crates/cgka-engine/src/` returns zero hits. Same for `crates/traits/`, `crates/storage-memory/`, and `crates/storage-sqlite/`.
 - **No `leave_group()` (the legacy MLS path).** Always `leave_group_via_self_remove` per MIP-03. This is grep-banned.
 - **OpenMLS family is tilde-pinned in workspace `Cargo.toml`.** Don't relax to caret; silent companion-crate skew has broken this stack before.
 - **Wire format is `PURE_PLAINTEXT_WIRE_FORMAT_POLICY`.** This is a deliberate 0.1.0 choice. Before changing it, read the module comment in `src/wire_format.rs` and the three alternative paths it links.

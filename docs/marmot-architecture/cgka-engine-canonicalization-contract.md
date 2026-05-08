@@ -215,6 +215,10 @@ snapshots, selecting candidate branches, or deciding whether a stale commit is
 inside the rewind horizon. A local default is only a fallback for groups that do
 not yet have a stored policy.
 
+Until MLS app components carry this policy, v0 engines use the local default
+policy and store explicit policy bytes when a group has negotiated or otherwise
+configured an override.
+
 The same value bounds retained anchor snapshots. At current tip `T`, the
 oldest retained anchor is:
 
@@ -223,8 +227,8 @@ oldest_retained_anchor = T - max_rewind_commits
 ```
 
 Engines MUST retain snapshots for the current tip and every epoch at or after
-that anchor. Engines MUST prune older retained anchors after a successful
-canonicalization pass advances the current tip.
+that anchor. Engines MUST prune older retained anchors as soon as a successful
+canonicalization pass reaches `Stable` and advances the current tip.
 
 `app_message_past_epoch_limit` MUST follow the MLS configuration used by the
 engine for decrypting past-epoch application messages. App messages outside
@@ -474,9 +478,12 @@ Required storage:
 - last successful canonicalization result,
 - last convergence-relevant input time for sync quiescence.
 
-Storage MAY discard candidate states, pending messages, and app payloads outside
-their negotiated retention horizons. Once discarded, those artifacts cannot
-cause rollback or app-message acceptance.
+Storage MAY discard candidate states, pending messages, retained anchors, and
+app payloads outside their negotiated retention horizons. Once discarded, those
+artifacts cannot cause rollback or app-message acceptance. Invalidated message
+records SHOULD remain durable audit/debug records even when they are no longer
+replayable. Applications MAY surface invalidated app messages according to
+local UX policy.
 
 When storage discards a retained anchor, later commits that require that anchor
 fall into one of two outcomes: `MissingRetainedAnchor` if the commit is still

@@ -2,7 +2,7 @@
 //!
 //! Process-local, `Arc`-cloneable in-memory backend for every storage trait
 //! in [`cgka_traits`]. Designed for tests, the multi-client harness, and
-//! ephemeral runs. SQLite persistence is deferred.
+//! ephemeral runs. Use `storage-sqlite` for SQLCipher-backed persistence.
 //!
 //! ## Cloneability
 //!

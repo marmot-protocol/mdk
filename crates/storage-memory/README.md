@@ -1,6 +1,6 @@
 # storage-memory
 
-In-memory implementation of the `cgka_traits::StorageProvider` aggregate. Suitable for tests and ephemeral scenarios. A SQLite backend is deferred to a separate plan.
+In-memory implementation of the `cgka_traits::StorageProvider` aggregate. Suitable for tests and ephemeral scenarios. Use `storage-sqlite` for SQLCipher-backed persistence.
 
 ## What this crate gives you
 

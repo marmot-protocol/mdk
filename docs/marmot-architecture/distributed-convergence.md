@@ -74,7 +74,8 @@ pointer.
 The retained anchor is the oldest epoch from which the engine may rebuild a
 candidate branch. Implementations MUST retain epoch snapshots for the current
 tip and every epoch inside `max_rewind_commits`. They MUST prune older retained
-anchors once the current tip advances past the rewind window.
+anchors as soon as stable canonicalization advances the current tip past the
+rewind window.
 
 Late commits are handled by their source epoch:
 

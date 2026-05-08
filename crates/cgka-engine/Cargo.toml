@@ -24,6 +24,8 @@ sha2.workspace = true
 
 [dev-dependencies]
 storage-memory.workspace = true
+storage-sqlite.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 test-log.workspace = true
 insta.workspace = true
+tempfile.workspace = true

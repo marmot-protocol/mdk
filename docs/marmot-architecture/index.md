@@ -89,7 +89,7 @@ These are longer working documents. Go here when you need depth, not orientation
 | Transport | Nostr relay control planes, embedded | `TransportAdapter` trait, `NostrAdapter` as first impl |
 | CGKA Engine | `crates/cgka-engine` implements the current OpenMLS-backed engine candidate | Spec-level `CgkaEngine` contract with production persistence and packaging |
 | Crypto | OpenMLS behind `CgkaEngine` | OpenMLS first, with the trait boundary preserving future CGKA swap room |
-| Storage | `storage-memory` for tests and simulator work | Production backend with retained anchors, snapshots, and pruning |
+| Storage | `storage-memory` for tests/simulator work; `storage-sqlite` for SQLCipher-backed persistence | MLS app-component policy negotiation, app key-management integration, packaging |
 
 ---
 

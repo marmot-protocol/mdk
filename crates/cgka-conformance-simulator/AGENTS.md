@@ -6,13 +6,13 @@ Read [`README.md`](README.md) for the human framing. This file is the agent-faci
 
 | Module | Role |
 |---|---|
-| `src/bus.rs` | `TransportBus` — in-memory bus. Owns delivery policy, the queue, partition state, and the address book that maps `MemberId → ClientId` (for welcome routing). |
-| `src/canonicalization.rs` | Executable model of the CGKA canonicalization contract. Uses symbolic peeled messages plus optional materialized candidate metadata, then calls the convergence selector to produce deterministic message dispositions. |
+| `src/bus.rs` | `TransportBus`, the in-memory bus. Owns delivery policy, the queue, partition state, and the address book that maps `MemberId` to `ClientId` for welcome routing. |
+| `cgka_engine::canonicalization` | Executable model of the CGKA canonicalization contract, re-exported by this crate for tests. Uses symbolic peeled messages plus optional materialized candidate metadata, then calls the convergence selector to produce deterministic message dispositions. |
 | `src/client.rs` | `HarnessClient` + `ClientBuilder`. Wraps an `Engine<MemoryStorage>` and the bus handle. `tick().await` drains pending inbound for one client. `confirm(pending).await` finishes a `GroupEvolution`. |
-| `src/convergence.rs` | Model-level candidate-state graph scoring rules for the distributed convergence design. These tests do not drive OpenMLS yet; they pin policy before the engine canonicalizer lands. |
+| `cgka_engine::convergence` | Candidate-state graph scoring rules for the distributed convergence design, re-exported by this crate for tests. These tests pin selector policy independently from OpenMLS replay. |
 | `src/family.rs` | Deterministic generated scenario families. `generate_send_leave_family` and `generate_convergence_e2e_delivery_family` record family name, generator version, seed, case index, and a runnable `ScenarioSpec`. `run_generated_case_report` adds generated metadata to report artifacts. |
-| `src/openmls_projection.rs` | Bytes-first OpenMLS projection and candidate materialization helpers. Parses MLS bytes, replays candidate paths against a snapshot, observes proposal refs / staged commits / app decryptions, rolls storage back, and can run the canonicalizer with OpenMLS-derived pending proposal/app-message evidence. |
-| `src/peeler.rs` | `MockPeeler` — pass-through. Group messages and welcomes go through distinct methods, matching the production `TransportPeeler` four-method shape, but the body is just length-prefixed framing with no encryption. Transport ids/timestamps are deterministic per client so vector traces stay stable despite OpenMLS randomness. |
+| `cgka_engine::openmls_projection` | Bytes-first OpenMLS projection and candidate materialization helpers, re-exported by this crate for tests. Parses MLS bytes, replays candidate paths against a snapshot, observes proposal refs / staged commits / app decryptions, rolls storage back, and can run the canonicalizer with OpenMLS-derived pending proposal/app-message evidence. |
+| `src/peeler.rs` | `MockPeeler`, a pass-through peeler. Group messages and welcomes go through distinct methods, matching the production `TransportPeeler` four-method shape, but the body is just length-prefixed framing with no transport encryption. Transport ids/timestamps are deterministic per client so vector traces stay stable despite OpenMLS randomness. |
 | `src/proptest_support.rs` | `intent_seq(n_clients, range)` proptest strategy. Generates `HarnessIntent::Send` and `HarnessIntent::Leave`; `delivery_profile()` covers FIFO, reverse, and seeded-random delivery. |
 | `src/scenario.rs` | Serializable `ScenarioSpec` v1 plus `run_scenario_spec` / `run_scenario_report`. Drives ordered client operations from JSON-shaped scenario data and returns either a `ScenarioTrace` or a serializable report with metadata, step log, flattened epoch changes, app invalidations, recoveries, and invariant failures. |
 | `src/vector.rs` | `ScenarioTrace` and observations. Records final epoch/member/payload facts plus member additions/removals, epoch changes, app invalidations, and `ForkRecoveryObservation` entries from `GroupEvent::ForkRecovered`. |
@@ -21,14 +21,14 @@ Read [`README.md`](README.md) for the human framing. This file is the agent-faci
 
 ## Bus model
 
-The bus is **synchronous and deterministic**. Calling `client.send_app(...)` enqueues; calling `bus.deliver_all()` (or `bus.step(n)`) flushes; calling `client.tick().await` ingests on the receiver side. There is no actual async runtime cooperation — sending is `&mut self`, the engine is awaited inline.
+The bus is **synchronous and deterministic**. Calling `client.send_app(...)` enqueues; calling `bus.deliver_all()` (or `bus.step(n)`) flushes; calling `client.tick().await` ingests on the receiver side. There is no actual async runtime cooperation; sending is `&mut self`, the engine is awaited inline.
 
 Delivery policies (`DeliveryPolicy`):
 
-- `ordered` — FIFO. Default for all canonical scenarios + the proptest.
-- `reverse` — pop from the back. Useful for ingesting commits before their proposals.
-- `seeded_random` — deterministic shuffle from a fixed `u64` seed.
-- `partition` — drop messages whose recipient is in the partition set.
+- `ordered`: FIFO. Default for all canonical scenarios + the proptest.
+- `reverse`: pop from the back. Useful for ingesting commits before their proposals.
+- `seeded_random`: deterministic shuffle from a fixed `u64` seed.
+- `partition`: drop messages whose recipient is in the partition set.
 
 The bus knows about welcomes vs. group messages so welcomes can be routed to a specific recipient without requiring it to be a group member yet.
 

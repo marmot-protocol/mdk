@@ -68,6 +68,8 @@ This repository now has the main engine candidate:
 - `crates/traits` — cross-boundary value types and traits.
 - `crates/cgka-engine` — OpenMLS-backed engine implementation.
 - `crates/storage-memory` — in-memory storage and snapshot backend for tests.
+- `crates/storage-sqlite` — SQLCipher-backed SQLite storage for Marmot and
+  custom OpenMLS state, with Rust migrations for schema/data evolution.
 - `crates/cgka-conformance-simulator` — multi-client simulator, vectors,
   generated scenarios, and property tests.
 - `formal/tamarin` — formal models for the convergence selector, delivery-order
@@ -79,9 +81,10 @@ events, model losing-branch invalidations, and test generated delivery variants.
 
 ## Known gaps
 
-- **Production persistence** — `storage-memory` proves the shape but is not a
-  production backend. SQLite snapshot retention and pruning still need design
-  and implementation.
+- **Production persistence hardening** — `storage-sqlite` provides encrypted
+  persistence, atomic group snapshots, retained-anchor pruning, and
+  privacy-oriented SQLite defaults. App key-management integration, packaging,
+  and longer-term rekey/vacuum/checkpoint policy still need production wiring.
 - **Production transport adapters** — the simulator uses an in-memory bus and
   `MockPeeler`. Nostr/FIPS adapters live outside this engine workspace.
 - **Portable fork-recovery vectors** — fork recovery is tested in Rust, but

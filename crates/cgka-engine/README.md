@@ -14,7 +14,9 @@ This crate is the core of the system: it owns the per-group state machine that s
 ## What it does *not* do
 
 - No transport (no Nostr, no relays). Plug in a `TransportPeeler` impl.
-- No persistence beyond what `StorageProvider` exposes. Pair with `storage-memory` for tests, a future SQLite backend for production.
+- No persistence beyond what `StorageProvider` exposes. Pair with
+  `storage-memory` for tests and `storage-sqlite` for SQLCipher-backed
+  persistence.
 - No CLI, no FFI, no application logic.
 
 ## Run the tests

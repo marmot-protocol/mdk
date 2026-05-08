@@ -1,6 +1,8 @@
 # cgka-conformance-simulator
 
-In-process multi-client simulator for the CGKA engine. Lets us replay scripted scenarios and run property-based invariants against `Engine<MemoryStorage>` without going anywhere near a network or real crypto.
+In-process multi-client simulator for the CGKA engine. Lets us replay scripted
+scenarios and run property-based invariants against `Engine<MemoryStorage>`
+without a network or transport encryption.
 
 ## What this crate gives you
 

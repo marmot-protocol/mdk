@@ -1,0 +1,56 @@
+# AGENTS.md - darkmatter
+
+Repository-level map for agents. Read `README.md` first for the human-facing
+overview.
+
+## Scope
+
+This repo owns the candidate CGKA engine workspace:
+
+- shared traits and cross-boundary types,
+- OpenMLS-backed engine implementation,
+- in-memory and SQLCipher-backed storage backends,
+- conformance simulator and vector fixtures,
+- Tamarin models for distributed convergence,
+- architecture and spec drafts.
+
+## Where to go
+
+| Task | Start here |
+| --- | --- |
+| Engine behavior | `crates/cgka-engine/AGENTS.md` |
+| Engine integration tests | `crates/cgka-engine/tests/AGENTS.md` |
+| Storage traits and shared types | `crates/traits/AGENTS.md` |
+| In-memory storage | `crates/storage-memory/AGENTS.md` |
+| SQLite storage | `crates/storage-sqlite/AGENTS.md` |
+| Multi-client harness / vectors | `crates/cgka-conformance-simulator/AGENTS.md` |
+| Architecture docs | `docs/AGENTS.md` and `docs/marmot-architecture/AGENTS.md` |
+| Formal model | `formal/tamarin/AGENTS.md` |
+
+## Invariants
+
+- Keep the engine generic over `S: cgka_traits::StorageProvider`.
+- Keep transport-specific code out of `crates/cgka-engine`, `crates/traits`,
+  and storage crates.
+- Keep SQLite persistence one database per Marmot account-device identity.
+- Keep Tamarin model names, Rust test names, and vector names easy to grep
+  across layers.
+- When adding an `AGENTS.md`, create a sibling `CLAUDE.md` symlink to it.
+
+## Verification
+
+Use the smallest command that covers the change, then widen before checkpointing
+cross-crate work:
+
+```sh
+just fmt-check
+just check
+just clippy
+just test
+```
+
+For formal-model changes:
+
+```sh
+just tamarin
+```

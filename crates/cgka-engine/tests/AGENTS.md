@@ -4,7 +4,7 @@ Three tiers, each owning a different correctness question. The crate's tests are
 
 ## Tier 1 — In-crate unit tests (other crates)
 
-**Where:** `crates/traits/src/engine_state.rs::tests`, `crates/traits/tests/snapshots.rs`, `crates/storage-memory/src/tests.rs`.
+**Where:** `crates/traits/src/engine_state.rs::tests`, `crates/traits/tests/snapshots.rs`, `crates/storage-memory/src/tests.rs`, `crates/storage-sqlite/src/**::tests`.
 **What they prove:** pure-data-structure correctness — state-machine transitions, storage round-trips, snapshot/rollback, JSON shape stability of cross-boundary value types. No engine, no MLS.
 
 ```sh
@@ -19,7 +19,7 @@ cargo insta review
 
 ## Tier 2 — Engine integration tests (this directory)
 
-**What they prove:** real OpenMLS-backed `Engine<MemoryStorage>` behavior across one or more engine instances using a pass-through `MockPeeler`. One file per phase or feature area.
+**What they prove:** real OpenMLS-backed engine behavior across one or more engine instances using a pass-through `MockPeeler`. Most files use `Engine<MemoryStorage>`; `sqlite_storage.rs` keeps the persistent backend on the same rail.
 
 | File | Owns |
 |---|---|
@@ -30,6 +30,7 @@ cargo insta review
 | `capabilities.rs` | Phase 4.6/4.7 + 5.4 — `feature_status`, capability cache, capability matrix |
 | `fork_detection.rs` | Phase 4.5 — deterministic same-epoch fork recovery plus the unrecoverable `ForkedEpoch` boundary |
 | `mip03_guards.rs` | Phase 4.9 — committer-MUST-NOT-be-leaver, admin-not-last, admin-self-remove |
+| `sqlite_storage.rs` | SQLCipher-backed `Engine<SqliteStorage>` create + confirm smoke |
 
 ```sh
 cargo test -p cgka-engine
@@ -60,7 +61,8 @@ cargo test -p cgka-conformance-simulator --features conformance-slow
 cargo test --workspace
 ```
 
-Expected today: 100 passing, 0 failing.
+Run before checkpointing broad storage/engine changes; the exact count changes as
+backend coverage grows.
 
 ## When adding a new test
 

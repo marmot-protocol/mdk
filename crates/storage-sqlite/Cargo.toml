@@ -1,0 +1,23 @@
+[package]
+name = "storage-sqlite"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "SQLite storage backend for the CGKA engine with Marmot and OpenMLS state in one database."
+
+[dependencies]
+cgka-traits.workspace = true
+openmls.workspace = true
+openmls_traits.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[features]
+extensions-draft-08 = ["openmls_traits/extensions-draft-08"]

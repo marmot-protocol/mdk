@@ -4,6 +4,7 @@ members = [
     "crates/traits",
     "crates/cgka-engine",
     "crates/storage-memory",
+    "crates/storage-sqlite",
     "crates/cgka-conformance-simulator",
 ]
 
@@ -35,6 +36,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rand = "0.8"
 sha2 = "0.10"
+rusqlite = { version = "0.32", features = ["bundled-sqlcipher-vendored-openssl"] }
+tempfile = "3"
 
 # test
 proptest = "1"
@@ -45,4 +48,5 @@ test-log = { version = "0.2", features = ["trace"] }
 cgka-traits = { path = "crates/traits" }
 cgka-engine = { path = "crates/cgka-engine" }
 storage-memory = { path = "crates/storage-memory" }
+storage-sqlite = { path = "crates/storage-sqlite" }
 cgka-conformance-simulator = { path = "crates/cgka-conformance-simulator" }
