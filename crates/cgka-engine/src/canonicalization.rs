@@ -30,7 +30,6 @@ impl Default for CanonicalizationPolicy {
 pub struct CanonicalizationState {
     pub current_tip_epoch: u64,
     pub retained_anchor_epoch: u64,
-    pub sync_state: SyncState,
     pub last_convergence_relevant_input_ms: u64,
     pub seen_message_ids: BTreeSet<String>,
 }

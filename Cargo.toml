@@ -6,7 +6,6 @@ members = [
     "crates/storage-memory",
     "crates/cgka-conformance-simulator",
 ]
-exclude = ["spike"]
 
 [workspace.package]
 edition = "2024"
@@ -15,7 +14,7 @@ license = "MIT"
 publish = false
 
 [workspace.dependencies]
-# OpenMLS family — tilde-pinned to avoid silent skew (see docs/learnings.md:32)
+# OpenMLS family — tilde-pinned to avoid silent companion-crate skew.
 openmls = "~0.8.1"
 openmls_basic_credential = "~0.5"
 openmls_rust_crypto = "~0.5"

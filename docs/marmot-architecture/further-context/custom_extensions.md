@@ -7,12 +7,11 @@ status: exploration
 related:
   - [[capability-negotiation]]
   - [[cgka-engine-design]]
-  - [[spike-findings]]
 ---
 
 # Custom Proposals & Extensions — When to Inherit vs Define
 
-**What this doc is.** An exploration, not a decision. A spike uncovered a case (SelfRemove / PublicMessage) where Marmot inherits a constraint from a more general spec for reasons that partially applied. That surfaced a broader question: *where else in the Marmot spec are we inheriting MLS / MLS-Extensions primitives with rationales that may or may not apply, and where could Marmot-defined extensions — particularly under the MLS-Extensions draft's new Safe Extensions framework — serve us better?*
+**What this doc is.** An exploration, not a decision. SelfRemove / PublicMessage exposed a case where Marmot inherits a constraint from a more general spec for reasons that only partly apply. That surfaced a broader question: *where else in the Marmot spec are we inheriting MLS / MLS-Extensions primitives with rationales that may or may not apply, and where could Marmot-defined extensions — particularly under the MLS-Extensions draft's new Safe Extensions framework — serve us better?*
 
 This doc now reflects a close reading of **draft-ietf-mls-extensions-09**, all merged MIPs (00, 01, 02, 03, 04, 05), and the MIP-06 multi-device PR (#44). The early "likely finding" speculation from the first draft has been replaced with fact-checked per-MIP analysis.
 
@@ -70,7 +69,7 @@ So even with MIP-06 active, the joining device **cannot** reference pending Self
 OpenMLS 0.8 enforces the MUST: `leave_group_via_self_remove()` rejects groups configured with `OutgoingWireFormatPolicy::AlwaysCiphertext`. And OpenMLS 0.8 offers only `AlwaysPlaintext` or `AlwaysCiphertext` — **no mixed option**. So any group that ever wants to issue a SelfRemove must use plaintext for all outgoing MLS messages.
 
 Options:
-- **Option A (spike's choice):** `PURE_PLAINTEXT_WIRE_FORMAT_POLICY` for the group. The outer kind-445 layer (ChaCha20Poly1305 keyed by `group_event_key` per MIP-03) still encrypts everything on the wire.
+- **Option A:** `PURE_PLAINTEXT_WIRE_FORMAT_POLICY` for the group. The outer kind-445 layer (ChaCha20Poly1305 keyed by `group_event_key` per MIP-03) still encrypts everything on the wire.
 - **Option B:** Patch OpenMLS upstream for mixed-outgoing wire format.
 - **Option C:** Move to a Marmot-specific leave proposal type — see §3.
 
@@ -109,7 +108,7 @@ Wire value 0x000a, empty body, MUST PublicMessage. Inherits MLS Extensions valid
 `ProposalType::Custom(marmot-assigned-u16)`, extensible body, free wire format.
 
 ### Path 3: Hedge — abstract at the engine trait
-The spike's `SendIntent::Leave { group_id }` is already abstract. Ship standard today, document the inheritance, keep the option open.
+`SendIntent::Leave { group_id }` is already abstract. Ship standard today, document the inheritance, keep the option open.
 
 **Recommendation (unchanged):** Path 3. Standard SelfRemove today. Document MIP-03's inheritance explicitly. Watch for (a) OpenMLS mixed-outgoing support landing upstream, (b) demand for richer leave semantics (reason codes, replacement-admin nomination, soft-leave), and (c) any future MIP that references pending SelfRemoves from external commits. If (c) happens, the PublicMessage requirement becomes load-bearing for Marmot too, and the custom path becomes weaker.
 
@@ -318,7 +317,7 @@ Each MIP was read in full. For each, the analysis is based on what the MIP actua
 
 Each has a different lifecycle, different update-frequency, and different "who cares about this." The monolithic versioning (single version field, append-only fields) means any change to any field is a group-wide extension version bump.
 
-My spike proposed splitting into `BasicGroupData` + `NostrTransportData`. In light of the Safe Extensions framework, the more principled split is into **multiple `AppDataDictionary` entries under the Safe framework** — one ComponentID per coherent concern. For example:
+The earlier architecture split was `BasicGroupData` + `NostrTransportData`. In light of the Safe Extensions framework, the more principled split is into **multiple `AppDataDictionary` entries under the Safe framework** — one ComponentID per coherent concern. For example:
 - ComponentID `0x8001` → GroupIdentity { name, description, image_* }
 - ComponentID `0x8002` → NostrTransport { nostr_group_id, relays }
 - ComponentID `0x8003` → MarmotAdmins { admin_pubkeys }
@@ -528,7 +527,7 @@ One-identity-scoped-leave is naturally modelled as "any of my devices authors `I
 
 **Wire format.** `IdentityRemove` is Marmot-only — no external-commit interop pressure (MIP-06's External Commits are narrowly constrained and don't reference pending proposals). Can be PrivateMessage. No OpenMLS wire-format-policy issue.
 
-**Committer ≠ target identity.** If `IdentityRemove` targets the committer's own identity, the committer is in the removed set, violating RFC 9420 §12.2. Enforce: "the committer's credential identity MUST NOT equal the target identity of any `IdentityRemove` proposal in the commit." This mirrors SelfRemove's rule and produces the same auto-commit-by-remaining-member pattern the spike already implements.
+**Committer ≠ target identity.** If `IdentityRemove` targets the committer's own identity, the committer is in the removed set, violating RFC 9420 §12.2. Enforce: "the committer's credential identity MUST NOT equal the target identity of any `IdentityRemove` proposal in the commit." This mirrors SelfRemove's rule and uses the same auto-commit-by-remaining-member pattern.
 
 **Admin depletion.** `IdentityRemove` targeting an admin identity must trigger the same admin-depletion check as SelfRemove (MIP-03 §150): after applying, at least one active-admin leaf must remain. If the target is the last-admin identity, the commit MUST be rejected. Scenario F (last admin leaves) needs the admin-first-self-demote flow from MIP-01/MIP-03, but at the identity level: demote all of their admin status via a GroupContextExtensions update first, then `IdentityRemove` themselves.
 
@@ -540,7 +539,7 @@ One-identity-scoped-leave is naturally modelled as "any of my devices authors `I
 
 **Proposal-time vs commit-time resolution.** Commit-time. This is the feature that distinguishes `IdentityRemove` from Option 1's bundle — at commit-time, the MLS implementation walks the post-proposals ratchet tree and expands the one proposal into the correct N leaf-removes.
 
-**Race handling: auto-commit rule.** Analogous to SelfRemove's lowest-index-remaining-member rule (documented in spike-findings.md): among remaining members whose credential identity is NOT the target, the lowest-leaf-index member auto-commits. Others observe the commit via normal inbound and advance.
+**Race handling: auto-commit rule.** Analogous to SelfRemove's lowest-index-remaining-member rule: among remaining members whose credential identity is NOT the target, the lowest-leaf-index member auto-commits. Others observe the commit via normal inbound and advance.
 
 **Interaction with MIP-06 multi-device signaling.** `IdentityRemove` only makes sense in groups where multi-device is possible. In a group where every user has exactly one leaf, `IdentityRemove` and `SelfRemove`/`Remove` collapse to the same outcome. This means `IdentityRemove` could be gated on `marmot_multi_device` (`0xF2F0`) being enabled — or it could work universally with the identity→leaves map being trivially 1-to-1 in non-multi-device groups.
 

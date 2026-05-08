@@ -3,6 +3,7 @@ title: "Target Architecture — Four Components"
 created: 2026-04-19
 tags: [marmot, overview, architecture, components]
 status: overview
+updated: 2026-05-08
 ---
 
 # Target Architecture — Four Components
@@ -42,7 +43,7 @@ Takes `TransportMessage` in from the transport layer; produces `GroupEvent` out.
 ### 3. TransportPeeler
 The explicit seam where a specific transport format meets a specific CGKA backend. For MLS-over-Nostr there's one peeler (`NostrMlsPeeler`); for MLS-over-FIPS-mesh there'd be a different one. Its job: wrap CGKA ciphertext with the transport envelope (outbound), unwrap the transport envelope to get CGKA ciphertext (inbound).
 
-Two-path interface (per spike findings): group messages use exporter-secret encryption; welcomes use recipient-pubkey encryption. Same trait, two crypto paths.
+Two-path interface: group messages use group/epoch material; welcomes use recipient-addressed encryption. Same trait, two crypto paths.
 
 ### 4. TransportAdapter
 Moves opaque blobs. Publishes `TransportMessage`s; subscribes to inbound streams. Never sees plaintext. For Nostr: wraps blobs in kind 445 / 1059 events and publishes to relays. For FIPS: wraps in mesh frames. For HTTP/P2P/BLE: whatever's appropriate.
@@ -89,9 +90,18 @@ This prevents the engine from advancing past a commit that never made it to the 
 
 ---
 
-## The spike validated this shape
+## Current implementation status
 
-April 2026 implementation spike built all four components as separate Rust crates (`cgka-engine`, `transport`, `mdk-spike`, `nostr-adapter`, `nostr-mls-peeler`, `whitenoise-core-spike`, `dm-cli`) and ran a 4-terminal chat across real Nostr relays. Boundaries held. Cross-boundary types needed tightening — those amendments are in [`../further-context/spike-findings.md`](../further-context/spike-findings.md).
+The active workspace proves the shape without the old prototype tree:
+
+- `crates/traits` defines the cross-boundary types.
+- `crates/cgka-engine` implements the OpenMLS-backed engine candidate.
+- `crates/storage-memory` provides in-memory storage and rollback snapshots.
+- `crates/cgka-conformance-simulator` drives multi-client scenarios, generated
+  delivery variants, and property tests over the engine.
+
+The production perimeter is still outside this workspace: real transport
+adapters, production storage, packaging, and app integration.
 
 ---
 
@@ -99,4 +109,4 @@ April 2026 implementation spike built all four components as separate Rust crate
 
 - Deep reference: [`../further-context/target-architecture.md`](../further-context/target-architecture.md)
 - CGKA engine trait specifics: [`../further-context/cgka-engine-design.md`](../further-context/cgka-engine-design.md)
-- What each boundary type needs: [`../further-context/spike-findings.md`](../further-context/spike-findings.md)
+- Canonicalization contract: [`../cgka-engine-canonicalization-contract.md`](../cgka-engine-canonicalization-contract.md)

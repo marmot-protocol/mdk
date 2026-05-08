@@ -77,7 +77,7 @@ A standardized toolkit for application-layer subsystems inside MLS groups:
 
 Motivated by MIP-06 multi-device: a user with N devices who wants to leave a group must currently SelfRemove from each device individually. An admin kicking such a user must bundle N Remove proposals and hope none are missed due to race. Both are fragile.
 
-Recommended shape: `ProposalType::Custom(marmot-assigned-u16)` carrying a target identity. Resolves to leaves at commit-time (not proposal-time, to capture new leaves added during the race window). Committed by any remaining non-same-identity member, following the same auto-commit-by-lowest-index-remaining rule the spike developed for SelfRemove. Stands outside the Safe framework.
+Recommended shape: `ProposalType::Custom(marmot-assigned-u16)` carrying a target identity. Resolves to leaves at commit-time (not proposal-time, to capture new leaves added during the race window). Committed by any remaining non-same-identity member, following the same lowest-index-remaining auto-commit rule used for SelfRemove. Stands outside the Safe framework.
 
 Deep design in [`../further-context/custom_extensions.md`](../further-context/custom_extensions.md) §7.
 

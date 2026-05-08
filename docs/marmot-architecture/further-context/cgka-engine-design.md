@@ -11,6 +11,12 @@ related:
 
 # CGKA Engine Design
 
+> **Reference status.** This is the older long-form engine design. The current
+> implementation lives in `crates/cgka-engine`, with the post-peeling contract
+> in [`../cgka-engine-canonicalization-contract.md`](../cgka-engine-canonicalization-contract.md).
+> Treat trait sketches below as design history when they differ from
+> `crates/traits`.
+
 **The problem this solves:** MDK today is a monolithic struct with no clean internal boundaries, Nostr types leaking into storage, and capabilities as hardcoded constants. This creates the compatibility breaks we've already seen (self-remove), makes testing hard, and makes the codebase difficult to reason about. This document defines what the CGKA Engine should look like — as a trait, as a set of internal state machines, and as a storage design — so that engineers have a concrete target to build toward.
 
 A detailed look at how the CGKA Engine layer should be structured — what traits it exposes, what state machines it contain, how storage fits in, and where the current MDK codebase is well-designed vs. where it needs rethinking.

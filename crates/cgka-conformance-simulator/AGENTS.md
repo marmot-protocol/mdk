@@ -12,7 +12,7 @@ Read [`README.md`](README.md) for the human framing. This file is the agent-faci
 | `src/convergence.rs` | Model-level candidate-state graph scoring rules for the distributed convergence design. These tests do not drive OpenMLS yet; they pin policy before the engine canonicalizer lands. |
 | `src/family.rs` | Deterministic generated scenario families. `generate_send_leave_family` and `generate_convergence_e2e_delivery_family` record family name, generator version, seed, case index, and a runnable `ScenarioSpec`. `run_generated_case_report` adds generated metadata to report artifacts. |
 | `src/openmls_projection.rs` | Bytes-first OpenMLS projection and candidate materialization helpers. Parses MLS bytes, replays candidate paths against a snapshot, observes proposal refs / staged commits / app decryptions, rolls storage back, and can run the canonicalizer with OpenMLS-derived pending proposal/app-message evidence. |
-| `src/peeler.rs` | `MockPeeler` — pass-through. Group messages and welcomes go through distinct methods (matches the real `TransportPeeler` four-method shape from spike-findings §1.3) but the body is just length-prefixed framing, no encryption. Transport ids/timestamps are deterministic per client so vector traces stay stable despite OpenMLS randomness. |
+| `src/peeler.rs` | `MockPeeler` — pass-through. Group messages and welcomes go through distinct methods, matching the production `TransportPeeler` four-method shape, but the body is just length-prefixed framing with no encryption. Transport ids/timestamps are deterministic per client so vector traces stay stable despite OpenMLS randomness. |
 | `src/proptest_support.rs` | `intent_seq(n_clients, range)` proptest strategy. Generates `HarnessIntent::Send` and `HarnessIntent::Leave`; `delivery_profile()` covers FIFO, reverse, and seeded-random delivery. |
 | `src/scenario.rs` | Serializable `ScenarioSpec` v1 plus `run_scenario_spec` / `run_scenario_report`. Drives ordered client operations from JSON-shaped scenario data and returns either a `ScenarioTrace` or a serializable report with metadata, step log, flattened epoch changes, app invalidations, recoveries, and invariant failures. |
 | `src/vector.rs` | `ScenarioTrace` and observations. Records final epoch/member/payload facts plus member additions/removals, epoch changes, app invalidations, and `ForkRecoveryObservation` entries from `GroupEvent::ForkRecovered`. |
@@ -101,8 +101,8 @@ cargo run -p cgka-conformance-simulator --bin cgka-conformance-simulator-report 
 
 1. New `proptest!` block in `tests/proptest_invariants.rs`.
 2. If you need new intent kinds, extend `HarnessIntent` in `src/proptest_support.rs` and the matching strategy fn.
-3. Encode the invariant as `prop_assert_unique(actual, expected, msg)` — the helper panics on mismatch so shrinking works.
-4. Default `cases` is 24; the `conformance-slow` feature lifts it to 1000. Don't hand-tune per-test counts.
+3. Encode the invariant with `prop_assert(actual, expected, msg)` when comparing model values; the helper panics with useful context so shrinking keeps the original failure visible.
+4. Use one config per `proptest!` block. Harness-heavy properties default to smaller case counts; pure selector/canonicalization properties can run more cases. The `conformance-slow` feature should lift release-check properties to 1000 cases.
 
 ## Coverage gaps
 
@@ -110,7 +110,7 @@ These are tracked in [`../../plans/2026-05-04-cgka-conformance-simulator-vectors
 
 - **`HarnessIntent` does not generate Invite / UpgradeCapabilities / UpdateGroupData.** Invite needs client minting inside a strategy; the scripted tests cover it today.
 - **Partition policy is scripted, not strategy-driven.** The bus supports partitions; proptest currently drives FIFO / Reverse / SeededRandom.
-- **Only one generated family exists.** `send-leave/v1` records replay metadata; invite races, group-data updates, and publish confirm/fail families are still future work.
+- **Only two generated families exist.** `send-leave/v1` records lifecycle metadata, and `convergence-e2e-delivery/v1` mutates the convergence E2E bridge with duplicate/delay/reorder delivery. Invite races, group-data updates, publish confirm/fail families, and broader failure minimization are still future work.
 - **Failure minimization is represented but not implemented.** Reports expose `minimized_case`, but there is no shrinker yet.
 
 ## Conventions

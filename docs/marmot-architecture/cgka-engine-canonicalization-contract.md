@@ -54,9 +54,10 @@ same anchor
 The canonical branch is selected by protocol evidence. Local arrival order is
 only an implementation detail.
 
-Lifecycle outputs also depend on local monotonic time. `sync_state` and
-`publishable_outbound_messages` are deterministic when the engines also have
-the same `last_convergence_relevant_input_time`, `stable_quiescence_ms`, and
+Lifecycle outputs also depend on local monotonic time. `sync_state` is a
+derived result, not an input claim. `sync_state` and
+`publishable_outbound_messages` are deterministic when engines also have the
+same `last_convergence_relevant_input_time`, `stable_quiescence_ms`, and
 current monotonic clock reading.
 
 ## Lifecycle

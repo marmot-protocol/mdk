@@ -16,10 +16,10 @@ In-process multi-client simulator for the CGKA engine. Lets us replay scripted s
 ## Run the tests
 
 ```sh
-# Default: scripted scenarios + proptest with 24 cases (~1 s).
+# Default: scripted scenarios plus the normal proptest case counts.
 cargo test -p cgka-conformance-simulator
 
-# Pre-release validation: 1000 proptest cases per property.
+# Pre-release validation: slow properties raise their case count to 1000.
 cargo test -p cgka-conformance-simulator --features conformance-slow
 ```
 

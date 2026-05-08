@@ -47,8 +47,7 @@ pub(crate) enum AutoCommitDecision {
 ///    target — if we were, we'd produce an invalid commit and OpenMLS
 ///    would reject it. Enforcing here gives a clean typed early exit
 ///    instead of an opaque MLS error.
-/// 3. We are the lowest-index remaining non-target member (Marmot
-///    fork-avoidance — `docs/learnings.md:112`).
+/// 3. We are the lowest-index remaining non-target member.
 ///
 /// Admin checks are partly enforced by send-time guards and partly here:
 /// if the leaver is the only admin, this policy observes instead of

@@ -215,7 +215,6 @@ async fn openmls_materializes_competing_commit_paths_from_same_anchor() {
             state: CanonicalizationState {
                 current_tip_epoch: 1,
                 retained_anchor_epoch: 1,
-                sync_state: SyncState::Stable,
                 last_convergence_relevant_input_ms: 0,
                 seen_message_ids: BTreeSet::new(),
             },
@@ -314,7 +313,6 @@ async fn openmls_canonicalization_maps_consumed_proposal_refs_to_pending_proposa
             state: CanonicalizationState {
                 current_tip_epoch: 1,
                 retained_anchor_epoch: 1,
-                sync_state: SyncState::Stable,
                 last_convergence_relevant_input_ms: 0,
                 seen_message_ids: BTreeSet::new(),
             },
@@ -423,7 +421,6 @@ async fn openmls_canonicalization_uses_app_messages_as_branch_witnesses() {
             state: CanonicalizationState {
                 current_tip_epoch: 1,
                 retained_anchor_epoch: 1,
-                sync_state: SyncState::Stable,
                 last_convergence_relevant_input_ms: 0,
                 seen_message_ids: BTreeSet::new(),
             },
@@ -543,7 +540,6 @@ async fn stored_openmls_messages_reconstruct_canonicalization_batch() {
         CanonicalizationState {
             current_tip_epoch: 1,
             retained_anchor_epoch: 1,
-            sync_state: SyncState::Stable,
             last_convergence_relevant_input_ms: 0,
             seen_message_ids: BTreeSet::new(),
         },
@@ -653,7 +649,6 @@ async fn stored_openmls_canonicalization_persists_message_dispositions() {
         CanonicalizationState {
             current_tip_epoch: 1,
             retained_anchor_epoch: 1,
-            sync_state: SyncState::Stable,
             last_convergence_relevant_input_ms: 0,
             seen_message_ids: BTreeSet::new(),
         },
@@ -762,7 +757,6 @@ async fn stored_openmls_canonicalization_applies_selected_branch_to_retained_gro
         CanonicalizationState {
             current_tip_epoch: 1,
             retained_anchor_epoch: 1,
-            sync_state: SyncState::Stable,
             last_convergence_relevant_input_ms: 0,
             seen_message_ids: BTreeSet::new(),
         },
@@ -884,7 +878,6 @@ async fn retained_anchor_late_commit_within_horizon_is_resolved() {
         CanonicalizationState {
             current_tip_epoch: 1,
             retained_anchor_epoch: 1,
-            sync_state: SyncState::Stable,
             last_convergence_relevant_input_ms: 0,
             seen_message_ids: BTreeSet::new(),
         },
@@ -909,7 +902,6 @@ async fn retained_anchor_late_commit_within_horizon_is_resolved() {
         CanonicalizationState {
             current_tip_epoch: 2,
             retained_anchor_epoch: 1,
-            sync_state: SyncState::Stable,
             last_convergence_relevant_input_ms: 0,
             seen_message_ids: BTreeSet::new(),
         },
@@ -993,7 +985,6 @@ async fn retained_anchor_missing_anchor_reports_error_without_mutation() {
         CanonicalizationState {
             current_tip_epoch: 1,
             retained_anchor_epoch: 1,
-            sync_state: SyncState::Stable,
             last_convergence_relevant_input_ms: 0,
             seen_message_ids: BTreeSet::new(),
         },
@@ -1021,7 +1012,6 @@ async fn retained_anchor_missing_anchor_reports_error_without_mutation() {
         CanonicalizationState {
             current_tip_epoch: 2,
             retained_anchor_epoch: 1,
-            sync_state: SyncState::Stable,
             last_convergence_relevant_input_ms: 0,
             seen_message_ids: BTreeSet::new(),
         },
@@ -1101,7 +1091,6 @@ async fn retained_anchor_commit_beyond_anchor_is_invalidated() {
         CanonicalizationState {
             current_tip_epoch: 1,
             retained_anchor_epoch: 1,
-            sync_state: SyncState::Stable,
             last_convergence_relevant_input_ms: 0,
             seen_message_ids: BTreeSet::new(),
         },
@@ -1138,7 +1127,6 @@ async fn retained_anchor_commit_beyond_anchor_is_invalidated() {
         CanonicalizationState {
             current_tip_epoch: 2,
             retained_anchor_epoch: 1,
-            sync_state: SyncState::Stable,
             last_convergence_relevant_input_ms: 0,
             seen_message_ids: BTreeSet::new(),
         },
@@ -1163,7 +1151,6 @@ async fn retained_anchor_commit_beyond_anchor_is_invalidated() {
         CanonicalizationState {
             current_tip_epoch: 3,
             retained_anchor_epoch: 2,
-            sync_state: SyncState::Stable,
             last_convergence_relevant_input_ms: 0,
             seen_message_ids: BTreeSet::new(),
         },

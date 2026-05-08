@@ -1,11 +1,10 @@
 ---
 title: "Required Features — What Marmot the Protocol Defines, and What It Doesn't"
 created: 2026-04-19
-updated: 2026-04-19
+updated: 2026-05-08
 tags: [marmot, architecture, protocol, interop, capability-negotiation, decoupling]
 status: principles
 related:
-  - [[marmot-architecture/direction-and-conclusions]]
   - [[marmot-architecture/target-architecture]]
   - [[marmot-architecture/capability-negotiation]]
   - [[marmot-architecture/custom_extensions]]
@@ -115,7 +114,7 @@ The protocol line stops at message content *interpretation* and everything above
 
 ## 4. Technology decoupling — the swap points
 
-A major goal going forward is to make sure that **no specific underlying technology choice is baked into what "Marmot" means**. The protocol should be expressible independently of its current implementation stack. The spike started this with explicit trait boundaries; we continue in that direction and go deeper.
+A major goal going forward is to make sure that **no specific underlying technology choice is baked into what "Marmot" means**. The protocol should be expressible independently of its current implementation stack. The current target architecture uses explicit trait boundaries to keep that true.
 
 ### 4.1 CGKA backend — swappable
 MLS (RFC 9420, via OpenMLS) is Marmot's CGKA today. That's an implementation choice, not a protocol requirement. The protocol package defines a `CgkaEngine` interface; any CGKA that can satisfy it (a different MLS library, a future BeeKEM-based CGKA, a hypothetical causal-order CGKA) could be the backend. The CGKA backend is the interoperability boundary — clients in the same group must use the same CGKA — but **which CGKA** is a swappable decision.
@@ -130,7 +129,7 @@ Blossom is the content-addressed blob storage Marmot uses today for encrypted me
 Nostr is Marmot's identity backend, and per `nostr-role-in-marmot.md` this is foundational and **not intended to be swappable** the way the others are. Marmot is built on Nostr identity deliberately. But the structural boundary still matters: the protocol package should be clear about which parts are Nostr-identity-specific (credential format, `kind: 450` proof pattern, NIP-44 for device-to-device encryption) vs. which parts are transport-layer Nostr use (kind 445, kind 1059 — these are Nostr-transport, not Nostr-identity).
 
 ### 4.5 The general principle
-**The protocol package must not bake in the specifics of any replaceable technology.** Where a specific technology is in use today (MLS, Nostr relays, Blossom), the protocol should document the interface it needs from that technology and define how a replacement would plug in. The current spike's 7-crate decomposition (`cgka-engine`, `transport`, `mdk`, `nostr-adapter`, `nostr-mls-peeler`, `whitenoise-core`, `dm-cli`) is an instance of this principle; each swap point is a real crate boundary.
+**The protocol package must not bake in the specifics of any replaceable technology.** Where a specific technology is in use today (MLS, Nostr relays, Blossom), the protocol should document the interface it needs from that technology and define how a replacement would plug in. The current boundary model is `Application -> CgkaEngine -> TransportPeeler -> TransportAdapter`, with storage below the engine.
 
 ---
 
@@ -169,11 +168,9 @@ This is the single most important "baked into every client from the beginning" r
 
 ## 6. Relationship to other architecture docs
 
-- **[[marmot-architecture/direction-and-conclusions]]** — the big-picture direction this doc is a principle-level expression of.
 - **[[marmot-architecture/target-architecture]]** — the component-level architecture (CgkaEngine / TransportAdapter / TransportPeeler / application) that implements the decoupling described in §4.
 - **[[marmot-architecture/capability-negotiation]]** — the detailed design for what §5 of this doc requires.
 - **[[marmot-architecture/custom_extensions]]** — the decision framework for how to place a new custom primitive on the protocol-or-application line, including the Safe Extensions framework that informs how new protocol-level data should be structured.
-- **[[marmot-architecture/spike-findings]]** — concrete boundary-crossing type amendments from the spike that exercise the decoupling in §4.
 
 ---
 

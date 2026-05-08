@@ -1,6 +1,9 @@
-# Spike Learnings
+# Historical Engineering Learnings
 
-Running log of surprises, rough edges, and design frictions hit while building the marmot-stack spike. Bias toward capturing what was *unexpected*, not what worked smoothly.
+Historical log of surprises, rough edges, and design frictions from the early
+Marmot architecture work. This file is kept for archaeology only. Current
+contracts live in `docs/marmot-architecture/`, `crates/*/README.md`, and
+`crates/*/AGENTS.md`.
 
 Format: date → area → observation → takeaway for the real system.
 
@@ -8,7 +11,7 @@ Format: date → area → observation → takeaway for the real system.
 
 ## 2026-04-25 — Production refactor in progress
 
-The CGKA engine production refactor (`plans/2026-04-22-cgka-engine-production-refactor-v1.md`) is largely complete. The spike tree has been moved to `spike/` (sealed, still buildable in isolation). The new workspace lives at the repo root with four crates:
+The CGKA engine production refactor (`plans/2026-04-22-cgka-engine-production-refactor-v1.md`) is largely complete. The old prototype tree has since been removed. The workspace lives at the repo root with four crates:
 
 - `crates/traits` — shared trait surface + value types (zero Nostr leakage; verified by grep)
 - `crates/cgka-engine` — OpenMLS-backed `CgkaEngine` impl
@@ -18,7 +21,7 @@ The CGKA engine production refactor (`plans/2026-04-22-cgka-engine-production-re
 Test totals at this checkpoint: ~80 tests across the workspace, 0 failing.
 
 Key corrections to earlier spike claims surfaced during implementation:
-- §3.2 of `spike-findings.md` (and learnings entry #8 above): the spike said per-leaf `Capabilities` access was blocked by `MlsGroup::member_at`. Implementation revealed the deeper truth: `LeafNode::capabilities()` IS public, but `MlsGroup::public_group()` is `pub(crate)`. The cache (`CapabilityStorage`) is **load-bearing for correctness**, populated from KeyPackages we directly handle (invite path, ingested commits' Add proposals) plus `MlsGroup::own_leaf_node()` for self.
+- Earlier notes said per-leaf `Capabilities` access was blocked by `MlsGroup::member_at`. Implementation revealed the deeper truth: `LeafNode::capabilities()` IS public, but `MlsGroup::public_group()` is `pub(crate)`. The cache (`CapabilityStorage`) is **load-bearing for correctness**, populated from KeyPackages we directly handle (invite path, ingested commits' Add proposals) plus `MlsGroup::own_leaf_node()` for self.
 - The creator's commit at `create_group` has no consumer — every other initial member lands via welcome with the post-commit state. Dropped from the engine output; new `SendResult::GroupCreated { welcomes, pending }` variant. Side-benefit: the welcome-before-commit `AlreadyAtEpoch` bounce that this learnings file cataloged earlier no longer fires for initial creation (still fires for invites, where existing members do need the commit).
 
 Now landed after this checkpoint: publish-before-apply, MIP-03 admin guards, first-pass deterministic fork recovery, and recovery observations in the canonical trace surface. Remaining recovery work is productionizing snapshot retention and packaging portable vectors beyond Rust tests.
@@ -29,7 +32,7 @@ See `crates/cgka-engine/tests/AGENTS.md` for the test-tier map and `crates/cgka-
 
 ## 2026-05-04 — Fork recovery landed
 
-The first working `ForkRecoveryManager` is in `crates/cgka-engine/src/fork_recovery.rs`. Same-epoch competing commits now use a deterministic ordering key: earlier `TransportMessage::timestamp` wins, with `MessageId` bytes as the tie-break. If a late inbound commit beats the local incumbent, the engine rolls storage back to the pre-commit snapshot and replays the winning commit. If it loses, the message becomes stale with `AlreadyAtEpoch`.
+The first working `ForkRecoveryManager` is in `crates/cgka-engine/src/fork_recovery.rs`. Same-epoch competing commits now use a deterministic content-derived ordering key: `SHA-256(mls_bytes)`, scoped by source epoch, with the lower digest winning. If a late inbound commit beats the local incumbent, the engine rolls storage back to the pre-commit snapshot and replays the winning commit. If it loses, the message becomes stale with `AlreadyAtEpoch`.
 
 Storage snapshots are now part of engine correctness, not a dormant hook. `storage-memory` snapshots the full OpenMLS memory map as a pragmatic harness backend. A production backend should snapshot group-scoped OpenMLS rows plus CGKA metadata atomically, add retention/pruning, and persist enough ordering metadata to recover after restart.
 

@@ -1,5 +1,10 @@
 # CGKA Engine — Reliable State-Machine Refactor
 
+> **Historical plan.** This records the April refactor sequence. The prototype
+> tree and dedicated spike-findings docs were removed on 2026-05-08. Treat
+> references to those artifacts as historical context; current contracts live in
+> `docs/marmot-architecture/`, `crates/*/README.md`, and `crates/*/AGENTS.md`.
+
 ## Objective
 
 Replace the spike code with a well-tested, well-commented CGKA engine built around a correctly modeled state machine. The deliverable is an OpenMLS-backed `CgkaEngine` implementation that:
@@ -17,7 +22,7 @@ Decisions captured from the clarifying round (reference only — not tasks):
 - **Scope:** engine trait crate + OpenMLS-backed implementation + `TransportPeeler` trait. No concrete peeler, no adapters, no wiring.
 - **Storage:** traits + in-memory backend; SQLite deferred.
 - **State machines:** `EpochState` (including `Recovering`) + minimal `WelcomeState`; skip `MemberState`.
-- **Fork recovery:** same-epoch commit races recover inside the CGKA engine using deterministic transport ordering plus storage snapshots. `EngineError::ForkedEpoch` remains the unrecoverable fallback.
+- **Fork recovery:** same-epoch commit races recover inside the CGKA engine using deterministic ordering plus storage snapshots. `EngineError::ForkedEpoch` remains the unrecoverable fallback.
 - **Wire format:** stay on `PURE_PLAINTEXT_WIRE_FORMAT_POLICY` with an explicit "revisit before external rollout" marker.
 - **Testing:** in-process multi-client simulator + property-based tests + mock-peeler fixture tests. Scenario DSL deferred.
 - **KeyPackages:** generation + validation only; expiry/refresh deferred.
@@ -248,7 +253,7 @@ Internal subsystems per `cgka-engine-design.md:214-233`. Each is a module inside
 
 1. **External vector fixture packaging.** `ScenarioTrace` now records recovery observations, but vectors still live as Rust tests. Next step is a language-neutral fixture format plus a runner contract.
 2. **Production snapshot backend.** `storage-memory` snapshots the full OpenMLS memory map. A SQLite backend should snapshot the group-scoped OpenMLS rows and CGKA metadata atomically, with retention/pruning modeled after the MDK snapshot manager.
-3. **Transport ordering key receipt.** The current winner key is `(TransportMessage::timestamp, MessageId)`. Real adapters must define whether those values come from pre-publish wrapping or post-publish transport receipt, then persist the final key for restart-safe recovery.
+3. **Fork recovery key history.** Superseded: the first recovery sketch used `(TransportMessage::timestamp, MessageId)`. The current engine uses a content-derived key, `SHA-256(mls_bytes)` scoped by source epoch, so transport receipt metadata is no longer part of the recovery winner rule.
 
 ### What's solid (don't churn)
 

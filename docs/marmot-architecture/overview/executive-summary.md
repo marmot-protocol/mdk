@@ -3,6 +3,7 @@ title: "Marmot — Executive Summary"
 created: 2026-04-19
 tags: [marmot, overview, executive-summary]
 status: overview
+updated: 2026-05-08
 ---
 
 # Marmot — Executive Summary
@@ -68,11 +69,15 @@ The core technical challenge: **MLS requires total linear ordering of group-stat
 - ✅ Spec merged for MIP-00 through MIP-05; MIP-06 multi-device in PR.
 - ✅ MDK (Rust) and Marmot-TS (TypeScript) both implement the merged spec.
 - ✅ whitenoise-rs client reference implementation running against real Nostr relays.
-- ✅ April 2026 implementation spike validated the 4-component architecture end-to-end across 4 terminals on a real relay.
+- ✅ Current CGKA engine workspace implements the OpenMLS-backed engine
+  candidate, convergence model, simulator harness, generated delivery variants,
+  property tests, and Tamarin proofs for the branch-selection core.
 - 🚧 MDK (~66K LOC) and whitenoise-rs (~100K LOC) are larger than their target shapes — decomposition follow-up needed.
 - 🚧 MIP structure being rethought — per-feature MIPs cause scatter; component-based reorg being considered.
 - 🚧 Safe framework adoption blocked on backend library support; needs investigation.
 - 🚧 `IdentityRemove` custom proposal type identified as the first needed Marmot-custom MLS proposal.
+- 🚧 Production storage, transport adapters, and app integration remain outside
+  the current engine simulator.
 
 ---
 

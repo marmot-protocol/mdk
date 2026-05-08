@@ -3,6 +3,7 @@ title: "Capability Negotiation"
 created: 2026-04-19
 tags: [marmot, overview, capability-negotiation, interop]
 status: overview
+updated: 2026-05-08
 ---
 
 # Capability Negotiation
@@ -75,11 +76,16 @@ This is the single most important "baked into every client from the beginning" r
 
 ---
 
-## Validated in the spike
+## Current implementation status
 
-The April 2026 spike registered three `RequirementLevel` shapes (Required, Optional, TransportRequired), exercised intersection-based group creation, and demonstrated negative-case rejection when a member's KeyPackage didn't advertise a required capability — with a structured error naming exactly what was missing.
+The current engine has runtime `FeatureRegistry` support, required/optional
+capability registration, group creation checks, invite checks, and structured
+errors for missing capabilities.
 
-Open gap: per-leaf `Capabilities` access isn't publicly exposed by OpenMLS 0.8, so `feature_status` can't definitively distinguish `Upgradeable` from `Unavailable` without additional member-capability caching. Tracked in spike findings.
+The per-leaf capability cache is still load-bearing: OpenMLS exposes
+capabilities on leaf nodes, but the engine cannot walk arbitrary public-group
+leaves through a stable public API in the shape we need. The cache is populated
+from KeyPackages, staged Add proposals, and the local member's own leaf node.
 
 ---
 

@@ -1,103 +1,101 @@
 ---
 title: "Current State — Implementations & Spec"
 created: 2026-04-19
+updated: 2026-05-08
 tags: [marmot, overview, current-state, implementations]
 status: overview
 ---
 
 # Current State — Implementations & Spec
 
-Where Marmot is today (April 2026): a merged spec, two independent protocol implementations, one client reference implementation, and a recent spike that validated the target architecture.
-
----
+Where Marmot is today: the merged MIPs define the deployed protocol shape,
+MDK and Marmot-TS give us independent implementations, and this repository now
+contains the candidate CGKA engine/convergence workspace that is being shaped
+into spec text.
 
 ## The spec
 
 **Merged MIPs:**
-- **MIP-00** — Credentials & KeyPackages (identity binding, kind 30443)
-- **MIP-01** — Group Construction & `marmot_group_data` extension
-- **MIP-02** — Welcomes (kind 1059 gift-wrap of kind 444 rumor)
-- **MIP-03** — Group Messages (kind 445 outer wrap, SelfRemove per MLS Extensions draft)
-- **MIP-04** — Encrypted Media (per-file keys via exporter-derived HKDF, Blossom storage)
-- **MIP-05** — Push Notifications (MIP-optional, kinds 447/448/449 for token gossip)
+- **MIP-00** — Credentials & KeyPackages
+- **MIP-01** — Group Construction & `marmot_group_data`
+- **MIP-02** — Welcomes
+- **MIP-03** — Group Messages and SelfRemove
+- **MIP-04** — Encrypted Media
+- **MIP-05** — Push Notifications
 
-**In PR:**
-- **MIP-06** — Multi-Device Support (External Commit-based pairing, `marmot_multi_device` extension 0xF2F0, `encrypted_device_name` extension 0xF2EF, `kind: 450` identity proof pattern, `join_psk` via exporter)
+**In PR / design:**
+- **MIP-06** — Multi-Device Support
+- **CGKA engine canonicalization** — post-peeling commit/proposal/app-message
+  contract in [`../cgka-engine-canonicalization-contract.md`](../cgka-engine-canonicalization-contract.md)
+- **Distributed convergence** — deterministic branch selection for unordered
+  transport input in [`../distributed-convergence.md`](../distributed-convergence.md)
 
-**Concrete spec pain point:** changes to many features scatter across multiple MIPs. This is being rethought — see [`direction.md`](./direction.md).
-
----
+The current spec pressure point is commit ordering. MLS wants one ordered commit
+log; Nostr and other transports may deliver unordered, duplicated, delayed
+input. The engine contract is where that mismatch gets resolved.
 
 ## Protocol implementations
 
-### MDK (Rust) — ~66K LOC across 6 crates
-- `mdk-core` — MLS/Nostr integration, group ops, message processing
-- `mdk-sqlite-storage` — SQLCipher-backed persistent storage
-- `mdk-memory-storage` — in-memory storage for testing
-- `mdk-storage-traits` — storage abstraction
-- `mdk-uniffi` — FFI bindings (Swift/Kotlin/Python)
-- `mdk-macros` — builder/setter proc macros
+### MDK (Rust)
 
-OpenMLS 0.8.1 under the hood. Wrapped with Nostr-aware API today (`process_message` takes `nostr::Event`); target is a Nostr-agnostic `CgkaEngine` trait.
+MDK is the deployed Rust protocol implementation. It still carries Nostr-aware
+API surface in places, but it remains the main source of production experience:
+persistent storage, OpenMLS integration, group operations, and current MIP
+coverage.
 
 ### Marmot-TS (TypeScript)
-Independent implementation of the Marmot protocol from scratch, written by a team member. Has already surfaced real stress points and spec ambiguities that MDK-alone would have missed silently. Continues to be invested in for protocol-hygiene purposes.
 
----
+Marmot-TS is an independent implementation. It is valuable because it catches
+spec ambiguity that a single reference implementation would normalize.
 
 ## Client reference implementation
 
-### whitenoise-rs (~100K LOC Rust) + whitenoise (Flutter, 66K LOC Dart)
-The primary Marmot client. whitenoise-rs wraps MDK with application concerns — account management, relay control plane, event processing, chat list, push notifications, scheduled tasks, database.
+### whitenoise-rs + whitenoise
 
-**Known architecture pain points:**
-- Global singleton struct with ~25 fields — testing and scope ownership are both hard.
-- 29 SQLx database modules with 45 sequential migrations.
-- `handle_mls_message.rs` is 2,329 LOC and touches everything.
-- Relay control plane migration in progress but incomplete — legacy and new paths coexist.
-- Session-projection refactor landing in ~19 phases, decomposing the singleton.
+whitenoise-rs is the application core for the Flutter client. It owns account
+management, relay control, event processing, chat projection, push
+notifications, and other app-layer work that should stay above the CGKA engine
+boundary.
 
----
+Known architecture pressure remains in the application layer: large database
+surface, relay-control migration, and event-processing complexity. Those are
+separate from the CGKA engine convergence work.
 
-## The April 2026 spike
+## Current CGKA engine workspace
 
-Built a 7-crate Rust workspace (`cgka-engine`, `transport`, `mdk-spike`, `nostr-adapter`, `nostr-mls-peeler`, `whitenoise-core-spike`, `dm-cli`) implementing the target architecture end-to-end. Validated across 4 terminals on `wss://relay.primal.net`:
+This repository now has the main engine candidate:
 
-- Group creation with capability negotiation
-- Invite (post-creation add)
-- Application messages (kind 9 chat inside MLS)
-- MIP-03 SelfRemove (spec-compliant via `leave_group_via_self_remove`, with auto-commit-by-lowest-index-remaining)
-- Capability rejection (negative test: `DM_DROP_CAPS=selfremove` correctly refuses group creation/invite)
+- `crates/traits` — cross-boundary value types and traits.
+- `crates/cgka-engine` — OpenMLS-backed engine implementation.
+- `crates/storage-memory` — in-memory storage and snapshot backend for tests.
+- `crates/cgka-conformance-simulator` — multi-client simulator, vectors,
+  generated scenarios, and property tests.
+- `formal/tamarin` — formal models for the convergence selector, delivery-order
+  robustness, lifecycle cases, and proof/test mapping.
 
-The 4-component architecture boundaries held. Cross-boundary types needed tightening (listed in spike-findings). See [`direction.md`](./direction.md) for the full findings and forward direction.
+The current engine can exercise the peeler-ingest boundary through in-memory
+clients, converge stored OpenMLS messages, emit application-visible group
+events, model losing-branch invalidations, and test generated delivery variants.
 
----
+## Known gaps
 
-## Known large items (not in the spike)
-
-- Relay control plane details (4 specialized planes, per-plane session management)
-- Push notification token management (MIP-05, 3,632 LOC)
-- Multi-step login flows (NIP-55 / Amber, 3,255 LOC)
-- User search (5-tier async pipeline)
-- Message aggregator (reactions, edits, delivery status)
-- Encrypted media (MIP-04 implementation, 2,338 LOC in MDK)
-
-Each of these will eventually get its own decomposition review under the target architecture.
-
----
-
-## Known spec/implementation gaps
-
-- **OpenMLS Safe Extensions framework support** — draft-09's Safe framework adoption is blocked on backend library support. Investigation needed.
-- **`IdentityRemove` proposal type** — identified as Marmot's first needed custom proposal but not yet specified or implemented.
-- **State machines** (`EpochState`, `WelcomeState`, `MemberState`) — in the design docs but not yet implemented in MDK.
-- **Fork recovery** — `EpochState::Recovering { buffered_events }` is sketched but not built.
-- **`marmot_group_data` split** — the long-term target of splitting this monolithic extension into multiple AppDataDictionary entries is not yet planned.
-
----
+- **Production persistence** — `storage-memory` proves the shape but is not a
+  production backend. SQLite snapshot retention and pruning still need design
+  and implementation.
+- **Production transport adapters** — the simulator uses an in-memory bus and
+  `MockPeeler`. Nostr/FIPS adapters live outside this engine workspace.
+- **Portable fork-recovery vectors** — fork recovery is tested in Rust, but
+  OpenMLS commit randomness makes stable external vectors harder.
+- **Safe Extensions framework support** — still gated on backend library
+  support and migration design.
+- **`IdentityRemove` proposal type** — identified as the first likely
+  Marmot-custom proposal, not specified or implemented.
+- **KeyPackage refresh/expiry policy** — still a higher-layer production
+  scheduling concern.
 
 ## See also
 
-- Deep reference (codebase metrics): [`../further-context/codebase-survey.md`](../further-context/codebase-survey.md)
-- Deep reference (whitenoise-rs analysis): [`../further-context/whitenoise-rs-deep-dive.md`](../further-context/whitenoise-rs-deep-dive.md)
-- Spike findings + amendments: [`../further-context/spike-findings.md`](../further-context/spike-findings.md)
+- Target architecture: [`target-architecture.md`](./target-architecture.md)
+- Direction: [`direction.md`](./direction.md)
+- Canonicalization contract: [`../cgka-engine-canonicalization-contract.md`](../cgka-engine-canonicalization-contract.md)
+- Distributed convergence: [`../distributed-convergence.md`](../distributed-convergence.md)

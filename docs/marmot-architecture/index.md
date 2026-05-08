@@ -1,18 +1,22 @@
 ---
 title: "Marmot Architecture — Index"
 created: 2026-04-15
-updated: 2026-04-21
+updated: 2026-05-08
 tags: [marmot, architecture, index]
 ---
 
 # Marmot Architecture — Index
 
-A clear-eyed technical reference for the Marmot stack — where it is today, where it's going, and why.
+A technical reference for the Marmot stack: where the current architecture
+stands, which contracts are becoming spec text, and which older notes are kept
+only for background.
 
 This wiki is organized in two tiers:
 
 1. **`overview/`** — **short, one-page docs**. Each covers one theme. Read these first; these are the docs to share with a new engineer.
-2. **`further-context/`** — **deep reference material**. Longer design docs, empirical spike findings, historical decision tracking, codebase surveys. Go here when you need depth on a topic, or when you're about to update the protocol itself.
+2. **`further-context/`** — **deep reference material**. Longer design docs,
+   historical decision tracking, codebase surveys, and older exploration notes.
+   Check the status banner before treating a further-context doc as current.
 
 ---
 
@@ -28,8 +32,8 @@ Written to be readable in 5 minutes each, shareable as a package.
 | [`overview/capability-negotiation.md`](./overview/capability-negotiation.md) | Why the capability system is load-bearing and what every client must implement. |
 | [`overview/custom-extensions.md`](./overview/custom-extensions.md) | The inherit-vs-define decision framework. The MLS Safe Extensions framework (draft-09). |
 | [`overview/nostr-role.md`](./overview/nostr-role.md) | Nostr's three distinct roles — identity, app message format, transport — and which are pluggable. |
-| [`overview/current-state.md`](./overview/current-state.md) | Implementations (MDK, Marmot-TS, whitenoise-rs, spike), merged MIPs, known gaps. |
-| [`overview/direction.md`](./overview/direction.md) | Where we're going. Conclusions from the April 2026 spike + spec exploration. |
+| [`overview/current-state.md`](./overview/current-state.md) | Implementations, merged MIPs, the current CGKA engine workspace, and known gaps. |
+| [`overview/direction.md`](./overview/direction.md) | Where we're going after the CGKA engine/convergence work. |
 
 **Read order for a new engineer:** executive-summary → protocol-boundary → target-architecture → capability-negotiation → nostr-role → custom-extensions → current-state → direction.
 
@@ -45,19 +49,11 @@ These are longer working documents. Go here when you need depth, not orientation
 |---|---|
 | [`cgka-engine-canonicalization-contract.md`](./cgka-engine-canonicalization-contract.md) | Draft CGKA engine canonicalization contract: post-peeling inputs, candidate-state graph, sync state, outputs, storage, conformance scenarios. |
 | [`distributed-convergence.md`](./distributed-convergence.md) | Draft convergence model for selecting one MLS branch from unordered multi-relay input. |
-| [`further-context/target-architecture.md`](./further-context/target-architecture.md) | The full target architecture with Rust trait sketches, data flow diagrams, migration path. |
-| [`further-context/cgka-engine-design.md`](./further-context/cgka-engine-design.md) | Detailed `CgkaEngine` trait design, internal subsystems, state machine enums, storage trait design, feature registry. |
+| [`further-context/target-architecture.md`](./further-context/target-architecture.md) | Older long-form target architecture with illustrative trait sketches. Current orientation lives in `overview/target-architecture.md`. |
+| [`further-context/cgka-engine-design.md`](./further-context/cgka-engine-design.md) | Older long-form `CgkaEngine` design. Current contract lives in the canonicalization and convergence docs. |
 | [`further-context/capability-negotiation.md`](./further-context/capability-negotiation.md) | Full capability negotiation design. The three queries, group creation, upgrade, admin action, MIP checklist. |
 | [`further-context/nostr-role-in-marmot.md`](./further-context/nostr-role-in-marmot.md) | Deep version of Nostr's three roles. What's spec-stable and what's transport-specific. |
 | [`further-context/custom_extensions.md`](./further-context/custom_extensions.md) | Full decision framework + per-MIP review + MLS Extensions Safe framework teaching + `IdentityRemove` design space. |
-
-### Spike artifacts (April 2026)
-
-| Doc | What it covers |
-|---|---|
-| [`further-context/direction-and-conclusions.md`](./further-context/direction-and-conclusions.md) | The landing document for the April 2026 exploration. Conclusions, directions, open questions, next steps, durability test. |
-| [`further-context/spike-findings.md`](./further-context/spike-findings.md) | Concrete cross-boundary type amendments from the implementation spike. Task list for updating the target-architecture and cgka-engine-design docs. |
-| [`../learnings.md`](../learnings.md) | Raw chronological log of spike friction points. Source material for spike-findings. |
 
 ### Current state — facts and analysis
 
@@ -65,6 +61,7 @@ These are longer working documents. Go here when you need depth, not orientation
 |---|---|
 | [`further-context/codebase-survey.md`](./further-context/codebase-survey.md) | Raw metrics — LOC counts, dependency graphs, module structures. |
 | [`further-context/whitenoise-rs-deep-dive.md`](./further-context/whitenoise-rs-deep-dive.md) | Detailed analysis of the whitenoise-rs client layer — major subsystems, known complexity hotspots, refactor plan. |
+| [`../learnings.md`](../learnings.md) | Historical engineering notes. Useful for archaeology, not a current contract. |
 
 ### Historical context
 
@@ -89,9 +86,9 @@ These are longer working documents. Go here when you need depth, not orientation
 | FFI bridge | flutter_rust_bridge | **whitenoise-ffi** — transport-agnostic, Dart + Swift |
 | Application | whitenoise-rs singleton | **whitenoise-core** — thin facade, per-account sessions |
 | Transport | Nostr relay control planes, embedded | `TransportAdapter` trait, `NostrAdapter` as first impl |
-| CGKA Engine | MDK — monolithic, Nostr types in API | MDK implementing `CgkaEngine` trait, Nostr types removed from storage |
-| Crypto | OpenMLS direct | OpenMLS behind `CgkaEngine` trait, swappable |
-| Storage | `MdkStorageProvider` (good design) | Same + `CapabilityStorage` added, `Group` type de-Nostr-ified |
+| CGKA Engine | `crates/cgka-engine` implements the current OpenMLS-backed engine candidate | Spec-level `CgkaEngine` contract with production persistence and packaging |
+| Crypto | OpenMLS behind `CgkaEngine` | OpenMLS first, with the trait boundary preserving future CGKA swap room |
+| Storage | `storage-memory` for tests and simulator work | Production backend with retained anchors, snapshots, and pruning |
 
 ---
 
@@ -100,6 +97,7 @@ These are longer working documents. Go here when you need depth, not orientation
 - **PCS is non-negotiable.** Both FS and PCS required. Sender Keys off the table.
 - **MLS stays.** BeeKEM and other CGKAs interesting but immature; `CgkaEngine` trait makes them swappable in future.
 - **Transport is pluggable.** FIPS mesh and others are first-class future targets.
+- **Commit convergence is engine-owned.** Transport ordering is advisory; the engine canonicalizes commits before releasing app-visible output.
 - **whitenoise-ffi, not whitenoise-frb.** FFI bridge outputs Swift bindings too.
 - **Nostr has three distinct roles** — identity (always), app message format (always), transport (pluggable).
 - **One capability per feature.** Flat feature registry, no dependency graph.

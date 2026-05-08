@@ -56,7 +56,7 @@ These are the load-bearing departures from the original plan. Each is also docum
    Bootstraps multi-admin groups so admins can subsequently self-remove (MIP-03 §149's "not the last admin" constraint). Creator is implicitly an admin; `initial_admins` adds co-admins.
 
 4. **The per-leaf capability cache is load-bearing for correctness, not a pure optimization.**
-   `LeafNode::capabilities()` IS public on OpenMLS (the spike's `pub(crate)` claim was wrong — see `memory/project_openmls_capabilities_access.md`). But `MlsGroup::public_group()` is `pub(crate)`, so there's no public API to walk to a *specific* leaf. The cache is populated from KeyPackages we directly handle (invite-side parses, `StagedCommit::add_proposals`) plus `MlsGroup::own_leaf_node()` for self.
+   `LeafNode::capabilities()` IS public on OpenMLS (an earlier prototype used the wrong access path — see `memory/project_openmls_capabilities_access.md`). But `MlsGroup::public_group()` is `pub(crate)`, so there's no public API to walk to a *specific* leaf. The cache is populated from KeyPackages we directly handle (invite-side parses, `StagedCommit::add_proposals`) plus `MlsGroup::own_leaf_node()` for self.
 
 5. **MIP-01 `marmot_group_data` (`0xF2EE`) is owned by the engine, not by a transport adapter.**
    §149 / §150 admin guards must fire at commit-construction time, which is inside the engine. Transport-y fields (relays, image_*, nostr_group_id) are populated with placeholders that a future transport adapter refines. A future component-based MIP-01 split will retire this monolithic module.
@@ -80,18 +80,18 @@ OpenMLS 0.8.1 surface used: `MlsGroup::pending_commit() -> Option<&StagedCommit>
 
 ### Done — ForkRecoveryManager (2026-05-04)
 
-`crates/cgka-engine/src/fork_recovery.rs` owns deterministic same-epoch commit recovery. The ordering key is `(TransportMessage::timestamp, MessageId bytes)`. Local and inbound commits create pre-commit snapshots; a better late candidate rolls storage back and replays, while a losing candidate is marked stale. Successful rollback emits `GroupEvent::ForkRecovered` so harness vectors can compare recovery trace, not just final state. `EngineError::ForkedEpoch` is now the fallback for missing snapshots or unrecoverable shapes. Tests: `tests/fork_detection.rs` plus the harness `deliberate_fork_via_harness`.
+`crates/cgka-engine/src/fork_recovery.rs` owns deterministic same-epoch commit recovery. The ordering key is content-derived: `SHA-256(mls_bytes)` scoped by source epoch, with lexicographically lower digest winning. Local and inbound commits create pre-commit snapshots; a better late candidate rolls storage back and replays, while a losing candidate is marked stale. Successful rollback emits `GroupEvent::ForkRecovered` so harness vectors can compare recovery trace, not just final state. `EngineError::ForkedEpoch` is now the fallback for missing snapshots or unrecoverable shapes. Tests: `tests/fork_detection.rs` plus the harness `deliberate_fork_via_harness`.
 
 ## Conventions in this crate
 
 - **Only `EpochManager` may construct non-`Stable` `EpochState` variants.** This is enforced by visibility — the variants' fields are private. Don't add a public constructor for `Recovering` etc. somewhere else.
 - **No Nostr types anywhere.** Grep test: `grep -ri nostr crates/cgka-engine/src/` returns zero hits. Same for `crates/traits/`, `crates/storage-memory/`.
 - **No `leave_group()` (the legacy MLS path).** Always `leave_group_via_self_remove` per MIP-03. This is grep-banned.
-- **OpenMLS family is tilde-pinned in workspace `Cargo.toml`.** Don't relax to caret — silent companion-crate skew is a real footgun, see `docs/learnings.md:32`.
+- **OpenMLS family is tilde-pinned in workspace `Cargo.toml`.** Don't relax to caret; silent companion-crate skew has broken this stack before.
 - **Wire format is `PURE_PLAINTEXT_WIRE_FORMAT_POLICY`.** This is a deliberate 0.1.0 choice. Before changing it, read the module comment in `src/wire_format.rs` and the three alternative paths it links.
 
 ## Memory files agents should consult
 
-- `project_openmls_capabilities_access` — corrects the spike's `pub(crate)` claim.
+- `project_openmls_capabilities_access` — records the OpenMLS capabilities access correction.
 - `feedback_openmls_accessor_pattern` — when to prefer accessor composition over hand-forwarding OpenMLS traits.
 - `project_two_layer_addressing` — why `StaleReason::NotForThisClient` is engine-layer identity filtering, not transport-layer defense-in-depth.

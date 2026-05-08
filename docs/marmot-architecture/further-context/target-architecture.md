@@ -12,6 +12,12 @@ related:
 
 # Target Architecture — The Big Picture
 
+> **Reference status.** This is the older long-form architecture note. The
+> active orientation doc is
+> [`../overview/target-architecture.md`](../overview/target-architecture.md).
+> Treat trait sketches below as illustrative; the current Rust surface lives in
+> `crates/traits` and the engine contract docs.
+
 **The problem this solves:** The current Marmot stack has MLS, Nostr, and application logic deeply coupled together. Changing anything requires understanding all of it. Transport is not pluggable. The CGKA (continuous group key agreement) backend is not swappable. Testing requires the full stack. This document defines a *potential* target architecture that separates these concerns cleanly — transport, CGKA, and application each behind their own interfaces, with the engine as the single integration point.
 
 This document captures the core architectural vision. Not an implementation plan. Not a refactor checklist. The idea, clearly stated, so it doesn't get lost.

@@ -39,7 +39,6 @@ fn state(current_tip_epoch: u64, retained_anchor_epoch: u64) -> Canonicalization
     CanonicalizationState {
         current_tip_epoch,
         retained_anchor_epoch,
-        sync_state: SyncState::Stable,
         last_convergence_relevant_input_ms: 0,
         seen_message_ids: BTreeSet::new(),
     }

@@ -116,7 +116,6 @@ impl<S: StorageProvider> Engine<S> {
         let state = CanonicalizationState {
             current_tip_epoch: previous_tip.0,
             retained_anchor_epoch,
-            sync_state: SyncState::Stable,
             last_convergence_relevant_input_ms,
             seen_message_ids: self
                 .seen_message_ids

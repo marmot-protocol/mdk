@@ -62,7 +62,4 @@ coverage-conformance-html:
 dead-code-audit:
     @rg -n '#\[allow\(([^]]*dead_code|dead_code)' crates docs plans Cargo.toml || true
 
-dead-code-audit-all:
-    @rg -n '#\[allow\(([^]]*dead_code|dead_code)' crates spike docs plans Cargo.toml || true
-
 ci: fmt-check check clippy test

@@ -26,7 +26,7 @@ use cgka_conformance_simulator::bus::DeliveryPolicy;
 use cgka_conformance_simulator::canonicalization::{
     AlreadySeen, CanonicalizationInput, CanonicalizationPolicy, CanonicalizationState,
     DroppedMessageReason, InvalidatedAppMessageReason, MaterializedCandidate, MessageKind,
-    PeeledMessage, PeeledMessageKind, SyncState, canonicalize_with_materialized_candidates,
+    PeeledMessage, PeeledMessageKind, canonicalize_with_materialized_candidates,
 };
 use cgka_conformance_simulator::convergence::{
     AppWitness, BranchCandidate, ConvergencePolicy, is_branch_eligible, select_canonical_branch,
@@ -345,7 +345,6 @@ fn canonical_state() -> CanonicalizationState {
     CanonicalizationState {
         current_tip_epoch: 4,
         retained_anchor_epoch: 1,
-        sync_state: SyncState::Stable,
         last_convergence_relevant_input_ms: 0,
         seen_message_ids: BTreeSet::new(),
     }
