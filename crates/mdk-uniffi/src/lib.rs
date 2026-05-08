@@ -3,6 +3,7 @@
 //! This crate provides foreign language bindings for mdk-core using UniFFI.
 //! It wraps the MDK core functionality with SQLite storage backend.
 
+#![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
 use std::collections::BTreeSet;
