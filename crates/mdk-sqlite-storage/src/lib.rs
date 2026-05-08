@@ -1370,6 +1370,16 @@ impl MdkStorageProvider for MdkSqliteStorage {
             )
             .map_err(|e| MdkStorageError::Database(e.to_string()))?;
 
+            // processed_welcomes has no mls_group_id column and no FK to groups —
+            // join through welcomes to find rows for this group. Must run BEFORE
+            // the welcomes delete below, otherwise the subquery returns empty.
+            conn.execute(
+                "DELETE FROM processed_welcomes WHERE wrapper_event_id IN \
+                 (SELECT wrapper_event_id FROM welcomes WHERE mls_group_id = ?)",
+                [group_id_bytes],
+            )
+            .map_err(|e| MdkStorageError::Database(e.to_string()))?;
+
             // welcomes has no FK to groups — needs explicit delete
             conn.execute(
                 "DELETE FROM welcomes WHERE mls_group_id = ?",
@@ -4793,7 +4803,9 @@ mod tests {
             Message, MessageState, ProcessedMessage, ProcessedMessageState,
         };
         use mdk_storage_traits::welcomes::WelcomeStorage;
-        use mdk_storage_traits::welcomes::types::{Welcome, WelcomeState};
+        use mdk_storage_traits::welcomes::types::{
+            ProcessedWelcome, ProcessedWelcomeState, Welcome, WelcomeState,
+        };
         use nostr::{EventId, Kind, PublicKey, Tags, Timestamp, UnsignedEvent};
         use rusqlite::params;
 
@@ -5007,6 +5019,103 @@ mod tests {
                     .unwrap()
                     .is_some()
             );
+        }
+
+        #[test]
+        fn delete_group_removes_processed_welcomes() {
+            let storage = MdkSqliteStorage::new_in_memory().unwrap();
+
+            // Seed a group with a welcome whose wrapper_event_id we control,
+            // then a ProcessedWelcome that references it. Pre-fix this row
+            // would survive delete_group (issue #68: data-retention bug +
+            // breaks dedup path on welcome re-processing).
+            let group_id = GroupId::from_slice(&[77, 77, 77, 77]);
+            let nostr_group_id = [77u8; 32];
+            let pubkey = PublicKey::parse(
+                "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+            )
+            .unwrap();
+            let now = Timestamp::now();
+            let group = Group {
+                mls_group_id: group_id.clone(),
+                nostr_group_id,
+                name: "Test".to_string(),
+                description: "".to_string(),
+                admin_pubkeys: BTreeSet::new(),
+                last_message_id: None,
+                last_message_at: None,
+                last_message_processed_at: None,
+                epoch: 1,
+                state: GroupState::Active,
+                image_hash: None,
+                image_key: None,
+                image_nonce: None,
+                self_update_state: SelfUpdateState::Required,
+                disappearing_message_secs: None,
+            };
+            storage.save_group(group).unwrap();
+
+            let wrapper_eid = EventId::from_slice(&[0xAAu8; 32]).unwrap();
+            let welcome_eid = EventId::from_slice(&[0xBBu8; 32]).unwrap();
+            let welcome = Welcome {
+                id: welcome_eid,
+                event: UnsignedEvent::new(
+                    pubkey,
+                    now,
+                    Kind::from(444u16),
+                    vec![],
+                    "welcome".to_string(),
+                ),
+                mls_group_id: group_id.clone(),
+                nostr_group_id,
+                group_name: "Test".to_string(),
+                group_description: "".to_string(),
+                group_image_hash: None,
+                group_image_key: None,
+                group_image_nonce: None,
+                group_admin_pubkeys: BTreeSet::new(),
+                group_relays: BTreeSet::new(),
+                welcomer: pubkey,
+                member_count: 2,
+                state: WelcomeState::Pending,
+                wrapper_event_id: wrapper_eid,
+            };
+            storage.save_welcome(welcome).unwrap();
+
+            let pw = ProcessedWelcome {
+                wrapper_event_id: wrapper_eid,
+                welcome_event_id: Some(welcome_eid),
+                processed_at: now,
+                state: ProcessedWelcomeState::Processed,
+                failure_reason: Some("sensitive welcome processing error".to_string()),
+            };
+            storage.save_processed_welcome(pw).unwrap();
+            assert!(
+                storage
+                    .find_processed_welcome_by_event_id(&wrapper_eid)
+                    .unwrap()
+                    .is_some()
+            );
+
+            storage.delete_group(&group_id).unwrap();
+
+            assert!(
+                storage
+                    .find_processed_welcome_by_event_id(&wrapper_eid)
+                    .unwrap()
+                    .is_none(),
+                "processed_welcomes row survived delete_group"
+            );
+            storage.with_connection(|conn| {
+                let count: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM processed_welcomes WHERE wrapper_event_id = ?",
+                        params![wrapper_eid.as_bytes()],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(count, 0, "processed_welcomes should be deleted");
+            });
         }
     }
 }

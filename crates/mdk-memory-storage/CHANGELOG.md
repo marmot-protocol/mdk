@@ -34,6 +34,7 @@
 ### Fixed
 
 - Fixed `MdkMemoryStorage::save_welcome` to reject oversized welcome group metadata and serialized event JSON before caching welcomes, matching SQLite backend payload bounds. ([#276](https://github.com/marmot-protocol/mdk/pull/276))
+- `delete_group` now scrubs `processed_welcomes_cache` entries for the group by collecting each welcome's `wrapper_event_id` during the welcomes scan and removing the matching processed-welcome rows. Previously these entries survived deletion, leaking group-linkable metadata and tripping the welcome dedup path on re-processing. Closes [marmot-protocol/marmot-security#68](https://github.com/marmot-protocol/marmot-security/issues/68).
 
 ### Removed
 

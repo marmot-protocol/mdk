@@ -995,15 +995,28 @@ impl MdkStorageProvider for MdkMemoryStorage {
                 .processed_messages_cache
                 .retain(|_, pm| pm.mls_group_id.as_ref() != Some(group_id));
 
-            // Welcomes (keyed by EventId — must iterate for group match)
-            let welcome_keys: Vec<nostr::EventId> = inner
-                .welcomes_cache
-                .iter()
-                .filter(|(_, w)| &w.mls_group_id == group_id)
-                .map(|(k, _)| *k)
-                .collect();
+            // Welcomes (keyed by EventId — must iterate for group match).
+            // Capture each welcome's wrapper_event_id so we can scrub matching
+            // processed_welcomes_cache entries below (that cache has no
+            // mls_group_id key and would otherwise leak group-linkable rows).
+            let mut welcome_keys: Vec<nostr::EventId> = Vec::new();
+            let mut welcome_wrapper_ids: Vec<nostr::EventId> = Vec::new();
+            for (k, w) in inner.welcomes_cache.iter() {
+                if &w.mls_group_id == group_id {
+                    welcome_keys.push(*k);
+                    welcome_wrapper_ids.push(w.wrapper_event_id);
+                }
+            }
             for key in &welcome_keys {
                 inner.welcomes_cache.pop(key);
+            }
+
+            // Processed welcomes (keyed by wrapper_event_id — has no
+            // mls_group_id, so we link via the welcomes we just collected).
+            // The cache is a HashMap (security-critical: must not be evicted),
+            // so use HashMap::remove rather than LruCache::pop.
+            for wid in &welcome_wrapper_ids {
+                inner.processed_welcomes_cache.remove(wid);
             }
 
             // OpenMLS data (typed methods handle key serialization)
@@ -4031,6 +4044,10 @@ mod tests {
         use mdk_storage_traits::messages::types::{
             Message, MessageState, ProcessedMessage, ProcessedMessageState,
         };
+        use mdk_storage_traits::welcomes::WelcomeStorage;
+        use mdk_storage_traits::welcomes::types::{
+            ProcessedWelcome, ProcessedWelcomeState, Welcome, WelcomeState,
+        };
         use nostr::{EventId, Keys, Kind, Tags, Timestamp, UnsignedEvent};
         use std::collections::BTreeSet;
 
@@ -4161,6 +4178,70 @@ mod tests {
                     .is_some()
             );
             assert_eq!(storage.messages(&group_b, None).unwrap().len(), 1);
+        }
+
+        #[test]
+        fn delete_group_removes_processed_welcomes() {
+            let storage = MdkMemoryStorage::default();
+            let group_id = GroupId::from_slice(&[77, 77, 77]);
+            storage.save_group(create_group(&[77, 77, 77])).unwrap();
+
+            // Save a welcome whose wrapper_event_id we control, then a
+            // ProcessedWelcome that references it. Pre-fix this row would
+            // survive delete_group (issue #68).
+            let pubkey = Keys::generate().public_key();
+            let now = Timestamp::now();
+            let wrapper_eid = EventId::from_slice(&[0xAAu8; 32]).unwrap();
+            let welcome_eid = EventId::from_slice(&[0xBBu8; 32]).unwrap();
+            let welcome = Welcome {
+                id: welcome_eid,
+                event: UnsignedEvent::new(
+                    pubkey,
+                    now,
+                    Kind::from(444u16),
+                    vec![],
+                    "welcome".to_string(),
+                ),
+                mls_group_id: group_id.clone(),
+                nostr_group_id: [77u8; 32],
+                group_name: "Test".to_string(),
+                group_description: "".to_string(),
+                group_image_hash: None,
+                group_image_key: None,
+                group_image_nonce: None,
+                group_admin_pubkeys: BTreeSet::new(),
+                group_relays: BTreeSet::new(),
+                welcomer: pubkey,
+                member_count: 2,
+                state: WelcomeState::Pending,
+                wrapper_event_id: wrapper_eid,
+            };
+            storage.save_welcome(welcome).unwrap();
+
+            let pw = ProcessedWelcome {
+                wrapper_event_id: wrapper_eid,
+                welcome_event_id: Some(welcome_eid),
+                processed_at: now,
+                state: ProcessedWelcomeState::Processed,
+                failure_reason: Some("sensitive welcome processing error".to_string()),
+            };
+            storage.save_processed_welcome(pw).unwrap();
+            assert!(
+                storage
+                    .find_processed_welcome_by_event_id(&wrapper_eid)
+                    .unwrap()
+                    .is_some()
+            );
+
+            storage.delete_group(&group_id).unwrap();
+
+            assert!(
+                storage
+                    .find_processed_welcome_by_event_id(&wrapper_eid)
+                    .unwrap()
+                    .is_none(),
+                "processed_welcomes_cache entry survived delete_group"
+            );
         }
     }
 }

@@ -2086,8 +2086,9 @@ where
     /// Delete all local state for a group.
     ///
     /// Removes everything MDK stores for this group: messages, processed
-    /// message records, MLS tree state, epoch secrets, key material, relay
-    /// associations, proposals, and snapshots.
+    /// message records, welcome records, processed welcome records, MLS tree
+    /// state, epoch secrets, key material, relay associations, proposals,
+    /// and snapshots.
     ///
     /// After deletion, the group cannot receive or decrypt new messages.
     /// Call `leave_group()` first if you want to notify other members of
