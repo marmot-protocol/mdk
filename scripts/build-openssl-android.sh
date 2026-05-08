@@ -19,10 +19,18 @@ OPENSSL_VERSION="${OPENSSL_VERSION:-3.3.2}"
 # Sourced from the official OpenSSL release (openssl.org) and cross-checked
 # against the GitHub release's published .sha256 sidecar. Update this in
 # lockstep with OPENSSL_VERSION; mismatched values must abort the build.
-declare -A OPENSSL_SHA256_BY_VERSION=(
-    ["3.3.2"]="2e8a40b01979afe8be0bbfb3de5dc1c6709fedb46d6c89c10da114ab5fc3d281"
-)
-OPENSSL_SHA256="${OPENSSL_SHA256:-${OPENSSL_SHA256_BY_VERSION[${OPENSSL_VERSION}]:-}}"
+#
+# A plain `case` is used instead of `declare -A` so the script keeps working
+# on macOS hosts, where the default /bin/bash is 3.2 and lacks associative
+# arrays. The `darwin*` host branch below is part of this script's contract.
+OPENSSL_SHA256="${OPENSSL_SHA256:-}"
+if [ -z "${OPENSSL_SHA256}" ]; then
+    case "${OPENSSL_VERSION}" in
+        3.3.2)
+            OPENSSL_SHA256="2e8a40b01979afe8be0bbfb3de5dc1c6709fedb46d6c89c10da114ab5fc3d281"
+            ;;
+    esac
+fi
 
 if [ -z "$ABI" ] || [ -z "$OUTPUT_DIR" ]; then
     echo "Usage: $0 <ABI> <OUTPUT_DIR>"
@@ -38,7 +46,7 @@ fi
 
 if [ -z "${OPENSSL_SHA256}" ]; then
     echo "Error: no pinned SHA-256 for OpenSSL ${OPENSSL_VERSION}."
-    echo "  Add the verified upstream hash to OPENSSL_SHA256_BY_VERSION,"
+    echo "  Add the verified upstream hash to the case statement above,"
     echo "  or set OPENSSL_SHA256 explicitly in the environment."
     exit 1
 fi
@@ -149,7 +157,18 @@ curl -fsSL "https://github.com/openssl/openssl/releases/download/openssl-${OPENS
 # tampered with in transit, on the CDN, or in the GitHub release; in any of
 # those cases continuing the build would link a compromised OpenSSL into the
 # distributed Android library.
-echo "${OPENSSL_SHA256}  openssl.tar.gz" | sha256sum -c -
+#
+# `sha256sum` is GNU coreutils and absent on macOS by default; fall back to
+# `shasum -a 256`, mirroring the `nproc || sysctl -n hw.ncpu` pattern used
+# later in this script.
+if command -v sha256sum >/dev/null 2>&1; then
+    echo "${OPENSSL_SHA256}  openssl.tar.gz" | sha256sum -c -
+elif command -v shasum >/dev/null 2>&1; then
+    echo "${OPENSSL_SHA256}  openssl.tar.gz" | shasum -a 256 -c -
+else
+    echo "Error: neither sha256sum nor shasum is available to verify the OpenSSL tarball" >&2
+    exit 1
+fi
 
 tar -xzf openssl.tar.gz
 cd "openssl-${OPENSSL_VERSION}"
