@@ -552,4 +552,4 @@ The current Tamarin model lives in
 and includes the delivery-order robustness contract for the generated
 `convergence-e2e-delivery/v1` variants.
 The contract scenario tests live in
-[`crates/cgka-conformance/tests/canonicalization_contract.rs`](../../crates/cgka-conformance/tests/canonicalization_contract.rs).
+[`crates/cgka-conformance-simulator/tests/canonicalization_contract.rs`](../../crates/cgka-conformance-simulator/tests/canonicalization_contract.rs).

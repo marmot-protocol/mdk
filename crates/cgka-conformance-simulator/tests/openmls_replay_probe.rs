@@ -1,18 +1,18 @@
 use std::collections::BTreeSet;
 
-use cgka_conformance::canonicalization::{
+use cgka_conformance_simulator::canonicalization::{
     CanonicalizationError, CanonicalizationInput, CanonicalizationPolicy, CanonicalizationResult,
     CanonicalizationState, DroppedMessage, DroppedMessageReason, InvalidatedAppMessage,
     InvalidatedAppMessageReason, MessageKind, SyncState, canonicalize_with_materialized_candidates,
 };
-use cgka_conformance::convergence::ConvergencePolicy;
-use cgka_conformance::openmls_projection::{
+use cgka_conformance_simulator::convergence::ConvergencePolicy;
+use cgka_conformance_simulator::openmls_projection::{
     OpenMlsCandidatePath, OpenMlsCanonicalizationBatch, OpenMlsContentKind,
     OpenMlsReplayObservation, apply_openmls_canonicalization_result, canonicalize_openmls_batch,
     canonicalize_stored_openmls_messages, materialize_openmls_candidate_paths,
     persist_openmls_canonicalization_dispositions, project_mls_message, replay_openmls_messages,
 };
-use cgka_conformance::{ClientBuilder, TransportBus};
+use cgka_conformance_simulator::{ClientBuilder, TransportBus};
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::provider::EngineOpenMlsProvider;
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};

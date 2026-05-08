@@ -1,4 +1,4 @@
-# cgka-conformance
+# cgka-conformance-simulator
 
 In-process multi-client simulator for the CGKA engine. Lets us replay scripted scenarios and run property-based invariants against `Engine<MemoryStorage>` without going anywhere near a network or real crypto.
 
@@ -9,7 +9,7 @@ In-process multi-client simulator for the CGKA engine. Lets us replay scripted s
 - `ScenarioSpec` — a serializable v1 input contract for deterministic scripted scenarios, including explicit queue faults and partitions.
 - `VectorFixture` — portable JSON fixtures pairing runnable scenario input with expected `ScenarioTrace` output.
 - `ScenarioReport` — serializable run artifacts with metadata, expected/observed traces, step logs, recoveries, and invariant failures.
-- `cgka-conformance-report` — a small CLI that runs generated scenario families and writes JSON reports.
+- `cgka-conformance-simulator-report` — a small CLI that runs generated scenario families and writes JSON reports.
 - `proptest_support` — strategies that generate arbitrary typed `SendIntent` sequences for property-based tests.
 - `MockPeeler` — a deliberately trivial `TransportPeeler` impl. Distinguishes the group-message vs welcome paths but performs no encryption.
 
@@ -17,10 +17,10 @@ In-process multi-client simulator for the CGKA engine. Lets us replay scripted s
 
 ```sh
 # Default: scripted scenarios + proptest with 24 cases (~1 s).
-cargo test -p cgka-conformance
+cargo test -p cgka-conformance-simulator
 
 # Pre-release validation: 1000 proptest cases per property.
-cargo test -p cgka-conformance --features conformance-slow
+cargo test -p cgka-conformance-simulator --features conformance-slow
 ```
 
 ## Canonical vector fixtures
@@ -30,7 +30,7 @@ JSON `VectorFixture` envelope:
 
 - `scenario_name` — stable logical scenario id, currently including `/v1`.
 - `vector_version` — fixture schema version, currently `"1"`.
-- `conformance_version` — `cgka-conformance` crate version that produced the fixture.
+- `conformance_version` — `cgka-conformance-simulator` crate version that produced the fixture.
 - `seed` — `null` for hand-authored deterministic scenarios.
 - `scenario` — the input-side `ScenarioSpec` to execute.
 - `expected_trace` — the `ScenarioTrace` a conforming implementation must
@@ -146,35 +146,35 @@ metadata: family name, generator version, seed, case index, and an optional
 To run the current generated family and write JSON reports:
 
 ```sh
-cargo run -p cgka-conformance --bin cgka-conformance-report -- \
+cargo run -p cgka-conformance-simulator --bin cgka-conformance-simulator-report -- \
   --family send-leave/v1 \
   --seed 42 \
   --cases 10 \
-  --out target/cgka-conformance-reports
+  --out target/cgka-conformance-simulator-reports
 ```
 
 To shake the convergence E2E bridge instead:
 
 ```sh
-cargo run -p cgka-conformance --bin cgka-conformance-report -- \
+cargo run -p cgka-conformance-simulator --bin cgka-conformance-simulator-report -- \
   --family convergence-e2e-delivery/v1 \
   --seed 42 \
   --cases 10 \
-  --out target/cgka-conformance-reports
+  --out target/cgka-conformance-simulator-reports
 ```
 
 Reports are written as one file per case, for example
-`target/cgka-conformance-reports/send-leave-v1-seed-42-case-0.json`.
+`target/cgka-conformance-simulator-reports/send-leave-v1-seed-42-case-0.json`.
 
 ## When to use the harness vs. integration tests
 
 | Question | Where to put the test |
 |---|---|
 | "Does this single engine method behave correctly?" | `cgka-engine/tests/*.rs` |
-| "Do N engines converge under FIFO delivery?" | `cgka-conformance/tests/canonical_scenarios.rs` |
-| "Does this hold for *any* sequence of N intents?" | `cgka-conformance/tests/proptest_invariants.rs` |
+| "Do N engines converge under FIFO delivery?" | `cgka-conformance-simulator/tests/canonical_scenarios.rs` |
+| "Does this hold for *any* sequence of N intents?" | `cgka-conformance-simulator/tests/proptest_invariants.rs` |
 | "What happens under reorder / partition / replay?" | New scripted scenario; consider extending the proptest strategies once the case is concrete |
 | "Can another implementation reproduce this behavior?" | Add or update a JSON fixture in `vectors/` |
-| "Do generated scenarios produce useful artifacts?" | Run `cargo run -p cgka-conformance --bin cgka-conformance-report -- ...` |
+| "Do generated scenarios produce useful artifacts?" | Run `cargo run -p cgka-conformance-simulator --bin cgka-conformance-simulator-report -- ...` |
 
 See [`AGENTS.md`](AGENTS.md) for the agent-facing map (bus model, scheduler policies, how to add a scenario).

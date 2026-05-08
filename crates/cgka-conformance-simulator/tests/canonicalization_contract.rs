@@ -1,12 +1,12 @@
 use std::collections::BTreeSet;
 
-use cgka_conformance::canonicalization::{
+use cgka_conformance_simulator::canonicalization::{
     AlreadySeen, CanonicalizationInput, CanonicalizationPolicy, CanonicalizationState,
     DroppedMessage, DroppedMessageReason, InvalidatedAppMessage, InvalidatedAppMessageReason,
     MaterializedCandidate, MessageKind, OutboundIntent, PeeledMessage, PeeledMessageKind,
     SyncState, canonicalize, canonicalize_with_materialized_candidates,
 };
-use cgka_conformance::convergence::{BranchCandidate, ConvergencePolicy};
+use cgka_conformance_simulator::convergence::{BranchCandidate, ConvergencePolicy};
 
 fn digest(byte: u8) -> [u8; 32] {
     [byte; 32]

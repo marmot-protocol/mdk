@@ -4,7 +4,7 @@ members = [
     "crates/traits",
     "crates/cgka-engine",
     "crates/storage-memory",
-    "crates/cgka-conformance",
+    "crates/cgka-conformance-simulator",
 ]
 exclude = ["spike"]
 
@@ -46,4 +46,4 @@ test-log = { version = "0.2", features = ["trace"] }
 cgka-traits = { path = "crates/traits" }
 cgka-engine = { path = "crates/cgka-engine" }
 storage-memory = { path = "crates/storage-memory" }
-cgka-conformance = { path = "crates/cgka-conformance" }
+cgka-conformance-simulator = { path = "crates/cgka-conformance-simulator" }

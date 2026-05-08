@@ -222,7 +222,7 @@ for application traffic to overrule any valid branch.
 The executable policy model lives in
 [`crates/cgka-engine/src/convergence.rs`](../../crates/cgka-engine/src/convergence.rs).
 The model tests live in
-[`crates/cgka-conformance/tests/candidate_state_graph.rs`](../../crates/cgka-conformance/tests/candidate_state_graph.rs).
+[`crates/cgka-conformance-simulator/tests/candidate_state_graph.rs`](../../crates/cgka-conformance-simulator/tests/candidate_state_graph.rs).
 The executable canonicalization contract model lives in
 [`crates/cgka-engine/src/canonicalization.rs`](../../crates/cgka-engine/src/canonicalization.rs).
 That model materializes symbolic commit edges into candidate branches before
@@ -251,7 +251,7 @@ Engine integration and OpenMLS conformance tests also cover:
 - peeler-ingest to `GroupEvent` output across multiple in-memory clients,
   including canonical app delivery and losing-branch app invalidation. The
   portable fixture is
-  [`convergence-e2e-group-events.v1.json`](../../crates/cgka-conformance/vectors/convergence-e2e-group-events.v1.json),
+  [`convergence-e2e-group-events.v1.json`](../../crates/cgka-conformance-simulator/vectors/convergence-e2e-group-events.v1.json),
   and the generated `convergence-e2e-delivery/v1` family exercises the same
   contract under duplicated, delayed, and reordered queued delivery.
 

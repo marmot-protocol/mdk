@@ -192,8 +192,8 @@ until the model includes it.
 | `Derive_*` rule | One policy step, such as score comparison or stale derivation. | Unit tests for the selector/comparator and its selected reason. |
 | all-traces lemma | An invariant that must hold in every modeled trace. | Property tests, invariant assertions, or both. |
 | `*_requires_*` lemma | A selected outcome must have matching evidence. | Debug assertions or tests that inspect selection reasons and evidence. |
-| lifecycle lemma | A canonicalization handoff, such as policy load, retained replay, missing anchor, `BeyondAnchor`, or app output, has the required evidence and mutation boundary. | Engine integration tests in `crates/cgka-engine/tests/distributed_convergence.rs`, OpenMLS replay tests in `crates/cgka-conformance/tests/openmls_replay_probe.rs`, and harness E2E coverage in `crates/cgka-conformance/tests/canonical_scenarios.rs` / `crates/cgka-conformance/vectors/convergence-e2e-group-events.v1.json`. |
-| delivery-order lemma | Reordered, delayed, and duplicate delivery after peeling is normalized before canonical output. | `generate_convergence_e2e_delivery_family` in `crates/cgka-conformance/src/family.rs` and `convergence_e2e_delivery_family_runs_generated_variants`. |
+| lifecycle lemma | A canonicalization handoff, such as policy load, retained replay, missing anchor, `BeyondAnchor`, or app output, has the required evidence and mutation boundary. | Engine integration tests in `crates/cgka-engine/tests/distributed_convergence.rs`, OpenMLS replay tests in `crates/cgka-conformance-simulator/tests/openmls_replay_probe.rs`, and harness E2E coverage in `crates/cgka-conformance-simulator/tests/canonical_scenarios.rs` / `crates/cgka-conformance-simulator/vectors/convergence-e2e-group-events.v1.json`. |
+| delivery-order lemma | Reordered, delayed, and duplicate delivery after peeling is normalized before canonical output. | `generate_convergence_e2e_delivery_family` in `crates/cgka-conformance-simulator/src/family.rs` and `convergence_e2e_delivery_family_runs_generated_variants`. |
 | model assumption | A fact the model accepts as already validated. | Tests or review at the layer that owns the assumption. |
 
 Keep names aligned across the proof and tests. If the Tamarin scenario is
@@ -205,8 +205,8 @@ For bounded policy seeds, update `policy_cases.json` first. Then check both
 consumers:
 
 ```sh
-cargo test -p cgka-conformance --test generated_policy_cases
-cargo run -p cgka-conformance --bin cgka-policy-casegen -- --format tamarin formal/tamarin/policy_cases.json
+cargo test -p cgka-conformance-simulator --test generated_policy_cases
+cargo run -p cgka-conformance-simulator --bin cgka-policy-casegen -- --format tamarin formal/tamarin/policy_cases.json
 ```
 
 Use the executable lemmas as a fixture catalog. Each one says "this situation

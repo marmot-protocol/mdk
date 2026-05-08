@@ -1,5 +1,7 @@
-use cgka_conformance::convergence::{BranchCandidate, ConvergencePolicy, select_canonical_branch};
-use cgka_conformance::policy_cases::{parse_policy_cases, reason_against};
+use cgka_conformance_simulator::convergence::{
+    BranchCandidate, ConvergencePolicy, select_canonical_branch,
+};
+use cgka_conformance_simulator::policy_cases::{parse_policy_cases, reason_against};
 
 const POLICY_CASES_JSON: &str = include_str!("../../../formal/tamarin/policy_cases.json");
 

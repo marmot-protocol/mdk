@@ -1,8 +1,10 @@
 use std::env;
 use std::fs;
 
-use cgka_conformance::convergence::ConvergencePolicy;
-use cgka_conformance::policy_cases::{PolicyCase, digest_rank, parse_policy_cases, reason_against};
+use cgka_conformance_simulator::convergence::ConvergencePolicy;
+use cgka_conformance_simulator::policy_cases::{
+    PolicyCase, digest_rank, parse_policy_cases, reason_against,
+};
 
 fn main() {
     let mut format = "tamarin";
@@ -178,8 +180,12 @@ fn print_tamarin(cases: &[PolicyCase]) {
 }
 
 fn print_rust_test() {
-    println!("use cgka_conformance::convergence::{{ConvergencePolicy, select_canonical_branch}};");
-    println!("use cgka_conformance::policy_cases::{{parse_policy_cases, reason_against}};");
+    println!(
+        "use cgka_conformance_simulator::convergence::{{ConvergencePolicy, select_canonical_branch}};"
+    );
+    println!(
+        "use cgka_conformance_simulator::policy_cases::{{parse_policy_cases, reason_against}};"
+    );
     println!();
     println!(
         "const POLICY_CASES_JSON: &str = include_str!(\"../../../formal/tamarin/policy_cases.json\");"

@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::PathBuf;
 
-use cgka_conformance::{ReportArgs, ReportCommand, parse_report_command, run_report};
+use cgka_conformance_simulator::{ReportArgs, ReportCommand, parse_report_command, run_report};
 
 #[test]
 fn parse_defaults_to_send_leave_family() {
@@ -12,7 +12,7 @@ fn parse_defaults_to_send_leave_family() {
             family: "send-leave/v1".into(),
             seed: 0,
             cases: 1,
-            out: PathBuf::from("target/cgka-conformance-reports"),
+            out: PathBuf::from("target/cgka-conformance-simulator-reports"),
         })
     );
 }
@@ -63,7 +63,7 @@ fn parse_rejects_missing_value() {
 #[tokio::test]
 async fn report_runner_writes_send_leave_json_reports() {
     let out_dir = std::env::temp_dir().join(format!(
-        "darkmatter-cgka-conformance-report-test-{}",
+        "darkmatter-cgka-conformance-simulator-report-test-{}",
         std::process::id()
     ));
     if out_dir.exists() {

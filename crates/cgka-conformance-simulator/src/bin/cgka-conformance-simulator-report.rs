@@ -1,6 +1,6 @@
 use std::error::Error;
 
-use cgka_conformance::{ReportCommand, parse_report_command, report_usage, run_report};
+use cgka_conformance_simulator::{ReportCommand, parse_report_command, report_usage, run_report};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {

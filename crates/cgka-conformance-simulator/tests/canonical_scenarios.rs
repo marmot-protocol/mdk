@@ -4,7 +4,7 @@
 //! leave only to generated scenarios. The proptest layer generalizes the same
 //! behavior into seeded random send/leave sequences.
 
-use cgka_conformance::{
+use cgka_conformance_simulator::{
     AppInvalidationObservation, ClientBuilder, EpochChangeObservation, ScenarioSpec, ScenarioStep,
     ScenarioTrace, TransportBus, VectorFixture, generate_convergence_e2e_delivery_family,
     generate_send_leave_family, observe_client, run_generated_case_report, run_scenario_report,
@@ -84,7 +84,7 @@ async fn three_client_happy_path_via_harness() {
     let _ = (alice.tick().await, bob.tick().await, carol.tick().await);
 
     // Each has received 2 application messages (everyone else's).
-    fn count_app_msgs(c: &mut cgka_conformance::HarnessClient) -> usize {
+    fn count_app_msgs(c: &mut cgka_conformance_simulator::HarnessClient) -> usize {
         c.drain_events()
             .into_iter()
             .filter(|e| matches!(e, GroupEvent::MessageReceived { .. }))
@@ -147,7 +147,7 @@ async fn three_client_message_exchange_vector_is_stable() {
         ScenarioTrace {
             name: "three-client-message-exchange/v1".into(),
             observations: vec![
-                cgka_conformance::ClientObservation {
+                cgka_conformance_simulator::ClientObservation {
                     client: "alice".into(),
                     epoch: 1,
                     member_count: 3,
@@ -158,7 +158,7 @@ async fn three_client_message_exchange_vector_is_stable() {
                     app_invalidations: vec![],
                     recoveries: vec![],
                 },
-                cgka_conformance::ClientObservation {
+                cgka_conformance_simulator::ClientObservation {
                     client: "bob".into(),
                     epoch: 1,
                     member_count: 3,
@@ -169,7 +169,7 @@ async fn three_client_message_exchange_vector_is_stable() {
                     app_invalidations: vec![],
                     recoveries: vec![],
                 },
-                cgka_conformance::ClientObservation {
+                cgka_conformance_simulator::ClientObservation {
                     client: "carol".into(),
                     epoch: 1,
                     member_count: 3,
@@ -1140,7 +1140,7 @@ fn convergence_e2e_group_events_trace() -> ScenarioTrace {
 }
 
 fn convergence_e2e_group_events_trace_named(name: &str) -> ScenarioTrace {
-    let observation = |client: &str| cgka_conformance::ClientObservation {
+    let observation = |client: &str| cgka_conformance_simulator::ClientObservation {
         client: client.into(),
         epoch: 3,
         member_count: 6,

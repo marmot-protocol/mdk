@@ -50,7 +50,7 @@ pub fn parse_report_command(
     let mut family = "send-leave/v1".to_string();
     let mut seed = 0u64;
     let mut cases = 1usize;
-    let mut out = PathBuf::from("target/cgka-conformance-reports");
+    let mut out = PathBuf::from("target/cgka-conformance-simulator-reports");
 
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
@@ -81,5 +81,5 @@ fn next_value(
 }
 
 pub fn report_usage() -> &'static str {
-    "Usage: cgka-conformance-report [--family send-leave/v1|convergence-e2e-delivery/v1] [--seed N] [--cases N] [--out DIR]"
+    "Usage: cgka-conformance-simulator-report [--family send-leave/v1|convergence-e2e-delivery/v1] [--seed N] [--cases N] [--out DIR]"
 }

@@ -22,19 +22,19 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use cgka_conformance::bus::DeliveryPolicy;
-use cgka_conformance::canonicalization::{
+use cgka_conformance_simulator::bus::DeliveryPolicy;
+use cgka_conformance_simulator::canonicalization::{
     AlreadySeen, CanonicalizationInput, CanonicalizationPolicy, CanonicalizationState,
     DroppedMessageReason, InvalidatedAppMessageReason, MaterializedCandidate, MessageKind,
     PeeledMessage, PeeledMessageKind, SyncState, canonicalize_with_materialized_candidates,
 };
-use cgka_conformance::convergence::{
+use cgka_conformance_simulator::convergence::{
     AppWitness, BranchCandidate, ConvergencePolicy, is_branch_eligible, select_canonical_branch,
 };
-use cgka_conformance::proptest_support::{
+use cgka_conformance_simulator::proptest_support::{
     ConfirmOutcome, DeliveryProfile, HarnessIntent, confirm_outcome, delivery_profile, intent_seq,
 };
-use cgka_conformance::{ClientBuilder, HarnessClient, TransportBus};
+use cgka_conformance_simulator::{ClientBuilder, HarnessClient, TransportBus};
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_traits::CgkaEngine;
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
@@ -431,7 +431,7 @@ fn message_ids_with_duplicates(messages: &[PeeledMessage]) -> BTreeSet<String> {
 fn canonicalize_disposition_case(
     case: &CanonicalDispositionCase,
     messages: Vec<PeeledMessage>,
-) -> cgka_conformance::canonicalization::CanonicalizationResult {
+) -> cgka_conformance_simulator::canonicalization::CanonicalizationResult {
     let accepted_proposal_ids: Vec<String> = (0..case.accepted_proposals)
         .map(|i| format!("accepted-proposal-{i}"))
         .collect();

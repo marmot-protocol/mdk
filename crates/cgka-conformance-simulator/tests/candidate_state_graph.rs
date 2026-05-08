@@ -1,4 +1,4 @@
-use cgka_conformance::convergence::{
+use cgka_conformance_simulator::convergence::{
     AppWitness, BranchCandidate, ConvergencePolicy, is_branch_eligible, select_canonical_branch,
 };
 

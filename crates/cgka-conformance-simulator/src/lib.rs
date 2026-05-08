@@ -1,4 +1,4 @@
-//! # cgka-conformance
+//! # cgka-conformance-simulator
 //!
 //! In-process multi-client simulator + shared test fixtures for the CGKA
 //! engine.
