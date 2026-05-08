@@ -20,6 +20,9 @@ pub const KIND_MARMOT_GROUP_MESSAGE: u64 = 445;
 /// Nostr kind used by NIP-59 gift wraps.
 pub const KIND_NIP59_GIFT_WRAP: u64 = 1059;
 
+/// Marmot welcome rumor kind inside the NIP-59 seal.
+pub const KIND_MARMOT_WELCOME_RUMOR: u16 = 444;
+
 /// Source label carried by [`cgka_traits::transport::TransportMessage`] values
 /// produced here.
 pub const NOSTR_SOURCE: &str = "nostr";

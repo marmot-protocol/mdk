@@ -1,8 +1,8 @@
 use crate::error::to_peeler_error;
 use crate::event::{decode_hex, decode_hex_exact};
 use crate::{
-    DEFAULT_EXPORTER_LABEL, GROUP_TAG, KIND_MARMOT_GROUP_MESSAGE, NOSTR_GROUP_KEY_LEN,
-    NostrTransportEvent,
+    DEFAULT_EXPORTER_LABEL, GROUP_TAG, KIND_MARMOT_GROUP_MESSAGE, KIND_MARMOT_WELCOME_RUMOR,
+    KIND_NIP59_GIFT_WRAP, NOSTR_GROUP_KEY_LEN, NostrTransportEvent, RECIPIENT_TAG,
 };
 use async_trait::async_trait;
 use cgka_traits::error::PeelerError;
@@ -13,17 +13,21 @@ use cgka_traits::transport::{EncryptedPayload, TransportEnvelope, TransportMessa
 use cgka_traits::types::{GroupId, MemberId};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
+use nostr::{EventBuilder, Kind, NostrSigner, PublicKey, UnsignedEvent};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 const NONCE_LEN: usize = 12;
 const GROUP_CONTENT_VERSION: u8 = 1;
+const WELCOME_SIGNER_CONTEXT: &str = "nostr_welcome_signer";
 
 /// Nostr implementation of the Marmot transport peeler.
 #[derive(Clone, Debug)]
 pub struct NostrMlsPeeler {
     exporter_label: String,
     author_pubkey: String,
+    welcome_signer: Option<Arc<dyn NostrSigner>>,
 }
 
 impl NostrMlsPeeler {
@@ -33,6 +37,7 @@ impl NostrMlsPeeler {
         Self {
             exporter_label: DEFAULT_EXPORTER_LABEL.into(),
             author_pubkey: author_pubkey.into(),
+            welcome_signer: None,
         }
     }
 
@@ -40,6 +45,26 @@ impl NostrMlsPeeler {
     pub fn with_exporter_label(mut self, label: impl Into<String>) -> Self {
         self.exporter_label = label.into();
         self
+    }
+
+    /// Inject the local Nostr signer/decrypter used for NIP-59 welcomes.
+    ///
+    /// The peeler does not own account lifecycle. Callers provide the signer
+    /// from the account-device layer that already owns local identity keys.
+    pub fn with_welcome_signer<T>(mut self, signer: T) -> Self
+    where
+        T: NostrSigner + 'static,
+    {
+        self.welcome_signer = Some(Arc::new(signer));
+        self
+    }
+
+    fn welcome_signer(&self) -> Result<&Arc<dyn NostrSigner>, PeelerError> {
+        self.welcome_signer
+            .as_ref()
+            .ok_or_else(|| PeelerError::MissingContext {
+                label: WELCOME_SIGNER_CONTEXT.into(),
+            })
     }
 
     fn group_key<'a>(&self, ctx: &'a GroupContextSnapshot) -> Result<&'a [u8], PeelerError> {
@@ -54,6 +79,12 @@ impl NostrMlsPeeler {
             });
         }
         Ok(secret)
+    }
+
+    fn recipient_pubkey(recipient: &MemberId) -> Result<PublicKey, PeelerError> {
+        PublicKey::from_slice(recipient.as_slice()).map_err(|e| {
+            PeelerError::WrapFailed(format!("recipient MemberId is not a Nostr pubkey: {e}"))
+        })
     }
 }
 
@@ -118,8 +149,44 @@ impl TransportPeeler for NostrMlsPeeler {
         })
     }
 
-    async fn peel_welcome(&self, _msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
-        Err(PeelerError::DecryptFailed)
+    async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
+        let signer = self.welcome_signer()?;
+        let event = NostrTransportEvent::from_transport_message(msg).map_err(to_peeler_error)?;
+        if event.kind != KIND_NIP59_GIFT_WRAP {
+            return Err(PeelerError::Malformed(format!(
+                "expected kind {KIND_NIP59_GIFT_WRAP}, got {}",
+                event.kind
+            )));
+        }
+        ensure_welcome_routing_matches(&event, msg)?;
+        let gift_wrap = event.to_verified_nostr_event().map_err(to_peeler_error)?;
+        let unwrapped = nostr::nips::nip59::extract_rumor(signer, &gift_wrap)
+            .await
+            .map_err(map_nip59_error)?;
+
+        if unwrapped.rumor.kind != Kind::Custom(KIND_MARMOT_WELCOME_RUMOR) {
+            return Err(PeelerError::Malformed(format!(
+                "expected Marmot welcome rumor kind {KIND_MARMOT_WELCOME_RUMOR}, got {}",
+                u16::from(unwrapped.rumor.kind)
+            )));
+        }
+        let welcome_bytes = decode_hex("welcome rumor content", &unwrapped.rumor.content)
+            .map_err(to_peeler_error)?;
+        if welcome_bytes.is_empty() {
+            return Err(PeelerError::Malformed(
+                "welcome rumor contained empty MLS welcome bytes".into(),
+            ));
+        }
+
+        Ok(PeeledMessage {
+            id: msg.id.clone(),
+            group_id: None,
+            sender: Some(MemberId::new(unwrapped.sender.to_bytes().to_vec())),
+            content: PeeledContent::Welcome {
+                bytes: welcome_bytes,
+            },
+            origin: msg.clone(),
+        })
     }
 
     async fn wrap_group_message(
@@ -163,12 +230,35 @@ impl TransportPeeler for NostrMlsPeeler {
 
     async fn wrap_welcome(
         &self,
-        _payload: &EncryptedPayload,
-        _recipient: &MemberId,
+        payload: &EncryptedPayload,
+        recipient: &MemberId,
     ) -> Result<TransportMessage, PeelerError> {
-        Err(PeelerError::WrapFailed(
-            "NIP-59 welcome gift wrapping requires signer/decrypter integration".into(),
-        ))
+        if !payload.aad.is_empty() {
+            return Err(PeelerError::WrapFailed(
+                "Nostr welcome wrap does not currently encode payload AAD".into(),
+            ));
+        }
+        if payload.ciphertext.is_empty() {
+            return Err(PeelerError::WrapFailed(
+                "welcome payload cannot be empty".into(),
+            ));
+        }
+        let signer = self.welcome_signer()?;
+        let sender_pubkey = signer
+            .get_public_key()
+            .await
+            .map_err(|e| PeelerError::WrapFailed(format!("signer public key: {e}")))?;
+        let recipient_pubkey = Self::recipient_pubkey(recipient)?;
+        let rumor: UnsignedEvent = EventBuilder::new(
+            Kind::Custom(KIND_MARMOT_WELCOME_RUMOR),
+            hex::encode(&payload.ciphertext),
+        )
+        .build(sender_pubkey);
+        let gift_wrap = EventBuilder::gift_wrap(signer, &recipient_pubkey, rumor, [])
+            .await
+            .map_err(|e| PeelerError::WrapFailed(format!("NIP-59 gift wrap: {e}")))?;
+        let event = NostrTransportEvent::from_nostr_event(&gift_wrap).map_err(to_peeler_error)?;
+        event.to_transport_message().map_err(to_peeler_error)
     }
 }
 
@@ -209,6 +299,38 @@ fn ensure_group_routing_matches(
         TransportEnvelope::Welcome { .. } => Err(PeelerError::Malformed(
             "group peeler received welcome envelope".into(),
         )),
+    }
+}
+
+fn ensure_welcome_routing_matches(
+    event: &NostrTransportEvent,
+    msg: &TransportMessage,
+) -> Result<(), PeelerError> {
+    let event_recipient = event
+        .tag_value(RECIPIENT_TAG)
+        .ok_or_else(|| PeelerError::Malformed("missing p tag".into()))
+        .and_then(|p| decode_hex_exact("recipient p tag", p, 32).map_err(to_peeler_error))?;
+    match &msg.envelope {
+        TransportEnvelope::Welcome { recipient } if recipient.as_slice() == event_recipient => {
+            Ok(())
+        }
+        TransportEnvelope::Welcome { .. } => Err(PeelerError::Malformed(
+            "event p tag does not match transport envelope".into(),
+        )),
+        TransportEnvelope::GroupMessage { .. } => Err(PeelerError::Malformed(
+            "welcome peeler received group envelope".into(),
+        )),
+    }
+}
+
+fn map_nip59_error(err: nostr::nips::nip59::Error) -> PeelerError {
+    match err {
+        nostr::nips::nip59::Error::NotGiftWrap => {
+            PeelerError::Malformed("Nostr event was not a gift wrap".into())
+        }
+        nostr::nips::nip59::Error::SenderMismatch
+        | nostr::nips::nip59::Error::Signer(_)
+        | nostr::nips::nip59::Error::Event(_) => PeelerError::DecryptFailed,
     }
 }
 
@@ -334,5 +456,154 @@ mod tests {
             .expect_err("mismatched route should not peel");
 
         assert!(matches!(err, PeelerError::Malformed(_)));
+    }
+
+    #[tokio::test]
+    async fn welcome_wrap_and_peel_round_trips_mls_welcome_bytes() {
+        let sender = sender_keys();
+        let receiver = receiver_keys();
+        let recipient = MemberId::new(receiver.public_key().to_bytes().to_vec());
+        let sender_peeler =
+            NostrMlsPeeler::new(sender.public_key().to_hex()).with_welcome_signer(sender.clone());
+        let receiver_peeler = NostrMlsPeeler::new(receiver.public_key().to_hex())
+            .with_welcome_signer(receiver.clone());
+
+        let wrapped = sender_peeler
+            .wrap_welcome(
+                &EncryptedPayload {
+                    ciphertext: b"mls welcome bytes".to_vec(),
+                    aad: vec![],
+                },
+                &recipient,
+            )
+            .await
+            .expect("wrap succeeds");
+
+        assert!(matches!(
+            wrapped.envelope,
+            TransportEnvelope::Welcome {
+                ref recipient,
+            } if recipient.as_slice() == receiver.public_key().as_bytes()
+        ));
+        let event = NostrTransportEvent::from_transport_message(&wrapped).unwrap();
+        assert_eq!(event.kind, KIND_NIP59_GIFT_WRAP);
+        assert!(event.sig.is_some());
+        assert_eq!(
+            event.tag_value("p"),
+            Some(receiver.public_key().to_hex().as_str())
+        );
+
+        let peeled = receiver_peeler
+            .peel_welcome(&wrapped)
+            .await
+            .expect("peel succeeds");
+
+        assert_eq!(peeled.id, wrapped.id);
+        assert_eq!(
+            peeled.sender,
+            Some(MemberId::new(sender.public_key().to_bytes().to_vec()))
+        );
+        assert_eq!(
+            peeled.content,
+            PeeledContent::Welcome {
+                bytes: b"mls welcome bytes".to_vec(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn welcome_peel_with_wrong_private_key_fails_closed() {
+        let sender = sender_keys();
+        let receiver = receiver_keys();
+        let wrong_receiver = wrong_receiver_keys();
+        let recipient = MemberId::new(receiver.public_key().to_bytes().to_vec());
+        let sender_peeler =
+            NostrMlsPeeler::new(sender.public_key().to_hex()).with_welcome_signer(sender);
+        let wrong_peeler = NostrMlsPeeler::new(wrong_receiver.public_key().to_hex())
+            .with_welcome_signer(wrong_receiver);
+        let wrapped = sender_peeler
+            .wrap_welcome(
+                &EncryptedPayload {
+                    ciphertext: b"mls welcome bytes".to_vec(),
+                    aad: vec![],
+                },
+                &recipient,
+            )
+            .await
+            .expect("wrap succeeds");
+
+        let err = wrong_peeler
+            .peel_welcome(&wrapped)
+            .await
+            .expect_err("wrong recipient key cannot decrypt");
+
+        assert!(matches!(err, PeelerError::DecryptFailed));
+    }
+
+    #[tokio::test]
+    async fn welcome_peel_rejects_mismatched_p_tag_and_envelope() {
+        let sender = sender_keys();
+        let receiver = receiver_keys();
+        let recipient = MemberId::new(receiver.public_key().to_bytes().to_vec());
+        let peeler =
+            NostrMlsPeeler::new(sender.public_key().to_hex()).with_welcome_signer(sender.clone());
+        let mut wrapped = peeler
+            .wrap_welcome(
+                &EncryptedPayload {
+                    ciphertext: b"mls welcome bytes".to_vec(),
+                    aad: vec![],
+                },
+                &recipient,
+            )
+            .await
+            .expect("wrap succeeds");
+        wrapped.envelope = TransportEnvelope::Welcome {
+            recipient: MemberId::new(vec![0x55; 32]),
+        };
+
+        let err = NostrMlsPeeler::new(receiver.public_key().to_hex())
+            .with_welcome_signer(receiver)
+            .peel_welcome(&wrapped)
+            .await
+            .expect_err("mismatched route should not peel");
+
+        assert!(matches!(err, PeelerError::Malformed(_)));
+    }
+
+    #[tokio::test]
+    async fn welcome_peel_rejects_authentic_non_welcome_rumor() {
+        let sender = sender_keys();
+        let receiver = receiver_keys();
+        let rumor = EventBuilder::text_note("not a Marmot welcome").build(sender.public_key());
+        let gift_wrap = EventBuilder::gift_wrap(&sender, &receiver.public_key(), rumor, [])
+            .await
+            .unwrap();
+        let wrapped = NostrTransportEvent::from_nostr_event(&gift_wrap)
+            .unwrap()
+            .to_transport_message()
+            .unwrap();
+
+        let err = NostrMlsPeeler::new(receiver.public_key().to_hex())
+            .with_welcome_signer(receiver)
+            .peel_welcome(&wrapped)
+            .await
+            .expect_err("wrong rumor kind should not peel");
+
+        assert!(matches!(err, PeelerError::Malformed(_)));
+    }
+
+    fn sender_keys() -> nostr::Keys {
+        nostr::Keys::parse("6b911fd37cdf5c81d4c0adb1ab7fa822ed253ab0ad9aa18d77257c88b29b718e")
+            .unwrap()
+    }
+
+    fn receiver_keys() -> nostr::Keys {
+        nostr::Keys::parse("7b911fd37cdf5c81d4c0adb1ab7fa822ed253ab0ad9aa18d77257c88b29b718e")
+            .unwrap()
+    }
+
+    fn wrong_receiver_keys() -> nostr::Keys {
+        nostr::Keys::parse("5b911fd37cdf5c81d4c0adb1ab7fa822ed253ab0ad9aa18d77257c88b29b718e")
+            .unwrap()
     }
 }

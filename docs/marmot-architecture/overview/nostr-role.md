@@ -44,8 +44,10 @@ The `TransportPeeler` trait is the explicit seam where this pluggability happens
 
 In this workspace, `crates/transport-nostr-peeler` is the first concrete Nostr
 peeler layer. It maps kind `445` / `1059` event shapes into engine transport
-messages and peels kind `445` group envelopes. Relay networking, event signing,
-and full NIP-59 welcome unwrapping remain adapter work above that crate.
+messages, peels kind `445` group envelopes, and handles NIP-59 welcome
+gift-wraps when the account-device layer supplies the local signer/decrypter.
+Relay networking, relay policy, and account key-management remain adapter or
+application work above that crate.
 
 ---
 

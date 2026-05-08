@@ -4,6 +4,7 @@ use crate::{
 };
 use cgka_traits::transport::{Timestamp, TransportEnvelope, TransportMessage, TransportSource};
 use cgka_traits::types::{MemberId, MessageId};
+use nostr::{Event, JsonUtil};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -23,6 +24,8 @@ pub struct NostrTransportEvent {
     pub kind: u64,
     pub tags: Vec<Vec<String>>,
     pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sig: Option<String>,
 }
 
 impl NostrTransportEvent {
@@ -46,6 +49,7 @@ impl NostrTransportEvent {
                 }
             }
             KIND_NIP59_GIFT_WRAP => {
+                self.to_verified_nostr_event()?;
                 let recipient = self
                     .tag_value(RECIPIENT_TAG)
                     .ok_or_else(|| NostrPeelerError::MissingTag(RECIPIENT_TAG.into()))?;
@@ -72,6 +76,32 @@ impl NostrTransportEvent {
         serde_json::from_slice(&msg.payload).map_err(|e| NostrPeelerError::Malformed(e.to_string()))
     }
 
+    /// Convert a signed Nostr SDK event into the boundary DTO.
+    pub fn from_nostr_event(event: &Event) -> Result<Self, NostrPeelerError> {
+        serde_json::from_value(serde_json::to_value(event).map_err(|e| {
+            NostrPeelerError::Malformed(format!("failed to serialize Nostr event: {e}"))
+        })?)
+        .map_err(|e| NostrPeelerError::Malformed(format!("failed to map Nostr event: {e}")))
+    }
+
+    /// Convert this DTO into a signed, verified Nostr SDK event.
+    pub fn to_verified_nostr_event(&self) -> Result<Event, NostrPeelerError> {
+        if self.sig.is_none() {
+            return Err(NostrPeelerError::Malformed(
+                "signed Nostr event is missing sig".into(),
+            ));
+        }
+        let event = Event::from_json(
+            serde_json::to_vec(self)
+                .map_err(|e| NostrPeelerError::Malformed(format!("event JSON: {e}")))?,
+        )
+        .map_err(|e| NostrPeelerError::Malformed(format!("Nostr event parse: {e}")))?;
+        event
+            .verify()
+            .map_err(|e| NostrPeelerError::Malformed(format!("Nostr event verification: {e}")))?;
+        Ok(event)
+    }
+
     /// Return the first value for a Nostr tag name.
     pub fn tag_value(&self, name: &str) -> Option<&str> {
         self.tags
@@ -96,6 +126,7 @@ impl NostrTransportEvent {
             kind,
             tags,
             content,
+            sig: None,
         }
     }
 }
@@ -169,6 +200,7 @@ mod tests {
                 vec!["e".into(), "99".repeat(32)],
             ],
             content: "encrypted body".into(),
+            sig: None,
         };
 
         let msg = event.to_transport_message().expect("event maps");
@@ -189,8 +221,37 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn signed_kind_1059_event_maps_to_welcome_transport_message() {
+        let sender =
+            nostr::Keys::parse("6b911fd37cdf5c81d4c0adb1ab7fa822ed253ab0ad9aa18d77257c88b29b718e")
+                .unwrap();
+        let receiver =
+            nostr::Keys::parse("7b911fd37cdf5c81d4c0adb1ab7fa822ed253ab0ad9aa18d77257c88b29b718e")
+                .unwrap();
+        let rumor =
+            nostr::EventBuilder::text_note("not a Marmot welcome").build(sender.public_key());
+        let gift_wrap = nostr::EventBuilder::gift_wrap(&sender, &receiver.public_key(), rumor, [])
+            .await
+            .unwrap();
+        let event = NostrTransportEvent::from_nostr_event(&gift_wrap).unwrap();
+
+        let msg = event.to_transport_message().expect("event maps");
+
+        assert_eq!(
+            msg.envelope,
+            TransportEnvelope::Welcome {
+                recipient: MemberId::new(receiver.public_key().to_bytes().to_vec()),
+            }
+        );
+        assert_eq!(
+            NostrTransportEvent::from_transport_message(&msg).expect("payload parses"),
+            event
+        );
+    }
+
     #[test]
-    fn kind_1059_event_maps_to_welcome_transport_message() {
+    fn unsigned_kind_1059_event_is_rejected() {
         let event = NostrTransportEvent {
             id: "33".repeat(32),
             pubkey: "44".repeat(32),
@@ -198,19 +259,13 @@ mod tests {
             kind: KIND_NIP59_GIFT_WRAP,
             tags: vec![vec!["p".into(), "55".repeat(32)]],
             content: "gift wrap body".into(),
+            sig: None,
         };
 
-        let msg = event.to_transport_message().expect("event maps");
+        let err = event
+            .to_transport_message()
+            .expect_err("unsigned gift wrap should not map");
 
-        assert_eq!(
-            msg.envelope,
-            TransportEnvelope::Welcome {
-                recipient: MemberId::new(vec![0x55; 32]),
-            }
-        );
-        assert_eq!(
-            NostrTransportEvent::from_transport_message(&msg).expect("payload parses"),
-            event
-        );
+        assert!(matches!(err, NostrPeelerError::Malformed(_)));
     }
 }

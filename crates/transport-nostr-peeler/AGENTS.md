@@ -9,6 +9,7 @@ This crate owns the Nostr transport-edge peeler:
 - Nostr-shaped event DTOs,
 - mapping kind `445` / `1059` events into `TransportMessage`,
 - kind `445` group envelope encryption and decryption,
+- NIP-59 welcome wrapping/peeling with injected signer/decrypter,
 - explicit errors for malformed or unsupported Nostr boundary input.
 
 It must not own relay networking, relay selection, account-device sessions, app
@@ -27,8 +28,10 @@ layer above this crate.
 ## Current limits
 
 - Group messages are wrapped and peeled.
-- Welcome events are classified, but full NIP-59 gift wrapping and unwrapping
-  still needs signer/decrypter integration.
+- Welcomes are wrapped and peeled through NIP-59 when callers inject the local
+  signer/decrypter. This crate must not decide where that signer comes from.
+- Kind `445` group outputs carry a pre-signing id; final relay publication may
+  replace it after signing.
 
 ## Verification
 

@@ -73,7 +73,8 @@ This repository now has the main engine candidate:
 - `crates/storage-sqlite` — SQLCipher-backed SQLite storage for Marmot and
   custom OpenMLS state, with Rust migrations for schema/data evolution.
 - `crates/transport-nostr-peeler` — Nostr boundary mapping for kind `445` /
-  `1059` events and kind `445` group envelope peeling.
+  `1059` events, kind `445` group envelope peeling, and NIP-59 welcome
+  wrap/peel with injected local signer/decrypter.
 - `crates/cgka-conformance-simulator` — multi-client simulator, vectors,
   generated scenarios, and property tests.
 - `formal/tamarin` — formal models for the convergence selector, delivery-order
@@ -93,9 +94,9 @@ losing-branch invalidations, and test generated delivery variants.
   packaging, and longer-term rekey/vacuum/checkpoint policy still need
   production wiring.
 - **Production transport adapters** — the simulator uses an in-memory bus and
-  `MockPeeler`. The Nostr peeler boundary now exists for group messages, but
-  relay networking, final event signing, and NIP-59 welcome gift-wrap
-  decryption still live outside this engine workspace.
+  `MockPeeler`. The Nostr peeler boundary now exists for group messages and
+  welcomes, but relay networking, final group-event signing, and account
+  key-management wiring still live outside this engine workspace.
 - **Portable fork-recovery vectors** — fork recovery is tested in Rust, but
   OpenMLS commit randomness makes stable external vectors harder.
 - **Safe Extensions framework support** — still gated on backend library
