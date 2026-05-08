@@ -15,6 +15,15 @@ ABI="${1:-}"
 OUTPUT_DIR="${2:-}"
 OPENSSL_VERSION="${OPENSSL_VERSION:-3.3.2}"
 
+# SHA-256 of the upstream openssl-${OPENSSL_VERSION}.tar.gz release tarball.
+# Sourced from the official OpenSSL release (openssl.org) and cross-checked
+# against the GitHub release's published .sha256 sidecar. Update this in
+# lockstep with OPENSSL_VERSION; mismatched values must abort the build.
+declare -A OPENSSL_SHA256_BY_VERSION=(
+    ["3.3.2"]="2e8a40b01979afe8be0bbfb3de5dc1c6709fedb46d6c89c10da114ab5fc3d281"
+)
+OPENSSL_SHA256="${OPENSSL_SHA256:-${OPENSSL_SHA256_BY_VERSION[${OPENSSL_VERSION}]:-}}"
+
 if [ -z "$ABI" ] || [ -z "$OUTPUT_DIR" ]; then
     echo "Usage: $0 <ABI> <OUTPUT_DIR>"
     echo "  ABI: arm64-v8a, armeabi-v7a, x86_64, x86"
@@ -24,6 +33,13 @@ fi
 
 if [ -z "${NDK_HOME:-}" ]; then
     echo "Error: NDK_HOME environment variable is not set"
+    exit 1
+fi
+
+if [ -z "${OPENSSL_SHA256}" ]; then
+    echo "Error: no pinned SHA-256 for OpenSSL ${OPENSSL_VERSION}."
+    echo "  Add the verified upstream hash to OPENSSL_SHA256_BY_VERSION,"
+    echo "  or set OPENSSL_SHA256 explicitly in the environment."
     exit 1
 fi
 
@@ -128,6 +144,13 @@ echo "  Output: ${OUTPUT_DIR}"
 cd "${BUILD_DIR}"
 curl -fsSL "https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/openssl-${OPENSSL_VERSION}.tar.gz" \
     -o openssl.tar.gz
+
+# Verify integrity before extraction. A mismatch indicates the tarball was
+# tampered with in transit, on the CDN, or in the GitHub release; in any of
+# those cases continuing the build would link a compromised OpenSSL into the
+# distributed Android library.
+echo "${OPENSSL_SHA256}  openssl.tar.gz" | sha256sum -c -
+
 tar -xzf openssl.tar.gz
 cd "openssl-${OPENSSL_VERSION}"
 
