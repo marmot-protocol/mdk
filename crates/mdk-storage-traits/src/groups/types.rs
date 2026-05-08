@@ -106,6 +106,11 @@ pub struct Group {
     ///
     /// See [`SelfUpdateState`] for the possible values and their meanings.
     pub self_update_state: SelfUpdateState,
+    /// Disappearing message duration in seconds
+    ///
+    /// - `None`: Messages persist forever (disabled)
+    /// - `Some(n)`: Messages expire `n` seconds after creation (`n > 0`)
+    pub disappearing_message_secs: Option<u64>,
 }
 
 impl fmt::Debug for Group {
@@ -217,6 +222,7 @@ mod tests {
             epoch: 0,
             state: GroupState::Active,
             self_update_state: SelfUpdateState::Required,
+            disappearing_message_secs: None,
         }
     }
 
@@ -364,6 +370,7 @@ mod tests {
             epoch: 0,
             state: GroupState::Active,
             self_update_state: SelfUpdateState::Required,
+            disappearing_message_secs: None,
         };
 
         let serialized = serde_json::to_value(&group).unwrap();
@@ -397,6 +404,7 @@ mod tests {
             epoch: 0,
             state: GroupState::Active,
             self_update_state: SelfUpdateState::Required,
+            disappearing_message_secs: None,
         };
 
         let err = serde_json::to_value(&group)
@@ -425,6 +433,7 @@ mod tests {
             epoch: 3,
             state: GroupState::Active,
             self_update_state: SelfUpdateState::Required,
+            disappearing_message_secs: None,
         };
 
         let debug_str = format!("{:?}", group);

@@ -74,6 +74,7 @@ async fn main() -> Result<(), Error> {
         Some(image_nonce),
         vec![relay_url.clone()],
         vec![alice_keys.public_key(), bob_keys.public_key()],
+        None, // disappearing_message_secs
     );
 
     let group_create_result = alice_mdk.create_group(
