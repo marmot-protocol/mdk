@@ -247,7 +247,9 @@ Engine integration and OpenMLS conformance tests also cover:
 - missing retained anchor reported without mutation,
 - retained anchor pruning by `max_rewind_commits`,
 - stale commits older than the retained anchor invalidated,
-- retained-anchor replay and stale invalidation after engine rebuild.
+- retained-anchor replay and stale invalidation after engine rebuild,
+- peeler-ingest to `GroupEvent` output across multiple in-memory clients,
+  including canonical app delivery and losing-branch app invalidation.
 
 ## Formal Verification
 

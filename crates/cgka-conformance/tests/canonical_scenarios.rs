@@ -10,9 +10,10 @@ use cgka_conformance::{
     run_scenario_spec,
 };
 use cgka_engine::feature_registry::FeatureRegistry;
+use cgka_engine::openmls_projection::{OpenMlsContentKind, project_mls_message};
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
-use cgka_traits::engine::GroupEvent;
-use cgka_traits::types::MemberId;
+use cgka_traits::engine::{AppMessageInvalidationReason, GroupEvent};
+use cgka_traits::types::{EpochId, MemberId, MessageId};
 
 fn pad32(name: &[u8]) -> Vec<u8> {
     // MIP-01 admin pubkeys MUST be 32 bytes. Test identities get
@@ -801,6 +802,138 @@ async fn deliberate_fork_via_harness() {
 }
 
 #[tokio::test]
+async fn convergence_e2e_from_peeler_ingest_to_group_events() {
+    let bus = TransportBus::ordered();
+    let mut alice = ClientBuilder::new(pad32(b"alice"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+    let mut bob = ClientBuilder::new(pad32(b"bob"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+    let mut carol = ClientBuilder::new(pad32(b"carol"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+    let mut frank = ClientBuilder::new(pad32(b"frank"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+    let mut david = ClientBuilder::new(pad32(b"david"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+    let mut eve = ClientBuilder::new(pad32(b"eve"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+
+    let bob_kp = bob.fresh_key_package().await;
+    let carol_kp = carol.fresh_key_package().await;
+    let frank_kp = frank.fresh_key_package().await;
+    let (_group_id, pending) = alice
+        .create_group("convergence-e2e", vec![bob_kp, carol_kp, frank_kp], vec![])
+        .await;
+    alice.confirm(pending).await;
+    bus.deliver_all();
+    bob.tick().await;
+    carol.tick().await;
+    frank.tick().await;
+    for client in [&mut alice, &mut bob, &mut carol, &mut frank] {
+        client.drain_events();
+    }
+
+    let david_kp = david.fresh_key_package().await;
+    let eve_kp = eve.fresh_key_package().await;
+    let alice_pending = alice.invite(vec![david_kp]).await;
+    let bob_pending = bob.invite(vec![eve_kp]).await;
+    alice.confirm(alice_pending).await;
+    bob.confirm(bob_pending).await;
+    let alice_app = alice
+        .send_app_capture(b"alice branch payload".to_vec())
+        .await;
+    let bob_app = bob.send_app_capture(b"bob branch payload".to_vec()).await;
+
+    let queued_messages = bus.queued_messages();
+    let commit_messages: Vec<_> = queued_messages
+        .iter()
+        .filter(|message| {
+            project_mls_message(&message.payload)
+                .is_ok_and(|projection| projection.kind == OpenMlsContentKind::Commit)
+        })
+        .collect();
+    assert_eq!(
+        commit_messages.len(),
+        2,
+        "expected exactly the two competing invite commits in the bus queue"
+    );
+    let alice_commit_digest = project_mls_message(&commit_messages[0].payload)
+        .expect("alice commit projects")
+        .message_digest;
+    let bob_commit_digest = project_mls_message(&commit_messages[1].payload)
+        .expect("bob commit projects")
+        .message_digest;
+    let selected_index = if alice_commit_digest < bob_commit_digest {
+        0
+    } else {
+        1
+    };
+    let expected_payload = if selected_index == 0 {
+        b"alice branch payload".to_vec()
+    } else {
+        b"bob branch payload".to_vec()
+    };
+    let losing_payload = if selected_index == 0 {
+        b"bob branch payload".to_vec()
+    } else {
+        b"alice branch payload".to_vec()
+    };
+    let expected_member = if selected_index == 0 {
+        MemberId::new(pad32(b"david"))
+    } else {
+        MemberId::new(pad32(b"eve"))
+    };
+    let losing_member = if selected_index == 0 {
+        MemberId::new(pad32(b"eve"))
+    } else {
+        MemberId::new(pad32(b"david"))
+    };
+    let losing_app_id = if selected_index == 0 {
+        bob_app.id.clone()
+    } else {
+        alice_app.id.clone()
+    };
+
+    bus.deliver_all();
+    let carol_outcomes = carol.tick().await;
+    let frank_outcomes = frank.tick().await;
+    assert_tick_reached_convergence("carol", &carol_outcomes);
+    assert_tick_reached_convergence("frank", &frank_outcomes);
+
+    assert_canonical_application_events(
+        "carol",
+        carol.drain_events(),
+        expected_payload.clone(),
+        losing_payload.clone(),
+        losing_app_id.clone(),
+    );
+    assert_canonical_application_events(
+        "frank",
+        frank.drain_events(),
+        expected_payload,
+        losing_payload,
+        losing_app_id,
+    );
+    assert_eq!(carol.epoch(), EpochId(2));
+    assert_eq!(frank.epoch(), EpochId(2));
+    for (name, members) in [("carol", carol.members()), ("frank", frank.members())] {
+        assert!(
+            members.iter().any(|member| member.id == expected_member),
+            "{name} should contain the selected branch invitee"
+        );
+        assert!(
+            !members.iter().any(|member| member.id == losing_member),
+            "{name} should not contain the losing branch invitee"
+        );
+    }
+}
+
+#[tokio::test]
 async fn canonical_vector_fixtures_match_generated_traces() {
     // Fork-recovery vectors are deliberately absent: under content-derived
     // ordering (`CommitOrderingKey { source_epoch, commit_digest }`), the
@@ -822,6 +955,78 @@ async fn canonical_vector_fixtures_match_generated_traces() {
             .expect("fixture scenario runs");
         assert_vector_fixture_matches(fixture_name, &fixture, observed_trace);
     }
+}
+
+fn assert_tick_reached_convergence(
+    client: &str,
+    outcomes: &[Result<cgka_traits::ingest::IngestOutcome, cgka_traits::EngineError>],
+) {
+    assert!(
+        outcomes.iter().all(Result::is_ok),
+        "{client} should not hit ingest errors: {outcomes:?}"
+    );
+    assert!(
+        outcomes.iter().any(|outcome| {
+            matches!(
+                outcome,
+                Ok(cgka_traits::ingest::IngestOutcome::Buffered { .. })
+            )
+        }),
+        "{client} should have buffered convergence input from peeler ingest: {outcomes:?}"
+    );
+}
+
+fn assert_canonical_application_events(
+    client: &str,
+    events: Vec<GroupEvent>,
+    expected_payload: Vec<u8>,
+    losing_payload: Vec<u8>,
+    losing_app_id: MessageId,
+) {
+    let received_payloads: Vec<Vec<u8>> = events
+        .iter()
+        .filter_map(|event| match event {
+            GroupEvent::MessageReceived { payload, .. } => Some(payload.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        received_payloads,
+        vec![expected_payload],
+        "{client} should receive exactly the canonical branch application payload"
+    );
+    assert!(
+        !received_payloads.contains(&losing_payload),
+        "{client} must not receive the losing branch payload as a normal app message"
+    );
+    assert!(
+        events.iter().any(|event| {
+            matches!(
+                event,
+                GroupEvent::AppMessageInvalidated {
+                    message_id,
+                    epoch: EpochId(2),
+                    reason: AppMessageInvalidationReason::LosingBranch,
+                    decrypted_payload_ref: Some(_),
+                    ..
+                } if *message_id == losing_app_id
+            )
+        }),
+        "{client} should receive an invalidation event for the losing branch app message: {events:?}"
+    );
+    assert!(
+        events.iter().any(|event| {
+            matches!(
+                event,
+                GroupEvent::EpochChanged {
+                    from: EpochId(1),
+                    to: EpochId(2),
+                    ..
+                }
+            )
+        }),
+        "{client} should observe the canonical epoch transition: {events:?}"
+    );
 }
 
 fn assert_vector_fixture_matches(

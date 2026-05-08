@@ -517,6 +517,8 @@ The conformance suite should cover:
 - proposal not consumed by a canonical commit left pending,
 - proposal on losing branch dropped,
 - app message on losing branch invalidated with payload reference when known,
+- end-to-end peeler ingest emits only canonical application `GroupEvent`
+  output and losing-branch invalidation events across multiple clients,
 - app message beyond MLS past-epoch retention expired,
 - commit beyond `max_rewind_commits` discarded,
 - late same-epoch commit inside the retained anchor window replayed from the
