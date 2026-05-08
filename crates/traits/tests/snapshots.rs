@@ -13,7 +13,8 @@ use cgka_traits::capabilities::{
     TransportKind,
 };
 use cgka_traits::engine::{
-    CommitOrderingKey, CreateGroupRequest, GroupEvent, KeyPackage, SendIntent, SendResult,
+    AppMessageInvalidationReason, CommitOrderingKey, CreateGroupRequest, GroupEvent, KeyPackage,
+    SendIntent, SendResult,
 };
 use cgka_traits::engine_state::PendingStateRef;
 use cgka_traits::group::{Group, Member};
@@ -223,6 +224,16 @@ fn snapshot_group_events() {
             group_id: gid(),
             sender: mem_id(),
             payload: b"hi".to_vec(),
+        }
+    );
+    insta::assert_json_snapshot!(
+        "event_app_message_invalidated",
+        GroupEvent::AppMessageInvalidated {
+            group_id: gid(),
+            message_id: mid(),
+            epoch: EpochId(2),
+            reason: AppMessageInvalidationReason::LosingBranch,
+            decrypted_payload_ref: Some("sha256:payload".into()),
         }
     );
     insta::assert_json_snapshot!(

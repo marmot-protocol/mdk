@@ -100,6 +100,15 @@ pub enum SendResult {
     },
 }
 
+/// Why an application message did not become canonical group output.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AppMessageInvalidationReason {
+    LosingBranch,
+    BeyondAnchor,
+    BeyondAppRetention,
+    UndecryptableInCanonicalState,
+}
+
 /// Deterministic, content-derived ordering key used to resolve same-epoch
 /// commit races. Two replicas processing the same commit derive the same key
 /// from the same MLS wire bytes, independent of transport metadata. Lower keys
@@ -155,6 +164,13 @@ pub enum GroupEvent {
         group_id: GroupId,
         sender: MemberId,
         payload: Vec<u8>,
+    },
+    AppMessageInvalidated {
+        group_id: GroupId,
+        message_id: MessageId,
+        epoch: EpochId,
+        reason: AppMessageInvalidationReason,
+        decrypted_payload_ref: Option<String>,
     },
     MemberAdded {
         group_id: GroupId,
@@ -247,6 +263,9 @@ pub trait CgkaEngine: Send + Sync {
     /// that is now safe to regenerate from the selected canonical state.
     /// Accepted inbound application messages from the canonical branch are
     /// appended to [`Self::drain_events`] as [`GroupEvent::MessageReceived`].
+    /// Invalidated application messages are appended as
+    /// [`GroupEvent::AppMessageInvalidated`] so applications can decide
+    /// whether to hide, annotate, or surface them separately.
     ///
     /// Applications should call this after relay sync batches, reconnect
     /// catch-up, or a convergence timer tick. The engine uses its local

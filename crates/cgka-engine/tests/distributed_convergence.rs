@@ -10,7 +10,10 @@ use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::openmls_projection::project_mls_message;
 use cgka_engine::{Engine, EngineBuilder};
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
-use cgka_traits::engine::{CgkaEngine, CreateGroupRequest, GroupEvent, SendIntent, SendResult};
+use cgka_traits::engine::{
+    AppMessageInvalidationReason, CgkaEngine, CreateGroupRequest, GroupEvent, SendIntent,
+    SendResult,
+};
 use cgka_traits::error::PeelerError;
 use cgka_traits::group_context::GroupContextSnapshot;
 use cgka_traits::ingest::{PeeledContent, PeeledMessage};
@@ -1395,6 +1398,20 @@ async fn engine_emits_only_canonical_branch_app_messages_after_convergence() {
             b"bob branch payload".to_vec()
         }]
     );
+    assert!(events.iter().any(|event| {
+        matches!(
+            event,
+            GroupEvent::AppMessageInvalidated {
+                group_id: event_group,
+                message_id,
+                epoch,
+                reason: AppMessageInvalidationReason::LosingBranch,
+                decrypted_payload_ref: Some(_),
+            } if *event_group == group_id
+                && *message_id == app_messages[losing_index].id
+                && *epoch == EpochId(2)
+        )
+    }));
 }
 
 #[tokio::test]
@@ -1469,6 +1486,133 @@ async fn rebuilt_engine_emits_canonical_app_message_after_convergence() {
             )
         }),
         "expected rebuilt engine to emit canonical app payload, got {events:?}"
+    );
+}
+
+#[tokio::test]
+async fn rebuilt_engine_emits_losing_branch_app_invalidation_after_convergence() {
+    let (mut alice, _alice_storage) = build_client(b"alice");
+    let (mut bob, _bob_storage) = build_client(b"bob");
+    let (mut carol, carol_storage) = build_client(b"carol");
+    let (mut david, _david_storage) = build_client(b"david");
+    let (mut eve, _eve_storage) = build_client(b"eve");
+
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "engine-restart-app-invalidation".into(),
+            description: "".into(),
+            members: vec![bob_kp, carol_kp],
+            required_features: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(welcome_for(&welcomes, b"bob"))
+        .await
+        .unwrap();
+    carol
+        .join_welcome(welcome_for(&welcomes, b"carol"))
+        .await
+        .unwrap();
+
+    let david_kp = david.fresh_key_package().await.unwrap();
+    let eve_kp = eve.fresh_key_package().await.unwrap();
+    let alice_invite = alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![david_kp],
+        })
+        .await
+        .unwrap();
+    let bob_invite = bob
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![eve_kp],
+        })
+        .await
+        .unwrap();
+    let (alice_commit, alice_pending) = evolution(alice_invite);
+    let (bob_commit, bob_pending) = evolution(bob_invite);
+    let commit_messages = [
+        route(alice_commit.clone(), &group_id),
+        route(bob_commit.clone(), &group_id),
+    ];
+
+    alice.confirm_published(alice_pending).await.unwrap();
+    bob.confirm_published(bob_pending).await.unwrap();
+    let app_messages = [
+        send_app(&mut alice, &group_id, b"restart alice branch".to_vec()).await,
+        send_app(&mut bob, &group_id, b"restart bob branch".to_vec()).await,
+    ];
+
+    let first_digest = project_mls_message(&commit_messages[0].payload)
+        .expect("first commit projects")
+        .message_digest;
+    let second_digest = project_mls_message(&commit_messages[1].payload)
+        .expect("second commit projects")
+        .message_digest;
+    let selected_index = if first_digest < second_digest { 0 } else { 1 };
+    let losing_index = 1 - selected_index;
+
+    for message in commit_messages.iter().chain(app_messages.iter()) {
+        carol
+            .buffer_openmls_convergence_message(&group_id, message.clone(), 1_000)
+            .expect("message buffered");
+    }
+
+    let mut restarted = EngineBuilder::new(carol_storage.clone())
+        .identity(pad32(b"carol"))
+        .feature_registry(selfremove_registry())
+        .peeler(Box::new(MockPeeler))
+        .build()
+        .unwrap();
+
+    let result = restarted
+        .converge_stored_openmls_messages(&group_id, 1_000_000)
+        .expect("rebuilt engine converges stored OpenMLS messages");
+
+    assert_eq!(
+        result.accepted_app_messages,
+        vec![hex::encode(app_messages[selected_index].id.as_slice())]
+    );
+    assert_message_state(
+        &carol_storage,
+        &app_messages[losing_index],
+        MessageState::EpochInvalidated,
+    );
+    let events = restarted.drain_events();
+    assert!(events.iter().any(|event| {
+        matches!(
+            event,
+            GroupEvent::AppMessageInvalidated {
+                group_id: event_group,
+                message_id,
+                reason: AppMessageInvalidationReason::LosingBranch,
+                ..
+            } if *event_group == group_id && *message_id == app_messages[losing_index].id
+        )
+    }));
+    let received_payloads: Vec<Vec<u8>> = events
+        .iter()
+        .filter_map(|event| match event {
+            GroupEvent::MessageReceived { payload, .. } => Some(payload.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        received_payloads,
+        vec![if selected_index == 0 {
+            b"restart alice branch".to_vec()
+        } else {
+            b"restart bob branch".to_vec()
+        }]
     );
 }
 

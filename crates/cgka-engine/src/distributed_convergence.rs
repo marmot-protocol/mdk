@@ -3,7 +3,8 @@
 use std::collections::HashSet;
 
 use crate::canonicalization::{
-    CanonicalizationPolicy, CanonicalizationResult, CanonicalizationState, SyncState,
+    CanonicalizationPolicy, CanonicalizationResult, CanonicalizationState,
+    InvalidatedAppMessageReason, SyncState,
 };
 use crate::engine::Engine;
 use crate::openmls_projection::{
@@ -11,11 +12,11 @@ use crate::openmls_projection::{
     apply_openmls_canonicalization_result, canonicalize_stored_openmls_messages,
     project_mls_message,
 };
-use cgka_traits::engine::GroupEvent;
+use cgka_traits::engine::{AppMessageInvalidationReason, GroupEvent};
 use cgka_traits::message::{MessageRecord, MessageState};
 use cgka_traits::storage::{StorageError, StorageProvider};
 use cgka_traits::transport::TransportMessage;
-use cgka_traits::types::{EpochId, GroupId, MemberId};
+use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
 
 impl<S: StorageProvider> Engine<S> {
     pub fn set_convergence_policy(&mut self, policy: CanonicalizationPolicy) {
@@ -155,6 +156,7 @@ impl<S: StorageProvider> Engine<S> {
             )?;
         }
         self.emit_application_replay_events(group_id, &observations);
+        self.emit_invalidated_app_events(group_id, &result)?;
 
         self.remember_canonicalization_result_messages(&result);
         Ok(result)
@@ -227,6 +229,24 @@ impl<S: StorageProvider> Engine<S> {
         }
     }
 
+    fn emit_invalidated_app_events(
+        &mut self,
+        group_id: &GroupId,
+        result: &CanonicalizationResult,
+    ) -> Result<(), OpenMlsProjectionError> {
+        for invalidated in &result.invalidated_app_messages {
+            self.events_buf
+                .push_back(GroupEvent::AppMessageInvalidated {
+                    group_id: group_id.clone(),
+                    message_id: message_id_from_hex(&invalidated.message_id)?,
+                    epoch: EpochId(invalidated.epoch),
+                    reason: app_invalidation_reason(invalidated.reason),
+                    decrypted_payload_ref: invalidated.decrypted_payload_ref.clone(),
+                });
+        }
+        Ok(())
+    }
+
     fn remember_canonicalization_result_messages(&mut self, result: &CanonicalizationResult) {
         for message_id in result
             .accepted_commits
@@ -253,6 +273,25 @@ impl<S: StorageProvider> Engine<S> {
                 self.seen_message_ids
                     .insert(cgka_traits::types::MessageId::new(bytes));
             }
+        }
+    }
+}
+
+fn message_id_from_hex(encoded: &str) -> Result<MessageId, OpenMlsProjectionError> {
+    hex::decode(encoded)
+        .map(MessageId::new)
+        .map_err(|e| OpenMlsProjectionError::Decode(format!("message id {encoded}: {e:?}")))
+}
+
+fn app_invalidation_reason(reason: InvalidatedAppMessageReason) -> AppMessageInvalidationReason {
+    match reason {
+        InvalidatedAppMessageReason::LosingBranch => AppMessageInvalidationReason::LosingBranch,
+        InvalidatedAppMessageReason::BeyondAnchor => AppMessageInvalidationReason::BeyondAnchor,
+        InvalidatedAppMessageReason::BeyondAppRetention => {
+            AppMessageInvalidationReason::BeyondAppRetention
+        }
+        InvalidatedAppMessageReason::UndecryptableInCanonicalState => {
+            AppMessageInvalidationReason::UndecryptableInCanonicalState
         }
     }
 }

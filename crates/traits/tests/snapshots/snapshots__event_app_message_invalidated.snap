@@ -1,0 +1,23 @@
+---
+source: crates/traits/tests/snapshots.rs
+expression: "GroupEvent::AppMessageInvalidated\n{\n    group_id: gid(), message_id: mid(), epoch: EpochId(2), reason:\n    AppMessageInvalidationReason::LosingBranch, decrypted_payload_ref:\n    Some(\"sha256:payload\".into()),\n}"
+---
+{
+  "AppMessageInvalidated": {
+    "group_id": [
+      170,
+      170,
+      170,
+      170
+    ],
+    "message_id": [
+      187,
+      187,
+      187,
+      187
+    ],
+    "epoch": 2,
+    "reason": "LosingBranch",
+    "decrypted_payload_ref": "sha256:payload"
+  }
+}

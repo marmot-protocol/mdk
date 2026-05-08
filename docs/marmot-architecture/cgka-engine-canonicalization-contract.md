@@ -354,7 +354,9 @@ InvalidatedAppMessage {
 ```
 
 Applications decide whether to hide, mark, or surface invalidated messages.
-The engine only reports protocol disposition.
+The engine reports protocol disposition through
+`GroupEvent::AppMessageInvalidated`; it MUST NOT emit an invalidated message as
+`GroupEvent::MessageReceived`.
 
 ## Outbound Intents
 
