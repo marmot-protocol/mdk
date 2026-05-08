@@ -126,6 +126,18 @@ That maps to the welcome-before-commit ingest tests and the fork-detection
 boundary where only a client's own local commit history makes stale same-source
 commits fork candidates.
 
+The current proposal proof slice is:
+
+```text
+applied canonical branch + consumed proposal relation => accepted proposal;
+proposal on losing branch => dropped proposal;
+dropped proposal => never accepted
+```
+
+That maps to canonicalization's `accepted_proposals` and `dropped_messages`
+dispositions, with OpenMLS supplying the consumed-proposal relation during
+replay.
+
 The v0 model now uses bounded symbolic score classes instead of an opaque
 `ScoreCase` fact:
 

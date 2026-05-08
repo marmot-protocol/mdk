@@ -720,6 +720,47 @@ rule Init_Own_Commit_Fork_Handoff:
     !CommitOnBranchState(~run, 'group', 'foreign_commit', 'foreign_branch')
   ]
 
+/*
+  Scenario 18:
+
+  A selected canonical commit consumes one pending proposal. A different
+  proposal that only belongs to the losing branch is dropped instead of
+  becoming accepted application state.
+*/
+rule Init_Proposal_Canonical_Consumption:
+  [ Fr(~run) ]
+--[
+    Scenario(~run, 'proposal_canonical_consumption'),
+    SameInputSet(~run, 'alice'),
+    SameInputSet(~run, 'bob'),
+    PolicyLoaded(~run, 'group', 'default_policy'),
+    Eligible(~run, 'selected'),
+    Eligible(~run, 'losing'),
+    Score(~run, 'selected', 'd2', 'd2', 'qno', 'w1', 'gff'),
+    Score(~run, 'losing', 'd1', 'd1', 'qno', 'w1', 'g00'),
+    ScoreGreater(~run, 'd2', 'd1'),
+    ProposalMessage(~run, 'remove_bob', 'proposal_pending'),
+    ProposalMessage(~run, 'losing_remove', 'losing'),
+    CommitConsumesProposal(~run, 'selected', 'remove_bob'),
+    BranchDifferent(~run, 'losing', 'selected')
+  ]->
+  [
+    Compare(~run, 'selected', 'losing'),
+    Compare(~run, 'losing', 'selected'),
+    View(~run, 'alice', 'selected', 'losing'),
+    View(~run, 'bob', 'losing', 'selected'),
+    !PolicyLoadedState(~run),
+    !EligibleState(~run, 'selected'),
+    !EligibleState(~run, 'losing'),
+    !ScoreState(~run, 'selected', 'd2', 'd2', 'qno', 'w1', 'gff'),
+    !ScoreState(~run, 'losing', 'd1', 'd1', 'qno', 'w1', 'g00'),
+    !GtState(~run, 'd2', 'd1'),
+    !ProposalMessageState(~run, 'remove_bob', 'proposal_pending'),
+    !ProposalMessageState(~run, 'losing_remove', 'losing'),
+    !CommitConsumesProposalState(~run, 'selected', 'remove_bob'),
+    !BranchDifferentState(~run, 'losing', 'selected')
+  ]
+
 rule Derive_Stale_Beyond_Rewind:
   [
     !RetainedAnchorState(run, anchor),
@@ -1055,6 +1096,28 @@ rule Emit_Accepted_App_Output:
   ]->
   []
 
+rule Accept_Proposal_Consumed_By_Canonical_Branch:
+  [
+    !AppliedCanonicalBranchState(run, client, branch),
+    !ProposalMessageState(run, proposal, proposal_branch),
+    !CommitConsumesProposalState(run, branch, proposal)
+  ]
+--[
+    AcceptedProposal(run, client, proposal, branch)
+  ]->
+  []
+
+rule Drop_Losing_Branch_Proposal:
+  [
+    !AppliedCanonicalBranchState(run, client, selected),
+    !ProposalMessageState(run, proposal, losing),
+    !BranchDifferentState(run, losing, selected)
+  ]
+--[
+    DroppedProposal(run, proposal, losing, 'losing_branch')
+  ]->
+  []
+
 rule Invalidate_Losing_Branch_App:
   [
     !AppliedCanonicalBranchState(run, client, selected),
@@ -1194,6 +1257,34 @@ lemma fork_detection_requires_prior_local_commit:
       Ex #j.
           LocalCommitFromEpoch(run, group, client, source_epoch) @ #j
     )"
+
+lemma accepted_proposal_requires_applied_consuming_branch:
+  "All run client proposal branch #i.
+      AcceptedProposal(run, client, proposal, branch) @ #i
+    ==> (
+      Ex proposal_branch #j #k #m.
+          AppliedCanonicalBranch(run, client, branch) @ #j
+        & ProposalMessage(run, proposal, proposal_branch) @ #k
+        & CommitConsumesProposal(run, branch, proposal) @ #m
+        & #j < #i
+    )"
+
+lemma dropped_proposal_requires_applied_different_branch:
+  "All run proposal losing reason #i.
+      DroppedProposal(run, proposal, losing, reason) @ #i
+    ==> (
+      Ex client selected #j #k #m.
+          AppliedCanonicalBranch(run, client, selected) @ #j
+        & ProposalMessage(run, proposal, losing) @ #k
+        & BranchDifferent(run, losing, selected) @ #m
+        & #j < #i
+    )"
+
+lemma dropped_proposals_are_never_accepted:
+  "All run client proposal losing reason branch #i #j.
+      DroppedProposal(run, proposal, losing, reason) @ #i
+    & AcceptedProposal(run, client, proposal, branch) @ #j
+    ==> F"
 
 lemma effective_depth_selection_requires_score_order:
   "All run client branch #i.
@@ -1503,6 +1594,13 @@ lemma own_commit_fork_handoff_executable:
   "Ex run #i #j.
       Scenario(run, 'own_commit_fork_handoff') @ #i
     & ForkDetected(run, 'group', 'alice', 'foreign_commit', 'e1', 'e2') @ #j"
+
+lemma proposal_canonical_consumption_executable:
+  exists-trace
+  "Ex run #i #j #k.
+      Scenario(run, 'proposal_canonical_consumption') @ #i
+    & AcceptedProposal(run, 'alice', 'remove_bob', 'selected') @ #j
+    & DroppedProposal(run, 'losing_remove', 'losing', 'losing_branch') @ #k"
 
 lemma generated_quorum_override_executable:
   exists-trace

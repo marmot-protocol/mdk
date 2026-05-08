@@ -306,6 +306,9 @@ Initial lemmas:
     `AlreadyAtEpoch` and does not trigger convergence selection or fork
     recovery. A stale same-source commit is fork-shaped only when the local
     client previously committed from that source epoch.
+14. **Proposal disposition:** a proposal is accepted only when a canonical
+    branch consumes it; proposals that belong only to losing branches are
+    dropped and cannot also become accepted.
 
 The v0 model currently verifies deterministic selection, eligible-only
 selection, score-order justifications, stale-rewind rejection derived from
@@ -313,8 +316,8 @@ anchor/distance facts, sender/epoch witness dedupe, queued outbound gating,
 three-branch permutations, late withheld publication after anchor, loaded-policy
 requirements, retained-anchor replay, missing-anchor no-mutation, `BeyondAnchor`
 invalidation, canonical app output, losing-branch app invalidation disposition,
-welcome/commit handoff, generated bounded seed cases, and executable traces for
-each modeled scenario.
+welcome/commit handoff, proposal disposition, generated bounded seed cases, and
+executable traces for each modeled scenario.
 The bounded seed source is
 [`formal/tamarin/policy_cases.json`](../../formal/tamarin/policy_cases.json);
 `cgka-policy-casegen` emits matching Tamarin seed rules from the same file that
