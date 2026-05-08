@@ -101,3 +101,48 @@ async fn report_runner_writes_send_leave_json_reports() {
 
     fs::remove_dir_all(out_dir).expect("clean output dir");
 }
+
+#[tokio::test]
+async fn report_runner_writes_convergence_delivery_json_reports() {
+    let out_dir = std::env::temp_dir().join(format!(
+        "darkmatter-cgka-convergence-delivery-report-test-{}",
+        std::process::id()
+    ));
+    if out_dir.exists() {
+        fs::remove_dir_all(&out_dir).expect("remove stale output dir");
+    }
+
+    run_report(&ReportArgs {
+        family: "convergence-e2e-delivery/v1".into(),
+        seed: 7,
+        cases: 2,
+        out: out_dir.clone(),
+    })
+    .await
+    .expect("runner writes convergence delivery reports");
+
+    let case0 = out_dir.join("convergence-e2e-delivery-v1-seed-7-case-0.json");
+    let case1 = out_dir.join("convergence-e2e-delivery-v1-seed-7-case-1.json");
+    assert!(case0.exists(), "case 0 report should exist");
+    assert!(case1.exists(), "case 1 report should exist");
+
+    let report: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&case0).expect("read report"))
+            .expect("report JSON parses");
+    assert_eq!(
+        report["metadata"]["generated"]["family_name"],
+        "convergence-e2e-delivery/v1"
+    );
+    assert_eq!(
+        report["app_invalidation_observations"]
+            .as_array()
+            .map(Vec::len),
+        Some(2)
+    );
+    assert_eq!(
+        report["epoch_change_observations"].as_array().map(Vec::len),
+        Some(2)
+    );
+
+    fs::remove_dir_all(out_dir).expect("clean output dir");
+}

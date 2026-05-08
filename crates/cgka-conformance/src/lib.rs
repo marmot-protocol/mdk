@@ -33,7 +33,10 @@ pub mod vector;
 pub use bus::{ClientId, DeliveryPolicy, TransportBus};
 pub use cgka_engine::{canonicalization, convergence, openmls_projection};
 pub use client::{ClientBuilder, HarnessClient};
-pub use family::{GeneratedScenarioCase, generate_send_leave_family, run_generated_case_report};
+pub use family::{
+    GeneratedScenarioCase, generate_convergence_e2e_delivery_family, generate_send_leave_family,
+    run_generated_case_report,
+};
 pub use peeler::MockPeeler;
 pub use report::{ReportArgs, ReportCommand, parse_report_command, report_usage, run_report};
 pub use scenario::{

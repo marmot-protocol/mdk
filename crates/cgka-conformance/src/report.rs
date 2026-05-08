@@ -1,7 +1,9 @@
 use std::error::Error;
 use std::path::PathBuf;
 
-use crate::{generate_send_leave_family, run_generated_case_report};
+use crate::{
+    generate_convergence_e2e_delivery_family, generate_send_leave_family, run_generated_case_report,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReportArgs {
@@ -22,6 +24,9 @@ pub async fn run_report(args: &ReportArgs) -> Result<(), Box<dyn Error>> {
 
     let cases = match args.family.as_str() {
         "send-leave/v1" => generate_send_leave_family(args.seed, args.cases),
+        "convergence-e2e-delivery/v1" => {
+            generate_convergence_e2e_delivery_family(args.seed, args.cases)
+        }
         other => return Err(format!("unsupported family {other}").into()),
     };
 
@@ -76,5 +81,5 @@ fn next_value(
 }
 
 pub fn report_usage() -> &'static str {
-    "Usage: cgka-conformance-report [--family send-leave/v1] [--seed N] [--cases N] [--out DIR]"
+    "Usage: cgka-conformance-report [--family send-leave/v1|convergence-e2e-delivery/v1] [--seed N] [--cases N] [--out DIR]"
 }

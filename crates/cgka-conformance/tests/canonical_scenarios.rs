@@ -6,8 +6,9 @@
 
 use cgka_conformance::{
     AppInvalidationObservation, ClientBuilder, EpochChangeObservation, ScenarioSpec, ScenarioStep,
-    ScenarioTrace, TransportBus, VectorFixture, generate_send_leave_family, observe_client,
-    run_generated_case_report, run_scenario_report, run_scenario_spec,
+    ScenarioTrace, TransportBus, VectorFixture, generate_convergence_e2e_delivery_family,
+    generate_send_leave_family, observe_client, run_generated_case_report, run_scenario_report,
+    run_scenario_spec,
 };
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::openmls_projection::{OpenMlsContentKind, project_mls_message};
@@ -459,6 +460,61 @@ async fn send_leave_family_records_seed_and_runs_generated_cases() {
     let json = serde_json::to_value(&cases[0]).expect("case serializes");
     assert_eq!(json["seed"], 42);
     assert_eq!(json["generator_version"], "1");
+}
+
+#[tokio::test]
+async fn convergence_e2e_delivery_family_runs_generated_variants() {
+    let cases = generate_convergence_e2e_delivery_family(99, 12);
+
+    assert_eq!(cases, generate_convergence_e2e_delivery_family(99, 12));
+    assert_eq!(cases.len(), 12);
+    assert!(
+        cases.iter().any(|case| case
+            .scenario
+            .steps
+            .iter()
+            .any(|step| matches!(step, ScenarioStep::DuplicateQueued { .. }))),
+        "generated cases should include duplicate-delivery variants"
+    );
+    assert!(
+        cases.iter().any(|case| case
+            .scenario
+            .steps
+            .iter()
+            .any(|step| matches!(step, ScenarioStep::DelayQueued { .. }))),
+        "generated cases should include delayed-delivery variants"
+    );
+    assert!(
+        cases.iter().any(|case| case
+            .scenario
+            .steps
+            .iter()
+            .any(|step| matches!(step, ScenarioStep::ReorderQueued { .. }))),
+        "generated cases should include reordered-delivery variants"
+    );
+
+    for (case_index, case) in cases.iter().enumerate() {
+        assert_eq!(case.family_name, "convergence-e2e-delivery/v1");
+        assert_eq!(case.generator_version, "1");
+        assert_eq!(case.seed, 99);
+        assert_eq!(case.case_index, case_index as u64);
+
+        let expected = convergence_e2e_group_events_trace_named(&case.scenario.name);
+        let report = run_generated_case_report(case, Some(expected.clone()))
+            .await
+            .expect("generated convergence variant reports");
+        assert_eq!(report.observed_trace, Some(expected));
+        assert!(report.invariant_failures.is_empty());
+        assert_eq!(report.epoch_change_observations.len(), 2);
+        assert_eq!(report.app_invalidation_observations.len(), 2);
+        assert!(
+            report
+                .app_invalidation_observations
+                .iter()
+                .all(|observation| observation.reason == "losing_branch"
+                    && observation.payload_ref == Some(payload_ref("bob losing payload")))
+        );
+    }
 }
 
 #[tokio::test]
@@ -1080,6 +1136,10 @@ fn convergence_e2e_group_events_spec() -> ScenarioSpec {
 }
 
 fn convergence_e2e_group_events_trace() -> ScenarioTrace {
+    convergence_e2e_group_events_trace_named("convergence-e2e-group-events/v1")
+}
+
+fn convergence_e2e_group_events_trace_named(name: &str) -> ScenarioTrace {
     let observation = |client: &str| cgka_conformance::ClientObservation {
         client: client.into(),
         epoch: 3,
@@ -1096,7 +1156,7 @@ fn convergence_e2e_group_events_trace() -> ScenarioTrace {
         recoveries: vec![],
     };
     ScenarioTrace {
-        name: "convergence-e2e-group-events/v1".into(),
+        name: name.into(),
         observations: vec![observation("carol"), observation("frank")],
     }
 }

@@ -9,7 +9,7 @@ In-process multi-client simulator for the CGKA engine. Lets us replay scripted s
 - `ScenarioSpec` — a serializable v1 input contract for deterministic scripted scenarios, including explicit queue faults and partitions.
 - `VectorFixture` — portable JSON fixtures pairing runnable scenario input with expected `ScenarioTrace` output.
 - `ScenarioReport` — serializable run artifacts with metadata, expected/observed traces, step logs, recoveries, and invariant failures.
-- `cgka-conformance-report` — a small CLI that runs generated `send-leave/v1` cases and writes JSON reports.
+- `cgka-conformance-report` — a small CLI that runs generated scenario families and writes JSON reports.
 - `proptest_support` — strategies that generate arbitrary typed `SendIntent` sequences for property-based tests.
 - `MockPeeler` — a deliberately trivial `TransportPeeler` impl. Distinguishes the group-message vs welcome paths but performs no encryption.
 
@@ -113,6 +113,13 @@ The generated `scenario` is a normal `ScenarioSpec`, so a failing generated
 case can be serialized and promoted into a fixed fixture without inventing a
 separate execution path.
 
+`generate_convergence_e2e_delivery_family(seed, cases)` produces deterministic
+variants of `convergence-e2e-group-events/v1`. Each variant keeps the logical
+branch race stable but mutates queued delivery with duplicate, delay/release,
+and reorder steps before observer clients tick. The expected application
+behavior remains the same: canonical app payload delivered once, losing-branch
+app invalidated, epoch advanced, and selected members added.
+
 ## Report artifacts
 
 `run_scenario_report(spec, expected_trace)` executes a scenario and returns a
@@ -141,6 +148,16 @@ To run the current generated family and write JSON reports:
 ```sh
 cargo run -p cgka-conformance --bin cgka-conformance-report -- \
   --family send-leave/v1 \
+  --seed 42 \
+  --cases 10 \
+  --out target/cgka-conformance-reports
+```
+
+To shake the convergence E2E bridge instead:
+
+```sh
+cargo run -p cgka-conformance --bin cgka-conformance-report -- \
+  --family convergence-e2e-delivery/v1 \
   --seed 42 \
   --cases 10 \
   --out target/cgka-conformance-reports

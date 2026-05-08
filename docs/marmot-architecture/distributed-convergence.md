@@ -251,7 +251,9 @@ Engine integration and OpenMLS conformance tests also cover:
 - peeler-ingest to `GroupEvent` output across multiple in-memory clients,
   including canonical app delivery and losing-branch app invalidation. The
   portable fixture is
-  [`convergence-e2e-group-events.v1.json`](../../crates/cgka-conformance/vectors/convergence-e2e-group-events.v1.json).
+  [`convergence-e2e-group-events.v1.json`](../../crates/cgka-conformance/vectors/convergence-e2e-group-events.v1.json),
+  and the generated `convergence-e2e-delivery/v1` family exercises the same
+  contract under duplicated, delayed, and reordered queued delivery.
 
 ## Formal Verification
 

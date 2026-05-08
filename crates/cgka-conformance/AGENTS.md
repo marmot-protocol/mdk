@@ -10,7 +10,7 @@ Read [`README.md`](README.md) for the human framing. This file is the agent-faci
 | `src/canonicalization.rs` | Executable model of the CGKA canonicalization contract. Uses symbolic peeled messages plus optional materialized candidate metadata, then calls the convergence selector to produce deterministic message dispositions. |
 | `src/client.rs` | `HarnessClient` + `ClientBuilder`. Wraps an `Engine<MemoryStorage>` and the bus handle. `tick().await` drains pending inbound for one client. `confirm(pending).await` finishes a `GroupEvolution`. |
 | `src/convergence.rs` | Model-level candidate-state graph scoring rules for the distributed convergence design. These tests do not drive OpenMLS yet; they pin policy before the engine canonicalizer lands. |
-| `src/family.rs` | Deterministic generated scenario families. `generate_send_leave_family` records family name, generator version, seed, case index, and a runnable `ScenarioSpec`. `run_generated_case_report` adds generated metadata to report artifacts. |
+| `src/family.rs` | Deterministic generated scenario families. `generate_send_leave_family` and `generate_convergence_e2e_delivery_family` record family name, generator version, seed, case index, and a runnable `ScenarioSpec`. `run_generated_case_report` adds generated metadata to report artifacts. |
 | `src/openmls_projection.rs` | Bytes-first OpenMLS projection and candidate materialization helpers. Parses MLS bytes, replays candidate paths against a snapshot, observes proposal refs / staged commits / app decryptions, rolls storage back, and can run the canonicalizer with OpenMLS-derived pending proposal/app-message evidence. |
 | `src/peeler.rs` | `MockPeeler` — pass-through. Group messages and welcomes go through distinct methods (matches the real `TransportPeeler` four-method shape from spike-findings §1.3) but the body is just length-prefixed framing, no encryption. Transport ids/timestamps are deterministic per client so vector traces stay stable despite OpenMLS randomness. |
 | `src/proptest_support.rs` | `intent_seq(n_clients, range)` proptest strategy. Generates `HarnessIntent::Send` and `HarnessIntent::Leave`; `delivery_profile()` covers FIFO, reverse, and seeded-random delivery. |
@@ -41,6 +41,11 @@ Use `clear_events` after setup when a scenario wants the final trace to describe
 only the behavior under test. The convergence E2E vector does this after the
 initial welcome joins so its trace contains only canonical branch application,
 app invalidation, epoch change, and member addition events.
+
+The `convergence-e2e-delivery/v1` generated family reuses that E2E shape and
+varies queue delivery with duplicate, delay/release, and reorder steps before
+observer ticks. Use it when checking the peeler-ingest to `GroupEvent` bridge
+under transport schedule noise.
 
 ## How to add a new scripted scenario
 

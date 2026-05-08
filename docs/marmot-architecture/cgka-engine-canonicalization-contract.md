@@ -520,6 +520,8 @@ The conformance suite should cover:
 - end-to-end peeler ingest emits only canonical application `GroupEvent`
   output and losing-branch invalidation events across multiple clients
   (`convergence-e2e-group-events/v1`),
+- generated `convergence-e2e-delivery/v1` variants preserve that output under
+  duplicated, delayed, and reordered queued delivery,
 - app message beyond MLS past-epoch retention expired,
 - commit beyond `max_rewind_commits` discarded,
 - late same-epoch commit inside the retained anchor window replayed from the
