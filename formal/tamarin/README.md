@@ -114,6 +114,18 @@ invalidated apps => no normal application-visible output
 That maps to `GroupEvent::MessageReceived` and
 `GroupEvent::AppMessageInvalidated` emission in the engine integration tests.
 
+The current welcome/commit handoff proof slice is:
+
+```text
+welcome for invite commit => recipient joins at post-commit epoch;
+matching commit after welcome => AlreadyAtEpoch with no mutation;
+own local commit from the same source epoch => fork-shaped stale commit
+```
+
+That maps to the welcome-before-commit ingest tests and the fork-detection
+boundary where only a client's own local commit history makes stale same-source
+commits fork candidates.
+
 The v0 model now uses bounded symbolic score classes instead of an opaque
 `ScoreCase` fact:
 
@@ -188,7 +200,5 @@ Next refinements:
 2. Replace symbolic score classes with generated bounded numeric families.
 3. Add a code-generation path that emits both Tamarin seed scenarios and Rust
    property-test cases from one policy-case source.
-4. Add handoff scenarios for welcome processing and commit application during
-   convergence selection.
-5. Add generated lifecycle cases once retained-anchor policy families move
+4. Add generated lifecycle cases once retained-anchor policy families move
    beyond the current one-rewind hand-written scenarios.

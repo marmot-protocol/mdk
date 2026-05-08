@@ -666,6 +666,60 @@ rule Init_Commit_Application_App_Output:
     !BranchDifferentState(~run, 'losing', 'selected')
   ]
 
+/*
+  Scenario 16:
+
+  A new member accepts the Welcome for an invite before they ingest the invite
+  commit itself. The Welcome places the member at the post-commit epoch, so the
+  matching commit arriving later is stale AlreadyAtEpoch and must not trigger
+  convergence selection or fork recovery.
+*/
+rule Init_Welcome_Before_Commit_Handoff:
+  [ Fr(~run) ]
+--[
+    Scenario(~run, 'welcome_before_commit_handoff'),
+    PolicyLoaded(~run, 'group', 'default_policy'),
+    WelcomeForCommit(
+      ~run, 'group', 'carol_welcome', 'invite_commit',
+      'invite_branch', 'e1', 'e2', 'carol'
+    ),
+    CommitTransition(~run, 'group', 'invite_commit', 'invite_branch', 'e1', 'e2'),
+    CommitOnBranch(~run, 'group', 'invite_commit', 'invite_branch')
+  ]->
+  [
+    !PolicyLoadedState(~run),
+    !WelcomeForCommitState(
+      ~run, 'group', 'carol_welcome', 'invite_commit',
+      'invite_branch', 'e1', 'e2', 'carol'
+    ),
+    !CommitTransitionState(~run, 'group', 'invite_commit', 'invite_branch', 'e1', 'e2'),
+    !CommitOnBranchState(~run, 'group', 'invite_commit', 'invite_branch')
+  ]
+
+/*
+  Scenario 17:
+
+  The contrast case for fork detection: a client that locally committed from
+  the same source epoch and then sees a competing commit for that source has
+  a fork-shaped stale commit rather than a welcome-before-commit replay.
+*/
+rule Init_Own_Commit_Fork_Handoff:
+  [ Fr(~run) ]
+--[
+    Scenario(~run, 'own_commit_fork_handoff'),
+    PolicyLoaded(~run, 'group', 'default_policy'),
+    LocalCommitFromEpoch(~run, 'group', 'alice', 'e1'),
+    CommitTransition(~run, 'group', 'foreign_commit', 'foreign_branch', 'e1', 'e2'),
+    CommitOnBranch(~run, 'group', 'foreign_commit', 'foreign_branch')
+  ]->
+  [
+    !PolicyLoadedState(~run),
+    !ClientEpochState(~run, 'group', 'alice', 'e2'),
+    !ClientCommittedFromState(~run, 'group', 'alice', 'e1'),
+    !CommitTransitionState(~run, 'group', 'foreign_commit', 'foreign_branch', 'e1', 'e2'),
+    !CommitOnBranchState(~run, 'group', 'foreign_commit', 'foreign_branch')
+  ]
+
 rule Derive_Stale_Beyond_Rewind:
   [
     !RetainedAnchorState(run, anchor),
@@ -794,6 +848,43 @@ rule Publish_Outbound_When_Stable:
   ]
 --[
     PublishedOutbound(run, client, intent)
+  ]->
+  []
+
+rule Accept_Welcome_For_Post_Commit_Epoch:
+  [
+    !WelcomeForCommitState(run, group, welcome, commit, branch, source_epoch, post_epoch, client)
+  ]
+--[
+    WelcomeAccepted(run, group, client, welcome, commit, post_epoch),
+    GroupJoinedAtEpoch(run, group, client, post_epoch)
+  ]->
+  [
+    !ClientEpochState(run, group, client, post_epoch),
+    !CommitAlreadyRepresentedByWelcomeState(run, group, client, commit, source_epoch, post_epoch)
+  ]
+
+rule Classify_Matching_Commit_After_Welcome:
+  [
+    !CommitTransitionState(run, group, commit, branch, source_epoch, post_epoch),
+    !CommitAlreadyRepresentedByWelcomeState(run, group, client, commit, source_epoch, post_epoch),
+    !ClientEpochState(run, group, client, post_epoch)
+  ]
+--[
+    CommitAfterWelcome(run, group, client, commit),
+    AlreadyAtEpochAfterWelcome(run, group, client, commit, source_epoch, post_epoch),
+    NoMutation(run, group, 'welcome_replayed_commit')
+  ]->
+  []
+
+rule Detect_Fork_On_Own_Stale_Commit:
+  [
+    !CommitTransitionState(run, group, commit, branch, source_epoch, post_epoch),
+    !ClientEpochState(run, group, client, post_epoch),
+    !ClientCommittedFromState(run, group, client, source_epoch)
+  ]
+--[
+    ForkDetected(run, group, client, commit, source_epoch, post_epoch)
   ]->
   []
 
@@ -1065,6 +1156,44 @@ lemma invalidated_dispositions_are_never_application_visible:
       AppInvalidationDisposition(run, app, branch, reason) @ #i
     & ApplicationVisible(run, client, app) @ #j
     ==> F"
+
+lemma welcome_acceptance_requires_matching_commit_context:
+  "All run group client welcome commit post_epoch #i.
+      WelcomeAccepted(run, group, client, welcome, commit, post_epoch) @ #i
+    ==> (
+      Ex branch source_epoch #j.
+          WelcomeForCommit(run, group, welcome, commit, branch, source_epoch, post_epoch, client) @ #j
+    )"
+
+lemma commit_after_welcome_requires_prior_welcome:
+  "All run group client commit source_epoch post_epoch #i.
+      AlreadyAtEpochAfterWelcome(run, group, client, commit, source_epoch, post_epoch) @ #i
+    ==> (
+      Ex welcome #j.
+          WelcomeAccepted(run, group, client, welcome, commit, post_epoch) @ #j
+        & #j < #i
+    )"
+
+lemma welcome_replayed_commit_does_not_select_branch:
+  "All run group client commit source_epoch post_epoch branch reason #i #j #k.
+      AlreadyAtEpochAfterWelcome(run, group, client, commit, source_epoch, post_epoch) @ #i
+    & CommitOnBranch(run, group, commit, branch) @ #j
+    & Selected(run, client, branch, reason) @ #k
+    ==> F"
+
+lemma welcome_replayed_commit_does_not_detect_fork:
+  "All run group client commit source_epoch post_epoch #i #j.
+      AlreadyAtEpochAfterWelcome(run, group, client, commit, source_epoch, post_epoch) @ #i
+    & ForkDetected(run, group, client, commit, source_epoch, post_epoch) @ #j
+    ==> F"
+
+lemma fork_detection_requires_prior_local_commit:
+  "All run group client commit source_epoch post_epoch #i.
+      ForkDetected(run, group, client, commit, source_epoch, post_epoch) @ #i
+    ==> (
+      Ex #j.
+          LocalCommitFromEpoch(run, group, client, source_epoch) @ #j
+    )"
 
 lemma effective_depth_selection_requires_score_order:
   "All run client branch #i.
@@ -1360,6 +1489,20 @@ lemma commit_application_app_output_executable:
     & ApplicationVisible(run, 'alice', 'app_selected') @ #l
     & InvalidatedApp(run, 'app_losing', 'losing', 'losing_branch') @ #m
     & AppInvalidationDisposition(run, 'app_losing', 'losing', 'losing_branch') @ #n"
+
+lemma welcome_before_commit_handoff_executable:
+  exists-trace
+  "Ex run #i #j #k #l.
+      Scenario(run, 'welcome_before_commit_handoff') @ #i
+    & WelcomeAccepted(run, 'group', 'carol', 'carol_welcome', 'invite_commit', 'e2') @ #j
+    & AlreadyAtEpochAfterWelcome(run, 'group', 'carol', 'invite_commit', 'e1', 'e2') @ #k
+    & NoMutation(run, 'group', 'welcome_replayed_commit') @ #l"
+
+lemma own_commit_fork_handoff_executable:
+  exists-trace
+  "Ex run #i #j.
+      Scenario(run, 'own_commit_fork_handoff') @ #i
+    & ForkDetected(run, 'group', 'alice', 'foreign_commit', 'e1', 'e2') @ #j"
 
 lemma generated_quorum_override_executable:
   exists-trace

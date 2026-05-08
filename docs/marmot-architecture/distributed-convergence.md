@@ -301,6 +301,11 @@ Initial lemmas:
     only after their canonical branch is applied; losing-branch app messages
     produce an invalidation disposition and are never delivered as normal
     output.
+13. **Welcome/commit handoff:** a welcome-derived join lands the recipient at
+    the post-commit epoch; the matching commit arriving afterward is
+    `AlreadyAtEpoch` and does not trigger convergence selection or fork
+    recovery. A stale same-source commit is fork-shaped only when the local
+    client previously committed from that source epoch.
 
 The v0 model currently verifies deterministic selection, eligible-only
 selection, score-order justifications, stale-rewind rejection derived from
@@ -308,7 +313,8 @@ anchor/distance facts, sender/epoch witness dedupe, queued outbound gating,
 three-branch permutations, late withheld publication after anchor, loaded-policy
 requirements, retained-anchor replay, missing-anchor no-mutation, `BeyondAnchor`
 invalidation, canonical app output, losing-branch app invalidation disposition,
-generated bounded seed cases, and executable traces for each modeled scenario.
+welcome/commit handoff, generated bounded seed cases, and executable traces for
+each modeled scenario.
 The bounded seed source is
 [`formal/tamarin/policy_cases.json`](../../formal/tamarin/policy_cases.json);
 `cgka-policy-casegen` emits matching Tamarin seed rules from the same file that
