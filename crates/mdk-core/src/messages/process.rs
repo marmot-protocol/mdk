@@ -189,19 +189,28 @@ where
                     "Merging pending own commit after rollback/reprocess"
                 );
 
-                // Snapshot current state before applying commit (for rollback support)
                 let content_hash = super::content_hash(&event.content);
-                if self
-                    .epoch_snapshots
-                    .create_snapshot(
-                        self.storage(),
-                        &group.mls_group_id,
-                        mls_group.epoch().as_u64(),
-                        &event.id,
-                        event.created_at.as_secs(),
-                        &content_hash,
-                    )
-                    .is_err()
+                let current_epoch = mls_group.epoch().as_u64();
+                let has_pending_snapshot = self.epoch_snapshots.has_pending_snapshot(
+                    self.storage(),
+                    &group.mls_group_id,
+                    current_epoch,
+                    &event.id,
+                );
+
+                // Snapshot current state before applying commit (for rollback support)
+                if !has_pending_snapshot
+                    && self
+                        .epoch_snapshots
+                        .create_snapshot(
+                            self.storage(),
+                            &group.mls_group_id,
+                            current_epoch,
+                            &event.id,
+                            event.created_at.as_secs(),
+                            &content_hash,
+                        )
+                        .is_err()
                 {
                     tracing::warn!(
                         target: "mdk_core::messages::dispatch_by_content_type",
@@ -225,6 +234,16 @@ where
                 mls_group
                     .merge_pending_commit(&self.provider)
                     .map_err(|_e| Error::Message("Failed to merge pending commit".to_string()))?;
+                if has_pending_snapshot {
+                    self.epoch_snapshots.activate_pending_snapshot_for_commit(
+                        self.storage(),
+                        &group.mls_group_id,
+                        current_epoch,
+                        &event.id,
+                        event.created_at.as_secs(),
+                        &content_hash,
+                    );
+                }
 
                 // Handle post-commit operations
 
