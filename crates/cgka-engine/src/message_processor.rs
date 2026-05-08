@@ -647,10 +647,15 @@ impl<S: StorageProvider> Engine<S> {
 
     fn has_unresolved_convergence_inputs(&self, group_id: &GroupId) -> Result<bool, EngineError> {
         let anchor = match self.storage.get_group(group_id) {
-            Ok(group) => group
-                .epoch
-                .0
-                .saturating_sub(self.convergence_policy.convergence.max_rewind_commits),
+            Ok(group) => {
+                let policy = self
+                    .convergence_policy_for_group(group_id)
+                    .map_err(|e| EngineError::Backend(format!("load convergence policy: {e}")))?;
+                group
+                    .epoch
+                    .0
+                    .saturating_sub(policy.convergence.max_rewind_commits)
+            }
             Err(StorageError::NotFound) => return Ok(false),
             Err(e) => return Err(EngineError::Storage(e)),
         };

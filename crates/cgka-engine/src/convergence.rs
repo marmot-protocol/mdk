@@ -7,7 +7,9 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConvergencePolicy {
     pub max_rewind_commits: u64,
     pub witness_quorum_senders_per_epoch: usize,

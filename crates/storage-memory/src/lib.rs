@@ -18,8 +18,9 @@ use cgka_traits::capabilities::{CapabilityRequirement, Feature, GroupCapabilitie
 use cgka_traits::group::{Group, Member};
 use cgka_traits::message::{MessageRecord, MessageState};
 use cgka_traits::storage::{
-    CapabilityStorage, GroupStorage, MessageStorage, OutboundIntentStorage, QueuedOutboundIntent,
-    StorageError, StorageProvider, StorageResult, WelcomeStorage,
+    CapabilityStorage, ConvergencePolicyStorage, GroupStorage, MessageStorage,
+    OutboundIntentStorage, QueuedOutboundIntent, StorageError, StorageProvider, StorageResult,
+    WelcomeStorage,
 };
 use cgka_traits::types::{Backend, EpochId, GroupId, MemberId, MessageId};
 use cgka_traits::welcome::PendingWelcome;
@@ -39,6 +40,7 @@ struct Inner {
     welcomes: HashMap<MessageId, PendingWelcome>,
     features: HashMap<Feature, CapabilityRequirement>,
     member_caps: HashMap<(GroupId, MemberId), GroupCapabilities>,
+    convergence_policies: HashMap<GroupId, Vec<u8>>,
     /// `(group_id, snapshot_name) -> GroupSnapshot` — captures CGKA metadata
     /// plus the OpenMLS memory map so fork recovery can reload the group at
     /// the snapshot epoch.
@@ -52,6 +54,7 @@ struct GroupSnapshot {
     queued_outbound_intents: HashMap<MessageId, QueuedOutboundIntent>,
     queued_outbound_order: HashMap<MessageId, u64>,
     member_caps: HashMap<MemberId, GroupCapabilities>,
+    convergence_policy: Option<Vec<u8>>,
     mls_values: HashMap<Vec<u8>, Vec<u8>>,
 }
 
@@ -125,6 +128,7 @@ impl GroupStorage for MemoryStorage {
             inner.queued_outbound_order.remove(&queued_id);
         }
         inner.member_caps.retain(|(g, _), _| g != id);
+        inner.convergence_policies.remove(id);
         inner.snapshots.retain(|(g, _), _| g != id);
         Ok(())
     }
@@ -226,6 +230,7 @@ impl MessageStorage for MemoryStorage {
             .filter(|((g, _), _)| g == group_id)
             .map(|((_, m), caps)| (m.clone(), caps.clone()))
             .collect();
+        let convergence_policy = inner.convergence_policies.get(group_id).cloned();
         let mls_values = self
             .openmls
             .values
@@ -241,6 +246,7 @@ impl MessageStorage for MemoryStorage {
                 queued_outbound_intents,
                 queued_outbound_order,
                 member_caps,
+                convergence_policy,
                 mls_values,
             },
         );
@@ -291,6 +297,7 @@ impl MessageStorage for MemoryStorage {
             .iter()
             .map(|(m, caps)| ((group_id.clone(), m.clone()), caps.clone()))
             .collect();
+        let convergence_policy = snap.convergence_policy.clone();
         let mls_values = snap.mls_values.clone();
         inner.groups.insert(group_id.clone(), group);
         let removed_ids: Vec<MessageId> = inner
@@ -330,6 +337,14 @@ impl MessageStorage for MemoryStorage {
         inner.member_caps.retain(|(g, _), _| g != group_id);
         for (key, caps) in member_caps {
             inner.member_caps.insert(key, caps);
+        }
+        match convergence_policy {
+            Some(policy) => {
+                inner.convergence_policies.insert(group_id.clone(), policy);
+            }
+            None => {
+                inner.convergence_policies.remove(group_id);
+            }
         }
         *self
             .openmls
@@ -455,6 +470,24 @@ impl CapabilityStorage for MemoryStorage {
         Ok(read(&self.inner)?
             .member_caps
             .get(&(group_id.clone(), member_id.clone()))
+            .cloned())
+    }
+}
+
+// ── ConvergencePolicyStorage ────────────────────────────────────────────────
+
+impl ConvergencePolicyStorage for MemoryStorage {
+    fn put_convergence_policy(&self, group_id: &GroupId, policy: &[u8]) -> StorageResult<()> {
+        write(&self.inner)?
+            .convergence_policies
+            .insert(group_id.clone(), policy.to_vec());
+        Ok(())
+    }
+
+    fn convergence_policy(&self, group_id: &GroupId) -> StorageResult<Option<Vec<u8>>> {
+        Ok(read(&self.inner)?
+            .convergence_policies
+            .get(group_id)
             .cloned())
     }
 }

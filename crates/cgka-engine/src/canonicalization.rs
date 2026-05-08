@@ -7,8 +7,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::convergence::{AppWitness, BranchCandidate, ConvergencePolicy, select_canonical_branch};
+use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CanonicalizationPolicy {
     pub convergence: ConvergencePolicy,
     pub app_message_past_epoch_limit: u64,

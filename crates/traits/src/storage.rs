@@ -136,6 +136,18 @@ pub trait CapabilityStorage {
     ) -> StorageResult<Option<GroupCapabilities>>;
 }
 
+// ── ConvergencePolicyStorage ────────────────────────────────────────────────
+
+/// Durable per-group convergence policy.
+///
+/// The storage layer keeps opaque bytes so `cgka_traits` does not need to own
+/// the engine's policy schema. Engines are responsible for versioned
+/// serialization and validation.
+pub trait ConvergencePolicyStorage {
+    fn put_convergence_policy(&self, group_id: &GroupId, policy: &[u8]) -> StorageResult<()>;
+    fn convergence_policy(&self, group_id: &GroupId) -> StorageResult<Option<Vec<u8>>>;
+}
+
 // ── StorageProvider aggregate ───────────────────────────────────────────────
 
 /// The single storage type parameter carried by the engine.
@@ -149,6 +161,7 @@ pub trait StorageProvider:
     + OutboundIntentStorage
     + WelcomeStorage
     + CapabilityStorage
+    + ConvergencePolicyStorage
     + Send
     + Sync
 {

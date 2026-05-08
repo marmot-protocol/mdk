@@ -11,6 +11,18 @@ local arrival order are not consensus inputs.
 
 The transport layer may buffer, retry, and fetch from relays. The CGKA engine
 receives peeled messages and decides which protocol artifacts become canonical.
+Any ordering supplied by the transport adapter is advisory. The engine may use
+it as input order for buffering, but branch selection depends on MLS replay,
+retained anchors, and the negotiated policy.
+
+The handoff is:
+
+```text
+transport adapter -> peeler -> CGKA engine canonicalization -> application events/results
+```
+
+The application consumes accepted app messages and invalidation records after
+canonicalization. It does not decide which commit branch is canonical.
 
 The contract has one logical operation:
 
@@ -195,6 +207,12 @@ ConvergencePolicy {
 
 `max_rewind_commits` defaults to 5 and is normative for v0 groups unless the
 group negotiates another value.
+
+Engines MUST persist the negotiated policy per group. After restart, the engine
+MUST load the stored group policy before computing retained anchors, pruning
+snapshots, selecting candidate branches, or deciding whether a stale commit is
+inside the rewind horizon. A local default is only a fallback for groups that do
+not yet have a stored policy.
 
 The same value bounds retained anchor snapshots. At current tip `T`, the
 oldest retained anchor is:
@@ -431,7 +449,8 @@ restart.
 
 Required storage:
 
-- negotiated convergence policy and engine version,
+- negotiated convergence policy and engine version, stored per group and loaded
+  before convergence after restart,
 - finalized anchor and anchor epoch,
 - retained Marmot and OpenMLS epoch snapshots from the current tip back through
   `max_rewind_commits`,

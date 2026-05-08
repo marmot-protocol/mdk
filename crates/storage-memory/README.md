@@ -4,9 +4,9 @@ In-memory implementation of the `cgka_traits::StorageProvider` aggregate. Suitab
 
 ## What this crate gives you
 
-`MemoryStorage` — implements:
+`MemoryStorage` implements:
 
-- `GroupStorage`, `MessageStorage`, `WelcomeStorage`, `CapabilityStorage` (the four CGKA-specific sub-traits)
+- `GroupStorage`, `MessageStorage`, `WelcomeStorage`, `CapabilityStorage`, `ConvergencePolicyStorage`, and `OutboundIntentStorage`
 - `openmls_traits::storage::StorageProvider<CURRENT_VERSION>` (via `openmls_memory_storage`), exposed through the `mls_storage()` accessor
 
 Internals are `Arc<RwLock<...>>` so the same `MemoryStorage` can be cloned and shared across multi-client harness tests. Snapshots also capture the OpenMLS memory map, which makes same-epoch fork recovery testable end-to-end.
@@ -17,4 +17,4 @@ Internals are `Arc<RwLock<...>>` so the same `MemoryStorage` can be cloned and s
 cargo test -p storage-memory
 ```
 
-18 tests covering: round-trip every type, snapshot + rollback correctness, OpenMLS rollback coverage, concurrent-access soundness under tokio, cascade behavior on group delete.
+22 tests covering: round-trip every type, snapshot + rollback correctness, convergence policy storage, OpenMLS rollback coverage, concurrent-access soundness under tokio, cascade behavior on group delete.

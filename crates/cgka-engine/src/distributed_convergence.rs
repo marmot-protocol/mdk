@@ -21,6 +21,31 @@ impl<S: StorageProvider> Engine<S> {
         self.convergence_policy = policy;
     }
 
+    pub fn set_group_convergence_policy(
+        &mut self,
+        group_id: &GroupId,
+        policy: CanonicalizationPolicy,
+    ) -> Result<(), OpenMlsProjectionError> {
+        self.storage
+            .put_convergence_policy(group_id, &encode_convergence_policy(&policy)?)
+            .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
+        Ok(())
+    }
+
+    pub(crate) fn convergence_policy_for_group(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<CanonicalizationPolicy, OpenMlsProjectionError> {
+        let Some(policy_bytes) = self
+            .storage
+            .convergence_policy(group_id)
+            .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?
+        else {
+            return Ok(self.convergence_policy.clone());
+        };
+        decode_convergence_policy(&policy_bytes)
+    }
+
     pub fn buffer_openmls_convergence_message(
         &mut self,
         group_id: &GroupId,
@@ -76,7 +101,7 @@ impl<S: StorageProvider> Engine<S> {
             .epoch_manager
             .epoch(group_id)
             .unwrap_or(previous_group.epoch);
-        let policy = self.convergence_policy.clone();
+        let policy = self.convergence_policy_for_group(group_id)?;
         let max_retained_anchor_rewind = policy.convergence.max_rewind_commits;
         let retained_anchor_epoch = previous_tip
             .0
@@ -208,4 +233,16 @@ impl<S: StorageProvider> Engine<S> {
             }
         }
     }
+}
+
+fn encode_convergence_policy(
+    policy: &CanonicalizationPolicy,
+) -> Result<Vec<u8>, OpenMlsProjectionError> {
+    serde_json::to_vec(policy).map_err(|e| OpenMlsProjectionError::Serialize(format!("{e:?}")))
+}
+
+fn decode_convergence_policy(
+    bytes: &[u8],
+) -> Result<CanonicalizationPolicy, OpenMlsProjectionError> {
+    serde_json::from_slice(bytes).map_err(|e| OpenMlsProjectionError::Serialize(format!("{e:?}")))
 }

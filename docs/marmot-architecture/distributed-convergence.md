@@ -29,6 +29,18 @@ relays:
 The engine must choose a canonical branch from protocol evidence, not from
 Nostr `created_at`, outer event ids, or local first-seen time.
 
+## Pipeline Boundary
+
+The transport adapter may buffer relay output, retry fetches, and make an early
+best-effort ordering pass. That ordering is advisory. The peeler turns
+transport events into protocol messages and hands those messages to the engine.
+
+The engine owns the authoritative ordering decision for commits. It may hold a
+short convergence buffer while relay input quiesces, then canonicalizes stored
+commits, proposals, and app-message witnesses before mutating the live
+`MlsGroup`. Accepted application messages and invalidation records are then
+available for the application layer to render, hide, mark, or otherwise handle.
+
 ## Shape
 
 The engine keeps a bounded candidate-state graph. The live `MlsGroup` is a
@@ -166,9 +178,10 @@ convergence_policy = {
 ```
 
 `max_rewind_commits` also bounds snapshot retention, so the forward-secrecy
-cost is explicit. Once MLS app components are available, the policy should live
-there. Until then, Marmot can carry it in a group context extension and treat an
-unsupported policy as a capability mismatch.
+cost is explicit. The engine persists the per-group policy and uses that stored
+value after restart. Once MLS app components are available, the policy should
+live there. Until then, Marmot can carry it in a group context extension and
+treat an unsupported policy as a capability mismatch.
 
 ## Examples
 

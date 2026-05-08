@@ -681,7 +681,9 @@ async fn rebuilt_engine_replays_late_same_epoch_commit_from_retained_anchor() {
         .join_welcome(welcome_for(&welcomes, b"carol"))
         .await
         .unwrap();
-    carol.set_convergence_policy(policy.clone());
+    carol
+        .set_group_convergence_policy(&group_id, policy.clone())
+        .expect("group convergence policy persisted");
 
     let david_kp = david.fresh_key_package().await.unwrap();
     let alice_invite = alice
@@ -724,7 +726,6 @@ async fn rebuilt_engine_replays_late_same_epoch_commit_from_retained_anchor() {
     let bob_wins = bob_digest < alice_digest;
 
     let mut carol = build_client_with_storage(b"carol", carol_storage.clone());
-    carol.set_convergence_policy(policy);
     carol
         .buffer_openmls_convergence_message(&group_id, bob_commit.clone(), 2_000)
         .expect("late bob commit buffered after restart");
@@ -1085,7 +1086,9 @@ async fn rebuilt_engine_invalidates_commit_older_than_retained_anchor() {
         .join_welcome(welcome_for(&welcomes, b"carol"))
         .await
         .unwrap();
-    carol.set_convergence_policy(policy.clone());
+    carol
+        .set_group_convergence_policy(&group_id, policy.clone())
+        .expect("group convergence policy persisted");
 
     let frank_kp = frank.fresh_key_package().await.unwrap();
     let bob_invite = bob
@@ -1139,7 +1142,6 @@ async fn rebuilt_engine_invalidates_commit_older_than_retained_anchor() {
     drop(carol);
 
     let mut carol = build_client_with_storage(b"carol", carol_storage.clone());
-    carol.set_convergence_policy(policy);
     carol
         .buffer_openmls_convergence_message(&group_id, stale_bob_commit.clone(), 4_000)
         .expect("stale bob commit buffered after restart");
