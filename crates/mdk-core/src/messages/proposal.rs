@@ -95,9 +95,11 @@ where
                                         return Ok(result);
                                     }
 
-                                    // Legacy Remove(self) proposal + admin receiver:
-                                    // auto-commit an admin-authored removal for the
-                                    // departing leaf.
+                                    // OpenMLS returns a QueuedProposal here, but it only enters
+                                    // the proposal store when store_pending_proposal is called.
+                                    // The admin path intentionally drops the queued legacy
+                                    // proposal and builds an equivalent admin-authored removal,
+                                    // avoiding the SelfRemove-only pending-store filter.
                                     self.auto_commit_legacy_self_remove(
                                         mls_group,
                                         event,
@@ -298,6 +300,9 @@ where
             }));
         }
 
+        // Check the current admin set against live members after this sender's
+        // leaf departs. If no active admin would remain, the leave is invalid
+        // and should not be stored for a later commit.
         if let Err(e) = self.validate_admin_depletion(mls_group, &[sender_leaf_index]) {
             tracing::warn!(
                 target: "mdk_core::messages::process_proposal",
@@ -359,6 +364,8 @@ where
 
         let commit_event = self.build_message_event(group_id, serialized_commit_message, None)?;
 
+        // Record the epoch after staging the generated commit. Rollback
+        // invalidation treats this proposal as part of the staged epoch branch.
         self.mark_processed(event, group_id, mls_group.epoch().as_u64())?;
 
         tracing::debug!(
@@ -411,6 +418,8 @@ where
 
         let commit_event = self.build_message_event(group_id, serialized_commit_message, None)?;
 
+        // Record the epoch after staging the generated commit. Rollback
+        // invalidation treats this proposal as part of the staged epoch branch.
         self.mark_processed(event, group_id, mls_group.epoch().as_u64())?;
 
         tracing::debug!(
@@ -659,6 +668,7 @@ mod tests {
             .merge_pending_commit(&group_id)
             .expect("Alice should merge commit");
 
+        // create_group returns welcomes in invitee order; Bob's KeyPackage was first.
         let bob_preview = bob_mdk
             .process_welcome(
                 &nostr::EventId::all_zeros(),

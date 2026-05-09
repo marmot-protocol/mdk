@@ -8365,21 +8365,21 @@ mod tests {
     #[test]
     fn test_admin_auto_commit_legacy_remove_self_removes_member() {
         let alice_mdk = create_test_mdk(); // admin
-        let bob_mdk = create_test_mdk(); // capability-poor legacy fixture
+        let legacy_mdk = create_test_mdk(); // capability-poor legacy fixture
         let charlie_mdk = create_test_mdk(); // modern non-admin, the leaver
         let alice_keys = Keys::generate();
-        let bob_keys = Keys::generate();
+        let legacy_keys = Keys::generate();
         let charlie_keys = Keys::generate();
 
-        // Bob's legacy KeyPackage forces RequiredCapabilities = [], so
+        // The legacy KeyPackage forces RequiredCapabilities = [], so
         // Charlie's leave falls back to legacy Remove(self).
-        let bob_kp = create_legacy_key_package_event(&bob_mdk, &bob_keys);
+        let legacy_kp = create_legacy_key_package_event(&legacy_mdk, &legacy_keys);
         let charlie_kp = create_key_package_event(&charlie_mdk, &charlie_keys);
 
         let create_result = alice_mdk
             .create_group(
                 &alice_keys.public_key(),
-                vec![bob_kp, charlie_kp],
+                vec![legacy_kp, charlie_kp],
                 create_nostr_group_config_data(vec![alice_keys.public_key()]),
             )
             .expect("alice creates mixed group");
@@ -8389,8 +8389,9 @@ mod tests {
             .merge_pending_commit(&group_id)
             .expect("alice merges creation commit");
 
-        // Charlie joins. Bob is only a legacy fixture and does not need to
-        // process a welcome for Alice to hold a mixed-group state.
+        // create_group returns welcomes in invitee order. Charlie's KeyPackage
+        // is second; the first invitee is only a legacy capability fixture and
+        // does not need to process a welcome for Alice to hold mixed state.
         let charlie_welcome = charlie_mdk
             .process_welcome(
                 &nostr::EventId::all_zeros(),
@@ -8409,7 +8410,7 @@ mod tests {
                 .members()
                 .count(),
             3,
-            "alice starts with alice, bob, and charlie"
+            "alice starts with alice, the legacy invitee, and charlie"
         );
 
         let required_proposals = charlie_mdk
