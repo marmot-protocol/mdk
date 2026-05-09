@@ -14,5 +14,10 @@ tracing.workspace = true
 
 [dev-dependencies]
 async-trait.workspace = true
+hex.workspace = true
+nostr.workspace = true
+sha2.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
+transport-nostr-adapter.workspace = true
+transport-nostr-peeler.workspace = true

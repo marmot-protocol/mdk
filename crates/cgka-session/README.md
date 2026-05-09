@@ -36,6 +36,15 @@ Those live above this crate.
 - auto-publish work after SelfRemove proposal ingest;
 - convergence advancement releasing queued outbound app messages.
 
+`tests/nostr_stack.rs` covers the production-shaped non-relay stack:
+
+- `AccountDeviceSession` using SQLCipher storage and the real
+  `NostrMlsPeeler`;
+- `NostrTransportAdapter` activation, inbox delivery, group subscription, and
+  publish reports over an in-memory relay client;
+- NIP-59 welcome publication/delivery into `GroupJoined`;
+- kind `445` group message publication/delivery into `MessageReceived`.
+
 Run:
 
 ```sh

@@ -359,11 +359,16 @@ dependencies = [
  "async-trait",
  "cgka-engine",
  "cgka-traits",
+ "hex",
+ "nostr",
+ "sha2",
  "storage-sqlite",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "transport-nostr-adapter",
+ "transport-nostr-peeler",
 ]
 
 [[package]]
