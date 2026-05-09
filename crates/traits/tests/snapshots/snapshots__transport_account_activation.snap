@@ -1,0 +1,36 @@
+---
+source: crates/traits/tests/snapshots.rs
+expression: "TransportAccountActivation\n{\n    account_id: mem_id(), inbox_endpoints:\n    vec![TransportEndpoint(\"wss://inbox.example\".into())],\n    group_subscriptions:\n    vec![TransportGroupSubscription\n    {\n        group_id: gid(), transport_group_id: vec![0xCC; 4], endpoints:\n        vec![TransportEndpoint(\"wss://group.example\".into())],\n    }], since: Some(Timestamp(1717171717)),\n}"
+---
+{
+  "account_id": [
+    97,
+    108,
+    105,
+    99,
+    101
+  ],
+  "inbox_endpoints": [
+    "wss://inbox.example"
+  ],
+  "group_subscriptions": [
+    {
+      "group_id": [
+        170,
+        170,
+        170,
+        170
+      ],
+      "transport_group_id": [
+        204,
+        204,
+        204,
+        204
+      ],
+      "endpoints": [
+        "wss://group.example"
+      ]
+    }
+  ],
+  "since": 1717171717
+}

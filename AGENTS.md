@@ -11,7 +11,7 @@ This repo owns the candidate CGKA engine workspace:
 - OpenMLS-backed engine implementation,
 - production-shaped account-device session wrapper,
 - in-memory and SQLCipher-backed storage backends,
-- Nostr transport peeler,
+- Nostr transport adapter and peeler,
 - conformance simulator and vector fixtures,
 - Tamarin models for distributed convergence,
 - architecture and spec drafts.
@@ -26,6 +26,7 @@ This repo owns the candidate CGKA engine workspace:
 | Storage traits and shared types | `crates/traits/AGENTS.md` |
 | In-memory storage | `crates/storage-memory/AGENTS.md` |
 | SQLite storage | `crates/storage-sqlite/AGENTS.md` |
+| Nostr transport adapter | `crates/transport-nostr-adapter/AGENTS.md` |
 | Nostr transport peeler | `crates/transport-nostr-peeler/AGENTS.md` |
 | Multi-client harness / vectors | `crates/cgka-conformance-simulator/AGENTS.md` |
 | Architecture docs | `docs/AGENTS.md` and `docs/marmot-architecture/AGENTS.md` |
@@ -39,6 +40,10 @@ This repo owns the candidate CGKA engine workspace:
 - Keep SQLite persistence one database per Marmot account-device identity.
 - Keep Tamarin model names, Rust test names, and vector names easy to grep
   across layers.
+- Keep tracing/logging privacy-safe: explicit crate/module `target` and
+  `method` fields, aggregate values only, and no account ids, group ids,
+  message ids, relay URLs, pubkeys, payloads, ciphertext, plaintext, or key
+  material. See `docs/marmot-architecture/overview/observability.md`.
 - When adding an `AGENTS.md`, create a sibling `CLAUDE.md` symlink to it.
 
 ## Verification

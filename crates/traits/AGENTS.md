@@ -8,6 +8,7 @@ This crate owns values and traits that cross crate boundaries:
 
 - `CgkaEngine`
 - `TransportPeeler`
+- `TransportAdapter`
 - Marmot storage traits and `StorageProvider`
 - transport envelopes and peeled messages
 - group/member/message ids
@@ -25,6 +26,7 @@ storage aggregate needs the OpenMLS storage trait bound.
 | `src/storage.rs` | Storage trait aggregate and snapshot/rollback contract. |
 | `src/engine_state.rs` | Epoch and welcome state machines. |
 | `src/transport.rs` | Transport-facing message envelope types. |
+| `src/transport_adapter.rs` | Account-aware adapter trait, publish targets, delivery metadata. |
 | `src/ingest.rs` | Peeled-message content and ingest outcomes. |
 | `tests/snapshots.rs` | JSON/debug shape checks for cross-boundary types. |
 

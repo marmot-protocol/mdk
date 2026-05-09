@@ -118,5 +118,9 @@ These are tracked in [`../../plans/2026-05-04-cgka-conformance-simulator-vectors
 ## Conventions
 
 - **Client labels seed deterministic Nostr keys.** The ergonomic `pad32(b"name")` helper remains fine for stable test labels, but the engine identity attached to the bus is the derived public key. Use `HarnessClient::member_id()` for admin lists or other policy inputs.
+- **Tracing audit is repo-wide.** `tests/tracing_audit.rs` scans production Rust
+  source for `tracing::*` calls. New tracing must include explicit `target` and
+  `method` fields and must not include account ids, group ids, message ids,
+  relay URLs, pubkeys, payloads, ciphertext, plaintext, or key material.
 - **The harness peeler is real; the relay is not.** `TransportBus` stays in memory, but group messages and welcomes go through `transport-nostr-peeler`.
 - **`HarnessClient` exposes only what tests need.** If you need the inner `Engine<S>`, that's a smell — extend the harness API instead and keep tests at one abstraction level.

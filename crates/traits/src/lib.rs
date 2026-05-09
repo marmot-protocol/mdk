@@ -16,6 +16,7 @@ pub mod message;
 pub mod peeler;
 pub mod storage;
 pub mod transport;
+pub mod transport_adapter;
 pub mod types;
 pub mod welcome;
 
@@ -44,6 +45,12 @@ pub use storage::{
 pub use transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };
+pub use transport_adapter::{
+    TransportAccountActivation, TransportAdapter, TransportAdapterError, TransportDelivery,
+    TransportDeliveryPlane, TransportDeliverySource, TransportEndpoint, TransportEndpointFailure,
+    TransportEndpointReceipt, TransportGroupSubscription, TransportGroupSync,
+    TransportPublishReport, TransportPublishRequest, TransportPublishTarget,
+};
 pub use types::{Backend, EpochId, GroupId, MemberId, MessageId};
 pub use welcome::PendingWelcome;
 
@@ -53,3 +60,4 @@ pub use welcome::PendingWelcome;
 // witnesses fail at compile time.
 const _: fn(Box<dyn CgkaEngine + Send + Sync>) = |_| {};
 const _: fn(Box<dyn TransportPeeler + Send + Sync>) = |_| {};
+const _: fn(Box<dyn TransportAdapter + Send + Sync>) = |_| {};

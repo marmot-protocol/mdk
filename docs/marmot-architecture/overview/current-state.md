@@ -1,7 +1,7 @@
 ---
 title: "Current State — Implementations & Spec"
 created: 2026-04-19
-updated: 2026-05-08
+updated: 2026-05-09
 tags: [marmot, overview, current-state, implementations]
 status: overview
 ---
@@ -65,13 +65,18 @@ separate from the CGKA engine convergence work.
 
 This repository now has the main engine candidate:
 
-- `crates/traits` — cross-boundary value types and traits.
+- `crates/traits` — cross-boundary value types and traits, including the
+  account-aware `TransportAdapter` boundary.
 - `crates/cgka-engine` — OpenMLS-backed engine implementation.
 - `crates/cgka-session` — production-shaped account-device session wrapper
   over `Engine<SqliteStorage>`.
 - `crates/storage-memory` — in-memory storage and snapshot backend for tests.
 - `crates/storage-sqlite` — SQLCipher-backed SQLite storage for Marmot and
   custom OpenMLS state, with Rust migrations for schema/data evolution.
+- `crates/transport-nostr-adapter` — Nostr transport adapter core for account
+  activation, group subscription sync, relay-event routing, and endpoint-level
+  publish reports behind an injectable relay-client boundary. Its optional
+  `sdk` feature provides the first `nostr-sdk` backed relay client.
 - `crates/transport-nostr-peeler` — Nostr boundary mapping for kind `445` /
   `1059` events, kind `445` group envelope peeling, and NIP-59 welcome
   wrap/peel with injected local signer/decrypter.
@@ -93,10 +98,15 @@ losing-branch invalidations, and test generated delivery variants.
   database per account-device identity. App key-management integration,
   packaging, and longer-term rekey/vacuum/checkpoint policy still need
   production wiring.
-- **Production transport adapters** — the simulator uses an in-memory bus with
-  the Nostr peeler wired in for group messages and NIP-59 welcomes. Relay
-  networking, final group-event signing, and account key-management wiring
-  still live outside this engine workspace.
+- **Production transport adapters** — `transport-nostr-adapter` now implements
+  the Nostr adapter core over an injectable relay-client boundary, with an
+  optional `nostr-sdk` relay client, exact stale group subscription cleanup,
+  adapter-local metrics, privacy-safe tracing, and redacted SDK relay-health
+  summaries. The SDK owns reconnect/backoff, retry interval adjustment, jitter,
+  and relay status mechanics. The simulator still uses an in-memory bus with
+  the Nostr peeler wired in for group messages and NIP-59 welcomes. Production
+  relay auth, app-level relay policy, richer telemetry export, and account
+  key-management wiring still need integration.
 - **Portable fork-recovery vectors** — fork recovery is tested in Rust, but
   OpenMLS commit randomness makes stable external vectors harder.
 - **Safe Extensions framework support** — still gated on backend library

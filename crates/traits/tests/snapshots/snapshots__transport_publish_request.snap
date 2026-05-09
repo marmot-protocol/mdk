@@ -1,0 +1,55 @@
+---
+source: crates/traits/tests/snapshots.rs
+expression: "TransportPublishRequest\n{\n    account_id: mem_id(), message: TransportMessage\n    {\n        id: mid(), payload: vec![1, 2, 3], timestamp: Timestamp(1717171717),\n        causal_deps: vec![], source: TransportSource(\"nostr\".into()),\n        envelope: TransportEnvelope::Welcome { recipient: mem_id(), },\n    }, target: TransportPublishTarget::Inbox\n    {\n        recipient: mem_id(), endpoints:\n        vec![TransportEndpoint(\"wss://inbox.example\".into())],\n    }, required_acks: 1,\n}"
+---
+{
+  "account_id": [
+    97,
+    108,
+    105,
+    99,
+    101
+  ],
+  "message": {
+    "id": [
+      187,
+      187,
+      187,
+      187
+    ],
+    "payload": [
+      1,
+      2,
+      3
+    ],
+    "timestamp": 1717171717,
+    "causal_deps": [],
+    "source": "nostr",
+    "envelope": {
+      "Welcome": {
+        "recipient": [
+          97,
+          108,
+          105,
+          99,
+          101
+        ]
+      }
+    }
+  },
+  "target": {
+    "Inbox": {
+      "recipient": [
+        97,
+        108,
+        105,
+        99,
+        101
+      ],
+      "endpoints": [
+        "wss://inbox.example"
+      ]
+    }
+  },
+  "required_acks": 1
+}

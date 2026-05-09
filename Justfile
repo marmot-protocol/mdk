@@ -24,6 +24,9 @@ conformance:
 conformance-slow:
     cargo test -p cgka-conformance-simulator --features conformance-slow
 
+tracing-audit:
+    cargo test -p cgka-conformance-simulator --test tracing_audit
+
 tamarin:
     @command -v tamarin-prover >/dev/null || { echo "error: tamarin-prover not found on PATH"; exit 127; }
     @make -C formal/tamarin prove

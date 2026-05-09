@@ -8,6 +8,8 @@ caller imports from here.
 
 - `CgkaEngine` — the engine trait the rest of the system depends on.
 - `TransportPeeler` — four-method async peeler trait (group-message + welcome × peel + wrap).
+- `TransportAdapter` — account-aware network boundary for activation,
+  subscription refresh, publish receipts, and inbound deliveries.
 - `StorageProvider` and the Marmot storage traits it aggregates
   (`GroupStorage`, `MessageStorage`, `OutboundIntentStorage`,
   `WelcomeStorage`, `CapabilityStorage`, `ConvergencePolicyStorage`) — plus an
@@ -16,7 +18,11 @@ caller imports from here.
 - `MessageRecord`, `MessageState`, `StoredMessagePayload` — durable message
   state plus the typed envelope that distinguishes raw transport bytes from
   peeled OpenMLS wire bytes.
-- All cross-boundary value types: `TransportMessage`, `TransportEnvelope`, `PeeledMessage`, `EncryptedPayload`, `SendIntent`, `SendResult`, `GroupEvent`, `PendingStateRef`, `MessageId`, `GroupId`, `MemberId`, `EpochId`, `Group`, `Member`.
+- All cross-boundary value types: `TransportMessage`, `TransportEnvelope`,
+  `TransportAccountActivation`, `TransportPublishRequest`,
+  `TransportDelivery`, `PeeledMessage`, `EncryptedPayload`, `SendIntent`,
+  `SendResult`, `GroupEvent`, `PendingStateRef`, `MessageId`, `GroupId`,
+  `MemberId`, `EpochId`, `Group`, `Member`.
 
 ## Run the tests
 

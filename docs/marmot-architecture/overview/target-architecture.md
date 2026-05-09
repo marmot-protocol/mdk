@@ -3,7 +3,7 @@ title: "Target Architecture — Four Components"
 created: 2026-04-19
 tags: [marmot, overview, architecture, components]
 status: overview
-updated: 2026-05-08
+updated: 2026-05-09
 ---
 
 # Target Architecture — Four Components
@@ -46,7 +46,18 @@ The explicit seam where a specific transport format meets a specific CGKA backen
 Two-path interface: group messages use group/epoch material; welcomes use recipient-addressed encryption. Same trait, two crypto paths.
 
 ### 4. TransportAdapter
-Moves opaque blobs. Publishes `TransportMessage`s; subscribes to inbound streams. Never sees plaintext. For Nostr: wraps blobs in kind 445 / 1059 events and publishes to relays. For FIPS: wraps in mesh frames. For HTTP/P2P/BLE: whatever's appropriate.
+Moves opaque blobs. Publishes `TransportMessage`s; subscribes to inbound
+streams. Never sees plaintext. For Nostr, this is the relay-control layer:
+activate an account against its inbox relays, keep group subscriptions synced
+from the active group set, publish group messages to group relays, publish
+welcomes to recipient inbox relays, and deliver account-scoped
+`TransportMessage`s back to the coordinator. It should remove stale
+subscriptions when the active group set changes and expose diagnostics without
+feeding those diagnostics into convergence. A concrete adapter should use its
+transport library's native connection lifecycle when available; for Nostr, the
+SDK owns reconnect/backoff, retry interval adjustment, jitter, and relay status
+mechanics. For FIPS: wraps in mesh frames. For HTTP/P2P/BLE: whatever's
+appropriate.
 
 Multiple transports can run simultaneously for the same group — the engine deduplicates by MessageId.
 
@@ -94,12 +105,19 @@ This prevents the engine from advancing past a commit that never made it to the 
 
 The active workspace proves the shape without the old prototype tree:
 
-- `crates/traits` defines the cross-boundary types.
+- `crates/traits` defines the cross-boundary types, including the
+  account-aware `TransportAdapter` boundary: activation, group sync, publish
+  requests/reports, and delivery metadata.
 - `crates/cgka-engine` implements the OpenMLS-backed engine candidate.
 - `crates/cgka-session` wires the engine to encrypted account-device storage.
 - `crates/storage-memory` provides in-memory storage and rollback snapshots.
 - `crates/storage-sqlite` provides SQLCipher-backed persistence for Marmot
   metadata and group-scoped OpenMLS state.
+- `crates/transport-nostr-adapter` implements the Nostr adapter core:
+  account-scoped activation, group subscription sync, stale subscription
+  cleanup, relay-event routing, diagnostics, redacted relay-health summaries,
+  and publish reports over an injectable relay-client boundary. Its optional
+  `sdk` feature provides the first `nostr-sdk` backed relay client.
 - `crates/transport-nostr-peeler` maps Nostr kind `445` / `1059` events into
   engine transport messages, peels Nostr/MLS group envelopes, and handles
   NIP-59 welcomes when supplied with a local signer/decrypter.

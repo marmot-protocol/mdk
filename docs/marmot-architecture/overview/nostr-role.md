@@ -1,7 +1,7 @@
 ---
 title: "Nostr's Role in Marmot — Three Layers"
 created: 2026-04-19
-updated: 2026-05-08
+updated: 2026-05-09
 tags: [marmot, overview, nostr, identity, transport]
 status: overview
 ---
@@ -40,14 +40,22 @@ The inner event structure is **tied to Nostr identity** (the `pubkey` field is t
 
 But transport is explicitly pluggable. A different transport (FIPS mesh, direct P2P, BLE, etc.) would have its own wrapping. The outer envelope is purely a transport concern; the inner application message stays Nostr-structured regardless.
 
-The `TransportPeeler` trait is the explicit seam where this pluggability happens (see [`target-architecture.md`](./target-architecture.md)).
+The `TransportAdapter` and `TransportPeeler` traits are the explicit seams
+where this pluggability happens (see [`target-architecture.md`](./target-architecture.md)).
 
-In this workspace, `crates/transport-nostr-peeler` is the first concrete Nostr
-peeler layer. It maps kind `445` / `1059` event shapes into engine transport
-messages, peels kind `445` group envelopes, and handles NIP-59 welcome
-gift-wraps when the account-device layer supplies the local signer/decrypter.
-Relay networking, relay policy, and account key-management remain adapter or
-application work above that crate.
+In this workspace, `crates/transport-nostr-adapter` is the Nostr adapter core:
+account activation, group subscription sync, relay-event routing, and publish
+reports behind an injectable relay-client boundary. It also removes stale group
+subscriptions on group sync and exposes adapter-local diagnostics. Its optional
+`sdk` feature provides the first `nostr-sdk` backed relay client and exposes
+redacted relay-health summaries. Reconnect/backoff, retry interval adjustment,
+jitter, and relay status mechanics remain owned by `nostr-sdk`.
+`crates/transport-nostr-peeler` is the Nostr/MLS peeler layer. It maps kind
+`445` / `1059` event shapes into engine transport messages, peels kind `445`
+group envelopes, and handles NIP-59 welcome gift-wraps when the account-device
+layer supplies the local signer/decrypter. Production relay auth, app-level
+relay policy, telemetry export, and account key-management integration still
+sit above those crates.
 
 ---
 

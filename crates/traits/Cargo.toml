@@ -5,7 +5,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "Shared traits and cross-boundary value types for the CGKA engine, TransportPeeler, and storage backends."
+description = "Shared traits and cross-boundary value types for the CGKA engine, TransportAdapter, TransportPeeler, and storage backends."
 
 [dependencies]
 async-trait.workspace = true

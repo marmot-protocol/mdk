@@ -3,7 +3,7 @@ title: "Marmot — Executive Summary"
 created: 2026-04-19
 tags: [marmot, overview, executive-summary]
 status: overview
-updated: 2026-05-08
+updated: 2026-05-09
 ---
 
 # Marmot — Executive Summary
@@ -76,8 +76,12 @@ The core technical challenge: **MLS requires total linear ordering of group-stat
 - 🚧 MIP structure being rethought — per-feature MIPs cause scatter; component-based reorg being considered.
 - 🚧 Safe framework adoption blocked on backend library support; needs investigation.
 - 🚧 `IdentityRemove` custom proposal type identified as the first needed Marmot-custom MLS proposal.
-- 🚧 Production storage, transport adapters, and app integration remain outside
-  the current engine simulator.
+- 🚧 Production app integration remains outside the current engine simulator;
+  the Nostr adapter core, optional SDK client, stale subscription cleanup, and
+  adapter diagnostics exist. The adapter relies on `nostr-sdk` for
+  reconnect/backoff and relay status mechanics, but relay auth, app-level relay
+  policy, telemetry export, and account key-management integration still need
+  production work.
 
 ---
 

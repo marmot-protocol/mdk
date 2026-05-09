@@ -10,6 +10,7 @@ cgka-engine.workspace = true
 cgka-traits.workspace = true
 storage-sqlite.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 async-trait.workspace = true

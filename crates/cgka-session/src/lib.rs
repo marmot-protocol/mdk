@@ -23,6 +23,8 @@ use cgka_traits::transport::TransportMessage;
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
 use storage_sqlite::{SqlCipherKey, SqliteStorage, SqliteStorageOptions};
 
+const TRACE_TARGET: &str = "cgka_session::session";
+
 pub type SessionResult<T> = Result<T, SessionError>;
 
 #[derive(Debug, thiserror::Error)]
@@ -136,6 +138,11 @@ pub struct IngestEffects {
 
 impl AccountDeviceSession {
     pub fn open(config: SessionConfig) -> SessionResult<Self> {
+        tracing::debug!(
+            target: TRACE_TARGET,
+            method = "open",
+            "opening account device session"
+        );
         let storage = SqliteStorage::open_encrypted_with_options(
             config.database_path,
             &config.database_key,
@@ -148,29 +155,81 @@ impl AccountDeviceSession {
             .build()?;
         engine.hydrate_stable_groups_from_storage()?;
         engine.set_convergence_policy(config.convergence_policy);
+        tracing::debug!(
+            target: TRACE_TARGET,
+            method = "open",
+            "account device session opened"
+        );
         Ok(Self { engine })
     }
 
     pub async fn fresh_key_package(&mut self) -> Result<KeyPackage, EngineError> {
-        self.engine.fresh_key_package().await
+        tracing::debug!(
+            target: TRACE_TARGET,
+            method = "fresh_key_package",
+            "creating fresh key package"
+        );
+        let key_package = self.engine.fresh_key_package().await?;
+        tracing::debug!(
+            target: TRACE_TARGET,
+            method = "fresh_key_package",
+            "fresh key package created"
+        );
+        Ok(key_package)
     }
 
     pub async fn create_group(
         &mut self,
         req: CreateGroupRequest,
     ) -> SessionResult<CreateGroupEffects> {
+        tracing::debug!(
+            target: TRACE_TARGET,
+            method = "create_group",
+            invitee_count = req.members.len(),
+            required_feature_count = req.required_features.len(),
+            initial_admin_count = req.initial_admins.len(),
+            "creating group"
+        );
         let (group_id, result) = self.engine.create_group(req).await?;
         let effects = self.collect_effects(vec![result]);
+        tracing::debug!(
+            target: TRACE_TARGET,
+            method = "create_group",
+            "group created"
+        );
         Ok(CreateGroupEffects { group_id, effects })
     }
 
     pub async fn send(&mut self, intent: SendIntent) -> SessionResult<SessionEffects> {
+        tracing::debug!(
+            target: TRACE_TARGET,
+            method = "send",
+            intent_kind = send_intent_kind(&intent),
+            "sending local intent"
+        );
         let result = self.engine.send(intent).await?;
+        tracing::debug!(
+            target: TRACE_TARGET,
+            method = "send",
+            result_kind = send_result_kind(&result),
+            "local intent accepted"
+        );
         Ok(self.collect_effects(vec![result]))
     }
 
     pub async fn ingest(&mut self, msg: TransportMessage) -> SessionResult<IngestEffects> {
+        tracing::debug!(
+            target: TRACE_TARGET,
+            method = "ingest",
+            "ingesting transport message"
+        );
         let outcome = self.engine.ingest(msg).await?;
+        tracing::debug!(
+            target: TRACE_TARGET,
+            method = "ingest",
+            outcome_kind = ingest_outcome_kind(&outcome),
+            "transport message ingested"
+        );
         let effects = self.collect_effects(vec![]);
         Ok(IngestEffects { outcome, effects })
     }
@@ -179,7 +238,18 @@ impl AccountDeviceSession {
         &mut self,
         group_id: &GroupId,
     ) -> SessionResult<SessionEffects> {
+        tracing::debug!(
+            target: TRACE_TARGET,
+            method = "advance_convergence",
+            "advancing convergence"
+        );
         let results = self.engine.advance_convergence(group_id).await?;
+        tracing::debug!(
+            target: TRACE_TARGET,
+            method = "advance_convergence",
+            result_count = results.len(),
+            "convergence advanced"
+        );
         Ok(self.collect_effects(results))
     }
 
@@ -187,11 +257,21 @@ impl AccountDeviceSession {
         &mut self,
         pending: PendingStateRef,
     ) -> SessionResult<SessionEffects> {
+        tracing::debug!(
+            target: TRACE_TARGET,
+            method = "confirm_published",
+            "confirming published state"
+        );
         let event = self.engine.confirm_published(pending).await?;
         let mut effects = self.collect_effects(vec![]);
         if !effects.events.contains(&event) {
             effects.events.insert(0, event);
         }
+        tracing::debug!(
+            target: TRACE_TARGET,
+            method = "confirm_published",
+            "published state confirmed"
+        );
         Ok(effects)
     }
 
@@ -199,11 +279,26 @@ impl AccountDeviceSession {
         &mut self,
         pending: PendingStateRef,
     ) -> SessionResult<SessionEffects> {
+        tracing::debug!(
+            target: TRACE_TARGET,
+            method = "publish_failed",
+            "recording publish failure"
+        );
         self.engine.publish_failed(pending).await?;
+        tracing::debug!(
+            target: TRACE_TARGET,
+            method = "publish_failed",
+            "publish failure recorded"
+        );
         Ok(self.collect_effects(vec![]))
     }
 
     pub fn drain(&mut self) -> SessionEffects {
+        tracing::trace!(
+            target: TRACE_TARGET,
+            method = "drain",
+            "draining session effects"
+        );
         self.collect_effects(vec![])
     }
 
@@ -220,6 +315,11 @@ impl AccountDeviceSession {
     }
 
     pub fn set_convergence_policy(&mut self, policy: CanonicalizationPolicy) {
+        tracing::debug!(
+            target: TRACE_TARGET,
+            method = "set_convergence_policy",
+            "updating convergence policy"
+        );
         self.engine.set_convergence_policy(policy);
     }
 
@@ -260,6 +360,41 @@ impl AccountDeviceSession {
             effects.publish.push(PublishWork::AutoPublish { msg });
         }
         effects.events.extend(self.engine.drain_events());
+        tracing::trace!(
+            target: TRACE_TARGET,
+            method = "collect_effects",
+            event_count = effects.events.len(),
+            publish_count = effects.publish.len(),
+            queued_count = effects.queued.len(),
+            "session effects collected"
+        );
         effects
+    }
+}
+
+fn send_intent_kind(intent: &SendIntent) -> &'static str {
+    match intent {
+        SendIntent::AppMessage { .. } => "app_message",
+        SendIntent::Invite { .. } => "invite",
+        SendIntent::Leave { .. } => "leave",
+        SendIntent::UpdateGroupData { .. } => "update_group_data",
+    }
+}
+
+fn send_result_kind(result: &SendResult) -> &'static str {
+    match result {
+        SendResult::ApplicationMessage { .. } => "application_message",
+        SendResult::Queued { .. } => "queued",
+        SendResult::Proposal { .. } => "proposal",
+        SendResult::GroupEvolution { .. } => "group_evolution",
+        SendResult::GroupCreated { .. } => "group_created",
+    }
+}
+
+fn ingest_outcome_kind(outcome: &IngestOutcome) -> &'static str {
+    match outcome {
+        IngestOutcome::Processed => "processed",
+        IngestOutcome::Buffered { .. } => "buffered",
+        IngestOutcome::Stale { .. } => "stale",
     }
 }

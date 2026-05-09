@@ -21,6 +21,9 @@ as a high-level constraint, not an implementation checklist.
 - Keep overview docs short. Move long rationale into `further-context/`.
 - When changing code behavior, update `overview/current-state.md` if the public
   status changed.
+- Keep observability guidance current in
+  `marmot-architecture/overview/observability.md` when tracing/logging policy
+  changes.
 
 ## Verification
 

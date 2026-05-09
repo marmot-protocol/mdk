@@ -1,7 +1,7 @@
 ---
 title: "Marmot Architecture — Index"
 created: 2026-04-15
-updated: 2026-05-08
+updated: 2026-05-09
 tags: [marmot, architecture, index]
 ---
 
@@ -32,10 +32,11 @@ Written to be readable in 5 minutes each, shareable as a package.
 | [`overview/capability-negotiation.md`](./overview/capability-negotiation.md) | Why the capability system is load-bearing and what every client must implement. |
 | [`overview/custom-extensions.md`](./overview/custom-extensions.md) | The inherit-vs-define decision framework. The MLS Safe Extensions framework (draft-09). |
 | [`overview/nostr-role.md`](./overview/nostr-role.md) | Nostr's three distinct roles — identity, app message format, transport — and which are pluggable. |
+| [`overview/observability.md`](./overview/observability.md) | Privacy-safe tracing/logging rules and the repo-wide tracing audit guardrail. |
 | [`overview/current-state.md`](./overview/current-state.md) | Implementations, merged MIPs, the current CGKA engine workspace, and known gaps. |
 | [`overview/direction.md`](./overview/direction.md) | Where we're going after the CGKA engine/convergence work. |
 
-**Read order for a new engineer:** executive-summary → protocol-boundary → target-architecture → capability-negotiation → nostr-role → custom-extensions → current-state → direction.
+**Read order for a new engineer:** executive-summary → protocol-boundary → target-architecture → capability-negotiation → nostr-role → observability → custom-extensions → current-state → direction.
 
 ---
 
@@ -86,7 +87,7 @@ These are longer working documents. Go here when you need depth, not orientation
 | Presentation | Flutter (whitenoise) | Unchanged |
 | FFI bridge | flutter_rust_bridge | **whitenoise-ffi** — transport-agnostic, Dart + Swift |
 | Application | whitenoise-rs singleton | **whitenoise-core** — thin facade, per-account sessions |
-| Transport | Nostr relay control planes, embedded | `TransportAdapter` trait, `NostrAdapter` as first impl |
+| Transport | Nostr relay control planes, embedded | `TransportAdapter` trait plus `transport-nostr-adapter` core, stale subscription cleanup, diagnostics, redacted SDK relay health, and optional SDK client; relay auth/policy next |
 | CGKA Engine | `crates/cgka-engine` implements the current OpenMLS-backed engine candidate; `crates/cgka-session` wraps it in an encrypted account-device lifecycle | Spec-level `CgkaEngine` contract with production persistence and packaging |
 | Crypto | OpenMLS behind `CgkaEngine` | OpenMLS first, with the trait boundary preserving future CGKA swap room |
 | Storage | `storage-memory` for tests/simulator work; `storage-sqlite` for SQLCipher-backed persistence | MLS app-component policy negotiation, app key-management integration, packaging |

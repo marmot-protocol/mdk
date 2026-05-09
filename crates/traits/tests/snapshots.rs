@@ -23,6 +23,10 @@ use cgka_traits::message::StoredMessagePayload;
 use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };
+use cgka_traits::transport_adapter::{
+    TransportAccountActivation, TransportDelivery, TransportDeliveryPlane, TransportDeliverySource,
+    TransportEndpoint, TransportGroupSubscription, TransportPublishRequest, TransportPublishTarget,
+};
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
 
 fn gid() -> GroupId {
@@ -63,6 +67,121 @@ fn snapshot_transport_message_welcome() {
         },
     };
     insta::assert_json_snapshot!(msg);
+}
+
+#[test]
+fn transport_publish_request_validates_matching_group_target() {
+    let request = TransportPublishRequest {
+        account_id: mem_id(),
+        message: TransportMessage {
+            id: mid(),
+            payload: vec![1, 2, 3],
+            timestamp: Timestamp(1717171717),
+            causal_deps: vec![],
+            source: TransportSource("nostr".into()),
+            envelope: TransportEnvelope::GroupMessage {
+                transport_group_id: vec![0xCC; 4],
+            },
+        },
+        target: TransportPublishTarget::Group {
+            group_id: gid(),
+            transport_group_id: vec![0xCC; 4],
+            endpoints: vec![TransportEndpoint("wss://relay.example".into())],
+        },
+        required_acks: 1,
+    };
+
+    assert!(request.validate_envelope_matches_target().is_ok());
+}
+
+#[test]
+fn transport_publish_request_rejects_mismatched_group_target() {
+    let request = TransportPublishRequest {
+        account_id: mem_id(),
+        message: TransportMessage {
+            id: mid(),
+            payload: vec![1, 2, 3],
+            timestamp: Timestamp(1717171717),
+            causal_deps: vec![],
+            source: TransportSource("nostr".into()),
+            envelope: TransportEnvelope::GroupMessage {
+                transport_group_id: vec![0xCC; 4],
+            },
+        },
+        target: TransportPublishTarget::Group {
+            group_id: gid(),
+            transport_group_id: vec![0xDD; 4],
+            endpoints: vec![TransportEndpoint("wss://relay.example".into())],
+        },
+        required_acks: 1,
+    };
+
+    let err = request.validate_envelope_matches_target().unwrap_err();
+    assert!(err.to_string().contains("publish target does not match"));
+}
+
+#[test]
+fn snapshot_transport_adapter_boundary_types() {
+    insta::assert_json_snapshot!(
+        "transport_account_activation",
+        TransportAccountActivation {
+            account_id: mem_id(),
+            inbox_endpoints: vec![TransportEndpoint("wss://inbox.example".into())],
+            group_subscriptions: vec![TransportGroupSubscription {
+                group_id: gid(),
+                transport_group_id: vec![0xCC; 4],
+                endpoints: vec![TransportEndpoint("wss://group.example".into())],
+            }],
+            since: Some(Timestamp(1717171717)),
+        }
+    );
+
+    insta::assert_json_snapshot!(
+        "transport_publish_request",
+        TransportPublishRequest {
+            account_id: mem_id(),
+            message: TransportMessage {
+                id: mid(),
+                payload: vec![1, 2, 3],
+                timestamp: Timestamp(1717171717),
+                causal_deps: vec![],
+                source: TransportSource("nostr".into()),
+                envelope: TransportEnvelope::Welcome {
+                    recipient: mem_id(),
+                },
+            },
+            target: TransportPublishTarget::Inbox {
+                recipient: mem_id(),
+                endpoints: vec![TransportEndpoint("wss://inbox.example".into())],
+            },
+            required_acks: 1,
+        }
+    );
+
+    insta::assert_json_snapshot!(
+        "transport_delivery",
+        TransportDelivery {
+            account_id: mem_id(),
+            group_id_hint: Some(gid()),
+            message: TransportMessage {
+                id: mid(),
+                payload: vec![1, 2, 3],
+                timestamp: Timestamp(1717171717),
+                causal_deps: vec![],
+                source: TransportSource("nostr".into()),
+                envelope: TransportEnvelope::GroupMessage {
+                    transport_group_id: vec![0xCC; 4],
+                },
+            },
+            received_at: Timestamp(1717171720),
+            source: TransportDeliverySource {
+                transport: TransportSource("nostr".into()),
+                plane: TransportDeliveryPlane::Group,
+                endpoint: Some(TransportEndpoint("wss://group.example".into())),
+                subscription_id: Some("sub-1".into()),
+            },
+        }
+    );
 }
 
 #[test]
