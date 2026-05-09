@@ -71,7 +71,8 @@ The core technical challenge: **MLS requires total linear ordering of group-stat
 - ✅ whitenoise-rs client reference implementation running against real Nostr relays.
 - ✅ Current CGKA engine workspace implements the OpenMLS-backed engine
   candidate, convergence model, simulator harness, generated delivery variants,
-  property tests, and Tamarin proofs for the branch-selection core.
+  no-network Nostr stack chaos, property tests, and Tamarin proofs for the
+  branch-selection core.
 - 🚧 MDK (~66K LOC) and whitenoise-rs (~100K LOC) are larger than their target shapes — decomposition follow-up needed.
 - 🚧 MIP structure being rethought — per-feature MIPs cause scatter; component-based reorg being considered.
 - 🚧 Safe framework adoption blocked on backend library support; needs investigation.

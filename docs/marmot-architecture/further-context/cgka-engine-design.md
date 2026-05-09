@@ -422,7 +422,7 @@ Feature::NostrTransport => FeatureSpec {
 },
 
 Feature::FipsTransport => FeatureSpec {
-    requires: Capability::Extension(FIPS_GROUP_DATA_EXTENSION_TYPE), // TBD
+    requires: Capability::Extension(FIPS_GROUP_DATA_EXTENSION_TYPE), // future assigned type
     requirement_level: RequirementLevel::TransportRequired {
         transport: TransportKind::Fips
     },

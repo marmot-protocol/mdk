@@ -1,10 +1,15 @@
 # Decision Points
 
+Historical note: this April 2026 decision log predates the current
+`CgkaEngine` / `TransportPeeler` / `TransportAdapter` crate split. Keep it as
+background rationale; use the overview docs and CGKA engine spec for current
+status.
+
 **The problem this addresses:** Good architecture docs can still leave engineers uncertain about what's actually decided vs. what's still open. This document makes that explicit. Each decision either has a clear recommendation or is flagged as requiring team input.
 
-**Status summary:** Decision 6 (PCS) is resolved. Decision 8 (refactor vs. greenfield) is the most consequential open question — it affects the priority and sequencing of everything else. All other decisions have recommendations but haven't been formally confirmed by the team.
+**Historical status summary:** Decision 6 (PCS) was resolved at the time. Decision 8 (refactor vs. greenfield) was the major unresolved decision in this note and affected the priority and sequencing of everything else. All other decisions had recommendations but had not been formally confirmed by the team.
 
-*Last updated: 2026-04-16.*
+*Last updated: 2026-05-09.*
 
 ---
 
@@ -167,4 +172,6 @@ This is also the lowest-risk test of the crate extraction pattern. If extracting
 | 7 | Push notifications extraction | **Now** | Very low | Split file now, extract crate later |
 | 8 | Refactor vs. greenfield | **Soon** | **High** | ⚠️ Open — team input needed |
 
-Decisions 1, 6, and 8 are the current critical path. 8 is the most consequential open question — its answer affects the priority and sequencing of everything else.
+At the time of writing, decisions 1, 6, and 8 were the critical path. Decision
+8 was the major unresolved item because its answer affected the priority and
+sequencing of everything else.

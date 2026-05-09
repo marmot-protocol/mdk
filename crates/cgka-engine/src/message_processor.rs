@@ -1,4 +1,4 @@
-//! Inbound ingest and outbound send routing for [`Engine`](crate::Engine).
+//! Inbound ingest and outbound send routing for [`Engine`].
 //!
 //! Inbound messages are peeled, classified, stored, and either applied or
 //! buffered for convergence. Outbound intents are checked against local epoch

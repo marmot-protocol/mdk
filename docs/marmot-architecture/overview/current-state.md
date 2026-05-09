@@ -89,8 +89,8 @@ The current workspace can exercise the peeler-ingest boundary through
 in-memory clients, reopen encrypted SQLCipher-backed account-device sessions,
 drive a real `AccountDeviceSession` + `NostrTransportAdapter` +
 `NostrMlsPeeler` stack over an in-memory relay client, cover publish ack/fail
-resolution and basic delivery-chaos cases at that stack boundary, converge
-stored OpenMLS messages, emit application-visible group events, model
+resolution and delivery/invite-lifecycle chaos cases at that stack boundary,
+converge stored OpenMLS messages, emit application-visible group events, model
 losing-branch invalidations, and test generated delivery variants.
 
 ## Known gaps
@@ -109,7 +109,8 @@ losing-branch invalidations, and test generated delivery variants.
   and relay status mechanics. The session crate now has an in-memory relay
   integration harness that drives NIP-59 welcomes, kind `445` group messages,
   invite group evolution, insufficient acks, publish errors, subscription
-  gating, duplicate delivery, and reordered delivery through the real session,
+  gating, duplicate delivery, reordered delivery, invite commit/welcome order
+  variants, and terminal stale-epoch invite commits through the real session,
   adapter, and peeler stack. Production relay auth, app-level relay policy,
   richer telemetry export, and account key-management wiring still need
   integration.

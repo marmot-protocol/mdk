@@ -134,14 +134,14 @@ context. If that fails and retained epoch snapshots are available, it SHOULD
 try those retained contexts newest-to-oldest within the retention window before
 classifying the message as `PeelDeferred`.
 
-Transport group envelopes SHOULD carry an authenticated clear source-epoch
-hint. If the source epoch is older than the current local context and no
-retained snapshot can peel the message, the engine MUST classify the message as
-a terminal `PeelFailed`, not `PeelDeferred`. This is the expected path for an
-invitee who joined via welcome and later receives the invite commit that
-created that welcome: the invitee never had the pre-welcome epoch secret.
-Future-epoch group messages, or group messages without a trustworthy
-source-epoch hint, MAY remain `PeelDeferred`.
+Transport group envelopes SHOULD carry a clear source-epoch hint. If the
+peeler reports that the source epoch is older than the current local context
+and no retained snapshot can peel the message, the engine MUST classify the
+message as a terminal `PeelFailed`, not `PeelDeferred`. This is the expected
+path for an invitee who joined via welcome and later receives the invite commit
+that created that welcome: the invitee never had the pre-welcome epoch secret.
+Future-epoch group messages, or group messages without a usable source-epoch
+hint, MAY remain `PeelDeferred`.
 
 When convergence reaches a stable selected branch, the engine MUST retry
 `PeelDeferred` raw group messages for that group. A retry that peels into

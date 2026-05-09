@@ -20,8 +20,11 @@ use async_trait::async_trait;
 /// ### Method invariants
 ///
 /// - `peel_group_message` MUST fail cleanly with `PeelerError::DecryptFailed`
-///   on stale/wrong exporter secrets — the engine maps that to
-///   `StaleReason::PeelFailed`, not a hard error.
+///   on wrong exporter secrets. If envelope metadata shows the message source
+///   epoch is older than the supplied context, prefer `PeelerError::StaleEpoch`.
+///   The engine maps both to
+///   `StaleReason::PeelFailed`, choosing retry or terminal storage from
+///   the available epoch evidence.
 /// - `peel_welcome` MUST fail cleanly for welcomes not addressed to the
 ///   local identity — the engine maps that to `StaleReason::NotForThisClient`.
 /// - `wrap_group_message` MUST be deterministic given the same input

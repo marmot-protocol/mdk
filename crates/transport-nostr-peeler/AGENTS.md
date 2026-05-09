@@ -9,6 +9,7 @@ This crate owns the Nostr transport-edge peeler:
 - Nostr-shaped event DTOs,
 - mapping kind `445` / `1059` events into `TransportMessage`,
 - kind `445` group envelope encryption and decryption,
+- source-epoch metadata for kind `445` group envelopes,
 - NIP-59 welcome wrapping/peeling with injected signer/decrypter,
 - explicit errors for malformed or unsupported Nostr boundary input.
 
@@ -28,6 +29,9 @@ layer above this crate.
 ## Current limits
 
 - Group messages are wrapped and peeled.
+- New kind `445` group outputs include `source_epoch`. The engine uses this
+  hint to classify pre-join stale messages as terminal when no retained epoch
+  context can peel them.
 - Welcomes are wrapped and peeled through NIP-59 when callers inject the local
   signer/decrypter. This crate must not decide where that signer comes from.
 - Kind `445` group outputs carry a pre-signing id; final relay publication may

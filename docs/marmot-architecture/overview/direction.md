@@ -3,7 +3,7 @@ title: "Direction — Where We're Going"
 created: 2026-04-19
 tags: [marmot, overview, direction, conclusions]
 status: overview
-updated: 2026-05-08
+updated: 2026-05-09
 ---
 
 # Direction — Where We're Going
@@ -31,7 +31,7 @@ architecture docs is that convergence belongs inside the engine, after peeling
 and before application-visible output.
 
 ### 4. MLS Extensions Safe Framework as default for new customs.
-Draft-09's Components + AppDataDictionary + SafeExportSecret + SafeAAD toolkit is the right architectural home for new protocol-level data going forward. Existing classical extensions don't need emergency migration. **Gated on backend library support** — OpenMLS's Safe framework status is an open question.
+Draft-09's Components + AppDataDictionary + SafeExportSecret + SafeAAD toolkit is the right architectural home for new protocol-level data going forward. Existing classical extensions don't need emergency migration. **Gated on backend library support** — OpenMLS's Safe framework support still needs a concrete backend investigation.
 
 ### 5. Custom proposal types stay outside the Safe framework.
 The framework covers component data (persistent + ephemeral) but not custom proposal semantics. `IdentityRemove` (Marmot's first custom proposal type) will be a classical `ProposalType::Custom(u16)`.
@@ -68,7 +68,7 @@ proposal.
 
 ---
 
-## Open questions requiring investigation
+## Investigation items
 
 - Does OpenMLS (or the MLS library Marmot-TS uses) support draft-09's Safe Extensions framework? If not, what's the upstream timeline?
 - What does a component-based Marmot spec structure look like concretely? Which existing feature is the right pilot?

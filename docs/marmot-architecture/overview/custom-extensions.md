@@ -3,6 +3,7 @@ title: "Custom Extensions & Safe Framework"
 created: 2026-04-19
 tags: [marmot, overview, extensions, safe-framework, mls]
 status: overview
+updated: 2026-05-09
 ---
 
 # Custom Extensions & Safe Framework
@@ -67,7 +68,7 @@ A standardized toolkit for application-layer subsystems inside MLS groups:
 - **New subsystems** default to Safe framework components. Evaluate classical extensions only if there's a reason (e.g. LeafNode-scoped extensions — framework is GroupContext-focused).
 - **Existing customs (`0xF2EE`, `0xF2EF`, `0xF2F0`)** don't need emergency migration.
 - **Long-term target:** split the monolithic `marmot_group_data` into multiple AppDataDictionary entries (identity, transport, admin, message-lifecycle).
-- **Gated on backend library support.** OpenMLS 0.8's Safe framework support is an open question; investigating it is a near-term next step.
+- **Gated on backend library support.** OpenMLS 0.8's Safe framework support still needs a concrete backend investigation.
 
 ---
 

@@ -11,14 +11,15 @@ Format: date → area → observation → takeaway for the real system.
 
 ## 2026-04-25 — Production refactor in progress
 
-The CGKA engine production refactor (`plans/2026-04-22-cgka-engine-production-refactor-v1.md`) is largely complete. The old prototype tree has since been removed. The workspace lives at the repo root with four crates:
+The CGKA engine production refactor (`plans/2026-04-22-cgka-engine-production-refactor-v1.md`) was largely complete at this checkpoint. The old prototype tree has since been removed. At the time, the workspace had these four core crates:
 
 - `crates/traits` — shared trait surface + value types (zero Nostr leakage; verified by grep)
 - `crates/cgka-engine` — OpenMLS-backed `CgkaEngine` impl
 - `crates/storage-memory` — `Arc<RwLock>`-cloneable in-memory backend
 - `crates/cgka-conformance-simulator` — multi-client `TransportBus` + `HarnessClient` + proptest
 
-Test totals at this checkpoint: ~80 tests across the workspace, 0 failing.
+Test totals at this checkpoint: ~80 tests across the workspace, 0 failing. The
+current workspace has more crates; use the root `README.md` as the current map.
 
 Key corrections to earlier spike claims surfaced during implementation:
 - Earlier notes said per-leaf `Capabilities` access was blocked by `MlsGroup::member_at`. Implementation revealed the deeper truth: `LeafNode::capabilities()` IS public, but `MlsGroup::public_group()` is `pub(crate)`. The cache (`CapabilityStorage`) is **load-bearing for correctness**, populated from KeyPackages we directly handle (invite path, ingested commits' Add proposals) plus `MlsGroup::own_leaf_node()` for self.
@@ -150,7 +151,7 @@ Added post-creation invite, spec-compliant SelfRemove (per MIP-03 and draft-ietf
 
 **4. `remove_members([own_index])` is an error** (`CreateCommitError::CannotRemoveSelf`). Validated spec intent — OpenMLS refuses this specifically to force use of the SelfRemove proposal path. The architecture correctly forbids shortcuts.
 
-**5. Relay backlog causes spurious peeler decrypt errors.** Any subscription without a `since` filter receives historical events encrypted with old-epoch secrets that the new joiner doesn't have. Fix in spike: `Filter::new()...since(Timestamp::now())`. But the deeper fix is to treat peel-decrypt failures as `IngestOutcome::Stale` rather than errors — **`StaleReason::AlreadyAtEpoch` is the right bucket even when the true cause is "wrong epoch" in either direction**. Real Marmot's event-processor needs this same demotion.
+**5. Relay backlog causes spurious peeler decrypt errors.** Any subscription without a `since` filter receives historical events encrypted with old-epoch secrets that the new joiner doesn't have. Fix in spike: `Filter::new()...since(Timestamp::now())`. The deeper fix was to treat peel-decrypt failures as `IngestOutcome::Stale` rather than hard errors. Current code uses `StaleReason::PeelFailed`, and stale source-epoch group envelopes can be terminal when no retained snapshot can peel them.
 
 **6. Forked commit recovery is out of scope for the spike, but real.** When a commit race *does* produce a fork (e.g. two admins committing concurrent adds), some members end up at irreconcilable epoch-N-alpha / epoch-N-beta states. The spike dodges this via the lowest-index-auto-commit rule for SelfRemove, but the general mechanism is absent. The target architecture's `EpochState::Recovering { last_stable_epoch, buffered_events }` (cgka-engine-design.md) is the right home for this — worth prioritizing.
 
@@ -171,7 +172,7 @@ That's: required has proposal `10` (SelfRemove), had has proposal `65281` (React
 ### What I'd still change if this weren't a throwaway
 
 - Add `EngineError::MissingRequiredCapabilities { required, had }` typed variant (see finding 9).
-- Add `StaleReason::PeelFailed` to distinguish peel-level stale from MLS-level stale (currently we overload `AlreadyAtEpoch` for both).
+- Add `StaleReason::PeelFailed` to distinguish peel-level stale from MLS-level stale. Superseded: this now exists, and the Nostr group envelope carries a source-epoch hint so pre-join stale messages can be terminal.
 - Fix the auto-commit race properly — the "lowest-index" rule is a shortcut that breaks when the lowest-index member is offline. Real fix: short randomized delay + observer-of-commit suppression.
 - Store members' advertised capabilities in a local index so `feature_status()` can give real `Unavailable`/`Upgradeable` answers without LeafNode access.
 - Use a custom OpenMLS build with mixed-outgoing wire format so MLS-layer encryption isn't sacrificed for SelfRemove support.

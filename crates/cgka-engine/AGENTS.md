@@ -55,8 +55,8 @@ These are the load-bearing departures from the original plan. Each is also docum
 3. **`CreateGroupRequest::initial_admins: Vec<MemberId>`.**
    Bootstraps multi-admin groups so admins can subsequently self-remove (MIP-03 §149's "not the last admin" constraint). Creator is implicitly an admin; `initial_admins` adds co-admins.
 
-4. **The per-leaf capability cache is load-bearing for correctness, not a pure optimization.**
-   `LeafNode::capabilities()` IS public on OpenMLS (an earlier prototype used the wrong access path — see `memory/project_openmls_capabilities_access.md`). But `MlsGroup::public_group()` is `pub(crate)`, so there's no public API to walk to a *specific* leaf. The cache is populated from KeyPackages we directly handle (invite-side parses, `StagedCommit::add_proposals`) plus `MlsGroup::own_leaf_node()` for self.
+4. **The per-leaf capability cache is required for correctness, not a pure optimization.**
+   `LeafNode::capabilities()` is public on OpenMLS, but `MlsGroup::public_group()` is `pub(crate)`, so there is no public API to walk to a specific leaf. The cache is populated from KeyPackages we directly handle (invite-side parses, `StagedCommit::add_proposals`) plus `MlsGroup::own_leaf_node()` for self.
 
 5. **MIP-01 `marmot_group_data` (`0xF2EE`) is owned by the engine, not by a transport adapter.**
    §149 / §150 admin guards must fire at commit-construction time, which is inside the engine. Transport-y fields (relays, image_*, nostr_group_id) are populated with placeholders that a future transport adapter refines. A future component-based MIP-01 split will retire this monolithic module.
@@ -66,9 +66,9 @@ These are the load-bearing departures from the original plan. Each is also docum
 
 ## Open structural items
 
-None in the engine core. Remaining work is around production packaging and
-adjacent layers: transport adapters, app key-management integration, external
-vector fixtures/runners, WAL checkpoint/rekey policy, and KeyPackage refresh
+None in the engine core. Remaining production work sits around adjacent
+layers: relay auth and relay-policy wiring, app key-management integration,
+external vector runners, WAL checkpoint/rekey policy, and KeyPackage refresh
 scheduling.
 
 ### Done — Task 4.2 `update_group_data` (2026-04-25)
@@ -93,8 +93,8 @@ OpenMLS 0.8.1 surface used: `MlsGroup::pending_commit() -> Option<&StagedCommit>
 - **OpenMLS family is tilde-pinned in workspace `Cargo.toml`.** Don't relax to caret; silent companion-crate skew has broken this stack before.
 - **Wire format is `PURE_PLAINTEXT_WIRE_FORMAT_POLICY`.** This is a deliberate 0.1.0 choice. Before changing it, read the module comment in `src/wire_format.rs` and the three alternative paths it links.
 
-## Memory files agents should consult
+## Historical notes reflected here
 
-- `project_openmls_capabilities_access` — records the OpenMLS capabilities access correction.
-- `feedback_openmls_accessor_pattern` — when to prefer accessor composition over hand-forwarding OpenMLS traits.
-- `project_two_layer_addressing` — why `StaleReason::NotForThisClient` is engine-layer identity filtering, not transport-layer defense-in-depth.
+- OpenMLS capability access: read `capability_manager.rs` before changing the cache.
+- OpenMLS storage access: keep `StorageProvider::mls_storage()` as accessor composition.
+- Two-layer addressing: `StaleReason::NotForThisClient` is engine-layer identity filtering as well as transport defense.

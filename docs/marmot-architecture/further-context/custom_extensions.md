@@ -281,7 +281,7 @@ Notice the pattern. Classical extensions stay classical for things that are trul
 
 ### 5.8 Practical caveat: OpenMLS support
 
-The Safe Extensions framework is still draft (draft-09 as of this writing). **Whether OpenMLS 0.8 — or any other major MLS library — implements the Safe framework is an open question** requiring investigation. Adopting it in Marmot is gated on backend support. If OpenMLS doesn't implement it, Marmot would need either (a) upstream contributions to add it, or (b) application-layer reimplementation of the framework's invariants (which partially defeats the point — you'd be rolling your own label discipline again, just wrapped in framework-shaped names).
+The Safe Extensions framework is still draft (draft-09 as of this writing). **OpenMLS 0.8 and other major MLS-library support for the Safe framework require investigation.** Adopting it in Marmot is gated on backend support. If OpenMLS doesn't implement it, Marmot would need either (a) upstream contributions to add it, or (b) application-layer reimplementation of the framework's invariants (which partially defeats the point — you'd be rolling your own label discipline again, just wrapped in framework-shaped names).
 
 The recommendation in §7 defers Safe-framework adoption precisely because of this gate. But the direction is clear.
 

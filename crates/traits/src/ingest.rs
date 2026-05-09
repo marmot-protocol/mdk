@@ -1,5 +1,5 @@
-//! Typed outcomes from [`CgkaEngine::ingest`] plus the peeled-message
-//! intermediate form.
+//! Typed outcomes from [`crate::engine::CgkaEngine::ingest`] plus the
+//! peeled-message intermediate form.
 //!
 //! `IngestOutcome` separates applied messages from classifiable stale cases.
 //! Hard errors stay in `EngineError`; stale routing, dedupe, and epoch cases
@@ -42,8 +42,9 @@ pub enum StaleReason {
     UnknownGroup,
     /// The message is our own commit echoed back by the transport.
     OwnEcho,
-    /// The peeler rejected the message, for example because the exporter
-    /// secret is stale.
+    /// The peeler rejected the message. The stored message may be terminal or
+    /// retryable depending on whether the engine has evidence that another
+    /// epoch context could later peel it.
     PeelFailed,
 }
 

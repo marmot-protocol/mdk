@@ -30,7 +30,7 @@ as a high-level constraint, not an implementation checklist.
 After doc changes, run:
 
 ```sh
-rg -n "future SQLite|production storage|TODO|TBD" docs
+rg -n "TODO|TBD|open question|future SQLite|production storage|retry-deferred|AlreadyAtEpoch.*Peel" docs --glob '!AGENTS.md'
 ```
 
 Review matches before deciding whether they are stale.

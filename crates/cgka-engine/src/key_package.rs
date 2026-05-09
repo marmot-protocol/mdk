@@ -1,8 +1,8 @@
 //! KeyPackage generation + validation.
 //!
 //! Scope for 0.1.0: produce a fresh KeyPackage whose leaf capabilities are
-//! derived from the [`FeatureRegistry`]. Expiry and refresh scheduling are
-//! handled above the engine.
+//! derived from the [`crate::FeatureRegistry`]. Expiry and refresh scheduling
+//! are handled above the engine.
 
 use crate::capabilities::leaf_capabilities;
 use crate::engine::Engine;

@@ -193,7 +193,7 @@ trait Sequencer {
 
 **Assessment:** Full BeeKEM migration is a 6-12 month project including implementation, testing, security analysis, and deployment. But the architectural preparation — abstracting the CGKA interface — should happen now regardless, because it also improves testability and modularity. The cost of the abstraction is low. The cost of not having it when you need it is a full rewrite.
 
-**Critical open question:** BeeKEM's blanking-recovery pattern adds latency under high concurrency. For document access control this is fine. For real-time messaging where users expect sub-second delivery, the recovery latency needs benchmarking. Nobody has measured this for messaging workloads.
+**Critical benchmarking need:** BeeKEM's blanking-recovery pattern adds latency under high concurrency. For document access control this is fine. For real-time messaging where users expect sub-second delivery, the recovery latency needs benchmarking. Nobody has measured this for messaging workloads.
 
 ## 5. The Coordinator Concept
 

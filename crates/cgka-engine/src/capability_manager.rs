@@ -2,15 +2,12 @@
 //!
 //! ## How this cache is populated
 //!
-//! **Correction to an earlier note.** The `project_openmls_capabilities_access`
-//! memory originally claimed per-leaf access is available via
-//! `group.public_group().leaf(idx).capabilities()`. The first half is true —
-//! `LeafNode::capabilities()` has been `pub` since OpenMLS ≥ 0.7.0 — but
-//! `MlsGroup::public_group()` itself is `pub(crate)` in 0.8.1. And
+//! `LeafNode::capabilities()` has been public since OpenMLS 0.7, but
+//! `MlsGroup::public_group()` itself is `pub(crate)` in OpenMLS 0.8.1.
 //! `MlsGroup::members()` returns `Member` records that omit capabilities.
-//! Net: the engine **cannot** read another member's capabilities from a
-//! live MlsGroup via public API. The cache is therefore **load-bearing for
-//! correctness**, not just an optimization.
+//! The engine therefore cannot read another member's capabilities from a live
+//! `MlsGroup` via public API. The cache is required for correctness, not just
+//! speed.
 //!
 //! Cache population uses only public APIs:
 //!

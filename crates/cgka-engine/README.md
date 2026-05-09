@@ -41,4 +41,6 @@ Tests are split into three tiers (unit, in-crate integration, multi-client harne
 
 ## Status
 
-`0.1.0`, single internal consumer, not semver-stable. See the implementation plan for what's done vs. open.
+`0.1.0`, single internal consumer, not semver-stable. For current readiness and
+open production work, start with
+[`../../docs/marmot-architecture/overview/current-state.md`](../../docs/marmot-architecture/overview/current-state.md).

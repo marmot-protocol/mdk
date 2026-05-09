@@ -4,7 +4,9 @@
 //! and [`cgka_traits::transport::TransportMessage`]. It does not connect to
 //! relays, manage subscriptions, pick relays, or own application sessions.
 //! Real Nostr signing and relay publication belong in a transport adapter
-//! above this crate.
+//! above this crate. Group envelopes include a clear source-epoch hint so the
+//! engine can distinguish stale pre-join messages from messages that may peel
+//! after convergence advances.
 
 mod error;
 mod event;
