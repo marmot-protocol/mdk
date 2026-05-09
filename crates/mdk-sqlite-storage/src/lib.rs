@@ -1913,6 +1913,7 @@ mod tests {
             image_key: None,
             image_nonce: None,
             self_update_state: SelfUpdateState::Required,
+            disappearing_message_secs: None,
         };
 
         // Save the group
@@ -2043,6 +2044,7 @@ mod tests {
             image_key: None,
             image_nonce: None,
             self_update_state: SelfUpdateState::Required,
+            disappearing_message_secs: None,
         };
         storage.save_group(group).unwrap();
 
@@ -2295,6 +2297,7 @@ mod tests {
                     image_key: None,
                     image_nonce: None,
                     self_update_state: SelfUpdateState::Required,
+                    disappearing_message_secs: None,
                 };
 
                 storage.save_group(group).unwrap();
@@ -2463,6 +2466,7 @@ mod tests {
                     image_key: None,
                     image_nonce: None,
                     self_update_state: SelfUpdateState::Required,
+                    disappearing_message_secs: None,
                 };
                 storage.save_group(group).unwrap();
 
@@ -3432,6 +3436,7 @@ mod tests {
                 image_key: None,
                 image_nonce: None,
                 self_update_state: SelfUpdateState::Required,
+                disappearing_message_secs: None,
             }
         }
 
@@ -3910,6 +3915,7 @@ mod tests {
                 image_key: None,
                 image_nonce: None,
                 self_update_state: SelfUpdateState::Required,
+                disappearing_message_secs: None,
             };
             storage.save_group(group).unwrap();
 
@@ -3965,6 +3971,7 @@ mod tests {
                 image_key: None,
                 image_nonce: None,
                 self_update_state: SelfUpdateState::Required,
+                disappearing_message_secs: None,
             };
             let g2 = Group {
                 mls_group_id: group2.clone(),
@@ -4014,6 +4021,7 @@ mod tests {
                 image_key: None,
                 image_nonce: None,
                 self_update_state: SelfUpdateState::Required,
+                disappearing_message_secs: None,
             };
             storage.save_group(group).unwrap();
 
@@ -4060,6 +4068,7 @@ mod tests {
                 image_key: None,
                 image_nonce: None,
                 self_update_state: SelfUpdateState::Required,
+                disappearing_message_secs: None,
             };
             storage.save_group(group).unwrap();
 
@@ -4104,6 +4113,7 @@ mod tests {
                 image_key: None,
                 image_nonce: None,
                 self_update_state: SelfUpdateState::Required,
+                disappearing_message_secs: None,
             };
             storage.save_group(group).unwrap();
 
@@ -4169,6 +4179,7 @@ mod tests {
                 image_key: None,
                 image_nonce: None,
                 self_update_state: SelfUpdateState::Required,
+                disappearing_message_secs: None,
             }
         }
 
@@ -4812,6 +4823,7 @@ mod tests {
                 image_key: None,
                 image_nonce: None,
                 self_update_state: SelfUpdateState::Required,
+                disappearing_message_secs: None,
             };
             storage.save_group(group).unwrap();
 

@@ -103,10 +103,24 @@ jobs:
       - name: Get master branch coverage (for PRs)
         if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
         id: master_coverage
+        env:
+          BASELINE_INPUT: ${{ github.event.inputs.baseline_coverage }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          # Check if manual baseline provided (for testing)
-          if [ -n "${{ github.event.inputs.baseline_coverage }}" ]; then
-            MASTER_COV="${{ github.event.inputs.baseline_coverage }}"
+          # Numeric percentage: integer or decimal, no leading sign. Anything else
+          # is rejected so it can't flow into downstream expression expansions
+          # (Compare coverage / github-script) as a shell or JS payload.
+          NUMERIC_RE='^[0-9]+(\.[0-9]+)?$'
+
+          # Check if manual baseline provided (for testing).
+          # The workflow_dispatch input defaults to "0", which is a sentinel meaning
+          # "not provided" — fall through to the master-artifact path in that case.
+          if [ -n "$BASELINE_INPUT" ] && [ "$BASELINE_INPUT" != "0" ]; then
+            if ! [[ "$BASELINE_INPUT" =~ $NUMERIC_RE ]]; then
+              echo "::error::baseline_coverage must be a numeric percentage (got: $BASELINE_INPUT)"
+              exit 1
+            fi
+            MASTER_COV="$BASELINE_INPUT"
             echo "baseline=$MASTER_COV" >> "$GITHUB_OUTPUT"
             echo "Using manual baseline: $MASTER_COV%"
           else
@@ -138,6 +152,11 @@ jobs:
 
               if [ -f master-coverage/coverage-baseline.txt ]; then
                 MASTER_COV=$(cat master-coverage/coverage-baseline.txt)
+                if ! [[ "$MASTER_COV" =~ $NUMERIC_RE ]]; then
+                  echo "baseline=0" >> "$GITHUB_OUTPUT"
+                  echo "⚠️  Baseline artifact contained non-numeric data, ignoring"
+                  exit 0
+                fi
                 echo "baseline=$MASTER_COV" >> "$GITHUB_OUTPUT"
                 echo "✓ Master branch coverage: $MASTER_COV%"
               else
@@ -149,8 +168,6 @@ jobs:
               echo "⚠️  Failed to download baseline artifact from run $RUN_ID"
             fi
           fi
-        env:
-          GH_TOKEN: ${{ github.token }}
 
       - name: Compare coverage
         if: (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch') && steps.master_coverage.outputs.baseline != '0'

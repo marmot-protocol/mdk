@@ -25,13 +25,19 @@
 
 ### Breaking changes
 
+- **Extension version bumped from 2 to 3**: `NostrGroupDataExtension::CURRENT_VERSION` is now `3`. The new version adds a `disappearing_message_secs` field to the TLS-serialized group data extension. Existing v1/v2 groups are forward-compatible (the field deserializes as `None`). `NostrGroupConfigData::new` now takes an additional `disappearing_message_secs: Option<u64>` parameter. ([#253](https://github.com/marmot-protocol/mdk/pull/253))
+- **`NostrGroupDataExtension::migrate_to_v2` removed from public API.** The 0.8.0 method was used only to construct test fixtures; production code never migrates extensions in-place (deserialization upgrades v1/v2 → v3 through `into_v3`, and new groups author v3 directly). Mirrors the existing convention for `migrate_group_image_v1_to_v2`, which was already documented as internal-only. ([#253](https://github.com/marmot-protocol/mdk/pull/253))
+
 ### Changed
 
 ### Added
 
+- Added `disappearing_message_secs: Option<u64>` field to `NostrGroupDataExtension`, `NostrGroupConfigData`, and `NostrGroupDataUpdate` for configuring disappearing messages on groups. `None` means messages persist forever; `Some(n)` means messages expire `n` seconds after creation. The field is propagated through group creation, group updates, and welcome processing. ([#253](https://github.com/marmot-protocol/mdk/pull/253))
+
 ### Fixed
 
 - Fixed admin auto-commit of legacy `Remove(self)` leaves in mixed/legacy groups so departing members are actually removed instead of silently remaining in the MLS group. ([#288](https://github.com/marmot-protocol/mdk/pull/288))
+- Accepted `NostrGroupDataExtension` payloads from future versions with unknown trailing fields, per MIP-01's forward-compatibility requirement. Previously, any v(N+1) extension on the wire was rejected by `deserialize_bytes`, which would have bricked every group operation (commit/proposal/welcome/admin checks) the moment any peer authored a newer-version extension. ([#88](https://github.com/marmot-protocol/marmot-security/issues/88))
 - Recorded rollback snapshots for locally merged admin-list updates so clients can converge on the MIP-03 winner when competing admins concurrently mutate `admin_pubkeys`. ([#289](https://github.com/marmot-protocol/mdk/pull/289))
 - Verified unsigned application-message rumor IDs before accepting or sending them, preventing caller-supplied IDs from being trusted when they do not match the canonical event hash. ([#287](https://github.com/marmot-protocol/mdk/pull/287))
 - Fixed `mdk-core` crates.io package verification against OpenMLS 0.8.1 by using a temporary exported-ratchet-tree compatibility shim until crates.io OpenMLS exposes the upstream full-leaf iterator. ([#273](https://github.com/marmot-protocol/mdk/pull/273))

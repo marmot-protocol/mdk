@@ -33,6 +33,8 @@
 
 ### Fixed
 
+- Hardened the Kotlin bindings publishing workflow. The version-tag step now runs only on `v*` tag pushes, refuses to overwrite an existing remote tag (no more `git push --force`), and routes secrets through step `env:` blocks instead of inline expression substitution. Downstream JitPack consumers can now trust that a pinned Kotlin version maps to immutable artifact content. ([#292](https://github.com/marmot-protocol/mdk/pull/292))
+
 ### Removed
 
 ### Deprecated
