@@ -119,6 +119,12 @@ losing-branch invalidations, and test generated delivery variants.
   secret tree. We need an explicit policy for how much same-epoch app-message
   reordering the transport/session layer promises to tolerate, and how to
   classify messages outside that window.
+- **Late invite commits for new members** — invite lifecycle chaos shows that a
+  member who joined from the welcome cannot decrypt the earlier group commit
+  that invited them. The stack currently fails closed with `PeelFailed` and
+  treats replay as another deferred peel attempt. We should decide whether that
+  class should become terminal once the welcome has already landed the member
+  at the post-invite epoch.
 - **Portable fork-recovery vectors** — fork recovery is tested in Rust, but
   OpenMLS commit randomness makes stable external vectors harder.
 - **Safe Extensions framework support** — still gated on backend library

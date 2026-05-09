@@ -20,6 +20,9 @@ Use it for production-shaped session/adapter/peeler behavior:
 
 `nostr_stack_chaos.rs` is the seeded chaos runner. Keep chaos reports
 reproducible by seed and write artifacts under `target/`, not into the repo.
+Lifecycle chaos in this file should stay at the adapter/session boundary:
+assert routed `IngestOutcome`s and emitted `GroupEvent`s, not internal engine
+state.
 
 Do not connect to real relays from these tests.
 

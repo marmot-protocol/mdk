@@ -2,11 +2,12 @@ mod support;
 
 use std::path::Path;
 
+use cgka_engine::canonicalization::CanonicalizationPolicy;
 use cgka_session::IngestEffects;
 use cgka_session::PublishWork;
 use cgka_traits::engine::{CreateGroupRequest, GroupEvent, SendIntent};
 use cgka_traits::ingest::{IngestOutcome, StaleReason};
-use cgka_traits::{GroupId, TransportEndpoint};
+use cgka_traits::{EpochId, GroupId, MemberId, TransportEndpoint, TransportMessage};
 use serde::Serialize;
 use support::nostr_stack::{CreatedGroup, NostrStackHarness, StackClient};
 use transport_nostr_peeler::NostrTransportEvent;
@@ -25,6 +26,177 @@ async fn seeded_delivery_chaos_variants_preserve_stack_invariants() {
             serde_json::to_string_pretty(&report).unwrap()
         );
     }
+}
+
+#[tokio::test]
+async fn invite_lifecycle_chaos_handles_wrong_routes_replays_and_welcome_before_commit() {
+    let seed = 0x1FEC7_u64;
+    let stack = NostrStackHarness::new();
+    let mut alice = stack.client("alice").await;
+    let mut bob = stack.client("bob").await;
+    let mut carol = stack.client("carol").await;
+    let created = create_group_for_bob(&mut alice, &mut bob, seed).await;
+    let group_id = created.group_id.clone();
+    publish_confirm_and_deliver_welcome(&stack, &mut alice, &mut bob, created).await;
+    stack.sync_group(&bob, &group_id).await;
+
+    let invite = invite_carol(&mut alice, &mut carol, &group_id).await;
+    let commit_report = stack
+        .publish_group(&alice, &group_id, invite.commit.clone(), 1)
+        .await
+        .unwrap();
+    let welcome_report = stack
+        .publish_welcome(&alice, &carol, invite.welcome.clone(), 1)
+        .await
+        .unwrap();
+    assert!(commit_report.met_required_acks());
+    assert!(welcome_report.met_required_acks());
+    alice
+        .session
+        .confirm_published(invite.pending)
+        .await
+        .unwrap();
+    bob.session.set_convergence_policy(CanonicalizationPolicy {
+        stable_quiescence_ms: 0,
+        ..CanonicalizationPolicy::default()
+    });
+
+    let commit_event = stack.take_next_published();
+    let welcome_event = stack.take_next_published();
+    assert_eq!(commit_event.endpoints, vec![stack.group_endpoint()]);
+    assert_eq!(welcome_event.endpoints, vec![carol.inbox_endpoint.clone()]);
+
+    let wrong_commit = stack
+        .deliver_event_to_session(
+            &mut bob,
+            TransportEndpoint("wss://wrong-group.example".into()),
+            "wrong-commit",
+            commit_event.event.clone(),
+        )
+        .await;
+    assert!(wrong_commit.is_none());
+
+    let carol_endpoint = carol.inbox_endpoint.clone();
+    let wrong_welcome = stack
+        .deliver_event_to_session(
+            &mut carol,
+            TransportEndpoint("wss://wrong-inbox.example".into()),
+            "wrong-welcome",
+            welcome_event.event.clone(),
+        )
+        .await;
+    assert!(wrong_welcome.is_none());
+
+    let carol_joined = stack
+        .deliver_event_to_session(
+            &mut carol,
+            carol_endpoint.clone(),
+            "carol-valid-welcome",
+            welcome_event.event.clone(),
+        )
+        .await
+        .expect("valid welcome should route to Carol");
+    assert_eq!(carol_joined.outcome, IngestOutcome::Processed);
+    assert_eq!(
+        carol_joined.effects.events,
+        vec![GroupEvent::GroupJoined {
+            group_id: group_id.clone(),
+            via_welcome: welcome_report.message_id,
+        }]
+    );
+    assert_eq!(carol.session.epoch(&group_id).unwrap(), EpochId(2));
+    assert_eq!(carol.session.members(&group_id).unwrap().len(), 3);
+
+    let carol_welcome_replay = stack
+        .deliver_event_to_session(
+            &mut carol,
+            carol_endpoint,
+            "carol-welcome-replay",
+            welcome_event.event,
+        )
+        .await
+        .expect("welcome replay should still route to Carol");
+    assert!(matches!(
+        carol_welcome_replay.outcome,
+        IngestOutcome::Stale {
+            reason: StaleReason::AlreadySeen
+        }
+    ));
+    assert!(carol_welcome_replay.effects.events.is_empty());
+
+    stack.sync_group(&carol, &group_id).await;
+    let bob_account_id = bob.account_id.clone();
+    let carol_account_id = carol.account_id.clone();
+    let mut commit_deliveries = stack
+        .deliver_event_to_sessions(
+            &mut [&mut bob, &mut carol],
+            stack.group_endpoint(),
+            "shared-commit-delivery",
+            commit_event.event.clone(),
+        )
+        .await;
+    assert_eq!(commit_deliveries.len(), 2);
+
+    let bob_commit = take_effect_for(&mut commit_deliveries, &bob_account_id);
+    assert_eq!(bob_commit.outcome, IngestOutcome::Processed);
+    assert!(bob_commit.effects.events.iter().any(|event| matches!(
+        event,
+        GroupEvent::EpochChanged {
+            group_id: changed_group,
+            from: EpochId(1),
+            to: EpochId(2),
+        } if changed_group == &group_id
+    )));
+    assert!(bob_commit.effects.events.iter().any(|event| matches!(
+        event,
+        GroupEvent::MemberAdded {
+            group_id: changed_group,
+            member,
+        } if changed_group == &group_id && member.id == carol_account_id
+    )));
+    assert_eq!(bob.session.epoch(&group_id).unwrap(), EpochId(2));
+    assert_eq!(bob.session.members(&group_id).unwrap().len(), 3);
+
+    let carol_late_commit = take_effect_for(&mut commit_deliveries, &carol_account_id);
+    assert!(
+        matches!(
+            carol_late_commit.outcome,
+            IngestOutcome::Stale {
+                reason: StaleReason::PeelFailed
+            }
+        ),
+        "unexpected Carol late commit outcome: {:?}",
+        carol_late_commit.outcome
+    );
+    assert!(carol_late_commit.effects.events.is_empty());
+
+    let mut replay_deliveries = stack
+        .deliver_event_to_sessions(
+            &mut [&mut bob, &mut carol],
+            stack.group_endpoint(),
+            "shared-commit-replay",
+            commit_event.event,
+        )
+        .await;
+    assert_eq!(replay_deliveries.len(), 2);
+
+    let bob_commit_replay = take_effect_for(&mut replay_deliveries, &bob_account_id);
+    assert!(matches!(
+        bob_commit_replay.outcome,
+        IngestOutcome::Stale {
+            reason: StaleReason::AlreadySeen
+        }
+    ));
+    assert!(bob_commit_replay.effects.events.is_empty());
+
+    let carol_commit_replay = take_effect_for(&mut replay_deliveries, &carol_account_id);
+    assert!(matches!(
+        carol_commit_replay.outcome,
+        IngestOutcome::Stale {
+            reason: StaleReason::PeelFailed
+        }
+    ));
+    assert!(carol_commit_replay.effects.events.is_empty());
 }
 
 #[derive(Clone, Debug)]
@@ -71,6 +243,12 @@ struct ChaosRunState<'a> {
     expected_payloads: Vec<String>,
     observed_payloads: Vec<String>,
     failures: Vec<String>,
+}
+
+struct InvitePublish {
+    pending: cgka_traits::PendingStateRef,
+    commit: TransportMessage,
+    welcome: TransportMessage,
 }
 
 fn stack_chaos_scenarios() -> Vec<StackChaosScenario> {
@@ -518,6 +696,34 @@ async fn publish_app_events(
     events
 }
 
+async fn invite_carol(
+    alice: &mut StackClient,
+    carol: &mut StackClient,
+    group_id: &GroupId,
+) -> InvitePublish {
+    let carol_key_package = carol.session.fresh_key_package().await.unwrap();
+    let invite = alice
+        .session
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![carol_key_package],
+        })
+        .await
+        .unwrap();
+    match &invite.publish[0] {
+        PublishWork::GroupEvolution {
+            msg,
+            welcomes,
+            pending,
+        } => InvitePublish {
+            pending: *pending,
+            commit: msg.clone(),
+            welcome: welcomes[0].clone(),
+        },
+        other => panic!("expected group evolution publish work, got {other:?}"),
+    }
+}
+
 fn message_payloads(ingest: &IngestEffects) -> Vec<String> {
     ingest
         .effects
@@ -530,6 +736,17 @@ fn message_payloads(ingest: &IngestEffects) -> Vec<String> {
             _ => None,
         })
         .collect()
+}
+
+fn take_effect_for(
+    deliveries: &mut Vec<(MemberId, IngestEffects)>,
+    account_id: &MemberId,
+) -> IngestEffects {
+    let position = deliveries
+        .iter()
+        .position(|(delivered, _)| delivered == account_id)
+        .expect("expected delivery for account");
+    deliveries.remove(position).1
 }
 
 fn payload_label(seed: u64, message_index: usize) -> String {

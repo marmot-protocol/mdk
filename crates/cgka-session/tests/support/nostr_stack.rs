@@ -291,6 +291,19 @@ impl NostrStackHarness {
         subscription_id: impl Into<String>,
         event: NostrTransportEvent,
     ) -> Option<IngestEffects> {
+        let mut routed = self
+            .deliver_event_to_sessions(&mut [recipient], endpoint, subscription_id, event)
+            .await;
+        routed.pop().map(|(_, effects)| effects)
+    }
+
+    pub async fn deliver_event_to_sessions(
+        &self,
+        recipients: &mut [&mut StackClient],
+        endpoint: TransportEndpoint,
+        subscription_id: impl Into<String>,
+        event: NostrTransportEvent,
+    ) -> Vec<(MemberId, IngestEffects)> {
         let delivered = self
             .adapter
             .handle_relay_event(NostrRelayEvent {
@@ -301,11 +314,21 @@ impl NostrStackHarness {
             .await
             .unwrap();
         if delivered == 0 {
-            return None;
+            return Vec::new();
         }
-        let delivery = self.adapter.receive().await.unwrap().unwrap();
-        assert_eq!(delivery.account_id, recipient.account_id);
-        Some(recipient.session.ingest(delivery.message).await.unwrap())
+
+        let mut effects = Vec::with_capacity(delivered);
+        for _ in 0..delivered {
+            let delivery = self.adapter.receive().await.unwrap().unwrap();
+            let recipient = recipients
+                .iter_mut()
+                .find(|recipient| recipient.account_id == delivery.account_id)
+                .expect("relay event delivered to an unexpected account");
+            let account_id = recipient.account_id.clone();
+            let ingest = recipient.session.ingest(delivery.message).await.unwrap();
+            effects.push((account_id, ingest));
+        }
+        effects
     }
 
     pub fn group_endpoint(&self) -> TransportEndpoint {
