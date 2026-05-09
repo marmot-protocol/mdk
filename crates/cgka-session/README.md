@@ -49,6 +49,11 @@ Those live above this crate.
 - group subscription gating, duplicate relay delivery, out-of-order delivery,
   and invite group evolution with both commit and welcome outputs.
 
+`tests/nostr_stack_chaos.rs` runs seeded no-network delivery-chaos scripts
+against the same stack. It writes reproducibility reports to
+`target/session-stack-chaos/` and currently keeps generated same-epoch
+app-message reordering inside a shallow delivery window.
+
 Run:
 
 ```sh

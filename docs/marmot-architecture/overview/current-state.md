@@ -113,6 +113,12 @@ losing-branch invalidations, and test generated delivery variants.
   adapter, and peeler stack. Production relay auth, app-level relay policy,
   richer telemetry export, and account key-management wiring still need
   integration.
+- **Deep same-epoch app-message reordering** — the seeded stack-chaos runner
+  keeps generated app-message reordering shallow. A deeper generated reversal
+  exposed OpenMLS `TooDistantInThePast` behavior in the message generation
+  secret tree. We need an explicit policy for how much same-epoch app-message
+  reordering the transport/session layer promises to tolerate, and how to
+  classify messages outside that window.
 - **Portable fork-recovery vectors** — fork recovery is tested in Rust, but
   OpenMLS commit randomness makes stable external vectors harder.
 - **Safe Extensions framework support** — still gated on backend library

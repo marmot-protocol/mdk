@@ -361,6 +361,8 @@ dependencies = [
  "cgka-traits",
  "hex",
  "nostr",
+ "serde",
+ "serde_json",
  "sha2",
  "storage-sqlite",
  "tempfile",

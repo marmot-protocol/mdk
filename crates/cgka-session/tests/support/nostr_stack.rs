@@ -1,3 +1,9 @@
+#![allow(dead_code)]
+//! Shared no-network Nostr stack harness for session integration tests.
+//!
+//! Each integration test binary compiles this module independently, so some
+//! public helpers are intentionally used by only one sibling test file.
+
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;

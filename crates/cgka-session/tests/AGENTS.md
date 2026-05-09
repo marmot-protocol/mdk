@@ -18,6 +18,9 @@ Use it for production-shaped session/adapter/peeler behavior:
 - kind `445` group delivery,
 - duplicate, dropped, or reordered relay deliveries.
 
+`nostr_stack_chaos.rs` is the seeded chaos runner. Keep chaos reports
+reproducible by seed and write artifacts under `target/`, not into the repo.
+
 Do not connect to real relays from these tests.
 
 ## Verification
