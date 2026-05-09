@@ -16,9 +16,11 @@ production deployment runner.
 
 ## Current State
 
-The harness in `crates/cgka-conformance-simulator` is an in-process simulator. It uses
-`Engine<MemoryStorage>` instances, a pass-through `MockPeeler`, and a
-deterministic `TransportBus`.
+The harness in `crates/cgka-conformance-simulator` is an in-process simulator.
+It uses `Engine<MemoryStorage>` instances, the real `NostrMlsPeeler` over an
+in-memory bus, and deterministic `TransportBus` delivery controls. Engine-local
+tests still use pass-through mock peelers when the question under test does not
+cross the transport-peeling boundary.
 
 Current bus capabilities:
 
@@ -26,6 +28,7 @@ Current bus capabilities:
 - Reverse delivery.
 - Seeded-random delivery.
 - Scripted partitions via `TransportBus::set_partition`.
+- Queue-level drop, duplicate, delay/release, and reorder scenario steps.
 - Direct message injection via `TransportBus::inject` for replay tests.
 
 Current scenario coverage:
@@ -64,17 +67,21 @@ Current fixture coverage:
   trace, step log, recovery observations, and invariant failures.
 - `run_generated_case_report` adds generated-family metadata and a future
   `minimized_case` field.
-- `cgka-conformance-simulator-report` writes generated `send-leave/v1` scenario reports as JSON
-  artifacts from seed and case-count CLI arguments.
+- `cgka-conformance-simulator-report` writes generated `send-leave/v1` and
+  `convergence-e2e-delivery/v1` scenario reports as JSON artifacts from seed
+  and case-count CLI arguments.
 - `three-client-message-exchange/v1` is captured as a fixture.
-- `deliberate-fork-recovery/v1` is captured as a fixture and includes
-  `ForkRecoveryObservation`.
-- Fixture-loading tests regenerate both traces and compare them exactly.
+- Fork recovery is covered by in-tree scenarios, but not as a portable fixture:
+  OpenMLS commit randomness makes the winner digest intentionally unstable
+  across runs.
+- Fixture-loading tests regenerate portable fixture traces and compare them
+  exactly.
 
-Current gaps after Phase 5 initial slice:
+Current gaps after the generated-delivery slice:
 
-- Queue faults are fixed-script operations, not generated delivery profiles.
-- Generated family coverage is limited to send/leave traffic.
+- Generated family coverage includes send/leave and convergence E2E delivery
+  variants, but not invite races, group-data updates, publish confirm/fail
+  families, or restart/storage-loss families.
 - Generated failures do not yet run a shrinker to populate minimized cases.
 
 ## Ideas Borrowed From FIPS Chaos
@@ -117,7 +124,6 @@ Create `crates/cgka-conformance-simulator/vectors/`.
 Add JSON fixtures for:
 
 - `three-client-message-exchange/v1`
-- `deliberate-fork-recovery/v1`
 
 Each fixture should include:
 
@@ -131,7 +137,9 @@ Add a Rust test that regenerates each fixture from the current conformance runne
 compares the trace exactly. Failure output must include the fixture name and
 the observed trace.
 
-Status: complete for the initial two fixtures.
+Status: complete for the portable initial fixture. Fork recovery remains
+scenario-tested in Rust rather than fixture-backed because OpenMLS commit
+randomness makes exact trace bytes unstable.
 
 ### Phase 2 - Add a Minimal ScenarioSpec
 
@@ -187,6 +195,8 @@ Start with small families:
 Generated failures should be convertible into fixed fixtures.
 
 Status: initial `send-leave/v1` family complete.
+`convergence-e2e-delivery/v1` is also complete for duplicate/delay/reorder
+delivery variants around the real-peeler convergence bridge.
 
 ### Phase 5 - Add Analysis and Failure Minimization
 

@@ -34,7 +34,12 @@ Decisions captured from the clarifying round (reference only — not tasks):
 
 ## Current Status (2026-05-04)
 
-**Workspace state:** 100 tests passing, 0 failing. `cargo clippy --workspace --all-targets -- -D warnings` green. `cargo fmt --all --check` clean. Slow harness gate (`cargo test -p cgka-conformance-simulator --features conformance-slow`) green. Spike workspace at `spike/` builds independently with known deprecation/dead-code warnings. **All original tasks in the plan are closed; recovery trace observations have a first implementation via `GroupEvent::ForkRecovered` + `ScenarioTrace::recoveries`.**
+This section is a preserved May 4 snapshot, not the current repo status. Since
+then, the archived `spike/` tree was deleted, SQLCipher storage, the real Nostr
+transport peeler, session lifecycle, distributed convergence, conformance
+families, and Tamarin models have landed on `master`.
+
+**Workspace state at the time:** 100 tests passing, 0 failing. `cargo clippy --workspace --all-targets -- -D warnings` green. `cargo fmt --all --check` clean. Slow harness gate (`cargo test -p cgka-conformance-simulator --features conformance-slow`) green. The then-archived spike workspace at `spike/` built independently with known deprecation/dead-code warnings. **All original tasks in the plan were closed; recovery trace observations had a first implementation via `GroupEvent::ForkRecovered` + `ScenarioTrace::recoveries`.**
 
 **Crate inventory (all at 0.1.0, root workspace):**
 
@@ -252,7 +257,10 @@ Internal subsystems per `cgka-engine-design.md:214-233`. Each is a module inside
 ### What's left
 
 1. **External vector fixture packaging.** `ScenarioTrace` now records recovery observations, but vectors still live as Rust tests. Next step is a language-neutral fixture format plus a runner contract.
-2. **Production snapshot backend.** `storage-memory` snapshots the full OpenMLS memory map. A SQLite backend should snapshot the group-scoped OpenMLS rows and CGKA metadata atomically, with retention/pruning modeled after the MDK snapshot manager.
+2. **Production snapshot backend.** Superseded: `storage-sqlite` now snapshots
+   group-scoped OpenMLS rows and CGKA metadata atomically. The remaining
+   production question is operational pruning/retention policy, not the backend
+   shape.
 3. **Fork recovery key history.** Superseded: the first recovery sketch used `(TransportMessage::timestamp, MessageId)`. The current engine uses a content-derived key, `SHA-256(mls_bytes)` scoped by source epoch, so transport receipt metadata is no longer part of the recovery winner rule.
 
 ### What's solid (don't churn)
@@ -266,7 +274,10 @@ Internal subsystems per `cgka-engine-design.md:214-233`. Each is a module inside
 
 - **Plan as written:** this file, with `[STATUS]` annotations on each task.
 - **Spike learnings + corrections:** `docs/learnings.md` (2026-04-25 entry summarizes the refactor).
-- **Spike findings (architectural):** `docs/marmot-architecture/further-context/spike-findings.md` (some claims annotated as "Corrected 2026-04-22" — read both the original and correction).
+- **Historical spike findings:** the dedicated spike-findings document was
+  removed with the archived spike tree. Use `docs/learnings.md` for retained
+  corrections and the current specs in `docs/marmot-architecture/` for
+  normative behavior.
 - **Test layout:** `crates/cgka-engine/tests/AGENTS.md`.
 - **Per-crate maps:** `crates/cgka-engine/AGENTS.md` (subsystem map + design deviations), `crates/cgka-conformance-simulator/AGENTS.md` (bus model + scenario authoring).
 - **MIP-01 wire format:** the canonical reference is the spec; our `crates/cgka-engine/src/group_data.rs` is the implementation.
@@ -283,10 +294,9 @@ Internal subsystems per `cgka-engine-design.md:214-233`. Each is a module inside
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
-cd spike && cargo check  # archive integrity
 ```
 
-Expected: 100 tests passing, 0 failing, all hygiene gates green. `spike/` currently reports known deprecation/dead-code warnings.
+Expected: all workspace tests and hygiene gates green.
 
 ---
 
