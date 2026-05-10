@@ -6,10 +6,14 @@ Map for simulator tests.
 
 | File | Owns |
 | --- | --- |
+| `candidate_state_graph.rs` | Selector/candidate graph policy tests. |
 | `canonical_scenarios.rs` | Scripted scenarios, vector fixtures, generated family checks, reports. |
+| `canonicalization_contract.rs` | Executable canonicalization contract behavior, including sync-state edge cases. |
+| `generated_policy_cases.rs` | Rust consumer for bounded policy cases shared with Tamarin generation. |
 | `openmls_replay_probe.rs` | OpenMLS replay and candidate materialization probes. |
 | `proptest_invariants.rs` | Property tests over generated intent sequences and delivery profiles. |
 | `report_runner.rs` | Report artifact runner coverage. |
+| `tracing_audit.rs` | Repo-wide production tracing privacy audit. |
 
 ## Rules
 

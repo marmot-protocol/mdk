@@ -3,7 +3,7 @@ title: "Target Architecture — Four Components"
 created: 2026-04-19
 tags: [marmot, overview, architecture, components]
 status: overview
-updated: 2026-05-09
+updated: 2026-05-10
 ---
 
 # Target Architecture — Four Components
@@ -99,6 +99,11 @@ Group-evolution operations (commits, adds, removes, rotations) follow a two-step
 
 This prevents the engine from advancing past a commit that never made it to the network.
 
+Auto-publish work created while ingesting inbound messages follows the same
+rule. The current example is a SelfRemove auto-commit: the engine stages the
+commit, returns a publish obligation with a pending reference, and waits for
+`confirm_published` or `publish_failed` before applying or discarding it.
+
 ---
 
 ## Current implementation status
@@ -124,9 +129,9 @@ The active workspace proves the shape without the old prototype tree:
 - `crates/cgka-conformance-simulator` drives multi-client scenarios, generated
   delivery variants, and property tests over the engine.
 
-The production perimeter is still partly outside this workspace: real transport
-adapters, account key-management integration, persistence operations policy,
-and packaging.
+The production perimeter is still partly outside this workspace: app-level relay
+policy, relay auth, account key-management integration, persistence operations
+policy, and packaging.
 
 ---
 

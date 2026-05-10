@@ -21,8 +21,12 @@ caller imports from here.
 - All cross-boundary value types: `TransportMessage`, `TransportEnvelope`,
   `TransportAccountActivation`, `TransportPublishRequest`,
   `TransportDelivery`, `PeeledMessage`, `EncryptedPayload`, `SendIntent`,
-  `SendResult`, `GroupEvent`, `PendingStateRef`, `MessageId`, `GroupId`,
-  `MemberId`, `EpochId`, `Group`, `Member`.
+  `SendResult`, `AutoPublish`, `GroupEvent`, `PendingStateRef`, `MessageId`,
+  `GroupId`, `MemberId`, `EpochId`, `Group`, `Member`.
+
+`AutoPublish` follows the same publish-before-apply contract as explicit group
+evolution: callers publish the message, then confirm or fail the attached
+`PendingStateRef`.
 
 ## Run the tests
 

@@ -179,8 +179,23 @@ The engine MUST NOT advance local group state for a local commit until the
 application confirms publication. This rule prevents local epoch advance for a
 commit the rest of the group cannot see.
 
+### Auto-publish lifecycle
+
 Auto-publish commits created by engine policy are drained through
-`drain_auto_publish`. In v0 they do not have a per-message confirm callback.
+`drain_auto_publish`. Each drained item carries the wrapped commit and a
+`PendingStateRef`. The application MUST publish the commit, then call
+`confirm_published(pending)` or `publish_failed(pending)`.
+
+The current example is the SelfRemove auto-commit chosen by
+`LowestIndexAutoCommitter`: the remaining lowest-index member stages a
+commit for a peer's SelfRemove proposal and queues it for publication.
+The engine may project the pending epoch/member view in Marmot metadata,
+but it MUST NOT merge the OpenMLS pending commit or emit removal events
+until publication is confirmed.
+
+If publication fails, the engine clears the staged commit and re-derives
+Marmot metadata from the still-unmerged OpenMLS group. Auto-publish and
+explicit `send` paths now share the same publish-before-apply rule.
 
 ## Outbound Intent Gating
 

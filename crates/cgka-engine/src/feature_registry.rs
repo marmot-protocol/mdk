@@ -9,6 +9,8 @@ use cgka_traits::capabilities::{
 };
 use std::collections::HashMap;
 
+const TRACE_TARGET: &str = "cgka_engine::feature_registry";
+
 /// Runtime-queryable feature registry. Populated at engine construction;
 /// immutable thereafter.
 #[derive(Default, Clone)]
@@ -21,7 +23,22 @@ impl FeatureRegistry {
         Self::default()
     }
 
+    /// Register or replace a feature's requirement.
+    ///
+    /// Re-registering an existing feature with a different requirement is
+    /// almost always a bug — registries are populated once at engine
+    /// construction. We warn on duplicate registration so the conflict
+    /// surfaces in tracing audits.
     pub fn register(&mut self, feature: Feature, req: CapabilityRequirement) {
+        if let Some(prev) = self.features.get(&feature)
+            && prev != &req
+        {
+            tracing::warn!(
+                target: TRACE_TARGET,
+                method = "register",
+                "feature re-registered with a different requirement; later registration wins"
+            );
+        }
         self.features.insert(feature, req);
     }
 

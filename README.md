@@ -23,8 +23,10 @@ Marmot protocol work.
 - `crates/cgka-conformance-simulator` drives multi-client scenarios, generated
   delivery variants, vector fixtures, and property tests.
 - `formal/tamarin` contains the abstract convergence model and proof harness.
-- `docs/marmot-architecture` contains the current spec drafts and architecture
-  notes.
+- `docs/marmot-architecture` contains architecture notes and the CGKA
+  engine/convergence contracts.
+- `spec/` is the rewrite sandbox for the Marmot protocol spec. It is organized
+  by protocol surface instead of MIP number.
 
 ## Start here
 
@@ -36,7 +38,8 @@ Marmot protocol work.
 6. `crates/storage-sqlite/README.md`
 7. `crates/transport-nostr-adapter/README.md`
 8. `crates/transport-nostr-peeler/README.md`
-9. `formal/tamarin/README.md`
+9. `spec/README.md`
+10. `formal/tamarin/README.md`
 
 ## Common commands
 
@@ -55,3 +58,4 @@ just tamarin
 
 Read `AGENTS.md` in the directory you are changing. `CLAUDE.md` files are
 symlinks to the same guidance so Claude-based tooling reads the canonical file.
+For spec rewrite work, start in `spec/README.md` and `spec/AGENTS.md`.

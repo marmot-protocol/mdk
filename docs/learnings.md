@@ -9,6 +9,42 @@ Format: date → area → observation → takeaway for the real system.
 
 ---
 
+## 2026-05-09 — Engine line-by-line audit + fix pass
+
+A read-only audit of every file under `crates/cgka-engine/src/` produced
+15 findings. Of those, 14 were addressed in code or docs in the same
+session; one (zeroize for `SignatureKeyPair`) is upstream-blocked.
+
+The bug class that consistently slipped past the original review: **the
+engine had two write paths for Marmot record fields** — `confirm_published`
+mirrors `epoch + members + required_capabilities + name + description`,
+while `update_group_record_from_replay` (the convergence-side apply path)
+only mirrored `epoch + members`. Any GCE commit (capability upgrade,
+update_group_data) accepted via convergence rather than direct publish-
+confirm left two of the five fields stale on the recipient. Fix:
+load the post-replay MlsGroup once and refresh all five fields. Tests
+in `tests/update_group_data.rs` and `tests/capabilities.rs` now exercise
+this path explicitly. Lesson: when a value is derived from MlsGroup,
+keep ONE function that does the mirror and call it from every apply
+site.
+
+The privacy class that slipped: **operational identifiers (snapshot
+names) were embedding plaintext group ids**. Storage error messages
+propagate snapshot names; future tracing might surface them; SQLCipher
+encryption protects the file at rest but not the in-process names. Fix:
+hash the group id into an 8-byte digest before composing the snapshot
+name. Lesson: the observability rule "no group_ids in tracing" should
+extend to "no group_ids in any string that storage might surface."
+
+The state-machine subtlety: **`EpochState` transitions in `EpochManager`
+removed the entry from `states` before attempting the transition.** A
+failing inner transition would orphan the group with no way to recover.
+Fix: clone-then-replace pattern. Lesson: when `&mut self` operations
+chain Result-returning transitions, never leave the data structure
+inconsistent on the failure path.
+
+---
+
 ## 2026-04-25 — Production refactor in progress
 
 The CGKA engine production refactor (`plans/2026-04-22-cgka-engine-production-refactor-v1.md`) was largely complete at this checkpoint. The old prototype tree has since been removed. At the time, the workspace had these four core crates:
@@ -155,7 +191,7 @@ Added post-creation invite, spec-compliant SelfRemove (per MIP-03 and draft-ietf
 
 **6. Forked commit recovery is out of scope for the spike, but real.** When a commit race *does* produce a fork (e.g. two admins committing concurrent adds), some members end up at irreconcilable epoch-N-alpha / epoch-N-beta states. The spike dodges this via the lowest-index-auto-commit rule for SelfRemove, but the general mechanism is absent. The target architecture's `EpochState::Recovering { last_stable_epoch, buffered_events }` (cgka-engine-design.md) is the right home for this — worth prioritizing.
 
-**7. Engine-emitted side-effect messages (auto-publish queue).** Adding `drain_auto_publish() -> Vec<TransportMessage>` to the `CgkaEngine` trait covers a real case the doc didn't explicitly name: sometimes processing an inbound message produces an outbound message (e.g. auto-committing a received proposal). The app layer must publish these. The trait now has three drain methods — events (to application), auto-publish (to transport), and errors (returned). Clean factoring. **Recommendation for target-architecture.md:** add `drain_auto_publish` to the CgkaEngine trait signature or fold it into SendResult.
+**7. Engine-emitted side-effect messages (auto-publish queue).** Adding `drain_auto_publish() -> Vec<AutoPublish>` to the `CgkaEngine` trait covers a real case the doc didn't explicitly name: sometimes processing an inbound message produces an outbound group-evolution message (e.g. auto-committing a received proposal). The app layer must publish these and then confirm or fail the attached `PendingStateRef`, just like explicit group evolution. **Recommendation for target-architecture.md:** keep `drain_auto_publish` in the CgkaEngine trait signature or fold it into a unified publish-obligation result.
 
 **8. Per-leaf capabilities — spike used the wrong access path (corrected 2026-04-22).** The spike concluded that per-leaf `Capabilities` access is blocked in OpenMLS 0.8 because `MlsGroup::member_at(idx)` returns a `Member` struct with `credential` but no capabilities. **This is a mis-diagnosis, not a real limitation.** `LeafNode::capabilities()` has been `pub` since OpenMLS ≥ 0.7.0 and remains `pub` in 0.8.1. The supported access path is `group.public_group().leaf(idx)? → LeafNode::capabilities()`. `Member` is deliberately a thin summary type; the full leaf data lives on the public group. **Real-Marmot impact:** `feature_status()` can distinguish `Upgradeable` from `Unavailable` with no fork, no upstream PR. `CapabilityStorage` caching is still a worthwhile optimization (avoids tree walks; retains caps for removed members for audit/replay) — just not the *workaround* it was originally framed as.
 

@@ -38,6 +38,12 @@ use openmls::prelude::{BasicCredential, ExtensionType, KeyPackage};
 /// Cache self's capabilities from the local `MlsGroup`. Called after any
 /// membership change since our own leaf might get updated (e.g. on
 /// `add_members` with `force_self_update=true`).
+///
+/// Cross-checks the OpenMLS-reported leaf credential against the engine's
+/// declared `self_id`. A mismatch is a structural bug (the engine and
+/// OpenMLS disagree about who "we" are inside the group) and is surfaced
+/// as `EngineError::Backend` rather than silently caching under a wrong
+/// member id.
 pub(crate) fn cache_self_capabilities<S: StorageProvider>(
     storage: &S,
     group_id: &GroupId,
@@ -48,12 +54,16 @@ pub(crate) fn cache_self_capabilities<S: StorageProvider>(
         let caps = capabilities_of_leaf(leaf);
         let bc = BasicCredential::try_from(leaf.credential().clone())
             .map_err(|e| EngineError::Backend(format!("credential: {e:?}")))?;
+        let leaf_id = MemberId::new(bc.identity().to_vec());
+        if &leaf_id != self_id {
+            return Err(EngineError::Backend(
+                "own_leaf_node identity does not match engine self_id".into(),
+            ));
+        }
         let member = MarmotMember {
-            id: MemberId::new(bc.identity().to_vec()),
+            id: leaf_id,
             credential: vec![],
         };
-        // Ensure the id matches what we've been told is "self."
-        let _ = self_id;
         storage.save_member_capabilities(group_id, &member, caps)?;
     }
     Ok(())

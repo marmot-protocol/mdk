@@ -13,7 +13,7 @@ use crate::identity::Identity;
 use async_trait::async_trait;
 use cgka_traits::capabilities::{Feature, FeatureStatus, GroupCapabilities};
 use cgka_traits::engine::{
-    CgkaEngine, CreateGroupRequest, GroupEvent, KeyPackage, SendIntent, SendResult,
+    AutoPublish, CgkaEngine, CreateGroupRequest, GroupEvent, KeyPackage, SendIntent, SendResult,
 };
 use cgka_traits::engine_state::PendingStateRef;
 use cgka_traits::error::EngineError;
@@ -52,7 +52,8 @@ pub struct Engine<S: StorageProvider> {
     pub(crate) fork_recovery: crate::fork_recovery::ForkRecoveryManager,
 
     pub(crate) events_buf: VecDeque<GroupEvent>,
-    pub(crate) auto_publish_buf: VecDeque<TransportMessage>,
+    pub(crate) auto_publish_buf: VecDeque<AutoPublish>,
+    pub(crate) pending_auto_removed: HashMap<PendingStateRef, Vec<MemberId>>,
 
     /// MessageIds the engine has ingested. Backs `StaleReason::AlreadySeen`.
     pub(crate) seen_message_ids: HashSet<MessageId>,
@@ -138,6 +139,7 @@ impl<S: StorageProvider> EngineBuilder<S> {
             fork_recovery: crate::fork_recovery::ForkRecoveryManager::default(),
             events_buf: VecDeque::new(),
             auto_publish_buf: VecDeque::new(),
+            pending_auto_removed: HashMap::new(),
             seen_message_ids: HashSet::new(),
             sent_message_ids: HashSet::new(),
             convergence_policy: crate::canonicalization::CanonicalizationPolicy::default(),
@@ -188,7 +190,7 @@ impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
         self.events_buf.drain(..).collect()
     }
 
-    fn drain_auto_publish(&mut self) -> Vec<TransportMessage> {
+    fn drain_auto_publish(&mut self) -> Vec<AutoPublish> {
         self.auto_publish_buf.drain(..).collect()
     }
 

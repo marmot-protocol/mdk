@@ -152,6 +152,10 @@ impl EpochManager {
     /// (engine `confirm_published`) is responsible for the OpenMLS
     /// `merge_pending_commit` + Marmot/cache rewrites.
     ///
+    /// Atomic in the state map: if either inner state-machine transition
+    /// fails, both `pending` and `states` retain their pre-call values
+    /// so a retry sees the same legal moves.
+    ///
     /// Returns `(group_id, new_epoch)` so the caller can emit events.
     pub(crate) fn confirm_publish(
         &mut self,
@@ -159,16 +163,20 @@ impl EpochManager {
     ) -> Result<(GroupId, EpochId), EngineError> {
         let meta = self
             .pending
-            .remove(&pending)
+            .get(&pending)
+            .cloned()
             .ok_or(EngineError::UnknownPending)?;
         let group_id = meta.group_id;
         let prev = self
             .states
-            .remove(&group_id)
+            .get(&group_id)
+            .cloned()
             .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
         let merging = prev.confirm_publish()?;
         let merging_epoch = merging.epoch();
         let stable = merging.merge_to_stable(merging_epoch)?;
+        // Both transitions succeeded — commit the swap.
+        self.pending.remove(&pending);
         self.states.insert(group_id.clone(), stable);
         Ok((group_id, merging_epoch))
     }
@@ -178,6 +186,9 @@ impl EpochManager {
     /// the OpenMLS `clear_pending_commit` + any Marmot/cache rewinds — this
     /// only handles the state-machine bookkeeping.
     ///
+    /// Atomic in the state map: a failed `rollback_pending` leaves both
+    /// `pending` and `states` untouched.
+    ///
     /// Returns `(group_id, prior_epoch)` so the caller can target the
     /// matching MLS group.
     pub(crate) fn rollback_publish(
@@ -186,15 +197,18 @@ impl EpochManager {
     ) -> Result<(GroupId, EpochId), EngineError> {
         let meta = self
             .pending
-            .remove(&pending)
+            .get(&pending)
+            .cloned()
             .ok_or(EngineError::UnknownPending)?;
         let group_id = meta.group_id;
         let prior_epoch = meta.prior_epoch;
         let prev = self
             .states
-            .remove(&group_id)
+            .get(&group_id)
+            .cloned()
             .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
         let stable = prev.rollback_pending(prior_epoch)?;
+        self.pending.remove(&pending);
         self.states.insert(group_id.clone(), stable);
         Ok((group_id, prior_epoch))
     }

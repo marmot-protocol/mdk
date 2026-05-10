@@ -13,6 +13,8 @@ has the full design notes.
 - `distributed_convergence.rs` is the stored-message convergence entry point.
 - `openmls_projection.rs` is the OpenMLS bytes/replay bridge for
   canonicalization.
+- `snapshot_guard.rs` owns panic-safe snapshot rollback/release for replay and
+  peel probes.
 - No Nostr types in this crate.
 
 ## Verification

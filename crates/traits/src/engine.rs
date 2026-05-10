@@ -100,6 +100,18 @@ pub enum SendResult {
     },
 }
 
+/// Group evolution produced as a side effect of inbound processing.
+///
+/// Auto-publish work follows the same publish-before-apply contract as
+/// [`SendResult::GroupEvolution`]: the application publishes `msg`, then calls
+/// [`CgkaEngine::confirm_published`] or [`CgkaEngine::publish_failed`] with
+/// `pending`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AutoPublish {
+    pub msg: TransportMessage,
+    pub pending: PendingStateRef,
+}
+
 /// Why an application message did not become canonical group output.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AppMessageInvalidationReason {
@@ -242,12 +254,13 @@ pub trait CgkaEngine: Send + Sync {
     /// typically calls this right after every `ingest` batch.
     fn drain_events(&mut self) -> Vec<GroupEvent>;
 
-    /// Drain transport messages the engine produced as a side-effect of
-    /// `ingest` (e.g. auto-committing a received SelfRemove proposal per the
-    /// lowest-index rule). These are NOT tied to a `SendIntent` — the
-    /// application should publish them but does not need to call
-    /// `confirm_published` on any of them.
-    fn drain_auto_publish(&mut self) -> Vec<TransportMessage>;
+    /// Drain group evolution the engine produced as a side effect of `ingest`
+    /// (e.g. auto-committing a received SelfRemove proposal per the
+    /// lowest-index rule). These are not tied to a `SendIntent`, but they are
+    /// still publish-before-apply obligations: the application must publish
+    /// each message and then call [`Self::confirm_published`] or
+    /// [`Self::publish_failed`] with its pending reference.
+    fn drain_auto_publish(&mut self) -> Vec<AutoPublish>;
 
     // ── Outbound ────────────────────────────────────────────────────────────
 

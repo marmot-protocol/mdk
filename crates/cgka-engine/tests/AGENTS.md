@@ -25,12 +25,18 @@ cargo insta review
 |---|---|
 | `scaffold.rs` | `EngineBuilder` validation; `Box<dyn CgkaEngine>` witness |
 | `group_creation.rs` | Phase 4.2 + 4.8 — fresh KeyPackage, create, join welcome, confirm |
+| `group_context_view.rs` | `GroupContextView` exporter-secret length contract |
+| `group_data_routing_id.rs` | `marmot_group_data.nostr_group_id` randomness/privacy |
 | `ingest.rs` | Phase 4.3 — every `StaleReason` variant; send(AppMessage) round-trip |
-| `invite_leave.rs` | Phase 4.3b + 4.11 — invite, MIP-03 SelfRemove auto-commit |
+| `invite_leave.rs` | Phase 4.3b + 4.11 — invite, MIP-03 SelfRemove auto-commit, auto-publish confirm/fail |
 | `capabilities.rs` | Phase 4.6/4.7 + 5.4 — `feature_status`, capability cache, capability matrix |
 | `fork_detection.rs` | Phase 4.5 — deterministic same-epoch fork recovery plus the unrecoverable `ForkedEpoch` boundary |
+| `distributed_convergence.rs` | Stored-message convergence, stale classification, and retained-anchor behavior |
 | `mip03_guards.rs` | Phase 4.9 — committer-MUST-NOT-be-leaver, admin-not-last, admin-self-remove |
+| `publish_lifecycle.rs` | Explicit publish-before-apply lifecycle for local group evolution |
+| `snapshot_privacy.rs` | Snapshot names do not expose plaintext group ids |
 | `sqlite_storage.rs` | SQLCipher-backed `Engine<SqliteStorage>` create + confirm smoke |
+| `update_group_data.rs` | Group profile GCE updates and convergence-side Marmot record refresh |
 
 ```sh
 cargo test -p cgka-engine

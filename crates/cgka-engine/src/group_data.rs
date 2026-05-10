@@ -31,6 +31,12 @@ pub const NOSTR_GROUP_DATA_VERSION: u16 = 3;
 ///
 /// All variable-length fields use QUIC varint length prefixes via
 /// `tls_codec::VLBytes`.
+///
+/// `nostr_group_id` is generated from a CSPRNG at create time so it is
+/// not derivable from any member identity. Deriving the routing tag from
+/// a member identity would let a relay-side observer (or any group
+/// member, since this field is in the signed group context) correlate
+/// every group created by that identity.
 #[derive(Clone, Debug, PartialEq, Eq, TlsSerialize, TlsDeserialize, TlsSize)]
 pub struct NostrGroupData {
     /// Version field. MUST be ≥ 1; 0 is rejected. Currently 3.
@@ -178,4 +184,51 @@ pub fn admin_pubkey_from_member_id(id: &MemberId) -> Result<[u8; 32], EngineErro
 /// group-context-required extension at create time.
 pub fn extension_type() -> ExtensionType {
     ExtensionType::Unknown(MARMOT_GROUP_DATA_EXT_TYPE)
+}
+
+/// Snapshot of the routing-relevant fields inside `marmot_group_data`,
+/// pulled out by integration tests that need to assert on the wire shape
+/// of the extension. Production callers should not use this — the engine
+/// owns interpretation of `marmot_group_data`.
+#[derive(Clone, Debug)]
+pub struct MarmotGroupDataSnapshot {
+    pub nostr_group_id: [u8; 32],
+    pub admins: Vec<[u8; 32]>,
+    pub name: String,
+    pub description: String,
+}
+
+/// Test-only helper: load the named group from storage, read its
+/// `marmot_group_data` extension, and return a copy of its routing-
+/// relevant fields. Returns `None` if the group has no extension or the
+/// extension fails to parse.
+///
+/// This is exported under a `_for_test` suffix so production code does
+/// not accidentally reach for it; storage-side direct reads should go
+/// through the engine API.
+pub fn read_marmot_group_data_for_test<S: cgka_traits::storage::StorageProvider>(
+    storage: &S,
+    group_id: &cgka_traits::types::GroupId,
+) -> Option<MarmotGroupDataSnapshot> {
+    use openmls::group::{GroupId as MlsGroupId, MlsGroup};
+    use openmls_rust_crypto::RustCrypto;
+
+    let crypto = RustCrypto::default();
+    let provider = crate::provider::EngineOpenMlsProvider::<S>::new(&crypto, storage.mls_storage());
+    let mls_gid = MlsGroupId::from_slice(group_id.as_slice());
+    let mls_group = MlsGroup::load(
+        <crate::provider::EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(
+            &provider,
+        ),
+        &mls_gid,
+    )
+    .ok()
+    .flatten()?;
+    let data = read_from_group(&mls_group).ok().flatten()?;
+    Some(MarmotGroupDataSnapshot {
+        nostr_group_id: data.nostr_group_id,
+        admins: data.admins(),
+        name: String::from_utf8_lossy(data.name.as_slice()).into_owned(),
+        description: String::from_utf8_lossy(data.description.as_slice()).into_owned(),
+    })
 }

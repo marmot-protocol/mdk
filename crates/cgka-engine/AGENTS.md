@@ -38,8 +38,9 @@ Each module has a one-paragraph rustdoc at the top explaining its responsibility
 | `publish.rs` | `do_confirm_published` (merges staged commit + mirrors Marmot/cache post-merge) and `do_publish_failed` (`MlsGroup::clear_pending_commit` + Marmot re-derive). The publish-before-apply contract lives here. |
 | `auto_committer.rs` | `LowestIndexAutoCommitter` policy for SelfRemove (future policy hook) |
 | `upgrade.rs` | `do_upgrade_group_capabilities` — the only GCE-commit construction site today |
-| `group_data.rs` | MIP-01 `marmot_group_data` (`0xF2EE`) extension construction |
-| `group_context_view.rs` | snapshot view of `GroupContext` for trait callers |
+| `group_data.rs` | MIP-01 `marmot_group_data` (`0xF2EE`) extension construction; `nostr_group_id` is CSPRNG to avoid creator-correlation leaks |
+| `group_context_view.rs` | snapshot view of `GroupContext` for trait callers; `exporter_secret(label, length)` returns `None` rather than truncating when callers ask for more bytes than were cached |
+| `snapshot_guard.rs` | RAII guard that rolls back + releases a snapshot on Drop; used by snapshot-probing call sites so panics or async cancellation don't leave storage in mid-mutation state |
 | `wire_format.rs` | `PURE_PLAINTEXT_WIRE_FORMAT_POLICY` + the `WIRE_FORMAT_POLICY_REVIEW_REQUIRED` grep marker |
 
 ## Design deviations (read these before changing the contract)
@@ -64,6 +65,47 @@ These are the load-bearing departures from the original plan. Each is also docum
 6. **Test identities are 32 bytes via `pad32`.**
    MIP-01 admin pubkeys MUST be 32-byte x-only secp256k1. The engine strict-fails non-32-byte member identities at admin-set time. Production identities (real Nostr pubkeys) flow through unchanged.
 
+## Recent audit corrections (2026-05-09)
+
+A line-by-line engine audit closed a batch of correctness, privacy, and
+hardening items. Each fix has a regression test in `tests/`; this section
+exists so a future contributor can grep for the rule that was put in
+place.
+
+| Item | What changed | Test |
+|---|---|---|
+| **B1** Convergence-side recipient Marmot record | `openmls_projection::update_group_record_from_replay` now also refreshes `required_capabilities`, `name`, and `description` from the post-replay MlsGroup so a GCE commit accepted via convergence doesn't leave the recipient's record stale. | `tests/update_group_data.rs::convergence_refreshes_recipient_marmot_record_name_and_description`, `tests/capabilities.rs::convergence_refreshes_recipient_required_capabilities_on_upgrade` |
+| **B2** `marmot_group_data.nostr_group_id` privacy | Engine now generates `nostr_group_id` via CSPRNG instead of copying the creator's pubkey. Two groups by the same creator have distinct routing tags. | `tests/group_data_routing_id.rs` |
+| **B3** `GroupContextView::exporter_secret` length contract | Returns `None` when the caller asks for more bytes than the cached secret holds, instead of silently returning a too-short prefix. | `tests/group_context_view.rs` |
+| **P1** Snapshot names must not embed plaintext group ids | `fork_recovery::next_snapshot_name` and the peel-restore name in `message_processor` now hash the group id into an 8-byte digest instead of hex-encoding the full id. | `tests/snapshot_privacy.rs` |
+| **S2** `Canonicalizing` sync state emission | `canonicalization::sync_state_for_result` now emits `Canonicalizing` when the input window has closed but a pending message did not receive a disposition this pass (e.g. a child commit waiting for its parent). `Stable` strictly requires fixed-point. | `crates/cgka-conformance-simulator/tests/canonicalization_contract.rs::quiescence_with_orphan_commit_in_input_is_canonicalizing` |
+| **S3** Unattributable application messages | `message_processor::ingest_group_message` no longer emits `MessageReceived` with an empty `MemberId` for senders whose leaf credential cannot be resolved. The message is marked `Failed`; a typed sender variant on `GroupEvent` would be a larger API change deferred to v0.2. | implicit (no event leak — covered by existing tests) |
+| **Sm1** Atomic state-machine transitions | `EpochManager::confirm_publish` / `rollback_publish` clone the prior `EpochState` + `PendingMeta` before transitioning. A failing inner transition no longer orphans the group's state map entry. | covered by existing publish-lifecycle tests |
+| **Sm2** Convergence ingest outcome classification | `message_processor::convergence_ingest_outcome` now reports `Stale` for terminal dispositions (`BeyondAnchor`, `LosingBranch`, `BeyondAppRetention`, dropped) and only `Buffered` for retryable cases (`UndecryptableInCanonicalState` for future-epoch app messages). | covered by distributed-convergence integration tests |
+| **Sm3** Capability-cache self-id assertion | `cache_self_capabilities` now errors with `EngineError::Backend` if `MlsGroup::own_leaf_node()` reports an identity that disagrees with the engine's `self_id`. | implicit (existing cache tests guard the happy path) |
+| **Sm4** Welcome dedup at the API surface | `do_join_welcome` rejects a re-call for the same welcome via `seen_message_ids` and stored-message state. | `tests/group_creation.rs::join_welcome_called_twice_for_same_welcome_errors_on_second_call` |
+| **Sm5** `FeatureRegistry::register` warn on conflicting duplicate | Same feature registered with a different requirement now emits a `tracing::warn!` so the conflict surfaces in audits. Last-write still wins. | static — observed via tracing-audit infrastructure |
+| **Sm6** Replay error classification | `process_openmls_messages_inner` swallows only `ProcessMessageError::ValidationError` for application messages during replay — `LibraryError` and other structural failures propagate. | covered by existing replay tests |
+| **Sm7** Auto-committer §150 fail-closed | `LowestIndexAutoCommitter::decide` now refuses to auto-commit a SelfRemove if the leaver's credential is malformed (length ≠ 32) instead of treating that as "no admin to compare against." | covered by existing MIP-03 guard tests |
+| **H1** Snapshot rollback panic safety | New `crates/cgka-engine/src/snapshot_guard.rs::SnapshotRollbackGuard` rolls back + releases on `Drop`. Used by `try_peel_group_message_from_available_snapshots` and `replay_openmls_messages` so panics or async cancellation cannot leave storage in mid-mutation state. | structural — panics in async are hard to assert directly |
+
+Items deliberately deferred:
+
+- **H2 (AAD binding to group_id + epoch on transport wraps)** — exporter
+  secrets already differ per (group, epoch). Cross-context attacks on
+  the outer ChaCha20Poly1305 wrap require the exporter key, which is
+  already per-context. AAD binding would be defense-in-depth without a
+  concrete threat it foils. Reconsider if a future transport reuses
+  exporter material across contexts.
+- **H3 (zeroize `SignatureKeyPair`)** — `openmls_basic_credential` does
+  not expose private bytes for zeroization. Implementing this requires
+  either an upstream change or wrapping the signer in a custom type
+  that re-implements OpenMLS's `Signer` trait. Tracked as upstream
+  dependency, not engine work.
+- **S1 strict publish-before-apply for auto-commit** — closed. Auto-publish
+  work now carries a `PendingStateRef`; callers publish it and then use the
+  shared `confirm_published` / `publish_failed` lifecycle.
+
 ## Open structural items
 
 None in the engine core. Remaining production work sits around adjacent
@@ -77,7 +119,7 @@ scheduling.
 
 ### Done — Task 4.13 publish-before-apply (2026-04-25)
 
-`do_create_group` / `do_send_invite` / `do_upgrade_group_capabilities` stage their commits and defer merge until `CgkaEngine::confirm_published`. `CgkaEngine::publish_failed` discards via `MlsGroup::clear_pending_commit` + Marmot re-derive from the still-unmerged group. **Auto-commit** (in `message_processor.rs::ingest_group_message`'s `ProposalMessage` branch) intentionally still merges before publish — see `auto_committer.rs` rustdoc for why. The Marmot record holds *projected post-merge* `members` so `members()` and `feature_status` reflect the user's intent during `PendingPublish`. See `tests/publish_lifecycle.rs` for the contract.
+`do_create_group` / `do_send_invite` / `do_upgrade_group_capabilities` / auto-commit stage their commits and defer merge until `CgkaEngine::confirm_published`. `CgkaEngine::publish_failed` discards via `MlsGroup::clear_pending_commit` + Marmot re-derive from the still-unmerged group. The Marmot record holds *projected post-merge* `members` so `members()` and `feature_status` reflect the pending group evolution during `PendingPublish`. See `tests/publish_lifecycle.rs` and `tests/invite_leave.rs` for the contract.
 
 OpenMLS 0.8.1 surface used: `MlsGroup::pending_commit() -> Option<&StagedCommit>` (`mod.rs:353`), `StagedCommit::export_secret` (`staged_commit.rs:778`, identical signature to `MlsGroup::export_secret`), `MlsGroup::merge_pending_commit` (`processing.rs:307`), `MlsGroup::clear_pending_commit` (`mod.rs:374`).
 

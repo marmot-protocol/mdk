@@ -227,7 +227,10 @@ fn canonicalize_internal(
         previous_tip: input.state.current_tip_epoch,
         selected_tip,
         selected_branch_id: selected_branch_id.clone(),
-        sync_state: sync_state_for(&input),
+        // Provisional; recomputed after dispositions are known so we can
+        // distinguish Stable (fixed point) from Canonicalizing (window
+        // closed, more work pending).
+        sync_state: SyncState::Syncing,
         accepted_commits: Vec::new(),
         accepted_proposals: Vec::new(),
         accepted_app_messages: Vec::new(),
@@ -312,6 +315,18 @@ fn canonicalize_internal(
         &mut result,
         &materialized_graph.materialized_commit_ids_by_branch,
     );
+
+    // Compute the sync state now that dispositions are known. Spec
+    // (cgka-engine-canonicalization-contract.md §Lifecycle):
+    //
+    // - Syncing: convergence-relevant input window has not yet quiesced.
+    // - Canonicalizing: window quiesced, but the canonicalize pass left
+    //   work pending (commits with no materialized parent, blocking
+    //   errors like MissingRetainedAnchor / CandidateStateUnavailable).
+    // - Stable: window quiesced AND every input message received a
+    //   disposition AND no blocking error remains. This is the
+    //   fixed-point case.
+    result.sync_state = sync_state_for_result(&input, &input.pending_messages, &result);
 
     if result.sync_state == SyncState::Stable {
         result.publishable_outbound_messages = input.outbound_intents;
@@ -702,14 +717,54 @@ fn drop_losing_materialized_candidate_commits(
     }
 }
 
-fn sync_state_for(input: &CanonicalizationInput) -> SyncState {
+fn sync_state_for_result(
+    input: &CanonicalizationInput,
+    input_messages: &[PeeledMessage],
+    result: &CanonicalizationResult,
+) -> SyncState {
     let elapsed = input
         .now_ms
         .saturating_sub(input.state.last_convergence_relevant_input_ms);
-    if elapsed >= input.policy.stable_quiescence_ms {
-        SyncState::Stable
+    if elapsed < input.policy.stable_quiescence_ms {
+        return SyncState::Syncing;
+    }
+
+    let resolved: BTreeSet<&str> = result
+        .accepted_commits
+        .iter()
+        .map(String::as_str)
+        .chain(result.accepted_proposals.iter().map(String::as_str))
+        .chain(result.accepted_app_messages.iter().map(String::as_str))
+        .chain(
+            result
+                .dropped_messages
+                .iter()
+                .map(|d| d.message_id.as_str()),
+        )
+        .chain(
+            result
+                .invalidated_app_messages
+                .iter()
+                .map(|i| i.message_id.as_str()),
+        )
+        .chain(result.already_seen.iter().map(|s| s.message_id.as_str()))
+        .collect();
+
+    // Canonicalizing fires when a pending input message did not receive
+    // a disposition this pass — the typical case is a child commit
+    // whose parent has not yet been materialized into a candidate
+    // branch. `CandidateStateUnavailable` alone is *not* enough to flag
+    // Canonicalizing: it is reported any time no eligible branch was
+    // selected, including the legitimate fixed-point case "no candidate
+    // commits in the input batch at all."
+    let unresolved_input = input_messages
+        .iter()
+        .any(|message| !resolved.contains(message.message_id.as_str()));
+
+    if unresolved_input {
+        SyncState::Canonicalizing
     } else {
-        SyncState::Syncing
+        SyncState::Stable
     }
 }
 

@@ -1,8 +1,9 @@
 //! Capability negotiation, cache population, and upgrade discovery.
 
 use async_trait::async_trait;
-use cgka_engine::EngineBuilder;
+use cgka_engine::canonicalization::SyncState;
 use cgka_engine::feature_registry::FeatureRegistry;
+use cgka_engine::{Engine, EngineBuilder};
 use cgka_traits::capabilities::{
     Capability, CapabilityRequirement, Feature, FeatureStatus, RequirementLevel,
 };
@@ -11,6 +12,7 @@ use cgka_traits::error::PeelerError;
 use cgka_traits::group_context::GroupContextSnapshot;
 use cgka_traits::ingest::{PeeledContent, PeeledMessage};
 use cgka_traits::peeler::TransportPeeler;
+use cgka_traits::storage::GroupStorage;
 use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };
@@ -762,5 +764,103 @@ async fn bob_sees_alice_caps_cached_after_invite_commit() {
     assert!(
         matches!(status, FeatureStatus::Unavailable { .. }),
         "bob can't confirm alice's caps → Unavailable, got: {status:?}"
+    );
+}
+
+// ── B1 regression: convergence-side capability upgrade ────────────────────
+
+fn build_concrete_with_storage(
+    id: &[u8],
+    registry: FeatureRegistry,
+) -> (Engine<MemoryStorage>, MemoryStorage) {
+    let storage = MemoryStorage::new();
+    let engine = EngineBuilder::new(storage.clone())
+        .identity(pad32(id))
+        .feature_registry(registry)
+        .peeler(Box::new(MockPeeler))
+        .build()
+        .unwrap();
+    (engine, storage)
+}
+
+/// When a capability upgrade commit lands on the recipient via the
+/// convergence path (not via `confirm_published`), the recipient's
+/// Marmot record must be refreshed with the post-merge
+/// `RequiredCapabilities`. Before this fix the convergence path only
+/// refreshed `epoch` and `members`, so `feature_status` would still
+/// report the upgraded capability as `Upgradeable` even though MLS
+/// truth said `Available`.
+#[tokio::test]
+async fn convergence_refreshes_recipient_required_capabilities_on_upgrade() {
+    let (mut alice, _alice_storage) = build_concrete_with_storage(
+        b"alice",
+        registry_selfremove_required_and_reactions_optional(),
+    );
+    let (mut bob, bob_storage) = build_concrete_with_storage(
+        b"bob",
+        registry_selfremove_required_and_reactions_optional(),
+    );
+
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let (gid, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "g".into(),
+            description: "".into(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (alice_pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        _ => unreachable!(),
+    };
+    alice.confirm_published(alice_pending).await.unwrap();
+    let welcome = welcomes.into_iter().next().unwrap();
+    bob.join_welcome(welcome).await.unwrap();
+
+    // Reactions is Optional and not required pre-upgrade.
+    let bob_pre = bob_storage.get_group(&gid).unwrap();
+    assert!(
+        !bob_pre.required_capabilities.proposals.contains(&0xFF01),
+        "reactions must NOT be required pre-upgrade"
+    );
+
+    // Alice upgrades the group's capabilities.
+    let upgrade = alice.upgrade_group_capabilities(&gid).await.unwrap();
+    let (commit, alice_pending) = match upgrade {
+        SendResult::GroupEvolution { msg, pending, .. } => (msg, pending),
+        _ => unreachable!(),
+    };
+    alice.confirm_published(alice_pending).await.unwrap();
+
+    // Bob ingests via convergence — NOT via confirm.
+    let routed = TransportMessage {
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: gid.as_slice().to_vec(),
+        },
+        ..commit
+    };
+    bob.ingest(routed).await.unwrap();
+    let result = bob
+        .converge_stored_openmls_messages(&gid, 1_000_000)
+        .unwrap();
+    assert_eq!(result.sync_state, SyncState::Stable);
+
+    // Bob's Marmot record now reflects the upgraded RequiredCapabilities.
+    // Pre-fix: `required_capabilities` was stale; reactions still missing.
+    let bob_post = bob_storage.get_group(&gid).unwrap();
+    assert!(
+        bob_post.required_capabilities.proposals.contains(&0xFF01),
+        "convergence MUST refresh recipient required_capabilities; got {:?}",
+        bob_post.required_capabilities
+    );
+
+    // And `feature_status` follows: reactions is Available now.
+    let status = bob.feature_status(&gid, &Feature("reactions")).unwrap();
+    assert!(
+        matches!(status, FeatureStatus::Available),
+        "feature_status should report Available after convergence-applied upgrade, got: {status:?}"
     );
 }

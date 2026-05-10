@@ -77,12 +77,21 @@ stateDiagram-v2
 States:
 
 - `Syncing`: the engine is collecting peeled messages. Outbound app messages and
-  group changes MUST be queued as intents.
+  group changes MUST be queued as intents. Emitted while the convergence-
+  relevant input window has not yet closed (i.e., the configured
+  quiescence duration has not elapsed since the last input).
 - `Canonicalizing`: the engine is building candidate states, scoring branches,
-  applying the selected branch, and assigning message dispositions.
+  applying the selected branch, and assigning message dispositions. In an
+  executable model where canonicalization is synchronous, this state is
+  emitted at the completion of a pass when the input window has closed
+  but the pass left work pending — typically a child commit whose
+  parent is not yet materialized into a candidate branch. Outbound work
+  remains queued.
 - `Stable`: the engine has seen no convergence-relevant input for at least the
   configured quiescence duration and the last canonicalization pass reached a
-  fixed point.
+  fixed point. Every pending input message received a disposition
+  (accepted, dropped, invalidated, or already-seen) and no work remains.
+  Outbound intents become publishable only in this state.
 
 Convergence-relevant input includes commits, proposals, and app messages that
 can affect branch witness scores. Pure duplicate messages do not reset the

@@ -20,6 +20,7 @@ use cgka_traits::error::PeelerError;
 use cgka_traits::group_context::GroupContextSnapshot;
 use cgka_traits::ingest::{PeeledContent, PeeledMessage};
 use cgka_traits::peeler::TransportPeeler;
+use cgka_traits::storage::GroupStorage;
 use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };
@@ -128,6 +129,17 @@ fn build(id: &[u8]) -> Engine<MemoryStorage> {
         .peeler(Box::new(MockPeeler))
         .build()
         .unwrap()
+}
+
+fn build_with_storage(id: &[u8]) -> (Engine<MemoryStorage>, MemoryStorage) {
+    let storage = MemoryStorage::new();
+    let engine = EngineBuilder::new(storage.clone())
+        .identity(pad32(id))
+        .feature_registry(registry())
+        .peeler(Box::new(MockPeeler))
+        .build()
+        .unwrap();
+    (engine, storage)
 }
 
 fn converge_buffered_commit(engine: &mut Engine<MemoryStorage>, group_id: &GroupId) {
@@ -277,6 +289,83 @@ async fn update_group_data_with_no_fields_errors() {
         .err()
         .unwrap();
     assert!(matches!(err, EngineError::Other(_)));
+}
+
+// ── Multi-client convergence: B1 regression ─────────────────────────────────
+
+/// Convergence-side application of a `update_group_data` commit must
+/// refresh the recipient's Marmot record `name` and `description` to
+/// match the post-merge MlsGroup state. Before this fix the convergence
+/// path only refreshed `epoch` and `members`, leaving the Marmot record's
+/// human-readable fields stale.
+#[tokio::test]
+async fn convergence_refreshes_recipient_marmot_record_name_and_description() {
+    let (mut alice, _alice_storage) = build_with_storage(b"alice");
+    let (mut bob, bob_storage) = build_with_storage(b"bob");
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+
+    let (gid, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "original-name".into(),
+            description: "original-description".into(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (alice_pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        _ => unreachable!(),
+    };
+    alice.confirm_published(alice_pending).await.unwrap();
+    let welcome = welcomes.into_iter().next().unwrap();
+    bob.join_welcome(welcome).await.unwrap();
+
+    // Bob's record reflects the create-time name.
+    let bob_group = bob_storage.get_group(&gid).unwrap();
+    assert_eq!(bob_group.name, "original-name");
+    assert_eq!(bob_group.description, "original-description");
+
+    // Alice renames the group.
+    let res = alice
+        .send(SendIntent::UpdateGroupData {
+            group_id: gid.clone(),
+            name: Some("new-renamed".into()),
+            description: Some("new-described".into()),
+        })
+        .await
+        .unwrap();
+    let (commit, alice_pending) = match res {
+        SendResult::GroupEvolution { msg, pending, .. } => (msg, pending),
+        _ => unreachable!(),
+    };
+    alice.confirm_published(alice_pending).await.unwrap();
+
+    // Bob ingests via convergence — NOT via `confirm_published`.
+    let routed = TransportMessage {
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: gid.as_slice().to_vec(),
+        },
+        ..commit
+    };
+    bob.ingest(routed).await.unwrap();
+    converge_buffered_commit(&mut bob, &gid);
+
+    // Bob's epoch advanced (this already worked).
+    assert_eq!(bob.epoch(&gid).unwrap().0, 2);
+
+    // Bob's Marmot record reflects the new name + description.
+    // Pre-fix: this was still "original-name" / "original-description".
+    let bob_group = bob_storage.get_group(&gid).unwrap();
+    assert_eq!(
+        bob_group.name, "new-renamed",
+        "convergence MUST refresh recipient name"
+    );
+    assert_eq!(
+        bob_group.description, "new-described",
+        "convergence MUST refresh recipient description"
+    );
 }
 
 // ── State guard ─────────────────────────────────────────────────────────────

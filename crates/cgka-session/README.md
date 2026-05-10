@@ -13,8 +13,9 @@ plus publishable transport work from each lifecycle method.
 - Opens one encrypted SQLite database for one Marmot account-device identity.
 - Builds `Engine<SqliteStorage>` with an injected `TransportPeeler`.
 - Surfaces `GroupEvent`s and publishable transport work as `SessionEffects`.
-- Preserves the publish-before-apply contract: callers still confirm or fail
-  pending group operations after transport publish.
+- Preserves the publish-before-apply contract: callers confirm or fail pending
+  group operations after transport publish, including auto-publish work created
+  while ingesting inbound messages.
 - Exposes convergence advancement so queued outbound work can be regenerated
   from canonical state.
 
@@ -33,7 +34,8 @@ Those live above this crate.
 - encrypted SQLCipher open, create, confirm, close, and reopen;
 - welcome ingest producing `GroupJoined`;
 - app-message ingest producing `MessageReceived`;
-- auto-publish work after SelfRemove proposal ingest;
+- auto-publish work after SelfRemove proposal ingest, including the pending ref
+  callers must confirm or fail;
 - convergence advancement releasing queued outbound app messages.
 
 `tests/nostr_stack.rs` covers the production-shaped non-relay stack:

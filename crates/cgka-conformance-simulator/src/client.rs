@@ -373,13 +373,18 @@ impl HarnessClient {
         // the bus.
         let auto = self.engine.drain_auto_publish();
         let gid = self.default_group.clone();
-        for m in auto {
+        for auto in auto {
             let routed = if let Some(gid) = &gid {
-                route(m, gid)
+                route(auto.msg, gid)
             } else {
-                m
+                auto.msg
             };
             self.bus.send(self.bus_id, routed);
+            if let Err(e) = self.engine.confirm_published(auto.pending).await {
+                outcomes.push(Err(e));
+                continue;
+            }
+            self.capture_engine_events();
         }
         outcomes
     }

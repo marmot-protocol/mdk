@@ -1,10 +1,27 @@
 ---
 title: "Current State — Implementations & Spec"
 created: 2026-04-19
-updated: 2026-05-09
+updated: 2026-05-10
 tags: [marmot, overview, current-state, implementations]
 status: overview
 ---
+
+> **2026-05-09 audit pass:** A line-by-line engine review surfaced and
+> closed three correctness bugs (canonical convergence not refreshing
+> recipient `marmot_group_data` / `RequiredCapabilities`; the routing
+> tag in `marmot_group_data.nostr_group_id` being copied from the
+> creator's pubkey instead of CSPRNG; the `GroupContext::exporter_secret`
+> contract silently truncating over-length requests), tightened seven
+> smells (welcome dedup at the API surface, atomic `EpochState`
+> transitions, replay error classification, more honest convergence
+> ingest outcomes, capability-cache self-id assertion, fail-closed
+> auto-committer admin guard, registry-overwrite warning), and added
+> a `SnapshotRollbackGuard` so the snapshot dance is panic-safe.
+> Snapshot names no longer carry plaintext group ids. The
+> canonicalization contract now distinguishes `Canonicalizing` from
+> `Stable`. The former auto-commit exception to publish-before-apply is
+> closed: auto-publish work now carries a pending ref and confirms or
+> rolls back like explicit group evolution.
 
 # Current State — Implementations & Spec
 
@@ -25,6 +42,8 @@ into spec text.
 
 **In PR / design:**
 - **MIP-06** — Multi-Device Support
+- **Spec rewrite sandbox** — protocol laws, publish lifecycle, and draft MLS
+  app data dictionary components in [`../../../spec/README.md`](../../../spec/README.md)
 - **CGKA engine canonicalization** — post-peeling commit/proposal/app-message
   contract in [`../cgka-engine-canonicalization-contract.md`](../cgka-engine-canonicalization-contract.md)
 - **Distributed convergence** — deterministic branch selection for unordered
@@ -84,6 +103,8 @@ This repository now has the main engine candidate:
   generated scenarios, and property tests.
 - `formal/tamarin` — formal models for the convergence selector, delivery-order
   robustness, lifecycle cases, and proof/test mapping.
+- `spec` — experimental Marmot spec rewrite by stable surface, including
+  protocol laws and app data dictionary components.
 
 The current workspace can exercise the peeler-ingest boundary through
 in-memory clients, reopen encrypted SQLCipher-backed account-device sessions,

@@ -272,11 +272,11 @@ async fn selfremove_full_flow_with_auto_commit() {
     // MIP-03 end-to-end (post-§149):
     //   alice creates group with bob + carol, confirms; both join via welcome
     //   bob (non-admin) sends SelfRemove → Proposal
-    //   alice ingests bob's proposal → auto-commits (lowest-index remaining,
-    //                                                 not the target, alice
-    //                                                 is admin so no §150
-    //                                                 depletion concern)
-    //   alice advances to epoch 2, drain_auto_publish yields the commit
+    //   alice ingests bob's proposal → stages an auto-commit (lowest-index
+    //                                   remaining, not the target, alice is
+    //                                   admin so no §150 depletion concern)
+    //   drain_auto_publish yields the commit + pending ref
+    //   alice confirms publish → epoch 2 applies locally
     //   bob ingests alice's commit → bob's epoch advances, sees himself
     //                                removed
     let mut alice = build_client(b"alice");
@@ -332,15 +332,16 @@ async fn selfremove_full_flow_with_auto_commit() {
     assert!(matches!(outcome, IngestOutcome::Processed));
     let alice_events = alice.drain_events();
     assert!(
-        alice_events.iter().any(|e| matches!(
+        !alice_events.iter().any(|e| matches!(
             e,
             cgka_traits::engine::GroupEvent::MemberRemoved { member, .. }
                 if member == &bob.self_id()
         )),
-        "alice should emit MemberRemoved for bob; got {alice_events:?}"
+        "alice must not emit MemberRemoved until auto-commit publish is confirmed; got {alice_events:?}"
     );
 
-    // Alice's state should now be epoch 2, bob removed.
+    // Alice has a projected pending epoch/member set, but the group is not
+    // Stable/applied yet. New sends must wait for publish confirmation.
     assert_eq!(alice.epoch(&group_id).unwrap().0, 2);
     let alice_members = alice.members(&group_id).unwrap();
     assert_eq!(
@@ -348,14 +349,35 @@ async fn selfremove_full_flow_with_auto_commit() {
         2,
         "bob should be removed; got {alice_members:?}"
     );
+    let pending_send = alice
+        .send(SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload: b"wait for auto confirm".to_vec(),
+        })
+        .await;
+    assert!(
+        matches!(pending_send, Err(EngineError::InvalidTransition(_))),
+        "auto-commit should leave alice in PendingPublish until confirmed"
+    );
 
     // drain_auto_publish yields the commit alice produced.
-    let auto_msgs = alice.drain_auto_publish();
+    let mut auto_msgs = alice.drain_auto_publish();
     assert_eq!(auto_msgs.len(), 1);
+    let auto = auto_msgs.remove(0);
+    alice.confirm_published(auto.pending).await.unwrap();
+    let alice_events = alice.drain_events();
+    assert!(
+        alice_events.iter().any(|e| matches!(
+            e,
+            cgka_traits::engine::GroupEvent::MemberRemoved { member, .. }
+                if member == &bob.self_id()
+        )),
+        "alice should emit MemberRemoved for bob after confirm; got {alice_events:?}"
+    );
 
     // Bob ingests alice's commit — bob's epoch advances; he sees himself
     // removed.
-    let commit = auto_msgs.into_iter().next().unwrap();
+    let commit = auto.msg;
     let routed = TransportMessage {
         envelope: TransportEnvelope::GroupMessage {
             transport_group_id: group_id.as_slice().to_vec(),
@@ -374,6 +396,76 @@ async fn selfremove_full_flow_with_auto_commit() {
                 if member == &bob.self_id()
         )),
         "bob should emit MemberRemoved for himself; got {bob_events:?}"
+    );
+}
+
+#[tokio::test]
+async fn selfremove_auto_commit_publish_failed_rolls_back_projection() {
+    let mut alice = build_client(b"alice");
+    let mut bob = build_client(b"bob");
+    let mut carol = build_client(b"carol");
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "mip03 rollback".into(),
+            description: "".into(),
+            members: vec![bob_kp, carol_kp],
+            required_features: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (welcome_for_bob, welcome_for_carol) = match create {
+        SendResult::GroupCreated {
+            pending,
+            mut welcomes,
+        } => {
+            alice.confirm_published(pending).await.unwrap();
+            (welcomes.remove(0), welcomes.remove(0))
+        }
+        _ => unreachable!(),
+    };
+    bob.join_welcome(welcome_for_bob).await.unwrap();
+    carol.join_welcome(welcome_for_carol).await.unwrap();
+
+    let proposal = match bob
+        .send(SendIntent::Leave {
+            group_id: group_id.clone(),
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::Proposal { msg } => msg,
+        _ => unreachable!(),
+    };
+    let routed = TransportMessage {
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+        ..proposal
+    };
+    alice.ingest(routed).await.unwrap();
+
+    assert_eq!(alice.epoch(&group_id).unwrap().0, 2);
+    assert_eq!(alice.members(&group_id).unwrap().len(), 2);
+    let mut auto = alice.drain_auto_publish();
+    assert_eq!(auto.len(), 1);
+
+    alice.publish_failed(auto.remove(0).pending).await.unwrap();
+
+    assert_eq!(alice.epoch(&group_id).unwrap().0, 1);
+    let members = alice.members(&group_id).unwrap();
+    assert_eq!(members.len(), 3, "publish_failed should restore bob");
+    let events = alice.drain_events();
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            cgka_traits::engine::GroupEvent::MemberRemoved { member, .. }
+                if member == &bob.self_id()
+        )),
+        "failed auto-publish must not emit MemberRemoved; got {events:?}"
     );
 }
 

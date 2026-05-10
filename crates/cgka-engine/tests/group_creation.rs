@@ -133,6 +133,19 @@ fn build_client(identity: &[u8], registry: FeatureRegistry) -> impl CgkaEngine {
         .expect("build engine")
 }
 
+fn build_client_on_storage(
+    identity: &[u8],
+    registry: FeatureRegistry,
+    storage: MemoryStorage,
+) -> impl CgkaEngine {
+    EngineBuilder::new(storage)
+        .identity(pad32(identity))
+        .feature_registry(registry)
+        .peeler(Box::new(MockPeeler))
+        .build()
+        .expect("build engine")
+}
+
 #[tokio::test]
 async fn create_group_with_three_members_happy_path() {
     let mut alice = build_client(b"alice-identity", selfremove_registry());
@@ -229,6 +242,95 @@ async fn fresh_key_package_roundtrips_bytes() {
     let mut alice = build_client(b"a", selfremove_registry());
     let kp = alice.fresh_key_package().await.unwrap();
     assert!(!kp.0.is_empty(), "key package bytes should be non-empty");
+}
+
+#[tokio::test]
+async fn join_welcome_called_twice_for_same_welcome_errors_on_second_call() {
+    // Direct `CgkaEngine::join_welcome` callers skip the ingest-path
+    // dedup. Without entry-level dedup, a re-call would re-stage a
+    // Welcome on top of an existing group — in storage-memory that
+    // overwrites silently. The second call must error.
+    let mut alice = build_client(b"alice", selfremove_registry());
+    let mut bob = build_client(b"bob", selfremove_registry());
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+
+    let (_gid, result) = alice
+        .create_group(CreateGroupRequest {
+            name: "g".into(),
+            description: "".into(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let welcome = match result {
+        SendResult::GroupCreated { welcomes, pending } => {
+            alice.confirm_published(pending).await.unwrap();
+            welcomes.into_iter().next().unwrap()
+        }
+        _ => unreachable!(),
+    };
+
+    bob.join_welcome(welcome.clone()).await.unwrap();
+    let err = bob
+        .join_welcome(welcome)
+        .await
+        .expect_err("second join_welcome must error");
+    match err {
+        EngineError::Other(msg) => {
+            assert!(
+                msg.contains("already processed"),
+                "expected 'already processed' message, got: {msg}"
+            );
+        }
+        other => panic!("expected EngineError::Other(already processed), got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn join_welcome_dedup_survives_engine_rebuild_on_same_storage() {
+    // Direct `join_welcome` should persist the welcome's terminal state,
+    // not rely only on in-memory `seen_message_ids`. A rebuilt engine on
+    // the same storage must reject the duplicate before re-staging it.
+    let mut alice = build_client(b"alice", selfremove_registry());
+    let bob_storage = MemoryStorage::new();
+    let mut bob = build_client_on_storage(b"bob", selfremove_registry(), bob_storage.clone());
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+
+    let (_gid, result) = alice
+        .create_group(CreateGroupRequest {
+            name: "g".into(),
+            description: "".into(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let welcome = match result {
+        SendResult::GroupCreated { welcomes, pending } => {
+            alice.confirm_published(pending).await.unwrap();
+            welcomes.into_iter().next().unwrap()
+        }
+        _ => unreachable!(),
+    };
+
+    bob.join_welcome(welcome.clone()).await.unwrap();
+    drop(bob);
+
+    let mut rebuilt_bob = build_client_on_storage(b"bob", selfremove_registry(), bob_storage);
+    let err = rebuilt_bob
+        .join_welcome(welcome)
+        .await
+        .expect_err("rebuilt engine must reject duplicate welcome");
+    match err {
+        EngineError::Other(msg) => assert!(
+            msg.contains("already processed"),
+            "expected 'already processed' message, got: {msg}"
+        ),
+        other => panic!("expected EngineError::Other(already processed), got {other:?}"),
+    }
 }
 
 #[tokio::test]

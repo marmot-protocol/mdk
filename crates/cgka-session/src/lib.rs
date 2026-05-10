@@ -115,6 +115,7 @@ pub enum PublishWork {
     },
     AutoPublish {
         msg: TransportMessage,
+        pending: PendingStateRef,
     },
 }
 
@@ -356,8 +357,11 @@ impl AccountDeviceSession {
                 }),
             }
         }
-        for msg in self.engine.drain_auto_publish() {
-            effects.publish.push(PublishWork::AutoPublish { msg });
+        for auto in self.engine.drain_auto_publish() {
+            effects.publish.push(PublishWork::AutoPublish {
+                msg: auto.msg,
+                pending: auto.pending,
+            });
         }
         effects.events.extend(self.engine.drain_events());
         tracing::trace!(

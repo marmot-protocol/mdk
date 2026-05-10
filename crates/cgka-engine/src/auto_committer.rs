@@ -18,13 +18,12 @@
 //!
 //! ## Auto-publish lifecycle
 //!
-//! Explicit `send` paths defer their `merge_pending_commit` to
-//! `do_confirm_published`. The auto-commit path merges immediately, then
-//! pushes the wrapped commit onto `auto_publish_buf` for
-//! `drain_auto_publish`. There is no per-message confirm callback for
-//! auto-publish yet. A later API can return `(TransportMessage,
-//! PendingStateRef)` from the auto-publish drain and add an
-//! `auto_publish_failed` callback.
+//! Auto-commit follows the same publish-before-apply lifecycle as explicit
+//! group evolution. It stages an OpenMLS pending commit, pushes
+//! `(TransportMessage, PendingStateRef)` onto `auto_publish_buf`, and defers
+//! `merge_pending_commit` until `do_confirm_published`. If publication fails,
+//! the application calls `publish_failed` with the pending ref and the engine
+//! clears the staged commit.
 
 use openmls::framing::Sender;
 use openmls::group::MlsGroup;
@@ -89,8 +88,20 @@ pub(crate) fn decide(mls_group: &MlsGroup, proposal: &QueuedProposal) -> AutoCom
 
     // (4) MIP-03 §150 admin-depletion guard. If the leaver is the only
     //     admin, committing this SelfRemove would deplete admins. Refuse.
-    if let Ok(admins) = crate::group_data::admins_of_group(mls_group)
-        && let Some(leaver_pubkey) = pubkey_at_leaf_index(mls_group, leaver_idx)
+    //
+    // Fail-closed: if we cannot read the admin set or the leaver's
+    // pubkey (e.g. malformed admin extension, non-32-byte credential),
+    // we do NOT commit. A corrupted group is not a state the auto-
+    // committer should advance on best-effort.
+    let Ok(admins) = crate::group_data::admins_of_group(mls_group) else {
+        return AutoCommitDecision::Observe;
+    };
+    let leaver_pubkey = match pubkey_at_leaf_index(mls_group, leaver_idx) {
+        PubkeyResult::Ok(p) => Some(p),
+        PubkeyResult::MalformedIdentity => return AutoCommitDecision::Observe,
+        PubkeyResult::LeafMissing => None,
+    };
+    if let Some(leaver_pubkey) = leaver_pubkey
         && admins.len() == 1
         && admins[0] == leaver_pubkey
     {
@@ -100,22 +111,37 @@ pub(crate) fn decide(mls_group: &MlsGroup, proposal: &QueuedProposal) -> AutoCom
     AutoCommitDecision::Commit
 }
 
+enum PubkeyResult {
+    Ok([u8; 32]),
+    LeafMissing,
+    MalformedIdentity,
+}
+
 /// Look up the 32-byte identity (admin pubkey form) at a given leaf index.
+///
+/// Returns three distinct outcomes so the auto-committer can fail-closed
+/// on malformed identities (which violate MIP-01) instead of treating
+/// them as "no leaver pubkey to compare against."
 fn pubkey_at_leaf_index(
     mls_group: &MlsGroup,
     idx: openmls::prelude::LeafNodeIndex,
-) -> Option<[u8; 32]> {
-    let m = mls_group.members().find(|m| m.index == idx)?;
-    let bc = openmls::prelude::BasicCredential::try_from(m.credential).ok()?;
+) -> PubkeyResult {
+    let Some(m) = mls_group.members().find(|m| m.index == idx) else {
+        return PubkeyResult::LeafMissing;
+    };
+    let Ok(bc) = openmls::prelude::BasicCredential::try_from(m.credential) else {
+        return PubkeyResult::MalformedIdentity;
+    };
     let id = bc.identity();
     if id.len() != 32 {
-        return None;
+        return PubkeyResult::MalformedIdentity;
     }
     let mut out = [0u8; 32];
     out.copy_from_slice(id);
-    Some(out)
+    PubkeyResult::Ok(out)
 }
 
-// The commit-and-apply work happens in `message_processor::ingest_group_message`
-// directly — the `MlsGroup` holding the pending proposal must be the same
-// instance, and reloading from storage loses the in-memory proposal queue.
+// The commit-staging work happens in `message_processor::ingest_group_message`
+// directly so the freshly processed proposal can be stored and committed on
+// the same OpenMLS group instance. Applying the staged commit still waits for
+// `confirm_published`.

@@ -25,8 +25,8 @@ pub use capabilities::{
     TransportKind,
 };
 pub use engine::{
-    CgkaEngine, CommitOrderingKey, CreateGroupRequest, GroupEvent, KeyPackage, SendIntent,
-    SendResult,
+    AutoPublish, CgkaEngine, CommitOrderingKey, CreateGroupRequest, GroupEvent, KeyPackage,
+    SendIntent, SendResult,
 };
 pub use engine_state::{
     EpochState, InvalidTransition, Merging, PendingPublish, PendingStateRef, PendingWelcomeState,

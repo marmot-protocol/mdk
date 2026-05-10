@@ -48,6 +48,7 @@ pub mod message_processor;
 pub mod openmls_projection;
 pub mod provider;
 pub mod publish;
+pub mod snapshot_guard;
 pub mod update_group_data;
 pub mod upgrade;
 pub mod wire_format;

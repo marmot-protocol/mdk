@@ -6,14 +6,16 @@ This crate is the core of the system: it owns the per-group state machine that s
 
 ## What this crate does
 
-- Wraps `MlsGroup` for each joined group and manages its `EpochState` lifecycle (`Stable → PendingPublish → Merging → Stable`, plus deterministic rollback/replay for recoverable forks).
+- Wraps `MlsGroup` for each joined group and manages its `EpochState`
+  lifecycle (`Stable`, `PendingPublish`, `Merging`, `Recovering`).
 - Translates `SendIntent`s (create, invite, leave, app-message, capability upgrade) into MLS commits; translates inbound `TransportEnvelope`s into typed `IngestOutcome`s + `GroupEvent`s.
 - Stores inbound payloads as typed raw-transport or peeled-OpenMLS records so
   peel-deferred messages can be retried without polluting convergence replay.
 - Retains a small, configurable OpenMLS past-epoch window for delayed
   application messages.
 - Maintains a per-leaf capability cache so `feature_status` lookups don't walk the ratchet tree.
-- Picks a deterministic auto-committer for MIP-03 SelfRemove proposals.
+- Picks a deterministic auto-committer for MIP-03 SelfRemove proposals and
+  returns that work as publish-before-apply obligations.
 
 ## What it does *not* do
 
@@ -38,6 +40,10 @@ Tests are split into three tiers (unit, in-crate integration, multi-client harne
 3. [`../../docs/marmot-architecture/cgka-engine-canonicalization-contract.md`](../../docs/marmot-architecture/cgka-engine-canonicalization-contract.md) — the detailed post-peeling contract
 4. [`../../docs/marmot-architecture/distributed-convergence.md`](../../docs/marmot-architecture/distributed-convergence.md) — the branch-selection and convergence model
 5. [`AGENTS.md`](AGENTS.md) — module-by-module map of this crate, design deviations, where to look for what
+
+For the protocol rewrite that may eventually replace the monolithic
+`marmot_group_data` extension with app data dictionary components, see
+[`../../spec/README.md`](../../spec/README.md).
 
 ## Status
 

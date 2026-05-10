@@ -14,7 +14,8 @@ This repo owns the candidate CGKA engine workspace:
 - Nostr transport adapter and peeler,
 - conformance simulator and vector fixtures,
 - Tamarin models for distributed convergence,
-- architecture and spec drafts.
+- architecture notes and CGKA contracts,
+- Marmot protocol spec rewrite drafts.
 
 ## Where to go
 
@@ -30,6 +31,7 @@ This repo owns the candidate CGKA engine workspace:
 | Nostr transport peeler | `crates/transport-nostr-peeler/AGENTS.md` |
 | Multi-client harness / vectors | `crates/cgka-conformance-simulator/AGENTS.md` |
 | Architecture docs | `docs/AGENTS.md` and `docs/marmot-architecture/AGENTS.md` |
+| Spec rewrite sandbox | `spec/AGENTS.md` |
 | Formal model | `formal/tamarin/AGENTS.md` |
 
 ## Invariants
@@ -40,6 +42,9 @@ This repo owns the candidate CGKA engine workspace:
 - Keep SQLite persistence one database per Marmot account-device identity.
 - Keep Tamarin model names, Rust test names, and vector names easy to grep
   across layers.
+- Keep protocol laws and app-component drafts in `spec/` implementation-neutral.
+  Local engine, storage, queue, and diagnostic notes belong in
+  `spec/implementation-model.md` or architecture docs.
 - Keep tracing/logging privacy-safe: explicit crate/module `target` and
   `method` fields, aggregate values only, and no account ids, group ids,
   message ids, relay URLs, pubkeys, payloads, ciphertext, plaintext, or key

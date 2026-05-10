@@ -14,7 +14,7 @@ use cgka_traits::message::{MessageRecord, MessageState, StoredMessagePayload};
 use cgka_traits::storage::{StorageError, StorageProvider};
 use cgka_traits::transport::{TransportEnvelope, TransportMessage};
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
-use openmls::group::MlsGroup;
+use openmls::group::{MlsGroup, ProcessMessageError};
 use openmls::prelude::{
     BasicCredential, ContentType, MlsMessageBodyIn, MlsMessageIn, ProcessedMessageContent,
     ProtocolMessage, Sender,
@@ -233,22 +233,19 @@ pub fn replay_openmls_messages<S: StorageProvider>(
     group_id: &GroupId,
     messages: &[TransportMessage],
 ) -> Result<Vec<OpenMlsReplayObservation>, OpenMlsProjectionError> {
+    use crate::snapshot_guard::SnapshotRollbackGuard;
     let snapshot = replay_snapshot_name(group_id, messages);
-    storage
-        .create_group_snapshot(group_id, &snapshot)
+    // RAII: on any unwind path (panic during replay, early error)
+    // Drop rolls back + releases. On the happy path we explicitly
+    // commit at the end.
+    let guard = SnapshotRollbackGuard::create(storage, group_id.clone(), snapshot)
         .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")))?;
 
     let result =
         process_openmls_messages_inner(storage, group_id, messages).map(|out| out.observations);
-    let rollback_result = storage
-        .rollback_group_to_snapshot(group_id, &snapshot)
-        .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")));
-    let release_result = storage
-        .release_group_snapshot(group_id, &snapshot)
-        .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")));
-
-    rollback_result?;
-    release_result?;
+    guard
+        .commit()
+        .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")))?;
     result
 }
 
@@ -942,9 +939,51 @@ fn update_group_record_from_replay<S: StorageProvider>(
     };
     group.epoch = EpochId(output.final_epoch);
     group.members = output.final_members.clone();
+
+    // The replay just merged any GCE commits on the canonical path, so
+    // the live MlsGroup carries the post-canonical RequiredCapabilities
+    // and marmot_group_data extensions. Mirror those into the Marmot
+    // record so `feature_status` / `members()` / display name / admin
+    // checks all see the post-canonical truth — otherwise a capability
+    // upgrade or update_group_data commit accepted via convergence
+    // would leave the Marmot record stale.
+    let crypto = RustCrypto::default();
+    let provider = EngineOpenMlsProvider::<S>::new(&crypto, storage.mls_storage());
+    let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
+    if let Some(mls_group) = MlsGroup::load(provider.storage(), &mls_gid)
+        .map_err(|e| OpenMlsProjectionError::Replay(format!("load post-replay group: {e:?}")))?
+    {
+        group.required_capabilities = required_capabilities_from_group(&mls_group);
+        if let Ok(Some(data)) = crate::group_data::read_from_group(&mls_group) {
+            group.name = String::from_utf8_lossy(data.name.as_slice()).into_owned();
+            group.description = String::from_utf8_lossy(data.description.as_slice()).into_owned();
+        }
+    }
+
     storage
         .put_group(&group)
         .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))
+}
+
+fn required_capabilities_from_group(
+    mls_group: &MlsGroup,
+) -> cgka_traits::capabilities::GroupCapabilities {
+    use openmls::extensions::Extension;
+    use openmls::prelude::ExtensionType;
+    let mut caps = cgka_traits::capabilities::GroupCapabilities::default();
+    for ext in mls_group.extensions().iter() {
+        if let Extension::RequiredCapabilities(rc) = ext {
+            for t in rc.extension_types() {
+                if let ExtensionType::Unknown(n) = t {
+                    caps.extensions.insert(*n);
+                }
+            }
+            for t in rc.proposal_types() {
+                caps.proposals.insert(u16::from(*t));
+            }
+        }
+    }
+    caps
 }
 
 fn record_state_is_canonicalization_input(state: MessageState) -> bool {
@@ -1181,12 +1220,24 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                 ))?;
         let processed = match mls_group.process_message(&provider, protocol) {
             Ok(processed) => processed,
-            Err(_) if projection.kind == OpenMlsContentKind::Application => {
-                observations.push(OpenMlsReplayObservation::Ignored {
-                    message_id,
-                    kind: projection.kind,
-                });
-                continue;
+            Err(err) if projection.kind == OpenMlsContentKind::Application => {
+                // App-message replay against a candidate state is best-
+                // effort: an app message that doesn't decrypt on this
+                // branch is just evidence that it belongs to a different
+                // branch, not a fatal error. ValidationError covers the
+                // expected failure modes (WrongEpoch, decryption fail,
+                // sender-membership, etc.). LibraryError or any other
+                // structural failure is a real bug — propagate so we
+                // don't silently mask malformed input.
+                if matches!(err, ProcessMessageError::ValidationError(_)) {
+                    observations.push(OpenMlsReplayObservation::Ignored {
+                        message_id,
+                        kind: projection.kind,
+                    });
+                    continue;
+                } else {
+                    return Err(replay_error("process_message", err));
+                }
             }
             Err(e) => return Err(replay_error("process_message", e)),
         };

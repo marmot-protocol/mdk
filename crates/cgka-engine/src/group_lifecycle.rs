@@ -21,11 +21,13 @@ use cgka_traits::capabilities::{GroupCapabilities, TransportKind};
 use cgka_traits::engine::{CreateGroupRequest, SendResult};
 use cgka_traits::error::EngineError;
 use cgka_traits::group::{Group, Member};
+use cgka_traits::message::{MessageRecord, MessageState, StoredMessagePayload};
 use cgka_traits::storage::StorageProvider;
 use cgka_traits::transport::{EncryptedPayload, TransportEnvelope, TransportMessage};
 use cgka_traits::types::{EpochId, GroupId, MemberId};
 use openmls::group::{MlsGroup, MlsGroupCreateConfig, StagedWelcome};
 use openmls::prelude::{BasicCredential, Extension, Extensions, MlsMessageBodyIn, MlsMessageIn};
+use rand::RngCore;
 use tls_codec::{Deserialize as _, Serialize as _};
 
 /// Exporter-secret label the engine reserves for its own internal use (group
@@ -85,13 +87,19 @@ impl<S: StorageProvider> Engine<S> {
             }
         }
 
+        // The MIP-01 transport-visible group id is the routing handle the
+        // network layer uses to fan group messages out. It MUST NOT be
+        // derived from any group-member identity: a deterministic mapping
+        // would let a relay-side observer correlate every group created
+        // by the same creator (or attended by the same member) by
+        // watching the same routing tag. We therefore generate it from
+        // cryptographically secure randomness here, even though this
+        // field is shaped for the Nostr transport — getting routing
+        // metadata right at create time is more important than honoring
+        // the "engine doesn't know about transports" rule for an opaque
+        // 32-byte identifier.
         let mut nostr_group_id = [0u8; 32];
-        // Deterministic-from-self-id placeholder: real Nostr deployments
-        // generate this with secure randomness in the transport adapter.
-        // For 0.1.0's engine-only world, copy creator's id so wire bytes are
-        // valid + reproducible per-creator. (Will be re-randomized once a
-        // transport adapter wires `group_extension`.)
-        nostr_group_id.copy_from_slice(&creator_pubkey);
+        rand::thread_rng().fill_bytes(&mut nostr_group_id);
         let mut group_data = crate::group_data::NostrGroupData::fresh(
             &req.name,
             &req.description,
@@ -241,18 +249,39 @@ impl<S: StorageProvider> Engine<S> {
     /// Real implementation of `CgkaEngine::join_welcome`.
     ///
     /// Flow:
-    /// 1. Verify the welcome envelope targets this client
-    /// 2. Peel via `TransportPeeler::peel_welcome`
-    /// 3. Deserialize the inner MLS Welcome
-    /// 4. Stage the welcome into an `MlsGroup` (ratchet tree is embedded)
-    /// 5. Persist the Marmot `Group` record
-    /// 6. Initialize `EpochState::Stable` at the post-welcome epoch
-    /// 7. Emit `GroupEvent::GroupJoined`
+    /// 1. Dedupe against prior ingest of this welcome
+    /// 2. Verify the welcome envelope targets this client
+    /// 3. Peel via `TransportPeeler::peel_welcome`
+    /// 4. Deserialize the inner MLS Welcome
+    /// 5. Stage the welcome into an `MlsGroup` (ratchet tree is embedded)
+    /// 6. Persist the Marmot `Group` record
+    /// 7. Initialize `EpochState::Stable` at the post-welcome epoch
+    /// 8. Persist durable duplicate detection state
+    /// 9. Emit `GroupEvent::GroupJoined`
     pub(crate) async fn do_join_welcome(
         &mut self,
         welcome_msg: TransportMessage,
     ) -> Result<GroupId, EngineError> {
-        // 1. Envelope check.
+        // 1. Dedupe. The ingest-path welcome handler already guards with
+        // `seen_message_ids`; direct `CgkaEngine::join_welcome` callers
+        // skipped that. Without this check, a re-call would re-stage a
+        // Welcome on top of an existing group — in storage-memory that
+        // overwrites silently, which is unsafe.
+        if self.seen_message_ids.contains(&welcome_msg.id) {
+            return Err(EngineError::Other("welcome already processed".to_string()));
+        }
+        if let Ok(record) = self.storage.get_message(&welcome_msg.id)
+            && matches!(
+                record.state,
+                cgka_traits::message::MessageState::Processed
+                    | cgka_traits::message::MessageState::Failed
+                    | cgka_traits::message::MessageState::EpochInvalidated
+            )
+        {
+            return Err(EngineError::Other("welcome already processed".to_string()));
+        }
+
+        // 2. Envelope check.
         match &welcome_msg.envelope {
             TransportEnvelope::Welcome { recipient } => {
                 if recipient != self.identity.self_id() {
@@ -271,7 +300,7 @@ impl<S: StorageProvider> Engine<S> {
         }
         let welcome_id = welcome_msg.id.clone();
 
-        // 2. Peel.
+        // 3. Peel.
         let peeled = self
             .peeler
             .peel_welcome(&welcome_msg)
@@ -288,7 +317,7 @@ impl<S: StorageProvider> Engine<S> {
             }
         };
 
-        // 3. Deserialize.
+        // 4. Deserialize.
         let msg_in = MlsMessageIn::tls_deserialize_exact(welcome_bytes.as_slice())
             .map_err(|e| EngineError::Serialize(format!("welcome deserialize: {e:?}")))?;
         let welcome = match msg_in.extract() {
@@ -300,7 +329,7 @@ impl<S: StorageProvider> Engine<S> {
             }
         };
 
-        // 4. Stage + land.
+        // 5. Stage + land.
         let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
         let join_config = join_config(self.max_past_epochs);
         let staged = StagedWelcome::new_from_welcome(&provider, &join_config, welcome, None)
@@ -311,7 +340,7 @@ impl<S: StorageProvider> Engine<S> {
 
         let group_id = GroupId::new(mls_group.group_id().as_slice().to_vec());
 
-        // 5. Persist Marmot group record from signed group-context data.
+        // 6. Persist Marmot group record from signed group-context data.
         let mut group_record = Group {
             id: group_id.clone(),
             name: String::new(),
@@ -335,16 +364,32 @@ impl<S: StorageProvider> Engine<S> {
             self.identity.self_id(),
         )?;
 
-        // 6. State machine: Stable at the post-welcome epoch.
+        // 7. State machine: Stable at the post-welcome epoch.
         self.epoch_manager
             .set_stable(group_id.clone(), EpochId(mls_group.epoch().as_u64()));
 
-        // 7. Emit event.
+        // 8. Persist durable dedup state for direct `join_welcome`
+        // callers. The ingest path records the welcome after this
+        // method returns, but callers using the trait method directly
+        // need restart-safe duplicate detection too.
+        let payload = StoredMessagePayload::raw_transport(welcome_msg)
+            .encode()
+            .map_err(|e| EngineError::Serialize(format!("{e:?}")))?;
+        self.storage.put_message(&MessageRecord {
+            id: welcome_id.clone(),
+            group_id: group_id.clone(),
+            epoch: EpochId(mls_group.epoch().as_u64()),
+            state: MessageState::Processed,
+            payload,
+        })?;
+
+        // 9. Emit event + register for in-process dedup.
         self.events_buf
             .push_back(cgka_traits::engine::GroupEvent::GroupJoined {
                 group_id: group_id.clone(),
-                via_welcome: welcome_id,
+                via_welcome: welcome_id.clone(),
             });
+        self.seen_message_ids.insert(welcome_id);
 
         self.replay_buffered_messages(&group_id).await?;
         Ok(group_id)

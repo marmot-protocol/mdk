@@ -8,6 +8,10 @@ Use `marmot-architecture/index.md` as the entry point. The `overview/` pages are
 the current orientation set. The `further-context/` pages are deeper background
 and may contain older exploratory wording.
 
+The protocol spec rewrite sandbox lives outside this directory in `../spec/`.
+Use it for implementation-neutral Marmot protocol text. Keep repository and
+engine-specific notes in `marmot-architecture/` or crate docs.
+
 `required-features.md` is the protocol boundary principles document. Treat it
 as a high-level constraint, not an implementation checklist.
 
@@ -24,6 +28,8 @@ as a high-level constraint, not an implementation checklist.
 - Keep observability guidance current in
   `marmot-architecture/overview/observability.md` when tracing/logging policy
   changes.
+- When a protocol rule graduates from exploratory architecture text, link to the
+  matching `../spec/` document instead of copying the rule into multiple docs.
 
 ## Verification
 

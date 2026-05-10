@@ -109,6 +109,14 @@ impl<S: StorageProvider> Engine<S> {
             _ => unreachable!("confirm only emits create/evolution events"),
         };
         self.events_buf.push_back(event.clone());
+        if let Some(removed) = self.pending_auto_removed.remove(&pending) {
+            for member in removed {
+                self.events_buf.push_back(GroupEvent::MemberRemoved {
+                    group_id: replay_group_id.clone(),
+                    member,
+                });
+            }
+        }
         self.replay_buffered_messages(&replay_group_id).await?;
         Ok(event)
     }
@@ -152,6 +160,7 @@ impl<S: StorageProvider> Engine<S> {
         }
 
         let (group_id, _prior_epoch) = self.epoch_manager.rollback_publish(pending)?;
+        self.pending_auto_removed.remove(&pending);
         self.forget_pending_commit_for_recovery(pending)?;
         self.replay_buffered_messages(&group_id).await?;
         Ok(())

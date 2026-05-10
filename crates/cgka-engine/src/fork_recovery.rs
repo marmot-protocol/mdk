@@ -22,6 +22,7 @@ use cgka_traits::error::EngineError;
 use cgka_traits::message::MessageState;
 use cgka_traits::storage::{StorageError, StorageProvider};
 use cgka_traits::types::{EpochId, GroupId, MessageId};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
 #[derive(Clone, Debug)]
@@ -58,11 +59,22 @@ pub(crate) struct ForkRecoveryManager {
 impl ForkRecoveryManager {
     fn next_snapshot_name(&mut self, group_id: &GroupId, source_epoch: EpochId) -> String {
         self.snapshot_counter += 1;
+        // Hash the group_id rather than embedding it as hex: snapshot
+        // names appear in storage error messages and could leak through
+        // tracing if storage tracing ever expands. Per the privacy rule
+        // in `docs/marmot-architecture/overview/observability.md`,
+        // group_ids must not appear in operational identifiers.
+        let mut hasher = Sha256::new();
+        hasher.update(b"cgka-engine-fork-recovery/v1");
+        hasher.update(group_id.as_slice());
+        hasher.update(source_epoch.0.to_be_bytes());
+        hasher.update(self.snapshot_counter.to_be_bytes());
+        let digest = hasher.finalize();
         format!(
             "fork-{}-{}-{}",
-            hex::encode(group_id.as_slice()),
             source_epoch.0,
-            self.snapshot_counter
+            self.snapshot_counter,
+            hex::encode(&digest[..8])
         )
     }
 

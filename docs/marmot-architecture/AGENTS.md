@@ -11,6 +11,7 @@ Agent map for the Marmot architecture docs.
 5. `cgka-engine-spec.md`
 6. `cgka-engine-canonicalization-contract.md`
 7. `distributed-convergence.md`
+8. `../../spec/README.md` when the task touches the protocol rewrite.
 
 ## Document roles
 
@@ -21,6 +22,7 @@ Agent map for the Marmot architecture docs.
 | `cgka-engine-spec.md` | Draft normative engine spec. |
 | `cgka-engine-canonicalization-contract.md` | Detailed post-peeling convergence contract. |
 | `distributed-convergence.md` | Branch selection, retained anchors, and convergence model. |
+| `../../spec/` | Experimental Marmot protocol rewrite by stable surface and app component. |
 
 ## Conventions
 
@@ -28,5 +30,7 @@ Agent map for the Marmot architecture docs.
 - Treat `storage-sqlite` as the current persistent backend.
 - Keep Nostr language separated into identity, app message format, and
   transport roles.
+- Keep implementation architecture here. Put implementation-neutral protocol
+  laws, wire surfaces, and app component dictionaries in `../../spec/`.
 - If Tamarin or Rust tests add a named scenario, mirror the name in the docs
   when that scenario becomes part of the contract.

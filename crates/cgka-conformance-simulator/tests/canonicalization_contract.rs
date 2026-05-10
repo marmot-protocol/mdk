@@ -501,3 +501,50 @@ fn outbound_intents_are_queued_while_syncing() {
     );
     assert!(result.publishable_outbound_messages.is_empty());
 }
+
+#[test]
+fn quiescence_with_no_input_is_stable() {
+    let mut input = input(vec![], vec![branch("live", 1, 3, 0x00)]);
+    input.state.last_convergence_relevant_input_ms = 0;
+    input.now_ms = 5_000; // window definitely closed
+
+    let result = canonicalize(input);
+
+    assert_eq!(
+        result.sync_state,
+        SyncState::Stable,
+        "quiesced + nothing pending = Stable"
+    );
+}
+
+#[test]
+fn quiescence_with_orphan_commit_in_input_is_canonicalizing() {
+    // Construct a commit whose parent branch isn't materialized AND
+    // doesn't fork from a tracked candidate. The canonicalizer cannot
+    // give it a disposition this pass — the spec calls this state
+    // "Canonicalizing" (window closed but pass left work pending),
+    // distinct from Stable (fixed point reached).
+    let orphan = commit_edge(
+        "orphan-1",
+        "orphan-branch",
+        Some("missing-parent"),
+        5,
+        6,
+        0x99,
+    );
+    let mut inp = input(vec![orphan], vec![]);
+    inp.state.last_convergence_relevant_input_ms = 0;
+    inp.now_ms = 5_000; // window closed
+
+    let result = canonicalize(inp);
+
+    assert_eq!(
+        result.sync_state,
+        SyncState::Canonicalizing,
+        "orphan commit with no parent leaves work pending → Canonicalizing"
+    );
+    // The orphan didn't get a disposition.
+    assert!(result.accepted_commits.is_empty());
+    assert!(result.dropped_messages.is_empty());
+    assert!(result.invalidated_app_messages.is_empty());
+}

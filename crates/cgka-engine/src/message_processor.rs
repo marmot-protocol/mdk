@@ -15,7 +15,7 @@ use crate::openmls_projection::{
     OpenMlsContentKind, project_mls_message, retained_anchor_epoch_from_snapshot_name,
 };
 use crate::provider::EngineOpenMlsProvider;
-use cgka_traits::engine::{CommitOrderingKey, GroupEvent, SendIntent, SendResult};
+use cgka_traits::engine::{AutoPublish, CommitOrderingKey, GroupEvent, SendIntent, SendResult};
 use cgka_traits::engine_state::EpochState;
 use cgka_traits::error::{EngineError, PeelerError};
 use cgka_traits::ingest::{IngestOutcome, PeeledContent, StaleReason};
@@ -389,9 +389,28 @@ impl<S: StorageProvider> Engine<S> {
             let sender_id = member_id_of_sender(processed.sender(), &mls_group);
             return match processed.into_content() {
                 ProcessedMessageContent::ApplicationMessage(bytes) => {
+                    let Some(sender) = sender_id else {
+                        // OpenMLS allows external senders for some
+                        // ProcessedMessageContent variants but Marmot
+                        // does not surface unattributable application
+                        // messages to applications: a `MessageReceived`
+                        // event without a real sender is silent
+                        // attribution loss. Mark the message Failed and
+                        // skip the event. (We deliberately avoid logging
+                        // payload contents per observability.md.)
+                        tracing::warn!(
+                            target: "cgka_engine::message_processor",
+                            method = "ingest_group_message",
+                            "dropping application message with unattributable sender"
+                        );
+                        self.update_stored_message_state(&msg.id, MessageState::Failed)?;
+                        return Ok(IngestOutcome::Stale {
+                            reason: StaleReason::PeelFailed,
+                        });
+                    };
                     self.events_buf.push_back(GroupEvent::MessageReceived {
                         group_id: group_id.clone(),
-                        sender: sender_id.unwrap_or_else(|| MemberId::new(Vec::new())),
+                        sender,
                         payload: bytes.into_bytes(),
                     });
                     self.update_stored_message_state(&msg.id, MessageState::Processed)?;
@@ -521,8 +540,6 @@ impl<S: StorageProvider> Engine<S> {
                             &group_id,
                             pre_commit_epoch,
                         )?;
-                        self.epoch_manager
-                            .record_committed_from(&group_id, pre_commit_epoch);
                         let pre_commit_ctx =
                             group_lifecycle::build_group_context_snapshot(&mls_group, &provider)?;
                         let (commit_out, _welcome_opt, _gi) = mls_group
@@ -548,52 +565,50 @@ impl<S: StorageProvider> Engine<S> {
                             },
                             ..wrapped
                         };
-                        self.retain_current_epoch_snapshot_for_group(&group_id)?;
-                        mls_group
-                            .merge_pending_commit(&provider)
-                            .map_err(|e| EngineError::Backend(format!("merge_pending: {e:?}")))?;
-
-                        let new_epoch = EpochId(mls_group.epoch().as_u64());
-                        let prior = EpochId(new_epoch.0.saturating_sub(1));
-
                         self.record_sent_openmls_message(
                             &wrapped,
                             commit_bytes.as_slice(),
                             &group_id,
                             pre_commit_epoch,
                         )?;
-                        self.record_applied_commit_for_recovery(
+
+                        let new_epoch = EpochId(pre_commit_epoch.0 + 1);
+                        let pending_ref = self.epoch_manager.next_pending_ref();
+                        let staged = cgka_traits::engine_state::StagedCommitHandle::from_bytes(
+                            group_id.as_slice().to_vec(),
+                        );
+                        self.epoch_manager.begin_pending(
+                            group_id.clone(),
+                            pre_commit_epoch,
+                            new_epoch,
+                            staged,
+                            pending_ref,
+                            crate::epoch_manager::PendingKind::GroupEvolution,
+                        )?;
+                        self.track_pending_commit_for_recovery(
+                            pending_ref,
                             group_id.clone(),
                             pre_commit_epoch,
                             wrapped.id.clone(),
                             &commit_bytes,
                             recovery_snapshot,
                         );
-                        self.auto_publish_buf.push_back(wrapped);
+                        self.pending_auto_removed
+                            .insert(pending_ref, auto_removed.clone());
+                        self.auto_publish_buf.push_back(AutoPublish {
+                            msg: wrapped,
+                            pending: pending_ref,
+                        });
 
-                        self.epoch_manager.set_stable(group_id.clone(), new_epoch);
+                        // Match the explicit send paths' projected Marmot
+                        // state: callers can see the pending member set, while
+                        // the OpenMLS commit itself is not merged until
+                        // confirm_published.
                         if let Ok(mut g) = self.storage.get_group(&group_id) {
                             g.epoch = new_epoch;
-                            g.members = group_lifecycle::marmot_members(&mls_group);
+                            g.members
+                                .retain(|member| !auto_removed.iter().any(|id| id == &member.id));
                             self.storage.put_group(&g)?;
-                        }
-                        crate::capability_manager::cache_self_capabilities(
-                            &self.storage,
-                            &group_id,
-                            &mls_group,
-                            self.identity.self_id(),
-                        )?;
-
-                        self.events_buf.push_back(GroupEvent::EpochChanged {
-                            group_id: group_id.clone(),
-                            from: prior,
-                            to: new_epoch,
-                        });
-                        for member in auto_removed {
-                            self.events_buf.push_back(GroupEvent::MemberRemoved {
-                                group_id: group_id.clone(),
-                                member,
-                            });
                         }
                     }
                     Ok(IngestOutcome::Processed)
@@ -1186,18 +1201,73 @@ fn convergence_ingest_outcome(
     epoch: EpochId,
 ) -> IngestOutcome {
     let message_id = hex::encode(msg.id.as_slice());
+
+    // Was this exact message classified by the canonicalize pass? Map
+    // the disposition to a typed outcome so callers can log by category
+    // instead of treating every non-accepted result as "Buffered, retry
+    // later" — a message that was dropped (BeyondAnchor) or invalidated
+    // (LosingBranch) is terminal.
     let accepted = result
         .accepted_commits
         .iter()
         .chain(&result.accepted_proposals)
         .chain(&result.accepted_app_messages)
         .any(|accepted| accepted == &message_id);
-
-    if result.sync_state == crate::canonicalization::SyncState::Stable && accepted {
-        IngestOutcome::Processed
-    } else {
-        IngestOutcome::Buffered { group_id, epoch }
+    if accepted && result.sync_state == crate::canonicalization::SyncState::Stable {
+        return IngestOutcome::Processed;
     }
+
+    if result
+        .already_seen
+        .iter()
+        .any(|seen| seen.message_id == message_id)
+    {
+        return IngestOutcome::Stale {
+            reason: StaleReason::AlreadySeen,
+        };
+    }
+
+    // `dropped_messages` and most `invalidated_app_messages` reasons
+    // are terminal — the engine can never accept them, so reporting
+    // Buffered would mislead callers into expecting a later retry.
+    //
+    // The one retryable invalidation reason is
+    // `UndecryptableInCanonicalState`: the message arrived for a
+    // future epoch the local context can't yet peel. A subsequent
+    // canonicalize pass that advances the MLS context will re-evaluate
+    // it. Keep that case as Buffered.
+    if result
+        .dropped_messages
+        .iter()
+        .any(|dropped| dropped.message_id == message_id)
+    {
+        return IngestOutcome::Stale {
+            reason: StaleReason::PeelFailed,
+        };
+    }
+    if let Some(inv) = result
+        .invalidated_app_messages
+        .iter()
+        .find(|inv| inv.message_id == message_id)
+    {
+        use crate::canonicalization::InvalidatedAppMessageReason;
+        match inv.reason {
+            InvalidatedAppMessageReason::UndecryptableInCanonicalState => {
+                // Possibly retryable on a later pass; fall through to
+                // Buffered so the application keeps the message and
+                // waits for branch selection to advance.
+            }
+            InvalidatedAppMessageReason::LosingBranch
+            | InvalidatedAppMessageReason::BeyondAnchor
+            | InvalidatedAppMessageReason::BeyondAppRetention => {
+                return IngestOutcome::Stale {
+                    reason: StaleReason::PeelFailed,
+                };
+            }
+        }
+    }
+
+    IngestOutcome::Buffered { group_id, epoch }
 }
 
 impl<S: StorageProvider> Engine<S> {
@@ -1258,28 +1328,44 @@ impl<S: StorageProvider> Engine<S> {
         group_id: &GroupId,
         current_epoch: EpochId,
     ) -> Result<Option<cgka_traits::ingest::PeeledMessage>, EngineError> {
+        use crate::snapshot_guard::SnapshotRollbackGuard;
         let snapshots = self.available_past_peel_snapshots(group_id)?;
         for (source_epoch, snapshot_name) in snapshots {
             if source_epoch >= current_epoch {
                 continue;
             }
+            // Privacy: do not embed `group_id` or `msg.id` as hex in the
+            // snapshot name. Storage error messages and any future
+            // tracing on snapshot names would otherwise leak routing /
+            // dedup-key material that observability.md explicitly
+            // forbids.
+            let mut hasher = Sha256::new();
+            hasher.update(b"cgka-engine-peel-restore/v1");
+            hasher.update(group_id.as_slice());
+            hasher.update(current_epoch.0.to_be_bytes());
+            hasher.update(msg.id.as_slice());
+            let snapshot_digest = hasher.finalize();
             let restore_snapshot = format!(
-                "peel-restore-{}-{}-{}",
-                hex::encode(group_id.as_slice()),
+                "peel-restore-{}-{}",
                 current_epoch.0,
-                hex::encode(msg.id.as_slice())
+                hex::encode(&snapshot_digest[..8])
             );
-            self.storage
-                .create_group_snapshot(group_id, &restore_snapshot)?;
+            // RAII guard: rollback + release on any unwind path
+            // (panic, early error, async cancel) so the live group
+            // state never leaks past this scope as the past-snapshot
+            // state.
+            let guard =
+                SnapshotRollbackGuard::create(&self.storage, group_id.clone(), restore_snapshot)?;
             let ctx = match self.context_from_group_snapshot(group_id, &snapshot_name) {
                 Ok(ctx) => ctx,
                 Err(err) => {
-                    self.restore_after_snapshot_peel(group_id, &restore_snapshot)?;
+                    // Drop on `guard` rolls back to live + releases.
+                    guard.commit()?;
                     return Err(err);
                 }
             };
             let peeled = self.peeler.peel_group_message(msg, &ctx).await;
-            self.restore_after_snapshot_peel(group_id, &restore_snapshot)?;
+            guard.commit()?;
             match peeled {
                 Ok(peeled) => return Ok(Some(peeled)),
                 Err(PeelerError::DecryptFailed | PeelerError::StaleEpoch { .. }) => continue,
@@ -1324,22 +1410,6 @@ impl<S: StorageProvider> Engine<S> {
         .map_err(|e| EngineError::Backend(format!("load snapshot group: {e:?}")))?
         .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
         group_lifecycle::build_group_context_snapshot(&mls_group, &provider)
-    }
-
-    fn restore_after_snapshot_peel(
-        &self,
-        group_id: &GroupId,
-        restore_snapshot: &str,
-    ) -> Result<(), EngineError> {
-        self.storage
-            .rollback_group_to_snapshot(group_id, restore_snapshot)?;
-        match self
-            .storage
-            .release_group_snapshot(group_id, restore_snapshot)
-        {
-            Ok(()) | Err(StorageError::SnapshotMissing(_)) => Ok(()),
-            Err(err) => Err(EngineError::Storage(err)),
-        }
     }
 
     pub(crate) fn record_sent_openmls_message(

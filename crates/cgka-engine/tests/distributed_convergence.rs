@@ -1674,8 +1674,9 @@ async fn engine_ingest_retains_proposal_until_canonical_commit_consumes_it() {
         .into_iter()
         .next()
         .expect("alice auto-commits bob's self-remove");
+    alice.confirm_published(auto_commit.pending).await.unwrap();
 
-    let commit = route(auto_commit, &group_id);
+    let commit = route(auto_commit.msg, &group_id);
     let commit_outcome = carol.ingest(commit.clone()).await.unwrap();
     assert!(matches!(
         commit_outcome,
