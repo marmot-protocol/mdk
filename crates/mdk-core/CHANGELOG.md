@@ -36,6 +36,7 @@
 
 ### Fixed
 
+- Fixed admin auto-commit of legacy `Remove(self)` leaves in mixed/legacy groups so departing members are actually removed instead of silently remaining in the MLS group. ([#288](https://github.com/marmot-protocol/mdk/pull/288))
 - Accepted `NostrGroupDataExtension` payloads from future versions with unknown trailing fields, per MIP-01's forward-compatibility requirement. Previously, any v(N+1) extension on the wire was rejected by `deserialize_bytes`, which would have bricked every group operation (commit/proposal/welcome/admin checks) the moment any peer authored a newer-version extension. ([#88](https://github.com/marmot-protocol/marmot-security/issues/88))
 - Recorded rollback snapshots for locally merged admin-list updates so clients can converge on the MIP-03 winner when competing admins concurrently mutate `admin_pubkeys`. ([#289](https://github.com/marmot-protocol/mdk/pull/289))
 - Verified unsigned application-message rumor IDs before accepting or sending them, preventing caller-supplied IDs from being trusted when they do not match the canonical event hash. ([#287](https://github.com/marmot-protocol/mdk/pull/287))

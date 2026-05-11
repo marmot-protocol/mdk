@@ -8350,6 +8350,14 @@ mod tests {
             .accept_welcome(&charlie_welcome)
             .expect("charlie accepts");
 
+        let required_proposals = bob_mdk
+            .group_required_proposals(&group_id)
+            .expect("bob reads required proposals");
+        assert!(
+            !required_proposals.contains(&ProposalType::SelfRemove),
+            "mixed group must not require SelfRemove before Bob's legacy fallback leave"
+        );
+
         // Bob leaves the mixed group.
         let bob_leave = bob_mdk.leave_group(&group_id).expect("Bob should leave");
 
@@ -8365,6 +8373,94 @@ mod tests {
             "mixed-group leave must fall back to legacy Remove and surface as PendingProposal \
              for a non-admin receiver; got {:?}",
             result
+        );
+    }
+
+    /// Leave-path: when an admin receives a legacy `Remove(self)` leave from
+    /// a mixed group, the auto-commit must actually remove the departing
+    /// member rather than producing an empty self-update commit.
+    #[test]
+    fn test_admin_auto_commit_legacy_remove_self_removes_member() {
+        let alice_mdk = create_test_mdk(); // admin
+        let legacy_mdk = create_test_mdk(); // capability-poor legacy fixture
+        let charlie_mdk = create_test_mdk(); // modern non-admin, the leaver
+        let alice_keys = Keys::generate();
+        let legacy_keys = Keys::generate();
+        let charlie_keys = Keys::generate();
+
+        // The legacy KeyPackage forces RequiredCapabilities = [], so
+        // Charlie's leave falls back to legacy Remove(self).
+        let legacy_kp = create_legacy_key_package_event(&legacy_mdk, &legacy_keys);
+        let charlie_kp = create_key_package_event(&charlie_mdk, &charlie_keys);
+
+        let create_result = alice_mdk
+            .create_group(
+                &alice_keys.public_key(),
+                vec![legacy_kp, charlie_kp],
+                create_nostr_group_config_data(vec![alice_keys.public_key()]),
+            )
+            .expect("alice creates mixed group");
+        let group_id = create_result.group.mls_group_id.clone();
+
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("alice merges creation commit");
+
+        // create_group returns welcomes in invitee order. Charlie's KeyPackage
+        // is second; the first invitee is only a legacy capability fixture and
+        // does not need to process a welcome for Alice to hold mixed state.
+        let charlie_welcome = charlie_mdk
+            .process_welcome(
+                &nostr::EventId::all_zeros(),
+                &create_result.welcome_rumors[1],
+            )
+            .expect("charlie processes welcome");
+        charlie_mdk
+            .accept_welcome(&charlie_welcome)
+            .expect("charlie accepts welcome");
+
+        assert_eq!(
+            alice_mdk
+                .load_mls_group(&group_id)
+                .expect("alice loads group")
+                .expect("alice has group")
+                .members()
+                .count(),
+            3,
+            "alice starts with alice, the legacy invitee, and charlie"
+        );
+
+        let required_proposals = charlie_mdk
+            .group_required_proposals(&group_id)
+            .expect("charlie reads required proposals");
+        assert!(
+            !required_proposals.contains(&ProposalType::SelfRemove),
+            "mixed group must not require SelfRemove before Charlie's legacy fallback leave"
+        );
+
+        let charlie_leave = charlie_mdk
+            .leave_group(&group_id)
+            .expect("charlie leaves mixed group");
+
+        let result = alice_mdk
+            .process_message(&charlie_leave.evolution_event)
+            .expect("alice processes charlie's leave");
+        assert!(
+            matches!(result, MessageProcessingResult::Proposal(_)),
+            "admin should auto-commit legacy Remove(self), got {:?}",
+            result
+        );
+
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("alice merges auto-commit");
+
+        let members = alice_mdk
+            .get_members(&group_id)
+            .expect("alice reads members after leave");
+        assert!(
+            !members.contains(&charlie_keys.public_key()),
+            "legacy Remove(self) auto-commit must remove the departing member"
         );
     }
 
