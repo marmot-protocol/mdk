@@ -1576,6 +1576,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "marmot-lab"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "cgka-engine",
+ "cgka-session",
+ "cgka-traits",
+ "hex",
+ "marmot-account",
+ "nostr",
+ "nostr-relay-builder",
+ "nostr-sdk",
+ "serde",
+ "serde_json",
+ "sha2",
+ "storage-sqlite",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "transport-nostr-adapter",
+ "transport-nostr-peeler",
+]
+
+[[package]]
 name = "matchers"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1649,6 +1673,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ade30de16869618919c6b5efc8258f47b654a98b51541eb77f85e8ec5e3c83a6"
 dependencies = [
  "nostr",
+]
+
+[[package]]
+name = "nostr-relay-builder"
+version = "0.44.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "51ba8e48eaadd5644e7317ca2f892b89a394a8cc57e99fea9f624dc081df1a24"
+dependencies = [
+ "async-utility",
+ "async-wsocket",
+ "atomic-destructor",
+ "hex",
+ "negentropy",
+ "nostr",
+ "nostr-database",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

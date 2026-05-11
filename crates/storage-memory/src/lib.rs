@@ -18,9 +18,9 @@ use cgka_traits::capabilities::{CapabilityRequirement, Feature, GroupCapabilitie
 use cgka_traits::group::{Group, Member};
 use cgka_traits::message::{MessageRecord, MessageState};
 use cgka_traits::storage::{
-    CapabilityStorage, ConvergencePolicyStorage, GroupStorage, MessageStorage,
-    OutboundIntentStorage, QueuedOutboundIntent, StorageError, StorageProvider, StorageResult,
-    WelcomeStorage,
+    AccountDeviceSignerBinding, AccountDeviceSignerStorage, CapabilityStorage,
+    ConvergencePolicyStorage, GroupStorage, MessageStorage, OutboundIntentStorage,
+    QueuedOutboundIntent, StorageError, StorageProvider, StorageResult, WelcomeStorage,
 };
 use cgka_traits::types::{Backend, EpochId, GroupId, MemberId, MessageId};
 use cgka_traits::welcome::PendingWelcome;
@@ -41,6 +41,7 @@ struct Inner {
     features: HashMap<Feature, CapabilityRequirement>,
     member_caps: HashMap<(GroupId, MemberId), GroupCapabilities>,
     convergence_policies: HashMap<GroupId, Vec<u8>>,
+    account_device_signers: HashMap<MemberId, AccountDeviceSignerBinding>,
     /// `(group_id, snapshot_name) -> GroupSnapshot` — captures CGKA metadata
     /// plus the OpenMLS memory map so fork recovery can reload the group at
     /// the snapshot epoch.
@@ -488,6 +489,27 @@ impl ConvergencePolicyStorage for MemoryStorage {
         Ok(read(&self.inner)?
             .convergence_policies
             .get(group_id)
+            .cloned())
+    }
+}
+
+// ── AccountDeviceSignerStorage ─────────────────────────────────────────────
+
+impl AccountDeviceSignerStorage for MemoryStorage {
+    fn put_account_device_signer(&self, binding: &AccountDeviceSignerBinding) -> StorageResult<()> {
+        write(&self.inner)?
+            .account_device_signers
+            .insert(binding.marmot_identity.clone(), binding.clone());
+        Ok(())
+    }
+
+    fn account_device_signer(
+        &self,
+        marmot_identity: &MemberId,
+    ) -> StorageResult<Option<AccountDeviceSignerBinding>> {
+        Ok(read(&self.inner)?
+            .account_device_signers
+            .get(marmot_identity)
             .cloned())
     }
 }

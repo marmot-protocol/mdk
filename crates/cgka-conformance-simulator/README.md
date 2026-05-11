@@ -37,7 +37,8 @@ JSON `VectorFixture` envelope:
 - `seed` — `null` for hand-authored deterministic scenarios.
 - `scenario` — the input-side `ScenarioSpec` to execute.
 - `expected_trace` — the `ScenarioTrace` a conforming implementation must
-  produce.
+  produce. The trace records client observations and scenario-level pending
+  publish confirmations or rollbacks.
 
 Non-Rust implementations should read the JSON file, run the named scenario
 from `scenario`, serialize their observed trace into the same shape, and
@@ -46,9 +47,11 @@ internals.
 
 The next vector pass is tracked in
 [`docs/marmot-architecture/overview/cgka-engine-quality-and-vectors.md`](../../docs/marmot-architecture/overview/cgka-engine-quality-and-vectors.md).
-That pass should add a vector manifest and a byte-level fixture schema for
-component and wire-format bytes. This crate currently has scenario fixtures,
-not a full byte-level vector suite.
+That pass has started with [`vectors/manifest.v1.json`](vectors/manifest.v1.json)
+and [`vectors/byte-fixtures/schema.v1.json`](vectors/byte-fixtures/schema.v1.json).
+This crate now has first app-component byte fixtures and a portable
+`publish-fail/v1` pending-rollback vector, but not a full byte-level vector
+suite.
 
 `convergence-e2e-group-events/v1` is kept as an in-tree bridge scenario rather
 than a portable JSON fixture. Raw harness messages enter through the Nostr

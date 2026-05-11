@@ -1,0 +1,131 @@
+{
+  "manifest_version": "1",
+  "updated": "2026-05-11",
+  "purpose": "Inventory of current CGKA conformance artifacts and the next vectorization state for each one.",
+  "entries": [
+    {
+      "id": "three-client-message-exchange/v1",
+      "kind": "scenario_vector",
+      "status": "portable",
+      "artifact": "three-client-message-exchange.v1.json",
+      "coverage": [
+        "group creation with two invitees",
+        "welcome processing",
+        "same-epoch application messages",
+        "implementation-neutral trace comparison"
+      ],
+      "next": "Keep as the smoke fixture for independent implementations."
+    },
+    {
+      "id": "publish-fail/v1",
+      "kind": "scenario_vector",
+      "status": "portable",
+      "artifact": "publish-fail.v1.json",
+      "coverage": [
+        "publish-before-apply rollback",
+        "pending publish failure",
+        "stable pre-publish epoch after rollback"
+      ],
+      "next": "Use as the smoke fixture for pending rollback traces."
+    },
+    {
+      "id": "convergence-e2e-group-events/v1",
+      "kind": "scenario",
+      "status": "rust_only_bridge",
+      "coverage": [
+        "real Nostr peeler ingress",
+        "same-epoch invite race",
+        "canonical branch application payload",
+        "losing branch payload exclusion"
+      ],
+      "next": "Promote to a portable scenario vector after the trace can abstract over OpenMLS commit randomness."
+    },
+    {
+      "id": "delayed-past-epoch-app-message/v1",
+      "kind": "scenario",
+      "status": "rust_only",
+      "coverage": [
+        "retained epoch context peel",
+        "past-epoch application message acceptance"
+      ],
+      "next": "Promote to a portable scenario vector."
+    },
+    {
+      "id": "welcome-before-commit-rejects-commit-echo/v1",
+      "kind": "scenario",
+      "status": "rust_only",
+      "coverage": [
+        "welcome before matching invite commit",
+        "terminal stale commit classification for invitee echo"
+      ],
+      "next": "Promote to a portable scenario vector once stale classifications are part of the trace format."
+    },
+    {
+      "id": "send-leave/v1",
+      "kind": "generated_scenario_family",
+      "status": "generated",
+      "coverage": [
+        "arbitrary send and leave intent sequences",
+        "event conservation",
+        "seeded report artifacts"
+      ],
+      "next": "Select minimized failures or high-signal cases and promote them to fixed vectors."
+    },
+    {
+      "id": "convergence-e2e-delivery/v1",
+      "kind": "generated_scenario_family",
+      "status": "generated",
+      "coverage": [
+        "duplicate delivery",
+        "delay and release",
+        "reorder before convergence observation"
+      ],
+      "next": "Promote stable variants into portable vectors after trace expectations can represent both valid selected branches."
+    },
+    {
+      "id": "selector-policy-cases/v1",
+      "kind": "formal_case_fixture",
+      "status": "portable_policy_fixture",
+      "artifact": "../../../formal/tamarin/policy_cases.json",
+      "coverage": [
+        "Tamarin-derived branch selector cases",
+        "candidate order invariance"
+      ],
+      "next": "Keep this linked to formal model names and Rust selector tests."
+    },
+    {
+      "id": "marmot.transport.nostr.routing.v1/state-valid-two-relays/v1",
+      "kind": "byte_fixture",
+      "status": "portable",
+      "artifact": "byte-fixtures/nostr-routing-v1-valid-state.v1.json",
+      "coverage": [
+        "component state bytes",
+        "sorted relay list",
+        "32-byte Nostr group routing id"
+      ],
+      "next": "Use as the first cross-implementation app-component state decode vector."
+    },
+    {
+      "id": "marmot.transport.nostr.routing.v1/update-valid-two-relays/v1",
+      "kind": "byte_fixture",
+      "status": "portable",
+      "artifact": "byte-fixtures/nostr-routing-v1-valid-update.v1.json",
+      "coverage": [
+        "component update bytes",
+        "relay-only update payload"
+      ],
+      "next": "Use as the first cross-implementation app-component update decode vector."
+    },
+    {
+      "id": "marmot.transport.nostr.routing.v1/update-invalid-duplicate-relay/v1",
+      "kind": "byte_fixture",
+      "status": "portable",
+      "artifact": "byte-fixtures/nostr-routing-v1-invalid-duplicate-relay.v1.json",
+      "coverage": [
+        "component update validation",
+        "duplicate relay rejection"
+      ],
+      "next": "Add unsorted, malformed URL, and oversized relay-list vectors."
+    }
+  ]
+}

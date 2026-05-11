@@ -76,6 +76,14 @@
   },
   "expected_trace": {
     "name": "three-client-message-exchange/v1",
+    "pending_resolutions": [
+      {
+        "step_index": 1,
+        "client": "alice",
+        "pending": "create",
+        "resolution": "confirmed"
+      }
+    ],
     "observations": [
       {
         "client": "alice",

@@ -124,8 +124,8 @@ impl<S: StorageProvider> EngineBuilder<S> {
         let peeler = self
             .peeler
             .ok_or_else(|| EngineError::Other("TransportPeeler is required".into()))?;
-        let identity =
-            Identity::generate(self.ciphersuite, identity_bytes).map_err(EngineError::Other)?;
+        let identity = Identity::load_or_generate(self.ciphersuite, identity_bytes, &self.storage)
+            .map_err(EngineError::Other)?;
 
         Ok(Engine {
             storage: self.storage,

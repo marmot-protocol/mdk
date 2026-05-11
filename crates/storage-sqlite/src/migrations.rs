@@ -1,5 +1,7 @@
 #[path = "migrations/0001_initial_schema.rs"]
 mod migration_0001_initial_schema;
+#[path = "migrations/0002_account_device_signers.rs"]
+mod migration_0002_account_device_signers;
 
 use crate::SqliteResultExt;
 use cgka_traits::storage::{StorageError, StorageResult};
@@ -11,11 +13,18 @@ pub(crate) struct Migration {
     pub(crate) apply: fn(&Transaction<'_>) -> StorageResult<()>,
 }
 
-const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    name: "0001_initial_schema",
-    apply: migration_0001_initial_schema::apply,
-}];
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "0001_initial_schema",
+        apply: migration_0001_initial_schema::apply,
+    },
+    Migration {
+        version: 2,
+        name: "0002_account_device_signers",
+        apply: migration_0002_account_device_signers::apply,
+    },
+];
 
 pub(crate) fn run_all(connection: &mut Connection) -> StorageResult<()> {
     run(connection, MIGRATIONS)
@@ -147,7 +156,10 @@ mod tests {
         let store = SqliteStorage::in_memory().unwrap();
         assert_eq!(
             applied_migrations(&store),
-            vec![(1, "0001_initial_schema".to_string())]
+            vec![
+                (1, "0001_initial_schema".to_string()),
+                (2, "0002_account_device_signers".to_string())
+            ]
         );
     }
 
@@ -159,13 +171,16 @@ mod tests {
 
         {
             let store = SqliteStorage::open_encrypted(&path, &key).unwrap();
-            assert_eq!(applied_migrations(&store).len(), 1);
+            assert_eq!(applied_migrations(&store).len(), 2);
         }
 
         let reopened = SqliteStorage::open_encrypted(&path, &key).unwrap();
         assert_eq!(
             applied_migrations(&reopened),
-            vec![(1, "0001_initial_schema".to_string())]
+            vec![
+                (1, "0001_initial_schema".to_string()),
+                (2, "0002_account_device_signers".to_string())
+            ]
         );
     }
 

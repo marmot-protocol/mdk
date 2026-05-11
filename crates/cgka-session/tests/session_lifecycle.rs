@@ -256,6 +256,63 @@ async fn session_ingest_surfaces_join_and_app_message_events() {
 }
 
 #[tokio::test]
+async fn reopened_creator_can_send_valid_group_messages() {
+    let dir = tempfile::tempdir().unwrap();
+    let alice_path = dir.path().join("alice.sqlite");
+    let bob_path = dir.path().join("bob.sqlite");
+    let key = SqlCipherKey::new("session reopened signer key").unwrap();
+    let mut alice = AccountDeviceSession::open(config(&alice_path, &key, b"alice")).unwrap();
+    let mut bob = AccountDeviceSession::open(config(&bob_path, &key, b"bob")).unwrap();
+
+    let bob_key_package = bob.fresh_key_package().await.unwrap();
+    let created = alice
+        .create_group(CreateGroupRequest {
+            name: "session-reopened-signer".into(),
+            description: "".into(),
+            members: vec![bob_key_package],
+            required_features: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (pending, welcome) = match &created.effects.publish[0] {
+        PublishWork::GroupCreated { pending, welcomes } => (*pending, welcomes[0].clone()),
+        other => panic!("expected GroupCreated publish work, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.ingest(welcome).await.unwrap();
+
+    drop(alice);
+    let mut alice = AccountDeviceSession::open(config(&alice_path, &key, b"alice")).unwrap();
+
+    let sent = alice
+        .send(SendIntent::AppMessage {
+            group_id: created.group_id.clone(),
+            payload: b"hello after restart".to_vec(),
+        })
+        .await
+        .unwrap();
+    let app_msg = match &sent.publish[0] {
+        PublishWork::ApplicationMessage { msg } => route(msg.clone(), &created.group_id),
+        other => panic!("expected application publish work, got {other:?}"),
+    };
+
+    let received = bob.ingest(app_msg).await.unwrap();
+    assert_eq!(
+        received.outcome,
+        cgka_traits::ingest::IngestOutcome::Processed
+    );
+    assert_eq!(
+        received.effects.events,
+        vec![GroupEvent::MessageReceived {
+            group_id: created.group_id,
+            sender: alice.self_id(),
+            payload: b"hello after restart".to_vec(),
+        }]
+    );
+}
+
+#[tokio::test]
 async fn session_ingest_drains_auto_publish_work() {
     let dir = tempfile::tempdir().unwrap();
     let key = SqlCipherKey::new("session auto publish key").unwrap();

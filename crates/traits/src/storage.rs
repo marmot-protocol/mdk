@@ -148,6 +148,30 @@ pub trait ConvergencePolicyStorage {
     fn convergence_policy(&self, group_id: &GroupId) -> StorageResult<Option<Vec<u8>>>;
 }
 
+// ── AccountDeviceSignerStorage ─────────────────────────────────────────────
+
+/// Account-device-local binding from Marmot identity to MLS signer lookup key.
+///
+/// OpenMLS stores signature keypairs keyed by their MLS signing public key.
+/// Marmot sessions are opened from stable identity bytes instead. For the
+/// Nostr-backed profile, those identity bytes are the Nostr public key. This
+/// binding lets a session recover which MLS signing keypair belongs to that
+/// Marmot account-device identity. Key material itself remains in OpenMLS
+/// storage.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountDeviceSignerBinding {
+    pub marmot_identity: MemberId,
+    pub mls_signature_public_key: Vec<u8>,
+}
+
+pub trait AccountDeviceSignerStorage {
+    fn put_account_device_signer(&self, binding: &AccountDeviceSignerBinding) -> StorageResult<()>;
+    fn account_device_signer(
+        &self,
+        marmot_identity: &MemberId,
+    ) -> StorageResult<Option<AccountDeviceSignerBinding>>;
+}
+
 // ── StorageProvider aggregate ───────────────────────────────────────────────
 
 /// The single storage type parameter carried by the engine.
@@ -162,6 +186,7 @@ pub trait StorageProvider:
     + WelcomeStorage
     + CapabilityStorage
     + ConvergencePolicyStorage
+    + AccountDeviceSignerStorage
     + Send
     + Sync
 {

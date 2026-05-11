@@ -135,3 +135,16 @@ The next engine-centered pass should produce:
 
 The Nostr relay-plane work should proceed only far enough to make that
 integration map honest.
+
+## Started Artifacts
+
+- Vector manifest:
+  [`../../../crates/cgka-conformance-simulator/vectors/manifest.v1.json`](../../../crates/cgka-conformance-simulator/vectors/manifest.v1.json)
+- Byte fixture schema:
+  [`../../../crates/cgka-conformance-simulator/vectors/byte-fixtures/schema.v1.json`](../../../crates/cgka-conformance-simulator/vectors/byte-fixtures/schema.v1.json)
+- First app-component byte fixtures:
+  [`../../../crates/cgka-conformance-simulator/vectors/byte-fixtures/`](../../../crates/cgka-conformance-simulator/vectors/byte-fixtures/)
+- First pending rollback scenario vector:
+  [`../../../crates/cgka-conformance-simulator/vectors/publish-fail.v1.json`](../../../crates/cgka-conformance-simulator/vectors/publish-fail.v1.json)
+- whitenoise-rs shim map and friction list:
+  [`whitenoise-integration-map.md`](./whitenoise-integration-map.md)

@@ -4,7 +4,10 @@
 //! implementations can drive the same logical client operations, then compare
 //! their observed trace to the fixture's expected trace.
 
-use crate::{ClientBuilder, HarnessClient, ScenarioTrace, TransportBus, observe_client};
+use crate::{
+    ClientBuilder, HarnessClient, PendingResolutionObservation, ScenarioTrace, TransportBus,
+    observe_client,
+};
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
 use cgka_traits::engine::KeyPackage;
@@ -114,6 +117,8 @@ pub struct ScenarioReport {
     pub expected_trace: Option<ScenarioTrace>,
     pub observed_trace: Option<ScenarioTrace>,
     pub step_log: Vec<ScenarioStepLogEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_resolution_observations: Vec<PendingResolutionObservation>,
     pub recovery_observations: Vec<crate::ForkRecoveryObservation>,
     pub epoch_change_observations: Vec<EpochChangeReportObservation>,
     pub app_invalidation_observations: Vec<AppInvalidationReportObservation>,
@@ -229,6 +234,7 @@ pub async fn run_scenario_report(
     }
 
     let mut pending_refs = HashMap::new();
+    let mut pending_resolutions = Vec::new();
     let mut observations = Vec::new();
     let mut step_log = Vec::new();
 
@@ -262,13 +268,27 @@ pub async fn run_scenario_report(
             }
             ScenarioStep::ConfirmPending { client, pending } => {
                 let pending_ref = take_pending(&mut pending_refs, pending, step_index)?;
+                let client_label = client.clone();
                 let client = client_mut(&mut clients, client, step_index)?;
                 client.confirm(pending_ref).await;
+                pending_resolutions.push(PendingResolutionObservation {
+                    step_index,
+                    client: client_label,
+                    pending: pending.clone(),
+                    resolution: "confirmed".into(),
+                });
             }
             ScenarioStep::FailPending { client, pending } => {
                 let pending_ref = take_pending(&mut pending_refs, pending, step_index)?;
+                let client_label = client.clone();
                 let client = client_mut(&mut clients, client, step_index)?;
                 client.fail(pending_ref).await;
+                pending_resolutions.push(PendingResolutionObservation {
+                    step_index,
+                    client: client_label,
+                    pending: pending.clone(),
+                    resolution: "rolled_back".into(),
+                });
             }
             ScenarioStep::SendAppMessage { sender, payload } => {
                 let sender = client_mut(&mut clients, sender, step_index)?;
@@ -355,8 +375,10 @@ pub async fn run_scenario_report(
 
     let observed_trace = ScenarioTrace {
         name: spec.name.clone(),
+        pending_resolutions,
         observations,
     };
+    let pending_resolution_observations = observed_trace.pending_resolutions.clone();
     let recovery_observations = observed_trace
         .observations
         .iter()
@@ -402,6 +424,7 @@ pub async fn run_scenario_report(
         expected_trace,
         observed_trace: Some(observed_trace),
         step_log,
+        pending_resolution_observations,
         recovery_observations,
         epoch_change_observations,
         app_invalidation_observations,

@@ -34,11 +34,12 @@ Written to be readable in 5 minutes each, shareable as a package.
 | [`overview/nostr-role.md`](./overview/nostr-role.md) | Nostr's three distinct roles — identity, app message format, transport — and which are pluggable. |
 | [`overview/nostr-account-transport.md`](./overview/nostr-account-transport.md) | Working note on Nostr user directory, account bootstrap, relay plane, group routing, and relay safety policy. |
 | [`overview/cgka-engine-quality-and-vectors.md`](./overview/cgka-engine-quality-and-vectors.md) | Near-term engine quality target: whitenoise-rs integration, chaos coverage, scenario vectors, and byte-level vectors. |
+| [`overview/whitenoise-integration-map.md`](./overview/whitenoise-integration-map.md) | First shim map from whitenoise-rs account/relay flows to the current engine/session/account boundary. |
 | [`overview/observability.md`](./overview/observability.md) | Privacy-safe tracing/logging rules and the repo-wide tracing audit guardrail. |
 | [`overview/current-state.md`](./overview/current-state.md) | Implementations, merged MIPs, the current CGKA engine workspace, and known gaps. |
 | [`overview/direction.md`](./overview/direction.md) | Where we're going after the CGKA engine/convergence work. |
 
-**Read order for a new engineer:** executive-summary → protocol-boundary → target-architecture → capability-negotiation → nostr-role → cgka-engine-quality-and-vectors → observability → custom-extensions → current-state → direction.
+**Read order for a new engineer:** executive-summary → protocol-boundary → target-architecture → capability-negotiation → nostr-role → cgka-engine-quality-and-vectors → whitenoise-integration-map → observability → custom-extensions → current-state → direction.
 
 ---
 

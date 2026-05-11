@@ -10,6 +10,7 @@ members = [
     "crates/transport-nostr-peeler",
     "crates/transport-nostr-adapter",
     "crates/marmot-account",
+    "crates/marmot-lab",
 ]
 
 [workspace.package]
@@ -43,6 +44,7 @@ sha2 = "0.10"
 chacha20poly1305 = "0.10"
 nostr = { version = "0.44.2", default-features = false, features = ["std", "nip59"] }
 nostr-sdk = { version = "0.44", features = ["nip59"] }
+nostr-relay-builder = "0.44"
 rusqlite = { version = "0.32", features = ["bundled-sqlcipher-vendored-openssl"] }
 tempfile = "3"
 
@@ -61,3 +63,4 @@ cgka-conformance-simulator = { path = "crates/cgka-conformance-simulator" }
 transport-nostr-peeler = { path = "crates/transport-nostr-peeler" }
 transport-nostr-adapter = { path = "crates/transport-nostr-adapter" }
 marmot-account = { path = "crates/marmot-account" }
+marmot-lab = { path = "crates/marmot-lab" }

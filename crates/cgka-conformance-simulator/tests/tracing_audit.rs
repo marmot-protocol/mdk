@@ -120,6 +120,10 @@ struct TraceInvocation {
 }
 
 fn is_cli_binary(path: &Path) -> bool {
+    if path.file_name().and_then(|name| name.to_str()) == Some("main.rs") {
+        return true;
+    }
+
     path.components()
         .any(|component| matches!(component.as_os_str().to_str(), Some("bin")))
 }

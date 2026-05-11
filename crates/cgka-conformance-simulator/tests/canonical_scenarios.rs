@@ -5,10 +5,10 @@
 //! behavior into seeded random send/leave sequences.
 
 use cgka_conformance_simulator::{
-    ClientBuilder, EpochChangeObservation, HarnessClient, ScenarioSpec, ScenarioStep,
-    ScenarioTrace, TransportBus, VectorFixture, generate_convergence_e2e_delivery_family,
-    generate_send_leave_family, observe_client, run_generated_case_report, run_scenario_report,
-    run_scenario_spec,
+    ClientBuilder, EpochChangeObservation, HarnessClient, PendingResolutionObservation,
+    ScenarioSpec, ScenarioStep, ScenarioTrace, TransportBus, VectorFixture,
+    generate_convergence_e2e_delivery_family, generate_send_leave_family, observe_client,
+    run_generated_case_report, run_scenario_report, run_scenario_spec,
 };
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::openmls_projection::{OpenMlsContentKind, project_mls_message};
@@ -219,6 +219,12 @@ async fn three_client_message_exchange_vector_is_stable() {
 
     let trace = ScenarioTrace {
         name: "three-client-message-exchange/v1".into(),
+        pending_resolutions: vec![PendingResolutionObservation {
+            step_index: 1,
+            client: "alice".into(),
+            pending: "create".into(),
+            resolution: "confirmed".into(),
+        }],
         observations: vec![
             observe_client("alice", &mut alice),
             observe_client("bob", &mut bob),
@@ -230,6 +236,12 @@ async fn three_client_message_exchange_vector_is_stable() {
         trace,
         ScenarioTrace {
             name: "three-client-message-exchange/v1".into(),
+            pending_resolutions: vec![PendingResolutionObservation {
+                step_index: 1,
+                client: "alice".into(),
+                pending: "create".into(),
+                resolution: "confirmed".into(),
+            }],
             observations: vec![
                 cgka_conformance_simulator::ClientObservation {
                     client: "alice".into(),
@@ -347,6 +359,15 @@ async fn scenario_spec_supports_publish_fail() {
     assert_eq!(trace.observations[0].client, "alice");
     assert_eq!(trace.observations[0].epoch, 0);
     assert_eq!(trace.observations[0].member_count, 1);
+    assert_eq!(
+        trace.pending_resolutions,
+        vec![PendingResolutionObservation {
+            step_index: 1,
+            client: "alice".into(),
+            pending: "create".into(),
+            resolution: "rolled_back".into(),
+        }]
+    );
 }
 
 #[tokio::test]
@@ -723,6 +744,7 @@ async fn scenario_report_records_mismatch_as_invariant_failure() {
     };
     let expected = ScenarioTrace {
         name: spec.name.clone(),
+        pending_resolutions: vec![],
         observations: vec![],
     };
 
@@ -789,6 +811,12 @@ async fn three_client_message_exchange_trace() -> ScenarioTrace {
 
     ScenarioTrace {
         name: "three-client-message-exchange/v1".into(),
+        pending_resolutions: vec![PendingResolutionObservation {
+            step_index: 1,
+            client: "alice".into(),
+            pending: "create".into(),
+            resolution: "confirmed".into(),
+        }],
         observations: vec![
             observe_client("alice", &mut alice),
             observe_client("bob", &mut bob),
@@ -913,6 +941,7 @@ async fn deliberate_fork_via_harness() {
     );
     let trace = ScenarioTrace {
         name: "deliberate-fork-recovery/v1".into(),
+        pending_resolutions: vec![],
         observations: vec![
             observe_client("alice", &mut alice),
             observe_client("bob", &mut bob),
@@ -1103,10 +1132,16 @@ async fn canonical_vector_fixtures_match_generated_traces() {
     // does not work for fork-recovery scenarios. See
     // `docs/marmot-architecture/distributed-convergence.md` (Track A) for
     // the path forward.
-    let fixtures = [(
-        "three-client-message-exchange.v1.json",
-        include_str!("../vectors/three-client-message-exchange.v1.json"),
-    )];
+    let fixtures = [
+        (
+            "three-client-message-exchange.v1.json",
+            include_str!("../vectors/three-client-message-exchange.v1.json"),
+        ),
+        (
+            "publish-fail.v1.json",
+            include_str!("../vectors/publish-fail.v1.json"),
+        ),
+    ];
 
     for (fixture_name, contents) in fixtures {
         let fixture: VectorFixture = serde_json::from_str(contents).expect("fixture JSON parses");

@@ -1,0 +1,35 @@
+{
+  "fixture_name": "marmot.transport.nostr.routing.v1/update-valid-two-relays/v1",
+  "fixture_version": "1",
+  "vector_type": "app_component_update",
+  "component": {
+    "id": "0x8004",
+    "name": "marmot.transport.nostr.routing.v1",
+    "document": "spec/app-components/nostr-routing-v1.md"
+  },
+  "encoding": {
+    "format": "TLS presentation language",
+    "notes": [
+      "bytes.hex is the MarmotNostrRoutingUpdateV1 payload, not the AppDataUpdate proposal wrapper.",
+      "The update payload contains only relays<V>.",
+      "MarmotNostrRelayV1.url<1..512> is encoded with a two-byte vector length.",
+      "relays<V> is encoded with a four-byte vector length."
+    ]
+  },
+  "bytes": {
+    "hex": "0000002e00157773733a2f2f72656c61792d612e6578616d706c6500157773733a2f2f72656c61792d622e6578616d706c65"
+  },
+  "expected": {
+    "valid": true,
+    "fields": {
+      "relays": [
+        "wss://relay-a.example",
+        "wss://relay-b.example"
+      ]
+    },
+    "errors": []
+  },
+  "notes": [
+    "There is no v1 update that changes nostr_group_id."
+  ]
+}

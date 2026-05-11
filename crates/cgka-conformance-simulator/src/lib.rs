@@ -42,5 +42,6 @@ pub use scenario::{
 };
 pub use vector::{
     AppInvalidationObservation, ClientObservation, EpochChangeObservation, ForkRecoveryObservation,
-    RecoveryOrderingKeyObservation, ScenarioTrace, VectorFixture, observe_client,
+    PendingResolutionObservation, RecoveryOrderingKeyObservation, ScenarioTrace, VectorFixture,
+    observe_client,
 };

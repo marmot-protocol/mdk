@@ -113,6 +113,7 @@ This repository now has the main engine candidate:
 
 The current workspace can exercise the peeler-ingest boundary through
 in-memory clients, reopen encrypted SQLCipher-backed account-device sessions,
+preserve MLS signing identity across those reopens,
 drive a real `AccountDeviceSession` + `NostrTransportAdapter` +
 `NostrMlsPeeler` stack over an in-memory relay client, cover publish ack/fail
 resolution and delivery/invite-lifecycle chaos cases at that stack boundary,
@@ -153,6 +154,11 @@ invalidations, and test generated delivery variants.
   plan is still thin. We need a manifest that names which cases are portable,
   Rust-only, generated, or byte-level, plus a fixture schema for exact
   component and wire-format bytes.
+- **whitenoise-rs integration map** — the first integration path is likely a
+  shim over `cgka-session` / `marmot-account`, with whitenoise-rs keeping
+  account setup, Nostr directory state, relay-list repair, and shared relay
+  plane ownership. The current friction points are tracked in
+  [`whitenoise-integration-map.md`](./whitenoise-integration-map.md).
 - **Deep same-epoch app-message reordering** — the seeded stack-chaos runner
   keeps generated app-message reordering shallow. A deeper generated reversal
   exposed OpenMLS `TooDistantInThePast` behavior in the message generation
@@ -174,5 +180,6 @@ invalidations, and test generated delivery variants.
 - Direction: [`direction.md`](./direction.md)
 - Engine quality and vectors: [`cgka-engine-quality-and-vectors.md`](./cgka-engine-quality-and-vectors.md)
 - Nostr account transport notes: [`nostr-account-transport.md`](./nostr-account-transport.md)
+- whitenoise-rs integration map: [`whitenoise-integration-map.md`](./whitenoise-integration-map.md)
 - Canonicalization contract: [`../cgka-engine-canonicalization-contract.md`](../cgka-engine-canonicalization-contract.md)
 - Distributed convergence: [`../distributed-convergence.md`](../distributed-convergence.md)

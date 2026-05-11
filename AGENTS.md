@@ -31,6 +31,7 @@ This repo owns the candidate CGKA engine workspace:
 | SQLite storage | `crates/storage-sqlite/AGENTS.md` |
 | Nostr transport adapter | `crates/transport-nostr-adapter/AGENTS.md` |
 | Nostr transport peeler | `crates/transport-nostr-peeler/AGENTS.md` |
+| Local two-client lab | `crates/marmot-lab/README.md` |
 | Multi-client harness / vectors | `crates/cgka-conformance-simulator/AGENTS.md` |
 | Architecture docs | `docs/AGENTS.md` and `docs/marmot-architecture/AGENTS.md` |
 | Spec rewrite sandbox | `spec/AGENTS.md` |

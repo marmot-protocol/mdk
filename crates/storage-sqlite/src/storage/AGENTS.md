@@ -7,6 +7,7 @@ Map for Marmot-side SQLite tables.
 | Module | Owns |
 | --- | --- |
 | `groups.rs` | Group CRUD, group listing, cascade delete. |
+| `account_device_signer.rs` | Marmot identity to MLS signing-key binding. |
 | `messages.rs` | Message rows and `MessageStorage` dispatch. |
 | `snapshots/` | Snapshot capture, rollback, listing, release. |
 | `outbound.rs` | Durable queued outbound intents. |

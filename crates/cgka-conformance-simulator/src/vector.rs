@@ -21,7 +21,17 @@ pub struct VectorFixture {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScenarioTrace {
     pub name: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_resolutions: Vec<PendingResolutionObservation>,
     pub observations: Vec<ClientObservation>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingResolutionObservation {
+    pub step_index: usize,
+    pub client: String,
+    pub pending: String,
+    pub resolution: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

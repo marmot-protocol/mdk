@@ -372,6 +372,34 @@ fn convergence_policy_is_group_scoped_and_snapshot_restored() {
     );
 }
 
+// ── AccountDeviceSignerStorage ─────────────────────────────────────────────
+
+#[test]
+fn account_device_signer_binding_roundtrip_is_account_scoped() {
+    let store = MemoryStorage::new();
+    let alice = AccountDeviceSignerBinding {
+        marmot_identity: member_id(1),
+        mls_signature_public_key: vec![1, 2, 3],
+    };
+    let bob = AccountDeviceSignerBinding {
+        marmot_identity: member_id(2),
+        mls_signature_public_key: vec![4, 5, 6],
+    };
+
+    store.put_account_device_signer(&alice).unwrap();
+    store.put_account_device_signer(&bob).unwrap();
+
+    assert_eq!(
+        store.account_device_signer(&member_id(1)).unwrap(),
+        Some(alice)
+    );
+    assert_eq!(
+        store.account_device_signer(&member_id(2)).unwrap(),
+        Some(bob)
+    );
+    assert_eq!(store.account_device_signer(&member_id(9)).unwrap(), None);
+}
+
 #[test]
 fn release_drops_the_snapshot_only() {
     let store = MemoryStorage::new();

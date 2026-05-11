@@ -1,3 +1,4 @@
+mod account_device_signer;
 mod capabilities;
 mod convergence_policy;
 mod groups;

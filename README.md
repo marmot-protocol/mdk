@@ -13,6 +13,9 @@ Marmot protocol work.
 - `crates/marmot-account` is the thin future app-core shell over a session and
   transport adapter: account activation, transport routing policy, KeyPackage
   publication, and publish confirmation/rollback.
+- `crates/marmot-lab` provides a local two-client CLI lab over a file-backed
+  fake relay for fast end-to-end checks with real sessions and the Nostr
+  adapter stack.
 - `crates/storage-memory` provides an in-memory backend for tests and simulator
   runs.
 - `crates/storage-sqlite` provides SQLCipher-backed persistence for Marmot
@@ -42,8 +45,9 @@ Marmot protocol work.
 7. `crates/storage-sqlite/README.md`
 8. `crates/transport-nostr-adapter/README.md`
 9. `crates/transport-nostr-peeler/README.md`
-10. `spec/README.md`
-11. `formal/tamarin/README.md`
+10. `crates/marmot-lab/README.md`
+11. `spec/README.md`
+12. `formal/tamarin/README.md`
 
 ## Common commands
 
