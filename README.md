@@ -1,19 +1,32 @@
 # darkmatter
 
-Candidate Marmot v2 protocol draft and CGKA engine workspace.
+Candidate Marmot v2 protocol draft, CGKA engine, and conformance workspace.
 
-This repository is for team review of two connected pieces of work:
+This repository is for team review. It contains:
 
 - the Marmot v2 protocol draft in `spec/`;
-- the OpenMLS-backed CGKA engine and the conformance simulator that tests it.
+- the OpenMLS-backed CGKA engine in `crates/cgka-engine`;
+- the simulator, vector fixtures, property tests, and Tamarin model used to test convergence behavior.
 
 The code also includes storage, session, account, Nostr transport, and lab crates. Those crates exist to exercise the
 engine boundary and show the integration path toward MDK/whitenoise replacement work. MDK remains the deployed Rust
 protocol implementation until this draft and engine are adopted.
 
-## What To Review First
+## Start Here
 
-Most reviewers should start with one of these two paths.
+If you are landing in this repo for the first time, read these files in order:
+
+1. [`spec/README.md`](spec/README.md) - status and map for the Marmot v2 draft.
+2. [`crates/cgka-engine/README.md`](crates/cgka-engine/README.md) - what the engine owns and what it leaves out.
+3. [`crates/cgka-conformance-simulator/README.md`](crates/cgka-conformance-simulator/README.md) - how scenarios,
+   vectors, generated chaos, and property tests work.
+4. [`formal/tamarin/README.md`](formal/tamarin/README.md) - how the formal model maps back to the Rust tests.
+
+After that, choose the review lane that matches the question in front of you.
+
+## Review Lanes
+
+Most reviewers should use one of these two paths.
 
 ### Protocol Draft
 
@@ -31,10 +44,10 @@ with the current MIPs.
 
 The existing MIPs remain the current production reference until this draft is adopted.
 
-### CGKA Engine And Conformance
+### CGKA Engine, Conformance, And Proofs
 
 Use this path when reviewing the engine state machine, convergence model, publish lifecycle, retained history, testing,
-or portable scenarios.
+portable scenarios, or formal proofs.
 
 1. [`crates/cgka-engine/README.md`](crates/cgka-engine/README.md)
 2. [`docs/marmot-architecture/cgka-engine-spec.md`](docs/marmot-architecture/cgka-engine-spec.md)
