@@ -11,7 +11,7 @@ Map for simulator tests.
 | `canonicalization_contract.rs` | Executable canonicalization contract behavior, including sync-state edge cases. |
 | `generated_policy_cases.rs` | Rust consumer for bounded policy cases shared with Tamarin generation. |
 | `openmls_replay_probe.rs` | OpenMLS replay and candidate materialization probes. |
-| `proptest_invariants.rs` | Property tests over generated intent sequences and delivery profiles. |
+| `proptest_invariants.rs` | Property tests for selector order, canonicalization, capability matrices, lifecycle/restart behavior, generated send/leave histories, and delivery-profile convergence. |
 | `report_runner.rs` | Report artifact runner coverage. |
 | `tracing_audit.rs` | Repo-wide production tracing privacy audit. |
 
@@ -21,6 +21,8 @@ Map for simulator tests.
 - Promote a generated failure into a vector when it becomes a regression case.
 - Keep harness tests at the `HarnessClient`/`TransportBus` level. Extend the
   harness API instead of reaching into engine internals.
+- Keep default property-test counts fast. Use `conformance-slow` for the wider
+  pass, with case counts chosen by test cost.
 
 ## Verification
 

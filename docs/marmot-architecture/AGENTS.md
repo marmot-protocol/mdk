@@ -36,6 +36,6 @@ Agent map for the Marmot architecture docs.
 - Keep Nostr language separated into identity, app message format, and
   transport roles.
 - Keep implementation architecture here. Put implementation-neutral protocol
-  laws, wire surfaces, and app component dictionaries in `../../spec/`.
+  principles, wire surfaces, and app components in `../../spec/`.
 - If Tamarin or Rust tests add a named scenario, mirror the name in the docs
   when that scenario becomes part of the contract.

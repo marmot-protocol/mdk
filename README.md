@@ -34,6 +34,33 @@ Marmot protocol work.
 - `spec/` is the rewrite sandbox for the Marmot protocol spec. It is organized
   by protocol surface instead of MIP number.
 
+## Testing map
+
+The engine tests and simulator answer different questions.
+
+- `cargo test -p cgka-engine` checks the local engine boundary: one engine call,
+  one storage backend, one expected outcome.
+- `cargo test -p cgka-conformance-simulator` checks many clients running the
+  engine together through the Nostr peeler and an in-memory transport bus. It
+  also runs the checked-in vector fixtures.
+- `cargo test -p cgka-conformance-simulator --features conformance-slow` raises
+  the property-test case counts for a slower pre-release pass.
+
+The normal test command already validates the portable JSON vector fixtures.
+Run the report command when you want one JSON report per fixture plus a
+human-readable pass/fail summary:
+
+```sh
+cargo run -p cgka-conformance-simulator --bin cgka-conformance-simulator-report -- \
+  --vectors crates/cgka-conformance-simulator/vectors \
+  --out target/cgka-conformance-simulator-reports
+```
+
+Start with [`crates/cgka-engine/README.md`](crates/cgka-engine/README.md) for
+the engine-level story, then use
+[`crates/cgka-conformance-simulator/README.md`](crates/cgka-conformance-simulator/README.md)
+for scenarios, vectors, generated chaos cases, reports, and property tests.
+
 ## Start here
 
 1. `docs/marmot-architecture/index.md`

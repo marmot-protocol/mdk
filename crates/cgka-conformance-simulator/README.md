@@ -1,25 +1,72 @@
 # cgka-conformance-simulator
 
-In-process multi-client simulator for the CGKA engine. Lets us replay scripted
-scenarios and run property-based invariants against `Engine<MemoryStorage>`
-without real relays. Transport wrapping still goes through the Nostr peeler, so
-group messages use the Marmot kind-445 envelope and welcomes use NIP-59 gift
-wraps over the in-memory bus.
+In-process multi-client simulator for the CGKA engine.
+
+The engine crate proves local engine rules. This crate asks the bigger question:
+if several clients run that engine and the network behaves badly, do they still
+end up with the same group state?
+
+The simulator does not use real relays. It runs `Engine<MemoryStorage>` clients
+against a deterministic in-memory `TransportBus`. Transport wrapping still goes
+through the real Nostr peeler, so group messages use the Marmot kind-445
+envelope and welcomes use NIP-59 gift wraps before the bus delivers them.
 
 ## What this crate gives you
 
-- `TransportBus` — an in-memory message bus with seeded scheduling, partition support, broadcast and addressed delivery (for welcomes), and replay hooks.
-- `HarnessClient` — wraps `Engine<MemoryStorage>` + the real Nostr transport peeler while keeping delivery in memory.
-- `ScenarioSpec` — a serializable v1 input contract for deterministic scripted scenarios, including explicit queue faults and partitions.
+- `TransportBus` — an in-memory message bus with seeded scheduling, partition
+  support, broadcast and addressed delivery for welcomes, and replay hooks.
+- `HarnessClient` — wraps `Engine<MemoryStorage>` and the real Nostr transport
+  peeler while keeping delivery in memory.
+- `ScenarioSpec` — a serializable v1 input contract for deterministic scripted
+  scenarios, including explicit queue faults and partitions.
 - `VectorFixture` — portable JSON fixtures pairing runnable scenario input
   with exact traces or semantic expected outcomes.
-- `ScenarioReport` — serializable run artifacts with metadata, expected/observed traces, step logs, recoveries, and invariant failures.
+- `ScenarioReport` — serializable run artifacts with metadata, expected and
+  observed traces, step logs, recoveries, and expectation failures.
 - `cgka-conformance-simulator-report` — a small CLI that runs generated
   scenario families, writes JSON reports, and emits fixture candidates for
   generated cases.
-- `proptest_support` — strategies that generate arbitrary typed `SendIntent` sequences for property-based tests.
+- `proptest_support` — strategies that generate arbitrary typed `SendIntent`
+  sequences for property-based tests.
 
-## Property Tests
+## Testing layers
+
+| Layer | Files | What it catches |
+|---|---|---|
+| Scripted scenarios | [`tests/canonical_scenarios.rs`](tests/canonical_scenarios.rs) | Known multi-client flows and named regressions. |
+| Vector fixtures | [`vectors/`](vectors/) | Portable conformance cases that other implementations can run. |
+| Generated families | [`src/family.rs`](src/family.rs), report CLI | Seeded adversarial cases, report artifacts, and fixture candidates. |
+| Property tests | [`tests/proptest_invariants.rs`](tests/proptest_invariants.rs) | Broad invariant checks over many generated inputs. |
+| Replay probes | [`tests/openmls_replay_probe.rs`](tests/openmls_replay_probe.rs) | Byte-first replay behavior and fixture materialization probes. |
+
+## Run the tests
+
+```sh
+# Default: scripted scenarios plus normal property-test case counts.
+cargo test -p cgka-conformance-simulator
+
+# Slower validation: raises property-test case counts according to test cost.
+cargo test -p cgka-conformance-simulator --features conformance-slow
+```
+
+To run every portable vector fixture and write a report for each one:
+
+```sh
+cargo run -p cgka-conformance-simulator --bin cgka-conformance-simulator-report -- \
+  --vectors crates/cgka-conformance-simulator/vectors \
+  --out target/cgka-conformance-simulator-reports
+```
+
+The normal `cargo test -p cgka-conformance-simulator` run already validates the
+top-level vector fixtures and checks the vector manifest / byte-fixture files.
+Use the report command when you want saved JSON reports and a human-readable
+pass/fail summary outside the test harness.
+
+The report command exits non-zero when any fixture expectation fails. Each
+report includes the exact scenario input, observed trace, flattened recovery and
+epoch observations, and the mismatched expected/actual JSON.
+
+## Property tests
 
 Property tests live in
 [`tests/proptest_invariants.rs`](tests/proptest_invariants.rs). They generate
@@ -32,16 +79,6 @@ publish confirm/fail, and group-data update publish confirm/fail.
 
 Cheap symbolic properties run more cases. Harness-heavy properties use smaller
 default counts and larger `conformance-slow` counts.
-
-## Run the tests
-
-```sh
-# Default: scripted scenarios plus the normal proptest case counts.
-cargo test -p cgka-conformance-simulator
-
-# Pre-release validation: slow properties raise their case count to 1000.
-cargo test -p cgka-conformance-simulator --features conformance-slow
-```
 
 ## Canonical vector fixtures
 
@@ -63,14 +100,14 @@ from `scenario`, serialize their observed trace into the same shape, and
 compare it with either `expected_trace` or `expected_outcomes`. The trace
 intentionally avoids OpenMLS internals.
 
-The next vector pass is tracked in
+The current vector work is tracked in
 [`docs/marmot-architecture/overview/cgka-engine-quality-and-vectors.md`](../../docs/marmot-architecture/overview/cgka-engine-quality-and-vectors.md).
-That pass has started with [`vectors/manifest.v1.json`](vectors/manifest.v1.json)
-and [`vectors/byte-fixtures/schema.v1.json`](vectors/byte-fixtures/schema.v1.json).
-This crate now has first app-component byte fixtures and portable scenario
-vectors for message exchange, pending rollback, invites, group-data updates,
-queue faults, partition repair, leave, delayed past-epoch app delivery, and
-fork recovery. It does not yet have a full byte-level wire-event suite.
+The crate now has [`vectors/manifest.v1.json`](vectors/manifest.v1.json),
+[`vectors/byte-fixtures/schema.v1.json`](vectors/byte-fixtures/schema.v1.json),
+first app-component byte fixtures, and portable scenario vectors for message
+exchange, pending rollback, invites, group-data updates, queue faults,
+partition repair, leave, delayed past-epoch app delivery, and fork recovery. It
+does not yet have a full byte-level wire-event suite.
 
 `convergence-e2e-group-events/v1` is kept as an in-tree bridge scenario rather
 than a portable JSON fixture. Raw harness messages enter through the Nostr
@@ -236,18 +273,6 @@ Reports are written as one file per case, for example
 `target/cgka-conformance-simulator-reports/send-leave-v1-seed-42-case-0.json`.
 Generated family runs also write fixture candidates such as
 `target/cgka-conformance-simulator-reports/convergence-chaos-v1-seed-42-case-0-fixture.v1.json`.
-
-To run every portable vector fixture and print a pass/fail summary:
-
-```sh
-cargo run -p cgka-conformance-simulator --bin cgka-conformance-simulator-report -- \
-  --vectors crates/cgka-conformance-simulator/vectors \
-  --out target/cgka-conformance-simulator-reports
-```
-
-The command exits non-zero when any fixture has expectation failures. Each
-report includes the scenario input, observed trace, flattened observations, and
-the exact expectation failures.
 
 ## When to use the harness vs. integration tests
 

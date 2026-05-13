@@ -60,7 +60,7 @@ families, and Tamarin models have landed on `master`.
 | 3 — State-machine types | ✅ | All in `cgka-traits`; `Box<dyn CgkaEngine + Send + Sync>` witness compiles |
 | 4 — Engine impl | ✅ | All 14 original tasks landed, plus `ForkRecoveryManager` for same-epoch commit races. |
 | 5 — Unit tests | ✅ | 5.1 trybuild deferred per plan edit; 5.4 **full 36-cell capability matrix landed** as a single parametrized test in `tests/capabilities.rs::capability_matrix_36_cells`; 5.7 witness compiles; 5.8 insta snapshots locked. |
-| 6 — Test harness | ✅ | Bus + client + 4 scripted scenarios green. Proptest depth: 4 properties — (a) true same-id replay via `bus.inject`; (b) convergence under Send+Leave intents; (b') convergence under varied `DeliveryProfile` (FIFO / Reverse / SeededRandom); (c) confirm-vs-fail rollback round trip. Slow gate (`--features conformance-slow`) lifts case counts to 200–1000. Fork scenario asserts deterministic convergence and records the rollback trace. |
+| 6 — Test harness | ✅ | Bus + client + 4 scripted scenarios green. Proptest depth at the original checkpoint: 4 properties — (a) true same-id replay via `bus.inject`; (b) convergence under Send+Leave intents; (b') convergence under varied `DeliveryProfile` (FIFO / Reverse / SeededRandom); (c) confirm-vs-fail rollback round trip. The later conformance pass expanded this into selector, canonicalization, capability, lifecycle/restart, send/leave, and delivery-profile properties. Slow gate (`--features conformance-slow`) raises counts according to test cost. Fork scenario asserts deterministic convergence and records the rollback trace. |
 | 7 — Docs + hygiene | ✅ | Per-crate `README.md` + `AGENTS.md` pair (cgka-engine, cgka-conformance-simulator) plus thin `README.md` for traits + storage-memory. `tests/AGENTS.md` documents the three-tier test layout. `docs/learnings.md` 2026-04-25 entry added. Clippy/fmt CI gates passing. |
 
 **Phase 4 detail (every task):**
@@ -186,7 +186,7 @@ Internal subsystems per `cgka-engine-design.md:214-233`. Each is a module inside
   - **(b) Convergence** — `prop_convergence_under_send_leave_sequence` + `prop_convergence_under_varied_delivery`: undisturbed clients agree on epoch after any sequence of Send+Leave intents, under any `DeliveryProfile`.
   - **(c) Rollback** — `prop_upgrade_confirm_or_fail_round_trip`: `upgrade_group_capabilities` followed by random `confirm_published` / `publish_failed` choice; assert epoch advances on confirm, rolls back on fail, and a post-rollback retry succeeds.
   - **(d) Event conservation** — folded into (b) via the convergence harness.
-- [x] Task 6.10. **[DONE 2026-04-25]** `cargo test -p cgka-conformance-simulator --features conformance-slow` lifts proptest case counts to 200–1000 per property. With the richer 6.8/6.9 surface in place, the slow run actually has new ground to cover (Send+Leave under three delivery profiles, true replay, rollback round trips). Confirmed runtime: ~28 s for the slow profile.
+- [x] Task 6.10. **[DONE 2026-04-25; superseded 2026-05-13]** `cargo test -p cgka-conformance-simulator --features conformance-slow` raises proptest case counts according to test cost. The original pass covered Send+Leave under three delivery profiles, true replay, and rollback round trips. The later pass added selector, canonicalization, capability, lifecycle/restart, and group-data publish properties, so old runtime numbers should not be treated as current.
 
 ### Phase 7 — Documentation + loose ends
 
@@ -204,7 +204,9 @@ Internal subsystems per `cgka-engine-design.md:214-233`. Each is a module inside
 - `spike/` workspace independently `cargo check`-s green.
 - Every `EpochState` transition, every `StaleReason` variant, and every `EngineError` variant is exercised by at least one unit test.
 - The 3-client happy-path harness scenario passes. The welcome-before-commit scenario reproduces `StaleReason::AlreadyAtEpoch`. The SelfRemove scenario converges without `ForkedEpoch`. The concurrent-invite scenario recovers to one deterministic winner and leaves both active clients at the same epoch/member set.
-- Proptest suite runs default (small-case) in < 30s and passes in CI; the `--features conformance-slow` suite (1000+ cases) passes locally.
+- Proptest suite runs default small-case counts in CI; the
+  `--features conformance-slow` suite raises counts according to test cost and
+  should pass locally before release-style checkpoints.
 - `feature_status()` returns `Available` / `Upgradeable` / `Unavailable` correctly differentiated for a group with mixed-capability members (validating the `CapabilityStorage` cache closes the OpenMLS pub(crate) gap from `docs/learnings.md:125`).
 - `invite()` with a KeyPackage missing a required capability returns `EngineError::MissingRequiredCapabilities { required, had }` with populated sets — no stringly-typed error leaks.
 - No Nostr types appear anywhere in `crates/traits/`, `crates/cgka-engine/`, or `crates/storage-memory/`. (grep for `nostr` in those crates returns zero hits outside of test names / comments.)
@@ -249,7 +251,7 @@ Internal subsystems per `cgka-engine-design.md:214-233`. Each is a module inside
 | ~~Task 5.4 exhaustive capability matrix~~ | ~~1 hr~~ | DONE 2026-04-25 | `capability_matrix_36_cells` in `tests/capabilities.rs`. |
 | ~~Task 4.2 `update_group_data` impl~~ | ~~1 hr~~ | DONE | Landed 2026-04-25 in `crates/cgka-engine/src/update_group_data.rs`. 5 tests in `tests/update_group_data.rs`. |
 | ~~Task 2.2 snapshot/rollback wiring into engine~~ | n/a | DONE | Publish rollback still uses `MlsGroup::clear_pending_commit`; fork recovery uses `MessageStorage` snapshots. |
-| ~~Task 6.10 broader slow gate~~ | n/a | DONE 2026-04-25 | `--features conformance-slow` runs 200–1000 cases per property; ~28 s wall time. |
+| ~~Task 6.10 broader slow gate~~ | n/a | DONE 2026-04-25; updated 2026-05-13 | `--features conformance-slow` now raises case counts according to property cost; old 200–1000 case and runtime notes only describe the original four-property checkpoint. |
 | ~~Recovery observations in test vectors~~ | ~~1-2 hr~~ | DONE 2026-05-04 | `GroupEvent::ForkRecovered` + `ScenarioTrace::recoveries` capture winner/incumbent ordering keys, invalidated message, source epoch, and recovered epoch. |
 
 **Status as of 2026-05-04:** every original task in this plan is closed. Future-roadmap items (SQLite storage, KeyPackage refresh scheduling, external vector fixture packaging, transport adapters, FFI) live in their own plans or the next implementation slice.

@@ -73,7 +73,15 @@ The first working `ForkRecoveryManager` is in `crates/cgka-engine/src/fork_recov
 
 Storage snapshots are now part of engine correctness, not a dormant hook. `storage-memory` snapshots the full OpenMLS memory map as a pragmatic harness backend. `storage-sqlite` now snapshots group-scoped OpenMLS rows plus CGKA metadata atomically and uses Rust migrations for schema/data evolution; follow-up work should add retention/pruning and persist enough ordering metadata to recover after restart.
 
-Follow-up: recovery observability now has a first contract. `cgka_traits::GroupEvent::ForkRecovered` records the source epoch, recovered epoch, winner ordering key, and invalidated incumbent ordering key. `cgka_conformance_simulator::ScenarioTrace` exposes that as `ClientObservation::recoveries` with hex message ids, and the deliberate fork scenario asserts that exactly one peer rolls back to the deterministic winner. The next portability step is not more engine plumbing; it is turning these scripted scenarios into explicit external vector fixtures/runners.
+Follow-up: recovery observability now has a first contract.
+`cgka_traits::GroupEvent::ForkRecovered` records the source epoch, recovered
+epoch, winner ordering key, and invalidated incumbent ordering key.
+`cgka_conformance_simulator::ScenarioTrace` exposes that as
+`ClientObservation::recoveries` with hex message ids, and the deliberate fork
+scenario asserts that exactly one peer rolls back to the deterministic winner.
+That work has since moved into portable semantic fixtures such as
+`group-data-fork-recovery/v1` and `concurrent-invite-fork-recovery/v1`; exact
+randomized MLS commit bytes are outside the scenario contract.
 
 ---
 

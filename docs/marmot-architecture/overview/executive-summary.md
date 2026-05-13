@@ -3,7 +3,7 @@ title: "Marmot — Executive Summary"
 created: 2026-04-19
 tags: [marmot, overview, executive-summary]
 status: overview
-updated: 2026-05-10
+updated: 2026-05-13
 ---
 
 # Marmot — Executive Summary
@@ -75,7 +75,7 @@ The core technical challenge: **MLS requires total linear ordering of group-stat
   branch-selection core.
 - 🚧 MDK (~66K LOC) and whitenoise-rs (~100K LOC) are larger than their target shapes — decomposition follow-up needed.
 - 🚧 MIP structure being reworked in `spec/` — the new draft is organized by
-  stable protocol surfaces and small MLS app data dictionary components.
+  stable protocol surfaces and small MLS app components.
 - 🚧 Safe framework adoption blocked on backend library support; needs investigation.
 - 🚧 `IdentityRemove` custom proposal type identified as the first needed Marmot-custom MLS proposal.
 - 🚧 Production app integration remains outside the current engine simulator;

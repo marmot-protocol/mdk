@@ -1,7 +1,7 @@
 ---
 title: "CGKA Engine Quality And Vectors"
 created: 2026-05-11
-updated: 2026-05-11
+updated: 2026-05-13
 tags: [marmot, overview, cgka, conformance, vectors]
 status: working-note
 ---
@@ -43,16 +43,19 @@ The engine is in good shape when:
 
 ## Test Layers
 
-The current test stack already has useful coverage:
+The current test stack has useful coverage at several levels:
 
 - engine tests for single-boundary behavior;
 - session tests for SQLCipher-backed account-device lifecycle;
 - Nostr adapter/peeler integration tests over an in-memory relay client;
-- conformance simulator scenarios;
-- generated scenario families;
+- conformance simulator scenarios and portable vector fixtures;
+- generated scenario families with JSON reports and fixture candidates;
+- property tests for selector, canonicalization, capability, lifecycle,
+  restart, and generated send/leave histories;
 - Tamarin models for distributed convergence.
 
-The missing piece is a clearer vector story.
+The remaining gap is a broader byte-level vector story for encodings and
+transport shapes.
 
 ## Scenario Vectors
 
@@ -138,23 +141,7 @@ Each new chaos case should have a path to one of:
 - a byte-level fixture;
 - a Tamarin scenario name.
 
-## Near-Term Work
-
-The next engine-centered pass should produce:
-
-1. A vector manifest that names every current scenario and whether it is
-   portable, Rust-only, generated, or byte-level.
-2. A byte-level fixture schema for component/wire-format vectors.
-3. At least one app-component byte vector for
-   `marmot.transport.nostr.routing.v1` state and update validation.
-4. A whitenoise-rs integration note that lists the adapter or shim methods the
-   app core would need.
-5. A short list of engine API friction points found while mapping that shim.
-
-The Nostr relay-plane work should proceed only far enough to make that
-integration map honest.
-
-## Started Artifacts
+## Current Artifacts
 
 - Vector manifest:
   [`../../../crates/cgka-conformance-simulator/vectors/manifest.v1.json`](../../../crates/cgka-conformance-simulator/vectors/manifest.v1.json)
@@ -168,3 +155,19 @@ integration map honest.
   [`../../../crates/cgka-conformance-simulator/vectors/`](../../../crates/cgka-conformance-simulator/vectors/)
 - whitenoise-rs shim map and friction list:
   [`whitenoise-integration-map.md`](./whitenoise-integration-map.md)
+
+## Next Useful Work
+
+The next engine-centered pass should focus on:
+
+1. more byte-level fixtures for transport events, post-peel inputs, malformed
+   app-component bytes, and exporter contracts where deterministic inputs are
+   available;
+2. a cross-language fixture runner guide that explains how TypeScript or another
+   implementation consumes `ScenarioSpec` and `VectorFixture`;
+3. a relay-backed integration tier that sits above the simulator and below a
+   production app;
+4. domain-aware minimization for generated failures, once the current greedy
+   step remover stops being enough;
+5. continued expansion of `convergence-chaos/v1` around large groups,
+   multi-device identity lifecycle, and message storms with mixed commits.

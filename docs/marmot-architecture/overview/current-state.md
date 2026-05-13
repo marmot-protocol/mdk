@@ -1,7 +1,7 @@
 ---
 title: "Current State — Implementations & Spec"
 created: 2026-04-19
-updated: 2026-05-11
+updated: 2026-05-13
 tags: [marmot, overview, current-state, implementations]
 status: overview
 ---
@@ -42,8 +42,8 @@ into spec text.
 
 **In PR / design:**
 - **MIP-06** — Multi-Device Support
-- **Spec rewrite sandbox** — protocol laws, publish lifecycle, and draft MLS
-  app data dictionary components in [`../../../spec/README.md`](../../../spec/README.md)
+- **Spec rewrite sandbox** — protocol principles, publish lifecycle, and draft
+  MLS app components in [`../../../spec/README.md`](../../../spec/README.md)
 - **CGKA engine canonicalization** — post-peeling commit/proposal/app-message
   contract in [`../cgka-engine-canonicalization-contract.md`](../cgka-engine-canonicalization-contract.md)
 - **Distributed convergence** — deterministic branch selection for unordered
@@ -111,7 +111,7 @@ This repository now has the main engine candidate:
 - `formal/tamarin` — formal models for the convergence selector, delivery-order
   robustness, lifecycle cases, and proof/test mapping.
 - `spec` — experimental Marmot spec rewrite by stable surface, including
-  protocol laws and app data dictionary components.
+  protocol principles and app components.
 
 The current workspace can exercise the peeler-ingest boundary through
 in-memory clients, reopen encrypted SQLCipher-backed account-device sessions,

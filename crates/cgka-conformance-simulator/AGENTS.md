@@ -125,7 +125,10 @@ cargo run -p cgka-conformance-simulator --bin cgka-conformance-simulator-report 
 1. New `proptest!` block in `tests/proptest_invariants.rs`.
 2. If you need new intent kinds, extend `HarnessIntent` in `src/proptest_support.rs` and the matching strategy fn.
 3. Encode the invariant with `prop_assert(actual, expected, msg)` when comparing model values; the helper panics with useful context so shrinking keeps the original failure visible.
-4. Use one config per `proptest!` block. Harness-heavy properties default to smaller case counts; pure selector/canonicalization properties can run more cases. The `conformance-slow` feature should lift release-check properties to 1000 cases.
+4. Use one config per `proptest!` block. Harness-heavy properties default to
+   smaller case counts; pure selector/canonicalization properties can run more
+   cases. The `conformance-slow` feature should raise counts according to test
+   cost, rather than forcing every property to the same number.
 
 ## Coverage gaps
 

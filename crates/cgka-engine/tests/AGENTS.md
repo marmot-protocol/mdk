@@ -1,6 +1,8 @@
 # AGENTS.md — cgka-engine tests
 
-Three tiers, each owning a different correctness question. The crate's tests are Tier 2; Tiers 1 and 3 live in sibling crates and are listed here for navigation.
+Three tiers, each owning a different correctness question. The crate's tests are
+Tier 2; Tiers 1 and 3 live in sibling crates and are listed here for
+navigation.
 
 ## Tier 1 — In-crate unit tests (other crates)
 
@@ -49,14 +51,14 @@ cargo test -p cgka-engine
 | File | Owns |
 |---|---|
 | `canonical_scenarios.rs` | Scripted + portable harness scenarios: 3-client happy path, welcome-before-commit, SelfRemove convergence, deliberate fork with recovery observation, `ScenarioSpec`, vector fixtures, scheduled faults, generated-family reports |
-| `proptest_invariants.rs` | Phase 6.9 — convergence + event conservation under random `SendIntent` sequences |
+| `proptest_invariants.rs` | Property tests for selector order, canonicalization, capability negotiation, lifecycle/restart behavior, generated send/leave histories, and delivery-profile convergence |
 
-Quick CI run (24 proptest cases, ~1 s):
+Quick CI run:
 ```sh
 cargo test -p cgka-conformance-simulator
 ```
 
-Slow exhaustive run (1000 cases per property; pre-release validation):
+Slower pre-release run:
 ```sh
 cargo test -p cgka-conformance-simulator --features conformance-slow
 ```
@@ -74,7 +76,8 @@ backend coverage grows.
 
 - New `EpochState` transition → unit test in `crates/traits/src/engine_state.rs::tests` first; integration test only if the engine is involved in the transition.
 - New `StaleReason` variant → add a case to `tests/ingest.rs` and a dedicated assertion that the typed variant fires.
-- New capability requirement type → extend `tests/capabilities.rs`; the matrix is partial today (`Required/Optional/TransportRequired` × coverage × member-count), parametrize when adding rows.
+- New capability requirement type → extend `tests/capabilities.rs` and the
+  simulator capability property so fixed examples and generated matrices agree.
 - New MIP-03 rule → add to `tests/mip03_guards.rs`. These tests assert at the engine boundary, not via the harness.
 - Multi-client convergence question → harness scenario in `crates/cgka-conformance-simulator/tests/canonical_scenarios.rs`. If it should hold for *any* sequence of intents, encode as a proptest in `proptest_invariants.rs`.
 - Cross-implementation or reportable scenario → prefer `ScenarioSpec` / JSON fixtures in `crates/cgka-conformance-simulator/vectors/`, and use `cgka-conformance-simulator-report` for generated report artifacts.

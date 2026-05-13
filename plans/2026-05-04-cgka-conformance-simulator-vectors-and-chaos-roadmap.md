@@ -244,10 +244,10 @@ The semantic expectation layer should support:
 - fork-recovery counts and epochs;
 - future selected-branch payload checks for invite races.
 
-Status: started. `group-data-fork-recovery/v1` and
-`convergence-chaos/v1` now use semantic outcomes instead of exact commit digest
-bytes, and fixture reports include `expectation_failures` with expected and
-actual JSON values.
+Status: complete for the first conformance pass. `group-data-fork-recovery/v1`,
+`concurrent-invite-fork-recovery/v1`, and `convergence-chaos/v1` use semantic
+outcomes instead of exact commit digest bytes, and fixture reports include
+`expectation_failures` with expected and actual JSON values.
 
 ### Phase 5 - Add Analysis and Failure Minimization
 

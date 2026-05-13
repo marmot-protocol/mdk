@@ -45,9 +45,9 @@ This repo owns the candidate CGKA engine workspace:
 - Keep SQLite persistence one database per Marmot account-device identity.
 - Keep Tamarin model names, Rust test names, and vector names easy to grep
   across layers.
-- Keep protocol laws and app-component drafts in `spec/` implementation-neutral.
-  Local engine, storage, queue, and diagnostic notes belong in
-  `spec/implementation-model.md` or architecture docs.
+- Keep protocol principles and app-component drafts in `spec/`
+  implementation-neutral. Local engine, storage, queue, and diagnostic notes
+  belong in `spec/implementation-model.md` or architecture docs.
 - Keep tracing/logging privacy-safe: explicit crate/module `target` and
   `method` fields, aggregate values only, and no account ids, group ids,
   message ids, relay URLs, pubkeys, payloads, ciphertext, plaintext, or key

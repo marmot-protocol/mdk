@@ -1,7 +1,7 @@
 ---
 title: "whitenoise-rs Integration Map"
 created: 2026-05-11
-updated: 2026-05-11
+updated: 2026-05-13
 tags: [marmot, overview, cgka, integration, whitenoise]
 status: working-note
 ---
@@ -124,8 +124,8 @@ These are the current points likely to hurt during integration.
 1. `AccountDeviceSession` does not expose a group list or app-facing group
    summaries. A shim needs another source of known group ids.
 2. `GroupContext` exposes `transport_group_id` and exporter secrets, but not
-   raw app data dictionary bytes or parsed app components. Nostr routing v1
-   needs component access.
+   raw app-component entries or parsed app components. Nostr routing v1 needs
+   component access.
 3. `CreateGroupRequest` still carries legacy group profile fields directly.
    App-component creation inputs are not modeled yet.
 4. `KeyPackagePublisher` is separate from `TransportAdapter`. Production Nostr
