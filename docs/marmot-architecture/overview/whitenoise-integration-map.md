@@ -8,12 +8,10 @@ status: working-note
 
 # whitenoise-rs Integration Map
 
-This note maps the current engine/session/account boundary to the first
-whitenoise-rs integration path.
+This note maps the current engine/session/account boundary to the first whitenoise-rs integration path.
 
-The likely first path is a shim. A direct whitenoise-rs interface change may
-be cleaner later, but a shim lets us test the engine boundary against the
-existing account, relay, and event-processing shape.
+The likely first path is a shim. A direct whitenoise-rs interface change may be cleaner later, but a shim lets us test
+the engine boundary against the existing account, relay, and event-processing shape.
 
 ## Boundary Goal
 
@@ -80,8 +78,7 @@ A first whitenoise-rs shim would need to do the following.
 - ensure NIP-65 relay list state exists;
 - ensure inbox relay list state exists;
 - ensure kind `10051` KeyPackage relay-list state exists;
-- publish or repair missing account relay-list events before normal runtime
-  publication depends on them.
+- publish or repair missing account relay-list events before normal runtime publication depends on them.
 
 ### KeyPackage Publication
 
@@ -89,17 +86,14 @@ A first whitenoise-rs shim would need to do the following.
 - publish kind `30443` KeyPackage events to relays from kind `10051`;
 - record enough result state to decide whether the account setup needs repair.
 
-This probably belongs in the Nostr transport/account service, not inside the
-engine.
+This probably belongs in the Nostr transport/account service, not inside the engine.
 
 ### Group Send And Publish Resolution
 
 - call `send(SendIntent)`;
 - publish all `PublishWork` messages through the relay plane;
-- confirm a pending ref only after the transport reports enough accepted
-  publishes;
-- roll back pending state when publication fails or lacks required
-  acknowledgements.
+- confirm a pending ref only after the transport reports enough accepted publishes;
+- roll back pending state when publication fails or lacks required acknowledgements.
 
 ### Inbound Sync
 
@@ -107,8 +101,7 @@ engine.
 - peel Nostr transport envelopes;
 - call `ingest`;
 - drain events;
-- call `advance_convergence` after relay sync batches, reconnect catch-up, or
-  timer ticks.
+- call `advance_convergence` after relay sync batches, reconnect catch-up, or timer ticks.
 
 ### Group Routing
 
@@ -121,28 +114,22 @@ engine.
 
 These are the current points likely to hurt during integration.
 
-1. `AccountDeviceSession` does not expose a group list or app-facing group
-   summaries. A shim needs another source of known group ids.
-2. `GroupContext` exposes `transport_group_id` and exporter secrets, but not
-   raw app-component entries or parsed app components. Nostr routing v1 needs
-   component access.
-3. `CreateGroupRequest` still carries legacy group profile fields directly.
-   App-component creation inputs are not modeled yet.
-4. `KeyPackagePublisher` is separate from `TransportAdapter`. Production Nostr
-   KeyPackage publication should probably live with the Nostr transport/account
-   service.
-5. `TransportRoutingPolicy` is synchronous and local-snapshot shaped. A real
-   Nostr implementation depends on directory state, account bootstrap state,
-   group component state, relay health, and safety policy.
-6. `TransportAdapter` is account-aware, but the trait does not model a shared
-   multi-account relay plane. whitenoise-rs already needs cross-account
-   subscription dedupe.
-7. Scenario vectors now capture pending confirmations and rollbacks. They do
-   not yet capture selected stale outcomes. Some integration behavior is tested
-   in Rust but not portable.
-8. Error values are engine-oriented. Login/setup flows may need higher-level
-   recovery actions such as "publish missing kind 10051" or "repair inbox
-   relays".
+1. `AccountDeviceSession` does not expose a group list or app-facing group summaries. A shim needs another source of
+   known group ids.
+2. `GroupContext` exposes `transport_group_id` and exporter secrets, but not raw app-component entries or parsed app
+   components. Nostr routing v1 needs component access.
+3. `CreateGroupRequest` still carries legacy group profile fields directly. App-component creation inputs are not
+   modeled yet.
+4. `KeyPackagePublisher` is separate from `TransportAdapter`. Production Nostr KeyPackage publication should probably
+   live with the Nostr transport/account service.
+5. `TransportRoutingPolicy` is synchronous and local-snapshot shaped. A real Nostr implementation depends on directory
+   state, account bootstrap state, group component state, relay health, and safety policy.
+6. `TransportAdapter` is account-aware, but the trait does not model a shared multi-account relay plane. whitenoise-rs
+   already needs cross-account subscription dedupe.
+7. Scenario vectors now capture pending confirmations and rollbacks. They do not yet capture selected stale outcomes.
+   Some integration behavior is tested in Rust but not portable.
+8. Error values are engine-oriented. Login/setup flows may need higher-level recovery actions such as "publish missing
+   kind 10051" or "repair inbox relays".
 
 ## First Shim Methods
 
@@ -162,15 +149,12 @@ A thin integration layer would likely expose methods like:
 - `resolve_publish_report(account_id, pending, report)`;
 - `group_snapshot(account_id, group_id)`.
 
-The first implementation can be narrower, but these names describe the shape
-whitenoise-rs will probably need.
+The first implementation can be narrower, but these names describe the shape whitenoise-rs will probably need.
 
 ## Near-Term Engine Work From This Map
 
 This map points to three engine-adjacent tasks:
 
-1. Expose enough group/app-component snapshot state for Nostr routing without
-   leaking OpenMLS internals.
+1. Expose enough group/app-component snapshot state for Nostr routing without leaking OpenMLS internals.
 2. Extend portable scenario traces to include selected stale outcomes.
-3. Keep `marmot-account` as the small coordinator shell while resisting a full
-   app-core rebuild inside this repository.
+3. Keep `marmot-account` as the small coordinator shell while resisting a full app-core rebuild inside this repository.

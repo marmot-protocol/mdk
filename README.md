@@ -1,54 +1,133 @@
 # darkmatter
 
-Candidate CGKA engine, storage backends, simulator, and formal models for the
-Marmot protocol work.
+Candidate Marmot v2 protocol draft and CGKA engine workspace.
 
-## What is in this repository
+This repository is for team review of two connected pieces of work:
 
-- `crates/traits` defines the cross-boundary engine, transport adapter,
-  peeler, storage, and value types.
-- `crates/cgka-engine` implements the OpenMLS-backed engine candidate.
-- `crates/cgka-session` wires `Engine<SqliteStorage>` into a
-  production-shaped account-device lifecycle.
-- `crates/marmot-account` is the thin future app-core shell over a session and
-  transport adapter: account activation, transport routing policy, KeyPackage
-  publication, and publish confirmation/rollback.
-- `crates/marmot-lab` provides a local two-client CLI lab over a file-backed
-  fake relay for fast end-to-end checks with real sessions and the Nostr
-  adapter stack.
-- `crates/storage-memory` provides an in-memory backend for tests and simulator
-  runs.
-- `crates/storage-sqlite` provides SQLCipher-backed persistence for Marmot
-  metadata and group-scoped OpenMLS state.
-- `crates/transport-nostr-adapter` implements the Nostr transport adapter core:
-  account activation, group subscription sync, relay-event routing, and publish
-  reports behind an injectable relay-client boundary, with an optional
-  `nostr-sdk` backed client.
-- `crates/transport-nostr-peeler` maps Nostr kind `445` / `1059` events into
-  engine transport messages and peels Nostr/MLS group envelopes.
-- `crates/cgka-conformance-simulator` drives multi-client scenarios, generated
-  delivery variants, vector fixtures, and property tests.
-- `formal/tamarin` contains the abstract convergence model and proof harness.
-- `docs/marmot-architecture` contains architecture notes and the CGKA
-  engine/convergence contracts.
-- `spec/` is the rewrite sandbox for the Marmot protocol spec. It is organized
-  by protocol surface instead of MIP number.
+- the Marmot v2 protocol draft in `spec/`;
+- the OpenMLS-backed CGKA engine and the conformance simulator that tests it.
 
-## Testing map
+The code also includes storage, session, account, Nostr transport, and lab crates. Those crates exist to exercise the
+engine boundary and show the integration path toward MDK/whitenoise replacement work. MDK remains the deployed Rust
+protocol implementation until this draft and engine are adopted.
 
-The engine tests and simulator answer different questions.
+## What To Review First
 
-- `cargo test -p cgka-engine` checks the local engine boundary: one engine call,
-  one storage backend, one expected outcome.
-- `cargo test -p cgka-conformance-simulator` checks many clients running the
-  engine together through the Nostr peeler and an in-memory transport bus. It
-  also runs the checked-in vector fixtures.
-- `cargo test -p cgka-conformance-simulator --features conformance-slow` raises
-  the property-test case counts for a slower pre-release pass.
+Most reviewers should start with one of these two paths.
 
-The normal test command already validates the portable JSON vector fixtures.
-Run the report command when you want one JSON report per fixture plus a
-human-readable pass/fail summary:
+### Protocol Draft
+
+Use this path when reviewing protocol shape, spec organization, app components, transport boundaries, or compatibility
+with the current MIPs.
+
+1. [`spec/README.md`](spec/README.md)
+2. [`spec/principles.md`](spec/principles.md)
+3. [`spec/foundation/README.md`](spec/foundation/README.md)
+4. [`spec/protocol-core/README.md`](spec/protocol-core/README.md)
+5. [`spec/transports/nostr.md`](spec/transports/nostr.md)
+6. [`spec/app-components/README.md`](spec/app-components/README.md)
+7. [`spec/features/README.md`](spec/features/README.md)
+8. [`spec/mip-coverage.md`](spec/mip-coverage.md)
+
+The existing MIPs remain the current production reference until this draft is adopted.
+
+### CGKA Engine And Conformance
+
+Use this path when reviewing the engine state machine, convergence model, publish lifecycle, retained history, testing,
+or portable scenarios.
+
+1. [`crates/cgka-engine/README.md`](crates/cgka-engine/README.md)
+2. [`docs/marmot-architecture/cgka-engine-spec.md`](docs/marmot-architecture/cgka-engine-spec.md)
+3. [`docs/marmot-architecture/distributed-convergence.md`](docs/marmot-architecture/distributed-convergence.md)
+4. [`crates/cgka-conformance-simulator/README.md`](crates/cgka-conformance-simulator/README.md)
+5. [`crates/cgka-conformance-simulator/SCENARIOS.md`](crates/cgka-conformance-simulator/SCENARIOS.md)
+6. [`crates/cgka-conformance-simulator/PROPERTY_TESTS.md`](crates/cgka-conformance-simulator/PROPERTY_TESTS.md)
+7. [`formal/tamarin/README.md`](formal/tamarin/README.md)
+
+The engine README explains the local state machine. The simulator README explains how we test multi-client convergence,
+generated chaos, property tests, and portable vector fixtures.
+
+The Tamarin model is the formal side of the same convergence work. It models the abstract branch-selection and lifecycle
+rules that are hard to reason about from local tests alone: deterministic selection from the same valid candidate set,
+policy-gated eligibility, retained-anchor replay, stale-branch rejection, delivery reordering and duplication,
+app-output invalidation, welcome/commit handoff, proposal consumption, and outbound gating while convergence is syncing.
+Rust tests then check that the implementation follows those rules with OpenMLS objects, storage, and the simulator
+harness.
+
+## Repository Map
+
+Primary review areas:
+
+- `spec/` - Marmot v2 protocol draft organized by stable protocol surface.
+- `crates/cgka-engine` - OpenMLS-backed CGKA engine and local group state machine.
+- `crates/cgka-conformance-simulator` - multi-client scenarios, generated chaos, reports, property tests, and vectors.
+
+Engine support:
+
+- `crates/traits` - shared traits and cross-boundary types.
+- `crates/storage-memory` - in-memory storage for tests and simulator runs.
+- `crates/storage-sqlite` - SQLCipher-backed persistence for session and engine integration.
+- `crates/transport-nostr-peeler` - Nostr event to engine-message boundary and MLS envelope peeling.
+
+Integration prototypes:
+
+- `crates/cgka-session` - account-device session wrapper over `Engine<SqliteStorage>`.
+- `crates/marmot-account` - early app-core shell for session plus transport adapter orchestration.
+- `crates/transport-nostr-adapter` - Nostr transport adapter core behind an injectable relay-client boundary.
+- `crates/marmot-lab` - two-client CLI checks over a file-backed fake relay.
+
+Reference and model support:
+
+- `docs/marmot-architecture` - architecture notes, engine contracts, and current-state docs.
+- `formal/tamarin` - Tamarin proofs for the convergence selector, lifecycle boundaries, delivery-order behavior, and
+  proof-to-test mapping.
+
+## What Feedback We Want
+
+For the protocol draft:
+
+- Are the stable surfaces in the right places?
+- Are identity, application payloads, MLS usage, transports, and app components separated clearly?
+- Which rules still depend on MIP-era assumptions?
+- Which docs need more exact bytes, validation, or authorization rules before another implementation could build from
+  them?
+
+For the engine:
+
+- Does the publish-before-apply lifecycle match the protocol we want?
+- Are the group states and recovery states understandable?
+- Does convergence choose canonical state for the right reasons?
+- Do the simulator scenarios and property tests check real behavior rather than shallow markers?
+
+## Current Boundary
+
+This repo is candidate work. It is not the production MDK code path today.
+
+The integration crates show how the engine can fit into account/session and transport layers, but the review focus
+should stay on the protocol draft, the engine state machine, and the conformance story.
+
+## Test Commands
+
+Use the smallest command that covers your change.
+
+```sh
+# Engine boundary tests.
+cargo test -p cgka-engine
+
+# Simulator scenarios, vectors, and default property-test counts.
+cargo test -p cgka-conformance-simulator
+
+# Wider simulator property-test run.
+cargo test -p cgka-conformance-simulator --features conformance-slow
+
+# Workspace checks.
+just fmt-check
+just check
+just clippy
+just test
+```
+
+Run vector reports when you want saved JSON reports plus a pass/fail summary:
 
 ```sh
 cargo run -p cgka-conformance-simulator --bin cgka-conformance-simulator-report -- \
@@ -56,41 +135,15 @@ cargo run -p cgka-conformance-simulator --bin cgka-conformance-simulator-report 
   --out target/cgka-conformance-simulator-reports
 ```
 
-Start with [`crates/cgka-engine/README.md`](crates/cgka-engine/README.md) for
-the engine-level story, then use
-[`crates/cgka-conformance-simulator/README.md`](crates/cgka-conformance-simulator/README.md)
-for scenarios, vectors, generated chaos cases, reports, and property tests.
-
-## Start here
-
-1. `docs/marmot-architecture/index.md`
-2. `docs/marmot-architecture/overview/current-state.md`
-3. `docs/marmot-architecture/overview/observability.md`
-4. `crates/cgka-engine/README.md`
-5. `crates/cgka-session/README.md`
-6. `crates/marmot-account/README.md`
-7. `crates/storage-sqlite/README.md`
-8. `crates/transport-nostr-adapter/README.md`
-9. `crates/transport-nostr-peeler/README.md`
-10. `crates/marmot-lab/README.md`
-11. `spec/README.md`
-12. `formal/tamarin/README.md`
-
-## Common commands
+Formal model checks:
 
 ```sh
-just fmt-check
-just check
-just clippy
-just test
-just tracing-audit
 just tamarin
 ```
 
 `just tamarin` requires `tamarin-prover` on `PATH`.
 
-## Agent guidance
+## Agent Guidance
 
-Read `AGENTS.md` in the directory you are changing. `CLAUDE.md` files are
-symlinks to the same guidance so Claude-based tooling reads the canonical file.
-For spec rewrite work, start in `spec/README.md` and `spec/AGENTS.md`.
+Read `AGENTS.md` in the directory you are changing. `CLAUDE.md` files are symlinks to the same guidance so Claude-based
+tooling reads the canonical file.

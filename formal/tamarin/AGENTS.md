@@ -14,13 +14,12 @@ Agent map for the Tamarin proof directory.
 ## Rules
 
 - Keep model scenario names aligned with Rust test or fixture names.
-- Model only the global convergence properties that need proof. Storage schema,
-  parsing, and simple max-by-input behavior belong in Rust tests.
-- If `policy_cases.json` changes, run `just policy-casegen` and the relevant
-  Rust tests.
+- Model only the global convergence properties that need proof. Storage schema, parsing, and simple max-by-input
+  behavior belong in Rust tests.
+- If `policy_cases.json` changes, run `just policy-casegen` and the relevant Rust tests.
 - If the `.spthy` file changes, run `just tamarin`.
 
 ## Boundaries
 
-Tamarin proves the abstract design. Rust tests prove the implementation follows
-that design with real OpenMLS bytes, storage, and engine state.
+Tamarin proves the abstract design. Rust tests prove the implementation follows that design with real OpenMLS bytes,
+storage, and engine state.

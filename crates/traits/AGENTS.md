@@ -14,9 +14,8 @@ This crate owns values and traits that cross crate boundaries:
 - group/member/message ids
 - engine state and error vocabulary
 
-It should not depend on engine internals, storage implementations, Nostr
-libraries, or OpenMLS concrete engine types. OpenMLS appears only where the
-storage aggregate needs the OpenMLS storage trait bound.
+It should not depend on engine internals, storage implementations, Nostr libraries, or OpenMLS concrete engine types.
+OpenMLS appears only where the storage aggregate needs the OpenMLS storage trait bound.
 
 ## Key files
 

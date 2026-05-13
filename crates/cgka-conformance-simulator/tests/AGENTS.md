@@ -4,27 +4,41 @@ Map for simulator tests.
 
 ## Files
 
-| File | Owns |
-| --- | --- |
-| `candidate_state_graph.rs` | Selector/candidate graph policy tests. |
-| `canonical_scenarios.rs` | Scripted scenarios, vector fixtures, generated family checks, reports. |
-| `canonicalization_contract.rs` | Executable canonicalization contract behavior, including sync-state edge cases. |
-| `generated_policy_cases.rs` | Rust consumer for bounded policy cases shared with Tamarin generation. |
-| `openmls_replay_probe.rs` | OpenMLS replay and candidate materialization probes. |
-| `proptest_invariants.rs` | Property tests for selector order, canonicalization, capability matrices, lifecycle/restart behavior, generated send/leave histories, and delivery-profile convergence. |
-| `report_runner.rs` | Report artifact runner, oracle evidence, and coverage matrix coverage. |
-| `tracing_audit.rs` | Repo-wide production tracing privacy audit. |
+- **File:** `candidate_state_graph.rs`
+  - **Owns:** Selector/candidate graph policy tests.
+
+- **File:** `canonical_scenarios.rs`
+  - **Owns:** Scripted scenarios, vector fixtures, generated family checks, reports.
+
+- **File:** `canonicalization_contract.rs`
+  - **Owns:** Executable canonicalization contract behavior, including sync-state edge cases.
+
+- **File:** `generated_policy_cases.rs`
+  - **Owns:** Rust consumer for bounded policy cases shared with Tamarin generation.
+
+- **File:** `openmls_replay_probe.rs`
+  - **Owns:** OpenMLS replay and candidate materialization probes.
+
+- **File:** `proptest_invariants.rs`
+  - **Owns:** Property tests for selector order, canonicalization, capability matrices, lifecycle/restart behavior,
+    generated send/leave histories, and delivery-profile convergence.
+
+- **File:** `report_runner.rs`
+  - **Owns:** Report artifact runner, oracle evidence, and coverage matrix coverage.
+
+- **File:** `tracing_audit.rs`
+  - **Owns:** Repo-wide production tracing privacy audit.
 
 ## Rules
 
 - Use a fixed seed for generated test families.
 - Promote a generated failure into a vector when it becomes a regression case.
-- Update `../SCENARIOS.md` or `../PROPERTY_TESTS.md` when adding a scenario,
-  generated family, or property-test invariant.
-- Keep harness tests at the `HarnessClient`/`TransportBus` level. Extend the
-  harness API instead of reaching into engine internals.
-- Keep default property-test counts fast. Use `conformance-slow` for the wider
-  pass, with case counts chosen by test cost.
+- Update `../SCENARIOS.md` or `../PROPERTY_TESTS.md` when adding a scenario, generated family, or property-test
+  invariant.
+- Keep harness tests at the `HarnessClient`/`TransportBus` level. Extend the harness API instead of reaching into engine
+  internals.
+- Keep default property-test counts fast. Use `conformance-slow` for the wider pass, with case counts chosen by test
+  cost.
 
 ## Verification
 

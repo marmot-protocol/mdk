@@ -11,15 +11,19 @@ related:
 
 # CGKA Engine Design
 
-> **Reference status.** This is the older long-form engine design. The current
-> implementation lives in `crates/cgka-engine`, with the post-peeling contract
-> in [`../cgka-engine-canonicalization-contract.md`](../cgka-engine-canonicalization-contract.md).
-> Treat trait sketches below as design history when they differ from
-> `crates/traits`.
+> **Reference status.** This is the older long-form engine design. The current implementation lives in
+> `crates/cgka-engine`, with the post-peeling contract in
+> [`../cgka-engine-canonicalization-contract.md`](../cgka-engine-canonicalization-contract.md). Treat trait sketches
+> below as design history when they differ from `crates/traits`.
 
-**The problem this solves:** MDK today is a monolithic struct with no clean internal boundaries, Nostr types leaking into storage, and capabilities as hardcoded constants. This creates the compatibility breaks we've already seen (self-remove), makes testing hard, and makes the codebase difficult to reason about. This document defines what the CGKA Engine should look like — as a trait, as a set of internal state machines, and as a storage design — so that engineers have a concrete target to build toward.
+**The problem this solves:** MDK today is a monolithic struct with no clean internal boundaries, Nostr types leaking
+into storage, and capabilities as hardcoded constants. This creates the compatibility breaks we've already seen
+(self-remove), makes testing hard, and makes the codebase difficult to reason about. This document defines what the CGKA
+Engine should look like — as a trait, as a set of internal state machines, and as a storage design — so that engineers
+have a concrete target to build toward.
 
-A detailed look at how the CGKA Engine layer should be structured — what traits it exposes, what state machines it contain, how storage fits in, and where the current MDK codebase is well-designed vs. where it needs rethinking.
+A detailed look at how the CGKA Engine layer should be structured — what traits it exposes, what state machines it
+contain, how storage fits in, and where the current MDK codebase is well-designed vs. where it needs rethinking.
 
 ---
 
@@ -30,6 +34,7 @@ From [[target-architecture]]:
 > The application layer has one job: express intent, consume events. Everything else is below the line.
 
 The CGKA Engine owns:
+
 - Group key agreement (MLS state machine today)
 - Message encryption / decryption (inner layer)
 - Outbound serialization (intent → encrypted payload)
@@ -39,6 +44,7 @@ The CGKA Engine owns:
 - Storage of group state, messages, key packages, epoch snapshots
 
 It does NOT own:
+
 - Transport (relay connections, subscriptions)
 - Account management
 - Chat list state
@@ -51,23 +57,42 @@ It does NOT own:
 
 ### What's well-designed
 
-**Storage traits are clean.** The separation into `GroupStorage + MessageStorage + WelcomeStorage + StorageProvider<CURRENT_VERSION>` composing into `MdkStorageProvider` is the right pattern. Multiple backends (SQLite, in-memory) work correctly. The snapshot/rollback system (`create_group_snapshot`, `rollback_group_to_snapshot`) is a good foundation. Keep all of this.
+**Storage traits are clean.** The separation into
+`GroupStorage + MessageStorage + WelcomeStorage + StorageProvider<CURRENT_VERSION>` composing into `MdkStorageProvider`
+is the right pattern. Multiple backends (SQLite, in-memory) work correctly. The snapshot/rollback system
+(`create_group_snapshot`, `rollback_group_to_snapshot`) is a good foundation. Keep all of this.
 
-**The `MDK<Storage>` generic is correct.** Parameterising over storage at the type level (rather than a trait object) gives zero-cost dispatch and compile-time guarantees that the storage implementation is consistent. Don't change this pattern.
+**The `MDK<Storage>` generic is correct.** Parameterising over storage at the type level (rather than a trait object)
+gives zero-cost dispatch and compile-time guarantees that the storage implementation is consistent. Don't change this
+pattern.
 
-**OpenMLS delegation is well-abstracted.** MDK wraps OpenMLS via the `MdkProvider<Storage>` struct and the `OpenMlsProvider` trait. The MLS state machine internals stay inside OpenMLS. MDK shouldn't try to re-implement MLS.
+**OpenMLS delegation is well-abstracted.** MDK wraps OpenMLS via the `MdkProvider<Storage>` struct and the
+`OpenMlsProvider` trait. The MLS state machine internals stay inside OpenMLS. MDK shouldn't try to re-implement MLS.
 
-**The epoch snapshot system is a real architectural asset.** The `EpochSnapshotManager` and the rollback/retry logic in message processing (`OwnCommitPending`, `Retryable` message states) are genuinely clever and solve a hard problem. This is MDK's key differentiator from plain OpenMLS.
+**The epoch snapshot system is a real architectural asset.** The `EpochSnapshotManager` and the rollback/retry logic in
+message processing (`OwnCommitPending`, `Retryable` message states) are genuinely clever and solve a hard problem. This
+is MDK's key differentiator from plain OpenMLS.
 
 ### What needs rethinking
 
-**`MDK<Storage>` is a monolithic struct.** Currently it has ~200 methods across 37+ files in whitenoise-rs (via the `Whitenoise` facade that wraps it). The struct holds ciphersuite, extensions, provider, config, epoch_snapshots, and callback as flat fields. There are no internal boundary between "group lifecycle management", "message processing", "key package management", and "capability management". These should be clearer internal subsystems even if they're not separate public crates.
+**`MDK<Storage>` is a monolithic struct.** Currently it has ~200 methods across 37+ files in whitenoise-rs (via the
+`Whitenoise` facade that wraps it). The struct holds ciphersuite, extensions, provider, config, epoch_snapshots, and
+callback as flat fields. There are no internal boundary between "group lifecycle management", "message processing", "key
+package management", and "capability management". These should be clearer internal subsystems even if they're not
+separate public crates.
 
-**Nostr types leak into the core.** `process_message()` takes a `nostr::Event`. `constant.rs` references Nostr event kinds (`Kind::Custom(30443)`). `GroupStorage` has fields like `nostr_group_id`. This is the "clean Nostr types from MDK API" item from the decision points. The CGKA engine should accept `TransportMessage` (opaque bytes + metadata), not `nostr::Event`. The Nostr-specific unwrapping belongs in the `TransportPeeler`.
+**Nostr types leak into the core.** `process_message()` takes a `nostr::Event`. `constant.rs` references Nostr event
+kinds (`Kind::Custom(30443)`). `GroupStorage` has fields like `nostr_group_id`. This is the "clean Nostr types from MDK
+API" item from the decision points. The CGKA engine should accept `TransportMessage` (opaque bytes + metadata), not
+`nostr::Event`. The Nostr-specific unwrapping belongs in the `TransportPeeler`.
 
-**Capabilities are static constants, not runtime-queryable.** `SUPPORTED_PROPOSALS`, `GROUP_CONTEXT_REQUIRED_PROPOSALS`, `SUPPORTED_EXTENSIONS` are hardcoded in `constant.rs`. There's no `feature_status()` function, no `constructable_capabilities()`, no way to ask "does this group support disappearing messages?" at runtime. This is the root cause of the self-remove compatibility break — the capability system doesn't exist yet at the right level.
+**Capabilities are static constants, not runtime-queryable.** `SUPPORTED_PROPOSALS`, `GROUP_CONTEXT_REQUIRED_PROPOSALS`,
+`SUPPORTED_EXTENSIONS` are hardcoded in `constant.rs`. There's no `feature_status()` function, no
+`constructable_capabilities()`, no way to ask "does this group support disappearing messages?" at runtime. This is the
+root cause of the self-remove compatibility break — the capability system doesn't exist yet at the right level.
 
-**No `CgkaEngine` trait.** MDK is a concrete type, not a trait. You can't swap it out, mock it cleanly in tests, or reason about what the "CGKA contract" actually is. The trait should be defined first; MDK should be the implementation.
+**No `CgkaEngine` trait.** MDK is a concrete type, not a trait. You can't swap it out, mock it cleanly in tests, or
+reason about what the "CGKA contract" actually is. The trait should be defined first; MDK should be the implementation.
 
 ---
 
@@ -140,12 +165,12 @@ pub trait CgkaEngine: Send + Sync {
 
 ## State machines: what should be an enum, what shouldn't
 
-The rustls lesson: if illegal state transitions exist and they're only caught at runtime via `if/match` checks, model it as an enum instead. The compiler enforces it for free.
+The rustls lesson: if illegal state transitions exist and they're only caught at runtime via `if/match` checks, model it
+as an enum instead. The compiler enforces it for free.
 
 ### ✅ Should be explicit state machine enums
 
-**1. Epoch/commit state**
-Each group is always in one of these states:
+**1. Epoch/commit state** Each group is always in one of these states:
 
 ```rust
 pub enum EpochState {
@@ -171,7 +196,9 @@ pub enum EpochState {
 }
 ```
 
-The current code handles these states implicitly via `pending_commit().is_some()`, error variants like `OwnCommitPending`, and the snapshot system. Making it an explicit enum:
+The current code handles these states implicitly via `pending_commit().is_some()`, error variants like
+`OwnCommitPending`, and the snapshot system. Making it an explicit enum:
+
 - Makes it impossible to call `process_message` when in `PendingPublish` state (compiler error)
 - Eliminates the defensive `if group.pending_commit().is_some()` checks throughout
 - Makes the recovery flow explicit rather than scattered across error handlers
@@ -207,7 +234,8 @@ pub enum MemberState {
 
 ### ❌ Should NOT be state machines
 
-**Message processing pipeline** — this is a sequential transformation (receive → peel → sequence → decrypt → emit), not a state machine. Keep it as a linear function chain.
+**Message processing pipeline** — this is a sequential transformation (receive → peel → sequence → decrypt → emit), not
+a state machine. Keep it as a linear function chain.
 
 **Storage operations** — pure data operations, no state machine needed.
 
@@ -219,22 +247,31 @@ pub enum MemberState {
 
 ## Internal subsystems
 
-The monolithic `MDK<Storage>` struct should be reorganised into internal subsystems with clearer boundaries. These don't need to be separate public crates immediately — internal modules with explicit interfaces is a reasonable first step.
+The monolithic `MDK<Storage>` struct should be reorganised into internal subsystems with clearer boundaries. These don't
+need to be separate public crates immediately — internal modules with explicit interfaces is a reasonable first step.
 
 ### `GroupLifecycle`
-Create, join, leave, add member, remove member, update group data. Owns the MLS group operations that change membership or group context.
+
+Create, join, leave, add member, remove member, update group data. Owns the MLS group operations that change membership
+or group context.
 
 ### `MessageProcessor`
-Inbound pipeline: peel → sequence (coordinator) → apply MLS → emit `GroupEvent`.
-Outbound pipeline: `SendIntent` → encrypt → wrap via peeler → `SendResult`.
+
+Inbound pipeline: peel → sequence (coordinator) → apply MLS → emit `GroupEvent`. Outbound pipeline: `SendIntent` →
+encrypt → wrap via peeler → `SendResult`.
 
 ### `EpochManager`
-Owns the `EpochState` state machine. Manages pending commits, snapshot creation/rollback, and recovery from epoch forks. Currently scattered across `epoch_snapshots.rs` and the error handling in `messages/process.rs`.
+
+Owns the `EpochState` state machine. Manages pending commits, snapshot creation/rollback, and recovery from epoch forks.
+Currently scattered across `epoch_snapshots.rs` and the error handling in `messages/process.rs`.
 
 ### `CapabilityManager`
-Owns feature registry, `feature_status()`, `constructable_capabilities()`, `upgradeable_capabilities()`. Currently doesn't exist — capabilities are static constants in `constant.rs`.
+
+Owns feature registry, `feature_status()`, `constructable_capabilities()`, `upgradeable_capabilities()`. Currently
+doesn't exist — capabilities are static constants in `constant.rs`.
 
 ### `KeyPackageManager`
+
 Publish, refresh, expire, validate key packages. Currently in `key_packages.rs`.
 
 ---
@@ -242,6 +279,7 @@ Publish, refresh, expire, validate key packages. Currently in `key_packages.rs`.
 ## Storage traits: keep the structure, fix the leaks
 
 The current storage trait design is good. Keep:
+
 - `GroupStorage` — group metadata
 - `MessageStorage` — message records with state machine (Created → Processed → Failed → Retryable → EpochInvalidated)
 - `WelcomeStorage` — pending welcomes
@@ -250,8 +288,9 @@ The current storage trait design is good. Keep:
 
 **What needs fixing:**
 
-**1. Remove Nostr types from storage types.**
-`Group` in `mdk-storage-traits` has a `nostr_group_id` field. This leaks Nostr knowledge into a layer that should be transport-agnostic. The group ID in storage should be the MLS group ID only. The mapping between MLS group ID and Nostr group ID belongs in whitenoise-core's transport adapter, not in MDK storage.
+**1. Remove Nostr types from storage types.** `Group` in `mdk-storage-traits` has a `nostr_group_id` field. This leaks
+Nostr knowledge into a layer that should be transport-agnostic. The group ID in storage should be the MLS group ID only.
+The mapping between MLS group ID and Nostr group ID belongs in whitenoise-core's transport adapter, not in MDK storage.
 
 ```rust
 // Current (wrong):
@@ -273,7 +312,8 @@ pub struct Group {
 }
 ```
 
-The transport adapter in whitenoise-core maintains the mapping between `GroupId` → `NostrGroupId` and `GroupId` → relay URLs. MDK doesn't need to know about relays at all.
+The transport adapter in whitenoise-core maintains the mapping between `GroupId` → `NostrGroupId` and `GroupId` → relay
+URLs. MDK doesn't need to know about relays at all.
 
 **2. Add a `CapabilityStorage` trait** for the feature registry and per-group capability state.
 
@@ -302,6 +342,7 @@ pub trait CapabilityStorage {
 ```
 
 **3. `MdkStorageProvider` becomes:**
+
 ```rust
 pub trait MdkStorageProvider:
     GroupStorage
@@ -321,7 +362,9 @@ pub trait MdkStorageProvider:
 
 ## The feature registry: fixing the static constants problem
 
-Currently `SUPPORTED_PROPOSALS` and `GROUP_CONTEXT_REQUIRED_PROPOSALS` are static constants. This is what causes migration pain — you can't query "does this group support SelfRemove?" at runtime in a way that accounts for members' actual KeyPackages.
+Currently `SUPPORTED_PROPOSALS` and `GROUP_CONTEXT_REQUIRED_PROPOSALS` are static constants. This is what causes
+migration pain — you can't query "does this group support SelfRemove?" at runtime in a way that accounts for members'
+actual KeyPackages.
 
 Replace with a runtime feature registry that is initialized at startup:
 
@@ -366,18 +409,25 @@ pub enum RequirementLevel {
 
 **Why one capability per feature?**
 
-The alternative — a `Vec<Capability>` or a `depends_on: Vec<Feature>` graph — makes it hard to reason about what a group actually requires. "What does this group need?" becomes a traversal instead of a flat lookup.
+The alternative — a `Vec<Capability>` or a `depends_on: Vec<Feature>` graph — makes it hard to reason about what a group
+actually requires. "What does this group need?" becomes a traversal instead of a flat lookup.
 
 With one-capability-per-feature:
+
 - `RequiredCapabilities` = simple union of all active features' single capabilities
 - No graph traversal, no hidden dependencies
 - Easy to audit: the feature registry is a flat list you can read top-to-bottom
 
-The UI layer activates user-facing features by calling `upgrade_group_capabilities()`, which applies the full set of upgradeable capabilities atomically. A user-facing "disappearing messages" might map to two engine-level features (`DisappearingMessagesExtension` + `DisappearingMessagesProposal`), but the user never sees that split — they just see the feature become available when both capabilities are satisfied.
+The UI layer activates user-facing features by calling `upgrade_group_capabilities()`, which applies the full set of
+upgradeable capabilities atomically. A user-facing "disappearing messages" might map to two engine-level features
+(`DisappearingMessagesExtension` + `DisappearingMessagesProposal`), but the user never sees that split — they just see
+the feature become available when both capabilities are satisfied.
 
-The registry is populated at `MDK` initialization with all known features. `CapabilityManager` reads from it. The `CapabilityStorage` trait caches member capabilities locally so `feature_status()` is always a local, cheap operation.
+The registry is populated at `MDK` initialization with all known features. `CapabilityManager` reads from it. The
+`CapabilityStorage` trait caches member capabilities locally so `feature_status()` is always a local, cheap operation.
 
-**Migration from static constants:** The existing `SUPPORTED_PROPOSALS` and `GROUP_CONTEXT_REQUIRED_PROPOSALS` arrays become the initial state of the feature registry. No wire format changes needed.
+**Migration from static constants:** The existing `SUPPORTED_PROPOSALS` and `GROUP_CONTEXT_REQUIRED_PROPOSALS` arrays
+become the initial state of the feature registry. No wire format changes needed.
 
 ---
 
@@ -385,9 +435,12 @@ The registry is populated at `MDK` initialization with all known features. `Capa
 
 This is a significant mental model shift from how MDK currently works.
 
-**Current model:** `NostrGroupData` is a single hardcoded extension. There is no concept of transport-specific extensions. Every group has it because every group is Nostr.
+**Current model:** `NostrGroupData` is a single hardcoded extension. There is no concept of transport-specific
+extensions. Every group has it because every group is Nostr.
 
-**Target model:** Transport-specific metadata extensions are features like any other, governed by the same `RequiredCapabilities` / `FeatureRegistry` system. A group that uses Nostr transport requires `NostrGroupData`. A group that uses FIPS mesh transport would require a `FipsGroupData` extension. A group using both requires both.
+**Target model:** Transport-specific metadata extensions are features like any other, governed by the same
+`RequiredCapabilities` / `FeatureRegistry` system. A group that uses Nostr transport requires `NostrGroupData`. A group
+that uses FIPS mesh transport would require a `FipsGroupData` extension. A group using both requires both.
 
 ```rust
 pub enum Feature {
@@ -411,6 +464,7 @@ pub enum Feature {
 ```
 
 **Transport features in the registry:**
+
 ```rust
 Feature::NostrTransport => FeatureSpec {
     requires: Capability::Extension(NOSTR_GROUP_DATA_EXTENSION_TYPE), // 0xF2EE
@@ -434,6 +488,7 @@ Feature::FipsTransport => FeatureSpec {
 **What this means for group creation:**
 
 When whitenoise-core creates a group, it passes the intended transports:
+
 ```rust
 engine.create_group(
     members,
@@ -442,9 +497,12 @@ engine.create_group(
 )
 ```
 
-The engine (or more precisely, the active transport adapters) constructs the appropriate transport extensions before creating the MLS group. A group with `transports: [Nostr, Fips]` would have both `NostrGroupData` and `FipsGroupData` in its `RequiredCapabilities`, meaning all members must have clients that support both transports.
+The engine (or more precisely, the active transport adapters) constructs the appropriate transport extensions before
+creating the MLS group. A group with `transports: [Nostr, Fips]` would have both `NostrGroupData` and `FipsGroupData` in
+its `RequiredCapabilities`, meaning all members must have clients that support both transports.
 
 **Transport adapters provide their extension data:**
+
 ```rust
 trait TransportAdapter {
     // existing methods...
@@ -455,14 +513,22 @@ trait TransportAdapter {
 }
 ```
 
-The Nostr adapter returns `(NOSTR_GROUP_DATA_EXTENSION_TYPE, serialized_nostr_group_data)`. The FIPS adapter would return its own. The engine assembles these into the group's extension list and `RequiredCapabilities` at creation time.
+The Nostr adapter returns `(NOSTR_GROUP_DATA_EXTENSION_TYPE, serialized_nostr_group_data)`. The FIPS adapter would
+return its own. The engine assembles these into the group's extension list and `RequiredCapabilities` at creation time.
 
-**Key insight:** The `NostrGroupRegistry` (the GroupId → NostrGroupId + relay URL mapping) that lives in whitenoise-core's transport adapter is *derived from* the `NostrGroupData` extension that lives in the MLS group. The extension is the source of truth; the registry is a local index for fast lookup. When a new member receives a Welcome message, they read the `NostrGroupData` extension from the group state and populate their local registry. No separate communication needed.
+**Key insight:** The `NostrGroupRegistry` (the GroupId → NostrGroupId + relay URL mapping) that lives in
+whitenoise-core's transport adapter is _derived from_ the `NostrGroupData` extension that lives in the MLS group. The
+extension is the source of truth; the registry is a local index for fast lookup. When a new member receives a Welcome
+message, they read the `NostrGroupData` extension from the group state and populate their local registry. No separate
+communication needed.
 
 **Why this matters long-term:**
 
-Today, adding FIPS support would require changes throughout MDK and whitenoise-rs because Nostr transport is baked in. With this model:
-- Adding FIPS requires: a new `FipsGroupData` extension type, a `FipsTransport` feature in the registry, a `FipsAdapter` implementing `TransportAdapter`, and a `FipsMlsPeeler` implementing `TransportPeeler`
+Today, adding FIPS support would require changes throughout MDK and whitenoise-rs because Nostr transport is baked in.
+With this model:
+
+- Adding FIPS requires: a new `FipsGroupData` extension type, a `FipsTransport` feature in the registry, a `FipsAdapter`
+  implementing `TransportAdapter`, and a `FipsMlsPeeler` implementing `TransportPeeler`
 - MDK itself changes nothing — the engine is transport-agnostic by design
 - Existing Nostr groups continue working unchanged
 - New groups can opt into FIPS, Nostr, or both at creation time
@@ -474,16 +540,20 @@ Today, adding FIPS support would require changes throughout MDK and whitenoise-r
 Given the session-projection refactor is in progress, here's the recommended order to avoid conflict:
 
 **1. While session projection is landing:**
+
 - Define the `CgkaEngine` trait as a document (like we did for `TransportAdapter`) — no code yet, just the interface
-- Add the `feature_status()` / `constructable_capabilities()` / `upgradeable_capabilities()` methods to MDK as concrete additions (don't need the trait first to get the value)
+- Add the `feature_status()` / `constructable_capabilities()` / `upgradeable_capabilities()` methods to MDK as concrete
+  additions (don't need the trait first to get the value)
 - Add the feature registry as a new module in `mdk-core`
 
 **2. After session projection:**
+
 - Extract `EpochManager` into its own internal module — the `EpochState` enum with the state machine
 - Add `CapabilityStorage` trait to `mdk-storage-traits` + implement in both backends
 - Start removing Nostr types from `mdk-storage-traits` (coordinate with whitenoise-core changes)
 
 **3. Later (as part of CGKA trait introduction):**
+
 - Implement `CgkaEngine` on `MDK<Storage>`
 - Update whitenoise-core to call `engine: Box<dyn CgkaEngine>` rather than `mdk: MDK<S>` directly
 
@@ -514,4 +584,6 @@ TransportAdapter (in whitenoise-core)
   → none of this lives in MDK
 ```
 
-The current MDK is ~66k LOC including tests and storage implementations. The target is a cleaner 66k, not necessarily smaller — but with the complexity in the right places and the Nostr leakage eliminated. The storage traits are already the best part of the codebase; the state machines and capability system are the biggest gaps.
+The current MDK is ~66k LOC including tests and storage implementations. The target is a cleaner 66k, not necessarily
+smaller — but with the complexity in the right places and the Nostr leakage eliminated. The storage traits are already
+the best part of the codebase; the state machines and capability system are the biggest gaps.

@@ -1,7 +1,6 @@
 # AGENTS.md - darkmatter
 
-Repository-level map for agents. Read `README.md` first for the human-facing
-overview.
+Repository-level map for agents. Read `README.md` first for the human-facing overview.
 
 ## Scope
 
@@ -16,7 +15,7 @@ This repo owns the candidate CGKA engine workspace:
 - conformance simulator and vector fixtures,
 - Tamarin models for distributed convergence,
 - architecture notes and CGKA contracts,
-- Marmot protocol spec rewrite drafts.
+- Marmot v2 protocol draft.
 
 ## Where to go
 
@@ -34,30 +33,25 @@ This repo owns the candidate CGKA engine workspace:
 | Local two-client lab | `crates/marmot-lab/README.md` |
 | Multi-client harness / vectors | `crates/cgka-conformance-simulator/AGENTS.md` |
 | Architecture docs | `docs/AGENTS.md` and `docs/marmot-architecture/AGENTS.md` |
-| Spec rewrite sandbox | `spec/AGENTS.md` |
+| Marmot v2 protocol draft | `spec/AGENTS.md` |
 | Formal model | `formal/tamarin/AGENTS.md` |
 
 ## Invariants
 
 - Keep the engine generic over `S: cgka_traits::StorageProvider`.
-- Keep transport-specific code out of `crates/cgka-engine`, `crates/traits`,
-  and storage crates.
+- Keep transport-specific code out of `crates/cgka-engine`, `crates/traits`, and storage crates.
 - Keep SQLite persistence one database per Marmot account-device identity.
-- Keep Tamarin model names, Rust test names, and vector names easy to grep
-  across layers.
-- Keep protocol principles and app-component drafts in `spec/`
-  implementation-neutral. Local engine, storage, queue, and diagnostic notes
-  belong in `spec/implementation-model.md` or architecture docs.
-- Keep tracing/logging privacy-safe: explicit crate/module `target` and
-  `method` fields, aggregate values only, and no account ids, group ids,
-  message ids, relay URLs, pubkeys, payloads, ciphertext, plaintext, or key
-  material. See `docs/marmot-architecture/overview/observability.md`.
+- Keep Tamarin model names, Rust test names, and vector names easy to grep across layers.
+- Keep protocol principles and app-component documents in `spec/` implementation-neutral. Local engine, storage, queue,
+  and diagnostic notes belong in `spec/implementation-model.md` or architecture docs.
+- Keep tracing/logging privacy-safe: explicit crate/module `target` and `method` fields, aggregate values only, and no
+  account ids, group ids, message ids, relay URLs, pubkeys, payloads, ciphertext, plaintext, or key material. See
+  `docs/marmot-architecture/overview/observability.md`.
 - When adding an `AGENTS.md`, create a sibling `CLAUDE.md` symlink to it.
 
 ## Verification
 
-Use the smallest command that covers the change, then widen before checkpointing
-cross-crate work:
+Use the smallest command that covers the change, then widen before checkpointing cross-crate work:
 
 ```sh
 just fmt-check

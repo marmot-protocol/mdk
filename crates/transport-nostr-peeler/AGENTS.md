@@ -13,9 +13,8 @@ This crate owns the Nostr transport-edge peeler:
 - NIP-59 welcome wrapping/peeling with injected signer/decrypter,
 - explicit errors for malformed or unsupported Nostr boundary input.
 
-It must not own relay networking, relay selection, account-device sessions, app
-message projection, or application storage. Keep those in adapters or the app
-layer above this crate.
+It must not own relay networking, relay selection, account-device sessions, app message projection, or application
+storage. Keep those in adapters or the app layer above this crate.
 
 ## Key files
 
@@ -29,13 +28,11 @@ layer above this crate.
 ## Current limits
 
 - Group messages are wrapped and peeled.
-- New kind `445` group outputs include `source_epoch`. The engine uses this
-  hint to classify pre-join stale messages as terminal when no retained epoch
-  context can peel them.
-- Welcomes are wrapped and peeled through NIP-59 when callers inject the local
-  signer/decrypter. This crate must not decide where that signer comes from.
-- Kind `445` group outputs carry a pre-signing id; final relay publication may
-  replace it after signing.
+- New kind `445` group outputs include `source_epoch`. The engine uses this hint to classify pre-join stale messages as
+  terminal when no retained epoch context can peel them.
+- Welcomes are wrapped and peeled through NIP-59 when callers inject the local signer/decrypter. This crate must not
+  decide where that signer comes from.
+- Kind `445` group outputs carry a pre-signing id; final relay publication may replace it after signing.
 
 ## Verification
 

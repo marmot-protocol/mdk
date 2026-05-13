@@ -13,9 +13,7 @@ Map for SQLite group snapshots.
 
 ## Rules
 
-- Snapshots must include Marmot group metadata, messages, queued outbound
-  intents, member capabilities, convergence policy, and group-scoped OpenMLS
-  rows.
+- Snapshots must include Marmot group metadata, messages, queued outbound intents, member capabilities, convergence
+  policy, and group-scoped OpenMLS rows.
 - Rollback should restore the captured state and leave unrelated groups alone.
-- Snapshot release is idempotent only where the caller explicitly handles
-  `SnapshotMissing`.
+- Snapshot release is idempotent only where the caller explicitly handles `SnapshotMissing`.

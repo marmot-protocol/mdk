@@ -19,7 +19,6 @@ Map for Marmot-side SQLite tables.
 ## Rules
 
 - Keep tests beside the module they exercise.
-- Store serialized Marmot records in `record` blobs so trait shapes can evolve
-  through Rust migrations.
+- Store serialized Marmot records in `record` blobs so trait shapes can evolve through Rust migrations.
 - Preserve insertion order where replay depends on deterministic ordering.
 - Group delete must remove group-scoped OpenMLS rows too.

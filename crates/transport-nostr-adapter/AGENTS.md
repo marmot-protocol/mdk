@@ -4,8 +4,7 @@ Agent-facing map for the Nostr transport adapter crate.
 
 ## Scope
 
-This crate implements the shared `TransportAdapter` boundary for Nostr-shaped
-traffic:
+This crate implements the shared `TransportAdapter` boundary for Nostr-shaped traffic:
 
 - account inbox activation,
 - group subscription sync,
@@ -13,10 +12,9 @@ traffic:
 - relay-event to account-scoped delivery routing,
 - publish target validation and endpoint-level publish reports.
 
-It does not own MLS peeling, CGKA convergence, storage, account key custody, or
-real relay socket policy by default. The optional `sdk` feature provides
-`NostrSdkRelayClient` through the `NostrRelayClient` boundary and relies on
-`nostr-sdk` for reconnect/backoff and relay status mechanics.
+It does not own MLS peeling, CGKA convergence, storage, account key custody, or real relay socket policy by default. The
+optional `sdk` feature provides `NostrSdkRelayClient` through the `NostrRelayClient` boundary and relies on `nostr-sdk`
+for reconnect/backoff and relay status mechanics.
 
 ## Key files
 
@@ -29,16 +27,14 @@ real relay socket policy by default. The optional `sdk` feature provides
 ## Invariants
 
 - Keep Nostr event DTO conversion delegated to `transport-nostr-peeler`.
-- Keep `TransportDeliverySource` metadata diagnostic only; do not feed it into
-  consensus decisions.
-- Preserve account-scoped deliveries even when group subscriptions share relay
-  endpoints.
+- Keep `TransportDeliverySource` metadata diagnostic only; do not feed it into consensus decisions.
+- Preserve account-scoped deliveries even when group subscriptions share relay endpoints.
 - Keep real relay clients behind `NostrRelayClient`.
 - Keep the `nostr-sdk` dependency behind the `sdk` feature.
-- Do not log relay URLs, account ids, group ids, message ids, subscription ids,
-  pubkeys, plaintext, ciphertext, or payload-derived values.
-- Use tracing `target` plus `method` fields so crate/module/method are visible
-  while diagnostic data stays aggregate-only.
+- Do not log relay URLs, account ids, group ids, message ids, subscription ids, pubkeys, plaintext, ciphertext, or
+  payload-derived values.
+- Use tracing `target` plus `method` fields so crate/module/method are visible while diagnostic data stays
+  aggregate-only.
 
 ## Verification
 

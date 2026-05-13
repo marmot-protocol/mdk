@@ -1,15 +1,17 @@
 # Codebase Survey
 
-> **Reference doc.** Raw data only — skip this unless you need to understand the current size, shape, or dependency structure of the repos. For architectural direction, read [[target-architecture]] instead.
+> **Reference doc.** Raw data only — skip this unless you need to understand the current size, shape, or dependency
+> structure of the repos. For architectural direction, read [[target-architecture]] instead.
 
-**What this covers:** LOC breakdowns, dependency graphs, and module structures for whitenoise (Flutter), whitenoise-rs (Rust application layer), and mdk (Rust protocol layer). Facts, not opinions.
+**What this covers:** LOC breakdowns, dependency graphs, and module structures for whitenoise (Flutter), whitenoise-rs
+(Rust application layer), and mdk (Rust protocol layer). Facts, not opinions.
 
 ## Line Counts
 
 ### mdk (~66K LOC Rust)
 
 | Crate | LOC | Purpose |
-|-------|-----|---------|
+| --- | --- | --- |
 | mdk-core | 14,666 | MLS/Nostr integration, group ops, message processing |
 | mdk-sqlite-storage | 9,758 | SQLCipher-backed persistent storage |
 | mdk-memory-storage | 7,011 | In-memory storage for testing |
@@ -18,6 +20,7 @@
 | mdk-macros | 343 | Builder/setter proc macros |
 
 **Largest files:**
+
 - `mdk-core/src/groups.rs` — 6,238 lines (group management)
 - `mdk-sqlite-storage/src/lib.rs` — 4,858 lines (StorageProvider impl)
 - `mdk-core/src/messages/commit.rs` — 2,461 lines (commit processing + rollback)
@@ -28,7 +31,7 @@
 ### whitenoise-rs (~100K LOC Rust)
 
 | Module | LOC | Purpose |
-|--------|-----|---------|
+| --- | --- | --- |
 | whitenoise/ (core) | ~29,366 | Application logic |
 | database/ | 22,015 | 29 SQLx domain modules |
 | relay_control/ | 6,994 | Relay plane architecture |
@@ -51,7 +54,7 @@
 ### whitenoise (Flutter)
 
 | Layer | LOC | Files |
-|-------|-----|-------|
+| --- | --- | --- |
 | Dart (total) | 66,255 | 241 |
 | Rust API wrapper | 4,864 | 20 modules |
 | FFI generated | ~351KB | frb_generated.dart |
@@ -66,19 +69,23 @@
 ### mdk Dependencies
 
 **Core crypto:**
+
 - openmls 0.8.1 + openmls_traits 0.5 + openmls_rust_crypto 0.5.1
 - chacha20poly1305, hkdf, sha2
 - nostr 0.44 (with nip44)
 
 **Storage:**
+
 - rusqlite (SQLCipher-bundled)
 - refinery (schema migrations)
 
 **Security:**
+
 - keyring-core 0.7 (platform keychains)
 - zeroize (secret memory wiping)
 
 **Serialization:**
+
 - serde + serde_json, postcard, tls_codec
 
 **Config:** Edition 2024, MSRV 1.90.0, workspace version 0.7.1
@@ -86,31 +93,33 @@
 ### whitenoise-rs Dependencies
 
 **Nostr:**
+
 - nostr-sdk (with NIP-44, NIP-59)
 - nostr-relay-builder (MockRelay for testing — transitive)
 
 **Async:**
+
 - tokio (full features)
 - futures
 
 **Storage:**
+
 - sqlx (SQLite, runtime-tokio)
 
 **Concurrency:**
+
 - dashmap
 
 **Crypto:**
+
 - mdk (local path dependency)
 
 **Config:** Edition 2024, MSRV 1.90.0, single workspace with proc-macro helper crate
 
 ### whitenoise (Flutter) Dependencies
 
-**State management:** flutter_riverpod, flutter_hooks, riverpod_annotation
-**Navigation:** go_router
-**FFI:** flutter_rust_bridge 2.11.1
-**Storage:** flutter_secure_storage
-**UI:** flutter_screenutil, cached_network_image
+**State management:** flutter_riverpod, flutter_hooks, riverpod_annotation **Navigation:** go_router **FFI:**
+flutter_rust_bridge 2.11.1 **Storage:** flutter_secure_storage **UI:** flutter_screenutil, cached_network_image
 **Platform:** platform-specific signer, notifications
 
 ## Module Structure Details
@@ -230,7 +239,7 @@ rust/src/api/ (20 modules, 4.8K LOC — thin FFI wrapper)
 ## Key Metrics
 
 | Metric | mdk | whitenoise-rs | whitenoise |
-|--------|-----|---------------|------------|
+| --- | --- | --- | --- |
 | Total LOC | ~66K Rust | ~100K Rust | 66K Dart + 5K Rust |
 | Crates/packages | 6 | 2 | 1 |
 | Edition | 2024 | 2024 | Flutter 3.x |

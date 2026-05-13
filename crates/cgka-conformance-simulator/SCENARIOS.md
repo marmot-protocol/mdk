@@ -2,15 +2,15 @@
 
 This is the human registry for simulator scenarios.
 
-The JSON manifest and report files are the machine-readable inventory. This file explains what each scenario sets
-up, what trouble it introduces, and what result the engine is supposed to produce.
+The JSON manifest and report files are the machine-readable inventory. This file explains what each scenario sets up,
+what trouble it introduces, and what result the engine is supposed to produce.
 
 ## Scenario Types
 
 Portable vectors live in `vectors/*.json`. They are the cross-implementation cases.
 
-Rust-only harness scenarios live in `tests/canonical_scenarios.rs`. They cover engine behavior that still needs
-direct harness access.
+Rust-only harness scenarios live in `tests/canonical_scenarios.rs`. They cover engine behavior that still needs direct
+harness access.
 
 Generated families live in `src/family.rs`. They produce seeded adversarial `ScenarioSpec` cases. Promote one into
 `vectors/` only when it should become a stable named contract.
@@ -88,8 +88,7 @@ These are the scenarios another implementation should be able to load from JSON 
 ### `partition-clear-leave/v1`
 
 - File: `vectors/partition-clear-leave.v1.json`
-- Setup: Alice creates a group with Bob. Bob sends while partitioned, then sends after the partition clears and
-  leaves.
+- Setup: Alice creates a group with Bob. Bob sends while partitioned, then sends after the partition clears and leaves.
 - Pressure: partition, partition repair, and self-remove.
 - Expected: Alice ignores the hidden partitioned payload, receives the visible payload, and ends with Bob removed.
 
@@ -119,8 +118,7 @@ These are real simulator scenarios that are still tied to Rust harness details.
 
 ### `delayed_past_epoch_app_message_peels_from_retained_anchor`
 
-- Setup: Bob sends an epoch-1 app message. Alice advances the group by inviting David. The old app message arrives
-  late.
+- Setup: Bob sends an epoch-1 app message. Alice advances the group by inviting David. The old app message arrives late.
 - Expected: Carol processes the late app message by using retained epoch context.
 - Reason: the fixed vector covers the same behavior; this test keeps byte-level storage state close.
 
@@ -133,14 +131,14 @@ These are real simulator scenarios that are still tied to Rust harness details.
 ### `deliberate_fork_via_harness`
 
 - Setup: Alice and Bob concurrently invite different new members while a partition hides each branch.
-- Expected: one branch wins by deterministic ordering. One peer rolls back, and Alice and Bob end on the same
-  member set.
+- Expected: one branch wins by deterministic ordering. One peer rolls back, and Alice and Bob end on the same member
+  set.
 - Reason: the test inspects recovery observations and exact branch ordering keys.
 
 ### `convergence-e2e-group-events/v1`
 
-- Setup: Alice creates a four-member group. Alice and Bob race invite commits and each branch has an app payload.
-  Carol and Frank ingest through the real Nostr peeler path.
+- Setup: Alice creates a four-member group. Alice and Bob race invite commits and each branch has an app payload. Carol
+  and Frank ingest through the real Nostr peeler path.
 - Expected: observers accept the selected branch payload, exclude the losing branch payload, and converge at epoch 2.
 - Reason: the trace does not yet carry enough selected-branch detail for a portable fixture.
 
@@ -153,9 +151,9 @@ These are real simulator scenarios that are still tied to Rust harness details.
 
 ## Generated Scenario Families
 
-Generated cases are deterministic for a fixed family, seed, and case index. They are run directly as generated
-coverage. A generated case becomes a vector only when we want it to be a stable named contract: for example, when it
-caught a regression, covers a new semantic edge, or is the smallest readable example of a behavior.
+Generated cases are deterministic for a fixed family, seed, and case index. They are run directly as generated coverage.
+A generated case becomes a vector only when we want it to be a stable named contract: for example, when it caught a
+regression, covers a new semantic edge, or is the smallest readable example of a behavior.
 
 ### `send-leave/v1`
 
@@ -247,10 +245,9 @@ caught a regression, covers a new semantic edge, or is the smallest readable exa
 
 These tests keep the simulator machinery honest.
 
-- `canonical_vector_fixtures_match_generated_traces` checks that every top-level JSON scenario vector still matches
-  its expected trace or semantic outcomes.
-- `tests/report_runner.rs` checks CLI parsing, report JSON writing, fixture-candidate writing, and pass/fail
-  summaries.
+- `canonical_vector_fixtures_match_generated_traces` checks that every top-level JSON scenario vector still matches its
+  expected trace or semantic outcomes.
+- `tests/report_runner.rs` checks CLI parsing, report JSON writing, fixture-candidate writing, and pass/fail summaries.
 - `src/oracle.rs` and `tests/report_runner.rs` check that reports name their stimuli, expected behavior classes,
   observed behavior classes, and weak-oracle warnings.
 - `failing_generated_case_records_a_minimized_reproducer` checks that a failing generated case records a smaller

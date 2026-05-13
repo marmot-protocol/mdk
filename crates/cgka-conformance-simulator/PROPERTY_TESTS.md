@@ -12,7 +12,7 @@ The tests live in `tests/proptest_invariants.rs`. Shared generators live in `src
 `cargo test -p cgka-conformance-simulator --features conformance-slow` raises the count for broader search.
 
 | Property | Normal cases | Slow cases |
-|---|---:|---:|
+| --- | --- | --- |
 | Candidate graph selection | 128 | 1000 |
 | Canonicalization dispositions | 128 | 1000 |
 | Canonicalization replay | 128 | 1000 |
@@ -36,24 +36,23 @@ The tests live in `tests/proptest_invariants.rs`. Shared generators live in `src
 
 ### `prop_canonicalization_dispositions_are_order_invariant`
 
-- Generates: symbolic proposal and app-message batches with selected-branch messages, losing-branch messages,
-  pending proposals, duplicates, and delivery-order variants.
+- Generates: symbolic proposal and app-message batches with selected-branch messages, losing-branch messages, pending
+  proposals, duplicates, and delivery-order variants.
 - Checks: accepted apps, invalidated apps, accepted proposals, dropped proposals, and already-seen messages stay the
   same after reordering.
 - Why: the convergence layer must classify messages by branch validity and message id, not by arrival order.
 
 ### `prop_canonicalization_replay_is_already_seen`
 
-- Generates: the same symbolic batch shape as the disposition property, with every message id already in the seen
-  set.
+- Generates: the same symbolic batch shape as the disposition property, with every message id already in the seen set.
 - Checks: replay emits no app output, no invalidations, no drops, and no accepted proposals or commits. Every replayed
   occurrence is reported as already seen.
 - Why: replay should be idempotent and should not produce app-visible events twice.
 
 ### `prop_quiescence_gate_controls_stability`
 
-- Generates: a selected commit, an outbound app intent, a generated stability window, and an early timestamp inside
-  that window.
+- Generates: a selected commit, an outbound app intent, a generated stability window, and an early timestamp inside that
+  window.
 - Checks: before the window closes, sync state stays `Syncing` and outbound work stays queued. At the window boundary,
   the same input becomes `Stable` and releases outbound work.
 - Why: the engine should wait for branch races to settle before publishing queued local work.
@@ -88,8 +87,7 @@ The tests live in `tests/proptest_invariants.rs`. Shared generators live in `src
 ### `prop_group_data_update_publish_lifecycle`
 
 - Generates: a group-data name and a publish outcome: confirm or fail.
-- Checks: confirm keeps the projected epoch and group name. Fail restores the previous stable state and permits a
-  retry.
+- Checks: confirm keeps the projected epoch and group name. Fail restores the previous stable state and permits a retry.
 - Why: group metadata updates must obey the same pending-publish lifecycle as other group evolutions.
 
 ### `prop_true_same_id_replay`

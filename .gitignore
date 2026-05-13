@@ -3,3 +3,5 @@
 
 # Rust build outputs at any workspace depth
 target/
+
+plans/
