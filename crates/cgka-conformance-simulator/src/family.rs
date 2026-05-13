@@ -196,7 +196,7 @@ fn convergence_chaos_case(
     rng: &mut StdRng,
     case_index: u64,
 ) -> (ScenarioSpec, Vec<TraceExpectation>) {
-    match case_index % 10 {
+    match case_index % 11 {
         0 => convergence_chaos_invite_fork(case_index),
         1 => convergence_chaos_group_data_fork(case_index),
         2 => convergence_chaos_rollback_queue_faults(rng, case_index),
@@ -206,7 +206,8 @@ fn convergence_chaos_case(
         6 => convergence_chaos_large_message_storm(case_index),
         7 => convergence_chaos_large_partitioned_storm(case_index),
         8 => convergence_chaos_large_commit_storm(case_index),
-        _ => convergence_chaos_large_mixed_message_commit_storm(case_index),
+        9 => convergence_chaos_large_mixed_message_commit_storm(case_index),
+        _ => convergence_chaos_restart_delivery_faults(case_index),
     }
 }
 
@@ -701,6 +702,53 @@ fn convergence_chaos_large_mixed_message_commit_storm(
             &format!("{committer}-mixed-update"),
         ));
     }
+    (scenario, expected)
+}
+
+fn convergence_chaos_restart_delivery_faults(
+    case_index: u64,
+) -> (ScenarioSpec, Vec<TraceExpectation>) {
+    let payload = format!("bob:restart-delivery:{case_index}");
+    let scenario = ScenarioSpec {
+        name: format!("convergence-chaos/v1/case-{case_index}"),
+        spec_version: "1".into(),
+        clients: labels(["alice", "bob", "carol"]),
+        steps: vec![
+            create_group(
+                "alice",
+                format!("restart-delivery-{case_index}"),
+                ["bob", "carol"],
+                "create",
+            ),
+            confirmed_step("alice", "create"),
+            ScenarioStep::DeliverAll,
+            tick(["bob", "carol"]),
+            clear(["alice", "bob", "carol"]),
+            ScenarioStep::SendAppMessage {
+                sender: "bob".into(),
+                payload: payload.clone(),
+            },
+            ScenarioStep::DelayQueued {
+                index: 0,
+                delayed: "restart-delayed".into(),
+            },
+            ScenarioStep::RestartClient {
+                client: "alice".into(),
+            },
+            ScenarioStep::ReleaseDelayed {
+                delayed: "restart-delayed".into(),
+            },
+            ScenarioStep::DuplicateQueued { index: 0 },
+            ScenarioStep::ReorderQueued { order: vec![1, 0] },
+            ScenarioStep::DeliverAll,
+            tick(["alice"]),
+            observe(["alice"]),
+        ],
+    };
+    let expected = vec![
+        confirmed(1, "alice", "create"),
+        client_state("alice", 1, 3, vec![payload]),
+    ];
     (scenario, expected)
 }
 

@@ -1,6 +1,6 @@
 {
   "manifest_version": "1",
-  "updated": "2026-05-12",
+  "updated": "2026-05-13",
   "purpose": "Inventory of current CGKA conformance artifacts and the next vectorization state for each one.",
   "entries": [
     {
@@ -137,6 +137,19 @@
       "next": "Use as the retained-anchor app-message fixture."
     },
     {
+      "id": "restart-delivery-faults/v1",
+      "kind": "scenario_vector",
+      "status": "portable",
+      "artifact": "restart-delivery-faults.v1.json",
+      "coverage": [
+        "engine restart over durable in-memory storage",
+        "stable group hydration after restart",
+        "delayed duplicate delivery after restart",
+        "single app payload emission after replay"
+      ],
+      "next": "Use as the restart-plus-delivery-fault fixture."
+    },
+    {
       "id": "convergence-e2e-group-events/v1",
       "kind": "scenario",
       "status": "rust_only_bridge",
@@ -167,7 +180,7 @@
         "event conservation",
         "seeded report artifacts"
       ],
-      "next": "Select minimized failures or high-signal cases and promote them to fixed vectors."
+      "next": "Promote only minimized failures or cases that should become named contracts."
     },
     {
       "id": "convergence-e2e-delivery/v1",
@@ -178,7 +191,7 @@
         "delay and release",
         "reorder before convergence observation"
       ],
-      "next": "Promote stable variants after selecting high-signal generated cases and pinning their semantic recovery outcomes."
+      "next": "Promote only selected variants after their semantic recovery outcomes are stable."
     },
     {
       "id": "convergence-chaos/v1",
@@ -195,9 +208,10 @@
         "20+ client partitioned delivery storms",
         "multi-committer group-data storms",
         "mixed large message and commit storms",
+        "restart plus duplicate delivery",
         "greedy generated-failure minimization"
       ],
-      "next": "Run seeded report batches, promote high-signal cases from the emitted fixture candidates, and improve the minimizer with domain-aware shrinking."
+      "next": "Run seeded batches, promote only cases we want named, and improve the minimizer."
     },
     {
       "id": "selector-policy-cases/v1",

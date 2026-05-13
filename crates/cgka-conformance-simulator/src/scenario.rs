@@ -5,8 +5,9 @@
 //! their observed trace to exact or semantic fixture expectations.
 
 use crate::{
-    ClientBuilder, ExpectationFailure, HarnessClient, PendingResolutionObservation, ScenarioTrace,
-    TraceExpectation, TransportBus, VectorFixture, compare_trace_expectations, observe_client,
+    ClientBuilder, ExpectationFailure, HarnessClient, PendingResolutionObservation,
+    ScenarioOracleReport, ScenarioTrace, TraceExpectation, TransportBus, VectorFixture,
+    build_scenario_oracle_report, compare_trace_expectations, observe_client,
 };
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
@@ -90,6 +91,9 @@ pub enum ScenarioStep {
         allow: Vec<String>,
     },
     ClearPartition,
+    RestartClient {
+        client: String,
+    },
 }
 
 impl ScenarioStep {
@@ -113,6 +117,7 @@ impl ScenarioStep {
             ScenarioStep::ReorderQueued { .. } => "reorder_queued",
             ScenarioStep::SetPartition { .. } => "set_partition",
             ScenarioStep::ClearPartition => "clear_partition",
+            ScenarioStep::RestartClient { .. } => "restart_client",
         }
     }
 }
@@ -125,6 +130,7 @@ pub struct ScenarioReport {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub expected_outcomes: Vec<TraceExpectation>,
     pub observed_trace: Option<ScenarioTrace>,
+    pub oracle: ScenarioOracleReport,
     pub step_log: Vec<ScenarioStepLogEntry>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pending_resolution_observations: Vec<PendingResolutionObservation>,
@@ -427,6 +433,10 @@ async fn run_scenario_report_inner(
                 bus.set_partition(Some(allowed));
             }
             ScenarioStep::ClearPartition => bus.set_partition(None),
+            ScenarioStep::RestartClient { client } => {
+                let client = client_mut(&mut clients, client, step_index)?;
+                client.restart();
+            }
         }
         step_log.push(ScenarioStepLogEntry {
             step_index,
@@ -477,6 +487,12 @@ async fn run_scenario_report_inner(
     let expectation_failures =
         compare_trace_expectations(expected_trace.as_ref(), &expected_outcomes, &observed_trace);
     let invariant_failures = invariant_failures(&expectation_failures);
+    let oracle = build_scenario_oracle_report(
+        spec,
+        expected_trace.as_ref(),
+        &expected_outcomes,
+        &observed_trace,
+    );
 
     Ok(ScenarioReport {
         metadata: ScenarioReportMetadata {
@@ -490,6 +506,7 @@ async fn run_scenario_report_inner(
         expected_trace,
         expected_outcomes,
         observed_trace: Some(observed_trace),
+        oracle,
         step_log,
         pending_resolution_observations,
         recovery_observations,

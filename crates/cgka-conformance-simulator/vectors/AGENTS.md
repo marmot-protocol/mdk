@@ -8,6 +8,8 @@ Map for portable JSON vector fixtures.
   `expected_trace` output or semantic `expected_outcomes`.
 - Keep `manifest.v1.json` updated when adding a scenario, generated family,
   formal case fixture, or byte-level vector.
+- Keep `../SCENARIOS.md` updated when adding or changing a runnable scenario
+  vector.
 - Byte-level fixtures live under `byte-fixtures/` and follow
   `byte-fixtures/schema.v1.json`.
 - Keep fixture names stable and versioned, usually `name.v1.json`.

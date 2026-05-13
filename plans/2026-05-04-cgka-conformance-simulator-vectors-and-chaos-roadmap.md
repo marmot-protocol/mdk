@@ -69,17 +69,18 @@ Current fixture coverage:
 - Each fixture includes a runnable `ScenarioSpec` input and either exact
   `ScenarioTrace` output or semantic expected outcomes.
 - `ScenarioSpec` includes fixture-visible queue faults for drop, duplicate,
-  delay/release, reorder, partition, and heal.
+  delay/release, reorder, partition/heal, and client restart.
 - `generate_send_leave_family` emits deterministic generated cases with
   family name, generator version, seed, case index, and runnable
   `ScenarioSpec`.
 - `generate_convergence_chaos_family` emits deterministic adversarial
   convergence cases with runnable `ScenarioSpec`s and semantic expectations,
   including large 20+ client message storms, partitioned large-group storms,
-  multi-committer group-data storms, and mixed message/commit storms.
+  multi-committer group-data storms, mixed message/commit storms, and restart
+  plus duplicate delivery.
 - `run_scenario_report` emits serializable metadata, expected trace, observed
-  trace, executed scenario input, step log, recovery observations, expectation
-  failures, and invariant failures.
+  trace, executed scenario input, oracle coverage evidence, step log, recovery
+  observations, expectation failures, and invariant failures.
 - `run_generated_case_report` adds generated-family metadata and records a
   minimized case when conservative greedy step removal can reproduce the same
   failure kinds.
@@ -90,8 +91,8 @@ Current fixture coverage:
 - Portable scenario fixtures now cover message exchange, create rollback,
   invite success, invite rollback, group-data update, queue drop,
   duplicate/delay/reorder queue faults, partition heal with leave, delayed
-  past-epoch app delivery, group-data fork recovery, and concurrent-invite
-  fork recovery.
+  past-epoch app delivery, restart plus delayed duplicate delivery, group-data
+  fork recovery, and concurrent-invite fork recovery.
 - Fixture-loading tests regenerate portable fixture traces and compare either
   exact traces or semantic expected outcomes.
 
@@ -100,13 +101,15 @@ Current gaps after the generated-delivery slice:
 - Generated family coverage includes send/leave, convergence E2E delivery
   variants, and `convergence-chaos/v1` for invite races, group-data races,
   publish rollback, partition/heal/leave, delayed past-epoch app delivery,
-  queue faults, large-group message storms, partitioned large-group storms, and
-  multi-committer storms. Restart/storage-loss families remain open.
+  queue faults, large-group message storms, partitioned large-group storms,
+  multi-committer storms, mixed message/commit storms, and restart plus
+  duplicate delivery. Storage-loss families remain open.
 - Generated failures now run a conservative greedy minimizer. It is useful for
   dropping removable app/delivery noise, but it is not yet a domain-specific
   shrinker for joins, commits, or client topology.
-- Fixture reports now expose semantic expectation mismatches directly; the next
-  reporting gap is richer grouping by scenario family and failure kind.
+- Fixture reports now expose semantic expectation mismatches and oracle coverage
+  evidence directly; the next reporting gap is richer grouping by scenario
+  family and failure kind.
 
 ## Ideas Borrowed From FIPS Chaos
 
@@ -214,7 +217,7 @@ Start with small families:
 - Invite races with deterministic winner checks.
 - Update group data interleaved with application traffic.
 - Publish confirm/fail sequences.
-- Restart-like storage rollback cases once restart support exists.
+- Restart/reopen delivery cases.
 
 Generated failures should be convertible into fixed fixtures.
 
@@ -224,7 +227,7 @@ delivery variants around the real-peeler convergence bridge.
 `convergence-chaos/v1` is complete for first-pass adversarial convergence
 cases with semantic expectations, fixture-candidate output, 20+ client message
 storms, partitioned large-group storms, multi-committer group-data storms, and
-mixed message/commit storms.
+mixed message/commit storms, and restart plus duplicate delivery.
 
 ### Phase 4A - Use Semantic Scenario Expectations
 

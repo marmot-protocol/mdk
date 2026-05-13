@@ -22,7 +22,8 @@ envelope and welcomes use NIP-59 gift wraps before the bus delivers them.
 - `VectorFixture` — portable JSON fixtures pairing runnable scenario input
   with exact traces or semantic expected outcomes.
 - `ScenarioReport` — serializable run artifacts with metadata, expected and
-  observed traces, step logs, recoveries, and expectation failures.
+  observed traces, oracle coverage evidence, step logs, recoveries, and
+  expectation failures.
 - `cgka-conformance-simulator-report` — a small CLI that runs generated
   scenario families, writes JSON reports, and emits fixture candidates for
   generated cases.
@@ -33,10 +34,12 @@ envelope and welcomes use NIP-59 gift wraps before the bus delivers them.
 
 | Layer | Files | What it catches |
 |---|---|---|
+| Scenario registry | [`SCENARIOS.md`](SCENARIOS.md) | Human-readable setup, fault shape, and expected outcome for each scenario family. |
 | Scripted scenarios | [`tests/canonical_scenarios.rs`](tests/canonical_scenarios.rs) | Known multi-client flows and named regressions. |
 | Vector fixtures | [`vectors/`](vectors/) | Portable conformance cases that other implementations can run. |
 | Generated families | [`src/family.rs`](src/family.rs), report CLI | Seeded adversarial cases, report artifacts, and fixture candidates. |
-| Property tests | [`tests/proptest_invariants.rs`](tests/proptest_invariants.rs) | Broad invariant checks over many generated inputs. |
+| Oracle coverage | [`src/oracle.rs`](src/oracle.rs), report CLI | Which stimuli were run, which behaviors were expected, and which behaviors were observed. |
+| Property tests | [`PROPERTY_TESTS.md`](PROPERTY_TESTS.md), [`tests/proptest_invariants.rs`](tests/proptest_invariants.rs) | Broad invariant checks over many generated inputs. |
 | Replay probes | [`tests/openmls_replay_probe.rs`](tests/openmls_replay_probe.rs) | Byte-first replay behavior and fixture materialization probes. |
 
 ## Run the tests
@@ -69,7 +72,8 @@ epoch observations, and the mismatched expected/actual JSON.
 ## Property tests
 
 Property tests live in
-[`tests/proptest_invariants.rs`](tests/proptest_invariants.rs). They generate
+[`tests/proptest_invariants.rs`](tests/proptest_invariants.rs). See
+[`PROPERTY_TESTS.md`](PROPERTY_TESTS.md) for the human-readable registry. They generate
 many small inputs and assert rules that should hold for every generated shape:
 candidate selection order-invariance, canonicalization disposition
 order-invariance, canonicalization replay idempotence, quiescence gating,
@@ -106,8 +110,12 @@ The crate now has [`vectors/manifest.v1.json`](vectors/manifest.v1.json),
 [`vectors/byte-fixtures/schema.v1.json`](vectors/byte-fixtures/schema.v1.json),
 first app-component byte fixtures, and portable scenario vectors for message
 exchange, pending rollback, invites, group-data updates, queue faults,
-partition repair, leave, delayed past-epoch app delivery, and fork recovery. It
-does not yet have a full byte-level wire-event suite.
+partition repair, leave, delayed past-epoch app delivery, restart plus delayed
+duplicate delivery, and fork recovery. It does not yet have a full byte-level
+wire-event suite.
+
+For a human-readable list of each fixed scenario, generated family, and Rust-only
+harness case, read [`SCENARIOS.md`](SCENARIOS.md).
 
 `convergence-e2e-group-events/v1` is kept as an in-tree bridge scenario rather
 than a portable JSON fixture. Raw harness messages enter through the Nostr
@@ -160,6 +168,7 @@ steps are:
 - `reorder_queued`
 - `set_partition`
 - `clear_partition`
+- `restart_client`
 
 Pending operations are referenced by string labels chosen inside the scenario.
 Client labels are stable logical names; the Rust harness maps them to
@@ -183,9 +192,11 @@ of the queue.
 - `scenario`
 - `expected_outcomes`
 
-The generated `scenario` is a normal `ScenarioSpec`, so a failing generated
-case can be serialized and promoted into a fixed fixture without inventing a
-separate execution path.
+The generated `scenario` is a normal `ScenarioSpec`, so a selected generated
+case can be serialized into a fixed fixture without inventing a separate
+execution path. We promote a case only when it should become a stable named
+contract, such as a regression fixture or the smallest readable example of a
+semantic edge.
 
 `generate_convergence_e2e_delivery_family(seed, cases)` produces deterministic
 variants of `convergence-e2e-group-events/v1`. Each variant keeps the logical
@@ -202,9 +213,10 @@ generator version rotates through invite forks, group-data forks, publish
 rollback plus delayed duplicates, partition/heal/leave, delayed past-epoch app
 delivery, stable duplicate/delay/reorder queue faults, 20+ client message
 storms, partitioned large-group delivery storms, multi-committer group-data
-storms, and mixed large message/commit storms. These cases are ordinary
-`ScenarioSpec`s, so the same runner and report path can promote any interesting
-case into a fixed vector.
+storms, mixed large message/commit storms, and restart plus duplicate delivery
+faults. These cases are ordinary `ScenarioSpec`s, so the same runner and report
+path can turn selected generated cases into fixed vectors when that makes the
+conformance contract clearer.
 
 ## Report artifacts
 
@@ -217,7 +229,11 @@ serializable `ScenarioReport` with:
 - `expected_trace` — the trace being checked, when supplied.
 - `expected_outcomes` — semantic fixture expectations, when supplied.
 - `observed_trace` — the trace produced by the scenario runner.
+- `oracle` — scenario stimuli, expected behavior classes, observed behavior
+  classes, evidence counts, and weak-oracle warnings.
 - `step_log` — one entry per completed scenario step.
+- `pending_resolution_observations` — flattened publish confirmations and
+  rollbacks.
 - `recovery_observations` — flattened fork-recovery events from all client
   observations.
 - `epoch_change_observations` — flattened `EpochChanged` events from all

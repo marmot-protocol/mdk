@@ -108,9 +108,14 @@ The first convergence-focused generated chaos family is
 expectations for invite forks, group-data forks, publish rollback, partitions
 and leaves, delayed past-epoch app messages, duplicate/delay/reorder queue
 faults, 20+ client message storms, partitioned large-group storms,
-multi-committer group-data storms, and mixed message/commit storms. Each run
-writes both a report and a `*-fixture.v1.json` candidate so a high-signal
-generated case can become a permanent vector after review. Failing generated
+multi-committer group-data storms, mixed message/commit storms, and restart
+plus duplicate delivery. Each run writes both a report and a
+`*-fixture.v1.json` candidate. We promote a generated case only when it should
+become a stable named contract, such as a regression fixture or a small readable
+example of a semantic edge. The first promoted restart case is
+`restart-delivery-faults/v1`. Reports include oracle coverage evidence so a
+reviewer can see which stimuli were present, which behavior classes were
+expected, and which behavior classes were actually observed. Failing generated
 cases also run a conservative greedy minimizer and record a smaller reproducer
 when removable app/delivery steps can be dropped without changing the failure
 kinds.

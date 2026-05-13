@@ -401,6 +401,8 @@ pub struct ClientObservation {
     pub client: String,
     pub epoch: u64,
     pub member_count: usize,
+    #[serde(default)]
+    pub event_counts: ClientEventCounts,
     pub received_payloads: Vec<String>,
     #[serde(default)]
     pub added_members: Vec<String>,
@@ -410,6 +412,16 @@ pub struct ClientObservation {
     #[serde(default)]
     pub app_invalidations: Vec<AppInvalidationObservation>,
     pub recoveries: Vec<ForkRecoveryObservation>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientEventCounts {
+    pub message_received: usize,
+    pub member_added: usize,
+    pub member_removed: usize,
+    pub epoch_changed: usize,
+    pub app_invalidated: usize,
+    pub fork_recovered: usize,
 }
 
 fn client_observation<'a>(
@@ -464,10 +476,37 @@ pub struct RecoveryOrderingKeyObservation {
 
 pub fn observe_client(label: impl Into<String>, client: &mut HarnessClient) -> ClientObservation {
     let events = client.drain_events();
+    let event_counts = ClientEventCounts {
+        message_received: events
+            .iter()
+            .filter(|event| matches!(event, GroupEvent::MessageReceived { .. }))
+            .count(),
+        member_added: events
+            .iter()
+            .filter(|event| matches!(event, GroupEvent::MemberAdded { .. }))
+            .count(),
+        member_removed: events
+            .iter()
+            .filter(|event| matches!(event, GroupEvent::MemberRemoved { .. }))
+            .count(),
+        epoch_changed: events
+            .iter()
+            .filter(|event| matches!(event, GroupEvent::EpochChanged { .. }))
+            .count(),
+        app_invalidated: events
+            .iter()
+            .filter(|event| matches!(event, GroupEvent::AppMessageInvalidated { .. }))
+            .count(),
+        fork_recovered: events
+            .iter()
+            .filter(|event| matches!(event, GroupEvent::ForkRecovered { .. }))
+            .count(),
+    };
     ClientObservation {
         client: label.into(),
         epoch: client.epoch().0,
         member_count: client.members().len(),
+        event_counts,
         received_payloads: events
             .iter()
             .filter_map(|e| match e {

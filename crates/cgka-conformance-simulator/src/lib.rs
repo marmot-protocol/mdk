@@ -21,6 +21,7 @@
 pub mod bus;
 pub mod client;
 pub mod family;
+pub mod oracle;
 pub mod policy_cases;
 pub mod proptest_support;
 pub mod report;
@@ -35,6 +36,12 @@ pub use family::{
     generate_convergence_e2e_delivery_family, generate_send_leave_family,
     run_generated_case_report,
 };
+pub use oracle::{
+    BehaviorEvidenceSummary, CoverageMatrixEntry, OracleBehavior, OracleCoverageWarning,
+    ScenarioOracleReport, ScenarioStimulus, behavior_evidence, build_scenario_oracle_report,
+    coverage_matrix_entry, expected_behaviors, property_test_coverage_entries, scenario_stimuli,
+    trace_behaviors,
+};
 pub use report::{
     ReportArgs, ReportCommand, ReportFailureSummary, ReportInput, ReportRunSummary,
     ScenarioReportSummary, parse_report_command, report_usage, run_report,
@@ -47,8 +54,8 @@ pub use scenario::{
     run_vector_fixture_report,
 };
 pub use vector::{
-    AppInvalidationObservation, ClientObservation, EpochChangeObservation, ExpectationFailure,
-    ForkRecoveryObservation, PendingResolutionObservation, RecoveryOrderingKeyObservation,
-    ScenarioTrace, TraceExpectation, VectorFixture, VectorMismatch, compare_trace_expectations,
-    observe_client,
+    AppInvalidationObservation, ClientEventCounts, ClientObservation, EpochChangeObservation,
+    ExpectationFailure, ForkRecoveryObservation, PendingResolutionObservation,
+    RecoveryOrderingKeyObservation, ScenarioTrace, TraceExpectation, VectorFixture, VectorMismatch,
+    compare_trace_expectations, observe_client,
 };

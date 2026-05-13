@@ -1,6 +1,8 @@
 # AGENTS.md — cgka-conformance-simulator
 
-Read [`README.md`](README.md) for the human framing. This file is the agent-facing model.
+Read [`README.md`](README.md) for the human framing, [`SCENARIOS.md`](SCENARIOS.md)
+for the scenario registry, and [`PROPERTY_TESTS.md`](PROPERTY_TESTS.md) for the
+property-test registry. This file is the agent-facing model.
 
 ## Pieces
 
@@ -11,6 +13,7 @@ Read [`README.md`](README.md) for the human framing. This file is the agent-faci
 | `src/client.rs` | `HarnessClient` + `ClientBuilder`. Wraps an `Engine<MemoryStorage>`, a real `NostrMlsPeeler`, and the bus handle. `tick().await` drains pending inbound for one client. `confirm(pending).await` finishes a `GroupEvolution`. |
 | `cgka_engine::convergence` | Candidate-state graph scoring rules for the distributed convergence design, re-exported by this crate for tests. These tests pin selector policy independently from OpenMLS replay. |
 | `src/family.rs` | Deterministic generated scenario families. `generate_send_leave_family`, `generate_convergence_e2e_delivery_family`, and `generate_convergence_chaos_family` record family name, generator version, seed, case index, runnable `ScenarioSpec`, and optional semantic expectations. `run_generated_case_report` adds generated metadata to report artifacts. |
+| `src/oracle.rs` | Scenario oracle and coverage evidence. Computes scenario stimuli, expected behavior classes, observed behavior classes, weak-oracle warnings, and coverage matrix rows. |
 | `cgka_engine::openmls_projection` | Bytes-first OpenMLS projection and candidate materialization helpers, re-exported by this crate for tests. Parses MLS bytes, replays candidate paths against a snapshot, observes proposal refs / staged commits / app decryptions, rolls storage back, and can run the canonicalizer with OpenMLS-derived pending proposal/app-message evidence. |
 | `src/proptest_support.rs` | `intent_seq(n_clients, range)` proptest strategy. Generates `HarnessIntent::Send` and `HarnessIntent::Leave`; `delivery_profile()` covers FIFO, reverse, and seeded-random delivery. Other properties in `tests/proptest_invariants.rs` generate symbolic canonicalization, capability, lifecycle, and restart cases locally. |
 | `src/scenario.rs` | Serializable `ScenarioSpec` v1 plus `run_scenario_spec` / `run_scenario_report` / `run_vector_fixture_report`. Drives ordered client operations from JSON-shaped scenario data and returns either a `ScenarioTrace` or a serializable report with the executed scenario, metadata, step log, flattened epoch changes, app invalidations, recoveries, expectation failures, and invariant failures. |
@@ -54,9 +57,9 @@ convergence shapes: invite fork recovery, group-data fork recovery, rollback
 plus delayed duplicate delivery, partition/heal/leave, delayed past-epoch app
 delivery, stable duplicate/delay/reorder queue faults, 20+ client message
 storms, partitioned large-group delivery storms, multi-committer group-data
-storms, and mixed large message/commit storms. These cases carry semantic
-`expected_outcomes`, so report failures point at the broken convergence
-invariant instead of only writing an observation dump.
+storms, mixed large message/commit storms, and restart plus duplicate delivery
+faults. These cases carry semantic `expected_outcomes`, so report failures point
+at the broken convergence invariant instead of only writing an observation dump.
 
 ## How to add a new scripted scenario
 
@@ -65,6 +68,7 @@ invariant instead of only writing an observation dump.
 3. Build N clients with `ClientBuilder::new(pad32(b"alice")).registry(registry()).attach(&bus)` only when the test needs lower-level harness control. The label bytes seed deterministic Nostr keys; use `client.member_id()` when a scenario needs the actual engine member id.
 4. Drive manual scenarios with `client.send_*` / `bus.deliver_all()` / `client.tick().await`.
 5. Assert on `client.epoch()`, `client.members()`, `observe_client(...)`, or `run_scenario_report(...)` depending on the test surface.
+6. Update [`SCENARIOS.md`](SCENARIOS.md) with the setup, fault shape, and expected outcome.
 
 Look at `three_client_happy_path_via_harness` for the canonical shape.
 
@@ -129,6 +133,7 @@ cargo run -p cgka-conformance-simulator --bin cgka-conformance-simulator-report 
    smaller case counts; pure selector/canonicalization properties can run more
    cases. The `conformance-slow` feature should raise counts according to test
    cost, rather than forcing every property to the same number.
+5. Update [`PROPERTY_TESTS.md`](PROPERTY_TESTS.md) with generated inputs, the rule being checked, and the case counts.
 
 ## Coverage gaps
 
@@ -136,7 +141,7 @@ These are tracked in [`../../plans/2026-05-04-cgka-conformance-simulator-vectors
 
 - **`HarnessIntent` does not generate Invite / UpgradeCapabilities / UpdateGroupData.** Invite needs client minting inside a strategy; the scripted tests cover it today. Upgrade and group-data update lifecycle are covered by separate generated properties.
 - **Partition policy is scripted, not strategy-driven.** The bus supports partitions; proptest currently drives FIFO / Reverse / SeededRandom.
-- **Generated family coverage is now convergence-focused but not exhaustive.** `send-leave/v1` records lifecycle metadata, `convergence-e2e-delivery/v1` mutates the convergence E2E bridge with duplicate/delay/reorder delivery, and `convergence-chaos/v1` covers invite races, group-data races, publish rollback, partitions, leaves, delayed past-epoch app delivery, queue faults, 20+ client message storms, partitioned large-group storms, multi-committer group-data storms, and mixed message/commit storms. Restart/storage-loss families are still future work.
+- **Generated family coverage is now convergence-focused but not exhaustive.** `send-leave/v1` records lifecycle metadata, `convergence-e2e-delivery/v1` mutates the convergence E2E bridge with duplicate/delay/reorder delivery, and `convergence-chaos/v1` covers invite races, group-data races, publish rollback, partitions, leaves, delayed past-epoch app delivery, queue faults, 20+ client message storms, partitioned large-group storms, multi-committer group-data storms, mixed message/commit storms, and restart plus duplicate delivery. Storage-loss families are still future work.
 - **Failure minimization is intentionally conservative.** Generated reports populate `minimized_case` with a greedy step-removal reducer when removable app/delivery noise can be dropped without changing the failure kinds. There is no domain-specific shrinker yet.
 
 ## Conventions

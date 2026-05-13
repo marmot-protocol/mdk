@@ -249,6 +249,10 @@ async fn three_client_message_exchange_vector_is_stable() {
                     client: "alice".into(),
                     epoch: 1,
                     member_count: 3,
+                    event_counts: cgka_conformance_simulator::ClientEventCounts {
+                        message_received: 2,
+                        ..Default::default()
+                    },
                     received_payloads: vec!["bob:hello".into(), "carol:hello".into()],
                     added_members: vec![],
                     removed_members: vec![],
@@ -260,6 +264,10 @@ async fn three_client_message_exchange_vector_is_stable() {
                     client: "bob".into(),
                     epoch: 1,
                     member_count: 3,
+                    event_counts: cgka_conformance_simulator::ClientEventCounts {
+                        message_received: 2,
+                        ..Default::default()
+                    },
                     received_payloads: vec!["alice:hello".into(), "carol:hello".into()],
                     added_members: vec![],
                     removed_members: vec![],
@@ -271,6 +279,10 @@ async fn three_client_message_exchange_vector_is_stable() {
                     client: "carol".into(),
                     epoch: 1,
                     member_count: 3,
+                    event_counts: cgka_conformance_simulator::ClientEventCounts {
+                        message_received: 2,
+                        ..Default::default()
+                    },
                     received_payloads: vec!["alice:hello".into(), "bob:hello".into()],
                     added_members: vec![],
                     removed_members: vec![],
@@ -712,6 +724,14 @@ async fn convergence_chaos_family_generates_specs_with_semantic_expectations() {
             case.scenario.clients.len() >= 21 && sends >= 20 && commits >= 4
         }),
         "chaos cases should include 20+ client mixed message and commit storms"
+    );
+    assert!(
+        cases.iter().any(|case| case
+            .scenario
+            .steps
+            .iter()
+            .any(|step| matches!(step, ScenarioStep::RestartClient { .. }))),
+        "chaos cases should include restart/reopen between delivery and observation"
     );
 
     for (case_index, case) in cases.iter().enumerate() {

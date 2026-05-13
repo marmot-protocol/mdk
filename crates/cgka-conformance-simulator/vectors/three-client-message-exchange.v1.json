@@ -89,6 +89,14 @@
         "client": "alice",
         "epoch": 1,
         "member_count": 3,
+        "event_counts": {
+          "message_received": 2,
+          "member_added": 0,
+          "member_removed": 0,
+          "epoch_changed": 0,
+          "app_invalidated": 0,
+          "fork_recovered": 0
+        },
         "received_payloads": [
           "bob:hello",
           "carol:hello"
@@ -100,6 +108,14 @@
         "client": "bob",
         "epoch": 1,
         "member_count": 3,
+        "event_counts": {
+          "message_received": 2,
+          "member_added": 0,
+          "member_removed": 0,
+          "epoch_changed": 0,
+          "app_invalidated": 0,
+          "fork_recovered": 0
+        },
         "received_payloads": [
           "alice:hello",
           "carol:hello"
@@ -111,6 +127,14 @@
         "client": "carol",
         "epoch": 1,
         "member_count": 3,
+        "event_counts": {
+          "message_received": 2,
+          "member_added": 0,
+          "member_removed": 0,
+          "epoch_changed": 0,
+          "app_invalidated": 0,
+          "fork_recovered": 0
+        },
         "received_payloads": [
           "alice:hello",
           "bob:hello"

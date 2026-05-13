@@ -26,6 +26,9 @@ pub struct HarnessClient {
     pub bus_id: ClientId,
     bus: TransportBus,
     storage: MemoryStorage,
+    identity: Vec<u8>,
+    signer: nostr::Keys,
+    registry: FeatureRegistry,
     pending_events: Vec<GroupEvent>,
     /// Default group_id used to set transport_group_id on outbound + inbound
     /// envelopes. Set automatically after the first create/join.
@@ -58,20 +61,23 @@ impl ClientBuilder {
 
     pub fn attach(self, bus: &TransportBus) -> HarnessClient {
         let storage = MemoryStorage::new();
-        let peeler =
-            NostrMlsPeeler::new(self.signer.public_key().to_hex()).with_welcome_signer(self.signer);
+        let peeler = NostrMlsPeeler::new(self.signer.public_key().to_hex())
+            .with_welcome_signer(self.signer.clone());
         let engine = EngineBuilder::new(storage.clone())
             .identity(self.identity.clone())
-            .feature_registry(self.registry)
+            .feature_registry(self.registry.clone())
             .peeler(Box::new(peeler))
             .build()
             .expect("engine builds");
-        let bus_id = bus.attach(MemberId::new(self.identity));
+        let bus_id = bus.attach(MemberId::new(self.identity.clone()));
         HarnessClient {
             engine,
             bus_id,
             bus: bus.clone(),
             storage,
+            identity: self.identity,
+            signer: self.signer,
+            registry: self.registry,
             pending_events: Vec::new(),
             default_group: None,
         }
@@ -135,6 +141,22 @@ fn logical_label_from_seed(seed: &[u8]) -> Option<String> {
 impl HarnessClient {
     pub fn storage(&self) -> &MemoryStorage {
         &self.storage
+    }
+
+    pub fn restart(&mut self) {
+        let peeler = NostrMlsPeeler::new(self.signer.public_key().to_hex())
+            .with_welcome_signer(self.signer.clone());
+        let mut engine = EngineBuilder::new(self.storage.clone())
+            .identity(self.identity.clone())
+            .feature_registry(self.registry.clone())
+            .peeler(Box::new(peeler))
+            .build()
+            .expect("engine rebuilds");
+        engine
+            .hydrate_stable_groups_from_storage()
+            .expect("engine hydrates from storage");
+        self.engine = engine;
+        self.pending_events.clear();
     }
 
     pub fn member_id(&self) -> MemberId {

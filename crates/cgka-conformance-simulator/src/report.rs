@@ -2,7 +2,8 @@ use std::error::Error;
 use std::path::{Path, PathBuf};
 
 use crate::{
-    GeneratedScenarioCase, ScenarioReport, VectorFixture, generate_convergence_chaos_family,
+    CoverageMatrixEntry, GeneratedScenarioCase, ScenarioReport, VectorFixture,
+    coverage_matrix_entry, generate_convergence_chaos_family,
     generate_convergence_e2e_delivery_family, generate_send_leave_family,
     run_generated_case_report, run_vector_fixture_report,
 };
@@ -34,6 +35,7 @@ pub enum ReportCommand {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReportRunSummary {
     pub out: PathBuf,
+    pub coverage_matrix: Vec<CoverageMatrixEntry>,
     pub scenarios: Vec<ScenarioReportSummary>,
 }
 
@@ -95,6 +97,7 @@ pub struct ScenarioReportSummary {
     pub expectation_count: usize,
     pub failure_count: usize,
     pub failures: Vec<ReportFailureSummary>,
+    pub coverage: CoverageMatrixEntry,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -117,8 +120,14 @@ pub async fn run_report(args: &ReportArgs) -> Result<ReportRunSummary, Box<dyn E
         }
     };
 
+    let coverage_matrix = scenarios
+        .iter()
+        .map(|scenario| scenario.coverage.clone())
+        .collect();
+
     Ok(ReportRunSummary {
         out: args.out.clone(),
+        coverage_matrix,
         scenarios,
     })
 }
@@ -154,9 +163,11 @@ async fn run_generated_family_reports(
         ));
         let fixture = generated_fixture_candidate(&case, &report);
         std::fs::write(&fixture_output, serde_json::to_string_pretty(&fixture)?)?;
+        let source = case.family_name.clone();
+        let coverage = coverage_matrix_entry(source.clone(), &report);
         summaries.push(ScenarioReportSummary {
             scenario_name: report.metadata.scenario_name.clone(),
-            source: case.family_name.clone(),
+            source,
             output,
             expectation_count: report.expected_trace.iter().count()
                 + report.expected_outcomes.len(),
@@ -169,6 +180,7 @@ async fn run_generated_family_reports(
                     message: failure.message.clone(),
                 })
                 .collect(),
+            coverage,
         });
     }
 
@@ -211,9 +223,11 @@ async fn run_vector_fixture_reports(
             fixture.scenario_name.replace('/', "-")
         ));
         std::fs::write(&output, serde_json::to_string_pretty(&report)?)?;
+        let source = path.display().to_string();
+        let coverage = coverage_matrix_entry(source.clone(), &report);
         summaries.push(ScenarioReportSummary {
             scenario_name: fixture.scenario_name.clone(),
-            source: path.display().to_string(),
+            source,
             output,
             expectation_count: fixture.expected_trace.iter().count()
                 + fixture.expected_outcomes.len(),
@@ -226,6 +240,7 @@ async fn run_vector_fixture_reports(
                     message: failure.message.clone(),
                 })
                 .collect(),
+            coverage,
         });
     }
     Ok(summaries)

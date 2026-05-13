@@ -2,7 +2,8 @@ use std::fs;
 use std::path::PathBuf;
 
 use cgka_conformance_simulator::{
-    ReportArgs, ReportCommand, ReportInput, parse_report_command, run_report,
+    OracleBehavior, ReportArgs, ReportCommand, ReportInput, ScenarioStimulus, parse_report_command,
+    property_test_coverage_entries, run_report,
 };
 
 #[test]
@@ -85,6 +86,41 @@ fn parse_rejects_unknown_argument() {
 fn parse_rejects_missing_value() {
     let err = parse_report_command(["--seed".into()]).expect_err("missing value errors");
     assert!(err.to_string().contains("missing value for --seed"));
+}
+
+#[test]
+fn property_test_coverage_matrix_names_each_property_family() {
+    let matrix = property_test_coverage_entries();
+    let names = matrix
+        .iter()
+        .map(|entry| entry.scenario_name.as_str())
+        .collect::<Vec<_>>();
+
+    for expected in [
+        "prop_candidate_graph_selection_is_order_invariant",
+        "prop_canonicalization_dispositions_are_order_invariant",
+        "prop_canonicalization_replay_is_already_seen",
+        "prop_quiescence_gate_controls_stability",
+        "prop_capability_negotiation_matches_matrix",
+        "prop_convergence_under_send_leave_sequence",
+        "prop_convergence_under_varied_delivery",
+        "prop_stored_convergence_restart_equivalence",
+        "prop_group_data_update_publish_lifecycle",
+        "prop_true_same_id_replay",
+        "prop_upgrade_confirm_or_fail_round_trip",
+    ] {
+        assert!(
+            names.contains(&expected),
+            "coverage matrix should include {expected}"
+        );
+    }
+
+    assert!(matrix.iter().any(|entry| {
+        entry.stimuli.contains(&ScenarioStimulus::StorageRestart)
+            && entry
+                .oracle_behaviors
+                .contains(&OracleBehavior::RestartEquivalence)
+    }));
 }
 
 #[tokio::test]
@@ -235,6 +271,18 @@ async fn report_runner_writes_convergence_chaos_reports_and_fixture_candidates()
             .as_array()
             .is_some_and(|expectations| !expectations.is_empty())
     );
+    assert!(
+        report["oracle"]["stimuli"]
+            .as_array()
+            .is_some_and(|stimuli| !stimuli.is_empty()),
+        "report should include scenario stimuli"
+    );
+    assert!(
+        report["oracle"]["observed_behaviors"]
+            .as_array()
+            .is_some_and(|behaviors| !behaviors.is_empty()),
+        "report should include observed behavior evidence"
+    );
 
     let fixture: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&fixture_path).expect("read fixture candidate"))
@@ -247,6 +295,15 @@ async fn report_runner_writes_convergence_chaos_reports_and_fixture_candidates()
         fixture["expected_outcomes"]
             .as_array()
             .is_some_and(|expectations| !expectations.is_empty())
+    );
+    assert!(
+        summary.coverage_matrix.iter().any(|entry| {
+            entry.stimuli.contains(&ScenarioStimulus::InviteMembers)
+                && entry
+                    .oracle_behaviors
+                    .contains(&OracleBehavior::ForkRecovered)
+        }),
+        "coverage matrix should show which generated cases check fork recovery"
     );
 
     fs::remove_dir_all(out_dir).expect("clean output dir");
