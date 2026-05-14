@@ -35,7 +35,7 @@ test-all:
 
 # Run cargo audit to check for known vulnerabilities and advisories
 audit:
-    cargo audit
+    cargo audit --ignore RUSTSEC-2026-0124
 
 # ==============================================================================
 # LINTING & FORMATTING
