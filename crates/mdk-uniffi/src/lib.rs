@@ -22,6 +22,7 @@ use mdk_core::{
     },
     groups::{NostrGroupConfigData, NostrGroupDataUpdate},
     messages::{EventTag, MessageProcessingResult},
+    prelude::{ExtensionType, ProposalType, ProposalUpgradability, VerifiableCiphersuite},
 };
 use mdk_sqlite_storage::{EncryptionConfig, MdkSqliteStorage};
 use mdk_storage_traits::{
@@ -370,6 +371,42 @@ fn update_group_result_to_uniffi(
         welcome_rumors_json,
         mls_group_id: hex::encode(result.mls_group_id.as_slice()),
     })
+}
+
+fn proposal_type_from_uniffi(
+    proposal_type: MdkProposalType,
+) -> Result<ProposalType, MdkUniffiError> {
+    match proposal_type {
+        MdkProposalType::SelfRemove => Ok(ProposalType::SelfRemove),
+        MdkProposalType::Unknown => Err(MdkUniffiError::InvalidInput(
+            "Unknown proposal types cannot be used for capability upgrades".to_string(),
+        )),
+    }
+}
+
+fn proposal_types_from_uniffi(
+    proposal_types: Vec<MdkProposalType>,
+) -> Result<BTreeSet<ProposalType>, MdkUniffiError> {
+    proposal_types
+        .into_iter()
+        .map(proposal_type_from_uniffi)
+        .collect()
+}
+
+fn proposal_types_to_uniffi(proposal_types: BTreeSet<ProposalType>) -> Vec<MdkProposalType> {
+    let deduped: BTreeSet<MdkProposalType> = proposal_types
+        .into_iter()
+        .map(MdkProposalType::from)
+        .collect();
+    deduped.into_iter().collect()
+}
+
+fn extension_type_to_uniffi(extension_type: ExtensionType) -> u16 {
+    u16::from(extension_type)
+}
+
+fn ciphersuite_to_uniffi(ciphersuite: VerifiableCiphersuite) -> u16 {
+    ciphersuite.value()
 }
 
 impl Mdk {
@@ -787,13 +824,67 @@ impl Mdk {
     ) -> Result<Vec<MdkProposalType>, MdkUniffiError> {
         let group_id = parse_group_id(&group_id_hex)?;
         let required = self.lock()?.group_required_proposals(&group_id)?;
-        // BTreeSet collapses any distinct source variants that map to the
-        // same mirror variant (e.g. several non-SelfRemove types all
-        // mapping to `Unknown`) into a single entry, so `Vec` cardinality
-        // reflects distinct *mirror* values, not distinct source values.
-        let deduped: BTreeSet<MdkProposalType> =
-            required.into_iter().map(MdkProposalType::from).collect();
-        Ok(deduped.into_iter().collect())
+        Ok(proposal_types_to_uniffi(required))
+    }
+
+    /// Returns per-member advertised MLS capabilities for every active group leaf.
+    ///
+    /// Any member may call this. The returned vector is ordered by MLS leaf index.
+    ///
+    /// # Arguments
+    ///
+    /// * `group_id_hex` - Hex-encoded MLS group ID
+    pub fn group_member_capabilities(
+        &self,
+        group_id_hex: String,
+    ) -> Result<Vec<MdkMemberCapabilities>, MdkUniffiError> {
+        let group_id = parse_group_id(&group_id_hex)?;
+        Ok(self
+            .lock()?
+            .group_member_capabilities(&group_id)?
+            .into_iter()
+            .map(MdkMemberCapabilities::from)
+            .collect())
+    }
+
+    /// Returns per-proposal capability upgrade readiness for a group.
+    ///
+    /// Any member may call this. Each entry reports whether the mirrored proposal type is already
+    /// required, currently available for upgrade, or blocked by one or more members.
+    ///
+    /// # Arguments
+    ///
+    /// * `group_id_hex` - Hex-encoded MLS group ID
+    pub fn group_capability_upgrade_status(
+        &self,
+        group_id_hex: String,
+    ) -> Result<MdkCapabilityUpgradeStatus, MdkUniffiError> {
+        let group_id = parse_group_id(&group_id_hex)?;
+        Ok(MdkCapabilityUpgradeStatus::from(
+            self.lock()?.group_capability_upgrade_status(&group_id)?,
+        ))
+    }
+
+    /// Proposes a group capability upgrade by adding proposal types to `RequiredCapabilities`.
+    ///
+    /// Admin-only. Pass the proposal types reported as `Available` by
+    /// [`Mdk::group_capability_upgrade_status`].
+    ///
+    /// # Arguments
+    ///
+    /// * `group_id_hex` - Hex-encoded MLS group ID
+    /// * `proposals_to_add` - Proposal types to add to the group's required capabilities
+    pub fn upgrade_group_capabilities(
+        &self,
+        group_id_hex: String,
+        proposals_to_add: Vec<MdkProposalType>,
+    ) -> Result<UpdateGroupResult, MdkUniffiError> {
+        let group_id = parse_group_id(&group_id_hex)?;
+        let proposals = proposal_types_from_uniffi(proposals_to_add)?;
+        let result = self
+            .lock()?
+            .upgrade_group_capabilities(&group_id, &proposals)?;
+        update_group_result_to_uniffi(result)
     }
 
     /// Get messages for a group with optional pagination
@@ -1556,7 +1647,7 @@ pub struct LeafMapEntry {
 /// If that changes — e.g. a future MIP makes another proposal type
 /// observable to UIs — add a variant here and a matching arm in the
 /// `From` impl below.
-#[derive(uniffi::Enum, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, uniffi::Enum)]
 pub enum MdkProposalType {
     /// Member-initiated voluntary departure (MLS Extensions draft,
     /// `0x000a`). When a group's required-capabilities set contains
@@ -1566,14 +1657,13 @@ pub enum MdkProposalType {
     Unknown,
 }
 
-impl From<mdk_core::prelude::ProposalType> for MdkProposalType {
-    fn from(pt: mdk_core::prelude::ProposalType) -> Self {
+impl From<ProposalType> for MdkProposalType {
+    fn from(pt: ProposalType) -> Self {
         // Intentionally no wildcard arm. `openmls::prelude::ProposalType`
         // is a closed enum (not `#[non_exhaustive]`), so listing every
         // current variant means a future openmls bump that adds one
         // fails to compile here — forcing a conscious decision rather
         // than a silent collapse into `Unknown`.
-        use mdk_core::prelude::ProposalType;
         match pt {
             ProposalType::SelfRemove => Self::SelfRemove,
             ProposalType::Add
@@ -1585,6 +1675,104 @@ impl From<mdk_core::prelude::ProposalType> for MdkProposalType {
             | ProposalType::GroupContextExtensions
             | ProposalType::Grease(_)
             | ProposalType::Custom(_) => Self::Unknown,
+        }
+    }
+}
+
+/// UniFFI-friendly upgrade readiness for a proposal type.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum MdkProposalUpgradability {
+    /// The proposal type is already required by the group.
+    AlreadyRequired,
+    /// Every current member advertises this proposal type, so an admin may upgrade it.
+    Available,
+    /// One or more members do not advertise this proposal type.
+    Blocked {
+        /// Hex-encoded public keys of members blocking this upgrade.
+        blockers: Vec<String>,
+    },
+}
+
+impl From<ProposalUpgradability> for MdkProposalUpgradability {
+    fn from(upgradability: ProposalUpgradability) -> Self {
+        match upgradability {
+            ProposalUpgradability::AlreadyRequired => Self::AlreadyRequired,
+            ProposalUpgradability::Available => Self::Available,
+            ProposalUpgradability::Blocked { blockers } => Self::Blocked {
+                blockers: blockers.into_iter().map(|pk| pk.to_hex()).collect(),
+            },
+        }
+    }
+}
+
+/// Upgrade readiness for one proposal type.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdkProposalUpgradeStatus {
+    /// The proposal type being reported.
+    pub proposal: MdkProposalType,
+    /// Whether this proposal can be added to required capabilities.
+    pub upgradability: MdkProposalUpgradability,
+}
+
+impl From<(ProposalType, ProposalUpgradability)> for MdkProposalUpgradeStatus {
+    fn from((proposal, upgradability): (ProposalType, ProposalUpgradability)) -> Self {
+        Self {
+            proposal: MdkProposalType::from(proposal),
+            upgradability: MdkProposalUpgradability::from(upgradability),
+        }
+    }
+}
+
+/// Per-proposal capability upgrade readiness for a group.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdkCapabilityUpgradeStatus {
+    /// One entry per proposal type MDK reports through the UniFFI API.
+    pub per_proposal: Vec<MdkProposalUpgradeStatus>,
+}
+
+impl From<mdk_core::groups::CapabilityUpgradeStatus> for MdkCapabilityUpgradeStatus {
+    fn from(status: mdk_core::groups::CapabilityUpgradeStatus) -> Self {
+        Self {
+            per_proposal: status
+                .per_proposal
+                .into_iter()
+                .map(MdkProposalUpgradeStatus::from)
+                .collect(),
+        }
+    }
+}
+
+/// Public MLS capabilities advertised by one group member's current leaf.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MdkMemberCapabilities {
+    /// Hex-encoded public key for this member.
+    pub member: String,
+    /// Whether this member is currently a group admin.
+    pub is_admin: bool,
+    /// Proposal types advertised by this member, deduplicated after UniFFI mirroring.
+    pub proposals: Vec<MdkProposalType>,
+    /// Raw MLS extension type registry values advertised by this member.
+    pub extensions: Vec<u16>,
+    /// Raw MLS ciphersuite registry values advertised by this member.
+    pub ciphersuites: Vec<u16>,
+}
+
+impl From<mdk_core::groups::MemberCapabilities> for MdkMemberCapabilities {
+    fn from(capabilities: mdk_core::groups::MemberCapabilities) -> Self {
+        Self {
+            member: capabilities.member.to_hex(),
+            is_admin: capabilities.is_admin,
+            proposals: proposal_types_to_uniffi(capabilities.proposals),
+            extensions: capabilities
+                .extensions
+                .into_iter()
+                .map(extension_type_to_uniffi)
+                .collect(),
+            ciphersuites: capabilities
+                .ciphersuites
+                .into_iter()
+                .map(ciphersuite_to_uniffi)
+                .collect(),
         }
     }
 }
@@ -2604,6 +2792,74 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[test]
+    fn test_group_capability_bindings_allow_single_member_upgrade() {
+        let mdk = create_test_mdk();
+        let creator_keys = Keys::generate();
+        let relays = vec!["wss://relay.example.com".to_string()];
+
+        let create_result = mdk
+            .create_group(
+                creator_keys.public_key().to_hex(),
+                Vec::new(),
+                "Test Group".to_string(),
+                "Test Description".to_string(),
+                relays,
+                vec![creator_keys.public_key().to_hex()],
+            )
+            .unwrap();
+        let group_id = create_result.group.mls_group_id.clone();
+
+        let roster = mdk.group_member_capabilities(group_id.clone()).unwrap();
+        assert_eq!(roster.len(), 1);
+        assert_eq!(roster[0].member, creator_keys.public_key().to_hex());
+        assert!(roster[0].is_admin);
+        assert!(roster[0].proposals.contains(&MdkProposalType::SelfRemove));
+        assert!(!roster[0].extensions.is_empty());
+        assert!(!roster[0].ciphersuites.is_empty());
+
+        let status = mdk
+            .group_capability_upgrade_status(group_id.clone())
+            .unwrap();
+        let self_remove_status = status
+            .per_proposal
+            .iter()
+            .find(|entry| entry.proposal == MdkProposalType::SelfRemove)
+            .unwrap();
+        assert_eq!(
+            self_remove_status.upgradability,
+            MdkProposalUpgradability::Available
+        );
+
+        let upgrade = mdk
+            .upgrade_group_capabilities(group_id.clone(), vec![MdkProposalType::SelfRemove])
+            .unwrap();
+        assert_eq!(upgrade.mls_group_id, group_id);
+        assert!(upgrade.welcome_rumors_json.is_none());
+
+        mdk.merge_pending_commit(group_id.clone()).unwrap();
+
+        let post_status = mdk.group_capability_upgrade_status(group_id).unwrap();
+        let post_self_remove_status = post_status
+            .per_proposal
+            .iter()
+            .find(|entry| entry.proposal == MdkProposalType::SelfRemove)
+            .unwrap();
+        assert_eq!(
+            post_self_remove_status.upgradability,
+            MdkProposalUpgradability::AlreadyRequired
+        );
+    }
+
+    #[test]
+    fn test_upgrade_group_capabilities_rejects_unknown_proposal_type() {
+        let mdk = create_test_mdk();
+        let fake_group_id = hex::encode([0u8; 32]);
+        let result = mdk.upgrade_group_capabilities(fake_group_id, vec![MdkProposalType::Unknown]);
+
+        assert!(matches!(result, Err(MdkUniffiError::InvalidInput(_))));
+    }
+
     /// Multiple distinct `openmls::prelude::ProposalType` variants collapse
     /// into `MdkProposalType::Unknown`. The wrapper must return a set — not
     /// a bag — so a consumer counting `vec.len()` sees distinct mirror
@@ -2614,8 +2870,6 @@ mod tests {
     /// the dedup contract lives.
     #[test]
     fn test_mdk_proposal_type_collapses_unknown_duplicates() {
-        use mdk_core::prelude::ProposalType;
-
         let source: BTreeSet<ProposalType> = [
             ProposalType::Add,
             ProposalType::Remove,
