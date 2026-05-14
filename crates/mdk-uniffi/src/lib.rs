@@ -2021,6 +2021,10 @@ pub struct EncryptedMediaUploadResult {
     pub blurhash: Option<String>,
     /// Thumbhash preview string if generated, otherwise `None`
     pub thumbhash: Option<String>,
+    /// Optional audio duration in milliseconds for display purposes
+    pub duration_ms: Option<u64>,
+    /// Optional audio waveform samples in the inclusive range 0..=100
+    pub waveform: Option<Vec<u8>>,
     /// 12-byte ChaCha20-Poly1305 nonce used for encryption
     pub nonce: Vec<u8>,
 }
@@ -2040,6 +2044,8 @@ impl TryFrom<EncryptedMediaUpload> for EncryptedMediaUploadResult {
             dimensions: u.dimensions.map(|(w, h)| vec![w, h]),
             blurhash: u.blurhash,
             thumbhash: u.thumbhash,
+            duration_ms: u.duration_ms,
+            waveform: u.waveform,
             nonce: u.nonce.to_vec(),
         })
     }
@@ -2061,6 +2067,10 @@ pub struct MediaReferenceRecord {
     pub filename: String,
     /// Image dimensions `[width, height]` if the media is an image, otherwise `None`
     pub dimensions: Option<Vec<u32>>,
+    /// Optional audio duration in milliseconds for display purposes
+    pub duration_ms: Option<u64>,
+    /// Optional audio waveform samples in the inclusive range 0..=100
+    pub waveform: Option<Vec<u8>>,
     /// Encryption scheme version (e.g. `"mip04-v2"`)
     pub scheme_version: String,
     /// 12-byte ChaCha20-Poly1305 nonce — 12 bytes
@@ -2096,6 +2106,8 @@ impl TryFrom<MediaReferenceRecord> for MediaReference {
             mime_type: r.mime_type,
             filename: r.filename,
             dimensions,
+            duration_ms: r.duration_ms,
+            waveform: r.waveform,
             scheme_version: r.scheme_version,
             nonce,
         })
@@ -2110,6 +2122,8 @@ impl From<MediaReference> for MediaReferenceRecord {
             mime_type: r.mime_type,
             filename: r.filename,
             dimensions: r.dimensions.map(|(w, h)| vec![w, h]),
+            duration_ms: r.duration_ms,
+            waveform: r.waveform,
             scheme_version: r.scheme_version,
             nonce: r.nonce.to_vec(),
         }
@@ -2317,6 +2331,8 @@ impl TryFrom<EncryptedMediaUploadResult> for EncryptedMediaUpload {
             dimensions,
             blurhash: r.blurhash,
             thumbhash: r.thumbhash,
+            duration_ms: r.duration_ms,
+            waveform: r.waveform,
             nonce,
         })
     }
@@ -4047,6 +4063,8 @@ mod tests {
                 mime_type: "image/jpeg".to_string(),
                 filename: "test.jpg".to_string(),
                 dimensions: None,
+                duration_ms: None,
+                waveform: None,
                 scheme_version: "mip04-v2".to_string(),
                 nonce: vec![0u8; 8], // wrong length — should be 12
             };
@@ -4085,7 +4103,7 @@ mod tests {
             let mdk = create_test_mdk();
             let group_id = create_test_group(&mdk);
 
-            let upload = mdk
+            let mut upload = mdk
                 .encrypt_media_for_upload(
                     group_id.clone(),
                     TEST_PAYLOAD.to_vec(),
@@ -4093,6 +4111,8 @@ mod tests {
                     "payload.bin".to_string(),
                 )
                 .unwrap();
+            upload.duration_ms = Some(1_500);
+            upload.waveform = Some(vec![0, 25, 50, 75, 100]);
 
             // Build a MediaReferenceRecord directly from the upload result
             let reference = MediaReferenceRecord {
@@ -4101,6 +4121,8 @@ mod tests {
                 mime_type: upload.mime_type.clone(),
                 filename: upload.filename.clone(),
                 dimensions: upload.dimensions.clone(),
+                duration_ms: upload.duration_ms,
+                waveform: upload.waveform.clone(),
                 scheme_version: "mip04-v2".to_string(),
                 nonce: upload.nonce.clone(),
             };
@@ -4120,7 +4142,7 @@ mod tests {
             let mdk = create_test_mdk();
             let group_id = create_test_group(&mdk);
 
-            let upload = mdk
+            let mut upload = mdk
                 .encrypt_media_for_upload(
                     group_id.clone(),
                     TEST_PAYLOAD.to_vec(),
@@ -4128,6 +4150,8 @@ mod tests {
                     "payload.bin".to_string(),
                 )
                 .unwrap();
+            upload.duration_ms = Some(1_500);
+            upload.waveform = Some(vec![0, 25, 50, 75, 100]);
 
             let uploaded_url = "https://blossom.example.com/abc123.bin".to_string();
             let imeta_tag = mdk
@@ -4149,6 +4173,8 @@ mod tests {
             assert_eq!(reference.original_hash, upload.original_hash);
             assert_eq!(reference.nonce, upload.nonce);
             assert_eq!(reference.scheme_version, "mip04-v2");
+            assert_eq!(reference.duration_ms, Some(1_500));
+            assert_eq!(reference.waveform, Some(vec![0, 25, 50, 75, 100]));
         }
 
         #[test]

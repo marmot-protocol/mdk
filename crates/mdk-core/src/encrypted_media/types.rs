@@ -46,6 +46,10 @@ pub struct EncryptedMediaUpload {
     pub blurhash: Option<String>,
     /// Thumbhash for images
     pub thumbhash: Option<String>,
+    /// Optional audio duration in milliseconds for display purposes
+    pub duration_ms: Option<u64>,
+    /// Optional audio waveform samples in the inclusive range 0..=100
+    pub waveform: Option<Vec<u8>>,
     /// Encryption nonce (96 bits, 12 bytes) - randomly generated per encryption
     pub nonce: [u8; 12],
 }
@@ -63,6 +67,10 @@ pub struct MediaReference {
     pub filename: String,
     /// Dimensions if applicable
     pub dimensions: Option<(u32, u32)>,
+    /// Optional audio duration in milliseconds for display purposes
+    pub duration_ms: Option<u64>,
+    /// Optional audio waveform samples in the inclusive range 0..=100
+    pub waveform: Option<Vec<u8>>,
     /// Encryption scheme version (e.g., "mip04-v2")
     pub scheme_version: String,
     /// Encryption nonce (96 bits, 12 bytes) - required for decryption
@@ -162,6 +170,8 @@ mod tests {
             dimensions: Some((1024, 768)),
             blurhash: Some("L6PZfSi_.AyE_3t7t7R**0o#DgR4".to_string()),
             thumbhash: Some("}U#WoBrZy#_/qQ8PC,N]q7m}6X".to_string()), // dummy base91 thumbhash
+            duration_ms: None,
+            waveform: None,
             nonce: [0x03; 12],
         };
 
@@ -176,6 +186,8 @@ mod tests {
         assert_eq!(upload.dimensions, Some((1024, 768)));
         assert!(upload.blurhash.is_some());
         assert!(upload.thumbhash.is_some());
+        assert_eq!(upload.duration_ms, None);
+        assert_eq!(upload.waveform, None);
         assert_eq!(upload.nonce, [0x03; 12]);
     }
 
@@ -187,6 +199,8 @@ mod tests {
             mime_type: "video/mp4".to_string(),
             filename: "test.mp4".to_string(),
             dimensions: Some((1920, 1080)),
+            duration_ms: Some(3_500),
+            waveform: Some(vec![0, 20, 80, 100]),
             scheme_version: "mip04-v2".to_string(),
             nonce: [0xAA; 12],
         };
@@ -197,6 +211,8 @@ mod tests {
         assert_eq!(media_ref.mime_type, "video/mp4");
         assert_eq!(media_ref.filename, "test.mp4");
         assert_eq!(media_ref.dimensions, Some((1920, 1080)));
+        assert_eq!(media_ref.duration_ms, Some(3_500));
+        assert_eq!(media_ref.waveform, Some(vec![0, 20, 80, 100]));
         assert_eq!(media_ref.scheme_version, "mip04-v2");
         assert_eq!(media_ref.nonce, [0xAA; 12]);
     }

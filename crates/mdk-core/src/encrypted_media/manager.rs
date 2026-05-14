@@ -27,6 +27,11 @@ use mdk_storage_traits::{MdkStorageProvider, Secret};
 /// temporarily without leaving the legacy fallback open-ended.
 const LEGACY_MEDIA_MIGRATION_DEADLINE: u64 = 1_778_803_200;
 
+/// Generous abuse-resistance bound for display-only waveform metadata.
+/// NIP-A0 suggests compact sample counts, but MDK does not enforce product
+/// duration or UI limits for audio attachments.
+const MAX_WAVEFORM_SAMPLES: usize = 16_384;
+
 /// Manager for encrypted media operations
 pub struct EncryptedMediaManager<'a, Storage>
 where
@@ -42,6 +47,104 @@ where
 {
     fn allow_legacy_media_fallback_at(current_time: u64) -> bool {
         current_time <= LEGACY_MEDIA_MIGRATION_DEADLINE
+    }
+
+    fn parse_duration_ms(value: &str) -> Option<u64> {
+        let trimmed = value.trim();
+        if trimmed.is_empty() || trimmed.starts_with('-') || trimmed.starts_with('+') {
+            return None;
+        }
+
+        let (seconds_part, fractional_part) = match trimmed.split_once('.') {
+            Some((seconds, fractional)) => (seconds, Some(fractional)),
+            None => (trimmed, None),
+        };
+
+        if seconds_part.is_empty() || !seconds_part.chars().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+
+        let seconds = seconds_part.parse::<u64>().ok()?;
+        let seconds_ms = seconds.checked_mul(1000)?;
+        let fractional_ms = match fractional_part {
+            Some(fractional) => {
+                if fractional.is_empty()
+                    || fractional.len() > 3
+                    || !fractional.chars().all(|c| c.is_ascii_digit())
+                {
+                    return None;
+                }
+
+                let mut padded = fractional.to_string();
+                while padded.len() < 3 {
+                    padded.push('0');
+                }
+                padded.parse::<u64>().ok()?
+            }
+            None => 0,
+        };
+
+        let duration_ms = seconds_ms.checked_add(fractional_ms)?;
+        match duration_ms {
+            0 => None,
+            _ => Some(duration_ms),
+        }
+    }
+
+    fn format_duration_seconds(duration_ms: u64) -> Option<String> {
+        match duration_ms {
+            0 => None,
+            _ => {
+                let seconds = duration_ms / 1000;
+                let millis = duration_ms % 1000;
+                match millis {
+                    0 => Some(seconds.to_string()),
+                    _ => {
+                        let fractional = format!("{:03}", millis).trim_end_matches('0').to_string();
+                        Some(format!("{}.{}", seconds, fractional))
+                    }
+                }
+            }
+        }
+    }
+
+    fn parse_waveform(value: &str) -> Option<Vec<u8>> {
+        let mut samples = Vec::new();
+
+        for sample in value.split_whitespace() {
+            if samples.len() == MAX_WAVEFORM_SAMPLES {
+                return None;
+            }
+
+            let sample = sample.parse::<u8>().ok()?;
+            if sample > 100 {
+                return None;
+            }
+
+            samples.push(sample);
+        }
+
+        match samples.is_empty() {
+            true => None,
+            false => Some(samples),
+        }
+    }
+
+    fn format_waveform(waveform: &[u8]) -> Option<String> {
+        if waveform.is_empty()
+            || waveform.len() > MAX_WAVEFORM_SAMPLES
+            || waveform.iter().any(|sample| *sample > 100)
+        {
+            return None;
+        }
+
+        Some(
+            waveform
+                .iter()
+                .map(u8::to_string)
+                .collect::<Vec<_>>()
+                .join(" "),
+        )
     }
 
     /// Try to decrypt with a single exporter secret, falling back to the legacy
@@ -208,6 +311,8 @@ where
             dimensions: metadata.dimensions,
             blurhash: metadata.blurhash,
             thumbhash: metadata.thumbhash,
+            duration_ms: None,
+            waveform: None,
             nonce: *nonce,
         })
     }
@@ -412,6 +517,12 @@ where
         if let Some(ref thumbhash) = upload.thumbhash {
             tag_values.push(format!("thumbhash {}", thumbhash));
         }
+        if let Some(duration) = upload.duration_ms.and_then(Self::format_duration_seconds) {
+            tag_values.push(format!("duration {}", duration));
+        }
+        if let Some(waveform) = upload.waveform.as_deref().and_then(Self::format_waveform) {
+            tag_values.push(format!("waveform {}", waveform));
+        }
 
         // x field contains SHA256 hash of original file content (hex-encoded)
         tag_values.push(format!("x {}", hex::encode(upload.original_hash)));
@@ -437,6 +548,8 @@ where
             mime_type: upload.mime_type.clone(),
             filename: upload.filename.clone(),
             dimensions: upload.dimensions,
+            duration_ms: upload.duration_ms,
+            waveform: upload.waveform.clone(),
             scheme_version: DEFAULT_SCHEME_VERSION.to_string(),
             nonce: upload.nonce,
         }
@@ -473,6 +586,8 @@ where
         let mut original_hash: Option<[u8; 32]> = None;
         let mut nonce: Option<[u8; 12]> = None;
         let mut dimensions: Option<(u32, u32)> = None;
+        let mut duration_ms: Option<u64> = None;
+        let mut waveform: Option<Vec<u8>> = None;
         let mut version: Option<String> = None;
 
         // Parse key-value pairs from IMETA tag
@@ -536,6 +651,8 @@ where
                         dimensions = Some((width, height));
                     }
                 }
+                "duration" => duration_ms = Self::parse_duration_ms(parts[1]),
+                "waveform" => waveform = Self::parse_waveform(parts[1]),
                 "filename" => match validation::validate_filename(parts[1]) {
                     Ok(_) => filename = Some(parts[1].to_string()),
                     Err(_) => {
@@ -591,6 +708,8 @@ where
             mime_type,
             filename,
             dimensions,
+            duration_ms,
+            waveform,
             scheme_version,
             nonce,
         })
@@ -716,6 +835,22 @@ mod tests {
         LEGACY_MEDIA_MIGRATION_DEADLINE.saturating_add(1)
     }
 
+    fn valid_audio_imeta_tag(extra_fields: Vec<String>) -> NostrTag {
+        let mut tag_values = vec![
+            "url https://example.com/encrypted.ogg".to_string(),
+            "m audio/ogg".to_string(),
+            "filename voice.ogg".to_string(),
+        ];
+        tag_values.extend(extra_fields);
+        tag_values.extend([
+            format!("x {}", hex::encode([0x42; 32])),
+            format!("n {}", hex::encode([0xBE; 12])),
+            "v mip04-v2".to_string(),
+        ]);
+
+        NostrTag::custom(TagKind::Custom("imeta".into()), tag_values)
+    }
+
     #[test]
     fn test_create_imeta_tag() {
         let mdk = create_test_mdk();
@@ -733,6 +868,8 @@ mod tests {
             dimensions: Some((1920, 1080)),
             blurhash: Some("LKO2?U%2Tw=w]~RBVZRi};RPxuwH".to_string()),
             thumbhash: Some("}U#WoBrZy#_/qQ8PC,N]q7m}6X".to_string()),
+            duration_ms: None,
+            waveform: None,
             nonce: [0xAA; 12],
         };
 
@@ -791,6 +928,8 @@ mod tests {
             dimensions: Some((1920, 1080)),
             blurhash: Some("LKO2?U%2Tw=w]~RBVZRi};RPxuwH".to_string()),
             thumbhash: None,
+            duration_ms: None,
+            waveform: None,
             nonce: [0xAA; 12],
         };
 
@@ -822,6 +961,8 @@ mod tests {
             dimensions: Some((1920, 1080)),
             blurhash: None,
             thumbhash: Some("}U#WoBrZy#_/qQ8PC,N]q7m}6X".to_string()),
+            duration_ms: None,
+            waveform: None,
             nonce: [0xAA; 12],
         };
 
@@ -834,6 +975,41 @@ mod tests {
                 .iter()
                 .any(|v| v.starts_with("thumbhash }U#WoBrZy#_/qQ8PC,N]q7m}6X"))
         );
+    }
+
+    #[test]
+    fn test_create_imeta_tag_emits_audio_display_metadata() {
+        let mdk = create_test_mdk();
+        let group_id = GroupId::from_slice(&[1, 2, 3, 4]);
+        let manager = mdk.media_manager(group_id);
+
+        let upload = EncryptedMediaUpload {
+            encrypted_data: vec![1, 2, 3, 4],
+            original_hash: [0x42; 32],
+            encrypted_hash: [0x43; 32],
+            mime_type: "audio/ogg".to_string(),
+            filename: "voice.ogg".to_string(),
+            original_size: 1000,
+            encrypted_size: 1004,
+            dimensions: None,
+            blurhash: None,
+            thumbhash: None,
+            duration_ms: Some(1_500),
+            waveform: Some(vec![0, 25, 50, 75, 100]),
+            nonce: [0xAA; 12],
+        };
+
+        let tag = manager.create_imeta_tag(&upload, "https://example.com/voice.ogg");
+        let values = tag.clone().to_vec();
+
+        assert!(values.iter().any(|v| v == "duration 1.5"));
+        assert!(values.iter().any(|v| v == "waveform 0 25 50 75 100"));
+
+        let parsed = manager
+            .parse_imeta_tag(&tag)
+            .expect("builder output should round-trip through parser");
+        assert_eq!(parsed.duration_ms, Some(1_500));
+        assert_eq!(parsed.waveform, Some(vec![0, 25, 50, 75, 100]));
     }
 
     #[test]
@@ -868,6 +1044,105 @@ mod tests {
         assert_eq!(media_ref.dimensions, Some((1920, 1080)));
         assert_eq!(media_ref.scheme_version, "mip04-v2");
         assert_eq!(media_ref.nonce, test_nonce);
+    }
+
+    #[test]
+    fn test_parse_imeta_tag_audio_display_metadata() {
+        let mdk = create_test_mdk();
+        let group_id = GroupId::from_slice(&[1, 2, 3, 4]);
+        let manager = mdk.media_manager(group_id);
+
+        let imeta_tag = valid_audio_imeta_tag(vec![
+            "duration 42".to_string(),
+            "waveform 0 25 50 75 100".to_string(),
+        ]);
+        let media_ref = manager
+            .parse_imeta_tag(&imeta_tag)
+            .expect("valid audio display metadata should parse");
+
+        assert_eq!(media_ref.mime_type, "audio/ogg");
+        assert_eq!(media_ref.duration_ms, Some(42_000));
+        assert_eq!(media_ref.waveform, Some(vec![0, 25, 50, 75, 100]));
+    }
+
+    #[test]
+    fn test_parse_imeta_tag_accepts_audio_without_display_metadata() {
+        let mdk = create_test_mdk();
+        let group_id = GroupId::from_slice(&[1, 2, 3, 4]);
+        let manager = mdk.media_manager(group_id);
+
+        let imeta_tag = valid_audio_imeta_tag(vec![]);
+        let media_ref = manager
+            .parse_imeta_tag(&imeta_tag)
+            .expect("audio media without display metadata should parse");
+
+        assert_eq!(media_ref.mime_type, "audio/ogg");
+        assert_eq!(media_ref.duration_ms, None);
+        assert_eq!(media_ref.waveform, None);
+    }
+
+    #[test]
+    fn test_parse_imeta_tag_malformed_duration_is_best_effort() {
+        let mdk = create_test_mdk();
+        let group_id = GroupId::from_slice(&[1, 2, 3, 4]);
+        let manager = mdk.media_manager(group_id);
+
+        for duration in ["not-a-number", "0", "-1", "1.2345"] {
+            let imeta_tag = valid_audio_imeta_tag(vec![
+                format!("duration {}", duration),
+                "waveform 0 50 100".to_string(),
+            ]);
+            let media_ref = manager
+                .parse_imeta_tag(&imeta_tag)
+                .expect("bad duration should not fail a valid media tag");
+
+            assert_eq!(media_ref.duration_ms, None);
+            assert_eq!(media_ref.waveform, Some(vec![0, 50, 100]));
+        }
+    }
+
+    #[test]
+    fn test_parse_imeta_tag_malformed_waveform_is_best_effort() {
+        let mdk = create_test_mdk();
+        let group_id = GroupId::from_slice(&[1, 2, 3, 4]);
+        let manager = mdk.media_manager(group_id);
+
+        for waveform in ["", "0 101 100", "0 nope 100", "-1 50 100"] {
+            let imeta_tag = valid_audio_imeta_tag(vec![
+                "duration 2".to_string(),
+                format!("waveform {}", waveform),
+            ]);
+            let media_ref = manager
+                .parse_imeta_tag(&imeta_tag)
+                .expect("bad waveform should not fail a valid media tag");
+
+            assert_eq!(media_ref.duration_ms, Some(2_000));
+            assert_eq!(media_ref.waveform, None);
+        }
+    }
+
+    #[test]
+    fn test_parse_imeta_tag_audio_metadata_does_not_replace_required_fields() {
+        let mdk = create_test_mdk();
+        let group_id = GroupId::from_slice(&[1, 2, 3, 4]);
+        let manager = mdk.media_manager(group_id);
+
+        let tag_values = vec![
+            "url https://example.com/encrypted.ogg".to_string(),
+            "m audio/ogg".to_string(),
+            "filename voice.ogg".to_string(),
+            "duration 2".to_string(),
+            "waveform 0 50 100".to_string(),
+            format!("x {}", hex::encode([0x42; 32])),
+            "v mip04-v2".to_string(),
+        ];
+        let tag = NostrTag::custom(TagKind::Custom("imeta".into()), tag_values);
+        let result = manager.parse_imeta_tag(&tag);
+
+        assert!(matches!(
+            result,
+            Err(EncryptedMediaError::InvalidImetaTag { .. })
+        ));
     }
 
     #[test]
@@ -979,6 +1254,8 @@ mod tests {
             dimensions: Some((800, 600)),
             blurhash: None,
             thumbhash: None,
+            duration_ms: None,
+            waveform: None,
             nonce: test_nonce,
         };
 
@@ -1823,6 +2100,8 @@ mod tests {
             mime_type: "text/plain".to_string(),
             filename: "legacy-current.txt".to_string(),
             dimensions: None,
+            duration_ms: None,
+            waveform: None,
             scheme_version: DEFAULT_SCHEME_VERSION.to_string(),
             nonce: *nonce,
         };
@@ -1963,6 +2242,8 @@ mod tests {
             dimensions: None,
             blurhash: None,
             thumbhash: None,
+            duration_ms: None,
+            waveform: None,
             nonce: *nonce,
         };
         let media_ref = mdk
@@ -2208,6 +2489,8 @@ mod tests {
             mime_type: "text/plain".to_string(),
             filename: "legacy.txt".to_string(),
             dimensions: None,
+            duration_ms: None,
+            waveform: None,
             scheme_version: DEFAULT_SCHEME_VERSION.to_string(),
             nonce: *nonce,
         };
@@ -2227,6 +2510,8 @@ mod tests {
                 dimensions: None,
                 blurhash: None,
                 thumbhash: None,
+                duration_ms: None,
+                waveform: None,
                 nonce: *nonce,
             },
             alice_keys.public_key(),
@@ -2282,6 +2567,8 @@ mod tests {
             mime_type: "text/plain".to_string(),
             filename: "legacy-post.txt".to_string(),
             dimensions: None,
+            duration_ms: None,
+            waveform: None,
             scheme_version: DEFAULT_SCHEME_VERSION.to_string(),
             nonce: *nonce,
         };
@@ -2301,6 +2588,8 @@ mod tests {
                 dimensions: None,
                 blurhash: None,
                 thumbhash: None,
+                duration_ms: None,
+                waveform: None,
                 nonce: *nonce,
             },
             alice_keys.public_key(),
