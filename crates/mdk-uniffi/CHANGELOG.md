@@ -11,6 +11,8 @@
 
 ### Breaking changes
 
+- **MIP-04 media records now include optional audio display metadata.** `EncryptedMediaUploadResult` and `MediaReferenceRecord` both add `duration_ms: Option<u64>` and `waveform: Option<Vec<u8>>`, allowing binding consumers to pass and receive typed audio duration and waveform metadata through IMETA tag creation/parsing. Callers constructing these records directly must provide the new fields. ([#300](https://github.com/marmot-protocol/mdk/pull/300))
+
 ### Changed
 
 ### Added

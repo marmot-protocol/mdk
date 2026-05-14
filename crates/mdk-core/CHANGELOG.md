@@ -25,6 +25,7 @@
 
 ### Breaking changes
 
+- **MIP-04 media upload/reference structs now include optional audio display metadata.** `EncryptedMediaUpload` and `MediaReference` both add `duration_ms: Option<u64>` and `waveform: Option<Vec<u8>>`; callers constructing these structs directly must provide the new fields. The IMETA parser reads optional NIP-A0 `duration` and `waveform` entries on a best-effort basis, and the tag builder emits them when provided. ([#300](https://github.com/marmot-protocol/mdk/pull/300))
 - **Extension version bumped from 2 to 3**: `NostrGroupDataExtension::CURRENT_VERSION` is now `3`. The new version adds a `disappearing_message_secs` field to the TLS-serialized group data extension. Existing v1/v2 groups are forward-compatible (the field deserializes as `None`). `NostrGroupConfigData::new` now takes an additional `disappearing_message_secs: Option<u64>` parameter. ([#253](https://github.com/marmot-protocol/mdk/pull/253))
 - **`NostrGroupDataExtension::migrate_to_v2` removed from public API.** The 0.8.0 method was used only to construct test fixtures; production code never migrates extensions in-place (deserialization upgrades v1/v2 → v3 through `into_v3`, and new groups author v3 directly). Mirrors the existing convention for `migrate_group_image_v1_to_v2`, which was already documented as internal-only. ([#253](https://github.com/marmot-protocol/mdk/pull/253))
 
