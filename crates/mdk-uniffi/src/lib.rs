@@ -1680,7 +1680,7 @@ impl From<ProposalType> for MdkProposalType {
 }
 
 /// UniFFI-friendly upgrade readiness for a proposal type.
-#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+#[derive(Clone, PartialEq, Eq, uniffi::Enum)]
 pub enum MdkProposalUpgradability {
     /// The proposal type is already required by the group.
     AlreadyRequired,
@@ -1706,7 +1706,7 @@ impl From<ProposalUpgradability> for MdkProposalUpgradability {
 }
 
 /// Upgrade readiness for one proposal type.
-#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+#[derive(Clone, PartialEq, Eq, uniffi::Record)]
 pub struct MdkProposalUpgradeStatus {
     /// The proposal type being reported.
     pub proposal: MdkProposalType,
@@ -1724,7 +1724,7 @@ impl From<(ProposalType, ProposalUpgradability)> for MdkProposalUpgradeStatus {
 }
 
 /// Per-proposal capability upgrade readiness for a group.
-#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+#[derive(Clone, PartialEq, Eq, uniffi::Record)]
 pub struct MdkCapabilityUpgradeStatus {
     /// One entry per proposal type MDK reports through the UniFFI API.
     pub per_proposal: Vec<MdkProposalUpgradeStatus>,
@@ -1737,13 +1737,14 @@ impl From<mdk_core::groups::CapabilityUpgradeStatus> for MdkCapabilityUpgradeSta
                 .per_proposal
                 .into_iter()
                 .map(MdkProposalUpgradeStatus::from)
+                .filter(|entry| entry.proposal != MdkProposalType::Unknown)
                 .collect(),
         }
     }
 }
 
 /// Public MLS capabilities advertised by one group member's current leaf.
-#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+#[derive(Clone, PartialEq, Eq, uniffi::Record)]
 pub struct MdkMemberCapabilities {
     /// Hex-encoded public key for this member.
     pub member: String,
@@ -2826,10 +2827,10 @@ mod tests {
             .iter()
             .find(|entry| entry.proposal == MdkProposalType::SelfRemove)
             .unwrap();
-        assert_eq!(
-            self_remove_status.upgradability,
+        assert!(matches!(
+            &self_remove_status.upgradability,
             MdkProposalUpgradability::Available
-        );
+        ));
 
         let upgrade = mdk
             .upgrade_group_capabilities(group_id.clone(), vec![MdkProposalType::SelfRemove])
@@ -2845,10 +2846,10 @@ mod tests {
             .iter()
             .find(|entry| entry.proposal == MdkProposalType::SelfRemove)
             .unwrap();
-        assert_eq!(
-            post_self_remove_status.upgradability,
+        assert!(matches!(
+            &post_self_remove_status.upgradability,
             MdkProposalUpgradability::AlreadyRequired
-        );
+        ));
     }
 
     #[test]
@@ -2858,6 +2859,30 @@ mod tests {
         let result = mdk.upgrade_group_capabilities(fake_group_id, vec![MdkProposalType::Unknown]);
 
         assert!(matches!(result, Err(MdkUniffiError::InvalidInput(_))));
+    }
+
+    #[test]
+    fn test_capability_upgrade_status_filters_unknown_proposals() {
+        let exported =
+            MdkCapabilityUpgradeStatus::from(mdk_core::groups::CapabilityUpgradeStatus {
+                per_proposal: vec![
+                    (ProposalType::Add, ProposalUpgradability::Available),
+                    (ProposalType::Remove, ProposalUpgradability::AlreadyRequired),
+                    (ProposalType::SelfRemove, ProposalUpgradability::Available),
+                ],
+            });
+
+        let unknown_count = exported
+            .per_proposal
+            .iter()
+            .filter(|entry| entry.proposal == MdkProposalType::Unknown)
+            .count();
+        assert_eq!(unknown_count, 0);
+        assert_eq!(exported.per_proposal.len(), 1);
+        assert_eq!(
+            exported.per_proposal[0].proposal,
+            MdkProposalType::SelfRemove
+        );
     }
 
     /// Multiple distinct `openmls::prelude::ProposalType` variants collapse
