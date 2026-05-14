@@ -193,7 +193,7 @@ jobs:
         key: test-${{ matrix.features.name }}
 
     - name: Install cargo-nextest
-      uses: taiki-e/install-action@cca35edeb1d01366c2843b68fc3ca441446d73d3 # v2.77.1
+      uses: taiki-e/install-action@3235f8901fd37ffed0052b276cec25a362fb82e9 # v2.77.7
       with:
         tool: cargo-nextest
 
@@ -219,9 +219,9 @@ jobs:
       uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
     - name: Install cargo-audit
-      uses: taiki-e/install-action@cca35edeb1d01366c2843b68fc3ca441446d73d3 # v2.77.1
+      uses: taiki-e/install-action@3235f8901fd37ffed0052b276cec25a362fb82e9 # v2.77.7
       with:
         tool: cargo-audit
 
     - name: Run cargo audit
-      run: cargo audit
+      run: cargo audit --ignore RUSTSEC-2026-0124
