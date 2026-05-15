@@ -98,7 +98,7 @@ pub struct KeyPackageOptions {
 ///
 /// Rules:
 /// - non-empty
-/// - exactly [`D_TAG_HEX_LEN`] (64) characters
+/// - exactly 64 hex characters (32 random bytes, hex-encoded — per MIP-00)
 /// - ASCII hex digits only
 ///
 /// Mirrors the MIP-00 `d` tag validation performed by [`MDK::parse_key_package`] so that
