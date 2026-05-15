@@ -1,4 +1,5 @@
-use std::process::Command;
+use std::process::{Child, Command};
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
@@ -41,6 +42,24 @@ fn run_json_error(home: &std::path::Path, args: &[&str]) -> Value {
     value["error"].clone()
 }
 
+fn run_json_with_env(home: &std::path::Path, args: &[&str], envs: &[(&str, &str)]) -> Value {
+    let mut command = dm(home);
+    command.args(args);
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+    let output = command.output().expect("dm command should start");
+    assert!(
+        output.status.success(),
+        "dm failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).expect("stdout should be JSON");
+    assert_eq!(value["ok"], true);
+    value["result"].clone()
+}
+
 fn member_accounts(value: &Value) -> Vec<String> {
     let mut accounts = value["members"]
         .as_array()
@@ -50,6 +69,46 @@ fn member_accounts(value: &Value) -> Vec<String> {
         .collect::<Vec<_>>();
     accounts.sort();
     accounts
+}
+
+fn wait_for_daemon(socket: &std::path::Path) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        let output = Command::new(env!("CARGO_BIN_EXE_dm"))
+            .arg("--socket")
+            .arg(socket)
+            .arg("--json")
+            .args(["daemon", "status"])
+            .output()
+            .expect("dm daemon status should start");
+        if output.status.success() {
+            let value: Value =
+                serde_json::from_slice(&output.stdout).expect("status stdout should be JSON");
+            if value["result"]["running"].as_bool() == Some(true) {
+                return;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!("daemon did not become ready at {}", socket.display());
+}
+
+fn stop_daemon(socket: &std::path::Path, child: &mut Child) {
+    let _ = Command::new(env!("CARGO_BIN_EXE_dm"))
+        .arg("--socket")
+        .arg(socket)
+        .arg("--json")
+        .args(["daemon", "stop"])
+        .output();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if let Ok(Some(_)) = child.try_wait() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 #[test]
@@ -301,14 +360,14 @@ fn key_package_fetches_latest_package_via_relay_list_discovery() {
     );
     let account_id = created["account_id"].as_str().expect("account id");
 
-    let published = run_json(home.path(), &["key-package", "publish", "--account", "bob"]);
+    let published = run_json(home.path(), &["--account", "bob", "keys", "publish"]);
     let published_bytes = published["key_package_bytes"].as_u64().expect("bytes");
     assert!(published_bytes > 0);
 
     let fetched = run_json(
         home.path(),
         &[
-            "key-package",
+            "keys",
             "fetch",
             "--pubkey",
             account_id,
@@ -330,7 +389,7 @@ fn key_package_fetches_latest_package_via_relay_list_discovery() {
 }
 
 #[test]
-fn directory_caches_relay_lists_and_key_packages_for_pubkeys() {
+fn global_account_selects_subject_for_keys_fetch_and_relay_lists() {
     let home = tempfile::tempdir().expect("tempdir");
 
     let created = run_json(
@@ -347,50 +406,272 @@ fn directory_caches_relay_lists_and_key_packages_for_pubkeys() {
     );
     let account_id = created["account_id"].as_str().expect("account id");
 
-    let refreshed = run_json(
+    let relay_lists = run_json(
         home.path(),
         &[
-            "directory",
-            "refresh",
-            "--pubkey",
-            account_id,
+            "--account",
+            "bob",
+            "account",
+            "relay-lists",
             "--bootstrap-relays",
             "marmot-local://seed",
         ],
     );
-    assert_eq!(refreshed["account_id"], account_id);
-    assert_eq!(refreshed["relay_lists"]["complete"], true);
-    assert_eq!(refreshed["key_package"], serde_json::Value::Null);
+    assert_eq!(relay_lists["account_id"], account_id);
+    assert_eq!(relay_lists["relay_lists"]["complete"], true);
 
-    let cached = run_json(home.path(), &["directory", "get", "--pubkey", account_id]);
-    assert_eq!(cached, refreshed);
+    let published = run_json(home.path(), &["--account", "bob", "keys", "publish"]);
+    let fetched = run_json(home.path(), &["--account", "bob", "keys", "fetch"]);
+    assert_eq!(fetched["account_id"], account_id);
+    assert_eq!(fetched["key_package_bytes"], published["key_package_bytes"]);
+}
 
-    let published = run_json(home.path(), &["key-package", "publish", "--account", "bob"]);
-    let fetched = run_json(
+#[test]
+fn keys_namespace_uses_account_resolution() {
+    let home = tempfile::tempdir().expect("tempdir");
+
+    run_json(home.path(), &["account", "create", "bob"]);
+
+    let published = run_json(home.path(), &["keys", "publish"]);
+    assert_eq!(published["account"], "bob");
+    assert!(published["key_package_bytes"].as_u64().unwrap() > 0);
+}
+
+#[test]
+fn legacy_or_duplicate_command_shapes_are_not_supported() {
+    let home = tempfile::tempdir().expect("tempdir");
+
+    assert_eq!(
+        run_json_error(home.path(), &["key-package", "publish"])["code"],
+        "usage"
+    );
+    assert_eq!(
+        run_json_error(home.path(), &["directory", "get", "--pubkey", "00"])["code"],
+        "usage"
+    );
+    assert_eq!(
+        run_json_error(home.path(), &["group", "list"])["code"],
+        "usage"
+    );
+    assert_eq!(
+        run_json_error(home.path(), &["group", "show", "00"])["code"],
+        "usage"
+    );
+    assert_eq!(
+        run_json_error(home.path(), &["keys", "publish", "--account", "bob"])["code"],
+        "usage"
+    );
+}
+
+#[test]
+fn account_resolution_errors_are_stable_json_contracts() {
+    let home = tempfile::tempdir().expect("tempdir");
+
+    let missing = run_json_error(home.path(), &["keys", "publish"]);
+    assert_eq!(missing["code"], "missing_account");
+    assert_eq!(missing["repair"]["select"], "--account <name-or-pubkey>");
+
+    run_json(home.path(), &["account", "create", "alice"]);
+    run_json(home.path(), &["account", "create", "bob"]);
+
+    let multiple = run_json_error(home.path(), &["keys", "publish"]);
+    assert_eq!(multiple["code"], "multiple_accounts");
+    assert_eq!(multiple["repair"]["env"], "DM_ACCOUNT");
+
+    let unknown = run_json_error(home.path(), &["--account", "carol", "keys", "publish"]);
+    assert_eq!(unknown["code"], "unknown_account");
+    assert_eq!(unknown["account"], "carol");
+}
+
+#[test]
+fn positional_group_and_message_commands_use_global_or_env_account() {
+    let home = tempfile::tempdir().expect("tempdir");
+
+    run_json(home.path(), &["account", "create", "alice"]);
+    run_json(home.path(), &["account", "create", "bob"]);
+    run_json(home.path(), &["--account", "bob", "keys", "publish"]);
+
+    let created_group = run_json(
+        home.path(),
+        &["--account", "alice", "group", "create", "general", "bob"],
+    );
+    let group_id = created_group["group_id"].as_str().expect("group id");
+
+    let bob_join = run_json_with_env(home.path(), &["sync"], &[("DM_ACCOUNT", "bob")]);
+    assert_eq!(bob_join["joined_groups"][0], group_id);
+
+    run_json(
         home.path(),
         &[
-            "key-package",
-            "fetch",
-            "--pubkey",
-            account_id,
-            "--bootstrap-relays",
-            "marmot-local://seed",
+            "--account",
+            "alice",
+            "message",
+            "send",
+            group_id,
+            "hello bob",
         ],
     );
-    assert_eq!(
-        fetched["key_package_bytes"], published["key_package_bytes"],
-        "fetched package should be the one that was just published"
+
+    let bob_sync = run_json_with_env(home.path(), &["sync"], &[("DM_ACCOUNT", "bob")]);
+    assert_eq!(bob_sync["messages"][0]["plaintext"], "hello bob");
+}
+
+#[test]
+fn message_send_accepts_hyphen_leading_text_after_group_flag() {
+    let home = tempfile::tempdir().expect("tempdir");
+
+    run_json(home.path(), &["account", "create", "alice"]);
+    run_json(home.path(), &["account", "create", "bob"]);
+    run_json(home.path(), &["--account", "bob", "keys", "publish"]);
+
+    let created_group = run_json(
+        home.path(),
+        &["--account", "alice", "group", "create", "general", "bob"],
+    );
+    let group_id = created_group["group_id"].as_str().expect("group id");
+    run_json(home.path(), &["--account", "bob", "sync"]);
+
+    run_json(
+        home.path(),
+        &[
+            "--account",
+            "alice",
+            "message",
+            "send",
+            "--group",
+            group_id,
+            "--starts-with-dash",
+        ],
     );
 
-    let cached = run_json(home.path(), &["directory", "get", "--pubkey", account_id]);
-    assert_eq!(cached["account_id"], account_id);
-    assert_eq!(
-        cached["key_package"]["bytes"],
-        published["key_package_bytes"]
+    let bob_sync = run_json(home.path(), &["--account", "bob", "sync"]);
+    assert_eq!(bob_sync["messages"][0]["plaintext"], "--starts-with-dash");
+}
+
+#[test]
+fn chats_list_exposes_visible_groups() {
+    let home = tempfile::tempdir().expect("tempdir");
+
+    run_json(home.path(), &["account", "create", "alice"]);
+    run_json(home.path(), &["account", "create", "bob"]);
+    run_json(home.path(), &["--account", "bob", "keys", "publish"]);
+
+    let created_group = run_json(
+        home.path(),
+        &["--account", "alice", "group", "create", "general", "bob"],
     );
-    assert_eq!(
-        cached["key_package"]["source_relays"],
-        serde_json::json!(["marmot-local://key-packages"])
+    let group_id = created_group["group_id"].as_str().expect("group id");
+    run_json(home.path(), &["--account", "bob", "sync"]);
+
+    let chats = run_json(home.path(), &["--account", "bob", "chats", "list"]);
+    assert_eq!(chats["chats"][0]["group_id"], group_id);
+    assert_eq!(chats["chats"][0]["profile"]["name"], "general");
+}
+
+#[test]
+fn daemon_executes_cli_commands_over_socket() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let socket = home.path().join("dev").join("dmd.sock");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_dmd"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("--socket")
+        .arg(&socket)
+        .arg("--secret-store")
+        .arg("file")
+        .spawn()
+        .expect("dmd should start");
+
+    wait_for_daemon(&socket);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_dm"))
+        .arg("--socket")
+        .arg(&socket)
+        .arg("--json")
+        .args(["account", "create", "alice"])
+        .output()
+        .expect("dm should start");
+    assert!(
+        output.status.success(),
+        "dm failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).expect("stdout should be JSON");
+    assert_eq!(value["result"]["account"], "alice");
+
+    stop_daemon(&socket, &mut child);
+}
+
+#[test]
+fn daemon_start_status_execute_and_stop_are_user_facing_commands() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let socket = home.path().join("dev").join("dmd.sock");
+
+    let start = Command::new(env!("CARGO_BIN_EXE_dm"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("--socket")
+        .arg(&socket)
+        .arg("--secret-store")
+        .arg("file")
+        .arg("--json")
+        .args(["daemon", "start"])
+        .output()
+        .expect("dm daemon start should run");
+    assert!(
+        start.status.success(),
+        "daemon start failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&start.stdout),
+        String::from_utf8_lossy(&start.stderr)
+    );
+
+    let status = Command::new(env!("CARGO_BIN_EXE_dm"))
+        .arg("--socket")
+        .arg(&socket)
+        .arg("--json")
+        .args(["daemon", "status"])
+        .output()
+        .expect("dm daemon status should run");
+    assert!(
+        status.status.success(),
+        "daemon status failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&status.stdout),
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let status_json: Value =
+        serde_json::from_slice(&status.stdout).expect("status stdout should be JSON");
+    assert_eq!(status_json["result"]["running"], true);
+
+    let created = Command::new(env!("CARGO_BIN_EXE_dm"))
+        .arg("--socket")
+        .arg(&socket)
+        .arg("--json")
+        .args(["account", "create", "alice"])
+        .output()
+        .expect("dm account create should run through daemon");
+    assert!(
+        created.status.success(),
+        "daemon execute failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&created.stdout),
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let created_json: Value =
+        serde_json::from_slice(&created.stdout).expect("created stdout should be JSON");
+    assert_eq!(created_json["result"]["account"], "alice");
+
+    let stop = Command::new(env!("CARGO_BIN_EXE_dm"))
+        .arg("--socket")
+        .arg(&socket)
+        .arg("--json")
+        .args(["daemon", "stop"])
+        .output()
+        .expect("dm daemon stop should run");
+    assert!(
+        stop.status.success(),
+        "daemon stop failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&stop.stdout),
+        String::from_utf8_lossy(&stop.stderr)
     );
 }
 
@@ -404,10 +685,10 @@ fn missing_key_package_errors_include_repair_guidance() {
     let error = run_json_error(
         home.path(),
         &[
-            "group",
-            "create",
             "--account",
             "alice",
+            "group",
+            "create",
             "--name",
             "general",
             "--member",
@@ -417,14 +698,15 @@ fn missing_key_package_errors_include_repair_guidance() {
 
     assert_eq!(error["code"], "missing_key_package");
     assert_eq!(error["account"], "bob");
+    assert_eq!(error["repair"]["local"], "dm --account bob keys publish");
     assert_eq!(
-        error["repair"]["local"],
-        "dm key-package publish --account bob"
+        error["repair"]["remote"],
+        "dm keys fetch --pubkey <npub-or-hex> --bootstrap-relays <relay-url>"
     );
 }
 
 #[test]
-fn group_create_can_invite_a_member_from_the_directory_by_pubkey() {
+fn group_create_can_invite_a_member_by_fetched_pubkey() {
     let home = tempfile::tempdir().expect("tempdir");
 
     run_json(home.path(), &["account", "create", "alice"]);
@@ -442,11 +724,11 @@ fn group_create_can_invite_a_member_from_the_directory_by_pubkey() {
     );
     let bob_account_id = bob["account_id"].as_str().expect("bob account id");
 
-    run_json(home.path(), &["key-package", "publish", "--account", "bob"]);
+    run_json(home.path(), &["--account", "bob", "keys", "publish"]);
     run_json(
         home.path(),
         &[
-            "key-package",
+            "keys",
             "fetch",
             "--pubkey",
             bob_account_id,
@@ -458,19 +740,19 @@ fn group_create_can_invite_a_member_from_the_directory_by_pubkey() {
     let created_group = run_json(
         home.path(),
         &[
-            "group",
-            "create",
             "--account",
             "alice",
+            "group",
+            "create",
             "--name",
-            "directory",
+            "pubkey",
             "--member",
             bob_account_id,
         ],
     );
     let group_id = created_group["group_id"].as_str().expect("group id");
 
-    let bob_join = run_json(home.path(), &["sync", "--account", "bob"]);
+    let bob_join = run_json(home.path(), &["--account", "bob", "sync"]);
     assert_eq!(bob_join["joined_groups"][0], group_id);
 }
 
@@ -480,15 +762,15 @@ fn group_archive_is_local_state_not_membership_state() {
 
     run_json(home.path(), &["account", "create", "alice"]);
     run_json(home.path(), &["account", "create", "bob"]);
-    run_json(home.path(), &["key-package", "publish", "--account", "bob"]);
+    run_json(home.path(), &["--account", "bob", "keys", "publish"]);
 
     let created_group = run_json(
         home.path(),
         &[
-            "group",
-            "create",
             "--account",
             "alice",
+            "group",
+            "create",
             "--name",
             "general",
             "--member",
@@ -496,40 +778,40 @@ fn group_archive_is_local_state_not_membership_state() {
         ],
     );
     let group_id = created_group["group_id"].as_str().expect("group id");
-    run_json(home.path(), &["sync", "--account", "bob"]);
+    run_json(home.path(), &["--account", "bob", "sync"]);
 
     let archived = run_json(
         home.path(),
-        &["group", "archive", "--account", "bob", group_id],
+        &["--account", "bob", "chats", "archive", group_id],
     );
     assert_eq!(archived["group"]["archived"], true);
 
-    let visible = run_json(home.path(), &["group", "list", "--account", "bob"]);
-    assert_eq!(visible["groups"], serde_json::json!([]));
+    let visible = run_json(home.path(), &["--account", "bob", "chats", "list"]);
+    assert_eq!(visible["chats"], serde_json::json!([]));
 
     let included = run_json(
         home.path(),
-        &["group", "list", "--account", "bob", "--include-archived"],
+        &["--account", "bob", "chats", "list", "--include-archived"],
     );
-    assert_eq!(included["groups"][0]["group_id"], group_id);
-    assert_eq!(included["groups"][0]["archived"], true);
+    assert_eq!(included["chats"][0]["group_id"], group_id);
+    assert_eq!(included["chats"][0]["archived"], true);
 
     let bob_members = run_json(
         home.path(),
-        &["group", "members", "--account", "bob", group_id],
+        &["--account", "bob", "group", "members", group_id],
     );
     assert_eq!(member_accounts(&bob_members), vec!["alice", "bob"]);
 
-    let alice_groups = run_json(home.path(), &["group", "list", "--account", "alice"]);
-    assert_eq!(alice_groups["groups"][0]["archived"], false);
+    let alice_chats = run_json(home.path(), &["--account", "alice", "chats", "list"]);
+    assert_eq!(alice_chats["chats"][0]["archived"], false);
 
     let unarchived = run_json(
         home.path(),
-        &["group", "unarchive", "--account", "bob", group_id],
+        &["--account", "bob", "chats", "unarchive", group_id],
     );
     assert_eq!(unarchived["group"]["archived"], false);
-    let visible = run_json(home.path(), &["group", "list", "--account", "bob"]);
-    assert_eq!(visible["groups"][0]["group_id"], group_id);
+    let visible = run_json(home.path(), &["--account", "bob", "chats", "list"]);
+    assert_eq!(visible["chats"][0]["group_id"], group_id);
 }
 
 #[test]
@@ -538,15 +820,15 @@ fn local_group_message_workflow_runs_through_the_dm_contract() {
 
     run_json(home.path(), &["account", "create", "alice"]);
     run_json(home.path(), &["account", "create", "bob"]);
-    run_json(home.path(), &["key-package", "publish", "--account", "bob"]);
+    run_json(home.path(), &["--account", "bob", "keys", "publish"]);
 
     let created_group = run_json(
         home.path(),
         &[
-            "group",
-            "create",
             "--account",
             "alice",
+            "group",
+            "create",
             "--name",
             "general",
             "--member",
@@ -555,16 +837,16 @@ fn local_group_message_workflow_runs_through_the_dm_contract() {
     );
     let group_id = created_group["group_id"].as_str().expect("group id");
 
-    let bob_join = run_json(home.path(), &["sync", "--account", "bob"]);
+    let bob_join = run_json(home.path(), &["--account", "bob", "sync"]);
     assert_eq!(bob_join["joined_groups"][0], group_id);
 
     run_json(
         home.path(),
         &[
-            "message",
-            "send",
             "--account",
             "alice",
+            "message",
+            "send",
             "--group",
             group_id,
             "hello",
@@ -572,12 +854,12 @@ fn local_group_message_workflow_runs_through_the_dm_contract() {
         ],
     );
 
-    let bob_sync = run_json(home.path(), &["sync", "--account", "bob"]);
+    let bob_sync = run_json(home.path(), &["--account", "bob", "sync"]);
     assert_eq!(bob_sync["messages"][0]["from"], "alice");
     assert_eq!(bob_sync["messages"][0]["group_id"], group_id);
     assert_eq!(bob_sync["messages"][0]["plaintext"], "hello bob");
 
-    let bob_messages = run_json(home.path(), &["message", "list", "--account", "bob"]);
+    let bob_messages = run_json(home.path(), &["--account", "bob", "message", "list"]);
     assert_eq!(bob_messages["messages"][0]["from"], "alice");
     assert_eq!(bob_messages["messages"][0]["group_id"], group_id);
     assert_eq!(bob_messages["messages"][0]["plaintext"], "hello bob");
@@ -589,15 +871,15 @@ fn cli_can_inspect_projected_groups_messages_and_status() {
 
     run_json(home.path(), &["account", "create", "alice"]);
     run_json(home.path(), &["account", "create", "bob"]);
-    run_json(home.path(), &["key-package", "publish", "--account", "bob"]);
+    run_json(home.path(), &["--account", "bob", "keys", "publish"]);
 
     let created_group = run_json(
         home.path(),
         &[
-            "group",
-            "create",
             "--account",
             "alice",
+            "group",
+            "create",
             "--name",
             "general",
             "--member",
@@ -616,15 +898,15 @@ fn cli_can_inspect_projected_groups_messages_and_status() {
         "marmot.group.blossom.image.v1"
     );
     assert_eq!(created_group["image"]["present"], false);
-    run_json(home.path(), &["sync", "--account", "bob"]);
+    run_json(home.path(), &["--account", "bob", "sync"]);
 
-    let groups = run_json(home.path(), &["group", "list", "--account", "bob"]);
-    assert_eq!(groups["groups"][0]["group_id"], group_id);
-    assert_eq!(groups["groups"][0]["profile"]["name"], "general");
+    let chats = run_json(home.path(), &["--account", "bob", "chats", "list"]);
+    assert_eq!(chats["chats"][0]["group_id"], group_id);
+    assert_eq!(chats["chats"][0]["profile"]["name"], "general");
 
     let group = run_json(
         home.path(),
-        &["group", "show", "--account", "bob", group_id],
+        &["--account", "bob", "chats", "show", group_id],
     );
     assert_eq!(group["group"]["group_id"], group_id);
     assert_eq!(group["group"]["profile"]["name"], "general");
@@ -632,17 +914,17 @@ fn cli_can_inspect_projected_groups_messages_and_status() {
     let first_send = run_json(
         home.path(),
         &[
-            "message",
-            "send",
             "--account",
             "alice",
+            "message",
+            "send",
             "--group",
             group_id,
             "first",
         ],
     );
     let first_message_id = first_send["message_ids"][0].as_str().expect("message id");
-    let alice_messages = run_json(home.path(), &["message", "list", "--account", "alice"]);
+    let alice_messages = run_json(home.path(), &["--account", "alice", "message", "list"]);
     assert_eq!(alice_messages["messages"].as_array().unwrap().len(), 1);
     assert_eq!(alice_messages["messages"][0]["direction"], "sent");
     assert_eq!(
@@ -652,9 +934,9 @@ fn cli_can_inspect_projected_groups_messages_and_status() {
     assert_eq!(alice_messages["messages"][0]["from"], "alice");
     assert_eq!(alice_messages["messages"][0]["plaintext"], "first");
 
-    run_json(home.path(), &["sync", "--account", "alice"]);
+    run_json(home.path(), &["--account", "alice", "sync"]);
     let alice_messages_after_echo =
-        run_json(home.path(), &["message", "list", "--account", "alice"]);
+        run_json(home.path(), &["--account", "alice", "message", "list"]);
     assert_eq!(
         alice_messages_after_echo["messages"]
             .as_array()
@@ -667,25 +949,25 @@ fn cli_can_inspect_projected_groups_messages_and_status() {
     let second_send = run_json(
         home.path(),
         &[
-            "message",
-            "send",
             "--account",
             "alice",
+            "message",
+            "send",
             "--group",
             group_id,
             "second",
         ],
     );
     assert!(second_send["message_ids"][0].as_str().is_some());
-    run_json(home.path(), &["sync", "--account", "bob"]);
+    run_json(home.path(), &["--account", "bob", "sync"]);
 
     let messages = run_json(
         home.path(),
         &[
-            "message",
-            "list",
             "--account",
             "bob",
+            "message",
+            "list",
             "--group",
             group_id,
             "--limit",
@@ -711,15 +993,15 @@ fn group_update_publishes_profile_component_changes() {
 
     run_json(home.path(), &["account", "create", "alice"]);
     run_json(home.path(), &["account", "create", "bob"]);
-    run_json(home.path(), &["key-package", "publish", "--account", "bob"]);
+    run_json(home.path(), &["--account", "bob", "keys", "publish"]);
 
     let created_group = run_json(
         home.path(),
         &[
-            "group",
-            "create",
             "--account",
             "alice",
+            "group",
+            "create",
             "--name",
             "general",
             "--member",
@@ -727,15 +1009,15 @@ fn group_update_publishes_profile_component_changes() {
         ],
     );
     let group_id = created_group["group_id"].as_str().expect("group id");
-    run_json(home.path(), &["sync", "--account", "bob"]);
+    run_json(home.path(), &["--account", "bob", "sync"]);
 
     let updated = run_json(
         home.path(),
         &[
-            "group",
-            "update",
             "--account",
             "alice",
+            "group",
+            "update",
             group_id,
             "--name",
             "team room",
@@ -750,10 +1032,10 @@ fn group_update_publishes_profile_component_changes() {
     );
     assert_eq!(updated["published"], 1);
 
-    run_json(home.path(), &["sync", "--account", "bob"]);
+    run_json(home.path(), &["--account", "bob", "sync"]);
     let bob_group = run_json(
         home.path(),
-        &["group", "show", "--account", "bob", group_id],
+        &["--account", "bob", "chats", "show", group_id],
     );
     assert_eq!(bob_group["group"]["profile"]["name"], "team room");
     assert_eq!(
@@ -769,19 +1051,16 @@ fn group_members_invite_and_remove_flow_updates_projected_members() {
     run_json(home.path(), &["account", "create", "alice"]);
     run_json(home.path(), &["account", "create", "bob"]);
     run_json(home.path(), &["account", "create", "carol"]);
-    run_json(home.path(), &["key-package", "publish", "--account", "bob"]);
-    run_json(
-        home.path(),
-        &["key-package", "publish", "--account", "carol"],
-    );
+    run_json(home.path(), &["--account", "bob", "keys", "publish"]);
+    run_json(home.path(), &["--account", "carol", "keys", "publish"]);
 
     let created_group = run_json(
         home.path(),
         &[
-            "group",
-            "create",
             "--account",
             "alice",
+            "group",
+            "create",
             "--name",
             "general",
             "--member",
@@ -789,32 +1068,32 @@ fn group_members_invite_and_remove_flow_updates_projected_members() {
         ],
     );
     let group_id = created_group["group_id"].as_str().expect("group id");
-    run_json(home.path(), &["sync", "--account", "bob"]);
+    run_json(home.path(), &["--account", "bob", "sync"]);
 
     let initial_members = run_json(
         home.path(),
-        &["group", "members", "--account", "alice", group_id],
+        &["--account", "alice", "group", "members", group_id],
     );
     assert_eq!(member_accounts(&initial_members), vec!["alice", "bob"]);
 
     let invite = run_json(
         home.path(),
         &[
-            "group",
-            "invite",
             "--account",
             "alice",
+            "group",
+            "invite",
             group_id,
             "--member",
             "carol",
         ],
     );
     assert_eq!(invite["published"], 2);
-    run_json(home.path(), &["sync", "--account", "carol"]);
+    run_json(home.path(), &["--account", "carol", "sync"]);
 
     let invited_members = run_json(
         home.path(),
-        &["group", "members", "--account", "alice", group_id],
+        &["--account", "alice", "group", "members", group_id],
     );
     assert_eq!(
         member_accounts(&invited_members),
@@ -824,60 +1103,60 @@ fn group_members_invite_and_remove_flow_updates_projected_members() {
     run_json(
         home.path(),
         &[
-            "message",
-            "send",
             "--account",
             "alice",
+            "message",
+            "send",
             "--group",
             group_id,
             "history",
             "stays",
         ],
     );
-    run_json(home.path(), &["sync", "--account", "bob"]);
-    run_json(home.path(), &["sync", "--account", "carol"]);
+    run_json(home.path(), &["--account", "bob", "sync"]);
+    run_json(home.path(), &["--account", "carol", "sync"]);
 
     let remove = run_json(
         home.path(),
         &[
-            "group",
-            "remove",
             "--account",
             "alice",
+            "group",
+            "remove",
             group_id,
             "--member",
             "bob",
         ],
     );
     assert_eq!(remove["published"], 1);
-    run_json(home.path(), &["sync", "--account", "bob"]);
-    run_json(home.path(), &["sync", "--account", "carol"]);
+    run_json(home.path(), &["--account", "bob", "sync"]);
+    run_json(home.path(), &["--account", "carol", "sync"]);
 
     let alice_members = run_json(
         home.path(),
-        &["group", "members", "--account", "alice", group_id],
+        &["--account", "alice", "group", "members", group_id],
     );
     assert_eq!(member_accounts(&alice_members), vec!["alice", "carol"]);
 
     let carol_members = run_json(
         home.path(),
-        &["group", "members", "--account", "carol", group_id],
+        &["--account", "carol", "group", "members", group_id],
     );
     assert_eq!(member_accounts(&carol_members), vec!["alice", "carol"]);
 
     let bob_group = run_json(
         home.path(),
-        &["group", "show", "--account", "bob", group_id],
+        &["--account", "bob", "chats", "show", group_id],
     );
     assert_eq!(bob_group["group"]["profile"]["name"], "general");
     let bob_members = run_json(
         home.path(),
-        &["group", "members", "--account", "bob", group_id],
+        &["--account", "bob", "group", "members", group_id],
     );
     assert_eq!(member_accounts(&bob_members), vec!["alice", "carol"]);
     let bob_history = run_json(
         home.path(),
-        &["message", "list", "--account", "bob", "--group", group_id],
+        &["--account", "bob", "message", "list", "--group", group_id],
     );
     assert_eq!(bob_history["messages"][0]["plaintext"], "history stays");
 }

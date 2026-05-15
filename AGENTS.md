@@ -13,7 +13,7 @@ This repo owns the candidate CGKA engine workspace:
 - first app runtime bridge,
 - in-memory and SQLCipher-backed storage backends,
 - Nostr transport adapter and peeler,
-- first app CLI surface,
+- first app CLI surface and daemon,
 - conformance simulator and vector fixtures,
 - Tamarin models for distributed convergence,
 - architecture notes and CGKA contracts,
@@ -33,7 +33,7 @@ This repo owns the candidate CGKA engine workspace:
 | SQLite storage | `crates/storage-sqlite/AGENTS.md` |
 | Nostr transport adapter | `crates/transport-nostr-adapter/AGENTS.md` |
 | Nostr transport peeler | `crates/transport-nostr-peeler/AGENTS.md` |
-| First app CLI surface | `crates/dm/AGENTS.md` |
+| First app CLI / daemon surface | `crates/dm/AGENTS.md` |
 | Local two-client lab | `crates/marmot-lab/README.md` |
 | Multi-client harness / vectors | `crates/cgka-conformance-simulator/AGENTS.md` |
 | Architecture docs | `docs/AGENTS.md` and `docs/marmot-architecture/AGENTS.md` |

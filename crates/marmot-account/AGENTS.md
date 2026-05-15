@@ -27,6 +27,7 @@ relay auth, or transport-specific relay discovery.
 - Treat `KeyPackagePublisher` as provisional. The likely production direction is to move KeyPackage publication into the
   transport adapter family rather than keeping it as a separate app-core-owned publisher.
 - Keep `AccountDeviceSession` as the owner of engine state.
+- Keep CLI account-selection ergonomics and relay-list repair out of this crate; those belong in `dm` and `marmot-app`.
 - Confirm pending work only after the adapter reports enough acknowledgements.
 - Roll back pending work when publication fails or does not meet the required acknowledgement count.
 - Do not log account ids, group ids, relay URLs, message ids, pubkeys, payloads, ciphertext, plaintext, or key material.

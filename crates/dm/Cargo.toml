@@ -9,6 +9,10 @@ publish.workspace = true
 name = "dm"
 path = "src/main.rs"
 
+[[bin]]
+name = "dmd"
+path = "src/bin/dmd.rs"
+
 [dependencies]
 cgka-traits.workspace = true
 clap.workspace = true
@@ -16,9 +20,10 @@ hex.workspace = true
 marmot-account.workspace = true
 marmot-app.workspace = true
 nostr.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["io-util", "net"] }
 
 [dev-dependencies]
 tempfile.workspace = true

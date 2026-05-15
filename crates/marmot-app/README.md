@@ -19,3 +19,7 @@ New-account bootstrap can publish the required NIP-65, inbox kind `10050`, and K
 from a default relay set, while import flows can check whether those lists are already present before writing local
 account state. The same status API can fetch those relay-list events from supplied bootstrap relays and store discovered
 user relay/KeyPackage data for deterministic CLI/TUI development.
+
+The local file relay models relay boundaries by endpoint. Fetching account relay lists or KeyPackages from specific
+`marmot-local://...` bootstrap/source relays only sees records published to those endpoints, which keeps CLI and future
+TUI discovery behavior honest during local tests.

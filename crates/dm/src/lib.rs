@@ -1,5 +1,5 @@
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use cgka_traits::GroupId;
 use cgka_traits::TransportEndpoint;
@@ -8,36 +8,43 @@ use clap::{Parser, Subcommand, ValueEnum};
 use marmot_account::{AccountError, AccountHome, AccountHomeError, DEFAULT_KEYCHAIN_SERVICE_NAME};
 use marmot_app::{
     AccountRelayListBootstrap, AccountRelayListStatus, AppError, AppGroupMemberRecord,
-    AppGroupRecord, AppMessageQuery, AppMessageRecord, AppStatus, DirectoryEntry,
-    FetchedKeyPackage, MarmotApp, SyncSummary,
+    AppGroupRecord, AppMessageQuery, AppMessageRecord, AppStatus, FetchedKeyPackage, MarmotApp,
+    SyncSummary,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-#[derive(Parser, Debug)]
+pub mod daemon;
+
+#[derive(Parser, Clone, Debug, Serialize, Deserialize)]
 #[command(name = "dm", about = "Darkmatter CLI", disable_help_subcommand = true)]
 struct Cli {
     #[arg(long, global = true, value_name = "PATH")]
     home: Option<PathBuf>,
+    #[arg(long, global = true, value_name = "PATH")]
+    socket: Option<PathBuf>,
     #[arg(long, global = true, value_name = "URL")]
     relay: Option<String>,
     #[arg(long, global = true, value_enum, value_name = "STORE")]
     secret_store: Option<SecretStoreKind>,
     #[arg(long, global = true, value_name = "SERVICE")]
     keychain_service: Option<String>,
+    #[arg(long, value_name = "ACCOUNT")]
+    account: Option<String>,
     #[arg(long, global = true)]
     json: bool,
     #[command(subcommand)]
     command: Command,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
-enum SecretStoreKind {
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, ValueEnum)]
+pub enum SecretStoreKind {
     Keychain,
     File,
 }
 
 impl SecretStoreKind {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             SecretStoreKind::Keychain => "keychain",
             SecretStoreKind::File => "file",
@@ -51,16 +58,19 @@ struct CliRuntimeInfo {
     keychain_service: String,
 }
 
-#[derive(Subcommand, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize, Subcommand)]
 enum Command {
     Account {
         #[command(subcommand)]
         command: AccountCommand,
     },
-    #[command(name = "key-package", alias = "keypkg")]
-    KeyPackage {
+    Keys {
         #[command(subcommand)]
         command: KeyPackageCommand,
+    },
+    Chats {
+        #[command(subcommand)]
+        command: ChatsCommand,
     },
     Group {
         #[command(subcommand)]
@@ -70,17 +80,14 @@ enum Command {
         #[command(subcommand)]
         command: MessageCommand,
     },
-    Directory {
+    Daemon {
         #[command(subcommand)]
-        command: DirectoryCommand,
+        command: DaemonCommand,
     },
-    Sync {
-        #[arg(long)]
-        account: String,
-    },
+    Sync,
 }
 
-#[derive(Subcommand, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize, Subcommand)]
 enum AccountCommand {
     Create {
         name: String,
@@ -91,7 +98,7 @@ enum AccountCommand {
     },
     Import {
         name: String,
-        #[arg(long, alias = "insec", value_name = "NSEC_OR_HEX")]
+        #[arg(long, value_name = "NSEC_OR_HEX")]
         nsec: String,
         #[arg(long, value_name = "URLS", value_delimiter = ',')]
         default_relays: Vec<String>,
@@ -102,7 +109,7 @@ enum AccountCommand {
     },
     List,
     Status {
-        name: String,
+        name: Option<String>,
     },
     #[command(name = "relay-lists")]
     RelayLists {
@@ -114,12 +121,9 @@ enum AccountCommand {
     },
 }
 
-#[derive(Subcommand, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize, Subcommand)]
 enum KeyPackageCommand {
-    Publish {
-        #[arg(long)]
-        account: String,
-    },
+    Publish,
     Fetch {
         name: Option<String>,
         #[arg(long, value_name = "NPUB_OR_HEX")]
@@ -129,59 +133,50 @@ enum KeyPackageCommand {
     },
 }
 
-#[derive(Subcommand, Debug)]
-enum GroupCommand {
-    Create {
-        #[arg(long)]
-        account: String,
-        #[arg(long)]
-        name: String,
-        #[arg(long = "member", required = true)]
-        members: Vec<String>,
-    },
+#[derive(Clone, Debug, Serialize, Deserialize, Subcommand)]
+enum ChatsCommand {
     List {
-        #[arg(long)]
-        account: String,
         #[arg(long)]
         include_archived: bool,
     },
     Show {
-        #[arg(long)]
-        account: String,
         group: String,
     },
+    Archive {
+        group: String,
+    },
+    Unarchive {
+        group: String,
+    },
+    #[command(name = "list-archived")]
+    ListArchived,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Subcommand)]
+enum GroupCommand {
+    Create {
+        name: Option<String>,
+        #[arg(value_name = "MEMBER")]
+        members: Vec<String>,
+        #[arg(long = "name", value_name = "NAME")]
+        name_flag: Option<String>,
+        #[arg(long = "member", value_name = "MEMBER")]
+        member_flags: Vec<String>,
+    },
     Members {
-        #[arg(long)]
-        account: String,
         group: String,
     },
     Invite {
-        #[arg(long)]
-        account: String,
         group: String,
         #[arg(long = "member", required = true)]
         members: Vec<String>,
     },
     Remove {
-        #[arg(long)]
-        account: String,
         group: String,
         #[arg(long = "member", required = true)]
         members: Vec<String>,
     },
-    Archive {
-        #[arg(long)]
-        account: String,
-        group: String,
-    },
-    Unarchive {
-        #[arg(long)]
-        account: String,
-        group: String,
-    },
     Update {
-        #[arg(long)]
-        account: String,
         group: String,
         #[arg(long)]
         name: Option<String>,
@@ -190,18 +185,15 @@ enum GroupCommand {
     },
 }
 
-#[derive(Subcommand, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize, Subcommand)]
 enum MessageCommand {
     Send {
-        #[arg(long)]
-        account: String,
-        #[arg(long)]
-        group: String,
-        text: Vec<String>,
+        #[arg(long = "group", value_name = "GROUP")]
+        group_flag: Option<String>,
+        #[arg(value_name = "GROUP_OR_TEXT", allow_hyphen_values = true)]
+        args: Vec<String>,
     },
     List {
-        #[arg(long)]
-        account: String,
         #[arg(long)]
         group: Option<String>,
         #[arg(long)]
@@ -209,23 +201,14 @@ enum MessageCommand {
     },
 }
 
-#[derive(Subcommand, Debug)]
-enum DirectoryCommand {
-    Get {
-        name: Option<String>,
-        #[arg(long, value_name = "NPUB_OR_HEX")]
-        pubkey: Option<String>,
-    },
-    Refresh {
-        name: Option<String>,
-        #[arg(long, value_name = "NPUB_OR_HEX")]
-        pubkey: Option<String>,
-        #[arg(long, value_name = "URLS", value_delimiter = ',')]
-        bootstrap_relays: Vec<String>,
-    },
+#[derive(Clone, Debug, Serialize, Deserialize, Subcommand)]
+enum DaemonCommand {
+    Start,
+    Stop,
+    Status,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CliOutput {
     pub code: i32,
     pub stdout: String,
@@ -248,10 +231,18 @@ enum DmError {
     Hex(#[from] hex::FromHexError),
     #[error("message text is required")]
     EmptyMessage,
+    #[error("group name is required")]
+    MissingGroupName,
+    #[error("group id is required")]
+    MissingGroupId,
     #[error("relay URL cannot be empty")]
     EmptyRelayUrl,
-    #[error("pass either an account name or --pubkey")]
-    MissingAccountSelector,
+    #[error("no account selected")]
+    MissingAccount,
+    #[error("multiple accounts exist; pass --account or set DM_ACCOUNT")]
+    MultipleAccounts,
+    #[error("account not found: {0}")]
+    UnknownLocalAccount(String),
     #[error("pass an account name or --pubkey, not both")]
     AmbiguousAccountSelector,
     #[error("invalid public key")]
@@ -291,6 +282,25 @@ where
         }
     };
 
+    if let Command::Daemon { command } = cli.command.clone() {
+        return daemon::run_daemon_command(cli, command).await;
+    }
+
+    let home = resolve_home(cli.home.clone());
+    if let Some(socket) = daemon_socket_for_client(&cli, &home) {
+        match daemon::send_execute(&socket, cli.clone()).await {
+            Ok(output) => return output,
+            Err(err) if cli.socket.is_some() || std::env::var_os("DM_SOCKET").is_some() => {
+                return daemon_client_error(cli.json, err);
+            }
+            Err(_) => {}
+        }
+    }
+
+    run_cli_local(cli).await
+}
+
+pub(crate) async fn run_cli_local(cli: Cli) -> CliOutput {
     match execute(cli).await {
         Ok((json_output, output)) => {
             if json_output {
@@ -337,7 +347,7 @@ async fn execute(cli: Cli) -> Result<(bool, CommandOutput), (bool, DmError)> {
 }
 
 async fn execute_inner(cli: Cli) -> Result<CommandOutput, DmError> {
-    let home = resolve_home(cli.home);
+    let home = resolve_home(cli.home.clone());
     let secret_store = resolve_secret_store(cli.secret_store)?;
     let keychain_service = resolve_keychain_service(cli.keychain_service);
     let runtime_info = CliRuntimeInfo {
@@ -346,15 +356,70 @@ async fn execute_inner(cli: Cli) -> Result<CommandOutput, DmError> {
     };
     let account_home = open_account_home(&home, secret_store, &keychain_service)?;
     let app = app_for(home, cli.relay, account_home.clone());
+    let account_flag = cli.account.clone();
     match cli.command {
         Command::Account { command } => {
-            account_command(&account_home, &app, command, runtime_info).await
+            account_command(&account_home, &app, command, runtime_info, account_flag).await
         }
-        Command::KeyPackage { command } => key_package_command(&account_home, &app, command).await,
-        Command::Group { command } => group_command(&app, command).await,
-        Command::Message { command } => message_command(&app, command).await,
-        Command::Directory { command } => directory_command(&account_home, &app, command).await,
-        Command::Sync { account } => sync_command(&app, account).await,
+        Command::Keys { command } => {
+            key_package_command(&account_home, &app, command, account_flag).await
+        }
+        Command::Chats { command } => {
+            chats_command(&account_home, &app, command, account_flag).await
+        }
+        Command::Group { command } => {
+            group_command(&account_home, &app, command, account_flag).await
+        }
+        Command::Message { command } => {
+            message_command(&account_home, &app, command, account_flag).await
+        }
+        Command::Daemon { .. } => Ok(CommandOutput {
+            plain: "daemon command is handled by dm".to_owned(),
+            json: json!({"handled": "client"}),
+        }),
+        Command::Sync => {
+            let account = resolve_account_label(&account_home, account_flag)?;
+            sync_command(&app, account).await
+        }
+    }
+}
+
+fn daemon_socket_for_client(cli: &Cli, home: &Path) -> Option<PathBuf> {
+    let env_socket = std::env::var_os("DM_SOCKET").map(PathBuf::from);
+    let socket = cli
+        .socket
+        .clone()
+        .or(env_socket.clone())
+        .unwrap_or_else(|| daemon::default_socket_path(home));
+    if cli.socket.is_some() || env_socket.is_some() || socket.exists() {
+        Some(socket)
+    } else {
+        None
+    }
+}
+
+fn daemon_client_error(json_output: bool, err: daemon::DaemonClientError) -> CliOutput {
+    if json_output {
+        return CliOutput {
+            code: 1,
+            stdout: format!(
+                "{}\n",
+                serde_json::to_string(&json!({
+                    "ok": false,
+                    "error": {
+                        "code": "daemon_unavailable",
+                        "message": err.to_string(),
+                    }
+                }))
+                .expect("JSON response serialization cannot fail")
+            ),
+            stderr: String::new(),
+        };
+    }
+    CliOutput {
+        code: 1,
+        stdout: String::new(),
+        stderr: format!("error: {err}\n"),
     }
 }
 
@@ -363,6 +428,7 @@ async fn account_command(
     app: &MarmotApp,
     command: AccountCommand,
     runtime_info: CliRuntimeInfo,
+    account_flag: Option<String>,
 ) -> Result<CommandOutput, DmError> {
     match command {
         AccountCommand::Create {
@@ -475,6 +541,7 @@ async fn account_command(
             })
         }
         AccountCommand::Status { name } => {
+            let name = resolve_account_label(account_home, name.or(account_flag))?;
             let status = app.status(&name)?;
             Ok(CommandOutput {
                 plain: serde_json::to_string_pretty(&dm_status_json(status.clone(), &runtime_info))
@@ -487,7 +554,7 @@ async fn account_command(
             pubkey,
             bootstrap_relays,
         } => {
-            let account_id = account_selector(account_home, name, pubkey)?;
+            let account_id = account_selector_or_default(account_home, name, pubkey, account_flag)?;
             let relay_lists = relay_list_status_for_account_id(
                 app,
                 &account_id,
@@ -509,9 +576,11 @@ async fn key_package_command(
     account_home: &AccountHome,
     app: &MarmotApp,
     command: KeyPackageCommand,
+    account_flag: Option<String>,
 ) -> Result<CommandOutput, DmError> {
     match command {
-        KeyPackageCommand::Publish { account } => {
+        KeyPackageCommand::Publish => {
+            let account = resolve_account_label(account_home, account_flag)?;
             app.status(&account)?;
             let mut client = app.client(&account).await?;
             let key_package = client.publish_key_package().await?;
@@ -531,7 +600,7 @@ async fn key_package_command(
             pubkey,
             bootstrap_relays,
         } => {
-            let account_id = account_selector(account_home, name, pubkey)?;
+            let account_id = account_selector_or_default(account_home, name, pubkey, account_flag)?;
             let fetched = app
                 .fetch_latest_key_package_for_account_id(
                     &account_id,
@@ -550,13 +619,78 @@ async fn key_package_command(
     }
 }
 
-async fn group_command(app: &MarmotApp, command: GroupCommand) -> Result<CommandOutput, DmError> {
+async fn chats_command(
+    account_home: &AccountHome,
+    app: &MarmotApp,
+    command: ChatsCommand,
+    account_flag: Option<String>,
+) -> Result<CommandOutput, DmError> {
+    match command {
+        ChatsCommand::List { include_archived } => {
+            let account = resolve_account_label(account_home, account_flag)?;
+            app.status(&account)?;
+            let chats = if include_archived {
+                app.groups(&account)?
+            } else {
+                app.visible_groups(&account)?
+            };
+            Ok(CommandOutput {
+                plain: group_list_plain(&chats),
+                json: json!({
+                    "account": account,
+                    "include_archived": include_archived,
+                    "chats": chats.into_iter().map(group_json).collect::<Vec<_>>(),
+                }),
+            })
+        }
+        ChatsCommand::Show { group } => {
+            let account = resolve_account_label(account_home, account_flag)?;
+            group_show_output(app, account, group)
+        }
+        ChatsCommand::Archive { group } => {
+            let account = resolve_account_label(account_home, account_flag)?;
+            group_archive_output(app, account, group, true)
+        }
+        ChatsCommand::Unarchive { group } => {
+            let account = resolve_account_label(account_home, account_flag)?;
+            group_archive_output(app, account, group, false)
+        }
+        ChatsCommand::ListArchived => {
+            let account = resolve_account_label(account_home, account_flag)?;
+            app.status(&account)?;
+            let chats = app
+                .groups(&account)?
+                .into_iter()
+                .filter(|group| group.archived)
+                .collect::<Vec<_>>();
+            Ok(CommandOutput {
+                plain: group_list_plain(&chats),
+                json: json!({
+                    "account": account,
+                    "chats": chats.into_iter().map(group_json).collect::<Vec<_>>(),
+                }),
+            })
+        }
+    }
+}
+
+async fn group_command(
+    account_home: &AccountHome,
+    app: &MarmotApp,
+    command: GroupCommand,
+    account_flag: Option<String>,
+) -> Result<CommandOutput, DmError> {
     match command {
         GroupCommand::Create {
-            account,
             name,
             members,
+            name_flag,
+            member_flags,
         } => {
+            let account = resolve_account_label(account_home, account_flag)?;
+            let name = name_flag.or(name).ok_or(DmError::MissingGroupName)?;
+            let mut members = members;
+            members.extend(member_flags);
             app.status(&account)?;
             let mut client = app.client(&account).await?;
             let member_refs = members.iter().map(String::as_str).collect::<Vec<_>>();
@@ -577,40 +711,8 @@ async fn group_command(app: &MarmotApp, command: GroupCommand) -> Result<Command
                 }),
             })
         }
-        GroupCommand::List {
-            account,
-            include_archived,
-        } => {
-            app.status(&account)?;
-            let groups = if include_archived {
-                app.groups(&account)?
-            } else {
-                app.visible_groups(&account)?
-            };
-            Ok(CommandOutput {
-                plain: group_list_plain(&groups),
-                json: json!({
-                    "account": account,
-                    "include_archived": include_archived,
-                    "groups": groups.into_iter().map(group_json).collect::<Vec<_>>(),
-                }),
-            })
-        }
-        GroupCommand::Show { account, group } => {
-            app.status(&account)?;
-            let group_id = normalize_group_id_hex(&group)?;
-            let group = app
-                .group(&account, &group_id)?
-                .ok_or_else(|| AppError::UnknownGroup(group_id.clone()))?;
-            Ok(CommandOutput {
-                plain: group_plain(&group),
-                json: json!({
-                    "account": account,
-                    "group": group_json(group),
-                }),
-            })
-        }
-        GroupCommand::Members { account, group } => {
+        GroupCommand::Members { group } => {
+            let account = resolve_account_label(account_home, account_flag)?;
             app.status(&account)?;
             let group_id = GroupId::new(hex::decode(normalize_group_id_hex(&group)?)?);
             let client = app.client(&account).await?;
@@ -624,11 +726,8 @@ async fn group_command(app: &MarmotApp, command: GroupCommand) -> Result<Command
                 }),
             })
         }
-        GroupCommand::Invite {
-            account,
-            group,
-            members,
-        } => {
+        GroupCommand::Invite { group, members } => {
+            let account = resolve_account_label(account_home, account_flag)?;
             app.status(&account)?;
             let group_id = GroupId::new(hex::decode(normalize_group_id_hex(&group)?)?);
             let mut client = app.client(&account).await?;
@@ -649,11 +748,8 @@ async fn group_command(app: &MarmotApp, command: GroupCommand) -> Result<Command
                 }),
             })
         }
-        GroupCommand::Remove {
-            account,
-            group,
-            members,
-        } => {
+        GroupCommand::Remove { group, members } => {
+            let account = resolve_account_label(account_home, account_flag)?;
             app.status(&account)?;
             let group_id = GroupId::new(hex::decode(normalize_group_id_hex(&group)?)?);
             let mut client = app.client(&account).await?;
@@ -674,36 +770,12 @@ async fn group_command(app: &MarmotApp, command: GroupCommand) -> Result<Command
                 }),
             })
         }
-        GroupCommand::Archive { account, group } => {
-            app.status(&account)?;
-            let group_id = normalize_group_id_hex(&group)?;
-            let group = app.set_group_archived(&account, &group_id, true)?;
-            Ok(CommandOutput {
-                plain: format!("archived group {group_id}"),
-                json: json!({
-                    "account": account,
-                    "group": group_json(group),
-                }),
-            })
-        }
-        GroupCommand::Unarchive { account, group } => {
-            app.status(&account)?;
-            let group_id = normalize_group_id_hex(&group)?;
-            let group = app.set_group_archived(&account, &group_id, false)?;
-            Ok(CommandOutput {
-                plain: format!("unarchived group {group_id}"),
-                json: json!({
-                    "account": account,
-                    "group": group_json(group),
-                }),
-            })
-        }
         GroupCommand::Update {
-            account,
             group,
             name,
             description,
         } => {
+            let account = resolve_account_label(account_home, account_flag)?;
             app.status(&account)?;
             let group_id = GroupId::new(hex::decode(normalize_group_id_hex(&group)?)?);
             let mut client = app.client(&account).await?;
@@ -730,19 +802,71 @@ async fn group_command(app: &MarmotApp, command: GroupCommand) -> Result<Command
     }
 }
 
+fn group_show_output(
+    app: &MarmotApp,
+    account: String,
+    group: String,
+) -> Result<CommandOutput, DmError> {
+    app.status(&account)?;
+    let group_id = normalize_group_id_hex(&group)?;
+    let group = app
+        .group(&account, &group_id)?
+        .ok_or_else(|| AppError::UnknownGroup(group_id.clone()))?;
+    Ok(CommandOutput {
+        plain: group_plain(&group),
+        json: json!({
+            "account": account,
+            "group": group_json(group),
+        }),
+    })
+}
+
+fn group_archive_output(
+    app: &MarmotApp,
+    account: String,
+    group: String,
+    archived: bool,
+) -> Result<CommandOutput, DmError> {
+    app.status(&account)?;
+    let group_id = normalize_group_id_hex(&group)?;
+    let group = app.set_group_archived(&account, &group_id, archived)?;
+    let verb = if archived { "archived" } else { "unarchived" };
+    Ok(CommandOutput {
+        plain: format!("{verb} group {group_id}"),
+        json: json!({
+            "account": account,
+            "group": group_json(group),
+        }),
+    })
+}
+
+fn message_target_and_text(
+    group_flag: Option<String>,
+    mut args: Vec<String>,
+) -> Result<(String, Vec<String>), DmError> {
+    if let Some(group) = group_flag {
+        return Ok((group, args));
+    }
+    if args.is_empty() {
+        return Err(DmError::MissingGroupId);
+    }
+    let group = args.remove(0);
+    Ok((group, args))
+}
+
 async fn message_command(
+    account_home: &AccountHome,
     app: &MarmotApp,
     command: MessageCommand,
+    account_flag: Option<String>,
 ) -> Result<CommandOutput, DmError> {
     match command {
-        MessageCommand::Send {
-            account,
-            group,
-            text,
-        } => {
+        MessageCommand::Send { group_flag, args } => {
+            let (group, text) = message_target_and_text(group_flag, args)?;
             if text.is_empty() {
                 return Err(DmError::EmptyMessage);
             }
+            let account = resolve_account_label(account_home, account_flag)?;
             app.status(&account)?;
             let group_id = GroupId::new(hex::decode(group)?);
             let payload = text.join(" ");
@@ -758,11 +882,8 @@ async fn message_command(
                 }),
             })
         }
-        MessageCommand::List {
-            account,
-            group,
-            limit,
-        } => {
+        MessageCommand::List { group, limit } => {
+            let account = resolve_account_label(account_home, account_flag)?;
             app.status(&account)?;
             let messages = app.messages_with_query(
                 &account,
@@ -792,42 +913,6 @@ async fn sync_command(app: &MarmotApp, account: String) -> Result<CommandOutput,
         plain: sync_plain(&summary),
         json: sync_json(account, summary),
     })
-}
-
-async fn directory_command(
-    account_home: &AccountHome,
-    app: &MarmotApp,
-    command: DirectoryCommand,
-) -> Result<CommandOutput, DmError> {
-    match command {
-        DirectoryCommand::Get { name, pubkey } => {
-            let account_id = account_selector(account_home, name, pubkey)?;
-            let entry = app
-                .directory_entry_for_account_id(&account_id)?
-                .ok_or_else(|| AppError::MissingDirectoryEntry(account_id.clone()))?;
-            Ok(CommandOutput {
-                plain: directory_entry_plain(&entry),
-                json: directory_entry_json(entry),
-            })
-        }
-        DirectoryCommand::Refresh {
-            name,
-            pubkey,
-            bootstrap_relays,
-        } => {
-            let account_id = account_selector(account_home, name, pubkey)?;
-            let entry = app
-                .refresh_directory_entry_for_account_id(
-                    &account_id,
-                    relay_endpoints(bootstrap_relays)?,
-                )
-                .await?;
-            Ok(CommandOutput {
-                plain: directory_entry_plain(&entry),
-                json: directory_entry_json(entry),
-            })
-        }
-    }
 }
 
 fn sync_plain(summary: &SyncSummary) -> String {
@@ -974,37 +1059,6 @@ fn key_package_fetch_json(fetched: FetchedKeyPackage) -> Value {
     })
 }
 
-fn directory_entry_plain(entry: &DirectoryEntry) -> String {
-    let key_package = if entry.key_package.is_some() {
-        "key-package=yes"
-    } else {
-        "key-package=no"
-    };
-    format!(
-        "directory {} relay-lists={} {key_package}",
-        entry.account_id_hex,
-        relay_setup_plain(&entry.relay_lists)
-    )
-}
-
-fn directory_entry_json(entry: DirectoryEntry) -> Value {
-    let key_package = entry.key_package.map(|key_package| {
-        json!({
-            "key_package_id": key_package.key_package_id,
-            "bytes": hex::decode(&key_package.key_package_hex)
-                .map(|bytes| bytes.len())
-                .unwrap_or_default(),
-            "created_at": key_package.created_at,
-            "source_relays": key_package.source_relays,
-        })
-    });
-    json!({
-        "account_id": entry.account_id_hex,
-        "relay_lists": relay_lists_json(entry.relay_lists),
-        "key_package": key_package,
-    })
-}
-
 fn dm_status_json(status: AppStatus, runtime_info: &CliRuntimeInfo) -> Value {
     json!({
         "account": status.account,
@@ -1111,17 +1165,56 @@ async fn relay_list_status_for_account_id(
     }
 }
 
-fn account_selector(
+fn account_selector_or_default(
     account_home: &AccountHome,
     name: Option<String>,
     pubkey: Option<String>,
+    default_account: Option<String>,
 ) -> Result<String, DmError> {
     match (name, pubkey) {
         (Some(_), Some(_)) => Err(DmError::AmbiguousAccountSelector),
-        (None, None) => Err(DmError::MissingAccountSelector),
         (Some(name), None) => Ok(account_home.account(&name)?.account_id_hex),
         (None, Some(pubkey)) => parse_public_key(&pubkey),
+        (None, None) => {
+            let label = resolve_account_label(account_home, default_account)?;
+            Ok(account_home.account(&label)?.account_id_hex)
+        }
     }
+}
+
+fn resolve_account_label(
+    account_home: &AccountHome,
+    explicit: Option<String>,
+) -> Result<String, DmError> {
+    if let Some(account) = explicit
+        .or_else(|| std::env::var("DM_ACCOUNT").ok())
+        .filter(|account| !account.trim().is_empty())
+    {
+        return resolve_account_ref(account_home, &account);
+    }
+
+    let accounts = account_home.accounts()?;
+    match accounts.as_slice() {
+        [] => Err(DmError::MissingAccount),
+        [account] => Ok(account.label.clone()),
+        _ => Err(DmError::MultipleAccounts),
+    }
+}
+
+fn resolve_account_ref(account_home: &AccountHome, value: &str) -> Result<String, DmError> {
+    if let Ok(account) = account_home.account(value) {
+        return Ok(account.label);
+    }
+
+    if let Ok(account_id_hex) = parse_public_key(value) {
+        for account in account_home.accounts()? {
+            if account.account_id_hex == account_id_hex {
+                return Ok(account.label);
+            }
+        }
+    }
+
+    Err(DmError::UnknownLocalAccount(value.to_owned()))
 }
 
 fn parse_public_key(value: &str) -> Result<String, DmError> {
@@ -1298,13 +1391,38 @@ fn dm_error_json(err: &DmError) -> Value {
             "code": "empty_message",
             "message": err.to_string(),
         }),
+        DmError::MissingGroupName => json!({
+            "code": "missing_group_name",
+            "message": err.to_string(),
+        }),
+        DmError::MissingGroupId => json!({
+            "code": "missing_group_id",
+            "message": err.to_string(),
+        }),
         DmError::EmptyRelayUrl => json!({
             "code": "empty_relay_url",
             "message": err.to_string(),
         }),
-        DmError::MissingAccountSelector => json!({
-            "code": "missing_account_selector",
+        DmError::MissingAccount => json!({
+            "code": "missing_account",
             "message": err.to_string(),
+            "repair": {
+                "create": "dm account create <name>",
+                "select": "--account <name-or-pubkey>",
+            },
+        }),
+        DmError::MultipleAccounts => json!({
+            "code": "multiple_accounts",
+            "message": err.to_string(),
+            "repair": {
+                "flag": "--account",
+                "env": "DM_ACCOUNT",
+            },
+        }),
+        DmError::UnknownLocalAccount(account) => json!({
+            "code": "unknown_account",
+            "message": err.to_string(),
+            "account": account,
         }),
         DmError::AmbiguousAccountSelector => json!({
             "code": "ambiguous_account_selector",
@@ -1379,8 +1497,8 @@ fn app_error_json(err: &AppError) -> Value {
             "message": err.to_string(),
             "account": account,
             "repair": {
-                "local": format!("dm key-package publish --account {account}"),
-                "remote": format!("dm key-package fetch --pubkey {account} --bootstrap-relays <relay-url>")
+                "local": format!("dm --account {account} keys publish"),
+                "remote": "dm keys fetch --pubkey <npub-or-hex> --bootstrap-relays <relay-url>"
             },
         }),
         AppError::UnknownGroup(group_id) => json!({
@@ -1424,7 +1542,7 @@ fn app_error_json(err: &AppError) -> Value {
             "message": err.to_string(),
             "account_id": account_id,
             "repair": {
-                "command": format!("dm directory refresh --pubkey {account_id} --bootstrap-relays <relay-url>")
+                "command": format!("dm keys fetch --pubkey {account_id} --bootstrap-relays <relay-url>")
             },
         }),
         AppError::InvalidGroupProfile(reason) => json!({

@@ -112,6 +112,43 @@ async fn local_app_publishes_account_relay_lists_for_setup() {
 }
 
 #[tokio::test]
+async fn local_relay_list_fetch_only_uses_requested_bootstrap_relays() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    let app = MarmotApp::local(dir.path());
+
+    app.publish_account_relay_lists(
+        "alice",
+        AccountRelayListBootstrap::new(
+            vec![TransportEndpoint("marmot-local://key-packages".into())],
+            vec![TransportEndpoint("marmot-local://seed-a".into())],
+        ),
+    )
+    .await
+    .unwrap();
+
+    let account_id = home.account("alice").unwrap().account_id_hex;
+    let missing_from_seed_b = app
+        .fetch_account_relay_list_status_for_account_id(
+            &account_id,
+            vec![TransportEndpoint("marmot-local://seed-b".into())],
+        )
+        .await
+        .unwrap();
+
+    assert!(!missing_from_seed_b.complete);
+    assert_eq!(
+        missing_from_seed_b.missing,
+        vec!["nip65", "inbox", "key_package"]
+    );
+    assert_eq!(
+        missing_from_seed_b.bootstrap_relays,
+        vec!["marmot-local://seed-b"]
+    );
+}
+
+#[tokio::test]
 async fn directory_cache_is_durable_app_state_not_json_user_files() {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());

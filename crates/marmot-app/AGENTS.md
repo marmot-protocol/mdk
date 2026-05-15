@@ -9,6 +9,8 @@ App runtime bridge for the first real Marmot app surfaces.
 - Keep CLI/TUI presentation out of this crate.
 - Keep protocol engine behavior in `cgka-engine` and session ownership in `cgka-session`.
 - Keep local development relay code clearly separate from production Nostr relay-list setup and discovery.
+- Keep local relay discovery endpoint-scoped: a fetch from one `marmot-local://...` relay must not see records that were
+  only published to another local relay.
 - Do not print or log account ids, group ids, relay URLs, message ids, pubkeys, payloads, ciphertext, plaintext, or key
   material.
 

@@ -24,7 +24,8 @@ key storage, and runtime coordination with a `TransportAdapter`.
 `AccountHome` is the durable app-core boundary for local account setup. It keeps public summaries separate from secret
 material. Real app surfaces should use `AccountHome::open_with_keychain` or `open_with_default_keychain`; tests and local
 labs can keep using `AccountHome::open`, which uses the local file secret store. Relay-list discovery and repair belong
-above this crate in the Nostr account transport/app-runtime layer.
+above this crate in the Nostr account transport/app-runtime layer, and CLI account selection belongs in presentation
+surfaces like `dm`.
 
 `TransportRoutingPolicy` is the transport-generic boundary. It answers:
 

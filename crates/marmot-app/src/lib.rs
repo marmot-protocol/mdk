@@ -642,7 +642,18 @@ impl MarmotApp {
         bootstrap_relays: Vec<TransportEndpoint>,
     ) -> Result<AccountRelayListStatus, AppError> {
         if bootstrap_relays.is_empty() || bootstrap_relays.iter().all(is_local_relay_endpoint) {
-            let mut status = self.account_relay_list_status_for_account_id(account_id_hex)?;
+            let records = self
+                .relay_events()?
+                .into_iter()
+                .filter(|record| {
+                    bootstrap_relays.is_empty()
+                        || record
+                            .endpoints
+                            .iter()
+                            .any(|endpoint| bootstrap_relays.contains(endpoint))
+                })
+                .collect::<Vec<_>>();
+            let mut status = relay_list_status_from_records(account_id_hex, records);
             if !bootstrap_relays.is_empty() {
                 status.bootstrap_relays = bootstrap_relays
                     .into_iter()
