@@ -175,7 +175,11 @@ where
     where
         I: IntoIterator<Item = RelayUrl>,
     {
-        self.create_key_package_for_event_internal(public_key, relays, &KeyPackageOptions::default())
+        self.create_key_package_for_event_internal(
+            public_key,
+            relays,
+            &KeyPackageOptions::default(),
+        )
     }
 
     /// Creates a key package for a Nostr event with additional options.
