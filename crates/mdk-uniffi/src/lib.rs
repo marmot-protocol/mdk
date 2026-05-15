@@ -1520,9 +1520,12 @@ impl Mdk {
 
 /// Options for creating a key package event.
 ///
-/// Mirrors `mdk_core::key_packages::KeyPackageOptions`. Pass an instance with the
-/// default values (`protected = false`, `existing_d_tag = None`) for the standard
-/// behavior, or set fields to customize.
+/// Mirrors `mdk_core::key_packages::KeyPackageOptions`. Both fields carry FFI-level
+/// defaults via `#[uniffi(default = ...)]`, so foreign callers (Kotlin / Swift /
+/// Python) can omit either or both for the standard behavior — e.g. in Kotlin,
+/// `KeyPackageOptions()` is equivalent to
+/// `KeyPackageOptions(protected = false, existingDTag = null)`. Or skip options
+/// entirely by calling `create_key_package_for_event` instead.
 #[derive(uniffi::Record, Default, Clone)]
 pub struct KeyPackageOptions {
     /// Add the NIP-70 protected tag (`["-"]`).
@@ -1531,6 +1534,7 @@ pub struct KeyPackageOptions {
     /// event by third parties. Many popular relays (Damus, Primal, nos.lol) reject
     /// protected events entirely — only enable when publishing to relays known to
     /// accept NIP-70 protected events. Defaults to `false` for max relay compat.
+    #[uniffi(default = false)]
     pub protected: bool,
 
     /// Reuse an existing `d` tag value instead of generating a new one.
@@ -1542,8 +1546,9 @@ pub struct KeyPackageOptions {
     /// Must be exactly 64 ASCII hex digits (per MIP-00). Validation runs at the FFI
     /// boundary; malformed input surfaces as `MdkUniffiError::InvalidInput` before
     /// crossing into `mdk_core`, matching how `parse_public_key` / `parse_relay_urls`
-    /// report parameter errors. When `None`, a fresh random 32-byte hex value is
-    /// generated (current default behavior).
+    /// report parameter errors. When `None` (the default), a fresh random 32-byte
+    /// hex value is generated.
+    #[uniffi(default = None)]
     pub existing_d_tag: Option<String>,
 }
 
