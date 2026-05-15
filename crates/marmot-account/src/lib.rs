@@ -49,6 +49,7 @@ pub struct AccountHome {
 pub struct AccountSummary {
     pub label: String,
     pub account_id_hex: String,
+    pub local_signing: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -65,6 +66,8 @@ pub enum AccountHomeError {
     UnknownAccount(String),
     #[error("invalid nsec or secret key")]
     InvalidSecretKey,
+    #[error("invalid Nostr public key")]
+    InvalidPublicKey,
     #[error("invalid account label: {0}")]
     InvalidAccountLabel(String),
     #[error("stored account id does not match stored secret key")]
@@ -262,14 +265,13 @@ impl AccountHome {
     }
 
     pub fn create_account(&self, label: &str) -> AccountHomeResult<AccountSummary> {
-        validate_account_label(label)?;
-        if self.account_record_path(label).exists()
-            || self.secret_store.has_secret_for_label(label)?
-        {
-            return Err(AccountHomeError::AccountExists(label.to_owned()));
-        }
         let keys = nostr::Keys::generate();
-        self.write_account(label, &keys)
+        self.write_signing_account_for_label(label, &keys)
+    }
+
+    pub fn create_nostr_account(&self) -> AccountHomeResult<AccountSummary> {
+        let keys = nostr::Keys::generate();
+        self.write_signing_account(&keys)
     }
 
     pub fn import_account(
@@ -277,15 +279,29 @@ impl AccountHome {
         label: &str,
         secret_key: &str,
     ) -> AccountHomeResult<AccountSummary> {
-        validate_account_label(label)?;
-        if self.account_record_path(label).exists()
-            || self.secret_store.has_secret_for_label(label)?
-        {
-            return Err(AccountHomeError::AccountExists(label.to_owned()));
-        }
         let keys =
             nostr::Keys::parse(secret_key).map_err(|_| AccountHomeError::InvalidSecretKey)?;
-        self.write_account(label, &keys)
+        self.write_signing_account_for_label(label, &keys)
+    }
+
+    pub fn import_nostr_account(&self, secret_key: &str) -> AccountHomeResult<AccountSummary> {
+        let keys =
+            nostr::Keys::parse(secret_key).map_err(|_| AccountHomeError::InvalidSecretKey)?;
+        self.write_signing_account(&keys)
+    }
+
+    pub fn add_public_account(&self, public_key: &str) -> AccountHomeResult<AccountSummary> {
+        let account_id_hex = Self::account_id_for_public_key(public_key)?;
+        if self.account_record_path(&account_id_hex).exists() {
+            return Err(AccountHomeError::AccountExists(account_id_hex));
+        }
+        let account = AccountSummary {
+            label: account_id_hex.clone(),
+            account_id_hex,
+            local_signing: false,
+        };
+        self.write_account_record(&account)?;
+        Ok(account)
     }
 
     pub fn account_id_for_secret(secret_key: &str) -> AccountHomeResult<String> {
@@ -294,11 +310,25 @@ impl AccountHome {
         Ok(keys.public_key().to_hex())
     }
 
-    pub fn account(&self, label: &str) -> AccountHomeResult<AccountSummary> {
-        validate_account_label(label)?;
-        let path = self.account_record_path(label);
+    pub fn account_id_for_public_key(public_key: &str) -> AccountHomeResult<String> {
+        nostr::PublicKey::parse(public_key)
+            .map(|pubkey| pubkey.to_hex())
+            .map_err(|_| AccountHomeError::InvalidPublicKey)
+    }
+
+    pub fn account(&self, account_ref: &str) -> AccountHomeResult<AccountSummary> {
+        if validate_account_label(account_ref).is_ok() {
+            let path = self.account_record_path(account_ref);
+            if path.exists() {
+                return read_json(path);
+            }
+        }
+
+        let account_id = Self::account_id_for_public_key(account_ref)
+            .map_err(|_| AccountHomeError::UnknownAccount(account_ref.to_owned()))?;
+        let path = self.account_record_path(&account_id);
         if !path.exists() {
-            return Err(AccountHomeError::UnknownAccount(label.to_owned()));
+            return Err(AccountHomeError::UnknownAccount(account_ref.to_owned()));
         }
         read_json(path)
     }
@@ -316,24 +346,25 @@ impl AccountHome {
                 accounts.push(read_json(path)?);
             }
         }
-        accounts.sort_by(|a: &AccountSummary, b| a.label.cmp(&b.label));
+        accounts.sort_by(|a: &AccountSummary, b| a.account_id_hex.cmp(&b.account_id_hex));
         Ok(accounts)
     }
 
-    pub fn remove_account(&self, label: &str) -> AccountHomeResult<()> {
-        validate_account_label(label)?;
-        let account = self.account(label)?;
+    pub fn remove_account(&self, account_ref: &str) -> AccountHomeResult<()> {
+        let account = self.account(account_ref)?;
         self.secret_store.remove_secret(&account)?;
-        match fs::remove_dir_all(self.account_dir(label)) {
+        match fs::remove_dir_all(self.account_dir(&account.label)) {
             Ok(()) => Ok(()),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(err) => Err(err.into()),
         }
     }
 
-    pub fn load_signing_keys(&self, label: &str) -> AccountHomeResult<nostr::Keys> {
-        validate_account_label(label)?;
-        let account = self.account(label)?;
+    pub fn load_signing_keys(&self, account_ref: &str) -> AccountHomeResult<nostr::Keys> {
+        let account = self.account(account_ref)?;
+        if !account.local_signing {
+            return Err(AccountHomeError::SecretNotFound(account.account_id_hex));
+        }
         let keys = self.secret_store.load_secret(&account)?;
         if keys.public_key().to_hex() != account.account_id_hex {
             return Err(AccountHomeError::AccountIdMismatch);
@@ -341,18 +372,39 @@ impl AccountHome {
         Ok(keys)
     }
 
-    fn write_account(&self, label: &str, keys: &nostr::Keys) -> AccountHomeResult<AccountSummary> {
-        validate_account_label(label)?;
+    fn write_signing_account(&self, keys: &nostr::Keys) -> AccountHomeResult<AccountSummary> {
+        let label = keys.public_key().to_hex();
+        self.write_signing_account_for_label(&label, keys)
+    }
+
+    fn write_signing_account_for_label(
+        &self,
+        label: &str,
+        keys: &nostr::Keys,
+    ) -> AccountHomeResult<AccountSummary> {
+        let label = label.to_owned();
+        validate_account_label(&label)?;
+        if self.account_record_path(&label).exists()
+            || self.secret_store.has_secret_for_label(&label)?
+        {
+            return Err(AccountHomeError::AccountExists(label));
+        }
         let account = AccountSummary {
-            label: label.to_owned(),
+            label,
             account_id_hex: keys.public_key().to_hex(),
+            local_signing: true,
         };
         self.secret_store.write_secret(&account, keys)?;
-        if let Err(err) = write_json(self.account_record_path(label), &account) {
+        if let Err(err) = self.write_account_record(&account) {
             let _ = self.secret_store.remove_secret(&account);
             return Err(err);
         }
         Ok(account)
+    }
+
+    fn write_account_record(&self, account: &AccountSummary) -> AccountHomeResult<()> {
+        validate_account_label(&account.label)?;
+        write_json(self.account_record_path(&account.label), account)
     }
 
     fn accounts_dir(&self) -> PathBuf {

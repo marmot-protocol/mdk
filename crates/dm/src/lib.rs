@@ -11,6 +11,7 @@ use marmot_app::{
     AppGroupRecord, AppMessageQuery, AppMessageRecord, AppStatus, FetchedKeyPackage, MarmotApp,
     SyncSummary,
 };
+use nostr::ToBech32;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -90,32 +91,21 @@ enum Command {
 #[derive(Clone, Debug, Serialize, Deserialize, Subcommand)]
 enum AccountCommand {
     Create {
-        name: String,
+        #[arg(value_name = "NSEC_OR_NPUB")]
+        identity: Option<String>,
         #[arg(long, value_name = "URLS", value_delimiter = ',')]
         default_relays: Vec<String>,
         #[arg(long, value_name = "URLS", value_delimiter = ',')]
         bootstrap_relays: Vec<String>,
-    },
-    Import {
-        name: String,
-        #[arg(long, value_name = "NSEC_OR_HEX")]
-        nsec: String,
-        #[arg(long, value_name = "URLS", value_delimiter = ',')]
-        default_relays: Vec<String>,
-        #[arg(long, value_name = "URLS", value_delimiter = ',')]
-        bootstrap_relays: Vec<String>,
-        #[arg(long)]
-        publish_missing_relay_lists: bool,
     },
     List,
     Status {
-        name: Option<String>,
+        account: Option<String>,
     },
     #[command(name = "relay-lists")]
     RelayLists {
-        name: Option<String>,
-        #[arg(long, value_name = "NPUB_OR_HEX")]
-        pubkey: Option<String>,
+        #[arg(value_name = "NPUB_OR_HEX")]
+        account: Option<String>,
         #[arg(long, value_name = "URLS", value_delimiter = ',')]
         bootstrap_relays: Vec<String>,
     },
@@ -125,9 +115,8 @@ enum AccountCommand {
 enum KeyPackageCommand {
     Publish,
     Fetch {
-        name: Option<String>,
-        #[arg(long, value_name = "NPUB_OR_HEX")]
-        pubkey: Option<String>,
+        #[arg(value_name = "NPUB_OR_HEX")]
+        account: Option<String>,
         #[arg(long, value_name = "URLS", value_delimiter = ',')]
         bootstrap_relays: Vec<String>,
     },
@@ -203,7 +192,10 @@ enum MessageCommand {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Subcommand)]
 enum DaemonCommand {
-    Start,
+    Start {
+        #[arg(long, value_name = "MILLIS")]
+        sync_interval_ms: Option<u64>,
+    },
     Stop,
     Status,
 }
@@ -243,10 +235,10 @@ enum DmError {
     MultipleAccounts,
     #[error("account not found: {0}")]
     UnknownLocalAccount(String),
-    #[error("pass an account name or --pubkey, not both")]
-    AmbiguousAccountSelector,
     #[error("invalid public key")]
     InvalidPublicKey,
+    #[error("public Nostr accounts do not have local signing keys")]
+    PublicAccountCannotSign,
     #[error("invalid secret store: {0}")]
     InvalidSecretStore(String),
     #[error("missing account relay lists: {0:?}")]
@@ -378,7 +370,8 @@ async fn execute_inner(cli: Cli) -> Result<CommandOutput, DmError> {
             json: json!({"handled": "client"}),
         }),
         Command::Sync => {
-            let account = resolve_account_label(&account_home, account_flag)?;
+            let account = resolve_account(&account_home, account_flag)?;
+            ensure_local_signing(&account)?;
             sync_command(&app, account).await
         }
     }
@@ -432,85 +425,121 @@ async fn account_command(
 ) -> Result<CommandOutput, DmError> {
     match command {
         AccountCommand::Create {
-            name,
+            identity,
             default_relays,
             bootstrap_relays,
         } => {
-            let account = account_home.create_account(&name)?;
-            let relay_lists = match maybe_publish_relay_lists(
-                app,
-                &name,
-                relay_bootstrap(default_relays, bootstrap_relays)?,
-            )
-            .await
-            {
-                Ok(relay_lists) => relay_lists,
-                Err(err) => rollback_account_after_setup_failure(account_home, &name, err)?,
-            };
-            Ok(CommandOutput {
-                plain: format!(
-                    "created account {name} {} relay-lists={}",
-                    account.account_id_hex,
-                    relay_setup_plain(&relay_lists)
-                ),
-                json: json!({
-                    "account": name,
-                    "account_id": account.account_id_hex,
-                    "relay_lists": relay_lists_json(relay_lists),
-                }),
-            })
-        }
-        AccountCommand::Import {
-            name,
-            nsec,
-            default_relays,
-            bootstrap_relays,
-            publish_missing_relay_lists,
-        } => {
-            let account_id = AccountHome::account_id_for_secret(&nsec)?;
-            let bootstrap_endpoints = relay_endpoints(bootstrap_relays.clone())?;
-            let current_status =
-                relay_list_status_for_account_id(app, &account_id, bootstrap_endpoints.clone())
-                    .await?;
-            if !current_status.complete && !publish_missing_relay_lists {
-                return Err(DmError::MissingRelayLists(
-                    current_status.missing.clone(),
-                    Box::new(current_status),
-                ));
-            }
-            if !current_status.complete && default_relays.is_empty() {
-                return Err(AppError::MissingDefaultRelays.into());
-            }
-            let account = account_home.import_account(&name, &nsec)?;
-            let relay_lists = if publish_missing_relay_lists && !current_status.complete {
-                let bootstrap =
-                    relay_bootstrap_from_endpoints(default_relays, bootstrap_endpoints)?
-                        .ok_or(AppError::MissingDefaultRelays)?;
-                match app
-                    .publish_missing_account_relay_lists_from_status(
-                        &name,
-                        bootstrap,
-                        current_status,
-                    )
-                    .await
-                {
-                    Ok(relay_lists) => relay_lists,
-                    Err(err) => {
-                        rollback_account_after_setup_failure(account_home, &name, err.into())?
+            let imports_private_key = identity.as_deref().is_some_and(is_nostr_secret);
+            let account = create_nostr_account(account_home, identity)?;
+            let relay_lists = match account.local_signing {
+                true => {
+                    if imports_private_key && !bootstrap_relays.is_empty() {
+                        let bootstrap_endpoints = match relay_endpoints(bootstrap_relays.clone()) {
+                            Ok(endpoints) => endpoints,
+                            Err(err) => rollback_account_after_setup_failure(
+                                account_home,
+                                &account.label,
+                                err,
+                            )?,
+                        };
+                        let current_status = match relay_list_status_for_account_id(
+                            app,
+                            &account.account_id_hex,
+                            bootstrap_endpoints.clone(),
+                        )
+                        .await
+                        {
+                            Ok(status) => status,
+                            Err(err) => rollback_account_after_setup_failure(
+                                account_home,
+                                &account.label,
+                                err,
+                            )?,
+                        };
+                        if current_status.complete {
+                            current_status
+                        } else if default_relays.is_empty() {
+                            rollback_account_after_setup_failure(
+                                account_home,
+                                &account.label,
+                                DmError::MissingRelayLists(
+                                    current_status.missing.clone(),
+                                    Box::new(current_status),
+                                ),
+                            )?
+                        } else {
+                            let bootstrap = match relay_bootstrap_from_endpoints(
+                                default_relays,
+                                bootstrap_endpoints,
+                            )
+                            .and_then(|bootstrap| {
+                                bootstrap.ok_or_else(|| AppError::MissingDefaultRelays.into())
+                            }) {
+                                Ok(bootstrap) => bootstrap,
+                                Err(err) => rollback_account_after_setup_failure(
+                                    account_home,
+                                    &account.label,
+                                    err,
+                                )?,
+                            };
+                            match app
+                                .publish_missing_account_relay_lists_from_status(
+                                    &account.label,
+                                    bootstrap,
+                                    current_status,
+                                )
+                                .await
+                            {
+                                Ok(relay_lists) => relay_lists,
+                                Err(err) => rollback_account_after_setup_failure(
+                                    account_home,
+                                    &account.label,
+                                    err.into(),
+                                )?,
+                            }
+                        }
+                    } else {
+                        let bootstrap = match relay_bootstrap(default_relays, bootstrap_relays) {
+                            Ok(bootstrap) => bootstrap,
+                            Err(err) => rollback_account_after_setup_failure(
+                                account_home,
+                                &account.label,
+                                err,
+                            )?,
+                        };
+                        match maybe_publish_relay_lists(app, &account.label, bootstrap).await {
+                            Ok(relay_lists) => relay_lists,
+                            Err(err) => rollback_account_after_setup_failure(
+                                account_home,
+                                &account.label,
+                                err,
+                            )?,
+                        }
                     }
                 }
-            } else {
-                current_status
+                false => {
+                    if !default_relays.is_empty() {
+                        return Err(DmError::PublicAccountCannotSign);
+                    }
+                    relay_list_status_for_account_id(
+                        app,
+                        &account.account_id_hex,
+                        relay_endpoints(bootstrap_relays)?,
+                    )
+                    .await?
+                }
             };
             Ok(CommandOutput {
                 plain: format!(
-                    "imported account {name} {} relay-lists={}",
-                    account.account_id_hex,
+                    "created account {} local-signing={} relay-lists={}",
+                    npub_for_account_id(&account.account_id_hex),
+                    account.local_signing,
                     relay_setup_plain(&relay_lists)
                 ),
                 json: json!({
-                    "account": name,
                     "account_id": account.account_id_hex,
+                    "npub": npub_for_account_id(&account.account_id_hex),
+                    "local_signing": account.local_signing,
                     "relay_lists": relay_lists_json(relay_lists),
                 }),
             })
@@ -522,7 +551,14 @@ async fn account_command(
             } else {
                 accounts
                     .iter()
-                    .map(|account| format!("{} {}", account.label, account.account_id_hex))
+                    .map(|account| {
+                        format!(
+                            "{} {} local-signing={}",
+                            npub_for_account_id(&account.account_id_hex),
+                            account.account_id_hex,
+                            account.local_signing
+                        )
+                    })
                     .collect::<Vec<_>>()
                     .join("\n")
             };
@@ -530,8 +566,9 @@ async fn account_command(
                 .into_iter()
                 .map(|account| {
                     json!({
-                        "account": account.label,
                         "account_id": account.account_id_hex,
+                        "npub": npub_for_account_id(&account.account_id_hex),
+                        "local_signing": account.local_signing,
                     })
                 })
                 .collect::<Vec<_>>();
@@ -540,9 +577,19 @@ async fn account_command(
                 json: json!({ "accounts": accounts_json }),
             })
         }
-        AccountCommand::Status { name } => {
-            let name = resolve_account_label(account_home, name.or(account_flag))?;
-            let status = app.status(&name)?;
+        AccountCommand::Status { account } => {
+            let account = resolve_account(account_home, account.or(account_flag))?;
+            if !account.local_signing {
+                let relay_lists =
+                    app.account_relay_list_status_for_account_id(&account.account_id_hex)?;
+                let json = public_account_status_json(&account, relay_lists);
+                return Ok(CommandOutput {
+                    plain: serde_json::to_string_pretty(&json)
+                        .expect("JSON response serialization cannot fail"),
+                    json,
+                });
+            }
+            let status = app.status(&account.label)?;
             Ok(CommandOutput {
                 plain: serde_json::to_string_pretty(&dm_status_json(status.clone(), &runtime_info))
                     .expect("JSON response serialization cannot fail"),
@@ -550,11 +597,10 @@ async fn account_command(
             })
         }
         AccountCommand::RelayLists {
-            name,
-            pubkey,
+            account,
             bootstrap_relays,
         } => {
-            let account_id = account_selector_or_default(account_home, name, pubkey, account_flag)?;
+            let account_id = account_selector_or_default(account_home, account, account_flag)?;
             let relay_lists = relay_list_status_for_account_id(
                 app,
                 &account_id,
@@ -565,6 +611,7 @@ async fn account_command(
                 plain: relay_setup_plain(&relay_lists),
                 json: json!({
                     "account_id": account_id,
+                    "npub": npub_for_account_id(&account_id),
                     "relay_lists": relay_lists_json(relay_lists),
                 }),
             })
@@ -580,27 +627,29 @@ async fn key_package_command(
 ) -> Result<CommandOutput, DmError> {
     match command {
         KeyPackageCommand::Publish => {
-            let account = resolve_account_label(account_home, account_flag)?;
-            app.status(&account)?;
-            let mut client = app.client(&account).await?;
+            let account = resolve_account(account_home, account_flag)?;
+            ensure_local_signing(&account)?;
+            app.status(&account.label)?;
+            let mut client = app.client(&account.label).await?;
             let key_package = client.publish_key_package().await?;
             Ok(CommandOutput {
                 plain: format!(
-                    "published key package for {account} bytes={}",
+                    "published key package for {} bytes={}",
+                    npub_for_account_id(&account.account_id_hex),
                     key_package.0.len()
                 ),
                 json: json!({
-                    "account": account,
+                    "account_id": account.account_id_hex,
+                    "npub": npub_for_account_id(&account.account_id_hex),
                     "key_package_bytes": key_package.0.len(),
                 }),
             })
         }
         KeyPackageCommand::Fetch {
-            name,
-            pubkey,
+            account,
             bootstrap_relays,
         } => {
-            let account_id = account_selector_or_default(account_home, name, pubkey, account_flag)?;
+            let account_id = account_selector_or_default(account_home, account, account_flag)?;
             let fetched = app
                 .fetch_latest_key_package_for_account_id(
                     &account_id,
@@ -627,46 +676,53 @@ async fn chats_command(
 ) -> Result<CommandOutput, DmError> {
     match command {
         ChatsCommand::List { include_archived } => {
-            let account = resolve_account_label(account_home, account_flag)?;
-            app.status(&account)?;
+            let account = resolve_account(account_home, account_flag)?;
+            ensure_local_signing(&account)?;
+            app.status(&account.label)?;
             let chats = if include_archived {
-                app.groups(&account)?
+                app.groups(&account.label)?
             } else {
-                app.visible_groups(&account)?
+                app.visible_groups(&account.label)?
             };
             Ok(CommandOutput {
                 plain: group_list_plain(&chats),
                 json: json!({
-                    "account": account,
+                    "account_id": account.account_id_hex,
+                    "npub": npub_for_account_id(&account.account_id_hex),
                     "include_archived": include_archived,
                     "chats": chats.into_iter().map(group_json).collect::<Vec<_>>(),
                 }),
             })
         }
         ChatsCommand::Show { group } => {
-            let account = resolve_account_label(account_home, account_flag)?;
+            let account = resolve_account(account_home, account_flag)?;
+            ensure_local_signing(&account)?;
             group_show_output(app, account, group)
         }
         ChatsCommand::Archive { group } => {
-            let account = resolve_account_label(account_home, account_flag)?;
+            let account = resolve_account(account_home, account_flag)?;
+            ensure_local_signing(&account)?;
             group_archive_output(app, account, group, true)
         }
         ChatsCommand::Unarchive { group } => {
-            let account = resolve_account_label(account_home, account_flag)?;
+            let account = resolve_account(account_home, account_flag)?;
+            ensure_local_signing(&account)?;
             group_archive_output(app, account, group, false)
         }
         ChatsCommand::ListArchived => {
-            let account = resolve_account_label(account_home, account_flag)?;
-            app.status(&account)?;
+            let account = resolve_account(account_home, account_flag)?;
+            ensure_local_signing(&account)?;
+            app.status(&account.label)?;
             let chats = app
-                .groups(&account)?
+                .groups(&account.label)?
                 .into_iter()
                 .filter(|group| group.archived)
                 .collect::<Vec<_>>();
             Ok(CommandOutput {
                 plain: group_list_plain(&chats),
                 json: json!({
-                    "account": account,
+                    "account_id": account.account_id_hex,
+                    "npub": npub_for_account_id(&account.account_id_hex),
                     "chats": chats.into_iter().map(group_json).collect::<Vec<_>>(),
                 }),
             })
@@ -687,22 +743,24 @@ async fn group_command(
             name_flag,
             member_flags,
         } => {
-            let account = resolve_account_label(account_home, account_flag)?;
+            let account = resolve_account(account_home, account_flag)?;
+            ensure_local_signing(&account)?;
             let name = name_flag.or(name).ok_or(DmError::MissingGroupName)?;
             let mut members = members;
             members.extend(member_flags);
-            app.status(&account)?;
-            let mut client = app.client(&account).await?;
+            app.status(&account.label)?;
+            let mut client = app.client(&account.label).await?;
             let member_refs = members.iter().map(String::as_str).collect::<Vec<_>>();
             let group_id = client.create_group(&name, &member_refs).await?;
             let group_id_hex = hex::encode(group_id.as_slice());
             let group = app
-                .group(&account, &group_id_hex)?
+                .group(&account.label, &group_id_hex)?
                 .ok_or_else(|| AppError::UnknownGroup(group_id_hex.clone()))?;
             Ok(CommandOutput {
                 plain: format!("created group {group_id_hex}"),
                 json: json!({
-                    "account": account,
+                    "account_id": account.account_id_hex,
+                    "npub": npub_for_account_id(&account.account_id_hex),
                     "group_id": group.group_id_hex,
                     "name": group.profile.name.clone(),
                     "profile": group.profile,
@@ -712,25 +770,28 @@ async fn group_command(
             })
         }
         GroupCommand::Members { group } => {
-            let account = resolve_account_label(account_home, account_flag)?;
-            app.status(&account)?;
+            let account = resolve_account(account_home, account_flag)?;
+            ensure_local_signing(&account)?;
+            app.status(&account.label)?;
             let group_id = GroupId::new(hex::decode(normalize_group_id_hex(&group)?)?);
-            let client = app.client(&account).await?;
+            let client = app.client(&account.label).await?;
             let members = client.members(&group_id)?;
             Ok(CommandOutput {
                 plain: group_members_plain(&members),
                 json: json!({
-                    "account": account,
+                    "account_id": account.account_id_hex,
+                    "npub": npub_for_account_id(&account.account_id_hex),
                     "group_id": hex::encode(group_id.as_slice()),
                     "members": group_members_json(members),
                 }),
             })
         }
         GroupCommand::Invite { group, members } => {
-            let account = resolve_account_label(account_home, account_flag)?;
-            app.status(&account)?;
+            let account = resolve_account(account_home, account_flag)?;
+            ensure_local_signing(&account)?;
+            app.status(&account.label)?;
             let group_id = GroupId::new(hex::decode(normalize_group_id_hex(&group)?)?);
-            let mut client = app.client(&account).await?;
+            let mut client = app.client(&account.label).await?;
             let member_refs = members.iter().map(String::as_str).collect::<Vec<_>>();
             let summary = client.invite_members(&group_id, &member_refs).await?;
             Ok(CommandOutput {
@@ -740,7 +801,8 @@ async fn group_command(
                     summary.published
                 ),
                 json: json!({
-                    "account": account,
+                    "account_id": account.account_id_hex,
+                    "npub": npub_for_account_id(&account.account_id_hex),
                     "group_id": hex::encode(group_id.as_slice()),
                     "members": members,
                     "published": summary.published,
@@ -749,10 +811,11 @@ async fn group_command(
             })
         }
         GroupCommand::Remove { group, members } => {
-            let account = resolve_account_label(account_home, account_flag)?;
-            app.status(&account)?;
+            let account = resolve_account(account_home, account_flag)?;
+            ensure_local_signing(&account)?;
+            app.status(&account.label)?;
             let group_id = GroupId::new(hex::decode(normalize_group_id_hex(&group)?)?);
-            let mut client = app.client(&account).await?;
+            let mut client = app.client(&account.label).await?;
             let member_refs = members.iter().map(String::as_str).collect::<Vec<_>>();
             let summary = client.remove_members(&group_id, &member_refs).await?;
             Ok(CommandOutput {
@@ -762,7 +825,8 @@ async fn group_command(
                     summary.published
                 ),
                 json: json!({
-                    "account": account,
+                    "account_id": account.account_id_hex,
+                    "npub": npub_for_account_id(&account.account_id_hex),
                     "group_id": hex::encode(group_id.as_slice()),
                     "members": members,
                     "published": summary.published,
@@ -775,16 +839,17 @@ async fn group_command(
             name,
             description,
         } => {
-            let account = resolve_account_label(account_home, account_flag)?;
-            app.status(&account)?;
+            let account = resolve_account(account_home, account_flag)?;
+            ensure_local_signing(&account)?;
+            app.status(&account.label)?;
             let group_id = GroupId::new(hex::decode(normalize_group_id_hex(&group)?)?);
-            let mut client = app.client(&account).await?;
+            let mut client = app.client(&account.label).await?;
             let summary = client
                 .update_group_profile(&group_id, name.as_deref(), description.as_deref())
                 .await?;
             let group_id_hex = hex::encode(group_id.as_slice());
             let group = app
-                .group(&account, &group_id_hex)?
+                .group(&account.label, &group_id_hex)?
                 .ok_or_else(|| AppError::UnknownGroup(group_id_hex.clone()))?;
             Ok(CommandOutput {
                 plain: format!(
@@ -792,7 +857,8 @@ async fn group_command(
                     summary.published
                 ),
                 json: json!({
-                    "account": account,
+                    "account_id": account.account_id_hex,
+                    "npub": npub_for_account_id(&account.account_id_hex),
                     "group": group_json(group),
                     "published": summary.published,
                     "message_ids": summary.message_ids,
@@ -804,18 +870,19 @@ async fn group_command(
 
 fn group_show_output(
     app: &MarmotApp,
-    account: String,
+    account: marmot_account::AccountSummary,
     group: String,
 ) -> Result<CommandOutput, DmError> {
-    app.status(&account)?;
+    app.status(&account.label)?;
     let group_id = normalize_group_id_hex(&group)?;
     let group = app
-        .group(&account, &group_id)?
+        .group(&account.label, &group_id)?
         .ok_or_else(|| AppError::UnknownGroup(group_id.clone()))?;
     Ok(CommandOutput {
         plain: group_plain(&group),
         json: json!({
-            "account": account,
+            "account_id": account.account_id_hex,
+            "npub": npub_for_account_id(&account.account_id_hex),
             "group": group_json(group),
         }),
     })
@@ -823,18 +890,19 @@ fn group_show_output(
 
 fn group_archive_output(
     app: &MarmotApp,
-    account: String,
+    account: marmot_account::AccountSummary,
     group: String,
     archived: bool,
 ) -> Result<CommandOutput, DmError> {
-    app.status(&account)?;
+    app.status(&account.label)?;
     let group_id = normalize_group_id_hex(&group)?;
-    let group = app.set_group_archived(&account, &group_id, archived)?;
+    let group = app.set_group_archived(&account.label, &group_id, archived)?;
     let verb = if archived { "archived" } else { "unarchived" };
     Ok(CommandOutput {
         plain: format!("{verb} group {group_id}"),
         json: json!({
-            "account": account,
+            "account_id": account.account_id_hex,
+            "npub": npub_for_account_id(&account.account_id_hex),
             "group": group_json(group),
         }),
     })
@@ -866,16 +934,18 @@ async fn message_command(
             if text.is_empty() {
                 return Err(DmError::EmptyMessage);
             }
-            let account = resolve_account_label(account_home, account_flag)?;
-            app.status(&account)?;
+            let account = resolve_account(account_home, account_flag)?;
+            ensure_local_signing(&account)?;
+            app.status(&account.label)?;
             let group_id = GroupId::new(hex::decode(group)?);
             let payload = text.join(" ");
-            let mut client = app.client(&account).await?;
+            let mut client = app.client(&account.label).await?;
             let summary = client.send(&group_id, payload.as_bytes()).await?;
             Ok(CommandOutput {
                 plain: format!("sent message published={}", summary.published),
                 json: json!({
-                    "account": account,
+                    "account_id": account.account_id_hex,
+                    "npub": npub_for_account_id(&account.account_id_hex),
                     "group_id": hex::encode(group_id.as_slice()),
                     "published": summary.published,
                     "message_ids": summary.message_ids,
@@ -883,10 +953,11 @@ async fn message_command(
             })
         }
         MessageCommand::List { group, limit } => {
-            let account = resolve_account_label(account_home, account_flag)?;
-            app.status(&account)?;
+            let account = resolve_account(account_home, account_flag)?;
+            ensure_local_signing(&account)?;
+            app.status(&account.label)?;
             let messages = app.messages_with_query(
-                &account,
+                &account.label,
                 AppMessageQuery {
                     group_id_hex: group
                         .map(|group| normalize_group_id_hex(&group))
@@ -897,7 +968,8 @@ async fn message_command(
             Ok(CommandOutput {
                 plain: message_list_plain(&messages),
                 json: json!({
-                    "account": account,
+                    "account_id": account.account_id_hex,
+                    "npub": npub_for_account_id(&account.account_id_hex),
                     "messages": message_list_json(messages),
                 }),
             })
@@ -905,9 +977,12 @@ async fn message_command(
     }
 }
 
-async fn sync_command(app: &MarmotApp, account: String) -> Result<CommandOutput, DmError> {
-    app.status(&account)?;
-    let mut client = app.client(&account).await?;
+async fn sync_command(
+    app: &MarmotApp,
+    account: marmot_account::AccountSummary,
+) -> Result<CommandOutput, DmError> {
+    app.status(&account.label)?;
+    let mut client = app.client(&account.label).await?;
     let summary = client.sync().await?;
     Ok(CommandOutput {
         plain: sync_plain(&summary),
@@ -939,9 +1014,10 @@ fn sync_plain(summary: &SyncSummary) -> String {
     }
 }
 
-fn sync_json(account: String, summary: SyncSummary) -> Value {
+fn sync_json(account: marmot_account::AccountSummary, summary: SyncSummary) -> Value {
     json!({
-        "account": account,
+        "account_id": account.account_id_hex,
+        "npub": npub_for_account_id(&account.account_id_hex),
         "joined_groups": summary.joined_groups.into_iter().map(|group_id| {
             hex::encode(group_id.as_slice())
         }).collect::<Vec<_>>(),
@@ -992,12 +1068,7 @@ fn group_members_plain(members: &[AppGroupMemberRecord]) -> String {
     }
     members
         .iter()
-        .map(|member| {
-            member
-                .account
-                .clone()
-                .unwrap_or_else(|| member.member_id_hex.clone())
-        })
+        .map(|member| npub_for_account_id(&member.member_id_hex))
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -1008,7 +1079,7 @@ fn group_members_json(members: Vec<AppGroupMemberRecord>) -> Vec<Value> {
         .map(|member| {
             json!({
                 "member_id": member.member_id_hex,
-                "account": member.account,
+                "npub": npub_for_account_id(&member.member_id_hex),
                 "local": member.local,
             })
         })
@@ -1061,8 +1132,9 @@ fn key_package_fetch_json(fetched: FetchedKeyPackage) -> Value {
 
 fn dm_status_json(status: AppStatus, runtime_info: &CliRuntimeInfo) -> Value {
     json!({
-        "account": status.account,
         "account_id": status.account_id_hex,
+        "npub": npub_for_account_id(&status.account_id_hex),
+        "local_signing": true,
         "transport": status.transport,
         "groups": status.groups,
         "seen_events": status.seen_events,
@@ -1087,6 +1159,33 @@ fn secret_store_json(runtime_info: &CliRuntimeInfo) -> Value {
             "service": runtime_info.keychain_service,
         }),
     }
+}
+
+fn create_nostr_account(
+    account_home: &AccountHome,
+    identity: Option<String>,
+) -> Result<marmot_account::AccountSummary, DmError> {
+    match identity {
+        Some(value) if is_nostr_secret(&value) => Ok(account_home.import_nostr_account(&value)?),
+        Some(value) => Ok(account_home.add_public_account(&value)?),
+        None => Ok(account_home.create_nostr_account()?),
+    }
+}
+
+fn is_nostr_secret(value: &str) -> bool {
+    value.starts_with("nsec")
+}
+
+fn public_account_status_json(
+    account: &marmot_account::AccountSummary,
+    relay_lists: AccountRelayListStatus,
+) -> Value {
+    json!({
+        "account_id": account.account_id_hex,
+        "npub": npub_for_account_id(&account.account_id_hex),
+        "local_signing": false,
+        "relay_lists": relay_lists_json(relay_lists),
+    })
 }
 
 async fn maybe_publish_relay_lists(
@@ -1167,25 +1266,19 @@ async fn relay_list_status_for_account_id(
 
 fn account_selector_or_default(
     account_home: &AccountHome,
-    name: Option<String>,
-    pubkey: Option<String>,
+    account_ref: Option<String>,
     default_account: Option<String>,
 ) -> Result<String, DmError> {
-    match (name, pubkey) {
-        (Some(_), Some(_)) => Err(DmError::AmbiguousAccountSelector),
-        (Some(name), None) => Ok(account_home.account(&name)?.account_id_hex),
-        (None, Some(pubkey)) => parse_public_key(&pubkey),
-        (None, None) => {
-            let label = resolve_account_label(account_home, default_account)?;
-            Ok(account_home.account(&label)?.account_id_hex)
-        }
+    if let Some(account_ref) = account_ref {
+        return parse_public_key(&account_ref);
     }
+    Ok(resolve_account(account_home, default_account)?.account_id_hex)
 }
 
-fn resolve_account_label(
+fn resolve_account(
     account_home: &AccountHome,
     explicit: Option<String>,
-) -> Result<String, DmError> {
+) -> Result<marmot_account::AccountSummary, DmError> {
     if let Some(account) = explicit
         .or_else(|| std::env::var("DM_ACCOUNT").ok())
         .filter(|account| !account.trim().is_empty())
@@ -1196,31 +1289,44 @@ fn resolve_account_label(
     let accounts = account_home.accounts()?;
     match accounts.as_slice() {
         [] => Err(DmError::MissingAccount),
-        [account] => Ok(account.label.clone()),
+        [account] => Ok(account.clone()),
         _ => Err(DmError::MultipleAccounts),
     }
 }
 
-fn resolve_account_ref(account_home: &AccountHome, value: &str) -> Result<String, DmError> {
-    if let Ok(account) = account_home.account(value) {
-        return Ok(account.label);
-    }
-
-    if let Ok(account_id_hex) = parse_public_key(value) {
-        for account in account_home.accounts()? {
-            if account.account_id_hex == account_id_hex {
-                return Ok(account.label);
-            }
+fn resolve_account_ref(
+    account_home: &AccountHome,
+    value: &str,
+) -> Result<marmot_account::AccountSummary, DmError> {
+    let account_id_hex = parse_public_key(value)?;
+    for account in account_home.accounts()? {
+        if account.account_id_hex == account_id_hex {
+            return Ok(account);
         }
     }
 
     Err(DmError::UnknownLocalAccount(value.to_owned()))
 }
 
+fn ensure_local_signing(account: &marmot_account::AccountSummary) -> Result<(), DmError> {
+    if account.local_signing {
+        Ok(())
+    } else {
+        Err(DmError::PublicAccountCannotSign)
+    }
+}
+
 fn parse_public_key(value: &str) -> Result<String, DmError> {
     nostr::PublicKey::parse(value)
         .map(|pubkey| pubkey.to_hex())
         .map_err(|_| DmError::InvalidPublicKey)
+}
+
+fn npub_for_account_id(account_id: &str) -> String {
+    nostr::PublicKey::parse(account_id)
+        .expect("stored account ids are valid Nostr public keys")
+        .to_bech32()
+        .expect("stored account ids can be encoded as npub")
 }
 
 fn normalize_group_id_hex(value: &str) -> Result<String, DmError> {
@@ -1377,7 +1483,6 @@ fn dm_error_json(err: &DmError) -> Value {
             "missing": missing,
             "relay_lists": relay_lists_json(status.as_ref().clone()),
             "repair": {
-                "flag": "--publish-missing-relay-lists",
                 "requires": "--default-relays",
             },
         }),
@@ -1407,8 +1512,8 @@ fn dm_error_json(err: &DmError) -> Value {
             "code": "missing_account",
             "message": err.to_string(),
             "repair": {
-                "create": "dm account create <name>",
-                "select": "--account <name-or-pubkey>",
+                "create": "dm account create [nsec-or-npub]",
+                "select": "--account <npub-or-hex>",
             },
         }),
         DmError::MultipleAccounts => json!({
@@ -1422,14 +1527,14 @@ fn dm_error_json(err: &DmError) -> Value {
         DmError::UnknownLocalAccount(account) => json!({
             "code": "unknown_account",
             "message": err.to_string(),
-            "account": account,
-        }),
-        DmError::AmbiguousAccountSelector => json!({
-            "code": "ambiguous_account_selector",
-            "message": err.to_string(),
+            "account_ref": account,
         }),
         DmError::InvalidPublicKey => json!({
             "code": "invalid_public_key",
+            "message": err.to_string(),
+        }),
+        DmError::PublicAccountCannotSign => json!({
+            "code": "public_account_cannot_sign",
             "message": err.to_string(),
         }),
         DmError::InvalidSecretStore(store) => json!({
@@ -1444,7 +1549,7 @@ fn dm_error_json(err: &DmError) -> Value {
         } => json!({
             "code": "account_rollback_failed",
             "message": err.to_string(),
-            "account": account,
+            "account_ref": account,
             "source": dm_error_json(source),
             "rollback": account_home_error_json(rollback),
         }),
@@ -1456,21 +1561,25 @@ fn account_home_error_json(err: &AccountHomeError) -> Value {
         AccountHomeError::AccountExists(account) => json!({
             "code": "account_exists",
             "message": err.to_string(),
-            "account": account,
+            "account_ref": account,
         }),
         AccountHomeError::UnknownAccount(account) => json!({
             "code": "unknown_account",
             "message": err.to_string(),
-            "account": account,
+            "account_ref": account,
         }),
         AccountHomeError::InvalidSecretKey => json!({
             "code": "invalid_secret_key",
             "message": err.to_string(),
         }),
+        AccountHomeError::InvalidPublicKey => json!({
+            "code": "invalid_public_key",
+            "message": err.to_string(),
+        }),
         AccountHomeError::InvalidAccountLabel(account) => json!({
             "code": "invalid_account_label",
             "message": err.to_string(),
-            "account": account,
+            "label": account,
         }),
         AccountHomeError::SecretNotFound(account_id) => json!({
             "code": "secret_not_found",
@@ -1495,10 +1604,10 @@ fn app_error_json(err: &AppError) -> Value {
         AppError::MissingKeyPackage(account) => json!({
             "code": "missing_key_package",
             "message": err.to_string(),
-            "account": account,
+            "account_id": account,
             "repair": {
                 "local": format!("dm --account {account} keys publish"),
-                "remote": "dm keys fetch --pubkey <npub-or-hex> --bootstrap-relays <relay-url>"
+                "remote": "dm keys fetch <npub-or-hex> --bootstrap-relays <relay-url>"
             },
         }),
         AppError::UnknownGroup(group_id) => json!({
@@ -1542,7 +1651,7 @@ fn app_error_json(err: &AppError) -> Value {
             "message": err.to_string(),
             "account_id": account_id,
             "repair": {
-                "command": format!("dm keys fetch --pubkey {account_id} --bootstrap-relays <relay-url>")
+                "command": format!("dm keys fetch {account_id} --bootstrap-relays <relay-url>")
             },
         }),
         AppError::InvalidGroupProfile(reason) => json!({

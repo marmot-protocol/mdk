@@ -10,30 +10,34 @@ account-relay setup. `dm` can run commands directly or send them to the backgrou
 
 ## Examples
 
+Nostr is the identity layer. Local signing accounts are generated with `account create` or imported with
+`account create <nsec>`. Public accounts can be added with `account create <npub-or-pubkey-hex>`, but they cannot sign,
+publish KeyPackages, sync, or send messages.
+
 ```sh
-cargo run -p darkmatter-cli --bin dm -- --home /tmp/dm --secret-store file account create alice
-cargo run -p darkmatter-cli --bin dm -- --home /tmp/dm --secret-store file account create bob
-cargo run -p darkmatter-cli --bin dm -- --home /tmp/dm --secret-store file --account bob keys publish
-cargo run -p darkmatter-cli --bin dm -- --home /tmp/dm --secret-store file --account alice group create general bob
-cargo run -p darkmatter-cli --bin dm -- --home /tmp/dm --secret-store file --account bob sync
-cargo run -p darkmatter-cli --bin dm -- --home /tmp/dm --secret-store file --account alice message send <group-hex> "hello bob"
-cargo run -p darkmatter-cli --bin dm -- --home /tmp/dm --secret-store file --account bob sync
-cargo run -p darkmatter-cli --bin dm -- --home /tmp/dm --secret-store file --account bob chats list
-cargo run -p darkmatter-cli --bin dm -- --home /tmp/dm --secret-store file --account bob message list --group <group-hex> --limit 20
+cargo run -p darkmatter-cli --bin dm -- --home /tmp/dm --secret-store file account create
+cargo run -p darkmatter-cli --bin dm -- --home /tmp/dm --secret-store file account create <bob-nsec>
+cargo run -p darkmatter-cli --bin dm -- --home /tmp/dm --secret-store file --account <bob-npub-or-hex> keys publish
+cargo run -p darkmatter-cli --bin dm -- --home /tmp/dm --secret-store file --account <alice-npub-or-hex> group create general <bob-npub-or-hex>
+cargo run -p darkmatter-cli --bin dm -- --home /tmp/dm --secret-store file --account <bob-npub-or-hex> sync
+cargo run -p darkmatter-cli --bin dm -- --home /tmp/dm --secret-store file --account <alice-npub-or-hex> message send <group-hex> "hello bob"
+cargo run -p darkmatter-cli --bin dm -- --home /tmp/dm --secret-store file --account <bob-npub-or-hex> sync
+cargo run -p darkmatter-cli --bin dm -- --home /tmp/dm --secret-store file --account <bob-npub-or-hex> chats list
+cargo run -p darkmatter-cli --bin dm -- --home /tmp/dm --secret-store file --account <bob-npub-or-hex> message list --group <group-hex> --limit 20
 ```
 
 Most account-scoped commands resolve the local account in this order:
 
-1. top-level `--account <name-or-pubkey>`, before the command
+1. top-level `--account <npub-or-hex>`, before the command
 2. `DM_ACCOUNT`
 3. the only local account, when exactly one exists
 
 Use `keys` for normal KeyPackage work:
 
 ```sh
-dm --account bob keys publish
-dm --account bob keys fetch
-dm keys fetch --pubkey <npub-or-hex> --bootstrap-relays <relay-url>
+dm --account <npub-or-hex> keys publish
+dm --account <npub-or-hex> keys fetch
+dm keys fetch <npub-or-hex> --bootstrap-relays <relay-url>
 ```
 
 There are no legacy aliases for this namespace; `keys` is the command.
@@ -41,21 +45,40 @@ There are no legacy aliases for this namespace; `keys` is the command.
 Daemon commands:
 
 ```sh
-cargo run -p darkmatter-cli --bin dm -- --home /tmp/dm --secret-store file daemon start
+cargo run -p darkmatter-cli --bin dm -- --home /tmp/dm --secret-store file daemon start --sync-interval-ms 2000
 cargo run -p darkmatter-cli --bin dm -- --home /tmp/dm daemon status
 cargo run -p darkmatter-cli --bin dm -- --home /tmp/dm daemon stop
 ```
 
-Once a daemon socket exists for a home, `dm --home <path> ...` will send normal commands to `dmd`. Use `--socket` or
-`DM_SOCKET` to target a specific daemon.
+Once a daemon socket exists for a home, `dm --home <path> ...` will send normal commands to `dmd`. The daemon writes
+`dev/dmd.pid`, appends startup errors to `dev/dmd.log`, and periodically syncs every local signing account. Use
+`--socket` or `DM_SOCKET` to target a specific daemon.
+
+Two-terminal local loop:
+
+Terminal 1:
+
+```sh
+cargo run -p darkmatter-cli --bin dm -- --home /tmp/dm --secret-store file daemon start --sync-interval-ms 1000
+```
+
+Terminal 2:
+
+```sh
+cargo run -p darkmatter-cli --bin dm -- --home /tmp/dm account create
+cargo run -p darkmatter-cli --bin dm -- --home /tmp/dm account create <bob-nsec>
+cargo run -p darkmatter-cli --bin dm -- --home /tmp/dm --account <bob-npub-or-hex> keys publish
+cargo run -p darkmatter-cli --bin dm -- --home /tmp/dm --account <alice-npub-or-hex> group create general <bob-npub-or-hex>
+cargo run -p darkmatter-cli --bin dm -- --home /tmp/dm --account <bob-npub-or-hex> chats list
+```
 
 Chat commands are the preferred user-facing spelling for local chat projection work:
 
 ```sh
-dm --account bob chats list
-dm --account bob chats show <group-hex>
-dm --account bob chats archive <group-hex>
-dm --account bob chats unarchive <group-hex>
+dm --account <npub-or-hex> chats list
+dm --account <npub-or-hex> chats show <group-hex>
+dm --account <npub-or-hex> chats archive <group-hex>
+dm --account <npub-or-hex> chats unarchive <group-hex>
 ```
 
 When an account is removed from a group, `dm` keeps that account's local group and message projection as history.

@@ -8,7 +8,8 @@ key storage, and runtime coordination with a `TransportAdapter`.
 ## What this crate does
 
 - Activates the transport account for one local `AccountDeviceSession`.
-- Creates and imports local account identities in an app-owned home.
+- Creates and imports local signing identities in an app-owned home, with Nostr public keys as the stable account ids.
+- Can store a public Nostr account record without local signing material for directory-style identity references.
 - Stores account signing keys behind an injectable `AccountSecretStore` boundary, including a platform
   keychain/credential-store backend patterned after White Noise and a local development file backend for deterministic
   tests.
@@ -22,10 +23,12 @@ key storage, and runtime coordination with a `TransportAdapter`.
 ## Routing model
 
 `AccountHome` is the durable app-core boundary for local account setup. It keeps public summaries separate from secret
-material. Real app surfaces should use `AccountHome::open_with_keychain` or `open_with_default_keychain`; tests and local
-labs can keep using `AccountHome::open`, which uses the local file secret store. Relay-list discovery and repair belong
-above this crate in the Nostr account transport/app-runtime layer, and CLI account selection belongs in presentation
-surfaces like `dm`.
+material. `create_nostr_account`, `import_nostr_account`, and `add_public_account` use the Nostr public key as the record
+label for product-facing app surfaces. The older label-taking helpers remain for deterministic lab setup. Real app
+surfaces should use `AccountHome::open_with_keychain` or `open_with_default_keychain`; tests and local labs can keep
+using `AccountHome::open`, which uses the local file secret store. Relay-list discovery and repair belong above this
+crate in the Nostr account transport/app-runtime layer, and CLI account selection belongs in presentation surfaces like
+`dm`.
 
 `TransportRoutingPolicy` is the transport-generic boundary. It answers:
 
