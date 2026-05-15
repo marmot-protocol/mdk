@@ -1113,8 +1113,8 @@ impl<S: StorageProvider> Engine<S> {
 
         let target_admins = unique_targets
             .iter()
-            .filter_map(|member| crate::group_data::admin_pubkey_from_member_id(member).ok())
-            .collect::<Vec<_>>();
+            .map(crate::group_data::admin_pubkey_from_member_id)
+            .collect::<Result<Vec<_>, _>>()?;
         if admins
             .iter()
             .all(|admin| target_admins.iter().any(|target| target == admin))

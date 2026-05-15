@@ -668,11 +668,15 @@ impl MarmotApp {
                 .map_err(|e| AppError::RelayDirectory(format!("connect relay: {e}")))?;
         }
 
-        let filter = relay_list_filter(public_key);
-        let events = client
-            .fetch_events_from(relay_urls.clone(), filter, SDK_RELAY_LIST_FETCH_WAIT)
-            .await
-            .map_err(|e| AppError::RelayDirectory(format!("fetch relay lists: {e}")))?;
+        let mut events = Vec::new();
+        for filter in relay_list_filters(public_key) {
+            events.extend(
+                client
+                    .fetch_events_from(relay_urls.clone(), filter, SDK_RELAY_LIST_FETCH_WAIT)
+                    .await
+                    .map_err(|e| AppError::RelayDirectory(format!("fetch relay lists: {e}")))?,
+            );
+        }
         client.shutdown().await;
 
         let records = events
@@ -1061,7 +1065,8 @@ impl MarmotApp {
     }
 
     fn save_state(&self, state: &AccountState) -> Result<(), AppError> {
-        self.account_projection(&state.label)?.save_state(state)
+        let mut projection = self.account_projection(&state.label)?;
+        projection.save_state(state)
     }
 
     fn ensure_account_state(&self, label: &str) -> Result<(), AppError> {
@@ -1506,6 +1511,12 @@ impl AppClient {
     async fn sync_sdk_relay(&mut self) -> Result<SyncSummary, AppError> {
         let profiles = self.app.profiles_by_id()?;
         let mut summary = SyncSummary::default();
+        let mut seen = self
+            .state
+            .seen_events
+            .iter()
+            .cloned()
+            .collect::<HashSet<_>>();
         let mut first_wait = true;
 
         loop {
@@ -1522,9 +1533,12 @@ impl AppClient {
                 Ok(Err(e)) => return Err(e.into()),
                 Err(_) => break,
             };
-            self.state
-                .seen_events
-                .push(hex::encode(delivery.message.id.as_slice()));
+            let event_id = hex::encode(delivery.message.id.as_slice());
+            if seen.contains(&event_id) {
+                continue;
+            }
+            seen.insert(event_id.clone());
+            self.state.seen_events.push(event_id);
             self.ingest_delivery(delivery, &profiles, &mut summary)
                 .await?;
         }
@@ -1807,14 +1821,21 @@ fn relay_list_status_from_records(
     status
 }
 
-fn relay_list_filter(public_key: PublicKey) -> Filter {
+fn relay_list_filters(public_key: PublicKey) -> Vec<Filter> {
+    [
+        KIND_NIP65_RELAY_LIST,
+        KIND_MARMOT_INBOX_RELAY_LIST,
+        KIND_MARMOT_KEY_PACKAGE_RELAY_LIST,
+    ]
+    .into_iter()
+    .map(|kind| relay_list_filter(public_key, kind))
+    .collect()
+}
+
+fn relay_list_filter(public_key: PublicKey, kind: u64) -> Filter {
     Filter::new()
         .author(public_key)
-        .kinds([
-            Kind::from(KIND_NIP65_RELAY_LIST as u16),
-            Kind::from(KIND_MARMOT_INBOX_RELAY_LIST as u16),
-            Kind::from(KIND_MARMOT_KEY_PACKAGE_RELAY_LIST as u16),
-        ])
+        .kind(Kind::from(kind as u16))
         .limit(12)
 }
 
@@ -2185,4 +2206,37 @@ fn write_json<T: Serialize>(path: impl AsRef<Path>, value: &T) -> Result<(), App
     let bytes = serde_json::to_vec_pretty(value)?;
     fs::write(path, bytes)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relay_list_discovery_builds_one_limited_filter_per_required_kind() {
+        let public_key =
+            PublicKey::parse("0000000000000000000000000000000000000000000000000000000000000001")
+                .unwrap();
+
+        let filters = relay_list_filters(public_key);
+
+        assert_eq!(filters.len(), 3);
+        let kinds = filters
+            .iter()
+            .map(|filter| {
+                let kinds = filter.kinds.as_ref().expect("kind filter");
+                assert_eq!(kinds.len(), 1);
+                assert_eq!(filter.limit, Some(12));
+                kinds.iter().next().unwrap().as_u16() as u64
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            vec![
+                KIND_NIP65_RELAY_LIST,
+                KIND_MARMOT_INBOX_RELAY_LIST,
+                KIND_MARMOT_KEY_PACKAGE_RELAY_LIST
+            ]
+        );
+    }
 }

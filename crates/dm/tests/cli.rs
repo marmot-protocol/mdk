@@ -171,6 +171,26 @@ fn account_import_reports_missing_relay_lists_without_storing_the_nsec() {
 }
 
 #[test]
+fn account_create_rolls_back_when_relay_list_publication_fails() {
+    let home = tempfile::tempdir().expect("tempdir");
+
+    let error = run_json_error(
+        home.path(),
+        &[
+            "account",
+            "create",
+            "alice",
+            "--default-relays",
+            "not-a-relay-url",
+        ],
+    );
+    assert_ne!(error["code"], "usage");
+
+    let listed = run_json(home.path(), &["account", "list"]);
+    assert_eq!(listed["accounts"], serde_json::json!([]));
+}
+
+#[test]
 fn account_import_can_publish_missing_relay_lists_from_default_relays() {
     let home = tempfile::tempdir().expect("tempdir");
     let nsec = "nsec1j4c6269y9w0q2er2xjw8sv2ehyrtfxq3jwgdlxj6qfn8z4gjsq5qfvfk99";
@@ -198,6 +218,31 @@ fn account_import_can_publish_missing_relay_lists_from_default_relays() {
     );
     let listed = run_json(home.path(), &["account", "list"]);
     assert_eq!(listed["accounts"][0]["account"], "alice");
+}
+
+#[test]
+fn account_import_rolls_back_when_missing_relay_list_publication_fails() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let nsec = "nsec1j4c6269y9w0q2er2xjw8sv2ehyrtfxq3jwgdlxj6qfn8z4gjsq5qfvfk99";
+
+    let error = run_json_error(
+        home.path(),
+        &[
+            "account",
+            "import",
+            "alice",
+            "--nsec",
+            nsec,
+            "--default-relays",
+            "not-a-relay-url",
+            "--publish-missing-relay-lists",
+        ],
+    );
+    assert_ne!(error["code"], "usage");
+    assert!(!error.to_string().contains(nsec));
+
+    let listed = run_json(home.path(), &["account", "list"]);
+    assert_eq!(listed["accounts"], serde_json::json!([]));
 }
 
 #[test]

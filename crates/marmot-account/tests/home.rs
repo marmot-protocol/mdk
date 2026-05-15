@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use marmot_account::{AccountHome, AccountHomeResult, AccountSecretStore};
+use marmot_account::{AccountHome, AccountHomeError, AccountHomeResult, AccountSecretStore};
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -78,9 +78,13 @@ fn account_home_import_accepts_nsec_and_reopens_the_same_identity() {
 fn account_home_rejects_path_like_labels() {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
+    let nsec = "nsec1j4c6269y9w0q2er2xjw8sv2ehyrtfxq3jwgdlxj6qfn8z4gjsq5qfvfk99";
 
     assert!(home.create_account("../alice").is_err());
-    assert!(home.import_account("", "bad-secret").is_err());
+    assert!(matches!(
+        home.import_account("", nsec),
+        Err(AccountHomeError::InvalidAccountLabel(label)) if label.is_empty()
+    ));
 }
 
 #[test]

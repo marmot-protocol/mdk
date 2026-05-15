@@ -320,6 +320,17 @@ impl AccountHome {
         Ok(accounts)
     }
 
+    pub fn remove_account(&self, label: &str) -> AccountHomeResult<()> {
+        validate_account_label(label)?;
+        let account = self.account(label)?;
+        self.secret_store.remove_secret(&account)?;
+        match fs::remove_dir_all(self.account_dir(label)) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(err.into()),
+        }
+    }
+
     pub fn load_signing_keys(&self, label: &str) -> AccountHomeResult<nostr::Keys> {
         validate_account_label(label)?;
         let account = self.account(label)?;

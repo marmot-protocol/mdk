@@ -162,21 +162,28 @@ impl AccountProjectionDb {
         })
     }
 
-    pub(crate) fn save_state(&self, state: &AccountState) -> Result<(), AppError> {
-        self.ensure_account(&state.label)?;
-        self.conn.execute("DELETE FROM seen_events", [])?;
+    pub(crate) fn save_state(&mut self, state: &AccountState) -> Result<(), AppError> {
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "INSERT INTO account_state (label, updated_at)
+             VALUES (?1, ?2)
+             ON CONFLICT(label) DO NOTHING",
+            params![&state.label, unix_now_seconds() as i64],
+        )?;
+
+        tx.execute("DELETE FROM seen_events", [])?;
         for event_id in &state.seen_events {
-            self.conn.execute(
+            tx.execute(
                 "INSERT OR IGNORE INTO seen_events (event_id, seen_at)
                  VALUES (?1, ?2)",
                 params![event_id, unix_now_seconds() as i64],
             )?;
         }
 
-        self.conn.execute("DELETE FROM groups", [])?;
-        self.conn.execute("DELETE FROM group_app_components", [])?;
+        tx.execute("DELETE FROM groups", [])?;
+        tx.execute("DELETE FROM group_app_components", [])?;
         for group in &state.groups {
-            self.conn.execute(
+            tx.execute(
                 "INSERT INTO groups (
                     group_id_hex, endpoint, profile_name, profile_description,
                     image_hash_hex, image_key_hex, image_nonce_hex,
@@ -208,7 +215,7 @@ impl AccountProjectionDb {
                     unix_now_seconds() as i64
                 ],
             )?;
-            self.conn.execute(
+            tx.execute(
                 "INSERT INTO group_app_components (
                     group_id_hex, component_id, component_name, component_data_hex, updated_at
                  )
@@ -225,7 +232,7 @@ impl AccountProjectionDb {
                     unix_now_seconds() as i64
                 ],
             )?;
-            self.conn.execute(
+            tx.execute(
                 "INSERT INTO group_app_components (
                     group_id_hex, component_id, component_name, component_data_hex, updated_at
                  )
@@ -243,6 +250,7 @@ impl AccountProjectionDb {
                 ],
             )?;
         }
+        tx.commit()?;
         Ok(())
     }
 
@@ -373,4 +381,56 @@ fn ensure_column(
         [],
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn save_state_rolls_back_all_tables_when_component_write_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = AccountProjectionDb::open(dir.path().join("app.sqlite3"), "test-key").unwrap();
+        let original = AccountState {
+            label: "alice".to_owned(),
+            seen_events: vec!["event-before".to_owned()],
+            groups: vec![AppGroupRecord::new(
+                "aa".to_owned(),
+                "marmot-local://group/aa".to_owned(),
+                "before".to_owned(),
+                "".to_owned(),
+                AppGroupImageInput::default(),
+            )],
+        };
+        db.save_state(&original).unwrap();
+        db.conn
+            .execute_batch(
+                "CREATE TRIGGER fail_image_component_insert
+                 BEFORE INSERT ON group_app_components
+                 WHEN NEW.component_id = 32770
+                 BEGIN
+                    SELECT RAISE(FAIL, 'image component write failed');
+                 END;",
+            )
+            .unwrap();
+
+        let updated = AccountState {
+            label: "alice".to_owned(),
+            seen_events: vec!["event-after".to_owned()],
+            groups: vec![AppGroupRecord::new(
+                "bb".to_owned(),
+                "marmot-local://group/bb".to_owned(),
+                "after".to_owned(),
+                "".to_owned(),
+                AppGroupImageInput::default(),
+            )],
+        };
+
+        assert!(db.save_state(&updated).is_err());
+
+        let restored = db.load_state("alice").unwrap();
+        assert_eq!(restored.seen_events, original.seen_events);
+        assert_eq!(restored.groups[0].group_id_hex, "aa");
+        assert_eq!(restored.groups[0].profile.name, "before");
+    }
 }

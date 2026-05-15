@@ -260,6 +260,14 @@ enum DmError {
     InvalidSecretStore(String),
     #[error("missing account relay lists: {0:?}")]
     MissingRelayLists(Vec<String>, Box<AccountRelayListStatus>),
+    #[error(
+        "failed to roll back account {account} after setup failure: {source}; rollback error: {rollback}"
+    )]
+    AccountRollback {
+        account: String,
+        source: Box<DmError>,
+        rollback: AccountHomeError,
+    },
 }
 
 pub async fn run_from<I, T>(args: I) -> CliOutput
@@ -363,12 +371,16 @@ async fn account_command(
             bootstrap_relays,
         } => {
             let account = account_home.create_account(&name)?;
-            let relay_lists = maybe_publish_relay_lists(
+            let relay_lists = match maybe_publish_relay_lists(
                 app,
                 &name,
                 relay_bootstrap(default_relays, bootstrap_relays)?,
             )
-            .await?;
+            .await
+            {
+                Ok(relay_lists) => relay_lists,
+                Err(err) => rollback_account_after_setup_failure(account_home, &name, err)?,
+            };
             Ok(CommandOutput {
                 plain: format!(
                     "created account {name} {} relay-lists={}",
@@ -408,12 +420,19 @@ async fn account_command(
                 let bootstrap =
                     relay_bootstrap_from_endpoints(default_relays, bootstrap_endpoints)?
                         .ok_or(AppError::MissingDefaultRelays)?;
-                app.publish_missing_account_relay_lists_from_status(
-                    &name,
-                    bootstrap,
-                    current_status,
-                )
-                .await?
+                match app
+                    .publish_missing_account_relay_lists_from_status(
+                        &name,
+                        bootstrap,
+                        current_status,
+                    )
+                    .await
+                {
+                    Ok(relay_lists) => relay_lists,
+                    Err(err) => {
+                        rollback_account_after_setup_failure(account_home, &name, err.into())?
+                    }
+                }
             } else {
                 current_status
             };
@@ -1027,6 +1046,21 @@ async fn maybe_publish_relay_lists(
     }
 }
 
+fn rollback_account_after_setup_failure<T>(
+    account_home: &AccountHome,
+    account: &str,
+    source: DmError,
+) -> Result<T, DmError> {
+    match account_home.remove_account(account) {
+        Ok(()) => Err(source),
+        Err(rollback) => Err(DmError::AccountRollback {
+            account: account.to_owned(),
+            source: Box::new(source),
+            rollback,
+        }),
+    }
+}
+
 fn relay_bootstrap(
     default_relays: Vec<String>,
     bootstrap_relays: Vec<String>,
@@ -1284,6 +1318,17 @@ fn dm_error_json(err: &DmError) -> Value {
             "code": "invalid_secret_store",
             "message": err.to_string(),
             "secret_store": store,
+        }),
+        DmError::AccountRollback {
+            account,
+            source,
+            rollback,
+        } => json!({
+            "code": "account_rollback_failed",
+            "message": err.to_string(),
+            "account": account,
+            "source": dm_error_json(source),
+            "rollback": account_home_error_json(rollback),
         }),
     }
 }

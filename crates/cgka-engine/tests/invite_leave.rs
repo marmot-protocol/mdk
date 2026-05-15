@@ -124,6 +124,15 @@ fn build_client(id: &[u8]) -> Engine<MemoryStorage> {
         .unwrap()
 }
 
+fn build_raw_identity_client(id: &[u8]) -> Engine<MemoryStorage> {
+    EngineBuilder::new(MemoryStorage::new())
+        .identity(id.to_vec())
+        .feature_registry(selfremove_registry())
+        .peeler(Box::new(MockPeeler))
+        .build()
+        .unwrap()
+}
+
 fn converge_buffered_commit(engine: &mut Engine<MemoryStorage>, group_id: &GroupId) {
     let result = engine
         .converge_stored_openmls_messages(group_id, 1_000_000)
@@ -389,6 +398,43 @@ async fn non_admin_cannot_remove_members() {
         .err()
         .unwrap();
     assert!(matches!(err, EngineError::NotGroupAdmin { .. }));
+}
+
+#[tokio::test]
+async fn remove_members_rejects_malformed_target_member_identity() {
+    let mut alice = build_client(b"alice");
+    let mut bob = build_raw_identity_client(b"bob");
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "malformed-target".into(),
+            description: "".into(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    match create {
+        SendResult::GroupCreated { pending, .. } => {
+            alice.confirm_published(pending).await.unwrap();
+        }
+        _ => unreachable!(),
+    };
+
+    let err = alice
+        .send(SendIntent::RemoveMembers {
+            group_id: group_id.clone(),
+            members: vec![bob.self_id()],
+        })
+        .await
+        .err()
+        .unwrap();
+
+    assert!(
+        matches!(err, EngineError::Backend(message) if message.contains("32-byte member identities"))
+    );
 }
 
 // ── Leave (MIP-03 SelfRemove) ───────────────────────────────────────────────
