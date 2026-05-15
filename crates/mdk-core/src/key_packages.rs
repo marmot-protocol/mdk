@@ -17,6 +17,13 @@ use crate::constant::{
 use crate::error::Error;
 use crate::util::{ContentEncoding, NostrTagFormat, decode_content, encode_content};
 
+/// Maximum allowed length for a caller-supplied `existing_d_tag`.
+///
+/// The generated form is 64 hex chars (32 bytes); the cap is set well above that
+/// to be permissive for callers that have already published longer slot IDs in the
+/// wild, while still rejecting pathological inputs (multi-KB strings, etc.).
+const MAX_EXISTING_D_TAG_LEN: usize = 128;
+
 /// Data required to publish an MLS Key Package as a Nostr event.
 /// Contains the payload and tags for both the current (kind:30443)
 /// and legacy (kind:443) event formats.
@@ -38,9 +45,79 @@ pub struct KeyPackageEventData {
     /// Serialized `KeyPackageRef` bytes for lifecycle tracking.
     pub hash_ref: Vec<u8>,
 
-    /// The `d` tag value (32-byte hex string) for this KeyPackage slot.
-    /// Store and reuse this when rotating — it lets relays replace the old event.
+    /// The `d` tag value (hex string) for this KeyPackage slot.
+    ///
+    /// Store this value and pass it back via [`KeyPackageOptions::existing_d_tag`]
+    /// when rotating — reusing the same `d` value lets relays automatically replace
+    /// the old event under the same NIP-33 addressable coordinate.
+    ///
+    /// When the event was created without an `existing_d_tag`, this is a freshly
+    /// generated 32-byte hex string (64 characters).
     pub d_tag: String,
+}
+
+/// Options controlling key package event construction.
+///
+/// Pass to [`MDK::create_key_package_for_event_with_options`]. Use
+/// [`KeyPackageOptions::default()`] for the standard behavior (no protected tag,
+/// freshly generated `d` tag).
+#[derive(Debug, Clone, Default)]
+pub struct KeyPackageOptions {
+    /// Add the NIP-70 protected tag (`["-"]`).
+    ///
+    /// When `true`, relays that implement NIP-70 will reject republishing of this
+    /// event by third parties. Many popular relays (Damus, Primal, nos.lol) reject
+    /// protected events entirely — only enable this when publishing to relays known
+    /// to accept NIP-70 protected events.
+    ///
+    /// Defaults to `false` for maximum relay compatibility.
+    pub protected: bool,
+
+    /// Reuse an existing `d` tag value instead of generating a new one.
+    ///
+    /// When `Some(d)`, the value is validated and placed into both the `d` tag of
+    /// the kind:30443 event and the returned [`KeyPackageEventData::d_tag`]. This
+    /// lets callers rotate a KeyPackage while keeping the NIP-33 addressable slot
+    /// stable — relays will replace the previous event under the same
+    /// `(kind, pubkey, d)` coordinate.
+    ///
+    /// When `None`, a fresh random 32-byte hex value is generated (current default
+    /// behavior).
+    ///
+    /// The supplied value must be:
+    /// - Non-empty
+    /// - At most 128 characters
+    /// - Composed entirely of ASCII hex digits (`0`-`9`, `a`-`f`, `A`-`F`)
+    ///
+    /// Validation failures surface as [`Error::KeyPackage`].
+    pub existing_d_tag: Option<String>,
+}
+
+/// Validates a caller-supplied `existing_d_tag` value.
+///
+/// Rules (see [`KeyPackageOptions::existing_d_tag`] for context):
+/// - non-empty
+/// - length ≤ `MAX_EXISTING_D_TAG_LEN`
+/// - ASCII hex digits only
+fn validate_existing_d_tag(d: &str) -> Result<(), Error> {
+    if d.is_empty() {
+        return Err(Error::KeyPackage(
+            "existing_d_tag must not be empty".to_string(),
+        ));
+    }
+    if d.len() > MAX_EXISTING_D_TAG_LEN {
+        return Err(Error::KeyPackage(format!(
+            "existing_d_tag must be at most {} characters (got {})",
+            MAX_EXISTING_D_TAG_LEN,
+            d.len()
+        )));
+    }
+    if !d.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(Error::KeyPackage(
+            "existing_d_tag must contain only ASCII hex digits (0-9, a-f, A-F)".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 impl<Storage> MDK<Storage>
@@ -54,20 +131,24 @@ where
     /// This prevents downgrade attacks and parsing ambiguity across clients.
     ///
     /// A random `d` tag identifier is generated for this KeyPackage slot. When rotating,
-    /// callers SHOULD reuse the same `d` value to let relays automatically replace the old event.
+    /// callers SHOULD persist [`KeyPackageEventData::d_tag`] and pass it back via
+    /// [`KeyPackageOptions::existing_d_tag`] through
+    /// [`MDK::create_key_package_for_event_with_options`] so relays automatically replace
+    /// the old event under the same NIP-33 addressable coordinate.
     ///
     /// The key package contains the user's credential and capabilities required for MLS operations.
     ///
     /// **Note**: This function does NOT add the NIP-70 protected tag, ensuring maximum relay
     /// compatibility. Many popular relays (Damus, Primal, nos.lol) reject protected events.
-    /// If you need the protected tag, use `create_key_package_for_event_with_options` instead.
+    /// If you need the protected tag (or want to reuse a stored `d` tag for rotation),
+    /// use [`MDK::create_key_package_for_event_with_options`] instead.
     ///
     /// # Returns
     ///
-    /// A tuple containing:
-    /// * A base64-encoded string containing the serialized key package
-    /// * A vector of tags for the Nostr event:
-    ///   - `d` - Random 32-byte hex identifier for this KeyPackage slot (for addressable replacement)
+    /// A [`KeyPackageEventData`] containing:
+    /// * The base64-encoded serialized key package (as `content`)
+    /// * Tags for the Nostr event (`tags_30443` and `tags_443`):
+    ///   - `d` - Random 32-byte hex identifier for this KeyPackage slot (kind:30443 only)
     ///   - `mls_protocol_version` - MLS protocol version (e.g., "1.0")
     ///   - `mls_ciphersuite` - Ciphersuite identifier (e.g., "0x0001")
     ///   - `mls_extensions` - Required MLS extensions
@@ -77,7 +158,8 @@ where
     ///   - `client` - Client identifier and version
     ///   - `encoding` - The encoding format tag ("base64")
     /// * The serialized hash_ref bytes for the key package (for lifecycle tracking)
-    /// * The `d` tag value (32-byte hex string) — callers SHOULD store this and reuse it when rotating
+    /// * The `d` tag value (32-byte hex string) — callers SHOULD store this and reuse
+    ///   it when rotating (see [`KeyPackageOptions::existing_d_tag`])
     ///
     /// # Errors
     ///
@@ -93,34 +175,32 @@ where
     where
         I: IntoIterator<Item = RelayUrl>,
     {
-        self.create_key_package_for_event_internal(public_key, relays, false)
+        self.create_key_package_for_event_internal(public_key, relays, &KeyPackageOptions::default())
     }
 
     /// Creates a key package for a Nostr event with additional options.
     ///
-    /// This is the same as `create_key_package_for_event` but allows specifying
-    /// whether to include the NIP-70 protected tag.
+    /// This is the same as `create_key_package_for_event` but accepts a
+    /// [`KeyPackageOptions`] struct controlling NIP-70 protection and `d` tag reuse.
     ///
     /// # Arguments
     ///
     /// * `public_key` - The Nostr public key for the credential
     /// * `relays` - Relay URLs where the key package will be published
-    /// * `protected` - Whether to add the NIP-70 protected tag (`["-"]`). When `true`, relays
-    ///   that implement NIP-70 will reject republishing by third parties. However, many popular
-    ///   relays (Damus, Primal, nos.lol) reject protected events entirely. Only set to `true`
-    ///   if publishing to relays known to accept NIP-70 protected events.
+    /// * `options` - Optional event-construction parameters. See [`KeyPackageOptions`].
     ///
     /// # Returns
     ///
-    /// A tuple containing:
-    /// * A base64-encoded string containing the serialized key package
-    /// * A vector of tags for the Nostr event
-    /// * The serialized hash_ref bytes for the key package (for lifecycle tracking)
-    /// * The `d` tag value (32-byte hex string) — callers SHOULD store this and reuse it when rotating
+    /// A [`KeyPackageEventData`] containing the encoded content, tags for both event
+    /// kinds, the serialized `KeyPackageRef` bytes, and the `d` tag value (which
+    /// callers SHOULD store and pass back via [`KeyPackageOptions::existing_d_tag`]
+    /// when rotating).
     ///
     /// # Errors
     ///
     /// This function will return an error if:
+    /// * `options.existing_d_tag` is `Some` and fails validation (see
+    ///   [`KeyPackageOptions::existing_d_tag`])
     /// * It fails to generate the credential and signature keypair
     /// * It fails to build the key package
     /// * It fails to serialize the key package
@@ -128,12 +208,12 @@ where
         &self,
         public_key: &PublicKey,
         relays: I,
-        protected: bool,
+        options: KeyPackageOptions,
     ) -> Result<KeyPackageEventData, Error>
     where
         I: IntoIterator<Item = RelayUrl>,
     {
-        self.create_key_package_for_event_internal(public_key, relays, protected)
+        self.create_key_package_for_event_internal(public_key, relays, &options)
     }
 
     /// Internal implementation for creating key packages.
@@ -142,23 +222,30 @@ where
     /// `create_key_package_for_event_with_options`. It generates an MLS key package with
     /// the user's credential and builds the Nostr event tags.
     ///
-    /// A random `d` tag identifier is generated for this KeyPackage slot, making the event
-    /// addressable (kind 30443). Relays automatically replace events with the same
-    /// `(kind, pubkey, d)` tuple.
+    /// The `d` tag identifier for the kind:30443 event is either taken from
+    /// `options.existing_d_tag` (validated, then used directly) or generated as a fresh
+    /// random 32-byte hex value. The event is addressable per NIP-33: relays
+    /// automatically replace events sharing the same `(kind, pubkey, d)` tuple, so
+    /// callers SHOULD persist `KeyPackageEventData::d_tag` and pass it back through
+    /// `KeyPackageOptions::existing_d_tag` when rotating a KeyPackage.
     ///
-    /// The `protected` parameter controls whether the NIP-70 protected tag (`["-"]`) is
-    /// included in the output tags. When `true`, the tag is inserted between the `i`
-    /// and `client` tags, resulting in 9 total tags. When `false`, the protected tag is
-    /// omitted, resulting in 8 total tags.
+    /// `options.protected` controls whether the NIP-70 protected tag (`["-"]`) is
+    /// included. When `true`, the tag is inserted between the `i` and `client` tags,
+    /// resulting in 10 total kind:30443 tags. When `false`, the protected tag is
+    /// omitted, resulting in 9 total kind:30443 tags.
     fn create_key_package_for_event_internal<I>(
         &self,
         public_key: &PublicKey,
         relays: I,
-        protected: bool,
+        options: &KeyPackageOptions,
     ) -> Result<KeyPackageEventData, Error>
     where
         I: IntoIterator<Item = RelayUrl>,
     {
+        if let Some(ref existing) = options.existing_d_tag {
+            validate_existing_d_tag(existing)?;
+        }
+
         let (credential, signature_keypair) = self.generate_credential_with_key(public_key)?;
 
         let capabilities: Capabilities = self.capabilities();
@@ -192,9 +279,10 @@ where
 
         tracing::debug!(
             target: "mdk_core::key_packages",
-            "Encoded key package using {} format (protected: {})",
+            "Encoded key package using {} format (protected: {}, reused_d_tag: {})",
             encoding.as_tag_value(),
-            protected
+            options.protected,
+            options.existing_d_tag.is_some()
         );
 
         // Hex-encode the raw KeyPackageRef bytes for the `i` tag per MIP-00.
@@ -202,13 +290,19 @@ where
         // and decoding all KeyPackage events.
         let key_package_ref_hex = hex::encode(hash_ref.as_slice());
 
-        // Generate a random 32-byte hex identifier for the `d` tag.
+        // Determine the `d` tag value for this KeyPackage slot.
         // This makes the event addressable (kind 30443, NIP-33): relays automatically
         // replace events sharing the same (kind, pubkey, d) tuple.
-        // Callers SHOULD store and reuse this value when rotating the KeyPackage.
-        let mut d_bytes = [0u8; 32];
-        OsRng.fill_bytes(&mut d_bytes);
-        let d_value = hex::encode(d_bytes);
+        // Callers can pass back a previously stored value via `options.existing_d_tag`
+        // to rotate the KeyPackage while keeping the addressable slot stable.
+        let d_value = match options.existing_d_tag.as_deref() {
+            Some(existing) => existing.to_string(),
+            None => {
+                let mut d_bytes = [0u8; 32];
+                OsRng.fill_bytes(&mut d_bytes);
+                hex::encode(d_bytes)
+            }
+        };
 
         let mut tags_30443 = vec![
             Tag::identifier(&d_value),
@@ -223,7 +317,7 @@ where
             Tag::custom(TagKind::i(), [key_package_ref_hex]),
         ];
 
-        if protected {
+        if options.protected {
             tags_30443.push(Tag::protected());
         }
 
@@ -1201,7 +1295,14 @@ mod tests {
             d_tag: _d_value,
             ..
         } = mdk
-            .create_key_package_for_event_with_options(&test_pubkey, relays, true)
+            .create_key_package_for_event_with_options(
+                &test_pubkey,
+                relays,
+                KeyPackageOptions {
+                    protected: true,
+                    ..Default::default()
+                },
+            )
             .expect("Failed to create key package");
 
         // Verify hash_ref is returned from the with_options variant too
@@ -1245,6 +1346,185 @@ mod tests {
             TagKind::Custom("encoding".into()),
             "Tenth tag should be encoding"
         );
+    }
+
+    /// When `existing_d_tag` is `Some(d)`, that exact value must appear as the
+    /// `Tag::identifier(...)` in `tags_30443` and as `KeyPackageEventData::d_tag`.
+    /// No new random `d` value should be generated.
+    #[test]
+    fn test_existing_d_tag_is_used_verbatim() {
+        let mdk = create_test_mdk();
+        let test_pubkey =
+            PublicKey::from_hex("884704bd421671e01c13f854d2ce23ce2a5bfe9562f4f297ad2bc921ba30c3a6")
+                .unwrap();
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").unwrap()];
+
+        // A previously generated d-tag that the caller wants to reuse for rotation.
+        let stored_d_tag =
+            "deadbeefcafef00d0123456789abcdef0123456789abcdef0123456789abcdef".to_string();
+
+        let KeyPackageEventData {
+            tags_30443: tags,
+            tags_443: legacy_tags,
+            d_tag,
+            ..
+        } = mdk
+            .create_key_package_for_event_with_options(
+                &test_pubkey,
+                relays,
+                KeyPackageOptions {
+                    existing_d_tag: Some(stored_d_tag.clone()),
+                    ..Default::default()
+                },
+            )
+            .expect("Failed to create key package with existing d_tag");
+
+        // The returned d_tag should equal the supplied value verbatim.
+        assert_eq!(d_tag, stored_d_tag);
+
+        // The `d` tag in tags_30443 should carry the supplied value.
+        let identifier_tag = tags
+            .iter()
+            .find(|t| t.kind() == TagKind::d())
+            .expect("d tag missing from tags_30443");
+        assert_eq!(identifier_tag.content().unwrap(), stored_d_tag);
+
+        // tags_443 (legacy) should not contain a `d` tag at all, matching default behavior.
+        assert!(legacy_tags.iter().all(|t| t.kind() != TagKind::d()));
+    }
+
+    /// When `existing_d_tag` is `None`, behavior must match the no-options variant:
+    /// a fresh random 64-char hex `d` tag is generated.
+    #[test]
+    fn test_no_existing_d_tag_generates_fresh_value() {
+        let mdk = create_test_mdk();
+        let test_pubkey =
+            PublicKey::from_hex("884704bd421671e01c13f854d2ce23ce2a5bfe9562f4f297ad2bc921ba30c3a6")
+                .unwrap();
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").unwrap()];
+
+        let baseline = mdk
+            .create_key_package_for_event(&test_pubkey, relays.clone())
+            .expect("baseline creation failed");
+
+        let with_default_opts = mdk
+            .create_key_package_for_event_with_options(
+                &test_pubkey,
+                relays,
+                KeyPackageOptions::default(),
+            )
+            .expect("default-options creation failed");
+
+        // Both paths must produce a 64-char ASCII-hex d_tag.
+        for d in [&baseline.d_tag, &with_default_opts.d_tag] {
+            assert_eq!(d.len(), 64);
+            assert!(d.chars().all(|c| c.is_ascii_hexdigit()));
+        }
+
+        // Two independent calls must produce different random d_tags.
+        assert_ne!(
+            baseline.d_tag, with_default_opts.d_tag,
+            "Two random generations should not collide"
+        );
+    }
+
+    /// Validation rejects an empty `existing_d_tag` with `Error::KeyPackage`.
+    #[test]
+    fn test_existing_d_tag_empty_is_rejected() {
+        let mdk = create_test_mdk();
+        let test_pubkey =
+            PublicKey::from_hex("884704bd421671e01c13f854d2ce23ce2a5bfe9562f4f297ad2bc921ba30c3a6")
+                .unwrap();
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").unwrap()];
+
+        let result = mdk.create_key_package_for_event_with_options(
+            &test_pubkey,
+            relays,
+            KeyPackageOptions {
+                existing_d_tag: Some(String::new()),
+                ..Default::default()
+            },
+        );
+
+        assert!(matches!(result, Err(Error::KeyPackage(ref msg)) if msg.contains("empty")));
+    }
+
+    /// Validation rejects an `existing_d_tag` containing non-hex characters.
+    #[test]
+    fn test_existing_d_tag_non_hex_is_rejected() {
+        let mdk = create_test_mdk();
+        let test_pubkey =
+            PublicKey::from_hex("884704bd421671e01c13f854d2ce23ce2a5bfe9562f4f297ad2bc921ba30c3a6")
+                .unwrap();
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").unwrap()];
+
+        let result = mdk.create_key_package_for_event_with_options(
+            &test_pubkey,
+            relays,
+            KeyPackageOptions {
+                existing_d_tag: Some("not-hex-because-dashes".to_string()),
+                ..Default::default()
+            },
+        );
+
+        assert!(matches!(result, Err(Error::KeyPackage(ref msg)) if msg.contains("hex")));
+    }
+
+    /// Validation rejects an `existing_d_tag` exceeding the length cap.
+    #[test]
+    fn test_existing_d_tag_too_long_is_rejected() {
+        let mdk = create_test_mdk();
+        let test_pubkey =
+            PublicKey::from_hex("884704bd421671e01c13f854d2ce23ce2a5bfe9562f4f297ad2bc921ba30c3a6")
+                .unwrap();
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").unwrap()];
+
+        // One character over MAX_EXISTING_D_TAG_LEN (128), all valid hex.
+        let too_long = "a".repeat(MAX_EXISTING_D_TAG_LEN + 1);
+
+        let result = mdk.create_key_package_for_event_with_options(
+            &test_pubkey,
+            relays,
+            KeyPackageOptions {
+                existing_d_tag: Some(too_long),
+                ..Default::default()
+            },
+        );
+
+        assert!(matches!(result, Err(Error::KeyPackage(ref msg)) if msg.contains("128")));
+    }
+
+    /// A reused `existing_d_tag` must combine cleanly with `protected = true`:
+    /// the protected tag and reused d-tag both end up in the output.
+    #[test]
+    fn test_existing_d_tag_with_protected() {
+        let mdk = create_test_mdk();
+        let test_pubkey =
+            PublicKey::from_hex("884704bd421671e01c13f854d2ce23ce2a5bfe9562f4f297ad2bc921ba30c3a6")
+                .unwrap();
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").unwrap()];
+
+        let stored_d_tag =
+            "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789".to_string();
+
+        let KeyPackageEventData {
+            tags_30443: tags,
+            d_tag,
+            ..
+        } = mdk
+            .create_key_package_for_event_with_options(
+                &test_pubkey,
+                relays,
+                KeyPackageOptions {
+                    protected: true,
+                    existing_d_tag: Some(stored_d_tag.clone()),
+                },
+            )
+            .expect("Failed to create key package");
+
+        assert_eq!(d_tag, stored_d_tag);
+        assert_eq!(tags[0].content().unwrap(), stored_d_tag);
+        assert!(tags.iter().any(|t| t.kind() == TagKind::Protected));
     }
 
     #[test]

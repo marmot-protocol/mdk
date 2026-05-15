@@ -722,15 +722,13 @@ impl Mdk {
     ///
     /// * `public_key` - The Nostr public key (hex) for the credential
     /// * `relays` - Relay URLs where the key package will be published
-    /// * `protected` - Whether to add the NIP-70 protected tag. When `true`, relays that
-    ///   implement NIP-70 will reject republishing by third parties. However, many popular
-    ///   relays reject protected events entirely. Set to `false` for maximum relay
-    ///   compatibility.
+    /// * `options` - Event-construction options ([`KeyPackageOptions`]). Use the default
+    ///   value for "no protected tag, freshly generated `d` tag" behavior.
     pub fn create_key_package_for_event_with_options(
         &self,
         public_key: String,
         relays: Vec<String>,
-        protected: bool,
+        options: KeyPackageOptions,
     ) -> Result<KeyPackageResult, MdkUniffiError> {
         let pubkey = parse_public_key(&public_key)?;
         let relay_urls = parse_relay_urls(&relays)?;
@@ -742,7 +740,7 @@ impl Mdk {
             tags_443,
             hash_ref,
             d_tag,
-        } = mdk.create_key_package_for_event_with_options(&pubkey, relay_urls, protected)?;
+        } = mdk.create_key_package_for_event_with_options(&pubkey, relay_urls, options.into())?;
 
         let tags: Vec<Vec<String>> = tags.iter().map(|tag| tag.as_slice().to_vec()).collect();
         let tags_legacy: Vec<Vec<String>> =
@@ -1516,6 +1514,41 @@ impl Mdk {
     }
 }
 
+/// Options for creating a key package event.
+///
+/// Mirrors `mdk_core::key_packages::KeyPackageOptions`. Pass an instance with the
+/// default values (`protected = false`, `existing_d_tag = None`) for the standard
+/// behavior, or set fields to customize.
+#[derive(uniffi::Record, Default, Clone)]
+pub struct KeyPackageOptions {
+    /// Add the NIP-70 protected tag (`["-"]`).
+    ///
+    /// When `true`, relays that implement NIP-70 will reject republishing of this
+    /// event by third parties. Many popular relays (Damus, Primal, nos.lol) reject
+    /// protected events entirely — only enable when publishing to relays known to
+    /// accept NIP-70 protected events. Defaults to `false` for max relay compat.
+    pub protected: bool,
+
+    /// Reuse an existing `d` tag value instead of generating a new one.
+    ///
+    /// Pass a previously stored `d_tag` here to rotate a KeyPackage while keeping
+    /// the NIP-33 addressable slot stable — relays replace the previous event under
+    /// the same `(kind, pubkey, d)` coordinate.
+    ///
+    /// Must be a non-empty, ASCII-hex string of at most 128 characters. When `None`,
+    /// a fresh random 32-byte hex value is generated (current default behavior).
+    pub existing_d_tag: Option<String>,
+}
+
+impl From<KeyPackageOptions> for mdk_core::key_packages::KeyPackageOptions {
+    fn from(opts: KeyPackageOptions) -> Self {
+        Self {
+            protected: opts.protected,
+            existing_d_tag: opts.existing_d_tag,
+        }
+    }
+}
+
 /// Result of creating a key package
 #[derive(uniffi::Record)]
 pub struct KeyPackageResult {
@@ -1527,10 +1560,12 @@ pub struct KeyPackageResult {
     pub tags_legacy: Vec<Vec<String>>,
     /// Serialized hash_ref bytes for the key package (for lifecycle tracking)
     pub hash_ref: Vec<u8>,
-    /// The `d` tag value (32-byte hex string) for this KeyPackage slot.
-    /// Callers SHOULD store this and, when rotating, replace the generated
-    /// `["d", ...]` entry in `tags` with the stored value before signing.
-    /// Reusing the same `(kind, pubkey, d)` tuple lets relays replace the old event.
+    /// The `d` tag value (hex string) for this KeyPackage slot.
+    ///
+    /// Callers SHOULD store this and, when rotating, pass it back via
+    /// [`KeyPackageOptions::existing_d_tag`] so MDK emits the same `d` value
+    /// directly — no need to post-edit the tag list. Reusing the same
+    /// `(kind, pubkey, d)` tuple lets relays replace the old event.
     pub d_tag: String,
 }
 

@@ -27,12 +27,14 @@
 
 - **Extension version bumped from 2 to 3**: `NostrGroupDataExtension::CURRENT_VERSION` is now `3`. The new version adds a `disappearing_message_secs` field to the TLS-serialized group data extension. Existing v1/v2 groups are forward-compatible (the field deserializes as `None`). `NostrGroupConfigData::new` now takes an additional `disappearing_message_secs: Option<u64>` parameter. ([#253](https://github.com/marmot-protocol/mdk/pull/253))
 - **`NostrGroupDataExtension::migrate_to_v2` removed from public API.** The 0.8.0 method was used only to construct test fixtures; production code never migrates extensions in-place (deserialization upgrades v1/v2 → v3 through `into_v3`, and new groups author v3 directly). Mirrors the existing convention for `migrate_group_image_v1_to_v2`, which was already documented as internal-only. ([#253](https://github.com/marmot-protocol/mdk/pull/253))
+- **`create_key_package_for_event_with_options` signature changed**: the third parameter is now `options: KeyPackageOptions` instead of `protected: bool`. The new struct carries both the existing `protected` flag and a new `existing_d_tag: Option<String>` field for `d` tag reuse during KeyPackage rotation. Migrate by replacing `mdk.create_key_package_for_event_with_options(&pk, relays, true)` with `mdk.create_key_package_for_event_with_options(&pk, relays, KeyPackageOptions { protected: true, ..Default::default() })`. `create_key_package_for_event` (the no-options variant) is unchanged. The matching `Mdk::create_key_package_for_event_with_options` UniFFI binding now takes a `KeyPackageOptions` record with the same shape.
 
 ### Changed
 
 ### Added
 
 - Added `disappearing_message_secs: Option<u64>` field to `NostrGroupDataExtension`, `NostrGroupConfigData`, and `NostrGroupDataUpdate` for configuring disappearing messages on groups. `None` means messages persist forever; `Some(n)` means messages expire `n` seconds after creation. The field is propagated through group creation, group updates, and welcome processing. ([#253](https://github.com/marmot-protocol/mdk/pull/253))
+- Added `KeyPackageOptions::existing_d_tag: Option<String>` so callers can supply a previously stored `d` tag value when rotating a KeyPackage. When `Some`, the value is validated (non-empty, ≤ 128 chars, ASCII hex digits only) and used directly for both the kind:30443 `Tag::identifier(...)` and the returned `KeyPackageEventData::d_tag`; no random `d` is generated. When `None`, the existing random 32-byte hex behavior is preserved. Closes the ergonomics gap that previously forced consumers (e.g. whitenoise-rs) to post-edit the tag list to keep their NIP-33 addressable slot stable across rotations.
 
 ### Fixed
 

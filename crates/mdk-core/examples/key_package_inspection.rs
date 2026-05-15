@@ -50,7 +50,10 @@ async fn main() -> Result<(), Error> {
     } = mdk.create_key_package_for_event_with_options(
         &keys.public_key(),
         [relay_url.clone()],
-        true,
+        mdk_core::key_packages::KeyPackageOptions {
+            protected: true,
+            ..Default::default()
+        },
     )?;
 
     println!("Key Package Created Successfully!");
