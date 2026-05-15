@@ -94,6 +94,36 @@ pub struct KeyPackageOptions {
     pub existing_d_tag: Option<String>,
 }
 
+/// Shared `d` tag value validator.
+///
+/// Single source of truth for MIP-00's `d` tag rules — used by both creation
+/// ([`validate_existing_d_tag`], called from `create_key_package_for_event_with_options`)
+/// and parsing ([`MDK::parse_key_package`]). The `field_name` parameter is interpolated
+/// into error messages so callers see context-appropriate text (`"existing_d_tag"` vs
+/// `"d tag"`).
+///
+/// Rules:
+/// - non-empty
+/// - exactly [`D_TAG_HEX_LEN`] characters
+/// - ASCII hex digits only
+fn validate_d_tag_value(d: &str, field_name: &str) -> Result<(), Error> {
+    if d.is_empty() {
+        return Err(Error::KeyPackage(format!("{field_name} must not be empty")));
+    }
+    if d.len() != D_TAG_HEX_LEN {
+        return Err(Error::KeyPackage(format!(
+            "{field_name} must be exactly {D_TAG_HEX_LEN} hex characters (got {})",
+            d.len()
+        )));
+    }
+    if !d.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(Error::KeyPackage(format!(
+            "{field_name} must contain only ASCII hex digits (0-9, a-f, A-F)"
+        )));
+    }
+    Ok(())
+}
+
 /// Validates a caller-supplied `existing_d_tag` value.
 ///
 /// Rules:
@@ -103,25 +133,10 @@ pub struct KeyPackageOptions {
 ///
 /// Mirrors the MIP-00 `d` tag validation performed by [`MDK::parse_key_package`] so that
 /// caller-supplied values round-trip through publication and re-parsing without rejection.
+/// Both code paths delegate to the same internal `validate_d_tag_value` helper, so the
+/// accepted-value rule is impossible to drift across creation and parsing.
 pub fn validate_existing_d_tag(d: &str) -> Result<(), Error> {
-    if d.is_empty() {
-        return Err(Error::KeyPackage(
-            "existing_d_tag must not be empty".to_string(),
-        ));
-    }
-    if d.len() != D_TAG_HEX_LEN {
-        return Err(Error::KeyPackage(format!(
-            "existing_d_tag must be exactly {} hex characters (got {})",
-            D_TAG_HEX_LEN,
-            d.len()
-        )));
-    }
-    if !d.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err(Error::KeyPackage(
-            "existing_d_tag must contain only ASCII hex digits (0-9, a-f, A-F)".to_string(),
-        ));
-    }
-    Ok(())
+    validate_d_tag_value(d, "existing_d_tag")
 }
 
 impl<Storage> MDK<Storage>
@@ -452,22 +467,9 @@ where
                 }
                 Some(tag) => {
                     let d_value = tag.as_slice().get(1).map(|s| s.as_str()).unwrap_or("");
-                    if d_value.is_empty() {
-                        return Err(Error::KeyPackage(
-                            "d tag value must not be empty".to_string(),
-                        ));
-                    }
-                    if d_value.len() != 64 {
-                        return Err(Error::KeyPackage(
-                            "d tag must be exactly 64 hex characters (32 bytes)".to_string(),
-                        ));
-                    }
-                    hex::decode(d_value).map_err(|e| {
-                        Error::KeyPackage(format!(
-                            "d tag must contain valid hex-encoded data: {}",
-                            e
-                        ))
-                    })?;
+                    // Single source of truth — same helper used by `validate_existing_d_tag`,
+                    // so creation and parsing cannot drift on the accepted-value rule.
+                    validate_d_tag_value(d_value, "d tag")?;
                 }
             }
         }
