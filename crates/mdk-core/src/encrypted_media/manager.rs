@@ -1829,7 +1829,7 @@ mod tests {
 
         let manager = mdk.media_manager(group_id);
         let decrypted = manager
-            .decrypt_from_download(&encrypted_data, &reference)
+            .decrypt_from_download_at(&encrypted_data, &reference, fixed_pre_deadline_ts())
             .expect("Legacy current-epoch media should decrypt");
         assert_eq!(decrypted, data);
     }
@@ -1987,7 +1987,7 @@ mod tests {
 
         let manager = mdk.media_manager(group_id);
         let decrypted = manager
-            .decrypt_from_download(&encrypted_data, &media_ref)
+            .decrypt_from_download_at(&encrypted_data, &media_ref, fixed_pre_deadline_ts())
             .expect("Legacy media referenced by epoch hint should decrypt");
         assert_eq!(decrypted, data);
     }
