@@ -7,6 +7,10 @@ App runtime bridge for the first real Marmot app surfaces.
 - Own the app-facing runtime that ties `AccountHome`, SQLCipher session storage, Nostr peeling, Nostr transport adapter,
   and local development relay support together.
 - Keep CLI/TUI presentation out of this crate.
+- Keep the Nostr user directory app-facing and pubkey-keyed. It may cache local-account links, profile metadata, follow
+  lists, relay lists, and KeyPackages, but it must not become an unbounded Nostr social-graph crawler.
+- Keep directory search bounded over cached follow edges. Do not add web-of-trust scoring unless that is reopened as a
+  deliberate product decision.
 - Keep protocol engine behavior in `cgka-engine` and session ownership in `cgka-session`.
 - Keep local development relay code clearly separate from production Nostr relay-list setup and discovery.
 - Keep local relay discovery endpoint-scoped: a fetch from one `marmot-local://...` relay must not see records that were

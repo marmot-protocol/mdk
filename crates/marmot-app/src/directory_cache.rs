@@ -4,7 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OptionalExtension, params};
 
-use crate::{AppError, DirectoryEntry};
+use crate::{AppError, UserDirectoryRecord};
 
 pub(crate) struct DirectoryCache {
     conn: Connection,
@@ -17,7 +17,7 @@ impl DirectoryCache {
         }
         let conn = Connection::open(path)?;
         conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS directory_entries (
+            "CREATE TABLE IF NOT EXISTS user_directory_records (
                 account_id_hex TEXT PRIMARY KEY NOT NULL,
                 entry_json TEXT NOT NULL,
                 updated_at INTEGER NOT NULL
@@ -26,10 +26,13 @@ impl DirectoryCache {
         Ok(Self { conn })
     }
 
-    pub(crate) fn entry(&self, account_id_hex: &str) -> Result<Option<DirectoryEntry>, AppError> {
+    pub(crate) fn entry(
+        &self,
+        account_id_hex: &str,
+    ) -> Result<Option<UserDirectoryRecord>, AppError> {
         self.conn
             .query_row(
-                "SELECT entry_json FROM directory_entries WHERE account_id_hex = ?1",
+                "SELECT entry_json FROM user_directory_records WHERE account_id_hex = ?1",
                 [account_id_hex],
                 |row| row.get::<_, String>(0),
             )
@@ -38,9 +41,9 @@ impl DirectoryCache {
             .transpose()
     }
 
-    pub(crate) fn entries(&self) -> Result<Vec<DirectoryEntry>, AppError> {
+    pub(crate) fn entries(&self) -> Result<Vec<UserDirectoryRecord>, AppError> {
         let mut statement = self.conn.prepare(
-            "SELECT entry_json FROM directory_entries
+            "SELECT entry_json FROM user_directory_records
              ORDER BY account_id_hex",
         )?;
         let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
@@ -51,9 +54,9 @@ impl DirectoryCache {
         Ok(entries)
     }
 
-    pub(crate) fn put(&self, entry: &DirectoryEntry) -> Result<(), AppError> {
+    pub(crate) fn put(&self, entry: &UserDirectoryRecord) -> Result<(), AppError> {
         self.conn.execute(
-            "INSERT INTO directory_entries (account_id_hex, entry_json, updated_at)
+            "INSERT INTO user_directory_records (account_id_hex, entry_json, updated_at)
              VALUES (?1, ?2, ?3)
              ON CONFLICT(account_id_hex) DO UPDATE SET
                 entry_json = excluded.entry_json,

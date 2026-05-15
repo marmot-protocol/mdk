@@ -853,6 +853,42 @@ fn group_create_can_invite_a_member_by_fetched_pubkey() {
 }
 
 #[test]
+fn group_create_fetches_missing_key_package_for_pubkey_members() {
+    let home = tempfile::tempdir().expect("tempdir");
+
+    let alice = create_account(home.path());
+    let bob = create_account_with_relays(
+        home.path(),
+        "marmot-local://key-packages",
+        "marmot-local://seed",
+    );
+    let bob_account_id = bob["account_id"].as_str().expect("bob account id");
+
+    run_json(
+        home.path(),
+        &["--account", bob_account_id, "keys", "publish"],
+    );
+
+    let created_group = run_json(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "group",
+            "create",
+            "--name",
+            "pubkey",
+            "--member",
+            bob_account_id,
+        ],
+    );
+    let group_id = created_group["group_id"].as_str().expect("group id");
+
+    let bob_join = run_json(home.path(), &["--account", bob_account_id, "sync"]);
+    assert_eq!(bob_join["joined_groups"][0], group_id);
+}
+
+#[test]
 fn group_archive_is_local_state_not_membership_state() {
     let home = tempfile::tempdir().expect("tempdir");
 

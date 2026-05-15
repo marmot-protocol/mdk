@@ -9,10 +9,13 @@ Real CLI app surface for the Darkmatter/Marmot stack.
 - Reuse the real account/session/transport stack through `marmot-account` and `marmot-app`.
 - Do not depend on `marmot-lab` for product-facing account, group, message, or sync commands.
 - Keep Nostr public keys as the CLI identity layer. Do not introduce user-label account selection in product commands.
+- Do not add a CLI address-book/user-directory browsing namespace unless the product direction changes. Pubkeys are passed
+  directly to group/invite/key commands; directory warming and search live under `marmot-app`/daemon behavior.
 - Keep one spelling per product capability: `keys`, `chats`, top-level `--account <npub-or-hex>`, and positional basics
   for common group and message flows. Do not add hidden compatibility aliases for old command shapes.
 - Keep daemon behavior real. `dm daemon start|stop|status`, the `dmd` binary, socket-backed execution, pid/log files, and
-  background sync should be covered when touched.
+  background sync should be covered when touched. Background sync should also refresh the app-level Nostr user directory
+  for local signing accounts.
 - Do not print or log nsecs, secret key hex, plaintext database keys, or other key material.
 - Treat JSON response shapes as future TUI/API inputs; change them deliberately.
 

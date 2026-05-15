@@ -1,6 +1,6 @@
 use cgka_traits::TransportEndpoint;
 use marmot_account::AccountHome;
-use marmot_app::{AccountRelayListBootstrap, MarmotApp};
+use marmot_app::{AccountRelayListBootstrap, MarmotApp, UserDirectorySearch, UserProfileMetadata};
 
 #[tokio::test]
 async fn local_app_runtime_exchanges_messages_without_lab() {
@@ -176,6 +176,133 @@ async fn directory_cache_is_durable_app_state_not_json_user_files() {
     assert!(cached.relay_lists.complete);
     assert!(dir.path().join("app-cache.sqlite3").exists());
     assert!(!dir.path().join("directory/users").exists());
+}
+
+#[tokio::test]
+async fn user_directory_refresh_precaches_follows_profiles_and_searches_by_radius() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    home.create_account("bob").unwrap();
+    home.create_account("carol").unwrap();
+    let alice_id = home.account("alice").unwrap().account_id_hex;
+    let bob_id = home.account("bob").unwrap().account_id_hex;
+    let carol_id = home.account("carol").unwrap().account_id_hex;
+    let app = MarmotApp::local(dir.path());
+    let bootstrap = AccountRelayListBootstrap::new(
+        vec![TransportEndpoint("marmot-local://social".into())],
+        vec![TransportEndpoint("marmot-local://seed".into())],
+    );
+
+    app.publish_user_profile(
+        "bob",
+        UserProfileMetadata {
+            name: Some("bob".into()),
+            display_name: Some("Bob Builder".into()),
+            about: Some("Can we fix it".into()),
+            picture: None,
+            nip05: Some("bob@example.test".into()),
+            created_at: 0,
+            source_relays: Vec::new(),
+        },
+        bootstrap.clone(),
+    )
+    .await
+    .unwrap();
+    app.publish_user_profile(
+        "carol",
+        UserProfileMetadata {
+            name: Some("carol".into()),
+            display_name: Some("Carol Singer".into()),
+            about: None,
+            picture: None,
+            nip05: None,
+            created_at: 0,
+            source_relays: Vec::new(),
+        },
+        bootstrap.clone(),
+    )
+    .await
+    .unwrap();
+    app.publish_account_follow_list("alice", &[&bob_id], bootstrap.clone())
+        .await
+        .unwrap();
+    app.publish_account_follow_list("bob", &[&carol_id], bootstrap.clone())
+        .await
+        .unwrap();
+
+    let alice_refresh = app
+        .refresh_user_directory_for_account_id(
+            &alice_id,
+            vec![TransportEndpoint("marmot-local://seed".into())],
+        )
+        .await
+        .unwrap();
+    assert_eq!(alice_refresh.follow_count, 1);
+    assert_eq!(alice_refresh.profile_count, 1);
+
+    let bob_refresh = app
+        .refresh_user_directory_for_account_id(
+            &bob_id,
+            vec![TransportEndpoint("marmot-local://seed".into())],
+        )
+        .await
+        .unwrap();
+    assert_eq!(bob_refresh.follow_count, 1);
+    assert_eq!(bob_refresh.profile_count, 1);
+
+    let alice_record = app
+        .directory_entry_for_account_id(&alice_id)
+        .unwrap()
+        .expect("alice directory record");
+    assert_eq!(alice_record.account_id_hex, alice_id);
+    assert!(alice_record.npub.starts_with("npub1"));
+    assert_eq!(alice_record.local_account.as_ref().unwrap().label, "alice");
+    assert_eq!(alice_record.follows, vec![bob_id.clone()]);
+
+    let bob_record = app
+        .directory_entry_for_account_id(&bob_id)
+        .unwrap()
+        .expect("bob directory record");
+    assert_eq!(
+        bob_record.profile.as_ref().unwrap().display_name.as_deref(),
+        Some("Bob Builder")
+    );
+
+    let bob_results = app
+        .search_user_directory(UserDirectorySearch {
+            searcher_account_id_hex: alice_id.clone(),
+            query: "builder".into(),
+            radius_start: 0,
+            radius_end: 1,
+            limit: None,
+        })
+        .unwrap();
+    assert_eq!(bob_results[0].account_id_hex, bob_id);
+    assert_eq!(bob_results[0].radius, 1);
+
+    let carol_too_close = app
+        .search_user_directory(UserDirectorySearch {
+            searcher_account_id_hex: alice_id.clone(),
+            query: "carol".into(),
+            radius_start: 0,
+            radius_end: 1,
+            limit: None,
+        })
+        .unwrap();
+    assert!(carol_too_close.is_empty());
+
+    let carol_results = app
+        .search_user_directory(UserDirectorySearch {
+            searcher_account_id_hex: alice_id,
+            query: "carol".into(),
+            radius_start: 0,
+            radius_end: 2,
+            limit: None,
+        })
+        .unwrap();
+    assert_eq!(carol_results[0].account_id_hex, carol_id);
+    assert_eq!(carol_results[0].radius, 2);
 }
 
 #[tokio::test]

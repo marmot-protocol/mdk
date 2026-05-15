@@ -54,6 +54,10 @@ Once a daemon socket exists for a home, `dm --home <path> ...` will send normal 
 `dev/dmd.pid`, appends startup errors to `dev/dmd.log`, and periodically syncs every local signing account. Use
 `--socket` or `DM_SOCKET` to target a specific daemon.
 
+During account setup and background sync, `dm`/`dmd` also lets `marmot-app` refresh the Nostr user directory for local
+signing accounts. That warms cached follow lists and profile metadata for likely contacts without adding a CLI address
+book. Product commands still take `npub` or hex pubkeys directly at the point of use.
+
 Two-terminal local loop:
 
 Terminal 1:

@@ -24,6 +24,7 @@ use marmot_account::{
     AccountDeviceRuntime, AccountHome, AccountHomeError, AccountSummary, KeyPackagePublication,
     KeyPackagePublishError, KeyPackagePublisher, TransportRoutingError, TransportRoutingPolicy,
 };
+use nostr::ToBech32;
 use nostr_sdk::prelude::{Client as NostrSdkClient, Filter, Kind, PublicKey, RelayUrl};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
@@ -56,6 +57,8 @@ const EVENT_DIR: &str = "events";
 const SDK_FIRST_SYNC_WAIT: Duration = Duration::from_millis(750);
 const SDK_DRAIN_WAIT: Duration = Duration::from_millis(50);
 const SDK_RELAY_LIST_FETCH_WAIT: Duration = Duration::from_secs(3);
+const KIND_NOSTR_METADATA: u64 = 0;
+const KIND_NOSTR_CONTACT_LIST: u64 = 3;
 pub const GROUP_PROFILE_COMPONENT_ID: u16 = 0x8001;
 pub const GROUP_PROFILE_COMPONENT: &str = "marmot.group.profile.v1";
 pub const GROUP_BLOSSOM_IMAGE_COMPONENT_ID: u16 = 0x8002;
@@ -232,11 +235,83 @@ pub struct FetchedKeyPackage {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct DirectoryEntry {
+pub struct UserDirectoryRecord {
     pub account_id_hex: String,
+    pub npub: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_account: Option<UserDirectoryLocalAccount>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<UserProfileMetadata>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub follows: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub follow_source_relays: Vec<String>,
     pub relay_lists: AccountRelayListStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_package: Option<DirectoryKeyPackage>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UserDirectoryLocalAccount {
+    pub label: String,
+    pub local_signing: bool,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UserProfileMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub about: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub picture: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nip05: Option<String>,
+    #[serde(default)]
+    pub created_at: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_relays: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UserDirectoryRefresh {
+    pub account_id_hex: String,
+    pub follow_count: usize,
+    pub profile_count: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UserDirectorySearch {
+    pub searcher_account_id_hex: String,
+    pub query: String,
+    pub radius_start: u8,
+    pub radius_end: u8,
+    pub limit: Option<usize>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UserDirectorySearchResult {
+    pub account_id_hex: String,
+    pub npub: String,
+    pub radius: u8,
+    pub matched_field: String,
+    pub match_quality: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<UserProfileMetadata>,
+}
+
+impl UserDirectorySearch {
+    fn validate(&self) -> Result<(), AppError> {
+        if self.radius_start > self.radius_end {
+            return Err(AppError::InvalidDirectorySearch(
+                "radius_start must be less than or equal to radius_end".into(),
+            ));
+        }
+        parse_account_id_hex(&self.searcher_account_id_hex)?;
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -418,6 +493,8 @@ pub enum AppError {
     InvalidKeyPackageEvent(String),
     #[error("no directory entry for account: {0}")]
     MissingDirectoryEntry(String),
+    #[error("invalid user directory search: {0}")]
+    InvalidDirectorySearch(String),
     #[error("invalid group profile: {0}")]
     InvalidGroupProfile(String),
 }
@@ -454,6 +531,12 @@ struct KeyPackageRecord {
     #[serde(default)]
     key_package_id: String,
     key_package_hex: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FetchedFollowList {
+    follows: Vec<String>,
+    source_relays: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -742,7 +825,7 @@ impl MarmotApp {
         &self,
         account_id_hex: &str,
         bootstrap_relays: Vec<TransportEndpoint>,
-    ) -> Result<DirectoryEntry, AppError> {
+    ) -> Result<UserDirectoryRecord, AppError> {
         let status = if bootstrap_relays.is_empty() {
             self.account_relay_list_status_for_account_id(account_id_hex)?
         } else {
@@ -757,8 +840,133 @@ impl MarmotApp {
     pub fn directory_entry_for_account_id(
         &self,
         account_id_hex: &str,
-    ) -> Result<Option<DirectoryEntry>, AppError> {
+    ) -> Result<Option<UserDirectoryRecord>, AppError> {
         self.directory_cache()?.entry(account_id_hex)
+    }
+
+    pub async fn refresh_user_directory_for_account_id(
+        &self,
+        account_id_hex: &str,
+        bootstrap_relays: Vec<TransportEndpoint>,
+    ) -> Result<UserDirectoryRefresh, AppError> {
+        let account_id_hex = parse_account_id_hex(account_id_hex)?;
+        self.remember_directory_user(&account_id_hex)?;
+        let follow_list = self
+            .fetch_follow_list_for_account_id(&account_id_hex, &bootstrap_relays)
+            .await?;
+        self.remember_directory_follow_list(&account_id_hex, &follow_list)?;
+
+        let profile_count = self
+            .refresh_directory_profiles(&follow_list.follows, &bootstrap_relays)
+            .await?;
+
+        Ok(UserDirectoryRefresh {
+            account_id_hex,
+            follow_count: follow_list.follows.len(),
+            profile_count,
+        })
+    }
+
+    pub async fn publish_user_profile(
+        &self,
+        label: &str,
+        profile: UserProfileMetadata,
+        bootstrap: AccountRelayListBootstrap,
+    ) -> Result<(), AppError> {
+        let keys = self.account_home().load_signing_keys(label)?;
+        let endpoints = publish_endpoints_from_bootstrap(&bootstrap);
+        let content = serde_json::to_string(&profile_content_json(&profile))?;
+        let event = NostrTransportEvent::new_unsigned(
+            keys.public_key().to_hex(),
+            KIND_NOSTR_METADATA,
+            Vec::new(),
+            content,
+        );
+        self.relay_client_for_endpoints(&keys, &endpoints)
+            .publish_event(&endpoints, &event, 1)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn publish_account_follow_list(
+        &self,
+        label: &str,
+        follows: &[&str],
+        bootstrap: AccountRelayListBootstrap,
+    ) -> Result<(), AppError> {
+        let keys = self.account_home().load_signing_keys(label)?;
+        let endpoints = publish_endpoints_from_bootstrap(&bootstrap);
+        let tags = follows
+            .iter()
+            .map(|follow| {
+                parse_account_id_hex(follow).map(|account_id| vec!["p".to_owned(), account_id])
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let event = NostrTransportEvent::new_unsigned(
+            keys.public_key().to_hex(),
+            KIND_NOSTR_CONTACT_LIST,
+            tags,
+            String::new(),
+        );
+        self.relay_client_for_endpoints(&keys, &endpoints)
+            .publish_event(&endpoints, &event, 1)
+            .await?;
+        Ok(())
+    }
+
+    pub fn search_user_directory(
+        &self,
+        search: UserDirectorySearch,
+    ) -> Result<Vec<UserDirectorySearchResult>, AppError> {
+        search.validate()?;
+        let records = self.directory_entries()?;
+        let records_by_id = records
+            .into_iter()
+            .map(|record| (record.account_id_hex.clone(), record))
+            .collect::<HashMap<_, _>>();
+        let radii = directory_search_radii(
+            &records_by_id,
+            &search.searcher_account_id_hex,
+            search.radius_end,
+        );
+        let query = search.query.trim().to_lowercase();
+        if query.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut results = Vec::new();
+        for (account_id_hex, radius) in radii {
+            if radius < search.radius_start || radius > search.radius_end {
+                continue;
+            }
+            let Some(record) = records_by_id.get(&account_id_hex) else {
+                continue;
+            };
+            let Some(search_match) = user_record_match(record, &query) else {
+                continue;
+            };
+            results.push(UserDirectorySearchResult {
+                account_id_hex: record.account_id_hex.clone(),
+                npub: record.npub.clone(),
+                radius,
+                matched_field: search_match.field,
+                match_quality: search_match.quality,
+                profile: record.profile.clone(),
+            });
+        }
+        results.sort_by(|a, b| {
+            a.radius
+                .cmp(&b.radius)
+                .then_with(|| {
+                    match_quality_rank(&a.match_quality).cmp(&match_quality_rank(&b.match_quality))
+                })
+                .then_with(|| field_rank(&a.matched_field).cmp(&field_rank(&b.matched_field)))
+                .then_with(|| a.account_id_hex.cmp(&b.account_id_hex))
+        });
+        if let Some(limit) = search.limit {
+            results.truncate(limit);
+        }
+        Ok(results)
     }
 
     pub fn messages(&self, label: &str) -> Result<Vec<AppMessageRecord>, AppError> {
@@ -895,6 +1103,133 @@ impl MarmotApp {
             .collect()
     }
 
+    async fn fetch_follow_list_for_account_id(
+        &self,
+        account_id_hex: &str,
+        source_relays: &[TransportEndpoint],
+    ) -> Result<FetchedFollowList, AppError> {
+        let records = self
+            .fetch_events_for_account_ids(
+                &[account_id_hex.to_owned()],
+                KIND_NOSTR_CONTACT_LIST,
+                source_relays,
+            )
+            .await?;
+        Ok(
+            latest_follow_list_from_records(account_id_hex, records).unwrap_or_else(|| {
+                FetchedFollowList {
+                    follows: Vec::new(),
+                    source_relays: source_relays
+                        .iter()
+                        .map(|endpoint| endpoint.0.clone())
+                        .collect(),
+                }
+            }),
+        )
+    }
+
+    async fn refresh_directory_profiles(
+        &self,
+        account_ids: &[String],
+        source_relays: &[TransportEndpoint],
+    ) -> Result<usize, AppError> {
+        if account_ids.is_empty() {
+            return Ok(0);
+        }
+        let records = self
+            .fetch_events_for_account_ids(account_ids, KIND_NOSTR_METADATA, source_relays)
+            .await?;
+        let profiles = latest_profiles_from_records(records);
+        for account_id in account_ids {
+            self.remember_directory_user(account_id)?;
+        }
+        for (account_id, profile) in &profiles {
+            self.remember_directory_profile(account_id, profile)?;
+        }
+        Ok(profiles.len())
+    }
+
+    async fn fetch_events_for_account_ids(
+        &self,
+        account_ids: &[String],
+        kind: u64,
+        source_relays: &[TransportEndpoint],
+    ) -> Result<Vec<RelayEventRecord>, AppError> {
+        let source_relays = self.directory_source_relays(source_relays);
+        let account_ids = account_ids
+            .iter()
+            .map(|account_id| parse_account_id_hex(account_id))
+            .collect::<Result<Vec<_>, _>>()?;
+        if source_relays.is_empty() || source_relays.iter().all(is_local_relay_endpoint) {
+            let account_set = account_ids.iter().cloned().collect::<HashSet<_>>();
+            return Ok(self
+                .relay_events()?
+                .into_iter()
+                .filter(|record| {
+                    record.event.kind == kind
+                        && account_set.contains(&record.event.pubkey)
+                        && (source_relays.is_empty()
+                            || record
+                                .endpoints
+                                .iter()
+                                .any(|endpoint| source_relays.contains(endpoint)))
+                })
+                .collect());
+        }
+
+        let public_keys = account_ids
+            .iter()
+            .map(|account_id| PublicKey::parse(account_id).map_err(|_| AppError::InvalidPublicKey))
+            .collect::<Result<Vec<_>, _>>()?;
+        let relay_urls = relay_urls_from_endpoints(&source_relays)?;
+        let client = NostrSdkClient::builder().build();
+        for relay_url in &relay_urls {
+            client
+                .add_relay(relay_url.clone())
+                .await
+                .map_err(|e| AppError::RelayDirectory(format!("add relay: {e}")))?;
+            client
+                .connect_relay(relay_url.clone())
+                .await
+                .map_err(|e| AppError::RelayDirectory(format!("connect relay: {e}")))?;
+        }
+
+        let filter = Filter::new()
+            .authors(public_keys)
+            .kind(Kind::from(kind as u16))
+            .limit((account_ids.len() * 4).max(1));
+        let events = client
+            .fetch_events_from(relay_urls, filter, SDK_RELAY_LIST_FETCH_WAIT)
+            .await
+            .map_err(|e| AppError::RelayDirectory(format!("fetch user directory events: {e}")))?;
+        client.shutdown().await;
+
+        events
+            .into_iter()
+            .map(|event| {
+                NostrTransportEvent::from_nostr_event(&event)
+                    .map(|event| RelayEventRecord {
+                        endpoints: source_relays.to_vec(),
+                        event,
+                    })
+                    .map_err(|e| AppError::RelayDirectory(format!("map directory event: {e}")))
+            })
+            .collect()
+    }
+
+    fn directory_source_relays(
+        &self,
+        source_relays: &[TransportEndpoint],
+    ) -> Vec<TransportEndpoint> {
+        if !source_relays.is_empty() {
+            return source_relays.to_vec();
+        }
+        match &self.relay {
+            AppRelay::Local => Vec::new(),
+            AppRelay::Sdk { urls } => urls.iter().cloned().map(TransportEndpoint).collect(),
+        }
+    }
+
     fn open_account(&self, label: &str) -> Result<OpenAppAccount, AppError> {
         let state = self.load_state(label)?;
         let keys = self.account_home().load_signing_keys(label)?;
@@ -1008,20 +1343,40 @@ impl MarmotApp {
         Ok(KeyPackage(hex::decode(record.key_package_hex)?))
     }
 
-    fn member_key_package(&self, member_ref: &str) -> Result<KeyPackage, AppError> {
+    async fn member_key_package(&self, member_ref: &str) -> Result<KeyPackage, AppError> {
         if self.account_home().account(member_ref).is_ok() {
             return self.latest_key_package(member_ref);
         }
         let account_id = PublicKey::parse(member_ref)
             .map_err(|_| AppError::MissingKeyPackage(member_ref.to_owned()))?
             .to_hex();
-        let entry = self
-            .directory_entry_for_account_id(&account_id)?
-            .ok_or_else(|| AppError::MissingKeyPackage(account_id.clone()))?;
-        let key_package = entry
-            .key_package
-            .ok_or_else(|| AppError::MissingKeyPackage(account_id.clone()))?;
-        Ok(KeyPackage(hex::decode(key_package.key_package_hex)?))
+        if let Some(entry) = self.directory_entry_for_account_id(&account_id)? {
+            if let Some(key_package) = entry.key_package {
+                return Ok(KeyPackage(hex::decode(key_package.key_package_hex)?));
+            }
+            if !entry.relay_lists.key_package.relays.is_empty() {
+                let source_relays = entry
+                    .relay_lists
+                    .key_package
+                    .relays
+                    .iter()
+                    .cloned()
+                    .map(TransportEndpoint)
+                    .collect::<Vec<_>>();
+                let records = self
+                    .fetch_key_package_events_for_account_id(&account_id, &source_relays)
+                    .await?;
+                let mut fetched = latest_key_package_from_records(&account_id, records)?;
+                fetched.relay_lists = entry.relay_lists;
+                self.remember_directory_key_package(&fetched)?;
+                return Ok(fetched.key_package);
+            }
+        }
+
+        let fetched = self
+            .fetch_latest_key_package_for_account_id(&account_id, Vec::new())
+            .await?;
+        Ok(fetched.key_package)
     }
 
     fn member_id(&self, member_ref: &str) -> Result<MemberId, AppError> {
@@ -1042,7 +1397,7 @@ impl MarmotApp {
             .collect()
     }
 
-    fn directory_entries(&self) -> Result<Vec<DirectoryEntry>, AppError> {
+    fn directory_entries(&self) -> Result<Vec<UserDirectoryRecord>, AppError> {
         self.directory_cache()?.entries()
     }
 
@@ -1214,11 +1569,7 @@ impl MarmotApp {
     ) -> Result<(), AppError> {
         let mut entry = self
             .directory_entry_for_account_id(account_id_hex)?
-            .unwrap_or_else(|| DirectoryEntry {
-                account_id_hex: account_id_hex.to_owned(),
-                relay_lists: AccountRelayListStatus::empty(),
-                key_package: None,
-            });
+            .unwrap_or_else(|| self.empty_directory_record(account_id_hex));
         entry.account_id_hex = account_id_hex.to_owned();
         entry.relay_lists = relay_lists.clone();
         self.save_directory_entry(&entry)
@@ -1227,11 +1578,7 @@ impl MarmotApp {
     fn remember_directory_key_package(&self, fetched: &FetchedKeyPackage) -> Result<(), AppError> {
         let mut entry = self
             .directory_entry_for_account_id(&fetched.account_id_hex)?
-            .unwrap_or_else(|| DirectoryEntry {
-                account_id_hex: fetched.account_id_hex.clone(),
-                relay_lists: fetched.relay_lists.clone(),
-                key_package: None,
-            });
+            .unwrap_or_else(|| self.empty_directory_record(&fetched.account_id_hex));
         entry.account_id_hex = fetched.account_id_hex.clone();
         entry.relay_lists = fetched.relay_lists.clone();
         entry.key_package = Some(DirectoryKeyPackage {
@@ -1243,12 +1590,88 @@ impl MarmotApp {
         self.save_directory_entry(&entry)
     }
 
-    fn save_directory_entry(&self, entry: &DirectoryEntry) -> Result<(), AppError> {
-        self.directory_cache()?.put(entry)
+    fn remember_directory_user(&self, account_id_hex: &str) -> Result<(), AppError> {
+        let account_id_hex = parse_account_id_hex(account_id_hex)?;
+        let entry = self
+            .directory_entry_for_account_id(&account_id_hex)?
+            .unwrap_or_else(|| self.empty_directory_record(&account_id_hex));
+        self.save_directory_entry(&entry)
+    }
+
+    fn remember_directory_follow_list(
+        &self,
+        account_id_hex: &str,
+        follow_list: &FetchedFollowList,
+    ) -> Result<(), AppError> {
+        let mut entry = self
+            .directory_entry_for_account_id(account_id_hex)?
+            .unwrap_or_else(|| self.empty_directory_record(account_id_hex));
+        entry.follows = follow_list.follows.clone();
+        entry.follow_source_relays = follow_list.source_relays.clone();
+        self.save_directory_entry(&entry)?;
+        for follow in &follow_list.follows {
+            self.remember_directory_user(follow)?;
+        }
+        Ok(())
+    }
+
+    fn remember_directory_profile(
+        &self,
+        account_id_hex: &str,
+        profile: &UserProfileMetadata,
+    ) -> Result<(), AppError> {
+        let mut entry = self
+            .directory_entry_for_account_id(account_id_hex)?
+            .unwrap_or_else(|| self.empty_directory_record(account_id_hex));
+        entry.profile = Some(profile.clone());
+        self.save_directory_entry(&entry)
+    }
+
+    fn save_directory_entry(&self, entry: &UserDirectoryRecord) -> Result<(), AppError> {
+        let entry = self.hydrate_directory_record(entry.clone())?;
+        self.directory_cache()?.put(&entry)
     }
 
     fn directory_cache(&self) -> Result<DirectoryCache, AppError> {
         DirectoryCache::open(self.root.join(APP_CACHE_DB_FILE))
+    }
+
+    fn empty_directory_record(&self, account_id_hex: &str) -> UserDirectoryRecord {
+        UserDirectoryRecord {
+            account_id_hex: account_id_hex.to_owned(),
+            npub: npub_for_account_id_lossy(account_id_hex),
+            local_account: self.local_account_for_id(account_id_hex),
+            profile: None,
+            follows: Vec::new(),
+            follow_source_relays: Vec::new(),
+            relay_lists: AccountRelayListStatus::empty(),
+            key_package: None,
+        }
+    }
+
+    fn hydrate_directory_record(
+        &self,
+        mut entry: UserDirectoryRecord,
+    ) -> Result<UserDirectoryRecord, AppError> {
+        entry.account_id_hex = parse_account_id_hex(&entry.account_id_hex)?;
+        entry.npub = npub_for_account_id(&entry.account_id_hex)?;
+        entry.local_account = self.local_account_for_id(&entry.account_id_hex);
+        entry.follows = normalize_account_ids(entry.follows)?;
+        entry.follow_source_relays.sort();
+        entry.follow_source_relays.dedup();
+        Ok(entry)
+    }
+
+    fn local_account_for_id(&self, account_id_hex: &str) -> Option<UserDirectoryLocalAccount> {
+        self.account_home()
+            .accounts()
+            .ok()?
+            .into_iter()
+            .find(|account| account.account_id_hex == account_id_hex)
+            .map(|account| UserDirectoryLocalAccount {
+                label: account.label,
+                local_signing: account.local_signing,
+            })
     }
 
     fn relay_client_for_endpoints(
@@ -1295,7 +1718,7 @@ impl AppClient {
         validate_group_profile(name, "")?;
         let mut members = Vec::with_capacity(member_refs.len());
         for member in member_refs {
-            members.push(self.app.member_key_package(member)?);
+            members.push(self.app.member_key_package(member).await?);
         }
 
         let (group_id, effects) = self
@@ -1342,7 +1765,7 @@ impl AppClient {
         self.ensure_group(group_id)?;
         let mut key_packages = Vec::with_capacity(member_refs.len());
         for member in member_refs {
-            key_packages.push(self.app.member_key_package(member)?);
+            key_packages.push(self.app.member_key_package(member).await?);
         }
 
         self.runtime.sync_transport_groups(None).await?;
@@ -1919,6 +2342,264 @@ fn key_package_from_record(record: RelayEventRecord) -> Result<FetchedKeyPackage
 
 fn key_package_id(key_package: &KeyPackage) -> String {
     hex::encode(Sha256::digest(&key_package.0))
+}
+
+fn publish_endpoints_from_bootstrap(
+    bootstrap: &AccountRelayListBootstrap,
+) -> Vec<TransportEndpoint> {
+    if bootstrap.bootstrap_relays.is_empty() {
+        bootstrap.default_relays.clone()
+    } else {
+        bootstrap.bootstrap_relays.clone()
+    }
+}
+
+fn profile_content_json(profile: &UserProfileMetadata) -> serde_json::Value {
+    let mut value = serde_json::Map::new();
+    if let Some(name) = profile.name.as_ref().filter(|value| !value.is_empty()) {
+        value.insert("name".to_owned(), serde_json::Value::String(name.clone()));
+    }
+    if let Some(display_name) = profile
+        .display_name
+        .as_ref()
+        .filter(|value| !value.is_empty())
+    {
+        value.insert(
+            "display_name".to_owned(),
+            serde_json::Value::String(display_name.clone()),
+        );
+    }
+    if let Some(about) = profile.about.as_ref().filter(|value| !value.is_empty()) {
+        value.insert("about".to_owned(), serde_json::Value::String(about.clone()));
+    }
+    if let Some(picture) = profile.picture.as_ref().filter(|value| !value.is_empty()) {
+        value.insert(
+            "picture".to_owned(),
+            serde_json::Value::String(picture.clone()),
+        );
+    }
+    if let Some(nip05) = profile.nip05.as_ref().filter(|value| !value.is_empty()) {
+        value.insert("nip05".to_owned(), serde_json::Value::String(nip05.clone()));
+    }
+    serde_json::Value::Object(value)
+}
+
+fn latest_follow_list_from_records(
+    account_id_hex: &str,
+    mut records: Vec<RelayEventRecord>,
+) -> Option<FetchedFollowList> {
+    records.sort_by(|a, b| {
+        a.event
+            .created_at
+            .cmp(&b.event.created_at)
+            .then_with(|| a.event.id.cmp(&b.event.id))
+    });
+    records.into_iter().rev().find_map(|record| {
+        if record.event.kind == KIND_NOSTR_CONTACT_LIST && record.event.pubkey == account_id_hex {
+            Some(follow_list_from_record(record))
+        } else {
+            None
+        }
+    })
+}
+
+fn follow_list_from_record(record: RelayEventRecord) -> FetchedFollowList {
+    let mut follows = record
+        .event
+        .tags
+        .iter()
+        .filter(|tag| tag.first().is_some_and(|name| name == "p"))
+        .filter_map(|tag| tag.get(1))
+        .filter_map(|value| parse_account_id_hex(value).ok())
+        .collect::<Vec<_>>();
+    follows.sort();
+    follows.dedup();
+    FetchedFollowList {
+        follows,
+        source_relays: source_relays_from_record(&record),
+    }
+}
+
+fn latest_profiles_from_records(
+    mut records: Vec<RelayEventRecord>,
+) -> HashMap<String, UserProfileMetadata> {
+    records.sort_by(|a, b| {
+        a.event
+            .created_at
+            .cmp(&b.event.created_at)
+            .then_with(|| a.event.id.cmp(&b.event.id))
+    });
+    let mut profiles = HashMap::new();
+    for record in records {
+        if record.event.kind == KIND_NOSTR_METADATA
+            && let Some(profile) = profile_from_record(record)
+        {
+            profiles.insert(profile.0, profile.1);
+        }
+    }
+    profiles
+}
+
+fn profile_from_record(record: RelayEventRecord) -> Option<(String, UserProfileMetadata)> {
+    let content = serde_json::from_str::<serde_json::Value>(&record.event.content).ok()?;
+    Some((
+        record.event.pubkey.clone(),
+        UserProfileMetadata {
+            name: string_field(&content, "name"),
+            display_name: string_field(&content, "display_name")
+                .or_else(|| string_field(&content, "displayName")),
+            about: string_field(&content, "about"),
+            picture: string_field(&content, "picture"),
+            nip05: string_field(&content, "nip05"),
+            created_at: record.event.created_at,
+            source_relays: source_relays_from_record(&record),
+        },
+    ))
+}
+
+fn string_field(value: &serde_json::Value, field: &str) -> Option<String> {
+    value
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn source_relays_from_record(record: &RelayEventRecord) -> Vec<String> {
+    let mut relays = record
+        .endpoints
+        .iter()
+        .map(|endpoint| endpoint.0.clone())
+        .collect::<Vec<_>>();
+    relays.sort();
+    relays.dedup();
+    relays
+}
+
+fn directory_search_radii(
+    records: &HashMap<String, UserDirectoryRecord>,
+    searcher_account_id_hex: &str,
+    radius_end: u8,
+) -> Vec<(String, u8)> {
+    let mut result = Vec::new();
+    let mut seen = HashSet::new();
+    let mut frontier = vec![searcher_account_id_hex.to_owned()];
+    for radius in 0..=radius_end {
+        let mut next = Vec::new();
+        frontier.sort();
+        frontier.dedup();
+        for account_id in frontier {
+            if !seen.insert(account_id.clone()) {
+                continue;
+            }
+            result.push((account_id.clone(), radius));
+            if let Some(record) = records.get(&account_id) {
+                next.extend(record.follows.iter().cloned());
+            }
+        }
+        frontier = next;
+    }
+    result
+}
+
+#[derive(Clone, Debug)]
+struct UserRecordMatch {
+    field: String,
+    quality: String,
+}
+
+fn user_record_match(record: &UserDirectoryRecord, query: &str) -> Option<UserRecordMatch> {
+    let mut candidates = vec![
+        ("npub", record.npub.as_str()),
+        ("pubkey", record.account_id_hex.as_str()),
+    ];
+    if let Some(profile) = &record.profile {
+        if let Some(name) = profile.name.as_deref() {
+            candidates.push(("name", name));
+        }
+        if let Some(nip05) = profile.nip05.as_deref() {
+            candidates.push(("nip05", nip05));
+        }
+        if let Some(display_name) = profile.display_name.as_deref() {
+            candidates.push(("display_name", display_name));
+        }
+        if let Some(about) = profile.about.as_deref() {
+            candidates.push(("about", about));
+        }
+    }
+
+    candidates
+        .into_iter()
+        .filter_map(|(field, value)| {
+            let value = value.to_lowercase();
+            let quality = if value == query {
+                "exact"
+            } else if value.starts_with(query) {
+                "prefix"
+            } else if value.contains(query) {
+                "contains"
+            } else {
+                return None;
+            };
+            Some(UserRecordMatch {
+                field: field.to_owned(),
+                quality: quality.to_owned(),
+            })
+        })
+        .min_by(|a, b| {
+            match_quality_rank(&a.quality)
+                .cmp(&match_quality_rank(&b.quality))
+                .then_with(|| field_rank(&a.field).cmp(&field_rank(&b.field)))
+        })
+}
+
+fn match_quality_rank(quality: &str) -> u8 {
+    match quality {
+        "exact" => 0,
+        "prefix" => 1,
+        "contains" => 2,
+        _ => 3,
+    }
+}
+
+fn field_rank(field: &str) -> u8 {
+    match field {
+        "name" => 0,
+        "nip05" => 1,
+        "display_name" => 2,
+        "about" => 3,
+        "npub" => 4,
+        "pubkey" => 5,
+        _ => 6,
+    }
+}
+
+fn parse_account_id_hex(value: &str) -> Result<String, AppError> {
+    PublicKey::parse(value)
+        .map(|pubkey| pubkey.to_hex())
+        .map_err(|_| AppError::InvalidPublicKey)
+}
+
+fn normalize_account_ids(values: Vec<String>) -> Result<Vec<String>, AppError> {
+    let mut values = values
+        .into_iter()
+        .map(|value| parse_account_id_hex(&value))
+        .collect::<Result<Vec<_>, _>>()?;
+    values.sort();
+    values.dedup();
+    Ok(values)
+}
+
+fn npub_for_account_id(account_id_hex: &str) -> Result<String, AppError> {
+    PublicKey::parse(account_id_hex)
+        .map_err(|_| AppError::InvalidPublicKey)?
+        .to_bech32()
+        .map_err(|_| AppError::InvalidPublicKey)
+}
+
+fn npub_for_account_id_lossy(account_id_hex: &str) -> String {
+    npub_for_account_id(account_id_hex).unwrap_or_else(|_| account_id_hex.to_owned())
 }
 
 fn sqlite_file_requires_key(path: &Path) -> bool {

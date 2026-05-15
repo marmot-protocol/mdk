@@ -47,6 +47,11 @@ It should track:
 This is close to the shape whitenoise-rs already has: users and accounts are different records, with relationship and
 relay data kept fresh in the background.
 
+The first Darkmatter implementation keeps that scope bounded. It refreshes contact-list events for local signing
+accounts, caches direct follows and profile metadata, and supports radius-bounded search over cached follow edges for app
+surfaces. It does not try to crawl or score the full Nostr social graph, and the CLI does not expose a separate user
+directory browsing command.
+
 ### Account Bootstrap
 
 When creating or signing in to a Nostr-backed Marmot account, the app must ensure required account-published state

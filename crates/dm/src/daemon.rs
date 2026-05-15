@@ -65,6 +65,9 @@ pub struct DaemonSyncReport {
     pub events: usize,
     pub joined_groups: usize,
     pub messages: usize,
+    pub directory_accounts: usize,
+    pub directory_follows: usize,
+    pub directory_profiles: usize,
     pub errors: Vec<String>,
 }
 
@@ -578,6 +581,9 @@ async fn sync_accounts(defaults: &DaemonDefaults, account: Option<String>) -> Da
         events: 0,
         joined_groups: 0,
         messages: 0,
+        directory_accounts: 0,
+        directory_follows: 0,
+        directory_profiles: 0,
         errors: Vec::new(),
     };
 
@@ -617,6 +623,21 @@ async fn sync_accounts(defaults: &DaemonDefaults, account: Option<String>) -> Da
                 }
                 Err(err) => {
                     report.errors.push(err.to_string());
+                }
+            }
+            match app
+                .refresh_user_directory_for_account_id(&account.account_id_hex, Vec::new())
+                .await
+            {
+                Ok(refresh) => {
+                    report.directory_accounts += 1;
+                    report.directory_follows += refresh.follow_count;
+                    report.directory_profiles += refresh.profile_count;
+                }
+                Err(err) => {
+                    report
+                        .errors
+                        .push(format!("directory refresh failed: {err}"));
                 }
             }
         }

@@ -429,6 +429,7 @@ async fn account_command(
             default_relays,
             bootstrap_relays,
         } => {
+            let directory_bootstrap_relays = bootstrap_relays.clone();
             let imports_private_key = identity.as_deref().is_some_and(is_nostr_secret);
             let account = create_nostr_account(account_home, identity)?;
             let relay_lists = match account.local_signing {
@@ -529,6 +530,12 @@ async fn account_command(
                     .await?
                 }
             };
+            warm_user_directory_after_account_setup(
+                app,
+                &account.account_id_hex,
+                directory_bootstrap_relays,
+            )
+            .await;
             Ok(CommandOutput {
                 plain: format!(
                     "created account {} local-signing={} relay-lists={}",
@@ -617,6 +624,19 @@ async fn account_command(
             })
         }
     }
+}
+
+async fn warm_user_directory_after_account_setup(
+    app: &MarmotApp,
+    account_id_hex: &str,
+    bootstrap_relays: Vec<String>,
+) {
+    let Ok(bootstrap_relays) = relay_endpoints(bootstrap_relays) else {
+        return;
+    };
+    let _ = app
+        .refresh_user_directory_for_account_id(account_id_hex, bootstrap_relays)
+        .await;
 }
 
 async fn key_package_command(
