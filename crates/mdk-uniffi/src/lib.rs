@@ -740,7 +740,11 @@ impl Mdk {
             tags_443,
             hash_ref,
             d_tag,
-        } = mdk.create_key_package_for_event_with_options(&pubkey, relay_urls, options.into())?;
+        } = mdk.create_key_package_for_event_with_options(
+            &pubkey,
+            relay_urls,
+            options.try_into()?,
+        )?;
 
         let tags: Vec<Vec<String>> = tags.iter().map(|tag| tag.as_slice().to_vec()).collect();
         let tags_legacy: Vec<Vec<String>> =
@@ -1535,17 +1539,30 @@ pub struct KeyPackageOptions {
     /// the NIP-33 addressable slot stable — relays replace the previous event under
     /// the same `(kind, pubkey, d)` coordinate.
     ///
-    /// Must be a non-empty, ASCII-hex string of at most 128 characters. When `None`,
-    /// a fresh random 32-byte hex value is generated (current default behavior).
+    /// Must be exactly 64 ASCII hex digits (per MIP-00). Validation runs at the FFI
+    /// boundary; malformed input surfaces as `MdkUniffiError::InvalidInput` before
+    /// crossing into `mdk_core`, matching how `parse_public_key` / `parse_relay_urls`
+    /// report parameter errors. When `None`, a fresh random 32-byte hex value is
+    /// generated (current default behavior).
     pub existing_d_tag: Option<String>,
 }
 
-impl From<KeyPackageOptions> for mdk_core::key_packages::KeyPackageOptions {
-    fn from(opts: KeyPackageOptions) -> Self {
-        Self {
+impl TryFrom<KeyPackageOptions> for mdk_core::key_packages::KeyPackageOptions {
+    type Error = MdkUniffiError;
+
+    fn try_from(opts: KeyPackageOptions) -> Result<Self, Self::Error> {
+        // Pre-validate at the FFI boundary so a malformed `existing_d_tag` surfaces
+        // as `InvalidInput` (parameter error) rather than as a generic `Mdk` error
+        // bubbling out of core. Delegates to the canonical core validator so the
+        // accepted-value rule stays in one place.
+        if let Some(d) = opts.existing_d_tag.as_deref() {
+            mdk_core::key_packages::validate_existing_d_tag(d)
+                .map_err(|e| MdkUniffiError::InvalidInput(e.to_string()))?;
+        }
+        Ok(Self {
             protected: opts.protected,
             existing_d_tag: opts.existing_d_tag,
-        }
+        })
     }
 }
 

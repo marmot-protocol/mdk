@@ -17,12 +17,13 @@ use crate::constant::{
 use crate::error::Error;
 use crate::util::{ContentEncoding, NostrTagFormat, decode_content, encode_content};
 
-/// Maximum allowed length for a caller-supplied `existing_d_tag`.
+/// Required length (in hex chars) of a `d` tag value on a kind:30443 KeyPackage event.
 ///
-/// The generated form is 64 hex chars (32 bytes); the cap is set well above that
-/// to be permissive for callers that have already published longer slot IDs in the
-/// wild, while still rejecting pathological inputs (multi-KB strings, etc.).
-const MAX_EXISTING_D_TAG_LEN: usize = 128;
+/// Per MIP-00, the `d` tag is a 32-byte random identifier, hex-encoded — exactly 64
+/// characters. Both the generated and the caller-supplied forms must match this length
+/// so that `parse_key_package` (which enforces the same MIP-00 constraint) can round-trip
+/// the value back from a published event.
+const D_TAG_HEX_LEN: usize = 64;
 
 /// Data required to publish an MLS Key Package as a Nostr event.
 /// Contains the payload and tags for both the current (kind:30443)
@@ -84,10 +85,10 @@ pub struct KeyPackageOptions {
     /// When `None`, a fresh random 32-byte hex value is generated (current default
     /// behavior).
     ///
-    /// The supplied value must be:
-    /// - Non-empty
-    /// - At most 128 characters
-    /// - Composed entirely of ASCII hex digits (`0`-`9`, `a`-`f`, `A`-`F`)
+    /// The supplied value must be exactly 64 ASCII hex digits (`0`-`9`, `a`-`f`, `A`-`F`).
+    /// This matches the generated form and the MIP-00 validation enforced by
+    /// [`MDK::parse_key_package`], so that a `d` tag chosen here round-trips through
+    /// publication and re-parsing without rejection.
     ///
     /// Validation failures surface as [`Error::KeyPackage`].
     pub existing_d_tag: Option<String>,
@@ -95,20 +96,23 @@ pub struct KeyPackageOptions {
 
 /// Validates a caller-supplied `existing_d_tag` value.
 ///
-/// Rules (see [`KeyPackageOptions::existing_d_tag`] for context):
+/// Rules:
 /// - non-empty
-/// - length ≤ `MAX_EXISTING_D_TAG_LEN`
+/// - exactly [`D_TAG_HEX_LEN`] (64) characters
 /// - ASCII hex digits only
-fn validate_existing_d_tag(d: &str) -> Result<(), Error> {
+///
+/// Mirrors the MIP-00 `d` tag validation performed by [`MDK::parse_key_package`] so that
+/// caller-supplied values round-trip through publication and re-parsing without rejection.
+pub fn validate_existing_d_tag(d: &str) -> Result<(), Error> {
     if d.is_empty() {
         return Err(Error::KeyPackage(
             "existing_d_tag must not be empty".to_string(),
         ));
     }
-    if d.len() > MAX_EXISTING_D_TAG_LEN {
+    if d.len() != D_TAG_HEX_LEN {
         return Err(Error::KeyPackage(format!(
-            "existing_d_tag must be at most {} characters (got {})",
-            MAX_EXISTING_D_TAG_LEN,
+            "existing_d_tag must be exactly {} hex characters (got {})",
+            D_TAG_HEX_LEN,
             d.len()
         )));
     }
@@ -1474,28 +1478,36 @@ mod tests {
         assert!(matches!(result, Err(Error::KeyPackage(ref msg)) if msg.contains("hex")));
     }
 
-    /// Validation rejects an `existing_d_tag` exceeding the length cap.
+    /// Validation rejects any `existing_d_tag` whose length is not exactly
+    /// [`D_TAG_HEX_LEN`] — both too short and too long must fail. This guards the
+    /// round-trip with [`MDK::parse_key_package`], which enforces the same MIP-00
+    /// length constraint when parsing a published event.
     #[test]
-    fn test_existing_d_tag_too_long_is_rejected() {
+    fn test_existing_d_tag_wrong_length_is_rejected() {
         let mdk = create_test_mdk();
         let test_pubkey =
             PublicKey::from_hex("884704bd421671e01c13f854d2ce23ce2a5bfe9562f4f297ad2bc921ba30c3a6")
                 .unwrap();
         let relays = vec![RelayUrl::parse("wss://relay.example.com").unwrap()];
 
-        // One character over MAX_EXISTING_D_TAG_LEN (128), all valid hex.
-        let too_long = "a".repeat(MAX_EXISTING_D_TAG_LEN + 1);
+        let too_short = "a".repeat(D_TAG_HEX_LEN - 1);
+        let too_long = "a".repeat(D_TAG_HEX_LEN + 1);
 
-        let result = mdk.create_key_package_for_event_with_options(
-            &test_pubkey,
-            relays,
-            KeyPackageOptions {
-                existing_d_tag: Some(too_long),
-                ..Default::default()
-            },
-        );
+        for bad in [too_short, too_long] {
+            let result = mdk.create_key_package_for_event_with_options(
+                &test_pubkey,
+                relays.clone(),
+                KeyPackageOptions {
+                    existing_d_tag: Some(bad),
+                    ..Default::default()
+                },
+            );
 
-        assert!(matches!(result, Err(Error::KeyPackage(ref msg)) if msg.contains("128")));
+            assert!(matches!(
+                result,
+                Err(Error::KeyPackage(ref msg)) if msg.contains("64") && msg.contains("hex characters")
+            ));
+        }
     }
 
     /// A reused `existing_d_tag` must combine cleanly with `protected = true`:
