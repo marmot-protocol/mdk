@@ -27,11 +27,14 @@
 
 ### Breaking changes
 
+- **`Mdk::create_key_package_for_event_with_options` signature changed**: the third parameter is now `options: KeyPackageOptions` (a new UniFFI record) instead of `protected: bool`. The record carries both the existing `protected` flag and a new `existing_d_tag: Option<String>` field for `d` tag reuse during KeyPackage rotation. Binding consumers must update their call sites — replace e.g. `mdk.createKeyPackageForEventWithOptions(pubkey, relays, true)` with `mdk.createKeyPackageForEventWithOptions(pubkey, relays, KeyPackageOptions(protected = true, existingDTag = null))` (Kotlin) / equivalent in Swift / Python. Malformed `existing_d_tag` (non-empty / non-hex / wrong length) surfaces as `MdkUniffiError.InvalidInput` at the FFI boundary, matching how other parameter parsers in the binding report errors. `create_key_package_for_event` (the no-options variant) is unchanged. ([#303](https://github.com/marmot-protocol/mdk/pull/303))
+
 ### Changed
 
 ### Added
 
 - Added UniFFI bindings for group capability inspection and upgrades: `group_member_capabilities`, `group_capability_upgrade_status`, and `upgrade_group_capabilities`, plus binding-safe records and enums for member capability snapshots and upgrade readiness. ([#301](https://github.com/marmot-protocol/mdk/pull/301))
+- Added the `KeyPackageOptions` UniFFI record (fields: `protected: Boolean`, `existing_d_tag: Option<String>`). Pass a previously stored `d_tag` (the value returned in `KeyPackageResult.d_tag`) via `existing_d_tag` to rotate a KeyPackage while keeping the NIP-33 addressable slot stable — no more post-editing the tag list before signing. The value is validated at the FFI boundary (exactly 64 ASCII hex characters per MIP-00) so callers see `MdkUniffiError.InvalidInput` directly on malformed input. ([#303](https://github.com/marmot-protocol/mdk/pull/303))
 
 ### Fixed
 
