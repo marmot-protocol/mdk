@@ -21,8 +21,8 @@ use cgka_traits::{
     TransportEndpointReceipt, TransportGroupSubscription, TransportPublishTarget,
 };
 use marmot_account::{
-    AccountDeviceRuntime, KeyPackagePublication, KeyPackagePublishError, KeyPackagePublisher,
-    TransportRoutingError, TransportRoutingPolicy,
+    AccountDeviceRuntime, AccountHome, AccountHomeError, AccountSummary, KeyPackagePublication,
+    KeyPackagePublishError, KeyPackagePublisher, TransportRoutingError, TransportRoutingPolicy,
 };
 use nostr_sdk::prelude::Client as NostrSdkClient;
 use serde::{Deserialize, Serialize};
@@ -92,6 +92,8 @@ pub enum LabError {
     Json(#[from] serde_json::Error),
     #[error(transparent)]
     Hex(#[from] hex::FromHexError),
+    #[error(transparent)]
+    AccountHome(#[from] AccountHomeError),
     #[error("unknown account: {0}")]
     UnknownAccount(String),
     #[error("no published key package for account: {0}")]
@@ -104,7 +106,7 @@ pub enum LabError {
     Invariant(String),
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone)]
 struct AccountProfile {
     label: String,
     account_id_hex: String,
@@ -175,30 +177,17 @@ impl Lab {
     }
 
     pub async fn init_account(&self, label: &str) -> Result<MemberId, LabError> {
+        let keys = deterministic_nostr_keys(label.as_bytes());
         self.ensure_layout()?;
-        let account_dir = self.account_dir(label);
-        fs::create_dir_all(&account_dir)?;
-
-        let account_id = self.account_id(label);
-        let profile = AccountProfile {
-            label: label.to_owned(),
-            account_id_hex: hex::encode(account_id.as_slice()),
-            inbox_endpoint: self.account_inbox_endpoint(label).0,
+        let account = match self.account_home().account(label) {
+            Ok(account) => account,
+            Err(AccountHomeError::UnknownAccount(_)) => self
+                .account_home()
+                .import_account(label, &keys.secret_key().to_secret_hex())?,
+            Err(err) => return Err(err.into()),
         };
-        write_json(self.profile_path(label), &profile)?;
-
-        if !self.state_path(label).exists() {
-            write_json(
-                self.state_path(label),
-                &AccountState {
-                    label: label.to_owned(),
-                    seen_events: Vec::new(),
-                    groups: Vec::new(),
-                },
-            )?;
-        }
-
-        Ok(account_id)
+        self.ensure_account_state(label)?;
+        Ok(MemberId::new(hex::decode(account.account_id_hex)?))
     }
 
     pub async fn client(&self, label: &str) -> Result<LabClient, LabError> {
@@ -262,11 +251,13 @@ impl Lab {
     }
 
     pub fn status(&self, label: &str) -> Result<serde_json::Value, LabError> {
+        let account = self.account_home().account(label)?;
+        self.ensure_account_state(label)?;
         let state = self.load_state(label)?;
         Ok(serde_json::json!({
             "label": state.label,
             "transport": self.transport_label(),
-            "account_id": hex::encode(self.account_id(label).as_slice()),
+            "account_id": account.account_id_hex,
             "inbox_endpoint": self.account_inbox_endpoint(label).0,
             "groups": state.groups,
             "seen_events": state.seen_events.len(),
@@ -275,14 +266,14 @@ impl Lab {
 
     fn open_account(&self, label: &str) -> Result<OpenLabAccount, LabError> {
         let state = self.load_state(label)?;
-        let keys = deterministic_nostr_keys(label.as_bytes());
-        let account_id = self.account_id(label);
+        let keys = self.account_home().load_signing_keys(label)?;
+        let account_id = MemberId::new(keys.public_key().to_bytes());
         let peeler =
             NostrMlsPeeler::new(keys.public_key().to_hex()).with_welcome_signer(keys.clone());
         let session = AccountDeviceSession::open(
             SessionConfig::new(
                 self.account_dir(label).join("session.sqlite"),
-                SqlCipherKey::new(format!("marmot-lab-local-db-key-v1::{label}"))?,
+                self.sqlcipher_key(label, &keys)?,
                 account_id.as_slice().to_vec(),
                 Box::new(peeler),
             )
@@ -352,14 +343,17 @@ impl Lab {
     }
 
     async fn ensure_account(&self, label: &str) -> Result<(), LabError> {
-        if !self.state_path(label).exists() {
-            self.init_account(label).await?;
+        match self.account_home().account(label) {
+            Ok(_) => self.ensure_account_state(label)?,
+            Err(AccountHomeError::UnknownAccount(_)) => {
+                self.init_account(label).await?;
+            }
+            Err(err) => return Err(err.into()),
         }
         Ok(())
     }
 
     fn ensure_layout(&self) -> Result<(), LabError> {
-        fs::create_dir_all(self.accounts_dir())?;
         fs::create_dir_all(self.relay_dir().join(ACCOUNT_PROFILE_DIR))?;
         fs::create_dir_all(self.relay_dir().join(KEY_PACKAGE_DIR))?;
         fs::create_dir_all(self.relay_dir().join(EVENT_DIR))?;
@@ -379,19 +373,11 @@ impl Lab {
     }
 
     fn profiles(&self) -> Result<Vec<AccountProfile>, LabError> {
-        let dir = self.relay_dir().join(ACCOUNT_PROFILE_DIR);
-        if !dir.exists() {
-            return Ok(Vec::new());
-        }
-        let mut profiles = Vec::new();
-        for entry in fs::read_dir(dir)? {
-            let path = entry?.path();
-            if path.extension().and_then(|s| s.to_str()) == Some("json") {
-                profiles.push(read_json(path)?);
-            }
-        }
-        profiles.sort_by(|a: &AccountProfile, b| a.label.cmp(&b.label));
-        Ok(profiles)
+        self.account_home()
+            .accounts()?
+            .into_iter()
+            .map(|account| Ok(self.profile_for_account(account)))
+            .collect()
     }
 
     fn profiles_by_id(&self) -> Result<HashMap<String, String>, LabError> {
@@ -430,12 +416,45 @@ impl Lab {
         write_json(self.state_path(&state.label), state)
     }
 
-    fn account_id(&self, label: &str) -> MemberId {
-        MemberId::new(
-            deterministic_nostr_keys(label.as_bytes())
-                .public_key()
-                .to_bytes(),
-        )
+    fn ensure_account_state(&self, label: &str) -> Result<(), LabError> {
+        if !self.state_path(label).exists() {
+            write_json(
+                self.state_path(label),
+                &AccountState {
+                    label: label.to_owned(),
+                    seen_events: Vec::new(),
+                    groups: Vec::new(),
+                },
+            )?;
+        }
+        Ok(())
+    }
+
+    fn profile_for_account(&self, account: AccountSummary) -> AccountProfile {
+        AccountProfile {
+            inbox_endpoint: self.account_inbox_endpoint(&account.label).0,
+            label: account.label,
+            account_id_hex: account.account_id_hex,
+        }
+    }
+
+    fn sqlcipher_key(&self, label: &str, keys: &nostr::Keys) -> Result<SqlCipherKey, LabError> {
+        if keys.secret_key().to_secret_hex()
+            == deterministic_nostr_keys(label.as_bytes())
+                .secret_key()
+                .to_secret_hex()
+        {
+            return Ok(SqlCipherKey::new(format!(
+                "marmot-lab-local-db-key-v1::{label}"
+            ))?);
+        }
+
+        let mut hasher = Sha256::new();
+        hasher.update(b"darkmatter-cli-sqlcipher-key-v1");
+        hasher.update(label.as_bytes());
+        hasher.update(keys.public_key().to_bytes());
+        hasher.update(keys.secret_key().to_secret_bytes());
+        Ok(SqlCipherKey::new(hex::encode(hasher.finalize()))?)
     }
 
     fn account_inbox_endpoint(&self, label: &str) -> TransportEndpoint {
@@ -469,26 +488,20 @@ impl Lab {
         }
     }
 
-    fn accounts_dir(&self) -> PathBuf {
-        self.root.join("accounts")
-    }
-
     fn account_dir(&self, label: &str) -> PathBuf {
-        self.accounts_dir().join(label)
+        self.account_home().account_dir(label)
     }
 
     fn state_path(&self, label: &str) -> PathBuf {
         self.account_dir(label).join(ACCOUNT_STATE_FILE)
     }
 
-    fn profile_path(&self, label: &str) -> PathBuf {
-        self.relay_dir()
-            .join(ACCOUNT_PROFILE_DIR)
-            .join(format!("{label}.json"))
-    }
-
     fn relay_dir(&self) -> PathBuf {
         self.root.join("relay")
+    }
+
+    fn account_home(&self) -> AccountHome {
+        AccountHome::open(&self.root)
     }
 }
 

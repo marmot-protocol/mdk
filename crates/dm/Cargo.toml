@@ -1,0 +1,24 @@
+[package]
+name = "darkmatter-cli"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "dm"
+path = "src/main.rs"
+
+[dependencies]
+cgka-traits.workspace = true
+clap.workspace = true
+hex.workspace = true
+marmot-account.workspace = true
+marmot-app.workspace = true
+nostr.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -29,6 +29,7 @@ use openmls::prelude::{
     ProcessedMessageContent, Proposal, ProtocolMessage, Sender, ValidationError,
 };
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use tls_codec::{Deserialize as _, Serialize as _};
 
 const MAX_CONVERGENCE_REPROCESSING_PASSES: usize = 16;
@@ -640,6 +641,9 @@ impl<S: StorageProvider> Engine<S> {
                 group_id,
                 key_packages,
             } => self.do_send_invite(group_id, key_packages).await,
+            SendIntent::RemoveMembers { group_id, members } => {
+                self.do_send_remove_members(group_id, members).await
+            }
             SendIntent::Leave { group_id } => self.do_send_leave(group_id).await,
             SendIntent::UpdateGroupData {
                 group_id,
@@ -1031,6 +1035,172 @@ impl<S: StorageProvider> Engine<S> {
         })
     }
 
+    async fn do_send_remove_members(
+        &mut self,
+        group_id: GroupId,
+        members: Vec<MemberId>,
+    ) -> Result<SendResult, EngineError> {
+        let mut target_set = HashSet::new();
+        let mut unique_targets = Vec::new();
+        for member in members {
+            if target_set.insert(member.clone()) {
+                unique_targets.push(member);
+            }
+        }
+        if unique_targets.is_empty() {
+            return Err(EngineError::Other(
+                "remove requires at least one member".into(),
+            ));
+        }
+        if unique_targets
+            .iter()
+            .any(|member| member == self.identity.self_id())
+        {
+            return Err(EngineError::Other(
+                "use SendIntent::Leave to remove the local member".into(),
+            ));
+        }
+
+        let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
+        let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
+        let mut mls_group = MlsGroup::load(
+            <EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(&provider),
+            &mls_gid,
+        )
+        .map_err(|e| EngineError::Backend(format!("load: {e:?}")))?
+        .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
+
+        if let Some(state) = self.epoch_manager.state(&group_id)
+            && !matches!(state, EpochState::Stable { .. })
+        {
+            return Err(EngineError::InvalidTransition(
+                cgka_traits::engine_state::InvalidTransition {
+                    from: state.name(),
+                    to: "RemoveMembers",
+                    reason: "remove members requires Stable",
+                },
+            ));
+        }
+
+        let existing = self.storage.get_group(&group_id)?;
+        let self_pubkey = crate::group_data::admin_pubkey_from_member_id(self.identity.self_id())?;
+        let admins = crate::group_data::admins_of_group(&mls_group)?;
+        if !admins.iter().any(|admin| admin == &self_pubkey) {
+            return Err(EngineError::NotGroupAdmin {
+                group_id: group_id.clone(),
+            });
+        }
+
+        let mut leaf_indices = Vec::with_capacity(unique_targets.len());
+        let mut found = HashSet::new();
+        for member in mls_group.members() {
+            let basic = BasicCredential::try_from(member.credential)
+                .map_err(|e| EngineError::Backend(format!("credential: {e:?}")))?;
+            let member_id = MemberId::new(basic.identity().to_vec());
+            if target_set.contains(&member_id) {
+                leaf_indices.push(member.index);
+                found.insert(member_id);
+            }
+        }
+        for member in &unique_targets {
+            if !found.contains(member) {
+                return Err(EngineError::UnknownMember {
+                    group_id: group_id.clone(),
+                    member: member.clone(),
+                });
+            }
+        }
+
+        let target_admins = unique_targets
+            .iter()
+            .filter_map(|member| crate::group_data::admin_pubkey_from_member_id(member).ok())
+            .collect::<Vec<_>>();
+        if admins
+            .iter()
+            .all(|admin| target_admins.iter().any(|target| target == admin))
+        {
+            return Err(EngineError::AdminDepletion {
+                group_id: group_id.clone(),
+            });
+        }
+
+        let pre_commit_epoch = EpochId(mls_group.epoch().as_u64());
+        let recovery_snapshot =
+            self.fork_recovery
+                .create_snapshot(&self.storage, &group_id, pre_commit_epoch)?;
+        self.epoch_manager
+            .record_committed_from(&group_id, pre_commit_epoch);
+        let pre_commit_ctx =
+            crate::group_lifecycle::build_group_context_snapshot(&mls_group, &provider)?;
+
+        let (commit_out, _welcome_opt, _gi) = mls_group
+            .remove_members(&provider, &self.identity.signer, &leaf_indices)
+            .map_err(|e| EngineError::Backend(format!("remove_members: {e:?}")))?;
+
+        let commit_bytes = commit_out
+            .tls_serialize_detached()
+            .map_err(|e| EngineError::Serialize(format!("{e:?}")))?;
+        let commit_msg = self
+            .peeler
+            .wrap_group_message(
+                &EncryptedPayload {
+                    ciphertext: commit_bytes.clone(),
+                    aad: vec![],
+                },
+                &pre_commit_ctx,
+            )
+            .await
+            .map_err(EngineError::Peeler)?;
+        let commit_msg = TransportMessage {
+            envelope: TransportEnvelope::GroupMessage {
+                transport_group_id: group_id.as_slice().to_vec(),
+            },
+            ..commit_msg
+        };
+        self.record_sent_openmls_message(
+            &commit_msg,
+            commit_bytes.as_slice(),
+            &group_id,
+            pre_commit_epoch,
+        )?;
+
+        let mut group_record = existing;
+        group_record
+            .members
+            .retain(|member| !target_set.contains(&member.id));
+        self.storage.put_group(&group_record)?;
+
+        let prior_epoch = EpochId(mls_group.epoch().as_u64());
+        let new_epoch = EpochId(prior_epoch.0 + 1);
+        let pending_ref = self.epoch_manager.next_pending_ref();
+        let staged =
+            cgka_traits::engine_state::StagedCommitHandle::from_bytes(group_id.as_slice().to_vec());
+        self.epoch_manager.begin_pending(
+            group_id.clone(),
+            prior_epoch,
+            new_epoch,
+            staged,
+            pending_ref,
+            crate::epoch_manager::PendingKind::GroupEvolution,
+        )?;
+        self.track_pending_commit_for_recovery(
+            pending_ref,
+            group_id.clone(),
+            prior_epoch,
+            commit_msg.id.clone(),
+            &commit_bytes,
+            recovery_snapshot,
+        );
+        self.pending_auto_removed
+            .insert(pending_ref, unique_targets.clone());
+
+        Ok(SendResult::GroupEvolution {
+            msg: commit_msg,
+            welcomes: vec![],
+            pending: pending_ref,
+        })
+    }
+
     async fn do_send_leave(&mut self, group_id: GroupId) -> Result<SendResult, EngineError> {
         // MIP-03 SelfRemove only. The legacy Remove-self flow is not exposed
         // by this engine.
@@ -1189,6 +1359,7 @@ fn send_intent_group_id(intent: &SendIntent) -> &GroupId {
     match intent {
         SendIntent::AppMessage { group_id, .. }
         | SendIntent::Invite { group_id, .. }
+        | SendIntent::RemoveMembers { group_id, .. }
         | SendIntent::Leave { group_id }
         | SendIntent::UpdateGroupData { group_id, .. } => group_id,
     }

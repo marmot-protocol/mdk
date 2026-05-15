@@ -4,7 +4,7 @@
 //! the fallback for backend failures that do not yet have a narrower variant.
 
 use crate::capabilities::GroupCapabilities;
-use crate::types::{EpochId, GroupId};
+use crate::types::{EpochId, GroupId, MemberId};
 
 /// Errors returned by every [`crate::engine::CgkaEngine`] method.
 #[derive(Debug, thiserror::Error)]
@@ -17,6 +17,12 @@ pub enum EngineError {
 
     #[error("local identity is not a member of group {group_id}")]
     NotAMember { group_id: GroupId },
+
+    #[error("local identity is not an admin of group {group_id}")]
+    NotGroupAdmin { group_id: GroupId },
+
+    #[error("member {member} is not in group {group_id}")]
+    UnknownMember { group_id: GroupId, member: MemberId },
 
     /// MIP-03 §149 — an admin cannot SelfRemove if doing so would leave the
     /// group with zero admins. Demote (or transfer admin status) before

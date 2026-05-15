@@ -1,7 +1,7 @@
 ---
 title: "Current State — Implementations & Spec"
 created: 2026-04-19
-updated: 2026-05-13
+updated: 2026-05-15
 tags: [marmot, overview, current-state, implementations]
 status: overview
 ---
@@ -81,6 +81,11 @@ This repository now has the main engine candidate:
 - `crates/marmot-account` — thin future app-core shell over a session and transport adapter. It activates the transport
   account, uses static transport routing for early harnesses, publishes fresh KeyPackages through an injected boundary,
   and confirms or rolls back pending session work from adapter publish reports.
+- `crates/marmot-app` — first app-core bridge over account home, per-account app projections, shared relay/directory
+  cache, relay-list setup, KeyPackage lookup, local development relay support, and app-facing group/message/member
+  methods.
+- `crates/dm` — first real CLI app surface over `marmot-app`. It is intentionally product-facing rather than a lab
+  harness, and its JSON envelope is shaped for future TUI/testing callers.
 - `crates/storage-memory` — in-memory storage and snapshot backend for tests.
 - `crates/storage-sqlite` — SQLCipher-backed SQLite storage for Marmot and custom OpenMLS state, with Rust migrations
   for schema/data evolution.
@@ -109,6 +114,11 @@ variants.
   retained-anchor pruning, and privacy-oriented SQLite defaults. `cgka-session` opens one encrypted database per
   account-device identity. App key-management integration, packaging, and longer-term rekey/vacuum/checkpoint policy
   still need production wiring.
+- **App-core hardening** — `marmot-app` and `dm` now exercise real account setup, key storage, relay-list repair,
+  KeyPackage publication/fetch, directory cache, group membership, group profile projection, message projection, local
+  archive state, and sync. The next hardening pass should keep app policy in `marmot-app`/`marmot-account` and keep
+  `dm` focused on command presentation and stable JSON output. The current boundary is summarized in
+  [`app-core-boundary.md`](./app-core-boundary.md).
 - **Production transport adapters** — `transport-nostr-adapter` now implements the Nostr adapter core over an injectable
   relay-client boundary, with an optional `nostr-sdk` relay client, exact stale group subscription cleanup,
   adapter-local metrics, privacy-safe tracing, and redacted SDK relay-health summaries. The SDK owns reconnect/backoff,

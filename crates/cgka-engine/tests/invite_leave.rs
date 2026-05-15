@@ -265,6 +265,132 @@ async fn invite_rejects_invitee_missing_required_capability() {
     ));
 }
 
+#[tokio::test]
+async fn admin_remove_members_publishes_commit_and_updates_membership() {
+    let mut alice = build_client(b"alice");
+    let mut bob = build_client(b"bob");
+    let mut carol = build_client(b"carol");
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "remove".into(),
+            description: "".into(),
+            members: vec![bob_kp, carol_kp],
+            required_features: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (welcome_for_bob, welcome_for_carol) = match create {
+        SendResult::GroupCreated {
+            pending,
+            mut welcomes,
+        } => {
+            alice.confirm_published(pending).await.unwrap();
+            (welcomes.remove(0), welcomes.remove(0))
+        }
+        _ => unreachable!(),
+    };
+    bob.join_welcome(welcome_for_bob).await.unwrap();
+    carol.join_welcome(welcome_for_carol).await.unwrap();
+
+    let remove = alice
+        .send(SendIntent::RemoveMembers {
+            group_id: group_id.clone(),
+            members: vec![bob.self_id()],
+        })
+        .await
+        .unwrap();
+    let (commit, pending) = match remove {
+        SendResult::GroupEvolution {
+            msg,
+            welcomes,
+            pending,
+        } => {
+            assert!(welcomes.is_empty());
+            (msg, pending)
+        }
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    };
+    assert_eq!(
+        alice.members(&group_id).unwrap().len(),
+        2,
+        "pending remove should project immediately"
+    );
+
+    alice.confirm_published(pending).await.unwrap();
+    let alice_events = alice.drain_events();
+    assert!(
+        alice_events.iter().any(|event| matches!(
+            event,
+            cgka_traits::engine::GroupEvent::MemberRemoved { member, .. }
+                if member == &bob.self_id()
+        )),
+        "alice should emit MemberRemoved after confirm; got {alice_events:?}"
+    );
+
+    let routed_commit = TransportMessage {
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+        ..commit
+    };
+    let outcome = carol.ingest(routed_commit).await.unwrap();
+    assert!(matches!(outcome, IngestOutcome::Buffered { .. }));
+    converge_buffered_commit(&mut carol, &group_id);
+    let carol_members = carol.members(&group_id).unwrap();
+    assert_eq!(carol_members.len(), 2);
+    assert!(
+        !carol_members
+            .iter()
+            .any(|member| member.id == bob.self_id()),
+        "carol should converge to a group without bob; got {carol_members:?}"
+    );
+}
+
+#[tokio::test]
+async fn non_admin_cannot_remove_members() {
+    let mut alice = build_client(b"alice");
+    let mut bob = build_client(b"bob");
+    let mut carol = build_client(b"carol");
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "remove".into(),
+            description: "".into(),
+            members: vec![bob_kp, carol_kp],
+            required_features: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let welcome_for_bob = match create {
+        SendResult::GroupCreated {
+            pending,
+            mut welcomes,
+        } => {
+            alice.confirm_published(pending).await.unwrap();
+            welcomes.remove(0)
+        }
+        _ => unreachable!(),
+    };
+    bob.join_welcome(welcome_for_bob).await.unwrap();
+
+    let err = bob
+        .send(SendIntent::RemoveMembers {
+            group_id: group_id.clone(),
+            members: vec![carol.self_id()],
+        })
+        .await
+        .err()
+        .unwrap();
+    assert!(matches!(err, EngineError::NotGroupAdmin { .. }));
+}
+
 // ── Leave (MIP-03 SelfRemove) ───────────────────────────────────────────────
 
 #[tokio::test]

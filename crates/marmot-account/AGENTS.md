@@ -6,14 +6,16 @@ Agent-facing map for the Marmot account orchestration crate.
 
 This crate owns the thin future app-core shell around:
 
+- account home layout;
+- local account records and signing-key storage;
 - `AccountDeviceSession`;
 - a pluggable `TransportAdapter`;
 - transport routing policy;
 - key-package publication;
 - publish confirmation and rollback.
 
-It should not own MLS internals, transport event parsing, SQLCipher key derivation, UI projection, notifications, or
-real relay auth.
+It should not own MLS internals, transport event parsing, SQLCipher key derivation, UI projection, notifications, real
+relay auth, or transport-specific relay discovery.
 
 ## Rules
 

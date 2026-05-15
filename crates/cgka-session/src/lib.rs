@@ -15,7 +15,7 @@ use cgka_traits::engine::{
 };
 use cgka_traits::engine_state::PendingStateRef;
 use cgka_traits::error::EngineError;
-use cgka_traits::group::Member;
+use cgka_traits::group::{Group, Member};
 use cgka_traits::ingest::IngestOutcome;
 use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::storage::StorageError;
@@ -177,6 +177,10 @@ impl AccountDeviceSession {
             "fresh key package created"
         );
         Ok(key_package)
+    }
+
+    pub fn group_record(&self, group_id: &GroupId) -> SessionResult<Group> {
+        Ok(self.engine.group_record(group_id)?)
     }
 
     pub async fn create_group(
@@ -380,6 +384,7 @@ fn send_intent_kind(intent: &SendIntent) -> &'static str {
     match intent {
         SendIntent::AppMessage { .. } => "app_message",
         SendIntent::Invite { .. } => "invite",
+        SendIntent::RemoveMembers { .. } => "remove_members",
         SendIntent::Leave { .. } => "leave",
         SendIntent::UpdateGroupData { .. } => "update_group_data",
     }

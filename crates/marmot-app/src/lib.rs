@@ -1,0 +1,2188 @@
+//! First app runtime bridge for Marmot.
+//!
+//! This crate wires `AccountHome` into the concrete local runtime pieces needed by
+//! early app surfaces: encrypted session storage, Nostr MLS peeling, Nostr
+//! transport publishing, and a local file relay for deterministic development.
+
+use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
+
+use async_trait::async_trait;
+use cgka_engine::canonicalization::CanonicalizationPolicy;
+use cgka_session::{AccountDeviceSession, SessionConfig};
+use cgka_traits::engine::{CreateGroupRequest, GroupEvent, KeyPackage, SendIntent};
+use cgka_traits::group::Group;
+use cgka_traits::transport::{TransportEnvelope, TransportMessage};
+use cgka_traits::{
+    GroupId, MemberId, Timestamp, TransportAdapter, TransportAdapterError, TransportEndpoint,
+    TransportEndpointReceipt, TransportGroupSubscription, TransportPublishTarget,
+};
+use marmot_account::{
+    AccountDeviceRuntime, AccountHome, AccountHomeError, AccountSummary, KeyPackagePublication,
+    KeyPackagePublishError, KeyPackagePublisher, TransportRoutingError, TransportRoutingPolicy,
+};
+use nostr_sdk::prelude::{Client as NostrSdkClient, Filter, Kind, PublicKey, RelayUrl};
+use rusqlite::Connection;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use storage_sqlite::SqlCipherKey;
+use tokio::task::JoinHandle;
+use tokio::time::timeout;
+use transport_nostr_adapter::{
+    KEY_PACKAGE_ENCODING_HEX, KIND_MARMOT_INBOX_RELAY_LIST, KIND_MARMOT_KEY_PACKAGE,
+    KIND_MARMOT_KEY_PACKAGE_RELAY_LIST, KIND_NIP65_RELAY_LIST, NostrAccountRelayListKind,
+    NostrAccountRelayListPublication, NostrKeyPackagePublication, NostrKeyPackagePublisher,
+    NostrPublishOutcome, NostrRelayClient, NostrRelayEvent, NostrSdkRelayClient,
+    NostrTransportAdapter,
+};
+use transport_nostr_peeler::{
+    KIND_MARMOT_GROUP_MESSAGE, KIND_NIP59_GIFT_WRAP, NostrMlsPeeler, NostrTransportEvent,
+};
+
+mod directory_cache;
+mod projection;
+
+use directory_cache::DirectoryCache;
+use projection::AccountProjectionDb;
+
+const ACCOUNT_APP_DB_FILE: &str = "app.sqlite3";
+const APP_CACHE_DB_FILE: &str = "app-cache.sqlite3";
+const LOCAL_RELAY_DIR: &str = "local-relay";
+const KEY_PACKAGE_DIR: &str = "key-packages";
+const EVENT_DIR: &str = "events";
+const SDK_FIRST_SYNC_WAIT: Duration = Duration::from_millis(750);
+const SDK_DRAIN_WAIT: Duration = Duration::from_millis(50);
+const SDK_RELAY_LIST_FETCH_WAIT: Duration = Duration::from_secs(3);
+pub const GROUP_PROFILE_COMPONENT_ID: u16 = 0x8001;
+pub const GROUP_PROFILE_COMPONENT: &str = "marmot.group.profile.v1";
+pub const GROUP_BLOSSOM_IMAGE_COMPONENT_ID: u16 = 0x8002;
+pub const GROUP_BLOSSOM_IMAGE_COMPONENT: &str = "marmot.group.blossom.image.v1";
+
+type AppRuntime =
+    AccountDeviceRuntime<NostrTransportAdapter, AppTransportRouting, AppKeyPackagePublisher>;
+
+#[derive(Clone)]
+pub struct MarmotApp {
+    root: PathBuf,
+    relay: AppRelay,
+    account_home: AccountHome,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum AppRelay {
+    Local,
+    Sdk { urls: Vec<String> },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppStatus {
+    pub account: String,
+    pub account_id_hex: String,
+    pub transport: String,
+    pub groups: Vec<AppGroupRecord>,
+    pub seen_events: usize,
+    pub group_count: usize,
+    pub message_count: usize,
+    pub projections: AppProjectionStatus,
+    pub relay_lists: AccountRelayListStatus,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppProjectionStatus {
+    pub account: AppDatabaseStatus,
+    pub shared: AppDatabaseStatus,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppDatabaseStatus {
+    pub path: String,
+    pub exists: bool,
+    pub encrypted: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AccountRelayListStatus {
+    pub complete: bool,
+    pub missing: Vec<String>,
+    pub default_relays: Vec<String>,
+    pub bootstrap_relays: Vec<String>,
+    pub nip65: AccountRelayListState,
+    pub inbox: AccountRelayListState,
+    pub key_package: AccountRelayListState,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AccountRelayListState {
+    pub kind: u64,
+    pub relays: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AccountRelayListBootstrap {
+    pub default_relays: Vec<TransportEndpoint>,
+    pub bootstrap_relays: Vec<TransportEndpoint>,
+}
+
+impl AccountRelayListBootstrap {
+    pub fn new(
+        default_relays: Vec<TransportEndpoint>,
+        bootstrap_relays: Vec<TransportEndpoint>,
+    ) -> Self {
+        let bootstrap_relays = if bootstrap_relays.is_empty() {
+            default_relays.clone()
+        } else {
+            bootstrap_relays
+        };
+        Self {
+            default_relays,
+            bootstrap_relays,
+        }
+    }
+}
+
+impl AccountRelayListStatus {
+    fn empty() -> Self {
+        let mut status = Self {
+            complete: false,
+            missing: Vec::new(),
+            default_relays: Vec::new(),
+            bootstrap_relays: Vec::new(),
+            nip65: AccountRelayListState {
+                kind: KIND_NIP65_RELAY_LIST,
+                relays: Vec::new(),
+            },
+            inbox: AccountRelayListState {
+                kind: KIND_MARMOT_INBOX_RELAY_LIST,
+                relays: Vec::new(),
+            },
+            key_package: AccountRelayListState {
+                kind: KIND_MARMOT_KEY_PACKAGE_RELAY_LIST,
+                relays: Vec::new(),
+            },
+        };
+        status.refresh();
+        status
+    }
+
+    fn refresh(&mut self) {
+        self.default_relays = self.nip65.relays.clone();
+        self.missing = Vec::new();
+        if self.nip65.relays.is_empty() {
+            self.missing.push("nip65".into());
+        }
+        if self.inbox.relays.is_empty() {
+            self.missing.push("inbox".into());
+        }
+        if self.key_package.relays.is_empty() {
+            self.missing.push("key_package".into());
+        }
+        self.complete = self.missing.is_empty();
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SyncSummary {
+    pub joined_groups: Vec<GroupId>,
+    pub messages: Vec<ReceivedMessage>,
+    pub events: Vec<GroupEvent>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReceivedMessage {
+    pub message_id_hex: String,
+    pub sender: String,
+    pub group_id: GroupId,
+    pub plaintext: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppMessageRecord {
+    pub message_id_hex: String,
+    pub direction: String,
+    pub group_id_hex: String,
+    pub sender: String,
+    pub plaintext: String,
+    pub recorded_at: u64,
+    pub received_at: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AppMessageQuery {
+    pub group_id_hex: Option<String>,
+    pub limit: Option<usize>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SendSummary {
+    pub published: usize,
+    pub message_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FetchedKeyPackage {
+    pub account_id_hex: String,
+    pub key_package: KeyPackage,
+    pub key_package_id: String,
+    pub created_at: u64,
+    pub source_relays: Vec<String>,
+    pub relay_lists: AccountRelayListStatus,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DirectoryEntry {
+    pub account_id_hex: String,
+    pub relay_lists: AccountRelayListStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_package: Option<DirectoryKeyPackage>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DirectoryKeyPackage {
+    pub key_package_id: String,
+    pub key_package_hex: String,
+    pub created_at: u64,
+    pub source_relays: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppGroupRecord {
+    pub group_id_hex: String,
+    pub endpoint: String,
+    pub profile: AppGroupProfileComponent,
+    pub image: AppGroupImageComponent,
+    #[serde(default)]
+    pub archived: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppGroupMemberRecord {
+    pub member_id_hex: String,
+    pub account: Option<String>,
+    pub local: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppGroupProfileComponent {
+    pub component_id: u16,
+    pub component: String,
+    pub name: String,
+    pub description: String,
+    pub data_hex: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppGroupImageComponent {
+    pub component_id: u16,
+    pub component: String,
+    pub present: bool,
+    pub image_hash_hex: String,
+    pub image_key_hex: String,
+    pub image_nonce_hex: String,
+    pub image_upload_key_hex: String,
+    pub media_type: Option<String>,
+    pub data_hex: String,
+}
+
+impl AppGroupRecord {
+    fn new(
+        group_id_hex: String,
+        endpoint: String,
+        profile_name: String,
+        profile_description: String,
+        image: AppGroupImageInput,
+    ) -> Self {
+        Self {
+            group_id_hex,
+            endpoint,
+            profile: AppGroupProfileComponent::new(profile_name, profile_description),
+            image: AppGroupImageComponent::new(image),
+            archived: false,
+        }
+    }
+
+    fn from_group(group_id: &GroupId, endpoint: TransportEndpoint, group: Option<&Group>) -> Self {
+        let (profile_name, profile_description) = group
+            .map(|group| (group.name.clone(), group.description.clone()))
+            .unwrap_or_default();
+        Self::new(
+            hex::encode(group_id.as_slice()),
+            endpoint.0,
+            profile_name,
+            profile_description,
+            AppGroupImageInput::default(),
+        )
+    }
+
+    fn refresh_from_group(&mut self, endpoint: TransportEndpoint, group: Option<&Group>) {
+        self.endpoint = endpoint.0;
+        if let Some(group) = group {
+            self.profile =
+                AppGroupProfileComponent::new(group.name.clone(), group.description.clone());
+        }
+    }
+}
+
+impl AppGroupProfileComponent {
+    fn new(name: String, description: String) -> Self {
+        let data = encode_component_vectors(&[name.as_bytes(), description.as_bytes()]);
+        Self {
+            component_id: GROUP_PROFILE_COMPONENT_ID,
+            component: GROUP_PROFILE_COMPONENT.to_owned(),
+            name,
+            description,
+            data_hex: hex::encode(data),
+        }
+    }
+}
+
+impl AppGroupImageComponent {
+    fn new(input: AppGroupImageInput) -> Self {
+        let present = !input.image_hash_hex.is_empty()
+            || !input.image_key_hex.is_empty()
+            || !input.image_nonce_hex.is_empty()
+            || !input.image_upload_key_hex.is_empty()
+            || input.media_type.is_some();
+        let image_hash = hex::decode(&input.image_hash_hex).unwrap_or_default();
+        let image_key = hex::decode(&input.image_key_hex).unwrap_or_default();
+        let image_nonce = hex::decode(&input.image_nonce_hex).unwrap_or_default();
+        let image_upload_key = hex::decode(&input.image_upload_key_hex).unwrap_or_default();
+        let media_type_bytes = input.media_type.as_deref().unwrap_or("").as_bytes();
+        let data = encode_component_vectors(&[
+            image_hash.as_slice(),
+            image_key.as_slice(),
+            image_nonce.as_slice(),
+            image_upload_key.as_slice(),
+            media_type_bytes,
+        ]);
+        Self {
+            component_id: GROUP_BLOSSOM_IMAGE_COMPONENT_ID,
+            component: GROUP_BLOSSOM_IMAGE_COMPONENT.to_owned(),
+            present,
+            image_hash_hex: input.image_hash_hex,
+            image_key_hex: input.image_key_hex,
+            image_nonce_hex: input.image_nonce_hex,
+            image_upload_key_hex: input.image_upload_key_hex,
+            media_type: input.media_type,
+            data_hex: hex::encode(data),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct AppGroupImageInput {
+    image_hash_hex: String,
+    image_key_hex: String,
+    image_nonce_hex: String,
+    image_upload_key_hex: String,
+    media_type: Option<String>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum AppError {
+    #[error(transparent)]
+    Account(#[from] marmot_account::AccountError),
+    #[error(transparent)]
+    AccountHome(#[from] AccountHomeError),
+    #[error(transparent)]
+    Session(#[from] cgka_session::SessionError),
+    #[error(transparent)]
+    Storage(#[from] cgka_traits::storage::StorageError),
+    #[error(transparent)]
+    Transport(#[from] TransportAdapterError),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
+    #[error(transparent)]
+    Sqlite(#[from] rusqlite::Error),
+    #[error(transparent)]
+    Hex(#[from] hex::FromHexError),
+    #[error("no published key package for account: {0}")]
+    MissingKeyPackage(String),
+    #[error("unknown local group: {0}")]
+    UnknownGroup(String),
+    #[error("publish failed: {0}")]
+    Publish(String),
+    #[error("default relays are required to publish account relay lists")]
+    MissingDefaultRelays,
+    #[error("missing account relay lists: {0:?}")]
+    MissingRelayLists(Vec<String>),
+    #[error("relay directory fetch failed: {0}")]
+    RelayDirectory(String),
+    #[error("invalid Nostr public key")]
+    InvalidPublicKey,
+    #[error("invalid Marmot KeyPackage event: {0}")]
+    InvalidKeyPackageEvent(String),
+    #[error("no directory entry for account: {0}")]
+    MissingDirectoryEntry(String),
+    #[error("invalid group profile: {0}")]
+    InvalidGroupProfile(String),
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct AccountState {
+    label: String,
+    #[serde(default)]
+    seen_events: Vec<String>,
+    #[serde(default)]
+    groups: Vec<AppGroupRecord>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AppMessageProjection {
+    message_id_hex: String,
+    direction: String,
+    group_id_hex: String,
+    sender: String,
+    plaintext: String,
+}
+
+#[derive(Clone)]
+struct AccountProfile {
+    label: String,
+    account_id_hex: String,
+    inbox_endpoints: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct KeyPackageRecord {
+    account_label: String,
+    account_id_hex: String,
+    #[serde(default)]
+    key_package_id: String,
+    key_package_hex: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct RelayEventRecord {
+    endpoints: Vec<TransportEndpoint>,
+    event: NostrTransportEvent,
+}
+
+struct OpenAppAccount {
+    runtime: AppRuntime,
+    adapter: NostrTransportAdapter,
+    routing: AppTransportRouting,
+    state: AccountState,
+    notification_forwarder: Option<JoinHandle<()>>,
+}
+
+pub struct AppClient {
+    app: MarmotApp,
+    runtime: AppRuntime,
+    adapter: NostrTransportAdapter,
+    routing: AppTransportRouting,
+    state: AccountState,
+    notification_forwarder: Option<JoinHandle<()>>,
+}
+
+impl MarmotApp {
+    pub fn local(root: impl AsRef<Path>) -> Self {
+        let root = root.as_ref().to_path_buf();
+        Self {
+            account_home: AccountHome::open(&root),
+            root,
+            relay: AppRelay::Local,
+        }
+    }
+
+    pub fn local_with_account_home(root: impl AsRef<Path>, account_home: AccountHome) -> Self {
+        Self {
+            root: root.as_ref().to_path_buf(),
+            relay: AppRelay::Local,
+            account_home,
+        }
+    }
+
+    pub fn with_relay(root: impl AsRef<Path>, relay_url: impl Into<String>) -> Self {
+        Self::with_relays(root, vec![relay_url.into()])
+    }
+
+    pub fn with_relays(root: impl AsRef<Path>, relay_urls: Vec<String>) -> Self {
+        let root = root.as_ref().to_path_buf();
+        Self {
+            account_home: AccountHome::open(&root),
+            root,
+            relay: AppRelay::Sdk { urls: relay_urls },
+        }
+    }
+
+    pub fn with_relays_and_account_home(
+        root: impl AsRef<Path>,
+        relay_urls: Vec<String>,
+        account_home: AccountHome,
+    ) -> Self {
+        Self {
+            root: root.as_ref().to_path_buf(),
+            relay: AppRelay::Sdk { urls: relay_urls },
+            account_home,
+        }
+    }
+
+    pub async fn client(&self, label: &str) -> Result<AppClient, AppError> {
+        self.ensure_account_state(label)?;
+        let open = self.open_account(label)?;
+        open.runtime.activate_transport(None).await?;
+        open.runtime.sync_transport_groups(None).await?;
+        Ok(AppClient {
+            app: self.clone(),
+            runtime: open.runtime,
+            adapter: open.adapter,
+            routing: open.routing,
+            state: open.state,
+            notification_forwarder: open.notification_forwarder,
+        })
+    }
+
+    pub fn status(&self, label: &str) -> Result<AppStatus, AppError> {
+        let account = self.account_home().account(label)?;
+        self.ensure_account_state(label)?;
+        let state = self.load_state(label)?;
+        let message_count = self.account_projection(label)?.message_count()?;
+        Ok(AppStatus {
+            account: state.label,
+            account_id_hex: account.account_id_hex.clone(),
+            transport: self.transport_label().to_owned(),
+            group_count: state.groups.len(),
+            message_count,
+            projections: self.projection_status(label),
+            groups: state.groups,
+            seen_events: state.seen_events.len(),
+            relay_lists: self.account_relay_list_status_for_account_id(&account.account_id_hex)?,
+        })
+    }
+
+    pub async fn publish_account_relay_lists(
+        &self,
+        label: &str,
+        bootstrap: AccountRelayListBootstrap,
+    ) -> Result<AccountRelayListStatus, AppError> {
+        self.publish_selected_account_relay_lists(
+            label,
+            bootstrap,
+            &[
+                NostrAccountRelayListKind::Nip65,
+                NostrAccountRelayListKind::Inbox,
+                NostrAccountRelayListKind::KeyPackage,
+            ],
+        )
+        .await
+    }
+
+    pub async fn publish_missing_account_relay_lists(
+        &self,
+        label: &str,
+        bootstrap: AccountRelayListBootstrap,
+    ) -> Result<AccountRelayListStatus, AppError> {
+        let current = self.account_relay_list_status(label)?;
+        self.publish_missing_account_relay_lists_from_status(label, bootstrap, current)
+            .await
+    }
+
+    pub async fn publish_missing_account_relay_lists_from_status(
+        &self,
+        label: &str,
+        bootstrap: AccountRelayListBootstrap,
+        current: AccountRelayListStatus,
+    ) -> Result<AccountRelayListStatus, AppError> {
+        let missing = current
+            .missing
+            .iter()
+            .filter_map(|name| match name.as_str() {
+                "nip65" => Some(NostrAccountRelayListKind::Nip65),
+                "inbox" => Some(NostrAccountRelayListKind::Inbox),
+                "key_package" => Some(NostrAccountRelayListKind::KeyPackage),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if missing.is_empty() {
+            return Ok(current);
+        }
+        self.publish_selected_account_relay_lists(label, bootstrap, &missing)
+            .await
+    }
+
+    async fn publish_selected_account_relay_lists(
+        &self,
+        label: &str,
+        bootstrap: AccountRelayListBootstrap,
+        list_kinds: &[NostrAccountRelayListKind],
+    ) -> Result<AccountRelayListStatus, AppError> {
+        if bootstrap.default_relays.is_empty() {
+            return Err(AppError::MissingDefaultRelays);
+        }
+        let keys = self.account_home().load_signing_keys(label)?;
+        let account_id = MemberId::new(keys.public_key().to_bytes().to_vec());
+        let relay_client = self.relay_client_for_endpoints(&keys, &bootstrap.bootstrap_relays);
+        for list_kind in list_kinds {
+            let publication = NostrAccountRelayListPublication {
+                account_id: account_id.clone(),
+                list_kind: *list_kind,
+                relays: bootstrap.default_relays.clone(),
+                publish_endpoints: bootstrap.bootstrap_relays.clone(),
+            };
+            let event = publication.to_event()?;
+            relay_client
+                .publish_event(&bootstrap.bootstrap_relays, &event, 1)
+                .await?;
+        }
+        self.fetch_account_relay_list_status_for_account_id(
+            &keys.public_key().to_hex(),
+            bootstrap.bootstrap_relays,
+        )
+        .await
+    }
+
+    pub async fn fetch_account_relay_list_status_for_account_id(
+        &self,
+        account_id_hex: &str,
+        bootstrap_relays: Vec<TransportEndpoint>,
+    ) -> Result<AccountRelayListStatus, AppError> {
+        if bootstrap_relays.is_empty() || bootstrap_relays.iter().all(is_local_relay_endpoint) {
+            let mut status = self.account_relay_list_status_for_account_id(account_id_hex)?;
+            if !bootstrap_relays.is_empty() {
+                status.bootstrap_relays = bootstrap_relays
+                    .into_iter()
+                    .map(|endpoint| endpoint.0)
+                    .collect();
+            }
+            self.remember_directory_relay_lists(account_id_hex, &status)?;
+            return Ok(status);
+        }
+
+        let public_key =
+            PublicKey::parse(account_id_hex).map_err(|_| AppError::InvalidPublicKey)?;
+        let relay_urls = relay_urls_from_endpoints(&bootstrap_relays)?;
+        let client = NostrSdkClient::builder().build();
+        for relay_url in &relay_urls {
+            client
+                .add_relay(relay_url.clone())
+                .await
+                .map_err(|e| AppError::RelayDirectory(format!("add relay: {e}")))?;
+            client
+                .connect_relay(relay_url.clone())
+                .await
+                .map_err(|e| AppError::RelayDirectory(format!("connect relay: {e}")))?;
+        }
+
+        let filter = relay_list_filter(public_key);
+        let events = client
+            .fetch_events_from(relay_urls.clone(), filter, SDK_RELAY_LIST_FETCH_WAIT)
+            .await
+            .map_err(|e| AppError::RelayDirectory(format!("fetch relay lists: {e}")))?;
+        client.shutdown().await;
+
+        let records = events
+            .into_iter()
+            .map(|event| {
+                NostrTransportEvent::from_nostr_event(&event)
+                    .map(|event| RelayEventRecord {
+                        endpoints: bootstrap_relays.clone(),
+                        event,
+                    })
+                    .map_err(|e| AppError::RelayDirectory(format!("map relay-list event: {e}")))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let status = relay_list_status_from_records(account_id_hex, records);
+        self.remember_directory_relay_lists(account_id_hex, &status)?;
+        Ok(status)
+    }
+
+    pub async fn fetch_latest_key_package_for_account_id(
+        &self,
+        account_id_hex: &str,
+        bootstrap_relays: Vec<TransportEndpoint>,
+    ) -> Result<FetchedKeyPackage, AppError> {
+        let relay_lists = if bootstrap_relays.is_empty() {
+            self.account_relay_list_status_for_account_id(account_id_hex)?
+        } else {
+            self.fetch_account_relay_list_status_for_account_id(account_id_hex, bootstrap_relays)
+                .await?
+        };
+        self.remember_directory_relay_lists(account_id_hex, &relay_lists)?;
+        if relay_lists.key_package.relays.is_empty() {
+            return Err(AppError::MissingRelayLists(vec!["key_package".into()]));
+        }
+
+        let source_relays = relay_lists
+            .key_package
+            .relays
+            .iter()
+            .cloned()
+            .map(TransportEndpoint)
+            .collect::<Vec<_>>();
+        let records = self
+            .fetch_key_package_events_for_account_id(account_id_hex, &source_relays)
+            .await?;
+        let mut fetched = latest_key_package_from_records(account_id_hex, records)?;
+        fetched.relay_lists = relay_lists;
+        self.remember_directory_key_package(&fetched)?;
+        Ok(fetched)
+    }
+
+    pub async fn refresh_directory_entry_for_account_id(
+        &self,
+        account_id_hex: &str,
+        bootstrap_relays: Vec<TransportEndpoint>,
+    ) -> Result<DirectoryEntry, AppError> {
+        let status = if bootstrap_relays.is_empty() {
+            self.account_relay_list_status_for_account_id(account_id_hex)?
+        } else {
+            self.fetch_account_relay_list_status_for_account_id(account_id_hex, bootstrap_relays)
+                .await?
+        };
+        self.remember_directory_relay_lists(account_id_hex, &status)?;
+        self.directory_entry_for_account_id(account_id_hex)?
+            .ok_or_else(|| AppError::MissingDirectoryEntry(account_id_hex.to_owned()))
+    }
+
+    pub fn directory_entry_for_account_id(
+        &self,
+        account_id_hex: &str,
+    ) -> Result<Option<DirectoryEntry>, AppError> {
+        self.directory_cache()?.entry(account_id_hex)
+    }
+
+    pub fn messages(&self, label: &str) -> Result<Vec<AppMessageRecord>, AppError> {
+        self.messages_with_query(label, AppMessageQuery::default())
+    }
+
+    pub fn messages_with_query(
+        &self,
+        label: &str,
+        query: AppMessageQuery,
+    ) -> Result<Vec<AppMessageRecord>, AppError> {
+        self.ensure_account_state(label)?;
+        self.account_projection(label)?.messages(query)
+    }
+
+    pub fn groups(&self, label: &str) -> Result<Vec<AppGroupRecord>, AppError> {
+        self.ensure_account_state(label)?;
+        Ok(self.load_state(label)?.groups)
+    }
+
+    pub fn visible_groups(&self, label: &str) -> Result<Vec<AppGroupRecord>, AppError> {
+        Ok(self
+            .groups(label)?
+            .into_iter()
+            .filter(|group| !group.archived)
+            .collect())
+    }
+
+    pub fn group(
+        &self,
+        label: &str,
+        group_id_hex: &str,
+    ) -> Result<Option<AppGroupRecord>, AppError> {
+        Ok(self
+            .groups(label)?
+            .into_iter()
+            .find(|group| group.group_id_hex == group_id_hex))
+    }
+
+    pub fn set_group_archived(
+        &self,
+        label: &str,
+        group_id_hex: &str,
+        archived: bool,
+    ) -> Result<AppGroupRecord, AppError> {
+        self.ensure_account_state(label)?;
+        let mut state = self.load_state(label)?;
+        let group = state
+            .groups
+            .iter_mut()
+            .find(|group| group.group_id_hex == group_id_hex)
+            .ok_or_else(|| AppError::UnknownGroup(group_id_hex.to_owned()))?;
+        group.archived = archived;
+        let group = group.clone();
+        self.save_state(&state)?;
+        Ok(group)
+    }
+
+    pub fn account_relay_list_status(
+        &self,
+        label: &str,
+    ) -> Result<AccountRelayListStatus, AppError> {
+        let account = self.account_home().account(label)?;
+        self.account_relay_list_status_for_account_id(&account.account_id_hex)
+    }
+
+    pub fn account_relay_list_status_for_account_id(
+        &self,
+        account_id_hex: &str,
+    ) -> Result<AccountRelayListStatus, AppError> {
+        Ok(relay_list_status_from_records(
+            account_id_hex,
+            self.relay_events()?,
+        ))
+    }
+
+    async fn fetch_key_package_events_for_account_id(
+        &self,
+        account_id_hex: &str,
+        source_relays: &[TransportEndpoint],
+    ) -> Result<Vec<RelayEventRecord>, AppError> {
+        if source_relays.is_empty() || source_relays.iter().all(is_local_relay_endpoint) {
+            let records = self
+                .relay_events()?
+                .into_iter()
+                .filter(|record| {
+                    record.event.kind == KIND_MARMOT_KEY_PACKAGE
+                        && record.event.pubkey == account_id_hex
+                        && (source_relays.is_empty()
+                            || record
+                                .endpoints
+                                .iter()
+                                .any(|endpoint| source_relays.contains(endpoint)))
+                })
+                .collect();
+            return Ok(records);
+        }
+
+        let public_key =
+            PublicKey::parse(account_id_hex).map_err(|_| AppError::InvalidPublicKey)?;
+        let relay_urls = relay_urls_from_endpoints(source_relays)?;
+        let client = NostrSdkClient::builder().build();
+        for relay_url in &relay_urls {
+            client
+                .add_relay(relay_url.clone())
+                .await
+                .map_err(|e| AppError::RelayDirectory(format!("add relay: {e}")))?;
+            client
+                .connect_relay(relay_url.clone())
+                .await
+                .map_err(|e| AppError::RelayDirectory(format!("connect relay: {e}")))?;
+        }
+
+        let events = client
+            .fetch_events_from(
+                relay_urls,
+                key_package_filter(public_key),
+                SDK_RELAY_LIST_FETCH_WAIT,
+            )
+            .await
+            .map_err(|e| AppError::RelayDirectory(format!("fetch key packages: {e}")))?;
+        client.shutdown().await;
+
+        events
+            .into_iter()
+            .map(|event| {
+                NostrTransportEvent::from_nostr_event(&event)
+                    .map(|event| RelayEventRecord {
+                        endpoints: source_relays.to_vec(),
+                        event,
+                    })
+                    .map_err(|e| AppError::RelayDirectory(format!("map key-package event: {e}")))
+            })
+            .collect()
+    }
+
+    fn open_account(&self, label: &str) -> Result<OpenAppAccount, AppError> {
+        let state = self.load_state(label)?;
+        let keys = self.account_home().load_signing_keys(label)?;
+        let account_id = MemberId::new(keys.public_key().to_bytes());
+        let peeler =
+            NostrMlsPeeler::new(keys.public_key().to_hex()).with_welcome_signer(keys.clone());
+        let session = AccountDeviceSession::open(
+            SessionConfig::new(
+                self.account_dir(label).join("session.sqlite"),
+                self.sqlcipher_key(label, &keys)?,
+                account_id.as_slice().to_vec(),
+                Box::new(peeler),
+            )
+            .convergence_policy(CanonicalizationPolicy {
+                stable_quiescence_ms: 0,
+                ..CanonicalizationPolicy::default()
+            }),
+        )?;
+
+        let (adapter, notification_forwarder) = match &self.relay {
+            AppRelay::Local => {
+                let relay_client = Arc::new(FileRelayClient {
+                    root: self.local_relay_dir(),
+                });
+                (NostrTransportAdapter::new(relay_client), None)
+            }
+            AppRelay::Sdk { .. } => {
+                let client = NostrSdkClient::builder().signer(keys.clone()).build();
+                let relay_client = NostrSdkRelayClient::new(client);
+                let adapter = NostrTransportAdapter::new(Arc::new(relay_client.clone()));
+                let forwarder = relay_client.spawn_notification_forwarder(adapter.clone());
+                (adapter, Some(forwarder))
+            }
+        };
+
+        let key_packages = AppKeyPackagePublisher {
+            app: self.clone(),
+            account_label: label.to_owned(),
+            keys: keys.clone(),
+        };
+        let routing = self.routing_for(&state)?;
+        let runtime =
+            AccountDeviceRuntime::new(session, adapter.clone(), routing.clone(), key_packages);
+        Ok(OpenAppAccount {
+            runtime,
+            adapter,
+            routing,
+            state,
+            notification_forwarder,
+        })
+    }
+
+    fn routing_for(&self, state: &AccountState) -> Result<AppTransportRouting, AppError> {
+        let mut inbox_routes = HashMap::new();
+        for profile in self.profiles()? {
+            inbox_routes.insert(
+                MemberId::new(hex::decode(profile.account_id_hex)?),
+                profile
+                    .inbox_endpoints
+                    .into_iter()
+                    .map(TransportEndpoint)
+                    .collect(),
+            );
+        }
+        for entry in self.directory_entries()? {
+            if entry.relay_lists.inbox.relays.is_empty() {
+                continue;
+            }
+            inbox_routes
+                .entry(MemberId::new(hex::decode(entry.account_id_hex)?))
+                .or_insert_with(|| {
+                    entry
+                        .relay_lists
+                        .inbox
+                        .relays
+                        .into_iter()
+                        .map(TransportEndpoint)
+                        .collect()
+                });
+        }
+
+        let account = self.account_home().account(&state.label)?;
+        let relay_lists = self.account_relay_list_status_for_account_id(&account.account_id_hex)?;
+        let mut group_routes = Vec::new();
+        for group in &state.groups {
+            let group_id = GroupId::new(hex::decode(&group.group_id_hex)?);
+            group_routes.push(group_subscription(
+                &group_id,
+                TransportEndpoint(group.endpoint.clone()),
+            ));
+        }
+
+        Ok(AppTransportRouting::new(AppRoutingState {
+            local_inbox_endpoints: self.account_inbox_endpoints(&state.label, &relay_lists),
+            key_package_endpoints: self.key_package_endpoints(&relay_lists),
+            inbox_routes,
+            group_routes,
+            required_acks: 1,
+        }))
+    }
+
+    fn latest_key_package(&self, label: &str) -> Result<KeyPackage, AppError> {
+        let path = self
+            .local_relay_dir()
+            .join(KEY_PACKAGE_DIR)
+            .join(format!("{label}.json"));
+        if !path.exists() {
+            return Err(AppError::MissingKeyPackage(label.to_owned()));
+        }
+        let record: KeyPackageRecord = read_json(path)?;
+        Ok(KeyPackage(hex::decode(record.key_package_hex)?))
+    }
+
+    fn member_key_package(&self, member_ref: &str) -> Result<KeyPackage, AppError> {
+        if self.account_home().account(member_ref).is_ok() {
+            return self.latest_key_package(member_ref);
+        }
+        let account_id = PublicKey::parse(member_ref)
+            .map_err(|_| AppError::MissingKeyPackage(member_ref.to_owned()))?
+            .to_hex();
+        let entry = self
+            .directory_entry_for_account_id(&account_id)?
+            .ok_or_else(|| AppError::MissingKeyPackage(account_id.clone()))?;
+        let key_package = entry
+            .key_package
+            .ok_or_else(|| AppError::MissingKeyPackage(account_id.clone()))?;
+        Ok(KeyPackage(hex::decode(key_package.key_package_hex)?))
+    }
+
+    fn member_id(&self, member_ref: &str) -> Result<MemberId, AppError> {
+        if let Ok(account) = self.account_home().account(member_ref) {
+            return Ok(MemberId::new(hex::decode(account.account_id_hex)?));
+        }
+        let account_id = PublicKey::parse(member_ref)
+            .map_err(|_| AppError::InvalidPublicKey)?
+            .to_hex();
+        Ok(MemberId::new(hex::decode(account_id)?))
+    }
+
+    fn profiles(&self) -> Result<Vec<AccountProfile>, AppError> {
+        self.account_home()
+            .accounts()?
+            .into_iter()
+            .map(|account| Ok(self.profile_for_account(account)))
+            .collect()
+    }
+
+    fn directory_entries(&self) -> Result<Vec<DirectoryEntry>, AppError> {
+        self.directory_cache()?.entries()
+    }
+
+    fn profiles_by_id(&self) -> Result<HashMap<String, String>, AppError> {
+        Ok(self
+            .profiles()?
+            .into_iter()
+            .map(|profile| (profile.account_id_hex, profile.label))
+            .collect())
+    }
+
+    fn relay_events(&self) -> Result<Vec<RelayEventRecord>, AppError> {
+        let dir = self.local_relay_dir().join(EVENT_DIR);
+        if !dir.exists() {
+            return Ok(Vec::new());
+        }
+        let mut paths = fs::read_dir(dir)?
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<Result<Vec<_>, _>>()?;
+        paths.sort();
+        paths
+            .into_iter()
+            .filter(|path| path.extension().and_then(|s| s.to_str()) == Some("json"))
+            .map(read_json)
+            .collect()
+    }
+
+    fn load_state(&self, label: &str) -> Result<AccountState, AppError> {
+        self.ensure_account_state(label)?;
+        self.account_projection(label)?.load_state(label)
+    }
+
+    fn save_state(&self, state: &AccountState) -> Result<(), AppError> {
+        self.account_projection(&state.label)?.save_state(state)
+    }
+
+    fn ensure_account_state(&self, label: &str) -> Result<(), AppError> {
+        self.account_home().account(label)?;
+        self.account_projection(label)?.ensure_account(label)?;
+        Ok(())
+    }
+
+    fn profile_for_account(&self, account: AccountSummary) -> AccountProfile {
+        let relay_lists = self
+            .account_relay_list_status_for_account_id(&account.account_id_hex)
+            .unwrap_or_else(|_| AccountRelayListStatus::empty());
+        AccountProfile {
+            inbox_endpoints: self
+                .account_inbox_endpoints(&account.label, &relay_lists)
+                .into_iter()
+                .map(|endpoint| endpoint.0)
+                .collect(),
+            label: account.label,
+            account_id_hex: account.account_id_hex,
+        }
+    }
+
+    fn sqlcipher_key(&self, label: &str, keys: &nostr::Keys) -> Result<SqlCipherKey, AppError> {
+        Ok(SqlCipherKey::new(self.sqlcipher_key_material(label, keys))?)
+    }
+
+    fn sqlcipher_key_material(&self, label: &str, keys: &nostr::Keys) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(b"marmot-app-sqlcipher-key-v1");
+        hasher.update(label.as_bytes());
+        hasher.update(keys.public_key().to_bytes());
+        hasher.update(keys.secret_key().to_secret_bytes());
+        hex::encode(hasher.finalize())
+    }
+
+    fn account_inbox_endpoints(
+        &self,
+        label: &str,
+        relay_lists: &AccountRelayListStatus,
+    ) -> Vec<TransportEndpoint> {
+        if !relay_lists.inbox.relays.is_empty() {
+            return relay_lists
+                .inbox
+                .relays
+                .iter()
+                .cloned()
+                .map(TransportEndpoint)
+                .collect();
+        }
+        match &self.relay {
+            AppRelay::Local => vec![TransportEndpoint(format!("marmot-local://inbox/{label}"))],
+            AppRelay::Sdk { urls } => urls.iter().cloned().map(TransportEndpoint).collect(),
+        }
+    }
+
+    fn group_endpoint(&self, group_id: &GroupId) -> TransportEndpoint {
+        match &self.relay {
+            AppRelay::Local => TransportEndpoint(format!(
+                "marmot-local://group/{}",
+                hex::encode(group_id.as_slice())
+            )),
+            AppRelay::Sdk { urls } => TransportEndpoint(urls.first().cloned().unwrap_or_default()),
+        }
+    }
+
+    fn key_package_endpoints(
+        &self,
+        relay_lists: &AccountRelayListStatus,
+    ) -> Vec<TransportEndpoint> {
+        if !relay_lists.key_package.relays.is_empty() {
+            return relay_lists
+                .key_package
+                .relays
+                .iter()
+                .cloned()
+                .map(TransportEndpoint)
+                .collect();
+        }
+        match &self.relay {
+            AppRelay::Local => vec![TransportEndpoint("marmot-local://key-packages".into())],
+            AppRelay::Sdk { urls } => urls.iter().cloned().map(TransportEndpoint).collect(),
+        }
+    }
+
+    fn transport_label(&self) -> &'static str {
+        match self.relay {
+            AppRelay::Local => "local",
+            AppRelay::Sdk { .. } => "relay",
+        }
+    }
+
+    fn account_dir(&self, label: &str) -> PathBuf {
+        self.account_home().account_dir(label)
+    }
+
+    fn account_projection_path(&self, label: &str) -> PathBuf {
+        self.account_dir(label).join(ACCOUNT_APP_DB_FILE)
+    }
+
+    fn account_projection(&self, label: &str) -> Result<AccountProjectionDb, AppError> {
+        let keys = self.account_home().load_signing_keys(label)?;
+        AccountProjectionDb::open(
+            self.account_projection_path(label),
+            &self.sqlcipher_key_material(label, &keys),
+        )
+    }
+
+    fn projection_status(&self, label: &str) -> AppProjectionStatus {
+        let account_path = self.account_projection_path(label);
+        let shared_path = self.root.join(APP_CACHE_DB_FILE);
+        AppProjectionStatus {
+            account: AppDatabaseStatus {
+                path: account_path.display().to_string(),
+                exists: account_path.exists(),
+                encrypted: sqlite_file_requires_key(&account_path),
+            },
+            shared: AppDatabaseStatus {
+                path: shared_path.display().to_string(),
+                exists: shared_path.exists(),
+                encrypted: false,
+            },
+        }
+    }
+
+    fn local_relay_dir(&self) -> PathBuf {
+        self.root.join(LOCAL_RELAY_DIR)
+    }
+
+    fn remember_directory_relay_lists(
+        &self,
+        account_id_hex: &str,
+        relay_lists: &AccountRelayListStatus,
+    ) -> Result<(), AppError> {
+        let mut entry = self
+            .directory_entry_for_account_id(account_id_hex)?
+            .unwrap_or_else(|| DirectoryEntry {
+                account_id_hex: account_id_hex.to_owned(),
+                relay_lists: AccountRelayListStatus::empty(),
+                key_package: None,
+            });
+        entry.account_id_hex = account_id_hex.to_owned();
+        entry.relay_lists = relay_lists.clone();
+        self.save_directory_entry(&entry)
+    }
+
+    fn remember_directory_key_package(&self, fetched: &FetchedKeyPackage) -> Result<(), AppError> {
+        let mut entry = self
+            .directory_entry_for_account_id(&fetched.account_id_hex)?
+            .unwrap_or_else(|| DirectoryEntry {
+                account_id_hex: fetched.account_id_hex.clone(),
+                relay_lists: fetched.relay_lists.clone(),
+                key_package: None,
+            });
+        entry.account_id_hex = fetched.account_id_hex.clone();
+        entry.relay_lists = fetched.relay_lists.clone();
+        entry.key_package = Some(DirectoryKeyPackage {
+            key_package_id: fetched.key_package_id.clone(),
+            key_package_hex: hex::encode(&fetched.key_package.0),
+            created_at: fetched.created_at,
+            source_relays: fetched.source_relays.clone(),
+        });
+        self.save_directory_entry(&entry)
+    }
+
+    fn save_directory_entry(&self, entry: &DirectoryEntry) -> Result<(), AppError> {
+        self.directory_cache()?.put(entry)
+    }
+
+    fn directory_cache(&self) -> Result<DirectoryCache, AppError> {
+        DirectoryCache::open(self.root.join(APP_CACHE_DB_FILE))
+    }
+
+    fn relay_client_for_endpoints(
+        &self,
+        keys: &nostr::Keys,
+        endpoints: &[TransportEndpoint],
+    ) -> Arc<dyn NostrRelayClient> {
+        if !endpoints.is_empty() {
+            if endpoints.iter().all(is_local_relay_endpoint) {
+                return Arc::new(FileRelayClient {
+                    root: self.local_relay_dir(),
+                });
+            }
+            let client = NostrSdkClient::builder().signer(keys.clone()).build();
+            return Arc::new(NostrSdkRelayClient::new(client));
+        }
+        match &self.relay {
+            AppRelay::Local => Arc::new(FileRelayClient {
+                root: self.local_relay_dir(),
+            }),
+            AppRelay::Sdk { .. } => {
+                let client = NostrSdkClient::builder().signer(keys.clone()).build();
+                Arc::new(NostrSdkRelayClient::new(client))
+            }
+        }
+    }
+
+    fn account_home(&self) -> AccountHome {
+        self.account_home.clone()
+    }
+}
+
+impl AppClient {
+    pub async fn publish_key_package(&mut self) -> Result<KeyPackage, AppError> {
+        self.runtime.activate_transport(None).await?;
+        Ok(self.runtime.publish_fresh_key_package().await?)
+    }
+
+    pub async fn create_group(
+        &mut self,
+        name: &str,
+        member_refs: &[&str],
+    ) -> Result<GroupId, AppError> {
+        validate_group_profile(name, "")?;
+        let mut members = Vec::with_capacity(member_refs.len());
+        for member in member_refs {
+            members.push(self.app.member_key_package(member)?);
+        }
+
+        let (group_id, effects) = self
+            .runtime
+            .create_group(CreateGroupRequest {
+                name: name.to_owned(),
+                description: String::new(),
+                members,
+                required_features: Vec::new(),
+                initial_admins: Vec::new(),
+            })
+            .await?;
+        fail_if_publish_failed(&effects.failures)?;
+        self.add_group(&group_id)?;
+        self.runtime.sync_transport_groups(None).await?;
+        self.app.save_state(&self.state)?;
+        Ok(group_id)
+    }
+
+    pub fn members(&self, group_id: &GroupId) -> Result<Vec<AppGroupMemberRecord>, AppError> {
+        self.ensure_group(group_id)?;
+        let profiles = self.app.profiles_by_id()?;
+        Ok(self
+            .runtime
+            .members(group_id)?
+            .into_iter()
+            .map(|member| {
+                let member_id_hex = hex::encode(member.id.as_slice());
+                let account = profiles.get(&member_id_hex).cloned();
+                AppGroupMemberRecord {
+                    member_id_hex,
+                    local: account.is_some(),
+                    account,
+                }
+            })
+            .collect())
+    }
+
+    pub async fn invite_members(
+        &mut self,
+        group_id: &GroupId,
+        member_refs: &[&str],
+    ) -> Result<SendSummary, AppError> {
+        self.ensure_group(group_id)?;
+        let mut key_packages = Vec::with_capacity(member_refs.len());
+        for member in member_refs {
+            key_packages.push(self.app.member_key_package(member)?);
+        }
+
+        self.runtime.sync_transport_groups(None).await?;
+        let effects = self
+            .runtime
+            .send(SendIntent::Invite {
+                group_id: group_id.clone(),
+                key_packages,
+            })
+            .await?;
+        fail_if_publish_failed(&effects.failures)?;
+        self.refresh_group(group_id);
+        self.app.save_state(&self.state)?;
+        Ok(send_summary_from_effects(&effects))
+    }
+
+    pub async fn remove_members(
+        &mut self,
+        group_id: &GroupId,
+        member_refs: &[&str],
+    ) -> Result<SendSummary, AppError> {
+        self.ensure_group(group_id)?;
+        let mut members = Vec::with_capacity(member_refs.len());
+        for member in member_refs {
+            members.push(self.app.member_id(member)?);
+        }
+
+        self.runtime.sync_transport_groups(None).await?;
+        let effects = self
+            .runtime
+            .send(SendIntent::RemoveMembers {
+                group_id: group_id.clone(),
+                members,
+            })
+            .await?;
+        fail_if_publish_failed(&effects.failures)?;
+        self.refresh_group(group_id);
+        self.app.save_state(&self.state)?;
+        Ok(send_summary_from_effects(&effects))
+    }
+
+    pub async fn send(
+        &mut self,
+        group_id: &GroupId,
+        payload: &[u8],
+    ) -> Result<SendSummary, AppError> {
+        self.ensure_group(group_id)?;
+
+        self.runtime.sync_transport_groups(None).await?;
+        let effects = self
+            .runtime
+            .send(SendIntent::AppMessage {
+                group_id: group_id.clone(),
+                payload: payload.to_vec(),
+            })
+            .await?;
+        fail_if_publish_failed(&effects.failures)?;
+        let group_id_hex = hex::encode(group_id.as_slice());
+        let plaintext = String::from_utf8_lossy(payload).to_string();
+        let message_ids = effects
+            .reports
+            .iter()
+            .map(|report| hex::encode(report.message_id.as_slice()))
+            .collect::<Vec<_>>();
+        let projection = self.app.account_projection(&self.state.label)?;
+        for message_id_hex in &message_ids {
+            projection.record_message(&AppMessageProjection {
+                message_id_hex: message_id_hex.clone(),
+                direction: "sent".to_owned(),
+                group_id_hex: group_id_hex.clone(),
+                sender: self.state.label.clone(),
+                plaintext: plaintext.clone(),
+            })?;
+        }
+        Ok(SendSummary {
+            published: effects.reports.len(),
+            message_ids,
+        })
+    }
+
+    pub async fn update_group_profile(
+        &mut self,
+        group_id: &GroupId,
+        name: Option<&str>,
+        description: Option<&str>,
+    ) -> Result<SendSummary, AppError> {
+        if name.is_none() && description.is_none() {
+            return Err(AppError::InvalidGroupProfile(
+                "name or description is required".into(),
+            ));
+        }
+        validate_group_profile(name.unwrap_or(""), description.unwrap_or(""))?;
+        self.ensure_group(group_id)?;
+
+        self.runtime.sync_transport_groups(None).await?;
+        let effects = self
+            .runtime
+            .send(SendIntent::UpdateGroupData {
+                group_id: group_id.clone(),
+                name: name.map(ToOwned::to_owned),
+                description: description.map(ToOwned::to_owned),
+            })
+            .await?;
+        fail_if_publish_failed(&effects.failures)?;
+        let message_ids = effects
+            .reports
+            .iter()
+            .map(|report| hex::encode(report.message_id.as_slice()))
+            .collect::<Vec<_>>();
+        let endpoint = self.app.group_endpoint(group_id);
+        let group_metadata = self.runtime.group_record(group_id).ok();
+        add_group(&mut self.state, group_id, endpoint, group_metadata.as_ref());
+        self.app.save_state(&self.state)?;
+        Ok(SendSummary {
+            published: effects.reports.len(),
+            message_ids,
+        })
+    }
+
+    pub async fn sync(&mut self) -> Result<SyncSummary, AppError> {
+        self.runtime.sync_transport_groups(None).await?;
+        match self.app.relay {
+            AppRelay::Local => self.sync_file_relay().await,
+            AppRelay::Sdk { .. } => self.sync_sdk_relay().await,
+        }
+    }
+
+    async fn sync_file_relay(&mut self) -> Result<SyncSummary, AppError> {
+        let profiles = self.app.profiles_by_id()?;
+        let mut summary = SyncSummary::default();
+        let mut seen = self
+            .state
+            .seen_events
+            .iter()
+            .cloned()
+            .collect::<HashSet<_>>();
+
+        for record in self.app.relay_events()? {
+            if seen.contains(&record.event.id) {
+                continue;
+            }
+            if !is_transport_delivery_event(&record.event) {
+                continue;
+            }
+
+            let mut delivered_total = 0;
+            for endpoint in &record.endpoints {
+                let delivered = self
+                    .adapter
+                    .handle_relay_event(NostrRelayEvent {
+                        endpoint: endpoint.clone(),
+                        subscription_id: Some(format!("file-relay:{}", record.event.id)),
+                        event: record.event.clone(),
+                    })
+                    .await?;
+                delivered_total += delivered;
+            }
+
+            for _ in 0..delivered_total {
+                let delivery = self
+                    .adapter
+                    .receive()
+                    .await?
+                    .ok_or_else(|| AppError::Publish("adapter delivery queue closed".into()))?;
+                self.ingest_delivery(delivery, &profiles, &mut summary)
+                    .await?;
+            }
+
+            seen.insert(record.event.id.clone());
+            self.state.seen_events.push(record.event.id);
+        }
+
+        self.app.save_state(&self.state)?;
+        Ok(summary)
+    }
+
+    async fn sync_sdk_relay(&mut self) -> Result<SyncSummary, AppError> {
+        let profiles = self.app.profiles_by_id()?;
+        let mut summary = SyncSummary::default();
+        let mut first_wait = true;
+
+        loop {
+            let wait = if first_wait {
+                SDK_FIRST_SYNC_WAIT
+            } else {
+                SDK_DRAIN_WAIT
+            };
+            first_wait = false;
+
+            let delivery = match timeout(wait, self.adapter.receive()).await {
+                Ok(Ok(Some(delivery))) => delivery,
+                Ok(Ok(None)) => break,
+                Ok(Err(e)) => return Err(e.into()),
+                Err(_) => break,
+            };
+            self.state
+                .seen_events
+                .push(hex::encode(delivery.message.id.as_slice()));
+            self.ingest_delivery(delivery, &profiles, &mut summary)
+                .await?;
+        }
+
+        self.app.save_state(&self.state)?;
+        Ok(summary)
+    }
+
+    async fn ingest_delivery(
+        &mut self,
+        delivery: cgka_traits::TransportDelivery,
+        profiles: &HashMap<String, String>,
+        summary: &mut SyncSummary,
+    ) -> Result<(), AppError> {
+        let source_message_id_hex = hex::encode(delivery.message.id.as_slice());
+        let effects = self.runtime.ingest_delivery(delivery).await?;
+        fail_if_publish_failed(&effects.effects.failures)?;
+        for event in &effects.effects.events {
+            let before = self.state.groups.len();
+            let group_metadata =
+                event_group_id(event).and_then(|group_id| self.runtime.group_record(group_id).ok());
+            if let Some(message) = observe_event(
+                &mut self.state,
+                profiles,
+                summary,
+                event,
+                &self.app,
+                group_metadata.as_ref(),
+                &source_message_id_hex,
+            ) {
+                self.app
+                    .account_projection(&self.state.label)?
+                    .record_message(&AppMessageProjection {
+                        message_id_hex: message.message_id_hex.clone(),
+                        direction: "received".to_owned(),
+                        group_id_hex: hex::encode(message.group_id.as_slice()),
+                        sender: message.sender.clone(),
+                        plaintext: message.plaintext.clone(),
+                    })?;
+            }
+            if self.state.groups.len() != before {
+                self.refresh_group_routes()?;
+                self.runtime.sync_transport_groups(None).await?;
+            }
+        }
+        Ok(())
+    }
+
+    fn ensure_group(&self, group_id: &GroupId) -> Result<(), AppError> {
+        let group_id_hex = hex::encode(group_id.as_slice());
+        if self
+            .state
+            .groups
+            .iter()
+            .any(|group| group.group_id_hex == group_id_hex)
+        {
+            Ok(())
+        } else {
+            Err(AppError::UnknownGroup(group_id_hex))
+        }
+    }
+
+    fn refresh_group(&mut self, group_id: &GroupId) {
+        let endpoint = self.app.group_endpoint(group_id);
+        let group_metadata = self.runtime.group_record(group_id).ok();
+        add_group(&mut self.state, group_id, endpoint, group_metadata.as_ref());
+    }
+
+    fn add_group(&mut self, group_id: &GroupId) -> Result<(), AppError> {
+        let endpoint = self.app.group_endpoint(group_id);
+        let group_metadata = self.runtime.group_record(group_id).ok();
+        add_group(
+            &mut self.state,
+            group_id,
+            endpoint.clone(),
+            group_metadata.as_ref(),
+        );
+        self.routing
+            .add_group(group_subscription(group_id, endpoint));
+        Ok(())
+    }
+
+    fn refresh_group_routes(&mut self) -> Result<(), AppError> {
+        for group in &self.state.groups {
+            let group_id = GroupId::new(hex::decode(&group.group_id_hex)?);
+            self.routing.add_group(group_subscription(
+                &group_id,
+                TransportEndpoint(group.endpoint.clone()),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Drop for AppClient {
+    fn drop(&mut self) {
+        if let Some(handle) = self.notification_forwarder.take() {
+            handle.abort();
+        }
+    }
+}
+
+#[derive(Clone)]
+struct AppTransportRouting {
+    inner: Arc<RwLock<AppRoutingState>>,
+}
+
+#[derive(Clone, Debug)]
+struct AppRoutingState {
+    local_inbox_endpoints: Vec<TransportEndpoint>,
+    key_package_endpoints: Vec<TransportEndpoint>,
+    inbox_routes: HashMap<MemberId, Vec<TransportEndpoint>>,
+    group_routes: Vec<TransportGroupSubscription>,
+    required_acks: usize,
+}
+
+impl AppTransportRouting {
+    fn new(state: AppRoutingState) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(state)),
+        }
+    }
+
+    fn add_group(&self, group: TransportGroupSubscription) {
+        let mut state = self.inner.write().expect("app routing lock poisoned");
+        if state
+            .group_routes
+            .iter()
+            .any(|existing| existing.group_id == group.group_id)
+        {
+            return;
+        }
+        state.group_routes.push(group);
+    }
+}
+
+impl TransportRoutingPolicy for AppTransportRouting {
+    fn local_inbox_endpoints(&self) -> Vec<TransportEndpoint> {
+        self.inner
+            .read()
+            .expect("app routing lock poisoned")
+            .local_inbox_endpoints
+            .clone()
+    }
+
+    fn key_package_endpoints(&self) -> Vec<TransportEndpoint> {
+        self.inner
+            .read()
+            .expect("app routing lock poisoned")
+            .key_package_endpoints
+            .clone()
+    }
+
+    fn group_subscriptions(&self) -> Vec<TransportGroupSubscription> {
+        self.inner
+            .read()
+            .expect("app routing lock poisoned")
+            .group_routes
+            .clone()
+    }
+
+    fn publish_target(
+        &self,
+        message: &TransportMessage,
+    ) -> Result<TransportPublishTarget, TransportRoutingError> {
+        let state = self.inner.read().expect("app routing lock poisoned");
+        match &message.envelope {
+            TransportEnvelope::Welcome { recipient } => {
+                let endpoints = state
+                    .inbox_routes
+                    .get(recipient)
+                    .cloned()
+                    .ok_or(TransportRoutingError::MissingInboxRoute)?;
+                Ok(TransportPublishTarget::Inbox {
+                    recipient: recipient.clone(),
+                    endpoints,
+                })
+            }
+            TransportEnvelope::GroupMessage { transport_group_id } => {
+                let route = state
+                    .group_routes
+                    .iter()
+                    .find(|route| route.transport_group_id == *transport_group_id)
+                    .cloned()
+                    .ok_or(TransportRoutingError::MissingGroupRoute)?;
+                Ok(TransportPublishTarget::Group {
+                    group_id: route.group_id,
+                    transport_group_id: route.transport_group_id,
+                    endpoints: route.endpoints,
+                })
+            }
+        }
+    }
+
+    fn required_acks(&self, _target: &TransportPublishTarget) -> usize {
+        self.inner
+            .read()
+            .expect("app routing lock poisoned")
+            .required_acks
+    }
+}
+
+#[derive(Clone)]
+struct AppKeyPackagePublisher {
+    app: MarmotApp,
+    account_label: String,
+    keys: nostr::Keys,
+}
+
+#[async_trait]
+impl KeyPackagePublisher for AppKeyPackagePublisher {
+    async fn publish_key_package(
+        &self,
+        publication: KeyPackagePublication,
+    ) -> Result<(), KeyPackagePublishError> {
+        let key_package_id = key_package_id(&publication.key_package);
+        let relay_client = self
+            .app
+            .relay_client_for_endpoints(&self.keys, &publication.endpoints);
+        let nostr_publication = NostrKeyPackagePublication {
+            account_id: publication.account_id.clone(),
+            key_package: publication.key_package.clone(),
+            key_package_id: key_package_id.clone(),
+            mls_ciphersuite: "0x0001".into(),
+            mls_extensions: vec!["0xf2ee".into()],
+            mls_proposals: vec!["0x000a".into()],
+            advertised_relays: publication.endpoints.clone(),
+            publish_endpoints: publication.endpoints.clone(),
+        };
+        NostrKeyPackagePublisher::new(relay_client)
+            .publish_key_package(&nostr_publication)
+            .await
+            .map_err(|e| KeyPackagePublishError(e.to_string()))?;
+
+        let dir = self.app.local_relay_dir().join(KEY_PACKAGE_DIR);
+        fs::create_dir_all(&dir).map_err(|e| KeyPackagePublishError(e.to_string()))?;
+        write_json(
+            dir.join(format!("{}.json", self.account_label)),
+            &KeyPackageRecord {
+                account_label: self.account_label.clone(),
+                account_id_hex: hex::encode(publication.account_id.as_slice()),
+                key_package_id,
+                key_package_hex: hex::encode(publication.key_package.0),
+            },
+        )
+        .map_err(|e| KeyPackagePublishError(e.to_string()))
+    }
+}
+
+fn relay_list_status_from_records(
+    account_id_hex: &str,
+    mut records: Vec<RelayEventRecord>,
+) -> AccountRelayListStatus {
+    records.sort_by_key(|record| record.event.created_at);
+    let mut status = AccountRelayListStatus::empty();
+    for record in records {
+        if record.event.pubkey != account_id_hex {
+            continue;
+        }
+        let relays = relays_from_relay_list_event(&record.event);
+        if relays.is_empty() {
+            continue;
+        }
+        match record.event.kind {
+            KIND_NIP65_RELAY_LIST => status.nip65.relays = relays,
+            KIND_MARMOT_INBOX_RELAY_LIST => status.inbox.relays = relays,
+            KIND_MARMOT_KEY_PACKAGE_RELAY_LIST => status.key_package.relays = relays,
+            _ => continue,
+        }
+        push_unique_strings(
+            &mut status.bootstrap_relays,
+            record
+                .endpoints
+                .iter()
+                .map(|endpoint| endpoint.0.clone())
+                .collect::<Vec<_>>(),
+        );
+    }
+    status.refresh();
+    status
+}
+
+fn relay_list_filter(public_key: PublicKey) -> Filter {
+    Filter::new()
+        .author(public_key)
+        .kinds([
+            Kind::from(KIND_NIP65_RELAY_LIST as u16),
+            Kind::from(KIND_MARMOT_INBOX_RELAY_LIST as u16),
+            Kind::from(KIND_MARMOT_KEY_PACKAGE_RELAY_LIST as u16),
+        ])
+        .limit(12)
+}
+
+fn key_package_filter(public_key: PublicKey) -> Filter {
+    Filter::new()
+        .author(public_key)
+        .kind(Kind::from(KIND_MARMOT_KEY_PACKAGE as u16))
+        .limit(12)
+}
+
+fn latest_key_package_from_records(
+    account_id_hex: &str,
+    mut records: Vec<RelayEventRecord>,
+) -> Result<FetchedKeyPackage, AppError> {
+    records.sort_by(|a, b| {
+        a.event
+            .created_at
+            .cmp(&b.event.created_at)
+            .then_with(|| a.event.id.cmp(&b.event.id))
+    });
+    let mut latest = None;
+    for record in records {
+        if record.event.kind != KIND_MARMOT_KEY_PACKAGE || record.event.pubkey != account_id_hex {
+            continue;
+        }
+        latest = Some(key_package_from_record(record)?);
+    }
+    latest.ok_or_else(|| AppError::MissingKeyPackage(account_id_hex.to_owned()))
+}
+
+fn key_package_from_record(record: RelayEventRecord) -> Result<FetchedKeyPackage, AppError> {
+    let event = record.event;
+    let key_package_id = event
+        .tag_value("d")
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| AppError::InvalidKeyPackageEvent("missing d tag".into()))?
+        .to_owned();
+    let encoding = event
+        .tag_value("encoding")
+        .ok_or_else(|| AppError::InvalidKeyPackageEvent("missing encoding tag".into()))?;
+    if encoding != KEY_PACKAGE_ENCODING_HEX {
+        return Err(AppError::InvalidKeyPackageEvent(format!(
+            "unsupported encoding: {encoding}"
+        )));
+    }
+    let key_package_bytes = hex::decode(&event.content)?;
+    if key_package_bytes.is_empty() {
+        return Err(AppError::InvalidKeyPackageEvent(
+            "empty key package content".into(),
+        ));
+    }
+    let mut source_relays = Vec::new();
+    push_unique_strings(
+        &mut source_relays,
+        record
+            .endpoints
+            .into_iter()
+            .map(|endpoint| endpoint.0)
+            .collect::<Vec<_>>(),
+    );
+    Ok(FetchedKeyPackage {
+        account_id_hex: event.pubkey,
+        key_package: KeyPackage(key_package_bytes),
+        key_package_id,
+        created_at: event.created_at,
+        source_relays,
+        relay_lists: AccountRelayListStatus::empty(),
+    })
+}
+
+fn key_package_id(key_package: &KeyPackage) -> String {
+    hex::encode(Sha256::digest(&key_package.0))
+}
+
+fn sqlite_file_requires_key(path: &Path) -> bool {
+    if !path.exists() {
+        return false;
+    }
+    Connection::open(path)
+        .and_then(|conn| {
+            conn.query_row("SELECT count(*) FROM sqlite_master", [], |row| {
+                row.get::<_, i64>(0)
+            })
+        })
+        .is_err()
+}
+
+fn relay_urls_from_endpoints(endpoints: &[TransportEndpoint]) -> Result<Vec<RelayUrl>, AppError> {
+    endpoints
+        .iter()
+        .map(|endpoint| {
+            RelayUrl::parse(endpoint.as_str()).map_err(|e| {
+                AppError::RelayDirectory(format!("invalid relay URL {}: {e}", endpoint.as_str()))
+            })
+        })
+        .collect()
+}
+
+fn is_local_relay_endpoint(endpoint: &TransportEndpoint) -> bool {
+    endpoint.as_str().starts_with("marmot-local://")
+}
+
+fn is_transport_delivery_event(event: &NostrTransportEvent) -> bool {
+    matches!(event.kind, KIND_MARMOT_GROUP_MESSAGE | KIND_NIP59_GIFT_WRAP)
+}
+
+fn relays_from_relay_list_event(event: &NostrTransportEvent) -> Vec<String> {
+    let tag_name = match event.kind {
+        KIND_NIP65_RELAY_LIST => "r",
+        KIND_MARMOT_INBOX_RELAY_LIST | KIND_MARMOT_KEY_PACKAGE_RELAY_LIST => "relay",
+        _ => return Vec::new(),
+    };
+    let mut relays = Vec::new();
+    for tag in &event.tags {
+        if tag.first().is_some_and(|name| name == tag_name)
+            && let Some(value) = tag.get(1).filter(|value| !value.trim().is_empty())
+        {
+            push_unique_strings(&mut relays, [value.clone()]);
+        }
+    }
+    relays
+}
+
+fn push_unique_strings(values: &mut Vec<String>, candidates: impl IntoIterator<Item = String>) {
+    for candidate in candidates {
+        if !values.contains(&candidate) {
+            values.push(candidate);
+        }
+    }
+}
+
+#[derive(Clone)]
+struct FileRelayClient {
+    root: PathBuf,
+}
+
+#[async_trait]
+impl NostrRelayClient for FileRelayClient {
+    async fn subscribe(
+        &self,
+        _subscription: transport_nostr_adapter::NostrSubscription,
+    ) -> Result<(), TransportAdapterError> {
+        Ok(())
+    }
+
+    async fn unsubscribe(
+        &self,
+        _subscription: transport_nostr_adapter::NostrSubscription,
+    ) -> Result<(), TransportAdapterError> {
+        Ok(())
+    }
+
+    async fn unsubscribe_account(
+        &self,
+        _account_id: &MemberId,
+    ) -> Result<(), TransportAdapterError> {
+        Ok(())
+    }
+
+    async fn publish_event(
+        &self,
+        endpoints: &[TransportEndpoint],
+        event: &NostrTransportEvent,
+        required_acks: usize,
+    ) -> Result<NostrPublishOutcome, TransportAdapterError> {
+        let dir = self.root.join(EVENT_DIR);
+        fs::create_dir_all(&dir).map_err(|e| TransportAdapterError::Backend(e.to_string()))?;
+        let _ = required_acks;
+        let record = RelayEventRecord {
+            endpoints: endpoints.to_vec(),
+            event: event.clone(),
+        };
+        let file = dir.join(format!("{}-{}.json", event.created_at, event.id));
+        write_json(file, &record).map_err(|e| TransportAdapterError::Backend(e.to_string()))?;
+        Ok(NostrPublishOutcome {
+            accepted: endpoints
+                .iter()
+                .cloned()
+                .map(|endpoint| TransportEndpointReceipt {
+                    endpoint,
+                    accepted_at: Some(Timestamp(event.created_at)),
+                })
+                .collect(),
+            failed: Vec::new(),
+        })
+    }
+}
+
+fn observe_event(
+    state: &mut AccountState,
+    profiles: &HashMap<String, String>,
+    summary: &mut SyncSummary,
+    event: &GroupEvent,
+    app: &MarmotApp,
+    group_metadata: Option<&Group>,
+    source_message_id_hex: &str,
+) -> Option<ReceivedMessage> {
+    match event {
+        GroupEvent::GroupJoined { group_id, .. } | GroupEvent::GroupCreated { group_id } => {
+            add_group(
+                state,
+                group_id,
+                app.group_endpoint(group_id),
+                group_metadata,
+            );
+            summary.joined_groups.push(group_id.clone());
+            summary.events.push(event.clone());
+            None
+        }
+        GroupEvent::MessageReceived {
+            group_id,
+            sender,
+            payload,
+        } => {
+            add_group(
+                state,
+                group_id,
+                app.group_endpoint(group_id),
+                group_metadata,
+            );
+            let sender_hex = hex::encode(sender.as_slice());
+            let sender_label = profiles.get(&sender_hex).cloned().unwrap_or(sender_hex);
+            let plaintext = String::from_utf8_lossy(payload).to_string();
+            let message = ReceivedMessage {
+                message_id_hex: source_message_id_hex.to_owned(),
+                sender: sender_label,
+                group_id: group_id.clone(),
+                plaintext,
+            };
+            summary.messages.push(message.clone());
+            summary.events.push(event.clone());
+            Some(message)
+        }
+        _ => {
+            if let Some(group_id) = event_group_id(event) {
+                add_group(
+                    state,
+                    group_id,
+                    app.group_endpoint(group_id),
+                    group_metadata,
+                );
+            }
+            summary.events.push(event.clone());
+            None
+        }
+    }
+}
+
+fn event_group_id(event: &GroupEvent) -> Option<&GroupId> {
+    match event {
+        GroupEvent::GroupCreated { group_id }
+        | GroupEvent::GroupJoined { group_id, .. }
+        | GroupEvent::MessageReceived { group_id, .. }
+        | GroupEvent::AppMessageInvalidated { group_id, .. }
+        | GroupEvent::MemberAdded { group_id, .. }
+        | GroupEvent::MemberRemoved { group_id, .. }
+        | GroupEvent::EpochChanged { group_id, .. }
+        | GroupEvent::ForkRecovered { group_id, .. } => Some(group_id),
+    }
+}
+
+fn add_group(
+    state: &mut AccountState,
+    group_id: &GroupId,
+    endpoint: TransportEndpoint,
+    group_metadata: Option<&Group>,
+) {
+    let group_id_hex = hex::encode(group_id.as_slice());
+    if let Some(existing) = state
+        .groups
+        .iter_mut()
+        .find(|group| group.group_id_hex == group_id_hex)
+    {
+        existing.refresh_from_group(endpoint, group_metadata);
+        return;
+    }
+    state.groups.push(AppGroupRecord::from_group(
+        group_id,
+        endpoint,
+        group_metadata,
+    ));
+}
+
+fn group_subscription(
+    group_id: &GroupId,
+    endpoint: TransportEndpoint,
+) -> TransportGroupSubscription {
+    TransportGroupSubscription {
+        group_id: group_id.clone(),
+        transport_group_id: group_id.as_slice().to_vec(),
+        endpoints: vec![endpoint],
+    }
+}
+
+fn fail_if_publish_failed(failures: &[marmot_account::PublishFailure]) -> Result<(), AppError> {
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(AppError::Publish(
+            failures
+                .iter()
+                .map(|failure| failure.reason.as_str())
+                .collect::<Vec<_>>()
+                .join("; "),
+        ))
+    }
+}
+
+fn send_summary_from_effects(effects: &marmot_account::AccountDeviceEffects) -> SendSummary {
+    SendSummary {
+        published: effects.reports.len(),
+        message_ids: effects
+            .reports
+            .iter()
+            .map(|report| hex::encode(report.message_id.as_slice()))
+            .collect(),
+    }
+}
+
+fn validate_group_profile(name: &str, description: &str) -> Result<(), AppError> {
+    if name.len() > 256 {
+        return Err(AppError::InvalidGroupProfile(
+            "name must be at most 256 UTF-8 bytes".into(),
+        ));
+    }
+    if description.len() > 4096 {
+        return Err(AppError::InvalidGroupProfile(
+            "description must be at most 4096 UTF-8 bytes".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn encode_component_vectors(parts: &[&[u8]]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for part in parts {
+        encode_quic_varint(part.len() as u64, &mut out);
+        out.extend_from_slice(part);
+    }
+    out
+}
+
+fn encode_quic_varint(value: u64, out: &mut Vec<u8>) {
+    if value < 64 {
+        out.push(value as u8);
+    } else if value < 16_384 {
+        let encoded = 0x4000 | value as u16;
+        out.extend_from_slice(&encoded.to_be_bytes());
+    } else if value < 1_073_741_824 {
+        let encoded = 0x8000_0000 | value as u32;
+        out.extend_from_slice(&encoded.to_be_bytes());
+    } else {
+        let encoded = 0xC000_0000_0000_0000 | value;
+        out.extend_from_slice(&encoded.to_be_bytes());
+    }
+}
+
+fn read_json<T: for<'de> Deserialize<'de>>(path: impl AsRef<Path>) -> Result<T, AppError> {
+    let bytes = fs::read(path)?;
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+fn write_json<T: Serialize>(path: impl AsRef<Path>, value: &T) -> Result<(), AppError> {
+    let path = path.as_ref();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let bytes = serde_json::to_vec_pretty(value)?;
+    fs::write(path, bytes)?;
+    Ok(())
+}

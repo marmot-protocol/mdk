@@ -1,0 +1,28 @@
+[package]
+name = "marmot-app"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+cgka-engine.workspace = true
+cgka-session.workspace = true
+cgka-traits.workspace = true
+hex.workspace = true
+marmot-account.workspace = true
+nostr.workspace = true
+nostr-sdk.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+storage-sqlite.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+transport-nostr-adapter = { workspace = true, features = ["sdk"] }
+transport-nostr-peeler.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

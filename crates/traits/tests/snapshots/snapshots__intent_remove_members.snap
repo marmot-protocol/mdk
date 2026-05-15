@@ -1,0 +1,23 @@
+---
+source: crates/traits/tests/snapshots.rs
+expression: "SendIntent::RemoveMembers { group_id: gid(), members: vec![mem_id()], }"
+---
+{
+  "RemoveMembers": {
+    "group_id": [
+      170,
+      170,
+      170,
+      170
+    ],
+    "members": [
+      [
+        97,
+        108,
+        105,
+        99,
+        101
+      ]
+    ]
+  }
+}

@@ -350,6 +350,13 @@ fn snapshot_send_intents() {
             key_packages: vec![KeyPackage(vec![0xEF; 4])],
         }
     );
+    insta::assert_json_snapshot!(
+        "intent_remove_members",
+        SendIntent::RemoveMembers {
+            group_id: gid(),
+            members: vec![mem_id()],
+        }
+    );
     insta::assert_json_snapshot!("intent_leave", SendIntent::Leave { group_id: gid() });
     insta::assert_json_snapshot!(
         "intent_update_group_data",

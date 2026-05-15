@@ -16,6 +16,7 @@ adds a `nostr-sdk` backed `NostrSdkRelayClient`.
 - Publishes already-wrapped `TransportMessage`s to target endpoints and returns endpoint-level publish reports.
 - Builds and publishes Marmot kind `30443` KeyPackage events through the same relay-client boundary when supplied with
   the MIP-00 metadata.
+- Builds NIP-65 kind `10002`, Marmot inbox kind `10050`, and Marmot KeyPackage kind `10051` account relay-list events.
 - Removes stale group subscriptions when an active account's group set changes.
 - Exposes adapter-local lifecycle metrics for diagnostics.
 - With the `sdk` feature, plans `nostr-sdk` filters/subscription ids, signs unsigned group events with the configured

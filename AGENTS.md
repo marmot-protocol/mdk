@@ -10,8 +10,10 @@ This repo owns the candidate CGKA engine workspace:
 - OpenMLS-backed engine implementation,
 - production-shaped account-device session wrapper,
 - future app-core account orchestration,
+- first app runtime bridge,
 - in-memory and SQLCipher-backed storage backends,
 - Nostr transport adapter and peeler,
+- first app CLI surface,
 - conformance simulator and vector fixtures,
 - Tamarin models for distributed convergence,
 - architecture notes and CGKA contracts,
@@ -25,11 +27,13 @@ This repo owns the candidate CGKA engine workspace:
 | Engine integration tests | `crates/cgka-engine/tests/AGENTS.md` |
 | Account-device session lifecycle | `crates/cgka-session/AGENTS.md` |
 | Account orchestration / app-core shell | `crates/marmot-account/AGENTS.md` |
+| App runtime bridge | `crates/marmot-app/AGENTS.md` |
 | Storage traits and shared types | `crates/traits/AGENTS.md` |
 | In-memory storage | `crates/storage-memory/AGENTS.md` |
 | SQLite storage | `crates/storage-sqlite/AGENTS.md` |
 | Nostr transport adapter | `crates/transport-nostr-adapter/AGENTS.md` |
 | Nostr transport peeler | `crates/transport-nostr-peeler/AGENTS.md` |
+| First app CLI surface | `crates/dm/AGENTS.md` |
 | Local two-client lab | `crates/marmot-lab/README.md` |
 | Multi-client harness / vectors | `crates/cgka-conformance-simulator/AGENTS.md` |
 | Architecture docs | `docs/AGENTS.md` and `docs/marmot-architecture/AGENTS.md` |

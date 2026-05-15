@@ -17,7 +17,7 @@ use cgka_traits::engine::{
 };
 use cgka_traits::engine_state::PendingStateRef;
 use cgka_traits::error::EngineError;
-use cgka_traits::group::Member;
+use cgka_traits::group::{Group, Member};
 use cgka_traits::group_context::GroupContext;
 use cgka_traits::ingest::IngestOutcome;
 use cgka_traits::peeler::TransportPeeler;
@@ -53,6 +53,9 @@ pub struct Engine<S: StorageProvider> {
 
     pub(crate) events_buf: VecDeque<GroupEvent>,
     pub(crate) auto_publish_buf: VecDeque<AutoPublish>,
+    /// Members removed by a locally staged commit. The event is emitted after
+    /// publish confirmation, when the OpenMLS pending commit is actually
+    /// merged.
     pub(crate) pending_auto_removed: HashMap<PendingStateRef, Vec<MemberId>>,
 
     /// MessageIds the engine has ingested. Backs `StaleReason::AlreadySeen`.
@@ -173,6 +176,14 @@ impl<S: StorageProvider> Engine<S> {
             .as_millis()
             .try_into()
             .unwrap_or(u64::MAX)
+    }
+
+    /// Return the Marmot group metadata mirrored from signed MLS group state.
+    ///
+    /// App surfaces use this for projections such as group profile components
+    /// without reaching into OpenMLS internals.
+    pub fn group_record(&self, group_id: &GroupId) -> Result<Group, EngineError> {
+        Ok(self.storage.get_group(group_id)?)
     }
 }
 

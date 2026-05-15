@@ -25,12 +25,17 @@ use tokio::sync::{Mutex, RwLock, mpsc};
 use transport_nostr_peeler::{NOSTR_SOURCE, NostrTransportEvent};
 
 mod key_package;
+mod relay_list;
 #[cfg(feature = "sdk")]
 mod sdk_client;
 
 pub use key_package::{
     KEY_PACKAGE_ENCODING_HEX, KIND_MARMOT_KEY_PACKAGE, KIND_MARMOT_KEY_PACKAGE_RELAY_LIST,
     NostrKeyPackagePublication, NostrKeyPackagePublisher,
+};
+pub use relay_list::{
+    KIND_MARMOT_INBOX_RELAY_LIST, KIND_NIP65_RELAY_LIST, NostrAccountRelayListKind,
+    NostrAccountRelayListPublication,
 };
 #[cfg(feature = "sdk")]
 pub use sdk_client::{NostrSdkRelayClient, NostrSdkSubscriptionPlan};

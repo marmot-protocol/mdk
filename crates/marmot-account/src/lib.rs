@@ -5,6 +5,10 @@
 //! routing, KeyPackage publication, and publish confirmation or rollback.
 
 use std::collections::{HashMap, VecDeque};
+use std::fs;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use cgka_session::{
@@ -14,6 +18,7 @@ use cgka_session::{
 use cgka_traits::engine::{CreateGroupRequest, GroupEvent, KeyPackage, SendIntent};
 use cgka_traits::engine_state::PendingStateRef;
 use cgka_traits::error::EngineError;
+use cgka_traits::group::{Group, Member};
 use cgka_traits::ingest::IngestOutcome;
 use cgka_traits::transport::{TransportEnvelope, TransportMessage};
 use cgka_traits::{
@@ -21,10 +26,518 @@ use cgka_traits::{
     TransportAdapterError, TransportDelivery, TransportEndpoint, TransportGroupSubscription,
     TransportGroupSync, TransportPublishReport, TransportPublishRequest, TransportPublishTarget,
 };
+use serde::{Deserialize, Serialize};
 
 const TRACE_TARGET: &str = "marmot_account::runtime";
 
 pub type AccountResult<T> = Result<T, AccountError>;
+
+pub type AccountHomeResult<T> = Result<T, AccountHomeError>;
+
+const ACCOUNT_RECORD_FILE: &str = "account.json";
+const ACCOUNT_SECRET_FILE: &str = "secret.json";
+const LOCAL_FILE_SECRET_BACKEND: &str = "local-dev-file";
+pub const DEFAULT_KEYCHAIN_SERVICE_NAME: &str = "com.marmot.darkmatter";
+
+#[derive(Clone)]
+pub struct AccountHome {
+    root: PathBuf,
+    secret_store: Arc<dyn AccountSecretStore>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AccountSummary {
+    pub label: String,
+    pub account_id_hex: String,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum AccountHomeError {
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
+    #[error(transparent)]
+    Hex(#[from] hex::FromHexError),
+    #[error("account already exists: {0}")]
+    AccountExists(String),
+    #[error("unknown account: {0}")]
+    UnknownAccount(String),
+    #[error("invalid nsec or secret key")]
+    InvalidSecretKey,
+    #[error("invalid account label: {0}")]
+    InvalidAccountLabel(String),
+    #[error("stored account id does not match stored secret key")]
+    AccountIdMismatch,
+    #[error("unsupported account secret storage backend: {0}")]
+    UnsupportedSecretBackend(String),
+    #[error("account secret store is not initialized: {0}")]
+    SecretStoreNotInitialized(String),
+    #[error("account secret store is unavailable: {0}")]
+    SecretStoreUnavailable(String),
+    #[error("account secret store operation failed: {0}")]
+    SecretStore(String),
+    #[error("account secret was not found for account id: {0}")]
+    SecretNotFound(String),
+    #[error("account secret store service name cannot be empty")]
+    EmptySecretStoreService,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct StoredAccountSecret {
+    #[serde(default = "stored_secret_version")]
+    version: u32,
+    #[serde(default = "stored_secret_backend")]
+    backend: String,
+    secret_key_hex: String,
+}
+
+pub trait AccountSecretStore: Send + Sync {
+    fn has_secret_for_label(&self, label: &str) -> AccountHomeResult<bool>;
+    fn write_secret(&self, account: &AccountSummary, keys: &nostr::Keys) -> AccountHomeResult<()>;
+    fn load_secret(&self, account: &AccountSummary) -> AccountHomeResult<nostr::Keys>;
+    fn remove_secret(&self, account: &AccountSummary) -> AccountHomeResult<()>;
+}
+
+#[derive(Clone, Debug)]
+pub struct LocalFileSecretStore {
+    root: PathBuf,
+}
+
+impl LocalFileSecretStore {
+    pub fn new(root: impl AsRef<Path>) -> Self {
+        Self {
+            root: root.as_ref().to_path_buf(),
+        }
+    }
+
+    fn secret_path(&self, label: &str) -> PathBuf {
+        self.root
+            .join("accounts")
+            .join(label)
+            .join(ACCOUNT_SECRET_FILE)
+    }
+}
+
+impl AccountSecretStore for LocalFileSecretStore {
+    fn has_secret_for_label(&self, label: &str) -> AccountHomeResult<bool> {
+        Ok(self.secret_path(label).exists())
+    }
+
+    fn write_secret(&self, account: &AccountSummary, keys: &nostr::Keys) -> AccountHomeResult<()> {
+        write_secret_json(
+            self.secret_path(&account.label),
+            &StoredAccountSecret {
+                version: stored_secret_version(),
+                backend: stored_secret_backend(),
+                secret_key_hex: keys.secret_key().to_secret_hex(),
+            },
+        )
+    }
+
+    fn load_secret(&self, account: &AccountSummary) -> AccountHomeResult<nostr::Keys> {
+        let secret: StoredAccountSecret = read_json(self.secret_path(&account.label))?;
+        if secret.backend != LOCAL_FILE_SECRET_BACKEND {
+            return Err(AccountHomeError::UnsupportedSecretBackend(secret.backend));
+        }
+        nostr::Keys::parse(&secret.secret_key_hex).map_err(|_| AccountHomeError::InvalidSecretKey)
+    }
+
+    fn remove_secret(&self, account: &AccountSummary) -> AccountHomeResult<()> {
+        let path = self.secret_path(&account.label);
+        match fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(err.into()),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct KeychainSecretStore {
+    service_name: String,
+}
+
+impl KeychainSecretStore {
+    pub fn new(service_name: impl Into<String>) -> AccountHomeResult<Self> {
+        let service_name = service_name.into().trim().to_owned();
+        if service_name.is_empty() {
+            return Err(AccountHomeError::EmptySecretStoreService);
+        }
+        initialize_keyring_store()?;
+        Ok(Self { service_name })
+    }
+
+    pub fn service_name(&self) -> &str {
+        &self.service_name
+    }
+
+    fn entry_for_account(&self, account_id_hex: &str) -> AccountHomeResult<keyring_core::Entry> {
+        keyring_core::Entry::new(&self.service_name, account_id_hex).map_err(map_keyring_error)
+    }
+}
+
+impl AccountSecretStore for KeychainSecretStore {
+    fn has_secret_for_label(&self, _label: &str) -> AccountHomeResult<bool> {
+        Ok(false)
+    }
+
+    fn write_secret(&self, account: &AccountSummary, keys: &nostr::Keys) -> AccountHomeResult<()> {
+        self.entry_for_account(&account.account_id_hex)?
+            .set_password(&keys.secret_key().to_secret_hex())
+            .map_err(map_keyring_error)
+    }
+
+    fn load_secret(&self, account: &AccountSummary) -> AccountHomeResult<nostr::Keys> {
+        match self
+            .entry_for_account(&account.account_id_hex)?
+            .get_password()
+        {
+            Ok(secret_key) => {
+                nostr::Keys::parse(&secret_key).map_err(|_| AccountHomeError::InvalidSecretKey)
+            }
+            Err(keyring_core::Error::NoEntry) => Err(AccountHomeError::SecretNotFound(
+                account.account_id_hex.clone(),
+            )),
+            Err(err) => Err(map_keyring_error(err)),
+        }
+    }
+
+    fn remove_secret(&self, account: &AccountSummary) -> AccountHomeResult<()> {
+        match self
+            .entry_for_account(&account.account_id_hex)?
+            .delete_credential()
+        {
+            Ok(()) | Err(keyring_core::Error::NoEntry) => Ok(()),
+            Err(err) => Err(map_keyring_error(err)),
+        }
+    }
+}
+
+fn stored_secret_version() -> u32 {
+    1
+}
+
+fn stored_secret_backend() -> String {
+    LOCAL_FILE_SECRET_BACKEND.to_owned()
+}
+
+impl AccountHome {
+    pub fn open(root: impl AsRef<Path>) -> Self {
+        let root = root.as_ref().to_path_buf();
+        Self {
+            secret_store: Arc::new(LocalFileSecretStore::new(&root)),
+            root,
+        }
+    }
+
+    pub fn open_with_keychain(
+        root: impl AsRef<Path>,
+        service_name: impl Into<String>,
+    ) -> AccountHomeResult<Self> {
+        let secret_store = Arc::new(KeychainSecretStore::new(service_name)?);
+        Ok(Self::open_with_secret_store(root, secret_store))
+    }
+
+    pub fn open_with_default_keychain(root: impl AsRef<Path>) -> AccountHomeResult<Self> {
+        Self::open_with_keychain(root, DEFAULT_KEYCHAIN_SERVICE_NAME)
+    }
+
+    pub fn open_with_secret_store(
+        root: impl AsRef<Path>,
+        secret_store: Arc<dyn AccountSecretStore>,
+    ) -> Self {
+        Self {
+            root: root.as_ref().to_path_buf(),
+            secret_store,
+        }
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub fn account_dir(&self, label: &str) -> PathBuf {
+        self.accounts_dir().join(label)
+    }
+
+    pub fn create_account(&self, label: &str) -> AccountHomeResult<AccountSummary> {
+        validate_account_label(label)?;
+        if self.account_record_path(label).exists()
+            || self.secret_store.has_secret_for_label(label)?
+        {
+            return Err(AccountHomeError::AccountExists(label.to_owned()));
+        }
+        let keys = nostr::Keys::generate();
+        self.write_account(label, &keys)
+    }
+
+    pub fn import_account(
+        &self,
+        label: &str,
+        secret_key: &str,
+    ) -> AccountHomeResult<AccountSummary> {
+        validate_account_label(label)?;
+        if self.account_record_path(label).exists()
+            || self.secret_store.has_secret_for_label(label)?
+        {
+            return Err(AccountHomeError::AccountExists(label.to_owned()));
+        }
+        let keys =
+            nostr::Keys::parse(secret_key).map_err(|_| AccountHomeError::InvalidSecretKey)?;
+        self.write_account(label, &keys)
+    }
+
+    pub fn account_id_for_secret(secret_key: &str) -> AccountHomeResult<String> {
+        let keys =
+            nostr::Keys::parse(secret_key).map_err(|_| AccountHomeError::InvalidSecretKey)?;
+        Ok(keys.public_key().to_hex())
+    }
+
+    pub fn account(&self, label: &str) -> AccountHomeResult<AccountSummary> {
+        validate_account_label(label)?;
+        let path = self.account_record_path(label);
+        if !path.exists() {
+            return Err(AccountHomeError::UnknownAccount(label.to_owned()));
+        }
+        read_json(path)
+    }
+
+    pub fn accounts(&self) -> AccountHomeResult<Vec<AccountSummary>> {
+        let dir = self.accounts_dir();
+        if !dir.exists() {
+            return Ok(Vec::new());
+        }
+
+        let mut accounts = Vec::new();
+        for entry in fs::read_dir(dir)? {
+            let path = entry?.path().join(ACCOUNT_RECORD_FILE);
+            if path.exists() {
+                accounts.push(read_json(path)?);
+            }
+        }
+        accounts.sort_by(|a: &AccountSummary, b| a.label.cmp(&b.label));
+        Ok(accounts)
+    }
+
+    pub fn load_signing_keys(&self, label: &str) -> AccountHomeResult<nostr::Keys> {
+        validate_account_label(label)?;
+        let account = self.account(label)?;
+        let keys = self.secret_store.load_secret(&account)?;
+        if keys.public_key().to_hex() != account.account_id_hex {
+            return Err(AccountHomeError::AccountIdMismatch);
+        }
+        Ok(keys)
+    }
+
+    fn write_account(&self, label: &str, keys: &nostr::Keys) -> AccountHomeResult<AccountSummary> {
+        validate_account_label(label)?;
+        let account = AccountSummary {
+            label: label.to_owned(),
+            account_id_hex: keys.public_key().to_hex(),
+        };
+        self.secret_store.write_secret(&account, keys)?;
+        if let Err(err) = write_json(self.account_record_path(label), &account) {
+            let _ = self.secret_store.remove_secret(&account);
+            return Err(err);
+        }
+        Ok(account)
+    }
+
+    fn accounts_dir(&self) -> PathBuf {
+        self.root.join("accounts")
+    }
+
+    fn account_record_path(&self, label: &str) -> PathBuf {
+        self.account_dir(label).join(ACCOUNT_RECORD_FILE)
+    }
+}
+
+fn initialize_keyring_store() -> AccountHomeResult<()> {
+    static KEYRING_STORE_INIT: Mutex<()> = Mutex::new(());
+    let _guard = KEYRING_STORE_INIT.lock().map_err(|_| {
+        AccountHomeError::SecretStoreUnavailable("keyring init lock poisoned".into())
+    })?;
+    if keyring_core::get_default_store().is_some() {
+        return Ok(());
+    }
+    initialize_platform_keyring_store()
+}
+
+fn initialize_platform_keyring_store() -> AccountHomeResult<()> {
+    #[cfg(test)]
+    {
+        set_default_keyring_store(keyring_core::mock::Store::new(), "mock")
+    }
+
+    #[cfg(all(not(test), target_os = "macos"))]
+    {
+        set_default_keyring_store(
+            apple_native_keyring_store::keychain::Store::new(),
+            "macOS Keychain",
+        )
+    }
+
+    #[cfg(all(not(test), target_os = "ios"))]
+    {
+        set_default_keyring_store(
+            apple_native_keyring_store::protected::Store::new(),
+            "iOS protected-data",
+        )
+    }
+
+    #[cfg(all(not(test), target_os = "windows"))]
+    {
+        set_default_keyring_store(windows_native_keyring_store::Store::new(), "Windows")
+    }
+
+    #[cfg(all(
+        not(test),
+        any(
+            target_os = "linux",
+            target_os = "freebsd",
+            target_os = "openbsd",
+            target_os = "netbsd",
+            target_os = "dragonfly"
+        )
+    ))]
+    {
+        set_default_keyring_store(
+            zbus_secret_service_keyring_store::Store::new(),
+            "Secret Service",
+        )
+    }
+
+    #[cfg(all(not(test), target_os = "android"))]
+    {
+        set_default_keyring_store(android_native_keyring_store::Store::new(), "Android")
+    }
+
+    #[cfg(all(
+        not(test),
+        not(any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "windows",
+            target_os = "linux",
+            target_os = "freebsd",
+            target_os = "openbsd",
+            target_os = "netbsd",
+            target_os = "dragonfly",
+            target_os = "android",
+        ))
+    ))]
+    {
+        Err(AccountHomeError::SecretStoreUnavailable(
+            "no platform credential store is available for this target OS".into(),
+        ))
+    }
+}
+
+fn set_default_keyring_store<S>(
+    store: keyring_core::Result<Arc<S>>,
+    store_name: &str,
+) -> AccountHomeResult<()>
+where
+    S: keyring_core::api::CredentialStoreApi + Send + Sync + 'static,
+{
+    let store = store.map_err(|err| {
+        AccountHomeError::SecretStoreUnavailable(format!(
+            "failed to create {store_name} credential store: {err}"
+        ))
+    })?;
+    keyring_core::set_default_store(store);
+    Ok(())
+}
+
+fn map_keyring_error(err: keyring_core::Error) -> AccountHomeError {
+    match err {
+        keyring_core::Error::NoDefaultStore => {
+            AccountHomeError::SecretStoreNotInitialized(err.to_string())
+        }
+        keyring_core::Error::NoStorageAccess(inner) => {
+            AccountHomeError::SecretStoreUnavailable(format_storage_access_error(inner.as_ref()))
+        }
+        other => AccountHomeError::SecretStore(other.to_string()),
+    }
+}
+
+fn format_storage_access_error(inner: &dyn std::error::Error) -> String {
+    if cfg!(any(
+        target_os = "linux",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    )) {
+        format!(
+            "platform keyring is not available: {inner}. Make sure a Secret Service provider is running and unlocked."
+        )
+    } else {
+        format!("platform keyring is not available: {inner}")
+    }
+}
+
+fn read_json<T: for<'de> Deserialize<'de>>(path: impl AsRef<Path>) -> AccountHomeResult<T> {
+    let bytes = fs::read(path)?;
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+fn write_json<T: Serialize>(path: impl AsRef<Path>, value: &T) -> AccountHomeResult<()> {
+    let path = path.as_ref();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let bytes = serde_json::to_vec_pretty(value)?;
+    fs::write(path, bytes)?;
+    Ok(())
+}
+
+fn write_secret_json<T: Serialize>(path: impl AsRef<Path>, value: &T) -> AccountHomeResult<()> {
+    let path = path.as_ref();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let bytes = serde_json::to_vec_pretty(value)?;
+    write_private_file(path, &bytes)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn write_private_file(path: &Path, bytes: &[u8]) -> AccountHomeResult<()> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(bytes)?;
+    file.flush()?;
+    let mut permissions = file.metadata()?.permissions();
+    permissions.set_mode(0o600);
+    fs::set_permissions(path, permissions)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn write_private_file(path: &Path, bytes: &[u8]) -> AccountHomeResult<()> {
+    fs::write(path, bytes)?;
+    Ok(())
+}
+
+fn validate_account_label(label: &str) -> AccountHomeResult<()> {
+    if label.is_empty()
+        || label == "."
+        || label == ".."
+        || label.contains('/')
+        || label.contains('\\')
+    {
+        return Err(AccountHomeError::InvalidAccountLabel(label.to_owned()));
+    }
+    Ok(())
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum AccountError {
@@ -227,6 +740,10 @@ where
         &mut self.session
     }
 
+    pub fn group_record(&self, group_id: &GroupId) -> AccountResult<Group> {
+        Ok(self.session.group_record(group_id)?)
+    }
+
     pub async fn activate_transport(&self, since: Option<Timestamp>) -> AccountResult<()> {
         tracing::debug!(
             target: TRACE_TARGET,
@@ -293,6 +810,10 @@ where
     pub async fn send(&mut self, intent: SendIntent) -> AccountResult<AccountDeviceEffects> {
         let effects = self.session.send(intent).await?;
         self.publish_session_effects(effects).await
+    }
+
+    pub fn members(&self, group_id: &GroupId) -> AccountResult<Vec<Member>> {
+        Ok(self.session.members(group_id)?)
     }
 
     pub async fn ingest_delivery(

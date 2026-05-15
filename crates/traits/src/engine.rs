@@ -48,6 +48,11 @@ pub enum SendIntent {
         group_id: GroupId,
         key_packages: Vec<KeyPackage>,
     },
+    /// Remove existing members from the group.
+    RemoveMembers {
+        group_id: GroupId,
+        members: Vec<MemberId>,
+    },
     /// Leave the group via MIP-03 SelfRemove.
     Leave { group_id: GroupId },
     /// Update the group's `BasicGroupData` extension fields.
