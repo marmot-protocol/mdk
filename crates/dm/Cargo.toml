@@ -16,10 +16,12 @@ path = "src/bin/dmd.rs"
 [dependencies]
 cgka-traits.workspace = true
 clap.workspace = true
+crossterm.workspace = true
 hex.workspace = true
 marmot-account.workspace = true
 marmot-app.workspace = true
 nostr.workspace = true
+ratatui.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

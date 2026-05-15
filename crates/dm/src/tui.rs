@@ -1,0 +1,994 @@
+use std::path::PathBuf;
+use std::process::Command as StdCommand;
+use std::time::Duration;
+
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::Frame;
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
+use serde_json::Value;
+
+use crate::{Cli, CliOutput, SecretStoreKind};
+
+type TuiResult<T> = Result<T, TuiError>;
+
+#[derive(Debug, thiserror::Error)]
+enum TuiError {
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error("{0}")]
+    Cli(String),
+}
+
+pub(crate) async fn run_tui(cli: Cli) -> CliOutput {
+    match TuiApp::new(cli).and_then(|mut app| app.run()) {
+        Ok(()) => CliOutput {
+            code: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+        },
+        Err(err) => CliOutput {
+            code: 1,
+            stdout: String::new(),
+            stderr: format!("error: {err}\n"),
+        },
+    }
+}
+
+#[derive(Clone, Debug)]
+struct DmClient {
+    exe: PathBuf,
+    home: Option<PathBuf>,
+    socket: Option<PathBuf>,
+    relay: Option<String>,
+    secret_store: Option<SecretStoreKind>,
+    keychain_service: Option<String>,
+}
+
+impl DmClient {
+    fn from_cli(cli: &Cli) -> TuiResult<Self> {
+        Ok(Self {
+            exe: std::env::current_exe()?,
+            home: cli.home.clone(),
+            socket: cli.socket.clone(),
+            relay: cli.relay.clone(),
+            secret_store: cli.secret_store,
+            keychain_service: cli.keychain_service.clone(),
+        })
+    }
+
+    fn run_json<S>(&self, account: Option<&str>, args: &[S]) -> TuiResult<Value>
+    where
+        S: AsRef<str>,
+    {
+        let mut command = StdCommand::new(&self.exe);
+        command.arg("--json");
+        if let Some(home) = &self.home {
+            command.arg("--home").arg(home);
+        }
+        if let Some(socket) = &self.socket {
+            command.arg("--socket").arg(socket);
+        }
+        if let Some(relay) = &self.relay {
+            command.arg("--relay").arg(relay);
+        }
+        if let Some(secret_store) = self.secret_store {
+            command.arg("--secret-store").arg(secret_store.as_str());
+        }
+        if let Some(service) = &self.keychain_service {
+            command.arg("--keychain-service").arg(service);
+        }
+        if let Some(account) = account {
+            command.arg("--account").arg(account);
+        }
+        for arg in args {
+            command.arg(arg.as_ref());
+        }
+
+        let output = command.output()?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let envelope: Value = serde_json::from_str(stdout.trim()).map_err(|err| {
+            let mut message = format!("dm returned invalid JSON: {err}");
+            if !stderr.trim().is_empty() {
+                message.push_str(&format!("; stderr: {}", stderr.trim()));
+            }
+            TuiError::Cli(message)
+        })?;
+        if envelope.get("ok").and_then(Value::as_bool) == Some(true) {
+            return Ok(envelope.get("result").cloned().unwrap_or(Value::Null));
+        }
+        let message = envelope
+            .get("error")
+            .and_then(|error| error.get("message"))
+            .and_then(Value::as_str)
+            .or_else(|| {
+                envelope
+                    .get("error")
+                    .and_then(|error| error.get("code"))
+                    .and_then(Value::as_str)
+            })
+            .unwrap_or_else(|| stderr.trim());
+        Err(TuiError::Cli(message.to_owned()))
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AccountRow {
+    account_id: String,
+    npub: String,
+    local_signing: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ChatRow {
+    group_id: String,
+    name: String,
+    archived: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MessageRow {
+    direction: String,
+    from: String,
+    plaintext: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Focus {
+    Accounts,
+    Chats,
+    Composer,
+}
+
+impl Focus {
+    fn next(self) -> Self {
+        match self {
+            Self::Accounts => Self::Chats,
+            Self::Chats => Self::Composer,
+            Self::Composer => Self::Accounts,
+        }
+    }
+
+    fn previous(self) -> Self {
+        match self {
+            Self::Accounts => Self::Composer,
+            Self::Chats => Self::Accounts,
+            Self::Composer => Self::Chats,
+        }
+    }
+
+    fn title(self) -> &'static str {
+        match self {
+            Self::Accounts => "accounts",
+            Self::Chats => "chats",
+            Self::Composer => "composer",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum SlashCommand {
+    Help,
+    Refresh,
+    Sync,
+    Account(String),
+    NewGroup { name: String, members: Vec<String> },
+    Invite(String),
+    Remove(String),
+    KeysPublish,
+    KeysFetch(String),
+    Quit,
+}
+
+struct TuiApp {
+    client: DmClient,
+    initial_account: Option<String>,
+    running: bool,
+    focus: Focus,
+    accounts: Vec<AccountRow>,
+    selected_account: usize,
+    chats: Vec<ChatRow>,
+    selected_chat: usize,
+    messages: Vec<MessageRow>,
+    input: String,
+    status: String,
+    show_help: bool,
+}
+
+impl TuiApp {
+    fn new(cli: Cli) -> TuiResult<Self> {
+        let client = DmClient::from_cli(&cli)?;
+        Ok(Self {
+            client,
+            initial_account: cli.account.clone(),
+            running: true,
+            focus: Focus::Composer,
+            accounts: Vec::new(),
+            selected_account: 0,
+            chats: Vec::new(),
+            selected_chat: 0,
+            messages: Vec::new(),
+            input: String::new(),
+            status: "loading accounts".to_owned(),
+            show_help: false,
+        })
+    }
+
+    fn run(&mut self) -> TuiResult<()> {
+        let mut terminal = ratatui::init();
+        let result = (|| -> TuiResult<()> {
+            self.refresh_accounts()?;
+            while self.running {
+                terminal.draw(|frame| self.render(frame))?;
+                if event::poll(Duration::from_millis(200))? {
+                    match event::read()? {
+                        Event::Key(key) if key.kind == KeyEventKind::Press => {
+                            self.handle_key(key)?;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Ok(())
+        })();
+        ratatui::restore();
+        result
+    }
+
+    fn render(&self, frame: &mut Frame) {
+        let area = frame.area();
+        let root = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Min(8),
+                Constraint::Length(5),
+            ])
+            .split(area);
+
+        self.render_header(frame, root[0]);
+
+        let body = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Length(34),
+                Constraint::Length(36),
+                Constraint::Min(24),
+            ])
+            .split(root[1]);
+
+        self.render_accounts(frame, body[0]);
+        self.render_chats(frame, body[1]);
+        self.render_messages(frame, body[2]);
+        self.render_composer(frame, root[2]);
+
+        if self.show_help {
+            self.render_help(frame, centered_rect(70, 70, area));
+        }
+    }
+
+    fn render_header(&self, frame: &mut Frame, area: Rect) {
+        let account = self
+            .selected_account_row()
+            .map(|account| shorten(&account.npub, 18))
+            .unwrap_or_else(|| "no account".to_owned());
+        let chat = self
+            .selected_chat_row()
+            .map(|chat| shorten(&chat.name, 24))
+            .unwrap_or_else(|| "no chat".to_owned());
+        let line = Line::from(vec![
+            Span::styled(
+                "dm",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::raw(format!("focus={}  ", self.focus.title())),
+            Span::raw(format!("account={account}  chat={chat}")),
+        ]);
+        frame.render_widget(
+            Paragraph::new(line)
+                .block(Block::default().borders(Borders::ALL).title("Darkmatter"))
+                .alignment(Alignment::Left),
+            area,
+        );
+    }
+
+    fn render_accounts(&self, frame: &mut Frame, area: Rect) {
+        let items = if self.accounts.is_empty() {
+            vec![ListItem::new("no accounts")]
+        } else {
+            self.accounts
+                .iter()
+                .enumerate()
+                .map(|(index, account)| {
+                    let marker = if index == self.selected_account {
+                        ">"
+                    } else {
+                        " "
+                    };
+                    let signing = if account.local_signing {
+                        "local"
+                    } else {
+                        "public"
+                    };
+                    let style = selected_style(index == self.selected_account);
+                    ListItem::new(Line::from(vec![
+                        Span::raw(format!("{marker} ")),
+                        Span::styled(shorten(&account.npub, 22), Style::default().fg(Color::Cyan)),
+                        Span::raw(format!(" {signing}")),
+                    ]))
+                    .style(style)
+                })
+                .collect()
+        };
+        frame.render_widget(
+            List::new(items).block(panel_block("Accounts", self.focus == Focus::Accounts)),
+            area,
+        );
+    }
+
+    fn render_chats(&self, frame: &mut Frame, area: Rect) {
+        let items = if self.chats.is_empty() {
+            vec![ListItem::new("no chats")]
+        } else {
+            self.chats
+                .iter()
+                .enumerate()
+                .map(|(index, chat)| {
+                    let marker = if index == self.selected_chat {
+                        ">"
+                    } else {
+                        " "
+                    };
+                    let archived = if chat.archived { " archived" } else { "" };
+                    let style = selected_style(index == self.selected_chat);
+                    ListItem::new(Line::from(vec![
+                        Span::raw(format!("{marker} ")),
+                        Span::styled(shorten(&chat.name, 24), Style::default().fg(Color::Green)),
+                        Span::raw(archived),
+                    ]))
+                    .style(style)
+                })
+                .collect()
+        };
+        frame.render_widget(
+            List::new(items).block(panel_block("Chats", self.focus == Focus::Chats)),
+            area,
+        );
+    }
+
+    fn render_messages(&self, frame: &mut Frame, area: Rect) {
+        let lines = if self.messages.is_empty() {
+            vec![Line::from("no messages")]
+        } else {
+            self.messages
+                .iter()
+                .rev()
+                .flat_map(|message| {
+                    let author = if message.direction == "sent" {
+                        "me".to_owned()
+                    } else {
+                        shorten(&message.from, 18)
+                    };
+                    [
+                        Line::from(vec![
+                            Span::styled(author, Style::default().fg(Color::Yellow)),
+                            Span::raw(": "),
+                            Span::raw(message.plaintext.clone()),
+                        ]),
+                        Line::from(""),
+                    ]
+                })
+                .collect()
+        };
+        frame.render_widget(
+            Paragraph::new(lines)
+                .block(panel_block("Messages", false))
+                .wrap(Wrap { trim: false }),
+            area,
+        );
+    }
+
+    fn render_composer(&self, frame: &mut Frame, area: Rect) {
+        let prompt = if self.input.is_empty() {
+            "type a message or /help"
+        } else {
+            &self.input
+        };
+        let lines = vec![
+            Line::from(vec![
+                Span::styled("> ", Style::default().fg(Color::Cyan)),
+                Span::raw(prompt.to_owned()),
+            ]),
+            Line::from(self.status.clone()),
+        ];
+        frame.render_widget(
+            Paragraph::new(lines)
+                .block(panel_block("Composer", self.focus == Focus::Composer))
+                .wrap(Wrap { trim: false }),
+            area,
+        );
+    }
+
+    fn render_help(&self, frame: &mut Frame, area: Rect) {
+        let lines = vec![
+            Line::from(Span::styled(
+                "Darkmatter TUI",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from("Tab cycles panels. Arrows move. Enter selects or submits. Ctrl-C quits."),
+            Line::from(""),
+            Line::from("/sync"),
+            Line::from("/refresh"),
+            Line::from("/account <npub-or-hex>"),
+            Line::from("/new <name> [member-npub-or-hex ...]"),
+            Line::from("/invite <npub-or-hex>"),
+            Line::from("/remove <npub-or-hex>"),
+            Line::from("/keys publish"),
+            Line::from("/keys fetch <npub-or-hex>"),
+            Line::from("/quit"),
+        ];
+        frame.render_widget(Clear, area);
+        frame.render_widget(
+            Paragraph::new(lines)
+                .block(Block::default().borders(Borders::ALL).title("Help"))
+                .wrap(Wrap { trim: false }),
+            area,
+        );
+    }
+
+    fn handle_key(&mut self, key: KeyEvent) -> TuiResult<()> {
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+            self.running = false;
+            return Ok(());
+        }
+
+        match key.code {
+            KeyCode::Char('?') if self.focus != Focus::Composer || self.input.is_empty() => {
+                self.show_help = !self.show_help;
+            }
+            KeyCode::Char('q') if self.focus != Focus::Composer && self.input.is_empty() => {
+                self.running = false;
+            }
+            KeyCode::Tab => self.focus = self.focus.next(),
+            KeyCode::BackTab => self.focus = self.focus.previous(),
+            KeyCode::Up => self.move_selection(-1),
+            KeyCode::Down => self.move_selection(1),
+            KeyCode::Enter => self.activate_focus()?,
+            KeyCode::Esc => {
+                self.show_help = false;
+                self.input.clear();
+            }
+            KeyCode::Backspace if self.focus == Focus::Composer => {
+                self.input.pop();
+            }
+            KeyCode::Char('/') if self.focus != Focus::Composer => {
+                self.focus = Focus::Composer;
+                self.input.push('/');
+            }
+            KeyCode::Char('j') if self.focus != Focus::Composer => self.move_selection(1),
+            KeyCode::Char('k') if self.focus != Focus::Composer => self.move_selection(-1),
+            KeyCode::Char(character) if self.focus == Focus::Composer => {
+                self.input.push(character);
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn move_selection(&mut self, delta: isize) {
+        match self.focus {
+            Focus::Accounts => {
+                self.selected_account =
+                    move_index(self.selected_account, self.accounts.len(), delta);
+            }
+            Focus::Chats => {
+                self.selected_chat = move_index(self.selected_chat, self.chats.len(), delta);
+            }
+            Focus::Composer => {}
+        }
+    }
+
+    fn activate_focus(&mut self) -> TuiResult<()> {
+        match self.focus {
+            Focus::Accounts => self.select_current_account(),
+            Focus::Chats => self.refresh_messages(),
+            Focus::Composer => self.submit_input(),
+        }
+    }
+
+    fn submit_input(&mut self) -> TuiResult<()> {
+        let input = self.input.trim().to_owned();
+        self.input.clear();
+        if input.is_empty() {
+            return Ok(());
+        }
+        if input.starts_with('/') {
+            let command = parse_slash_command(&input).map_err(TuiError::Cli)?;
+            return self.run_slash_command(command);
+        }
+        self.send_message(input)
+    }
+
+    fn run_slash_command(&mut self, command: SlashCommand) -> TuiResult<()> {
+        match command {
+            SlashCommand::Help => {
+                self.show_help = true;
+                Ok(())
+            }
+            SlashCommand::Refresh => self.refresh_accounts(),
+            SlashCommand::Sync => {
+                let account_id = self.require_selected_local_account()?;
+                let result = self.client.run_json(Some(&account_id), &["sync"])?;
+                self.status = sync_status(&result);
+                self.refresh_chats()
+            }
+            SlashCommand::Account(selector) => self.select_account_by_selector(&selector),
+            SlashCommand::NewGroup { name, members } => {
+                let account_id = self.require_selected_local_account()?;
+                let mut args = vec!["group".to_owned(), "create".to_owned(), name];
+                args.extend(members);
+                let result = self.client.run_json(Some(&account_id), &args)?;
+                let group_id = value_string(&result, "group_id");
+                self.status = group_id
+                    .as_deref()
+                    .map(|group_id| format!("created group {}", shorten(group_id, 18)))
+                    .unwrap_or_else(|| "created group".to_owned());
+                self.refresh_chats()?;
+                if let Some(group_id) = group_id {
+                    self.select_chat_by_group_id(&group_id)?;
+                }
+                Ok(())
+            }
+            SlashCommand::Invite(member) => {
+                let account_id = self.require_selected_local_account()?;
+                let group_id = self.require_selected_group()?;
+                let args = vec![
+                    "group".to_owned(),
+                    "invite".to_owned(),
+                    group_id,
+                    "--member".to_owned(),
+                    member,
+                ];
+                let result = self.client.run_json(Some(&account_id), &args)?;
+                self.status = publish_status("invited member", &result);
+                self.refresh_messages()
+            }
+            SlashCommand::Remove(member) => {
+                let account_id = self.require_selected_local_account()?;
+                let group_id = self.require_selected_group()?;
+                let args = vec![
+                    "group".to_owned(),
+                    "remove".to_owned(),
+                    group_id,
+                    "--member".to_owned(),
+                    member,
+                ];
+                let result = self.client.run_json(Some(&account_id), &args)?;
+                self.status = publish_status("removed member", &result);
+                self.refresh_messages()
+            }
+            SlashCommand::KeysPublish => {
+                let account_id = self.require_selected_local_account()?;
+                let result = self
+                    .client
+                    .run_json(Some(&account_id), &["keys", "publish"])?;
+                let bytes = result
+                    .get("key_package_bytes")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default();
+                self.status = format!("published key package bytes={bytes}");
+                Ok(())
+            }
+            SlashCommand::KeysFetch(account) => {
+                let result = self.client.run_json(None, &["keys", "fetch", &account])?;
+                let bytes = result
+                    .get("key_package_bytes")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default();
+                self.status = format!("fetched key package bytes={bytes}");
+                Ok(())
+            }
+            SlashCommand::Quit => {
+                self.running = false;
+                Ok(())
+            }
+        }
+    }
+
+    fn send_message(&mut self, text: String) -> TuiResult<()> {
+        let account_id = self.require_selected_local_account()?;
+        let group_id = self.require_selected_group()?;
+        let args = vec!["message", "send", &group_id, &text];
+        let result = self.client.run_json(Some(&account_id), &args)?;
+        self.status = publish_status("sent message", &result);
+        self.refresh_messages()
+    }
+
+    fn refresh_accounts(&mut self) -> TuiResult<()> {
+        let result = self.client.run_json(None, &["account", "list"])?;
+        let previous_account_id = self
+            .selected_account_row()
+            .map(|account| account.account_id.clone())
+            .or_else(|| self.initial_account.clone());
+        self.accounts = result
+            .get("accounts")
+            .and_then(Value::as_array)
+            .map(|accounts| accounts.iter().filter_map(parse_account).collect())
+            .unwrap_or_default();
+        self.selected_account =
+            selected_account_index(&self.accounts, previous_account_id.as_deref()).unwrap_or(0);
+        if self.accounts.is_empty() {
+            self.chats.clear();
+            self.messages.clear();
+            self.status = "no accounts yet; create one with dm account create".to_owned();
+            return Ok(());
+        }
+        self.refresh_chats()
+    }
+
+    fn refresh_chats(&mut self) -> TuiResult<()> {
+        let Some(account) = self.selected_account_row().cloned() else {
+            self.chats.clear();
+            self.messages.clear();
+            self.status = "no account selected".to_owned();
+            return Ok(());
+        };
+        if !account.local_signing {
+            self.chats.clear();
+            self.messages.clear();
+            self.status =
+                "selected account is public-only; choose a local signing account".to_owned();
+            return Ok(());
+        }
+
+        let previous_group_id = self.selected_chat_row().map(|chat| chat.group_id.clone());
+        let result = self
+            .client
+            .run_json(Some(&account.account_id), &["chats", "list"])?;
+        self.chats = result
+            .get("chats")
+            .and_then(Value::as_array)
+            .map(|chats| chats.iter().filter_map(parse_chat).collect())
+            .unwrap_or_default();
+        self.selected_chat =
+            selected_chat_index(&self.chats, previous_group_id.as_deref()).unwrap_or(0);
+        if self.chats.is_empty() {
+            self.messages.clear();
+            self.status = format!("loaded account {}; no chats", shorten(&account.npub, 18));
+            return Ok(());
+        }
+        self.refresh_messages()
+    }
+
+    fn refresh_messages(&mut self) -> TuiResult<()> {
+        let account_id = self.require_selected_local_account()?;
+        let group_id = self.require_selected_group()?;
+        let args = vec![
+            "message".to_owned(),
+            "list".to_owned(),
+            "--group".to_owned(),
+            group_id.clone(),
+            "--limit".to_owned(),
+            "50".to_owned(),
+        ];
+        let result = self.client.run_json(Some(&account_id), &args)?;
+        self.messages = result
+            .get("messages")
+            .and_then(Value::as_array)
+            .map(|messages| messages.iter().filter_map(parse_message).collect())
+            .unwrap_or_default();
+        self.status = format!("loaded {} message(s)", self.messages.len());
+        Ok(())
+    }
+
+    fn select_current_account(&mut self) -> TuiResult<()> {
+        if self.accounts.is_empty() {
+            return Ok(());
+        }
+        self.refresh_chats()
+    }
+
+    fn select_account_by_selector(&mut self, selector: &str) -> TuiResult<()> {
+        let Some(index) = self
+            .accounts
+            .iter()
+            .position(|account| account_matches(account, selector))
+        else {
+            return Err(TuiError::Cli(format!("account not loaded: {selector}")));
+        };
+        self.selected_account = index;
+        self.status = format!("selected account {}", shorten(selector, 18));
+        self.refresh_chats()
+    }
+
+    fn select_chat_by_group_id(&mut self, group_id: &str) -> TuiResult<()> {
+        let Some(index) = self.chats.iter().position(|chat| chat.group_id == group_id) else {
+            return Ok(());
+        };
+        self.selected_chat = index;
+        self.refresh_messages()
+    }
+
+    fn selected_account_row(&self) -> Option<&AccountRow> {
+        self.accounts.get(self.selected_account)
+    }
+
+    fn selected_chat_row(&self) -> Option<&ChatRow> {
+        self.chats.get(self.selected_chat)
+    }
+
+    fn require_selected_local_account(&self) -> TuiResult<String> {
+        let account = self
+            .selected_account_row()
+            .ok_or_else(|| TuiError::Cli("no account selected".to_owned()))?;
+        if !account.local_signing {
+            return Err(TuiError::Cli(
+                "selected account is public-only and cannot sign".to_owned(),
+            ));
+        }
+        Ok(account.account_id.clone())
+    }
+
+    fn require_selected_group(&self) -> TuiResult<String> {
+        self.selected_chat_row()
+            .map(|chat| chat.group_id.clone())
+            .ok_or_else(|| TuiError::Cli("no chat selected".to_owned()))
+    }
+}
+
+fn parse_slash_command(input: &str) -> Result<SlashCommand, String> {
+    let trimmed = input.trim();
+    if !trimmed.starts_with('/') {
+        return Err("slash command must start with /".to_owned());
+    }
+    let mut parts = trimmed[1..].split_whitespace();
+    let Some(command) = parts.next() else {
+        return Err("empty slash command".to_owned());
+    };
+    let rest = parts.map(str::to_owned).collect::<Vec<_>>();
+    match command {
+        "help" | "?" => Ok(SlashCommand::Help),
+        "refresh" => Ok(SlashCommand::Refresh),
+        "sync" => Ok(SlashCommand::Sync),
+        "account" => one_arg(command, rest).map(SlashCommand::Account),
+        "new" => {
+            let mut rest = rest.into_iter();
+            let Some(name) = rest.next() else {
+                return Err("/new requires a group name".to_owned());
+            };
+            Ok(SlashCommand::NewGroup {
+                name,
+                members: rest.collect(),
+            })
+        }
+        "invite" => one_arg(command, rest).map(SlashCommand::Invite),
+        "remove" => one_arg(command, rest).map(SlashCommand::Remove),
+        "keys" => parse_keys_command(rest),
+        "quit" | "q" => Ok(SlashCommand::Quit),
+        other => Err(format!("unknown slash command: /{other}")),
+    }
+}
+
+fn parse_keys_command(args: Vec<String>) -> Result<SlashCommand, String> {
+    match args.as_slice() {
+        [command] if command == "publish" => Ok(SlashCommand::KeysPublish),
+        [command, account] if command == "fetch" => Ok(SlashCommand::KeysFetch(account.clone())),
+        _ => Err("/keys expects 'publish' or 'fetch <npub-or-hex>'".to_owned()),
+    }
+}
+
+fn one_arg(command: &str, args: Vec<String>) -> Result<String, String> {
+    match args.as_slice() {
+        [arg] => Ok(arg.clone()),
+        [] => Err(format!("/{command} requires an argument")),
+        _ => Err(format!("/{command} accepts exactly one argument")),
+    }
+}
+
+fn parse_account(value: &Value) -> Option<AccountRow> {
+    Some(AccountRow {
+        account_id: value_string(value, "account_id")?,
+        npub: value_string(value, "npub")?,
+        local_signing: value.get("local_signing").and_then(Value::as_bool)?,
+    })
+}
+
+fn parse_chat(value: &Value) -> Option<ChatRow> {
+    let profile = value.get("profile")?;
+    Some(ChatRow {
+        group_id: value_string(value, "group_id")?,
+        name: value_string(profile, "name").unwrap_or_else(|| "unnamed".to_owned()),
+        archived: value
+            .get("archived")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    })
+}
+
+fn parse_message(value: &Value) -> Option<MessageRow> {
+    Some(MessageRow {
+        direction: value_string(value, "direction").unwrap_or_else(|| "received".to_owned()),
+        from: value_string(value, "from").unwrap_or_else(|| "unknown".to_owned()),
+        plaintext: value_string(value, "plaintext")?,
+    })
+}
+
+fn value_string(value: &Value, key: &str) -> Option<String> {
+    value.get(key).and_then(Value::as_str).map(str::to_owned)
+}
+
+fn selected_account_index(accounts: &[AccountRow], selector: Option<&str>) -> Option<usize> {
+    selector.and_then(|selector| {
+        accounts
+            .iter()
+            .position(|account| account_matches(account, selector))
+    })
+}
+
+fn selected_chat_index(chats: &[ChatRow], group_id: Option<&str>) -> Option<usize> {
+    group_id.and_then(|group_id| chats.iter().position(|chat| chat.group_id == group_id))
+}
+
+fn account_matches(account: &AccountRow, selector: &str) -> bool {
+    account.account_id == selector || account.npub == selector
+}
+
+fn move_index(current: usize, len: usize, delta: isize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    let max = len.saturating_sub(1) as isize;
+    (current as isize + delta).clamp(0, max) as usize
+}
+
+fn sync_status(result: &Value) -> String {
+    let events = result
+        .get("events")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    let joined = result
+        .get("joined_groups")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    let messages = result
+        .get("messages")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    format!("sync: events={events} joined={joined} messages={messages}")
+}
+
+fn publish_status(action: &str, result: &Value) -> String {
+    let published = result
+        .get("published")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    format!("{action}; published={published}")
+}
+
+fn selected_style(selected: bool) -> Style {
+    if selected {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::White)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    }
+}
+
+fn panel_block(title: &'static str, focused: bool) -> Block<'static> {
+    let style = if focused {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    Block::default()
+        .borders(Borders::ALL)
+        .border_style(style)
+        .title(title)
+}
+
+fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(area);
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(vertical[1])[1]
+}
+
+fn shorten(value: &str, max_len: usize) -> String {
+    if value.len() <= max_len {
+        return value.to_owned();
+    }
+    if max_len <= 3 {
+        return value.chars().take(max_len).collect();
+    }
+    let prefix_len = (max_len - 3) / 2;
+    let suffix_len = max_len - 3 - prefix_len;
+    let prefix = value.chars().take(prefix_len).collect::<String>();
+    let suffix = value
+        .chars()
+        .rev()
+        .take(suffix_len)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
+    format!("{prefix}...{suffix}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn slash_command_parser_understands_core_commands() {
+        assert_eq!(parse_slash_command("/help"), Ok(SlashCommand::Help));
+        assert_eq!(parse_slash_command("/sync"), Ok(SlashCommand::Sync));
+        assert_eq!(
+            parse_slash_command("/account npub1abc"),
+            Ok(SlashCommand::Account("npub1abc".to_owned()))
+        );
+        assert_eq!(
+            parse_slash_command("/new general npub1bob deadbeef"),
+            Ok(SlashCommand::NewGroup {
+                name: "general".to_owned(),
+                members: vec!["npub1bob".to_owned(), "deadbeef".to_owned()],
+            })
+        );
+    }
+
+    #[test]
+    fn slash_command_parser_handles_key_package_commands() {
+        assert_eq!(
+            parse_slash_command("/keys publish"),
+            Ok(SlashCommand::KeysPublish)
+        );
+        assert_eq!(
+            parse_slash_command("/keys fetch npub1bob"),
+            Ok(SlashCommand::KeysFetch("npub1bob".to_owned()))
+        );
+        assert!(parse_slash_command("/keys").is_err());
+    }
+
+    #[test]
+    fn account_selection_matches_npub_or_hex_pubkey() {
+        let account = AccountRow {
+            account_id: "abc123".to_owned(),
+            npub: "npub1abc".to_owned(),
+            local_signing: true,
+        };
+
+        assert!(account_matches(&account, "abc123"));
+        assert!(account_matches(&account, "npub1abc"));
+        assert!(!account_matches(&account, "abc"));
+    }
+
+    #[test]
+    fn move_index_clamps_at_list_edges() {
+        assert_eq!(move_index(0, 3, -1), 0);
+        assert_eq!(move_index(0, 3, 1), 1);
+        assert_eq!(move_index(2, 3, 1), 2);
+        assert_eq!(move_index(0, 0, 1), 0);
+    }
+}

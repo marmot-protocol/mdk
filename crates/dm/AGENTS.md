@@ -13,11 +13,13 @@ Real CLI app surface for the Darkmatter/Marmot stack.
   directly to group/invite/key commands; directory warming and search live under `marmot-app`/daemon behavior.
 - Keep one spelling per product capability: `keys`, `chats`, top-level `--account <npub-or-hex>`, and positional basics
   for common group and message flows. Do not add hidden compatibility aliases for old command shapes.
+- Keep `dm tui` as a thin Ratatui shell over the real `dm --json` command surface. It may add approachable navigation
+  and slash commands, but it should not become a second app runtime or bypass `marmot-app`/daemon behavior.
 - Keep daemon behavior real. `dm daemon start|stop|status`, the `dmd` binary, socket-backed execution, pid/log files, and
   background sync should be covered when touched. Background sync should also refresh the app-level Nostr user directory
   for local signing accounts.
 - Do not print or log nsecs, secret key hex, plaintext database keys, or other key material.
-- Treat JSON response shapes as future TUI/API inputs; change them deliberately.
+- Treat JSON response shapes as TUI/API inputs; change them deliberately.
 
 ## Verification
 

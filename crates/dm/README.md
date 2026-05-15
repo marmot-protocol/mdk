@@ -3,7 +3,7 @@
 `dm` is the first real app surface for the Darkmatter/Marmot stack.
 
 It is intentionally small, but it is not a smoke harness: commands are named around accounts, keys, chats, groups,
-messages, and sync. Pass `--json` for a stable response envelope suitable for a future TUI.
+messages, and sync. Pass `--json` for a stable response envelope; `dm tui` uses that same surface.
 
 The CLI uses `marmot-account` for account home/key storage and `marmot-app` for the runtime bridge plus Nostr
 account-relay setup. `dm` can run commands directly or send them to the background `dmd` daemon over a Unix socket.
@@ -24,6 +24,37 @@ cargo run -p darkmatter-cli --bin dm -- --home /tmp/dm --secret-store file --acc
 cargo run -p darkmatter-cli --bin dm -- --home /tmp/dm --secret-store file --account <bob-npub-or-hex> sync
 cargo run -p darkmatter-cli --bin dm -- --home /tmp/dm --secret-store file --account <bob-npub-or-hex> chats list
 cargo run -p darkmatter-cli --bin dm -- --home /tmp/dm --secret-store file --account <bob-npub-or-hex> message list --group <group-hex> --limit 20
+```
+
+## TUI
+
+`dm tui` is a Ratatui shell over the real CLI. It lists local accounts, shows visible chats for the selected local
+signing account, renders recent messages, and sends messages from a composer. When a daemon socket exists for the same
+home, the TUI's child `dm --json` commands use the daemon just like normal CLI commands.
+
+```sh
+cargo run -p darkmatter-cli --bin dm -- --home /tmp/dm --secret-store file tui
+```
+
+Controls stay deliberately small:
+
+- `Tab` cycles accounts, chats, and composer.
+- Arrow keys move the selected account or chat.
+- `Enter` selects the highlighted account/chat or submits the composer.
+- `?` opens help, `Esc` clears help/input, and `Ctrl-C` quits.
+
+The composer accepts either a plain chat message or a slash command:
+
+```text
+/sync
+/refresh
+/account <npub-or-hex>
+/new <name> [member-npub-or-hex ...]
+/invite <npub-or-hex>
+/remove <npub-or-hex>
+/keys publish
+/keys fetch <npub-or-hex>
+/quit
 ```
 
 Most account-scoped commands resolve the local account in this order:

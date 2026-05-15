@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub mod daemon;
+pub mod tui;
 
 #[derive(Parser, Clone, Debug, Serialize, Deserialize)]
 #[command(name = "dm", about = "Darkmatter CLI", disable_help_subcommand = true)]
@@ -61,6 +62,8 @@ struct CliRuntimeInfo {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Subcommand)]
 enum Command {
+    #[command(about = "Open the interactive terminal UI")]
+    Tui,
     Account {
         #[command(subcommand)]
         command: AccountCommand,
@@ -278,6 +281,10 @@ where
         return daemon::run_daemon_command(cli, command).await;
     }
 
+    if matches!(cli.command, Command::Tui) {
+        return tui::run_tui(cli).await;
+    }
+
     let home = resolve_home(cli.home.clone());
     if let Some(socket) = daemon_socket_for_client(&cli, &home) {
         match daemon::send_execute(&socket, cli.clone()).await {
@@ -367,6 +374,10 @@ async fn execute_inner(cli: Cli) -> Result<CommandOutput, DmError> {
         }
         Command::Daemon { .. } => Ok(CommandOutput {
             plain: "daemon command is handled by dm".to_owned(),
+            json: json!({"handled": "client"}),
+        }),
+        Command::Tui => Ok(CommandOutput {
+            plain: "tui command is handled by dm".to_owned(),
             json: json!({"handled": "client"}),
         }),
         Command::Sync => {
