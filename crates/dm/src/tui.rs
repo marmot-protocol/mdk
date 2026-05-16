@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 use std::process::Command as StdCommand;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::Frame;
@@ -13,6 +13,9 @@ use serde_json::Value;
 use crate::{Cli, CliOutput, SecretStoreKind};
 
 type TuiResult<T> = Result<T, TuiError>;
+
+const DAEMON_STATUS_INTERVAL: Duration = Duration::from_secs(2);
+const LIVE_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Debug, thiserror::Error)]
 enum TuiError {
@@ -136,6 +139,23 @@ struct MessageRow {
     plaintext: String,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct DaemonView {
+    running: bool,
+    pid: Option<u64>,
+    sync_interval_ms: Option<u64>,
+    last_sync: Option<DaemonSyncView>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DaemonSyncView {
+    accounts: u64,
+    events: u64,
+    joined_groups: u64,
+    messages: u64,
+    errors: usize,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Focus {
     Accounts,
@@ -178,6 +198,9 @@ enum SlashCommand {
     AccountCreate,
     AccountAddPublic(String),
     AccountImportSecret(String),
+    DaemonStatus,
+    DaemonStart { sync_interval_ms: Option<u64> },
+    DaemonStop,
     NewGroup { name: String, members: Vec<String> },
     Invite(String),
     Remove(String),
@@ -196,6 +219,9 @@ struct TuiApp {
     chats: Vec<ChatRow>,
     selected_chat: usize,
     messages: Vec<MessageRow>,
+    daemon: DaemonView,
+    last_daemon_poll: Instant,
+    last_live_refresh: Instant,
     input: String,
     status: String,
     show_help: bool,
@@ -204,6 +230,7 @@ struct TuiApp {
 impl TuiApp {
     fn new(cli: Cli) -> TuiResult<Self> {
         let client = DmClient::from_cli(&cli)?;
+        let now = Instant::now();
         Ok(Self {
             client,
             initial_account: cli.account.clone(),
@@ -214,6 +241,9 @@ impl TuiApp {
             chats: Vec::new(),
             selected_chat: 0,
             messages: Vec::new(),
+            daemon: DaemonView::default(),
+            last_daemon_poll: now,
+            last_live_refresh: now,
             input: String::new(),
             status: "loading accounts".to_owned(),
             show_help: false,
@@ -223,8 +253,10 @@ impl TuiApp {
     fn run(&mut self) -> TuiResult<()> {
         let mut terminal = ratatui::init();
         let result = (|| -> TuiResult<()> {
+            let _ = self.refresh_daemon_status();
             self.refresh_accounts()?;
             while self.running {
+                self.tick();
                 terminal.draw(|frame| self.render(frame))?;
                 if event::poll(Duration::from_millis(200))? {
                     match event::read()? {
@@ -239,6 +271,36 @@ impl TuiApp {
         })();
         ratatui::restore();
         result
+    }
+
+    fn tick(&mut self) {
+        let now = Instant::now();
+        if now.duration_since(self.last_daemon_poll) >= DAEMON_STATUS_INTERVAL {
+            if let Err(err) = self.refresh_daemon_status() {
+                self.status = format!("daemon status failed: {err}");
+            }
+            self.last_daemon_poll = now;
+        }
+
+        if should_live_refresh(
+            &self.daemon,
+            &self.input,
+            now.duration_since(self.last_live_refresh),
+        ) {
+            match self.refresh_accounts() {
+                Ok(()) => {
+                    self.status = live_refresh_status(
+                        self.accounts.len(),
+                        self.chats.len(),
+                        self.messages.len(),
+                    );
+                }
+                Err(err) => {
+                    self.status = format!("live refresh failed: {err}");
+                }
+            }
+            self.last_live_refresh = now;
+        }
     }
 
     fn render(&self, frame: &mut Frame) {
@@ -282,6 +344,7 @@ impl TuiApp {
             .selected_chat_row()
             .map(|chat| shorten(&chat.name, 24))
             .unwrap_or_else(|| "no chat".to_owned());
+        let daemon = daemon_header_label(&self.daemon);
         let line = Line::from(vec![
             Span::styled(
                 "dm",
@@ -291,6 +354,7 @@ impl TuiApp {
             ),
             Span::raw("  "),
             Span::raw(format!("focus={}  ", self.focus.title())),
+            Span::raw(format!("daemon={daemon}  ")),
             Span::raw(format!("account={account}  chat={chat}")),
         ]);
         frame.render_widget(
@@ -435,6 +499,9 @@ impl TuiApp {
             Line::from("/account create"),
             Line::from("/account add <npub-or-hex>"),
             Line::from("/account import <nsec>"),
+            Line::from("/daemon status"),
+            Line::from("/daemon start [sync-interval-ms]"),
+            Line::from("/daemon stop"),
             Line::from("/new <name> [member-npub-or-hex ...]"),
             Line::from("/invite <npub-or-hex>"),
             Line::from("/remove <npub-or-hex>"),
@@ -545,6 +612,13 @@ impl TuiApp {
             SlashCommand::AccountImportSecret(secret) => {
                 self.create_or_import_account(Some(secret), "imported account")
             }
+            SlashCommand::DaemonStatus => {
+                self.refresh_daemon_status()?;
+                self.status = daemon_status_sentence(&self.daemon);
+                Ok(())
+            }
+            SlashCommand::DaemonStart { sync_interval_ms } => self.start_daemon(sync_interval_ms),
+            SlashCommand::DaemonStop => self.stop_daemon(),
             SlashCommand::NewGroup { name, members } => {
                 let account_id = self.require_selected_local_account()?;
                 let mut args = vec!["group".to_owned(), "create".to_owned(), name];
@@ -661,6 +735,31 @@ impl TuiApp {
             "public-only"
         };
         self.status = format!("{action} {} {signing}", shorten(&npub, 18));
+        Ok(())
+    }
+
+    fn refresh_daemon_status(&mut self) -> TuiResult<()> {
+        let result = self.client.run_json(None, &["daemon", "status"])?;
+        self.daemon = parse_daemon_view(&result);
+        Ok(())
+    }
+
+    fn start_daemon(&mut self, sync_interval_ms: Option<u64>) -> TuiResult<()> {
+        let mut args = vec!["daemon".to_owned(), "start".to_owned()];
+        if let Some(sync_interval_ms) = sync_interval_ms {
+            args.push("--sync-interval-ms".to_owned());
+            args.push(sync_interval_ms.to_string());
+        }
+        let result = self.client.run_json(None, &args)?;
+        self.daemon = parse_daemon_view(&result);
+        self.status = daemon_status_sentence(&self.daemon);
+        Ok(())
+    }
+
+    fn stop_daemon(&mut self) -> TuiResult<()> {
+        let result = self.client.run_json(None, &["daemon", "stop"])?;
+        self.daemon = parse_daemon_view(&result);
+        self.status = "daemon stopped".to_owned();
         Ok(())
     }
 
@@ -811,6 +910,7 @@ fn parse_slash_command(input: &str) -> Result<SlashCommand, String> {
         "refresh" => Ok(SlashCommand::Refresh),
         "sync" => Ok(SlashCommand::Sync),
         "account" => parse_account_command(rest),
+        "daemon" => parse_daemon_command(rest),
         "new" => {
             let mut rest = rest.into_iter();
             let Some(name) = rest.next() else {
@@ -826,6 +926,32 @@ fn parse_slash_command(input: &str) -> Result<SlashCommand, String> {
         "keys" => parse_keys_command(rest),
         "quit" | "q" => Ok(SlashCommand::Quit),
         other => Err(format!("unknown slash command: /{other}")),
+    }
+}
+
+fn parse_daemon_command(args: Vec<String>) -> Result<SlashCommand, String> {
+    match args.as_slice() {
+        [command] if command == "status" => Ok(SlashCommand::DaemonStatus),
+        [command] if command == "start" => Ok(SlashCommand::DaemonStart {
+            sync_interval_ms: None,
+        }),
+        [command, sync_interval_ms] if command == "start" => {
+            let sync_interval_ms = sync_interval_ms
+                .parse::<u64>()
+                .map_err(|_| "/daemon start interval must be milliseconds".to_owned())?;
+            Ok(SlashCommand::DaemonStart {
+                sync_interval_ms: Some(sync_interval_ms),
+            })
+        }
+        [command] if command == "stop" => Ok(SlashCommand::DaemonStop),
+        [] => Err("/daemon expects status, start, or stop".to_owned()),
+        [command, ..] if command == "status" => {
+            Err("/daemon status does not accept arguments".to_owned())
+        }
+        [command, ..] if command == "stop" => {
+            Err("/daemon stop does not accept arguments".to_owned())
+        }
+        _ => Err("/daemon expects status, start, or stop".to_owned()),
     }
 }
 
@@ -949,6 +1075,83 @@ fn publish_status(action: &str, result: &Value) -> String {
     format!("{action}; published={published}")
 }
 
+fn parse_daemon_view(value: &Value) -> DaemonView {
+    DaemonView {
+        running: value
+            .get("running")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        pid: value.get("pid").and_then(Value::as_u64),
+        sync_interval_ms: value.get("sync_interval_ms").and_then(Value::as_u64),
+        last_sync: value.get("last_sync").and_then(parse_daemon_sync_view),
+    }
+}
+
+fn parse_daemon_sync_view(value: &Value) -> Option<DaemonSyncView> {
+    Some(DaemonSyncView {
+        accounts: value.get("accounts").and_then(Value::as_u64)?,
+        events: value.get("events").and_then(Value::as_u64).unwrap_or(0),
+        joined_groups: value
+            .get("joined_groups")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        messages: value.get("messages").and_then(Value::as_u64).unwrap_or(0),
+        errors: value
+            .get("errors")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len),
+    })
+}
+
+fn daemon_header_label(daemon: &DaemonView) -> String {
+    if !daemon.running {
+        return "off".to_owned();
+    }
+    let mut label = daemon
+        .pid
+        .map(|pid| format!("on pid={pid}"))
+        .unwrap_or_else(|| "on".to_owned());
+    if let Some(sync) = &daemon.last_sync {
+        label.push_str(&format!(
+            " sync={}/{}/{}",
+            sync.events, sync.joined_groups, sync.messages
+        ));
+        if sync.errors > 0 {
+            label.push_str(&format!(" errors={}", sync.errors));
+        }
+    }
+    label
+}
+
+fn daemon_status_sentence(daemon: &DaemonView) -> String {
+    if !daemon.running {
+        return "daemon not running".to_owned();
+    }
+    let interval = daemon
+        .sync_interval_ms
+        .map(|interval| format!(" interval={}ms", interval))
+        .unwrap_or_default();
+    let sync = daemon
+        .last_sync
+        .as_ref()
+        .map(|sync| {
+            format!(
+                " last-sync accounts={} events={} joined={} messages={} errors={}",
+                sync.accounts, sync.events, sync.joined_groups, sync.messages, sync.errors
+            )
+        })
+        .unwrap_or_default();
+    format!("daemon running{interval}{sync}")
+}
+
+fn should_live_refresh(daemon: &DaemonView, input: &str, elapsed: Duration) -> bool {
+    daemon.running && input.is_empty() && elapsed >= LIVE_REFRESH_INTERVAL
+}
+
+fn live_refresh_status(accounts: usize, chats: usize, messages: usize) -> String {
+    format!("live refresh: accounts={accounts} chats={chats} messages={messages}")
+}
+
 fn selected_style(selected: bool) -> Style {
     if selected {
         Style::default()
@@ -1070,6 +1273,90 @@ mod tests {
             parse_slash_command("/account import nsec1secret"),
             Ok(SlashCommand::AccountImportSecret("nsec1secret".to_owned()))
         );
+    }
+
+    #[test]
+    fn slash_command_parser_handles_daemon_commands() {
+        assert_eq!(
+            parse_slash_command("/daemon status"),
+            Ok(SlashCommand::DaemonStatus)
+        );
+        assert_eq!(
+            parse_slash_command("/daemon start"),
+            Ok(SlashCommand::DaemonStart {
+                sync_interval_ms: None,
+            })
+        );
+        assert_eq!(
+            parse_slash_command("/daemon start 750"),
+            Ok(SlashCommand::DaemonStart {
+                sync_interval_ms: Some(750),
+            })
+        );
+        assert_eq!(
+            parse_slash_command("/daemon stop"),
+            Ok(SlashCommand::DaemonStop)
+        );
+        assert!(parse_slash_command("/daemon restart").is_err());
+    }
+
+    #[test]
+    fn daemon_status_json_becomes_header_and_status_text() {
+        let daemon = parse_daemon_view(&serde_json::json!({
+            "running": true,
+            "pid": 1234,
+            "sync_interval_ms": 750,
+            "last_sync": {
+                "accounts": 2,
+                "events": 3,
+                "joined_groups": 1,
+                "messages": 4,
+                "errors": ["relay unavailable"]
+            }
+        }));
+
+        assert_eq!(
+            daemon_header_label(&daemon),
+            "on pid=1234 sync=3/1/4 errors=1"
+        );
+        assert_eq!(
+            daemon_status_sentence(&daemon),
+            "daemon running interval=750ms last-sync accounts=2 events=3 joined=1 messages=4 errors=1"
+        );
+        assert_eq!(
+            daemon_status_sentence(&parse_daemon_view(&serde_json::json!({"running": false}))),
+            "daemon not running"
+        );
+    }
+
+    #[test]
+    fn live_refresh_waits_for_running_daemon_idle_input_and_interval() {
+        let running = DaemonView {
+            running: true,
+            ..DaemonView::default()
+        };
+        let stopped = DaemonView::default();
+
+        assert!(should_live_refresh(
+            &running,
+            "",
+            LIVE_REFRESH_INTERVAL + Duration::from_millis(1)
+        ));
+        assert!(!should_live_refresh(
+            &running,
+            "/account",
+            LIVE_REFRESH_INTERVAL + Duration::from_millis(1)
+        ));
+        assert!(!should_live_refresh(
+            &stopped,
+            "",
+            LIVE_REFRESH_INTERVAL + Duration::from_millis(1)
+        ));
+        assert!(!should_live_refresh(
+            &running,
+            "",
+            LIVE_REFRESH_INTERVAL - Duration::from_millis(1)
+        ));
     }
 
     #[test]

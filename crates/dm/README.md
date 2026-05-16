@@ -30,7 +30,9 @@ cargo run -p darkmatter-cli --bin dm -- --home /tmp/dm --secret-store file --acc
 
 `dm tui` is a Ratatui shell over the real CLI. It lists local accounts, shows visible chats for the selected local
 signing account, renders recent messages, and sends messages from a composer. When a daemon socket exists for the same
-home, the TUI's child `dm --json` commands use the daemon just like normal CLI commands.
+home, the TUI's child `dm --json` commands use the daemon just like normal CLI commands. The header shows daemon state,
+and while the daemon is running the TUI periodically refreshes the visible account/chat/message projection when the
+composer is idle.
 
 ```sh
 cargo run -p darkmatter-cli --bin dm -- --home /tmp/dm --secret-store file tui
@@ -52,6 +54,9 @@ The composer accepts either a plain chat message or a slash command:
 /account create
 /account add <npub-or-hex>
 /account import <nsec>
+/daemon status
+/daemon start [sync-interval-ms]
+/daemon stop
 /new <name> [member-npub-or-hex ...]
 /invite <npub-or-hex>
 /remove <npub-or-hex>

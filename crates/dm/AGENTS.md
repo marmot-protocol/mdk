@@ -17,6 +17,8 @@ Real CLI app surface for the Darkmatter/Marmot stack.
   and slash commands, but it should not become a second app runtime or bypass `marmot-app`/daemon behavior.
 - Keep TUI account onboarding on top of `dm account create`; redact `nsec` import input before rendering it in the
   composer.
+- Keep TUI daemon controls on top of `dm daemon start|stop|status`; live refresh should observe daemon state and avoid
+  interrupting active composer input.
 - Keep daemon behavior real. `dm daemon start|stop|status`, the `dmd` binary, socket-backed execution, pid/log files, and
   background sync should be covered when touched. Background sync should also refresh the app-level Nostr user directory
   for local signing accounts.
