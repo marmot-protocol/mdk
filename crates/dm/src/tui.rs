@@ -207,14 +207,9 @@ enum SlashCommand {
     ChatArchive,
     ChatUnarchive,
     ChatArchived(bool),
-    ChatMembers,
     MembersAdd(Vec<String>),
-    MembersRemove(String),
-    MembersClear,
+    MembersRemove(Vec<String>),
     MembersList,
-    Invite(String),
-    Remove(String),
-    ImageSend(String),
     KeysPublish,
     KeysFetch(String),
     Quit,
@@ -234,7 +229,6 @@ struct TuiApp {
     daemon: DaemonView,
     last_daemon_poll: Instant,
     last_live_refresh: Instant,
-    member_draft: Vec<String>,
     input: String,
     status: String,
     show_help: bool,
@@ -258,7 +252,6 @@ impl TuiApp {
             daemon: DaemonView::default(),
             last_daemon_poll: now,
             last_live_refresh: now,
-            member_draft: Vec::new(),
             input: String::new(),
             status: "loading accounts".to_owned(),
             show_help: false,
@@ -487,7 +480,6 @@ impl TuiApp {
                 Span::styled("> ", Style::default().fg(Color::Cyan)),
                 Span::raw(prompt),
             ]),
-            Line::from(member_draft_line(&self.member_draft)),
             Line::from(self.status.clone()),
         ];
         frame.render_widget(
@@ -524,14 +516,9 @@ impl TuiApp {
             Line::from("/chat archive"),
             Line::from("/chat unarchive"),
             Line::from("/chat archived [on|off]"),
-            Line::from("/chat members"),
             Line::from("/members add <npub-or-hex> [...]"),
-            Line::from("/members remove <npub-or-hex>"),
-            Line::from("/members clear"),
+            Line::from("/members remove <npub-or-hex> [...]"),
             Line::from("/members list"),
-            Line::from("/invite <npub-or-hex>"),
-            Line::from("/remove <npub-or-hex>"),
-            Line::from("/image <path>"),
             Line::from("/keys publish"),
             Line::from("/keys fetch <npub-or-hex>"),
             Line::from("/quit"),
@@ -660,63 +647,9 @@ impl TuiApp {
             SlashCommand::ChatArchive => self.set_selected_chat_archived(true),
             SlashCommand::ChatUnarchive => self.set_selected_chat_archived(false),
             SlashCommand::ChatArchived(include) => self.set_archived_chat_visibility(include),
-            SlashCommand::ChatMembers => self.show_selected_chat_members(),
-            SlashCommand::MembersAdd(members) => {
-                add_member_refs(&mut self.member_draft, members);
-                self.status = member_draft_status(&self.member_draft);
-                Ok(())
-            }
-            SlashCommand::MembersRemove(member) => {
-                let removed = remove_member_ref(&mut self.member_draft, &member);
-                self.status = if removed {
-                    member_draft_status(&self.member_draft)
-                } else {
-                    format!("member draft did not include {}", shorten(&member, 18))
-                };
-                Ok(())
-            }
-            SlashCommand::MembersClear => {
-                self.member_draft.clear();
-                self.status = "member draft cleared".to_owned();
-                Ok(())
-            }
-            SlashCommand::MembersList => {
-                self.status = member_draft_status(&self.member_draft);
-                Ok(())
-            }
-            SlashCommand::Invite(member) => {
-                let account_id = self.require_selected_local_account()?;
-                let group_id = self.require_selected_group()?;
-                let args = vec![
-                    "group".to_owned(),
-                    "invite".to_owned(),
-                    group_id,
-                    "--member".to_owned(),
-                    member,
-                ];
-                let result = self.client.run_json(Some(&account_id), &args)?;
-                let status = publish_status("invited member", &result);
-                self.refresh_messages()?;
-                self.status = status;
-                Ok(())
-            }
-            SlashCommand::Remove(member) => {
-                let account_id = self.require_selected_local_account()?;
-                let group_id = self.require_selected_group()?;
-                let args = vec![
-                    "group".to_owned(),
-                    "remove".to_owned(),
-                    group_id,
-                    "--member".to_owned(),
-                    member,
-                ];
-                let result = self.client.run_json(Some(&account_id), &args)?;
-                let status = publish_status("removed member", &result);
-                self.refresh_messages()?;
-                self.status = status;
-                Ok(())
-            }
-            SlashCommand::ImageSend(path) => Err(TuiError::Cli(image_send_error(&path))),
+            SlashCommand::MembersAdd(members) => self.add_selected_chat_members(members),
+            SlashCommand::MembersRemove(members) => self.remove_selected_chat_members(members),
+            SlashCommand::MembersList => self.show_selected_chat_members(),
             SlashCommand::KeysPublish => {
                 let account_id = self.require_selected_local_account()?;
                 let result = self
@@ -758,15 +691,12 @@ impl TuiApp {
 
     fn create_chat(&mut self, name: String, members: Vec<String>) -> TuiResult<()> {
         let account_id = self.require_selected_local_account()?;
-        let mut all_members = Vec::new();
-        add_member_refs(&mut all_members, self.member_draft.clone());
-        add_member_refs(&mut all_members, members);
+        let all_members = unique_member_refs(members);
         let mut args = vec!["group".to_owned(), "create".to_owned(), name];
         args.extend(all_members.iter().cloned());
         let result = self.client.run_json(Some(&account_id), &args)?;
         let group_id = value_string(&result, "group_id");
         let member_count = all_members.len();
-        self.member_draft.clear();
         self.refresh_chats()?;
         if let Some(group_id) = group_id.as_deref() {
             self.select_chat_by_group_id(group_id)?;
@@ -781,6 +711,32 @@ impl TuiApp {
                 )
             })
             .unwrap_or_else(|| format!("created chat with {member_count} member(s)"));
+        Ok(())
+    }
+
+    fn add_selected_chat_members(&mut self, members: Vec<String>) -> TuiResult<()> {
+        let account_id = self.require_selected_local_account()?;
+        let group_id = self.require_selected_group()?;
+        let members = unique_member_refs(members);
+        let mut args = vec!["group".to_owned(), "invite".to_owned(), group_id];
+        args.extend(members);
+        let result = self.client.run_json(Some(&account_id), &args)?;
+        let status = publish_status("added member(s)", &result);
+        self.refresh_messages()?;
+        self.status = status;
+        Ok(())
+    }
+
+    fn remove_selected_chat_members(&mut self, members: Vec<String>) -> TuiResult<()> {
+        let account_id = self.require_selected_local_account()?;
+        let group_id = self.require_selected_group()?;
+        let members = unique_member_refs(members);
+        let mut args = vec!["group".to_owned(), "remove".to_owned(), group_id];
+        args.extend(members);
+        let result = self.client.run_json(Some(&account_id), &args)?;
+        let status = publish_status("removed member(s)", &result);
+        self.refresh_messages()?;
+        self.status = status;
         Ok(())
     }
 
@@ -1059,9 +1015,6 @@ fn parse_slash_command(input: &str) -> Result<SlashCommand, String> {
         "daemon" => parse_daemon_command(rest),
         "chat" => parse_chat_command(rest),
         "members" => parse_members_command(rest),
-        "invite" => one_arg(command, rest).map(SlashCommand::Invite),
-        "remove" => one_arg(command, rest).map(SlashCommand::Remove),
-        "image" => one_arg(command, rest).map(SlashCommand::ImageSend),
         "keys" => parse_keys_command(rest),
         "quit" | "q" => Ok(SlashCommand::Quit),
         other => Err(format!("unknown slash command: /{other}")),
@@ -1091,15 +1044,10 @@ fn parse_chat_command(args: Vec<String>) -> Result<SlashCommand, String> {
         [command, value] if command == "archived" => {
             parse_on_off(value).map(SlashCommand::ChatArchived)
         }
-        [command] if command == "members" => Ok(SlashCommand::ChatMembers),
-        [] => Err(
-            "/chat expects new, rename, describe, archive, unarchive, archived, or members"
-                .to_owned(),
-        ),
-        _ => Err(
-            "/chat expects new, rename, describe, archive, unarchive, archived, or members"
-                .to_owned(),
-        ),
+        [] => {
+            Err("/chat expects new, rename, describe, archive, unarchive, or archived".to_owned())
+        }
+        _ => Err("/chat expects new, rename, describe, archive, unarchive, or archived".to_owned()),
     }
 }
 
@@ -1111,20 +1059,18 @@ fn parse_members_command(args: Vec<String>) -> Result<SlashCommand, String> {
         [command] if command == "add" => {
             Err("/members add requires at least one member".to_owned())
         }
-        [command, member] if command == "remove" => Ok(SlashCommand::MembersRemove(member.clone())),
-        [command, ..] if command == "remove" => {
-            Err("/members remove expects exactly one member".to_owned())
+        [command, members @ ..] if command == "remove" && !members.is_empty() => {
+            Ok(SlashCommand::MembersRemove(members.to_vec()))
         }
-        [command] if command == "clear" => Ok(SlashCommand::MembersClear),
+        [command] if command == "remove" => {
+            Err("/members remove requires at least one member".to_owned())
+        }
         [command] if command == "list" => Ok(SlashCommand::MembersList),
-        [command, ..] if command == "clear" => {
-            Err("/members clear does not accept arguments".to_owned())
-        }
         [command, ..] if command == "list" => {
             Err("/members list does not accept arguments".to_owned())
         }
-        [] => Err("/members expects add, remove, clear, or list".to_owned()),
-        _ => Err("/members expects add, remove, clear, or list".to_owned()),
+        [] => Err("/members expects add, remove, or list".to_owned()),
+        _ => Err("/members expects add, remove, or list".to_owned()),
     }
 }
 
@@ -1191,14 +1137,6 @@ fn parse_on_off(value: &str) -> Result<bool, String> {
         "on" | "true" | "yes" => Ok(true),
         "off" | "false" | "no" => Ok(false),
         _ => Err("expected on or off".to_owned()),
-    }
-}
-
-fn one_arg(command: &str, args: Vec<String>) -> Result<String, String> {
-    match args.as_slice() {
-        [arg] => Ok(arg.clone()),
-        [] => Err(format!("/{command} requires an argument")),
-        _ => Err(format!("/{command} accepts exactly one argument")),
     }
 }
 
@@ -1359,34 +1297,14 @@ fn live_refresh_status(accounts: usize, chats: usize, messages: usize) -> String
     format!("live refresh: accounts={accounts} chats={chats} messages={messages}")
 }
 
-fn add_member_refs(draft: &mut Vec<String>, members: Vec<String>) {
+fn unique_member_refs(members: Vec<String>) -> Vec<String> {
+    let mut unique = Vec::new();
     for member in members {
-        if !member.is_empty() && !draft.iter().any(|existing| existing == &member) {
-            draft.push(member);
+        if !member.is_empty() && !unique.iter().any(|existing| existing == &member) {
+            unique.push(member);
         }
     }
-}
-
-fn remove_member_ref(draft: &mut Vec<String>, member: &str) -> bool {
-    let Some(index) = draft.iter().position(|existing| existing == member) else {
-        return false;
-    };
-    draft.remove(index);
-    true
-}
-
-fn member_draft_line(draft: &[String]) -> String {
-    if draft.is_empty() {
-        return "members: none".to_owned();
-    }
-    format!("members: {}", member_ref_summary(draft))
-}
-
-fn member_draft_status(draft: &[String]) -> String {
-    if draft.is_empty() {
-        return "member draft is empty".to_owned();
-    }
-    format!("member draft: {}", member_ref_summary(draft))
+    unique
 }
 
 fn member_ref_summary(members: &[String]) -> String {
@@ -1414,12 +1332,6 @@ fn group_members_status(result: &Value) -> String {
         return "members: none".to_owned();
     }
     format!("members: {}", member_ref_summary(&members))
-}
-
-fn image_send_error(path: &str) -> String {
-    format!(
-        "image messages are not implemented yet; {path} was not sent because encrypted media upload is still draft-only"
-    )
 }
 
 fn selected_style(selected: bool) -> Style {
@@ -1598,10 +1510,6 @@ mod tests {
             Ok(SlashCommand::ChatArchived(false))
         );
         assert_eq!(
-            parse_slash_command("/chat members"),
-            Ok(SlashCommand::ChatMembers)
-        );
-        assert_eq!(
             parse_slash_command("/members add npub1bob npub1carol"),
             Ok(SlashCommand::MembersAdd(vec![
                 "npub1bob".to_owned(),
@@ -1609,41 +1517,38 @@ mod tests {
             ]))
         );
         assert_eq!(
-            parse_slash_command("/members remove npub1bob"),
-            Ok(SlashCommand::MembersRemove("npub1bob".to_owned()))
-        );
-        assert_eq!(
-            parse_slash_command("/members clear"),
-            Ok(SlashCommand::MembersClear)
+            parse_slash_command("/members remove npub1bob npub1carol"),
+            Ok(SlashCommand::MembersRemove(vec![
+                "npub1bob".to_owned(),
+                "npub1carol".to_owned(),
+            ]))
         );
         assert_eq!(
             parse_slash_command("/members list"),
             Ok(SlashCommand::MembersList)
         );
+        assert!(parse_slash_command("/members clear").is_err());
+        assert!(parse_slash_command("/invite npub1bob").is_err());
+        assert!(parse_slash_command("/remove npub1bob").is_err());
     }
 
     #[test]
-    fn member_draft_adds_uniquely_and_removes_by_pubkey() {
-        let mut members = vec!["npub1bob".to_owned()];
+    fn group_members_status_summarizes_member_records() {
+        let status = group_members_status(&serde_json::json!({
+            "members": [
+                {"npub": "npub1bob"},
+                {"member_id": "0123456789abcdef"}
+            ]
+        }));
 
-        add_member_refs(
-            &mut members,
-            vec!["npub1bob".to_owned(), "npub1carol".to_owned()],
-        );
-        assert_eq!(members, vec!["npub1bob", "npub1carol"]);
-
-        assert!(remove_member_ref(&mut members, "npub1bob"));
-        assert_eq!(members, vec!["npub1carol"]);
-        assert!(!remove_member_ref(&mut members, "npub1missing"));
+        assert!(status.starts_with("members: "));
+        assert!(status.contains("npub1bob"));
+        assert!(status.contains("01234"));
     }
 
     #[test]
-    fn slash_command_parser_keeps_image_send_explicitly_unsupported() {
-        assert_eq!(
-            parse_slash_command("/image /tmp/photo.jpg"),
-            Ok(SlashCommand::ImageSend("/tmp/photo.jpg".to_owned()))
-        );
-        assert!(image_send_error("/tmp/photo.jpg").contains("not implemented"));
+    fn slash_command_parser_rejects_unimplemented_image_send() {
+        assert!(parse_slash_command("/image /tmp/photo.jpg").is_err());
     }
 
     #[test]

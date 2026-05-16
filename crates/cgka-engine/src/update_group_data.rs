@@ -57,6 +57,7 @@ impl<S: StorageProvider> Engine<S> {
         )
         .map_err(|e| EngineError::Backend(format!("load: {e:?}")))?
         .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
+        crate::group_data::require_admin(&mls_group, &group_id, self.identity.self_id())?;
 
         // Read the existing marmot_group_data extension and overwrite only
         // the requested fields. Everything else (admins, relays, image_*,

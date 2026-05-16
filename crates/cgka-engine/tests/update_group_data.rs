@@ -215,6 +215,23 @@ async fn update_group_data_renames_group_and_advances_epoch() {
     assert_eq!(bob.epoch(&gid).unwrap().0, 2);
 }
 
+#[tokio::test]
+async fn non_admin_cannot_update_group_data() {
+    let (_alice, mut bob, gid) = create_pair().await;
+
+    let err = bob
+        .send(SendIntent::UpdateGroupData {
+            group_id: gid.clone(),
+            name: Some("mallory edit".into()),
+            description: None,
+        })
+        .await
+        .err()
+        .unwrap();
+
+    assert!(matches!(err, EngineError::NotGroupAdmin { .. }));
+}
+
 // ── Partial update ──────────────────────────────────────────────────────────
 
 #[tokio::test]

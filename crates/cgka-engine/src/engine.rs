@@ -185,6 +185,26 @@ impl<S: StorageProvider> Engine<S> {
     pub fn group_record(&self, group_id: &GroupId) -> Result<Group, EngineError> {
         Ok(self.storage.get_group(group_id)?)
     }
+
+    /// Return the current Marmot admin policy keys mirrored from signed MLS
+    /// group state.
+    pub fn admin_pubkeys(&self, group_id: &GroupId) -> Result<Vec<[u8; 32]>, EngineError> {
+        let provider = crate::provider::EngineOpenMlsProvider::<S>::new(
+            &self.crypto,
+            self.storage.mls_storage(),
+        );
+        let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
+        let mls_group = openmls::group::MlsGroup::load(
+            <crate::provider::EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(&provider),
+            &mls_gid,
+        )
+        .map_err(|e| EngineError::Backend(format!("load: {e:?}")))?
+        .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
+        let mut admins = crate::group_data::admins_of_group(&mls_group)?;
+        admins.sort();
+        admins.dedup();
+        Ok(admins)
+    }
 }
 
 // ── CgkaEngine impl ─────────────────────────────────────────────────────────

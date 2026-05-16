@@ -1233,7 +1233,9 @@ async fn deliberate_fork_via_harness() {
         .attach(&bus);
 
     let bob_kp = bob.fresh_key_package().await;
-    let (group_id, pending) = alice.create_group("fork", vec![bob_kp], vec![]).await;
+    let (group_id, pending) = alice
+        .create_group_with_admins("fork", vec![bob_kp], vec![], vec![bob.member_id()])
+        .await;
     alice.confirm(pending).await;
     bus.deliver_all();
     bob.tick().await;
@@ -1343,7 +1345,12 @@ async fn convergence_e2e_from_peeler_ingest_to_group_events() {
     let carol_kp = carol.fresh_key_package().await;
     let frank_kp = frank.fresh_key_package().await;
     let (_group_id, pending) = alice
-        .create_group("convergence-e2e", vec![bob_kp, carol_kp, frank_kp], vec![])
+        .create_group_with_admins(
+            "convergence-e2e",
+            vec![bob_kp, carol_kp, frank_kp],
+            vec![],
+            vec![bob.member_id()],
+        )
         .await;
     alice.confirm(pending).await;
     bus.deliver_all();

@@ -328,9 +328,16 @@ async fn account_projection_db_records_received_messages() {
         "marmot.group.blossom.image.v1"
     );
     assert!(!alice_groups[0].image.present);
+    assert_eq!(alice_groups[0].admin_policy.component_id, 0x8003);
+    assert_eq!(
+        alice_groups[0].admin_policy.component,
+        "marmot.group.admin-policy.v1"
+    );
+    assert_eq!(alice_groups[0].admin_policy.admins.len(), 1);
     bob.sync().await.unwrap();
     let bob_groups = app.groups("bob").unwrap();
     assert_eq!(bob_groups[0].profile.name, "messages");
+    assert_eq!(bob_groups[0].admin_policy, alice_groups[0].admin_policy);
 
     alice
         .send(&group_id, b"persist this projection")

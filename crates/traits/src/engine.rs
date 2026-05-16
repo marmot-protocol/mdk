@@ -220,7 +220,9 @@ pub struct CreateGroupRequest {
     pub description: String,
     pub members: Vec<KeyPackage>,
     pub required_features: Vec<Feature>,
-    /// Initial admin set (per MIP-01 `marmot_group_data.admin_pubkeys`).
+    /// Initial admin set, projected to `marmot.group.admin-policy.v1`.
+    /// The current engine stores this in MIP-01 `marmot_group_data.admin_pubkeys`
+    /// until the signed GroupContext app-data dictionary path is fully wired.
     /// The **creator is always implicitly added** to this set — pass
     /// additional `MemberId`s here to bootstrap a multi-admin group.
     /// Default (empty) → creator is sole admin.

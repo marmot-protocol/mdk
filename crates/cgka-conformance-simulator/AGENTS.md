@@ -186,6 +186,9 @@ Keep these aligned with [`README.md`](README.md), [`SCENARIOS.md`](SCENARIOS.md)
   `convergence-chaos/v1` covers invite races, group-data races, publish rollback, partitions, leaves, delayed past-epoch
   app delivery, queue faults, 20+ client message storms, partitioned large-group storms, multi-committer group-data
   storms, mixed message/commit storms, and restart plus duplicate delivery. Storage-loss families are still future work.
+- **Admin-gated scripted steps need admin setup.** When a scenario has an invitee later send `InviteMembers` or
+  `UpdateGroupData`, the runner promotes that invitee to an initial admin for the group. Direct harness tests should
+  use `create_group_with_admins` explicitly for competing admin commits.
 - **Failure minimization is intentionally conservative.** Generated reports populate `minimized_case` with a greedy
   step-removal reducer when removable app/delivery noise can be dropped without changing the failure kinds. There is no
   domain-specific shrinker yet.

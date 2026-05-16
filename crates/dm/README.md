@@ -63,14 +63,9 @@ The composer accepts either a plain chat message or a slash command:
 /chat archive
 /chat unarchive
 /chat archived [on|off]
-/chat members
 /members add <npub-or-hex> [...]
-/members remove <npub-or-hex>
-/members clear
+/members remove <npub-or-hex> [...]
 /members list
-/invite <npub-or-hex>
-/remove <npub-or-hex>
-/image <path>
 /keys publish
 /keys fetch <npub-or-hex>
 /quit
@@ -80,14 +75,10 @@ The composer accepts either a plain chat message or a slash command:
 `/account add <npub-or-hex>` adds a public-only account for relay-list and KeyPackage lookup. Imported `nsec` input is
 redacted in the composer.
 
-`/members add` builds a pending member draft shown under the composer. `/chat new` uses the draft plus any members typed
-directly on the command, then clears the draft after the group is created. `/chat rename`, `/chat describe`,
-`/chat archive`, `/chat unarchive`, and `/chat members` operate on the selected chat. `/chat archived` shows archived
-chats so they can be selected and unarchived; `/chat archived off` returns to the normal visible-chat list. `/invite`
-and `/remove` change membership for the selected chat.
-
-`/image <path>` is present as an honest boundary: the TUI reports that image messages are not implemented and does not
-send a placeholder text message. Real image sends need the encrypted-media/blob upload path first.
+`/chat new` creates a chat with any members typed directly on the command. `/chat rename`, `/chat describe`,
+`/chat archive`, and `/chat unarchive` operate on the selected chat. `/chat archived` shows archived chats so they can
+be selected and unarchived; `/chat archived off` returns to the normal visible-chat list. `/members add`,
+`/members remove`, and `/members list` operate on the selected chat and use the real group membership commands.
 
 Most account-scoped commands resolve the local account in this order:
 
@@ -146,6 +137,13 @@ dm --account <npub-or-hex> chats list
 dm --account <npub-or-hex> chats show <group-hex>
 dm --account <npub-or-hex> chats archive <group-hex>
 dm --account <npub-or-hex> chats unarchive <group-hex>
+```
+
+Group membership changes use positional Nostr identities:
+
+```sh
+dm --account <npub-or-hex> group invite <group-hex> <member-npub-or-hex> [...]
+dm --account <npub-or-hex> group remove <group-hex> <member-npub-or-hex> [...]
 ```
 
 When an account is removed from a group, `dm` keeps that account's local group and message projection as history.

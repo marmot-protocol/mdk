@@ -401,6 +401,48 @@ async fn non_admin_cannot_remove_members() {
 }
 
 #[tokio::test]
+async fn non_admin_cannot_invite_members() {
+    let mut alice = build_client(b"alice");
+    let mut bob = build_client(b"bob");
+    let mut carol = build_client(b"carol");
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+
+    let (_group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "invite-policy".into(),
+            description: "".into(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let welcome_for_bob = match create {
+        SendResult::GroupCreated {
+            pending,
+            mut welcomes,
+        } => {
+            alice.confirm_published(pending).await.unwrap();
+            welcomes.remove(0)
+        }
+        _ => unreachable!(),
+    };
+    let group_id = bob.join_welcome(welcome_for_bob).await.unwrap();
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+
+    let err = bob
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![carol_kp],
+        })
+        .await
+        .err()
+        .unwrap();
+
+    assert!(matches!(err, EngineError::NotGroupAdmin { .. }));
+}
+
+#[tokio::test]
 async fn remove_members_rejects_malformed_target_member_identity() {
     let mut alice = build_client(b"alice");
     let mut bob = build_raw_identity_client(b"bob");

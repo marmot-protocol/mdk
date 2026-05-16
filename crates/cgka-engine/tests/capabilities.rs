@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use cgka_engine::canonicalization::SyncState;
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::{Engine, EngineBuilder};
+use cgka_traits::EngineError;
 use cgka_traits::capabilities::{
     Capability, CapabilityRequirement, Feature, FeatureStatus, RequirementLevel,
 };
@@ -645,6 +646,48 @@ async fn upgrade_group_capabilities_promotes_optional_to_required() {
             .unwrap(),
         FeatureStatus::Available
     ));
+}
+
+#[tokio::test]
+async fn non_admin_cannot_upgrade_group_capabilities() {
+    let mut alice = build_client(
+        b"alice",
+        registry_selfremove_required_and_reactions_optional(),
+    );
+    let mut bob = build_client(
+        b"bob",
+        registry_selfremove_required_and_reactions_optional(),
+    );
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let (_group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "u".into(),
+            description: "".into(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let welcome_for_bob = match create {
+        SendResult::GroupCreated {
+            pending,
+            mut welcomes,
+        } => {
+            alice.confirm_published(pending).await.unwrap();
+            welcomes.remove(0)
+        }
+        _ => unreachable!(),
+    };
+    let group_id = bob.join_welcome(welcome_for_bob).await.unwrap();
+
+    let err = bob
+        .upgrade_group_capabilities(&group_id)
+        .await
+        .err()
+        .unwrap();
+
+    assert!(matches!(err, EngineError::NotGroupAdmin { .. }));
 }
 
 #[tokio::test]

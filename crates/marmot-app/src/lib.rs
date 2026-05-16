@@ -63,6 +63,8 @@ pub const GROUP_PROFILE_COMPONENT_ID: u16 = 0x8001;
 pub const GROUP_PROFILE_COMPONENT: &str = "marmot.group.profile.v1";
 pub const GROUP_BLOSSOM_IMAGE_COMPONENT_ID: u16 = 0x8002;
 pub const GROUP_BLOSSOM_IMAGE_COMPONENT: &str = "marmot.group.blossom.image.v1";
+pub const GROUP_ADMIN_POLICY_COMPONENT_ID: u16 = 0x8003;
+pub const GROUP_ADMIN_POLICY_COMPONENT: &str = "marmot.group.admin-policy.v1";
 
 type AppRuntime =
     AccountDeviceRuntime<NostrTransportAdapter, AppTransportRouting, AppKeyPackagePublisher>;
@@ -328,6 +330,7 @@ pub struct AppGroupRecord {
     pub endpoint: String,
     pub profile: AppGroupProfileComponent,
     pub image: AppGroupImageComponent,
+    pub admin_policy: AppGroupAdminPolicyComponent,
     #[serde(default)]
     pub archived: bool,
 }
@@ -361,6 +364,14 @@ pub struct AppGroupImageComponent {
     pub data_hex: String,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppGroupAdminPolicyComponent {
+    pub component_id: u16,
+    pub component: String,
+    pub admins: Vec<String>,
+    pub data_hex: String,
+}
+
 impl AppGroupRecord {
     fn new(
         group_id_hex: String,
@@ -368,17 +379,24 @@ impl AppGroupRecord {
         profile_name: String,
         profile_description: String,
         image: AppGroupImageInput,
+        admin_policy: AppGroupAdminPolicyComponent,
     ) -> Self {
         Self {
             group_id_hex,
             endpoint,
             profile: AppGroupProfileComponent::new(profile_name, profile_description),
             image: AppGroupImageComponent::new(image),
+            admin_policy,
             archived: false,
         }
     }
 
-    fn from_group(group_id: &GroupId, endpoint: TransportEndpoint, group: Option<&Group>) -> Self {
+    fn from_group(
+        group_id: &GroupId,
+        endpoint: TransportEndpoint,
+        group: Option<&Group>,
+        admin_policy: AppGroupAdminPolicyComponent,
+    ) -> Self {
         let (profile_name, profile_description) = group
             .map(|group| (group.name.clone(), group.description.clone()))
             .unwrap_or_default();
@@ -388,11 +406,18 @@ impl AppGroupRecord {
             profile_name,
             profile_description,
             AppGroupImageInput::default(),
+            admin_policy,
         )
     }
 
-    fn refresh_from_group(&mut self, endpoint: TransportEndpoint, group: Option<&Group>) {
+    fn refresh_from_group(
+        &mut self,
+        endpoint: TransportEndpoint,
+        group: Option<&Group>,
+        admin_policy: AppGroupAdminPolicyComponent,
+    ) {
         self.endpoint = endpoint.0;
+        self.admin_policy = admin_policy;
         if let Some(group) = group {
             self.profile =
                 AppGroupProfileComponent::new(group.name.clone(), group.description.clone());
@@ -441,6 +466,26 @@ impl AppGroupImageComponent {
             image_nonce_hex: input.image_nonce_hex,
             image_upload_key_hex: input.image_upload_key_hex,
             media_type: input.media_type,
+            data_hex: hex::encode(data),
+        }
+    }
+}
+
+impl AppGroupAdminPolicyComponent {
+    fn new(mut admins: Vec<[u8; 32]>) -> Self {
+        admins.sort();
+        admins.dedup();
+        let mut admin_bytes = Vec::with_capacity(admins.len() * 32);
+        for admin in &admins {
+            admin_bytes.extend_from_slice(admin);
+        }
+        let mut data = Vec::new();
+        encode_quic_varint(admin_bytes.len() as u64, &mut data);
+        data.extend_from_slice(&admin_bytes);
+        Self {
+            component_id: GROUP_ADMIN_POLICY_COMPONENT_ID,
+            component: GROUP_ADMIN_POLICY_COMPONENT.to_owned(),
+            admins: admins.iter().map(hex::encode).collect(),
             data_hex: hex::encode(data),
         }
     }
@@ -1877,7 +1922,14 @@ impl AppClient {
             .collect::<Vec<_>>();
         let endpoint = self.app.group_endpoint(group_id);
         let group_metadata = self.runtime.group_record(group_id).ok();
-        add_group(&mut self.state, group_id, endpoint, group_metadata.as_ref());
+        let admin_policy = self.admin_policy_for_group(group_id);
+        add_group(
+            &mut self.state,
+            group_id,
+            endpoint,
+            group_metadata.as_ref(),
+            admin_policy,
+        );
         self.app.save_state(&self.state)?;
         Ok(SendSummary {
             published: effects.reports.len(),
@@ -1994,13 +2046,21 @@ impl AppClient {
             let before = self.state.groups.len();
             let group_metadata =
                 event_group_id(event).and_then(|group_id| self.runtime.group_record(group_id).ok());
+            let group_projection = event_group_id(event).map(|group_id| EventGroupProjection {
+                endpoint: self.app.group_endpoint(group_id),
+                group_metadata: group_metadata.as_ref(),
+                admin_policy: self
+                    .runtime
+                    .admin_pubkeys(group_id)
+                    .map(AppGroupAdminPolicyComponent::new)
+                    .unwrap_or_else(|_| AppGroupAdminPolicyComponent::new(Vec::new())),
+            });
             if let Some(message) = observe_event(
                 &mut self.state,
                 profiles,
                 summary,
                 event,
-                &self.app,
-                group_metadata.as_ref(),
+                group_projection.as_ref(),
                 &source_message_id_hex,
             ) {
                 self.app
@@ -2038,21 +2098,37 @@ impl AppClient {
     fn refresh_group(&mut self, group_id: &GroupId) {
         let endpoint = self.app.group_endpoint(group_id);
         let group_metadata = self.runtime.group_record(group_id).ok();
-        add_group(&mut self.state, group_id, endpoint, group_metadata.as_ref());
+        let admin_policy = self.admin_policy_for_group(group_id);
+        add_group(
+            &mut self.state,
+            group_id,
+            endpoint,
+            group_metadata.as_ref(),
+            admin_policy,
+        );
     }
 
     fn add_group(&mut self, group_id: &GroupId) -> Result<(), AppError> {
         let endpoint = self.app.group_endpoint(group_id);
         let group_metadata = self.runtime.group_record(group_id).ok();
+        let admin_policy = self.admin_policy_for_group(group_id);
         add_group(
             &mut self.state,
             group_id,
             endpoint.clone(),
             group_metadata.as_ref(),
+            admin_policy,
         );
         self.routing
             .add_group(group_subscription(group_id, endpoint));
         Ok(())
+    }
+
+    fn admin_policy_for_group(&self, group_id: &GroupId) -> AppGroupAdminPolicyComponent {
+        self.runtime
+            .admin_pubkeys(group_id)
+            .map(AppGroupAdminPolicyComponent::new)
+            .unwrap_or_else(|_| AppGroupAdminPolicyComponent::new(Vec::new()))
     }
 
     fn refresh_group_routes(&mut self) -> Result<(), AppError> {
@@ -2716,23 +2792,31 @@ impl NostrRelayClient for FileRelayClient {
     }
 }
 
+struct EventGroupProjection<'a> {
+    endpoint: TransportEndpoint,
+    group_metadata: Option<&'a Group>,
+    admin_policy: AppGroupAdminPolicyComponent,
+}
+
 fn observe_event(
     state: &mut AccountState,
     profiles: &HashMap<String, String>,
     summary: &mut SyncSummary,
     event: &GroupEvent,
-    app: &MarmotApp,
-    group_metadata: Option<&Group>,
+    group_projection: Option<&EventGroupProjection<'_>>,
     source_message_id_hex: &str,
 ) -> Option<ReceivedMessage> {
     match event {
         GroupEvent::GroupJoined { group_id, .. } | GroupEvent::GroupCreated { group_id } => {
-            add_group(
-                state,
-                group_id,
-                app.group_endpoint(group_id),
-                group_metadata,
-            );
+            if let Some(projection) = group_projection {
+                add_group(
+                    state,
+                    group_id,
+                    projection.endpoint.clone(),
+                    projection.group_metadata,
+                    projection.admin_policy.clone(),
+                );
+            }
             summary.joined_groups.push(group_id.clone());
             summary.events.push(event.clone());
             None
@@ -2742,12 +2826,15 @@ fn observe_event(
             sender,
             payload,
         } => {
-            add_group(
-                state,
-                group_id,
-                app.group_endpoint(group_id),
-                group_metadata,
-            );
+            if let Some(projection) = group_projection {
+                add_group(
+                    state,
+                    group_id,
+                    projection.endpoint.clone(),
+                    projection.group_metadata,
+                    projection.admin_policy.clone(),
+                );
+            }
             let sender_hex = hex::encode(sender.as_slice());
             let sender_label = profiles.get(&sender_hex).cloned().unwrap_or(sender_hex);
             let plaintext = String::from_utf8_lossy(payload).to_string();
@@ -2762,12 +2849,13 @@ fn observe_event(
             Some(message)
         }
         _ => {
-            if let Some(group_id) = event_group_id(event) {
+            if let (Some(group_id), Some(projection)) = (event_group_id(event), group_projection) {
                 add_group(
                     state,
                     group_id,
-                    app.group_endpoint(group_id),
-                    group_metadata,
+                    projection.endpoint.clone(),
+                    projection.group_metadata,
+                    projection.admin_policy.clone(),
                 );
             }
             summary.events.push(event.clone());
@@ -2794,6 +2882,7 @@ fn add_group(
     group_id: &GroupId,
     endpoint: TransportEndpoint,
     group_metadata: Option<&Group>,
+    admin_policy: AppGroupAdminPolicyComponent,
 ) {
     let group_id_hex = hex::encode(group_id.as_slice());
     if let Some(existing) = state
@@ -2801,13 +2890,14 @@ fn add_group(
         .iter_mut()
         .find(|group| group.group_id_hex == group_id_hex)
     {
-        existing.refresh_from_group(endpoint, group_metadata);
+        existing.refresh_from_group(endpoint, group_metadata, admin_policy);
         return;
     }
     state.groups.push(AppGroupRecord::from_group(
         group_id,
         endpoint,
         group_metadata,
+        admin_policy,
     ));
 }
 

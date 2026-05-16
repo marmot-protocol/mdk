@@ -10,8 +10,8 @@ It owns the first app projections:
 
 - shared app cache in `app-cache.sqlite3` for the Nostr user directory: local-account links, profile metadata,
   follow-list caches, discovered user relay lists, and KeyPackages;
-- per-account SQLCipher app state in `accounts/<label>/app.sqlite3` for joined groups, app-component profile/image
-  projections, seen relay events, and sent/received message projections.
+- per-account SQLCipher app state in `accounts/<label>/app.sqlite3` for joined groups, app-component profile/image/admin
+  policy projections, seen relay events, and sent/received message projections.
 
 The app runtime exposes those projections through account status, group listing/showing, and message listing APIs so CLI
 and TUI surfaces can inspect app state without opening the databases directly.

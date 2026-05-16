@@ -21,9 +21,10 @@ Real CLI app surface for the Darkmatter/Marmot stack.
   interrupting active composer input.
 - Keep TUI chat/group management on top of real CLI commands. `/chat new` is the TUI spelling for chat creation; do not
   reintroduce `/new` as a hidden compatibility alias.
+- Keep TUI member commands direct: `/members add`, `/members remove`, and `/members list` operate on the selected chat.
+  Do not add a hidden in-memory member draft or a `/members clear` command.
 - Do not fake image messages in the TUI by sending file paths, plaintext placeholders, or raw bytes through
-  `message send`. Until encrypted-media/blob upload is implemented, `/image <path>` must stay an explicit unsupported
-  status.
+  `message send`. Add an image command only when it uses the real encrypted-media/blob upload path.
 - Keep daemon behavior real. `dm daemon start|stop|status`, the `dmd` binary, socket-backed execution, pid/log files, and
   background sync should be covered when touched. Background sync should also refresh the app-level Nostr user directory
   for local signing accounts.

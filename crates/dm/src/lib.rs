@@ -147,25 +147,21 @@ enum ChatsCommand {
 #[derive(Clone, Debug, Serialize, Deserialize, Subcommand)]
 enum GroupCommand {
     Create {
-        name: Option<String>,
+        name: String,
         #[arg(value_name = "MEMBER")]
         members: Vec<String>,
-        #[arg(long = "name", value_name = "NAME")]
-        name_flag: Option<String>,
-        #[arg(long = "member", value_name = "MEMBER")]
-        member_flags: Vec<String>,
     },
     Members {
         group: String,
     },
     Invite {
         group: String,
-        #[arg(long = "member", required = true)]
+        #[arg(value_name = "MEMBER", required = true)]
         members: Vec<String>,
     },
     Remove {
         group: String,
-        #[arg(long = "member", required = true)]
+        #[arg(value_name = "MEMBER", required = true)]
         members: Vec<String>,
     },
     Update {
@@ -226,8 +222,6 @@ enum DmError {
     Hex(#[from] hex::FromHexError),
     #[error("message text is required")]
     EmptyMessage,
-    #[error("group name is required")]
-    MissingGroupName,
     #[error("group id is required")]
     MissingGroupId,
     #[error("relay URL cannot be empty")]
@@ -768,17 +762,9 @@ async fn group_command(
     account_flag: Option<String>,
 ) -> Result<CommandOutput, DmError> {
     match command {
-        GroupCommand::Create {
-            name,
-            members,
-            name_flag,
-            member_flags,
-        } => {
+        GroupCommand::Create { name, members } => {
             let account = resolve_account(account_home, account_flag)?;
             ensure_local_signing(&account)?;
-            let name = name_flag.or(name).ok_or(DmError::MissingGroupName)?;
-            let mut members = members;
-            members.extend(member_flags);
             app.status(&account.label)?;
             let mut client = app.client(&account.label).await?;
             let member_refs = members.iter().map(String::as_str).collect::<Vec<_>>();
@@ -796,6 +782,7 @@ async fn group_command(
                     "name": group.profile.name.clone(),
                     "profile": group.profile,
                     "image": group.image,
+                    "admin_policy": group.admin_policy,
                     "members": members,
                 }),
             })
@@ -1089,6 +1076,7 @@ fn group_json(group: AppGroupRecord) -> Value {
         "endpoint": group.endpoint,
         "profile": group.profile,
         "image": group.image,
+        "admin_policy": group.admin_policy,
         "archived": group.archived,
     })
 }
@@ -1527,10 +1515,6 @@ fn dm_error_json(err: &DmError) -> Value {
             "code": "empty_message",
             "message": err.to_string(),
         }),
-        DmError::MissingGroupName => json!({
-            "code": "missing_group_name",
-            "message": err.to_string(),
-        }),
         DmError::MissingGroupId => json!({
             "code": "missing_group_id",
             "message": err.to_string(),
@@ -1632,6 +1616,9 @@ fn app_error_json(err: &AppError) -> Value {
     match err {
         AppError::AccountHome(err) => account_home_error_json(err),
         AppError::Account(AccountError::Engine(err)) => engine_error_json(err),
+        AppError::Account(AccountError::Session(cgka_session::SessionError::Engine(err))) => {
+            engine_error_json(err)
+        }
         AppError::MissingKeyPackage(account) => json!({
             "code": "missing_key_package",
             "message": err.to_string(),

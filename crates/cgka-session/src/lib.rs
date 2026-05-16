@@ -183,6 +183,10 @@ impl AccountDeviceSession {
         Ok(self.engine.group_record(group_id)?)
     }
 
+    pub fn admin_pubkeys(&self, group_id: &GroupId) -> SessionResult<Vec<[u8; 32]>> {
+        Ok(self.engine.admin_pubkeys(group_id)?)
+    }
+
     pub async fn create_group(
         &mut self,
         req: CreateGroupRequest,

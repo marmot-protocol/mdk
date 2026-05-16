@@ -13,6 +13,7 @@ use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
 use cgka_traits::engine::KeyPackage;
 use cgka_traits::engine_state::PendingStateRef;
+use cgka_traits::types::MemberId;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
@@ -306,12 +307,14 @@ async fn run_scenario_report_inner(
                 required_features,
                 pending,
             } => {
+                let initial_admin_labels = scenario_initial_admins(spec, step_index, invitees);
+                let initial_admins = member_ids(&clients, &initial_admin_labels, step_index)?;
                 let key_packages = fresh_key_packages(&mut clients, invitees, step_index).await?;
                 let required_features =
                     required_features_from_names(required_features, step_index)?;
                 let creator = client_mut(&mut clients, creator, step_index)?;
                 let (_group_id, pending_ref) = creator
-                    .create_group(name, key_packages, required_features)
+                    .create_group_with_admins(name, key_packages, required_features, initial_admins)
                     .await;
                 insert_pending(&mut pending_refs, pending, pending_ref, step_index)?;
             }
@@ -528,6 +531,42 @@ async fn fresh_key_packages(
         key_packages.push(client.fresh_key_package().await);
     }
     Ok(key_packages)
+}
+
+fn member_ids(
+    clients: &BTreeMap<String, HarnessClient>,
+    labels: &[String],
+    step_index: usize,
+) -> Result<Vec<MemberId>, ScenarioRunError> {
+    labels
+        .iter()
+        .map(|label| client_ref(clients, label, step_index).map(HarnessClient::member_id))
+        .collect()
+}
+
+fn scenario_initial_admins(
+    spec: &ScenarioSpec,
+    create_step_index: usize,
+    invitees: &[String],
+) -> Vec<String> {
+    invitees
+        .iter()
+        .filter(|invitee| {
+            spec.steps
+                .iter()
+                .skip(create_step_index + 1)
+                .any(|step| admin_gated_actor(step).is_some_and(|actor| actor == invitee.as_str()))
+        })
+        .cloned()
+        .collect()
+}
+
+fn admin_gated_actor(step: &ScenarioStep) -> Option<&str> {
+    match step {
+        ScenarioStep::InviteMembers { inviter, .. } => Some(inviter),
+        ScenarioStep::UpdateGroupData { client, .. } => Some(client),
+        _ => None,
+    }
 }
 
 fn insert_pending(

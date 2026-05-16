@@ -6,9 +6,9 @@
 //! `admin_pubkeys` is actively consulted by the engine (for MIP-03
 //! §149/§150 guards).
 //!
-//! Per the user's direction (2026-04-25): we keep the monolithic
-//! `marmot_group_data` extension as-is rather than splitting into
-//! components. A future component-based split will retire this module.
+//! The engine still reads the legacy field as the signed source of truth while
+//! app-facing projections expose the same keys as
+//! `marmot.group.admin-policy.v1`.
 
 use tls_codec::{
     Deserialize as TlsDeserialize, Serialize as TlsSerialize, TlsDeserialize, TlsSerialize,
@@ -16,7 +16,7 @@ use tls_codec::{
 };
 
 use cgka_traits::error::EngineError;
-use cgka_traits::types::MemberId;
+use cgka_traits::types::{GroupId, MemberId};
 use openmls::extensions::Extension;
 use openmls::group::MlsGroup;
 use openmls::prelude::ExtensionType;
@@ -158,6 +158,22 @@ pub fn admins_of_group(mls_group: &MlsGroup) -> Result<Vec<[u8; 32]>, EngineErro
     Ok(read_from_group(mls_group)?
         .map(|d| d.admins())
         .unwrap_or_default())
+}
+
+/// Require that `member_id` is in the current group admin set.
+pub fn require_admin(
+    mls_group: &MlsGroup,
+    group_id: &GroupId,
+    member_id: &MemberId,
+) -> Result<(), EngineError> {
+    let member_pubkey = admin_pubkey_from_member_id(member_id)?;
+    let admins = admins_of_group(mls_group)?;
+    if admins.iter().any(|admin| admin == &member_pubkey) {
+        return Ok(());
+    }
+    Err(EngineError::NotGroupAdmin {
+        group_id: group_id.clone(),
+    })
 }
 
 /// Convert a [`MemberId`] into a 32-byte admin pubkey. MIP-01 admin pubkeys

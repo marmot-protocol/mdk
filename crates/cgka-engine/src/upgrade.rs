@@ -25,14 +25,6 @@ impl<S: StorageProvider> Engine<S> {
         &mut self,
         group_id: &GroupId,
     ) -> Result<SendResult, EngineError> {
-        // Compute upgradeable capabilities; bail if there's nothing to upgrade.
-        let upgradeable = self.do_upgradeable_capabilities(group_id)?;
-        if upgradeable.is_empty() {
-            return Err(EngineError::Other(
-                "no upgradeable capabilities to apply".into(),
-            ));
-        }
-
         // Must be Stable to upgrade.
         if let Some(state) = self.epoch_manager.state(group_id)
             && !matches!(state, EpochState::Stable { .. })
@@ -54,6 +46,17 @@ impl<S: StorageProvider> Engine<S> {
         )
         .map_err(|e| EngineError::Backend(format!("load: {e:?}")))?
         .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
+        crate::group_data::require_admin(&mls_group, group_id, self.identity.self_id())?;
+
+        // Compute upgradeable capabilities only after the admin gate so
+        // non-admin callers get the policy error instead of a cache-shaped
+        // "nothing to upgrade" result.
+        let upgradeable = self.do_upgradeable_capabilities(group_id)?;
+        if upgradeable.is_empty() {
+            return Err(EngineError::Other(
+                "no upgradeable capabilities to apply".into(),
+            ));
+        }
 
         // Build new RequiredCapabilities = existing ∪ upgradeable.
         let mut req_exts: Vec<u16> = Vec::new();

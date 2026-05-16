@@ -145,6 +145,14 @@ fn rt() -> tokio::runtime::Runtime {
 /// Set up an N-client group via the harness. Returns the clients (alice
 /// is index 0) all at epoch 1 and on Stable.
 async fn setup_group(n: usize, bus: &TransportBus) -> Vec<HarnessClient> {
+    setup_group_with_admins(n, bus, &[]).await
+}
+
+async fn setup_group_with_admins(
+    n: usize,
+    bus: &TransportBus,
+    initial_admin_indices: &[usize],
+) -> Vec<HarnessClient> {
     assert!(n >= 2, "need at least 2 clients");
     let mut clients: Vec<HarnessClient> = (0..n)
         .map(|i| {
@@ -153,11 +161,19 @@ async fn setup_group(n: usize, bus: &TransportBus) -> Vec<HarnessClient> {
                 .attach(bus)
         })
         .collect();
+    let initial_admins = initial_admin_indices
+        .iter()
+        .copied()
+        .filter(|index| *index > 0 && *index < n)
+        .map(|index| clients[index].member_id())
+        .collect::<Vec<_>>();
     let mut invite_kps = Vec::with_capacity(n - 1);
     for c in clients.iter_mut().skip(1) {
         invite_kps.push(c.fresh_key_package().await);
     }
-    let (_gid, pending) = clients[0].create_group("prop", invite_kps, vec![]).await;
+    let (_gid, pending) = clients[0]
+        .create_group_with_admins("prop", invite_kps, vec![], initial_admins)
+        .await;
     clients[0].confirm(pending).await;
     bus.deliver_all();
     for c in clients.iter_mut().skip(1) {
@@ -1194,9 +1210,14 @@ proptest! {
 fn stored_convergence_restart_equivalence(name: String, committer_idx: usize) {
     rt().block_on(async {
         let bus = TransportBus::ordered();
-        let mut clients = setup_group(3, &bus).await;
-        let group_id = clients[0].group_id();
         let committer_idx = committer_idx % 2;
+        let initial_admin_indices = if committer_idx == 0 {
+            Vec::new()
+        } else {
+            vec![committer_idx]
+        };
+        let mut clients = setup_group_with_admins(3, &bus, &initial_admin_indices).await;
+        let group_id = clients[0].group_id();
         let res = clients[committer_idx]
             .engine
             .send(SendIntent::UpdateGroupData {

@@ -478,6 +478,14 @@ fn legacy_or_duplicate_command_shapes_are_not_supported() {
         run_json_error(home.path(), &["keys", "publish", "--account", "bob"])["code"],
         "usage"
     );
+    assert_eq!(
+        run_json_error(home.path(), &["group", "create", "--name", "general"])["code"],
+        "usage"
+    );
+    assert_eq!(
+        run_json_error(home.path(), &["group", "invite", "00", "--member", "bob"])["code"],
+        "usage"
+    );
 }
 
 #[test]
@@ -782,16 +790,7 @@ fn missing_key_package_errors_include_repair_guidance() {
 
     let error = run_json_error(
         home.path(),
-        &[
-            "--account",
-            &alice,
-            "group",
-            "create",
-            "--name",
-            "general",
-            "--member",
-            &bob,
-        ],
+        &["--account", &alice, "group", "create", "general", &bob],
     );
 
     assert_eq!(error["code"], "missing_key_package");
@@ -840,9 +839,7 @@ fn group_create_can_invite_a_member_by_fetched_pubkey() {
             &alice,
             "group",
             "create",
-            "--name",
             "pubkey",
-            "--member",
             bob_account_id,
         ],
     );
@@ -876,9 +873,7 @@ fn group_create_fetches_missing_key_package_for_pubkey_members() {
             &alice,
             "group",
             "create",
-            "--name",
             "pubkey",
-            "--member",
             bob_account_id,
         ],
     );
@@ -898,16 +893,7 @@ fn group_archive_is_local_state_not_membership_state() {
 
     let created_group = run_json(
         home.path(),
-        &[
-            "--account",
-            &alice,
-            "group",
-            "create",
-            "--name",
-            "general",
-            "--member",
-            &bob,
-        ],
+        &["--account", &alice, "group", "create", "general", &bob],
     );
     let group_id = created_group["group_id"].as_str().expect("group id");
     run_json(home.path(), &["--account", &bob, "sync"]);
@@ -959,16 +945,7 @@ fn local_group_message_workflow_runs_through_the_dm_contract() {
 
     let created_group = run_json(
         home.path(),
-        &[
-            "--account",
-            &alice,
-            "group",
-            "create",
-            "--name",
-            "general",
-            "--member",
-            &bob,
-        ],
+        &["--account", &alice, "group", "create", "general", &bob],
     );
     let group_id = created_group["group_id"].as_str().expect("group id");
 
@@ -1010,16 +987,7 @@ fn cli_can_inspect_projected_groups_messages_and_status() {
 
     let created_group = run_json(
         home.path(),
-        &[
-            "--account",
-            &alice,
-            "group",
-            "create",
-            "--name",
-            "general",
-            "--member",
-            &bob,
-        ],
+        &["--account", &alice, "group", "create", "general", &bob],
     );
     let group_id = created_group["group_id"].as_str().expect("group id");
     assert_eq!(created_group["profile"]["component_id"], 0x8001);
@@ -1033,11 +1001,24 @@ fn cli_can_inspect_projected_groups_messages_and_status() {
         "marmot.group.blossom.image.v1"
     );
     assert_eq!(created_group["image"]["present"], false);
+    assert_eq!(created_group["admin_policy"]["component_id"], 0x8003);
+    assert_eq!(
+        created_group["admin_policy"]["component"],
+        "marmot.group.admin-policy.v1"
+    );
+    assert_eq!(
+        created_group["admin_policy"]["admins"],
+        serde_json::json!([alice])
+    );
     run_json(home.path(), &["--account", &bob, "sync"]);
 
     let chats = run_json(home.path(), &["--account", &bob, "chats", "list"]);
     assert_eq!(chats["chats"][0]["group_id"], group_id);
     assert_eq!(chats["chats"][0]["profile"]["name"], "general");
+    assert_eq!(
+        chats["chats"][0]["admin_policy"]["admins"],
+        serde_json::json!([alice])
+    );
 
     let group = run_json(home.path(), &["--account", &bob, "chats", "show", group_id]);
     assert_eq!(group["group"]["group_id"], group_id);
@@ -1129,16 +1110,7 @@ fn group_update_publishes_profile_component_changes() {
 
     let created_group = run_json(
         home.path(),
-        &[
-            "--account",
-            &alice,
-            "group",
-            "create",
-            "--name",
-            "general",
-            "--member",
-            &bob,
-        ],
+        &["--account", &alice, "group", "create", "general", &bob],
     );
     let group_id = created_group["group_id"].as_str().expect("group id");
     run_json(home.path(), &["--account", &bob, "sync"]);
@@ -1174,6 +1146,44 @@ fn group_update_publishes_profile_component_changes() {
 }
 
 #[test]
+fn non_admin_group_mutations_return_admin_policy_errors() {
+    let home = tempfile::tempdir().expect("tempdir");
+
+    let alice = create_account(home.path());
+    let bob = create_account(home.path());
+    let carol = create_account(home.path());
+    run_json(home.path(), &["--account", &bob, "keys", "publish"]);
+    run_json(home.path(), &["--account", &carol, "keys", "publish"]);
+
+    let created_group = run_json(
+        home.path(),
+        &["--account", &alice, "group", "create", "general", &bob],
+    );
+    let group_id = created_group["group_id"].as_str().expect("group id");
+    run_json(home.path(), &["--account", &bob, "sync"]);
+
+    let invite_error = run_json_error(
+        home.path(),
+        &["--account", &bob, "group", "invite", group_id, &carol],
+    );
+    assert_eq!(invite_error["code"], "not_group_admin");
+
+    let update_error = run_json_error(
+        home.path(),
+        &[
+            "--account",
+            &bob,
+            "group",
+            "update",
+            group_id,
+            "--name",
+            "nope",
+        ],
+    );
+    assert_eq!(update_error["code"], "not_group_admin");
+}
+
+#[test]
 fn group_members_invite_and_remove_flow_updates_projected_members() {
     let home = tempfile::tempdir().expect("tempdir");
 
@@ -1185,16 +1195,7 @@ fn group_members_invite_and_remove_flow_updates_projected_members() {
 
     let created_group = run_json(
         home.path(),
-        &[
-            "--account",
-            &alice,
-            "group",
-            "create",
-            "--name",
-            "general",
-            "--member",
-            &bob,
-        ],
+        &["--account", &alice, "group", "create", "general", &bob],
     );
     let group_id = created_group["group_id"].as_str().expect("group id");
     run_json(home.path(), &["--account", &bob, "sync"]);
@@ -1210,15 +1211,7 @@ fn group_members_invite_and_remove_flow_updates_projected_members() {
 
     let invite = run_json(
         home.path(),
-        &[
-            "--account",
-            &alice,
-            "group",
-            "invite",
-            group_id,
-            "--member",
-            &carol,
-        ],
+        &["--account", &alice, "group", "invite", group_id, &carol],
     );
     assert_eq!(invite["published"], 2);
     run_json(home.path(), &["--account", &carol, "sync"]);
@@ -1250,15 +1243,7 @@ fn group_members_invite_and_remove_flow_updates_projected_members() {
 
     let remove = run_json(
         home.path(),
-        &[
-            "--account",
-            &alice,
-            "group",
-            "remove",
-            group_id,
-            "--member",
-            &bob,
-        ],
+        &["--account", &alice, "group", "remove", group_id, &bob],
     );
     assert_eq!(remove["published"], 1);
     run_json(home.path(), &["--account", &bob, "sync"]);

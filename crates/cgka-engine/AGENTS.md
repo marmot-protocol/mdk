@@ -123,10 +123,11 @@ These are the load-bearing departures from the original plan. Each is also docum
    leaf. The cache is populated from KeyPackages we directly handle (invite-side parses, `StagedCommit::add_proposals`)
    plus `MlsGroup::own_leaf_node()` for self.
 
-5. **MIP-01 `marmot_group_data` (`0xF2EE`) is owned by the engine, not by a transport adapter.** §149 / §150 admin
-   guards must fire at commit-construction time, which is inside the engine. Transport-y fields (relays, image\_\*,
-   nostr_group_id) are populated with placeholders that a future transport adapter refines. A future component-based
-   MIP-01 split will retire this monolithic module.
+5. **MIP-01 `marmot_group_data` (`0xF2EE`) is owned by the engine, not by a transport adapter.** Admin guards for
+   invite, removal, profile updates, and inbound admin-gated commits must fire inside the engine. Transport-y fields
+   (relays, image\_\*, nostr_group_id) are populated with placeholders that a future transport adapter refines. App-facing
+   projections expose the admin set as `marmot.group.admin-policy.v1` while the engine still reads the signed legacy
+   field as the source of truth.
 
 6. **Test identities are 32 bytes via `pad32`.** MIP-01 admin pubkeys MUST be 32-byte x-only secp256k1. The engine
    strict-fails non-32-byte member identities at admin-set time. Production identities (real Nostr pubkeys) flow through

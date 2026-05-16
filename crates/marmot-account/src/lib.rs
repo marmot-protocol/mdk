@@ -807,6 +807,10 @@ where
         Ok(self.session.group_record(group_id)?)
     }
 
+    pub fn admin_pubkeys(&self, group_id: &GroupId) -> AccountResult<Vec<[u8; 32]>> {
+        Ok(self.session.admin_pubkeys(group_id)?)
+    }
+
     pub async fn activate_transport(&self, since: Option<Timestamp>) -> AccountResult<()> {
         tracing::debug!(
             target: TRACE_TARGET,

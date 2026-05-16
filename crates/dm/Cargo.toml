@@ -15,6 +15,7 @@ path = "src/bin/dmd.rs"
 
 [dependencies]
 cgka-traits.workspace = true
+cgka-session.workspace = true
 clap.workspace = true
 crossterm.workspace = true
 hex.workspace = true

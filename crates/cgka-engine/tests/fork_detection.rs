@@ -143,7 +143,7 @@ async fn concurrent_invites_recover_to_deterministic_winner() {
             description: "".into(),
             members: vec![bob_kp],
             required_features: vec![],
-            initial_admins: vec![],
+            initial_admins: vec![bob.self_id()],
         })
         .await
         .unwrap();

@@ -194,7 +194,12 @@ async fn openmls_materializes_competing_commit_paths_from_same_anchor() {
     let bob_kp = bob.fresh_key_package().await;
     let carol_kp = carol.fresh_key_package().await;
     let (group_id, pending) = alice
-        .create_group("openmls-branches", vec![bob_kp, carol_kp], vec![])
+        .create_group_with_admins(
+            "openmls-branches",
+            vec![bob_kp, carol_kp],
+            vec![],
+            vec![bob.member_id()],
+        )
         .await;
     alice.confirm(pending).await;
     bus.deliver_all();
@@ -398,7 +403,12 @@ async fn openmls_canonicalization_uses_app_messages_as_branch_witnesses() {
     let bob_kp = bob.fresh_key_package().await;
     let carol_kp = carol.fresh_key_package().await;
     let (group_id, pending) = alice
-        .create_group("openmls-canonical-app", vec![bob_kp, carol_kp], vec![])
+        .create_group_with_admins(
+            "openmls-canonical-app",
+            vec![bob_kp, carol_kp],
+            vec![],
+            vec![bob.member_id()],
+        )
         .await;
     alice.confirm(pending).await;
     bus.deliver_all();
@@ -511,7 +521,12 @@ async fn stored_openmls_messages_reconstruct_canonicalization_batch() {
     let bob_kp = bob.fresh_key_package().await;
     let carol_kp = carol.fresh_key_package().await;
     let (group_id, pending) = alice
-        .create_group("stored-openmls-canonical", vec![bob_kp, carol_kp], vec![])
+        .create_group_with_admins(
+            "stored-openmls-canonical",
+            vec![bob_kp, carol_kp],
+            vec![],
+            vec![bob.member_id()],
+        )
         .await;
     alice.confirm(pending).await;
     bus.deliver_all();
@@ -611,10 +626,11 @@ async fn stored_openmls_canonicalization_persists_message_dispositions() {
     let bob_kp = bob.fresh_key_package().await;
     let carol_kp = carol.fresh_key_package().await;
     let (group_id, pending) = alice
-        .create_group(
+        .create_group_with_admins(
             "stored-openmls-dispositions",
             vec![bob_kp, carol_kp],
             vec![],
+            vec![bob.member_id()],
         )
         .await;
     alice.confirm(pending).await;
@@ -719,7 +735,12 @@ async fn stored_openmls_canonicalization_applies_selected_branch_to_retained_gro
     let bob_kp = bob.fresh_key_package().await;
     let carol_kp = carol.fresh_key_package().await;
     let (group_id, pending) = alice
-        .create_group("stored-openmls-apply", vec![bob_kp, carol_kp], vec![])
+        .create_group_with_admins(
+            "stored-openmls-apply",
+            vec![bob_kp, carol_kp],
+            vec![],
+            vec![bob.member_id()],
+        )
         .await;
     alice.confirm(pending).await;
     bus.deliver_all();
@@ -853,10 +874,11 @@ async fn retained_anchor_late_commit_within_horizon_is_resolved() {
     let bob_kp = bob.fresh_key_package().await;
     let carol_kp = carol.fresh_key_package().await;
     let (group_id, pending) = alice
-        .create_group(
+        .create_group_with_admins(
             "retained-anchor-late-within",
             vec![bob_kp, carol_kp],
             vec![],
+            vec![bob.member_id()],
         )
         .await;
     alice.confirm(pending).await;
@@ -957,7 +979,12 @@ async fn retained_anchor_missing_anchor_reports_error_without_mutation() {
     let bob_kp = bob.fresh_key_package().await;
     let carol_kp = carol.fresh_key_package().await;
     let (group_id, pending) = alice
-        .create_group("retained-anchor-missing", vec![bob_kp, carol_kp], vec![])
+        .create_group_with_admins(
+            "retained-anchor-missing",
+            vec![bob_kp, carol_kp],
+            vec![],
+            vec![bob.member_id()],
+        )
         .await;
     alice.confirm(pending).await;
     bus.deliver_all();
@@ -1050,7 +1077,12 @@ async fn retained_anchor_commit_beyond_anchor_is_invalidated() {
     let bob_kp = bob.fresh_key_package().await;
     let carol_kp = carol.fresh_key_package().await;
     let (group_id, pending) = alice
-        .create_group("retained-anchor-beyond", vec![bob_kp, carol_kp], vec![])
+        .create_group_with_admins(
+            "retained-anchor-beyond",
+            vec![bob_kp, carol_kp],
+            vec![],
+            vec![bob.member_id()],
+        )
         .await;
     alice.confirm(pending).await;
     bus.deliver_all();
@@ -1181,10 +1213,11 @@ async fn openmls_canonicalization_apply_rolls_back_when_selected_path_fails() {
     let bob_kp = bob.fresh_key_package().await;
     let carol_kp = carol.fresh_key_package().await;
     let (group_id, pending) = alice
-        .create_group(
+        .create_group_with_admins(
             "stored-openmls-apply-rollback",
             vec![bob_kp, carol_kp],
             vec![],
+            vec![bob.member_id()],
         )
         .await;
     alice.confirm(pending).await;

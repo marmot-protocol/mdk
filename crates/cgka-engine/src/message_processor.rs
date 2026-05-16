@@ -419,6 +419,15 @@ impl<S: StorageProvider> Engine<S> {
                 }
                 ProcessedMessageContent::StagedCommitMessage(staged) => {
                     let before = EpochId(mls_group.epoch().as_u64());
+                    if staged_commit_requires_admin(&staged) {
+                        let Some(sender) = sender_id.as_ref() else {
+                            self.update_stored_message_state(&msg.id, MessageState::Failed)?;
+                            return Err(EngineError::NotGroupAdmin {
+                                group_id: group_id.clone(),
+                            });
+                        };
+                        crate::group_data::require_admin(&mls_group, &group_id, sender)?;
+                    }
                     let recovery_snapshot =
                         self.fork_recovery
                             .create_snapshot(&self.storage, &group_id, before)?;
@@ -899,6 +908,7 @@ impl<S: StorageProvider> Engine<S> {
                 },
             ));
         }
+        crate::group_data::require_admin(&mls_group, &group_id, self.identity.self_id())?;
 
         // Validate capabilities (same rule as create_group — see Risk #1
         // capability doc).
@@ -1083,13 +1093,8 @@ impl<S: StorageProvider> Engine<S> {
         }
 
         let existing = self.storage.get_group(&group_id)?;
-        let self_pubkey = crate::group_data::admin_pubkey_from_member_id(self.identity.self_id())?;
+        crate::group_data::require_admin(&mls_group, &group_id, self.identity.self_id())?;
         let admins = crate::group_data::admins_of_group(&mls_group)?;
-        if !admins.iter().any(|admin| admin == &self_pubkey) {
-            return Err(EngineError::NotGroupAdmin {
-                group_id: group_id.clone(),
-            });
-        }
 
         let mut leaf_indices = Vec::with_capacity(unique_targets.len());
         let mut found = HashSet::new();
@@ -1363,6 +1368,14 @@ fn send_intent_group_id(intent: &SendIntent) -> &GroupId {
         | SendIntent::Leave { group_id }
         | SendIntent::UpdateGroupData { group_id, .. } => group_id,
     }
+}
+
+fn staged_commit_requires_admin(staged: &openmls::group::StagedCommit) -> bool {
+    staged.add_proposals().next().is_some()
+        || staged.remove_proposals().next().is_some()
+        || staged
+            .queued_proposals()
+            .any(|queued| matches!(queued.proposal(), Proposal::GroupContextExtensions(_)))
 }
 
 fn convergence_ingest_outcome(

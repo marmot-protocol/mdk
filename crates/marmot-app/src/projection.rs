@@ -5,8 +5,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rusqlite::{Connection, params};
 
 use crate::{
-    AccountState, AppError, AppGroupImageInput, AppGroupRecord, AppMessageProjection,
-    AppMessageQuery, AppMessageRecord,
+    AccountState, AppError, AppGroupAdminPolicyComponent, AppGroupImageInput, AppGroupRecord,
+    AppMessageProjection, AppMessageQuery, AppMessageRecord,
 };
 
 pub(crate) struct AccountProjectionDb {
@@ -40,6 +40,7 @@ impl AccountProjectionDb {
                 image_nonce_hex TEXT NOT NULL DEFAULT '',
                 image_upload_key_hex TEXT NOT NULL DEFAULT '',
                 image_media_type TEXT,
+                admin_keys_hex TEXT NOT NULL DEFAULT '',
                 archived INTEGER NOT NULL DEFAULT 0,
                 updated_at INTEGER NOT NULL
             );
@@ -92,6 +93,12 @@ impl AccountProjectionDb {
             "TEXT NOT NULL DEFAULT ''",
         )?;
         ensure_column(&conn, "groups", "image_media_type", "TEXT")?;
+        ensure_column(
+            &conn,
+            "groups",
+            "admin_keys_hex",
+            "TEXT NOT NULL DEFAULT ''",
+        )?;
         ensure_column(&conn, "groups", "archived", "INTEGER NOT NULL DEFAULT 0")?;
         ensure_column(&conn, "messages", "message_id_hex", "TEXT")?;
         ensure_column(
@@ -129,7 +136,7 @@ impl AccountProjectionDb {
         let mut group_statement = self.conn.prepare(
             "SELECT group_id_hex, endpoint, profile_name, profile_description,
                     image_hash_hex, image_key_hex, image_nonce_hex,
-                    image_upload_key_hex, image_media_type, archived
+                    image_upload_key_hex, image_media_type, admin_keys_hex, archived
              FROM groups
              ORDER BY updated_at, group_id_hex",
         )?;
@@ -146,8 +153,9 @@ impl AccountProjectionDb {
                     image_upload_key_hex: row.get(7)?,
                     media_type: row.get(8)?,
                 },
+                AppGroupAdminPolicyComponent::new(parse_admin_keys_hex(&row.get::<_, String>(9)?)),
             );
-            group.archived = row.get::<_, i64>(9)? != 0;
+            group.archived = row.get::<_, i64>(10)? != 0;
             Ok(group)
         })?;
         let mut groups = Vec::new();
@@ -187,9 +195,9 @@ impl AccountProjectionDb {
                 "INSERT INTO groups (
                     group_id_hex, endpoint, profile_name, profile_description,
                     image_hash_hex, image_key_hex, image_nonce_hex,
-                    image_upload_key_hex, image_media_type, archived, updated_at
+                    image_upload_key_hex, image_media_type, admin_keys_hex, archived, updated_at
                  )
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
                  ON CONFLICT(group_id_hex) DO UPDATE SET
                     endpoint = excluded.endpoint,
                     profile_name = excluded.profile_name,
@@ -199,6 +207,7 @@ impl AccountProjectionDb {
                     image_nonce_hex = excluded.image_nonce_hex,
                     image_upload_key_hex = excluded.image_upload_key_hex,
                     image_media_type = excluded.image_media_type,
+                    admin_keys_hex = excluded.admin_keys_hex,
                     archived = excluded.archived,
                     updated_at = excluded.updated_at",
                 params![
@@ -211,6 +220,7 @@ impl AccountProjectionDb {
                     &group.image.image_nonce_hex,
                     &group.image.image_upload_key_hex,
                     &group.image.media_type,
+                    group.admin_policy.admins.join(","),
                     if group.archived { 1_i64 } else { 0_i64 },
                     unix_now_seconds() as i64
                 ],
@@ -246,6 +256,23 @@ impl AccountProjectionDb {
                     i64::from(group.image.component_id),
                     &group.image.component,
                     &group.image.data_hex,
+                    unix_now_seconds() as i64
+                ],
+            )?;
+            tx.execute(
+                "INSERT INTO group_app_components (
+                    group_id_hex, component_id, component_name, component_data_hex, updated_at
+                 )
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(group_id_hex, component_id) DO UPDATE SET
+                    component_name = excluded.component_name,
+                    component_data_hex = excluded.component_data_hex,
+                    updated_at = excluded.updated_at",
+                params![
+                    &group.group_id_hex,
+                    i64::from(group.admin_policy.component_id),
+                    &group.admin_policy.component,
+                    &group.admin_policy.data_hex,
                     unix_now_seconds() as i64
                 ],
             )?;
@@ -362,6 +389,17 @@ fn limit_to_i64(limit: usize) -> i64 {
     i64::try_from(limit).unwrap_or(i64::MAX)
 }
 
+fn parse_admin_keys_hex(value: &str) -> Vec<[u8; 32]> {
+    value
+        .split(',')
+        .filter_map(|key| {
+            let bytes = hex::decode(key).ok()?;
+            let array: [u8; 32] = bytes.try_into().ok()?;
+            Some(array)
+        })
+        .collect()
+}
+
 fn ensure_column(
     conn: &Connection,
     table: &str,
@@ -400,6 +438,7 @@ mod tests {
                 "before".to_owned(),
                 "".to_owned(),
                 AppGroupImageInput::default(),
+                AppGroupAdminPolicyComponent::new(Vec::new()),
             )],
         };
         db.save_state(&original).unwrap();
@@ -423,6 +462,7 @@ mod tests {
                 "after".to_owned(),
                 "".to_owned(),
                 AppGroupImageInput::default(),
+                AppGroupAdminPolicyComponent::new(Vec::new()),
             )],
         };
 
