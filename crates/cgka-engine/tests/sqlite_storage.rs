@@ -132,6 +132,7 @@ async fn create_group_confirm_and_reopen_with_encrypted_sqlite_storage() {
             description: "engine integration smoke".into(),
             members: vec![bob_key_package],
             required_features: vec![],
+            app_components: vec![],
             initial_admins: vec![],
         })
         .await

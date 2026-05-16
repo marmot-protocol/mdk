@@ -1,8 +1,7 @@
-//! `upgrade_group_capabilities` — produces a `GroupContextExtensions`
-//! commit that promotes every currently-upgradeable capability into the
-//! group's `RequiredCapabilities`.
+//! `upgrade_group_capabilities` — produces a commit that promotes every
+//! currently-upgradeable capability into the group's required set.
 //!
-//! Mirrors `do_send_invite`'s shape (parse, stage GCE commit, wrap with
+//! Mirrors `do_send_invite`'s shape (parse, stage commit, wrap with
 //! pre-stage exporter, transition to `PendingPublish`, return
 //! `GroupEvolution`). Publish-before-apply defers merge and Marmot record
 //! updates to `do_confirm_published`.
@@ -15,8 +14,10 @@ use cgka_traits::error::EngineError;
 use cgka_traits::storage::StorageProvider;
 use cgka_traits::transport::{EncryptedPayload, TransportEnvelope, TransportMessage};
 use cgka_traits::types::{EpochId, GroupId};
+use openmls::component::ComponentData;
 use openmls::extensions::{Extension, Extensions, RequiredCapabilitiesExtension};
 use openmls::group::MlsGroup;
+use openmls::messages::proposals::{AppDataUpdateOperation, AppDataUpdateProposal, Proposal};
 use openmls::prelude::{ExtensionType, ProposalType};
 use tls_codec::Serialize as _;
 
@@ -46,7 +47,7 @@ impl<S: StorageProvider> Engine<S> {
         )
         .map_err(|e| EngineError::Backend(format!("load: {e:?}")))?
         .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
-        crate::group_data::require_admin(&mls_group, group_id, self.identity.self_id())?;
+        crate::app_components::require_admin(&mls_group, group_id, self.identity.self_id())?;
 
         // Compute upgradeable capabilities only after the admin gate so
         // non-admin callers get the policy error instead of a cache-shaped
@@ -58,15 +59,15 @@ impl<S: StorageProvider> Engine<S> {
             ));
         }
 
-        // Build new RequiredCapabilities = existing ∪ upgradeable.
+        // Build new RequiredCapabilities = existing ∪ upgradeable MLS
+        // primitives. App components are negotiated in the upstream
+        // `app_components` component, not in MLS RequiredCapabilities.
         let mut req_exts: Vec<u16> = Vec::new();
         let mut req_props: Vec<u16> = Vec::new();
         for ext in mls_group.extensions().iter() {
             if let Extension::RequiredCapabilities(rc) = ext {
                 for t in rc.extension_types() {
-                    if let ExtensionType::Unknown(n) = t {
-                        req_exts.push(*n);
-                    }
+                    req_exts.push(u16::from(*t));
                 }
                 for t in rc.proposal_types() {
                     req_props.push(u16::from(*t));
@@ -87,30 +88,57 @@ impl<S: StorageProvider> Engine<S> {
         req_exts.dedup();
         req_props.sort();
         req_props.dedup();
-        let new_rc = RequiredCapabilitiesExtension::new(
-            &req_exts
-                .iter()
-                .copied()
-                .map(ExtensionType::Unknown)
-                .collect::<Vec<_>>(),
-            &req_props
-                .iter()
-                .copied()
-                .map(ProposalType::from)
-                .collect::<Vec<_>>(),
-            &[],
-        );
+        let upgrades_required_capabilities =
+            !upgradeable.extensions.is_empty() || !upgradeable.proposals.is_empty();
+        let new_extensions = if upgrades_required_capabilities {
+            let new_rc = RequiredCapabilitiesExtension::new(
+                &req_exts
+                    .iter()
+                    .copied()
+                    .map(ExtensionType::from)
+                    .collect::<Vec<_>>(),
+                &req_props
+                    .iter()
+                    .copied()
+                    .map(ProposalType::from)
+                    .collect::<Vec<_>>(),
+                &[],
+            );
 
-        // Replace the RequiredCapabilities ext in the existing extension set.
-        let mut new_ext_vec: Vec<Extension> = mls_group
-            .extensions()
-            .iter()
-            .filter(|e| !matches!(e, Extension::RequiredCapabilities(_)))
-            .cloned()
-            .collect();
-        new_ext_vec.push(Extension::RequiredCapabilities(new_rc));
-        let new_extensions = Extensions::from_vec(new_ext_vec)
-            .map_err(|e| EngineError::Backend(format!("extensions: {e:?}")))?;
+            let mut new_ext_vec: Vec<Extension> = mls_group
+                .extensions()
+                .iter()
+                .filter(|e| !matches!(e, Extension::RequiredCapabilities(_)))
+                .cloned()
+                .collect();
+            new_ext_vec.push(Extension::RequiredCapabilities(new_rc));
+            Some(
+                Extensions::from_vec(new_ext_vec)
+                    .map_err(|e| EngineError::Backend(format!("extensions: {e:?}")))?,
+            )
+        } else {
+            None
+        };
+
+        let mut app_component_updates = Vec::new();
+        if !upgradeable.app_components.is_empty() {
+            let mut required_components =
+                crate::app_components::required_app_components_of_group(&mls_group)?;
+            let before = required_components.clone();
+            for component_id in &upgradeable.app_components.ids {
+                required_components.insert(*component_id);
+            }
+            if required_components != before {
+                app_component_updates.push(Proposal::AppDataUpdate(Box::new(
+                    AppDataUpdateProposal::update(
+                        cgka_traits::app_components::APP_COMPONENTS_COMPONENT_ID,
+                        cgka_traits::app_components::encode_components_list(
+                            &required_components.ids,
+                        ),
+                    ),
+                )));
+            }
+        }
 
         // Fork-detection bookkeeping.
         let pre_commit_epoch = EpochId(mls_group.epoch().as_u64());
@@ -122,14 +150,49 @@ impl<S: StorageProvider> Engine<S> {
         let pre_commit_ctx =
             crate::group_lifecycle::build_group_context_snapshot(&mls_group, &provider)?;
 
-        // Produce + stage the GCE commit. Under publish-before-apply we
+        // Produce + stage the upgrade commit. Under publish-before-apply we
         // do NOT call `merge_pending_commit` here — the merge + Marmot
-        // record's `required_capabilities` update both defer to
-        // `do_confirm_published` (which reads the new RequiredCapabilities
-        // off the post-merge group context and mirrors it).
-        let (commit_out, _welcome_opt, _gi) = mls_group
-            .update_group_context_extensions(&provider, new_extensions, &self.identity.signer)
-            .map_err(|e| EngineError::Backend(format!("update_gce: {e:?}")))?;
+        // record's required capability update both defer to
+        // `do_confirm_published` (which reads the post-merge group state).
+        let mut commit_builder = mls_group.commit_builder();
+        if let Some(new_extensions) = new_extensions {
+            commit_builder = commit_builder
+                .propose_group_context_extensions(new_extensions)
+                .map_err(|e| EngineError::Backend(format!("upgrade_gce: {e:?}")))?;
+        }
+        if !app_component_updates.is_empty() {
+            commit_builder = commit_builder.add_proposals(app_component_updates);
+        }
+        let mut builder = commit_builder
+            .load_psks(
+                <EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(
+                    &provider,
+                ),
+            )
+            .map_err(|e| EngineError::Backend(format!("upgrade load_psks: {e:?}")))?;
+        let mut app_data = builder.app_data_dictionary_updater();
+        for proposal in builder.app_data_update_proposals() {
+            if let AppDataUpdateOperation::Update(data) = proposal.operation() {
+                app_data.set(ComponentData::from_parts(
+                    proposal.component_id(),
+                    data.clone(),
+                ));
+            }
+        }
+        builder.with_app_data_dictionary_updates(app_data.changes());
+        let commit_bundle = builder
+            .build(
+                <EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::rand(&provider),
+                <EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::crypto(
+                    &provider,
+                ),
+                &self.identity.signer,
+                |_| true,
+            )
+            .map_err(|e| EngineError::Backend(format!("upgrade build: {e:?}")))?
+            .stage_commit(&provider)
+            .map_err(|e| EngineError::Backend(format!("upgrade stage: {e:?}")))?;
+        let (commit_out, _welcome_opt, _gi) = commit_bundle.into_contents();
         let commit_bytes = commit_out
             .tls_serialize_detached()
             .map_err(|e| EngineError::Serialize(format!("{e:?}")))?;
@@ -147,7 +210,10 @@ impl<S: StorageProvider> Engine<S> {
             .map_err(EngineError::Peeler)?;
         let wrapped = TransportMessage {
             envelope: TransportEnvelope::GroupMessage {
-                transport_group_id: group_id.as_slice().to_vec(),
+                transport_group_id: pre_commit_ctx
+                    .transport_group_id()
+                    .map(ToOwned::to_owned)
+                    .unwrap_or_else(|| group_id.as_slice().to_vec()),
             },
             ..wrapped
         };

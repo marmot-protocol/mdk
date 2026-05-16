@@ -69,14 +69,14 @@ impl<S: StorageProvider> Engine<S> {
         }
 
         // Now the MLS group is at the new epoch. Mirror the Marmot record
-        // (epoch + members + RequiredCapabilities + name/description
-        // derived from the post-merge group context) and refresh the
-        // self-cache (commits can rotate own leaf via force_self_update).
+        // (epoch + members + RequiredCapabilities + app-component state)
+        // and refresh the self-cache (commits can rotate own leaf via
+        // force_self_update).
         if let Ok(mut g) = self.storage.get_group(&group_id) {
             g.epoch = EpochId(mls_group.epoch().as_u64());
             g.members = crate::group_lifecycle::marmot_members(&mls_group);
             g.required_capabilities = required_capabilities_from_group(&mls_group);
-            mirror_group_data_into_record(&mls_group, &mut g);
+            crate::group_lifecycle::mirror_app_components_into_record(&mls_group, &mut g);
             self.storage.put_group(&g)?;
         }
         crate::capability_manager::cache_self_capabilities(
@@ -155,7 +155,7 @@ impl<S: StorageProvider> Engine<S> {
             g.epoch = EpochId(mls_group.epoch().as_u64());
             g.members = crate::group_lifecycle::marmot_members(&mls_group);
             g.required_capabilities = required_capabilities_from_group(&mls_group);
-            mirror_group_data_into_record(&mls_group, &mut g);
+            crate::group_lifecycle::mirror_app_components_into_record(&mls_group, &mut g);
             self.storage.put_group(&g)?;
         }
 
@@ -167,17 +167,6 @@ impl<S: StorageProvider> Engine<S> {
     }
 }
 
-/// Read `marmot_group_data` from the (post-merge or post-rollback) MLS
-/// group and mirror its `name` / `description` into the Marmot record.
-/// Best-effort: if the extension is missing or unparseable (legacy
-/// fixtures), leave the record's existing values alone.
-fn mirror_group_data_into_record(mls_group: &MlsGroup, record: &mut cgka_traits::group::Group) {
-    if let Ok(Some(data)) = crate::group_data::read_from_group(mls_group) {
-        record.name = String::from_utf8_lossy(data.name.as_slice()).into_owned();
-        record.description = String::from_utf8_lossy(data.description.as_slice()).into_owned();
-    }
-}
-
 /// Read the `RequiredCapabilities` extension off the (post-merge) MLS
 /// group context and translate it into the Marmot-side
 /// `GroupCapabilities` shape used in the `Group` record.
@@ -185,19 +174,19 @@ fn required_capabilities_from_group(
     mls_group: &MlsGroup,
 ) -> cgka_traits::capabilities::GroupCapabilities {
     use openmls::extensions::Extension;
-    use openmls::prelude::ExtensionType;
     let mut caps = cgka_traits::capabilities::GroupCapabilities::default();
     for ext in mls_group.extensions().iter() {
         if let Extension::RequiredCapabilities(rc) = ext {
             for t in rc.extension_types() {
-                if let ExtensionType::Unknown(n) = t {
-                    caps.extensions.insert(*n);
-                }
+                caps.extensions.insert(u16::from(*t));
             }
             for t in rc.proposal_types() {
                 caps.proposals.insert(u16::from(*t));
             }
         }
+    }
+    if let Ok(components) = crate::app_components::required_app_components_of_group(mls_group) {
+        caps.app_components = components;
     }
     caps
 }

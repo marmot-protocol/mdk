@@ -143,6 +143,7 @@ async fn committer_must_not_be_leaver_holds_for_self_proposal() {
             description: "".into(),
             members: vec![bob_kp, carol_kp],
             required_features: vec![],
+            app_components: vec![],
             initial_admins: vec![],
         })
         .await
@@ -213,6 +214,7 @@ async fn admin_cannot_self_remove_when_only_admin() {
             description: "".into(),
             members: vec![bob_kp],
             required_features: vec![],
+            app_components: vec![],
             initial_admins: vec![],
         })
         .await
@@ -249,6 +251,7 @@ async fn admin_can_self_remove_when_co_admin_present() {
             description: "".into(),
             members: vec![bob_kp, carol_kp],
             required_features: vec![],
+            app_components: vec![],
             initial_admins: vec![bob_id],
         })
         .await
@@ -297,6 +300,7 @@ async fn auto_committer_commits_admin_self_remove_when_co_admin_present() {
             description: "".into(),
             members: vec![bob_kp, carol_kp],
             required_features: vec![],
+            app_components: vec![],
             initial_admins: vec![bob_id],
         })
         .await
@@ -355,6 +359,7 @@ async fn non_admin_can_self_remove_freely() {
             description: "".into(),
             members: vec![bob_kp],
             required_features: vec![],
+            app_components: vec![],
             initial_admins: vec![],
         })
         .await

@@ -40,7 +40,9 @@ Those live above this crate.
 - `NostrTransportAdapter` activation, inbox delivery, group subscription, and publish reports over an in-memory relay
   client;
 - NIP-59 welcome publication/delivery into `GroupJoined`;
-- kind `445` group message publication/delivery into `MessageReceived`.
+- kind `445` group message publication/delivery into `MessageReceived`;
+- signed `marmot.transport.nostr.routing.v1` component state driving the Nostr `h` tag, group subscriptions, and group
+  publish targets instead of assuming the transport id equals the MLS group id.
 - publish lifecycle resolution for successful acks, insufficient acks, and relay publish errors;
 - group subscription gating, duplicate relay delivery, out-of-order delivery, and invite group evolution with both
   commit and welcome outputs.

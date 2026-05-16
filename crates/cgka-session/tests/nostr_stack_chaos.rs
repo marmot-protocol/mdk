@@ -690,6 +690,9 @@ async fn create_group_for_bob(
             description: "seeded session stack chaos".into(),
             members: vec![bob_key_package],
             required_features: vec![],
+            app_components: vec![support::nostr_stack::nostr_routing_component(
+                format!("stack-chaos-{seed:x}").as_bytes(),
+            )],
             initial_admins: vec![],
         })
         .await

@@ -6,9 +6,13 @@
 //! serializing — without pulling in a real peeler impl.
 
 use async_trait::async_trait;
-use cgka_engine::EngineBuilder;
 use cgka_engine::feature_registry::FeatureRegistry;
+use cgka_engine::{Engine, EngineBuilder};
 use cgka_traits::EngineError;
+use cgka_traits::app_components::{
+    AppComponentData, GROUP_ADMIN_POLICY_COMPONENT_ID, GROUP_PROFILE_COMPONENT_ID,
+    NOSTR_ROUTING_COMPONENT_ID, NostrRoutingV1, default_group_components, encode_nostr_routing_v1,
+};
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
 use cgka_traits::engine::{CgkaEngine, CreateGroupRequest, SendResult};
 use cgka_traits::error::PeelerError;
@@ -79,7 +83,7 @@ impl TransportPeeler for MockPeeler {
     async fn wrap_group_message(
         &self,
         payload: &EncryptedPayload,
-        _ctx: &GroupContextSnapshot,
+        ctx: &GroupContextSnapshot,
     ) -> Result<TransportMessage, PeelerError> {
         Ok(TransportMessage {
             id: hash_id(&payload.ciphertext),
@@ -88,7 +92,7 @@ impl TransportPeeler for MockPeeler {
             causal_deps: vec![],
             source: TransportSource("mock".into()),
             envelope: TransportEnvelope::GroupMessage {
-                transport_group_id: vec![],
+                transport_group_id: ctx.transport_group_id().unwrap_or_default().to_vec(),
             },
         })
     }
@@ -109,6 +113,18 @@ impl TransportPeeler for MockPeeler {
             },
         })
     }
+}
+
+fn build_client_with_components(
+    identity: &[u8],
+    components: impl IntoIterator<Item = u16>,
+) -> Engine<MemoryStorage> {
+    EngineBuilder::new(MemoryStorage::new())
+        .identity(pad32(identity))
+        .supported_app_components(components)
+        .peeler(Box::new(MockPeeler))
+        .build()
+        .expect("build engine")
 }
 
 fn selfremove_registry() -> FeatureRegistry {
@@ -161,6 +177,7 @@ async fn create_group_with_three_members_happy_path() {
             description: "integration smoke".into(),
             members: vec![bob_kp, carol_kp],
             required_features: vec![Feature("self-remove")],
+            app_components: vec![],
             initial_admins: vec![],
         })
         .await
@@ -194,6 +211,90 @@ async fn create_group_with_three_members_happy_path() {
 }
 
 #[tokio::test]
+async fn nostr_routing_component_drives_group_message_route() {
+    let mut supported = default_group_components();
+    supported.insert(NOSTR_ROUTING_COMPONENT_ID);
+    let mut alice = build_client_with_components(b"alice", supported.clone());
+    let mut bob = build_client_with_components(b"bob", supported);
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let routing = NostrRoutingV1::new(
+        [0x41; 32],
+        vec![
+            "wss://relay-b.example".into(),
+            "wss://relay-a.example".into(),
+        ],
+    )
+    .unwrap();
+    let routing_bytes = encode_nostr_routing_v1(&routing).unwrap();
+
+    let (group_id, result) = alice
+        .create_group(CreateGroupRequest {
+            name: "nostr".into(),
+            description: "routing component".into(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![AppComponentData {
+                component_id: NOSTR_ROUTING_COMPONENT_ID,
+                data: routing_bytes.clone(),
+            }],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let pending = match result {
+        SendResult::GroupCreated { pending, .. } => pending,
+        other => panic!("expected group created, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+
+    let group = alice.group_record(&group_id).unwrap();
+    assert!(
+        group
+            .required_capabilities
+            .app_components
+            .contains(NOSTR_ROUTING_COMPONENT_ID)
+    );
+    assert_eq!(
+        alice
+            .app_component(&group_id, NOSTR_ROUTING_COMPONENT_ID)
+            .unwrap(),
+        Some(routing_bytes)
+    );
+
+    let sent = alice
+        .send(cgka_traits::engine::SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload: b"hello".to_vec(),
+        })
+        .await
+        .unwrap();
+    let msg = match sent {
+        SendResult::ApplicationMessage { msg } => msg,
+        other => panic!("expected app message, got {other:?}"),
+    };
+    assert_eq!(
+        msg.envelope,
+        TransportEnvelope::GroupMessage {
+            transport_group_id: routing.nostr_group_id.to_vec()
+        }
+    );
+    assert_ne!(routing.nostr_group_id.as_slice(), group_id.as_slice());
+
+    assert!(
+        group
+            .required_capabilities
+            .app_components
+            .contains(GROUP_PROFILE_COMPONENT_ID)
+    );
+    assert!(
+        group
+            .required_capabilities
+            .app_components
+            .contains(GROUP_ADMIN_POLICY_COMPONENT_ID)
+    );
+}
+
+#[tokio::test]
 async fn create_group_rejects_invitee_missing_required_capability() {
     // Alice requires SelfRemove; "stripped" Bob advertises no required caps.
     let mut alice = build_client(b"alice", selfremove_registry());
@@ -206,6 +307,7 @@ async fn create_group_rejects_invitee_missing_required_capability() {
             description: "".into(),
             members: vec![kp],
             required_features: vec![Feature("self-remove")],
+            app_components: vec![],
             initial_admins: vec![],
         })
         .await
@@ -260,6 +362,7 @@ async fn join_welcome_called_twice_for_same_welcome_errors_on_second_call() {
             description: "".into(),
             members: vec![bob_kp],
             required_features: vec![],
+            app_components: vec![],
             initial_admins: vec![],
         })
         .await
@@ -304,6 +407,7 @@ async fn join_welcome_dedup_survives_engine_rebuild_on_same_storage() {
             description: "".into(),
             members: vec![bob_kp],
             required_features: vec![],
+            app_components: vec![],
             initial_admins: vec![],
         })
         .await
@@ -345,6 +449,7 @@ async fn confirm_published_transitions_to_stable_and_emits_group_created() {
             description: "".into(),
             members: vec![bob_kp],
             required_features: vec![],
+            app_components: vec![],
             initial_admins: vec![],
         })
         .await
@@ -386,6 +491,7 @@ async fn two_engine_happy_path_create_and_join() {
             description: "".into(),
             members: vec![bob_kp],
             required_features: vec![],
+            app_components: vec![],
             initial_admins: vec![],
         })
         .await
@@ -441,6 +547,7 @@ async fn join_welcome_rejects_wrong_recipient() {
             description: "".into(),
             members: vec![bob_kp],
             required_features: vec![],
+            app_components: vec![],
             initial_admins: vec![],
         })
         .await
@@ -470,6 +577,7 @@ async fn create_group_buffers_ingest_via_pending_state() {
             description: "".into(),
             members: vec![bob_kp],
             required_features: vec![],
+            app_components: vec![],
             initial_admins: vec![],
         })
         .await

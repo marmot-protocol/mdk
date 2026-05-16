@@ -60,7 +60,7 @@ relay-plane format, or a future non-Nostr transport.
 - No UI projection or message database.
 - No account recovery or key migration UX yet.
 - No derivation of full MIP-00 KeyPackage metadata from fresh engine KeyPackage bytes yet.
-- No relay auth, Nostr routing-component reader, relay-list discovery, relay-list repair, or relay health scoring.
+- No relay auth, relay-list discovery, relay-list repair, or relay health scoring.
 
 ## Run tests
 

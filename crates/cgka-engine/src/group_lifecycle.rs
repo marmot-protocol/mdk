@@ -11,12 +11,14 @@
 //! confirm/fail are state-machine-only no-ops MLS-side.
 
 use crate::capabilities::{
-    capabilities_of_key_package, leaf_capabilities, required_capabilities_extension_for_features,
+    capabilities_of_key_package, extension_from_group_capabilities, leaf_capabilities,
+    required_capabilities_extension_for_features,
 };
 use crate::engine::Engine;
 use crate::provider::EngineOpenMlsProvider;
 use crate::wire_format::PURE_PLAINTEXT_WIRE_FORMAT_POLICY;
 use crate::wire_format::join_config;
+use cgka_traits::app_components::{AppComponentSet, default_group_components};
 use cgka_traits::capabilities::{GroupCapabilities, TransportKind};
 use cgka_traits::engine::{CreateGroupRequest, SendResult};
 use cgka_traits::error::EngineError;
@@ -27,7 +29,6 @@ use cgka_traits::transport::{EncryptedPayload, TransportEnvelope, TransportMessa
 use cgka_traits::types::{EpochId, GroupId, MemberId};
 use openmls::group::{MlsGroup, MlsGroupCreateConfig, StagedWelcome};
 use openmls::prelude::{BasicCredential, Extension, Extensions, MlsMessageBodyIn, MlsMessageIn};
-use rand::RngCore;
 use tls_codec::{Deserialize as _, Serialize as _};
 
 /// Exporter-secret label the engine reserves for its own internal use (group
@@ -42,82 +43,91 @@ impl<S: StorageProvider> Engine<S> {
     ) -> Result<(GroupId, SendResult), EngineError> {
         // 1. Validate invitees against required capabilities.
         let active_transports: [TransportKind; 0] = []; // engine-layer: no transports
-        let (required_caps, required_caps_ext) = required_capabilities_extension_for_features(
+        let (mut required_caps, _) = required_capabilities_extension_for_features(
             &self.registry,
             &active_transports,
             &req.required_features,
         )?;
+        let mut desired_components = AppComponentSet::from(default_group_components());
+        for component_id in required_caps.app_components.ids.clone() {
+            desired_components.insert(component_id);
+        }
+        for component in &req.app_components {
+            required_caps.app_components.insert(component.component_id);
+            desired_components.insert(component.component_id);
+        }
+        let self_missing = required_caps
+            .app_components
+            .missing_from(&self.supported_app_components);
+        if !self_missing.is_empty() {
+            let had = GroupCapabilities {
+                app_components: self.supported_app_components.clone(),
+                ..GroupCapabilities::default()
+            };
+            return Err(EngineError::MissingRequiredCapabilities {
+                required: Box::new(required_caps.clone()),
+                had: Box::new(had),
+            });
+        }
 
         let mut parsed_kps = Vec::with_capacity(req.members.len());
+        let mut negotiated_components =
+            desired_components.intersection(&self.supported_app_components);
         for kp in &req.members {
             let parsed = self.parse_key_package(kp)?;
             let had = capabilities_of_key_package(&parsed);
             let missing = required_caps.missing_from(&had);
             if !missing.is_empty() {
                 return Err(EngineError::MissingRequiredCapabilities {
-                    required: required_caps.clone(),
-                    had,
+                    required: Box::new(required_caps.clone()),
+                    had: Box::new(had),
                 });
             }
+            negotiated_components = negotiated_components.intersection(&had.app_components);
             parsed_kps.push(parsed);
         }
+        required_caps.app_components = negotiated_components;
+        let required_caps_ext = extension_from_group_capabilities(&required_caps);
 
-        // 2. Build the group config with leaf capabilities + required
-        //    capabilities extension + MIP-01 marmot_group_data.
+        // 2. Build the group config with leaf capabilities, MLS
+        //    RequiredCapabilities, and Marmot app-component state.
         let leaf_caps = leaf_capabilities(&self.registry, self.ciphersuite);
+        let leaf_extensions = Extensions::single(
+            crate::app_components::leaf_app_components_extension(&self.supported_app_components)?,
+        )
+        .map_err(|e| EngineError::Backend(format!("leaf extensions: {e:?}")))?;
 
-        // Construct the MIP-01 marmot_group_data extension.
-        //
-        // Admin set: creator is always included. Additional initial
-        // admins from `req.initial_admins` are merged in (deduped).
-        // Allows tests + Whitenoise-level bootstrap to create groups with
-        // multiple admins from the start, which is the only path (in
-        // 0.1.0) for an admin to subsequently self-remove without
-        // tripping §149.
-        //
-        // Other marmot_group_data fields (relays, image, etc.) are
-        // placeholders the transport adapter can refine on the way out.
         let creator_pubkey =
-            crate::group_data::admin_pubkey_from_member_id(self.identity.self_id())?;
+            crate::app_components::admin_pubkey_from_member_id(self.identity.self_id())?;
         let mut admin_set: Vec<[u8; 32]> = vec![creator_pubkey];
         for extra in &req.initial_admins {
-            let pk = crate::group_data::admin_pubkey_from_member_id(extra)?;
+            let pk = crate::app_components::admin_pubkey_from_member_id(extra)?;
             if !admin_set.contains(&pk) {
                 admin_set.push(pk);
             }
         }
 
-        // The MIP-01 transport-visible group id is the routing handle the
-        // network layer uses to fan group messages out. It MUST NOT be
-        // derived from any group-member identity: a deterministic mapping
-        // would let a relay-side observer correlate every group created
-        // by the same creator (or attended by the same member) by
-        // watching the same routing tag. We therefore generate it from
-        // cryptographically secure randomness here, even though this
-        // field is shaped for the Nostr transport — getting routing
-        // metadata right at create time is more important than honoring
-        // the "engine doesn't know about transports" rule for an opaque
-        // 32-byte identifier.
-        let mut nostr_group_id = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut nostr_group_id);
-        let mut group_data = crate::group_data::NostrGroupData::fresh(
-            &req.name,
-            &req.description,
-            nostr_group_id,
-            creator_pubkey,
-        );
-        group_data.set_admins(&admin_set);
-        let group_data_ext = group_data.to_extension()?;
+        let app_data_ext = crate::app_components::app_data_dictionary_extension_for_group(
+            &required_caps.app_components,
+            &crate::app_components::InitialComponentState {
+                name: req.name.clone(),
+                description: req.description.clone(),
+                admins: admin_set,
+                app_components: req.app_components.clone(),
+            },
+        )?;
 
         let gc_exts = Extensions::from_vec(vec![
             Extension::RequiredCapabilities(required_caps_ext),
-            group_data_ext,
+            app_data_ext,
         ])
         .map_err(|e| EngineError::Backend(format!("extensions: {e:?}")))?;
 
         let group_config = MlsGroupCreateConfig::builder()
             .ciphersuite(self.ciphersuite)
             .capabilities(leaf_caps)
+            .with_leaf_node_extensions(leaf_extensions)
+            .map_err(|e| EngineError::Backend(format!("leaf extensions: {e:?}")))?
             .wire_format_policy(PURE_PLAINTEXT_WIRE_FORMAT_POLICY)
             .max_past_epochs(self.max_past_epochs)
             .with_group_context_extensions(gc_exts)
@@ -351,7 +361,7 @@ impl<S: StorageProvider> Engine<S> {
                 &mls_group,
             ),
         };
-        mirror_group_data_into_record(&mls_group, &mut group_record);
+        mirror_app_components_into_record(&mls_group, &mut group_record);
         self.storage.put_group(&group_record)?;
 
         // Cache self's capabilities. Other members' capabilities arrive as
@@ -414,6 +424,7 @@ impl<S: StorageProvider> Engine<S> {
             return Ok(leaf_capabilities_as_marmot(
                 &self.registry,
                 self.ciphersuite,
+                &self.supported_app_components,
             ));
         }
         let mut it = key_packages.iter();
@@ -433,6 +444,7 @@ impl<S: StorageProvider> Engine<S> {
                     .intersection(&other.extensions)
                     .copied()
                     .collect(),
+                app_components: acc.app_components.intersection(&other.app_components),
             };
         }
         Ok(acc)
@@ -489,11 +501,13 @@ pub(crate) fn marmot_members(group: &MlsGroup) -> Vec<Member> {
 fn leaf_capabilities_as_marmot(
     registry: &crate::feature_registry::FeatureRegistry,
     _cs: openmls_traits::types::Ciphersuite,
+    supported_app_components: &cgka_traits::app_components::AppComponentSet,
 ) -> GroupCapabilities {
     let mut out = GroupCapabilities::default();
     for (_f, req) in registry.iter() {
         out.insert(req.requires);
     }
+    out.app_components = supported_app_components.clone();
     out
 }
 
@@ -514,18 +528,24 @@ pub(crate) fn build_group_context_snapshot<S: StorageProvider>(
     Ok(cgka_traits::group_context::GroupContextSnapshot::new(
         EpochId(mls_group.epoch().as_u64()),
         map,
-        Some(mls_group.group_id().as_slice().to_vec()),
+        Some(crate::app_components::transport_group_id_of_group(
+            mls_group,
+        )?),
     ))
 }
 
-/// Mirror signed `marmot_group_data` into the local app-facing group record.
-/// Missing legacy data leaves the record's existing values unchanged.
-pub(crate) fn mirror_group_data_into_record(
+/// Mirror signed app-component state into the local app-facing group record.
+/// Missing profile state leaves the record's existing values unchanged.
+pub(crate) fn mirror_app_components_into_record(
     mls_group: &MlsGroup,
     record: &mut cgka_traits::group::Group,
 ) {
-    if let Ok(Some(data)) = crate::group_data::read_from_group(mls_group) {
-        record.name = String::from_utf8_lossy(data.name.as_slice()).into_owned();
-        record.description = String::from_utf8_lossy(data.description.as_slice()).into_owned();
+    if let Ok(Some((name, description))) = crate::app_components::group_profile_of_group(mls_group)
+    {
+        record.name = name;
+        record.description = description;
+    }
+    if let Ok(components) = crate::app_components::required_app_components_of_group(mls_group) {
+        record.required_capabilities.app_components = components;
     }
 }

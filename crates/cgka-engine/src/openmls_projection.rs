@@ -14,10 +14,12 @@ use cgka_traits::message::{MessageRecord, MessageState, StoredMessagePayload};
 use cgka_traits::storage::{StorageError, StorageProvider};
 use cgka_traits::transport::{TransportEnvelope, TransportMessage};
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
+use openmls::component::ComponentData;
 use openmls::group::{MlsGroup, ProcessMessageError};
+use openmls::messages::proposals::{AppDataUpdateOperation, Proposal, ProposalOrRef};
 use openmls::prelude::{
-    BasicCredential, ContentType, MlsMessageBodyIn, MlsMessageIn, ProcessedMessageContent,
-    ProtocolMessage, Sender,
+    BasicCredential, ContentType, MlsMessageBodyIn, MlsMessageIn, ProcessedMessage,
+    ProcessedMessageContent, ProtocolMessage, ProtocolVersion, Sender,
 };
 use openmls_rust_crypto::RustCrypto;
 use openmls_traits::OpenMlsProvider;
@@ -940,13 +942,11 @@ fn update_group_record_from_replay<S: StorageProvider>(
     group.epoch = EpochId(output.final_epoch);
     group.members = output.final_members.clone();
 
-    // The replay just merged any GCE commits on the canonical path, so
-    // the live MlsGroup carries the post-canonical RequiredCapabilities
-    // and marmot_group_data extensions. Mirror those into the Marmot
-    // record so `feature_status` / `members()` / display name / admin
-    // checks all see the post-canonical truth — otherwise a capability
-    // upgrade or update_group_data commit accepted via convergence
-    // would leave the Marmot record stale.
+    // The replay just merged any GCE/AppData commits on the canonical path, so
+    // the live MlsGroup carries the post-canonical RequiredCapabilities and
+    // app-component state. Mirror those into the Marmot record so
+    // `feature_status` / `members()` / display name / admin checks all see
+    // the post-canonical truth.
     let crypto = RustCrypto::default();
     let provider = EngineOpenMlsProvider::<S>::new(&crypto, storage.mls_storage());
     let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
@@ -954,10 +954,7 @@ fn update_group_record_from_replay<S: StorageProvider>(
         .map_err(|e| OpenMlsProjectionError::Replay(format!("load post-replay group: {e:?}")))?
     {
         group.required_capabilities = required_capabilities_from_group(&mls_group);
-        if let Ok(Some(data)) = crate::group_data::read_from_group(&mls_group) {
-            group.name = String::from_utf8_lossy(data.name.as_slice()).into_owned();
-            group.description = String::from_utf8_lossy(data.description.as_slice()).into_owned();
-        }
+        crate::group_lifecycle::mirror_app_components_into_record(&mls_group, &mut group);
     }
 
     storage
@@ -969,19 +966,19 @@ fn required_capabilities_from_group(
     mls_group: &MlsGroup,
 ) -> cgka_traits::capabilities::GroupCapabilities {
     use openmls::extensions::Extension;
-    use openmls::prelude::ExtensionType;
     let mut caps = cgka_traits::capabilities::GroupCapabilities::default();
     for ext in mls_group.extensions().iter() {
         if let Extension::RequiredCapabilities(rc) = ext {
             for t in rc.extension_types() {
-                if let ExtensionType::Unknown(n) = t {
-                    caps.extensions.insert(*n);
-                }
+                caps.extensions.insert(u16::from(*t));
             }
             for t in rc.proposal_types() {
                 caps.proposals.insert(u16::from(*t));
             }
         }
+    }
+    if let Ok(components) = crate::app_components::required_app_components_of_group(mls_group) {
+        caps.app_components = components;
     }
     caps
 }
@@ -1218,7 +1215,11 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                 .ok_or(OpenMlsProjectionError::UnsupportedMessageKind(
                     projection.kind,
                 ))?;
-        let processed = match mls_group.process_message(&provider, protocol) {
+        let processed = match if projection.kind == OpenMlsContentKind::Commit {
+            process_commit_with_app_data_updates(&mut mls_group, &provider, protocol)
+        } else {
+            mls_group.process_message(&provider, protocol)
+        } {
             Ok(processed) => processed,
             Err(err) if projection.kind == OpenMlsContentKind::Application => {
                 // App-message replay against a candidate state is best-
@@ -1348,6 +1349,58 @@ fn kind_from_content_type(content_type: ContentType) -> OpenMlsContentKind {
 
 fn replay_error(context: &str, error: impl std::fmt::Debug) -> OpenMlsProjectionError {
     OpenMlsProjectionError::Replay(format!("{context}: {error:?}"))
+}
+
+fn process_commit_with_app_data_updates<S: StorageProvider>(
+    mls_group: &mut MlsGroup,
+    provider: &EngineOpenMlsProvider<'_, S>,
+    proto: ProtocolMessage,
+) -> Result<
+    ProcessedMessage,
+    ProcessMessageError<
+        <<S as StorageProvider>::Mls as openmls_traits::storage::StorageProvider<
+            { openmls_traits::storage::CURRENT_VERSION },
+        >>::Error,
+    >,
+> {
+    let unverified = mls_group.unprotect_message(provider, proto)?;
+    let mut updater = mls_group.app_data_dictionary_updater();
+    if let Some(committed_proposals) = unverified.committed_proposals() {
+        for proposal_or_ref in committed_proposals {
+            let validated = proposal_or_ref.clone().validate(
+                provider.crypto(),
+                mls_group.ciphersuite(),
+                ProtocolVersion::Mls10,
+            )?;
+            let proposal = match validated {
+                ProposalOrRef::Proposal(proposal) => proposal,
+                ProposalOrRef::Reference(reference) => mls_group
+                    .proposal_store()
+                    .proposals()
+                    .find(|p| p.proposal_reference_ref() == &*reference)
+                    .map(|p| Box::new(p.proposal().clone()))
+                    .ok_or(ProcessMessageError::FoundAppDataUpdateProposal)?,
+            };
+            if let Proposal::AppDataUpdate(update) = proposal.as_ref() {
+                match update.operation() {
+                    AppDataUpdateOperation::Update(data) => {
+                        updater.set(ComponentData::from_parts(
+                            update.component_id(),
+                            data.clone(),
+                        ));
+                    }
+                    AppDataUpdateOperation::Remove => {
+                        updater.remove(&update.component_id());
+                    }
+                }
+            }
+        }
+    }
+    mls_group.process_unverified_message_with_app_data_updates(
+        provider,
+        unverified,
+        updater.changes(),
+    )
 }
 
 fn sender_identity(sender: &Sender, group: &MlsGroup) -> Option<Vec<u8>> {

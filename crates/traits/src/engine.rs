@@ -17,6 +17,7 @@
 //! `Box<dyn CgkaEngine + Send + Sync>` today and can be dropped later without
 //! breaking the contract.
 
+use crate::app_components::{AppComponentData, AppComponentId};
 use crate::capabilities::{Feature, FeatureStatus, GroupCapabilities};
 use crate::engine_state::PendingStateRef;
 use crate::error::EngineError;
@@ -55,7 +56,7 @@ pub enum SendIntent {
     },
     /// Leave the group via MIP-03 SelfRemove.
     Leave { group_id: GroupId },
-    /// Update the group's `BasicGroupData` extension fields.
+    /// Update the group's `marmot.group.profile.v1` app component fields.
     UpdateGroupData {
         group_id: GroupId,
         name: Option<String>,
@@ -220,9 +221,11 @@ pub struct CreateGroupRequest {
     pub description: String,
     pub members: Vec<KeyPackage>,
     pub required_features: Vec<Feature>,
+    /// Initial app-component state that must be present in the new group.
+    /// The engine requires every founding member to advertise these component
+    /// ids and writes the bytes into the group's `app_data_dictionary`.
+    pub app_components: Vec<AppComponentData>,
     /// Initial admin set, projected to `marmot.group.admin-policy.v1`.
-    /// The current engine stores this in MIP-01 `marmot_group_data.admin_pubkeys`
-    /// until the signed GroupContext app-data dictionary path is fully wired.
     /// The **creator is always implicitly added** to this set — pass
     /// additional `MemberId`s here to bootstrap a multi-admin group.
     /// Default (empty) → creator is sole admin.
@@ -393,6 +396,14 @@ pub trait CgkaEngine: Send + Sync {
     /// transport group id). Read-only. Returns `Box<dyn>` because the
     /// underlying type varies with the storage parameter.
     fn group_context(&self, group_id: &GroupId) -> Result<Box<dyn GroupContext + '_>, EngineError>;
+
+    /// Signed app-component bytes from the group's current
+    /// `app_data_dictionary`.
+    fn app_component(
+        &self,
+        group_id: &GroupId,
+        component_id: AppComponentId,
+    ) -> Result<Option<Vec<u8>>, EngineError>;
 
     fn members(&self, group_id: &GroupId) -> Result<Vec<Member>, EngineError>;
 

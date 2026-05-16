@@ -590,7 +590,6 @@ impl StorageProvider<CURRENT_VERSION> for SqliteOpenMlsStorage {
         self.delete_value(PSK_LABEL, serde_json::to_vec(psk_id)?)
     }
 
-    #[cfg(feature = "extensions-draft-08")]
     fn write_application_export_tree<
         GroupId: traits::GroupId<CURRENT_VERSION>,
         ApplicationExportTree: traits::ApplicationExportTree<CURRENT_VERSION>,
@@ -606,7 +605,6 @@ impl StorageProvider<CURRENT_VERSION> for SqliteOpenMlsStorage {
         )
     }
 
-    #[cfg(feature = "extensions-draft-08")]
     fn application_export_tree<
         GroupId: traits::GroupId<CURRENT_VERSION>,
         ApplicationExportTree: traits::ApplicationExportTree<CURRENT_VERSION>,
@@ -617,7 +615,6 @@ impl StorageProvider<CURRENT_VERSION> for SqliteOpenMlsStorage {
         self.read_group_entity(APPLICATION_EXPORT_TREE_LABEL, group_id)
     }
 
-    #[cfg(feature = "extensions-draft-08")]
     fn delete_application_export_tree<
         GroupId: traits::GroupId<CURRENT_VERSION>,
         ApplicationExportTree: traits::ApplicationExportTree<CURRENT_VERSION>,

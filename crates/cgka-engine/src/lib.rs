@@ -27,7 +27,9 @@
 //! - [`publish`] - publish-confirm and publish-failed lifecycle.
 //! - [`capability_manager`], [`capabilities`], [`upgrade`] - capability policy.
 //! - [`auto_committer`] - deterministic SelfRemove auto-commit policy.
-//! - [`group_data`] - Marmot group-data extension helpers.
+//! - [`app_components`] - Marmot app-component state in `app_data_dictionary`.
+
+pub mod app_components;
 
 pub mod auto_committer;
 pub mod canonicalization;
@@ -40,7 +42,6 @@ pub mod epoch_manager;
 pub mod feature_registry;
 pub mod fork_recovery;
 pub mod group_context_view;
-pub mod group_data;
 pub mod group_lifecycle;
 pub mod identity;
 pub mod key_package;

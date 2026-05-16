@@ -534,6 +534,7 @@ fn snapshot_create_group_request() {
                 description: "".into(),
                 members: vec![KeyPackage(vec![0xEF; 4])],
                 required_features: vec![Feature("self-remove")],
+                app_components: vec![],
                 initial_admins: vec![],
             }
         )

@@ -11,7 +11,7 @@ use cgka_traits::engine::KeyPackage;
 use cgka_traits::error::EngineError;
 use cgka_traits::storage::StorageProvider;
 use openmls::prelude::{
-    KeyPackage as MlsKeyPackage, MlsMessageBodyIn, MlsMessageOut, ProtocolVersion,
+    Extensions, KeyPackage as MlsKeyPackage, MlsMessageBodyIn, MlsMessageOut, ProtocolVersion,
 };
 use openmls_traits::OpenMlsProvider as _;
 use tls_codec::{Deserialize as _, Serialize as _};
@@ -20,10 +20,15 @@ impl<S: StorageProvider> Engine<S> {
     /// Build + persist a fresh KeyPackage, returning its wire bytes.
     pub(crate) fn do_fresh_key_package(&mut self) -> Result<KeyPackage, EngineError> {
         let caps = leaf_capabilities(&self.registry, self.ciphersuite);
+        let leaf_extensions = Extensions::single(
+            crate::app_components::leaf_app_components_extension(&self.supported_app_components)?,
+        )
+        .map_err(|e| EngineError::Backend(format!("leaf extensions: {e:?}")))?;
         let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
 
         let bundle = MlsKeyPackage::builder()
             .leaf_node_capabilities(caps)
+            .leaf_node_extensions(leaf_extensions)
             .build(
                 self.ciphersuite,
                 &provider,

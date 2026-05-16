@@ -161,6 +161,7 @@ async fn session_reopens_encrypted_sqlite_group_state() {
             description: "account-device lifecycle".into(),
             members: vec![bob_key_package],
             required_features: vec![],
+            app_components: vec![],
             initial_admins: vec![],
         })
         .await
@@ -208,6 +209,7 @@ async fn session_ingest_surfaces_join_and_app_message_events() {
             description: "".into(),
             members: vec![bob_key_package],
             required_features: vec![],
+            app_components: vec![],
             initial_admins: vec![],
         })
         .await
@@ -271,6 +273,7 @@ async fn reopened_creator_can_send_valid_group_messages() {
             description: "".into(),
             members: vec![bob_key_package],
             required_features: vec![],
+            app_components: vec![],
             initial_admins: vec![],
         })
         .await
@@ -333,6 +336,7 @@ async fn session_ingest_drains_auto_publish_work() {
             description: "".into(),
             members: vec![bob_key_package],
             required_features: vec![],
+            app_components: vec![],
             initial_admins: vec![],
         })
         .await
@@ -395,6 +399,7 @@ async fn session_advance_convergence_releases_queued_outbound_work() {
             description: "".into(),
             members: vec![bob_key_package, carol_key_package],
             required_features: vec![],
+            app_components: vec![],
             initial_admins: vec![],
         })
         .await

@@ -59,10 +59,11 @@ TransportPublishRequest -> NostrTransportAdapter -> NostrRelayClient
 `NostrRelayClient` is intentionally small so tests can use an in-memory client and production can use
 `NostrSdkRelayClient` behind the `sdk` feature.
 
-The likely next expansion is to keep Nostr-specific routing here: derive group subscriptions and group-message publish
-targets from `marmot.transport.nostr.routing.v1`, derive KeyPackage publish targets from the user's kind `10051`
-KeyPackage relay list, and publish KeyPackages as Nostr kind `30443` events through the same relay-client boundary. Kind
-`30443` is the Marmot KeyPackage event kind; do not substitute deprecated NIP-104 key package kinds for this path.
+The app-runtime layer now projects group subscriptions and group-message publish targets from
+`marmot.transport.nostr.routing.v1`. The next expansion is to harden relay safety policy, derive KeyPackage publish
+targets from the user's kind `10051` KeyPackage relay list, and publish KeyPackages as Nostr kind `30443` events through
+the same relay-client boundary. Kind `30443` is the Marmot KeyPackage event kind; do not substitute deprecated NIP-104
+key package kinds for this path.
 
 ## Run tests
 

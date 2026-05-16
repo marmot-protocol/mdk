@@ -6,6 +6,7 @@
 //! (ExtensionType / ProposalType). This module is the translator.
 
 use crate::feature_registry::FeatureRegistry;
+use cgka_traits::app_components::AppComponentSet;
 use cgka_traits::capabilities::{
     Capability as CTCapability, Feature, GroupCapabilities, RequirementLevel, TransportKind,
 };
@@ -23,18 +24,15 @@ pub(crate) fn leaf_capabilities(
 ) -> Capabilities {
     let mut ext_types: Vec<ExtensionType> = vec![
         ExtensionType::RequiredCapabilities,
-        // MIP-01 requires every member to advertise marmot_group_data
-        // (0xF2EE) in their leaf capabilities. The engine ALWAYS includes
-        // this regardless of feature registry — it's a structural
-        // requirement of the Marmot protocol, not a feature.
-        crate::group_data::extension_type(),
+        ExtensionType::AppDataDictionary,
     ];
-    let mut proposal_types: Vec<ProposalType> = Vec::new();
+    let mut proposal_types: Vec<ProposalType> = vec![ProposalType::AppDataUpdate];
 
     for (_feat, req) in registry.iter() {
         match req.requires {
-            CTCapability::Extension(t) => ext_types.push(ExtensionType::Unknown(t)),
+            CTCapability::Extension(t) => ext_types.push(ExtensionType::from(t)),
             CTCapability::Proposal(t) => proposal_types.push(ProposalType::from(t)),
+            CTCapability::AppComponent(_) => {}
         }
     }
     ext_types.sort();
@@ -59,11 +57,12 @@ pub(crate) fn required_capabilities_extension(
     active_transports: &[TransportKind],
 ) -> (GroupCapabilities, RequiredCapabilitiesExtension) {
     let mut caps = GroupCapabilities::default();
-    // MIP-01 mandates marmot_group_data (0xF2EE) be in the group's
-    // RequiredCapabilities. Always added.
-    caps.insert(CTCapability::Extension(
-        crate::group_data::MARMOT_GROUP_DATA_EXT_TYPE,
-    ));
+    caps.insert(CTCapability::Extension(u16::from(
+        ExtensionType::AppDataDictionary,
+    )));
+    caps.insert(CTCapability::Proposal(u16::from(
+        ProposalType::AppDataUpdate,
+    )));
     for (_f, req) in registry.iter() {
         match &req.level {
             RequirementLevel::Required => caps.insert(req.requires),
@@ -79,7 +78,7 @@ pub(crate) fn required_capabilities_extension(
     let ext_types: Vec<ExtensionType> = caps
         .extensions
         .iter()
-        .map(|t| ExtensionType::Unknown(*t))
+        .map(|t| ExtensionType::from(*t))
         .collect();
     let proposal_types: Vec<ProposalType> = caps
         .proposals
@@ -115,7 +114,7 @@ pub(crate) fn extension_from_group_capabilities(
     let ext_types: Vec<ExtensionType> = caps
         .extensions
         .iter()
-        .map(|t| ExtensionType::Unknown(*t))
+        .map(|t| ExtensionType::from(*t))
         .collect();
     let proposal_types: Vec<ProposalType> = caps
         .proposals
@@ -138,12 +137,14 @@ pub(crate) fn capabilities_of_leaf(leaf: &openmls::prelude::LeafNode) -> GroupCa
     let caps = leaf.capabilities();
     let mut out = GroupCapabilities::default();
     for ext in caps.extensions() {
-        if let ExtensionType::Unknown(t) = ext {
-            out.extensions.insert(*t);
+        if !ext.is_grease() {
+            out.extensions.insert(u16::from(*ext));
         }
     }
     for prop in caps.proposals() {
         out.proposals.insert(u16::from(*prop));
     }
+    out.app_components = crate::app_components::app_components_of_leaf(leaf)
+        .unwrap_or_else(|_| AppComponentSet::default());
     out
 }

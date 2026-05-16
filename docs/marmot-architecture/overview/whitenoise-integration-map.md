@@ -116,17 +116,15 @@ These are the current points likely to hurt during integration.
 
 1. `AccountDeviceSession` does not expose a group list or app-facing group summaries. A shim needs another source of
    known group ids.
-2. `GroupContext` exposes `transport_group_id` and exporter secrets, but not raw app-component entries or parsed app
-   components. Nostr routing v1 needs component access.
-3. `CreateGroupRequest` still carries legacy group profile fields directly. App-component creation inputs are not
-   modeled yet.
-4. `KeyPackagePublisher` is separate from `TransportAdapter`. Production Nostr KeyPackage publication should probably
+2. `CreateGroupRequest` still carries profile fields directly. That now feeds `marmot.group.profile.v1`; richer
+   component-specific creation inputs are not modeled yet.
+3. `KeyPackagePublisher` is separate from `TransportAdapter`. Production Nostr KeyPackage publication should probably
    live with the Nostr transport/account service.
-5. `TransportRoutingPolicy` is synchronous and local-snapshot shaped. A real Nostr implementation depends on directory
+4. `TransportRoutingPolicy` is synchronous and local-snapshot shaped. A real Nostr implementation depends on directory
    state, account bootstrap state, group component state, relay health, and safety policy.
-6. `TransportAdapter` is account-aware, but the trait does not model a shared multi-account relay plane. whitenoise-rs
+5. `TransportAdapter` is account-aware, but the trait does not model a shared multi-account relay plane. whitenoise-rs
    already needs cross-account subscription dedupe.
-7. Scenario vectors now capture pending confirmations and rollbacks. They do not yet capture selected stale outcomes.
+6. Scenario vectors now capture pending confirmations and rollbacks. They do not yet capture selected stale outcomes.
    Some integration behavior is tested in Rust but not portable.
 8. Error values are engine-oriented. Login/setup flows may need higher-level recovery actions such as "publish missing
    kind 10051" or "repair inbox relays".

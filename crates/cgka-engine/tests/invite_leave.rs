@@ -156,6 +156,7 @@ async fn invite_adds_third_member_and_advances_epoch() {
             description: "".into(),
             members: vec![bob_kp],
             required_features: vec![],
+            app_components: vec![],
             initial_admins: vec![],
         })
         .await
@@ -251,6 +252,7 @@ async fn invite_rejects_invitee_missing_required_capability() {
             description: "".into(),
             members: vec![bob_kp],
             required_features: vec![],
+            app_components: vec![],
             initial_admins: vec![],
         })
         .await
@@ -288,6 +290,7 @@ async fn admin_remove_members_publishes_commit_and_updates_membership() {
             description: "".into(),
             members: vec![bob_kp, carol_kp],
             required_features: vec![],
+            app_components: vec![],
             initial_admins: vec![],
         })
         .await
@@ -373,6 +376,7 @@ async fn non_admin_cannot_remove_members() {
             description: "".into(),
             members: vec![bob_kp, carol_kp],
             required_features: vec![],
+            app_components: vec![],
             initial_admins: vec![],
         })
         .await
@@ -413,6 +417,7 @@ async fn non_admin_cannot_invite_members() {
             description: "".into(),
             members: vec![bob_kp],
             required_features: vec![],
+            app_components: vec![],
             initial_admins: vec![],
         })
         .await
@@ -454,6 +459,7 @@ async fn remove_members_rejects_malformed_target_member_identity() {
             description: "".into(),
             members: vec![bob_kp],
             required_features: vec![],
+            app_components: vec![],
             initial_admins: vec![],
         })
         .await
@@ -505,6 +511,7 @@ async fn selfremove_full_flow_with_auto_commit() {
             description: "".into(),
             members: vec![bob_kp, carol_kp],
             required_features: vec![],
+            app_components: vec![],
             initial_admins: vec![],
         })
         .await
@@ -627,6 +634,7 @@ async fn selfremove_auto_commit_publish_failed_rolls_back_projection() {
             description: "".into(),
             members: vec![bob_kp, carol_kp],
             required_features: vec![],
+            app_components: vec![],
             initial_admins: vec![],
         })
         .await
@@ -694,6 +702,7 @@ async fn leave_produces_selfremove_proposal() {
             description: "".into(),
             members: vec![bob_kp],
             required_features: vec![],
+            app_components: vec![],
             initial_admins: vec![],
         })
         .await

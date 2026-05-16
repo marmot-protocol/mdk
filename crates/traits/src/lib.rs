@@ -5,6 +5,7 @@
 //!
 //! This crate is the one dependency anything crossing a seam should import.
 
+pub mod app_components;
 pub mod capabilities;
 pub mod engine;
 pub mod engine_state;
@@ -20,6 +21,16 @@ pub mod transport_adapter;
 pub mod types;
 pub mod welcome;
 
+pub use app_components::{
+    AGENT_TEXT_STREAM_QUIC_COMPONENT, AGENT_TEXT_STREAM_QUIC_COMPONENT_ID,
+    APP_COMPONENTS_COMPONENT_ID, AppComponentData, AppComponentId, AppComponentSet,
+    GROUP_ADMIN_POLICY_COMPONENT, GROUP_ADMIN_POLICY_COMPONENT_ID, GROUP_BLOSSOM_IMAGE_COMPONENT,
+    GROUP_BLOSSOM_IMAGE_COMPONENT_ID, GROUP_MESSAGE_RETENTION_COMPONENT,
+    GROUP_MESSAGE_RETENTION_COMPONENT_ID, GROUP_PROFILE_COMPONENT, GROUP_PROFILE_COMPONENT_ID,
+    NOSTR_ROUTING_COMPONENT, NOSTR_ROUTING_COMPONENT_ID, NostrRoutingV1, decode_components_list,
+    decode_nostr_routing_v1, decode_quic_varint, default_group_components,
+    encode_component_vectors, encode_components_list, encode_nostr_routing_v1,
+};
 pub use capabilities::{
     Capability, CapabilityRequirement, Feature, FeatureStatus, GroupCapabilities, RequirementLevel,
     TransportKind,

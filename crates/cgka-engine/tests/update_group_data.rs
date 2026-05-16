@@ -159,6 +159,7 @@ async fn create_pair() -> (Engine<MemoryStorage>, Engine<MemoryStorage>, GroupId
             description: "orig description".into(),
             members: vec![bob_kp],
             required_features: vec![],
+            app_components: vec![],
             initial_admins: vec![],
         })
         .await
@@ -327,6 +328,7 @@ async fn convergence_refreshes_recipient_marmot_record_name_and_description() {
             description: "original-description".into(),
             members: vec![bob_kp],
             required_features: vec![],
+            app_components: vec![],
             initial_admins: vec![],
         })
         .await
@@ -399,6 +401,7 @@ async fn update_group_data_during_pending_publish_is_rejected() {
             description: "".into(),
             members: vec![bob_kp],
             required_features: vec![],
+            app_components: vec![],
             initial_admins: vec![],
         })
         .await

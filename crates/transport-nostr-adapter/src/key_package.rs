@@ -15,6 +15,7 @@ const IDENTITY_TAG: &str = "i";
 const MLS_CIPHERSUITE_TAG: &str = "mls_ciphersuite";
 const MLS_EXTENSIONS_TAG: &str = "mls_extensions";
 const MLS_PROPOSALS_TAG: &str = "mls_proposals";
+const APP_COMPONENTS_TAG: &str = "app_components";
 const ENCODING_TAG: &str = "encoding";
 const RELAYS_TAG: &str = "relays";
 
@@ -26,6 +27,7 @@ pub struct NostrKeyPackagePublication {
     pub mls_ciphersuite: String,
     pub mls_extensions: Vec<String>,
     pub mls_proposals: Vec<String>,
+    pub app_components: Vec<String>,
     pub advertised_relays: Vec<TransportEndpoint>,
     pub publish_endpoints: Vec<TransportEndpoint>,
 }
@@ -57,6 +59,11 @@ impl NostrKeyPackagePublication {
                 "Marmot KeyPackage mls_proposals tag must not be empty".into(),
             ));
         }
+        if self.app_components.is_empty() {
+            return Err(TransportAdapterError::Publish(
+                "Marmot KeyPackage app_components tag must not be empty".into(),
+            ));
+        }
         if self.advertised_relays.is_empty() {
             return Err(TransportAdapterError::Publish(
                 "Marmot KeyPackage relays tag must not be empty".into(),
@@ -75,6 +82,7 @@ impl NostrKeyPackagePublication {
             vec![MLS_CIPHERSUITE_TAG.into(), self.mls_ciphersuite.clone()],
             values_tag(MLS_EXTENSIONS_TAG, &self.mls_extensions),
             values_tag(MLS_PROPOSALS_TAG, &self.mls_proposals),
+            values_tag(APP_COMPONENTS_TAG, &self.app_components),
             vec![ENCODING_TAG.into(), KEY_PACKAGE_ENCODING_HEX.into()],
             values_tag(
                 RELAYS_TAG,
@@ -200,6 +208,21 @@ mod tests {
             event
                 .tags
                 .iter()
+                .find(|candidate| candidate
+                    .first()
+                    .is_some_and(|name| name == "app_components"))
+                .unwrap(),
+            &vec![
+                "app_components".to_string(),
+                "0x8001".to_string(),
+                "0x8003".to_string(),
+                "0x8004".to_string()
+            ]
+        );
+        assert_eq!(
+            event
+                .tags
+                .iter()
                 .find(|candidate| candidate.first().is_some_and(|name| name == "relays"))
                 .unwrap(),
             &vec![
@@ -234,6 +257,7 @@ mod tests {
             mls_ciphersuite: "0x0001".into(),
             mls_extensions: vec!["0xf2ee".into()],
             mls_proposals: vec!["0x000a".into()],
+            app_components: vec!["0x8001".into(), "0x8003".into(), "0x8004".into()],
             advertised_relays: vec![
                 TransportEndpoint("wss://kp-a.example".into()),
                 TransportEndpoint("wss://kp-b.example".into()),

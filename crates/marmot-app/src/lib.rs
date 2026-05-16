@@ -13,6 +13,15 @@ use std::time::Duration;
 use async_trait::async_trait;
 use cgka_engine::canonicalization::CanonicalizationPolicy;
 use cgka_session::{AccountDeviceSession, SessionConfig};
+use cgka_traits::app_components::{
+    AppComponentData, NostrRoutingV1, decode_nostr_routing_v1, default_group_components,
+    encode_component_vectors, encode_nostr_routing_v1, encode_quic_varint,
+};
+pub use cgka_traits::app_components::{
+    GROUP_ADMIN_POLICY_COMPONENT, GROUP_ADMIN_POLICY_COMPONENT_ID, GROUP_BLOSSOM_IMAGE_COMPONENT,
+    GROUP_BLOSSOM_IMAGE_COMPONENT_ID, GROUP_PROFILE_COMPONENT, GROUP_PROFILE_COMPONENT_ID,
+    NOSTR_ROUTING_COMPONENT, NOSTR_ROUTING_COMPONENT_ID,
+};
 use cgka_traits::engine::{CreateGroupRequest, GroupEvent, KeyPackage, SendIntent};
 use cgka_traits::group::Group;
 use cgka_traits::transport::{TransportEnvelope, TransportMessage};
@@ -26,6 +35,8 @@ use marmot_account::{
 };
 use nostr::ToBech32;
 use nostr_sdk::prelude::{Client as NostrSdkClient, Filter, Kind, PublicKey, RelayUrl};
+use rand::RngCore;
+use rand::rngs::OsRng;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -59,12 +70,6 @@ const SDK_DRAIN_WAIT: Duration = Duration::from_millis(50);
 const SDK_RELAY_LIST_FETCH_WAIT: Duration = Duration::from_secs(3);
 const KIND_NOSTR_METADATA: u64 = 0;
 const KIND_NOSTR_CONTACT_LIST: u64 = 3;
-pub const GROUP_PROFILE_COMPONENT_ID: u16 = 0x8001;
-pub const GROUP_PROFILE_COMPONENT: &str = "marmot.group.profile.v1";
-pub const GROUP_BLOSSOM_IMAGE_COMPONENT_ID: u16 = 0x8002;
-pub const GROUP_BLOSSOM_IMAGE_COMPONENT: &str = "marmot.group.blossom.image.v1";
-pub const GROUP_ADMIN_POLICY_COMPONENT_ID: u16 = 0x8003;
-pub const GROUP_ADMIN_POLICY_COMPONENT: &str = "marmot.group.admin-policy.v1";
 
 type AppRuntime =
     AccountDeviceRuntime<NostrTransportAdapter, AppTransportRouting, AppKeyPackagePublisher>;
@@ -328,6 +333,7 @@ pub struct DirectoryKeyPackage {
 pub struct AppGroupRecord {
     pub group_id_hex: String,
     pub endpoint: String,
+    pub nostr_routing: AppGroupNostrRoutingComponent,
     pub profile: AppGroupProfileComponent,
     pub image: AppGroupImageComponent,
     pub admin_policy: AppGroupAdminPolicyComponent,
@@ -372,18 +378,29 @@ pub struct AppGroupAdminPolicyComponent {
     pub data_hex: String,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppGroupNostrRoutingComponent {
+    pub component_id: u16,
+    pub component: String,
+    pub nostr_group_id_hex: String,
+    pub relays: Vec<String>,
+    pub data_hex: String,
+}
+
 impl AppGroupRecord {
     fn new(
         group_id_hex: String,
-        endpoint: String,
+        nostr_routing: AppGroupNostrRoutingComponent,
         profile_name: String,
         profile_description: String,
         image: AppGroupImageInput,
         admin_policy: AppGroupAdminPolicyComponent,
     ) -> Self {
+        let endpoint = nostr_routing.relays.first().cloned().unwrap_or_default();
         Self {
             group_id_hex,
             endpoint,
+            nostr_routing,
             profile: AppGroupProfileComponent::new(profile_name, profile_description),
             image: AppGroupImageComponent::new(image),
             admin_policy,
@@ -393,7 +410,7 @@ impl AppGroupRecord {
 
     fn from_group(
         group_id: &GroupId,
-        endpoint: TransportEndpoint,
+        nostr_routing: AppGroupNostrRoutingComponent,
         group: Option<&Group>,
         admin_policy: AppGroupAdminPolicyComponent,
     ) -> Self {
@@ -402,7 +419,7 @@ impl AppGroupRecord {
             .unwrap_or_default();
         Self::new(
             hex::encode(group_id.as_slice()),
-            endpoint.0,
+            nostr_routing,
             profile_name,
             profile_description,
             AppGroupImageInput::default(),
@@ -412,11 +429,12 @@ impl AppGroupRecord {
 
     fn refresh_from_group(
         &mut self,
-        endpoint: TransportEndpoint,
+        nostr_routing: AppGroupNostrRoutingComponent,
         group: Option<&Group>,
         admin_policy: AppGroupAdminPolicyComponent,
     ) {
-        self.endpoint = endpoint.0;
+        self.endpoint = nostr_routing.relays.first().cloned().unwrap_or_default();
+        self.nostr_routing = nostr_routing;
         self.admin_policy = admin_policy;
         if let Some(group) = group {
             self.profile =
@@ -491,6 +509,32 @@ impl AppGroupAdminPolicyComponent {
     }
 }
 
+impl AppGroupNostrRoutingComponent {
+    fn new(routing: NostrRoutingV1) -> Result<Self, AppError> {
+        let data = encode_nostr_routing_v1(&routing).map_err(AppError::InvalidNostrRouting)?;
+        Ok(Self {
+            component_id: NOSTR_ROUTING_COMPONENT_ID,
+            component: NOSTR_ROUTING_COMPONENT.to_owned(),
+            nostr_group_id_hex: hex::encode(routing.nostr_group_id),
+            relays: routing.relays,
+            data_hex: hex::encode(data),
+        })
+    }
+
+    fn from_bytes(bytes: &[u8]) -> Result<Self, AppError> {
+        let routing = decode_nostr_routing_v1(bytes).map_err(AppError::InvalidNostrRouting)?;
+        Self::new(routing)
+    }
+
+    fn subscription(&self, group_id: &GroupId) -> Result<TransportGroupSubscription, AppError> {
+        Ok(TransportGroupSubscription {
+            group_id: group_id.clone(),
+            transport_group_id: hex::decode(&self.nostr_group_id_hex)?,
+            endpoints: self.relays.iter().cloned().map(TransportEndpoint).collect(),
+        })
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct AppGroupImageInput {
     image_hash_hex: String,
@@ -542,6 +586,8 @@ pub enum AppError {
     InvalidDirectorySearch(String),
     #[error("invalid group profile: {0}")]
     InvalidGroupProfile(String),
+    #[error("invalid Nostr routing component: {0}")]
+    InvalidNostrRouting(String),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1288,6 +1334,7 @@ impl MarmotApp {
                 account_id.as_slice().to_vec(),
                 Box::new(peeler),
             )
+            .supported_app_components(self.supported_app_component_ids())
             .convergence_policy(CanonicalizationPolicy {
                 stable_quiescence_ms: 0,
                 ..CanonicalizationPolicy::default()
@@ -1314,6 +1361,11 @@ impl MarmotApp {
             app: self.clone(),
             account_label: label.to_owned(),
             keys: keys.clone(),
+            app_components: self
+                .supported_app_component_ids()
+                .into_iter()
+                .map(|id| format!("0x{id:04x}"))
+                .collect(),
         };
         let routing = self.routing_for(&state)?;
         let runtime =
@@ -1361,10 +1413,7 @@ impl MarmotApp {
         let mut group_routes = Vec::new();
         for group in &state.groups {
             let group_id = GroupId::new(hex::decode(&group.group_id_hex)?);
-            group_routes.push(group_subscription(
-                &group_id,
-                TransportEndpoint(group.endpoint.clone()),
-            ));
+            group_routes.push(group.nostr_routing.subscription(&group_id)?);
         }
 
         Ok(AppTransportRouting::new(AppRoutingState {
@@ -1531,16 +1580,6 @@ impl MarmotApp {
         match &self.relay {
             AppRelay::Local => vec![TransportEndpoint(format!("marmot-local://inbox/{label}"))],
             AppRelay::Sdk { urls } => urls.iter().cloned().map(TransportEndpoint).collect(),
-        }
-    }
-
-    fn group_endpoint(&self, group_id: &GroupId) -> TransportEndpoint {
-        match &self.relay {
-            AppRelay::Local => TransportEndpoint(format!(
-                "marmot-local://group/{}",
-                hex::encode(group_id.as_slice())
-            )),
-            AppRelay::Sdk { urls } => TransportEndpoint(urls.first().cloned().unwrap_or_default()),
         }
     }
 
@@ -1747,6 +1786,25 @@ impl MarmotApp {
     fn account_home(&self) -> AccountHome {
         self.account_home.clone()
     }
+
+    fn supported_app_component_ids(&self) -> Vec<u16> {
+        let mut components = default_group_components();
+        components.insert(NOSTR_ROUTING_COMPONENT_ID);
+        components.into_iter().collect()
+    }
+
+    fn new_nostr_routing(&self) -> Result<NostrRoutingV1, AppError> {
+        let mut nostr_group_id = [0_u8; 32];
+        OsRng.fill_bytes(&mut nostr_group_id);
+        let relays = match &self.relay {
+            AppRelay::Local => vec![format!(
+                "marmot-local://group/{}",
+                hex::encode(nostr_group_id)
+            )],
+            AppRelay::Sdk { urls } => urls.clone(),
+        };
+        NostrRoutingV1::new(nostr_group_id, relays).map_err(AppError::InvalidNostrRouting)
+    }
 }
 
 impl AppClient {
@@ -1765,6 +1823,9 @@ impl AppClient {
         for member in member_refs {
             members.push(self.app.member_key_package(member).await?);
         }
+        let nostr_routing = self.app.new_nostr_routing()?;
+        let nostr_routing_bytes =
+            encode_nostr_routing_v1(&nostr_routing).map_err(AppError::InvalidNostrRouting)?;
 
         let (group_id, effects) = self
             .runtime
@@ -1773,6 +1834,10 @@ impl AppClient {
                 description: String::new(),
                 members,
                 required_features: Vec::new(),
+                app_components: vec![AppComponentData {
+                    component_id: NOSTR_ROUTING_COMPONENT_ID,
+                    data: nostr_routing_bytes,
+                }],
                 initial_admins: Vec::new(),
             })
             .await?;
@@ -1920,13 +1985,13 @@ impl AppClient {
             .iter()
             .map(|report| hex::encode(report.message_id.as_slice()))
             .collect::<Vec<_>>();
-        let endpoint = self.app.group_endpoint(group_id);
         let group_metadata = self.runtime.group_record(group_id).ok();
         let admin_policy = self.admin_policy_for_group(group_id);
+        let nostr_routing = self.nostr_routing_for_group(group_id)?;
         add_group(
             &mut self.state,
             group_id,
-            endpoint,
+            nostr_routing,
             group_metadata.as_ref(),
             admin_policy,
         );
@@ -2046,15 +2111,19 @@ impl AppClient {
             let before = self.state.groups.len();
             let group_metadata =
                 event_group_id(event).and_then(|group_id| self.runtime.group_record(group_id).ok());
-            let group_projection = event_group_id(event).map(|group_id| EventGroupProjection {
-                endpoint: self.app.group_endpoint(group_id),
-                group_metadata: group_metadata.as_ref(),
-                admin_policy: self
-                    .runtime
-                    .admin_pubkeys(group_id)
-                    .map(AppGroupAdminPolicyComponent::new)
-                    .unwrap_or_else(|_| AppGroupAdminPolicyComponent::new(Vec::new())),
-            });
+            let group_projection = event_group_id(event)
+                .map(|group_id| {
+                    Ok::<_, AppError>(EventGroupProjection {
+                        nostr_routing: self.nostr_routing_for_group(group_id)?,
+                        group_metadata: group_metadata.as_ref(),
+                        admin_policy: self
+                            .runtime
+                            .admin_pubkeys(group_id)
+                            .map(AppGroupAdminPolicyComponent::new)
+                            .unwrap_or_else(|_| AppGroupAdminPolicyComponent::new(Vec::new())),
+                    })
+                })
+                .transpose()?;
             if let Some(message) = observe_event(
                 &mut self.state,
                 profiles,
@@ -2096,31 +2165,33 @@ impl AppClient {
     }
 
     fn refresh_group(&mut self, group_id: &GroupId) {
-        let endpoint = self.app.group_endpoint(group_id);
         let group_metadata = self.runtime.group_record(group_id).ok();
         let admin_policy = self.admin_policy_for_group(group_id);
+        let Ok(nostr_routing) = self.nostr_routing_for_group(group_id) else {
+            return;
+        };
         add_group(
             &mut self.state,
             group_id,
-            endpoint,
+            nostr_routing,
             group_metadata.as_ref(),
             admin_policy,
         );
     }
 
     fn add_group(&mut self, group_id: &GroupId) -> Result<(), AppError> {
-        let endpoint = self.app.group_endpoint(group_id);
         let group_metadata = self.runtime.group_record(group_id).ok();
         let admin_policy = self.admin_policy_for_group(group_id);
+        let nostr_routing = self.nostr_routing_for_group(group_id)?;
         add_group(
             &mut self.state,
             group_id,
-            endpoint.clone(),
+            nostr_routing.clone(),
             group_metadata.as_ref(),
             admin_policy,
         );
         self.routing
-            .add_group(group_subscription(group_id, endpoint));
+            .add_group(nostr_routing.subscription(group_id)?);
         Ok(())
     }
 
@@ -2134,12 +2205,25 @@ impl AppClient {
     fn refresh_group_routes(&mut self) -> Result<(), AppError> {
         for group in &self.state.groups {
             let group_id = GroupId::new(hex::decode(&group.group_id_hex)?);
-            self.routing.add_group(group_subscription(
-                &group_id,
-                TransportEndpoint(group.endpoint.clone()),
-            ));
+            self.routing
+                .add_group(group.nostr_routing.subscription(&group_id)?);
         }
         Ok(())
+    }
+
+    fn nostr_routing_for_group(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<AppGroupNostrRoutingComponent, AppError> {
+        let bytes = self
+            .runtime
+            .app_component(group_id, NOSTR_ROUTING_COMPONENT_ID)?
+            .ok_or_else(|| {
+                AppError::InvalidNostrRouting(
+                    "group is missing marmot.transport.nostr.routing.v1".into(),
+                )
+            })?;
+        AppGroupNostrRoutingComponent::from_bytes(&bytes)
     }
 }
 
@@ -2256,6 +2340,7 @@ struct AppKeyPackagePublisher {
     app: MarmotApp,
     account_label: String,
     keys: nostr::Keys,
+    app_components: Vec<String>,
 }
 
 #[async_trait]
@@ -2275,6 +2360,7 @@ impl KeyPackagePublisher for AppKeyPackagePublisher {
             mls_ciphersuite: "0x0001".into(),
             mls_extensions: vec!["0xf2ee".into()],
             mls_proposals: vec!["0x000a".into()],
+            app_components: self.app_components.clone(),
             advertised_relays: publication.endpoints.clone(),
             publish_endpoints: publication.endpoints.clone(),
         };
@@ -2793,7 +2879,7 @@ impl NostrRelayClient for FileRelayClient {
 }
 
 struct EventGroupProjection<'a> {
-    endpoint: TransportEndpoint,
+    nostr_routing: AppGroupNostrRoutingComponent,
     group_metadata: Option<&'a Group>,
     admin_policy: AppGroupAdminPolicyComponent,
 }
@@ -2812,7 +2898,7 @@ fn observe_event(
                 add_group(
                     state,
                     group_id,
-                    projection.endpoint.clone(),
+                    projection.nostr_routing.clone(),
                     projection.group_metadata,
                     projection.admin_policy.clone(),
                 );
@@ -2830,7 +2916,7 @@ fn observe_event(
                 add_group(
                     state,
                     group_id,
-                    projection.endpoint.clone(),
+                    projection.nostr_routing.clone(),
                     projection.group_metadata,
                     projection.admin_policy.clone(),
                 );
@@ -2853,7 +2939,7 @@ fn observe_event(
                 add_group(
                     state,
                     group_id,
-                    projection.endpoint.clone(),
+                    projection.nostr_routing.clone(),
                     projection.group_metadata,
                     projection.admin_policy.clone(),
                 );
@@ -2880,7 +2966,7 @@ fn event_group_id(event: &GroupEvent) -> Option<&GroupId> {
 fn add_group(
     state: &mut AccountState,
     group_id: &GroupId,
-    endpoint: TransportEndpoint,
+    nostr_routing: AppGroupNostrRoutingComponent,
     group_metadata: Option<&Group>,
     admin_policy: AppGroupAdminPolicyComponent,
 ) {
@@ -2890,26 +2976,15 @@ fn add_group(
         .iter_mut()
         .find(|group| group.group_id_hex == group_id_hex)
     {
-        existing.refresh_from_group(endpoint, group_metadata, admin_policy);
+        existing.refresh_from_group(nostr_routing, group_metadata, admin_policy);
         return;
     }
     state.groups.push(AppGroupRecord::from_group(
         group_id,
-        endpoint,
+        nostr_routing,
         group_metadata,
         admin_policy,
     ));
-}
-
-fn group_subscription(
-    group_id: &GroupId,
-    endpoint: TransportEndpoint,
-) -> TransportGroupSubscription {
-    TransportGroupSubscription {
-        group_id: group_id.clone(),
-        transport_group_id: group_id.as_slice().to_vec(),
-        endpoints: vec![endpoint],
-    }
 }
 
 fn fail_if_publish_failed(failures: &[marmot_account::PublishFailure]) -> Result<(), AppError> {
@@ -2949,30 +3024,6 @@ fn validate_group_profile(name: &str, description: &str) -> Result<(), AppError>
         ));
     }
     Ok(())
-}
-
-fn encode_component_vectors(parts: &[&[u8]]) -> Vec<u8> {
-    let mut out = Vec::new();
-    for part in parts {
-        encode_quic_varint(part.len() as u64, &mut out);
-        out.extend_from_slice(part);
-    }
-    out
-}
-
-fn encode_quic_varint(value: u64, out: &mut Vec<u8>) {
-    if value < 64 {
-        out.push(value as u8);
-    } else if value < 16_384 {
-        let encoded = 0x4000 | value as u16;
-        out.extend_from_slice(&encoded.to_be_bytes());
-    } else if value < 1_073_741_824 {
-        let encoded = 0x8000_0000 | value as u32;
-        out.extend_from_slice(&encoded.to_be_bytes());
-    } else {
-        let encoded = 0xC000_0000_0000_0000 | value;
-        out.extend_from_slice(&encoded.to_be_bytes());
-    }
 }
 
 fn read_json<T: for<'de> Deserialize<'de>>(path: impl AsRef<Path>) -> Result<T, AppError> {

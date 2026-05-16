@@ -10,6 +10,7 @@
 //! deliberate: it avoids dependency graphs and keeps `feature_status()` a
 //! flat lookup.
 
+use crate::app_components::{AppComponentId, AppComponentSet};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::fmt;
@@ -21,6 +22,8 @@ pub enum Capability {
     Proposal(u16),
     /// A custom extension type (`ExtensionType::Unknown(u16)`).
     Extension(u16),
+    /// A Marmot MLS app component id carried in `app_data_dictionary`.
+    AppComponent(AppComponentId),
 }
 
 /// Stable, opaque identifier for a feature. Callers construct these as
@@ -72,6 +75,8 @@ pub struct CapabilityRequirement {
 pub struct GroupCapabilities {
     pub proposals: BTreeSet<u16>,
     pub extensions: BTreeSet<u16>,
+    #[serde(default)]
+    pub app_components: AppComponentSet,
 }
 
 impl GroupCapabilities {
@@ -83,6 +88,9 @@ impl GroupCapabilities {
             Capability::Extension(e) => {
                 self.extensions.insert(e);
             }
+            Capability::AppComponent(id) => {
+                self.app_components.insert(id);
+            }
         }
     }
 
@@ -90,6 +98,7 @@ impl GroupCapabilities {
         match cap {
             Capability::Proposal(p) => self.proposals.contains(p),
             Capability::Extension(e) => self.extensions.contains(e),
+            Capability::AppComponent(id) => self.app_components.contains(*id),
         }
     }
 
@@ -106,11 +115,12 @@ impl GroupCapabilities {
                 .difference(&other.extensions)
                 .copied()
                 .collect(),
+            app_components: self.app_components.missing_from(&other.app_components),
         }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.proposals.is_empty() && self.extensions.is_empty()
+        self.proposals.is_empty() && self.extensions.is_empty() && self.app_components.is_empty()
     }
 }
 

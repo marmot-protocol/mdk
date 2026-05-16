@@ -83,11 +83,12 @@ realises. Read those rustdocs as the source of truth — this table is just an i
   - **Owns:** `LowestIndexAutoCommitter` policy for SelfRemove (future policy hook)
 
 - **Module:** `upgrade.rs`
-  - **Owns:** `do_upgrade_group_capabilities` — the only GCE-commit construction site today
+  - **Owns:** `do_upgrade_group_capabilities` — promotes upgradeable MLS primitives through
+    `GroupContextExtensions` and app-component requirements through `AppDataUpdate`
 
-- **Module:** `group_data.rs`
-  - **Owns:** MIP-01 `marmot_group_data` (`0xF2EE`) extension construction; `nostr_group_id` is CSPRNG to avoid
-    creator-correlation leaks
+- **Module:** `app_components.rs`
+  - **Owns:** MLS `app_data_dictionary` helpers, LeafNode/group `app_components` negotiation bytes, group profile
+    bytes, and admin-policy bytes
 
 - **Module:** `group_context_view.rs`
   - **Owns:** snapshot view of `GroupContext` for trait callers; `exporter_secret(label, length)` returns `None` rather
@@ -123,13 +124,11 @@ These are the load-bearing departures from the original plan. Each is also docum
    leaf. The cache is populated from KeyPackages we directly handle (invite-side parses, `StagedCommit::add_proposals`)
    plus `MlsGroup::own_leaf_node()` for self.
 
-5. **MIP-01 `marmot_group_data` (`0xF2EE`) is owned by the engine, not by a transport adapter.** Admin guards for
-   invite, removal, profile updates, and inbound admin-gated commits must fire inside the engine. Transport-y fields
-   (relays, image\_\*, nostr_group_id) are populated with placeholders that a future transport adapter refines. App-facing
-   projections expose the admin set as `marmot.group.admin-policy.v1` while the engine still reads the signed legacy
-   field as the source of truth.
+5. **Group state is app-component state.** New groups do not create or read the legacy `marmot_group_data` extension.
+   The engine writes `app_data_dictionary`, advertises supported component ids in LeafNode `app_components`, records
+   required component ids in GroupContext `app_components`, and reads admin/profile state from component bytes.
 
-6. **Test identities are 32 bytes via `pad32`.** MIP-01 admin pubkeys MUST be 32-byte x-only secp256k1. The engine
+6. **Test identities are 32 bytes via `pad32`.** Admin-policy pubkeys MUST be 32-byte x-only secp256k1. The engine
    strict-fails non-32-byte member identities at admin-set time. Production identities (real Nostr pubkeys) flow through
    unchanged.
 
@@ -144,11 +143,6 @@ in `tests/`; this section exists so a future contributor can grep for the rule t
     recipient's record stale.
   - **Test:** `tests/update_group_data.rs::convergence_refreshes_recipient_marmot_record_name_and_description`,
     `tests/capabilities.rs::convergence_refreshes_recipient_required_capabilities_on_upgrade`
-
-- **Item:** **B2** `marmot_group_data.nostr_group_id` privacy
-  - **What changed:** Engine now generates `nostr_group_id` via CSPRNG instead of copying the creator's pubkey. Two
-    groups by the same creator have distinct routing tags.
-  - **Test:** `tests/group_data_routing_id.rs`
 
 - **Item:** **B3** `GroupContextView::exporter_secret` length contract
   - **What changed:** Returns `None` when the caller asks for more bytes than the cached secret holds, instead of
@@ -234,11 +228,9 @@ key-management integration, external vector runners, WAL checkpoint/rekey policy
 
 ### Done — Task 4.2 `update_group_data` (2026-04-25)
 
-`crates/cgka-engine/src/update_group_data.rs` mirrors the `do_upgrade_group_capabilities` shape: stages a GCE commit
-that overwrites the `marmot_group_data` extension's `name` / `description` fields, defers merge to
-`do_confirm_published`, rolls back via `do_publish_failed`. Other extension fields (admin set, relays, image\_\*,
-disappearing_message_secs, version, nostr_group_id) are preserved verbatim. Admin-set updates and relay updates are
-deliberately out of scope. Tests: 5 in `tests/update_group_data.rs`.
+`crates/cgka-engine/src/update_group_data.rs` stages an `AppDataUpdate` commit for
+`marmot.group.profile.v1`, defers merge to `do_confirm_published`, and rolls back via `do_publish_failed`.
+Admin-policy and routing-component updates are deliberately out of scope. Tests live in `tests/update_group_data.rs`.
 
 ### Done — Task 4.13 publish-before-apply (2026-04-25)
 

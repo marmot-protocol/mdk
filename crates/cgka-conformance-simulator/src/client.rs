@@ -195,6 +195,7 @@ impl HarnessClient {
                 description: "".into(),
                 members: invitees,
                 required_features,
+                app_components: vec![],
                 initial_admins,
             })
             .await

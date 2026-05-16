@@ -10,6 +10,7 @@ description = "OpenMLS-backed CGKA engine implementation."
 cgka-traits.workspace = true
 openmls.workspace = true
 openmls_basic_credential.workspace = true
+openmls_memory_storage.workspace = true
 openmls_rust_crypto.workspace = true
 openmls_traits.workspace = true
 tls_codec = { workspace = true, features = ["derive", "std"] }

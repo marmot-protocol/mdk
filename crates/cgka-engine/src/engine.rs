@@ -11,6 +11,7 @@
 use crate::feature_registry::FeatureRegistry;
 use crate::identity::Identity;
 use async_trait::async_trait;
+use cgka_traits::app_components::{AppComponentId, AppComponentSet, default_group_components};
 use cgka_traits::capabilities::{Feature, FeatureStatus, GroupCapabilities};
 use cgka_traits::engine::{
     AutoPublish, CgkaEngine, CreateGroupRequest, GroupEvent, KeyPackage, SendIntent, SendResult,
@@ -40,6 +41,7 @@ pub struct Engine<S: StorageProvider> {
     pub(crate) crypto: RustCrypto,
     pub(crate) identity: Identity,
     pub(crate) registry: FeatureRegistry,
+    pub(crate) supported_app_components: AppComponentSet,
     pub(crate) peeler: Box<dyn TransportPeeler>,
     pub(crate) ciphersuite: Ciphersuite,
     pub(crate) max_past_epochs: usize,
@@ -78,6 +80,7 @@ pub struct EngineBuilder<S: StorageProvider> {
     storage: S,
     identity_bytes: Option<Vec<u8>>,
     registry: FeatureRegistry,
+    supported_app_components: AppComponentSet,
     peeler: Option<Box<dyn TransportPeeler>>,
     ciphersuite: Ciphersuite,
     max_past_epochs: usize,
@@ -89,6 +92,7 @@ impl<S: StorageProvider> EngineBuilder<S> {
             storage,
             identity_bytes: None,
             registry: FeatureRegistry::new(),
+            supported_app_components: AppComponentSet::new(default_group_components()),
             peeler: None,
             ciphersuite: DEFAULT_CIPHERSUITE,
             max_past_epochs: crate::wire_format::DEFAULT_MAX_PAST_EPOCHS,
@@ -102,6 +106,14 @@ impl<S: StorageProvider> EngineBuilder<S> {
 
     pub fn feature_registry(mut self, registry: FeatureRegistry) -> Self {
         self.registry = registry;
+        self
+    }
+
+    pub fn supported_app_components(
+        mut self,
+        components: impl IntoIterator<Item = AppComponentId>,
+    ) -> Self {
+        self.supported_app_components = AppComponentSet::new(components);
         self
     }
 
@@ -136,6 +148,7 @@ impl<S: StorageProvider> EngineBuilder<S> {
             crypto,
             identity,
             registry: self.registry,
+            supported_app_components: self.supported_app_components,
             peeler,
             ciphersuite: self.ciphersuite,
             max_past_epochs: self.max_past_epochs,
@@ -200,7 +213,7 @@ impl<S: StorageProvider> Engine<S> {
         )
         .map_err(|e| EngineError::Backend(format!("load: {e:?}")))?
         .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
-        let mut admins = crate::group_data::admins_of_group(&mls_group)?;
+        let mut admins = crate::app_components::admins_of_group(&mls_group)?;
         admins.sort();
         admins.dedup();
         Ok(admins)
@@ -325,8 +338,32 @@ impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
         Ok(Box::new(crate::group_context_view::GroupContextView::new(
             EpochId(epoch),
             map,
-            Some(group_id.as_slice().to_vec()),
+            Some(crate::app_components::transport_group_id_of_group(
+                &mls_group,
+            )?),
         )))
+    }
+
+    fn app_component(
+        &self,
+        group_id: &GroupId,
+        component_id: AppComponentId,
+    ) -> Result<Option<Vec<u8>>, EngineError> {
+        let provider = crate::provider::EngineOpenMlsProvider::<S>::new(
+            &self.crypto,
+            self.storage.mls_storage(),
+        );
+        let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
+        let mls_group = openmls::group::MlsGroup::load(
+            <crate::provider::EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(&provider),
+            &mls_gid,
+        )
+        .map_err(|e| EngineError::Backend(format!("load: {e:?}")))?
+        .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
+        Ok(crate::app_components::app_component_data_of_group(
+            &mls_group,
+            component_id,
+        ))
     }
 
     fn members(&self, group_id: &GroupId) -> Result<Vec<Member>, EngineError> {

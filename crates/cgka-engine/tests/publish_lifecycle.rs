@@ -155,6 +155,7 @@ async fn invite_publish_failed_rolls_back_projected_member_set() {
             description: "".into(),
             members: vec![bob_kp],
             required_features: vec![],
+            app_components: vec![],
             initial_admins: vec![],
         })
         .await
@@ -228,6 +229,7 @@ async fn upgrade_publish_failed_rolls_back_required_capabilities() {
             description: "".into(),
             members: vec![bob_kp],
             required_features: vec![],
+            app_components: vec![],
             initial_admins: vec![],
         })
         .await
@@ -294,6 +296,7 @@ async fn create_publish_failed_drops_invitee_and_keeps_solo_alice() {
             description: "".into(),
             members: vec![bob_kp],
             required_features: vec![],
+            app_components: vec![],
             initial_admins: vec![],
         })
         .await
@@ -344,6 +347,7 @@ async fn double_confirm_and_confirm_after_fail_both_error_unknown_pending() {
             description: "".into(),
             members: vec![bob_kp],
             required_features: vec![],
+            app_components: vec![],
             initial_admins: vec![],
         })
         .await
@@ -398,6 +402,7 @@ async fn welcome_wrapped_pre_merge_lands_recipient_at_post_stage_epoch() {
             description: "".into(),
             members: vec![bob_kp],
             required_features: vec![],
+            app_components: vec![],
             initial_admins: vec![],
         })
         .await

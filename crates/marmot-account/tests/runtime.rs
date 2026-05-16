@@ -311,6 +311,7 @@ async fn create_group_publishes_welcome_and_confirms_pending_on_ack() {
             description: "".into(),
             members: vec![bob_kp],
             required_features: vec![],
+            app_components: vec![],
             initial_admins: vec![],
         })
         .await
@@ -362,6 +363,7 @@ async fn create_group_rolls_back_pending_when_publish_acks_are_insufficient() {
             description: "".into(),
             members: vec![bob_kp],
             required_features: vec![],
+            app_components: vec![],
             initial_admins: vec![],
         })
         .await

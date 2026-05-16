@@ -1,5 +1,5 @@
 ---
 source: crates/traits/tests/snapshots.rs
-expression: "format!(\"{:?}\", CreateGroupRequest\n{\n    name: \"demo\".into(), description: \"\".into(), members:\n    vec![KeyPackage(vec![0xEF; 4])], required_features:\n    vec![Feature(\"self-remove\")], initial_admins: vec![],\n})"
+expression: "format!(\"{:?}\", CreateGroupRequest\n{\n    name: \"demo\".into(), description: \"\".into(), members:\n    vec![KeyPackage(vec![0xEF; 4])], required_features:\n    vec![Feature(\"self-remove\")], app_components: vec![], initial_admins:\n    vec![],\n})"
 ---
-"CreateGroupRequest { name: \"demo\", description: \"\", members: [KeyPackage([239, 239, 239, 239])], required_features: [Feature(\"self-remove\")], initial_admins: [] }"
+"CreateGroupRequest { name: \"demo\", description: \"\", members: [KeyPackage([239, 239, 239, 239])], required_features: [Feature(\"self-remove\")], app_components: [], initial_admins: [] }"

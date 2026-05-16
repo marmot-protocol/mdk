@@ -5,12 +5,23 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rusqlite::{Connection, params};
 
 use crate::{
-    AccountState, AppError, AppGroupAdminPolicyComponent, AppGroupImageInput, AppGroupRecord,
-    AppMessageProjection, AppMessageQuery, AppMessageRecord,
+    AccountState, AppError, AppGroupAdminPolicyComponent, AppGroupImageInput,
+    AppGroupNostrRoutingComponent, AppGroupRecord, AppMessageProjection, AppMessageQuery,
+    AppMessageRecord, NOSTR_ROUTING_COMPONENT_ID,
 };
 
 pub(crate) struct AccountProjectionDb {
     conn: Connection,
+}
+
+struct RawGroupRow {
+    group_id_hex: String,
+    profile_name: String,
+    profile_description: String,
+    image: AppGroupImageInput,
+    admin_keys_hex: String,
+    archived: bool,
+    nostr_routing_data_hex: String,
 }
 
 impl AccountProjectionDb {
@@ -136,31 +147,47 @@ impl AccountProjectionDb {
         let mut group_statement = self.conn.prepare(
             "SELECT group_id_hex, endpoint, profile_name, profile_description,
                     image_hash_hex, image_key_hex, image_nonce_hex,
-                    image_upload_key_hex, image_media_type, admin_keys_hex, archived
+                    image_upload_key_hex, image_media_type, admin_keys_hex, archived,
+                    COALESCE((
+                        SELECT component_data_hex FROM group_app_components c
+                        WHERE c.group_id_hex = groups.group_id_hex
+                          AND c.component_id = ?1
+                    ), '') AS nostr_routing_data_hex
              FROM groups
              ORDER BY updated_at, group_id_hex",
         )?;
-        let group_rows = group_statement.query_map([], |row| {
-            let mut group = AppGroupRecord::new(
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                row.get(3)?,
-                AppGroupImageInput {
-                    image_hash_hex: row.get(4)?,
-                    image_key_hex: row.get(5)?,
-                    image_nonce_hex: row.get(6)?,
-                    image_upload_key_hex: row.get(7)?,
-                    media_type: row.get(8)?,
-                },
-                AppGroupAdminPolicyComponent::new(parse_admin_keys_hex(&row.get::<_, String>(9)?)),
-            );
-            group.archived = row.get::<_, i64>(10)? != 0;
-            Ok(group)
-        })?;
+        let group_rows =
+            group_statement.query_map([i64::from(NOSTR_ROUTING_COMPONENT_ID)], |row| {
+                Ok(RawGroupRow {
+                    group_id_hex: row.get(0)?,
+                    profile_name: row.get(2)?,
+                    profile_description: row.get(3)?,
+                    image: AppGroupImageInput {
+                        image_hash_hex: row.get(4)?,
+                        image_key_hex: row.get(5)?,
+                        image_nonce_hex: row.get(6)?,
+                        image_upload_key_hex: row.get(7)?,
+                        media_type: row.get(8)?,
+                    },
+                    admin_keys_hex: row.get(9)?,
+                    archived: row.get::<_, i64>(10)? != 0,
+                    nostr_routing_data_hex: row.get(11)?,
+                })
+            })?;
         let mut groups = Vec::new();
         for row in group_rows {
-            groups.push(row?);
+            let row = row?;
+            let routing_bytes = hex::decode(&row.nostr_routing_data_hex)?;
+            let mut group = AppGroupRecord::new(
+                row.group_id_hex,
+                AppGroupNostrRoutingComponent::from_bytes(&routing_bytes)?,
+                row.profile_name,
+                row.profile_description,
+                row.image,
+                AppGroupAdminPolicyComponent::new(parse_admin_keys_hex(&row.admin_keys_hex)),
+            );
+            group.archived = row.archived;
+            groups.push(group);
         }
 
         Ok(AccountState {
@@ -273,6 +300,23 @@ impl AccountProjectionDb {
                     i64::from(group.admin_policy.component_id),
                     &group.admin_policy.component,
                     &group.admin_policy.data_hex,
+                    unix_now_seconds() as i64
+                ],
+            )?;
+            tx.execute(
+                "INSERT INTO group_app_components (
+                    group_id_hex, component_id, component_name, component_data_hex, updated_at
+                 )
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(group_id_hex, component_id) DO UPDATE SET
+                    component_name = excluded.component_name,
+                    component_data_hex = excluded.component_data_hex,
+                    updated_at = excluded.updated_at",
+                params![
+                    &group.group_id_hex,
+                    i64::from(group.nostr_routing.component_id),
+                    &group.nostr_routing.component,
+                    &group.nostr_routing.data_hex,
                     unix_now_seconds() as i64
                 ],
             )?;
@@ -434,7 +478,7 @@ mod tests {
             seen_events: vec!["event-before".to_owned()],
             groups: vec![AppGroupRecord::new(
                 "aa".to_owned(),
-                "marmot-local://group/aa".to_owned(),
+                test_routing([0xAA; 32], "marmot-local://group/aa"),
                 "before".to_owned(),
                 "".to_owned(),
                 AppGroupImageInput::default(),
@@ -458,7 +502,7 @@ mod tests {
             seen_events: vec!["event-after".to_owned()],
             groups: vec![AppGroupRecord::new(
                 "bb".to_owned(),
-                "marmot-local://group/bb".to_owned(),
+                test_routing([0xBB; 32], "marmot-local://group/bb"),
                 "after".to_owned(),
                 "".to_owned(),
                 AppGroupImageInput::default(),
@@ -472,5 +516,12 @@ mod tests {
         assert_eq!(restored.seen_events, original.seen_events);
         assert_eq!(restored.groups[0].group_id_hex, "aa");
         assert_eq!(restored.groups[0].profile.name, "before");
+    }
+
+    fn test_routing(nostr_group_id: [u8; 32], relay: &str) -> AppGroupNostrRoutingComponent {
+        AppGroupNostrRoutingComponent::new(
+            crate::NostrRoutingV1::new(nostr_group_id, vec![relay.to_owned()]).unwrap(),
+        )
+        .unwrap()
     }
 }

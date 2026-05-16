@@ -143,6 +143,7 @@ async fn concurrent_invites_recover_to_deterministic_winner() {
             description: "".into(),
             members: vec![bob_kp],
             required_features: vec![],
+            app_components: vec![],
             initial_admins: vec![bob.self_id()],
         })
         .await
@@ -320,6 +321,7 @@ async fn stale_commit_without_own_commit_is_classified_as_already_at_epoch_not_f
             description: "".into(),
             members: vec![bob_kp],
             required_features: vec![],
+            app_components: vec![],
             initial_admins: vec![],
         })
         .await

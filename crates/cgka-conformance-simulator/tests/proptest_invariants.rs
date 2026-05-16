@@ -965,6 +965,7 @@ fn capability_negotiation_matches_matrix(case: CapabilityNegotiationCase) {
                     .then_some(PROP_FEATURE)
                     .into_iter()
                     .collect(),
+                app_components: vec![],
                 initial_admins: vec![],
             })
             .await;

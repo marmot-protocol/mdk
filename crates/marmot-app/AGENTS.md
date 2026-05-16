@@ -12,6 +12,8 @@ App runtime bridge for the first real Marmot app surfaces.
 - Keep directory search bounded over cached follow edges. Do not add web-of-trust scoring unless that is reopened as a
   deliberate product decision.
 - Keep protocol engine behavior in `cgka-engine` and session ownership in `cgka-session`.
+- Keep Nostr group routing sourced from `marmot.transport.nostr.routing.v1` component bytes; local filtering may affect
+  connections, but must not rewrite signed routing state.
 - Keep local development relay code clearly separate from production Nostr relay-list setup and discovery.
 - Keep local relay discovery endpoint-scoped: a fetch from one `marmot-local://...` relay must not see records that were
   only published to another local relay.

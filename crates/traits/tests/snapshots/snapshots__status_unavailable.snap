@@ -1,5 +1,6 @@
 ---
 source: crates/traits/tests/snapshots.rs
+assertion_line: 498
 expression: "FeatureStatus::Unavailable { missing }"
 ---
 {
@@ -8,7 +9,10 @@ expression: "FeatureStatus::Unavailable { missing }"
       "proposals": [
         10
       ],
-      "extensions": []
+      "extensions": [],
+      "app_components": {
+        "ids": []
+      }
     }
   }
 }

@@ -570,6 +570,7 @@ mod tests {
             mls_ciphersuite: "0x0001".into(),
             mls_extensions: vec!["0xf2ee".into()],
             mls_proposals: vec!["0x000a".into()],
+            app_components: vec!["0x8001".into(), "0x8003".into(), "0x8004".into()],
             advertised_relays: vec![TransportEndpoint("wss://kp.example".into())],
             publish_endpoints: vec![TransportEndpoint("wss://kp.example".into())],
         }

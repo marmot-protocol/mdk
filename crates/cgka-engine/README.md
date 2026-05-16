@@ -63,8 +63,8 @@ See [`tests/AGENTS.md`](tests/AGENTS.md) for the test file map.
 4. Branch-selection and convergence model: `../../docs/marmot-architecture/distributed-convergence.md`
 5. [`AGENTS.md`](AGENTS.md) — module-by-module map of this crate, design deviations, where to look for what
 
-For the Marmot v2 draft work that may eventually replace the monolithic `marmot_group_data` extension with app
-components, see [`../../spec/README.md`](../../spec/README.md).
+For the Marmot app-component model now used by new groups, see
+[`../../spec/README.md`](../../spec/README.md) and [`src/app_components.rs`](src/app_components.rs).
 
 ## Status
 

@@ -374,6 +374,9 @@ async fn create_group_for_bob(alice: &mut StackClient, bob: &mut StackClient) ->
             description: "session adapter peeler integration".into(),
             members: vec![bob_key_package],
             required_features: vec![],
+            app_components: vec![support::nostr_stack::nostr_routing_component(
+                b"nostr-stack",
+            )],
             initial_admins: vec![],
         })
         .await

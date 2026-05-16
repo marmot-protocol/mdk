@@ -528,6 +528,7 @@ impl LabClient {
                 description: String::new(),
                 members,
                 required_features: Vec::new(),
+                app_components: vec![],
                 initial_admins: Vec::new(),
             })
             .await?;

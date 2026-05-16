@@ -8,7 +8,6 @@ pub(crate) const SIGNATURE_KEY_PAIR_LABEL: &[u8] = b"SignatureKeyPair";
 pub(crate) const EPOCH_KEY_PAIRS_LABEL: &[u8] = b"EpochKeyPairs";
 pub(crate) const TREE_LABEL: &[u8] = b"Tree";
 pub(crate) const GROUP_CONTEXT_LABEL: &[u8] = b"GroupContext";
-#[cfg(feature = "extensions-draft-08")]
 pub(crate) const APPLICATION_EXPORT_TREE_LABEL: &[u8] = b"ApplicationExportTree";
 pub(crate) const INTERIM_TRANSCRIPT_HASH_LABEL: &[u8] = b"InterimTranscriptHash";
 pub(crate) const CONFIRMATION_TAG_LABEL: &[u8] = b"ConfirmationTag";

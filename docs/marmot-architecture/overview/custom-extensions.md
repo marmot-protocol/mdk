@@ -20,11 +20,11 @@ MLS has three separate registries for custom primitives:
 
 - **Term:** **Custom extension**
   - **What it is:** A new `ExtensionType` number carrying app-specific data
-  - **Example:** `marmot_group_data` (0xF2EE)
+  - **Example:** A future LeafNode-scoped extension that cannot be represented as group app-component state
 
 - **Term:** **Safe-framework component**
   - **What it is:** A ComponentID under draft-09 Safe Extensions, using SafeExportSecret / AppDataDictionary / etc.
-  - **Example:** Future Marmot subsystems
+  - **Example:** `marmot.group.profile.v1`
 
 - **Term:** **Custom proposal type**
   - **What it is:** A new `ProposalType` number with custom semantics
@@ -84,9 +84,7 @@ global namespace where label discipline was the only guard against collisions.
 
 - **New subsystems** default to Safe framework components. Evaluate classical extensions only if there's a reason (e.g.
   LeafNode-scoped extensions — framework is GroupContext-focused).
-- **Existing customs (`0xF2EE`, `0xF2EF`, `0xF2F0`)** don't need emergency migration.
-- **Long-term target:** split the monolithic `marmot_group_data` into multiple AppDataDictionary entries (identity,
-  transport, admin, message-lifecycle).
+- **Current group state** belongs in AppDataDictionary components. Avoid adding new monolithic group-state extensions.
 - **Gated on backend library support.** OpenMLS 0.8's Safe framework support still needs a concrete backend
   investigation.
 

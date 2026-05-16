@@ -125,6 +125,7 @@ async fn snapshot_names_do_not_embed_plaintext_group_id() {
             description: "".into(),
             members: vec![bob_kp],
             required_features: vec![],
+            app_components: vec![],
             initial_admins: vec![],
         })
         .await

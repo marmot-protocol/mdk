@@ -33,7 +33,7 @@ use cgka_traits::storage::StorageProvider;
 use cgka_traits::types::{GroupId, MemberId};
 use openmls::extensions::Extension;
 use openmls::group::{MlsGroup, StagedCommit};
-use openmls::prelude::{BasicCredential, ExtensionType, KeyPackage};
+use openmls::prelude::{BasicCredential, KeyPackage};
 
 /// Cache self's capabilities from the local `MlsGroup`. Called after any
 /// membership change since our own leaf might get updated (e.g. on
@@ -119,14 +119,15 @@ pub(crate) fn required_capabilities_from_group(mls_group: &MlsGroup) -> GroupCap
     for ext in mls_group.extensions().iter() {
         if let Extension::RequiredCapabilities(rc) = ext {
             for t in rc.extension_types() {
-                if let ExtensionType::Unknown(n) = t {
-                    out.extensions.insert(*n);
-                }
+                out.extensions.insert(u16::from(*t));
             }
             for t in rc.proposal_types() {
                 out.proposals.insert(u16::from(*t));
             }
         }
+    }
+    if let Ok(components) = crate::app_components::required_app_components_of_group(mls_group) {
+        out.app_components = components;
     }
     out
 }

@@ -35,9 +35,6 @@ cargo insta review
 - **File:** `group_context_view.rs`
   - **Owns:** `GroupContextView` exporter-secret length contract
 
-- **File:** `group_data_routing_id.rs`
-  - **Owns:** `marmot_group_data.nostr_group_id` randomness/privacy
-
 - **File:** `ingest.rs`
   - **Owns:** Phase 4.3 — every `StaleReason` variant; send(AppMessage) round-trip
 
@@ -66,7 +63,7 @@ cargo insta review
   - **Owns:** SQLCipher-backed `Engine<SqliteStorage>` create + confirm smoke
 
 - **File:** `update_group_data.rs`
-  - **Owns:** Group profile GCE updates and convergence-side Marmot record refresh
+  - **Owns:** Group profile `AppDataUpdate` commits and convergence-side Marmot record refresh
 
 ```sh
 cargo test -p cgka-engine

@@ -93,7 +93,7 @@ pub(crate) fn decide(mls_group: &MlsGroup, proposal: &QueuedProposal) -> AutoCom
     // pubkey (e.g. malformed admin extension, non-32-byte credential),
     // we do NOT commit. A corrupted group is not a state the auto-
     // committer should advance on best-effort.
-    let Ok(admins) = crate::group_data::admins_of_group(mls_group) else {
+    let Ok(admins) = crate::app_components::admins_of_group(mls_group) else {
         return AutoCommitDecision::Observe;
     };
     let leaver_pubkey = match pubkey_at_leaf_index(mls_group, leaver_idx) {

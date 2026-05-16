@@ -121,6 +121,7 @@ async fn exporter_secret_returns_full_cached_secret_at_exact_length() {
             description: "".into(),
             members: vec![],
             required_features: vec![],
+            app_components: vec![],
             initial_admins: vec![],
         })
         .await
@@ -146,6 +147,7 @@ async fn exporter_secret_returns_prefix_when_caller_asks_for_less() {
             description: "".into(),
             members: vec![],
             required_features: vec![],
+            app_components: vec![],
             initial_admins: vec![],
         })
         .await
@@ -175,6 +177,7 @@ async fn exporter_secret_returns_none_when_caller_asks_for_more_than_cached() {
             description: "".into(),
             members: vec![],
             required_features: vec![],
+            app_components: vec![],
             initial_admins: vec![],
         })
         .await
@@ -201,6 +204,7 @@ async fn exporter_secret_returns_none_for_unknown_label() {
             description: "".into(),
             members: vec![],
             required_features: vec![],
+            app_components: vec![],
             initial_admins: vec![],
         })
         .await

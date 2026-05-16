@@ -1,5 +1,6 @@
 ---
 source: crates/traits/tests/snapshots.rs
+assertion_line: 510
 expression: "Group\n{\n    id: gid(), name: \"ops\".into(), description: \"for ops talk\".into(), epoch:\n    EpochId(3), members: vec![Member { id: mem_id(), credential: vec![], }],\n    required_capabilities: GroupCapabilities::default(),\n}"
 ---
 {
@@ -26,6 +27,9 @@ expression: "Group\n{\n    id: gid(), name: \"ops\".into(), description: \"for o
   ],
   "required_capabilities": {
     "proposals": [],
-    "extensions": []
+    "extensions": [],
+    "app_components": {
+      "ids": []
+    }
   }
 }

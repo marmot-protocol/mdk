@@ -261,6 +261,7 @@ async fn peel_deferred_message_retries_instead_of_short_circuiting() {
             description: "".into(),
             members: vec![bob_kp],
             required_features: vec![],
+            app_components: vec![],
             initial_admins: vec![],
         })
         .await
@@ -326,6 +327,7 @@ async fn ingest_own_created_message_returns_own_echo() {
             description: "".into(),
             members: vec![bob_kp],
             required_features: vec![],
+            app_components: vec![],
             initial_admins: vec![],
         })
         .await
@@ -390,6 +392,7 @@ async fn welcome_before_commit_yields_already_at_epoch() {
             description: "".into(),
             members: vec![bob_kp],
             required_features: vec![],
+            app_components: vec![],
             initial_admins: vec![],
         })
         .await
@@ -460,6 +463,7 @@ async fn send_app_message_round_trips_to_another_client() {
             description: "".into(),
             members: vec![bob_kp],
             required_features: vec![],
+            app_components: vec![],
             initial_admins: vec![],
         })
         .await
@@ -526,6 +530,7 @@ async fn inbound_group_message_during_pending_publish_replays_after_rollback() {
             description: "".into(),
             members: vec![bob_kp],
             required_features: vec![],
+            app_components: vec![],
             initial_admins: vec![],
         })
         .await

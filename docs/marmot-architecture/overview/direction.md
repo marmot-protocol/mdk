@@ -74,10 +74,11 @@ components, patterns, and primitives** with feature MIPs that reference them.
 **NOT a strict Bitcoin/BIP one-number-per-feature model** — overlap between features is too real. Needs a concrete pilot
 before committing.
 
-### 2. `marmot_group_data` should eventually split into AppDataDictionary entries.
+### 2. App components are now the group-state shape.
 
-The monolithic 0xF2EE conflates identity, transport, admin, and message-lifecycle concerns. Each wants its own
-ComponentID and update frequency. Major migration; long-term.
+Group profile, admin policy, and Nostr routing now live in `app_data_dictionary`, and KeyPackages advertise supported
+component ids through the upstream `app_components` component. Keep pushing new group-state work into small component
+documents.
 
 ### 3. MDK and whitenoise-rs need their own decomposition review.
 
@@ -92,7 +93,6 @@ The likely answer is phased, but it still deserves its own cost/benefit proposal
 - Does OpenMLS (or the MLS library Marmot-TS uses) support draft-09's Safe Extensions framework? If not, what's the
   upstream timeline?
 - What does a component-based Marmot spec structure look like concretely? Which existing feature is the right pilot?
-- What's the migration path for `marmot_group_data` split? How do groups transition?
 - Should `IdentityRemove` be gated on multi-device being active, or available universally?
 - Should the `kind: 450` identity proof pattern be elevated to a first-class Marmot primitive (a
   `MarmotNostrIdentityProof` reference doc) that multiple MIPs reference?
@@ -125,12 +125,12 @@ Each small enough to actually do, each produces an artifact that makes bigger de
 | Reference-impl + multi-impl + clients | **High** | Same pattern; already on this path. |
 | Four-component target architecture | **High** | Boundaries align with real concerns. |
 | Safe framework as default for new customs | **Medium** | Contingent on MLS ecosystem and backend adoption. |
-| `marmot_group_data` split | **Medium** | Architecturally clean; depends on Safe framework + migration will. |
+| App-component group state | **High** | Matches the current engine path and keeps profile/admin/routing concerns separable. |
 | Component-based spec structure | **Unknown** | Novel for Marmot; needs piloting. |
 | `IdentityRemove` as first custom proposal | **High** | Real gap; once shipped, stable. |
 
 High-confidence decisions are about **shape** (thick protocol, reference-impl, crate boundaries). Lower-confidence
-decisions are about **ecosystem timing** (Safe framework adoption, migration windows). Commit to shape now; defer
+decisions are about **ecosystem timing** (Safe framework adoption and component-backed routing details). Commit to shape now; defer
 timing-dependent decisions until external work resolves.
 
 ---

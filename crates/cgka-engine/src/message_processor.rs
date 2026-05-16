@@ -23,10 +23,12 @@ use cgka_traits::message::{MessageRecord, MessageState, StoredMessagePayload};
 use cgka_traits::storage::{QueuedOutboundIntent, StorageError, StorageProvider};
 use cgka_traits::transport::{EncryptedPayload, TransportEnvelope, TransportMessage};
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
+use openmls::component::ComponentData;
 use openmls::group::{MlsGroup, ProcessMessageError};
+use openmls::messages::proposals::{AppDataUpdateOperation, ProposalOrRef};
 use openmls::prelude::{
-    BasicCredential, ContentType, MlsMessageBodyIn, MlsMessageIn, MlsMessageOut,
-    ProcessedMessageContent, Proposal, ProtocolMessage, Sender, ValidationError,
+    BasicCredential, ContentType, MlsMessageBodyIn, MlsMessageIn, MlsMessageOut, ProcessedMessage,
+    ProcessedMessageContent, Proposal, ProtocolMessage, ProtocolVersion, Sender, ValidationError,
 };
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
@@ -141,10 +143,7 @@ impl<S: StorageProvider> Engine<S> {
         msg: &TransportMessage,
         transport_group_id: Vec<u8>,
     ) -> Result<IngestOutcome, EngineError> {
-        // Convention (0.1.0): transport_group_id bytes == MLS group_id bytes.
-        // A real peeler/adapter may map via a local index; we'll carry that
-        // indirection when the Nostr peeler lands.
-        let group_id = GroupId::new(transport_group_id.clone());
+        let group_id = self.group_id_for_transport_group_id(&transport_group_id)?;
         let mut pending_recovery: Option<(EpochId, CommitOrderingKey, CommitOrderingKey)> = None;
 
         loop {
@@ -324,8 +323,14 @@ impl<S: StorageProvider> Engine<S> {
                 MessageState::Created,
             )?;
 
-            // Process via MLS.
-            let processed = match mls_group.process_message(&provider, proto) {
+            // Process via MLS. Commits may contain AppDataUpdate proposals,
+            // which require the application to compute the resulting
+            // AppDataDictionary before OpenMLS stages the commit.
+            let processed = match if msg_content_type == ContentType::Commit {
+                process_commit_with_app_data_updates(&mut mls_group, &provider, proto)
+            } else {
+                mls_group.process_message(&provider, proto)
+            } {
                 Ok(p) => p,
                 Err(ProcessMessageError::ValidationError(ValidationError::WrongEpoch)) => {
                     let current = EpochId(mls_group.epoch().as_u64());
@@ -426,7 +431,7 @@ impl<S: StorageProvider> Engine<S> {
                                 group_id: group_id.clone(),
                             });
                         };
-                        crate::group_data::require_admin(&mls_group, &group_id, sender)?;
+                        crate::app_components::require_admin(&mls_group, &group_id, sender)?;
                     }
                     let recovery_snapshot =
                         self.fork_recovery
@@ -473,6 +478,11 @@ impl<S: StorageProvider> Engine<S> {
                     if let Ok(mut g) = self.storage.get_group(&group_id) {
                         g.epoch = after;
                         g.members = after_members;
+                        g.required_capabilities =
+                            crate::capability_manager::required_capabilities_from_group(&mls_group);
+                        crate::group_lifecycle::mirror_app_components_into_record(
+                            &mls_group, &mut g,
+                        );
                         self.storage.put_group(&g)?;
                     }
                     // Refresh self-cache since our own leaf may have been
@@ -569,12 +579,7 @@ impl<S: StorageProvider> Engine<S> {
                             )
                             .await
                             .map_err(EngineError::Peeler)?;
-                        let wrapped = TransportMessage {
-                            envelope: TransportEnvelope::GroupMessage {
-                                transport_group_id: group_id.as_slice().to_vec(),
-                            },
-                            ..wrapped
-                        };
+                        let wrapped = route_wrapped_group_message(wrapped, &pre_commit_ctx);
                         self.record_sent_openmls_message(
                             &wrapped,
                             commit_bytes.as_slice(),
@@ -908,7 +913,7 @@ impl<S: StorageProvider> Engine<S> {
                 },
             ));
         }
-        crate::group_data::require_admin(&mls_group, &group_id, self.identity.self_id())?;
+        crate::app_components::require_admin(&mls_group, &group_id, self.identity.self_id())?;
 
         // Validate capabilities (same rule as create_group — see Risk #1
         // capability doc).
@@ -920,7 +925,10 @@ impl<S: StorageProvider> Engine<S> {
             let had = crate::capabilities::capabilities_of_key_package(&parsed);
             let missing = required.missing_from(&had);
             if !missing.is_empty() {
-                return Err(EngineError::MissingRequiredCapabilities { required, had });
+                return Err(EngineError::MissingRequiredCapabilities {
+                    required: Box::new(required),
+                    had: Box::new(had),
+                });
             }
             parsed_kps.push(parsed);
         }
@@ -964,12 +972,7 @@ impl<S: StorageProvider> Engine<S> {
             )
             .await
             .map_err(EngineError::Peeler)?;
-        let commit_msg = TransportMessage {
-            envelope: TransportEnvelope::GroupMessage {
-                transport_group_id: group_id.as_slice().to_vec(),
-            },
-            ..commit_msg
-        };
+        let commit_msg = route_wrapped_group_message(commit_msg, &pre_commit_ctx);
         self.record_sent_openmls_message(
             &commit_msg,
             commit_bytes.as_slice(),
@@ -1093,8 +1096,8 @@ impl<S: StorageProvider> Engine<S> {
         }
 
         let existing = self.storage.get_group(&group_id)?;
-        crate::group_data::require_admin(&mls_group, &group_id, self.identity.self_id())?;
-        let admins = crate::group_data::admins_of_group(&mls_group)?;
+        crate::app_components::require_admin(&mls_group, &group_id, self.identity.self_id())?;
+        let admins = crate::app_components::admins_of_group(&mls_group)?;
 
         let mut leaf_indices = Vec::with_capacity(unique_targets.len());
         let mut found = HashSet::new();
@@ -1118,7 +1121,7 @@ impl<S: StorageProvider> Engine<S> {
 
         let target_admins = unique_targets
             .iter()
-            .map(crate::group_data::admin_pubkey_from_member_id)
+            .map(crate::app_components::admin_pubkey_from_member_id)
             .collect::<Result<Vec<_>, _>>()?;
         if admins
             .iter()
@@ -1156,12 +1159,7 @@ impl<S: StorageProvider> Engine<S> {
             )
             .await
             .map_err(EngineError::Peeler)?;
-        let commit_msg = TransportMessage {
-            envelope: TransportEnvelope::GroupMessage {
-                transport_group_id: group_id.as_slice().to_vec(),
-            },
-            ..commit_msg
-        };
+        let commit_msg = route_wrapped_group_message(commit_msg, &pre_commit_ctx);
         self.record_sent_openmls_message(
             &commit_msg,
             commit_bytes.as_slice(),
@@ -1221,8 +1219,9 @@ impl<S: StorageProvider> Engine<S> {
         // MIP-03 §149 admin-cannot-self-remove guard. If the leaver is an
         // admin AND they're the only admin, refuse with a typed error so
         // the caller can prompt for admin transfer.
-        let self_pubkey = crate::group_data::admin_pubkey_from_member_id(self.identity.self_id())?;
-        let admins = crate::group_data::admins_of_group(&mls_group)?;
+        let self_pubkey =
+            crate::app_components::admin_pubkey_from_member_id(self.identity.self_id())?;
+        let admins = crate::app_components::admins_of_group(&mls_group)?;
         let i_am_admin = admins.iter().any(|k| k == &self_pubkey);
         let only_admin = i_am_admin && admins.len() == 1;
         if only_admin {
@@ -1251,12 +1250,7 @@ impl<S: StorageProvider> Engine<S> {
             )
             .await
             .map_err(EngineError::Peeler)?;
-        let wrapped = TransportMessage {
-            envelope: TransportEnvelope::GroupMessage {
-                transport_group_id: group_id.as_slice().to_vec(),
-            },
-            ..wrapped
-        };
+        let wrapped = route_wrapped_group_message(wrapped, &ctx);
         self.record_sent_openmls_message(
             &wrapped,
             bytes.as_slice(),
@@ -1318,12 +1312,7 @@ impl<S: StorageProvider> Engine<S> {
             .await
             .map_err(EngineError::Peeler)?;
 
-        let wrapped = TransportMessage {
-            envelope: TransportEnvelope::GroupMessage {
-                transport_group_id: group_id.as_slice().to_vec(),
-            },
-            ..wrapped
-        };
+        let wrapped = route_wrapped_group_message(wrapped, &ctx);
         self.record_sent_openmls_message(
             &wrapped,
             out_bytes.as_slice(),
@@ -1333,6 +1322,58 @@ impl<S: StorageProvider> Engine<S> {
 
         Ok(SendResult::ApplicationMessage { msg: wrapped })
     }
+}
+
+fn process_commit_with_app_data_updates<S: StorageProvider>(
+    mls_group: &mut MlsGroup,
+    provider: &EngineOpenMlsProvider<'_, S>,
+    proto: ProtocolMessage,
+) -> Result<
+    ProcessedMessage,
+    ProcessMessageError<
+        <<S as StorageProvider>::Mls as openmls_traits::storage::StorageProvider<
+            { openmls_traits::storage::CURRENT_VERSION },
+        >>::Error,
+    >,
+> {
+    let unverified = mls_group.unprotect_message(provider, proto)?;
+    let mut updater = mls_group.app_data_dictionary_updater();
+    if let Some(committed_proposals) = unverified.committed_proposals() {
+        for proposal_or_ref in committed_proposals {
+            let validated = proposal_or_ref.clone().validate(
+                <EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::crypto(provider),
+                mls_group.ciphersuite(),
+                ProtocolVersion::Mls10,
+            )?;
+            let proposal = match validated {
+                ProposalOrRef::Proposal(proposal) => proposal,
+                ProposalOrRef::Reference(reference) => mls_group
+                    .proposal_store()
+                    .proposals()
+                    .find(|p| p.proposal_reference_ref() == &*reference)
+                    .map(|p| Box::new(p.proposal().clone()))
+                    .ok_or(ProcessMessageError::FoundAppDataUpdateProposal)?,
+            };
+            if let Proposal::AppDataUpdate(update) = proposal.as_ref() {
+                match update.operation() {
+                    AppDataUpdateOperation::Update(data) => {
+                        updater.set(ComponentData::from_parts(
+                            update.component_id(),
+                            data.clone(),
+                        ));
+                    }
+                    AppDataUpdateOperation::Remove => {
+                        updater.remove(&update.component_id());
+                    }
+                }
+            }
+        }
+    }
+    mls_group.process_unverified_message_with_app_data_updates(
+        provider,
+        unverified,
+        updater.changes(),
+    )
 }
 
 fn member_id_of_sender(sender: &Sender, group: &MlsGroup) -> Option<MemberId> {
@@ -1360,6 +1401,19 @@ fn record_group_id(msg: &TransportMessage) -> GroupId {
     }
 }
 
+fn route_wrapped_group_message(
+    msg: TransportMessage,
+    ctx: &cgka_traits::group_context::GroupContextSnapshot,
+) -> TransportMessage {
+    let Some(transport_group_id) = ctx.transport_group_id().map(ToOwned::to_owned) else {
+        return msg;
+    };
+    TransportMessage {
+        envelope: TransportEnvelope::GroupMessage { transport_group_id },
+        ..msg
+    }
+}
+
 fn send_intent_group_id(intent: &SendIntent) -> &GroupId {
     match intent {
         SendIntent::AppMessage { group_id, .. }
@@ -1373,9 +1427,12 @@ fn send_intent_group_id(intent: &SendIntent) -> &GroupId {
 fn staged_commit_requires_admin(staged: &openmls::group::StagedCommit) -> bool {
     staged.add_proposals().next().is_some()
         || staged.remove_proposals().next().is_some()
-        || staged
-            .queued_proposals()
-            .any(|queued| matches!(queued.proposal(), Proposal::GroupContextExtensions(_)))
+        || staged.queued_proposals().any(|queued| {
+            matches!(
+                queued.proposal(),
+                Proposal::GroupContextExtensions(_) | Proposal::AppDataUpdate(_)
+            )
+        })
 }
 
 fn convergence_ingest_outcome(
@@ -1455,6 +1512,42 @@ fn convergence_ingest_outcome(
 }
 
 impl<S: StorageProvider> Engine<S> {
+    fn group_id_for_transport_group_id(
+        &self,
+        transport_group_id: &[u8],
+    ) -> Result<GroupId, EngineError> {
+        let direct = GroupId::new(transport_group_id.to_vec());
+        match self.storage.get_group(&direct) {
+            Ok(group) => return Ok(group.id),
+            Err(StorageError::NotFound) => {}
+            Err(err) => return Err(EngineError::Storage(err)),
+        }
+
+        let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
+        for group_id in self.storage.list_groups()? {
+            if group_id.as_slice() == transport_group_id {
+                return Ok(group_id);
+            }
+            let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
+            let Some(mls_group) = MlsGroup::load(
+                <EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(
+                    &provider,
+                ),
+                &mls_gid,
+            )
+            .map_err(|e| EngineError::Backend(format!("load route candidate: {e:?}")))?
+            else {
+                continue;
+            };
+            if crate::app_components::transport_group_id_of_group(&mls_group)? == transport_group_id
+            {
+                return Ok(group_id);
+            }
+        }
+
+        Ok(direct)
+    }
+
     fn recorded_message_outcome(
         &mut self,
         id: &MessageId,

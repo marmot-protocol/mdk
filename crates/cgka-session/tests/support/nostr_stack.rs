@@ -10,6 +10,10 @@ use async_trait::async_trait;
 use cgka_session::{
     AccountDeviceSession, CreateGroupEffects, IngestEffects, PublishWork, SessionConfig,
 };
+use cgka_traits::app_components::{
+    AppComponentData, NOSTR_ROUTING_COMPONENT_ID, NostrRoutingV1, decode_nostr_routing_v1,
+    default_group_components, encode_nostr_routing_v1,
+};
 use cgka_traits::engine_state::PendingStateRef;
 use cgka_traits::{
     GroupId, MemberId, TransportAccountActivation, TransportAdapter, TransportAdapterError,
@@ -135,7 +139,7 @@ impl NostrStackHarness {
             database_key: SqlCipherKey::new("nostr stack integration key").unwrap(),
             relay,
             adapter,
-            group_endpoint: TransportEndpoint("wss://group.example".into()),
+            group_endpoint: TransportEndpoint(default_group_endpoint()),
         }
     }
 
@@ -143,12 +147,15 @@ impl NostrStackHarness {
         let keys = deterministic_nostr_keys(label.as_bytes());
         let account_id = member_id(&keys);
         let inbox_endpoint = TransportEndpoint(format!("wss://{label}-inbox.example"));
-        let session = AccountDeviceSession::open(SessionConfig::new(
-            self._dir.path().join(format!("{label}.sqlite")),
-            self.database_key.clone(),
-            keys.public_key().to_bytes().to_vec(),
-            Box::new(NostrMlsPeeler::new(keys.public_key().to_hex()).with_welcome_signer(keys)),
-        ))
+        let session = AccountDeviceSession::open(
+            SessionConfig::new(
+                self._dir.path().join(format!("{label}.sqlite")),
+                self.database_key.clone(),
+                keys.public_key().to_bytes().to_vec(),
+                Box::new(NostrMlsPeeler::new(keys.public_key().to_hex()).with_welcome_signer(keys)),
+            )
+            .supported_app_components(supported_app_components()),
+        )
         .unwrap();
         self.adapter
             .activate_account(TransportAccountActivation {
@@ -175,12 +182,13 @@ impl NostrStackHarness {
     }
 
     pub async fn sync_group(&self, client: &StackClient, group_id: &GroupId) {
+        let transport_group_id = transport_group_id_for_session(client, group_id);
         self.adapter
             .sync_account_groups(TransportGroupSync {
                 account_id: client.account_id.clone(),
                 group_subscriptions: vec![TransportGroupSubscription {
                     group_id: group_id.clone(),
-                    transport_group_id: group_id.as_slice().to_vec(),
+                    transport_group_id,
                     endpoints: vec![self.group_endpoint.clone()],
                 }],
                 since: None,
@@ -234,13 +242,14 @@ impl NostrStackHarness {
         message: TransportMessage,
         required_acks: usize,
     ) -> Result<TransportPublishReport, TransportAdapterError> {
+        let transport_group_id = transport_group_id_for_session(sender, group_id);
         self.adapter
             .publish(TransportPublishRequest {
                 account_id: sender.account_id.clone(),
                 message,
                 target: TransportPublishTarget::Group {
                     group_id: group_id.clone(),
-                    transport_group_id: group_id.as_slice().to_vec(),
+                    transport_group_id,
                     endpoints: vec![self.group_endpoint.clone()],
                 },
                 required_acks,
@@ -334,6 +343,22 @@ impl NostrStackHarness {
     pub fn group_endpoint(&self) -> TransportEndpoint {
         self.group_endpoint.clone()
     }
+
+    pub fn nostr_routing_component(&self, seed: &[u8]) -> AppComponentData {
+        nostr_routing_component(seed)
+    }
+}
+
+pub fn nostr_routing_component(seed: &[u8]) -> AppComponentData {
+    let routing = NostrRoutingV1::new(
+        deterministic_nostr_group_id(seed),
+        vec![default_group_endpoint()],
+    )
+    .unwrap();
+    AppComponentData {
+        component_id: NOSTR_ROUTING_COMPONENT_ID,
+        data: encode_nostr_routing_v1(&routing).unwrap(),
+    }
 }
 
 impl CreatedGroup {
@@ -386,4 +411,31 @@ fn deterministic_nostr_keys(seed: &[u8]) -> nostr::Keys {
             .checked_add(1)
             .expect("deterministic Nostr key search exhausted");
     }
+}
+
+fn default_group_endpoint() -> String {
+    "wss://group.example".into()
+}
+
+fn supported_app_components() -> Vec<u16> {
+    let mut components = default_group_components();
+    components.insert(NOSTR_ROUTING_COMPONENT_ID);
+    components.into_iter().collect()
+}
+
+fn transport_group_id_for_session(client: &StackClient, group_id: &GroupId) -> Vec<u8> {
+    client
+        .session
+        .app_component(group_id, NOSTR_ROUTING_COMPONENT_ID)
+        .unwrap()
+        .and_then(|bytes| decode_nostr_routing_v1(&bytes).ok())
+        .map(|routing| routing.nostr_group_id.to_vec())
+        .unwrap_or_else(|| group_id.as_slice().to_vec())
+}
+
+fn deterministic_nostr_group_id(seed: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"marmot-cgka-session-nostr-group-id-v1");
+    hasher.update(seed);
+    hasher.finalize().into()
 }

@@ -1,15 +1,14 @@
 ---
 title: "Current State — Implementations & Spec"
 created: 2026-04-19
-updated: 2026-05-15
+updated: 2026-05-16
 tags: [marmot, overview, current-state, implementations]
 status: overview
 ---
 
-> **2026-05-09 audit pass:** A line-by-line engine review surfaced and closed three correctness bugs (canonical
-> convergence not refreshing recipient `marmot_group_data` / `RequiredCapabilities`; the routing tag in
-> `marmot_group_data.nostr_group_id` being copied from the creator's pubkey instead of CSPRNG; the
-> `GroupContext::exporter_secret` contract silently truncating over-length requests), tightened seven smells (welcome
+> **2026-05-09 audit pass:** A line-by-line engine review surfaced and closed correctness bugs in recipient
+> required-capability refresh, group profile refresh, and the `GroupContext::exporter_secret` over-length contract,
+> tightened seven smells (welcome
 > dedup at the API surface, atomic `EpochState` transitions, replay error classification, more honest convergence ingest
 > outcomes, capability-cache self-id assertion, fail-closed auto-committer admin guard, registry-overwrite warning), and
 > added a `SnapshotRollbackGuard` so the snapshot dance is panic-safe. Snapshot names no longer carry plaintext group
@@ -28,7 +27,7 @@ into spec text.
 **Merged MIPs:**
 
 - **MIP-00** — Credentials & KeyPackages
-- **MIP-01** — Group Construction & `marmot_group_data`
+- **MIP-01** — Group Construction
 - **MIP-02** — Welcomes
 - **MIP-03** — Group Messages and SelfRemove
 - **MIP-04** — Encrypted Media
@@ -37,7 +36,7 @@ into spec text.
 **In PR / design:**
 
 - **MIP-06** — Multi-Device Support
-- **Marmot v2 protocol draft** — protocol principles, publish lifecycle, and draft MLS app components in
+- **Marmot v2 protocol draft** — protocol principles, publish lifecycle, and MLS app components in
   [`../../../spec/README.md`](../../../spec/README.md)
 - **CGKA engine canonicalization** — post-peeling commit/proposal/app-message contract in
   [`../cgka-engine-canonicalization-contract.md`](../cgka-engine-canonicalization-contract.md)
@@ -123,11 +122,11 @@ variants.
   relay-client boundary, with an optional `nostr-sdk` relay client, exact stale group subscription cleanup,
   adapter-local metrics, privacy-safe tracing, and redacted SDK relay-health summaries. The SDK owns reconnect/backoff,
   retry interval adjustment, jitter, and relay status mechanics. The session crate now has an in-memory relay
-  integration harness that drives NIP-59 welcomes, kind `445` group messages, invite group evolution, insufficient acks,
-  publish errors, subscription gating, duplicate delivery, reordered delivery, invite commit/welcome order variants, and
-  terminal stale-epoch invite commits through the real session, adapter, and peeler stack. Production relay auth,
-  Nostr-backed transport routing policy, full KeyPackage metadata derivation through the transport layer, richer
-  telemetry export, and account key-management wiring still need integration.
+  integration harness that drives NIP-59 welcomes, `marmot.transport.nostr.routing.v1`-backed kind `445` group messages,
+  invite group evolution, insufficient acks, publish errors, subscription gating, duplicate delivery, reordered delivery,
+  invite commit/welcome order variants, and terminal stale-epoch invite commits through the real session, adapter, and
+  peeler stack. Production relay auth, relay safety policy, full KeyPackage metadata derivation through the transport
+  layer, richer telemetry export, and account key-management wiring still need integration.
 - **Nostr account transport shape** — the likely production shape includes a Nostr user directory, account bootstrap for
   relay-list events, a shared multi-account relay plane, `marmot.transport.nostr.routing.v1` group routing, and explicit
   relay URL safety policy. This is captured as a working note in

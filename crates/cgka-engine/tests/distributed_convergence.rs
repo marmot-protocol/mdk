@@ -155,6 +155,7 @@ async fn engine_converges_stored_openmls_messages_to_selected_branch() {
             description: "".into(),
             members: vec![bob_kp, carol_kp],
             required_features: vec![],
+            app_components: vec![],
             initial_admins: vec![bob.self_id()],
         })
         .await
@@ -287,6 +288,7 @@ async fn engine_does_not_apply_stored_branch_before_stability_gate() {
             description: "".into(),
             members: vec![bob_kp, carol_kp],
             required_features: vec![],
+            app_components: vec![],
             initial_admins: vec![],
         })
         .await
@@ -346,6 +348,7 @@ async fn engine_ingest_buffers_commit_for_convergence_before_quiescence() {
             description: "".into(),
             members: vec![bob_kp, carol_kp],
             required_features: vec![],
+            app_components: vec![],
             initial_admins: vec![],
         })
         .await
@@ -403,6 +406,7 @@ async fn engine_materializes_multi_commit_path_from_stored_commits() {
             description: "".into(),
             members: vec![carol_kp],
             required_features: vec![],
+            app_components: vec![],
             initial_admins: vec![],
         })
         .await
@@ -507,6 +511,7 @@ async fn engine_keeps_child_commit_pending_until_parent_arrives() {
             description: "".into(),
             members: vec![carol_kp],
             required_features: vec![],
+            app_components: vec![],
             initial_admins: vec![],
         })
         .await
@@ -574,6 +579,7 @@ async fn engine_replays_late_same_epoch_commit_from_retained_anchor() {
             description: "".into(),
             members: vec![bob_kp, carol_kp],
             required_features: vec![],
+            app_components: vec![],
             initial_admins: vec![bob.self_id()],
         })
         .await
@@ -695,6 +701,7 @@ async fn rebuilt_engine_replays_late_same_epoch_commit_from_retained_anchor() {
             description: "".into(),
             members: vec![bob_kp, carol_kp],
             required_features: vec![],
+            app_components: vec![],
             initial_admins: vec![bob.self_id()],
         })
         .await
@@ -801,6 +808,7 @@ async fn engine_reports_missing_retained_anchor_without_mutating_late_commit() {
             description: "".into(),
             members: vec![bob_kp, carol_kp],
             required_features: vec![],
+            app_components: vec![],
             initial_admins: vec![bob.self_id()],
         })
         .await
@@ -892,6 +900,7 @@ async fn engine_prunes_retained_anchor_snapshots_to_rewind_horizon() {
             description: "".into(),
             members: vec![carol_kp],
             required_features: vec![],
+            app_components: vec![],
             initial_admins: vec![],
         })
         .await
@@ -978,6 +987,7 @@ async fn engine_invalidates_commit_older_than_retained_anchor() {
             description: "".into(),
             members: vec![bob_kp, carol_kp],
             required_features: vec![],
+            app_components: vec![],
             initial_admins: vec![bob.self_id()],
         })
         .await
@@ -1100,6 +1110,7 @@ async fn rebuilt_engine_invalidates_commit_older_than_retained_anchor() {
             description: "".into(),
             members: vec![bob_kp, carol_kp],
             required_features: vec![],
+            app_components: vec![],
             initial_admins: vec![bob.self_id()],
         })
         .await
@@ -1217,6 +1228,7 @@ async fn engine_ingest_buffers_future_epoch_app_message_as_convergence_witness()
             description: "".into(),
             members: vec![bob_kp, carol_kp],
             required_features: vec![],
+            app_components: vec![],
             initial_admins: vec![bob.self_id()],
         })
         .await
@@ -1296,6 +1308,7 @@ async fn engine_emits_only_canonical_branch_app_messages_after_convergence() {
             description: "".into(),
             members: vec![bob_kp, carol_kp],
             required_features: vec![],
+            app_components: vec![],
             initial_admins: vec![bob.self_id()],
         })
         .await
@@ -1427,6 +1440,7 @@ async fn rebuilt_engine_emits_canonical_app_message_after_convergence() {
             description: "".into(),
             members: vec![carol_kp],
             required_features: vec![],
+            app_components: vec![],
             initial_admins: vec![],
         })
         .await
@@ -1505,6 +1519,7 @@ async fn rebuilt_engine_emits_losing_branch_app_invalidation_after_convergence()
             description: "".into(),
             members: vec![bob_kp, carol_kp],
             required_features: vec![],
+            app_components: vec![],
             initial_admins: vec![bob.self_id()],
         })
         .await
@@ -1630,6 +1645,7 @@ async fn engine_ingest_retains_proposal_until_canonical_commit_consumes_it() {
             description: "".into(),
             members: vec![bob_kp, carol_kp],
             required_features: vec![],
+            app_components: vec![],
             initial_admins: vec![bob.self_id()],
         })
         .await
@@ -1719,6 +1735,7 @@ async fn engine_duplicate_convergence_input_does_not_reset_quiescence() {
             description: "".into(),
             members: vec![bob_kp, carol_kp],
             required_features: vec![],
+            app_components: vec![],
             initial_admins: vec![bob.self_id()],
         })
         .await
@@ -1775,6 +1792,7 @@ async fn engine_queues_app_send_until_convergence_is_stable() {
             description: "".into(),
             members: vec![bob_kp, carol_kp],
             required_features: vec![],
+            app_components: vec![],
             initial_admins: vec![bob.self_id()],
         })
         .await
@@ -1878,6 +1896,7 @@ async fn engine_queues_group_evolution_until_convergence_is_stable() {
             description: "".into(),
             members: vec![bob_kp, carol_kp],
             required_features: vec![],
+            app_components: vec![],
             initial_admins: vec![carol.self_id()],
         })
         .await
@@ -1969,6 +1988,7 @@ async fn trait_advance_convergence_drains_queued_outbound_intent() {
             description: "".into(),
             members: vec![bob_kp, carol_kp],
             required_features: vec![],
+            app_components: vec![],
             initial_admins: vec![bob.self_id()],
         })
         .await
@@ -2047,6 +2067,7 @@ async fn advance_convergence_retains_queued_intent_when_regeneration_fails() {
             description: "".into(),
             members: vec![],
             required_features: vec![],
+            app_components: vec![],
             initial_admins: vec![],
         })
         .await
@@ -2096,6 +2117,7 @@ async fn queued_group_evolution_pauses_later_queued_intents_until_publish_resolv
             description: "".into(),
             members: vec![bob_kp],
             required_features: vec![],
+            app_components: vec![],
             initial_admins: vec![bob.self_id()],
         })
         .await
@@ -2190,6 +2212,7 @@ async fn queued_outbound_intent_survives_engine_rebuild() {
             description: "".into(),
             members: vec![bob_kp, carol_kp],
             required_features: vec![],
+            app_components: vec![],
             initial_admins: vec![bob.self_id()],
         })
         .await

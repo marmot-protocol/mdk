@@ -42,8 +42,8 @@ pub enum EngineError {
     /// `required` and `had` are populated so callers can render the diff.
     #[error("missing required capabilities: required={required:?} had={had:?}")]
     MissingRequiredCapabilities {
-        required: GroupCapabilities,
-        had: GroupCapabilities,
+        required: Box<GroupCapabilities>,
+        had: Box<GroupCapabilities>,
     },
 
     /// Epoch fork detected that the current recovery manager could not

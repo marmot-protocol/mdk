@@ -1,18 +1,7 @@
-//! `SendIntent::UpdateGroupData` — issues a `GroupContextExtensions` commit
-//! that replaces the `marmot_group_data` extension with one whose `name` /
-//! `description` fields have been overwritten by the caller's request.
-//!
-//! Other `marmot_group_data` fields (admins, relays, image_*, etc.) are
-//! preserved as-is. Admin set updates and relay updates are out of scope
-//! for this intent; admin promotion lives in a follow-on plan and relay
-//! configuration is transport-adapter territory.
-//!
-//! The send path stages a GCE commit with the pre-stage exporter context,
-//! enters `PendingPublish`, and defers merge until `do_confirm_published`.
-//! Rollback via `do_publish_failed` discards the staged GCE.
+//! `SendIntent::UpdateGroupData` — issues an `AppDataUpdate` commit for
+//! `marmot.group.profile.v1`.
 
 use crate::engine::Engine;
-use crate::group_data::{NostrGroupData, read_from_group};
 use crate::provider::EngineOpenMlsProvider;
 use cgka_traits::engine::SendResult;
 use cgka_traits::engine_state::{EpochState, StagedCommitHandle};
@@ -20,8 +9,9 @@ use cgka_traits::error::EngineError;
 use cgka_traits::storage::StorageProvider;
 use cgka_traits::transport::{EncryptedPayload, TransportEnvelope, TransportMessage};
 use cgka_traits::types::{EpochId, GroupId};
-use openmls::extensions::{Extension, Extensions};
+use openmls::component::ComponentData;
 use openmls::group::MlsGroup;
+use openmls::messages::proposals::{AppDataUpdateOperation, AppDataUpdateProposal, Proposal};
 use tls_codec::Serialize as _;
 
 impl<S: StorageProvider> Engine<S> {
@@ -57,36 +47,20 @@ impl<S: StorageProvider> Engine<S> {
         )
         .map_err(|e| EngineError::Backend(format!("load: {e:?}")))?
         .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
-        crate::group_data::require_admin(&mls_group, &group_id, self.identity.self_id())?;
+        crate::app_components::require_admin(&mls_group, &group_id, self.identity.self_id())?;
 
-        // Read the existing marmot_group_data extension and overwrite only
-        // the requested fields. Everything else (admins, relays, image_*,
-        // disappearing_message_secs, version, nostr_group_id) is
-        // preserved verbatim.
-        let mut data: NostrGroupData = read_from_group(&mls_group)?.ok_or_else(|| {
-            EngineError::Backend(
-                "UpdateGroupData on a group with no marmot_group_data extension".into(),
-            )
-        })?;
-        if let Some(n) = name {
-            data.name = tls_codec::VLBytes::new(n.into_bytes());
-        }
-        if let Some(d) = description {
-            data.description = tls_codec::VLBytes::new(d.into_bytes());
-        }
-        let new_marmot_ext = data.to_extension()?;
-
-        // Replace ONLY the marmot_group_data extension; preserve every
-        // other extension (RequiredCapabilities especially).
-        let mut new_ext_vec: Vec<Extension> = mls_group
-            .extensions()
-            .iter()
-            .filter(|e| !is_marmot_group_data(e))
-            .cloned()
-            .collect();
-        new_ext_vec.push(new_marmot_ext);
-        let new_extensions = Extensions::from_vec(new_ext_vec)
-            .map_err(|e| EngineError::Backend(format!("extensions: {e:?}")))?;
+        let current_profile = crate::app_components::group_profile_of_group(&mls_group)?
+            .or_else(|| {
+                self.storage
+                    .get_group(&group_id)
+                    .ok()
+                    .map(|g| (g.name, g.description))
+            })
+            .unwrap_or_default();
+        let projected_name = name.unwrap_or(current_profile.0);
+        let projected_description = description.unwrap_or(current_profile.1);
+        let profile_bytes =
+            crate::app_components::encode_group_profile(&projected_name, &projected_description)?;
 
         // Fork-detection bookkeeping (pre-stage epoch is the commit
         // origin).
@@ -99,10 +73,44 @@ impl<S: StorageProvider> Engine<S> {
         let pre_commit_ctx =
             crate::group_lifecycle::build_group_context_snapshot(&mls_group, &provider)?;
 
-        // Stage the GCE commit. Don't merge — confirm path does that.
-        let (commit_out, _welcome_opt, _gi) = mls_group
-            .update_group_context_extensions(&provider, new_extensions, &self.identity.signer)
-            .map_err(|e| EngineError::Backend(format!("update_gce: {e:?}")))?;
+        // Stage the AppDataUpdate commit. Don't merge — confirm path does that.
+        let mut builder = mls_group
+            .commit_builder()
+            .add_proposals(vec![Proposal::AppDataUpdate(Box::new(
+                AppDataUpdateProposal::update(
+                    cgka_traits::app_components::GROUP_PROFILE_COMPONENT_ID,
+                    profile_bytes.clone(),
+                ),
+            ))])
+            .load_psks(
+                <EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(
+                    &provider,
+                ),
+            )
+            .map_err(|e| EngineError::Backend(format!("load_psks: {e:?}")))?;
+        let mut app_data = builder.app_data_dictionary_updater();
+        for proposal in builder.app_data_update_proposals() {
+            if let AppDataUpdateOperation::Update(data) = proposal.operation() {
+                app_data.set(ComponentData::from_parts(
+                    proposal.component_id(),
+                    data.clone(),
+                ));
+            }
+        }
+        builder.with_app_data_dictionary_updates(app_data.changes());
+        let commit_bundle = builder
+            .build(
+                <EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::rand(&provider),
+                <EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::crypto(
+                    &provider,
+                ),
+                &self.identity.signer,
+                |_| true,
+            )
+            .map_err(|e| EngineError::Backend(format!("app_data_update build: {e:?}")))?
+            .stage_commit(&provider)
+            .map_err(|e| EngineError::Backend(format!("app_data_update stage: {e:?}")))?;
+        let (commit_out, _welcome_opt, _gi) = commit_bundle.into_contents();
         let commit_bytes = commit_out
             .tls_serialize_detached()
             .map_err(|e| EngineError::Serialize(format!("{e:?}")))?;
@@ -120,7 +128,10 @@ impl<S: StorageProvider> Engine<S> {
             .map_err(EngineError::Peeler)?;
         let wrapped = TransportMessage {
             envelope: TransportEnvelope::GroupMessage {
-                transport_group_id: group_id.as_slice().to_vec(),
+                transport_group_id: pre_commit_ctx
+                    .transport_group_id()
+                    .map(ToOwned::to_owned)
+                    .unwrap_or_else(|| group_id.as_slice().to_vec()),
             },
             ..wrapped
         };
@@ -131,14 +142,11 @@ impl<S: StorageProvider> Engine<S> {
             pre_commit_epoch,
         )?;
 
-        // Mirror the projected name/description in the Marmot record at
-        // send time (rolled back on publish_failed via the stored data
-        // re-derive from MLS). The Marmot record's name/description are
-        // user-visible fields; they should reflect "what the user just
-        // asked for" during PendingPublish.
+        // Mirror the projected name/description in the Marmot record at send
+        // time. Rollback re-derives from the unmerged MLS app component.
         if let Ok(mut g) = self.storage.get_group(&group_id) {
-            g.name = String::from_utf8_lossy(data.name.as_slice()).into_owned();
-            g.description = String::from_utf8_lossy(data.description.as_slice()).into_owned();
+            g.name = projected_name;
+            g.description = projected_description;
             self.storage.put_group(&g)?;
         }
 
@@ -168,11 +176,4 @@ impl<S: StorageProvider> Engine<S> {
             pending: pending_ref,
         })
     }
-}
-
-fn is_marmot_group_data(ext: &Extension) -> bool {
-    matches!(
-        ext,
-        Extension::Unknown(crate::group_data::MARMOT_GROUP_DATA_EXT_TYPE, _)
-    )
 }

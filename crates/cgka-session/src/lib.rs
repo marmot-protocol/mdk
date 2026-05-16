@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use cgka_engine::canonicalization::CanonicalizationPolicy;
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::{Engine, EngineBuilder};
+use cgka_traits::app_components::{AppComponentId, AppComponentSet, default_group_components};
 use cgka_traits::engine::{
     CgkaEngine, CreateGroupRequest, GroupEvent, KeyPackage, SendIntent, SendResult,
 };
@@ -41,6 +42,7 @@ pub struct SessionConfig {
     identity: Vec<u8>,
     peeler: Box<dyn TransportPeeler>,
     feature_registry: FeatureRegistry,
+    supported_app_components: AppComponentSet,
     storage_options: SqliteStorageOptions,
     convergence_policy: CanonicalizationPolicy,
 }
@@ -58,6 +60,7 @@ impl SessionConfig {
             identity,
             peeler,
             feature_registry: FeatureRegistry::new(),
+            supported_app_components: AppComponentSet::new(default_group_components()),
             storage_options: SqliteStorageOptions::default(),
             convergence_policy: CanonicalizationPolicy::default(),
         }
@@ -65,6 +68,14 @@ impl SessionConfig {
 
     pub fn feature_registry(mut self, registry: FeatureRegistry) -> Self {
         self.feature_registry = registry;
+        self
+    }
+
+    pub fn supported_app_components(
+        mut self,
+        components: impl IntoIterator<Item = AppComponentId>,
+    ) -> Self {
+        self.supported_app_components = AppComponentSet::new(components);
         self
     }
 
@@ -152,6 +163,7 @@ impl AccountDeviceSession {
         let mut engine = EngineBuilder::new(storage)
             .identity(config.identity)
             .feature_registry(config.feature_registry)
+            .supported_app_components(config.supported_app_components.ids)
             .peeler(config.peeler)
             .build()?;
         engine.hydrate_stable_groups_from_storage()?;
@@ -185,6 +197,14 @@ impl AccountDeviceSession {
 
     pub fn admin_pubkeys(&self, group_id: &GroupId) -> SessionResult<Vec<[u8; 32]>> {
         Ok(self.engine.admin_pubkeys(group_id)?)
+    }
+
+    pub fn app_component(
+        &self,
+        group_id: &GroupId,
+        component_id: AppComponentId,
+    ) -> SessionResult<Option<Vec<u8>>> {
+        Ok(self.engine.app_component(group_id, component_id)?)
     }
 
     pub async fn create_group(

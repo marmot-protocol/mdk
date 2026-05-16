@@ -15,6 +15,7 @@ use cgka_session::{
     AccountDeviceSession, CreateGroupEffects, IngestEffects, PublishWork, QueuedIntentRef,
     SessionEffects, SessionError,
 };
+use cgka_traits::AppComponentId;
 use cgka_traits::engine::{CreateGroupRequest, GroupEvent, KeyPackage, SendIntent};
 use cgka_traits::engine_state::PendingStateRef;
 use cgka_traits::error::EngineError;
@@ -809,6 +810,14 @@ where
 
     pub fn admin_pubkeys(&self, group_id: &GroupId) -> AccountResult<Vec<[u8; 32]>> {
         Ok(self.session.admin_pubkeys(group_id)?)
+    }
+
+    pub fn app_component(
+        &self,
+        group_id: &GroupId,
+        component_id: AppComponentId,
+    ) -> AccountResult<Option<Vec<u8>>> {
+        Ok(self.session.app_component(group_id, component_id)?)
     }
 
     pub async fn activate_transport(&self, since: Option<Timestamp>) -> AccountResult<()> {

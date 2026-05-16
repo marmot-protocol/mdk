@@ -139,13 +139,13 @@ The active workspace proves the shape without the old prototype tree:
 - `crates/cgka-conformance-simulator` drives multi-client scenarios, generated delivery variants, and property tests
   over the engine.
 
-The production perimeter is still partly outside this workspace: Nostr-backed transport routing policy, relay auth,
-account key-management integration, persistence operations policy, and packaging.
+The production perimeter is still partly outside this workspace: relay auth, relay safety policy, account
+key-management integration, persistence operations policy, and packaging.
 
-The expected Nostr routing source of truth is the signed `marmot.transport.nostr.routing.v1` app component for group
-routes and the user's kind `10051` KeyPackage relay list for KeyPackage publication. The generic account runtime should
-remain transport-agnostic; Nostr-specific routing and KeyPackage event publication likely belong in the Nostr transport
-adapter family.
+The Nostr routing source of truth is the signed `marmot.transport.nostr.routing.v1` app component for group routes and
+the user's kind `10051` KeyPackage relay list for KeyPackage publication. The generic account runtime remains
+transport-agnostic; Nostr-specific relay safety and full KeyPackage event publication should stay with the Nostr
+transport/app-runtime layer.
 
 ---
 

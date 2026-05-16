@@ -154,8 +154,8 @@ application core.
 
 The next Nostr-facing code should be small:
 
-- parse and validate `marmot.transport.nostr.routing.v1`;
-- project routing state into group subscriptions and publish targets;
+- harden relay safety policy around `marmot.transport.nostr.routing.v1`;
+- keep group subscriptions and publish targets projected from signed routing state;
 - define how a Nostr-backed service publishes kind `30443` KeyPackages using kind `10051` relay-list data.
 
 The engine work remains the center of gravity.

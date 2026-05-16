@@ -5,6 +5,9 @@ use cgka_engine::canonicalization::SyncState;
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::{Engine, EngineBuilder};
 use cgka_traits::EngineError;
+use cgka_traits::app_components::{
+    GROUP_ADMIN_POLICY_COMPONENT_ID, GROUP_PROFILE_COMPONENT_ID, default_group_components,
+};
 use cgka_traits::capabilities::{
     Capability, CapabilityRequirement, Feature, FeatureStatus, RequirementLevel,
 };
@@ -103,6 +106,7 @@ impl TransportPeeler for MockPeeler {
 }
 
 const REACTIONS_PROPOSAL: u16 = 0xFF01;
+const TEST_APP_COMPONENT: u16 = 0x8101;
 
 fn registry_selfremove_required_and_reactions_optional() -> FeatureRegistry {
     let mut r = FeatureRegistry::new();
@@ -138,6 +142,19 @@ fn registry_selfremove_only() -> FeatureRegistry {
     r
 }
 
+fn registry_selfremove_required_and_component_optional() -> FeatureRegistry {
+    let mut r = registry_selfremove_only();
+    r.register(
+        Feature("test-app-component"),
+        CapabilityRequirement {
+            requires: Capability::AppComponent(TEST_APP_COMPONENT),
+            level: RequirementLevel::Optional,
+            description: "test app component",
+        },
+    );
+    r
+}
+
 fn build_client(id: &[u8], registry: FeatureRegistry) -> impl CgkaEngine {
     EngineBuilder::new(MemoryStorage::new())
         .identity(pad32(id))
@@ -145,6 +162,152 @@ fn build_client(id: &[u8], registry: FeatureRegistry) -> impl CgkaEngine {
         .peeler(Box::new(MockPeeler))
         .build()
         .unwrap()
+}
+
+fn build_engine_with_components(
+    id: &[u8],
+    components: impl IntoIterator<Item = u16>,
+) -> Engine<MemoryStorage> {
+    EngineBuilder::new(MemoryStorage::new())
+        .identity(pad32(id))
+        .supported_app_components(components)
+        .peeler(Box::new(MockPeeler))
+        .build()
+        .unwrap()
+}
+
+fn build_engine_with_registry_and_components(
+    id: &[u8],
+    registry: FeatureRegistry,
+    components: impl IntoIterator<Item = u16>,
+) -> Engine<MemoryStorage> {
+    EngineBuilder::new(MemoryStorage::new())
+        .identity(pad32(id))
+        .feature_registry(registry)
+        .supported_app_components(components)
+        .peeler(Box::new(MockPeeler))
+        .build()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn group_creation_negotiates_app_component_intersection() {
+    let mut alice = build_engine_with_components(
+        b"alice",
+        [GROUP_PROFILE_COMPONENT_ID, GROUP_ADMIN_POLICY_COMPONENT_ID],
+    );
+    let mut bob = build_engine_with_components(b"bob", [GROUP_PROFILE_COMPONENT_ID]);
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+
+    let constructable = alice
+        .constructable_capabilities(std::slice::from_ref(&bob_kp))
+        .unwrap();
+    assert!(
+        constructable
+            .app_components
+            .contains(GROUP_PROFILE_COMPONENT_ID)
+    );
+    assert!(
+        !constructable
+            .app_components
+            .contains(GROUP_ADMIN_POLICY_COMPONENT_ID)
+    );
+
+    let (group_id, _result) = alice
+        .create_group(CreateGroupRequest {
+            name: "components".into(),
+            description: "intersection".into(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+
+    let group = alice.group_record(&group_id).unwrap();
+    assert!(
+        group
+            .required_capabilities
+            .app_components
+            .contains(GROUP_PROFILE_COMPONENT_ID)
+    );
+    assert!(
+        !group
+            .required_capabilities
+            .app_components
+            .contains(GROUP_ADMIN_POLICY_COMPONENT_ID)
+    );
+}
+
+#[tokio::test]
+async fn upgrade_group_capabilities_promotes_optional_app_component_to_required() {
+    let mut supported = default_group_components();
+    supported.insert(TEST_APP_COMPONENT);
+    let mut alice = build_engine_with_registry_and_components(
+        b"alice",
+        registry_selfremove_required_and_component_optional(),
+        supported.clone(),
+    );
+    let mut bob = build_engine_with_registry_and_components(
+        b"bob",
+        registry_selfremove_required_and_component_optional(),
+        supported,
+    );
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "component-upgrade".into(),
+            description: "".into(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let pending = match create {
+        SendResult::GroupCreated { pending, .. } => pending,
+        _ => unreachable!(),
+    };
+    alice.confirm_published(pending).await.unwrap();
+
+    assert!(matches!(
+        alice
+            .feature_status(&group_id, &Feature("test-app-component"))
+            .unwrap(),
+        FeatureStatus::Upgradeable
+    ));
+    assert!(
+        !alice
+            .group_record(&group_id)
+            .unwrap()
+            .required_capabilities
+            .app_components
+            .contains(TEST_APP_COMPONENT)
+    );
+
+    let upgrade = alice.upgrade_group_capabilities(&group_id).await.unwrap();
+    let pending = match upgrade {
+        SendResult::GroupEvolution { pending, .. } => pending,
+        _ => unreachable!(),
+    };
+    alice.confirm_published(pending).await.unwrap();
+
+    assert!(matches!(
+        alice
+            .feature_status(&group_id, &Feature("test-app-component"))
+            .unwrap(),
+        FeatureStatus::Available
+    ));
+    assert!(
+        alice
+            .group_record(&group_id)
+            .unwrap()
+            .required_capabilities
+            .app_components
+            .contains(TEST_APP_COMPONENT)
+    );
 }
 
 #[tokio::test]
@@ -165,6 +328,7 @@ async fn feature_in_required_capabilities_is_available() {
             description: "".into(),
             members: vec![bob_kp],
             required_features: vec![Feature("self-remove")],
+            app_components: vec![],
             initial_admins: vec![],
         })
         .await
@@ -194,6 +358,7 @@ async fn create_group_requested_optional_feature_becomes_required() {
             description: "".into(),
             members: vec![bob_kp],
             required_features: vec![Feature("reactions")],
+            app_components: vec![],
             initial_admins: vec![],
         })
         .await
@@ -220,6 +385,7 @@ async fn create_group_rejects_invitee_missing_requested_optional_feature() {
             description: "".into(),
             members: vec![bob_kp],
             required_features: vec![Feature("reactions")],
+            app_components: vec![],
             initial_admins: vec![],
         })
         .await
@@ -248,6 +414,7 @@ async fn feature_supported_by_all_but_not_required_is_upgradeable() {
             description: "".into(),
             members: vec![bob_kp],
             required_features: vec![],
+            app_components: vec![],
             initial_admins: vec![],
         })
         .await
@@ -277,6 +444,7 @@ async fn feature_missing_from_one_member_is_unavailable_with_missing_set() {
             description: "".into(),
             members: vec![bob_kp],
             required_features: vec![],
+            app_components: vec![],
             initial_admins: vec![],
         })
         .await
@@ -309,6 +477,7 @@ async fn upgradeable_capabilities_lists_universally_supported() {
             description: "".into(),
             members: vec![bob_kp],
             required_features: vec![],
+            app_components: vec![],
             initial_admins: vec![],
         })
         .await
@@ -360,6 +529,7 @@ async fn transport_required_when_transport_inactive_behaves_like_optional() {
             description: "".into(),
             members: vec![bob_kp],
             required_features: vec![],
+            app_components: vec![],
             initial_admins: vec![],
         })
         .await
@@ -503,6 +673,7 @@ async fn capability_matrix_36_cells() {
                         description: "".into(),
                         members: kps,
                         required_features: vec![],
+                        app_components: vec![],
                         initial_admins: vec![],
                     })
                     .await;
@@ -605,6 +776,7 @@ async fn upgrade_group_capabilities_promotes_optional_to_required() {
             description: "".into(),
             members: vec![bob_kp],
             required_features: vec![],
+            app_components: vec![],
             initial_admins: vec![],
         })
         .await
@@ -665,6 +837,7 @@ async fn non_admin_cannot_upgrade_group_capabilities() {
             description: "".into(),
             members: vec![bob_kp],
             required_features: vec![],
+            app_components: vec![],
             initial_admins: vec![],
         })
         .await
@@ -707,6 +880,7 @@ async fn group_context_returns_live_view() {
             description: "".into(),
             members: vec![bob_kp],
             required_features: vec![],
+            app_components: vec![],
             initial_admins: vec![],
         })
         .await
@@ -747,6 +921,7 @@ async fn bob_sees_alice_caps_cached_after_invite_commit() {
             description: "".into(),
             members: vec![bob_kp],
             required_features: vec![],
+            app_components: vec![],
             initial_admins: vec![],
         })
         .await
@@ -851,6 +1026,7 @@ async fn convergence_refreshes_recipient_required_capabilities_on_upgrade() {
             description: "".into(),
             members: vec![bob_kp],
             required_features: vec![],
+            app_components: vec![],
             initial_admins: vec![],
         })
         .await
