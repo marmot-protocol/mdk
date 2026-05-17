@@ -18,6 +18,28 @@ clippy:
 test:
     cargo test --workspace
 
+relay-up:
+    docker compose up -d
+    ./scripts/wait_for_relays.sh
+
+relay-smoke:
+    ./scripts/wait_for_relays.sh
+
+relay-down:
+    docker compose down -v
+
+relay-logs:
+    docker compose logs -f
+
+e2e-test test="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ -z "{{test}}" ]; then
+        DARKMATTER_E2E_REQUIRE_RELAYS=1 cargo test -p darkmatter-cli --test cli real_local_relays_deliver_cli_messages_over_sdk_path -- --exact
+    else
+        DARKMATTER_E2E_REQUIRE_RELAYS=1 cargo test -p darkmatter-cli --test cli "{{test}}"
+    fi
+
 conformance:
     cargo test -p cgka-conformance-simulator
 

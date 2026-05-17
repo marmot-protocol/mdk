@@ -191,7 +191,7 @@ async fn engine_converges_stored_openmls_messages_to_selected_branch() {
         .unwrap();
     let (alice_commit, alice_pending) = evolution(alice_invite);
     let (bob_commit, bob_pending) = evolution(bob_invite);
-    let commit_messages = vec![
+    let commit_messages = [
         route(alice_commit.clone(), &group_id),
         route(bob_commit.clone(), &group_id),
     ];
@@ -1345,7 +1345,7 @@ async fn engine_emits_only_canonical_branch_app_messages_after_convergence() {
         .unwrap();
     let (alice_commit, alice_pending) = evolution(alice_invite);
     let (bob_commit, bob_pending) = evolution(bob_invite);
-    let commit_messages = vec![
+    let commit_messages = [
         route(alice_commit.clone(), &group_id),
         route(bob_commit.clone(), &group_id),
     ];

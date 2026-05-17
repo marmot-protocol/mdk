@@ -3,6 +3,8 @@ name: CI
 on:
   pull_request:
   push:
+    branches:
+      - master
   merge_group:
   workflow_dispatch:
 
@@ -64,6 +66,27 @@ jobs:
 
       - name: Run workspace tests
         run: cargo test --workspace --locked
+
+      - name: Start local relay stack
+        run: docker compose up -d
+
+      - name: Wait for local relays
+        run: |
+          docker compose ps
+          ./scripts/wait_for_relays.sh
+
+      - name: Run real relay CLI E2E
+        env:
+          DARKMATTER_E2E_REQUIRE_RELAYS: "1"
+        run: cargo test -p darkmatter-cli --test cli real_local_relays_deliver_cli_messages_over_sdk_path --locked -- --exact
+
+      - name: Dump local relay logs
+        if: failure()
+        run: docker compose logs nostr-rs-relay strfry-nostr-relay || true
+
+      - name: Stop local relay stack
+        if: always()
+        run: docker compose down -v
 
   conformance:
     name: Simulator and vectors

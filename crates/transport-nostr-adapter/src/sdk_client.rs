@@ -145,9 +145,10 @@ impl NostrSdkRelayClient {
                 let endpoint_digest = endpoint_set_digest(endpoints);
                 Ok(NostrSdkSubscriptionPlan {
                     account_id: account_id.clone(),
-                    subscription_id: SubscriptionId::new(format!(
-                        "marmot:{account_id}:inbox:{endpoint_digest}"
-                    )),
+                    subscription_id: compact_subscription_id(
+                        "inbox",
+                        &[account_id.as_slice(), endpoint_digest.as_bytes()],
+                    ),
                     endpoints: parse_endpoints(endpoints, "account inbox subscription")?,
                     filter,
                 })
@@ -169,9 +170,15 @@ impl NostrSdkRelayClient {
                 let endpoint_digest = endpoint_set_digest(endpoints);
                 Ok(NostrSdkSubscriptionPlan {
                     account_id: account_id.clone(),
-                    subscription_id: SubscriptionId::new(format!(
-                        "marmot:{account_id}:group:{group_id}:{h_tag}:{endpoint_digest}"
-                    )),
+                    subscription_id: compact_subscription_id(
+                        "group",
+                        &[
+                            account_id.as_slice(),
+                            group_id.as_slice(),
+                            h_tag.as_bytes(),
+                            endpoint_digest.as_bytes(),
+                        ],
+                    ),
                     endpoints: parse_endpoints(endpoints, "group subscription")?,
                     filter,
                 })
@@ -307,6 +314,16 @@ impl NostrRelayClient for NostrSdkRelayClient {
             endpoint_count = parsed_endpoints.len(),
             "publishing SDK relay event"
         );
+        for endpoint in &parsed_endpoints {
+            self.client
+                .add_relay(endpoint.clone())
+                .await
+                .map_err(|e| TransportAdapterError::Publish(format!("add relay: {e}")))?;
+            self.client
+                .connect_relay(endpoint.clone())
+                .await
+                .map_err(|e| TransportAdapterError::Publish(format!("connect relay: {e}")))?;
+        }
         let output = self
             .client
             .send_event_to(parsed_endpoints, &event)
@@ -404,6 +421,21 @@ fn endpoint_set_digest(endpoints: &[TransportEndpoint]) -> String {
     hex::encode(hasher.finalize())
 }
 
+fn compact_subscription_id(kind: &str, components: &[&[u8]]) -> SubscriptionId {
+    let mut hasher = Sha256::new();
+    hash_component(&mut hasher, kind.as_bytes());
+    for component in components {
+        hash_component(&mut hasher, component);
+    }
+    let digest = hex::encode(hasher.finalize());
+    SubscriptionId::new(format!("marmot:{kind}:{}", &digest[..32]))
+}
+
+fn hash_component(hasher: &mut Sha256, component: &[u8]) {
+    hasher.update((component.len() as u64).to_be_bytes());
+    hasher.update(component);
+}
+
 trait PushUnique<T> {
     fn push_unique(&mut self, value: T);
 }
@@ -428,29 +460,39 @@ mod tests {
     #[test]
     fn group_subscription_plan_uses_mls_group_kind_h_tag_and_since() {
         let account_id = MemberId::new(vec![0xA1; 32]);
+        let group_id = cgka_traits::GroupId::new(vec![0xB2; 32]);
         let transport_group_id = vec![0xC3; 32];
         let endpoint = TransportEndpoint("wss://group.example".into());
 
         let plan = NostrSdkRelayClient::plan_subscription(&NostrSubscription::Group {
             account_id: account_id.clone(),
-            group_id: cgka_traits::GroupId::new(vec![0xB2; 32]),
+            group_id: group_id.clone(),
             transport_group_id: transport_group_id.clone(),
             endpoints: vec![endpoint.clone()],
             since: Some(Timestamp(1_700_000_000)),
         })
         .expect("plan");
 
+        let h_tag = hex::encode(&transport_group_id);
+        let endpoint_digest = endpoint_set_digest(std::slice::from_ref(&endpoint));
+        let expected_subscription_id = compact_subscription_id(
+            "group",
+            &[
+                account_id.as_slice(),
+                group_id.as_slice(),
+                h_tag.as_bytes(),
+                endpoint_digest.as_bytes(),
+            ],
+        );
         assert_eq!(plan.account_id, account_id);
         assert_eq!(plan.endpoints[0].to_string(), endpoint.0);
-        assert_eq!(
-            plan.subscription_id.to_string(),
-            format!(
-                "marmot:{account_id}:group:{}:{}:{}",
-                hex::encode(vec![0xB2; 32]),
-                hex::encode(&transport_group_id),
-                endpoint_set_digest(&[endpoint])
-            )
+        assert_eq!(plan.subscription_id, expected_subscription_id);
+        assert!(
+            plan.subscription_id
+                .to_string()
+                .starts_with("marmot:group:")
         );
+        assert!(plan.subscription_id.to_string().len() <= 64);
         let json = serde_json::to_value(&plan.filter).unwrap();
         assert_eq!(json["kinds"], serde_json::json!([445]));
         assert_eq!(
@@ -473,15 +515,20 @@ mod tests {
         })
         .expect("plan");
 
+        let endpoint_digest = endpoint_set_digest(std::slice::from_ref(&endpoint));
+        let expected_subscription_id = compact_subscription_id(
+            "inbox",
+            &[account_id.as_slice(), endpoint_digest.as_bytes()],
+        );
         assert_eq!(plan.account_id, account_id);
         assert_eq!(plan.endpoints[0].to_string(), endpoint.0);
-        assert_eq!(
-            plan.subscription_id.to_string(),
-            format!(
-                "marmot:{account_id}:inbox:{}",
-                endpoint_set_digest(&[endpoint])
-            )
+        assert_eq!(plan.subscription_id, expected_subscription_id);
+        assert!(
+            plan.subscription_id
+                .to_string()
+                .starts_with("marmot:inbox:")
         );
+        assert!(plan.subscription_id.to_string().len() <= 64);
         let json = serde_json::to_value(&plan.filter).unwrap();
         assert_eq!(json["kinds"], serde_json::json!([1059]));
         assert_eq!(json["#p"], serde_json::json!([keys.public_key().to_hex()]));

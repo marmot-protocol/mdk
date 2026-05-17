@@ -6,3 +6,6 @@ target/
 
 plans/
 reviews/
+
+# Local Docker relay state.
+dev/data/

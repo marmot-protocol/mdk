@@ -24,7 +24,7 @@ use cgka_traits::storage::{QueuedOutboundIntent, StorageError, StorageProvider};
 use cgka_traits::transport::{EncryptedPayload, TransportEnvelope, TransportMessage};
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
 use openmls::component::ComponentData;
-use openmls::group::{MlsGroup, ProcessMessageError};
+use openmls::group::{MlsGroup, MlsGroupStateError, ProcessMessageError};
 use openmls::messages::proposals::{AppDataUpdateOperation, ProposalOrRef};
 use openmls::prelude::{
     BasicCredential, ContentType, MlsMessageBodyIn, MlsMessageIn, MlsMessageOut, ProcessedMessage,
@@ -178,6 +178,17 @@ impl<S: StorageProvider> Engine<S> {
             // store the transport message for deterministic replay once the
             // group returns to Stable.
             let current_epoch = EpochId(mls_group.epoch().as_u64());
+            if !mls_group.is_active() {
+                self.persist_transport_message(
+                    msg,
+                    &group_id,
+                    current_epoch,
+                    MessageState::Failed,
+                )?;
+                return Ok(IngestOutcome::Stale {
+                    reason: StaleReason::PeelFailed,
+                });
+            }
             if !self.epoch_manager.can_ingest(&group_id) {
                 self.persist_transport_message(
                     msg,
@@ -383,6 +394,12 @@ impl<S: StorageProvider> Engine<S> {
                     self.update_stored_message_state(&msg.id, MessageState::Failed)?;
                     return Ok(IngestOutcome::Stale {
                         reason: StaleReason::AlreadyAtEpoch { current, msg_epoch },
+                    });
+                }
+                Err(ProcessMessageError::GroupStateError(MlsGroupStateError::UseAfterEviction)) => {
+                    self.update_stored_message_state(&msg.id, MessageState::Failed)?;
+                    return Ok(IngestOutcome::Stale {
+                        reason: StaleReason::PeelFailed,
                     });
                 }
                 Err(e) => {
