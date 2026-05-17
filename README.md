@@ -1,4 +1,4 @@
-# darkmatter
+<img width="710" height="114" alt="darkmatter" src="https://github.com/user-attachments/assets/99ac0fe4-5124-40c4-b560-48d40596b9b3" />
 
 Candidate Marmot v2 protocol draft, CGKA engine, and conformance workspace.
 
