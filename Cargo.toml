@@ -12,7 +12,7 @@ members = [
     "crates/marmot-account",
     "crates/marmot-lab",
     "crates/marmot-app",
-    "crates/dm",
+    "crates/cli",
 ]
 
 [workspace.package]
@@ -72,4 +72,4 @@ transport-nostr-adapter = { path = "crates/transport-nostr-adapter" }
 marmot-account = { path = "crates/marmot-account" }
 marmot-lab = { path = "crates/marmot-lab" }
 marmot-app = { path = "crates/marmot-app" }
-darkmatter-cli = { path = "crates/dm" }
+darkmatter-cli = { path = "crates/cli" }

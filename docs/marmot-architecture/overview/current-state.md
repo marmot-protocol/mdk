@@ -83,7 +83,7 @@ This repository now has the main engine candidate:
 - `crates/marmot-app` — first app-core bridge over account home, per-account app projections, shared relay/directory
   cache, relay-list setup, KeyPackage lookup, local development relay support, and app-facing group/message/member
   methods.
-- `crates/dm` — first real CLI app surface over `marmot-app`. It is intentionally product-facing rather than a lab
+- `crates/cli` — first real CLI app surface over `marmot-app`. It is intentionally product-facing rather than a lab
   harness, and its JSON envelope is shaped for future TUI/testing callers.
 - `crates/storage-memory` — in-memory storage and snapshot backend for tests.
 - `crates/storage-sqlite` — SQLCipher-backed SQLite storage for Marmot and custom OpenMLS state, with Rust migrations

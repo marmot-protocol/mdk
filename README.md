@@ -88,7 +88,7 @@ Integration prototypes:
 - `crates/marmot-account` - app-core home, account records, key storage, and transport adapter orchestration.
 - `crates/marmot-app` - first non-lab app runtime bridge used by the CLI, daemon, and TUI.
 - `crates/transport-nostr-adapter` - Nostr transport adapter core behind an injectable relay-client boundary.
-- `crates/dm` - first real CLI app surface plus `dmd` daemon and `dm tui` for Nostr-keyed accounts, keys, chats,
+- `crates/cli` - first real CLI app surface plus `dmd` daemon and `dm tui` for Nostr-keyed accounts, keys, chats,
   groups, messages, and background sync.
 - `crates/marmot-lab` - two-client CLI checks over a file-backed fake relay.
 

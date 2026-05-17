@@ -1,7 +1,7 @@
 ---
 title: "App Core Boundary"
 created: 2026-05-15
-updated: 2026-05-15
+updated: 2026-05-17
 tags: [marmot, app-core, cli, tui, swift]
 status: overview
 ---
@@ -29,7 +29,7 @@ transport activation, routing policy, KeyPackage publication, and publish confir
 discovery, local development relay support, Nostr SDK relay access, group/message records, and the `AppClient` methods
 used by app surfaces.
 
-`crates/dm` owns commands and output. Its JSON envelope is intentionally stable enough for a future TUI or harness, but
+`crates/cli` owns commands and output. Its JSON envelope is intentionally stable enough for a future TUI or harness, but
 Swift and other host apps should prefer app-core bindings over shelling out to the CLI.
 
 ## Stable App Concepts
