@@ -96,6 +96,9 @@ These are longer working documents. Go here when you need depth, not orientation
 - **Doc:** [`../../spec/README.md`](../../spec/README.md)
   - **What it covers:** Marmot v2 protocol draft by stable protocol surface and app component.
 
+- **Doc:** [`../quic-broker-deployment.md`](../quic-broker-deployment.md)
+  - **What it covers:** Local Compose, GHCR image, and VM deployment notes for the memory-only QUIC broker.
+
 - **Doc:** [`further-context/target-architecture.md`](./further-context/target-architecture.md)
   - **What it covers:** Older long-form target architecture with illustrative trait sketches. Current orientation lives
     in `overview/target-architecture.md`.

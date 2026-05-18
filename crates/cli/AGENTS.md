@@ -34,6 +34,7 @@ Command-line app, background daemon, and terminal UI for the Darkmatter/Marmot s
 - `chats`: list, show, archive, and unarchive local chat projections.
 - `group`: create groups, list members, invite/remove members, and update profile fields.
 - `message`: send text messages and list projected messages.
+- `stream`: receive and send provisional QUIC agent text stream previews.
 - `sync`: process relay events for the selected local signing account.
 - `daemon`: start, stop, and inspect `dmd`.
 - `tui`: open the Ratatui interface over the real `dm --json` command surface.

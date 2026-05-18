@@ -9,6 +9,8 @@ members = [
     "crates/cgka-conformance-simulator",
     "crates/transport-nostr-peeler",
     "crates/transport-nostr-adapter",
+    "crates/transport-quic-stream",
+    "crates/transport-quic-broker",
     "crates/marmot-account",
     "crates/marmot-app",
     "crates/cli",
@@ -49,6 +51,10 @@ sha2 = "0.10"
 url = "2"
 chacha20poly1305 = "0.10"
 keyring-core = "1"
+quinn = { version = "0.11", default-features = false, features = ["log", "platform-verifier", "runtime-tokio", "rustls-ring"] }
+rcgen = "0.14"
+rustls = { version = "0.23.40", default-features = false, features = ["ring", "std"] }
+rustls-pemfile = "2"
 nostr = { version = "0.44.2", default-features = false, features = ["std", "nip59"] }
 nostr-sdk = { version = "0.44", features = ["nip59"] }
 nostr-relay-builder = "0.44"
@@ -69,6 +75,8 @@ storage-sqlite = { path = "crates/storage-sqlite" }
 cgka-conformance-simulator = { path = "crates/cgka-conformance-simulator" }
 transport-nostr-peeler = { path = "crates/transport-nostr-peeler" }
 transport-nostr-adapter = { path = "crates/transport-nostr-adapter" }
+transport-quic-stream = { path = "crates/transport-quic-stream" }
+transport-quic-broker = { path = "crates/transport-quic-broker" }
 marmot-account = { path = "crates/marmot-account" }
 marmot-app = { path = "crates/marmot-app" }
 darkmatter-cli = { path = "crates/cli" }

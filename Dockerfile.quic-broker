@@ -1,0 +1,21 @@
+# syntax=docker/dockerfile:1.7
+
+FROM rust:1.90-bookworm AS builder
+
+WORKDIR /workspace
+COPY . .
+RUN cargo build --locked --release -p transport-quic-broker --bin marmot-quic-broker
+
+FROM debian:bookworm-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --system --uid 10001 --home-dir /nonexistent --shell /usr/sbin/nologin marmot
+
+COPY --from=builder /workspace/target/release/marmot-quic-broker /usr/local/bin/marmot-quic-broker
+
+USER marmot
+EXPOSE 4450/udp
+ENTRYPOINT ["marmot-quic-broker"]
+CMD ["--bind", "0.0.0.0:4450"]

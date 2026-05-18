@@ -16,7 +16,9 @@ use cgka_session::{AccountDeviceSession, SessionConfig};
 use cgka_traits::agent_text_stream::{
     AGENT_TEXT_STREAM_QUIC_FANOUT_FEATURE, AGENT_TEXT_STREAM_QUIC_RECEIVE_FEATURE,
     AGENT_TEXT_STREAM_QUIC_SEND_FEATURE, AGENT_TEXT_STREAM_ROLE_FANOUT,
-    AGENT_TEXT_STREAM_ROLE_RECEIVE, AGENT_TEXT_STREAM_ROLE_SEND, AgentTextStreamQuicPolicyV1,
+    AGENT_TEXT_STREAM_ROLE_RECEIVE, AGENT_TEXT_STREAM_ROLE_SEND,
+    AGENT_TEXT_STREAM_ROUTE_BROKERED_QUIC, AGENT_TEXT_STREAM_ROUTE_DIRECT_QUIC,
+    AgentTextStreamQuicPolicyV1,
 };
 use cgka_traits::app_components::{
     AGENT_TEXT_STREAM_QUIC_COMPONENT, AGENT_TEXT_STREAM_QUIC_COMPONENT_ID, AppComponentData,
@@ -394,6 +396,8 @@ pub struct AppAgentTextStreamComponent {
     pub required: bool,
     pub required_member_roles: Vec<String>,
     pub allowed_member_roles: Vec<String>,
+    pub required_route_modes: Vec<String>,
+    pub allowed_route_modes: Vec<String>,
     pub max_plaintext_frame_len: u32,
     pub replay_ttl_secs: u32,
     pub padding_bucket_bytes: u16,
@@ -570,6 +574,8 @@ impl AppAgentTextStreamComponent {
                 required: true,
                 required_member_roles: Vec::new(),
                 allowed_member_roles: Vec::new(),
+                required_route_modes: Vec::new(),
+                allowed_route_modes: Vec::new(),
                 max_plaintext_frame_len: 0,
                 replay_ttl_secs: 0,
                 padding_bucket_bytes: 0,
@@ -585,6 +591,8 @@ impl AppAgentTextStreamComponent {
             required: true,
             required_member_roles: role_names(policy.required_member_roles),
             allowed_member_roles: role_names(policy.allowed_member_roles),
+            required_route_modes: route_mode_names(policy.required_route_modes),
+            allowed_route_modes: route_mode_names(policy.allowed_route_modes),
             max_plaintext_frame_len: policy.max_plaintext_frame_len,
             replay_ttl_secs: policy.replay_ttl_secs,
             padding_bucket_bytes: policy.padding_bucket_bytes,
@@ -599,6 +607,8 @@ impl AppAgentTextStreamComponent {
             required: false,
             required_member_roles: Vec::new(),
             allowed_member_roles: Vec::new(),
+            required_route_modes: Vec::new(),
+            allowed_route_modes: Vec::new(),
             max_plaintext_frame_len: 0,
             replay_ttl_secs: 0,
             padding_bucket_bytes: 0,
@@ -2251,6 +2261,17 @@ fn role_names(mask: u8) -> Vec<String> {
         roles.push("fanout".to_owned());
     }
     roles
+}
+
+fn route_mode_names(mask: u8) -> Vec<String> {
+    let mut modes = Vec::new();
+    if mask & AGENT_TEXT_STREAM_ROUTE_DIRECT_QUIC != 0 {
+        modes.push("direct_quic".to_owned());
+    }
+    if mask & AGENT_TEXT_STREAM_ROUTE_BROKERED_QUIC != 0 {
+        modes.push("brokered_quic".to_owned());
+    }
+    modes
 }
 
 #[derive(Clone)]

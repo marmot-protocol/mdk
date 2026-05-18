@@ -68,7 +68,7 @@ jobs:
         run: cargo test --workspace --locked
 
       - name: Start local relay stack
-        run: docker compose up -d
+        run: docker compose up -d setup nostr-rs-relay strfry-nostr-relay
 
       - name: Wait for local relays
         run: |

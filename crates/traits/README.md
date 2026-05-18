@@ -19,6 +19,8 @@ between engine, peeler, storage, and caller imports from here.
 - All cross-boundary value types: `TransportMessage`, `TransportEnvelope`, `TransportAccountActivation`,
   `TransportPublishRequest`, `TransportDelivery`, `PeeledMessage`, `EncryptedPayload`, `SendIntent`, `SendResult`,
   `AutoPublish`, `GroupEvent`, `PendingStateRef`, `MessageId`, `GroupId`, `MemberId`, `EpochId`, `Group`, `Member`.
+- Agent text stream preview values: thin QUIC policy/component state, brokered/direct route mode bits,
+  length-delimited stream records, transcript hash helpers, and typed start/final app-message payload envelopes.
 
 `AutoPublish` follows the same publish-before-apply contract as explicit group evolution: callers publish the message,
 then confirm or fail the attached `PendingStateRef`.

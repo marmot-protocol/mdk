@@ -1,11 +1,14 @@
 use std::env;
-use std::net::{TcpStream, ToSocketAddrs};
-use std::process::{Child, Command, Output};
-use std::sync::OnceLock;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
+use std::process::{Child, Command, Output, Stdio};
+use std::sync::{OnceLock, mpsc as std_mpsc};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use nostr_relay_builder::MockRelay;
 use serde_json::Value;
+use tokio::sync::oneshot;
+use transport_quic_broker::{DEFAULT_SUBSCRIBER_QUEUE_DEPTH, QuicBrokerConfig, QuicBrokerServer};
 
 const POLL_TIMEOUT: Duration = Duration::from_secs(8);
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -79,18 +82,25 @@ fn json_value_summary(label: &str, value: &Value) -> String {
 }
 
 fn run_json(home: &std::path::Path, args: &[&str]) -> Value {
+    try_run_json(home, args).unwrap_or_else(|failure| panic!("dm failed\n{failure}"))
+}
+
+fn try_run_json(home: &std::path::Path, args: &[&str]) -> Result<Value, String> {
     let output = dm(home)
         .args(args)
         .output()
         .expect("dm command should start");
-    assert!(
-        output.status.success(),
-        "dm failed\nargs={args:?}\n{}",
-        command_output_summary(&output)
-    );
+    if !output.status.success() {
+        return Err(format!(
+            "dm failed\nargs={args:?}\n{}",
+            command_output_summary(&output)
+        ));
+    }
     let value: Value = serde_json::from_slice(&output.stdout).expect("stdout should be JSON");
-    assert_eq!(value["ok"], true);
-    value["result"].clone()
+    if value["ok"] != true {
+        return Err(format!("unexpected json response: {value}"));
+    }
+    Ok(value["result"].clone())
 }
 
 fn run_json_with_relay(home: &std::path::Path, relay: &str, args: &[&str]) -> Value {
@@ -215,6 +225,170 @@ fn assert_no_message_plaintext(value: &Value, unexpected: &str) {
         actual.iter().all(|plaintext| plaintext != unexpected),
         "did not expect message {unexpected:?} in {actual:?}"
     );
+}
+
+fn free_udp_addr() -> String {
+    let socket = UdpSocket::bind("127.0.0.1:0").expect("bind free udp socket");
+    socket.local_addr().expect("local udp addr").to_string()
+}
+
+fn wait_for_udp_listener(addr: &str, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        match UdpSocket::bind(addr) {
+            Ok(socket) => drop(socket),
+            Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => return,
+            Err(err) => panic!("failed to probe udp listener {addr}: {err}"),
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    panic!("udp listener {addr} did not become ready");
+}
+
+fn run_json_until_child_exits(
+    home: &std::path::Path,
+    mut child: Child,
+    timeout: Duration,
+    mut run_command: impl FnMut(&std::path::Path) -> Result<Value, String>,
+) -> (Value, Output) {
+    let deadline = Instant::now() + timeout;
+    let mut last_error = None;
+    let mut command_value = None;
+    while Instant::now() < deadline {
+        if command_value.is_none() {
+            match run_command(home) {
+                Ok(value) => command_value = Some(value),
+                Err(error) => last_error = Some(error),
+            }
+        }
+        if let Some(value) = command_value.take() {
+            if child.try_wait().expect("child status").is_some() {
+                let output = child.wait_with_output().expect("child output");
+                return (value, output);
+            }
+            command_value = Some(value);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let _ = child.kill();
+    let output = child.wait_with_output().expect("killed child output");
+    panic!(
+        "child did not finish after retried command\n{}\nlast_command_error={}",
+        command_output_summary(&output),
+        last_error.as_deref().unwrap_or("<none>")
+    );
+}
+
+#[test]
+fn run_json_until_child_exits_does_not_repeat_successful_command() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let child = Command::new("sh")
+        .args(["-c", "sleep 0.2"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("child should start");
+    let calls = std::cell::Cell::new(0);
+
+    let (value, output) =
+        run_json_until_child_exits(home.path(), child, Duration::from_secs(2), |_| {
+            let next = calls.get() + 1;
+            calls.set(next);
+            assert_eq!(next, 1, "successful command must not be repeated");
+            Ok(serde_json::json!({ "sent": true }))
+        });
+
+    assert_eq!(calls.get(), 1);
+    assert!(output.status.success());
+    assert_eq!(value["sent"], true);
+}
+
+fn run_json_until_success(home: &std::path::Path, args: &[&str], timeout: Duration) -> Value {
+    let deadline = Instant::now() + timeout;
+    let mut last_error = None;
+    while Instant::now() < deadline {
+        match try_run_json(home, args) {
+            Ok(value) => return value,
+            Err(error) => last_error = Some(error),
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!(
+        "dm did not succeed after retries\nlast_command_error={}",
+        last_error.as_deref().unwrap_or("<none>")
+    );
+}
+
+fn wait_child_output_or_panic(child: Child, timeout: Duration, context: &str) -> Output {
+    let output = wait_child_output(child, timeout);
+    assert!(
+        output.status.success(),
+        "{context}\n{}",
+        command_output_summary(&output)
+    );
+    output
+}
+
+struct BrokerHandle {
+    addr: SocketAddr,
+    shutdown: Option<oneshot::Sender<()>>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl Drop for BrokerHandle {
+    fn drop(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn spawn_quic_broker() -> BrokerHandle {
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let (ready_tx, ready_rx) = std_mpsc::channel();
+    let thread = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Runtime::new().expect("broker runtime");
+        runtime.block_on(async {
+            let server = QuicBrokerServer::bind(QuicBrokerConfig {
+                bind_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+                per_subscriber_queue: DEFAULT_SUBSCRIBER_QUEUE_DEPTH,
+                ..QuicBrokerConfig::default()
+            })
+            .expect("broker bind");
+            let addr = server.local_addr().expect("broker addr");
+            ready_tx.send(addr).expect("broker ready signal");
+            server
+                .run_until(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .expect("broker should stop cleanly");
+        });
+    });
+    let addr = ready_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("broker should become ready");
+    BrokerHandle {
+        addr,
+        shutdown: Some(shutdown_tx),
+        thread: Some(thread),
+    }
+}
+
+fn wait_child_output(mut child: Child, timeout: Duration) -> Output {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if child.try_wait().expect("child status").is_some() {
+            return child.wait_with_output().expect("child output");
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let _ = child.kill();
+    let output = child.wait_with_output().expect("killed child output");
+    panic!("child timed out\n{}", command_output_summary(&output));
 }
 
 fn real_relay_urls() -> Vec<String> {
@@ -924,12 +1098,250 @@ fn group_create_includes_agent_text_streams_by_default() {
     );
     assert_eq!(
         created_group["agent_text_stream"]["data_hex"],
-        "010300001000000000000000"
+        "0103020200001000000000000000"
+    );
+    assert_eq!(
+        created_group["agent_text_stream"]["required_route_modes"],
+        serde_json::json!(["brokered_quic"])
     );
 
     sync_until_joined(home.path(), test_relay_url(), &bob, group_id);
     let bob_group = run_json(home.path(), &["--account", &bob, "chats", "show", group_id]);
     assert_eq!(bob_group["group"]["agent_text_stream"]["required"], true);
+}
+
+#[test]
+fn stream_send_and_receive_show_quic_text_content() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let bind = free_udp_addr();
+    let mut receiver = dm(home.path());
+    receiver
+        .args(["stream", "receive", "--bind", &bind])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let receiver = receiver.spawn().expect("stream receiver should start");
+    wait_for_udp_listener(&bind, Duration::from_secs(5));
+
+    let sent = run_json_until_success(
+        home.path(),
+        &[
+            "stream",
+            "send",
+            "--connect",
+            &bind,
+            "--insecure-local",
+            "--chunk-bytes",
+            "5",
+            "hello",
+            "streaming",
+        ],
+        Duration::from_secs(5),
+    );
+    assert_eq!(sent["chunk_count"], 3);
+
+    let output =
+        wait_child_output_or_panic(receiver, Duration::from_secs(5), "stream receiver failed");
+    let value: Value = serde_json::from_slice(&output.stdout).expect("stdout should be JSON");
+    assert_eq!(value["ok"], true);
+    let result = &value["result"];
+    assert_eq!(result["text"], "hello streaming");
+    assert_eq!(result["chunk_count"], 3);
+    assert_eq!(result["chunks"][0]["text"], "hello");
+}
+
+#[test]
+fn stream_send_insecure_local_rejects_remote_endpoints() {
+    let home = tempfile::tempdir().expect("tempdir");
+
+    let error = run_json_error(
+        home.path(),
+        &[
+            "stream",
+            "send",
+            "--connect",
+            "203.0.113.10:4450",
+            "--insecure-local",
+            "hello",
+        ],
+    );
+
+    assert_eq!(error["code"], "insecure_local_requires_loopback");
+
+    let broker_error = run_json_error(
+        home.path(),
+        &[
+            "stream",
+            "send",
+            "--broker",
+            "--connect",
+            "203.0.113.10:4450",
+            "--insecure-local",
+            "hello",
+        ],
+    );
+
+    assert_eq!(broker_error["code"], "insecure_local_requires_loopback");
+}
+
+#[test]
+fn stream_start_quic_chunks_and_final_payload_verify_through_mls_messages() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let broker = spawn_quic_broker();
+
+    let alice = create_account(home.path());
+    let bob = create_account(home.path());
+    run_json(home.path(), &["--account", &bob, "keys", "publish"]);
+    let created_group = run_json(
+        home.path(),
+        &["--account", &alice, "group", "create", "agent", &bob],
+    );
+    let group_id = created_group["group_id"].as_str().expect("group id");
+    run_json(home.path(), &["--account", &bob, "sync"]);
+
+    let stream_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let broker_candidate = format!("quic://127.0.0.1:{}", broker.addr.port());
+    let started = run_json(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "stream",
+            "start",
+            group_id,
+            "--stream-id",
+            stream_id,
+            "--quic-candidate",
+            &broker_candidate,
+        ],
+    );
+    let start_message_id = started["message_ids"][0]
+        .as_str()
+        .expect("start message id");
+
+    let bob_start_sync = run_json(home.path(), &["--account", &bob, "sync"]);
+    assert_eq!(
+        bob_start_sync["messages"][0]["agent_text_stream"]["kind"],
+        "start"
+    );
+    assert_eq!(
+        bob_start_sync["messages"][0]["agent_text_stream"]["stream_id"],
+        stream_id
+    );
+    assert_eq!(
+        bob_start_sync["messages"][0]["agent_text_stream"]["route"],
+        "brokered_quic"
+    );
+    assert_eq!(
+        bob_start_sync["messages"][0]["agent_text_stream"]["quic_candidates"],
+        serde_json::json!([broker_candidate])
+    );
+
+    let mut watcher = dm(home.path());
+    watcher
+        .args([
+            "--account",
+            &bob,
+            "stream",
+            "watch",
+            group_id,
+            "--stream-id",
+            stream_id,
+            "--insecure-local",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let watcher = watcher.spawn().expect("stream watcher should start");
+    let broker_addr = broker.addr.to_string();
+    let (sent, output) =
+        run_json_until_child_exits(home.path(), watcher, Duration::from_secs(15), |home| {
+            try_run_json(
+                home,
+                &[
+                    "stream",
+                    "send",
+                    "--broker",
+                    "--connect",
+                    &broker_addr,
+                    "--server-name",
+                    "localhost",
+                    "--insecure-local",
+                    "--stream-id",
+                    stream_id,
+                    "--start-event-id",
+                    start_message_id,
+                    "--chunk-bytes",
+                    "5",
+                    "--chunk-delay-ms",
+                    "25",
+                    "hello",
+                    "anchored",
+                    "stream",
+                ],
+            )
+        });
+    assert_eq!(sent["brokered"], true);
+    assert!(
+        output.status.success(),
+        "stream watcher failed\n{}",
+        command_output_summary(&output)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).expect("stdout should be JSON");
+    assert_eq!(value["ok"], true);
+    let received = &value["result"];
+    assert_eq!(received["brokered"], true);
+    assert_eq!(received["stream_id"], stream_id);
+    assert_eq!(received["text"], "hello anchored stream");
+    assert_eq!(received["transcript_hash"], sent["transcript_hash"]);
+
+    let finished = run_json(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "stream",
+            "finish",
+            group_id,
+            "--stream-id",
+            stream_id,
+            "--transcript-hash",
+            sent["transcript_hash"].as_str().expect("transcript hash"),
+            "--chunk-count",
+            &sent["chunk_count"].to_string(),
+            "hello",
+            "anchored",
+            "stream",
+        ],
+    );
+    assert_eq!(finished["agent_text_stream"]["kind"], "final");
+
+    let bob_final_sync = run_json(home.path(), &["--account", &bob, "sync"]);
+    assert_eq!(
+        bob_final_sync["messages"][0]["agent_text_stream"]["kind"],
+        "final"
+    );
+    assert_eq!(
+        bob_final_sync["messages"][0]["agent_text_stream"]["transcript_hash"],
+        sent["transcript_hash"]
+    );
+
+    let verified = run_json(
+        home.path(),
+        &[
+            "--account",
+            &bob,
+            "stream",
+            "verify",
+            group_id,
+            "--stream-id",
+            stream_id,
+            "--transcript-hash",
+            received["transcript_hash"].as_str().expect("received hash"),
+            "--chunk-count",
+            &received["chunk_count"].to_string(),
+        ],
+    );
+    assert_eq!(verified["verified"], true);
+    assert_eq!(verified["final_message"]["stream_id"], stream_id);
 }
 
 #[test]

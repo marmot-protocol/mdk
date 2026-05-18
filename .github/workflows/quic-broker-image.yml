@@ -1,0 +1,65 @@
+name: QUIC Broker Image
+
+on:
+  pull_request:
+    paths:
+      - Dockerfile.quic-broker
+      - Cargo.lock
+      - Cargo.toml
+      - crates/traits/**
+      - crates/transport-quic-stream/**
+      - crates/transport-quic-broker/**
+      - .github/workflows/quic-broker-image.yml
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: quic-broker-image-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  image:
+    name: Build broker image
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Set image name
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "IMAGE_NAME=ghcr.io/${GITHUB_REPOSITORY,,}/marmot-quic-broker" >> "$GITHUB_ENV"
+
+      - name: Build image
+        run: docker build -f Dockerfile.quic-broker -t "$IMAGE_NAME:ci" .
+
+      - name: Smoke test image
+        run: docker run --rm "$IMAGE_NAME:ci" --help
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: echo "$GITHUB_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+
+      - name: Push image
+        if: github.event_name != 'pull_request'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha_tag="sha-${GITHUB_SHA::12}"
+          docker tag "$IMAGE_NAME:ci" "$IMAGE_NAME:$sha_tag"
+          docker push "$IMAGE_NAME:$sha_tag"
+          if [[ "$GITHUB_REF" == "refs/heads/master" ]]; then
+            docker tag "$IMAGE_NAME:ci" "$IMAGE_NAME:latest"
+            docker push "$IMAGE_NAME:latest"
+          fi

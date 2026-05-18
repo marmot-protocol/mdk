@@ -1,0 +1,6 @@
+.git
+.github
+target
+dev/data
+.DS_Store
+*.log

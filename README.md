@@ -81,6 +81,10 @@ Engine support:
 - `crates/storage-memory` - in-memory storage for tests and simulator runs.
 - `crates/storage-sqlite` - SQLCipher-backed persistence for session and engine integration.
 - `crates/transport-nostr-peeler` - Nostr event to engine-message boundary and MLS envelope peeling.
+- `crates/transport-quic-stream` - raw QUIC transport binding for transient agent text stream previews tied to
+  durable MLS start/final messages.
+- `crates/transport-quic-broker` - memory-only QUIC pub/sub broker for forwarding live preview records.
+- `docs/quic-broker-deployment.md` - local Compose and GHCR/VM deployment notes for `marmot-quic-broker`.
 
 Integration prototypes:
 

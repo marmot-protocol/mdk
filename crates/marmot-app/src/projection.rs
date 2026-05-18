@@ -568,7 +568,7 @@ mod tests {
             AppGroupAdminPolicyComponent::new(Vec::new()),
         );
         group.agent_text_stream = AppAgentTextStreamComponent::from_bytes(&[
-            0x01, 0x03, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x01, 0x03, 0x02, 0x02, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         ]);
         let state = AccountState {
             label: "alice".to_owned(),
@@ -582,7 +582,7 @@ mod tests {
         assert!(restored.groups[0].agent_text_stream.required);
         assert_eq!(
             restored.groups[0].agent_text_stream.data_hex,
-            "010300001000000000000000"
+            "0103020200001000000000000000"
         );
     }
 

@@ -37,3 +37,13 @@ services:
     depends_on:
       setup:
         condition: service_completed_successfully
+
+  quic-broker:
+    image: marmot-quic-broker:local
+    build:
+      context: .
+      dockerfile: Dockerfile.quic-broker
+    ports:
+      - "127.0.0.1:4450:4450/udp"
+    restart: unless-stopped
+    command: ["--bind", "0.0.0.0:4450"]

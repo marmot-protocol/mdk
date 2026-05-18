@@ -82,8 +82,16 @@ async fn relay_app_runtime_creates_default_agent_text_stream_group() {
         vec!["receive".to_owned(), "send".to_owned()]
     );
     assert_eq!(
+        alice_group.agent_text_stream.required_route_modes,
+        vec!["brokered_quic".to_owned()]
+    );
+    assert_eq!(
+        alice_group.agent_text_stream.allowed_route_modes,
+        vec!["brokered_quic".to_owned()]
+    );
+    assert_eq!(
         alice_group.agent_text_stream.data_hex,
-        "010300001000000000000000"
+        "0103020200001000000000000000"
     );
 
     bob.sync().await.unwrap();

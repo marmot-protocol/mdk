@@ -1,0 +1,27 @@
+[package]
+name = "transport-quic-broker"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "marmot-quic-broker"
+path = "src/bin/marmot-quic-broker.rs"
+
+[dependencies]
+cgka-traits.workspace = true
+clap.workspace = true
+hex.workspace = true
+quinn.workspace = true
+rcgen.workspace = true
+rustls.workspace = true
+rustls-pemfile.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["net", "signal", "sync", "time"] }
+transport-quic-stream.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -151,6 +151,31 @@ dm --account <npub-or-hex> message list
 dm --account <npub-or-hex> message list --group <group-hex> --limit 20
 ```
 
+Agent text stream preview commands:
+
+```sh
+marmot-quic-broker --bind 127.0.0.1:4450
+dm --account <npub-or-hex> stream start <group-hex> \
+  --stream-id <stream-hex> --quic-candidate quic://127.0.0.1:4450
+dm --account <npub-or-hex> stream watch <group-hex> --stream-id <stream-hex> --insecure-local
+dm stream send --broker --connect 127.0.0.1:4450 --insecure-local \
+  --stream-id <stream-hex> --start-event-id <start-message-id-hex> "hello over quic"
+dm stream send --connect <host:port> --server-name <dns-name> "hello over quic"
+dm --account <npub-or-hex> stream finish <group-hex> \
+  --stream-id <stream-hex> --transcript-hash <hash-hex> --chunk-count <n> "hello over quic"
+dm --account <npub-or-hex> stream verify <group-hex> \
+  --stream-id <stream-hex> --transcript-hash <hash-hex> --chunk-count <n>
+```
+
+`stream start` and `stream finish` send typed payloads through the normal encrypted Marmot message path. Brokered
+starts include concrete `quic://host:port` candidates for that stream. `stream watch` reads the durable start payload,
+subscribes to the broker candidate, and prints the provisional text preview plus transcript hash. `stream send --broker`
+publishes ordered `TextDelta` records through the memory-only broker. Without `--broker`, `stream send` still connects
+directly to a peer receiver, which is useful with `dm stream receive --bind 127.0.0.1:4450` for local transport probes.
+`stream verify` compares a received QUIC transcript hash and chunk count against the latest durable final payload for the
+same stream id. QUIC chunks are transient preview data; normal Marmot messages remain the durable group history. Use
+`--insecure-local` only for loopback development with generated self-signed certificates.
+
 Sync command:
 
 ```sh
