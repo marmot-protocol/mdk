@@ -1078,6 +1078,15 @@ impl Mdk {
         admins: Vec<String>,
         disappearing_message_secs: Option<u64>,
     ) -> Result<CreateGroupResult, MdkUniffiError> {
+        // Surface `Some(0)` as a parameter error at the FFI boundary so callers
+        // pattern-match on `InvalidInput` rather than the catch-all `Mdk` variant
+        // that the `From<MdkError>` impl would otherwise produce.
+        if disappearing_message_secs == Some(0) {
+            return Err(MdkUniffiError::InvalidInput(
+                "disappearing_message_secs must be > 0; use None to disable".to_string(),
+            ));
+        }
+
         let creator_pubkey = parse_public_key(&creator_public_key)?;
         let relay_urls = parse_relay_urls(&relays)?;
         let admin_pubkeys: Vec<PublicKey> = admins
@@ -1283,6 +1292,15 @@ impl Mdk {
         mls_group_id: String,
         update: GroupDataUpdate,
     ) -> Result<UpdateGroupResult, MdkUniffiError> {
+        // `Some(Some(0))` means "set duration to zero", which the core rejects.
+        // Pre-check so callers see `InvalidInput` (matching the documented contract)
+        // instead of the generic `Mdk` variant produced by `From<MdkError>`.
+        if update.disappearing_message_secs == Some(Some(0)) {
+            return Err(MdkUniffiError::InvalidInput(
+                "disappearing_message_secs must be > 0; use Some(None) to disable".to_string(),
+            ));
+        }
+
         let group_id = parse_group_id(&mls_group_id)?;
 
         let mut group_update = NostrGroupDataUpdate::new();
@@ -3702,6 +3720,23 @@ mod tests {
     }
 
     #[test]
+    fn test_create_group_disappearing_secs_zero_rejected() {
+        let mdk = create_test_mdk();
+        let creator_keys = Keys::generate();
+        let creator_pubkey_hex = creator_keys.public_key().to_hex();
+        let result = mdk.create_group(
+            creator_pubkey_hex.clone(),
+            vec![],
+            "Test".to_string(),
+            "Test".to_string(),
+            vec!["wss://relay.example.com".to_string()],
+            vec![creator_pubkey_hex],
+            Some(0),
+        );
+        assert!(matches!(result, Err(MdkUniffiError::InvalidInput(_))));
+    }
+
+    #[test]
     fn test_add_members_invalid_group_id() {
         let mdk = create_test_mdk();
         let invalid_group_id = "not_valid_hex".to_string();
@@ -3888,6 +3923,24 @@ mod tests {
             relays: Some(vec!["not_a_valid_url".to_string()]),
             admins: None,
             disappearing_message_secs: None,
+        };
+        let result = mdk.update_group_data(fake_group_id, update);
+        assert!(matches!(result, Err(MdkUniffiError::InvalidInput(_))));
+    }
+
+    #[test]
+    fn test_update_group_data_disappearing_secs_zero_rejected() {
+        let mdk = create_test_mdk();
+        let fake_group_id = hex::encode([0u8; 32]);
+        let update = GroupDataUpdate {
+            name: None,
+            description: None,
+            image_hash: None,
+            image_key: None,
+            image_nonce: None,
+            relays: None,
+            admins: None,
+            disappearing_message_secs: Some(Some(0)),
         };
         let result = mdk.update_group_data(fake_group_id, update);
         assert!(matches!(result, Err(MdkUniffiError::InvalidInput(_))));
