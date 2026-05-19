@@ -44,7 +44,19 @@ where
         group: &mut MlsGroup,
         message_bytes: &[u8],
     ) -> Result<ProcessedMessage> {
-        let mls_message = MlsMessageIn::tls_deserialize_exact(message_bytes)?;
+        // Use non-strict deserialization so trailing zero-padding bytes added
+        // by the sender (see `crate::padding`) are silently ignored. The TLS
+        // length-prefixed framing means the decoder reads exactly the MLS
+        // message and leaves the cursor at the start of any padding. Enforce
+        // that the trailing bytes are zero-only so the padding region cannot
+        // be used as a covert channel for unencrypted data.
+        let mut cursor = message_bytes;
+        let mls_message = MlsMessageIn::tls_deserialize(&mut cursor)?;
+        if cursor.iter().any(|&b| b != 0) {
+            return Err(Error::Message(
+                "Malformed message content: non-zero bytes in padding region".to_string(),
+            ));
+        }
         let protocol_message = mls_message.try_into_protocol_message()?;
 
         // Return error if group ID doesn't match
