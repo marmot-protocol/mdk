@@ -33,10 +33,24 @@ pub(crate) const MESSAGE_PADDING_FLOOR: usize = 512;
 /// Minimum bucket size for the Welcome rumor payload (raw MLS bytes, before
 /// base64 encoding and NIP-59 gift wrapping).
 ///
-/// Welcomes always carry the full ratchet tree, so they are inherently larger
-/// than chat messages; a higher floor keeps tiny groups indistinguishable from
-/// each other.
-pub(crate) const WELCOME_PADDING_FLOOR: usize = 1024;
+/// Welcomes carry the full ratchet tree + per-recipient HPKE-encrypted
+/// GroupSecrets, so their serialized size scales with member count. For the
+/// only ciphersuite MDK supports today
+/// (`MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519`), the raw welcome grows by
+/// roughly 365 bytes per added member, with small +68 bumps when the ratchet
+/// tree depth grows (added member counts 2, 4, 8, 16, …). At 8192 bytes the
+/// floor absorbs every welcome up to and including a 20-member group
+/// (19 added members + 1 creator); the next padded bucket (16384) covers
+/// roughly 21–38 member groups. Anything below this floor — most importantly
+/// 1-on-1 DMs and small group chats — is bucketed identically, so a relay
+/// observing kind:1059 gift-wrap sizes cannot distinguish a DM from a small
+/// team chat.
+///
+/// To re-measure (e.g. after an OpenMLS bump), run:
+/// `cargo test -p mdk-core measure_welcome_rumor_sizes -- --ignored --nocapture`
+///
+/// Guards marmot-security issue #33 (Welcome size leaks group size).
+pub(crate) const WELCOME_PADDING_FLOOR: usize = 8192;
 
 /// Returns the smallest power-of-two bucket that fits `len` bytes and is at
 /// least `floor` bytes wide.
@@ -97,10 +111,11 @@ mod tests {
 
     #[test]
     fn welcome_floor_buckets() {
-        assert_eq!(bucket_for_len(0, WELCOME_PADDING_FLOOR), 1024);
-        assert_eq!(bucket_for_len(1024, WELCOME_PADDING_FLOOR), 1024);
-        assert_eq!(bucket_for_len(1025, WELCOME_PADDING_FLOOR), 2048);
-        assert_eq!(bucket_for_len(4097, WELCOME_PADDING_FLOOR), 8192);
+        assert_eq!(bucket_for_len(0, WELCOME_PADDING_FLOOR), 8192);
+        assert_eq!(bucket_for_len(1024, WELCOME_PADDING_FLOOR), 8192);
+        assert_eq!(bucket_for_len(8192, WELCOME_PADDING_FLOOR), 8192);
+        assert_eq!(bucket_for_len(8193, WELCOME_PADDING_FLOOR), 16384);
+        assert_eq!(bucket_for_len(16385, WELCOME_PADDING_FLOOR), 32768);
     }
 
     #[test]

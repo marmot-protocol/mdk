@@ -9100,17 +9100,39 @@ mod tests {
             );
         }
 
-        /// Welcome rumors for different small groups must share a padding
-        /// bucket so a relay cannot estimate the group's member count from
-        /// the kind:1059 gift-wrap size. Guards issue #33.
+        /// Welcome rumors for groups within the floor's coverage must share a
+        /// padding bucket so a relay cannot estimate member count from the
+        /// kind:1059 gift-wrap size. Guards issue #33.
+        ///
+        /// The floor (`WELCOME_PADDING_FLOOR = 8192`) was chosen from a
+        /// measurement sweep over MDK's only supported ciphersuite
+        /// (`MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519`): raw welcome size
+        /// is ~1085 bytes at 1 added member and grows ~365 bytes per added
+        /// member, with the 8192-byte bucket boundary crossed between 19 and
+        /// 20 added members. This test pins both halves of that boundary:
+        ///
+        /// * 1, 5, 10, 15, 19 added members must all share the 8192 bucket
+        ///   (anti-fingerprinting property).
+        /// * 20 added members must jump to the 16384 bucket — this is the
+        ///   loud-failure tripwire: if OpenMLS bloats the welcome (e.g. wider
+        ///   credentials, extra extensions, a different ciphersuite), the
+        ///   boundary slides down and this assertion fires, prompting a
+        ///   re-measurement and a floor re-decision rather than a silent
+        ///   privacy regression.
+        ///
+        /// Re-run the measurement diagnostic with:
+        /// `cargo test -p mdk-core measure_welcome_rumor_sizes -- --ignored --nocapture`
         #[test]
         fn test_welcome_rumor_size_is_bucketed_for_small_groups() {
-            fn welcome_decoded_len(mdk: &MDK<MdkMemoryStorage>, member_count: usize) -> usize {
+            fn welcome_decoded_len(member_count: usize) -> usize {
+                // Fresh MDK per call: signer/key-package state from earlier
+                // groups must not perturb the welcome serialization.
+                let mdk = create_test_mdk();
                 let creator = Keys::generate();
                 let mut key_packages = Vec::new();
                 for _ in 0..member_count {
                     let member = Keys::generate();
-                    key_packages.push(create_key_package_event(mdk, &member));
+                    key_packages.push(create_key_package_event(&mdk, &member));
                 }
                 let result = mdk
                     .create_group(
@@ -9126,26 +9148,152 @@ mod tests {
                     .len()
             }
 
-            let mdk = create_test_mdk();
-            let small = welcome_decoded_len(&mdk, 1);
-            let medium = welcome_decoded_len(&mdk, 3);
+            // In-floor cohort: every welcome here MUST land in the 8192 bucket.
+            let in_floor_sizes = [1usize, 5, 10, 15, 19];
+            let in_floor_lens: Vec<(usize, usize)> = in_floor_sizes
+                .iter()
+                .map(|&n| (n, welcome_decoded_len(n)))
+                .collect();
 
+            for &(n, len) in &in_floor_lens {
+                assert_eq!(
+                    len, WELCOME_PADDING_FLOOR,
+                    "welcome for N={n} added members must occupy the floor bucket \
+                     ({floor} bytes), got {len}. Either OpenMLS welcome size shifted \
+                     or the floor needs re-measurement.",
+                    floor = WELCOME_PADDING_FLOOR
+                );
+            }
+
+            // All in-floor welcomes share a single bucket → indistinguishable.
+            let unique_in_floor: std::collections::BTreeSet<usize> =
+                in_floor_lens.iter().map(|&(_, l)| l).collect();
             assert_eq!(
-                small, medium,
-                "welcomes for small groups (1 vs 3 members) must share a padding \
-                 bucket (small={small}, medium={medium}) — otherwise relays can \
-                 estimate group size from the gift-wrap event length"
+                unique_in_floor.len(),
+                1,
+                "welcomes for in-floor group sizes must all share one bucket; \
+                 saw distinct sizes {:?}. Relay observers could distinguish these.",
+                in_floor_lens
             );
-            assert!(
-                small >= WELCOME_PADDING_FLOOR,
-                "padded welcome must be at least the welcome floor ({} bytes), got {}",
-                WELCOME_PADDING_FLOOR,
-                small
+
+            // Boundary tripwire: one member past the in-floor cohort must
+            // promote to the next bucket. If this fires *upward* (welcome
+            // shrinks), great — bump the in-floor cohort. If it fires
+            // *downward* (boundary slid in), the floor is leaking privacy
+            // for groups it used to cover; re-measure and revisit.
+            let breakpoint_len = welcome_decoded_len(20);
+            assert_eq!(
+                breakpoint_len,
+                WELCOME_PADDING_FLOOR * 2,
+                "welcome at N=20 must occupy the next bucket ({} bytes), got {}. \
+                 The 8192 floor's coverage window has shifted — re-run the \
+                 measurement diagnostic and adjust WELCOME_PADDING_FLOOR or the \
+                 in-floor cohort accordingly.",
+                WELCOME_PADDING_FLOOR * 2,
+                breakpoint_len
             );
-            assert!(
-                small.is_power_of_two(),
-                "padded welcome length must be a power-of-two bucket, got {small}"
+        }
+
+        /// Measurement (not a property test): sweep group size and report the
+        /// *unpadded* serialized Welcome length so we can pick
+        /// `WELCOME_PADDING_FLOOR` from data instead of guessing.
+        ///
+        /// The padded buffer contains exactly one `MlsMessageIn` followed by
+        /// zero padding; `tls_deserialize` advances the cursor by exactly the
+        /// framed length, so `padded.len() - remaining.len()` is the raw
+        /// welcome size. Run with:
+        ///
+        ///   cargo test -p mdk-core measure_welcome_rumor_sizes -- --nocapture
+        #[test]
+        #[ignore = "diagnostic: prints a size table, run manually with --nocapture"]
+        fn measure_welcome_rumor_sizes_across_group_sizes() {
+            use openmls::prelude::MlsMessageIn;
+            use tls_codec::Deserialize as TlsDeserialize;
+
+            fn welcome_raw_len(member_count: usize) -> usize {
+                // Fresh MDK per iteration so signer/key-package storage from
+                // earlier rounds doesn't perturb the serialized welcome size.
+                let mdk = create_test_mdk();
+                let creator = Keys::generate();
+                let mut key_packages = Vec::new();
+                for _ in 0..member_count {
+                    let member = Keys::generate();
+                    key_packages.push(create_key_package_event(&mdk, &member));
+                }
+                let result = mdk
+                    .create_group(
+                        &creator.public_key(),
+                        key_packages,
+                        create_nostr_group_config_data(vec![creator.public_key()]),
+                    )
+                    .expect("group creates");
+                let welcome = &result.welcome_rumors[0];
+                let padded = BASE64
+                    .decode(&welcome.content)
+                    .expect("welcome content is base64");
+                let total = padded.len();
+                let mut cursor: &[u8] = &padded;
+                MlsMessageIn::tls_deserialize(&mut cursor)
+                    .expect("padded welcome must contain a deserializable MlsMessage prefix");
+                total - cursor.len()
+            }
+
+            fn bucket_for(raw: usize, floor: usize) -> usize {
+                if raw <= floor {
+                    floor
+                } else {
+                    raw.next_power_of_two()
+                }
+            }
+
+            let sizes: &[usize] = &[
+                1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 15, 16, 17, 18, 19, 20, 30, 50, 75, 100,
+            ];
+
+            println!();
+            println!("=== Welcome rumor size by group member count (added members, +1 creator) ===");
+            println!(
+                "{:>5} | {:>7} | {:>8} | {:>8} | {:>8} | {:>8}",
+                "N", "raw", "Δ/N-1", "floor=1k", "floor=4k", "floor=8k"
             );
+            println!("{}", "-".repeat(62));
+
+            let mut prev_raw: Option<usize> = None;
+            let mut samples: Vec<(usize, usize)> = Vec::new();
+            for &n in sizes {
+                let raw = welcome_raw_len(n);
+                let b1k = bucket_for(raw, 1024);
+                let b4k = bucket_for(raw, 4096);
+                let b8k = bucket_for(raw, 8192);
+                let per_member = match prev_raw {
+                    Some(p) if n > 1 => format!("{:+}", raw as i64 - p as i64),
+                    _ => "—".to_string(),
+                };
+                println!(
+                    "{:>5} | {:>7} | {:>8} | {:>8} | {:>8} | {:>8}",
+                    n, raw, per_member, b1k, b4k, b8k
+                );
+                prev_raw = Some(raw);
+                samples.push((n, raw));
+            }
+
+            // Boundary report: for each candidate floor, find the largest N
+            // whose welcome still fits in that floor's first bucket.
+            println!();
+            println!("=== First bucket bleed-over by candidate floor ===");
+            for floor in [1024usize, 2048, 4096, 8192, 16384] {
+                let mut last_in_floor = 0usize;
+                for &(n, raw) in &samples {
+                    if raw <= floor {
+                        last_in_floor = n;
+                    }
+                }
+                println!(
+                    "floor={:>5} bytes: groups with N ≤ {} share the first bucket",
+                    floor, last_in_floor
+                );
+            }
+            println!();
         }
 
         /// Trailing bytes after the MLS Welcome framing MUST be zero. A
