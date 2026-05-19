@@ -9377,16 +9377,24 @@ mod tests {
             let err = joiner_bad
                 .process_welcome(&nostr::EventId::all_zeros(), &bad_rumor)
                 .expect_err("non-zero padding must be rejected");
-            // process_welcome wraps preview errors in Error::Welcome(String);
-            // match either the unwrapped or the wrapped form.
+            // process_welcome wraps preview errors in Error::Welcome(String).
+            // Accept any of:
+            //   * unwrapped Error::InvalidWelcomeMessage (if no sanitizer runs)
+            //   * Welcome-wrapped Debug form ("InvalidWelcomeMessage" in msg)
+            //   * Sanitized welcome-failure category ("welcome_parse_failed"),
+            //     introduced by the security hardening on master in #307. The
+            //     branch may be tested standalone or merged with master in CI,
+            //     so we accept both forms.
             let surfaces_invalid = match &err {
                 Error::InvalidWelcomeMessage => true,
-                Error::Welcome(msg) => msg.contains("InvalidWelcomeMessage"),
+                Error::Welcome(msg) => {
+                    msg.contains("InvalidWelcomeMessage") || msg.contains("welcome_parse_failed")
+                }
                 _ => false,
             };
             assert!(
                 surfaces_invalid,
-                "expected InvalidWelcomeMessage (or Welcome-wrapped form), got: {err:?}"
+                "expected InvalidWelcomeMessage (or Welcome-wrapped / sanitized form), got: {err:?}"
             );
         }
     }
