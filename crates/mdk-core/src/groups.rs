@@ -9157,7 +9157,8 @@ mod tests {
 
             for &(n, len) in &in_floor_lens {
                 assert_eq!(
-                    len, WELCOME_PADDING_FLOOR,
+                    len,
+                    WELCOME_PADDING_FLOOR,
                     "welcome for N={n} added members must occupy the floor bucket \
                      ({floor} bytes), got {len}. Either OpenMLS welcome size shifted \
                      or the floor needs re-measurement.",
@@ -9251,7 +9252,9 @@ mod tests {
             ];
 
             println!();
-            println!("=== Welcome rumor size by group member count (added members, +1 creator) ===");
+            println!(
+                "=== Welcome rumor size by group member count (added members, +1 creator) ==="
+            );
             println!(
                 "{:>5} | {:>7} | {:>8} | {:>8} | {:>8} | {:>8}",
                 "N", "raw", "Δ/N-1", "floor=1k", "floor=4k", "floor=8k"
