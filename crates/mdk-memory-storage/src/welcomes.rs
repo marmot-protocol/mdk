@@ -1,5 +1,6 @@
 //! Memory-based storage implementation of the MdkStorageProvider trait for MDK welcomes
 
+use mdk_storage_traits::truncate_failure_reason;
 use mdk_storage_traits::welcomes::error::WelcomeError;
 use mdk_storage_traits::welcomes::types::*;
 use mdk_storage_traits::welcomes::validation::validate_welcome_fields;
@@ -124,8 +125,11 @@ impl WelcomeStorage for MdkMemoryStorage {
 
     fn save_processed_welcome(
         &self,
-        processed_welcome: ProcessedWelcome,
+        mut processed_welcome: ProcessedWelcome,
     ) -> Result<(), WelcomeError> {
+        processed_welcome.failure_reason =
+            truncate_failure_reason(processed_welcome.failure_reason);
+
         let mut inner = self.inner.write();
         // Capture the wrapper -> group association from the just-saved welcome
         // so delete_group can still scrub this processed_welcomes entry after

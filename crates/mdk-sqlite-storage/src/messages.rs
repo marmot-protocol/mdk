@@ -3,6 +3,7 @@
 use mdk_storage_traits::messages::MessageStorage;
 use mdk_storage_traits::messages::error::MessageError;
 use mdk_storage_traits::messages::types::{Message, ProcessedMessage};
+use mdk_storage_traits::truncate_failure_reason;
 use nostr::{EventId, JsonUtil};
 use rusqlite::{OptionalExtension, params};
 
@@ -97,8 +98,11 @@ impl MessageStorage for MdkSqliteStorage {
 
     fn save_processed_message(
         &self,
-        processed_message: ProcessedMessage,
+        mut processed_message: ProcessedMessage,
     ) -> Result<(), MessageError> {
+        processed_message.failure_reason =
+            truncate_failure_reason(processed_message.failure_reason);
+
         // Convert message_event_id to bytes if it exists
         let message_event_id = processed_message
             .message_event_id

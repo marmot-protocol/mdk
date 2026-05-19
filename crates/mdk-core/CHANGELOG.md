@@ -45,6 +45,7 @@
 - Verified unsigned application-message rumor IDs before accepting or sending them, preventing caller-supplied IDs from being trusted when they do not match the canonical event hash. ([#287](https://github.com/marmot-protocol/mdk/pull/287))
 - Fixed `mdk-core` crates.io package verification against OpenMLS 0.8.1 by using a temporary exported-ratchet-tree compatibility shim until crates.io OpenMLS exposes the upstream full-leaf iterator. ([#273](https://github.com/marmot-protocol/mdk/pull/273))
 - Updated `MDK::delete_group` docstring to list welcome and processed welcome records, matching the storage backends now that processed-welcome scrubbing is wired into both backends. Closes [marmot-protocol/marmot-security#68](https://github.com/marmot-protocol/marmot-security/issues/68). ([#293](https://github.com/marmot-protocol/mdk/pull/293))
+- Replaced raw `{:?}`-formatted debug strings on the welcome path with stable, sanitized category strings (`missing_encoding_tag`, `welcome_decode_failed`, `welcome_parse_failed`) so persistent failure records and logs no longer leak internal state or privacy-sensitive identifiers derived from untrusted welcome content. Matches the sanitized-category pattern already used on the message path. Closes [marmot-protocol/marmot-security#6](https://github.com/marmot-protocol/marmot-security/issues/6). ([#307](https://github.com/marmot-protocol/mdk/pull/307))
 
 ### Removed
 

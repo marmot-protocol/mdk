@@ -14,6 +14,22 @@ use crate::error::Error;
 use crate::extension::NostrGroupDataExtension;
 use crate::util::{ContentEncoding, decode_content};
 
+/// Stable, sanitized failure categories used when recording a failed welcome.
+///
+/// These strings are persisted to storage and surfaced in logs and in
+/// [`Error::WelcomePreviouslyFailed`]. They intentionally do not include the
+/// underlying error (which is derived from untrusted welcome content) so that
+/// internal state and privacy-sensitive identifiers cannot leak through
+/// failure records.
+mod welcome_failure {
+    /// The welcome event was missing its required `encoding` tag.
+    pub const MISSING_ENCODING_TAG: &str = "missing_encoding_tag";
+    /// The welcome event content could not be decoded with the declared encoding.
+    pub const DECODE_FAILED: &str = "welcome_decode_failed";
+    /// The decoded welcome could not be parsed as a valid MLS staged welcome.
+    pub const PARSE_FAILED: &str = "welcome_parse_failed";
+}
+
 /// Welcome preview
 #[derive(Debug)]
 pub struct WelcomePreview {
@@ -450,26 +466,11 @@ where
         let encoding = match ContentEncoding::from_tags(welcome_event.tags.iter()) {
             Some(enc) => enc,
             None => {
-                let error_string = "Missing required encoding tag".to_string();
-                let processed_welcome = welcome_types::ProcessedWelcome {
-                    wrapper_event_id: *wrapper_event_id,
-                    welcome_event_id: welcome_event.id,
-                    processed_at: Timestamp::now(),
-                    state: welcome_types::ProcessedWelcomeState::Failed,
-                    failure_reason: Some(error_string.clone()),
-                };
-
-                self.storage()
-                    .save_processed_welcome(processed_welcome)
-                    .map_err(|e| Error::Welcome(e.to_string()))?;
-
-                tracing::error!(
-                    target: "mdk_core::welcomes::process_welcome",
-                    "Error processing welcome: {}",
-                    error_string
-                );
-
-                return Err(Error::Welcome(error_string));
+                return Err(self.record_welcome_failure(
+                    wrapper_event_id,
+                    welcome_event.id,
+                    welcome_failure::MISSING_ENCODING_TAG,
+                )?);
             }
         };
 
@@ -481,27 +482,12 @@ where
                 );
                 content
             }
-            Err(e) => {
-                let error_string = format!(
-                    "Error decoding welcome event content ({}): {:?}",
-                    encoding.as_tag_value(),
-                    e
-                );
-                let processed_welcome = welcome_types::ProcessedWelcome {
-                    wrapper_event_id: *wrapper_event_id,
-                    welcome_event_id: welcome_event.id,
-                    processed_at: Timestamp::now(),
-                    state: welcome_types::ProcessedWelcomeState::Failed,
-                    failure_reason: Some(error_string.clone()),
-                };
-
-                self.storage()
-                    .save_processed_welcome(processed_welcome)
-                    .map_err(|e| Error::Welcome(e.to_string()))?;
-
-                tracing::error!(target: "mdk_core::welcomes::process_welcome", "Error processing welcome: {}", error_string);
-
-                return Err(Error::Welcome(error_string));
+            Err(_e) => {
+                return Err(self.record_welcome_failure(
+                    wrapper_event_id,
+                    welcome_event.id,
+                    welcome_failure::DECODE_FAILED,
+                )?);
             }
         };
 
@@ -510,27 +496,54 @@ where
                 staged_welcome,
                 nostr_group_data,
             },
-            Err(e) => {
-                let error_string = format!("Error previewing welcome: {:?}", e);
-                let processed_welcome = welcome_types::ProcessedWelcome {
-                    wrapper_event_id: *wrapper_event_id,
-                    welcome_event_id: welcome_event.id,
-                    processed_at: Timestamp::now(),
-                    state: welcome_types::ProcessedWelcomeState::Failed,
-                    failure_reason: Some(error_string.clone()),
-                };
-
-                self.storage()
-                    .save_processed_welcome(processed_welcome)
-                    .map_err(|e| Error::Welcome(e.to_string()))?;
-
-                tracing::error!(target: "mdk_core::welcomes::process_welcome", "Error processing welcome: {}", error_string);
-
-                return Err(Error::Welcome(error_string));
+            Err(_e) => {
+                return Err(self.record_welcome_failure(
+                    wrapper_event_id,
+                    welcome_event.id,
+                    welcome_failure::PARSE_FAILED,
+                )?);
             }
         };
 
         Ok(welcome_preview)
+    }
+
+    /// Persist a failed-welcome record with a stable, sanitized category and
+    /// return the corresponding [`Error::Welcome`].
+    ///
+    /// Only the category is stored and logged — the underlying error (which is
+    /// derived from untrusted welcome content) is intentionally dropped so it
+    /// cannot leak through persistent failure records or logs.
+    ///
+    /// Returns `Err(_)` only if persisting the failed-welcome record itself
+    /// fails; in that case the storage error is returned and the original
+    /// welcome failure is logged but not persisted.
+    fn record_welcome_failure(
+        &self,
+        wrapper_event_id: &EventId,
+        welcome_event_id: Option<EventId>,
+        category: &'static str,
+    ) -> Result<Error, Error> {
+        let processed_welcome = welcome_types::ProcessedWelcome {
+            wrapper_event_id: *wrapper_event_id,
+            welcome_event_id,
+            processed_at: Timestamp::now(),
+            state: welcome_types::ProcessedWelcomeState::Failed,
+            failure_reason: Some(category.to_string()),
+        };
+
+        self.storage()
+            .save_processed_welcome(processed_welcome)
+            .map_err(|e| Error::Welcome(e.to_string()))?;
+
+        tracing::error!(
+            target: "mdk_core::welcomes::process_welcome",
+            wrapper_event_id = %wrapper_event_id,
+            "Welcome processing failed: {}",
+            category
+        );
+
+        Ok(Error::Welcome(category.to_string()))
     }
 }
 
@@ -1221,17 +1234,20 @@ mod tests {
         let welcome = &group_result.welcome_rumors[0];
 
         // Step 3: Test missing signing key scenario
-        // Bob Device B tries to process the welcome but doesn't have the signing key
+        // Bob Device B tries to process the welcome but doesn't have the signing key.
+        // The welcome parses but cannot be constructed into a StagedWelcome without
+        // the key material; this surfaces as the sanitized `welcome_parse_failed`
+        // category (no raw debug content is leaked).
         let result = bob_device_b.process_welcome(&nostr::EventId::all_zeros(), welcome);
 
-        // Verify the error message is informative
-        let error_msg = result
-            .expect_err("Processing welcome without signing key should fail")
-            .to_string();
+        let error = result.expect_err("Processing welcome without signing key should fail");
         assert!(
-            error_msg.contains("key") || error_msg.contains("Key") || error_msg.contains("storage"),
-            "Error message should mention key/storage issue: {}",
-            error_msg
+            matches!(
+                error,
+                Error::Welcome(ref msg) if msg == welcome_failure::PARSE_FAILED
+            ),
+            "Error should be the sanitized parse-failed category, got: {:?}",
+            error
         );
 
         // Step 4: Test unknown KeyPackage scenario
@@ -1646,34 +1662,95 @@ mod tests {
             content: "not_valid_base64!!!".to_string(),
         };
 
-        // First attempt should fail with a decoding error
+        // First attempt should fail with the sanitized decode-failed category
         let first_result = mdk.process_welcome(&wrapper_event_id, &invalid_welcome);
         assert!(first_result.is_err(), "First attempt should fail");
         let first_error = first_result.unwrap_err();
-        // The error should be a Welcome error about decoding
         assert!(
-            matches!(first_error, Error::Welcome(ref msg) if msg.contains("decoding")),
-            "First error should be about decoding, got: {:?}",
+            matches!(
+                first_error,
+                Error::Welcome(ref msg) if msg == welcome_failure::DECODE_FAILED
+            ),
+            "First error should be the sanitized decode-failed category, got: {:?}",
             first_error
         );
 
-        // Second attempt (retry) should return WelcomePreviouslyFailed with the original reason
+        // Second attempt (retry) should return WelcomePreviouslyFailed carrying
+        // the stored category (also sanitized).
         let second_result = mdk.process_welcome(&wrapper_event_id, &invalid_welcome);
         assert!(second_result.is_err(), "Second attempt should also fail");
         let second_error = second_result.unwrap_err();
 
-        // Verify we get the new error type with the original failure reason
         match second_error {
             Error::WelcomePreviouslyFailed(reason) => {
-                assert!(
-                    reason.contains("decoding"),
-                    "Failure reason should contain original error about decoding, got: {}",
-                    reason
+                assert_eq!(
+                    reason,
+                    welcome_failure::DECODE_FAILED,
+                    "Stored failure reason should be the sanitized category"
                 );
             }
             other => {
                 panic!("Expected WelcomePreviouslyFailed error, got: {:?}", other);
             }
         }
+    }
+
+    /// Test that welcome failures are stored as sanitized category strings, not
+    /// raw debug-formatted error messages (security issue: leaking debug
+    /// content into persistent failure records).
+    #[test]
+    fn test_welcome_failure_reason_is_sanitized_category() {
+        use mdk_storage_traits::welcomes::WelcomeStorage;
+        use nostr::RelayUrl;
+
+        let mdk = create_test_mdk();
+        let wrapper_event_id = EventId::from_slice(&[7u8; 32]).unwrap();
+
+        // Valid structure, invalid base64 content -> decode failure path.
+        let mut tags = nostr::Tags::new();
+        tags.push(nostr::Tag::relays(vec![
+            RelayUrl::parse("wss://relay.example.com").unwrap(),
+        ]));
+        tags.push(nostr::Tag::event(EventId::all_zeros()));
+        tags.push(nostr::Tag::custom(
+            nostr::TagKind::Custom("encoding".into()),
+            ["base64"],
+        ));
+
+        let invalid_welcome = UnsignedEvent {
+            id: Some(EventId::from_slice(&[8u8; 32]).unwrap()),
+            pubkey: Keys::generate().public_key(),
+            created_at: Timestamp::now(),
+            kind: Kind::MlsWelcome,
+            tags,
+            content: "not_valid_base64!!!".to_string(),
+        };
+
+        let result = mdk.process_welcome(&wrapper_event_id, &invalid_welcome);
+        assert!(result.is_err(), "Expected decode failure");
+
+        let processed = mdk
+            .storage()
+            .find_processed_welcome_by_event_id(&wrapper_event_id)
+            .expect("storage lookup")
+            .expect("processed welcome record");
+
+        assert_eq!(
+            processed.state,
+            welcome_types::ProcessedWelcomeState::Failed
+        );
+
+        let reason = processed
+            .failure_reason
+            .expect("failure_reason should be set");
+
+        // The reason must be exactly the stable category — not a debug-formatted
+        // error string carrying untrusted content.
+        assert_eq!(reason, welcome_failure::DECODE_FAILED);
+
+        // Defense-in-depth: must not contain debug tokens or wrapped error fragments.
+        assert!(!reason.contains("Error"));
+        assert!(!reason.contains("{"));
+        assert!(!reason.contains(':'));
     }
 }

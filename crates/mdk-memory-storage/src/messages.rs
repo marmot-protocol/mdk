@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use mdk_storage_traits::GroupId;
+use mdk_storage_traits::{GroupId, truncate_failure_reason};
 use nostr::{EventId, JsonUtil};
 #[cfg(test)]
 use nostr::{Kind, Tags, Timestamp, UnsignedEvent};
@@ -155,8 +155,11 @@ impl MessageStorage for MdkMemoryStorage {
 
     fn save_processed_message(
         &self,
-        processed_message: ProcessedMessage,
+        mut processed_message: ProcessedMessage,
     ) -> Result<(), MessageError> {
+        processed_message.failure_reason =
+            truncate_failure_reason(processed_message.failure_reason);
+
         let mut inner = self.inner.write();
         inner
             .processed_messages_cache
