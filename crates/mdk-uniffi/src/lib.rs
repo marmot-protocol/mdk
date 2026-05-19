@@ -1067,6 +1067,7 @@ impl Mdk {
     }
 
     /// Create a new group
+    #[allow(clippy::too_many_arguments)]
     pub fn create_group(
         &self,
         creator_public_key: String,
@@ -1075,6 +1076,7 @@ impl Mdk {
         description: String,
         relays: Vec<String>,
         admins: Vec<String>,
+        disappearing_message_secs: Option<u64>,
     ) -> Result<CreateGroupResult, MdkUniffiError> {
         let creator_pubkey = parse_public_key(&creator_public_key)?;
         let relay_urls = parse_relay_urls(&relays)?;
@@ -1096,7 +1098,7 @@ impl Mdk {
             None, // image_nonce
             relay_urls,
             admin_pubkeys,
-            None, // disappearing_message_secs
+            disappearing_message_secs,
         );
 
         let mdk = self.lock()?;
@@ -1316,6 +1318,10 @@ impl Mdk {
                 .map(|a| parse_public_key(a))
                 .collect::<Result<_, _>>()?;
             group_update = group_update.admins(admin_pubkeys);
+        }
+
+        if let Some(duration) = update.disappearing_message_secs {
+            group_update = group_update.disappearing_message_secs(duration);
         }
 
         let mdk = self.lock()?;
@@ -1628,6 +1634,8 @@ pub struct GroupDataUpdate {
     pub relays: Option<Vec<String>>,
     /// Group admins (optional)
     pub admins: Option<Vec<String>>,
+    /// Disappearing message duration in seconds (optional, use Some(None) to disable)
+    pub disappearing_message_secs: Option<Option<u64>>,
 }
 
 /// Result of processing a message
@@ -1905,6 +1913,8 @@ pub struct Group {
     /// - `"required"`: Must perform a post-join self-update (MIP-02).
     /// - `"completed_at:<unix_timestamp>"`: Last self-update merged at this time (MIP-00).
     pub self_update_state: String,
+    /// Disappearing message duration in seconds (None = disabled, Some(n) = n seconds)
+    pub disappearing_message_secs: Option<u64>,
 }
 
 impl From<group_types::Group> for Group {
@@ -1929,6 +1939,7 @@ impl From<group_types::Group> for Group {
                     format!("completed_at:{}", ts.as_secs())
                 }
             },
+            disappearing_message_secs: g.disappearing_message_secs,
         }
     }
 }
@@ -2929,6 +2940,7 @@ mod tests {
                 "Test Description".to_string(),
                 relays,
                 vec![creator_keys.public_key().to_hex()],
+                None,
             )
             .unwrap();
 
@@ -2961,6 +2973,7 @@ mod tests {
                 "Test Description".to_string(),
                 relays,
                 vec![creator_keys.public_key().to_hex()],
+                None,
             )
             .unwrap();
         let group_id = create_result.group.mls_group_id.clone();
@@ -3106,6 +3119,7 @@ mod tests {
                 "Test Description".to_string(),
                 relays.clone(),
                 vec![creator_keys.public_key().to_hex()],
+                None,
             )
             .unwrap();
 
@@ -3221,6 +3235,7 @@ mod tests {
                 "Test Description".to_string(),
                 relays.clone(),
                 vec![creator_keys.public_key().to_hex()],
+                None,
             )
             .unwrap();
 
@@ -3293,6 +3308,7 @@ mod tests {
                 "Test Description".to_string(),
                 relays.clone(),
                 vec![creator_keys.public_key().to_hex()],
+                None,
             )
             .unwrap();
 
@@ -3352,6 +3368,7 @@ mod tests {
                 "Test Description".to_string(),
                 relays.clone(),
                 vec![creator_keys.public_key().to_hex()],
+                None,
             )
             .unwrap();
 
@@ -3607,6 +3624,7 @@ mod tests {
             "Test Description".to_string(),
             relays,
             vec![creator_keys.public_key().to_hex()],
+            None,
         );
 
         assert!(result.is_ok());
@@ -3627,6 +3645,7 @@ mod tests {
             "Test".to_string(),
             vec!["wss://relay.example.com".to_string()],
             vec![],
+            None,
         );
         assert!(matches!(result, Err(MdkUniffiError::InvalidInput(_))));
     }
@@ -3643,6 +3662,7 @@ mod tests {
             "Test".to_string(),
             vec!["wss://relay.example.com".to_string()],
             vec!["not_valid_hex".to_string()],
+            None,
         );
         assert!(matches!(result, Err(MdkUniffiError::InvalidInput(_))));
     }
@@ -3659,6 +3679,7 @@ mod tests {
             "Test".to_string(),
             vec!["not_a_valid_url".to_string()],
             vec![],
+            None,
         );
         assert!(matches!(result, Err(MdkUniffiError::InvalidInput(_))));
     }
@@ -3675,6 +3696,7 @@ mod tests {
             "Test".to_string(),
             vec!["wss://relay.example.com".to_string()],
             vec![],
+            None,
         );
         assert!(matches!(result, Err(MdkUniffiError::InvalidInput(_))));
     }
@@ -3766,6 +3788,7 @@ mod tests {
                 "Test Description".to_string(),
                 relays,
                 vec![creator_keys.public_key().to_hex()],
+                None,
             )
             .unwrap();
 
@@ -3846,6 +3869,7 @@ mod tests {
             image_nonce: None,
             relays: None,
             admins: None,
+            disappearing_message_secs: None,
         };
         let result = mdk.update_group_data(invalid_group_id, update);
         assert!(matches!(result, Err(MdkUniffiError::InvalidInput(_))));
@@ -3863,6 +3887,7 @@ mod tests {
             image_nonce: None,
             relays: Some(vec!["not_a_valid_url".to_string()]),
             admins: None,
+            disappearing_message_secs: None,
         };
         let result = mdk.update_group_data(fake_group_id, update);
         assert!(matches!(result, Err(MdkUniffiError::InvalidInput(_))));
@@ -3880,6 +3905,7 @@ mod tests {
             image_nonce: None,
             relays: None,
             admins: Some(vec!["not_valid_hex".to_string()]),
+            disappearing_message_secs: None,
         };
         let result = mdk.update_group_data(fake_group_id, update);
         assert!(matches!(result, Err(MdkUniffiError::InvalidInput(_))));
@@ -4008,6 +4034,7 @@ mod tests {
                 "Test Description".to_string(),
                 relays,
                 vec![alice_keys.public_key().to_hex()],
+                None,
             )
             .unwrap();
 
@@ -4221,6 +4248,7 @@ mod tests {
                 "Test Description".to_string(),
                 relays,
                 vec![alice_keys.public_key().to_hex()],
+                None,
             )
             .unwrap();
         alice_mdk
@@ -4277,6 +4305,7 @@ mod tests {
                 "Test Description".to_string(),
                 relays,
                 vec![alice_keys.public_key().to_hex()],
+                None,
             )
             .unwrap();
         alice_mdk
@@ -4463,6 +4492,7 @@ mod tests {
                     "Test Description".to_string(),
                     relays,
                     vec![creator_keys.public_key().to_hex()],
+                    None,
                 )
                 .unwrap();
 

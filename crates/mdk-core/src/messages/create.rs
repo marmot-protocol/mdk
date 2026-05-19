@@ -939,4 +939,148 @@ mod tests {
             "Expiration tag should be present on the wrapper event"
         );
     }
+
+    fn create_test_group_with_disappearing(
+        mdk: &crate::MDK<mdk_memory_storage::MdkMemoryStorage>,
+        creator: &Keys,
+        members: &[Keys],
+        admins: &[nostr::PublicKey],
+        disappearing_message_secs: Option<u64>,
+    ) -> GroupId {
+        let key_package_events: Vec<_> = members
+            .iter()
+            .map(|m| create_key_package_event(mdk, m))
+            .collect();
+        let mut config = create_nostr_group_config_data(admins.to_vec());
+        config.disappearing_message_secs = disappearing_message_secs;
+        let result = mdk
+            .create_group(&creator.public_key(), key_package_events, config)
+            .expect("create group");
+        mdk.merge_pending_commit(&result.group.mls_group_id)
+            .unwrap();
+        result.group.mls_group_id
+    }
+
+    #[test]
+    fn test_create_message_auto_inserts_expiration_when_group_has_duration() {
+        use nostr::TagStandard;
+
+        let mdk = create_test_mdk();
+        let (creator, members, admins) = create_test_group_members();
+        let group_id =
+            create_test_group_with_disappearing(&mdk, &creator, &members, &admins, Some(60));
+
+        let rumor = create_test_rumor(&creator, "auto-expiring message");
+        let before = Timestamp::now().as_secs();
+        let event = mdk.create_message(&group_id, rumor, None).unwrap();
+        let after = Timestamp::now().as_secs();
+
+        let exp_tag = event
+            .tags
+            .iter()
+            .find(|t| t.kind() == TagKind::Expiration)
+            .expect("expiration tag must be auto-inserted");
+        let exp_ts = match exp_tag.as_standardized() {
+            Some(TagStandard::Expiration(ts)) => ts.as_secs(),
+            other => panic!("expected expiration tag, got {other:?}"),
+        };
+        assert!(
+            exp_ts >= before + 60 && exp_ts <= after + 60,
+            "expiration {exp_ts} not in [{}+60, {}+60]",
+            before,
+            after
+        );
+        assert_eq!(event.created_at.as_secs() + 60, exp_ts);
+    }
+
+    #[test]
+    fn test_create_message_no_expiration_when_group_has_none() {
+        let mdk = create_test_mdk();
+        let (creator, members, admins) = create_test_group_members();
+        let group_id = create_test_group(&mdk, &creator, &members, &admins);
+
+        let rumor = create_test_rumor(&creator, "persistent message");
+        let event = mdk.create_message(&group_id, rumor, None).unwrap();
+
+        assert!(
+            !event.tags.iter().any(|t| t.kind() == TagKind::Expiration),
+            "no expiration should be added when group has None"
+        );
+    }
+
+    #[test]
+    fn test_create_message_caller_expiration_wins_when_lower() {
+        use nostr::TagStandard;
+
+        let mdk = create_test_mdk();
+        let (creator, members, admins) = create_test_group_members();
+        // Group says 1h; caller asks for ~30s (a shorter ephemeral burst). Caller wins.
+        let group_id =
+            create_test_group_with_disappearing(&mdk, &creator, &members, &admins, Some(3600));
+
+        let short_lived = Timestamp::now().as_secs() + 30;
+        let event = mdk
+            .create_message(
+                &group_id,
+                create_test_rumor(&creator, "burst"),
+                Some(vec![EventTag::expiration(Timestamp::from(short_lived))]),
+            )
+            .unwrap();
+
+        let exp_ts = match event
+            .tags
+            .iter()
+            .find(|t| t.kind() == TagKind::Expiration)
+            .and_then(|t| t.as_standardized())
+        {
+            Some(TagStandard::Expiration(ts)) => ts.as_secs(),
+            other => panic!("expected expiration tag, got {other:?}"),
+        };
+        assert_eq!(
+            exp_ts, short_lived,
+            "caller's shorter expiration must win over group's longer duration"
+        );
+        let exp_count = event
+            .tags
+            .iter()
+            .filter(|t| t.kind() == TagKind::Expiration)
+            .count();
+        assert_eq!(exp_count, 1, "only one expiration tag should remain");
+    }
+
+    #[test]
+    fn test_create_message_group_expiration_wins_when_lower() {
+        use nostr::TagStandard;
+
+        let mdk = create_test_mdk();
+        let (creator, members, admins) = create_test_group_members();
+        let group_id =
+            create_test_group_with_disappearing(&mdk, &creator, &members, &admins, Some(60));
+
+        // Caller asks for 1h; group says 60s — group wins because it's earlier.
+        let long_lived = Timestamp::now().as_secs() + 3600;
+        let before = Timestamp::now().as_secs();
+        let event = mdk
+            .create_message(
+                &group_id,
+                create_test_rumor(&creator, "long-lived attempt"),
+                Some(vec![EventTag::expiration(Timestamp::from(long_lived))]),
+            )
+            .unwrap();
+        let after = Timestamp::now().as_secs();
+
+        let exp_ts = match event
+            .tags
+            .iter()
+            .find(|t| t.kind() == TagKind::Expiration)
+            .and_then(|t| t.as_standardized())
+        {
+            Some(TagStandard::Expiration(ts)) => ts.as_secs(),
+            other => panic!("expected expiration tag, got {other:?}"),
+        };
+        assert!(
+            exp_ts >= before + 60 && exp_ts <= after + 60,
+            "group's shorter expiration must win"
+        );
+    }
 }

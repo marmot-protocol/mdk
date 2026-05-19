@@ -30,8 +30,12 @@
 ### Breaking changes
 
 - **`Mdk::create_key_package_for_event_with_options` signature changed**: the third parameter is now `options: KeyPackageOptions` (a new UniFFI record) instead of `protected: bool`. The record carries both the existing `protected` flag and a new `existing_d_tag: Option<String>` field for `d` tag reuse during KeyPackage rotation. Binding consumers must update their call sites — replace e.g. `mdk.createKeyPackageForEventWithOptions(pubkey, relays, true)` with `mdk.createKeyPackageForEventWithOptions(pubkey, relays, KeyPackageOptions(protected = true, existingDTag = null))` (Kotlin) / equivalent in Swift / Python. Malformed `existing_d_tag` (non-empty / non-hex / wrong length) surfaces as `MdkUniffiError.InvalidInput` at the FFI boundary, matching how other parameter parsers in the binding report errors. `create_key_package_for_event` (the no-options variant) is unchanged. ([#303](https://github.com/marmot-protocol/mdk/pull/303))
+- **`Mdk::create_group` gained a `disappearing_message_secs: Option<UInt64>` parameter** (after `admins`). `None` = disabled; `Some(n)` = expire `n` seconds after creation. `Some(0)` is rejected as `MdkUniffiError::InvalidInput`. Binding consumers must update their call sites. Part 2 of #253.
+- **`GroupDataUpdate` gained `disappearing_message_secs: Option<Option<UInt64>>`**. Outer `None` = leave unchanged; `Some(None)` = disable; `Some(Some(n))` = set to `n` seconds. Binding consumers constructing `GroupDataUpdate` literals must include the new field. Part 2 of #253.
 
 ### Changed
+
+- The `Group` UniFFI record now exposes `disappearing_message_secs: Option<UInt64>`, mirroring the new field on the core `Group` struct. Part 2 of #253.
 
 ### Added
 
