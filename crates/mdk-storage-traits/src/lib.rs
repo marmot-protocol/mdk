@@ -248,6 +248,31 @@ pub use error::MdkStorageError;
 pub use group_id::GroupId;
 pub use secret::{PlaintextSecret, Secret, Zeroize};
 
+/// Maximum number of bytes accepted for a persisted `failure_reason` string.
+///
+/// Failure reasons are expected to be short, stable category identifiers
+/// (e.g. `"welcome_decode_failed"`) produced by the caller. This bound is a
+/// defense-in-depth cap so that even an unsanitized caller cannot use the
+/// `failure_reason` field as an unbounded storage-exhaustion vector.
+pub const MAX_FAILURE_REASON_LEN: usize = 256;
+
+/// Truncate a `failure_reason` string to at most [`MAX_FAILURE_REASON_LEN`] bytes.
+///
+/// Truncation respects UTF-8 character boundaries, so the returned string is
+/// always valid UTF-8 even when the limit falls inside a multi-byte sequence.
+pub fn truncate_failure_reason(reason: Option<String>) -> Option<String> {
+    reason.map(|mut s| {
+        if s.len() > MAX_FAILURE_REASON_LEN {
+            let mut idx = MAX_FAILURE_REASON_LEN;
+            while idx > 0 && !s.is_char_boundary(idx) {
+                idx -= 1;
+            }
+            s.truncate(idx);
+        }
+        s
+    })
+}
+
 use self::groups::GroupStorage;
 use self::messages::MessageStorage;
 use self::welcomes::WelcomeStorage;
@@ -374,5 +399,37 @@ mod tests {
     fn test_backend_is_persistent() {
         assert!(!Backend::Memory.is_persistent());
         assert!(Backend::SQLite.is_persistent());
+    }
+
+    #[test]
+    fn truncate_failure_reason_passes_short_strings_unchanged() {
+        let short = "welcome_decode_failed".to_string();
+        let result = truncate_failure_reason(Some(short.clone()));
+        assert_eq!(result, Some(short));
+    }
+
+    #[test]
+    fn truncate_failure_reason_preserves_none() {
+        assert_eq!(truncate_failure_reason(None), None);
+    }
+
+    #[test]
+    fn truncate_failure_reason_caps_long_strings() {
+        let long = "a".repeat(MAX_FAILURE_REASON_LEN * 4);
+        let result = truncate_failure_reason(Some(long)).unwrap();
+        assert_eq!(result.len(), MAX_FAILURE_REASON_LEN);
+    }
+
+    #[test]
+    fn truncate_failure_reason_respects_utf8_boundaries() {
+        // "é" is two bytes (0xC3 0xA9). Construct a string where the cap
+        // would otherwise fall in the middle of a multi-byte character.
+        let mut s = "a".repeat(MAX_FAILURE_REASON_LEN - 1);
+        s.push('é');
+        let result = truncate_failure_reason(Some(s)).unwrap();
+        // The 2-byte 'é' starts at index MAX_FAILURE_REASON_LEN - 1, so we
+        // must truncate back to that boundary rather than split it.
+        assert_eq!(result.len(), MAX_FAILURE_REASON_LEN - 1);
+        assert!(result.chars().all(|c| c == 'a'));
     }
 }

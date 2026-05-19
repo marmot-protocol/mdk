@@ -35,6 +35,7 @@
 
 - Fixed `MdkMemoryStorage::save_welcome` to reject oversized welcome group metadata and serialized event JSON before caching welcomes, matching SQLite backend payload bounds. ([#276](https://github.com/marmot-protocol/mdk/pull/276))
 - `delete_group` now scrubs `processed_welcomes_cache` entries for the group by consulting a non-evicting `wrapper_event_id -> mls_group_id` index (populated by `save_processed_welcome` from the just-cached welcome). Previously these entries survived deletion, leaking group-linkable metadata and tripping the welcome dedup path on re-processing. The index closes the eviction window where an LRU-evicted welcome would otherwise strand its processed-welcome entry; bounded at the same rate as `processed_welcomes_cache` itself. Closes [marmot-protocol/marmot-security#68](https://github.com/marmot-protocol/marmot-security/issues/68). ([#293](https://github.com/marmot-protocol/mdk/pull/293))
+- Bounded `failure_reason` length in `save_processed_message` and `save_processed_welcome` via `truncate_failure_reason` from `mdk-storage-traits`, removing an unbounded storage-exhaustion sink for attacker-influenced diagnostic strings. Closes [marmot-protocol/marmot-security#19](https://github.com/marmot-protocol/marmot-security/issues/19). ([#307](https://github.com/marmot-protocol/mdk/pull/307))
 
 ### Removed
 

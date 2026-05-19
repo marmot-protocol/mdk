@@ -34,6 +34,8 @@
 
 ### Added
 
+- Added `MAX_FAILURE_REASON_LEN` (256 bytes) and `truncate_failure_reason(Option<String>) -> Option<String>` so storage backends can defensively cap the length of `failure_reason` values before persistence, with UTF-8-safe truncation that walks back to a valid char boundary. Closes [marmot-protocol/marmot-security#19](https://github.com/marmot-protocol/marmot-security/issues/19). ([#307](https://github.com/marmot-protocol/mdk/pull/307))
+
 ### Fixed
 
 - Redacted sensitive MLS/Nostr group identifiers and private payload fields from storage-domain `Debug` output. ([#277](https://github.com/marmot-protocol/mdk/pull/277))

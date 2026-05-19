@@ -1,5 +1,6 @@
 //! Implementation of WelcomeStorage trait for SQLite storage.
 
+use mdk_storage_traits::truncate_failure_reason;
 use mdk_storage_traits::welcomes::error::WelcomeError;
 use mdk_storage_traits::welcomes::types::{ProcessedWelcome, Welcome};
 use mdk_storage_traits::welcomes::{Pagination, WelcomeStorage, validate_pending_welcomes_limit};
@@ -143,8 +144,11 @@ impl WelcomeStorage for MdkSqliteStorage {
 
     fn save_processed_welcome(
         &self,
-        processed_welcome: ProcessedWelcome,
+        mut processed_welcome: ProcessedWelcome,
     ) -> Result<(), WelcomeError> {
+        processed_welcome.failure_reason =
+            truncate_failure_reason(processed_welcome.failure_reason);
+
         // Convert welcome_event_id to string if it exists
         let welcome_event_id: Option<&[u8; 32]> = processed_welcome
             .welcome_event_id
