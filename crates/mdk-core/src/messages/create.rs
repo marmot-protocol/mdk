@@ -180,7 +180,7 @@ mod tests {
     use mdk_storage_traits::GroupId;
     use mdk_storage_traits::messages::types as message_types;
     use nostr::event::Error as NostrEventError;
-    use nostr::{EventId, Keys, Kind, TagKind, Timestamp};
+    use nostr::{EventId, Keys, Kind, TagKind, TagStandard, Timestamp};
 
     use crate::error::Error;
     use crate::messages::EventTag;
@@ -963,8 +963,6 @@ mod tests {
 
     #[test]
     fn test_create_message_auto_inserts_expiration_when_group_has_duration() {
-        use nostr::TagStandard;
-
         let mdk = create_test_mdk();
         let (creator, members, admins) = create_test_group_members();
         let group_id =
@@ -1010,8 +1008,6 @@ mod tests {
 
     #[test]
     fn test_create_message_caller_expiration_wins_when_lower() {
-        use nostr::TagStandard;
-
         let mdk = create_test_mdk();
         let (creator, members, admins) = create_test_group_members();
         // Group says 1h; caller asks for ~30s (a shorter ephemeral burst). Caller wins.
@@ -1050,8 +1046,6 @@ mod tests {
 
     #[test]
     fn test_create_message_group_expiration_wins_when_lower() {
-        use nostr::TagStandard;
-
         let mdk = create_test_mdk();
         let (creator, members, admins) = create_test_group_members();
         let group_id =

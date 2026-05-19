@@ -2559,7 +2559,7 @@ mod tests {
     use mdk_memory_storage::MdkMemoryStorage;
     use mdk_storage_traits::groups::GroupStorage;
     use mdk_storage_traits::messages::{MessageStorage, types as message_types};
-    use nostr::{Keys, PublicKey};
+    use nostr::{Keys, PublicKey, TagKind, TagStandard, Timestamp};
     use openmls::prelude::{BasicCredential, ProposalType};
     use openmls_basic_credential::SignatureKeyPair;
 
@@ -8729,8 +8729,6 @@ mod tests {
 
     #[test]
     fn test_commit_event_carries_expiration_when_group_has_duration() {
-        use nostr::{TagKind, TagStandard, Timestamp};
-
         let mdk = create_test_mdk();
         let (creator, members, admins) = create_test_group_members();
         let creator_pk = creator.public_key();
