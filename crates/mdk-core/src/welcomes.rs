@@ -411,8 +411,15 @@ where
         &self,
         mut welcome_message: &[u8],
     ) -> Result<(StagedWelcome, NostrGroupDataExtension), Error> {
-        // Parse welcome message
+        // Parse welcome message. Non-strict deserialization permits trailing
+        // bytes so the sender-side bucket padding (see `crate::padding`) is
+        // ignored, but we then enforce that those trailing bytes are zero
+        // only: an admin authoring a Welcome must not be able to use the
+        // padding region as a covert channel to the new joiner.
         let welcome_message_in = MlsMessageIn::tls_deserialize(&mut welcome_message)?;
+        if welcome_message.iter().any(|&b| b != 0) {
+            return Err(Error::InvalidWelcomeMessage);
+        }
 
         let welcome: Welcome = match welcome_message_in.extract() {
             MlsMessageBodyIn::Welcome(welcome) => welcome,
