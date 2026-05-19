@@ -34,6 +34,7 @@ use crate::constant::{GROUP_CONTEXT_REQUIRED_EXTENSIONS, SUPPORTED_PROPOSALS};
 use crate::error::Error;
 use crate::messages::EventTag;
 use crate::messages::crypto::encrypt_message_with_exporter_secret;
+use crate::padding::{MESSAGE_PADDING_FLOOR, WELCOME_PADDING_FLOOR, pad_to_bucket};
 use crate::util::{ContentEncoding, encode_content};
 
 /// Result of creating a new MLS group
@@ -2411,6 +2412,12 @@ where
     /// Per MIP-03, the encryption key is derived via `MLS-Exporter("marmot", "group-event", 32)`,
     /// a random 12-byte nonce is generated per event. No AAD is used per MIP-03.
     /// The content format is `base64(nonce || ciphertext)`.
+    ///
+    /// Before encryption the serialized MLS message is padded to a power-of-two
+    /// bucket (see `crate::padding`) so a relay cannot fingerprint specific
+    /// message types (notably empty SelfRemove proposals) by their on-the-wire
+    /// size. The receiver's MLS deserializer consumes only the framed message
+    /// bytes and ignores the trailing zero padding.
     pub(crate) fn build_message_event(
         &self,
         group_id: &GroupId,
@@ -2421,7 +2428,8 @@ where
 
         // Derive the encryption key via MLS exporter (stable per epoch)
         let secret: group_types::GroupExporterSecret = self.exporter_secret(group_id)?;
-        let encrypted_content = encrypt_message_with_exporter_secret(&secret, &serialized_content)?;
+        let padded_content = pad_to_bucket(&serialized_content, MESSAGE_PADDING_FLOOR);
+        let encrypted_content = encrypt_message_with_exporter_secret(&secret, &padded_content)?;
 
         // Generate ephemeral key for signing (MUST NOT be reused across events)
         let ephemeral_nostr_keys: Keys = Keys::generate();
@@ -2452,12 +2460,20 @@ where
         let committer_pubkey = self.get_own_pubkey(group)?;
         let mut welcome_rumors_vec = Vec::new();
 
+        // Pad once before the per-recipient loop: the MLS Welcome bytes are
+        // identical for every recipient in this commit, and padding to a
+        // power-of-two bucket prevents a relay from inferring group size from
+        // the resulting NIP-59 gift-wrap event length. The recipient's
+        // `Welcome::tls_deserialize` consumes only the framed welcome and
+        // ignores the trailing zero padding.
+        let padded_welcome = pad_to_bucket(&serialized_welcome, WELCOME_PADDING_FLOOR);
+
         for event in key_package_events {
             // SECURITY: Always use base64 encoding with explicit encoding tag per MIP-00/MIP-02.
             // This prevents downgrade attacks and parsing ambiguity across clients.
             let encoding = ContentEncoding::Base64;
 
-            let encoded_welcome = encode_content(&serialized_welcome, encoding);
+            let encoded_welcome = encode_content(&padded_welcome, encoding);
 
             tracing::debug!(
                 target: "mdk_core::groups",
@@ -8592,5 +8608,351 @@ mod tests {
             "mixed group must not require SelfRemove (got {:?})",
             proposal_types
         );
+    }
+
+    /// Wire-format padding tests guarding marmot-security issues #33
+    /// (Welcome size leaks group size) and #37 (SelfRemove size leaks
+    /// departure intent). Each test exercises a sender path and asserts that
+    /// the observable on-the-wire content size is bucketed instead of leaking
+    /// the underlying plaintext length.
+    mod padding_tests {
+        use base64::Engine;
+        use base64::engine::general_purpose::STANDARD as BASE64;
+        use nostr::{EventBuilder, Kind};
+
+        use super::*;
+        use crate::MDK;
+        use crate::messages::crypto::encrypt_message_with_exporter_secret;
+        use crate::padding::{MESSAGE_PADDING_FLOOR, WELCOME_PADDING_FLOOR};
+
+        /// Decoded length of a kind:445 wrapper event's content, stripping
+        /// the 12-byte nonce and 16-byte Poly1305 tag added by
+        /// ChaCha20-Poly1305 — what's left is the padded MLS plaintext.
+        fn decoded_plaintext_len(content: &str) -> usize {
+            let decoded = BASE64
+                .decode(content)
+                .expect("kind:445 content must be valid base64");
+            assert!(
+                decoded.len() >= 28,
+                "decoded content must have nonce + tag (≥28 bytes)"
+            );
+            // 12-byte nonce + 16-byte Poly1305 tag overhead.
+            decoded.len() - 28
+        }
+
+        /// Two text messages with very different short lengths must produce
+        /// kind:445 events with identical plaintext sizes — proof that the
+        /// floor bucket flattens their fingerprints. Guards issue #37.
+        #[test]
+        fn test_kind_445_short_messages_share_padding_bucket() {
+            let mdk = create_test_mdk();
+            let (creator, members, admins) = create_test_group_members();
+            let group_id = create_test_group(&mdk, &creator, &members, &admins);
+
+            let short = mdk
+                .create_message(&group_id, create_test_rumor(&creator, "hi"), None)
+                .expect("short message creates");
+            let longer = mdk
+                .create_message(
+                    &group_id,
+                    create_test_rumor(&creator, &"x".repeat(50)),
+                    None,
+                )
+                .expect("longer message creates");
+
+            let short_len = decoded_plaintext_len(&short.content);
+            let longer_len = decoded_plaintext_len(&longer.content);
+
+            assert_eq!(
+                short_len, longer_len,
+                "small messages in the same bucket must produce identical sizes \
+                 (short={short_len}, longer={longer_len})"
+            );
+            assert!(
+                short_len >= MESSAGE_PADDING_FLOOR,
+                "padded plaintext must be at least the bucket floor ({} bytes), got {}",
+                MESSAGE_PADDING_FLOOR,
+                short_len
+            );
+            assert!(
+                short_len.is_power_of_two(),
+                "padded plaintext length must be a power-of-two bucket, got {short_len}"
+            );
+        }
+
+        /// A SelfRemove proposal (issue #37's specific concern) must not be
+        /// distinguishable by size from a routine small text message — both
+        /// land in the same bucket.
+        #[test]
+        fn test_self_remove_event_size_matches_text_message() {
+            let alice_keys = Keys::generate();
+            let bob_keys = Keys::generate();
+
+            let alice_mdk = create_test_mdk();
+            let bob_mdk = create_test_mdk();
+
+            let bob_kp = create_key_package_event(&bob_mdk, &bob_keys);
+
+            let create_result = alice_mdk
+                .create_group(
+                    &alice_keys.public_key(),
+                    vec![bob_kp],
+                    create_nostr_group_config_data(vec![alice_keys.public_key()]),
+                )
+                .expect("alice creates group");
+            let group_id = create_result.group.mls_group_id.clone();
+            alice_mdk
+                .merge_pending_commit(&group_id)
+                .expect("alice merges");
+
+            let bob_welcome = &create_result.welcome_rumors[0];
+            let bob_preview = bob_mdk
+                .process_welcome(&nostr::EventId::all_zeros(), bob_welcome)
+                .expect("bob processes welcome");
+            bob_mdk.accept_welcome(&bob_preview).expect("bob accepts");
+
+            let small_text = bob_mdk
+                .create_message(&group_id, create_test_rumor(&bob_keys, "hi"), None)
+                .expect("small text creates");
+            let leave = bob_mdk.leave_group(&group_id).expect("bob leaves");
+
+            let text_len = decoded_plaintext_len(&small_text.content);
+            let leave_len = decoded_plaintext_len(&leave.evolution_event.content);
+
+            assert_eq!(
+                text_len, leave_len,
+                "SelfRemove event must bucket to the same size as a small text \
+                 message (text={text_len}, leave={leave_len}) — otherwise a \
+                 relay can fingerprint departures by size"
+            );
+        }
+
+        /// The receiver must accept legacy (unpadded) kind:445 plaintexts so
+        /// patched clients can continue to read messages produced by older
+        /// senders. This pins the forward-compatibility direction of the
+        /// `tls_deserialize_exact` → `tls_deserialize` relaxation in
+        /// `process_mls_message`.
+        #[test]
+        fn test_receiver_accepts_legacy_unpadded_kind_445() {
+            let alice_keys = Keys::generate();
+            let bob_keys = Keys::generate();
+
+            let alice_mdk = create_test_mdk();
+            let bob_mdk = create_test_mdk();
+
+            let bob_kp = create_key_package_event(&bob_mdk, &bob_keys);
+            let create_result = alice_mdk
+                .create_group(
+                    &alice_keys.public_key(),
+                    vec![bob_kp],
+                    create_nostr_group_config_data(vec![alice_keys.public_key()]),
+                )
+                .expect("alice creates group");
+            let group_id = create_result.group.mls_group_id.clone();
+            alice_mdk
+                .merge_pending_commit(&group_id)
+                .expect("alice merges");
+
+            let bob_welcome = &create_result.welcome_rumors[0];
+            let bob_preview = bob_mdk
+                .process_welcome(&nostr::EventId::all_zeros(), bob_welcome)
+                .expect("bob processes welcome");
+            bob_mdk.accept_welcome(&bob_preview).expect("bob accepts");
+
+            // Hand-craft an unpadded kind:445 event the way pre-padding
+            // senders did: encrypt the raw serialized MLS payload directly,
+            // with no padding pass.
+            let mut mls_group = bob_mdk
+                .load_mls_group(&group_id)
+                .expect("load ok")
+                .expect("group exists");
+            let mut rumor = create_test_rumor(&bob_keys, "legacy unpadded hello");
+            let serialized = bob_mdk
+                .create_mls_message_payload(&mut mls_group, &mut rumor)
+                .expect("serialize ok");
+            let secret = bob_mdk
+                .exporter_secret(&group_id)
+                .expect("exporter secret available");
+            let encrypted_content = encrypt_message_with_exporter_secret(&secret, &serialized)
+                .expect("legacy encrypt ok");
+
+            let bob_group = bob_mdk.get_group(&group_id).expect("group").expect("ok");
+            let h_tag =
+                nostr::Tag::custom(nostr::TagKind::h(), [hex::encode(bob_group.nostr_group_id)]);
+            let encoding_tag =
+                nostr::Tag::custom(nostr::TagKind::Custom("encoding".into()), ["base64"]);
+            let ephemeral_keys = Keys::generate();
+            let legacy_event = EventBuilder::new(Kind::MlsGroupMessage, encrypted_content)
+                .tag(h_tag)
+                .tag(encoding_tag)
+                .sign_with_keys(&ephemeral_keys)
+                .expect("sign ok");
+
+            // The patched receiver must successfully process the legacy
+            // unpadded event.
+            alice_mdk
+                .process_message(&legacy_event)
+                .expect("patched receiver must accept legacy unpadded kind:445");
+        }
+
+        /// Trailing bytes after the MLS framing MUST be zero. Anything else
+        /// would form a covert channel inside the padding region — reject it
+        /// so the wire format is pinned to "zero-byte padding only".
+        ///
+        /// The test runs the same construction twice with the only difference
+        /// being one tail byte: zero (must succeed) vs non-zero (must yield
+        /// `MessageProcessingResult::Unprocessable`). Any other failure mode
+        /// would affect both branches identically, so a divergent outcome
+        /// isolates the padding check.
+        #[test]
+        fn test_receiver_rejects_kind_445_with_non_zero_padding() {
+            use mdk_storage_traits::{GroupId, MdkStorageProvider};
+            use nostr::Event;
+
+            fn craft_event<S: MdkStorageProvider>(
+                sender_mdk: &MDK<S>,
+                sender_keys: &Keys,
+                group_id: &GroupId,
+                tail_byte: u8,
+            ) -> Event {
+                let mut mls_group = sender_mdk
+                    .load_mls_group(group_id)
+                    .expect("load ok")
+                    .expect("group exists");
+                let mut rumor = create_test_rumor(sender_keys, "padding-tail-probe");
+                let mut serialized = sender_mdk
+                    .create_mls_message_payload(&mut mls_group, &mut rumor)
+                    .expect("serialize ok");
+                // Pad past the MLS frame so the receiver-side check inspects
+                // a real trailing region (rather than zero trailing bytes).
+                let target = serialized.len().next_power_of_two().max(512);
+                serialized.resize(target, 0);
+                *serialized.last_mut().expect("padded buffer is non-empty") = tail_byte;
+
+                let secret = sender_mdk
+                    .exporter_secret(group_id)
+                    .expect("exporter secret available");
+                let encrypted_content =
+                    encrypt_message_with_exporter_secret(&secret, &serialized).expect("encrypt ok");
+
+                let group = sender_mdk.get_group(group_id).expect("group").expect("ok");
+                let h_tag =
+                    nostr::Tag::custom(nostr::TagKind::h(), [hex::encode(group.nostr_group_id)]);
+                let encoding_tag =
+                    nostr::Tag::custom(nostr::TagKind::Custom("encoding".into()), ["base64"]);
+                let ephemeral_keys = Keys::generate();
+                EventBuilder::new(Kind::MlsGroupMessage, encrypted_content)
+                    .tag(h_tag)
+                    .tag(encoding_tag)
+                    .sign_with_keys(&ephemeral_keys)
+                    .expect("sign ok")
+            }
+
+            // Two independent groups so each branch runs against a clean
+            // receiver state (process_message records failure metadata that
+            // would otherwise cross-contaminate the second call via the
+            // deduplication path).
+            fn setup_pair() -> (MDK<MdkMemoryStorage>, MDK<MdkMemoryStorage>, Keys, GroupId) {
+                let alice_keys = Keys::generate();
+                let bob_keys = Keys::generate();
+                let alice_mdk = create_test_mdk();
+                let bob_mdk = create_test_mdk();
+
+                let bob_kp = create_key_package_event(&bob_mdk, &bob_keys);
+                let create_result = alice_mdk
+                    .create_group(
+                        &alice_keys.public_key(),
+                        vec![bob_kp],
+                        create_nostr_group_config_data(vec![alice_keys.public_key()]),
+                    )
+                    .expect("alice creates group");
+                let group_id = create_result.group.mls_group_id.clone();
+                alice_mdk
+                    .merge_pending_commit(&group_id)
+                    .expect("alice merges");
+
+                let bob_welcome = &create_result.welcome_rumors[0];
+                let bob_preview = bob_mdk
+                    .process_welcome(&nostr::EventId::all_zeros(), bob_welcome)
+                    .expect("bob processes welcome");
+                bob_mdk.accept_welcome(&bob_preview).expect("bob accepts");
+
+                (alice_mdk, bob_mdk, bob_keys, group_id)
+            }
+
+            // Zero-tail control: identical construction except the last byte
+            // is zero. Must successfully decode.
+            let (alice_ok, bob_ok, bob_keys_ok, group_id_ok) = setup_pair();
+            let zero_tail_event = craft_event(&bob_ok, &bob_keys_ok, &group_id_ok, 0);
+            let ok_result = alice_ok
+                .process_message(&zero_tail_event)
+                .expect("zero-tail control must process");
+            assert!(
+                matches!(ok_result, MessageProcessingResult::ApplicationMessage(_)),
+                "zero-tail control must succeed (got {:?})",
+                ok_result
+            );
+
+            // Mutated tail: flip the final padding byte to a non-zero value.
+            // Must be rejected as Unprocessable.
+            let (alice_bad, bob_bad, bob_keys_bad, group_id_bad) = setup_pair();
+            let bad_tail_event = craft_event(&bob_bad, &bob_keys_bad, &group_id_bad, 0xFF);
+            let bad_result = alice_bad
+                .process_message(&bad_tail_event)
+                .expect("process_message returns Ok wrapping the rejection variant");
+            assert!(
+                matches!(bad_result, MessageProcessingResult::Unprocessable { .. }),
+                "non-zero padding must be classified as Unprocessable (got {:?})",
+                bad_result
+            );
+        }
+
+        /// Welcome rumors for different small groups must share a padding
+        /// bucket so a relay cannot estimate the group's member count from
+        /// the kind:1059 gift-wrap size. Guards issue #33.
+        #[test]
+        fn test_welcome_rumor_size_is_bucketed_for_small_groups() {
+            fn welcome_decoded_len(mdk: &MDK<MdkMemoryStorage>, member_count: usize) -> usize {
+                let creator = Keys::generate();
+                let mut key_packages = Vec::new();
+                for _ in 0..member_count {
+                    let member = Keys::generate();
+                    key_packages.push(create_key_package_event(mdk, &member));
+                }
+                let result = mdk
+                    .create_group(
+                        &creator.public_key(),
+                        key_packages,
+                        create_nostr_group_config_data(vec![creator.public_key()]),
+                    )
+                    .expect("group creates");
+                let welcome = &result.welcome_rumors[0];
+                BASE64
+                    .decode(&welcome.content)
+                    .expect("welcome content is base64")
+                    .len()
+            }
+
+            let mdk = create_test_mdk();
+            let small = welcome_decoded_len(&mdk, 1);
+            let medium = welcome_decoded_len(&mdk, 3);
+
+            assert_eq!(
+                small, medium,
+                "welcomes for small groups (1 vs 3 members) must share a padding \
+                 bucket (small={small}, medium={medium}) — otherwise relays can \
+                 estimate group size from the gift-wrap event length"
+            );
+            assert!(
+                small >= WELCOME_PADDING_FLOOR,
+                "padded welcome must be at least the welcome floor ({} bytes), got {}",
+                WELCOME_PADDING_FLOOR,
+                small
+            );
+            assert!(
+                small.is_power_of_two(),
+                "padded welcome length must be a power-of-two bucket, got {small}"
+            );
+        }
     }
 }
