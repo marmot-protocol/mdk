@@ -37,6 +37,8 @@ versioning through the workspace version in the root `Cargo.toml`.
   daemon-forwarded account creation.
 - Added TUI `/stream` slash commands for starting, watching, finishing, verifying, and inspecting brokered agent text
   stream previews from the selected chat.
+- Added a TUI status panel below the composer with the latest status line, selected-chat MLS epoch/group/member state,
+  and raw app-component data from `dm groups show --json`.
 - Added `dm stream start`, `dm stream finish`, and `dm stream verify` for anchoring agent text
   stream starts/finals through normal encrypted Marmot messages and checking QUIC transcript hashes.
 - Added `dm stream watch` and `dm stream send --broker` for brokered QUIC preview streams anchored by the
@@ -56,6 +58,8 @@ versioning through the workspace version in the root `Cargo.toml`.
   stream anchors/finals no longer jump ahead of older chat text merely because they arrived first during catch-up.
 - Account list, `whoami`, sync, and message-list JSON now include cached Nostr profile display names where available,
   and the TUI uses those names in account chrome and received-message authors before falling back to npubs.
+- `dm groups show --json` now includes selected-group MLS state, and group JSON includes the Nostr routing app
+  component alongside the other group components.
 - The TUI now tails daemon-backed `messages subscribe` updates for the selected chat, so incoming messages and QUIC
   stream-preview deltas can render without timer-driven message-list refreshes.
 - The TUI now tails daemon-backed `chats subscribe` updates for the selected account, so newly processed invites appear

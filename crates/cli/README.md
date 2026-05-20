@@ -375,8 +375,8 @@ real time.
 ## TUI
 
 `dm tui` is a Ratatui interface over the real `dm --json` command surface. It lists local accounts, shows
-visible chats for the selected local signing account, renders recent messages, and sends messages from a
-composer.
+visible chats for the selected local signing account, renders recent messages, sends messages from a composer, and
+keeps the latest status plus selected-chat MLS/component state in a status panel below the composer.
 
 ```sh
 dm tui

@@ -185,6 +185,10 @@ enum AccountWorkerCommand {
         group_id: GroupId,
         respond: oneshot::Sender<Result<Vec<AppGroupMemberRecord>, AppError>>,
     },
+    GroupMlsState {
+        group_id: GroupId,
+        respond: oneshot::Sender<Result<AppGroupMlsState, AppError>>,
+    },
     InviteMembers {
         group_id: GroupId,
         members: Vec<String>,
@@ -738,6 +742,14 @@ impl MarmotAppRuntime {
         self.accounts.group_members(account_ref, group_id).await
     }
 
+    pub async fn group_mls_state(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+    ) -> Result<AppGroupMlsState, AppError> {
+        self.accounts.group_mls_state(account_ref, group_id).await
+    }
+
     pub async fn invite_members(
         &self,
         account_ref: &str,
@@ -1222,6 +1234,23 @@ impl AccountManager {
         let (respond, response) = oneshot::channel();
         command
             .send(AccountWorkerCommand::Members {
+                group_id: group_id.clone(),
+                respond,
+            })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
+    pub async fn group_mls_state(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+    ) -> Result<AppGroupMlsState, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::GroupMlsState {
                 group_id: group_id.clone(),
                 respond,
             })
@@ -1842,6 +1871,14 @@ pub struct AppGroupMemberRecord {
     pub member_id_hex: String,
     pub account: Option<String>,
     pub local: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppGroupMlsState {
+    pub group_id_hex: String,
+    pub epoch: u64,
+    pub member_count: usize,
+    pub required_app_components: Vec<u16>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -3424,9 +3461,13 @@ async fn run_app_runtime_account_worker(
                                 );
                             }
                             let _ = respond.send(result);
-                        }
+                    }
                     Some(AccountWorkerCommand::Members { group_id, respond }) => {
                         let result = client.members(&group_id);
+                        let _ = respond.send(result);
+                    }
+                    Some(AccountWorkerCommand::GroupMlsState { group_id, respond }) => {
+                        let result = client.group_mls_state(&group_id);
                         let _ = respond.send(result);
                     }
                     Some(AccountWorkerCommand::InviteMembers {
@@ -3807,6 +3848,23 @@ impl AppClient {
                 }
             })
             .collect())
+    }
+
+    pub fn group_mls_state(&self, group_id: &GroupId) -> Result<AppGroupMlsState, AppError> {
+        self.ensure_group(group_id)?;
+        let group = self.runtime.group_record(group_id)?;
+        Ok(AppGroupMlsState {
+            group_id_hex: hex::encode(group_id.as_slice()),
+            epoch: group.epoch.0,
+            member_count: group.members.len(),
+            required_app_components: group
+                .required_capabilities
+                .app_components
+                .ids
+                .iter()
+                .copied()
+                .collect(),
+        })
     }
 
     pub fn safe_export_secret(

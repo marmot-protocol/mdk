@@ -3737,6 +3737,19 @@ fn cli_can_inspect_projected_groups_messages_and_status() {
     assert_eq!(group["group"]["group_id"], group_id);
     assert_eq!(group["group"]["profile"]["name"], "general");
 
+    let group = run_json(
+        home.path(),
+        &["--account", &bob, "groups", "show", group_id],
+    );
+    assert_eq!(group["group"]["group_id"], group_id);
+    assert_eq!(group["group"]["profile"]["name"], "general");
+    assert_eq!(
+        group["group"]["nostr_routing"]["component"],
+        "marmot.transport.nostr.routing.v1"
+    );
+    assert_eq!(group["mls"]["epoch"], 1);
+    assert_eq!(group["mls"]["member_count"], 2);
+
     let first_send = run_json(
         home.path(),
         &[

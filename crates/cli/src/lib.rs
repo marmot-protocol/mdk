@@ -14,9 +14,9 @@ use clap::{Parser, Subcommand, ValueEnum};
 use marmot_account::{AccountError, AccountHome, AccountHomeError, DEFAULT_KEYCHAIN_SERVICE_NAME};
 use marmot_app::{
     AccountRelayListBootstrap, AccountRelayListStatus, AccountSetupRequest, AccountSetupResult,
-    AgentTextStreamFinishRequest, AppError, AppGroupMemberRecord, AppGroupRecord, AppMessageQuery,
-    AppMessageRecord, AppStatus, FetchedKeyPackage, MarmotApp, MarmotAppRuntime, SyncSummary,
-    UserDirectorySearch, UserProfileMetadata,
+    AgentTextStreamFinishRequest, AppError, AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord,
+    AppMessageQuery, AppMessageRecord, AppStatus, FetchedKeyPackage, MarmotApp, MarmotAppRuntime,
+    SyncSummary, UserDirectorySearch, UserProfileMetadata,
 };
 use nostr::ToBech32;
 use serde::{Deserialize, Serialize};
@@ -1998,7 +1998,7 @@ async fn chats_command(
         ChatsCommand::Show { group } => {
             let account = resolve_account(account_home, account_flag)?;
             ensure_local_signing(&account)?;
-            group_show_output(app, account, group)
+            group_show_output(app, account, group, None)
         }
         ChatsCommand::Subscribe => Err(DmError::MessagesSubscribeRequiresDaemon),
         ChatsCommand::Archive { group } => {
@@ -2299,7 +2299,14 @@ pub(crate) async fn groups_command_with_runtime(
         GroupsCommand::Show { group_id } => {
             let account = resolve_account(account_home, account_flag)?;
             ensure_local_signing(&account)?;
-            group_show_output(app, account, group_id)
+            app.status(&account.label)?;
+            let group_id_hex = normalize_group_id_hex(&group_id)?;
+            let group_id = GroupId::new(hex::decode(&group_id_hex)?);
+            let mls = runtime
+                .group_mls_state(&account.label, &group_id)
+                .await
+                .map(group_mls_state_json)?;
+            group_show_output(app, account, group_id_hex, Some(mls))
         }
         GroupsCommand::AddMembers { group_id, members } => {
             group_command_with_runtime(
@@ -2539,20 +2546,29 @@ fn group_show_output(
     app: &MarmotApp,
     account: marmot_account::AccountSummary,
     group: String,
+    mls: Option<Value>,
 ) -> Result<CommandOutput, DmError> {
     app.status(&account.label)?;
     let group_id = normalize_group_id_hex(&group)?;
     let group = app
         .group(&account.label, &group_id)?
         .ok_or_else(|| AppError::UnknownGroup(group_id.clone()))?;
-    Ok(CommandOutput {
-        plain: group_plain(&group),
-        json: json!({
+    let plain = group_plain(&group);
+    let group = group_json(group);
+    let json = match mls {
+        Some(mls) => json!({
             "account_id": account.account_id_hex,
             "npub": npub_for_account_id(&account.account_id_hex),
-            "group": group_json(group),
+            "group": group,
+            "mls": mls,
         }),
-    })
+        None => json!({
+            "account_id": account.account_id_hex,
+            "npub": npub_for_account_id(&account.account_id_hex),
+            "group": group,
+        }),
+    };
+    Ok(CommandOutput { plain, json })
 }
 
 fn group_archive_output(
@@ -4097,8 +4113,18 @@ fn group_json(group: AppGroupRecord) -> Value {
         "profile": group.profile,
         "image": group.image,
         "admin_policy": group.admin_policy,
+        "nostr_routing": group.nostr_routing,
         "agent_text_stream": group.agent_text_stream,
         "archived": group.archived,
+    })
+}
+
+fn group_mls_state_json(state: AppGroupMlsState) -> Value {
+    json!({
+        "group_id": state.group_id_hex,
+        "epoch": state.epoch,
+        "member_count": state.member_count,
+        "required_app_components": state.required_app_components,
     })
 }
 

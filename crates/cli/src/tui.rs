@@ -207,6 +207,22 @@ struct LiveStreamPreview {
     optimistic: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GroupDiagnostics {
+    group_id: String,
+    epoch: Option<u64>,
+    member_count: Option<u64>,
+    components: Vec<GroupComponentDiagnostics>,
+    error: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GroupComponentDiagnostics {
+    component: String,
+    component_id: Option<u64>,
+    data_hex: String,
+}
+
 #[derive(Debug)]
 enum SubscriptionEvent {
     Result(Value),
@@ -343,6 +359,7 @@ struct TuiApp {
     chat_subscription: Option<ChatSubscription>,
     message_subscription: Option<MessageSubscription>,
     daemon: DaemonView,
+    group_diagnostics: Option<GroupDiagnostics>,
     input: String,
     streaming: Option<StreamComposer>,
     status: String,
@@ -452,6 +469,7 @@ impl TuiApp {
             chat_subscription: None,
             message_subscription: None,
             daemon: DaemonView::default(),
+            group_diagnostics: None,
             input: String::new(),
             streaming: None,
             status: "loading accounts".to_owned(),
@@ -498,7 +516,8 @@ impl TuiApp {
             .constraints([
                 Constraint::Length(3),
                 Constraint::Min(8),
-                Constraint::Length(5),
+                Constraint::Length(3),
+                Constraint::Length(12),
             ])
             .split(area);
 
@@ -517,6 +536,7 @@ impl TuiApp {
         self.render_chats(frame, body[1]);
         self.render_messages(frame, body[2]);
         self.render_composer(frame, root[2]);
+        self.render_status_panel(frame, root[3]);
 
         if self.show_help {
             self.render_help(frame, centered_rect(70, 70, area));
@@ -649,17 +669,26 @@ impl TuiApp {
         } else {
             composer_display_text(&self.input)
         };
-        let lines = vec![
-            Line::from(vec![
-                Span::styled("> ", Style::default().fg(FOCUS_ACCENT)),
-                Span::raw(prompt),
-            ]),
-            Line::from(self.status.clone()),
-        ];
+        let lines = vec![Line::from(vec![
+            Span::styled("> ", Style::default().fg(FOCUS_ACCENT)),
+            Span::raw(prompt),
+        ])];
         frame.render_widget(
             Paragraph::new(lines)
                 .block(panel_block("Composer", self.focus == Focus::Composer))
                 .wrap(Wrap { trim: false }),
+            area,
+        );
+    }
+
+    fn render_status_panel(&self, frame: &mut Frame, area: Rect) {
+        frame.render_widget(
+            Paragraph::new(status_panel_lines(
+                &self.status,
+                self.group_diagnostics.as_ref(),
+            ))
+            .block(panel_block("Status", false))
+            .wrap(Wrap { trim: false }),
             area,
         );
     }
@@ -1469,6 +1498,7 @@ impl TuiApp {
             self.messages.clear();
             self.chat_subscription = None;
             self.message_subscription = None;
+            self.group_diagnostics = None;
             self.status = "no identities yet; create one with dm create-identity".to_owned();
             return Ok(());
         }
@@ -1479,6 +1509,9 @@ impl TuiApp {
         let Some(account) = self.selected_account_row().cloned() else {
             self.chats.clear();
             self.messages.clear();
+            self.chat_subscription = None;
+            self.message_subscription = None;
+            self.group_diagnostics = None;
             self.status = "no account selected".to_owned();
             return Ok(());
         };
@@ -1487,6 +1520,7 @@ impl TuiApp {
             self.messages.clear();
             self.chat_subscription = None;
             self.message_subscription = None;
+            self.group_diagnostics = None;
             self.status =
                 "selected account is public-only; choose a local signing account".to_owned();
             return Ok(());
@@ -1511,6 +1545,7 @@ impl TuiApp {
         if self.chats.is_empty() {
             self.messages.clear();
             self.message_subscription = None;
+            self.group_diagnostics = None;
             self.status = format!(
                 "loaded account {}; no chats",
                 shorten(&account_display_label(&account), 18)
@@ -1542,8 +1577,26 @@ impl TuiApp {
             self.status = format!("message subscription failed: {err}");
             return Ok(());
         }
+        self.refresh_group_diagnostics(&account_id, &group_id);
         self.status = format!("loaded {} message(s)", self.messages.len());
         Ok(())
+    }
+
+    fn refresh_group_diagnostics(&mut self, account_id: &str, group_id: &str) {
+        self.group_diagnostics = Some(
+            match self
+                .client
+                .run_json(Some(account_id), &["groups", "show", group_id])
+            {
+                Ok(result) => parse_group_diagnostics(&result).unwrap_or_else(|| {
+                    GroupDiagnostics::unavailable(
+                        group_id,
+                        "groups show did not return group diagnostics",
+                    )
+                }),
+                Err(err) => GroupDiagnostics::unavailable(group_id, err.to_string()),
+            },
+        );
     }
 
     fn ensure_chat_subscription(&mut self, account_id: &str) -> TuiResult<()> {
@@ -2789,6 +2842,112 @@ fn group_members_status(result: &Value) -> String {
     format!("members: {}", member_ref_summary(&members))
 }
 
+impl GroupDiagnostics {
+    fn unavailable(group_id: &str, error: impl Into<String>) -> Self {
+        Self {
+            group_id: group_id.to_owned(),
+            epoch: None,
+            member_count: None,
+            components: Vec::new(),
+            error: Some(error.into()),
+        }
+    }
+}
+
+fn parse_group_diagnostics(value: &Value) -> Option<GroupDiagnostics> {
+    let group = value.get("group")?;
+    let group_id = value_string(group, "group_id")?;
+    let mls = value.get("mls");
+    Some(GroupDiagnostics {
+        group_id,
+        epoch: mls
+            .and_then(|mls| mls.get("epoch"))
+            .and_then(Value::as_u64)
+            .or_else(|| group.get("epoch").and_then(Value::as_u64)),
+        member_count: mls
+            .and_then(|mls| mls.get("member_count"))
+            .and_then(Value::as_u64)
+            .or_else(|| group.get("member_count").and_then(Value::as_u64)),
+        components: group_component_diagnostics(group),
+        error: None,
+    })
+}
+
+fn group_component_diagnostics(group: &Value) -> Vec<GroupComponentDiagnostics> {
+    [
+        "profile",
+        "image",
+        "admin_policy",
+        "nostr_routing",
+        "agent_text_stream",
+    ]
+    .into_iter()
+    .filter_map(|key| {
+        let component = group.get(key)?;
+        Some(GroupComponentDiagnostics {
+            component: value_string(component, "component").unwrap_or_else(|| key.to_owned()),
+            component_id: component.get("component_id").and_then(Value::as_u64),
+            data_hex: value_string(component, "data_hex").unwrap_or_default(),
+        })
+    })
+    .collect()
+}
+
+fn status_panel_lines(status: &str, diagnostics: Option<&GroupDiagnostics>) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        Line::from(status.to_owned()),
+        Line::from(""),
+        Line::from(""),
+    ];
+    let Some(diagnostics) = diagnostics else {
+        lines.push(Line::from("MLS no group selected"));
+        return lines;
+    };
+    if let Some(error) = &diagnostics.error {
+        lines.push(Line::from(format!(
+            "MLS group={} unavailable: {}",
+            shorten(&diagnostics.group_id, 18),
+            error
+        )));
+        return lines;
+    }
+    let epoch = diagnostics
+        .epoch
+        .map(|epoch| epoch.to_string())
+        .unwrap_or_else(|| "unknown".to_owned());
+    let member_count = diagnostics
+        .member_count
+        .map(|member_count| member_count.to_string())
+        .unwrap_or_else(|| "unknown".to_owned());
+    lines.push(Line::from(format!(
+        "MLS epoch={epoch} group={} members={member_count}",
+        shorten(&diagnostics.group_id, 18)
+    )));
+    if diagnostics.components.is_empty() {
+        lines.push(Line::from("components: none"));
+        return lines;
+    }
+    lines.push(Line::from("components:"));
+    lines.extend(
+        diagnostics
+            .components
+            .iter()
+            .map(group_component_diagnostics_line),
+    );
+    lines
+}
+
+fn group_component_diagnostics_line(component: &GroupComponentDiagnostics) -> Line<'static> {
+    let id = component
+        .component_id
+        .map(|id| id.to_string())
+        .unwrap_or_else(|| "unknown".to_owned());
+    Line::from(format!(
+        "{} id={id} data={}",
+        component.component, component.data_hex
+    ))
+}
+
 fn selected_style(selected: bool) -> Style {
     if selected {
         Style::default()
@@ -3094,6 +3253,64 @@ mod tests {
         assert!(status.starts_with("members: "));
         assert!(status.contains("npub1bob"));
         assert!(status.contains("01234"));
+    }
+
+    #[test]
+    fn status_panel_lines_show_latest_status_then_mls_and_components() {
+        let diagnostics = parse_group_diagnostics(&serde_json::json!({
+            "group": {
+                "group_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "profile": {
+                    "component_id": 32769,
+                    "component": "marmot.group.profile.v1",
+                    "data_hex": "010203"
+                },
+                "admin_policy": {
+                    "component_id": 32771,
+                    "component": "marmot.group.admin-policy.v1",
+                    "data_hex": "aabbcc"
+                },
+                "agent_text_stream": {
+                    "component_id": 32774,
+                    "component": "marmot.group.agent-text-stream.quic.v1",
+                    "data_hex": "ffee"
+                }
+            },
+            "mls": {
+                "epoch": 7,
+                "member_count": 3
+            }
+        }))
+        .expect("diagnostics");
+
+        let rendered = status_panel_lines("loaded 2 message(s)", Some(&diagnostics))
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>();
+
+        assert_eq!(rendered[0], "loaded 2 message(s)");
+        assert_eq!(rendered[1], "");
+        assert_eq!(rendered[2], "");
+        assert_eq!(
+            rendered[3],
+            "MLS epoch=7 group=aaaaaaa...aaaaaaaa members=3"
+        );
+        assert_eq!(rendered[4], "components:");
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line == "marmot.group.profile.v1 id=32769 data=010203")
+        );
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line == "marmot.group.admin-policy.v1 id=32771 data=aabbcc")
+        );
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line == "marmot.group.agent-text-stream.quic.v1 id=32774 data=ffee")
+        );
     }
 
     #[test]
