@@ -357,7 +357,7 @@ jobs:
       uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
 
     - name: Setup Ruby
-      uses: ruby/setup-ruby@c4e5b1316158f92e3d49443a9d58b31d25ac0f8f # v1.306.0
+      uses: ruby/setup-ruby@afeafc3d1ab54a631816aba4c914a0081c12ff2f # v1.310.0
       with:
         ruby-version: '3.2'
 
@@ -475,7 +475,7 @@ jobs:
 
     - name: Setup Ruby for gem publishing
       if: startsWith(github.ref, 'refs/tags/v')
-      uses: ruby/setup-ruby@c4e5b1316158f92e3d49443a9d58b31d25ac0f8f # v1.306.0
+      uses: ruby/setup-ruby@afeafc3d1ab54a631816aba4c914a0081c12ff2f # v1.310.0
       with:
         ruby-version: '3.2'
 
