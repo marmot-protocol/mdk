@@ -16,7 +16,8 @@ clippy:
     cargo clippy --workspace --all-targets -- -D warnings
 
 test:
-    cargo test --workspace
+    cargo nextest run --workspace
+    cargo test --workspace --doc
 
 relay-up:
     docker compose up -d
@@ -38,19 +39,20 @@ e2e-test test="":
     #!/usr/bin/env bash
     set -euo pipefail
     if [ -z "{{test}}" ]; then
-        DARKMATTER_E2E_REQUIRE_RELAYS=1 cargo test -p darkmatter-cli --test cli real_local_relays_deliver_cli_messages_over_sdk_path -- --exact
+        DARKMATTER_E2E_REQUIRE_RELAYS=1 cargo nextest run -p darkmatter-cli --test cli -E 'test(=real_local_relays_deliver_cli_messages_over_sdk_path)'
     else
-        DARKMATTER_E2E_REQUIRE_RELAYS=1 cargo test -p darkmatter-cli --test cli "{{test}}"
+        DARKMATTER_E2E_REQUIRE_RELAYS=1 cargo nextest run -p darkmatter-cli --test cli "{{test}}"
     fi
 
 conformance:
-    cargo test -p cgka-conformance-simulator
+    cargo nextest run -p cgka-conformance-simulator
+    cargo test -p cgka-conformance-simulator --doc
 
 conformance-slow:
-    cargo test -p cgka-conformance-simulator --features conformance-slow
+    cargo nextest run -p cgka-conformance-simulator --features conformance-slow
 
 tracing-audit:
-    cargo test -p cgka-conformance-simulator --test tracing_audit
+    cargo nextest run -p cgka-conformance-simulator --test tracing_audit
 
 tamarin:
     @command -v tamarin-prover >/dev/null || { echo "error: tamarin-prover not found on PATH"; exit 127; }
