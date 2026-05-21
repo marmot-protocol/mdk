@@ -27,8 +27,8 @@ mod errors;
 mod subscriptions;
 
 use conversions::{
-    AccountSummaryFfi, AppGroupMemberRecordFfi, AppMessageRecordFfi, SendSummaryFfi,
-    UserProfileMetadataFfi, group_id_from_hex,
+    AccountSummaryFfi, AppGroupMemberRecordFfi, AppGroupMlsStateFfi, AppGroupRecordFfi,
+    AppMessageRecordFfi, SendSummaryFfi, UserProfileMetadataFfi, group_id_from_hex,
 };
 use errors::MarmotKitError;
 use subscriptions::{
@@ -273,12 +273,90 @@ impl Marmot {
         Ok(summary.into())
     }
 
+    /// Grant admin rights to `member_ref` (npub or hex). Requires the caller
+    /// to be an admin; publishes a group state update.
+    pub async fn promote_admin(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+        member_ref: String,
+    ) -> Result<SendSummaryFfi, MarmotKitError> {
+        let group_id = group_id_from_hex(&group_id_hex)?;
+        let summary = self
+            .runtime
+            .promote_admin(&account_ref, &group_id, &member_ref)
+            .await?;
+        Ok(summary.into())
+    }
+
+    /// Revoke `member_ref`'s admin rights.
+    pub async fn demote_admin(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+        member_ref: String,
+    ) -> Result<SendSummaryFfi, MarmotKitError> {
+        let group_id = group_id_from_hex(&group_id_hex)?;
+        let summary = self
+            .runtime
+            .demote_admin(&account_ref, &group_id, &member_ref)
+            .await?;
+        Ok(summary.into())
+    }
+
+    /// Step down as an admin of `group_id_hex` (demote the active account).
+    pub async fn self_demote_admin(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+    ) -> Result<SendSummaryFfi, MarmotKitError> {
+        let group_id = group_id_from_hex(&group_id_hex)?;
+        let summary = self
+            .runtime
+            .self_demote_admin(&account_ref, &group_id)
+            .await?;
+        Ok(summary.into())
+    }
+
+    /// Current MLS state (epoch, member count, required components) for the
+    /// conversation developer/debug view.
+    pub async fn group_mls_state(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+    ) -> Result<AppGroupMlsStateFfi, MarmotKitError> {
+        let group_id = group_id_from_hex(&group_id_hex)?;
+        let state = self
+            .runtime
+            .group_mls_state(&account_ref, &group_id)
+            .await?;
+        Ok(state.into())
+    }
+
+    /// Flag a group archived (or restore it). Local-only projection state —
+    /// it does not change membership or publish anything. The chats list
+    /// filters archived groups unless `include_archived` is set.
+    pub fn set_group_archived(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+        archived: bool,
+    ) -> Result<AppGroupRecordFfi, MarmotKitError> {
+        let account = self.runtime.accounts().resolve(&account_ref)?;
+        let group_id = group_id_from_hex(&group_id_hex)?;
+        let group_id_hex = hex::encode(group_id.as_slice());
+        let group = self
+            .app
+            .set_group_archived(&account.label, &group_id_hex, archived)?;
+        Ok(group.into())
+    }
+
     // -----------------------------------------------------------------------
     // Messaging
     // -----------------------------------------------------------------------
 
     /// Send a plain UTF-8 text message. Structured payloads (reactions,
-    /// deletes, media) go through dedicated methods.
+    /// replies, deletes, media) go through dedicated methods.
     pub async fn send_text(
         &self,
         account_ref: String,
@@ -289,6 +367,70 @@ impl Marmot {
         let summary = self
             .runtime
             .send_message(&account_ref, &group_id, text.into_bytes())
+            .await?;
+        Ok(summary.into())
+    }
+
+    /// React to `target_message_id` with `emoji` (an "add" reaction).
+    pub async fn react_to_message(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+        target_message_id: String,
+        emoji: String,
+    ) -> Result<SendSummaryFfi, MarmotKitError> {
+        let group_id = group_id_from_hex(&group_id_hex)?;
+        let summary = self
+            .runtime
+            .react_to_message(&account_ref, &group_id, &target_message_id, &emoji)
+            .await?;
+        Ok(summary.into())
+    }
+
+    /// Remove this account's reaction from `target_message_id`.
+    pub async fn unreact_from_message(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+        target_message_id: String,
+    ) -> Result<SendSummaryFfi, MarmotKitError> {
+        let group_id = group_id_from_hex(&group_id_hex)?;
+        let summary = self
+            .runtime
+            .unreact_from_message(&account_ref, &group_id, &target_message_id)
+            .await?;
+        Ok(summary.into())
+    }
+
+    /// Send `text` as a reply that quotes `target_message_id`.
+    pub async fn reply_to_message(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+        target_message_id: String,
+        text: String,
+    ) -> Result<SendSummaryFfi, MarmotKitError> {
+        let group_id = group_id_from_hex(&group_id_hex)?;
+        let summary = self
+            .runtime
+            .reply_to_message(&account_ref, &group_id, &target_message_id, &text)
+            .await?;
+        Ok(summary.into())
+    }
+
+    /// Mark `target_message_id` deleted for the whole group. This is a
+    /// tombstone — the original stays in everyone's store; clients render a
+    /// "message deleted" placeholder.
+    pub async fn delete_message(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+        target_message_id: String,
+    ) -> Result<SendSummaryFfi, MarmotKitError> {
+        let group_id = group_id_from_hex(&group_id_hex)?;
+        let summary = self
+            .runtime
+            .delete_message(&account_ref, &group_id, &target_message_id)
             .await?;
         Ok(summary.into())
     }

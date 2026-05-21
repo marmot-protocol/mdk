@@ -52,6 +52,13 @@ impl MarmotAppMessageEnvelopeV1 {
         Self::new(MarmotAppMessagePayloadV1::Media { reference, caption })
     }
 
+    pub fn reply(target_message_id: impl Into<String>, text: impl Into<String>) -> Self {
+        Self::new(MarmotAppMessagePayloadV1::Reply {
+            target_message_id: target_message_id.into(),
+            text: text.into(),
+        })
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         if self.marmot_payload != MARMOT_APP_MESSAGE_PAYLOAD_V1 {
             return Err("unexpected Marmot app-message payload marker".into());
@@ -98,6 +105,10 @@ pub enum MarmotAppMessagePayloadV1 {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         caption: Option<String>,
     },
+    Reply {
+        target_message_id: String,
+        text: String,
+    },
 }
 
 impl MarmotAppMessagePayloadV1 {
@@ -123,6 +134,15 @@ impl MarmotAppMessagePayloadV1 {
             }
             MarmotAppMessagePayloadV1::Media { reference, .. } => {
                 reference.validate()?;
+            }
+            MarmotAppMessagePayloadV1::Reply {
+                target_message_id,
+                text,
+            } => {
+                validate_message_ref(target_message_id)?;
+                if text.trim().is_empty() {
+                    return Err("reply requires non-empty text".into());
+                }
             }
         }
         Ok(())
@@ -196,6 +216,8 @@ pub fn display_text_for_app_message(payload: &MarmotAppMessagePayloadV1) -> Stri
             }
             _ => format!("media {}", reference.file_name),
         },
+        // A reply renders as a normal message; its display text is the body.
+        MarmotAppMessagePayloadV1::Reply { text, .. } => text.clone(),
     }
 }
 

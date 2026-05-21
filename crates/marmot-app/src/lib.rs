@@ -872,6 +872,22 @@ impl MarmotAppRuntime {
         .await
     }
 
+    pub async fn reply_to_message(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        target_message_id: &str,
+        text: &str,
+    ) -> Result<SendSummary, AppError> {
+        let envelope = MarmotAppMessageEnvelopeV1::reply(target_message_id, text);
+        self.send_message(
+            account_ref,
+            group_id,
+            encode_validated_app_message(&envelope)?,
+        )
+        .await
+    }
+
     pub async fn delete_message(
         &self,
         account_ref: &str,

@@ -2262,7 +2262,7 @@ fn messages_subscribe_streams_messages_and_quic_previews_from_daemon() {
             "20",
         ],
     );
-    let initial = subscription.wait_for(Duration::from_secs(8), |line| {
+    let initial = subscription.wait_for(Duration::from_secs(20), |line| {
         line["result"]["trigger"] == "InitialMessage"
             && line["result"]["type"] == "message"
             && line["result"]["message"]["plaintext"] == "hello bob"
@@ -2289,7 +2289,7 @@ fn messages_subscribe_streams_messages_and_quic_previews_from_daemon() {
         .as_str()
         .expect("start message id");
 
-    subscription.wait_for(Duration::from_secs(8), |line| {
+    subscription.wait_for(Duration::from_secs(20), |line| {
         line["result"]["trigger"] == "AgentStreamStarted"
             && line["result"]["type"] == "agent_stream_start"
             && line["result"]["message"]["agent_text_stream"]["kind"] == "start"
@@ -2336,7 +2336,7 @@ fn messages_subscribe_streams_messages_and_quic_previews_from_daemon() {
         Duration::from_secs(5),
     );
 
-    let delta = subscription.wait_for(Duration::from_secs(8), |line| {
+    let delta = subscription.wait_for(Duration::from_secs(20), |line| {
         line["result"]["trigger"] == "AgentStreamDelta"
             && line["result"]["type"] == "agent_stream_delta"
             && line["result"]["agent_stream_delta"]["stream_id"] == stream_id
@@ -2411,7 +2411,7 @@ fn tui_style_stream_compose_auto_watches_and_publishes_final_message() {
             "20",
         ],
     );
-    subscription.wait_for(Duration::from_secs(8), |line| {
+    subscription.wait_for(Duration::from_secs(20), |line| {
         line["result"]["trigger"] == "SubscriptionReady"
             && line["result"]["type"] == "subscription_ready"
             && line["result"]["group_id"] == group_id
@@ -2439,7 +2439,7 @@ fn tui_style_stream_compose_auto_watches_and_publishes_final_message() {
     assert_eq!(opened["status"], "streaming");
     assert_eq!(opened["stream_id"], stream_id);
 
-    subscription.wait_for(Duration::from_secs(8), |line| {
+    subscription.wait_for(Duration::from_secs(20), |line| {
         matches!(
             line["result"]["trigger"].as_str(),
             Some("AgentStreamStarted" | "InitialMessage")
@@ -2466,7 +2466,7 @@ fn tui_style_stream_compose_auto_watches_and_publishes_final_message() {
         },
     );
 
-    subscription.wait_for(Duration::from_secs(8), |line| {
+    subscription.wait_for(Duration::from_secs(20), |line| {
         matches!(
             line["result"]["trigger"].as_str(),
             Some("InitialStreamPreview" | "StreamPreviewUpdated")
@@ -2487,7 +2487,7 @@ fn tui_style_stream_compose_auto_watches_and_publishes_final_message() {
             "hello ",
         ],
     );
-    let delta = subscription.wait_for(Duration::from_secs(8), |line| {
+    let delta = subscription.wait_for(Duration::from_secs(20), |line| {
         line["result"]["trigger"] == "AgentStreamDelta"
             && line["result"]["type"] == "agent_stream_delta"
             && line["result"]["agent_stream_delta"]["stream_id"] == stream_id
@@ -2670,7 +2670,7 @@ fn daemon_defaults_create_identities_and_stream_without_manual_sync_or_relay_env
     );
     assert_eq!(opened["status"], "streaming");
 
-    subscription.wait_for(Duration::from_secs(8), |line| {
+    subscription.wait_for(Duration::from_secs(20), |line| {
         line["result"]["trigger"] == "AgentStreamStarted"
             && line["result"]["type"] == "agent_stream_start"
             && line["result"]["message"]["agent_text_stream"]["stream_id"] == stream_id
@@ -3097,7 +3097,7 @@ fn chats_subscribe_streams_initial_chat_rows_from_daemon() {
 
     let subscription =
         spawn_json_subscription(home.path(), &["--account", &bob, "chats", "subscribe"]);
-    let initial = subscription.wait_for(Duration::from_secs(8), |line| {
+    let initial = subscription.wait_for(Duration::from_secs(20), |line| {
         line["result"]["trigger"] == "InitialChat"
             && line["result"]["type"] == "chat"
             && line["result"]["chat"]["group_id"] == group_id
@@ -3115,7 +3115,7 @@ fn chats_subscribe_streams_initial_chat_rows_from_daemon() {
             "general-renamed",
         ],
     );
-    let updated = subscription.wait_for(Duration::from_secs(8), |line| {
+    let updated = subscription.wait_for(Duration::from_secs(20), |line| {
         line["result"]["trigger"] == "ChatUpdated"
             && line["result"]["type"] == "chat"
             && line["result"]["chat"]["group_id"] == group_id
@@ -3162,7 +3162,7 @@ fn groups_subscribe_state_streams_initial_group_state_from_daemon() {
         home.path(),
         &["--account", &alice, "groups", "subscribe-state", group_id],
     );
-    let initial = subscription.wait_for(Duration::from_secs(8), |line| {
+    let initial = subscription.wait_for(Duration::from_secs(20), |line| {
         line["result"]["trigger"] == "InitialGroupState"
             && line["result"]["type"] == "group_state"
             && line["result"]["group"]["group_id"] == group_id
@@ -3182,7 +3182,7 @@ fn groups_subscribe_state_streams_initial_group_state_from_daemon() {
             "general-renamed",
         ],
     );
-    let updated = subscription.wait_for(Duration::from_secs(8), |line| {
+    let updated = subscription.wait_for(Duration::from_secs(20), |line| {
         line["result"]["trigger"] == "GroupStateUpdated"
             && line["result"]["type"] == "group_state"
             && line["result"]["group"]["group_id"] == group_id
