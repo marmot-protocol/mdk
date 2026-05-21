@@ -23,6 +23,7 @@ const STREAM_APPEND_FLUSH_INTERVAL: Duration = Duration::from_millis(125);
 const FOCUS_ACCENT: Color = Color::Green;
 const ACCOUNT_ACCENT: Color = Color::White;
 const DEFAULT_STREAM_CANDIDATE: &str = "quic://127.0.0.1:4450";
+const SLASH_SUGGESTION_LIMIT: usize = 8;
 
 #[derive(Debug, thiserror::Error)]
 enum TuiError {
@@ -358,6 +359,127 @@ enum SlashCommand {
     Quit,
 }
 
+#[derive(Debug, Eq, PartialEq)]
+struct SlashCommandSuggestion {
+    usage: &'static str,
+    description: &'static str,
+}
+
+const SLASH_COMMAND_SUGGESTIONS: &[SlashCommandSuggestion] = &[
+    SlashCommandSuggestion {
+        usage: "/help",
+        description: "show full TUI help",
+    },
+    SlashCommandSuggestion {
+        usage: "/refresh",
+        description: "reload accounts and chats",
+    },
+    SlashCommandSuggestion {
+        usage: "/account <npub-or-hex>",
+        description: "select an account",
+    },
+    SlashCommandSuggestion {
+        usage: "/create-identity",
+        description: "create a local signing identity",
+    },
+    SlashCommandSuggestion {
+        usage: "/login <nsec-or-npub>",
+        description: "import or add an identity",
+    },
+    SlashCommandSuggestion {
+        usage: "/daemon status",
+        description: "show daemon state",
+    },
+    SlashCommandSuggestion {
+        usage: "/daemon start",
+        description: "start the daemon",
+    },
+    SlashCommandSuggestion {
+        usage: "/daemon stop",
+        description: "stop the daemon",
+    },
+    SlashCommandSuggestion {
+        usage: "/chat new <name> [member-npub-or-hex ...]",
+        description: "create a chat",
+    },
+    SlashCommandSuggestion {
+        usage: "/chat rename <name>",
+        description: "rename the selected chat",
+    },
+    SlashCommandSuggestion {
+        usage: "/chat describe <description>",
+        description: "update the selected chat description",
+    },
+    SlashCommandSuggestion {
+        usage: "/chat archive",
+        description: "archive the selected chat",
+    },
+    SlashCommandSuggestion {
+        usage: "/chat unarchive",
+        description: "unarchive the selected chat",
+    },
+    SlashCommandSuggestion {
+        usage: "/chat archived [on|off]",
+        description: "toggle archived chat visibility",
+    },
+    SlashCommandSuggestion {
+        usage: "/members add <npub-or-hex> [...]",
+        description: "add members to the selected chat",
+    },
+    SlashCommandSuggestion {
+        usage: "/members remove <npub-or-hex> [...]",
+        description: "remove members from the selected chat",
+    },
+    SlashCommandSuggestion {
+        usage: "/members list",
+        description: "show selected chat members",
+    },
+    SlashCommandSuggestion {
+        usage: "/keys fetch <npub-or-hex>",
+        description: "fetch another account's KeyPackage",
+    },
+    SlashCommandSuggestion {
+        usage: "/keys rotate",
+        description: "mint and publish a replacement KeyPackage",
+    },
+    SlashCommandSuggestion {
+        usage: "/name <display-name>",
+        description: "publish a profile display name",
+    },
+    SlashCommandSuggestion {
+        usage: "/profile name <display-name>",
+        description: "publish a profile display name",
+    },
+    SlashCommandSuggestion {
+        usage: "/stream [--stream-id <id>] [--quic-candidate <url>]",
+        description: "open the streaming composer",
+    },
+    SlashCommandSuggestion {
+        usage: "/stream start <quic-candidate> [...]",
+        description: "anchor an agent stream start",
+    },
+    SlashCommandSuggestion {
+        usage: "/stream watch [stream-id] [--insecure-local]",
+        description: "watch brokered stream previews",
+    },
+    SlashCommandSuggestion {
+        usage: "/stream status",
+        description: "show daemon stream-watch state",
+    },
+    SlashCommandSuggestion {
+        usage: "/stream finish <stream-id> <transcript-hash> <chunk-count> <text>",
+        description: "anchor an agent stream final",
+    },
+    SlashCommandSuggestion {
+        usage: "/stream verify <stream-id> <transcript-hash> [chunk-count]",
+        description: "verify a stream transcript",
+    },
+    SlashCommandSuggestion {
+        usage: "/quit",
+        description: "exit the TUI",
+    },
+];
+
 struct TuiApp {
     client: DmClient,
     initial_account: Option<String>,
@@ -560,6 +682,7 @@ impl TuiApp {
         self.render_messages(frame, body[2]);
         self.render_composer(frame, root[2]);
         self.render_status_panel(frame, root[3]);
+        self.render_slash_suggestions(frame, root[2]);
 
         if self.show_help {
             self.render_help(frame, centered_rect(70, 70, area));
@@ -683,7 +806,7 @@ impl TuiApp {
         let prompt = if self.streaming.is_some() && self.input.is_empty() {
             "streaming... type text, Enter finishes, Esc cancels".to_owned()
         } else if self.input.is_empty() {
-            "type a message or /help".to_owned()
+            "type a message or / for commands".to_owned()
         } else {
             composer_display_text(&self.input)
         };
@@ -694,6 +817,32 @@ impl TuiApp {
         frame.render_widget(
             Paragraph::new(lines)
                 .block(panel_block("Composer", self.focus == Focus::Composer))
+                .wrap(Wrap { trim: false }),
+            area,
+        );
+    }
+
+    fn render_slash_suggestions(&self, frame: &mut Frame, composer_area: Rect) {
+        if self.focus != Focus::Composer || self.streaming.is_some() || self.show_help {
+            return;
+        }
+        let lines = slash_suggestion_lines(&self.input, SLASH_SUGGESTION_LIMIT);
+        if lines.is_empty() || composer_area.width < 12 || composer_area.y == 0 {
+            return;
+        }
+
+        let height = (lines.len() as u16 + 2).min(composer_area.y);
+        let width = composer_area.width.saturating_sub(4).clamp(12, 84);
+        let area = Rect {
+            x: composer_area.x + (composer_area.width.saturating_sub(width) / 2),
+            y: composer_area.y - height,
+            width,
+            height,
+        };
+        frame.render_widget(Clear, area);
+        frame.render_widget(
+            Paragraph::new(lines)
+                .block(Block::default().borders(Borders::ALL).title("Commands"))
                 .wrap(Wrap { trim: false }),
             area,
         );
@@ -786,12 +935,14 @@ impl TuiApp {
                 self.input.pop();
             }
             KeyCode::Char('/') if self.focus != Focus::Composer => {
+                self.show_help = false;
                 self.focus = Focus::Composer;
                 self.input.push('/');
             }
             KeyCode::Char('j') if self.focus != Focus::Composer => self.move_selection(1),
             KeyCode::Char('k') if self.focus != Focus::Composer => self.move_selection(-1),
             KeyCode::Char(character) if self.focus == Focus::Composer => {
+                self.show_help = false;
                 self.input.push(character);
             }
             _ => {}
@@ -2068,6 +2219,86 @@ fn parse_slash_command(input: &str) -> Result<SlashCommand, String> {
         "quit" | "q" => Ok(SlashCommand::Quit),
         other => Err(format!("unknown slash command: /{other}")),
     }
+}
+
+fn slash_command_suggestions(input: &str) -> Vec<&'static SlashCommandSuggestion> {
+    if !is_slash_command_input(input) {
+        return Vec::new();
+    }
+    SLASH_COMMAND_SUGGESTIONS
+        .iter()
+        .filter(|suggestion| slash_suggestion_matches(input, suggestion))
+        .collect()
+}
+
+fn slash_suggestion_lines(input: &str, limit: usize) -> Vec<Line<'static>> {
+    if !is_slash_command_input(input) {
+        return Vec::new();
+    }
+
+    let suggestions = slash_command_suggestions(input);
+    if suggestions.is_empty() {
+        return vec![Line::from(Span::styled(
+            "no matching commands",
+            Style::default().fg(Color::DarkGray),
+        ))];
+    }
+
+    suggestions
+        .into_iter()
+        .take(limit)
+        .map(|suggestion| {
+            Line::from(vec![
+                Span::styled(
+                    suggestion.usage,
+                    Style::default()
+                        .fg(FOCUS_ACCENT)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("  "),
+                Span::raw(suggestion.description),
+            ])
+        })
+        .collect()
+}
+
+fn is_slash_command_input(input: &str) -> bool {
+    input.starts_with('/')
+}
+
+fn slash_suggestion_matches(input: &str, suggestion: &SlashCommandSuggestion) -> bool {
+    let typed_words = input
+        .to_ascii_lowercase()
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if typed_words.is_empty() {
+        return true;
+    }
+
+    let literal_words = suggestion
+        .usage
+        .split_whitespace()
+        .take_while(|word| !word.starts_with('<') && !word.starts_with('['))
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>();
+
+    for (index, typed_word) in typed_words.iter().enumerate() {
+        let Some(literal_word) = literal_words.get(index) else {
+            return slash_suggestion_accepts_arguments(suggestion);
+        };
+        if !literal_word.starts_with(typed_word) {
+            return false;
+        }
+    }
+    true
+}
+
+fn slash_suggestion_accepts_arguments(suggestion: &SlashCommandSuggestion) -> bool {
+    suggestion
+        .usage
+        .split_whitespace()
+        .any(|word| word.starts_with('<') || word.starts_with('['))
 }
 
 fn split_slash_command_words(input: &str) -> Result<Vec<String>, String> {
@@ -3378,6 +3609,61 @@ mod tests {
             Ok(SlashCommand::Account("npub1abc".to_owned()))
         );
         assert!(parse_slash_command("/new general npub1bob").is_err());
+    }
+
+    #[test]
+    fn slash_command_suggestions_open_on_bare_slash_and_filter_nested_commands() {
+        let bare = slash_command_suggestions("/")
+            .iter()
+            .map(|suggestion| suggestion.usage)
+            .collect::<Vec<_>>();
+
+        assert!(bare.contains(&"/help"));
+        assert!(bare.contains(&"/chat new <name> [member-npub-or-hex ...]"));
+        assert!(bare.contains(&"/members add <npub-or-hex> [...]"));
+
+        let chat_rename = slash_command_suggestions("/chat r")
+            .iter()
+            .map(|suggestion| suggestion.usage)
+            .collect::<Vec<_>>();
+        assert_eq!(chat_rename, vec!["/chat rename <name>"]);
+
+        let chat_new_with_name = slash_command_suggestions("/chat new general")
+            .iter()
+            .map(|suggestion| suggestion.usage)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            chat_new_with_name,
+            vec!["/chat new <name> [member-npub-or-hex ...]"]
+        );
+
+        assert!(slash_command_suggestions("/daemon status now").is_empty());
+        assert!(slash_command_suggestions("hello").is_empty());
+    }
+
+    #[test]
+    fn composer_renders_filtered_slash_command_popup() {
+        let mut app = test_tui_app(
+            test_unused_client(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        );
+        app.input = "/chat r".to_owned();
+
+        let backend = ratatui::backend::TestBackend::new(100, 30);
+        let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+        terminal.draw(|frame| app.render(frame)).expect("draw TUI");
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(rendered.contains("Commands"));
+        assert!(rendered.contains("/chat rename <name>"));
+        assert!(!rendered.contains("/members add <npub-or-hex>"));
     }
 
     #[test]
