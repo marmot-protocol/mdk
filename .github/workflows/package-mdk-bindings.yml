@@ -25,7 +25,14 @@ env:
 
 jobs:
   package-swift:
-    runs-on: macos-latest
+    # Pin to macos-26 so the iOS SDK we build against matches what
+    # downstream consumers on Xcode 26 expect. macos-latest currently resolves
+    # to macos-15-arm64 whose default Xcode is 16.x (iPhoneSimulator 18.5 SDK),
+    # and the resulting sim slice — while structurally a valid iossimulator
+    # build — mixes sdk=18.5 and sdk=26.x objects, which Xcode 26's stricter
+    # linker rejects with the platform-mismatch error reported in
+    # marmot-protocol/mdk-swift#1.
+    runs-on: macos-26
     name: Build and Package Swift Bindings
 
     steps:
