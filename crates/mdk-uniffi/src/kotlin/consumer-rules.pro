@@ -6,3 +6,7 @@
 -keep class com.sun.jna.** { *; }
 -keep class * extends com.sun.jna.** { *; }
 -keep class build.marmot.mdk.** { *; }
+
+# JNA's Native$AWT references java.awt.* which doesn't exist on Android.
+# Without this, R8 fails consumer builds with "Missing class java.awt.Component" etc.
+-dontwarn java.awt.**
