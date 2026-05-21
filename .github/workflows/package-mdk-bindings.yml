@@ -48,6 +48,17 @@ jobs:
 
     - name: Cache Rust dependencies
       uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      with:
+        # Skip target/ caching: published xcframework artifacts must reflect
+        # the current toolchain. Swatinem keys on Darwin-arm64 + Cargo.lock
+        # hash + Rust version, none of which change when we bump the macOS
+        # runner image, so a cache hit would silently restore C-dep object
+        # files (libsqlite3-sys, secp256k1-sys) compiled against the previous
+        # runner's iOS SDK. That's exactly what happened on the macos-26
+        # pin in #312: cache hit -> stale sdk=18.5 objects -> byte-identical
+        # libmdk_uniffi.a republished to mdk-swift. The registry/crate-source
+        # cache is harmless, so leave that on.
+        cache-targets: false
 
     - name: Install just
       uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
