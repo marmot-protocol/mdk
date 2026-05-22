@@ -13,7 +13,8 @@ final MLS app-message payload remains authoritative.
 - Subscribers open a QUIC bidirectional stream, send one broker control frame, then receive matching record frames from
   the broker.
 - Rooms are keyed by `stream_id + start_event_id`.
-- Subscriber queues are bounded and live-only. When the publisher finishes, the room is removed.
+- Subscriber queues are bounded and live-only.
+- Finished rooms retain bounded backlog for 60 seconds so late subscribers can still replay the completed preview.
 
 ## Run
 
