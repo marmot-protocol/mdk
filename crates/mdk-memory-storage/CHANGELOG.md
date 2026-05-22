@@ -31,6 +31,8 @@
 
 ### Added
 
+- Implemented `delete_message`, `delete_messages_before_timestamp`, and `delete_processed_messages_for_group` for per-message and bulk expiry-based deletion. `delete_message` and `delete_messages_before_timestamp` scope `messages_cache` eviction to the owning group so a coincident `EventId` in another group cannot be evicted by accident. Part 3 of #253. ([#315](https://github.com/marmot-protocol/mdk/pull/315))
+
 ### Fixed
 
 - Fixed `MdkMemoryStorage::save_welcome` to reject oversized welcome group metadata and serialized event JSON before caching welcomes, matching SQLite backend payload bounds. ([#276](https://github.com/marmot-protocol/mdk/pull/276))
@@ -56,7 +58,6 @@
 - Added `MdkMemoryStorage::signature_key_count` under the `test-utils` feature. Cardinality probe over the signer store for invariant tests that need to observe store growth when the fresh signer's public key is generated internally and therefore cannot be rediscovered via `SignatureKeyPair::read`. ([#262](https://github.com/marmot-protocol/mdk/pull/262))
 - Propagated `disappearing_message_secs` field through all `Group` construction sites for the new disappearing messages feature. ([#258](https://github.com/marmot-protocol/mdk/pull/258))
 - Implemented `delete_messages_for_group` and `delete_group` for local "clear chat" and "delete chat" operations. Added `clear_group` methods to `MlsGroupData` and `MlsEpochKeyPairs` for bulk group-scoped MLS state cleanup. ([#250](https://github.com/marmot-protocol/mdk/pull/250))
-- Implemented `delete_message`, `delete_messages_before_timestamp`, and `delete_processed_messages_for_group` for per-message and bulk expiry-based deletion.
 - Implemented legacy exporter-secret compatibility storage for the temporary `0.6.x -> 0.7.x` migration window, including snapshot and restore support for preserved pre-0.7.0 group-event secrets. ([#222](https://github.com/marmot-protocol/mdk/pull/222))
 
 ### Fixed

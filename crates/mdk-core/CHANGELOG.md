@@ -38,6 +38,7 @@
 - `create_group` and `update_group_data` now reject `Some(0)` (or `Some(Some(0))` on updates) with `Error::Group`. Callers must use `None` (or `Some(None)` on updates) to disable. Part 2 of #253. ([#306](https://github.com/marmot-protocol/mdk/pull/306))
 - Outer kind:445 wrappers built by `build_message_event` (messages, proposals, commits) automatically carry a NIP-40 `expiration` tag when the group has a `disappearing_message_secs` set. If the caller also supplies an expiration tag, the earliest of the two is used — the caller can request a shorter ephemeral lifetime but never extend the group's setting. The event's `created_at` is pinned to the same snapshot used for the expiration math. Part 2 of #253. ([#306](https://github.com/marmot-protocol/mdk/pull/306))
 - Added `KeyPackageOptions::existing_d_tag: Option<String>` so callers can supply a previously stored `d` tag value when rotating a KeyPackage. When `Some`, the value is validated (non-empty, exactly 64 ASCII hex digits per MIP-00) and used directly for both the kind:30443 `Tag::identifier(...)` and the returned `KeyPackageEventData::d_tag`; no random `d` is generated. When `None`, the existing random 32-byte hex behavior is preserved. Validation matches the MIP-00 constraint enforced by `parse_key_package`, so caller-supplied values round-trip through publication and re-parsing. The `mdk_core::key_packages::validate_existing_d_tag` helper is also re-exported as `pub` so consumers (and the UniFFI binding) can pre-validate before calling. Closes the ergonomics gap that previously forced consumers (e.g. whitenoise-rs) to post-edit the tag list to keep their NIP-33 addressable slot stable across rotations. ([#303](https://github.com/marmot-protocol/mdk/pull/303))
+- Added `delete_message`, `delete_messages_before_timestamp`, and `delete_processed_messages_for_group` public methods on `MDK` for granular message deletion supporting disappearing-message cleanup by the client. Part 3 of #253. ([#315](https://github.com/marmot-protocol/mdk/pull/315))
 
 ### Fixed
 
@@ -91,7 +92,6 @@
 - Admin depletion validation: SelfRemove proposals and commits are rejected if they would leave the group with zero admins. ([#236](https://github.com/marmot-protocol/mdk/pull/236))
 - Added feature-gated MIP-05 notification request builders that group token tags by notification server, preserve relay hints, chunk requests at 100 tokens per server, and return ready-to-publish gift-wrapped notification batches for `kind:446` delivery. ([#238](https://github.com/marmot-protocol/mdk/pull/238))
 - `create_message` now accepts an optional `tags` parameter of type `Vec<EventTag>` for appending allow-listed tags (e.g. NIP-40 `expiration`) to the outer kind:445 wrapper event. The `EventTag` enum enforces at compile time which tags are permitted. ([#248](https://github.com/marmot-protocol/mdk/pull/248))
-- Added `delete_message`, `delete_messages_before_timestamp`, and `delete_processed_messages_for_group` public methods on `MDK` for granular message deletion supporting disappearing-message cleanup by the client.
 
 ### Fixed
 

@@ -41,6 +41,7 @@
 
 - Added UniFFI bindings for group capability inspection and upgrades: `group_member_capabilities`, `group_capability_upgrade_status`, and `upgrade_group_capabilities`, plus binding-safe records and enums for member capability snapshots and upgrade readiness. ([#301](https://github.com/marmot-protocol/mdk/pull/301))
 - Added the `KeyPackageOptions` UniFFI record (fields: `protected: Boolean`, `existing_d_tag: Option<String>`). Pass a previously stored `d_tag` (the value returned in `KeyPackageResult.d_tag`) via `existing_d_tag` to rotate a KeyPackage while keeping the NIP-33 addressable slot stable — no more post-editing the tag list before signing. The value is validated at the FFI boundary (exactly 64 ASCII hex characters per MIP-00) so callers see `MdkUniffiError.InvalidInput` directly on malformed input. ([#303](https://github.com/marmot-protocol/mdk/pull/303))
+- Added UniFFI bindings for `delete_message`, `delete_messages_before_timestamp`, and `delete_processed_messages_for_group`, exposing the new granular deletion APIs to Kotlin and Swift consumers for disappearing-message cleanup. Part 3 of #253. ([#315](https://github.com/marmot-protocol/mdk/pull/315))
 
 ### Fixed
 

@@ -33,6 +33,9 @@
 
 ### Added
 
+- Implemented `delete_message`, `delete_messages_before_timestamp`, and `delete_processed_messages_for_group` for per-message and bulk expiry-based deletion. Part 3 of #253. ([#315](https://github.com/marmot-protocol/mdk/pull/315))
+- Enabled `PRAGMA secure_delete = ON` on every connection init so deleted data (including expired disappearing messages) is overwritten with zeros on disk, blocking forensic recovery from the database file. Part 3 of #253. ([#315](https://github.com/marmot-protocol/mdk/pull/315))
+
 ### Fixed
 
 - `delete_group` now scrubs `processed_welcomes` rows for the group via a join through `welcomes` on `wrapper_event_id`, ordered before the existing `welcomes` delete. Previously these rows survived deletion, leaking `wrapper_event_id`, `welcome_event_id`, `processed_at`, `state`, and unsanitized `failure_reason` linkable to the deleted group, and tripping the welcome dedup path on re-processing. Closes [marmot-protocol/marmot-security#68](https://github.com/marmot-protocol/marmot-security/issues/68). ([#293](https://github.com/marmot-protocol/mdk/pull/293))
@@ -57,8 +60,6 @@
 
 - Added V006 migration adding `disappearing_message_secs INTEGER` column to the `groups` table for disappearing message support. `NULL` means disabled; a positive integer means messages expire after that many seconds. `row_to_group` updated to read the new column. ([#258](https://github.com/marmot-protocol/mdk/pull/258))
 - Implemented `delete_messages_for_group` and `delete_group` for local "clear chat" and "delete chat" operations. `delete_group` runs all deletes in a single `BEGIN IMMEDIATE` transaction covering OpenMLS tables, MDK tables, and `processed_messages`. ([#250](https://github.com/marmot-protocol/mdk/pull/250))
-- Implemented `delete_message`, `delete_messages_before_timestamp`, and `delete_processed_messages_for_group` for per-message and bulk expiry-based deletion.
-- Enabled `PRAGMA secure_delete = ON` so that deleted data (including expired disappearing messages) is overwritten with zeros on disk, preventing forensic recovery from the database file.
 - Implemented legacy exporter-secret compatibility storage for the temporary `0.6.x -> 0.7.x` migration window, including read/write support for preserved pre-0.7.0 group-event secrets and snapshot rollback restoration into the legacy compatibility label. ([#222](https://github.com/marmot-protocol/mdk/pull/222))
 
 ### Fixed

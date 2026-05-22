@@ -29,12 +29,14 @@
 
 - Changed default serde serialization for `Secret<T>` to fail instead of emitting wrapped secret values. Use `Secret::expose_for_serialization()` for deliberate plaintext exports. ([#280](https://github.com/marmot-protocol/mdk/pull/280))
 - Added `disappearing_message_secs: Option<u64>` field to the `Group` struct. All code that constructs `Group` structs must now provide this field. `None` means messages persist forever; `Some(n)` means messages expire after `n` seconds. ([#253](https://github.com/marmot-protocol/mdk/pull/253))
+- Added `MessageStorage::delete_message`, `MessageStorage::delete_messages_before_timestamp`, and `MessageStorage::delete_processed_messages_for_group` to the trait. Storage implementations must add these methods. Part 3 of #253. ([#315](https://github.com/marmot-protocol/mdk/pull/315))
 
 ### Changed
 
 ### Added
 
 - Added `MAX_FAILURE_REASON_LEN` (256 bytes) and `truncate_failure_reason(Option<String>) -> Option<String>` so storage backends can defensively cap the length of `failure_reason` values before persistence, with UTF-8-safe truncation that walks back to a valid char boundary. Closes [marmot-protocol/marmot-security#19](https://github.com/marmot-protocol/marmot-security/issues/19). ([#307](https://github.com/marmot-protocol/mdk/pull/307))
+- `MessageStorage::delete_message` enables per-message deletion. `MessageStorage::delete_messages_before_timestamp` enables bulk expiry-based deletion. `MessageStorage::delete_processed_messages_for_group` clears the dedup metadata for a group. These methods support disappearing-message implementation by the client. Part 3 of #253. ([#315](https://github.com/marmot-protocol/mdk/pull/315))
 
 ### Fixed
 
@@ -50,7 +52,6 @@
 ### Breaking changes
 
 - Added `MessageStorage::delete_messages_for_group` and `MdkStorageProvider::delete_group` for local "clear chat" and "delete chat" operations. Storage implementations must add these methods. ([#250](https://github.com/marmot-protocol/mdk/pull/250))
-- Added `MessageStorage::delete_message`, `MessageStorage::delete_messages_before_timestamp`, and `MessageStorage::delete_processed_messages_for_group` to the trait. Storage implementations must add these methods.
 - Added `GroupStorage::get_group_legacy_exporter_secret` and `GroupStorage::save_group_legacy_exporter_secret` so storage backends can preserve pre-0.7.0 exporter-secret bytes separately during the temporary migration-compatibility window. Storage implementations must add these methods. ([#222](https://github.com/marmot-protocol/mdk/pull/222))
 
 ### Changed
@@ -64,7 +65,6 @@
 ### Added
 
 - `GroupStorage::get_group_legacy_exporter_secret` and `GroupStorage::save_group_legacy_exporter_secret` store and retrieve preserved pre-0.7.0 exporter-secret bytes for the temporary migration-compatibility window, returning a group-scoped secret when one was preserved for that epoch. ([#222](https://github.com/marmot-protocol/mdk/pull/222))
-- Added `MessageStorage::delete_message` for per-message deletion, `MessageStorage::delete_messages_before_timestamp` for bulk expiry-based deletion, and `MessageStorage::delete_processed_messages_for_group` for metadata cleanup. These methods support disappearing-message implementation by the client.
 
 ### Fixed
 
