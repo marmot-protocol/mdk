@@ -7,7 +7,7 @@
 //! Here we also define the storage traits that are used to store and retrieve messages
 
 use crate::GroupId;
-use nostr::EventId;
+use nostr::{EventId, Timestamp};
 
 pub mod error;
 pub mod types;
@@ -114,9 +114,46 @@ pub trait MessageStorage {
     /// Delete all stored messages for a group.
     ///
     /// Removes decrypted message content from local storage. Does not affect
-    /// processed message records, the group's MLS state, or epoch secrets.
+    /// processed message records (which act as deduplication guards to prevent
+    /// reprocessing), the group's MLS state, or epoch secrets.
     ///
     /// Returns the number of messages deleted. Deleting messages for a group
     /// with no messages returns `Ok(0)`.
     fn delete_messages_for_group(&self, group_id: &GroupId) -> Result<usize, MessageError>;
+
+    /// Delete a single message by event ID within a group.
+    ///
+    /// Removes the decrypted message content from local storage. Does not
+    /// affect processed message records, the group's MLS state, or epoch
+    /// secrets.
+    ///
+    /// Returns `Ok(true)` if the message was found and deleted, `Ok(false)`
+    /// if no message with the given event ID exists in the group.
+    fn delete_message(&self, group_id: &GroupId, event_id: &EventId) -> Result<bool, MessageError>;
+
+    /// Delete all messages in a group that were created before the given
+    /// timestamp.
+    ///
+    /// This is intended for disappearing-message cleanup: the caller
+    /// computes `now - duration` and passes it as `before`. All messages
+    /// with `created_at < before` are removed.
+    ///
+    /// Returns the number of messages deleted.
+    fn delete_messages_before_timestamp(
+        &self,
+        group_id: &GroupId,
+        before: Timestamp,
+    ) -> Result<usize, MessageError>;
+
+    /// Delete all processed message records for a group.
+    ///
+    /// Removes tracking metadata (wrapper event IDs, epochs, processing
+    /// state) from local storage. This means previously-seen events may be
+    /// reprocessed if encountered again.
+    ///
+    /// Returns the number of processed message records deleted.
+    fn delete_processed_messages_for_group(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<usize, MessageError>;
 }

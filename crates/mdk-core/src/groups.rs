@@ -2099,6 +2099,56 @@ where
             .map_err(|e| Error::Group(e.to_string()))
     }
 
+    /// Delete a single message by event ID within a group.
+    ///
+    /// Removes the decrypted message content from storage. Does not affect
+    /// processed message records.
+    ///
+    /// Returns `Ok(true)` if the message was found and deleted, `Ok(false)`
+    /// if no message with the given event ID exists in the group.
+    ///
+    /// This is a local-only operation — no MLS proposals or Nostr events
+    /// are published.
+    pub fn delete_message(&self, group_id: &GroupId, event_id: &EventId) -> Result<bool, Error> {
+        self.storage()
+            .delete_message(group_id, event_id)
+            .map_err(|e| Error::Group(e.to_string()))
+    }
+
+    /// Delete all messages in a group created before the given timestamp.
+    ///
+    /// Intended for disappearing-message cleanup: compute
+    /// `now - disappearing_message_secs` and pass it as `before`.
+    ///
+    /// Returns the number of messages deleted.
+    ///
+    /// This is a local-only operation — no MLS proposals or Nostr events
+    /// are published.
+    pub fn delete_messages_before_timestamp(
+        &self,
+        group_id: &GroupId,
+        before: Timestamp,
+    ) -> Result<usize, Error> {
+        self.storage()
+            .delete_messages_before_timestamp(group_id, before)
+            .map_err(|e| Error::Group(e.to_string()))
+    }
+
+    /// Delete all processed message records for a group.
+    ///
+    /// Removes tracking metadata from local storage. Previously-seen events
+    /// may be reprocessed if encountered again.
+    ///
+    /// Returns the number of records deleted.
+    ///
+    /// This is a local-only operation — no MLS proposals or Nostr events
+    /// are published.
+    pub fn delete_processed_messages_for_group(&self, group_id: &GroupId) -> Result<usize, Error> {
+        self.storage()
+            .delete_processed_messages_for_group(group_id)
+            .map_err(|e| Error::Group(e.to_string()))
+    }
+
     /// Delete all local state for a group.
     ///
     /// Removes everything MDK stores for this group: messages, processed

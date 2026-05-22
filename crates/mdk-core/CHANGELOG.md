@@ -91,6 +91,7 @@
 - Admin depletion validation: SelfRemove proposals and commits are rejected if they would leave the group with zero admins. ([#236](https://github.com/marmot-protocol/mdk/pull/236))
 - Added feature-gated MIP-05 notification request builders that group token tags by notification server, preserve relay hints, chunk requests at 100 tokens per server, and return ready-to-publish gift-wrapped notification batches for `kind:446` delivery. ([#238](https://github.com/marmot-protocol/mdk/pull/238))
 - `create_message` now accepts an optional `tags` parameter of type `Vec<EventTag>` for appending allow-listed tags (e.g. NIP-40 `expiration`) to the outer kind:445 wrapper event. The `EventTag` enum enforces at compile time which tags are permitted. ([#248](https://github.com/marmot-protocol/mdk/pull/248))
+- Added `delete_message`, `delete_messages_before_timestamp`, and `delete_processed_messages_for_group` public methods on `MDK` for granular message deletion supporting disappearing-message cleanup by the client.
 
 ### Fixed
 

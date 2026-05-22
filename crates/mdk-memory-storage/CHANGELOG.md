@@ -56,6 +56,7 @@
 - Added `MdkMemoryStorage::signature_key_count` under the `test-utils` feature. Cardinality probe over the signer store for invariant tests that need to observe store growth when the fresh signer's public key is generated internally and therefore cannot be rediscovered via `SignatureKeyPair::read`. ([#262](https://github.com/marmot-protocol/mdk/pull/262))
 - Propagated `disappearing_message_secs` field through all `Group` construction sites for the new disappearing messages feature. ([#258](https://github.com/marmot-protocol/mdk/pull/258))
 - Implemented `delete_messages_for_group` and `delete_group` for local "clear chat" and "delete chat" operations. Added `clear_group` methods to `MlsGroupData` and `MlsEpochKeyPairs` for bulk group-scoped MLS state cleanup. ([#250](https://github.com/marmot-protocol/mdk/pull/250))
+- Implemented `delete_message`, `delete_messages_before_timestamp`, and `delete_processed_messages_for_group` for per-message and bulk expiry-based deletion.
 - Implemented legacy exporter-secret compatibility storage for the temporary `0.6.x -> 0.7.x` migration window, including snapshot and restore support for preserved pre-0.7.0 group-event secrets. ([#222](https://github.com/marmot-protocol/mdk/pull/222))
 
 ### Fixed
