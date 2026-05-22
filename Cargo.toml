@@ -60,7 +60,7 @@ rustls-pemfile = "2"
 nostr = { version = "0.44.2", default-features = false, features = ["std", "nip59"] }
 nostr-sdk = { version = "0.44", features = ["nip59"] }
 nostr-relay-builder = "0.44"
-rusqlite = { version = "0.32", features = ["bundled-sqlcipher-vendored-openssl"] }
+rusqlite = { version = "0.32", features = ["bundled-sqlcipher-vendored-openssl", "trace"] }
 tempfile = "3"
 
 # test
