@@ -10,8 +10,10 @@
 //! - State guard: not allowed during PendingPublish.
 
 use async_trait::async_trait;
-use cgka_engine::canonicalization::SyncState;
+use cgka_engine::DEFAULT_CIPHERSUITE;
+use cgka_engine::canonicalization::{DroppedMessageReason, SyncState};
 use cgka_engine::feature_registry::FeatureRegistry;
+use cgka_engine::provider::EngineOpenMlsProvider;
 use cgka_engine::{Engine, EngineBuilder};
 use cgka_traits::EngineError;
 use cgka_traits::app_components::{AppComponentData, GROUP_ADMIN_POLICY_COMPONENT_ID};
@@ -20,13 +22,23 @@ use cgka_traits::engine::{CgkaEngine, CreateGroupRequest, SendIntent, SendResult
 use cgka_traits::error::PeelerError;
 use cgka_traits::group_context::GroupContextSnapshot;
 use cgka_traits::ingest::{PeeledContent, PeeledMessage};
+use cgka_traits::message::MessageState;
 use cgka_traits::peeler::TransportPeeler;
-use cgka_traits::storage::GroupStorage;
+use cgka_traits::storage::{
+    AccountDeviceSignerStorage, GroupStorage, MessageStorage, StorageProvider,
+};
 use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };
 use cgka_traits::types::{GroupId, MemberId, MessageId};
+use openmls::component::ComponentData;
+use openmls::group::MlsGroup;
+use openmls::messages::proposals::{AppDataUpdateOperation, AppDataUpdateProposal, Proposal};
+use openmls_basic_credential::SignatureKeyPair;
+use openmls_rust_crypto::RustCrypto;
+use openmls_traits::OpenMlsProvider as _;
 use storage_memory::MemoryStorage;
+use tls_codec::Serialize as _;
 
 fn pad32(name: &[u8]) -> Vec<u8> {
     let mut out = vec![0u8; 32];
@@ -163,6 +175,75 @@ fn converge_buffered_commit(engine: &mut Engine<MemoryStorage>, group_id: &Group
         .converge_stored_openmls_messages(group_id, 1_000_000)
         .expect("buffered commit converges");
     assert_eq!(result.sync_state, SyncState::Stable);
+}
+
+fn malicious_app_component_commit(
+    storage: &MemoryStorage,
+    sender: &MemberId,
+    group_id: &GroupId,
+    updates: Vec<AppComponentData>,
+) -> TransportMessage {
+    let crypto = RustCrypto::default();
+    let provider = EngineOpenMlsProvider::<MemoryStorage>::new(&crypto, storage.mls_storage());
+    let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
+    let mut mls_group = MlsGroup::load(provider.storage(), &mls_gid)
+        .expect("load attacker's MLS group")
+        .expect("attacker joined group");
+    let binding = storage
+        .account_device_signer(sender)
+        .expect("load signer binding")
+        .expect("signer binding exists");
+    let signer = SignatureKeyPair::read(
+        storage.mls_storage(),
+        &binding.mls_signature_public_key,
+        DEFAULT_CIPHERSUITE.signature_algorithm(),
+    )
+    .expect("MLS signer exists");
+
+    let proposals = updates
+        .iter()
+        .map(|update| {
+            Proposal::AppDataUpdate(Box::new(AppDataUpdateProposal::update(
+                update.component_id,
+                update.data.clone(),
+            )))
+        })
+        .collect::<Vec<_>>();
+    let mut builder = mls_group
+        .commit_builder()
+        .add_proposals(proposals)
+        .load_psks(provider.storage())
+        .expect("load PSKs");
+    let mut app_data = builder.app_data_dictionary_updater();
+    for proposal in builder.app_data_update_proposals() {
+        if let AppDataUpdateOperation::Update(data) = proposal.operation() {
+            app_data.set(ComponentData::from_parts(
+                proposal.component_id(),
+                data.clone(),
+            ));
+        }
+    }
+    builder.with_app_data_dictionary_updates(app_data.changes());
+    let commit_bundle = builder
+        .build(provider.rand(), provider.crypto(), &signer, |_| true)
+        .expect("build malicious app-data commit")
+        .stage_commit(&provider)
+        .expect("stage malicious app-data commit");
+    let (commit_out, _welcome_opt, _group_info) = commit_bundle.into_contents();
+    let commit_bytes = commit_out
+        .tls_serialize_detached()
+        .expect("serialize malicious app-data commit");
+
+    TransportMessage {
+        id: hash_id(&commit_bytes),
+        payload: commit_bytes,
+        timestamp: Timestamp(0),
+        causal_deps: vec![],
+        source: TransportSource("malicious-openmls".into()),
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+    }
 }
 
 async fn create_pair() -> (Engine<MemoryStorage>, Engine<MemoryStorage>, GroupId) {
@@ -371,6 +452,76 @@ async fn promoted_member_group_data_update_converges_for_original_admin() {
 
     let alice_group = alice_storage.get_group(&gid).unwrap();
     assert_eq!(alice_group.name, "bob rename");
+}
+
+#[tokio::test]
+async fn convergence_rejects_non_admin_admin_policy_update() {
+    let (mut alice, alice_storage) = build_with_storage(b"alice");
+    let (mut bob, bob_storage) = build_with_storage(b"bob");
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let alice_id = pad32(b"alice");
+    let alice_admin: [u8; 32] = alice_id.clone().try_into().unwrap();
+    let bob_id = pad32(b"bob");
+
+    let (gid, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "original".into(),
+            description: "orig description".into(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        _ => unreachable!(),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    let welcome = welcomes.into_iter().next().unwrap();
+    bob.join_welcome(welcome).await.unwrap();
+
+    let malicious = malicious_app_component_commit(
+        &bob_storage,
+        &bob.self_id(),
+        &gid,
+        vec![AppComponentData {
+            component_id: GROUP_ADMIN_POLICY_COMPONENT_ID,
+            data: encode_admin_policy_for_test(&[alice_id.clone(), bob_id]),
+        }],
+    );
+    let malicious_id = hex::encode(malicious.id.as_slice());
+
+    alice
+        .ingest(malicious.clone())
+        .await
+        .expect("malicious commit enters convergence");
+    let result = alice
+        .converge_stored_openmls_messages(&gid, 1_000_000)
+        .expect("convergence should reject unauthorized commit without failing");
+
+    assert_eq!(result.sync_state, SyncState::Stable);
+    assert!(
+        result.accepted_commits.is_empty(),
+        "non-admin commit must not be selected"
+    );
+    assert!(
+        result.dropped_messages.iter().any(|dropped| {
+            dropped.message_id == malicious_id
+                && dropped.reason == DroppedMessageReason::InvalidAgainstCandidateState
+        }),
+        "unauthorized commit should receive a terminal dropped disposition: {result:?}"
+    );
+    assert_eq!(alice.epoch(&gid).unwrap().0, 1);
+    assert_eq!(alice.admin_pubkeys(&gid).unwrap(), vec![alice_admin]);
+    assert_eq!(
+        alice_storage
+            .get_message(&malicious.id)
+            .expect("malicious message was stored")
+            .state,
+        MessageState::EpochInvalidated
+    );
 }
 
 #[tokio::test]

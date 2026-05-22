@@ -9,7 +9,8 @@ use cgka_traits::app_components::{
 use cgka_traits::error::EngineError;
 use cgka_traits::types::{GroupId, MemberId};
 use openmls::extensions::{AppDataDictionary, AppDataDictionaryExtension, Extension};
-use openmls::group::MlsGroup;
+use openmls::group::{MlsGroup, StagedCommit};
+use openmls::messages::proposals::Proposal;
 use openmls::prelude::LeafNode;
 use std::collections::BTreeSet;
 
@@ -171,6 +172,34 @@ pub(crate) fn require_admin(
     Err(EngineError::NotGroupAdmin {
         group_id: group_id.clone(),
     })
+}
+
+pub(crate) fn require_admin_for_staged_commit(
+    mls_group: &MlsGroup,
+    group_id: &GroupId,
+    sender: Option<&MemberId>,
+    staged: &StagedCommit,
+) -> Result<(), EngineError> {
+    if !staged_commit_requires_admin(staged) {
+        return Ok(());
+    }
+    let Some(sender) = sender else {
+        return Err(EngineError::NotGroupAdmin {
+            group_id: group_id.clone(),
+        });
+    };
+    require_admin(mls_group, group_id, sender)
+}
+
+pub(crate) fn staged_commit_requires_admin(staged: &StagedCommit) -> bool {
+    staged.add_proposals().next().is_some()
+        || staged.remove_proposals().next().is_some()
+        || staged.queued_proposals().any(|queued| {
+            matches!(
+                queued.proposal(),
+                Proposal::GroupContextExtensions(_) | Proposal::AppDataUpdate(_)
+            )
+        })
 }
 
 pub(crate) fn admin_pubkey_from_member_id(id: &MemberId) -> Result<[u8; 32], EngineError> {

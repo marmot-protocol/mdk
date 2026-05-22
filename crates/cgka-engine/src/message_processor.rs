@@ -442,14 +442,14 @@ impl<S: StorageProvider> Engine<S> {
                 }
                 ProcessedMessageContent::StagedCommitMessage(staged) => {
                     let before = EpochId(mls_group.epoch().as_u64());
-                    if staged_commit_requires_admin(&staged) {
-                        let Some(sender) = sender_id.as_ref() else {
-                            self.update_stored_message_state(&msg.id, MessageState::Failed)?;
-                            return Err(EngineError::NotGroupAdmin {
-                                group_id: group_id.clone(),
-                            });
-                        };
-                        crate::app_components::require_admin(&mls_group, &group_id, sender)?;
+                    if let Err(err) = crate::app_components::require_admin_for_staged_commit(
+                        &mls_group,
+                        &group_id,
+                        sender_id.as_ref(),
+                        &staged,
+                    ) {
+                        self.update_stored_message_state(&msg.id, MessageState::Failed)?;
+                        return Err(err);
                     }
                     let recovery_snapshot =
                         self.fork_recovery
@@ -1457,17 +1457,6 @@ fn send_intent_group_id(intent: &SendIntent) -> &GroupId {
         | SendIntent::UpdateAppComponents { group_id, .. }
         | SendIntent::UpdateGroupData { group_id, .. } => group_id,
     }
-}
-
-fn staged_commit_requires_admin(staged: &openmls::group::StagedCommit) -> bool {
-    staged.add_proposals().next().is_some()
-        || staged.remove_proposals().next().is_some()
-        || staged.queued_proposals().any(|queued| {
-            matches!(
-                queued.proposal(),
-                Proposal::GroupContextExtensions(_) | Proposal::AppDataUpdate(_)
-            )
-        })
 }
 
 fn convergence_ingest_outcome(

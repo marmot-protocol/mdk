@@ -130,6 +130,18 @@ struct CandidatePathProbe {
 }
 
 #[derive(Clone, Debug)]
+struct StoredOpenMlsCandidatePathResult {
+    candidate_paths: Vec<OpenMlsCandidatePath>,
+    invalid_commit_drops: Vec<DroppedMessage>,
+}
+
+#[derive(Clone, Debug)]
+enum CandidatePathProbeResult {
+    Materialized(Option<OpenMlsMaterializedCandidate>),
+    UnauthorizedCommit { message_id: String },
+}
+
+#[derive(Clone, Debug)]
 struct StoredOpenMlsCanonicalizationWork {
     state: CanonicalizationState,
     commit_messages: Vec<StoredCommitMessage>,
@@ -182,6 +194,7 @@ pub enum OpenMlsProjectionError {
     MissingGroup,
     Snapshot(String),
     Replay(String),
+    UnauthorizedCommit { message_id: String },
     Serialize(String),
     Storage(String),
 }
@@ -202,6 +215,9 @@ impl std::fmt::Display for OpenMlsProjectionError {
             OpenMlsProjectionError::MissingGroup => write!(f, "MLS group not found"),
             OpenMlsProjectionError::Snapshot(e) => write!(f, "snapshot failed: {e}"),
             OpenMlsProjectionError::Replay(e) => write!(f, "OpenMLS replay failed: {e}"),
+            OpenMlsProjectionError::UnauthorizedCommit { message_id } => {
+                write!(f, "unauthorized admin-gated commit: {message_id}")
+            }
             OpenMlsProjectionError::Serialize(e) => write!(f, "serialize failed: {e}"),
             OpenMlsProjectionError::Storage(e) => write!(f, "storage failed: {e}"),
         }
@@ -445,7 +461,7 @@ pub fn canonicalize_stored_openmls_messages<S: StorageProvider>(
                 replay_start_epoch,
             },
         )?;
-        append_dropped_stale_commits(&mut result, stale_commit_drops);
+        append_dropped_messages(&mut result, stale_commit_drops);
         return Ok(result);
     }
 
@@ -462,15 +478,15 @@ pub fn canonicalize_stored_openmls_messages<S: StorageProvider>(
             replay_start_epoch,
         },
     )?;
-    append_dropped_stale_commits(&mut result, stale_commit_drops);
+    append_dropped_messages(&mut result, stale_commit_drops);
     Ok(result)
 }
 
-fn append_dropped_stale_commits(
+fn append_dropped_messages(
     result: &mut CanonicalizationResult,
-    stale_commit_drops: Vec<DroppedMessage>,
+    dropped_messages: Vec<DroppedMessage>,
 ) {
-    for dropped in stale_commit_drops {
+    for dropped in dropped_messages {
         if result
             .dropped_messages
             .iter()
@@ -522,7 +538,7 @@ fn canonicalize_stored_openmls_messages_from_current<S: StorageProvider>(
     group_id: &GroupId,
     work: StoredOpenMlsCanonicalizationWork,
 ) -> Result<CanonicalizationResult, OpenMlsProjectionError> {
-    let candidate_paths = build_stored_openmls_candidate_paths(
+    let path_result = build_stored_openmls_candidate_paths(
         storage,
         group_id,
         work.commit_messages,
@@ -530,18 +546,20 @@ fn canonicalize_stored_openmls_messages_from_current<S: StorageProvider>(
         work.replay_start_epoch,
     )?;
 
-    canonicalize_openmls_batch(
+    let mut result = canonicalize_openmls_batch(
         storage,
         group_id,
         OpenMlsCanonicalizationBatch {
             state: work.state,
-            candidate_paths,
+            candidate_paths: path_result.candidate_paths,
             pending_messages: work.pending_messages,
             outbound_intents: work.outbound_intents,
             policy: work.policy,
             now_ms: work.now_ms,
         },
-    )
+    )?;
+    append_dropped_messages(&mut result, path_result.invalid_commit_drops);
+    Ok(result)
 }
 
 fn historical_replay_start_epoch(
@@ -592,7 +610,7 @@ fn build_stored_openmls_candidate_paths<S: StorageProvider>(
     mut commits: Vec<StoredCommitMessage>,
     pending_messages: &[TransportMessage],
     starting_epoch: u64,
-) -> Result<Vec<OpenMlsCandidatePath>, OpenMlsProjectionError> {
+) -> Result<StoredOpenMlsCandidatePathResult, OpenMlsProjectionError> {
     commits.sort_by(|a, b| {
         a.source_epoch
             .cmp(&b.source_epoch)
@@ -607,6 +625,7 @@ fn build_stored_openmls_candidate_paths<S: StorageProvider>(
         tip_epoch: starting_epoch,
     }];
     let mut completed = Vec::new();
+    let mut invalid_commit_drops = Vec::new();
     let mut seen_paths = BTreeSet::from([Vec::<[u8; 32]>::new()]);
 
     while !frontier.is_empty() {
@@ -627,15 +646,23 @@ fn build_stored_openmls_candidate_paths<S: StorageProvider>(
                     continue;
                 }
 
-                let Some(candidate) = probe_candidate_path(
+                let candidate = match probe_candidate_path(
                     storage,
                     group_id,
                     messages.clone(),
                     &digests,
                     &pending_proposals,
-                )?
-                else {
-                    continue;
+                )? {
+                    CandidatePathProbeResult::Materialized(Some(candidate)) => candidate,
+                    CandidatePathProbeResult::Materialized(None) => continue,
+                    CandidatePathProbeResult::UnauthorizedCommit { message_id } => {
+                        invalid_commit_drops.push(DroppedMessage {
+                            message_id,
+                            kind: MessageKind::Commit,
+                            reason: DroppedMessageReason::InvalidAgainstCandidateState,
+                        });
+                        continue;
+                    }
                 };
 
                 extended = true;
@@ -654,13 +681,16 @@ fn build_stored_openmls_candidate_paths<S: StorageProvider>(
         frontier = next_frontier;
     }
 
-    Ok(completed
-        .into_iter()
-        .map(|path| OpenMlsCandidatePath {
-            branch_id: branch_id_for_path_digests(&path.digests),
-            messages: path.messages,
-        })
-        .collect())
+    Ok(StoredOpenMlsCandidatePathResult {
+        candidate_paths: completed
+            .into_iter()
+            .map(|path| OpenMlsCandidatePath {
+                branch_id: branch_id_for_path_digests(&path.digests),
+                messages: path.messages,
+            })
+            .collect(),
+        invalid_commit_drops,
+    })
 }
 
 fn pending_proposal_messages(
@@ -681,15 +711,18 @@ fn probe_candidate_path<S: StorageProvider>(
     messages: Vec<TransportMessage>,
     digests: &[[u8; 32]],
     pending_proposals: &[TransportMessage],
-) -> Result<Option<OpenMlsMaterializedCandidate>, OpenMlsProjectionError> {
+) -> Result<CandidatePathProbeResult, OpenMlsProjectionError> {
     let path = OpenMlsCandidatePath {
         branch_id: branch_id_for_path_digests(digests),
         messages,
     };
     let replay_paths = candidate_paths_with_pending_replay_messages(&[path], pending_proposals)?;
     match materialize_openmls_candidate_paths(storage, group_id, &replay_paths) {
-        Ok(mut candidates) => Ok(candidates.pop()),
-        Err(OpenMlsProjectionError::Replay(_)) => Ok(None),
+        Ok(mut candidates) => Ok(CandidatePathProbeResult::Materialized(candidates.pop())),
+        Err(OpenMlsProjectionError::UnauthorizedCommit { message_id }) => {
+            Ok(CandidatePathProbeResult::UnauthorizedCommit { message_id })
+        }
+        Err(OpenMlsProjectionError::Replay(_)) => Ok(CandidatePathProbeResult::Materialized(None)),
         Err(err) => Err(err),
     }
 }
@@ -1243,7 +1276,9 @@ fn process_openmls_messages_inner<S: StorageProvider>(
             }
             Err(e) => return Err(replay_error("process_message", e)),
         };
-        let sender = sender_identity(processed.sender(), &mls_group).unwrap_or_default();
+        let sender = sender_identity(processed.sender(), &mls_group);
+        let sender_id = sender.clone().map(MemberId::new);
+        let sender = sender.unwrap_or_default();
 
         match processed.into_content() {
             ProcessedMessageContent::ProposalMessage(queued) => {
@@ -1260,6 +1295,21 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                 });
             }
             ProcessedMessageContent::StagedCommitMessage(staged) => {
+                if let Err(err) = crate::app_components::require_admin_for_staged_commit(
+                    &mls_group,
+                    group_id,
+                    sender_id.as_ref(),
+                    &staged,
+                ) {
+                    return match err {
+                        cgka_traits::error::EngineError::NotGroupAdmin { .. } => {
+                            Err(OpenMlsProjectionError::UnauthorizedCommit { message_id })
+                        }
+                        other => Err(OpenMlsProjectionError::Replay(format!(
+                            "admin check: {other:?}"
+                        ))),
+                    };
+                }
                 let resulting_epoch = mls_group.epoch().as_u64() + 1;
                 let mut consumed_proposal_refs = staged
                     .queued_proposals()
