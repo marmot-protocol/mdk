@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
-use std::net::{SocketAddr, ToSocketAddrs};
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -32,6 +32,9 @@ use transport_quic_stream::{
 
 pub mod daemon;
 pub mod tui;
+
+pub(crate) const DEFAULT_PRODUCTION_QUIC_BROKER_CANDIDATE: &str = "quic://quic-broker.ipf.dev:4450";
+const AGENT_STREAM_START_LOOKBACK_LIMIT: usize = 200;
 
 #[derive(Parser, Clone, Debug, Serialize, Deserialize)]
 #[command(
@@ -997,6 +1000,8 @@ pub(crate) enum DmError {
     EmptyStreamText,
     #[error("no brokered stream start found")]
     MissingStreamStart,
+    #[error("brokered stream start has no confirmed message id yet")]
+    StreamStartNotConfirmed,
     #[error("brokered stream start has no QUIC candidates")]
     MissingQuicCandidate,
     #[error("unsupported stream route for broker watch: {0}")]
@@ -3710,11 +3715,14 @@ where
         &account.label,
         AppMessageQuery {
             group_id_hex: Some(group_id_hex.clone()),
-            limit: None,
+            limit: Some(AGENT_STREAM_START_LOOKBACK_LIMIT),
         },
     )?;
     let (start_message_id_hex, start_payload) =
         latest_stream_start(messages, expected_stream_id_hex.as_deref())?;
+    if start_message_id_hex.is_empty() {
+        return Err(DmError::StreamStartNotConfirmed);
+    }
     if start_payload.route != AgentTextStreamRouteV1::BrokeredQuic {
         return Err(DmError::UnsupportedStreamRoute(
             route_name(&start_payload.route).to_owned(),
@@ -3857,6 +3865,35 @@ fn candidate_server_name(authority: &str) -> Result<String, DmError> {
         .map(|(host, _)| host.to_owned())
         .filter(|host| !host.is_empty())
         .ok_or_else(|| DmError::InvalidQuicCandidate(authority.to_owned()))
+}
+
+pub(crate) fn first_quic_candidate_is_loopback(candidates: &[String]) -> bool {
+    candidates
+        .iter()
+        .find(|candidate| candidate.trim().starts_with("quic://"))
+        .and_then(|candidate| quic_candidate_host(candidate))
+        .is_some_and(|host| quic_host_is_loopback(&host))
+}
+
+fn quic_candidate_host(candidate: &str) -> Option<String> {
+    let rest = candidate.trim().strip_prefix("quic://")?;
+    let authority = rest.split('/').next().unwrap_or(rest);
+    if let Some(rest) = authority.strip_prefix('[') {
+        return rest.split_once(']').map(|(host, _)| host.to_owned());
+    }
+    authority
+        .rsplit_once(':')
+        .map(|(host, _)| host.to_owned())
+        .filter(|host| !host.is_empty())
+}
+
+fn quic_host_is_loopback(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    host.parse::<IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
 }
 
 fn transcript_hash_from_hex(value: &str) -> Result<[u8; 32], DmError> {
@@ -4660,6 +4697,10 @@ fn dm_error_json(err: &DmError) -> Value {
             "code": "missing_stream_start",
             "message": err.to_string(),
         }),
+        DmError::StreamStartNotConfirmed => json!({
+            "code": "stream_start_not_confirmed",
+            "message": err.to_string(),
+        }),
         DmError::MissingQuicCandidate => json!({
             "code": "missing_quic_candidate",
             "message": err.to_string(),
@@ -4946,7 +4987,8 @@ mod tests {
 
     use super::{
         AppMessageRecord, DmError, GlobalRelayDefaults, apply_global_relay_defaults,
-        apply_message_cursors, default_home_from_env, relay_endpoints, resolve_relay,
+        apply_message_cursors, default_home_from_env, first_quic_candidate_is_loopback,
+        relay_endpoints, resolve_relay,
     };
 
     #[test]
@@ -5043,6 +5085,22 @@ mod tests {
             resolve_relay(Some(" wss://relay.example/path ".to_owned())).unwrap(),
             Some("wss://relay.example/path".to_owned())
         );
+    }
+
+    #[test]
+    fn first_quic_candidate_loopback_detection_is_literal_and_localhost_only() {
+        assert!(first_quic_candidate_is_loopback(&[
+            "quic://127.0.0.1:4450".to_owned()
+        ]));
+        assert!(first_quic_candidate_is_loopback(&[
+            "quic://[::1]:4450".to_owned()
+        ]));
+        assert!(first_quic_candidate_is_loopback(&[
+            "quic://localhost:4450".to_owned()
+        ]));
+        assert!(!first_quic_candidate_is_loopback(&[
+            "quic://quic-broker.ipf.dev:4450".to_owned()
+        ]));
     }
 
     #[test]

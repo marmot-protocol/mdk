@@ -20,6 +20,7 @@ cgka-traits.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
 hex.workspace = true
+rand.workspace = true
 uniffi = { version = "0.28", features = ["tokio"] }
 
 [dev-dependencies]

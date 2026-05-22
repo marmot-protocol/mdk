@@ -71,3 +71,14 @@ dm --account <alice> stream start <group-hex> \
 
 When the certificate chains to normal platform roots and the candidate host matches the certificate, clients can use the
 default platform verifier. `--insecure-local` is only for loopback development.
+
+## Production Broker
+
+The shared production broker candidate is:
+
+```sh
+quic://quic-broker.ipf.dev:4450
+```
+
+It uses a certificate for `quic-broker.ipf.dev`, so clients should use normal platform trust and must not pass
+`--insecure-local`.

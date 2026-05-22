@@ -2,11 +2,11 @@
 //!
 //! Each subscription wraps one of marmot-app's `Runtime*Subscription` types
 //! (or a `broadcast::Receiver` for the top-level event firehose) and exposes
-//! Swift-friendly methods:
+//! host-friendly methods:
 //!
 //! - `snapshot()` returns the initial state exactly once (subsequent calls
 //!   yield the empty case).
-//! - `next()` is an async fn the Swift side can drive in a `while let` loop
+//! - `next()` is an async fn host apps can drive in a loop
 //!   to receive subsequent updates; it returns `None` when the underlying
 //!   sender drops.
 //!
@@ -17,13 +17,13 @@ use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 
 use marmot_app::{
-    MarmotAppEvent, RuntimeChatsSubscription, RuntimeGroupStateSubscription,
-    RuntimeMessagesSubscription,
+    MarmotAppEvent, RuntimeAgentStreamWatch, RuntimeChatsSubscription,
+    RuntimeGroupStateSubscription, RuntimeMessagesSubscription,
 };
 use tokio::sync::{Mutex, broadcast};
 
 use crate::conversions::{
-    AppGroupRecordFfi, AppMessageRecordFfi, MarmotEventFfi, MessageUpdateFfi,
+    AgentStreamUpdateFfi, AppGroupRecordFfi, AppMessageRecordFfi, MarmotEventFfi, MessageUpdateFfi,
 };
 
 #[derive(uniffi::Object)]
@@ -144,5 +144,36 @@ impl EventsSubscription {
                 Err(broadcast::error::RecvError::Closed) => return None,
             }
         }
+    }
+}
+
+/// A live agent-text-stream watch. Drive `next()` in a `while let` loop to fill
+/// a bubble; it yields `Chunk` deltas then a terminal `Finished`/`Failed`,
+/// after which it returns `None`.
+#[derive(uniffi::Object)]
+pub struct AgentStreamSubscription {
+    stream_id_hex: String,
+    inner: Mutex<RuntimeAgentStreamWatch>,
+}
+
+impl AgentStreamSubscription {
+    pub(crate) fn new(inner: RuntimeAgentStreamWatch) -> Arc<Self> {
+        Arc::new(Self {
+            stream_id_hex: inner.stream_id_hex.clone(),
+            inner: Mutex::new(inner),
+        })
+    }
+}
+
+#[uniffi::export(async_runtime = "tokio")]
+impl AgentStreamSubscription {
+    /// The resolved stream id this watch is following (hex).
+    pub fn stream_id_hex(&self) -> String {
+        self.stream_id_hex.clone()
+    }
+
+    pub async fn next(&self) -> Option<AgentStreamUpdateFfi> {
+        let mut inner = self.inner.lock().await;
+        inner.recv().await.map(Into::into)
     }
 }

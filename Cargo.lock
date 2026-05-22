@@ -2442,8 +2442,11 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
  "transport-nostr-adapter",
  "transport-nostr-peeler",
+ "transport-quic-broker",
+ "transport-quic-stream",
 ]
 
 [[package]]
@@ -2455,6 +2458,7 @@ dependencies = [
  "keyring-core",
  "marmot-account",
  "marmot-app",
+ "rand 0.8.6",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",

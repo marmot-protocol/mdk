@@ -2865,6 +2865,7 @@ async fn auto_watch_agent_stream_starts(
             continue;
         }
         let group_id = hex::encode(message.group_id.as_slice());
+        let insecure_local = crate::first_quic_candidate_is_loopback(&start.quic_candidates);
         let stream_id = start.stream_id;
         if stream_manager.watch_exists(Some(account_id), &group_id, Some(stream_id.as_str())) {
             continue;
@@ -2885,7 +2886,7 @@ async fn auto_watch_agent_stream_starts(
                     group: group_id,
                     stream_id: Some(stream_id),
                     server_cert_der_hex: None,
-                    insecure_local: true,
+                    insecure_local,
                     background: false,
                 },
             },

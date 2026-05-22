@@ -11,8 +11,8 @@ use marmot_app::{
     AccountRelayListState, AccountRelayListStatus, AppGroupAdminPolicyComponent,
     AppGroupMemberRecord, AppGroupMlsState, AppGroupNostrRoutingComponent,
     AppGroupProfileComponent, AppGroupRecord, AppMessageRecord, MarmotAppEvent, ReceivedMessage,
-    RelayPlaneHealth, RuntimeMessageReceived, RuntimeMessageUpdate, SendSummary,
-    UserProfileMetadata,
+    RelayPlaneHealth, RuntimeAgentStreamUpdate, RuntimeMessageReceived, RuntimeMessageUpdate,
+    SendSummary, UserProfileMetadata,
 };
 
 #[derive(Clone, Debug, uniffi::Record)]
@@ -38,8 +38,61 @@ impl From<SendSummary> for SendSummaryFfi {
     }
 }
 
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct AgentStreamStartFfi {
+    pub stream_id_hex: String,
+    pub published: u32,
+    pub message_ids: Vec<String>,
+}
+
+impl AgentStreamStartFfi {
+    pub(crate) fn new(stream_id_hex: String, summary: SendSummary) -> Self {
+        Self {
+            stream_id_hex,
+            published: summary.published as u32,
+            message_ids: summary.message_ids,
+        }
+    }
+}
+
+/// One update from a live agent-text-stream watch. `Chunk.text` is an
+/// incremental fragment; `Finished.text` is the complete transcript.
+#[derive(Clone, Debug, uniffi::Enum)]
+pub enum AgentStreamUpdateFfi {
+    Chunk {
+        seq: u64,
+        text: String,
+    },
+    Finished {
+        text: String,
+        transcript_hash_hex: String,
+        chunk_count: u64,
+    },
+    Failed {
+        message: String,
+    },
+}
+
+impl From<RuntimeAgentStreamUpdate> for AgentStreamUpdateFfi {
+    fn from(value: RuntimeAgentStreamUpdate) -> Self {
+        match value {
+            RuntimeAgentStreamUpdate::Chunk { seq, text } => Self::Chunk { seq, text },
+            RuntimeAgentStreamUpdate::Finished {
+                text,
+                transcript_hash_hex,
+                chunk_count,
+            } => Self::Finished {
+                text,
+                transcript_hash_hex,
+                chunk_count,
+            },
+            RuntimeAgentStreamUpdate::Failed { message } => Self::Failed { message },
+        }
+    }
+}
+
 /// Structured chat payloads (reactions, replies, deletes, …) carried inside a
-/// message. Flattened from `MarmotAppMessagePayloadV1` for the Swift side.
+/// message. Flattened from `MarmotAppMessagePayloadV1` for host bindings.
 #[derive(Clone, Debug, uniffi::Enum)]
 pub enum AppMessagePayloadFfi {
     Reaction {
@@ -280,7 +333,7 @@ impl From<RuntimeMessageReceived> for RuntimeMessageReceivedFfi {
 }
 
 /// A unified update from a messages subscription. Each variant carries enough
-/// context for the iOS side to update its in-memory timeline without holding
+/// context for host apps to update an in-memory timeline without holding
 /// onto the underlying marmot-app types.
 #[derive(Clone, Debug, uniffi::Enum)]
 pub enum MessageUpdateFfi {
@@ -312,8 +365,8 @@ impl From<RuntimeMessageUpdate> for MessageUpdateFfi {
 }
 
 /// Top-level event firehose, FFI-shaped. Agent streams collapse to a single
-/// "agent stream activity" variant — the iOS app doesn't differentiate them
-/// at the surface level for v1.
+/// "agent stream activity" variant — host apps do not differentiate them at
+/// the surface level for v1.
 #[derive(Clone, Debug, uniffi::Enum)]
 pub enum MarmotEventFfi {
     GroupJoined {

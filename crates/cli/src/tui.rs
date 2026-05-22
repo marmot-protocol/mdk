@@ -22,7 +22,7 @@ const UI_EVENT_WAIT: Duration = Duration::from_millis(50);
 const STREAM_APPEND_FLUSH_INTERVAL: Duration = Duration::from_millis(125);
 const FOCUS_ACCENT: Color = Color::Green;
 const ACCOUNT_ACCENT: Color = Color::White;
-const DEFAULT_STREAM_CANDIDATE: &str = "quic://127.0.0.1:4450";
+const DEFAULT_STREAM_CANDIDATE: &str = crate::DEFAULT_PRODUCTION_QUIC_BROKER_CANDIDATE;
 const SLASH_SUGGESTION_LIMIT: usize = 8;
 
 #[derive(Debug, thiserror::Error)]
@@ -1146,12 +1146,11 @@ impl TuiApp {
         let account_id = self.require_selected_local_account()?;
         let group_id = self.require_selected_group()?;
         let preview_group_id = group_id.clone();
-        let mut args = vec![
-            "stream".to_owned(),
-            "compose-open".to_owned(),
-            group_id,
-            "--insecure-local".to_owned(),
-        ];
+        let insecure_local = crate::first_quic_candidate_is_loopback(&quic_candidates);
+        let mut args = vec!["stream".to_owned(), "compose-open".to_owned(), group_id];
+        if insecure_local {
+            args.push("--insecure-local".to_owned());
+        }
         if let Some(stream_id) = stream_id {
             args.push("--stream-id".to_owned());
             args.push(stream_id);

@@ -265,7 +265,8 @@ publishes ordered `TextDelta` records through the memory-only broker. Without `-
 directly to a peer receiver, which is useful with `dm stream receive --bind 127.0.0.1:4450` for local transport probes.
 `stream verify` compares a received QUIC transcript hash and chunk count against the latest durable final payload for the
 same stream id. QUIC chunks are transient preview data; normal Marmot messages remain the durable group history. Use
-`--insecure-local` only for loopback development with generated self-signed certificates.
+`quic://quic-broker.ipf.dev:4450` with platform trust for the shared production broker, and use `--insecure-local` only
+for loopback development with generated self-signed certificates.
 
 When `dmd` is running, `stream watch --background` starts the broker subscription through the daemon and returns
 immediately. The runtime stream manager owns the running/completed/failed preview state. `dm daemon status --json`
@@ -424,6 +425,8 @@ Composer slash commands:
 /stream verify <stream-id> <transcript-hash> [chunk-count]
 /quit
 ```
+
+`/stream` uses `quic://quic-broker.ipf.dev:4450` when no candidate is supplied.
 
 `/login <nsec>` redacts the secret in the composer. `/chat archived` shows archived chats so they
 can be selected and unarchived; `/chat archived off` returns to the visible-chat list. Member commands operate

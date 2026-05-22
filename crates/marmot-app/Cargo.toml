@@ -21,9 +21,12 @@ serde_json.workspace = true
 sha2.workspace = true
 storage-sqlite.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["net"] }
+tracing.workspace = true
 transport-nostr-adapter = { workspace = true, features = ["sdk"] }
 transport-nostr-peeler.workspace = true
+transport-quic-broker.workspace = true
+transport-quic-stream.workspace = true
 
 [dev-dependencies]
 nostr-relay-builder.workspace = true

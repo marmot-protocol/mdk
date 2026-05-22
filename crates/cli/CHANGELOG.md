@@ -83,6 +83,8 @@ versioning through the workspace version in the root `Cargo.toml`.
   treatment; daemon controls stay focused on start, status, and stop.
 - TUI slash commands now accept quoted multi-word names for `/chat new`, so group names with spaces no longer consume
   the first word after the space as a member pubkey.
+- TUI stream compose now defaults to the production QUIC broker candidate at `quic://quic-broker.ipf.dev:4450`, and
+  daemon auto-watch paths only request insecure local trust for loopback broker candidates.
 - Typed app-message payloads are validated before publish/projection; malformed reaction, media, delete, or retry
   envelopes are rejected instead of being treated as valid typed app messages.
 - `dmd` now keeps long-lived per-account relay subscriptions for real WebSocket relays instead of rebuilding
