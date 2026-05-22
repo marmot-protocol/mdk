@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
 const AGENT_STREAM_UPDATE_REPLAY_LIMIT: usize = 256;
+const AGENT_STREAM_WATCH_RETAIN_LIMIT: usize = 256;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentStreamDelta {
@@ -143,6 +144,7 @@ impl AgentStreamWatchManager {
             report.result = completion.result;
             report.clone()
         };
+        self.prune_finished_reports();
         self.publish_update(AgentStreamUpdate::WatchUpdated(finished.clone()));
         Some(finished)
     }
@@ -216,6 +218,35 @@ impl AgentStreamWatchManager {
             }
         }
         let _ = self.inner.updates.send(update);
+    }
+
+    fn prune_finished_reports(&self) {
+        let Ok(mut watches) = self.inner.watches.lock() else {
+            return;
+        };
+        if watches.len() <= AGENT_STREAM_WATCH_RETAIN_LIMIT {
+            return;
+        }
+
+        let running_count = watches
+            .values()
+            .filter(|watch| watch.status == "running")
+            .count();
+        let finished_retain_limit = AGENT_STREAM_WATCH_RETAIN_LIMIT.saturating_sub(running_count);
+        let mut finished = watches
+            .values()
+            .filter(|watch| watch.status != "running")
+            .map(|watch| (watch.started_at, watch.watch_id.clone()))
+            .collect::<Vec<_>>();
+        if finished.len() <= finished_retain_limit {
+            return;
+        }
+
+        finished.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+        let remove_count = finished.len() - finished_retain_limit;
+        for (_, watch_id) in finished.into_iter().take(remove_count) {
+            watches.remove(&watch_id);
+        }
     }
 }
 
@@ -311,5 +342,48 @@ mod tests {
             manager.recent_updates().last(),
             Some(AgentStreamUpdate::WatchUpdated(report)) if report.watch_id == finished.watch_id
         ));
+    }
+
+    #[test]
+    fn stream_watch_manager_prunes_old_finished_reports() {
+        let manager = AgentStreamWatchManager::default();
+        let group_id = "aa".repeat(32);
+
+        for index in 0..(AGENT_STREAM_WATCH_RETAIN_LIMIT + 2) {
+            let started = manager.start_watch(AgentStreamWatchStart {
+                account: Some("alice".to_owned()),
+                group_id: group_id.clone(),
+                stream_id: Some(format!("{index:064x}")),
+                started_at: 1_700_000_000 + index as u64,
+                started_at_millis: 1_700_000_000_000 + index as u128,
+            });
+            manager
+                .finish_watch(
+                    &started.watch_id,
+                    AgentStreamWatchCompletion {
+                        finished_at: 1_700_000_100 + index as u64,
+                        status: "completed".to_owned(),
+                        stream_id: started.stream_id,
+                        text: Some(format!("preview {index}")),
+                        transcript_hash: None,
+                        chunk_count: Some(1),
+                        error: None,
+                        result: None,
+                    },
+                )
+                .expect("watch finishes");
+        }
+
+        let reports = manager.reports();
+        assert_eq!(reports.len(), AGENT_STREAM_WATCH_RETAIN_LIMIT);
+        assert_eq!(
+            reports.first().and_then(|report| report.text.as_deref()),
+            Some("preview 2")
+        );
+        let expected_last = format!("preview {}", AGENT_STREAM_WATCH_RETAIN_LIMIT + 1);
+        assert_eq!(
+            reports.last().and_then(|report| report.text.as_deref()),
+            Some(expected_last.as_str())
+        );
     }
 }

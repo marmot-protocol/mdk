@@ -93,6 +93,7 @@ const SDK_DRAIN_WAIT: Duration = Duration::from_millis(250);
 const APP_RUNTIME_ACCOUNT_READY_WAIT: Duration = Duration::from_secs(3);
 const APP_RUNTIME_RELAY_REBUILD_LOOKBACK: Duration = Duration::from_secs(120);
 const APP_RUNTIME_SUBSCRIPTION_BUFFER: usize = 1024;
+pub(crate) const MAX_SEEN_EVENT_IDS: usize = 16_384;
 const KIND_NOSTR_METADATA: u64 = 0;
 const KIND_NOSTR_CONTACT_LIST: u64 = 3;
 
@@ -1722,6 +1723,26 @@ impl AccountManager {
         for (_, worker) in workers.drain() {
             worker.handle.abort();
         }
+    }
+}
+
+fn remember_seen_event(state: &mut AccountState, event_id: String) {
+    if !state.seen_events.contains(&event_id) {
+        state.seen_events.push(event_id);
+        prune_seen_events(&mut state.seen_events);
+    }
+}
+
+pub(crate) fn prune_seen_events(seen_events: &mut Vec<String>) {
+    let overflow = seen_events.len().saturating_sub(MAX_SEEN_EVENT_IDS);
+    if overflow > 0 {
+        seen_events.drain(0..overflow);
+    }
+}
+
+fn refresh_seen_lookup_if_needed(seen: &mut HashSet<String>, state: &AccountState) {
+    if seen.len() > MAX_SEEN_EVENT_IDS {
+        *seen = state.seen_events.iter().cloned().collect();
     }
 }
 
@@ -4257,6 +4278,12 @@ impl AppClient {
             .account_home()
             .account(&self.state.label)?
             .account_id_hex;
+        let mut seen = self
+            .state
+            .seen_events
+            .iter()
+            .cloned()
+            .collect::<HashSet<_>>();
 
         loop {
             let delivery = self
@@ -4265,19 +4292,15 @@ impl AppClient {
                 .await?
                 .ok_or(AppError::TransportClosed)?;
             let event_id = hex::encode(delivery.message.id.as_slice());
-            let seen = self
-                .state
-                .seen_events
-                .iter()
-                .cloned()
-                .collect::<HashSet<_>>();
             if is_own_relay_echo(&delivery, &local_account_id_hex, &seen) {
                 continue;
             }
             if seen.contains(&event_id) {
                 continue;
             }
-            self.state.seen_events.push(event_id);
+            seen.insert(event_id.clone());
+            remember_seen_event(&mut self.state, event_id);
+            refresh_seen_lookup_if_needed(&mut seen, &self.state);
 
             let mut summary = SyncSummary::default();
             self.ingest_delivery(delivery, &display_names, &mut summary)
@@ -4331,7 +4354,8 @@ impl AppClient {
                 continue;
             }
             seen.insert(event_id.clone());
-            self.state.seen_events.push(event_id);
+            remember_seen_event(&mut self.state, event_id);
+            refresh_seen_lookup_if_needed(&mut seen, &self.state);
             self.ingest_delivery(delivery, &display_names, &mut summary)
                 .await?;
         }
@@ -4489,9 +4513,7 @@ impl AppClient {
     fn remember_published_reports(&mut self, effects: &marmot_account::AccountDeviceEffects) {
         for report in &effects.reports {
             let event_id = hex::encode(report.message_id.as_slice());
-            if !self.state.seen_events.contains(&event_id) {
-                self.state.seen_events.push(event_id);
-            }
+            remember_seen_event(&mut self.state, event_id);
         }
     }
 
@@ -5508,6 +5530,37 @@ mod tests {
         assert_eq!(
             MarmotRelayPlane::full_history().subscription_rebuild_since(Some(1_700_000_000)),
             None
+        );
+    }
+
+    #[test]
+    fn remembered_seen_events_are_bounded_in_memory() {
+        let mut state = AccountState {
+            label: "alice".to_owned(),
+            seen_events: Vec::new(),
+            last_transport_timestamp: None,
+            groups: Vec::new(),
+        };
+        let mut seen = HashSet::new();
+
+        for index in 0..(MAX_SEEN_EVENT_IDS + 2) {
+            let event_id = format!("event-{index:05}");
+            seen.insert(event_id.clone());
+            remember_seen_event(&mut state, event_id);
+            refresh_seen_lookup_if_needed(&mut seen, &state);
+        }
+
+        assert_eq!(state.seen_events.len(), MAX_SEEN_EVENT_IDS);
+        assert_eq!(seen.len(), MAX_SEEN_EVENT_IDS);
+        assert!(!seen.contains("event-00000"));
+        assert_eq!(
+            state.seen_events.first().map(String::as_str),
+            Some("event-00002")
+        );
+        let expected_last = format!("event-{:05}", MAX_SEEN_EVENT_IDS + 1);
+        assert_eq!(
+            state.seen_events.last().map(String::as_str),
+            Some(expected_last.as_str())
         );
     }
 }

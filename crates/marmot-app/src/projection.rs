@@ -156,10 +156,17 @@ impl AccountProjectionDb {
             )?
             .and_then(|value| u64::try_from(value).ok());
         let mut seen_statement = self.conn.prepare(
-            "SELECT event_id FROM seen_events
-             ORDER BY seen_at, event_id",
+            "SELECT event_id FROM (
+                SELECT event_id, seen_at, rowid FROM seen_events
+                ORDER BY seen_at DESC, rowid DESC
+                LIMIT ?1
+             )
+             ORDER BY seen_at, rowid",
         )?;
-        let seen_rows = seen_statement.query_map([], |row| row.get::<_, String>(0))?;
+        let seen_rows = seen_statement
+            .query_map(params![limit_to_i64(crate::MAX_SEEN_EVENT_IDS)], |row| {
+                row.get::<_, String>(0)
+            })?;
         let mut seen_events = Vec::new();
         for row in seen_rows {
             seen_events.push(row?);
@@ -252,13 +259,26 @@ impl AccountProjectionDb {
             ],
         )?;
 
-        for event_id in &state.seen_events {
+        let retained_start = state
+            .seen_events
+            .len()
+            .saturating_sub(crate::MAX_SEEN_EVENT_IDS);
+        for event_id in &state.seen_events[retained_start..] {
             tx.execute(
                 "INSERT OR IGNORE INTO seen_events (event_id, seen_at)
                  VALUES (?1, ?2)",
                 params![event_id, unix_now_seconds() as i64],
             )?;
         }
+        tx.execute(
+            "DELETE FROM seen_events
+             WHERE event_id NOT IN (
+                SELECT event_id FROM seen_events
+                ORDER BY seen_at DESC, rowid DESC
+                LIMIT ?1
+             )",
+            params![limit_to_i64(crate::MAX_SEEN_EVENT_IDS)],
+        )?;
 
         for group in &state.groups {
             tx.execute(
@@ -654,6 +674,42 @@ mod tests {
         assert_eq!(
             restored.groups[0].agent_text_stream.data_hex,
             "0103020200001000000000000000"
+        );
+    }
+
+    #[test]
+    fn save_state_retains_only_recent_seen_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = AccountProjectionDb::open(dir.path().join("app.sqlite3"), "test-key").unwrap();
+        let seen_events = (0..(crate::MAX_SEEN_EVENT_IDS + 2))
+            .map(|index| format!("event-{index:05}"))
+            .collect::<Vec<_>>();
+        let state = AccountState {
+            label: "alice".to_owned(),
+            seen_events,
+            last_transport_timestamp: Some(1_700_000_004),
+            groups: vec![AppGroupRecord::new(
+                "aa".to_owned(),
+                test_routing([0xAA; 32], "ws://127.0.0.1:18080"),
+                "chat".to_owned(),
+                "".to_owned(),
+                AppGroupImageInput::default(),
+                AppGroupAdminPolicyComponent::new(Vec::new()),
+            )],
+        };
+
+        db.save_state(&state).unwrap();
+
+        let restored = db.load_state("alice").unwrap();
+        assert_eq!(restored.seen_events.len(), crate::MAX_SEEN_EVENT_IDS);
+        assert_eq!(
+            restored.seen_events.first().map(String::as_str),
+            Some("event-00002")
+        );
+        let expected_last = format!("event-{:05}", crate::MAX_SEEN_EVENT_IDS + 1);
+        assert_eq!(
+            restored.seen_events.last().map(String::as_str),
+            Some(expected_last.as_str())
         );
     }
 

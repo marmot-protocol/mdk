@@ -181,12 +181,23 @@ impl StreamWatchWorkers {
     fn replace(&self, watch_id: String, handle: JoinHandle<()>) {
         match self.handles.lock() {
             Ok(mut handles) => {
+                Self::reap_finished_locked(&mut handles);
                 if let Some(previous) = handles.insert(watch_id, handle) {
                     previous.abort();
                 }
             }
             Err(_) => handle.abort(),
         }
+    }
+
+    fn reap_finished(&self) {
+        if let Ok(mut handles) = self.handles.lock() {
+            Self::reap_finished_locked(&mut handles);
+        }
+    }
+
+    fn reap_finished_locked(handles: &mut HashMap<String, JoinHandle<()>>) {
+        handles.retain(|_, handle| !handle.is_finished());
     }
 
     fn abort_all(&self) {
@@ -711,7 +722,13 @@ async fn handle_connection(
             },
         ),
         DaemonRequest::Status => {
-            let status = server_status(defaults, &state, workers.runtime.runtime.as_ref()).await;
+            let status = server_status(
+                defaults,
+                &state,
+                workers.runtime.runtime.as_ref(),
+                &workers.runtime.stream_watch,
+            )
+            .await;
             (
                 false,
                 CliOutput {
@@ -981,6 +998,10 @@ async fn handle_messages_subscription(
 
     loop {
         tokio::select! {
+            // Stream-start messages are published before their preview updates; keep that
+            // ordering stable when both broadcast channels are ready in the same poll.
+            biased;
+
             update = runtime_subscription.recv() => {
                 let Some(update) = update else {
                     return Ok(());
@@ -3050,7 +3071,9 @@ async fn server_status(
     defaults: &DaemonDefaults,
     state: &Arc<Mutex<DaemonState>>,
     runtime: Option<&marmot_app::MarmotAppRuntime>,
+    stream_workers: &StreamWatchWorkers,
 ) -> DaemonStatus {
+    stream_workers.reap_finished();
     let state = state.lock().ok();
     let relay_health = if let Some(runtime) = runtime {
         let shared = runtime.shared_services();
@@ -3538,6 +3561,35 @@ mod tests {
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         );
         assert_eq!(value["from_display_name"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn stream_watch_workers_reap_finished_handles_on_replace() {
+        let workers = StreamWatchWorkers::default();
+        workers.replace("finished".to_owned(), tokio::spawn(async {}));
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+            if workers
+                .handles
+                .lock()
+                .map(|handles| handles["finished"].is_finished())
+                .unwrap_or(false)
+            {
+                break;
+            }
+        }
+
+        workers.replace(
+            "running".to_owned(),
+            tokio::spawn(async {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }),
+        );
+
+        let handles = workers.handles.lock().expect("worker lock");
+        assert!(!handles.contains_key("finished"));
+        assert!(handles.contains_key("running"));
+        handles["running"].abort();
     }
 
     #[test]
