@@ -90,6 +90,22 @@ fn json_value_summary(label: &str, value: &Value) -> String {
     format!("{label}_json_len={}", value.to_string().len())
 }
 
+fn assert_two_word_pseudonym(value: &str) {
+    let words = value.split(' ').collect::<Vec<_>>();
+    assert_eq!(words.len(), 2, "expected two words: {value}");
+    for word in words {
+        let mut chars = word.chars();
+        assert!(
+            chars.next().is_some_and(|ch| ch.is_ascii_uppercase()),
+            "word should start uppercase: {word}"
+        );
+        assert!(
+            chars.all(|ch| ch.is_ascii_lowercase()),
+            "word should be title-cased ASCII: {word}"
+        );
+    }
+}
+
 fn run_json(home: &std::path::Path, args: &[&str]) -> Value {
     try_run_json(home, args).unwrap_or_else(|failure| panic!("dm failed\n{failure}"))
 }
@@ -1210,14 +1226,12 @@ fn whitenoise_identity_commands_create_login_and_show_accounts() {
     assert_eq!(created["key_package"]["published"], true);
     assert!(created["key_package"]["bytes"].as_u64().expect("bytes") > 0);
     let created_id = created["account_id"].as_str().expect("created account id");
-    assert_eq!(
-        created["profile"]["name"],
-        format!("marmot_{}", &created_id[..8])
-    );
-    assert_eq!(
-        created["profile"]["display_name"],
-        format!("Marmot {}", &created_id[..8])
-    );
+    let profile_name = created["profile"]["name"].as_str().expect("profile name");
+    let display_name = created["profile"]["display_name"]
+        .as_str()
+        .expect("display name");
+    assert_eq!(display_name, profile_name);
+    assert_two_word_pseudonym(profile_name);
 
     let shown_profile = run_json(home.path(), &["--account", created_id, "profile", "show"]);
     assert_eq!(shown_profile["profile"], created["profile"]);
@@ -3733,6 +3747,11 @@ fn local_group_message_workflow_runs_through_the_dm_contract() {
     let home = tempfile::tempdir().expect("tempdir");
 
     let alice = create_account(home.path());
+    let alice_profile = run_json(home.path(), &["--account", &alice, "profile", "show"]);
+    let alice_display_name = alice_profile["profile"]["display_name"]
+        .as_str()
+        .expect("alice display name")
+        .to_owned();
     let bob = create_account(home.path());
     run_json(home.path(), &["--account", &bob, "keys", "publish"]);
 
@@ -3763,7 +3782,7 @@ fn local_group_message_workflow_runs_through_the_dm_contract() {
     assert_eq!(bob_sync["messages"][0]["from"], alice);
     assert_eq!(
         bob_sync["messages"][0]["from_display_name"],
-        format!("Marmot {}", &alice[..8])
+        alice_display_name
     );
     assert_eq!(bob_sync["messages"][0]["group_id"], group_id);
     assert_eq!(bob_sync["messages"][0]["plaintext"], "hello bob");
@@ -3772,7 +3791,7 @@ fn local_group_message_workflow_runs_through_the_dm_contract() {
     assert_eq!(bob_messages["messages"][0]["from"], alice);
     assert_eq!(
         bob_messages["messages"][0]["from_display_name"],
-        format!("Marmot {}", &alice[..8])
+        alice_display_name
     );
     assert_eq!(bob_messages["messages"][0]["group_id"], group_id);
     assert_eq!(bob_messages["messages"][0]["plaintext"], "hello bob");

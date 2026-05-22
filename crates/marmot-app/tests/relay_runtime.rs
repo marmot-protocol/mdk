@@ -25,6 +25,22 @@ fn endpoint(url: &str) -> TransportEndpoint {
     TransportEndpoint(url.to_owned())
 }
 
+fn assert_two_word_pseudonym(value: &str) {
+    let words = value.split(' ').collect::<Vec<_>>();
+    assert_eq!(words.len(), 2, "expected two words: {value}");
+    for word in words {
+        let mut chars = word.chars();
+        assert!(
+            chars.next().is_some_and(|ch| ch.is_ascii_uppercase()),
+            "word should start uppercase: {word}"
+        );
+        assert!(
+            chars.all(|ch| ch.is_ascii_lowercase()),
+            "word should be title-cased ASCII: {word}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn app_runtime_create_identity_bootstraps_managed_account_and_key_package() {
     let dir = tempfile::tempdir().unwrap();
@@ -49,11 +65,9 @@ async fn app_runtime_create_identity_bootstraps_managed_account_and_key_package(
         .unwrap()
         .expect("directory entry");
     let profile = directory_entry.profile.expect("created identity profile");
-    assert_eq!(
-        profile.name,
-        Some(format!("marmot_{}", &created.account.account_id_hex[..8]))
-    );
-    assert!(profile.display_name.is_some());
+    let profile_name = profile.name.as_deref().expect("profile name");
+    assert_eq!(profile.display_name.as_deref(), Some(profile_name));
+    assert_two_word_pseudonym(profile_name);
     assert_eq!(
         runtime
             .accounts()

@@ -96,6 +96,8 @@ versioning through the workspace version in the root `Cargo.toml`.
 - `dm create-identity` and `dm login <nsec>` publish the required NIP-65, inbox, and KeyPackage relay lists for new
   local signing identities from daemon account-relay defaults when relay-list flags are omitted; `dm login --relay
   <url>` remains the command-local import fallback.
+- Newly created local identities now publish matching Nostr `name` and `display_name` values using two-word pseudonyms
+  instead of account-id-derived Marmot labels.
 - Imported `nsec` accounts now require `--publish-missing-relay-lists` before publishing missing required relay
   lists discovered from bootstrap relays.
 - Removed the file-backed local transport and Marmot Lab crate; local tests now use Nostr SDK mock relays and

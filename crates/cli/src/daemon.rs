@@ -1961,7 +1961,11 @@ async fn open_stream_compose(
         Ok(candidate) => candidate,
         Err(err) => return daemon_error(cli.json, "stream_compose_failed", err.to_string()),
     };
-    let trust = match crate::broker_trust(parsed_candidate.addr, None, insecure_local) {
+    let candidate_addr = match crate::resolve_quic_candidate_addr(&parsed_candidate).await {
+        Ok(addr) => addr,
+        Err(err) => return daemon_error(cli.json, "stream_compose_failed", err.to_string()),
+    };
+    let trust = match crate::broker_trust(candidate_addr, None, insecure_local) {
         Ok(trust) => trust,
         Err(err) => return daemon_error(cli.json, "stream_compose_failed", err.to_string()),
     };
@@ -2022,7 +2026,7 @@ async fn open_stream_compose(
     let handle = tokio::spawn(async move {
         run_stream_compose_session(
             OpenBrokerTextPublisher {
-                broker_addr: parsed_candidate.addr,
+                broker_addr: candidate_addr,
                 server_name: parsed_candidate.server_name,
                 trust,
                 stream_id: stream_id_bytes,

@@ -102,6 +102,18 @@ const AGENT_STREAM_START_LOOKBACK_LIMIT: usize = 200;
 pub(crate) const MAX_SEEN_EVENT_IDS: usize = 16_384;
 const KIND_NOSTR_METADATA: u64 = 0;
 const KIND_NOSTR_CONTACT_LIST: u64 = 3;
+const DEFAULT_PROFILE_ADJECTIVES: &[&str] = &[
+    "Agile", "Angry", "Brave", "Bright", "Calm", "Clever", "Cosmic", "Daring", "Electric",
+    "Gentle", "Golden", "Happy", "Hidden", "Jolly", "Kind", "Lucky", "Majestic", "Mellow",
+    "Mighty", "Nimble", "Noble", "Quiet", "Rapid", "Sage", "Silver", "Sunny", "Swift", "Vivid",
+    "Witty", "Wondrous", "Young", "Zesty",
+];
+const DEFAULT_PROFILE_NOUNS: &[&str] = &[
+    "Antelope", "Badger", "Bear", "Beaver", "Bison", "Bobcat", "Cougar", "Dolphin", "Eagle",
+    "Falcon", "Finch", "Fox", "Gecko", "Heron", "Jaguar", "Koala", "Llama", "Lynx", "Moose",
+    "Narwhal", "Otter", "Owl", "Panda", "Puffin", "Raven", "Robin", "Seal", "Swan", "Tiger",
+    "Turtle", "Wolf", "Yak",
+];
 
 type AppRuntime = AccountDeviceRuntime<
     MarmotRelayPlaneAccountAdapter,
@@ -1684,13 +1696,10 @@ impl AccountManager {
         account: &AccountSummary,
         request: &AccountSetupRequest,
     ) -> Result<UserProfileMetadata, AppError> {
-        let short_id = account
-            .account_id_hex
-            .get(..8)
-            .unwrap_or(account.account_id_hex.as_str());
+        let pseudonym = default_profile_pseudonym(&account.account_id_hex);
         let profile = UserProfileMetadata {
-            name: Some(format!("marmot_{short_id}")),
-            display_name: Some(format!("Marmot {short_id}")),
+            name: Some(pseudonym.clone()),
+            display_name: Some(pseudonym),
             created_at: unix_now_seconds(),
             ..UserProfileMetadata::default()
         };
@@ -5213,6 +5222,18 @@ fn display_name_for_profile(profile: Option<&UserProfileMetadata>) -> Option<Str
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_owned)
+}
+
+fn default_profile_pseudonym(account_id_hex: &str) -> String {
+    let digest = Sha256::digest(account_id_hex.as_bytes());
+    let adjective_index =
+        u16::from_be_bytes([digest[0], digest[1]]) as usize % DEFAULT_PROFILE_ADJECTIVES.len();
+    let noun_index =
+        u16::from_be_bytes([digest[2], digest[3]]) as usize % DEFAULT_PROFILE_NOUNS.len();
+    format!(
+        "{} {}",
+        DEFAULT_PROFILE_ADJECTIVES[adjective_index], DEFAULT_PROFILE_NOUNS[noun_index]
+    )
 }
 
 fn unix_now_seconds() -> u64 {

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
-use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -3734,7 +3734,8 @@ where
         .find(|candidate| candidate.trim().starts_with("quic://"))
         .ok_or(DmError::MissingQuicCandidate)?;
     let candidate = parse_quic_candidate(candidate)?;
-    let trust = broker_trust(candidate.addr, server_cert_der_hex, insecure_local)?;
+    let candidate_addr = resolve_quic_candidate_addr(&candidate).await?;
+    let trust = broker_trust(candidate_addr, server_cert_der_hex, insecure_local)?;
     let stream_id = hex::decode(&start_payload.stream_id)?;
     let stream_id_hex = start_payload.stream_id.clone();
     let start_event_id = MessageId::new(hex::decode(&start_message_id_hex)?);
@@ -3743,7 +3744,7 @@ where
     let delta_stream_id = stream_id_hex.clone();
     let received = subscribe_text_from_broker_with_updates(
         SubscribeTextFromBroker {
-            broker_addr: candidate.addr,
+            broker_addr: candidate_addr,
             server_name: candidate.server_name.clone(),
             trust: trust.clone(),
             stream_id,
@@ -3772,7 +3773,7 @@ where
         json: json!({
             "brokered": true,
             "candidate": candidate.original,
-            "connect": candidate.addr.to_string(),
+            "connect": candidate_addr.to_string(),
             "server_name": candidate.server_name,
             "trust": broker_trust_name(&trust),
             "stream_id": hex::encode(&received.stream_id),
@@ -3822,7 +3823,7 @@ fn latest_stream_start(
 
 struct ParsedQuicCandidate {
     original: String,
-    addr: SocketAddr,
+    authority: String,
     server_name: String,
 }
 
@@ -3836,21 +3837,25 @@ fn parse_quic_candidate(candidate: &str) -> Result<ParsedQuicCandidate, DmError>
         return Err(DmError::InvalidQuicCandidate(trimmed.to_owned()));
     }
     let server_name = candidate_server_name(authority)?;
-    let mut addrs =
-        authority
-            .to_socket_addrs()
-            .map_err(|source| DmError::QuicCandidateResolve {
-                candidate: trimmed.to_owned(),
-                source,
-            })?;
-    let addr = addrs
-        .next()
-        .ok_or_else(|| DmError::InvalidQuicCandidate(trimmed.to_owned()))?;
     Ok(ParsedQuicCandidate {
         original: trimmed.to_owned(),
-        addr,
+        authority: authority.to_owned(),
         server_name,
     })
+}
+
+async fn resolve_quic_candidate_addr(
+    candidate: &ParsedQuicCandidate,
+) -> Result<SocketAddr, DmError> {
+    let mut addrs = tokio::net::lookup_host(&candidate.authority)
+        .await
+        .map_err(|source| DmError::QuicCandidateResolve {
+            candidate: candidate.original.clone(),
+            source,
+        })?;
+    addrs
+        .next()
+        .ok_or_else(|| DmError::InvalidQuicCandidate(candidate.original.clone()))
 }
 
 fn candidate_server_name(authority: &str) -> Result<String, DmError> {
