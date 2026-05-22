@@ -188,8 +188,11 @@ impl NostrGroupDataExtension {
         let mut random_bytes = [0u8; 32];
         rng.fill(&mut random_bytes);
 
-        // Normalize Some(0) to None — zero means "no expiration" and from_raw()
+        // Defense-in-depth backstop: zero means "no expiration" and from_raw()
         // rejects it on the read path, so the write path must not produce it.
+        // Callers should reject Some(0) at the public API boundary
+        // (see MDK::create_group / MDK::update_group_data) so this filter
+        // never fires for legitimate input.
         let disappearing_message_secs = disappearing_message_secs.filter(|&d| d != 0);
 
         // Version tracks protocol capabilities: v3 when disappearing messages

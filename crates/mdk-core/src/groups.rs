@@ -1401,6 +1401,14 @@ where
         group_id: &GroupId,
         update: NostrGroupDataUpdate,
     ) -> Result<UpdateGroupResult, Error> {
+        // Zero is reserved to mean "disabled"; require callers to use Some(None) for that.
+        if matches!(update.disappearing_message_secs, Some(Some(0))) {
+            return Err(Error::Group(
+                "disappearing_message_secs must be greater than zero (use Some(None) to disable)"
+                    .to_string(),
+            ));
+        }
+
         let mut mls_group = self.load_mls_group(group_id)?.ok_or(Error::GroupNotFound)?;
 
         let mut group_data = NostrGroupDataExtension::from_group(&mls_group)?;
@@ -1538,6 +1546,14 @@ where
 
         // Validate group members
         self.validate_group_members(creator_public_key, &member_pubkeys, &admins)?;
+
+        // Zero is reserved to mean "disabled"; require callers to use None for that.
+        if config.disappearing_message_secs == Some(0) {
+            return Err(Error::Group(
+                "disappearing_message_secs must be greater than zero (use None to disable)"
+                    .to_string(),
+            ));
+        }
 
         let group_data = NostrGroupDataExtension::new(
             config.name,
@@ -2419,6 +2435,9 @@ where
     ) -> Result<Event, Error> {
         let group = self.get_group(group_id)?.ok_or(Error::GroupNotFound)?;
 
+        // Snapshot once so the event's `created_at` matches any expiration math.
+        let now = Timestamp::now();
+
         // Derive the encryption key via MLS exporter (stable per epoch)
         let secret: group_types::GroupExporterSecret = self.exporter_secret(group_id)?;
         let encrypted_content = encrypt_message_with_exporter_secret(&secret, &serialized_content)?;
@@ -2426,15 +2445,50 @@ where
         // Generate ephemeral key for signing (MUST NOT be reused across events)
         let ephemeral_nostr_keys: Keys = Keys::generate();
 
-        let tag: Tag = Tag::custom(TagKind::h(), [hex::encode(group.nostr_group_id)]);
+        let h_tag: Tag = Tag::custom(TagKind::h(), [hex::encode(group.nostr_group_id)]);
         let encoding_tag: Tag = Tag::custom(TagKind::Custom("encoding".into()), ["base64"]);
 
-        let mut builder = EventBuilder::new(Kind::MlsGroupMessage, encrypted_content)
-            .tag(tag)
-            .tag(encoding_tag);
-
+        // Split caller-supplied tags into "expiration" vs "everything else" so we
+        // can take the min(caller, group) below — caller can ask for a *shorter*
+        // lifetime than the group's setting, but never longer.
+        let mut caller_tags: Vec<Tag> = Vec::new();
+        let mut caller_expiration: Option<Timestamp> = None;
         if let Some(tags) = tags {
-            builder = builder.tags(tags.into_iter().map(|t| t.into_tag()));
+            for tag in tags {
+                let tag = tag.into_tag();
+                if let Some(TagStandard::Expiration(ts)) = tag.as_standardized() {
+                    let ts = *ts;
+                    caller_expiration = Some(match caller_expiration {
+                        Some(prev) => prev.min(ts),
+                        None => ts,
+                    });
+                } else {
+                    caller_tags.push(tag);
+                }
+            }
+        }
+
+        // Group-imposed expiration: now + duration (None if the group has no setting).
+        let group_expiration = group
+            .disappearing_message_secs
+            .map(|d| Timestamp::from(now.as_secs().saturating_add(d)));
+
+        // Final expiration is the earliest of the two — lowest wins.
+        let final_expiration = match (caller_expiration, group_expiration) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        };
+
+        let mut builder = EventBuilder::new(Kind::MlsGroupMessage, encrypted_content)
+            .custom_created_at(now)
+            .tag(h_tag)
+            .tag(encoding_tag)
+            .tags(caller_tags);
+
+        if let Some(exp) = final_expiration {
+            builder = builder.tag(Tag::expiration(exp));
         }
 
         let event = builder.sign_with_keys(&ephemeral_nostr_keys)?;
@@ -2505,7 +2559,7 @@ mod tests {
     use mdk_memory_storage::MdkMemoryStorage;
     use mdk_storage_traits::groups::GroupStorage;
     use mdk_storage_traits::messages::{MessageStorage, types as message_types};
-    use nostr::{Keys, PublicKey};
+    use nostr::{Keys, PublicKey, TagKind, TagStandard, Timestamp};
     use openmls::prelude::{BasicCredential, ProposalType};
     use openmls_basic_credential::SignatureKeyPair;
 
@@ -8591,6 +8645,135 @@ mod tests {
             !proposal_types.contains(&ProposalType::SelfRemove),
             "mixed group must not require SelfRemove (got {:?})",
             proposal_types
+        );
+    }
+
+    fn config_with_disappearing(
+        admins: Vec<PublicKey>,
+        disappearing_message_secs: Option<u64>,
+    ) -> super::NostrGroupConfigData {
+        let mut config = create_nostr_group_config_data(admins);
+        config.disappearing_message_secs = disappearing_message_secs;
+        config
+    }
+
+    #[test]
+    fn test_create_group_rejects_zero_disappearing_duration() {
+        let mdk = create_test_mdk();
+        let (creator, members, admins) = create_test_group_members();
+        let creator_pk = creator.public_key();
+
+        let key_package_events: Vec<_> = members
+            .iter()
+            .map(|m| create_key_package_event(&mdk, m))
+            .collect();
+
+        let result = mdk.create_group(
+            &creator_pk,
+            key_package_events,
+            config_with_disappearing(admins, Some(0)),
+        );
+
+        let err = result.expect_err("Some(0) must be rejected");
+        assert!(
+            matches!(&err, Error::Group(msg) if msg.contains("greater than zero")),
+            "expected zero-duration rejection, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_update_group_data_rejects_zero_disappearing_duration() {
+        let mdk = create_test_mdk();
+        let (creator, members, admins) = create_test_group_members();
+        let group_id = create_test_group(&mdk, &creator, &members, &admins);
+
+        let update = NostrGroupDataUpdate::new().disappearing_message_secs(Some(0));
+        let result = mdk.update_group_data(&group_id, update);
+
+        let err = result.expect_err("Some(Some(0)) must be rejected");
+        assert!(
+            matches!(&err, Error::Group(msg) if msg.contains("greater than zero")),
+            "expected zero-duration rejection, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_update_group_data_allows_clearing_via_some_none() {
+        let mdk = create_test_mdk();
+        let (creator, members, admins) = create_test_group_members();
+        let creator_pk = creator.public_key();
+        let key_package_events: Vec<_> = members
+            .iter()
+            .map(|m| create_key_package_event(&mdk, m))
+            .collect();
+
+        let create_result = mdk
+            .create_group(
+                &creator_pk,
+                key_package_events,
+                config_with_disappearing(admins, Some(3600)),
+            )
+            .expect("create group with duration");
+        let group_id = create_result.group.mls_group_id.clone();
+        mdk.merge_pending_commit(&group_id).unwrap();
+
+        let update = NostrGroupDataUpdate::new().disappearing_message_secs(None);
+        mdk.update_group_data(&group_id, update)
+            .expect("Some(None) must be accepted to disable");
+        mdk.merge_pending_commit(&group_id).unwrap();
+
+        let mls_group = mdk.load_mls_group(&group_id).unwrap().unwrap();
+        let group_data = NostrGroupDataExtension::from_group(&mls_group).unwrap();
+        assert_eq!(group_data.disappearing_message_secs, None);
+    }
+
+    #[test]
+    fn test_commit_event_carries_expiration_when_group_has_duration() {
+        let mdk = create_test_mdk();
+        let (creator, members, admins) = create_test_group_members();
+        let creator_pk = creator.public_key();
+        let key_package_events: Vec<_> = members
+            .iter()
+            .map(|m| create_key_package_event(&mdk, m))
+            .collect();
+
+        let create_result = mdk
+            .create_group(
+                &creator_pk,
+                key_package_events,
+                config_with_disappearing(admins, Some(60)),
+            )
+            .expect("create group with duration");
+        let group_id = create_result.group.mls_group_id.clone();
+        mdk.merge_pending_commit(&group_id).unwrap();
+
+        // Trigger a commit via add_members so we can inspect its outer wrapper.
+        let new_member = Keys::generate();
+        let new_kp = create_key_package_event(&mdk, &new_member);
+        let before = Timestamp::now().as_secs();
+        let add_result = mdk.add_members(&group_id, &[new_kp]).unwrap();
+        let after = Timestamp::now().as_secs();
+        let commit_event = add_result.evolution_event;
+
+        let expiration_tag = commit_event
+            .tags
+            .iter()
+            .find(|t| t.kind() == TagKind::Expiration)
+            .expect("commit event must carry an expiration tag when group has duration");
+        let exp_ts = match expiration_tag.as_standardized() {
+            Some(TagStandard::Expiration(ts)) => ts.as_secs(),
+            other => panic!("expected expiration tag, got {other:?}"),
+        };
+        assert!(
+            exp_ts >= before + 60 && exp_ts <= after + 60,
+            "expiration {exp_ts} not in expected window [{}+60, {}+60]",
+            before,
+            after
+        );
+        assert_eq!(
+            commit_event.created_at.as_secs() + 60,
+            exp_ts,
+            "expiration must equal created_at + duration"
         );
     }
 }
