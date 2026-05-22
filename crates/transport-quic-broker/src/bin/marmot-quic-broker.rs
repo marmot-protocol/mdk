@@ -48,7 +48,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tls,
     })?;
     let local_addr = server.local_addr()?;
-    let server_cert_der_hex = hex::encode(server.server_cert_der());
+    let server_cert_sha256_fingerprint = server.server_cert_sha256_fingerprint();
 
     if args.json {
         println!(
@@ -57,7 +57,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "ok": true,
                 "result": {
                     "local_addr": local_addr.to_string(),
-                    "server_cert_der_hex": server_cert_der_hex,
+                    "server_cert_sha256_fingerprint": server_cert_sha256_fingerprint,
                     "tls": tls_mode,
                     "persistence": "none",
                     "per_subscriber_queue": args.per_subscriber_queue,
@@ -67,7 +67,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     } else {
         eprintln!("listening on {local_addr}");
-        eprintln!("server_cert_der_hex={server_cert_der_hex}");
+        eprintln!("server_cert_sha256_fingerprint={server_cert_sha256_fingerprint}");
         eprintln!("tls={tls_mode}");
         eprintln!("persistence=none");
         eprintln!("max_backlog={}", args.max_backlog);

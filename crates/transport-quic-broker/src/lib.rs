@@ -18,6 +18,7 @@ use quinn::crypto::rustls::QuicClientConfig;
 use quinn::{ClientConfig, Endpoint, ServerConfig};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, Notify, mpsc};
 use tokio::time::{sleep, timeout};
 use transport_quic_stream::{ReceivedTextChunk, ReceivedTextStream, SentTextStream};
@@ -99,6 +100,10 @@ impl QuicBrokerServer {
         &self.server_cert_der
     }
 
+    pub fn server_cert_sha256_fingerprint(&self) -> String {
+        certificate_sha256_fingerprint_hex(&self.server_cert_der)
+    }
+
     pub async fn run_until(
         self,
         shutdown: impl Future<Output = ()>,
@@ -126,6 +131,10 @@ impl QuicBrokerServer {
             }
         }
     }
+}
+
+fn certificate_sha256_fingerprint_hex(certificate_der: &[u8]) -> String {
+    hex::encode(Sha256::digest(certificate_der))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -1108,5 +1117,13 @@ mod tests {
         .unwrap();
 
         assert_eq!(server.server_cert_der(), certified_key.cert.der().as_ref());
+    }
+
+    #[test]
+    fn certificate_fingerprint_is_sha256_hex() {
+        assert_eq!(
+            certificate_sha256_fingerprint_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
     }
 }

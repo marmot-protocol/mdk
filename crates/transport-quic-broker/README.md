@@ -21,7 +21,7 @@ final MLS app-message payload remains authoritative.
 cargo run -p transport-quic-broker --bin marmot-quic-broker -- --bind 127.0.0.1:4450
 ```
 
-For local development the broker prints a generated self-signed certificate in hex. A stable certificate can be supplied
-with `--cert-pem <path> --key-pem <path>`.
+For local development the broker prints the SHA-256 fingerprint of its generated self-signed certificate. A stable
+certificate can be supplied with `--cert-pem <path> --key-pem <path>`.
 
 Docker and VM deployment notes live in [`../../docs/quic-broker-deployment.md`](../../docs/quic-broker-deployment.md).
