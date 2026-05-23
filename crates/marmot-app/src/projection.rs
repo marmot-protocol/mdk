@@ -2,7 +2,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{Connection, params, types::Type};
+use rusqlite::{Connection, Transaction, params, types::Type};
 
 use crate::{
     AGENT_TEXT_STREAM_COMPONENT_ID, AccountState, AppAgentTextStreamComponent, AppError,
@@ -244,6 +244,7 @@ impl AccountProjectionDb {
     }
 
     pub(crate) fn save_state(&mut self, state: &AccountState) -> Result<(), AppError> {
+        let now = unix_now_seconds() as i64;
         let tx = self.conn.transaction()?;
         tx.execute(
             "INSERT INTO account_state (label, updated_at, last_transport_timestamp)
@@ -253,7 +254,7 @@ impl AccountProjectionDb {
                 last_transport_timestamp = excluded.last_transport_timestamp",
             params![
                 &state.label,
-                unix_now_seconds() as i64,
+                now,
                 state
                     .last_transport_timestamp
                     .and_then(|value| i64::try_from(value).ok()),
@@ -268,7 +269,7 @@ impl AccountProjectionDb {
             tx.execute(
                 "INSERT OR IGNORE INTO seen_events (event_id, seen_at)
                  VALUES (?1, ?2)",
-                params![event_id, unix_now_seconds() as i64],
+                params![event_id, now],
             )?;
         }
         tx.execute(
@@ -282,10 +283,7 @@ impl AccountProjectionDb {
         )?;
 
         for group in &state.groups {
-            tx.execute(
-                "DELETE FROM group_app_components WHERE group_id_hex = ?1",
-                params![&group.group_id_hex],
-            )?;
+            let admin_keys_hex = group.admin_policy.admins.join(",");
             tx.execute(
                 "INSERT INTO groups (
                     group_id_hex, endpoint, profile_name, profile_description,
@@ -304,7 +302,17 @@ impl AccountProjectionDb {
                     image_media_type = excluded.image_media_type,
                     admin_keys_hex = excluded.admin_keys_hex,
                     archived = excluded.archived,
-                    updated_at = excluded.updated_at",
+                    updated_at = excluded.updated_at
+                 WHERE groups.endpoint IS NOT excluded.endpoint
+                    OR groups.profile_name IS NOT excluded.profile_name
+                    OR groups.profile_description IS NOT excluded.profile_description
+                    OR groups.image_hash_hex IS NOT excluded.image_hash_hex
+                    OR groups.image_key_hex IS NOT excluded.image_key_hex
+                    OR groups.image_nonce_hex IS NOT excluded.image_nonce_hex
+                    OR groups.image_upload_key_hex IS NOT excluded.image_upload_key_hex
+                    OR groups.image_media_type IS NOT excluded.image_media_type
+                    OR groups.admin_keys_hex IS NOT excluded.admin_keys_hex
+                    OR groups.archived IS NOT excluded.archived",
                 params![
                     &group.group_id_hex,
                     &group.endpoint,
@@ -315,96 +323,81 @@ impl AccountProjectionDb {
                     &group.image.image_nonce_hex,
                     &group.image.image_upload_key_hex,
                     &group.image.media_type,
-                    group.admin_policy.admins.join(","),
+                    admin_keys_hex,
                     if group.archived { 1_i64 } else { 0_i64 },
-                    unix_now_seconds() as i64
+                    now
                 ],
             )?;
-            tx.execute(
-                "INSERT INTO group_app_components (
-                    group_id_hex, component_id, component_name, component_data_hex, updated_at
-                 )
-                 VALUES (?1, ?2, ?3, ?4, ?5)
-                 ON CONFLICT(group_id_hex, component_id) DO UPDATE SET
-                    component_name = excluded.component_name,
-                    component_data_hex = excluded.component_data_hex,
-                    updated_at = excluded.updated_at",
-                params![
-                    &group.group_id_hex,
-                    i64::from(group.profile.component_id),
-                    &group.profile.component,
-                    &group.profile.data_hex,
-                    unix_now_seconds() as i64
-                ],
-            )?;
-            tx.execute(
-                "INSERT INTO group_app_components (
-                    group_id_hex, component_id, component_name, component_data_hex, updated_at
-                 )
-                 VALUES (?1, ?2, ?3, ?4, ?5)
-                 ON CONFLICT(group_id_hex, component_id) DO UPDATE SET
-                    component_name = excluded.component_name,
-                    component_data_hex = excluded.component_data_hex,
-                    updated_at = excluded.updated_at",
-                params![
-                    &group.group_id_hex,
-                    i64::from(group.image.component_id),
-                    &group.image.component,
-                    &group.image.data_hex,
-                    unix_now_seconds() as i64
-                ],
-            )?;
-            tx.execute(
-                "INSERT INTO group_app_components (
-                    group_id_hex, component_id, component_name, component_data_hex, updated_at
-                 )
-                 VALUES (?1, ?2, ?3, ?4, ?5)
-                 ON CONFLICT(group_id_hex, component_id) DO UPDATE SET
-                    component_name = excluded.component_name,
-                    component_data_hex = excluded.component_data_hex,
-                    updated_at = excluded.updated_at",
-                params![
-                    &group.group_id_hex,
-                    i64::from(group.admin_policy.component_id),
-                    &group.admin_policy.component,
-                    &group.admin_policy.data_hex,
-                    unix_now_seconds() as i64
-                ],
-            )?;
-            tx.execute(
-                "INSERT INTO group_app_components (
-                    group_id_hex, component_id, component_name, component_data_hex, updated_at
-                 )
-                 VALUES (?1, ?2, ?3, ?4, ?5)
-                 ON CONFLICT(group_id_hex, component_id) DO UPDATE SET
-                    component_name = excluded.component_name,
-                    component_data_hex = excluded.component_data_hex,
-                    updated_at = excluded.updated_at",
-                params![
-                    &group.group_id_hex,
-                    i64::from(group.nostr_routing.component_id),
-                    &group.nostr_routing.component,
-                    &group.nostr_routing.data_hex,
-                    unix_now_seconds() as i64
-                ],
-            )?;
+
             if group.agent_text_stream.required {
                 tx.execute(
-                    "INSERT INTO group_app_components (
-                        group_id_hex, component_id, component_name, component_data_hex, updated_at
-                     )
-                     VALUES (?1, ?2, ?3, ?4, ?5)
-                     ON CONFLICT(group_id_hex, component_id) DO UPDATE SET
-                        component_name = excluded.component_name,
-                        component_data_hex = excluded.component_data_hex,
-                        updated_at = excluded.updated_at",
+                    "DELETE FROM group_app_components
+                     WHERE group_id_hex = ?1
+                       AND component_id NOT IN (?2, ?3, ?4, ?5, ?6)",
                     params![
                         &group.group_id_hex,
+                        i64::from(group.profile.component_id),
+                        i64::from(group.image.component_id),
+                        i64::from(group.admin_policy.component_id),
+                        i64::from(group.nostr_routing.component_id),
                         i64::from(group.agent_text_stream.component_id),
-                        &group.agent_text_stream.component,
-                        &group.agent_text_stream.data_hex,
-                        unix_now_seconds() as i64
                     ],
+                )?;
+            } else {
+                tx.execute(
+                    "DELETE FROM group_app_components
+                     WHERE group_id_hex = ?1
+                       AND component_id NOT IN (?2, ?3, ?4, ?5)",
+                    params![
+                        &group.group_id_hex,
+                        i64::from(group.profile.component_id),
+                        i64::from(group.image.component_id),
+                        i64::from(group.admin_policy.component_id),
+                        i64::from(group.nostr_routing.component_id),
+                    ],
+                )?;
+            }
+
+            upsert_group_component(
+                &tx,
+                &group.group_id_hex,
+                group.profile.component_id,
+                &group.profile.component,
+                &group.profile.data_hex,
+                now,
+            )?;
+            upsert_group_component(
+                &tx,
+                &group.group_id_hex,
+                group.image.component_id,
+                &group.image.component,
+                &group.image.data_hex,
+                now,
+            )?;
+            upsert_group_component(
+                &tx,
+                &group.group_id_hex,
+                group.admin_policy.component_id,
+                &group.admin_policy.component,
+                &group.admin_policy.data_hex,
+                now,
+            )?;
+            upsert_group_component(
+                &tx,
+                &group.group_id_hex,
+                group.nostr_routing.component_id,
+                &group.nostr_routing.component,
+                &group.nostr_routing.data_hex,
+                now,
+            )?;
+            if group.agent_text_stream.required {
+                upsert_group_component(
+                    &tx,
+                    &group.group_id_hex,
+                    group.agent_text_stream.component_id,
+                    &group.agent_text_stream.component,
+                    &group.agent_text_stream.data_hex,
+                    now,
                 )?;
             }
         }
@@ -539,6 +532,36 @@ impl AccountProjectionDb {
         )?;
         Ok(pruned)
     }
+}
+
+fn upsert_group_component(
+    tx: &Transaction<'_>,
+    group_id_hex: &str,
+    component_id: u16,
+    component_name: &str,
+    component_data_hex: &str,
+    now: i64,
+) -> Result<(), AppError> {
+    tx.execute(
+        "INSERT INTO group_app_components (
+            group_id_hex, component_id, component_name, component_data_hex, updated_at
+         )
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(group_id_hex, component_id) DO UPDATE SET
+            component_name = excluded.component_name,
+            component_data_hex = excluded.component_data_hex,
+            updated_at = excluded.updated_at
+         WHERE group_app_components.component_name IS NOT excluded.component_name
+            OR group_app_components.component_data_hex IS NOT excluded.component_data_hex",
+        params![
+            group_id_hex,
+            i64::from(component_id),
+            component_name,
+            component_data_hex,
+            now
+        ],
+    )?;
+    Ok(())
 }
 
 fn unix_now_seconds() -> u64 {
@@ -698,6 +721,80 @@ mod tests {
             restored.groups[0].agent_text_stream.data_hex,
             "010300001000000000000000"
         );
+    }
+
+    #[test]
+    fn save_state_does_not_rewrite_unchanged_group_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = AccountProjectionDb::open(dir.path().join("app.sqlite3"), "test-key").unwrap();
+        let state = AccountState {
+            label: "alice".to_owned(),
+            seen_events: Vec::new(),
+            last_transport_timestamp: Some(1_700_000_003),
+            groups: vec![
+                AppGroupRecord::new(
+                    "aa".to_owned(),
+                    test_routing([0xAA; 32], "ws://127.0.0.1:18080"),
+                    "alpha".to_owned(),
+                    "".to_owned(),
+                    AppGroupImageInput::default(),
+                    AppGroupAdminPolicyComponent::new(Vec::new()),
+                    AppGroupMessageRetentionComponent::disabled(),
+                ),
+                AppGroupRecord::new(
+                    "bb".to_owned(),
+                    test_routing([0xBB; 32], "ws://127.0.0.1:18081"),
+                    "beta".to_owned(),
+                    "".to_owned(),
+                    AppGroupImageInput::default(),
+                    AppGroupAdminPolicyComponent::new(Vec::new()),
+                    AppGroupMessageRetentionComponent::disabled(),
+                ),
+            ],
+        };
+        db.save_state(&state).unwrap();
+        db.conn
+            .execute_batch(
+                "CREATE TABLE write_audit (table_name TEXT NOT NULL);
+                 CREATE TRIGGER audit_groups_insert
+                 AFTER INSERT ON groups
+                 BEGIN
+                    INSERT INTO write_audit (table_name) VALUES ('groups');
+                 END;
+                 CREATE TRIGGER audit_groups_update
+                 AFTER UPDATE ON groups
+                 BEGIN
+                    INSERT INTO write_audit (table_name) VALUES ('groups');
+                 END;
+                 CREATE TRIGGER audit_components_insert
+                 AFTER INSERT ON group_app_components
+                 BEGIN
+                    INSERT INTO write_audit (table_name) VALUES ('group_app_components');
+                 END;
+                 CREATE TRIGGER audit_components_update
+                 AFTER UPDATE ON group_app_components
+                 BEGIN
+                    INSERT INTO write_audit (table_name) VALUES ('group_app_components');
+                 END;
+                 CREATE TRIGGER audit_components_delete
+                 AFTER DELETE ON group_app_components
+                 BEGIN
+                    INSERT INTO write_audit (table_name) VALUES ('group_app_components');
+                 END;",
+            )
+            .unwrap();
+
+        let mut state_with_seen_event = state.clone();
+        state_with_seen_event
+            .seen_events
+            .push("event-after".to_owned());
+        db.save_state(&state_with_seen_event).unwrap();
+
+        let group_rewrites: i64 = db
+            .conn
+            .query_row("SELECT count(*) FROM write_audit", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(group_rewrites, 0);
     }
 
     #[test]
