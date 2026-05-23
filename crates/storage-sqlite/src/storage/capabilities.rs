@@ -7,6 +7,8 @@ use cgka_traits::storage::{CapabilityStorage, StorageResult};
 use cgka_traits::types::{GroupId, MemberId};
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 
 #[derive(Serialize, Deserialize)]
 struct CapabilityRequirementRow {
@@ -30,9 +32,29 @@ impl From<CapabilityRequirementRow> for CapabilityRequirement {
         Self {
             requires: value.requires,
             level: value.level,
-            description: Box::leak(value.description.into_boxed_str()),
+            description: intern_capability_description(value.description),
         }
     }
+}
+
+fn intern_capability_description(description: String) -> &'static str {
+    static INTERNER: OnceLock<Mutex<HashMap<String, &'static str>>> = OnceLock::new();
+
+    let interner = INTERNER.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut interner = interner
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(interned) = interner.get(description.as_str()) {
+        return interned;
+    }
+
+    // `CapabilityRequirement` exposes `&'static str` descriptions for
+    // registry constants. SQLite has to reconstruct persisted strings, so
+    // intern each distinct value once instead of leaking one allocation per
+    // read.
+    let interned: &'static str = Box::leak(description.clone().into_boxed_str());
+    interner.insert(description, interned);
+    interned
 }
 
 impl CapabilityStorage for SqliteStorage {
@@ -145,6 +167,32 @@ mod tests {
         assert_eq!(
             store.member_capabilities(&gid(2), &member.id).unwrap(),
             None
+        );
+    }
+
+    #[test]
+    fn feature_requirement_reuses_description_allocation_across_reads() {
+        let store = SqliteStorage::in_memory().unwrap();
+        let feature = Feature("agent-text-stream");
+        store
+            .register_feature(
+                feature.clone(),
+                CapabilityRequirement {
+                    requires: Capability::AppComponent(0x8006),
+                    level: RequirementLevel::Optional,
+                    description: "agent text stream over QUIC",
+                },
+            )
+            .unwrap();
+
+        let first = store.feature_requirement(&feature).unwrap().unwrap();
+        let second = store.feature_requirement(&feature).unwrap().unwrap();
+
+        assert_eq!(first.description, second.description);
+        assert_eq!(
+            first.description.as_ptr(),
+            second.description.as_ptr(),
+            "SQLite capability reads must not leak a fresh description allocation per read"
         );
     }
 }
