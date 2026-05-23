@@ -467,6 +467,16 @@ async fn app_runtime_message_subscription_returns_snapshot_then_live_updates() {
         )
         .await
         .unwrap();
+    wait_for_event(&mut events, |event| {
+        matches!(
+            event,
+            MarmotAppEvent::MessageReceived(message)
+                if message.account_id_hex == bob_id
+                    && message.message.group_id == group_id
+                    && message.message.plaintext == "already projected"
+        )
+    })
+    .await;
 
     let group_id_hex = hex::encode(group_id.as_slice());
     let mut subscription = runtime

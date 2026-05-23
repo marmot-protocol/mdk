@@ -198,6 +198,14 @@ impl RuntimeSharedServices {
 struct ManagedAccountWorker {
     handle: JoinHandle<()>,
     commands: mpsc::Sender<AccountWorkerCommand>,
+    shutdown: oneshot::Sender<()>,
+}
+
+impl ManagedAccountWorker {
+    fn stop(self) {
+        let _ = self.shutdown.send(());
+        self.handle.abort();
+    }
 }
 
 struct AccountWorkerRuntime {
@@ -206,7 +214,6 @@ struct AccountWorkerRuntime {
     account_id_hex: String,
     relay_plane: MarmotRelayPlane,
     events: broadcast::Sender<MarmotAppEvent>,
-    client: AppClient,
 }
 
 enum AccountWorkerCommand {
@@ -846,7 +853,13 @@ impl MarmotAppRuntime {
                     continue;
                 }
                 let group_id_hex = hex::encode(group_id.as_slice());
-                let group = match app.group(&account_label, &group_id_hex) {
+                let app_for_lookup = app.clone();
+                let account_label_for_lookup = account_label.clone();
+                let group = match blocking_app_task(move || {
+                    app_for_lookup.group(&account_label_for_lookup, &group_id_hex)
+                })
+                .await
+                {
                     Ok(Some(group)) => group,
                     Ok(None) | Err(_) => continue,
                 };
@@ -899,7 +912,14 @@ impl MarmotAppRuntime {
                 if event_account_id_hex != account_id_hex || event_group_id != &group_id {
                     continue;
                 }
-                let group = match app.group(&account_label, &group_id_hex) {
+                let app_for_lookup = app.clone();
+                let account_label_for_lookup = account_label.clone();
+                let group_id_hex_for_lookup = group_id_hex.clone();
+                let group = match blocking_app_task(move || {
+                    app_for_lookup.group(&account_label_for_lookup, &group_id_hex_for_lookup)
+                })
+                .await
+                {
                     Ok(Some(group)) => group,
                     Ok(None) | Err(_) => continue,
                 };
@@ -931,13 +951,18 @@ impl MarmotAppRuntime {
         options: AgentStreamWatchOptions,
     ) -> Result<RuntimeAgentStreamWatch, AppError> {
         let group_id_hex = hex::encode(group_id.as_slice());
-        let messages = self.messages_with_query(
-            account_ref,
-            AppMessageQuery {
-                group_id_hex: Some(group_id_hex),
-                limit: Some(AGENT_STREAM_START_LOOKBACK_LIMIT),
-            },
-        )?;
+        let app = self.accounts.app.clone();
+        let account_ref_for_query = account_ref.to_owned();
+        let messages = blocking_app_task(move || {
+            app.messages_with_query(
+                &account_ref_for_query,
+                AppMessageQuery {
+                    group_id_hex: Some(group_id_hex),
+                    limit: Some(AGENT_STREAM_START_LOOKBACK_LIMIT),
+                },
+            )
+        })
+        .await?;
         let (start_message_id_hex, start, sender_hex) =
             latest_agent_stream_start(messages, options.stream_id_hex.as_deref())?;
         if start_message_id_hex.is_empty() {
@@ -1452,57 +1477,61 @@ impl AccountManager {
                 .collect::<Vec<_>>();
             for account_id in stale_account_ids {
                 if let Some(worker) = workers.remove(&account_id) {
-                    worker.handle.abort();
+                    worker.stop();
                 }
             }
             workers.keys().cloned().collect::<HashSet<_>>()
         };
 
-        let mut pending = Vec::new();
-        for account in accounts {
-            if existing_account_ids.contains(&account.account_id_hex) {
-                continue;
-            }
-            let client = self
-                .app
-                .runtime_client(&account.label, self.shared.relay_plane())
-                .await?;
-            pending.push((account, client));
-        }
+        let pending = accounts
+            .into_iter()
+            .filter(|account| !existing_account_ids.contains(&account.account_id_hex))
+            .collect::<Vec<_>>();
 
         let mut ready_receivers = Vec::new();
         {
             let mut workers = self.workers.lock().await;
-            for (account, client) in pending {
+            for account in pending {
                 if workers.contains_key(&account.account_id_hex) {
                     continue;
                 }
                 let (ready_tx, ready_rx) = oneshot::channel();
+                let (shutdown_tx, shutdown_rx) = oneshot::channel();
                 let (command_tx, command_rx) = mpsc::channel(8);
-                let handle = tokio::spawn(run_app_runtime_account_worker(
+                let handle = spawn_app_runtime_account_worker(
                     AccountWorkerRuntime {
                         app: self.app.clone(),
                         account_label: account.label.clone(),
                         account_id_hex: account.account_id_hex.clone(),
                         relay_plane: self.shared.relay_plane().clone(),
                         events: self.events.clone(),
-                        client,
                     },
                     command_rx,
                     ready_tx,
-                ));
+                    shutdown_rx,
+                );
                 workers.insert(
                     account.account_id_hex,
                     ManagedAccountWorker {
                         handle,
                         commands: command_tx,
+                        shutdown: shutdown_tx,
                     },
                 );
                 ready_receivers.push(ready_rx);
             }
         }
         for ready in ready_receivers {
-            let _ = timeout(APP_RUNTIME_ACCOUNT_READY_WAIT, ready).await;
+            match timeout(APP_RUNTIME_ACCOUNT_READY_WAIT, ready).await {
+                Ok(Ok(Ok(()))) => {}
+                Ok(Ok(Err(message))) => return Err(AppError::BlockingTask(message)),
+                Ok(Err(_closed)) => return Err(AppError::TransportClosed),
+                Err(_elapsed) => {
+                    return Err(AppError::BlockingTask(
+                        "account worker startup timed out".into(),
+                    ));
+                }
+            }
         }
         Ok(())
     }
@@ -1511,7 +1540,7 @@ impl AccountManager {
         {
             let mut workers = self.workers.lock().await;
             if let Some(worker) = workers.remove(account_id_hex) {
-                worker.handle.abort();
+                worker.stop();
             }
         }
         self.reconcile().await
@@ -2143,7 +2172,7 @@ impl AccountManager {
     pub async fn shutdown(&self) {
         let mut workers = self.workers.lock().await;
         for (_, worker) in workers.drain() {
-            worker.handle.abort();
+            worker.stop();
         }
     }
 }
@@ -2184,6 +2213,17 @@ async fn account_worker_response<T>(
     response: oneshot::Receiver<Result<T, AppError>>,
 ) -> Result<T, AppError> {
     response.await.map_err(|_| AppError::TransportClosed)?
+}
+
+async fn blocking_app_task<T>(
+    task: impl FnOnce() -> Result<T, AppError> + Send + 'static,
+) -> Result<T, AppError>
+where
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(task)
+        .await
+        .map_err(|err| AppError::BlockingTask(err.to_string()))?
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -2739,6 +2779,8 @@ pub enum AppError {
     InvalidAppMessagePayload(String),
     #[error("SQLCipher key derivation failed: {0}")]
     SqlcipherKeyDerivation(String),
+    #[error("blocking app task failed: {0}")]
+    BlockingTask(String),
     #[error("no matching reaction by this account to retract")]
     ReactionNotFound,
     #[error("transport event stream closed")]
@@ -2882,10 +2924,17 @@ impl MarmotApp {
         label: &str,
         relay_plane: &MarmotRelayPlane,
     ) -> Result<AppClient, AppError> {
-        self.ensure_account_state(label)?;
-        let open = self.open_account(label, relay_plane)?;
+        let app = self.clone();
+        let label = label.to_owned();
+        let relay_plane_for_open = relay_plane.clone();
+        let relay_plane_for_rebuild = relay_plane.clone();
+        let open = blocking_app_task(move || {
+            app.ensure_account_state(&label)?;
+            app.open_account(&label, &relay_plane_for_open)
+        })
+        .await?;
         let rebuild_since =
-            relay_plane.subscription_rebuild_since(open.state.last_transport_timestamp);
+            relay_plane_for_rebuild.subscription_rebuild_since(open.state.last_transport_timestamp);
         open.runtime.activate_transport(rebuild_since).await?;
         open.runtime.sync_transport_groups(rebuild_since).await?;
         Ok(AppClient {
@@ -4132,10 +4181,28 @@ impl MarmotApp {
     }
 }
 
+fn spawn_app_runtime_account_worker(
+    runtime: AccountWorkerRuntime,
+    commands: mpsc::Receiver<AccountWorkerCommand>,
+    ready: oneshot::Sender<Result<(), String>>,
+    shutdown: oneshot::Receiver<()>,
+) -> JoinHandle<()> {
+    tokio::task::spawn_blocking(move || {
+        let worker_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("account worker runtime");
+        worker_runtime.block_on(run_app_runtime_account_worker(
+            runtime, commands, ready, shutdown,
+        ));
+    })
+}
+
 async fn run_app_runtime_account_worker(
     runtime: AccountWorkerRuntime,
     mut commands: mpsc::Receiver<AccountWorkerCommand>,
-    ready: oneshot::Sender<()>,
+    ready: oneshot::Sender<Result<(), String>>,
+    mut shutdown: oneshot::Receiver<()>,
 ) {
     let AccountWorkerRuntime {
         app,
@@ -4143,9 +4210,21 @@ async fn run_app_runtime_account_worker(
         account_id_hex,
         relay_plane,
         events,
-        client,
     } = runtime;
-    let mut client = client;
+    let mut client = match app.runtime_client(&account_label, &relay_plane).await {
+        Ok(client) => client,
+        Err(err) => {
+            let message = format!("runtime startup failed: {err}");
+            publish_app_runtime_account_error(
+                &events,
+                &account_id_hex,
+                &account_label,
+                message.clone(),
+            );
+            let _ = ready.send(Err(message));
+            return;
+        }
+    };
 
     match client.sync().await {
         Ok(summary) => {
@@ -4160,10 +4239,13 @@ async fn run_app_runtime_account_worker(
             );
         }
     }
-    let _ = ready.send(());
+    let _ = ready.send(Ok(()));
 
     loop {
         tokio::select! {
+            _ = &mut shutdown => {
+                return;
+            }
             command = commands.recv() => {
                 match command {
                     Some(AccountWorkerCommand::CatchUp { respond }) => {
@@ -7154,6 +7236,14 @@ mod tests {
             &local_pubkey,
             &known_event_ids
         ));
+    }
+
+    #[test]
+    fn account_worker_is_spawned_on_blocking_pool() {
+        let source = include_str!("lib.rs");
+
+        assert!(source.contains("tokio::task::spawn_blocking(move ||"));
+        assert!(source.contains("worker_runtime.block_on(run_app_runtime_account_worker"));
     }
 
     #[test]
