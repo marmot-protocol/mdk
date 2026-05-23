@@ -1,5 +1,5 @@
 use std::env;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -110,6 +110,31 @@ fn run_json(home: &std::path::Path, args: &[&str]) -> Value {
     try_run_json(home, args).unwrap_or_else(|failure| panic!("dm failed\n{failure}"))
 }
 
+fn run_json_with_stdin(home: &std::path::Path, args: &[&str], stdin: &str) -> Value {
+    let mut child = dm(home)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("dm command should start");
+    child
+        .stdin
+        .take()
+        .expect("stdin should be piped")
+        .write_all(stdin.as_bytes())
+        .expect("stdin should accept nsec input");
+    let output = child.wait_with_output().expect("dm command should finish");
+    assert!(
+        output.status.success(),
+        "dm failed\nargs={args:?}\n{}",
+        command_output_summary(&output)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).expect("stdout should be JSON");
+    assert_eq!(value["ok"], true);
+    value["result"].clone()
+}
+
 fn run_json_without_relay(home: &std::path::Path, args: &[&str]) -> Value {
     try_run_json_without_relay(home, args).unwrap_or_else(|failure| panic!("dm failed\n{failure}"))
 }
@@ -180,6 +205,31 @@ fn run_json_error(home: &std::path::Path, args: &[&str]) -> Value {
     value["error"].clone()
 }
 
+fn run_json_error_with_stdin(home: &std::path::Path, args: &[&str], stdin: &str) -> Value {
+    let mut child = dm(home)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("dm command should start");
+    child
+        .stdin
+        .take()
+        .expect("stdin should be piped")
+        .write_all(stdin.as_bytes())
+        .expect("stdin should accept nsec input");
+    let output = child.wait_with_output().expect("dm command should finish");
+    assert!(
+        !output.status.success(),
+        "dm unexpectedly succeeded\nargs={args:?}\n{}",
+        command_output_summary(&output)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).expect("stdout should be JSON");
+    assert_eq!(value["ok"], false);
+    value["error"].clone()
+}
+
 fn run_json_with_env(home: &std::path::Path, args: &[&str], envs: &[(&str, &str)]) -> Value {
     let mut command = dm(home);
     command.args(args);
@@ -217,7 +267,7 @@ fn whitenoise_command_surface_names_are_present() {
         ("daemon", "Start, stop, and inspect"),
         ("debug", "Inspect local runtime diagnostics"),
         ("create-identity", "Create a new local signing identity"),
-        ("login", "Log in with an nsec"),
+        ("login", "Import an nsec from stdin"),
         ("logout", "Log out and remove a local account"),
         ("whoami", "Show current account identities"),
         ("export-nsec", "Exporting private keys is disabled"),
@@ -267,6 +317,10 @@ fn whitenoise_command_surface_names_are_present() {
     assert!(
         login_help.contains("--relay"),
         "dm login --help should expose the command-local relay override"
+    );
+    assert!(
+        login_help.contains("--nsec-stdin"),
+        "dm login --help should expose stdin-based nsec import"
     );
 
     let dmd_help = Command::new(env!("CARGO_BIN_EXE_dmd"))
@@ -1242,8 +1296,39 @@ fn account_create_accepts_nsec_without_echoing_it() {
     let relay = test_relay_url();
     let nsec = "nsec1j4c6269y9w0q2er2xjw8sv2ehyrtfxq3jwgdlxj6qfn8z4gjsq5qfvfk99";
 
-    let output = dm(home.path())
-        .args([
+    let imported = run_json_with_stdin(
+        home.path(),
+        &[
+            "account",
+            "create",
+            "--nsec-stdin",
+            "--default-relays",
+            "wss://relay.example",
+            "--bootstrap-relays",
+            relay,
+            "--publish-missing-relay-lists",
+        ],
+        &format!("{nsec}\n"),
+    );
+    assert!(!imported.to_string().contains(nsec));
+
+    let account_id = imported["account_id"].as_str().expect("account id");
+    assert_eq!(account_id.len(), 64);
+    assert_eq!(imported["local_signing"], true);
+
+    let status = run_json(home.path(), &["account", "status", account_id]);
+    assert_eq!(status["account_id"], account_id);
+}
+
+#[test]
+fn account_create_rejects_nsec_argv_and_accepts_stdin_secret() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let relay = test_relay_url();
+    let nsec = "nsec1j4c6269y9w0q2er2xjw8sv2ehyrtfxq3jwgdlxj6qfn8z4gjsq5qfvfk99";
+
+    let error = run_json_error(
+        home.path(),
+        &[
             "account",
             "create",
             nsec,
@@ -1251,26 +1336,30 @@ fn account_create_accepts_nsec_without_echoing_it() {
             "wss://relay.example",
             "--bootstrap-relays",
             relay,
-            "--publish-missing-relay-lists",
-        ])
-        .output()
-        .expect("dm command should start");
-    assert!(
-        output.status.success(),
-        "dm failed\n{}",
-        command_output_summary(&output)
+        ],
     );
-    assert!(!String::from_utf8_lossy(&output.stdout).contains(nsec));
+    assert_eq!(error["code"], "secret_argument_rejected");
+    assert!(!error.to_string().contains(nsec));
 
-    let imported: Value = serde_json::from_slice(&output.stdout).expect("stdout should be JSON");
-    let account_id = imported["result"]["account_id"]
-        .as_str()
-        .expect("account id");
-    assert_eq!(account_id.len(), 64);
-    assert_eq!(imported["result"]["local_signing"], true);
-
-    let status = run_json(home.path(), &["account", "status", account_id]);
-    assert_eq!(status["account_id"], account_id);
+    let imported = run_json_with_stdin(
+        home.path(),
+        &[
+            "account",
+            "create",
+            "--nsec-stdin",
+            "--default-relays",
+            "wss://relay.example",
+            "--bootstrap-relays",
+            relay,
+            "--publish-missing-relay-lists",
+        ],
+        &format!("{nsec}\n"),
+    );
+    assert_eq!(imported["local_signing"], true);
+    assert_eq!(
+        imported["account_id"].as_str().expect("account id").len(),
+        64
+    );
 }
 
 #[test]
@@ -1295,26 +1384,19 @@ fn whitenoise_identity_commands_create_login_and_show_accounts() {
     let shown_profile = run_json(home.path(), &["--account", created_id, "profile", "show"]);
     assert_eq!(shown_profile["profile"], created["profile"]);
 
-    let output = dm(home.path())
-        .args(["login", nsec, "--relay", relay])
-        .output()
-        .expect("dm login should start");
-    assert!(
-        output.status.success(),
-        "dm failed\n{}",
-        command_output_summary(&output)
+    let positional_error = run_json_error(home.path(), &["login", nsec, "--relay", relay]);
+    assert_eq!(positional_error["code"], "secret_argument_rejected");
+    assert!(!positional_error.to_string().contains(nsec));
+
+    let logged_in = run_json_with_stdin(
+        home.path(),
+        &["login", "--nsec-stdin", "--relay", relay],
+        &format!("{nsec}\n"),
     );
-    assert!(!String::from_utf8_lossy(&output.stdout).contains(nsec));
-    let logged_in: Value = serde_json::from_slice(&output.stdout).expect("stdout should be JSON");
-    assert_eq!(logged_in["ok"], true);
-    assert_eq!(logged_in["result"]["local_signing"], true);
-    assert_eq!(logged_in["result"]["key_package"]["published"], true);
-    assert!(
-        logged_in["result"]["key_package"]["bytes"]
-            .as_u64()
-            .expect("bytes")
-            > 0
-    );
+    assert!(!logged_in.to_string().contains(nsec));
+    assert_eq!(logged_in["local_signing"], true);
+    assert_eq!(logged_in["key_package"]["published"], true);
+    assert!(logged_in["key_package"]["bytes"].as_u64().expect("bytes") > 0);
 
     let whoami = run_json(home.path(), &["whoami"]);
     let accounts = whoami["accounts"].as_array().expect("accounts");
@@ -1508,9 +1590,16 @@ fn account_create_reports_missing_relay_lists_without_storing_the_nsec() {
     let relay = TestRelay::new();
     let nsec = "nsec1j4c6269y9w0q2er2xjw8sv2ehyrtfxq3jwgdlxj6qfn8z4gjsq5qfvfk99";
 
-    let error = run_json_error(
+    let error = run_json_error_with_stdin(
         home.path(),
-        &["account", "create", nsec, "--bootstrap-relays", relay.url()],
+        &[
+            "account",
+            "create",
+            "--nsec-stdin",
+            "--bootstrap-relays",
+            relay.url(),
+        ],
+        &format!("{nsec}\n"),
     );
     assert_eq!(error["code"], "missing_relay_lists");
     assert_eq!(
@@ -1544,18 +1633,19 @@ fn account_create_can_publish_missing_relay_lists_from_default_relays() {
     let relay = TestRelay::new();
     let nsec = "nsec1j4c6269y9w0q2er2xjw8sv2ehyrtfxq3jwgdlxj6qfn8z4gjsq5qfvfk99";
 
-    let imported = run_json(
+    let imported = run_json_with_stdin(
         home.path(),
         &[
             "account",
             "create",
-            nsec,
+            "--nsec-stdin",
             "--default-relays",
             "wss://relay1.example,wss://relay2.example",
             "--bootstrap-relays",
             relay.url(),
             "--publish-missing-relay-lists",
         ],
+        &format!("{nsec}\n"),
     );
 
     assert_eq!(imported["relay_lists"]["complete"], true);
@@ -1573,17 +1663,18 @@ fn account_import_requires_explicit_repair_before_publishing_missing_relay_lists
     let relay = TestRelay::new();
     let nsec = "nsec1j4c6269y9w0q2er2xjw8sv2ehyrtfxq3jwgdlxj6qfn8z4gjsq5qfvfk99";
 
-    let error = run_json_error(
+    let error = run_json_error_with_stdin(
         home.path(),
         &[
             "account",
             "create",
-            nsec,
+            "--nsec-stdin",
             "--default-relays",
             relay.url(),
             "--bootstrap-relays",
             relay.url(),
         ],
+        &format!("{nsec}\n"),
     );
 
     assert_eq!(error["code"], "missing_relay_lists");
@@ -1606,15 +1697,16 @@ fn account_create_rolls_back_when_missing_relay_list_publication_fails() {
     let home = tempfile::tempdir().expect("tempdir");
     let nsec = "nsec1j4c6269y9w0q2er2xjw8sv2ehyrtfxq3jwgdlxj6qfn8z4gjsq5qfvfk99";
 
-    let error = run_json_error(
+    let error = run_json_error_with_stdin(
         home.path(),
         &[
             "account",
             "create",
-            nsec,
+            "--nsec-stdin",
             "--default-relays",
             "not-a-relay-url",
         ],
+        &format!("{nsec}\n"),
     );
     assert_ne!(error["code"], "usage");
     assert!(!error.to_string().contains(nsec));

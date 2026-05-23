@@ -61,8 +61,8 @@ versioning through the workspace version in the root `Cargo.toml`.
   runtime subscription model. The older singular `dm message` spelling still works during the transition.
 - `dm messages subscribe` can now omit the group argument to stream live updates across all local groups for the
   selected account.
-- `dm create-identity` and `dm login <nsec>` now publish the initial local KeyPackage automatically after relay-list
-  setup, so the normal invite path does not require a separate `keys publish` repair step.
+- `dm create-identity` and `dm login --nsec-stdin` now publish the initial local KeyPackage automatically after
+  relay-list setup, so the normal invite path does not require a separate `keys publish` repair step.
 - `dm keys publish` now republishes the cached initial KeyPackage instead of minting a replacement package during
   normal repair/setup flows.
 - Message projections now order history by recorded transport time before local receipt/insertion order, so synced
@@ -91,15 +91,17 @@ versioning through the workspace version in the root `Cargo.toml`.
   daemon auto-watch paths only request insecure local trust for loopback broker candidates.
 - Typed app-message payloads are validated before publish/projection; malformed reaction, media, delete, or retry
   envelopes are rejected instead of being treated as valid typed app messages.
+- `dm login` and `dm account create` now reject positional `nsec` values; private-key imports must use
+  `--nsec-stdin`, and the TUI pipes `/login <nsec>` to the child `dm` process over stdin instead of argv.
 - `dmd` now keeps long-lived per-account relay subscriptions for real WebSocket relays instead of rebuilding
   subscriptions through periodic rebuild loops.
 - `dm daemon status --json` now reports `last_runtime_activity` instead of `last_sync`, matching the runtime-owned
   subscription model.
 - Nostr SDK relay connect and publish calls are now bounded by timeouts so first-run account setup fails with JSON
   instead of hanging indefinitely when a local relay does not ACK publishes.
-- `dm create-identity` and `dm login <nsec>` publish the required NIP-65, inbox, and KeyPackage relay lists for new
-  local signing identities from daemon account-relay defaults when relay-list flags are omitted; `dm login --relay
-  <url>` remains the command-local import fallback.
+- `dm create-identity` and `dm login --nsec-stdin` publish the required NIP-65, inbox, and KeyPackage relay lists for
+  new local signing identities from daemon account-relay defaults when relay-list flags are omitted; `dm login
+  --nsec-stdin --relay <url>` remains the command-local import fallback.
 - Newly created local identities now publish matching Nostr `name` and `display_name` values using two-word pseudonyms
   instead of account-id-derived Marmot labels.
 - Imported `nsec` accounts now require `--publish-missing-relay-lists` before publishing missing required relay

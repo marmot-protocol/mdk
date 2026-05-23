@@ -1,7 +1,7 @@
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
-use std::process::{Child, Command as StdCommand, Stdio};
+use std::process::{Child, Command as StdCommand, Output, Stdio};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -76,30 +76,30 @@ impl DmClient {
     {
         let mut command = self.command(account, args);
         let output = command.output()?;
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let envelope: Value = serde_json::from_str(stdout.trim()).map_err(|err| {
-            let mut message = format!("dm returned invalid JSON: {err}");
-            if !stderr.trim().is_empty() {
-                message.push_str(&format!("; stderr: {}", stderr.trim()));
-            }
-            TuiError::Cli(message)
-        })?;
-        if envelope.get("ok").and_then(Value::as_bool) == Some(true) {
-            return Ok(envelope.get("result").cloned().unwrap_or(Value::Null));
-        }
-        let message = envelope
-            .get("error")
-            .and_then(|error| error.get("message"))
-            .and_then(Value::as_str)
-            .or_else(|| {
-                envelope
-                    .get("error")
-                    .and_then(|error| error.get("code"))
-                    .and_then(Value::as_str)
-            })
-            .unwrap_or_else(|| stderr.trim());
-        Err(TuiError::Cli(message.to_owned()))
+        parse_json_output(output)
+    }
+
+    fn run_json_with_stdin<S>(
+        &self,
+        account: Option<&str>,
+        args: &[S],
+        stdin: &str,
+    ) -> TuiResult<Value>
+    where
+        S: AsRef<str>,
+    {
+        let mut child = self
+            .command(account, args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        child
+            .stdin
+            .take()
+            .ok_or_else(|| TuiError::Cli("dm stdin pipe was not available".to_owned()))?
+            .write_all(stdin.as_bytes())?;
+        parse_json_output(child.wait_with_output()?)
     }
 
     fn spawn_json_lines<S>(&self, account: Option<&str>, args: &[S]) -> TuiResult<Child>
@@ -139,6 +139,56 @@ impl DmClient {
             command.arg(arg.as_ref());
         }
         command
+    }
+}
+
+fn parse_json_output(output: Output) -> TuiResult<Value> {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let envelope: Value = serde_json::from_str(stdout.trim()).map_err(|err| {
+        let mut message = format!("dm returned invalid JSON: {err}");
+        if !stderr.trim().is_empty() {
+            message.push_str(&format!("; stderr: {}", stderr.trim()));
+        }
+        TuiError::Cli(message)
+    })?;
+    if envelope.get("ok").and_then(Value::as_bool) == Some(true) {
+        return Ok(envelope.get("result").cloned().unwrap_or(Value::Null));
+    }
+    let message = envelope
+        .get("error")
+        .and_then(|error| error.get("message"))
+        .and_then(Value::as_str)
+        .or_else(|| {
+            envelope
+                .get("error")
+                .and_then(|error| error.get("code"))
+                .and_then(Value::as_str)
+        })
+        .unwrap_or_else(|| stderr.trim());
+    Err(TuiError::Cli(message.to_owned()))
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct DmInvocation {
+    args: Vec<String>,
+    stdin: Option<String>,
+}
+
+fn account_setup_invocation(identity: Option<String>) -> DmInvocation {
+    match identity {
+        Some(identity) if crate::is_nostr_secret(&identity) => DmInvocation {
+            args: vec!["login".to_owned(), "--nsec-stdin".to_owned()],
+            stdin: Some(format!("{identity}\n")),
+        },
+        Some(identity) => DmInvocation {
+            args: vec!["login".to_owned(), identity],
+            stdin: None,
+        },
+        None => DmInvocation {
+            args: vec!["create-identity".to_owned()],
+            stdin: None,
+        },
     }
 }
 
@@ -1533,11 +1583,13 @@ impl TuiApp {
         identity: Option<String>,
         action: &'static str,
     ) -> TuiResult<()> {
-        let args = match identity {
-            Some(identity) => vec!["login".to_owned(), identity],
-            None => vec!["create-identity".to_owned()],
+        let invocation = account_setup_invocation(identity);
+        let result = match invocation.stdin {
+            Some(stdin) => self
+                .client
+                .run_json_with_stdin(None, &invocation.args, &stdin)?,
+            None => self.client.run_json(None, &invocation.args)?,
         };
-        let result = self.client.run_json(None, &args)?;
         let selector =
             value_string(&result, "account_id").or_else(|| value_string(&result, "npub"));
         let npub = value_string(&result, "npub").unwrap_or_else(|| "unknown".to_owned());
@@ -4655,6 +4707,24 @@ mod tests {
             "/login <hidden nsec>"
         );
         assert_eq!(composer_display_text("/login npub1bob"), "/login npub1bob");
+    }
+
+    #[test]
+    fn account_setup_invocation_pipes_nsec_imports_to_stdin() {
+        assert_eq!(
+            account_setup_invocation(Some("nsec1secret".to_owned())),
+            DmInvocation {
+                args: vec!["login".to_owned(), "--nsec-stdin".to_owned()],
+                stdin: Some("nsec1secret\n".to_owned()),
+            }
+        );
+        assert_eq!(
+            account_setup_invocation(Some("npub1bob".to_owned())),
+            DmInvocation {
+                args: vec!["login".to_owned(), "npub1bob".to_owned()],
+                stdin: None,
+            }
+        );
     }
 
     #[test]

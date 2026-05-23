@@ -81,7 +81,7 @@ dm daemon start \
   --default-account-relays ws://127.0.0.1:27777
 
 dm create-identity
-dm login <bob-nsec>
+printf '%s\n' "$BOB_NSEC" | dm login --nsec-stdin
 dm whoami
 
 dm --account <alice-npub-or-hex> groups create general <bob-npub-or-hex>
@@ -109,7 +109,9 @@ Identity and account commands:
 
 ```sh
 dm create-identity
-dm login <nsec-or-npub> [--relay <relay-url>]
+printf '%s\n' "$NSEC" | dm login --nsec-stdin
+printf '%s\n' "$NSEC" | dm login --nsec-stdin --relay <relay-url>
+dm login <npub-or-hex>
 dm whoami
 dm logout <npub-or-hex>
 dm export-nsec <npub-or-hex>
@@ -122,10 +124,10 @@ dm account relay-lists [npub-or-hex] --bootstrap-relays <relay-url>
 The older `dm account create` spelling is kept as a compatibility/repair surface, but new setup flows should use
 `dm create-identity` or `dm login`.
 
-When a daemon is running, `create-identity` and `login <nsec>` use the daemon's account-relay defaults to publish the
-required relay lists and an initial KeyPackage. `dm login <nsec> --relay <url>` is the command-local fallback for a
-custom relay-list publish during import. Public `npub` logins only check relay-list availability because they cannot
-sign.
+When a daemon is running, `create-identity` and `dm login --nsec-stdin` use the daemon's account-relay defaults to
+publish the required relay lists and an initial KeyPackage. `printf '%s\n' "$NSEC" | dm login --nsec-stdin --relay
+<url>` is the command-local fallback for a custom relay-list publish during import. Public `npub` logins only check
+relay-list availability because they cannot sign.
 `export-nsec` is present for command-shape compatibility but returns `unsupported_command`; this CLI does not print
 private keys.
 
@@ -428,9 +430,10 @@ Composer slash commands:
 
 `/stream` uses `quic://quic-broker.ipf.dev:4450` when no candidate is supplied.
 
-`/login <nsec>` redacts the secret in the composer. `/chat archived` shows archived chats so they
-can be selected and unarchived; `/chat archived off` returns to the visible-chat list. Member commands operate
-on the selected chat and call the same group membership commands exposed by the CLI.
+`/login <nsec>` redacts the secret in the composer and pipes it to the child `dm` process over stdin instead of argv.
+`/chat archived` shows archived chats so they can be selected and unarchived; `/chat archived off` returns to the
+visible-chat list. Member commands operate on the selected chat and call the same group membership commands exposed by
+the CLI.
 Stream commands operate on the selected chat. `/stream watch` starts a daemon background watch and completed previews
 appear as provisional preview rows in the message panel. `/stream` opens the TUI stream composer, publishes the stream
 anchor, starts the receiver watch through the daemon, and then treats the next submitted composer line as the streamed

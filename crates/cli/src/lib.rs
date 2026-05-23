@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
+use std::io::Read;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -130,13 +131,16 @@ enum Command {
         about = "Create a new local signing identity"
     )]
     CreateIdentity,
-    #[command(about = "Log in with an nsec or add a public npub identity")]
+    #[command(about = "Import an nsec from stdin or add a public npub identity")]
     Login {
         #[arg(
-            value_name = "NSEC_OR_NPUB",
-            help = "nsec to import or npub to track as a public account"
+            value_name = "NPUB_OR_HEX",
+            help = "npub or hex pubkey to track as a public account"
         )]
         identity: Option<String>,
+        #[serde(default)]
+        #[arg(long, help = "Read an nsec private key from stdin instead of argv")]
+        nsec_stdin: bool,
         #[arg(
             long,
             value_name = "URL",
@@ -274,10 +278,13 @@ enum AccountCommand {
     #[command(about = "Create a local account and publish its bootstrap records")]
     Create {
         #[arg(
-            value_name = "NSEC_OR_NPUB",
-            help = "Optional nsec to import or npub to track"
+            value_name = "NPUB_OR_HEX",
+            help = "Optional npub or hex pubkey to track"
         )]
         identity: Option<String>,
+        #[serde(default)]
+        #[arg(long, help = "Read an nsec private key from stdin instead of argv")]
+        nsec_stdin: bool,
         #[arg(
             long,
             value_name = "URLS",
@@ -1024,8 +1031,18 @@ pub(crate) enum DmError {
     InsecureLocalRequiresLoopback(SocketAddr),
     #[error("messages subscribe requires the daemon; start it with `dm daemon start`")]
     MessagesSubscribeRequiresDaemon,
-    #[error("login requires an nsec or npub identity")]
+    #[error("login requires --nsec-stdin or an npub identity")]
     MissingLoginIdentity,
+    #[error(
+        "{command} does not accept private keys as command-line arguments; pipe the nsec to --nsec-stdin"
+    )]
+    SecretArgumentRejected { command: &'static str },
+    #[error("{command} expects either a public identity argument or --nsec-stdin, not both")]
+    ConflictingSecretInput { command: &'static str },
+    #[error("{command} --nsec-stdin received empty input")]
+    MissingStdinSecret { command: &'static str },
+    #[error("{command} --nsec-stdin requires an nsec secret key")]
+    InvalidStdinSecret { command: &'static str },
     #[error("{command} is not implemented yet: {reason}")]
     UnsupportedCommand {
         command: &'static str,
@@ -1042,7 +1059,7 @@ where
 {
     let argv = args.into_iter().map(Into::into).collect::<Vec<_>>();
     let wants_json = argv.iter().any(|arg| arg.to_string_lossy() == "--json");
-    let cli = match Cli::try_parse_from(argv) {
+    let mut cli = match Cli::try_parse_from(argv) {
         Ok(cli) => cli,
         Err(err) => {
             if wants_json {
@@ -1055,6 +1072,9 @@ where
             };
         }
     };
+    if let Err(err) = materialize_secret_inputs(&mut cli) {
+        return command_output_result(cli.json, Err(err));
+    }
 
     if let Command::Daemon { command } = cli.command.clone() {
         return daemon::run_daemon_command(cli, command).await;
@@ -1108,6 +1128,71 @@ where
     }
 
     run_cli_local(cli).await
+}
+
+fn materialize_secret_inputs(cli: &mut Cli) -> Result<(), DmError> {
+    match &mut cli.command {
+        Command::Login {
+            identity,
+            nsec_stdin,
+            ..
+        } => materialize_identity_secret_input("login", identity, *nsec_stdin),
+        Command::Account {
+            command:
+                AccountCommand::Create {
+                    identity,
+                    nsec_stdin,
+                    ..
+                },
+        }
+        | Command::Accounts {
+            command:
+                AccountCommand::Create {
+                    identity,
+                    nsec_stdin,
+                    ..
+                },
+        } => materialize_identity_secret_input("account create", identity, *nsec_stdin),
+        _ => Ok(()),
+    }
+}
+
+fn materialize_identity_secret_input(
+    command: &'static str,
+    identity: &mut Option<String>,
+    nsec_stdin: bool,
+) -> Result<(), DmError> {
+    if nsec_stdin {
+        if identity.is_some() {
+            return Err(DmError::ConflictingSecretInput { command });
+        }
+        *identity = Some(read_nsec_from_stdin(command)?);
+    }
+    validate_materialized_secret_identity(command, identity, nsec_stdin)
+}
+
+fn read_nsec_from_stdin(command: &'static str) -> Result<String, DmError> {
+    let mut value = String::new();
+    std::io::stdin().read_to_string(&mut value)?;
+    let value = value.trim().to_owned();
+    if value.is_empty() {
+        return Err(DmError::MissingStdinSecret { command });
+    }
+    if !is_nostr_secret(&value) {
+        return Err(DmError::InvalidStdinSecret { command });
+    }
+    Ok(value)
+}
+
+pub(crate) fn validate_materialized_secret_identity(
+    command: &'static str,
+    identity: &Option<String>,
+    nsec_stdin: bool,
+) -> Result<(), DmError> {
+    if identity.as_deref().is_some_and(is_nostr_secret) && !nsec_stdin {
+        return Err(DmError::SecretArgumentRejected { command });
+    }
+    Ok(())
 }
 
 fn is_background_stream_watch(cli: &Cli) -> bool {
@@ -1248,11 +1333,16 @@ async fn execute_inner(cli: Cli) -> Result<CommandOutput, DmError> {
             )
             .await
         }
-        Command::Login { identity, relay: _ } => {
+        Command::Login {
+            identity,
+            nsec_stdin,
+            relay: _,
+        } => {
             identity_login_command(
                 &app,
                 runtime_info,
                 identity,
+                nsec_stdin,
                 relay,
                 cli.daemon_default_account_relays,
                 cli.daemon_discovery_relays,
@@ -1393,6 +1483,7 @@ async fn identity_create_command(
         bootstrap_relays,
         false,
         true,
+        false,
         runtime_info,
         relay,
     )
@@ -1403,10 +1494,12 @@ async fn identity_login_command(
     app: &MarmotApp,
     runtime_info: CliRuntimeInfo,
     identity: Option<String>,
+    nsec_stdin: bool,
     relay: Option<String>,
     default_relays: Vec<String>,
     bootstrap_relays: Vec<String>,
 ) -> Result<CommandOutput, DmError> {
+    validate_materialized_secret_identity("login", &identity, nsec_stdin)?;
     let Some(identity) = identity else {
         return Err(DmError::MissingLoginIdentity);
     };
@@ -1417,6 +1510,7 @@ async fn identity_login_command(
         bootstrap_relays,
         true,
         true,
+        nsec_stdin,
         runtime_info,
         relay,
     )
@@ -1565,9 +1659,11 @@ async fn create_or_import_account_command(
     mut bootstrap_relays: Vec<String>,
     publish_missing_relay_lists: bool,
     publish_initial_key_package: bool,
+    nsec_stdin: bool,
     _runtime_info: CliRuntimeInfo,
     relay: Option<String>,
 ) -> Result<CommandOutput, DmError> {
+    validate_materialized_secret_identity("account create", &identity, nsec_stdin)?;
     let global_relay_defaults =
         apply_global_relay_defaults(&mut default_relays, &mut bootstrap_relays, relay);
     let imports_private_key = identity.as_deref().is_some_and(is_nostr_secret);
@@ -1674,6 +1770,7 @@ async fn account_command(
     match command {
         AccountCommand::Create {
             identity,
+            nsec_stdin,
             default_relays,
             bootstrap_relays,
             publish_missing_relay_lists,
@@ -1685,6 +1782,7 @@ async fn account_command(
                 bootstrap_relays,
                 publish_missing_relay_lists,
                 false,
+                nsec_stdin,
                 runtime_info,
                 relay,
             )
@@ -4900,8 +4998,33 @@ fn dm_error_json(err: &DmError) -> Value {
             "code": "missing_login_identity",
             "message": err.to_string(),
             "repair": {
-                "login": "dm login <nsec-or-npub>",
+                "login": "dm login <npub-or-hex>",
+                "import_nsec": "printf '%s\\n' \"$NSEC\" | dm login --nsec-stdin",
             },
+        }),
+        DmError::SecretArgumentRejected { command } => json!({
+            "code": "secret_argument_rejected",
+            "message": err.to_string(),
+            "command": command,
+            "repair": {
+                "login": "printf '%s\\n' \"$NSEC\" | dm login --nsec-stdin",
+                "account_create": "printf '%s\\n' \"$NSEC\" | dm account create --nsec-stdin",
+            },
+        }),
+        DmError::ConflictingSecretInput { command } => json!({
+            "code": "conflicting_secret_input",
+            "message": err.to_string(),
+            "command": command,
+        }),
+        DmError::MissingStdinSecret { command } => json!({
+            "code": "missing_stdin_secret",
+            "message": err.to_string(),
+            "command": command,
+        }),
+        DmError::InvalidStdinSecret { command } => json!({
+            "code": "invalid_stdin_secret",
+            "message": err.to_string(),
+            "command": command,
         }),
         DmError::UnsupportedCommand { command, reason } => json!({
             "code": "unsupported_command",
@@ -4921,7 +5044,7 @@ fn dm_error_json(err: &DmError) -> Value {
             "code": "invalid_relay_url",
             "message": err.to_string(),
             "repair": {
-                "login": "dm login <nsec> --relay <ws-or-wss-url>",
+                "login": "printf '%s\\n' \"$NSEC\" | dm login --nsec-stdin --relay <ws-or-wss-url>",
                 "daemon": "dm daemon start --discovery-relays <url> --default-account-relays <url>",
                 "account_setup": "--default-relays <ws-or-wss-url> --bootstrap-relays <ws-or-wss-url>",
             },
@@ -4938,7 +5061,8 @@ fn dm_error_json(err: &DmError) -> Value {
             "code": "missing_account",
             "message": err.to_string(),
             "repair": {
-                "create": "dm account create [nsec-or-npub]",
+                "create": "dm account create [npub-or-hex]",
+                "import_nsec": "printf '%s\\n' \"$NSEC\" | dm account create --nsec-stdin",
                 "select": "--account <npub-or-hex>",
             },
         }),

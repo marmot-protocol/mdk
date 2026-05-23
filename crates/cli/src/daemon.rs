@@ -2753,7 +2753,12 @@ fn app_runtime_account_setup_request(
                 publish_initial_key_package: true,
             }))
         }
-        crate::Command::Login { identity, .. } => {
+        crate::Command::Login {
+            identity,
+            nsec_stdin,
+            ..
+        } => {
+            crate::validate_materialized_secret_identity("login", identity, *nsec_stdin)?;
             let Some(identity) = identity.clone() else {
                 return Err(crate::DmError::MissingLoginIdentity);
             };
@@ -2772,6 +2777,7 @@ fn app_runtime_account_setup_request(
             command:
                 crate::AccountCommand::Create {
                     identity,
+                    nsec_stdin,
                     default_relays,
                     bootstrap_relays,
                     publish_missing_relay_lists,
@@ -2781,17 +2787,21 @@ fn app_runtime_account_setup_request(
             command:
                 crate::AccountCommand::Create {
                     identity,
+                    nsec_stdin,
                     default_relays,
                     bootstrap_relays,
                     publish_missing_relay_lists,
                 },
-        } => Ok(Some(marmot_app::AccountSetupRequest {
-            identity: identity.clone(),
-            default_relays: crate::relay_endpoints(default_relays.clone())?,
-            bootstrap_relays: crate::relay_endpoints(bootstrap_relays.clone())?,
-            publish_missing_relay_lists: *publish_missing_relay_lists,
-            publish_initial_key_package: false,
-        })),
+        } => {
+            crate::validate_materialized_secret_identity("account create", identity, *nsec_stdin)?;
+            Ok(Some(marmot_app::AccountSetupRequest {
+                identity: identity.clone(),
+                default_relays: crate::relay_endpoints(default_relays.clone())?,
+                bootstrap_relays: crate::relay_endpoints(bootstrap_relays.clone())?,
+                publish_missing_relay_lists: *publish_missing_relay_lists,
+                publish_initial_key_package: false,
+            }))
+        }
         _ => Ok(None),
     }
 }
@@ -3905,6 +3915,7 @@ mod tests {
             command: crate::Command::Account {
                 command: crate::AccountCommand::Create {
                     identity: None,
+                    nsec_stdin: false,
                     default_relays: Vec::new(),
                     bootstrap_relays: Vec::new(),
                     publish_missing_relay_lists: false,
