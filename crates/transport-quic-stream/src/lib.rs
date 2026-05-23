@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use cgka_traits::agent_text_stream::{
+    AGENT_TEXT_STREAM_DEFAULT_MAX_PLAINTEXT_BYTES, AGENT_TEXT_STREAM_DEFAULT_MAX_RECORDS,
     AGENT_TEXT_STREAM_RECORD_TEXT_DELTA, AGENT_TEXT_STREAM_RECORD_VERSION,
     AgentTextStreamKeyContextV1, AgentTextStreamRecordError, AgentTextStreamRecordV1,
     AgentTextStreamTranscriptV1,
@@ -53,6 +54,20 @@ impl QuicTextStreamReceiver {
         start_event_id: MessageId,
         crypto: Option<AgentTextStreamCrypto>,
     ) -> Result<ReceivedTextStream, QuicTextStreamError> {
+        self.receive_once_with_limits(
+            start_event_id,
+            crypto,
+            AgentTextStreamReceiveLimits::default(),
+        )
+        .await
+    }
+
+    pub async fn receive_once_with_limits(
+        self,
+        start_event_id: MessageId,
+        crypto: Option<AgentTextStreamCrypto>,
+        limits: AgentTextStreamReceiveLimits,
+    ) -> Result<ReceivedTextStream, QuicTextStreamError> {
         let incoming = self
             .endpoint
             .accept()
@@ -65,6 +80,7 @@ impl QuicTextStreamReceiver {
         let mut chunks = Vec::new();
         let mut text = String::new();
         let mut transcript = None;
+        let mut limit_state = AgentTextStreamReceiveAccumulator::new(limits);
 
         while let Some(record) = read_record(&mut recv).await? {
             let record = if let Some(crypto) = &crypto {
@@ -72,6 +88,7 @@ impl QuicTextStreamReceiver {
             } else {
                 record
             };
+            limit_state.observe(&record)?;
             if record.seq != expected_seq {
                 return Err(QuicTextStreamError::UnexpectedSequence {
                     expected: expected_seq,
@@ -185,6 +202,100 @@ impl AgentTextStreamCrypto {
             context,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AgentTextStreamReceiveLimits {
+    pub max_records: u64,
+    pub max_plaintext_bytes: usize,
+}
+
+impl Default for AgentTextStreamReceiveLimits {
+    fn default() -> Self {
+        Self {
+            max_records: AGENT_TEXT_STREAM_DEFAULT_MAX_RECORDS,
+            max_plaintext_bytes: AGENT_TEXT_STREAM_DEFAULT_MAX_PLAINTEXT_BYTES,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct AgentTextStreamReceiveAccumulator {
+    limits: AgentTextStreamReceiveLimits,
+    records: u64,
+    plaintext_bytes: usize,
+}
+
+impl AgentTextStreamReceiveAccumulator {
+    pub fn new(limits: AgentTextStreamReceiveLimits) -> Self {
+        Self {
+            limits,
+            records: 0,
+            plaintext_bytes: 0,
+        }
+    }
+
+    pub fn observe(
+        &mut self,
+        record: &AgentTextStreamRecordV1,
+    ) -> Result<(), AgentTextStreamReceiveLimitError> {
+        let records = self.records.checked_add(1).ok_or(
+            AgentTextStreamReceiveLimitError::RecordLimitExceeded {
+                attempted: u64::MAX,
+                limit: self.limits.max_records,
+            },
+        )?;
+        if records > self.limits.max_records {
+            return Err(AgentTextStreamReceiveLimitError::RecordLimitExceeded {
+                attempted: records,
+                limit: self.limits.max_records,
+            });
+        }
+
+        let plaintext_bytes = self
+            .plaintext_bytes
+            .checked_add(record.plaintext_frame.len())
+            .ok_or(
+                AgentTextStreamReceiveLimitError::PlaintextByteLimitExceeded {
+                    attempted: usize::MAX,
+                    limit: self.limits.max_plaintext_bytes,
+                },
+            )?;
+        if plaintext_bytes > self.limits.max_plaintext_bytes {
+            return Err(
+                AgentTextStreamReceiveLimitError::PlaintextByteLimitExceeded {
+                    attempted: plaintext_bytes,
+                    limit: self.limits.max_plaintext_bytes,
+                },
+            );
+        }
+
+        self.records = records;
+        self.plaintext_bytes = plaintext_bytes;
+        Ok(())
+    }
+
+    pub fn records(&self) -> u64 {
+        self.records
+    }
+
+    pub fn plaintext_bytes(&self) -> usize {
+        self.plaintext_bytes
+    }
+}
+
+impl Default for AgentTextStreamReceiveAccumulator {
+    fn default() -> Self {
+        Self::new(AgentTextStreamReceiveLimits::default())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum AgentTextStreamReceiveLimitError {
+    #[error("agent text stream record limit exceeded: {attempted} > {limit}")]
+    RecordLimitExceeded { attempted: u64, limit: u64 },
+    #[error("agent text stream plaintext byte limit exceeded: {attempted} > {limit}")]
+    PlaintextByteLimitExceeded { attempted: usize, limit: usize },
 }
 
 pub async fn send_text_stream(
@@ -569,6 +680,8 @@ pub enum QuicTextStreamError {
     #[error(transparent)]
     Record(#[from] AgentTextStreamRecordError),
     #[error(transparent)]
+    ReceiveLimit(#[from] AgentTextStreamReceiveLimitError),
+    #[error(transparent)]
     Utf8(#[from] str::Utf8Error),
     #[error("certificate setup failed: {0}")]
     Certificate(String),
@@ -633,6 +746,39 @@ mod tests {
         assert!(matches!(
             validate_frame_len(MAX_FRAME_SIZE + 1),
             Err(QuicTextStreamError::FrameTooLarge(_))
+        ));
+    }
+
+    #[test]
+    fn receive_limits_bound_record_count_and_plaintext_bytes() {
+        let record = AgentTextStreamRecordV1::text_delta(vec![0x11; 32], 1, b"hello".to_vec());
+        let mut record_limited =
+            AgentTextStreamReceiveAccumulator::new(AgentTextStreamReceiveLimits {
+                max_records: 1,
+                max_plaintext_bytes: 1024,
+            });
+        record_limited.observe(&record).unwrap();
+        assert!(matches!(
+            record_limited.observe(&record),
+            Err(AgentTextStreamReceiveLimitError::RecordLimitExceeded {
+                attempted: 2,
+                limit: 1
+            })
+        ));
+
+        let mut byte_limited =
+            AgentTextStreamReceiveAccumulator::new(AgentTextStreamReceiveLimits {
+                max_records: 10,
+                max_plaintext_bytes: 4,
+            });
+        assert!(matches!(
+            byte_limited.observe(&record),
+            Err(
+                AgentTextStreamReceiveLimitError::PlaintextByteLimitExceeded {
+                    attempted: 5,
+                    limit: 4
+                }
+            )
         ));
     }
 

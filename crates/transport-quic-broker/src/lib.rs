@@ -22,8 +22,9 @@ use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, Notify, Semaphore, mpsc};
 use tokio::time::{sleep, timeout};
 use transport_quic_stream::{
-    AgentTextStreamCrypto, ReceivedTextChunk, ReceivedTextStream, SentTextStream, decrypt_record,
-    encrypt_record,
+    AgentTextStreamCrypto, AgentTextStreamReceiveAccumulator, AgentTextStreamReceiveLimitError,
+    AgentTextStreamReceiveLimits, ReceivedTextChunk, ReceivedTextStream, SentTextStream,
+    decrypt_record, encrypt_record,
 };
 
 pub const QUIC_BROKER_PROTOCOL_V1: &str = "marmot.quic_broker.v1";
@@ -443,6 +444,22 @@ pub async fn subscribe_text_from_broker_with_updates<F>(
 where
     F: FnMut(&ReceivedTextChunk),
 {
+    subscribe_text_from_broker_with_limits(
+        config,
+        AgentTextStreamReceiveLimits::default(),
+        &mut on_chunk,
+    )
+    .await
+}
+
+pub async fn subscribe_text_from_broker_with_limits<F>(
+    config: SubscribeTextFromBroker,
+    limits: AgentTextStreamReceiveLimits,
+    mut on_chunk: F,
+) -> Result<ReceivedTextStream, QuicBrokerError>
+where
+    F: FnMut(&ReceivedTextChunk),
+{
     let endpoint = client_endpoint(config.trust, config.broker_addr)?;
     let connection = endpoint
         .connect(config.broker_addr, &config.server_name)?
@@ -460,6 +477,7 @@ where
     let mut text = String::new();
     let mut transcript =
         AgentTextStreamTranscriptV1::new(config.stream_id.clone(), config.start_event_id);
+    let mut limit_state = AgentTextStreamReceiveAccumulator::new(limits);
 
     while let Some(record) = read_record_frame(&mut recv, None).await? {
         let record = if let Some(crypto) = &config.crypto {
@@ -467,6 +485,7 @@ where
         } else {
             record
         };
+        limit_state.observe(&record)?;
         if record.stream_id != config.stream_id {
             return Err(QuicBrokerError::MixedStreamIds);
         }
@@ -869,12 +888,14 @@ async fn handle_publish_stream(
     };
     let key = control.key()?;
     state.wait_for_subscriber(&key).await?;
+    let mut limit_state = AgentTextStreamReceiveAccumulator::default();
 
     while let Some(record) = read_record_frame(&mut recv, Some(read_timeout)).await? {
         if record.stream_id != key.stream_id {
             state.drop_room(&key).await;
             return Err(QuicBrokerError::MixedStreamIds);
         }
+        limit_state.observe(&record)?;
         state.publish(&key, record).await?;
     }
     state.finish_room(&key).await;
@@ -1227,6 +1248,8 @@ pub enum QuicBrokerError {
     Utf8(#[from] str::Utf8Error),
     #[error(transparent)]
     StreamCrypto(#[from] transport_quic_stream::QuicTextStreamError),
+    #[error(transparent)]
+    ReceiveLimit(#[from] AgentTextStreamReceiveLimitError),
     #[error("certificate setup failed: {0}")]
     Certificate(String),
     #[error("certificate PEM file did not contain any certificates")]
@@ -1359,6 +1382,70 @@ mod tests {
         assert_eq!(received.chunk_count, 4);
         assert_eq!(sent.chunk_count, received.chunk_count);
         assert_eq!(sent.transcript_hash, received.transcript_hash);
+
+        let _ = shutdown_tx.send(());
+        broker_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn broker_subscriber_rejects_streams_past_receive_limits() {
+        let server = QuicBrokerServer::bind(QuicBrokerConfig {
+            bind_addr: LOCAL_SERVER_BIND,
+            per_subscriber_queue: DEFAULT_SUBSCRIBER_QUEUE_DEPTH,
+            ..QuicBrokerConfig::default()
+        })
+        .unwrap();
+        let broker_addr = server.local_addr().unwrap();
+        let server_cert = server.server_cert_der().to_vec();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let broker_task = tokio::spawn(server.run_until(async {
+            let _ = shutdown_rx.await;
+        }));
+
+        let stream_id = vec![0xdd; 32];
+        let start_event_id = MessageId::new(vec![0x44; 32]);
+        let subscriber = tokio::spawn(subscribe_text_from_broker_with_limits(
+            SubscribeTextFromBroker {
+                broker_addr,
+                server_name: "localhost".to_owned(),
+                trust: BrokerServerTrust::CertificateDer(server_cert.clone()),
+                stream_id: stream_id.clone(),
+                start_event_id: start_event_id.clone(),
+                crypto: None,
+            },
+            AgentTextStreamReceiveLimits {
+                max_records: 1,
+                max_plaintext_bytes: 1024,
+            },
+            |_| {},
+        ));
+        sleep(Duration::from_millis(100)).await;
+
+        let _ = publish_text_to_broker(PublishTextToBroker {
+            broker_addr,
+            server_name: "localhost".to_owned(),
+            trust: BrokerServerTrust::CertificateDer(server_cert),
+            stream_id,
+            start_event_id,
+            text: "two records".to_owned(),
+            max_chunk_bytes: 3,
+            chunk_delay: Duration::ZERO,
+            crypto: None,
+        })
+        .await;
+
+        let err = timeout(Duration::from_secs(5), subscriber)
+            .await
+            .expect("subscriber should hit receive limit")
+            .unwrap()
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            QuicBrokerError::ReceiveLimit(AgentTextStreamReceiveLimitError::RecordLimitExceeded {
+                attempted: 2,
+                limit: 1
+            })
+        ));
 
         let _ = shutdown_tx.send(());
         broker_task.await.unwrap().unwrap();
