@@ -1261,6 +1261,18 @@ impl<S: StorageProvider> Engine<S> {
         .map_err(|e| EngineError::Backend(format!("load: {e:?}")))?
         .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
 
+        if let Some(state) = self.epoch_manager.state(&group_id)
+            && !matches!(state, EpochState::Stable { .. })
+        {
+            return Err(EngineError::InvalidTransition(
+                cgka_traits::engine_state::InvalidTransition {
+                    from: state.name(),
+                    to: "Leave",
+                    reason: "leave requires Stable",
+                },
+            ));
+        }
+
         // member-departure.md:23-26 — an admin must leave the admin set before
         // using SelfRemove. This is stricter than merely preserving a non-empty
         // admin set: it prevents an admin identity from departing while still

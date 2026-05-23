@@ -632,6 +632,47 @@ async fn selfremove_full_flow_with_auto_commit() {
 }
 
 #[tokio::test]
+async fn leave_requires_stable_epoch_state() {
+    let mut alice = build_client(b"alice");
+    let mut bob = build_client(b"bob");
+    let mut carol = build_client(b"carol");
+
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let (group_id, create_result) = alice
+        .create_group(CreateGroupRequest {
+            name: "leave-stable-guard".into(),
+            description: "".into(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let pending = match create_result {
+        SendResult::GroupCreated { pending, .. } => pending,
+        other => panic!("expected group created, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let pending_invite = alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![carol_kp],
+        })
+        .await
+        .unwrap();
+    assert!(matches!(pending_invite, SendResult::GroupEvolution { .. }));
+
+    let err = alice
+        .send(SendIntent::Leave { group_id })
+        .await
+        .unwrap_err();
+    assert!(matches!(err, EngineError::InvalidTransition(_)));
+}
+
+#[tokio::test]
 async fn selfremove_auto_commit_publish_failed_rolls_back_projection() {
     let mut alice = build_client(b"alice");
     let mut bob = build_client(b"bob");
