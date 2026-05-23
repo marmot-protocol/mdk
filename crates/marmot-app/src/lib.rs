@@ -49,8 +49,8 @@ use cgka_traits::engine::{CreateGroupRequest, GroupEvent, KeyPackage, SendIntent
 use cgka_traits::group::Group;
 use cgka_traits::transport::{TransportEnvelope, TransportMessage};
 use cgka_traits::{
-    GroupId, MemberId, MessageId, TransportAdapter, TransportAdapterError, TransportEndpoint,
-    TransportGroupSubscription, TransportPublishTarget,
+    GroupId, MemberId, MessageId, SecretBytes, TransportAdapter, TransportAdapterError,
+    TransportEndpoint, TransportGroupSubscription, TransportPublishTarget,
 };
 use marmot_account::{
     AccountDeviceRuntime, AccountHome, AccountHomeError, AccountSummary, KeyPackagePublication,
@@ -225,7 +225,7 @@ enum AccountWorkerCommand {
     SafeExportSecret {
         group_id: GroupId,
         component_id: cgka_traits::AppComponentId,
-        respond: oneshot::Sender<Result<Vec<u8>, AppError>>,
+        respond: oneshot::Sender<Result<SecretBytes, AppError>>,
     },
     InviteMembers {
         group_id: GroupId,
@@ -1048,7 +1048,7 @@ impl MarmotAppRuntime {
         account_ref: &str,
         group_id: &GroupId,
         component_id: cgka_traits::AppComponentId,
-    ) -> Result<Vec<u8>, AppError> {
+    ) -> Result<SecretBytes, AppError> {
         self.accounts
             .safe_export_secret(account_ref, group_id, component_id)
             .await
@@ -1603,7 +1603,7 @@ impl AccountManager {
         account_ref: &str,
         group_id: &GroupId,
         component_id: cgka_traits::AppComponentId,
-    ) -> Result<Vec<u8>, AppError> {
+    ) -> Result<SecretBytes, AppError> {
         let command = self.worker_commands(account_ref).await?;
         let (respond, response) = oneshot::channel();
         command
@@ -3829,10 +3829,8 @@ impl MarmotApp {
 
     fn account_projection(&self, label: &str) -> Result<AccountProjectionDb, AppError> {
         let keys = self.account_home().load_signing_keys(label)?;
-        AccountProjectionDb::open(
-            self.account_projection_path(label),
-            &self.sqlcipher_key_material(label, &keys),
-        )
+        let key = self.sqlcipher_key(label, &keys)?;
+        AccountProjectionDb::open(self.account_projection_path(label), &key)
     }
 
     fn projection_status(&self, label: &str) -> AppProjectionStatus {
@@ -3951,10 +3949,8 @@ impl MarmotApp {
         account: &AccountSummary,
     ) -> Result<DirectoryCache, AppError> {
         let keys = self.account_home().load_signing_keys(&account.label)?;
-        DirectoryCache::open(
-            self.directory_cache_path(&account.label),
-            &self.directory_cache_key_material(&account.label, &keys),
-        )
+        let key = SqlCipherKey::new(self.directory_cache_key_material(&account.label, &keys))?;
+        DirectoryCache::open(self.directory_cache_path(&account.label), &key)
     }
 
     fn directory_caches(&self) -> Result<Vec<DirectoryCache>, AppError> {
@@ -4789,7 +4785,7 @@ impl AppClient {
         &mut self,
         group_id: &GroupId,
         component_id: cgka_traits::AppComponentId,
-    ) -> Result<Vec<u8>, AppError> {
+    ) -> Result<SecretBytes, AppError> {
         self.ensure_group(group_id)?;
         Ok(self.runtime.safe_export_secret(group_id, component_id)?)
     }

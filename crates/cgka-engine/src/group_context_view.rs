@@ -17,20 +17,20 @@
 //! than a silent prefix — a fresh `MLS-Exporter` derivation must instead
 //! happen via the engine, which has the live OpenMLS group.
 
-use cgka_traits::group_context::GroupContext;
+use cgka_traits::group_context::{GroupContext, SecretBytes};
 use cgka_traits::types::EpochId;
 use std::collections::HashMap;
 
 pub struct GroupContextView {
     epoch: EpochId,
-    secrets: HashMap<String, Vec<u8>>,
+    secrets: HashMap<String, SecretBytes>,
     transport_group_id: Option<Vec<u8>>,
 }
 
 impl GroupContextView {
     pub(crate) fn new(
         epoch: EpochId,
-        secrets: HashMap<String, Vec<u8>>,
+        secrets: HashMap<String, SecretBytes>,
         transport_group_id: Option<Vec<u8>>,
     ) -> Self {
         Self {
@@ -46,7 +46,7 @@ impl GroupContext for GroupContextView {
         self.epoch
     }
 
-    fn exporter_secret(&self, label: &str, length: usize) -> Option<Vec<u8>> {
+    fn exporter_secret(&self, label: &str, length: usize) -> Option<SecretBytes> {
         let stored = self.secrets.get(label)?;
         if stored.len() < length {
             // Caller wants more than we cached. Returning a prefix would
@@ -54,7 +54,9 @@ impl GroupContext for GroupContextView {
             // request, not a slice request). Fail loudly.
             return None;
         }
-        Some(stored.iter().take(length).copied().collect())
+        Some(SecretBytes::new(
+            stored.iter().take(length).copied().collect(),
+        ))
     }
 
     fn transport_group_id(&self) -> Option<Vec<u8>> {

@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use cgka_engine::canonicalization::CanonicalizationPolicy;
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::{Engine, EngineBuilder};
+use cgka_traits::SecretBytes;
 use cgka_traits::app_components::{AppComponentId, AppComponentSet, default_group_components};
 use cgka_traits::engine::{
     CgkaEngine, CreateGroupRequest, GroupEvent, KeyPackage, SendIntent, SendResult,
@@ -211,7 +212,7 @@ impl AccountDeviceSession {
         &mut self,
         group_id: &GroupId,
         component_id: AppComponentId,
-    ) -> Result<Vec<u8>, EngineError> {
+    ) -> Result<SecretBytes, EngineError> {
         self.engine.safe_export_secret(group_id, component_id)
     }
 

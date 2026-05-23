@@ -53,6 +53,7 @@ rand = "0.8"
 sha2 = "0.10"
 url = "2"
 chacha20poly1305 = "0.10"
+zeroize = "1"
 keyring-core = "1"
 quinn = { version = "0.11", default-features = false, features = ["log", "platform-verifier", "runtime-tokio", "rustls-ring"] }
 rcgen = "0.14"

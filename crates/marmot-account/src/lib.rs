@@ -824,7 +824,7 @@ where
         &mut self,
         group_id: &GroupId,
         component_id: AppComponentId,
-    ) -> AccountResult<Vec<u8>> {
+    ) -> AccountResult<cgka_traits::SecretBytes> {
         Ok(self.session.safe_export_secret(group_id, component_id)?)
     }
 

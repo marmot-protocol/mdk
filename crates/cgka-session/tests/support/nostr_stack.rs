@@ -31,7 +31,7 @@ use transport_nostr_peeler::{NostrMlsPeeler, NostrTransportEvent};
 
 pub struct NostrStackHarness {
     _dir: TempDir,
-    database_key: SqlCipherKey,
+    database_key_material: &'static str,
     relay: Arc<FakeRelayClient>,
     adapter: NostrTransportAdapter,
     group_endpoint: TransportEndpoint,
@@ -137,7 +137,7 @@ impl NostrStackHarness {
         let adapter = NostrTransportAdapter::new(relay.clone());
         Self {
             _dir: tempfile::tempdir().unwrap(),
-            database_key: SqlCipherKey::new("nostr stack integration key").unwrap(),
+            database_key_material: "nostr stack integration key",
             relay,
             adapter,
             group_endpoint: TransportEndpoint(default_group_endpoint()),
@@ -151,7 +151,7 @@ impl NostrStackHarness {
         let session = AccountDeviceSession::open(
             SessionConfig::new(
                 self._dir.path().join(format!("{label}.sqlite")),
-                self.database_key.clone(),
+                SqlCipherKey::new(self.database_key_material).unwrap(),
                 keys.public_key().to_bytes().to_vec(),
                 Box::new(NostrMlsPeeler::new().with_welcome_signer(keys)),
             )

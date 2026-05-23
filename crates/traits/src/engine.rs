@@ -22,7 +22,7 @@ use crate::capabilities::{Feature, FeatureStatus, GroupCapabilities};
 use crate::engine_state::PendingStateRef;
 use crate::error::EngineError;
 use crate::group::Member;
-use crate::group_context::GroupContext;
+use crate::group_context::{GroupContext, SecretBytes};
 use crate::ingest::IngestOutcome;
 use crate::transport::TransportMessage;
 use crate::types::{EpochId, GroupId, MemberId, MessageId};
@@ -425,7 +425,7 @@ pub trait CgkaEngine: Send + Sync {
         &mut self,
         group_id: &GroupId,
         component_id: AppComponentId,
-    ) -> Result<Vec<u8>, EngineError>;
+    ) -> Result<SecretBytes, EngineError>;
 
     /// Signed app-component bytes from the group's current
     /// `app_data_dictionary`.

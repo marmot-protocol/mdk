@@ -112,8 +112,13 @@ fn session(
     identity: &[u8],
 ) -> AccountDeviceSession {
     AccountDeviceSession::open(
-        SessionConfig::new(path, key.clone(), pad32(identity), Box::new(MockPeeler))
-            .feature_registry(FeatureRegistry::new()),
+        SessionConfig::new(
+            path,
+            SqlCipherKey::new(key.as_secret_str()).unwrap(),
+            pad32(identity),
+            Box::new(MockPeeler),
+        )
+        .feature_registry(FeatureRegistry::new()),
     )
     .unwrap()
 }

@@ -10,7 +10,9 @@ use cgka_traits::agent_text_stream::{
     AgentTextStreamTranscriptV1,
 };
 use cgka_traits::app_components::encode_quic_varint;
-use cgka_traits::{MessageId, agent_text_stream::AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN};
+use cgka_traits::{
+    MessageId, SecretBytes, agent_text_stream::AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN,
+};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 use quinn::crypto::rustls::QuicClientConfig;
@@ -189,18 +191,27 @@ pub struct ReceivedTextChunk {
     pub text: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct AgentTextStreamCrypto {
-    pub component_secret: Vec<u8>,
+    pub component_secret: SecretBytes,
     pub context: AgentTextStreamKeyContextV1,
 }
 
 impl AgentTextStreamCrypto {
-    pub fn new(component_secret: Vec<u8>, context: AgentTextStreamKeyContextV1) -> Self {
+    pub fn new(component_secret: SecretBytes, context: AgentTextStreamKeyContextV1) -> Self {
         Self {
             component_secret,
             context,
         }
+    }
+}
+
+impl std::fmt::Debug for AgentTextStreamCrypto {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentTextStreamCrypto")
+            .field("component_secret", &"<redacted>")
+            .field("context", &self.context)
+            .finish()
     }
 }
 
@@ -481,7 +492,7 @@ fn derive_record_nonce(crypto: &AgentTextStreamCrypto, seq: u64) -> [u8; 12] {
 fn derive_bytes(crypto: &AgentTextStreamCrypto, label: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(b"marmot agent text stream quic aead v1");
-    encode_hash_part(&mut hasher, &crypto.component_secret);
+    encode_hash_part(&mut hasher, crypto.component_secret.as_slice());
     encode_hash_part(&mut hasher, label);
     encode_hash_part(&mut hasher, &crypto.context.encode());
     hasher.finalize().into()
@@ -786,7 +797,7 @@ mod tests {
     fn crypto_seals_record_body_and_round_trips() {
         let stream_id = vec![0x42; 32];
         let crypto = AgentTextStreamCrypto::new(
-            vec![0x07; 32],
+            SecretBytes::new(vec![0x07; 32]),
             AgentTextStreamKeyContextV1::new(
                 cgka_traits::GroupId::new(vec![0x01; 32]),
                 stream_id.clone(),
@@ -808,6 +819,25 @@ mod tests {
 
         let opened = decrypt_record(&crypto, &sealed).unwrap();
         assert_eq!(opened, record);
+    }
+
+    #[test]
+    fn crypto_debug_redacts_component_secret() {
+        let crypto = AgentTextStreamCrypto::new(
+            SecretBytes::new(b"debug-visible stream secret".to_vec()),
+            AgentTextStreamKeyContextV1::new(
+                cgka_traits::GroupId::new(vec![0x01; 32]),
+                vec![0x42; 32],
+                cgka_traits::EpochId(3),
+                cgka_traits::MemberId::new(vec![0x02; 32]),
+                MessageId::new(vec![0x24; 32]),
+            ),
+        );
+
+        let rendered = format!("{crypto:?}");
+
+        assert!(!rendered.contains("debug-visible stream secret"));
+        assert!(rendered.contains("redacted"));
     }
 
     #[tokio::test]

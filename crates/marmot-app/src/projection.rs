@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, Transaction, params, types::Type};
+use storage_sqlite::SqlCipherKey;
 
 use crate::{
     AGENT_TEXT_STREAM_COMPONENT_ID, AccountState, AppAgentTextStreamComponent, AppError,
@@ -27,12 +28,12 @@ struct RawGroupRow {
 }
 
 impl AccountProjectionDb {
-    pub(crate) fn open(path: PathBuf, key_material: &str) -> Result<Self, AppError> {
+    pub(crate) fn open(path: PathBuf, key: &SqlCipherKey) -> Result<Self, AppError> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
         let conn = Connection::open(path)?;
-        conn.pragma_update(None, "key", key_material)?;
+        conn.pragma_update(None, "key", key.as_secret_str())?;
         let _: i64 = conn.query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get(0))?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS account_state (
@@ -635,7 +636,8 @@ mod tests {
     #[test]
     fn save_state_rolls_back_all_tables_when_component_write_fails() {
         let dir = tempfile::tempdir().unwrap();
-        let mut db = AccountProjectionDb::open(dir.path().join("app.sqlite3"), "test-key").unwrap();
+        let key = SqlCipherKey::new("test-key").unwrap();
+        let mut db = AccountProjectionDb::open(dir.path().join("app.sqlite3"), &key).unwrap();
         let original = AccountState {
             label: "alice".to_owned(),
             seen_events: vec!["event-before".to_owned()],
@@ -692,7 +694,8 @@ mod tests {
     #[test]
     fn load_state_uses_agent_text_stream_component_row() {
         let dir = tempfile::tempdir().unwrap();
-        let mut db = AccountProjectionDb::open(dir.path().join("app.sqlite3"), "test-key").unwrap();
+        let key = SqlCipherKey::new("test-key").unwrap();
+        let mut db = AccountProjectionDb::open(dir.path().join("app.sqlite3"), &key).unwrap();
         let mut group = AppGroupRecord::new(
             "aa".to_owned(),
             test_routing([0xAA; 32], "ws://127.0.0.1:18080"),
@@ -726,7 +729,8 @@ mod tests {
     #[test]
     fn save_state_does_not_rewrite_unchanged_group_rows() {
         let dir = tempfile::tempdir().unwrap();
-        let mut db = AccountProjectionDb::open(dir.path().join("app.sqlite3"), "test-key").unwrap();
+        let key = SqlCipherKey::new("test-key").unwrap();
+        let mut db = AccountProjectionDb::open(dir.path().join("app.sqlite3"), &key).unwrap();
         let state = AccountState {
             label: "alice".to_owned(),
             seen_events: Vec::new(),
@@ -800,7 +804,8 @@ mod tests {
     #[test]
     fn save_state_retains_only_recent_seen_events() {
         let dir = tempfile::tempdir().unwrap();
-        let mut db = AccountProjectionDb::open(dir.path().join("app.sqlite3"), "test-key").unwrap();
+        let key = SqlCipherKey::new("test-key").unwrap();
+        let mut db = AccountProjectionDb::open(dir.path().join("app.sqlite3"), &key).unwrap();
         let seen_events = (0..(crate::MAX_SEEN_EVENT_IDS + 2))
             .map(|index| format!("event-{index:05}"))
             .collect::<Vec<_>>();
@@ -837,7 +842,8 @@ mod tests {
     #[test]
     fn prune_group_messages_before_removes_only_expired_group_rows() {
         let dir = tempfile::tempdir().unwrap();
-        let db = AccountProjectionDb::open(dir.path().join("app.sqlite3"), "test-key").unwrap();
+        let key = SqlCipherKey::new("test-key").unwrap();
+        let db = AccountProjectionDb::open(dir.path().join("app.sqlite3"), &key).unwrap();
         for (message_id_hex, group_id_hex, recorded_at) in [
             ("old-aa", "aa", 10),
             ("new-aa", "aa", 20),

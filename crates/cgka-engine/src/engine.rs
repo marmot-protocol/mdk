@@ -232,7 +232,7 @@ impl<S: StorageProvider> Engine<S> {
         &mut self,
         group_id: &GroupId,
         component_id: AppComponentId,
-    ) -> Result<(EpochId, Vec<u8>), EngineError> {
+    ) -> Result<(EpochId, cgka_traits::SecretBytes), EngineError> {
         let provider = crate::provider::EngineOpenMlsProvider::<S>::new(
             &self.crypto,
             self.storage.mls_storage(),
@@ -264,12 +264,15 @@ impl<S: StorageProvider> Engine<S> {
             let secret = mls_group
                 .safe_export_secret_from_pending(crypto, storage, component_id)
                 .map_err(|e| EngineError::Backend(format!("staged safe_export_secret: {e:?}")))?;
-            Ok((epoch, secret))
+            Ok((epoch, cgka_traits::SecretBytes::new(secret)))
         } else {
             let secret = mls_group
                 .safe_export_secret(crypto, storage, component_id)
                 .map_err(|e| EngineError::Backend(format!("safe_export_secret: {e:?}")))?;
-            Ok((EpochId(mls_group.epoch().as_u64()), secret))
+            Ok((
+                EpochId(mls_group.epoch().as_u64()),
+                cgka_traits::SecretBytes::new(secret),
+            ))
         }
     }
 }
@@ -400,7 +403,7 @@ impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
         let mut map = std::collections::HashMap::new();
         map.insert(
             crate::group_lifecycle::EXPORTER_SNAPSHOT_KEY.to_string(),
-            secret,
+            cgka_traits::SecretBytes::new(secret),
         );
         Ok(Box::new(crate::group_context_view::GroupContextView::new(
             EpochId(epoch),
@@ -415,7 +418,7 @@ impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
         &mut self,
         group_id: &GroupId,
         component_id: AppComponentId,
-    ) -> Result<Vec<u8>, EngineError> {
+    ) -> Result<cgka_traits::SecretBytes, EngineError> {
         self.safe_export_secret_with_epoch(group_id, component_id)
             .map(|(_, secret)| secret)
     }

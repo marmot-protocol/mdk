@@ -445,7 +445,7 @@ async fn admin_cannot_self_remove_when_only_admin() {
     let mut alice = build(b"alice");
     let mut bob = build(b"bob");
     let bob_kp = bob.fresh_key_package().await.unwrap();
-    let (group_id, _) = alice
+    let (group_id, create) = alice
         .create_group(CreateGroupRequest {
             name: "alone".into(),
             description: "".into(),
@@ -456,6 +456,12 @@ async fn admin_cannot_self_remove_when_only_admin() {
         })
         .await
         .unwrap();
+    match create {
+        SendResult::GroupCreated { pending, .. } => {
+            alice.confirm_published(pending).await.unwrap();
+        }
+        _ => unreachable!(),
+    }
     let err = alice
         .send(SendIntent::Leave {
             group_id: group_id.clone(),

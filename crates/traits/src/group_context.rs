@@ -12,13 +12,18 @@
 
 use crate::types::EpochId;
 use std::collections::HashMap;
+use std::fmt;
+use zeroize::Zeroizing;
+
+/// Heap-owned secret bytes that are wiped when dropped.
+pub type SecretBytes = Zeroizing<Vec<u8>>;
 
 /// Engine-internal live view of a group. Application code can query this via
 /// `CgkaEngine::group_context`. Peeler code must not — the peeler uses
 /// [`GroupContextSnapshot`].
 pub trait GroupContext: Send + Sync {
     fn epoch(&self) -> EpochId;
-    fn exporter_secret(&self, label: &str, length: usize) -> Option<Vec<u8>>;
+    fn exporter_secret(&self, label: &str, length: usize) -> Option<SecretBytes>;
     fn transport_group_id(&self) -> Option<Vec<u8>>;
 }
 
@@ -28,10 +33,10 @@ pub trait GroupContext: Send + Sync {
 /// Constructed fresh per peeler call. The `labels` argument to
 /// [`GroupContextSnapshot::from_context`] names which exporter secrets the
 /// snapshot should materialize — per-peeler isolation comes for free.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct GroupContextSnapshot {
     epoch: EpochId,
-    exporter_secrets: HashMap<String, Vec<u8>>,
+    exporter_secrets: HashMap<String, SecretBytes>,
     transport_group_id: Option<Vec<u8>>,
 }
 
@@ -58,6 +63,10 @@ impl GroupContextSnapshot {
         exporter_secrets: HashMap<String, Vec<u8>>,
         transport_group_id: Option<Vec<u8>>,
     ) -> Self {
+        let exporter_secrets = exporter_secrets
+            .into_iter()
+            .map(|(label, secret)| (label, SecretBytes::new(secret)))
+            .collect();
         Self {
             epoch,
             exporter_secrets,
@@ -70,10 +79,39 @@ impl GroupContextSnapshot {
     }
 
     pub fn exporter_secret(&self, label: &str) -> Option<&[u8]> {
-        self.exporter_secrets.get(label).map(Vec::as_slice)
+        self.exporter_secrets
+            .get(label)
+            .map(|secret| secret.as_slice())
     }
 
     pub fn transport_group_id(&self) -> Option<&[u8]> {
         self.transport_group_id.as_deref()
+    }
+}
+
+impl fmt::Debug for GroupContextSnapshot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GroupContextSnapshot")
+            .field("epoch", &self.epoch)
+            .field("exporter_secret_count", &self.exporter_secrets.len())
+            .field("transport_group_id", &self.transport_group_id)
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_debug_redacts_exporter_secret_bytes() {
+        let mut exporter_secrets = HashMap::new();
+        exporter_secrets.insert("test/exporter".to_owned(), b"super secret bytes".to_vec());
+        let snapshot = GroupContextSnapshot::new(EpochId(7), exporter_secrets, None);
+
+        let rendered = format!("{snapshot:?}");
+
+        assert!(!rendered.contains("super secret bytes"));
+        assert!(rendered.contains("exporter_secret_count"));
     }
 }

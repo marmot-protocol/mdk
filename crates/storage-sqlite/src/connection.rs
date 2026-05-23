@@ -2,18 +2,19 @@ use crate::openmls_storage::SqliteOpenMlsStorage;
 use crate::{SqliteResultExt, migrations};
 use cgka_traits::storage::{StorageError, StorageProvider, StorageResult};
 use cgka_traits::types::Backend;
+use std::fmt;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use zeroize::Zeroizing;
 
 pub(crate) type SharedConnection = Arc<Mutex<rusqlite::Connection>>;
 
-#[derive(Clone)]
-pub struct SqlCipherKey(String);
+pub struct SqlCipherKey(Zeroizing<String>);
 
 impl SqlCipherKey {
     pub fn new(key: impl Into<String>) -> StorageResult<Self> {
-        let key = key.into();
+        let key = Zeroizing::new(key.into());
         if key.is_empty() {
             return Err(StorageError::Backend(
                 "SQLCipher key must not be empty".to_string(),
@@ -22,8 +23,14 @@ impl SqlCipherKey {
         Ok(Self(key))
     }
 
-    fn as_str(&self) -> &str {
+    pub fn as_secret_str(&self) -> &str {
         &self.0
+    }
+}
+
+impl fmt::Debug for SqlCipherKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("SqlCipherKey").field(&"<redacted>").finish()
     }
 }
 
@@ -145,7 +152,7 @@ impl SqliteStorage {
 
 fn apply_sqlcipher_key(connection: &rusqlite::Connection, key: &SqlCipherKey) -> StorageResult<()> {
     connection
-        .pragma_update(None, "key", key.as_str())
+        .pragma_update(None, "key", key.as_secret_str())
         .storage()?;
     let _: i64 = connection
         .query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get(0))
@@ -239,6 +246,16 @@ mod tests {
             SqliteStorage::in_memory().unwrap().backend(),
             Backend::Sqlite
         );
+    }
+
+    #[test]
+    fn sqlcipher_key_debug_redacts_secret_material() {
+        let key = SqlCipherKey::new("debug-visible secret").unwrap();
+
+        let rendered = format!("{key:?}");
+
+        assert!(!rendered.contains("debug-visible secret"));
+        assert!(rendered.contains("redacted"));
     }
 
     #[test]

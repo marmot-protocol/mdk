@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OptionalExtension, params};
+use storage_sqlite::SqlCipherKey;
 
 use crate::{AppError, UserDirectoryRecord};
 
@@ -11,12 +12,12 @@ pub(crate) struct DirectoryCache {
 }
 
 impl DirectoryCache {
-    pub(crate) fn open(path: PathBuf, key_material: &str) -> Result<Self, AppError> {
+    pub(crate) fn open(path: PathBuf, key: &SqlCipherKey) -> Result<Self, AppError> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
         let conn = Connection::open(path)?;
-        conn.pragma_update(None, "key", key_material)?;
+        conn.pragma_update(None, "key", key.as_secret_str())?;
         let _: i64 = conn.query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get(0))?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS user_directory_records (
