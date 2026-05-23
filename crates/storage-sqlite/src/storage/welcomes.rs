@@ -32,13 +32,14 @@ impl WelcomeStorage for SqliteStorage {
             .optional()
             .storage()?
             .ok_or(StorageError::NotFound)?;
+        let welcome = deserialize(&record)?;
         tx.execute(
             "DELETE FROM cgka_welcomes WHERE message_id = ?1",
             params![id.as_slice()],
         )
         .storage()?;
         tx.commit().storage()?;
-        deserialize(&record)
+        Ok(welcome)
     }
 
     fn list_welcomes(&self) -> StorageResult<Vec<PendingWelcome>> {
@@ -77,5 +78,30 @@ mod tests {
             store.take_welcome(&mid(1)),
             Err(StorageError::NotFound)
         ));
+    }
+
+    #[test]
+    fn take_welcome_retains_row_when_decode_fails() {
+        let store = SqliteStorage::in_memory().unwrap();
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO cgka_welcomes (message_id, group_id, record)
+                 VALUES (?1, ?2, ?3)",
+                rusqlite::params![mid(1).as_slice(), gid(1).as_slice(), b"not json"],
+            )
+            .unwrap();
+
+        assert!(matches!(
+            store.take_welcome(&mid(1)),
+            Err(StorageError::Serialization(_))
+        ));
+        let remaining: i64 = store
+            .lock()
+            .unwrap()
+            .query_row("SELECT count(*) FROM cgka_welcomes", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(remaining, 1);
     }
 }
