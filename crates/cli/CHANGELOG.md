@@ -47,6 +47,8 @@ versioning through the workspace version in the root `Cargo.toml`.
 - Added `dm keys rotate` as an explicit repair command that force-mints and publishes a fresh replacement KeyPackage.
 - Added TUI unread badges for chats that receive messages while another chat is selected.
 - Added a TUI slash-command suggestion popup that opens on `/` and filters as the composer input narrows.
+- Added a scrollable TUI messages panel: Tab to the Messages focus and use Up/Down or `j`/`k` to scroll, plus
+  PageUp/PageDown and Home/End from any focus. New messages stay pinned to the bottom unless you have scrolled up.
 
 ### Security
 

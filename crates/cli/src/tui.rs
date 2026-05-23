@@ -277,6 +277,7 @@ impl Drop for GroupStateSubscription {
 enum Focus {
     Accounts,
     Chats,
+    Messages,
     Composer,
 }
 
@@ -284,7 +285,8 @@ impl Focus {
     fn next(self) -> Self {
         match self {
             Self::Accounts => Self::Chats,
-            Self::Chats => Self::Composer,
+            Self::Chats => Self::Messages,
+            Self::Messages => Self::Composer,
             Self::Composer => Self::Accounts,
         }
     }
@@ -293,7 +295,8 @@ impl Focus {
         match self {
             Self::Accounts => Self::Composer,
             Self::Chats => Self::Accounts,
-            Self::Composer => Self::Chats,
+            Self::Messages => Self::Chats,
+            Self::Composer => Self::Messages,
         }
     }
 
@@ -301,6 +304,7 @@ impl Focus {
         match self {
             Self::Accounts => "accounts",
             Self::Chats => "chats",
+            Self::Messages => "messages",
             Self::Composer => "composer",
         }
     }
@@ -494,6 +498,8 @@ struct TuiApp {
     unread_counts: HashMap<String, usize>,
     show_archived_chats: bool,
     messages: Vec<MessageRow>,
+    messages_scroll: u16,
+    messages_viewport: u16,
     live_stream_previews: Vec<LiveStreamPreview>,
     chat_subscription: Option<ChatSubscription>,
     message_subscription: Option<MessageSubscription>,
@@ -608,6 +614,8 @@ impl TuiApp {
             unread_counts: HashMap::new(),
             show_archived_chats: false,
             messages: Vec::new(),
+            messages_scroll: 0,
+            messages_viewport: 0,
             live_stream_previews: Vec::new(),
             chat_subscription: None,
             message_subscription: None,
@@ -654,7 +662,7 @@ impl TuiApp {
         }
     }
 
-    fn render(&self, frame: &mut Frame) {
+    fn render(&mut self, frame: &mut Frame) {
         let area = frame.area();
         let root = Layout::default()
             .direction(Direction::Vertical)
@@ -781,7 +789,7 @@ impl TuiApp {
         );
     }
 
-    fn render_messages(&self, frame: &mut Frame, area: Rect) {
+    fn render_messages(&mut self, frame: &mut Frame, area: Rect) {
         let mut lines = if self.messages.is_empty() {
             vec![Line::from("no messages")]
         } else {
@@ -794,10 +802,32 @@ impl TuiApp {
         for preview in stream_preview_lines(&self.daemon, &self.live_stream_previews, group_id) {
             lines.push(preview);
         }
+
+        let inner_width = area.width.saturating_sub(2);
+        let inner_height = area.height.saturating_sub(2);
+        self.messages_viewport = inner_height;
+
+        let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+        let total = u16::try_from(paragraph.line_count(inner_width)).unwrap_or(u16::MAX);
+        let (clamped_scroll, scroll_top) =
+            messages_scroll_offsets(total, inner_height, self.messages_scroll);
+        self.messages_scroll = clamped_scroll;
+
+        let title = if scroll_top == 0 && self.messages_scroll == 0 {
+            "Messages".to_owned()
+        } else if self.messages_scroll == 0 {
+            format!("Messages [{scroll_top} above]")
+        } else {
+            format!(
+                "Messages [{scroll_top} above | {} below]",
+                self.messages_scroll
+            )
+        };
+
         frame.render_widget(
-            Paragraph::new(lines)
-                .block(panel_block("Messages", false))
-                .wrap(Wrap { trim: false }),
+            paragraph
+                .block(panel_block(&title, self.focus == Focus::Messages))
+                .scroll((scroll_top, 0)),
             area,
         );
     }
@@ -870,6 +900,9 @@ impl TuiApp {
             )),
             Line::from(""),
             Line::from("Tab cycles panels. Arrows move. Enter selects or submits. Ctrl-C quits."),
+            Line::from(
+                "Messages panel: Up/Down or j/k scroll; PageUp/PageDown, Home/End jump. New messages stick to the bottom.",
+            ),
             Line::from(""),
             Line::from("/refresh"),
             Line::from("/account <npub-or-hex>"),
@@ -922,6 +955,20 @@ impl TuiApp {
             KeyCode::BackTab => self.focus = self.focus.previous(),
             KeyCode::Up => self.move_selection(-1),
             KeyCode::Down => self.move_selection(1),
+            KeyCode::PageUp => {
+                let by = self.messages_page();
+                self.scroll_messages_up(by);
+            }
+            KeyCode::PageDown => {
+                let by = self.messages_page();
+                self.scroll_messages_down(by);
+            }
+            KeyCode::Home => {
+                self.messages_scroll = u16::MAX;
+            }
+            KeyCode::End => {
+                self.messages_scroll = 0;
+            }
             KeyCode::Enter => {
                 if let Err(err) = self.activate_focus() {
                     self.status = format!("error: {err}");
@@ -959,14 +1006,34 @@ impl TuiApp {
             Focus::Chats => {
                 self.selected_chat = move_index(self.selected_chat, self.chats.len(), delta);
             }
+            Focus::Messages => {
+                if delta < 0 {
+                    self.scroll_messages_up(1);
+                } else if delta > 0 {
+                    self.scroll_messages_down(1);
+                }
+            }
             Focus::Composer => {}
         }
+    }
+
+    fn messages_page(&self) -> u16 {
+        self.messages_viewport.saturating_sub(1).max(1)
+    }
+
+    fn scroll_messages_up(&mut self, by: u16) {
+        self.messages_scroll = self.messages_scroll.saturating_add(by);
+    }
+
+    fn scroll_messages_down(&mut self, by: u16) {
+        self.messages_scroll = self.messages_scroll.saturating_sub(by);
     }
 
     fn activate_focus(&mut self) -> TuiResult<()> {
         match self.focus {
             Focus::Accounts => self.select_current_account(),
             Focus::Chats => self.refresh_messages(),
+            Focus::Messages => Ok(()),
             Focus::Composer => self.submit_input(),
         }
     }
@@ -1761,6 +1828,7 @@ impl TuiApp {
             .unwrap_or_default();
         self.messages_account_id = Some(account_id.clone());
         self.messages_group_id = Some(group_id.clone());
+        self.messages_scroll = 0;
         self.unread_counts.remove(&group_id);
         sort_messages_chronologically(&mut self.messages);
         if let Err(err) = self.ensure_message_subscription(&account_id) {
@@ -2864,6 +2932,14 @@ fn move_index(current: usize, len: usize, delta: isize) -> usize {
     (current as isize + delta).clamp(0, max) as usize
 }
 
+// `scrollback` counts lines up from the bottom (0 keeps the newest pinned). Returns the
+// clamped scrollback and the top-line offset to hand to `Paragraph::scroll`.
+fn messages_scroll_offsets(total: u16, viewport: u16, scrollback: u16) -> (u16, u16) {
+    let max_scroll = total.saturating_sub(viewport);
+    let clamped = scrollback.min(max_scroll);
+    (clamped, max_scroll - clamped)
+}
+
 fn publish_status(action: &str, result: &Value) -> String {
     let published = result
         .get("published")
@@ -3523,7 +3599,7 @@ fn row_label_style(selected: bool, color: Color) -> Style {
     }
 }
 
-fn panel_block(title: &'static str, focused: bool) -> Block<'static> {
+fn panel_block(title: &str, focused: bool) -> Block<'_> {
     let style = if focused {
         Style::default().fg(FOCUS_ACCENT)
     } else {
@@ -4743,6 +4819,19 @@ mod tests {
         assert_eq!(move_index(0, 0, 1), 0);
     }
 
+    #[test]
+    fn messages_scroll_offsets_anchor_to_bottom_and_clamp() {
+        // Content fits the viewport: no scrolling is possible.
+        assert_eq!(messages_scroll_offsets(5, 10, 0), (0, 0));
+        assert_eq!(messages_scroll_offsets(5, 10, 4), (0, 0));
+        // Pinned to the bottom shows the newest lines (offset = overflow).
+        assert_eq!(messages_scroll_offsets(40, 10, 0), (0, 30));
+        // Scrolling up moves the top offset toward the first line.
+        assert_eq!(messages_scroll_offsets(40, 10, 12), (12, 18));
+        // Scrollback past the top clamps to the first line.
+        assert_eq!(messages_scroll_offsets(40, 10, u16::MAX), (30, 0));
+    }
+
     fn line_text(line: &Line<'_>) -> String {
         line.spans
             .iter()
@@ -4770,6 +4859,8 @@ mod tests {
             unread_counts: HashMap::new(),
             show_archived_chats: false,
             messages: Vec::new(),
+            messages_scroll: 0,
+            messages_viewport: 0,
             live_stream_previews: Vec::new(),
             chat_subscription: None,
             message_subscription: None,
