@@ -48,7 +48,7 @@ impl ChatsSubscription {
 #[uniffi::export(async_runtime = "tokio")]
 impl ChatsSubscription {
     pub fn snapshot(&self) -> Vec<AppGroupRecordFfi> {
-        self.snapshot.lock().unwrap().take().unwrap_or_default()
+        take_snapshot(&self.snapshot).unwrap_or_default()
     }
 
     pub async fn next(&self) -> Option<AppGroupRecordFfi> {
@@ -79,7 +79,7 @@ impl MessagesSubscription {
 #[uniffi::export(async_runtime = "tokio")]
 impl MessagesSubscription {
     pub fn snapshot(&self) -> Vec<AppMessageRecordFfi> {
-        self.snapshot.lock().unwrap().take().unwrap_or_default()
+        take_snapshot(&self.snapshot).unwrap_or_default()
     }
 
     pub async fn next(&self) -> Option<MessageUpdateFfi> {
@@ -107,7 +107,7 @@ impl GroupStateSubscription {
 #[uniffi::export(async_runtime = "tokio")]
 impl GroupStateSubscription {
     pub fn snapshot(&self) -> Option<AppGroupRecordFfi> {
-        self.snapshot.lock().unwrap().take()
+        take_snapshot(&self.snapshot)
     }
 
     pub async fn next(&self) -> Option<AppGroupRecordFfi> {
@@ -162,6 +162,30 @@ impl AgentStreamSubscription {
             stream_id_hex: inner.stream_id_hex.clone(),
             inner: Mutex::new(inner),
         })
+    }
+}
+
+fn take_snapshot<T>(snapshot: &StdMutex<Option<T>>) -> Option<T> {
+    match snapshot.lock() {
+        Ok(mut guard) => guard.take(),
+        Err(poisoned) => poisoned.into_inner().take(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn take_snapshot_recovers_from_poisoned_lock() {
+        let snapshot = StdMutex::new(Some("initial"));
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = snapshot.lock().unwrap();
+            panic!("poison snapshot lock");
+        });
+
+        assert_eq!(take_snapshot(&snapshot), Some("initial"));
+        assert_eq!(take_snapshot(&snapshot), None);
     }
 }
 

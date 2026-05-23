@@ -26,7 +26,10 @@ use cgka_traits::app_event::{
     MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_DELETE, MARMOT_APP_EVENT_KIND_REACTION,
 };
 
-use crate::{Cli, CliOutput, DaemonCommand, SecretStoreKind, resolve_home};
+use crate::{
+    Cli, CliOutput, DaemonCommand, SecretStoreKind, create_private_dir_all,
+    open_private_append_file, resolve_home, write_private_file,
+};
 
 const DAEMON_EVENT_REPLAY_LIMIT: usize = 256;
 const MAX_DAEMON_REQUEST_BYTES: usize = 1024 * 1024;
@@ -578,7 +581,7 @@ async fn run_server(args: DaemonArgs) -> Result<(), Box<dyn std::error::Error + 
         prepare_socket_dir(parent, &home)?;
     }
     if let Some(parent) = pid_path.parent() {
-        std::fs::create_dir_all(parent)?;
+        create_private_dir_all(parent)?;
     }
     remove_stale_socket(&socket).await?;
     remove_stale_pid(&pid_path).await?;
@@ -3701,10 +3704,7 @@ fn stream_result_plain(result: &serde_json::Value) -> String {
 }
 
 fn write_pid_file(pid_path: &Path) -> std::io::Result<()> {
-    if let Some(parent) = pid_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(pid_path, format!("{}\n", std::process::id()))
+    write_private_file(pid_path, format!("{}\n", std::process::id()))
 }
 
 fn read_pid_file(pid_path: &Path) -> std::io::Result<Option<u32>> {
@@ -3728,13 +3728,7 @@ async fn remove_stale_pid(pid_path: &Path) -> std::io::Result<()> {
 }
 
 fn open_daemon_log(log_path: &Path) -> std::io::Result<std::fs::File> {
-    if let Some(parent) = log_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let mut log = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log_path)?;
+    let mut log = open_private_append_file(log_path)?;
     writeln!(log, "dmd start requested at {}", unix_now())?;
     Ok(log)
 }
@@ -3850,6 +3844,60 @@ mod tests {
     use cgka_traits::GroupId;
     use cgka_traits::MessageId;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    #[cfg(unix)]
+    fn daemon_pid_and_log_writers_create_private_files() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let pid_path = home.path().join("dev").join("dmd.pid");
+        let log_path = home.path().join("logs").join("dmd.log");
+
+        write_pid_file(&pid_path).expect("write pid file");
+        drop(open_daemon_log(&log_path).expect("open daemon log"));
+
+        assert_eq!(
+            pid_path
+                .parent()
+                .expect("pid parent")
+                .metadata()
+                .expect("pid parent metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            pid_path
+                .metadata()
+                .expect("pid metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(
+            log_path
+                .parent()
+                .expect("log parent")
+                .metadata()
+                .expect("log parent metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            log_path
+                .metadata()
+                .expect("log metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
 
     #[test]
     fn apply_defaults_overwrites_forwarded_cli_relay_with_daemon_relay() {

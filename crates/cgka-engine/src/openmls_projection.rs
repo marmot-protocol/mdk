@@ -1323,7 +1323,7 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                         )));
                     }
                 }
-                let resulting_epoch = mls_group.epoch().as_u64() + 1;
+                let resulting_epoch = mls_group.epoch().as_u64().saturating_add(1);
                 let mut consumed_proposal_refs = staged
                     .queued_proposals()
                     .map(|proposal| tls_hex(proposal.proposal_reference_ref()))

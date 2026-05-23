@@ -49,6 +49,7 @@ pub struct SqliteStorageOptions {
     pub temp_store_memory: bool,
     pub trusted_schema: bool,
     pub cipher_memory_security: bool,
+    pub cipher_compatibility: u8,
 }
 
 impl Default for SqliteStorageOptions {
@@ -61,6 +62,7 @@ impl Default for SqliteStorageOptions {
             temp_store_memory: true,
             trusted_schema: false,
             cipher_memory_security: true,
+            cipher_compatibility: 4,
         }
     }
 }
@@ -164,6 +166,13 @@ fn apply_cipher_pragmas(
     connection: &rusqlite::Connection,
     options: &SqliteStorageOptions,
 ) -> StorageResult<()> {
+    connection
+        .pragma_update(
+            None,
+            "cipher_compatibility",
+            i64::from(options.cipher_compatibility),
+        )
+        .storage()?;
     if options.cipher_memory_security {
         connection
             .execute_batch("PRAGMA cipher_memory_security = ON;")
@@ -225,7 +234,9 @@ mod tests {
 
     fn trace_sqlcipher_setup(sql: &str) {
         let sql = sql.to_ascii_lowercase();
-        let setup_step = if sql.contains("cipher_memory_security") {
+        let setup_step = if sql.contains("cipher_compatibility") {
+            Some("cipher_compatibility")
+        } else if sql.contains("cipher_memory_security") {
             Some("cipher_memory_security")
         } else if sql.contains("pragma key") || sql.contains("pragma \"key\"") {
             Some("key")
@@ -276,7 +287,7 @@ mod tests {
     }
 
     #[test]
-    fn encrypted_connection_enables_cipher_memory_security_before_keying() {
+    fn encrypted_connection_pins_cipher_pragmas_before_keying() {
         let _guard = TRACE_TEST_LOCK.lock().unwrap();
         TRACED_SQLCIPHER_SETUP.lock().unwrap().clear();
 
@@ -294,6 +305,10 @@ mod tests {
         .unwrap();
 
         let statements = TRACED_SQLCIPHER_SETUP.lock().unwrap().clone();
+        let cipher_compatibility = statements
+            .iter()
+            .position(|statement| *statement == "cipher_compatibility")
+            .expect("cipher_compatibility pragma was traced");
         let cipher_memory_security = statements
             .iter()
             .position(|statement| *statement == "cipher_memory_security")
@@ -307,6 +322,14 @@ mod tests {
             .position(|statement| *statement == "key_probe")
             .expect("keying probe was traced");
 
+        assert!(
+            cipher_compatibility < key,
+            "cipher_compatibility must be pinned before SQLCipher keying",
+        );
+        assert!(
+            cipher_compatibility < key_probe,
+            "cipher_compatibility must be pinned before the keying probe",
+        );
         assert!(
             cipher_memory_security < key,
             "cipher_memory_security must be enabled before SQLCipher keying",
@@ -327,6 +350,7 @@ mod tests {
             temp_store_memory: false,
             trusted_schema: true,
             cipher_memory_security: false,
+            cipher_compatibility: 4,
         })
         .unwrap();
         let conn = store.lock().unwrap();

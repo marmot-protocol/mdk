@@ -731,6 +731,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn welcome_peel_rejects_unsigned_gift_wrap_after_route_mapping() {
+        let receiver = receiver_keys();
+        let unsigned = NostrTransportEvent {
+            id: "33".repeat(32),
+            pubkey: "44".repeat(32),
+            created_at: 1_700_000_001,
+            kind: KIND_NIP59_GIFT_WRAP,
+            tags: vec![vec!["p".into(), receiver.public_key().to_hex()]],
+            content: "gift wrap body".into(),
+            sig: None,
+        }
+        .to_transport_message()
+        .expect("route mapping accepts unverified gift-wrap envelope");
+
+        let err = NostrMlsPeeler::new()
+            .with_welcome_signer(receiver)
+            .peel_welcome(&unsigned)
+            .await
+            .expect_err("peeling verifies the signed gift wrap");
+
+        assert!(matches!(err, PeelerError::Malformed(_)));
+    }
+
+    #[tokio::test]
     async fn welcome_peel_rejects_authentic_non_welcome_rumor() {
         let sender = sender_keys();
         let receiver = receiver_keys();

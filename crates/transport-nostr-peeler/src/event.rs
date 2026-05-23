@@ -50,7 +50,6 @@ impl NostrTransportEvent {
                 }
             }
             KIND_NIP59_GIFT_WRAP => {
-                self.to_verified_nostr_event()?;
                 let recipient = self
                     .tag_value(RECIPIENT_TAG)
                     .ok_or_else(|| NostrPeelerError::MissingTag(RECIPIENT_TAG.into()))?;
@@ -79,10 +78,20 @@ impl NostrTransportEvent {
 
     /// Convert a signed Nostr SDK event into the boundary DTO.
     pub fn from_nostr_event(event: &Event) -> Result<Self, NostrPeelerError> {
-        serde_json::from_value(serde_json::to_value(event).map_err(|e| {
-            NostrPeelerError::Malformed(format!("failed to serialize Nostr event: {e}"))
-        })?)
-        .map_err(|e| NostrPeelerError::Malformed(format!("failed to map Nostr event: {e}")))
+        Ok(Self {
+            id: event.id.to_hex(),
+            pubkey: event.pubkey.to_hex(),
+            created_at: event.created_at.as_secs(),
+            kind: u64::from(event.kind.as_u16()),
+            tags: event
+                .tags
+                .clone()
+                .into_iter()
+                .map(|tag| tag.to_vec())
+                .collect(),
+            content: event.content.clone(),
+            sig: Some(event.sig.to_string()),
+        })
     }
 
     /// Convert this DTO into a signed, verified Nostr SDK event.
@@ -250,7 +259,7 @@ mod tests {
     }
 
     #[test]
-    fn unsigned_kind_1059_event_is_rejected() {
+    fn kind_1059_route_mapping_defers_signature_verification_to_peeling() {
         let event = NostrTransportEvent {
             id: "33".repeat(32),
             pubkey: "44".repeat(32),
@@ -261,10 +270,15 @@ mod tests {
             sig: None,
         };
 
-        let err = event
+        let msg = event
             .to_transport_message()
-            .expect_err("unsigned gift wrap should not map");
+            .expect("route mapping should not verify gift-wrap signatures");
 
-        assert!(matches!(err, NostrPeelerError::Malformed(_)));
+        assert_eq!(
+            msg.envelope,
+            TransportEnvelope::Welcome {
+                recipient: MemberId::new(vec![0x55; 32]),
+            }
+        );
     }
 }

@@ -629,7 +629,7 @@ impl<S: StorageProvider> Engine<S> {
                             pre_commit_epoch,
                         )?;
 
-                        let new_epoch = EpochId(pre_commit_epoch.0 + 1);
+                        let new_epoch = EpochId(pre_commit_epoch.0.saturating_add(1));
                         let pending_ref = self.epoch_manager.next_pending_ref();
                         let staged = cgka_traits::engine_state::StagedCommitHandle::from_bytes(
                             group_id.as_slice().to_vec(),
@@ -1065,7 +1065,7 @@ impl<S: StorageProvider> Engine<S> {
         // The MLS group is still at the pre-commit epoch, so the projected
         // post-merge epoch is +1.
         let prior_epoch = EpochId(mls_group.epoch().as_u64());
-        let new_epoch = EpochId(prior_epoch.0 + 1);
+        let new_epoch = EpochId(prior_epoch.0.saturating_add(1));
         let pending_ref = self.epoch_manager.next_pending_ref();
         let staged =
             cgka_traits::engine_state::StagedCommitHandle::from_bytes(group_id.as_slice().to_vec());
@@ -1219,7 +1219,7 @@ impl<S: StorageProvider> Engine<S> {
         self.storage.put_group(&group_record)?;
 
         let prior_epoch = EpochId(mls_group.epoch().as_u64());
-        let new_epoch = EpochId(prior_epoch.0 + 1);
+        let new_epoch = EpochId(prior_epoch.0.saturating_add(1));
         let pending_ref = self.epoch_manager.next_pending_ref();
         let staged =
             cgka_traits::engine_state::StagedCommitHandle::from_bytes(group_id.as_slice().to_vec());

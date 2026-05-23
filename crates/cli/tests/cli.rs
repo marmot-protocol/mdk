@@ -1458,6 +1458,29 @@ fn whitenoise_parity_commands_have_real_or_explicit_contracts() {
     assert_eq!(settings["theme"], "dark");
     let settings = run_json(home.path(), &["settings", "language", "en"]);
     assert_eq!(settings["language"], "en");
+    #[cfg(unix)]
+    {
+        let dev_dir = home.path().join("dev");
+        let settings_path = dev_dir.join("settings.json");
+        assert_eq!(
+            dev_dir
+                .metadata()
+                .expect("settings dir metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            settings_path
+                .metadata()
+                .expect("settings file metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
 
     let health = run_json(home.path(), &["--account", &alice, "debug", "health"]);
     assert_eq!(health["healthy"], true);
@@ -3497,11 +3520,21 @@ fn daemon_socket_path_is_private() {
         .permissions()
         .mode()
         & 0o777;
+    let pid_mode = home
+        .path()
+        .join("dev")
+        .join("dmd.pid")
+        .metadata()
+        .expect("daemon pid metadata")
+        .permissions()
+        .mode()
+        & 0o777;
 
     stop_daemon(&socket, &mut child);
 
     assert_eq!(socket_dir_mode, 0o700);
     assert_eq!(socket_mode, 0o600);
+    assert_eq!(pid_mode, 0o600);
 }
 
 #[test]

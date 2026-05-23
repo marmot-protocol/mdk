@@ -191,7 +191,7 @@ impl<S: StorageProvider> Engine<S> {
             self.storage.put_group(&g)?;
         }
 
-        let new_epoch = EpochId(pre_commit_epoch.0 + 1);
+        let new_epoch = EpochId(pre_commit_epoch.0.saturating_add(1));
         let pending_ref = self.epoch_manager.next_pending_ref();
         let staged = StagedCommitHandle::from_bytes(group_id.as_slice().to_vec());
         self.epoch_manager.begin_pending(

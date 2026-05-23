@@ -106,8 +106,11 @@ const SQLCIPHER_KEY_LEN: usize = 32;
 const KEY_PACKAGE_DIR: &str = "key-packages";
 const SDK_FIRST_SYNC_WAIT: Duration = Duration::from_millis(750);
 const SDK_DRAIN_WAIT: Duration = Duration::from_millis(250);
-const APP_RUNTIME_ACCOUNT_READY_WAIT: Duration = Duration::from_secs(3);
+const APP_RUNTIME_ACCOUNT_READY_WAIT: Duration = Duration::from_secs(15);
 const APP_RUNTIME_RELAY_REBUILD_LOOKBACK: Duration = Duration::from_secs(120);
+const ACCOUNT_WORKER_RECONNECT_BASE_DELAY: Duration = Duration::from_secs(2);
+const ACCOUNT_WORKER_RECONNECT_MAX_DELAY: Duration = Duration::from_secs(60);
+const ACCOUNT_WORKER_RECONNECT_JITTER_MAX_MS: u64 = 500;
 const APP_RUNTIME_SUBSCRIPTION_BUFFER: usize = 1024;
 const AGENT_STREAM_START_LOOKBACK_LIMIT: usize = 200;
 const USER_DIRECTORY_SEARCH_MAX_VISITED: usize = 8192;
@@ -4240,6 +4243,7 @@ async fn run_app_runtime_account_worker(
         }
     }
     let _ = ready.send(Ok(()));
+    let mut reconnect_backoff = AccountWorkerReconnectBackoff::default();
 
     loop {
         tokio::select! {
@@ -4451,6 +4455,7 @@ async fn run_app_runtime_account_worker(
             result = client.next_event() => {
                 match result {
                     Ok(summary) => {
+                        reconnect_backoff.reset();
                         publish_app_runtime_summary(&events, &account_id_hex, &account_label, &summary);
                     }
                     Err(err) => {
@@ -4460,7 +4465,7 @@ async fn run_app_runtime_account_worker(
                             &account_label,
                             format!("runtime receive failed: {err}"),
                         );
-                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        tokio::time::sleep(reconnect_backoff.next_delay()).await;
                         match app.runtime_client(&account_label, &relay_plane).await {
                             Ok(reopened) => {
                                 client = reopened;
@@ -4472,7 +4477,7 @@ async fn run_app_runtime_account_worker(
                                     &account_label,
                                     format!("runtime restart failed: {setup_err}"),
                                 );
-                                tokio::time::sleep(Duration::from_secs(2)).await;
+                                tokio::time::sleep(reconnect_backoff.next_delay()).await;
                             }
                         }
                     }
@@ -4480,6 +4485,52 @@ async fn run_app_runtime_account_worker(
             }
         }
     }
+}
+
+#[derive(Debug, Clone)]
+struct AccountWorkerReconnectBackoff {
+    base: Duration,
+    max: Duration,
+    next: Duration,
+}
+
+impl Default for AccountWorkerReconnectBackoff {
+    fn default() -> Self {
+        Self::new(
+            ACCOUNT_WORKER_RECONNECT_BASE_DELAY,
+            ACCOUNT_WORKER_RECONNECT_MAX_DELAY,
+        )
+    }
+}
+
+impl AccountWorkerReconnectBackoff {
+    fn new(base: Duration, max: Duration) -> Self {
+        let base = std::cmp::min(base, max);
+        Self {
+            base,
+            max,
+            next: base,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.next = self.base;
+    }
+
+    fn next_delay(&mut self) -> Duration {
+        self.next_delay_with_jitter(account_worker_reconnect_jitter())
+    }
+
+    fn next_delay_with_jitter(&mut self, jitter: Duration) -> Duration {
+        let delay = std::cmp::min(self.next.saturating_add(jitter), self.max);
+        self.next = std::cmp::min(self.next.saturating_mul(2), self.max);
+        delay
+    }
+}
+
+fn account_worker_reconnect_jitter() -> Duration {
+    let jitter_ms = OsRng.next_u64() % (ACCOUNT_WORKER_RECONNECT_JITTER_MAX_MS + 1);
+    Duration::from_millis(jitter_ms)
 }
 
 fn publish_app_runtime_summary(
@@ -7244,6 +7295,34 @@ mod tests {
 
         assert!(source.contains("tokio::task::spawn_blocking(move ||"));
         assert!(source.contains("worker_runtime.block_on(run_app_runtime_account_worker"));
+    }
+
+    #[test]
+    fn account_worker_reconnect_backoff_doubles_caps_and_resets() {
+        let mut backoff =
+            AccountWorkerReconnectBackoff::new(Duration::from_secs(2), Duration::from_secs(8));
+
+        assert_eq!(
+            backoff.next_delay_with_jitter(Duration::ZERO),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            backoff.next_delay_with_jitter(Duration::ZERO),
+            Duration::from_secs(4)
+        );
+        assert_eq!(
+            backoff.next_delay_with_jitter(Duration::ZERO),
+            Duration::from_secs(8)
+        );
+        assert_eq!(
+            backoff.next_delay_with_jitter(Duration::from_secs(100)),
+            Duration::from_secs(8)
+        );
+        backoff.reset();
+        assert_eq!(
+            backoff.next_delay_with_jitter(Duration::ZERO),
+            Duration::from_secs(2)
+        );
     }
 
     #[test]
