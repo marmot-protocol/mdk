@@ -105,6 +105,8 @@ const APP_RUNTIME_ACCOUNT_READY_WAIT: Duration = Duration::from_secs(3);
 const APP_RUNTIME_RELAY_REBUILD_LOOKBACK: Duration = Duration::from_secs(120);
 const APP_RUNTIME_SUBSCRIPTION_BUFFER: usize = 1024;
 const AGENT_STREAM_START_LOOKBACK_LIMIT: usize = 200;
+const USER_DIRECTORY_SEARCH_MAX_VISITED: usize = 8192;
+const USER_DIRECTORY_SEARCH_MAX_FRONTIER: usize = 4096;
 /// Value of the `stream-type` tag on an agent text stream start event.
 const STREAM_TYPE_TEXT: &str = "text";
 /// Value of the `route` tag on a brokered QUIC agent text stream start event.
@@ -3106,12 +3108,8 @@ impl MarmotApp {
         account_id_hex: &str,
     ) -> Result<Option<UserDirectoryRecord>, AppError> {
         let account_id_hex = parse_account_id_hex(account_id_hex)?;
-        for cache in self.directory_caches()? {
-            if let Some(entry) = cache.entry(&account_id_hex)? {
-                return Ok(Some(entry));
-            }
-        }
-        Ok(None)
+        let caches = self.directory_caches()?;
+        Self::directory_entry_from_caches(&caches, &account_id_hex)
     }
 
     pub async fn refresh_user_directory_for_account_id(
@@ -3216,30 +3214,19 @@ impl MarmotApp {
         search: UserDirectorySearch,
     ) -> Result<Vec<UserDirectorySearchResult>, AppError> {
         search.validate()?;
-        let records = self.directory_entries()?;
-        let records_by_id = records
-            .into_iter()
-            .map(|record| (record.account_id_hex.clone(), record))
-            .collect::<HashMap<_, _>>();
-        let radii = directory_search_radii(
-            &records_by_id,
-            &search.searcher_account_id_hex,
-            search.radius_end,
-        );
+        let records =
+            self.directory_search_records(&search.searcher_account_id_hex, search.radius_end)?;
         let query = search.query.trim().to_lowercase();
         if query.is_empty() {
             return Ok(Vec::new());
         }
 
         let mut results = Vec::new();
-        for (account_id_hex, radius) in radii {
+        for (record, radius) in records {
             if radius < search.radius_start || radius > search.radius_end {
                 continue;
             }
-            let Some(record) = records_by_id.get(&account_id_hex) else {
-                continue;
-            };
-            let Some(search_match) = user_record_match(record, &query) else {
+            let Some(search_match) = user_record_match(&record, &query) else {
                 continue;
             };
             results.push(UserDirectorySearchResult {
@@ -3650,6 +3637,63 @@ impl MarmotApp {
             }
         }
         Ok(entries_by_id.into_values().collect())
+    }
+
+    fn directory_search_records(
+        &self,
+        searcher_account_id_hex: &str,
+        radius_end: u8,
+    ) -> Result<Vec<(UserDirectoryRecord, u8)>, AppError> {
+        let mut records = Vec::new();
+        let mut seen = HashSet::new();
+        let mut frontier = vec![parse_account_id_hex(searcher_account_id_hex)?];
+        let caches = self.directory_caches()?;
+
+        for radius in 0..=radius_end {
+            let mut next = Vec::new();
+            frontier.sort();
+            frontier.dedup();
+
+            for account_id in frontier {
+                if seen.len() >= USER_DIRECTORY_SEARCH_MAX_VISITED {
+                    return Ok(records);
+                }
+                if !seen.insert(account_id.clone()) {
+                    continue;
+                }
+
+                let Some(record) = Self::directory_entry_from_caches(&caches, &account_id)? else {
+                    continue;
+                };
+                if radius < radius_end {
+                    for follow in &record.follows {
+                        if next.len() >= USER_DIRECTORY_SEARCH_MAX_FRONTIER {
+                            break;
+                        }
+                        if !seen.contains(follow) {
+                            next.push(follow.clone());
+                        }
+                    }
+                }
+                records.push((record, radius));
+            }
+
+            frontier = next;
+        }
+
+        Ok(records)
+    }
+
+    fn directory_entry_from_caches(
+        caches: &[DirectoryCache],
+        account_id_hex: &str,
+    ) -> Result<Option<UserDirectoryRecord>, AppError> {
+        for cache in caches {
+            if let Some(entry) = cache.entry(account_id_hex)? {
+                return Ok(Some(entry));
+            }
+        }
+        Ok(None)
     }
 
     fn profiles_by_id(&self) -> Result<HashMap<String, String>, AppError> {
@@ -6067,32 +6111,6 @@ fn source_relays_from_record(record: &RelayEventRecord) -> Vec<String> {
     relays
 }
 
-fn directory_search_radii(
-    records: &HashMap<String, UserDirectoryRecord>,
-    searcher_account_id_hex: &str,
-    radius_end: u8,
-) -> Vec<(String, u8)> {
-    let mut result = Vec::new();
-    let mut seen = HashSet::new();
-    let mut frontier = vec![searcher_account_id_hex.to_owned()];
-    for radius in 0..=radius_end {
-        let mut next = Vec::new();
-        frontier.sort();
-        frontier.dedup();
-        for account_id in frontier {
-            if !seen.insert(account_id.clone()) {
-                continue;
-            }
-            result.push((account_id.clone(), radius));
-            if let Some(record) = records.get(&account_id) {
-                next.extend(record.follows.iter().cloned());
-            }
-        }
-        frontier = next;
-    }
-    result
-}
-
 #[derive(Clone, Debug)]
 struct UserRecordMatch {
     field: String,
@@ -6813,6 +6831,67 @@ mod tests {
                 KIND_MARMOT_KEY_PACKAGE_RELAY_LIST
             ]
         );
+    }
+
+    #[test]
+    fn directory_search_bounds_frontier_from_cached_follow_lists() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = AccountHome::open(dir.path());
+        let account = home.create_account("alice").unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+        let cache = app.directory_cache_for_account(&account).unwrap();
+        let follows = (0..USER_DIRECTORY_SEARCH_MAX_FRONTIER + 8)
+            .map(|idx| format!("{:064x}", idx + 1))
+            .collect::<Vec<_>>();
+
+        cache
+            .put(&UserDirectoryRecord {
+                account_id_hex: account.account_id_hex.clone(),
+                npub: npub_for_account_id_lossy(&account.account_id_hex),
+                local_account: None,
+                profile: None,
+                follows: follows.clone(),
+                follow_source_relays: Vec::new(),
+                relay_lists: AccountRelayListStatus::empty(),
+                key_package: None,
+            })
+            .unwrap();
+
+        for follow in follows {
+            cache
+                .put(&UserDirectoryRecord {
+                    account_id_hex: follow.clone(),
+                    npub: npub_for_account_id_lossy(&follow),
+                    local_account: None,
+                    profile: Some(UserProfileMetadata {
+                        name: Some("needle".into()),
+                        display_name: None,
+                        about: None,
+                        picture: None,
+                        nip05: None,
+                        lud16: None,
+                        created_at: 0,
+                        source_relays: Vec::new(),
+                    }),
+                    follows: Vec::new(),
+                    follow_source_relays: Vec::new(),
+                    relay_lists: AccountRelayListStatus::empty(),
+                    key_package: None,
+                })
+                .unwrap();
+        }
+
+        let results = app
+            .search_user_directory(UserDirectorySearch {
+                searcher_account_id_hex: account.account_id_hex,
+                query: "needle".into(),
+                radius_start: 1,
+                radius_end: 1,
+                limit: None,
+            })
+            .unwrap();
+
+        assert_eq!(results.len(), USER_DIRECTORY_SEARCH_MAX_FRONTIER);
     }
 
     #[test]
