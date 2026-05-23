@@ -24,6 +24,9 @@ const FOCUS_ACCENT: Color = Color::Green;
 const ACCOUNT_ACCENT: Color = Color::White;
 const DEFAULT_STREAM_CANDIDATE: &str = crate::DEFAULT_PRODUCTION_QUIC_BROKER_CANDIDATE;
 const SLASH_SUGGESTION_LIMIT: usize = 8;
+const TUI_MESSAGE_SCROLLBACK_LIMIT: usize = 1_000;
+const TUI_LIVE_STREAM_PREVIEW_LIMIT: usize = 128;
+const TUI_LIVE_STREAM_TEXT_LIMIT: usize = 64 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 enum TuiError {
@@ -684,15 +687,22 @@ impl TuiApp {
         let result = (|| -> TuiResult<()> {
             let _ = self.refresh_daemon_status();
             self.refresh_accounts()?;
+            let mut dirty = true;
             while self.running {
-                self.tick();
-                terminal.draw(|frame| self.render(frame))?;
+                dirty |= self.tick();
+                if dirty {
+                    terminal.draw(|frame| self.render(frame))?;
+                    dirty = false;
+                }
                 if event::poll(UI_EVENT_WAIT)? {
                     match event::read()? {
                         Event::Key(key) if key.kind == KeyEventKind::Press => {
                             self.handle_key(key)?;
+                            dirty = true;
                         }
-                        _ => {}
+                        _ => {
+                            dirty = true;
+                        }
                     }
                 }
             }
@@ -702,14 +712,20 @@ impl TuiApp {
         result
     }
 
-    fn tick(&mut self) {
+    fn tick(&mut self) -> bool {
         let now = Instant::now();
-        self.drain_chat_subscription();
-        self.drain_group_state_subscription();
-        self.drain_message_subscription();
-        if let Err(err) = self.flush_stream_append_if_due(now) {
-            self.status = format!("stream append failed: {err}");
+        let mut changed = false;
+        changed |= self.drain_chat_subscription();
+        changed |= self.drain_group_state_subscription();
+        changed |= self.drain_message_subscription();
+        match self.flush_stream_append_if_due(now) {
+            Ok(flushed) => changed |= flushed,
+            Err(err) => {
+                self.status = format!("stream append failed: {err}");
+                changed = true;
+            }
         }
+        changed
     }
 
     fn render(&mut self, frame: &mut Frame) {
@@ -1247,7 +1263,7 @@ impl TuiApp {
                     received_at: now,
                 },
             );
-            sort_messages_chronologically(&mut self.messages);
+            sort_and_cap_messages(&mut self.messages);
         } else {
             self.refresh_messages()?;
         }
@@ -1324,16 +1340,17 @@ impl TuiApp {
         );
     }
 
-    fn flush_stream_append_if_due(&mut self, now: Instant) -> TuiResult<()> {
+    fn flush_stream_append_if_due(&mut self, now: Instant) -> TuiResult<bool> {
         let Some(streaming) = self.streaming.as_ref() else {
-            return Ok(());
+            return Ok(false);
         };
         if streaming.pending_text.is_empty()
             || now.duration_since(streaming.last_flush) < STREAM_APPEND_FLUSH_INTERVAL
         {
-            return Ok(());
+            return Ok(false);
         }
-        self.flush_stream_append()
+        self.flush_stream_append()?;
+        Ok(true)
     }
 
     fn flush_stream_append(&mut self) -> TuiResult<()> {
@@ -1882,7 +1899,7 @@ impl TuiApp {
         self.messages_group_id = Some(group_id.clone());
         self.messages_scroll = 0;
         self.unread_counts.remove(&group_id);
-        sort_messages_chronologically(&mut self.messages);
+        sort_and_cap_messages(&mut self.messages);
         if let Err(err) = self.ensure_message_subscription(&account_id) {
             self.status = format!("message subscription failed: {err}");
             return Ok(());
@@ -2063,9 +2080,9 @@ impl TuiApp {
         }
     }
 
-    fn drain_chat_subscription(&mut self) {
+    fn drain_chat_subscription(&mut self) -> bool {
         let Some(subscription) = self.chat_subscription.as_ref() else {
-            return;
+            return false;
         };
         let mut events = Vec::new();
         loop {
@@ -2077,6 +2094,9 @@ impl TuiApp {
                     break;
                 }
             }
+        }
+        if events.is_empty() {
+            return false;
         }
         let previous_group_id = self.selected_chat_row().map(|chat| chat.group_id.clone());
         let mut chats_changed = false;
@@ -2114,12 +2134,13 @@ impl TuiApp {
             self.ensure_selected_message_subscription();
             self.ensure_selected_group_state_subscription();
         }
+        true
     }
 
-    fn drain_group_state_subscription(&mut self) {
+    fn drain_group_state_subscription(&mut self) -> bool {
         let Some((group_id, events)) = ({
             let Some(subscription) = self.group_state_subscription.as_ref() else {
-                return;
+                return false;
             };
             let mut events = Vec::new();
             loop {
@@ -2138,7 +2159,7 @@ impl TuiApp {
                 Some((subscription.group_id.clone(), events))
             }
         }) else {
-            return;
+            return false;
         };
 
         for event in events {
@@ -2167,11 +2188,12 @@ impl TuiApp {
                 }
             }
         }
+        true
     }
 
-    fn drain_message_subscription(&mut self) {
+    fn drain_message_subscription(&mut self) -> bool {
         let Some(subscription) = self.message_subscription.as_ref() else {
-            return;
+            return false;
         };
         let mut events = Vec::new();
         loop {
@@ -2183,6 +2205,9 @@ impl TuiApp {
                     break;
                 }
             }
+        }
+        if events.is_empty() {
+            return false;
         }
         for event in events {
             match event {
@@ -2208,6 +2233,7 @@ impl TuiApp {
                 }
             }
         }
+        true
     }
 
     fn select_current_account(&mut self) -> TuiResult<()> {
@@ -2793,6 +2819,19 @@ fn sort_messages_chronologically(messages: &mut [MessageRow]) {
     });
 }
 
+fn sort_and_cap_messages(messages: &mut Vec<MessageRow>) {
+    sort_messages_chronologically(messages);
+    cap_message_scrollback(messages);
+}
+
+fn cap_message_scrollback(messages: &mut Vec<MessageRow>) {
+    if messages.len() <= TUI_MESSAGE_SCROLLBACK_LIMIT {
+        return;
+    }
+    let excess = messages.len() - TUI_MESSAGE_SCROLLBACK_LIMIT;
+    messages.drain(0..excess);
+}
+
 fn agent_text_stream_summary(value: &Value) -> Option<String> {
     let stream_id = value_string(value, "stream_id")
         .map(|stream_id| shorten(&stream_id, 18))
@@ -3136,7 +3175,7 @@ fn apply_subscription_result(
             }
             let message = parse_message(message_value)?;
             upsert_message(messages, message);
-            sort_messages_chronologically(messages);
+            sort_and_cap_messages(messages);
             Some(format!("live update: messages={}", messages.len()))
         }
         Some("agent_stream_start") => {
@@ -3223,10 +3262,11 @@ fn append_live_stream_delta(
         }
         preview.status = "streaming".to_owned();
         preview.text.push_str(&text);
+        cap_live_stream_text(&mut preview.text);
         preview.error = None;
         return;
     }
-    live_previews.push(LiveStreamPreview {
+    let mut preview = LiveStreamPreview {
         group_id,
         stream_id,
         author: "stream".to_owned(),
@@ -3234,14 +3274,18 @@ fn append_live_stream_delta(
         text,
         error: None,
         optimistic: false,
-    });
+    };
+    cap_live_stream_preview(&mut preview);
+    live_previews.push(preview);
+    cap_live_stream_previews(live_previews);
 }
 
 fn upsert_live_stream_preview(
     live_previews: &mut Vec<LiveStreamPreview>,
-    preview: LiveStreamPreview,
+    mut preview: LiveStreamPreview,
     replace_text: bool,
 ) {
+    cap_live_stream_preview(&mut preview);
     if let Some(existing) = live_previews.iter_mut().find(|existing| {
         existing.group_id == preview.group_id && existing.stream_id == preview.stream_id
     }) {
@@ -3257,9 +3301,34 @@ fn upsert_live_stream_preview(
         if replace_text || existing.text.is_empty() {
             existing.text = preview.text;
         }
+        cap_live_stream_preview(existing);
         return;
     }
     live_previews.push(preview);
+    cap_live_stream_previews(live_previews);
+}
+
+fn cap_live_stream_previews(live_previews: &mut Vec<LiveStreamPreview>) {
+    if live_previews.len() <= TUI_LIVE_STREAM_PREVIEW_LIMIT {
+        return;
+    }
+    let excess = live_previews.len() - TUI_LIVE_STREAM_PREVIEW_LIMIT;
+    live_previews.drain(0..excess);
+}
+
+fn cap_live_stream_preview(preview: &mut LiveStreamPreview) {
+    cap_live_stream_text(&mut preview.text);
+}
+
+fn cap_live_stream_text(text: &mut String) {
+    if text.len() <= TUI_LIVE_STREAM_TEXT_LIMIT {
+        return;
+    }
+    let mut start = text.len() - TUI_LIVE_STREAM_TEXT_LIMIT;
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    text.drain(..start);
 }
 
 fn remove_live_stream_preview(
@@ -4425,6 +4494,92 @@ mod tests {
                 .map(|span| span.content.as_ref())
                 .collect::<String>();
         assert_eq!(rendered_preview, "stream: hello stream");
+    }
+
+    #[test]
+    fn subscription_messages_keep_bounded_scrollback() {
+        let mut messages = Vec::new();
+        let mut previews = Vec::new();
+
+        for index in 0..(TUI_MESSAGE_SCROLLBACK_LIMIT + 5) {
+            let message_id = format!("{index:04}");
+            apply_subscription_result(
+                &mut messages,
+                &mut previews,
+                &serde_json::json!({
+                    "type": "message",
+                    "message": {
+                        "message_id": message_id,
+                        "direction": "received",
+                        "from": "alice",
+                        "plaintext": "hello",
+                        "recorded_at": index,
+                        "received_at": index
+                    }
+                }),
+                false,
+            );
+        }
+
+        assert_eq!(messages.len(), TUI_MESSAGE_SCROLLBACK_LIMIT);
+        assert_eq!(
+            messages.first().map(|message| message.message_id.as_str()),
+            Some("0005")
+        );
+        assert_eq!(
+            messages.last().map(|message| message.message_id.as_str()),
+            Some("1004")
+        );
+    }
+
+    #[test]
+    fn stream_previews_keep_bounded_rows_and_tail_text() {
+        let group_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let long_text = format!("{}\u{00e9}", "a".repeat(TUI_LIVE_STREAM_TEXT_LIMIT));
+        let mut previews = Vec::new();
+
+        append_live_stream_delta(
+            &mut previews,
+            group_id.to_owned(),
+            "stream-long".to_owned(),
+            long_text,
+        );
+
+        assert!(previews[0].text.len() <= TUI_LIVE_STREAM_TEXT_LIMIT);
+        assert!(previews[0].text.ends_with('\u{00e9}'));
+
+        let mut previews = Vec::new();
+        for index in 0..(TUI_LIVE_STREAM_PREVIEW_LIMIT + 2) {
+            upsert_live_stream_preview(
+                &mut previews,
+                LiveStreamPreview {
+                    group_id: group_id.to_owned(),
+                    stream_id: format!("stream-{index}"),
+                    author: "stream".to_owned(),
+                    status: "streaming".to_owned(),
+                    text: "partial".to_owned(),
+                    error: None,
+                    optimistic: false,
+                },
+                true,
+            );
+        }
+
+        assert_eq!(previews.len(), TUI_LIVE_STREAM_PREVIEW_LIMIT);
+        assert_eq!(
+            previews.first().map(|preview| preview.stream_id.as_str()),
+            Some("stream-2")
+        );
+    }
+
+    #[test]
+    fn idle_tick_does_not_request_redraw() {
+        let mut app = test_tui_app(
+            test_unused_client(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        );
+
+        assert!(!app.tick());
     }
 
     #[test]
