@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use cgka_traits::TransportEndpoint;
 use cgka_traits::app_event::{
     MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_DELETE, MARMOT_APP_EVENT_KIND_REACTION,
@@ -42,6 +44,16 @@ fn assert_two_word_pseudonym(value: &str) {
             "word should be title-cased ASCII: {word}"
         );
     }
+}
+
+fn sqlite_file_requires_key_for_test(path: &Path) -> bool {
+    rusqlite::Connection::open(path)
+        .and_then(|conn| {
+            conn.query_row("SELECT count(*) FROM sqlite_master", [], |row| {
+                row.get::<_, i64>(0)
+            })
+        })
+        .is_err()
 }
 
 #[tokio::test]
@@ -992,7 +1004,10 @@ async fn directory_cache_is_durable_app_state_not_json_user_files() {
 
     assert_eq!(cached.account_id_hex, account_id);
     assert!(cached.relay_lists.complete);
-    assert!(dir.path().join("app-cache.sqlite3").exists());
+    let cache_path = home.account_dir("alice").join("app-cache.sqlite3");
+    assert!(cache_path.exists());
+    assert!(sqlite_file_requires_key_for_test(&cache_path));
+    assert!(!dir.path().join("app-cache.sqlite3").exists());
     assert!(!dir.path().join("directory/users").exists());
 }
 

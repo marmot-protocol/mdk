@@ -11,11 +11,13 @@ pub(crate) struct DirectoryCache {
 }
 
 impl DirectoryCache {
-    pub(crate) fn open(path: PathBuf) -> Result<Self, AppError> {
+    pub(crate) fn open(path: PathBuf, key_material: &str) -> Result<Self, AppError> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
         let conn = Connection::open(path)?;
+        conn.pragma_update(None, "key", key_material)?;
+        let _: i64 = conn.query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get(0))?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS user_directory_records (
                 account_id_hex TEXT PRIMARY KEY NOT NULL,
@@ -24,6 +26,15 @@ impl DirectoryCache {
             );",
         )?;
         Ok(Self { conn })
+    }
+
+    pub(crate) fn open_legacy_plaintext(path: PathBuf) -> Result<Option<Self>, AppError> {
+        if !path.exists() {
+            return Ok(None);
+        }
+        let conn = Connection::open(path)?;
+        let _: i64 = conn.query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get(0))?;
+        Ok(Some(Self { conn }))
     }
 
     pub(crate) fn entry(

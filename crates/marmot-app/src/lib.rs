@@ -4,7 +4,7 @@
 //! early app surfaces: encrypted session storage, Nostr MLS peeling, Nostr
 //! transport publishing, and relay-backed app projections.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -3105,7 +3105,13 @@ impl MarmotApp {
         &self,
         account_id_hex: &str,
     ) -> Result<Option<UserDirectoryRecord>, AppError> {
-        self.directory_cache()?.entry(account_id_hex)
+        let account_id_hex = parse_account_id_hex(account_id_hex)?;
+        for cache in self.directory_caches()? {
+            if let Some(entry) = cache.entry(&account_id_hex)? {
+                return Ok(Some(entry));
+            }
+        }
+        Ok(None)
     }
 
     pub async fn refresh_user_directory_for_account_id(
@@ -3635,7 +3641,15 @@ impl MarmotApp {
     }
 
     fn directory_entries(&self) -> Result<Vec<UserDirectoryRecord>, AppError> {
-        self.directory_cache()?.entries()
+        let mut entries_by_id = BTreeMap::new();
+        for cache in self.directory_caches()? {
+            for entry in cache.entries()? {
+                entries_by_id
+                    .entry(entry.account_id_hex.clone())
+                    .or_insert(entry);
+            }
+        }
+        Ok(entries_by_id.into_values().collect())
     }
 
     fn profiles_by_id(&self) -> Result<HashMap<String, String>, AppError> {
@@ -3780,7 +3794,7 @@ impl MarmotApp {
 
     fn projection_status(&self, label: &str) -> AppProjectionStatus {
         let account_path = self.account_projection_path(label);
-        let shared_path = self.root.join(APP_CACHE_DB_FILE);
+        let shared_path = self.directory_cache_path(label);
         AppProjectionStatus {
             account: AppDatabaseStatus {
                 path: account_path.display().to_string(),
@@ -3790,7 +3804,7 @@ impl MarmotApp {
             shared: AppDatabaseStatus {
                 path: shared_path.display().to_string(),
                 exists: shared_path.exists(),
-                encrypted: false,
+                encrypted: sqlite_file_requires_key(&shared_path),
             },
         }
     }
@@ -3875,11 +3889,68 @@ impl MarmotApp {
 
     fn save_directory_entry(&self, entry: &UserDirectoryRecord) -> Result<(), AppError> {
         let entry = self.hydrate_directory_record(entry.clone())?;
-        self.directory_cache()?.put(&entry)
+        for cache in self.directory_caches()? {
+            cache.put(&entry)?;
+        }
+        Ok(())
     }
 
-    fn directory_cache(&self) -> Result<DirectoryCache, AppError> {
-        DirectoryCache::open(self.root.join(APP_CACHE_DB_FILE))
+    fn directory_cache_path(&self, label: &str) -> PathBuf {
+        self.account_dir(label).join(APP_CACHE_DB_FILE)
+    }
+
+    fn legacy_directory_cache_path(&self) -> PathBuf {
+        self.root.join(APP_CACHE_DB_FILE)
+    }
+
+    fn directory_cache_for_account(
+        &self,
+        account: &AccountSummary,
+    ) -> Result<DirectoryCache, AppError> {
+        let keys = self.account_home().load_signing_keys(&account.label)?;
+        DirectoryCache::open(
+            self.directory_cache_path(&account.label),
+            &self.directory_cache_key_material(&account.label, &keys),
+        )
+    }
+
+    fn directory_caches(&self) -> Result<Vec<DirectoryCache>, AppError> {
+        let accounts = self
+            .account_home()
+            .accounts()?
+            .into_iter()
+            .filter(|account| account.local_signing)
+            .collect::<Vec<_>>();
+        let legacy_path = self.legacy_directory_cache_path();
+        let legacy_entries = DirectoryCache::open_legacy_plaintext(legacy_path.clone())?
+            .map(|cache| cache.entries())
+            .transpose()?;
+
+        let mut caches = Vec::with_capacity(accounts.len());
+        for account in accounts {
+            let cache = self.directory_cache_for_account(&account)?;
+            if let Some(entries) = &legacy_entries {
+                for entry in entries {
+                    cache.put(&self.hydrate_directory_record(entry.clone())?)?;
+                }
+            }
+            caches.push(cache);
+        }
+
+        if legacy_entries.is_some() {
+            remove_sqlite_file_set(&legacy_path)?;
+        }
+
+        Ok(caches)
+    }
+
+    fn directory_cache_key_material(&self, label: &str, keys: &nostr::Keys) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(b"marmot-app-directory-cache-sqlcipher-key-v1");
+        hasher.update(label.as_bytes());
+        hasher.update(keys.public_key().to_bytes());
+        hasher.update(keys.secret_key().to_secret_bytes());
+        hex::encode(hasher.finalize())
     }
 
     fn empty_directory_record(&self, account_id_hex: &str) -> UserDirectoryRecord {
@@ -6163,6 +6234,21 @@ fn sqlite_file_requires_key(path: &Path) -> bool {
             })
         })
         .is_err()
+}
+
+fn remove_sqlite_file_set(path: &Path) -> Result<(), AppError> {
+    for candidate in [
+        path.to_path_buf(),
+        PathBuf::from(format!("{}-wal", path.display())),
+        PathBuf::from(format!("{}-shm", path.display())),
+    ] {
+        match fs::remove_file(candidate) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err.into()),
+        }
+    }
+    Ok(())
 }
 
 fn relays_from_relay_list_event(event: &NostrTransportEvent) -> Vec<String> {
