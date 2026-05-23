@@ -143,14 +143,10 @@ impl TransportPeeler for NostrMlsPeeler {
                 },
             )
             .map_err(|_| PeelerError::DecryptFailed)?;
-        let sender = decode_hex_exact("event pubkey", &event.pubkey, 32)
-            .ok()
-            .map(MemberId::new);
-
         Ok(PeeledMessage {
             id: msg.id.clone(),
             group_id: transport_group_id(msg),
-            sender,
+            sender: None,
             content: PeeledContent::MlsMessage { bytes: plaintext },
             origin: msg.clone(),
         })
@@ -452,6 +448,7 @@ mod tests {
             .expect("peel succeeds");
 
         assert_eq!(peeled.id, wrapped.id);
+        assert_eq!(peeled.sender, None);
         assert_eq!(
             peeled.content,
             PeeledContent::MlsMessage {
