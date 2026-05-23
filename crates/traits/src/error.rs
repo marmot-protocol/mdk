@@ -9,19 +9,19 @@ use crate::types::{EpochId, GroupId, MemberId};
 /// Errors returned by every [`crate::engine::CgkaEngine`] method.
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
-    #[error("unknown group: {0}")]
+    #[error("unknown group")]
     UnknownGroup(GroupId),
 
     #[error("unknown pending send reference")]
     UnknownPending,
 
-    #[error("local identity is not a member of group {group_id}")]
+    #[error("local identity is not a member of the group")]
     NotAMember { group_id: GroupId },
 
-    #[error("local identity is not an admin of group {group_id}")]
+    #[error("local identity is not an admin of the group")]
     NotGroupAdmin { group_id: GroupId },
 
-    #[error("member {member} is not in group {group_id}")]
+    #[error("member is not in the group")]
     UnknownMember { group_id: GroupId, member: MemberId },
 
     /// A credential identity is not a valid Marmot account identity. Per
@@ -34,13 +34,13 @@ pub enum EngineError {
     InvalidCredentialIdentity(String),
 
     /// Admins must leave the admin set before using SelfRemove.
-    #[error("admin cannot self-remove from group {group_id}: leave the admin set first")]
+    #[error("admin cannot self-remove: leave the admin set first")]
     AdminCannotSelfRemove { group_id: GroupId },
 
     /// MIP-03 §150 — a commit that would result in zero admins is rejected
     /// before construction. Used when an inbound SelfRemove from the only
     /// admin would deplete admins on commit.
-    #[error("commit would deplete admins on group {group_id}")]
+    #[error("commit would deplete group admins")]
     AdminDepletion { group_id: GroupId },
 
     /// Invitee KeyPackage is missing a capability required by the group.
@@ -66,9 +66,7 @@ pub enum EngineError {
     /// Epoch fork detected that the current recovery manager could not
     /// resolve, usually because no pre-commit snapshot was available.
     /// Recoverable same-epoch commit races roll back and replay internally.
-    #[error(
-        "forked epoch on group {group_id}: last stable {last_stable}, conflicting {conflicting_epoch}"
-    )]
+    #[error("forked epoch: last stable {last_stable}, conflicting {conflicting_epoch}")]
     ForkedEpoch {
         group_id: GroupId,
         last_stable: EpochId,

@@ -81,7 +81,7 @@ pub enum AccountHomeError {
     SecretStoreUnavailable(String),
     #[error("account secret store operation failed: {0}")]
     SecretStore(String),
-    #[error("account secret was not found for account id: {0}")]
+    #[error("account secret was not found")]
     SecretNotFound(String),
     #[error("account secret store service name cannot be empty")]
     EmptySecretStoreService,

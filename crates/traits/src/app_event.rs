@@ -51,9 +51,9 @@ pub struct MarmotAppEvent {
 pub enum MarmotAppEventError {
     #[error("marmot app event JSON: {0}")]
     Json(String),
-    #[error("marmot app event id mismatch: expected {expected}, found {found}")]
+    #[error("marmot app event id mismatch")]
     IdMismatch { expected: String, found: String },
-    #[error("marmot app event pubkey mismatch: expected {expected}, found {found}")]
+    #[error("marmot app event pubkey mismatch")]
     PubkeyMismatch { expected: String, found: String },
 }
 

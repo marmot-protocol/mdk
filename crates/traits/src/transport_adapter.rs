@@ -228,7 +228,7 @@ pub struct TransportDelivery {
 /// Errors returned by transport adapters.
 #[derive(Debug, thiserror::Error)]
 pub enum TransportAdapterError {
-    #[error("account not active: {0}")]
+    #[error("account not active")]
     AccountNotActive(MemberId),
 
     #[error("publish target does not match message envelope: envelope={envelope}, target={target}")]

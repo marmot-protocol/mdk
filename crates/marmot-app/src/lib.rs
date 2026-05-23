@@ -1914,10 +1914,9 @@ impl AccountManager {
             .get(&account.account_id_hex)
             .map(|worker| worker.commands.clone())
             .ok_or_else(|| {
-                AppError::RelayDirectory(format!(
-                    "managed account worker is not running for {}",
-                    account.account_id_hex
-                ))
+                AppError::RelayDirectory(
+                    "managed account worker is not running for local signing account".into(),
+                )
             })
     }
 
@@ -2131,7 +2130,7 @@ impl AccountManager {
         match self.app.account_home().remove_account(account) {
             Ok(()) => Err(source),
             Err(rollback) => Err(AppError::RelayDirectory(format!(
-                "failed to roll back account {account} after setup failure: {source}; rollback error: {rollback}"
+                "failed to roll back account after setup failure: {source}; rollback error: {rollback}"
             ))),
         }
     }
@@ -2695,9 +2694,9 @@ pub enum AppError {
     Sqlite(#[from] rusqlite::Error),
     #[error(transparent)]
     Hex(#[from] hex::FromHexError),
-    #[error("no published key package for account: {0}")]
+    #[error("no published key package for account")]
     MissingKeyPackage(String),
-    #[error("unknown local group: {0}")]
+    #[error("unknown local group")]
     UnknownGroup(String),
     #[error("no agent text stream start found for this group")]
     AgentStreamMissingStart,
@@ -2721,7 +2720,7 @@ pub enum AppError {
     InvalidPublicKey,
     #[error("invalid Marmot KeyPackage event: {0}")]
     InvalidKeyPackageEvent(String),
-    #[error("no directory entry for account: {0}")]
+    #[error("no directory entry for account")]
     MissingDirectoryEntry(String),
     #[error("invalid user directory search: {0}")]
     InvalidDirectorySearch(String),
@@ -7251,5 +7250,22 @@ mod tests {
         );
 
         assert_eq!(ours, theirs.to_hex());
+    }
+
+    #[test]
+    fn app_error_display_does_not_expose_group_or_account_ids() {
+        let group_id = "aa".repeat(32);
+        let account_id = "bb".repeat(32);
+        let errors = [
+            AppError::UnknownGroup(group_id.clone()).to_string(),
+            AppError::MissingKeyPackage(account_id.clone()).to_string(),
+            AppError::MissingDirectoryEntry(account_id.clone()).to_string(),
+            AppError::AccountHome(AccountHomeError::SecretNotFound(account_id.clone())).to_string(),
+        ];
+
+        for error in errors {
+            assert!(!error.contains(&group_id), "{error}");
+            assert!(!error.contains(&account_id), "{error}");
+        }
     }
 }
