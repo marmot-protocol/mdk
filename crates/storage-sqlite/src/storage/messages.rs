@@ -45,10 +45,20 @@ impl MessageStorage for SqliteStorage {
     }
 
     fn update_message_state(&self, id: &MessageId, new_state: MessageState) -> StorageResult<()> {
-        let mut record = self.get_message(id)?;
+        let mut conn = self.lock()?;
+        let tx = conn.transaction().storage()?;
+        let record_bytes: Vec<u8> = tx
+            .query_row(
+                "SELECT record FROM cgka_messages WHERE id = ?1",
+                params![id.as_slice()],
+                |row| row.get(0),
+            )
+            .optional()
+            .storage()?
+            .ok_or(StorageError::NotFound)?;
+        let mut record: MessageRecord = deserialize(&record_bytes)?;
         record.state = new_state;
-        let changed = self
-            .lock()?
+        let changed = tx
             .execute(
                 "UPDATE cgka_messages SET state = ?1, record = ?2 WHERE id = ?3",
                 params![
@@ -61,6 +71,7 @@ impl MessageStorage for SqliteStorage {
         if changed == 0 {
             return Err(StorageError::NotFound);
         }
+        tx.commit().storage()?;
         Ok(())
     }
 
@@ -138,6 +149,18 @@ mod tests {
             store.get_message(&message.id).unwrap().state,
             MessageState::PeelDeferred
         );
+    }
+
+    #[test]
+    fn update_message_state_keeps_read_modify_write_in_one_transaction() {
+        let source = include_str!("messages.rs");
+        let body = source
+            .split("fn update_message_state")
+            .nth(1)
+            .expect("update_message_state body");
+
+        assert!(body.contains("transaction()"));
+        assert!(!body.contains("self.get_message(id)"));
     }
 
     #[test]

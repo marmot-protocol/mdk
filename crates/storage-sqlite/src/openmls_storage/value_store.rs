@@ -58,9 +58,35 @@ impl SqliteOpenMlsStorage {
         group_key: Option<Vec<u8>>,
         value: &T,
     ) -> Result<(), SqliteOpenMlsStorageError> {
-        let mut list: Vec<Vec<u8>> = self.read_raw_list(label, &key)?.unwrap_or_default();
+        let storage_key = build_key(label, key);
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let mut list: Vec<Vec<u8>> = tx
+            .query_row(
+                "SELECT value FROM openmls_values
+                 WHERE provider_version = ?1 AND storage_key = ?2",
+                params![CURRENT_VERSION, storage_key],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()?
+            .map(|value| serde_json::from_slice(&value))
+            .transpose()?
+            .unwrap_or_default();
         list.push(serde_json::to_vec(value)?);
-        self.write_value(label, key, group_key, serde_json::to_vec(&list)?)
+        tx.execute(
+            "INSERT OR REPLACE INTO openmls_values
+                (provider_version, label, storage_key, group_key, value)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                CURRENT_VERSION,
+                label,
+                storage_key,
+                group_key.as_deref(),
+                serde_json::to_vec(&list)?
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     pub(in crate::openmls_storage) fn remove_entity<T: Entity<CURRENT_VERSION>>(
@@ -71,11 +97,37 @@ impl SqliteOpenMlsStorage {
         value: &T,
     ) -> Result<(), SqliteOpenMlsStorageError> {
         let encoded = serde_json::to_vec(value)?;
-        let mut list: Vec<Vec<u8>> = self.read_raw_list(label, &key)?.unwrap_or_default();
+        let storage_key = build_key(label, key);
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let mut list: Vec<Vec<u8>> = tx
+            .query_row(
+                "SELECT value FROM openmls_values
+                 WHERE provider_version = ?1 AND storage_key = ?2",
+                params![CURRENT_VERSION, storage_key],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()?
+            .map(|value| serde_json::from_slice(&value))
+            .transpose()?
+            .unwrap_or_default();
         if let Some(pos) = list.iter().position(|stored| stored == &encoded) {
             list.remove(pos);
         }
-        self.write_value(label, key, group_key, serde_json::to_vec(&list)?)
+        tx.execute(
+            "INSERT OR REPLACE INTO openmls_values
+                (provider_version, label, storage_key, group_key, value)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                CURRENT_VERSION,
+                label,
+                storage_key,
+                group_key.as_deref(),
+                serde_json::to_vec(&list)?
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     fn read_raw_list(
@@ -186,5 +238,28 @@ impl SqliteOpenMlsStorage {
             )?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn list_mutations_keep_read_modify_write_under_one_transaction() {
+        let source = include_str!("value_store.rs");
+        for function in ["append_entity", "remove_entity"] {
+            let body = source
+                .split(&format!("fn {function}"))
+                .nth(1)
+                .expect("function body");
+            let body = body
+                .split("pub(in crate::openmls_storage) fn")
+                .next()
+                .unwrap_or(body);
+            let body = body.split("\n    fn ").next().unwrap_or(body);
+
+            assert!(body.contains("transaction()"), "{function}");
+            assert!(!body.contains("read_raw_list"), "{function}");
+            assert!(!body.contains("self.write_value"), "{function}");
+        }
     }
 }
