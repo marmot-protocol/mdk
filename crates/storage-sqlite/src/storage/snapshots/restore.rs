@@ -41,8 +41,11 @@ pub(super) fn rollback(store: &SqliteStorage, group_id: &GroupId, name: &str) ->
 
 fn group(tx: &rusqlite::Transaction<'_>, group_id: &GroupId, group: &Group) -> StorageResult<()> {
     tx.execute(
-        "INSERT OR REPLACE INTO cgka_groups (id, epoch, record)
-             VALUES (?1, ?2, ?3)",
+        "INSERT INTO cgka_groups (id, epoch, record)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(id) DO UPDATE SET
+                epoch = excluded.epoch,
+                record = excluded.record",
         params![
             group_id.as_slice(),
             epoch_to_i64(group.epoch)?,

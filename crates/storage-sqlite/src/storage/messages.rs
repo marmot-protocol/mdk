@@ -119,14 +119,15 @@ impl MessageStorage for SqliteStorage {
 #[cfg(test)]
 mod tests {
     use crate::SqliteStorage;
-    use crate::storage::test_support::{gid, mid, sample_message};
+    use crate::storage::test_support::{gid, mid, sample_group, sample_message};
     use cgka_traits::message::MessageState;
-    use cgka_traits::storage::MessageStorage;
+    use cgka_traits::storage::{GroupStorage, MessageStorage};
     use cgka_traits::types::EpochId;
 
     #[test]
     fn message_state_transitions() {
         let store = SqliteStorage::in_memory().unwrap();
+        store.put_group(&sample_group(gid(1), 0, 0)).unwrap();
         let message = sample_message(mid(1), gid(1), 0);
         store.put_message(&message).unwrap();
         assert_eq!(
@@ -166,6 +167,8 @@ mod tests {
     #[test]
     fn list_messages_filters_by_group_epoch_and_insert_order() {
         let store = SqliteStorage::in_memory().unwrap();
+        store.put_group(&sample_group(gid(1), 0, 0)).unwrap();
+        store.put_group(&sample_group(gid(2), 0, 0)).unwrap();
         store
             .put_message(&sample_message(mid(3), gid(1), 0))
             .unwrap();

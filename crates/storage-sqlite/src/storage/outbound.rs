@@ -64,12 +64,14 @@ impl OutboundIntentStorage for SqliteStorage {
 #[cfg(test)]
 mod tests {
     use crate::SqliteStorage;
-    use crate::storage::test_support::{gid, mid, sample_queued_intent};
-    use cgka_traits::storage::OutboundIntentStorage;
+    use crate::storage::test_support::{gid, mid, sample_group, sample_queued_intent};
+    use cgka_traits::storage::{GroupStorage, OutboundIntentStorage};
 
     #[test]
     fn queued_outbound_intents_are_group_scoped_and_ordered() {
         let store = SqliteStorage::in_memory().unwrap();
+        store.put_group(&sample_group(gid(1), 0, 0)).unwrap();
+        store.put_group(&sample_group(gid(2), 0, 0)).unwrap();
         store
             .put_queued_outbound_intent(&sample_queued_intent(mid(3), gid(1)))
             .unwrap();

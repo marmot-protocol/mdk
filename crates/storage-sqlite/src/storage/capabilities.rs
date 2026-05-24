@@ -132,11 +132,13 @@ impl CapabilityStorage for SqliteStorage {
 mod tests {
     use super::*;
     use crate::SqliteStorage;
-    use crate::storage::test_support::{gid, member_id};
+    use crate::storage::test_support::{gid, member_id, sample_group};
+    use cgka_traits::storage::GroupStorage;
 
     #[test]
     fn feature_registry_and_member_capabilities_roundtrip() {
         let store = SqliteStorage::in_memory().unwrap();
+        store.put_group(&sample_group(gid(1), 0, 1)).unwrap();
         let feature = Feature("self-remove");
         let requirement = CapabilityRequirement {
             requires: Capability::Proposal(10),

@@ -9,8 +9,11 @@ impl GroupStorage for SqliteStorage {
     fn put_group(&self, group: &Group) -> StorageResult<()> {
         self.lock()?
             .execute(
-                "INSERT OR REPLACE INTO cgka_groups (id, epoch, record)
-                 VALUES (?1, ?2, ?3)",
+                "INSERT INTO cgka_groups (id, epoch, record)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(id) DO UPDATE SET
+                    epoch = excluded.epoch,
+                    record = excluded.record",
                 params![
                     group.id.as_slice(),
                     epoch_to_i64(group.epoch)?,
@@ -48,31 +51,6 @@ impl GroupStorage for SqliteStorage {
         if deleted == 0 {
             return Err(StorageError::NotFound);
         }
-        tx.execute(
-            "DELETE FROM cgka_messages WHERE group_id = ?1",
-            params![id.as_slice()],
-        )
-        .storage()?;
-        tx.execute(
-            "DELETE FROM cgka_queued_outbound WHERE group_id = ?1",
-            params![id.as_slice()],
-        )
-        .storage()?;
-        tx.execute(
-            "DELETE FROM cgka_member_capabilities WHERE group_id = ?1",
-            params![id.as_slice()],
-        )
-        .storage()?;
-        tx.execute(
-            "DELETE FROM cgka_convergence_policies WHERE group_id = ?1",
-            params![id.as_slice()],
-        )
-        .storage()?;
-        tx.execute(
-            "DELETE FROM cgka_group_snapshots WHERE group_id = ?1",
-            params![id.as_slice()],
-        )
-        .storage()?;
         tx.execute(
             "DELETE FROM openmls_values WHERE provider_version = ?1 AND group_key = ?2",
             params![openmls_traits::storage::CURRENT_VERSION, mls_group_key],
@@ -114,6 +92,43 @@ mod tests {
         let group = sample_group(gid(1), 7, 3);
         store.put_group(&group).unwrap();
         assert_eq!(store.get_group(&group.id).unwrap(), group);
+    }
+
+    #[test]
+    fn group_update_preserves_foreign_key_owned_rows() {
+        let store = SqliteStorage::in_memory().unwrap();
+        let group = sample_group(gid(1), 0, 1);
+        store.put_group(&group).unwrap();
+        store
+            .put_message(&sample_message(mid(1), group.id.clone(), 0))
+            .unwrap();
+        store
+            .put_queued_outbound_intent(&sample_queued_intent(mid(2), group.id.clone()))
+            .unwrap();
+        store
+            .save_member_capabilities(&group.id, &group.members[0], GroupCapabilities::default())
+            .unwrap();
+        store.put_convergence_policy(&group.id, b"policy").unwrap();
+        store.create_group_snapshot(&group.id, "anchor").unwrap();
+
+        store.put_group(&sample_group(gid(1), 1, 1)).unwrap();
+
+        assert_eq!(store.list_messages(&group.id, EpochId(0)).unwrap().len(), 1);
+        assert_eq!(
+            store.list_queued_outbound_intents(&group.id).unwrap().len(),
+            1
+        );
+        assert!(
+            store
+                .member_capabilities(&group.id, &group.members[0].id)
+                .unwrap()
+                .is_some()
+        );
+        assert!(store.convergence_policy(&group.id).unwrap().is_some());
+        assert_eq!(
+            store.list_group_snapshots(&group.id).unwrap(),
+            vec!["anchor".to_owned()]
+        );
     }
 
     #[test]
