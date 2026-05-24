@@ -23,7 +23,7 @@ use cgka_engine::{
 };
 use cgka_session::{AccountDeviceSession, SessionConfig};
 use cgka_traits::agent_text_stream::{
-    AGENT_TEXT_STREAM_MAX_STREAM_ID_LEN, AGENT_TEXT_STREAM_QUIC_FANOUT_FEATURE,
+    AGENT_TEXT_STREAM_PROFILE_STREAM_ID_LEN, AGENT_TEXT_STREAM_QUIC_FANOUT_FEATURE,
     AGENT_TEXT_STREAM_QUIC_RECEIVE_FEATURE, AGENT_TEXT_STREAM_QUIC_SEND_FEATURE,
     AGENT_TEXT_STREAM_ROLE_FANOUT, AGENT_TEXT_STREAM_ROLE_RECEIVE, AGENT_TEXT_STREAM_ROLE_SEND,
     AgentTextStreamKeyContextV1, AgentTextStreamQuicPolicyV1,
@@ -408,7 +408,6 @@ pub struct MediaReference {
     pub file_name: String,
     pub media_type: String,
     pub version: String,
-    pub size_bytes: u64,
 }
 
 impl MediaReference {
@@ -442,11 +441,6 @@ impl MediaReference {
                 "media type cannot be empty".into(),
             ));
         }
-        if self.size_bytes == 0 {
-            return Err(AppError::InvalidAppMessagePayload(
-                "media size must be greater than zero".into(),
-            ));
-        }
         if self.version != "mip04-v2" {
             return Err(AppError::InvalidAppMessagePayload(
                 "media version must be mip04-v2".into(),
@@ -465,7 +459,6 @@ impl MediaReference {
             format!("x {}", self.file_hash_hex),
             format!("n {}", self.nonce_hex),
             format!("v {}", self.version),
-            format!("size {}", self.size_bytes),
         ]
     }
 }
@@ -6247,10 +6240,11 @@ impl KeyPackagePublisher for AppKeyPackagePublisher {
             key_package_ref: metadata.key_package_ref_hex,
             mls_ciphersuite: "0x0001".into(),
             mls_extensions: vec![
-                "0xf2ee".into(),
+                "0x0006".into(),
                 format!("0x{ACCOUNT_IDENTITY_PROOF_EXTENSION_TYPE:04x}"),
+                "0x000a".into(),
             ],
-            mls_proposals: vec!["0x000a".into()],
+            mls_proposals: vec!["0x0008".into(), "0x000a".into()],
             app_components: self.app_components.clone(),
             publish_endpoints: publication.endpoints.clone(),
         };
@@ -7417,7 +7411,6 @@ async fn upload_encrypted_media(
         file_name,
         media_type,
         version: ENCRYPTED_MEDIA_VERSION.to_owned(),
-        size_bytes: request.plaintext.len() as u64,
     };
     reference.validate()?;
     Ok(MediaUploadResult {
@@ -7465,11 +7458,6 @@ async fn download_encrypted_media(
             },
         )
         .map_err(|_| AppError::InvalidEncryptedMedia("media decryption failed".into()))?;
-    if plaintext.len() as u64 != reference.size_bytes {
-        return Err(AppError::InvalidEncryptedMedia(
-            "media plaintext size does not match reference".into(),
-        ));
-    }
     let actual_plaintext_hash: [u8; 32] = Sha256::digest(&plaintext).into();
     if actual_plaintext_hash != plaintext_hash {
         return Err(AppError::InvalidEncryptedMedia(
@@ -7477,10 +7465,10 @@ async fn download_encrypted_media(
         ));
     }
     Ok(MediaDownloadResult {
+        size_bytes: plaintext.len() as u64,
         plaintext,
         file_name: reference.file_name,
         media_type,
-        size_bytes: reference.size_bytes,
     })
 }
 
@@ -7801,9 +7789,9 @@ fn build_inner_event(
             quic_candidates,
         } => {
             let stream_id_hex = hex::encode(stream_id);
-            if stream_id.is_empty() || stream_id.len() > AGENT_TEXT_STREAM_MAX_STREAM_ID_LEN {
+            if stream_id.len() != AGENT_TEXT_STREAM_PROFILE_STREAM_ID_LEN {
                 return Err(AppError::InvalidAppMessagePayload(
-                    "agent text stream id length is out of range".into(),
+                    "agent text stream id must be 32 bytes".into(),
                 ));
             }
             let brokers: Vec<&String> = quic_candidates
@@ -7834,11 +7822,9 @@ fn build_inner_event(
             ))
         }
         AppMessageIntent::StreamFinal { request } => {
-            if request.stream_id.is_empty()
-                || request.stream_id.len() > AGENT_TEXT_STREAM_MAX_STREAM_ID_LEN
-            {
+            if request.stream_id.len() != AGENT_TEXT_STREAM_PROFILE_STREAM_ID_LEN {
                 return Err(AppError::InvalidAppMessagePayload(
-                    "agent text stream id length is out of range".into(),
+                    "agent text stream id must be 32 bytes".into(),
                 ));
             }
             // spec/features/agent-text-streams-quic.md:310-318 — the stream-final
@@ -8413,7 +8399,6 @@ mod tests {
                 file_name: "a.png".to_owned(),
                 media_type: "image/png".to_owned(),
                 version: "mip04-v2".to_owned(),
-                size_bytes: 7,
             },
             caption: Some("cap".to_owned()),
         });
@@ -8430,7 +8415,7 @@ mod tests {
                 .any(|field| field == "url https://media.example/a.png")
         );
         assert!(imeta.iter().any(|field| field == "m image/png"));
-        assert!(imeta.iter().any(|field| field == "size 7"));
+        assert!(!imeta.iter().any(|field| field.starts_with("size ")));
         assert!(imeta.iter().any(|field| field == "filename a.png"));
         assert!(
             imeta

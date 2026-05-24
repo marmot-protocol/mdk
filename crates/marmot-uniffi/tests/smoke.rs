@@ -88,7 +88,6 @@ async fn media_binding_records_are_public_and_methods_validate_group_hex() {
         file_name: "note.txt".into(),
         media_type: "text/plain".into(),
         version: "mip04-v2".into(),
-        size_bytes: 4,
     };
     let request = MediaUploadRequestFfi {
         file_name: "note.txt".into(),

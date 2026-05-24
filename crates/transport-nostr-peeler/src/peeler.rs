@@ -118,6 +118,7 @@ impl TransportPeeler for NostrMlsPeeler {
                 event.kind
             )));
         }
+        event.to_verified_nostr_event().map_err(to_peeler_error)?;
         ensure_group_routing_matches(&event, msg)?;
 
         // spec/transports/nostr.md: content = base64(nonce || ciphertext).
@@ -367,8 +368,8 @@ fn ensure_group_routing_matches(
     msg: &TransportMessage,
 ) -> Result<(), PeelerError> {
     let event_group_id = event
-        .tag_value(GROUP_TAG)
-        .ok_or_else(|| PeelerError::Malformed("missing h tag".into()))
+        .single_tag_value(GROUP_TAG)
+        .map_err(to_peeler_error)
         .and_then(|h| decode_hex("group h tag", h).map_err(to_peeler_error))?;
     match &msg.envelope {
         TransportEnvelope::GroupMessage { transport_group_id }
@@ -485,6 +486,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn group_peel_rejects_unsigned_kind_445() {
+        let secret = vec![0x7a; NOSTR_GROUP_KEY_LEN];
+        let group_id = vec![0x99; 32];
+        let ctx = GroupContextSnapshot::new(
+            EpochId(9),
+            HashMap::from([(DEFAULT_EXPORTER_LABEL.to_string(), secret)]),
+            Some(group_id),
+        );
+        let peeler = NostrMlsPeeler::default();
+        let wrapped = peeler
+            .wrap_group_message(
+                &EncryptedPayload {
+                    ciphertext: b"inner mls bytes".to_vec(),
+                    aad: vec![],
+                },
+                &ctx,
+            )
+            .await
+            .expect("wrap succeeds");
+        let mut event = NostrTransportEvent::from_transport_message(&wrapped).unwrap();
+        event.sig = None;
+        let unsigned_msg = event.to_transport_message().unwrap();
+
+        assert!(matches!(
+            peeler.peel_group_message(&unsigned_msg, &ctx).await,
+            Err(PeelerError::Malformed(_))
+        ));
+    }
+
+    #[tokio::test]
     async fn group_wrap_rejects_non_empty_aad() {
         let ctx = GroupContextSnapshot::new(
             EpochId(9),
@@ -551,31 +582,17 @@ mod tests {
             Some(group_id.clone()),
         );
         let peeler = NostrMlsPeeler::default();
-        let wrapped = peeler
-            .wrap_group_message(
-                &EncryptedPayload {
-                    ciphertext: b"inner mls bytes".to_vec(),
-                    aad: vec![],
-                },
-                &ctx,
-            )
-            .await
-            .expect("wrap succeeds");
-        let base = NostrTransportEvent::from_transport_message(&wrapped).unwrap();
 
         // Not valid base64.
-        let mut bad = base.clone();
-        bad.content = "!!! not base64 !!!".into();
-        let bad_msg = bad.to_transport_message().unwrap();
+        let bad_msg = signed_group_transport_message(&group_id, "!!! not base64 !!!");
         assert!(matches!(
             peeler.peel_group_message(&bad_msg, &ctx).await,
             Err(PeelerError::Malformed(_))
         ));
 
         // Valid base64 but fewer than 28 decoded bytes.
-        let mut short = base;
-        short.content = BASE64_STANDARD.encode([0u8; 10]);
-        let short_msg = short.to_transport_message().unwrap();
+        let short_msg =
+            signed_group_transport_message(&group_id, &BASE64_STANDARD.encode([0u8; 10]));
         assert!(matches!(
             peeler.peel_group_message(&short_msg, &ctx).await,
             Err(PeelerError::Malformed(_))
@@ -903,6 +920,20 @@ mod tests {
             .await
             .unwrap();
         NostrTransportEvent::from_nostr_event(&gift_wrap)
+            .unwrap()
+            .to_transport_message()
+            .unwrap()
+    }
+
+    fn signed_group_transport_message(group_id: &[u8], content: &str) -> TransportMessage {
+        let signed = EventBuilder::new(Kind::Custom(KIND_MARMOT_GROUP_MESSAGE as u16), content)
+            .tags([Tag::custom(
+                nostr::TagKind::custom(GROUP_TAG),
+                [hex::encode(group_id)],
+            )])
+            .sign_with_keys(&Keys::generate())
+            .expect("sign kind-445");
+        NostrTransportEvent::from_nostr_event(&signed)
             .unwrap()
             .to_transport_message()
             .unwrap()

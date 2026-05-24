@@ -601,8 +601,8 @@ mod tests {
             key_package_slot_id: "slot-1".into(),
             key_package_ref: "bb".repeat(32),
             mls_ciphersuite: "0x0001".into(),
-            mls_extensions: vec!["0xf2ee".into()],
-            mls_proposals: vec!["0x000a".into()],
+            mls_extensions: vec!["0x0006".into(), "0xf2f1".into(), "0x000a".into()],
+            mls_proposals: vec!["0x0008".into(), "0x000a".into()],
             app_components: vec!["0x8001".into(), "0x8003".into(), "0x8004".into()],
             publish_endpoints: vec![TransportEndpoint("wss://kp.example".into())],
         }

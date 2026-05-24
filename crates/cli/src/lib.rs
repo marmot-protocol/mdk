@@ -4676,10 +4676,6 @@ fn media_records_json(messages: Vec<AppMessageRecord>) -> Vec<Value> {
                 "nonce_hex": imeta.get("n").cloned().unwrap_or_default(),
                 "version": imeta.get("v").cloned().unwrap_or_default(),
                 "media_type": imeta.get("m").cloned().unwrap_or_default(),
-                "size_bytes": imeta
-                    .get("size")
-                    .and_then(|size| size.parse::<u64>().ok())
-                    .unwrap_or_default(),
                 "caption": caption,
                 "recorded_at": message.recorded_at,
                 "received_at": message.received_at,
@@ -4696,7 +4692,6 @@ fn media_reference_json(reference: &MediaReference) -> Value {
         "nonce_hex": reference.nonce_hex,
         "version": reference.version,
         "media_type": reference.media_type,
-        "size_bytes": reference.size_bytes,
     })
 }
 
@@ -4728,10 +4723,6 @@ fn media_reference_from_imeta(imeta: HashMap<String, String>) -> Result<MediaRef
             .filter(|value| !value.trim().is_empty())
             .ok_or(DmError::InvalidMediaReference(key.to_owned()))
     };
-    let size_bytes = imeta
-        .get("size")
-        .and_then(|size| size.parse::<u64>().ok())
-        .unwrap_or_default();
     Ok(MediaReference {
         url: required("url")?,
         file_hash_hex: required("x")?,
@@ -4739,7 +4730,6 @@ fn media_reference_from_imeta(imeta: HashMap<String, String>) -> Result<MediaRef
         file_name: required("filename")?,
         media_type: required("m")?,
         version: required("v")?,
-        size_bytes,
     })
 }
 

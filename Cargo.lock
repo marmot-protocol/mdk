@@ -746,6 +746,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "thiserror 2.0.18",
+ "url",
  "zeroize",
 ]
 
@@ -4811,6 +4812,7 @@ version = "0.1.0"
 dependencies = [
  "cgka-traits",
  "chacha20poly1305",
+ "hkdf",
  "quinn",
  "rand 0.8.6",
  "rcgen",

@@ -13,6 +13,7 @@ thiserror.workspace = true
 serde = { workspace = true }
 serde_json.workspace = true
 hex.workspace = true
+url.workspace = true
 openmls_traits.workspace = true
 sha2.workspace = true
 zeroize.workspace = true

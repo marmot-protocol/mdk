@@ -42,9 +42,7 @@ impl NostrTransportEvent {
             .collect::<Result<Vec<_>, _>>()?;
         let envelope = match self.kind {
             KIND_MARMOT_GROUP_MESSAGE => {
-                let group_id = self
-                    .tag_value(GROUP_TAG)
-                    .ok_or_else(|| NostrPeelerError::MissingTag(GROUP_TAG.into()))?;
+                let group_id = self.single_tag_value(GROUP_TAG)?;
                 TransportEnvelope::GroupMessage {
                     transport_group_id: decode_hex("group h tag", group_id)?,
                 }
@@ -119,6 +117,28 @@ impl NostrTransportEvent {
             .find(|tag| tag.first().is_some_and(|tag_name| tag_name == name))
             .and_then(|tag| tag.get(1))
             .map(String::as_str)
+    }
+
+    /// Return every value for a Nostr tag name.
+    pub fn tag_values(&self, name: &str) -> Vec<&str> {
+        self.tags
+            .iter()
+            .filter(|tag| tag.first().is_some_and(|tag_name| tag_name == name))
+            .filter_map(|tag| tag.get(1))
+            .map(String::as_str)
+            .collect()
+    }
+
+    /// Return exactly one value for a Nostr tag name.
+    pub fn single_tag_value(&self, name: &str) -> Result<&str, NostrPeelerError> {
+        let values = self.tag_values(name);
+        match values.as_slice() {
+            [] => Err(NostrPeelerError::MissingTag(name.into())),
+            [value] => Ok(value),
+            _ => Err(NostrPeelerError::Malformed(format!(
+                "Nostr event must contain exactly one {name} tag"
+            ))),
+        }
     }
 
     /// Build an unsigned local Nostr DTO and precompute the event id for the

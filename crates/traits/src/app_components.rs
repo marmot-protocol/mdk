@@ -6,6 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
+use url::Url;
 
 /// MLS ComponentID.
 pub type AppComponentId = u16;
@@ -252,12 +253,30 @@ fn validate_nostr_routing(routing: &NostrRoutingV1) -> Result<(), String> {
         return Err("Nostr relay URLs must be sorted and unique".into());
     }
     for relay in &routing.relays {
-        if relay.is_empty() {
-            return Err("Nostr relay URL must not be empty".into());
-        }
-        if relay.len() > 512 {
-            return Err("Nostr relay URL exceeds 512 bytes".into());
-        }
+        validate_nostr_relay_url(relay)?;
+    }
+    Ok(())
+}
+
+fn validate_nostr_relay_url(relay: &str) -> Result<(), String> {
+    if relay.is_empty() {
+        return Err("Nostr relay URL must not be empty".into());
+    }
+    if relay.len() > 512 {
+        return Err("Nostr relay URL exceeds 512 bytes".into());
+    }
+    let url = Url::parse(relay).map_err(|e| format!("Nostr relay URL is invalid: {e}"))?;
+    if !matches!(url.scheme(), "wss" | "ws") {
+        return Err("Nostr relay URL scheme must be wss or ws".into());
+    }
+    if url.host().is_none() {
+        return Err("Nostr relay URL must include a host".into());
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("Nostr relay URL must not include credentials".into());
+    }
+    if url.fragment().is_some() {
+        return Err("Nostr relay URL must not include a fragment".into());
     }
     Ok(())
 }
@@ -356,5 +375,24 @@ mod tests {
             encode_nostr_routing_v1(&routing),
             Err("Nostr relay URLs must be sorted and unique".into())
         );
+    }
+
+    #[test]
+    fn nostr_routing_rejects_invalid_relay_urls() {
+        for relay in [
+            "https://relay.example",
+            "wss://user@relay.example",
+            "wss://relay.example#fragment",
+            "wss://",
+        ] {
+            let routing = NostrRoutingV1 {
+                nostr_group_id: [0x42; 32],
+                relays: vec![relay.to_owned()],
+            };
+            assert!(
+                encode_nostr_routing_v1(&routing).is_err(),
+                "{relay} should be rejected"
+            );
+        }
     }
 }

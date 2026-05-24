@@ -5,7 +5,8 @@ use std::time::Duration;
 
 use cgka_traits::agent_text_stream::{
     AGENT_TEXT_STREAM_DEFAULT_MAX_PLAINTEXT_BYTES, AGENT_TEXT_STREAM_DEFAULT_MAX_RECORDS,
-    AGENT_TEXT_STREAM_RECORD_TEXT_DELTA, AGENT_TEXT_STREAM_RECORD_VERSION,
+    AGENT_TEXT_STREAM_PROFILE_STREAM_ID_LEN, AGENT_TEXT_STREAM_RECORD_TEXT_DELTA,
+    AGENT_TEXT_STREAM_RECORD_VERSION, AGENT_TEXT_STREAM_START_EVENT_ID_LEN,
     AgentTextStreamKeyContextV1, AgentTextStreamRecordError, AgentTextStreamRecordV1,
     AgentTextStreamTranscriptV1,
 };
@@ -15,6 +16,7 @@ use cgka_traits::{
 };
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
+use hkdf::Hkdf;
 use quinn::crypto::rustls::QuicClientConfig;
 use quinn::{ClientConfig, Endpoint, ServerConfig};
 use rand::{RngCore, rngs::OsRng};
@@ -27,6 +29,7 @@ const LOCAL_BIND: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 
 const MAX_FRAME_SIZE: usize = AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN as usize + 1024;
 const SEND_CLOSE_WAIT: Duration = Duration::from_secs(5);
 const AEAD_TAG_LEN: usize = 16;
+const AGENT_TEXT_STREAM_COMPONENT_SECRET_LEN: usize = 32;
 
 pub struct QuicTextStreamReceiver {
     endpoint: Endpoint,
@@ -409,8 +412,8 @@ pub fn encrypt_record(
             record.plaintext_frame.len(),
         ));
     }
-    let key = derive_record_key(crypto);
-    let nonce = derive_record_nonce(crypto, record.seq);
+    let key = derive_record_key(crypto)?;
+    let nonce = derive_record_nonce(crypto, record.seq)?;
     let aad = record_aad(crypto, record);
     let cipher = ChaCha20Poly1305::new_from_slice(&key)
         .map_err(|_| QuicTextStreamError::Crypto("invalid record key".into()))?;
@@ -439,8 +442,8 @@ pub fn decrypt_record(
             "encrypted record frame is shorter than the AEAD tag".into(),
         ));
     }
-    let key = derive_record_key(crypto);
-    let nonce = derive_record_nonce(crypto, record.seq);
+    let key = derive_record_key(crypto)?;
+    let nonce = derive_record_nonce(crypto, record.seq)?;
     let aad = record_aad(crypto, record);
     let cipher = ChaCha20Poly1305::new_from_slice(&key)
         .map_err(|_| QuicTextStreamError::Crypto("invalid record key".into()))?;
@@ -463,9 +466,19 @@ fn validate_crypto_record_context(
     crypto: &AgentTextStreamCrypto,
     record: &AgentTextStreamRecordV1,
 ) -> Result<(), QuicTextStreamError> {
-    if crypto.component_secret.is_empty() {
+    if crypto.component_secret.as_slice().len() != AGENT_TEXT_STREAM_COMPONENT_SECRET_LEN {
         return Err(QuicTextStreamError::Crypto(
-            "missing agent text stream component secret".into(),
+            "agent text stream component secret must be 32 bytes".into(),
+        ));
+    }
+    if crypto.context.stream_id.len() != AGENT_TEXT_STREAM_PROFILE_STREAM_ID_LEN {
+        return Err(QuicTextStreamError::Crypto(
+            "agent text stream id must be 32 bytes".into(),
+        ));
+    }
+    if crypto.context.start_event_id.as_slice().len() != AGENT_TEXT_STREAM_START_EVENT_ID_LEN {
+        return Err(QuicTextStreamError::Crypto(
+            "agent text stream start event id must be 32 bytes".into(),
         ));
     }
     if crypto.context.stream_id != record.stream_id {
@@ -474,28 +487,35 @@ fn validate_crypto_record_context(
     Ok(())
 }
 
-fn derive_record_key(crypto: &AgentTextStreamCrypto) -> [u8; 32] {
+fn derive_record_key(crypto: &AgentTextStreamCrypto) -> Result<[u8; 32], QuicTextStreamError> {
     derive_bytes(crypto, b"record key")
 }
 
-fn derive_record_nonce(crypto: &AgentTextStreamCrypto, seq: u64) -> [u8; 12] {
-    let base = derive_bytes(crypto, b"record nonce");
-    let mut nonce = [0_u8; 12];
-    nonce.copy_from_slice(&base[..12]);
+fn derive_record_nonce(
+    crypto: &AgentTextStreamCrypto,
+    seq: u64,
+) -> Result<[u8; 12], QuicTextStreamError> {
+    let mut nonce = derive_bytes(crypto, b"record nonce")?;
     let seq = (seq as u128).to_be_bytes();
     for (byte, seq_byte) in nonce.iter_mut().zip(seq[4..].iter()) {
         *byte ^= *seq_byte;
     }
-    nonce
+    Ok(nonce)
 }
 
-fn derive_bytes(crypto: &AgentTextStreamCrypto, label: &[u8]) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(b"marmot agent text stream quic aead v1");
-    encode_hash_part(&mut hasher, crypto.component_secret.as_slice());
-    encode_hash_part(&mut hasher, label);
-    encode_hash_part(&mut hasher, &crypto.context.encode());
-    hasher.finalize().into()
+fn derive_bytes<const N: usize>(
+    crypto: &AgentTextStreamCrypto,
+    label: &[u8],
+) -> Result<[u8; N], QuicTextStreamError> {
+    let hkdf = Hkdf::<Sha256>::from_prk(crypto.component_secret.as_slice())
+        .map_err(|_| QuicTextStreamError::Crypto("invalid component secret".into()))?;
+    let mut info = Vec::with_capacity(label.len() + crypto.context.encode().len());
+    info.extend_from_slice(label);
+    info.extend_from_slice(&crypto.context.encode());
+    let mut out = [0_u8; N];
+    hkdf.expand(&info, &mut out)
+        .map_err(|_| QuicTextStreamError::Crypto("agent text stream HKDF expand failed".into()))?;
+    Ok(out)
 }
 
 fn record_aad(crypto: &AgentTextStreamCrypto, record: &AgentTextStreamRecordV1) -> Vec<u8> {
@@ -512,11 +532,6 @@ fn record_aad(crypto: &AgentTextStreamCrypto, record: &AgentTextStreamRecordV1) 
     out.push(record.record_type);
     out.push(record.flags);
     out
-}
-
-fn encode_hash_part(hasher: &mut Sha256, bytes: &[u8]) {
-    hasher.update((bytes.len() as u64).to_be_bytes());
-    hasher.update(bytes);
 }
 
 fn configure_server() -> Result<(ServerConfig, Vec<u8>), QuicTextStreamError> {
@@ -824,7 +839,7 @@ mod tests {
     #[test]
     fn crypto_debug_redacts_component_secret() {
         let crypto = AgentTextStreamCrypto::new(
-            SecretBytes::new(b"debug-visible stream secret".to_vec()),
+            SecretBytes::new(b"debug-visible stream secret!!!!!".to_vec()),
             AgentTextStreamKeyContextV1::new(
                 cgka_traits::GroupId::new(vec![0x01; 32]),
                 vec![0x42; 32],
@@ -836,8 +851,28 @@ mod tests {
 
         let rendered = format!("{crypto:?}");
 
-        assert!(!rendered.contains("debug-visible stream secret"));
+        assert!(!rendered.contains("debug-visible"));
         assert!(rendered.contains("redacted"));
+    }
+
+    #[test]
+    fn crypto_rejects_wrong_component_secret_length() {
+        let crypto = AgentTextStreamCrypto::new(
+            SecretBytes::new(vec![0x07; 31]),
+            AgentTextStreamKeyContextV1::new(
+                cgka_traits::GroupId::new(vec![0x01; 32]),
+                vec![0x42; 32],
+                cgka_traits::EpochId(3),
+                cgka_traits::MemberId::new(vec![0x02; 32]),
+                MessageId::new(vec![0x24; 32]),
+            ),
+        );
+        let record = AgentTextStreamRecordV1::text_delta(vec![0x42; 32], 1, b"hello".to_vec());
+
+        assert!(matches!(
+            encrypt_record(&crypto, &record),
+            Err(QuicTextStreamError::Crypto(_))
+        ));
     }
 
     #[tokio::test]

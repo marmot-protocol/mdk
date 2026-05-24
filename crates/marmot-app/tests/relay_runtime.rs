@@ -256,10 +256,15 @@ async fn publish_key_package_at(
             vec!["mls_ciphersuite".to_owned(), "0x0001".to_owned()],
             vec![
                 "mls_extensions".to_owned(),
-                "0xf2ee".to_owned(),
+                "0x0006".to_owned(),
                 format!("0x{ACCOUNT_IDENTITY_PROOF_EXTENSION_TYPE:04x}"),
+                "0x000a".to_owned(),
             ],
-            vec!["mls_proposals".to_owned(), "0x000a".to_owned()],
+            vec![
+                "mls_proposals".to_owned(),
+                "0x0008".to_owned(),
+                "0x000a".to_owned(),
+            ],
             vec!["app_components".to_owned(), "0x8006".to_owned()],
         ],
         BASE64_STANDARD.encode(key_package.bytes()),
@@ -1105,7 +1110,6 @@ async fn relay_app_runtime_projects_typed_reactions_and_deletes() {
             file_name: "diagram.png".to_owned(),
             media_type: "image/png".to_owned(),
             version: "mip04-v2".to_owned(),
-            size_bytes: 1234,
         },
         Some("launch diagram".to_owned()),
     )
@@ -1144,7 +1148,6 @@ async fn relay_app_runtime_projects_typed_reactions_and_deletes() {
                 file_name: "diagram.png".to_owned(),
                 media_type: "image/png".to_owned(),
                 version: "mip04-v2".to_owned(),
-                size_bytes: 1234,
             },
             None,
         )
@@ -1260,7 +1263,6 @@ async fn encrypted_media_upload_sends_ciphertext_and_download_decrypts_plaintext
     assert_eq!(upload.reference.file_name, "note.txt");
     assert_eq!(upload.reference.media_type, "text/plain");
     assert_eq!(upload.reference.version, "mip04-v2");
-    assert_eq!(upload.reference.size_bytes, plaintext.len() as u64);
     assert_eq!(
         upload.reference.file_hash_hex,
         hex::encode(Sha256::digest(&plaintext))

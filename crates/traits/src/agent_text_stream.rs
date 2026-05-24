@@ -39,6 +39,8 @@ pub const AGENT_TEXT_STREAM_RECORD_ABORT: u8 = 0x05;
 pub const AGENT_TEXT_STREAM_RECORD_FINAL_NOTICE: u8 = 0x06;
 pub const AGENT_TEXT_STREAM_RECORD_VERSION: u8 = 0x01;
 pub const AGENT_TEXT_STREAM_MAX_STREAM_ID_LEN: usize = 64;
+pub const AGENT_TEXT_STREAM_PROFILE_STREAM_ID_LEN: usize = 32;
+pub const AGENT_TEXT_STREAM_START_EVENT_ID_LEN: usize = 32;
 
 pub const AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN: u32 = 64 * 1024;
 pub const AGENT_TEXT_STREAM_DEFAULT_MAX_RECORDS: u64 = 4096;
@@ -382,7 +384,7 @@ impl AgentTextStreamTranscriptV1 {
 }
 
 fn push_len_prefixed(out: &mut Vec<u8>, bytes: &[u8]) {
-    out.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+    encode_quic_varint(bytes.len() as u64, out);
     out.extend_from_slice(bytes);
 }
 
@@ -522,13 +524,13 @@ mod tests {
     fn key_context_is_versioned_and_length_delimited() {
         let context = AgentTextStreamKeyContextV1::new(
             GroupId::new(vec![0x01, 0x02]),
-            vec![0x03, 0x04],
+            vec![0x03; AGENT_TEXT_STREAM_PROFILE_STREAM_ID_LEN],
             EpochId(9),
             MemberId::new(vec![0x05]),
-            MessageId::new(vec![0x06; 32]),
+            MessageId::new(vec![0x06; AGENT_TEXT_STREAM_START_EVENT_ID_LEN]),
         )
         .encode();
-        assert_eq!(&context[..10], &[0, 0, 0, 0, 0, 0, 0, 2, b'v', b'1']);
+        assert_eq!(&context[..3], &[2, b'v', b'1']);
         assert!(
             context
                 .windows(8)

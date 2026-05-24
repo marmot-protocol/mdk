@@ -49,7 +49,6 @@ pub struct MediaReferenceFfi {
     pub file_name: String,
     pub media_type: String,
     pub version: String,
-    pub size_bytes: u64,
 }
 
 impl From<MediaReference> for MediaReferenceFfi {
@@ -61,7 +60,6 @@ impl From<MediaReference> for MediaReferenceFfi {
             file_name: value.file_name,
             media_type: value.media_type,
             version: value.version,
-            size_bytes: value.size_bytes,
         }
     }
 }
@@ -75,7 +73,6 @@ impl From<MediaReferenceFfi> for MediaReference {
             file_name: value.file_name,
             media_type: value.media_type,
             version: value.version,
-            size_bytes: value.size_bytes,
         }
     }
 }
@@ -295,10 +292,6 @@ fn media_reference_from_tags(tags: &[Vec<String>]) -> Option<MediaReferenceFfi> 
         file_name: required("filename")?,
         media_type: required("m")?,
         version: required("v")?,
-        size_bytes: fields
-            .get("size")
-            .and_then(|size| size.parse::<u64>().ok())
-            .unwrap_or_default(),
     })
 }
 
