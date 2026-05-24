@@ -39,7 +39,7 @@ FRAMEWORK_NAME="MarmotKit"
 cd "$WORKSPACE_DIR"
 
 echo "==> Cleaning previous build artifacts"
-rm -rf "$BUILD_DIR" "$OUT_DIR"
+rm -rf "$BUILD_DIR" "$OUT_DIR/$FRAMEWORK_NAME.xcframework" "$OUT_DIR/$FRAMEWORK_NAME.swift"
 mkdir -p "$BUILD_DIR/headers" "$OUT_DIR"
 
 echo "==> Building host dylib (used for binding generation)"

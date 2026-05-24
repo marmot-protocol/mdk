@@ -263,7 +263,7 @@ impl<S: StorageProvider> Engine<S> {
         Ok(admins)
     }
 
-    pub(crate) fn safe_export_secret_with_epoch(
+    pub fn safe_export_secret_with_epoch(
         &mut self,
         group_id: &GroupId,
         component_id: AppComponentId,
@@ -308,6 +308,38 @@ impl<S: StorageProvider> Engine<S> {
                 EpochId(mls_group.epoch().as_u64()),
                 cgka_traits::SecretBytes::new(secret),
             ))
+        }
+    }
+
+    pub fn current_safe_export_epoch(
+        &self,
+        group_id: &GroupId,
+        component_id: AppComponentId,
+    ) -> Result<EpochId, EngineError> {
+        let provider = crate::provider::EngineOpenMlsProvider::<S>::new(
+            &self.crypto,
+            self.storage.mls_storage(),
+        );
+        let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
+        let mls_group = openmls::group::MlsGroup::load(
+            <crate::provider::EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(&provider),
+            &mls_gid,
+        )
+        .map_err(|e| EngineError::Backend(format!("load: {e:?}")))?
+        .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
+
+        let required_components =
+            crate::app_components::required_app_components_of_group(&mls_group)?;
+        if !required_components.contains(component_id) {
+            return Err(EngineError::Other(format!(
+                "group does not require app component {component_id:#06x}"
+            )));
+        }
+
+        if let Some(staged) = mls_group.pending_commit() {
+            Ok(EpochId(staged.group_context().epoch().as_u64()))
+        } else {
+            Ok(EpochId(mls_group.epoch().as_u64()))
         }
     }
 }
@@ -414,8 +446,8 @@ impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
         // the engine reports via `epoch()` / `EpochState`.
         let crypto =
             <EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::crypto(&provider);
-        let (epoch, secret) = if let Some(staged) = mls_group.pending_commit() {
-            let s = staged
+        let (epoch, group_secret, media_secret) = if let Some(staged) = mls_group.pending_commit() {
+            let group_secret = staged
                 .export_secret(
                     crypto,
                     crate::group_lifecycle::EXPORTER_LABEL,
@@ -423,9 +455,23 @@ impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
                     32,
                 )
                 .map_err(|e| EngineError::Backend(format!("staged export_secret: {e:?}")))?;
-            (staged.group_context().epoch().as_u64(), s)
+            let media_secret = staged
+                .export_secret(
+                    crypto,
+                    crate::group_lifecycle::EXPORTER_LABEL,
+                    crate::group_lifecycle::ENCRYPTED_MEDIA_EXPORTER_CONTEXT,
+                    32,
+                )
+                .map_err(|e| {
+                    EngineError::Backend(format!("staged encrypted media export_secret: {e:?}"))
+                })?;
+            (
+                staged.group_context().epoch().as_u64(),
+                group_secret,
+                media_secret,
+            )
         } else {
-            let s = mls_group
+            let group_secret = mls_group
                 .export_secret(
                     crypto,
                     crate::group_lifecycle::EXPORTER_LABEL,
@@ -433,12 +479,26 @@ impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
                     32,
                 )
                 .map_err(|e| EngineError::Backend(format!("export_secret: {e:?}")))?;
-            (mls_group.epoch().as_u64(), s)
+            let media_secret = mls_group
+                .export_secret(
+                    crypto,
+                    crate::group_lifecycle::EXPORTER_LABEL,
+                    crate::group_lifecycle::ENCRYPTED_MEDIA_EXPORTER_CONTEXT,
+                    32,
+                )
+                .map_err(|e| {
+                    EngineError::Backend(format!("encrypted media export_secret: {e:?}"))
+                })?;
+            (mls_group.epoch().as_u64(), group_secret, media_secret)
         };
         let mut map = std::collections::HashMap::new();
         map.insert(
             crate::group_lifecycle::EXPORTER_SNAPSHOT_KEY.to_string(),
-            cgka_traits::SecretBytes::new(secret),
+            cgka_traits::SecretBytes::new(group_secret),
+        );
+        map.insert(
+            crate::group_lifecycle::ENCRYPTED_MEDIA_EXPORTER_SNAPSHOT_KEY.to_string(),
+            cgka_traits::SecretBytes::new(media_secret),
         );
         Ok(Box::new(crate::group_context_view::GroupContextView::new(
             EpochId(epoch),

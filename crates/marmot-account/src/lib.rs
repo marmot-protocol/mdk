@@ -23,7 +23,7 @@ use cgka_traits::group::{Group, Member};
 use cgka_traits::ingest::IngestOutcome;
 use cgka_traits::transport::{TransportEnvelope, TransportMessage};
 use cgka_traits::{
-    GroupId, MemberId, Timestamp, TransportAccountActivation, TransportAdapter,
+    EpochId, GroupId, MemberId, Timestamp, TransportAccountActivation, TransportAdapter,
     TransportAdapterError, TransportDelivery, TransportEndpoint, TransportGroupSubscription,
     TransportGroupSync, TransportPublishReport, TransportPublishRequest, TransportPublishTarget,
 };
@@ -826,6 +826,35 @@ where
         component_id: AppComponentId,
     ) -> AccountResult<cgka_traits::SecretBytes> {
         Ok(self.session.safe_export_secret(group_id, component_id)?)
+    }
+
+    pub fn exporter_secret(
+        &self,
+        group_id: &GroupId,
+        label: &str,
+        length: usize,
+    ) -> AccountResult<cgka_traits::SecretBytes> {
+        Ok(self.session.exporter_secret(group_id, label, length)?)
+    }
+
+    pub fn safe_export_secret_with_epoch(
+        &mut self,
+        group_id: &GroupId,
+        component_id: AppComponentId,
+    ) -> AccountResult<(EpochId, cgka_traits::SecretBytes)> {
+        Ok(self
+            .session
+            .safe_export_secret_with_epoch(group_id, component_id)?)
+    }
+
+    pub fn current_safe_export_epoch(
+        &self,
+        group_id: &GroupId,
+        component_id: AppComponentId,
+    ) -> AccountResult<EpochId> {
+        Ok(self
+            .session
+            .current_safe_export_epoch(group_id, component_id)?)
     }
 
     pub async fn activate_transport(&self, since: Option<Timestamp>) -> AccountResult<()> {

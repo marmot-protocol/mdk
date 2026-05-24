@@ -230,6 +230,36 @@ impl AccountDeviceSession {
         self.engine.safe_export_secret(group_id, component_id)
     }
 
+    pub fn exporter_secret(
+        &self,
+        group_id: &GroupId,
+        label: &str,
+        length: usize,
+    ) -> Result<SecretBytes, EngineError> {
+        let context = self.engine.group_context(group_id)?;
+        context
+            .exporter_secret(label, length)
+            .ok_or_else(|| EngineError::Other(format!("missing exporter secret for label {label}")))
+    }
+
+    pub fn safe_export_secret_with_epoch(
+        &mut self,
+        group_id: &GroupId,
+        component_id: AppComponentId,
+    ) -> Result<(EpochId, SecretBytes), EngineError> {
+        self.engine
+            .safe_export_secret_with_epoch(group_id, component_id)
+    }
+
+    pub fn current_safe_export_epoch(
+        &self,
+        group_id: &GroupId,
+        component_id: AppComponentId,
+    ) -> Result<EpochId, EngineError> {
+        self.engine
+            .current_safe_export_epoch(group_id, component_id)
+    }
+
     pub async fn create_group(
         &mut self,
         req: CreateGroupRequest,

@@ -6,11 +6,14 @@
 //! (Rust → FFI). When the iOS side needs to round-trip data back into
 //! marmot-app we'll add the reverse direction explicitly.
 
+use std::collections::HashMap;
+
 use cgka_traits::GroupId;
 use marmot_app::{
     AccountRelayListState, AccountRelayListStatus, AppGroupAdminPolicyComponent,
     AppGroupMemberRecord, AppGroupMlsState, AppGroupNostrRoutingComponent,
-    AppGroupProfileComponent, AppGroupRecord, AppMessageRecord, MarmotAppEvent, ReceivedMessage,
+    AppGroupProfileComponent, AppGroupRecord, AppMessageRecord, MarmotAppEvent,
+    MediaDownloadResult, MediaReference, MediaUploadRequest, MediaUploadResult, ReceivedMessage,
     RelayPlaneHealth, RuntimeAgentStreamUpdate, RuntimeMessageReceived, RuntimeMessageUpdate,
     SendSummary, UserProfileMetadata,
 };
@@ -36,6 +39,118 @@ impl From<SendSummary> for SendSummaryFfi {
             message_ids: value.message_ids,
         }
     }
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct MediaReferenceFfi {
+    pub url: String,
+    pub file_hash_hex: String,
+    pub nonce_hex: String,
+    pub file_name: String,
+    pub media_type: String,
+    pub version: String,
+    pub size_bytes: u64,
+}
+
+impl From<MediaReference> for MediaReferenceFfi {
+    fn from(value: MediaReference) -> Self {
+        Self {
+            url: value.url,
+            file_hash_hex: value.file_hash_hex,
+            nonce_hex: value.nonce_hex,
+            file_name: value.file_name,
+            media_type: value.media_type,
+            version: value.version,
+            size_bytes: value.size_bytes,
+        }
+    }
+}
+
+impl From<MediaReferenceFfi> for MediaReference {
+    fn from(value: MediaReferenceFfi) -> Self {
+        Self {
+            url: value.url,
+            file_hash_hex: value.file_hash_hex,
+            nonce_hex: value.nonce_hex,
+            file_name: value.file_name,
+            media_type: value.media_type,
+            version: value.version,
+            size_bytes: value.size_bytes,
+        }
+    }
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct MediaUploadRequestFfi {
+    pub file_name: String,
+    pub media_type: String,
+    pub plaintext: Vec<u8>,
+    pub caption: Option<String>,
+    pub send: bool,
+    pub blossom_server: Option<String>,
+}
+
+impl From<MediaUploadRequestFfi> for MediaUploadRequest {
+    fn from(value: MediaUploadRequestFfi) -> Self {
+        Self {
+            file_name: value.file_name,
+            media_type: value.media_type,
+            plaintext: value.plaintext,
+            caption: value.caption,
+            send: value.send,
+            blossom_server: value.blossom_server,
+        }
+    }
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct MediaUploadResultFfi {
+    pub reference: MediaReferenceFfi,
+    pub encrypted_hash_hex: String,
+    pub encrypted_size_bytes: u64,
+    pub sent: Option<SendSummaryFfi>,
+}
+
+impl From<MediaUploadResult> for MediaUploadResultFfi {
+    fn from(value: MediaUploadResult) -> Self {
+        Self {
+            reference: value.reference.into(),
+            encrypted_hash_hex: value.encrypted_hash_hex,
+            encrypted_size_bytes: value.encrypted_size_bytes,
+            sent: value.sent.map(Into::into),
+        }
+    }
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct MediaDownloadResultFfi {
+    pub plaintext: Vec<u8>,
+    pub file_name: String,
+    pub media_type: String,
+    pub size_bytes: u64,
+}
+
+impl From<MediaDownloadResult> for MediaDownloadResultFfi {
+    fn from(value: MediaDownloadResult) -> Self {
+        Self {
+            plaintext: value.plaintext,
+            file_name: value.file_name,
+            media_type: value.media_type,
+            size_bytes: value.size_bytes,
+        }
+    }
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct MediaRecordFfi {
+    pub message_id_hex: String,
+    pub direction: String,
+    pub group_id_hex: String,
+    pub sender: String,
+    pub reference: MediaReferenceFfi,
+    pub caption: Option<String>,
+    pub recorded_at: u64,
+    pub received_at: u64,
 }
 
 #[derive(Clone, Debug, uniffi::Record)]
@@ -134,6 +249,57 @@ impl From<AppMessageRecord> for AppMessageRecordFfi {
             received_at: value.received_at,
         }
     }
+}
+
+pub(crate) fn media_records_ffi(messages: Vec<AppMessageRecord>) -> Vec<MediaRecordFfi> {
+    messages
+        .into_iter()
+        .filter_map(|message| {
+            let reference = media_reference_from_tags(&message.tags)?;
+            let caption = (!message.plaintext.is_empty()).then_some(message.plaintext);
+            Some(MediaRecordFfi {
+                message_id_hex: message.message_id_hex,
+                direction: message.direction,
+                group_id_hex: message.group_id_hex,
+                sender: message.sender,
+                reference,
+                caption,
+                recorded_at: message.recorded_at,
+                received_at: message.received_at,
+            })
+        })
+        .collect()
+}
+
+fn media_reference_from_tags(tags: &[Vec<String>]) -> Option<MediaReferenceFfi> {
+    let fields = tags
+        .iter()
+        .find(|tag| tag.first().map(String::as_str) == Some("imeta"))
+        .map(|tag| {
+            tag.iter()
+                .skip(1)
+                .filter_map(|field| field.split_once(' '))
+                .map(|(key, value)| (key.to_owned(), value.to_owned()))
+                .collect::<HashMap<_, _>>()
+        })?;
+    let required = |key: &str| {
+        fields
+            .get(key)
+            .cloned()
+            .filter(|value| !value.trim().is_empty())
+    };
+    Some(MediaReferenceFfi {
+        url: required("url")?,
+        file_hash_hex: required("x")?,
+        nonce_hex: required("n")?,
+        file_name: required("filename")?,
+        media_type: required("m")?,
+        version: required("v")?,
+        size_bytes: fields
+            .get("size")
+            .and_then(|size| size.parse::<u64>().ok())
+            .unwrap_or_default(),
+    })
 }
 
 #[derive(Clone, Debug, uniffi::Record)]
@@ -474,7 +640,7 @@ impl From<RelayPlaneHealth> for RelayHealthFfi {
 pub fn group_id_from_hex(group_id_hex: &str) -> Result<GroupId, crate::errors::MarmotKitError> {
     let bytes =
         hex::decode(group_id_hex).map_err(|err| crate::errors::MarmotKitError::InvalidHex {
-            message: err.to_string(),
+            details: err.to_string(),
         })?;
     Ok(GroupId::new(bytes))
 }

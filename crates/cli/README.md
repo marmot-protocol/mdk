@@ -214,11 +214,14 @@ Media commands:
 ```sh
 dm --account <npub-or-hex> media list <group-hex>
 dm --account <npub-or-hex> media upload <group-hex> <file-path> --send --message <caption>
-dm --account <npub-or-hex> media download <group-hex> <file-hash>
+dm --account <npub-or-hex> media upload <group-hex> <file-path> --server https://blossom.primal.net
+dm --account <npub-or-hex> media download <group-hex> <file-hash> --output ./file.jpg
 ```
 
-`media list` reads typed media references from projected message history. Upload/download remain explicitly unsupported
-until the encrypted media blob backend is wired through the app runtime.
+`media upload` encrypts the file with the group's MIP-04 encrypted-media exporter secret, uploads the
+ciphertext to Blossom (`https://blossom.primal.net` by default), and optionally sends a kind-9 media reference. `media
+download` resolves a projected media reference by plaintext hash, fetches the encrypted Blossom blob, verifies it,
+decrypts it, and writes the plaintext file.
 
 Other Whitenoise-shaped commands:
 
@@ -240,8 +243,8 @@ dm users search <query> --radius 0..2
 dm reset --confirm
 ```
 
-`notifications subscribe`, chat mute/unmute, media upload/download, and user-driven invite accept/decline commands
-currently return `unsupported_command` rather than faking behavior.
+`notifications subscribe`, chat mute/unmute, and user-driven invite accept/decline commands currently return
+`unsupported_command` rather than faking behavior.
 
 Agent text stream preview commands:
 

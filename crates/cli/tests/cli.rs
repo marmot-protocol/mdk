@@ -1,10 +1,11 @@
+use std::collections::HashMap;
 use std::env;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::process::{Child, Command, Output, Stdio};
-use std::sync::{OnceLock, mpsc as std_mpsc};
+use std::sync::{Arc, Mutex, OnceLock, mpsc as std_mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -48,6 +49,177 @@ impl TestRelay {
     fn url(&self) -> &str {
         &self.url
     }
+}
+
+struct TestBlossom {
+    url: String,
+    blobs: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+    shutdown: Option<std_mpsc::Sender<()>>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl TestBlossom {
+    fn new() -> Self {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind blossom");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking blossom listener");
+        let addr = listener.local_addr().expect("blossom addr");
+        let url = format!("http://{addr}");
+        let blobs = Arc::new(Mutex::new(HashMap::<String, Vec<u8>>::new()));
+        let server_blobs = blobs.clone();
+        let server_url = url.clone();
+        let (shutdown_tx, shutdown_rx) = std_mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            loop {
+                if shutdown_rx.try_recv().is_ok() {
+                    break;
+                }
+                match listener.accept() {
+                    Ok((stream, _peer)) => {
+                        stream
+                            .set_nonblocking(false)
+                            .expect("blocking blossom stream");
+                        handle_blossom_connection(stream, &server_url, &server_blobs)
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        Self {
+            url,
+            blobs,
+            shutdown: Some(shutdown_tx),
+            handle: Some(handle),
+        }
+    }
+
+    fn url(&self) -> &str {
+        &self.url
+    }
+
+    fn blob(&self, hash_hex: &str) -> Option<Vec<u8>> {
+        self.blobs
+            .lock()
+            .expect("blossom blobs")
+            .get(hash_hex)
+            .cloned()
+    }
+}
+
+impl Drop for TestBlossom {
+    fn drop(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn handle_blossom_connection(
+    mut stream: TcpStream,
+    server_url: &str,
+    blobs: &Arc<Mutex<HashMap<String, Vec<u8>>>>,
+) {
+    let mut request = Vec::new();
+    let mut buffer = [0_u8; 4096];
+    let header_end = loop {
+        let read = stream.read(&mut buffer).expect("read blossom request");
+        if read == 0 {
+            return;
+        }
+        request.extend_from_slice(&buffer[..read]);
+        if let Some(offset) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+            break offset + 4;
+        }
+    };
+    let headers = String::from_utf8_lossy(&request[..header_end]).to_string();
+    let mut lines = headers.lines();
+    let request_line = lines.next().unwrap_or_default();
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().unwrap_or_default().to_owned();
+    let path = parts.next().unwrap_or_default().to_owned();
+    let mut content_length = 0_usize;
+    let mut x_sha256 = None;
+    let mut authorization = None;
+    for line in lines {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        match name.to_ascii_lowercase().as_str() {
+            "content-length" => content_length = value.trim().parse().unwrap_or_default(),
+            "x-sha-256" => x_sha256 = Some(value.trim().to_owned()),
+            "authorization" => authorization = Some(value.trim().to_owned()),
+            _ => {}
+        }
+    }
+    while request.len() < header_end + content_length {
+        let read = stream.read(&mut buffer).expect("read blossom body");
+        if read == 0 {
+            return;
+        }
+        request.extend_from_slice(&buffer[..read]);
+    }
+    let body = request[header_end..header_end + content_length].to_vec();
+    match (method.as_str(), path.as_str()) {
+        ("PUT", "/upload") => {
+            assert!(
+                authorization
+                    .as_deref()
+                    .is_some_and(|value| value.starts_with("Nostr "))
+            );
+            let encrypted_hash = x_sha256.expect("upload should include X-SHA-256");
+            blobs
+                .lock()
+                .expect("blossom blobs")
+                .insert(encrypted_hash.clone(), body.clone());
+            let descriptor = serde_json::json!({
+                "url": format!("{server_url}/{encrypted_hash}.bin"),
+                "sha256": encrypted_hash,
+                "size": body.len(),
+                "type": "application/octet-stream",
+                "uploaded": 1_u64,
+            })
+            .to_string();
+            write_blossom_response(&mut stream, 201, "application/json", descriptor.as_bytes());
+        }
+        ("GET", blob_path) => {
+            let hash = blob_path
+                .trim_start_matches('/')
+                .split_once('.')
+                .map(|(hash, _)| hash)
+                .unwrap_or_else(|| blob_path.trim_start_matches('/'));
+            let blob = blobs.lock().expect("blossom blobs").get(hash).cloned();
+            if let Some(blob) = blob {
+                write_blossom_response(&mut stream, 200, "application/octet-stream", &blob);
+            } else {
+                write_blossom_response(&mut stream, 404, "text/plain", b"not found");
+            }
+        }
+        _ => write_blossom_response(&mut stream, 404, "text/plain", b"not found"),
+    }
+}
+
+fn write_blossom_response(stream: &mut TcpStream, status: u16, content_type: &str, body: &[u8]) {
+    let reason = match status {
+        200 => "OK",
+        201 => "Created",
+        404 => "Not Found",
+        _ => "OK",
+    };
+    let head = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream
+        .write_all(head.as_bytes())
+        .expect("write response head");
+    stream.write_all(body).expect("write response body");
 }
 
 fn test_relay_url() -> &'static str {
@@ -472,8 +644,6 @@ fn whitenoise_command_surface_names_are_present() {
     for (args, hidden) in [
         (vec!["debug", "--help"], "ratchet-tree"),
         (vec!["chats", "--help"], "mute"),
-        (vec!["media", "--help"], "upload"),
-        (vec!["media", "--help"], "download"),
     ] {
         let help = Command::new(env!("CARGO_BIN_EXE_dm"))
             .args(args)
@@ -488,6 +658,27 @@ fn whitenoise_command_surface_names_are_present() {
         assert!(
             !help.contains(hidden),
             "nested help should not expose stale {hidden}"
+        );
+    }
+
+    let media_help = Command::new(env!("CARGO_BIN_EXE_dm"))
+        .args(["media", "--help"])
+        .output()
+        .expect("media help should run");
+    assert!(
+        media_help.status.success(),
+        "{}",
+        command_output_summary(&media_help)
+    );
+    let media_help = format!(
+        "{}{}",
+        String::from_utf8_lossy(&media_help.stdout),
+        String::from_utf8_lossy(&media_help.stderr)
+    );
+    for command in ["upload", "download", "list"] {
+        assert!(
+            media_help.contains(command),
+            "media help should expose real {command}"
         );
     }
 }
@@ -1514,6 +1705,78 @@ fn whitenoise_parity_commands_have_real_or_explicit_contracts() {
     assert_eq!(logout["logged_out"], true);
     let accounts = run_json(home.path(), &["accounts", "list"]);
     assert_eq!(accounts["accounts"].as_array().expect("accounts").len(), 1);
+}
+
+#[test]
+fn media_upload_and_download_round_trip_through_blossom() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let blossom = TestBlossom::new();
+
+    let alice = create_account(home.path());
+    let bob = create_account(home.path());
+    run_json(home.path(), &["--account", &bob, "keys", "publish"]);
+    let created_group = run_json(
+        home.path(),
+        &["--account", &alice, "groups", "create", "media", &bob],
+    );
+    let group_id = created_group["group_id"].as_str().expect("group id");
+    run_json(home.path(), &["--account", &bob, "sync"]);
+
+    let source_path = home.path().join("note.txt");
+    let plaintext = b"hello encrypted cli media";
+    std::fs::write(&source_path, plaintext).expect("write source media");
+    let source_path = source_path.to_string_lossy().to_string();
+    let upload = run_json(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "media",
+            "upload",
+            group_id,
+            &source_path,
+            "--send",
+            "--message",
+            "caption",
+            "--server",
+            blossom.url(),
+        ],
+    );
+    let encrypted_hash = upload["encrypted_hash_hex"]
+        .as_str()
+        .expect("encrypted hash");
+    let stored = blossom.blob(encrypted_hash).expect("stored encrypted blob");
+    assert_ne!(stored, plaintext);
+    let file_hash = upload["media"]["file_hash_hex"]
+        .as_str()
+        .expect("plaintext hash")
+        .to_owned();
+
+    run_json(home.path(), &["--account", &bob, "sync"]);
+    let listed = run_json(home.path(), &["--account", &bob, "media", "list", group_id]);
+    assert_eq!(listed["media"][0]["caption"], "caption");
+    assert_eq!(listed["media"][0]["file_hash_hex"], file_hash);
+
+    let output_path = home.path().join("downloaded-note.txt");
+    let output_path_string = output_path.to_string_lossy().to_string();
+    let download = run_json(
+        home.path(),
+        &[
+            "--account",
+            &bob,
+            "media",
+            "download",
+            group_id,
+            &file_hash,
+            "--output",
+            &output_path_string,
+        ],
+    );
+    assert_eq!(download["output_path"], output_path_string);
+    assert_eq!(
+        std::fs::read(&output_path).expect("downloaded file"),
+        plaintext
+    );
 }
 
 #[test]

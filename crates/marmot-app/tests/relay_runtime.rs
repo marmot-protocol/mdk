@@ -1,4 +1,6 @@
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 
 use cgka_engine::account_identity_proof::ACCOUNT_IDENTITY_PROOF_EXTENSION_TYPE;
 use cgka_engine::key_package::key_package_metadata;
@@ -12,12 +14,16 @@ use marmot_account::AccountHome;
 use marmot_app::{
     AGENT_TEXT_STREAM_COMPONENT_ID, AccountRelayListBootstrap, AccountSetupRequest,
     AppMessageQuery, MarmotApp, MarmotAppConfig, MarmotAppEvent, MarmotAppRuntime, MediaReference,
-    RuntimeMessageUpdate, UserDirectorySearch, UserProfileMetadata, tag_value,
+    MediaUploadRequest, RuntimeMessageUpdate, UserDirectorySearch, UserProfileMetadata, tag_value,
 };
 use nostr::base64::Engine as _;
 use nostr::base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use nostr_relay_builder::MockRelay;
 use nostr_sdk::prelude::Client as NostrSdkClient;
+use sha2::{Digest, Sha256};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
+use tokio::sync::Mutex;
 use tokio::time::{Duration, timeout};
 use transport_nostr_adapter::{
     KEY_PACKAGE_ENCODING_BASE64, KIND_MARMOT_KEY_PACKAGE, NostrRelayClient, NostrSdkRelayClient,
@@ -34,6 +40,155 @@ async fn mock_app(dir: &tempfile::TempDir) -> (MockRelay, MarmotApp, String) {
     let (relay, url) = mock_relay().await;
     let app = MarmotApp::with_relay(dir.path(), url.clone());
     (relay, app, url)
+}
+
+#[derive(Clone)]
+struct MockBlossom {
+    url: String,
+    blobs: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+}
+
+impl MockBlossom {
+    async fn blob(&self, hash_hex: &str) -> Option<Vec<u8>> {
+        self.blobs.lock().await.get(hash_hex).cloned()
+    }
+}
+
+async fn mock_blossom() -> MockBlossom {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let url = format!("http://{addr}");
+    let blobs = Arc::new(Mutex::new(HashMap::<String, Vec<u8>>::new()));
+    let server_blobs = blobs.clone();
+    let server_url = url.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _peer)) = listener.accept().await else {
+                break;
+            };
+            let blobs = server_blobs.clone();
+            let server_url = server_url.clone();
+            tokio::spawn(async move {
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 4096];
+                let header_end = loop {
+                    let read = stream.read(&mut buffer).await.unwrap();
+                    if read == 0 {
+                        return;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                    if let Some(offset) =
+                        request.windows(4).position(|window| window == b"\r\n\r\n")
+                    {
+                        break offset + 4;
+                    }
+                };
+                let headers = String::from_utf8_lossy(&request[..header_end]).to_string();
+                let mut lines = headers.lines();
+                let request_line = lines.next().unwrap_or_default();
+                let mut parts = request_line.split_whitespace();
+                let method = parts.next().unwrap_or_default().to_owned();
+                let path = parts.next().unwrap_or_default().to_owned();
+                let mut content_length = 0_usize;
+                let mut x_sha256 = None;
+                let mut authorization = None;
+                for line in lines {
+                    let Some((name, value)) = line.split_once(':') else {
+                        continue;
+                    };
+                    match name.to_ascii_lowercase().as_str() {
+                        "content-length" => {
+                            content_length = value.trim().parse().unwrap_or_default();
+                        }
+                        "x-sha-256" => x_sha256 = Some(value.trim().to_owned()),
+                        "authorization" => authorization = Some(value.trim().to_owned()),
+                        _ => {}
+                    }
+                }
+                while request.len() < header_end + content_length {
+                    let read = stream.read(&mut buffer).await.unwrap();
+                    if read == 0 {
+                        return;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                }
+                let body = request[header_end..header_end + content_length].to_vec();
+                match (method.as_str(), path.as_str()) {
+                    ("PUT", "/upload") => {
+                        assert!(
+                            authorization
+                                .as_deref()
+                                .is_some_and(|value| value.starts_with("Nostr "))
+                        );
+                        let encrypted_hash = hex::encode(Sha256::digest(&body));
+                        assert_eq!(x_sha256.as_deref(), Some(encrypted_hash.as_str()));
+                        blobs
+                            .lock()
+                            .await
+                            .insert(encrypted_hash.clone(), body.clone());
+                        let descriptor = serde_json::json!({
+                            "url": format!("{server_url}/{encrypted_hash}.bin"),
+                            "sha256": encrypted_hash,
+                            "size": body.len(),
+                            "type": "application/octet-stream",
+                            "uploaded": 1_u64,
+                        })
+                        .to_string();
+                        write_http_response(
+                            &mut stream,
+                            201,
+                            "application/json",
+                            descriptor.as_bytes(),
+                        )
+                        .await;
+                    }
+                    ("GET", blob_path) => {
+                        let hash = blob_path
+                            .trim_start_matches('/')
+                            .split_once('.')
+                            .map(|(hash, _)| hash)
+                            .unwrap_or_else(|| blob_path.trim_start_matches('/'));
+                        let blob = blobs.lock().await.get(hash).cloned();
+                        if let Some(blob) = blob {
+                            write_http_response(
+                                &mut stream,
+                                200,
+                                "application/octet-stream",
+                                &blob,
+                            )
+                            .await;
+                        } else {
+                            write_http_response(&mut stream, 404, "text/plain", b"not found").await;
+                        }
+                    }
+                    _ => {
+                        write_http_response(&mut stream, 404, "text/plain", b"not found").await;
+                    }
+                }
+            });
+        }
+    });
+    MockBlossom { url, blobs }
+}
+
+async fn write_http_response(
+    stream: &mut tokio::net::TcpStream,
+    status: u16,
+    content_type: &str,
+    body: &[u8],
+) {
+    let reason = match status {
+        200 => "OK",
+        201 => "Created",
+        404 => "Not Found",
+        _ => "OK",
+    };
+    let head = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(head.as_bytes()).await.unwrap();
+    stream.write_all(body).await.unwrap();
 }
 
 fn endpoint(url: &str) -> TransportEndpoint {
@@ -1065,6 +1220,110 @@ async fn relay_app_runtime_creates_default_agent_text_stream_group() {
         repeated_alice_secret.to_string().contains("PuncturedInput"),
         "{repeated_alice_secret}"
     );
+}
+
+#[tokio::test]
+async fn encrypted_media_upload_sends_ciphertext_and_download_decrypts_plaintext() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    home.create_account("bob").unwrap();
+
+    let (_relay, app, _url) = mock_app(&dir).await;
+    let blossom = mock_blossom().await;
+    let mut bob = app.client("bob").await.unwrap();
+    bob.publish_key_package().await.unwrap();
+
+    let mut alice = app.client("alice").await.unwrap();
+    let group_id = alice.create_group("media", &["bob"]).await.unwrap();
+    bob.sync().await.unwrap();
+    let group_state = alice.group_mls_state(&group_id).unwrap();
+    assert!(
+        !group_state.required_app_components.contains(&0x8007),
+        "MIP-04 media uses the raw encrypted-media exporter label, not a SafeExportSecret app component"
+    );
+
+    let plaintext = b"marmot encrypted media tracer bullet".to_vec();
+    let upload = alice
+        .upload_media(
+            &group_id,
+            MediaUploadRequest {
+                file_name: "note.txt".to_owned(),
+                media_type: "Text/Plain; charset=utf-8".to_owned(),
+                plaintext: plaintext.clone(),
+                caption: Some("secret note".to_owned()),
+                send: true,
+                blossom_server: Some(blossom.url.clone()),
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(upload.reference.file_name, "note.txt");
+    assert_eq!(upload.reference.media_type, "text/plain");
+    assert_eq!(upload.reference.version, "mip04-v2");
+    assert_eq!(upload.reference.size_bytes, plaintext.len() as u64);
+    assert_eq!(
+        upload.reference.file_hash_hex,
+        hex::encode(Sha256::digest(&plaintext))
+    );
+    assert_eq!(upload.reference.nonce_hex.len(), 24);
+    assert!(upload.sent.as_ref().is_some_and(|sent| sent.published > 0));
+
+    let stored = blossom
+        .blob(&upload.encrypted_hash_hex)
+        .await
+        .expect("encrypted blob was uploaded");
+    assert_ne!(stored, plaintext);
+    assert_eq!(
+        hex::encode(Sha256::digest(&stored)),
+        upload.encrypted_hash_hex
+    );
+
+    let sync = bob.sync().await.unwrap();
+    assert_eq!(sync.messages[0].plaintext, "secret note");
+    let imeta = sync.messages[0]
+        .tags
+        .iter()
+        .find(|tag| tag.first().map(String::as_str) == Some("imeta"))
+        .expect("media message carries imeta");
+    assert!(
+        imeta
+            .iter()
+            .any(|field| field == &format!("url {}", upload.reference.url))
+    );
+    assert!(imeta.iter().any(|field| field == "m text/plain"));
+    assert!(imeta.iter().any(|field| field == "filename note.txt"));
+    assert!(imeta.iter().any(|field| field == "v mip04-v2"));
+
+    let download = bob
+        .download_media(&group_id, upload.reference.clone())
+        .await
+        .unwrap();
+    assert_eq!(download.plaintext, plaintext);
+    assert_eq!(download.file_name, "note.txt");
+    assert_eq!(download.media_type, "text/plain");
+
+    let second_plaintext = b"second media in the same epoch".to_vec();
+    let second_upload = alice
+        .upload_media(
+            &group_id,
+            MediaUploadRequest {
+                file_name: "second.txt".to_owned(),
+                media_type: "text/plain".to_owned(),
+                plaintext: second_plaintext.clone(),
+                caption: None,
+                send: false,
+                blossom_server: Some(blossom.url.clone()),
+            },
+        )
+        .await
+        .unwrap();
+    let second_download = bob
+        .download_media(&group_id, second_upload.reference)
+        .await
+        .unwrap();
+    assert_eq!(second_download.plaintext, second_plaintext);
 }
 
 #[tokio::test]

@@ -31,7 +31,7 @@ mod subscriptions;
 use conversions::{
     AccountSummaryFfi, AgentStreamStartFfi, AppGroupMemberRecordFfi, AppGroupMlsStateFfi,
     AppGroupRecordFfi, AppMessageRecordFfi, SendSummaryFfi, UserProfileMetadataFfi,
-    group_id_from_hex,
+    group_id_from_hex, media_records_ffi,
 };
 use errors::MarmotKitError;
 use subscriptions::{
@@ -40,6 +40,11 @@ use subscriptions::{
 };
 
 uniffi::setup_scaffolding!();
+
+pub use conversions::{
+    MediaDownloadResultFfi, MediaRecordFfi, MediaReferenceFfi, MediaUploadRequestFfi,
+    MediaUploadResultFfi,
+};
 
 /// Convenience: turn an FFI string list of relay URLs into the engine's
 /// [`TransportEndpoint`] wrapper, dedup-stripped of empties.
@@ -454,6 +459,74 @@ impl Marmot {
         Ok(summary.into())
     }
 
+    /// Send an already-uploaded encrypted media reference as a kind-9 chat
+    /// carrying a NIP-92 `imeta` tag.
+    pub async fn send_media_reference(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+        reference: MediaReferenceFfi,
+        caption: Option<String>,
+    ) -> Result<SendSummaryFfi, MarmotKitError> {
+        let group_id = group_id_from_hex(&group_id_hex)?;
+        let summary = self
+            .runtime
+            .send_media_reference(&account_ref, &group_id, reference.into(), caption)
+            .await?;
+        Ok(summary.into())
+    }
+
+    /// Encrypt plaintext, upload the ciphertext to Blossom, and optionally
+    /// send the resulting media reference into the group.
+    pub async fn upload_media(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+        request: MediaUploadRequestFfi,
+    ) -> Result<MediaUploadResultFfi, MarmotKitError> {
+        let group_id = group_id_from_hex(&group_id_hex)?;
+        let upload = self
+            .runtime
+            .upload_media(&account_ref, &group_id, request.into())
+            .await?;
+        Ok(upload.into())
+    }
+
+    /// Fetch an encrypted Blossom blob and decrypt it using the group's
+    /// MIP-04 encrypted-media exporter secret.
+    pub async fn download_media(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+        reference: MediaReferenceFfi,
+    ) -> Result<MediaDownloadResultFfi, MarmotKitError> {
+        let group_id = group_id_from_hex(&group_id_hex)?;
+        let download = self
+            .runtime
+            .download_media(&account_ref, &group_id, reference.into())
+            .await?;
+        Ok(download.into())
+    }
+
+    /// Typed media references projected from group message history. Host apps
+    /// can pass a returned `reference` back to `download_media`.
+    pub fn list_media(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+        limit: Option<u32>,
+    ) -> Result<Vec<MediaRecordFfi>, MarmotKitError> {
+        let group_id_hex = hex::encode(group_id_from_hex(&group_id_hex)?.as_slice());
+        let records = self.runtime.messages_with_query(
+            &account_ref,
+            AppMessageQuery {
+                group_id_hex: Some(group_id_hex),
+                limit: limit.map(|n| n as usize),
+            },
+        )?;
+        Ok(media_records_ffi(records))
+    }
+
     /// Anchor a live agent text stream start in the encrypted group history.
     /// Host apps pass the broker candidate(s) they will publish to, such as
     /// `quic://quic-broker.ipf.dev:4450`; omit `stream_id_hex` to let Rust
@@ -468,7 +541,7 @@ impl Marmot {
         let group_id = group_id_from_hex(&group_id_hex)?;
         let stream_id = match stream_id_hex {
             Some(value) => hex::decode(value).map_err(|err| MarmotKitError::InvalidHex {
-                message: err.to_string(),
+                details: err.to_string(),
             })?,
             None => random_agent_stream_id(),
         };

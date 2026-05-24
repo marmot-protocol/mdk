@@ -8,18 +8,18 @@ pub enum MarmotKitError {
     UnknownAccount { account_ref: String },
     #[error("unknown group: {group_id_hex}")]
     UnknownGroup { group_id_hex: String },
-    #[error("invalid hex: {message}")]
-    InvalidHex { message: String },
-    #[error("invalid nostr identity: {message}")]
-    InvalidIdentity { message: String },
+    #[error("invalid hex: {details}")]
+    InvalidHex { details: String },
+    #[error("invalid nostr identity: {details}")]
+    InvalidIdentity { details: String },
     #[error("missing key package for {account}")]
     MissingKeyPackage { account: String },
-    #[error("publish failed: {message}")]
-    Publish { message: String },
+    #[error("publish failed: {details}")]
+    Publish { details: String },
     #[error("transport closed")]
     TransportClosed,
-    #[error("marmot runtime error: {message}")]
-    Runtime { message: String },
+    #[error("marmot runtime error: {details}")]
+    Runtime { details: String },
 }
 
 impl From<AppError> for MarmotKitError {
@@ -27,17 +27,17 @@ impl From<AppError> for MarmotKitError {
         match value {
             AppError::UnknownGroup(group_id_hex) => Self::UnknownGroup { group_id_hex },
             AppError::Hex(err) => Self::InvalidHex {
-                message: err.to_string(),
+                details: err.to_string(),
             },
             AppError::MissingKeyPackage(account) => Self::MissingKeyPackage { account },
             AppError::InvalidPublicKey => Self::InvalidIdentity {
-                message: "invalid nostr public key".into(),
+                details: "invalid nostr public key".into(),
             },
-            AppError::InvalidKeyPackageEvent(message) => Self::InvalidIdentity { message },
-            AppError::Publish(message) => Self::Publish { message },
+            AppError::InvalidKeyPackageEvent(details) => Self::InvalidIdentity { details },
+            AppError::Publish(details) => Self::Publish { details },
             AppError::TransportClosed => Self::TransportClosed,
             other => Self::Runtime {
-                message: other.to_string(),
+                details: other.to_string(),
             },
         }
     }

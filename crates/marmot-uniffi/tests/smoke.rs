@@ -10,7 +10,7 @@
 
 use std::sync::{Arc, Once};
 
-use marmot_uniffi::Marmot;
+use marmot_uniffi::{Marmot, MediaReferenceFfi, MediaUploadRequestFfi};
 
 /// `Marmot::new` opens a Keychain-backed secret store, which on the real
 /// targets (iOS/macOS) is always present but in headless CI (Linux Secret
@@ -69,4 +69,45 @@ fn display_name_is_none_for_unknown_account() {
         "expected None for unknown account, got {:?}",
         name
     );
+}
+
+#[tokio::test]
+async fn media_binding_records_are_public_and_methods_validate_group_hex() {
+    install_mock_keyring();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let kit = Marmot::new(
+        tmp.path().to_string_lossy().into_owned(),
+        vec!["wss://relay.invalid.test".to_string()],
+    )
+    .expect("open marmot kit");
+
+    let reference = MediaReferenceFfi {
+        url: "https://blossom.example/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+        file_hash_hex: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+        nonce_hex: "bbbbbbbbbbbbbbbbbbbbbbbb".into(),
+        file_name: "note.txt".into(),
+        media_type: "text/plain".into(),
+        version: "mip04-v2".into(),
+        size_bytes: 4,
+    };
+    let request = MediaUploadRequestFfi {
+        file_name: "note.txt".into(),
+        media_type: "text/plain".into(),
+        plaintext: b"note".to_vec(),
+        caption: Some("caption".into()),
+        send: true,
+        blossom_server: Some("https://blossom.primal.net".into()),
+    };
+
+    let send_error = kit
+        .send_media_reference("alice".into(), "not-hex".into(), reference, None)
+        .await
+        .expect_err("invalid group hex should fail before sending");
+    assert!(format!("{send_error}").contains("invalid hex"));
+
+    let upload_error = kit
+        .upload_media("alice".into(), "not-hex".into(), request)
+        .await
+        .expect_err("invalid group hex should fail before upload");
+    assert!(format!("{upload_error}").contains("invalid hex"));
 }
