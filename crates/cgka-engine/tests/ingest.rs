@@ -18,6 +18,9 @@ use std::collections::HashSet;
 use std::sync::Mutex;
 use storage_memory::MemoryStorage;
 
+mod support;
+use support::proof_signer;
+
 fn pad32(name: &[u8]) -> Vec<u8> {
     // Marmot credential identities MUST be a valid 32-byte x-only secp256k1
     // public key (spec/foundation/identity.md). Derive one deterministically
@@ -184,6 +187,7 @@ fn build_client(id: &[u8]) -> Engine<MemoryStorage> {
 fn build_client_with_peeler(id: &[u8], peeler: Box<dyn TransportPeeler>) -> Engine<MemoryStorage> {
     EngineBuilder::new(MemoryStorage::new())
         .identity(pad32(id))
+        .account_identity_proof_signer(proof_signer(id))
         .feature_registry(selfremove_registry())
         .peeler(peeler)
         .build()

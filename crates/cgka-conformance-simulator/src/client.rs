@@ -3,6 +3,9 @@
 //! `confirm_all_pending`, `assert_at_epoch`.
 
 use crate::bus::{ClientId, TransportBus};
+use cgka_engine::account_identity_proof::{
+    AccountIdentityProofRequest, AccountIdentityProofSigner,
+};
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::{Engine, EngineBuilder};
 use cgka_traits::app_components::{AppComponentData, GROUP_ADMIN_POLICY_COMPONENT_ID};
@@ -19,7 +22,7 @@ use cgka_traits::transport::{TransportEnvelope, TransportMessage};
 use cgka_traits::types::{EpochId, GroupId, MemberId};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use storage_memory::MemoryStorage;
 use transport_nostr_peeler::NostrMlsPeeler;
 
@@ -67,6 +70,9 @@ impl ClientBuilder {
         let peeler = NostrMlsPeeler::new().with_welcome_signer(self.signer.clone());
         let engine = EngineBuilder::new(storage.clone())
             .identity(self.identity.clone())
+            .account_identity_proof_signer(Arc::new(NostrAccountIdentityProofSigner {
+                keys: self.signer.clone(),
+            }))
             .feature_registry(self.registry.clone())
             .peeler(Box::new(peeler))
             .build()
@@ -101,6 +107,24 @@ fn deterministic_nostr_keys(seed: &[u8]) -> nostr::Keys {
         counter = counter
             .checked_add(1)
             .expect("deterministic Nostr key search exhausted");
+    }
+}
+
+#[derive(Clone)]
+struct NostrAccountIdentityProofSigner {
+    keys: nostr::Keys,
+}
+
+impl AccountIdentityProofSigner for NostrAccountIdentityProofSigner {
+    fn sign_account_identity_proof(
+        &self,
+        request: &AccountIdentityProofRequest,
+    ) -> Result<[u8; 64], String> {
+        if self.keys.public_key().to_bytes().as_slice() != request.account_identity.as_slice() {
+            return Err("request account identity does not match harness Nostr key".into());
+        }
+        let message = nostr::secp256k1::Message::from_digest(request.signing_digest());
+        Ok(self.keys.sign_schnorr(&message).serialize())
     }
 }
 
@@ -150,6 +174,9 @@ impl HarnessClient {
         let peeler = NostrMlsPeeler::new().with_welcome_signer(self.signer.clone());
         let mut engine = EngineBuilder::new(self.storage.clone())
             .identity(self.identity.clone())
+            .account_identity_proof_signer(Arc::new(NostrAccountIdentityProofSigner {
+                keys: self.signer.clone(),
+            }))
             .feature_registry(self.registry.clone())
             .peeler(Box::new(peeler))
             .build()

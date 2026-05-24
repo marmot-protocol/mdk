@@ -5,8 +5,9 @@
 //! `TransportPeeler`; actual network publish and relay sync stay above this
 //! crate.
 
-use std::path::PathBuf;
+use std::{path::PathBuf, sync::Arc};
 
+use cgka_engine::account_identity_proof::AccountIdentityProofSigner;
 use cgka_engine::canonicalization::CanonicalizationPolicy;
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::{Engine, EngineBuilder};
@@ -42,6 +43,7 @@ pub struct SessionConfig {
     database_key: SqlCipherKey,
     identity: Vec<u8>,
     peeler: Box<dyn TransportPeeler>,
+    account_identity_proof_signer: Option<Arc<dyn AccountIdentityProofSigner>>,
     feature_registry: FeatureRegistry,
     supported_app_components: AppComponentSet,
     storage_options: SqliteStorageOptions,
@@ -60,6 +62,7 @@ impl SessionConfig {
             database_key,
             identity,
             peeler,
+            account_identity_proof_signer: None,
             feature_registry: FeatureRegistry::new(),
             supported_app_components: AppComponentSet::new(default_group_components()),
             storage_options: SqliteStorageOptions::default(),
@@ -69,6 +72,14 @@ impl SessionConfig {
 
     pub fn feature_registry(mut self, registry: FeatureRegistry) -> Self {
         self.feature_registry = registry;
+        self
+    }
+
+    pub fn account_identity_proof_signer(
+        mut self,
+        signer: Arc<dyn AccountIdentityProofSigner>,
+    ) -> Self {
+        self.account_identity_proof_signer = Some(signer);
         self
     }
 
@@ -163,6 +174,9 @@ impl AccountDeviceSession {
         )?;
         let mut engine = EngineBuilder::new(storage)
             .identity(config.identity)
+            .account_identity_proof_signer(config.account_identity_proof_signer.ok_or_else(
+                || EngineError::Other("account identity proof signer is required".into()),
+            )?)
             .feature_registry(config.feature_registry)
             .supported_app_components(config.supported_app_components.ids)
             .peeler(config.peeler)

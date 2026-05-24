@@ -2416,6 +2416,7 @@ dependencies = [
  "nostr",
  "serde",
  "serde_json",
+ "sha2",
  "storage-sqlite",
  "tempfile",
  "thiserror 2.0.18",

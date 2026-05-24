@@ -23,6 +23,9 @@ use cgka_traits::transport::{
 use cgka_traits::types::{MemberId, MessageId};
 use storage_memory::MemoryStorage;
 
+mod support;
+use support::proof_signer;
+
 fn pad32(name: &[u8]) -> Vec<u8> {
     // Marmot credential identities MUST be a valid 32-byte x-only secp256k1
     // public key (spec/foundation/identity.md). Derive one deterministically
@@ -170,6 +173,7 @@ fn registry_selfremove_required_and_component_optional() -> FeatureRegistry {
 fn build_client(id: &[u8], registry: FeatureRegistry) -> impl CgkaEngine {
     EngineBuilder::new(MemoryStorage::new())
         .identity(pad32(id))
+        .account_identity_proof_signer(proof_signer(id))
         .feature_registry(registry)
         .peeler(Box::new(MockPeeler))
         .build()
@@ -182,6 +186,7 @@ fn build_engine_with_components(
 ) -> Engine<MemoryStorage> {
     EngineBuilder::new(MemoryStorage::new())
         .identity(pad32(id))
+        .account_identity_proof_signer(proof_signer(id))
         .supported_app_components(components)
         .peeler(Box::new(MockPeeler))
         .build()
@@ -195,6 +200,7 @@ fn build_engine_with_registry_and_components(
 ) -> Engine<MemoryStorage> {
     EngineBuilder::new(MemoryStorage::new())
         .identity(pad32(id))
+        .account_identity_proof_signer(proof_signer(id))
         .feature_registry(registry)
         .supported_app_components(components)
         .peeler(Box::new(MockPeeler))
@@ -1006,6 +1012,7 @@ fn build_concrete_with_storage(
     let storage = MemoryStorage::new();
     let engine = EngineBuilder::new(storage.clone())
         .identity(pad32(id))
+        .account_identity_proof_signer(proof_signer(id))
         .feature_registry(registry)
         .peeler(Box::new(MockPeeler))
         .build()

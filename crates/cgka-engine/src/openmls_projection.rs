@@ -1315,11 +1315,17 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                 // commit that would add a member with an invalid x-only
                 // secp256k1 credential identity before merging it.
                 for add in staged.add_proposals() {
-                    if let Err(err) = crate::identity::validated_member_id_of_leaf(
-                        add.add_proposal().key_package().leaf_node(),
-                    ) {
+                    let leaf = add.add_proposal().key_package().leaf_node();
+                    let validation =
+                        crate::identity::validated_member_id_of_leaf(leaf).and_then(|_| {
+                            crate::account_identity_proof::validate_leaf_account_identity_proof(
+                                leaf,
+                                crate::DEFAULT_CIPHERSUITE,
+                            )
+                        });
+                    if let Err(err) = validation {
                         return Err(OpenMlsProjectionError::Replay(format!(
-                            "invalid added credential identity: {err}"
+                            "invalid added credential identity or account proof: {err}"
                         )));
                     }
                 }

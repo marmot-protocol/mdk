@@ -9,6 +9,7 @@ use cgka_traits::storage::{
     AccountDeviceSignerBinding, StorageProvider as CgkaStorageProvider, StorageResult,
 };
 use cgka_traits::types::MemberId;
+use openmls::extensions::Extension;
 use openmls::prelude::{BasicCredential, Credential, CredentialWithKey, LeafNode, SignatureScheme};
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_traits::types::Ciphersuite;
@@ -18,6 +19,7 @@ pub struct Identity {
     pub(crate) signer: SignatureKeyPair,
     pub(crate) credential_with_key: CredentialWithKey,
     pub(crate) self_id: MemberId,
+    pub(crate) account_identity_proof_extension: Extension,
 }
 
 impl Identity {
@@ -27,6 +29,7 @@ impl Identity {
         ciphersuite: Ciphersuite,
         identity_bytes: Vec<u8>,
         storage: &S,
+        proof_signer: &dyn crate::account_identity_proof::AccountIdentityProofSigner,
     ) -> Result<Self, String>
     where
         S: CgkaStorageProvider,
@@ -47,7 +50,7 @@ impl Identity {
                 "identity storage: local signer record exists, but OpenMLS keypair is missing"
                     .to_string()
             })?;
-            return Ok(Self::from_signer(signer, identity_bytes));
+            return Self::from_signer(signer, identity_bytes, ciphersuite, proof_signer);
         }
 
         let signer = SignatureKeyPair::new(scheme).map_err(|e| format!("signer: {e}"))?;
@@ -60,20 +63,35 @@ impl Identity {
                 mls_signature_public_key: signer.to_public_vec(),
             }),
         )?;
-        Ok(Self::from_signer(signer, identity_bytes))
+        Self::from_signer(signer, identity_bytes, ciphersuite, proof_signer)
     }
 
-    fn from_signer(signer: SignatureKeyPair, identity_bytes: Vec<u8>) -> Self {
+    fn from_signer(
+        signer: SignatureKeyPair,
+        identity_bytes: Vec<u8>,
+        ciphersuite: Ciphersuite,
+        proof_signer: &dyn crate::account_identity_proof::AccountIdentityProofSigner,
+    ) -> Result<Self, String> {
         let credential = BasicCredential::new(identity_bytes.clone());
         let credential_with_key = CredentialWithKey {
             credential: credential.into(),
             signature_key: signer.public().into(),
         };
-        Self {
+        let account_identity_proof_extension =
+            crate::account_identity_proof::account_identity_proof_extension(
+                &identity_bytes,
+                &signer.to_public_vec(),
+                ciphersuite,
+                ciphersuite.signature_algorithm(),
+                proof_signer,
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(Self {
             signer,
             credential_with_key,
             self_id: MemberId::new(identity_bytes),
-        }
+            account_identity_proof_extension,
+        })
     }
 
     pub fn self_id(&self) -> &MemberId {

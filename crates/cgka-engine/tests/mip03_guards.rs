@@ -30,6 +30,9 @@ use openmls_rust_crypto::RustCrypto;
 use openmls_traits::OpenMlsProvider as _;
 use storage_memory::MemoryStorage;
 
+mod support;
+use support::proof_signer;
+
 fn pad32(name: &[u8]) -> Vec<u8> {
     // Marmot credential identities MUST be a valid 32-byte x-only secp256k1
     // public key (spec/foundation/identity.md). Derive one deterministically
@@ -140,6 +143,7 @@ fn registry() -> FeatureRegistry {
 fn build(id: &[u8]) -> impl CgkaEngine {
     EngineBuilder::new(MemoryStorage::new())
         .identity(pad32(id))
+        .account_identity_proof_signer(proof_signer(id))
         .feature_registry(registry())
         .peeler(Box::new(MockPeeler))
         .build()
@@ -150,6 +154,7 @@ fn build_with_storage(id: &[u8]) -> (Engine<MemoryStorage>, MemoryStorage) {
     let storage = MemoryStorage::new();
     let engine = EngineBuilder::new(storage.clone())
         .identity(pad32(id))
+        .account_identity_proof_signer(proof_signer(id))
         .feature_registry(registry())
         .peeler(Box::new(MockPeeler))
         .build()

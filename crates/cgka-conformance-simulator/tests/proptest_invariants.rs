@@ -32,6 +32,7 @@
 //!   result before and after rebuilding an engine over the same storage.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use cgka_conformance_simulator::bus::DeliveryPolicy;
 use cgka_conformance_simulator::canonicalization::{
@@ -48,6 +49,9 @@ use cgka_conformance_simulator::proptest_support::{
 };
 use cgka_conformance_simulator::{ClientBuilder, HarnessClient, TransportBus};
 use cgka_engine::EngineBuilder;
+use cgka_engine::account_identity_proof::{
+    AccountIdentityProofRequest, AccountIdentityProofSigner,
+};
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_traits::CgkaEngine;
 use cgka_traits::capabilities::{
@@ -73,6 +77,42 @@ fn pad32(name: &[u8]) -> Vec<u8> {
     let n = name.len().min(32);
     out[..n].copy_from_slice(&name[..n]);
     out
+}
+
+fn deterministic_nostr_keys(seed: &[u8]) -> nostr::Keys {
+    use sha2::{Digest, Sha256};
+    let mut counter = 0_u64;
+    loop {
+        let mut hasher = Sha256::new();
+        hasher.update(b"marmot-cgka-conformance-nostr-key-v1");
+        hasher.update(seed);
+        hasher.update(counter.to_be_bytes());
+        let secret = hasher.finalize();
+        if let Ok(keys) = nostr::Keys::parse(&hex::encode(secret)) {
+            return keys;
+        }
+        counter = counter
+            .checked_add(1)
+            .expect("deterministic Nostr key search exhausted");
+    }
+}
+
+#[derive(Clone)]
+struct NostrAccountIdentityProofSigner {
+    keys: nostr::Keys,
+}
+
+impl AccountIdentityProofSigner for NostrAccountIdentityProofSigner {
+    fn sign_account_identity_proof(
+        &self,
+        request: &AccountIdentityProofRequest,
+    ) -> Result<[u8; 64], String> {
+        if self.keys.public_key().to_bytes().as_slice() != request.account_identity.as_slice() {
+            return Err("request account identity does not match proptest key".into());
+        }
+        let message = nostr::secp256k1::Message::from_digest(request.signing_digest());
+        Ok(self.keys.sign_schnorr(&message).serialize())
+    }
 }
 
 fn registry() -> FeatureRegistry {
@@ -1263,10 +1303,15 @@ fn stored_convergence_restart_equivalence(name: String, committer_idx: usize) {
             .storage()
             .rollback_group_to_snapshot(&group_id, "restart-equivalence")
             .expect("rollback to pre-convergence snapshot");
-        let restarted_identity = clients[2].member_id().as_slice().to_vec();
+        let restarted_seed = pad32(b"client-2");
+        let restarted_keys = deterministic_nostr_keys(&restarted_seed);
+        let restarted_identity = restarted_keys.public_key().to_bytes().to_vec();
         let restarted_storage = clients[2].storage().clone();
         let mut restarted = EngineBuilder::new(restarted_storage.clone())
             .identity(restarted_identity.clone())
+            .account_identity_proof_signer(Arc::new(NostrAccountIdentityProofSigner {
+                keys: restarted_keys,
+            }))
             .feature_registry(registry())
             .peeler(Box::new(transport_nostr_peeler::NostrMlsPeeler::new()))
             .build()

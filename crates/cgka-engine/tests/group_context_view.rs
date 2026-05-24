@@ -19,6 +19,9 @@ use cgka_traits::transport::{
 use cgka_traits::types::{MemberId, MessageId};
 use storage_memory::MemoryStorage;
 
+mod support;
+use support::proof_signer;
+
 const ENGINE_EXPORTER_LABEL: &str = "marmot/group-event";
 
 fn pad32(name: &[u8]) -> Vec<u8> {
@@ -121,6 +124,7 @@ impl TransportPeeler for MockPeeler {
 fn build_client(identity: &[u8]) -> impl CgkaEngine {
     EngineBuilder::new(MemoryStorage::new())
         .identity(pad32(identity))
+        .account_identity_proof_signer(proof_signer(identity))
         .feature_registry(FeatureRegistry::new())
         .peeler(Box::new(MockPeeler))
         .build()

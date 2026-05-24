@@ -6,6 +6,9 @@
 //! serializing — without pulling in a real peeler impl.
 
 use async_trait::async_trait;
+use cgka_engine::account_identity_proof::{
+    ACCOUNT_IDENTITY_PROOF_EXTENSION_TYPE, account_identity_proof_extension,
+};
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::key_package::is_last_resort_key_package;
 use cgka_engine::{Engine, EngineBuilder};
@@ -26,12 +29,16 @@ use cgka_traits::transport::{
 };
 use cgka_traits::types::{MemberId, MessageId};
 use openmls::prelude::{
-    BasicCredential, Capabilities, CredentialWithKey, KeyPackage as MlsKeyPackage, MlsMessageOut,
+    BasicCredential, Capabilities, CredentialWithKey, ExtensionType, Extensions,
+    KeyPackage as MlsKeyPackage, MlsMessageOut,
 };
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_traits::types::Ciphersuite;
 use storage_memory::MemoryStorage;
 use tls_codec::Serialize as _;
+
+mod support;
+use support::proof_signer;
 
 /// Build a wire KeyPackage carrying a `BasicCredential` whose identity is the
 /// raw `identity` bytes, bypassing the engine's identity validation. Used to
@@ -47,6 +54,45 @@ fn key_package_with_raw_identity(identity: &[u8]) -> cgka_traits::engine::KeyPac
     };
     let bundle = MlsKeyPackage::builder()
         .leaf_node_capabilities(Capabilities::default())
+        .build(ciphersuite, &provider, &signer, credential_with_key)
+        .unwrap();
+    let mls_msg: MlsMessageOut = bundle.key_package().clone().into();
+    cgka_traits::engine::KeyPackage(mls_msg.tls_serialize_detached().unwrap())
+}
+
+fn key_package_with_mismatched_account_identity_proof(
+    credential_identity: &[u8],
+    proof_identity_seed: &[u8],
+) -> cgka_traits::engine::KeyPackage {
+    let ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
+    let provider = openmls_rust_crypto::OpenMlsRustCrypto::default();
+    let signer = SignatureKeyPair::new(ciphersuite.signature_algorithm()).unwrap();
+    let credential = BasicCredential::new(credential_identity.to_vec());
+    let credential_with_key = CredentialWithKey {
+        credential: credential.into(),
+        signature_key: signer.public().into(),
+    };
+    let proof_identity = pad32(proof_identity_seed);
+    let proof_signer = proof_signer(proof_identity_seed);
+    let proof_extension = account_identity_proof_extension(
+        &proof_identity,
+        &signer.to_public_vec(),
+        ciphersuite,
+        ciphersuite.signature_algorithm(),
+        proof_signer.as_ref(),
+    )
+    .unwrap();
+    let bundle = MlsKeyPackage::builder()
+        .leaf_node_capabilities(Capabilities::new(
+            None,
+            Some(&[ciphersuite]),
+            Some(&[ExtensionType::Unknown(
+                ACCOUNT_IDENTITY_PROOF_EXTENSION_TYPE,
+            )]),
+            None,
+            None,
+        ))
+        .leaf_node_extensions(Extensions::single(proof_extension).unwrap())
         .build(ciphersuite, &provider, &signer, credential_with_key)
         .unwrap();
     let mls_msg: MlsMessageOut = bundle.key_package().clone().into();
@@ -161,6 +207,7 @@ fn build_client_with_components(
 ) -> Engine<MemoryStorage> {
     EngineBuilder::new(MemoryStorage::new())
         .identity(pad32(identity))
+        .account_identity_proof_signer(proof_signer(identity))
         .supported_app_components(components)
         .peeler(Box::new(MockPeeler))
         .build()
@@ -183,6 +230,7 @@ fn selfremove_registry() -> FeatureRegistry {
 fn build_client(identity: &[u8], registry: FeatureRegistry) -> impl CgkaEngine {
     EngineBuilder::new(MemoryStorage::new())
         .identity(pad32(identity))
+        .account_identity_proof_signer(proof_signer(identity))
         .feature_registry(registry)
         .peeler(Box::new(MockPeeler))
         .build()
@@ -196,6 +244,7 @@ fn build_client_on_storage(
 ) -> impl CgkaEngine {
     EngineBuilder::new(storage)
         .identity(pad32(identity))
+        .account_identity_proof_signer(proof_signer(identity))
         .feature_registry(registry)
         .peeler(Box::new(MockPeeler))
         .build()
@@ -443,6 +492,49 @@ async fn constructable_capabilities_is_intersection() {
 }
 
 #[tokio::test]
+async fn create_group_rejects_invitee_keypackage_without_account_identity_proof() {
+    let mut alice = build_client(b"alice", selfremove_registry());
+    let bad_kp = key_package_with_raw_identity(&pad32(b"bob-no-proof"));
+
+    let err = alice
+        .create_group(CreateGroupRequest {
+            name: "bad".into(),
+            description: "".into(),
+            members: vec![bad_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, EngineError::InvalidAccountIdentityProof(_)));
+}
+
+#[tokio::test]
+async fn create_group_rejects_invitee_keypackage_with_mismatched_account_identity_proof() {
+    let mut alice = build_client(b"alice", selfremove_registry());
+    let bad_kp = key_package_with_mismatched_account_identity_proof(
+        &pad32(b"bob-credential"),
+        b"mallory-proof",
+    );
+
+    let err = alice
+        .create_group(CreateGroupRequest {
+            name: "bad".into(),
+            description: "".into(),
+            members: vec![bad_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, EngineError::InvalidAccountIdentityProof(_)));
+}
+
+#[tokio::test]
 async fn fresh_key_package_roundtrips_bytes() {
     let mut alice = build_client(b"a", selfremove_registry());
     let kp = alice.fresh_key_package().await.unwrap();
@@ -619,6 +711,7 @@ async fn join_welcome_rejected_when_client_lacks_required_app_component() {
     let carol_storage = MemoryStorage::new();
     let capable_carol = EngineBuilder::new(carol_storage.clone())
         .identity(pad32(b"carol"))
+        .account_identity_proof_signer(proof_signer(b"carol"))
         .supported_app_components([CUSTOM_COMPONENT])
         .peeler(Box::new(MockPeeler))
         .build()
@@ -652,6 +745,7 @@ async fn join_welcome_rejected_when_client_lacks_required_app_component() {
     // Downgraded carol supports no app components.
     let mut downgraded_carol = EngineBuilder::new(carol_storage)
         .identity(pad32(b"carol"))
+        .account_identity_proof_signer(proof_signer(b"carol"))
         .peeler(Box::new(MockPeeler))
         .build()
         .expect("build downgraded carol");

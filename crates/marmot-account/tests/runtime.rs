@@ -2,6 +2,9 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use cgka_engine::account_identity_proof::{
+    AccountIdentityProofRequest, AccountIdentityProofSigner,
+};
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_session::{AccountDeviceSession, PublishWork, SessionConfig};
 use cgka_traits::engine::{CreateGroupRequest, GroupEvent, SendIntent};
@@ -24,10 +27,44 @@ use marmot_account::{
 use storage_sqlite::SqlCipherKey;
 
 fn pad32(name: &[u8]) -> Vec<u8> {
-    let mut out = vec![0u8; 32];
-    let n = name.len().min(32);
-    out[..n].copy_from_slice(&name[..n]);
-    out
+    deterministic_nostr_keys(name)
+        .public_key()
+        .to_bytes()
+        .to_vec()
+}
+
+fn deterministic_nostr_keys(name: &[u8]) -> nostr::Keys {
+    use sha2::{Digest, Sha256};
+    let mut counter = 0u64;
+    loop {
+        let mut hasher = Sha256::new();
+        hasher.update(b"marmot-account-runtime-test-key-v1");
+        hasher.update(name);
+        hasher.update(counter.to_be_bytes());
+        let secret = hasher.finalize();
+        if let Ok(keys) = nostr::Keys::parse(&hex::encode(secret)) {
+            return keys;
+        }
+        counter += 1;
+    }
+}
+
+#[derive(Clone)]
+struct NostrAccountIdentityProofSigner {
+    keys: nostr::Keys,
+}
+
+impl AccountIdentityProofSigner for NostrAccountIdentityProofSigner {
+    fn sign_account_identity_proof(
+        &self,
+        request: &AccountIdentityProofRequest,
+    ) -> Result<[u8; 64], String> {
+        if self.keys.public_key().to_bytes().as_slice() != request.account_identity.as_slice() {
+            return Err("request account identity does not match marmot-account test key".into());
+        }
+        let message = nostr::secp256k1::Message::from_digest(request.signing_digest());
+        Ok(self.keys.sign_schnorr(&message).serialize())
+    }
 }
 
 fn hash_id(bytes: &[u8]) -> MessageId {
@@ -111,6 +148,7 @@ fn session(
     key: &SqlCipherKey,
     identity: &[u8],
 ) -> AccountDeviceSession {
+    let keys = deterministic_nostr_keys(identity);
     AccountDeviceSession::open(
         SessionConfig::new(
             path,
@@ -118,6 +156,7 @@ fn session(
             pad32(identity),
             Box::new(MockPeeler),
         )
+        .account_identity_proof_signer(Arc::new(NostrAccountIdentityProofSigner { keys }))
         .feature_registry(FeatureRegistry::new()),
     )
     .unwrap()

@@ -29,6 +29,9 @@ use cgka_traits::transport::{
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
 use storage_memory::MemoryStorage;
 
+mod support;
+use support::proof_signer;
+
 fn pad32(name: &[u8]) -> Vec<u8> {
     // Marmot credential identities MUST be a valid 32-byte x-only secp256k1
     // public key (spec/foundation/identity.md). Derive one deterministically
@@ -149,6 +152,7 @@ fn build_client(id: &[u8]) -> (Engine<MemoryStorage>, MemoryStorage) {
 fn build_client_with_storage(id: &[u8], storage: MemoryStorage) -> Engine<MemoryStorage> {
     EngineBuilder::new(storage)
         .identity(pad32(id))
+        .account_identity_proof_signer(proof_signer(id))
         .feature_registry(selfremove_registry())
         .peeler(Box::new(MockPeeler))
         .build()
@@ -1534,6 +1538,7 @@ async fn rebuilt_engine_emits_canonical_app_message_after_convergence() {
 
     let mut restarted = EngineBuilder::new(carol_storage.clone())
         .identity(pad32(b"carol"))
+        .account_identity_proof_signer(proof_signer(b"carol"))
         .feature_registry(selfremove_registry())
         .peeler(Box::new(MockPeeler))
         .build()
@@ -1641,6 +1646,7 @@ async fn rebuilt_engine_emits_losing_branch_app_invalidation_after_convergence()
 
     let mut restarted = EngineBuilder::new(carol_storage.clone())
         .identity(pad32(b"carol"))
+        .account_identity_proof_signer(proof_signer(b"carol"))
         .feature_registry(selfremove_registry())
         .peeler(Box::new(MockPeeler))
         .build()
@@ -2317,6 +2323,7 @@ async fn queued_outbound_intent_survives_engine_rebuild() {
 
     let mut restarted = EngineBuilder::new(carol_storage.clone())
         .identity(pad32(b"carol"))
+        .account_identity_proof_signer(proof_signer(b"carol"))
         .feature_registry(selfremove_registry())
         .peeler(Box::new(MockPeeler))
         .build()

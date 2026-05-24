@@ -42,6 +42,10 @@ pub fn key_package_metadata(kp: &KeyPackage) -> Result<KeyPackageMetadata, Engin
         .validate(&crypto, ProtocolVersion::Mls10)
         .map_err(|e| EngineError::Backend(format!("key_package validate: {e:?}")))?;
     let member_id = crate::identity::validated_member_id_of_leaf(key_package.leaf_node())?;
+    crate::account_identity_proof::validate_leaf_account_identity_proof(
+        key_package.leaf_node(),
+        crate::DEFAULT_CIPHERSUITE,
+    )?;
     let key_package_ref = key_package
         .hash_ref(&crypto)
         .map_err(|e| EngineError::Backend(format!("key_package ref: {e:?}")))?;
@@ -68,6 +72,11 @@ pub fn is_last_resort_key_package(kp: &KeyPackage) -> Result<bool, EngineError> 
     let key_package = kp_in
         .validate(&crypto, ProtocolVersion::Mls10)
         .map_err(|e| EngineError::Backend(format!("key_package validate: {e:?}")))?;
+    crate::identity::validated_member_id_of_leaf(key_package.leaf_node())?;
+    crate::account_identity_proof::validate_leaf_account_identity_proof(
+        key_package.leaf_node(),
+        crate::DEFAULT_CIPHERSUITE,
+    )?;
     Ok(key_package.last_resort())
 }
 
@@ -75,9 +84,10 @@ impl<S: StorageProvider> Engine<S> {
     /// Build + persist a fresh KeyPackage, returning its wire bytes.
     pub(crate) fn do_fresh_key_package(&mut self) -> Result<KeyPackage, EngineError> {
         let caps = leaf_capabilities(&self.registry, self.ciphersuite);
-        let leaf_extensions = Extensions::single(
+        let leaf_extensions = Extensions::from_vec(vec![
             crate::app_components::leaf_app_components_extension(&self.supported_app_components)?,
-        )
+            self.identity.account_identity_proof_extension.clone(),
+        ])
         .map_err(|e| EngineError::Backend(format!("leaf extensions: {e:?}")))?;
         let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
 
@@ -124,6 +134,10 @@ impl<S: StorageProvider> Engine<S> {
         // identity is not a valid Marmot account identity. This single gate
         // covers both the create-group and invite invitee paths.
         crate::identity::validated_member_id_of_leaf(key_package.leaf_node())?;
+        crate::account_identity_proof::validate_leaf_account_identity_proof(
+            key_package.leaf_node(),
+            self.ciphersuite,
+        )?;
         Ok(key_package)
     }
 }

@@ -14,6 +14,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use cgka_engine::{
     FeatureRegistry,
+    account_identity_proof::{
+        ACCOUNT_IDENTITY_PROOF_EXTENSION_TYPE, AccountIdentityProofRequest,
+        AccountIdentityProofSigner,
+    },
     canonicalization::CanonicalizationPolicy,
     key_package::{is_last_resort_key_package, key_package_metadata},
 };
@@ -3540,6 +3544,9 @@ impl MarmotApp {
                 account_id.as_slice().to_vec(),
                 Box::new(peeler),
             )
+            .account_identity_proof_signer(Arc::new(NostrAccountIdentityProofSigner {
+                keys: keys.clone(),
+            }))
             .feature_registry(app_feature_registry())
             .supported_app_components(self.supported_app_component_ids())
             .convergence_policy(CanonicalizationPolicy {
@@ -5899,6 +5906,24 @@ struct AppKeyPackagePublisher {
     app_components: Vec<String>,
 }
 
+#[derive(Clone)]
+struct NostrAccountIdentityProofSigner {
+    keys: nostr::Keys,
+}
+
+impl AccountIdentityProofSigner for NostrAccountIdentityProofSigner {
+    fn sign_account_identity_proof(
+        &self,
+        request: &AccountIdentityProofRequest,
+    ) -> Result<[u8; 64], String> {
+        if self.keys.public_key().to_bytes().as_slice() != request.account_identity.as_slice() {
+            return Err("request account identity does not match local Nostr key".into());
+        }
+        let message = nostr::secp256k1::Message::from_digest(request.signing_digest());
+        Ok(self.keys.sign_schnorr(&message).serialize())
+    }
+}
+
 #[async_trait]
 impl KeyPackagePublisher for AppKeyPackagePublisher {
     async fn publish_key_package(
@@ -5924,7 +5949,10 @@ impl KeyPackagePublisher for AppKeyPackagePublisher {
             key_package_slot_id: key_package_id.clone(),
             key_package_ref: metadata.key_package_ref_hex,
             mls_ciphersuite: "0x0001".into(),
-            mls_extensions: vec!["0xf2ee".into()],
+            mls_extensions: vec![
+                "0xf2ee".into(),
+                format!("0x{ACCOUNT_IDENTITY_PROOF_EXTENSION_TYPE:04x}"),
+            ],
             mls_proposals: vec!["0x000a".into()],
             app_components: self.app_components.clone(),
             advertised_relays: publication.endpoints.clone(),
@@ -6034,6 +6062,11 @@ fn key_package_from_record(record: RelayEventRecord) -> Result<FetchedKeyPackage
         .to_owned();
     require_key_package_tag(&event, "mls_ciphersuite", |value| !value.is_empty())?;
     require_multi_value_key_package_tag(&event, "mls_extensions")?;
+    require_multi_value_key_package_tag_contains(
+        &event,
+        "mls_extensions",
+        &format!("0x{ACCOUNT_IDENTITY_PROOF_EXTENSION_TYPE:04x}"),
+    )?;
     require_multi_value_key_package_tag(&event, "mls_proposals")?;
     require_multi_value_key_package_tag(&event, "app_components")?;
     require_multi_value_key_package_tag(&event, "relays")?;
@@ -6120,6 +6153,33 @@ fn require_multi_value_key_package_tag(
     } else {
         Err(AppError::InvalidKeyPackageEvent(format!(
             "empty {name} tag"
+        )))
+    }
+}
+
+fn require_multi_value_key_package_tag_contains(
+    event: &NostrTransportEvent,
+    name: &str,
+    required: &str,
+) -> Result<(), AppError> {
+    let Some(tag) = event
+        .tags
+        .iter()
+        .find(|tag| tag.first().is_some_and(|tag_name| tag_name == name))
+    else {
+        return Err(AppError::InvalidKeyPackageEvent(format!(
+            "missing {name} tag"
+        )));
+    };
+    if tag
+        .iter()
+        .skip(1)
+        .any(|value| value.eq_ignore_ascii_case(required))
+    {
+        Ok(())
+    } else {
+        Err(AppError::InvalidKeyPackageEvent(format!(
+            "{name} tag missing required value {required}"
         )))
     }
 }

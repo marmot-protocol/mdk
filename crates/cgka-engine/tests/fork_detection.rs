@@ -24,6 +24,9 @@ use cgka_traits::transport::{
 use cgka_traits::types::{EpochId, MemberId, MessageId};
 use storage_memory::MemoryStorage;
 
+mod support;
+use support::proof_signer;
+
 fn pad32(name: &[u8]) -> Vec<u8> {
     // Marmot credential identities MUST be a valid 32-byte x-only secp256k1
     // public key (spec/foundation/identity.md). Derive one deterministically
@@ -134,6 +137,7 @@ fn selfremove_registry() -> FeatureRegistry {
 fn build_client(id: &[u8]) -> impl CgkaEngine {
     EngineBuilder::new(MemoryStorage::new())
         .identity(pad32(id))
+        .account_identity_proof_signer(proof_signer(id))
         .feature_registry(selfremove_registry())
         .peeler(Box::new(MockPeeler))
         .build()

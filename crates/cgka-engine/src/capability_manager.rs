@@ -34,6 +34,7 @@ use cgka_traits::types::{GroupId, MemberId};
 use openmls::extensions::Extension;
 use openmls::group::{MlsGroup, StagedCommit};
 use openmls::prelude::{BasicCredential, KeyPackage};
+use openmls_traits::types::Ciphersuite;
 
 /// Cache self's capabilities from the local `MlsGroup`. Called after any
 /// membership change since our own leaf might get updated (e.g. on
@@ -49,8 +50,10 @@ pub(crate) fn cache_self_capabilities<S: StorageProvider>(
     group_id: &GroupId,
     mls_group: &MlsGroup,
     self_id: &MemberId,
+    ciphersuite: Ciphersuite,
 ) -> Result<(), EngineError> {
     if let Some(leaf) = mls_group.own_leaf_node() {
+        crate::account_identity_proof::validate_leaf_account_identity_proof(leaf, ciphersuite)?;
         let caps = capabilities_of_leaf(leaf);
         let bc = BasicCredential::try_from(leaf.credential().clone())
             .map_err(|e| EngineError::Backend(format!("credential: {e:?}")))?;
@@ -75,8 +78,13 @@ pub(crate) fn cache_from_key_packages<S: StorageProvider>(
     storage: &S,
     group_id: &GroupId,
     kps: &[KeyPackage],
+    ciphersuite: Ciphersuite,
 ) -> Result<(), EngineError> {
     for kp in kps {
+        crate::account_identity_proof::validate_leaf_account_identity_proof(
+            kp.leaf_node(),
+            ciphersuite,
+        )?;
         let caps = capabilities_of_key_package(kp);
         let bc = BasicCredential::try_from(kp.leaf_node().credential().clone())
             .map_err(|e| EngineError::Backend(format!("credential: {e:?}")))?;
@@ -96,9 +104,14 @@ pub(crate) fn cache_from_staged_commit<S: StorageProvider>(
     storage: &S,
     group_id: &GroupId,
     staged: &StagedCommit,
+    ciphersuite: Ciphersuite,
 ) -> Result<(), EngineError> {
     for add in staged.add_proposals() {
         let kp = add.add_proposal().key_package();
+        crate::account_identity_proof::validate_leaf_account_identity_proof(
+            kp.leaf_node(),
+            ciphersuite,
+        )?;
         let caps = capabilities_of_key_package(kp);
         let bc = BasicCredential::try_from(kp.leaf_node().credential().clone())
             .map_err(|e| EngineError::Backend(format!("credential: {e:?}")))?;

@@ -29,6 +29,8 @@ use cgka_traits::transport::{EncryptedPayload, TransportEnvelope, TransportMessa
 use cgka_traits::types::{EpochId, GroupId, MemberId};
 use openmls::group::{MlsGroup, MlsGroupCreateConfig, StagedWelcome};
 use openmls::prelude::{BasicCredential, Extension, Extensions, MlsMessageBodyIn, MlsMessageIn};
+use openmls::treesync::Node;
+use openmls_traits::types::Ciphersuite;
 use tls_codec::{Deserialize as _, Serialize as _};
 
 /// MLS exporter input for the Nostr kind-445 group-event encryption key:
@@ -98,9 +100,10 @@ impl<S: StorageProvider> Engine<S> {
         // 2. Build the group config with leaf capabilities, MLS
         //    RequiredCapabilities, and Marmot app-component state.
         let leaf_caps = leaf_capabilities(&self.registry, self.ciphersuite);
-        let leaf_extensions = Extensions::single(
+        let leaf_extensions = Extensions::from_vec(vec![
             crate::app_components::leaf_app_components_extension(&self.supported_app_components)?,
-        )
+            self.identity.account_identity_proof_extension.clone(),
+        ])
         .map_err(|e| EngineError::Backend(format!("leaf extensions: {e:?}")))?;
 
         let creator_pubkey =
@@ -168,6 +171,28 @@ impl<S: StorageProvider> Engine<S> {
 
         let group_id = GroupId::new(mls_group.group_id().as_slice().to_vec());
 
+        // 4. Persist Marmot-side group record with the PROJECTED
+        //    post-merge member set before recording outbound welcomes.
+        //    SQLite enforces message/group foreign keys, so the group row
+        //    must exist before `record_sent_message` writes welcome records.
+        //
+        //    The MLS group is still at epoch 0 pre-merge, but the `members`
+        //    field surfaced via the `CgkaEngine::members` API and walked by
+        //    `feature_status` needs to reflect "who the user thinks is in the
+        //    group" — which includes invitees they just added. On
+        //    `publish_failed` we re-derive from the (still-unmerged) MLS
+        //    state, which naturally rolls the projection back.
+        let projected_members = projected_members_with_pending(&mls_group, &parsed_kps)?;
+        let group_record = Group {
+            id: group_id.clone(),
+            name: req.name.clone(),
+            description: req.description.clone(),
+            epoch: EpochId(mls_group.epoch().as_u64()),
+            members: projected_members,
+            required_capabilities: required_caps,
+        };
+        self.storage.put_group(&group_record)?;
+
         // 5. Wrap welcomes via the peeler.
         //
         // Note: we intentionally do NOT emit the commit. The creator is the
@@ -200,31 +225,18 @@ impl<S: StorageProvider> Engine<S> {
             }
         }
 
-        // 6. Persist Marmot-side group record with the PROJECTED
-        //    post-merge member set. The MLS group is still at epoch 0
-        //    pre-merge, but the `members` field surfaced via the
-        //    `CgkaEngine::members` API and walked by `feature_status`
-        //    needs to reflect "who the user thinks is in the group" —
-        //    which includes invitees they just added. On `publish_failed`
-        //    we re-derive from the (still-unmerged) MLS state, which
-        //    naturally rolls the projection back.
-        let projected_members = projected_members_with_pending(&mls_group, &parsed_kps)?;
-        let group_record = Group {
-            id: group_id.clone(),
-            name: req.name.clone(),
-            description: req.description.clone(),
-            epoch: EpochId(mls_group.epoch().as_u64()),
-            members: projected_members,
-            required_capabilities: required_caps,
-        };
-        self.storage.put_group(&group_record)?;
-
-        crate::capability_manager::cache_from_key_packages(&self.storage, &group_id, &parsed_kps)?;
+        crate::capability_manager::cache_from_key_packages(
+            &self.storage,
+            &group_id,
+            &parsed_kps,
+            self.ciphersuite,
+        )?;
         crate::capability_manager::cache_self_capabilities(
             &self.storage,
             &group_id,
             &mls_group,
             self.identity.self_id(),
+            self.ciphersuite,
         )?;
 
         // 7. Enter PendingPublish — the caller must confirm_published once
@@ -360,7 +372,7 @@ impl<S: StorageProvider> Engine<S> {
         // credential identity (foundation/identity.md, joining.md:65). The
         // Welcome embeds the full ratchet tree, so every current member's
         // credential is checked here at join ingress.
-        validate_member_credentials(&mls_group)?;
+        validate_member_credentials_and_account_proofs(&mls_group, self.ciphersuite)?;
 
         // 5c. Reject the Welcome if the resulting group has active required
         // capabilities (MLS extensions, proposal types, or Marmot app
@@ -407,6 +419,7 @@ impl<S: StorageProvider> Engine<S> {
             &group_id,
             &mls_group,
             self.identity.self_id(),
+            self.ciphersuite,
         )?;
 
         // 7. State machine: Stable at the post-welcome epoch.
@@ -524,6 +537,29 @@ pub(crate) fn projected_members_with_pending(
 pub(crate) fn validate_member_credentials(group: &MlsGroup) -> Result<(), EngineError> {
     for member in group.members() {
         crate::identity::validated_member_id(&member.credential)?;
+    }
+    Ok(())
+}
+
+/// Validate every Marmot member identity and the account-key proof attached to
+/// each LeafNode in the exported MLS ratchet tree.
+pub(crate) fn validate_member_credentials_and_account_proofs(
+    group: &MlsGroup,
+    ciphersuite: Ciphersuite,
+) -> Result<(), EngineError> {
+    validate_member_credentials(group)?;
+    let tree = group.export_ratchet_tree();
+    let value = serde_json::to_value(tree)
+        .map_err(|e| EngineError::Backend(format!("export ratchet tree: {e}")))?;
+    let nodes: Vec<Option<Node>> = serde_json::from_value(value)
+        .map_err(|e| EngineError::Backend(format!("decode exported ratchet tree: {e}")))?;
+    for node in nodes {
+        if let Some(Node::LeafNode(leaf)) = node {
+            crate::account_identity_proof::validate_leaf_account_identity_proof(
+                &leaf,
+                ciphersuite,
+            )?;
+        }
     }
     Ok(())
 }

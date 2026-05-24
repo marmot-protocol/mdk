@@ -22,6 +22,9 @@ use cgka_traits::transport::{
 use cgka_traits::types::{MemberId, MessageId};
 use storage_memory::MemoryStorage;
 
+mod support;
+use support::proof_signer;
+
 fn pad32(name: &[u8]) -> Vec<u8> {
     // Marmot credential identities MUST be a valid 32-byte x-only secp256k1
     // public key (spec/foundation/identity.md). Derive one deterministically
@@ -121,6 +124,7 @@ async fn snapshot_names_do_not_embed_plaintext_group_id() {
     let storage = MemoryStorage::new();
     let mut alice = EngineBuilder::new(storage.clone())
         .identity(pad32(b"alice"))
+        .account_identity_proof_signer(proof_signer(b"alice"))
         .feature_registry(FeatureRegistry::new())
         .peeler(Box::new(MockPeeler))
         .build()
@@ -128,6 +132,7 @@ async fn snapshot_names_do_not_embed_plaintext_group_id() {
 
     let mut bob = EngineBuilder::new(MemoryStorage::new())
         .identity(pad32(b"bob"))
+        .account_identity_proof_signer(proof_signer(b"bob"))
         .feature_registry(FeatureRegistry::new())
         .peeler(Box::new(MockPeeler))
         .build()
@@ -152,6 +157,7 @@ async fn snapshot_names_do_not_embed_plaintext_group_id() {
     // Force a few snapshots: invite, app message, update_group_data.
     let mut carol = EngineBuilder::new(MemoryStorage::new())
         .identity(pad32(b"carol"))
+        .account_identity_proof_signer(proof_signer(b"carol"))
         .feature_registry(FeatureRegistry::new())
         .peeler(Box::new(MockPeeler))
         .build()

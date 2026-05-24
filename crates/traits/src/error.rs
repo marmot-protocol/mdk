@@ -63,6 +63,11 @@ pub enum EngineError {
     #[error("invalid Marmot app message payload: {0}")]
     InvalidAppMessagePayload(String),
 
+    /// A member leaf or KeyPackage does not carry a valid account-key proof
+    /// binding the Marmot credential identity to the MLS leaf signature key.
+    #[error("invalid account identity proof: {0}")]
+    InvalidAccountIdentityProof(String),
+
     /// Epoch fork detected that the current recovery manager could not
     /// resolve, usually because no pre-commit snapshot was available.
     /// Recoverable same-epoch commit races roll back and replay internally.

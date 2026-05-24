@@ -469,21 +469,23 @@ impl<S: StorageProvider> Engine<S> {
                     // would add a member whose credential identity is not a
                     // valid x-only secp256k1 public key, before it mutates
                     // canonical state.
-                    let added: Vec<MemberId> = match staged
-                        .add_proposals()
-                        .map(|p| {
-                            crate::identity::validated_member_id_of_leaf(
-                                p.add_proposal().key_package().leaf_node(),
-                            )
-                        })
-                        .collect::<Result<Vec<_>, _>>()
-                    {
-                        Ok(added) => added,
-                        Err(err) => {
-                            self.update_stored_message_state(&msg.id, MessageState::Failed)?;
-                            return Err(err);
+                    let mut added = Vec::new();
+                    for add in staged.add_proposals() {
+                        let leaf = add.add_proposal().key_package().leaf_node();
+                        match crate::identity::validated_member_id_of_leaf(leaf).and_then(|id| {
+                            crate::account_identity_proof::validate_leaf_account_identity_proof(
+                                leaf,
+                                self.ciphersuite,
+                            )?;
+                            Ok(id)
+                        }) {
+                            Ok(id) => added.push(id),
+                            Err(err) => {
+                                self.update_stored_message_state(&msg.id, MessageState::Failed)?;
+                                return Err(err);
+                            }
                         }
-                    };
+                    }
                     let recovery_snapshot =
                         self.fork_recovery
                             .create_snapshot(&self.storage, &group_id, before)?;
@@ -495,6 +497,7 @@ impl<S: StorageProvider> Engine<S> {
                         &self.storage,
                         &group_id,
                         &staged,
+                        self.ciphersuite,
                     )?;
                     mls_group
                         .merge_staged_commit(&provider, *staged)
@@ -534,6 +537,7 @@ impl<S: StorageProvider> Engine<S> {
                         &group_id,
                         &mls_group,
                         self.identity.self_id(),
+                        self.ciphersuite,
                     )?;
 
                     if let Some((source_epoch, winner, invalidated)) = pending_recovery.take() {
@@ -1055,7 +1059,12 @@ impl<S: StorageProvider> Engine<S> {
         // Epoch stays at the pre-merge value; that updates on confirm.
         // On `publish_failed`, the engine re-derives from the (still-
         // unmerged) MLS state, which naturally drops the projection.
-        crate::capability_manager::cache_from_key_packages(&self.storage, &group_id, &parsed_kps)?;
+        crate::capability_manager::cache_from_key_packages(
+            &self.storage,
+            &group_id,
+            &parsed_kps,
+            self.ciphersuite,
+        )?;
         let mut group_record = existing;
         group_record.members =
             crate::group_lifecycle::projected_members_with_pending(&mls_group, &parsed_kps)?;

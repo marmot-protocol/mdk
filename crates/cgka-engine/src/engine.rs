@@ -29,6 +29,7 @@ use cgka_traits::types::{EpochId, GroupId, MemberId};
 use openmls_rust_crypto::RustCrypto;
 pub use openmls_traits::types::Ciphersuite;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 use std::time::Instant;
 
 /// Default ciphersuite. MLS-1.0 mandatory-to-implement; TLS-ish naming.
@@ -79,6 +80,8 @@ pub struct Engine<S: StorageProvider> {
 pub struct EngineBuilder<S: StorageProvider> {
     storage: S,
     identity_bytes: Option<Vec<u8>>,
+    account_identity_proof_signer:
+        Option<Arc<dyn crate::account_identity_proof::AccountIdentityProofSigner>>,
     registry: FeatureRegistry,
     supported_app_components: AppComponentSet,
     peeler: Option<Box<dyn TransportPeeler>>,
@@ -91,6 +94,7 @@ impl<S: StorageProvider> EngineBuilder<S> {
         Self {
             storage,
             identity_bytes: None,
+            account_identity_proof_signer: None,
             registry: FeatureRegistry::new(),
             supported_app_components: AppComponentSet::new(default_group_components()),
             peeler: None,
@@ -101,6 +105,14 @@ impl<S: StorageProvider> EngineBuilder<S> {
 
     pub fn identity(mut self, bytes: Vec<u8>) -> Self {
         self.identity_bytes = Some(bytes);
+        self
+    }
+
+    pub fn account_identity_proof_signer(
+        mut self,
+        signer: Arc<dyn crate::account_identity_proof::AccountIdentityProofSigner>,
+    ) -> Self {
+        self.account_identity_proof_signer = Some(signer);
         self
     }
 
@@ -148,9 +160,17 @@ impl<S: StorageProvider> EngineBuilder<S> {
         let peeler = self
             .peeler
             .ok_or_else(|| EngineError::Other("TransportPeeler is required".into()))?;
+        let proof_signer = self.account_identity_proof_signer.ok_or_else(|| {
+            EngineError::Other("account identity proof signer is required".into())
+        })?;
         let crypto = RustCrypto::default();
-        let identity = Identity::load_or_generate(self.ciphersuite, identity_bytes, &self.storage)
-            .map_err(EngineError::Other)?;
+        let identity = Identity::load_or_generate(
+            self.ciphersuite,
+            identity_bytes,
+            &self.storage,
+            proof_signer.as_ref(),
+        )
+        .map_err(EngineError::Other)?;
 
         Ok(Engine {
             storage: self.storage,
@@ -186,6 +206,21 @@ impl<S: StorageProvider> Engine<S> {
     /// rows.
     pub fn hydrate_stable_groups_from_storage(&mut self) -> Result<(), EngineError> {
         for group_id in self.storage.list_groups()? {
+            let provider = crate::provider::EngineOpenMlsProvider::<S>::new(
+                &self.crypto,
+                self.storage.mls_storage(),
+            );
+            let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
+            let mls_group = openmls::group::MlsGroup::load(
+                <crate::provider::EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(&provider),
+                &mls_gid,
+            )
+            .map_err(|e| EngineError::Backend(format!("load: {e:?}")))?
+            .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
+            crate::group_lifecycle::validate_member_credentials_and_account_proofs(
+                &mls_group,
+                self.ciphersuite,
+            )?;
             let group = self.storage.get_group(&group_id)?;
             self.epoch_manager.set_stable(group_id, group.epoch);
         }

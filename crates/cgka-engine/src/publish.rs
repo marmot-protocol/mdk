@@ -63,7 +63,12 @@ impl<S: StorageProvider> Engine<S> {
         // leaf node. After merge the staged commit is consumed.
         if let Some(staged) = mls_group.pending_commit() {
             self.retain_current_epoch_snapshot_for_group(&group_id)?;
-            crate::capability_manager::cache_from_staged_commit(&self.storage, &group_id, staged)?;
+            crate::capability_manager::cache_from_staged_commit(
+                &self.storage,
+                &group_id,
+                staged,
+                self.ciphersuite,
+            )?;
             mls_group
                 .merge_pending_commit(&provider)
                 .map_err(|e| EngineError::Backend(format!("merge_pending: {e:?}")))?;
@@ -85,6 +90,7 @@ impl<S: StorageProvider> Engine<S> {
             &group_id,
             &mls_group,
             self.identity.self_id(),
+            self.ciphersuite,
         )?;
         self.retain_current_epoch_snapshot_for_group(&group_id)?;
 

@@ -18,6 +18,9 @@ use cgka_traits::transport::{
 use cgka_traits::types::{GroupId, MemberId, MessageId};
 use storage_memory::MemoryStorage;
 
+mod support;
+use support::proof_signer;
+
 fn pad32(name: &[u8]) -> Vec<u8> {
     // Marmot credential identities MUST be a valid 32-byte x-only secp256k1
     // public key (spec/foundation/identity.md). Derive one deterministically
@@ -131,6 +134,7 @@ fn selfremove_registry() -> FeatureRegistry {
 fn build_client(id: &[u8]) -> Engine<MemoryStorage> {
     EngineBuilder::new(MemoryStorage::new())
         .identity(pad32(id))
+        .account_identity_proof_signer(proof_signer(id))
         .feature_registry(selfremove_registry())
         .peeler(Box::new(MockPeeler))
         .build()
@@ -153,6 +157,7 @@ fn app_payload_for(engine: &Engine<MemoryStorage>, payload: impl AsRef<[u8]>) ->
 fn try_build_raw_identity_client(id: &[u8]) -> Result<Engine<MemoryStorage>, EngineError> {
     EngineBuilder::new(MemoryStorage::new())
         .identity(id.to_vec())
+        .account_identity_proof_signer(proof_signer(b"raw-identity"))
         .feature_registry(selfremove_registry())
         .peeler(Box::new(MockPeeler))
         .build()
@@ -265,6 +270,7 @@ async fn invite_rejects_invitee_missing_required_capability() {
     let mut bob = build_client(b"bob");
     let mut stripped = EngineBuilder::new(MemoryStorage::new())
         .identity(pad32(b"stripped"))
+        .account_identity_proof_signer(proof_signer(b"stripped"))
         .feature_registry(FeatureRegistry::new())
         .peeler(Box::new(MockPeeler))
         .build()

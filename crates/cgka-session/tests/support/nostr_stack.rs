@@ -7,6 +7,9 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use cgka_engine::account_identity_proof::{
+    AccountIdentityProofRequest, AccountIdentityProofSigner,
+};
 use cgka_session::{
     AccountDeviceSession, CreateGroupEffects, IngestEffects, PublishWork, SessionConfig,
 };
@@ -153,8 +156,11 @@ impl NostrStackHarness {
                 self._dir.path().join(format!("{label}.sqlite")),
                 SqlCipherKey::new(self.database_key_material).unwrap(),
                 keys.public_key().to_bytes().to_vec(),
-                Box::new(NostrMlsPeeler::new().with_welcome_signer(keys)),
+                Box::new(NostrMlsPeeler::new().with_welcome_signer(keys.clone())),
             )
+            .account_identity_proof_signer(Arc::new(NostrAccountIdentityProofSigner {
+                keys: keys.clone(),
+            }))
             .supported_app_components(supported_app_components()),
         )
         .unwrap();
@@ -411,6 +417,24 @@ fn deterministic_nostr_keys(seed: &[u8]) -> nostr::Keys {
         counter = counter
             .checked_add(1)
             .expect("deterministic Nostr key search exhausted");
+    }
+}
+
+#[derive(Clone)]
+struct NostrAccountIdentityProofSigner {
+    keys: nostr::Keys,
+}
+
+impl AccountIdentityProofSigner for NostrAccountIdentityProofSigner {
+    fn sign_account_identity_proof(
+        &self,
+        request: &AccountIdentityProofRequest,
+    ) -> Result<[u8; 64], String> {
+        if self.keys.public_key().to_bytes().as_slice() != request.account_identity.as_slice() {
+            return Err("request account identity does not match Nostr stack key".into());
+        }
+        let message = nostr::secp256k1::Message::from_digest(request.signing_digest());
+        Ok(self.keys.sign_schnorr(&message).serialize())
     }
 }
 

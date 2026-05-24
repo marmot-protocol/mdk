@@ -14,6 +14,7 @@
 //!
 //! - [`engine`] — the [`Engine<S>`] struct + its [`EngineBuilder`].
 //! - [`identity`] — local signer + credential bundle.
+//! - [`account_identity_proof`] — account-key proof binding credentials to MLS leaves.
 //! - [`feature_registry`] — runtime feature registry (replaces static constants).
 //! - [`wire_format`] - `PURE_PLAINTEXT_WIRE_FORMAT_POLICY` and review marker.
 //! - [`provider`] - `OpenMlsProvider` adapter composed from crypto + storage.
@@ -29,6 +30,7 @@
 //! - [`auto_committer`] - deterministic SelfRemove auto-commit policy.
 //! - [`app_components`] - Marmot app-component state in `app_data_dictionary`.
 
+pub mod account_identity_proof;
 pub mod app_components;
 
 pub(crate) mod app_payload;

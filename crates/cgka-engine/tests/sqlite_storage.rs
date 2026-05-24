@@ -21,6 +21,9 @@ use cgka_traits::transport::{
 use cgka_traits::types::{EpochId, MemberId, MessageId};
 use storage_sqlite::{SqlCipherKey, SqliteStorage};
 
+mod support;
+use support::proof_signer;
+
 fn pad32(name: &[u8]) -> Vec<u8> {
     // Marmot credential identities MUST be a valid 32-byte x-only secp256k1
     // public key (spec/foundation/identity.md). Derive one deterministically
@@ -122,6 +125,7 @@ impl TransportPeeler for MockPeeler {
 fn build_client(storage: SqliteStorage, identity: &[u8]) -> impl CgkaEngine {
     EngineBuilder::new(storage)
         .identity(pad32(identity))
+        .account_identity_proof_signer(proof_signer(identity))
         .feature_registry(FeatureRegistry::new())
         .peeler(Box::new(MockPeeler))
         .build()

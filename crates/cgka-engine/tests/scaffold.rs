@@ -15,6 +15,9 @@ use cgka_traits::types::MemberId;
 use cgka_traits::{CgkaEngine, EngineError};
 use storage_memory::MemoryStorage;
 
+mod support;
+use support::proof_signer;
+
 /// Deterministic, spec-valid x-only secp256k1 identity derived from a label.
 fn valid_identity(seed: &[u8]) -> Vec<u8> {
     use k256::schnorr::SigningKey;
@@ -72,6 +75,7 @@ fn engine_can_be_built_and_boxed_as_trait_object() {
     let identity = valid_identity(b"self-identity");
     let engine = EngineBuilder::new(MemoryStorage::new())
         .identity(identity.clone())
+        .account_identity_proof_signer(proof_signer(b"self-identity"))
         .peeler(Box::new(StubPeeler))
         .build()
         .expect("build");
@@ -105,6 +109,7 @@ fn builder_rejects_non_mandatory_ciphersuite() {
     // MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519 (0x0001) is permitted.
     let res = EngineBuilder::new(MemoryStorage::new())
         .identity(valid_identity(b"self-identity"))
+        .account_identity_proof_signer(proof_signer(b"self-identity"))
         .peeler(Box::new(StubPeeler))
         .ciphersuite(cgka_engine::Ciphersuite::MLS_128_DHKEMX25519_CHACHA20POLY1305_SHA256_Ed25519)
         .build();
@@ -121,6 +126,7 @@ fn builder_rejects_non_mandatory_ciphersuite() {
 fn builder_accepts_mandatory_ciphersuite_explicitly() {
     let res = EngineBuilder::new(MemoryStorage::new())
         .identity(valid_identity(b"self-identity"))
+        .account_identity_proof_signer(proof_signer(b"self-identity"))
         .peeler(Box::new(StubPeeler))
         .ciphersuite(cgka_engine::DEFAULT_CIPHERSUITE)
         .build();
@@ -131,6 +137,7 @@ fn builder_accepts_mandatory_ciphersuite_explicitly() {
 async fn empty_engine_methods_return_typed_results() {
     let mut engine = EngineBuilder::new(MemoryStorage::new())
         .identity(valid_identity(b"id"))
+        .account_identity_proof_signer(proof_signer(b"id"))
         .peeler(Box::new(StubPeeler))
         .build()
         .unwrap();

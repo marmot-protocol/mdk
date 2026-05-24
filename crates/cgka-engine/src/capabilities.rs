@@ -26,6 +26,7 @@ pub(crate) fn leaf_capabilities(
         ExtensionType::RequiredCapabilities,
         ExtensionType::AppDataDictionary,
         ExtensionType::LastResort,
+        crate::account_identity_proof::account_identity_proof_capability(),
     ];
     let mut proposal_types: Vec<ProposalType> = vec![ProposalType::AppDataUpdate];
 
@@ -61,6 +62,9 @@ pub(crate) fn required_capabilities_extension(
     caps.insert(CTCapability::Extension(u16::from(
         ExtensionType::AppDataDictionary,
     )));
+    caps.insert(CTCapability::Extension(
+        crate::account_identity_proof::ACCOUNT_IDENTITY_PROOF_EXTENSION_TYPE,
+    ));
     caps.insert(CTCapability::Proposal(u16::from(
         ProposalType::AppDataUpdate,
     )));
