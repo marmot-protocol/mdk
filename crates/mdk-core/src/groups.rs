@@ -1089,6 +1089,7 @@ where
         // error into `CreateCommitError::LeafNodeValidation(...)` directly
         // (a sibling variant exists), add that arm too. Anything else keeps
         // its flat-string shape.
+        self.prune_unauthorized_pending_proposals(&mut mls_group, group_id)?;
         let (commit_message, welcome_message, _group_info) = mls_group
             .add_members(&self.provider, &mls_signer, &key_packages_vec)
             .map_err(|e| match e {
@@ -1239,6 +1240,10 @@ where
             None
         };
 
+        // marmot-security #106: drop any non-admin Add/Remove(other)/GCE
+        // proposals from the pending store before the admin commit sweeps it.
+        self.prune_unauthorized_pending_proposals(&mut mls_group, group_id)?;
+
         // Build a single commit containing removal proposals and, if needed,
         // a GroupContextExtensions proposal to update the admin list.
         let mut builder = mls_group
@@ -1324,6 +1329,10 @@ where
         if !self.is_leaf_node_admin(group_id, own_leaf)? {
             return Err(Error::NotAdmin);
         }
+
+        // marmot-security #106: drop any non-admin Add/Remove(other)/GCE
+        // proposals from the pending store before the admin commit sweeps it.
+        self.prune_unauthorized_pending_proposals(mls_group, group_id)?;
 
         let extension = Self::get_unknown_extension_from_group_data(group_data)?;
         let mut extensions = mls_group.extensions().clone();
@@ -1483,7 +1492,7 @@ where
         Ok(relays.into_iter().map(|r| r.relay_url).collect())
     }
 
-    fn get_unknown_extension_from_group_data(
+    pub(crate) fn get_unknown_extension_from_group_data(
         group_data: &NostrGroupDataExtension,
     ) -> Result<Extension, Error> {
         let serialized_group_data = group_data.to_tls_bytes()?;
@@ -1754,6 +1763,13 @@ where
         let mut mls_group = self.load_mls_group(group_id)?.ok_or(Error::GroupNotFound)?;
 
         tracing::debug!(target: "mdk_core::groups::self_update", "Current epoch: {:?}", mls_group.epoch().as_u64());
+
+        // marmot-security #106: drop any non-admin Add/Remove(other)/GCE
+        // proposals before self_update_with_new_signer sweeps the pending
+        // store into this commit. Self-update is callable by both admins and
+        // non-admins; in either case the only proposals that belong in this
+        // commit are admin-authored or intrinsically self-scoped.
+        self.prune_unauthorized_pending_proposals(&mut mls_group, group_id)?;
 
         // Load current signer
         let current_signer: SignatureKeyPair = self.load_mls_signer(&mls_group)?;

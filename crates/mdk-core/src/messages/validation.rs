@@ -2,12 +2,14 @@
 //!
 //! This module handles validation of Nostr events and MLS identity verification.
 
-use mdk_storage_traits::MdkStorageProvider;
+use mdk_storage_traits::{GroupId, MdkStorageProvider};
 use nostr::{Event, Kind, TagKind, Timestamp};
-use openmls::prelude::{BasicCredential, MlsGroup, Proposal, Sender, StagedCommit};
+use openmls::prelude::{BasicCredential, MlsGroup, Proposal, QueuedProposal, Sender, StagedCommit};
+use openmls_traits::OpenMlsProvider;
 
 use crate::MDK;
 use crate::error::Error;
+use crate::extension::NostrGroupDataExtension;
 
 use super::Result;
 
@@ -311,6 +313,17 @@ where
                 let sender_is_admin = group_data.admins.contains(&sender_pubkey);
 
                 if sender_is_admin {
+                    // Defense against marmot-security #106: even from an admin
+                    // committer, every Add/Remove(other)/GCE proposal bundled
+                    // into the commit MUST itself be admin-authored. A peer
+                    // that skips this check would accept a non-admin's
+                    // smuggled membership change just because the wrapper
+                    // commit is admin-signed.
+                    self.validate_committed_proposal_authorship(
+                        mls_group,
+                        staged_commit,
+                        &group_data,
+                    )?;
                     self.validate_admin_invariant_after_commit(mls_group, staged_commit)?;
                     return Ok(());
                 }
@@ -356,6 +369,131 @@ where
                 Err(Error::MessageFromNonMember)
             }
         }
+    }
+
+    /// Returns true iff the queued proposal's proposer is authorized to apply
+    /// it in a commit, per MIP-03.
+    ///
+    /// - `Add`, `GroupContextExtensions`: proposer MUST be in `admins`.
+    /// - `Remove(target)`: proposer MUST be in `admins`, unless the proposal
+    ///   is a self-remove (`sender_leaf == target_leaf`), which represents the
+    ///   legacy `Remove(self)` leave path and is permitted from any member.
+    /// - `Update`, `SelfRemove`: intrinsically self-scoped — always permitted.
+    /// - Any other proposal type, or a non-member sender, is rejected
+    ///   conservatively.
+    pub(crate) fn is_proposal_admin_authorized(
+        &self,
+        mls_group: &MlsGroup,
+        queued: &QueuedProposal,
+        group_data: &NostrGroupDataExtension,
+    ) -> bool {
+        // Cheap exits for intrinsically self-scoped proposals: a non-admin
+        // proposer cannot use these to change *other* members' state.
+        match queued.proposal() {
+            Proposal::Update(_) | Proposal::SelfRemove => return true,
+            _ => {}
+        }
+
+        let Sender::Member(proposer_leaf) = queued.sender() else {
+            return false;
+        };
+
+        // For Remove proposals, a non-admin proposer is allowed only when
+        // they're removing themselves — the legacy Remove(self) leave path.
+        if let Proposal::Remove(remove) = queued.proposal()
+            && *proposer_leaf == remove.removed()
+        {
+            return true;
+        }
+
+        let Some(member) = mls_group.member_at(*proposer_leaf) else {
+            return false;
+        };
+        let Ok(cred) = BasicCredential::try_from(member.credential) else {
+            return false;
+        };
+        let Ok(pubkey) = self.parse_credential_identity(cred.identity()) else {
+            return false;
+        };
+        group_data.admins.contains(&pubkey)
+    }
+
+    /// Walks a staged commit's proposals and rejects any that the proposer was
+    /// not authorized to apply (marmot-security #106 receive-side guard).
+    pub(super) fn validate_committed_proposal_authorship(
+        &self,
+        mls_group: &MlsGroup,
+        staged_commit: &StagedCommit,
+        group_data: &NostrGroupDataExtension,
+    ) -> Result<()> {
+        for queued in staged_commit.queued_proposals() {
+            if self.is_proposal_admin_authorized(mls_group, queued, group_data) {
+                continue;
+            }
+            let label = match queued.proposal() {
+                Proposal::Add(_) => "Add",
+                Proposal::Remove(_) => "Remove",
+                Proposal::GroupContextExtensions(_) => "GroupContextExtensions",
+                Proposal::Update(_) => "Update",
+                Proposal::SelfRemove => "SelfRemove",
+                Proposal::PreSharedKey(_) => "PreSharedKey",
+                Proposal::ReInit(_) => "ReInit",
+                Proposal::ExternalInit(_) => "ExternalInit",
+                Proposal::Custom(_) => "Custom",
+            };
+            let sender_desc = match queued.sender() {
+                Sender::Member(idx) => format!("leaf {}", idx.u32()),
+                Sender::External(_) => "external".to_string(),
+                Sender::NewMemberCommit => "new-member-commit".to_string(),
+                Sender::NewMemberProposal => "new-member-proposal".to_string(),
+            };
+            tracing::warn!(
+                target: "mdk_core::messages::validate_committed_proposal_authorship",
+                "Rejecting commit: unauthorized {} proposal from {}",
+                label,
+                sender_desc,
+            );
+            return Err(Error::UnauthorizedProposalInCommit(format!(
+                "{label} proposal from {sender_desc} is not admin-authored"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Drops every pending proposal that is not admin-authorized before an
+    /// admin builds a commit (marmot-security #106 build-side guard).
+    ///
+    /// OpenMLS' high-level admin commit methods (`add_members`,
+    /// `update_group_context_extensions`, `self_update_with_new_signer`) and
+    /// `commit_builder().consume_proposal_store(true)` all sweep the entire
+    /// pending-proposal store by default. Without this prune, a non-admin's
+    /// queued Add/Remove(other)/GCE proposal would ride into the next
+    /// unrelated admin commit. The receive-side guard is the safety net; this
+    /// pre-drain stops honest admins from publishing the bad commit in the
+    /// first place.
+    pub(crate) fn prune_unauthorized_pending_proposals(
+        &self,
+        mls_group: &mut MlsGroup,
+        _group_id: &GroupId,
+    ) -> Result<()> {
+        let group_data = NostrGroupDataExtension::from_group(mls_group)?;
+        let to_remove: Vec<_> = mls_group
+            .pending_proposals()
+            .filter(|q| !self.is_proposal_admin_authorized(mls_group, q, &group_data))
+            .map(|q| q.proposal_reference_ref().clone())
+            .collect();
+
+        for proposal_ref in to_remove {
+            if let Err(e) =
+                mls_group.remove_pending_proposal(self.provider.storage(), &proposal_ref)
+            {
+                tracing::warn!(
+                    target: "mdk_core::messages::prune_unauthorized_pending_proposals",
+                    "Failed to drop unauthorized pending proposal: {e}",
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Validates that an event's timestamp is within acceptable bounds

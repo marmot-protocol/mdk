@@ -213,6 +213,14 @@ pub enum Error {
     /// Commit message received from a non-admin
     #[error("not processing commit from non-admin")]
     CommitFromNonAdmin,
+    /// Commit bundles a proposal whose proposer is not authorized to apply it
+    ///
+    /// Per MIP-03, Add/Remove(other)/GroupContextExtensions proposals may only
+    /// be *applied* by an admin commit, and the proposals themselves must be
+    /// admin-authored. A commit that smuggles a non-admin's Add/Remove/GCE
+    /// proposal past peers is rejected here.
+    #[error("commit bundles unauthorized proposal: {0}")]
+    UnauthorizedProposalInCommit(String),
     /// Own commit pending merge
     #[error("own commit pending merge")]
     OwnCommitPending,

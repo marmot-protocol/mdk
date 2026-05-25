@@ -956,6 +956,263 @@ mod tests {
         );
     }
 
+    /// Marmot-security #106: a non-admin's Add proposal MUST NOT ride into an
+    /// admin's unrelated commit.
+    ///
+    /// Bob (non-admin) proposes Add(Mallory). Alice (admin) processes the
+    /// proposal — pre-fix it sat in the OpenMLS pending-proposal store. Alice
+    /// then renames the group; pre-fix, the rename commit consumes the whole
+    /// proposal store with `|_| true`, smuggling Bob's Add into Alice's
+    /// admin-signed commit and adding Mallory group-wide.
+    ///
+    /// Post-fix: Alice's rename commit MUST exclude Bob's unauthorized Add,
+    /// and Mallory MUST NOT become a member on either Alice's or Carol's side.
+    #[test]
+    fn ctf_nonadmin_add_proposal_smuggled_into_admin_commit() {
+        use crate::groups::NostrGroupDataUpdate;
+
+        let alice_keys = Keys::generate();
+        let bob_keys = Keys::generate();
+        let carol_keys = Keys::generate();
+        let mallory_keys = Keys::generate();
+
+        let alice_mdk = create_test_mdk();
+        let bob_mdk = create_test_mdk();
+        let carol_mdk = create_test_mdk();
+        let mallory_mdk = create_test_mdk();
+
+        // Only Alice is admin.
+        let admins = vec![alice_keys.public_key()];
+        let bob_kp = create_key_package_event(&bob_mdk, &bob_keys);
+        let carol_kp = create_key_package_event(&carol_mdk, &carol_keys);
+
+        let create_result = alice_mdk
+            .create_group(
+                &alice_keys.public_key(),
+                vec![bob_kp, carol_kp],
+                create_nostr_group_config_data(admins),
+            )
+            .expect("Alice should create group");
+        let group_id = create_result.group.mls_group_id.clone();
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("Alice merges initial commit");
+
+        for (mdk, idx) in [(&bob_mdk, 0usize), (&carol_mdk, 1usize)] {
+            let w = mdk
+                .process_welcome(
+                    &nostr::EventId::all_zeros(),
+                    &create_result.welcome_rumors[idx],
+                )
+                .expect("process welcome");
+            mdk.accept_welcome(&w).expect("accept welcome");
+        }
+
+        let before = alice_mdk.get_members(&group_id).expect("members");
+        assert!(!before.contains(&mallory_keys.public_key()));
+        assert_eq!(before.len(), 3);
+
+        // ATTACK: Bob (non-admin) crafts an Add proposal for outsider Mallory
+        // and publishes it. Bob reaches around MDK's API to call OpenMLS
+        // directly, exactly as a lightly modified client would.
+        let mallory_kp_event = create_key_package_event(&mallory_mdk, &mallory_keys);
+        let mallory_kp = bob_mdk
+            .parse_key_package(&mallory_kp_event)
+            .expect("parse Mallory KeyPackage");
+        let mut bob_group = bob_mdk
+            .load_mls_group(&group_id)
+            .expect("load")
+            .expect("exists");
+        let bob_signer = bob_mdk.load_mls_signer(&bob_group).expect("signer");
+        let (proposal_msg, _ref) = bob_group
+            .propose_add_member(&bob_mdk.provider, &bob_signer, &mallory_kp)
+            .expect("Bob crafts Add proposal");
+        let serialized = proposal_msg.tls_serialize_detached().expect("serialize");
+        let proposal_event = bob_mdk
+            .build_message_event(&group_id, serialized, None)
+            .expect("wrap proposal");
+
+        // Alice and Carol both store Bob's proposal as pending.
+        let res = alice_mdk
+            .process_message(&proposal_event)
+            .expect("Alice processes");
+        assert!(matches!(
+            res,
+            MessageProcessingResult::PendingProposal { .. }
+        ));
+        carol_mdk
+            .process_message(&proposal_event)
+            .expect("Carol processes");
+
+        // Alice does an UNRELATED admin action: rename the group.
+        let rename = alice_mdk
+            .update_group_data(&group_id, NostrGroupDataUpdate::new().name("Renamed"))
+            .expect("Alice renames the group");
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("Alice merges rename");
+        carol_mdk
+            .process_message(&rename.evolution_event)
+            .expect("Carol processes Alice's rename");
+
+        // Post-fix: Mallory MUST NOT be a member, and the legitimate rename MUST
+        // still apply on both sides.
+        let alice_members = alice_mdk.get_members(&group_id).expect("alice members");
+        let carol_members = carol_mdk.get_members(&group_id).expect("carol members");
+        assert!(
+            !alice_members.contains(&mallory_keys.public_key()),
+            "FIX: Mallory must not be smuggled into Alice's view via the rename commit",
+        );
+        assert!(
+            !carol_members.contains(&mallory_keys.public_key()),
+            "FIX: Mallory must not be smuggled into Carol's view via the rename commit",
+        );
+        assert_eq!(
+            alice_members.len(),
+            3,
+            "Alice's member count must still be 3 (Alice, Bob, Carol)"
+        );
+        assert_eq!(
+            carol_members.len(),
+            3,
+            "Carol's member count must still be 3 (Alice, Bob, Carol)"
+        );
+    }
+
+    /// marmot-security #106 receive-side defense-in-depth.
+    ///
+    /// Simulates a non-conformant admin client that skips MDK's build-side
+    /// prune and consumes the entire pending-proposal store the way OpenMLS
+    /// did by default. The smuggled commit is signed by an admin, so a peer
+    /// that only checked the committer would accept it. The receive-side
+    /// guard added in `validate_committed_proposal_authorship` MUST reject it.
+    #[test]
+    fn receive_side_rejects_admin_commit_with_smuggled_nonadmin_add() {
+        use crate::MDK;
+        use crate::error::Error;
+        use crate::extension::NostrGroupDataExtension;
+
+        let alice_keys = Keys::generate();
+        let bob_keys = Keys::generate();
+        let carol_keys = Keys::generate();
+        let mallory_keys = Keys::generate();
+
+        let alice_mdk = create_test_mdk();
+        let bob_mdk = create_test_mdk();
+        let carol_mdk = create_test_mdk();
+        let mallory_mdk = create_test_mdk();
+
+        let admins = vec![alice_keys.public_key()];
+        let bob_kp = create_key_package_event(&bob_mdk, &bob_keys);
+        let carol_kp = create_key_package_event(&carol_mdk, &carol_keys);
+
+        let create_result = alice_mdk
+            .create_group(
+                &alice_keys.public_key(),
+                vec![bob_kp, carol_kp],
+                create_nostr_group_config_data(admins),
+            )
+            .expect("Alice creates group");
+        let group_id = create_result.group.mls_group_id.clone();
+        alice_mdk.merge_pending_commit(&group_id).unwrap();
+
+        for (mdk, idx) in [(&bob_mdk, 0usize), (&carol_mdk, 1usize)] {
+            let w = mdk
+                .process_welcome(
+                    &nostr::EventId::all_zeros(),
+                    &create_result.welcome_rumors[idx],
+                )
+                .unwrap();
+            mdk.accept_welcome(&w).unwrap();
+        }
+
+        // Bob's Add(Mallory) lands in Alice's and Carol's pending stores.
+        let mallory_kp_event = create_key_package_event(&mallory_mdk, &mallory_keys);
+        let mallory_kp = bob_mdk.parse_key_package(&mallory_kp_event).unwrap();
+        let mut bob_group = bob_mdk.load_mls_group(&group_id).unwrap().unwrap();
+        let bob_signer = bob_mdk.load_mls_signer(&bob_group).unwrap();
+        let (proposal_msg, _) = bob_group
+            .propose_add_member(&bob_mdk.provider, &bob_signer, &mallory_kp)
+            .unwrap();
+        let proposal_event = bob_mdk
+            .build_message_event(
+                &group_id,
+                proposal_msg.tls_serialize_detached().unwrap(),
+                None,
+            )
+            .unwrap();
+        alice_mdk.process_message(&proposal_event).unwrap();
+        carol_mdk.process_message(&proposal_event).unwrap();
+
+        // Simulate a malicious / non-conformant admin client: build a rename
+        // commit by calling OpenMLS directly with no pre-drain. This sweeps
+        // Bob's pending Add(Mallory) into Alice's admin-signed commit.
+        let mut alice_mls = alice_mdk.load_mls_group(&group_id).unwrap().unwrap();
+        let alice_signer = alice_mdk.load_mls_signer(&alice_mls).unwrap();
+        let mut group_data = NostrGroupDataExtension::from_group(&alice_mls).unwrap();
+        group_data.name = "Renamed".to_string();
+        let extension =
+            MDK::<mdk_memory_storage::MdkMemoryStorage>::get_unknown_extension_from_group_data(
+                &group_data,
+            )
+            .unwrap();
+        let mut extensions = alice_mls.extensions().clone();
+        extensions.add_or_replace(extension).unwrap();
+        let (message_out, _, _) = alice_mls
+            .update_group_context_extensions(&alice_mdk.provider, extensions, &alice_signer)
+            .expect("non-conformant admin builds a smuggled commit");
+        let evolution_event = alice_mdk
+            .build_message_event(
+                &group_id,
+                message_out.tls_serialize_detached().unwrap(),
+                None,
+            )
+            .unwrap();
+
+        // Carol's receive-side guard MUST reject the smuggled commit. MDK's
+        // top-level processor turns commit-validation errors into a recorded
+        // failure + `Unprocessable`, so the surface shape is Ok-Unprocessable,
+        // not Err — the load-bearing invariant is that Carol does NOT advance
+        // into the smuggled state.
+        let carol_result = carol_mdk
+            .process_message(&evolution_event)
+            .expect("process_message itself does not panic");
+        assert!(
+            matches!(carol_result, MessageProcessingResult::Unprocessable { .. }),
+            "expected Unprocessable (commit rejected), got: {:?}",
+            carol_result,
+        );
+
+        let carol_members = carol_mdk.get_members(&group_id).unwrap();
+        assert!(
+            !carol_members.contains(&mallory_keys.public_key()),
+            "Mallory must not be added to Carol's view"
+        );
+        assert_eq!(
+            carol_members.len(),
+            3,
+            "Carol's member count must remain 3 (Alice, Bob, Carol)"
+        );
+
+        // Ties the rejection back to *our* receive-side guard rather than the
+        // generic catch-all: MDK records a sanitized reason category for
+        // every Failed message; `UnauthorizedProposalInCommit` maps to
+        // `authorization_failed`, the same category as `CommitFromNonAdmin`.
+        use mdk_storage_traits::messages::MessageStorage;
+        let record = carol_mdk
+            .storage()
+            .find_processed_message_by_event_id(&evolution_event.id)
+            .expect("storage lookup")
+            .expect("processed record exists for the rejected commit");
+        let reason = record.failure_reason.unwrap_or_default();
+        assert_eq!(
+            reason, "authorization_failed",
+            "expected receive-side guard rejection (authorization_failed), got: {reason:?}",
+        );
+        // Hold a live reference to the variant so removing it breaks this test.
+        let _ = Error::UnauthorizedProposalInCommit(String::new());
+    }
+
     /// Test that a commit with only the update path (no explicit proposals) from non-admin succeeds
     ///
     /// In MLS, a commit can update the sender's leaf via the "update path" without

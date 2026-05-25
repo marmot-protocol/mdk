@@ -39,6 +39,7 @@ where
             Error::CannotDecryptOwnMessage => "own_message",
             Error::AuthorMismatch => "authentication_failed",
             Error::CommitFromNonAdmin => "authorization_failed",
+            Error::UnauthorizedProposalInCommit(_) => "authorization_failed",
             _ => "processing_failed",
         }
     }
