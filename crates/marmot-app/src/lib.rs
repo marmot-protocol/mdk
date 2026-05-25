@@ -1462,6 +1462,60 @@ impl MarmotAppRuntime {
             .await
     }
 
+    pub fn account_nip65_relays(&self, account_ref: &str) -> Result<Vec<String>, AppError> {
+        let account = self.accounts.resolve(account_ref)?;
+        self.accounts.app.account_nip65_relays(&account.label)
+    }
+
+    pub fn account_inbox_relays(&self, account_ref: &str) -> Result<Vec<String>, AppError> {
+        let account = self.accounts.resolve(account_ref)?;
+        self.accounts.app.account_inbox_relays(&account.label)
+    }
+
+    pub fn account_key_package_relays(&self, account_ref: &str) -> Result<Vec<String>, AppError> {
+        let account = self.accounts.resolve(account_ref)?;
+        self.accounts.app.account_key_package_relays(&account.label)
+    }
+
+    pub async fn set_account_nip65_relays(
+        &self,
+        account_ref: &str,
+        relays: Vec<TransportEndpoint>,
+        bootstrap_relays: Vec<TransportEndpoint>,
+    ) -> Result<AccountRelayListStatus, AppError> {
+        let account = self.accounts.resolve(account_ref)?;
+        self.accounts
+            .app
+            .set_account_nip65_relays(&account.label, relays, bootstrap_relays)
+            .await
+    }
+
+    pub async fn set_account_inbox_relays(
+        &self,
+        account_ref: &str,
+        relays: Vec<TransportEndpoint>,
+        bootstrap_relays: Vec<TransportEndpoint>,
+    ) -> Result<AccountRelayListStatus, AppError> {
+        let account = self.accounts.resolve(account_ref)?;
+        self.accounts
+            .app
+            .set_account_inbox_relays(&account.label, relays, bootstrap_relays)
+            .await
+    }
+
+    pub async fn set_account_key_package_relays(
+        &self,
+        account_ref: &str,
+        relays: Vec<TransportEndpoint>,
+        bootstrap_relays: Vec<TransportEndpoint>,
+    ) -> Result<AccountRelayListStatus, AppError> {
+        let account = self.accounts.resolve(account_ref)?;
+        self.accounts
+            .app
+            .set_account_key_package_relays(&account.label, relays, bootstrap_relays)
+            .await
+    }
+
     pub fn messages_with_query(
         &self,
         account_ref: &str,
@@ -3218,6 +3272,78 @@ impl MarmotApp {
                 )));
             }
         };
+        self.publish_selected_account_relay_lists(
+            label,
+            AccountRelayListBootstrap::new(relays, bootstrap_relays),
+            &[list_kind],
+        )
+        .await
+    }
+
+    pub fn account_nip65_relays(&self, label: &str) -> Result<Vec<String>, AppError> {
+        Ok(self.account_relay_list_status(label)?.nip65.relays)
+    }
+
+    pub fn account_inbox_relays(&self, label: &str) -> Result<Vec<String>, AppError> {
+        Ok(self.account_relay_list_status(label)?.inbox.relays)
+    }
+
+    pub fn account_key_package_relays(&self, label: &str) -> Result<Vec<String>, AppError> {
+        Ok(self.account_relay_list_status(label)?.key_package.relays)
+    }
+
+    pub async fn set_account_nip65_relays(
+        &self,
+        label: &str,
+        relays: Vec<TransportEndpoint>,
+        bootstrap_relays: Vec<TransportEndpoint>,
+    ) -> Result<AccountRelayListStatus, AppError> {
+        self.set_account_relay_list_kind(
+            label,
+            NostrAccountRelayListKind::Nip65,
+            relays,
+            bootstrap_relays,
+        )
+        .await
+    }
+
+    pub async fn set_account_inbox_relays(
+        &self,
+        label: &str,
+        relays: Vec<TransportEndpoint>,
+        bootstrap_relays: Vec<TransportEndpoint>,
+    ) -> Result<AccountRelayListStatus, AppError> {
+        self.set_account_relay_list_kind(
+            label,
+            NostrAccountRelayListKind::Inbox,
+            relays,
+            bootstrap_relays,
+        )
+        .await
+    }
+
+    pub async fn set_account_key_package_relays(
+        &self,
+        label: &str,
+        relays: Vec<TransportEndpoint>,
+        bootstrap_relays: Vec<TransportEndpoint>,
+    ) -> Result<AccountRelayListStatus, AppError> {
+        self.set_account_relay_list_kind(
+            label,
+            NostrAccountRelayListKind::KeyPackage,
+            relays,
+            bootstrap_relays,
+        )
+        .await
+    }
+
+    async fn set_account_relay_list_kind(
+        &self,
+        label: &str,
+        list_kind: NostrAccountRelayListKind,
+        relays: Vec<TransportEndpoint>,
+        bootstrap_relays: Vec<TransportEndpoint>,
+    ) -> Result<AccountRelayListStatus, AppError> {
         self.publish_selected_account_relay_lists(
             label,
             AccountRelayListBootstrap::new(relays, bootstrap_relays),

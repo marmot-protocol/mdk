@@ -110,3 +110,34 @@ async fn media_binding_records_are_public_and_methods_validate_group_hex() {
         .expect_err("invalid group hex should fail before upload");
     assert!(format!("{upload_error}").contains("invalid hex"));
 }
+
+#[tokio::test]
+async fn relay_list_binding_methods_are_public() {
+    install_mock_keyring();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let kit = Marmot::new(
+        tmp.path().to_string_lossy().into_owned(),
+        vec!["wss://relay.invalid.test".to_string()],
+    )
+    .expect("open marmot kit");
+    let relays = vec!["wss://relay.invalid.test".to_string()];
+
+    assert!(kit.account_nip65_relays("missing".into()).is_err());
+    assert!(kit.account_inbox_relays("missing".into()).is_err());
+    assert!(kit.account_key_package_relays("missing".into()).is_err());
+    assert!(
+        kit.set_account_nip65_relays("missing".into(), relays.clone(), relays.clone())
+            .await
+            .is_err()
+    );
+    assert!(
+        kit.set_account_inbox_relays("missing".into(), relays.clone(), relays.clone())
+            .await
+            .is_err()
+    );
+    assert!(
+        kit.set_account_key_package_relays("missing".into(), relays.clone(), relays)
+            .await
+            .is_err()
+    );
+}

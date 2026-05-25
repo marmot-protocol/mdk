@@ -1404,6 +1404,59 @@ async fn relay_app_publishes_account_relay_lists_for_setup() {
 }
 
 #[tokio::test]
+async fn relay_app_public_methods_read_and_update_each_account_relay_list() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    let (_seed, app, seed_url) = mock_app(&dir).await;
+    let (_inbox_relay, inbox_url) = mock_relay().await;
+    let (_key_package_relay, key_package_url) = mock_relay().await;
+
+    let status = app
+        .set_account_nip65_relays(
+            "alice",
+            vec![endpoint(&seed_url)],
+            vec![endpoint(&seed_url)],
+        )
+        .await
+        .unwrap();
+    assert_eq!(status.nip65.relays, vec![seed_url.clone()]);
+    assert_eq!(
+        app.account_nip65_relays("alice").unwrap(),
+        vec![seed_url.clone()]
+    );
+
+    let status = app
+        .set_account_inbox_relays(
+            "alice",
+            vec![endpoint(&inbox_url)],
+            vec![endpoint(&seed_url)],
+        )
+        .await
+        .unwrap();
+    assert_eq!(status.inbox.relays, vec![inbox_url.clone()]);
+    assert_eq!(
+        app.account_inbox_relays("alice").unwrap(),
+        vec![inbox_url.clone()]
+    );
+
+    let status = app
+        .set_account_key_package_relays(
+            "alice",
+            vec![endpoint(&key_package_url)],
+            vec![endpoint(&seed_url)],
+        )
+        .await
+        .unwrap();
+    assert!(status.complete);
+    assert_eq!(status.key_package.relays, vec![key_package_url.clone()]);
+    assert_eq!(
+        app.account_key_package_relays("alice").unwrap(),
+        vec![key_package_url.clone()]
+    );
+}
+
+#[tokio::test]
 async fn relay_list_fetch_only_uses_requested_bootstrap_relays() {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());

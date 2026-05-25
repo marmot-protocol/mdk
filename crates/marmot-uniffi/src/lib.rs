@@ -192,6 +192,72 @@ impl Marmot {
         Ok(())
     }
 
+    pub fn account_nip65_relays(&self, account_ref: String) -> Result<Vec<String>, MarmotKitError> {
+        Ok(self.runtime.account_nip65_relays(&account_ref)?)
+    }
+
+    pub fn account_inbox_relays(&self, account_ref: String) -> Result<Vec<String>, MarmotKitError> {
+        Ok(self.runtime.account_inbox_relays(&account_ref)?)
+    }
+
+    pub fn account_key_package_relays(
+        &self,
+        account_ref: String,
+    ) -> Result<Vec<String>, MarmotKitError> {
+        Ok(self.runtime.account_key_package_relays(&account_ref)?)
+    }
+
+    pub async fn set_account_nip65_relays(
+        &self,
+        account_ref: String,
+        relays: Vec<String>,
+        bootstrap_relays: Vec<String>,
+    ) -> Result<conversions::AccountRelayListsFfi, MarmotKitError> {
+        let status = self
+            .runtime
+            .set_account_nip65_relays(
+                &account_ref,
+                endpoints(&relays),
+                endpoints(&bootstrap_relays),
+            )
+            .await?;
+        Ok(status.into())
+    }
+
+    pub async fn set_account_inbox_relays(
+        &self,
+        account_ref: String,
+        relays: Vec<String>,
+        bootstrap_relays: Vec<String>,
+    ) -> Result<conversions::AccountRelayListsFfi, MarmotKitError> {
+        let status = self
+            .runtime
+            .set_account_inbox_relays(
+                &account_ref,
+                endpoints(&relays),
+                endpoints(&bootstrap_relays),
+            )
+            .await?;
+        Ok(status.into())
+    }
+
+    pub async fn set_account_key_package_relays(
+        &self,
+        account_ref: String,
+        relays: Vec<String>,
+        bootstrap_relays: Vec<String>,
+    ) -> Result<conversions::AccountRelayListsFfi, MarmotKitError> {
+        let status = self
+            .runtime
+            .set_account_key_package_relays(
+                &account_ref,
+                endpoints(&relays),
+                endpoints(&bootstrap_relays),
+            )
+            .await?;
+        Ok(status.into())
+    }
+
     /// Publish the Nostr kind:0 metadata for `account_ref`. The returned
     /// metadata is what marmot-app actually published (any server-applied
     /// defaults are reflected here).
