@@ -153,6 +153,22 @@ impl MessageStorage for MdkMemoryStorage {
         Ok(inner.processed_messages_cache.get(event_id).cloned())
     }
 
+    fn find_processed_message_by_message_event_id(
+        &self,
+        mls_group_id: &GroupId,
+        message_event_id: &EventId,
+    ) -> Result<Option<ProcessedMessage>, MessageError> {
+        let inner = self.inner.read();
+        Ok(inner
+            .processed_messages_cache
+            .values()
+            .find(|processed_message| {
+                processed_message.mls_group_id.as_ref() == Some(mls_group_id)
+                    && processed_message.message_event_id.as_ref() == Some(message_event_id)
+            })
+            .cloned())
+    }
+
     fn save_processed_message(
         &self,
         mut processed_message: ProcessedMessage,

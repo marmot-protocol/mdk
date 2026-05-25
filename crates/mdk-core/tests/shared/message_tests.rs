@@ -56,6 +56,11 @@ where
         EventId::from_hex("1111111111111111111111111111111111111111111111111111111111111111")
             .unwrap();
     let processed_message = create_test_processed_message(wrapper_event_id, Some(message_event_id));
+    let mls_group_id = GroupId::from_slice(&[1, 2, 3, 13]);
+    let processed_message = mdk_storage_traits::messages::types::ProcessedMessage {
+        mls_group_id: Some(mls_group_id.clone()),
+        ..processed_message
+    };
 
     // Test save
     storage
@@ -71,8 +76,14 @@ where
     assert_eq!(found.wrapper_event_id, wrapper_event_id);
     assert_eq!(found.message_event_id, Some(message_event_id));
 
-    // Note: The MessageStorage trait doesn't have find_processed_message_by_message_event_id
-    // We only test find_processed_message_by_event_id which finds by wrapper event id
+    // Test find by stable inner message/digest id within a group
+    let found = storage
+        .find_processed_message_by_message_event_id(&mls_group_id, &message_event_id)
+        .unwrap();
+    assert!(found.is_some());
+    let found = found.unwrap();
+    assert_eq!(found.wrapper_event_id, wrapper_event_id);
+    assert_eq!(found.message_event_id, Some(message_event_id));
 
     // Test find non-existent
     let non_existent_id =
@@ -80,6 +91,17 @@ where
             .unwrap();
     let result = storage
         .find_processed_message_by_event_id(&non_existent_id)
+        .unwrap();
+    assert!(result.is_none());
+
+    let result = storage
+        .find_processed_message_by_message_event_id(&mls_group_id, &non_existent_id)
+        .unwrap();
+    assert!(result.is_none());
+
+    let other_group_id = GroupId::from_slice(&[9, 9, 9, 9]);
+    let result = storage
+        .find_processed_message_by_message_event_id(&other_group_id, &message_event_id)
         .unwrap();
     assert!(result.is_none());
 }

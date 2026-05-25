@@ -2,10 +2,10 @@
 //!
 //! This module contains the main entry points for processing MLS messages.
 
-use mdk_storage_traits::MdkStorageProvider;
 use mdk_storage_traits::groups::types as group_types;
 use mdk_storage_traits::messages::types as message_types;
-use nostr::{Event, Timestamp};
+use mdk_storage_traits::{GroupId, MdkStorageProvider};
+use nostr::{Event, EventId, Timestamp};
 use openmls::group::{ProcessMessageError, ValidationError};
 use openmls::prelude::{
     ContentType, MlsGroup, MlsMessageIn, ProcessedMessage, ProcessedMessageContent, Proposal,
@@ -130,15 +130,13 @@ where
                 match processed_mls_message.into_content() {
                     ProcessedMessageContent::ApplicationMessage(application_message) => {
                         Ok(MessageProcessingOutcome::new(
-                            MessageProcessingResult::ApplicationMessage(
-                                self.process_application_message(
-                                    group,
-                                    mls_group.epoch().as_u64(),
-                                    event,
-                                    application_message,
-                                    sender_credential,
-                                )?,
-                            ),
+                            self.process_application_message(
+                                group,
+                                mls_group.epoch().as_u64(),
+                                event,
+                                application_message,
+                                sender_credential,
+                            )?,
                             sender_leaf_index,
                         ))
                     }
@@ -163,7 +161,7 @@ where
                         // Save a processed message so we don't reprocess
                         let processed_message = super::create_processed_message_record(
                             event.id,
-                            None,
+                            Some(super::content_hash_event_id(&event.content)),
                             Some(mls_group.epoch().as_u64()),
                             Some(group.mls_group_id.clone()),
                             message_types::ProcessedMessageState::Processed,
@@ -300,7 +298,7 @@ where
                 // Save a processed message so we don't reprocess
                 let processed_message = super::create_processed_message_record(
                     event.id,
-                    None,
+                    Some(super::content_hash_event_id(&event.content)),
                     Some(mls_group.epoch().as_u64()),
                     Some(group.mls_group_id.clone()),
                     message_types::ProcessedMessageState::ProcessedCommit,
@@ -443,6 +441,22 @@ where
             }
         };
 
+        let content_hash_event_id = super::content_hash_event_id(&event.content);
+        if let Some(group) = self
+            .storage()
+            .find_group_by_nostr_group_id(&nostr_group_id)
+            .map_err(|_e| Error::Group("Storage error while finding group".to_string()))?
+            && self.is_content_hash_replay(&group.mls_group_id, &content_hash_event_id, event.id)?
+        {
+            return self.record_replayed_mls_payload(
+                event.id,
+                content_hash_event_id,
+                group.epoch,
+                group.mls_group_id,
+                "Dropped replayed MLS payload before decrypt",
+            );
+        }
+
         // Step 2: Load group and decrypt message
         let decrypt_result = match now {
             Some(now) => self.decrypt_message_at(nostr_group_id, event, now.as_secs()),
@@ -476,6 +490,16 @@ where
             }
         };
 
+        if self.is_content_hash_replay(&group.mls_group_id, &content_hash_event_id, event.id)? {
+            return self.record_replayed_mls_payload(
+                event.id,
+                content_hash_event_id,
+                mls_group.epoch().as_u64(),
+                group.mls_group_id,
+                "Dropped replayed MLS payload",
+            );
+        }
+
         // Step 3: Process the decrypted message
         match self.dispatch_by_content_type_with_context(
             group.clone(),
@@ -486,6 +510,47 @@ where
             Ok(outcome) => Ok(outcome),
             Err(error) => self.handle_processing_error(error, event, &group),
         }
+    }
+
+    fn is_content_hash_replay(
+        &self,
+        mls_group_id: &GroupId,
+        content_hash_event_id: &EventId,
+        wrapper_event_id: EventId,
+    ) -> Result<bool> {
+        Ok(self
+            .storage()
+            .find_processed_message_by_message_event_id(mls_group_id, content_hash_event_id)
+            .map_err(|e| Error::Message(e.to_string()))?
+            .is_some_and(|processed| processed.wrapper_event_id != wrapper_event_id))
+    }
+
+    fn record_replayed_mls_payload(
+        &self,
+        wrapper_event_id: EventId,
+        content_hash_event_id: EventId,
+        epoch: u64,
+        mls_group_id: GroupId,
+        log_message: &'static str,
+    ) -> Result<MessageProcessingOutcome> {
+        let processed_message = super::create_processed_message_record(
+            wrapper_event_id,
+            Some(content_hash_event_id),
+            Some(epoch),
+            Some(mls_group_id.clone()),
+            message_types::ProcessedMessageState::Processed,
+            None,
+        );
+        self.save_processed_message_record(processed_message)?;
+
+        tracing::debug!(
+            target: "mdk_core::messages::process_message",
+            "{log_message}"
+        );
+
+        Ok(MessageProcessingOutcome::without_context(
+            MessageProcessingResult::Unprocessable { mls_group_id },
+        ))
     }
 }
 
@@ -1045,6 +1110,143 @@ mod tests {
             group.last_message_id.is_some(),
             "Group should have last message ID"
         );
+    }
+
+    #[test]
+    fn test_replayed_application_payload_with_fresh_wrapper_is_not_returned_again() {
+        let alice_mdk = create_test_mdk();
+        let bob_mdk = create_test_mdk();
+        let alice_keys = Keys::generate();
+        let bob_keys = Keys::generate();
+        let bob_key_package = create_key_package_event(&bob_mdk, &bob_keys);
+
+        let create_result = alice_mdk
+            .create_group(
+                &alice_keys.public_key(),
+                vec![bob_key_package],
+                create_nostr_group_config_data(vec![alice_keys.public_key()]),
+            )
+            .expect("Alice should create group");
+        let group_id = create_result.group.mls_group_id.clone();
+
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("Alice should merge initial commit");
+
+        let bob_welcome = bob_mdk
+            .process_welcome(
+                &nostr::EventId::all_zeros(),
+                &create_result.welcome_rumors[0],
+            )
+            .expect("Bob should process welcome");
+        bob_mdk
+            .accept_welcome(&bob_welcome)
+            .expect("Bob should accept welcome");
+
+        let rumor = create_test_rumor(&alice_keys, "Replay me once");
+        let original_event = alice_mdk
+            .create_message(&group_id, rumor, None)
+            .expect("Alice should create message");
+
+        let replay_event = EventBuilder::new(original_event.kind, original_event.content.clone())
+            .tags(original_event.tags.clone())
+            .sign_with_keys(&Keys::generate())
+            .expect("Replay wrapper should sign");
+        assert_ne!(original_event.id, replay_event.id);
+        assert_eq!(original_event.content, replay_event.content);
+
+        let first_result = bob_mdk
+            .process_message(&original_event)
+            .expect("First message should process");
+        assert!(matches!(
+            first_result,
+            MessageProcessingResult::ApplicationMessage(_)
+        ));
+
+        let replay_result = bob_mdk
+            .process_message(&replay_event)
+            .expect("Replay should be handled gracefully");
+        assert!(matches!(
+            replay_result,
+            MessageProcessingResult::Unprocessable { mls_group_id }
+                if mls_group_id == group_id
+        ));
+
+        let messages = bob_mdk
+            .get_messages(&group_id, None)
+            .expect("Messages should load");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].wrapper_event_id, original_event.id);
+    }
+
+    #[test]
+    fn test_replayed_commit_payload_with_fresh_wrapper_is_not_reprocessed() {
+        let alice_mdk = create_test_mdk();
+        let bob_mdk = create_test_mdk();
+        let alice_keys = Keys::generate();
+        let bob_keys = Keys::generate();
+        let bob_key_package = create_key_package_event(&bob_mdk, &bob_keys);
+
+        let create_result = alice_mdk
+            .create_group(
+                &alice_keys.public_key(),
+                vec![bob_key_package],
+                create_nostr_group_config_data(vec![alice_keys.public_key()]),
+            )
+            .expect("Alice should create group");
+        let group_id = create_result.group.mls_group_id.clone();
+
+        alice_mdk
+            .merge_pending_commit(&group_id)
+            .expect("Alice should merge initial commit");
+
+        let bob_welcome = bob_mdk
+            .process_welcome(
+                &nostr::EventId::all_zeros(),
+                &create_result.welcome_rumors[0],
+            )
+            .expect("Bob should process welcome");
+        bob_mdk
+            .accept_welcome(&bob_welcome)
+            .expect("Bob should accept welcome");
+
+        let update_result = alice_mdk
+            .update_group_data(
+                &group_id,
+                NostrGroupDataUpdate::new().name("Replay-resistant name".to_string()),
+            )
+            .expect("Alice should update group");
+        let original_event = update_result.evolution_event;
+
+        let replay_event = EventBuilder::new(original_event.kind, original_event.content.clone())
+            .tags(original_event.tags.clone())
+            .sign_with_keys(&Keys::generate())
+            .expect("Replay wrapper should sign");
+        assert_ne!(original_event.id, replay_event.id);
+        assert_eq!(original_event.content, replay_event.content);
+
+        let first_result = bob_mdk
+            .process_message(&original_event)
+            .expect("First commit should process");
+        assert!(matches!(
+            first_result,
+            MessageProcessingResult::Commit { .. }
+        ));
+
+        let replay_result = bob_mdk
+            .process_message(&replay_event)
+            .expect("Replay should be handled gracefully");
+        assert!(matches!(
+            replay_result,
+            MessageProcessingResult::Unprocessable { mls_group_id }
+                if mls_group_id == group_id
+        ));
+
+        let group = bob_mdk
+            .get_group(&group_id)
+            .expect("Group lookup should succeed")
+            .expect("Group should exist");
+        assert_eq!(group.name, "Replay-resistant name");
     }
 
     /// Single-client message idempotency

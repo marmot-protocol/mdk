@@ -42,6 +42,13 @@ pub trait MessageStorage {
         event_id: &EventId,
     ) -> Result<Option<ProcessedMessage>, MessageError>;
 
+    /// Find a processed message by stable inner message/digest ID within a group.
+    fn find_processed_message_by_message_event_id(
+        &self,
+        mls_group_id: &GroupId,
+        message_event_id: &EventId,
+    ) -> Result<Option<ProcessedMessage>, MessageError>;
+
     /// Mark messages with epoch > target as EpochInvalidated
     /// Returns EventIds of invalidated messages
     fn invalidate_messages_after_epoch(

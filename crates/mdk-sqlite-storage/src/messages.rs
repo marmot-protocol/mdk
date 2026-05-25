@@ -151,6 +151,27 @@ impl MessageStorage for MdkSqliteStorage {
         })
     }
 
+    fn find_processed_message_by_message_event_id(
+        &self,
+        mls_group_id: &mdk_storage_traits::GroupId,
+        message_event_id: &EventId,
+    ) -> Result<Option<ProcessedMessage>, MessageError> {
+        self.with_connection(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT * FROM processed_messages WHERE mls_group_id = ? AND message_event_id = ? LIMIT 1",
+                )
+                .map_err(into_message_err)?;
+
+            stmt.query_row(
+                params![mls_group_id.as_slice(), message_event_id.to_bytes()],
+                db::row_to_processed_message,
+            )
+            .optional()
+            .map_err(into_message_err)
+        })
+    }
+
     fn invalidate_messages_after_epoch(
         &self,
         group_id: &mdk_storage_traits::GroupId,

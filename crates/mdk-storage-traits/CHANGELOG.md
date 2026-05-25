@@ -27,6 +27,7 @@
 
 ### Breaking changes
 
+- Added `MessageStorage::find_processed_message_by_message_event_id` so storage backends can perform group-scoped processed-message lookups by stable inner message/content-hash ID. Storage implementors must add this method. ([#316](https://github.com/marmot-protocol/mdk/pull/316))
 - Changed default serde serialization for `Secret<T>` to fail instead of emitting wrapped secret values. Use `Secret::expose_for_serialization()` for deliberate plaintext exports. ([#280](https://github.com/marmot-protocol/mdk/pull/280))
 - Added `disappearing_message_secs: Option<u64>` field to the `Group` struct. All code that constructs `Group` structs must now provide this field. `None` means messages persist forever; `Some(n)` means messages expire after `n` seconds. ([#253](https://github.com/marmot-protocol/mdk/pull/253))
 

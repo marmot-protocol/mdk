@@ -46,6 +46,14 @@ pub(crate) fn content_hash(content: &str) -> [u8; 32] {
     Sha256::digest(content.as_bytes()).into()
 }
 
+/// Synthetic processed-message key for ciphertext replay detection.
+///
+/// This is a SHA-256 digest encoded in the same 32-byte shape as `EventId`; it is
+/// not a real Nostr event id.
+pub(crate) fn content_hash_event_id(content: &str) -> EventId {
+    EventId::from_slice(&content_hash(content)).expect("SHA-256 digest is always 32 bytes")
+}
+
 // =============================================================================
 // Helper Functions for ProcessedMessage Creation
 // =============================================================================
@@ -336,6 +344,19 @@ mod tests {
 
     use crate::test_util::*;
     use crate::tests::create_test_mdk;
+
+    #[test]
+    fn test_content_hash_event_id_is_stable_and_content_sensitive() {
+        let first = super::content_hash_event_id("same payload");
+        let second = super::content_hash_event_id("same payload");
+        let different = super::content_hash_event_id("different payload");
+        let expected = EventId::from_slice(&super::content_hash("same payload"))
+            .expect("content hash should be a valid synthetic event id");
+
+        assert_eq!(first, second);
+        assert_eq!(first, expected);
+        assert_ne!(first, different);
+    }
 
     #[test]
     fn test_get_message_not_found() {

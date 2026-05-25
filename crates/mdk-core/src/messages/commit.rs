@@ -115,7 +115,7 @@ where
         // Save a processed message so we don't reprocess
         let processed_message = super::create_processed_message_record(
             event.id,
-            None,
+            Some(super::content_hash_event_id(&event.content)),
             Some(mls_group.epoch().as_u64()),
             Some(group_id.clone()),
             message_types::ProcessedMessageState::ProcessedCommit,
@@ -168,7 +168,7 @@ where
 
         let processed_message = super::create_processed_message_record(
             event.id,
-            None,
+            Some(super::content_hash_event_id(&event.content)),
             group_epoch,
             Some(group_id.clone()),
             message_types::ProcessedMessageState::Processed,

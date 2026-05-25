@@ -10,7 +10,7 @@ use openmls::prelude::ApplicationMessage;
 
 use crate::MDK;
 
-use super::Result;
+use super::{MessageProcessingResult, Result};
 
 impl<Storage> MDK<Storage>
 where
@@ -40,20 +40,56 @@ where
     /// * `Err(Error)` - If message processing, author verification, or storage fails
     pub(super) fn process_application_message(
         &self,
-        mut group: group_types::Group,
+        group: group_types::Group,
         mls_epoch: u64,
         event: &Event,
         application_message: ApplicationMessage,
         sender_credential: openmls::credentials::Credential,
-    ) -> Result<message_types::Message> {
+    ) -> Result<MessageProcessingResult> {
         // This is a message from a group member
         let bytes = application_message.into_bytes();
-        let mut rumor: UnsignedEvent = UnsignedEvent::from_json(bytes)?;
+        let rumor: UnsignedEvent = UnsignedEvent::from_json(bytes)?;
 
         rumor.verify_id()?;
         self.verify_rumor_author(&rumor.pubkey, sender_credential)?;
 
+        self.process_application_rumor(group, mls_epoch, event, rumor)
+    }
+
+    fn process_application_rumor(
+        &self,
+        mut group: group_types::Group,
+        mls_epoch: u64,
+        event: &Event,
+        mut rumor: UnsignedEvent,
+    ) -> Result<MessageProcessingResult> {
         let rumor_id: EventId = rumor.id();
+
+        if let Some(existing_message) = self
+            .storage()
+            .find_message_by_event_id(&group.mls_group_id, &rumor_id)
+            .map_err(|e| crate::error::Error::Message(e.to_string()))?
+            && existing_message.wrapper_event_id != event.id
+        {
+            let processed_message = super::create_processed_message_record(
+                event.id,
+                Some(rumor_id),
+                Some(mls_epoch),
+                Some(group.mls_group_id.clone()),
+                message_types::ProcessedMessageState::Processed,
+                None,
+            );
+            self.save_processed_message_record(processed_message)?;
+
+            tracing::debug!(
+                target: "mdk_core::messages::process_message",
+                "Dropped replayed application message"
+            );
+
+            return Ok(MessageProcessingResult::Unprocessable {
+                mls_group_id: group.mls_group_id,
+            });
+        }
 
         let processed_message = super::create_processed_message_record(
             event.id,
@@ -95,7 +131,7 @@ where
             target: "mdk_core::messages::process_message",
             "Processed application message"
         );
-        Ok(message)
+        Ok(MessageProcessingResult::ApplicationMessage(message))
     }
 }
 
@@ -103,7 +139,7 @@ where
 mod tests {
     use mdk_storage_traits::messages::MessageStorage;
     use mdk_storage_traits::messages::types as message_types;
-    use nostr::{EventId, JsonUtil, Keys, Kind};
+    use nostr::{EventBuilder, EventId, JsonUtil, Keys, Kind};
     use tls_codec::Serialize as TlsSerialize;
 
     use crate::messages::MessageProcessingResult;
@@ -145,6 +181,45 @@ mod tests {
         );
         assert_eq!(processed_message.message_event_id, Some(rumor_id));
         assert_eq!(processed_message.wrapper_event_id, event.id);
+    }
+
+    #[test]
+    fn test_application_replay_with_fresh_wrapper_returns_unprocessable() {
+        let mdk = create_test_mdk();
+        let (creator, members, admins) = create_test_group_members();
+        let group_id = create_test_group(&mdk, &creator, &members, &admins);
+        let group = mdk
+            .get_group(&group_id)
+            .expect("group lookup should succeed")
+            .expect("group should exist");
+        let mut rumor = create_test_rumor(&creator, "fresh wrapper replay");
+        let rumor_id = rumor.id();
+        let original_event = mdk
+            .create_message(&group_id, rumor.clone(), None)
+            .expect("message should be stored");
+        let replay_event = EventBuilder::new(Kind::MlsGroupMessage, "replayed ciphertext")
+            .sign_with_keys(&Keys::generate())
+            .expect("replay wrapper should sign");
+        assert_ne!(original_event.id, replay_event.id);
+
+        let result = mdk
+            .process_application_rumor(group, 0, &replay_event, rumor)
+            .expect("replay should be handled");
+
+        assert!(matches!(
+            result,
+            MessageProcessingResult::Unprocessable { mls_group_id } if mls_group_id == group_id
+        ));
+        let processed = mdk
+            .storage()
+            .find_processed_message_by_event_id(&replay_event.id)
+            .expect("processed replay lookup should succeed")
+            .expect("processed replay should be stored");
+        assert_eq!(processed.message_event_id, Some(rumor_id));
+        assert_eq!(
+            processed.state,
+            message_types::ProcessedMessageState::Processed
+        );
     }
 
     /// Test message state transitions

@@ -259,7 +259,7 @@ where
     ) -> Result<()> {
         let processed_message = super::create_processed_message_record(
             event.id,
-            None,
+            Some(super::content_hash_event_id(&event.content)),
             Some(epoch),
             Some(mls_group_id.clone()),
             message_types::ProcessedMessageState::Processed,

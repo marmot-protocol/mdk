@@ -15,6 +15,8 @@
 
 ### Added
 
+- Implemented group-scoped processed-message lookup by stable inner message/content-hash ID for replay deduplication. ([#316](https://github.com/marmot-protocol/mdk/pull/316))
+
 ### Fixed
 
 ### Removed
