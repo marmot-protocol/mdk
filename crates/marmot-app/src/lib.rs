@@ -23,10 +23,11 @@ use cgka_engine::{
 };
 use cgka_session::{AccountDeviceSession, SessionConfig};
 use cgka_traits::agent_text_stream::{
-    AGENT_TEXT_STREAM_PROFILE_STREAM_ID_LEN, AGENT_TEXT_STREAM_QUIC_FANOUT_FEATURE,
-    AGENT_TEXT_STREAM_QUIC_RECEIVE_FEATURE, AGENT_TEXT_STREAM_QUIC_SEND_FEATURE,
-    AGENT_TEXT_STREAM_ROLE_FANOUT, AGENT_TEXT_STREAM_ROLE_RECEIVE, AGENT_TEXT_STREAM_ROLE_SEND,
-    AgentTextStreamKeyContextV1, AgentTextStreamQuicPolicyV1,
+    AGENT_TEXT_STREAM_EXPORTER_LABEL, AGENT_TEXT_STREAM_PROFILE_STREAM_ID_LEN,
+    AGENT_TEXT_STREAM_QUIC_FANOUT_FEATURE, AGENT_TEXT_STREAM_QUIC_RECEIVE_FEATURE,
+    AGENT_TEXT_STREAM_QUIC_SEND_FEATURE, AGENT_TEXT_STREAM_ROLE_FANOUT,
+    AGENT_TEXT_STREAM_ROLE_RECEIVE, AGENT_TEXT_STREAM_ROLE_SEND, AgentTextStreamKeyContextV1,
+    AgentTextStreamQuicPolicyV1,
 };
 use cgka_traits::app_components::{
     AGENT_TEXT_STREAM_QUIC_COMPONENT, AGENT_TEXT_STREAM_QUIC_COMPONENT_ID, AppComponentData,
@@ -277,6 +278,12 @@ enum AccountWorkerCommand {
     SafeExportSecret {
         group_id: GroupId,
         component_id: cgka_traits::AppComponentId,
+        respond: oneshot::Sender<Result<SecretBytes, AppError>>,
+    },
+    ExporterSecret {
+        group_id: GroupId,
+        label: String,
+        length: usize,
         respond: oneshot::Sender<Result<SecretBytes, AppError>>,
     },
     InviteMembers {
@@ -1051,15 +1058,11 @@ impl MarmotAppRuntime {
         let start_event_id = MessageId::new(hex::decode(&start_message_id_hex)?);
         let account = self.accounts.app.account_home().account(account_ref)?;
         let group_state = self.group_mls_state(&account.label, group_id).await?;
-        let component_secret = self
-            .safe_export_secret(
-                &account.label,
-                group_id,
-                AGENT_TEXT_STREAM_QUIC_COMPONENT_ID,
-            )
+        let stream_secret = self
+            .agent_text_stream_exporter_secret(&account.label, group_id)
             .await?;
         let crypto = AgentTextStreamCrypto::new(
-            component_secret,
+            stream_secret,
             AgentTextStreamKeyContextV1::new(
                 group_id.clone(),
                 stream_id.clone(),
@@ -1150,6 +1153,16 @@ impl MarmotAppRuntime {
     ) -> Result<SecretBytes, AppError> {
         self.accounts
             .safe_export_secret(account_ref, group_id, component_id)
+            .await
+    }
+
+    pub async fn agent_text_stream_exporter_secret(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+    ) -> Result<SecretBytes, AppError> {
+        self.accounts
+            .exporter_secret(account_ref, group_id, AGENT_TEXT_STREAM_EXPORTER_LABEL, 32)
             .await
     }
 
@@ -1789,6 +1802,27 @@ impl AccountManager {
             .send(AccountWorkerCommand::SafeExportSecret {
                 group_id: group_id.clone(),
                 component_id,
+                respond,
+            })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
+    pub async fn exporter_secret(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        label: &str,
+        length: usize,
+    ) -> Result<SecretBytes, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::ExporterSecret {
+                group_id: group_id.clone(),
+                label: label.to_owned(),
+                length,
                 respond,
             })
             .await
@@ -4689,6 +4723,15 @@ async fn run_app_runtime_account_worker(
                         let result = client.safe_export_secret(&group_id, component_id);
                         let _ = respond.send(result);
                     }
+                    Some(AccountWorkerCommand::ExporterSecret {
+                        group_id,
+                        label,
+                        length,
+                        respond,
+                    }) => {
+                        let result = client.exporter_secret(&group_id, &label, length);
+                        let _ = respond.send(result);
+                    }
                     Some(AccountWorkerCommand::InviteMembers {
                         group_id,
                         members,
@@ -5370,11 +5413,25 @@ impl AppClient {
         Ok(self.runtime.safe_export_secret(group_id, component_id)?)
     }
 
-    fn encrypted_media_exporter_secret(&self, group_id: &GroupId) -> Result<SecretBytes, AppError> {
+    pub fn agent_text_stream_exporter_secret(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<SecretBytes, AppError> {
+        self.exporter_secret(group_id, AGENT_TEXT_STREAM_EXPORTER_LABEL, 32)
+    }
+
+    fn exporter_secret(
+        &self,
+        group_id: &GroupId,
+        label: &str,
+        length: usize,
+    ) -> Result<SecretBytes, AppError> {
         self.ensure_group(group_id)?;
-        Ok(self
-            .runtime
-            .exporter_secret(group_id, ENCRYPTED_MEDIA_EXPORTER_LABEL, 32)?)
+        Ok(self.runtime.exporter_secret(group_id, label, length)?)
+    }
+
+    fn encrypted_media_exporter_secret(&self, group_id: &GroupId) -> Result<SecretBytes, AppError> {
+        self.exporter_secret(group_id, ENCRYPTED_MEDIA_EXPORTER_LABEL, 32)
     }
 
     pub async fn invite_members(

@@ -8,9 +8,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use cgka_traits::TransportEndpoint;
-use cgka_traits::agent_text_stream::{
-    AGENT_TEXT_STREAM_QUIC_COMPONENT_ID, AgentTextStreamKeyContextV1,
-};
+use cgka_traits::agent_text_stream::AgentTextStreamKeyContextV1;
 use cgka_traits::app_event::{
     MARMOT_APP_EVENT_KIND_AGENT_STREAM_START, STREAM_CHUNKS_TAG, STREAM_HASH_TAG, STREAM_START_TAG,
     STREAM_TAG,
@@ -4157,19 +4155,15 @@ pub(crate) async fn stream_crypto_for_start_event(
                 Ok(group_state) => group_state,
                 Err(_) => continue,
             };
-            let component_secret = match runtime
-                .safe_export_secret(
-                    &account.label,
-                    &group_id,
-                    AGENT_TEXT_STREAM_QUIC_COMPONENT_ID,
-                )
+            let stream_secret = match runtime
+                .agent_text_stream_exporter_secret(&account.label, &group_id)
                 .await
             {
                 Ok(secret) => secret,
                 Err(_) => continue,
             };
             let crypto = AgentTextStreamCrypto::new(
-                component_secret,
+                stream_secret,
                 AgentTextStreamKeyContextV1::new(
                     group_id,
                     stream_id.clone(),

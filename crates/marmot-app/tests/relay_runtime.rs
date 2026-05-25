@@ -12,9 +12,9 @@ use cgka_traits::app_event::{
 use cgka_traits::engine::KeyPackage;
 use marmot_account::AccountHome;
 use marmot_app::{
-    AGENT_TEXT_STREAM_COMPONENT_ID, AccountRelayListBootstrap, AccountSetupRequest,
-    AppMessageQuery, MarmotApp, MarmotAppConfig, MarmotAppEvent, MarmotAppRuntime, MediaReference,
-    MediaUploadRequest, RuntimeMessageUpdate, UserDirectorySearch, UserProfileMetadata, tag_value,
+    AccountRelayListBootstrap, AccountSetupRequest, AppMessageQuery, MarmotApp, MarmotAppConfig,
+    MarmotAppEvent, MarmotAppRuntime, MediaReference, MediaUploadRequest, RuntimeMessageUpdate,
+    UserDirectorySearch, UserProfileMetadata, tag_value,
 };
 use nostr::base64::Engine as _;
 use nostr::base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -1206,21 +1206,12 @@ async fn relay_app_runtime_creates_default_agent_text_stream_group() {
     );
     assert_eq!(prompt.messages[0].plaintext, "write a summary");
 
-    let alice_secret = alice
-        .safe_export_secret(&group_id, AGENT_TEXT_STREAM_COMPONENT_ID)
-        .unwrap();
-    let bob_secret = bob
-        .safe_export_secret(&group_id, AGENT_TEXT_STREAM_COMPONENT_ID)
-        .unwrap();
-    let repeated_alice_secret = alice
-        .safe_export_secret(&group_id, AGENT_TEXT_STREAM_COMPONENT_ID)
-        .unwrap_err();
+    let alice_secret = alice.agent_text_stream_exporter_secret(&group_id).unwrap();
+    let bob_secret = bob.agent_text_stream_exporter_secret(&group_id).unwrap();
+    let repeated_alice_secret = alice.agent_text_stream_exporter_secret(&group_id).unwrap();
 
     assert_eq!(alice_secret, bob_secret);
-    assert!(
-        repeated_alice_secret.to_string().contains("PuncturedInput"),
-        "{repeated_alice_secret}"
-    );
+    assert_eq!(alice_secret, repeated_alice_secret);
 }
 
 #[tokio::test]

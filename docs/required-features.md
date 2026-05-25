@@ -86,7 +86,8 @@ implementations:
 - How any Marmot subsystem derives cryptographic material from the MLS group state (currently:
   `MLS-Exporter("marmot", "group-event", 32)` for kind-445 outer wrap; similar labels for MIP-04 and MIP-06)
 - Whether that derivation is via raw MLS-Exporter or via the MLS Extensions Safe Framework's
-  `SafeExportSecret(ComponentID)` (direction: Safe framework for new work; see `custom_extensions.md` §5)
+  `SafeExportSecret(ComponentID)` (direction: Safe framework for one-shot component secrets; reusable per-epoch secrets
+  must keep a registered raw exporter label until the protocol defines another shape)
 
 **What "protocol-level" means concretely:** if a change to any of these breaks byte compatibility, it's a protocol
 change requiring coordinated client updates, capability negotiation rules, and (if needed) migration strategy. Protocol

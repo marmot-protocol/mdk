@@ -29,7 +29,7 @@ const LOCAL_BIND: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 
 const MAX_FRAME_SIZE: usize = AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN as usize + 1024;
 const SEND_CLOSE_WAIT: Duration = Duration::from_secs(5);
 const AEAD_TAG_LEN: usize = 16;
-const AGENT_TEXT_STREAM_COMPONENT_SECRET_LEN: usize = 32;
+const AGENT_TEXT_STREAM_SECRET_LEN: usize = 32;
 
 pub struct QuicTextStreamReceiver {
     endpoint: Endpoint,
@@ -196,14 +196,14 @@ pub struct ReceivedTextChunk {
 
 #[derive(Clone)]
 pub struct AgentTextStreamCrypto {
-    pub component_secret: SecretBytes,
+    pub stream_secret: SecretBytes,
     pub context: AgentTextStreamKeyContextV1,
 }
 
 impl AgentTextStreamCrypto {
-    pub fn new(component_secret: SecretBytes, context: AgentTextStreamKeyContextV1) -> Self {
+    pub fn new(stream_secret: SecretBytes, context: AgentTextStreamKeyContextV1) -> Self {
         Self {
-            component_secret,
+            stream_secret,
             context,
         }
     }
@@ -212,7 +212,7 @@ impl AgentTextStreamCrypto {
 impl std::fmt::Debug for AgentTextStreamCrypto {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AgentTextStreamCrypto")
-            .field("component_secret", &"<redacted>")
+            .field("stream_secret", &"<redacted>")
             .field("context", &self.context)
             .finish()
     }
@@ -466,9 +466,9 @@ fn validate_crypto_record_context(
     crypto: &AgentTextStreamCrypto,
     record: &AgentTextStreamRecordV1,
 ) -> Result<(), QuicTextStreamError> {
-    if crypto.component_secret.as_slice().len() != AGENT_TEXT_STREAM_COMPONENT_SECRET_LEN {
+    if crypto.stream_secret.as_slice().len() != AGENT_TEXT_STREAM_SECRET_LEN {
         return Err(QuicTextStreamError::Crypto(
-            "agent text stream component secret must be 32 bytes".into(),
+            "agent text stream secret must be 32 bytes".into(),
         ));
     }
     if crypto.context.stream_id.len() != AGENT_TEXT_STREAM_PROFILE_STREAM_ID_LEN {
@@ -507,11 +507,13 @@ fn derive_bytes<const N: usize>(
     crypto: &AgentTextStreamCrypto,
     label: &[u8],
 ) -> Result<[u8; N], QuicTextStreamError> {
-    let hkdf = Hkdf::<Sha256>::from_prk(crypto.component_secret.as_slice())
-        .map_err(|_| QuicTextStreamError::Crypto("invalid component secret".into()))?;
-    let mut info = Vec::with_capacity(label.len() + crypto.context.encode().len());
+    let hkdf = Hkdf::<Sha256>::from_prk(crypto.stream_secret.as_slice())
+        .map_err(|_| QuicTextStreamError::Crypto("invalid stream secret".into()))?;
+    let key_context = crypto.context.encode();
+    let mut info = Vec::with_capacity(label.len() + key_context.len() + 1);
+    encode_quic_varint(label.len() as u64, &mut info);
     info.extend_from_slice(label);
-    info.extend_from_slice(&crypto.context.encode());
+    info.extend_from_slice(&key_context);
     let mut out = [0_u8; N];
     hkdf.expand(&info, &mut out)
         .map_err(|_| QuicTextStreamError::Crypto("agent text stream HKDF expand failed".into()))?;
@@ -837,7 +839,7 @@ mod tests {
     }
 
     #[test]
-    fn crypto_debug_redacts_component_secret() {
+    fn crypto_debug_redacts_stream_secret() {
         let crypto = AgentTextStreamCrypto::new(
             SecretBytes::new(b"debug-visible stream secret!!!!!".to_vec()),
             AgentTextStreamKeyContextV1::new(
@@ -856,7 +858,7 @@ mod tests {
     }
 
     #[test]
-    fn crypto_rejects_wrong_component_secret_length() {
+    fn crypto_rejects_wrong_stream_secret_length() {
         let crypto = AgentTextStreamCrypto::new(
             SecretBytes::new(vec![0x07; 31]),
             AgentTextStreamKeyContextV1::new(

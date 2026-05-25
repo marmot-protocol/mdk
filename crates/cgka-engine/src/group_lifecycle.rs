@@ -39,12 +39,15 @@ use tls_codec::{Deserialize as _, Serialize as _};
 pub(crate) const EXPORTER_LABEL: &str = "marmot";
 pub(crate) const EXPORTER_CONTEXT: &[u8] = b"group-event";
 pub(crate) const ENCRYPTED_MEDIA_EXPORTER_CONTEXT: &[u8] = b"encrypted-media";
+pub(crate) const AGENT_TEXT_STREAM_EXPORTER_CONTEXT: &[u8] = b"agent-text-stream-quic";
 
 /// Key used in [`cgka_traits::group_context::GroupContextSnapshot`] so peelers
 /// can request the registered group-event exporter without separately carrying
 /// the MLS label/context pair.
 pub(crate) const EXPORTER_SNAPSHOT_KEY: &str = "marmot/group-event";
 pub(crate) const ENCRYPTED_MEDIA_EXPORTER_SNAPSHOT_KEY: &str = "marmot/encrypted-media";
+pub(crate) const AGENT_TEXT_STREAM_EXPORTER_SNAPSHOT_KEY: &str =
+    cgka_traits::agent_text_stream::AGENT_TEXT_STREAM_EXPORTER_LABEL;
 
 impl<S: StorageProvider> Engine<S> {
     /// Implementation of `CgkaEngine::create_group`.

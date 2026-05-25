@@ -21,6 +21,7 @@ pub const AGENT_TEXT_STREAM_QUIC_SEND_FEATURE: Feature =
 pub const AGENT_TEXT_STREAM_QUIC_FANOUT_FEATURE: Feature =
     Feature("marmot.feature.agent_text_stream_quic.fanout.v1");
 
+pub const AGENT_TEXT_STREAM_EXPORTER_LABEL: &str = "marmot/agent-text-stream-quic";
 pub const AGENT_TEXT_STREAM_KEY_CONTEXT_VERSION: &[u8] = b"v1";
 pub const AGENT_TEXT_STREAM_TRANSCRIPT_HASH_CONTEXT: &[u8] =
     b"marmot agent text stream transcript v1";

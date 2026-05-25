@@ -446,7 +446,9 @@ impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
         // the engine reports via `epoch()` / `EpochState`.
         let crypto =
             <EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::crypto(&provider);
-        let (epoch, group_secret, media_secret) = if let Some(staged) = mls_group.pending_commit() {
+        let (epoch, group_secret, media_secret, stream_secret) = if let Some(staged) =
+            mls_group.pending_commit()
+        {
             let group_secret = staged
                 .export_secret(
                     crypto,
@@ -465,10 +467,21 @@ impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
                 .map_err(|e| {
                     EngineError::Backend(format!("staged encrypted media export_secret: {e:?}"))
                 })?;
+            let stream_secret = staged
+                .export_secret(
+                    crypto,
+                    crate::group_lifecycle::EXPORTER_LABEL,
+                    crate::group_lifecycle::AGENT_TEXT_STREAM_EXPORTER_CONTEXT,
+                    32,
+                )
+                .map_err(|e| {
+                    EngineError::Backend(format!("staged agent text stream export_secret: {e:?}"))
+                })?;
             (
                 staged.group_context().epoch().as_u64(),
                 group_secret,
                 media_secret,
+                stream_secret,
             )
         } else {
             let group_secret = mls_group
@@ -489,7 +502,22 @@ impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
                 .map_err(|e| {
                     EngineError::Backend(format!("encrypted media export_secret: {e:?}"))
                 })?;
-            (mls_group.epoch().as_u64(), group_secret, media_secret)
+            let stream_secret = mls_group
+                .export_secret(
+                    crypto,
+                    crate::group_lifecycle::EXPORTER_LABEL,
+                    crate::group_lifecycle::AGENT_TEXT_STREAM_EXPORTER_CONTEXT,
+                    32,
+                )
+                .map_err(|e| {
+                    EngineError::Backend(format!("agent text stream export_secret: {e:?}"))
+                })?;
+            (
+                mls_group.epoch().as_u64(),
+                group_secret,
+                media_secret,
+                stream_secret,
+            )
         };
         let mut map = std::collections::HashMap::new();
         map.insert(
@@ -499,6 +527,10 @@ impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
         map.insert(
             crate::group_lifecycle::ENCRYPTED_MEDIA_EXPORTER_SNAPSHOT_KEY.to_string(),
             cgka_traits::SecretBytes::new(media_secret),
+        );
+        map.insert(
+            crate::group_lifecycle::AGENT_TEXT_STREAM_EXPORTER_SNAPSHOT_KEY.to_string(),
+            cgka_traits::SecretBytes::new(stream_secret),
         );
         Ok(Box::new(crate::group_context_view::GroupContextView::new(
             EpochId(epoch),
