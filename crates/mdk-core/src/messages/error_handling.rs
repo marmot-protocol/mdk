@@ -1097,6 +1097,13 @@ mod tests {
             "authorization_failed"
         );
 
+        assert_eq!(
+            MDK::<MdkMemoryStorage>::sanitize_error_reason(&Error::UnauthorizedProposalInCommit(
+                "Add proposal from leaf 2 is not admin-authored".to_string()
+            )),
+            "authorization_failed"
+        );
+
         // Test catch-all for unmapped variants (should return "processing_failed")
         assert_eq!(
             MDK::<MdkMemoryStorage>::sanitize_error_reason(&Error::MessageNotFound),

@@ -484,14 +484,16 @@ where
             .collect();
 
         for proposal_ref in to_remove {
-            if let Err(e) =
-                mls_group.remove_pending_proposal(self.provider.storage(), &proposal_ref)
-            {
-                tracing::warn!(
-                    target: "mdk_core::messages::prune_unauthorized_pending_proposals",
-                    "Failed to drop unauthorized pending proposal: {e}",
-                );
-            }
+            // A storage failure here would leave the unauthorized proposal in
+            // the pending store, which the next commit would then sweep —
+            // exactly the smuggling vector the prune exists to close. Abort
+            // the operation so the admin retries instead of publishing a
+            // tainted commit.
+            mls_group
+                .remove_pending_proposal(self.provider.storage(), &proposal_ref)
+                .map_err(|e| {
+                    Error::Group(format!("failed to drop unauthorized pending proposal: {e}"))
+                })?;
         }
         Ok(())
     }

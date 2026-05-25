@@ -812,6 +812,11 @@ where
         let mut upgraded_extensions = mls_group.extensions().clone();
         upgraded_extensions.add_or_replace(required_capabilities_extension)?;
 
+        // marmot-security #106: drop any non-admin Add/Remove(other)/GCE
+        // proposals from the pending store before this admin GCE commit
+        // sweeps it.
+        self.prune_unauthorized_pending_proposals(&mut mls_group, group_id)?;
+
         let signer: SignatureKeyPair = self.load_mls_signer(&mls_group)?;
         let (commit_message, _welcome, _group_info) = mls_group.update_group_context_extensions(
             &self.provider,

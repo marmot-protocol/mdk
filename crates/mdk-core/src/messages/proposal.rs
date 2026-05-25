@@ -1077,6 +1077,22 @@ mod tests {
             3,
             "Carol's member count must still be 3 (Alice, Bob, Carol)"
         );
+
+        // The legitimate rename — the *only* change the admin actually
+        // requested — MUST land on both replicas. Without this check, the
+        // smuggle test could vacuously pass against a regression that dropped
+        // the rename along with the prune.
+        let _ = &rename;
+        let alice_group = alice_mdk
+            .get_group(&group_id)
+            .expect("alice get_group")
+            .expect("alice group present");
+        let carol_group = carol_mdk
+            .get_group(&group_id)
+            .expect("carol get_group")
+            .expect("carol group present");
+        assert_eq!(alice_group.name, "Renamed", "rename must land on Alice");
+        assert_eq!(carol_group.name, "Renamed", "rename must land on Carol");
     }
 
     /// marmot-security #106 receive-side defense-in-depth.
