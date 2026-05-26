@@ -78,8 +78,7 @@ Primary review areas:
 Engine support:
 
 - `crates/traits` - shared traits and cross-boundary types.
-- `crates/storage-memory` - in-memory storage for tests and simulator runs.
-- `crates/storage-sqlite` - SQLCipher-backed persistence for session and engine integration.
+- `crates/storage-sqlite` - SQLCipher-backed persistence for session, engine integration, tests, and simulator runs.
 - `crates/transport-nostr-peeler` - Nostr event to engine-message boundary and MLS envelope peeling.
 - `crates/transport-quic-stream` - raw QUIC transport binding for transient agent text stream previews tied to
   durable MLS start/final messages.

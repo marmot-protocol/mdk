@@ -28,7 +28,7 @@ use openmls::schedule::PreSharedKeyId;
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::RustCrypto;
 use openmls_traits::OpenMlsProvider as _;
-use storage_memory::MemoryStorage;
+use storage_sqlite::SqliteStorage;
 
 mod support;
 use support::proof_signer;
@@ -141,7 +141,7 @@ fn registry() -> FeatureRegistry {
 }
 
 fn build(id: &[u8]) -> impl CgkaEngine {
-    EngineBuilder::new(MemoryStorage::new())
+    EngineBuilder::new(SqliteStorage::in_memory().unwrap())
         .identity(pad32(id))
         .account_identity_proof_signer(proof_signer(id))
         .feature_registry(registry())
@@ -150,8 +150,8 @@ fn build(id: &[u8]) -> impl CgkaEngine {
         .unwrap()
 }
 
-fn build_with_storage(id: &[u8]) -> (Engine<MemoryStorage>, MemoryStorage) {
-    let storage = MemoryStorage::new();
+fn build_with_storage(id: &[u8]) -> (Engine<SqliteStorage>, SqliteStorage) {
+    let storage = SqliteStorage::in_memory().unwrap();
     let engine = EngineBuilder::new(storage.clone())
         .identity(pad32(id))
         .account_identity_proof_signer(proof_signer(id))
@@ -165,12 +165,12 @@ fn build_with_storage(id: &[u8]) -> (Engine<MemoryStorage>, MemoryStorage) {
 /// Load the engine's underlying OpenMLS group + signer for `member` so a test
 /// can construct raw commits of arbitrary shape against the real group state.
 fn load_group_and_signer<'a>(
-    storage: &'a MemoryStorage,
+    storage: &'a SqliteStorage,
     crypto: &'a RustCrypto,
     member: &MemberId,
     group_id: &GroupId,
 ) -> (MlsGroup, SignatureKeyPair) {
-    let provider = EngineOpenMlsProvider::<MemoryStorage>::new(crypto, storage.mls_storage());
+    let provider = EngineOpenMlsProvider::<SqliteStorage>::new(crypto, storage.mls_storage());
     let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
     let mls_group = MlsGroup::load(provider.storage(), &mls_gid)
         .expect("load group")
@@ -193,13 +193,13 @@ fn load_group_and_signer<'a>(
 /// committer to be an admin. The pending commit is cleared afterward so the
 /// group can be reused.
 fn requires_admin_for_proposals(
-    storage: &MemoryStorage,
+    storage: &SqliteStorage,
     crypto: &RustCrypto,
     mls_group: &mut MlsGroup,
     signer: &SignatureKeyPair,
     proposals: Vec<Proposal>,
 ) -> bool {
-    let provider = EngineOpenMlsProvider::<MemoryStorage>::new(crypto, storage.mls_storage());
+    let provider = EngineOpenMlsProvider::<SqliteStorage>::new(crypto, storage.mls_storage());
     mls_group
         .commit_builder()
         .add_proposals(proposals)
@@ -259,7 +259,7 @@ async fn non_admin_commit_allowlist_accepts_only_self_update_and_self_remove() {
     let psk_id = PreSharedKeyId::external(vec![7u8; 32], vec![0u8; 32]);
     psk_id
         .store(
-            &EngineOpenMlsProvider::<MemoryStorage>::new(&crypto, alice_storage.mls_storage()),
+            &EngineOpenMlsProvider::<SqliteStorage>::new(&crypto, alice_storage.mls_storage()),
             &[9u8; 32],
         )
         .expect("store psk secret");
@@ -346,7 +346,7 @@ async fn non_admin_commit_allowlist_accepts_self_remove_only_commit() {
     // allowlist must classify it as a shape a non-admin is permitted to make.
     let crypto = RustCrypto::default();
     let provider =
-        EngineOpenMlsProvider::<MemoryStorage>::new(&crypto, alice_storage.mls_storage());
+        EngineOpenMlsProvider::<SqliteStorage>::new(&crypto, alice_storage.mls_storage());
     let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
     let mls_group = MlsGroup::load(provider.storage(), &mls_gid)
         .expect("load alice group")

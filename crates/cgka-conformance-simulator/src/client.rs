@@ -1,4 +1,4 @@
-//! `HarnessClient` — wraps an `Engine<MemoryStorage>` + Nostr peeler + bus
+//! `HarnessClient` — wraps an `Engine<SqliteStorage>` + Nostr peeler + bus
 //! attachment. Provides scenario-level affordances: `send`, `tick`,
 //! `confirm_all_pending`, `assert_at_epoch`.
 
@@ -26,14 +26,18 @@ use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
-use storage_memory::MemoryStorage;
+use storage_sqlite::{SqlCipherKey, SqliteStorage};
 use transport_nostr_peeler::NostrMlsPeeler;
 
+const STORAGE_MODE_ENV: &str = "DARKMATTER_CONFORMANCE_SQLITE_STORAGE";
+const TEMP_FILE_KEY: &str = "marmot-conformance-sqlite-temp-key";
+
 pub struct HarnessClient {
-    pub engine: Engine<MemoryStorage>,
+    pub engine: Engine<SqliteStorage>,
     pub bus_id: ClientId,
     bus: TransportBus,
-    storage: MemoryStorage,
+    storage: SqliteStorage,
+    _storage_dir: Option<tempfile::TempDir>,
     identity: Vec<u8>,
     signer: nostr::Keys,
     registry: FeatureRegistry,
@@ -48,6 +52,46 @@ pub struct ClientBuilder {
     identity: Vec<u8>,
     signer: nostr::Keys,
     registry: FeatureRegistry,
+    storage_mode: HarnessStorageMode,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HarnessStorageMode {
+    InMemorySqlite,
+    TempFileBackedSqlite,
+}
+
+impl HarnessStorageMode {
+    fn from_env() -> Self {
+        match std::env::var(STORAGE_MODE_ENV) {
+            Ok(value) if matches!(value.as_str(), "file" | "file-backed" | "tempfile") => {
+                Self::TempFileBackedSqlite
+            }
+            Ok(value) if matches!(value.as_str(), "memory" | "in-memory" | "sqlite-memory") => {
+                Self::InMemorySqlite
+            }
+            Ok(value) => panic!(
+                "{STORAGE_MODE_ENV} must be one of memory, in-memory, sqlite-memory, file, file-backed, or tempfile; got {value:?}"
+            ),
+            Err(_) => Self::InMemorySqlite,
+        }
+    }
+
+    fn open(self) -> Result<(SqliteStorage, Option<tempfile::TempDir>), String> {
+        match self {
+            Self::InMemorySqlite => SqliteStorage::in_memory()
+                .map(|storage| (storage, None))
+                .map_err(|err| err.to_string()),
+            Self::TempFileBackedSqlite => {
+                let dir = tempfile::tempdir().map_err(|err| err.to_string())?;
+                let key = SqlCipherKey::new(TEMP_FILE_KEY).map_err(|err| err.to_string())?;
+                let storage =
+                    SqliteStorage::open_encrypted(dir.path().join("client.sqlite3"), &key)
+                        .map_err(|err| err.to_string())?;
+                Ok((storage, Some(dir)))
+            }
+        }
+    }
 }
 
 impl ClientBuilder {
@@ -60,6 +104,7 @@ impl ClientBuilder {
             identity,
             signer,
             registry: FeatureRegistry::new(),
+            storage_mode: HarnessStorageMode::from_env(),
         }
     }
 
@@ -68,8 +113,13 @@ impl ClientBuilder {
         self
     }
 
+    pub fn storage_mode(mut self, mode: HarnessStorageMode) -> Self {
+        self.storage_mode = mode;
+        self
+    }
+
     pub fn attach(self, bus: &TransportBus) -> HarnessClient {
-        let storage = MemoryStorage::new();
+        let (storage, storage_dir) = self.storage_mode.open().expect("storage opens");
         let peeler = NostrMlsPeeler::new().with_welcome_signer(self.signer.clone());
         let engine = EngineBuilder::new(storage.clone())
             .identity(self.identity.clone())
@@ -87,6 +137,7 @@ impl ClientBuilder {
             bus_id,
             bus: bus.clone(),
             storage,
+            _storage_dir: storage_dir,
             identity: self.identity,
             signer: self.signer,
             registry: self.registry,
@@ -206,7 +257,7 @@ fn logical_label_from_seed(seed: &[u8]) -> Option<String> {
 }
 
 impl HarnessClient {
-    pub fn storage(&self) -> &MemoryStorage {
+    pub fn storage(&self) -> &SqliteStorage {
         &self.storage
     }
 

@@ -1,7 +1,7 @@
 //! SQLite-backed engine integration smoke.
 //!
-//! This keeps the production storage backend on the same engine test rail as
-//! `MemoryStorage` without trying to turn this crate into a full persistence
+//! This keeps encrypted file-backed SQLite on the same engine test rail as the
+//! in-memory SQLite cases without turning this crate into a full persistence
 //! reload suite. The behavior under test is: a real OpenMLS engine can create
 //! and confirm a group while all Marmot + OpenMLS state is backed by an
 //! encrypted SQLite database.

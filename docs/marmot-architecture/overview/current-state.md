@@ -86,9 +86,8 @@ This repository now has the main engine candidate:
   group/message/member methods.
 - `crates/cli` — first real CLI, daemon, and TUI surface over `marmot-app`. It is intentionally product-facing rather
   than a lab harness, and its JSON envelope is shaped for daemon/TUI/testing callers.
-- `crates/storage-memory` — in-memory storage and snapshot backend for tests.
 - `crates/storage-sqlite` — SQLCipher-backed SQLite storage for Marmot and custom OpenMLS state, with Rust migrations
-  for schema/data evolution.
+  for schema/data evolution. Tests and the simulator use its in-memory SQLite mode by default.
 - `crates/transport-nostr-adapter` — Nostr transport adapter core for account activation, group subscription sync,
   relay-event routing, and endpoint-level publish reports behind an injectable relay-client boundary. It also has the
   first Marmot kind `30443` KeyPackage event builder/publisher boundary, with MIP-00 metadata supplied explicitly. Its

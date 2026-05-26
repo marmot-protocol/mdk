@@ -7,7 +7,7 @@
 //!
 //! - [`bus`] - in-memory [`bus::TransportBus`] with seeded scheduler,
 //!   partition support, broadcast / addressed delivery for welcomes.
-//! - [`client`] - [`client::HarnessClient`] wrapping `Engine<MemoryStorage>`
+//! - [`client`] - [`client::HarnessClient`] wrapping `Engine<SqliteStorage>`
 //!   plus the real Nostr transport peeler over the in-memory bus.
 //! - [`canonicalization`] - executable model of the CGKA canonicalization
 //!   contract above the branch selector, re-exported from `cgka-engine`.
@@ -30,7 +30,7 @@ pub mod vector;
 
 pub use bus::{ClientId, DeliveryPolicy, TransportBus};
 pub use cgka_engine::{canonicalization, convergence, openmls_projection};
-pub use client::{ClientBuilder, HarnessClient};
+pub use client::{ClientBuilder, HarnessClient, HarnessStorageMode};
 pub use family::{
     GeneratedScenarioCase, generate_convergence_chaos_family,
     generate_convergence_e2e_delivery_family, generate_send_leave_family,

@@ -34,7 +34,7 @@ use openmls::prelude::{
 };
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_traits::types::Ciphersuite;
-use storage_memory::MemoryStorage;
+use storage_sqlite::SqliteStorage;
 use tls_codec::Serialize as _;
 
 mod support;
@@ -204,8 +204,8 @@ impl TransportPeeler for MockPeeler {
 fn build_client_with_components(
     identity: &[u8],
     components: impl IntoIterator<Item = u16>,
-) -> Engine<MemoryStorage> {
-    EngineBuilder::new(MemoryStorage::new())
+) -> Engine<SqliteStorage> {
+    EngineBuilder::new(SqliteStorage::in_memory().unwrap())
         .identity(pad32(identity))
         .account_identity_proof_signer(proof_signer(identity))
         .supported_app_components(components)
@@ -228,7 +228,7 @@ fn selfremove_registry() -> FeatureRegistry {
 }
 
 fn build_client(identity: &[u8], registry: FeatureRegistry) -> impl CgkaEngine {
-    EngineBuilder::new(MemoryStorage::new())
+    EngineBuilder::new(SqliteStorage::in_memory().unwrap())
         .identity(pad32(identity))
         .account_identity_proof_signer(proof_signer(identity))
         .feature_registry(registry)
@@ -240,7 +240,7 @@ fn build_client(identity: &[u8], registry: FeatureRegistry) -> impl CgkaEngine {
 fn build_client_on_storage(
     identity: &[u8],
     registry: FeatureRegistry,
-    storage: MemoryStorage,
+    storage: SqliteStorage,
 ) -> impl CgkaEngine {
     EngineBuilder::new(storage)
         .identity(pad32(identity))
@@ -251,7 +251,7 @@ fn build_client_on_storage(
         .expect("build engine")
 }
 
-fn app_payload_for(engine: &Engine<MemoryStorage>, payload: impl AsRef<[u8]>) -> Vec<u8> {
+fn app_payload_for(engine: &Engine<SqliteStorage>, payload: impl AsRef<[u8]>) -> Vec<u8> {
     let content = String::from_utf8(payload.as_ref().to_vec()).expect("test app payload is utf8");
     MarmotAppEvent::new(
         hex::encode(engine.self_id().as_slice()),
@@ -556,8 +556,7 @@ async fn fresh_key_package_is_mls_last_resort() {
 async fn join_welcome_called_twice_for_same_welcome_errors_on_second_call() {
     // Direct `CgkaEngine::join_welcome` callers skip the ingest-path
     // dedup. Without entry-level dedup, a re-call would re-stage a
-    // Welcome on top of an existing group — in storage-memory that
-    // overwrites silently. The second call must error.
+    // Welcome on top of an existing group. The second call must error.
     let mut alice = build_client(b"alice", selfremove_registry());
     let mut bob = build_client(b"bob", selfremove_registry());
     let bob_kp = bob.fresh_key_package().await.unwrap();
@@ -603,7 +602,7 @@ async fn join_welcome_dedup_survives_engine_rebuild_on_same_storage() {
     // not rely only on in-memory `seen_message_ids`. A rebuilt engine on
     // the same storage must reject the duplicate before re-staging it.
     let mut alice = build_client(b"alice", selfremove_registry());
-    let bob_storage = MemoryStorage::new();
+    let bob_storage = SqliteStorage::in_memory().unwrap();
     let mut bob = build_client_on_storage(b"bob", selfremove_registry(), bob_storage.clone());
     let bob_kp = bob.fresh_key_package().await.unwrap();
 
@@ -654,7 +653,7 @@ async fn join_welcome_rejected_when_client_no_longer_supports_required_capabilit
     // so her runtime no longer supports SelfRemove. Joining the group must now
     // be rejected.
     let mut alice = build_client(b"alice", selfremove_registry());
-    let carol_storage = MemoryStorage::new();
+    let carol_storage = SqliteStorage::in_memory().unwrap();
     let mut capable_carol =
         build_client_on_storage(b"carol", selfremove_registry(), carol_storage.clone());
     let carol_kp = capable_carol.fresh_key_package().await.unwrap();
@@ -711,7 +710,7 @@ async fn join_welcome_rejected_when_client_lacks_required_app_component() {
     // with an engine that does not support that component.
     const CUSTOM_COMPONENT: u16 = 0xF300;
     let mut alice = build_client_with_components(b"alice", [CUSTOM_COMPONENT]);
-    let carol_storage = MemoryStorage::new();
+    let carol_storage = SqliteStorage::in_memory().unwrap();
     let capable_carol = EngineBuilder::new(carol_storage.clone())
         .identity(pad32(b"carol"))
         .account_identity_proof_signer(proof_signer(b"carol"))

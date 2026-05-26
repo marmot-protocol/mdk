@@ -15,8 +15,10 @@ Read [`README.md`](README.md) for the human framing, [`SCENARIOS.md`](SCENARIOS.
     deterministic message dispositions.
 
 - **Module:** `src/client.rs`
-  - **Role:** `HarnessClient` + `ClientBuilder`. Wraps an `Engine<MemoryStorage>`, a real `NostrMlsPeeler`, and the bus
-    handle. `tick().await` drains pending inbound for one client. `confirm(pending).await` finishes a `GroupEvolution`.
+  - **Role:** `HarnessClient` + `ClientBuilder`. Wraps an `Engine<SqliteStorage>`, a real `NostrMlsPeeler`, and the bus
+    handle. It uses in-memory SQLite by default and can run on temp file-backed SQLite via
+    `DARKMATTER_CONFORMANCE_SQLITE_STORAGE=file` or `ClientBuilder::storage_mode`. `tick().await` drains pending inbound
+    for one client. `confirm(pending).await` finishes a `GroupEvolution`.
 
 - **Module:** `cgka_engine::convergence`
   - **Role:** Candidate-state graph scoring rules for the distributed convergence design, re-exported by this crate for
@@ -126,7 +128,7 @@ Look at `three_client_happy_path_via_harness` for the canonical shape.
 ## OpenMLS replay probes
 
 `openmls_projection` is intentionally bytes-first. Probe tests should capture `TransportMessage` values from the
-harness, replay their MLS payload bytes against a `MemoryStorage` group snapshot, collect observations such as
+harness, replay their MLS payload bytes against a `SqliteStorage` group snapshot, collect observations such as
 `ProposalRef`s from `StagedCommit::queued_proposals()`, then rely on the helper to roll storage back. Candidate
 materialization should turn those replay observations into `MaterializedCandidate` values, then call
 `canonicalize_with_materialized_candidates` so commit ids, consumed proposal ids, and losing-branch dispositions are

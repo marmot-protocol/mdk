@@ -305,8 +305,7 @@ impl<S: StorageProvider> Engine<S> {
         // 1. Dedupe. The ingest-path welcome handler already guards with
         // `seen_message_ids`; direct `CgkaEngine::join_welcome` callers
         // skipped that. Without this check, a re-call would re-stage a
-        // Welcome on top of an existing group — in storage-memory that
-        // overwrites silently, which is unsafe.
+        // Welcome on top of an existing group, which is unsafe.
         if self.seen_message_ids.contains(&welcome_msg.id) {
             return Err(EngineError::Other("welcome already processed".to_string()));
         }

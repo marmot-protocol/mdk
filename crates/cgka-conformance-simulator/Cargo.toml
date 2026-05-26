@@ -14,7 +14,7 @@ conformance-slow = []
 [dependencies]
 cgka-traits.workspace = true
 cgka-engine.workspace = true
-storage-memory.workspace = true
+storage-sqlite.workspace = true
 transport-nostr-peeler.workspace = true
 openmls.workspace = true
 openmls_rust_crypto.workspace = true
@@ -30,3 +30,4 @@ nostr.workspace = true
 proptest.workspace = true
 hex.workspace = true
 sha2.workspace = true
+tempfile.workspace = true

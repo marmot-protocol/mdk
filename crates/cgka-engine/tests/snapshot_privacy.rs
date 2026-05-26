@@ -20,7 +20,7 @@ use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };
 use cgka_traits::types::{MemberId, MessageId};
-use storage_memory::MemoryStorage;
+use storage_sqlite::SqliteStorage;
 
 mod support;
 use support::proof_signer;
@@ -121,7 +121,7 @@ impl TransportPeeler for MockPeeler {
 
 #[tokio::test]
 async fn snapshot_names_do_not_embed_plaintext_group_id() {
-    let storage = MemoryStorage::new();
+    let storage = SqliteStorage::in_memory().unwrap();
     let mut alice = EngineBuilder::new(storage.clone())
         .identity(pad32(b"alice"))
         .account_identity_proof_signer(proof_signer(b"alice"))
@@ -130,7 +130,7 @@ async fn snapshot_names_do_not_embed_plaintext_group_id() {
         .build()
         .unwrap();
 
-    let mut bob = EngineBuilder::new(MemoryStorage::new())
+    let mut bob = EngineBuilder::new(SqliteStorage::in_memory().unwrap())
         .identity(pad32(b"bob"))
         .account_identity_proof_signer(proof_signer(b"bob"))
         .feature_registry(FeatureRegistry::new())
@@ -155,7 +155,7 @@ async fn snapshot_names_do_not_embed_plaintext_group_id() {
     }
 
     // Force a few snapshots: invite, app message, update_group_data.
-    let mut carol = EngineBuilder::new(MemoryStorage::new())
+    let mut carol = EngineBuilder::new(SqliteStorage::in_memory().unwrap())
         .identity(pad32(b"carol"))
         .account_identity_proof_signer(proof_signer(b"carol"))
         .feature_registry(FeatureRegistry::new())

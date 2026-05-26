@@ -89,8 +89,6 @@ impl fmt::Display for EpochId {
 /// instance is. Consumers rarely need this, but tests and diagnostics sometimes do.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Backend {
-    /// Ephemeral, process-local storage. See `storage-memory`.
-    InMemory,
     /// SQLCipher-backed SQLite persistence. See `storage-sqlite`.
     Sqlite,
 }

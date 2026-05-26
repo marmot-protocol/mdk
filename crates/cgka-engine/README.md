@@ -21,8 +21,8 @@ rules, and returns typed outcomes for every ingest path.
 ## What it does _not_ do
 
 - No transport (no Nostr, no relays). Plug in a `TransportPeeler` impl.
-- No persistence beyond what `StorageProvider` exposes. Pair with `storage-memory` for tests and `storage-sqlite` for
-  SQLCipher-backed persistence.
+- No persistence beyond what `StorageProvider` exposes. Pair with `storage-sqlite` for SQLCipher-backed persistence;
+  tests can use its in-memory SQLite mode.
 - No CLI, no FFI, no application logic.
 
 ## Run the tests
@@ -31,8 +31,8 @@ rules, and returns typed outcomes for every ingest path.
 cargo test -p cgka-engine
 ```
 
-These tests cover the engine boundary directly. They use one or a few `Engine<S>` instances with memory or SQLite
-storage and a mock peeler. They are the right place for local rules: command validation, snapshot persistence,
+These tests cover the engine boundary directly. They use one or a few `Engine<SqliteStorage>` instances with in-memory
+SQLite storage and a mock peeler. They are the right place for local rules: command validation, snapshot persistence,
 processed-message idempotency, restart behavior, and the exact outputs from a single engine call.
 
 Run the simulator when you change convergence, delivery, branch selection, group data, or anything that depends on more

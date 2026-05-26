@@ -16,7 +16,7 @@ use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };
 use cgka_traits::types::{GroupId, MemberId, MessageId};
-use storage_memory::MemoryStorage;
+use storage_sqlite::SqliteStorage;
 
 mod support;
 use support::proof_signer;
@@ -131,8 +131,8 @@ fn selfremove_registry() -> FeatureRegistry {
     r
 }
 
-fn build_client(id: &[u8]) -> Engine<MemoryStorage> {
-    EngineBuilder::new(MemoryStorage::new())
+fn build_client(id: &[u8]) -> Engine<SqliteStorage> {
+    EngineBuilder::new(SqliteStorage::in_memory().unwrap())
         .identity(pad32(id))
         .account_identity_proof_signer(proof_signer(id))
         .feature_registry(selfremove_registry())
@@ -141,7 +141,7 @@ fn build_client(id: &[u8]) -> Engine<MemoryStorage> {
         .unwrap()
 }
 
-fn app_payload_for(engine: &Engine<MemoryStorage>, payload: impl AsRef<[u8]>) -> Vec<u8> {
+fn app_payload_for(engine: &Engine<SqliteStorage>, payload: impl AsRef<[u8]>) -> Vec<u8> {
     let content = String::from_utf8(payload.as_ref().to_vec()).expect("test app payload is utf8");
     MarmotAppEvent::new(
         hex::encode(engine.self_id().as_slice()),
@@ -154,8 +154,8 @@ fn app_payload_for(engine: &Engine<MemoryStorage>, payload: impl AsRef<[u8]>) ->
     .expect("test app event encodes")
 }
 
-fn try_build_raw_identity_client(id: &[u8]) -> Result<Engine<MemoryStorage>, EngineError> {
-    EngineBuilder::new(MemoryStorage::new())
+fn try_build_raw_identity_client(id: &[u8]) -> Result<Engine<SqliteStorage>, EngineError> {
+    EngineBuilder::new(SqliteStorage::in_memory().unwrap())
         .identity(id.to_vec())
         .account_identity_proof_signer(proof_signer(b"raw-identity"))
         .feature_registry(selfremove_registry())
@@ -163,7 +163,7 @@ fn try_build_raw_identity_client(id: &[u8]) -> Result<Engine<MemoryStorage>, Eng
         .build()
 }
 
-fn converge_buffered_commit(engine: &mut Engine<MemoryStorage>, group_id: &GroupId) {
+fn converge_buffered_commit(engine: &mut Engine<SqliteStorage>, group_id: &GroupId) {
     let result = engine
         .converge_stored_openmls_messages(group_id, 1_000_000)
         .expect("buffered commit converges");
@@ -268,7 +268,7 @@ async fn invite_adds_third_member_and_advances_epoch() {
 async fn invite_rejects_invitee_missing_required_capability() {
     let mut alice = build_client(b"alice");
     let mut bob = build_client(b"bob");
-    let mut stripped = EngineBuilder::new(MemoryStorage::new())
+    let mut stripped = EngineBuilder::new(SqliteStorage::in_memory().unwrap())
         .identity(pad32(b"stripped"))
         .account_identity_proof_signer(proof_signer(b"stripped"))
         .feature_registry(FeatureRegistry::new())

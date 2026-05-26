@@ -4,7 +4,6 @@ members = [
     "crates/traits",
     "crates/cgka-engine",
     "crates/cgka-session",
-    "crates/storage-memory",
     "crates/storage-sqlite",
     "crates/cgka-conformance-simulator",
     "crates/transport-nostr-peeler",
@@ -76,7 +75,6 @@ test-log = { version = "0.2", features = ["trace"] }
 cgka-traits = { path = "crates/traits" }
 cgka-engine = { path = "crates/cgka-engine" }
 cgka-session = { path = "crates/cgka-session" }
-storage-memory = { path = "crates/storage-memory" }
 storage-sqlite = { path = "crates/storage-sqlite" }
 cgka-conformance-simulator = { path = "crates/cgka-conformance-simulator" }
 transport-nostr-peeler = { path = "crates/transport-nostr-peeler" }

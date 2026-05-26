@@ -17,7 +17,7 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use cgka_traits::TransportEndpoint;
+use cgka_traits::{GroupId, TransportEndpoint};
 use marmot_app::{
     AccountSetupRequest, AppMessageQuery, MarmotApp, MarmotAppRuntime, UserProfileMetadata,
 };
@@ -30,10 +30,12 @@ mod subscriptions;
 
 use conversions::{
     AccountSummaryFfi, AgentStreamStartFfi, AppGroupMemberRecordFfi, AppGroupMlsStateFfi,
-    AppGroupRecordFfi, AppMessageRecordFfi, SendSummaryFfi, UserProfileMetadataFfi,
-    group_id_from_hex, media_records_ffi,
+    AppGroupRecordFfi, AppMessageRecordFfi, GroupDetailsFfi, GroupManagementStateFfi,
+    GroupMemberActionStateFfi, GroupMutationResultFfi, MemberRefFfi, SendSummaryFfi,
+    UserProfileMetadataFfi, group_details_ffi, group_id_from_hex, group_management_state_ffi,
+    media_records_ffi, normalize_member_ref_ffi,
 };
-use errors::MarmotKitError;
+pub use errors::MarmotKitError;
 use subscriptions::{
     AgentStreamSubscription, ChatsSubscription, EventsSubscription, GroupStateSubscription,
     MessagesSubscription,
@@ -66,6 +68,185 @@ fn unix_now_seconds() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+async fn group_details_for(
+    kit: &Marmot,
+    account_ref: &str,
+    group_id: &GroupId,
+    group_id_hex: &str,
+) -> Result<GroupDetailsFfi, MarmotKitError> {
+    let account = kit.runtime.accounts().resolve(account_ref)?;
+    let group = kit
+        .app
+        .group(&account.label, group_id_hex)?
+        .ok_or_else(|| MarmotKitError::UnknownGroup {
+            group_id_hex: group_id_hex.to_string(),
+        })?;
+    let group = AppGroupRecordFfi::from(group);
+    let members = kit
+        .runtime
+        .group_members(account_ref, group_id)
+        .await?
+        .into_iter()
+        .map(Into::into)
+        .collect::<Vec<AppGroupMemberRecordFfi>>();
+    let display_names = members
+        .iter()
+        .filter_map(|member| {
+            kit.runtime
+                .display_name_for_account_id(&member.member_id_hex)
+                .map(|display_name| (member.member_id_hex.clone(), display_name))
+        })
+        .collect();
+    group_details_ffi(group, members, &account.account_id_hex, display_names)
+}
+
+async fn group_management_state_for(
+    kit: &Marmot,
+    account_ref: &str,
+    group_id: &GroupId,
+    group_id_hex: &str,
+) -> Result<GroupManagementStateFfi, MarmotKitError> {
+    let account = kit.runtime.accounts().resolve(account_ref)?;
+    let details = group_details_for(kit, account_ref, group_id, group_id_hex).await?;
+    Ok(group_management_state_ffi(
+        &account.account_id_hex,
+        &details,
+    ))
+}
+
+async fn group_mutation_result_for(
+    kit: &Marmot,
+    account_ref: &str,
+    group_id: &GroupId,
+    group_id_hex: &str,
+    summary: SendSummaryFfi,
+) -> Result<GroupMutationResultFfi, MarmotKitError> {
+    let account = kit.runtime.accounts().resolve(account_ref)?;
+    let details = group_details_for(kit, account_ref, group_id, group_id_hex).await?;
+    let management_state = group_management_state_ffi(&account.account_id_hex, &details);
+    Ok(GroupMutationResultFfi {
+        summary,
+        details,
+        management_state,
+    })
+}
+
+fn group_member_action<'a>(
+    state: &'a GroupManagementStateFfi,
+    group_id_hex: &str,
+    member_ref: &str,
+) -> Result<(&'a GroupMemberActionStateFfi, MemberRefFfi), MarmotKitError> {
+    let normalized = normalize_member_ref_ffi(member_ref)?;
+    let action = state
+        .member_actions
+        .iter()
+        .find(|member| member.member_id_hex == normalized.account_id_hex)
+        .ok_or_else(|| MarmotKitError::MemberNotInGroup {
+            group_id_hex: group_id_hex.to_string(),
+            member_id_hex: normalized.account_id_hex.clone(),
+        })?;
+    Ok((action, normalized))
+}
+
+fn ensure_group_admin(
+    state: &GroupManagementStateFfi,
+    group_id_hex: &str,
+) -> Result<(), MarmotKitError> {
+    if state.is_self_admin {
+        Ok(())
+    } else {
+        Err(MarmotKitError::NotGroupAdmin {
+            group_id_hex: group_id_hex.to_string(),
+        })
+    }
+}
+
+fn ensure_can_remove_members(
+    state: &GroupManagementStateFfi,
+    group_id_hex: &str,
+    member_refs: &[String],
+) -> Result<(), MarmotKitError> {
+    ensure_group_admin(state, group_id_hex)?;
+    for member_ref in member_refs {
+        let (action, normalized) = group_member_action(state, group_id_hex, member_ref)?;
+        if action.is_self {
+            return Err(MarmotKitError::AdminCannotSelfRemove {
+                group_id_hex: group_id_hex.to_string(),
+            });
+        }
+        if !action.can_remove && action.is_admin {
+            return Err(MarmotKitError::WouldRemoveLastAdmin {
+                group_id_hex: group_id_hex.to_string(),
+            });
+        }
+        if !action.can_remove {
+            return Err(MarmotKitError::Runtime {
+                details: format!(
+                    "member {} cannot be removed from group {}",
+                    normalized.account_id_hex, group_id_hex
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn ensure_can_promote_admin(
+    state: &GroupManagementStateFfi,
+    group_id_hex: &str,
+    member_ref: &str,
+) -> Result<(), MarmotKitError> {
+    let (action, normalized) = group_member_action(state, group_id_hex, member_ref)?;
+    ensure_group_admin(state, group_id_hex)?;
+    if action.is_admin {
+        Err(MarmotKitError::AlreadyAdmin {
+            group_id_hex: group_id_hex.to_string(),
+            member_id_hex: normalized.account_id_hex,
+        })
+    } else {
+        Ok(())
+    }
+}
+
+fn ensure_can_demote_admin(
+    state: &GroupManagementStateFfi,
+    group_id_hex: &str,
+    member_ref: &str,
+) -> Result<(), MarmotKitError> {
+    let (action, normalized) = group_member_action(state, group_id_hex, member_ref)?;
+    ensure_group_admin(state, group_id_hex)?;
+    if !action.is_admin {
+        return Err(MarmotKitError::NotAdmin {
+            group_id_hex: group_id_hex.to_string(),
+            member_id_hex: normalized.account_id_hex,
+        });
+    }
+    if state.is_last_admin {
+        return Err(MarmotKitError::WouldRemoveLastAdmin {
+            group_id_hex: group_id_hex.to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn ensure_can_self_demote_admin(
+    state: &GroupManagementStateFfi,
+    group_id_hex: &str,
+) -> Result<(), MarmotKitError> {
+    if !state.is_self_admin {
+        return Err(MarmotKitError::NotAdmin {
+            group_id_hex: group_id_hex.to_string(),
+            member_id_hex: state.my_account_id_hex.clone(),
+        });
+    }
+    if state.is_last_admin {
+        return Err(MarmotKitError::WouldRemoveLastAdmin {
+            group_id_hex: group_id_hex.to_string(),
+        });
+    }
+    Ok(())
 }
 
 #[derive(uniffi::Object)]
@@ -299,6 +480,12 @@ impl Marmot {
         Ok(hex::encode(group_id.as_slice()))
     }
 
+    /// Normalize a member reference for group-management UI. Accepts hex,
+    /// `npub`, `nostr:npub...`, and `darkmatter://profile/...` references.
+    pub fn normalize_member_ref(&self, member_ref: String) -> Result<MemberRefFfi, MarmotKitError> {
+        normalize_member_ref_ffi(&member_ref)
+    }
+
     /// Membership roster for `group_id_hex`.
     pub async fn group_members(
         &self,
@@ -310,6 +497,28 @@ impl Marmot {
         Ok(members.into_iter().map(Into::into).collect())
     }
 
+    /// Group plus enriched member rows for detail screens.
+    pub async fn group_details(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+    ) -> Result<GroupDetailsFfi, MarmotKitError> {
+        let group_id = group_id_from_hex(&group_id_hex)?;
+        let group_id_hex = hex::encode(group_id.as_slice());
+        group_details_for(self, &account_ref, &group_id, &group_id_hex).await
+    }
+
+    /// Current caller permissions plus per-member action availability.
+    pub async fn group_management_state(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+    ) -> Result<GroupManagementStateFfi, MarmotKitError> {
+        let group_id = group_id_from_hex(&group_id_hex)?;
+        let group_id_hex = hex::encode(group_id.as_slice());
+        group_management_state_for(self, &account_ref, &group_id, &group_id_hex).await
+    }
+
     pub async fn invite_members(
         &self,
         account_ref: String,
@@ -317,6 +526,10 @@ impl Marmot {
         member_refs: Vec<String>,
     ) -> Result<SendSummaryFfi, MarmotKitError> {
         let group_id = group_id_from_hex(&group_id_hex)?;
+        let group_id_hex = hex::encode(group_id.as_slice());
+        let state =
+            group_management_state_for(self, &account_ref, &group_id, &group_id_hex).await?;
+        ensure_group_admin(&state, &group_id_hex)?;
         let summary = self
             .runtime
             .invite_members(&account_ref, &group_id, &member_refs)
@@ -331,6 +544,10 @@ impl Marmot {
         member_refs: Vec<String>,
     ) -> Result<SendSummaryFfi, MarmotKitError> {
         let group_id = group_id_from_hex(&group_id_hex)?;
+        let group_id_hex = hex::encode(group_id.as_slice());
+        let state =
+            group_management_state_for(self, &account_ref, &group_id, &group_id_hex).await?;
+        ensure_can_remove_members(&state, &group_id_hex, &member_refs)?;
         let summary = self
             .runtime
             .remove_members(&account_ref, &group_id, &member_refs)
@@ -344,6 +561,20 @@ impl Marmot {
         group_id_hex: String,
     ) -> Result<SendSummaryFfi, MarmotKitError> {
         let group_id = group_id_from_hex(&group_id_hex)?;
+        let group_id_hex = hex::encode(group_id.as_slice());
+        let state =
+            group_management_state_for(self, &account_ref, &group_id, &group_id_hex).await?;
+        if state.requires_self_demote_before_leave {
+            return Err(MarmotKitError::AdminCannotSelfRemove {
+                group_id_hex: group_id_hex.clone(),
+            });
+        }
+        if !state.can_leave {
+            return Err(MarmotKitError::MemberNotInGroup {
+                group_id_hex: group_id_hex.clone(),
+                member_id_hex: state.my_account_id_hex,
+            });
+        }
         let summary = self.runtime.leave_group(&account_ref, &group_id).await?;
         Ok(summary.into())
     }
@@ -372,6 +603,10 @@ impl Marmot {
         member_ref: String,
     ) -> Result<SendSummaryFfi, MarmotKitError> {
         let group_id = group_id_from_hex(&group_id_hex)?;
+        let group_id_hex = hex::encode(group_id.as_slice());
+        let state =
+            group_management_state_for(self, &account_ref, &group_id, &group_id_hex).await?;
+        ensure_can_promote_admin(&state, &group_id_hex, &member_ref)?;
         let summary = self
             .runtime
             .promote_admin(&account_ref, &group_id, &member_ref)
@@ -387,6 +622,10 @@ impl Marmot {
         member_ref: String,
     ) -> Result<SendSummaryFfi, MarmotKitError> {
         let group_id = group_id_from_hex(&group_id_hex)?;
+        let group_id_hex = hex::encode(group_id.as_slice());
+        let state =
+            group_management_state_for(self, &account_ref, &group_id, &group_id_hex).await?;
+        ensure_can_demote_admin(&state, &group_id_hex, &member_ref)?;
         let summary = self
             .runtime
             .demote_admin(&account_ref, &group_id, &member_ref)
@@ -401,11 +640,109 @@ impl Marmot {
         group_id_hex: String,
     ) -> Result<SendSummaryFfi, MarmotKitError> {
         let group_id = group_id_from_hex(&group_id_hex)?;
+        let group_id_hex = hex::encode(group_id.as_slice());
+        let state =
+            group_management_state_for(self, &account_ref, &group_id, &group_id_hex).await?;
+        ensure_can_self_demote_admin(&state, &group_id_hex)?;
         let summary = self
             .runtime
             .self_demote_admin(&account_ref, &group_id)
             .await?;
         Ok(summary.into())
+    }
+
+    pub async fn invite_members_detailed(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+        member_refs: Vec<String>,
+    ) -> Result<GroupMutationResultFfi, MarmotKitError> {
+        let group_id = group_id_from_hex(&group_id_hex)?;
+        let group_id_hex = hex::encode(group_id.as_slice());
+        let state =
+            group_management_state_for(self, &account_ref, &group_id, &group_id_hex).await?;
+        ensure_group_admin(&state, &group_id_hex)?;
+        let summary = self
+            .runtime
+            .invite_members(&account_ref, &group_id, &member_refs)
+            .await?;
+        group_mutation_result_for(self, &account_ref, &group_id, &group_id_hex, summary.into())
+            .await
+    }
+
+    pub async fn remove_members_detailed(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+        member_refs: Vec<String>,
+    ) -> Result<GroupMutationResultFfi, MarmotKitError> {
+        let group_id = group_id_from_hex(&group_id_hex)?;
+        let group_id_hex = hex::encode(group_id.as_slice());
+        let state =
+            group_management_state_for(self, &account_ref, &group_id, &group_id_hex).await?;
+        ensure_can_remove_members(&state, &group_id_hex, &member_refs)?;
+        let summary = self
+            .runtime
+            .remove_members(&account_ref, &group_id, &member_refs)
+            .await?;
+        group_mutation_result_for(self, &account_ref, &group_id, &group_id_hex, summary.into())
+            .await
+    }
+
+    pub async fn promote_admin_detailed(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+        member_ref: String,
+    ) -> Result<GroupMutationResultFfi, MarmotKitError> {
+        let group_id = group_id_from_hex(&group_id_hex)?;
+        let group_id_hex = hex::encode(group_id.as_slice());
+        let state =
+            group_management_state_for(self, &account_ref, &group_id, &group_id_hex).await?;
+        ensure_can_promote_admin(&state, &group_id_hex, &member_ref)?;
+        let summary = self
+            .runtime
+            .promote_admin(&account_ref, &group_id, &member_ref)
+            .await?;
+        group_mutation_result_for(self, &account_ref, &group_id, &group_id_hex, summary.into())
+            .await
+    }
+
+    pub async fn demote_admin_detailed(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+        member_ref: String,
+    ) -> Result<GroupMutationResultFfi, MarmotKitError> {
+        let group_id = group_id_from_hex(&group_id_hex)?;
+        let group_id_hex = hex::encode(group_id.as_slice());
+        let state =
+            group_management_state_for(self, &account_ref, &group_id, &group_id_hex).await?;
+        ensure_can_demote_admin(&state, &group_id_hex, &member_ref)?;
+        let summary = self
+            .runtime
+            .demote_admin(&account_ref, &group_id, &member_ref)
+            .await?;
+        group_mutation_result_for(self, &account_ref, &group_id, &group_id_hex, summary.into())
+            .await
+    }
+
+    pub async fn self_demote_admin_detailed(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+    ) -> Result<GroupMutationResultFfi, MarmotKitError> {
+        let group_id = group_id_from_hex(&group_id_hex)?;
+        let group_id_hex = hex::encode(group_id.as_slice());
+        let state =
+            group_management_state_for(self, &account_ref, &group_id, &group_id_hex).await?;
+        ensure_can_self_demote_admin(&state, &group_id_hex)?;
+        let summary = self
+            .runtime
+            .self_demote_admin(&account_ref, &group_id)
+            .await?;
+        group_mutation_result_for(self, &account_ref, &group_id, &group_id_hex, summary.into())
+            .await
     }
 
     /// Current MLS state (epoch, member count, required components) for the
@@ -678,7 +1015,9 @@ impl Marmot {
     /// `None` if it isn't a valid public key. Used to resolve a scanned or
     /// deep-linked npub back to the account id the rest of the API expects.
     pub fn account_id_hex(&self, reference: String) -> Option<String> {
-        marmot_app::account_id_hex_from_ref(&reference).ok()
+        normalize_member_ref_ffi(&reference)
+            .ok()
+            .map(|normalized| normalized.account_id_hex)
     }
 
     /// Per-account relay lists: the NIP-65, inbox, and key-package lists the
@@ -799,5 +1138,67 @@ impl Marmot {
             .runtime
             .subscribe_group_state(&account_ref, &group_id_hex)?;
         Ok(GroupStateSubscription::new(inner))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state(self_admin: bool, last_admin: bool) -> GroupManagementStateFfi {
+        let self_id = "aa4fc8665f5696e33db7e1a572e3b0f5b3d615837b0f362dcb1c8068b098c7b4";
+        let member_id = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+        GroupManagementStateFfi {
+            my_account_id_hex: self_id.into(),
+            is_self_admin: self_admin,
+            is_last_admin: last_admin,
+            can_invite: self_admin,
+            can_leave: !self_admin,
+            requires_self_demote_before_leave: self_admin,
+            member_actions: vec![
+                GroupMemberActionStateFfi {
+                    member_id_hex: self_id.into(),
+                    is_self: true,
+                    is_admin: self_admin,
+                    can_remove: false,
+                    can_promote: false,
+                    can_demote: false,
+                },
+                GroupMemberActionStateFfi {
+                    member_id_hex: member_id.into(),
+                    is_self: false,
+                    is_admin: true,
+                    can_remove: self_admin && !last_admin,
+                    can_promote: false,
+                    can_demote: self_admin && !last_admin,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn promote_preflight_returns_already_admin() {
+        let group_id_hex = "01".repeat(32);
+        let member_id = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+        let err = ensure_can_promote_admin(&state(true, false), &group_id_hex, member_id)
+            .expect_err("promoting an admin should fail");
+        assert!(matches!(err, MarmotKitError::AlreadyAdmin { .. }));
+    }
+
+    #[test]
+    fn self_demote_preflight_protects_last_admin() {
+        let group_id_hex = "01".repeat(32);
+        let err = ensure_can_self_demote_admin(&state(true, true), &group_id_hex)
+            .expect_err("last admin self-demote should fail");
+        assert!(matches!(err, MarmotKitError::WouldRemoveLastAdmin { .. }));
+    }
+
+    #[test]
+    fn admin_mutation_preflight_checks_caller_admin_first() {
+        let group_id_hex = "01".repeat(32);
+        let member_id = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+        let err = ensure_can_demote_admin(&state(false, false), &group_id_hex, member_id)
+            .expect_err("non-admin caller should fail");
+        assert!(matches!(err, MarmotKitError::NotGroupAdmin { .. }));
     }
 }

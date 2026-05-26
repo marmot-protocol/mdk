@@ -37,7 +37,7 @@ use openmls::messages::proposals::{AppDataUpdateOperation, AppDataUpdateProposal
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::RustCrypto;
 use openmls_traits::OpenMlsProvider as _;
-use storage_memory::MemoryStorage;
+use storage_sqlite::SqliteStorage;
 use tls_codec::Serialize as _;
 
 mod support;
@@ -168,8 +168,8 @@ fn registry() -> FeatureRegistry {
     r
 }
 
-fn build(id: &[u8]) -> Engine<MemoryStorage> {
-    EngineBuilder::new(MemoryStorage::new())
+fn build(id: &[u8]) -> Engine<SqliteStorage> {
+    EngineBuilder::new(SqliteStorage::in_memory().unwrap())
         .identity(pad32(id))
         .account_identity_proof_signer(proof_signer(id))
         .feature_registry(registry())
@@ -178,8 +178,8 @@ fn build(id: &[u8]) -> Engine<MemoryStorage> {
         .unwrap()
 }
 
-fn build_with_storage(id: &[u8]) -> (Engine<MemoryStorage>, MemoryStorage) {
-    let storage = MemoryStorage::new();
+fn build_with_storage(id: &[u8]) -> (Engine<SqliteStorage>, SqliteStorage) {
+    let storage = SqliteStorage::in_memory().unwrap();
     let engine = EngineBuilder::new(storage.clone())
         .identity(pad32(id))
         .account_identity_proof_signer(proof_signer(id))
@@ -190,7 +190,7 @@ fn build_with_storage(id: &[u8]) -> (Engine<MemoryStorage>, MemoryStorage) {
     (engine, storage)
 }
 
-fn converge_buffered_commit(engine: &mut Engine<MemoryStorage>, group_id: &GroupId) {
+fn converge_buffered_commit(engine: &mut Engine<SqliteStorage>, group_id: &GroupId) {
     let result = engine
         .converge_stored_openmls_messages(group_id, 1_000_000)
         .expect("buffered commit converges");
@@ -198,13 +198,13 @@ fn converge_buffered_commit(engine: &mut Engine<MemoryStorage>, group_id: &Group
 }
 
 fn malicious_app_component_commit(
-    storage: &MemoryStorage,
+    storage: &SqliteStorage,
     sender: &MemberId,
     group_id: &GroupId,
     updates: Vec<AppComponentData>,
 ) -> TransportMessage {
     let crypto = RustCrypto::default();
-    let provider = EngineOpenMlsProvider::<MemoryStorage>::new(&crypto, storage.mls_storage());
+    let provider = EngineOpenMlsProvider::<SqliteStorage>::new(&crypto, storage.mls_storage());
     let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
     let mut mls_group = MlsGroup::load(provider.storage(), &mls_gid)
         .expect("load attacker's MLS group")
@@ -266,7 +266,7 @@ fn malicious_app_component_commit(
     }
 }
 
-async fn create_pair() -> (Engine<MemoryStorage>, Engine<MemoryStorage>, GroupId) {
+async fn create_pair() -> (Engine<SqliteStorage>, Engine<SqliteStorage>, GroupId) {
     let mut alice = build(b"alice");
     let mut bob = build(b"bob");
     let bob_kp = bob.fresh_key_package().await.unwrap();

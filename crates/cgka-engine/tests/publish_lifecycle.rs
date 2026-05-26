@@ -26,7 +26,7 @@ use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };
 use cgka_traits::types::{MemberId, MessageId};
-use storage_memory::MemoryStorage;
+use storage_sqlite::SqliteStorage;
 
 mod support;
 use support::proof_signer;
@@ -150,7 +150,7 @@ fn registry_with_reactions() -> FeatureRegistry {
 }
 
 fn build(id: &[u8]) -> impl CgkaEngine {
-    EngineBuilder::new(MemoryStorage::new())
+    EngineBuilder::new(SqliteStorage::in_memory().unwrap())
         .identity(pad32(id))
         .account_identity_proof_signer(proof_signer(id))
         .feature_registry(registry_with_reactions())

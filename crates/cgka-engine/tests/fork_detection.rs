@@ -22,7 +22,7 @@ use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };
 use cgka_traits::types::{EpochId, MemberId, MessageId};
-use storage_memory::MemoryStorage;
+use storage_sqlite::SqliteStorage;
 
 mod support;
 use support::proof_signer;
@@ -135,7 +135,7 @@ fn selfremove_registry() -> FeatureRegistry {
 }
 
 fn build_client(id: &[u8]) -> impl CgkaEngine {
-    EngineBuilder::new(MemoryStorage::new())
+    EngineBuilder::new(SqliteStorage::in_memory().unwrap())
         .identity(pad32(id))
         .account_identity_proof_signer(proof_signer(id))
         .feature_registry(selfremove_registry())

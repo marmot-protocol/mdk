@@ -78,7 +78,6 @@ coverage-traits:
     cargo llvm-cov -p cgka-traits --all-targets --summary-only
 
 coverage-storage:
-    cargo llvm-cov -p storage-memory --all-targets --summary-only
     cargo llvm-cov -p storage-sqlite --all-targets --summary-only
 
 coverage-engine:

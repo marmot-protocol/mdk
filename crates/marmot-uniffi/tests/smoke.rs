@@ -10,7 +10,7 @@
 
 use std::sync::{Arc, Once};
 
-use marmot_uniffi::{Marmot, MediaReferenceFfi, MediaUploadRequestFfi};
+use marmot_uniffi::{Marmot, MarmotKitError, MediaReferenceFfi, MediaUploadRequestFfi};
 
 /// `Marmot::new` opens a Keychain-backed secret store, which on the real
 /// targets (iOS/macOS) is always present but in headless CI (Linux Secret
@@ -69,6 +69,44 @@ fn display_name_is_none_for_unknown_account() {
         "expected None for unknown account, got {:?}",
         name
     );
+}
+
+#[test]
+fn normalize_member_ref_accepts_profile_and_nostr_forms() {
+    install_mock_keyring();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let kit = Marmot::new(
+        tmp.path().to_string_lossy().into_owned(),
+        vec!["wss://relay.invalid.test".to_string()],
+    )
+    .expect("open marmot kit");
+    let account_id = "aa4fc8665f5696e33db7e1a572e3b0f5b3d615837b0f362dcb1c8068b098c7b4";
+    let npub = "npub14f8usejl26twx0dhuxjh9cas7keav9vr0v8nvtwtrjqx3vycc76qqh9nsy";
+
+    for reference in [
+        account_id.to_string(),
+        npub.to_string(),
+        format!("nostr:{npub}"),
+        format!("darkmatter://profile/{npub}?from=qr"),
+    ] {
+        let normalized = kit
+            .normalize_member_ref(reference.clone())
+            .expect("normalize member ref");
+        assert_eq!(normalized.member_ref, account_id);
+        assert_eq!(normalized.account_id_hex, account_id);
+        assert_eq!(normalized.npub, npub);
+        assert_eq!(
+            kit.account_id_hex(reference),
+            Some(account_id.to_string()),
+            "legacy account_id_hex should accept the same references"
+        );
+    }
+
+    assert!(matches!(
+        kit.normalize_member_ref("not-a-member-ref".into())
+            .expect_err("invalid member ref should fail"),
+        MarmotKitError::InvalidIdentity { .. }
+    ));
 }
 
 #[tokio::test]

@@ -21,7 +21,7 @@ use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };
 use cgka_traits::types::{MemberId, MessageId};
-use storage_memory::MemoryStorage;
+use storage_sqlite::SqliteStorage;
 
 mod support;
 use support::proof_signer;
@@ -171,7 +171,7 @@ fn registry_selfremove_required_and_component_optional() -> FeatureRegistry {
 }
 
 fn build_client(id: &[u8], registry: FeatureRegistry) -> impl CgkaEngine {
-    EngineBuilder::new(MemoryStorage::new())
+    EngineBuilder::new(SqliteStorage::in_memory().unwrap())
         .identity(pad32(id))
         .account_identity_proof_signer(proof_signer(id))
         .feature_registry(registry)
@@ -183,8 +183,8 @@ fn build_client(id: &[u8], registry: FeatureRegistry) -> impl CgkaEngine {
 fn build_engine_with_components(
     id: &[u8],
     components: impl IntoIterator<Item = u16>,
-) -> Engine<MemoryStorage> {
-    EngineBuilder::new(MemoryStorage::new())
+) -> Engine<SqliteStorage> {
+    EngineBuilder::new(SqliteStorage::in_memory().unwrap())
         .identity(pad32(id))
         .account_identity_proof_signer(proof_signer(id))
         .supported_app_components(components)
@@ -197,8 +197,8 @@ fn build_engine_with_registry_and_components(
     id: &[u8],
     registry: FeatureRegistry,
     components: impl IntoIterator<Item = u16>,
-) -> Engine<MemoryStorage> {
-    EngineBuilder::new(MemoryStorage::new())
+) -> Engine<SqliteStorage> {
+    EngineBuilder::new(SqliteStorage::in_memory().unwrap())
         .identity(pad32(id))
         .account_identity_proof_signer(proof_signer(id))
         .feature_registry(registry)
@@ -1008,8 +1008,8 @@ async fn bob_sees_alice_caps_cached_after_invite_commit() {
 fn build_concrete_with_storage(
     id: &[u8],
     registry: FeatureRegistry,
-) -> (Engine<MemoryStorage>, MemoryStorage) {
-    let storage = MemoryStorage::new();
+) -> (Engine<SqliteStorage>, SqliteStorage) {
+    let storage = SqliteStorage::in_memory().unwrap();
     let engine = EngineBuilder::new(storage.clone())
         .identity(pad32(id))
         .account_identity_proof_signer(proof_signer(id))

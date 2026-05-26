@@ -17,7 +17,7 @@ use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };
 use cgka_traits::types::{MemberId, MessageId};
-use storage_memory::MemoryStorage;
+use storage_sqlite::SqliteStorage;
 
 mod support;
 use support::proof_signer;
@@ -122,7 +122,7 @@ impl TransportPeeler for MockPeeler {
 }
 
 fn build_client(identity: &[u8]) -> impl CgkaEngine {
-    EngineBuilder::new(MemoryStorage::new())
+    EngineBuilder::new(SqliteStorage::in_memory().unwrap())
         .identity(pad32(identity))
         .account_identity_proof_signer(proof_signer(identity))
         .feature_registry(FeatureRegistry::new())

@@ -30,7 +30,6 @@ This repo owns the candidate CGKA engine workspace:
 | Account orchestration / app-core shell | `crates/marmot-account/AGENTS.md` |
 | App runtime bridge | `crates/marmot-app/AGENTS.md` |
 | Storage traits and shared types | `crates/traits/AGENTS.md` |
-| In-memory storage | `crates/storage-memory/AGENTS.md` |
 | SQLite storage | `crates/storage-sqlite/AGENTS.md` |
 | Nostr transport adapter | `crates/transport-nostr-adapter/AGENTS.md` |
 | Nostr transport peeler | `crates/transport-nostr-peeler/AGENTS.md` |

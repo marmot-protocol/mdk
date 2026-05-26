@@ -60,7 +60,12 @@ impl<S: StorageProvider> Engine<S> {
         }
         if self.sent_message_ids.contains(&msg.id) {
             let group_id = record_group_id(&msg);
-            self.persist_transport_message(&msg, &group_id, EpochId(0), MessageState::Sent)?;
+            self.persist_transport_message_for_existing_group(
+                &msg,
+                &group_id,
+                EpochId(0),
+                MessageState::Sent,
+            )?;
             return Ok(IngestOutcome::Stale {
                 reason: StaleReason::OwnEcho,
             });
@@ -95,12 +100,6 @@ impl<S: StorageProvider> Engine<S> {
         // member assumption. `NotForThisClient` also makes routing failures
         // easier to distinguish from decryption failures.
         if &recipient != self.identity.self_id() {
-            self.persist_transport_message(
-                msg,
-                &GroupId::new(Vec::new()),
-                EpochId(0),
-                MessageState::Failed,
-            )?;
             return Ok(IngestOutcome::Stale {
                 reason: StaleReason::NotForThisClient,
             });
@@ -113,28 +112,12 @@ impl<S: StorageProvider> Engine<S> {
                 self.persist_transport_message(msg, &gid, EpochId(0), MessageState::Processed)?;
                 Ok(IngestOutcome::Processed)
             }
-            Err(EngineError::Peeler(PeelerError::DecryptFailed)) => {
-                self.persist_transport_message(
-                    msg,
-                    &GroupId::new(Vec::new()),
-                    EpochId(0),
-                    MessageState::Failed,
-                )?;
-                Ok(IngestOutcome::Stale {
-                    reason: StaleReason::PeelFailed,
-                })
-            }
-            Err(EngineError::Peeler(PeelerError::Malformed(_))) => {
-                self.persist_transport_message(
-                    msg,
-                    &GroupId::new(Vec::new()),
-                    EpochId(0),
-                    MessageState::Failed,
-                )?;
-                Ok(IngestOutcome::Stale {
-                    reason: StaleReason::PeelFailed,
-                })
-            }
+            Err(EngineError::Peeler(PeelerError::DecryptFailed)) => Ok(IngestOutcome::Stale {
+                reason: StaleReason::PeelFailed,
+            }),
+            Err(EngineError::Peeler(PeelerError::Malformed(_))) => Ok(IngestOutcome::Stale {
+                reason: StaleReason::PeelFailed,
+            }),
             Err(other) => Err(other),
         }
     }
@@ -160,7 +143,7 @@ impl<S: StorageProvider> Engine<S> {
             ) {
                 Ok(Some(g)) => g,
                 Ok(None) => {
-                    self.persist_transport_message(
+                    self.persist_transport_message_for_existing_group(
                         msg,
                         &group_id,
                         EpochId(0),
@@ -1798,6 +1781,20 @@ impl<S: StorageProvider> Engine<S> {
             state,
             StoredMessagePayload::raw_transport(msg.clone()),
         )
+    }
+
+    fn persist_transport_message_for_existing_group(
+        &self,
+        msg: &TransportMessage,
+        group_id: &GroupId,
+        epoch: EpochId,
+        state: MessageState,
+    ) -> Result<(), EngineError> {
+        match self.storage.get_group(group_id) {
+            Ok(_) => self.persist_transport_message(msg, group_id, epoch, state),
+            Err(StorageError::NotFound) => Ok(()),
+            Err(e) => Err(EngineError::Storage(e)),
+        }
     }
 
     fn persist_openmls_wire_message(

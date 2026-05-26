@@ -128,8 +128,8 @@ The active workspace proves the shape without the old prototype tree:
 - `crates/cgka-session` wires the engine to encrypted account-device storage.
 - `crates/marmot-account` owns account/session orchestration: it combines an account-device session, a `TransportAdapter`,
   transport routing policy, KeyPackage publication, and pending publish confirmation.
-- `crates/storage-memory` provides in-memory storage and rollback snapshots.
-- `crates/storage-sqlite` provides SQLCipher-backed persistence for Marmot metadata and group-scoped OpenMLS state.
+- `crates/storage-sqlite` provides SQLCipher-backed persistence for Marmot metadata and group-scoped OpenMLS state, plus
+  an in-memory SQLite mode for tests and simulator runs.
 - `crates/transport-nostr-adapter` implements the Nostr adapter core: account-scoped activation, group subscription
   sync, stale subscription cleanup, relay-event routing, diagnostics, redacted relay-health summaries, and publish
   reports over an injectable relay-client boundary. Its optional `sdk` feature provides the first `nostr-sdk` backed

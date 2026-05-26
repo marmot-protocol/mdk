@@ -258,7 +258,7 @@ shapes. Tests: `tests/fork_detection.rs` plus the harness `deliberate_fork_via_h
 - **Only `EpochManager` may construct non-`Stable` `EpochState` variants.** This is enforced by visibility — the
   variants' fields are private. Don't add a public constructor for `Recovering` etc. somewhere else.
 - **No Nostr types anywhere.** Grep test: `grep -ri nostr crates/cgka-engine/src/` returns zero hits. Same for
-  `crates/traits/`, `crates/storage-memory/`, and `crates/storage-sqlite/`.
+  `crates/traits/` and `crates/storage-sqlite/`.
 - **No `leave_group()` (the legacy MLS path).** Always `leave_group_via_self_remove` per MIP-03. This is grep-banned.
 - **OpenMLS family is tilde-pinned in workspace `Cargo.toml`.** Don't relax to caret; silent companion-crate skew has
   broken this stack before.

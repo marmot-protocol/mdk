@@ -16,11 +16,14 @@ use cgka_conformance_simulator::openmls_projection::{
 use cgka_conformance_simulator::{ClientBuilder, HarnessClient, TransportBus};
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::provider::EngineOpenMlsProvider;
-use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
+use cgka_traits::capabilities::{
+    Capability, CapabilityRequirement, Feature, GroupCapabilities, RequirementLevel,
+};
+use cgka_traits::group::{Group, Member};
 use cgka_traits::message::{MessageRecord, MessageState};
 use cgka_traits::storage::{GroupStorage, MessageStorage, StorageProvider};
 use cgka_traits::transport::TransportMessage;
-use cgka_traits::types::{EpochId, GroupId, MessageId};
+use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
 use openmls::group::MlsGroup;
 use openmls_rust_crypto::RustCrypto;
 use openmls_traits::OpenMlsProvider;
@@ -1282,7 +1285,7 @@ async fn openmls_canonicalization_apply_rolls_back_when_selected_path_fails() {
 
 #[test]
 fn openmls_disposition_persistence_maps_all_canonicalization_states() {
-    let storage = storage_memory::MemoryStorage::new();
+    let storage = storage_sqlite::SqliteStorage::in_memory().unwrap();
     let group_id = GroupId::new(b"disposition-group".to_vec());
     let accepted_commit_id = MessageId::new(vec![1]);
     let accepted_app_id = MessageId::new(vec![2]);
@@ -1349,7 +1352,7 @@ fn assert_projected_kind(msg: &TransportMessage, expected_kind: OpenMlsContentKi
 }
 
 fn assert_message_state(
-    storage: &storage_memory::MemoryStorage,
+    storage: &storage_sqlite::SqliteStorage,
     msg: &TransportMessage,
     expected: MessageState,
 ) {
@@ -1357,7 +1360,7 @@ fn assert_message_state(
 }
 
 fn assert_message_id_state(
-    storage: &storage_memory::MemoryStorage,
+    storage: &storage_sqlite::SqliteStorage,
     id: &MessageId,
     expected: MessageState,
 ) {
@@ -1365,10 +1368,10 @@ fn assert_message_id_state(
     assert_eq!(record.state, expected);
 }
 
-fn stored_openmls_epoch(storage: &storage_memory::MemoryStorage, group_id: &GroupId) -> u64 {
+fn stored_openmls_epoch(storage: &storage_sqlite::SqliteStorage, group_id: &GroupId) -> u64 {
     let crypto = RustCrypto::default();
     let provider =
-        EngineOpenMlsProvider::<storage_memory::MemoryStorage>::new(&crypto, storage.mls_storage());
+        EngineOpenMlsProvider::<storage_sqlite::SqliteStorage>::new(&crypto, storage.mls_storage());
     let mls_group_id = openmls::group::GroupId::from_slice(group_id.as_slice());
     let group = MlsGroup::load(provider.storage(), &mls_group_id)
         .expect("MLS group loads")
@@ -1377,10 +1380,13 @@ fn stored_openmls_epoch(storage: &storage_memory::MemoryStorage, group_id: &Grou
 }
 
 fn store_dummy_created_message(
-    storage: &storage_memory::MemoryStorage,
+    storage: &storage_sqlite::SqliteStorage,
     group_id: &GroupId,
     id: &MessageId,
 ) {
+    storage
+        .put_group(&dummy_group(group_id.clone()))
+        .expect("group stored");
     storage
         .put_message(&MessageRecord {
             id: id.clone(),
@@ -1392,8 +1398,22 @@ fn store_dummy_created_message(
         .expect("message stored");
 }
 
+fn dummy_group(group_id: GroupId) -> Group {
+    Group {
+        id: group_id,
+        name: "probe".to_owned(),
+        description: String::new(),
+        epoch: EpochId(1),
+        members: vec![Member {
+            id: MemberId::new(vec![1]),
+            credential: vec![1],
+        }],
+        required_capabilities: GroupCapabilities::default(),
+    }
+}
+
 fn store_created_message(
-    storage: &storage_memory::MemoryStorage,
+    storage: &storage_sqlite::SqliteStorage,
     group_id: &GroupId,
     msg: &TransportMessage,
 ) {

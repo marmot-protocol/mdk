@@ -181,7 +181,7 @@ These are longer working documents. Go here when you need depth, not orientation
   - **Target:** OpenMLS first, with the trait boundary preserving future CGKA swap room
 
 - **Layer:** Storage
-  - **Today:** `storage-memory` for tests/simulator work; `storage-sqlite` for SQLCipher-backed persistence
+  - **Today:** `storage-sqlite` for SQLCipher-backed persistence plus in-memory SQLite test/simulator runs
   - **Target:** MLS app-component policy negotiation, app key-management integration, packaging
 
 ---

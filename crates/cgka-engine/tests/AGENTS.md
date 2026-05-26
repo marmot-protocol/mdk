@@ -6,13 +6,13 @@ crates and are listed here for navigation.
 ## Tier 1 — In-crate unit tests (other crates)
 
 **Where:** `crates/traits/src/engine_state.rs::tests`, `crates/traits/tests/snapshots.rs`,
-`crates/storage-memory/src/tests.rs`, `crates/storage-sqlite/src/**::tests`. **What they prove:**
+`crates/storage-sqlite/src/**::tests`. **What they prove:**
 pure-data-structure correctness — state-machine transitions, storage round-trips, snapshot/rollback, JSON shape
 stability of cross-boundary value types. No engine, no MLS.
 
 ```sh
 cargo test -p cgka-traits
-cargo test -p storage-memory
+cargo test -p storage-sqlite
 ```
 
 To accept new snapshot shapes after a deliberate change:
@@ -24,7 +24,8 @@ cargo insta review
 ## Tier 2 — Engine integration tests (this directory)
 
 **What they prove:** real OpenMLS-backed engine behavior across one or more engine instances using a pass-through
-`MockPeeler`. Most files use `Engine<MemoryStorage>`; `sqlite_storage.rs` keeps the persistent backend on the same rail.
+`MockPeeler`. Most files use in-memory `Engine<SqliteStorage>`; `sqlite_storage.rs` keeps the encrypted file-backed
+backend on the same rail.
 
 - **File:** `scaffold.rs`
   - **Owns:** `EngineBuilder` validation; `Box<dyn CgkaEngine>` witness
@@ -120,5 +121,5 @@ Run before checkpointing broad storage/engine changes; the exact count changes a
 ## Why no in-crate `#[cfg(test)]` modules
 
 The engine modules are intentionally test-free: testing them requires an `Engine<S>` instance which requires a storage
-backend, and we don't want `cgka-engine` to dev-depend on `storage-memory` for module-internal tests. All engine
-assertions go through `tests/*.rs` integration files which `dev-dependencies` on `storage-memory`.
+backend. All engine assertions go through `tests/*.rs` integration files, using `storage-sqlite` in-memory mode unless
+the test explicitly needs encrypted file-backed persistence.

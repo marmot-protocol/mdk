@@ -27,7 +27,7 @@ use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
-use storage_memory::MemoryStorage;
+use storage_sqlite::SqliteStorage;
 
 mod support;
 use support::proof_signer;
@@ -143,13 +143,13 @@ fn selfremove_registry() -> FeatureRegistry {
     r
 }
 
-fn build_client(id: &[u8]) -> (Engine<MemoryStorage>, MemoryStorage) {
-    let storage = MemoryStorage::new();
+fn build_client(id: &[u8]) -> (Engine<SqliteStorage>, SqliteStorage) {
+    let storage = SqliteStorage::in_memory().unwrap();
     let engine = build_client_with_storage(id, storage.clone());
     (engine, storage)
 }
 
-fn build_client_with_storage(id: &[u8], storage: MemoryStorage) -> Engine<MemoryStorage> {
+fn build_client_with_storage(id: &[u8], storage: SqliteStorage) -> Engine<SqliteStorage> {
     EngineBuilder::new(storage)
         .identity(pad32(id))
         .account_identity_proof_signer(proof_signer(id))
@@ -2385,7 +2385,7 @@ fn welcome_for(welcomes: &[TransportMessage], name: &[u8]) -> TransportMessage {
 }
 
 async fn send_app(
-    engine: &mut Engine<MemoryStorage>,
+    engine: &mut Engine<SqliteStorage>,
     group_id: &GroupId,
     payload: Vec<u8>,
 ) -> TransportMessage {
@@ -2402,7 +2402,7 @@ async fn send_app(
     }
 }
 
-fn app_payload_for(engine: &Engine<MemoryStorage>, payload: impl AsRef<[u8]>) -> Vec<u8> {
+fn app_payload_for(engine: &Engine<SqliteStorage>, payload: impl AsRef<[u8]>) -> Vec<u8> {
     let content = String::from_utf8(payload.as_ref().to_vec()).expect("test app payload is utf8");
     MarmotAppEvent::new(
         hex::encode(engine.self_id().as_slice()),
@@ -2434,7 +2434,7 @@ fn route(msg: TransportMessage, group_id: &GroupId) -> TransportMessage {
     }
 }
 
-fn assert_message_state(storage: &MemoryStorage, msg: &TransportMessage, expected: MessageState) {
+fn assert_message_state(storage: &SqliteStorage, msg: &TransportMessage, expected: MessageState) {
     let record = storage
         .get_message(&msg.id)
         .expect("message remains stored");

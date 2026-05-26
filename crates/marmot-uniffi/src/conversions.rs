@@ -6,7 +6,7 @@
 //! (Rust → FFI). When the iOS side needs to round-trip data back into
 //! marmot-app we'll add the reverse direction explicitly.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use cgka_traits::GroupId;
 use marmot_app::{
@@ -15,8 +15,10 @@ use marmot_app::{
     AppGroupProfileComponent, AppGroupRecord, AppMessageRecord, MarmotAppEvent,
     MediaDownloadResult, MediaReference, MediaUploadRequest, MediaUploadResult, ReceivedMessage,
     RelayPlaneHealth, RuntimeAgentStreamUpdate, RuntimeMessageReceived, RuntimeMessageUpdate,
-    SendSummary, UserProfileMetadata,
+    SendSummary, UserProfileMetadata, account_id_hex_from_ref, npub_for_account_id,
 };
+
+use crate::errors::MarmotKitError;
 
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct AccountSummaryFfi {
@@ -348,6 +350,166 @@ impl From<AppGroupMemberRecord> for AppGroupMemberRecordFfi {
     }
 }
 
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct MemberRefFfi {
+    pub member_ref: String,
+    pub account_id_hex: String,
+    pub npub: String,
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct GroupMemberDetailsFfi {
+    pub member_id_hex: String,
+    pub account: Option<String>,
+    pub local: bool,
+    pub is_admin: bool,
+    pub is_self: bool,
+    pub npub: String,
+    pub display_name: Option<String>,
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct GroupDetailsFfi {
+    pub group: AppGroupRecordFfi,
+    pub members: Vec<GroupMemberDetailsFfi>,
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct GroupMemberActionStateFfi {
+    pub member_id_hex: String,
+    pub is_self: bool,
+    pub is_admin: bool,
+    pub can_remove: bool,
+    pub can_promote: bool,
+    pub can_demote: bool,
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct GroupManagementStateFfi {
+    pub my_account_id_hex: String,
+    pub is_self_admin: bool,
+    pub is_last_admin: bool,
+    pub can_invite: bool,
+    pub can_leave: bool,
+    pub requires_self_demote_before_leave: bool,
+    pub member_actions: Vec<GroupMemberActionStateFfi>,
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct GroupMutationResultFfi {
+    pub summary: SendSummaryFfi,
+    pub details: GroupDetailsFfi,
+    pub management_state: GroupManagementStateFfi,
+}
+
+pub(crate) fn normalize_member_ref_ffi(member_ref: &str) -> Result<MemberRefFfi, MarmotKitError> {
+    let canonical = canonical_member_ref_input(member_ref);
+    let account_id_hex =
+        account_id_hex_from_ref(&canonical).map_err(|err| MarmotKitError::InvalidIdentity {
+            details: err.to_string(),
+        })?;
+    let npub =
+        npub_for_account_id(&account_id_hex).map_err(|err| MarmotKitError::InvalidIdentity {
+            details: err.to_string(),
+        })?;
+    Ok(MemberRefFfi {
+        member_ref: account_id_hex.clone(),
+        account_id_hex,
+        npub,
+    })
+}
+
+fn canonical_member_ref_input(member_ref: &str) -> String {
+    let trimmed = member_ref.trim();
+    let without_nostr = trimmed.strip_prefix("nostr:").unwrap_or(trimmed);
+    let without_profile = without_nostr
+        .strip_prefix("darkmatter://profile/")
+        .unwrap_or(without_nostr);
+    without_profile
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(without_profile)
+        .trim_matches('/')
+        .trim()
+        .to_string()
+}
+
+pub(crate) fn group_details_ffi(
+    group: AppGroupRecordFfi,
+    members: Vec<AppGroupMemberRecordFfi>,
+    my_account_id_hex: &str,
+    display_names: HashMap<String, String>,
+) -> Result<GroupDetailsFfi, MarmotKitError> {
+    let admin_ids = group.admins.iter().cloned().collect::<HashSet<_>>();
+    let members = members
+        .into_iter()
+        .map(|member| {
+            let npub = npub_for_account_id(&member.member_id_hex).map_err(|err| {
+                MarmotKitError::InvalidIdentity {
+                    details: err.to_string(),
+                }
+            })?;
+            Ok(GroupMemberDetailsFfi {
+                is_admin: admin_ids.contains(&member.member_id_hex),
+                is_self: member.member_id_hex == my_account_id_hex,
+                display_name: display_names.get(&member.member_id_hex).cloned(),
+                npub,
+                member_id_hex: member.member_id_hex,
+                account: member.account,
+                local: member.local,
+            })
+        })
+        .collect::<Result<Vec<_>, MarmotKitError>>()?;
+    Ok(GroupDetailsFfi { group, members })
+}
+
+pub(crate) fn group_management_state_ffi(
+    my_account_id_hex: &str,
+    details: &GroupDetailsFfi,
+) -> GroupManagementStateFfi {
+    let admin_count = details
+        .members
+        .iter()
+        .filter(|member| member.is_admin)
+        .count();
+    let self_member = details
+        .members
+        .iter()
+        .find(|member| member.member_id_hex == my_account_id_hex);
+    let is_self_admin = self_member.is_some_and(|member| member.is_admin);
+    let is_last_admin = is_self_admin && admin_count == 1;
+    let can_invite = is_self_admin;
+    let can_leave = self_member.is_some() && !is_self_admin;
+    let requires_self_demote_before_leave = self_member.is_some() && is_self_admin;
+    let member_actions = details
+        .members
+        .iter()
+        .map(|member| {
+            let would_remove_last_admin = member.is_admin && admin_count == 1;
+            GroupMemberActionStateFfi {
+                member_id_hex: member.member_id_hex.clone(),
+                is_self: member.is_self,
+                is_admin: member.is_admin,
+                can_remove: is_self_admin && !member.is_self && !would_remove_last_admin,
+                can_promote: is_self_admin && !member.is_admin,
+                can_demote: is_self_admin
+                    && member.is_admin
+                    && !member.is_self
+                    && !would_remove_last_admin,
+            }
+        })
+        .collect();
+    GroupManagementStateFfi {
+        my_account_id_hex: my_account_id_hex.to_string(),
+        is_self_admin,
+        is_last_admin,
+        can_invite,
+        can_leave,
+        requires_self_demote_before_leave,
+        member_actions,
+    }
+}
+
 /// MLS-level group state for the conversation's developer/debug view: the
 /// current epoch, live member count, and the app components the group requires.
 #[derive(Clone, Debug, uniffi::Record)]
@@ -636,4 +798,114 @@ pub fn group_id_from_hex(group_id_hex: &str) -> Result<GroupId, crate::errors::M
             details: err.to_string(),
         })?;
     Ok(GroupId::new(bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn group(admins: Vec<&str>) -> AppGroupRecordFfi {
+        AppGroupRecordFfi {
+            group_id_hex: "01".repeat(32),
+            endpoint: "marmot:group:01".into(),
+            name: "Test".into(),
+            description: String::new(),
+            admins: admins.into_iter().map(ToOwned::to_owned).collect(),
+            relays: vec![],
+            nostr_group_id_hex: "02".repeat(32),
+            archived: false,
+        }
+    }
+
+    fn member(member_id_hex: &str, is_admin: bool, is_self: bool) -> GroupMemberDetailsFfi {
+        GroupMemberDetailsFfi {
+            member_id_hex: member_id_hex.to_owned(),
+            account: None,
+            local: is_self,
+            is_admin,
+            is_self,
+            npub: "npub1placeholder".into(),
+            display_name: None,
+        }
+    }
+
+    #[test]
+    fn group_management_state_marks_last_admin_self_demote_requirement() {
+        let self_id = "aa4fc8665f5696e33db7e1a572e3b0f5b3d615837b0f362dcb1c8068b098c7b4";
+        let bob_id = "bb4fc8665f5696e33db7e1a572e3b0f5b3d615837b0f362dcb1c8068b098c7b4";
+        let details = GroupDetailsFfi {
+            group: group(vec![self_id]),
+            members: vec![member(self_id, true, true), member(bob_id, false, false)],
+        };
+
+        let state = group_management_state_ffi(self_id, &details);
+
+        assert!(state.is_self_admin);
+        assert!(state.is_last_admin);
+        assert!(state.can_invite);
+        assert!(!state.can_leave);
+        assert!(state.requires_self_demote_before_leave);
+        let self_action = state
+            .member_actions
+            .iter()
+            .find(|action| action.member_id_hex == self_id)
+            .expect("self action");
+        assert!(!self_action.can_remove);
+        assert!(!self_action.can_demote);
+        let bob_action = state
+            .member_actions
+            .iter()
+            .find(|action| action.member_id_hex == bob_id)
+            .expect("bob action");
+        assert!(bob_action.can_remove);
+        assert!(bob_action.can_promote);
+        assert!(!bob_action.can_demote);
+    }
+
+    #[test]
+    fn group_management_state_allows_demoting_another_admin_when_one_remains() {
+        let self_id = "aa4fc8665f5696e33db7e1a572e3b0f5b3d615837b0f362dcb1c8068b098c7b4";
+        let bob_id = "bb4fc8665f5696e33db7e1a572e3b0f5b3d615837b0f362dcb1c8068b098c7b4";
+        let details = GroupDetailsFfi {
+            group: group(vec![self_id, bob_id]),
+            members: vec![member(self_id, true, true), member(bob_id, true, false)],
+        };
+
+        let state = group_management_state_ffi(self_id, &details);
+
+        assert!(state.is_self_admin);
+        assert!(!state.is_last_admin);
+        let bob_action = state
+            .member_actions
+            .iter()
+            .find(|action| action.member_id_hex == bob_id)
+            .expect("bob action");
+        assert!(bob_action.can_remove);
+        assert!(!bob_action.can_promote);
+        assert!(bob_action.can_demote);
+    }
+
+    #[test]
+    fn group_management_state_keeps_non_admin_self_to_leave_only() {
+        let self_id = "aa4fc8665f5696e33db7e1a572e3b0f5b3d615837b0f362dcb1c8068b098c7b4";
+        let alice_id = "cc4fc8665f5696e33db7e1a572e3b0f5b3d615837b0f362dcb1c8068b098c7b4";
+        let details = GroupDetailsFfi {
+            group: group(vec![alice_id]),
+            members: vec![member(self_id, false, true), member(alice_id, true, false)],
+        };
+
+        let state = group_management_state_ffi(self_id, &details);
+
+        assert!(!state.is_self_admin);
+        assert!(!state.is_last_admin);
+        assert!(!state.can_invite);
+        assert!(state.can_leave);
+        assert!(!state.requires_self_demote_before_leave);
+        assert!(
+            state
+                .member_actions
+                .iter()
+                .all(|action| !action.can_remove && !action.can_promote && !action.can_demote)
+        );
+    }
 }

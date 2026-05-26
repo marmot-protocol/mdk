@@ -41,7 +41,7 @@ docs have since been removed. At the time, the workspace had these four core cra
 
 - `crates/traits` — shared trait surface + value types (zero Nostr leakage; verified by grep)
 - `crates/cgka-engine` — OpenMLS-backed `CgkaEngine` impl
-- `crates/storage-memory` — `Arc<RwLock>`-cloneable in-memory backend
+- An in-memory storage backend, since replaced by `storage-sqlite` in-memory mode
 - `crates/cgka-conformance-simulator` — multi-client `TransportBus` + `HarnessClient` + proptest
 
 Test totals at this checkpoint: ~80 tests across the workspace, 0 failing. The current workspace has more crates; use
@@ -74,10 +74,10 @@ now use a deterministic content-derived ordering key: `SHA-256(mls_bytes)`, scop
 digest winning. If a late inbound commit beats the local incumbent, the engine rolls storage back to the pre-commit
 snapshot and replays the winning commit. If it loses, the message becomes stale with `AlreadyAtEpoch`.
 
-Storage snapshots are now part of engine correctness, not a dormant hook. `storage-memory` snapshots the full OpenMLS
-memory map as a pragmatic harness backend. `storage-sqlite` now snapshots group-scoped OpenMLS rows plus CGKA metadata
-atomically and uses Rust migrations for schema/data evolution; follow-up work should add retention/pruning and persist
-enough ordering metadata to recover after restart.
+Storage snapshots are now part of engine correctness, not a dormant hook. The earlier in-memory backend snapshotted the
+full OpenMLS memory map as a pragmatic harness backend; `storage-sqlite` now snapshots group-scoped OpenMLS rows plus
+CGKA metadata atomically and uses Rust migrations for schema/data evolution. Follow-up work should add retention/pruning
+and persist enough ordering metadata to recover after restart.
 
 Follow-up: recovery observability now has a first contract. `cgka_traits::GroupEvent::ForkRecovered` records the source
 epoch, recovered epoch, winner ordering key, and invalidated incumbent ordering key.
