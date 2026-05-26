@@ -6,6 +6,8 @@ App runtime bridge for the first real Marmot app surfaces.
 
 - Own the app-facing runtime that ties `AccountHome`, SQLCipher session storage, Nostr peeling, and Nostr transport
   adapter support together.
+- Keep runtime orchestration, managed account workers, subscriptions, and live agent stream watches in `src/runtime.rs`
+  instead of regrowing `src/lib.rs`.
 - Keep CLI/TUI presentation out of this crate.
 - Keep the Nostr user directory app-facing and pubkey-keyed. It may cache local-account links, profile metadata, follow
   lists, relay lists, and KeyPackages, but it must not become an unbounded Nostr social-graph crawler.
