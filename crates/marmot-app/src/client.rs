@@ -12,7 +12,7 @@ use cgka_traits::app_event::{
     EVENT_REF_TAG, MARMOT_APP_EVENT_KIND_REACTION, MarmotAppEvent as MarmotInnerEvent,
 };
 use cgka_traits::engine::{CreateGroupRequest, KeyPackage, SendIntent};
-use cgka_traits::{GroupId, SecretBytes, TransportAdapter};
+use cgka_traits::{GroupId, SecretBytes, TransportAdapter, TransportEndpoint};
 use tokio::time::timeout;
 use transport_nostr_peeler::NostrTransportEvent;
 
@@ -25,6 +25,7 @@ use crate::media::{
     ENCRYPTED_MEDIA_EXPORTER_LABEL, download_encrypted_media, upload_encrypted_media,
 };
 use crate::messages::{AppMessageIntent, build_inner_event, encode_inner_event, tag_value};
+use crate::notifications;
 use crate::{
     AccountState, AgentTextStreamFinishRequest, AppAgentTextStreamComponent, AppError,
     AppGroupAdminPolicyComponent, AppGroupMemberRecord, AppGroupMessageRetentionComponent,
@@ -215,7 +216,13 @@ impl AppClient {
         self.refresh_group(group_id);
         self.prune_plaintext_retention_for_group(group_id)?;
         self.app.save_state(&self.state)?;
-        Ok(send_summary_from_effects(&effects))
+        let summary = send_summary_from_effects(&effects);
+        self.publish_notification_trigger_best_effort(
+            group_id,
+            notifications::NotificationTrigger::GroupInvite,
+        )
+        .await;
+        Ok(summary)
     }
 
     pub async fn remove_members(
@@ -240,6 +247,7 @@ impl AppClient {
         fail_if_publish_failed(&effects.failures)?;
         self.remember_published_reports(&effects);
         self.refresh_group(group_id);
+        self.cleanup_stale_push_tokens_best_effort(group_id);
         self.app.save_state(&self.state)?;
         Ok(send_summary_from_effects(&effects))
     }
@@ -413,19 +421,28 @@ impl AppClient {
         self.remember_published_reports(&effects);
         let group_id_hex = hex::encode(group_id.as_slice());
         let app_event_id = event.id.clone();
-        let projection = self.app.account_projection(&self.state.label)?;
-        projection.record_message(&AppMessageProjection {
-            message_id_hex: app_event_id.clone(),
-            direction: "sent".to_owned(),
-            group_id_hex: group_id_hex.clone(),
-            sender: sender.clone(),
-            plaintext: event.content.clone(),
-            kind: event.kind,
-            tags: event.tags.clone(),
-            recorded_at: None,
-        })?;
-        self.prune_plaintext_retention_for_group(group_id)?;
+        if !notifications::is_push_gossip_kind(event.kind) {
+            let projection = self.app.account_projection(&self.state.label)?;
+            projection.record_message(&AppMessageProjection {
+                message_id_hex: app_event_id.clone(),
+                direction: "sent".to_owned(),
+                group_id_hex: group_id_hex.clone(),
+                sender: sender.clone(),
+                plaintext: event.content.clone(),
+                kind: event.kind,
+                tags: event.tags.clone(),
+                recorded_at: None,
+            })?;
+            self.prune_plaintext_retention_for_group(group_id)?;
+        }
         self.app.save_state(&self.state)?;
+        if notification_trigger_for_intent(&intent).is_some() {
+            self.publish_notification_trigger_best_effort(
+                group_id,
+                notifications::NotificationTrigger::NewMessage,
+            )
+            .await;
+        }
         Ok((
             event,
             SendSummary {
@@ -433,6 +450,179 @@ impl AppClient {
                 message_ids: vec![app_event_id],
             },
         ))
+    }
+
+    pub(crate) async fn share_push_registration(&mut self) -> Result<usize, AppError> {
+        let account = self.app.account_home().account(&self.state.label)?;
+        let settings = self.app.notification_settings(&account.label)?;
+        let Some(registration) = self.app.stored_push_registration(&account.label)? else {
+            return Ok(0);
+        };
+        if !settings.native_push_enabled {
+            return Ok(0);
+        }
+        let mut shared = 0_usize;
+        for group in self.state.groups.clone() {
+            let Ok(group_id_bytes) = hex::decode(&group.group_id_hex) else {
+                continue;
+            };
+            let group_id = GroupId::new(group_id_bytes);
+            let Ok((member_id_hex, leaf_index)) = self.local_member_leaf(&group_id) else {
+                continue;
+            };
+            let (payload, record) = notifications::local_token_gossip_payload(
+                group.group_id_hex.clone(),
+                member_id_hex,
+                leaf_index,
+                &registration,
+            )?;
+            self.app.upsert_group_push_token(&account.label, &record)?;
+            let content = serde_json::to_string(&payload)?;
+            match self
+                .send_app_event(&group_id, AppMessageIntent::PushTokenUpdate { content })
+                .await
+            {
+                Ok((_event, _summary)) => shared += 1,
+                Err(err) => {
+                    tracing::warn!(
+                        target: "marmot_app::notifications",
+                        method = "share_push_registration",
+                        "push token gossip publish failed: {err}",
+                    );
+                }
+            }
+        }
+        if shared > 0 {
+            self.app
+                .mark_push_registration_shared(&account.label, notifications::unix_now_ms())?;
+        }
+        Ok(shared)
+    }
+
+    pub(crate) async fn remove_push_registration(
+        &mut self,
+        registration: crate::PushRegistration,
+    ) -> Result<usize, AppError> {
+        let account = self.app.account_home().account(&self.state.label)?;
+        let mut removed = 0_usize;
+        for group in self.state.groups.clone() {
+            let Ok(group_id_bytes) = hex::decode(&group.group_id_hex) else {
+                continue;
+            };
+            let group_id = GroupId::new(group_id_bytes);
+            let Ok((member_id_hex, _leaf_index)) = self.local_member_leaf(&group_id) else {
+                continue;
+            };
+            let payload = notifications::local_token_removal_payload(member_id_hex, &registration);
+            let content = serde_json::to_string(&payload)?;
+            match self
+                .send_app_event(&group_id, AppMessageIntent::PushTokenRemoval { content })
+                .await
+            {
+                Ok((_event, _summary)) => removed += 1,
+                Err(err) => {
+                    tracing::warn!(
+                        target: "marmot_app::notifications",
+                        method = "remove_push_registration",
+                        "push token removal gossip publish failed: {err}",
+                    );
+                }
+            }
+            self.app.remove_group_push_tokens_for_member(
+                &account.label,
+                &group.group_id_hex,
+                &account.account_id_hex,
+            )?;
+        }
+        Ok(removed)
+    }
+
+    async fn publish_notification_trigger_best_effort(
+        &self,
+        group_id: &GroupId,
+        trigger: notifications::NotificationTrigger,
+    ) {
+        if let Err(err) = self.publish_notification_trigger(group_id, trigger).await {
+            tracing::warn!(
+                target: "marmot_app::notifications",
+                method = "publish_notification_trigger_best_effort",
+                "notification trigger publish failed: {err}",
+            );
+        }
+    }
+
+    async fn publish_notification_trigger(
+        &self,
+        group_id: &GroupId,
+        _trigger: notifications::NotificationTrigger,
+    ) -> Result<(), AppError> {
+        let account = self.app.account_home().account(&self.state.label)?;
+        let group_id_hex = hex::encode(group_id.as_slice());
+        let tokens = self.app.group_push_tokens(&account.label, &group_id_hex)?;
+        let by_server = notifications::token_records_by_server(tokens, &account.account_id_hex);
+        if by_server.is_empty() {
+            return Ok(());
+        }
+        let keys = self
+            .app
+            .account_home()
+            .load_signing_keys(&self.state.label)?;
+        for (server_pubkey_hex, records) in by_server {
+            let encrypted_tokens = records
+                .iter()
+                .map(|record| record.encrypted_token.clone())
+                .collect::<Vec<_>>();
+            let endpoints = records
+                .iter()
+                .filter_map(|record| record.relay_hint.clone())
+                .collect::<HashSet<_>>()
+                .into_iter()
+                .map(TransportEndpoint)
+                .collect::<Vec<_>>();
+            if endpoints.is_empty() {
+                continue;
+            }
+            let event =
+                notifications::build_notification_gift_wrap(&server_pubkey_hex, &encrypted_tokens)
+                    .await?;
+            self.app
+                .relay_client_for_endpoints(&keys, &endpoints)
+                .publish_event(&endpoints, &event, 1)
+                .await
+                .map_err(AppError::Transport)?;
+        }
+        Ok(())
+    }
+
+    fn local_member_leaf(&self, group_id: &GroupId) -> Result<(String, u32), AppError> {
+        let local_account = self.app.account_home().account(&self.state.label)?;
+        self.runtime
+            .members(group_id)?
+            .into_iter()
+            .enumerate()
+            .find_map(|(index, member)| {
+                let member_id_hex = hex::encode(member.id.as_slice());
+                (member_id_hex == local_account.account_id_hex)
+                    .then_some((member_id_hex, index as u32))
+            })
+            .ok_or_else(|| AppError::UnknownGroup(hex::encode(group_id.as_slice())))
+    }
+
+    fn cleanup_stale_push_tokens_best_effort(&self, group_id: &GroupId) {
+        let Ok(account) = self.app.account_home().account(&self.state.label) else {
+            return;
+        };
+        let Ok(members) = self.runtime.members(group_id) else {
+            return;
+        };
+        let active_members = members
+            .into_iter()
+            .map(|member| hex::encode(member.id.as_slice()))
+            .collect::<Vec<_>>();
+        let group_id_hex = hex::encode(group_id.as_slice());
+        let _ =
+            self.app
+                .remove_stale_group_push_tokens(&account.label, &group_id_hex, &active_members);
     }
 
     /// Most recent kind-7 reaction this account authored that targets
@@ -813,6 +1003,22 @@ impl AppClient {
                 group_projection.as_ref(),
                 &source_message_id_hex,
             ) {
+                if notifications::is_push_gossip_kind(message.kind) {
+                    if let Err(err) = self
+                        .app
+                        .ingest_push_gossip_message(&self.state.label, &message)
+                    {
+                        tracing::warn!(
+                            target: "marmot_app::notifications",
+                            method = "ingest_delivery",
+                            "ignoring malformed push token gossip: {err}",
+                        );
+                    }
+                    summary
+                        .messages
+                        .retain(|candidate| candidate.message_id_hex != message.message_id_hex);
+                    continue;
+                }
                 self.app.remember_directory_message_sender(&message)?;
                 self.app
                     .account_projection(&self.state.label)?
@@ -831,6 +1037,15 @@ impl AppClient {
             if self.state.groups.len() != before {
                 self.refresh_group_routes()?;
                 self.sync_runtime_groups().await?;
+            }
+            if let cgka_traits::engine::GroupEvent::MemberRemoved { group_id, member } = event {
+                let group_id_hex = hex::encode(group_id.as_slice());
+                let member_id_hex = hex::encode(member.as_slice());
+                let _ = self.app.remove_group_push_tokens_for_member(
+                    &self.state.label,
+                    &group_id_hex,
+                    &member_id_hex,
+                );
             }
         }
         Ok(())
@@ -1007,4 +1222,23 @@ pub(crate) fn is_own_relay_echo(
     NostrTransportEvent::from_transport_message(&delivery.message)
         .ok()
         .is_some_and(|event| event.pubkey == local_account_id_hex)
+}
+
+fn notification_trigger_for_intent(
+    intent: &AppMessageIntent,
+) -> Option<notifications::NotificationTrigger> {
+    match intent {
+        AppMessageIntent::Chat { .. }
+        | AppMessageIntent::Reply { .. }
+        | AppMessageIntent::Media { .. }
+        | AppMessageIntent::StreamFinal { .. } => {
+            Some(notifications::NotificationTrigger::NewMessage)
+        }
+        AppMessageIntent::Reaction { .. }
+        | AppMessageIntent::Unreact { .. }
+        | AppMessageIntent::Delete { .. }
+        | AppMessageIntent::StreamStart { .. }
+        | AppMessageIntent::PushTokenUpdate { .. }
+        | AppMessageIntent::PushTokenRemoval { .. } => None,
+    }
 }

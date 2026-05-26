@@ -5,11 +5,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rusqlite::{Connection, Transaction, params, types::Type};
 use storage_sqlite::SqlCipherKey;
 
+use crate::notifications::StoredPushRegistration;
 use crate::{
     AGENT_TEXT_STREAM_COMPONENT_ID, AccountState, AppAgentTextStreamComponent, AppError,
     AppGroupAdminPolicyComponent, AppGroupImageInput, AppGroupMessageRetentionComponent,
     AppGroupNostrRoutingComponent, AppGroupRecord, AppMessageProjection, AppMessageQuery,
-    AppMessageRecord, NOSTR_ROUTING_COMPONENT_ID,
+    AppMessageRecord, GroupPushTokenRecord, NOSTR_ROUTING_COMPONENT_ID, NotificationSettings,
+    PushPlatform, PushRegistration,
 };
 
 pub(crate) struct AccountProjectionDb {
@@ -87,7 +89,38 @@ impl AccountProjectionDb {
             );
             CREATE UNIQUE INDEX IF NOT EXISTS messages_message_id_hex_idx
                 ON messages(message_id_hex)
-                WHERE message_id_hex IS NOT NULL;",
+                WHERE message_id_hex IS NOT NULL;
+            CREATE TABLE IF NOT EXISTS notification_settings (
+                account_label TEXT PRIMARY KEY NOT NULL,
+                account_id_hex TEXT NOT NULL,
+                local_notifications_enabled INTEGER NOT NULL DEFAULT 0,
+                native_push_enabled INTEGER NOT NULL DEFAULT 0,
+                updated_at_ms INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS push_registration (
+                account_label TEXT PRIMARY KEY NOT NULL,
+                account_id_hex TEXT NOT NULL,
+                platform INTEGER NOT NULL,
+                token_fingerprint TEXT NOT NULL,
+                token_bytes BLOB NOT NULL,
+                server_pubkey_hex TEXT NOT NULL,
+                relay_hint TEXT,
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL,
+                last_shared_at_ms INTEGER
+            );
+            CREATE TABLE IF NOT EXISTS group_push_tokens (
+                group_id_hex TEXT NOT NULL,
+                member_id_hex TEXT NOT NULL,
+                leaf_index INTEGER NOT NULL,
+                platform INTEGER NOT NULL,
+                token_fingerprint TEXT NOT NULL,
+                server_pubkey_hex TEXT NOT NULL,
+                relay_hint TEXT,
+                encrypted_token BLOB NOT NULL,
+                updated_at_ms INTEGER NOT NULL,
+                PRIMARY KEY (group_id_hex, member_id_hex, platform, server_pubkey_hex)
+            );",
         )?;
         ensure_column(&conn, "groups", "profile_name", "TEXT NOT NULL DEFAULT ''")?;
         ensure_column(
@@ -553,6 +586,293 @@ impl AccountProjectionDb {
         Ok(count.try_into().unwrap_or_default())
     }
 
+    pub(crate) fn notification_settings(
+        &self,
+        account_label: &str,
+        account_id_hex: &str,
+    ) -> Result<NotificationSettings, AppError> {
+        self.ensure_notification_settings(account_label, account_id_hex)?;
+        self.conn
+            .query_row(
+                "SELECT account_label, account_id_hex, local_notifications_enabled,
+                        native_push_enabled
+                 FROM notification_settings
+                 WHERE account_label = ?1",
+                params![account_label],
+                |row| {
+                    Ok(NotificationSettings {
+                        account_ref: row.get(0)?,
+                        account_id_hex: row.get(1)?,
+                        local_notifications_enabled: row.get::<_, i64>(2)? != 0,
+                        native_push_enabled: row.get::<_, i64>(3)? != 0,
+                    })
+                },
+            )
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn set_local_notifications_enabled(
+        &self,
+        account_label: &str,
+        account_id_hex: &str,
+        enabled: bool,
+    ) -> Result<NotificationSettings, AppError> {
+        self.ensure_notification_settings(account_label, account_id_hex)?;
+        self.conn.execute(
+            "UPDATE notification_settings
+             SET local_notifications_enabled = ?2, updated_at_ms = ?3
+             WHERE account_label = ?1",
+            params![account_label, bool_i64(enabled), unix_now_ms()],
+        )?;
+        self.notification_settings(account_label, account_id_hex)
+    }
+
+    pub(crate) fn set_native_push_enabled(
+        &self,
+        account_label: &str,
+        account_id_hex: &str,
+        enabled: bool,
+    ) -> Result<NotificationSettings, AppError> {
+        self.ensure_notification_settings(account_label, account_id_hex)?;
+        self.conn.execute(
+            "UPDATE notification_settings
+             SET native_push_enabled = ?2, updated_at_ms = ?3
+             WHERE account_label = ?1",
+            params![account_label, bool_i64(enabled), unix_now_ms()],
+        )?;
+        self.notification_settings(account_label, account_id_hex)
+    }
+
+    fn ensure_notification_settings(
+        &self,
+        account_label: &str,
+        account_id_hex: &str,
+    ) -> Result<(), AppError> {
+        self.conn.execute(
+            "INSERT INTO notification_settings (
+                account_label, account_id_hex, local_notifications_enabled,
+                native_push_enabled, updated_at_ms
+             )
+             VALUES (?1, ?2, 0, 0, ?3)
+             ON CONFLICT(account_label) DO UPDATE SET
+                account_id_hex = excluded.account_id_hex",
+            params![account_label, account_id_hex, unix_now_ms()],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn push_registration(
+        &self,
+        account_label: &str,
+    ) -> Result<Option<StoredPushRegistration>, AppError> {
+        let mut statement = self.conn.prepare(
+            "SELECT account_label, account_id_hex, platform, token_fingerprint,
+                    token_bytes, server_pubkey_hex, relay_hint, created_at_ms,
+                    updated_at_ms, last_shared_at_ms
+             FROM push_registration
+             WHERE account_label = ?1",
+        )?;
+        let mut rows = statement.query(params![account_label])?;
+        let Some(row) = rows.next()? else {
+            return Ok(None);
+        };
+        Ok(Some(stored_push_registration_from_row(row)?))
+    }
+
+    pub(crate) fn upsert_push_registration(
+        &self,
+        registration: PushRegistration,
+        token_bytes: Vec<u8>,
+    ) -> Result<StoredPushRegistration, AppError> {
+        let existing = self.push_registration(&registration.account_ref)?;
+        let created_at_ms = existing
+            .as_ref()
+            .map(|existing| existing.registration.created_at_ms)
+            .unwrap_or(registration.created_at_ms);
+        let last_shared_at_ms = existing
+            .as_ref()
+            .filter(|existing| {
+                existing.registration.token_fingerprint == registration.token_fingerprint
+                    && existing.registration.server_pubkey_hex == registration.server_pubkey_hex
+                    && existing.registration.platform == registration.platform
+            })
+            .and_then(|existing| existing.registration.last_shared_at_ms);
+        self.conn.execute(
+            "INSERT INTO push_registration (
+                account_label, account_id_hex, platform, token_fingerprint,
+                token_bytes, server_pubkey_hex, relay_hint, created_at_ms,
+                updated_at_ms, last_shared_at_ms
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             ON CONFLICT(account_label) DO UPDATE SET
+                account_id_hex = excluded.account_id_hex,
+                platform = excluded.platform,
+                token_fingerprint = excluded.token_fingerprint,
+                token_bytes = excluded.token_bytes,
+                server_pubkey_hex = excluded.server_pubkey_hex,
+                relay_hint = excluded.relay_hint,
+                updated_at_ms = excluded.updated_at_ms,
+                last_shared_at_ms = excluded.last_shared_at_ms",
+            params![
+                &registration.account_ref,
+                &registration.account_id_hex,
+                platform_i64(registration.platform),
+                &registration.token_fingerprint,
+                token_bytes,
+                &registration.server_pubkey_hex,
+                &registration.relay_hint,
+                created_at_ms,
+                registration.updated_at_ms,
+                last_shared_at_ms,
+            ],
+        )?;
+        self.push_registration(&registration.account_ref)?
+            .ok_or_else(|| AppError::InvalidPushToken("push registration was not stored".into()))
+    }
+
+    pub(crate) fn mark_push_registration_shared(
+        &self,
+        account_label: &str,
+        shared_at_ms: i64,
+    ) -> Result<(), AppError> {
+        self.conn.execute(
+            "UPDATE push_registration
+             SET last_shared_at_ms = ?2, updated_at_ms = ?2
+             WHERE account_label = ?1",
+            params![account_label, shared_at_ms],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn clear_push_registration(
+        &self,
+        account_label: &str,
+    ) -> Result<Option<StoredPushRegistration>, AppError> {
+        let existing = self.push_registration(account_label)?;
+        self.conn.execute(
+            "DELETE FROM push_registration WHERE account_label = ?1",
+            params![account_label],
+        )?;
+        Ok(existing)
+    }
+
+    pub(crate) fn upsert_group_push_token(
+        &self,
+        token: &GroupPushTokenRecord,
+    ) -> Result<(), AppError> {
+        self.conn.execute(
+            "INSERT INTO group_push_tokens (
+                group_id_hex, member_id_hex, leaf_index, platform, token_fingerprint,
+                server_pubkey_hex, relay_hint, encrypted_token, updated_at_ms
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(group_id_hex, member_id_hex, platform, server_pubkey_hex)
+             DO UPDATE SET
+                leaf_index = excluded.leaf_index,
+                token_fingerprint = excluded.token_fingerprint,
+                relay_hint = excluded.relay_hint,
+                encrypted_token = excluded.encrypted_token,
+                updated_at_ms = excluded.updated_at_ms",
+            params![
+                &token.group_id_hex,
+                &token.member_id_hex,
+                u32_i64(token.leaf_index),
+                platform_i64(token.platform),
+                &token.token_fingerprint,
+                &token.server_pubkey_hex,
+                &token.relay_hint,
+                &token.encrypted_token,
+                token.updated_at_ms,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn group_push_tokens(
+        &self,
+        group_id_hex: &str,
+    ) -> Result<Vec<GroupPushTokenRecord>, AppError> {
+        let mut statement = self.conn.prepare(
+            "SELECT group_id_hex, member_id_hex, leaf_index, platform,
+                    token_fingerprint, server_pubkey_hex, relay_hint,
+                    encrypted_token, updated_at_ms
+             FROM group_push_tokens
+             WHERE group_id_hex = ?1
+             ORDER BY member_id_hex, platform, server_pubkey_hex",
+        )?;
+        let rows = statement.query_map(params![group_id_hex], group_push_token_from_row)?;
+        let mut tokens = Vec::new();
+        for row in rows {
+            tokens.push(row?);
+        }
+        Ok(tokens)
+    }
+
+    pub(crate) fn remove_group_push_token(
+        &self,
+        group_id_hex: &str,
+        member_id_hex: &str,
+        platform: PushPlatform,
+        token_fingerprint: &str,
+        server_pubkey_hex: &str,
+    ) -> Result<(), AppError> {
+        self.conn.execute(
+            "DELETE FROM group_push_tokens
+             WHERE group_id_hex = ?1
+               AND member_id_hex = ?2
+               AND platform = ?3
+               AND token_fingerprint = ?4
+               AND server_pubkey_hex = ?5",
+            params![
+                group_id_hex,
+                member_id_hex,
+                platform_i64(platform),
+                token_fingerprint,
+                server_pubkey_hex,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn remove_group_push_tokens_for_member(
+        &self,
+        group_id_hex: &str,
+        member_id_hex: &str,
+    ) -> Result<(), AppError> {
+        self.conn.execute(
+            "DELETE FROM group_push_tokens
+             WHERE group_id_hex = ?1 AND member_id_hex = ?2",
+            params![group_id_hex, member_id_hex],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn remove_stale_group_push_tokens(
+        &self,
+        group_id_hex: &str,
+        active_members: &[String],
+    ) -> Result<usize, AppError> {
+        if active_members.is_empty() {
+            let removed = self.conn.execute(
+                "DELETE FROM group_push_tokens WHERE group_id_hex = ?1",
+                params![group_id_hex],
+            )?;
+            return Ok(removed);
+        }
+        let active = active_members
+            .iter()
+            .map(|member| format!("'{}'", member.replace('\'', "''")))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "DELETE FROM group_push_tokens
+             WHERE group_id_hex = ?1
+               AND member_id_hex NOT IN ({active})"
+        );
+        let removed = self.conn.execute(&sql, params![group_id_hex])?;
+        Ok(removed)
+    }
+
     pub(crate) fn prune_group_messages_before(
         &self,
         group_id_hex: &str,
@@ -610,6 +930,75 @@ fn unix_now_seconds() -> u64 {
 
 fn limit_to_i64(limit: usize) -> i64 {
     i64::try_from(limit).unwrap_or(i64::MAX)
+}
+
+fn unix_now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(i64::MAX)
+}
+
+fn bool_i64(value: bool) -> i64 {
+    if value { 1 } else { 0 }
+}
+
+fn u32_i64(value: u32) -> i64 {
+    i64::from(value)
+}
+
+fn platform_i64(platform: PushPlatform) -> i64 {
+    i64::from(platform.platform_byte())
+}
+
+fn platform_from_i64(value: i64) -> Result<PushPlatform, rusqlite::Error> {
+    let byte = u8::try_from(value).map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(0, Type::Integer, Box::new(err))
+    })?;
+    PushPlatform::from_platform_byte(byte)
+        .map_err(|err| rusqlite::Error::FromSqlConversionFailure(0, Type::Integer, Box::new(err)))
+}
+
+fn stored_push_registration_from_row(
+    row: &rusqlite::Row<'_>,
+) -> Result<StoredPushRegistration, rusqlite::Error> {
+    let platform = platform_from_i64(row.get(2)?)?;
+    Ok(StoredPushRegistration {
+        registration: PushRegistration {
+            account_ref: row.get(0)?,
+            account_id_hex: row.get(1)?,
+            platform,
+            token_fingerprint: row.get(3)?,
+            server_pubkey_hex: row.get(5)?,
+            relay_hint: row.get(6)?,
+            created_at_ms: row.get(7)?,
+            updated_at_ms: row.get(8)?,
+            last_shared_at_ms: row.get(9)?,
+        },
+        token_bytes: row.get(4)?,
+    })
+}
+
+fn group_push_token_from_row(
+    row: &rusqlite::Row<'_>,
+) -> Result<GroupPushTokenRecord, rusqlite::Error> {
+    let leaf_index = row.get::<_, i64>(2)?;
+    let leaf_index = u32::try_from(leaf_index).map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(2, Type::Integer, Box::new(err))
+    })?;
+    Ok(GroupPushTokenRecord {
+        group_id_hex: row.get(0)?,
+        member_id_hex: row.get(1)?,
+        leaf_index,
+        platform: platform_from_i64(row.get(3)?)?,
+        token_fingerprint: row.get(4)?,
+        server_pubkey_hex: row.get(5)?,
+        relay_hint: row.get(6)?,
+        encrypted_token: row.get(7)?,
+        updated_at_ms: row.get(8)?,
+    })
 }
 
 fn parse_admin_keys_hex(value: &str) -> Vec<[u8; 32]> {

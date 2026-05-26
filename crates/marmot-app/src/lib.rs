@@ -73,6 +73,7 @@ mod groups;
 mod ids;
 mod media;
 mod messages;
+mod notifications;
 mod projection;
 mod relay_plane;
 mod runtime;
@@ -85,7 +86,7 @@ pub use runtime::{
     RuntimeAgentStreamMessage, RuntimeAgentStreamUpdate, RuntimeAgentStreamWatch,
     RuntimeChatsSubscription, RuntimeGroupEvent, RuntimeGroupStateSubscription,
     RuntimeMessageReceived, RuntimeMessageUpdate, RuntimeMessagesSubscription,
-    RuntimeSharedServices, StreamStartView,
+    RuntimeNotificationsSubscription, RuntimeSharedServices, StreamStartView,
 };
 
 pub use agent_streams::{
@@ -106,6 +107,16 @@ pub use media::{
     MediaUploadResult,
 };
 pub use messages::{is_stream_final_event, tag_value, tag_values};
+pub use notifications::{
+    BackgroundNotificationCollection, GroupPushDebugInfo, GroupPushTokenDebugEntry,
+    GroupPushTokenRecord, KIND_MARMOT_NOTIFICATION_RUMOR, KIND_MARMOT_NOTIFICATION_SERVER_RELAYS,
+    LocalPushRegistrationDebug, MARMOT_APP_EVENT_KIND_PUSH_TOKEN_LIST,
+    MARMOT_APP_EVENT_KIND_PUSH_TOKEN_REMOVAL, MARMOT_APP_EVENT_KIND_PUSH_TOKEN_UPDATE,
+    MIP05_ENCRYPTED_TOKEN_LEN, MIP05_VERSION, NotificationCollectionStatus, NotificationSettings,
+    NotificationTrigger, NotificationUpdate, NotificationUser, NotificationWakeSource,
+    PushPlatform, PushRegistration, build_notification_gift_wrap, build_notification_rumor_content,
+    encrypted_mip05_token, parse_provider_token, push_token_fingerprint,
+};
 pub use relay_plane::{MarmotRelayPlane, MarmotRelayPlaneAccountAdapter, RelayPlaneHealth};
 
 use directory::{DirectoryCache, DirectorySyncHandle, DirectorySyncPlan};
@@ -463,6 +474,20 @@ pub struct DirectoryKeyPackage {
     pub key_package_hex: String,
     pub created_at: u64,
     pub source_relays: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AccountKeyPackageRecord {
+    pub account_label: Option<String>,
+    pub account_id_hex: String,
+    pub key_package_id: String,
+    pub key_package_ref_hex: String,
+    pub key_package_event_id: String,
+    pub published_at: u64,
+    pub key_package_bytes: usize,
+    pub source_relays: Vec<String>,
+    pub local: bool,
+    pub relay: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1144,6 +1169,215 @@ impl MarmotApp {
         self.account_projection(label)?.messages(query)
     }
 
+    pub fn notification_settings(
+        &self,
+        account_ref: &str,
+    ) -> Result<NotificationSettings, AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        self.account_projection(&account.label)?
+            .notification_settings(&account.label, &account.account_id_hex)
+    }
+
+    pub fn set_local_notifications_enabled(
+        &self,
+        account_ref: &str,
+        enabled: bool,
+    ) -> Result<NotificationSettings, AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        self.account_projection(&account.label)?
+            .set_local_notifications_enabled(&account.label, &account.account_id_hex, enabled)
+    }
+
+    pub fn set_native_push_enabled(
+        &self,
+        account_ref: &str,
+        enabled: bool,
+    ) -> Result<NotificationSettings, AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        let projection = self.account_projection(&account.label)?;
+        let settings =
+            projection.set_native_push_enabled(&account.label, &account.account_id_hex, enabled)?;
+        if !enabled {
+            let _ = projection.clear_push_registration(&account.label)?;
+        }
+        Ok(settings)
+    }
+
+    pub fn push_registration(
+        &self,
+        account_ref: &str,
+    ) -> Result<Option<PushRegistration>, AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        Ok(self
+            .account_projection(&account.label)?
+            .push_registration(&account.label)?
+            .map(|stored| stored.registration))
+    }
+
+    pub(crate) fn stored_push_registration(
+        &self,
+        account_ref: &str,
+    ) -> Result<Option<notifications::StoredPushRegistration>, AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        self.account_projection(&account.label)?
+            .push_registration(&account.label)
+    }
+
+    pub fn upsert_push_registration(
+        &self,
+        account_ref: &str,
+        platform: PushPlatform,
+        raw_token: &str,
+        server_pubkey_hex: &str,
+        relay_hint: Option<String>,
+    ) -> Result<PushRegistration, AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        let token_bytes = parse_provider_token(platform, raw_token)?;
+        let server_pubkey = PublicKey::parse(server_pubkey_hex)
+            .map_err(|_| AppError::InvalidPushServer("server pubkey must be valid".into()))?;
+        let now = notifications::unix_now_ms();
+        let registration = PushRegistration {
+            account_ref: account.label.clone(),
+            account_id_hex: account.account_id_hex.clone(),
+            platform,
+            token_fingerprint: push_token_fingerprint(platform, &token_bytes),
+            server_pubkey_hex: server_pubkey.to_hex(),
+            relay_hint: relay_hint.and_then(|relay| {
+                let relay = relay.trim().to_owned();
+                (!relay.is_empty()).then_some(relay)
+            }),
+            created_at_ms: now,
+            updated_at_ms: now,
+            last_shared_at_ms: None,
+        };
+        Ok(self
+            .account_projection(&account.label)?
+            .upsert_push_registration(registration, token_bytes)?
+            .registration)
+    }
+
+    pub fn clear_push_registration(&self, account_ref: &str) -> Result<(), AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        self.account_projection(&account.label)?
+            .clear_push_registration(&account.label)?;
+        Ok(())
+    }
+
+    pub(crate) fn mark_push_registration_shared(
+        &self,
+        account_ref: &str,
+        shared_at_ms: i64,
+    ) -> Result<(), AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        self.account_projection(&account.label)?
+            .mark_push_registration_shared(&account.label, shared_at_ms)
+    }
+
+    pub(crate) fn upsert_group_push_token(
+        &self,
+        account_ref: &str,
+        token: &GroupPushTokenRecord,
+    ) -> Result<(), AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        self.account_projection(&account.label)?
+            .upsert_group_push_token(token)
+    }
+
+    pub(crate) fn group_push_tokens(
+        &self,
+        account_ref: &str,
+        group_id_hex: &str,
+    ) -> Result<Vec<GroupPushTokenRecord>, AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        self.account_projection(&account.label)?
+            .group_push_tokens(group_id_hex)
+    }
+
+    pub(crate) fn ingest_push_gossip_message(
+        &self,
+        account_ref: &str,
+        message: &ReceivedMessage,
+    ) -> Result<(), AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        let group_id_hex = hex::encode(message.group_id.as_slice());
+        let projection = self.account_projection(&account.label)?;
+        match notifications::parse_push_gossip(message.kind, &group_id_hex, &message.plaintext)? {
+            notifications::PushGossipAction::Upsert(records) => {
+                for record in records {
+                    projection.upsert_group_push_token(&record)?;
+                }
+            }
+            notifications::PushGossipAction::Remove(removals) => {
+                for removal in removals {
+                    projection.remove_group_push_token(
+                        &group_id_hex,
+                        &removal.member_id_hex,
+                        removal.platform,
+                        &removal.token_fingerprint,
+                        &removal.server_pubkey_hex,
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn remove_group_push_tokens_for_member(
+        &self,
+        account_ref: &str,
+        group_id_hex: &str,
+        member_id_hex: &str,
+    ) -> Result<(), AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        self.account_projection(&account.label)?
+            .remove_group_push_tokens_for_member(group_id_hex, member_id_hex)
+    }
+
+    pub(crate) fn remove_stale_group_push_tokens(
+        &self,
+        account_ref: &str,
+        group_id_hex: &str,
+        active_members: &[String],
+    ) -> Result<usize, AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        self.account_projection(&account.label)?
+            .remove_stale_group_push_tokens(group_id_hex, active_members)
+    }
+
+    pub fn group_push_debug_info(
+        &self,
+        account_ref: &str,
+        group_id_hex: &str,
+        active_members: &[String],
+    ) -> Result<GroupPushDebugInfo, AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        let projection = self.account_projection(&account.label)?;
+        let settings = projection.notification_settings(&account.label, &account.account_id_hex)?;
+        let registration = projection.push_registration(&account.label)?;
+        let tokens = projection.group_push_tokens(group_id_hex)?;
+        Ok(notifications::group_debug_info(
+            settings,
+            registration,
+            tokens,
+            &account.account_id_hex,
+            active_members,
+        ))
+    }
+
     pub fn groups(&self, label: &str) -> Result<Vec<AppGroupRecord>, AppError> {
         self.ensure_account_state(label)?;
         Ok(self.load_state(label)?.groups)
@@ -1437,6 +1671,135 @@ impl MarmotApp {
             &record.key_package_hex,
             &record.key_package_event_id,
         )
+    }
+
+    pub fn local_key_package_records(
+        &self,
+        label: &str,
+    ) -> Result<Vec<AccountKeyPackageRecord>, AppError> {
+        let path = self.key_package_record_path(label);
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        let record: KeyPackageRecord = read_json(path)?;
+        Ok(vec![self.account_key_package_record_from_local(record)?])
+    }
+
+    pub async fn account_key_package_records(
+        &self,
+        label: &str,
+        bootstrap_relays: Vec<TransportEndpoint>,
+    ) -> Result<Vec<AccountKeyPackageRecord>, AppError> {
+        let keys = self.account_home().load_signing_keys(label)?;
+        let account_id_hex = keys.public_key().to_hex();
+        let mut packages = self.local_key_package_records(label)?;
+
+        let relay_lists = if bootstrap_relays.is_empty() {
+            self.account_relay_list_status_for_account_id(&account_id_hex)?
+        } else {
+            self.fetch_account_relay_list_status_for_account_id(&account_id_hex, bootstrap_relays)
+                .await?
+        };
+        let mut source_relays = relay_lists
+            .key_package
+            .relays
+            .iter()
+            .cloned()
+            .map(TransportEndpoint)
+            .collect::<Vec<_>>();
+        if source_relays.is_empty() {
+            source_relays = self.directory_source_relays(&[]);
+        }
+
+        if !source_relays.is_empty() {
+            let mut relay_records = self
+                .fetch_key_package_events_for_account_id(&account_id_hex, &source_relays)
+                .await?;
+            sort_directory_records(&mut relay_records);
+            for record in relay_records {
+                match key_package_from_record(record) {
+                    Ok(fetched) => {
+                        packages.push(account_key_package_record_from_fetched(fetched));
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            target: "marmot_app::key_packages",
+                            error = %err,
+                            "skipping invalid key package event while listing account packages"
+                        );
+                    }
+                }
+            }
+        }
+
+        Ok(merge_key_package_records(packages))
+    }
+
+    pub async fn delete_key_package_event(
+        &self,
+        label: &str,
+        event_id_hex: &str,
+        source_relays: Vec<TransportEndpoint>,
+    ) -> Result<usize, AppError> {
+        let event_id_hex = parse_key_package_event_id_hex(event_id_hex)?;
+        let keys = self.account_home().load_signing_keys(label)?;
+        let account_id_hex = keys.public_key().to_hex();
+        let mut endpoints = source_relays;
+        if endpoints.is_empty() {
+            let relay_lists = self.account_relay_list_status_for_account_id(&account_id_hex)?;
+            endpoints = self.key_package_endpoints(&relay_lists);
+        }
+        if endpoints.is_empty() {
+            return Err(AppError::MissingRelayLists(vec!["key_package".into()]));
+        }
+
+        let event = NostrTransportEvent::new_unsigned(
+            account_id_hex,
+            5,
+            vec![
+                vec!["e".into(), event_id_hex.clone()],
+                vec!["k".into(), KIND_MARMOT_KEY_PACKAGE.to_string()],
+            ],
+            String::new(),
+        );
+        let outcome = self
+            .relay_client_for_endpoints(&keys, &endpoints)
+            .publish_event(&endpoints, &event, 1)
+            .await?;
+
+        let path = self.key_package_record_path(label);
+        if let Ok(record) = read_json::<KeyPackageRecord>(&path)
+            && record.key_package_event_id == event_id_hex
+        {
+            match fs::remove_file(path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err.into()),
+            }
+        }
+
+        Ok(outcome.accepted.len())
+    }
+
+    fn account_key_package_record_from_local(
+        &self,
+        record: KeyPackageRecord,
+    ) -> Result<AccountKeyPackageRecord, AppError> {
+        let source_relays = self
+            .account_key_package_relays(&record.account_label)
+            .unwrap_or_default();
+        Ok(AccountKeyPackageRecord {
+            account_label: Some(record.account_label),
+            account_id_hex: record.account_id_hex,
+            key_package_id: record.key_package_id,
+            key_package_ref_hex: record.key_package_ref_hex,
+            key_package_event_id: record.key_package_event_id,
+            published_at: record.published_at,
+            key_package_bytes: hex::decode(record.key_package_hex)?.len(),
+            source_relays,
+            local: true,
+            relay: false,
+        })
     }
 
     fn key_package_record_path(&self, label: &str) -> PathBuf {
@@ -2732,6 +3095,68 @@ fn key_package_from_record(record: RelayEventRecord) -> Result<FetchedKeyPackage
         source_relays,
         relay_lists: AccountRelayListStatus::empty(),
     })
+}
+
+fn account_key_package_record_from_fetched(fetched: FetchedKeyPackage) -> AccountKeyPackageRecord {
+    AccountKeyPackageRecord {
+        account_label: None,
+        account_id_hex: fetched.account_id_hex,
+        key_package_id: fetched.key_package_id,
+        key_package_ref_hex: fetched.key_package_ref_hex,
+        key_package_event_id: fetched.key_package_event_id,
+        published_at: fetched.created_at,
+        key_package_bytes: fetched.key_package.bytes().len(),
+        source_relays: fetched.source_relays,
+        local: false,
+        relay: true,
+    }
+}
+
+fn merge_key_package_records(
+    records: Vec<AccountKeyPackageRecord>,
+) -> Vec<AccountKeyPackageRecord> {
+    let mut merged: BTreeMap<String, AccountKeyPackageRecord> = BTreeMap::new();
+    for record in records {
+        let key = if !record.key_package_event_id.is_empty() {
+            record.key_package_event_id.clone()
+        } else if !record.key_package_ref_hex.is_empty() {
+            record.key_package_ref_hex.clone()
+        } else {
+            record.key_package_id.clone()
+        };
+        merged
+            .entry(key)
+            .and_modify(|existing| {
+                existing.local |= record.local;
+                existing.relay |= record.relay;
+                existing.published_at = existing.published_at.max(record.published_at);
+                if existing.account_label.is_none() {
+                    existing.account_label = record.account_label.clone();
+                }
+                push_unique_strings(&mut existing.source_relays, record.source_relays.clone());
+            })
+            .or_insert(record);
+    }
+    let mut records = merged.into_values().collect::<Vec<_>>();
+    records.sort_by(|left, right| {
+        right
+            .published_at
+            .cmp(&left.published_at)
+            .then_with(|| left.key_package_event_id.cmp(&right.key_package_event_id))
+    });
+    records
+}
+
+fn parse_key_package_event_id_hex(value: &str) -> Result<String, AppError> {
+    let trimmed = value.trim();
+    let bytes = hex::decode(trimmed)?;
+    if bytes.len() != 32 {
+        return Err(AppError::InvalidKeyPackageEvent(format!(
+            "KeyPackage event id must be 32 bytes, got {}",
+            bytes.len()
+        )));
+    }
+    Ok(trimmed.to_owned())
 }
 
 fn require_key_package_tag(

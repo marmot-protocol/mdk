@@ -63,6 +63,14 @@ pub enum AppError {
     BlobStore(String),
     #[error("invalid app message payload: {0}")]
     InvalidAppMessagePayload(String),
+    #[error("invalid push token")]
+    InvalidPushToken(String),
+    #[error("invalid push notification server")]
+    InvalidPushServer(String),
+    #[error("invalid push token gossip")]
+    InvalidPushGossip(String),
+    #[error("local notifications are disabled")]
+    NotificationsDisabled,
     #[error("SQLCipher key derivation failed: {0}")]
     SqlcipherKeyDerivation(String),
     #[error("blocking app task failed: {0}")]

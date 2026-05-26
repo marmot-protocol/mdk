@@ -18,12 +18,13 @@ use std::sync::Mutex as StdMutex;
 
 use marmot_app::{
     MarmotAppEvent, RuntimeAgentStreamWatch, RuntimeChatsSubscription,
-    RuntimeGroupStateSubscription, RuntimeMessagesSubscription,
+    RuntimeGroupStateSubscription, RuntimeMessagesSubscription, RuntimeNotificationsSubscription,
 };
 use tokio::sync::{Mutex, broadcast};
 
 use crate::conversions::{
     AgentStreamUpdateFfi, AppGroupRecordFfi, AppMessageRecordFfi, MarmotEventFfi, MessageUpdateFfi,
+    NotificationUpdateFfi,
 };
 
 #[derive(uniffi::Object)]
@@ -144,6 +145,27 @@ impl EventsSubscription {
                 Err(broadcast::error::RecvError::Closed) => return None,
             }
         }
+    }
+}
+
+#[derive(uniffi::Object)]
+pub struct NotificationsSubscription {
+    inner: Mutex<RuntimeNotificationsSubscription>,
+}
+
+impl NotificationsSubscription {
+    pub(crate) fn new(inner: RuntimeNotificationsSubscription) -> Arc<Self> {
+        Arc::new(Self {
+            inner: Mutex::new(inner),
+        })
+    }
+}
+
+#[uniffi::export(async_runtime = "tokio")]
+impl NotificationsSubscription {
+    pub async fn next(&self) -> Option<NotificationUpdateFfi> {
+        let mut inner = self.inner.lock().await;
+        inner.recv().await.map(Into::into)
     }
 }
 

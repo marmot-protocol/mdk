@@ -13,8 +13,8 @@ use cgka_traits::engine::KeyPackage;
 use marmot_account::AccountHome;
 use marmot_app::{
     AccountRelayListBootstrap, AccountSetupRequest, AppMessageQuery, MarmotApp, MarmotAppConfig,
-    MarmotAppEvent, MarmotAppRuntime, MediaReference, MediaUploadRequest, RuntimeMessageUpdate,
-    UserDirectorySearch, UserProfileMetadata, tag_value,
+    MarmotAppEvent, MarmotAppRuntime, MediaReference, MediaUploadRequest, PushPlatform,
+    RuntimeMessageUpdate, UserDirectorySearch, UserProfileMetadata, tag_value,
 };
 use nostr::base64::Engine as _;
 use nostr::base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -720,6 +720,206 @@ async fn app_runtime_executes_group_and_message_intents_on_managed_accounts() {
         stream_event,
         MarmotAppEvent::AgentStreamStarted(_)
     ));
+
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn push_registration_settings_accept_apns_fcm_and_redact_tokens() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let account = runtime
+        .create_identity(AccountSetupRequest {
+            default_relays: vec![endpoint(&url)],
+            bootstrap_relays: vec![endpoint(&url)],
+            publish_initial_key_package: true,
+            ..AccountSetupRequest::default()
+        })
+        .await
+        .unwrap()
+        .account;
+    let server_pubkey = nostr::Keys::generate().public_key().to_hex();
+
+    let settings = app
+        .set_local_notifications_enabled(&account.account_id_hex, true)
+        .unwrap();
+    assert!(settings.local_notifications_enabled);
+    assert!(!settings.native_push_enabled);
+
+    let apns = app
+        .upsert_push_registration(
+            &account.account_id_hex,
+            PushPlatform::Apns,
+            "00aaff",
+            &server_pubkey,
+            Some(url.clone()),
+        )
+        .unwrap();
+    assert_eq!(apns.platform, PushPlatform::Apns);
+    assert!(apns.token_fingerprint.starts_with("sha256:"));
+    assert!(!format!("{apns:?}").contains("00aaff"));
+
+    let fcm = app
+        .upsert_push_registration(
+            &account.account_id_hex,
+            PushPlatform::Fcm,
+            "opaque-fcm-registration-token",
+            &server_pubkey,
+            Some(url),
+        )
+        .unwrap();
+    assert_eq!(fcm.platform, PushPlatform::Fcm);
+    assert!(!format!("{fcm:?}").contains("opaque-fcm-registration-token"));
+    assert_eq!(
+        app.push_registration(&account.account_id_hex)
+            .unwrap()
+            .unwrap()
+            .token_fingerprint,
+        fcm.token_fingerprint
+    );
+
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn push_token_gossip_register_replace_and_remove_lifecycle() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let setup = AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let alice = runtime.create_identity(setup.clone()).await.unwrap();
+    let bob = runtime.create_identity(setup).await.unwrap();
+    let group_id = runtime
+        .create_group(
+            &alice.account.account_id_hex,
+            "push lifecycle",
+            std::slice::from_ref(&bob.account.account_id_hex),
+            None,
+        )
+        .await
+        .unwrap();
+    let server_pubkey = nostr::Keys::generate().public_key().to_hex();
+
+    app.set_native_push_enabled(&bob.account.account_id_hex, true)
+        .unwrap();
+    let first = app
+        .upsert_push_registration(
+            &bob.account.account_id_hex,
+            PushPlatform::Fcm,
+            "first-fcm-token",
+            &server_pubkey,
+            Some(url.clone()),
+        )
+        .unwrap();
+    runtime
+        .share_push_registration(&bob.account.account_id_hex)
+        .await
+        .unwrap();
+    runtime.catch_up_accounts().await.unwrap();
+    let alice_view = runtime
+        .group_push_debug_info(&alice.account.account_id_hex, &group_id)
+        .await
+        .unwrap();
+    assert_eq!(alice_view.active_token_count, 1);
+    assert_eq!(
+        alice_view.tokens[0].token_fingerprint,
+        first.token_fingerprint
+    );
+
+    let second = app
+        .upsert_push_registration(
+            &bob.account.account_id_hex,
+            PushPlatform::Fcm,
+            "second-fcm-token",
+            &server_pubkey,
+            Some(url),
+        )
+        .unwrap();
+    runtime
+        .share_push_registration(&bob.account.account_id_hex)
+        .await
+        .unwrap();
+    runtime.catch_up_accounts().await.unwrap();
+    let alice_view = runtime
+        .group_push_debug_info(&alice.account.account_id_hex, &group_id)
+        .await
+        .unwrap();
+    assert_eq!(alice_view.active_token_count, 1);
+    assert_eq!(
+        alice_view.tokens[0].token_fingerprint,
+        second.token_fingerprint
+    );
+
+    runtime
+        .remove_push_registration(&bob.account.account_id_hex, second)
+        .await
+        .unwrap();
+    runtime.catch_up_accounts().await.unwrap();
+    let alice_view = runtime
+        .group_push_debug_info(&alice.account.account_id_hex, &group_id)
+        .await
+        .unwrap();
+    assert_eq!(alice_view.active_token_count, 0);
+
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn message_send_succeeds_when_notification_trigger_publish_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let setup = AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let alice = runtime.create_identity(setup.clone()).await.unwrap();
+    let bob = runtime.create_identity(setup).await.unwrap();
+    let group_id = runtime
+        .create_group(
+            &alice.account.account_id_hex,
+            "push failure",
+            std::slice::from_ref(&bob.account.account_id_hex),
+            None,
+        )
+        .await
+        .unwrap();
+    let server_pubkey = nostr::Keys::generate().public_key().to_hex();
+
+    app.set_native_push_enabled(&bob.account.account_id_hex, true)
+        .unwrap();
+    app.upsert_push_registration(
+        &bob.account.account_id_hex,
+        PushPlatform::Fcm,
+        "failing-relay-token",
+        &server_pubkey,
+        Some("not-a-relay-url".to_owned()),
+    )
+    .unwrap();
+    runtime
+        .share_push_registration(&bob.account.account_id_hex)
+        .await
+        .unwrap();
+    runtime.catch_up_accounts().await.unwrap();
+
+    let summary = runtime
+        .send_message(
+            &alice.account.account_id_hex,
+            &group_id,
+            b"delivery must not depend on push".to_vec(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(summary.published, 1);
+    assert_eq!(summary.message_ids.len(), 1);
 
     runtime.shutdown().await;
 }

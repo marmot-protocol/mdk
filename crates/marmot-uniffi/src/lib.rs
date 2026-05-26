@@ -38,14 +38,17 @@ use conversions::{
 pub use errors::MarmotKitError;
 use subscriptions::{
     AgentStreamSubscription, ChatsSubscription, EventsSubscription, GroupStateSubscription,
-    MessagesSubscription,
+    MessagesSubscription, NotificationsSubscription,
 };
 
 uniffi::setup_scaffolding!();
 
 pub use conversions::{
-    MediaDownloadResultFfi, MediaRecordFfi, MediaReferenceFfi, MediaUploadRequestFfi,
-    MediaUploadResultFfi,
+    BackgroundNotificationCollectionFfi, GroupPushDebugInfoFfi, GroupPushTokenDebugEntryFfi,
+    LocalPushRegistrationDebugFfi, MediaDownloadResultFfi, MediaRecordFfi, MediaReferenceFfi,
+    MediaUploadRequestFfi, MediaUploadResultFfi, NotificationCollectionStatusFfi,
+    NotificationSettingsFfi, NotificationTriggerFfi, NotificationUpdateFfi, NotificationUserFfi,
+    NotificationWakeSourceFfi, PushPlatformFfi, PushRegistrationFfi,
 };
 
 /// Convenience: turn an FFI string list of relay URLs into the engine's
@@ -386,6 +389,49 @@ impl Marmot {
         account_ref: String,
     ) -> Result<Vec<String>, MarmotKitError> {
         Ok(self.runtime.account_key_package_relays(&account_ref)?)
+    }
+
+    /// List the local and relay-discovered Marmot KeyPackage publications for
+    /// `account_ref`.
+    pub async fn account_key_packages(
+        &self,
+        account_ref: String,
+        bootstrap_relays: Vec<String>,
+    ) -> Result<Vec<conversions::AccountKeyPackageFfi>, MarmotKitError> {
+        Ok(self
+            .runtime
+            .account_key_packages(&account_ref, endpoints(&bootstrap_relays))
+            .await?
+            .into_iter()
+            .map(Into::into)
+            .collect())
+    }
+
+    /// Publish a new fresh KeyPackage for `account_ref`.
+    pub async fn publish_new_key_package(
+        &self,
+        account_ref: String,
+    ) -> Result<u64, MarmotKitError> {
+        Ok(self.runtime.publish_new_key_package(&account_ref).await? as u64)
+    }
+
+    /// Re-publish the latest cached KeyPackage when possible, otherwise
+    /// publish a fresh one.
+    pub async fn republish_key_package(&self, account_ref: String) -> Result<u64, MarmotKitError> {
+        Ok(self.runtime.publish_key_package(&account_ref).await? as u64)
+    }
+
+    /// Publish a NIP-09 deletion for a KeyPackage event.
+    pub async fn delete_account_key_package(
+        &self,
+        account_ref: String,
+        event_id_hex: String,
+        relays: Vec<String>,
+    ) -> Result<u64, MarmotKitError> {
+        Ok(self
+            .runtime
+            .delete_key_package(&account_ref, &event_id_hex, endpoints(&relays))
+            .await? as u64)
     }
 
     pub async fn set_account_nip65_relays(
@@ -1064,6 +1110,117 @@ impl Marmot {
         shared.relay_plane().relay_health().await.into()
     }
 
+    // -----------------------------------------------------------------------
+    // Notifications
+    // -----------------------------------------------------------------------
+
+    pub fn notification_settings(
+        &self,
+        account_ref: String,
+    ) -> Result<NotificationSettingsFfi, MarmotKitError> {
+        Ok(self.app.notification_settings(&account_ref)?.into())
+    }
+
+    pub fn set_local_notifications_enabled(
+        &self,
+        account_ref: String,
+        enabled: bool,
+    ) -> Result<NotificationSettingsFfi, MarmotKitError> {
+        Ok(self
+            .app
+            .set_local_notifications_enabled(&account_ref, enabled)?
+            .into())
+    }
+
+    pub async fn set_native_push_enabled(
+        &self,
+        account_ref: String,
+        enabled: bool,
+    ) -> Result<NotificationSettingsFfi, MarmotKitError> {
+        let existing = if enabled {
+            None
+        } else {
+            self.app.push_registration(&account_ref)?
+        };
+        if let Some(registration) = existing {
+            let _ = self
+                .runtime
+                .remove_push_registration(&account_ref, registration)
+                .await;
+        }
+        Ok(self
+            .app
+            .set_native_push_enabled(&account_ref, enabled)?
+            .into())
+    }
+
+    pub fn push_registration(
+        &self,
+        account_ref: String,
+    ) -> Result<Option<PushRegistrationFfi>, MarmotKitError> {
+        Ok(self.app.push_registration(&account_ref)?.map(Into::into))
+    }
+
+    pub async fn upsert_push_registration(
+        &self,
+        account_ref: String,
+        platform: PushPlatformFfi,
+        raw_token: String,
+        server_pubkey_hex: String,
+        relay_hint: Option<String>,
+    ) -> Result<PushRegistrationFfi, MarmotKitError> {
+        let registration = self.app.upsert_push_registration(
+            &account_ref,
+            platform.into(),
+            &raw_token,
+            &server_pubkey_hex,
+            relay_hint,
+        )?;
+        let _ = self.runtime.share_push_registration(&account_ref).await;
+        Ok(registration.into())
+    }
+
+    pub async fn clear_push_registration(&self, account_ref: String) -> Result<(), MarmotKitError> {
+        if let Some(registration) = self.app.push_registration(&account_ref)? {
+            let _ = self
+                .runtime
+                .remove_push_registration(&account_ref, registration)
+                .await;
+        }
+        self.app.clear_push_registration(&account_ref)?;
+        Ok(())
+    }
+
+    pub async fn group_push_debug_info(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+    ) -> Result<GroupPushDebugInfoFfi, MarmotKitError> {
+        let group_id = group_id_from_hex(&group_id_hex)?;
+        Ok(self
+            .runtime
+            .group_push_debug_info(&account_ref, &group_id)
+            .await?
+            .into())
+    }
+
+    pub async fn catch_up_accounts(&self) -> Result<(), MarmotKitError> {
+        self.runtime.catch_up_accounts().await?;
+        Ok(())
+    }
+
+    pub async fn collect_notifications_after_wake(
+        &self,
+        max_wait_ms: u32,
+        source: NotificationWakeSourceFfi,
+    ) -> Result<BackgroundNotificationCollectionFfi, MarmotKitError> {
+        Ok(self
+            .runtime
+            .collect_notifications_after_wake(max_wait_ms, source.into())
+            .await
+            .into())
+    }
+
     /// Full cached Nostr kind:0 profile for an account id (name, display
     /// name, about, picture, nip05, lud16), if the runtime has one
     /// projected. The local account's own profile is cached immediately
@@ -1117,6 +1274,13 @@ impl Marmot {
     /// per-account chats/messages/group-state subscriptions below.
     pub fn subscribe_events(&self) -> Arc<EventsSubscription> {
         EventsSubscription::new(self.runtime.subscribe())
+    }
+
+    pub async fn subscribe_notifications(
+        &self,
+    ) -> Result<Arc<NotificationsSubscription>, MarmotKitError> {
+        let inner = self.runtime.subscribe_notifications()?;
+        Ok(NotificationsSubscription::new(inner))
     }
 
     /// Per-account chats list. Emits whenever a group's projection changes.

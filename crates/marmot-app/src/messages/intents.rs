@@ -8,6 +8,7 @@ use cgka_traits::app_event::{
 };
 
 use crate::{AgentTextStreamFinishRequest, AppError, MediaReference};
+use crate::{MARMOT_APP_EVENT_KIND_PUSH_TOKEN_REMOVAL, MARMOT_APP_EVENT_KIND_PUSH_TOKEN_UPDATE};
 
 /// Value of the `stream-type` tag on an agent text stream start event.
 const STREAM_TYPE_TEXT: &str = "text";
@@ -47,6 +48,12 @@ pub(crate) enum AppMessageIntent {
     },
     StreamFinal {
         request: AgentTextStreamFinishRequest,
+    },
+    PushTokenUpdate {
+        content: String,
+    },
+    PushTokenRemoval {
+        content: String,
     },
 }
 
@@ -200,6 +207,16 @@ pub(crate) fn build_inner_event(
                 request.final_text_or_reference.clone(),
             ))
         }
+        AppMessageIntent::PushTokenUpdate { content } => Ok(event(
+            MARMOT_APP_EVENT_KIND_PUSH_TOKEN_UPDATE,
+            vec![vec!["v".to_owned(), crate::MIP05_VERSION.to_owned()]],
+            content.clone(),
+        )),
+        AppMessageIntent::PushTokenRemoval { content } => Ok(event(
+            MARMOT_APP_EVENT_KIND_PUSH_TOKEN_REMOVAL,
+            vec![vec!["v".to_owned(), crate::MIP05_VERSION.to_owned()]],
+            content.clone(),
+        )),
     }
 }
 

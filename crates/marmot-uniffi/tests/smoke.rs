@@ -10,7 +10,10 @@
 
 use std::sync::{Arc, Once};
 
-use marmot_uniffi::{Marmot, MarmotKitError, MediaReferenceFfi, MediaUploadRequestFfi};
+use marmot_uniffi::{
+    Marmot, MarmotKitError, MediaReferenceFfi, MediaUploadRequestFfi, NotificationWakeSourceFfi,
+    PushPlatformFfi,
+};
 
 /// `Marmot::new` opens a Keychain-backed secret store, which on the real
 /// targets (iOS/macOS) is always present but in headless CI (Linux Secret
@@ -178,4 +181,54 @@ async fn relay_list_binding_methods_are_public() {
             .await
             .is_err()
     );
+}
+
+#[tokio::test]
+async fn notification_binding_methods_are_public_and_validate_missing_accounts() {
+    install_mock_keyring();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let kit = Marmot::new(
+        tmp.path().to_string_lossy().into_owned(),
+        vec!["wss://relay.invalid.test".to_string()],
+    )
+    .expect("open marmot kit");
+
+    assert!(kit.notification_settings("missing".into()).is_err());
+    assert!(
+        kit.set_local_notifications_enabled("missing".into(), true)
+            .is_err()
+    );
+    assert!(
+        kit.set_native_push_enabled("missing".into(), true)
+            .await
+            .is_err()
+    );
+    assert!(kit.push_registration("missing".into()).is_err());
+    assert!(
+        kit.upsert_push_registration(
+            "missing".into(),
+            PushPlatformFfi::Fcm,
+            "opaque-token".into(),
+            "00".repeat(32),
+            None,
+        )
+        .await
+        .is_err()
+    );
+    assert!(kit.clear_push_registration("missing".into()).await.is_err());
+    assert!(
+        kit.group_push_debug_info("missing".into(), "00".repeat(32))
+            .await
+            .is_err()
+    );
+
+    let collected = kit
+        .collect_notifications_after_wake(1, NotificationWakeSourceFfi::ManualCatchUp)
+        .await
+        .expect("empty wake collection should be valid");
+    assert!(collected.notifications.is_empty());
+    let _subscription = kit
+        .subscribe_notifications()
+        .await
+        .expect("empty notification subscription should be valid");
 }

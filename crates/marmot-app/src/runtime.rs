@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use cgka_traits::agent_text_stream::{
     AGENT_TEXT_STREAM_EXPORTER_LABEL, AgentTextStreamKeyContextV1,
@@ -28,16 +28,19 @@ use crate::agent_streams::AgentStreamWatchManager;
 use crate::directory::{DirectorySyncHandle, DirectorySyncRunSummary};
 use crate::ids::normalize_group_id_hex_app;
 use crate::messages::{AppMessageIntent, STREAM_ROUTE_QUIC, tag_value, tag_values};
+use crate::notifications;
 use crate::{
     ACCOUNT_WORKER_RECONNECT_BASE_DELAY, ACCOUNT_WORKER_RECONNECT_JITTER_MAX_MS,
     ACCOUNT_WORKER_RECONNECT_MAX_DELAY, AGENT_STREAM_START_LOOKBACK_LIMIT,
     APP_RUNTIME_ACCOUNT_READY_WAIT, APP_RUNTIME_RELAY_REBUILD_LOOKBACK,
-    APP_RUNTIME_SUBSCRIPTION_BUFFER, AccountRelayListBootstrap, AccountRelayListStatus,
-    AgentTextStreamFinishRequest, AppError, AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord,
-    AppMessageQuery, AppMessageRecord, GroupInviteDeclineResult, MarmotApp, MarmotRelayPlane,
-    MediaDownloadResult, MediaReference, MediaUploadRequest, MediaUploadResult, ReceivedMessage,
-    SendSummary, SyncSummary, UserDirectoryRefresh, UserProfileMetadata, default_profile_pseudonym,
-    unix_now_seconds,
+    APP_RUNTIME_SUBSCRIPTION_BUFFER, AccountKeyPackageRecord, AccountRelayListBootstrap,
+    AccountRelayListStatus, AgentTextStreamFinishRequest, AppError, AppGroupMemberRecord,
+    AppGroupMlsState, AppGroupRecord, AppMessageQuery, AppMessageRecord,
+    BackgroundNotificationCollection, GroupInviteDeclineResult, GroupPushDebugInfo, MarmotApp,
+    MarmotRelayPlane, MediaDownloadResult, MediaReference, MediaUploadRequest, MediaUploadResult,
+    NotificationCollectionStatus, NotificationUpdate, NotificationWakeSource, PushRegistration,
+    ReceivedMessage, SendSummary, SyncSummary, UserDirectoryRefresh, UserProfileMetadata,
+    default_profile_pseudonym, unix_now_seconds,
 };
 
 #[derive(Clone)]
@@ -231,6 +234,13 @@ enum AccountWorkerCommand {
     RotateKeyPackage {
         respond: oneshot::Sender<Result<usize, AppError>>,
     },
+    SharePushRegistration {
+        respond: oneshot::Sender<Result<usize, AppError>>,
+    },
+    RemovePushRegistration {
+        registration: PushRegistration,
+        respond: oneshot::Sender<Result<usize, AppError>>,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -341,6 +351,16 @@ pub struct RuntimeGroupStateSubscription {
 
 impl RuntimeGroupStateSubscription {
     pub async fn recv(&mut self) -> Option<AppGroupRecord> {
+        self.updates.recv().await
+    }
+}
+
+pub struct RuntimeNotificationsSubscription {
+    updates: mpsc::Receiver<NotificationUpdate>,
+}
+
+impl RuntimeNotificationsSubscription {
+    pub async fn recv(&mut self) -> Option<NotificationUpdate> {
         self.updates.recv().await
     }
 }
@@ -617,6 +637,40 @@ impl MarmotAppRuntime {
         })
     }
 
+    pub fn subscribe_notifications(&self) -> Result<RuntimeNotificationsSubscription, AppError> {
+        let mut events = self.events.subscribe();
+        let app = self.accounts.app.clone();
+        let (updates_tx, updates_rx) = mpsc::channel(APP_RUNTIME_SUBSCRIPTION_BUFFER);
+        tokio::spawn(async move {
+            loop {
+                match events.recv().await {
+                    Ok(event) => {
+                        match notifications::notification_update_from_event(&app, &event) {
+                            Ok(Some(update)) => {
+                                if updates_tx.send(update).await.is_err() {
+                                    return;
+                                }
+                            }
+                            Ok(None) | Err(AppError::NotificationsDisabled) => {}
+                            Err(err) => {
+                                tracing::warn!(
+                                    target: "marmot_app::notifications",
+                                    method = "subscribe_notifications",
+                                    "notification projection skipped: {err}",
+                                );
+                            }
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => return,
+                }
+            }
+        });
+        Ok(RuntimeNotificationsSubscription {
+            updates: updates_rx,
+        })
+    }
+
     /// Watch a live agent text stream over the brokered QUIC channel. Resolves
     /// the latest `Start` payload for the group (or a specific `stream_id`),
     /// connects to the broker named in its `quic://` candidate, and streams
@@ -741,6 +795,89 @@ impl MarmotAppRuntime {
 
     pub async fn catch_up_accounts(&self) -> Result<(), AppError> {
         self.accounts.catch_up_accounts().await
+    }
+
+    pub async fn collect_notifications_after_wake(
+        &self,
+        max_wait_ms: u32,
+        _source: NotificationWakeSource,
+    ) -> BackgroundNotificationCollection {
+        let max_wait = Duration::from_millis(u64::from(max_wait_ms.max(1)));
+        let started = Instant::now();
+        let mut events = self.events.subscribe();
+        let catch_up = timeout(max_wait, self.catch_up_accounts()).await;
+        let remaining = max_wait.saturating_sub(started.elapsed());
+        let mut notifications = Vec::new();
+
+        match catch_up {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                return BackgroundNotificationCollection {
+                    status: NotificationCollectionStatus::Failed,
+                    notifications,
+                    error: Some(err.to_string()),
+                };
+            }
+            Err(_) => {
+                return BackgroundNotificationCollection {
+                    status: NotificationCollectionStatus::Failed,
+                    notifications,
+                    error: Some("notification wake collection timed out".into()),
+                };
+            }
+        }
+
+        let app = self.accounts.app.clone();
+        let drain_until = Instant::now() + remaining;
+        loop {
+            match events.try_recv() {
+                Ok(event) => match notifications::notification_update_from_event(&app, &event) {
+                    Ok(Some(update)) => notifications.push(update),
+                    Ok(None) | Err(AppError::NotificationsDisabled) => {}
+                    Err(err) => {
+                        tracing::warn!(
+                            target: "marmot_app::notifications",
+                            method = "collect_notifications_after_wake",
+                            "notification projection skipped: {err}",
+                        );
+                    }
+                },
+                Err(broadcast::error::TryRecvError::Empty) => {
+                    if Instant::now() >= drain_until {
+                        break;
+                    }
+                    match timeout(
+                        drain_until.saturating_duration_since(Instant::now()),
+                        events.recv(),
+                    )
+                    .await
+                    {
+                        Ok(Ok(event)) => {
+                            if let Ok(Some(update)) =
+                                notifications::notification_update_from_event(&app, &event)
+                            {
+                                notifications.push(update);
+                            }
+                        }
+                        Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
+                        Ok(Err(broadcast::error::RecvError::Closed)) | Err(_) => break,
+                    }
+                }
+                Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+                Err(broadcast::error::TryRecvError::Closed) => break,
+            }
+        }
+
+        let notifications = notifications::dedupe_notification_updates(notifications);
+        BackgroundNotificationCollection {
+            status: if notifications.is_empty() {
+                NotificationCollectionStatus::NoData
+            } else {
+                NotificationCollectionStatus::NewData
+            },
+            notifications,
+            error: None,
+        }
     }
 
     pub async fn create_group(
@@ -906,6 +1043,30 @@ impl MarmotAppRuntime {
             .await
     }
 
+    pub async fn share_push_registration(&self, account_ref: &str) -> Result<usize, AppError> {
+        self.accounts.share_push_registration(account_ref).await
+    }
+
+    pub async fn remove_push_registration(
+        &self,
+        account_ref: &str,
+        registration: PushRegistration,
+    ) -> Result<usize, AppError> {
+        self.accounts
+            .remove_push_registration(account_ref, registration)
+            .await
+    }
+
+    pub async fn group_push_debug_info(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+    ) -> Result<GroupPushDebugInfo, AppError> {
+        self.accounts
+            .group_push_debug_info(account_ref, group_id)
+            .await
+    }
+
     pub async fn react_to_message(
         &self,
         account_ref: &str,
@@ -1063,6 +1224,31 @@ impl MarmotAppRuntime {
 
     pub async fn rotate_key_package(&self, account_ref: &str) -> Result<usize, AppError> {
         self.accounts.rotate_key_package(account_ref).await
+    }
+
+    pub async fn publish_new_key_package(&self, account_ref: &str) -> Result<usize, AppError> {
+        self.rotate_key_package(account_ref).await
+    }
+
+    pub async fn account_key_packages(
+        &self,
+        account_ref: &str,
+        bootstrap_relays: Vec<TransportEndpoint>,
+    ) -> Result<Vec<AccountKeyPackageRecord>, AppError> {
+        self.accounts
+            .account_key_packages(account_ref, bootstrap_relays)
+            .await
+    }
+
+    pub async fn delete_key_package(
+        &self,
+        account_ref: &str,
+        event_id_hex: &str,
+        relays: Vec<TransportEndpoint>,
+    ) -> Result<usize, AppError> {
+        self.accounts
+            .delete_key_package(account_ref, event_id_hex, relays)
+            .await
     }
 
     pub async fn publish_user_profile(
@@ -1701,6 +1887,58 @@ impl AccountManager {
         account_worker_response(response).await
     }
 
+    async fn share_push_registration(&self, account_ref: &str) -> Result<usize, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::SharePushRegistration { respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
+    async fn remove_push_registration(
+        &self,
+        account_ref: &str,
+        registration: PushRegistration,
+    ) -> Result<usize, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::RemovePushRegistration {
+                registration,
+                respond,
+            })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
+    async fn group_push_debug_info(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+    ) -> Result<GroupPushDebugInfo, AppError> {
+        let account = self.resolve(account_ref)?;
+        self.reconcile().await?;
+        let command = self.worker_commands(&account.account_id_hex).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::Members {
+                group_id: group_id.clone(),
+                respond,
+            })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        let members = account_worker_response(response)
+            .await?
+            .into_iter()
+            .map(|member| member.member_id_hex)
+            .collect::<Vec<_>>();
+        self.app
+            .group_push_debug_info(&account.label, &hex::encode(group_id.as_slice()), &members)
+    }
+
     async fn send_app_event(
         &self,
         account_ref: &str,
@@ -1835,6 +2073,29 @@ impl AccountManager {
             .await
             .map_err(|_| AppError::TransportClosed)?;
         account_worker_response(response).await
+    }
+
+    pub async fn account_key_packages(
+        &self,
+        account_ref: &str,
+        bootstrap_relays: Vec<TransportEndpoint>,
+    ) -> Result<Vec<AccountKeyPackageRecord>, AppError> {
+        let account = self.resolve(account_ref)?;
+        self.app
+            .account_key_package_records(&account.label, bootstrap_relays)
+            .await
+    }
+
+    pub async fn delete_key_package(
+        &self,
+        account_ref: &str,
+        event_id_hex: &str,
+        relays: Vec<TransportEndpoint>,
+    ) -> Result<usize, AppError> {
+        let account = self.resolve(account_ref)?;
+        self.app
+            .delete_key_package_event(&account.label, event_id_hex, relays)
+            .await
     }
 
     async fn worker_commands(
@@ -2436,6 +2697,17 @@ async fn run_app_runtime_account_worker(
                             Ok(key_package.bytes().len())
                         }
                         .await;
+                        let _ = respond.send(result);
+                    }
+                    Some(AccountWorkerCommand::SharePushRegistration { respond }) => {
+                        let result = client.share_push_registration().await;
+                        let _ = respond.send(result);
+                    }
+                    Some(AccountWorkerCommand::RemovePushRegistration {
+                        registration,
+                        respond,
+                    }) => {
+                        let result = client.remove_push_registration(registration).await;
                         let _ = respond.send(result);
                     }
                     None => return,
