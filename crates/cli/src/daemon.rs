@@ -3166,8 +3166,9 @@ async fn handle_app_runtime_event(
         }
         marmot_app::MarmotAppEvent::GroupStateUpdated { .. } => {}
         marmot_app::MarmotAppEvent::MessageReceived(message) => {
-            // Every delivered timeline message (including a kind-9 stream-final)
-            // surfaces here; kind-1200 starts arrive as `AgentStreamStarted`.
+            // Raw message updates keep kind-1200 starts separate as
+            // `AgentStreamStarted`; materialized timeline subscriptions include
+            // those starts as timeline rows.
             events.publish_message(message_stream_response(
                 runtime_message_json(
                     &message.message,

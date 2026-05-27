@@ -6,6 +6,7 @@
 //! layers.
 
 mod account_projection;
+mod chat_list;
 mod codec;
 mod connection;
 mod migrations;
@@ -19,6 +20,7 @@ pub use account_projection::{
     AccountStoredPushRegistration, StoredAccountGroup, StoredAccountGroupComponent,
     StoredAccountState, StoredAppMessageQuery, StoredAppMessageRecord,
 };
+pub use chat_list::{ChatListAvatar, ChatListMessagePreview, ChatListQuery, ChatListRow};
 #[allow(deprecated)]
 pub use connection::SqliteStorage;
 pub use connection::{

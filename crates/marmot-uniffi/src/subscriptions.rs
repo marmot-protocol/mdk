@@ -17,15 +17,15 @@ use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 
 use marmot_app::{
-    RuntimeAgentStreamWatch, RuntimeChatsSubscription, RuntimeEventsSubscription,
-    RuntimeGroupStateSubscription, RuntimeMessagesSubscription, RuntimeNotificationsSubscription,
-    RuntimeTimelineMessagesSubscription,
+    RuntimeAgentStreamWatch, RuntimeChatListSubscription, RuntimeChatsSubscription,
+    RuntimeEventsSubscription, RuntimeGroupStateSubscription, RuntimeMessagesSubscription,
+    RuntimeNotificationsSubscription, RuntimeTimelineMessagesSubscription,
 };
 use tokio::sync::Mutex;
 
 use crate::conversions::{
-    AgentStreamUpdateFfi, AppGroupRecordFfi, AppMessageRecordFfi, MarmotEventFfi, MessageUpdateFfi,
-    NotificationUpdateFfi, TimelinePageFfi,
+    AgentStreamUpdateFfi, AppGroupRecordFfi, AppMessageRecordFfi, ChatListRowFfi, MarmotEventFfi,
+    MessageUpdateFfi, NotificationUpdateFfi, TimelinePageFfi,
 };
 
 #[derive(uniffi::Object)]
@@ -54,6 +54,37 @@ impl ChatsSubscription {
     }
 
     pub async fn next(&self) -> Option<AppGroupRecordFfi> {
+        let mut inner = self.inner.lock().await;
+        inner.recv().await.map(Into::into)
+    }
+}
+
+#[derive(uniffi::Object)]
+pub struct ChatListSubscription {
+    snapshot: StdMutex<Option<Vec<ChatListRowFfi>>>,
+    inner: Mutex<RuntimeChatListSubscription>,
+}
+
+impl ChatListSubscription {
+    pub(crate) fn new(mut inner: RuntimeChatListSubscription) -> Arc<Self> {
+        let snapshot: Vec<ChatListRowFfi> = std::mem::take(&mut inner.snapshot)
+            .into_iter()
+            .map(Into::into)
+            .collect();
+        Arc::new(Self {
+            snapshot: StdMutex::new(Some(snapshot)),
+            inner: Mutex::new(inner),
+        })
+    }
+}
+
+#[uniffi::export(async_runtime = "tokio")]
+impl ChatListSubscription {
+    pub fn snapshot(&self) -> Vec<ChatListRowFfi> {
+        take_snapshot(&self.snapshot).unwrap_or_default()
+    }
+
+    pub async fn next(&self) -> Option<ChatListRowFfi> {
         let mut inner = self.inner.lock().await;
         inner.recv().await.map(Into::into)
     }

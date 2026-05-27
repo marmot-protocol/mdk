@@ -40,11 +40,11 @@ use crate::{
     APP_RUNTIME_RELAY_REBUILD_LOOKBACK, APP_RUNTIME_SUBSCRIPTION_BUFFER, AccountKeyPackageRecord,
     AccountRelayListBootstrap, AccountRelayListStatus, AgentTextStreamFinishRequest, AppError,
     AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord, AppMessageQuery, AppMessageRecord,
-    BackgroundNotificationCollection, GroupInviteDeclineResult, GroupPushDebugInfo, MarmotApp,
-    MarmotRelayPlane, MediaDownloadResult, MediaReference, MediaUploadRequest, MediaUploadResult,
-    NotificationCollectionStatus, NotificationSettings, NotificationUpdate, NotificationWakeSource,
-    PushPlatform, PushRegistration, ReceivedMessage, SendSummary, SyncSummary,
-    TimelineMessageQuery, TimelinePage, UserDirectoryRefresh, UserProfileMetadata,
+    BackgroundNotificationCollection, ChatListRow, GroupInviteDeclineResult, GroupPushDebugInfo,
+    MarmotApp, MarmotRelayPlane, MediaDownloadResult, MediaReference, MediaUploadRequest,
+    MediaUploadResult, NotificationCollectionStatus, NotificationSettings, NotificationUpdate,
+    NotificationWakeSource, PushPlatform, PushRegistration, ReceivedMessage, SendSummary,
+    SyncSummary, TimelineMessageQuery, TimelinePage, UserDirectoryRefresh, UserProfileMetadata,
     default_profile_pseudonym, unix_now_seconds,
 };
 
@@ -490,8 +490,11 @@ pub struct RuntimeAccountError {
 
 /// A kind-1200 agent-text-stream **start** observed in a group. The inner
 /// event's stream metadata lives on `message.tags`; clients use it to open the
-/// ephemeral QUIC preview. The eventual kind-9 stream-final flows as a normal
-/// [`RuntimeMessageUpdate::Message`] carrying `stream`/`stream-start` tags.
+/// ephemeral QUIC preview. Raw message subscribers receive this as
+/// [`RuntimeMessageUpdate::AgentStreamStarted`]; materialized timeline
+/// subscribers see the same kind-1200 as a timeline row. The eventual kind-9
+/// stream-final flows as a normal [`RuntimeMessageUpdate::Message`] carrying
+/// `stream`/`stream-start` tags.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuntimeAgentStreamMessage {
     pub account_id_hex: String,
@@ -566,6 +569,21 @@ pub struct RuntimeChatsSubscription {
 
 impl RuntimeChatsSubscription {
     pub async fn recv(&mut self) -> Option<AppGroupRecord> {
+        tokio::select! {
+            update = self.updates.recv() => update,
+            _ = wait_for_runtime_shutdown(&mut self.stopping) => None,
+        }
+    }
+}
+
+pub struct RuntimeChatListSubscription {
+    pub snapshot: Vec<ChatListRow>,
+    updates: mpsc::Receiver<ChatListRow>,
+    stopping: watch::Receiver<bool>,
+}
+
+impl RuntimeChatListSubscription {
+    pub async fn recv(&mut self) -> Option<ChatListRow> {
         tokio::select! {
             update = self.updates.recv() => update,
             _ = wait_for_runtime_shutdown(&mut self.stopping) => None,
@@ -869,10 +887,15 @@ impl MarmotAppRuntime {
         } else {
             app.visible_groups(&account_label)?
         };
-        let mut seen_groups = snapshot
+        let mut group_fingerprints = snapshot
             .iter()
-            .map(app_group_record_fingerprint)
-            .collect::<HashSet<_>>();
+            .map(|group| {
+                (
+                    group.group_id_hex.clone(),
+                    app_group_record_fingerprint(group),
+                )
+            })
+            .collect::<HashMap<_, _>>();
         let (updates_tx, updates_rx) = mpsc::channel(APP_RUNTIME_SUBSCRIPTION_BUFFER);
         tokio::spawn(async move {
             loop {
@@ -894,29 +917,110 @@ impl MarmotAppRuntime {
                 let group_id_hex = hex::encode(group_id.as_slice());
                 let app_for_lookup = app.clone();
                 let account_label_for_lookup = account_label.clone();
+                let group_id_hex_for_lookup = group_id_hex.clone();
                 if runtime_shutdown_requested(&stopping) {
                     return;
                 }
                 let group = match blocking_app_task(move || {
-                    app_for_lookup.group(&account_label_for_lookup, &group_id_hex)
+                    app_for_lookup.group(&account_label_for_lookup, &group_id_hex_for_lookup)
                 })
                 .await
                 {
                     Ok(Some(group)) => group,
-                    Ok(None) | Err(_) => continue,
+                    Ok(None) | Err(_) => {
+                        group_fingerprints.remove(&group_id_hex);
+                        continue;
+                    }
                 };
                 if !include_archived && group.archived {
+                    group_fingerprints.remove(&group_id_hex);
+                    if updates_tx.send(group).await.is_err() {
+                        return;
+                    }
                     continue;
                 }
-                if !seen_groups.insert(app_group_record_fingerprint(&group)) {
+                let fingerprint = app_group_record_fingerprint(&group);
+                if group_fingerprints.get(&group.group_id_hex) == Some(&fingerprint) {
                     continue;
                 }
+                group_fingerprints.insert(group.group_id_hex.clone(), fingerprint);
                 if updates_tx.send(group).await.is_err() {
                     return;
                 }
             }
         });
         Ok(RuntimeChatsSubscription {
+            snapshot,
+            updates: updates_rx,
+            stopping: self.shared.lifecycle().subscribe_shutdown(),
+        })
+    }
+
+    pub fn subscribe_chat_list(
+        &self,
+        account_ref: &str,
+        include_archived: bool,
+    ) -> Result<RuntimeChatListSubscription, AppError> {
+        self.shared.lifecycle().ensure_running()?;
+        let account = self.accounts.resolve(account_ref)?;
+        let account_id_hex = account.account_id_hex.clone();
+        let account_label = account.label.clone();
+        let app = self.accounts.app.clone();
+        let mut events = self.events.subscribe();
+        let mut stopping = self.shared.lifecycle().subscribe_shutdown();
+        let snapshot = app.chat_list(&account_label, include_archived)?;
+        let mut row_fingerprints = snapshot
+            .iter()
+            .map(|row| (row.group_id_hex.clone(), chat_list_row_fingerprint(row)))
+            .collect::<HashMap<_, _>>();
+        let (updates_tx, updates_rx) = mpsc::channel(APP_RUNTIME_SUBSCRIPTION_BUFFER);
+        tokio::spawn(async move {
+            loop {
+                let event = tokio::select! {
+                    _ = wait_for_runtime_shutdown(&mut stopping) => return,
+                    event = events.recv() => match event {
+                        Ok(event) => event,
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(broadcast::error::RecvError::Closed) => return,
+                    },
+                };
+                let Some((event_account_id_hex, group_id)) = chat_list_event_route(&event) else {
+                    continue;
+                };
+                if event_account_id_hex != account_id_hex {
+                    continue;
+                }
+                let group_id_hex = hex::encode(group_id.as_slice());
+                let app_for_lookup = app.clone();
+                let account_label_for_lookup = account_label.clone();
+                let include_archived_for_lookup = include_archived;
+                if runtime_shutdown_requested(&stopping) {
+                    return;
+                }
+                let row = match blocking_app_task(move || {
+                    app_for_lookup
+                        .chat_list(&account_label_for_lookup, include_archived_for_lookup)
+                        .map(|rows| {
+                            rows.into_iter()
+                                .find(|candidate| candidate.group_id_hex == group_id_hex)
+                        })
+                })
+                .await
+                {
+                    Ok(Some(row)) => row,
+                    Ok(None) | Err(_) => continue,
+                };
+                let fingerprint = chat_list_row_fingerprint(&row);
+                if row_fingerprints.get(&row.group_id_hex) == Some(&fingerprint) {
+                    continue;
+                }
+                row_fingerprints.insert(row.group_id_hex.clone(), fingerprint);
+                if updates_tx.send(row).await.is_err() {
+                    return;
+                }
+            }
+        });
+        Ok(RuntimeChatListSubscription {
             snapshot,
             updates: updates_rx,
             stopping: self.shared.lifecycle().subscribe_shutdown(),
@@ -1829,6 +1933,40 @@ impl MarmotAppRuntime {
         self.accounts
             .app
             .timeline_messages_with_query(&account.label, query)
+    }
+
+    pub fn chat_list(
+        &self,
+        account_ref: &str,
+        include_archived: bool,
+    ) -> Result<Vec<ChatListRow>, AppError> {
+        let account = self.accounts.resolve(account_ref)?;
+        self.accounts
+            .app
+            .chat_list(&account.label, include_archived)
+    }
+
+    pub fn initialize_chat_read_state(
+        &self,
+        account_ref: &str,
+        group_id_hex: &str,
+    ) -> Result<Option<ChatListRow>, AppError> {
+        let account = self.accounts.resolve(account_ref)?;
+        self.accounts
+            .app
+            .initialize_chat_read_state(&account.label, group_id_hex)
+    }
+
+    pub fn mark_timeline_message_read(
+        &self,
+        account_ref: &str,
+        group_id_hex: &str,
+        message_id_hex: &str,
+    ) -> Result<Option<ChatListRow>, AppError> {
+        let account = self.accounts.resolve(account_ref)?;
+        self.accounts
+            .app
+            .mark_timeline_message_read(&account.label, group_id_hex, message_id_hex)
     }
 
     pub async fn create_identity(
@@ -3372,9 +3510,10 @@ fn publish_app_runtime_summary(
         });
     }
     for message in &summary.messages {
-        // A kind-1200 start is an open-preview signal, not a timeline message,
-        // so it is emitted only as `AgentStreamStarted`. Everything else
-        // (chat/reply/media/reaction/delete/stream-final) is a timeline message.
+        // Raw message subscribers get kind-1200 starts as a typed open-preview
+        // signal. The storage timeline still materializes the same start as a
+        // kind-1200 timeline row so timeline-only subscribers can discover and
+        // watch the live stream.
         if let Some(event) = agent_stream_runtime_event(account_id_hex, account_label, message) {
             let _ = events.send(event);
         } else {
@@ -3623,9 +3762,9 @@ pub(crate) fn broker_trust_for_addr(
 
 fn runtime_message_update_from_event(event: MarmotAppEvent) -> Option<RuntimeMessageUpdate> {
     match event {
-        // Every delivered timeline message (chat, reply, media, reaction,
-        // delete, stream-final) flows as a `Message`. The kind-1200 stream start
-        // arrives as its own `AgentStreamStarted` event below, never here.
+        // Raw message updates keep kind-1200 stream starts distinct from
+        // message rows. The materialized storage timeline still includes those
+        // starts when clients call `timeline_messages`.
         MarmotAppEvent::MessageReceived(message) => Some(RuntimeMessageUpdate::Message(message)),
         MarmotAppEvent::AgentStreamStarted(message) => {
             Some(RuntimeMessageUpdate::AgentStreamStarted(message))
@@ -3694,6 +3833,29 @@ fn runtime_group_event_route(event: &MarmotAppEvent) -> Option<(&str, &GroupId)>
     }
 }
 
+fn chat_list_event_route(event: &MarmotAppEvent) -> Option<(&str, &GroupId)> {
+    match event {
+        MarmotAppEvent::MessageReceived(update) => {
+            Some((&update.account_id_hex, &update.message.group_id))
+        }
+        MarmotAppEvent::GroupJoined {
+            account_id_hex,
+            group_id,
+            ..
+        }
+        | MarmotAppEvent::GroupStateUpdated {
+            account_id_hex,
+            group_id,
+            ..
+        } => Some((account_id_hex, group_id)),
+        MarmotAppEvent::GroupEvent(group_event) => Some((
+            &group_event.account_id_hex,
+            group_id_from_event(&group_event.event),
+        )),
+        MarmotAppEvent::AgentStreamStarted(_) | MarmotAppEvent::AccountError(_) => None,
+    }
+}
+
 fn group_id_from_event(event: &GroupEvent) -> &GroupId {
     match event {
         GroupEvent::GroupCreated { group_id }
@@ -3710,6 +3872,12 @@ fn group_id_from_event(event: &GroupEvent) -> &GroupId {
 
 fn app_group_record_fingerprint(group: &AppGroupRecord) -> String {
     serde_json::to_string(group).unwrap_or_else(|_| group.group_id_hex.clone())
+}
+
+fn chat_list_row_fingerprint(row: &ChatListRow) -> String {
+    let mut stable = row.clone();
+    stable.updated_at = 0;
+    serde_json::to_string(&stable).unwrap_or_else(|_| row.group_id_hex.clone())
 }
 
 fn publish_app_runtime_account_error(

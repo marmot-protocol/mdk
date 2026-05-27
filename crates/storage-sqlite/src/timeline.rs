@@ -484,6 +484,10 @@ fn project_group_events(events: Vec<RawAppEvent>) -> (Vec<TimelineRow>, Vec<Stre
             }
             MARMOT_APP_EVENT_KIND_AGENT_STREAM_START => {
                 if let Some(stream_id_hex) = tag_value(&event.tags, STREAM_TAG) {
+                    timeline.insert(
+                        event.message_id_hex.clone(),
+                        timeline_row_from_stream_start(event),
+                    );
                     stream_starts.push(StreamStartRow {
                         group_id_hex: event.group_id_hex.clone(),
                         message_id_hex: event.message_id_hex.clone(),
@@ -610,6 +614,27 @@ fn timeline_row_from_chat(event: &RawAppEvent) -> TimelineRow {
     }
 }
 
+fn timeline_row_from_stream_start(event: &RawAppEvent) -> TimelineRow {
+    TimelineRow {
+        message_id_hex: event.message_id_hex.clone(),
+        source_message_id_hex: event.source_message_id_hex.clone(),
+        direction: event.direction.clone(),
+        group_id_hex: event.group_id_hex.clone(),
+        sender: event.sender.clone(),
+        plaintext: event.plaintext.clone(),
+        kind: event.kind,
+        tags: event.tags.clone(),
+        timeline_at: event.recorded_at,
+        received_at: event.received_at,
+        reply_to_message_id_hex: None,
+        media: None,
+        agent_text_stream: agent_stream_start_metadata(event),
+        reactions: TimelineReactionSummary::default(),
+        deleted: false,
+        deleted_by_message_id_hex: None,
+    }
+}
+
 fn media_metadata(tags: &[Vec<String>]) -> Option<Value> {
     let imeta = tags
         .iter()
@@ -619,9 +644,18 @@ fn media_metadata(tags: &[Vec<String>]) -> Option<Value> {
     (!imeta.is_empty()).then(|| json!({ "imeta": imeta }))
 }
 
+fn agent_stream_start_metadata(event: &RawAppEvent) -> Option<Value> {
+    let stream_id_hex = tag_value(&event.tags, STREAM_TAG)?;
+    Some(json!({
+        "stream_id_hex": stream_id_hex,
+        "start_event_id": event.message_id_hex,
+        "status": "started"
+    }))
+}
+
 fn agent_stream_final_metadata(tags: &[Vec<String>]) -> Option<Value> {
     let stream_id_hex = tag_value(tags, STREAM_TAG)?;
-    let mut value = json!({ "stream_id_hex": stream_id_hex });
+    let mut value = json!({ "stream_id_hex": stream_id_hex, "status": "finalized" });
     if let Some(start) = tag_value(tags, STREAM_START_TAG) {
         value["start_event_id"] = Value::String(start.to_owned());
     }
@@ -1037,7 +1071,7 @@ mod tests {
     }
 
     #[test]
-    fn stream_start_is_not_visible_but_stream_final_is_materialized() {
+    fn stream_start_and_final_are_materialized_as_linked_timeline_records() {
         let store = SqliteAccountStorage::in_memory().unwrap();
         let start = StoredAppEvent {
             group_id_hex: "11".repeat(32),
@@ -1071,9 +1105,46 @@ mod tests {
         store.record_app_event(&final_event).unwrap();
 
         let messages = list(&store);
-        assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].message_id_hex, "final");
-        assert!(messages[0].agent_text_stream.is_some());
+        assert_eq!(messages.len(), 2);
+
+        let start = &messages[0];
+        assert_eq!(start.message_id_hex, "start");
+        assert_eq!(start.kind, MARMOT_APP_EVENT_KIND_AGENT_STREAM_START);
+        assert_eq!(
+            start
+                .agent_text_stream
+                .as_ref()
+                .and_then(|value| value.get("stream_id_hex"))
+                .and_then(Value::as_str),
+            Some("aa".repeat(32).as_str())
+        );
+        assert_eq!(
+            start
+                .agent_text_stream
+                .as_ref()
+                .and_then(|value| value.get("status"))
+                .and_then(Value::as_str),
+            Some("started")
+        );
+
+        let final_message = &messages[1];
+        assert_eq!(final_message.message_id_hex, "final");
+        assert_eq!(
+            final_message
+                .agent_text_stream
+                .as_ref()
+                .and_then(|value| value.get("start_event_id"))
+                .and_then(Value::as_str),
+            Some("start")
+        );
+        assert_eq!(
+            final_message
+                .agent_text_stream
+                .as_ref()
+                .and_then(|value| value.get("status"))
+                .and_then(Value::as_str),
+            Some("finalized")
+        );
     }
 
     #[test]

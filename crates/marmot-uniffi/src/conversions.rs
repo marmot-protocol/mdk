@@ -13,7 +13,8 @@ use marmot_app::{
     AccountKeyPackageRecord, AccountRelayListState, AccountRelayListStatus,
     AppGroupAdminPolicyComponent, AppGroupMemberRecord, AppGroupMlsState,
     AppGroupNostrRoutingComponent, AppGroupProfileComponent, AppGroupRecord, AppMessageRecord,
-    ForensicsDumpMode, GroupInviteDeclineResult, GroupPushDebugInfo, GroupPushTokenDebugEntry,
+    ChatListAvatar, ChatListMessagePreview, ChatListRow, ForensicsDumpMode,
+    GroupInviteDeclineResult, GroupPushDebugInfo, GroupPushTokenDebugEntry,
     LocalPushRegistrationDebug, MarmotAppEvent, MediaDownloadResult, MediaReference,
     MediaUploadRequest, MediaUploadResult, NotificationCollectionStatus, NotificationSettings,
     NotificationTrigger, NotificationUpdate, NotificationUser, NotificationWakeSource,
@@ -557,6 +558,89 @@ impl From<AppMessageRecord> for AppMessageRecordFfi {
             tags: message_tags_ffi(value.tags),
             recorded_at: value.recorded_at,
             received_at: value.received_at,
+        }
+    }
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct ChatListAvatarFfi {
+    pub image_hash_hex: String,
+    pub image_key_hex: String,
+    pub image_nonce_hex: String,
+    pub image_upload_key_hex: String,
+    pub media_type: Option<String>,
+}
+
+impl From<ChatListAvatar> for ChatListAvatarFfi {
+    fn from(value: ChatListAvatar) -> Self {
+        Self {
+            image_hash_hex: value.image_hash_hex,
+            image_key_hex: value.image_key_hex,
+            image_nonce_hex: value.image_nonce_hex,
+            image_upload_key_hex: value.image_upload_key_hex,
+            media_type: value.media_type,
+        }
+    }
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct ChatListMessagePreviewFfi {
+    pub message_id_hex: String,
+    pub sender: String,
+    pub sender_display_name: Option<String>,
+    pub plaintext: String,
+    pub kind: u64,
+    pub timeline_at: u64,
+    pub deleted: bool,
+}
+
+impl From<ChatListMessagePreview> for ChatListMessagePreviewFfi {
+    fn from(value: ChatListMessagePreview) -> Self {
+        Self {
+            message_id_hex: value.message_id_hex,
+            sender: value.sender,
+            sender_display_name: value.sender_display_name,
+            plaintext: value.plaintext,
+            kind: value.kind,
+            timeline_at: value.timeline_at,
+            deleted: value.deleted,
+        }
+    }
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct ChatListRowFfi {
+    pub group_id_hex: String,
+    pub archived: bool,
+    pub pending_confirmation: bool,
+    pub title: String,
+    pub group_name: String,
+    pub avatar: Option<ChatListAvatarFfi>,
+    pub last_message: Option<ChatListMessagePreviewFfi>,
+    pub unread_count: u64,
+    pub has_unread: bool,
+    pub first_unread_message_id_hex: Option<String>,
+    pub last_read_message_id_hex: Option<String>,
+    pub last_read_timeline_at: Option<u64>,
+    pub updated_at: u64,
+}
+
+impl From<ChatListRow> for ChatListRowFfi {
+    fn from(value: ChatListRow) -> Self {
+        Self {
+            group_id_hex: value.group_id_hex,
+            archived: value.archived,
+            pending_confirmation: value.pending_confirmation,
+            title: value.title,
+            group_name: value.group_name,
+            avatar: value.avatar.map(Into::into),
+            last_message: value.last_message.map(Into::into),
+            unread_count: value.unread_count,
+            has_unread: value.has_unread,
+            first_unread_message_id_hex: value.first_unread_message_id_hex,
+            last_read_message_id_hex: value.last_read_message_id_hex,
+            last_read_timeline_at: value.last_read_timeline_at,
+            updated_at: value.updated_at,
         }
     }
 }
@@ -1109,13 +1193,13 @@ impl From<RuntimeMessageReceived> for RuntimeMessageReceivedFfi {
 /// onto the underlying marmot-app types.
 #[derive(Clone, Debug, uniffi::Enum)]
 pub enum MessageUpdateFfi {
-    /// A timeline message: chat, reply, media, reaction, delete, or the kind-9
-    /// stream-final. Host apps branch on `received.message.kind` and `tags`; a
-    /// kind-9 carrying a `stream` tag is the stream-final that replaces the
-    /// ephemeral preview.
+    /// A raw message update: chat, reply, media, reaction, delete, or the kind-9
+    /// stream-final. Materialized timeline pages also include kind-1200 stream
+    /// starts as `TimelineMessageRecordFfi` rows.
     Message { received: RuntimeMessageReceivedFfi },
     /// A kind-1200 agent text stream start — the signal to open the QUIC
-    /// preview. Its stream id, route, and brokers live on `message.tags`.
+    /// preview for raw message subscribers. Its stream id, route, and brokers
+    /// live on `message.tags`.
     AgentStreamStarted { received: RuntimeMessageReceivedFfi },
 }
 

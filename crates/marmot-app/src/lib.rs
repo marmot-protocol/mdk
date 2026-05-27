@@ -89,8 +89,8 @@ pub use runtime::{
     AccountManager, AccountSetupRequest, AccountSetupResult, AgentStreamWatchOptions,
     ManagedAccount, MarmotAppEvent, MarmotAppRuntime, RuntimeAccountError,
     RuntimeAgentStreamMessage, RuntimeAgentStreamUpdate, RuntimeAgentStreamWatch,
-    RuntimeChatsSubscription, RuntimeEventsSubscription, RuntimeGroupEvent,
-    RuntimeGroupStateSubscription, RuntimeMessageReceived, RuntimeMessageUpdate,
+    RuntimeChatListSubscription, RuntimeChatsSubscription, RuntimeEventsSubscription,
+    RuntimeGroupEvent, RuntimeGroupStateSubscription, RuntimeMessageReceived, RuntimeMessageUpdate,
     RuntimeMessagesSubscription, RuntimeNotificationsSubscription, RuntimeSharedServices,
     RuntimeTimelineMessageUpdate, RuntimeTimelineMessagesSubscription, StreamStartView,
 };
@@ -130,8 +130,9 @@ pub use notifications::{
 };
 pub use relay_plane::{MarmotRelayPlane, MarmotRelayPlaneAccountAdapter, RelayPlaneHealth};
 pub use storage_sqlite::{
-    TimelineMessageQuery, TimelineMessageRecord, TimelinePage, TimelinePagination,
-    TimelineReactionSummary, TimelineReplyPreview, TimelineUserReaction,
+    ChatListAvatar, ChatListMessagePreview, ChatListQuery, ChatListRow, TimelineMessageQuery,
+    TimelineMessageRecord, TimelinePage, TimelinePagination, TimelineReactionSummary,
+    TimelineReplyPreview, TimelineUserReaction,
 };
 
 use directory::{DirectoryCache, DirectorySyncHandle, DirectorySyncPlan};
@@ -1495,6 +1496,49 @@ impl MarmotApp {
         Ok(self.account_storage(label)?.message_timeline(query)?)
     }
 
+    pub fn chat_list(
+        &self,
+        label: &str,
+        include_archived: bool,
+    ) -> Result<Vec<ChatListRow>, AppError> {
+        let account = self.account_home().account(label)?;
+        self.ensure_account_state(&account.label)?;
+        let mut rows = self
+            .account_storage(&account.label)?
+            .chat_list_rows(&account.account_id_hex, ChatListQuery { include_archived })?;
+        self.hydrate_chat_list_rows(&mut rows)?;
+        Ok(rows)
+    }
+
+    pub fn initialize_chat_read_state(
+        &self,
+        label: &str,
+        group_id_hex: &str,
+    ) -> Result<Option<ChatListRow>, AppError> {
+        let account = self.account_home().account(label)?;
+        self.ensure_account_state(&account.label)?;
+        let mut row = self
+            .account_storage(&account.label)?
+            .initialize_chat_read_state(&account.account_id_hex, group_id_hex)?;
+        self.hydrate_chat_list_row(row.as_mut())?;
+        Ok(row)
+    }
+
+    pub fn mark_timeline_message_read(
+        &self,
+        label: &str,
+        group_id_hex: &str,
+        message_id_hex: &str,
+    ) -> Result<Option<ChatListRow>, AppError> {
+        let account = self.account_home().account(label)?;
+        self.ensure_account_state(&account.label)?;
+        let mut row = self
+            .account_storage(&account.label)?
+            .mark_timeline_message_read(&account.account_id_hex, group_id_hex, message_id_hex)?;
+        self.hydrate_chat_list_row(row.as_mut())?;
+        Ok(row)
+    }
+
     pub fn notification_settings(
         &self,
         account_ref: &str,
@@ -2414,6 +2458,45 @@ impl MarmotApp {
             .into_iter()
             .find(|account| account.account_id_hex == account_id_hex)
             .map(|account| account.label))
+    }
+
+    fn hydrate_chat_list_rows(&self, rows: &mut [ChatListRow]) -> Result<(), AppError> {
+        let mut names = HashMap::new();
+        let senders = rows
+            .iter()
+            .filter_map(|row| {
+                row.last_message
+                    .as_ref()
+                    .map(|message| message.sender.clone())
+            })
+            .collect::<HashSet<_>>();
+        for sender in senders {
+            if let Some(name) = self.display_name_for_account_id(&sender)? {
+                names.insert(sender, name);
+            }
+        }
+        for row in rows {
+            let Some(message) = row.last_message.as_mut() else {
+                continue;
+            };
+            if let Some(name) = names.get(&message.sender) {
+                message.sender_display_name = Some(name.clone());
+            }
+        }
+        Ok(())
+    }
+
+    fn hydrate_chat_list_row(&self, row: Option<&mut ChatListRow>) -> Result<(), AppError> {
+        let Some(row) = row else {
+            return Ok(());
+        };
+        let Some(message) = row.last_message.as_mut() else {
+            return Ok(());
+        };
+        if let Some(name) = self.display_name_for_account_id(&message.sender)? {
+            message.sender_display_name = Some(name);
+        }
+        Ok(())
     }
 
     fn load_state(&self, label: &str) -> Result<AccountState, AppError> {
