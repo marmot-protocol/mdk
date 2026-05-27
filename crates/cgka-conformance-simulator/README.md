@@ -5,7 +5,7 @@ In-process multi-client simulator for the CGKA engine.
 The engine crate proves local engine rules. This crate asks the bigger question: if several clients run that engine and
 the network behaves badly, do they still end up with the same group state?
 
-The simulator does not use real relays. It runs `Engine<SqliteStorage>` clients against a deterministic in-memory
+The simulator does not use real relays. It runs `Engine<SqliteAccountStorage>` clients against a deterministic in-memory
 `TransportBus`, using in-memory SQLite by default. Set `DARKMATTER_CONFORMANCE_SQLITE_STORAGE=file` to run harness
 clients on temporary encrypted SQLite files. Transport wrapping still goes through the real Nostr peeler, so group
 messages use the Marmot kind-445 envelope and welcomes use NIP-59 gift wraps before the bus delivers them.
@@ -14,7 +14,7 @@ messages use the Marmot kind-445 envelope and welcomes use NIP-59 gift wraps bef
 
 - `TransportBus` — an in-memory message bus with seeded scheduling, partition support, broadcast and addressed
   delivery for welcomes, and replay hooks.
-- `HarnessClient` — wraps `Engine<SqliteStorage>` and the real Nostr transport peeler while keeping delivery in memory.
+- `HarnessClient` — wraps `Engine<SqliteAccountStorage>` and the real Nostr transport peeler while keeping delivery in memory.
 - `ScenarioSpec` — a serializable v1 input contract for deterministic scripted scenarios, including explicit queue
   faults and partitions.
 - `VectorFixture` — portable JSON fixtures pairing runnable scenario input with exact traces or semantic expected

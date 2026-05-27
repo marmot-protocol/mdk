@@ -35,10 +35,15 @@ impl fmt::Debug for SqlCipherKey {
 }
 
 #[derive(Clone)]
-pub struct SqliteStorage {
+pub struct SqliteAccountStorage {
     pub(crate) connection: SharedConnection,
     pub(crate) openmls: SqliteOpenMlsStorage,
 }
+
+#[deprecated(
+    note = "renamed to SqliteAccountStorage; SqliteStorage will be removed once downstream crates have migrated"
+)]
+pub type SqliteStorage = SqliteAccountStorage;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SqliteStorageOptions {
@@ -97,7 +102,7 @@ impl SqliteSynchronous {
     }
 }
 
-impl SqliteStorage {
+impl SqliteAccountStorage {
     pub fn in_memory() -> StorageResult<Self> {
         Self::in_memory_with_options(SqliteStorageOptions::default())
     }
@@ -213,7 +218,7 @@ fn apply_operational_pragmas(
     Ok(())
 }
 
-impl StorageProvider for SqliteStorage {
+impl StorageProvider for SqliteAccountStorage {
     type Mls = SqliteOpenMlsStorage;
 
     fn mls_storage(&self) -> &Self::Mls {
@@ -255,7 +260,7 @@ mod tests {
     #[test]
     fn reports_sqlite_backend() {
         assert_eq!(
-            SqliteStorage::in_memory().unwrap().backend(),
+            SqliteAccountStorage::in_memory().unwrap().backend(),
             Backend::Sqlite
         );
     }
@@ -272,7 +277,7 @@ mod tests {
 
     #[test]
     fn connection_lock_recovers_from_poisoned_guard() {
-        let store = SqliteStorage::in_memory().unwrap();
+        let store = SqliteAccountStorage::in_memory().unwrap();
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _guard = store.connection.lock().unwrap();
             panic!("poison sqlite connection lock");
@@ -288,7 +293,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("marmot.sqlite");
         let key = SqlCipherKey::new("operational defaults key").unwrap();
-        let store = SqliteStorage::open_encrypted(&path, &key).unwrap();
+        let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
         let conn = store.lock().unwrap();
 
         assert_eq!(pragma_i64(&conn, "busy_timeout"), 5_000);
@@ -311,7 +316,7 @@ mod tests {
         let mut connection = rusqlite::Connection::open(path).unwrap();
         connection.trace(Some(trace_sqlcipher_setup));
 
-        let _store = SqliteStorage::from_unkeyed_encrypted_connection_with_options(
+        let _store = SqliteAccountStorage::from_unkeyed_encrypted_connection_with_options(
             connection,
             &key,
             SqliteStorageOptions::default(),
@@ -356,7 +361,7 @@ mod tests {
 
     #[test]
     fn custom_options_can_relax_operational_defaults_for_tests() {
-        let store = SqliteStorage::in_memory_with_options(SqliteStorageOptions {
+        let store = SqliteAccountStorage::in_memory_with_options(SqliteStorageOptions {
             busy_timeout_ms: 250,
             journal_mode: SqliteJournalMode::Delete,
             synchronous: SqliteSynchronous::Normal,
@@ -387,16 +392,16 @@ mod tests {
         let wrong_key = SqlCipherKey::new("wrong key").unwrap();
 
         {
-            let store = SqliteStorage::open_encrypted(&path, &key).unwrap();
+            let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
             store.put_group(&sample_group(gid(1), 3, 1)).unwrap();
         }
 
         let file_bytes = std::fs::read(&path).unwrap();
         assert!(!file_bytes.starts_with(b"SQLite format 3\0"));
 
-        assert!(SqliteStorage::open_encrypted(&path, &wrong_key).is_err());
+        assert!(SqliteAccountStorage::open_encrypted(&path, &wrong_key).is_err());
 
-        let reopened = SqliteStorage::open_encrypted(&path, &key).unwrap();
+        let reopened = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
         assert_eq!(reopened.get_group(&gid(1)).unwrap().epoch, EpochId(3));
     }
 

@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -14,7 +16,7 @@ use crate::{
     PushPlatform, PushRegistration,
 };
 
-pub(crate) struct AccountProjectionDb {
+pub(crate) struct LegacyAccountProjectionDb {
     conn: Connection,
 }
 
@@ -32,7 +34,7 @@ struct RawGroupRow {
     agent_text_stream_data_hex: String,
 }
 
-impl AccountProjectionDb {
+impl LegacyAccountProjectionDb {
     pub(crate) fn open(path: PathBuf, key: &SqlCipherKey) -> Result<Self, AppError> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
@@ -611,6 +613,28 @@ impl AccountProjectionDb {
             .map_err(Into::into)
     }
 
+    pub(crate) fn existing_notification_settings(
+        &self,
+        account_label: &str,
+    ) -> Result<Option<NotificationSettings>, AppError> {
+        let mut statement = self.conn.prepare(
+            "SELECT account_label, account_id_hex, local_notifications_enabled,
+                    native_push_enabled
+             FROM notification_settings
+             WHERE account_label = ?1",
+        )?;
+        let mut rows = statement.query(params![account_label])?;
+        let Some(row) = rows.next()? else {
+            return Ok(None);
+        };
+        Ok(Some(NotificationSettings {
+            account_ref: row.get(0)?,
+            account_id_hex: row.get(1)?,
+            local_notifications_enabled: row.get::<_, i64>(2)? != 0,
+            native_push_enabled: row.get::<_, i64>(3)? != 0,
+        }))
+    }
+
     pub(crate) fn set_local_notifications_enabled(
         &self,
         account_label: &str,
@@ -801,6 +825,22 @@ impl AccountProjectionDb {
              ORDER BY member_id_hex, platform, server_pubkey_hex",
         )?;
         let rows = statement.query_map(params![group_id_hex], group_push_token_from_row)?;
+        let mut tokens = Vec::new();
+        for row in rows {
+            tokens.push(row?);
+        }
+        Ok(tokens)
+    }
+
+    pub(crate) fn all_group_push_tokens(&self) -> Result<Vec<GroupPushTokenRecord>, AppError> {
+        let mut statement = self.conn.prepare(
+            "SELECT group_id_hex, member_id_hex, leaf_index, platform,
+                    token_fingerprint, server_pubkey_hex, relay_hint,
+                    encrypted_token, updated_at_ms
+             FROM group_push_tokens
+             ORDER BY group_id_hex, member_id_hex, platform, server_pubkey_hex",
+        )?;
+        let rows = statement.query_map([], group_push_token_from_row)?;
         let mut tokens = Vec::new();
         for row in rows {
             tokens.push(row?);
@@ -1062,7 +1102,7 @@ mod tests {
     fn save_state_rolls_back_all_tables_when_component_write_fails() {
         let dir = tempfile::tempdir().unwrap();
         let key = SqlCipherKey::new("test-key").unwrap();
-        let mut db = AccountProjectionDb::open(dir.path().join("app.sqlite3"), &key).unwrap();
+        let mut db = LegacyAccountProjectionDb::open(dir.path().join("app.sqlite3"), &key).unwrap();
         let original = AccountState {
             label: "alice".to_owned(),
             seen_events: vec!["event-before".to_owned()],
@@ -1120,7 +1160,7 @@ mod tests {
     fn load_state_uses_agent_text_stream_component_row() {
         let dir = tempfile::tempdir().unwrap();
         let key = SqlCipherKey::new("test-key").unwrap();
-        let mut db = AccountProjectionDb::open(dir.path().join("app.sqlite3"), &key).unwrap();
+        let mut db = LegacyAccountProjectionDb::open(dir.path().join("app.sqlite3"), &key).unwrap();
         let mut group = AppGroupRecord::new(
             "aa".to_owned(),
             test_routing([0xAA; 32], "ws://127.0.0.1:18080"),
@@ -1155,7 +1195,7 @@ mod tests {
     fn save_state_does_not_rewrite_unchanged_group_rows() {
         let dir = tempfile::tempdir().unwrap();
         let key = SqlCipherKey::new("test-key").unwrap();
-        let mut db = AccountProjectionDb::open(dir.path().join("app.sqlite3"), &key).unwrap();
+        let mut db = LegacyAccountProjectionDb::open(dir.path().join("app.sqlite3"), &key).unwrap();
         let state = AccountState {
             label: "alice".to_owned(),
             seen_events: Vec::new(),
@@ -1230,7 +1270,7 @@ mod tests {
     fn save_state_retains_only_recent_seen_events() {
         let dir = tempfile::tempdir().unwrap();
         let key = SqlCipherKey::new("test-key").unwrap();
-        let mut db = AccountProjectionDb::open(dir.path().join("app.sqlite3"), &key).unwrap();
+        let mut db = LegacyAccountProjectionDb::open(dir.path().join("app.sqlite3"), &key).unwrap();
         let seen_events = (0..(crate::MAX_SEEN_EVENT_IDS + 2))
             .map(|index| format!("event-{index:05}"))
             .collect::<Vec<_>>();
@@ -1268,7 +1308,7 @@ mod tests {
     fn prune_group_messages_before_removes_only_expired_group_rows() {
         let dir = tempfile::tempdir().unwrap();
         let key = SqlCipherKey::new("test-key").unwrap();
-        let db = AccountProjectionDb::open(dir.path().join("app.sqlite3"), &key).unwrap();
+        let db = LegacyAccountProjectionDb::open(dir.path().join("app.sqlite3"), &key).unwrap();
         for (message_id_hex, group_id_hex, recorded_at) in [
             ("old-aa", "aa", 10),
             ("new-aa", "aa", 20),
@@ -1276,6 +1316,7 @@ mod tests {
         ] {
             db.record_message(&AppMessageProjection {
                 message_id_hex: message_id_hex.to_owned(),
+                source_message_id_hex: None,
                 direction: "received".to_owned(),
                 group_id_hex: group_id_hex.to_owned(),
                 sender: "sender".to_owned(),

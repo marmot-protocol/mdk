@@ -5,16 +5,31 @@
 //! same database so group snapshot and rollback can be atomic across both
 //! layers.
 
+mod account_projection;
 mod codec;
 mod connection;
 mod migrations;
 mod openmls_storage;
+mod shared;
 mod storage;
+mod timeline;
 
+pub use account_projection::{
+    AccountGroupPushToken, AccountNotificationSettings, AccountPushRegistration,
+    AccountStoredPushRegistration, StoredAccountGroup, StoredAccountGroupComponent,
+    StoredAccountState, StoredAppMessageQuery, StoredAppMessageRecord,
+};
+#[allow(deprecated)]
+pub use connection::SqliteStorage;
 pub use connection::{
-    SqlCipherKey, SqliteJournalMode, SqliteStorage, SqliteStorageOptions, SqliteSynchronous,
+    SqlCipherKey, SqliteAccountStorage, SqliteJournalMode, SqliteStorageOptions, SqliteSynchronous,
 };
 pub use openmls_storage::SqliteOpenMlsStorageError;
+pub use shared::{PublicDirectoryUserRecord, SqliteSharedStorage};
+pub use timeline::{
+    StoredAppEvent, TimelineMessageQuery, TimelineMessageRecord, TimelinePage, TimelinePagination,
+    TimelineReactionSummary, TimelineUserReaction,
+};
 
 pub(crate) use codec::{
     SqliteResultExt, created_at_to_i64, deserialize, epoch_to_i64, message_state_to_i64, serialize,

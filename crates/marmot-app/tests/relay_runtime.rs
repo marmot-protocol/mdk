@@ -1946,14 +1946,15 @@ async fn relay_app_runtime_reopens_account_state() {
         status.groups[0].group_id_hex,
         hex::encode(group_id.as_slice())
     );
-    let projection_path = dir.path().join("accounts/bob/app.sqlite3");
-    assert!(projection_path.exists());
-    let plain_open_result = rusqlite::Connection::open(&projection_path).and_then(|conn| {
+    let account_storage_path = dir.path().join("accounts/bob/session.sqlite");
+    assert!(account_storage_path.exists());
+    let plain_open_result = rusqlite::Connection::open(&account_storage_path).and_then(|conn| {
         conn.query_row("SELECT count(*) FROM sqlite_master", [], |row| {
             row.get::<_, i64>(0)
         })
     });
     assert!(plain_open_result.is_err());
+    assert!(!dir.path().join("accounts/bob/app.sqlite3").exists());
     assert!(!dir.path().join("accounts/bob/app-state.json").exists());
 }
 
@@ -2381,7 +2382,7 @@ async fn user_directory_refresh_rejects_future_follow_and_profile_events() {
 }
 
 #[tokio::test]
-async fn account_projection_db_records_received_messages() {
+async fn account_storage_records_received_messages() {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
     home.create_account("alice").unwrap();

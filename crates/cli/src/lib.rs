@@ -22,6 +22,7 @@ use marmot_app::{
     AgentTextStreamFinishRequest, AppError, AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord,
     AppMessageQuery, AppMessageRecord, AppStatus, DEFAULT_BLOSSOM_SERVER_URL, FetchedKeyPackage,
     MarmotApp, MarmotAppRuntime, MediaReference, MediaUploadRequest, StreamStartView, SyncSummary,
+    TimelineMessageQuery, TimelineMessageRecord, TimelinePage, TimelinePagination,
     UserDirectorySearch, UserProfileMetadata, tag_value,
 };
 use nostr::ToBech32;
@@ -683,6 +684,11 @@ enum MessageCommand {
         #[arg(long, help = "Maximum number of messages to return")]
         limit: Option<usize>,
     },
+    #[command(about = "List, search, and subscribe to the materialized message timeline")]
+    Timeline {
+        #[command(subcommand)]
+        command: MessageTimelineCommand,
+    },
     #[command(about = "Search messages in one group")]
     Search {
         #[arg(help = "Group id to search")]
@@ -700,6 +706,45 @@ enum MessageCommand {
         limit: Option<usize>,
     },
     #[command(about = "Subscribe to live message updates through the daemon")]
+    Subscribe {
+        #[arg(help = "Group id to watch; omit to watch all local groups")]
+        group: Option<String>,
+        #[arg(long, help = "Initial replay limit")]
+        limit: Option<usize>,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Subcommand)]
+enum MessageTimelineCommand {
+    #[command(about = "List materialized timeline messages")]
+    List {
+        #[arg(value_name = "GROUP", help = "Group id to list")]
+        group_id: Option<String>,
+        #[arg(long, help = "Group id to list")]
+        group: Option<String>,
+        #[arg(long, help = "Only include timeline rows before this unix timestamp")]
+        before: Option<u64>,
+        #[arg(long, help = "Only include timeline rows before this message id")]
+        before_message_id: Option<String>,
+        #[arg(long, help = "Only include timeline rows after this unix timestamp")]
+        after: Option<u64>,
+        #[arg(long, help = "Only include timeline rows after this message id")]
+        after_message_id: Option<String>,
+        #[arg(long, help = "Maximum number of timeline rows to return")]
+        limit: Option<usize>,
+    },
+    #[command(about = "Search materialized timeline messages")]
+    Search {
+        #[arg(help = "Search query")]
+        query: String,
+        #[arg(value_name = "GROUP", help = "Optional group id to search")]
+        group_id: Option<String>,
+        #[arg(long, help = "Group id to search")]
+        group: Option<String>,
+        #[arg(long, help = "Maximum number of results to return")]
+        limit: Option<usize>,
+    },
+    #[command(about = "Subscribe to live materialized timeline updates through the daemon")]
     Subscribe {
         #[arg(help = "Group id to watch; omit to watch all local groups")]
         group: Option<String>,
@@ -1279,6 +1324,14 @@ fn is_messages_subscribe(cli: &Cli) -> bool {
             command: MessageCommand::Subscribe { .. },
         } | Command::Messages {
             command: MessageCommand::Subscribe { .. },
+        } | Command::Message {
+            command: MessageCommand::Timeline {
+                command: MessageTimelineCommand::Subscribe { .. },
+            },
+        } | Command::Messages {
+            command: MessageCommand::Timeline {
+                command: MessageTimelineCommand::Subscribe { .. },
+            },
         }
     )
 }
@@ -2970,6 +3023,9 @@ pub(crate) async fn message_command_with_runtime(
                 }),
             })
         }
+        MessageCommand::Timeline { command } => {
+            handle_message_timeline_command(app, account_home, command, account_flag)
+        }
         MessageCommand::Search {
             group_id,
             query,
@@ -3005,6 +3061,83 @@ pub(crate) async fn message_command_with_runtime(
             })
         }
         MessageCommand::Subscribe { .. } => Err(DmError::MessagesSubscribeRequiresDaemon),
+    }
+}
+
+fn handle_message_timeline_command(
+    app: &MarmotApp,
+    account_home: &AccountHome,
+    command: MessageTimelineCommand,
+    account_flag: Option<String>,
+) -> Result<CommandOutput, DmError> {
+    match command {
+        MessageTimelineCommand::List {
+            group_id,
+            group,
+            before,
+            before_message_id,
+            after,
+            after_message_id,
+            limit,
+        } => {
+            let account = resolve_account(account_home, account_flag)?;
+            ensure_local_signing(&account)?;
+            app.status(&account.label)?;
+            let group = group.or(group_id);
+            let page = app.timeline_messages_with_query(
+                &account.label,
+                TimelineMessageQuery {
+                    group_id_hex: group
+                        .map(|group| normalize_group_id_hex(&group))
+                        .transpose()?,
+                    search: None,
+                    pagination: TimelinePagination {
+                        before,
+                        before_message_id,
+                        after,
+                        after_message_id,
+                        limit,
+                    },
+                },
+            )?;
+            Ok(timeline_page_output(
+                app,
+                &account.account_id_hex,
+                page,
+                None,
+            ))
+        }
+        MessageTimelineCommand::Search {
+            query,
+            group_id,
+            group,
+            limit,
+        } => {
+            let account = resolve_account(account_home, account_flag)?;
+            ensure_local_signing(&account)?;
+            app.status(&account.label)?;
+            let group = group.or(group_id);
+            let page = app.timeline_messages_with_query(
+                &account.label,
+                TimelineMessageQuery {
+                    group_id_hex: group
+                        .map(|group| normalize_group_id_hex(&group))
+                        .transpose()?,
+                    search: Some(query.clone()),
+                    pagination: TimelinePagination {
+                        limit,
+                        ..TimelinePagination::default()
+                    },
+                },
+            )?;
+            Ok(timeline_page_output(
+                app,
+                &account.account_id_hex,
+                page,
+                Some(query),
+            ))
+        }
+        MessageTimelineCommand::Subscribe { .. } => Err(DmError::MessagesSubscribeRequiresDaemon),
     }
 }
 
@@ -4620,6 +4753,86 @@ fn message_list_json_with_profiles(app: &MarmotApp, messages: Vec<AppMessageReco
             message_record_json(message, from_display_name)
         })
         .collect()
+}
+
+fn timeline_page_output(
+    app: &MarmotApp,
+    account_id_hex: &str,
+    page: TimelinePage,
+    query: Option<String>,
+) -> CommandOutput {
+    let plain = timeline_message_list_plain(&page.messages);
+    let messages = timeline_message_list_json_with_profiles(app, page.messages);
+    let mut json = json!({
+        "account_id": account_id_hex,
+        "npub": npub_for_account_id(account_id_hex),
+        "messages": messages,
+        "has_more_before": page.has_more_before,
+        "has_more_after": page.has_more_after,
+    });
+    if let Some(query) = query {
+        json["query"] = json!(query);
+    }
+    CommandOutput { plain, json }
+}
+
+fn timeline_message_list_plain(messages: &[TimelineMessageRecord]) -> String {
+    if messages.is_empty() {
+        return "no timeline messages".to_owned();
+    }
+    messages
+        .iter()
+        .map(|message| {
+            let deleted = if message.deleted { " deleted=true" } else { "" };
+            format!(
+                "group={} from={}: {}{}",
+                message.group_id_hex, message.sender, message.plaintext, deleted
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn timeline_message_list_json_with_profiles(
+    app: &MarmotApp,
+    messages: Vec<TimelineMessageRecord>,
+) -> Vec<Value> {
+    let mut display_names_by_sender: HashMap<String, Option<String>> = HashMap::new();
+    messages
+        .into_iter()
+        .map(|message| {
+            let from_display_name = display_names_by_sender
+                .entry(message.sender.clone())
+                .or_insert_with(|| display_name_for_sender(app, &message.sender))
+                .clone();
+            timeline_message_record_json(message, from_display_name)
+        })
+        .collect()
+}
+
+fn timeline_message_record_json(
+    message: TimelineMessageRecord,
+    from_display_name: Option<String>,
+) -> Value {
+    json!({
+        "message_id": message.message_id_hex,
+        "source_message_id": message.source_message_id_hex,
+        "direction": message.direction,
+        "group_id": message.group_id_hex,
+        "from": message.sender,
+        "from_display_name": from_display_name,
+        "plaintext": message.plaintext,
+        "kind": message.kind,
+        "tags": message.tags,
+        "timeline_at": message.timeline_at,
+        "received_at": message.received_at,
+        "reply_to_message_id": message.reply_to_message_id_hex,
+        "media": message.media,
+        "agent_text_stream": message.agent_text_stream,
+        "reactions": message.reactions,
+        "deleted": message.deleted,
+        "deleted_by_message_id": message.deleted_by_message_id_hex,
+    })
 }
 
 fn message_record_json(message: AppMessageRecord, from_display_name: Option<String>) -> Value {

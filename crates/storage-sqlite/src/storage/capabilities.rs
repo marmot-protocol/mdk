@@ -1,4 +1,4 @@
-use crate::{SqliteResultExt, SqliteStorage, deserialize, serialize};
+use crate::{SqliteAccountStorage, SqliteResultExt, deserialize, serialize};
 use cgka_traits::capabilities::{
     Capability, CapabilityRequirement, Feature, GroupCapabilities, RequirementLevel,
 };
@@ -57,7 +57,7 @@ fn intern_capability_description(description: String) -> &'static str {
     interned
 }
 
-impl CapabilityStorage for SqliteStorage {
+impl CapabilityStorage for SqliteAccountStorage {
     fn register_feature(&self, feature: Feature, req: CapabilityRequirement) -> StorageResult<()> {
         let row = CapabilityRequirementRow::from(&req);
         self.lock()?
@@ -131,13 +131,13 @@ impl CapabilityStorage for SqliteStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::SqliteStorage;
+    use crate::SqliteAccountStorage;
     use crate::storage::test_support::{gid, member_id, sample_group};
     use cgka_traits::storage::GroupStorage;
 
     #[test]
     fn feature_registry_and_member_capabilities_roundtrip() {
-        let store = SqliteStorage::in_memory().unwrap();
+        let store = SqliteAccountStorage::in_memory().unwrap();
         store.put_group(&sample_group(gid(1), 0, 1)).unwrap();
         let feature = Feature("self-remove");
         let requirement = CapabilityRequirement {
@@ -174,7 +174,7 @@ mod tests {
 
     #[test]
     fn feature_requirement_reuses_description_allocation_across_reads() {
-        let store = SqliteStorage::in_memory().unwrap();
+        let store = SqliteAccountStorage::in_memory().unwrap();
         let feature = Feature("agent-text-stream");
         store
             .register_feature(

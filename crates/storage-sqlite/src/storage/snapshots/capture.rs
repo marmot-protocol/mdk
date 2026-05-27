@@ -3,12 +3,16 @@ use super::rows::{
     Snapshot,
 };
 use crate::openmls_storage::mls_group_key;
-use crate::{SqliteResultExt, SqliteStorage, deserialize, serialize};
+use crate::{SqliteAccountStorage, SqliteResultExt, deserialize, serialize};
 use cgka_traits::storage::{StorageError, StorageResult};
 use cgka_traits::types::{GroupId, MemberId};
 use rusqlite::{OptionalExtension, params};
 
-pub(super) fn create(store: &SqliteStorage, group_id: &GroupId, name: &str) -> StorageResult<()> {
+pub(super) fn create(
+    store: &SqliteAccountStorage,
+    group_id: &GroupId,
+    name: &str,
+) -> StorageResult<()> {
     let mls_group_key = mls_group_key(group_id)?;
     let mut conn = store.lock()?;
     let tx = conn.transaction().storage()?;

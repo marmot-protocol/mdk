@@ -4,6 +4,10 @@ mod migration_0001_initial_schema;
 mod migration_0002_account_device_signers;
 #[path = "migrations/0003_group_foreign_keys.rs"]
 mod migration_0003_group_foreign_keys;
+#[path = "migrations/0004_app_timeline.rs"]
+mod migration_0004_app_timeline;
+#[path = "migrations/0005_account_projection.rs"]
+mod migration_0005_account_projection;
 
 use crate::SqliteResultExt;
 use cgka_traits::storage::{StorageError, StorageResult};
@@ -30,6 +34,16 @@ const MIGRATIONS: &[Migration] = &[
         version: 3,
         name: "0003_group_foreign_keys",
         apply: migration_0003_group_foreign_keys::apply,
+    },
+    Migration {
+        version: 4,
+        name: "0004_app_timeline",
+        apply: migration_0004_app_timeline::apply,
+    },
+    Migration {
+        version: 5,
+        name: "0005_account_projection",
+        apply: migration_0005_account_projection::apply,
     },
 ];
 
@@ -145,9 +159,9 @@ fn apply_migration(connection: &mut Connection, migration: &Migration) -> Storag
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{SqlCipherKey, SqliteStorage};
+    use crate::{SqlCipherKey, SqliteAccountStorage};
 
-    fn applied_migrations(store: &SqliteStorage) -> Vec<(i64, String)> {
+    fn applied_migrations(store: &SqliteAccountStorage) -> Vec<(i64, String)> {
         let conn = store.lock().unwrap();
         let mut stmt = conn
             .prepare("SELECT version, name FROM cgka_schema_migrations ORDER BY version")
@@ -160,13 +174,15 @@ mod tests {
 
     #[test]
     fn initial_schema_migration_is_recorded() {
-        let store = SqliteStorage::in_memory().unwrap();
+        let store = SqliteAccountStorage::in_memory().unwrap();
         assert_eq!(
             applied_migrations(&store),
             vec![
                 (1, "0001_initial_schema".to_string()),
                 (2, "0002_account_device_signers".to_string()),
-                (3, "0003_group_foreign_keys".to_string())
+                (3, "0003_group_foreign_keys".to_string()),
+                (4, "0004_app_timeline".to_string()),
+                (5, "0005_account_projection".to_string())
             ]
         );
     }
@@ -178,24 +194,26 @@ mod tests {
         let key = SqlCipherKey::new("migration key").unwrap();
 
         {
-            let store = SqliteStorage::open_encrypted(&path, &key).unwrap();
-            assert_eq!(applied_migrations(&store).len(), 3);
+            let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+            assert_eq!(applied_migrations(&store).len(), 5);
         }
 
-        let reopened = SqliteStorage::open_encrypted(&path, &key).unwrap();
+        let reopened = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
         assert_eq!(
             applied_migrations(&reopened),
             vec![
                 (1, "0001_initial_schema".to_string()),
                 (2, "0002_account_device_signers".to_string()),
-                (3, "0003_group_foreign_keys".to_string())
+                (3, "0003_group_foreign_keys".to_string()),
+                (4, "0004_app_timeline".to_string()),
+                (5, "0005_account_projection".to_string())
             ]
         );
     }
 
     #[test]
     fn group_owned_tables_have_cascading_foreign_keys() {
-        let store = SqliteStorage::in_memory().unwrap();
+        let store = SqliteAccountStorage::in_memory().unwrap();
         let conn = store.lock().unwrap();
 
         for (table, column) in [
@@ -215,7 +233,7 @@ mod tests {
 
     #[test]
     fn group_owned_tables_reject_orphan_rows() {
-        let store = SqliteStorage::in_memory().unwrap();
+        let store = SqliteAccountStorage::in_memory().unwrap();
         let conn = store.lock().unwrap();
         let orphan_group = vec![0x99_u8; 4];
 

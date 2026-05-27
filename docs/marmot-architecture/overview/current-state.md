@@ -1,7 +1,7 @@
 ---
 title: "Current State — Implementations & Spec"
 created: 2026-04-19
-updated: 2026-05-25
+updated: 2026-05-27
 tags: [marmot, overview, current-state, implementations]
 status: overview
 ---
@@ -77,7 +77,7 @@ This repository now has the main engine candidate:
 
 - `crates/traits` — cross-boundary value types and traits, including the account-aware `TransportAdapter` boundary.
 - `crates/cgka-engine` — OpenMLS-backed engine implementation.
-- `crates/cgka-session` — production-shaped account-device session wrapper over `Engine<SqliteStorage>`.
+- `crates/cgka-session` — production-shaped account-device session wrapper over `Engine<SqliteAccountStorage>`.
 - `crates/marmot-account` — account/session orchestration over a session and transport adapter. It activates the transport
   account, uses static transport routing for early harnesses, publishes fresh KeyPackages through an injected boundary,
   and confirms or rolls back pending session work from adapter publish reports.

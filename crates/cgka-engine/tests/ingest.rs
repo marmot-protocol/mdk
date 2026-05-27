@@ -16,7 +16,7 @@ use cgka_traits::transport::{
 use cgka_traits::types::{MemberId, MessageId};
 use std::collections::HashSet;
 use std::sync::Mutex;
-use storage_sqlite::SqliteStorage;
+use storage_sqlite::SqliteAccountStorage;
 
 mod support;
 use support::proof_signer;
@@ -180,12 +180,15 @@ fn selfremove_registry() -> FeatureRegistry {
     r
 }
 
-fn build_client(id: &[u8]) -> Engine<SqliteStorage> {
+fn build_client(id: &[u8]) -> Engine<SqliteAccountStorage> {
     build_client_with_peeler(id, Box::new(MockPeeler))
 }
 
-fn build_client_with_peeler(id: &[u8], peeler: Box<dyn TransportPeeler>) -> Engine<SqliteStorage> {
-    EngineBuilder::new(SqliteStorage::in_memory().unwrap())
+fn build_client_with_peeler(
+    id: &[u8],
+    peeler: Box<dyn TransportPeeler>,
+) -> Engine<SqliteAccountStorage> {
+    EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
         .identity(pad32(id))
         .account_identity_proof_signer(proof_signer(id))
         .feature_registry(selfremove_registry())
@@ -194,7 +197,7 @@ fn build_client_with_peeler(id: &[u8], peeler: Box<dyn TransportPeeler>) -> Engi
         .unwrap()
 }
 
-fn app_payload_for(engine: &Engine<SqliteStorage>, payload: impl AsRef<[u8]>) -> Vec<u8> {
+fn app_payload_for(engine: &Engine<SqliteAccountStorage>, payload: impl AsRef<[u8]>) -> Vec<u8> {
     let content = String::from_utf8(payload.as_ref().to_vec()).expect("test app payload is utf8");
     MarmotAppEvent::new(
         hex::encode(engine.self_id().as_slice()),

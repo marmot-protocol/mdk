@@ -1,9 +1,9 @@
-use crate::{SqliteResultExt, SqliteStorage};
+use crate::{SqliteAccountStorage, SqliteResultExt};
 use cgka_traits::storage::{ConvergencePolicyStorage, StorageResult};
 use cgka_traits::types::GroupId;
 use rusqlite::{OptionalExtension, params};
 
-impl ConvergencePolicyStorage for SqliteStorage {
+impl ConvergencePolicyStorage for SqliteAccountStorage {
     fn put_convergence_policy(&self, group_id: &GroupId, policy: &[u8]) -> StorageResult<()> {
         self.lock()?
             .execute(
@@ -29,13 +29,13 @@ impl ConvergencePolicyStorage for SqliteStorage {
 
 #[cfg(test)]
 mod tests {
-    use crate::SqliteStorage;
+    use crate::SqliteAccountStorage;
     use crate::storage::test_support::{gid, sample_group};
     use cgka_traits::storage::{ConvergencePolicyStorage, GroupStorage, MessageStorage};
 
     #[test]
     fn convergence_policy_is_group_scoped_and_snapshot_restored() {
-        let store = SqliteStorage::in_memory().unwrap();
+        let store = SqliteAccountStorage::in_memory().unwrap();
         let g1 = sample_group(gid(1), 0, 0);
         let g2 = sample_group(gid(2), 0, 0);
         store.put_group(&g1).unwrap();

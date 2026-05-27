@@ -19,7 +19,7 @@ use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };
 use cgka_traits::types::{EpochId, MemberId, MessageId};
-use storage_sqlite::{SqlCipherKey, SqliteStorage};
+use storage_sqlite::{SqlCipherKey, SqliteAccountStorage};
 
 mod support;
 use support::proof_signer;
@@ -122,7 +122,7 @@ impl TransportPeeler for MockPeeler {
     }
 }
 
-fn build_client(storage: SqliteStorage, identity: &[u8]) -> impl CgkaEngine {
+fn build_client(storage: SqliteAccountStorage, identity: &[u8]) -> impl CgkaEngine {
     EngineBuilder::new(storage)
         .identity(pad32(identity))
         .account_identity_proof_signer(proof_signer(identity))
@@ -139,8 +139,8 @@ async fn create_group_confirm_and_reopen_with_encrypted_sqlite_storage() {
     let bob_path = dir.path().join("bob.sqlite");
     let key = SqlCipherKey::new("sqlite engine smoke key").unwrap();
 
-    let alice_store = SqliteStorage::open_encrypted(&alice_path, &key).unwrap();
-    let bob_store = SqliteStorage::open_encrypted(&bob_path, &key).unwrap();
+    let alice_store = SqliteAccountStorage::open_encrypted(&alice_path, &key).unwrap();
+    let bob_store = SqliteAccountStorage::open_encrypted(&bob_path, &key).unwrap();
     let mut alice = build_client(alice_store, b"alice-sqlite");
     let mut bob = build_client(bob_store, b"bob-sqlite");
 
@@ -175,6 +175,6 @@ async fn create_group_confirm_and_reopen_with_encrypted_sqlite_storage() {
     let file_bytes = std::fs::read(&alice_path).unwrap();
     assert!(!file_bytes.starts_with(b"SQLite format 3\0"));
 
-    let reopened = SqliteStorage::open_encrypted(&alice_path, &key).unwrap();
+    let reopened = SqliteAccountStorage::open_encrypted(&alice_path, &key).unwrap();
     assert_eq!(reopened.get_group(&group_id).unwrap().epoch, EpochId(1));
 }

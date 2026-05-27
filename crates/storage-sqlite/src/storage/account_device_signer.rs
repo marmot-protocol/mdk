@@ -1,9 +1,9 @@
-use crate::{SqliteResultExt, SqliteStorage, deserialize, serialize};
+use crate::{SqliteAccountStorage, SqliteResultExt, deserialize, serialize};
 use cgka_traits::storage::{AccountDeviceSignerBinding, AccountDeviceSignerStorage, StorageResult};
 use cgka_traits::types::MemberId;
 use rusqlite::{OptionalExtension, params};
 
-impl AccountDeviceSignerStorage for SqliteStorage {
+impl AccountDeviceSignerStorage for SqliteAccountStorage {
     fn put_account_device_signer(&self, binding: &AccountDeviceSignerBinding) -> StorageResult<()> {
         self.lock()?
             .execute(
@@ -35,7 +35,7 @@ impl AccountDeviceSignerStorage for SqliteStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{SqlCipherKey, SqliteStorage};
+    use crate::{SqlCipherKey, SqliteAccountStorage};
 
     fn member_id(n: u8) -> MemberId {
         MemberId::new(vec![n; 4])
@@ -43,7 +43,7 @@ mod tests {
 
     #[test]
     fn account_device_signer_binding_roundtrips() {
-        let store = SqliteStorage::in_memory().unwrap();
+        let store = SqliteAccountStorage::in_memory().unwrap();
         let binding = AccountDeviceSignerBinding {
             marmot_identity: member_id(1),
             mls_signature_public_key: vec![1, 2, 3],
@@ -69,11 +69,11 @@ mod tests {
         };
 
         {
-            let store = SqliteStorage::open_encrypted(&path, &key).unwrap();
+            let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
             store.put_account_device_signer(&binding).unwrap();
         }
 
-        let reopened = SqliteStorage::open_encrypted(&path, &key).unwrap();
+        let reopened = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
         assert_eq!(
             reopened.account_device_signer(&member_id(1)).unwrap(),
             Some(binding)

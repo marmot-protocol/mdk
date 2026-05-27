@@ -1,11 +1,11 @@
-use crate::{SqliteResultExt, SqliteStorage, created_at_to_i64, deserialize, serialize};
+use crate::{SqliteAccountStorage, SqliteResultExt, created_at_to_i64, deserialize, serialize};
 use cgka_traits::storage::{
     OutboundIntentStorage, QueuedOutboundIntent, StorageError, StorageResult,
 };
 use cgka_traits::types::{GroupId, MessageId};
 use rusqlite::params;
 
-impl OutboundIntentStorage for SqliteStorage {
+impl OutboundIntentStorage for SqliteAccountStorage {
     fn put_queued_outbound_intent(&self, record: &QueuedOutboundIntent) -> StorageResult<()> {
         self.lock()?
             .execute(
@@ -63,13 +63,13 @@ impl OutboundIntentStorage for SqliteStorage {
 
 #[cfg(test)]
 mod tests {
-    use crate::SqliteStorage;
+    use crate::SqliteAccountStorage;
     use crate::storage::test_support::{gid, mid, sample_group, sample_queued_intent};
     use cgka_traits::storage::{GroupStorage, OutboundIntentStorage};
 
     #[test]
     fn queued_outbound_intents_are_group_scoped_and_ordered() {
-        let store = SqliteStorage::in_memory().unwrap();
+        let store = SqliteAccountStorage::in_memory().unwrap();
         store.put_group(&sample_group(gid(1), 0, 0)).unwrap();
         store.put_group(&sample_group(gid(2), 0, 0)).unwrap();
         store

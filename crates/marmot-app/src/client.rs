@@ -485,10 +485,14 @@ impl AppClient {
         self.remember_published_reports(&effects);
         let group_id_hex = hex::encode(group_id.as_slice());
         let app_event_id = event.id.clone();
+        let source_message_id_hex = effects
+            .reports
+            .first()
+            .map(|report| hex::encode(report.message_id.as_slice()));
         if !notifications::is_push_gossip_kind(event.kind) {
-            let projection = self.app.account_projection(&self.state.label)?;
-            projection.record_message(&AppMessageProjection {
+            let message_projection = AppMessageProjection {
                 message_id_hex: app_event_id.clone(),
+                source_message_id_hex,
                 direction: "sent".to_owned(),
                 group_id_hex: group_id_hex.clone(),
                 sender: sender.clone(),
@@ -496,7 +500,9 @@ impl AppClient {
                 kind: event.kind,
                 tags: event.tags.clone(),
                 recorded_at: None,
-            })?;
+            };
+            self.app
+                .record_account_app_event(&self.state.label, &message_projection)?;
             self.prune_plaintext_retention_for_group(group_id)?;
         }
         self.app.save_state(&self.state)?;
@@ -699,13 +705,13 @@ impl AppClient {
         target_message_id: &str,
     ) -> Result<String, AppError> {
         let group_id_hex = hex::encode(group_id.as_slice());
-        let messages =
-            self.app
-                .account_projection(&self.state.label)?
-                .messages(AppMessageQuery {
-                    group_id_hex: Some(group_id_hex),
-                    limit: None,
-                })?;
+        let messages = self.app.messages_with_query(
+            &self.state.label,
+            AppMessageQuery {
+                group_id_hex: Some(group_id_hex),
+                limit: None,
+            },
+        )?;
         messages
             .into_iter()
             .rev()
@@ -1084,19 +1090,32 @@ impl AppClient {
                     continue;
                 }
                 self.app.remember_directory_message_sender(&message)?;
+                let message_projection = AppMessageProjection {
+                    message_id_hex: message.message_id_hex.clone(),
+                    source_message_id_hex: Some(message.source_message_id_hex.clone()),
+                    direction: "received".to_owned(),
+                    group_id_hex: hex::encode(message.group_id.as_slice()),
+                    sender: message.sender.clone(),
+                    plaintext: message.plaintext.clone(),
+                    kind: message.kind,
+                    tags: message.tags.clone(),
+                    recorded_at: Some(source_recorded_at),
+                };
                 self.app
-                    .account_projection(&self.state.label)?
-                    .record_message(&AppMessageProjection {
-                        message_id_hex: message.message_id_hex.clone(),
-                        direction: "received".to_owned(),
-                        group_id_hex: hex::encode(message.group_id.as_slice()),
-                        sender: message.sender.clone(),
-                        plaintext: message.plaintext.clone(),
-                        kind: message.kind,
-                        tags: message.tags.clone(),
-                        recorded_at: Some(source_recorded_at),
-                    })?;
+                    .record_account_app_event(&self.state.label, &message_projection)?;
                 self.prune_plaintext_retention_for_group(&message.group_id)?;
+            }
+            if let cgka_traits::engine::GroupEvent::AppMessageInvalidated {
+                message_id,
+                reason,
+                ..
+            } = event
+            {
+                self.app.invalidate_timeline_source_message(
+                    &self.state.label,
+                    &hex::encode(message_id.as_slice()),
+                    &format!("{reason:?}"),
+                )?;
             }
             if self.state.groups.len() != before {
                 self.refresh_group_routes()?;
@@ -1212,9 +1231,11 @@ impl AppClient {
             return Ok(());
         }
         let cutoff = unix_now_seconds().saturating_sub(retention.disappearing_message_secs);
-        self.app
-            .account_projection(&self.state.label)?
-            .prune_group_messages_before(&hex::encode(group_id.as_slice()), cutoff)?;
+        self.app.prune_account_app_events_before(
+            &self.state.label,
+            &hex::encode(group_id.as_slice()),
+            cutoff,
+        )?;
         Ok(())
     }
 

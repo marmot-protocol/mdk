@@ -3313,6 +3313,21 @@ fn messages_plural_send_and_list_are_the_canonical_message_surface() {
     );
     assert_message_plaintexts(&listed, &["plural surface"]);
 
+    let timeline_listed = run_json(
+        home.path(),
+        &[
+            "--account",
+            &bob,
+            "messages",
+            "timeline",
+            "list",
+            group_id,
+            "--limit",
+            "20",
+        ],
+    );
+    assert_message_plaintexts(&timeline_listed, &["plural surface"]);
+
     run_json(
         home.path(),
         &[
@@ -3344,6 +3359,21 @@ fn messages_plural_send_and_list_are_the_canonical_message_surface() {
     );
     assert_message_plaintexts(&search, &["another searchable line"]);
     assert_no_message_plaintext(&search, "plural surface");
+
+    let timeline_search = run_json(
+        home.path(),
+        &[
+            "--account",
+            &bob,
+            "messages",
+            "timeline",
+            "search",
+            "searchable",
+            group_id,
+        ],
+    );
+    assert_message_plaintexts(&timeline_search, &["another searchable line"]);
+    assert_no_message_plaintext(&timeline_search, "plural surface");
 
     let search_all = run_json(
         home.path(),

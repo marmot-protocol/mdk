@@ -4,7 +4,7 @@ Agent-facing map for the production-shaped account-device session crate.
 
 ## Scope
 
-This crate wires `Engine<SqliteStorage>` into an app-facing session lifecycle. It does not own a transport adapter,
+This crate wires `Engine<SqliteAccountStorage>` into an app-facing session lifecycle. It does not own a transport adapter,
 account key derivation, relay sync, or UI projection.
 
 ## Rules

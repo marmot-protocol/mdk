@@ -4,7 +4,7 @@ Agent-facing map for the SQLCipher-backed storage backend.
 
 ## Scope
 
-`SqliteStorage` implements `cgka_traits::StorageProvider` with Marmot metadata and custom OpenMLS storage in one
+`SqliteAccountStorage` implements `cgka_traits::StorageProvider` with Marmot metadata and custom OpenMLS storage in one
 encrypted SQLite database. One database file belongs to one Marmot account-device identity.
 
 ## Key files

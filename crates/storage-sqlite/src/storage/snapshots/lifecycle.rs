@@ -1,9 +1,9 @@
-use crate::{SqliteResultExt, SqliteStorage};
+use crate::{SqliteAccountStorage, SqliteResultExt};
 use cgka_traits::storage::{StorageError, StorageResult};
 use cgka_traits::types::GroupId;
 use rusqlite::params;
 
-pub(super) fn list(store: &SqliteStorage, group_id: &GroupId) -> StorageResult<Vec<String>> {
+pub(super) fn list(store: &SqliteAccountStorage, group_id: &GroupId) -> StorageResult<Vec<String>> {
     let conn = store.lock()?;
     let mut stmt = conn
         .prepare(
@@ -18,7 +18,11 @@ pub(super) fn list(store: &SqliteStorage, group_id: &GroupId) -> StorageResult<V
         .storage()
 }
 
-pub(super) fn release(store: &SqliteStorage, group_id: &GroupId, name: &str) -> StorageResult<()> {
+pub(super) fn release(
+    store: &SqliteAccountStorage,
+    group_id: &GroupId,
+    name: &str,
+) -> StorageResult<()> {
     let changed = store
         .lock()?
         .execute(

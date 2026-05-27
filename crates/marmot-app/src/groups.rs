@@ -443,7 +443,7 @@ pub(crate) fn decode_received_event(
     sender_hex: &str,
     sender_display_name: Option<String>,
     group_id: &GroupId,
-    _source_message_id_hex: &str,
+    source_message_id_hex: &str,
 ) -> Option<ReceivedMessage> {
     let event = match MarmotInnerEvent::decode(payload) {
         Ok(event) => event,
@@ -480,6 +480,7 @@ pub(crate) fn decode_received_event(
     }
     Some(ReceivedMessage {
         message_id_hex: event.id,
+        source_message_id_hex: source_message_id_hex.to_owned(),
         sender: sender_hex.to_owned(),
         sender_display_name,
         group_id: group_id.clone(),

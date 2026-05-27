@@ -7,7 +7,7 @@
 //!
 //! - [`bus`] - in-memory [`bus::TransportBus`] with seeded scheduler,
 //!   partition support, broadcast / addressed delivery for welcomes.
-//! - [`client`] - [`client::HarnessClient`] wrapping `Engine<SqliteStorage>`
+//! - [`client`] - [`client::HarnessClient`] wrapping `Engine<SqliteAccountStorage>`
 //!   plus the real Nostr transport peeler over the in-memory bus.
 //! - [`canonicalization`] - executable model of the CGKA canonicalization
 //!   contract above the branch selector, re-exported from `cgka-engine`.

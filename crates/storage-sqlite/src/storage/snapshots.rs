@@ -3,29 +3,41 @@ mod lifecycle;
 mod restore;
 mod rows;
 
-use crate::SqliteStorage;
+use crate::SqliteAccountStorage;
 use cgka_traits::storage::StorageResult;
 use cgka_traits::types::GroupId;
 
-pub(super) fn create(store: &SqliteStorage, group_id: &GroupId, name: &str) -> StorageResult<()> {
+pub(super) fn create(
+    store: &SqliteAccountStorage,
+    group_id: &GroupId,
+    name: &str,
+) -> StorageResult<()> {
     capture::create(store, group_id, name)
 }
 
-pub(super) fn list(store: &SqliteStorage, group_id: &GroupId) -> StorageResult<Vec<String>> {
+pub(super) fn list(store: &SqliteAccountStorage, group_id: &GroupId) -> StorageResult<Vec<String>> {
     lifecycle::list(store, group_id)
 }
 
-pub(super) fn rollback(store: &SqliteStorage, group_id: &GroupId, name: &str) -> StorageResult<()> {
+pub(super) fn rollback(
+    store: &SqliteAccountStorage,
+    group_id: &GroupId,
+    name: &str,
+) -> StorageResult<()> {
     restore::rollback(store, group_id, name)
 }
 
-pub(super) fn release(store: &SqliteStorage, group_id: &GroupId, name: &str) -> StorageResult<()> {
+pub(super) fn release(
+    store: &SqliteAccountStorage,
+    group_id: &GroupId,
+    name: &str,
+) -> StorageResult<()> {
     lifecycle::release(store, group_id, name)
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::SqliteStorage;
+    use crate::SqliteAccountStorage;
     use crate::storage::test_support::{
         TestGroupState, gid, mid, sample_group, sample_message, sample_queued_intent,
     };
@@ -39,7 +51,7 @@ mod tests {
 
     #[test]
     fn snapshot_rollback_restores_group_messages_queue_caps_and_openmls_group_state() {
-        let store = SqliteStorage::in_memory().unwrap();
+        let store = SqliteAccountStorage::in_memory().unwrap();
         let g0 = sample_group(gid(1), 0, 1);
         store.put_group(&g0).unwrap();
         store
@@ -95,7 +107,7 @@ mod tests {
 
     #[test]
     fn snapshot_listing_and_release_are_group_scoped() {
-        let store = SqliteStorage::in_memory().unwrap();
+        let store = SqliteAccountStorage::in_memory().unwrap();
         let g1 = sample_group(gid(1), 0, 0);
         let g2 = sample_group(gid(2), 0, 0);
         store.put_group(&g1).unwrap();

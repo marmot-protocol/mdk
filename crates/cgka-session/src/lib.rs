@@ -25,7 +25,7 @@ use cgka_traits::storage::StorageError;
 use cgka_traits::transport::TransportMessage;
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
 use marmot_forensics::{ForensicsEngineGroupState, ForensicsExportOptions};
-use storage_sqlite::{SqlCipherKey, SqliteStorage, SqliteStorageOptions};
+use storage_sqlite::{SqlCipherKey, SqliteAccountStorage, SqliteStorageOptions};
 
 const TRACE_TARGET: &str = "cgka_session::session";
 
@@ -104,7 +104,7 @@ impl SessionConfig {
 }
 
 pub struct AccountDeviceSession {
-    engine: Engine<SqliteStorage>,
+    engine: Engine<SqliteAccountStorage>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -168,7 +168,7 @@ impl AccountDeviceSession {
             method = "open",
             "opening account device session"
         );
-        let storage = SqliteStorage::open_encrypted_with_options(
+        let storage = SqliteAccountStorage::open_encrypted_with_options(
             config.database_path,
             &config.database_key,
             config.storage_options,

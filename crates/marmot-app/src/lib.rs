@@ -56,7 +56,12 @@ use rand::rngs::OsRng;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use storage_sqlite::SqlCipherKey;
+use storage_sqlite::{
+    AccountGroupPushToken, AccountNotificationSettings, AccountPushRegistration,
+    AccountStoredPushRegistration, PublicDirectoryUserRecord, SqlCipherKey, SqliteAccountStorage,
+    SqliteSharedStorage, StoredAccountGroup, StoredAccountGroupComponent, StoredAccountState,
+    StoredAppEvent, StoredAppMessageQuery, StoredAppMessageRecord,
+};
 use transport_nostr_adapter::{
     KIND_MARMOT_INBOX_RELAY_LIST, KIND_MARMOT_KEY_PACKAGE, KIND_MARMOT_KEY_PACKAGE_RELAY_LIST,
     KIND_NIP65_RELAY_LIST, NostrAccountRelayListKind, NostrAccountRelayListPublication,
@@ -87,7 +92,7 @@ pub use runtime::{
     RuntimeChatsSubscription, RuntimeEventsSubscription, RuntimeGroupEvent,
     RuntimeGroupStateSubscription, RuntimeMessageReceived, RuntimeMessageUpdate,
     RuntimeMessagesSubscription, RuntimeNotificationsSubscription, RuntimeSharedServices,
-    StreamStartView,
+    RuntimeTimelineMessageUpdate, RuntimeTimelineMessagesSubscription, StreamStartView,
 };
 
 pub use agent_streams::{
@@ -124,14 +129,20 @@ pub use notifications::{
     encrypted_mip05_token, parse_provider_token, push_token_fingerprint,
 };
 pub use relay_plane::{MarmotRelayPlane, MarmotRelayPlaneAccountAdapter, RelayPlaneHealth};
+pub use storage_sqlite::{
+    TimelineMessageQuery, TimelineMessageRecord, TimelinePage, TimelinePagination,
+    TimelineReactionSummary, TimelineUserReaction,
+};
 
 use directory::{DirectoryCache, DirectorySyncHandle, DirectorySyncPlan};
 use ids::{normalize_account_ids, npub_for_account_id_lossy, parse_account_id_hex};
-use projection::AccountProjectionDb;
+use projection::LegacyAccountProjectionDb;
 use relay_plane::{DirectoryEventQuery, DirectoryRelayEventRecord as RelayEventRecord};
 
-const ACCOUNT_APP_DB_FILE: &str = "app.sqlite3";
+const LEGACY_ACCOUNT_APP_DB_FILE: &str = "app.sqlite3";
+const LEGACY_ACCOUNT_PROJECTION_IMPORT_MARKER: &str = "legacy-account-projection-v1";
 const APP_CACHE_DB_FILE: &str = "app-cache.sqlite3";
+const SHARED_DB_FILE: &str = "shared.sqlite3";
 const SESSION_DB_FILE: &str = "session.sqlite";
 const SQLCIPHER_SALT_SUFFIX: &str = ".salt";
 const SQLCIPHER_SALT_LEN: usize = 32;
@@ -312,6 +323,7 @@ pub struct SyncSummary {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReceivedMessage {
     pub message_id_hex: String,
+    pub source_message_id_hex: String,
     pub sender: String,
     pub sender_display_name: Option<String>,
     pub group_id: GroupId,
@@ -535,6 +547,7 @@ struct AccountState {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct AppMessageProjection {
     message_id_hex: String,
+    source_message_id_hex: Option<String>,
     direction: String,
     group_id_hex: String,
     sender: String,
@@ -542,6 +555,273 @@ struct AppMessageProjection {
     kind: u64,
     tags: Vec<Vec<String>>,
     recorded_at: Option<u64>,
+}
+
+fn stored_state_from_account_state(state: &AccountState) -> StoredAccountState {
+    StoredAccountState {
+        label: state.label.clone(),
+        seen_events: state.seen_events.clone(),
+        last_transport_timestamp: state.last_transport_timestamp,
+        groups: state
+            .groups
+            .iter()
+            .map(stored_group_from_app_group)
+            .collect(),
+    }
+}
+
+fn account_state_from_stored(stored: StoredAccountState) -> Result<AccountState, AppError> {
+    Ok(AccountState {
+        label: stored.label,
+        seen_events: stored.seen_events,
+        last_transport_timestamp: stored.last_transport_timestamp,
+        groups: stored
+            .groups
+            .into_iter()
+            .map(app_group_from_stored_group)
+            .collect::<Result<Vec<_>, _>>()?,
+    })
+}
+
+fn stored_group_from_app_group(group: &AppGroupRecord) -> StoredAccountGroup {
+    StoredAccountGroup {
+        group_id_hex: group.group_id_hex.clone(),
+        endpoint: group.endpoint.clone(),
+        profile_name: group.profile.name.clone(),
+        profile_description: group.profile.description.clone(),
+        image_hash_hex: group.image.image_hash_hex.clone(),
+        image_key_hex: group.image.image_key_hex.clone(),
+        image_nonce_hex: group.image.image_nonce_hex.clone(),
+        image_upload_key_hex: group.image.image_upload_key_hex.clone(),
+        image_media_type: group.image.media_type.clone(),
+        admin_keys_hex: group.admin_policy.admins.join(","),
+        archived: group.archived,
+        pending_confirmation: group.pending_confirmation,
+        welcomer_account_id_hex: group.welcomer_account_id_hex.clone(),
+        via_welcome_message_id_hex: group.via_welcome_message_id_hex.clone(),
+        components: stored_components_from_app_group(group),
+    }
+}
+
+fn stored_components_from_app_group(group: &AppGroupRecord) -> Vec<StoredAccountGroupComponent> {
+    let mut components = vec![
+        StoredAccountGroupComponent {
+            component_id: group.profile.component_id,
+            component_name: group.profile.component.clone(),
+            component_data_hex: group.profile.data_hex.clone(),
+        },
+        StoredAccountGroupComponent {
+            component_id: group.image.component_id,
+            component_name: group.image.component.clone(),
+            component_data_hex: group.image.data_hex.clone(),
+        },
+        StoredAccountGroupComponent {
+            component_id: group.admin_policy.component_id,
+            component_name: group.admin_policy.component.clone(),
+            component_data_hex: group.admin_policy.data_hex.clone(),
+        },
+        StoredAccountGroupComponent {
+            component_id: group.message_retention.component_id,
+            component_name: group.message_retention.component.clone(),
+            component_data_hex: group.message_retention.data_hex.clone(),
+        },
+        StoredAccountGroupComponent {
+            component_id: group.nostr_routing.component_id,
+            component_name: group.nostr_routing.component.clone(),
+            component_data_hex: group.nostr_routing.data_hex.clone(),
+        },
+    ];
+    if group.agent_text_stream.required {
+        components.push(StoredAccountGroupComponent {
+            component_id: group.agent_text_stream.component_id,
+            component_name: group.agent_text_stream.component.clone(),
+            component_data_hex: group.agent_text_stream.data_hex.clone(),
+        });
+    }
+    components
+}
+
+fn app_group_from_stored_group(stored: StoredAccountGroup) -> Result<AppGroupRecord, AppError> {
+    let routing_bytes = hex::decode(
+        account_component_data_hex(&stored.components, NOSTR_ROUTING_COMPONENT_ID).ok_or_else(
+            || AppError::InvalidNostrRouting("stored group is missing routing".into()),
+        )?,
+    )?;
+    let retention =
+        account_component_data_hex(&stored.components, GROUP_MESSAGE_RETENTION_COMPONENT_ID)
+            .map(hex::decode)
+            .transpose()?
+            .map(|bytes| AppGroupMessageRetentionComponent::from_bytes(&bytes))
+            .unwrap_or_else(AppGroupMessageRetentionComponent::disabled);
+    let mut group = AppGroupRecord::new(
+        stored.group_id_hex,
+        AppGroupNostrRoutingComponent::from_bytes(&routing_bytes)?,
+        stored.profile_name,
+        stored.profile_description,
+        AppGroupImageInput {
+            image_hash_hex: stored.image_hash_hex,
+            image_key_hex: stored.image_key_hex,
+            image_nonce_hex: stored.image_nonce_hex,
+            image_upload_key_hex: stored.image_upload_key_hex,
+            media_type: stored.image_media_type,
+        },
+        AppGroupAdminPolicyComponent::new(parse_admin_keys_hex(&stored.admin_keys_hex)),
+        retention,
+    );
+    if let Some(agent_hex) =
+        account_component_data_hex(&stored.components, AGENT_TEXT_STREAM_COMPONENT_ID)
+        && !agent_hex.is_empty()
+    {
+        let agent_bytes = hex::decode(agent_hex)?;
+        group.agent_text_stream = AppAgentTextStreamComponent::from_bytes(&agent_bytes);
+    }
+    group.archived = stored.archived;
+    group.pending_confirmation = stored.pending_confirmation;
+    group.welcomer_account_id_hex = stored.welcomer_account_id_hex;
+    group.via_welcome_message_id_hex = stored.via_welcome_message_id_hex;
+    Ok(group)
+}
+
+fn account_component_data_hex(
+    components: &[StoredAccountGroupComponent],
+    component_id: u16,
+) -> Option<&str> {
+    components
+        .iter()
+        .find(|component| component.component_id == component_id)
+        .map(|component| component.component_data_hex.as_str())
+}
+
+fn parse_admin_keys_hex(value: &str) -> Vec<[u8; 32]> {
+    value
+        .split(',')
+        .filter_map(|key| {
+            let bytes = hex::decode(key).ok()?;
+            let array: [u8; 32] = bytes.try_into().ok()?;
+            Some(array)
+        })
+        .collect()
+}
+
+fn app_message_record_from_stored(record: StoredAppMessageRecord) -> AppMessageRecord {
+    AppMessageRecord {
+        message_id_hex: record.message_id_hex,
+        direction: record.direction,
+        group_id_hex: record.group_id_hex,
+        sender: record.sender,
+        plaintext: record.plaintext,
+        kind: record.kind,
+        tags: record.tags,
+        recorded_at: record.recorded_at,
+        received_at: record.received_at,
+    }
+}
+
+fn stored_app_event_from_projection(
+    message: &AppMessageProjection,
+    received_at: u64,
+) -> StoredAppEvent {
+    StoredAppEvent {
+        group_id_hex: message.group_id_hex.clone(),
+        message_id_hex: message.message_id_hex.clone(),
+        source_message_id_hex: message.source_message_id_hex.clone(),
+        direction: message.direction.clone(),
+        sender: message.sender.clone(),
+        plaintext: message.plaintext.clone(),
+        kind: message.kind,
+        tags: message.tags.clone(),
+        recorded_at: message.recorded_at.unwrap_or(received_at),
+        received_at,
+    }
+}
+
+fn stored_app_event_from_message_record(record: &AppMessageRecord) -> StoredAppEvent {
+    StoredAppEvent {
+        group_id_hex: record.group_id_hex.clone(),
+        message_id_hex: record.message_id_hex.clone(),
+        source_message_id_hex: None,
+        direction: record.direction.clone(),
+        sender: record.sender.clone(),
+        plaintext: record.plaintext.clone(),
+        kind: record.kind,
+        tags: record.tags.clone(),
+        recorded_at: record.recorded_at,
+        received_at: record.received_at,
+    }
+}
+
+fn notification_settings_from_account(
+    settings: AccountNotificationSettings,
+) -> NotificationSettings {
+    NotificationSettings {
+        account_ref: settings.account_label,
+        account_id_hex: settings.account_id_hex,
+        local_notifications_enabled: settings.local_notifications_enabled,
+        native_push_enabled: settings.native_push_enabled,
+    }
+}
+
+fn account_push_registration_from_app(registration: PushRegistration) -> AccountPushRegistration {
+    AccountPushRegistration {
+        account_label: registration.account_ref,
+        account_id_hex: registration.account_id_hex,
+        platform: registration.platform.platform_byte(),
+        token_fingerprint: registration.token_fingerprint,
+        server_pubkey_hex: registration.server_pubkey_hex,
+        relay_hint: registration.relay_hint,
+        created_at_ms: registration.created_at_ms,
+        updated_at_ms: registration.updated_at_ms,
+        last_shared_at_ms: registration.last_shared_at_ms,
+    }
+}
+
+fn stored_push_registration_from_account(
+    stored: AccountStoredPushRegistration,
+) -> Result<notifications::StoredPushRegistration, AppError> {
+    Ok(notifications::StoredPushRegistration {
+        registration: PushRegistration {
+            account_ref: stored.registration.account_label,
+            account_id_hex: stored.registration.account_id_hex,
+            platform: PushPlatform::from_platform_byte(stored.registration.platform)?,
+            token_fingerprint: stored.registration.token_fingerprint,
+            server_pubkey_hex: stored.registration.server_pubkey_hex,
+            relay_hint: stored.registration.relay_hint,
+            created_at_ms: stored.registration.created_at_ms,
+            updated_at_ms: stored.registration.updated_at_ms,
+            last_shared_at_ms: stored.registration.last_shared_at_ms,
+        },
+        token_bytes: stored.token_bytes,
+    })
+}
+
+fn account_group_push_token_from_app(token: &GroupPushTokenRecord) -> AccountGroupPushToken {
+    AccountGroupPushToken {
+        group_id_hex: token.group_id_hex.clone(),
+        member_id_hex: token.member_id_hex.clone(),
+        leaf_index: token.leaf_index,
+        platform: token.platform.platform_byte(),
+        token_fingerprint: token.token_fingerprint.clone(),
+        server_pubkey_hex: token.server_pubkey_hex.clone(),
+        relay_hint: token.relay_hint.clone(),
+        encrypted_token: token.encrypted_token.clone(),
+        updated_at_ms: token.updated_at_ms,
+    }
+}
+
+fn group_push_token_from_account(
+    token: AccountGroupPushToken,
+) -> Result<GroupPushTokenRecord, AppError> {
+    Ok(GroupPushTokenRecord {
+        group_id_hex: token.group_id_hex,
+        member_id_hex: token.member_id_hex,
+        leaf_index: token.leaf_index,
+        platform: PushPlatform::from_platform_byte(token.platform)?,
+        token_fingerprint: token.token_fingerprint,
+        server_pubkey_hex: token.server_pubkey_hex,
+        relay_hint: token.relay_hint,
+        encrypted_token: token.encrypted_token,
+        updated_at_ms: token.updated_at_ms,
+    })
 }
 
 #[derive(Clone)]
@@ -704,7 +984,7 @@ impl MarmotApp {
         let account = self.account_home().account(label)?;
         self.ensure_account_state(label)?;
         let state = self.load_state(label)?;
-        let message_count = self.account_projection(label)?.message_count()?;
+        let message_count = self.account_storage(label)?.app_message_count()?;
         Ok(AppStatus {
             account: state.label,
             account_id_hex: account.account_id_hex.clone(),
@@ -1033,7 +1313,15 @@ impl MarmotApp {
     ) -> Result<Option<UserDirectoryRecord>, AppError> {
         let account_id_hex = parse_account_id_hex(account_id_hex)?;
         let caches = self.directory_caches()?;
-        Self::directory_entry_from_caches(&caches, &account_id_hex)
+        let cached_entry = Self::directory_entry_from_caches(&caches, &account_id_hex)?
+            .map(|entry| self.hydrate_directory_record(entry))
+            .transpose()?;
+        let shared_entry = self
+            .shared_storage()?
+            .public_directory_user(&account_id_hex)?
+            .map(|record| self.hydrate_public_directory_record(record))
+            .transpose()?;
+        Ok(select_newer_directory_entry(cached_entry, shared_entry))
     }
 
     pub async fn refresh_user_directory_for_account_id(
@@ -1187,7 +1475,24 @@ impl MarmotApp {
         query: AppMessageQuery,
     ) -> Result<Vec<AppMessageRecord>, AppError> {
         self.ensure_account_state(label)?;
-        self.account_projection(label)?.messages(query)
+        Ok(self
+            .account_storage(label)?
+            .app_messages(StoredAppMessageQuery {
+                group_id_hex: query.group_id_hex,
+                limit: query.limit,
+            })?
+            .into_iter()
+            .map(app_message_record_from_stored)
+            .collect())
+    }
+
+    pub fn timeline_messages_with_query(
+        &self,
+        label: &str,
+        query: TimelineMessageQuery,
+    ) -> Result<TimelinePage, AppError> {
+        self.ensure_account_state(label)?;
+        Ok(self.account_storage(label)?.message_timeline(query)?)
     }
 
     pub fn notification_settings(
@@ -1196,8 +1501,10 @@ impl MarmotApp {
     ) -> Result<NotificationSettings, AppError> {
         let account = self.account_home().account(account_ref)?;
         self.ensure_account_state(&account.label)?;
-        self.account_projection(&account.label)?
-            .notification_settings(&account.label, &account.account_id_hex)
+        Ok(notification_settings_from_account(
+            self.account_storage(&account.label)?
+                .notification_settings(&account.label, &account.account_id_hex)?,
+        ))
     }
 
     pub fn set_local_notifications_enabled(
@@ -1207,8 +1514,14 @@ impl MarmotApp {
     ) -> Result<NotificationSettings, AppError> {
         let account = self.account_home().account(account_ref)?;
         self.ensure_account_state(&account.label)?;
-        self.account_projection(&account.label)?
-            .set_local_notifications_enabled(&account.label, &account.account_id_hex, enabled)
+        Ok(notification_settings_from_account(
+            self.account_storage(&account.label)?
+                .set_local_notifications_enabled(
+                    &account.label,
+                    &account.account_id_hex,
+                    enabled,
+                )?,
+        ))
     }
 
     pub fn set_native_push_enabled(
@@ -1218,11 +1531,14 @@ impl MarmotApp {
     ) -> Result<NotificationSettings, AppError> {
         let account = self.account_home().account(account_ref)?;
         self.ensure_account_state(&account.label)?;
-        let projection = self.account_projection(&account.label)?;
-        let settings =
-            projection.set_native_push_enabled(&account.label, &account.account_id_hex, enabled)?;
+        let storage = self.account_storage(&account.label)?;
+        let settings = notification_settings_from_account(storage.set_native_push_enabled(
+            &account.label,
+            &account.account_id_hex,
+            enabled,
+        )?);
         if !enabled {
-            let _ = projection.clear_push_registration(&account.label)?;
+            let _ = storage.clear_push_registration(&account.label)?;
         }
         Ok(settings)
     }
@@ -1234,8 +1550,10 @@ impl MarmotApp {
         let account = self.account_home().account(account_ref)?;
         self.ensure_account_state(&account.label)?;
         Ok(self
-            .account_projection(&account.label)?
+            .account_storage(&account.label)?
             .push_registration(&account.label)?
+            .map(stored_push_registration_from_account)
+            .transpose()?
             .map(|stored| stored.registration))
     }
 
@@ -1245,8 +1563,10 @@ impl MarmotApp {
     ) -> Result<Option<notifications::StoredPushRegistration>, AppError> {
         let account = self.account_home().account(account_ref)?;
         self.ensure_account_state(&account.label)?;
-        self.account_projection(&account.label)?
-            .push_registration(&account.label)
+        self.account_storage(&account.label)?
+            .push_registration(&account.label)?
+            .map(stored_push_registration_from_account)
+            .transpose()
     }
 
     pub fn upsert_push_registration(
@@ -1277,16 +1597,19 @@ impl MarmotApp {
             updated_at_ms: now,
             last_shared_at_ms: None,
         };
-        Ok(self
-            .account_projection(&account.label)?
-            .upsert_push_registration(registration, token_bytes)?
-            .registration)
+        let stored = self
+            .account_storage(&account.label)?
+            .upsert_push_registration(
+                account_push_registration_from_app(registration),
+                token_bytes,
+            )?;
+        Ok(stored_push_registration_from_account(stored)?.registration)
     }
 
     pub fn clear_push_registration(&self, account_ref: &str) -> Result<(), AppError> {
         let account = self.account_home().account(account_ref)?;
         self.ensure_account_state(&account.label)?;
-        self.account_projection(&account.label)?
+        self.account_storage(&account.label)?
             .clear_push_registration(&account.label)?;
         Ok(())
     }
@@ -1298,8 +1621,9 @@ impl MarmotApp {
     ) -> Result<(), AppError> {
         let account = self.account_home().account(account_ref)?;
         self.ensure_account_state(&account.label)?;
-        self.account_projection(&account.label)?
-            .mark_push_registration_shared(&account.label, shared_at_ms)
+        self.account_storage(&account.label)?
+            .mark_push_registration_shared(&account.label, shared_at_ms)?;
+        Ok(())
     }
 
     pub(crate) fn upsert_group_push_token(
@@ -1309,8 +1633,9 @@ impl MarmotApp {
     ) -> Result<(), AppError> {
         let account = self.account_home().account(account_ref)?;
         self.ensure_account_state(&account.label)?;
-        self.account_projection(&account.label)?
-            .upsert_group_push_token(token)
+        self.account_storage(&account.label)?
+            .upsert_group_push_token(&account_group_push_token_from_app(token))?;
+        Ok(())
     }
 
     pub(crate) fn group_push_tokens(
@@ -1320,8 +1645,11 @@ impl MarmotApp {
     ) -> Result<Vec<GroupPushTokenRecord>, AppError> {
         let account = self.account_home().account(account_ref)?;
         self.ensure_account_state(&account.label)?;
-        self.account_projection(&account.label)?
-            .group_push_tokens(group_id_hex)
+        self.account_storage(&account.label)?
+            .group_push_tokens(group_id_hex)?
+            .into_iter()
+            .map(group_push_token_from_account)
+            .collect()
     }
 
     pub(crate) fn ingest_push_gossip_message(
@@ -1332,19 +1660,19 @@ impl MarmotApp {
         let account = self.account_home().account(account_ref)?;
         self.ensure_account_state(&account.label)?;
         let group_id_hex = hex::encode(message.group_id.as_slice());
-        let projection = self.account_projection(&account.label)?;
+        let storage = self.account_storage(&account.label)?;
         match notifications::parse_push_gossip(message.kind, &group_id_hex, &message.plaintext)? {
             notifications::PushGossipAction::Upsert(records) => {
                 for record in records {
-                    projection.upsert_group_push_token(&record)?;
+                    storage.upsert_group_push_token(&account_group_push_token_from_app(&record))?;
                 }
             }
             notifications::PushGossipAction::Remove(removals) => {
                 for removal in removals {
-                    projection.remove_group_push_token(
+                    storage.remove_group_push_token(
                         &group_id_hex,
                         &removal.member_id_hex,
-                        removal.platform,
+                        removal.platform.platform_byte(),
                         &removal.token_fingerprint,
                         &removal.server_pubkey_hex,
                     )?;
@@ -1362,8 +1690,9 @@ impl MarmotApp {
     ) -> Result<(), AppError> {
         let account = self.account_home().account(account_ref)?;
         self.ensure_account_state(&account.label)?;
-        self.account_projection(&account.label)?
-            .remove_group_push_tokens_for_member(group_id_hex, member_id_hex)
+        self.account_storage(&account.label)?
+            .remove_group_push_tokens_for_member(group_id_hex, member_id_hex)?;
+        Ok(())
     }
 
     pub(crate) fn remove_stale_group_push_tokens(
@@ -1374,8 +1703,9 @@ impl MarmotApp {
     ) -> Result<usize, AppError> {
         let account = self.account_home().account(account_ref)?;
         self.ensure_account_state(&account.label)?;
-        self.account_projection(&account.label)?
-            .remove_stale_group_push_tokens(group_id_hex, active_members)
+        Ok(self
+            .account_storage(&account.label)?
+            .remove_stale_group_push_tokens(group_id_hex, active_members)?)
     }
 
     pub fn group_push_debug_info(
@@ -1386,10 +1716,19 @@ impl MarmotApp {
     ) -> Result<GroupPushDebugInfo, AppError> {
         let account = self.account_home().account(account_ref)?;
         self.ensure_account_state(&account.label)?;
-        let projection = self.account_projection(&account.label)?;
-        let settings = projection.notification_settings(&account.label, &account.account_id_hex)?;
-        let registration = projection.push_registration(&account.label)?;
-        let tokens = projection.group_push_tokens(group_id_hex)?;
+        let storage = self.account_storage(&account.label)?;
+        let settings = notification_settings_from_account(
+            storage.notification_settings(&account.label, &account.account_id_hex)?,
+        );
+        let registration = storage
+            .push_registration(&account.label)?
+            .map(stored_push_registration_from_account)
+            .transpose()?;
+        let tokens = storage
+            .group_push_tokens(group_id_hex)?
+            .into_iter()
+            .map(group_push_token_from_account)
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(notifications::group_debug_info(
             settings,
             registration,
@@ -1938,10 +2277,15 @@ impl MarmotApp {
         let mut entries_by_id = BTreeMap::new();
         for cache in self.directory_caches()? {
             for entry in cache.entries()? {
-                entries_by_id
-                    .entry(entry.account_id_hex.clone())
-                    .or_insert(entry);
+                upsert_newer_directory_entry(
+                    &mut entries_by_id,
+                    self.hydrate_directory_record(entry)?,
+                );
             }
+        }
+        for record in self.shared_storage()?.public_directory_users()? {
+            let entry = self.hydrate_public_directory_record(record)?;
+            upsert_newer_directory_entry(&mut entries_by_id, entry);
         }
         Ok(entries_by_id.into_values().collect())
     }
@@ -2074,17 +2418,26 @@ impl MarmotApp {
 
     fn load_state(&self, label: &str) -> Result<AccountState, AppError> {
         self.ensure_account_state(label)?;
-        self.account_projection(label)?.load_state(label)
+        account_state_from_stored(
+            self.account_storage(label)?
+                .load_account_projection_state(label, MAX_SEEN_EVENT_IDS)?,
+        )
     }
 
     fn save_state(&self, state: &AccountState) -> Result<(), AppError> {
-        let mut projection = self.account_projection(&state.label)?;
-        projection.save_state(state)
+        self.account_storage(&state.label)?
+            .save_account_projection_state(
+                &stored_state_from_account_state(state),
+                MAX_SEEN_EVENT_IDS,
+            )?;
+        Ok(())
     }
 
     fn ensure_account_state(&self, label: &str) -> Result<(), AppError> {
         self.account_home().account(label)?;
-        self.account_projection(label)?.ensure_account(label)?;
+        self.migrate_legacy_account_projection_if_needed(label)?;
+        self.account_storage(label)?
+            .ensure_account_projection(label)?;
         Ok(())
     }
 
@@ -2193,25 +2546,121 @@ impl MarmotApp {
         self.account_home().account_dir(label)
     }
 
-    fn account_projection_path(&self, label: &str) -> PathBuf {
-        self.account_dir(label).join(ACCOUNT_APP_DB_FILE)
+    fn legacy_account_projection_path(&self, label: &str) -> PathBuf {
+        self.account_dir(label).join(LEGACY_ACCOUNT_APP_DB_FILE)
     }
 
-    fn account_projection(&self, label: &str) -> Result<AccountProjectionDb, AppError> {
+    fn account_storage_path(&self, label: &str) -> PathBuf {
+        self.account_dir(label).join(SESSION_DB_FILE)
+    }
+
+    fn account_storage(&self, label: &str) -> Result<SqliteAccountStorage, AppError> {
         let keys = self.account_home().load_signing_keys(label)?;
-        let path = self.account_projection_path(label);
+        let path = self.account_storage_path(label);
+        let key = self.sqlcipher_key(label, &keys, &path, SqlcipherDatabaseKind::Session)?;
+        Ok(SqliteAccountStorage::open_encrypted(&path, &key)?)
+    }
+
+    pub(crate) fn record_account_app_event(
+        &self,
+        label: &str,
+        message: &AppMessageProjection,
+    ) -> Result<(), AppError> {
+        let now = unix_now_seconds();
+        self.account_storage(label)?
+            .record_app_event(&stored_app_event_from_projection(message, now))?;
+        Ok(())
+    }
+
+    pub(crate) fn invalidate_timeline_source_message(
+        &self,
+        label: &str,
+        source_message_id_hex: &str,
+        reason: &str,
+    ) -> Result<(), AppError> {
+        let _ = self
+            .account_storage(label)?
+            .invalidate_app_event_by_source(source_message_id_hex, reason)?;
+        Ok(())
+    }
+
+    pub(crate) fn prune_account_app_events_before(
+        &self,
+        label: &str,
+        group_id_hex: &str,
+        cutoff_recorded_at: u64,
+    ) -> Result<usize, AppError> {
+        Ok(self
+            .account_storage(label)?
+            .prune_app_events_before(group_id_hex, cutoff_recorded_at)?)
+    }
+
+    fn migrate_legacy_account_projection_if_needed(&self, label: &str) -> Result<(), AppError> {
+        let path = self.legacy_account_projection_path(label);
+        if !path.exists() {
+            return Ok(());
+        }
+        let storage = self.account_storage(label)?;
+        if storage.account_import_marker(LEGACY_ACCOUNT_PROJECTION_IMPORT_MARKER)? {
+            return Ok(());
+        }
+
+        let legacy = self.legacy_account_projection(label)?;
+        let state = legacy.load_state(label)?;
+        storage.save_account_projection_state(
+            &stored_state_from_account_state(&state),
+            MAX_SEEN_EVENT_IDS,
+        )?;
+        for message in legacy.messages(AppMessageQuery::default())? {
+            if message.message_id_hex.is_empty() {
+                continue;
+            }
+            storage.record_app_event(&stored_app_event_from_message_record(&message))?;
+        }
+        if let Some(settings) = legacy.existing_notification_settings(label)? {
+            storage.notification_settings(label, &settings.account_id_hex)?;
+            storage.set_local_notifications_enabled(
+                label,
+                &settings.account_id_hex,
+                settings.local_notifications_enabled,
+            )?;
+            storage.set_native_push_enabled(
+                label,
+                &settings.account_id_hex,
+                settings.native_push_enabled,
+            )?;
+        }
+        if let Some(registration) = legacy.push_registration(label)? {
+            storage.upsert_push_registration(
+                account_push_registration_from_app(registration.registration),
+                registration.token_bytes,
+            )?;
+        }
+        for token in legacy.all_group_push_tokens()? {
+            storage.upsert_group_push_token(&account_group_push_token_from_app(&token))?;
+        }
+        storage.mark_account_import_complete(LEGACY_ACCOUNT_PROJECTION_IMPORT_MARKER)?;
+        Ok(())
+    }
+
+    fn legacy_account_projection(
+        &self,
+        label: &str,
+    ) -> Result<LegacyAccountProjectionDb, AppError> {
+        let keys = self.account_home().load_signing_keys(label)?;
+        let path = self.legacy_account_projection_path(label);
         let key = self.sqlcipher_key(
             label,
             &keys,
             &path,
             SqlcipherDatabaseKind::AccountProjection,
         )?;
-        AccountProjectionDb::open(path, &key)
+        LegacyAccountProjectionDb::open(path, &key)
     }
 
     fn projection_status(&self, label: &str) -> AppProjectionStatus {
-        let account_path = self.account_projection_path(label);
-        let shared_path = self.directory_cache_path(label);
+        let account_path = self.account_storage_path(label);
+        let shared_path = self.shared_storage_path();
         AppProjectionStatus {
             account: AppDatabaseStatus {
                 path: account_path.display().to_string(),
@@ -2400,7 +2849,15 @@ impl MarmotApp {
         entry: &UserDirectoryRecord,
         reason: &str,
     ) -> Result<(), AppError> {
-        let entry = self.hydrate_directory_record(entry.clone())?;
+        let proposed_entry = self.hydrate_directory_record(entry.clone())?;
+        let mut shared_storage = self.shared_storage()?;
+        let shared_entry = shared_storage
+            .public_directory_user(&proposed_entry.account_id_hex)?
+            .map(|record| self.hydrate_public_directory_record(record))
+            .transpose()?;
+        let entry = select_newer_directory_entry(Some(proposed_entry), shared_entry)
+            .expect("proposed directory entry should be present");
+        shared_storage.put_public_directory_user(&public_directory_user_record(&entry)?)?;
         for cache in self.directory_caches()? {
             cache.put_with_reason(&entry, reason)?;
         }
@@ -2428,6 +2885,14 @@ impl MarmotApp {
 
     fn directory_cache_path(&self, label: &str) -> PathBuf {
         self.account_dir(label).join(APP_CACHE_DB_FILE)
+    }
+
+    fn shared_storage_path(&self) -> PathBuf {
+        self.root.join(SHARED_DB_FILE)
+    }
+
+    fn shared_storage(&self) -> Result<SqliteSharedStorage, AppError> {
+        Ok(SqliteSharedStorage::open(self.shared_storage_path())?)
     }
 
     fn legacy_directory_cache_path(&self) -> PathBuf {
@@ -2534,6 +2999,13 @@ impl MarmotApp {
         Ok(entry)
     }
 
+    fn hydrate_public_directory_record(
+        &self,
+        record: PublicDirectoryUserRecord,
+    ) -> Result<UserDirectoryRecord, AppError> {
+        self.hydrate_directory_record(user_directory_record_from_public(record)?)
+    }
+
     fn local_account_for_id(&self, account_id_hex: &str) -> Option<UserDirectoryLocalAccount> {
         self.account_home()
             .accounts()
@@ -2579,6 +3051,124 @@ impl MarmotApp {
         OsRng.fill_bytes(&mut nostr_group_id);
         let relays = self.relay_urls.clone();
         NostrRoutingV1::new(nostr_group_id, relays).map_err(AppError::InvalidNostrRouting)
+    }
+}
+
+fn public_directory_user_record(
+    entry: &UserDirectoryRecord,
+) -> Result<PublicDirectoryUserRecord, AppError> {
+    let mut relay_lists = entry.relay_lists.clone();
+    relay_lists.bootstrap_relays.clear();
+
+    let profile_json = entry
+        .profile
+        .clone()
+        .map(|mut profile| {
+            profile.source_relays.clear();
+            serde_json::to_string(&profile)
+        })
+        .transpose()?;
+    let key_package_json = entry
+        .key_package
+        .clone()
+        .map(|mut key_package| {
+            key_package.source_relays.clear();
+            serde_json::to_string(&key_package)
+        })
+        .transpose()?;
+
+    Ok(PublicDirectoryUserRecord {
+        account_id_hex: entry.account_id_hex.clone(),
+        npub: entry.npub.clone(),
+        profile_json,
+        relay_lists_json: serde_json::to_string(&relay_lists)?,
+        key_package_json,
+        event_id_hex: entry.key_package.as_ref().and_then(|key_package| {
+            (!key_package.key_package_event_id.is_empty())
+                .then_some(key_package.key_package_event_id.clone())
+        }),
+        event_kind: None,
+        event_created_at: entry
+            .profile
+            .as_ref()
+            .map(|profile| profile.created_at)
+            .or_else(|| {
+                entry
+                    .key_package
+                    .as_ref()
+                    .map(|key_package| key_package.created_at)
+            }),
+        follows: entry.follows.clone(),
+    })
+}
+
+fn user_directory_record_from_public(
+    record: PublicDirectoryUserRecord,
+) -> Result<UserDirectoryRecord, AppError> {
+    Ok(UserDirectoryRecord {
+        account_id_hex: record.account_id_hex,
+        npub: record.npub,
+        local_account: None,
+        profile: record
+            .profile_json
+            .map(|json| serde_json::from_str(&json))
+            .transpose()?,
+        follows: record.follows,
+        follow_source_relays: Vec::new(),
+        relay_lists: serde_json::from_str(&record.relay_lists_json)?,
+        key_package: record
+            .key_package_json
+            .map(|json| serde_json::from_str(&json))
+            .transpose()?,
+    })
+}
+
+fn directory_record_recency(entry: &UserDirectoryRecord) -> u64 {
+    entry
+        .profile
+        .as_ref()
+        .map(|profile| profile.created_at)
+        .into_iter()
+        .chain(
+            entry
+                .key_package
+                .as_ref()
+                .map(|key_package| key_package.created_at),
+        )
+        .max()
+        .unwrap_or_default()
+}
+
+fn select_newer_directory_entry(
+    cached: Option<UserDirectoryRecord>,
+    shared: Option<UserDirectoryRecord>,
+) -> Option<UserDirectoryRecord> {
+    match (cached, shared) {
+        (Some(cached), Some(shared)) => {
+            if directory_record_recency(&shared) > directory_record_recency(&cached) {
+                Some(shared)
+            } else {
+                Some(cached)
+            }
+        }
+        (Some(entry), None) | (None, Some(entry)) => Some(entry),
+        (None, None) => None,
+    }
+}
+
+fn upsert_newer_directory_entry(
+    entries_by_id: &mut BTreeMap<String, UserDirectoryRecord>,
+    entry: UserDirectoryRecord,
+) {
+    match entries_by_id.entry(entry.account_id_hex.clone()) {
+        std::collections::btree_map::Entry::Vacant(slot) => {
+            slot.insert(entry);
+        }
+        std::collections::btree_map::Entry::Occupied(mut slot) => {
+            if directory_record_recency(&entry) > directory_record_recency(slot.get()) {
+                *slot.get_mut() = entry;
+            }
+        }
     }
 }
 
@@ -3880,6 +4470,105 @@ mod tests {
         );
     }
 
+    fn test_directory_record(
+        account_id_hex: &str,
+        name: &str,
+        created_at: u64,
+    ) -> UserDirectoryRecord {
+        UserDirectoryRecord {
+            account_id_hex: account_id_hex.to_owned(),
+            npub: npub_for_account_id_lossy(account_id_hex),
+            local_account: None,
+            profile: Some(UserProfileMetadata {
+                name: Some(name.to_owned()),
+                display_name: None,
+                about: None,
+                picture: None,
+                nip05: None,
+                lud16: None,
+                created_at,
+                source_relays: Vec::new(),
+            }),
+            follows: Vec::new(),
+            follow_source_relays: Vec::new(),
+            relay_lists: AccountRelayListStatus::empty(),
+            key_package: None,
+        }
+    }
+
+    #[test]
+    fn directory_entry_prefers_newer_shared_record_over_stale_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = AccountHome::open(dir.path());
+        let account = home.create_account("alice").unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+        let cache = app.directory_cache_for_account(&account).unwrap();
+        let contact = format!("{:064x}", 42);
+
+        cache
+            .put(&test_directory_record(&contact, "old-cache", 1))
+            .unwrap();
+        app.shared_storage()
+            .unwrap()
+            .put_public_directory_user(
+                &public_directory_user_record(&test_directory_record(&contact, "new-shared", 2))
+                    .unwrap(),
+            )
+            .unwrap();
+
+        let entry = app
+            .directory_entry_for_account_id(&contact)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            entry.profile.and_then(|profile| profile.name),
+            Some("new-shared".to_owned())
+        );
+    }
+
+    #[test]
+    fn directory_entries_and_save_keep_newer_shared_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = AccountHome::open(dir.path());
+        let account = home.create_account("alice").unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+        let cache = app.directory_cache_for_account(&account).unwrap();
+        let contact = format!("{:064x}", 43);
+        let stale = test_directory_record(&contact, "old-cache", 1);
+        let fresh = test_directory_record(&contact, "new-shared", 2);
+
+        cache.put(&stale).unwrap();
+        app.shared_storage()
+            .unwrap()
+            .put_public_directory_user(&public_directory_user_record(&fresh).unwrap())
+            .unwrap();
+
+        let listed = app.directory_entries().unwrap();
+        let listed_entry = listed
+            .iter()
+            .find(|entry| entry.account_id_hex == contact)
+            .unwrap();
+        assert_eq!(
+            listed_entry
+                .profile
+                .as_ref()
+                .and_then(|profile| profile.name.as_deref()),
+            Some("new-shared")
+        );
+
+        app.save_directory_entry_with_reason(&stale, "stale-cache")
+            .unwrap();
+        let entry = app
+            .directory_entry_for_account_id(&contact)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            entry.profile.and_then(|profile| profile.name),
+            Some("new-shared".to_owned())
+        );
+    }
+
     #[test]
     fn received_message_sender_is_admitted_to_directory_cache() {
         let dir = tempfile::tempdir().unwrap();
@@ -3895,6 +4584,7 @@ mod tests {
         );
         app.remember_directory_message_sender(&ReceivedMessage {
             message_id_hex: "message-id".to_owned(),
+            source_message_id_hex: "source-message-id".to_owned(),
             sender: sender.clone(),
             sender_display_name: None,
             group_id: GroupId::new(vec![0x01]),
@@ -3948,7 +4638,7 @@ mod tests {
         let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
         let keys = app.account_home().load_signing_keys("alice").unwrap();
         let session_path = app.account_dir("alice").join(SESSION_DB_FILE);
-        let projection_path = app.account_projection_path("alice");
+        let projection_path = app.legacy_account_projection_path("alice");
 
         let session_key = app
             .sqlcipher_key(
@@ -3991,7 +4681,7 @@ mod tests {
         home.create_account("alice").unwrap();
         let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
         let keys = app.account_home().load_signing_keys("alice").unwrap();
-        let projection_path = app.account_projection_path("alice");
+        let projection_path = app.legacy_account_projection_path("alice");
         fs::create_dir_all(projection_path.parent().unwrap()).unwrap();
         let legacy_key = SqlCipherKey::new(legacy_sqlcipher_key_material(
             "alice",
@@ -4036,6 +4726,116 @@ mod tests {
                 .get::<_, String>(0))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn legacy_account_projection_imports_once_into_account_storage() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = AccountHome::open(dir.path());
+        let account = home.create_account("alice").unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+        let keys = app.account_home().load_signing_keys("alice").unwrap();
+        let legacy_path = app.legacy_account_projection_path("alice");
+        let legacy_key = app
+            .sqlcipher_key(
+                "alice",
+                &keys,
+                &legacy_path,
+                SqlcipherDatabaseKind::AccountProjection,
+            )
+            .unwrap();
+        let mut legacy = LegacyAccountProjectionDb::open(legacy_path.clone(), &legacy_key).unwrap();
+        let group = AppGroupRecord::new(
+            "aa".to_owned(),
+            AppGroupNostrRoutingComponent::new(
+                NostrRoutingV1::new([0xAA; 32], vec!["wss://relay.example".to_owned()]).unwrap(),
+            )
+            .unwrap(),
+            "legacy".to_owned(),
+            String::new(),
+            AppGroupImageInput::default(),
+            AppGroupAdminPolicyComponent::new(Vec::new()),
+            AppGroupMessageRetentionComponent::disabled(),
+        );
+        legacy
+            .save_state(&AccountState {
+                label: "alice".to_owned(),
+                seen_events: vec!["seen".to_owned()],
+                last_transport_timestamp: Some(1_700_000_100),
+                groups: vec![group],
+            })
+            .unwrap();
+        legacy
+            .record_message(&AppMessageProjection {
+                message_id_hex: "legacy-message".to_owned(),
+                source_message_id_hex: None,
+                direction: "received".to_owned(),
+                group_id_hex: "aa".to_owned(),
+                sender: account.account_id_hex.clone(),
+                plaintext: "from legacy".to_owned(),
+                kind: 9,
+                tags: Vec::new(),
+                recorded_at: Some(1_700_000_101),
+            })
+            .unwrap();
+        legacy
+            .set_native_push_enabled("alice", &account.account_id_hex, true)
+            .unwrap();
+        legacy
+            .upsert_push_registration(
+                PushRegistration {
+                    account_ref: "alice".to_owned(),
+                    account_id_hex: account.account_id_hex.clone(),
+                    platform: PushPlatform::Apns,
+                    token_fingerprint: "fingerprint".to_owned(),
+                    server_pubkey_hex: "bb".repeat(32),
+                    relay_hint: Some("wss://relay.example".to_owned()),
+                    created_at_ms: 10,
+                    updated_at_ms: 11,
+                    last_shared_at_ms: None,
+                },
+                vec![1, 2, 3],
+            )
+            .unwrap();
+        legacy
+            .upsert_group_push_token(&GroupPushTokenRecord {
+                group_id_hex: "aa".to_owned(),
+                member_id_hex: account.account_id_hex.clone(),
+                leaf_index: 7,
+                platform: PushPlatform::Apns,
+                token_fingerprint: "fingerprint".to_owned(),
+                server_pubkey_hex: "bb".repeat(32),
+                relay_hint: None,
+                encrypted_token: vec![9, 8, 7],
+                updated_at_ms: 12,
+            })
+            .unwrap();
+
+        let groups = app.groups("alice").unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].profile.name, "legacy");
+        let messages = app.messages("alice").unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].plaintext, "from legacy");
+        let settings = app.notification_settings("alice").unwrap();
+        assert!(settings.native_push_enabled);
+        assert!(app.push_registration("alice").unwrap().is_some());
+        assert_eq!(app.group_push_tokens("alice", "aa").unwrap().len(), 1);
+
+        legacy
+            .record_message(&AppMessageProjection {
+                message_id_hex: "post-marker".to_owned(),
+                source_message_id_hex: None,
+                direction: "received".to_owned(),
+                group_id_hex: "aa".to_owned(),
+                sender: account.account_id_hex,
+                plaintext: "should stay legacy-only".to_owned(),
+                kind: 9,
+                tags: Vec::new(),
+                recorded_at: Some(1_700_000_102),
+            })
+            .unwrap();
+        assert_eq!(app.messages("alice").unwrap().len(), 1);
     }
 
     #[test]

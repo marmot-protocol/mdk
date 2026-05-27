@@ -1,13 +1,14 @@
 use super::snapshots;
 use crate::{
-    SqliteResultExt, SqliteStorage, deserialize, epoch_to_i64, message_state_to_i64, serialize,
+    SqliteAccountStorage, SqliteResultExt, deserialize, epoch_to_i64, message_state_to_i64,
+    serialize,
 };
 use cgka_traits::message::{MessageRecord, MessageState};
 use cgka_traits::storage::{MessageStorage, StorageError, StorageResult};
 use cgka_traits::types::{EpochId, GroupId, MessageId};
 use rusqlite::{OptionalExtension, params};
 
-impl MessageStorage for SqliteStorage {
+impl MessageStorage for SqliteAccountStorage {
     fn put_message(&self, record: &MessageRecord) -> StorageResult<()> {
         self.lock()?
             .execute(
@@ -118,7 +119,7 @@ impl MessageStorage for SqliteStorage {
 
 #[cfg(test)]
 mod tests {
-    use crate::SqliteStorage;
+    use crate::SqliteAccountStorage;
     use crate::storage::test_support::{gid, mid, sample_group, sample_message};
     use cgka_traits::message::MessageState;
     use cgka_traits::storage::{GroupStorage, MessageStorage};
@@ -126,7 +127,7 @@ mod tests {
 
     #[test]
     fn message_state_transitions() {
-        let store = SqliteStorage::in_memory().unwrap();
+        let store = SqliteAccountStorage::in_memory().unwrap();
         store.put_group(&sample_group(gid(1), 0, 0)).unwrap();
         let message = sample_message(mid(1), gid(1), 0);
         store.put_message(&message).unwrap();
@@ -166,7 +167,7 @@ mod tests {
 
     #[test]
     fn list_messages_filters_by_group_epoch_and_insert_order() {
-        let store = SqliteStorage::in_memory().unwrap();
+        let store = SqliteAccountStorage::in_memory().unwrap();
         store.put_group(&sample_group(gid(1), 0, 0)).unwrap();
         store.put_group(&sample_group(gid(2), 0, 0)).unwrap();
         store

@@ -19,12 +19,13 @@ use std::sync::Mutex as StdMutex;
 use marmot_app::{
     RuntimeAgentStreamWatch, RuntimeChatsSubscription, RuntimeEventsSubscription,
     RuntimeGroupStateSubscription, RuntimeMessagesSubscription, RuntimeNotificationsSubscription,
+    RuntimeTimelineMessagesSubscription,
 };
 use tokio::sync::Mutex;
 
 use crate::conversions::{
     AgentStreamUpdateFfi, AppGroupRecordFfi, AppMessageRecordFfi, MarmotEventFfi, MessageUpdateFfi,
-    NotificationUpdateFfi,
+    NotificationUpdateFfi, TimelinePageFfi,
 };
 
 #[derive(uniffi::Object)]
@@ -86,6 +87,33 @@ impl MessagesSubscription {
     pub async fn next(&self) -> Option<MessageUpdateFfi> {
         let mut inner = self.inner.lock().await;
         inner.recv().await.map(Into::into)
+    }
+}
+
+#[derive(uniffi::Object)]
+pub struct TimelineMessagesSubscription {
+    snapshot: StdMutex<Option<TimelinePageFfi>>,
+    inner: Mutex<RuntimeTimelineMessagesSubscription>,
+}
+
+impl TimelineMessagesSubscription {
+    pub(crate) fn new(inner: RuntimeTimelineMessagesSubscription) -> Arc<Self> {
+        Arc::new(Self {
+            snapshot: StdMutex::new(Some(inner.snapshot.clone().into())),
+            inner: Mutex::new(inner),
+        })
+    }
+}
+
+#[uniffi::export(async_runtime = "tokio")]
+impl TimelineMessagesSubscription {
+    pub fn snapshot(&self) -> Option<TimelinePageFfi> {
+        take_snapshot(&self.snapshot)
+    }
+
+    pub async fn next(&self) -> Option<TimelinePageFfi> {
+        let mut inner = self.inner.lock().await;
+        inner.recv().await.map(|update| update.page.into())
     }
 }
 

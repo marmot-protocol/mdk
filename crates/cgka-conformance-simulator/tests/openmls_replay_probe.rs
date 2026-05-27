@@ -1285,7 +1285,7 @@ async fn openmls_canonicalization_apply_rolls_back_when_selected_path_fails() {
 
 #[test]
 fn openmls_disposition_persistence_maps_all_canonicalization_states() {
-    let storage = storage_sqlite::SqliteStorage::in_memory().unwrap();
+    let storage = storage_sqlite::SqliteAccountStorage::in_memory().unwrap();
     let group_id = GroupId::new(b"disposition-group".to_vec());
     let accepted_commit_id = MessageId::new(vec![1]);
     let accepted_app_id = MessageId::new(vec![2]);
@@ -1352,7 +1352,7 @@ fn assert_projected_kind(msg: &TransportMessage, expected_kind: OpenMlsContentKi
 }
 
 fn assert_message_state(
-    storage: &storage_sqlite::SqliteStorage,
+    storage: &storage_sqlite::SqliteAccountStorage,
     msg: &TransportMessage,
     expected: MessageState,
 ) {
@@ -1360,7 +1360,7 @@ fn assert_message_state(
 }
 
 fn assert_message_id_state(
-    storage: &storage_sqlite::SqliteStorage,
+    storage: &storage_sqlite::SqliteAccountStorage,
     id: &MessageId,
     expected: MessageState,
 ) {
@@ -1368,10 +1368,12 @@ fn assert_message_id_state(
     assert_eq!(record.state, expected);
 }
 
-fn stored_openmls_epoch(storage: &storage_sqlite::SqliteStorage, group_id: &GroupId) -> u64 {
+fn stored_openmls_epoch(storage: &storage_sqlite::SqliteAccountStorage, group_id: &GroupId) -> u64 {
     let crypto = RustCrypto::default();
-    let provider =
-        EngineOpenMlsProvider::<storage_sqlite::SqliteStorage>::new(&crypto, storage.mls_storage());
+    let provider = EngineOpenMlsProvider::<storage_sqlite::SqliteAccountStorage>::new(
+        &crypto,
+        storage.mls_storage(),
+    );
     let mls_group_id = openmls::group::GroupId::from_slice(group_id.as_slice());
     let group = MlsGroup::load(provider.storage(), &mls_group_id)
         .expect("MLS group loads")
@@ -1380,7 +1382,7 @@ fn stored_openmls_epoch(storage: &storage_sqlite::SqliteStorage, group_id: &Grou
 }
 
 fn store_dummy_created_message(
-    storage: &storage_sqlite::SqliteStorage,
+    storage: &storage_sqlite::SqliteAccountStorage,
     group_id: &GroupId,
     id: &MessageId,
 ) {
@@ -1413,7 +1415,7 @@ fn dummy_group(group_id: GroupId) -> Group {
 }
 
 fn store_created_message(
-    storage: &storage_sqlite::SqliteStorage,
+    storage: &storage_sqlite::SqliteAccountStorage,
     group_id: &GroupId,
     msg: &TransportMessage,
 ) {

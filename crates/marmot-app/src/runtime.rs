@@ -44,7 +44,8 @@ use crate::{
     MarmotRelayPlane, MediaDownloadResult, MediaReference, MediaUploadRequest, MediaUploadResult,
     NotificationCollectionStatus, NotificationSettings, NotificationUpdate, NotificationWakeSource,
     PushPlatform, PushRegistration, ReceivedMessage, SendSummary, SyncSummary,
-    UserDirectoryRefresh, UserProfileMetadata, default_profile_pseudonym, unix_now_seconds,
+    TimelineMessageQuery, TimelinePage, UserDirectoryRefresh, UserProfileMetadata,
+    default_profile_pseudonym, unix_now_seconds,
 };
 
 #[derive(Clone)]
@@ -535,6 +536,28 @@ impl RuntimeMessagesSubscription {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuntimeTimelineMessageUpdate {
+    pub account_id_hex: String,
+    pub account_label: String,
+    pub page: TimelinePage,
+}
+
+pub struct RuntimeTimelineMessagesSubscription {
+    pub snapshot: TimelinePage,
+    updates: mpsc::Receiver<RuntimeTimelineMessageUpdate>,
+    stopping: watch::Receiver<bool>,
+}
+
+impl RuntimeTimelineMessagesSubscription {
+    pub async fn recv(&mut self) -> Option<RuntimeTimelineMessageUpdate> {
+        tokio::select! {
+            update = self.updates.recv() => update,
+            _ = wait_for_runtime_shutdown(&mut self.stopping) => None,
+        }
+    }
+}
+
 pub struct RuntimeChatsSubscription {
     pub snapshot: Vec<AppGroupRecord>,
     updates: mpsc::Receiver<AppGroupRecord>,
@@ -763,6 +786,66 @@ impl MarmotAppRuntime {
             }
         });
         Ok(RuntimeMessagesSubscription {
+            snapshot,
+            updates: updates_rx,
+            stopping: self.shared.lifecycle().subscribe_shutdown(),
+        })
+    }
+
+    pub fn subscribe_timeline_messages(
+        &self,
+        account_ref: &str,
+        query: TimelineMessageQuery,
+    ) -> Result<RuntimeTimelineMessagesSubscription, AppError> {
+        self.shared.lifecycle().ensure_running()?;
+        let account = self.accounts.resolve(account_ref)?;
+        let account_id_hex = account.account_id_hex.clone();
+        let account_label = account.label.clone();
+        let group_id_hex = query.group_id_hex.clone();
+        let app = self.accounts.app.clone();
+        let mut events = self.events.subscribe();
+        let mut stopping = self.shared.lifecycle().subscribe_shutdown();
+        let snapshot = app.timeline_messages_with_query(&account_label, query.clone())?;
+        let (updates_tx, updates_rx) = mpsc::channel(APP_RUNTIME_SUBSCRIPTION_BUFFER);
+        tokio::spawn(async move {
+            loop {
+                let event = tokio::select! {
+                    _ = wait_for_runtime_shutdown(&mut stopping) => return,
+                    event = events.recv() => match event {
+                        Ok(event) => event,
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(broadcast::error::RecvError::Closed) => return,
+                    },
+                };
+                if !timeline_event_matches_query(&event, &account_id_hex, group_id_hex.as_deref()) {
+                    continue;
+                }
+                let app_for_lookup = app.clone();
+                let account_label_for_lookup = account_label.clone();
+                let query_for_lookup = query.clone();
+                if runtime_shutdown_requested(&stopping) {
+                    return;
+                }
+                let page = match blocking_app_task(move || {
+                    app_for_lookup
+                        .timeline_messages_with_query(&account_label_for_lookup, query_for_lookup)
+                })
+                .await
+                {
+                    Ok(page) => page,
+                    Err(_) => continue,
+                };
+                let update = RuntimeTimelineMessageUpdate {
+                    account_id_hex: account_id_hex.clone(),
+                    account_label: account_label.clone(),
+                    page,
+                };
+                if updates_tx.send(update).await.is_err() {
+                    return;
+                }
+            }
+        });
+        Ok(RuntimeTimelineMessagesSubscription {
             snapshot,
             updates: updates_rx,
             stopping: self.shared.lifecycle().subscribe_shutdown(),
@@ -1735,6 +1818,17 @@ impl MarmotAppRuntime {
     ) -> Result<Vec<AppMessageRecord>, AppError> {
         let account = self.accounts.resolve(account_ref)?;
         self.accounts.app.messages_with_query(&account.label, query)
+    }
+
+    pub fn timeline_messages_with_query(
+        &self,
+        account_ref: &str,
+        query: TimelineMessageQuery,
+    ) -> Result<TimelinePage, AppError> {
+        let account = self.accounts.resolve(account_ref)?;
+        self.accounts
+            .app
+            .timeline_messages_with_query(&account.label, query)
     }
 
     pub async fn create_identity(
@@ -3543,6 +3637,41 @@ fn runtime_message_update_from_event(event: MarmotAppEvent) -> Option<RuntimeMes
     }
 }
 
+fn timeline_event_matches_query(
+    event: &MarmotAppEvent,
+    account_id_hex: &str,
+    group_id_hex: Option<&str>,
+) -> bool {
+    let (event_account_id_hex, group_id) = match event {
+        MarmotAppEvent::MessageReceived(update) => {
+            (&update.account_id_hex, &update.message.group_id)
+        }
+        MarmotAppEvent::AgentStreamStarted(update) => {
+            (&update.account_id_hex, &update.message.group_id)
+        }
+        MarmotAppEvent::GroupEvent(group_event) => match &group_event.event {
+            GroupEvent::MessageReceived { group_id, .. }
+            | GroupEvent::AppMessageInvalidated { group_id, .. } => {
+                (&group_event.account_id_hex, group_id)
+            }
+            GroupEvent::GroupCreated { .. }
+            | GroupEvent::GroupJoined { .. }
+            | GroupEvent::MemberAdded { .. }
+            | GroupEvent::MemberRemoved { .. }
+            | GroupEvent::EpochChanged { .. }
+            | GroupEvent::ForkRecovered { .. }
+            | GroupEvent::GroupUnrecoverable { .. } => return false,
+        },
+        MarmotAppEvent::GroupJoined { .. }
+        | MarmotAppEvent::GroupStateUpdated { .. }
+        | MarmotAppEvent::AccountError(_) => return false,
+    };
+    if event_account_id_hex != account_id_hex {
+        return false;
+    }
+    group_id_hex.is_none_or(|wanted| hex::encode(group_id.as_slice()) == wanted)
+}
+
 fn runtime_group_event_route(event: &MarmotAppEvent) -> Option<(&str, &GroupId)> {
     match event {
         MarmotAppEvent::GroupJoined {
@@ -3627,6 +3756,26 @@ mod tests {
         let (updates_tx, updates) = mpsc::channel(1);
         let mut subscription = RuntimeMessagesSubscription {
             snapshot: Vec::new(),
+            updates,
+            stopping: lifecycle.subscribe_shutdown(),
+        };
+
+        lifecycle.begin_shutdown();
+
+        assert!(subscription.recv().await.is_none());
+        drop(updates_tx);
+    }
+
+    #[tokio::test]
+    async fn timeline_subscription_recv_ends_when_runtime_shutdown_begins() {
+        let lifecycle = RuntimeLifecycle::new();
+        let (updates_tx, updates) = mpsc::channel(1);
+        let mut subscription = RuntimeTimelineMessagesSubscription {
+            snapshot: TimelinePage {
+                messages: Vec::new(),
+                has_more_before: false,
+                has_more_after: false,
+            },
             updates,
             stopping: lifecycle.subscribe_shutdown(),
         };

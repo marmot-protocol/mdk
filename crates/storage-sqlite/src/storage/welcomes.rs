@@ -1,10 +1,10 @@
-use crate::{SqliteResultExt, SqliteStorage, deserialize, serialize};
+use crate::{SqliteAccountStorage, SqliteResultExt, deserialize, serialize};
 use cgka_traits::storage::{StorageError, StorageResult, WelcomeStorage};
 use cgka_traits::types::MessageId;
 use cgka_traits::welcome::PendingWelcome;
 use rusqlite::{OptionalExtension, params};
 
-impl WelcomeStorage for SqliteStorage {
+impl WelcomeStorage for SqliteAccountStorage {
     fn put_welcome(&self, welcome: &PendingWelcome) -> StorageResult<()> {
         self.lock()?
             .execute(
@@ -58,14 +58,14 @@ impl WelcomeStorage for SqliteStorage {
 
 #[cfg(test)]
 mod tests {
-    use crate::SqliteStorage;
+    use crate::SqliteAccountStorage;
     use crate::storage::test_support::{gid, mid};
     use cgka_traits::storage::{StorageError, WelcomeStorage};
     use cgka_traits::welcome::PendingWelcome;
 
     #[test]
     fn welcome_take_is_one_shot() {
-        let store = SqliteStorage::in_memory().unwrap();
+        let store = SqliteAccountStorage::in_memory().unwrap();
         let welcome = PendingWelcome {
             message_id: mid(1),
             group_id: gid(1),
@@ -82,7 +82,7 @@ mod tests {
 
     #[test]
     fn take_welcome_retains_row_when_decode_fails() {
-        let store = SqliteStorage::in_memory().unwrap();
+        let store = SqliteAccountStorage::in_memory().unwrap();
         store
             .lock()
             .unwrap()

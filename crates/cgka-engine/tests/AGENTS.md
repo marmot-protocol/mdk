@@ -24,7 +24,7 @@ cargo insta review
 ## Tier 2 — Engine integration tests (this directory)
 
 **What they prove:** real OpenMLS-backed engine behavior across one or more engine instances using a pass-through
-`MockPeeler`. Most files use in-memory `Engine<SqliteStorage>`; `sqlite_storage.rs` keeps the encrypted file-backed
+`MockPeeler`. Most files use in-memory `Engine<SqliteAccountStorage>`; `sqlite_storage.rs` keeps the encrypted file-backed
 backend on the same rail.
 
 - **File:** `scaffold.rs`
@@ -61,7 +61,7 @@ backend on the same rail.
   - **Owns:** Snapshot names do not expose plaintext group ids
 
 - **File:** `sqlite_storage.rs`
-  - **Owns:** SQLCipher-backed `Engine<SqliteStorage>` create + confirm smoke
+  - **Owns:** SQLCipher-backed `Engine<SqliteAccountStorage>` create + confirm smoke
 
 - **File:** `update_group_data.rs`
   - **Owns:** Group profile `AppDataUpdate` commits and convergence-side Marmot record refresh

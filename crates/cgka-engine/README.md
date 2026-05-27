@@ -31,7 +31,7 @@ rules, and returns typed outcomes for every ingest path.
 cargo test -p cgka-engine
 ```
 
-These tests cover the engine boundary directly. They use one or a few `Engine<SqliteStorage>` instances with in-memory
+These tests cover the engine boundary directly. They use one or a few `Engine<SqliteAccountStorage>` instances with in-memory
 SQLite storage and a mock peeler. They are the right place for local rules: command validation, snapshot persistence,
 processed-message idempotency, restart behavior, and the exact outputs from a single engine call.
 

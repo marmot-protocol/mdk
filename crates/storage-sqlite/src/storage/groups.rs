@@ -1,11 +1,11 @@
 use crate::openmls_storage::mls_group_key;
-use crate::{SqliteResultExt, SqliteStorage, deserialize, epoch_to_i64, serialize};
+use crate::{SqliteAccountStorage, SqliteResultExt, deserialize, epoch_to_i64, serialize};
 use cgka_traits::group::Group;
 use cgka_traits::storage::{GroupStorage, StorageError, StorageResult};
 use cgka_traits::types::GroupId;
 use rusqlite::{OptionalExtension, params};
 
-impl GroupStorage for SqliteStorage {
+impl GroupStorage for SqliteAccountStorage {
     fn put_group(&self, group: &Group) -> StorageResult<()> {
         self.lock()?
             .execute(
@@ -74,7 +74,7 @@ impl GroupStorage for SqliteStorage {
 
 #[cfg(test)]
 mod tests {
-    use crate::SqliteStorage;
+    use crate::SqliteAccountStorage;
     use crate::storage::test_support::{
         TestGroupState, gid, mid, sample_group, sample_message, sample_queued_intent,
     };
@@ -88,7 +88,7 @@ mod tests {
 
     #[test]
     fn group_roundtrip_preserves_every_field() {
-        let store = SqliteStorage::in_memory().unwrap();
+        let store = SqliteAccountStorage::in_memory().unwrap();
         let group = sample_group(gid(1), 7, 3);
         store.put_group(&group).unwrap();
         assert_eq!(store.get_group(&group.id).unwrap(), group);
@@ -96,7 +96,7 @@ mod tests {
 
     #[test]
     fn group_update_preserves_foreign_key_owned_rows() {
-        let store = SqliteStorage::in_memory().unwrap();
+        let store = SqliteAccountStorage::in_memory().unwrap();
         let group = sample_group(gid(1), 0, 1);
         store.put_group(&group).unwrap();
         store
@@ -133,7 +133,7 @@ mod tests {
 
     #[test]
     fn group_missing_returns_not_found() {
-        let store = SqliteStorage::in_memory().unwrap();
+        let store = SqliteAccountStorage::in_memory().unwrap();
         assert!(matches!(
             store.get_group(&gid(9)),
             Err(StorageError::NotFound)
@@ -142,7 +142,7 @@ mod tests {
 
     #[test]
     fn group_delete_cascades_messages_queued_caps_policy_and_openmls_group_state() {
-        let store = SqliteStorage::in_memory().unwrap();
+        let store = SqliteAccountStorage::in_memory().unwrap();
         let group = sample_group(gid(1), 0, 1);
         store.put_group(&group).unwrap();
         store
@@ -188,7 +188,7 @@ mod tests {
 
     #[test]
     fn list_groups_returns_all_ids() {
-        let store = SqliteStorage::in_memory().unwrap();
+        let store = SqliteAccountStorage::in_memory().unwrap();
         store.put_group(&sample_group(gid(1), 0, 0)).unwrap();
         store.put_group(&sample_group(gid(2), 0, 0)).unwrap();
         assert_eq!(store.list_groups().unwrap(), vec![gid(1), gid(2)]);

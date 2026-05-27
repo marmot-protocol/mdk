@@ -1,6 +1,6 @@
 # cgka-session
 
-Production-shaped account-device wrapper around `Engine<SqliteStorage>`.
+Production-shaped account-device wrapper around `Engine<SqliteAccountStorage>`.
 
 This crate is where app integration starts to become concrete. Callers provide an identity, SQLCipher database key,
 database path, feature registry, and transport peeler. The session opens encrypted storage, builds the engine, hydrates
@@ -10,7 +10,7 @@ lifecycle method.
 ## What this crate does
 
 - Opens one encrypted SQLite database for one Marmot account-device identity.
-- Builds `Engine<SqliteStorage>` with an injected `TransportPeeler`.
+- Builds `Engine<SqliteAccountStorage>` with an injected `TransportPeeler`.
 - Surfaces `GroupEvent`s and publishable transport work as `SessionEffects`.
 - Preserves the publish-before-apply contract: callers confirm or fail pending group operations after transport publish,
   including auto-publish work created while ingesting inbound messages.

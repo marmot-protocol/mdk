@@ -4,7 +4,7 @@ use super::rows::{
 };
 use crate::openmls_storage::mls_group_key;
 use crate::{
-    SqliteResultExt, SqliteStorage, created_at_to_i64, deserialize, epoch_to_i64,
+    SqliteAccountStorage, SqliteResultExt, created_at_to_i64, deserialize, epoch_to_i64,
     message_state_to_i64, serialize,
 };
 use cgka_traits::group::Group;
@@ -12,7 +12,11 @@ use cgka_traits::storage::{StorageError, StorageResult};
 use cgka_traits::types::GroupId;
 use rusqlite::{OptionalExtension, params};
 
-pub(super) fn rollback(store: &SqliteStorage, group_id: &GroupId, name: &str) -> StorageResult<()> {
+pub(super) fn rollback(
+    store: &SqliteAccountStorage,
+    group_id: &GroupId,
+    name: &str,
+) -> StorageResult<()> {
     let mls_group_key = mls_group_key(group_id)?;
     let mut conn = store.lock()?;
     let tx = conn.transaction().storage()?;
