@@ -4827,6 +4827,7 @@ fn timeline_message_record_json(
         "timeline_at": message.timeline_at,
         "received_at": message.received_at,
         "reply_to_message_id": message.reply_to_message_id_hex,
+        "reply_preview": message.reply_preview,
         "media": message.media,
         "agent_text_stream": message.agent_text_stream,
         "reactions": message.reactions,

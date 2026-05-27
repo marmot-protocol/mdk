@@ -7,7 +7,7 @@ use cgka_traits::app_event::{
     STREAM_HASH_TAG, STREAM_START_TAG, STREAM_TAG,
 };
 use cgka_traits::storage::{StorageError, StorageResult};
-use rusqlite::{OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -57,11 +57,23 @@ pub struct TimelineMessageRecord {
     pub timeline_at: u64,
     pub received_at: u64,
     pub reply_to_message_id_hex: Option<String>,
+    pub reply_preview: Option<TimelineReplyPreview>,
     pub media: Option<Value>,
     pub agent_text_stream: Option<Value>,
     pub reactions: TimelineReactionSummary,
     pub deleted: bool,
     pub deleted_by_message_id_hex: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TimelineReplyPreview {
+    pub message_id_hex: String,
+    pub sender: String,
+    pub plaintext: String,
+    pub kind: u64,
+    pub media: Option<Value>,
+    pub agent_text_stream: Option<Value>,
+    pub deleted: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -227,15 +239,16 @@ impl SqliteAccountStorage {
         let pagination = validate_pagination(&query.pagination)?;
         let (sql, params) = timeline_query_sql(&query, &pagination)?;
         let conn = self.lock()?;
-        let mut stmt = conn.prepare(&sql).storage()?;
-        let rows = stmt
-            .query_map(
+        let rows = {
+            let mut stmt = conn.prepare(&sql).storage()?;
+            stmt.query_map(
                 rusqlite::params_from_iter(params.iter()),
                 timeline_record_from_row,
             )
             .storage()?
             .collect::<Result<Vec<_>, _>>()
-            .storage()?;
+            .storage()?
+        };
         let has_extra = rows.len() > pagination.limit;
         let mut messages = rows.into_iter().take(pagination.limit).collect::<Vec<_>>();
         let (has_more_before, has_more_after) = match pagination.direction {
@@ -249,6 +262,7 @@ impl SqliteAccountStorage {
             }
             CursorDirection::After => (true, has_extra),
         };
+        attach_reply_previews(&conn, &mut messages)?;
         Ok(TimelinePage {
             messages,
             has_more_before,
@@ -665,6 +679,7 @@ fn timeline_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Timelin
         timeline_at: row.get::<_, i64>(8)?.try_into().unwrap_or_default(),
         received_at: row.get::<_, i64>(9)?.try_into().unwrap_or_default(),
         reply_to_message_id_hex: row.get(10)?,
+        reply_preview: None,
         media: optional_value_from_json(row.get::<_, Option<String>>(11)?).map_err(|err| {
             rusqlite::Error::FromSqlConversionFailure(
                 11,
@@ -690,6 +705,79 @@ fn timeline_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Timelin
         })?,
         deleted: row.get::<_, i64>(14)? != 0,
         deleted_by_message_id_hex: row.get(15)?,
+    })
+}
+
+fn attach_reply_previews(
+    conn: &Connection,
+    messages: &mut [TimelineMessageRecord],
+) -> StorageResult<()> {
+    let targets = messages
+        .iter()
+        .filter_map(|message| {
+            message
+                .reply_to_message_id_hex
+                .as_ref()
+                .map(|target| (message.group_id_hex.clone(), target.clone()))
+        })
+        .collect::<HashSet<_>>();
+    if targets.is_empty() {
+        return Ok(());
+    }
+
+    let mut previews = HashMap::new();
+    for (group_id_hex, message_id_hex) in targets {
+        if let Some(preview) = load_reply_preview(conn, &group_id_hex, &message_id_hex)? {
+            previews.insert((group_id_hex, message_id_hex), preview);
+        }
+    }
+
+    for message in messages {
+        let Some(target) = message.reply_to_message_id_hex.as_ref() else {
+            continue;
+        };
+        message.reply_preview = previews
+            .get(&(message.group_id_hex.clone(), target.clone()))
+            .cloned();
+    }
+    Ok(())
+}
+
+fn load_reply_preview(
+    conn: &Connection,
+    group_id_hex: &str,
+    message_id_hex: &str,
+) -> StorageResult<Option<TimelineReplyPreview>> {
+    conn.query_row(
+        "SELECT message_id_hex, sender, plaintext, kind, media_json, agent_stream_json, deleted
+         FROM message_timeline
+         WHERE group_id_hex = ?1 AND message_id_hex = ?2",
+        params![group_id_hex, message_id_hex],
+        reply_preview_from_row,
+    )
+    .optional()
+    .storage()
+}
+
+fn reply_preview_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TimelineReplyPreview> {
+    Ok(TimelineReplyPreview {
+        message_id_hex: row.get(0)?,
+        sender: row.get(1)?,
+        plaintext: row.get(2)?,
+        kind: row.get::<_, i64>(3)?.try_into().unwrap_or_default(),
+        media: optional_value_from_json(row.get::<_, Option<String>>(4)?).map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(err))
+        })?,
+        agent_text_stream: optional_value_from_json(row.get::<_, Option<String>>(5)?).map_err(
+            |err| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    5,
+                    rusqlite::types::Type::Text,
+                    Box::new(err),
+                )
+            },
+        )?,
+        deleted: row.get::<_, i64>(6)? != 0,
     })
 }
 
@@ -756,6 +844,24 @@ mod tests {
             plaintext: emoji.to_owned(),
             kind: MARMOT_APP_EVENT_KIND_REACTION,
             tags: vec![vec![EVENT_REF_TAG.to_owned(), target.to_owned()]],
+            recorded_at: at,
+            received_at: at,
+        }
+    }
+
+    fn reply(id: &str, sender: &str, target: &str, at: u64, plaintext: &str) -> StoredAppEvent {
+        StoredAppEvent {
+            group_id_hex: "11".repeat(32),
+            message_id_hex: id.to_owned(),
+            source_message_id_hex: Some(format!("source-{id}")),
+            direction: "received".to_owned(),
+            sender: sender.to_owned(),
+            plaintext: plaintext.to_owned(),
+            kind: MARMOT_APP_EVENT_KIND_CHAT,
+            tags: vec![
+                vec![EVENT_REF_TAG.to_owned(), target.to_owned()],
+                vec![QUOTE_REF_TAG.to_owned(), target.to_owned()],
+            ],
             recorded_at: at,
             received_at: at,
         }
@@ -854,6 +960,38 @@ mod tests {
             message.reactions.by_emoji.get("+").cloned(),
             Some(vec!["bob".to_owned()])
         );
+    }
+
+    #[test]
+    fn reply_preview_is_hydrated_even_when_parent_is_outside_page() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        store
+            .record_app_event(&chat("parent", "alice", 1, "the original"))
+            .unwrap();
+        store
+            .record_app_event(&reply("reply", "bob", "parent", 2, "answer"))
+            .unwrap();
+
+        let page = store
+            .message_timeline(TimelineMessageQuery {
+                group_id_hex: Some("11".repeat(32)),
+                pagination: TimelinePagination {
+                    limit: Some(1),
+                    ..TimelinePagination::default()
+                },
+                ..TimelineMessageQuery::default()
+            })
+            .unwrap();
+
+        assert_eq!(page.messages.len(), 1);
+        let message = &page.messages[0];
+        assert_eq!(message.message_id_hex, "reply");
+        assert_eq!(message.reply_to_message_id_hex.as_deref(), Some("parent"));
+        let preview = message.reply_preview.as_ref().expect("reply preview");
+        assert_eq!(preview.message_id_hex, "parent");
+        assert_eq!(preview.sender, "alice");
+        assert_eq!(preview.plaintext, "the original");
+        assert!(!preview.deleted);
     }
 
     #[test]

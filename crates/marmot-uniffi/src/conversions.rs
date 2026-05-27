@@ -19,8 +19,8 @@ use marmot_app::{
     NotificationTrigger, NotificationUpdate, NotificationUser, NotificationWakeSource,
     PushPlatform, PushRegistration, ReceivedMessage, RelayPlaneHealth, RuntimeAgentStreamUpdate,
     RuntimeMessageReceived, RuntimeMessageUpdate, SendSummary, TimelineMessageRecord, TimelinePage,
-    TimelineReactionSummary, TimelineUserReaction, UserProfileMetadata, account_id_hex_from_ref,
-    npub_for_account_id,
+    TimelineReactionSummary, TimelineReplyPreview, TimelineUserReaction, UserProfileMetadata,
+    account_id_hex_from_ref, npub_for_account_id,
 };
 
 use crate::errors::MarmotKitError;
@@ -619,6 +619,31 @@ pub struct TimelineMessageQueryFfi {
 }
 
 #[derive(Clone, Debug, uniffi::Record)]
+pub struct TimelineReplyPreviewFfi {
+    pub message_id_hex: String,
+    pub sender: String,
+    pub plaintext: String,
+    pub kind: u64,
+    pub media_json: Option<String>,
+    pub agent_text_stream_json: Option<String>,
+    pub deleted: bool,
+}
+
+impl From<TimelineReplyPreview> for TimelineReplyPreviewFfi {
+    fn from(value: TimelineReplyPreview) -> Self {
+        Self {
+            message_id_hex: value.message_id_hex,
+            sender: value.sender,
+            plaintext: value.plaintext,
+            kind: value.kind,
+            media_json: value.media.map(|media| media.to_string()),
+            agent_text_stream_json: value.agent_text_stream.map(|stream| stream.to_string()),
+            deleted: value.deleted,
+        }
+    }
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
 pub struct TimelineMessageRecordFfi {
     pub message_id_hex: String,
     pub source_message_id_hex: Option<String>,
@@ -631,6 +656,7 @@ pub struct TimelineMessageRecordFfi {
     pub timeline_at: u64,
     pub received_at: u64,
     pub reply_to_message_id_hex: Option<String>,
+    pub reply_preview: Option<TimelineReplyPreviewFfi>,
     pub media_json: Option<String>,
     pub agent_text_stream_json: Option<String>,
     pub reactions: TimelineReactionSummaryFfi,
@@ -652,6 +678,7 @@ impl From<TimelineMessageRecord> for TimelineMessageRecordFfi {
             timeline_at: value.timeline_at,
             received_at: value.received_at,
             reply_to_message_id_hex: value.reply_to_message_id_hex,
+            reply_preview: value.reply_preview.map(Into::into),
             media_json: value.media.map(|media| media.to_string()),
             agent_text_stream_json: value.agent_text_stream.map(|stream| stream.to_string()),
             reactions: value.reactions.into(),
@@ -1344,6 +1371,15 @@ mod tests {
             timeline_at: 10,
             received_at: 11,
             reply_to_message_id_hex: Some("parent".to_owned()),
+            reply_preview: Some(TimelineReplyPreview {
+                message_id_hex: "parent".to_owned(),
+                sender: "bb".repeat(32),
+                plaintext: "parent text".to_owned(),
+                kind: 9,
+                media: None,
+                agent_text_stream: None,
+                deleted: false,
+            }),
             media: Some(serde_json::json!({
                 "imeta": [["imeta", "url https://blob.example/file"]]
             })),
@@ -1376,6 +1412,11 @@ mod tests {
         assert_eq!(message.message_id_hex, "message-1");
         assert_eq!(message.source_message_id_hex.as_deref(), Some("source-1"));
         assert_eq!(message.reply_to_message_id_hex.as_deref(), Some("parent"));
+        let preview = message.reply_preview.as_ref().expect("reply preview");
+        assert_eq!(preview.message_id_hex, "parent");
+        assert_eq!(preview.sender, "bb".repeat(32));
+        assert_eq!(preview.plaintext, "parent text");
+        assert!(!preview.deleted);
         assert_eq!(message.tags[0].values, vec!["q", "parent"]);
         assert_eq!(
             message.media_json.as_deref(),

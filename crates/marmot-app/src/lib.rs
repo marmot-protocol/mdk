@@ -131,7 +131,7 @@ pub use notifications::{
 pub use relay_plane::{MarmotRelayPlane, MarmotRelayPlaneAccountAdapter, RelayPlaneHealth};
 pub use storage_sqlite::{
     TimelineMessageQuery, TimelineMessageRecord, TimelinePage, TimelinePagination,
-    TimelineReactionSummary, TimelineUserReaction,
+    TimelineReactionSummary, TimelineReplyPreview, TimelineUserReaction,
 };
 
 use directory::{DirectoryCache, DirectorySyncHandle, DirectorySyncPlan};
