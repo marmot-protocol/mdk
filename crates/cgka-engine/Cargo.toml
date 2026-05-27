@@ -20,6 +20,7 @@ tracing.workspace = true
 serde = { workspace = true }
 serde_json.workspace = true
 hex.workspace = true
+marmot-forensics.workspace = true
 rand.workspace = true
 sha2.workspace = true
 # Pure-Rust secp256k1 used only to validate that a Marmot credential identity

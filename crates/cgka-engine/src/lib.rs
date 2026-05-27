@@ -43,6 +43,7 @@ pub mod distributed_convergence;
 pub mod engine;
 pub mod epoch_manager;
 pub mod feature_registry;
+pub mod forensics;
 pub mod fork_recovery;
 pub mod group_context_view;
 pub mod group_lifecycle;

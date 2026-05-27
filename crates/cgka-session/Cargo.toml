@@ -8,6 +8,7 @@ publish.workspace = true
 [dependencies]
 cgka-engine.workspace = true
 cgka-traits.workspace = true
+marmot-forensics.workspace = true
 storage-sqlite.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

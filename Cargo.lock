@@ -695,6 +695,7 @@ dependencies = [
  "hex",
  "insta",
  "k256",
+ "marmot-forensics",
  "openmls",
  "openmls_basic_credential",
  "openmls_memory_storage",
@@ -721,6 +722,7 @@ dependencies = [
  "cgka-engine",
  "cgka-traits",
  "hex",
+ "marmot-forensics",
  "nostr",
  "serde",
  "serde_json",
@@ -2502,6 +2504,7 @@ dependencies = [
  "cgka-traits",
  "hex",
  "keyring-core",
+ "marmot-forensics",
  "nostr",
  "serde",
  "serde_json",
@@ -2527,6 +2530,7 @@ dependencies = [
  "hex",
  "hkdf",
  "marmot-account",
+ "marmot-forensics",
  "nostr",
  "nostr-relay-builder",
  "nostr-sdk",
@@ -2549,6 +2553,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "marmot-forensics"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "serde",
+ "sha2",
+]
+
+[[package]]
+name = "marmot-forensics-analyzer"
+version = "0.1.0"
+dependencies = [
+ "cgka-conformance-simulator",
+ "clap",
+ "marmot-forensics",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "marmot-uniffi"
 version = "0.1.0"
 dependencies = [
@@ -2558,6 +2582,7 @@ dependencies = [
  "marmot-account",
  "marmot-app",
  "rand 0.8.6",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",

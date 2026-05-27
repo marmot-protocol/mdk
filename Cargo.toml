@@ -10,6 +10,8 @@ members = [
     "crates/transport-nostr-adapter",
     "crates/transport-quic-stream",
     "crates/transport-quic-broker",
+    "crates/marmot-forensics",
+    "crates/marmot-forensics-analyzer",
     "crates/marmot-account",
     "crates/marmot-app",
     "crates/marmot-uniffi",
@@ -81,6 +83,8 @@ transport-nostr-peeler = { path = "crates/transport-nostr-peeler" }
 transport-nostr-adapter = { path = "crates/transport-nostr-adapter" }
 transport-quic-stream = { path = "crates/transport-quic-stream" }
 transport-quic-broker = { path = "crates/transport-quic-broker" }
+marmot-forensics = { path = "crates/marmot-forensics" }
+marmot-forensics-analyzer = { path = "crates/marmot-forensics-analyzer" }
 marmot-account = { path = "crates/marmot-account" }
 marmot-app = { path = "crates/marmot-app" }
 marmot-uniffi = { path = "crates/marmot-uniffi" }

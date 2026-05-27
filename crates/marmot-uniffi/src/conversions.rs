@@ -13,7 +13,7 @@ use marmot_app::{
     AccountKeyPackageRecord, AccountRelayListState, AccountRelayListStatus,
     AppGroupAdminPolicyComponent, AppGroupMemberRecord, AppGroupMlsState,
     AppGroupNostrRoutingComponent, AppGroupProfileComponent, AppGroupRecord, AppMessageRecord,
-    GroupInviteDeclineResult, GroupPushDebugInfo, GroupPushTokenDebugEntry,
+    ForensicsDumpMode, GroupInviteDeclineResult, GroupPushDebugInfo, GroupPushTokenDebugEntry,
     LocalPushRegistrationDebug, MarmotAppEvent, MediaDownloadResult, MediaReference,
     MediaUploadRequest, MediaUploadResult, NotificationCollectionStatus, NotificationSettings,
     NotificationTrigger, NotificationUpdate, NotificationUser, NotificationWakeSource,
@@ -838,6 +838,21 @@ pub(crate) fn group_management_state_ffi(
         can_leave,
         requires_self_demote_before_leave,
         member_actions,
+    }
+}
+
+#[derive(Clone, Copy, Debug, uniffi::Enum)]
+pub enum ForensicsDumpModeFfi {
+    Public,
+    Sensitive,
+}
+
+impl From<ForensicsDumpModeFfi> for ForensicsDumpMode {
+    fn from(value: ForensicsDumpModeFfi) -> Self {
+        match value {
+            ForensicsDumpModeFfi::Public => Self::Public,
+            ForensicsDumpModeFfi::Sensitive => Self::Sensitive,
+        }
     }
 }
 

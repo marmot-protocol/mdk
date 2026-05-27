@@ -19,7 +19,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use cgka_traits::{GroupId, TransportEndpoint};
 use marmot_app::{
-    AccountSetupRequest, AppMessageQuery, MarmotApp, MarmotAppRuntime, UserProfileMetadata,
+    AccountSetupRequest, AppMessageQuery, ForensicsExportOptions, MarmotApp, MarmotAppRuntime,
+    UserProfileMetadata,
 };
 use rand::RngCore;
 use rand::rngs::OsRng;
@@ -44,11 +45,12 @@ use subscriptions::{
 uniffi::setup_scaffolding!();
 
 pub use conversions::{
-    BackgroundNotificationCollectionFfi, GroupPushDebugInfoFfi, GroupPushTokenDebugEntryFfi,
-    LocalPushRegistrationDebugFfi, MediaDownloadResultFfi, MediaRecordFfi, MediaReferenceFfi,
-    MediaUploadRequestFfi, MediaUploadResultFfi, NotificationCollectionStatusFfi,
-    NotificationSettingsFfi, NotificationTriggerFfi, NotificationUpdateFfi, NotificationUserFfi,
-    NotificationWakeSourceFfi, PushPlatformFfi, PushRegistrationFfi,
+    BackgroundNotificationCollectionFfi, ForensicsDumpModeFfi, GroupPushDebugInfoFfi,
+    GroupPushTokenDebugEntryFfi, LocalPushRegistrationDebugFfi, MediaDownloadResultFfi,
+    MediaRecordFfi, MediaReferenceFfi, MediaUploadRequestFfi, MediaUploadResultFfi,
+    NotificationCollectionStatusFfi, NotificationSettingsFfi, NotificationTriggerFfi,
+    NotificationUpdateFfi, NotificationUserFfi, NotificationWakeSourceFfi, PushPlatformFfi,
+    PushRegistrationFfi,
 };
 
 /// Convenience: turn an FFI string list of relay URLs into the engine's
@@ -64,6 +66,29 @@ fn random_agent_stream_id() -> Vec<u8> {
     let mut stream_id = vec![0; 32];
     OsRng.fill_bytes(&mut stream_id);
     stream_id
+}
+
+fn random_forensics_public_salt() -> Vec<u8> {
+    let mut salt = vec![0_u8; 32];
+    OsRng.fill_bytes(&mut salt);
+    salt
+}
+
+fn forensics_public_salt(
+    public_redaction_salt_hex: Option<String>,
+) -> Result<Vec<u8>, MarmotKitError> {
+    let Some(value) = public_redaction_salt_hex else {
+        return Ok(random_forensics_public_salt());
+    };
+    let salt = hex::decode(value.trim()).map_err(|err| MarmotKitError::InvalidHex {
+        details: err.to_string(),
+    })?;
+    if salt.len() < 16 {
+        return Err(MarmotKitError::InvalidHex {
+            details: "public redaction salt must be at least 16 bytes".to_owned(),
+        });
+    }
+    Ok(salt)
 }
 
 fn unix_now_seconds() -> u64 {
@@ -839,6 +864,34 @@ impl Marmot {
         Ok(state.into())
     }
 
+    /// Export a forensic JSON bundle for this account/device's local view of a
+    /// group. Public mode redacts operational identifiers, payload bytes, and
+    /// stable payload digests. Pass the same public salt across devices when
+    /// comparing public dumps from one incident.
+    pub async fn group_forensics_json(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+        mode: ForensicsDumpModeFfi,
+        public_redaction_salt_hex: Option<String>,
+    ) -> Result<String, MarmotKitError> {
+        let group_id = group_id_from_hex(&group_id_hex)?;
+        let mode = mode.into();
+        let options = match mode {
+            marmot_app::ForensicsDumpMode::Public => {
+                ForensicsExportOptions::public(forensics_public_salt(public_redaction_salt_hex)?)
+            }
+            marmot_app::ForensicsDumpMode::Sensitive => ForensicsExportOptions::sensitive(),
+        };
+        let bundle = self
+            .runtime
+            .group_forensics_bundle(&account_ref, &group_id, options)
+            .await?;
+        serde_json::to_string_pretty(&bundle).map_err(|err| MarmotKitError::Runtime {
+            details: err.to_string(),
+        })
+    }
+
     /// Flag a group archived (or restore it). Local-only projection state —
     /// it does not change membership or publish anything. The chats list
     /// filters archived groups unless `include_archived` is set.
@@ -1386,5 +1439,20 @@ mod tests {
         let err = ensure_can_demote_admin(&state(false, false), &group_id_hex, member_id)
             .expect_err("non-admin caller should fail");
         assert!(matches!(err, MarmotKitError::NotGroupAdmin { .. }));
+    }
+
+    #[test]
+    fn forensics_public_salt_accepts_shared_hex_salt() {
+        let salt_hex = "11".repeat(32);
+        let salt = forensics_public_salt(Some(salt_hex)).expect("valid salt");
+
+        assert_eq!(salt, vec![0x11; 32]);
+    }
+
+    #[test]
+    fn forensics_public_salt_rejects_tiny_salt() {
+        let err = forensics_public_salt(Some("11".repeat(4))).expect_err("tiny salt rejected");
+
+        assert!(matches!(err, MarmotKitError::InvalidHex { .. }));
     }
 }

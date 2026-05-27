@@ -103,6 +103,11 @@ pub use groups::{
     AppGroupNostrRoutingComponent, AppGroupProfileComponent, AppGroupRecord,
 };
 pub use ids::{account_id_hex_from_ref, npub_for_account_id};
+pub use marmot_forensics::{
+    FORENSICS_SCHEMA_VERSION, ForensicsAccount, ForensicsBundle, ForensicsDumpMode,
+    ForensicsEngineGroupState, ForensicsExportOptions, ForensicsGroup, ForensicsMessage,
+    ForensicsOpenMlsMessage, ForensicsProducer, ForensicsSnapshot,
+};
 pub use media::{
     DEFAULT_BLOSSOM_SERVER_URL, MediaDownloadResult, MediaReference, MediaUploadRequest,
     MediaUploadResult,
