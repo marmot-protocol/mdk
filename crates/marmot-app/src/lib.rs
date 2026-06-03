@@ -87,7 +87,7 @@ pub(crate) use groups::AppGroupImageInput;
 pub(crate) use runtime::blocking_app_task;
 pub use runtime::{
     AccountManager, AccountSetupRequest, AccountSetupResult, AgentStreamWatchOptions,
-    ManagedAccount, MarmotAppEvent, MarmotAppRuntime, RuntimeAccountError,
+    ChatListUpdateTrigger, ManagedAccount, MarmotAppEvent, MarmotAppRuntime, RuntimeAccountError,
     RuntimeAgentStreamMessage, RuntimeAgentStreamUpdate, RuntimeAgentStreamWatch,
     RuntimeChatListSubscription, RuntimeChatListUpdate, RuntimeChatsSubscription,
     RuntimeEventsSubscription, RuntimeGroupEvent, RuntimeGroupStateSubscription,
@@ -95,6 +95,7 @@ pub use runtime::{
     RuntimeNotificationsSubscription, RuntimeProjectionUpdate, RuntimeSharedServices,
     RuntimeTimelineMessageUpdate, RuntimeTimelineMessagesSubscription, StreamStartView,
 };
+pub use storage_sqlite::{TimelineMessageChange, TimelineRemoveReason, TimelineUpdateTrigger};
 
 pub use agent_streams::{
     AgentStreamDelta, AgentStreamUpdate, AgentStreamWatchCompletion, AgentStreamWatchManager,
@@ -352,7 +353,11 @@ pub struct ReceivedMessage {
 pub struct AppProjectionUpdate {
     pub group_id_hex: String,
     pub timeline_messages: Vec<TimelineMessageRecord>,
+    #[serde(default)]
+    pub timeline_changes: Vec<TimelineMessageChange>,
     pub chat_list_row: Option<ChatListRow>,
+    #[serde(default)]
+    pub chat_list_trigger: ChatListUpdateTrigger,
 }
 
 fn remember_seen_event(state: &mut AccountState, event_id: String) {
@@ -2806,16 +2811,34 @@ impl MarmotApp {
             .transpose()
     }
 
+    pub(crate) fn invalidate_timeline_app_event(
+        &self,
+        label: &str,
+        message_id_hex: &str,
+        reason: &str,
+    ) -> Result<Option<AppProjectionUpdate>, AppError> {
+        let update = self
+            .account_storage(label)?
+            .invalidate_app_event_by_message_id(message_id_hex, reason)?;
+        update
+            .map(|update| self.app_projection_update(label, update))
+            .transpose()
+    }
+
     fn app_projection_update(
         &self,
         label: &str,
         storage_update: TimelineProjectionUpdate,
     ) -> Result<AppProjectionUpdate, AppError> {
         let chat_list_row = self.refresh_chat_list_row(label, &storage_update.group_id_hex)?;
+        let chat_list_trigger =
+            ChatListUpdateTrigger::from_timeline_changes(&storage_update.changes);
         Ok(AppProjectionUpdate {
             group_id_hex: storage_update.group_id_hex,
             timeline_messages: storage_update.messages,
+            timeline_changes: storage_update.changes,
             chat_list_row,
+            chat_list_trigger,
         })
     }
 
@@ -4550,6 +4573,20 @@ mod tests {
 
     use crate::messages::STREAM_ROUTE_QUIC;
     use crate::messages::{AppMessageIntent, build_inner_event};
+
+    #[test]
+    fn legacy_projection_update_json_defaults_new_streaming_fields() {
+        let update: AppProjectionUpdate = serde_json::from_str(
+            r#"{"group_id_hex":"group","timeline_messages":[],"chat_list_row":null}"#,
+        )
+        .unwrap();
+
+        assert!(update.timeline_changes.is_empty());
+        assert_eq!(
+            update.chat_list_trigger,
+            ChatListUpdateTrigger::SnapshotRefresh
+        );
+    }
 
     fn relay_delivery(event_id: String, pubkey: String) -> cgka_traits::TransportDelivery {
         let event = NostrTransportEvent {

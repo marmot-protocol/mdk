@@ -1292,6 +1292,7 @@ fn wait_until_projected_agent_stream_message(
     let deadline = Instant::now() + POLL_TIMEOUT;
     let mut last = Value::Null;
     while Instant::now() < deadline {
+        run_json_with_relay(home, relay, &["--account", account, "sync"]);
         let messages = run_json_with_relay(
             home,
             relay,

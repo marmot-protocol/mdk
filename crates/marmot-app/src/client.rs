@@ -432,13 +432,30 @@ impl AppClient {
         group_id: &GroupId,
         payload: &[u8],
     ) -> Result<SendSummary, AppError> {
+        self.send_with_local_projection(group_id, payload, |_| {})
+            .await
+    }
+
+    pub(crate) async fn send_with_local_projection<F>(
+        &mut self,
+        group_id: &GroupId,
+        payload: &[u8],
+        on_local_projection: F,
+    ) -> Result<SendSummary, AppError>
+    where
+        F: FnMut(crate::AppProjectionUpdate),
+    {
         // The transport-facing `send` carries plain UTF-8 chat text; structured
         // payloads use `send_app_event` with a typed intent.
         let content = String::from_utf8(payload.to_vec()).map_err(|_| {
             AppError::InvalidAppMessagePayload("chat message must be valid UTF-8".into())
         })?;
         let (_event, summary) = self
-            .send_app_event(group_id, AppMessageIntent::Chat { content })
+            .send_app_event_with_local_projection(
+                group_id,
+                AppMessageIntent::Chat { content },
+                on_local_projection,
+            )
             .await?;
         Ok(summary)
     }
@@ -452,6 +469,19 @@ impl AppClient {
         group_id: &GroupId,
         intent: AppMessageIntent,
     ) -> Result<(MarmotInnerEvent, SendSummary), AppError> {
+        self.send_app_event_with_local_projection(group_id, intent, |_| {})
+            .await
+    }
+
+    pub(crate) async fn send_app_event_with_local_projection<F>(
+        &mut self,
+        group_id: &GroupId,
+        intent: AppMessageIntent,
+        mut on_local_projection: F,
+    ) -> Result<(MarmotInnerEvent, SendSummary), AppError>
+    where
+        F: FnMut(crate::AppProjectionUpdate),
+    {
         self.ensure_group(group_id)?;
         let sender = self
             .app
@@ -473,53 +503,66 @@ impl AppClient {
         };
         let event = build_inner_event(&intent, &sender, unix_now_seconds())?;
         let payload = encode_inner_event(&event)?;
-
-        self.sync_runtime_groups().await?;
-        let effects = self
-            .runtime
-            .send(SendIntent::AppMessage {
-                group_id: group_id.clone(),
-                payload,
-            })
-            .await?;
-        fail_if_publish_failed(&effects.failures)?;
-        self.remember_published_reports(&effects);
         let group_id_hex = hex::encode(group_id.as_slice());
         let app_event_id = event.id.clone();
+
+        let should_project_locally = !notifications::is_push_gossip_kind(event.kind);
+        if should_project_locally {
+            let update =
+                self.record_local_app_event_projection(&group_id_hex, &sender, &event, None)?;
+            on_local_projection(update);
+        }
+
+        let effects = match async {
+            self.sync_runtime_groups().await?;
+            let effects = self
+                .runtime
+                .send(SendIntent::AppMessage {
+                    group_id: group_id.clone(),
+                    payload,
+                })
+                .await?;
+            fail_if_publish_failed(&effects.failures)?;
+            Ok::<_, AppError>(effects)
+        }
+        .await
+        {
+            Ok(effects) => effects,
+            Err(err) => {
+                if should_project_locally {
+                    match self.app.invalidate_timeline_app_event(
+                        &self.state.label,
+                        &app_event_id,
+                        "local_publish_failed",
+                    ) {
+                        Ok(Some(update)) => on_local_projection(update),
+                        Ok(None) => {}
+                        Err(_) => {
+                            tracing::warn!(
+                                target: "marmot_app::messages",
+                                method = "send_app_event_with_local_projection",
+                                error_code = "local_projection_retract_failed",
+                                "failed to retract local projection after publish failure"
+                            );
+                        }
+                    }
+                }
+                return Err(err);
+            }
+        };
+        self.remember_published_reports(&effects);
         let source_message_id_hex = effects
             .reports
             .first()
             .map(|report| hex::encode(report.message_id.as_slice()));
-        if !notifications::is_push_gossip_kind(event.kind) {
-            let message_projection = AppMessageProjection {
-                message_id_hex: app_event_id.clone(),
+        if should_project_locally {
+            let update = self.record_local_app_event_projection(
+                &group_id_hex,
+                &sender,
+                &event,
                 source_message_id_hex,
-                direction: "sent".to_owned(),
-                group_id_hex: group_id_hex.clone(),
-                sender: sender.clone(),
-                plaintext: event.content.clone(),
-                kind: event.kind,
-                tags: event.tags.clone(),
-                recorded_at: None,
-            };
-            self.app
-                .record_account_app_event(&self.state.label, &message_projection)?;
-            if event.kind == MARMOT_APP_EVENT_KIND_CHAT {
-                let read_marker = self.app.mark_timeline_message_read(
-                    &self.state.label,
-                    &group_id_hex,
-                    &app_event_id,
-                );
-                if let Err(err) = read_marker {
-                    let error_code = read_marker_error_code(&err);
-                    tracing::warn!(
-                        target: "marmot_app::messages",
-                        method = "send_app_event",
-                        error_code = %error_code,
-                        "local read marker update skipped after successful send",
-                    );
-                }
-            }
+            )?;
+            on_local_projection(update);
             self.prune_plaintext_retention_for_group(group_id)?;
         }
         self.app.save_state(&self.state)?;
@@ -537,6 +580,44 @@ impl AppClient {
                 message_ids: vec![app_event_id],
             },
         ))
+    }
+
+    fn record_local_app_event_projection(
+        &self,
+        group_id_hex: &str,
+        sender: &str,
+        event: &MarmotInnerEvent,
+        source_message_id_hex: Option<String>,
+    ) -> Result<crate::AppProjectionUpdate, AppError> {
+        let message_projection = AppMessageProjection {
+            message_id_hex: event.id.clone(),
+            source_message_id_hex,
+            direction: "sent".to_owned(),
+            group_id_hex: group_id_hex.to_owned(),
+            sender: sender.to_owned(),
+            plaintext: event.content.clone(),
+            kind: event.kind,
+            tags: event.tags.clone(),
+            recorded_at: Some(event.created_at),
+        };
+        let update = self
+            .app
+            .record_account_app_event(&self.state.label, &message_projection)?;
+        if event.kind == MARMOT_APP_EVENT_KIND_CHAT {
+            let read_marker =
+                self.app
+                    .mark_timeline_message_read(&self.state.label, group_id_hex, &event.id);
+            if let Err(err) = read_marker {
+                let error_code = read_marker_error_code(&err);
+                tracing::warn!(
+                    target: "marmot_app::messages",
+                    method = "record_local_app_event_projection",
+                    error_code = %error_code,
+                    "local read marker update skipped after local send projection",
+                );
+            }
+        }
+        Ok(update)
     }
 
     pub(crate) async fn share_push_registration(&mut self) -> Result<usize, AppError> {
@@ -863,12 +944,32 @@ impl AppClient {
         stream_id: &[u8],
         quic_candidates: Vec<String>,
     ) -> Result<(MarmotInnerEvent, SendSummary), AppError> {
-        self.send_app_event(
+        self.start_agent_text_stream_with_local_projection(
+            group_id,
+            stream_id,
+            quic_candidates,
+            |_| {},
+        )
+        .await
+    }
+
+    pub(crate) async fn start_agent_text_stream_with_local_projection<F>(
+        &mut self,
+        group_id: &GroupId,
+        stream_id: &[u8],
+        quic_candidates: Vec<String>,
+        on_local_projection: F,
+    ) -> Result<(MarmotInnerEvent, SendSummary), AppError>
+    where
+        F: FnMut(crate::AppProjectionUpdate),
+    {
+        self.send_app_event_with_local_projection(
             group_id,
             AppMessageIntent::StreamStart {
                 stream_id: stream_id.to_vec(),
                 quic_candidates,
             },
+            on_local_projection,
         )
         .await
     }
@@ -878,8 +979,25 @@ impl AppClient {
         group_id: &GroupId,
         request: AgentTextStreamFinishRequest,
     ) -> Result<(MarmotInnerEvent, SendSummary), AppError> {
-        self.send_app_event(group_id, AppMessageIntent::StreamFinal { request })
+        self.finish_agent_text_stream_with_local_projection(group_id, request, |_| {})
             .await
+    }
+
+    pub(crate) async fn finish_agent_text_stream_with_local_projection<F>(
+        &mut self,
+        group_id: &GroupId,
+        request: AgentTextStreamFinishRequest,
+        on_local_projection: F,
+    ) -> Result<(MarmotInnerEvent, SendSummary), AppError>
+    where
+        F: FnMut(crate::AppProjectionUpdate),
+    {
+        self.send_app_event_with_local_projection(
+            group_id,
+            AppMessageIntent::StreamFinal { request },
+            on_local_projection,
+        )
+        .await
     }
 
     pub async fn retry_group_convergence(

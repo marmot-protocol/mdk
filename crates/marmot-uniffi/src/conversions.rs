@@ -20,9 +20,10 @@ use marmot_app::{
     NotificationTrigger, NotificationUpdate, NotificationUser, NotificationWakeSource,
     PushPlatform, PushRegistration, ReceivedMessage, RelayPlaneHealth, RuntimeAgentStreamUpdate,
     RuntimeChatListUpdate, RuntimeMessageReceived, RuntimeMessageUpdate, RuntimeProjectionUpdate,
-    RuntimeTimelineMessageUpdate, SendSummary, TimelineMessageRecord, TimelinePage,
-    TimelineReactionSummary, TimelineReplyPreview, TimelineUserReaction, UserProfileMetadata,
-    account_id_hex_from_ref, npub_for_account_id,
+    RuntimeTimelineMessageUpdate, SendSummary, TimelineMessageChange, TimelineMessageRecord,
+    TimelinePage, TimelineReactionSummary, TimelineRemoveReason, TimelineReplyPreview,
+    TimelineUpdateTrigger, TimelineUserReaction, UserProfileMetadata, account_id_hex_from_ref,
+    npub_for_account_id,
 };
 
 use crate::errors::MarmotKitError;
@@ -646,17 +647,64 @@ impl From<ChatListRow> for ChatListRowFfi {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, uniffi::Enum)]
 pub enum ChatListSubscriptionUpdateFfi {
-    Row { row: ChatListRowFfi },
-    RemoveRow { group_id_hex: String },
+    Row {
+        trigger: ChatListUpdateTriggerFfi,
+        row: ChatListRowFfi,
+    },
+    RemoveRow {
+        trigger: ChatListUpdateTriggerFfi,
+        group_id_hex: String,
+    },
 }
 
 impl From<RuntimeChatListUpdate> for ChatListSubscriptionUpdateFfi {
     fn from(value: RuntimeChatListUpdate) -> Self {
         match value {
-            RuntimeChatListUpdate::Row(row) => Self::Row { row: row.into() },
-            RuntimeChatListUpdate::RemoveRow { group_id_hex } => Self::RemoveRow { group_id_hex },
+            RuntimeChatListUpdate::Row { trigger, row } => Self::Row {
+                trigger: trigger.into(),
+                row: (*row).into(),
+            },
+            RuntimeChatListUpdate::RemoveRow {
+                trigger,
+                group_id_hex,
+            } => Self::RemoveRow {
+                trigger: trigger.into(),
+                group_id_hex,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, uniffi::Enum)]
+pub enum ChatListUpdateTriggerFfi {
+    NewGroup,
+    NewLastMessage,
+    LastMessageDeleted,
+    ArchiveChanged,
+    PendingConfirmationChanged,
+    MembershipChanged,
+    UnreadChanged,
+    SnapshotRefresh,
+    Removed,
+}
+
+impl From<marmot_app::ChatListUpdateTrigger> for ChatListUpdateTriggerFfi {
+    fn from(value: marmot_app::ChatListUpdateTrigger) -> Self {
+        match value {
+            marmot_app::ChatListUpdateTrigger::NewGroup => Self::NewGroup,
+            marmot_app::ChatListUpdateTrigger::NewLastMessage => Self::NewLastMessage,
+            marmot_app::ChatListUpdateTrigger::LastMessageDeleted => Self::LastMessageDeleted,
+            marmot_app::ChatListUpdateTrigger::ArchiveChanged => Self::ArchiveChanged,
+            marmot_app::ChatListUpdateTrigger::PendingConfirmationChanged => {
+                Self::PendingConfirmationChanged
+            }
+            marmot_app::ChatListUpdateTrigger::MembershipChanged => Self::MembershipChanged,
+            marmot_app::ChatListUpdateTrigger::UnreadChanged => Self::UnreadChanged,
+            marmot_app::ChatListUpdateTrigger::SnapshotRefresh => Self::SnapshotRefresh,
+            marmot_app::ChatListUpdateTrigger::Removed => Self::Removed,
         }
     }
 }
@@ -805,11 +853,96 @@ impl From<TimelinePage> for TimelinePageFfi {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
+#[derive(Clone, Debug, uniffi::Enum)]
+pub enum TimelineMessageChangeFfi {
+    Upsert {
+        trigger: TimelineUpdateTriggerFfi,
+        message: TimelineMessageRecordFfi,
+    },
+    Remove {
+        message_id_hex: String,
+        reason: TimelineRemoveReasonFfi,
+    },
+}
+
+impl From<TimelineMessageChange> for TimelineMessageChangeFfi {
+    fn from(value: TimelineMessageChange) -> Self {
+        match value {
+            TimelineMessageChange::Upsert { trigger, message } => Self::Upsert {
+                trigger: trigger.into(),
+                message: (*message).into(),
+            },
+            TimelineMessageChange::Remove {
+                message_id_hex,
+                reason,
+            } => Self::Remove {
+                message_id_hex,
+                reason: reason.into(),
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, uniffi::Enum)]
+pub enum TimelineUpdateTriggerFfi {
+    NewMessage,
+    MessageEditedOrReprojected,
+    ReactionAdded,
+    ReactionRemoved,
+    MessageDeleted,
+    ReplyPreviewChanged,
+    AgentStreamStarted,
+    AgentStreamFinished,
+    DeliveryOrSendStateChanged,
+    ReceiptChanged,
+    SnapshotRefresh,
+}
+
+impl From<TimelineUpdateTrigger> for TimelineUpdateTriggerFfi {
+    fn from(value: TimelineUpdateTrigger) -> Self {
+        match value {
+            TimelineUpdateTrigger::NewMessage => Self::NewMessage,
+            TimelineUpdateTrigger::MessageEditedOrReprojected => Self::MessageEditedOrReprojected,
+            TimelineUpdateTrigger::ReactionAdded => Self::ReactionAdded,
+            TimelineUpdateTrigger::ReactionRemoved => Self::ReactionRemoved,
+            TimelineUpdateTrigger::MessageDeleted => Self::MessageDeleted,
+            TimelineUpdateTrigger::ReplyPreviewChanged => Self::ReplyPreviewChanged,
+            TimelineUpdateTrigger::AgentStreamStarted => Self::AgentStreamStarted,
+            TimelineUpdateTrigger::AgentStreamFinished => Self::AgentStreamFinished,
+            TimelineUpdateTrigger::DeliveryOrSendStateChanged => Self::DeliveryOrSendStateChanged,
+            TimelineUpdateTrigger::ReceiptChanged => Self::ReceiptChanged,
+            TimelineUpdateTrigger::SnapshotRefresh => Self::SnapshotRefresh,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, uniffi::Enum)]
+pub enum TimelineRemoveReasonFfi {
+    Invalidated,
+    Cleared,
+    Pruned,
+    NoLongerMatchesQuery,
+}
+
+impl From<TimelineRemoveReason> for TimelineRemoveReasonFfi {
+    fn from(value: TimelineRemoveReason) -> Self {
+        match value {
+            TimelineRemoveReason::Invalidated => Self::Invalidated,
+            TimelineRemoveReason::Cleared => Self::Cleared,
+            TimelineRemoveReason::Pruned => Self::Pruned,
+            TimelineRemoveReason::NoLongerMatchesQuery => Self::NoLongerMatchesQuery,
+        }
+    }
+}
+
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct TimelineProjectionUpdateFfi {
     pub group_id_hex: String,
     pub messages: Vec<TimelineMessageRecordFfi>,
+    pub changes: Vec<TimelineMessageChangeFfi>,
     pub chat_list_row: Option<ChatListRowFfi>,
+    pub chat_list_trigger: ChatListUpdateTriggerFfi,
 }
 
 impl From<AppProjectionUpdate> for TimelineProjectionUpdateFfi {
@@ -821,7 +954,9 @@ impl From<AppProjectionUpdate> for TimelineProjectionUpdateFfi {
                 .into_iter()
                 .map(Into::into)
                 .collect(),
+            changes: value.timeline_changes.into_iter().map(Into::into).collect(),
             chat_list_row: value.chat_list_row.map(Into::into),
+            chat_list_trigger: value.chat_list_trigger.into(),
         }
     }
 }

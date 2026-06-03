@@ -47,14 +47,15 @@ uniffi::setup_scaffolding!();
 
 pub use conversions::{
     BackgroundNotificationCollectionFfi, ChatListAvatarFfi, ChatListMessagePreviewFfi,
-    ChatListRowFfi, ChatListSubscriptionUpdateFfi, ForensicsDumpModeFfi, GroupPushDebugInfoFfi,
-    GroupPushTokenDebugEntryFfi, LocalPushRegistrationDebugFfi, MediaDownloadResultFfi,
-    MediaRecordFfi, MediaReferenceFfi, MediaUploadRequestFfi, MediaUploadResultFfi,
-    NotificationCollectionStatusFfi, NotificationSettingsFfi, NotificationTriggerFfi,
-    NotificationUpdateFfi, NotificationUserFfi, NotificationWakeSourceFfi, PushPlatformFfi,
-    PushRegistrationFfi, RuntimeProjectionUpdateFfi, TimelineMessageQueryFfi,
-    TimelineMessageRecordFfi, TimelinePageFfi, TimelineProjectionUpdateFfi,
-    TimelineReactionEmojiFfi, TimelineReactionSummaryFfi, TimelineSubscriptionUpdateFfi,
+    ChatListRowFfi, ChatListSubscriptionUpdateFfi, ChatListUpdateTriggerFfi, ForensicsDumpModeFfi,
+    GroupPushDebugInfoFfi, GroupPushTokenDebugEntryFfi, LocalPushRegistrationDebugFfi,
+    MediaDownloadResultFfi, MediaRecordFfi, MediaReferenceFfi, MediaUploadRequestFfi,
+    MediaUploadResultFfi, NotificationCollectionStatusFfi, NotificationSettingsFfi,
+    NotificationTriggerFfi, NotificationUpdateFfi, NotificationUserFfi, NotificationWakeSourceFfi,
+    PushPlatformFfi, PushRegistrationFfi, RuntimeProjectionUpdateFfi, TimelineMessageChangeFfi,
+    TimelineMessageQueryFfi, TimelineMessageRecordFfi, TimelinePageFfi,
+    TimelineProjectionUpdateFfi, TimelineReactionEmojiFfi, TimelineReactionSummaryFfi,
+    TimelineRemoveReasonFfi, TimelineSubscriptionUpdateFfi, TimelineUpdateTriggerFfi,
     TimelineUserReactionFfi,
 };
 
@@ -955,12 +956,11 @@ impl Marmot {
         group_id_hex: String,
         archived: bool,
     ) -> Result<AppGroupRecordFfi, MarmotKitError> {
-        let account = self.runtime.accounts().resolve(&account_ref)?;
         let group_id = group_id_from_hex(&group_id_hex)?;
         let group_id_hex = hex::encode(group_id.as_slice());
         let group = self
-            .app
-            .set_group_archived(&account.label, &group_id_hex, archived)?;
+            .runtime
+            .set_group_archived(&account_ref, &group_id_hex, archived)?;
         Ok(group.into())
     }
 

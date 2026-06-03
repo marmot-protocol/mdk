@@ -89,7 +89,7 @@ impl ChatListSubscription {
         let mut inner = self.inner.lock().await;
         loop {
             match inner.recv().await? {
-                marmot_app::RuntimeChatListUpdate::Row(row) => return Some(row.into()),
+                marmot_app::RuntimeChatListUpdate::Row { row, .. } => return Some((*row).into()),
                 marmot_app::RuntimeChatListUpdate::RemoveRow { .. } => continue,
             }
         }

@@ -1733,6 +1733,12 @@ fn timeline_projection_stream_response(
     update: marmot_app::RuntimeProjectionUpdate,
     runtime: &marmot_app::MarmotAppRuntime,
 ) -> DaemonStreamResponse {
+    let changes = update
+        .update
+        .timeline_changes
+        .into_iter()
+        .map(|change| timeline_message_change_json(change, runtime))
+        .collect::<Vec<_>>();
     let messages = update
         .update
         .timeline_messages
@@ -1749,8 +1755,34 @@ fn timeline_projection_stream_response(
         "account_label": update.account_label,
         "group_id": update.update.group_id_hex,
         "messages": messages,
+        "changes": changes,
         "chat_list_row": update.update.chat_list_row,
+        "chat_list_trigger": update.update.chat_list_trigger,
     }))
+}
+
+fn timeline_message_change_json(
+    change: marmot_app::TimelineMessageChange,
+    runtime: &marmot_app::MarmotAppRuntime,
+) -> serde_json::Value {
+    match change {
+        marmot_app::TimelineMessageChange::Upsert { trigger, message } => {
+            let display_name = runtime.display_name_for_account_id(&message.sender);
+            serde_json::json!({
+                "type": "upsert",
+                "trigger": trigger,
+                "message": crate::timeline_message_record_json(*message, display_name),
+            })
+        }
+        marmot_app::TimelineMessageChange::Remove {
+            message_id_hex,
+            reason,
+        } => serde_json::json!({
+            "type": "remove",
+            "message_id": message_id_hex,
+            "reason": reason,
+        }),
+    }
 }
 
 fn timeline_stream_type(trigger: &str) -> &'static str {
@@ -3899,6 +3931,7 @@ fn stream_result_plain(result: &serde_json::Value) -> String {
         Some("initial_timeline_page") | Some("timeline_updated") => {
             timeline_stream_page_plain(result)
         }
+        Some("timeline_projection_updated") => timeline_projection_stream_plain(result),
         _ => result.to_string(),
     }
 }
@@ -3933,6 +3966,25 @@ fn timeline_stream_page_plain(result: &serde_json::Value) -> String {
         .collect::<Vec<_>>()
         .join("\n");
     format!("{label} has_more_before={has_more_before} has_more_after={has_more_after}\n{body}")
+}
+
+fn timeline_projection_stream_plain(result: &serde_json::Value) -> String {
+    let group_id = result
+        .get("group_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("<all>");
+    let changes = result
+        .get("changes")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    let chat_list_trigger = result
+        .get("chat_list_trigger")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("SnapshotRefresh");
+    format!(
+        "timeline projection updated group={group_id} changes={changes} chat_list_trigger={chat_list_trigger}"
+    )
 }
 
 fn timeline_stream_message_plain(message: &serde_json::Value) -> String {
@@ -4705,6 +4757,28 @@ mod tests {
         assert_eq!(
             stream_result_plain(&page),
             "initial timeline page has_more_before=true has_more_after=false\ngroup=aa from=alice: hello"
+        );
+
+        let projection = serde_json::json!({
+            "type": "timeline_projection_updated",
+            "group_id": "aa",
+            "chat_list_trigger": "NewLastMessage",
+            "changes": [
+                {
+                    "type": "upsert",
+                    "trigger": "NewMessage",
+                    "message": {
+                        "message_id": "01",
+                        "group_id": "aa",
+                        "from": "alice",
+                        "plaintext": "hello"
+                    }
+                }
+            ]
+        });
+        assert_eq!(
+            stream_result_plain(&projection),
+            "timeline projection updated group=aa changes=1 chat_list_trigger=NewLastMessage"
         );
     }
 

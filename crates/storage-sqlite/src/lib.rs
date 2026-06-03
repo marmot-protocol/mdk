@@ -29,8 +29,9 @@ pub use connection::{
 pub use openmls_storage::SqliteOpenMlsStorageError;
 pub use shared::{PublicDirectoryUserRecord, SqliteSharedStorage};
 pub use timeline::{
-    StoredAppEvent, TimelineMessageQuery, TimelineMessageRecord, TimelinePage, TimelinePagination,
-    TimelineProjectionUpdate, TimelineReactionSummary, TimelineReplyPreview, TimelineUserReaction,
+    StoredAppEvent, TimelineMessageChange, TimelineMessageQuery, TimelineMessageRecord,
+    TimelinePage, TimelinePagination, TimelineProjectionUpdate, TimelineReactionSummary,
+    TimelineRemoveReason, TimelineReplyPreview, TimelineUpdateTrigger, TimelineUserReaction,
 };
 
 pub(crate) use codec::{
