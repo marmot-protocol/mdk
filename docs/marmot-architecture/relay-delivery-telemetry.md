@@ -174,15 +174,19 @@ is the empirical correction to add on top of the cross-relay-spread floor when
 
 ### Where it lives
 
-The engine has no metrics struct today (unlike the adapter's `NostrAdapterMetrics`). The natural home is a counters
-struct on `Engine<S>`, incremented at the apply/settle site (`crates/cgka-engine/src/distributed_convergence.rs`, where
-`set_stable` runs and `EpochChanged` / `ForkRecovered` are emitted), with a per-group in-memory last-applied record for
-reorg classification, exposed by a new `engine_metrics()`-style accessor alongside the existing `drain_events()`.
+`EngineMetrics` ([`crates/cgka-engine/src/engine_metrics.rs`](../../crates/cgka-engine/src/engine_metrics.rs)) is the
+counters struct on `Engine<S>`. It is incremented at the apply/settle site
+(`crates/cgka-engine/src/distributed_convergence.rs`, where `set_stable` runs and `EpochChanged` is emitted), keeps a
+per-group in-memory last-applied record (tip, branch id, settle time, and a settled-since-apply flag) for reorg
+classification, and is read through the `Engine::engine_metrics()` accessor alongside the existing `drain_events()`. The
+classifier uses the selected branch's fork epoch (now surfaced on `CanonicalizationResult::selected_fork_epoch`): a
+settle whose new branch differs from the prior settled branch and forks *strictly below* the previously-applied tip is a
+post-settle reorg; forking *at* the tip is a forward advance and is not counted.
 
 Like all telemetry here it is **diagnostic only and must never feed convergence or branch selection**, and the snapshot
-carries only counts and millisecond buckets — no group ids, epochs, branch ids, or member ids in any emitted form.
-Because it is engine-side it is not an adapter metric; it joins the export path through the relay-plane rollup and ships
-to Grafana over the same OTLP exporter as the relay metrics.
+(`EngineMetricsSnapshot`) carries only counts and millisecond/commit buckets — no group ids, epochs, branch ids, or
+member ids in any emitted form. Because it is engine-side it is not an adapter metric; it joins the export path through
+the relay-plane rollup and ships to Grafana over the same OTLP exporter as the relay metrics.
 
 ### Open questions
 
@@ -252,8 +256,11 @@ the engine against settle outcomes and is out of scope for the adapter.
    ([`telemetry::RelaySyncTelemetry`](../../crates/transport-nostr-adapter/src/telemetry.rs)). *Resolving* those opaque
    indices to relay identity for export is the broad-observability workstream
    ([`relay-observability.md`](./relay-observability.md)).
-3. **Engine-side reorg-rate telemetry.** *Specified*, implementation pending. Closes the quiescence loss function by
-   measuring post-settle reorgs; see [Validation: post-settle reorg rate](#validation-post-settle-reorg-rate).
+3. **Engine-side reorg-rate telemetry.** *Done.* Closes the quiescence loss function by measuring post-settle reorgs.
+   `EngineMetrics` records `settles`, `post_settle_reorgs`, `reorg_rewind_depth`, and `reorg_lateness_ms` at the
+   convergence apply site and exposes them via `Engine::engine_metrics()`
+   ([`crates/cgka-engine/src/engine_metrics.rs`](../../crates/cgka-engine/src/engine_metrics.rs)); see
+   [Validation: post-settle reorg rate](#validation-post-settle-reorg-rate).
 4. **Set the static value from data.** Aggregate (1) and (3) over real relays and groups, read the distributions, and
    choose the negotiated `settlement_quiescence_ms`. An offline operator/analysis step, not a runtime controller.
 5. **Set reconciliation (NIP-77).** Fetch-completeness backstop for backdated late commits.

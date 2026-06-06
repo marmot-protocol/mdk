@@ -703,6 +703,149 @@ async fn engine_replays_late_same_epoch_commit_from_retained_anchor() {
 }
 
 #[tokio::test]
+async fn engine_metrics_count_post_settle_reorg_from_late_same_epoch_commit() {
+    // End-to-end check that the diagnostic reorg telemetry
+    // (`docs/marmot-architecture/relay-delivery-telemetry.md` §"Validation:
+    // post-settle reorg rate") is wired to the convergence apply site: the
+    // first settle is never a reorg, and a late same-epoch commit that flips
+    // the selected branch below the applied tip is counted as one.
+    let (mut alice, _alice_storage) = build_client(b"alice");
+    let (mut bob, _bob_storage) = build_client(b"bob");
+    let (mut carol, _carol_storage) = build_client(b"carol");
+    let (mut david, _david_storage) = build_client(b"david");
+    let (mut eve, _eve_storage) = build_client(b"eve");
+
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "engine-reorg-metrics".into(),
+            description: "".into(),
+            members: vec![bob_kp, carol_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![bob.self_id()],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(welcome_for(&welcomes, b"bob"))
+        .await
+        .unwrap();
+    carol
+        .join_welcome(welcome_for(&welcomes, b"carol"))
+        .await
+        .unwrap();
+    carol.set_convergence_policy(CanonicalizationPolicy {
+        convergence: ConvergencePolicy {
+            max_rewind_commits: 1,
+            ..ConvergencePolicy::default()
+        },
+        ..CanonicalizationPolicy::default()
+    });
+
+    // Carol settles on Alice's commit (epoch 1 -> 2) and retains the epoch-1
+    // anchor. This is the first settle for the group: not a reorg.
+    let david_kp = david.fresh_key_package().await.unwrap();
+    let alice_invite = alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![david_kp],
+        })
+        .await
+        .unwrap();
+    let (alice_commit, _alice_pending) = evolution(alice_invite);
+    let alice_commit = route(alice_commit, &group_id);
+    carol
+        .buffer_openmls_convergence_message(&group_id, alice_commit.clone(), 1_000)
+        .expect("alice commit buffered");
+    carol
+        .converge_stored_openmls_messages(&group_id, 3_000)
+        .expect("alice branch applies and retains epoch 1 anchor");
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(2));
+
+    let after_first_settle = carol.engine_metrics();
+    assert_eq!(after_first_settle.settles, 1, "first settle counts");
+    assert_eq!(
+        after_first_settle.post_settle_reorgs, 0,
+        "a first settle is never a reorg"
+    );
+    assert_eq!(after_first_settle.observed_reorg_rate(), Some(0.0));
+
+    // A competing same-epoch commit arrives after the settle. Convergence
+    // rolls back to the retained anchor and re-selects; whether it reorgs
+    // depends on the content-derived branch tiebreak.
+    let eve_kp = eve.fresh_key_package().await.unwrap();
+    let bob_invite = bob
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![eve_kp],
+        })
+        .await
+        .unwrap();
+    let (bob_commit, _bob_pending) = evolution(bob_invite);
+    let bob_commit = route(bob_commit, &group_id);
+
+    let alice_digest = project_mls_message(&alice_commit.payload)
+        .expect("alice commit projects")
+        .message_digest;
+    let bob_digest = project_mls_message(&bob_commit.payload)
+        .expect("bob commit projects")
+        .message_digest;
+    let bob_wins = bob_digest < alice_digest;
+
+    carol
+        .buffer_openmls_convergence_message(&group_id, bob_commit.clone(), 3_100)
+        .expect("late bob commit buffered");
+    let result = carol
+        .converge_stored_openmls_messages(&group_id, 4_500)
+        .expect("late same-epoch commit replays from retained anchor");
+    assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
+
+    let after_late_commit = carol.engine_metrics();
+    assert_eq!(
+        after_late_commit.settles, 2,
+        "the second applied settle is counted"
+    );
+    if bob_wins {
+        // The selection flipped to a different branch that forks below the
+        // previously-applied tip (epoch 2): a post-settle reorg.
+        assert_eq!(after_late_commit.post_settle_reorgs, 1);
+        assert_eq!(after_late_commit.observed_reorg_rate(), Some(0.5));
+        // Rewind depth = previous_applied_tip (2) - new_fork_epoch (1) = 1.
+        assert_eq!(after_late_commit.reorg_rewind_depth.sample_count(), 1);
+        let depth_one = after_late_commit
+            .reorg_rewind_depth
+            .buckets
+            .iter()
+            .find(|bucket| bucket.upper_bound == 1)
+            .expect("depth-1 bucket");
+        assert_eq!(depth_one.count, 1);
+        // Lateness = reorg time (4_500) - superseded settle time (3_000) =
+        // 1_500ms.
+        assert_eq!(after_late_commit.reorg_lateness_ms.sample_count(), 1);
+        let lateness = after_late_commit
+            .reorg_lateness_ms
+            .buckets
+            .iter()
+            .find(|bucket| bucket.upper_bound == 1_500)
+            .expect("1500ms bucket");
+        assert_eq!(lateness.count, 1);
+    } else {
+        // Alice's branch wins again: re-selecting the same branch is a settle
+        // but not a reorg.
+        assert_eq!(after_late_commit.post_settle_reorgs, 0);
+        assert_eq!(after_late_commit.observed_reorg_rate(), Some(0.0));
+        assert_eq!(after_late_commit.reorg_rewind_depth.sample_count(), 0);
+        assert_eq!(after_late_commit.reorg_lateness_ms.sample_count(), 0);
+    }
+}
+
+#[tokio::test]
 async fn rebuilt_engine_replays_late_same_epoch_commit_from_retained_anchor() {
     let (mut alice, _alice_storage) = build_client(b"alice");
     let (mut bob, _bob_storage) = build_client(b"bob");

@@ -171,7 +171,7 @@ impl<S: StorageProvider> Engine<S> {
                 eligible_count: 0,
                 max_rewind_commits,
                 selected_branch_id: result.selected_branch_id.clone(),
-                selected_fork_epoch: None,
+                selected_fork_epoch: result.selected_fork_epoch,
                 selected_tip_epoch: result.selected_tip,
             },
         );
@@ -211,6 +211,24 @@ impl<S: StorageProvider> Engine<S> {
             let selected_tip = EpochId(selected_tip);
             self.epoch_manager
                 .set_stable(group_id.clone(), selected_tip);
+            // Diagnostic only: classify this applied selection as a forward
+            // advance or a post-settle reorg for quiescence tuning. This MUST
+            // NOT influence convergence or branch selection — it only observes
+            // the branch the engine has already committed to. See
+            // relay-delivery-telemetry.md §"Validation: post-settle reorg rate".
+            if let (Some(selected_fork_epoch), Some(selected_branch_id)) = (
+                result.selected_fork_epoch,
+                result.selected_branch_id.as_deref(),
+            ) {
+                self.engine_metrics.note_applied_selection(
+                    group_id,
+                    result.convergence_status,
+                    selected_fork_epoch,
+                    selected_tip.0,
+                    selected_branch_id,
+                    now_ms,
+                );
+            }
             self.emit_convergence_events(
                 group_id,
                 previous_group.members,
@@ -346,6 +364,7 @@ fn unrecoverable_result(current_tip: u64) -> CanonicalizationResult {
     CanonicalizationResult {
         previous_tip: current_tip,
         selected_tip: None,
+        selected_fork_epoch: None,
         selected_branch_id: None,
         convergence_status: ConvergenceStatus::Blocked,
         accepted_commits: Vec::new(),

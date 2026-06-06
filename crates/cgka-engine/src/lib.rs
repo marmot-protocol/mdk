@@ -13,6 +13,7 @@
 //! ## Module layout
 //!
 //! - [`engine`] — the [`Engine<S>`] struct + its [`EngineBuilder`].
+//! - [`engine_metrics`] — diagnostic post-settle reorg telemetry.
 //! - [`identity`] — local signer + credential bundle.
 //! - [`account_identity_proof`] — account-key proof binding credentials to MLS leaves.
 //! - [`feature_registry`] — runtime feature registry (replaces static constants).
@@ -42,6 +43,7 @@ pub mod capability_manager;
 pub mod convergence;
 pub mod distributed_convergence;
 pub mod engine;
+pub mod engine_metrics;
 pub mod epoch_manager;
 pub mod feature_registry;
 pub mod forensics;
@@ -60,6 +62,9 @@ pub mod upgrade;
 pub mod wire_format;
 
 pub use engine::{Ciphersuite, DEFAULT_CIPHERSUITE, Engine, EngineBuilder};
+pub use engine_metrics::{
+    EngineMetrics, EngineMetricsSnapshot, HistogramBucket, HistogramSnapshot,
+};
 pub use feature_registry::FeatureRegistry;
 pub use key_package::{KeyPackageMetadata, key_package_metadata};
 pub use wire_format::{

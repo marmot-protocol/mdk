@@ -116,6 +116,11 @@ pub enum MessageKind {
 pub struct CanonicalizationResult {
     pub previous_tip: u64,
     pub selected_tip: Option<u64>,
+    /// Fork epoch of the selected branch (the epoch it diverges from common
+    /// history). `None` when no branch was selected. Diagnostic only — used by
+    /// engine reorg telemetry to classify a settle as a forward advance or a
+    /// post-settle reorg; never an input to convergence or branch selection.
+    pub selected_fork_epoch: Option<u64>,
     pub selected_branch_id: Option<String>,
     pub convergence_status: ConvergenceStatus,
     pub accepted_commits: Vec<String>,
@@ -223,10 +228,12 @@ fn canonicalize_internal(
     );
     let selected_branch_id = selected_branch.map(|branch| branch.id.clone());
     let selected_tip = selected_branch.map(|branch| branch.tip_epoch);
+    let selected_fork_epoch = selected_branch.map(|branch| branch.fork_epoch);
 
     let mut result = CanonicalizationResult {
         previous_tip: input.state.current_tip_epoch,
         selected_tip,
+        selected_fork_epoch,
         selected_branch_id: selected_branch_id.clone(),
         // Provisional; recomputed after dispositions are known so we can
         // distinguish Settled (fixed point) from Resolving (window

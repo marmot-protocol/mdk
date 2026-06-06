@@ -590,6 +590,7 @@ fn missing_retained_anchor_result(
     CanonicalizationResult {
         previous_tip: state.current_tip_epoch,
         selected_tip: None,
+        selected_fork_epoch: None,
         selected_branch_id: None,
         convergence_status,
         accepted_commits: Vec::new(),
