@@ -714,7 +714,23 @@ impl MarmotRelayPlane {
                     .get(&delivery.account_id)
                     .cloned();
                 if let Some(sender) = sender {
-                    let _ = sender.send(delivery).await;
+                    // Fan out without awaiting the per-account queue: a single
+                    // account whose receiver has stalled (full buffer) must not
+                    // block this shared router and back-pressure delivery for
+                    // every other account (and, upstream, the relay notification
+                    // pipeline). Drop the delivery for the lagging account
+                    // instead; it recovers on the next subscription catch-up.
+                    match sender.try_send(delivery) {
+                        Ok(()) => {}
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            tracing::warn!(
+                                target: "marmot_app::relay_plane",
+                                method = "spawn_router",
+                                "dropping transport delivery: account delivery queue full",
+                            );
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => {}
+                    }
                 }
             }
         });

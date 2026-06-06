@@ -32,6 +32,14 @@ const SDK_RELAY_PUBLISH_WAIT: Duration = Duration::from_secs(12);
 /// doesn't fail the whole publish.
 const SDK_RELAY_PUBLISH_ATTEMPTS: usize = 3;
 const SDK_RELAY_PUBLISH_RETRY_BACKOFF: Duration = Duration::from_millis(600);
+/// Overall wall-clock ceiling for a single `publish_event` fan-out. The
+/// per-relay connect/send/retry budget above still applies to each relay, but
+/// the whole publish aborts and returns once this elapses. Without it, a publish
+/// to relays that are all unreachable (or that cannot meet `required_acks`)
+/// waits out every relay's full retry budget (~38s) before failing; this bounds
+/// that degraded case. Sized to still allow a slow relay one full connect plus
+/// send attempt (`SDK_RELAY_CONNECT_WAIT + SDK_RELAY_PUBLISH_WAIT`) with margin.
+const SDK_RELAY_PUBLISH_OVERALL_WAIT: Duration = Duration::from_secs(20);
 
 /// Planned SDK subscription derived from a transport-adapter subscription.
 #[derive(Clone, Debug)]
@@ -453,25 +461,45 @@ impl NostrRelayClient for NostrSdkRelayClient {
             ));
         }
 
-        while let Some(result) = publishes.join_next().await {
-            match result {
-                Ok(Ok(receipt)) => {
-                    accepted.push(receipt);
-                    if ack_goal.is_some_and(|goal| accepted.len() >= goal) {
-                        publishes.abort_all();
-                        return Ok(NostrPublishOutcome {
-                            message_id: Some(message_id),
-                            accepted,
-                            failed,
-                        });
+        // Drain completions, but bound the whole fan-out by an overall deadline
+        // so a publish to unreachable (or under-acking) relays fails in bounded
+        // time instead of waiting out every relay's full retry budget. Per-relay
+        // early returns once `required_acks` is met are unaffected.
+        let deadline = tokio::time::Instant::now() + SDK_RELAY_PUBLISH_OVERALL_WAIT;
+        let mut timed_out = false;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                publishes.abort_all();
+                timed_out = true;
+                break;
+            }
+            match timeout(remaining, publishes.join_next()).await {
+                Err(_elapsed) => {
+                    publishes.abort_all();
+                    timed_out = true;
+                    break;
+                }
+                Ok(None) => break,
+                Ok(Some(result)) => match result {
+                    Ok(Ok(receipt)) => {
+                        accepted.push(receipt);
+                        if ack_goal.is_some_and(|goal| accepted.len() >= goal) {
+                            publishes.abort_all();
+                            return Ok(NostrPublishOutcome {
+                                message_id: Some(message_id),
+                                accepted,
+                                failed,
+                            });
+                        }
                     }
-                }
-                Ok(Err(failure)) => failed.push(failure),
-                Err(e) => {
-                    return Err(TransportAdapterError::Publish(format!(
-                        "publish task failed: {e}"
-                    )));
-                }
+                    Ok(Err(failure)) => failed.push(failure),
+                    Err(e) => {
+                        return Err(TransportAdapterError::Publish(format!(
+                            "publish task failed: {e}"
+                        )));
+                    }
+                },
             }
         }
 
@@ -483,7 +511,14 @@ impl NostrRelayClient for NostrSdkRelayClient {
             });
         }
 
-        let reason = if accepted.is_empty() && !failed.is_empty() {
+        let reason = if timed_out {
+            format!(
+                "publish timed out after {}s: accepted {} of required {}",
+                SDK_RELAY_PUBLISH_OVERALL_WAIT.as_secs(),
+                accepted.len(),
+                required_acks
+            )
+        } else if accepted.is_empty() && !failed.is_empty() {
             failed
                 .iter()
                 .map(|failure| failure.reason.as_str())
@@ -742,6 +777,19 @@ mod tests {
     #[test]
     fn publish_timeout_exceeds_sdk_ok_wait() {
         assert!(SDK_RELAY_PUBLISH_WAIT > Duration::from_secs(10));
+    }
+
+    #[test]
+    fn publish_overall_wait_bounds_degraded_publish_below_per_relay_budget() {
+        // Worst case a single relay can occupy: one connect plus every send
+        // attempt and the backoffs between them.
+        let per_relay_worst = SDK_RELAY_CONNECT_WAIT
+            + SDK_RELAY_PUBLISH_WAIT * SDK_RELAY_PUBLISH_ATTEMPTS as u32
+            + SDK_RELAY_PUBLISH_RETRY_BACKOFF * (SDK_RELAY_PUBLISH_ATTEMPTS as u32 - 1);
+        // The overall ceiling must cap the degraded fan-out below that budget...
+        assert!(SDK_RELAY_PUBLISH_OVERALL_WAIT < per_relay_worst);
+        // ...while still allowing a slow relay one full connect + send attempt.
+        assert!(SDK_RELAY_PUBLISH_OVERALL_WAIT >= SDK_RELAY_CONNECT_WAIT + SDK_RELAY_PUBLISH_WAIT);
     }
 
     #[tokio::test]
