@@ -1,4 +1,5 @@
 use cgka_traits::error::EngineError;
+use marmot_account::AccountHomeError;
 use marmot_app::AppError;
 
 #[derive(Debug, thiserror::Error, uniffi::Error)]
@@ -52,6 +53,9 @@ impl From<AppError> for MarmotKitError {
             return Self::from_engine_error(err);
         }
         match value {
+            AppError::AccountHome(AccountHomeError::UnknownAccount(account_ref)) => {
+                Self::UnknownAccount { account_ref }
+            }
             AppError::UnknownGroup(group_id_hex) => Self::UnknownGroup { group_id_hex },
             AppError::Hex(err) => Self::InvalidHex {
                 details: err.to_string(),

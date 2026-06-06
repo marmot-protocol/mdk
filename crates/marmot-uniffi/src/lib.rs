@@ -397,6 +397,12 @@ impl Marmot {
             .collect())
     }
 
+    /// Remove a local-signing account from this device.
+    pub async fn remove_account(&self, account_ref: String) -> Result<(), MarmotKitError> {
+        self.runtime.accounts().remove_account(&account_ref).await?;
+        Ok(())
+    }
+
     /// Create a brand-new Nostr identity, store its secret in the platform
     /// keychain, and publish initial relay lists + key package.
     pub async fn create_identity(

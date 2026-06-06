@@ -10,6 +10,7 @@
 
 use std::sync::{Arc, Once};
 
+use marmot_account::AccountHome;
 use marmot_uniffi::{
     Marmot, MarmotKitError, MediaReferenceFfi, MediaUploadRequestFfi, NotificationWakeSourceFfi,
     PushPlatformFfi, TimelineMessageQueryFfi,
@@ -58,6 +59,38 @@ async fn empty_kit_lifecycle() {
             .await
             .expect_err("start after shutdown should be refused"),
         MarmotKitError::RuntimeStopping
+    ));
+}
+
+#[tokio::test]
+async fn remove_account_updates_list_accounts() {
+    install_mock_keyring();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let kit = Marmot::new(
+        tmp.path().to_string_lossy().into_owned(),
+        vec!["wss://relay.invalid.test".to_string()],
+    )
+    .expect("open marmot kit");
+    let account = AccountHome::open_with_default_keychain(tmp.path())
+        .expect("open account home")
+        .create_nostr_account()
+        .expect("create local account");
+    assert_eq!(kit.list_accounts().expect("list accounts").len(), 1);
+
+    kit.remove_account(account.label.clone())
+        .await
+        .expect("remove account");
+
+    assert!(
+        kit.list_accounts()
+            .expect("list accounts after removal")
+            .is_empty()
+    );
+    assert!(matches!(
+        kit.remove_account(account.label)
+            .await
+            .expect_err("removed account should be unknown"),
+        MarmotKitError::UnknownAccount { .. }
     ));
 }
 

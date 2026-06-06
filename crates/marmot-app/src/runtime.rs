@@ -2408,6 +2408,20 @@ impl AccountManager {
         Ok(self.app.account_home().account(account_ref)?)
     }
 
+    pub async fn remove_account(&self, account_ref: &str) -> Result<(), AppError> {
+        self.shared.lifecycle().ensure_running()?;
+        let account = self.app.account_home().account(account_ref)?;
+        let mut workers = self.workers.lock().await;
+        let worker = workers.remove(&account.account_id_hex);
+        if let Some(worker) = worker {
+            worker.shutdown().await;
+        }
+        // Hold the worker map lock until storage is updated so reconcile()
+        // cannot recreate this account's worker mid-removal.
+        self.app.account_home().remove_account(&account.label)?;
+        Ok(())
+    }
+
     pub async fn reconcile(&self) -> Result<(), AppError> {
         self.shared.lifecycle().ensure_running()?;
         let accounts = self
