@@ -1,7 +1,7 @@
 ---
 title: "Marmot Architecture — Index"
 created: 2026-04-15
-updated: 2026-06-06
+updated: 2026-06-07
 tags: [marmot, architecture, index]
 ---
 
@@ -56,6 +56,10 @@ Written to be readable in 5 minutes each, shareable as a package.
 - **Doc:** [`overview/marmot-app-runtime.md`](./overview/marmot-app-runtime.md)
   - **What it covers:** The implemented first slice of the multi-account `marmot-app` runtime, its shared Nostr relay
     plane, and the daemon, CLI, TUI boundary.
+
+- **Doc:** [`hermes-openclaw-agent-integration-plan.md`](./hermes-openclaw-agent-integration-plan.md)
+  - **What it covers:** Working plan for hosting Hermes Agent and OpenClaw as server-side Marmot members with a
+    `dm-agent` connector, local gateway shims, invite allowlists, and QUIC previews.
 
 - **Doc:** [`overview/cgka-engine-quality-and-vectors.md`](./overview/cgka-engine-quality-and-vectors.md)
   - **What it covers:** Near-term engine quality target: whitenoise-rs integration, chaos coverage, scenario vectors,

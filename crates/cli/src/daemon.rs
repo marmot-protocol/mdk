@@ -9,19 +9,16 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 #[cfg(unix)]
 use std::os::unix::{fs::PermissionsExt, process::CommandExt};
 
+use agent_stream_compose::{StreamComposeCommand, StreamComposeReport, run_stream_compose_session};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
-use transport_quic_broker::{BrokerTextPublisher, OpenBrokerTextPublisher};
+use transport_quic_broker::OpenBrokerTextPublisher;
 
 use cgka_traits::GroupId;
-use cgka_traits::agent_text_stream::{
-    AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN, AGENT_TEXT_STREAM_RECORD_TEXT_DELTA,
-    AgentTextStreamTranscriptV1,
-};
 use cgka_traits::app_event::{
     MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_DELETE, MARMOT_APP_EVENT_KIND_REACTION,
 };
@@ -144,19 +141,7 @@ pub struct DaemonStatus {
 
 pub type DaemonStreamWatchReport = marmot_app::AgentStreamWatchReport;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct DaemonOutgoingStreamReport {
-    pub account: Option<String>,
-    pub group_id: String,
-    pub stream_id: String,
-    pub start_message_id: String,
-    pub candidate: String,
-    pub status: String,
-    pub text: String,
-    pub transcript_hash: Option<String>,
-    pub chunk_count: u64,
-    pub error: Option<String>,
-}
+pub type DaemonOutgoingStreamReport = StreamComposeReport;
 
 #[derive(Debug)]
 struct DaemonState {
@@ -267,17 +252,6 @@ impl DaemonWorkers {
 struct StreamComposeSession {
     tx: mpsc::Sender<StreamComposeCommand>,
     handle: JoinHandle<()>,
-}
-
-enum StreamComposeCommand {
-    Append {
-        text: String,
-        respond: oneshot::Sender<Result<DaemonOutgoingStreamReport, String>>,
-    },
-    Finish {
-        respond: oneshot::Sender<Result<DaemonOutgoingStreamReport, String>>,
-    },
-    Cancel,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -2270,6 +2244,17 @@ async fn open_stream_compose(
             "stream start did not return a start message id".to_owned(),
         );
     };
+    let Some(start_account_id) = start
+        .get("account_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+    else {
+        return daemon_error(
+            cli.json,
+            "stream_compose_failed",
+            "stream start did not return an account id".to_owned(),
+        );
+    };
     let start_event_id = match hex::decode(&start_message_id) {
         Ok(bytes) => cgka_traits::MessageId::new(bytes),
         Err(err) => return daemon_error(cli.json, "stream_compose_failed", err.to_string()),
@@ -2286,30 +2271,11 @@ async fn open_stream_compose(
                 "app runtime is not available for stream crypto".to_owned(),
             );
         };
-        let secret_store = match crate::resolve_secret_store(defaults.secret_store) {
-            Ok(secret_store) => secret_store,
-            Err(err) => return daemon_error(cli.json, "stream_compose_failed", err.to_string()),
-        };
-        let keychain_service = crate::resolve_keychain_service(defaults.keychain_service.clone());
-        let account_home =
-            match crate::open_account_home(&defaults.home, secret_store, &keychain_service) {
-                Ok(account_home) => account_home,
-                Err(err) => {
-                    return daemon_error(cli.json, "stream_compose_failed", err.to_string());
-                }
-            };
-        let app = crate::app_for(
-            defaults.home.clone(),
-            defaults.relay.clone(),
-            account_home.clone(),
-        );
         match crate::stream_crypto_for_start_event(
-            &account_home,
-            &app,
             runtime,
-            account.as_deref(),
-            Some(&group_id),
-            Some(&stream_id),
+            Some(&start_account_id),
+            Some(group_id.as_str()),
+            Some(stream_id.as_str()),
             &start_message_id,
         )
         .await
@@ -2524,232 +2490,6 @@ async fn run_hosted_stream_marker_cli_json(
         return Err("stream marker command did not use the daemon runtime".to_owned());
     };
     cli_output_result(output)
-}
-
-async fn run_stream_compose_session(
-    open: OpenBrokerTextPublisher,
-    chunk_bytes: usize,
-    mut rx: mpsc::Receiver<StreamComposeCommand>,
-    mut report: DaemonOutgoingStreamReport,
-) {
-    let mut transcript = LocalComposeTranscript::new(&open);
-    let mut pending_live_text = VecDeque::new();
-    let mut publisher = None;
-    let mut connect_task = Some(tokio::spawn(BrokerTextPublisher::connect(open)));
-    let mut live_error = None;
-
-    loop {
-        let command = if let Some(task) = connect_task.as_mut() {
-            tokio::select! {
-                connect_result = task => {
-                    connect_task = None;
-                    match connect_result {
-                        Ok(Ok(mut connected)) => {
-                            if let Err(err) = flush_pending_live_text(
-                                &mut connected,
-                                &mut pending_live_text,
-                                chunk_bytes,
-                            )
-                            .await
-                            {
-                                live_error = Some(err);
-                            } else {
-                                publisher = Some(connected);
-                            }
-                        }
-                        Ok(Err(err)) => {
-                            live_error = Some(err.to_string());
-                            pending_live_text.clear();
-                        }
-                        Err(err) => {
-                            live_error = Some(err.to_string());
-                            pending_live_text.clear();
-                        }
-                    }
-                    continue;
-                }
-                command = rx.recv() => command,
-            }
-        } else {
-            rx.recv().await
-        };
-        let Some(command) = command else {
-            if let Some(task) = connect_task {
-                task.abort();
-            }
-            return;
-        };
-
-        match command {
-            StreamComposeCommand::Append { text, respond } => {
-                let result = append_stream_compose_text(
-                    &mut report,
-                    &mut transcript,
-                    &mut publisher,
-                    &mut pending_live_text,
-                    &mut live_error,
-                    text,
-                    chunk_bytes,
-                )
-                .await;
-                let _ = respond.send(result);
-            }
-            StreamComposeCommand::Finish { respond } => {
-                if let Some(task) = connect_task.take() {
-                    task.abort();
-                }
-                let result = finish_stream_compose_report(
-                    &mut report,
-                    &transcript,
-                    &mut publisher,
-                    &mut pending_live_text,
-                    &mut live_error,
-                    chunk_bytes,
-                )
-                .await;
-                let _ = respond.send(result);
-                return;
-            }
-            StreamComposeCommand::Cancel => {
-                if let Some(task) = connect_task {
-                    task.abort();
-                }
-                return;
-            }
-        }
-    }
-}
-
-struct LocalComposeTranscript {
-    transcript: AgentTextStreamTranscriptV1,
-    next_seq: u64,
-}
-
-impl LocalComposeTranscript {
-    fn new(open: &OpenBrokerTextPublisher) -> Self {
-        Self {
-            transcript: AgentTextStreamTranscriptV1::new(
-                open.stream_id.clone(),
-                open.start_event_id.clone(),
-            ),
-            next_seq: 1,
-        }
-    }
-
-    fn append_text(&mut self, text: &str, chunk_bytes: usize) -> Result<u64, String> {
-        validate_stream_chunk_bytes(chunk_bytes)?;
-        let mut appended = 0_u64;
-        for chunk in transport_quic_stream::split_text_deltas(text, chunk_bytes) {
-            self.transcript
-                .append(self.next_seq, AGENT_TEXT_STREAM_RECORD_TEXT_DELTA, &chunk);
-            self.next_seq += 1;
-            appended += 1;
-        }
-        Ok(appended)
-    }
-
-    fn transcript_hash(&self) -> String {
-        hex::encode(self.transcript.hash())
-    }
-
-    fn chunk_count(&self) -> u64 {
-        self.transcript.chunk_count()
-    }
-}
-
-fn validate_stream_chunk_bytes(chunk_bytes: usize) -> Result<(), String> {
-    if chunk_bytes == 0 {
-        return Err("agent text stream chunk size cannot be zero".to_owned());
-    }
-    if chunk_bytes > AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN as usize {
-        return Err(format!(
-            "agent text stream chunk size exceeds app profile max: {chunk_bytes}"
-        ));
-    }
-    Ok(())
-}
-
-async fn append_stream_compose_text(
-    report: &mut DaemonOutgoingStreamReport,
-    transcript: &mut LocalComposeTranscript,
-    publisher: &mut Option<BrokerTextPublisher>,
-    pending_live_text: &mut VecDeque<String>,
-    live_error: &mut Option<String>,
-    text: String,
-    chunk_bytes: usize,
-) -> Result<DaemonOutgoingStreamReport, String> {
-    transcript.append_text(&text, chunk_bytes)?;
-    report.text.push_str(&text);
-    report.chunk_count = transcript.chunk_count();
-    report.transcript_hash = Some(transcript.transcript_hash());
-
-    if live_error.is_none() {
-        if let Some(publisher) = publisher.as_mut() {
-            if let Err(err) = publisher
-                .append_text(&text, chunk_bytes, Duration::ZERO)
-                .await
-                .map_err(|err| err.to_string())
-            {
-                *live_error = Some(err);
-            }
-        } else {
-            pending_live_text.push_back(text);
-        }
-    }
-    if let Some(err) = live_error {
-        report.error = Some(format!("live stream failed: {err}"));
-    }
-
-    Ok(report.clone())
-}
-
-async fn finish_stream_compose_report(
-    report: &mut DaemonOutgoingStreamReport,
-    transcript: &LocalComposeTranscript,
-    publisher: &mut Option<BrokerTextPublisher>,
-    pending_live_text: &mut VecDeque<String>,
-    live_error: &mut Option<String>,
-    chunk_bytes: usize,
-) -> Result<DaemonOutgoingStreamReport, String> {
-    if live_error.is_none()
-        && let Some(publisher) = publisher.as_mut()
-        && let Err(err) = flush_pending_live_text(publisher, pending_live_text, chunk_bytes).await
-    {
-        *live_error = Some(err);
-    }
-
-    if live_error.is_none()
-        && let Some(publisher) = publisher.take()
-        && let Err(err) = publisher.finish().await.map_err(|err| err.to_string())
-    {
-        *live_error = Some(err);
-    }
-
-    report.status = "finished".to_owned();
-    report.transcript_hash = Some(transcript.transcript_hash());
-    report.chunk_count = transcript.chunk_count();
-    if let Some(err) = live_error {
-        report.error = Some(format!("live stream failed: {err}"));
-    }
-    Ok(report.clone())
-}
-
-async fn flush_pending_live_text(
-    publisher: &mut BrokerTextPublisher,
-    pending_live_text: &mut VecDeque<String>,
-    chunk_bytes: usize,
-) -> Result<(), String> {
-    while let Some(text) = pending_live_text.pop_front() {
-        if let Err(err) = publisher
-            .append_text(&text, chunk_bytes, Duration::ZERO)
-            .await
-            .map_err(|err| err.to_string())
-        {
-            pending_live_text.clear();
-            return Err(err);
-        }
-    }
-    Ok(())
 }
 
 fn short_id(value: &str) -> String {
@@ -4157,6 +3897,9 @@ mod tests {
     use super::*;
     use cgka_traits::GroupId;
     use cgka_traits::MessageId;
+    use cgka_traits::agent_text_stream::{
+        AGENT_TEXT_STREAM_RECORD_TEXT_DELTA, AgentTextStreamTranscriptV1,
+    };
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;

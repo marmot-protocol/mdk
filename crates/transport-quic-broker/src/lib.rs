@@ -364,6 +364,22 @@ impl BrokerTextPublisher {
         max_chunk_bytes: usize,
         chunk_delay: Duration,
     ) -> Result<u64, QuicBrokerError> {
+        self.append_record_text(
+            AGENT_TEXT_STREAM_RECORD_TEXT_DELTA,
+            text,
+            max_chunk_bytes,
+            chunk_delay,
+        )
+        .await
+    }
+
+    pub async fn append_record_text(
+        &mut self,
+        record_type: u8,
+        text: &str,
+        max_chunk_bytes: usize,
+        chunk_delay: Duration,
+    ) -> Result<u64, QuicBrokerError> {
         if max_chunk_bytes == 0 {
             return Err(QuicBrokerError::EmptyChunkSize);
         }
@@ -373,11 +389,13 @@ impl BrokerTextPublisher {
 
         let mut appended = 0_u64;
         for chunk in transport_quic_stream::split_text_deltas(text, max_chunk_bytes) {
-            let record = AgentTextStreamRecordV1::text_delta(
+            let record = AgentTextStreamRecordV1::new(
                 self.transcript.stream_id().to_vec(),
                 self.next_seq,
+                record_type,
                 chunk,
             );
+            record.validate()?;
             self.next_seq += 1;
             let wire_record = if let Some(crypto) = &self.crypto {
                 encrypt_record(crypto, &record)?
@@ -1319,6 +1337,7 @@ pub enum QuicBrokerError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cgka_traits::agent_text_stream::AGENT_TEXT_STREAM_RECORD_STATUS;
     use tokio::sync::oneshot;
 
     fn test_state(max_backlog: usize) -> BrokerState {
@@ -1380,6 +1399,85 @@ mod tests {
         assert_eq!(received.stream_id, stream_id);
         assert_eq!(received.text, "hello broker stream");
         assert_eq!(received.chunk_count, 4);
+        assert_eq!(sent.chunk_count, received.chunk_count);
+        assert_eq!(sent.transcript_hash, received.transcript_hash);
+
+        let _ = shutdown_tx.send(());
+        broker_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn broker_forwards_status_records_without_adding_to_text() {
+        let server = QuicBrokerServer::bind(QuicBrokerConfig {
+            bind_addr: LOCAL_SERVER_BIND,
+            per_subscriber_queue: DEFAULT_SUBSCRIBER_QUEUE_DEPTH,
+            ..QuicBrokerConfig::default()
+        })
+        .unwrap();
+        let broker_addr = server.local_addr().unwrap();
+        let server_cert = server.server_cert_der().to_vec();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let broker_task = tokio::spawn(server.run_until(async {
+            let _ = shutdown_rx.await;
+        }));
+
+        let stream_id = vec![0xcc; 32];
+        let start_event_id = MessageId::new(vec![0x33; 32]);
+        let subscriber = tokio::spawn(subscribe_text_from_broker(SubscribeTextFromBroker {
+            broker_addr,
+            server_name: "localhost".to_owned(),
+            trust: BrokerServerTrust::CertificateDer(server_cert.clone()),
+            stream_id: stream_id.clone(),
+            start_event_id: start_event_id.clone(),
+            crypto: None,
+        }));
+        sleep(Duration::from_millis(100)).await;
+
+        let mut publisher = BrokerTextPublisher::connect(OpenBrokerTextPublisher {
+            broker_addr,
+            server_name: "localhost".to_owned(),
+            trust: BrokerServerTrust::CertificateDer(server_cert),
+            stream_id: stream_id.clone(),
+            start_event_id,
+            crypto: None,
+        })
+        .await
+        .unwrap();
+        publisher
+            .append_text("hello", 32, Duration::ZERO)
+            .await
+            .unwrap();
+        publisher
+            .append_record_text(
+                AGENT_TEXT_STREAM_RECORD_STATUS,
+                "thinking",
+                32,
+                Duration::ZERO,
+            )
+            .await
+            .unwrap();
+        let sent = publisher.finish().await.unwrap();
+
+        let received = tokio::time::timeout(Duration::from_secs(5), subscriber)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(received.stream_id, stream_id);
+        assert_eq!(received.text, "hello");
+        assert_eq!(received.chunk_count, 2);
+        assert_eq!(received.chunks.len(), 2);
+        assert_eq!(
+            received.chunks[0].record_type,
+            AGENT_TEXT_STREAM_RECORD_TEXT_DELTA
+        );
+        assert_eq!(received.chunks[0].text, "hello");
+        assert_eq!(
+            received.chunks[1].record_type,
+            AGENT_TEXT_STREAM_RECORD_STATUS
+        );
+        assert_eq!(received.chunks[1].text, "");
         assert_eq!(sent.chunk_count, received.chunk_count);
         assert_eq!(sent.transcript_hash, received.transcript_hash);
 

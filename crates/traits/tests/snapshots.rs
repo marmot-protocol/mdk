@@ -414,6 +414,14 @@ fn snapshot_group_events() {
         GroupEvent::GroupCreated { group_id: gid() }
     );
     insta::assert_json_snapshot!(
+        "event_group_joined",
+        GroupEvent::GroupJoined {
+            group_id: gid(),
+            via_welcome: mid(),
+            welcomer: Some(mem_id()),
+        }
+    );
+    insta::assert_json_snapshot!(
         "event_message_received",
         GroupEvent::MessageReceived {
             group_id: gid(),

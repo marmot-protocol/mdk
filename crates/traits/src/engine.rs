@@ -245,6 +245,7 @@ pub enum GroupEvent {
     GroupJoined {
         group_id: GroupId,
         via_welcome: MessageId,
+        welcomer: Option<MemberId>,
     },
     MessageReceived {
         group_id: GroupId,

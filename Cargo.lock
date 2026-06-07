@@ -38,6 +38,51 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent-connector"
+version = "0.1.0"
+dependencies = [
+ "agent-control",
+ "agent-stream-compose",
+ "cgka-traits",
+ "clap",
+ "hex",
+ "libc",
+ "marmot-account",
+ "marmot-app",
+ "nostr-relay-builder",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "transport-quic-broker",
+ "transport-quic-stream",
+]
+
+[[package]]
+name = "agent-control"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
+name = "agent-stream-compose"
+version = "0.1.0"
+dependencies = [
+ "cgka-traits",
+ "hex",
+ "serde",
+ "tokio",
+ "transport-quic-broker",
+ "transport-quic-stream",
+]
+
+[[package]]
 name = "ahash"
 version = "0.8.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1032,6 +1077,7 @@ dependencies = [
 name = "darkmatter-cli"
 version = "0.1.0"
 dependencies = [
+ "agent-stream-compose",
  "cgka-session",
  "cgka-traits",
  "clap",

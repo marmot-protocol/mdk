@@ -364,6 +364,7 @@ async fn invite_group_evolution_publishes_commit_and_welcome_through_stack() {
         vec![GroupEvent::GroupJoined {
             group_id: created.group_id.clone(),
             via_welcome: welcome_report.message_id,
+            welcomer: Some(alice.account_id.clone()),
         }]
     );
     assert_eq!(carol.session.epoch(&created.group_id).unwrap(), EpochId(2));
@@ -486,6 +487,7 @@ async fn publish_confirm_and_deliver_welcome(
                 other => panic!("expected GroupCreated event, got {other:?}"),
             },
             via_welcome: welcome_report.message_id.clone(),
+            welcomer: Some(alice.account_id.clone()),
         }]
     );
     welcome_report

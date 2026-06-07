@@ -192,18 +192,32 @@ pub struct AgentTextStreamRecordV1 {
 }
 
 impl AgentTextStreamRecordV1 {
-    pub fn text_delta(
+    pub fn new(
         stream_id: impl Into<Vec<u8>>,
         seq: u64,
+        record_type: u8,
         plaintext_frame: impl Into<Vec<u8>>,
     ) -> Self {
         Self {
             stream_id: stream_id.into(),
             seq,
-            record_type: AGENT_TEXT_STREAM_RECORD_TEXT_DELTA,
+            record_type,
             flags: 0,
             plaintext_frame: plaintext_frame.into(),
         }
+    }
+
+    pub fn text_delta(
+        stream_id: impl Into<Vec<u8>>,
+        seq: u64,
+        plaintext_frame: impl Into<Vec<u8>>,
+    ) -> Self {
+        Self::new(
+            stream_id,
+            seq,
+            AGENT_TEXT_STREAM_RECORD_TEXT_DELTA,
+            plaintext_frame,
+        )
     }
 
     pub fn encode(&self) -> Result<Vec<u8>, AgentTextStreamRecordError> {

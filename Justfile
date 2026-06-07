@@ -60,6 +60,42 @@ relay-logs:
 tui-reset:
     ./scripts/reset_tui_dev.sh
 
+hermes-dev-setup args="":
+    ./scripts/hermes_marmot_dev_setup.sh {{args}}
+
+hermes-dev-teardown args="":
+    ./scripts/hermes_marmot_dev_teardown.sh {{args}}
+
+hermes-dev-script-test:
+    integrations/hermes/marmot/tests/test_dev_scripts.sh
+
+hermes-dev-smoke root="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    root="{{root}}"
+    if [ -z "$root" ]; then
+        root="${HERMES_MARMOT_DEV_ROOT:-${TMPDIR:-/tmp}/hermes-marmot-test}"
+    fi
+    "$root/smoke-plugin.sh"
+
+hermes-dev-e2e-deterministic root="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ -z "{{root}}" ]; then
+        ./scripts/hermes_marmot_deterministic_e2e.sh
+    else
+        ./scripts/hermes_marmot_deterministic_e2e.sh --root "{{root}}"
+    fi
+
+hermes-dev-e2e-connector root="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ -z "{{root}}" ]; then
+        ./scripts/hermes_marmot_connector_e2e.sh
+    else
+        ./scripts/hermes_marmot_connector_e2e.sh --root "{{root}}"
+    fi
+
 e2e-test test="":
     #!/usr/bin/env bash
     set -euo pipefail

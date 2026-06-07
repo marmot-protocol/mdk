@@ -345,6 +345,7 @@ impl<S: StorageProvider> Engine<S> {
             .peel_welcome(&welcome_msg)
             .await
             .map_err(EngineError::Peeler)?;
+        let welcomer = peeled.sender.clone();
         let welcome_bytes = match peeled.content {
             cgka_traits::ingest::PeeledContent::Welcome { bytes } => bytes,
             _ => {
@@ -457,6 +458,7 @@ impl<S: StorageProvider> Engine<S> {
             .push_back(cgka_traits::engine::GroupEvent::GroupJoined {
                 group_id: group_id.clone(),
                 via_welcome: welcome_id.clone(),
+                welcomer,
             });
         self.seen_message_ids.insert(welcome_id);
 

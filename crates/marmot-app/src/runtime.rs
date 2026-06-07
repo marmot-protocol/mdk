@@ -800,6 +800,16 @@ pub struct AgentStreamWatchOptions {
     pub insecure_local: bool,
 }
 
+#[derive(Clone, Debug)]
+pub struct AgentTextStreamCryptoContext {
+    pub account_id_hex: String,
+    pub account_label: String,
+    pub group_id: GroupId,
+    pub stream_id: Vec<u8>,
+    pub start_event_id: MessageId,
+    pub crypto: AgentTextStreamCrypto,
+}
+
 /// A live agent-text-stream watch. Drains chunk/finished/failed updates from a
 /// background QUIC subscription task.
 pub struct RuntimeAgentStreamWatch {
@@ -1432,18 +1442,24 @@ impl MarmotAppRuntime {
         let group_id_hex = hex::encode(group_id.as_slice());
         let app = self.accounts.app.clone();
         let account_ref_for_query = account_ref.to_owned();
+        let group_id_hex_for_query = group_id_hex.clone();
         let messages = blocking_app_task(move || {
             app.messages_with_query(
                 &account_ref_for_query,
                 AppMessageQuery {
-                    group_id_hex: Some(group_id_hex),
+                    group_id_hex: Some(group_id_hex_for_query),
                     limit: Some(AGENT_STREAM_START_LOOKBACK_LIMIT),
                 },
             )
         })
         .await?;
-        let (start_message_id_hex, start, sender_hex) =
-            latest_agent_stream_start(messages, options.stream_id_hex.as_deref())?;
+        let normalized_stream_id_hex = options
+            .stream_id_hex
+            .as_deref()
+            .map(normalize_hex_app)
+            .transpose()?;
+        let (start_message_id_hex, start, _sender_hex) =
+            latest_agent_stream_start(messages, normalized_stream_id_hex.as_deref())?;
         if start_message_id_hex.is_empty() {
             // The latest start hasn't been echoed back with a message id yet, so
             // we can't reference it to the broker; surface that rather than
@@ -1456,24 +1472,15 @@ impl MarmotAppRuntime {
         let candidates = parse_quic_candidates(&start.quic_candidates)?;
         let server_cert_der = options.server_cert_der;
         let insecure_local = options.insecure_local;
-        let stream_id = hex::decode(&start.stream_id_hex)?;
-        let stream_id_hex = start.stream_id_hex.clone();
-        let start_event_id = MessageId::new(hex::decode(&start_message_id_hex)?);
-        let account = self.accounts.app.account_home().account(account_ref)?;
-        let group_state = self.group_mls_state(&account.label, group_id).await?;
-        let stream_secret = self
-            .agent_text_stream_exporter_secret(&account.label, group_id)
+        let stream_id_hex = normalize_hex_app(&start.stream_id_hex)?;
+        let crypto_context = self
+            .agent_text_stream_crypto_for_start_event(
+                Some(account_ref),
+                Some(&group_id_hex),
+                Some(&stream_id_hex),
+                &start_message_id_hex,
+            )
             .await?;
-        let crypto = AgentTextStreamCrypto::new(
-            stream_secret,
-            AgentTextStreamKeyContextV1::new(
-                group_id.clone(),
-                stream_id.clone(),
-                cgka_traits::EpochId(group_state.epoch),
-                MemberId::new(hex::decode(sender_hex)?),
-                start_event_id.clone(),
-            ),
-        );
 
         let (updates_tx, updates_rx) = mpsc::channel(1024);
         let mut stopping = self.shared.lifecycle().subscribe_shutdown();
@@ -1484,9 +1491,9 @@ impl MarmotAppRuntime {
                     candidates,
                     server_cert_der,
                     insecure_local,
-                    stream_id,
-                    start_event_id,
-                    Some(crypto),
+                    crypto_context.stream_id,
+                    crypto_context.start_event_id,
+                    Some(crypto_context.crypto),
                     updates_tx.clone(),
                 ) => update,
             };
@@ -1498,6 +1505,96 @@ impl MarmotAppRuntime {
             abort: handle.abort_handle(),
             stopping: self.shared.lifecycle().subscribe_shutdown(),
         })
+    }
+
+    pub async fn agent_text_stream_crypto_for_start_event(
+        &self,
+        account_ref: Option<&str>,
+        group_id_hex: Option<&str>,
+        stream_id_hex: Option<&str>,
+        start_message_id_hex: &str,
+    ) -> Result<AgentTextStreamCryptoContext, AppError> {
+        self.shared.lifecycle().ensure_running()?;
+        let start_message_id_hex = normalize_hex_app(start_message_id_hex)?;
+        let group_id_hex = group_id_hex.map(normalize_group_id_hex_app).transpose()?;
+        let stream_id_hex = stream_id_hex.map(normalize_hex_app).transpose()?;
+
+        let accounts = if let Some(account_ref) =
+            account_ref.filter(|account_ref| !account_ref.trim().is_empty())
+        {
+            vec![self.accounts.resolve(account_ref)?]
+        } else {
+            self.accounts.app.account_home().accounts()?
+        };
+
+        for account in accounts {
+            if !account.local_signing {
+                continue;
+            }
+            let app = self.accounts.app.clone();
+            let account_label = account.label.clone();
+            let query_group_id_hex = group_id_hex.clone();
+            let messages = blocking_app_task(move || {
+                app.messages_with_query(
+                    &account_label,
+                    AppMessageQuery {
+                        group_id_hex: query_group_id_hex,
+                        limit: None,
+                    },
+                )
+            })
+            .await?;
+
+            for message in messages.into_iter().rev() {
+                if message.message_id_hex != start_message_id_hex {
+                    continue;
+                }
+                let Some(start) = StreamStartView::from_event(message.kind, &message.tags) else {
+                    continue;
+                };
+                let start_stream_id_hex = normalize_hex_app(&start.stream_id_hex)?;
+                if stream_id_hex
+                    .as_deref()
+                    .is_some_and(|stream_id| stream_id != start_stream_id_hex)
+                {
+                    continue;
+                }
+                let group_id = GroupId::new(hex::decode(&message.group_id_hex)?);
+                let stream_id = hex::decode(&start_stream_id_hex)?;
+                let start_event_id = MessageId::new(hex::decode(&start_message_id_hex)?);
+                let group_state = match self.group_mls_state(&account.label, &group_id).await {
+                    Ok(group_state) => group_state,
+                    Err(_) => continue,
+                };
+                let stream_secret = match self
+                    .agent_text_stream_exporter_secret(&account.label, &group_id)
+                    .await
+                {
+                    Ok(secret) => secret,
+                    Err(_) => continue,
+                };
+                let crypto = AgentTextStreamCrypto::new(
+                    stream_secret,
+                    AgentTextStreamKeyContextV1::new(
+                        group_id.clone(),
+                        stream_id.clone(),
+                        cgka_traits::EpochId(group_state.epoch),
+                        MemberId::new(hex::decode(message.sender)?),
+                        start_event_id.clone(),
+                    ),
+                );
+                return Ok(AgentTextStreamCryptoContext {
+                    account_id_hex: account.account_id_hex,
+                    account_label: account.label,
+                    group_id,
+                    stream_id,
+                    start_event_id,
+                    crypto,
+                });
+            }
+        }
+
+        Err(AppError::AgentStreamMissingStart)
     }
 
     pub fn accounts(&self) -> AccountManager {
@@ -4124,18 +4221,27 @@ fn latest_agent_stream_start(
     messages: Vec<AppMessageRecord>,
     stream_id_hex: Option<&str>,
 ) -> Result<(String, StreamStartView, String), AppError> {
+    let stream_id_hex = stream_id_hex.map(normalize_hex_app).transpose()?;
     messages
         .into_iter()
         .rev()
         .find_map(|message| {
             let start = StreamStartView::from_event(message.kind, &message.tags)?;
-            if stream_id_hex.is_none_or(|stream_id| stream_id == start.stream_id_hex) {
+            let start_stream_id_hex = normalize_hex_app(&start.stream_id_hex).ok()?;
+            if stream_id_hex
+                .as_deref()
+                .is_none_or(|stream_id| stream_id == start_stream_id_hex)
+            {
                 Some((message.message_id_hex, start, message.sender))
             } else {
                 None
             }
         })
         .ok_or(AppError::AgentStreamMissingStart)
+}
+
+fn normalize_hex_app(value: &str) -> Result<String, AppError> {
+    Ok(hex::encode(hex::decode(value)?))
 }
 
 fn parse_quic_candidate(candidate: &str) -> Result<ParsedQuicCandidate, AppError> {
@@ -4632,6 +4738,33 @@ mod tests {
                 row,
             }) if row.group_id_hex == "group" && row.title == "after"
         ));
+    }
+
+    #[test]
+    fn latest_agent_stream_start_accepts_mixed_case_filter() {
+        let stream_id_hex = hex::encode([0xab; 32]);
+        let (message_id_hex, start, sender) = latest_agent_stream_start(
+            vec![AppMessageRecord {
+                message_id_hex: "11".repeat(32),
+                direction: "inbound".to_owned(),
+                group_id_hex: "22".repeat(32),
+                sender: "33".repeat(32),
+                plaintext: String::new(),
+                kind: MARMOT_APP_EVENT_KIND_AGENT_STREAM_START,
+                tags: vec![
+                    vec![STREAM_TAG.to_owned(), stream_id_hex.clone()],
+                    vec![STREAM_ROUTE_TAG.to_owned(), STREAM_ROUTE_QUIC.to_owned()],
+                ],
+                recorded_at: 0,
+                received_at: 0,
+            }],
+            Some(&stream_id_hex.to_uppercase()),
+        )
+        .unwrap();
+
+        assert_eq!(message_id_hex, "11".repeat(32));
+        assert_eq!(start.stream_id_hex, stream_id_hex);
+        assert_eq!(sender, "33".repeat(32));
     }
 
     fn chat_list_test_row(group_id_hex: &str, title: &str) -> ChatListRow {

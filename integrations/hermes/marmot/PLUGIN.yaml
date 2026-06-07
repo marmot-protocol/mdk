@@ -1,0 +1,26 @@
+name: marmot
+label: Marmot
+kind: platform
+version: 0.1.0
+description: Hermes platform adapter for Marmot through the local dm-agent control socket
+author: Darkmatter
+requires_env: []
+optional_env:
+  - name: MARMOT_HOME
+    description: "dm-agent home directory; required unless MARMOT_AGENT_SOCKET is set"
+    password: false
+  - name: MARMOT_AGENT_SOCKET
+    description: "Unix socket for dm-agent; defaults to $MARMOT_HOME/dev/dm-agent.sock"
+    password: false
+  - name: MARMOT_ACCOUNT_ID_HEX
+    description: "Agent account pubkey/account id hex; required when dm-agent has more than one account"
+    password: false
+  - name: MARMOT_GROUP_ID_HEX
+    description: "Optional Marmot group id filter for inbound messages"
+    password: false
+  - name: MARMOT_QUIC_CANDIDATES
+    description: "Comma-separated quic:// preview broker candidates for live Marmot previews"
+    password: false
+  - name: MARMOT_HOME_CHANNEL
+    description: "Default Marmot group id for Hermes cron/home delivery"
+    password: false

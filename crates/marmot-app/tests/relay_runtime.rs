@@ -714,10 +714,23 @@ async fn app_runtime_executes_group_and_message_intents_on_managed_accounts() {
         )
     })
     .await;
-    assert!(matches!(
-        stream_event,
-        MarmotAppEvent::AgentStreamStarted(_)
-    ));
+    let MarmotAppEvent::AgentStreamStarted(stream_event) = stream_event else {
+        panic!("expected agent stream start event");
+    };
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let stream_id_hex = hex::encode(stream_id);
+    let stream_crypto = runtime
+        .agent_text_stream_crypto_for_start_event(
+            Some(&bob.account.account_id_hex),
+            Some(group_id_hex.as_str()),
+            Some(stream_id_hex.as_str()),
+            &stream_event.message.message_id_hex,
+        )
+        .await
+        .unwrap();
+    assert_eq!(stream_crypto.account_id_hex, bob.account.account_id_hex);
+    assert_eq!(stream_crypto.group_id, group_id);
+    assert_eq!(stream_crypto.stream_id, stream_id.to_vec());
 
     runtime.shutdown().await;
 }
@@ -1139,6 +1152,10 @@ async fn app_runtime_marks_welcome_joined_groups_pending_until_accepted() {
     assert!(pending.pending_confirmation);
     assert!(!pending.archived);
     assert!(pending.via_welcome_message_id_hex.is_some());
+    assert_eq!(
+        pending.welcomer_account_id_hex.as_deref(),
+        Some(alice.account.account_id_hex.as_str())
+    );
 
     let accepted = runtime
         .accept_group_invite(&bob.account.account_id_hex, &group_id)

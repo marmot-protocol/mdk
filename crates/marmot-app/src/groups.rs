@@ -543,12 +543,16 @@ pub(crate) fn observe_event(
                     projection,
                     match event {
                         GroupEvent::GroupCreated { .. } => GroupConfirmationProjection::Accepted,
-                        GroupEvent::GroupJoined { via_welcome, .. } => {
-                            GroupConfirmationProjection::Pending {
-                                via_welcome_message_id_hex: hex::encode(via_welcome.as_slice()),
-                                welcomer_account_id_hex: None,
-                            }
-                        }
+                        GroupEvent::GroupJoined {
+                            via_welcome,
+                            welcomer,
+                            ..
+                        } => GroupConfirmationProjection::Pending {
+                            via_welcome_message_id_hex: hex::encode(via_welcome.as_slice()),
+                            welcomer_account_id_hex: welcomer
+                                .as_ref()
+                                .map(|member_id| hex::encode(member_id.as_slice())),
+                        },
                         _ => GroupConfirmationProjection::Preserve,
                     },
                 );

@@ -278,7 +278,8 @@ async fn session_ingest_surfaces_join_and_app_message_events() {
         joined.effects.events,
         vec![GroupEvent::GroupJoined {
             group_id: created.group_id.clone(),
-            via_welcome: welcome_id
+            via_welcome: welcome_id,
+            welcomer: None,
         }]
     );
 

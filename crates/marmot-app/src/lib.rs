@@ -91,13 +91,14 @@ pub(crate) use groups::AppGroupImageInput;
 pub(crate) use runtime::blocking_app_task;
 pub use runtime::{
     AccountManager, AccountSetupRequest, AccountSetupResult, AgentStreamWatchOptions,
-    ChatListUpdateTrigger, ManagedAccount, MarmotAppEvent, MarmotAppRuntime, RuntimeAccountError,
-    RuntimeAgentStreamMessage, RuntimeAgentStreamUpdate, RuntimeAgentStreamWatch,
-    RuntimeChatListSubscription, RuntimeChatListUpdate, RuntimeChatsSubscription,
-    RuntimeEventsSubscription, RuntimeGroupEvent, RuntimeGroupStateSubscription,
-    RuntimeMessageReceived, RuntimeMessageUpdate, RuntimeMessagesSubscription,
-    RuntimeNotificationsSubscription, RuntimeProjectionUpdate, RuntimeSharedServices,
-    RuntimeTimelineMessageUpdate, RuntimeTimelineMessagesSubscription, StreamStartView,
+    AgentTextStreamCryptoContext, ChatListUpdateTrigger, ManagedAccount, MarmotAppEvent,
+    MarmotAppRuntime, RuntimeAccountError, RuntimeAgentStreamMessage, RuntimeAgentStreamUpdate,
+    RuntimeAgentStreamWatch, RuntimeChatListSubscription, RuntimeChatListUpdate,
+    RuntimeChatsSubscription, RuntimeEventsSubscription, RuntimeGroupEvent,
+    RuntimeGroupStateSubscription, RuntimeMessageReceived, RuntimeMessageUpdate,
+    RuntimeMessagesSubscription, RuntimeNotificationsSubscription, RuntimeProjectionUpdate,
+    RuntimeSharedServices, RuntimeTimelineMessageUpdate, RuntimeTimelineMessagesSubscription,
+    StreamStartView,
 };
 pub use storage_sqlite::{TimelineMessageChange, TimelineRemoveReason, TimelineUpdateTrigger};
 

@@ -1,0 +1,496 @@
+//! Local control protocol DTOs and newline-delimited JSON framing for Marmot agents.
+
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
+
+pub const AGENT_CONTROL_PROTOCOL_V1: &str = "marmot.agent-control.v1";
+pub const MAX_AGENT_CONTROL_FRAME_BYTES: usize = 1024 * 1024;
+
+#[derive(Debug, thiserror::Error)]
+pub enum AgentControlError {
+    #[error("agent control frame is empty")]
+    EmptyFrame,
+    #[error("agent control frame exceeds max size: {0}")]
+    FrameTooLarge(usize),
+    #[error("wrong agent control protocol: {0}")]
+    WrongProtocol(String),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentControlEnvelope<T> {
+    pub marmot_agent_control: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(flatten)]
+    pub payload: T,
+}
+
+impl<T> AgentControlEnvelope<T> {
+    pub fn new(id: Option<String>, payload: T) -> Self {
+        Self {
+            marmot_agent_control: AGENT_CONTROL_PROTOCOL_V1.to_owned(),
+            id,
+            payload,
+        }
+    }
+
+    pub fn request(id: Option<String>, payload: T) -> Self {
+        Self::new(id, payload)
+    }
+
+    pub fn validate_protocol(&self) -> Result<(), AgentControlError> {
+        if self.marmot_agent_control == AGENT_CONTROL_PROTOCOL_V1 {
+            Ok(())
+        } else {
+            Err(AgentControlError::WrongProtocol(
+                self.marmot_agent_control.clone(),
+            ))
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AgentControlRequest {
+    SubscribeInbound {
+        account_id_hex: Option<String>,
+        group_id_hex: Option<String>,
+    },
+    SendFinal {
+        account_id_hex: String,
+        group_id_hex: String,
+        text: String,
+        reply_to_message_id_hex: Option<String>,
+    },
+    StreamBegin {
+        account_id_hex: String,
+        group_id_hex: String,
+        stream_id_hex: Option<String>,
+        quic_candidates: Vec<String>,
+    },
+    StreamAppend {
+        stream_id_hex: String,
+        append_text: String,
+    },
+    StreamStatus {
+        stream_id_hex: String,
+        status: String,
+    },
+    StreamFinalize {
+        stream_id_hex: String,
+        final_text: String,
+        transcript_hash_hex: String,
+        chunk_count: u64,
+    },
+    StreamCancel {
+        stream_id_hex: String,
+        reason: Option<String>,
+    },
+    AccountList,
+    AccountCreate {
+        label: Option<String>,
+        publish_key_package: bool,
+    },
+    AccountPublishKeyPackage {
+        account_id_hex: String,
+    },
+    AllowlistList {
+        account_id_hex: String,
+    },
+    AllowlistAdd {
+        account_id_hex: String,
+        welcomer_account_id_hex: String,
+    },
+    AllowlistRemove {
+        account_id_hex: String,
+        welcomer_account_id_hex: String,
+    },
+    DebugInjectInbound {
+        account_id_hex: String,
+        group_id_hex: String,
+        message_id_hex: String,
+        sender_account_id_hex: String,
+        text: String,
+    },
+    DebugRecordedFinals,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AgentControlResponse {
+    Ack,
+    Error {
+        code: String,
+        message: String,
+    },
+    AccountList {
+        accounts: Vec<AgentControlAccount>,
+    },
+    AccountCreated {
+        account: AgentControlAccount,
+    },
+    KeyPackagePublished {
+        account_id_hex: String,
+        key_package_bytes: usize,
+    },
+    FinalSent {
+        message_ids_hex: Vec<String>,
+    },
+    Allowlist {
+        account_id_hex: String,
+        welcomer_account_ids_hex: Vec<String>,
+    },
+    StreamBegun {
+        stream_id_hex: String,
+        start_message_id_hex: String,
+        quic_candidates: Vec<String>,
+    },
+    StreamFinalized {
+        stream_id_hex: String,
+        message_ids_hex: Vec<String>,
+    },
+    DebugRecordedFinals {
+        sends: Vec<AgentControlDebugFinalSend>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentControlAccount {
+    pub account_id_hex: String,
+    pub label: String,
+    pub local_signing: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentControlDebugFinalSend {
+    pub account_id_hex: String,
+    pub group_id_hex: String,
+    pub text: String,
+    pub reply_to_message_id_hex: Option<String>,
+    pub message_ids_hex: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AgentControlEvent {
+    InboundMessage {
+        account_id_hex: String,
+        group_id_hex: String,
+        message_id_hex: String,
+        sender_account_id_hex: String,
+        text: String,
+    },
+    GroupInvite {
+        account_id_hex: String,
+        group_id_hex: String,
+        via_welcome_message_id_hex: String,
+        welcomer_account_id_hex: Option<String>,
+    },
+    StreamUpdate {
+        account_id_hex: String,
+        group_id_hex: String,
+        stream_id_hex: String,
+        status: String,
+    },
+}
+
+pub fn encode_frame<T: Serialize>(message: &T) -> Result<Vec<u8>, AgentControlError> {
+    let mut bytes = serde_json::to_vec(message)?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
+pub fn decode_frame<T: DeserializeOwned>(frame: &[u8]) -> Result<T, AgentControlError> {
+    let frame = trim_line_ending(frame);
+    if frame.is_empty() {
+        return Err(AgentControlError::EmptyFrame);
+    }
+    if frame.len() > MAX_AGENT_CONTROL_FRAME_BYTES {
+        return Err(AgentControlError::FrameTooLarge(frame.len()));
+    }
+    Ok(serde_json::from_slice(frame)?)
+}
+
+pub fn decode_envelope<T: DeserializeOwned>(
+    frame: &[u8],
+) -> Result<AgentControlEnvelope<T>, AgentControlError> {
+    let envelope: AgentControlEnvelope<T> = decode_frame(frame)?;
+    envelope.validate_protocol()?;
+    Ok(envelope)
+}
+
+pub async fn write_frame<W, T>(writer: &mut W, message: &T) -> Result<(), AgentControlError>
+where
+    W: AsyncWrite + Unpin,
+    T: Serialize,
+{
+    let frame = encode_frame(message)?;
+    writer.write_all(&frame).await?;
+    writer.flush().await?;
+    Ok(())
+}
+
+pub async fn read_frame<R, T>(reader: &mut R) -> Result<Option<T>, AgentControlError>
+where
+    R: AsyncBufRead + Unpin,
+    T: DeserializeOwned,
+{
+    let mut frame = Vec::new();
+    let read = reader.read_until(b'\n', &mut frame).await?;
+    if read == 0 {
+        return Ok(None);
+    }
+    if frame.len() > MAX_AGENT_CONTROL_FRAME_BYTES {
+        return Err(AgentControlError::FrameTooLarge(frame.len()));
+    }
+    decode_frame(&frame).map(Some)
+}
+
+pub async fn read_envelope<R, T>(
+    reader: &mut R,
+) -> Result<Option<AgentControlEnvelope<T>>, AgentControlError>
+where
+    R: AsyncBufRead + Unpin,
+    T: DeserializeOwned,
+{
+    match read_frame(reader).await? {
+        Some(envelope) => {
+            let envelope: AgentControlEnvelope<T> = envelope;
+            envelope.validate_protocol()?;
+            Ok(Some(envelope))
+        }
+        None => Ok(None),
+    }
+}
+
+fn trim_line_ending(frame: &[u8]) -> &[u8] {
+    let frame = frame.strip_suffix(b"\n").unwrap_or(frame);
+    frame.strip_suffix(b"\r").unwrap_or(frame)
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::Value;
+    use tokio::io::AsyncReadExt;
+    use tokio::io::BufReader;
+
+    use crate::{
+        AgentControlEnvelope, AgentControlRequest, AgentControlResponse, decode_envelope,
+        encode_frame, read_envelope, write_frame,
+    };
+
+    #[test]
+    fn stream_append_frame_round_trips_as_append_only_text() {
+        let frame = AgentControlEnvelope::request(
+            Some("req-1".to_owned()),
+            AgentControlRequest::StreamAppend {
+                stream_id_hex: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    .to_owned(),
+                append_text: "lo".to_owned(),
+            },
+        );
+
+        let encoded = encode_frame(&frame).unwrap();
+        assert!(encoded.ends_with(b"\n"));
+        let json: Value = serde_json::from_slice(&encoded[..encoded.len() - 1]).unwrap();
+        assert_eq!(json["marmot_agent_control"], "marmot.agent-control.v1");
+        assert_eq!(json["id"], "req-1");
+        assert_eq!(json["type"], "stream_append");
+        assert_eq!(json["append_text"], "lo");
+        assert!(json.get("text").is_none());
+        assert!(json.get("replace_text").is_none());
+
+        let decoded: AgentControlEnvelope<AgentControlRequest> = decode_envelope(&encoded).unwrap();
+        assert_eq!(decoded, frame);
+    }
+
+    #[tokio::test]
+    async fn async_frame_helpers_exchange_typed_requests_and_responses() {
+        let (client, server) = tokio::io::duplex(4096);
+        let (client_read, mut client_write) = tokio::io::split(client);
+        let (server_read, mut server_write) = tokio::io::split(server);
+        let mut client_read = BufReader::new(client_read);
+        let mut server_read = BufReader::new(server_read);
+
+        let request = AgentControlEnvelope::request(
+            Some("req-2".to_owned()),
+            AgentControlRequest::AccountList,
+        );
+        write_frame(&mut client_write, &request).await.unwrap();
+        let received: AgentControlEnvelope<AgentControlRequest> =
+            read_envelope(&mut server_read).await.unwrap().unwrap();
+        assert_eq!(received, request);
+
+        let response =
+            AgentControlEnvelope::new(Some("req-2".to_owned()), AgentControlResponse::Ack);
+        write_frame(&mut server_write, &response).await.unwrap();
+        let received: AgentControlEnvelope<AgentControlResponse> =
+            read_envelope(&mut client_read).await.unwrap().unwrap();
+        assert_eq!(received, response);
+    }
+
+    #[tokio::test]
+    async fn write_frame_emits_one_json_line() {
+        let (mut writer, mut reader) = tokio::io::duplex(4096);
+        let request = AgentControlEnvelope::request(
+            Some("req-single-frame".to_owned()),
+            AgentControlRequest::AccountList,
+        );
+
+        write_frame(&mut writer, &request).await.unwrap();
+        drop(writer);
+
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).await.unwrap();
+        let lines = bytes
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>();
+        assert_eq!(lines.len(), 1, "write_frame should emit exactly one frame");
+        let decoded: AgentControlEnvelope<AgentControlRequest> = decode_envelope(&bytes).unwrap();
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn all_initial_request_variants_have_stable_type_names() {
+        let requests = vec![
+            (
+                AgentControlRequest::SubscribeInbound {
+                    account_id_hex: None,
+                    group_id_hex: None,
+                },
+                "subscribe_inbound",
+            ),
+            (
+                AgentControlRequest::SendFinal {
+                    account_id_hex: account(),
+                    group_id_hex: group(),
+                    text: "done".to_owned(),
+                    reply_to_message_id_hex: None,
+                },
+                "send_final",
+            ),
+            (
+                AgentControlRequest::StreamBegin {
+                    account_id_hex: account(),
+                    group_id_hex: group(),
+                    stream_id_hex: None,
+                    quic_candidates: vec!["quic://127.0.0.1:4450".to_owned()],
+                },
+                "stream_begin",
+            ),
+            (
+                AgentControlRequest::StreamAppend {
+                    stream_id_hex: stream(),
+                    append_text: "hel".to_owned(),
+                },
+                "stream_append",
+            ),
+            (
+                AgentControlRequest::StreamStatus {
+                    stream_id_hex: stream(),
+                    status: "thinking".to_owned(),
+                },
+                "stream_status",
+            ),
+            (
+                AgentControlRequest::StreamFinalize {
+                    stream_id_hex: stream(),
+                    final_text: "hello".to_owned(),
+                    transcript_hash_hex: hash(),
+                    chunk_count: 1,
+                },
+                "stream_finalize",
+            ),
+            (
+                AgentControlRequest::StreamCancel {
+                    stream_id_hex: stream(),
+                    reason: Some("gateway_replaced_text".to_owned()),
+                },
+                "stream_cancel",
+            ),
+            (AgentControlRequest::AccountList, "account_list"),
+            (
+                AgentControlRequest::AccountCreate {
+                    label: Some("agent".to_owned()),
+                    publish_key_package: true,
+                },
+                "account_create",
+            ),
+            (
+                AgentControlRequest::AccountPublishKeyPackage {
+                    account_id_hex: account(),
+                },
+                "account_publish_key_package",
+            ),
+            (
+                AgentControlRequest::AllowlistList {
+                    account_id_hex: account(),
+                },
+                "allowlist_list",
+            ),
+            (
+                AgentControlRequest::AllowlistAdd {
+                    account_id_hex: account(),
+                    welcomer_account_id_hex: welcomer(),
+                },
+                "allowlist_add",
+            ),
+            (
+                AgentControlRequest::AllowlistRemove {
+                    account_id_hex: account(),
+                    welcomer_account_id_hex: welcomer(),
+                },
+                "allowlist_remove",
+            ),
+            (
+                AgentControlRequest::DebugInjectInbound {
+                    account_id_hex: account(),
+                    group_id_hex: group(),
+                    message_id_hex: message(),
+                    sender_account_id_hex: welcomer(),
+                    text: "hello agent".to_owned(),
+                },
+                "debug_inject_inbound",
+            ),
+            (
+                AgentControlRequest::DebugRecordedFinals,
+                "debug_recorded_finals",
+            ),
+        ];
+
+        for (request, expected_type) in requests {
+            let value = serde_json::to_value(request).unwrap();
+            assert_eq!(value["type"], expected_type);
+        }
+    }
+
+    fn account() -> String {
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned()
+    }
+
+    fn welcomer() -> String {
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned()
+    }
+
+    fn group() -> String {
+        "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".to_owned()
+    }
+
+    fn stream() -> String {
+        "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_owned()
+    }
+
+    fn message() -> String {
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".to_owned()
+    }
+
+    fn hash() -> String {
+        "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".to_owned()
+    }
+}

@@ -10,6 +10,9 @@ members = [
     "crates/transport-nostr-adapter",
     "crates/transport-quic-stream",
     "crates/transport-quic-broker",
+    "crates/agent-stream-compose",
+    "crates/agent-control",
+    "crates/agent-connector",
     "crates/marmot-forensics",
     "crates/marmot-account",
     "crates/marmot-app",
@@ -88,6 +91,9 @@ transport-nostr-peeler = { path = "crates/transport-nostr-peeler" }
 transport-nostr-adapter = { path = "crates/transport-nostr-adapter" }
 transport-quic-stream = { path = "crates/transport-quic-stream" }
 transport-quic-broker = { path = "crates/transport-quic-broker" }
+agent-stream-compose = { path = "crates/agent-stream-compose" }
+agent-control = { path = "crates/agent-control" }
+agent-connector = { path = "crates/agent-connector" }
 marmot-forensics = { path = "crates/marmot-forensics" }
 marmot-account = { path = "crates/marmot-account" }
 marmot-app = { path = "crates/marmot-app" }
