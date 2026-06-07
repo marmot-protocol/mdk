@@ -1,13 +1,13 @@
 # AGENTS.md - marmot-forensics
 
-Shared forensic dump schema for Marmot incident capture.
+Shared JSONL forensic audit schema for Marmot incident capture.
 
 ## Scope
 
-- Own serializable dump types shared by app exports, UniFFI bindings, and internal analysis tooling.
+- Own the append-only audit-log schema and recorder traits used by engine/runtime incident capture.
 - Keep this crate independent of engine, app, storage, transport SDK, and simulator crates.
-- Keep public-mode helpers privacy-preserving by default: hash operational identifiers and never include raw payload bytes.
-- Keep sensitive-mode fields explicit and easy to audit.
+- Keep static snapshot dump analysis out of this repo; external tools should consume JSONL audit files.
+- Keep audit logging opt-in and explicit because JSONL audit files can include sensitive operational identifiers.
 
 ## Verification
 

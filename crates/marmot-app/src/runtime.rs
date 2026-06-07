@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::{
-    Arc,
+    Arc, Mutex as StdMutex,
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant};
@@ -16,7 +16,6 @@ use cgka_traits::app_event::{
 use cgka_traits::engine::GroupEvent;
 use cgka_traits::{GroupId, MemberId, MessageId, SecretBytes, TransportEndpoint};
 use marmot_account::{AccountHomeError, AccountSummary};
-use marmot_forensics::{ForensicsBundle, ForensicsExportOptions};
 use rand::RngCore;
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
@@ -40,13 +39,14 @@ use crate::{
     APP_RUNTIME_RELAY_REBUILD_LOOKBACK, APP_RUNTIME_SUBSCRIPTION_BUFFER, AccountKeyPackageRecord,
     AccountRelayListBootstrap, AccountRelayListStatus, AgentTextStreamFinishRequest, AppError,
     AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord, AppMessageQuery, AppMessageRecord,
-    AppProjectionUpdate, BackgroundNotificationCollection, ChatListRow, GroupInviteDeclineResult,
-    GroupPushDebugInfo, MarmotApp, MarmotRelayPlane, MediaDownloadResult, MediaReference,
-    MediaUploadRequest, MediaUploadResult, NotificationCollectionStatus, NotificationSettings,
-    NotificationUpdate, NotificationWakeSource, PushPlatform, PushRegistration, ReceivedMessage,
-    SendSummary, SyncSummary, TimelineMessageChange, TimelineMessageQuery, TimelinePage,
-    TimelineUpdateTrigger, UserDirectoryRefresh, UserProfileMetadata, default_profile_pseudonym,
-    unix_now_seconds,
+    AppProjectionUpdate, AuditLogFile, AuditLogSettings, AuditLogUploadResult,
+    BackgroundNotificationCollection, ChatListRow, GroupInviteDeclineResult, GroupPushDebugInfo,
+    MarmotApp, MarmotRelayPlane, MediaDownloadResult, MediaReference, MediaUploadRequest,
+    MediaUploadResult, NotificationCollectionStatus, NotificationSettings, NotificationUpdate,
+    NotificationWakeSource, PushPlatform, PushRegistration, ReceivedMessage,
+    RelayTelemetryExportConfig, RelayTelemetryRuntimeConfig, RelayTelemetrySettings, SendSummary,
+    SyncSummary, TimelineMessageChange, TimelineMessageQuery, TimelinePage, TimelineUpdateTrigger,
+    UserDirectoryRefresh, UserProfileMetadata, default_profile_pseudonym, unix_now_seconds,
 };
 
 #[derive(Clone)]
@@ -70,6 +70,8 @@ pub struct RuntimeSharedServices {
     relay_plane: MarmotRelayPlane,
     agent_streams: AgentStreamWatchManager,
     lifecycle: RuntimeLifecycle,
+    relay_telemetry_exporter: Arc<StdMutex<Option<JoinHandle<()>>>>,
+    relay_telemetry_runtime_config: Arc<StdMutex<RelayTelemetryRuntimeConfig>>,
 }
 
 impl Default for RuntimeSharedServices {
@@ -78,6 +80,10 @@ impl Default for RuntimeSharedServices {
             relay_plane: MarmotRelayPlane::runtime_default(APP_RUNTIME_RELAY_REBUILD_LOOKBACK),
             agent_streams: AgentStreamWatchManager::default(),
             lifecycle: RuntimeLifecycle::new(),
+            relay_telemetry_exporter: Arc::new(StdMutex::new(None)),
+            relay_telemetry_runtime_config: Arc::new(StdMutex::new(
+                RelayTelemetryRuntimeConfig::default(),
+            )),
         }
     }
 }
@@ -88,6 +94,10 @@ impl RuntimeSharedServices {
             relay_plane: app.relay_plane.clone(),
             agent_streams: AgentStreamWatchManager::default(),
             lifecycle: RuntimeLifecycle::new(),
+            relay_telemetry_exporter: Arc::new(StdMutex::new(None)),
+            relay_telemetry_runtime_config: Arc::new(StdMutex::new(
+                RelayTelemetryRuntimeConfig::default(),
+            )),
         }
     }
 
@@ -102,6 +112,56 @@ impl RuntimeSharedServices {
     pub(crate) fn lifecycle(&self) -> RuntimeLifecycle {
         self.lifecycle.clone()
     }
+
+    fn configure_relay_telemetry_exporter(&self, config: RelayTelemetryExportConfig) {
+        self.stop_relay_telemetry_exporter();
+        #[cfg(feature = "otlp-export")]
+        {
+            if let Some(exporter) = self.relay_plane.telemetry_exporter(config) {
+                let shutdown = self.lifecycle.subscribe_shutdown();
+                let handle = tokio::spawn(exporter.run(shutdown));
+                *self
+                    .relay_telemetry_exporter
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(handle);
+            }
+        }
+        #[cfg(not(feature = "otlp-export"))]
+        {
+            if config.enabled {
+                tracing::warn!(
+                    target: "marmot_app::relay_telemetry_export",
+                    method = "configure_relay_telemetry_exporter",
+                    "relay telemetry export requested, but marmot-app was built without otlp-export",
+                );
+            }
+        }
+    }
+
+    fn relay_telemetry_runtime_config(&self) -> RelayTelemetryRuntimeConfig {
+        self.relay_telemetry_runtime_config
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn set_relay_telemetry_runtime_config(&self, config: RelayTelemetryRuntimeConfig) {
+        *self
+            .relay_telemetry_runtime_config
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = config;
+    }
+
+    fn stop_relay_telemetry_exporter(&self) {
+        if let Some(handle) = self
+            .relay_telemetry_exporter
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            handle.abort();
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -111,6 +171,7 @@ pub(crate) struct RuntimeLifecycle {
 
 struct RuntimeLifecycleInner {
     stopping: AtomicBool,
+    running: AtomicBool,
     stop_tx: watch::Sender<bool>,
     active_account_opens: AtomicUsize,
     account_opens_drained: Notify,
@@ -127,6 +188,7 @@ impl RuntimeLifecycle {
         Self {
             inner: Arc::new(RuntimeLifecycleInner {
                 stopping: AtomicBool::new(false),
+                running: AtomicBool::new(false),
                 stop_tx,
                 active_account_opens: AtomicUsize::new(0),
                 account_opens_drained: Notify::new(),
@@ -136,10 +198,19 @@ impl RuntimeLifecycle {
 
     pub(crate) fn begin_shutdown(&self) -> bool {
         let was_stopping = self.inner.stopping.swap(true, Ordering::AcqRel);
+        self.inner.running.store(false, Ordering::Release);
         if !was_stopping {
             self.inner.stop_tx.send_replace(true);
         }
         !was_stopping
+    }
+
+    pub(crate) fn mark_running(&self) {
+        self.inner.running.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn is_running(&self) -> bool {
+        self.inner.running.load(Ordering::Acquire) && !self.is_stopping()
     }
 
     pub(crate) fn is_stopping(&self) -> bool {
@@ -329,11 +400,6 @@ enum AccountWorkerCommand {
     GroupMlsState {
         group_id: GroupId,
         respond: oneshot::Sender<Result<AppGroupMlsState, AppError>>,
-    },
-    GroupForensicsBundle {
-        group_id: GroupId,
-        options: ForensicsExportOptions,
-        respond: oneshot::Sender<Result<ForensicsBundle, AppError>>,
     },
     SafeExportSecret {
         group_id: GroupId,
@@ -605,7 +671,7 @@ pub enum RuntimeChatListUpdate {
     },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ChatListUpdateTrigger {
     NewGroup,
     NewLastMessage,
@@ -614,14 +680,9 @@ pub enum ChatListUpdateTrigger {
     PendingConfirmationChanged,
     MembershipChanged,
     UnreadChanged,
+    #[default]
     SnapshotRefresh,
     Removed,
-}
-
-impl Default for ChatListUpdateTrigger {
-    fn default() -> Self {
-        Self::SnapshotRefresh
-    }
 }
 
 impl ChatListUpdateTrigger {
@@ -1453,8 +1514,16 @@ impl MarmotAppRuntime {
 
     pub async fn start(&self) -> Result<(), AppError> {
         self.shared.lifecycle().ensure_running()?;
+        let config = self
+            .accounts
+            .app
+            .relay_telemetry_settings()?
+            .export_config_with_runtime(self.shared.relay_telemetry_runtime_config());
         self.sync_user_directory_subscriptions().await?;
-        self.reconcile_accounts().await
+        self.reconcile_accounts().await?;
+        self.shared.lifecycle().mark_running();
+        self.shared.configure_relay_telemetry_exporter(config);
+        Ok(())
     }
 
     pub(crate) async fn sync_user_directory_subscriptions(
@@ -1594,17 +1663,6 @@ impl MarmotAppRuntime {
         group_id: &GroupId,
     ) -> Result<AppGroupMlsState, AppError> {
         self.accounts.group_mls_state(account_ref, group_id).await
-    }
-
-    pub async fn group_forensics_bundle(
-        &self,
-        account_ref: &str,
-        group_id: &GroupId,
-        options: ForensicsExportOptions,
-    ) -> Result<ForensicsBundle, AppError> {
-        self.accounts
-            .group_forensics_bundle(account_ref, group_id, options)
-            .await
     }
 
     pub async fn safe_export_secret(
@@ -1796,6 +1854,68 @@ impl MarmotAppRuntime {
         account_ref: &str,
     ) -> Result<NotificationSettings, AppError> {
         self.accounts.app.notification_settings(account_ref)
+    }
+
+    pub fn relay_telemetry_settings(&self) -> Result<RelayTelemetrySettings, AppError> {
+        self.accounts.app.relay_telemetry_settings()
+    }
+
+    pub fn telemetry_install_id(&self) -> Result<String, AppError> {
+        self.accounts.app.telemetry_install_id()
+    }
+
+    pub fn set_relay_telemetry_settings(
+        &self,
+        settings: RelayTelemetrySettings,
+    ) -> Result<RelayTelemetrySettings, AppError> {
+        let settings = self.accounts.app.set_relay_telemetry_settings(settings)?;
+        if self.shared.lifecycle().is_running() {
+            self.shared.configure_relay_telemetry_exporter(
+                settings.export_config_with_runtime(self.shared.relay_telemetry_runtime_config()),
+            );
+        }
+        Ok(settings)
+    }
+
+    pub fn set_relay_telemetry_runtime_config(
+        &self,
+        config: RelayTelemetryRuntimeConfig,
+    ) -> Result<RelayTelemetryRuntimeConfig, AppError> {
+        let config = config
+            .normalize()
+            .map_err(AppError::InvalidRelayTelemetrySettings)?;
+        self.shared
+            .set_relay_telemetry_runtime_config(config.clone());
+        if self.shared.lifecycle().is_running() {
+            let settings = self.accounts.app.relay_telemetry_settings()?;
+            self.shared.configure_relay_telemetry_exporter(
+                settings.export_config_with_runtime(config.clone()),
+            );
+        }
+        Ok(config)
+    }
+
+    pub fn audit_log_settings(&self) -> Result<AuditLogSettings, AppError> {
+        self.accounts.app.audit_log_settings()
+    }
+
+    pub fn set_audit_log_settings(
+        &self,
+        settings: AuditLogSettings,
+    ) -> Result<AuditLogSettings, AppError> {
+        self.accounts.app.set_audit_log_settings(settings)
+    }
+
+    pub fn audit_log_files(&self) -> Result<Vec<AuditLogFile>, AppError> {
+        self.accounts.app.audit_log_files()
+    }
+
+    pub async fn post_audit_log_file(
+        &self,
+        path: &str,
+        endpoint: &str,
+    ) -> Result<AuditLogUploadResult, AppError> {
+        self.accounts.app.post_audit_log_file(path, endpoint).await
     }
 
     pub fn set_local_notifications_enabled(
@@ -2328,6 +2448,7 @@ impl MarmotAppRuntime {
     pub async fn shutdown(&self) {
         let started_at = Instant::now();
         self.shared.lifecycle().begin_shutdown();
+        self.shared.stop_relay_telemetry_exporter();
         if let Some(directory_sync) = self.directory_sync.lock().await.take() {
             directory_sync.shutdown().await;
         }
@@ -2587,25 +2708,6 @@ impl AccountManager {
         command
             .send(AccountWorkerCommand::GroupMlsState {
                 group_id: group_id.clone(),
-                respond,
-            })
-            .await
-            .map_err(|_| AppError::TransportClosed)?;
-        account_worker_response(response).await
-    }
-
-    pub async fn group_forensics_bundle(
-        &self,
-        account_ref: &str,
-        group_id: &GroupId,
-        options: ForensicsExportOptions,
-    ) -> Result<ForensicsBundle, AppError> {
-        let command = self.worker_commands(account_ref).await?;
-        let (respond, response) = oneshot::channel();
-        command
-            .send(AccountWorkerCommand::GroupForensicsBundle {
-                group_id: group_id.clone(),
-                options,
                 respond,
             })
             .await
@@ -3526,26 +3628,6 @@ async fn run_app_runtime_account_worker(
                     Some(AccountWorkerCommand::GroupMlsState { group_id, respond }) => {
                         let result = client.group_mls_state(&group_id);
                         let _ = respond.send(result);
-                    }
-                    Some(AccountWorkerCommand::GroupForensicsBundle {
-                        group_id,
-                        options,
-                        respond,
-                    }) => {
-                        let task = tokio::task::spawn_blocking(move || {
-                            let result = client.group_forensics_bundle(&group_id, &options);
-                            (client, result)
-                        });
-                        match task.await {
-                            Ok((restored_client, result)) => {
-                                client = restored_client;
-                                let _ = respond.send(result);
-                            }
-                            Err(err) => {
-                                let _ = respond.send(Err(AppError::BlockingTask(err.to_string())));
-                                return;
-                            }
-                        }
                     }
                     Some(AccountWorkerCommand::UpdateMessageRetention {
                         group_id,

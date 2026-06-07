@@ -69,6 +69,12 @@ pub enum AppError {
     InvalidPushServer(String),
     #[error("invalid push token gossip")]
     InvalidPushGossip(String),
+    #[error("invalid relay telemetry settings: {0}")]
+    InvalidRelayTelemetrySettings(String),
+    #[error("invalid audit log file: {0}")]
+    InvalidAuditLogFile(String),
+    #[error("audit log upload failed: {0}")]
+    AuditLogUpload(String),
     #[error("local notifications are disabled")]
     NotificationsDisabled,
     #[error("SQLCipher key derivation failed: {0}")]

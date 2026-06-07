@@ -14,10 +14,6 @@ use cgka_traits::app_event::{
 };
 use cgka_traits::engine::{CreateGroupRequest, KeyPackage, SendIntent};
 use cgka_traits::{GroupId, SecretBytes, TransportAdapter, TransportEndpoint};
-use marmot_forensics::{
-    FORENSICS_SCHEMA_VERSION, ForensicsAccount, ForensicsBundle, ForensicsExportOptions,
-    ForensicsGroup, ForensicsProducer,
-};
 use tokio::time::timeout;
 use transport_nostr_peeler::NostrTransportEvent;
 
@@ -163,66 +159,6 @@ impl AppClient {
                 .iter()
                 .copied()
                 .collect(),
-        })
-    }
-
-    pub fn group_forensics_bundle(
-        &self,
-        group_id: &GroupId,
-        options: &ForensicsExportOptions,
-    ) -> Result<ForensicsBundle, AppError> {
-        self.ensure_group(group_id)?;
-        let group_id_hex = hex::encode(group_id.as_slice());
-        let app_group = self
-            .app
-            .group(&self.state.label, &group_id_hex)?
-            .ok_or_else(|| AppError::UnknownGroup(group_id_hex.clone()))?;
-        let account = self.app.account_home().account(&self.state.label)?;
-        let engine = self.runtime.group_forensics(group_id, options)?;
-        let mut warnings = engine.warnings;
-        if !options.mode.is_sensitive() {
-            warnings.push(
-                "public dump redacts account ids, group ids, relay URLs, and payload bytes"
-                    .to_owned(),
-            );
-        }
-        Ok(ForensicsBundle {
-            schema_version: FORENSICS_SCHEMA_VERSION.to_owned(),
-            mode: options.mode,
-            redaction_salt_id: options.redaction_salt_id(),
-            exported_at_ms: unix_now_seconds().saturating_mul(1000),
-            producer: ForensicsProducer {
-                name: "marmot-app".to_owned(),
-                version: env!("CARGO_PKG_VERSION").to_owned(),
-            },
-            account: ForensicsAccount {
-                account_ref: options.protect_text(&account.label),
-                account_id: options.protect_hex(&account.account_id_hex),
-            },
-            group: ForensicsGroup {
-                group_id: engine.group_id,
-                epoch: engine.epoch,
-                member_count: engine.member_count,
-                required_app_components: engine.required_app_components,
-                admins: app_group
-                    .admin_policy
-                    .admins
-                    .iter()
-                    .map(|admin| options.protect_hex(admin))
-                    .collect(),
-                relays: app_group
-                    .nostr_routing
-                    .relays
-                    .iter()
-                    .map(|relay| options.protect_text(relay))
-                    .collect(),
-                nostr_group_id: Some(
-                    options.protect_hex(&app_group.nostr_routing.nostr_group_id_hex),
-                ),
-            },
-            messages: engine.messages,
-            snapshots: engine.snapshots,
-            warnings,
         })
     }
 
@@ -1477,6 +1413,11 @@ fn read_marker_error_code(error: &AppError) -> &'static str {
         AppError::InvalidPushToken(_) => "read_marker_failed:invalid_push_token",
         AppError::InvalidPushServer(_) => "read_marker_failed:invalid_push_server",
         AppError::InvalidPushGossip(_) => "read_marker_failed:invalid_push_gossip",
+        AppError::InvalidRelayTelemetrySettings(_) => {
+            "read_marker_failed:invalid_relay_telemetry_settings"
+        }
+        AppError::InvalidAuditLogFile(_) => "read_marker_failed:invalid_audit_log_file",
+        AppError::AuditLogUpload(_) => "read_marker_failed:audit_log_upload",
         AppError::NotificationsDisabled => "read_marker_failed:notifications_disabled",
         AppError::SqlcipherKeyDerivation(_) => "read_marker_failed:sqlcipher_key_derivation",
         AppError::BlockingTask(_) => "read_marker_failed:blocking_task",

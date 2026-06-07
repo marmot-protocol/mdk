@@ -12,9 +12,12 @@ use std::sync::{Arc, Once};
 
 use marmot_account::AccountHome;
 use marmot_uniffi::{
-    Marmot, MarmotKitError, MediaReferenceFfi, MediaUploadRequestFfi, NotificationWakeSourceFfi,
-    PushPlatformFfi, TimelineMessageQueryFfi,
+    AuditLogSettingsFfi, Marmot, MarmotKitError, MediaReferenceFfi, MediaUploadRequestFfi,
+    NotificationWakeSourceFfi, PushPlatformFfi, RelayTelemetrySettingsFfi, TimelineMessageQueryFfi,
 };
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
+use tokio::sync::oneshot;
 
 /// `Marmot::new` opens a Keychain-backed secret store, which on the real
 /// targets (iOS/macOS) is always present but in headless CI (Linux Secret
@@ -30,6 +33,76 @@ fn install_mock_keyring() {
             keyring_core::set_default_store(store);
         }
     });
+}
+
+struct CapturedAuditUpload {
+    method: String,
+    path: String,
+    content_type: Option<String>,
+    body: Vec<u8>,
+}
+
+fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+async fn capture_audit_upload(listener: TcpListener, tx: oneshot::Sender<CapturedAuditUpload>) {
+    let Ok((mut stream, _)) = listener.accept().await else {
+        return;
+    };
+    let mut buf = Vec::new();
+    let mut chunk = [0_u8; 4096];
+    loop {
+        let read = match stream.read(&mut chunk).await {
+            Ok(0) | Err(_) => return,
+            Ok(read) => read,
+        };
+        buf.extend_from_slice(&chunk[..read]);
+
+        let Some(header_end) = find_subsequence(&buf, b"\r\n\r\n").map(|pos| pos + 4) else {
+            continue;
+        };
+        let headers = String::from_utf8_lossy(&buf[..header_end]).to_string();
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                line.to_ascii_lowercase()
+                    .strip_prefix("content-length:")
+                    .and_then(|value| value.trim().parse::<usize>().ok())
+            })
+            .unwrap_or(0);
+        while buf.len() < header_end + content_length {
+            match stream.read(&mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(read) => buf.extend_from_slice(&chunk[..read]),
+            }
+        }
+
+        let request_line = headers.lines().next().unwrap_or_default();
+        let mut parts = request_line.split_whitespace();
+        let method = parts.next().unwrap_or_default().to_owned();
+        let path = parts.next().unwrap_or_default().to_owned();
+        let content_type = headers.lines().find_map(|line| {
+            line.to_ascii_lowercase()
+                .strip_prefix("content-type:")
+                .map(|value| value.trim().to_owned())
+        });
+        let body = buf[header_end..header_end + content_length].to_vec();
+
+        let _ = stream
+            .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+            .await;
+        let _ = stream.shutdown().await;
+        let _ = tx.send(CapturedAuditUpload {
+            method,
+            path,
+            content_type,
+            body,
+        });
+        return;
+    }
 }
 
 #[tokio::test]
@@ -265,6 +338,154 @@ async fn notification_binding_methods_are_public_and_validate_missing_accounts()
         .subscribe_notifications()
         .await
         .expect("empty notification subscription should be valid");
+}
+
+#[test]
+fn relay_telemetry_settings_binding_round_trips() {
+    install_mock_keyring();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let kit = Marmot::new(
+        tmp.path().to_string_lossy().into_owned(),
+        vec!["wss://relay.invalid.test".to_string()],
+    )
+    .expect("open marmot kit");
+
+    let settings = kit
+        .relay_telemetry_settings()
+        .expect("default telemetry settings");
+    assert!(!settings.export_enabled);
+    assert_eq!(settings.export_interval_seconds, 60);
+
+    let stored = kit
+        .set_relay_telemetry_settings(RelayTelemetrySettingsFfi {
+            export_enabled: true,
+            export_interval_seconds: 30,
+        })
+        .expect("set telemetry settings");
+    assert!(stored.export_enabled);
+    assert_eq!(stored.export_interval_seconds, 30);
+
+    let reopened = Marmot::new(
+        tmp.path().to_string_lossy().into_owned(),
+        vec!["wss://relay.invalid.test".to_string()],
+    )
+    .expect("reopen marmot kit");
+    assert_eq!(
+        reopened
+            .relay_telemetry_settings()
+            .expect("persisted telemetry settings")
+            .export_interval_seconds,
+        stored.export_interval_seconds
+    );
+}
+
+#[test]
+fn audit_log_settings_binding_round_trips() {
+    install_mock_keyring();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let kit = Marmot::new(
+        tmp.path().to_string_lossy().into_owned(),
+        vec!["wss://relay.invalid.test".to_string()],
+    )
+    .expect("open marmot kit");
+
+    let settings = kit.audit_log_settings().expect("default audit settings");
+    assert!(!settings.enabled);
+
+    let stored = kit
+        .set_audit_log_settings(AuditLogSettingsFfi { enabled: true })
+        .expect("set audit settings");
+    assert!(stored.enabled);
+
+    let reopened = Marmot::new(
+        tmp.path().to_string_lossy().into_owned(),
+        vec!["wss://relay.invalid.test".to_string()],
+    )
+    .expect("reopen marmot kit");
+    assert!(
+        reopened
+            .audit_log_settings()
+            .expect("persisted audit settings")
+            .enabled
+    );
+}
+
+#[test]
+fn audit_log_binding_lists_local_jsonl_logs() {
+    install_mock_keyring();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let kit = Marmot::new(
+        tmp.path().to_string_lossy().into_owned(),
+        vec!["wss://relay.invalid.test".to_string()],
+    )
+    .expect("open marmot kit");
+    let account = AccountHome::open_with_default_keychain(tmp.path())
+        .expect("open account home")
+        .create_nostr_account()
+        .expect("create local account");
+    let audit_path = AccountHome::open_with_default_keychain(tmp.path())
+        .expect("reopen account home")
+        .account_dir(&account.label)
+        .join("audit-binding.jsonl");
+    std::fs::write(&audit_path, b"{\"seq\":1}\n").expect("write audit log");
+
+    let files = kit.audit_log_files().expect("list audit logs");
+
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].path, audit_path.to_string_lossy());
+    assert_eq!(files[0].file_name, "audit-binding.jsonl");
+    assert!(files[0].size_bytes > 0);
+}
+
+#[tokio::test]
+async fn audit_log_binding_posts_jsonl_file() {
+    install_mock_keyring();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let kit = Marmot::new(
+        tmp.path().to_string_lossy().into_owned(),
+        vec!["wss://relay.invalid.test".to_string()],
+    )
+    .expect("open marmot kit");
+    let account = AccountHome::open_with_default_keychain(tmp.path())
+        .expect("open account home")
+        .create_nostr_account()
+        .expect("create local account");
+    let audit_body = b"{\"seq\":1}\n{\"seq\":2}\n";
+    let audit_path = AccountHome::open_with_default_keychain(tmp.path())
+        .expect("reopen account home")
+        .account_dir(&account.label)
+        .join("audit-binding-upload.jsonl");
+    std::fs::write(&audit_path, audit_body).expect("write audit log");
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = oneshot::channel();
+    let server = tokio::spawn(capture_audit_upload(listener, tx));
+
+    let result = kit
+        .post_audit_log_file(
+            audit_path.to_string_lossy().into_owned(),
+            format!("http://{addr}/ingest"),
+        )
+        .await
+        .expect("post audit log through binding");
+
+    assert_eq!(
+        std::fs::canonicalize(&result.path).expect("canonical result path"),
+        std::fs::canonicalize(&audit_path).expect("canonical audit path")
+    );
+    assert_eq!(result.status, 204);
+    assert_eq!(result.bytes_sent, audit_body.len() as u64);
+    let captured = rx.await.expect("captured upload");
+    assert_eq!(captured.method, "POST");
+    assert_eq!(captured.path, "/ingest");
+    assert_eq!(
+        captured.content_type.as_deref(),
+        Some("application/x-ndjson")
+    );
+    assert_eq!(captured.body, audit_body);
+
+    server.await.unwrap();
 }
 
 #[tokio::test]

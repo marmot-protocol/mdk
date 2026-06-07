@@ -495,7 +495,8 @@ impl MarmotRelayPlane {
         config: &RelayTelemetryExportConfig,
     ) -> Option<RelayLabelResolution> {
         // Same gate as `telemetry_exporter`: resolution cannot happen unless
-        // export is opted in, has an endpoint, and that endpoint is TLS.
+        // export is opted in with a TLS/loopback endpoint, auth, and resource
+        // metadata.
         if !config.export_allowed() {
             return None;
         }
@@ -1334,7 +1335,24 @@ mod tests {
     use transport_nostr_adapter::{NostrRelayEvent, NostrSubscription};
     use transport_nostr_peeler::{KIND_MARMOT_GROUP_MESSAGE, NOSTR_SOURCE};
 
+    use crate::config::{RelayTelemetryResource, RelayTelemetryRuntimeConfig};
+
     use super::*;
+
+    fn relay_telemetry_runtime_config() -> RelayTelemetryRuntimeConfig {
+        RelayTelemetryRuntimeConfig {
+            otlp_endpoint: Some("https://otlp.example.org/v1/metrics".to_owned()),
+            authorization_bearer_token: Some("token".to_owned()),
+            resource: Some(RelayTelemetryResource {
+                service_version: "1.4.2".to_owned(),
+                service_instance_id: "8e1ca50b-05a2-4c31-a31c-1e69c75a9366".to_owned(),
+                deployment_environment: "staging".to_owned(),
+                os_type: "ios".to_owned(),
+                os_version: "17.5".to_owned(),
+                device_model_identifier: None,
+            }),
+        }
+    }
 
     #[test]
     fn account_deliveries_lock_helpers_recover_from_poisoned_guard() {
@@ -1708,9 +1726,11 @@ mod tests {
                 .is_none()
         );
 
-        // Opted in with a TLS endpoint: the export boundary resolves the opaque
-        // index for the activated inbox endpoint back to its relay URL.
-        let enabled = RelayTelemetryExportConfig::enabled("https://otlp.example");
+        // Opted in with a TLS endpoint and runtime metadata: the export boundary
+        // resolves the opaque index for the activated inbox endpoint back to its
+        // relay URL.
+        let enabled = RelayTelemetryExportConfig::enabled("https://otlp.example/v1/metrics")
+            .with_runtime_config(relay_telemetry_runtime_config());
         let resolution = relay_plane
             .resolve_relay_labels(&enabled)
             .await

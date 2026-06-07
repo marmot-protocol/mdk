@@ -27,7 +27,6 @@ use cgka_traits::{
     TransportAdapterError, TransportDelivery, TransportEndpoint, TransportGroupSubscription,
     TransportGroupSync, TransportPublishReport, TransportPublishRequest, TransportPublishTarget,
 };
-use marmot_forensics::{ForensicsEngineGroupState, ForensicsExportOptions};
 use serde::{Deserialize, Serialize};
 
 const TRACE_TARGET: &str = "marmot_account::runtime";
@@ -936,14 +935,6 @@ where
 
     pub fn members(&self, group_id: &GroupId) -> AccountResult<Vec<Member>> {
         Ok(self.session.members(group_id)?)
-    }
-
-    pub fn group_forensics(
-        &self,
-        group_id: &GroupId,
-        options: &ForensicsExportOptions,
-    ) -> AccountResult<ForensicsEngineGroupState> {
-        Ok(self.session.group_forensics(group_id, options)?)
     }
 
     pub async fn ingest_delivery(

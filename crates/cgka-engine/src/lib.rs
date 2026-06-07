@@ -46,7 +46,6 @@ pub mod engine;
 pub mod engine_metrics;
 pub mod epoch_manager;
 pub mod feature_registry;
-pub mod forensics;
 pub mod fork_recovery;
 pub mod group_context_view;
 pub mod group_lifecycle;

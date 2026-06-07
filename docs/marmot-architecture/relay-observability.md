@@ -79,15 +79,16 @@ binding.
 
 | Metric | Shape | Source today | Ranks |
 | --- | --- | --- | --- |
-| `relay_first_event_latency` | histogram | `RelaySyncSnapshot.first_event` (currently aggregate) | responsiveness |
-| `relay_eose_latency` | histogram | `RelaySyncSnapshot.eose` (currently aggregate) | sync speed |
+| `relay_first_event_latency_ms` | histogram | `RelaySyncSnapshot.first_event` (currently aggregate) | responsiveness |
+| `relay_eose_latency_ms` | histogram | `RelaySyncSnapshot.eose` (currently aggregate) | sync speed |
 | `relay_first_deliverer_rate` | ratio | new: how often this relay delivered a copy first | redundancy value |
 | `relay_delivery_count` / `relay_redundant_count` | counters | adapter inbound path | reliability |
 | `relay_publish_accept` / `relay_publish_reject` (by kind) | counters | publish path / `NostrAdapterMetrics` | write health, kind policy |
 | `relay_connection_success_rate` | ratio | `NostrSdkRelayHealth` | connectivity |
-| `cross_relay_spread` | histogram | `RelayDeliverySpread` (global, not per-relay) | population delivery jitter → quiescence |
+| `cross_relay_spread_ms` | histogram | `RelayDeliverySpread` (global, not per-relay) | population delivery jitter → quiescence |
+| `message_observed` / `message_corroborated` / `message_single_source` | counters | `RelayDeliverySpread` population counts | coverage health |
 
-`cross_relay_spread` is exported as a population-level distribution (no relay label — it is inherently cross-relay), and
+`cross_relay_spread_ms` is exported as a population-level distribution (no relay label — it is inherently cross-relay), and
 is the direct input to the static quiescence decision in `relay-delivery-telemetry.md`. The per-relay metrics are the
 ranking signal. Per-relay attribution of the latency histograms and the first-deliverer rate is **recorded today**,
 behind opaque device-local indices (`RelayLatencyStats`, `RelayDeliveryStats`); that is allowed under the current rules
@@ -111,9 +112,11 @@ adapter (per-relay raw)  ->  relay plane (aggregate across accounts)  ->  export
   code that resolves relay identity into a label, and it enforces the contract (no client labels, aggregate only).
   Implemented as `marmot_app::RelayTelemetryExporter`, constructed only through the opt-in gate
   `MarmotRelayPlane::telemetry_exporter`. The privacy-critical mapping (`build_export_batch`) lives in the default build
-  and is fully tested; the OTLP protobuf encoding and the TLS `POST` to `{endpoint}/v1/metrics` are behind the
-  `otlp-export` feature. The export batch is a flat list of points each carrying at most a single `relay` label —
-  there is structurally no field for any other identifier.
+  and is fully tested; the OTLP protobuf encoding and HTTP `POST` to the configured full metrics URL are behind the
+  `otlp-export` feature. Exporter construction requires the persisted opt-in settings plus host-supplied full metrics
+  URL, bearer auth, and resource metadata; these runtime values are not persisted by Marmot. The export batch is a flat
+  list of points each carrying at most a single `relay` label — there is
+  structurally no field for any other identifier.
 
 Export mechanism: clients roam and are not scrapeable servers, so this is **push**, not pull — Prometheus `remote_write`
 to a first-party receiver, or OTLP to a collector, behind an IP-stripping proxy. Cardinality is bounded by the number of

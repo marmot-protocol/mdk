@@ -1,5 +1,7 @@
 set shell := ["bash", "-cu"]
 
+otlp-features := "marmot-app/otlp-export,marmot-uniffi/otlp-export,darkmatter-cli/otlp-export"
+
 default:
     @just --list
 
@@ -9,15 +11,38 @@ fmt:
 fmt-check:
     cargo fmt --all --check
 
-check:
+build: build-default build-otlp
+
+build-default:
+    cargo build --workspace --all-targets
+
+build-otlp:
+    cargo build --workspace --all-targets --features {{otlp-features}}
+
+check: check-default check-otlp
+
+check-default:
     RUSTFLAGS='-D warnings' cargo check --workspace --all-targets
 
-clippy:
+check-otlp:
+    RUSTFLAGS='-D warnings' cargo check --workspace --all-targets --features {{otlp-features}}
+
+clippy: clippy-default clippy-otlp
+
+clippy-default:
     cargo clippy --workspace --all-targets -- -D warnings
 
-test:
+clippy-otlp:
+    cargo clippy --workspace --all-targets --features {{otlp-features}} -- -D warnings
+
+test: test-default test-otlp
+
+test-default:
     cargo nextest run --workspace
     cargo test --workspace --doc
+
+test-otlp:
+    cargo nextest run --workspace --features {{otlp-features}}
 
 relay-up:
     docker compose up -d

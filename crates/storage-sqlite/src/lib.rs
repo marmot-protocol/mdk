@@ -27,7 +27,10 @@ pub use connection::{
     SqlCipherKey, SqliteAccountStorage, SqliteJournalMode, SqliteStorageOptions, SqliteSynchronous,
 };
 pub use openmls_storage::SqliteOpenMlsStorageError;
-pub use shared::{PublicDirectoryUserRecord, SqliteSharedStorage};
+pub use shared::{
+    PublicDirectoryUserRecord, SqliteSharedStorage, StoredAuditLogSettings,
+    StoredRelayTelemetrySettings,
+};
 pub use timeline::{
     StoredAppEvent, TimelineMessageChange, TimelineMessageQuery, TimelineMessageRecord,
     TimelinePage, TimelinePagination, TimelineProjectionUpdate, TimelineReactionSummary,

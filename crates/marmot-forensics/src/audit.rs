@@ -30,8 +30,12 @@ use serde::{Deserialize, Serialize};
 
 pub const AUDIT_LOG_SCHEMA_VERSION: &str = "marmot-forensics-audit/v1";
 
+/// Hex-encoded 16-byte account identity hash. Stable across devices for the
+/// same account when the caller supplies it.
+pub type AccountRefHex = String;
+
 /// Hex-encoded 16-byte engine identity hash. Stable for the lifetime of a
-/// single engine instance.
+/// single account-device engine instance.
 pub type EngineIdHex = String;
 
 /// Hex-encoded `GroupId` bytes. Raw form; the audit log is local-only.
@@ -45,13 +49,15 @@ pub type DigestHex = String;
 
 /// One line of the JSONL audit log.
 ///
-/// `seq`, `wall_time_ms`, and `engine_id` are recorder-assigned; the engine
-/// supplies the rest via [`AuditRecord`].
+/// `seq`, `wall_time_ms`, `account_ref`, and `engine_id` are
+/// recorder-assigned; the engine supplies the rest via [`AuditRecord`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuditEvent {
     pub schema_version: String,
     pub seq: u64,
     pub wall_time_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_ref: Option<AccountRefHex>,
     pub engine_id: EngineIdHex,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group_ref: Option<GroupRefHex>,
@@ -212,11 +218,35 @@ pub struct JsonlRecorder {
 struct JsonlInner {
     writer: BufWriter<File>,
     seq: u64,
+    account_ref: Option<AccountRefHex>,
     engine_id: EngineIdHex,
+}
+
+fn validate_account_ref_hex(account_ref: &str) -> std::io::Result<()> {
+    let is_valid =
+        account_ref.len() == 32 && account_ref.bytes().all(|byte| byte.is_ascii_hexdigit());
+    if is_valid {
+        return Ok(());
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        "account_ref must be a 16-byte hex string",
+    ))
 }
 
 impl JsonlRecorder {
     pub fn open(path: impl AsRef<Path>, engine_id: EngineIdHex) -> std::io::Result<Self> {
+        Self::open_with_account_ref(path, engine_id, None)
+    }
+
+    pub fn open_with_account_ref(
+        path: impl AsRef<Path>,
+        engine_id: EngineIdHex,
+        account_ref: Option<AccountRefHex>,
+    ) -> std::io::Result<Self> {
+        if let Some(account_ref) = account_ref.as_deref() {
+            validate_account_ref_hex(account_ref)?;
+        }
         let file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -225,6 +255,7 @@ impl JsonlRecorder {
             inner: Mutex::new(JsonlInner {
                 writer: BufWriter::new(file),
                 seq: 0,
+                account_ref,
                 engine_id,
             }),
         })
@@ -253,6 +284,7 @@ impl ForensicRecorder for JsonlRecorder {
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0),
+            account_ref: inner.account_ref.clone(),
             engine_id: inner.engine_id.clone(),
             group_ref: record.group_ref,
             kind: record.kind,
@@ -322,9 +354,51 @@ mod tests {
         let second: AuditEvent = serde_json::from_str(lines[1]).unwrap();
         assert_eq!(first.seq, 0);
         assert_eq!(second.seq, 1);
+        assert_eq!(first.account_ref, None);
         assert_eq!(first.engine_id, "engine-abc");
         assert_eq!(second.group_ref.as_deref(), Some("group-1"));
         assert_eq!(first.schema_version, AUDIT_LOG_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn jsonl_recorder_records_account_ref_when_supplied() {
+        let dir = TempDir::new().unwrap();
+        let path = default_jsonl_path(dir.path(), "engine-abc");
+        let account_ref = "0123456789abcdef0123456789abcdef".to_owned();
+        let recorder = JsonlRecorder::open_with_account_ref(
+            &path,
+            "engine-abc".to_string(),
+            Some(account_ref.clone()),
+        )
+        .unwrap();
+        recorder.record(AuditRecord {
+            group_ref: None,
+            kind: AuditEventKind::SendEntry {
+                intent_kind: "app_message".into(),
+            },
+        });
+        drop(recorder);
+
+        let contents = fs::read_to_string(&path).unwrap();
+        let event: AuditEvent = serde_json::from_str(contents.lines().next().unwrap()).unwrap();
+        assert_eq!(event.account_ref.as_deref(), Some(account_ref.as_str()));
+    }
+
+    #[test]
+    fn jsonl_recorder_rejects_invalid_account_ref() {
+        let dir = TempDir::new().unwrap();
+        let path = default_jsonl_path(dir.path(), "engine-abc");
+
+        let err = match JsonlRecorder::open_with_account_ref(
+            &path,
+            "engine-abc".to_string(),
+            Some("account-abc".to_string()),
+        ) {
+            Ok(_) => panic!("invalid account_ref should be rejected"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
     }
 
     #[test]
@@ -333,6 +407,7 @@ mod tests {
             schema_version: AUDIT_LOG_SCHEMA_VERSION.into(),
             seq: 7,
             wall_time_ms: 1_700_000_000_000,
+            account_ref: Some("account-1".into()),
             engine_id: "engine-xyz".into(),
             group_ref: Some("group-1".into()),
             kind: AuditEventKind::ForkResolution {
@@ -422,6 +497,7 @@ mod tests {
                 schema_version: AUDIT_LOG_SCHEMA_VERSION.into(),
                 seq: 0,
                 wall_time_ms: 0,
+                account_ref: None,
                 engine_id: "e".into(),
                 group_ref: None,
                 kind: kind.clone(),

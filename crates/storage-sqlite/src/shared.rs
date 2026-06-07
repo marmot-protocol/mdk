@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::SqliteResultExt;
 use cgka_traits::storage::{StorageError, StorageResult};
@@ -25,6 +25,17 @@ pub struct PublicDirectoryUserRecord {
     pub event_kind: Option<u64>,
     pub event_created_at: Option<u64>,
     pub follows: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredRelayTelemetrySettings {
+    pub export_enabled: bool,
+    pub export_interval_seconds: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredAuditLogSettings {
+    pub enabled: bool,
 }
 
 impl SqliteSharedStorage {
@@ -98,9 +109,26 @@ CREATE TABLE IF NOT EXISTS directory_search_graph_follows (
     event_created_at INTEGER,
     PRIMARY KEY (account_id_hex, follow_account_id_hex)
 );
-"#,
+	CREATE TABLE IF NOT EXISTS relay_telemetry_settings (
+	    id INTEGER PRIMARY KEY CHECK (id = 1),
+	    export_enabled INTEGER NOT NULL DEFAULT 0,
+	    export_interval_seconds INTEGER NOT NULL DEFAULT 60,
+	    updated_at_ms INTEGER NOT NULL
+	);
+		CREATE TABLE IF NOT EXISTS audit_log_settings (
+		    id INTEGER PRIMARY KEY CHECK (id = 1),
+		    enabled INTEGER NOT NULL DEFAULT 0,
+		    updated_at_ms INTEGER NOT NULL
+		);
+		CREATE TABLE IF NOT EXISTS telemetry_install (
+		    id INTEGER PRIMARY KEY CHECK (id = 1),
+		    install_id TEXT NOT NULL,
+		    updated_at_ms INTEGER NOT NULL
+		);
+		"#,
         )
         .storage()?;
+        Self::clear_legacy_relay_telemetry_endpoint(&conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -231,6 +259,109 @@ CREATE TABLE IF NOT EXISTS directory_search_graph_follows (
         Ok(records)
     }
 
+    pub fn relay_telemetry_settings(&self) -> StorageResult<StoredRelayTelemetrySettings> {
+        self.ensure_relay_telemetry_settings()?;
+        self.lock()
+            .query_row(
+                "SELECT export_enabled, export_interval_seconds
+                 FROM relay_telemetry_settings
+                 WHERE id = 1",
+                [],
+                |row| {
+                    let interval: i64 = row.get(1)?;
+                    Ok(StoredRelayTelemetrySettings {
+                        export_enabled: row.get::<_, i64>(0)? != 0,
+                        export_interval_seconds: u64::try_from(interval).unwrap_or(60),
+                    })
+                },
+            )
+            .storage()
+    }
+
+    pub fn set_relay_telemetry_settings(
+        &self,
+        settings: &StoredRelayTelemetrySettings,
+    ) -> StorageResult<()> {
+        self.lock()
+            .execute(
+                "INSERT INTO relay_telemetry_settings (
+                    id, export_enabled, export_interval_seconds, updated_at_ms
+                 )
+                 VALUES (1, ?1, ?2, ?3)
+                 ON CONFLICT(id) DO UPDATE SET
+                    export_enabled = excluded.export_enabled,
+                    export_interval_seconds = excluded.export_interval_seconds,
+                    updated_at_ms = excluded.updated_at_ms",
+                params![
+                    bool_i64(settings.export_enabled),
+                    u64_to_i64(settings.export_interval_seconds)?,
+                    unix_now_ms(),
+                ],
+            )
+            .storage()?;
+        Ok(())
+    }
+
+    pub fn telemetry_install_id(&self) -> StorageResult<Option<String>> {
+        self.lock()
+            .query_row(
+                "SELECT install_id
+                 FROM telemetry_install
+                 WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .storage()
+    }
+
+    pub fn set_telemetry_install_id(&self, install_id: &str) -> StorageResult<()> {
+        self.lock()
+            .execute(
+                "INSERT INTO telemetry_install (id, install_id, updated_at_ms)
+                 VALUES (1, ?1, ?2)
+                 ON CONFLICT(id) DO UPDATE SET
+                    install_id = excluded.install_id,
+                    updated_at_ms = excluded.updated_at_ms",
+                params![install_id, unix_now_ms()],
+            )
+            .storage()?;
+        Ok(())
+    }
+
+    pub fn audit_log_settings(&self) -> StorageResult<StoredAuditLogSettings> {
+        self.ensure_audit_log_settings()?;
+        self.lock()
+            .query_row(
+                "SELECT enabled
+                 FROM audit_log_settings
+                 WHERE id = 1",
+                [],
+                |row| {
+                    Ok(StoredAuditLogSettings {
+                        enabled: row.get::<_, i64>(0)? != 0,
+                    })
+                },
+            )
+            .storage()
+    }
+
+    pub fn set_audit_log_settings(&self, settings: &StoredAuditLogSettings) -> StorageResult<()> {
+        self.lock()
+            .execute(
+                "INSERT INTO audit_log_settings (
+                    id, enabled, updated_at_ms
+                 )
+                 VALUES (1, ?1, ?2)
+                 ON CONFLICT(id) DO UPDATE SET
+                    enabled = excluded.enabled,
+                    updated_at_ms = excluded.updated_at_ms",
+                params![bool_i64(settings.enabled), unix_now_ms()],
+            )
+            .storage()?;
+        Ok(())
+    }
+
     #[cfg(test)]
     fn table_columns(&self, table: &str) -> Vec<String> {
         let conn = self.lock();
@@ -256,6 +387,66 @@ CREATE TABLE IF NOT EXISTS directory_search_graph_follows (
     ) -> &'a rusqlite::Connection {
         conn
     }
+
+    fn ensure_relay_telemetry_settings(&self) -> StorageResult<()> {
+        self.lock()
+            .execute(
+                "INSERT INTO relay_telemetry_settings (
+                    id, export_enabled, export_interval_seconds, updated_at_ms
+                 )
+                 VALUES (1, 0, 60, ?1)
+                 ON CONFLICT(id) DO NOTHING",
+                params![unix_now_ms()],
+            )
+            .storage()?;
+        Ok(())
+    }
+
+    fn clear_legacy_relay_telemetry_endpoint(conn: &rusqlite::Connection) -> StorageResult<()> {
+        let columns = {
+            let mut stmt = conn
+                .prepare("PRAGMA table_info(relay_telemetry_settings)")
+                .storage()?;
+            stmt.query_map([], |row| row.get::<_, String>(1))
+                .storage()?
+                .collect::<Result<Vec<_>, _>>()
+                .storage()?
+        };
+        if columns.iter().any(|column| column == "otlp_endpoint") {
+            conn.execute(
+                "UPDATE relay_telemetry_settings SET otlp_endpoint = NULL",
+                [],
+            )
+            .storage()?;
+        }
+        Ok(())
+    }
+
+    fn ensure_audit_log_settings(&self) -> StorageResult<()> {
+        self.lock()
+            .execute(
+                "INSERT INTO audit_log_settings (
+                    id, enabled, updated_at_ms
+                 )
+                 VALUES (1, 0, ?1)
+                 ON CONFLICT(id) DO NOTHING",
+                params![unix_now_ms()],
+            )
+            .storage()?;
+        Ok(())
+    }
+}
+
+fn bool_i64(value: bool) -> i64 {
+    if value { 1 } else { 0 }
+}
+
+fn u64_to_i64(value: u64) -> StorageResult<i64> {
+    i64::try_from(value).map_err(|_| {
+        cgka_traits::storage::StorageError::Backend(
+            "u64 value does not fit in sqlite INTEGER".to_owned(),
+        )
+    })
 }
 
 fn optional_u64_to_i64(value: Option<u64>) -> StorageResult<Option<i64>> {
@@ -280,6 +471,13 @@ fn usize_to_i64(value: usize) -> StorageResult<i64> {
             "usize value does not fit in sqlite INTEGER".to_owned(),
         )
     })
+}
+
+fn unix_now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as i64)
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -322,5 +520,87 @@ mod tests {
                 .unwrap(),
             record
         );
+    }
+
+    #[test]
+    fn relay_telemetry_settings_default_and_persist() {
+        let storage = SqliteSharedStorage::in_memory().unwrap();
+
+        assert_eq!(
+            storage.relay_telemetry_settings().unwrap(),
+            StoredRelayTelemetrySettings {
+                export_enabled: false,
+                export_interval_seconds: 60,
+            }
+        );
+
+        let updated = StoredRelayTelemetrySettings {
+            export_enabled: true,
+            export_interval_seconds: 30,
+        };
+        storage.set_relay_telemetry_settings(&updated).unwrap();
+
+        assert_eq!(storage.relay_telemetry_settings().unwrap(), updated);
+    }
+
+    #[test]
+    fn clears_legacy_plaintext_relay_telemetry_endpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shared.sqlite3");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE relay_telemetry_settings (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    export_enabled INTEGER NOT NULL DEFAULT 0,
+                    otlp_endpoint TEXT,
+                    export_interval_seconds INTEGER NOT NULL DEFAULT 60,
+                    updated_at_ms INTEGER NOT NULL
+                );
+                INSERT INTO relay_telemetry_settings (
+                    id, export_enabled, otlp_endpoint, export_interval_seconds, updated_at_ms
+                )
+                VALUES (1, 1, 'https://collector.example/v1/metrics?token=secret', 30, 1);
+                "#,
+            )
+            .unwrap();
+        }
+
+        let storage = SqliteSharedStorage::open(&path).unwrap();
+
+        assert_eq!(
+            storage.relay_telemetry_settings().unwrap(),
+            StoredRelayTelemetrySettings {
+                export_enabled: true,
+                export_interval_seconds: 30,
+            }
+        );
+        drop(storage);
+
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let endpoint: Option<String> = conn
+            .query_row(
+                "SELECT otlp_endpoint FROM relay_telemetry_settings WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(endpoint, None);
+    }
+
+    #[test]
+    fn audit_log_settings_default_and_persist() {
+        let storage = SqliteSharedStorage::in_memory().unwrap();
+
+        assert_eq!(
+            storage.audit_log_settings().unwrap(),
+            StoredAuditLogSettings { enabled: false }
+        );
+
+        let updated = StoredAuditLogSettings { enabled: true };
+        storage.set_audit_log_settings(&updated).unwrap();
+
+        assert_eq!(storage.audit_log_settings().unwrap(), updated);
     }
 }

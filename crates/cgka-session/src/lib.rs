@@ -24,7 +24,7 @@ use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::storage::StorageError;
 use cgka_traits::transport::TransportMessage;
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
-use marmot_forensics::{ForensicRecorder, ForensicsEngineGroupState, ForensicsExportOptions};
+use marmot_forensics::ForensicRecorder;
 use storage_sqlite::{SqlCipherKey, SqliteAccountStorage, SqliteStorageOptions};
 
 const TRACE_TARGET: &str = "cgka_session::session";
@@ -403,14 +403,6 @@ impl AccountDeviceSession {
 
     pub fn members(&self, group_id: &GroupId) -> Result<Vec<Member>, EngineError> {
         self.engine.members(group_id)
-    }
-
-    pub fn group_forensics(
-        &self,
-        group_id: &GroupId,
-        options: &ForensicsExportOptions,
-    ) -> Result<ForensicsEngineGroupState, EngineError> {
-        self.engine.group_forensics(group_id, options)
     }
 
     pub fn self_id(&self) -> MemberId {

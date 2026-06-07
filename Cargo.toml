@@ -11,7 +11,6 @@ members = [
     "crates/transport-quic-stream",
     "crates/transport-quic-broker",
     "crates/marmot-forensics",
-    "crates/marmot-forensics-analyzer",
     "crates/marmot-account",
     "crates/marmot-app",
     "crates/marmot-uniffi",
@@ -35,6 +34,7 @@ tls_codec = "~0.4"
 
 # async
 tokio = { version = "1", features = ["sync", "macros", "rt", "rt-multi-thread", "time"] }
+tokio-util = { version = "0.7", features = ["io"] }
 async-trait = "0.1"
 futures = "0.3"
 
@@ -55,7 +55,7 @@ rand = "0.8"
 sha2 = "0.10"
 url = "2"
 chacha20poly1305 = "0.10"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 zeroize = "1"
 keyring-core = "1"
 quinn = { version = "0.11", default-features = false, features = ["log", "platform-verifier", "runtime-tokio", "rustls-ring"] }
@@ -89,7 +89,6 @@ transport-nostr-adapter = { path = "crates/transport-nostr-adapter" }
 transport-quic-stream = { path = "crates/transport-quic-stream" }
 transport-quic-broker = { path = "crates/transport-quic-broker" }
 marmot-forensics = { path = "crates/marmot-forensics" }
-marmot-forensics-analyzer = { path = "crates/marmot-forensics-analyzer" }
 marmot-account = { path = "crates/marmot-account" }
 marmot-app = { path = "crates/marmot-app" }
 marmot-uniffi = { path = "crates/marmot-uniffi" }

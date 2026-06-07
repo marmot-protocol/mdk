@@ -12,6 +12,7 @@ crate-type = ["cdylib", "staticlib", "lib"]
 [features]
 default = []
 cli = ["uniffi/cli"]
+otlp-export = ["marmot-app/otlp-export"]
 
 [dependencies]
 marmot-app.workspace = true
@@ -27,7 +28,7 @@ uniffi = { version = "0.28", features = ["tokio"] }
 
 [dev-dependencies]
 tempfile.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread"] }
 keyring-core.workspace = true
 
 [[bin]]
