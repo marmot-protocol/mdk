@@ -33,6 +33,13 @@ CRATE_NAME="marmot-uniffi"
 LIB_BASENAME="marmot_uniffi"
 FRAMEWORK_NAME="MarmotKit"
 
+FEATURE_ARGS=()
+BINDGEN_FEATURES="cli"
+if [[ "${OTLP_EXPORT:-0}" == "1" || "${OTLP_EXPORT:-}" == "true" ]]; then
+  FEATURE_ARGS=(--features otlp-export)
+  BINDGEN_FEATURES="cli,otlp-export"
+fi
+
 # Run from the workspace root so cargo resolves the right Cargo.toml no
 # matter where this script was invoked from (e.g. the iOS repo's
 # sync-bindings.sh).
@@ -43,16 +50,16 @@ rm -rf "$BUILD_DIR" "$OUT_DIR/$FRAMEWORK_NAME.xcframework" "$OUT_DIR/$FRAMEWORK_
 mkdir -p "$BUILD_DIR/headers" "$OUT_DIR"
 
 echo "==> Building host dylib (used for binding generation)"
-cargo build --release -p "$CRATE_NAME"
+cargo build --release -p "$CRATE_NAME" "${FEATURE_ARGS[@]}"
 
 echo "==> Building iOS device target (aarch64-apple-ios)"
-cargo build --release -p "$CRATE_NAME" --target aarch64-apple-ios
+cargo build --release -p "$CRATE_NAME" --target aarch64-apple-ios "${FEATURE_ARGS[@]}"
 
 echo "==> Building iOS simulator target (aarch64-apple-ios-sim)"
-cargo build --release -p "$CRATE_NAME" --target aarch64-apple-ios-sim
+cargo build --release -p "$CRATE_NAME" --target aarch64-apple-ios-sim "${FEATURE_ARGS[@]}"
 
 echo "==> Generating Swift bindings"
-cargo run --release -p "$CRATE_NAME" --features cli --bin uniffi-bindgen -- \
+cargo run --release -p "$CRATE_NAME" --features "$BINDGEN_FEATURES" --bin uniffi-bindgen -- \
   generate \
   --library "$TARGET_DIR/release/lib${LIB_BASENAME}.dylib" \
   --language swift \
