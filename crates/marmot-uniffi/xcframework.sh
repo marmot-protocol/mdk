@@ -29,6 +29,10 @@ TARGET_DIR="$WORKSPACE_DIR/target"
 BUILD_DIR="$CRATE_DIR/build"
 OUT_DIR="$CRATE_DIR/output"
 
+# Set public first-party endpoint defaults for values compiled via option_env!.
+# Tokens remain host-app runtime configuration.
+source "$CRATE_DIR/marmotkit-endpoints.env"
+
 CRATE_NAME="marmot-uniffi"
 LIB_BASENAME="marmot_uniffi"
 FRAMEWORK_NAME="MarmotKit"

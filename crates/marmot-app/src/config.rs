@@ -3,16 +3,36 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 const DEFAULT_DIRECTORY_MAX_FUTURE_SKEW: Duration = Duration::from_secs(5 * 60);
+const COMPILED_RELAY_TELEMETRY_OTLP_ENDPOINT: Option<&str> =
+    option_env!("MARMOT_RELAY_TELEMETRY_OTLP_ENDPOINT");
+const COMPILED_AUDIT_LOG_TRACKER_ENDPOINT: Option<&str> =
+    option_env!("MARMOT_AUDIT_LOG_TRACKER_ENDPOINT");
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MarmotAppConfig {
     pub directory_max_future_skew: Duration,
+    pub service_endpoints: MarmotServiceEndpoints,
+}
+
+/// Compiled or app-level default service URLs for production telemetry export
+/// and forensic audit-log tracker uploads.
+///
+/// Defaults are intentionally separate from bearer tokens. Host apps supply
+/// credentials at runtime, while the Dark Matter/Marmot build owns stable
+/// first-party URLs. `MarmotAppConfig::default()` reads these from
+/// `MARMOT_RELAY_TELEMETRY_OTLP_ENDPOINT` and
+/// `MARMOT_AUDIT_LOG_TRACKER_ENDPOINT` at compile time.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MarmotServiceEndpoints {
+    pub relay_telemetry_otlp_endpoint: Option<String>,
+    pub audit_log_tracker_endpoint: Option<String>,
 }
 
 impl Default for MarmotAppConfig {
     fn default() -> Self {
         Self {
             directory_max_future_skew: DEFAULT_DIRECTORY_MAX_FUTURE_SKEW,
+            service_endpoints: MarmotServiceEndpoints::compiled(),
         }
     }
 }
@@ -20,6 +40,28 @@ impl Default for MarmotAppConfig {
 impl MarmotAppConfig {
     pub fn with_directory_max_future_skew(mut self, skew: Duration) -> Self {
         self.directory_max_future_skew = skew;
+        self
+    }
+
+    pub fn with_service_endpoints(mut self, endpoints: MarmotServiceEndpoints) -> Self {
+        self.service_endpoints = endpoints.normalize();
+        self
+    }
+}
+
+impl MarmotServiceEndpoints {
+    pub fn compiled() -> Self {
+        Self {
+            relay_telemetry_otlp_endpoint: COMPILED_RELAY_TELEMETRY_OTLP_ENDPOINT
+                .map(str::to_owned),
+            audit_log_tracker_endpoint: COMPILED_AUDIT_LOG_TRACKER_ENDPOINT.map(str::to_owned),
+        }
+        .normalize()
+    }
+
+    pub fn normalize(mut self) -> Self {
+        self.relay_telemetry_otlp_endpoint = trim_optional(self.relay_telemetry_otlp_endpoint);
+        self.audit_log_tracker_endpoint = trim_optional(self.audit_log_tracker_endpoint);
         self
     }
 }
@@ -146,8 +188,15 @@ impl AuditLogTrackerConfig {
         Ok(self)
     }
 
-    pub(crate) fn upload_allowed(&self) -> bool {
+    pub(crate) fn resolved_endpoint(&self, endpoints: &MarmotServiceEndpoints) -> Option<String> {
         self.endpoint
+            .clone()
+            .or_else(|| endpoints.audit_log_tracker_endpoint.clone())
+            .and_then(|endpoint| trim_optional(Some(endpoint)))
+    }
+
+    pub(crate) fn upload_allowed_with_endpoints(&self, endpoints: &MarmotServiceEndpoints) -> bool {
+        self.resolved_endpoint(endpoints)
             .as_deref()
             .is_some_and(endpoint_transport_allowed)
             && self
@@ -202,10 +251,20 @@ impl RelayTelemetrySettings {
         &self,
         runtime: RelayTelemetryRuntimeConfig,
     ) -> RelayTelemetryExportConfig {
+        self.export_config_with_runtime_and_endpoints(runtime, &MarmotServiceEndpoints::default())
+    }
+
+    pub fn export_config_with_runtime_and_endpoints(
+        &self,
+        runtime: RelayTelemetryRuntimeConfig,
+        endpoints: &MarmotServiceEndpoints,
+    ) -> RelayTelemetryExportConfig {
         let runtime = runtime.normalize_for_export();
         RelayTelemetryExportConfig {
             enabled: self.export_enabled,
-            endpoint: runtime.otlp_endpoint,
+            endpoint: runtime
+                .otlp_endpoint
+                .or_else(|| trim_optional(endpoints.relay_telemetry_otlp_endpoint.clone())),
             interval: Duration::from_secs(self.export_interval_seconds),
             authorization_bearer_token: runtime.authorization_bearer_token,
             resource: runtime.resource,

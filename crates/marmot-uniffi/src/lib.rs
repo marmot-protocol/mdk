@@ -1158,8 +1158,8 @@ impl Marmot {
     }
 
     /// Device-wide relay telemetry export settings. Export is opt-in and stays
-    /// inert until `export_enabled` is true and the runtime config supplies a
-    /// valid OTLP endpoint, bearer token, and resource attributes.
+    /// inert until `export_enabled` is true and runtime/default config supplies
+    /// a valid OTLP endpoint, bearer token, and resource attributes.
     pub fn relay_telemetry_settings(&self) -> Result<RelayTelemetrySettingsFfi, MarmotKitError> {
         Ok(self.runtime.relay_telemetry_settings()?.into())
     }
@@ -1171,9 +1171,9 @@ impl Marmot {
         Ok(self.runtime.telemetry_install_id()?)
     }
 
-    /// Supply non-persisted OTLP runtime metadata: full metrics URL, bearer
-    /// token from the host app's build-time secret, and resource attributes
-    /// from the platform shell.
+    /// Supply non-persisted OTLP runtime metadata: optional metrics URL
+    /// override, bearer token from the host app's build-time secret, and
+    /// resource attributes from the platform shell.
     pub fn set_relay_telemetry_runtime_config(
         &self,
         config: RelayTelemetryRuntimeConfigFfi,
@@ -1210,8 +1210,9 @@ impl Marmot {
         Ok(self.runtime.set_audit_log_settings(settings.into())?.into())
     }
 
-    /// Supply non-persisted audit tracker upload metadata: full Goggles upload
-    /// URL, bearer token from the host app, and optional human source labels.
+    /// Supply non-persisted audit tracker upload metadata: optional Goggles
+    /// upload URL override, bearer token from the host app, and optional human
+    /// source labels.
     pub fn set_audit_log_tracker_config(
         &self,
         config: AuditLogTrackerConfigFfi,

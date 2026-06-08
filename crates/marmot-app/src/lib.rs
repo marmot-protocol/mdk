@@ -108,8 +108,9 @@ pub use agent_streams::{
 };
 pub use client::AppClient;
 pub use config::{
-    AuditLogTrackerConfig, AuditLogUploadSource, MarmotAppConfig, RelayTelemetryExportConfig,
-    RelayTelemetryResource, RelayTelemetryRuntimeConfig, RelayTelemetrySettings,
+    AuditLogTrackerConfig, AuditLogUploadSource, MarmotAppConfig, MarmotServiceEndpoints,
+    RelayTelemetryExportConfig, RelayTelemetryResource, RelayTelemetryRuntimeConfig,
+    RelayTelemetrySettings,
 };
 pub use error::AppError;
 pub use groups::{
@@ -1120,7 +1121,16 @@ impl MarmotApp {
     }
 
     pub fn relay_telemetry_export_config(&self) -> Result<RelayTelemetryExportConfig, AppError> {
-        Ok(self.relay_telemetry_settings()?.export_config())
+        Ok(self
+            .relay_telemetry_settings()?
+            .export_config_with_runtime_and_endpoints(
+                config::RelayTelemetryRuntimeConfig::default(),
+                self.service_endpoints(),
+            ))
+    }
+
+    pub(crate) fn service_endpoints(&self) -> &MarmotServiceEndpoints {
+        &self.config.service_endpoints
     }
 
     pub fn telemetry_install_id(&self) -> Result<String, AppError> {
@@ -1205,10 +1215,13 @@ impl MarmotApp {
             .clone()
             .normalize()
             .map_err(AppError::AuditLogUpload)?;
-        let endpoint =
-            validate_audit_upload_endpoint(config.endpoint.as_deref().ok_or_else(|| {
-                AppError::AuditLogUpload("forensic upload endpoint is empty".into())
-            })?)?;
+        let endpoint = validate_audit_upload_endpoint(
+            &config
+                .resolved_endpoint(self.service_endpoints())
+                .ok_or_else(|| {
+                    AppError::AuditLogUpload("forensic upload endpoint is empty".into())
+                })?,
+        )?;
         let file = tokio::fs::File::open(&path).await?;
         let bytes_sent = file.metadata().await?.len();
         if bytes_sent > AUDIT_LOG_UPLOAD_MAX_BYTES {

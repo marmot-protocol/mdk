@@ -24,8 +24,19 @@ OUT_DIR="$CRATE_DIR/output/android"
 KOTLIN_OUT_DIR="$OUT_DIR/kotlin"
 JNI_OUT_DIR="$OUT_DIR/jniLibs"
 
+# Set public first-party endpoint defaults for values compiled via option_env!.
+# Tokens remain host-app runtime configuration.
+source "$CRATE_DIR/marmotkit-endpoints.env"
+
 CRATE_NAME="marmot-uniffi"
 LIB_BASENAME="marmot_uniffi"
+
+FEATURE_ARGS=()
+BINDGEN_FEATURES="cli"
+if [[ "${OTLP_EXPORT:-0}" == "1" || "${OTLP_EXPORT:-}" == "true" ]]; then
+  FEATURE_ARGS=(--features otlp-export)
+  BINDGEN_FEATURES="cli,otlp-export"
+fi
 
 ANDROID_API="${ANDROID_API:-26}"
 ANDROID_ABIS="${ANDROID_ABIS:-arm64-v8a armeabi-v7a x86 x86_64}"
@@ -172,10 +183,10 @@ rm -rf "$OUT_DIR"
 mkdir -p "$KOTLIN_OUT_DIR" "$JNI_OUT_DIR"
 
 echo "==> Building host dylib (used for binding generation)"
-cargo build --release -p "$CRATE_NAME"
+cargo build --release -p "$CRATE_NAME" "${FEATURE_ARGS[@]}"
 
 echo "==> Generating Kotlin bindings"
-cargo run --release -p "$CRATE_NAME" --features cli --bin uniffi-bindgen -- \
+cargo run --release -p "$CRATE_NAME" --features "$BINDGEN_FEATURES" --bin uniffi-bindgen -- \
   generate \
   --library "$(host_dylib_path)" \
   --language kotlin \
@@ -187,7 +198,7 @@ for abi in $ANDROID_ABIS; do
   target="$(abi_to_target "$abi")"
   echo "==> Building Android target $target ($abi)"
   configure_android_toolchain "$NDK_DIR" "$HOST_TAG" "$target"
-  cargo build --release -p "$CRATE_NAME" --target "$target"
+  cargo build --release -p "$CRATE_NAME" --target "$target" "${FEATURE_ARGS[@]}"
   mkdir -p "$JNI_OUT_DIR/$abi"
   cp "$TARGET_DIR/$target/release/lib${LIB_BASENAME}.so" "$JNI_OUT_DIR/$abi/"
 done

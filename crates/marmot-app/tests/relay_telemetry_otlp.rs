@@ -10,8 +10,9 @@
 use std::time::Duration;
 
 use marmot_app::{
-    MarmotApp, MarmotAppRuntime, MarmotRelayPlane, RelayTelemetryExportConfig,
-    RelayTelemetryResource, RelayTelemetryRuntimeConfig, RelayTelemetrySettings,
+    MarmotApp, MarmotAppConfig, MarmotAppRuntime, MarmotRelayPlane, MarmotServiceEndpoints,
+    RelayTelemetryExportConfig, RelayTelemetryResource, RelayTelemetryRuntimeConfig,
+    RelayTelemetrySettings,
 };
 use nostr_relay_builder::MockRelay;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -181,6 +182,21 @@ fn runtime_config(endpoint: impl Into<String>) -> RelayTelemetryRuntimeConfig {
     }
 }
 
+fn runtime_config_without_endpoint() -> RelayTelemetryRuntimeConfig {
+    RelayTelemetryRuntimeConfig {
+        otlp_endpoint: None,
+        authorization_bearer_token: Some("test-token".to_owned()),
+        resource: Some(RelayTelemetryResource {
+            service_version: "1.4.2".to_owned(),
+            service_instance_id: "8e1ca50b-05a2-4c31-a31c-1e69c75a9366".to_owned(),
+            deployment_environment: "staging".to_owned(),
+            os_type: "ios".to_owned(),
+            os_version: "17.5".to_owned(),
+            device_model_identifier: None,
+        }),
+    }
+}
+
 #[tokio::test]
 async fn export_once_pushes_otlp_metrics_over_http() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -290,6 +306,50 @@ async fn running_runtime_pushes_after_telemetry_settings_toggle() {
         .expect("captured request");
     assert_eq!(captured.method, "POST");
     assert_eq!(captured.path, "/v1/metrics");
+    assert_eq!(
+        captured.content_type.as_deref(),
+        Some("application/x-protobuf")
+    );
+    assert!(captured.body_len > 0, "OTLP protobuf body is non-empty");
+
+    runtime.shutdown().await;
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn running_runtime_pushes_to_default_telemetry_endpoint_when_runtime_endpoint_missing() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = oneshot::channel();
+    let server = tokio::spawn(capture_one_request(listener, tx));
+
+    let tmp = tempfile::tempdir().unwrap();
+    let relay = MockRelay::run().await.unwrap();
+    let config = MarmotAppConfig::default().with_service_endpoints(MarmotServiceEndpoints {
+        relay_telemetry_otlp_endpoint: Some(format!("http://{addr}/v1/metrics")),
+        audit_log_tracker_endpoint: None,
+    });
+    let app = MarmotApp::with_relay_and_config(tmp.path(), relay.url().await.to_string(), config);
+    let runtime = MarmotAppRuntime::new(app);
+    runtime.start().await.expect("runtime starts");
+
+    runtime
+        .set_relay_telemetry_runtime_config(runtime_config_without_endpoint())
+        .expect("runtime telemetry metadata is accepted");
+    runtime
+        .set_relay_telemetry_settings(RelayTelemetrySettings {
+            export_enabled: true,
+            export_interval_seconds: 10,
+        })
+        .expect("telemetry settings persist");
+
+    let captured = tokio::time::timeout(Duration::from_secs(5), rx)
+        .await
+        .expect("runtime exporter pushed in time")
+        .expect("captured request");
+    assert_eq!(captured.method, "POST");
+    assert_eq!(captured.path, "/v1/metrics");
+    assert_eq!(captured.authorization.as_deref(), Some("Bearer test-token"));
     assert_eq!(
         captured.content_type.as_deref(),
         Some("application/x-protobuf")

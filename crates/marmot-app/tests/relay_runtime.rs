@@ -2456,9 +2456,7 @@ async fn relay_list_future_skew_is_configurable_at_app_instantiation() {
     let app = MarmotApp::with_relays_and_config(
         dir.path(),
         vec![seed_url.clone()],
-        MarmotAppConfig {
-            directory_max_future_skew: Duration::from_secs(900),
-        },
+        MarmotAppConfig::default().with_directory_max_future_skew(Duration::from_secs(900)),
     );
 
     publish_account_relay_lists_at(

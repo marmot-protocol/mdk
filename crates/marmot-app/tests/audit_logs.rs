@@ -1,6 +1,7 @@
 use marmot_account::AccountHome;
 use marmot_app::{
-    AuditLogSettings, AuditLogTrackerConfig, AuditLogUploadSource, MarmotApp, MarmotAppRuntime,
+    AuditLogSettings, AuditLogTrackerConfig, AuditLogUploadSource, MarmotApp, MarmotAppConfig,
+    MarmotAppRuntime, MarmotServiceEndpoints,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -186,6 +187,62 @@ async fn post_audit_log_tracker_update_uses_configured_goggles_contract() {
     assert_eq!(captured.device_label.as_deref(), Some("Alice iPhone"));
     assert_eq!(captured.platform.as_deref(), Some("ios"));
     assert_eq!(captured.app_version.as_deref(), Some("2026.6.8"));
+    assert_eq!(captured.body, audit_body);
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn post_audit_log_tracker_update_uses_default_endpoint_with_host_token() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(tmp.path());
+    let account = home.create_account("alice").unwrap();
+    let audit_body = b"{\"seq\":1}\n";
+    let audit_path = home
+        .account_dir(&account.label)
+        .join("audit-default-endpoint.jsonl");
+    std::fs::write(&audit_path, audit_body).unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = oneshot::channel();
+    let server = tokio::spawn(capture_one_request(listener, tx));
+
+    let config = MarmotAppConfig::default().with_service_endpoints(MarmotServiceEndpoints {
+        relay_telemetry_otlp_endpoint: None,
+        audit_log_tracker_endpoint: Some(format!("http://{addr}/api/v1/audit-logs/")),
+    });
+    let app = MarmotApp::with_relay_and_config(tmp.path(), "wss://relay.example", config);
+    app.set_audit_log_settings(AuditLogSettings { enabled: true })
+        .unwrap();
+    let runtime = MarmotAppRuntime::new(app);
+    runtime
+        .set_audit_log_tracker_config(AuditLogTrackerConfig {
+            endpoint: None,
+            authorization_bearer_token: Some("goggles_client_secret".to_owned()),
+            source: AuditLogUploadSource {
+                account_label: Some("Alice".to_owned()),
+                device_label: Some("Alice iPhone".to_owned()),
+                platform: Some("ios".to_owned()),
+                app_version: Some("2026.6.8".to_owned()),
+            },
+        })
+        .unwrap();
+
+    let result = runtime.post_audit_log_tracker_update().await.unwrap();
+
+    assert!(result.enabled);
+    assert_eq!(result.skipped_reason, None);
+    assert_eq!(result.uploaded.len(), 1);
+    assert_eq!(result.uploaded[0].status, 204);
+
+    let captured = rx.await.unwrap();
+    assert_eq!(captured.method, "POST");
+    assert_eq!(captured.path, "/api/v1/audit-logs/");
+    assert_eq!(
+        captured.authorization.as_deref(),
+        Some("Bearer goggles_client_secret")
+    );
+    assert_eq!(captured.platform.as_deref(), Some("ios"));
     assert_eq!(captured.body, audit_body);
     server.await.unwrap();
 }

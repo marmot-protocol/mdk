@@ -12,6 +12,16 @@ package that shared surface:
 The Kotlin binding is generated from the same release host library metadata as Swift, so it exposes the same `Marmot`
 object, subscription objects, records, enums, and error variants.
 
+## Service Endpoint Defaults
+
+`marmotkit-endpoints.env` sets the public build-time defaults consumed by Marmot's compiled endpoint config:
+
+- `MARMOT_AUDIT_LOG_TRACKER_ENDPOINT`
+- `MARMOT_RELAY_TELEMETRY_OTLP_ENDPOINT`
+
+These are route URLs only. Host apps still supply audit and telemetry bearer tokens at runtime. Set either environment
+variable before invoking a build script to override the default for staging or local testing.
+
 ## Kotlin / Android
 
 Prerequisites:

@@ -90,6 +90,11 @@ available:
 ./crates/marmot-uniffi/kotlin-bindings.sh
 ```
 
+The binding build scripts source `crates/marmot-uniffi/marmotkit-endpoints.env` so production MarmotKit artifacts embed
+the public audit-log and OTLP route defaults. Override `MARMOT_AUDIT_LOG_TRACKER_ENDPOINT` or
+`MARMOT_RELAY_TELEMETRY_OTLP_ENDPOINT` in the environment only for staging or local collector builds. Bearer tokens are
+not compiled into MarmotKit; apps supply them at runtime.
+
 The GitHub workflow repeats the release builds on clean runners. Local builds catch drift earlier.
 
 ## Whole-Workspace Release

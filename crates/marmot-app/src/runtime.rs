@@ -44,11 +44,11 @@ use crate::{
     AppProjectionUpdate, AuditLogFile, AuditLogSettings, AuditLogTrackerConfig,
     AuditLogTrackerUpdateResult, AuditLogUploadResult, BackgroundNotificationCollection,
     ChatListRow, GroupInviteDeclineResult, GroupPushDebugInfo, MarmotApp, MarmotRelayPlane,
-    MediaDownloadResult, MediaReference, MediaUploadRequest, MediaUploadResult,
-    NotificationCollectionStatus, NotificationSettings, NotificationUpdate, NotificationWakeSource,
-    PushPlatform, PushRegistration, ReceivedMessage, RelayTelemetryExportConfig,
-    RelayTelemetryRuntimeConfig, RelayTelemetrySettings, SendSummary, SyncSummary,
-    TimelineMessageChange, TimelineMessageQuery, TimelinePage, TimelineUpdateTrigger,
+    MarmotServiceEndpoints, MediaDownloadResult, MediaReference, MediaUploadRequest,
+    MediaUploadResult, NotificationCollectionStatus, NotificationSettings, NotificationUpdate,
+    NotificationWakeSource, PushPlatform, PushRegistration, ReceivedMessage,
+    RelayTelemetryExportConfig, RelayTelemetryRuntimeConfig, RelayTelemetrySettings, SendSummary,
+    SyncSummary, TimelineMessageChange, TimelineMessageQuery, TimelinePage, TimelineUpdateTrigger,
     UserDirectoryRefresh, UserProfileMetadata, default_profile_pseudonym, unix_now_seconds,
 };
 
@@ -76,6 +76,7 @@ pub struct RuntimeSharedServices {
     relay_telemetry_exporter: Arc<StdMutex<Option<JoinHandle<()>>>>,
     relay_telemetry_runtime_config: Arc<StdMutex<RelayTelemetryRuntimeConfig>>,
     audit_log_tracker_config: Arc<StdMutex<AuditLogTrackerConfig>>,
+    service_endpoints: MarmotServiceEndpoints,
     audit_log_tracker_uploader: Option<AuditLogTrackerUploader>,
 }
 
@@ -90,6 +91,7 @@ impl Default for RuntimeSharedServices {
                 RelayTelemetryRuntimeConfig::default(),
             )),
             audit_log_tracker_config: Arc::new(StdMutex::new(AuditLogTrackerConfig::default())),
+            service_endpoints: MarmotServiceEndpoints::default(),
             audit_log_tracker_uploader: None,
         }
     }
@@ -113,6 +115,7 @@ impl RuntimeSharedServices {
                 RelayTelemetryRuntimeConfig::default(),
             )),
             audit_log_tracker_config,
+            service_endpoints: app.service_endpoints().clone(),
             audit_log_tracker_uploader: Some(audit_log_tracker_uploader),
         }
     }
@@ -161,6 +164,10 @@ impl RuntimeSharedServices {
             .clone()
     }
 
+    fn service_endpoints(&self) -> &MarmotServiceEndpoints {
+        &self.service_endpoints
+    }
+
     fn set_relay_telemetry_runtime_config(&self, config: RelayTelemetryRuntimeConfig) {
         *self
             .relay_telemetry_runtime_config
@@ -194,7 +201,11 @@ impl RuntimeSharedServices {
     }
 
     fn schedule_audit_log_tracker_update(&self, trigger: &'static str) {
-        if self.lifecycle.is_stopping() || !self.audit_log_tracker_config().upload_allowed() {
+        if self.lifecycle.is_stopping()
+            || !self
+                .audit_log_tracker_config()
+                .upload_allowed_with_endpoints(self.service_endpoints())
+        {
             return;
         }
         if let Some(uploader) = &self.audit_log_tracker_uploader {
@@ -488,7 +499,7 @@ async fn run_audit_log_tracker_uploader(
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clone();
-            if config.upload_allowed() {
+            if config.upload_allowed_with_endpoints(app.service_endpoints()) {
                 match post_audit_log_tracker_update_for_app(&app, config).await {
                     Ok(result) => {
                         if result.skipped_reason.is_none() {
@@ -1821,7 +1832,10 @@ impl MarmotAppRuntime {
             .accounts
             .app
             .relay_telemetry_settings()?
-            .export_config_with_runtime(self.shared.relay_telemetry_runtime_config());
+            .export_config_with_runtime_and_endpoints(
+                self.shared.relay_telemetry_runtime_config(),
+                self.shared.service_endpoints(),
+            );
         self.sync_user_directory_subscriptions().await?;
         self.reconcile_accounts().await?;
         self.shared.lifecycle().mark_running();
@@ -2174,7 +2188,10 @@ impl MarmotAppRuntime {
         let settings = self.accounts.app.set_relay_telemetry_settings(settings)?;
         if self.shared.lifecycle().is_running() {
             self.shared.configure_relay_telemetry_exporter(
-                settings.export_config_with_runtime(self.shared.relay_telemetry_runtime_config()),
+                settings.export_config_with_runtime_and_endpoints(
+                    self.shared.relay_telemetry_runtime_config(),
+                    self.shared.service_endpoints(),
+                ),
             );
         }
         Ok(settings)
@@ -2192,7 +2209,10 @@ impl MarmotAppRuntime {
         if self.shared.lifecycle().is_running() {
             let settings = self.accounts.app.relay_telemetry_settings()?;
             self.shared.configure_relay_telemetry_exporter(
-                settings.export_config_with_runtime(config.clone()),
+                settings.export_config_with_runtime_and_endpoints(
+                    config.clone(),
+                    self.shared.service_endpoints(),
+                ),
             );
         }
         Ok(config)
@@ -2803,7 +2823,7 @@ async fn post_audit_log_tracker_update_for_app(
         });
     }
 
-    if config.endpoint.is_none() {
+    if config.resolved_endpoint(app.service_endpoints()).is_none() {
         return Ok(AuditLogTrackerUpdateResult {
             enabled: true,
             uploaded: Vec::new(),
@@ -2817,7 +2837,7 @@ async fn post_audit_log_tracker_update_for_app(
             skipped_reason: Some("audit log tracker authorization token missing".to_owned()),
         });
     }
-    if !config.upload_allowed() {
+    if !config.upload_allowed_with_endpoints(app.service_endpoints()) {
         return Ok(AuditLogTrackerUpdateResult {
             enabled: true,
             uploaded: Vec::new(),
