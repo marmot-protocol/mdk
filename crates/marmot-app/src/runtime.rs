@@ -2584,6 +2584,31 @@ impl MarmotAppRuntime {
             .await
     }
 
+    /// Edit a prior message: publish a kind-1010 event whose single `e` tag
+    /// references `target_message_id` and whose content is the replacement
+    /// text. Authorship is enforced on read (an edit is only honored when its
+    /// authenticated author matches the target's author), and the chat-list
+    /// preview is intentionally left untouched so an edit doesn't reorder the
+    /// conversation list.
+    pub async fn edit_message(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        target_message_id: &str,
+        content: &str,
+    ) -> Result<SendSummary, AppError> {
+        self.accounts
+            .send_app_event(
+                account_ref,
+                group_id,
+                AppMessageIntent::Edit {
+                    target_message_id: target_message_id.to_owned(),
+                    content: content.to_owned(),
+                },
+            )
+            .await
+    }
+
     /// Send a media attachment as a kind-9 chat carrying a NIP-92 `imeta` tag.
     pub async fn send_media_attachments(
         &self,

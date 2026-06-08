@@ -1832,6 +1832,7 @@ fn notification_trigger_for_intent(
         }
         AppMessageIntent::Reaction { .. }
         | AppMessageIntent::Unreact { .. }
+        | AppMessageIntent::Edit { .. }
         | AppMessageIntent::Delete { .. }
         | AppMessageIntent::StreamStart { .. }
         | AppMessageIntent::AgentActivity { .. }

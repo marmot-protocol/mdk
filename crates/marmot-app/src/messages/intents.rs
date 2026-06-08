@@ -4,7 +4,7 @@ use cgka_traits::app_event::{
     AGENT_OPERATION_TYPE_TAG, EVENT_REF_TAG, GROUP_SYSTEM_TYPE_TAG,
     MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY, MARMOT_APP_EVENT_KIND_AGENT_OPERATION,
     MARMOT_APP_EVENT_KIND_AGENT_STREAM_START, MARMOT_APP_EVENT_KIND_CHAT,
-    MARMOT_APP_EVENT_KIND_DELETE, MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
+    MARMOT_APP_EVENT_KIND_DELETE, MARMOT_APP_EVENT_KIND_EDIT, MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
     MARMOT_APP_EVENT_KIND_REACTION, MarmotAppEvent as MarmotInnerEvent, QUOTE_REF_TAG,
     STREAM_BROKER_TAG, STREAM_CHUNKS_TAG, STREAM_FINAL_KIND_TAG, STREAM_HASH_TAG, STREAM_ROUTE_TAG,
     STREAM_START_TAG, STREAM_TAG, STREAM_TYPE_TAG,
@@ -38,6 +38,10 @@ pub(crate) enum AppMessageIntent {
     Reply {
         target_message_id: String,
         text: String,
+    },
+    Edit {
+        target_message_id: String,
+        content: String,
     },
     Delete {
         target_message_id: String,
@@ -143,6 +147,22 @@ pub(crate) fn build_inner_event(
                     vec![QUOTE_REF_TAG.to_owned(), target_message_id.clone()],
                 ],
                 text.clone(),
+            ))
+        }
+        AppMessageIntent::Edit {
+            target_message_id,
+            content,
+        } => {
+            validate_message_ref(target_message_id)?;
+            if content.trim().is_empty() {
+                return Err(AppError::InvalidAppMessagePayload(
+                    "edit requires non-empty content".into(),
+                ));
+            }
+            Ok(event(
+                MARMOT_APP_EVENT_KIND_EDIT,
+                vec![event_ref_tag(target_message_id)],
+                content.clone(),
             ))
         }
         AppMessageIntent::Unreact { .. } | AppMessageIntent::Delete { .. } => {
