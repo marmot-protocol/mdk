@@ -223,6 +223,10 @@ pub struct MarmotApp {
     config: MarmotAppConfig,
     directory_sync: Arc<RwLock<Option<DirectorySyncHandle>>>,
     account_storages: Arc<Mutex<HashMap<String, SqliteAccountStorage>>>,
+    directory_caches: Arc<Mutex<HashMap<String, DirectoryCache>>>,
+    legacy_directory_cache_checked: Arc<Mutex<bool>>,
+    #[cfg(test)]
+    directory_cache_open_count: Arc<std::sync::atomic::AtomicUsize>,
     shared_storage: Arc<Mutex<Option<SqliteSharedStorage>>>,
     account_state_ready: Arc<Mutex<HashSet<String>>>,
     chat_list_projection_warmed: Arc<Mutex<HashSet<String>>>,
@@ -1275,6 +1279,10 @@ impl MarmotApp {
             config,
             directory_sync: Arc::new(RwLock::new(None)),
             account_storages: Arc::new(Mutex::new(HashMap::new())),
+            directory_caches: Arc::new(Mutex::new(HashMap::new())),
+            legacy_directory_cache_checked: Arc::new(Mutex::new(false)),
+            #[cfg(test)]
+            directory_cache_open_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             shared_storage: Arc::new(Mutex::new(None)),
             account_state_ready: Arc::new(Mutex::new(HashSet::new())),
             chat_list_projection_warmed: Arc::new(Mutex::new(HashSet::new())),
@@ -1309,6 +1317,10 @@ impl MarmotApp {
             config,
             directory_sync: Arc::new(RwLock::new(None)),
             account_storages: Arc::new(Mutex::new(HashMap::new())),
+            directory_caches: Arc::new(Mutex::new(HashMap::new())),
+            legacy_directory_cache_checked: Arc::new(Mutex::new(false)),
+            #[cfg(test)]
+            directory_cache_open_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             shared_storage: Arc::new(Mutex::new(None)),
             account_state_ready: Arc::new(Mutex::new(HashSet::new())),
             chat_list_projection_warmed: Arc::new(Mutex::new(HashSet::new())),
@@ -1318,6 +1330,24 @@ impl MarmotApp {
 
     pub fn runtime(&self) -> MarmotAppRuntime {
         MarmotAppRuntime::new(self.clone())
+    }
+
+    pub fn warm_directory_storage(&self) -> Result<(), AppError> {
+        let _span = tracing::debug_span!(
+            target: "marmot_app::directory",
+            "directory_storage_warm",
+            method = "warm_directory_storage"
+        )
+        .entered();
+        let _shared = self.shared_storage()?;
+        let _caches = self.directory_caches()?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn directory_cache_open_count_for_test(&self) -> usize {
+        self.directory_cache_open_count
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     pub async fn client(&self, label: &str) -> Result<AppClient, AppError> {
@@ -1686,15 +1716,8 @@ impl MarmotApp {
     ) -> Result<Option<UserDirectoryRecord>, AppError> {
         let account_id_hex = parse_account_id_hex(account_id_hex)?;
         let caches = self.directory_caches()?;
-        let cached_entry = Self::directory_entry_from_caches(&caches, &account_id_hex)?
-            .map(|entry| self.hydrate_directory_record(entry))
-            .transpose()?;
-        let shared_entry = self
-            .shared_storage()?
-            .public_directory_user(&account_id_hex)?
-            .map(|record| self.hydrate_public_directory_record(record))
-            .transpose()?;
-        Ok(select_newer_directory_entry(cached_entry, shared_entry))
+        let shared_storage = self.shared_storage()?;
+        self.directory_entry_for_account_id_with_handles(&account_id_hex, &caches, &shared_storage)
     }
 
     pub async fn refresh_user_directory_for_account_id(
@@ -2875,6 +2898,22 @@ impl MarmotApp {
         Ok(records)
     }
 
+    fn directory_entry_for_account_id_with_handles(
+        &self,
+        account_id_hex: &str,
+        caches: &[DirectoryCache],
+        shared_storage: &SqliteSharedStorage,
+    ) -> Result<Option<UserDirectoryRecord>, AppError> {
+        let cached_entry = Self::directory_entry_from_caches(caches, account_id_hex)?
+            .map(|entry| self.hydrate_directory_record(entry))
+            .transpose()?;
+        let shared_entry = shared_storage
+            .public_directory_user(account_id_hex)?
+            .map(|record| self.hydrate_public_directory_record(record))
+            .transpose()?;
+        Ok(select_newer_directory_entry(cached_entry, shared_entry))
+    }
+
     fn directory_entry_from_caches(
         caches: &[DirectoryCache],
         account_id_hex: &str,
@@ -2907,6 +2946,15 @@ impl MarmotApp {
             .collect())
     }
 
+    fn local_account_labels_by_id(&self) -> Result<HashMap<String, String>, AppError> {
+        Ok(self
+            .account_home()
+            .accounts()?
+            .into_iter()
+            .map(|account| (account.account_id_hex, account.label))
+            .collect())
+    }
+
     fn display_names_by_id(&self) -> Result<HashMap<String, String>, AppError> {
         let mut names = self.profiles_by_id()?;
         for entry in self.directory_entries()? {
@@ -2915,6 +2963,43 @@ impl MarmotApp {
             };
             names.insert(entry.account_id_hex, name);
         }
+        Ok(names)
+    }
+
+    fn display_names_for_account_ids(
+        &self,
+        account_id_hexes: &[String],
+    ) -> Result<HashMap<String, String>, AppError> {
+        let mut account_ids = account_id_hexes
+            .iter()
+            .map(|account_id| parse_account_id_hex(account_id))
+            .collect::<Result<Vec<_>, _>>()?;
+        account_ids.sort();
+        account_ids.dedup();
+        if account_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let caches = self.directory_caches()?;
+        let shared_storage = self.shared_storage()?;
+        let local_names = self.local_account_labels_by_id()?;
+        let mut names = HashMap::new();
+
+        for account_id in account_ids {
+            if let Some(entry) = self.directory_entry_for_account_id_with_handles(
+                &account_id,
+                &caches,
+                &shared_storage,
+            )? && let Some(name) = display_name_for_profile(entry.profile.as_ref())
+            {
+                names.insert(account_id, name);
+                continue;
+            }
+            if let Some(name) = local_names.get(&account_id) {
+                names.insert(account_id, name.clone());
+            }
+        }
+
         Ok(names)
     }
 
@@ -2936,7 +3021,6 @@ impl MarmotApp {
     }
 
     fn hydrate_chat_list_rows(&self, rows: &mut [ChatListRow]) -> Result<(), AppError> {
-        let mut names = HashMap::new();
         let senders = rows
             .iter()
             .filter_map(|row| {
@@ -2945,11 +3029,8 @@ impl MarmotApp {
                     .map(|message| message.sender.clone())
             })
             .collect::<HashSet<_>>();
-        for sender in senders {
-            if let Some(name) = self.display_name_for_account_id(&sender)? {
-                names.insert(sender, name);
-            }
-        }
+        let senders = senders.into_iter().collect::<Vec<_>>();
+        let names = self.display_names_for_account_ids(&senders)?;
         for row in rows {
             let Some(message) = row.last_message.as_mut() else {
                 continue;
@@ -3552,6 +3633,13 @@ impl MarmotApp {
         self.account_dir(label).join(APP_CACHE_DB_FILE)
     }
 
+    fn drop_directory_cache_for_account(&self, label: &str) {
+        self.directory_caches
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(label);
+    }
+
     fn shared_storage_path(&self) -> PathBuf {
         self.root.join(SHARED_DB_FILE)
     }
@@ -3612,6 +3700,21 @@ impl MarmotApp {
         account: &AccountSummary,
     ) -> Result<DirectoryCache, AppError> {
         self.clean_future_dated_directory_caches_for_all_accounts_once()?;
+        if let Some(cache) = self
+            .directory_caches
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&account.label)
+            .cloned()
+        {
+            return Ok(cache);
+        }
+        let _span = tracing::debug_span!(
+            target: "marmot_app::directory",
+            "directory_cache_handle_open",
+            method = "directory_cache_for_account"
+        )
+        .entered();
         let keys = self.account_home().load_signing_keys(&account.label)?;
         let path = self.directory_cache_path(&account.label);
         let key = self.sqlcipher_key(
@@ -3620,7 +3723,18 @@ impl MarmotApp {
             &path,
             SqlcipherDatabaseKind::DirectoryCache,
         )?;
-        DirectoryCache::open(path, &key)
+        let cache = DirectoryCache::open(path, &key)?;
+        #[cfg(test)]
+        self.directory_cache_open_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let mut caches = self
+            .directory_caches
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Ok(caches
+            .entry(account.label.clone())
+            .or_insert_with(|| cache.clone())
+            .clone())
     }
 
     fn directory_caches(&self) -> Result<Vec<DirectoryCache>, AppError> {
@@ -3631,27 +3745,70 @@ impl MarmotApp {
             .filter(|account| account.local_signing)
             .collect::<Vec<_>>();
         self.clean_future_dated_directory_caches_once(&accounts)?;
+
+        let mut caches = Vec::with_capacity(accounts.len());
+        for account in accounts {
+            caches.push(self.directory_cache_for_account(&account)?);
+        }
+
+        self.migrate_legacy_directory_cache_once(&caches)?;
+        Ok(caches)
+    }
+
+    fn migrate_legacy_directory_cache_once(
+        &self,
+        caches: &[DirectoryCache],
+    ) -> Result<(), AppError> {
+        let mut checked = self
+            .legacy_directory_cache_checked
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if *checked {
+            return Ok(());
+        }
         let legacy_path = self.legacy_directory_cache_path();
         let legacy_entries = DirectoryCache::open_legacy_plaintext(legacy_path.clone())?
             .map(|cache| cache.entries())
             .transpose()?;
 
-        let mut caches = Vec::with_capacity(accounts.len());
-        for account in accounts {
-            let cache = self.directory_cache_for_account(&account)?;
-            if let Some(entries) = &legacy_entries {
-                for entry in entries {
-                    cache.put(&self.hydrate_directory_record(entry.clone())?)?;
+        let Some(entries) = legacy_entries else {
+            *checked = true;
+            return Ok(());
+        };
+
+        let entries = entries
+            .into_iter()
+            .map(|entry| self.hydrate_directory_record(entry))
+            .collect::<Result<Vec<_>, _>>()?;
+        let shared_storage = self.shared_storage()?;
+        for entry in &entries {
+            shared_storage.put_public_directory_user(&public_directory_user_record(entry)?)?;
+        }
+        for cache in caches {
+            for entry in &entries {
+                cache.put(entry)?;
+            }
+        }
+        for entry in &entries {
+            if shared_storage
+                .public_directory_user(&entry.account_id_hex)?
+                .is_none()
+            {
+                return Err(AppError::MissingDirectoryEntry(
+                    entry.account_id_hex.clone(),
+                ));
+            }
+            for cache in caches {
+                if cache.entry(&entry.account_id_hex)?.is_none() {
+                    return Err(AppError::MissingDirectoryEntry(
+                        entry.account_id_hex.clone(),
+                    ));
                 }
             }
-            caches.push(cache);
         }
-
-        if legacy_entries.is_some() {
-            remove_sqlite_file_set(&legacy_path)?;
-        }
-
-        Ok(caches)
+        remove_sqlite_file_set(&legacy_path)?;
+        *checked = true;
+        Ok(())
     }
 
     fn clean_future_dated_directory_caches_once(
@@ -5230,6 +5387,211 @@ mod tests {
         assert_eq!(
             entry.profile.and_then(|profile| profile.name),
             Some("new-shared".to_owned())
+        );
+        assert_eq!(
+            app.display_name_for_account_id(&contact).unwrap(),
+            Some("new-shared".to_owned())
+        );
+    }
+
+    #[test]
+    fn repeated_display_name_lookup_reuses_directory_cache_handle() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = AccountHome::open(dir.path());
+        let account = home.create_account("alice").unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+        let contact = format!("{:064x}", 44);
+
+        app.save_directory_entry(&test_directory_record(&contact, "Cached Contact", 1))
+            .unwrap();
+        drop(app);
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+
+        for _ in 0..5 {
+            assert_eq!(
+                app.display_name_for_account_id(&contact).unwrap(),
+                Some("Cached Contact".to_owned())
+            );
+        }
+
+        assert_eq!(app.directory_cache_open_count_for_test(), 1);
+        assert!(app.directory_cache_path(&account.label).exists());
+    }
+
+    #[test]
+    fn batch_display_name_lookup_opens_one_directory_cache_per_local_account() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = AccountHome::open(dir.path());
+        home.create_account("alice").unwrap();
+        let bob = home.create_account("bob").unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+        let contact = format!("{:064x}", 45);
+
+        app.save_directory_entry(&test_directory_record(&contact, "Batch Contact", 1))
+            .unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+
+        for _ in 0..5 {
+            let names = app
+                .display_names_for_account_ids(&[contact.clone(), bob.account_id_hex.clone()])
+                .unwrap();
+            assert_eq!(names.get(&contact), Some(&"Batch Contact".to_owned()));
+            assert_eq!(names.get(&bob.account_id_hex), Some(&"bob".to_owned()));
+        }
+
+        assert_eq!(app.directory_cache_open_count_for_test(), 2);
+    }
+
+    #[test]
+    fn warm_directory_storage_opens_shared_and_local_directory_handles() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = AccountHome::open(dir.path());
+        let alice = home.create_account("alice").unwrap();
+        let bob = home.create_account("bob").unwrap();
+        let public_key = nostr::Keys::generate().public_key().to_hex();
+        let public_account = home.add_public_account(&public_key).unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+
+        app.warm_directory_storage().unwrap();
+        let open_count_after_warm = app.directory_cache_open_count_for_test();
+
+        assert_eq!(open_count_after_warm, 2);
+        assert!(app.shared_storage_path().exists());
+        assert!(app.directory_cache_path(&alice.label).exists());
+        assert!(app.directory_cache_path(&bob.label).exists());
+        assert!(!app.directory_cache_path(&public_account.label).exists());
+
+        assert_eq!(
+            app.display_name_for_account_id(&alice.account_id_hex)
+                .unwrap(),
+            Some("alice".to_owned())
+        );
+        assert_eq!(
+            app.display_names_for_account_ids(&[bob.account_id_hex.clone(), public_key])
+                .unwrap()
+                .get(&bob.account_id_hex),
+            Some(&"bob".to_owned())
+        );
+        assert_eq!(
+            app.directory_cache_open_count_for_test(),
+            open_count_after_warm
+        );
+    }
+
+    #[test]
+    fn legacy_plaintext_directory_cache_migrates_once_into_resident_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = AccountHome::open(dir.path());
+        home.create_account("alice").unwrap();
+        let legacy_path = dir.path().join(APP_CACHE_DB_FILE);
+        let cleanup_marker = dir.path().join(DIRECTORY_FUTURE_CREATED_AT_CLEANUP_MARKER);
+        fs::write(cleanup_marker, b"done\n").unwrap();
+        drop(Connection::open(&legacy_path).unwrap());
+        let legacy_cache = DirectoryCache::open_legacy_plaintext(legacy_path.clone())
+            .unwrap()
+            .unwrap();
+        let contact = format!("{:064x}", 46);
+        legacy_cache
+            .put(&test_directory_record(&contact, "Legacy Contact", 1))
+            .unwrap();
+        drop(legacy_cache);
+
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+        let entry = app
+            .directory_entry_for_account_id(&contact)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            entry.profile.and_then(|profile| profile.name),
+            Some("Legacy Contact".to_owned())
+        );
+        let shared_entry = app
+            .shared_storage()
+            .unwrap()
+            .public_directory_user(&contact)
+            .unwrap()
+            .unwrap();
+        assert_eq!(shared_entry.account_id_hex, contact);
+        assert!(!legacy_path.exists());
+        let open_count_after_migration = app.directory_cache_open_count_for_test();
+        assert!(open_count_after_migration >= 1);
+
+        let entry = app
+            .directory_entry_for_account_id(&contact)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            entry.profile.and_then(|profile| profile.name),
+            Some("Legacy Contact".to_owned())
+        );
+        assert_eq!(
+            app.directory_cache_open_count_for_test(),
+            open_count_after_migration
+        );
+    }
+
+    #[test]
+    fn legacy_plaintext_directory_cache_migrates_to_shared_storage_without_account_caches() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy_path = dir.path().join(APP_CACHE_DB_FILE);
+        drop(Connection::open(&legacy_path).unwrap());
+        let legacy_cache = DirectoryCache::open_legacy_plaintext(legacy_path.clone())
+            .unwrap()
+            .unwrap();
+        let contact = format!("{:064x}", 47);
+        legacy_cache
+            .put(&test_directory_record(&contact, "Shared Legacy Contact", 1))
+            .unwrap();
+        drop(legacy_cache);
+
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+        app.migrate_legacy_directory_cache_once(&[]).unwrap();
+
+        let shared_entry = app
+            .shared_storage()
+            .unwrap()
+            .public_directory_user(&contact)
+            .unwrap()
+            .unwrap();
+        let hydrated = app.hydrate_public_directory_record(shared_entry).unwrap();
+        assert_eq!(
+            hydrated.profile.and_then(|profile| profile.name),
+            Some("Shared Legacy Contact".to_owned())
+        );
+        assert!(!legacy_path.exists());
+    }
+
+    #[test]
+    fn legacy_plaintext_directory_cache_keeps_file_when_migration_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy_path = dir.path().join(APP_CACHE_DB_FILE);
+        drop(Connection::open(&legacy_path).unwrap());
+        let legacy_cache = DirectoryCache::open_legacy_plaintext(legacy_path.clone())
+            .unwrap()
+            .unwrap();
+        legacy_cache
+            .put(&UserDirectoryRecord {
+                account_id_hex: "not-a-public-key".to_owned(),
+                npub: "npub-invalid".to_owned(),
+                local_account: None,
+                profile: None,
+                follows: Vec::new(),
+                follow_source_relays: Vec::new(),
+                relay_lists: AccountRelayListStatus::empty(),
+                key_package: None,
+            })
+            .unwrap();
+        drop(legacy_cache);
+
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+        assert!(app.migrate_legacy_directory_cache_once(&[]).is_err());
+        assert!(legacy_path.exists());
+        assert!(
+            !*app
+                .legacy_directory_cache_checked
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
         );
     }
 

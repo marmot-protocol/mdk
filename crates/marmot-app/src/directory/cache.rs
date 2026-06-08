@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OptionalExtension, params};
@@ -9,48 +10,62 @@ use storage_sqlite::SqlCipherKey;
 
 use crate::{AccountRelayListStatus, AppError, UserDirectoryRecord, UserProfileMetadata};
 
+#[derive(Clone)]
 pub(crate) struct DirectoryCache {
-    conn: Connection,
+    conn: Arc<Mutex<Connection>>,
 }
 
 impl DirectoryCache {
     pub(crate) fn open(path: PathBuf, key: &SqlCipherKey) -> Result<Self, AppError> {
+        record_directory_cache_open();
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
         let conn = Connection::open(path)?;
         conn.pragma_update(None, "key", key.as_secret_str())?;
         let _: i64 = conn.query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get(0))?;
-        initialize_schema(&conn)?;
-        let cache = Self { conn };
-        cache.migrate_legacy_json_records()?;
-        Ok(cache)
+        Self::from_connection(conn)
     }
 
     pub(crate) fn open_legacy_plaintext(path: PathBuf) -> Result<Option<Self>, AppError> {
         if !path.exists() {
             return Ok(None);
         }
+        record_directory_cache_open();
         let conn = Connection::open(path)?;
         let _: i64 = conn.query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get(0))?;
+        Self::from_connection(conn).map(Some)
+    }
+
+    fn from_connection(conn: Connection) -> Result<Self, AppError> {
         initialize_schema(&conn)?;
-        let cache = Self { conn };
+        let cache = Self {
+            conn: Arc::new(Mutex::new(conn)),
+        };
         cache.migrate_legacy_json_records()?;
-        Ok(Some(cache))
+        Ok(cache)
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Connection> {
+        self.conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     pub(crate) fn entry(
         &self,
         account_id_hex: &str,
     ) -> Result<Option<UserDirectoryRecord>, AppError> {
-        let Some(row) = self.directory_user_row(account_id_hex)? else {
+        let conn = self.lock();
+        let Some(row) = Self::directory_user_row(&conn, account_id_hex)? else {
             return Ok(None);
         };
-        self.record_from_directory_user_row(row).map(Some)
+        Self::record_from_directory_user_row(&conn, row).map(Some)
     }
 
     pub(crate) fn entries(&self) -> Result<Vec<UserDirectoryRecord>, AppError> {
-        let mut statement = self.conn.prepare(
+        let conn = self.lock();
+        let mut statement = conn.prepare(
             "SELECT account_id_hex, npub, local_account_json, profile_json,
                     relay_lists_json, key_package_json
              FROM directory_users
@@ -59,7 +74,7 @@ impl DirectoryCache {
         let rows = statement.query_map([], directory_user_row_from_row)?;
         let mut entries = Vec::new();
         for row in rows {
-            entries.push(self.record_from_directory_user_row(row?)?);
+            entries.push(Self::record_from_directory_user_row(&conn, row?)?);
         }
         Ok(entries)
     }
@@ -83,8 +98,20 @@ impl DirectoryCache {
         entry: &UserDirectoryRecord,
         reason: &str,
     ) -> Result<(), AppError> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        Self::put_with_reason_locked(&tx, entry, reason)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn put_with_reason_locked(
+        conn: &Connection,
+        entry: &UserDirectoryRecord,
+        reason: &str,
+    ) -> Result<(), AppError> {
         let now = unix_now_seconds() as i64;
-        self.conn.execute(
+        conn.execute(
             "INSERT INTO directory_users (
                 account_id_hex,
                 npub,
@@ -112,41 +139,46 @@ impl DirectoryCache {
                 now,
             ],
         )?;
-        self.replace_follow_rows(
+        Self::replace_follow_rows(
+            conn,
             "directory_user_follows",
             &entry.account_id_hex,
             &entry.follows,
             now,
         )?;
-        self.replace_follow_source_rows(&entry.account_id_hex, &entry.follow_source_relays, now)?;
-        self.remember_known_reason(&entry.account_id_hex, reason, now)?;
-        self.put_search_graph_snapshot(entry, now)?;
+        Self::replace_follow_source_rows(
+            conn,
+            &entry.account_id_hex,
+            &entry.follow_source_relays,
+            now,
+        )?;
+        Self::remember_known_reason(conn, &entry.account_id_hex, reason, now)?;
+        Self::put_search_graph_snapshot(conn, entry, now)?;
         Ok(())
     }
 
     fn directory_user_row(
-        &self,
+        conn: &Connection,
         account_id_hex: &str,
     ) -> Result<Option<DirectoryUserRow>, AppError> {
-        self.conn
-            .query_row(
-                "SELECT account_id_hex, npub, local_account_json, profile_json,
-                        relay_lists_json, key_package_json
-                 FROM directory_users
-                 WHERE account_id_hex = ?1",
-                [account_id_hex],
-                directory_user_row_from_row,
-            )
-            .optional()
-            .map_err(AppError::from)
+        conn.query_row(
+            "SELECT account_id_hex, npub, local_account_json, profile_json,
+                    relay_lists_json, key_package_json
+             FROM directory_users
+             WHERE account_id_hex = ?1",
+            [account_id_hex],
+            directory_user_row_from_row,
+        )
+        .optional()
+        .map_err(AppError::from)
     }
 
     fn record_from_directory_user_row(
-        &self,
+        conn: &Connection,
         row: DirectoryUserRow,
     ) -> Result<UserDirectoryRecord, AppError> {
-        let follows = self.follow_rows("directory_user_follows", &row.account_id_hex)?;
-        let follow_source_relays = self.follow_source_rows(&row.account_id_hex)?;
+        let follows = Self::follow_rows(conn, "directory_user_follows", &row.account_id_hex)?;
+        let follow_source_relays = Self::follow_source_rows(conn, &row.account_id_hex)?;
         Ok(UserDirectoryRecord {
             account_id_hex: row.account_id_hex,
             npub: row.npub,
@@ -163,12 +195,12 @@ impl DirectoryCache {
         &self,
         account_id_hex: &str,
     ) -> Result<Option<UserDirectoryRecord>, AppError> {
-        let Some(row) = self
-            .conn
+        let conn = self.lock();
+        let Some(row) = conn
             .query_row(
                 "SELECT account_id_hex, npub, profile_json, follows_known
-                 FROM directory_search_graph_users
-                 WHERE account_id_hex = ?1",
+             FROM directory_search_graph_users
+             WHERE account_id_hex = ?1",
                 [account_id_hex],
                 |row| {
                     Ok(SearchGraphUserRow {
@@ -184,7 +216,7 @@ impl DirectoryCache {
             return Ok(None);
         };
         let follows = if row.follows_known {
-            self.follow_rows("directory_search_graph_follows", &row.account_id_hex)?
+            Self::follow_rows(&conn, "directory_search_graph_follows", &row.account_id_hex)?
         } else {
             Vec::new()
         };
@@ -201,11 +233,12 @@ impl DirectoryCache {
     }
 
     fn put_search_graph_snapshot(
-        &self,
+        conn: &Connection,
         entry: &UserDirectoryRecord,
         now: i64,
     ) -> Result<(), AppError> {
-        self.put_search_graph_record(
+        Self::put_search_graph_record_locked(
+            conn,
             &DirectorySearchGraphRecord {
                 account_id_hex: entry.account_id_hex.clone(),
                 npub: entry.npub.clone(),
@@ -218,8 +251,21 @@ impl DirectoryCache {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn put_search_graph_record(
         &self,
+        record: &DirectorySearchGraphRecord,
+        now: i64,
+    ) -> Result<(), AppError> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        Self::put_search_graph_record_locked(&tx, record, now)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn put_search_graph_record_locked(
+        conn: &Connection,
         record: &DirectorySearchGraphRecord,
         now: i64,
     ) -> Result<(), AppError> {
@@ -231,7 +277,7 @@ impl DirectoryCache {
             .and_then(|value| i64::try_from(value).ok());
         let follows_known = record.follows.is_some();
         let follows_updated_at = follows_known.then_some(now);
-        self.conn.execute(
+        conn.execute(
             "INSERT INTO directory_search_graph_users (
                 account_id_hex,
                 npub,
@@ -264,14 +310,15 @@ impl DirectoryCache {
             ],
         )?;
         if let Some(follows) = &record.follows {
-            self.replace_follow_rows(
+            Self::replace_follow_rows(
+                conn,
                 "directory_search_graph_follows",
                 &record.account_id_hex,
                 follows,
                 now,
             )
         } else {
-            self.conn.execute(
+            conn.execute(
                 "DELETE FROM directory_search_graph_follows WHERE account_id_hex = ?1",
                 [&record.account_id_hex],
             )?;
@@ -280,18 +327,18 @@ impl DirectoryCache {
     }
 
     fn replace_follow_rows(
-        &self,
+        conn: &Connection,
         table: &str,
         account_id_hex: &str,
         follows: &[String],
         now: i64,
     ) -> Result<(), AppError> {
-        self.conn.execute(
+        conn.execute(
             &format!("DELETE FROM {table} WHERE account_id_hex = ?1"),
             [account_id_hex],
         )?;
         for (position, follow) in follows.iter().enumerate() {
-            self.conn.execute(
+            conn.execute(
                 &format!(
                     "INSERT INTO {table} (
                         account_id_hex,
@@ -313,17 +360,17 @@ impl DirectoryCache {
     }
 
     fn replace_follow_source_rows(
-        &self,
+        conn: &Connection,
         account_id_hex: &str,
         source_relays: &[String],
         now: i64,
     ) -> Result<(), AppError> {
-        self.conn.execute(
+        conn.execute(
             "DELETE FROM directory_follow_source_relays WHERE account_id_hex = ?1",
             [account_id_hex],
         )?;
         for (position, relay_url) in source_relays.iter().enumerate() {
-            self.conn.execute(
+            conn.execute(
                 "INSERT INTO directory_follow_source_relays (
                     account_id_hex,
                     relay_url,
@@ -343,12 +390,12 @@ impl DirectoryCache {
     }
 
     fn remember_known_reason(
-        &self,
+        conn: &Connection,
         account_id_hex: &str,
         reason: &str,
         now: i64,
     ) -> Result<(), AppError> {
-        self.conn.execute(
+        conn.execute(
             "INSERT INTO directory_known_user_reasons (
                 account_id_hex,
                 reason,
@@ -363,8 +410,12 @@ impl DirectoryCache {
         Ok(())
     }
 
-    fn follow_rows(&self, table: &str, account_id_hex: &str) -> Result<Vec<String>, AppError> {
-        let mut statement = self.conn.prepare(&format!(
+    fn follow_rows(
+        conn: &Connection,
+        table: &str,
+        account_id_hex: &str,
+    ) -> Result<Vec<String>, AppError> {
+        let mut statement = conn.prepare(&format!(
             "SELECT follow_account_id_hex FROM {table}
              WHERE account_id_hex = ?1
              ORDER BY position, follow_account_id_hex"
@@ -377,8 +428,11 @@ impl DirectoryCache {
         Ok(follows)
     }
 
-    fn follow_source_rows(&self, account_id_hex: &str) -> Result<Vec<String>, AppError> {
-        let mut statement = self.conn.prepare(
+    fn follow_source_rows(
+        conn: &Connection,
+        account_id_hex: &str,
+    ) -> Result<Vec<String>, AppError> {
+        let mut statement = conn.prepare(
             "SELECT relay_url FROM directory_follow_source_relays
              WHERE account_id_hex = ?1
              ORDER BY position, relay_url",
@@ -392,12 +446,13 @@ impl DirectoryCache {
     }
 
     fn migrate_legacy_json_records(&self) -> Result<(), AppError> {
-        if !self.table_exists("user_directory_records")? {
+        let mut conn = self.lock();
+        if !Self::table_exists_locked(&conn, "user_directory_records")? {
             return Ok(());
         }
-        let mut statement = self
-            .conn
-            .prepare("SELECT entry_json FROM user_directory_records ORDER BY account_id_hex")?;
+        let tx = conn.transaction()?;
+        let mut statement =
+            tx.prepare("SELECT entry_json FROM user_directory_records ORDER BY account_id_hex")?;
         let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
         let mut json_entries = Vec::new();
         for row in rows {
@@ -407,24 +462,37 @@ impl DirectoryCache {
 
         for json in json_entries {
             let entry = serde_json::from_str::<UserDirectoryRecord>(&json)?;
-            self.put(&entry)?;
+            Self::put_with_reason_locked(&tx, &entry, "directory")?;
         }
-        self.conn
-            .execute_batch("DROP TABLE IF EXISTS user_directory_records;")?;
+        tx.execute_batch("DROP TABLE IF EXISTS user_directory_records;")?;
+        tx.commit()?;
         Ok(())
     }
 
+    #[cfg(test)]
     fn table_exists(&self, table: &str) -> Result<bool, AppError> {
-        self.conn
-            .query_row(
-                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
-                [table],
-                |_| Ok(()),
-            )
-            .optional()
-            .map(|value| value.is_some())
-            .map_err(AppError::from)
+        let conn = self.lock();
+        Self::table_exists_locked(&conn, table)
     }
+
+    fn table_exists_locked(conn: &Connection, table: &str) -> Result<bool, AppError> {
+        conn.query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [table],
+            |_| Ok(()),
+        )
+        .optional()
+        .map(|value| value.is_some())
+        .map_err(AppError::from)
+    }
+}
+
+fn record_directory_cache_open() {
+    tracing::debug!(
+        target: "marmot_app::directory",
+        method = "directory_cache_open",
+        "opening directory cache"
+    );
 }
 
 struct DirectoryUserRow {
@@ -598,16 +666,15 @@ mod tests {
             .put(&directory_record(alice.clone(), vec![bob.clone()]))
             .unwrap();
 
-        let user_count: i64 = cache
-            .conn
+        let conn = cache.lock();
+        let user_count: i64 = conn
             .query_row(
                 "SELECT count(*) FROM directory_users WHERE account_id_hex = ?1",
                 [&alice],
                 |row| row.get(0),
             )
             .unwrap();
-        let follows = cache
-            .conn
+        let follows = conn
             .prepare(
                 "SELECT follow_account_id_hex FROM directory_user_follows
                  WHERE account_id_hex = ?1
@@ -696,10 +763,11 @@ mod tests {
 
         let cache = DirectoryCache::open(path, &key).unwrap();
         let entry = cache.entry(&alice).unwrap().unwrap();
-        let user_count: i64 = cache
-            .conn
+        let conn = cache.lock();
+        let user_count: i64 = conn
             .query_row("SELECT count(*) FROM directory_users", [], |row| row.get(0))
             .unwrap();
+        drop(conn);
         let legacy_table_exists = cache.table_exists("user_directory_records").unwrap();
 
         assert_eq!(entry.follows, vec![bob]);

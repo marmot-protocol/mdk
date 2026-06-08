@@ -153,14 +153,14 @@ async fn group_details_for(
         .into_iter()
         .map(Into::into)
         .collect::<Vec<AppGroupMemberRecordFfi>>();
-    let display_names = members
+    let member_ids = members
         .iter()
-        .filter_map(|member| {
-            kit.runtime
-                .display_name_for_account_id(&member.member_id_hex)
-                .map(|display_name| (member.member_id_hex.clone(), display_name))
-        })
-        .collect();
+        .map(|member| member.member_id_hex.clone())
+        .collect::<Vec<_>>();
+    let display_names = kit
+        .runtime
+        .display_names_for_account_ids(&member_ids)
+        .unwrap_or_default();
     group_details_ffi(group, members, &account.account_id_hex, display_names)
 }
 
