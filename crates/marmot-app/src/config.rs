@@ -54,6 +54,21 @@ pub struct RelayTelemetryRuntimeConfig {
     pub resource: Option<RelayTelemetryResource>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AuditLogUploadSource {
+    pub account_label: Option<String>,
+    pub device_label: Option<String>,
+    pub platform: Option<String>,
+    pub app_version: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AuditLogTrackerConfig {
+    pub endpoint: Option<String>,
+    pub authorization_bearer_token: Option<String>,
+    pub source: AuditLogUploadSource,
+}
+
 impl RelayTelemetryResource {
     fn has_required_attributes(&self) -> bool {
         [
@@ -100,6 +115,45 @@ impl RelayTelemetryRuntimeConfig {
             .resource
             .and_then(|resource| RelayTelemetryResource::normalize(resource).ok());
         self
+    }
+}
+
+impl AuditLogUploadSource {
+    fn normalize(mut self) -> Self {
+        self.account_label = trim_optional(self.account_label);
+        self.device_label = trim_optional(self.device_label);
+        self.platform = trim_optional(self.platform);
+        self.app_version = trim_optional(self.app_version);
+        self
+    }
+}
+
+impl AuditLogTrackerConfig {
+    pub(crate) fn normalize(mut self) -> Result<Self, String> {
+        self.endpoint = trim_optional(self.endpoint);
+        self.authorization_bearer_token = trim_optional(self.authorization_bearer_token);
+        self.source = self.source.normalize();
+        if self
+            .endpoint
+            .as_deref()
+            .is_some_and(|endpoint| !endpoint_transport_allowed(endpoint))
+        {
+            return Err(
+                "audit log tracker endpoint must be https, or loopback http for local testing"
+                    .to_owned(),
+            );
+        }
+        Ok(self)
+    }
+
+    pub(crate) fn upload_allowed(&self) -> bool {
+        self.endpoint
+            .as_deref()
+            .is_some_and(endpoint_transport_allowed)
+            && self
+                .authorization_bearer_token
+                .as_deref()
+                .is_some_and(|token| !token.trim().is_empty())
     }
 }
 

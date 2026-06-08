@@ -12,8 +12,9 @@ use std::sync::{Arc, Once};
 
 use marmot_account::AccountHome;
 use marmot_uniffi::{
-    AuditLogSettingsFfi, Marmot, MarmotKitError, MediaReferenceFfi, MediaUploadRequestFfi,
-    NotificationWakeSourceFfi, PushPlatformFfi, RelayTelemetrySettingsFfi, TimelineMessageQueryFfi,
+    AuditLogSettingsFfi, AuditLogTrackerConfigFfi, AuditLogUploadSourceFfi, Marmot, MarmotKitError,
+    MediaReferenceFfi, MediaUploadRequestFfi, NotificationWakeSourceFfi, PushPlatformFfi,
+    RelayTelemetrySettingsFfi, TimelineMessageQueryFfi,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -38,7 +39,12 @@ fn install_mock_keyring() {
 struct CapturedAuditUpload {
     method: String,
     path: String,
+    authorization: Option<String>,
     content_type: Option<String>,
+    account_label: Option<String>,
+    device_label: Option<String>,
+    platform: Option<String>,
+    app_version: Option<String>,
     body: Vec<u8>,
 }
 
@@ -46,6 +52,15 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
         .windows(needle.len())
         .position(|window| window == needle)
+}
+
+fn header_value(headers: &str, name: &str) -> Option<String> {
+    headers.lines().find_map(|line| {
+        let (candidate, value) = line.split_once(':')?;
+        candidate
+            .eq_ignore_ascii_case(name)
+            .then(|| value.trim().to_owned())
+    })
 }
 
 async fn capture_audit_upload(listener: TcpListener, tx: oneshot::Sender<CapturedAuditUpload>) {
@@ -84,11 +99,12 @@ async fn capture_audit_upload(listener: TcpListener, tx: oneshot::Sender<Capture
         let mut parts = request_line.split_whitespace();
         let method = parts.next().unwrap_or_default().to_owned();
         let path = parts.next().unwrap_or_default().to_owned();
-        let content_type = headers.lines().find_map(|line| {
-            line.to_ascii_lowercase()
-                .strip_prefix("content-type:")
-                .map(|value| value.trim().to_owned())
-        });
+        let authorization = header_value(&headers, "authorization");
+        let content_type = header_value(&headers, "content-type");
+        let account_label = header_value(&headers, "x-goggles-account-label");
+        let device_label = header_value(&headers, "x-goggles-device-label");
+        let platform = header_value(&headers, "x-goggles-platform");
+        let app_version = header_value(&headers, "x-goggles-app-version");
         let body = buf[header_end..header_end + content_length].to_vec();
 
         let _ = stream
@@ -98,7 +114,12 @@ async fn capture_audit_upload(listener: TcpListener, tx: oneshot::Sender<Capture
         let _ = tx.send(CapturedAuditUpload {
             method,
             path,
+            authorization,
             content_type,
+            account_label,
+            device_label,
+            platform,
+            app_version,
             body,
         });
         return;
@@ -483,6 +504,75 @@ async fn audit_log_binding_posts_jsonl_file() {
         captured.content_type.as_deref(),
         Some("application/x-ndjson")
     );
+    assert_eq!(captured.body, audit_body);
+
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn audit_log_binding_posts_tracker_update() {
+    install_mock_keyring();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let kit = Marmot::new(
+        tmp.path().to_string_lossy().into_owned(),
+        vec!["wss://relay.invalid.test".to_string()],
+    )
+    .expect("open marmot kit");
+    let account = AccountHome::open_with_default_keychain(tmp.path())
+        .expect("open account home")
+        .create_nostr_account()
+        .expect("create local account");
+    let audit_body = b"{\"seq\":1}\n{\"seq\":2}\n";
+    let audit_path = AccountHome::open_with_default_keychain(tmp.path())
+        .expect("reopen account home")
+        .account_dir(&account.label)
+        .join("audit-binding-tracker.jsonl");
+    std::fs::write(&audit_path, audit_body).expect("write audit log");
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = oneshot::channel();
+    let server = tokio::spawn(capture_audit_upload(listener, tx));
+
+    kit.set_audit_log_settings(AuditLogSettingsFfi { enabled: true })
+        .expect("enable audit logs");
+    kit.set_audit_log_tracker_config(AuditLogTrackerConfigFfi {
+        endpoint: Some(format!("http://{addr}/api/v1/audit-logs/")),
+        authorization_bearer_token: Some("goggles_binding_secret".to_owned()),
+        source: AuditLogUploadSourceFfi {
+            account_label: Some("Alice".to_owned()),
+            device_label: Some("Alice iPhone".to_owned()),
+            platform: Some("ios".to_owned()),
+            app_version: Some("2026.6.8".to_owned()),
+        },
+    })
+    .expect("configure audit tracker");
+
+    let result = kit
+        .post_audit_log_tracker_update()
+        .await
+        .expect("post tracker update");
+
+    assert!(result.enabled);
+    assert_eq!(result.skipped_reason, None);
+    assert_eq!(result.uploaded.len(), 1);
+    assert_eq!(result.uploaded[0].status, 204);
+    assert_eq!(result.uploaded[0].bytes_sent, audit_body.len() as u64);
+    let captured = rx.await.expect("captured upload");
+    assert_eq!(captured.method, "POST");
+    assert_eq!(captured.path, "/api/v1/audit-logs/");
+    assert_eq!(
+        captured.authorization.as_deref(),
+        Some("Bearer goggles_binding_secret")
+    );
+    assert_eq!(
+        captured.content_type.as_deref(),
+        Some("application/x-ndjson")
+    );
+    assert_eq!(captured.account_label.as_deref(), Some("Alice"));
+    assert_eq!(captured.device_label.as_deref(), Some("Alice iPhone"));
+    assert_eq!(captured.platform.as_deref(), Some("ios"));
+    assert_eq!(captured.app_version.as_deref(), Some("2026.6.8"));
     assert_eq!(captured.body, audit_body);
 
     server.await.unwrap();

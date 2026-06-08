@@ -13,7 +13,8 @@ use marmot_app::{
     AccountKeyPackageRecord, AccountRelayListState, AccountRelayListStatus,
     AppGroupAdminPolicyComponent, AppGroupMemberRecord, AppGroupMlsState,
     AppGroupNostrRoutingComponent, AppGroupProfileComponent, AppGroupRecord, AppMessageRecord,
-    AppProjectionUpdate, AuditLogFile, AuditLogSettings, AuditLogUploadResult, ChatListAvatar,
+    AppProjectionUpdate, AuditLogFile, AuditLogSettings, AuditLogTrackerConfig,
+    AuditLogTrackerUpdateResult, AuditLogUploadResult, AuditLogUploadSource, ChatListAvatar,
     ChatListMessagePreview, ChatListRow, GroupInviteDeclineResult, GroupPushDebugInfo,
     GroupPushTokenDebugEntry, LocalPushRegistrationDebug, MarmotAppEvent, MediaDownloadResult,
     MediaReference, MediaUploadRequest, MediaUploadResult, NotificationCollectionStatus,
@@ -63,6 +64,23 @@ impl From<AuditLogUploadResult> for AuditLogUploadResultFfi {
             path: value.path,
             status: value.status,
             bytes_sent: value.bytes_sent,
+        }
+    }
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct AuditLogTrackerUpdateResultFfi {
+    pub enabled: bool,
+    pub uploaded: Vec<AuditLogUploadResultFfi>,
+    pub skipped_reason: Option<String>,
+}
+
+impl From<AuditLogTrackerUpdateResult> for AuditLogTrackerUpdateResultFfi {
+    fn from(value: AuditLogTrackerUpdateResult) -> Self {
+        Self {
+            enabled: value.enabled,
+            uploaded: value.uploaded.into_iter().map(Into::into).collect(),
+            skipped_reason: value.skipped_reason,
         }
     }
 }
@@ -296,6 +314,63 @@ impl From<AuditLogSettingsFfi> for AuditLogSettings {
     fn from(value: AuditLogSettingsFfi) -> Self {
         Self {
             enabled: value.enabled,
+        }
+    }
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct AuditLogUploadSourceFfi {
+    pub account_label: Option<String>,
+    pub device_label: Option<String>,
+    pub platform: Option<String>,
+    pub app_version: Option<String>,
+}
+
+impl From<AuditLogUploadSourceFfi> for AuditLogUploadSource {
+    fn from(value: AuditLogUploadSourceFfi) -> Self {
+        Self {
+            account_label: value.account_label,
+            device_label: value.device_label,
+            platform: value.platform,
+            app_version: value.app_version,
+        }
+    }
+}
+
+impl From<AuditLogUploadSource> for AuditLogUploadSourceFfi {
+    fn from(value: AuditLogUploadSource) -> Self {
+        Self {
+            account_label: value.account_label,
+            device_label: value.device_label,
+            platform: value.platform,
+            app_version: value.app_version,
+        }
+    }
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct AuditLogTrackerConfigFfi {
+    pub endpoint: Option<String>,
+    pub authorization_bearer_token: Option<String>,
+    pub source: AuditLogUploadSourceFfi,
+}
+
+impl From<AuditLogTrackerConfigFfi> for AuditLogTrackerConfig {
+    fn from(value: AuditLogTrackerConfigFfi) -> Self {
+        Self {
+            endpoint: value.endpoint,
+            authorization_bearer_token: value.authorization_bearer_token,
+            source: value.source.into(),
+        }
+    }
+}
+
+impl From<AuditLogTrackerConfig> for AuditLogTrackerConfigFfi {
+    fn from(value: AuditLogTrackerConfig) -> Self {
+        Self {
+            endpoint: value.endpoint,
+            authorization_bearer_token: value.authorization_bearer_token,
+            source: value.source.into(),
         }
     }
 }

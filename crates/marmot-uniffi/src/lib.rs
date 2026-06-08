@@ -46,16 +46,16 @@ use subscriptions::{
 uniffi::setup_scaffolding!();
 
 pub use conversions::{
-    AuditLogFileFfi, AuditLogSettingsFfi, AuditLogUploadResultFfi,
-    BackgroundNotificationCollectionFfi, ChatListAvatarFfi, ChatListMessagePreviewFfi,
-    ChatListRowFfi, ChatListSubscriptionUpdateFfi, ChatListUpdateTriggerFfi, GroupPushDebugInfoFfi,
-    GroupPushTokenDebugEntryFfi, LocalPushRegistrationDebugFfi, MediaDownloadResultFfi,
-    MediaRecordFfi, MediaReferenceFfi, MediaUploadRequestFfi, MediaUploadResultFfi,
-    NotificationCollectionStatusFfi, NotificationSettingsFfi, NotificationTriggerFfi,
-    NotificationUpdateFfi, NotificationUserFfi, NotificationWakeSourceFfi, PushPlatformFfi,
-    PushRegistrationFfi, RelayTelemetryResourceFfi, RelayTelemetryRuntimeConfigFfi,
-    RelayTelemetrySettingsFfi, RuntimeProjectionUpdateFfi, TimelineMessageChangeFfi,
-    TimelineMessageQueryFfi, TimelineMessageRecordFfi, TimelinePageFfi,
+    AuditLogFileFfi, AuditLogSettingsFfi, AuditLogTrackerConfigFfi, AuditLogTrackerUpdateResultFfi,
+    AuditLogUploadResultFfi, AuditLogUploadSourceFfi, BackgroundNotificationCollectionFfi,
+    ChatListAvatarFfi, ChatListMessagePreviewFfi, ChatListRowFfi, ChatListSubscriptionUpdateFfi,
+    ChatListUpdateTriggerFfi, GroupPushDebugInfoFfi, GroupPushTokenDebugEntryFfi,
+    LocalPushRegistrationDebugFfi, MediaDownloadResultFfi, MediaRecordFfi, MediaReferenceFfi,
+    MediaUploadRequestFfi, MediaUploadResultFfi, NotificationCollectionStatusFfi,
+    NotificationSettingsFfi, NotificationTriggerFfi, NotificationUpdateFfi, NotificationUserFfi,
+    NotificationWakeSourceFfi, PushPlatformFfi, PushRegistrationFfi, RelayTelemetryResourceFfi,
+    RelayTelemetryRuntimeConfigFfi, RelayTelemetrySettingsFfi, RuntimeProjectionUpdateFfi,
+    TimelineMessageChangeFfi, TimelineMessageQueryFfi, TimelineMessageRecordFfi, TimelinePageFfi,
     TimelineProjectionUpdateFfi, TimelineReactionEmojiFfi, TimelineReactionSummaryFfi,
     TimelineRemoveReasonFfi, TimelineSubscriptionUpdateFfi, TimelineUpdateTriggerFfi,
     TimelineUserReactionFfi,
@@ -1210,6 +1210,18 @@ impl Marmot {
         Ok(self.runtime.set_audit_log_settings(settings.into())?.into())
     }
 
+    /// Supply non-persisted audit tracker upload metadata: full Goggles upload
+    /// URL, bearer token from the host app, and optional human source labels.
+    pub fn set_audit_log_tracker_config(
+        &self,
+        config: AuditLogTrackerConfigFfi,
+    ) -> Result<AuditLogTrackerConfigFfi, MarmotKitError> {
+        Ok(self
+            .runtime
+            .set_audit_log_tracker_config(config.into())?
+            .into())
+    }
+
     /// Local JSONL audit logs available for explicit forensic upload.
     pub fn audit_log_files(&self) -> Result<Vec<AuditLogFileFfi>, MarmotKitError> {
         Ok(self
@@ -1231,6 +1243,15 @@ impl Marmot {
             .post_audit_log_file(&path, &endpoint)
             .await?
             .into())
+    }
+
+    /// POST all local audit logs to the configured tracker when audit logging is
+    /// enabled. This is safe for host apps to call unconditionally; disabled or
+    /// unconfigured states return a structured skip result.
+    pub async fn post_audit_log_tracker_update(
+        &self,
+    ) -> Result<AuditLogTrackerUpdateResultFfi, MarmotKitError> {
+        Ok(self.runtime.post_audit_log_tracker_update().await?.into())
     }
 
     // -----------------------------------------------------------------------

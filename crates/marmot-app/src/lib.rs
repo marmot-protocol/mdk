@@ -108,8 +108,8 @@ pub use agent_streams::{
 };
 pub use client::AppClient;
 pub use config::{
-    MarmotAppConfig, RelayTelemetryExportConfig, RelayTelemetryResource,
-    RelayTelemetryRuntimeConfig, RelayTelemetrySettings,
+    AuditLogTrackerConfig, AuditLogUploadSource, MarmotAppConfig, RelayTelemetryExportConfig,
+    RelayTelemetryResource, RelayTelemetryRuntimeConfig, RelayTelemetrySettings,
 };
 pub use error::AppError;
 pub use groups::{
@@ -382,6 +382,13 @@ pub struct AuditLogUploadResult {
     pub path: String,
     pub status: u16,
     pub bytes_sent: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuditLogTrackerUpdateResult {
+    pub enabled: bool,
+    pub uploaded: Vec<AuditLogUploadResult>,
+    pub skipped_reason: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -1176,8 +1183,28 @@ impl MarmotApp {
         path: &str,
         endpoint: &str,
     ) -> Result<AuditLogUploadResult, AppError> {
+        let config = config::AuditLogTrackerConfig {
+            endpoint: Some(endpoint.to_owned()),
+            ..Default::default()
+        };
+        self.post_audit_log_file_with_tracker_config(path, &config)
+            .await
+    }
+
+    pub async fn post_audit_log_file_with_tracker_config(
+        &self,
+        path: &str,
+        config: &config::AuditLogTrackerConfig,
+    ) -> Result<AuditLogUploadResult, AppError> {
         let path = self.validate_audit_log_path(path)?;
-        let endpoint = validate_audit_upload_endpoint(endpoint)?;
+        let config = config
+            .clone()
+            .normalize()
+            .map_err(AppError::AuditLogUpload)?;
+        let endpoint =
+            validate_audit_upload_endpoint(config.endpoint.as_deref().ok_or_else(|| {
+                AppError::AuditLogUpload("forensic upload endpoint is empty".into())
+            })?)?;
         let file = tokio::fs::File::open(&path).await?;
         let bytes_sent = file.metadata().await?.len();
         if bytes_sent > AUDIT_LOG_UPLOAD_MAX_BYTES {
@@ -1187,14 +1214,27 @@ impl MarmotApp {
             )));
         }
         let body = reqwest::Body::wrap_stream(ReaderStream::new(file));
-        let response = AUDIT_LOG_UPLOAD_CLIENT
+        let mut request = AUDIT_LOG_UPLOAD_CLIENT
             .post(endpoint)
             .header(reqwest::header::CONTENT_TYPE, AUDIT_LOG_CONTENT_TYPE)
             .header(reqwest::header::CONTENT_LENGTH, bytes_sent)
-            .body(body)
-            .send()
-            .await
-            .map_err(audit_log_reqwest_error)?;
+            .body(body);
+        if let Some(token) = config.authorization_bearer_token.as_deref() {
+            request = request.bearer_auth(token);
+        }
+        if let Some(value) = config.source.account_label.as_deref() {
+            request = request.header("X-Goggles-Account-Label", value);
+        }
+        if let Some(value) = config.source.device_label.as_deref() {
+            request = request.header("X-Goggles-Device-Label", value);
+        }
+        if let Some(value) = config.source.platform.as_deref() {
+            request = request.header("X-Goggles-Platform", value);
+        }
+        if let Some(value) = config.source.app_version.as_deref() {
+            request = request.header("X-Goggles-App-Version", value);
+        }
+        let response = request.send().await.map_err(audit_log_reqwest_error)?;
         let status = response.status();
         if !status.is_success() {
             return Err(AppError::AuditLogUpload(format!(
