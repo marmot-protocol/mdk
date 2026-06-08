@@ -482,9 +482,10 @@ mod otlp {
             string_key_value("service.version", resource.service_version.clone()),
             string_key_value("service.instance.id", resource.service_instance_id.clone()),
             string_key_value(
-                "deployment.environment",
+                "deployment.environment.name",
                 resource.deployment_environment.clone(),
             ),
+            string_key_value("tenant", resource.tenant.clone()),
             string_key_value("os.type", resource.os_type.clone()),
             string_key_value("os.version", resource.os_version.clone()),
         ];
@@ -668,6 +669,7 @@ mod otlp {
                     service_version: "1.4.2".to_owned(),
                     service_instance_id: "8e1ca50b-05a2-4c31-a31c-1e69c75a9366".to_owned(),
                     deployment_environment: "staging".to_owned(),
+                    tenant: "darkmatter-ios".to_owned(),
                     os_type: "ios".to_owned(),
                     os_version: "17.5".to_owned(),
                     device_model_identifier: Some("iPhone15,3".to_owned()),
@@ -695,7 +697,12 @@ mod otlp {
                 resource_attr("service.instance.id"),
                 Some("8e1ca50b-05a2-4c31-a31c-1e69c75a9366")
             );
-            assert_eq!(resource_attr("deployment.environment"), Some("staging"));
+            assert_eq!(
+                resource_attr("deployment.environment.name"),
+                Some("staging")
+            );
+            assert_eq!(resource_attr("deployment.environment"), None);
+            assert_eq!(resource_attr("tenant"), Some("darkmatter-ios"));
             assert_eq!(resource_attr("os.type"), Some("ios"));
             assert_eq!(resource_attr("os.version"), Some("17.5"));
             assert_eq!(resource_attr("device.model.identifier"), Some("iPhone15,3"));
@@ -886,6 +893,7 @@ mod tests {
                 service_version: "1.4.2".to_owned(),
                 service_instance_id: "8e1ca50b-05a2-4c31-a31c-1e69c75a9366".to_owned(),
                 deployment_environment: "staging".to_owned(),
+                tenant: "darkmatter-ios".to_owned(),
                 os_type: "ios".to_owned(),
                 os_version: "17.5".to_owned(),
                 device_model_identifier: None,

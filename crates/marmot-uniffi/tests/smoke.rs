@@ -361,8 +361,8 @@ async fn notification_binding_methods_are_public_and_validate_missing_accounts()
         .expect("empty notification subscription should be valid");
 }
 
-#[test]
-fn relay_telemetry_settings_binding_round_trips() {
+#[tokio::test]
+async fn relay_telemetry_settings_binding_round_trips() {
     install_mock_keyring();
     let tmp = tempfile::tempdir().expect("tempdir");
     let kit = Marmot::new(
@@ -382,6 +382,7 @@ fn relay_telemetry_settings_binding_round_trips() {
             export_enabled: true,
             export_interval_seconds: 30,
         })
+        .await
         .expect("set telemetry settings");
     assert!(stored.export_enabled);
     assert_eq!(stored.export_interval_seconds, 30);

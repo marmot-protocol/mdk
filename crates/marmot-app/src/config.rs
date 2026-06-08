@@ -84,6 +84,7 @@ pub struct RelayTelemetryResource {
     pub service_version: String,
     pub service_instance_id: String,
     pub deployment_environment: String,
+    pub tenant: String,
     pub os_type: String,
     pub os_version: String,
     pub device_model_identifier: Option<String>,
@@ -117,6 +118,7 @@ impl RelayTelemetryResource {
             self.service_version.as_str(),
             self.service_instance_id.as_str(),
             self.deployment_environment.as_str(),
+            self.tenant.as_str(),
             self.os_type.as_str(),
             self.os_version.as_str(),
         ]
@@ -128,7 +130,8 @@ impl RelayTelemetryResource {
         self.service_version = trim_required("service.version", self.service_version)?;
         self.service_instance_id = trim_required("service.instance.id", self.service_instance_id)?;
         self.deployment_environment =
-            trim_required("deployment.environment", self.deployment_environment)?;
+            trim_required("deployment.environment.name", self.deployment_environment)?;
+        self.tenant = trim_required("tenant", self.tenant)?;
         self.os_type = trim_required("os.type", self.os_type)?;
         self.os_version = trim_required("os.version", self.os_version)?;
         self.device_model_identifier = self.device_model_identifier.and_then(|value| {
@@ -402,6 +405,7 @@ mod tests {
                 service_version: "1.4.2".to_owned(),
                 service_instance_id: "8e1ca50b-05a2-4c31-a31c-1e69c75a9366".to_owned(),
                 deployment_environment: "staging".to_owned(),
+                tenant: "darkmatter-ios".to_owned(),
                 os_type: "ios".to_owned(),
                 os_version: "17.5".to_owned(),
                 device_model_identifier: None,
@@ -528,6 +532,7 @@ mod tests {
                 service_version: " 1.4.2 ".to_owned(),
                 service_instance_id: " 8e1ca50b-05a2-4c31-a31c-1e69c75a9366 ".to_owned(),
                 deployment_environment: " staging ".to_owned(),
+                tenant: " darkmatter-ios ".to_owned(),
                 os_type: " ios ".to_owned(),
                 os_version: " 17.5 ".to_owned(),
                 device_model_identifier: Some(" iPhone15,2 ".to_owned()),
@@ -546,6 +551,7 @@ mod tests {
         );
         assert_eq!(config.authorization_bearer_token.as_deref(), Some("token"));
         let resource = config.resource.as_ref().unwrap();
+        assert_eq!(resource.tenant, "darkmatter-ios");
         assert_eq!(resource.os_type, "ios");
         assert_eq!(
             resource.device_model_identifier.as_deref(),

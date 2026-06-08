@@ -1347,6 +1347,7 @@ mod tests {
                 service_version: "1.4.2".to_owned(),
                 service_instance_id: "8e1ca50b-05a2-4c31-a31c-1e69c75a9366".to_owned(),
                 deployment_environment: "staging".to_owned(),
+                tenant: "darkmatter-ios".to_owned(),
                 os_type: "ios".to_owned(),
                 os_version: "17.5".to_owned(),
                 device_model_identifier: None,
