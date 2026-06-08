@@ -201,11 +201,49 @@ impl RuntimeSharedServices {
     }
 
     fn schedule_audit_log_tracker_update(&self, trigger: &'static str) {
-        if self.lifecycle.is_stopping()
-            || !self
-                .audit_log_tracker_config()
-                .upload_allowed_with_endpoints(self.service_endpoints())
+        if self.lifecycle.is_stopping() {
+            tracing::debug!(
+                target: "marmot_app::audit_log",
+                method = "schedule_audit_log_tracker_update",
+                trigger,
+                skipped_reason = "runtime_stopping",
+                "skipped forensic audit log tracker update"
+            );
+            return;
+        }
+        let config = self.audit_log_tracker_config();
+        if config.resolved_endpoint(self.service_endpoints()).is_none() {
+            tracing::debug!(
+                target: "marmot_app::audit_log",
+                method = "schedule_audit_log_tracker_update",
+                trigger,
+                skipped_reason = "audit_log_tracker_endpoint_missing",
+                "skipped forensic audit log tracker update"
+            );
+            return;
+        }
+        if config
+            .authorization_bearer_token
+            .as_deref()
+            .is_none_or(|token| token.trim().is_empty())
         {
+            tracing::debug!(
+                target: "marmot_app::audit_log",
+                method = "schedule_audit_log_tracker_update",
+                trigger,
+                skipped_reason = "audit_log_tracker_authorization_token_missing",
+                "skipped forensic audit log tracker update"
+            );
+            return;
+        }
+        if !config.upload_allowed_with_endpoints(self.service_endpoints()) {
+            tracing::debug!(
+                target: "marmot_app::audit_log",
+                method = "schedule_audit_log_tracker_update",
+                trigger,
+                skipped_reason = "audit_log_tracker_not_configured",
+                "skipped forensic audit log tracker update"
+            );
             return;
         }
         if let Some(uploader) = &self.audit_log_tracker_uploader {
@@ -502,7 +540,15 @@ async fn run_audit_log_tracker_uploader(
             if config.upload_allowed_with_endpoints(app.service_endpoints()) {
                 match post_audit_log_tracker_update_for_app(&app, config).await {
                     Ok(result) => {
-                        if result.skipped_reason.is_none() {
+                        if let Some(skipped_reason) = result.skipped_reason.as_deref() {
+                            tracing::debug!(
+                                target: "marmot_app::audit_log",
+                                method = "schedule_audit_log_tracker_update",
+                                trigger,
+                                skipped_reason,
+                                "skipped forensic audit log tracker update"
+                            );
+                        } else {
                             tracing::debug!(
                                 target: "marmot_app::audit_log",
                                 method = "schedule_audit_log_tracker_update",
@@ -587,6 +633,7 @@ struct AccountWorkerRuntime {
     relay_plane: MarmotRelayPlane,
     events: broadcast::Sender<MarmotAppEvent>,
     lifecycle: RuntimeLifecycle,
+    shared: RuntimeSharedServices,
 }
 
 enum AccountWorkerCommand {
@@ -2856,9 +2903,18 @@ async fn post_audit_log_tracker_update_for_app(
         });
     }
 
+    let files = app.audit_log_files()?;
+    if files.is_empty() {
+        return Ok(AuditLogTrackerUpdateResult {
+            enabled: true,
+            uploaded: Vec::new(),
+            skipped_reason: Some("audit log files missing".to_owned()),
+        });
+    }
+
     let mut uploaded = Vec::new();
     let mut failed = 0_usize;
-    for (file_index, file) in app.audit_log_files()?.into_iter().enumerate() {
+    for (file_index, file) in files.into_iter().enumerate() {
         match app
             .post_audit_log_file_with_tracker_config(&file.path, &config)
             .await
@@ -3007,6 +3063,7 @@ impl AccountManager {
                         relay_plane: self.shared.relay_plane().clone(),
                         events: self.events.clone(),
                         lifecycle: self.shared.lifecycle(),
+                        shared: self.shared.clone(),
                     },
                     command_rx,
                     ready_tx,
@@ -3956,6 +4013,7 @@ async fn run_app_runtime_account_worker(
         relay_plane,
         events,
         lifecycle,
+        shared,
     } = runtime;
     let mut lifecycle_shutdown = lifecycle.subscribe_shutdown();
     let mut client = match tokio::select! {
@@ -4006,6 +4064,9 @@ async fn run_app_runtime_account_worker(
     } {
         Ok(summary) => {
             publish_app_runtime_summary(&events, &account_id_hex, &account_label, &summary);
+            if sync_summary_triggers_audit_tracker_update(&summary) {
+                shared.schedule_audit_log_tracker_update("startup_sync");
+            }
         }
         Err(err) => {
             publish_app_runtime_account_error(
@@ -4035,6 +4096,9 @@ async fn run_app_runtime_account_worker(
                         let result = match client.sync().await {
                             Ok(summary) => {
                                 publish_app_runtime_summary(&events, &account_id_hex, &account_label, &summary);
+                                if sync_summary_triggers_audit_tracker_update(&summary) {
+                                    shared.schedule_audit_log_tracker_update("catch_up");
+                                }
                                 Ok(())
                             }
                             Err(err) => {
@@ -4337,6 +4401,9 @@ async fn run_app_runtime_account_worker(
                     Ok(summary) => {
                         reconnect_backoff.reset();
                         publish_app_runtime_summary(&events, &account_id_hex, &account_label, &summary);
+                        if sync_summary_triggers_audit_tracker_update(&summary) {
+                            shared.schedule_audit_log_tracker_update("receive");
+                        }
                     }
                     Err(err) => {
                         publish_app_runtime_account_error(
@@ -4442,6 +4509,10 @@ fn collect_notification_update_from_event(
             );
         }
     }
+}
+
+fn sync_summary_triggers_audit_tracker_update(summary: &SyncSummary) -> bool {
+    !summary.joined_groups.is_empty() || !summary.messages.is_empty() || !summary.events.is_empty()
 }
 
 fn publish_app_runtime_summary(

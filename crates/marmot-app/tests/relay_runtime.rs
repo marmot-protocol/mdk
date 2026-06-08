@@ -988,6 +988,68 @@ async fn app_runtime_schedules_audit_tracker_update_after_create_group_welcome()
 }
 
 #[tokio::test]
+async fn app_runtime_schedules_audit_tracker_update_after_inbound_welcome() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    home.create_account("bob").unwrap();
+    let bob_id = home.account("bob").unwrap().account_id_hex;
+
+    let (_relay, app, _url) = mock_app(&dir).await;
+    app.set_audit_log_settings(AuditLogSettings { enabled: true })
+        .unwrap();
+    let mut bob_setup = app.client("bob").await.unwrap();
+    bob_setup.publish_key_package().await.unwrap();
+    drop(bob_setup);
+
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let mut events = runtime.subscribe();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let server = tokio::spawn(capture_delayed_audit_upload(listener, tx, release_rx));
+    runtime
+        .set_audit_log_tracker_config(AuditLogTrackerConfig {
+            endpoint: Some(format!("http://{addr}/api/v1/audit-logs/")),
+            authorization_bearer_token: Some("goggles_inbound_secret".to_owned()),
+            source: AuditLogUploadSource::default(),
+        })
+        .unwrap();
+    runtime.start().await.unwrap();
+
+    let mut alice = app.client("alice").await.unwrap();
+    let group_id = alice
+        .create_group("runtime inbound audit", &["bob"])
+        .await
+        .unwrap();
+    wait_for_event(&mut events, |event| {
+        matches!(
+            event,
+            MarmotAppEvent::GroupJoined { account_id_hex, group_id: joined_group, .. }
+                if account_id_hex == &bob_id && joined_group == &group_id
+        )
+    })
+    .await;
+
+    let captured = timeout(Duration::from_secs(5), rx)
+        .await
+        .expect("audit tracker should receive inbound-triggered upload")
+        .unwrap();
+    assert_eq!(captured.method, "POST");
+    assert_eq!(captured.path, "/api/v1/audit-logs/");
+    assert_eq!(
+        captured.authorization.as_deref(),
+        Some("Bearer goggles_inbound_secret")
+    );
+    assert!(!captured.body.is_empty());
+
+    let _ = release_tx.send(());
+    server.await.unwrap();
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
 async fn app_runtime_coalesces_audit_tracker_updates_while_upload_is_in_flight() {
     let dir = tempfile::tempdir().unwrap();
     let (_relay, app, url) = mock_app(&dir).await;
