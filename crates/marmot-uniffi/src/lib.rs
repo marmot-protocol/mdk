@@ -1139,8 +1139,8 @@ impl Marmot {
             .map(|normalized| normalized.account_id_hex)
     }
 
-    /// Per-account relay lists: the NIP-65, inbox, and key-package lists the
-    /// account has published, plus the configured default/bootstrap sets.
+    /// Per-account relay lists: the NIP-65 and inbox lists the account has
+    /// published, plus the configured default/bootstrap sets.
     pub fn account_relay_lists(
         &self,
         account_ref: String,
