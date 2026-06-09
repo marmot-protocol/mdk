@@ -125,6 +125,34 @@ just hermes-phone-test-bootstrap
 Use the provider secret and optional `HERMES_MODEL` or `HERMES_PROVIDER` settings that match your Hermes setup. The
 Compose service passes through common provider variables when they are set in your shell.
 
+The phone-test container patches `$HERMES_HOME/config.yaml` before starting the gateway. By default it enables Hermes
+gateway streaming for the Marmot platform and keeps tool/status chatter out of durable chat history:
+
+```sh
+HERMES_MARMOT_STREAMING=1 \
+HERMES_MARMOT_STREAMING_TRANSPORT=auto \
+HERMES_MARMOT_TOOL_PROGRESS=off \
+HERMES_MARMOT_INTERIM_MESSAGES=0 \
+HERMES_MARMOT_LONG_RUNNING_NOTIFICATIONS=0 \
+HERMES_MARMOT_BUSY_ACK_DETAIL=0 \
+just hermes-phone-test-up
+```
+
+To compare the final-message-only path, turn streaming off:
+
+```sh
+HERMES_MARMOT_STREAMING=0 just hermes-phone-test-up
+```
+
+To deliberately test Hermes tool-progress and interim-message behavior in the phone app, opt back in:
+
+```sh
+HERMES_MARMOT_TOOL_PROGRESS=all \
+HERMES_MARMOT_INTERIM_MESSAGES=1 \
+HERMES_MARMOT_LONG_RUNNING_NOTIFICATIONS=1 \
+just hermes-phone-test-up
+```
+
 The bootstrap command prints the agent account hex, `npub`, `nprofile`, relay hints, QUIC preview candidate, and QR
 code. The QR payload is the `nprofile`; QUIC preview candidates are printed for diagnostics and are still announced by
 Hermes in the first agent-stream start message. Run logs in another terminal while testing from the phone:
@@ -135,6 +163,11 @@ just hermes-phone-test-logs
 
 For this manual test the container starts `dm-agent` with `MARMOT_AGENT_ALLOW_ANY=1`, so the first phone invite can land
 without knowing the phone account id ahead of time. Use an explicit allowlist for a real deployment.
+
+In the phone-test container, `MARMOT_PROFILE_NAME_ONBOARDING=1` makes the Marmot Hermes adapter ask on the first
+encrypted chat message whether to publish a public Nostr profile name for the agent account. Reply with the name to
+publish it as kind-0 metadata, or reply `skip` to leave the agent unnamed. Outside this container path the prompt is
+opt-in; set `MARMOT_PROFILE_NAME_ONBOARDING=1` or plugin extra `profile_name_onboarding: true` to enable it.
 
 Stop the container without deleting the agent account:
 

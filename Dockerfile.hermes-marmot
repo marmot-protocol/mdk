@@ -31,6 +31,7 @@ COPY . .
 RUN cargo build --locked --release -p agent-connector --bin dm-agent \
     && install -m 0755 target/release/dm-agent /usr/local/bin/dm-agent \
     && install -m 0755 scripts/hermes_marmot_bootstrap_agent.py /usr/local/bin/marmot-agent-bootstrap \
+    && install -m 0755 scripts/hermes_marmot_configure_gateway.py /usr/local/bin/marmot-configure-hermes-gateway \
     && install -m 0755 scripts/hermes_marmot_container_entrypoint.sh /usr/local/bin/hermes-marmot-entrypoint \
     && ln -sfn /opt/hermes-agent/.venv/bin/hermes /usr/local/bin/hermes
 
@@ -42,6 +43,12 @@ ENV MARMOT_HOME=/data/marmot-agent \
     MARMOT_AGENT_SOCKET_MODE=0660 \
     MARMOT_RELAYS=wss://relay.eu.whiteniose.chat,wss://relay.us.whitenoise.chat \
     MARMOT_QUIC_CANDIDATES=quic://quic-broker.ipf.dev:4450 \
+    HERMES_MARMOT_STREAMING=1 \
+    HERMES_MARMOT_STREAMING_TRANSPORT=auto \
+    HERMES_MARMOT_TOOL_PROGRESS=off \
+    HERMES_MARMOT_INTERIM_MESSAGES=0 \
+    HERMES_MARMOT_LONG_RUNNING_NOTIFICATIONS=0 \
+    HERMES_MARMOT_BUSY_ACK_DETAIL=0 \
     PATH=/opt/hermes-agent/.venv/bin:/usr/local/cargo/bin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 VOLUME ["/data"]

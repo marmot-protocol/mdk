@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use cgka_traits::MessageId;
 use cgka_traits::agent_text_stream::{
     AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN, AGENT_TEXT_STREAM_MAX_STREAM_ID_LEN,
+    AGENT_TEXT_STREAM_RECORD_PROGRESS_DELTA, AGENT_TEXT_STREAM_RECORD_STATUS,
     AGENT_TEXT_STREAM_RECORD_TEXT_DELTA, AgentTextStreamRecordError, AgentTextStreamRecordV1,
     AgentTextStreamTranscriptV1,
 };
@@ -515,19 +516,16 @@ where
         }
         expected_seq += 1;
 
-        let delta = if record.record_type == AGENT_TEXT_STREAM_RECORD_TEXT_DELTA {
-            let delta = str::from_utf8(&record.plaintext_frame)?.to_owned();
-            text.push_str(&delta);
-            delta
-        } else {
-            String::new()
-        };
+        let frame_text = stream_record_text(&record)?;
+        if record.record_type == AGENT_TEXT_STREAM_RECORD_TEXT_DELTA {
+            text.push_str(&frame_text);
+        }
         transcript.append(record.seq, record.record_type, &record.plaintext_frame);
         let chunk = ReceivedTextChunk {
             seq: record.seq,
             record_type: record.record_type,
             flags: record.flags,
-            text: delta,
+            text: frame_text,
         };
         on_chunk(&chunk);
         chunks.push(chunk);
@@ -544,6 +542,17 @@ where
         transcript_hash: transcript.hash(),
         chunk_count: transcript.chunk_count(),
     })
+}
+
+fn stream_record_text(record: &AgentTextStreamRecordV1) -> Result<String, QuicBrokerError> {
+    match record.record_type {
+        AGENT_TEXT_STREAM_RECORD_TEXT_DELTA
+        | AGENT_TEXT_STREAM_RECORD_STATUS
+        | AGENT_TEXT_STREAM_RECORD_PROGRESS_DELTA => {
+            Ok(str::from_utf8(&record.plaintext_frame)?.to_owned())
+        }
+        _ => Ok(String::new()),
+    }
 }
 
 #[derive(Debug)]
@@ -1477,7 +1486,7 @@ mod tests {
             received.chunks[1].record_type,
             AGENT_TEXT_STREAM_RECORD_STATUS
         );
-        assert_eq!(received.chunks[1].text, "");
+        assert_eq!(received.chunks[1].text, "thinking");
         assert_eq!(sent.chunk_count, received.chunk_count);
         assert_eq!(sent.transcript_hash, received.transcript_hash);
 

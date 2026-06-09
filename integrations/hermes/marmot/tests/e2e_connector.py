@@ -159,6 +159,7 @@ async def run() -> None:
                     "socket_path": str(socket_path),
                     "account_id_hex": ACCOUNT_ID_HEX,
                     "group_id_hex": GROUP_ID_HEX,
+                    "profile_name_onboarding": False,
                 },
             )
             adapter = module.MarmotPlatformAdapter(config)

@@ -251,6 +251,23 @@ pub struct AgentTextStreamFinishRequest {
     pub finished_at: u64,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct AgentOperationEventRequest {
+    pub event_type: String,
+    pub status: String,
+    pub operation_id: Option<String>,
+    pub run_id: Option<String>,
+    pub turn_id: Option<String>,
+    pub name: Option<String>,
+    pub text: String,
+    pub preview: Option<String>,
+    pub details: Option<serde_json::Value>,
+    pub sequence: Option<u64>,
+    pub ok: Option<bool>,
+    pub duration_ms: Option<u64>,
+    pub reply_to_message_id: Option<String>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AppStatus {
     pub account: String,
@@ -5204,10 +5221,14 @@ mod tests {
     use super::*;
     use cgka_traits::Timestamp;
     use cgka_traits::app_event::{
-        EVENT_REF_TAG, MARMOT_APP_EVENT_KIND_AGENT_STREAM_START, MARMOT_APP_EVENT_KIND_CHAT,
-        MARMOT_APP_EVENT_KIND_DELETE, MARMOT_APP_EVENT_KIND_REACTION,
-        MarmotAppEvent as MarmotInnerEvent, QUOTE_REF_TAG, STREAM_CHUNKS_TAG,
-        STREAM_FINAL_KIND_TAG, STREAM_HASH_TAG, STREAM_START_TAG, STREAM_TAG, STREAM_TYPE_TAG,
+        AGENT_ACTIVITY_STATUS_TAG, AGENT_OPERATION_NAME_TAG, AGENT_OPERATION_STATUS_TAG,
+        AGENT_OPERATION_TYPE_TAG, EVENT_REF_TAG, GROUP_SYSTEM_TYPE_TAG,
+        MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY, MARMOT_APP_EVENT_KIND_AGENT_OPERATION,
+        MARMOT_APP_EVENT_KIND_AGENT_STREAM_START, MARMOT_APP_EVENT_KIND_CHAT,
+        MARMOT_APP_EVENT_KIND_DELETE, MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
+        MARMOT_APP_EVENT_KIND_REACTION, MarmotAppEvent as MarmotInnerEvent, QUOTE_REF_TAG,
+        STREAM_CHUNKS_TAG, STREAM_FINAL_KIND_TAG, STREAM_HASH_TAG, STREAM_START_TAG, STREAM_TAG,
+        STREAM_TYPE_TAG,
     };
     use marmot_account::AccountHomeError;
     use transport_quic_broker::BrokerServerTrust;
@@ -6384,6 +6405,88 @@ mod tests {
             Some(hex::encode([0xee; 32]).as_str())
         );
         assert_eq!(tag_value(&event.tags, STREAM_CHUNKS_TAG), Some("3"));
+    }
+
+    #[test]
+    fn agent_activity_intent_builds_kind_1201_json_payload() {
+        let event = build(AppMessageIntent::AgentActivity {
+            status: "thinking".to_owned(),
+            text: "Thinking".to_owned(),
+            reply_to_message_id: Some("parent".to_owned()),
+            extra: None,
+        });
+        assert_eq!(event.kind, MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY);
+        assert_eq!(
+            tag_value(&event.tags, AGENT_ACTIVITY_STATUS_TAG),
+            Some("thinking")
+        );
+        assert_eq!(tag_value(&event.tags, EVENT_REF_TAG), Some("parent"));
+        let content: serde_json::Value = serde_json::from_str(&event.content).unwrap();
+        assert_eq!(content["v"], 1);
+        assert_eq!(content["status"], "thinking");
+        assert_eq!(content["text"], "Thinking");
+    }
+
+    #[test]
+    fn agent_operation_intent_builds_kind_1202_json_payload() {
+        let event = build(AppMessageIntent::AgentOperation {
+            event_type: "tool_call".to_owned(),
+            status: "started".to_owned(),
+            operation_id: Some("call-123".to_owned()),
+            run_id: Some("run-1".to_owned()),
+            turn_id: Some("turn-1".to_owned()),
+            name: Some("search".to_owned()),
+            text: "Searching".to_owned(),
+            preview: Some("glp-1".to_owned()),
+            details: Some(serde_json::json!({"args": {"query": "glp-1"}})),
+            sequence: Some(2),
+            ok: None,
+            duration_ms: None,
+            reply_to_message_id: Some("parent".to_owned()),
+        });
+        assert_eq!(event.kind, MARMOT_APP_EVENT_KIND_AGENT_OPERATION);
+        assert_eq!(
+            tag_value(&event.tags, AGENT_OPERATION_STATUS_TAG),
+            Some("started")
+        );
+        assert_eq!(
+            tag_value(&event.tags, AGENT_OPERATION_TYPE_TAG),
+            Some("tool_call")
+        );
+        assert_eq!(
+            tag_value(&event.tags, AGENT_OPERATION_NAME_TAG),
+            Some("search")
+        );
+        assert_eq!(tag_value(&event.tags, EVENT_REF_TAG), Some("parent"));
+        let content: serde_json::Value = serde_json::from_str(&event.content).unwrap();
+        assert_eq!(content["event_type"], "tool_call");
+        assert_eq!(content["status"], "started");
+        assert_eq!(content["operation_id"], "call-123");
+        assert_eq!(content["run_id"], "run-1");
+        assert_eq!(content["turn_id"], "turn-1");
+        assert_eq!(content["name"], "search");
+        assert_eq!(content["preview"], "glp-1");
+        assert_eq!(content["details"]["args"]["query"], "glp-1");
+        assert_eq!(content["sequence"], 2);
+    }
+
+    #[test]
+    fn group_system_intent_builds_kind_1210_json_payload() {
+        let event = build(AppMessageIntent::GroupSystem {
+            system_type: "member_added".to_owned(),
+            text: "Member added".to_owned(),
+            data: Some(serde_json::json!({"member": "alice"})),
+        });
+        assert_eq!(event.kind, MARMOT_APP_EVENT_KIND_GROUP_SYSTEM);
+        assert_eq!(
+            tag_value(&event.tags, GROUP_SYSTEM_TYPE_TAG),
+            Some("member_added")
+        );
+        let content: serde_json::Value = serde_json::from_str(&event.content).unwrap();
+        assert_eq!(content["system_type"], "member_added");
+        assert_eq!(content["text"], "Member added");
+        assert_eq!(content["data"]["member"], "alice");
+        assert!(content.get("status").is_none());
     }
 
     #[test]

@@ -4,8 +4,9 @@ use std::collections::VecDeque;
 use std::time::Duration;
 
 use cgka_traits::agent_text_stream::{
-    AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN, AGENT_TEXT_STREAM_RECORD_STATUS,
-    AGENT_TEXT_STREAM_RECORD_TEXT_DELTA, AgentTextStreamTranscriptV1,
+    AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN, AGENT_TEXT_STREAM_RECORD_PROGRESS_DELTA,
+    AGENT_TEXT_STREAM_RECORD_STATUS, AGENT_TEXT_STREAM_RECORD_TEXT_DELTA,
+    AgentTextStreamTranscriptV1,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
@@ -32,6 +33,10 @@ pub enum StreamComposeCommand {
     },
     Status {
         status: String,
+        respond: oneshot::Sender<Result<StreamComposeReport, String>>,
+    },
+    Progress {
+        text: String,
         respond: oneshot::Sender<Result<StreamComposeReport, String>>,
     },
     Finish {
@@ -116,6 +121,19 @@ pub async fn run_stream_compose_session(
                     &mut pending_live_records,
                     &mut live_error,
                     status,
+                    chunk_bytes,
+                )
+                .await;
+                let _ = respond.send(result);
+            }
+            StreamComposeCommand::Progress { text, respond } => {
+                let result = append_stream_compose_progress(
+                    &mut report,
+                    &mut transcript,
+                    &mut publisher,
+                    &mut pending_live_records,
+                    &mut live_error,
+                    text,
                     chunk_bytes,
                 )
                 .await;
@@ -248,21 +266,74 @@ async fn append_stream_compose_status(
     status: String,
     chunk_bytes: usize,
 ) -> Result<StreamComposeReport, String> {
-    transcript.append_record_text(AGENT_TEXT_STREAM_RECORD_STATUS, &status, chunk_bytes)?;
     report.status.clone_from(&status);
-    report.chunk_count = transcript.chunk_count();
-    report.transcript_hash = Some(transcript.transcript_hash());
-
-    append_live_record(
-        publisher,
-        pending_live_records,
-        live_error,
+    append_stream_compose_non_text_record(
+        report,
+        transcript,
+        ComposeLiveSink {
+            publisher,
+            pending_live_records,
+            live_error,
+        },
         AGENT_TEXT_STREAM_RECORD_STATUS,
         status,
         chunk_bytes,
     )
+    .await
+}
+
+async fn append_stream_compose_progress(
+    report: &mut StreamComposeReport,
+    transcript: &mut LocalComposeTranscript,
+    publisher: &mut Option<BrokerTextPublisher>,
+    pending_live_records: &mut VecDeque<PendingComposeRecord>,
+    live_error: &mut Option<String>,
+    text: String,
+    chunk_bytes: usize,
+) -> Result<StreamComposeReport, String> {
+    append_stream_compose_non_text_record(
+        report,
+        transcript,
+        ComposeLiveSink {
+            publisher,
+            pending_live_records,
+            live_error,
+        },
+        AGENT_TEXT_STREAM_RECORD_PROGRESS_DELTA,
+        text,
+        chunk_bytes,
+    )
+    .await
+}
+
+struct ComposeLiveSink<'a> {
+    publisher: &'a mut Option<BrokerTextPublisher>,
+    pending_live_records: &'a mut VecDeque<PendingComposeRecord>,
+    live_error: &'a mut Option<String>,
+}
+
+async fn append_stream_compose_non_text_record(
+    report: &mut StreamComposeReport,
+    transcript: &mut LocalComposeTranscript,
+    live: ComposeLiveSink<'_>,
+    record_type: u8,
+    text: String,
+    chunk_bytes: usize,
+) -> Result<StreamComposeReport, String> {
+    transcript.append_record_text(record_type, &text, chunk_bytes)?;
+    report.chunk_count = transcript.chunk_count();
+    report.transcript_hash = Some(transcript.transcript_hash());
+
+    append_live_record(
+        live.publisher,
+        live.pending_live_records,
+        live.live_error,
+        record_type,
+        text,
+        chunk_bytes,
+    )
     .await;
-    if let Some(err) = live_error {
+    if let Some(err) = live.live_error.as_deref() {
         report.error = Some(format!("live stream failed: {err}"));
     }
 
@@ -354,8 +425,8 @@ mod tests {
 
     use cgka_traits::MessageId;
     use cgka_traits::agent_text_stream::{
-        AGENT_TEXT_STREAM_RECORD_STATUS, AGENT_TEXT_STREAM_RECORD_TEXT_DELTA,
-        AgentTextStreamTranscriptV1,
+        AGENT_TEXT_STREAM_RECORD_PROGRESS_DELTA, AGENT_TEXT_STREAM_RECORD_STATUS,
+        AGENT_TEXT_STREAM_RECORD_TEXT_DELTA, AgentTextStreamTranscriptV1,
     };
     use tokio::sync::{mpsc, oneshot};
     use transport_quic_broker::{BrokerServerTrust, OpenBrokerTextPublisher};
@@ -598,6 +669,80 @@ mod tests {
 
         assert_eq!(finished.status, "finished");
         assert_eq!(finished.text, "hello");
+        assert_eq!(finished.chunk_count, 2);
+        assert_eq!(
+            finished.transcript_hash.as_deref(),
+            Some(expected_hash.as_str())
+        );
+
+        session.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn compose_session_progress_updates_transcript_without_changing_text() {
+        let stream_id = vec![0x9a; 32];
+        let start_event_id = MessageId::new(vec![0x9b; 32]);
+        let open = test_stream_compose_open(stream_id.clone(), start_event_id.clone());
+        let report = test_stream_compose_report(&stream_id);
+        let (tx, rx) = mpsc::channel(4);
+        let session = tokio::spawn(run_stream_compose_session(open, 16, rx, report));
+
+        let (append_respond, append_response) = oneshot::channel();
+        tx.send(StreamComposeCommand::Append {
+            text: "answer".to_owned(),
+            respond: append_respond,
+        })
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_millis(250), append_response)
+            .await
+            .expect("append should complete")
+            .unwrap()
+            .unwrap();
+
+        let (progress_respond, progress_response) = oneshot::channel();
+        tx.send(StreamComposeCommand::Progress {
+            text: "search: glp-1".to_owned(),
+            respond: progress_respond,
+        })
+        .await
+        .unwrap();
+        let progress_report = tokio::time::timeout(Duration::from_millis(250), progress_response)
+            .await
+            .expect("progress should complete")
+            .unwrap()
+            .unwrap();
+
+        let expected_hash = expected_stream_transcript_hash_for_records(
+            &stream_id,
+            &start_event_id,
+            &[
+                (AGENT_TEXT_STREAM_RECORD_TEXT_DELTA, "answer"),
+                (AGENT_TEXT_STREAM_RECORD_PROGRESS_DELTA, "search: glp-1"),
+            ],
+            16,
+        );
+        assert_eq!(progress_report.text, "answer");
+        assert_eq!(progress_report.chunk_count, 2);
+        assert_eq!(
+            progress_report.transcript_hash.as_deref(),
+            Some(expected_hash.as_str())
+        );
+
+        let (finish_respond, finish_response) = oneshot::channel();
+        tx.send(StreamComposeCommand::Finish {
+            respond: finish_respond,
+        })
+        .await
+        .unwrap();
+        let finished = tokio::time::timeout(Duration::from_millis(250), finish_response)
+            .await
+            .expect("finish should complete")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(finished.status, "finished");
+        assert_eq!(finished.text, "answer");
         assert_eq!(finished.chunk_count, 2);
         assert_eq!(
             finished.transcript_hash.as_deref(),

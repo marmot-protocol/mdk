@@ -18,7 +18,8 @@ use agent_stream_compose::{StreamComposeCommand, StreamComposeReport, run_stream
 use cgka_traits::{GroupId, MessageId, engine::GroupEvent};
 use marmot_account::{AccountHome, AccountHomeError, AccountSummary};
 use marmot_app::{
-    AgentTextStreamFinishRequest, AppError, MarmotApp, MarmotAppEvent, MarmotAppRuntime,
+    AccountRelayListBootstrap, AgentOperationEventRequest, AgentTextStreamFinishRequest, AppError,
+    MarmotApp, MarmotAppEvent, MarmotAppRuntime, UserProfileMetadata,
 };
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncWrite, BufReader};
@@ -32,6 +33,7 @@ const ALLOWLIST_DIR: &str = "agent-allowlist";
 const STREAM_COMPOSE_CHANNEL_DEPTH: usize = 32;
 const STREAM_COMPOSE_CHUNK_BYTES: usize = 1024;
 const INBOUND_CATCH_UP_INTERVAL: Duration = Duration::from_secs(5);
+const MAX_PROFILE_NAME_CHARS: usize = 80;
 
 #[derive(Clone, Debug)]
 pub struct AgentConnectorConfig {
@@ -301,6 +303,10 @@ impl AgentConnector {
                 stream_id_hex,
                 status,
             } => self.stream_status_response(&stream_id_hex, status).await,
+            AgentControlRequest::StreamProgress {
+                stream_id_hex,
+                text,
+            } => self.stream_progress_response(&stream_id_hex, text).await,
             AgentControlRequest::StreamFinalize {
                 stream_id_hex,
                 final_text,
@@ -332,6 +338,84 @@ impl AgentConnector {
                     account_id_hex,
                     key_package_bytes,
                 })
+            }
+            AgentControlRequest::AccountPublishProfile {
+                account_id_hex,
+                name,
+                display_name,
+            } => {
+                self.publish_profile_response(&account_id_hex, name, display_name)
+                    .await
+            }
+            AgentControlRequest::SendAgentActivity {
+                account_id_hex,
+                group_id_hex,
+                status,
+                text,
+                reply_to_message_id_hex,
+                extra,
+            } => {
+                self.send_agent_activity_response(
+                    &account_id_hex,
+                    &group_id_hex,
+                    status,
+                    text,
+                    reply_to_message_id_hex,
+                    extra,
+                )
+                .await
+            }
+            AgentControlRequest::SendAgentOperationEvent {
+                account_id_hex,
+                group_id_hex,
+                event_type,
+                status,
+                operation_id,
+                run_id,
+                turn_id,
+                name,
+                text,
+                preview,
+                details,
+                sequence,
+                ok,
+                duration_ms,
+                reply_to_message_id_hex,
+            } => {
+                self.send_agent_operation_event_response(
+                    &account_id_hex,
+                    &group_id_hex,
+                    event_type,
+                    status,
+                    operation_id,
+                    run_id,
+                    turn_id,
+                    name,
+                    text,
+                    preview,
+                    details,
+                    sequence,
+                    ok,
+                    duration_ms,
+                    reply_to_message_id_hex,
+                )
+                .await
+            }
+            AgentControlRequest::SendGroupSystemEvent {
+                account_id_hex,
+                group_id_hex,
+                system_type,
+                text,
+                data,
+            } => {
+                self.send_group_system_event_response(
+                    &account_id_hex,
+                    &group_id_hex,
+                    system_type,
+                    text,
+                    data,
+                )
+                .await
             }
             other => Ok(AgentControlResponse::Error {
                 code: "unsupported_request".to_owned(),
@@ -372,6 +456,39 @@ impl AgentConnector {
                 label: account.label,
                 local_signing: account.local_signing,
             },
+        })
+    }
+
+    async fn publish_profile_response(
+        &self,
+        account_id_hex: &str,
+        name: String,
+        display_name: Option<String>,
+    ) -> Result<AgentControlResponse, ConnectorError> {
+        let account = self.local_account_for_account_id(account_id_hex)?;
+        let name = validate_profile_name(name)?;
+        let display_name = display_name
+            .map(validate_profile_name)
+            .transpose()?
+            .unwrap_or_else(|| name.clone());
+        let bootstrap_relays = self.configured_relay_endpoints();
+        let profile = UserProfileMetadata {
+            name: Some(name.clone()),
+            display_name: Some(display_name.clone()),
+            created_at: unix_now_seconds(),
+            ..UserProfileMetadata::default()
+        };
+        self.runtime
+            .publish_user_profile(
+                &account.label,
+                profile,
+                AccountRelayListBootstrap::new(bootstrap_relays.clone(), bootstrap_relays),
+            )
+            .await?;
+        Ok(AgentControlResponse::ProfilePublished {
+            account_id_hex: account.account_id_hex,
+            name,
+            display_name: Some(display_name),
         })
     }
 
@@ -646,6 +763,128 @@ impl AgentConnector {
             .map_err(|err| ConnectorError::Stream(err.to_string()))?
             .map_err(ConnectorError::Stream)?;
         Ok(AgentControlResponse::Ack)
+    }
+
+    async fn stream_progress_response(
+        &self,
+        stream_id_hex: &str,
+        text: String,
+    ) -> Result<AgentControlResponse, ConnectorError> {
+        let session = self.streams.get(stream_id_hex)?;
+        let (respond, response) = oneshot::channel();
+        session
+            .tx
+            .send(StreamComposeCommand::Progress { text, respond })
+            .await
+            .map_err(|_| ConnectorError::Stream("stream compose session is closed".into()))?;
+        response
+            .await
+            .map_err(|err| ConnectorError::Stream(err.to_string()))?
+            .map_err(ConnectorError::Stream)?;
+        Ok(AgentControlResponse::Ack)
+    }
+
+    async fn send_agent_activity_response(
+        &self,
+        account_id_hex: &str,
+        group_id_hex: &str,
+        status: String,
+        text: String,
+        reply_to_message_id_hex: Option<String>,
+        extra: Option<serde_json::Value>,
+    ) -> Result<AgentControlResponse, ConnectorError> {
+        let account = self.local_account_for_account_id(account_id_hex)?;
+        let group_id_hex = normalize_hex(group_id_hex)?;
+        let group_id = GroupId::new(hex::decode(&group_id_hex)?);
+        let reply_to_message_id_hex = reply_to_message_id_hex
+            .map(|value| normalize_hex(&value))
+            .transpose()?;
+        let summary = self
+            .runtime
+            .send_agent_activity(
+                &account.label,
+                &group_id,
+                status,
+                text,
+                reply_to_message_id_hex,
+                extra,
+            )
+            .await?;
+        Ok(AgentControlResponse::AppEventSent {
+            message_ids_hex: summary.message_ids,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn send_agent_operation_event_response(
+        &self,
+        account_id_hex: &str,
+        group_id_hex: &str,
+        event_type: String,
+        status: String,
+        operation_id: Option<String>,
+        run_id: Option<String>,
+        turn_id: Option<String>,
+        name: Option<String>,
+        text: String,
+        preview: Option<String>,
+        details: Option<serde_json::Value>,
+        sequence: Option<u64>,
+        ok: Option<bool>,
+        duration_ms: Option<u64>,
+        reply_to_message_id_hex: Option<String>,
+    ) -> Result<AgentControlResponse, ConnectorError> {
+        let account = self.local_account_for_account_id(account_id_hex)?;
+        let group_id_hex = normalize_hex(group_id_hex)?;
+        let group_id = GroupId::new(hex::decode(&group_id_hex)?);
+        let reply_to_message_id_hex = reply_to_message_id_hex
+            .map(|value| normalize_hex(&value))
+            .transpose()?;
+        let summary = self
+            .runtime
+            .send_agent_operation_event(
+                &account.label,
+                &group_id,
+                AgentOperationEventRequest {
+                    event_type,
+                    status,
+                    operation_id,
+                    run_id,
+                    turn_id,
+                    name,
+                    text,
+                    preview,
+                    details,
+                    sequence,
+                    ok,
+                    duration_ms,
+                    reply_to_message_id: reply_to_message_id_hex,
+                },
+            )
+            .await?;
+        Ok(AgentControlResponse::AppEventSent {
+            message_ids_hex: summary.message_ids,
+        })
+    }
+
+    async fn send_group_system_event_response(
+        &self,
+        account_id_hex: &str,
+        group_id_hex: &str,
+        system_type: String,
+        text: String,
+        data: Option<serde_json::Value>,
+    ) -> Result<AgentControlResponse, ConnectorError> {
+        let account = self.local_account_for_account_id(account_id_hex)?;
+        let group_id_hex = normalize_hex(group_id_hex)?;
+        let group_id = GroupId::new(hex::decode(&group_id_hex)?);
+        let summary = self
+            .runtime
+            .send_group_system_event(&account.label, &group_id, system_type, text, data)
+            .await?;
+        Ok(AgentControlResponse::AppEventSent {
+            message_ids_hex: summary.message_ids,
+        })
     }
 
     async fn stream_finalize_response(
@@ -1268,6 +1507,8 @@ pub enum ConnectorError {
     UnsafeControlPlaneConfig(&'static str),
     #[error("agent stream error: {0}")]
     Stream(String),
+    #[error("invalid profile name: {0}")]
+    InvalidProfileName(&'static str),
 }
 
 impl ConnectorError {
@@ -1283,6 +1524,7 @@ impl ConnectorError {
             Self::Unauthorized => "unauthorized",
             Self::UnsafeControlPlaneConfig(_) => "unsafe_control_plane_config",
             Self::Stream(_) => "stream_error",
+            Self::InvalidProfileName(_) => "invalid_profile_name",
         }
     }
 
@@ -1294,6 +1536,7 @@ impl ConnectorError {
             Self::Hex(_) => "invalid hex value",
             Self::Json(_) | Self::Control(_) => "invalid control request",
             Self::Stream(_) => "agent stream request failed",
+            Self::InvalidProfileName(_) => "invalid profile name",
             Self::Io(_) => "connector I/O failed",
             Self::AccountHome(_) | Self::App(_) => "connector request failed",
         }
@@ -1431,6 +1674,17 @@ fn auth_token_matches(expected: &str, provided: Option<&str>) -> bool {
 
 fn endpoint(url: &str) -> cgka_traits::TransportEndpoint {
     cgka_traits::TransportEndpoint(url.to_owned())
+}
+
+fn validate_profile_name(value: String) -> Result<String, ConnectorError> {
+    let value = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if value.is_empty() {
+        return Err(ConnectorError::InvalidProfileName("empty"));
+    }
+    if value.chars().count() > MAX_PROFILE_NAME_CHARS {
+        return Err(ConnectorError::InvalidProfileName("too_long"));
+    }
+    Ok(value)
 }
 
 #[cfg(test)]
@@ -2263,6 +2517,74 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(key_package_bytes, fetched.key_package.bytes().len());
+
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn connector_socket_publishes_profile_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let relay = MockRelay::run().await.unwrap();
+        let relay_url = relay.url().await.to_string();
+        let account_home = AccountHome::open(dir.path());
+        let account = account_home.create_account("agent").unwrap();
+        let app = MarmotApp::with_relay(dir.path(), relay_url.clone());
+        let socket = dir.path().join("dev").join("dm-agent.sock");
+        let connector = AgentConnector::open(test_config(
+            dir.path(),
+            socket.clone(),
+            vec![relay_url.clone()],
+            false,
+            false,
+        ))
+        .unwrap();
+        let listener = bind_connector_socket(&socket).unwrap();
+        let server = tokio::spawn(async move { connector.serve_once(&listener).await });
+
+        let client = UnixStream::connect(&socket).await.unwrap();
+        let (client_read, mut client_write) = tokio::io::split(client);
+        let mut client_read = BufReader::new(client_read);
+        let request = AgentControlEnvelope::request(
+            Some("req-profile".to_owned()),
+            AgentControlRequest::AccountPublishProfile {
+                account_id_hex: account.account_id_hex.clone(),
+                name: "  Hermes Agent  ".to_owned(),
+                display_name: None,
+            },
+        );
+        write_frame(&mut client_write, &request).await.unwrap();
+
+        let response: AgentControlEnvelope<AgentControlResponse> =
+            read_envelope(&mut client_read).await.unwrap().unwrap();
+        assert_eq!(response.id.as_deref(), Some("req-profile"));
+        let AgentControlResponse::ProfilePublished {
+            account_id_hex,
+            name,
+            display_name,
+        } = response.payload.clone()
+        else {
+            panic!(
+                "expected profile published response, got {:?}",
+                response.payload
+            );
+        };
+        assert_eq!(account_id_hex, account.account_id_hex);
+        assert_eq!(name, "Hermes Agent");
+        assert_eq!(display_name.as_deref(), Some("Hermes Agent"));
+
+        app.refresh_profile_for_account_id(
+            &account.account_id_hex,
+            vec![crate::endpoint(&relay_url)],
+        )
+        .await
+        .unwrap();
+        let profile = app
+            .directory_entry_for_account_id(&account.account_id_hex)
+            .unwrap()
+            .and_then(|entry| entry.profile)
+            .expect("published profile");
+        assert_eq!(profile.name.as_deref(), Some("Hermes Agent"));
+        assert_eq!(profile.display_name.as_deref(), Some("Hermes Agent"));
 
         server.await.unwrap().unwrap();
     }

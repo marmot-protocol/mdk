@@ -1,11 +1,15 @@
 use cgka_traits::agent_text_stream::AGENT_TEXT_STREAM_PROFILE_STREAM_ID_LEN;
 use cgka_traits::app_event::{
-    EVENT_REF_TAG, MARMOT_APP_EVENT_KIND_AGENT_STREAM_START, MARMOT_APP_EVENT_KIND_CHAT,
-    MARMOT_APP_EVENT_KIND_DELETE, MARMOT_APP_EVENT_KIND_REACTION,
-    MarmotAppEvent as MarmotInnerEvent, QUOTE_REF_TAG, STREAM_BROKER_TAG, STREAM_CHUNKS_TAG,
-    STREAM_FINAL_KIND_TAG, STREAM_HASH_TAG, STREAM_ROUTE_TAG, STREAM_START_TAG, STREAM_TAG,
-    STREAM_TYPE_TAG,
+    AGENT_ACTIVITY_STATUS_TAG, AGENT_OPERATION_NAME_TAG, AGENT_OPERATION_STATUS_TAG,
+    AGENT_OPERATION_TYPE_TAG, EVENT_REF_TAG, GROUP_SYSTEM_TYPE_TAG,
+    MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY, MARMOT_APP_EVENT_KIND_AGENT_OPERATION,
+    MARMOT_APP_EVENT_KIND_AGENT_STREAM_START, MARMOT_APP_EVENT_KIND_CHAT,
+    MARMOT_APP_EVENT_KIND_DELETE, MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
+    MARMOT_APP_EVENT_KIND_REACTION, MarmotAppEvent as MarmotInnerEvent, QUOTE_REF_TAG,
+    STREAM_BROKER_TAG, STREAM_CHUNKS_TAG, STREAM_FINAL_KIND_TAG, STREAM_HASH_TAG, STREAM_ROUTE_TAG,
+    STREAM_START_TAG, STREAM_TAG, STREAM_TYPE_TAG,
 };
+use serde_json::{Map, Value, json};
 
 use crate::{AgentTextStreamFinishRequest, AppError, MediaAttachmentReference};
 use crate::{MARMOT_APP_EVENT_KIND_PUSH_TOKEN_REMOVAL, MARMOT_APP_EVENT_KIND_PUSH_TOKEN_UPDATE};
@@ -48,6 +52,32 @@ pub(crate) enum AppMessageIntent {
     },
     StreamFinal {
         request: AgentTextStreamFinishRequest,
+    },
+    AgentActivity {
+        status: String,
+        text: String,
+        reply_to_message_id: Option<String>,
+        extra: Option<Value>,
+    },
+    AgentOperation {
+        event_type: String,
+        status: String,
+        operation_id: Option<String>,
+        run_id: Option<String>,
+        turn_id: Option<String>,
+        name: Option<String>,
+        text: String,
+        preview: Option<String>,
+        details: Option<Value>,
+        sequence: Option<u64>,
+        ok: Option<bool>,
+        duration_ms: Option<u64>,
+        reply_to_message_id: Option<String>,
+    },
+    GroupSystem {
+        system_type: String,
+        text: String,
+        data: Option<Value>,
     },
     PushTokenUpdate {
         content: String,
@@ -227,6 +257,111 @@ pub(crate) fn build_inner_event(
                 request.final_text_or_reference.clone(),
             ))
         }
+        AppMessageIntent::AgentActivity {
+            status,
+            text,
+            reply_to_message_id,
+            extra,
+        } => {
+            let status = validate_non_empty_field(status, "agent activity status")?;
+            let mut tags = vec![vec![AGENT_ACTIVITY_STATUS_TAG.to_owned(), status.clone()]];
+            if let Some(target_message_id) = optional_message_ref(reply_to_message_id)? {
+                tags.push(event_ref_tag(&target_message_id));
+            }
+            let mut content = app_payload_base(status.clone(), text.clone());
+            if let Some(extra) = extra {
+                content.insert("extra".to_owned(), extra.clone());
+            }
+            Ok(event(
+                MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY,
+                tags,
+                Value::Object(content).to_string(),
+            ))
+        }
+        AppMessageIntent::AgentOperation {
+            event_type,
+            status,
+            operation_id,
+            run_id,
+            turn_id,
+            name,
+            text,
+            preview,
+            details,
+            sequence,
+            ok,
+            duration_ms,
+            reply_to_message_id,
+        } => {
+            let event_type = validate_non_empty_field(event_type, "agent operation type")?;
+            let status = validate_non_empty_field(status, "agent operation status")?;
+            let mut tags = vec![
+                vec![AGENT_OPERATION_TYPE_TAG.to_owned(), event_type.clone()],
+                vec![AGENT_OPERATION_STATUS_TAG.to_owned(), status.clone()],
+            ];
+            if let Some(name) = optional_non_empty_field(name) {
+                tags.push(vec![AGENT_OPERATION_NAME_TAG.to_owned(), name.to_owned()]);
+            }
+            if let Some(target_message_id) = optional_message_ref(reply_to_message_id)? {
+                tags.push(event_ref_tag(&target_message_id));
+            }
+            let mut content = app_payload_base(status.clone(), text.clone());
+            content.insert("event_type".to_owned(), Value::String(event_type));
+            if let Some(operation_id) = optional_non_empty_field(operation_id) {
+                content.insert(
+                    "operation_id".to_owned(),
+                    Value::String(operation_id.to_owned()),
+                );
+            }
+            if let Some(run_id) = optional_non_empty_field(run_id) {
+                content.insert("run_id".to_owned(), Value::String(run_id.to_owned()));
+            }
+            if let Some(turn_id) = optional_non_empty_field(turn_id) {
+                content.insert("turn_id".to_owned(), Value::String(turn_id.to_owned()));
+            }
+            if let Some(name) = optional_non_empty_field(name) {
+                content.insert("name".to_owned(), Value::String(name.to_owned()));
+            }
+            if let Some(preview) = optional_non_empty_field(preview) {
+                content.insert("preview".to_owned(), Value::String(preview.to_owned()));
+            }
+            if let Some(details) = details {
+                content.insert("details".to_owned(), details.clone());
+            }
+            if let Some(sequence) = sequence {
+                content.insert("sequence".to_owned(), json!(sequence));
+            }
+            if let Some(ok) = ok {
+                content.insert("ok".to_owned(), json!(ok));
+            }
+            if let Some(duration_ms) = duration_ms {
+                content.insert("duration_ms".to_owned(), json!(duration_ms));
+            }
+            Ok(event(
+                MARMOT_APP_EVENT_KIND_AGENT_OPERATION,
+                tags,
+                Value::Object(content).to_string(),
+            ))
+        }
+        AppMessageIntent::GroupSystem {
+            system_type,
+            text,
+            data,
+        } => {
+            let system_type = validate_non_empty_field(system_type, "group system type")?;
+            let mut content = Map::new();
+            content.insert("v".to_owned(), json!(1));
+            content.insert("system_type".to_owned(), Value::String(system_type.clone()));
+            content.insert("text".to_owned(), Value::String(text.clone()));
+            if let Some(data) = data {
+                content.insert("data".to_owned(), data.clone());
+            }
+            Ok(event(
+                MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
+                vec![vec![GROUP_SYSTEM_TYPE_TAG.to_owned(), system_type]],
+                Value::Object(content).to_string(),
+            ))
+        }
         AppMessageIntent::PushTokenUpdate { content } => Ok(event(
             MARMOT_APP_EVENT_KIND_PUSH_TOKEN_UPDATE,
             vec![vec!["v".to_owned(), crate::MIP05_VERSION.to_owned()]],
@@ -251,6 +386,39 @@ fn validate_message_ref(target_message_id: &str) -> Result<(), AppError> {
         ));
     }
     Ok(())
+}
+
+fn validate_non_empty_field(value: &str, field: &str) -> Result<String, AppError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(AppError::InvalidAppMessagePayload(format!(
+            "{field} cannot be empty"
+        )));
+    }
+    Ok(trimmed.to_owned())
+}
+
+fn optional_non_empty_field(value: &Option<String>) -> Option<&str> {
+    value
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn optional_message_ref(value: &Option<String>) -> Result<Option<String>, AppError> {
+    let Some(value) = optional_non_empty_field(value) else {
+        return Ok(None);
+    };
+    validate_message_ref(value)?;
+    Ok(Some(value.to_owned()))
+}
+
+fn app_payload_base(kind_or_status: String, text: String) -> Map<String, Value> {
+    let mut content = Map::new();
+    content.insert("v".to_owned(), json!(1));
+    content.insert("status".to_owned(), Value::String(kind_or_status));
+    content.insert("text".to_owned(), Value::String(text));
+    content
 }
 
 /// Encode a built inner event into MLS application-message plaintext bytes.

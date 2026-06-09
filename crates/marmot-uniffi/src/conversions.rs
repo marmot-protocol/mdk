@@ -757,6 +757,19 @@ pub enum AgentStreamUpdateFfi {
         seq: u64,
         text: String,
     },
+    Status {
+        seq: u64,
+        status: String,
+    },
+    Progress {
+        seq: u64,
+        text: String,
+    },
+    Record {
+        seq: u64,
+        record_type: u8,
+        text: String,
+    },
     Finished {
         text: String,
         transcript_hash_hex: String,
@@ -771,6 +784,17 @@ impl From<RuntimeAgentStreamUpdate> for AgentStreamUpdateFfi {
     fn from(value: RuntimeAgentStreamUpdate) -> Self {
         match value {
             RuntimeAgentStreamUpdate::Chunk { seq, text } => Self::Chunk { seq, text },
+            RuntimeAgentStreamUpdate::Status { seq, status } => Self::Status { seq, status },
+            RuntimeAgentStreamUpdate::Progress { seq, text } => Self::Progress { seq, text },
+            RuntimeAgentStreamUpdate::Record {
+                seq,
+                record_type,
+                text,
+            } => Self::Record {
+                seq,
+                record_type,
+                text,
+            },
             RuntimeAgentStreamUpdate::Finished {
                 text,
                 transcript_hash_hex,
@@ -1186,6 +1210,9 @@ pub enum TimelineUpdateTriggerFfi {
     ReplyPreviewChanged,
     AgentStreamStarted,
     AgentStreamFinished,
+    AgentActivity,
+    AgentOperation,
+    GroupSystem,
     DeliveryOrSendStateChanged,
     ReceiptChanged,
     SnapshotRefresh,
@@ -1202,6 +1229,9 @@ impl From<TimelineUpdateTrigger> for TimelineUpdateTriggerFfi {
             TimelineUpdateTrigger::ReplyPreviewChanged => Self::ReplyPreviewChanged,
             TimelineUpdateTrigger::AgentStreamStarted => Self::AgentStreamStarted,
             TimelineUpdateTrigger::AgentStreamFinished => Self::AgentStreamFinished,
+            TimelineUpdateTrigger::AgentActivity => Self::AgentActivity,
+            TimelineUpdateTrigger::AgentOperation => Self::AgentOperation,
+            TimelineUpdateTrigger::GroupSystem => Self::GroupSystem,
             TimelineUpdateTrigger::DeliveryOrSendStateChanged => Self::DeliveryOrSendStateChanged,
             TimelineUpdateTrigger::ReceiptChanged => Self::ReceiptChanged,
             TimelineUpdateTrigger::SnapshotRefresh => Self::SnapshotRefresh,

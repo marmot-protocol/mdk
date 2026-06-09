@@ -20,11 +20,19 @@ pub const MARMOT_APP_EVENT_KIND_DELETE: u64 = 5;
 pub const MARMOT_APP_EVENT_KIND_REACTION: u64 = 7;
 pub const MARMOT_APP_EVENT_KIND_CHAT: u64 = 9;
 pub const MARMOT_APP_EVENT_KIND_AGENT_STREAM_START: u64 = 1200;
+pub const MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY: u64 = 1201;
+pub const MARMOT_APP_EVENT_KIND_AGENT_OPERATION: u64 = 1202;
+pub const MARMOT_APP_EVENT_KIND_GROUP_SYSTEM: u64 = 1210;
 
 /// Tag names. `e`/`q` are standard Nostr reference tags; the `stream-*` set is
 /// owned by the agent-text-stream feature.
 pub const EVENT_REF_TAG: &str = "e";
 pub const QUOTE_REF_TAG: &str = "q";
+pub const AGENT_ACTIVITY_STATUS_TAG: &str = "status";
+pub const AGENT_OPERATION_TYPE_TAG: &str = "operation";
+pub const AGENT_OPERATION_NAME_TAG: &str = "operation-name";
+pub const AGENT_OPERATION_STATUS_TAG: &str = "operation-status";
+pub const GROUP_SYSTEM_TYPE_TAG: &str = "system";
 pub const STREAM_TAG: &str = "stream";
 pub const STREAM_TYPE_TAG: &str = "stream-type";
 pub const STREAM_FINAL_KIND_TAG: &str = "final-kind";

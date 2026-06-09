@@ -31,14 +31,14 @@ use crate::media::{
 use crate::messages::{AppMessageIntent, build_inner_event, encode_inner_event, tag_value};
 use crate::notifications;
 use crate::{
-    AccountState, AgentTextStreamFinishRequest, AppAgentTextStreamComponent, AppBlobEndpoint,
-    AppError, AppGroupAdminPolicyComponent, AppGroupAvatarUrlComponent,
-    AppGroupEncryptedMediaComponent, AppGroupMemberRecord, AppGroupMessageRetentionComponent,
-    AppGroupMlsState, AppGroupNostrRoutingComponent, AppGroupRecord, AppMessageProjection,
-    AppMessageQuery, AppRuntime, AppTransportRouting, GroupInviteDeclineResult, MarmotApp,
-    MarmotRelayPlane, MarmotRelayPlaneAccountAdapter, MediaAttachmentReference,
-    MediaDownloadResult, MediaUploadRequest, MediaUploadResult, SDK_DRAIN_WAIT,
-    SDK_FIRST_SYNC_WAIT, SendSummary, SyncSummary, refresh_seen_lookup_if_needed,
+    AccountState, AgentOperationEventRequest, AgentTextStreamFinishRequest,
+    AppAgentTextStreamComponent, AppBlobEndpoint, AppError, AppGroupAdminPolicyComponent,
+    AppGroupAvatarUrlComponent, AppGroupEncryptedMediaComponent, AppGroupMemberRecord,
+    AppGroupMessageRetentionComponent, AppGroupMlsState, AppGroupNostrRoutingComponent,
+    AppGroupRecord, AppMessageProjection, AppMessageQuery, AppRuntime, AppTransportRouting,
+    GroupInviteDeclineResult, MarmotApp, MarmotRelayPlane, MarmotRelayPlaneAccountAdapter,
+    MediaAttachmentReference, MediaDownloadResult, MediaUploadRequest, MediaUploadResult,
+    SDK_DRAIN_WAIT, SDK_FIRST_SYNC_WAIT, SendSummary, SyncSummary, refresh_seen_lookup_if_needed,
     remember_seen_event, unix_now_seconds,
 };
 pub struct AppClient {
@@ -1056,6 +1056,91 @@ impl AppClient {
         .await
     }
 
+    pub async fn send_agent_activity(
+        &mut self,
+        group_id: &GroupId,
+        status: String,
+        text: String,
+        reply_to_message_id: Option<String>,
+        extra: Option<serde_json::Value>,
+    ) -> Result<SendSummary, AppError> {
+        let (_event, summary) = self
+            .send_app_event(
+                group_id,
+                AppMessageIntent::AgentActivity {
+                    status,
+                    text,
+                    reply_to_message_id,
+                    extra,
+                },
+            )
+            .await?;
+        Ok(summary)
+    }
+
+    pub async fn send_agent_operation_event(
+        &mut self,
+        group_id: &GroupId,
+        request: AgentOperationEventRequest,
+    ) -> Result<SendSummary, AppError> {
+        let AgentOperationEventRequest {
+            event_type,
+            status,
+            operation_id,
+            run_id,
+            turn_id,
+            name,
+            text,
+            preview,
+            details,
+            sequence,
+            ok,
+            duration_ms,
+            reply_to_message_id,
+        } = request;
+        let (_event, summary) = self
+            .send_app_event(
+                group_id,
+                AppMessageIntent::AgentOperation {
+                    event_type,
+                    status,
+                    operation_id,
+                    run_id,
+                    turn_id,
+                    name,
+                    text,
+                    preview,
+                    details,
+                    sequence,
+                    ok,
+                    duration_ms,
+                    reply_to_message_id,
+                },
+            )
+            .await?;
+        Ok(summary)
+    }
+
+    pub async fn send_group_system_event(
+        &mut self,
+        group_id: &GroupId,
+        system_type: String,
+        text: String,
+        data: Option<serde_json::Value>,
+    ) -> Result<SendSummary, AppError> {
+        let (_event, summary) = self
+            .send_app_event(
+                group_id,
+                AppMessageIntent::GroupSystem {
+                    system_type,
+                    text,
+                    data,
+                },
+            )
+            .await?;
+        Ok(summary)
+    }
+
     pub async fn retry_group_convergence(
         &mut self,
         group_id: &GroupId,
@@ -1720,6 +1805,9 @@ fn notification_trigger_for_intent(
         | AppMessageIntent::Unreact { .. }
         | AppMessageIntent::Delete { .. }
         | AppMessageIntent::StreamStart { .. }
+        | AppMessageIntent::AgentActivity { .. }
+        | AppMessageIntent::AgentOperation { .. }
+        | AppMessageIntent::GroupSystem { .. }
         | AppMessageIntent::PushTokenUpdate { .. }
         | AppMessageIntent::PushTokenRemoval { .. } => None,
     }

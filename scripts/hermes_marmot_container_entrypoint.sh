@@ -15,6 +15,13 @@ fi
 : "${MARMOT_QUIC_CANDIDATES:=quic://quic-broker.ipf.dev:4450}"
 : "${HERMES_MARMOT_AUTO_BOOTSTRAP:=1}"
 : "${HERMES_MARMOT_START_GATEWAY:=1}"
+: "${HERMES_MARMOT_STREAMING:=1}"
+: "${HERMES_MARMOT_STREAMING_TRANSPORT:=auto}"
+: "${HERMES_MARMOT_TOOL_PROGRESS:=off}"
+: "${HERMES_MARMOT_INTERIM_MESSAGES:=0}"
+: "${HERMES_MARMOT_LONG_RUNNING_NOTIFICATIONS:=0}"
+: "${HERMES_MARMOT_BUSY_ACK_DETAIL:=0}"
+: "${MARMOT_PROFILE_NAME_ONBOARDING:=1}"
 
 export MARMOT_HOME
 export HERMES_HOME
@@ -24,6 +31,7 @@ export MARMOT_AGENT_SOCKET_DIR_MODE
 export MARMOT_AGENT_SOCKET_MODE
 export MARMOT_RELAYS
 export MARMOT_QUIC_CANDIDATES
+export MARMOT_PROFILE_NAME_ONBOARDING
 export PATH="/opt/hermes-agent/.venv/bin:$PATH"
 
 mkdir -p "$MARMOT_HOME" "$HERMES_HOME/plugins" "$(dirname "$MARMOT_AGENT_SOCKET")"
@@ -92,6 +100,15 @@ else
     echo "error: hermes launcher not found on PATH" >&2
     exit 1
 fi
+
+marmot-configure-hermes-gateway \
+    --home "$HERMES_HOME" \
+    --streaming "$HERMES_MARMOT_STREAMING" \
+    --transport "$HERMES_MARMOT_STREAMING_TRANSPORT" \
+    --tool-progress "$HERMES_MARMOT_TOOL_PROGRESS" \
+    --interim-messages "$HERMES_MARMOT_INTERIM_MESSAGES" \
+    --long-running-notifications "$HERMES_MARMOT_LONG_RUNNING_NOTIFICATIONS" \
+    --busy-ack-detail "$HERMES_MARMOT_BUSY_ACK_DETAIL"
 
 if [ "$HERMES_MARMOT_START_GATEWAY" = "0" ]; then
     echo "Hermes gateway disabled; dm-agent is running."
