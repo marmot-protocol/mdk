@@ -27,6 +27,7 @@ use rand::rngs::OsRng;
 
 mod conversions;
 mod errors;
+mod markdown;
 mod subscriptions;
 
 use conversions::{
@@ -37,6 +38,11 @@ use conversions::{
     group_management_state_ffi, media_records_ffi, normalize_member_ref_ffi,
 };
 pub use errors::MarmotKitError;
+pub use markdown::{
+    MarkdownAlignmentFfi, MarkdownAutolinkKindFfi, MarkdownBlockFfi, MarkdownCodeBlockKindFfi,
+    MarkdownDocumentFfi, MarkdownInlineFfi, MarkdownListItemFfi, MarkdownListKindFfi,
+    MarkdownNostrEntityFfi, MarkdownNostrHrpFfi, MarkdownTableCellFfi,
+};
 use subscriptions::{
     AgentStreamSubscription, ChatListSubscription, ChatsSubscription, EventsSubscription,
     GroupStateSubscription, MessagesSubscription, NotificationsSubscription,
@@ -1185,6 +1191,13 @@ impl Marmot {
         normalize_member_ref_ffi(&reference)
             .ok()
             .map(|normalized| normalized.account_id_hex)
+    }
+
+    /// Parse plaintext message content into the same Markdown AST returned on
+    /// message and timeline records. Useful for draft previews and host-side
+    /// fallback rendering.
+    pub fn parse_markdown(&self, text: String) -> MarkdownDocumentFfi {
+        markdown::parse_markdown_document(&text)
     }
 
     /// Per-account relay lists: the NIP-65 and inbox lists the account has

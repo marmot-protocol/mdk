@@ -340,6 +340,7 @@ mod tests {
         ChatListUpdateTriggerFfi, TimelineReactionSummaryFfi, TimelineRemoveReasonFfi,
         TimelineUpdateTriggerFfi,
     };
+    use crate::markdown::parse_markdown_document;
 
     #[test]
     fn take_snapshot_recovers_from_poisoned_lock() {
@@ -419,6 +420,7 @@ mod tests {
             group_id_hex: "group".to_owned(),
             sender: "sender".to_owned(),
             plaintext: message_id_hex.to_owned(),
+            content_tokens: parse_markdown_document(message_id_hex),
             kind: 9,
             tags: Vec::new(),
             timeline_at,

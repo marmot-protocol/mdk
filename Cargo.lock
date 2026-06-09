@@ -2622,6 +2622,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "marmot-markdown"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "marmot-uniffi"
 version = "0.1.0"
 dependencies = [
@@ -2630,6 +2638,7 @@ dependencies = [
  "keyring-core",
  "marmot-account",
  "marmot-app",
+ "marmot-markdown",
  "rand 0.8.6",
  "serde_json",
  "tempfile",

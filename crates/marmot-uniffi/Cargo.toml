@@ -17,6 +17,7 @@ otlp-export = ["marmot-app/otlp-export"]
 [dependencies]
 marmot-app.workspace = true
 marmot-account.workspace = true
+marmot-markdown.workspace = true
 cgka-traits.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
