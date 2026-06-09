@@ -2,12 +2,12 @@ use std::collections::{HashMap, HashSet};
 
 use cgka_engine::key_package::is_last_resort_key_package;
 use cgka_traits::agent_text_stream::{
-    AGENT_TEXT_STREAM_EXPORTER_LABEL, AgentTextStreamQuicPolicyV1,
+    AGENT_TEXT_STREAM_EXPORTER_CACHE_KEY, AgentTextStreamQuicPolicyV1,
 };
 use cgka_traits::app_components::{
     AGENT_TEXT_STREAM_QUIC_COMPONENT_ID, AppComponentData, BlobStoreEndpointV1,
     ENCRYPTED_MEDIA_FORMAT_V1, EncryptedMediaPolicyV1, GROUP_AVATAR_URL_COMPONENT_ID,
-    GROUP_ENCRYPTED_MEDIA_COMPONENT_ID, GROUP_ENCRYPTED_MEDIA_EXPORTER_LABEL,
+    GROUP_ENCRYPTED_MEDIA_COMPONENT_ID, GROUP_ENCRYPTED_MEDIA_EXPORTER_CACHE_KEY,
     GROUP_MESSAGE_RETENTION_COMPONENT_ID, NOSTR_ROUTING_COMPONENT_ID, encode_nostr_routing_v1,
 };
 use cgka_traits::app_event::{
@@ -183,7 +183,7 @@ impl AppClient {
         &self,
         group_id: &GroupId,
     ) -> Result<SecretBytes, AppError> {
-        self.exporter_secret(group_id, AGENT_TEXT_STREAM_EXPORTER_LABEL, 32)
+        self.exporter_secret(group_id, AGENT_TEXT_STREAM_EXPORTER_CACHE_KEY, 32)
     }
 
     pub(crate) fn exporter_secret(
@@ -1581,7 +1581,7 @@ impl AppClient {
     ) -> Result<(u64, SecretBytes), AppError> {
         let (epoch, secret) = self.runtime.exporter_secret_with_epoch(
             group_id,
-            GROUP_ENCRYPTED_MEDIA_EXPORTER_LABEL,
+            GROUP_ENCRYPTED_MEDIA_EXPORTER_CACHE_KEY,
             32,
         )?;
         self.remember_encrypted_media_epoch_secret(group_id, epoch.0, secret.as_ref())?;
@@ -1598,7 +1598,7 @@ impl AppClient {
         }
         let (epoch, secret) = self.runtime.exporter_secret_with_epoch(
             group_id,
-            GROUP_ENCRYPTED_MEDIA_EXPORTER_LABEL,
+            GROUP_ENCRYPTED_MEDIA_EXPORTER_CACHE_KEY,
             32,
         )?;
         self.remember_encrypted_media_epoch_secret(group_id, epoch.0, secret.as_ref())?;
@@ -1613,7 +1613,7 @@ impl AppClient {
     fn remember_current_encrypted_media_secret(&self, group_id: &GroupId) -> Result<(), AppError> {
         let (epoch, secret) = self.runtime.exporter_secret_with_epoch(
             group_id,
-            GROUP_ENCRYPTED_MEDIA_EXPORTER_LABEL,
+            GROUP_ENCRYPTED_MEDIA_EXPORTER_CACHE_KEY,
             32,
         )?;
         self.remember_encrypted_media_epoch_secret(group_id, epoch.0, secret.as_ref())

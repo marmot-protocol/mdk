@@ -21,7 +21,13 @@ pub const AGENT_TEXT_STREAM_QUIC_SEND_FEATURE: Feature =
 pub const AGENT_TEXT_STREAM_QUIC_FANOUT_FEATURE: Feature =
     Feature("marmot.feature.agent_text_stream_quic.fanout.v1");
 
-pub const AGENT_TEXT_STREAM_EXPORTER_LABEL: &str = "marmot/agent-text-stream-quic";
+/// Lookup key for the agent-text-stream secret in the
+/// [`crate::group_context::GroupContextSnapshot`] secrets map (used by
+/// `GroupContextView::exporter_secret`). This is an internal cache key, NOT the
+/// MLS exporter label/context: the secret is derived as
+/// `MLS-Exporter("marmot", "agent-text-stream-quic", 32)` — label `"marmot"`,
+/// context `"agent-text-stream-quic"` — per the Marmot spec.
+pub const AGENT_TEXT_STREAM_EXPORTER_CACHE_KEY: &str = "marmot/agent-text-stream-quic";
 pub const AGENT_TEXT_STREAM_KEY_CONTEXT_VERSION: &[u8] = b"v1";
 pub const AGENT_TEXT_STREAM_TRANSCRIPT_HASH_CONTEXT: &[u8] =
     b"marmot agent text stream transcript v1";

@@ -46,9 +46,9 @@ pub(crate) const AGENT_TEXT_STREAM_EXPORTER_CONTEXT: &[u8] = b"agent-text-stream
 /// the MLS label/context pair.
 pub(crate) const EXPORTER_SNAPSHOT_KEY: &str = "marmot/group-event";
 pub(crate) const ENCRYPTED_MEDIA_EXPORTER_SNAPSHOT_KEY: &str =
-    cgka_traits::app_components::GROUP_ENCRYPTED_MEDIA_EXPORTER_LABEL;
+    cgka_traits::app_components::GROUP_ENCRYPTED_MEDIA_EXPORTER_CACHE_KEY;
 pub(crate) const AGENT_TEXT_STREAM_EXPORTER_SNAPSHOT_KEY: &str =
-    cgka_traits::agent_text_stream::AGENT_TEXT_STREAM_EXPORTER_LABEL;
+    cgka_traits::agent_text_stream::AGENT_TEXT_STREAM_EXPORTER_CACHE_KEY;
 
 impl<S: StorageProvider> Engine<S> {
     /// Implementation of `CgkaEngine::create_group`.

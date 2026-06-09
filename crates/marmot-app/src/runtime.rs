@@ -7,7 +7,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use cgka_traits::agent_text_stream::{
-    AGENT_TEXT_STREAM_EXPORTER_LABEL, AGENT_TEXT_STREAM_RECORD_PROGRESS_DELTA,
+    AGENT_TEXT_STREAM_EXPORTER_CACHE_KEY, AGENT_TEXT_STREAM_RECORD_PROGRESS_DELTA,
     AGENT_TEXT_STREAM_RECORD_STATUS, AGENT_TEXT_STREAM_RECORD_TEXT_DELTA,
     AgentTextStreamKeyContextV1,
 };
@@ -2103,7 +2103,12 @@ impl MarmotAppRuntime {
         group_id: &GroupId,
     ) -> Result<SecretBytes, AppError> {
         self.accounts
-            .exporter_secret(account_ref, group_id, AGENT_TEXT_STREAM_EXPORTER_LABEL, 32)
+            .exporter_secret(
+                account_ref,
+                group_id,
+                AGENT_TEXT_STREAM_EXPORTER_CACHE_KEY,
+                32,
+            )
             .await
     }
 

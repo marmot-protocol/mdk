@@ -24,7 +24,12 @@ pub const GROUP_MESSAGE_RETENTION_COMPONENT_ID: AppComponentId = 0x8005;
 pub const AGENT_TEXT_STREAM_QUIC_COMPONENT_ID: AppComponentId = 0x8006;
 pub const GROUP_AVATAR_URL_COMPONENT_ID: AppComponentId = 0x8007;
 pub const GROUP_ENCRYPTED_MEDIA_COMPONENT_ID: AppComponentId = 0x8008;
-pub const GROUP_ENCRYPTED_MEDIA_EXPORTER_LABEL: &str = "marmot/encrypted-media";
+/// Lookup key for the encrypted-media secret in the
+/// [`crate::group_context::GroupContextSnapshot`] secrets map. This is an
+/// internal cache key, NOT the MLS exporter label/context: the secret is derived
+/// as `MLS-Exporter("marmot", "encrypted-media", 32)` — label `"marmot"`,
+/// context `"encrypted-media"` — per the Marmot spec.
+pub const GROUP_ENCRYPTED_MEDIA_EXPORTER_CACHE_KEY: &str = "marmot/encrypted-media";
 
 pub const GROUP_PROFILE_COMPONENT: &str = "marmot.group.profile.v1";
 pub const GROUP_BLOSSOM_IMAGE_COMPONENT: &str = "marmot.group.blossom.image.v1";
