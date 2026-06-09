@@ -18,6 +18,8 @@ mod migration_0008_timeline_invalidation_status;
 mod migration_0009_app_event_source_epoch;
 #[path = "migrations/0010_encrypted_media_epoch_secrets.rs"]
 mod migration_0010_encrypted_media_epoch_secrets;
+#[path = "migrations/0011_chat_list_avatar_url.rs"]
+mod migration_0011_chat_list_avatar_url;
 
 use crate::SqliteResultExt;
 use cgka_traits::storage::{StorageError, StorageResult};
@@ -80,6 +82,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "0010_encrypted_media_epoch_secrets",
         apply: migration_0010_encrypted_media_epoch_secrets::apply,
     },
+    Migration {
+        version: 11,
+        name: "0011_chat_list_avatar_url",
+        apply: migration_0011_chat_list_avatar_url::apply,
+    },
 ];
 
 pub(crate) fn run_all(connection: &mut Connection) -> StorageResult<()> {
@@ -89,6 +96,7 @@ pub(crate) fn run_all(connection: &mut Connection) -> StorageResult<()> {
 pub(crate) fn run(connection: &mut Connection, migrations: &[Migration]) -> StorageResult<()> {
     ensure_migration_table(connection)?;
     ensure_ordered(migrations)?;
+    reconcile_legacy_migration_names(connection, migrations)?;
     reject_unknown_future_migrations(connection, migrations)?;
 
     for migration in migrations {
@@ -167,6 +175,70 @@ fn reject_unknown_future_migrations(
     Ok(())
 }
 
+fn reconcile_legacy_migration_names(
+    connection: &mut Connection,
+    migrations: &[Migration],
+) -> StorageResult<()> {
+    const LEGACY_CHAT_LIST_AVATAR_URL: &str = "0009_chat_list_avatar_url";
+    const APP_EVENT_SOURCE_EPOCH: &str = "0009_app_event_source_epoch";
+
+    let expects_app_event_source_epoch = migrations
+        .iter()
+        .any(|migration| migration.version == 9 && migration.name == APP_EVENT_SOURCE_EPOCH);
+    if !expects_app_event_source_epoch {
+        return Ok(());
+    }
+
+    let Some(applied) = applied_name(connection, 9)? else {
+        return Ok(());
+    };
+    if applied != LEGACY_CHAT_LIST_AVATAR_URL {
+        return Ok(());
+    }
+
+    let tx = connection.transaction().storage()?;
+    add_column_if_missing(&tx, "app_events", "source_epoch", "INTEGER")?;
+    add_column_if_missing(&tx, "message_timeline", "source_epoch", "INTEGER")?;
+    tx.execute(
+        "UPDATE cgka_schema_migrations
+            SET name = ?1
+          WHERE version = 9
+            AND name = ?2",
+        params![APP_EVENT_SOURCE_EPOCH, LEGACY_CHAT_LIST_AVATAR_URL],
+    )
+    .storage()?;
+    tx.commit().storage()
+}
+
+fn add_column_if_missing(
+    tx: &Transaction<'_>,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> StorageResult<()> {
+    if table_has_column(tx, table, column)? {
+        return Ok(());
+    }
+    tx.execute_batch(&format!(
+        "ALTER TABLE {table} ADD COLUMN {column} {definition};"
+    ))
+    .storage()
+}
+
+fn table_has_column(tx: &Transaction<'_>, table: &str, column: &str) -> StorageResult<bool> {
+    let mut statement = tx
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .storage()?;
+    let mut rows = statement.query([]).storage()?;
+    while let Some(row) = rows.next().storage()? {
+        let name: String = row.get("name").storage()?;
+        if name == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn applied_name(connection: &Connection, version: i64) -> StorageResult<Option<String>> {
     connection
         .query_row(
@@ -233,6 +305,128 @@ mod tests {
 
         let reopened = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
         assert_eq!(applied_migrations(&reopened), expected_migrations());
+    }
+
+    #[test]
+    fn canonical_pre_avatar_database_upgrades_through_current_migrations() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        run(&mut conn, &MIGRATIONS[..8]).unwrap();
+        assert_eq!(
+            applied_name(&conn, 8).unwrap().as_deref(),
+            Some("0008_timeline_invalidation_status")
+        );
+        assert_eq!(applied_name(&conn, 9).unwrap(), None);
+        assert!(!connection_has_column(&conn, "app_events", "source_epoch"));
+        assert!(!connection_has_column(
+            &conn,
+            "chat_list_rows",
+            "avatar_url"
+        ));
+
+        run(&mut conn, MIGRATIONS).unwrap();
+
+        assert_eq!(
+            applied_name(&conn, 9).unwrap().as_deref(),
+            Some("0009_app_event_source_epoch")
+        );
+        assert_eq!(
+            applied_name(&conn, 11).unwrap().as_deref(),
+            Some("0011_chat_list_avatar_url")
+        );
+        assert!(connection_has_column(&conn, "app_events", "source_epoch"));
+        assert!(connection_has_column(
+            &conn,
+            "encrypted_media_epoch_secrets",
+            "secret"
+        ));
+        assert!(connection_has_column(&conn, "chat_list_rows", "avatar_url"));
+        assert_eq!(
+            applied_migrations_from_connection(&conn),
+            expected_migrations()
+        );
+    }
+
+    #[test]
+    fn legacy_chat_list_avatar_migration_slot_is_reconciled() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        let legacy_migrations = [
+            Migration {
+                version: 1,
+                name: "0001_initial_schema",
+                apply: migration_0001_initial_schema::apply,
+            },
+            Migration {
+                version: 2,
+                name: "0002_account_device_signers",
+                apply: migration_0002_account_device_signers::apply,
+            },
+            Migration {
+                version: 3,
+                name: "0003_group_foreign_keys",
+                apply: migration_0003_group_foreign_keys::apply,
+            },
+            Migration {
+                version: 4,
+                name: "0004_app_timeline",
+                apply: migration_0004_app_timeline::apply,
+            },
+            Migration {
+                version: 5,
+                name: "0005_account_projection",
+                apply: migration_0005_account_projection::apply,
+            },
+            Migration {
+                version: 6,
+                name: "0006_chat_list_projection",
+                apply: migration_0006_chat_list_projection::apply,
+            },
+            Migration {
+                version: 7,
+                name: "0007_timeline_projection_indexes",
+                apply: migration_0007_timeline_projection_indexes::apply,
+            },
+            Migration {
+                version: 8,
+                name: "0008_timeline_invalidation_status",
+                apply: migration_0008_timeline_invalidation_status::apply,
+            },
+            Migration {
+                version: 9,
+                name: "0009_chat_list_avatar_url",
+                apply: |tx| {
+                    tx.execute_batch("ALTER TABLE chat_list_rows ADD COLUMN avatar_url TEXT;")
+                        .storage()
+                },
+            },
+        ];
+        run(&mut conn, &legacy_migrations).unwrap();
+        assert_eq!(
+            applied_name(&conn, 9).unwrap().as_deref(),
+            Some("0009_chat_list_avatar_url")
+        );
+        assert!(connection_has_column(&conn, "chat_list_rows", "avatar_url"));
+        assert!(!connection_has_column(&conn, "app_events", "source_epoch"));
+        assert!(!connection_has_column(
+            &conn,
+            "message_timeline",
+            "source_epoch"
+        ));
+
+        run(&mut conn, MIGRATIONS).unwrap();
+
+        assert_eq!(
+            applied_name(&conn, 9).unwrap().as_deref(),
+            Some("0009_app_event_source_epoch")
+        );
+        assert!(connection_has_column(&conn, "app_events", "source_epoch"));
+        assert!(connection_has_column(
+            &conn,
+            "message_timeline",
+            "source_epoch"
+        ));
+        assert!(connection_has_column(&conn, "chat_list_rows", "avatar_url"));
+        let applied = applied_migrations_from_connection(&conn);
+        assert_eq!(applied, expected_migrations());
     }
 
     #[test]
@@ -413,5 +607,24 @@ mod tests {
             err.to_string().contains("FOREIGN KEY constraint failed"),
             "unexpected error: {err}"
         );
+    }
+
+    fn applied_migrations_from_connection(conn: &rusqlite::Connection) -> Vec<(i64, String)> {
+        let mut stmt = conn
+            .prepare("SELECT version, name FROM cgka_schema_migrations ORDER BY version")
+            .unwrap();
+        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    fn connection_has_column(conn: &rusqlite::Connection, table: &str, column: &str) -> bool {
+        let mut stmt = conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .unwrap();
+        stmt.query_map([], |row| row.get::<_, String>("name"))
+            .unwrap()
+            .any(|name| name.as_deref() == Ok(column))
     }
 }

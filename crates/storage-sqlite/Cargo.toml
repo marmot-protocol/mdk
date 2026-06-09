@@ -8,6 +8,7 @@ description = "SQLite storage backend for the CGKA engine with Marmot and OpenML
 
 [dependencies]
 cgka-traits.workspace = true
+hex.workspace = true
 openmls.workspace = true
 openmls_traits.workspace = true
 rusqlite.workspace = true

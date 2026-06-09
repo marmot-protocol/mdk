@@ -4380,6 +4380,7 @@ name = "storage-sqlite"
 version = "0.1.0"
 dependencies = [
  "cgka-traits",
+ "hex",
  "openmls",
  "openmls_traits",
  "rusqlite",

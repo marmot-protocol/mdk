@@ -1,4 +1,5 @@
 use crate::{SqliteAccountStorage, SqliteResultExt};
+use cgka_traits::app_components::{GROUP_AVATAR_URL_COMPONENT_ID, decode_group_avatar_url_v1};
 use cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT;
 use cgka_traits::storage::{StorageError, StorageResult};
 use rusqlite::{OptionalExtension, Params, Transaction, params};
@@ -36,6 +37,7 @@ pub struct ChatListRow {
     pub pending_confirmation: bool,
     pub title: String,
     pub group_name: String,
+    pub avatar_url: Option<String>,
     pub avatar: Option<ChatListAvatar>,
     pub last_message: Option<ChatListMessagePreview>,
     pub unread_count: u64,
@@ -52,6 +54,7 @@ struct AccountGroupRow {
     archived: bool,
     pending_confirmation: bool,
     profile_name: String,
+    avatar_url: Option<String>,
     avatar: Option<ChatListAvatar>,
 }
 
@@ -255,6 +258,9 @@ fn chat_list_projection_complete_tx(tx: &Transaction<'_>) -> StorageResult<bool>
         "SELECT EXISTS(
                 SELECT 1
                 FROM account_groups AS ag
+                LEFT JOIN account_group_app_components AS avatar_url
+                    ON avatar_url.group_id_hex = ag.group_id_hex
+                   AND avatar_url.component_id = ?1
                 JOIN chat_list_rows AS row
                     ON row.group_id_hex = ag.group_id_hex
                 WHERE row.archived IS NOT ag.archived
@@ -269,9 +275,11 @@ fn chat_list_projection_complete_tx(tx: &Transaction<'_>) -> StorageResult<bool>
                    OR row.avatar_image_nonce_hex IS NOT ag.image_nonce_hex
                    OR row.avatar_image_upload_key_hex IS NOT ag.image_upload_key_hex
                    OR row.avatar_media_type IS NOT ag.image_media_type
+                   OR (row.avatar_url IS NOT NULL AND avatar_url.component_data_hex IS NULL)
+                   OR row.updated_at < COALESCE(avatar_url.updated_at, 0)
                    OR row.updated_at < ag.updated_at
              )",
-        [],
+        params![GROUP_AVATAR_URL_COMPONENT_ID],
     )? {
         return Ok(false);
     }
@@ -384,6 +392,7 @@ fn rebuild_chat_list_row_for_group_tx(
     tx.execute(
         "INSERT INTO chat_list_rows (
             group_id_hex, archived, pending_confirmation, title, group_name,
+            avatar_url,
             avatar_image_hash_hex, avatar_image_key_hex, avatar_image_nonce_hex,
             avatar_image_upload_key_hex, avatar_media_type,
             last_message_id_hex, last_message_sender, last_message_preview,
@@ -393,13 +402,14 @@ fn rebuild_chat_list_row_for_group_tx(
          )
          VALUES (
             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
-            ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21
+            ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22
          )
          ON CONFLICT(group_id_hex) DO UPDATE SET
             archived = excluded.archived,
             pending_confirmation = excluded.pending_confirmation,
             title = excluded.title,
             group_name = excluded.group_name,
+            avatar_url = excluded.avatar_url,
             avatar_image_hash_hex = excluded.avatar_image_hash_hex,
             avatar_image_key_hex = excluded.avatar_image_key_hex,
             avatar_image_nonce_hex = excluded.avatar_image_nonce_hex,
@@ -422,6 +432,7 @@ fn rebuild_chat_list_row_for_group_tx(
             bool_i64(group.pending_confirmation),
             chat_title(&group),
             &group.profile_name,
+            group.avatar_url.as_deref(),
             group
                 .avatar
                 .as_ref()
@@ -563,16 +574,22 @@ fn unread_summary_tx(
 fn account_groups_tx(tx: &Transaction<'_>) -> StorageResult<Vec<AccountGroupRow>> {
     let mut stmt = tx
         .prepare(
-            "SELECT group_id_hex, archived, pending_confirmation, profile_name,
+            "SELECT ag.group_id_hex, ag.archived, ag.pending_confirmation, ag.profile_name,
                     image_hash_hex, image_key_hex, image_nonce_hex,
-                    image_upload_key_hex, image_media_type
-             FROM account_groups",
+                    image_upload_key_hex, image_media_type, avatar_url.component_data_hex
+             FROM account_groups AS ag
+             LEFT JOIN account_group_app_components AS avatar_url
+                ON avatar_url.group_id_hex = ag.group_id_hex
+               AND avatar_url.component_id = ?1",
         )
         .storage()?;
-    stmt.query_map([], account_group_from_row)
-        .storage()?
-        .collect::<Result<Vec<_>, _>>()
-        .storage()
+    stmt.query_map(
+        params![GROUP_AVATAR_URL_COMPONENT_ID],
+        account_group_from_row,
+    )
+    .storage()?
+    .collect::<Result<Vec<_>, _>>()
+    .storage()
 }
 
 fn account_group_tx(
@@ -580,12 +597,15 @@ fn account_group_tx(
     group_id_hex: &str,
 ) -> StorageResult<Option<AccountGroupRow>> {
     tx.query_row(
-        "SELECT group_id_hex, archived, pending_confirmation, profile_name,
+        "SELECT ag.group_id_hex, ag.archived, ag.pending_confirmation, ag.profile_name,
                 image_hash_hex, image_key_hex, image_nonce_hex,
-                image_upload_key_hex, image_media_type
-         FROM account_groups
-         WHERE group_id_hex = ?1",
-        params![group_id_hex],
+                image_upload_key_hex, image_media_type, avatar_url.component_data_hex
+         FROM account_groups AS ag
+         LEFT JOIN account_group_app_components AS avatar_url
+            ON avatar_url.group_id_hex = ag.group_id_hex
+           AND avatar_url.component_id = ?2
+         WHERE ag.group_id_hex = ?1",
+        params![group_id_hex, GROUP_AVATAR_URL_COMPONENT_ID],
         account_group_from_row,
     )
     .optional()
@@ -598,6 +618,7 @@ fn account_group_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AccountGr
     let image_nonce_hex: String = row.get(6)?;
     let image_upload_key_hex: String = row.get(7)?;
     let media_type: Option<String> = row.get(8)?;
+    let avatar_url_component_hex: Option<String> = row.get(9)?;
     let has_avatar = !image_hash_hex.is_empty()
         || !image_key_hex.is_empty()
         || !image_nonce_hex.is_empty()
@@ -608,6 +629,7 @@ fn account_group_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AccountGr
         archived: row.get::<_, i64>(1)? != 0,
         pending_confirmation: row.get::<_, i64>(2)? != 0,
         profile_name: row.get(3)?,
+        avatar_url: decoded_avatar_url(avatar_url_component_hex.as_deref()),
         avatar: has_avatar.then_some(ChatListAvatar {
             image_hash_hex,
             image_key_hex,
@@ -696,6 +718,7 @@ fn chat_list_rows_tx(
 ) -> StorageResult<Vec<ChatListRow>> {
     let sql = if query.include_archived {
         "SELECT group_id_hex, archived, pending_confirmation, title, group_name,
+                avatar_url,
                 avatar_image_hash_hex, avatar_image_key_hex, avatar_image_nonce_hex,
                 avatar_image_upload_key_hex, avatar_media_type,
                 last_message_id_hex, last_message_sender, last_message_preview,
@@ -706,6 +729,7 @@ fn chat_list_rows_tx(
          ORDER BY last_message_timeline_at DESC, group_id_hex"
     } else {
         "SELECT group_id_hex, archived, pending_confirmation, title, group_name,
+                avatar_url,
                 avatar_image_hash_hex, avatar_image_key_hex, avatar_image_nonce_hex,
                 avatar_image_upload_key_hex, avatar_media_type,
                 last_message_id_hex, last_message_sender, last_message_preview,
@@ -729,6 +753,7 @@ fn chat_list_row_tx(
 ) -> StorageResult<Option<ChatListRow>> {
     tx.query_row(
         "SELECT group_id_hex, archived, pending_confirmation, title, group_name,
+                avatar_url,
                 avatar_image_hash_hex, avatar_image_key_hex, avatar_image_nonce_hex,
                 avatar_image_upload_key_hex, avatar_media_type,
                 last_message_id_hex, last_message_sender, last_message_preview,
@@ -745,44 +770,46 @@ fn chat_list_row_tx(
 }
 
 fn chat_list_row_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChatListRow> {
-    let image_hash_hex: String = row.get(5)?;
-    let image_key_hex: String = row.get(6)?;
-    let image_nonce_hex: String = row.get(7)?;
-    let image_upload_key_hex: String = row.get(8)?;
-    let media_type: Option<String> = row.get(9)?;
+    let avatar_url: Option<String> = row.get(5)?;
+    let image_hash_hex: String = row.get(6)?;
+    let image_key_hex: String = row.get(7)?;
+    let image_nonce_hex: String = row.get(8)?;
+    let image_upload_key_hex: String = row.get(9)?;
+    let media_type: Option<String> = row.get(10)?;
     let has_avatar = !image_hash_hex.is_empty()
         || !image_key_hex.is_empty()
         || !image_nonce_hex.is_empty()
         || !image_upload_key_hex.is_empty()
         || media_type.is_some();
-    let last_message_id_hex: Option<String> = row.get(10)?;
+    let last_message_id_hex: Option<String> = row.get(11)?;
     let last_message = last_message_id_hex.map(|message_id_hex| ChatListMessagePreview {
         message_id_hex,
-        sender: row.get(11).unwrap_or_default(),
+        sender: row.get(12).unwrap_or_default(),
         sender_display_name: None,
-        plaintext: row.get(12).unwrap_or_default(),
+        plaintext: row.get(13).unwrap_or_default(),
         kind: row
-            .get::<_, Option<i64>>(13)
-            .unwrap_or_default()
-            .and_then(|value| value.try_into().ok())
-            .unwrap_or_default(),
-        timeline_at: row
             .get::<_, Option<i64>>(14)
             .unwrap_or_default()
             .and_then(|value| value.try_into().ok())
             .unwrap_or_default(),
-        deleted: row.get::<_, i64>(15).unwrap_or_default() != 0,
+        timeline_at: row
+            .get::<_, Option<i64>>(15)
+            .unwrap_or_default()
+            .and_then(|value| value.try_into().ok())
+            .unwrap_or_default(),
+        deleted: row.get::<_, i64>(16).unwrap_or_default() != 0,
     });
-    let raw_unread_count = row.get::<_, i64>(16)?;
+    let raw_unread_count = row.get::<_, i64>(17)?;
     let unread_count = raw_unread_count
         .try_into()
-        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(16, raw_unread_count))?;
+        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(17, raw_unread_count))?;
     Ok(ChatListRow {
         group_id_hex: row.get(0)?,
         archived: row.get::<_, i64>(1)? != 0,
         pending_confirmation: row.get::<_, i64>(2)? != 0,
         title: row.get(3)?,
         group_name: row.get(4)?,
+        avatar_url,
         avatar: has_avatar.then_some(ChatListAvatar {
             image_hash_hex,
             image_key_hex,
@@ -793,12 +820,12 @@ fn chat_list_row_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChatListR
         last_message,
         unread_count,
         has_unread: unread_count > 0,
-        first_unread_message_id_hex: row.get(17)?,
-        last_read_message_id_hex: row.get(18)?,
+        first_unread_message_id_hex: row.get(18)?,
+        last_read_message_id_hex: row.get(19)?,
         last_read_timeline_at: row
-            .get::<_, Option<i64>>(19)?
+            .get::<_, Option<i64>>(20)?
             .and_then(|value| value.try_into().ok()),
-        updated_at: row.get::<_, i64>(20)?.try_into().unwrap_or_default(),
+        updated_at: row.get::<_, i64>(21)?.try_into().unwrap_or_default(),
     })
 }
 
@@ -808,6 +835,12 @@ fn chat_title(group: &AccountGroupRow) -> &str {
     } else {
         &group.profile_name
     }
+}
+
+fn decoded_avatar_url(component_data_hex: Option<&str>) -> Option<String> {
+    let bytes = hex::decode(component_data_hex?).ok()?;
+    let avatar = decode_group_avatar_url_v1(&bytes).ok()?;
+    (!avatar.url.is_empty()).then_some(avatar.url)
 }
 
 fn timeline_tuple_after(left_at: u64, left_id: &str, right_at: u64, right_id: &str) -> bool {
@@ -843,7 +876,13 @@ fn unix_now_seconds() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{StoredAccountGroup, StoredAccountState, StoredAppEvent};
+    use crate::{
+        StoredAccountGroup, StoredAccountGroupComponent, StoredAccountState, StoredAppEvent,
+    };
+    use cgka_traits::app_components::{
+        GROUP_AVATAR_URL_COMPONENT, GROUP_AVATAR_URL_COMPONENT_ID, GroupAvatarUrlV1,
+        encode_group_avatar_url_v1,
+    };
     use cgka_traits::app_event::{
         EVENT_REF_TAG, MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_REACTION,
     };
@@ -904,19 +943,37 @@ mod tests {
         }
     }
 
-    fn setup_store() -> SqliteAccountStorage {
+    fn setup_store_with_group(group: StoredAccountGroup) -> SqliteAccountStorage {
         let store = SqliteAccountStorage::in_memory().unwrap();
         store
             .save_account_projection_state(
                 &StoredAccountState {
                     label: "alice".to_owned(),
-                    groups: vec![group()],
+                    groups: vec![group],
                     ..StoredAccountState::default()
                 },
                 256,
             )
             .unwrap();
         store
+    }
+
+    fn setup_store() -> SqliteAccountStorage {
+        setup_store_with_group(group())
+    }
+
+    fn avatar_url_component(url: &str) -> StoredAccountGroupComponent {
+        let bytes = encode_group_avatar_url_v1(&GroupAvatarUrlV1 {
+            url: url.to_owned(),
+            dim: None,
+            thumbhash: None,
+        })
+        .unwrap();
+        StoredAccountGroupComponent {
+            component_id: GROUP_AVATAR_URL_COMPONENT_ID,
+            component_name: GROUP_AVATAR_URL_COMPONENT.to_owned(),
+            component_data_hex: hex::encode(bytes),
+        }
     }
 
     #[test]
@@ -952,6 +1009,25 @@ mod tests {
         assert_eq!(
             store.refresh_chat_list_row(LOCAL, "missing-group").unwrap(),
             None
+        );
+    }
+
+    #[test]
+    fn refresh_chat_list_row_projects_group_avatar_url() {
+        let mut group = group();
+        group
+            .components
+            .push(avatar_url_component("https://cdn.example.com/group.png"));
+        let store = setup_store_with_group(group);
+
+        let row = store
+            .refresh_chat_list_row(LOCAL, GROUP)
+            .unwrap()
+            .expect("chat row");
+
+        assert_eq!(
+            row.avatar_url.as_deref(),
+            Some("https://cdn.example.com/group.png")
         );
     }
 

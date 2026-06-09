@@ -5597,6 +5597,7 @@ mod tests {
             pending_confirmation: false,
             title: title.to_owned(),
             group_name: title.to_owned(),
+            avatar_url: None,
             avatar: None,
             last_message: None,
             unread_count: 0,
