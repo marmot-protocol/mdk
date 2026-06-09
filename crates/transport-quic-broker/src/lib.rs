@@ -11,9 +11,9 @@ use std::time::{Duration, Instant};
 use cgka_traits::MessageId;
 use cgka_traits::agent_text_stream::{
     AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN, AGENT_TEXT_STREAM_MAX_STREAM_ID_LEN,
-    AGENT_TEXT_STREAM_RECORD_PROGRESS_DELTA, AGENT_TEXT_STREAM_RECORD_STATUS,
-    AGENT_TEXT_STREAM_RECORD_TEXT_DELTA, AgentTextStreamRecordError, AgentTextStreamRecordV1,
-    AgentTextStreamTranscriptV1,
+    AGENT_TEXT_STREAM_RECORD_CHECKPOINT, AGENT_TEXT_STREAM_RECORD_PROGRESS_DELTA,
+    AGENT_TEXT_STREAM_RECORD_STATUS, AGENT_TEXT_STREAM_RECORD_TEXT_DELTA,
+    AgentTextStreamRecordError, AgentTextStreamRecordV1, AgentTextStreamTranscriptV1,
 };
 use quinn::crypto::rustls::QuicClientConfig;
 use quinn::{ClientConfig, Endpoint, ServerConfig, TransportConfig, VarInt};
@@ -544,11 +544,22 @@ where
     })
 }
 
+/// Decode the per-record text a subscriber can surface for a single stream record.
+///
+/// `TextDelta`, `Status`, `ProgressDelta`, and `Checkpoint` carry UTF-8 the
+/// consumer renders: deltas build the provisional preview, status/progress feed
+/// non-chat agent chrome, and a `Checkpoint` is a full preview snapshot the
+/// consumer swaps in for its live preview. `Abort` and `FinalNotice` are
+/// advisory (the consumer acts on the record type, not its bytes), as is any
+/// unknown future type, so they decode to an empty string. Note this only
+/// decodes one record's frame; accumulation into the provisional answer text is
+/// the caller's job and stays `TextDelta`-only.
 fn stream_record_text(record: &AgentTextStreamRecordV1) -> Result<String, QuicBrokerError> {
     match record.record_type {
         AGENT_TEXT_STREAM_RECORD_TEXT_DELTA
         | AGENT_TEXT_STREAM_RECORD_STATUS
-        | AGENT_TEXT_STREAM_RECORD_PROGRESS_DELTA => {
+        | AGENT_TEXT_STREAM_RECORD_PROGRESS_DELTA
+        | AGENT_TEXT_STREAM_RECORD_CHECKPOINT => {
             Ok(str::from_utf8(&record.plaintext_frame)?.to_owned())
         }
         _ => Ok(String::new()),
@@ -1495,6 +1506,171 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn broker_forwards_checkpoint_snapshot_without_merging_into_final_text() {
+        let server = QuicBrokerServer::bind(QuicBrokerConfig {
+            bind_addr: LOCAL_SERVER_BIND,
+            per_subscriber_queue: DEFAULT_SUBSCRIBER_QUEUE_DEPTH,
+            ..QuicBrokerConfig::default()
+        })
+        .unwrap();
+        let broker_addr = server.local_addr().unwrap();
+        let server_cert = server.server_cert_der().to_vec();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let broker_task = tokio::spawn(server.run_until(async {
+            let _ = shutdown_rx.await;
+        }));
+
+        let stream_id = vec![0xc4; 32];
+        let start_event_id = MessageId::new(vec![0x44; 32]);
+        let subscriber = tokio::spawn(subscribe_text_from_broker(SubscribeTextFromBroker {
+            broker_addr,
+            server_name: "localhost".to_owned(),
+            trust: BrokerServerTrust::CertificateDer(server_cert.clone()),
+            stream_id: stream_id.clone(),
+            start_event_id: start_event_id.clone(),
+            crypto: None,
+        }));
+        sleep(Duration::from_millis(100)).await;
+
+        let mut publisher = BrokerTextPublisher::connect(OpenBrokerTextPublisher {
+            broker_addr,
+            server_name: "localhost".to_owned(),
+            trust: BrokerServerTrust::CertificateDer(server_cert),
+            stream_id: stream_id.clone(),
+            start_event_id,
+            crypto: None,
+        })
+        .await
+        .unwrap();
+        // A delta builds the provisional answer; the checkpoint is a full preview
+        // snapshot the receiver forwards for the consumer to swap in.
+        publisher
+            .append_text("hello", 32, Duration::ZERO)
+            .await
+            .unwrap();
+        publisher
+            .append_record_text(
+                AGENT_TEXT_STREAM_RECORD_CHECKPOINT,
+                "hello world",
+                32,
+                Duration::ZERO,
+            )
+            .await
+            .unwrap();
+        let sent = publisher.finish().await.unwrap();
+
+        let received = tokio::time::timeout(Duration::from_secs(5), subscriber)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        // Checkpoint plaintext reaches the subscriber as the record's text...
+        assert_eq!(received.chunks.len(), 2);
+        assert_eq!(
+            received.chunks[1].record_type,
+            AGENT_TEXT_STREAM_RECORD_CHECKPOINT
+        );
+        assert_eq!(received.chunks[1].text, "hello world");
+        // ...but it is not merged into the provisional final text, which stays the
+        // concatenation of TextDelta frames only.
+        assert_eq!(received.text, "hello");
+        assert_eq!(received.chunk_count, 2);
+        assert_eq!(sent.chunk_count, received.chunk_count);
+        assert_eq!(sent.transcript_hash, received.transcript_hash);
+
+        let _ = shutdown_tx.send(());
+        broker_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn broker_progress_and_status_only_stream_yields_empty_final_text() {
+        let server = QuicBrokerServer::bind(QuicBrokerConfig {
+            bind_addr: LOCAL_SERVER_BIND,
+            per_subscriber_queue: DEFAULT_SUBSCRIBER_QUEUE_DEPTH,
+            ..QuicBrokerConfig::default()
+        })
+        .unwrap();
+        let broker_addr = server.local_addr().unwrap();
+        let server_cert = server.server_cert_der().to_vec();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let broker_task = tokio::spawn(server.run_until(async {
+            let _ = shutdown_rx.await;
+        }));
+
+        let stream_id = vec![0x9c; 32];
+        let start_event_id = MessageId::new(vec![0x55; 32]);
+        let subscriber = tokio::spawn(subscribe_text_from_broker(SubscribeTextFromBroker {
+            broker_addr,
+            server_name: "localhost".to_owned(),
+            trust: BrokerServerTrust::CertificateDer(server_cert.clone()),
+            stream_id: stream_id.clone(),
+            start_event_id: start_event_id.clone(),
+            crypto: None,
+        }));
+        sleep(Duration::from_millis(100)).await;
+
+        let mut publisher = BrokerTextPublisher::connect(OpenBrokerTextPublisher {
+            broker_addr,
+            server_name: "localhost".to_owned(),
+            trust: BrokerServerTrust::CertificateDer(server_cert),
+            stream_id: stream_id.clone(),
+            start_event_id,
+            crypto: None,
+        })
+        .await
+        .unwrap();
+        publisher
+            .append_record_text(
+                AGENT_TEXT_STREAM_RECORD_STATUS,
+                "thinking",
+                32,
+                Duration::ZERO,
+            )
+            .await
+            .unwrap();
+        publisher
+            .append_record_text(
+                AGENT_TEXT_STREAM_RECORD_PROGRESS_DELTA,
+                "searching",
+                32,
+                Duration::ZERO,
+            )
+            .await
+            .unwrap();
+        let sent = publisher.finish().await.unwrap();
+
+        let received = tokio::time::timeout(Duration::from_secs(5), subscriber)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        // A stream that never sends a TextDelta has no chat answer: the final text
+        // is legitimately empty, so consumers can tell "no answer" apart from a
+        // real preview instead of rendering a blank chat bubble.
+        assert_eq!(received.text, "");
+        // The status/progress content is still delivered per-record for live
+        // non-chat chrome.
+        assert_eq!(received.chunks.len(), 2);
+        assert_eq!(
+            received.chunks[0].record_type,
+            AGENT_TEXT_STREAM_RECORD_STATUS
+        );
+        assert_eq!(received.chunks[0].text, "thinking");
+        assert_eq!(
+            received.chunks[1].record_type,
+            AGENT_TEXT_STREAM_RECORD_PROGRESS_DELTA
+        );
+        assert_eq!(received.chunks[1].text, "searching");
+        assert_eq!(received.chunk_count, 2);
+        assert_eq!(sent.transcript_hash, received.transcript_hash);
+
+        let _ = shutdown_tx.send(());
+        broker_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
     async fn broker_subscriber_rejects_streams_past_receive_limits() {
         let server = QuicBrokerServer::bind(QuicBrokerConfig {
             bind_addr: LOCAL_SERVER_BIND,
@@ -1878,6 +2054,44 @@ mod tests {
             validate_frame_len(MAX_FRAME_SIZE + 1),
             Err(QuicBrokerError::FrameTooLarge(_))
         ));
+    }
+
+    #[test]
+    fn stream_record_text_decodes_renderable_frames_and_leaves_advisory_records_empty() {
+        use cgka_traits::agent_text_stream::{
+            AGENT_TEXT_STREAM_RECORD_ABORT, AGENT_TEXT_STREAM_RECORD_FINAL_NOTICE,
+        };
+
+        let stream_id = vec![0x11; 32];
+        let record = |record_type, plaintext: &str| {
+            AgentTextStreamRecordV1::new(stream_id.clone(), 1, record_type, plaintext.as_bytes())
+        };
+
+        // Renderable frames decode to their UTF-8 plaintext. Checkpoint is a full
+        // preview snapshot the consumer swaps in, so it must not stay blank.
+        for (record_type, plaintext) in [
+            (AGENT_TEXT_STREAM_RECORD_TEXT_DELTA, "hello"),
+            (AGENT_TEXT_STREAM_RECORD_STATUS, "thinking"),
+            (AGENT_TEXT_STREAM_RECORD_PROGRESS_DELTA, "search: glp-1"),
+            (AGENT_TEXT_STREAM_RECORD_CHECKPOINT, "hello world"),
+        ] {
+            assert_eq!(
+                stream_record_text(&record(record_type, plaintext)).unwrap(),
+                plaintext
+            );
+        }
+
+        // Abort and FinalNotice are advisory: the consumer reacts to the record
+        // type, so they decode to "" even when the sender attached bytes.
+        for record_type in [
+            AGENT_TEXT_STREAM_RECORD_ABORT,
+            AGENT_TEXT_STREAM_RECORD_FINAL_NOTICE,
+        ] {
+            assert_eq!(
+                stream_record_text(&record(record_type, "ignored")).unwrap(),
+                ""
+            );
+        }
     }
 
     #[test]

@@ -5,11 +5,11 @@ use std::time::Duration;
 
 use cgka_traits::agent_text_stream::{
     AGENT_TEXT_STREAM_DEFAULT_MAX_PLAINTEXT_BYTES, AGENT_TEXT_STREAM_DEFAULT_MAX_RECORDS,
-    AGENT_TEXT_STREAM_PROFILE_STREAM_ID_LEN, AGENT_TEXT_STREAM_RECORD_PROGRESS_DELTA,
-    AGENT_TEXT_STREAM_RECORD_STATUS, AGENT_TEXT_STREAM_RECORD_TEXT_DELTA,
-    AGENT_TEXT_STREAM_RECORD_VERSION, AGENT_TEXT_STREAM_START_EVENT_ID_LEN,
-    AgentTextStreamKeyContextV1, AgentTextStreamRecordError, AgentTextStreamRecordV1,
-    AgentTextStreamTranscriptV1,
+    AGENT_TEXT_STREAM_PROFILE_STREAM_ID_LEN, AGENT_TEXT_STREAM_RECORD_CHECKPOINT,
+    AGENT_TEXT_STREAM_RECORD_PROGRESS_DELTA, AGENT_TEXT_STREAM_RECORD_STATUS,
+    AGENT_TEXT_STREAM_RECORD_TEXT_DELTA, AGENT_TEXT_STREAM_RECORD_VERSION,
+    AGENT_TEXT_STREAM_START_EVENT_ID_LEN, AgentTextStreamKeyContextV1, AgentTextStreamRecordError,
+    AgentTextStreamRecordV1, AgentTextStreamTranscriptV1,
 };
 use cgka_traits::app_components::encode_quic_varint;
 use cgka_traits::{
@@ -148,11 +148,22 @@ impl QuicTextStreamReceiver {
     }
 }
 
+/// Decode the per-record text a consumer can surface for a single stream record.
+///
+/// `TextDelta`, `Status`, `ProgressDelta`, and `Checkpoint` carry UTF-8 the
+/// consumer renders: deltas build the provisional preview, status/progress feed
+/// non-chat agent chrome, and a `Checkpoint` is a full preview snapshot the
+/// consumer swaps in for its live preview. `Abort` and `FinalNotice` are
+/// advisory (the consumer acts on the record type, not its bytes), as is any
+/// unknown future type, so they decode to an empty string. Note this only
+/// decodes one record's frame; accumulation into the provisional answer text is
+/// the caller's job and stays `TextDelta`-only.
 fn stream_record_text(record: &AgentTextStreamRecordV1) -> Result<String, QuicTextStreamError> {
     match record.record_type {
         AGENT_TEXT_STREAM_RECORD_TEXT_DELTA
         | AGENT_TEXT_STREAM_RECORD_STATUS
-        | AGENT_TEXT_STREAM_RECORD_PROGRESS_DELTA => {
+        | AGENT_TEXT_STREAM_RECORD_PROGRESS_DELTA
+        | AGENT_TEXT_STREAM_RECORD_CHECKPOINT => {
             Ok(str::from_utf8(&record.plaintext_frame)?.to_owned())
         }
         _ => Ok(String::new()),
@@ -784,6 +795,44 @@ mod tests {
             validate_frame_len(MAX_FRAME_SIZE + 1),
             Err(QuicTextStreamError::FrameTooLarge(_))
         ));
+    }
+
+    #[test]
+    fn stream_record_text_decodes_renderable_frames_and_leaves_advisory_records_empty() {
+        use cgka_traits::agent_text_stream::{
+            AGENT_TEXT_STREAM_RECORD_ABORT, AGENT_TEXT_STREAM_RECORD_FINAL_NOTICE,
+        };
+
+        let stream_id = vec![0x11; 32];
+        let record = |record_type, plaintext: &str| {
+            AgentTextStreamRecordV1::new(stream_id.clone(), 1, record_type, plaintext.as_bytes())
+        };
+
+        // Renderable frames decode to their UTF-8 plaintext. Checkpoint is a full
+        // preview snapshot the consumer swaps in, so it must not stay blank.
+        for (record_type, plaintext) in [
+            (AGENT_TEXT_STREAM_RECORD_TEXT_DELTA, "hello"),
+            (AGENT_TEXT_STREAM_RECORD_STATUS, "thinking"),
+            (AGENT_TEXT_STREAM_RECORD_PROGRESS_DELTA, "search: glp-1"),
+            (AGENT_TEXT_STREAM_RECORD_CHECKPOINT, "hello world"),
+        ] {
+            assert_eq!(
+                stream_record_text(&record(record_type, plaintext)).unwrap(),
+                plaintext
+            );
+        }
+
+        // Abort and FinalNotice are advisory: the consumer reacts to the record
+        // type, so they decode to "" even when the sender attached bytes.
+        for record_type in [
+            AGENT_TEXT_STREAM_RECORD_ABORT,
+            AGENT_TEXT_STREAM_RECORD_FINAL_NOTICE,
+        ] {
+            assert_eq!(
+                stream_record_text(&record(record_type, "ignored")).unwrap(),
+                ""
+            );
+        }
     }
 
     #[test]
