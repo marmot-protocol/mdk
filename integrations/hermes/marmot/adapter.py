@@ -78,15 +78,6 @@ class NonAppendOnlyUpdate(RuntimeError):
     """Raised when a gateway replacement cannot be represented as an append."""
 
 
-# Plain assistant sends shorter than this while a live preview is open are treated
-# as interim commentary (kind 1201) rather than durable chat (kind 9).
-INTERIM_ASSISTANT_MESSAGE_MAX_CHARS = 200
-CONTINUATION_FRAGMENT_LEADERS = ",.;:)]}\n"
-# Overlap splicing bounds for reconstructing one answer from sequential segments.
-MIN_TURN_TEXT_OVERLAP_CHARS = 8
-MAX_TURN_TEXT_OVERLAP_SCAN_CHARS = 4096
-
-
 class AppendOnlyTextState:
     """Tracks the latest visible stream text and returns safe suffix deltas."""
 
@@ -512,7 +503,6 @@ class MarmotLiveStream:
         stream_id_hex: str,
         start_message_id_hex: str,
         chunk_bytes: int,
-        source: str = "preview",
     ):
         self.client = client
         self.account_id_hex = account_id_hex
@@ -526,7 +516,6 @@ class MarmotLiveStream:
             chunk_bytes=chunk_bytes,
         )
         self.finalized = False
-        self.source = source
 
     @classmethod
     async def begin(
@@ -552,7 +541,6 @@ class MarmotLiveStream:
             stream_id_hex=response["stream_id_hex"],
             start_message_id_hex=response["start_message_id_hex"],
             chunk_bytes=chunk_bytes,
-            source="preview",
         )
 
     async def append_replacement(self, next_text: str) -> None:
@@ -611,7 +599,6 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         self._active_streams: Dict[str, MarmotLiveStream] = {}
         self._draft_streams: Dict[tuple[str, int], MarmotLiveStream] = {}
         self._last_chat_stream: Dict[str, MarmotLiveStream] = {}
-        self._turn_preview_text: Dict[str, str] = {}
         self._tool_progress_events: OrderedDict[str, set[str]] = OrderedDict()
         self._tool_progress_replies: Dict[str, Optional[str]] = {}
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -650,7 +637,6 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                 pass
             self._listener_task = None
         await self._cancel_all_streams("adapter disconnect")
-        self._turn_preview_text.clear()
         self._tool_progress_events.clear()
         self._tool_progress_replies.clear()
         self._mark_disconnected()
@@ -691,83 +677,32 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
 
         stream = self._last_chat_stream.get(chat_id)
         if stream is not None and not stream.finalized:
-            if _is_interim_assistant_message(stream, visible_content):
-                result = await self._send_agent_activity_result(
+            message_id = _stream_message_id(stream.stream_id_hex)
+            try:
+                # The final text is authoritative. Finalize the live preview only
+                # when the final is an exact append-only extension of the streamed
+                # text; otherwise drop the preview and send the final verbatim.
+                return await self._finalize_active_stream(
+                    chat_id,
+                    stream,
+                    visible_content,
+                    message_id=message_id,
+                )
+            except NonAppendOnlyUpdate:
+                await self._cancel_stream(
+                    chat_id,
+                    message_id,
+                    stream,
+                    "final text was not append-only",
+                )
+                return await self._send_final_direct(
                     chat_id,
                     visible_content,
                     reply_to_message_id_hex=_optional_hex(reply_to),
                 )
-                if result.success:
-                    self._record_turn_preview_text(chat_id, visible_content)
-                return result
-            if _is_likely_stream_final(stream, visible_content) or _is_continuation_fragment(
-                visible_content
-            ):
-                message_id = _stream_message_id(stream.stream_id_hex)
-                effective = self._resolved_final_text(chat_id, visible_content)
-                stream_effective = _merge_preview_final_text(stream.text.text, visible_content)
-                if effective != stream_effective:
-                    # The durable final needs prefix text (interim commentary or a
-                    # superseded preview) that the live stream transcript does not
-                    # contain, so the stream cannot finalize to the full answer.
-                    await self._cancel_stream(
-                        chat_id,
-                        message_id,
-                        stream,
-                        "final text extends earlier turn output",
-                    )
-                    return await self._send_final_direct(
-                        chat_id,
-                        visible_content,
-                        reply_to_message_id_hex=_optional_hex(reply_to),
-                    )
-                try:
-                    result = await self._finalize_active_stream(
-                        chat_id,
-                        stream,
-                        visible_content,
-                        message_id=message_id,
-                    )
-                    self._turn_preview_text.pop(chat_id, None)
-                    return result
-                except NonAppendOnlyUpdate:
-                    await self._cancel_stream(
-                        chat_id,
-                        message_id,
-                        stream,
-                        "final text was not append-only",
-                    )
-                    return await self._send_final_direct(
-                        chat_id,
-                        visible_content,
-                        reply_to_message_id_hex=_optional_hex(reply_to),
-                    )
-                except Exception as exc:
-                    logger.debug("Marmot live-preview finalize failed: %s", exc)
-                    return SendResult(success=False, error=str(exc), retryable=is_retryable(exc))
-            await self._cancel_stream(
-                chat_id,
-                _stream_message_id(stream.stream_id_hex),
-                stream,
-                "final text was not append-only",
-            )
-            return await self._send_final_direct(
-                chat_id,
-                visible_content,
-                reply_to_message_id_hex=_optional_hex(reply_to),
-            )
-
-        if _is_standalone_interim_reply(visible_content, reply_to) and self._agent_turn_in_progress(
-            chat_id
-        ):
-            result = await self._send_agent_activity_result(
-                chat_id,
-                visible_content,
-                reply_to_message_id_hex=_optional_hex(reply_to),
-            )
-            if result.success:
-                self._record_turn_preview_text(chat_id, visible_content)
-            return result
+            except Exception as exc:
+                logger.debug("Marmot live-preview finalize failed: %s", exc)
+                return SendResult(success=False, error=str(exc), retryable=is_retryable(exc))
 
         return await self._send_final_direct(
             chat_id,
@@ -807,24 +742,12 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             if not finalize:
                 return SendResult(success=True, message_id=message_id)
 
-            effective = self._resolved_final_text(chat_id, visible_content)
-            stream_effective = _merge_preview_final_text(stream.text.text, visible_content)
-            if effective != stream_effective:
-                await self._cancel_stream(
-                    chat_id,
-                    message_id,
-                    stream,
-                    "final text extends earlier turn output",
-                )
-                return await self._send_final_direct(chat_id, visible_content)
-            result = await self._finalize_active_stream(
+            return await self._finalize_active_stream(
                 chat_id,
                 stream,
                 visible_content,
                 message_id=message_id,
             )
-            self._turn_preview_text.pop(chat_id, None)
-            return result
         except NonAppendOnlyUpdate as exc:
             await self._cancel_stream(chat_id, message_id, stream, str(exc))
             if finalize:
@@ -915,7 +838,6 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                 )
                 await self._cancel_other_chat_streams(chat_id, reason="superseded by newer draft")
                 stream = await self._begin_live_stream(chat_id)
-                stream.source = "draft"
                 self._draft_streams[key] = stream
                 self._last_chat_stream[chat_id] = stream
             await stream.append_replacement(visible_content)
@@ -929,41 +851,6 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             logger.debug("Marmot live-preview draft failed: %s", exc)
             return SendResult(success=False, error=str(exc), retryable=is_retryable(exc))
 
-    async def _send_agent_activity_result(
-        self,
-        chat_id: str,
-        text: str,
-        *,
-        reply_to_message_id_hex: Optional[str] = None,
-        status: str = "commentary",
-    ) -> SendResult:
-        try:
-            account_id = await self._ensure_account_id()
-            response = await self.client.send_agent_activity(
-                account_id,
-                chat_id,
-                status=status,
-                text=text,
-                reply_to_message_id_hex=reply_to_message_id_hex,
-            )
-            message_ids = tuple(response.get("message_ids_hex") or ())
-            message_id = message_ids[-1] if message_ids else None
-            if response.get("type") != "app_event_sent" or not message_ids:
-                raise AgentControlError(
-                    "Marmot agent activity send returned no message ids",
-                    code="unexpected_activity_response",
-                    retryable=True,
-                )
-            return SendResult(
-                success=True,
-                message_id=message_id,
-                raw_response=response,
-                continuation_message_ids=message_ids[:-1],
-            )
-        except Exception as exc:
-            logger.debug("Marmot send_agent_activity failed: %s", exc)
-            return SendResult(success=False, error=str(exc), retryable=is_retryable(exc))
-
     async def _finalize_active_stream(
         self,
         chat_id: str,
@@ -972,8 +859,7 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         *,
         message_id: Optional[str] = None,
     ) -> SendResult:
-        effective = _merge_preview_final_text(stream.text.text, final_text)
-        response = await stream.finalize(effective)
+        response = await stream.finalize(final_text)
         if message_id:
             self._active_streams.pop(message_id, None)
         self._forget_stream(chat_id, stream)
@@ -996,35 +882,6 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             continuation_message_ids=message_ids[:-1],
         )
 
-    def _agent_turn_in_progress(self, chat_id: str) -> bool:
-        chat_id = _normalize_hex(chat_id, "chat_id")
-        if chat_id in self._turn_preview_text or chat_id in self._last_chat_stream:
-            return True
-        streams = set(self._active_streams.values()) | set(self._draft_streams.values())
-        return any(stream.group_id_hex == chat_id for stream in streams)
-
-    def _record_turn_preview_text(self, chat_id: str, text: str) -> None:
-        chat_id = _normalize_hex(chat_id, "chat_id")
-        text = str(text or "")
-        if not text:
-            return
-        merged = _merge_turn_text(self._turn_preview_text.get(chat_id, ""), text)
-        if merged:
-            self._turn_preview_text[chat_id] = merged
-
-    def _turn_text_with_stream(self, chat_id: str) -> str:
-        """Best reconstruction of the turn's answer so far: recorded prefix plus live stream."""
-        chat_id = _normalize_hex(chat_id, "chat_id")
-        turn = self._turn_preview_text.get(chat_id, "")
-        stream = self._last_chat_stream.get(chat_id)
-        if stream is not None and not stream.finalized:
-            turn = _merge_turn_text(turn, stream.text.text)
-        return turn
-
-    def _resolved_final_text(self, chat_id: str, content: str) -> str:
-        content = str(content or "")
-        return _merge_preview_final_text(self._turn_text_with_stream(chat_id), content)
-
     async def _send_final_direct(
         self,
         chat_id: str,
@@ -1032,8 +889,6 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         *,
         reply_to_message_id_hex: Optional[str] = None,
     ) -> SendResult:
-        chat_id = _normalize_hex(chat_id, "chat_id")
-        content = self._resolved_final_text(chat_id, content)
         try:
             account_id = await self._ensure_account_id()
             response = await self.client.send_final(
@@ -1042,7 +897,6 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                 content,
                 reply_to_message_id_hex=reply_to_message_id_hex,
             )
-            self._turn_preview_text.pop(chat_id, None)
             message_ids = tuple(response.get("message_ids_hex") or ())
             message_id = message_ids[-1] if message_ids else None
             return SendResult(
@@ -1241,7 +1095,6 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         stream: MarmotLiveStream,
         reason: str,
     ) -> None:
-        self._record_turn_preview_text(chat_id, stream.text.text)
         try:
             await stream.cancel(reason)
         except Exception:
@@ -1315,12 +1168,6 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         group_id_hex = event["group_id_hex"]
         sender_account_id_hex = event["sender_account_id_hex"]
         message_id_hex = event["message_id_hex"]
-        # A new inbound user message starts a new assistant turn; drop any
-        # reconstruction state left over from the previous turn.
-        try:
-            self._turn_preview_text.pop(_normalize_hex(group_id_hex, "group_id_hex"), None)
-        except AgentControlError:
-            pass
         if await self._maybe_handle_profile_name_onboarding(event):
             return
 
@@ -1699,110 +1546,6 @@ def _config_bool(value: Any, *, default: bool) -> bool:
     if not text:
         return default
     return text not in {"0", "false", "no", "off", "disabled"}
-
-
-def _splice_with_overlap(prefix_text: str, fragment: str) -> Optional[str]:
-    """Splice `fragment` onto `prefix_text` at the largest suffix/prefix overlap."""
-    prefix_text = str(prefix_text or "")
-    fragment = str(fragment or "")
-    if not prefix_text or not fragment:
-        return None
-    scan_start = max(0, len(prefix_text) - MAX_TURN_TEXT_OVERLAP_SCAN_CHARS)
-    for start in range(scan_start, len(prefix_text) - MIN_TURN_TEXT_OVERLAP_CHARS + 1):
-        suffix = prefix_text[start:]
-        if fragment.startswith(suffix):
-            return prefix_text[:start] + fragment
-    return None
-
-
-def _merge_turn_text(current: str, text: str) -> str:
-    """Fold newly observed assistant text into the running turn reconstruction."""
-    current = str(current or "")
-    text = str(text or "")
-    if not text:
-        return current
-    if not current:
-        return text
-    if text.startswith(current):
-        return text
-    if current.startswith(text):
-        return current
-    spliced = _splice_with_overlap(current, text)
-    if spliced is not None:
-        return spliced
-    if _is_continuation_fragment(text):
-        return current + text
-    return text
-
-
-def _merge_preview_final_text(accumulated: str, final_text: str) -> str:
-    """Merge a streamed prefix with a continuation-style final fragment when needed."""
-    accumulated = str(accumulated or "")
-    final_text = str(final_text or "")
-    if not accumulated:
-        return final_text
-    if final_text.startswith(accumulated):
-        return final_text
-    spliced = _splice_with_overlap(accumulated, final_text)
-    if spliced is not None:
-        return spliced
-    if _is_continuation_fragment(final_text):
-        return accumulated + final_text
-    return final_text
-
-
-def _is_continuation_fragment(text: str) -> bool:
-    text = str(text or "")
-    if not text:
-        return False
-    if text[0] in CONTINUATION_FRAGMENT_LEADERS:
-        return True
-    return text.startswith("\n\n#")
-
-
-def _is_standalone_interim_reply(text: str, reply_to: Optional[str]) -> bool:
-    if not reply_to:
-        return False
-    visible = str(text or "").strip()
-    if not visible or len(visible) >= INTERIM_ASSISTANT_MESSAGE_MAX_CHARS:
-        return False
-    return not _is_continuation_fragment(text)
-
-
-def _is_likely_stream_final(stream: MarmotLiveStream, final_text: str) -> bool:
-    """Distinguish a stream-final answer from short interim assistant commentary."""
-    effective = _merge_preview_final_text(stream.text.text, final_text)
-    accumulated = stream.text.text
-    if accumulated:
-        if effective.startswith(accumulated):
-            return True
-        if _is_continuation_fragment(final_text):
-            return True
-        return len(effective.strip()) >= INTERIM_ASSISTANT_MESSAGE_MAX_CHARS
-    if _is_continuation_fragment(final_text):
-        return True
-    return len(effective.strip()) >= INTERIM_ASSISTANT_MESSAGE_MAX_CHARS
-
-
-def _is_interim_assistant_message(stream: MarmotLiveStream, final_text: str) -> bool:
-    """Short assistant commentary while a live preview is still in progress."""
-    if stream.source == "draft":
-        return False
-    if _is_continuation_fragment(final_text):
-        return False
-    if _is_likely_stream_final(stream, final_text):
-        return False
-    visible = str(final_text or "").strip()
-    if len(visible) >= INTERIM_ASSISTANT_MESSAGE_MAX_CHARS:
-        return False
-    accumulated = stream.text.text
-    if not accumulated:
-        return True
-    if visible.startswith(accumulated):
-        return False
-    if accumulated and final_text and final_text[0] in CONTINUATION_FRAGMENT_LEADERS:
-        return False
-    return len(accumulated) < INTERIM_ASSISTANT_MESSAGE_MAX_CHARS
 
 
 def _stream_message_id(stream_id_hex: str) -> str:

@@ -232,26 +232,16 @@ does not appear in process environments by default.
 
 - Inbound Marmot messages become Hermes `MessageEvent`s with `chat_id` set to
   the Marmot group id and `user_id` set to the sender account id.
-- Hermes progressive edits open at most one live preview per chat turn. A newer
-  preview cancels the previous stream start for that chat.
-- Successful stream finalization publishes one tagged stream-final `kind: 9`
-  through `stream_finalize`. The adapter does not also send a duplicate plain
-  `send_final` for the same text.
-- Short interim assistant commentary sent while a preview is still open is
-  published as `kind: 1201` agent activity instead of durable `kind: 9` chat.
-- When a final answer arrives as a continuation fragment (for example
-  `, here's the answer` or `:\n\n## Heading`), the adapter merges it with the
-  turn's earlier output — interim commentary, superseded previews, and the live
-  stream — before finalizing or falling back to `send_final`. Overlapping
-  re-sent text is spliced instead of duplicated. If the merged final needs
-  prefix text the stream transcript does not contain, the stream is cancelled
-  and the full text goes out as one plain `send_final`.
-- Turn reconstruction state is dropped when a new inbound user message starts
-  the next turn.
-- Short `reply_to` acknowledgements sent without an active preview stream are
-  published as `kind: 1201` agent activity instead of durable `kind: 9` chat.
-- Non-append-only finals cancel the live preview and fall back to one plain
-  `send_final` with the full final text.
+- Hermes progressive edits open at most one live preview per chat at a time. A
+  newer preview cancels the previous stream for that chat.
+- Durable message text is exactly what Hermes hands the adapter. The adapter
+  never merges, splices, or reconstructs text across sends; fragmented or
+  duplicated finals must be fixed in Hermes message segmentation.
+- A plain send while a preview is open finalizes that stream as one tagged
+  stream-final `kind: 9` when the final text is an append-only extension of the
+  streamed text. There is no duplicate plain `send_final` for the same text.
+- Otherwise the preview is cancelled and the final goes out verbatim as one
+  plain `send_final`.
 - Status records are included in the stream transcript hash and chunk count.
 
 Run the shim tests with:
