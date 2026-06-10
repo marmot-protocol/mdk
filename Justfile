@@ -84,6 +84,9 @@ hermes-phone-test-logs:
 hermes-phone-test-down:
     docker compose --profile hermes-phone-test down
 
+hermes-phone-test-reset:
+    docker compose --profile hermes-phone-test down -v
+
 hermes-dev-smoke root="":
     #!/usr/bin/env bash
     set -euo pipefail

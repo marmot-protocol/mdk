@@ -199,6 +199,12 @@ Stop the container while preserving the named volume:
 just hermes-phone-test-down
 ```
 
+Stop the container and delete the named volume for a fresh agent account and KeyPackage:
+
+```sh
+just hermes-phone-test-reset
+```
+
 ## Rollback
 
 Stop Hermes first, then `dm-agent`:

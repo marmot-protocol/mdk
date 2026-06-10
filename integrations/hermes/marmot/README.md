@@ -175,6 +175,12 @@ Stop the container without deleting the agent account:
 just hermes-phone-test-down
 ```
 
+Stop the container and delete all persisted agent/Hermes data for a fresh bootstrap:
+
+```sh
+just hermes-phone-test-reset
+```
+
 ## Configuration
 
 Start the connector first with the same public Nostr relay set the phone uses:
