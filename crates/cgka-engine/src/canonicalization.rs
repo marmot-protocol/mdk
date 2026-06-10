@@ -6,7 +6,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::convergence::{AppWitness, BranchCandidate, ConvergencePolicy, select_canonical_branch};
+use crate::convergence::{
+    AppWitness, BranchCandidate, ConvergencePolicy, is_branch_eligible, select_canonical_branch,
+};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -130,6 +132,8 @@ pub struct CanonicalizationResult {
     /// post-settle reorg; never an input to convergence or branch selection.
     pub selected_fork_epoch: Option<u64>,
     pub selected_branch_id: Option<String>,
+    pub candidate_count: usize,
+    pub eligible_count: usize,
     pub convergence_status: ConvergenceStatus,
     pub accepted_commits: Vec<String>,
     pub accepted_proposals: Vec<String>,
@@ -234,6 +238,18 @@ fn canonicalize_internal(
         &materialized_graph.candidates,
         &input.policy.convergence,
     );
+    let candidate_count = materialized_graph.candidates.len();
+    let eligible_count = materialized_graph
+        .candidates
+        .iter()
+        .filter(|candidate| {
+            is_branch_eligible(
+                input.state.current_tip_epoch,
+                candidate,
+                &input.policy.convergence,
+            )
+        })
+        .count();
     let selected_branch_id = selected_branch.map(|branch| branch.id.clone());
     let selected_tip = selected_branch.map(|branch| branch.tip_epoch);
     let selected_fork_epoch = selected_branch.map(|branch| branch.fork_epoch);
@@ -243,6 +259,8 @@ fn canonicalize_internal(
         selected_tip,
         selected_fork_epoch,
         selected_branch_id: selected_branch_id.clone(),
+        candidate_count,
+        eligible_count,
         // Provisional; recomputed after dispositions are known so we can
         // distinguish Settled (fixed point) from Resolving (window
         // closed, more work pending).

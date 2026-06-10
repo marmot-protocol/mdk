@@ -37,6 +37,11 @@ pub(crate) enum AutoCommitDecision {
     Observe,
 }
 
+pub(crate) struct AutoCommitDecisionReport {
+    pub decision: AutoCommitDecision,
+    pub reason: &'static str,
+}
+
 /// Inspect a QueuedProposal and decide whether we should auto-commit.
 ///
 /// Criteria:
@@ -56,24 +61,40 @@ pub(crate) enum AutoCommitDecision {
 /// - **§151 remove-beats-self-remove**: a precedence rule when both a
 ///   Remove and a SelfRemove target the same leaf in the same pending
 ///   queue. The engine does not produce Remove proposals yet.
-pub(crate) fn decide(mls_group: &MlsGroup, proposal: &QueuedProposal) -> AutoCommitDecision {
+pub(crate) fn decide_with_reason(
+    mls_group: &MlsGroup,
+    proposal: &QueuedProposal,
+) -> AutoCommitDecisionReport {
     // (1) SelfRemove only.
     match proposal.proposal() {
         Proposal::SelfRemove => {}
-        _ => return AutoCommitDecision::Observe,
+        _ => {
+            return AutoCommitDecisionReport {
+                decision: AutoCommitDecision::Observe,
+                reason: "proposal_not_self_remove",
+            };
+        }
     }
 
     // Identify the leaver.
     let leaver_idx: LeafNodeIndex = match proposal.sender() {
         Sender::Member(i) => *i,
-        _ => return AutoCommitDecision::Observe,
+        _ => {
+            return AutoCommitDecisionReport {
+                decision: AutoCommitDecision::Observe,
+                reason: "sender_not_member",
+            };
+        }
     };
 
     let own = mls_group.own_leaf_index();
 
     // (2) We are not the target.
     if own == leaver_idx {
-        return AutoCommitDecision::Observe;
+        return AutoCommitDecisionReport {
+            decision: AutoCommitDecision::Observe,
+            reason: "we_are_target",
+        };
     }
 
     // (3) We are the lowest-index remaining non-target member.
@@ -83,7 +104,10 @@ pub(crate) fn decide(mls_group: &MlsGroup, proposal: &QueuedProposal) -> AutoCom
         .filter(|i| *i != leaver_idx)
         .min();
     if lowest != Some(own) {
-        return AutoCommitDecision::Observe;
+        return AutoCommitDecisionReport {
+            decision: AutoCommitDecision::Observe,
+            reason: "not_lowest_remaining_member",
+        };
     }
 
     // (4) member-departure.md:23-26 — an admin must leave the admin set before
@@ -95,20 +119,34 @@ pub(crate) fn decide(mls_group: &MlsGroup, proposal: &QueuedProposal) -> AutoCom
     // we do NOT commit. A corrupted group is not a state the auto-
     // committer should advance on best-effort.
     let Ok(admins) = crate::app_components::admins_of_group(mls_group) else {
-        return AutoCommitDecision::Observe;
+        return AutoCommitDecisionReport {
+            decision: AutoCommitDecision::Observe,
+            reason: "admin_set_unreadable",
+        };
     };
     let leaver_pubkey = match pubkey_at_leaf_index(mls_group, leaver_idx) {
         PubkeyResult::Ok(p) => Some(p),
-        PubkeyResult::MalformedIdentity => return AutoCommitDecision::Observe,
+        PubkeyResult::MalformedIdentity => {
+            return AutoCommitDecisionReport {
+                decision: AutoCommitDecision::Observe,
+                reason: "leaver_identity_malformed",
+            };
+        }
         PubkeyResult::LeafMissing => None,
     };
     if let Some(leaver_pubkey) = leaver_pubkey
         && admins.iter().any(|admin| admin == &leaver_pubkey)
     {
-        return AutoCommitDecision::Observe;
+        return AutoCommitDecisionReport {
+            decision: AutoCommitDecision::Observe,
+            reason: "leaver_still_admin",
+        };
     }
 
-    AutoCommitDecision::Commit
+    AutoCommitDecisionReport {
+        decision: AutoCommitDecision::Commit,
+        reason: "self_remove_lowest_remaining_member",
+    }
 }
 
 enum PubkeyResult {

@@ -596,6 +596,8 @@ fn missing_retained_anchor_result(
         selected_tip: None,
         selected_fork_epoch: None,
         selected_branch_id: None,
+        candidate_count: 0,
+        eligible_count: 0,
         convergence_status,
         accepted_commits: Vec::new(),
         accepted_proposals: Vec::new(),

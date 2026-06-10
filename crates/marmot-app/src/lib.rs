@@ -75,6 +75,7 @@ use transport_nostr_adapter::{
 use transport_nostr_peeler::{NostrMlsPeeler, NostrTransportEvent};
 
 mod agent_streams;
+mod app_telemetry;
 mod client;
 mod config;
 mod directory;
@@ -107,6 +108,9 @@ pub use storage_sqlite::{TimelineMessageChange, TimelineRemoveReason, TimelineUp
 pub use agent_streams::{
     AgentStreamDelta, AgentStreamUpdate, AgentStreamWatchCompletion, AgentStreamWatchManager,
     AgentStreamWatchReport, AgentStreamWatchStart,
+};
+pub use app_telemetry::{
+    AppPerformanceOperationSnapshot, AppPerformanceSnapshot, AppPerformanceTelemetry,
 };
 pub use client::AppClient;
 pub use config::{
@@ -144,7 +148,8 @@ pub use relay_plane::{
 };
 pub use relay_telemetry_export::{
     ExportHistogram, ExportMetricPoint, ExportMetricValue, RelayExportError,
-    RelayTelemetryExportBatch, RelayTelemetryExporter, build_export_batch, metric_names,
+    RelayTelemetryExportBatch, RelayTelemetryExporter, build_export_batch,
+    build_export_batch_with_app_performance, metric_names,
 };
 pub use storage_sqlite::{
     ChatListAvatar, ChatListMessagePreview, ChatListQuery, ChatListRow, TimelineMessageQuery,

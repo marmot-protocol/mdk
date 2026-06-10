@@ -98,7 +98,8 @@ Most account-scoped commands resolve the account in this order:
 
 1. `--account <npub-or-hex>`
 2. `DM_ACCOUNT`
-3. the only local signing account, when exactly one exists
+3. the only account, when exactly one exists — whether or not it can sign; a public-only account is still selected
+   here, and commands that require signing then fail with an explicit error
 
 Public-only identities can be added with `dm login <npub-or-hex>`. They are useful for relay-list
 and KeyPackage lookup, but cannot sign, publish KeyPackages, sync groups, or send messages.
@@ -135,11 +136,16 @@ KeyPackage commands:
 
 ```sh
 dm --account <npub-or-hex> keys list
+dm --account <npub-or-hex> keys publish
+dm --account <npub-or-hex> keys rotate
 dm keys fetch <npub-or-hex> --bootstrap-relays <relay-url>
 dm keys check <npub-or-hex>
 dm --account <npub-or-hex> keys delete <event-id>
 dm --account <npub-or-hex> keys delete-all --confirm
 ```
+
+`keys publish` republishes the currently cached KeyPackage; `keys rotate` (alias `force-publish`) force-mints and
+publishes a fresh replacement KeyPackage.
 
 KeyPackage publish/fetch/check/list use the current relay-directory path. Relay deletion commands are present but return
 `unsupported_command` until Nostr deletion is wired through the app runtime.
@@ -149,6 +155,7 @@ Chat projection commands:
 ```sh
 dm --account <npub-or-hex> chats list
 dm --account <npub-or-hex> chats list --include-archived
+dm --account <npub-or-hex> chats list-archived
 dm --account <npub-or-hex> chats show <group-hex>
 dm --account <npub-or-hex> chats subscribe
 dm --account <npub-or-hex> chats subscribe-archived
@@ -198,7 +205,13 @@ dm --account <npub-or-hex> messages unreact <group-hex> <message-id>
 dm --account <npub-or-hex> messages delete <group-hex> <message-id>
 dm --account <npub-or-hex> messages retry <group-hex> <event-id>
 dm --account <npub-or-hex> messages subscribe <group-hex> --limit 50
+dm --account <npub-or-hex> messages timeline list <group-hex> --limit 20
+dm --account <npub-or-hex> messages timeline search <group-hex> <query> --limit 20
+dm --account <npub-or-hex> messages timeline subscribe <group-hex>
 ```
+
+The `messages timeline` subcommands list, search, and subscribe to the materialized message timeline (the projection
+that interleaves messages, media, and agent-stream anchors/finals in conversation order).
 
 Projected history is ordered by recorded message time first, then local receipt/insertion order. That keeps synced
 stream anchors and final markers in conversation order instead of relay catch-up order.
@@ -219,7 +232,9 @@ dm --account <npub-or-hex> media download <group-hex> <file-hash> --output ./fil
 ```
 
 `media upload` encrypts the file with the group's current `MLS-Exporter("marmot", "encrypted-media", 32)` media secret,
-uploads the ciphertext to Blossom (`https://blossom.primal.net` by default), and optionally sends a kind-9 media message.
+uploads the ciphertext to Blossom, and optionally sends a kind-9 media message. Without `--server`, the upload targets
+the endpoints in the group's `marmot.group.encrypted-media.v1` component (`https://blossom.primal.net` is the endpoint
+baked into newly created groups' component, not a hardcoded CLI default).
 Upload JSON returns an `attachments` array with each attachment's `plaintext_sha256`, `ciphertext_sha256`, and locators.
 `media download` resolves a projected media reference by plaintext hash, fetches the encrypted blob, verifies it,
 decrypts it, and writes the plaintext file.
@@ -232,10 +247,12 @@ dm debug relay-control-state
 dm --account <npub-or-hex> follows list
 dm --account <npub-or-hex> follows add <npub-or-hex>
 dm --account <npub-or-hex> follows remove <npub-or-hex>
+dm --account <npub-or-hex> follows check <npub-or-hex>
 dm --account <npub-or-hex> profile show
 dm --account <npub-or-hex> profile update --name <name> --about <text>
 dm --account <npub-or-hex> relays list --type nip65
 dm --account <npub-or-hex> relays add <relay-url> --type inbox
+dm --account <npub-or-hex> relays remove <relay-url> --type inbox
 dm settings show
 dm settings theme dark
 dm settings language en
@@ -266,7 +283,8 @@ dm stream send --broker --connect 127.0.0.1:4450 --insecure-local \
   --stream-id <stream-hex> --start-event-id <start-message-id-hex> "hello over quic"
 dm stream send --connect <host:port> --server-name <dns-name> "hello over quic"
 dm --account <npub-or-hex> stream finish <group-hex> \
-  --stream-id <stream-hex> --transcript-hash <hash-hex> --chunk-count <n> "hello over quic"
+  --stream-id <stream-hex> --start-event-id <start-message-id-hex> \
+  --transcript-hash <hash-hex> --chunk-count <n> "hello over quic"
 dm --account <npub-or-hex> stream verify <group-hex> \
   --stream-id <stream-hex> --transcript-hash <hash-hex> --chunk-count <n>
 ```
@@ -412,7 +430,7 @@ Controls:
 Composer slash commands:
 
 ```text
-/sync
+/help
 /refresh
 /account <npub-or-hex>
 /create-identity
@@ -430,6 +448,9 @@ Composer slash commands:
 /members remove <npub-or-hex> [...]
 /members list
 /keys fetch <npub-or-hex>
+/keys rotate
+/name <display-name>
+/profile name <display-name>
 /stream [--stream-id <hex>] [--quic-candidate <quic-url>]
 /stream start [--stream-id <hex>] --quic-candidate <quic-url>
 /stream watch [--stream-id <hex>] [--insecure-local]
@@ -449,7 +470,8 @@ Stream commands operate on the selected chat. `/stream watch` starts a daemon ba
 appear as provisional preview rows in the message panel. `/stream` opens the TUI stream composer, publishes the stream
 anchor, starts the receiver watch through the daemon, and then treats the next submitted composer line as the streamed
 text to finish.
-`/sync` is a diagnostic escape hatch for explicit catch-up; it is not part of the normal live runtime path.
+There is no `/sync` slash command in the TUI; it rejects `/sync` because live updates come from subscriptions. Explicit
+catch-up is the CLI-only `dm sync` command, used as a diagnostic/repair escape hatch outside the TUI.
 
 ## JSON Output
 

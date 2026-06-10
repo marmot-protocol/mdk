@@ -112,9 +112,10 @@ The current vector work is tracked in the engine quality plan:
 `docs/marmot-architecture/overview/cgka-engine-quality-and-vectors.md`.
 The crate now has [`vectors/manifest.v1.json`](vectors/manifest.v1.json),
 [`vectors/byte-fixtures/schema.v1.json`](vectors/byte-fixtures/schema.v1.json), first app-component byte fixtures, and
-portable scenario vectors for message exchange, pending rollback, invites, group-data updates, queue faults, partition
-repair, leave, delayed past-epoch app delivery, restart plus delayed duplicate delivery, and fork recovery. It does not
-yet have a full byte-level wire-event suite.
+portable scenario vectors for message exchange, pending rollback, invites, group-data updates, admin-policy
+promotion/demotion (`vectors/admin-policy-update.v1.json`), queue faults, partition repair, leave, delayed past-epoch
+app delivery, restart plus delayed duplicate delivery, and fork recovery. It does not yet have a full byte-level
+wire-event suite.
 
 For a human-readable list of each fixed scenario, generated family, and Rust-only harness case, read
 [`SCENARIOS.md`](SCENARIOS.md).
@@ -146,6 +147,9 @@ recovery without pinning which invite branch wins.
 - `create_group`
 - `invite_members`
 - `update_group_data`
+- `update_admin_policy`
+- `expect_update_admin_policy_error`
+- `observe_admin_policy`
 - `confirm_pending`
 - `fail_pending`
 - `send_app_message`

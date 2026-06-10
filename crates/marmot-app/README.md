@@ -8,11 +8,13 @@ account/session/engine crates.
 
 It owns the first app projections:
 
-- shared app cache in `app-cache.sqlite3` for the Nostr user directory: local-account links, profile metadata,
-  follow-list caches, bounded search-graph edges, discovered user relay lists, and KeyPackages;
-- per-account SQLCipher app state in `accounts/<label>/app.sqlite3` for joined groups, app-component
-  profile/image/admin/Nostr-routing projections, pending invite confirmation state, seen relay events, and
-  sent/received message projections.
+- a per-account SQLCipher directory cache at `accounts/<label>/app-cache.sqlite3` for the Nostr user directory:
+  local-account links, profile metadata, follow-list caches, bounded search-graph edges, discovered user relay lists,
+  and KeyPackages (the root-level `app-cache.sqlite3` is a legacy location that is migrated and then removed);
+- per-account SQLCipher app state in the account's storage database (`accounts/<label>/session.sqlite`) for joined
+  groups, app-component profile/image/admin/Nostr-routing projections, pending invite confirmation state, seen relay
+  events, and sent/received message projections. The older `accounts/<label>/app.sqlite3` is the legacy projection
+  database; its contents are imported once (tracked by the `legacy-account-projection-v1` marker) and then superseded.
 
 The app runtime exposes those projections through account status, group listing/showing, message listing, and
 snapshot-plus-live subscription APIs so CLI and TUI surfaces can inspect app state without opening the databases

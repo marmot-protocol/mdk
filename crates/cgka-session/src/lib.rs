@@ -11,7 +11,6 @@ use cgka_engine::account_identity_proof::AccountIdentityProofSigner;
 use cgka_engine::canonicalization::CanonicalizationPolicy;
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::{Engine, EngineBuilder};
-use cgka_traits::SecretBytes;
 use cgka_traits::app_components::{AppComponentId, AppComponentSet, default_group_components};
 use cgka_traits::engine::{
     CgkaEngine, CreateGroupRequest, GroupEvent, KeyPackage, SendIntent, SendResult,
@@ -24,7 +23,12 @@ use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::storage::StorageError;
 use cgka_traits::transport::TransportMessage;
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
-use marmot_forensics::ForensicRecorder;
+use cgka_traits::{
+    SecretBytes, TransportDelivery, TransportDeliveryPlane, TransportDeliverySource,
+};
+use marmot_forensics::{
+    AuditEventContext, AuditEventKind, AuditTransportContext, ForensicRecorder,
+};
 use storage_sqlite::{SqlCipherKey, SqliteAccountStorage, SqliteStorageOptions};
 
 const TRACE_TARGET: &str = "cgka_session::session";
@@ -196,6 +200,7 @@ impl AccountDeviceSession {
         let mut engine = builder.build()?;
         engine.hydrate_stable_groups_from_storage()?;
         engine.set_convergence_policy(config.convergence_policy);
+        engine.audit_recorder_health();
         tracing::debug!(
             target: TRACE_TARGET,
             method = "open",
@@ -309,6 +314,32 @@ impl AccountDeviceSession {
         Ok(CreateGroupEffects { group_id, effects })
     }
 
+    pub async fn create_group_with_audit_context(
+        &mut self,
+        req: CreateGroupRequest,
+        context: AuditEventContext,
+    ) -> SessionResult<CreateGroupEffects> {
+        tracing::debug!(
+            target: TRACE_TARGET,
+            method = "create_group_with_audit_context",
+            invitee_count = req.members.len(),
+            required_feature_count = req.required_features.len(),
+            initial_admin_count = req.initial_admins.len(),
+            "creating group"
+        );
+        let (group_id, result) = self
+            .engine
+            .create_group_with_audit_context(req, Some(context))
+            .await?;
+        tracing::debug!(
+            target: TRACE_TARGET,
+            method = "create_group_with_audit_context",
+            "group created"
+        );
+        let effects = self.collect_effects(vec![result]);
+        Ok(CreateGroupEffects { group_id, effects })
+    }
+
     pub async fn send(&mut self, intent: SendIntent) -> SessionResult<SessionEffects> {
         tracing::debug!(
             target: TRACE_TARGET,
@@ -320,6 +351,30 @@ impl AccountDeviceSession {
         tracing::debug!(
             target: TRACE_TARGET,
             method = "send",
+            result_kind = send_result_kind(&result),
+            "local intent accepted"
+        );
+        Ok(self.collect_effects(vec![result]))
+    }
+
+    pub async fn send_with_audit_context(
+        &mut self,
+        intent: SendIntent,
+        context: AuditEventContext,
+    ) -> SessionResult<SessionEffects> {
+        tracing::debug!(
+            target: TRACE_TARGET,
+            method = "send_with_audit_context",
+            intent_kind = send_intent_kind(&intent),
+            "sending local intent"
+        );
+        let result = self
+            .engine
+            .send_with_audit_context(intent, Some(context))
+            .await?;
+        tracing::debug!(
+            target: TRACE_TARGET,
+            method = "send_with_audit_context",
             result_kind = send_result_kind(&result),
             "local intent accepted"
         );
@@ -338,6 +393,30 @@ impl AccountDeviceSession {
             method = "ingest",
             outcome_kind = ingest_outcome_kind(&outcome),
             "transport message ingested"
+        );
+        let effects = self.collect_effects(vec![]);
+        Ok(IngestEffects { outcome, effects })
+    }
+
+    pub async fn ingest_delivery(
+        &mut self,
+        delivery: TransportDelivery,
+    ) -> SessionResult<IngestEffects> {
+        tracing::debug!(
+            target: TRACE_TARGET,
+            method = "ingest_delivery",
+            "ingesting transport delivery"
+        );
+        let transport_context = audit_transport_context(delivery.source);
+        let outcome = self
+            .engine
+            .ingest_with_audit_context(delivery.message, Some(transport_context))
+            .await?;
+        tracing::debug!(
+            target: TRACE_TARGET,
+            method = "ingest_delivery",
+            outcome_kind = ingest_outcome_kind(&outcome),
+            "transport delivery ingested"
         );
         let effects = self.collect_effects(vec![]);
         Ok(IngestEffects { outcome, effects })
@@ -432,6 +511,19 @@ impl AccountDeviceSession {
         self.engine.set_convergence_policy(policy);
     }
 
+    pub fn record_audit_event(
+        &self,
+        group_id: Option<&GroupId>,
+        context: Option<AuditEventContext>,
+        kind: AuditEventKind,
+    ) {
+        self.engine.audit_external(group_id, context, kind);
+    }
+
+    pub fn record_audit_health(&self) {
+        self.engine.audit_recorder_health();
+    }
+
     fn collect_effects(&mut self, results: Vec<SendResult>) -> SessionEffects {
         let mut effects = SessionEffects {
             events: self.engine.drain_events(),
@@ -510,5 +602,23 @@ fn ingest_outcome_kind(outcome: &IngestOutcome) -> &'static str {
         IngestOutcome::Processed => "processed",
         IngestOutcome::Buffered { .. } => "buffered",
         IngestOutcome::Stale { .. } => "stale",
+    }
+}
+
+fn audit_transport_context(source: TransportDeliverySource) -> AuditTransportContext {
+    AuditTransportContext {
+        transport_source: source.transport.0,
+        delivery_plane: Some(delivery_plane_label(source.plane).to_string()),
+        relay_url: source.endpoint.map(|endpoint| endpoint.0),
+        subscription_id: source.subscription_id,
+    }
+}
+
+fn delivery_plane_label(plane: TransportDeliveryPlane) -> &'static str {
+    match plane {
+        TransportDeliveryPlane::Discovery => "discovery",
+        TransportDeliveryPlane::AccountInbox => "account_inbox",
+        TransportDeliveryPlane::Group => "group",
+        TransportDeliveryPlane::Ephemeral => "ephemeral",
     }
 }

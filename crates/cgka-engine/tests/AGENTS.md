@@ -66,6 +66,9 @@ backend on the same rail.
 - **File:** `update_group_data.rs`
   - **Owns:** Group profile `AppDataUpdate` commits and convergence-side Marmot record refresh
 
+- **File:** `audit_log.rs`
+  - **Owns:** Append-only forensic audit log wiring — recorder install, JSONL round-trip, and no-op default behavior
+
 ```sh
 cargo test -p cgka-engine
 ```
@@ -82,6 +85,30 @@ cargo test -p cgka-engine
 - **File:** `proptest_invariants.rs`
   - **Owns:** Property tests for selector order, canonicalization, capability negotiation, lifecycle/restart behavior,
     generated send/leave histories, and delivery-profile convergence
+
+- **File:** `candidate_state_graph.rs`
+  - **Owns:** Candidate-state-graph branch-selection assertions
+
+- **File:** `canonicalization_contract.rs`
+  - **Owns:** Executable canonicalization-contract assertions (quiescence, resolving/settled status)
+
+- **File:** `generated_policy_cases.rs`
+  - **Owns:** Generated bounded convergence-policy cases shared with the Tamarin model
+
+- **File:** `openmls_replay_probe.rs`
+  - **Owns:** OpenMLS replay-probe behavior
+
+- **File:** `report_runner.rs`
+  - **Owns:** Generated-report runner coverage
+
+- **File:** `sqlite_storage_modes.rs`
+  - **Owns:** Harness storage-mode coverage over temp file-backed SQLite
+
+- **File:** `tracing_audit.rs`
+  - **Owns:** Repo-wide tracing/logging privacy-invariant enforcement
+
+- **File:** `vector_artifacts.rs`
+  - **Owns:** Vector manifest and byte-fixture well-formedness checks
 
 Quick CI run:
 
@@ -118,8 +145,9 @@ Run before checkpointing broad storage/engine changes; the exact count changes a
   `crates/cgka-conformance-simulator/vectors/`, and use `cgka-conformance-simulator-report` for generated report
   artifacts.
 
-## Why no in-crate `#[cfg(test)]` modules
+## Why most engine modules have no in-crate `#[cfg(test)]` modules
 
-The engine modules are intentionally test-free: testing them requires an `Engine<S>` instance which requires a storage
-backend. All engine assertions go through `tests/*.rs` integration files, using `storage-sqlite` in-memory mode unless
-the test explicitly needs encrypted file-backed persistence.
+Testing engine behavior requires an `Engine<S>` instance which requires a storage backend, so engine-behavior assertions
+go through `tests/*.rs` integration files, using `storage-sqlite` in-memory mode unless the test explicitly needs
+encrypted file-backed persistence. The exceptions are `src/identity.rs` and `src/engine_metrics.rs`, which carry small
+in-crate `#[cfg(test)]` modules for pure-data logic that needs no `Engine` instance.

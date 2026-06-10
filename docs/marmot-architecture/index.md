@@ -1,7 +1,7 @@
 ---
 title: "Marmot Architecture — Index"
 created: 2026-04-15
-updated: 2026-06-08
+updated: 2026-06-10
 tags: [marmot, architecture, index]
 ---
 
@@ -112,6 +112,14 @@ These are longer working documents. Go here when you need depth, not orientation
 - **Doc:** [`relay-observability.md`](./relay-observability.md)
   - **What it covers:** Export contract for client-side relay performance telemetry: the opt-in/aggregate/k-anonymous
     privacy contract, metric catalogue, collection architecture, and the proposed observability.md amendment.
+
+- **Doc:** [`telemetry.md`](./telemetry.md)
+  - **What it covers:** Current implementation inventory for relay telemetry, OTLP export, engine reorg metrics,
+    tracing/logging guardrails, local surfaces, and exactly what fields are collected or exported.
+
+- **Doc:** [`audit-logging.md`](./audit-logging.md)
+  - **What it covers:** Current implementation inventory for opt-in forensic JSONL logs, file identity, every event
+    kind and metadata field, upload/tracker behavior, and downstream tooling guidance.
 
 - **Doc:** [`../../spec/README.md`](../../spec/README.md)
   - **What it covers:** Marmot v2 protocol draft by stable protocol surface and app component.

@@ -5,6 +5,7 @@
 //! can group on.
 
 use cgka_traits::engine::{SendIntent, SendResult};
+use cgka_traits::error::{EngineError, PeelerError};
 use cgka_traits::ingest::{IngestOutcome, StaleReason};
 use cgka_traits::message::MessageState;
 use cgka_traits::transport::{TransportEnvelope, TransportMessage};
@@ -73,6 +74,13 @@ pub(crate) fn ingest_outcome_epoch(outcome: &IngestOutcome) -> Option<u64> {
     }
 }
 
+pub(crate) fn ingest_outcome_group_ref(outcome: &IngestOutcome) -> Option<String> {
+    match outcome {
+        IngestOutcome::Buffered { group_id, .. } => Some(hex::encode(group_id.as_slice())),
+        _ => None,
+    }
+}
+
 pub(crate) fn send_intent_kind_str(intent: &SendIntent) -> &'static str {
     match intent {
         SendIntent::AppMessage { .. } => "app_message",
@@ -81,6 +89,17 @@ pub(crate) fn send_intent_kind_str(intent: &SendIntent) -> &'static str {
         SendIntent::Leave { .. } => "leave",
         SendIntent::UpdateAppComponents { .. } => "update_app_components",
         SendIntent::UpdateGroupData { .. } => "update_group_data",
+    }
+}
+
+pub(crate) fn send_intent_group_ref(intent: &SendIntent) -> Option<String> {
+    match intent {
+        SendIntent::AppMessage { group_id, .. }
+        | SendIntent::Invite { group_id, .. }
+        | SendIntent::RemoveMembers { group_id, .. }
+        | SendIntent::Leave { group_id }
+        | SendIntent::UpdateAppComponents { group_id, .. }
+        | SendIntent::UpdateGroupData { group_id, .. } => Some(hex::encode(group_id.as_slice())),
     }
 }
 
@@ -137,6 +156,7 @@ pub(crate) fn ingest_entry_event(msg: &TransportMessage) -> AuditEventKind {
     AuditEventKind::IngestEntry {
         msg_id: hex::encode(msg.id.as_slice()),
         envelope_kind: envelope_kind_str(&msg.envelope).to_string(),
+        transport_source: msg.source.0.clone(),
         payload_len: msg.payload.len() as u64,
         payload_digest: hex::encode(Sha256::digest(&msg.payload)) as DigestHex,
     }
@@ -166,7 +186,25 @@ pub(crate) fn message_state_changed_event(
 ) -> AuditEventKind {
     AuditEventKind::MessageStateChanged {
         msg_id: msg_id_hex,
+        previous_state: None,
         new_state: message_state_str(state).to_string(),
+        epoch: None,
+        reason: reason.to_string(),
+    }
+}
+
+pub(crate) fn message_state_transition_event(
+    msg_id_hex: MessageRefHex,
+    previous_state: Option<MessageState>,
+    state: MessageState,
+    epoch: Option<EpochId>,
+    reason: &str,
+) -> AuditEventKind {
+    AuditEventKind::MessageStateChanged {
+        msg_id: msg_id_hex,
+        previous_state: previous_state.map(message_state_str).map(str::to_string),
+        new_state: message_state_str(state).to_string(),
+        epoch: epoch.map(|epoch| epoch.0),
         reason: reason.to_string(),
     }
 }
@@ -179,6 +217,53 @@ pub(crate) fn send_outcome_event(intent_kind: String, result: &SendResult) -> Au
         result_kind: send_result_kind_str(result).to_string(),
         outbound_msg_id,
         outbound_welcome_msg_ids,
+    }
+}
+
+pub(crate) fn create_group_outcome_event(result: &SendResult) -> AuditEventKind {
+    let (_outbound_msg_id, outbound_welcome_msg_ids) = send_outbound_ids(result);
+    AuditEventKind::CreateGroupOutcome {
+        result_kind: send_result_kind_str(result).to_string(),
+        outbound_welcome_msg_ids,
+    }
+}
+
+pub(crate) fn engine_error_kind(err: &EngineError) -> &'static str {
+    match err {
+        EngineError::UnknownGroup(_) => "unknown_group",
+        EngineError::UnknownPending => "unknown_pending",
+        EngineError::NotAMember { .. } => "not_a_member",
+        EngineError::NotGroupAdmin { .. } => "not_group_admin",
+        EngineError::UnknownMember { .. } => "unknown_member",
+        EngineError::InvalidCredentialIdentity(_) => "invalid_credential_identity",
+        EngineError::AdminCannotSelfRemove { .. } => "admin_cannot_self_remove",
+        EngineError::AdminDepletion { .. } => "admin_depletion",
+        EngineError::MissingRequiredCapabilities { .. } => "missing_required_capabilities",
+        EngineError::UnsupportedCiphersuite { .. } => "unsupported_ciphersuite",
+        EngineError::InvalidAppMessagePayload(_) => "invalid_app_message_payload",
+        EngineError::InvalidAccountIdentityProof(_) => "invalid_account_identity_proof",
+        EngineError::ForkedEpoch { .. } => "forked_epoch",
+        EngineError::InvalidTransition(_) => "invalid_transition",
+        EngineError::Storage(_) => "storage",
+        EngineError::Peeler(_) => "peeler",
+        EngineError::Serialize(_) => "serialize",
+        EngineError::Backend(_) => "backend",
+        EngineError::Other(_) => "other",
+    }
+}
+
+pub(crate) fn engine_error_detail(err: &EngineError) -> Option<String> {
+    Some(err.to_string())
+}
+
+pub(crate) fn peeler_error_kind(err: &PeelerError) -> &'static str {
+    match err {
+        PeelerError::Malformed(_) => "malformed",
+        PeelerError::DecryptFailed => "decrypt_failed",
+        PeelerError::StaleEpoch { .. } => "stale_epoch",
+        PeelerError::MissingContext { .. } => "missing_context",
+        PeelerError::WrapFailed(_) => "wrap_failed",
+        PeelerError::Backend(_) => "backend",
     }
 }
 

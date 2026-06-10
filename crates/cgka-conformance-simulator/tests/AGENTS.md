@@ -26,8 +26,14 @@ Map for simulator tests.
 - **File:** `report_runner.rs`
   - **Owns:** Report artifact runner, oracle evidence, and coverage matrix coverage.
 
+- **File:** `sqlite_storage_modes.rs`
+  - **Owns:** Harness storage-mode coverage over temp file-backed SQLite.
+
 - **File:** `tracing_audit.rs`
   - **Owns:** Repo-wide production tracing privacy audit.
+
+- **File:** `vector_artifacts.rs`
+  - **Owns:** Vector manifest and byte-fixture well-formedness checks.
 
 ## Rules
 

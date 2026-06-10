@@ -26,7 +26,10 @@ use cgka_traits::storage::StorageProvider;
 use cgka_traits::transport::TransportMessage;
 use cgka_traits::types::MessageId;
 use cgka_traits::types::{EpochId, GroupId, MemberId};
-use marmot_forensics::{AuditEventKind, AuditRecord, ForensicRecorder, NoopRecorder};
+use marmot_forensics::{
+    AuditEngineContext, AuditEventContext, AuditEventKind, AuditGroupContext, AuditRecord,
+    ForensicRecorder, NoopRecorder,
+};
 use openmls_rust_crypto::RustCrypto;
 pub use openmls_traits::types::Ciphersuite;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -84,6 +87,7 @@ pub struct Engine<S: StorageProvider> {
     /// at every state-relevant decision point so a later analyzer can
     /// reconstruct what each device saw and decided.
     pub(crate) recorder: Box<dyn ForensicRecorder>,
+    pub(crate) audit_operation_counter: u64,
 }
 
 // ── Builder ─────────────────────────────────────────────────────────────────
@@ -214,11 +218,143 @@ impl<S: StorageProvider> EngineBuilder<S> {
             convergence_clock_started_at: Instant::now(),
             engine_metrics: crate::engine_metrics::EngineMetrics::default(),
             recorder: self.recorder.unwrap_or_else(|| Box::new(NoopRecorder)),
+            audit_operation_counter: 0,
         })
     }
 }
 
 impl<S: StorageProvider> Engine<S> {
+    pub async fn ingest_with_audit_context(
+        &mut self,
+        msg: TransportMessage,
+        transport_context: Option<marmot_forensics::AuditTransportContext>,
+    ) -> Result<IngestOutcome, EngineError> {
+        let operation_id = self.next_audit_operation_id();
+        let msg_id_hex = hex::encode(msg.id.as_slice());
+        let mut context = AuditEventContext {
+            operation_id: Some(operation_id.clone()),
+            human_action: None,
+            transport: transport_context,
+            engine: None,
+            group: None,
+        };
+        self.audit_with_context(
+            None,
+            Some(context.clone()),
+            crate::audit_helpers::ingest_entry_event(&msg),
+        );
+        let result = self.do_ingest(msg).await;
+        match &result {
+            Ok(outcome) => {
+                let group_ref = crate::audit_helpers::ingest_outcome_group_ref(outcome);
+                self.recorder.record(AuditRecord {
+                    group_ref,
+                    context: Some(context),
+                    kind: crate::audit_helpers::ingest_outcome_event(msg_id_hex, outcome),
+                });
+            }
+            Err(err) => {
+                context.engine = Some(self.audit_engine_context_snapshot());
+                self.audit_with_context(
+                    None,
+                    Some(context),
+                    AuditEventKind::IngestError {
+                        msg_id: msg_id_hex,
+                        error_kind: crate::audit_helpers::engine_error_kind(err).to_string(),
+                        detail: crate::audit_helpers::engine_error_detail(err),
+                    },
+                );
+            }
+        }
+        result
+    }
+
+    pub async fn send_with_audit_context(
+        &mut self,
+        intent: SendIntent,
+        context: Option<AuditEventContext>,
+    ) -> Result<SendResult, EngineError> {
+        let operation_id = self.next_audit_operation_id();
+        let intent_kind = crate::audit_helpers::send_intent_kind_str(&intent).to_string();
+        let group_ref = crate::audit_helpers::send_intent_group_ref(&intent);
+        let mut context = context.unwrap_or_default();
+        context.operation_id = Some(operation_id);
+        self.recorder.record(AuditRecord {
+            group_ref: group_ref.clone(),
+            context: Some(context.clone()),
+            kind: AuditEventKind::SendEntry {
+                intent_kind: intent_kind.clone(),
+            },
+        });
+        let result = self.do_send(intent).await;
+        match &result {
+            Ok(send_result) => {
+                self.recorder.record(AuditRecord {
+                    group_ref,
+                    context: Some(context),
+                    kind: crate::audit_helpers::send_outcome_event(intent_kind, send_result),
+                });
+            }
+            Err(err) => {
+                self.recorder.record(AuditRecord {
+                    group_ref,
+                    context: Some(context),
+                    kind: AuditEventKind::SendError {
+                        intent_kind,
+                        error_kind: crate::audit_helpers::engine_error_kind(err).to_string(),
+                        detail: crate::audit_helpers::engine_error_detail(err),
+                    },
+                });
+            }
+        }
+        result
+    }
+
+    pub async fn create_group_with_audit_context(
+        &mut self,
+        req: CreateGroupRequest,
+        context: Option<AuditEventContext>,
+    ) -> Result<(GroupId, SendResult), EngineError> {
+        let operation_id = self.next_audit_operation_id();
+        let mut context = context.unwrap_or_default();
+        context.operation_id = Some(operation_id);
+        context.engine = Some(self.audit_engine_context_snapshot());
+        self.audit_with_context(
+            None,
+            Some(context.clone()),
+            AuditEventKind::CreateGroupEntry {
+                member_count: req.members.len() as u64,
+                required_feature_count: req.required_features.len() as u64,
+                app_component_count: req.app_components.len() as u64,
+                initial_admin_count: req.initial_admins.len() as u64,
+            },
+        );
+        let result = self.do_create_group(req).await;
+        match &result {
+            Ok((group_id, send_result)) => {
+                let mut outcome_context = context;
+                outcome_context.group = self.audit_group_context_snapshot(group_id);
+                self.audit_group_with_context(
+                    group_id,
+                    outcome_context,
+                    crate::audit_helpers::create_group_outcome_event(send_result),
+                );
+                self.audit_group_context(group_id, "create_group");
+            }
+            Err(err) => {
+                self.audit_with_context(
+                    None,
+                    Some(context),
+                    AuditEventKind::CreateGroupError {
+                        error_kind: crate::audit_helpers::engine_error_kind(err).to_string(),
+                        detail: crate::audit_helpers::engine_error_detail(err),
+                    },
+                );
+            }
+        }
+        result
+    }
+
     /// Restore stable epoch state for groups already present in storage.
     ///
     /// This is used by production session startup after opening durable
@@ -276,18 +412,110 @@ impl<S: StorageProvider> Engine<S> {
 
     /// Emit an audit-log event with no group attribution.
     pub(crate) fn audit(&self, kind: AuditEventKind) {
-        self.recorder.record(AuditRecord {
-            group_ref: None,
-            kind,
-        });
+        self.audit_with_context(None, None, kind);
     }
 
     /// Emit an audit-log event attributed to a specific group.
     pub(crate) fn audit_group(&self, group_id: &GroupId, kind: AuditEventKind) {
-        self.recorder.record(AuditRecord {
-            group_ref: Some(hex::encode(group_id.as_slice())),
+        self.audit_with_context(Some(group_id), None, kind);
+    }
+
+    pub(crate) fn audit_group_with_context(
+        &self,
+        group_id: &GroupId,
+        context: AuditEventContext,
+        kind: AuditEventKind,
+    ) {
+        self.audit_with_context(Some(group_id), Some(context), kind);
+    }
+
+    pub(crate) fn audit_with_context(
+        &self,
+        group_id: Option<&GroupId>,
+        context: Option<AuditEventContext>,
+        kind: AuditEventKind,
+    ) {
+        let mut record = AuditRecord::new(
+            group_id.map(|group_id| hex::encode(group_id.as_slice())),
             kind,
+        );
+        record.context = context;
+        self.recorder.record(record);
+    }
+
+    pub fn audit_external(
+        &self,
+        group_id: Option<&GroupId>,
+        context: Option<AuditEventContext>,
+        kind: AuditEventKind,
+    ) {
+        self.audit_with_context(group_id, context, kind);
+    }
+
+    pub fn audit_recorder_health(&self) {
+        let health = self.recorder.health_snapshot();
+        self.audit(AuditEventKind::RecorderHealth {
+            serialization_failures: health.serialization_failures,
+            write_failures: health.write_failures,
+            flush_failures: health.flush_failures,
         });
+    }
+
+    pub(crate) fn next_audit_operation_id(&mut self) -> String {
+        let id = self.audit_operation_counter;
+        self.audit_operation_counter = self.audit_operation_counter.wrapping_add(1);
+        format!("op-{id}")
+    }
+
+    pub fn audit_engine_context(&self) {
+        self.audit(AuditEventKind::EngineContext {
+            context: self.audit_engine_context_snapshot(),
+        });
+    }
+
+    pub(crate) fn audit_engine_context_snapshot(&self) -> AuditEngineContext {
+        AuditEngineContext {
+            ciphersuite: Some(u16::from(self.ciphersuite)),
+            max_past_epochs: Some(self.max_past_epochs as u64),
+            convergence_max_rewind_commits: Some(
+                self.convergence_policy.convergence.max_rewind_commits,
+            ),
+            supported_app_component_count: Some(self.supported_app_components.ids.len() as u64),
+            feature_count: Some(self.registry.iter().count() as u64),
+        }
+    }
+
+    pub(crate) fn audit_group_context_snapshot(
+        &self,
+        group_id: &GroupId,
+    ) -> Option<AuditGroupContext> {
+        let group = self.storage.get_group(group_id).ok()?;
+        Some(AuditGroupContext {
+            epoch: Some(group.epoch.0),
+            member_count: Some(group.members.len() as u64),
+            required_app_component_count: Some(
+                group.required_capabilities.app_components.ids.len() as u64,
+            ),
+            admin_count: self
+                .admin_pubkeys(group_id)
+                .ok()
+                .map(|admins| admins.len() as u64),
+            convergence_max_rewind_commits: Some(
+                self.convergence_policy.convergence.max_rewind_commits,
+            ),
+        })
+    }
+
+    pub(crate) fn audit_group_context(&self, group_id: &GroupId, reason: &str) {
+        if let Some(context) = self.audit_group_context_snapshot(group_id) {
+            self.audit_group(
+                group_id,
+                AuditEventKind::GroupContext {
+                    reason: reason.to_string(),
+                    context,
+                },
+            );
+        }
     }
 
     /// Emit a `SnapshotCreated` audit event. Call this immediately after
@@ -428,15 +656,7 @@ impl<S: StorageProvider> Engine<S> {
 #[async_trait]
 impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
     async fn ingest(&mut self, msg: TransportMessage) -> Result<IngestOutcome, EngineError> {
-        self.audit(crate::audit_helpers::ingest_entry_event(&msg));
-        let msg_id_hex = hex::encode(msg.id.as_slice());
-        let result = self.do_ingest(msg).await;
-        if let Ok(ref outcome) = result {
-            self.audit(crate::audit_helpers::ingest_outcome_event(
-                msg_id_hex, outcome,
-            ));
-        }
-        result
+        self.ingest_with_audit_context(msg, None).await
     }
 
     fn drain_events(&mut self) -> Vec<GroupEvent> {
@@ -448,18 +668,7 @@ impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
     }
 
     async fn send(&mut self, intent: SendIntent) -> Result<SendResult, EngineError> {
-        let intent_kind = crate::audit_helpers::send_intent_kind_str(&intent).to_string();
-        self.audit(AuditEventKind::SendEntry {
-            intent_kind: intent_kind.clone(),
-        });
-        let result = self.do_send(intent).await;
-        if let Ok(ref send_result) = result {
-            self.audit(crate::audit_helpers::send_outcome_event(
-                intent_kind,
-                send_result,
-            ));
-        }
-        result
+        self.send_with_audit_context(intent, None).await
     }
 
     async fn advance_convergence(
@@ -486,7 +695,7 @@ impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
         &mut self,
         req: CreateGroupRequest,
     ) -> Result<(GroupId, SendResult), EngineError> {
-        self.do_create_group(req).await
+        self.create_group_with_audit_context(req, None).await
     }
 
     async fn join_welcome(

@@ -56,10 +56,22 @@ Read [`README.md`](README.md) for the human framing, [`SCENARIOS.md`](SCENARIOS.
     facts plus member additions/removals, client convergence, epoch changes, app invalidations, and
     `ForkRecoveryObservation` entries from `GroupEvent::ForkRecovered`.
 
+- **Module:** `src/policy_cases.rs`
+  - **Role:** Serializable `PolicyCase` DTOs plus selection-reasoning helpers (`parse_policy_cases`, `reason_against`,
+    `digest_rank`) for the bounded convergence-policy cases shared with the Tamarin model.
+
+- **Module:** `src/report.rs`
+  - **Role:** Report command parsing and run-summary types (`ReportArgs`, `ReportCommand`, `ReportRunSummary`,
+    `ScenarioReportSummary`, `ReportFailureSummary`) used by the report CLI.
+
 - **Module:** `src/bin/cgka-conformance-simulator-report.rs`
   - **Role:** Report writer CLI. Runs generated families or vector fixture files/directories, writes one JSON
     `ScenarioReport` per scenario plus fixture candidates for generated cases, prints a pass/fail summary, and exits
     non-zero on expectation failures.
+
+- **Module:** `src/bin/cgka-policy-casegen.rs`
+  - **Role:** Policy-case generator CLI; reads `formal/tamarin/policy_cases.json` and parses/reasons over the bounded
+    convergence-policy cases shared with Tamarin.
 
 - **Module:** `vectors/`
   - **Role:** External JSON `VectorFixture` files. Each fixture carries input `scenario` plus either exact

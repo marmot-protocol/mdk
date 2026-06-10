@@ -15,7 +15,7 @@ capability negotiation, and MIP-03 admin policy — everything that OpenMLS does
   - **Open...:** `src/epoch_manager.rs` + `cgka_traits::engine_state`
 
 - **You want to...:** Trace an inbound message
-  - **Open...:** `src/message_processor.rs::ingest_inbound`
+  - **Open...:** `src/message_processor.rs::do_ingest` (dispatched from `CgkaEngine::ingest` in `engine.rs`)
 
 - **You want to...:** Trace an outbound intent
   - **Open...:** `src/message_processor.rs::do_send` (then the matching `do_*` in `group_lifecycle.rs` / `upgrade.rs`)
@@ -63,10 +63,11 @@ realises. Read those rustdocs as the source of truth — this table is just an i
   - **Owns:** `fresh_key_package` (no expiry; that's a higher-layer concern)
 
 - **Module:** `group_lifecycle.rs`
-  - **Owns:** `do_create_group`, `do_join_welcome`, `do_send_invite`, `do_send_leave`
+  - **Owns:** `do_create_group`, `do_join_welcome`
 
 - **Module:** `message_processor.rs`
-  - **Owns:** inbound peel → classify → apply; outbound `SendIntent` dispatch; MIP-03 guards
+  - **Owns:** inbound peel → classify → apply (`do_ingest`); outbound `SendIntent` dispatch including `do_send_invite`
+    and `do_send_leave`; MIP-03 guards
 
 - **Module:** `epoch_manager.rs`
   - **Owns:** only place that mutates `EpochState`; owns `PendingMeta` (group_id + prior_epoch + kind),
@@ -80,7 +81,8 @@ realises. Read those rustdocs as the source of truth — this table is just an i
     (`MlsGroup::clear_pending_commit` + Marmot re-derive). The publish-before-apply contract lives here.
 
 - **Module:** `auto_committer.rs`
-  - **Owns:** `LowestIndexAutoCommitter` policy for SelfRemove (future policy hook)
+  - **Owns:** the free function `decide(mls_group, proposal) -> AutoCommitDecision` — lowest-index auto-commit policy
+    for SelfRemove proposals
 
 - **Module:** `upgrade.rs`
   - **Owns:** `do_upgrade_group_capabilities` — promotes upgradeable MLS primitives through
@@ -101,6 +103,33 @@ realises. Read those rustdocs as the source of truth — this table is just an i
 - **Module:** `wire_format.rs`
   - **Owns:** `PURE_PLAINTEXT_WIRE_FORMAT_POLICY` + the `WIRE_FORMAT_POLICY_REVIEW_REQUIRED` grep marker
 
+- **Module:** `account_identity_proof.rs`
+  - **Owns:** the Marmot account identity-proof LeafNode extension binding the account key to the MLS signature key
+
+- **Module:** `app_payload.rs`
+  - **Owns:** `validate_app_payload_for_sender` — `MarmotAppEvent` sender validation for application messages
+
+- **Module:** `audit_helpers.rs`
+  - **Owns:** stringification/extraction helpers that produce stable, low-cardinality forensic audit-log strings
+
+- **Module:** `canonicalization.rs`
+  - **Owns:** the executable post-peeling canonicalization-contract model (symbolic branches/messages above OpenMLS)
+
+- **Module:** `convergence.rs`
+  - **Owns:** the candidate-state-graph deterministic branch-selection policy
+
+- **Module:** `distributed_convergence.rs`
+  - **Owns:** the engine entry point for stored-message distributed convergence
+
+- **Module:** `engine_metrics.rs`
+  - **Owns:** engine-side diagnostic telemetry for post-settle convergence reorgs
+
+- **Module:** `openmls_projection.rs`
+  - **Owns:** bytes-first OpenMLS projection + canonicalization helpers, including Marmot record refresh on replay
+
+- **Module:** `update_group_data.rs`
+  - **Owns:** `SendIntent::UpdateGroupData` — stages an `AppDataUpdate` commit for `marmot.group.profile.v1`
+
 ## Design deviations (read these before changing the contract)
 
 These are the load-bearing departures from the original plan. Each is also documented inline at the deviation site.
@@ -108,7 +137,8 @@ These are the load-bearing departures from the original plan. Each is also docum
 1. **Storage aggregate uses accessor composition, not direct supertrait.** `cgka_traits::StorageProvider` exposes
    `type Mls; fn mls_storage(&self) -> &Self::Mls` instead of being
    `: openmls_traits::storage::StorageProvider<CURRENT_VERSION>`. Hand-forwarding 50+ OpenMLS trait methods is
-   mechanical churn with zero functional value. Site: `crates/traits/src/storage.rs:120-130`.
+   mechanical churn with zero functional value. Site: `crates/traits/src/storage.rs` (`StorageProvider` aggregate with
+   `type Mls` / `fn mls_storage`).
 
 2. **`SendResult::GroupCreated { welcomes, pending }` is its own variant.** `GroupEvolution` carries a
    `msg: TransportMessage` that has no consumer at create-time (every other initial member arrives via welcome with
@@ -199,7 +229,7 @@ in `tests/`; this section exists so a future contributor can grep for the rule t
   - **Test:** covered by existing replay tests
 
 - **Item:** **Sm7** Auto-committer §150 fail-closed
-  - **What changed:** `LowestIndexAutoCommitter::decide` now refuses to auto-commit a SelfRemove if the leaver's
+  - **What changed:** `auto_committer::decide` now refuses to auto-commit a SelfRemove if the leaver's
     credential is malformed (length ≠ 32) instead of treating that as "no admin to compare against."
   - **Test:** covered by existing MIP-03 guard tests
 
@@ -257,8 +287,11 @@ shapes. Tests: `tests/fork_detection.rs` plus the harness `deliberate_fork_via_h
 
 - **Only `EpochManager` may construct non-`Stable` `EpochState` variants.** This is enforced by visibility — the
   variants' fields are private. Don't add a public constructor for `Recovering` etc. somewhere else.
-- **No Nostr types anywhere.** Grep test: `grep -ri nostr crates/cgka-engine/src/` returns zero hits. Same for
-  `crates/traits/` and `crates/storage-sqlite/`.
+- **No Nostr library/SDK dependency.** These crates do not depend on any Nostr crate and use no Nostr SDK types. They
+  do reference the `marmot.transport.nostr.routing.v1` app-component by id (`NOSTR_ROUTING_COMPONENT_ID`,
+  `NostrRoutingV1`) and name Nostr concepts in comments (e.g. the kind-445 exporter label), so
+  `grep -ri nostr crates/cgka-engine/src/` is no longer zero — grep the `Cargo.toml` deps instead to enforce the
+  no-dependency invariant.
 - **No `leave_group()` (the legacy MLS path).** Always `leave_group_via_self_remove` per MIP-03. This is grep-banned.
 - **OpenMLS family is tilde-pinned in workspace `Cargo.toml`.** Don't relax to caret; silent companion-crate skew has
   broken this stack before.

@@ -1250,6 +1250,8 @@ async fn openmls_canonicalization_apply_rolls_back_when_selected_path_fails() {
         selected_tip: Some(3),
         selected_fork_epoch: Some(1),
         selected_branch_id: Some("bad-selected-path".into()),
+        candidate_count: 2,
+        eligible_count: 2,
         convergence_status: ConvergenceStatus::Settled,
         accepted_commits: commit_messages
             .iter()
@@ -1309,6 +1311,8 @@ fn openmls_disposition_persistence_maps_all_canonicalization_states() {
         selected_tip: Some(2),
         selected_fork_epoch: Some(1),
         selected_branch_id: Some("accepted-branch".into()),
+        candidate_count: 2,
+        eligible_count: 1,
         convergence_status: ConvergenceStatus::Settled,
         accepted_commits: vec![hex::encode(accepted_commit_id.as_slice())],
         accepted_proposals: vec![],

@@ -29,9 +29,12 @@
 
 use transport_nostr_adapter::{DurationHistogramSnapshot, RelayIndex, RelayLabelResolution};
 
+use crate::app_telemetry::{AppPerformanceOperationSnapshot, AppPerformanceSnapshot};
 use crate::config::RelayTelemetryExportConfig;
 use crate::relay_plane::{EngineReorgMetrics, MarmotRelayPlane, RelayTelemetryRollup};
 
+#[cfg(feature = "otlp-export")]
+use crate::app_telemetry::AppPerformanceTelemetry;
 #[cfg(feature = "otlp-export")]
 use rand::{RngCore, rngs::OsRng};
 #[cfg(feature = "otlp-export")]
@@ -84,6 +87,82 @@ pub mod metric_names {
     pub const MESSAGE_CORROBORATED: &str = "message_corroborated";
     /// Population-level messages seen on exactly one relay.
     pub const MESSAGE_SINGLE_SOURCE: &str = "message_single_source";
+    /// App startup duration histogram.
+    pub const APP_START_DURATION: &str = "app_start_duration_ms";
+    /// App startup attempts.
+    pub const APP_START_ATTEMPTS: &str = "app_start_attempts";
+    /// Successful app startups.
+    pub const APP_START_SUCCESSES: &str = "app_start_successes";
+    /// Failed app startups.
+    pub const APP_START_FAILURES: &str = "app_start_failures";
+    /// Directory subscription sync duration histogram.
+    pub const APP_DIRECTORY_SUBSCRIPTION_SYNC_DURATION: &str =
+        "app_directory_subscription_sync_duration_ms";
+    /// Directory subscription sync attempts.
+    pub const APP_DIRECTORY_SUBSCRIPTION_SYNC_ATTEMPTS: &str =
+        "app_directory_subscription_sync_attempts";
+    /// Successful directory subscription syncs.
+    pub const APP_DIRECTORY_SUBSCRIPTION_SYNC_SUCCESSES: &str =
+        "app_directory_subscription_sync_successes";
+    /// Failed directory subscription syncs.
+    pub const APP_DIRECTORY_SUBSCRIPTION_SYNC_FAILURES: &str =
+        "app_directory_subscription_sync_failures";
+    /// Account reconcile duration histogram.
+    pub const APP_ACCOUNT_RECONCILE_DURATION: &str = "app_account_reconcile_duration_ms";
+    /// Account reconcile attempts.
+    pub const APP_ACCOUNT_RECONCILE_ATTEMPTS: &str = "app_account_reconcile_attempts";
+    /// Successful account reconciles.
+    pub const APP_ACCOUNT_RECONCILE_SUCCESSES: &str = "app_account_reconcile_successes";
+    /// Failed account reconciles.
+    pub const APP_ACCOUNT_RECONCILE_FAILURES: &str = "app_account_reconcile_failures";
+    /// Per-account open duration histogram.
+    pub const APP_ACCOUNT_OPEN_DURATION: &str = "app_account_open_duration_ms";
+    /// Per-account open attempts.
+    pub const APP_ACCOUNT_OPEN_ATTEMPTS: &str = "app_account_open_attempts";
+    /// Successful account opens.
+    pub const APP_ACCOUNT_OPEN_SUCCESSES: &str = "app_account_open_successes";
+    /// Failed account opens.
+    pub const APP_ACCOUNT_OPEN_FAILURES: &str = "app_account_open_failures";
+    /// Multi-account catch-up duration histogram.
+    pub const APP_ACCOUNT_CATCH_UP_DURATION: &str = "app_account_catch_up_duration_ms";
+    /// Multi-account catch-up attempts.
+    pub const APP_ACCOUNT_CATCH_UP_ATTEMPTS: &str = "app_account_catch_up_attempts";
+    /// Successful multi-account catch-ups.
+    pub const APP_ACCOUNT_CATCH_UP_SUCCESSES: &str = "app_account_catch_up_successes";
+    /// Failed multi-account catch-ups.
+    pub const APP_ACCOUNT_CATCH_UP_FAILURES: &str = "app_account_catch_up_failures";
+    /// Per-account sync duration histogram.
+    pub const APP_ACCOUNT_SYNC_DURATION: &str = "app_account_sync_duration_ms";
+    /// Per-account sync attempts.
+    pub const APP_ACCOUNT_SYNC_ATTEMPTS: &str = "app_account_sync_attempts";
+    /// Successful per-account syncs.
+    pub const APP_ACCOUNT_SYNC_SUCCESSES: &str = "app_account_sync_successes";
+    /// Failed per-account syncs.
+    pub const APP_ACCOUNT_SYNC_FAILURES: &str = "app_account_sync_failures";
+    /// One-sided outbound message send duration histogram.
+    pub const APP_OUTBOUND_MESSAGE_SEND_DURATION: &str = "app_outbound_message_send_duration_ms";
+    /// One-sided outbound message send attempts.
+    pub const APP_OUTBOUND_MESSAGE_SEND_ATTEMPTS: &str = "app_outbound_message_send_attempts";
+    /// Successful one-sided outbound message sends.
+    pub const APP_OUTBOUND_MESSAGE_SEND_SUCCESSES: &str = "app_outbound_message_send_successes";
+    /// Failed one-sided outbound message sends.
+    pub const APP_OUTBOUND_MESSAGE_SEND_FAILURES: &str = "app_outbound_message_send_failures";
+    /// Media upload duration histogram.
+    pub const APP_MEDIA_UPLOAD_DURATION: &str = "app_media_upload_duration_ms";
+    /// Media upload attempts.
+    pub const APP_MEDIA_UPLOAD_ATTEMPTS: &str = "app_media_upload_attempts";
+    /// Successful media uploads.
+    pub const APP_MEDIA_UPLOAD_SUCCESSES: &str = "app_media_upload_successes";
+    /// Failed media uploads.
+    pub const APP_MEDIA_UPLOAD_FAILURES: &str = "app_media_upload_failures";
+    /// Media download duration histogram.
+    pub const APP_MEDIA_DOWNLOAD_DURATION: &str = "app_media_download_duration_ms";
+    /// Media download attempts.
+    pub const APP_MEDIA_DOWNLOAD_ATTEMPTS: &str = "app_media_download_attempts";
+    /// Successful media downloads.
+    pub const APP_MEDIA_DOWNLOAD_SUCCESSES: &str = "app_media_download_successes";
+    /// Failed media downloads.
+    pub const APP_MEDIA_DOWNLOAD_FAILURES: &str = "app_media_download_failures";
 }
 
 /// A fixed-bucket cumulative histogram in the export batch.
@@ -324,6 +403,126 @@ pub fn build_export_batch(
     RelayTelemetryExportBatch { points }
 }
 
+/// Map relay and app-performance rollups into one privacy-safe export batch.
+///
+/// App-performance points are population-level only: no relay label and no
+/// account, group, message, URL, or payload-derived label.
+pub fn build_export_batch_with_app_performance(
+    rollup: &RelayTelemetryRollup,
+    resolution: &RelayLabelResolution,
+    app_performance: Option<&AppPerformanceSnapshot>,
+) -> RelayTelemetryExportBatch {
+    let mut batch = build_export_batch(rollup, resolution);
+    if let Some(app_performance) = app_performance {
+        append_app_performance_points(&mut batch.points, app_performance);
+    }
+    batch
+}
+
+fn append_app_performance_points(
+    points: &mut Vec<ExportMetricPoint>,
+    app_performance: &AppPerformanceSnapshot,
+) {
+    append_app_operation_points(
+        points,
+        &app_performance.app_start,
+        metric_names::APP_START_DURATION,
+        metric_names::APP_START_ATTEMPTS,
+        metric_names::APP_START_SUCCESSES,
+        metric_names::APP_START_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.directory_subscription_sync,
+        metric_names::APP_DIRECTORY_SUBSCRIPTION_SYNC_DURATION,
+        metric_names::APP_DIRECTORY_SUBSCRIPTION_SYNC_ATTEMPTS,
+        metric_names::APP_DIRECTORY_SUBSCRIPTION_SYNC_SUCCESSES,
+        metric_names::APP_DIRECTORY_SUBSCRIPTION_SYNC_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.account_reconcile,
+        metric_names::APP_ACCOUNT_RECONCILE_DURATION,
+        metric_names::APP_ACCOUNT_RECONCILE_ATTEMPTS,
+        metric_names::APP_ACCOUNT_RECONCILE_SUCCESSES,
+        metric_names::APP_ACCOUNT_RECONCILE_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.account_open,
+        metric_names::APP_ACCOUNT_OPEN_DURATION,
+        metric_names::APP_ACCOUNT_OPEN_ATTEMPTS,
+        metric_names::APP_ACCOUNT_OPEN_SUCCESSES,
+        metric_names::APP_ACCOUNT_OPEN_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.account_catch_up,
+        metric_names::APP_ACCOUNT_CATCH_UP_DURATION,
+        metric_names::APP_ACCOUNT_CATCH_UP_ATTEMPTS,
+        metric_names::APP_ACCOUNT_CATCH_UP_SUCCESSES,
+        metric_names::APP_ACCOUNT_CATCH_UP_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.account_sync,
+        metric_names::APP_ACCOUNT_SYNC_DURATION,
+        metric_names::APP_ACCOUNT_SYNC_ATTEMPTS,
+        metric_names::APP_ACCOUNT_SYNC_SUCCESSES,
+        metric_names::APP_ACCOUNT_SYNC_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.outbound_message_send,
+        metric_names::APP_OUTBOUND_MESSAGE_SEND_DURATION,
+        metric_names::APP_OUTBOUND_MESSAGE_SEND_ATTEMPTS,
+        metric_names::APP_OUTBOUND_MESSAGE_SEND_SUCCESSES,
+        metric_names::APP_OUTBOUND_MESSAGE_SEND_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.media_upload,
+        metric_names::APP_MEDIA_UPLOAD_DURATION,
+        metric_names::APP_MEDIA_UPLOAD_ATTEMPTS,
+        metric_names::APP_MEDIA_UPLOAD_SUCCESSES,
+        metric_names::APP_MEDIA_UPLOAD_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.media_download,
+        metric_names::APP_MEDIA_DOWNLOAD_DURATION,
+        metric_names::APP_MEDIA_DOWNLOAD_ATTEMPTS,
+        metric_names::APP_MEDIA_DOWNLOAD_SUCCESSES,
+        metric_names::APP_MEDIA_DOWNLOAD_FAILURES,
+    );
+}
+
+fn append_app_operation_points(
+    points: &mut Vec<ExportMetricPoint>,
+    operation: &AppPerformanceOperationSnapshot,
+    duration_name: &'static str,
+    attempts_name: &'static str,
+    successes_name: &'static str,
+    failures_name: &'static str,
+) {
+    points.push(ExportMetricPoint {
+        name: duration_name,
+        relay: None,
+        value: ExportMetricValue::Histogram(ExportHistogram::from_snapshot(&operation.duration_ms)),
+    });
+    for (name, value) in [
+        (attempts_name, operation.attempts),
+        (successes_name, operation.successes),
+        (failures_name, operation.failures),
+    ] {
+        points.push(ExportMetricPoint {
+            name,
+            relay: None,
+            value: ExportMetricValue::Counter(value),
+        });
+    }
+}
+
 /// Error surfaced by the opt-in OTLP exporter.
 ///
 /// Messages are deliberately free of the endpoint URL and any relay identity so
@@ -413,6 +612,15 @@ impl RelayTelemetryExporter {
         &self,
         engine: Option<EngineReorgMetrics>,
     ) -> RelayTelemetryExportBatch {
+        self.build_batch_with_app_performance(engine, None).await
+    }
+
+    /// Build a privacy-safe batch including optional app-performance rollups.
+    pub async fn build_batch_with_app_performance(
+        &self,
+        engine: Option<EngineReorgMetrics>,
+        app_performance: Option<AppPerformanceSnapshot>,
+    ) -> RelayTelemetryExportBatch {
         let rollup = self.relay_plane.telemetry_rollup(engine).await;
         // The exporter only exists when opted in, so resolution is always
         // available here; default to an empty resolution defensively.
@@ -421,7 +629,7 @@ impl RelayTelemetryExporter {
             .resolve_relay_labels(&self.config)
             .await
             .unwrap_or_default();
-        build_export_batch(&rollup, &resolution)
+        build_export_batch_with_app_performance(&rollup, &resolution, app_performance.as_ref())
     }
 }
 
@@ -757,6 +965,15 @@ impl RelayTelemetryExporter {
         &self,
         engine: Option<EngineReorgMetrics>,
     ) -> Result<usize, RelayExportError> {
+        self.export_once_with_app_performance(engine, None).await
+    }
+
+    /// Build the batch with optional app-performance rollups and push it once.
+    pub async fn export_once_with_app_performance(
+        &self,
+        engine: Option<EngineReorgMetrics>,
+        app_performance: Option<AppPerformanceSnapshot>,
+    ) -> Result<usize, RelayExportError> {
         let endpoint = self
             .config
             .endpoint
@@ -772,7 +989,9 @@ impl RelayTelemetryExporter {
             .authorization_bearer_token
             .as_deref()
             .ok_or(RelayExportError::MissingAuthorizationToken)?;
-        let batch = self.build_batch(engine).await;
+        let batch = self
+            .build_batch_with_app_performance(engine, app_performance)
+            .await;
         let count = batch.len();
         otlp::push(
             &batch,
@@ -801,6 +1020,15 @@ impl RelayTelemetryExporter {
         &self,
         engine: Option<EngineReorgMetrics>,
     ) -> Result<usize, RelayExportError> {
+        self.export_once_with_retries_and_app_performance(engine, None)
+            .await
+    }
+
+    async fn export_once_with_retries_and_app_performance(
+        &self,
+        engine: Option<EngineReorgMetrics>,
+        app_performance: Option<AppPerformanceSnapshot>,
+    ) -> Result<usize, RelayExportError> {
         let deadline = Instant::now() + self.config.interval;
         let mut last_error = None;
         for attempt in 0..EXPORT_MAX_ATTEMPTS {
@@ -809,7 +1037,12 @@ impl RelayTelemetryExporter {
                 break;
             }
             let remaining = deadline.saturating_duration_since(now);
-            match tokio::time::timeout(remaining, self.export_once(engine.clone())).await {
+            match tokio::time::timeout(
+                remaining,
+                self.export_once_with_app_performance(engine.clone(), app_performance.clone()),
+            )
+            .await
+            {
                 Ok(Ok(count)) => return Ok(count),
                 Ok(Err(err)) => last_error = Some(err),
                 Err(_) => last_error = Some(RelayExportError::Request),
@@ -833,7 +1066,35 @@ impl RelayTelemetryExporter {
     /// reports adapter and relay-plane metrics until the engine snapshot is
     /// wired in at this seam.
     pub async fn run(self, mut shutdown: tokio::sync::watch::Receiver<bool>) {
-        if !*shutdown.borrow() && self.export_once_with_retries(None).await.is_err() {
+        self.run_loop(&mut shutdown, None).await;
+    }
+
+    /// Poll-and-push relay and app-performance telemetry on the configured
+    /// interval until `shutdown` flips to `true`.
+    pub async fn run_with_app_performance(
+        self,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+        app_performance: AppPerformanceTelemetry,
+    ) {
+        self.run_loop(&mut shutdown, Some(app_performance)).await;
+    }
+
+    async fn run_loop(
+        self,
+        shutdown: &mut tokio::sync::watch::Receiver<bool>,
+        app_performance: Option<AppPerformanceTelemetry>,
+    ) {
+        if !*shutdown.borrow()
+            && self
+                .export_once_with_retries_and_app_performance(
+                    None,
+                    app_performance
+                        .as_ref()
+                        .map(AppPerformanceTelemetry::snapshot),
+                )
+                .await
+                .is_err()
+        {
             tracing::warn!(
                 target: "marmot_app::relay_telemetry_export",
                 method = "run",
@@ -844,7 +1105,14 @@ impl RelayTelemetryExporter {
             let delay = jittered_export_interval(self.config.interval);
             tokio::select! {
                 _ = tokio::time::sleep(delay) => {
-                    if self.export_once_with_retries(None).await.is_err() {
+                    if self
+                        .export_once_with_retries_and_app_performance(
+                            None,
+                            app_performance.as_ref().map(AppPerformanceTelemetry::snapshot),
+                        )
+                        .await
+                        .is_err()
+                    {
                         tracing::warn!(
                             target: "marmot_app::relay_telemetry_export",
                             method = "run",
@@ -870,6 +1138,7 @@ mod tests {
     use cgka_traits::TransportEndpoint;
     use transport_nostr_adapter::HistogramBucket;
 
+    use crate::app_telemetry::{AppPerformanceOperationSnapshot, AppPerformanceSnapshot};
     use crate::config::{RelayTelemetryResource, RelayTelemetryRuntimeConfig};
     use crate::relay_plane::{EngineReorgMetrics, RelayRollupEntry, RelayTelemetryRollup};
 
@@ -1070,6 +1339,51 @@ mod tests {
                     && point.value == ExportMetricValue::Counter(value)
             }));
             assert!(!name.ends_with("_total"));
+        }
+    }
+
+    #[test]
+    fn build_export_batch_appends_unlabeled_app_performance_metrics() {
+        let app_performance = AppPerformanceSnapshot {
+            app_start: AppPerformanceOperationSnapshot {
+                attempts: 3,
+                successes: 2,
+                failures: 1,
+                duration_ms: hist(2),
+            },
+            ..Default::default()
+        };
+        let batch = build_export_batch_with_app_performance(
+            &RelayTelemetryRollup::default(),
+            &RelayLabelResolution::default(),
+            Some(&app_performance),
+        );
+
+        assert!(batch.points.iter().all(|point| point.relay.is_none()));
+        assert!(batch.points.iter().any(|point| {
+            point.name == metric_names::APP_START_ATTEMPTS
+                && point.value == ExportMetricValue::Counter(3)
+        }));
+        assert!(batch.points.iter().any(|point| {
+            point.name == metric_names::APP_START_SUCCESSES
+                && point.value == ExportMetricValue::Counter(2)
+        }));
+        assert!(batch.points.iter().any(|point| {
+            point.name == metric_names::APP_START_FAILURES
+                && point.value == ExportMetricValue::Counter(1)
+        }));
+
+        let duration = batch
+            .points
+            .iter()
+            .find(|point| point.name == metric_names::APP_START_DURATION)
+            .expect("app start duration metric");
+        match &duration.value {
+            ExportMetricValue::Histogram(histogram) => {
+                assert_eq!(histogram.bounds_ms, vec![50]);
+                assert_eq!(histogram.bucket_counts, vec![2]);
+            }
+            other => panic!("expected histogram, got {other:?}"),
         }
     }
 

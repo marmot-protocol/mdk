@@ -32,6 +32,7 @@ use transport_quic_stream::AgentTextStreamCrypto;
 const APP_RUNTIME_AUDIT_TRACKER_QUEUE: usize = 1;
 
 use crate::agent_streams::AgentStreamWatchManager;
+use crate::app_telemetry::{AppPerformanceOperation, AppPerformanceTelemetry};
 use crate::directory::{DirectorySyncHandle, DirectorySyncRunSummary};
 use crate::ids::normalize_group_id_hex_app;
 use crate::messages::{AppMessageIntent, STREAM_ROUTE_QUIC, tag_value, tag_values};
@@ -74,6 +75,7 @@ pub struct AccountManager {
 #[derive(Clone)]
 pub struct RuntimeSharedServices {
     relay_plane: MarmotRelayPlane,
+    app_performance_telemetry: AppPerformanceTelemetry,
     agent_streams: AgentStreamWatchManager,
     lifecycle: RuntimeLifecycle,
     relay_telemetry_exporter: Arc<StdMutex<Option<JoinHandle<()>>>>,
@@ -87,6 +89,7 @@ impl Default for RuntimeSharedServices {
     fn default() -> Self {
         Self {
             relay_plane: MarmotRelayPlane::runtime_default(APP_RUNTIME_RELAY_REBUILD_LOOKBACK),
+            app_performance_telemetry: AppPerformanceTelemetry::default(),
             agent_streams: AgentStreamWatchManager::default(),
             lifecycle: RuntimeLifecycle::new(),
             relay_telemetry_exporter: Arc::new(StdMutex::new(None)),
@@ -111,6 +114,7 @@ impl RuntimeSharedServices {
         );
         Self {
             relay_plane: app.relay_plane.clone(),
+            app_performance_telemetry: AppPerformanceTelemetry::default(),
             agent_streams: AgentStreamWatchManager::default(),
             lifecycle,
             relay_telemetry_exporter: Arc::new(StdMutex::new(None)),
@@ -127,6 +131,10 @@ impl RuntimeSharedServices {
         &self.relay_plane
     }
 
+    pub fn app_performance_telemetry(&self) -> AppPerformanceTelemetry {
+        self.app_performance_telemetry.clone()
+    }
+
     pub fn agent_streams(&self) -> AgentStreamWatchManager {
         self.agent_streams.clone()
     }
@@ -141,7 +149,10 @@ impl RuntimeSharedServices {
         {
             if let Some(exporter) = self.relay_plane.telemetry_exporter(config) {
                 let shutdown = self.lifecycle.subscribe_shutdown();
-                let handle = tokio::spawn(exporter.run(shutdown));
+                let app_performance_telemetry = self.app_performance_telemetry.clone();
+                let handle = tokio::spawn(
+                    exporter.run_with_app_performance(shutdown, app_performance_telemetry),
+                );
                 *self
                     .relay_telemetry_exporter
                     .lock()
@@ -1939,20 +1950,31 @@ impl MarmotAppRuntime {
     }
 
     pub async fn start(&self) -> Result<(), AppError> {
-        self.shared.lifecycle().ensure_running()?;
-        let app = self.accounts.app.clone();
-        blocking_app_task(move || app.warm_directory_storage()).await?;
-        let config = self
-            .accounts
-            .app
-            .relay_telemetry_settings()?
-            .export_config_with_runtime_and_endpoints(
-                self.shared.relay_telemetry_runtime_config(),
-                self.shared.service_endpoints(),
-            );
-        self.sync_user_directory_subscriptions().await?;
-        self.reconcile_accounts().await?;
-        self.shared.lifecycle().mark_running();
+        let started_at = Instant::now();
+        let result: Result<RelayTelemetryExportConfig, AppError> = async {
+            self.shared.lifecycle().ensure_running()?;
+            let app = self.accounts.app.clone();
+            blocking_app_task(move || app.warm_directory_storage()).await?;
+            let config = self
+                .accounts
+                .app
+                .relay_telemetry_settings()?
+                .export_config_with_runtime_and_endpoints(
+                    self.shared.relay_telemetry_runtime_config(),
+                    self.shared.service_endpoints(),
+                );
+            self.sync_user_directory_subscriptions().await?;
+            self.reconcile_accounts().await?;
+            self.shared.lifecycle().mark_running();
+            Ok(config)
+        }
+        .await;
+        self.shared.app_performance_telemetry().record(
+            AppPerformanceOperation::AppStart,
+            started_at.elapsed(),
+            result.is_ok(),
+        );
+        let config = result?;
         self.shared.configure_relay_telemetry_exporter(config);
         Ok(())
     }
@@ -1960,9 +1982,19 @@ impl MarmotAppRuntime {
     pub(crate) async fn sync_user_directory_subscriptions(
         &self,
     ) -> Result<DirectorySyncRunSummary, AppError> {
-        self.shared.lifecycle().ensure_running()?;
-        let directory_sync = self.ensure_directory_sync_worker().await;
-        directory_sync.request_rebuild_and_wait().await
+        let started_at = Instant::now();
+        let result = async {
+            self.shared.lifecycle().ensure_running()?;
+            let directory_sync = self.ensure_directory_sync_worker().await;
+            directory_sync.request_rebuild_and_wait().await
+        }
+        .await;
+        self.shared.app_performance_telemetry().record(
+            AppPerformanceOperation::DirectorySubscriptionSync,
+            started_at.elapsed(),
+            result.is_ok(),
+        );
+        result
     }
 
     async fn ensure_directory_sync_worker(&self) -> DirectorySyncHandle {
@@ -3187,92 +3219,117 @@ impl AccountManager {
     }
 
     pub async fn reconcile(&self) -> Result<(), AppError> {
-        self.shared.lifecycle().ensure_running()?;
-        let accounts = self
-            .app
-            .account_home()
-            .accounts()?
-            .into_iter()
-            .filter(|account| account.local_signing)
-            .collect::<Vec<_>>();
-        let active_account_ids = accounts
-            .iter()
-            .map(|account| account.account_id_hex.clone())
-            .collect::<HashSet<_>>();
-
-        let existing_account_ids = {
-            let mut workers = self.workers.lock().await;
-            let stale_account_ids = workers
-                .iter()
-                .filter_map(|(account_id, worker)| {
-                    if active_account_ids.contains(account_id) && !worker.handle.is_finished() {
-                        None
-                    } else {
-                        Some(account_id.clone())
-                    }
-                })
+        let started_at = Instant::now();
+        let result = async {
+            self.shared.lifecycle().ensure_running()?;
+            let accounts = self
+                .app
+                .account_home()
+                .accounts()?
+                .into_iter()
+                .filter(|account| account.local_signing)
                 .collect::<Vec<_>>();
-            for account_id in stale_account_ids {
-                if let Some(worker) = workers.remove(&account_id) {
-                    worker.stop();
-                }
-            }
-            workers.keys().cloned().collect::<HashSet<_>>()
-        };
+            let active_account_ids = accounts
+                .iter()
+                .map(|account| account.account_id_hex.clone())
+                .collect::<HashSet<_>>();
 
-        let pending = accounts
-            .into_iter()
-            .filter(|account| !existing_account_ids.contains(&account.account_id_hex))
-            .collect::<Vec<_>>();
+            let existing_account_ids = {
+                let mut workers = self.workers.lock().await;
+                let stale_account_ids = workers
+                    .iter()
+                    .filter_map(|(account_id, worker)| {
+                        if active_account_ids.contains(account_id) && !worker.handle.is_finished() {
+                            None
+                        } else {
+                            Some(account_id.clone())
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                for account_id in stale_account_ids {
+                    if let Some(worker) = workers.remove(&account_id) {
+                        worker.stop();
+                    }
+                }
+                workers.keys().cloned().collect::<HashSet<_>>()
+            };
 
-        let mut ready_receivers = Vec::new();
-        {
-            let mut workers = self.workers.lock().await;
-            for account in pending {
-                if workers.contains_key(&account.account_id_hex) {
-                    continue;
-                }
-                let (ready_tx, ready_rx) = oneshot::channel();
-                let (shutdown_tx, shutdown_rx) = oneshot::channel();
-                let (command_tx, command_rx) = mpsc::channel(8);
-                let handle = spawn_app_runtime_account_worker(
-                    AccountWorkerRuntime {
-                        app: self.app.clone(),
-                        account_label: account.label.clone(),
-                        account_id_hex: account.account_id_hex.clone(),
-                        relay_plane: self.shared.relay_plane().clone(),
-                        events: self.events.clone(),
-                        lifecycle: self.shared.lifecycle(),
-                        shared: self.shared.clone(),
-                    },
-                    command_rx,
-                    ready_tx,
-                    shutdown_rx,
-                );
-                workers.insert(
-                    account.account_id_hex,
-                    ManagedAccountWorker {
-                        handle,
-                        commands: command_tx,
-                        shutdown: shutdown_tx,
-                    },
-                );
-                ready_receivers.push(ready_rx);
-            }
-        }
-        for ready in ready_receivers {
-            match timeout(APP_RUNTIME_ACCOUNT_READY_WAIT, ready).await {
-                Ok(Ok(Ok(()))) => {}
-                Ok(Ok(Err(message))) => return Err(AppError::BlockingTask(message)),
-                Ok(Err(_closed)) => return Err(AppError::TransportClosed),
-                Err(_elapsed) => {
-                    return Err(AppError::BlockingTask(
-                        "account worker startup timed out".into(),
-                    ));
+            let pending = accounts
+                .into_iter()
+                .filter(|account| !existing_account_ids.contains(&account.account_id_hex))
+                .collect::<Vec<_>>();
+
+            let mut ready_receivers = Vec::new();
+            {
+                let mut workers = self.workers.lock().await;
+                for account in pending {
+                    if workers.contains_key(&account.account_id_hex) {
+                        continue;
+                    }
+                    let (ready_tx, ready_rx) = oneshot::channel();
+                    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+                    let (command_tx, command_rx) = mpsc::channel(8);
+                    let handle = spawn_app_runtime_account_worker(
+                        AccountWorkerRuntime {
+                            app: self.app.clone(),
+                            account_label: account.label.clone(),
+                            account_id_hex: account.account_id_hex.clone(),
+                            relay_plane: self.shared.relay_plane().clone(),
+                            events: self.events.clone(),
+                            lifecycle: self.shared.lifecycle(),
+                            shared: self.shared.clone(),
+                        },
+                        command_rx,
+                        ready_tx,
+                        shutdown_rx,
+                    );
+                    workers.insert(
+                        account.account_id_hex,
+                        ManagedAccountWorker {
+                            handle,
+                            commands: command_tx,
+                            shutdown: shutdown_tx,
+                        },
+                    );
+                    ready_receivers.push((Instant::now(), ready_rx));
                 }
             }
+            let mut ready_waits = JoinSet::new();
+            for (account_started_at, ready) in ready_receivers {
+                ready_waits.spawn(async move {
+                    let ready_result = timeout(APP_RUNTIME_ACCOUNT_READY_WAIT, ready).await;
+                    (account_started_at.elapsed(), ready_result)
+                });
+            }
+            while let Some(joined) = ready_waits.join_next().await {
+                let (account_open_elapsed, ready_result) = joined.map_err(|err| {
+                    AppError::BlockingTask(format!("account worker readiness wait failed: {err}"))
+                })?;
+                self.shared.app_performance_telemetry().record(
+                    AppPerformanceOperation::AccountOpen,
+                    account_open_elapsed,
+                    matches!(ready_result, Ok(Ok(Ok(())))),
+                );
+                match ready_result {
+                    Ok(Ok(Ok(()))) => {}
+                    Ok(Ok(Err(message))) => return Err(AppError::BlockingTask(message)),
+                    Ok(Err(_closed)) => return Err(AppError::TransportClosed),
+                    Err(_elapsed) => {
+                        return Err(AppError::BlockingTask(
+                            "account worker startup timed out".into(),
+                        ));
+                    }
+                }
+            }
+            Ok(())
         }
-        Ok(())
+        .await;
+        self.shared.app_performance_telemetry().record(
+            AppPerformanceOperation::AccountReconcile,
+            started_at.elapsed(),
+            result.is_ok(),
+        );
+        result
     }
 
     pub async fn restart_account(&self, account_id_hex: &str) -> Result<(), AppError> {
@@ -3287,37 +3344,47 @@ impl AccountManager {
     }
 
     pub async fn catch_up_accounts(&self) -> Result<(), AppError> {
-        self.shared.lifecycle().ensure_running()?;
-        self.reconcile().await?;
-        let commands = {
-            let workers = self.workers.lock().await;
-            workers
-                .values()
-                .map(|worker| worker.commands.clone())
-                .collect::<Vec<_>>()
-        };
-        let mut responses = Vec::with_capacity(commands.len());
-        for command in commands {
-            let (respond, response) = oneshot::channel();
-            command
-                .send(AccountWorkerCommand::CatchUp { respond })
-                .await
-                .map_err(|_| AppError::TransportClosed)?;
-            responses.push(response);
-        }
-        for response in responses {
-            match timeout(APP_RUNTIME_ACCOUNT_READY_WAIT, response).await {
-                Ok(Ok(Ok(()))) => {}
-                Ok(Ok(Err(message))) => return Err(AppError::RelayDirectory(message)),
-                Ok(Err(_)) => return Err(AppError::TransportClosed),
-                Err(_) => {
-                    return Err(AppError::RelayDirectory(
-                        "account worker catch-up timed out".into(),
-                    ));
+        let started_at = Instant::now();
+        let result = async {
+            self.shared.lifecycle().ensure_running()?;
+            self.reconcile().await?;
+            let commands = {
+                let workers = self.workers.lock().await;
+                workers
+                    .values()
+                    .map(|worker| worker.commands.clone())
+                    .collect::<Vec<_>>()
+            };
+            let mut responses = Vec::with_capacity(commands.len());
+            for command in commands {
+                let (respond, response) = oneshot::channel();
+                command
+                    .send(AccountWorkerCommand::CatchUp { respond })
+                    .await
+                    .map_err(|_| AppError::TransportClosed)?;
+                responses.push(response);
+            }
+            for response in responses {
+                match timeout(APP_RUNTIME_ACCOUNT_READY_WAIT, response).await {
+                    Ok(Ok(Ok(()))) => {}
+                    Ok(Ok(Err(message))) => return Err(AppError::RelayDirectory(message)),
+                    Ok(Err(_)) => return Err(AppError::TransportClosed),
+                    Err(_) => {
+                        return Err(AppError::RelayDirectory(
+                            "account worker catch-up timed out".into(),
+                        ));
+                    }
                 }
             }
+            Ok(())
         }
-        Ok(())
+        .await;
+        self.shared.app_performance_telemetry().record(
+            AppPerformanceOperation::AccountCatchUp,
+            started_at.elapsed(),
+            result.is_ok(),
+        );
+        result
     }
 
     pub async fn create_group(
@@ -4400,7 +4467,8 @@ async fn run_app_runtime_account_worker(
         }
     };
 
-    match tokio::select! {
+    let sync_started_at = Instant::now();
+    let startup_sync_result = tokio::select! {
         _ = &mut shutdown => {
             if let Some(ready) = ready.take() {
                 let _ = ready.send(Err("runtime startup cancelled".into()));
@@ -4414,7 +4482,13 @@ async fn run_app_runtime_account_worker(
             return;
         }
         result = client.sync() => result,
-    } {
+    };
+    shared.app_performance_telemetry().record(
+        AppPerformanceOperation::AccountSync,
+        sync_started_at.elapsed(),
+        startup_sync_result.is_ok(),
+    );
+    match startup_sync_result {
         Ok(summary) => {
             publish_app_runtime_summary(&events, &account_id_hex, &account_label, &summary);
             if sync_summary_triggers_audit_tracker_update(&summary) {
@@ -4446,6 +4520,7 @@ async fn run_app_runtime_account_worker(
             command = commands.recv() => {
                 match command {
                     Some(AccountWorkerCommand::CatchUp { respond }) => {
+                        let sync_started_at = Instant::now();
                         let result = match client.sync().await {
                             Ok(summary) => {
                                 publish_app_runtime_summary(&events, &account_id_hex, &account_label, &summary);
@@ -4465,6 +4540,11 @@ async fn run_app_runtime_account_worker(
                                 Err(message)
                             }
                         };
+                        shared.app_performance_telemetry().record(
+                            AppPerformanceOperation::AccountSync,
+                            sync_started_at.elapsed(),
+                            result.is_ok(),
+                        );
                         let _ = respond.send(result);
                     }
                         Some(AccountWorkerCommand::CreateGroup {
@@ -4686,6 +4766,7 @@ async fn run_app_runtime_account_worker(
                         payload,
                         respond,
                     }) => {
+                        let send_started_at = Instant::now();
                         let result = client
                             .send_with_local_projection(&group_id, &payload, |update| {
                                 publish_app_runtime_projection_update(
@@ -4696,6 +4777,11 @@ async fn run_app_runtime_account_worker(
                                 );
                             })
                             .await;
+                        shared.app_performance_telemetry().record(
+                            AppPerformanceOperation::OutboundMessageSend,
+                            send_started_at.elapsed(),
+                            result.is_ok(),
+                        );
                         let _ = respond.send(result);
                     }
                     Some(AccountWorkerCommand::SendAppEvent {
@@ -4703,6 +4789,7 @@ async fn run_app_runtime_account_worker(
                         intent,
                         respond,
                     }) => {
+                        let send_started_at = Instant::now();
                         let result = client
                             .send_app_event_with_local_projection(&group_id, intent, |update| {
                                 publish_app_runtime_projection_update(
@@ -4714,6 +4801,11 @@ async fn run_app_runtime_account_worker(
                             })
                             .await
                             .map(|(_event, summary)| summary);
+                        shared.app_performance_telemetry().record(
+                            AppPerformanceOperation::OutboundMessageSend,
+                            send_started_at.elapsed(),
+                            result.is_ok(),
+                        );
                         let _ = respond.send(result);
                     }
                     Some(AccountWorkerCommand::UploadMedia {
@@ -4721,7 +4813,13 @@ async fn run_app_runtime_account_worker(
                         request,
                         respond,
                     }) => {
+                        let upload_started_at = Instant::now();
                         let result = client.upload_media(&group_id, request).await;
+                        shared.app_performance_telemetry().record(
+                            AppPerformanceOperation::MediaUpload,
+                            upload_started_at.elapsed(),
+                            result.is_ok(),
+                        );
                         let _ = respond.send(result);
                     }
                     Some(AccountWorkerCommand::DownloadMedia {
@@ -4729,7 +4827,13 @@ async fn run_app_runtime_account_worker(
                         reference,
                         respond,
                     }) => {
+                        let download_started_at = Instant::now();
                         let result = client.download_media(&group_id, reference).await;
+                        shared.app_performance_telemetry().record(
+                            AppPerformanceOperation::MediaDownload,
+                            download_started_at.elapsed(),
+                            result.is_ok(),
+                        );
                         let _ = respond.send(result);
                     }
                     Some(AccountWorkerCommand::StartAgentTextStream {

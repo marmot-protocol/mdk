@@ -92,7 +92,13 @@ Integration prototypes:
 - `crates/cgka-session` - account-device session wrapper over `Engine<SqliteAccountStorage>`.
 - `crates/marmot-account` - app-core home, account records, key storage, and transport adapter orchestration.
 - `crates/marmot-app` - first non-lab multi-account app runtime bridge used by the CLI, daemon, and TUI.
+- `crates/marmot-uniffi` - UniFFI bindings over the app runtime, consumed by generated Swift and Kotlin clients.
+- `crates/marmot-markdown` - hand-written CommonMark + nostr parser for rendering message content.
+- `crates/marmot-forensics` - shared append-only JSONL forensic audit schema and recorder traits.
 - `crates/transport-nostr-adapter` - Nostr transport adapter core behind an injectable relay-client boundary.
+- `crates/agent-control` - `marmot.agent-control.v1` control-protocol DTOs and newline-delimited JSON framing.
+- `crates/agent-stream-compose` - reusable live-preview stream composition over the QUIC broker publisher.
+- `crates/agent-connector` - local `dm-agent` connector daemon bridging agent control + stream composition to the app.
 - `crates/cli` - first real CLI app surface plus `dmd` daemon and `dm tui` for Nostr-keyed accounts, keys, chats,
   groups, messages, live runtime subscriptions, and diagnostic catch-up.
 

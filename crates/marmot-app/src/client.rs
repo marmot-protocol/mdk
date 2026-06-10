@@ -6,10 +6,11 @@ use cgka_traits::agent_text_stream::{
 };
 use cgka_traits::app_components::{
     AGENT_TEXT_STREAM_QUIC_COMPONENT_ID, AppComponentData, BlobStoreEndpointV1,
-    ENCRYPTED_MEDIA_FORMAT_V1, EncryptedMediaPolicyV1, GROUP_AVATAR_URL_COMPONENT_ID,
-    GROUP_BLOSSOM_IMAGE_COMPONENT_ID, GROUP_ENCRYPTED_MEDIA_COMPONENT_ID,
-    GROUP_ENCRYPTED_MEDIA_EXPORTER_CACHE_KEY,
-    GROUP_MESSAGE_RETENTION_COMPONENT_ID, NOSTR_ROUTING_COMPONENT_ID, encode_nostr_routing_v1,
+    ENCRYPTED_MEDIA_FORMAT_V1, EncryptedMediaPolicyV1, GROUP_ADMIN_POLICY_COMPONENT_ID,
+    GROUP_AVATAR_URL_COMPONENT_ID, GROUP_BLOSSOM_IMAGE_COMPONENT_ID,
+    GROUP_ENCRYPTED_MEDIA_COMPONENT_ID, GROUP_ENCRYPTED_MEDIA_EXPORTER_CACHE_KEY,
+    GROUP_MESSAGE_RETENTION_COMPONENT_ID, GROUP_PROFILE_COMPONENT_ID, NOSTR_ROUTING_COMPONENT_ID,
+    encode_nostr_routing_v1,
 };
 use cgka_traits::app_event::{
     EVENT_REF_TAG, MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_REACTION,
@@ -17,6 +18,7 @@ use cgka_traits::app_event::{
 };
 use cgka_traits::engine::{CreateGroupRequest, KeyPackage, SendIntent};
 use cgka_traits::{GroupId, SecretBytes, TransportAdapter, TransportEndpoint};
+use marmot_forensics::{AuditEventContext, AuditEventKind, AuditHumanActionContext};
 use tokio::time::timeout;
 use transport_nostr_peeler::NostrTransportEvent;
 
@@ -40,8 +42,7 @@ use crate::{
     AppRuntime, AppTransportRouting, GroupInviteDeclineResult, MarmotApp, MarmotRelayPlane,
     MarmotRelayPlaneAccountAdapter, MediaAttachmentReference, MediaDownloadResult,
     MediaUploadRequest, MediaUploadResult, SDK_DRAIN_WAIT, SDK_FIRST_SYNC_WAIT, SendSummary,
-    SyncSummary, refresh_seen_lookup_if_needed,
-    remember_seen_event, unix_now_seconds,
+    SyncSummary, refresh_seen_lookup_if_needed, remember_seen_event, unix_now_seconds,
 };
 pub struct AppClient {
     pub(crate) app: MarmotApp,
@@ -52,7 +53,147 @@ pub struct AppClient {
     pub(crate) state: AccountState,
 }
 
+struct ObservedHumanActionAudit {
+    action: &'static str,
+    fields: Vec<&'static str>,
+    component_ids: Vec<u16>,
+    target_count: Option<u64>,
+    message_ids: Vec<String>,
+    from_epoch: Option<u64>,
+    to_epoch: Option<u64>,
+}
+
+impl ObservedHumanActionAudit {
+    fn source(
+        action: &'static str,
+        fields: Vec<&'static str>,
+        component_ids: Vec<u16>,
+        source_message_id_hex: &str,
+    ) -> Self {
+        Self {
+            action,
+            fields,
+            component_ids,
+            target_count: None,
+            message_ids: vec![source_message_id_hex.to_string()],
+            from_epoch: None,
+            to_epoch: None,
+        }
+    }
+
+    fn messages(
+        action: &'static str,
+        fields: Vec<&'static str>,
+        component_ids: Vec<u16>,
+        message_ids: Vec<String>,
+    ) -> Self {
+        Self {
+            action,
+            fields,
+            component_ids,
+            target_count: None,
+            message_ids,
+            from_epoch: None,
+            to_epoch: None,
+        }
+    }
+
+    fn with_target_count(mut self, target_count: u64) -> Self {
+        self.target_count = Some(target_count);
+        self
+    }
+
+    fn with_epoch_range(mut self, from_epoch: Option<u64>, to_epoch: Option<u64>) -> Self {
+        self.from_epoch = from_epoch;
+        self.to_epoch = to_epoch;
+        self
+    }
+}
+
 impl AppClient {
+    fn local_human_action_context(
+        action: impl Into<String>,
+        fields: Vec<&'static str>,
+        component_ids: Vec<u16>,
+        target_count: Option<u64>,
+    ) -> AuditEventContext {
+        AuditEventContext {
+            human_action: Some(AuditHumanActionContext {
+                action: action.into(),
+                origin: "local_user".into(),
+                fields: fields.into_iter().map(str::to_string).collect(),
+                component_ids,
+                target_count,
+            }),
+            ..AuditEventContext::default()
+        }
+    }
+
+    fn observed_human_action_context(
+        action: impl Into<String>,
+        fields: Vec<&'static str>,
+        component_ids: Vec<u16>,
+        target_count: Option<u64>,
+    ) -> AuditEventContext {
+        AuditEventContext {
+            human_action: Some(AuditHumanActionContext {
+                action: action.into(),
+                origin: "observed_group_event".into(),
+                fields: fields.into_iter().map(str::to_string).collect(),
+                component_ids,
+                target_count,
+            }),
+            ..AuditEventContext::default()
+        }
+    }
+
+    fn record_human_action(
+        &self,
+        group_id: &GroupId,
+        context: &AuditEventContext,
+        phase: &'static str,
+        message_ids: Vec<String>,
+        from_epoch: Option<u64>,
+        to_epoch: Option<u64>,
+    ) {
+        let Some(action) = context.human_action.as_ref() else {
+            return;
+        };
+        self.runtime.session().record_audit_event(
+            Some(group_id),
+            Some(context.clone()),
+            AuditEventKind::HumanAction {
+                action: action.action.clone(),
+                origin: action.origin.clone(),
+                phase: phase.to_string(),
+                fields: action.fields.clone(),
+                component_ids: action.component_ids.clone(),
+                target_count: action.target_count,
+                message_ids,
+                from_epoch,
+                to_epoch,
+                error_kind: None,
+                detail: None,
+            },
+        );
+    }
+
+    fn record_human_action_succeeded(
+        &self,
+        group_id: &GroupId,
+        context: &AuditEventContext,
+        effects: &marmot_account::AccountDeviceEffects,
+    ) {
+        self.record_human_action(
+            group_id,
+            context,
+            "succeeded",
+            audit_message_ids_from_effects(effects),
+            None,
+            None,
+        );
+    }
+
     async fn sync_runtime_groups(&self) -> Result<(), AppError> {
         let rebuild_since = self
             .relay_plane
@@ -116,19 +257,33 @@ impl AppClient {
                 .map_err(|err| AppError::InvalidAgentTextStreamPolicy(err.to_string()))?,
         );
         app_components.push(self.encrypted_media_component_for_new_group()?);
+        let audit_context = Self::local_human_action_context(
+            "create_group",
+            vec!["name", "members"],
+            vec![
+                NOSTR_ROUTING_COMPONENT_ID,
+                AGENT_TEXT_STREAM_QUIC_COMPONENT_ID,
+                GROUP_ENCRYPTED_MEDIA_COMPONENT_ID,
+            ],
+            Some(member_refs.len() as u64),
+        );
 
         let (group_id, effects) = self
             .runtime
-            .create_group(CreateGroupRequest {
-                name: name.to_owned(),
-                description: String::new(),
-                members,
-                required_features: Vec::new(),
-                app_components,
-                initial_admins: Vec::new(),
-            })
+            .create_group_with_audit_context(
+                CreateGroupRequest {
+                    name: name.to_owned(),
+                    description: String::new(),
+                    members,
+                    required_features: Vec::new(),
+                    app_components,
+                    initial_admins: Vec::new(),
+                },
+                audit_context.clone(),
+            )
             .await?;
         fail_if_publish_failed(&effects.failures)?;
+        self.record_human_action_succeeded(&group_id, &audit_context, &effects);
         self.remember_published_reports(&effects);
         self.add_group(&group_id)?;
         self.sync_runtime_groups().await?;
@@ -209,16 +364,26 @@ impl AppClient {
             key_packages.push(self.app.member_key_package(member).await?);
         }
         self.refresh_routing()?;
+        let audit_context = Self::local_human_action_context(
+            "invite_members",
+            vec!["members"],
+            Vec::new(),
+            Some(member_refs.len() as u64),
+        );
 
         self.sync_runtime_groups().await?;
         let effects = self
             .runtime
-            .send(SendIntent::Invite {
-                group_id: group_id.clone(),
-                key_packages,
-            })
+            .send_with_audit_context(
+                SendIntent::Invite {
+                    group_id: group_id.clone(),
+                    key_packages,
+                },
+                audit_context.clone(),
+            )
             .await?;
         fail_if_publish_failed(&effects.failures)?;
+        self.record_human_action_succeeded(group_id, &audit_context, &effects);
         self.remember_published_reports(&effects);
         self.refresh_group(group_id);
         self.prune_plaintext_retention_for_group(group_id)?;
@@ -242,16 +407,26 @@ impl AppClient {
         for member in member_refs {
             members.push(self.app.member_id(member)?);
         }
+        let audit_context = Self::local_human_action_context(
+            "remove_members",
+            vec!["members"],
+            Vec::new(),
+            Some(member_refs.len() as u64),
+        );
 
         self.sync_runtime_groups().await?;
         let effects = self
             .runtime
-            .send(SendIntent::RemoveMembers {
-                group_id: group_id.clone(),
-                members,
-            })
+            .send_with_audit_context(
+                SendIntent::RemoveMembers {
+                    group_id: group_id.clone(),
+                    members,
+                },
+                audit_context.clone(),
+            )
             .await?;
         fail_if_publish_failed(&effects.failures)?;
+        self.record_human_action_succeeded(group_id, &audit_context, &effects);
         self.remember_published_reports(&effects);
         self.refresh_group(group_id);
         self.cleanup_stale_push_tokens_best_effort(group_id);
@@ -260,16 +435,35 @@ impl AppClient {
     }
 
     pub async fn leave_group(&mut self, group_id: &GroupId) -> Result<SendSummary, AppError> {
+        let audit_context = Self::local_human_action_context(
+            "leave_group",
+            vec!["membership"],
+            Vec::new(),
+            Some(1),
+        );
+        self.leave_group_with_audit_context(group_id, audit_context)
+            .await
+    }
+
+    async fn leave_group_with_audit_context(
+        &mut self,
+        group_id: &GroupId,
+        audit_context: AuditEventContext,
+    ) -> Result<SendSummary, AppError> {
         self.ensure_group(group_id)?;
 
         self.sync_runtime_groups().await?;
         let effects = self
             .runtime
-            .send(SendIntent::Leave {
-                group_id: group_id.clone(),
-            })
+            .send_with_audit_context(
+                SendIntent::Leave {
+                    group_id: group_id.clone(),
+                },
+                audit_context.clone(),
+            )
             .await?;
         fail_if_publish_failed(&effects.failures)?;
+        self.record_human_action_succeeded(group_id, &audit_context, &effects);
         self.remember_published_reports(&effects);
         self.app.save_state(&self.state)?;
         Ok(send_summary_from_effects(&effects))
@@ -283,7 +477,15 @@ impl AppClient {
         &mut self,
         group_id: &GroupId,
     ) -> Result<GroupInviteDeclineResult, AppError> {
-        let summary = self.leave_group(group_id).await?;
+        let audit_context = Self::local_human_action_context(
+            "decline_group_invite",
+            vec!["membership"],
+            Vec::new(),
+            Some(1),
+        );
+        let summary = self
+            .leave_group_with_audit_context(group_id, audit_context)
+            .await?;
         let group = self.set_group_invite_confirmation(group_id, false, true)?;
         Ok(GroupInviteDeclineResult { group, summary })
     }
@@ -298,7 +500,14 @@ impl AppClient {
         admins.push(admin_pubkey_from_member_id(
             &self.app.member_id(member_ref)?,
         )?);
-        self.update_admin_policy(group_id, admins).await
+        let audit_context = Self::local_human_action_context(
+            "promote_admin",
+            vec!["admins"],
+            vec![GROUP_ADMIN_POLICY_COMPONENT_ID],
+            Some(1),
+        );
+        self.update_admin_policy(group_id, admins, audit_context)
+            .await
     }
 
     pub async fn demote_admin(
@@ -310,7 +519,14 @@ impl AppClient {
         let target = admin_pubkey_from_member_id(&self.app.member_id(member_ref)?)?;
         let mut admins = self.runtime.admin_pubkeys(group_id)?;
         admins.retain(|admin| admin != &target);
-        self.update_admin_policy(group_id, admins).await
+        let audit_context = Self::local_human_action_context(
+            "demote_admin",
+            vec!["admins"],
+            vec![GROUP_ADMIN_POLICY_COMPONENT_ID],
+            Some(1),
+        );
+        self.update_admin_policy(group_id, admins, audit_context)
+            .await
     }
 
     pub async fn self_demote_admin(&mut self, group_id: &GroupId) -> Result<SendSummary, AppError> {
@@ -319,25 +535,37 @@ impl AppClient {
         let local = admin_pubkey_from_account_id_hex(&account.account_id_hex)?;
         let mut admins = self.runtime.admin_pubkeys(group_id)?;
         admins.retain(|admin| admin != &local);
-        self.update_admin_policy(group_id, admins).await
+        let audit_context = Self::local_human_action_context(
+            "self_demote_admin",
+            vec!["admins"],
+            vec![GROUP_ADMIN_POLICY_COMPONENT_ID],
+            Some(1),
+        );
+        self.update_admin_policy(group_id, admins, audit_context)
+            .await
     }
 
     async fn update_admin_policy(
         &mut self,
         group_id: &GroupId,
         admins: Vec<[u8; 32]>,
+        audit_context: AuditEventContext,
     ) -> Result<SendSummary, AppError> {
         let component = AppGroupAdminPolicyComponent::new(admins).to_app_component_data()?;
 
         self.sync_runtime_groups().await?;
         let effects = self
             .runtime
-            .send(SendIntent::UpdateAppComponents {
-                group_id: group_id.clone(),
-                updates: vec![component],
-            })
+            .send_with_audit_context(
+                SendIntent::UpdateAppComponents {
+                    group_id: group_id.clone(),
+                    updates: vec![component],
+                },
+                audit_context.clone(),
+            )
             .await?;
         fail_if_publish_failed(&effects.failures)?;
+        self.record_human_action_succeeded(group_id, &audit_context, &effects);
         self.remember_published_reports(&effects);
         self.refresh_group(group_id);
         self.app.save_state(&self.state)?;
@@ -352,16 +580,26 @@ impl AppClient {
         self.ensure_group(group_id)?;
         let component = AppGroupMessageRetentionComponent::new(disappearing_message_secs)
             .to_app_component_data()?;
+        let audit_context = Self::local_human_action_context(
+            "update_message_retention",
+            vec!["message_retention"],
+            vec![GROUP_MESSAGE_RETENTION_COMPONENT_ID],
+            None,
+        );
 
         self.sync_runtime_groups().await?;
         let effects = self
             .runtime
-            .send(SendIntent::UpdateAppComponents {
-                group_id: group_id.clone(),
-                updates: vec![component],
-            })
+            .send_with_audit_context(
+                SendIntent::UpdateAppComponents {
+                    group_id: group_id.clone(),
+                    updates: vec![component],
+                },
+                audit_context.clone(),
+            )
             .await?;
         fail_if_publish_failed(&effects.failures)?;
+        self.record_human_action_succeeded(group_id, &audit_context, &effects);
         self.remember_published_reports(&effects);
         self.refresh_group(group_id);
         self.prune_plaintext_retention_for_group(group_id)?;
@@ -375,6 +613,7 @@ impl AppClient {
         endpoints: Vec<AppBlobEndpoint>,
     ) -> Result<SendSummary, AppError> {
         self.ensure_group(group_id)?;
+        let endpoint_count = endpoints.len() as u64;
         let mut allowed_locator_kinds = Vec::new();
         for endpoint in &endpoints {
             if !allowed_locator_kinds
@@ -395,16 +634,26 @@ impl AppClient {
         )
         .map_err(AppError::InvalidEncryptedMedia)?;
         let component = AppGroupEncryptedMediaComponent::new(policy)?.to_app_component_data()?;
+        let audit_context = Self::local_human_action_context(
+            "replace_encrypted_media_blob_endpoints",
+            vec!["encrypted_media"],
+            vec![GROUP_ENCRYPTED_MEDIA_COMPONENT_ID],
+            Some(endpoint_count),
+        );
 
         self.sync_runtime_groups().await?;
         let effects = self
             .runtime
-            .send(SendIntent::UpdateAppComponents {
-                group_id: group_id.clone(),
-                updates: vec![component],
-            })
+            .send_with_audit_context(
+                SendIntent::UpdateAppComponents {
+                    group_id: group_id.clone(),
+                    updates: vec![component],
+                },
+                audit_context.clone(),
+            )
             .await?;
         fail_if_publish_failed(&effects.failures)?;
+        self.record_human_action_succeeded(group_id, &audit_context, &effects);
         self.remember_published_reports(&effects);
         self.refresh_group(group_id);
         self.app.save_state(&self.state)?;
@@ -428,16 +677,26 @@ impl AppClient {
             }
             _ => AppGroupAvatarUrlComponent::absent().to_app_component_data()?,
         };
+        let audit_context = Self::local_human_action_context(
+            "update_group_avatar_url",
+            vec!["avatar_url"],
+            vec![GROUP_AVATAR_URL_COMPONENT_ID],
+            None,
+        );
 
         self.sync_runtime_groups().await?;
         let effects = self
             .runtime
-            .send(SendIntent::UpdateAppComponents {
-                group_id: group_id.clone(),
-                updates: vec![component],
-            })
+            .send_with_audit_context(
+                SendIntent::UpdateAppComponents {
+                    group_id: group_id.clone(),
+                    updates: vec![component],
+                },
+                audit_context.clone(),
+            )
             .await?;
         fail_if_publish_failed(&effects.failures)?;
+        self.record_human_action_succeeded(group_id, &audit_context, &effects);
         self.remember_published_reports(&effects);
         self.refresh_group(group_id);
         self.app.save_state(&self.state)?;
@@ -1009,6 +1268,12 @@ impl AppClient {
         media_type: &str,
     ) -> Result<SendSummary, AppError> {
         self.ensure_group(group_id)?;
+        let audit_context = Self::local_human_action_context(
+            "update_group_image",
+            vec!["image"],
+            vec![GROUP_BLOSSOM_IMAGE_COMPONENT_ID],
+            None,
+        );
         self.sync_runtime_groups().await?;
         let input = if plaintext.is_empty() {
             AppGroupImageInput::default()
@@ -1025,15 +1290,19 @@ impl AppClient {
         let data = hex::decode(AppGroupImageComponent::new(input).data_hex)?;
         let effects = self
             .runtime
-            .send(SendIntent::UpdateAppComponents {
-                group_id: group_id.clone(),
-                updates: vec![AppComponentData {
-                    component_id: GROUP_BLOSSOM_IMAGE_COMPONENT_ID,
-                    data,
-                }],
-            })
+            .send_with_audit_context(
+                SendIntent::UpdateAppComponents {
+                    group_id: group_id.clone(),
+                    updates: vec![AppComponentData {
+                        component_id: GROUP_BLOSSOM_IMAGE_COMPONENT_ID,
+                        data,
+                    }],
+                },
+                audit_context.clone(),
+            )
             .await?;
         fail_if_publish_failed(&effects.failures)?;
+        self.record_human_action_succeeded(group_id, &audit_context, &effects);
         self.remember_published_reports(&effects);
         let summary = send_summary_from_effects(&effects);
         self.refresh_group(group_id);
@@ -1237,17 +1506,34 @@ impl AppClient {
         }
         validate_group_profile(name.unwrap_or(""), description.unwrap_or(""))?;
         self.ensure_group(group_id)?;
+        let mut fields = Vec::new();
+        if name.is_some() {
+            fields.push("name");
+        }
+        if description.is_some() {
+            fields.push("description");
+        }
+        let audit_context = Self::local_human_action_context(
+            "update_group_profile",
+            fields,
+            vec![GROUP_PROFILE_COMPONENT_ID],
+            None,
+        );
 
         self.sync_runtime_groups().await?;
         let effects = self
             .runtime
-            .send(SendIntent::UpdateGroupData {
-                group_id: group_id.clone(),
-                name: name.map(ToOwned::to_owned),
-                description: description.map(ToOwned::to_owned),
-            })
+            .send_with_audit_context(
+                SendIntent::UpdateGroupData {
+                    group_id: group_id.clone(),
+                    name: name.map(ToOwned::to_owned),
+                    description: description.map(ToOwned::to_owned),
+                },
+                audit_context.clone(),
+            )
             .await?;
         fail_if_publish_failed(&effects.failures)?;
+        self.record_human_action_succeeded(group_id, &audit_context, &effects);
         self.remember_published_reports(&effects);
         let message_ids = effects
             .reports
@@ -1394,6 +1680,8 @@ impl AppClient {
         self.remember_transport_cursor(source_recorded_at);
         for event in &effects.effects.events {
             let before = self.state.groups.len();
+            let previous_group =
+                event_group_id(event).and_then(|group_id| self.state_group_record(group_id));
             let group_metadata =
                 event_group_id(event).and_then(|group_id| self.runtime.group_record(group_id).ok());
             let group_projection = event_group_id(event)
@@ -1471,6 +1759,14 @@ impl AppClient {
                 summary.projection_updates.push(projection_update);
                 self.prune_plaintext_retention_for_group(&message.group_id)?;
             }
+            let updated_group =
+                event_group_id(event).and_then(|group_id| self.state_group_record(group_id));
+            self.audit_observed_group_event(
+                event,
+                previous_group.as_ref(),
+                updated_group.as_ref(),
+                &source_message_id_hex,
+            );
             if let cgka_traits::engine::GroupEvent::AppMessageInvalidated {
                 message_id, reason, ..
             } = event
@@ -1511,6 +1807,235 @@ impl AppClient {
         } else {
             Err(AppError::UnknownGroup(group_id_hex))
         }
+    }
+
+    fn state_group_record(&self, group_id: &GroupId) -> Option<AppGroupRecord> {
+        let group_id_hex = hex::encode(group_id.as_slice());
+        self.state
+            .groups
+            .iter()
+            .find(|group| group.group_id_hex == group_id_hex)
+            .cloned()
+    }
+
+    fn audit_observed_group_event(
+        &self,
+        event: &cgka_traits::engine::GroupEvent,
+        previous: Option<&AppGroupRecord>,
+        updated: Option<&AppGroupRecord>,
+        source_message_id_hex: &str,
+    ) {
+        match event {
+            cgka_traits::engine::GroupEvent::GroupCreated { group_id } => {
+                self.record_observed_human_action(
+                    group_id,
+                    ObservedHumanActionAudit::source(
+                        "create_group",
+                        vec!["membership"],
+                        Vec::new(),
+                        source_message_id_hex,
+                    )
+                    .with_target_count(1),
+                );
+            }
+            cgka_traits::engine::GroupEvent::GroupJoined {
+                group_id,
+                via_welcome,
+                ..
+            } => {
+                self.record_observed_human_action(
+                    group_id,
+                    ObservedHumanActionAudit::messages(
+                        "group_joined",
+                        vec!["membership"],
+                        Vec::new(),
+                        vec![hex::encode(via_welcome.as_slice())],
+                    )
+                    .with_target_count(1),
+                );
+            }
+            cgka_traits::engine::GroupEvent::MemberAdded { group_id, .. } => {
+                self.record_observed_human_action(
+                    group_id,
+                    ObservedHumanActionAudit::source(
+                        "invite_members",
+                        vec!["members"],
+                        Vec::new(),
+                        source_message_id_hex,
+                    )
+                    .with_target_count(1),
+                );
+            }
+            cgka_traits::engine::GroupEvent::MemberRemoved { group_id, .. } => {
+                self.record_observed_human_action(
+                    group_id,
+                    ObservedHumanActionAudit::source(
+                        "remove_members",
+                        vec!["members"],
+                        Vec::new(),
+                        source_message_id_hex,
+                    )
+                    .with_target_count(1),
+                );
+            }
+            cgka_traits::engine::GroupEvent::EpochChanged { group_id, from, to } => {
+                if let (Some(previous), Some(updated)) = (previous, updated)
+                    && self.audit_observed_group_projection_delta(
+                        group_id,
+                        previous,
+                        updated,
+                        source_message_id_hex,
+                        Some(from.0),
+                        Some(to.0),
+                    )
+                {
+                    return;
+                }
+                self.record_observed_human_action(
+                    group_id,
+                    ObservedHumanActionAudit::source(
+                        "epoch_changed",
+                        Vec::new(),
+                        Vec::new(),
+                        source_message_id_hex,
+                    )
+                    .with_epoch_range(Some(from.0), Some(to.0)),
+                );
+            }
+            _ => {}
+        }
+    }
+
+    fn audit_observed_group_projection_delta(
+        &self,
+        group_id: &GroupId,
+        previous: &AppGroupRecord,
+        updated: &AppGroupRecord,
+        source_message_id_hex: &str,
+        from_epoch: Option<u64>,
+        to_epoch: Option<u64>,
+    ) -> bool {
+        let mut recorded = false;
+        let mut profile_fields = Vec::new();
+        if previous.profile.name != updated.profile.name {
+            profile_fields.push("name");
+        }
+        if previous.profile.description != updated.profile.description {
+            profile_fields.push("description");
+        }
+        if !profile_fields.is_empty() {
+            self.record_observed_human_action(
+                group_id,
+                ObservedHumanActionAudit::source(
+                    "update_group_profile",
+                    profile_fields,
+                    vec![GROUP_PROFILE_COMPONENT_ID],
+                    source_message_id_hex,
+                )
+                .with_epoch_range(from_epoch, to_epoch),
+            );
+            recorded = true;
+        }
+        if previous.admin_policy.admins != updated.admin_policy.admins {
+            let action = match updated
+                .admin_policy
+                .admins
+                .len()
+                .cmp(&previous.admin_policy.admins.len())
+            {
+                std::cmp::Ordering::Greater => "promote_admin",
+                std::cmp::Ordering::Less => "demote_admin",
+                std::cmp::Ordering::Equal => "update_admin_policy",
+            };
+            let delta = previous
+                .admin_policy
+                .admins
+                .len()
+                .abs_diff(updated.admin_policy.admins.len());
+            self.record_observed_human_action(
+                group_id,
+                ObservedHumanActionAudit::source(
+                    action,
+                    vec!["admins"],
+                    vec![GROUP_ADMIN_POLICY_COMPONENT_ID],
+                    source_message_id_hex,
+                )
+                .with_target_count(delta.max(1) as u64)
+                .with_epoch_range(from_epoch, to_epoch),
+            );
+            recorded = true;
+        }
+        if previous.message_retention.data_hex != updated.message_retention.data_hex {
+            self.record_observed_human_action(
+                group_id,
+                ObservedHumanActionAudit::source(
+                    "update_message_retention",
+                    vec!["message_retention"],
+                    vec![GROUP_MESSAGE_RETENTION_COMPONENT_ID],
+                    source_message_id_hex,
+                )
+                .with_epoch_range(from_epoch, to_epoch),
+            );
+            recorded = true;
+        }
+        if previous.avatar_url.data_hex != updated.avatar_url.data_hex {
+            self.record_observed_human_action(
+                group_id,
+                ObservedHumanActionAudit::source(
+                    "update_group_avatar_url",
+                    vec!["avatar_url"],
+                    vec![GROUP_AVATAR_URL_COMPONENT_ID],
+                    source_message_id_hex,
+                )
+                .with_epoch_range(from_epoch, to_epoch),
+            );
+            recorded = true;
+        }
+        if previous.image.data_hex != updated.image.data_hex {
+            self.record_observed_human_action(
+                group_id,
+                ObservedHumanActionAudit::source(
+                    "update_group_image",
+                    vec!["image"],
+                    vec![GROUP_BLOSSOM_IMAGE_COMPONENT_ID],
+                    source_message_id_hex,
+                )
+                .with_epoch_range(from_epoch, to_epoch),
+            );
+            recorded = true;
+        }
+        if previous.encrypted_media.data_hex != updated.encrypted_media.data_hex {
+            self.record_observed_human_action(
+                group_id,
+                ObservedHumanActionAudit::source(
+                    "replace_encrypted_media_blob_endpoints",
+                    vec!["encrypted_media"],
+                    vec![GROUP_ENCRYPTED_MEDIA_COMPONENT_ID],
+                    source_message_id_hex,
+                )
+                .with_target_count(updated.encrypted_media.default_blob_endpoints.len() as u64)
+                .with_epoch_range(from_epoch, to_epoch),
+            );
+            recorded = true;
+        }
+        recorded
+    }
+
+    fn record_observed_human_action(&self, group_id: &GroupId, audit: ObservedHumanActionAudit) {
+        let context = Self::observed_human_action_context(
+            audit.action,
+            audit.fields,
+            audit.component_ids,
+            audit.target_count,
+        );
+        self.record_human_action(
+            group_id,
+            &context,
+            "observed",
+            audit.message_ids,
+            audit.from_epoch,
+            audit.to_epoch,
+        );
     }
 
     fn set_group_invite_confirmation(
@@ -1822,6 +2347,14 @@ impl AppClient {
             })?;
         AppGroupNostrRoutingComponent::from_bytes(&bytes)
     }
+}
+
+fn audit_message_ids_from_effects(effects: &marmot_account::AccountDeviceEffects) -> Vec<String> {
+    effects
+        .reports
+        .iter()
+        .map(|report| hex::encode(report.message_id.as_slice()))
+        .collect()
 }
 
 fn read_marker_error_code(error: &AppError) -> &'static str {

@@ -8,9 +8,10 @@ rules, and returns typed outcomes for every ingest path.
 ## What this crate does
 
 - Wraps `MlsGroup` for each joined group and manages its `EpochState` lifecycle (`Stable`, `PendingPublish`, `Merging`,
-  `Recovering`).
-- Translates `SendIntent`s (create, invite, remove, leave, app-message, capability upgrade) into MLS commits;
-  translates inbound `TransportEnvelope`s into typed `IngestOutcome`s and `GroupEvent`s.
+  `Recovering`, `Unrecoverable`).
+- Translates `SendIntent`s (app-message, invite, remove-members, leave, update-app-components, update-group-data) into
+  MLS commits — group creation and capability upgrade are separate trait calls (`create_group`,
+  `upgrade_group_capabilities`); translates inbound `TransportEnvelope`s into typed `IngestOutcome`s and `GroupEvent`s.
 - Stores inbound payloads as typed raw-transport or peeled-OpenMLS records so peel-deferred messages can be retried
   without polluting convergence replay.
 - Retains a small, configurable OpenMLS past-epoch window for delayed application messages.

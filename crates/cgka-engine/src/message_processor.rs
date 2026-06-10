@@ -37,6 +37,13 @@ use tls_codec::{Deserialize as _, Serialize as _};
 
 const MAX_CONVERGENCE_REPROCESSING_PASSES: usize = 16;
 
+struct PastPeelRecovery {
+    peeled: cgka_traits::ingest::PeeledMessage,
+    source_epoch: EpochId,
+    snapshot_name: String,
+    attempt_count: u64,
+}
+
 impl<S: StorageProvider> Engine<S> {
     /// Inbound pipeline. Never panics; every classifiable stale case returns
     /// a typed `StaleReason` inside `Ok(IngestOutcome::Stale { .. })`.
@@ -208,6 +215,13 @@ impl<S: StorageProvider> Engine<S> {
                     msg_id: msg_id_hex.clone(),
                     outcome: raw_outcome,
                     fallback_snapshot_used: false,
+                    fallback_snapshot_name: None,
+                    fallback_snapshot_source_epoch: None,
+                    fallback_attempt_count: None,
+                    error_kind: match &peel_result {
+                        Err(e) => Some(crate::audit_helpers::peeler_error_kind(e).to_string()),
+                        Ok(_) => None,
+                    },
                     detail: match &peel_result {
                         Err(e) => Some(format!("{e}")),
                         Ok(_) => None,
@@ -217,7 +231,7 @@ impl<S: StorageProvider> Engine<S> {
             let peeled = match peel_result {
                 Ok(p) => p,
                 Err(PeelerError::DecryptFailed) => {
-                    if let Some(peeled) = self
+                    if let Some(recovery) = self
                         .try_peel_group_message_from_available_snapshots(
                             msg,
                             &group_id,
@@ -231,10 +245,14 @@ impl<S: StorageProvider> Engine<S> {
                                 msg_id: msg_id_hex.clone(),
                                 outcome: marmot_forensics::PeelerOutcomeKind::Success,
                                 fallback_snapshot_used: true,
+                                fallback_snapshot_name: Some(recovery.snapshot_name.clone()),
+                                fallback_snapshot_source_epoch: Some(recovery.source_epoch.0),
+                                fallback_attempt_count: Some(recovery.attempt_count),
+                                error_kind: None,
                                 detail: Some("recovered_after_decrypt_failed".to_string()),
                             },
                         );
-                        peeled
+                        recovery.peeled
                     } else {
                         self.persist_transport_message(
                             msg,
@@ -256,7 +274,7 @@ impl<S: StorageProvider> Engine<S> {
                     }
                 }
                 Err(PeelerError::StaleEpoch { .. }) => {
-                    if let Some(peeled) = self
+                    if let Some(recovery) = self
                         .try_peel_group_message_from_available_snapshots(
                             msg,
                             &group_id,
@@ -270,10 +288,14 @@ impl<S: StorageProvider> Engine<S> {
                                 msg_id: msg_id_hex.clone(),
                                 outcome: marmot_forensics::PeelerOutcomeKind::Success,
                                 fallback_snapshot_used: true,
+                                fallback_snapshot_name: Some(recovery.snapshot_name.clone()),
+                                fallback_snapshot_source_epoch: Some(recovery.source_epoch.0),
+                                fallback_attempt_count: Some(recovery.attempt_count),
+                                error_kind: None,
                                 detail: Some("recovered_after_stale_epoch".to_string()),
                             },
                         );
-                        peeled
+                        recovery.peeled
                     } else {
                         self.persist_transport_message(
                             msg,
@@ -629,8 +651,9 @@ impl<S: StorageProvider> Engine<S> {
                     // this proposal. OpenMLS does not auto-enqueue processed
                     // proposals, so store it before attempting to commit the
                     // pending proposal queue.
-                    let decision = crate::auto_committer::decide(&mls_group, &queued);
-                    let decision_str = match &decision {
+                    let decision_report =
+                        crate::auto_committer::decide_with_reason(&mls_group, &queued);
+                    let decision_str = match &decision_report.decision {
                         crate::auto_committer::AutoCommitDecision::Commit => "commit",
                         crate::auto_committer::AutoCommitDecision::Observe => "observe",
                     };
@@ -642,7 +665,7 @@ impl<S: StorageProvider> Engine<S> {
                             )
                             .to_string(),
                             decision: decision_str.to_string(),
-                            reason: None,
+                            reason: Some(decision_report.reason.to_string()),
                         },
                     );
                     let auto_removed = match queued.proposal() {
@@ -662,7 +685,10 @@ impl<S: StorageProvider> Engine<S> {
                         *queued,
                     )
                     .map_err(|e| EngineError::Backend(format!("store_pending: {e:?}")))?;
-                    if matches!(decision, crate::auto_committer::AutoCommitDecision::Commit) {
+                    if matches!(
+                        decision_report.decision,
+                        crate::auto_committer::AutoCommitDecision::Commit
+                    ) {
                         // Fork-detection bookkeeping — we're committing FROM
                         // the current pre-commit epoch.
                         let pre_commit_epoch = EpochId(mls_group.epoch().as_u64());
@@ -1767,13 +1793,15 @@ impl<S: StorageProvider> Engine<S> {
         msg: &TransportMessage,
         group_id: &GroupId,
         current_epoch: EpochId,
-    ) -> Result<Option<cgka_traits::ingest::PeeledMessage>, EngineError> {
+    ) -> Result<Option<PastPeelRecovery>, EngineError> {
         use crate::snapshot_guard::SnapshotRollbackGuard;
         let snapshots = self.available_past_peel_snapshots(group_id)?;
+        let mut attempt_count = 0_u64;
         for (source_epoch, snapshot_name) in snapshots {
             if source_epoch >= current_epoch {
                 continue;
             }
+            attempt_count = attempt_count.saturating_add(1);
             // Privacy: do not embed `group_id` or `msg.id` as hex in the
             // snapshot name. Storage error messages and any future
             // tracing on snapshot names would otherwise leak routing /
@@ -1807,7 +1835,14 @@ impl<S: StorageProvider> Engine<S> {
             let peeled = self.peeler.peel_group_message(msg, &ctx).await;
             guard.commit()?;
             match peeled {
-                Ok(peeled) => return Ok(Some(peeled)),
+                Ok(peeled) => {
+                    return Ok(Some(PastPeelRecovery {
+                        peeled,
+                        source_epoch,
+                        snapshot_name,
+                        attempt_count,
+                    }));
+                }
                 Err(PeelerError::DecryptFailed | PeelerError::StaleEpoch { .. }) => continue,
                 Err(err) => return Err(EngineError::Peeler(err)),
             }
@@ -1934,7 +1969,13 @@ impl<S: StorageProvider> Engine<S> {
         })?;
         self.audit_group(
             group_id,
-            crate::audit_helpers::message_state_changed_event(id_hex, state, "persist"),
+            crate::audit_helpers::message_state_transition_event(
+                id_hex,
+                None,
+                state,
+                Some(epoch),
+                "persist",
+            ),
         );
         Ok(())
     }
@@ -1944,12 +1985,20 @@ impl<S: StorageProvider> Engine<S> {
         id: &MessageId,
         state: MessageState,
     ) -> Result<(), EngineError> {
+        let previous = self.storage.get_message(id).ok();
         self.storage.update_message_state(id, state)?;
-        self.audit(crate::audit_helpers::message_state_changed_event(
+        let event = crate::audit_helpers::message_state_transition_event(
             hex::encode(id.as_slice()),
+            previous.as_ref().map(|record| record.state),
             state,
+            previous.as_ref().map(|record| record.epoch),
             "state_update",
-        ));
+        );
+        if let Some(record) = previous {
+            self.audit_group(&record.group_id, event);
+        } else {
+            self.audit(event);
+        }
         Ok(())
     }
 

@@ -3,6 +3,7 @@ use marmot_app::{
     AuditLogSettings, AuditLogTrackerConfig, AuditLogUploadSource, MarmotApp, MarmotAppConfig,
     MarmotAppRuntime, MarmotServiceEndpoints,
 };
+use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
@@ -478,4 +479,60 @@ async fn audit_log_setting_enables_jsonl_recorder_for_opened_accounts() {
     assert_eq!(files[0].account_ref, "alice");
     assert!(files[0].file_name.starts_with("audit-"));
     assert!(files[0].file_name.ends_with(".jsonl"));
+}
+
+#[tokio::test]
+async fn local_group_action_writes_human_action_context() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(tmp.path());
+    let account = home.create_account("alice").unwrap();
+    let app = MarmotApp::with_relay(tmp.path(), "wss://relay.example");
+    app.set_audit_log_settings(AuditLogSettings { enabled: true })
+        .unwrap();
+
+    let mut client = app.client(&account.label).await.unwrap();
+    client.create_group("audit actions", &[]).await.unwrap();
+
+    let files = app.audit_log_files().unwrap();
+    assert_eq!(files.len(), 1);
+    let body = std::fs::read_to_string(&files[0].path).unwrap();
+    let events = body
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect::<Vec<_>>();
+
+    let human_action = events
+        .iter()
+        .find(|event| {
+            event["kind"]["type"] == "human_action"
+                && event["kind"]["action"] == "create_group"
+                && event["kind"]["phase"] == "succeeded"
+        })
+        .expect("create_group should write a human_action audit row");
+    assert_eq!(human_action["kind"]["origin"], "local_user");
+    assert!(
+        human_action["kind"]["fields"]
+            .as_array()
+            .unwrap()
+            .contains(&Value::String("name".into()))
+    );
+    assert!(
+        human_action["kind"]["fields"]
+            .as_array()
+            .unwrap()
+            .contains(&Value::String("members".into()))
+    );
+
+    let create_entry = events
+        .iter()
+        .find(|event| event["kind"]["type"] == "create_group_entry")
+        .expect("create_group should write a create_group_entry audit row");
+    assert_eq!(
+        create_entry["context"]["human_action"]["action"],
+        "create_group"
+    );
+    assert_eq!(
+        create_entry["context"]["human_action"]["origin"],
+        "local_user"
+    );
 }

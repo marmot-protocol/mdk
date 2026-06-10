@@ -27,6 +27,7 @@ use cgka_traits::{
     TransportAdapterError, TransportDelivery, TransportEndpoint, TransportGroupSubscription,
     TransportGroupSync, TransportPublishReport, TransportPublishRequest, TransportPublishTarget,
 };
+use marmot_forensics::{AuditEventContext, AuditEventKind, PublishRelayFailure};
 use serde::{Deserialize, Serialize};
 
 const TRACE_TARGET: &str = "marmot_account::runtime";
@@ -931,9 +932,37 @@ where
         Ok((group_id, effects))
     }
 
+    pub async fn create_group_with_audit_context(
+        &mut self,
+        request: CreateGroupRequest,
+        context: AuditEventContext,
+    ) -> AccountResult<(GroupId, AccountDeviceEffects)> {
+        let CreateGroupEffects { group_id, effects } = self
+            .session
+            .create_group_with_audit_context(request, context.clone())
+            .await?;
+        let effects = self
+            .publish_session_effects_with_audit_context(effects, Some(context))
+            .await?;
+        Ok((group_id, effects))
+    }
+
     pub async fn send(&mut self, intent: SendIntent) -> AccountResult<AccountDeviceEffects> {
         let effects = self.session.send(intent).await?;
         self.publish_session_effects(effects).await
+    }
+
+    pub async fn send_with_audit_context(
+        &mut self,
+        intent: SendIntent,
+        context: AuditEventContext,
+    ) -> AccountResult<AccountDeviceEffects> {
+        let effects = self
+            .session
+            .send_with_audit_context(intent, context.clone())
+            .await?;
+        self.publish_session_effects_with_audit_context(effects, Some(context))
+            .await
     }
 
     pub async fn advance_convergence(
@@ -955,7 +984,7 @@ where
         if delivery.account_id != self.session.self_id() {
             return Err(AccountError::WrongAccountDelivery);
         }
-        let IngestEffects { outcome, effects } = self.session.ingest(delivery.message).await?;
+        let IngestEffects { outcome, effects } = self.session.ingest_delivery(delivery).await?;
         let effects = self.publish_session_effects(effects).await?;
         Ok(AccountIngestEffects { outcome, effects })
     }
@@ -964,6 +993,15 @@ where
         &mut self,
         effects: SessionEffects,
     ) -> AccountResult<AccountDeviceEffects> {
+        self.publish_session_effects_with_audit_context(effects, None)
+            .await
+    }
+
+    async fn publish_session_effects_with_audit_context(
+        &mut self,
+        effects: SessionEffects,
+        context: Option<AuditEventContext>,
+    ) -> AccountResult<AccountDeviceEffects> {
         let mut output = AccountDeviceEffects::default();
         let mut queue = VecDeque::new();
         output.absorb_session_effects(effects, &mut queue);
@@ -971,23 +1009,42 @@ where
         while let Some(work) = queue.pop_front() {
             match work {
                 PublishWork::ApplicationMessage { msg } | PublishWork::Proposal { msg } => {
-                    self.publish_one(msg, &mut output).await?;
+                    self.publish_one(msg, &mut output, context.clone()).await?;
                 }
                 PublishWork::GroupCreated { welcomes, pending } => {
-                    self.publish_pending(welcomes, pending, &mut output, &mut queue)
-                        .await?;
+                    self.publish_pending(
+                        welcomes,
+                        pending,
+                        &mut output,
+                        &mut queue,
+                        context.clone(),
+                    )
+                    .await?;
                 }
                 PublishWork::GroupEvolution {
                     msg,
                     welcomes,
                     pending,
                 } => {
-                    self.publish_group_evolution(msg, welcomes, pending, &mut output, &mut queue)
-                        .await?;
+                    self.publish_group_evolution(
+                        msg,
+                        welcomes,
+                        pending,
+                        &mut output,
+                        &mut queue,
+                        context.clone(),
+                    )
+                    .await?;
                 }
                 PublishWork::AutoPublish { msg, pending } => {
-                    self.publish_pending(vec![msg], pending, &mut output, &mut queue)
-                        .await?;
+                    self.publish_pending(
+                        vec![msg],
+                        pending,
+                        &mut output,
+                        &mut queue,
+                        context.clone(),
+                    )
+                    .await?;
                 }
             }
         }
@@ -1001,10 +1058,11 @@ where
         pending: PendingStateRef,
         output: &mut AccountDeviceEffects,
         queue: &mut VecDeque<PublishWork>,
+        context: Option<AuditEventContext>,
     ) -> AccountResult<()> {
         let mut all_published = true;
         for message in messages {
-            all_published &= self.publish_one(message, output).await?;
+            all_published &= self.publish_one(message, output, context.clone()).await?;
         }
 
         if all_published {
@@ -1030,8 +1088,9 @@ where
         pending: PendingStateRef,
         output: &mut AccountDeviceEffects,
         queue: &mut VecDeque<PublishWork>,
+        context: Option<AuditEventContext>,
     ) -> AccountResult<()> {
-        if self.publish_one(commit, output).await? {
+        if self.publish_one(commit, output, context.clone()).await? {
             let effects = self.session.confirm_published(pending).await?;
             output
                 .pending
@@ -1039,7 +1098,7 @@ where
             output.absorb_session_effects(effects, queue);
 
             for welcome in welcomes {
-                self.publish_one(welcome, output).await?;
+                self.publish_one(welcome, output, context.clone()).await?;
             }
         } else {
             let effects = self.session.publish_failed(pending).await?;
@@ -1055,11 +1114,26 @@ where
         &self,
         message: TransportMessage,
         output: &mut AccountDeviceEffects,
+        context: Option<AuditEventContext>,
     ) -> AccountResult<bool> {
         let message_id = message.id.clone();
+        let msg_id_hex = hex::encode(message_id.as_slice());
+        let mut publish_context = context.unwrap_or_default();
+        publish_context.operation_id = Some(format!("publish-{msg_id_hex}"));
         let target = match self.routing.publish_target(&message) {
             Ok(target) => target,
             Err(e) => {
+                self.session.record_audit_event(
+                    None,
+                    Some(publish_context),
+                    AuditEventKind::PublishFailure {
+                        msg_id: msg_id_hex,
+                        stage: "routing".into(),
+                        target_kind: "unknown".into(),
+                        relay_urls: Vec::new(),
+                        reason: e.to_string(),
+                    },
+                );
                 output.failures.push(PublishFailure {
                     message_id,
                     reason: e.to_string(),
@@ -1068,6 +1142,19 @@ where
             }
         };
         let required_acks = self.routing.required_acks(&target);
+        let target_kind = publish_target_kind(&target).to_string();
+        let relay_urls = publish_target_relay_urls(&target);
+        let target_group_id = publish_target_group_id(&target);
+        self.session.record_audit_event(
+            target_group_id.as_ref(),
+            Some(publish_context.clone()),
+            AuditEventKind::PublishAttempt {
+                msg_id: msg_id_hex.clone(),
+                target_kind: target_kind.clone(),
+                relay_urls: relay_urls.clone(),
+                required_acks: required_acks as u64,
+            },
+        );
         let report = match self
             .adapter
             .publish(TransportPublishRequest {
@@ -1080,6 +1167,17 @@ where
         {
             Ok(report) => report,
             Err(e) => {
+                self.session.record_audit_event(
+                    target_group_id.as_ref(),
+                    Some(publish_context),
+                    AuditEventKind::PublishFailure {
+                        msg_id: msg_id_hex,
+                        stage: "adapter".into(),
+                        target_kind,
+                        relay_urls,
+                        reason: e.to_string(),
+                    },
+                );
                 output.failures.push(PublishFailure {
                     message_id,
                     reason: e.to_string(),
@@ -1088,7 +1186,41 @@ where
             }
         };
         let published = report.met_required_acks();
+        self.session.record_audit_event(
+            target_group_id.as_ref(),
+            Some(publish_context.clone()),
+            AuditEventKind::PublishOutcome {
+                msg_id: hex::encode(report.message_id.as_slice()),
+                target_kind: target_kind.clone(),
+                accepted_relay_urls: report
+                    .accepted
+                    .iter()
+                    .map(|receipt| receipt.endpoint.0.clone())
+                    .collect(),
+                failed_relays: report
+                    .failed
+                    .iter()
+                    .map(|failure| PublishRelayFailure {
+                        relay_url: failure.endpoint.0.clone(),
+                        reason: failure.reason.clone(),
+                    })
+                    .collect(),
+                required_acks: report.required_acks as u64,
+                met_required_acks: published,
+            },
+        );
         if !published {
+            self.session.record_audit_event(
+                target_group_id.as_ref(),
+                Some(publish_context),
+                AuditEventKind::PublishFailure {
+                    msg_id: hex::encode(report.message_id.as_slice()),
+                    stage: "required_acks".into(),
+                    target_kind,
+                    relay_urls,
+                    reason: "insufficient publish acknowledgements".into(),
+                },
+            );
             output.failures.push(PublishFailure {
                 message_id: report.message_id.clone(),
                 reason: "insufficient publish acknowledgements".into(),
@@ -1096,6 +1228,28 @@ where
         }
         output.reports.push(report);
         Ok(published)
+    }
+}
+
+fn publish_target_kind(target: &TransportPublishTarget) -> &'static str {
+    match target {
+        TransportPublishTarget::Group { .. } => "group",
+        TransportPublishTarget::Inbox { .. } => "inbox",
+    }
+}
+
+fn publish_target_relay_urls(target: &TransportPublishTarget) -> Vec<String> {
+    target
+        .endpoints()
+        .iter()
+        .map(|endpoint| endpoint.0.clone())
+        .collect()
+}
+
+fn publish_target_group_id(target: &TransportPublishTarget) -> Option<GroupId> {
+    match target {
+        TransportPublishTarget::Group { group_id, .. } => Some(group_id.clone()),
+        TransportPublishTarget::Inbox { .. } => None,
     }
 }
 

@@ -17,6 +17,11 @@ encrypted SQLite database. One database file belongs to one Marmot account-devic
 | `src/migrations/` | Numbered Rust migration bodies. |
 | `src/storage/` | Marmot storage tables by concern. |
 | `src/openmls_storage/` | Custom OpenMLS storage adapter. |
+| `src/account_projection.rs` | Account-level event projection. |
+| `src/chat_list.rs` | Chat-list projection, including avatar URLs. |
+| `src/timeline.rs` | Materialized message-timeline aggregation. |
+| `src/encrypted_media_secrets.rs` | Per-group encrypted-media secret storage. |
+| `src/shared.rs` | Shared row helpers used across projections. |
 
 ## Invariants
 

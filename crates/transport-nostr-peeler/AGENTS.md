@@ -28,7 +28,7 @@ storage. Keep those in adapters or the app layer above this crate.
 ## Current limits
 
 - Group messages are wrapped and peeled. Each outbound kind `445` event is signed by a fresh ephemeral Nostr key
-  generated per event (`spec/transports/nostr.md:32-34`); the account identity never appears as the outer event pubkey.
+  generated per event (`spec/transports/nostr.md:64-65`); the account identity never appears as the outer event pubkey.
 - Kind `445` content is `base64(nonce || ciphertext)` of a single ChaCha20-Poly1305 sealing under the empty AAD. There
   is no source-epoch hint: an undecryptable message returns `DecryptFailed`, and the engine falls back to retained-epoch
   snapshots / deferred-peel retry rather than a transport-carried epoch.

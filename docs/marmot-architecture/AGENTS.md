@@ -49,6 +49,12 @@ Agent map for the Marmot architecture docs.
 - **Path:** `relay-observability.md`
   - **Role:** Export contract for client-side relay telemetry: privacy contract, metric catalogue, and observability.md amendment.
 
+- **Path:** `hermes-agent-production-runbook.md`
+  - **Role:** Draft operational runbook for the Hermes agent deployment. Check status and dates before relying on it.
+
+- **Path:** `hermes-openclaw-agent-integration-plan.md`
+  - **Role:** Working plan for the Hermes/OpenClaw agent integration. Check status and dates before relying on it.
+
 - **Path:** `../../spec/`
   - **Role:** Marmot v2 protocol draft by stable surface and app component.
 

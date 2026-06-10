@@ -14,6 +14,10 @@ This repo owns the candidate CGKA engine workspace:
 - SQLCipher-backed storage backend,
 - Nostr transport adapter and peeler,
 - raw QUIC agent text stream preview transport and memory-only broker,
+- agent control protocol, stream composition, and the `dm-agent` connector daemon,
+- app message Markdown display parser,
+- shared JSONL forensic audit schema,
+- UniFFI bindings for the app runtime,
 - first app CLI surface, daemon, and TUI,
 - conformance simulator and vector fixtures,
 - Tamarin models for distributed convergence,
@@ -36,6 +40,11 @@ This repo owns the candidate CGKA engine workspace:
 | Nostr transport peeler | `crates/transport-nostr-peeler/AGENTS.md` |
 | QUIC agent text stream previews | `crates/transport-quic-stream/AGENTS.md` |
 | QUIC preview broker | `crates/transport-quic-broker/AGENTS.md` |
+| Agent control protocol DTOs / framing | `crates/agent-control/AGENTS.md` |
+| Agent stream composition | `crates/agent-stream-compose/AGENTS.md` |
+| `dm-agent` connector daemon | `crates/agent-connector/AGENTS.md` |
+| Forensic audit schema | `crates/marmot-forensics/AGENTS.md` |
+| App runtime UniFFI bindings | `crates/marmot-uniffi/README.md` |
 | First app CLI / daemon / TUI surface | `crates/cli/AGENTS.md` |
 | Multi-client harness / vectors | `crates/cgka-conformance-simulator/AGENTS.md` |
 | Architecture docs | `docs/AGENTS.md` and `docs/marmot-architecture/AGENTS.md` |

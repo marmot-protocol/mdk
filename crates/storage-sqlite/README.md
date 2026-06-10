@@ -16,6 +16,10 @@ The crate is split around storage concerns:
 - `openmls_storage/` owns the custom OpenMLS adapter. `value_store.rs` contains the SQLite row mechanics, `labels.rs`
   contains stable labels and key helpers, and `provider.rs` is the direct implementation of the large OpenMLS storage
   trait.
+- `account_projection.rs`, `chat_list.rs`, and `timeline.rs` own the app-facing projections (account event projection,
+  chat-list projection including avatar URLs, and the materialized message timeline).
+- `encrypted_media_secrets.rs` owns per-group encrypted-media secret storage; `shared.rs` and `codec.rs` own shared
+  row/codec helpers and SQLite error mapping.
 - `migrations.rs` owns the migration runner and migration tests.
 
 ## Migrations

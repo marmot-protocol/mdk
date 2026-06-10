@@ -21,6 +21,7 @@ use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
 impl<S: StorageProvider> Engine<S> {
     pub fn set_convergence_policy(&mut self, policy: CanonicalizationPolicy) {
         self.convergence_policy = policy;
+        self.audit_engine_context();
     }
 
     pub fn set_group_convergence_policy(
@@ -35,6 +36,17 @@ impl<S: StorageProvider> Engine<S> {
         self.storage
             .put_convergence_policy(group_id, &encode_convergence_policy(&policy)?)
             .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
+        let mut context = self
+            .audit_group_context_snapshot(group_id)
+            .unwrap_or_default();
+        context.convergence_max_rewind_commits = Some(policy.convergence.max_rewind_commits);
+        self.audit_group(
+            group_id,
+            marmot_forensics::AuditEventKind::GroupContext {
+                reason: "set_group_convergence_policy".to_string(),
+                context,
+            },
+        );
         Ok(())
     }
 
@@ -178,8 +190,8 @@ impl<S: StorageProvider> Engine<S> {
             group_id,
             marmot_forensics::AuditEventKind::ConvergenceDecision {
                 current_tip_epoch: previous_tip.0,
-                candidate_count: 0,
-                eligible_count: 0,
+                candidate_count: result.candidate_count,
+                eligible_count: result.eligible_count,
                 max_rewind_commits,
                 selected_branch_id: result.selected_branch_id.clone(),
                 selected_fork_epoch: result.selected_fork_epoch,
@@ -381,6 +393,8 @@ fn unrecoverable_result(current_tip: u64) -> CanonicalizationResult {
         selected_tip: None,
         selected_fork_epoch: None,
         selected_branch_id: None,
+        candidate_count: 0,
+        eligible_count: 0,
         convergence_status: ConvergenceStatus::Blocked,
         accepted_commits: Vec::new(),
         accepted_proposals: Vec::new(),
