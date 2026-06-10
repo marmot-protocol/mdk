@@ -193,7 +193,7 @@ jobs:
         key: test-${{ matrix.features.name }}
 
     - name: Install cargo-nextest
-      uses: taiki-e/install-action@65851e10cd6c377f11a60e600abc07cb08643468 # v2.79.3
+      uses: taiki-e/install-action@fd2f5e3d644b484055ebf4268f474c565f148f25 # v2.81.9
       with:
         tool: cargo-nextest
 
@@ -219,7 +219,7 @@ jobs:
       uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
     - name: Install cargo-audit
-      uses: taiki-e/install-action@65851e10cd6c377f11a60e600abc07cb08643468 # v2.79.3
+      uses: taiki-e/install-action@fd2f5e3d644b484055ebf4268f474c565f148f25 # v2.81.9
       with:
         tool: cargo-audit
 
