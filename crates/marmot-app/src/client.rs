@@ -7,7 +7,8 @@ use cgka_traits::agent_text_stream::{
 use cgka_traits::app_components::{
     AGENT_TEXT_STREAM_QUIC_COMPONENT_ID, AppComponentData, BlobStoreEndpointV1,
     ENCRYPTED_MEDIA_FORMAT_V1, EncryptedMediaPolicyV1, GROUP_AVATAR_URL_COMPONENT_ID,
-    GROUP_ENCRYPTED_MEDIA_COMPONENT_ID, GROUP_ENCRYPTED_MEDIA_EXPORTER_CACHE_KEY,
+    GROUP_BLOSSOM_IMAGE_COMPONENT_ID, GROUP_ENCRYPTED_MEDIA_COMPONENT_ID,
+    GROUP_ENCRYPTED_MEDIA_EXPORTER_CACHE_KEY,
     GROUP_MESSAGE_RETENTION_COMPONENT_ID, NOSTR_ROUTING_COMPONENT_ID, encode_nostr_routing_v1,
 };
 use cgka_traits::app_event::{
@@ -25,20 +26,21 @@ use crate::groups::{
 };
 use crate::ids::{admin_pubkey_from_account_id_hex, admin_pubkey_from_member_id};
 use crate::media::{
-    DEFAULT_BLOSSOM_SERVER_URL, download_encrypted_media, media_imeta_tags_are_valid,
-    upload_encrypted_media,
+    DEFAULT_BLOSSOM_SERVER_URL, download_encrypted_media, fetch_group_image,
+    media_imeta_tags_are_valid, upload_encrypted_media, upload_group_image,
 };
 use crate::messages::{AppMessageIntent, build_inner_event, encode_inner_event, tag_value};
 use crate::notifications;
 use crate::{
     AccountState, AgentOperationEventRequest, AgentTextStreamFinishRequest,
     AppAgentTextStreamComponent, AppBlobEndpoint, AppError, AppGroupAdminPolicyComponent,
-    AppGroupAvatarUrlComponent, AppGroupEncryptedMediaComponent, AppGroupMemberRecord,
-    AppGroupMessageRetentionComponent, AppGroupMlsState, AppGroupNostrRoutingComponent,
-    AppGroupRecord, AppMessageProjection, AppMessageQuery, AppRuntime, AppTransportRouting,
-    GroupInviteDeclineResult, MarmotApp, MarmotRelayPlane, MarmotRelayPlaneAccountAdapter,
-    MediaAttachmentReference, MediaDownloadResult, MediaUploadRequest, MediaUploadResult,
-    SDK_DRAIN_WAIT, SDK_FIRST_SYNC_WAIT, SendSummary, SyncSummary, refresh_seen_lookup_if_needed,
+    AppGroupAvatarUrlComponent, AppGroupEncryptedMediaComponent, AppGroupImageComponent,
+    AppGroupImageInput, AppGroupMemberRecord, AppGroupMessageRetentionComponent, AppGroupMlsState,
+    AppGroupNostrRoutingComponent, AppGroupRecord, AppMessageProjection, AppMessageQuery,
+    AppRuntime, AppTransportRouting, GroupInviteDeclineResult, MarmotApp, MarmotRelayPlane,
+    MarmotRelayPlaneAccountAdapter, MediaAttachmentReference, MediaDownloadResult,
+    MediaUploadRequest, MediaUploadResult, SDK_DRAIN_WAIT, SDK_FIRST_SYNC_WAIT, SendSummary,
+    SyncSummary, refresh_seen_lookup_if_needed,
     remember_seen_event, unix_now_seconds,
 };
 pub struct AppClient {
@@ -996,6 +998,69 @@ impl AppClient {
         .await
     }
 
+    /// Encrypt + upload a group avatar to Blossom, then publish the
+    /// `marmot.group.blossom.image.v1` component via an MLS commit. Admin
+    /// authorization is enforced by the engine on send. Passing an empty
+    /// `plaintext` clears the image.
+    pub async fn update_group_image(
+        &mut self,
+        group_id: &GroupId,
+        plaintext: Vec<u8>,
+        media_type: &str,
+    ) -> Result<SendSummary, AppError> {
+        self.ensure_group(group_id)?;
+        self.sync_runtime_groups().await?;
+        let input = if plaintext.is_empty() {
+            AppGroupImageInput::default()
+        } else {
+            let upload = upload_group_image(&plaintext, media_type, None).await?;
+            AppGroupImageInput {
+                image_hash_hex: upload.image_hash_hex,
+                image_key_hex: upload.image_key_hex,
+                image_nonce_hex: upload.image_nonce_hex,
+                image_upload_key_hex: upload.image_upload_key_hex,
+                media_type: Some(upload.media_type),
+            }
+        };
+        let data = hex::decode(AppGroupImageComponent::new(input).data_hex)?;
+        let effects = self
+            .runtime
+            .send(SendIntent::UpdateAppComponents {
+                group_id: group_id.clone(),
+                updates: vec![AppComponentData {
+                    component_id: GROUP_BLOSSOM_IMAGE_COMPONENT_ID,
+                    data,
+                }],
+            })
+            .await?;
+        fail_if_publish_failed(&effects.failures)?;
+        self.remember_published_reports(&effects);
+        let summary = send_summary_from_effects(&effects);
+        self.refresh_group(group_id);
+        self.app.save_state(&self.state)?;
+        Ok(summary)
+    }
+
+    /// Fetch + decrypt the group's avatar. Errors when the group has no image set.
+    pub async fn download_group_image(&mut self, group_id: &GroupId) -> Result<Vec<u8>, AppError> {
+        self.ensure_group(group_id)?;
+        self.sync_runtime_groups().await?;
+        let input = self.image_for_group(group_id);
+        if !input.is_present() {
+            return Err(AppError::InvalidEncryptedMedia(
+                "group has no image set".into(),
+            ));
+        }
+        fetch_group_image(
+            &input.image_hash_hex,
+            &input.image_key_hex,
+            &input.image_nonce_hex,
+            input.media_type.as_deref().unwrap_or_default(),
+            None,
+        )
+        .await
+    }
+
     pub async fn start_agent_text_stream(
         &mut self,
         group_id: &GroupId,
@@ -1199,6 +1264,7 @@ impl AppClient {
             agent_text_stream: self.agent_text_stream_for_group(group_id),
             avatar_url: self.avatar_url_for_group(group_id),
             encrypted_media: self.encrypted_media_for_group(group_id),
+            image: self.image_for_group(group_id),
         };
         add_group(
             &mut self.state,
@@ -1344,6 +1410,7 @@ impl AppClient {
                         agent_text_stream: self.agent_text_stream_for_group(group_id),
                         avatar_url: self.avatar_url_for_group(group_id),
                         encrypted_media: self.encrypted_media_for_group(group_id),
+                        image: self.image_for_group(group_id),
                     })
                 })
                 .transpose()?;
@@ -1479,6 +1546,7 @@ impl AppClient {
             agent_text_stream: self.agent_text_stream_for_group(group_id),
             avatar_url: self.avatar_url_for_group(group_id),
             encrypted_media: self.encrypted_media_for_group(group_id),
+            image: self.image_for_group(group_id),
         };
         add_group(
             &mut self.state,
@@ -1500,6 +1568,7 @@ impl AppClient {
             agent_text_stream: self.agent_text_stream_for_group(group_id),
             avatar_url: self.avatar_url_for_group(group_id),
             encrypted_media: self.encrypted_media_for_group(group_id),
+            image: self.image_for_group(group_id),
         };
         add_group(
             &mut self.state,
@@ -1566,6 +1635,15 @@ impl AppClient {
             .flatten()
             .map(|bytes| AppGroupEncryptedMediaComponent::from_bytes(&bytes))
             .unwrap_or_else(AppGroupEncryptedMediaComponent::disabled)
+    }
+
+    fn image_for_group(&self, group_id: &GroupId) -> AppGroupImageInput {
+        self.runtime
+            .app_component(group_id, GROUP_BLOSSOM_IMAGE_COMPONENT_ID)
+            .ok()
+            .flatten()
+            .and_then(|bytes| AppGroupImageInput::from_component_bytes(&bytes))
+            .unwrap_or_default()
     }
 
     fn encrypted_media_policy_for_group(

@@ -13,8 +13,8 @@ use cgka_traits::app_components::{
     GROUP_MESSAGE_RETENTION_COMPONENT_ID, GROUP_PROFILE_COMPONENT, GROUP_PROFILE_COMPONENT_ID,
     GroupAvatarUrlV1, NOSTR_ROUTING_COMPONENT, NOSTR_ROUTING_COMPONENT_ID, NostrRoutingV1,
     decode_encrypted_media_policy_v1, decode_group_avatar_url_v1, decode_nostr_routing_v1,
-    encode_component_vectors, encode_encrypted_media_policy_v1, encode_group_avatar_url_v1,
-    encode_nostr_routing_v1, encode_quic_varint,
+    decode_quic_varint, encode_component_vectors, encode_encrypted_media_policy_v1,
+    encode_group_avatar_url_v1, encode_nostr_routing_v1, encode_quic_varint,
 };
 use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent as MarmotInnerEvent};
 use cgka_traits::engine::GroupEvent;
@@ -219,6 +219,7 @@ impl AppGroupRecord {
         agent_text_stream: AppAgentTextStreamComponent,
         avatar_url: AppGroupAvatarUrlComponent,
         encrypted_media: AppGroupEncryptedMediaComponent,
+        image: AppGroupImageInput,
     ) -> Self {
         let (profile_name, profile_description) = group
             .map(|group| (group.name.clone(), group.description.clone()))
@@ -228,7 +229,7 @@ impl AppGroupRecord {
             nostr_routing,
             profile_name,
             profile_description,
-            AppGroupImageInput::default(),
+            image,
             admin_policy,
             message_retention,
         );
@@ -247,6 +248,7 @@ impl AppGroupRecord {
         self.agent_text_stream = projection.agent_text_stream.clone();
         self.avatar_url = projection.avatar_url.clone();
         self.encrypted_media = projection.encrypted_media.clone();
+        self.image = AppGroupImageComponent::new(projection.image.clone());
         if let Some(group) = projection.group_metadata {
             self.profile =
                 AppGroupProfileComponent::new(group.name.clone(), group.description.clone());
@@ -290,7 +292,7 @@ impl AppGroupProfileComponent {
 }
 
 impl AppGroupImageComponent {
-    fn new(input: AppGroupImageInput) -> Self {
+    pub(crate) fn new(input: AppGroupImageInput) -> Self {
         let present = !input.image_hash_hex.is_empty()
             || !input.image_key_hex.is_empty()
             || !input.image_nonce_hex.is_empty()
@@ -615,6 +617,57 @@ pub(crate) struct AppGroupImageInput {
     pub(crate) media_type: Option<String>,
 }
 
+impl AppGroupImageInput {
+    /// Whether a usable image is present (matches the engine's all-or-nothing
+    /// validation: hash, key, nonce, and media type must all be set).
+    pub(crate) fn is_present(&self) -> bool {
+        !self.image_hash_hex.is_empty()
+            && !self.image_key_hex.is_empty()
+            && !self.image_nonce_hex.is_empty()
+            && self.media_type.is_some()
+    }
+
+    /// Decode the `marmot.group.blossom.image.v1` component wire format
+    /// (`encode_component_vectors([hash, key, nonce, upload_key, media_type])`).
+    /// Returns the default (absent) input when the component is empty.
+    pub(crate) fn from_component_bytes(bytes: &[u8]) -> Option<Self> {
+        let mut cursor = bytes;
+        let mut fields: Vec<Vec<u8>> = Vec::with_capacity(5);
+        for _ in 0..5 {
+            fields.push(read_component_vector(&mut cursor)?);
+        }
+        if !cursor.is_empty() {
+            return None;
+        }
+        let media_type = fields.pop().unwrap_or_default();
+        let media_type = if media_type.is_empty() {
+            None
+        } else {
+            Some(String::from_utf8(media_type).ok()?)
+        };
+        Some(Self {
+            image_hash_hex: hex::encode(&fields[0]),
+            image_key_hex: hex::encode(&fields[1]),
+            image_nonce_hex: hex::encode(&fields[2]),
+            image_upload_key_hex: hex::encode(&fields[3]),
+            media_type,
+        })
+    }
+}
+
+/// Read a single QUIC-varint-length-prefixed byte vector, advancing the cursor.
+fn read_component_vector(cursor: &mut &[u8]) -> Option<Vec<u8>> {
+    let (len, width) = decode_quic_varint(cursor).ok()?;
+    let len = len as usize;
+    let rest = cursor.get(width..)?;
+    if rest.len() < len {
+        return None;
+    }
+    let (head, tail) = rest.split_at(len);
+    *cursor = tail;
+    Some(head.to_vec())
+}
+
 pub(crate) struct EventGroupProjection<'a> {
     pub(crate) nostr_routing: AppGroupNostrRoutingComponent,
     pub(crate) group_metadata: Option<&'a Group>,
@@ -623,6 +676,7 @@ pub(crate) struct EventGroupProjection<'a> {
     pub(crate) agent_text_stream: AppAgentTextStreamComponent,
     pub(crate) avatar_url: AppGroupAvatarUrlComponent,
     pub(crate) encrypted_media: AppGroupEncryptedMediaComponent,
+    pub(crate) image: AppGroupImageInput,
 }
 
 #[derive(Clone, Debug)]
@@ -821,6 +875,7 @@ pub(crate) fn add_group(
         projection.agent_text_stream.clone(),
         projection.avatar_url.clone(),
         projection.encrypted_media.clone(),
+        projection.image.clone(),
     );
     group.apply_confirmation_state(confirmation);
     state.groups.push(group);

@@ -1668,10 +1668,21 @@ impl MarmotApp {
         // (no NIP-65 yet). The declared list (content) is `default_relays`, but
         // the relays we publish *through* must be reachable — the account's own
         // relays or the seed, never the (possibly not-yet-reachable) declared set.
-        let endpoints = self.outbox_endpoints(
-            &account_id_hex,
-            publish_endpoints_from_bootstrap(&bootstrap),
-        );
+        //
+        // We then UNION in the caller's explicitly-requested publish endpoints.
+        // Without this, a republish/set that *adds* a relay can never reach that
+        // new relay: `outbox_endpoints` returns the existing (narrower) NIP-65
+        // outbox and drops the requested set entirely, so the updated list only
+        // ever lands on the relays you were already on. Unioning means an
+        // explicit republish reaches both your old relays (so they update) and
+        // the newly-declared ones (so they learn about you for the first time).
+        let requested = publish_endpoints_from_bootstrap(&bootstrap);
+        let mut endpoints = self.outbox_endpoints(&account_id_hex, requested.clone());
+        for endpoint in requested {
+            if !endpoints.iter().any(|existing| existing.0 == endpoint.0) {
+                endpoints.push(endpoint);
+            }
+        }
         let relay_client = self.relay_client_for_endpoints(&keys, &endpoints);
         for list_kind in list_kinds {
             let publication = NostrAccountRelayListPublication {
@@ -1731,6 +1742,17 @@ impl MarmotApp {
         account_id_hex: &str,
         bootstrap_relays: Vec<TransportEndpoint>,
     ) -> Result<FetchedKeyPackage, AppError> {
+        // Normalize the identifier to canonical hex up front. The relay *queries*
+        // below re-parse internally, but the KeyPackage record filter compares
+        // `event.pubkey` (always hex) against this string verbatim — so an npub
+        // arg would resolve the relay list yet silently drop every KeyPackage
+        // record (hex != npub), surfacing a bogus `MissingKeyPackage` for an
+        // account that has one. Canonicalizing here makes the arg accept npub or
+        // hex consistently across query and filter.
+        let canonical = PublicKey::parse(account_id_hex)
+            .map_err(|_| AppError::InvalidPublicKey)?
+            .to_hex();
+        let account_id_hex = canonical.as_str();
         let has_explicit_bootstrap_relays = !bootstrap_relays.is_empty();
         let mut relay_lists = if has_explicit_bootstrap_relays {
             self.fetch_account_relay_list_status_for_account_id(account_id_hex, bootstrap_relays)

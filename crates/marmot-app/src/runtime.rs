@@ -710,6 +710,16 @@ enum AccountWorkerCommand {
         description: Option<String>,
         respond: oneshot::Sender<Result<SendSummary, AppError>>,
     },
+    UpdateGroupImage {
+        group_id: GroupId,
+        plaintext: Vec<u8>,
+        media_type: String,
+        respond: oneshot::Sender<Result<SendSummary, AppError>>,
+    },
+    DownloadGroupImage {
+        group_id: GroupId,
+        respond: oneshot::Sender<Result<Vec<u8>, AppError>>,
+    },
     UpdateMessageRetention {
         group_id: GroupId,
         disappearing_message_secs: u64,
@@ -2202,6 +2212,28 @@ impl MarmotAppRuntime {
         Ok(summary)
     }
 
+    pub async fn update_group_image(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        plaintext: Vec<u8>,
+        media_type: String,
+    ) -> Result<SendSummary, AppError> {
+        self.accounts
+            .update_group_image(account_ref, group_id, plaintext, media_type)
+            .await
+    }
+
+    pub async fn download_group_image(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+    ) -> Result<Vec<u8>, AppError> {
+        self.accounts
+            .download_group_image(account_ref, group_id)
+            .await
+    }
+
     pub async fn update_message_retention(
         &self,
         account_ref: &str,
@@ -3487,6 +3519,46 @@ impl AccountManager {
         Ok(result)
     }
 
+    pub async fn update_group_image(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        plaintext: Vec<u8>,
+        media_type: String,
+    ) -> Result<SendSummary, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::UpdateGroupImage {
+                group_id: group_id.clone(),
+                plaintext,
+                media_type,
+                respond,
+            })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        let summary = account_worker_response(response).await?;
+        self.catch_up_accounts().await?;
+        Ok(summary)
+    }
+
+    pub async fn download_group_image(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+    ) -> Result<Vec<u8>, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::DownloadGroupImage {
+                group_id: group_id.clone(),
+                respond,
+            })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
     pub async fn update_message_retention(
         &self,
         account_ref: &str,
@@ -4584,6 +4656,29 @@ async fn run_app_runtime_account_worker(
                                     &group_id,
                                 );
                             }
+                            let _ = respond.send(result);
+                        }
+                        Some(AccountWorkerCommand::UpdateGroupImage {
+                            group_id,
+                            plaintext,
+                            media_type,
+                            respond,
+                        }) => {
+                            let result = client
+                                .update_group_image(&group_id, plaintext, &media_type)
+                                .await;
+                            if result.is_ok() {
+                                publish_app_runtime_group_state_updated(
+                                    &events,
+                                    &account_id_hex,
+                                    &account_label,
+                                    &group_id,
+                                );
+                            }
+                            let _ = respond.send(result);
+                        }
+                        Some(AccountWorkerCommand::DownloadGroupImage { group_id, respond }) => {
+                            let result = client.download_group_image(&group_id).await;
                             let _ = respond.send(result);
                         }
                     Some(AccountWorkerCommand::SendMessage {
