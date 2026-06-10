@@ -1145,6 +1145,154 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(adapter._turn_preview_text, {})
 
+    async def test_interim_prefix_merges_into_continuation_final(self):
+        class FakeClient:
+            def __init__(self):
+                self.activities = []
+                self.final_sends = []
+                self.stream_finalizes = []
+                self.stream_cancels = []
+
+            async def stream_begin(self, account_id_hex, group_id_hex, *, stream_id_hex=None, quic_candidates=()):
+                return {
+                    "type": "stream_begun",
+                    "stream_id_hex": "55" * 32,
+                    "start_message_id_hex": "66" * 32,
+                    "quic_candidates": list(quic_candidates),
+                }
+
+            async def stream_append(self, stream_id_hex, append_text):
+                return {"type": "ack"}
+
+            async def stream_finalize(self, stream_id_hex, final_text, transcript_hash_hex, chunk_count):
+                self.stream_finalizes.append((stream_id_hex, final_text))
+                return {
+                    "type": "stream_finalized",
+                    "stream_id_hex": stream_id_hex,
+                    "message_ids_hex": ["77" * 32],
+                }
+
+            async def stream_cancel(self, stream_id_hex, reason=None):
+                self.stream_cancels.append((stream_id_hex, reason))
+                return {"type": "ack"}
+
+            async def send_agent_activity(
+                self,
+                account_id_hex,
+                group_id_hex,
+                *,
+                status,
+                text,
+                reply_to_message_id_hex=None,
+                extra=None,
+            ):
+                self.activities.append((status, text))
+                return {"type": "app_event_sent", "message_ids_hex": ["44" * 32]}
+
+            async def send_final(self, account_id_hex, group_id_hex, text, reply_to_message_id_hex=None):
+                self.final_sends.append((account_id_hex, group_id_hex, text, reply_to_message_id_hex))
+                return {"type": "final_sent", "message_ids_hex": ["88" * 32]}
+
+        fake_client = FakeClient()
+        adapter = self.adapter_module.MarmotPlatformAdapter(
+            self.config_cls(
+                extra={
+                    "account_id_hex": "11" * 32,
+                    "quic_candidates": ["quic://127.0.0.1:4433"],
+                }
+            ),
+            client=fake_client,
+        )
+
+        # Stream opens for the turn before any visible text lands.
+        preview = await adapter.send("22" * 32, "\u2589")
+        self.assertTrue(preview.success)
+
+        # Pre-tool commentary goes out as kind-1201 activity.
+        interim = await adapter.send(
+            "22" * 32,
+            "I'll check the copper price for you.",
+            reply_to="33" * 32,
+        )
+        self.assertTrue(interim.success)
+        self.assertEqual(len(fake_client.activities), 1)
+
+        # The post-tool answer arrives as a continuation fragment.
+        final = await adapter.send(
+            "22" * 32,
+            ",\n\n## Copper is trading at $4.20 per pound.",
+        )
+
+        self.assertTrue(final.success)
+        self.assertEqual(fake_client.stream_finalizes, [])
+        self.assertEqual(
+            fake_client.stream_cancels,
+            [("55" * 32, "final text extends earlier turn output")],
+        )
+        self.assertEqual(len(fake_client.final_sends), 1)
+        self.assertEqual(
+            fake_client.final_sends[0][2],
+            "I'll check the copper price for you.,\n\n## Copper is trading at $4.20 per pound.",
+        )
+        self.assertEqual(adapter._turn_preview_text, {})
+
+    async def test_overlap_splice_merges_resent_fragment(self):
+        class FakeClient:
+            def __init__(self):
+                self.final_sends = []
+
+            async def send_final(self, account_id_hex, group_id_hex, text, reply_to_message_id_hex=None):
+                self.final_sends.append((account_id_hex, group_id_hex, text, reply_to_message_id_hex))
+                return {"type": "final_sent", "message_ids_hex": ["88" * 32]}
+
+        fake_client = FakeClient()
+        adapter = self.adapter_module.MarmotPlatformAdapter(
+            self.config_cls(extra={"account_id_hex": "11" * 32}),
+            client=fake_client,
+        )
+        adapter._turn_preview_text["22" * 32] = "The copper price is currently"
+
+        result = await adapter.send("22" * 32, "is currently $4.20 per pound, near record highs.")
+
+        self.assertTrue(result.success)
+        self.assertEqual(
+            fake_client.final_sends[0][2],
+            "The copper price is currently $4.20 per pound, near record highs.",
+        )
+
+    async def test_inbound_message_resets_turn_state(self):
+        events = [
+            {
+                "type": "inbound_message",
+                "account_id_hex": "11" * 32,
+                "group_id_hex": "22" * 32,
+                "message_id_hex": "33" * 32,
+                "sender_account_id_hex": "44" * 32,
+                "text": "What is the price of copper?",
+            }
+        ]
+
+        class FakeClient:
+            async def inbound_events(self, account_id_hex=None, group_id_hex=None):
+                for event in events:
+                    yield event
+
+        adapter = self.adapter_module.MarmotPlatformAdapter(
+            self.config_cls(
+                extra={
+                    "account_id_hex": "11" * 32,
+                    "profile_name_onboarding": False,
+                }
+            ),
+            client=FakeClient(),
+        )
+        adapter._turn_preview_text["22" * 32] = "stale text from the previous turn"
+
+        await adapter._consume_inbound_once()
+
+        self.assertEqual(adapter._turn_preview_text, {})
+        self.assertEqual(len(adapter.events), 1)
+
     async def test_interim_plain_send_maps_to_agent_activity(self):
         class FakeClient:
             def __init__(self):

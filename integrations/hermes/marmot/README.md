@@ -241,9 +241,13 @@ does not appear in process environments by default.
   published as `kind: 1201` agent activity instead of durable `kind: 9` chat.
 - When a final answer arrives as a continuation fragment (for example
   `, here's the answer` or `:\n\n## Heading`), the adapter merges it with the
-  streamed prefix before finalizing or falling back to `send_final`.
-- Preview text accumulated across superseded streams in one assistant turn is
-  retained so a later plain `send_final` can still reconstruct the full answer.
+  turn's earlier output — interim commentary, superseded previews, and the live
+  stream — before finalizing or falling back to `send_final`. Overlapping
+  re-sent text is spliced instead of duplicated. If the merged final needs
+  prefix text the stream transcript does not contain, the stream is cancelled
+  and the full text goes out as one plain `send_final`.
+- Turn reconstruction state is dropped when a new inbound user message starts
+  the next turn.
 - Short `reply_to` acknowledgements sent without an active preview stream are
   published as `kind: 1201` agent activity instead of durable `kind: 9` chat.
 - Non-append-only finals cancel the live preview and fall back to one plain

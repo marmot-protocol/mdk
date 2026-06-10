@@ -82,6 +82,9 @@ class NonAppendOnlyUpdate(RuntimeError):
 # as interim commentary (kind 1201) rather than durable chat (kind 9).
 INTERIM_ASSISTANT_MESSAGE_MAX_CHARS = 200
 CONTINUATION_FRAGMENT_LEADERS = ",.;:)]}\n"
+# Overlap splicing bounds for reconstructing one answer from sequential segments.
+MIN_TURN_TEXT_OVERLAP_CHARS = 8
+MAX_TURN_TEXT_OVERLAP_SCAN_CHARS = 4096
 
 
 class AppendOnlyTextState:
@@ -678,7 +681,6 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                 await self._cancel_other_chat_streams(chat_id, reason="superseded by newer preview")
                 stream = await self._begin_live_stream(chat_id)
                 await stream.append_replacement(visible_content)
-                self._record_turn_preview_text(chat_id, stream.text.text)
                 message_id = _stream_message_id(stream.stream_id_hex)
                 self._active_streams[message_id] = stream
                 self._last_chat_stream[chat_id] = stream
@@ -690,15 +692,35 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         stream = self._last_chat_stream.get(chat_id)
         if stream is not None and not stream.finalized:
             if _is_interim_assistant_message(stream, visible_content):
-                return await self._send_agent_activity_result(
+                result = await self._send_agent_activity_result(
                     chat_id,
                     visible_content,
                     reply_to_message_id_hex=_optional_hex(reply_to),
                 )
+                if result.success:
+                    self._record_turn_preview_text(chat_id, visible_content)
+                return result
             if _is_likely_stream_final(stream, visible_content) or _is_continuation_fragment(
                 visible_content
             ):
                 message_id = _stream_message_id(stream.stream_id_hex)
+                effective = self._resolved_final_text(chat_id, visible_content)
+                stream_effective = _merge_preview_final_text(stream.text.text, visible_content)
+                if effective != stream_effective:
+                    # The durable final needs prefix text (interim commentary or a
+                    # superseded preview) that the live stream transcript does not
+                    # contain, so the stream cannot finalize to the full answer.
+                    await self._cancel_stream(
+                        chat_id,
+                        message_id,
+                        stream,
+                        "final text extends earlier turn output",
+                    )
+                    return await self._send_final_direct(
+                        chat_id,
+                        visible_content,
+                        reply_to_message_id_hex=_optional_hex(reply_to),
+                    )
                 try:
                     result = await self._finalize_active_stream(
                         chat_id,
@@ -709,7 +731,6 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                     self._turn_preview_text.pop(chat_id, None)
                     return result
                 except NonAppendOnlyUpdate:
-                    effective = _merge_preview_final_text(stream.text.text, visible_content)
                     await self._cancel_stream(
                         chat_id,
                         message_id,
@@ -718,13 +739,12 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                     )
                     return await self._send_final_direct(
                         chat_id,
-                        effective,
+                        visible_content,
                         reply_to_message_id_hex=_optional_hex(reply_to),
                     )
                 except Exception as exc:
                     logger.debug("Marmot live-preview finalize failed: %s", exc)
                     return SendResult(success=False, error=str(exc), retryable=is_retryable(exc))
-            effective = _merge_preview_final_text(stream.text.text, visible_content)
             await self._cancel_stream(
                 chat_id,
                 _stream_message_id(stream.stream_id_hex),
@@ -733,18 +753,21 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             )
             return await self._send_final_direct(
                 chat_id,
-                effective,
+                visible_content,
                 reply_to_message_id_hex=_optional_hex(reply_to),
             )
 
         if _is_standalone_interim_reply(visible_content, reply_to) and self._agent_turn_in_progress(
             chat_id
         ):
-            return await self._send_agent_activity_result(
+            result = await self._send_agent_activity_result(
                 chat_id,
                 visible_content,
                 reply_to_message_id_hex=_optional_hex(reply_to),
             )
+            if result.success:
+                self._record_turn_preview_text(chat_id, visible_content)
+            return result
 
         return await self._send_final_direct(
             chat_id,
@@ -781,10 +804,19 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         visible_content = self._strip_streaming_cursor(content)
         try:
             await stream.append_replacement(visible_content)
-            self._record_turn_preview_text(chat_id, stream.text.text)
             if not finalize:
                 return SendResult(success=True, message_id=message_id)
 
+            effective = self._resolved_final_text(chat_id, visible_content)
+            stream_effective = _merge_preview_final_text(stream.text.text, visible_content)
+            if effective != stream_effective:
+                await self._cancel_stream(
+                    chat_id,
+                    message_id,
+                    stream,
+                    "final text extends earlier turn output",
+                )
+                return await self._send_final_direct(chat_id, visible_content)
             result = await self._finalize_active_stream(
                 chat_id,
                 stream,
@@ -796,8 +828,7 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         except NonAppendOnlyUpdate as exc:
             await self._cancel_stream(chat_id, message_id, stream, str(exc))
             if finalize:
-                effective = _merge_preview_final_text(stream.text.text, visible_content)
-                return await self._send_final_direct(chat_id, effective)
+                return await self._send_final_direct(chat_id, visible_content)
             return SendResult(success=False, error=str(exc), retryable=False)
         except Exception as exc:
             logger.debug("Marmot live-preview edit failed: %s", exc)
@@ -888,7 +919,6 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                 self._draft_streams[key] = stream
                 self._last_chat_stream[chat_id] = stream
             await stream.append_replacement(visible_content)
-            self._record_turn_preview_text(chat_id, stream.text.text)
             return SendResult(success=True)
         except NonAppendOnlyUpdate as exc:
             stream = self._draft_streams.pop(key, None)
@@ -978,18 +1008,22 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         text = str(text or "")
         if not text:
             return
-        current = self._turn_preview_text.get(chat_id, "")
-        if len(text) >= len(current):
-            self._turn_preview_text[chat_id] = text
+        merged = _merge_turn_text(self._turn_preview_text.get(chat_id, ""), text)
+        if merged:
+            self._turn_preview_text[chat_id] = merged
+
+    def _turn_text_with_stream(self, chat_id: str) -> str:
+        """Best reconstruction of the turn's answer so far: recorded prefix plus live stream."""
+        chat_id = _normalize_hex(chat_id, "chat_id")
+        turn = self._turn_preview_text.get(chat_id, "")
+        stream = self._last_chat_stream.get(chat_id)
+        if stream is not None and not stream.finalized:
+            turn = _merge_turn_text(turn, stream.text.text)
+        return turn
 
     def _resolved_final_text(self, chat_id: str, content: str) -> str:
-        chat_id = _normalize_hex(chat_id, "chat_id")
         content = str(content or "")
-        stream = self._last_chat_stream.get(chat_id)
-        accumulated = stream.text.text if stream is not None and not stream.finalized else ""
-        if not accumulated:
-            accumulated = self._turn_preview_text.get(chat_id, "")
-        return _merge_preview_final_text(accumulated, content)
+        return _merge_preview_final_text(self._turn_text_with_stream(chat_id), content)
 
     async def _send_final_direct(
         self,
@@ -1281,6 +1315,12 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         group_id_hex = event["group_id_hex"]
         sender_account_id_hex = event["sender_account_id_hex"]
         message_id_hex = event["message_id_hex"]
+        # A new inbound user message starts a new assistant turn; drop any
+        # reconstruction state left over from the previous turn.
+        try:
+            self._turn_preview_text.pop(_normalize_hex(group_id_hex, "group_id_hex"), None)
+        except AgentControlError:
+            pass
         if await self._maybe_handle_profile_name_onboarding(event):
             return
 
@@ -1661,6 +1701,40 @@ def _config_bool(value: Any, *, default: bool) -> bool:
     return text not in {"0", "false", "no", "off", "disabled"}
 
 
+def _splice_with_overlap(prefix_text: str, fragment: str) -> Optional[str]:
+    """Splice `fragment` onto `prefix_text` at the largest suffix/prefix overlap."""
+    prefix_text = str(prefix_text or "")
+    fragment = str(fragment or "")
+    if not prefix_text or not fragment:
+        return None
+    scan_start = max(0, len(prefix_text) - MAX_TURN_TEXT_OVERLAP_SCAN_CHARS)
+    for start in range(scan_start, len(prefix_text) - MIN_TURN_TEXT_OVERLAP_CHARS + 1):
+        suffix = prefix_text[start:]
+        if fragment.startswith(suffix):
+            return prefix_text[:start] + fragment
+    return None
+
+
+def _merge_turn_text(current: str, text: str) -> str:
+    """Fold newly observed assistant text into the running turn reconstruction."""
+    current = str(current or "")
+    text = str(text or "")
+    if not text:
+        return current
+    if not current:
+        return text
+    if text.startswith(current):
+        return text
+    if current.startswith(text):
+        return current
+    spliced = _splice_with_overlap(current, text)
+    if spliced is not None:
+        return spliced
+    if _is_continuation_fragment(text):
+        return current + text
+    return text
+
+
 def _merge_preview_final_text(accumulated: str, final_text: str) -> str:
     """Merge a streamed prefix with a continuation-style final fragment when needed."""
     accumulated = str(accumulated or "")
@@ -1669,9 +1743,10 @@ def _merge_preview_final_text(accumulated: str, final_text: str) -> str:
         return final_text
     if final_text.startswith(accumulated):
         return final_text
-    if final_text and final_text[0] in CONTINUATION_FRAGMENT_LEADERS:
-        return accumulated + final_text
-    if final_text.startswith("\n\n#"):
+    spliced = _splice_with_overlap(accumulated, final_text)
+    if spliced is not None:
+        return spliced
+    if _is_continuation_fragment(final_text):
         return accumulated + final_text
     return final_text
 
