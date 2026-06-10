@@ -232,10 +232,22 @@ does not appear in process environments by default.
 
 - Inbound Marmot messages become Hermes `MessageEvent`s with `chat_id` set to
   the Marmot group id and `user_id` set to the sender account id.
-- Normal Hermes sends call `send_final` and produce durable Marmot messages.
-- Hermes progressive edits are represented as live Marmot preview streams only
-  when the text is append-only. Replacement edits cancel the preview and leave
-  the durable final send as the fallback.
+- Hermes progressive edits open at most one live preview per chat turn. A newer
+  preview cancels the previous stream start for that chat.
+- Successful stream finalization publishes one tagged stream-final `kind: 9`
+  through `stream_finalize`. The adapter does not also send a duplicate plain
+  `send_final` for the same text.
+- Short interim assistant commentary sent while a preview is still open is
+  published as `kind: 1201` agent activity instead of durable `kind: 9` chat.
+- When a final answer arrives as a continuation fragment (for example
+  `, here's the answer` or `:\n\n## Heading`), the adapter merges it with the
+  streamed prefix before finalizing or falling back to `send_final`.
+- Preview text accumulated across superseded streams in one assistant turn is
+  retained so a later plain `send_final` can still reconstruct the full answer.
+- Short `reply_to` acknowledgements sent without an active preview stream are
+  published as `kind: 1201` agent activity instead of durable `kind: 9` chat.
+- Non-append-only finals cancel the live preview and fall back to one plain
+  `send_final` with the full final text.
 - Status records are included in the stream transcript hash and chunk count.
 
 Run the shim tests with:
