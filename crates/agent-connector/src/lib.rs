@@ -16,7 +16,7 @@ use std::net::SocketAddr;
 use std::os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -32,9 +32,9 @@ use marmot_app::{
     MarmotApp, MarmotAppEvent, MarmotAppRuntime, UserProfileMetadata,
 };
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncWrite, BufReader};
+use tokio::io::{AsyncBufRead, AsyncWrite, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{Mutex as AsyncMutex, broadcast, mpsc, oneshot};
 use transport_quic_broker::{BrokerServerTrust, OpenBrokerTextPublisher};
 
 const AGENT_SOCKET_DIR_MODE: u32 = 0o700;
@@ -95,6 +95,7 @@ pub struct AgentConnector {
     streams: StreamSessionStore,
     app: MarmotApp,
     runtime: MarmotAppRuntime,
+    inbound_catch_up: InboundCatchUpDriver,
     relays: Vec<String>,
     connection_errors: Arc<AtomicU64>,
 }
@@ -187,6 +188,7 @@ impl AgentConnector {
             account_home.clone(),
         );
         let runtime = MarmotAppRuntime::new(app.clone());
+        let inbound_catch_up = InboundCatchUpDriver::new(runtime.clone());
         let allowlists = AllowlistStore::new(&config.home);
         let (debug_events, _) = broadcast::channel(1024);
         Ok(Self {
@@ -200,6 +202,7 @@ impl AgentConnector {
             streams: StreamSessionStore::default(),
             app,
             runtime,
+            inbound_catch_up,
             relays,
             connection_errors: Arc::new(AtomicU64::new(0)),
         })
@@ -289,7 +292,13 @@ impl AgentConnector {
         } = request.payload
         {
             return self
-                .stream_inbound_events(request.id, account_id_hex, group_id_hex, &mut write_half)
+                .stream_inbound_events(
+                    request.id,
+                    account_id_hex,
+                    group_id_hex,
+                    &mut reader,
+                    &mut write_half,
+                )
                 .await;
         }
         let response = match self.handle_request(request.payload).await {
@@ -1066,19 +1075,22 @@ impl AgentConnector {
         Ok(AgentControlResponse::Ack)
     }
 
-    async fn stream_inbound_events<W>(
+    async fn stream_inbound_events<R, W>(
         &self,
         request_id: Option<String>,
         account_id_hex: Option<String>,
         group_id_hex: Option<String>,
+        reader: &mut R,
         writer: &mut W,
     ) -> Result<(), ConnectorError>
     where
+        R: AsyncBufRead + Unpin,
         W: AsyncWrite + Unpin,
     {
         let mut runtime_events = self.runtime.subscribe();
         let mut debug_events = self.debug_events.subscribe();
-        if let Err(err) = self.runtime.catch_up_accounts().await {
+        let (mut catch_up_events, _catch_up_subscription) = self.inbound_catch_up.subscribe();
+        if let Err(err) = self.inbound_catch_up.request().await {
             let err = ConnectorError::from(err);
             let response = AgentControlEnvelope::new(
                 request_id,
@@ -1089,22 +1101,34 @@ impl AgentConnector {
         }
         let response = AgentControlEnvelope::new(request_id.clone(), AgentControlResponse::Ack);
         write_frame(writer, &response).await?;
-        let mut catch_up_interval = tokio::time::interval_at(
-            tokio::time::Instant::now() + INBOUND_CATCH_UP_INTERVAL,
-            INBOUND_CATCH_UP_INTERVAL,
-        );
-        catch_up_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             let event = tokio::select! {
-                _ = catch_up_interval.tick() => {
-                    if let Err(err) = self.runtime.catch_up_accounts().await {
-                        let err = ConnectorError::from(err);
-                        let response = AgentControlEnvelope::new(
-                            request_id.clone(),
-                            self.error_response("stream_inbound_events", &err),
-                        );
-                        write_frame(writer, &response).await?;
-                        return Ok(());
+                // SubscribeInbound is read-only after the initial request: clients are only
+                // expected to close the stream. read_envelope() uses read_until(), which is
+                // not cancellation-safe for partial frames inside select!; switch this to a
+                // cancellation-safe framed read before adding subscriber-side messages here.
+                read = read_envelope(reader) => {
+                    let read: Result<Option<AgentControlEnvelope<AgentControlRequest>>, AgentControlError> = read;
+                    match read {
+                        Ok(None) => return Ok(()),
+                        Ok(Some(envelope)) => {
+                            let request_type = agent_control_request_type(&envelope.payload);
+                            tracing::warn!(
+                                target: "agent_connector",
+                                method = "stream_inbound_events",
+                                request_type,
+                                "additional request received after SubscribeInbound"
+                            );
+                            continue;
+                        }
+                        Err(err) => return Err(err.into()),
+                    }
+                }
+                catch_up = catch_up_events.recv() => {
+                    match catch_up {
+                        Ok(InboundCatchUpEvent::Completed)
+                        | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(broadcast::error::RecvError::Closed) => return Ok(()),
                     }
                     continue;
                 }
@@ -1332,6 +1356,106 @@ impl AgentConnector {
     }
 }
 
+#[derive(Clone, Copy)]
+enum InboundCatchUpEvent {
+    Completed,
+}
+
+#[derive(Clone)]
+struct InboundCatchUpDriver {
+    runtime: MarmotAppRuntime,
+    lock: Arc<AsyncMutex<()>>,
+    events: broadcast::Sender<InboundCatchUpEvent>,
+    started: Arc<AtomicBool>,
+    active: Arc<AtomicU64>,
+}
+
+impl InboundCatchUpDriver {
+    fn new(runtime: MarmotAppRuntime) -> Self {
+        let (events, _) = broadcast::channel(16);
+        Self {
+            runtime,
+            lock: Arc::new(AsyncMutex::new(())),
+            events,
+            started: Arc::new(AtomicBool::new(false)),
+            active: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    fn spawn(&self) {
+        if self.started.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let driver = self.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval_at(
+                tokio::time::Instant::now() + INBOUND_CATCH_UP_INTERVAL,
+                INBOUND_CATCH_UP_INTERVAL,
+            );
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                if driver.active.load(Ordering::Acquire) == 0 {
+                    driver.started.store(false, Ordering::Release);
+                    if driver.active.load(Ordering::Acquire) == 0 {
+                        break;
+                    }
+                    if driver
+                        .started
+                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                let _ = driver.request().await;
+            }
+        });
+    }
+
+    fn subscribe(
+        &self,
+    ) -> (
+        broadcast::Receiver<InboundCatchUpEvent>,
+        InboundCatchUpSubscription,
+    ) {
+        self.active.fetch_add(1, Ordering::AcqRel);
+        self.spawn();
+        (
+            self.events.subscribe(),
+            InboundCatchUpSubscription {
+                active: self.active.clone(),
+            },
+        )
+    }
+
+    async fn request(&self) -> Result<(), AppError> {
+        let _guard = self.lock.lock().await;
+        let result = self.runtime.catch_up_accounts().await;
+        if result.is_ok() {
+            let _ = self.events.send(InboundCatchUpEvent::Completed);
+        } else {
+            tracing::warn!(
+                target: "agent_connector",
+                method = "inbound_catch_up_request",
+                error_code = "catch_up_failed",
+                "inbound catch-up request failed"
+            );
+        }
+        result
+    }
+}
+
+struct InboundCatchUpSubscription {
+    active: Arc<AtomicU64>,
+}
+
+impl Drop for InboundCatchUpSubscription {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 pub async fn serve_socket(config: AgentConnectorConfig) -> Result<(), ConnectorError> {
     validate_control_plane_config(&config)?;
     let listener = bind_connector_socket_with_mode(
@@ -1342,7 +1466,23 @@ pub async fn serve_socket(config: AgentConnectorConfig) -> Result<(), ConnectorE
     let connector = AgentConnector::open(config)?;
     connector.start().await?;
     loop {
-        let (stream, _peer_addr) = listener.accept().await?;
+        let (stream, _peer_addr) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            Err(err) => {
+                let connection_error =
+                    connector.connection_errors.fetch_add(1, Ordering::Relaxed) + 1;
+                tracing::warn!(
+                    target: "agent_connector",
+                    method = "serve_socket",
+                    connection_error,
+                    error_code = "accept_error",
+                    error_kind = ?err.kind(),
+                    "accept failed"
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+        };
         let connector = connector.clone();
         tokio::spawn(async move {
             if let Err(err) = connector.handle_connection(stream).await {
@@ -1455,6 +1595,31 @@ fn unsupported_request_message(request: &AgentControlRequest) -> &'static str {
             "subscribe_inbound must be sent as the first request on a streaming connection"
         }
         _ => "request is not implemented by this connector slice",
+    }
+}
+
+fn agent_control_request_type(request: &AgentControlRequest) -> &'static str {
+    match request {
+        AgentControlRequest::SubscribeInbound { .. } => "subscribe_inbound",
+        AgentControlRequest::SendFinal { .. } => "send_final",
+        AgentControlRequest::StreamBegin { .. } => "stream_begin",
+        AgentControlRequest::StreamAppend { .. } => "stream_append",
+        AgentControlRequest::StreamStatus { .. } => "stream_status",
+        AgentControlRequest::StreamProgress { .. } => "stream_progress",
+        AgentControlRequest::StreamFinalize { .. } => "stream_finalize",
+        AgentControlRequest::StreamCancel { .. } => "stream_cancel",
+        AgentControlRequest::AccountList => "account_list",
+        AgentControlRequest::AccountCreate { .. } => "account_create",
+        AgentControlRequest::AccountPublishKeyPackage { .. } => "account_publish_key_package",
+        AgentControlRequest::AccountPublishProfile { .. } => "account_publish_profile",
+        AgentControlRequest::SendAgentActivity { .. } => "send_agent_activity",
+        AgentControlRequest::SendAgentOperationEvent { .. } => "send_agent_operation_event",
+        AgentControlRequest::SendGroupSystemEvent { .. } => "send_group_system_event",
+        AgentControlRequest::AllowlistList { .. } => "allowlist_list",
+        AgentControlRequest::AllowlistAdd { .. } => "allowlist_add",
+        AgentControlRequest::AllowlistRemove { .. } => "allowlist_remove",
+        AgentControlRequest::DebugInjectInbound { .. } => "debug_inject_inbound",
+        AgentControlRequest::DebugRecordedFinals => "debug_recorded_finals",
     }
 }
 
@@ -2009,13 +2174,14 @@ mod tests {
     use std::collections::HashSet;
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
+    use std::sync::atomic::Ordering;
     use tokio::io::BufReader;
     use tokio::net::UnixStream;
     use tokio::time::{Duration, sleep, timeout};
 
     use crate::{
         AgentConnector, AgentConnectorConfig, AllowlistRecord, AllowlistStore,
-        bind_connector_socket, bind_connector_socket_with_mode, serve_socket,
+        InboundCatchUpDriver, bind_connector_socket, bind_connector_socket_with_mode, serve_socket,
     };
 
     const CONTROL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(120);
@@ -2033,6 +2199,44 @@ mod tests {
         config.allow_any = allow_any;
         config.debug_controls = debug_controls;
         config
+    }
+
+    #[tokio::test]
+    async fn inbound_catch_up_driver_tracks_active_subscriptions() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = MarmotAppRuntime::new(MarmotApp::with_relays(dir.path(), Vec::new()));
+        let driver = InboundCatchUpDriver::new(runtime.clone());
+
+        let (_first_events, first_subscription) = driver.subscribe();
+        assert_eq!(driver.active.load(Ordering::Acquire), 1);
+        assert!(driver.started.load(Ordering::Acquire));
+
+        let (_second_events, second_subscription) = driver.subscribe();
+        assert_eq!(driver.active.load(Ordering::Acquire), 2);
+
+        drop(first_subscription);
+        assert_eq!(driver.active.load(Ordering::Acquire), 1);
+
+        drop(second_subscription);
+        assert_eq!(driver.active.load(Ordering::Acquire), 0);
+
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn inbound_catch_up_driver_failure_does_not_close_subscribers() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = MarmotAppRuntime::new(MarmotApp::with_relays(dir.path(), Vec::new()));
+        runtime.shutdown().await;
+        let driver = InboundCatchUpDriver::new(runtime);
+        let (mut events, _subscription) = driver.subscribe();
+
+        assert!(driver.request().await.is_err());
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+        assert_eq!(driver.active.load(Ordering::Acquire), 1);
     }
 
     #[tokio::test]
@@ -2399,6 +2603,54 @@ mod tests {
 
         server.abort();
         let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn connector_socket_subscribe_terminates_when_client_disconnects() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("dev").join("dm-agent.sock");
+        let connector = AgentConnector::open(test_config(
+            dir.path(),
+            socket.clone(),
+            Vec::new(),
+            false,
+            false,
+        ))
+        .unwrap();
+        let listener = bind_connector_socket(&socket).unwrap();
+        let server = tokio::spawn(async move { connector.serve_once(&listener).await });
+
+        let subscriber = UnixStream::connect(&socket).await.unwrap();
+        let (subscriber_read, mut subscriber_write) = tokio::io::split(subscriber);
+        let mut subscriber_read = BufReader::new(subscriber_read);
+        let subscribe = AgentControlEnvelope::request(
+            Some("req-disconnect-subscribe".to_owned()),
+            AgentControlRequest::SubscribeInbound {
+                account_id_hex: None,
+                group_id_hex: None,
+            },
+        );
+        write_frame(&mut subscriber_write, &subscribe)
+            .await
+            .unwrap();
+        let ack: AgentControlEnvelope<AgentControlResponse> = timeout(
+            CONTROL_RESPONSE_TIMEOUT,
+            read_envelope(&mut subscriber_read),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        assert_eq!(ack.payload, AgentControlResponse::Ack);
+
+        drop(subscriber_write);
+        drop(subscriber_read);
+
+        timeout(Duration::from_secs(1), server)
+            .await
+            .expect("subscribe connection should terminate promptly after client disconnect")
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]
