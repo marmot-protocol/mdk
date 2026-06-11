@@ -218,6 +218,95 @@ fn apply_operational_pragmas(
     Ok(())
 }
 
+/// SQLCipher hardening for connections opened *outside* the account-storage
+/// aggregate (the app's directory cache, legacy account-projection import, and
+/// key-rotation paths). It mirrors the hardening [`SqliteAccountStorage`]
+/// applies so every SQLCipher database the workspace opens pins
+/// `cipher_compatibility`, enables `cipher_memory_security` *before* keying,
+/// and optionally scrubs deleted rows and keeps temp state in memory.
+///
+/// The cipher fields default to the same values as [`SqliteStorageOptions`] so
+/// the two hardening paths cannot silently drift apart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SqlCipherHardening {
+    /// Pin `cipher_compatibility` so a future SQLCipher default-compat bump
+    /// cannot silently change the on-disk format these databases require.
+    pub cipher_compatibility: u8,
+    /// Enable `cipher_memory_security` so key/page material is wiped from the
+    /// SQLCipher heap.
+    pub cipher_memory_security: bool,
+    /// Scrub deleted rows on this connection (`secure_delete`).
+    pub secure_delete: bool,
+    /// Keep temporary tables/indexes in memory (`temp_store = MEMORY`).
+    pub temp_store_memory: bool,
+}
+
+impl SqlCipherHardening {
+    /// Cipher hardening only: pin `cipher_compatibility` and enable
+    /// `cipher_memory_security`, without row scrubbing or temp-store changes.
+    /// Suitable for short-lived migration/rekey opens.
+    pub fn cipher_only() -> Self {
+        let defaults = SqliteStorageOptions::default();
+        Self {
+            cipher_compatibility: defaults.cipher_compatibility,
+            cipher_memory_security: defaults.cipher_memory_security,
+            secure_delete: false,
+            temp_store_memory: false,
+        }
+    }
+
+    /// Full hardening for a long-lived encrypted cache: cipher hardening plus
+    /// `secure_delete` and `temp_store = MEMORY`.
+    pub fn live_cache() -> Self {
+        Self {
+            secure_delete: true,
+            temp_store_memory: true,
+            ..Self::cipher_only()
+        }
+    }
+}
+
+impl Default for SqlCipherHardening {
+    fn default() -> Self {
+        Self::cipher_only()
+    }
+}
+
+/// Apply SQLCipher hardening to `connection` and key it, in the order the
+/// PRAGMAs require to take effect: `cipher_compatibility` and
+/// `cipher_memory_security` are set **before** `PRAGMA key`, then the privacy
+/// PRAGMAs (`secure_delete`, `temp_store`) are applied after keying.
+///
+/// This is the shared entry point for SQLCipher databases opened outside
+/// [`SqliteAccountStorage`]. The cipher-pragma ordering invariant is exercised
+/// by `public_hardened_open_pins_cipher_pragmas_before_keying`.
+pub fn open_hardened_sqlcipher(
+    connection: &rusqlite::Connection,
+    key: &SqlCipherKey,
+    hardening: SqlCipherHardening,
+) -> StorageResult<()> {
+    // Reuse the account-storage cipher-pragma path so the "cipher pragmas
+    // before keying" ordering lives in exactly one place.
+    let cipher_options = SqliteStorageOptions {
+        cipher_compatibility: hardening.cipher_compatibility,
+        cipher_memory_security: hardening.cipher_memory_security,
+        ..SqliteStorageOptions::default()
+    };
+    apply_cipher_pragmas(connection, &cipher_options)?;
+    apply_sqlcipher_key(connection, key)?;
+    if hardening.secure_delete {
+        connection
+            .pragma_update(None, "secure_delete", true)
+            .storage()?;
+    }
+    if hardening.temp_store_memory {
+        connection
+            .pragma_update(None, "temp_store", "MEMORY")
+            .storage()?;
+    }
+    Ok(())
+}
+
 impl StorageProvider for SqliteAccountStorage {
     type Mls = SqliteOpenMlsStorage;
 
@@ -357,6 +446,114 @@ mod tests {
             cipher_memory_security < key_probe,
             "cipher_memory_security must be enabled before the keying probe",
         );
+    }
+
+    #[test]
+    fn public_hardened_open_pins_cipher_pragmas_before_keying() {
+        let _guard = TRACE_TEST_LOCK.lock().unwrap();
+        TRACED_SQLCIPHER_SETUP.lock().unwrap().clear();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hardened.sqlite");
+        let key = SqlCipherKey::new("public hardened key").unwrap();
+        let mut connection = rusqlite::Connection::open(path).unwrap();
+        connection.trace(Some(trace_sqlcipher_setup));
+
+        open_hardened_sqlcipher(&connection, &key, SqlCipherHardening::live_cache()).unwrap();
+
+        let statements = TRACED_SQLCIPHER_SETUP.lock().unwrap().clone();
+        let cipher_compatibility = statements
+            .iter()
+            .position(|statement| *statement == "cipher_compatibility")
+            .expect("cipher_compatibility pragma was traced");
+        let cipher_memory_security = statements
+            .iter()
+            .position(|statement| *statement == "cipher_memory_security")
+            .expect("cipher_memory_security pragma was traced");
+        let key = statements
+            .iter()
+            .position(|statement| *statement == "key")
+            .expect("key pragma was traced");
+        let key_probe = statements
+            .iter()
+            .position(|statement| *statement == "key_probe")
+            .expect("keying probe was traced");
+
+        assert!(
+            cipher_compatibility < key,
+            "cipher_compatibility must be pinned before SQLCipher keying",
+        );
+        assert!(
+            cipher_compatibility < key_probe,
+            "cipher_compatibility must be pinned before the keying probe",
+        );
+        assert!(
+            cipher_memory_security < key,
+            "cipher_memory_security must be enabled before SQLCipher keying",
+        );
+        assert!(
+            cipher_memory_security < key_probe,
+            "cipher_memory_security must be enabled before the keying probe",
+        );
+    }
+
+    #[test]
+    fn public_hardened_open_applies_requested_privacy_pragmas() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hardened.sqlite");
+        let key = SqlCipherKey::new("hardened privacy key").unwrap();
+
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        open_hardened_sqlcipher(&connection, &key, SqlCipherHardening::live_cache()).unwrap();
+        assert_eq!(pragma_i64(&connection, "secure_delete"), 1);
+        assert_eq!(pragma_i64(&connection, "temp_store"), 2);
+        drop(connection);
+
+        // cipher_only() must not switch temp_store to MEMORY. (secure_delete is
+        // left at the SQLCipher compile-time default, which is ON, so it is not
+        // asserted here — only the live-cache path opts into it explicitly.)
+        let path = dir.path().join("cipher-only.sqlite");
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        open_hardened_sqlcipher(&connection, &key, SqlCipherHardening::cipher_only()).unwrap();
+        assert_ne!(pragma_i64(&connection, "temp_store"), 2);
+    }
+
+    #[test]
+    fn hardened_file_roundtrip_requires_the_correct_sqlcipher_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hardened-roundtrip.sqlite");
+        let key = SqlCipherKey::new("hardened correct key").unwrap();
+        let wrong_key = SqlCipherKey::new("hardened wrong key").unwrap();
+
+        {
+            let connection = rusqlite::Connection::open(&path).unwrap();
+            open_hardened_sqlcipher(&connection, &key, SqlCipherHardening::live_cache()).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE marker (value TEXT NOT NULL);
+                     INSERT INTO marker (value) VALUES ('kept');",
+                )
+                .unwrap();
+        }
+
+        let file_bytes = std::fs::read(&path).unwrap();
+        assert!(!file_bytes.starts_with(b"SQLite format 3\0"));
+
+        // Wrong key cannot read the data.
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        assert!(
+            open_hardened_sqlcipher(&connection, &wrong_key, SqlCipherHardening::live_cache())
+                .is_err()
+        );
+        drop(connection);
+
+        // Correct key reopens and reads.
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        open_hardened_sqlcipher(&connection, &key, SqlCipherHardening::live_cache()).unwrap();
+        let value: String = connection
+            .query_row("SELECT value FROM marker", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(value, "kept");
     }
 
     #[test]

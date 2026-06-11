@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, Transaction, params, types::Type};
-use storage_sqlite::SqlCipherKey;
+use storage_sqlite::{SqlCipherHardening, SqlCipherKey, open_hardened_sqlcipher};
 
 use crate::notifications::StoredPushRegistration;
 use crate::{
@@ -40,8 +40,10 @@ impl LegacyAccountProjectionDb {
             fs::create_dir_all(parent)?;
         }
         let conn = Connection::open(path)?;
-        conn.pragma_update(None, "key", key.as_secret_str())?;
-        let _: i64 = conn.query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get(0))?;
+        // Harden this legacy migration source the same way as storage-sqlite:
+        // pin cipher_compatibility and enable cipher_memory_security before
+        // keying so key/page material is wiped from the SQLCipher heap.
+        open_hardened_sqlcipher(&conn, key, SqlCipherHardening::cipher_only())?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS account_state (
                 label TEXT PRIMARY KEY NOT NULL,

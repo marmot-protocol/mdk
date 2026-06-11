@@ -25,7 +25,8 @@ pub use chat_list::{ChatListAvatar, ChatListMessagePreview, ChatListQuery, ChatL
 #[allow(deprecated)]
 pub use connection::SqliteStorage;
 pub use connection::{
-    SqlCipherKey, SqliteAccountStorage, SqliteJournalMode, SqliteStorageOptions, SqliteSynchronous,
+    SqlCipherHardening, SqlCipherKey, SqliteAccountStorage, SqliteJournalMode,
+    SqliteStorageOptions, SqliteSynchronous, open_hardened_sqlcipher,
 };
 pub use openmls_storage::SqliteOpenMlsStorageError;
 pub use shared::{

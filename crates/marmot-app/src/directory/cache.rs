@@ -6,7 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use storage_sqlite::SqlCipherKey;
+use storage_sqlite::{SqlCipherHardening, SqlCipherKey, open_hardened_sqlcipher};
 
 use crate::{AccountRelayListStatus, AppError, UserDirectoryRecord, UserProfileMetadata};
 
@@ -22,8 +22,10 @@ impl DirectoryCache {
             fs::create_dir_all(parent)?;
         }
         let conn = Connection::open(path)?;
-        conn.pragma_update(None, "key", key.as_secret_str())?;
-        let _: i64 = conn.query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get(0))?;
+        // Mirror storage-sqlite's hardened open: pin cipher_compatibility and
+        // enable cipher_memory_security before keying, and scrub deleted rows /
+        // keep temp state in memory for this long-lived encrypted cache.
+        open_hardened_sqlcipher(&conn, key, SqlCipherHardening::live_cache())?;
         Self::from_connection(conn)
     }
 

@@ -61,10 +61,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use storage_sqlite::{
     AccountGroupPushToken, AccountNotificationSettings, AccountPushRegistration,
-    AccountStoredPushRegistration, PublicDirectoryUserRecord, SqlCipherKey, SqliteAccountStorage,
-    SqliteSharedStorage, StoredAccountGroup, StoredAccountGroupComponent, StoredAccountState,
-    StoredAppEvent, StoredAppMessageQuery, StoredAppMessageRecord, StoredAuditLogSettings,
-    StoredRelayTelemetrySettings, TimelineProjectionUpdate,
+    AccountStoredPushRegistration, PublicDirectoryUserRecord, SqlCipherHardening, SqlCipherKey,
+    SqliteAccountStorage, SqliteSharedStorage, StoredAccountGroup, StoredAccountGroupComponent,
+    StoredAccountState, StoredAppEvent, StoredAppMessageQuery, StoredAppMessageRecord,
+    StoredAuditLogSettings, StoredRelayTelemetrySettings, TimelineProjectionUpdate,
+    open_hardened_sqlcipher,
 };
 use tokio_util::io::ReaderStream;
 use transport_nostr_adapter::{
@@ -5191,8 +5192,10 @@ fn rekey_legacy_sqlcipher_database(
     new_key: &SqlCipherKey,
 ) -> Result<(), AppError> {
     let conn = Connection::open(db_path)?;
-    conn.pragma_update(None, "key", legacy_key.as_secret_str())?;
-    let _: i64 = conn.query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get(0))?;
+    // Pin cipher_compatibility and enable cipher_memory_security before keying,
+    // matching storage-sqlite, so the rekey open does not depend on SQLCipher
+    // defaults and key material is wiped from the heap.
+    open_hardened_sqlcipher(&conn, legacy_key, SqlCipherHardening::cipher_only())?;
     conn.pragma_update(None, "rekey", new_key.as_secret_str())?;
     Ok(())
 }
