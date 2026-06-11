@@ -1,9 +1,10 @@
 //! Local Marmot agent connector daemon.
 
 use std::collections::HashMap;
-use std::io::ErrorKind;
+use std::fs::{File, OpenOptions};
+use std::io::{ErrorKind, Write};
 use std::net::SocketAddr;
-use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1312,11 +1313,22 @@ impl AllowlistStore {
     fn read_record(&self, account_id_hex: &str) -> Result<AllowlistRecord, ConnectorError> {
         let path = self.record_path(account_id_hex);
         match std::fs::read(&path) {
-            Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
-            Err(err) if err.kind() == ErrorKind::NotFound => Ok(AllowlistRecord {
-                account_id_hex: account_id_hex.to_owned(),
-                welcomer_account_ids_hex: Vec::new(),
-            }),
+            Ok(bytes) => match serde_json::from_slice(&bytes) {
+                Ok(record) => Ok(record),
+                Err(_err) => {
+                    tracing::warn!(
+                        target: "agent_connector",
+                        method = "allowlist_read_record",
+                        error_code = "corrupt_allowlist_record",
+                        "ignoring corrupt allowlist record"
+                    );
+                    // The corrupt bytes are unrecoverable; fail closed as deny-all so the
+                    // next successful allowlist update resets the record instead of
+                    // wedging invite policy and control operations on a JSON error.
+                    Ok(Self::empty_record(account_id_hex))
+                }
+            },
+            Err(err) if err.kind() == ErrorKind::NotFound => Ok(Self::empty_record(account_id_hex)),
             Err(err) => Err(err.into()),
         }
     }
@@ -1325,13 +1337,46 @@ impl AllowlistStore {
         std::fs::create_dir_all(&self.dir)?;
         std::fs::set_permissions(&self.dir, std::fs::Permissions::from_mode(0o700))?;
         let path = self.record_path(&record.account_id_hex);
-        std::fs::write(&path, serde_json::to_vec_pretty(record)?)?;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        let temp_path = self.temp_record_path(&record.account_id_hex);
+        let bytes = serde_json::to_vec_pretty(record)?;
+        {
+            let mut file = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&temp_path)?;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+        }
+        if let Err(err) = std::fs::rename(&temp_path, &path) {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(err.into());
+        }
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        Self::sync_parent_dir(&self.dir)?;
         Ok(())
     }
 
     fn record_path(&self, account_id_hex: &str) -> PathBuf {
         self.dir.join(format!("{account_id_hex}.json"))
+    }
+
+    fn temp_record_path(&self, account_id_hex: &str) -> PathBuf {
+        self.dir.join(format!(".{account_id_hex}.json.tmp"))
+    }
+
+    fn empty_record(account_id_hex: &str) -> AllowlistRecord {
+        AllowlistRecord {
+            account_id_hex: account_id_hex.to_owned(),
+            welcomer_account_ids_hex: Vec::new(),
+        }
+    }
+
+    fn sync_parent_dir(dir: &Path) -> Result<(), ConnectorError> {
+        File::open(dir)?.sync_all()?;
+        Ok(())
     }
 }
 
@@ -1708,8 +1753,8 @@ mod tests {
     use tokio::time::{Duration, sleep, timeout};
 
     use crate::{
-        AgentConnector, AgentConnectorConfig, bind_connector_socket,
-        bind_connector_socket_with_mode, serve_socket,
+        AgentConnector, AgentConnectorConfig, AllowlistRecord, AllowlistStore,
+        bind_connector_socket, bind_connector_socket_with_mode, serve_socket,
     };
 
     const CONTROL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(120);
@@ -2236,6 +2281,74 @@ mod tests {
         )
         .await;
         assert_allowlist(removed, "req-allow-remove", &agent.account_id_hex, &[]);
+    }
+
+    #[test]
+    fn allowlist_store_treats_corrupt_record_as_empty_and_recovers_on_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = AllowlistStore::new(dir.path());
+        let account_id_hex = format!("{:064x}", 1);
+        let welcomer_account_id_hex = format!("{:064x}", 2);
+        std::fs::create_dir_all(&store.dir).unwrap();
+        std::fs::write(store.record_path(&account_id_hex), b"{not valid json").unwrap();
+
+        assert_eq!(store.list(&account_id_hex).unwrap(), Vec::<String>::new());
+        assert!(
+            !store
+                .contains(&account_id_hex, &welcomer_account_id_hex)
+                .unwrap()
+        );
+
+        assert_eq!(
+            store
+                .add(&account_id_hex, &welcomer_account_id_hex)
+                .unwrap(),
+            vec![welcomer_account_id_hex.clone()]
+        );
+        assert_eq!(
+            store
+                .read_record(&account_id_hex)
+                .unwrap()
+                .welcomer_account_ids_hex,
+            vec![welcomer_account_id_hex]
+        );
+    }
+
+    #[test]
+    fn allowlist_store_atomic_write_replaces_stale_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = AllowlistStore::new(dir.path());
+        let account_id_hex = format!("{:064x}", 1);
+        let welcomer_account_id_hex = format!("{:064x}", 2);
+        let temp_path = store.temp_record_path(&account_id_hex);
+        std::fs::create_dir_all(&store.dir).unwrap();
+        std::fs::write(&temp_path, b"partial write from crashed writer").unwrap();
+
+        store
+            .write_record(&AllowlistRecord {
+                account_id_hex: account_id_hex.clone(),
+                welcomer_account_ids_hex: vec![welcomer_account_id_hex.clone()],
+            })
+            .unwrap();
+
+        assert!(!temp_path.exists());
+        assert_eq!(
+            store
+                .read_record(&account_id_hex)
+                .unwrap()
+                .welcomer_account_ids_hex,
+            vec![welcomer_account_id_hex]
+        );
+        assert_eq!(
+            store
+                .record_path(&account_id_hex)
+                .metadata()
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
     }
 
     #[tokio::test]
