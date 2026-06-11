@@ -78,6 +78,13 @@ class NonAppendOnlyUpdate(RuntimeError):
     """Raised when a gateway replacement cannot be represented as an append."""
 
 
+class _ResyncRequired(RuntimeError):
+    """Internal signal that the connector dropped inbound messages on broadcast lag and could
+    not auto-replay them. Raised out of the inbound consume loop to force a reconnect, which
+    re-runs the connector's catch-up and storage-backed replay so the missed messages are
+    recovered rather than silently lost."""
+
+
 class AppendOnlyTextState:
     """Tracks the latest visible stream text and returns safe suffix deltas."""
 
@@ -1148,6 +1155,13 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                 await self._consume_inbound_once()
             except asyncio.CancelledError:
                 raise
+            except _ResyncRequired as exc:
+                # The connector could not auto-replay the messages dropped on broadcast lag and
+                # asked us to re-sync. Tear down and reopen the subscription: a fresh subscription
+                # re-runs the connector's catch_up_accounts() and a fresh storage-backed replay,
+                # which recovers the missed inbound messages we would otherwise never see.
+                logger.warning("Marmot inbound resync requested, reconnecting: %s", exc)
+                await asyncio.sleep(0.5)
             except Exception as exc:
                 logger.warning("Marmot inbound subscription failed, retrying: %s", exc)
                 await asyncio.sleep(2.0)
@@ -1159,8 +1173,25 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         ):
             await self._handle_control_event(event)
 
+    async def _handle_resync_required(self, event: Dict[str, Any]) -> None:
+        # Emitted when the connector's inbound broadcast lagged AND its storage-backed replay
+        # could not recover the dropped messages. We must not silently drop user messages: force a
+        # reconnect so the connector re-runs catch-up and replays from storage on a fresh
+        # subscription. Privacy-safe log: counts only, never ids/payloads.
+        dropped_events = event.get("dropped_events")
+        logger.warning(
+            "Marmot connector requested resync (dropped_events=%s); reconnecting subscription",
+            dropped_events,
+        )
+        raise _ResyncRequired(
+            f"connector resync_required (dropped_events={dropped_events})"
+        )
+
     async def _handle_control_event(self, event: Dict[str, Any]) -> None:
         event_type = event.get("type")
+        if event_type == "resync_required":
+            await self._handle_resync_required(event)
+            return
         if event_type != "inbound_message":
             logger.debug("Ignoring Marmot control event type %s", event_type)
             return

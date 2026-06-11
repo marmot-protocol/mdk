@@ -255,6 +255,16 @@ pub enum AgentControlEvent {
         stream_id_hex: String,
         status: String,
     },
+    /// The connector's inbound broadcast lagged and dropped events before they could be
+    /// delivered on this subscription. Dropped inbound messages are gone from the channel and
+    /// will not be re-emitted, so the agent must re-query/re-sync state (e.g. via its own
+    /// message history) to recover anything it missed. `dropped_events` is the number of
+    /// broadcast slots that overflowed (not necessarily all inbound messages).
+    ResyncRequired {
+        account_id_hex: Option<String>,
+        group_id_hex: Option<String>,
+        dropped_events: u64,
+    },
 }
 
 pub fn encode_frame<T: Serialize>(message: &T) -> Result<Vec<u8>, AgentControlError> {

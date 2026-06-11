@@ -673,6 +673,100 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(event.source.chat_type, "group")
         self.assertEqual(event.source.user_id, "44" * 32)
 
+    async def test_resync_required_event_raises_to_force_reconnect(self):
+        # Regression for darkmatter#210: a resync_required event (emitted when the connector
+        # dropped inbound messages on broadcast lag and could not auto-replay them) must NOT be
+        # silently ignored. It must raise so the consume loop reconnects, re-running the
+        # connector's catch-up and storage-backed replay to recover the missed messages.
+        events = [
+            {
+                "type": "resync_required",
+                "account_id_hex": "11" * 32,
+                "group_id_hex": "22" * 32,
+                "dropped_events": 1500,
+            }
+        ]
+
+        class FakeClient:
+            async def inbound_events(self, account_id_hex=None, group_id_hex=None):
+                for event in events:
+                    yield event
+
+        adapter = self.adapter_module.MarmotPlatformAdapter(
+            self.config_cls(
+                extra={
+                    "account_id_hex": "11" * 32,
+                    "profile_name_onboarding": False,
+                }
+            ),
+            client=FakeClient(),
+        )
+
+        with self.assertRaises(self.adapter_module._ResyncRequired):
+            await adapter._consume_inbound_once()
+        # The resync signal is not delivered to the agent as a message.
+        self.assertEqual(adapter.events, [])
+
+    async def test_consume_loop_reconnects_after_resync_then_delivers(self):
+        # The consume loop must survive a resync_required (reconnect) and then deliver the
+        # message recovered on the fresh subscription, rather than crashing or dropping it.
+        attempts = {"n": 0}
+
+        class FakeClient:
+            async def inbound_events(self, account_id_hex=None, group_id_hex=None):
+                attempts["n"] += 1
+                # Yield control so the event loop can run the test's poll/cancel between
+                # reconnect attempts (the consume loop reconnects in a tight cycle otherwise).
+                await asyncio.sleep(0)
+                if attempts["n"] == 1:
+                    yield {
+                        "type": "resync_required",
+                        "account_id_hex": "11" * 32,
+                        "group_id_hex": "22" * 32,
+                        "dropped_events": 3,
+                    }
+                elif attempts["n"] == 2:
+                    yield {
+                        "type": "inbound_message",
+                        "account_id_hex": "11" * 32,
+                        "group_id_hex": "22" * 32,
+                        "message_id_hex": "33" * 32,
+                        "sender_account_id_hex": "44" * 32,
+                        "text": "recovered after resync",
+                    }
+                else:
+                    # No further events; idle so the loop parks instead of busy-spinning.
+                    await asyncio.sleep(3600)
+                    return
+
+        adapter = self.adapter_module.MarmotPlatformAdapter(
+            self.config_cls(
+                extra={
+                    "account_id_hex": "11" * 32,
+                    "profile_name_onboarding": False,
+                }
+            ),
+            client=FakeClient(),
+        )
+
+        # Drive the loop just long enough to reconnect once and deliver the recovered message.
+        loop_task = asyncio.ensure_future(adapter._consume_inbound_loop())
+        try:
+            for _ in range(300):
+                if adapter.events:
+                    break
+                await asyncio.sleep(0.01)
+        finally:
+            loop_task.cancel()
+            try:
+                await loop_task
+            except asyncio.CancelledError:
+                pass
+
+        self.assertGreaterEqual(attempts["n"], 2, "loop should reconnect after resync")
+        self.assertEqual(len(adapter.events), 1)
+        self.assertEqual(adapter.events[0].text, "recovered after resync")
+
     async def test_first_inbound_message_prompts_for_public_profile_name(self):
         events = [
             {
