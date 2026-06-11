@@ -736,6 +736,81 @@ async fn signed_welcome_event_becomes_account_inbox_delivery() {
     );
 }
 
+#[tokio::test]
+async fn inbox_subscription_since_is_widened_by_the_nip59_tweak_window() {
+    let relay = Arc::new(FakeRelayClient::default());
+    let adapter = NostrTransportAdapter::new(relay.clone());
+    let account_id = MemberId::new(vec![0xA1; 32]);
+    let cursor = 1_700_000_000_u64;
+
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: account_id.clone(),
+            inbox_endpoints: vec![TransportEndpoint("wss://inbox.example".into())],
+            group_subscriptions: vec![TransportGroupSubscription {
+                group_id: cgka_traits::GroupId::new(vec![0xC3; 32]),
+                transport_group_id: vec![0xD4; 32],
+                endpoints: vec![TransportEndpoint("wss://group.example".into())],
+            }],
+            since: Some(Timestamp(cursor)),
+        })
+        .await
+        .expect("activation succeeds");
+
+    let issued = relay.subscriptions.lock().unwrap().clone();
+    let inbox_since = issued
+        .iter()
+        .find_map(|subscription| match subscription {
+            NostrSubscription::AccountInbox { since, .. } => Some(since.clone()),
+            _ => None,
+        })
+        .expect("inbox subscription issued");
+    let group_since = issued
+        .iter()
+        .find_map(|subscription| match subscription {
+            NostrSubscription::Group { since, .. } => Some(since.clone()),
+            _ => None,
+        })
+        .expect("group subscription issued");
+
+    // Welcomes arrive as NIP-59 gift wraps whose created_at is backdated up to
+    // the full tweak range; the inbox window must reach that far back or
+    // welcomes published while offline are skipped.
+    assert_eq!(
+        inbox_since,
+        Some(Timestamp(
+            cursor - transport_nostr_adapter::NIP59_TIMESTAMP_TWEAK_SECS
+        ))
+    );
+    assert_eq!(group_since, Some(Timestamp(cursor)));
+}
+
+#[tokio::test]
+async fn inbox_subscription_since_saturates_at_zero() {
+    let relay = Arc::new(FakeRelayClient::default());
+    let adapter = NostrTransportAdapter::new(relay.clone());
+
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: MemberId::new(vec![0xA1; 32]),
+            inbox_endpoints: vec![TransportEndpoint("wss://inbox.example".into())],
+            group_subscriptions: vec![],
+            since: Some(Timestamp(1)),
+        })
+        .await
+        .expect("activation succeeds");
+
+    let issued = relay.subscriptions.lock().unwrap().clone();
+    let inbox_since = issued
+        .iter()
+        .find_map(|subscription| match subscription {
+            NostrSubscription::AccountInbox { since, .. } => Some(since.clone()),
+            _ => None,
+        })
+        .expect("inbox subscription issued");
+    assert_eq!(inbox_since, Some(Timestamp(0)));
+}
+
 fn group_event(id_byte: &str, transport_group_id: &[u8]) -> NostrTransportEvent {
     NostrTransportEvent {
         id: id_byte.repeat(32),

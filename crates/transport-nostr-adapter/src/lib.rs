@@ -429,7 +429,7 @@ impl TransportAdapter for NostrTransportAdapter {
         issued.push(NostrSubscription::AccountInbox {
             account_id: account_id.clone(),
             endpoints: activation.inbox_endpoints.clone(),
-            since: activation.since,
+            since: inbox_since(activation.since),
         });
         for group in &activation.group_subscriptions {
             issued.push(group_subscription(&account_id, group, activation.since));
@@ -816,6 +816,19 @@ impl AdapterState {
                 .collect(),
         }
     }
+}
+
+/// NIP-59 gift wraps (welcomes) randomize the wrapper's `created_at` up to two
+/// days into the past to resist timing analysis. A catch-up `since` derived
+/// from the last-seen transport timestamp would therefore permanently skip any
+/// welcome published while this device was offline whose tweak landed before
+/// the cursor. Widen the inbox window by the full tweak range; re-delivered
+/// wraps are deduplicated by seen-event ids downstream, and only welcomes
+/// travel as gift wraps so the re-fetch volume stays small.
+pub const NIP59_TIMESTAMP_TWEAK_SECS: u64 = 172_800;
+
+fn inbox_since(since: Option<Timestamp>) -> Option<Timestamp> {
+    since.map(|since| Timestamp(since.0.saturating_sub(NIP59_TIMESTAMP_TWEAK_SECS)))
 }
 
 fn group_subscription(
