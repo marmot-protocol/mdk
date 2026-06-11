@@ -3,7 +3,7 @@
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub const AGENT_CONTROL_PROTOCOL_V1: &str = "marmot.agent-control.v1";
 pub const MAX_AGENT_CONTROL_FRAME_BYTES: usize = 1024 * 1024;
@@ -299,7 +299,15 @@ where
     T: DeserializeOwned,
 {
     let mut frame = Vec::new();
-    let read = reader.read_until(b'\n', &mut frame).await?;
+    // Cap the read itself so a client that never sends a newline cannot make us
+    // buffer unbounded memory before the size check runs. We allow one byte past
+    // the limit so an over-cap frame is detectable (read_until on a Take adapter
+    // stops silently at the limit instead of erroring).
+    let limit = (MAX_AGENT_CONTROL_FRAME_BYTES + 1) as u64;
+    let read = {
+        let mut limited = (&mut *reader).take(limit);
+        limited.read_until(b'\n', &mut frame).await?
+    };
     if read == 0 {
         return Ok(None);
     }
@@ -338,8 +346,9 @@ mod tests {
     use tokio::io::BufReader;
 
     use crate::{
-        AgentControlEnvelope, AgentControlRequest, AgentControlResponse, decode_envelope,
-        encode_frame, read_envelope, write_frame,
+        AgentControlEnvelope, AgentControlError, AgentControlRequest, AgentControlResponse,
+        MAX_AGENT_CONTROL_FRAME_BYTES, decode_envelope, encode_frame, read_envelope, read_frame,
+        write_frame,
     };
 
     #[test]
@@ -428,6 +437,77 @@ mod tests {
         assert_eq!(lines.len(), 1, "write_frame should emit exactly one frame");
         let decoded: AgentControlEnvelope<AgentControlRequest> = decode_envelope(&bytes).unwrap();
         assert_eq!(decoded, request);
+    }
+
+    #[tokio::test]
+    async fn read_frame_rejects_oversized_frame_without_buffering_unbounded() {
+        // A client that streams data without a trailing newline must not be able
+        // to make read_frame buffer past the cap. The read-side `.take()` adapter
+        // stops at MAX + 1 bytes, so the post-read size check fires deterministically
+        // instead of letting allocation grow unbounded (pre-auth OOM, darkmatter#212).
+        let oversize = MAX_AGENT_CONTROL_FRAME_BYTES + 4096;
+        let payload = vec![b'a'; oversize]; // no newline, intentionally over the cap
+        let mut reader = BufReader::new(std::io::Cursor::new(payload));
+
+        let result: Result<Option<AgentControlEnvelope<AgentControlRequest>>, _> =
+            read_envelope(&mut reader).await;
+        match result {
+            Err(AgentControlError::FrameTooLarge(len)) => {
+                // We buffer at most one byte past the cap, never the full payload.
+                assert_eq!(len, MAX_AGENT_CONTROL_FRAME_BYTES + 1);
+            }
+            other => panic!("expected FrameTooLarge, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn read_frame_accepts_frame_at_the_cap_boundary() {
+        // A frame whose encoded line is exactly MAX_AGENT_CONTROL_FRAME_BYTES
+        // (including its trailing newline) must still round-trip; the read-side
+        // limit allows one byte past the cap precisely so a legal max-size frame
+        // is not truncated. We pad `append_text` with ASCII bytes (which serde
+        // serializes 1:1 with no escaping) so we can hit the cap to the byte.
+        let make = |append_text: String| {
+            AgentControlEnvelope::request(
+                Some("req-boundary".to_owned()),
+                AgentControlRequest::StreamAppend {
+                    stream_id_hex:
+                        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                            .to_owned(),
+                    append_text,
+                },
+            )
+        };
+        // Measure the frame size with an empty body, then pad the body so the
+        // total encoded length (JSON + trailing newline) is exactly the cap.
+        let base_len = encode_frame(&make(String::new())).unwrap().len();
+        assert!(base_len < MAX_AGENT_CONTROL_FRAME_BYTES);
+        let padding = MAX_AGENT_CONTROL_FRAME_BYTES - base_len;
+        let request = make("a".repeat(padding));
+
+        let mut encoded = encode_frame(&request).unwrap();
+        assert!(encoded.ends_with(b"\n"));
+        assert_eq!(
+            encoded.len(),
+            MAX_AGENT_CONTROL_FRAME_BYTES,
+            "boundary frame must encode to exactly the cap"
+        );
+        // Append a following frame's bytes to prove read_frame stops at the first
+        // newline and does not over-read past the cap into trailing data.
+        encoded.extend_from_slice(b"trailing");
+        let mut reader = BufReader::new(std::io::Cursor::new(encoded));
+
+        let received: AgentControlEnvelope<AgentControlRequest> =
+            read_envelope(&mut reader).await.unwrap().unwrap();
+        assert_eq!(received, request);
+    }
+
+    #[tokio::test]
+    async fn read_frame_returns_none_on_empty_stream() {
+        let mut reader = BufReader::new(std::io::Cursor::new(Vec::<u8>::new()));
+        let result: Option<AgentControlEnvelope<AgentControlRequest>> =
+            read_frame(&mut reader).await.unwrap();
+        assert!(result.is_none());
     }
 
     #[test]
