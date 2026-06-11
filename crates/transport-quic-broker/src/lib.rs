@@ -928,7 +928,18 @@ async fn handle_publish_stream(
     state.wait_for_subscriber(&key).await?;
     let mut limit_state = AgentTextStreamReceiveAccumulator::default();
 
-    while let Some(record) = read_record_frame(&mut recv, Some(read_timeout)).await? {
+    // The `read_timeout` is a handshake deadline only: it bounds how long an
+    // unauthenticated peer may stall before sending its publish control frame.
+    // Once a publisher has authenticated a room we must NOT apply a per-record
+    // deadline. Agents legitimately go quiet between records (e.g. a long tool
+    // call with no progress events); a per-frame deadline would error the
+    // publish stream on that silence, which latches the composer's `live_error`
+    // and kills the live preview for the rest of the response with no recovery.
+    // QUIC liveness (max_idle_timeout + keep_alive_interval) still reaps a
+    // genuinely dead publisher, and the resource caps (max_connections /
+    // max_rooms / backlog budgets) still bound an idle-but-alive one, so reads
+    // here are intentionally unbounded by the application-level deadline.
+    while let Some(record) = read_record_frame(&mut recv, None).await? {
         if record.stream_id != key.stream_id {
             state.drop_room(&key).await;
             return Err(QuicBrokerError::MixedStreamIds);
@@ -1419,6 +1430,82 @@ mod tests {
         assert_eq!(received.stream_id, stream_id);
         assert_eq!(received.text, "hello broker stream");
         assert_eq!(received.chunk_count, 4);
+        assert_eq!(sent.chunk_count, received.chunk_count);
+        assert_eq!(sent.transcript_hash, received.transcript_hash);
+
+        let _ = shutdown_tx.send(());
+        broker_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn broker_does_not_apply_per_record_deadline_to_authenticated_publisher() {
+        // Regression for the live-preview latch: an agent that goes quiet between
+        // records (e.g. a long tool call with no progress events) must not have
+        // its publish stream errored by a per-record read deadline. Before the
+        // fix, `read_timeout` was enforced on every record-frame read after the
+        // handshake, so an idle gap longer than the deadline killed the stream;
+        // the composer then latched `live_error` and the preview was dead for the
+        // rest of the response. Here we use a tiny read_timeout and idle well past
+        // it between two records, and assert both records still arrive. The QUIC
+        // idle timeout (kept long here) is what reaps a genuinely dead publisher.
+        let server = QuicBrokerServer::bind(QuicBrokerConfig {
+            bind_addr: LOCAL_SERVER_BIND,
+            per_subscriber_queue: DEFAULT_SUBSCRIBER_QUEUE_DEPTH,
+            read_timeout: Duration::from_millis(100),
+            ..QuicBrokerConfig::default()
+        })
+        .unwrap();
+        let broker_addr = server.local_addr().unwrap();
+        let server_cert = server.server_cert_der().to_vec();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let broker_task = tokio::spawn(server.run_until(async {
+            let _ = shutdown_rx.await;
+        }));
+
+        let stream_id = vec![0xa9; 32];
+        let start_event_id = MessageId::new(vec![0x19; 32]);
+        let subscriber = tokio::spawn(subscribe_text_from_broker(SubscribeTextFromBroker {
+            broker_addr,
+            server_name: "localhost".to_owned(),
+            trust: BrokerServerTrust::CertificateDer(server_cert.clone()),
+            stream_id: stream_id.clone(),
+            start_event_id: start_event_id.clone(),
+            crypto: None,
+        }));
+        sleep(Duration::from_millis(100)).await;
+
+        let mut publisher = BrokerTextPublisher::connect(OpenBrokerTextPublisher {
+            broker_addr,
+            server_name: "localhost".to_owned(),
+            trust: BrokerServerTrust::CertificateDer(server_cert),
+            stream_id: stream_id.clone(),
+            start_event_id,
+            crypto: None,
+        })
+        .await
+        .unwrap();
+        publisher
+            .append_text("before", 32, Duration::ZERO)
+            .await
+            .unwrap();
+        // Idle far longer than the per-record read_timeout (100ms).
+        sleep(Duration::from_millis(500)).await;
+        // This write would have failed before the fix, because the broker would
+        // have already errored the publish stream on the idle gap.
+        publisher
+            .append_text("after", 32, Duration::ZERO)
+            .await
+            .unwrap();
+        let sent = publisher.finish().await.unwrap();
+
+        let received = tokio::time::timeout(Duration::from_secs(5), subscriber)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(received.stream_id, stream_id);
+        assert_eq!(received.text, "beforeafter");
         assert_eq!(sent.chunk_count, received.chunk_count);
         assert_eq!(sent.transcript_hash, received.transcript_hash);
 
