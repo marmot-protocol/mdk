@@ -43,7 +43,7 @@ use crate::{
     APP_RUNTIME_ACCOUNT_READY_WAIT, APP_RUNTIME_ACCOUNT_SHUTDOWN_WAIT,
     APP_RUNTIME_RELAY_REBUILD_LOOKBACK, APP_RUNTIME_SUBSCRIPTION_BUFFER, AccountKeyPackageRecord,
     AccountRelayListBootstrap, AccountRelayListStatus, AgentOperationEventRequest,
-    AgentTextStreamFinishRequest, AppBlobEndpoint, AppError, AppGroupMemberRecord,
+    AgentTextStreamFinishRequest, AppBlobEndpoint, AppClient, AppError, AppGroupMemberRecord,
     AppGroupMlsState, AppGroupRecord, AppMessageQuery, AppMessageRecord, AppProjectionUpdate,
     AuditLogDeleteOutcome, AuditLogFile, AuditLogSettings, AuditLogTrackerConfig,
     AuditLogTrackerUpdateResult, AuditLogUploadResult, BackgroundNotificationCollection,
@@ -4778,6 +4778,20 @@ async fn run_app_runtime_account_worker(
                             client.invite_members(&group_id, &member_refs).await
                         }
                         .await;
+                        if result.is_ok() {
+                            publish_client_pending_projection_updates(
+                                &mut client,
+                                &events,
+                                &account_id_hex,
+                                &account_label,
+                            );
+                            publish_app_runtime_group_state_updated(
+                                &events,
+                                &account_id_hex,
+                                &account_label,
+                                &group_id,
+                            );
+                        }
                         let _ = respond.send(result);
                     }
                     Some(AccountWorkerCommand::RemoveMembers {
@@ -4790,6 +4804,20 @@ async fn run_app_runtime_account_worker(
                             client.remove_members(&group_id, &member_refs).await
                         }
                         .await;
+                        if result.is_ok() {
+                            publish_client_pending_projection_updates(
+                                &mut client,
+                                &events,
+                                &account_id_hex,
+                                &account_label,
+                            );
+                            publish_app_runtime_group_state_updated(
+                                &events,
+                                &account_id_hex,
+                                &account_label,
+                                &group_id,
+                            );
+                        }
                         let _ = respond.send(result);
                     }
                     Some(AccountWorkerCommand::LeaveGroup { group_id, respond }) => {
@@ -4826,6 +4854,20 @@ async fn run_app_runtime_account_worker(
                         respond,
                     }) => {
                         let result = client.promote_admin(&group_id, &member_ref).await;
+                        if result.is_ok() {
+                            publish_client_pending_projection_updates(
+                                &mut client,
+                                &events,
+                                &account_id_hex,
+                                &account_label,
+                            );
+                            publish_app_runtime_group_state_updated(
+                                &events,
+                                &account_id_hex,
+                                &account_label,
+                                &group_id,
+                            );
+                        }
                         let _ = respond.send(result);
                     }
                     Some(AccountWorkerCommand::DemoteAdmin {
@@ -4834,10 +4876,38 @@ async fn run_app_runtime_account_worker(
                         respond,
                     }) => {
                         let result = client.demote_admin(&group_id, &member_ref).await;
+                        if result.is_ok() {
+                            publish_client_pending_projection_updates(
+                                &mut client,
+                                &events,
+                                &account_id_hex,
+                                &account_label,
+                            );
+                            publish_app_runtime_group_state_updated(
+                                &events,
+                                &account_id_hex,
+                                &account_label,
+                                &group_id,
+                            );
+                        }
                         let _ = respond.send(result);
                     }
                     Some(AccountWorkerCommand::SelfDemoteAdmin { group_id, respond }) => {
                         let result = client.self_demote_admin(&group_id).await;
+                        if result.is_ok() {
+                            publish_client_pending_projection_updates(
+                                &mut client,
+                                &events,
+                                &account_id_hex,
+                                &account_label,
+                            );
+                            publish_app_runtime_group_state_updated(
+                                &events,
+                                &account_id_hex,
+                                &account_label,
+                                &group_id,
+                            );
+                        }
                         let _ = respond.send(result);
                     }
                         Some(AccountWorkerCommand::UpdateGroupProfile {
@@ -4850,6 +4920,12 @@ async fn run_app_runtime_account_worker(
                                 .update_group_profile(&group_id, name.as_deref(), description.as_deref())
                                 .await;
                             if result.is_ok() {
+                                publish_client_pending_projection_updates(
+                                    &mut client,
+                                    &events,
+                                    &account_id_hex,
+                                    &account_label,
+                                );
                                 publish_app_runtime_group_state_updated(
                                     &events,
                                     &account_id_hex,
@@ -4869,6 +4945,12 @@ async fn run_app_runtime_account_worker(
                                 .update_group_image(&group_id, plaintext, &media_type)
                                 .await;
                             if result.is_ok() {
+                                publish_client_pending_projection_updates(
+                                    &mut client,
+                                    &events,
+                                    &account_id_hex,
+                                    &account_label,
+                                );
                                 publish_app_runtime_group_state_updated(
                                     &events,
                                     &account_id_hex,
@@ -5217,6 +5299,17 @@ fn publish_app_runtime_projection_update(
         account_label: account_label.to_owned(),
         update,
     }));
+}
+
+fn publish_client_pending_projection_updates(
+    client: &mut AppClient,
+    events: &broadcast::Sender<MarmotAppEvent>,
+    account_id_hex: &str,
+    account_label: &str,
+) {
+    for update in client.take_pending_projection_updates() {
+        publish_app_runtime_projection_update(events, account_id_hex, account_label, update);
+    }
 }
 
 fn publish_app_runtime_group_state_updated(

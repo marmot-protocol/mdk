@@ -1527,6 +1527,7 @@ impl MarmotApp {
             routing: open.routing,
             relay_plane: relay_plane.clone(),
             state: open.state,
+            pending_projection_updates: Vec::new(),
         })
     }
 
