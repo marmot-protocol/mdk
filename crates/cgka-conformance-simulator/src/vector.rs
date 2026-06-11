@@ -5,7 +5,9 @@
 //! should produce after running the same scripted scenario.
 
 use crate::{HarnessClient, ScenarioSpec};
-use cgka_traits::engine::{AppMessageInvalidationReason, CommitOrderingKey, GroupEvent};
+use cgka_traits::engine::{
+    AppMessageInvalidationReason, CommitOrderingKey, GroupEvent, GroupStateChange,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -559,11 +561,28 @@ pub fn observe_client(label: impl Into<String>, client: &mut HarnessClient) -> C
             .count(),
         member_added: events
             .iter()
-            .filter(|event| matches!(event, GroupEvent::MemberAdded { .. }))
+            .filter(|event| {
+                matches!(
+                    event,
+                    GroupEvent::GroupStateChanged {
+                        change: GroupStateChange::MemberAdded { .. },
+                        ..
+                    }
+                )
+            })
             .count(),
         member_removed: events
             .iter()
-            .filter(|event| matches!(event, GroupEvent::MemberRemoved { .. }))
+            .filter(|event| {
+                matches!(
+                    event,
+                    GroupEvent::GroupStateChanged {
+                        change: GroupStateChange::MemberRemoved { .. }
+                            | GroupStateChange::MemberLeft { .. },
+                        ..
+                    }
+                )
+            })
             .count(),
         epoch_changed: events
             .iter()
@@ -596,18 +615,22 @@ pub fn observe_client(label: impl Into<String>, client: &mut HarnessClient) -> C
         removed_members: events
             .iter()
             .filter_map(|e| match e {
-                GroupEvent::MemberRemoved { member, .. } => {
-                    Some(observe_member_id(member.as_slice()))
-                }
+                GroupEvent::GroupStateChanged {
+                    change:
+                        GroupStateChange::MemberRemoved { member }
+                        | GroupStateChange::MemberLeft { member },
+                    ..
+                } => Some(observe_member_id(member.as_slice())),
                 _ => None,
             })
             .collect(),
         added_members: events
             .iter()
             .filter_map(|e| match e {
-                GroupEvent::MemberAdded { member, .. } => {
-                    Some(observe_member_id(member.id.as_slice()))
-                }
+                GroupEvent::GroupStateChanged {
+                    change: GroupStateChange::MemberAdded { member },
+                    ..
+                } => Some(observe_member_id(member.as_slice())),
                 _ => None,
             })
             .collect(),

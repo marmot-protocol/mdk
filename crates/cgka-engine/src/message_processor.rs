@@ -16,7 +16,9 @@ use crate::openmls_projection::{
 };
 use crate::provider::EngineOpenMlsProvider;
 use cgka_traits::app_components::AppComponentData;
-use cgka_traits::engine::{AutoPublish, CommitOrderingKey, GroupEvent, SendIntent, SendResult};
+use cgka_traits::engine::{
+    AutoPublish, CommitOrderingKey, GroupEvent, GroupStateChange, SendIntent, SendResult,
+};
 use cgka_traits::engine_state::EpochState;
 use cgka_traits::error::{EngineError, PeelerError};
 use cgka_traits::ingest::{IngestOutcome, PeeledContent, StaleReason};
@@ -552,6 +554,19 @@ impl<S: StorageProvider> Engine<S> {
                             }
                         }
                     }
+                    // Classify departures before the merge consumes the staged
+                    // commit and the leaving leaves disappear: a SelfRemove is a
+                    // member leaving (attributed to themselves); a Remove is an
+                    // admin removing someone (attributed to the committer).
+                    let mut self_removed: std::collections::HashSet<MemberId> =
+                        std::collections::HashSet::new();
+                    for queued in staged.queued_proposals() {
+                        if matches!(queued.proposal(), Proposal::SelfRemove)
+                            && let Some(id) = member_id_of_sender(queued.sender(), &mls_group)
+                        {
+                            self_removed.insert(id);
+                        }
+                    }
                     let recovery_snapshot =
                         self.fork_recovery
                             .create_snapshot(&self.storage, &group_id, before)?;
@@ -562,6 +577,12 @@ impl<S: StorageProvider> Engine<S> {
                         "pre_inbound_commit_apply",
                     );
                     let before_members = group_lifecycle::marmot_members(&mls_group);
+                    let before_admins =
+                        crate::app_components::admins_of_group(&mls_group).unwrap_or_default();
+                    let before_profile = crate::app_components::group_profile_of_group(&mls_group)
+                        .ok()
+                        .flatten();
+                    let before_avatar = avatar_component_snapshot(&mls_group);
                     self.retain_current_epoch_snapshot_for_group(&group_id)?;
                     // Extract capabilities from Add proposals before the
                     // staged commit is consumed by merge.
@@ -576,6 +597,12 @@ impl<S: StorageProvider> Engine<S> {
                         .map_err(|e| EngineError::Backend(format!("merge_staged_commit: {e:?}")))?;
                     let after = EpochId(mls_group.epoch().as_u64());
                     let after_members = group_lifecycle::marmot_members(&mls_group);
+                    let after_admins =
+                        crate::app_components::admins_of_group(&mls_group).unwrap_or_default();
+                    let after_profile = crate::app_components::group_profile_of_group(&mls_group)
+                        .ok()
+                        .flatten();
+                    let after_avatar = avatar_component_snapshot(&mls_group);
                     let after_ids: std::collections::HashSet<MemberId> =
                         after_members.iter().map(|m| m.id.clone()).collect();
                     let removed: Vec<MemberId> = before_members
@@ -626,22 +653,47 @@ impl<S: StorageProvider> Engine<S> {
                         from: before,
                         to: after,
                     });
-                    for m in added {
-                        // Reconstruct a Member — credential bytes aren't needed
-                        // for the event consumer since id is authoritative.
-                        self.events_buf.push_back(GroupEvent::MemberAdded {
-                            group_id: group_id.clone(),
-                            member: cgka_traits::group::Member {
-                                id: m,
-                                credential: vec![],
-                            },
-                        });
+                    // Synthesize attributed state-change events, ordered:
+                    // additions, departures, admin grants/revocations, then
+                    // profile changes. The app turns each into a kind-1210 row.
+                    for member in added {
+                        self.push_group_state_change(
+                            &group_id,
+                            after,
+                            sender_id.clone(),
+                            GroupStateChange::MemberAdded { member },
+                        );
                     }
-                    for m in removed {
-                        self.events_buf.push_back(GroupEvent::MemberRemoved {
-                            group_id: group_id.clone(),
-                            member: m,
-                        });
+                    for member in removed {
+                        let (change, actor) = if self_removed.contains(&member) {
+                            // A leave is attributed to the leaver, not the member
+                            // that sequenced the auto-commit.
+                            (
+                                GroupStateChange::MemberLeft {
+                                    member: member.clone(),
+                                },
+                                Some(member),
+                            )
+                        } else {
+                            (
+                                GroupStateChange::MemberRemoved { member },
+                                sender_id.clone(),
+                            )
+                        };
+                        self.push_group_state_change(&group_id, after, actor, change);
+                    }
+                    for change in
+                        crate::group_state_changes::admin_changes(&before_admins, &after_admins)
+                    {
+                        self.push_group_state_change(&group_id, after, sender_id.clone(), change);
+                    }
+                    for change in crate::group_state_changes::profile_changes(
+                        before_profile.as_ref().map(|(name, _)| name.as_str()),
+                        after_profile.as_ref().map(|(name, _)| name.as_str()),
+                        &before_avatar,
+                        &after_avatar,
+                    ) {
+                        self.push_group_state_change(&group_id, after, sender_id.clone(), change);
                     }
                     self.update_stored_message_state(&msg.id, MessageState::Processed)?;
                     Ok(IngestOutcome::Processed)
@@ -668,7 +720,7 @@ impl<S: StorageProvider> Engine<S> {
                             reason: Some(decision_report.reason.to_string()),
                         },
                     );
-                    let auto_removed = match queued.proposal() {
+                    let auto_removed: Vec<MemberId> = match queued.proposal() {
                         Proposal::Remove(r) => member_id_at_leaf(&mls_group, r.removed())
                             .into_iter()
                             .collect(),
@@ -677,6 +729,11 @@ impl<S: StorageProvider> Engine<S> {
                             .collect(),
                         _ => Vec::new(),
                     };
+                    // Capture attribution before `store_pending_proposal`
+                    // consumes `queued`. A SelfRemove is a leave attributed to
+                    // the leaver; a Remove is attributed to the proposer.
+                    let auto_is_self_remove = matches!(queued.proposal(), Proposal::SelfRemove);
+                    let auto_proposer = member_id_of_sender(queued.sender(), &mls_group);
                     mls_group
                     .store_pending_proposal(
                         <EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(
@@ -752,8 +809,27 @@ impl<S: StorageProvider> Engine<S> {
                             &commit_bytes,
                             recovery_snapshot,
                         );
-                        self.pending_auto_removed
-                            .insert(pending_ref, auto_removed.clone());
+                        let auto_changes = auto_removed
+                            .iter()
+                            .cloned()
+                            .map(|member| {
+                                let (change, actor) = if auto_is_self_remove {
+                                    (
+                                        GroupStateChange::MemberLeft {
+                                            member: member.clone(),
+                                        },
+                                        Some(member),
+                                    )
+                                } else {
+                                    (
+                                        GroupStateChange::MemberRemoved { member },
+                                        auto_proposer.clone(),
+                                    )
+                                };
+                                crate::engine::PendingGroupStateChange { actor, change }
+                            })
+                            .collect();
+                        self.pending_state_changes.insert(pending_ref, auto_changes);
                         self.auto_publish_buf.push_back(AutoPublish {
                             msg: wrapped,
                             pending: pending_ref,
@@ -1035,6 +1111,23 @@ impl<S: StorageProvider> Engine<S> {
         })
     }
 
+    /// Queue a `GroupStateChanged` event for the application to synthesize into
+    /// a durable kind-1210 group system row.
+    pub(crate) fn push_group_state_change(
+        &mut self,
+        group_id: &GroupId,
+        epoch: EpochId,
+        actor: Option<MemberId>,
+        change: GroupStateChange,
+    ) {
+        self.events_buf.push_back(GroupEvent::GroupStateChanged {
+            group_id: group_id.clone(),
+            epoch,
+            actor,
+            change,
+        });
+    }
+
     async fn do_send_invite(
         &mut self,
         group_id: GroupId,
@@ -1206,6 +1299,18 @@ impl<S: StorageProvider> Engine<S> {
             &commit_bytes,
             recovery_snapshot,
         );
+        // Buffer the additions so confirm_published emits an attributed
+        // GroupStateChanged (and the app a kind-1210 row) once the commit merges.
+        let added_changes = parsed_kps
+            .iter()
+            .filter_map(|kp| crate::identity::validated_member_id_of_leaf(kp.leaf_node()).ok())
+            .map(|member| crate::engine::PendingGroupStateChange {
+                actor: Some(self.identity.self_id().clone()),
+                change: GroupStateChange::MemberAdded { member },
+            })
+            .collect();
+        self.pending_state_changes
+            .insert(pending_ref, added_changes);
 
         Ok(SendResult::GroupEvolution {
             msg: commit_msg,
@@ -1367,8 +1472,16 @@ impl<S: StorageProvider> Engine<S> {
             &commit_bytes,
             recovery_snapshot,
         );
-        self.pending_auto_removed
-            .insert(pending_ref, unique_targets.clone());
+        let removed_changes = unique_targets
+            .iter()
+            .cloned()
+            .map(|member| crate::engine::PendingGroupStateChange {
+                actor: Some(self.identity.self_id().clone()),
+                change: GroupStateChange::MemberRemoved { member },
+            })
+            .collect();
+        self.pending_state_changes
+            .insert(pending_ref, removed_changes);
 
         Ok(SendResult::GroupEvolution {
             msg: commit_msg,
@@ -1575,6 +1688,24 @@ fn process_commit_with_app_data_updates<S: StorageProvider>(
         unverified,
         updater.changes(),
     )
+}
+
+/// Snapshot the two avatar-bearing component byte blobs (avatar-url and
+/// blossom-image) so a before/after comparison can detect an avatar change.
+///
+/// Presence is normalized: an absent component (`None`) and the canonical
+/// "absent" encoding both collapse to `None`, so this inbound diff matches the
+/// own-commit diff in `update_group_data` and a "clear an already-absent
+/// avatar" commit converges to no row on every client.
+fn avatar_component_snapshot(mls_group: &MlsGroup) -> [Option<Vec<u8>>; 2] {
+    let snapshot = |component_id| {
+        crate::app_components::app_component_data_of_group(mls_group, component_id)
+            .filter(|bytes| crate::app_components::avatar_component_present(component_id, bytes))
+    };
+    [
+        snapshot(cgka_traits::app_components::GROUP_AVATAR_URL_COMPONENT_ID),
+        snapshot(cgka_traits::app_components::GROUP_BLOSSOM_IMAGE_COMPONENT_ID),
+    ]
 }
 
 fn member_id_of_sender(sender: &Sender, group: &MlsGroup) -> Option<MemberId> {

@@ -4744,7 +4744,18 @@ fn group_members_invite_and_remove_flow_updates_projected_members() {
         home.path(),
         &["--account", &bob, "message", "list", "--group", group_id],
     );
-    assert_eq!(bob_history["messages"][0]["plaintext"], "history stays");
+    // bob retains chat history after removal. The list now also carries a
+    // kind-1210 group system row for his removal, so assert by content rather
+    // than position.
+    let bob_messages = bob_history["messages"]
+        .as_array()
+        .expect("messages should be an array");
+    assert!(
+        bob_messages
+            .iter()
+            .any(|message| message["plaintext"] == "history stays"),
+        "bob should retain the chat after removal; got {bob_messages:?}"
+    );
 }
 
 #[test]

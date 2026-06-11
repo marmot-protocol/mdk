@@ -2126,7 +2126,7 @@ async fn relay_app_runtime_publishes_member_leave() {
     home.create_account("alice").unwrap();
     home.create_account("bob").unwrap();
 
-    let (_relay, app, _url) = mock_app(&dir).await;
+    let (_relay, app, url) = mock_app(&dir).await;
     let mut bob = app.client("bob").await.unwrap();
     bob.publish_key_package().await.unwrap();
 
@@ -2140,9 +2140,126 @@ async fn relay_app_runtime_publishes_member_leave() {
     let alice_sync = alice.sync().await.unwrap();
     assert!(alice_sync.events.iter().any(|event| matches!(
         event,
-        cgka_traits::GroupEvent::MemberRemoved { group_id: removed_group, .. }
-            if removed_group == &group_id
+        cgka_traits::GroupEvent::GroupStateChanged {
+            group_id: removed_group,
+            change:
+                cgka_traits::GroupStateChange::MemberRemoved { .. }
+                | cgka_traits::GroupStateChange::MemberLeft { .. },
+            ..
+        } if removed_group == &group_id
     )));
+
+    // The authenticated departure is synthesized into alice's timeline as a
+    // durable kind-1210 group system row (no kind-1210 message is sent).
+    let alice_timeline = MarmotApp::with_relay(dir.path(), url)
+        .timeline_messages_with_query(
+            "alice",
+            TimelineMessageQuery {
+                group_id_hex: Some(hex::encode(group_id.as_slice())),
+                ..TimelineMessageQuery::default()
+            },
+        )
+        .unwrap();
+    let has_departure_row = alice_timeline.messages.iter().any(|message| {
+        message.kind == cgka_traits::app_event::MARMOT_APP_EVENT_KIND_GROUP_SYSTEM
+            && (message.plaintext.contains("member_left")
+                || message.plaintext.contains("member_removed"))
+    });
+    assert!(
+        has_departure_row,
+        "alice's timeline should contain a kind-1210 departure row; got {:?}",
+        alice_timeline.messages
+    );
+}
+
+#[tokio::test]
+async fn relay_app_runtime_synthesizes_system_row_for_own_invite() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    home.create_account("bob").unwrap();
+    home.create_account("carol").unwrap();
+
+    let (_relay, app, url) = mock_app(&dir).await;
+    let mut bob = app.client("bob").await.unwrap();
+    bob.publish_key_package().await.unwrap();
+    let mut carol = app.client("carol").await.unwrap();
+    carol.publish_key_package().await.unwrap();
+
+    let mut alice = app.client("alice").await.unwrap();
+    let group_id = alice.create_group("ops", &["bob"]).await.unwrap();
+
+    // Own action: alice invites carol post-creation. The confirmed commit
+    // synthesizes a kind-1210 member_added row in alice's own timeline.
+    alice.invite_members(&group_id, &["carol"]).await.unwrap();
+
+    let alice_timeline = MarmotApp::with_relay(dir.path(), url)
+        .timeline_messages_with_query(
+            "alice",
+            TimelineMessageQuery {
+                group_id_hex: Some(hex::encode(group_id.as_slice())),
+                ..TimelineMessageQuery::default()
+            },
+        )
+        .unwrap();
+    let has_added_row = alice_timeline.messages.iter().any(|message| {
+        message.kind == cgka_traits::app_event::MARMOT_APP_EVENT_KIND_GROUP_SYSTEM
+            && message.plaintext.contains("member_added")
+    });
+    assert!(
+        has_added_row,
+        "alice's own invite should synthesize a member_added row; got {:?}",
+        alice_timeline.messages
+    );
+}
+
+#[tokio::test]
+async fn relay_app_runtime_synthesizes_rows_for_multi_member_invite() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    home.create_account("bob").unwrap();
+    home.create_account("carol").unwrap();
+    home.create_account("dave").unwrap();
+
+    let (_relay, app, url) = mock_app(&dir).await;
+    for label in ["bob", "carol", "dave"] {
+        let mut client = app.client(label).await.unwrap();
+        client.publish_key_package().await.unwrap();
+    }
+
+    let mut alice = app.client("alice").await.unwrap();
+    let group_id = alice.create_group("ops", &["bob"]).await.unwrap();
+
+    // One commit invites two members, so two member_added rows must both persist
+    // — previously they collided on the unique source index and one was dropped.
+    alice
+        .invite_members(&group_id, &["carol", "dave"])
+        .await
+        .unwrap();
+
+    let alice_timeline = MarmotApp::with_relay(dir.path(), url)
+        .timeline_messages_with_query(
+            "alice",
+            TimelineMessageQuery {
+                group_id_hex: Some(hex::encode(group_id.as_slice())),
+                ..TimelineMessageQuery::default()
+            },
+        )
+        .unwrap();
+    let added_rows = alice_timeline
+        .messages
+        .iter()
+        .filter(|message| {
+            message.kind == cgka_traits::app_event::MARMOT_APP_EVENT_KIND_GROUP_SYSTEM
+                && message.plaintext.contains("member_added")
+        })
+        .count();
+    assert_eq!(
+        added_rows, 2,
+        "both invited members should get a row; got {:?}",
+        alice_timeline.messages
+    );
 }
 
 #[tokio::test]

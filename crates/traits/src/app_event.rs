@@ -37,6 +37,28 @@ pub const AGENT_OPERATION_TYPE_TAG: &str = "operation";
 pub const AGENT_OPERATION_NAME_TAG: &str = "operation-name";
 pub const AGENT_OPERATION_STATUS_TAG: &str = "operation-status";
 pub const GROUP_SYSTEM_TYPE_TAG: &str = "system";
+
+/// Current schema version for kind-1210 group system event content.
+pub const GROUP_SYSTEM_EVENT_VERSION: u8 = 1;
+
+/// `system_type` values for kind-1210 group system rows. Each names one
+/// authenticated group-state change a client renders as a durable system row,
+/// separate from chat. See `spec/foundation/application-messages.md`.
+pub const GROUP_SYSTEM_TYPE_MEMBER_ADDED: &str = "member_added";
+pub const GROUP_SYSTEM_TYPE_MEMBER_REMOVED: &str = "member_removed";
+pub const GROUP_SYSTEM_TYPE_MEMBER_LEFT: &str = "member_left";
+pub const GROUP_SYSTEM_TYPE_ADMIN_ADDED: &str = "admin_added";
+pub const GROUP_SYSTEM_TYPE_ADMIN_REMOVED: &str = "admin_removed";
+pub const GROUP_SYSTEM_TYPE_GROUP_RENAMED: &str = "group_renamed";
+pub const GROUP_SYSTEM_TYPE_GROUP_AVATAR_CHANGED: &str = "group_avatar_changed";
+
+/// Keys inside the kind-1210 `data` object. Values are lowercase-hex pubkeys
+/// (`actor`/`subject`) or a UTF-8 string (`name`), so renderers can resolve
+/// display names locally and localize the row.
+pub const GROUP_SYSTEM_DATA_ACTOR: &str = "actor";
+pub const GROUP_SYSTEM_DATA_SUBJECT: &str = "subject";
+pub const GROUP_SYSTEM_DATA_NAME: &str = "name";
+
 pub const STREAM_TAG: &str = "stream";
 pub const STREAM_TYPE_TAG: &str = "stream-type";
 pub const STREAM_FINAL_KIND_TAG: &str = "final-kind";
@@ -173,9 +195,77 @@ pub fn canonical_event_id(
     hex::encode(Sha256::digest(bytes))
 }
 
+/// Decoded body of a kind-1210 group system event (`content` JSON).
+///
+/// `text` is a human-readable fallback only; clients SHOULD render from
+/// `system_type` plus the structured `data` (hex pubkeys, names) so the row can
+/// be localized and re-resolved as display names change. Group system rows are
+/// durable UI/history facts, not chat bodies, and MUST NOT be rendered as a
+/// kind-9 chat message.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupSystemEvent {
+    pub v: u8,
+    pub system_type: String,
+    #[serde(default)]
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<Value>,
+}
+
+impl GroupSystemEvent {
+    /// Build a group system event at the current schema version.
+    pub fn new(
+        system_type: impl Into<String>,
+        text: impl Into<String>,
+        data: Option<Value>,
+    ) -> Self {
+        Self {
+            v: GROUP_SYSTEM_EVENT_VERSION,
+            system_type: system_type.into(),
+            text: text.into(),
+            data,
+        }
+    }
+
+    /// Serialize to the kind-1210 `content` JSON string. Returns an error rather
+    /// than swallowing a serialization failure into empty content.
+    pub fn to_content(&self) -> Result<String, MarmotAppEventError> {
+        serde_json::to_string(self).map_err(|err| MarmotAppEventError::Json(err.to_string()))
+    }
+
+    /// Parse a kind-1210 `content` JSON string.
+    pub fn parse(content: &str) -> Result<Self, MarmotAppEventError> {
+        serde_json::from_str(content).map_err(|err| MarmotAppEventError::Json(err.to_string()))
+    }
+
+    /// Read a hex/string field out of `data`.
+    pub fn data_str(&self, key: &str) -> Option<&str> {
+        self.data.as_ref()?.get(key).and_then(Value::as_str)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn group_system_event_round_trips() {
+        let event = GroupSystemEvent::new(
+            GROUP_SYSTEM_TYPE_MEMBER_ADDED,
+            "Member added",
+            Some(serde_json::json!({
+                GROUP_SYSTEM_DATA_ACTOR: "aa".repeat(32),
+                GROUP_SYSTEM_DATA_SUBJECT: "bb".repeat(32),
+            })),
+        );
+        let parsed = GroupSystemEvent::parse(&event.to_content().unwrap()).unwrap();
+        assert_eq!(parsed, event);
+        assert_eq!(parsed.v, GROUP_SYSTEM_EVENT_VERSION);
+        assert_eq!(
+            parsed.data_str(GROUP_SYSTEM_DATA_SUBJECT),
+            Some("bb".repeat(32).as_str())
+        );
+    }
 
     #[test]
     fn chat_event_round_trips_and_validates() {

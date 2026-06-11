@@ -9,6 +9,11 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Added
 
+- The TUI now renders kind-1210 group system rows as friendly lines (e.g. "alice added bob", "bob left",
+  "alice renamed the group") instead of raw JSON. These durable rows are synthesized locally from authenticated group
+  state changes (member added/removed/left, admin granted/revoked, group renamed, avatar changed) and appear inline in
+  message and timeline history.
+
 - Added `dm relay-stats`, which prints the device-local relay performance telemetry (aggregate lifecycle counters,
   cross-relay arrival spread, per-relay first-deliverer and first-event/EOSE timing, and redacted relay health). The
   command runs against the live `dmd` runtime when a daemon socket exists. Output is aggregate-only and uses opaque

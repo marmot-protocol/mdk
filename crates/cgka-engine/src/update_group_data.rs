@@ -3,8 +3,11 @@
 
 use crate::engine::Engine;
 use crate::provider::EngineOpenMlsProvider;
-use cgka_traits::app_components::{AppComponentData, GROUP_PROFILE_COMPONENT_ID};
-use cgka_traits::engine::SendResult;
+use cgka_traits::app_components::{
+    AppComponentData, GROUP_ADMIN_POLICY_COMPONENT_ID, GROUP_AVATAR_URL_COMPONENT_ID,
+    GROUP_BLOSSOM_IMAGE_COMPONENT_ID, GROUP_PROFILE_COMPONENT_ID,
+};
+use cgka_traits::engine::{GroupStateChange, SendResult};
 use cgka_traits::engine_state::{EpochState, StagedCommitHandle};
 use cgka_traits::error::EngineError;
 use cgka_traits::storage::StorageProvider;
@@ -92,6 +95,74 @@ impl<S: StorageProvider> Engine<S> {
         .map_err(|e| EngineError::Backend(format!("load: {e:?}")))?
         .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
         crate::app_components::require_admin(&mls_group, &group_id, self.identity.self_id())?;
+
+        // Diff the components being changed against the live (pre-commit) group
+        // so confirm_published can emit attributed GroupStateChanged events (and
+        // the app kind-1210 rows) once this own commit merges. `mls_group` still
+        // holds the BEFORE state here; `updates` carries the AFTER bytes.
+        let self_actor = Some(self.identity.self_id().clone());
+        let mut staged_changes: Vec<crate::engine::PendingGroupStateChange> = Vec::new();
+        let mut avatar_changed = false;
+        for update in &updates {
+            match update.component_id {
+                GROUP_ADMIN_POLICY_COMPONENT_ID => {
+                    let before =
+                        crate::app_components::admins_of_group(&mls_group).unwrap_or_default();
+                    let after = crate::app_components::decode_admin_policy(&update.data)
+                        .unwrap_or_default();
+                    for change in crate::group_state_changes::admin_changes(&before, &after) {
+                        staged_changes.push(crate::engine::PendingGroupStateChange {
+                            actor: self_actor.clone(),
+                            change,
+                        });
+                    }
+                }
+                GROUP_PROFILE_COMPONENT_ID => {
+                    let before = crate::app_components::group_profile_of_group(&mls_group)
+                        .ok()
+                        .flatten();
+                    let after = crate::app_components::decode_group_profile(&update.data).ok();
+                    let before_name = before.as_ref().map(|(name, _)| name.as_str()).unwrap_or("");
+                    let after_name = after.as_ref().map(|(name, _)| name.as_str()).unwrap_or("");
+                    if before_name != after_name {
+                        staged_changes.push(crate::engine::PendingGroupStateChange {
+                            actor: self_actor.clone(),
+                            change: GroupStateChange::GroupRenamed {
+                                name: after_name.to_owned(),
+                            },
+                        });
+                    }
+                }
+                GROUP_AVATAR_URL_COMPONENT_ID | GROUP_BLOSSOM_IMAGE_COMPONENT_ID => {
+                    let before = crate::app_components::app_component_data_of_group(
+                        &mls_group,
+                        update.component_id,
+                    );
+                    // Normalize presence so an absent component (`None`) and the
+                    // canonical "absent" encoding compare equal — otherwise
+                    // clearing an already-absent avatar would emit a bogus row.
+                    let before_present = before.as_deref().is_some_and(|bytes| {
+                        crate::app_components::avatar_component_present(update.component_id, bytes)
+                    });
+                    let after_present = crate::app_components::avatar_component_present(
+                        update.component_id,
+                        &update.data,
+                    );
+                    if before_present != after_present
+                        || (after_present && before.as_deref() != Some(update.data.as_slice()))
+                    {
+                        avatar_changed = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if avatar_changed {
+            staged_changes.push(crate::engine::PendingGroupStateChange {
+                actor: self_actor.clone(),
+                change: GroupStateChange::GroupAvatarChanged,
+            });
+        }
 
         // Fork-detection bookkeeping (pre-stage epoch is the commit
         // origin).
@@ -217,6 +288,10 @@ impl<S: StorageProvider> Engine<S> {
             &commit_bytes,
             recovery_snapshot,
         );
+        if !staged_changes.is_empty() {
+            self.pending_state_changes
+                .insert(pending_ref, staged_changes);
+        }
 
         Ok(SendResult::GroupEvolution {
             msg: wrapped,

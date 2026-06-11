@@ -14,7 +14,8 @@ use async_trait::async_trait;
 use cgka_traits::app_components::{AppComponentId, AppComponentSet, default_group_components};
 use cgka_traits::capabilities::{Feature, FeatureStatus, GroupCapabilities};
 use cgka_traits::engine::{
-    AutoPublish, CgkaEngine, CreateGroupRequest, GroupEvent, KeyPackage, SendIntent, SendResult,
+    AutoPublish, CgkaEngine, CreateGroupRequest, GroupEvent, GroupStateChange, KeyPackage,
+    SendIntent, SendResult,
 };
 use cgka_traits::engine_state::PendingStateRef;
 use cgka_traits::error::EngineError;
@@ -41,6 +42,16 @@ pub const DEFAULT_CIPHERSUITE: Ciphersuite =
     Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
 
 /// OpenMLS-backed CGKA engine. Construct via [`EngineBuilder`].
+/// A group-state change effected by a locally staged commit, buffered until
+/// publish confirmation merges that commit. `actor` attributes the change: for
+/// our own invite/remove/profile commits it is the local member; for an
+/// auto-committed peer SelfRemove it is the leaving member, not us.
+#[derive(Clone)]
+pub(crate) struct PendingGroupStateChange {
+    pub(crate) actor: Option<MemberId>,
+    pub(crate) change: GroupStateChange,
+}
+
 pub struct Engine<S: StorageProvider> {
     pub(crate) storage: S,
     pub(crate) crypto: RustCrypto,
@@ -60,10 +71,12 @@ pub struct Engine<S: StorageProvider> {
 
     pub(crate) events_buf: VecDeque<GroupEvent>,
     pub(crate) auto_publish_buf: VecDeque<AutoPublish>,
-    /// Members removed by a locally staged commit. The event is emitted after
-    /// publish confirmation, when the OpenMLS pending commit is actually
-    /// merged.
-    pub(crate) pending_auto_removed: HashMap<PendingStateRef, Vec<MemberId>>,
+    /// Group-state changes effected by a locally staged commit, with the actor
+    /// to attribute each to. Buffered here because publish-before-apply defers
+    /// the OpenMLS merge: the `GroupEvent::GroupStateChanged` events are emitted
+    /// in `do_confirm_published`, once the pending commit is actually merged,
+    /// and dropped in `do_publish_failed`.
+    pub(crate) pending_state_changes: HashMap<PendingStateRef, Vec<PendingGroupStateChange>>,
 
     /// MessageIds the engine has ingested. Backs `StaleReason::AlreadySeen`.
     pub(crate) seen_message_ids: HashSet<MessageId>,
@@ -216,7 +229,7 @@ impl<S: StorageProvider> EngineBuilder<S> {
             fork_recovery: crate::fork_recovery::ForkRecoveryManager::default(),
             events_buf: VecDeque::new(),
             auto_publish_buf: VecDeque::new(),
-            pending_auto_removed: HashMap::new(),
+            pending_state_changes: HashMap::new(),
             seen_message_ids: HashSet::new(),
             sent_message_ids: HashSet::new(),
             convergence_policy: crate::canonicalization::CanonicalizationPolicy::default(),

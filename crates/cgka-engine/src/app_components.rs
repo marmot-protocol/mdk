@@ -486,6 +486,40 @@ fn validate_group_image(bytes: &[u8]) -> Result<(), EngineError> {
     Ok(())
 }
 
+/// Whether avatar/image component bytes encode a *present* avatar. An empty
+/// avatar-url or an all-empty blossom-image is the canonical "absent" encoding
+/// (see `encode_group_avatar_url_v1`) and is equivalent to the component being
+/// missing entirely. Unparseable bytes are treated as present (conservative:
+/// surface a change rather than silently drop one).
+pub(crate) fn avatar_component_present(component_id: AppComponentId, bytes: &[u8]) -> bool {
+    match component_id {
+        GROUP_AVATAR_URL_COMPONENT_ID => {
+            decode_group_avatar_url_v1(bytes).map_or(true, |avatar| !avatar.url.is_empty())
+        }
+        GROUP_BLOSSOM_IMAGE_COMPONENT_ID => group_image_present(bytes),
+        _ => true,
+    }
+}
+
+fn group_image_present(bytes: &[u8]) -> bool {
+    let mut cursor = bytes;
+    let mut next = |max, label| decode_var_bytes(&mut cursor, max, label).ok();
+    let (Some(hash), Some(key), Some(nonce), Some(upload_key), Some(media_type)) = (
+        next(32, "group image hash"),
+        next(32, "group image key"),
+        next(12, "group image nonce"),
+        next(32, "group image upload key"),
+        next(128, "group image media type"),
+    ) else {
+        return true;
+    };
+    !hash.is_empty()
+        || !key.is_empty()
+        || !nonce.is_empty()
+        || !upload_key.is_empty()
+        || !media_type.is_empty()
+}
+
 fn validate_message_retention(bytes: &[u8]) -> Result<(), EngineError> {
     if bytes.len() != 8 {
         return Err(EngineError::Serialize(format!(

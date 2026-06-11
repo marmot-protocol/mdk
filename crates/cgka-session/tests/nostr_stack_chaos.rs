@@ -858,10 +858,11 @@ fn assert_invite_commit_processed(
     )));
     assert!(effects.effects.events.iter().any(|event| matches!(
         event,
-        GroupEvent::MemberAdded {
+        GroupEvent::GroupStateChanged {
             group_id: changed_group,
-            member,
-        } if changed_group == group_id && &member.id == added_member
+            change: cgka_traits::engine::GroupStateChange::MemberAdded { member },
+            ..
+        } if changed_group == group_id && member == added_member
     )));
 }
 

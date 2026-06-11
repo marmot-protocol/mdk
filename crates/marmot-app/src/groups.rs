@@ -842,8 +842,7 @@ pub(crate) fn event_group_id(event: &GroupEvent) -> Option<&GroupId> {
         | GroupEvent::GroupJoined { group_id, .. }
         | GroupEvent::MessageReceived { group_id, .. }
         | GroupEvent::AppMessageInvalidated { group_id, .. }
-        | GroupEvent::MemberAdded { group_id, .. }
-        | GroupEvent::MemberRemoved { group_id, .. }
+        | GroupEvent::GroupStateChanged { group_id, .. }
         | GroupEvent::EpochChanged { group_id, .. }
         | GroupEvent::ForkRecovered { group_id, .. }
         | GroupEvent::GroupUnrecoverable { group_id } => Some(group_id),

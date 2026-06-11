@@ -12,7 +12,7 @@ use crate::openmls_projection::{
     apply_openmls_canonicalization_result, canonicalize_stored_openmls_messages,
     project_mls_message, retain_current_group_epoch_snapshot,
 };
-use cgka_traits::engine::{AppMessageInvalidationReason, GroupEvent};
+use cgka_traits::engine::{AppMessageInvalidationReason, GroupEvent, GroupStateChange};
 use cgka_traits::message::{MessageRecord, MessageState, StoredMessagePayload};
 use cgka_traits::storage::{StorageError, StorageProvider};
 use cgka_traits::transport::TransportMessage;
@@ -295,19 +295,29 @@ impl<S: StorageProvider> Engine<S> {
             .map(|member| member.id.clone())
             .collect();
 
+        // Convergence reorg: we reach the canonical branch by replaying stored
+        // commits, so the committer that effected each membership delta is not
+        // resolved cheaply here. Emit the change unattributed (`actor: None`);
+        // the row still renders ("X was added") without a "by Y".
         for member in current_group.members {
             if !previous_ids.contains(&member.id) {
-                self.events_buf.push_back(GroupEvent::MemberAdded {
-                    group_id: group_id.clone(),
-                    member,
-                });
+                self.push_group_state_change(
+                    group_id,
+                    selected_tip,
+                    None,
+                    GroupStateChange::MemberAdded { member: member.id },
+                );
             }
         }
         for member_id in previous_ids.difference(&current_ids) {
-            self.events_buf.push_back(GroupEvent::MemberRemoved {
-                group_id: group_id.clone(),
-                member: member_id.clone(),
-            });
+            self.push_group_state_change(
+                group_id,
+                selected_tip,
+                None,
+                GroupStateChange::MemberRemoved {
+                    member: member_id.clone(),
+                },
+            );
         }
 
         Ok(())

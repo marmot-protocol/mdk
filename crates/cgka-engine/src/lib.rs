@@ -49,6 +49,7 @@ pub mod feature_registry;
 pub mod fork_recovery;
 pub mod group_context_view;
 pub mod group_lifecycle;
+pub mod group_state_changes;
 pub mod identity;
 pub mod key_package;
 pub mod message_processor;

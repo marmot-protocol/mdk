@@ -236,6 +236,31 @@ impl PartialOrd for CommitOrderingKey {
     }
 }
 
+/// A specific, MLS-authenticated change to durable group state, carried by
+/// [`GroupEvent::GroupStateChanged`]. Each variant maps to one renderable
+/// group system row (inner kind 1210). The `member` carried by the member /
+/// admin variants is the **subject** of the change, not the actor — the actor
+/// (committer) travels alongside on [`GroupEvent::GroupStateChanged`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GroupStateChange {
+    /// `member` was added to the group (by `actor`).
+    MemberAdded { member: MemberId },
+    /// `member` was removed from the group by another member (admin action).
+    MemberRemoved { member: MemberId },
+    /// `member` removed themselves via a SelfRemove proposal. For this variant
+    /// the subject and the originating actor are the same member, regardless of
+    /// which member sequenced the auto-commit.
+    MemberLeft { member: MemberId },
+    /// `member` was granted group admin.
+    AdminAdded { member: MemberId },
+    /// `member`'s group admin was revoked.
+    AdminRemoved { member: MemberId },
+    /// The group display name changed to `name`.
+    GroupRenamed { name: String },
+    /// The group avatar/image changed (avatar-url or blossom-image component).
+    GroupAvatarChanged,
+}
+
 /// Ordered, decrypted output the application should render / act on.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GroupEvent {
@@ -260,13 +285,21 @@ pub enum GroupEvent {
         reason: AppMessageInvalidationReason,
         decrypted_payload_ref: Option<String>,
     },
-    MemberAdded {
+    /// A durable, MLS-authenticated change to group state that the application
+    /// SHOULD surface as a group system row (inner kind 1210). Synthesized
+    /// locally on each client that applies the change, so the row is derived
+    /// from authenticated state rather than a separately delivered message.
+    /// `actor` is the committing member, when attributable (it is `None` for
+    /// changes applied through a convergence reorg, where the committer cannot
+    /// be resolved cheaply).
+    GroupStateChanged {
         group_id: GroupId,
-        member: Member,
-    },
-    MemberRemoved {
-        group_id: GroupId,
-        member: MemberId,
+        /// The epoch the group reached when this change was applied. Used as the
+        /// synthesized system row's timeline sort key so it interleaves with
+        /// chat correctly.
+        epoch: EpochId,
+        actor: Option<MemberId>,
+        change: GroupStateChange,
     },
     EpochChanged {
         group_id: GroupId,

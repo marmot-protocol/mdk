@@ -2788,10 +2788,14 @@ fn parse_message(value: &Value) -> Option<MessageRow> {
     {
         return None;
     }
-    let display_text = value
-        .get("agent_text_stream")
-        .and_then(agent_text_stream_summary)
-        .unwrap_or_else(|| plaintext.clone());
+    let display_text = if value.get("kind").and_then(Value::as_u64) == Some(GROUP_SYSTEM_KIND) {
+        group_system_summary(value, &plaintext).unwrap_or_else(|| plaintext.clone())
+    } else {
+        value
+            .get("agent_text_stream")
+            .and_then(agent_text_stream_summary)
+            .unwrap_or_else(|| plaintext.clone())
+    };
     Some(MessageRow {
         message_id: value_string(value, "message_id").unwrap_or_default(),
         direction: value_string(value, "direction").unwrap_or_else(|| "received".to_owned()),
@@ -2830,6 +2834,56 @@ fn cap_message_scrollback(messages: &mut Vec<MessageRow>) {
     }
     let excess = messages.len() - TUI_MESSAGE_SCROLLBACK_LIMIT;
     messages.drain(0..excess);
+}
+
+/// Inner app-event kind for durable group system rows (membership/admin/profile).
+const GROUP_SYSTEM_KIND: u64 = 1210;
+
+/// Friendly one-line rendering of a kind-1210 group system row from its JSON
+/// content, e.g. "alice added bob". Falls back to the embedded `text` field, or
+/// `None` when the content is not a parseable group system event.
+fn group_system_summary(value: &Value, plaintext: &str) -> Option<String> {
+    let content: Value = serde_json::from_str(plaintext).ok()?;
+    let system_type = content.get("system_type").and_then(Value::as_str)?;
+    let data = content.get("data");
+    // `actor` is absent for unattributed changes (e.g. a convergence reorg,
+    // where the committer isn't resolved). Render the passive voice then rather
+    // than implying an unknown actor performed the action.
+    let actor = non_empty_value_string(value, "from_display_name").or_else(|| {
+        value_string(value, "from")
+            .filter(|from| !from.is_empty())
+            .map(|from| shorten(&from, 12))
+    });
+    let subject = data
+        .and_then(|data| data.get("subject"))
+        .and_then(Value::as_str)
+        .map_or_else(|| "someone".to_owned(), |subject| shorten(subject, 12));
+    let name = data
+        .and_then(|data| data.get("name"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let summary = match (system_type, actor.as_deref()) {
+        ("member_added", Some(actor)) => format!("{actor} added {subject}"),
+        ("member_added", None) => format!("{subject} was added"),
+        ("member_removed", Some(actor)) => format!("{actor} removed {subject}"),
+        ("member_removed", None) => format!("{subject} was removed"),
+        ("member_left", Some(actor)) => format!("{actor} left"),
+        ("member_left", None) => format!("{subject} left"),
+        ("admin_added", Some(actor)) => format!("{actor} made {subject} an admin"),
+        ("admin_added", None) => format!("{subject} was made an admin"),
+        ("admin_removed", Some(actor)) => format!("{actor} removed {subject} as admin"),
+        ("admin_removed", None) => format!("{subject} is no longer an admin"),
+        ("group_renamed", Some(actor)) => format!("{actor} renamed the group to \"{name}\""),
+        ("group_renamed", None) => format!("the group was renamed to \"{name}\""),
+        ("group_avatar_changed", Some(actor)) => format!("{actor} changed the group avatar"),
+        ("group_avatar_changed", None) => "the group avatar changed".to_owned(),
+        _ => content
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or(system_type)
+            .to_owned(),
+    };
+    Some(summary)
 }
 
 fn agent_text_stream_summary(value: &Value) -> Option<String> {
@@ -3807,6 +3861,114 @@ fn message_subscription_args() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn system_value(from: &str, from_display_name: Option<&str>) -> Value {
+        let mut value = serde_json::json!({ "from": from });
+        if let Some(name) = from_display_name {
+            value["from_display_name"] = Value::String(name.to_owned());
+        }
+        value
+    }
+
+    #[test]
+    fn group_system_summary_formats_known_types() {
+        let value = system_value(&"aa".repeat(32), Some("alice"));
+        let added = r#"{"v":1,"system_type":"member_added","text":"Member added","data":{"subject":"bbbbbbbb"}}"#;
+        assert_eq!(
+            group_system_summary(&value, added).as_deref(),
+            Some("alice added bbbbbbbb")
+        );
+
+        let left = r#"{"v":1,"system_type":"member_left","text":"Member left","data":{}}"#;
+        assert_eq!(
+            group_system_summary(&value, left).as_deref(),
+            Some("alice left")
+        );
+
+        let admin = r#"{"v":1,"system_type":"admin_added","text":"Admin added","data":{"subject":"bbbbbbbb"}}"#;
+        assert_eq!(
+            group_system_summary(&value, admin).as_deref(),
+            Some("alice made bbbbbbbb an admin")
+        );
+
+        let renamed =
+            r#"{"v":1,"system_type":"group_renamed","text":"Group renamed","data":{"name":"ops"}}"#;
+        assert_eq!(
+            group_system_summary(&value, renamed).as_deref(),
+            Some("alice renamed the group to \"ops\"")
+        );
+
+        let avatar =
+            r#"{"v":1,"system_type":"group_avatar_changed","text":"Group avatar changed"}"#;
+        assert_eq!(
+            group_system_summary(&value, avatar).as_deref(),
+            Some("alice changed the group avatar")
+        );
+    }
+
+    #[test]
+    fn group_system_summary_falls_back_for_unknown_type() {
+        let value = system_value(&"aa".repeat(32), Some("alice"));
+        let with_text = r#"{"v":1,"system_type":"mystery","text":"Something happened","data":{}}"#;
+        assert_eq!(
+            group_system_summary(&value, with_text).as_deref(),
+            Some("Something happened")
+        );
+        // Unknown type with no text falls back to the system_type string.
+        let bare = r#"{"v":1,"system_type":"mystery"}"#;
+        assert_eq!(
+            group_system_summary(&value, bare).as_deref(),
+            Some("mystery")
+        );
+    }
+
+    #[test]
+    fn group_system_summary_handles_missing_actor_and_subject() {
+        // No display name: actor falls back to the shortened "from" pubkey, and a
+        // missing subject renders as "someone".
+        let value = serde_json::json!({ "from": "aa".repeat(32) });
+        let added = r#"{"v":1,"system_type":"member_added","data":{}}"#;
+        let summary = group_system_summary(&value, added).unwrap();
+        assert!(summary.ends_with("added someone"), "got {summary}");
+        assert!(
+            !summary.starts_with("someone"),
+            "actor should be the pubkey"
+        );
+    }
+
+    #[test]
+    fn group_system_summary_renders_passive_for_unattributed() {
+        // An unattributed row (convergence reorg) has an empty `from` and no
+        // display name; render the passive voice instead of fabricating an actor.
+        let value = serde_json::json!({ "from": "" });
+        let added = r#"{"v":1,"system_type":"member_added","data":{"subject":"bbbbbbbb"}}"#;
+        assert_eq!(
+            group_system_summary(&value, added).as_deref(),
+            Some("bbbbbbbb was added")
+        );
+
+        let removed = r#"{"v":1,"system_type":"member_removed","data":{"subject":"bbbbbbbb"}}"#;
+        assert_eq!(
+            group_system_summary(&value, removed).as_deref(),
+            Some("bbbbbbbb was removed")
+        );
+
+        let renamed = r#"{"v":1,"system_type":"group_renamed","data":{"name":"ops"}}"#;
+        assert_eq!(
+            group_system_summary(&value, renamed).as_deref(),
+            Some("the group was renamed to \"ops\"")
+        );
+    }
+
+    #[test]
+    fn group_system_summary_rejects_non_system_content() {
+        let value = system_value(&"aa".repeat(32), Some("alice"));
+        assert_eq!(group_system_summary(&value, "not json"), None);
+        assert_eq!(
+            group_system_summary(&value, r#"{"text":"no system_type"}"#),
+            None
+        );
+    }
 
     #[test]
     fn slash_command_parser_understands_core_commands() {

@@ -142,12 +142,14 @@ impl<S: StorageProvider> Engine<S> {
             _ => unreachable!("confirm only emits create/evolution events"),
         };
         self.events_buf.push_back(event.clone());
-        if let Some(removed) = self.pending_auto_removed.remove(&pending) {
-            for member in removed {
-                self.events_buf.push_back(GroupEvent::MemberRemoved {
-                    group_id: replay_group_id.clone(),
-                    member,
-                });
+        if let Some(changes) = self.pending_state_changes.remove(&pending) {
+            for pending_change in changes {
+                self.push_group_state_change(
+                    &replay_group_id,
+                    new_epoch,
+                    pending_change.actor,
+                    pending_change.change,
+                );
             }
         }
         self.replay_buffered_messages(&replay_group_id).await?;
@@ -208,7 +210,7 @@ impl<S: StorageProvider> Engine<S> {
                 crate::audit_helpers::pending_kind_str(kind),
             ),
         );
-        self.pending_auto_removed.remove(&pending);
+        self.pending_state_changes.remove(&pending);
         self.forget_pending_commit_for_recovery(pending)?;
         self.replay_buffered_messages(&group_id).await?;
         Ok(())

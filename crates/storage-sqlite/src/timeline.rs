@@ -314,6 +314,10 @@ impl SqliteAccountStorage {
     ) -> StorageResult<Option<TimelineProjectionUpdate>> {
         let mut conn = self.lock()?;
         let tx = conn.transaction().storage()?;
+        // A non-null `source_message_id_hex` is unique (partial index in
+        // 0004_app_timeline.rs), and `message_id_hex` is unique per group, so a
+        // lookup resolves to at most one row. (Synthesized group system rows
+        // deliberately carry a null source for exactly this reason.)
         let row: Option<(String, String, u64, Vec<Vec<String>>)> = tx
             .query_row(select_sql, params![lookup_id_hex], |row| {
                 let kind = row.get::<_, i64>(2)?.try_into().unwrap_or_default();
@@ -1486,6 +1490,24 @@ mod tests {
         }
     }
 
+    fn group_system(id: &str, system_type: &str, at: u64) -> StoredAppEvent {
+        StoredAppEvent {
+            group_id_hex: "11".repeat(32),
+            message_id_hex: id.to_owned(),
+            // Synthesized group system rows carry a null source so several rows
+            // from one commit don't collide on the partial unique source index.
+            source_message_id_hex: None,
+            source_epoch: None,
+            direction: "system".to_owned(),
+            sender: "alice".to_owned(),
+            plaintext: format!(r#"{{"v":1,"system_type":"{system_type}","text":"","data":{{}}}}"#),
+            kind: MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
+            tags: vec![vec!["system".to_owned(), system_type.to_owned()]],
+            recorded_at: at,
+            received_at: at,
+        }
+    }
+
     fn list(store: &SqliteAccountStorage) -> Vec<TimelineMessageRecord> {
         store
             .message_timeline(TimelineMessageQuery {
@@ -1960,6 +1982,30 @@ mod tests {
         let rows = list(&store);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].invalidation_status.as_deref(), Some("BeyondAnchor"));
+    }
+
+    #[test]
+    fn multiple_group_system_rows_from_one_commit_coexist() {
+        // A single commit can synthesize several kind-1210 rows (e.g. inviting
+        // two members). They carry a null source, so they all persist instead of
+        // colliding on the partial unique `source_message_id_hex` index.
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        store
+            .record_app_event(&group_system("sys-added-1", "member_added", 1))
+            .unwrap();
+        store
+            .record_app_event(&group_system("sys-added-2", "member_added", 1))
+            .unwrap();
+        store
+            .record_app_event(&group_system("sys-admin", "admin_added", 1))
+            .unwrap();
+
+        let rows = list(&store);
+        assert_eq!(rows.len(), 3);
+        assert!(
+            rows.iter()
+                .all(|row| row.kind == MARMOT_APP_EVENT_KIND_GROUP_SYSTEM)
+        );
     }
 
     #[test]
