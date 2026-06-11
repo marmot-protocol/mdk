@@ -45,14 +45,14 @@ use crate::{
     AccountRelayListBootstrap, AccountRelayListStatus, AgentOperationEventRequest,
     AgentTextStreamFinishRequest, AppBlobEndpoint, AppError, AppGroupMemberRecord,
     AppGroupMlsState, AppGroupRecord, AppMessageQuery, AppMessageRecord, AppProjectionUpdate,
-    AuditLogFile, AuditLogSettings, AuditLogTrackerConfig, AuditLogTrackerUpdateResult,
-    AuditLogUploadResult, BackgroundNotificationCollection, ChatListRow, GroupInviteDeclineResult,
-    GroupPushDebugInfo, MarmotApp, MarmotRelayPlane, MarmotServiceEndpoints,
-    MediaAttachmentReference, MediaDownloadResult, MediaUploadRequest, MediaUploadResult,
-    NotificationCollectionStatus, NotificationSettings, NotificationUpdate, NotificationWakeSource,
-    PushPlatform, PushRegistration, ReceivedMessage, RelayTelemetryExportConfig,
-    RelayTelemetryRuntimeConfig, RelayTelemetrySettings, SendSummary, SyncSummary,
-    TimelineMessageChange, TimelineMessageQuery, TimelinePage, TimelineUpdateTrigger,
+    AuditLogDeleteOutcome, AuditLogFile, AuditLogSettings, AuditLogTrackerConfig,
+    AuditLogTrackerUpdateResult, AuditLogUploadResult, BackgroundNotificationCollection,
+    ChatListRow, GroupInviteDeclineResult, GroupPushDebugInfo, MarmotApp, MarmotRelayPlane,
+    MarmotServiceEndpoints, MediaAttachmentReference, MediaDownloadResult, MediaUploadRequest,
+    MediaUploadResult, NotificationCollectionStatus, NotificationSettings, NotificationUpdate,
+    NotificationWakeSource, PushPlatform, PushRegistration, ReceivedMessage,
+    RelayTelemetryExportConfig, RelayTelemetryRuntimeConfig, RelayTelemetrySettings, SendSummary,
+    SyncSummary, TimelineMessageChange, TimelineMessageQuery, TimelinePage, TimelineUpdateTrigger,
     UserDirectoryRefresh, UserProfileMetadata, default_profile_pseudonym, unix_now_seconds,
 };
 
@@ -795,6 +795,14 @@ enum AccountWorkerCommand {
     RemovePushRegistration {
         registration: PushRegistration,
         respond: oneshot::Sender<Result<usize, AppError>>,
+    },
+    DeleteAuditLog {
+        path: std::path::PathBuf,
+        respond: oneshot::Sender<Result<bool, AppError>>,
+    },
+    SetAuditRecording {
+        enabled: bool,
+        respond: oneshot::Sender<Result<(), AppError>>,
     },
 }
 
@@ -2464,11 +2472,26 @@ impl MarmotAppRuntime {
         self.accounts.app.audit_log_settings()
     }
 
-    pub fn set_audit_log_settings(
+    /// Persist the local forensic audit-logging switch and apply it to any
+    /// already-running sessions in place (no reopen): enabling installs a live
+    /// recorder, disabling swaps in a no-op recorder and closes the file.
+    pub async fn set_audit_log_settings(
         &self,
         settings: AuditLogSettings,
     ) -> Result<AuditLogSettings, AppError> {
-        self.accounts.app.set_audit_log_settings(settings)
+        let previously_enabled = self
+            .accounts
+            .app
+            .audit_log_settings()
+            .ok()
+            .map(|settings| settings.enabled);
+        let stored = self.accounts.app.set_audit_log_settings(settings)?;
+        if previously_enabled != Some(stored.enabled) {
+            self.accounts
+                .apply_audit_recording_to_workers(stored.enabled)
+                .await;
+        }
+        Ok(stored)
     }
 
     pub fn audit_log_files(&self) -> Result<Vec<AuditLogFile>, AppError> {
@@ -2497,6 +2520,16 @@ impl MarmotAppRuntime {
     ) -> Result<AuditLogTrackerUpdateResult, AppError> {
         let config = self.shared.audit_log_tracker_config();
         post_audit_log_tracker_update_for_app(&self.accounts.app, config).await
+    }
+
+    /// Delete one local JSONL audit log file. When a session for the file's
+    /// account is live and audit logging is on, the recorder rotates to a fresh
+    /// file and keeps recording; otherwise the file is simply removed.
+    pub async fn delete_audit_log_file(
+        &self,
+        path: &str,
+    ) -> Result<AuditLogDeleteOutcome, AppError> {
+        self.accounts.delete_audit_log_file(path).await
     }
 
     pub fn set_local_notifications_enabled(
@@ -4102,6 +4135,84 @@ impl AccountManager {
         account_worker_response(response).await
     }
 
+    /// Delete one local JSONL audit log file.
+    ///
+    /// If the owning account has a running worker whose live recorder is
+    /// appending to this exact file, the recorder is rotated — the file is
+    /// deleted and a fresh one is reopened — so the held file handle is never
+    /// orphaned and (when audit logging is on) recording continues. Otherwise
+    /// the file is removed directly. The returned outcome reports whether
+    /// recording continues into a fresh file.
+    pub async fn delete_audit_log_file(
+        &self,
+        path: &str,
+    ) -> Result<AuditLogDeleteOutcome, AppError> {
+        let (path, owner_account_id_hex) = self.app.resolve_audit_log_path(path)?;
+        if let Some(account_id_hex) = owner_account_id_hex {
+            let commands = {
+                let workers = self.workers.lock().await;
+                workers
+                    .get(&account_id_hex)
+                    .map(|worker| worker.commands.clone())
+            };
+            if let Some(commands) = commands {
+                let (respond, response) = oneshot::channel();
+                // A send error means the worker channel is closed, so its
+                // session — and thus any file handle — is gone; fall through to
+                // a direct removal, which is then safe.
+                if commands
+                    .send(AccountWorkerCommand::DeleteAuditLog {
+                        path: path.clone(),
+                        respond,
+                    })
+                    .await
+                    .is_ok()
+                    && account_worker_response(response).await?
+                {
+                    // The live recorder owned this file and rotated it: old
+                    // file gone, fresh file already recording.
+                    return Ok(AuditLogDeleteOutcome {
+                        still_recording: true,
+                    });
+                }
+                // Otherwise the worker's recorder does not append here (audit
+                // logging off, or a stale file): fall through to a direct
+                // removal below.
+            }
+        }
+        self.app.remove_audit_log_file(&path)?;
+        Ok(AuditLogDeleteOutcome {
+            still_recording: false,
+        })
+    }
+
+    /// Apply the audit-logging switch to every running account worker by
+    /// hot-swapping its recorder in place.
+    ///
+    /// Best-effort: workers that are not running pick the setting up at their
+    /// next open, and per-worker send/response failures are ignored (the
+    /// recorder is a non-fatal debug aid). The global flag is already persisted
+    /// by the caller; this only updates live sessions.
+    async fn apply_audit_recording_to_workers(&self, enabled: bool) {
+        let commands = {
+            let workers = self.workers.lock().await;
+            workers
+                .values()
+                .map(|worker| worker.commands.clone())
+                .collect::<Vec<_>>()
+        };
+        for command in commands {
+            let (respond, response) = oneshot::channel();
+            if command
+                .send(AccountWorkerCommand::SetAuditRecording { enabled, respond })
+                .await
+                .is_ok()
+            {
+                let _ = response.await;
+            }
+        }
+    }
+
     pub async fn account_key_packages(
         &self,
         account_ref: &str,
@@ -4920,6 +5031,14 @@ async fn run_app_runtime_account_worker(
                     }) => {
                         let result = client.remove_push_registration(registration).await;
                         let _ = respond.send(result);
+                    }
+                    Some(AccountWorkerCommand::DeleteAuditLog { path, respond }) => {
+                        let result = client.rotate_audit_log_if_active(&path);
+                        let _ = respond.send(result);
+                    }
+                    Some(AccountWorkerCommand::SetAuditRecording { enabled, respond }) => {
+                        client.set_audit_recording(enabled);
+                        let _ = respond.send(Ok(()));
                     }
                     None => return,
                 }

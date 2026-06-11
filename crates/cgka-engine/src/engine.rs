@@ -476,6 +476,26 @@ impl<S: StorageProvider> Engine<S> {
         });
     }
 
+    /// Filesystem path the installed forensic recorder appends to, if it is
+    /// file-backed. `None` for the default [`NoopRecorder`].
+    pub fn audit_recorder_path(&self) -> Option<std::path::PathBuf> {
+        self.recorder.audit_log_path()
+    }
+
+    /// Rotate the installed forensic recorder: discard its current file and
+    /// begin a fresh one, then keep recording. No-op for non-file recorders.
+    pub fn rotate_audit_recorder(&self) -> std::io::Result<()> {
+        self.recorder.rotate()
+    }
+
+    /// Replace the installed forensic recorder on a live engine. Dropping the
+    /// prior recorder flushes and closes any file it held. Used to start or
+    /// stop audit logging in place when the audit switch is toggled, without
+    /// rebuilding the engine. Pass [`NoopRecorder`] to stop recording.
+    pub fn set_recorder(&mut self, recorder: Box<dyn ForensicRecorder>) {
+        self.recorder = recorder;
+    }
+
     pub(crate) fn next_audit_operation_id(&mut self) -> String {
         let id = self.audit_operation_counter;
         self.audit_operation_counter = self.audit_operation_counter.wrapping_add(1);

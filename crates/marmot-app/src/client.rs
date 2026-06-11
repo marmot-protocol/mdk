@@ -955,6 +955,36 @@ impl AppClient {
         Ok(update)
     }
 
+    /// Apply the audit-logging switch to this live session by swapping the
+    /// recorder in place: a file-backed recorder when `enabled`, or a no-op
+    /// recorder when off. Dropping the prior recorder flushes and closes any
+    /// file it held, so no session reopen is required.
+    pub(crate) fn set_audit_recording(&mut self, enabled: bool) {
+        let recorder = self.app.build_audit_recorder(&self.state.label, enabled);
+        self.runtime.session_mut().set_audit_recorder(recorder);
+    }
+
+    /// Rotate the live forensic recorder iff it is the one appending to
+    /// `path`, returning whether a rotation happened.
+    ///
+    /// Returns `true` only when this session holds a file-backed recorder
+    /// writing exactly `path`: in that case the recorder deletes the file and
+    /// reopens a fresh one, so the held handle is never orphaned and recording
+    /// continues. Returns `false` when no recorder is installed (audit logging
+    /// off) or it appends elsewhere (e.g. a stale file with a different engine
+    /// id), leaving the caller to delete `path` directly.
+    pub(crate) fn rotate_audit_log_if_active(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<bool, AppError> {
+        if self.runtime.session().audit_log_path().as_deref() == Some(path) {
+            self.runtime.session().rotate_audit_log()?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
     pub(crate) async fn share_push_registration(&mut self) -> Result<usize, AppError> {
         let account = self.app.account_home().account(&self.state.label)?;
         let settings = self.app.notification_settings(&account.label)?;

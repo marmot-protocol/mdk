@@ -524,6 +524,28 @@ impl AccountDeviceSession {
         self.engine.audit_recorder_health();
     }
 
+    /// Path of the active forensic audit log, if a file-backed recorder is
+    /// installed on this session. `None` when audit logging is off (the
+    /// engine uses the no-op recorder).
+    pub fn audit_log_path(&self) -> Option<std::path::PathBuf> {
+        self.engine.audit_recorder_path()
+    }
+
+    /// Rotate the forensic audit log: discard the current file and begin a
+    /// fresh one, continuing to record from that point. No-op when no
+    /// file-backed recorder is installed.
+    pub fn rotate_audit_log(&self) -> std::io::Result<()> {
+        self.engine.rotate_audit_recorder()
+    }
+
+    /// Install or replace the forensic recorder on the live engine, e.g. when
+    /// the audit-logging switch is toggled. Pass a `NoopRecorder` to stop
+    /// recording; dropping the prior recorder flushes and closes any file it
+    /// held, so no session reopen is required.
+    pub fn set_audit_recorder(&mut self, recorder: Box<dyn ForensicRecorder>) {
+        self.engine.set_recorder(recorder);
+    }
+
     fn collect_effects(&mut self, results: Vec<SendResult>) -> SessionEffects {
         let mut effects = SessionEffects {
             events: self.engine.drain_events(),

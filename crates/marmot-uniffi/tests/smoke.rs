@@ -413,8 +413,8 @@ async fn relay_telemetry_settings_binding_round_trips() {
     );
 }
 
-#[test]
-fn audit_log_settings_binding_round_trips() {
+#[tokio::test]
+async fn audit_log_settings_binding_round_trips() {
     install_mock_keyring();
     let tmp = tempfile::tempdir().expect("tempdir");
     let kit = Marmot::new(
@@ -428,6 +428,7 @@ fn audit_log_settings_binding_round_trips() {
 
     let stored = kit
         .set_audit_log_settings(AuditLogSettingsFfi { enabled: true })
+        .await
         .expect("set audit settings");
     assert!(stored.enabled);
 
@@ -548,6 +549,7 @@ async fn audit_log_binding_posts_tracker_update() {
     let server = tokio::spawn(capture_audit_upload(listener, tx));
 
     kit.set_audit_log_settings(AuditLogSettingsFfi { enabled: true })
+        .await
         .expect("enable audit logs");
     kit.set_audit_log_tracker_config(AuditLogTrackerConfigFfi {
         endpoint: Some(format!("http://{addr}/api/v1/audit-logs/")),

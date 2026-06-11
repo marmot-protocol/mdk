@@ -22,7 +22,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -453,6 +453,26 @@ pub trait ForensicRecorder: Send + Sync {
     fn health_snapshot(&self) -> AuditRecorderHealthSnapshot {
         AuditRecorderHealthSnapshot::default()
     }
+
+    /// Filesystem path this recorder appends to, if it is file-backed.
+    ///
+    /// Returns `None` for recorders with no on-disk file (e.g.
+    /// [`NoopRecorder`]). Callers use this to confirm which file a live
+    /// recorder owns before deciding whether to [`rotate`](Self::rotate) it
+    /// versus removing an unrelated file directly.
+    fn audit_log_path(&self) -> Option<PathBuf> {
+        None
+    }
+
+    /// Discard the recorder's current backing store and begin a fresh one,
+    /// then keep recording.
+    ///
+    /// For a file-backed recorder this deletes the current file and reopens an
+    /// empty one at the same path, so a held file handle is never orphaned. The
+    /// default is a no-op for recorders with no rotatable backing store.
+    fn rotate(&self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Default recorder. Drops every event without observable side effects.
@@ -469,6 +489,9 @@ impl ForensicRecorder for NoopRecorder {
 /// the engine's hot path. Use a typed [`open`](Self::open) error for setup
 /// failures only.
 pub struct JsonlRecorder {
+    /// Path the recorder appends to. Immutable: [`rotate`](ForensicRecorder::rotate)
+    /// reopens the same path, so this is held outside the mutex.
+    path: PathBuf,
     inner: Mutex<JsonlInner>,
 }
 
@@ -506,12 +529,11 @@ impl JsonlRecorder {
         if let Some(account_ref) = account_ref.as_deref() {
             validate_account_ref_hex(account_ref)?;
         }
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path.as_ref())?;
+        let path = path.as_ref().to_path_buf();
+        let file = OpenOptions::new().create(true).append(true).open(&path)?;
         let recorder_session_id = generate_recorder_session_id();
         let recorder = Self {
+            path,
             inner: Mutex::new(JsonlInner {
                 writer: BufWriter::new(file),
                 seq: 0,
@@ -623,6 +645,55 @@ impl ForensicRecorder for JsonlRecorder {
             .health
             .clone()
     }
+
+    fn audit_log_path(&self) -> Option<PathBuf> {
+        Some(self.path.clone())
+    }
+
+    fn rotate(&self) -> std::io::Result<()> {
+        // Generate the new session id up front; `record` below re-acquires the
+        // lock, so we must release it before recording the boundary line.
+        let recorder_session_id = generate_recorder_session_id();
+        {
+            let mut inner = match self.inner.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            // Best-effort flush of whatever is buffered into the file we are
+            // about to discard.
+            let _ = inner.writer.flush();
+            // Unlink the current file. The fd still held by `inner.writer`
+            // keeps pointing at the now-unlinked inode until it is replaced
+            // below; on Unix that is harmless and the writer is discarded
+            // immediately. A missing file is fine — the goal state is "no old
+            // file, fresh file recording".
+            match std::fs::remove_file(&self.path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err),
+            }
+            // Open a brand-new file at the same path and swap it in. Assigning
+            // to `inner.writer` drops the old `BufWriter`, closing the stale
+            // (unlinked) fd.
+            let file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.path)?;
+            inner.writer = BufWriter::new(file);
+            inner.seq = 0;
+            inner.recorder_session_id = recorder_session_id.clone();
+            inner.health = AuditRecorderHealthSnapshot::default();
+        }
+        // Mark the start of the fresh file, mirroring `open_with_account_ref`.
+        self.record(AuditRecord::new(
+            None,
+            AuditEventKind::RecorderStarted {
+                recorder_session_id,
+                recorder: "marmot_forensics::JsonlRecorder".to_string(),
+            },
+        ));
+        Ok(())
+    }
 }
 
 /// Filename convention for the engine-scoped audit log.
@@ -693,6 +764,57 @@ mod tests {
         assert_eq!(third.group_ref.as_deref(), Some("group-1"));
         assert_eq!(first.schema_version, AUDIT_LOG_SCHEMA_VERSION);
         assert!(first.recorder_session_id.is_some());
+    }
+
+    #[test]
+    fn jsonl_recorder_rotate_discards_old_lines_and_keeps_recording() {
+        let dir = TempDir::new().unwrap();
+        let path = default_jsonl_path(dir.path(), "engine-abc");
+        let recorder = JsonlRecorder::open(&path, "engine-abc".to_string()).unwrap();
+        recorder.record(AuditRecord::new(
+            None,
+            AuditEventKind::SendEntry {
+                intent_kind: "app_message".into(),
+            },
+        ));
+        // `recorder_started` + the one row above.
+        assert_eq!(fs::read_to_string(&path).unwrap().lines().count(), 2);
+
+        assert_eq!(recorder.audit_log_path().as_deref(), Some(path.as_path()));
+        recorder.rotate().unwrap();
+
+        // The rotated file replaces the old contents: it holds only the fresh
+        // `recorder_started` boundary line, with the sequence reset to 0.
+        let contents = fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(lines.len(), 1);
+        let started: AuditEvent = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(started.seq, 0);
+        assert!(matches!(
+            started.kind,
+            AuditEventKind::RecorderStarted { .. }
+        ));
+
+        // Recording continues into the new file from that point forward.
+        recorder.record(AuditRecord::new(
+            None,
+            AuditEventKind::SendEntry {
+                intent_kind: "app_message".into(),
+            },
+        ));
+        drop(recorder);
+        let contents = fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(lines.len(), 2);
+        let second: AuditEvent = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(second.seq, 1);
+    }
+
+    #[test]
+    fn noop_recorder_has_no_path_and_rotate_is_a_no_op() {
+        let recorder = NoopRecorder;
+        assert!(recorder.audit_log_path().is_none());
+        recorder.rotate().unwrap();
     }
 
     #[test]

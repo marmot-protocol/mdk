@@ -13,16 +13,16 @@ use marmot_app::{
     AccountKeyPackageRecord, AccountRelayListState, AccountRelayListStatus, AppBlobEndpoint,
     AppGroupAdminPolicyComponent, AppGroupEncryptedMediaComponent, AppGroupMemberRecord,
     AppGroupMlsState, AppGroupNostrRoutingComponent, AppGroupProfileComponent, AppGroupRecord,
-    AppMessageRecord, AppProjectionUpdate, AuditLogFile, AuditLogSettings, AuditLogTrackerConfig,
-    AuditLogTrackerUpdateResult, AuditLogUploadResult, AuditLogUploadSource, ChatListAvatar,
-    ChatListMessagePreview, ChatListRow, GroupInviteDeclineResult, GroupPushDebugInfo,
-    GroupPushTokenDebugEntry, LocalPushRegistrationDebug, MarmotAppEvent, MediaAttachmentReference,
-    MediaDownloadResult, MediaLocator, MediaUploadAttachmentRequest, MediaUploadRequest,
-    MediaUploadResult, NotificationCollectionStatus, NotificationSettings, NotificationTrigger,
-    NotificationUpdate, NotificationUser, NotificationWakeSource, PushPlatform, PushRegistration,
-    ReceivedMessage, RelayPlaneHealth, RelayTelemetryResource, RelayTelemetryRuntimeConfig,
-    RelayTelemetrySettings, RuntimeAgentStreamUpdate, RuntimeChatListUpdate,
-    RuntimeMessageReceived, RuntimeMessageUpdate, RuntimeProjectionUpdate,
+    AppMessageRecord, AppProjectionUpdate, AuditLogDeleteOutcome, AuditLogFile, AuditLogSettings,
+    AuditLogTrackerConfig, AuditLogTrackerUpdateResult, AuditLogUploadResult, AuditLogUploadSource,
+    ChatListAvatar, ChatListMessagePreview, ChatListRow, GroupInviteDeclineResult,
+    GroupPushDebugInfo, GroupPushTokenDebugEntry, LocalPushRegistrationDebug, MarmotAppEvent,
+    MediaAttachmentReference, MediaDownloadResult, MediaLocator, MediaUploadAttachmentRequest,
+    MediaUploadRequest, MediaUploadResult, NotificationCollectionStatus, NotificationSettings,
+    NotificationTrigger, NotificationUpdate, NotificationUser, NotificationWakeSource,
+    PushPlatform, PushRegistration, ReceivedMessage, RelayPlaneHealth, RelayTelemetryResource,
+    RelayTelemetryRuntimeConfig, RelayTelemetrySettings, RuntimeAgentStreamUpdate,
+    RuntimeChatListUpdate, RuntimeMessageReceived, RuntimeMessageUpdate, RuntimeProjectionUpdate,
     RuntimeTimelineMessageUpdate, SendSummary, TimelineMessageChange, TimelineMessageRecord,
     TimelinePage, TimelineReactionSummary, TimelineRemoveReason, TimelineReplyPreview,
     TimelineUpdateTrigger, TimelineUserReaction, UserProfileMetadata, account_id_hex_from_ref,
@@ -66,6 +66,22 @@ impl From<AuditLogUploadResult> for AuditLogUploadResultFfi {
             path: value.path,
             status: value.status,
             bytes_sent: value.bytes_sent,
+        }
+    }
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct AuditLogDeleteResultFfi {
+    /// `true` when a live recorder was rotated and is already recording to a
+    /// fresh file; `false` when the file was simply removed (no live recorder,
+    /// or audit logging off).
+    pub still_recording: bool,
+}
+
+impl From<AuditLogDeleteOutcome> for AuditLogDeleteResultFfi {
+    fn from(value: AuditLogDeleteOutcome) -> Self {
+        Self {
+            still_recording: value.still_recording,
         }
     }
 }
