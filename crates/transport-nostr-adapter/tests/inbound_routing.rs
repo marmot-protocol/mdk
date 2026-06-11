@@ -761,14 +761,14 @@ async fn inbox_subscription_since_is_widened_by_the_nip59_tweak_window() {
     let inbox_since = issued
         .iter()
         .find_map(|subscription| match subscription {
-            NostrSubscription::AccountInbox { since, .. } => Some(since.clone()),
+            NostrSubscription::AccountInbox { since, .. } => Some(*since),
             _ => None,
         })
         .expect("inbox subscription issued");
     let group_since = issued
         .iter()
         .find_map(|subscription| match subscription {
-            NostrSubscription::Group { since, .. } => Some(since.clone()),
+            NostrSubscription::Group { since, .. } => Some(*since),
             _ => None,
         })
         .expect("group subscription issued");
@@ -804,7 +804,7 @@ async fn inbox_subscription_since_saturates_at_zero() {
     let inbox_since = issued
         .iter()
         .find_map(|subscription| match subscription {
-            NostrSubscription::AccountInbox { since, .. } => Some(since.clone()),
+            NostrSubscription::AccountInbox { since, .. } => Some(*since),
             _ => None,
         })
         .expect("inbox subscription issued");
