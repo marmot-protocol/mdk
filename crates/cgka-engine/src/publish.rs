@@ -100,9 +100,14 @@ impl<S: StorageProvider> Engine<S> {
             .epoch_manager
             .kind_for_pending(pending)
             .ok_or(EngineError::UnknownPending)?;
+        // The originating operation's context, captured at `begin_pending`. The
+        // engine's ambient context has cleared by now (this is a later
+        // publish-confirm call), so re-attach it explicitly.
+        let audit_context = self.epoch_manager.audit_context_for_pending(pending);
         let (group_id, new_epoch) = self.epoch_manager.confirm_publish(pending)?;
-        self.audit_group(
-            &group_id,
+        self.audit_with_context(
+            Some(&group_id),
+            audit_context.clone(),
             crate::audit_helpers::epoch_confirmed_event(
                 EpochId(new_epoch.0.saturating_sub(1)),
                 new_epoch,
@@ -112,8 +117,9 @@ impl<S: StorageProvider> Engine<S> {
         if let Some(message_id) = self.promote_pending_commit_for_recovery(pending) {
             self.storage
                 .update_message_state(&message_id, MessageState::Processed)?;
-            self.audit_group(
-                &group_id,
+            self.audit_with_context(
+                Some(&group_id),
+                audit_context.clone(),
                 crate::audit_helpers::message_state_changed_event(
                     hex::encode(message_id.as_slice()),
                     MessageState::Processed,
@@ -191,9 +197,11 @@ impl<S: StorageProvider> Engine<S> {
             .kind_for_pending(pending)
             .ok_or(EngineError::UnknownPending)?;
         let pending_epoch_pre = EpochId(mls_group.epoch().as_u64());
+        let audit_context = self.epoch_manager.audit_context_for_pending(pending);
         let (group_id, prior_epoch) = self.epoch_manager.rollback_publish(pending)?;
-        self.audit_group(
-            &group_id,
+        self.audit_with_context(
+            Some(&group_id),
+            audit_context,
             crate::audit_helpers::epoch_rolled_back_event(
                 pending_epoch_pre,
                 prior_epoch,

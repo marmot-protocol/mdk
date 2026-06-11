@@ -742,6 +742,7 @@ impl<S: StorageProvider> Engine<S> {
                             staged,
                             pending_ref,
                             crate::epoch_manager::PendingKind::GroupEvolution,
+                            self.current_audit_context.clone(),
                         )?;
                         self.track_pending_commit_for_recovery(
                             pending_ref,
@@ -1195,6 +1196,7 @@ impl<S: StorageProvider> Engine<S> {
             staged,
             pending_ref,
             crate::epoch_manager::PendingKind::GroupEvolution,
+            self.current_audit_context.clone(),
         )?;
         self.track_pending_commit_for_recovery(
             pending_ref,
@@ -1355,6 +1357,7 @@ impl<S: StorageProvider> Engine<S> {
             staged,
             pending_ref,
             crate::epoch_manager::PendingKind::GroupEvolution,
+            self.current_audit_context.clone(),
         )?;
         self.track_pending_commit_for_recovery(
             pending_ref,

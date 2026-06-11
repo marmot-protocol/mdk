@@ -11,6 +11,7 @@
 use async_trait::async_trait;
 use cgka_engine::EngineBuilder;
 use cgka_traits::CgkaEngine;
+use cgka_traits::engine::{CreateGroupRequest, SendResult};
 use cgka_traits::error::PeelerError;
 use cgka_traits::group_context::GroupContextSnapshot;
 use cgka_traits::ingest::{IngestOutcome, PeeledMessage, StaleReason};
@@ -19,7 +20,9 @@ use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };
 use cgka_traits::types::{MemberId, MessageId};
-use marmot_forensics::{AuditEvent, AuditEventKind, JsonlRecorder};
+use marmot_forensics::{
+    AuditEvent, AuditEventContext, AuditEventKind, AuditHumanActionContext, JsonlRecorder,
+};
 use storage_sqlite::SqliteAccountStorage;
 
 mod support;
@@ -183,6 +186,70 @@ async fn audit_log_records_ingest_entry_and_outcome_via_jsonl() {
         }
         _ => unreachable!(),
     }
+}
+
+#[tokio::test]
+async fn epoch_confirmed_inherits_operation_human_action() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("audit.jsonl");
+    let recorder = JsonlRecorder::open(&path, "test-engine-epoch".to_string()).unwrap();
+
+    let identity = valid_identity(b"self");
+    let mut engine = EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+        .identity(identity)
+        .account_identity_proof_signer(proof_signer(b"self"))
+        .peeler(Box::new(StubPeeler))
+        .recorder(Box::new(recorder))
+        .build()
+        .expect("build engine with recorder");
+
+    // `epoch_confirmed` is emitted on the later confirm call, after the engine's
+    // ambient context clears, so it must inherit the staging operation's action.
+    let audit_context = AuditEventContext {
+        human_action: Some(AuditHumanActionContext {
+            action: "create_group".into(),
+            origin: "local_user".into(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let (_group_id, send_result) = engine
+        .create_group_with_audit_context(
+            CreateGroupRequest {
+                name: "g".into(),
+                description: String::new(),
+                members: vec![],
+                required_features: vec![],
+                app_components: vec![],
+                initial_admins: vec![],
+            },
+            Some(audit_context),
+        )
+        .await
+        .expect("create group");
+    let SendResult::GroupCreated { pending, .. } = send_result else {
+        panic!("expected GroupCreated send result");
+    };
+    engine.confirm_published(pending).await.expect("confirm");
+    drop(engine);
+
+    let events: Vec<AuditEvent> = std::fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+
+    let epoch_confirmed = events
+        .iter()
+        .find(|event| matches!(event.kind, AuditEventKind::EpochConfirmed { .. }))
+        .expect("epoch_confirmed should be recorded");
+    let human_action = epoch_confirmed
+        .context
+        .as_ref()
+        .and_then(|ctx| ctx.human_action.as_ref())
+        .expect("epoch_confirmed should inherit the operation's human_action");
+    assert_eq!(human_action.action, "create_group");
+    assert_eq!(human_action.origin, "local_user");
 }
 
 #[tokio::test]

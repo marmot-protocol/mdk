@@ -274,6 +274,7 @@ impl<S: StorageProvider> Engine<S> {
             staged,
             pending_ref,
             crate::epoch_manager::PendingKind::CreateGroup,
+            self.current_audit_context.clone(),
         )?;
 
         let _ = ctx;

@@ -19,6 +19,7 @@ use cgka_traits::engine_state::{EpochState, PendingStateRef, StagedCommitHandle}
 use cgka_traits::error::EngineError;
 use cgka_traits::ingest::PeeledMessage;
 use cgka_traits::types::{EpochId, GroupId};
+use marmot_forensics::AuditEventContext;
 use std::collections::{BTreeSet, HashMap};
 
 /// Per-pending sidecar so `confirm_publish` / `rollback_publish` can find
@@ -29,6 +30,11 @@ struct PendingMeta {
     group_id: GroupId,
     prior_epoch: EpochId,
     kind: PendingKind,
+    /// Audit context of the operation that staged this commit, captured at
+    /// `begin_pending`. Re-attached to the `epoch_confirmed` / `epoch_rolled_back`
+    /// rows, which are emitted on a later publish-confirm call after the
+    /// engine's ambient context has cleared.
+    audit_context: Option<AuditEventContext>,
 }
 
 /// Discriminator the engine uses when emitting the post-confirm event.
@@ -102,6 +108,9 @@ impl EpochManager {
     /// path can later distinguish "we committed at this epoch" from "this
     /// is a benign late-arriving commit." Also stashes `pre_commit_epoch`
     /// as the rollback target for `rollback_publish`.
+    // Each argument is a distinct piece of the pending-publish transition; a
+    // wrapper struct would only move the same fields behind a name.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn begin_pending(
         &mut self,
         group_id: GroupId,
@@ -110,6 +119,7 @@ impl EpochManager {
         pending: StagedCommitHandle,
         pending_ref: PendingStateRef,
         kind: PendingKind,
+        audit_context: Option<AuditEventContext>,
     ) -> Result<(), EngineError> {
         // Record the pre-commit epoch BEFORE the transition so fork
         // detection works even if the transition fails.
@@ -130,6 +140,7 @@ impl EpochManager {
                 group_id,
                 prior_epoch: pre_commit_epoch,
                 kind,
+                audit_context,
             },
         );
         Ok(())
@@ -146,6 +157,17 @@ impl EpochManager {
     /// Peek at the per-pending kind tag (Create vs. Evolution).
     pub(crate) fn kind_for_pending(&self, pending: PendingStateRef) -> Option<PendingKind> {
         self.pending.get(&pending).map(|m| m.kind)
+    }
+
+    /// Peek at the audit context captured when this pending was staged, so the
+    /// post-confirm/rollback rows can carry the originating `human_action`.
+    pub(crate) fn audit_context_for_pending(
+        &self,
+        pending: PendingStateRef,
+    ) -> Option<AuditEventContext> {
+        self.pending
+            .get(&pending)
+            .and_then(|m| m.audit_context.clone())
     }
 
     /// `PendingPublish → Merging → Stable{new_epoch}` in one step. Caller
