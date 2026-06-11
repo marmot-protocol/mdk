@@ -3,20 +3,28 @@
 use async_trait::async_trait;
 use cgka_engine::canonicalization::ConvergenceStatus;
 use cgka_engine::feature_registry::FeatureRegistry;
-use cgka_engine::{Engine, EngineBuilder};
+use cgka_engine::provider::EngineOpenMlsProvider;
+use cgka_engine::{DEFAULT_CIPHERSUITE, Engine, EngineBuilder};
 use cgka_traits::EngineError;
 use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent};
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
-use cgka_traits::engine::{CgkaEngine, CreateGroupRequest, SendIntent, SendResult};
+use cgka_traits::engine::{CgkaEngine, CreateGroupRequest, KeyPackage, SendIntent, SendResult};
 use cgka_traits::error::PeelerError;
 use cgka_traits::group_context::GroupContextSnapshot;
 use cgka_traits::ingest::{IngestOutcome, PeeledContent, PeeledMessage};
 use cgka_traits::peeler::TransportPeeler;
+use cgka_traits::storage::{AccountDeviceSignerStorage, StorageProvider};
 use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };
 use cgka_traits::types::{GroupId, MemberId, MessageId};
+use openmls::group::MlsGroup;
+use openmls::prelude::{BasicCredential, MlsMessageBodyIn, MlsMessageIn, ProtocolVersion};
+use openmls_basic_credential::SignatureKeyPair;
+use openmls_rust_crypto::RustCrypto;
+use openmls_traits::OpenMlsProvider as _;
 use storage_sqlite::SqliteAccountStorage;
+use tls_codec::{Deserialize as _, Serialize as _};
 
 mod support;
 use support::proof_signer;
@@ -132,13 +140,77 @@ fn selfremove_registry() -> FeatureRegistry {
 }
 
 fn build_client(id: &[u8]) -> Engine<SqliteAccountStorage> {
-    EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+    build_with_storage(id).0
+}
+
+fn build_with_storage(id: &[u8]) -> (Engine<SqliteAccountStorage>, SqliteAccountStorage) {
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let engine = EngineBuilder::new(storage.clone())
         .identity(pad32(id))
         .account_identity_proof_signer(proof_signer(id))
         .feature_registry(selfremove_registry())
         .peeler(Box::new(MockPeeler))
         .build()
-        .unwrap()
+        .unwrap();
+    (engine, storage)
+}
+
+fn clone_key_package_for_invite(kp: &KeyPackage) -> openmls::prelude::KeyPackage {
+    let msg = MlsMessageIn::tls_deserialize_exact(kp.bytes())
+        .expect("deserialize KeyPackage MLS message");
+    let kp_in = match msg.extract() {
+        MlsMessageBodyIn::KeyPackage(kp) => kp,
+        _ => panic!("expected MLS KeyPackage message"),
+    };
+    let crypto = RustCrypto::default();
+    kp_in
+        .validate(&crypto, ProtocolVersion::Mls10)
+        .expect("validate KeyPackage")
+}
+
+fn welcome_from_existing_non_admin(
+    storage: &SqliteAccountStorage,
+    sender: &MemberId,
+    group_id: &GroupId,
+    invitee_key_package: &KeyPackage,
+) -> TransportMessage {
+    let crypto = RustCrypto::default();
+    let provider =
+        EngineOpenMlsProvider::<SqliteAccountStorage>::new(&crypto, storage.mls_storage());
+    let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
+    let mut mls_group = MlsGroup::load(provider.storage(), &mls_gid)
+        .expect("load attacker's MLS group")
+        .expect("attacker joined group");
+    let binding = storage
+        .account_device_signer(sender)
+        .expect("load signer binding")
+        .expect("signer binding exists");
+    let signer = SignatureKeyPair::read(
+        storage.mls_storage(),
+        &binding.mls_signature_public_key,
+        DEFAULT_CIPHERSUITE.signature_algorithm(),
+    )
+    .expect("MLS signer exists");
+    let invitee = clone_key_package_for_invite(invitee_key_package);
+    let recipient = BasicCredential::try_from(invitee.leaf_node().credential().clone())
+        .expect("invitee uses BasicCredential");
+    let (_commit_out, welcome_out, _group_info) = mls_group
+        .add_members(&provider, &signer, &[invitee])
+        .expect("non-admin can build raw OpenMLS Add+Welcome fork");
+    let welcome_bytes = welcome_out
+        .tls_serialize_detached()
+        .expect("serialize malicious Welcome");
+
+    TransportMessage {
+        id: hash_id(&welcome_bytes),
+        payload: welcome_bytes,
+        timestamp: Timestamp(0),
+        causal_deps: vec![],
+        source: TransportSource("malicious-openmls".into()),
+        envelope: TransportEnvelope::Welcome {
+            recipient: MemberId::new(recipient.identity().to_vec()),
+        },
+    }
 }
 
 fn app_payload_for(engine: &Engine<SqliteAccountStorage>, payload: impl AsRef<[u8]>) -> Vec<u8> {
@@ -476,6 +548,53 @@ async fn non_admin_cannot_invite_members() {
         .unwrap();
 
     assert!(matches!(err, EngineError::NotGroupAdmin { .. }));
+}
+
+#[tokio::test]
+async fn join_rejects_welcome_authored_by_existing_non_admin() {
+    let mut alice = build_client(b"alice");
+    let (mut bob, bob_storage) = build_with_storage(b"bob");
+    let mut carol = build_client(b"carol");
+    let mut david = build_client(b"david");
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "welcome-policy".into(),
+            description: "".into(),
+            members: vec![bob_kp, carol_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (welcome_for_bob, welcome_for_carol) = match create {
+        SendResult::GroupCreated {
+            pending,
+            mut welcomes,
+        } => {
+            alice.confirm_published(pending).await.unwrap();
+            (welcomes.remove(0), welcomes.remove(0))
+        }
+        _ => unreachable!(),
+    };
+    bob.join_welcome(welcome_for_bob).await.unwrap();
+    carol.join_welcome(welcome_for_carol).await.unwrap();
+
+    let david_kp = david.fresh_key_package().await.unwrap();
+    let malicious_welcome =
+        welcome_from_existing_non_admin(&bob_storage, &bob.self_id(), &group_id, &david_kp);
+
+    let err = david
+        .join_welcome(malicious_welcome)
+        .await
+        .expect_err("non-admin-authored Welcome must be rejected");
+    assert!(
+        matches!(err, EngineError::NotGroupAdmin { .. }),
+        "expected NotGroupAdmin for non-admin Welcome signer, got {err:?}"
+    );
 }
 
 #[tokio::test]

@@ -53,5 +53,6 @@ pub fn join_config(max_past_epochs: usize) -> MlsGroupJoinConfig {
     MlsGroupJoinConfig::builder()
         .wire_format_policy(PURE_PLAINTEXT_WIRE_FORMAT_POLICY)
         .max_past_epochs(max_past_epochs)
+        .use_ratchet_tree_extension(true)
         .build()
 }

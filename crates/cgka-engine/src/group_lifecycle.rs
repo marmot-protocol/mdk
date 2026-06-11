@@ -16,8 +16,7 @@ use crate::capabilities::{
 };
 use crate::engine::Engine;
 use crate::provider::EngineOpenMlsProvider;
-use crate::wire_format::PURE_PLAINTEXT_WIRE_FORMAT_POLICY;
-use crate::wire_format::join_config;
+use crate::wire_format::{PURE_PLAINTEXT_WIRE_FORMAT_POLICY, join_config};
 use cgka_traits::TransportEndpoint;
 use cgka_traits::app_components::{AppComponentSet, default_group_components};
 use cgka_traits::capabilities::{GroupCapabilities, TransportKind};
@@ -376,6 +375,10 @@ impl<S: StorageProvider> Engine<S> {
         let join_config = join_config(self.max_past_epochs);
         let staged = StagedWelcome::new_from_welcome(&provider, &join_config, welcome, None)
             .map_err(|e| EngineError::Backend(format!("stage welcome: {e:?}")))?;
+        let welcome_sender = staged
+            .welcome_sender()
+            .map_err(|e| EngineError::Backend(format!("welcome sender: {e:?}")))?;
+        let welcome_sender_id = crate::identity::validated_member_id_of_leaf(welcome_sender)?;
         let mls_group = staged
             .into_group(&provider)
             .map_err(|e| EngineError::Backend(format!("into_group: {e:?}")))?;
@@ -410,6 +413,12 @@ impl<S: StorageProvider> Engine<S> {
                 had: Box::new(had),
             });
         }
+
+        // 5d. Reject Welcome forks authored by a non-admin member. OpenMLS
+        // verifies the GroupInfo signature; Marmot additionally requires the
+        // signer leaf's MLS-authenticated account identity to be authorized for
+        // admin-gated member additions (joining.md, admin-policy-v1.md).
+        crate::app_components::require_admin(&mls_group, &group_id, &welcome_sender_id)?;
 
         // 6. Persist Marmot group record from signed group-context data.
         let mut group_record = Group {
