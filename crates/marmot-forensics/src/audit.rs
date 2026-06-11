@@ -381,6 +381,43 @@ pub enum AuditEventKind {
     },
 }
 
+impl AuditEventKind {
+    /// The serde `type` tag for this kind, exactly as it appears in the JSONL
+    /// output. Kept in lockstep with the `#[serde(rename_all = "snake_case")]`
+    /// variant names; used to backfill a `system` `human_action` action name on
+    /// rows that arrive without one.
+    pub fn type_tag(&self) -> &'static str {
+        match self {
+            AuditEventKind::RecorderStarted { .. } => "recorder_started",
+            AuditEventKind::EngineContext { .. } => "engine_context",
+            AuditEventKind::GroupContext { .. } => "group_context",
+            AuditEventKind::RecorderHealth { .. } => "recorder_health",
+            AuditEventKind::HumanAction { .. } => "human_action",
+            AuditEventKind::IngestEntry { .. } => "ingest_entry",
+            AuditEventKind::IngestOutcome { .. } => "ingest_outcome",
+            AuditEventKind::IngestError { .. } => "ingest_error",
+            AuditEventKind::SendEntry { .. } => "send_entry",
+            AuditEventKind::SendOutcome { .. } => "send_outcome",
+            AuditEventKind::SendError { .. } => "send_error",
+            AuditEventKind::CreateGroupEntry { .. } => "create_group_entry",
+            AuditEventKind::CreateGroupOutcome { .. } => "create_group_outcome",
+            AuditEventKind::CreateGroupError { .. } => "create_group_error",
+            AuditEventKind::PublishAttempt { .. } => "publish_attempt",
+            AuditEventKind::PublishOutcome { .. } => "publish_outcome",
+            AuditEventKind::PublishFailure { .. } => "publish_failure",
+            AuditEventKind::EpochConfirmed { .. } => "epoch_confirmed",
+            AuditEventKind::EpochRolledBack { .. } => "epoch_rolled_back",
+            AuditEventKind::SnapshotCreated { .. } => "snapshot_created",
+            AuditEventKind::ForkResolution { .. } => "fork_resolution",
+            AuditEventKind::ConvergenceDecision { .. } => "convergence_decision",
+            AuditEventKind::PeelerOutcome { .. } => "peeler_outcome",
+            AuditEventKind::AutoCommitDecision { .. } => "auto_commit_decision",
+            AuditEventKind::MessageStateChanged { .. } => "message_state_changed",
+            AuditEventKind::Rejection { .. } => "rejection",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ForkWinner {
@@ -504,14 +541,19 @@ fn generate_recorder_session_id() -> String {
     format!("{now:032x}{:08x}{counter:016x}", std::process::id())
 }
 
-/// Stamp lifecycle and diagnostic rows with a `system`-origin `human_action`.
+/// Backfill a `system`-origin `human_action` on any row that arrives without
+/// one.
 ///
-/// `recorder_started`, `engine_context`, and `recorder_health` are emitted at
-/// startup, outside any human-initiated operation, so they arrive with no
-/// `human_action`. Audit consumers that require a human action on every row
-/// reject them otherwise. Rows that already carry a `human_action` (including
-/// every operation row) are returned unchanged.
-fn stamp_system_lifecycle_action(
+/// Locally-initiated operation rows inherit the originating `human_action` in
+/// the engine. Everything else — startup lifecycle rows (`recorder_started`,
+/// `engine_context`, `recorder_health`) and the entire inbound
+/// message-processing path (`ingest_*`, `peeler_outcome`, `message_state_changed`
+/// on received messages, fork/convergence/auto-commit decisions) — happens
+/// outside any human operation and so carries no `human_action`. Audit consumers
+/// require a `human_action` on every row and reject those without one, so we
+/// stamp a `system` action named after the row's own kind. Rows that already
+/// carry a `human_action` are returned unchanged.
+fn stamp_system_human_action(
     context: Option<AuditEventContext>,
     kind: &AuditEventKind,
 ) -> Option<AuditEventContext> {
@@ -521,15 +563,9 @@ fn stamp_system_lifecycle_action(
     {
         return context;
     }
-    let action = match kind {
-        AuditEventKind::RecorderStarted { .. } => "recorder_started",
-        AuditEventKind::EngineContext { .. } => "engine_context",
-        AuditEventKind::RecorderHealth { .. } => "recorder_health",
-        _ => return context,
-    };
     let mut context = context.unwrap_or_default();
     context.human_action = Some(AuditHumanActionContext {
-        action: action.to_string(),
+        action: kind.type_tag().to_string(),
         origin: "system".to_string(),
         ..Default::default()
     });
@@ -551,7 +587,7 @@ impl ForensicRecorder for JsonlRecorder {
         };
         let seq = inner.seq;
         inner.seq = seq.wrapping_add(1);
-        let context = stamp_system_lifecycle_action(record.context, &record.kind);
+        let context = stamp_system_human_action(record.context, &record.kind);
         let event = AuditEvent {
             schema_version: AUDIT_LOG_SCHEMA_VERSION.to_string(),
             seq,
@@ -660,12 +696,13 @@ mod tests {
     }
 
     #[test]
-    fn jsonl_recorder_stamps_lifecycle_rows_with_system_human_action() {
+    fn jsonl_recorder_stamps_unattributed_rows_with_system_human_action() {
         let dir = TempDir::new().unwrap();
         let path = default_jsonl_path(dir.path(), "engine-abc");
         let recorder = JsonlRecorder::open(&path, "engine-abc".to_string()).unwrap();
         // `recorder_started` is emitted by `open`. Add the other two lifecycle
-        // kinds plus an operation row that already carries a human action.
+        // kinds, an inbound message-processing row (no human action), plus an
+        // operation row that already carries a human action.
         recorder.record(AuditRecord::new(
             None,
             AuditEventKind::EngineContext {
@@ -678,6 +715,16 @@ mod tests {
                 serialization_failures: 0,
                 write_failures: 0,
                 flush_failures: 0,
+            },
+        ));
+        recorder.record(AuditRecord::new(
+            Some("group-1".into()),
+            AuditEventKind::IngestEntry {
+                msg_id: "msg-1".into(),
+                envelope_kind: "group_message".into(),
+                transport_source: "nostr".into(),
+                payload_len: 42,
+                payload_digest: "deadbeef".into(),
             },
         ));
         recorder.record(
@@ -707,13 +754,21 @@ mod tests {
         let human_action = |kind_name: &str| -> AuditHumanActionContext {
             events
                 .iter()
-                .find(|event| audit_kind_type(&event.kind) == kind_name)
+                .find(|event| event.kind.type_tag() == kind_name)
                 .and_then(|event| event.context.as_ref())
                 .and_then(|ctx| ctx.human_action.clone())
                 .unwrap_or_else(|| panic!("{kind_name} row should carry a human_action"))
         };
 
-        for kind_name in ["recorder_started", "engine_context", "recorder_health"] {
+        // Every row that arrived without a human action — lifecycle rows and
+        // the inbound ingest row alike — is backfilled with a system action
+        // named after its own kind.
+        for kind_name in [
+            "recorder_started",
+            "engine_context",
+            "recorder_health",
+            "ingest_entry",
+        ] {
             let action = human_action(kind_name);
             assert_eq!(action.origin, "system");
             assert_eq!(action.action, kind_name);
@@ -722,16 +777,6 @@ mod tests {
         let send = human_action("send_entry");
         assert_eq!(send.origin, "local_user");
         assert_eq!(send.action, "send_message");
-    }
-
-    fn audit_kind_type(kind: &AuditEventKind) -> &'static str {
-        match kind {
-            AuditEventKind::RecorderStarted { .. } => "recorder_started",
-            AuditEventKind::EngineContext { .. } => "engine_context",
-            AuditEventKind::RecorderHealth { .. } => "recorder_health",
-            AuditEventKind::SendEntry { .. } => "send_entry",
-            _ => "other",
-        }
     }
 
     #[test]
