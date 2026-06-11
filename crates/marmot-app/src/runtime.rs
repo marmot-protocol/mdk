@@ -2831,10 +2831,21 @@ impl MarmotAppRuntime {
     pub async fn publish_user_profile(
         &self,
         account_ref: &str,
-        profile: UserProfileMetadata,
+        mut profile: UserProfileMetadata,
         bootstrap: AccountRelayListBootstrap,
     ) -> Result<UserProfileMetadata, AppError> {
         let account = self.accounts.resolve(account_ref)?;
+        // Stamp the just-published profile with the current time before caching
+        // it. The published kind-0 event is authored with `now`, so the cached
+        // own-account entry must carry a matching `created_at`. Callers that
+        // arrive via FFI hardcode `created_at == 0` (see
+        // `UserProfileMetadataFfi -> UserProfileMetadata`), and a zero stamp
+        // loses to *any* fetched kind-0 in `remember_directory_profile_if_newer`
+        // (it only retains the cache when `cached.created_at > fetched`). That
+        // let a stale pre-edit copy served by a lagging relay revert the local
+        // edit on the next directory refresh. Stamping `now` protects the edit
+        // against relay copies published before this moment.
+        stamp_published_profile_created_at(&mut profile, unix_now_seconds());
         self.accounts
             .app
             .publish_user_profile(&account.label, profile.clone(), bootstrap)
@@ -5799,9 +5810,75 @@ fn publish_app_runtime_account_error(
     }));
 }
 
+/// Stamp a just-published profile's `created_at` so the locally cached
+/// own-account entry is protected against stale relay copies.
+///
+/// FFI callers construct `UserProfileMetadata` with `created_at == 0` (the
+/// `From<UserProfileMetadataFfi>` impl hardcodes it). Caching a zero stamp via
+/// `remember_directory_profile` makes the entry lose to *any* fetched kind-0 in
+/// `remember_directory_profile_if_newer`, which only keeps the cache when
+/// `cached.created_at > fetched.created_at`. A `now` stamp matches the authored
+/// kind-0 event and keeps the local edit visible until the new event
+/// propagates. Callers that already carry a non-zero `created_at` (e.g. the
+/// default-profile path) are left untouched.
+fn stamp_published_profile_created_at(profile: &mut UserProfileMetadata, now: u64) {
+    if profile.created_at == 0 {
+        profile.created_at = now;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stamp_published_profile_created_at_replaces_zero_with_now() {
+        // FFI-published profiles arrive with created_at == 0; they must be
+        // stamped so the cached own-account entry survives a directory refresh
+        // that re-fetches a stale pre-edit kind-0 from a lagging relay.
+        let mut profile = UserProfileMetadata {
+            name: Some("edited".to_owned()),
+            created_at: 0,
+            ..UserProfileMetadata::default()
+        };
+        stamp_published_profile_created_at(&mut profile, 1_700_000_000);
+        assert_eq!(profile.created_at, 1_700_000_000);
+    }
+
+    #[test]
+    fn stamp_published_profile_created_at_preserves_existing_stamp() {
+        // Callers that already carry a real timestamp (e.g. the default-profile
+        // setup path) must not have it clobbered.
+        let mut profile = UserProfileMetadata {
+            name: Some("preset".to_owned()),
+            created_at: 42,
+            ..UserProfileMetadata::default()
+        };
+        stamp_published_profile_created_at(&mut profile, 1_700_000_000);
+        assert_eq!(profile.created_at, 42);
+    }
+
+    #[test]
+    fn stamped_profile_wins_over_stale_relay_copy_in_if_newer_check() {
+        // Regression for darkmatter#206: model the exact comparison
+        // remember_directory_profile_if_newer performs. A zero-stamped cache
+        // loses to any fetched copy; a now-stamped cache beats an older one.
+        let mut zero_cache = UserProfileMetadata {
+            created_at: 0,
+            ..UserProfileMetadata::default()
+        };
+        let stale_relay_copy = UserProfileMetadata {
+            created_at: 1_699_999_900,
+            ..UserProfileMetadata::default()
+        };
+        // Before the fix: cached(0) > fetched is false, so the stale copy wins.
+        assert!(zero_cache.created_at <= stale_relay_copy.created_at);
+
+        // After stamping the just-published edit with a fresh clock:
+        stamp_published_profile_created_at(&mut zero_cache, 1_700_000_000);
+        // The local edit now beats the older relay copy and is retained.
+        assert!(zero_cache.created_at > stale_relay_copy.created_at);
+    }
 
     #[tokio::test]
     async fn managed_account_worker_shutdown_aborts_unresponsive_task_after_timeout() {

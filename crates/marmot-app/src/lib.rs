@@ -3766,11 +3766,20 @@ impl MarmotApp {
         account_id_hex: &str,
         profile: &UserProfileMetadata,
     ) -> Result<(), AppError> {
+        // Retain the cached profile when it is at least as recent as the
+        // fetched copy. Nostr `created_at` is second-resolution, so a rapid
+        // profile republish can carry the same timestamp as the previous
+        // pre-edit kind-0. A strict `>` guard would treat an equal-second stale
+        // relay copy as "newer or equal -> replace" and revert the just-published
+        // local edit (darkmatter#206). Keeping the cache on equality protects
+        // the local edit; an equal-timestamp event re-fetched from a relay is
+        // either the user's own echoed publish (identical content) or a stale
+        // copy that must not win.
         if let Some(entry) = self.directory_entry_for_account_id(account_id_hex)?
             && entry
                 .profile
                 .as_ref()
-                .is_some_and(|cached| cached.created_at > profile.created_at)
+                .is_some_and(|cached| cached.created_at >= profile.created_at)
         {
             return Ok(());
         }
@@ -5782,6 +5791,63 @@ mod tests {
             relay_lists: AccountRelayListStatus::empty(),
             key_package: None,
         }
+    }
+
+    #[test]
+    fn remember_directory_profile_if_newer_keeps_local_edit_on_equal_timestamp() {
+        // Regression for darkmatter#206: Nostr `created_at` is second-resolution,
+        // so a rapid profile republish can carry the same timestamp as the
+        // previous pre-edit kind-0. A lagging relay can then serve that stale
+        // same-second copy back during a directory refresh. The cache must be
+        // retained on an equal timestamp so the just-published local edit is not
+        // reverted; only a strictly newer fetch replaces it.
+        let dir = tempfile::tempdir().unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+        let account_id = format!("{:064x}", 206);
+
+        // Local edit cached at t=1_700_000_000 (own-account entry).
+        app.save_directory_entry(&test_directory_record(
+            &account_id,
+            "edited-local",
+            1_700_000_000,
+        ))
+        .unwrap();
+
+        // Stale relay copy arrives with the SAME second-resolution timestamp.
+        let stale_same_second = UserProfileMetadata {
+            name: Some("stale-relay".to_owned()),
+            created_at: 1_700_000_000,
+            ..UserProfileMetadata::default()
+        };
+        app.remember_directory_profile_if_newer(&account_id, &stale_same_second)
+            .unwrap();
+
+        // The local edit must survive the equal-timestamp refresh.
+        let entry = app
+            .directory_entry_for_account_id(&account_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            entry.profile.and_then(|profile| profile.name),
+            Some("edited-local".to_owned())
+        );
+
+        // A strictly newer fetch still wins (genuine remote update).
+        let newer = UserProfileMetadata {
+            name: Some("newer-remote".to_owned()),
+            created_at: 1_700_000_001,
+            ..UserProfileMetadata::default()
+        };
+        app.remember_directory_profile_if_newer(&account_id, &newer)
+            .unwrap();
+        let entry = app
+            .directory_entry_for_account_id(&account_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            entry.profile.and_then(|profile| profile.name),
+            Some("newer-remote".to_owned())
+        );
     }
 
     #[test]
