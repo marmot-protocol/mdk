@@ -1075,17 +1075,51 @@ fn is_ascii_ws_for_flank(b: u8) -> bool {
 
 /// Walk the delimiter stack and pair up `*` / `_` / `~` runs, replacing the
 /// matched portion with `Emph` / `Strong` / `Strikethrough` inlines.
-fn process_emphasis(out: &mut Vec<Inline>, delims: &mut Vec<BracketDelim>, stack_bottom: usize) {
+fn process_emphasis(out: &mut Vec<Inline>, delims: &mut [BracketDelim], stack_bottom: usize) {
+    if out.is_empty() || stack_bottom >= delims.len() {
+        return;
+    }
+
+    // The CommonMark delimiter algorithm removes delimiter nodes and wraps
+    // inline ranges in its inner loop. Doing that with Vec::remove/drain/insert
+    // shifts the tail on every match, so an input like `*a* *a* ...` spends
+    // quadratic time moving both `out` and `delims`. Convert `out` to a tiny
+    // intrusive list for this pass: delimiter `out_pos` values become stable
+    // node ids, removals are pointer rewrites, and we only compact back to Vec
+    // once at the end.
+    let mut arena = InlineArena::from_items(std::mem::take(out));
+
+    // Stable delimiter links for the active slice. We keep `delims` itself in
+    // source order so existing indices remain usable for links/images outside
+    // this processing window.
+    let mut prev = vec![None; delims.len()];
+    let mut next = vec![None; delims.len()];
+    let mut last = None;
+    let mut first = None;
+    for idx in stack_bottom..delims.len() {
+        if !delims[idx].active {
+            continue;
+        }
+        if first.is_none() {
+            first = Some(idx);
+        }
+        prev[idx] = last;
+        if let Some(p) = last {
+            next[p] = Some(idx);
+        }
+        last = Some(idx);
+    }
+
     // For each (delim_char, can_open, mod3) we track an "openers_bottom"
     // index — earlier than this we won't search for an opener again.
     use std::collections::HashMap;
     let mut openers_bottom: HashMap<(u8, bool, usize), usize> = HashMap::new();
 
-    let mut closer_idx = stack_bottom;
-    while closer_idx < delims.len() {
+    let mut closer_cursor = first;
+    while let Some(closer_idx) = closer_cursor {
         let closer = delims[closer_idx];
         if !is_run(closer.kind) || !closer.can_close || !closer.active {
-            closer_idx += 1;
+            closer_cursor = next[closer_idx];
             continue;
         }
         let key = (closer.kind, closer.can_open, closer.orig_len % 3);
@@ -1093,27 +1127,29 @@ fn process_emphasis(out: &mut Vec<Inline>, delims: &mut Vec<BracketDelim>, stack
 
         // Walk back to find a compatible opener.
         let mut opener_pos: Option<usize> = None;
-        let mut k = closer_idx;
-        while k > bottom {
-            k -= 1;
+        let mut k_cursor = prev[closer_idx];
+        while let Some(k) = k_cursor {
+            if k < bottom {
+                break;
+            }
             let opener = &delims[k];
-            // Brackets terminate the search? Per spec we only look back at
-            // delimiters; bracket openers between us are handled elsewhere.
-            // A bracket "blocks" emphasis pairing across it.
+            // Brackets terminate the search. Inactive brackets are not linked
+            // into this pass, matching the previous "continue if inactive"
+            // behavior.
             if opener.kind == b'[' || opener.kind == b'!' {
-                if opener.active {
-                    break;
-                }
-                continue;
+                break;
             }
             if !is_run(opener.kind) || !opener.active || opener.kind != closer.kind {
+                k_cursor = prev[k];
                 continue;
             }
             if !opener.can_open {
+                k_cursor = prev[k];
                 continue;
             }
             // Strikethrough only pairs runs of length ≥ 2 on both sides.
             if opener.kind == b'~' && (opener.len < 2 || closer.len < 2) {
+                k_cursor = prev[k];
                 continue;
             }
             // Rule of three (`*` and `_`; not `~` per the plan).
@@ -1123,6 +1159,7 @@ fn process_emphasis(out: &mut Vec<Inline>, delims: &mut Vec<BracketDelim>, stack
                 let both_mod3 =
                     opener.orig_len.is_multiple_of(3) && closer.orig_len.is_multiple_of(3);
                 if both_can && sum_is_mod3 && !both_mod3 {
+                    k_cursor = prev[k];
                     continue;
                 }
             }
@@ -1132,149 +1169,250 @@ fn process_emphasis(out: &mut Vec<Inline>, delims: &mut Vec<BracketDelim>, stack
 
         if let Some(opener_idx) = opener_pos {
             let opener = delims[opener_idx];
+            let closer = delims[closer_idx];
             // Strikethrough always consumes 2; emphasis takes 2 when both
             // sides are ≥ 2 (strong), else 1 (emph).
             let strong = opener.len >= 2 && closer.len >= 2;
             let n = if closer.kind == b'~' || strong { 2 } else { 1 };
 
-            // Drain children = out items strictly between opener.out_pos and
-            // closer.out_pos.
-            let drain_start = opener.out_pos + 1;
-            let drain_end = closer.out_pos;
-            let children: Vec<Inline> = out.drain(drain_start..drain_end).collect();
-            // After this drain, all out_pos > drain_start shift by
-            // -(drain_end - drain_start).
-            let shift_a = drain_end - drain_start;
-
-            // Trim n chars from the opener's Text (right end) and closer's
-            // Text (left end). The closer's out_pos has shifted by shift_a.
-            let new_closer_out_pos = closer.out_pos - shift_a;
-
-            let opener_empty = trim_run_text(out, opener.out_pos, n, /*from_right*/ true);
-            let closer_empty = trim_run_text(out, new_closer_out_pos, n, /*from_right*/ false);
-
-            // Insert the wrapped node directly after the opener Text. If the
-            // opener is now empty, replace it; otherwise insert after.
-            let wrap_pos = if opener_empty {
-                out.remove(opener.out_pos);
-                opener.out_pos
-            } else {
-                opener.out_pos + 1
-            };
+            let children = arena.detach_between(opener.out_pos, closer.out_pos);
+            let opener_empty = arena.trim_run_text(opener.out_pos, n, /*from_right*/ true);
+            let closer_empty = arena.trim_run_text(closer.out_pos, n, /*from_right*/ false);
             let wrapped = match closer.kind {
                 b'~' => Inline::Strikethrough(children),
                 _ if strong => Inline::Strong(children),
                 _ => Inline::Emph(children),
             };
-            out.insert(wrap_pos, wrapped);
 
-            // Now bookkeeping: closer position in out changes too.
-            // After insertion at wrap_pos, items at index ≥ wrap_pos shift
-            // by +1.
-            let shift_b = 1usize;
-
+            if opener_empty {
+                let prev_node = arena.nodes[opener.out_pos].prev;
+                let next_node = arena.nodes[opener.out_pos].next;
+                arena.unlink(opener.out_pos);
+                arena.insert_between(prev_node, next_node, wrapped);
+            } else {
+                let next_node = arena.nodes[opener.out_pos].next;
+                arena.insert_between(Some(opener.out_pos), next_node, wrapped);
+            }
             if closer_empty {
-                // Closer's text was at new_closer_out_pos; after the insert
-                // its index is new_closer_out_pos + shift_b - (opener_empty
-                // ? 1 : 0). Compute precisely:
-                let closer_pos_now = if opener_empty {
-                    new_closer_out_pos - 1 + shift_b
-                } else {
-                    new_closer_out_pos + shift_b
-                };
-                out.remove(closer_pos_now);
+                arena.unlink(closer.out_pos);
             }
 
-            // Update delim out_pos for survivors; remove all delims strictly
-            // between opener and closer; possibly drop opener and closer too.
-            // First, trim opener/closer lengths.
             delims[opener_idx].len -= n;
             delims[closer_idx].len -= n;
             let drop_opener = delims[opener_idx].len == 0;
             let drop_closer = delims[closer_idx].len == 0;
+            let after_closer = next[closer_idx];
 
-            // Net shift for delims strictly after closer_idx — derived once,
-            // applied during the in-place compaction below. shift_a items
-            // drained at drain_start; shift_b inserted at wrap_pos; one
-            // removal each for opener_empty / closer_empty.
-            let net: isize = -(shift_a as isize) + (shift_b as isize)
-                - (if drop_opener { 1 } else { 0 })
-                - (if drop_closer { 1 } else { 0 });
-
-            // In-place compaction with a write index — avoids the per-match
-            // Vec::with_capacity(delims.len()) allocation the prior code paid
-            // every emphasis pairing. BracketDelim is Copy, so the move is a
-            // memcpy; w ≤ r at all times, so reads from delims[r] are never
-            // clobbered by writes to delims[w].
-            let len = delims.len();
-            let mut w = 0;
-            for r in 0..len {
-                if r > opener_idx && r < closer_idx {
-                    continue;
-                }
-                if (r == opener_idx && drop_opener) || (r == closer_idx && drop_closer) {
-                    continue;
-                }
-                let mut d = delims[r];
-                if r == closer_idx {
-                    d.out_pos = if drop_opener {
-                        new_closer_out_pos - 1 + shift_b
-                    } else {
-                        new_closer_out_pos + shift_b
-                    };
-                } else if r > closer_idx {
-                    d.out_pos = (d.out_pos as isize + net) as usize;
-                }
-                delims[w] = d;
-                w += 1;
+            unlink_delims_between(delims, &mut prev, &mut next, opener_idx, closer_idx);
+            let resume = if !drop_opener {
+                Some(opener_idx)
+            } else if !drop_closer {
+                Some(closer_idx)
+            } else {
+                after_closer
+            };
+            if drop_opener {
+                unlink_delim(delims, &mut prev, &mut next, opener_idx);
             }
-            delims.truncate(w);
-            openers_bottom.clear();
+            if drop_closer {
+                unlink_delim(delims, &mut prev, &mut next, closer_idx);
+            }
 
-            // After a match, the delim list has been rewritten. Restart
-            // from the opener's index — if the opener survived, the next
-            // loop iteration will see it (and skip because it's a left-
-            // flanking opener, not a closer); if it didn't survive, the
-            // index now points at the first delim that came after the
-            // closer.
-            closer_idx = opener_idx;
+            closer_cursor = resume;
             continue;
         } else {
             // No opener found.
             openers_bottom.insert(key, closer_idx);
+            let after_closer = next[closer_idx];
             if !closer.can_open {
-                // Drop this closer (it can't be an opener for later
-                // closers); but we keep its text in `out` as literal.
-                delims.remove(closer_idx);
-                continue;
+                // Drop this closer (it can't be an opener for later closers),
+                // but keep its text node in `out` as literal.
+                unlink_delim(delims, &mut prev, &mut next, closer_idx);
             }
-            closer_idx += 1;
+            closer_cursor = after_closer;
         }
     }
+
+    let (items, node_positions) = arena.into_items();
+    *out = items;
+    for d in delims.iter_mut().filter(|d| d.active) {
+        if let Some(Some(pos)) = node_positions.get(d.out_pos) {
+            d.out_pos = *pos;
+        } else {
+            d.active = false;
+        }
+    }
+}
+
+struct InlineNode {
+    item: Inline,
+    prev: Option<usize>,
+    next: Option<usize>,
+    alive: bool,
+}
+
+struct InlineArena {
+    nodes: Vec<InlineNode>,
+    head: Option<usize>,
+    tail: Option<usize>,
+}
+
+impl InlineArena {
+    fn from_items(items: Vec<Inline>) -> Self {
+        let len = items.len();
+        let nodes = items
+            .into_iter()
+            .enumerate()
+            .map(|(idx, item)| InlineNode {
+                item,
+                prev: idx.checked_sub(1),
+                next: (idx + 1 < len).then_some(idx + 1),
+                alive: true,
+            })
+            .collect();
+        Self {
+            nodes,
+            head: (len > 0).then_some(0),
+            tail: (len > 0).then_some(len - 1),
+        }
+    }
+
+    fn detach_between(&mut self, before: usize, after: usize) -> Vec<Inline> {
+        let mut children = Vec::new();
+        let mut cursor = self.nodes[before].next;
+        while let Some(idx) = cursor {
+            if idx == after {
+                break;
+            }
+            let next = self.nodes[idx].next;
+            self.unlink(idx);
+            children.push(std::mem::replace(
+                &mut self.nodes[idx].item,
+                Inline::Text(String::new()),
+            ));
+            cursor = next;
+        }
+        children
+    }
+
+    fn trim_run_text(&mut self, pos: usize, n: usize, from_right: bool) -> bool {
+        if let Inline::Text(s) = &mut self.nodes[pos].item {
+            if from_right {
+                for _ in 0..n {
+                    s.pop();
+                }
+            } else {
+                let byte_end = s.char_indices().nth(n).map(|(i, _)| i).unwrap_or(s.len());
+                s.drain(..byte_end);
+            }
+            s.is_empty()
+        } else {
+            false
+        }
+    }
+
+    fn unlink(&mut self, idx: usize) {
+        if !self.nodes[idx].alive {
+            return;
+        }
+        let prev = self.nodes[idx].prev;
+        let next = self.nodes[idx].next;
+        if let Some(prev) = prev {
+            self.nodes[prev].next = next;
+        } else {
+            self.head = next;
+        }
+        if let Some(next) = next {
+            self.nodes[next].prev = prev;
+        } else {
+            self.tail = prev;
+        }
+        self.nodes[idx].prev = None;
+        self.nodes[idx].next = None;
+        self.nodes[idx].alive = false;
+    }
+
+    fn insert_between(&mut self, prev: Option<usize>, next: Option<usize>, item: Inline) -> usize {
+        let idx = self.nodes.len();
+        self.nodes.push(InlineNode {
+            item,
+            prev,
+            next,
+            alive: true,
+        });
+        if let Some(prev) = prev {
+            self.nodes[prev].next = Some(idx);
+        } else {
+            self.head = Some(idx);
+        }
+        if let Some(next) = next {
+            self.nodes[next].prev = Some(idx);
+        } else {
+            self.tail = Some(idx);
+        }
+        idx
+    }
+
+    fn into_items(mut self) -> (Vec<Inline>, Vec<Option<usize>>) {
+        let mut items = Vec::new();
+        let mut node_positions = vec![None; self.nodes.len()];
+        let mut cursor = self.head;
+        while let Some(idx) = cursor {
+            cursor = self.nodes[idx].next;
+            if !self.nodes[idx].alive {
+                continue;
+            }
+            node_positions[idx] = Some(items.len());
+            items.push(std::mem::replace(
+                &mut self.nodes[idx].item,
+                Inline::Text(String::new()),
+            ));
+        }
+        (items, node_positions)
+    }
+}
+
+fn unlink_delims_between(
+    delims: &mut [BracketDelim],
+    prev: &mut [Option<usize>],
+    next: &mut [Option<usize>],
+    opener_idx: usize,
+    closer_idx: usize,
+) {
+    let mut cursor = next[opener_idx];
+    while let Some(idx) = cursor {
+        if idx == closer_idx {
+            break;
+        }
+        cursor = next[idx];
+        unlink_delim(delims, prev, next, idx);
+    }
+}
+
+fn unlink_delim(
+    delims: &mut [BracketDelim],
+    prev: &mut [Option<usize>],
+    next: &mut [Option<usize>],
+    idx: usize,
+) {
+    if !delims[idx].active {
+        return;
+    }
+    let prev_idx = prev[idx];
+    let next_idx = next[idx];
+    if let Some(prev_idx) = prev_idx {
+        next[prev_idx] = next_idx;
+    }
+    if let Some(next_idx) = next_idx {
+        prev[next_idx] = prev_idx;
+    }
+    prev[idx] = None;
+    next[idx] = None;
+    delims[idx].active = false;
 }
 
 fn is_run(k: u8) -> bool {
     matches!(k, b'*' | b'_' | b'~')
-}
-
-/// Trim `n` characters from a run's Text node at `out[pos]`. If
-/// `from_right` is true, trim from the end; otherwise from the front.
-/// Returns true if the Text became empty (caller is responsible for
-/// removing it).
-fn trim_run_text(out: &mut [Inline], pos: usize, n: usize, from_right: bool) -> bool {
-    if let Inline::Text(s) = &mut out[pos] {
-        if from_right {
-            for _ in 0..n {
-                s.pop();
-            }
-        } else {
-            let byte_end = s.char_indices().nth(n).map(|(i, _)| i).unwrap_or(s.len());
-            s.drain(..byte_end);
-        }
-        s.is_empty()
-    } else {
-        false
-    }
 }
 
 fn utf8_char_len(first_byte: u8) -> usize {
