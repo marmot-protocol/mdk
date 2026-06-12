@@ -22,7 +22,7 @@ pub const MARMOT_APP_EVENT_KIND_CHAT: u64 = 9;
 /// An edit of a prior message. Carries a single `e` tag referencing the edited
 /// event id; `content` is the replacement plaintext. Only honored when the
 /// edit's authenticated author matches the target event's author.
-pub const MARMOT_APP_EVENT_KIND_EDIT: u64 = 1010;
+pub const MARMOT_APP_EVENT_KIND_EDIT: u64 = 1009;
 pub const MARMOT_APP_EVENT_KIND_AGENT_STREAM_START: u64 = 1200;
 pub const MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY: u64 = 1201;
 pub const MARMOT_APP_EVENT_KIND_AGENT_OPERATION: u64 = 1202;

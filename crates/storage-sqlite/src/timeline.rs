@@ -4,7 +4,7 @@ use crate::{SqliteAccountStorage, SqliteResultExt};
 use cgka_traits::app_event::{
     EVENT_REF_TAG, MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY, MARMOT_APP_EVENT_KIND_AGENT_OPERATION,
     MARMOT_APP_EVENT_KIND_AGENT_STREAM_START, MARMOT_APP_EVENT_KIND_CHAT,
-    MARMOT_APP_EVENT_KIND_DELETE, MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
+    MARMOT_APP_EVENT_KIND_DELETE, MARMOT_APP_EVENT_KIND_EDIT, MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
     MARMOT_APP_EVENT_KIND_REACTION, QUOTE_REF_TAG, STREAM_CHUNKS_TAG, STREAM_HASH_TAG,
     STREAM_START_TAG, STREAM_TAG,
 };
@@ -541,6 +541,13 @@ fn affected_timeline_message_ids_for_parts_tx(
             ids.insert(message_id_hex.to_owned());
             reply_preview_targets.insert(message_id_hex.to_owned());
         }
+        MARMOT_APP_EVENT_KIND_EDIT => {
+            // The edit row itself is the new timeline entry; its e-tag targets
+            // are also affected so the original bubble re-renders with the
+            // overlaid body the client computes from the edit chain.
+            ids.insert(message_id_hex.to_owned());
+            ids.extend(tag_values(tags, EVENT_REF_TAG).map(ToOwned::to_owned));
+        }
         MARMOT_APP_EVENT_KIND_REACTION => {
             ids.extend(tag_values(tags, EVENT_REF_TAG).map(ToOwned::to_owned));
         }
@@ -948,7 +955,8 @@ fn project_group_events(events: Vec<RawAppEvent>) -> (Vec<TimelineRow>, Vec<Stre
             }
             MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY
             | MARMOT_APP_EVENT_KIND_AGENT_OPERATION
-            | MARMOT_APP_EVENT_KIND_GROUP_SYSTEM => {
+            | MARMOT_APP_EVENT_KIND_GROUP_SYSTEM
+            | MARMOT_APP_EVENT_KIND_EDIT => {
                 let mut row = timeline_row_from_app_event(event);
                 if event.invalidated {
                     row.invalidation_status = Some(invalidation_status(event));
