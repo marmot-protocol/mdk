@@ -215,8 +215,13 @@ struct StreamComposeWorkers {
 impl StreamComposeWorkers {
     fn insert(&mut self, key: String, session: StreamComposeSession) {
         if let Some(previous) = self.sessions.insert(key, session) {
-            let _ = previous.tx.try_send(StreamComposeCommand::Cancel);
-            previous.handle.abort();
+            // Graceful cancel over the dedicated signal: let the replaced
+            // session emit its live Abort and self-terminate. The cancel signal
+            // is its own bounded channel that can't be starved by queued
+            // commands, so only force-abort if that channel is already gone.
+            if previous.cancel_tx.try_send(()).is_err() {
+                previous.handle.abort();
+            }
         }
     }
 
@@ -230,8 +235,12 @@ impl StreamComposeWorkers {
 
     fn abort_all(&mut self) {
         for (_, session) in self.sessions.drain() {
-            let _ = session.tx.try_send(StreamComposeCommand::Cancel);
-            session.handle.abort();
+            // Graceful cancel so each session flushes its live Abort before the
+            // task ends; force-abort only as a fallback when the dedicated
+            // cancel channel is gone.
+            if session.cancel_tx.try_send(()).is_err() {
+                session.handle.abort();
+            }
         }
     }
 }
@@ -251,6 +260,7 @@ impl DaemonWorkers {
 
 struct StreamComposeSession {
     tx: mpsc::Sender<StreamComposeCommand>,
+    cancel_tx: mpsc::Sender<()>,
     handle: JoinHandle<()>,
 }
 
@@ -2287,6 +2297,10 @@ async fn open_stream_compose(
 
     let key = stream_compose_key(account.as_deref(), &stream_id);
     let (tx, rx) = mpsc::channel(32);
+    // Dedicated cancel signal: a bounded channel that can't be starved behind
+    // queued append/status/progress commands, so an explicit cancel always
+    // reaches the session and a live `Abort` is emitted before shutdown.
+    let (cancel_tx, cancel_rx) = mpsc::channel(1);
     let report = DaemonOutgoingStreamReport {
         account,
         group_id,
@@ -2312,11 +2326,19 @@ async fn open_stream_compose(
             },
             chunk_bytes,
             rx,
+            cancel_rx,
             task_report,
         )
         .await;
     });
-    workers.insert(key, StreamComposeSession { tx, handle });
+    workers.insert(
+        key,
+        StreamComposeSession {
+            tx,
+            cancel_tx,
+            handle,
+        },
+    );
     daemon_output(
         cli.json,
         &format!("streaming {}", short_id(&report.stream_id)),
@@ -2458,8 +2480,13 @@ fn cancel_stream_compose(
     };
     let key = stream_compose_key(cli.account.as_deref(), &stream_id);
     if let Some(session) = workers.remove(&key) {
-        let _ = session.tx.try_send(StreamComposeCommand::Cancel);
-        session.handle.abort();
+        // Graceful cancel over the dedicated signal: the compose session emits a
+        // live Abort record so online subscribers observe the cancellation, then
+        // self-terminates. The signal can't be starved by a full command queue,
+        // so only force-abort if that dedicated channel is already gone.
+        if session.cancel_tx.try_send(()).is_err() {
+            session.handle.abort();
+        }
         return daemon_output(
             cli.json,
             &format!("cancelled stream {}", short_id(&stream_id)),
@@ -4135,7 +4162,8 @@ mod tests {
         let open = test_stream_compose_open(stream_id.clone(), start_event_id.clone());
         let report = test_stream_compose_report(&stream_id);
         let (tx, rx) = mpsc::channel(4);
-        let session = tokio::spawn(run_stream_compose_session(open, 8, rx, report));
+        let (_cancel_tx, cancel_rx) = mpsc::channel(1);
+        let session = tokio::spawn(run_stream_compose_session(open, 8, rx, cancel_rx, report));
 
         let (append_tx, append_rx) = oneshot::channel();
         tx.send(StreamComposeCommand::Append {
@@ -4182,7 +4210,8 @@ mod tests {
         let open = test_stream_compose_open(stream_id.clone(), start_event_id.clone());
         let report = test_stream_compose_report(&stream_id);
         let (tx, rx) = mpsc::channel(4);
-        let session = tokio::spawn(run_stream_compose_session(open, 5, rx, report));
+        let (_cancel_tx, cancel_rx) = mpsc::channel(1);
+        let session = tokio::spawn(run_stream_compose_session(open, 5, rx, cancel_rx, report));
 
         for text in ["hello ", "world"] {
             let (respond, response) = oneshot::channel();

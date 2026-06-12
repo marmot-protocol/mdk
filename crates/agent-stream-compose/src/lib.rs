@@ -13,6 +13,10 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 use transport_quic_broker::{BrokerTextPublisher, OpenBrokerTextPublisher};
 
+/// Bounded grace period to let an in-flight broker connect land during cancel
+/// so a live `Abort` record can be published before the session shuts down.
+const CANCEL_CONNECT_GRACE: Duration = Duration::from_secs(2);
+
 const DEFAULT_LIVE_BROKER_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -45,7 +49,6 @@ pub enum StreamComposeCommand {
     Finish {
         respond: oneshot::Sender<Result<StreamComposeReport, String>>,
     },
-    Cancel,
 }
 
 trait LiveBrokerPublisher: Sized + Send + 'static {
@@ -55,6 +58,10 @@ trait LiveBrokerPublisher: Sized + Send + 'static {
         text: &str,
         chunk_bytes: usize,
     ) -> Result<(), String>;
+
+    /// Emit a single live `Abort` (`0x05`) record so online subscribers observe
+    /// the terminal cancellation of the preview.
+    async fn append_abort(&mut self) -> Result<(), String>;
 
     async fn finish(self) -> Result<(), String>;
 }
@@ -78,6 +85,12 @@ impl LiveBrokerPublisher for BrokerTextPublisher {
         .map_err(|err| err.to_string())
     }
 
+    async fn append_abort(&mut self) -> Result<(), String> {
+        BrokerTextPublisher::append_abort(self)
+            .await
+            .map_err(|err| err.to_string())
+    }
+
     async fn finish(self) -> Result<(), String> {
         BrokerTextPublisher::finish(self)
             .await
@@ -90,6 +103,7 @@ pub async fn run_stream_compose_session(
     open: OpenBrokerTextPublisher,
     chunk_bytes: usize,
     rx: mpsc::Receiver<StreamComposeCommand>,
+    cancel_rx: mpsc::Receiver<()>,
     report: StreamComposeReport,
 ) {
     let connect = BrokerTextPublisher::connect(open.clone());
@@ -98,6 +112,7 @@ pub async fn run_stream_compose_session(
         connect,
         chunk_bytes,
         rx,
+        cancel_rx,
         report,
         DEFAULT_LIVE_BROKER_WRITE_TIMEOUT,
     )
@@ -109,6 +124,7 @@ async fn run_stream_compose_session_with_connector<P, C, E>(
     connect: C,
     chunk_bytes: usize,
     mut rx: mpsc::Receiver<StreamComposeCommand>,
+    mut cancel_rx: mpsc::Receiver<()>,
     mut report: StreamComposeReport,
     live_write_timeout: Duration,
 ) where
@@ -125,8 +141,24 @@ async fn run_stream_compose_session_with_connector<P, C, E>(
     let mut live_error = None;
 
     loop {
+        // The dedicated cancel signal is a separate, bounded channel that
+        // callers cannot starve behind queued append/status/progress commands.
+        // Poll it first (`biased`) so an explicit cancel always wins the race
+        // against pending work and the session emits a live `Abort` before it
+        // shuts down.
         let command = if let Some(task) = connect_task.as_mut() {
             tokio::select! {
+                biased;
+                _ = cancel_rx.recv() => {
+                    cancel_stream_compose_session(
+                        connect_task.take(),
+                        &mut publisher,
+                        &mut live_error,
+                        live_write_timeout,
+                    )
+                    .await;
+                    return;
+                }
                 connect_result = task => {
                     connect_task = None;
                     match connect_result {
@@ -161,7 +193,20 @@ async fn run_stream_compose_session_with_connector<P, C, E>(
                 command = rx.recv() => command,
             }
         } else {
-            rx.recv().await
+            tokio::select! {
+                biased;
+                _ = cancel_rx.recv() => {
+                    cancel_stream_compose_session(
+                        None,
+                        &mut publisher,
+                        &mut live_error,
+                        live_write_timeout,
+                    )
+                    .await;
+                    return;
+                }
+                command = rx.recv() => command,
+            }
         };
         let Some(command) = command else {
             if let Some(task) = connect_task {
@@ -236,12 +281,6 @@ async fn run_stream_compose_session_with_connector<P, C, E>(
                 )
                 .await;
                 let _ = respond.send(result);
-                return;
-            }
-            StreamComposeCommand::Cancel => {
-                if let Some(task) = connect_task {
-                    task.abort();
-                }
                 return;
             }
         }
@@ -499,6 +538,52 @@ async fn live_broker_deadline<T>(
         .map_err(|_| format!("live broker write timed out after {live_write_timeout:?}"))?
 }
 
+/// Cancel an in-flight compose session, emitting a live `Abort` record so any
+/// online subscribers observe the terminal cancellation of the preview.
+///
+/// If the broker publisher is connected (or the connect task is still pending,
+/// in which case we briefly await it), we send a single `Abort` record and
+/// close the publisher cleanly with `finish`. If the broker was never reachable
+/// (connect failed, or a prior live error already poisoned the stream), local
+/// cleanup still proceeds: the pending connect task is aborted and we return
+/// without emitting anything. Abort/finish writes are bounded by
+/// `live_write_timeout` so a stalled broker cannot stall cleanup.
+async fn cancel_stream_compose_session<P>(
+    connect_task: Option<tokio::task::JoinHandle<Result<P, String>>>,
+    publisher: &mut Option<P>,
+    live_error: &mut Option<String>,
+    live_write_timeout: Duration,
+) where
+    P: LiveBrokerPublisher,
+{
+    // If we never finished connecting, give the in-flight connect a brief,
+    // bounded chance to land so the abort can be published; otherwise drop it.
+    // Bounding matters for abandoned/idle sweeps where the broker is gone and an
+    // unbounded await would stall cleanup for the full connect timeout.
+    if publisher.is_none()
+        && live_error.is_none()
+        && let Some(task) = connect_task
+    {
+        match tokio::time::timeout(CANCEL_CONNECT_GRACE, task).await {
+            Ok(Ok(Ok(connected))) => *publisher = Some(connected),
+            Ok(Ok(Err(err))) => *live_error = Some(err),
+            Ok(Err(err)) => *live_error = Some(err.to_string()),
+            Err(_) => *live_error = Some("broker connect timed out during cancel".to_owned()),
+        }
+    } else if let Some(task) = connect_task {
+        task.abort();
+    }
+
+    if live_error.is_none()
+        && let Some(mut connected) = publisher.take()
+        && live_broker_deadline(live_write_timeout, connected.append_abort())
+            .await
+            .is_ok()
+    {
+        let _ = live_broker_deadline(live_write_timeout, connected.finish()).await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::future;
@@ -507,11 +592,15 @@ mod tests {
 
     use cgka_traits::MessageId;
     use cgka_traits::agent_text_stream::{
-        AGENT_TEXT_STREAM_RECORD_PROGRESS_DELTA, AGENT_TEXT_STREAM_RECORD_STATUS,
-        AGENT_TEXT_STREAM_RECORD_TEXT_DELTA, AgentTextStreamTranscriptV1,
+        AGENT_TEXT_STREAM_RECORD_ABORT, AGENT_TEXT_STREAM_RECORD_PROGRESS_DELTA,
+        AGENT_TEXT_STREAM_RECORD_STATUS, AGENT_TEXT_STREAM_RECORD_TEXT_DELTA,
+        AgentTextStreamTranscriptV1,
     };
     use tokio::sync::{mpsc, oneshot};
-    use transport_quic_broker::{BrokerServerTrust, OpenBrokerTextPublisher};
+    use transport_quic_broker::{
+        BrokerServerTrust, OpenBrokerTextPublisher, QuicBrokerConfig, QuicBrokerServer,
+        SubscribeTextFromBroker, subscribe_text_from_broker,
+    };
 
     use crate::{StreamComposeCommand, StreamComposeReport, run_stream_compose_session};
 
@@ -587,7 +676,8 @@ mod tests {
         let open = test_stream_compose_open(stream_id.clone(), start_event_id.clone());
         let report = test_stream_compose_report(&stream_id);
         let (tx, rx) = mpsc::channel(4);
-        let session = tokio::spawn(run_stream_compose_session(open, 8, rx, report));
+        let (_cancel_tx, cancel_rx) = mpsc::channel(1);
+        let session = tokio::spawn(run_stream_compose_session(open, 8, rx, cancel_rx, report));
 
         let (append_tx, append_rx) = oneshot::channel();
         tx.send(StreamComposeCommand::Append {
@@ -640,7 +730,8 @@ mod tests {
         let open = test_stream_compose_open(stream_id.clone(), start_event_id.clone());
         let report = test_stream_compose_report(&stream_id);
         let (tx, rx) = mpsc::channel(4);
-        let session = tokio::spawn(run_stream_compose_session(open, 5, rx, report));
+        let (_cancel_tx, cancel_rx) = mpsc::channel(1);
+        let session = tokio::spawn(run_stream_compose_session(open, 5, rx, cancel_rx, report));
 
         for text in ["hello ", "world"] {
             let (respond, response) = oneshot::channel();
@@ -692,7 +783,8 @@ mod tests {
         let open = test_stream_compose_open(stream_id.clone(), start_event_id.clone());
         let report = test_stream_compose_report(&stream_id);
         let (tx, rx) = mpsc::channel(4);
-        let session = tokio::spawn(run_stream_compose_session(open, 16, rx, report));
+        let (_cancel_tx, cancel_rx) = mpsc::channel(1);
+        let session = tokio::spawn(run_stream_compose_session(open, 16, rx, cancel_rx, report));
 
         let (append_respond, append_response) = oneshot::channel();
         tx.send(StreamComposeCommand::Append {
@@ -767,7 +859,8 @@ mod tests {
         let open = test_stream_compose_open(stream_id.clone(), start_event_id.clone());
         let report = test_stream_compose_report(&stream_id);
         let (tx, rx) = mpsc::channel(4);
-        let session = tokio::spawn(run_stream_compose_session(open, 16, rx, report));
+        let (_cancel_tx, cancel_rx) = mpsc::channel(1);
+        let session = tokio::spawn(run_stream_compose_session(open, 16, rx, cancel_rx, report));
 
         let (append_respond, append_response) = oneshot::channel();
         tx.send(StreamComposeCommand::Append {
@@ -851,6 +944,10 @@ mod tests {
             future::pending().await
         }
 
+        async fn append_abort(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+
         async fn finish(self) -> Result<(), String> {
             Ok(())
         }
@@ -896,6 +993,10 @@ mod tests {
             _text: &str,
             _chunk_bytes: usize,
         ) -> Result<(), String> {
+            Ok(())
+        }
+
+        async fn append_abort(&mut self) -> Result<(), String> {
             Ok(())
         }
 
@@ -952,6 +1053,7 @@ mod tests {
         let open = test_stream_compose_open(stream_id.clone(), start_event_id.clone());
         let report = test_stream_compose_report(&stream_id);
         let (tx, rx) = mpsc::channel(4);
+        let (_cancel_tx, cancel_rx) = mpsc::channel(1);
         let (connect_tx, connect_rx) = oneshot::channel();
         let (append_started_tx, append_started_rx) = oneshot::channel();
         let session = tokio::spawn(super::run_stream_compose_session_with_connector(
@@ -964,6 +1066,7 @@ mod tests {
             },
             8,
             rx,
+            cancel_rx,
             report,
             Duration::from_millis(10),
         ));
@@ -1025,5 +1128,252 @@ mod tests {
         );
 
         session.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn compose_session_cancel_emits_abort_record_to_subscriber() {
+        let server = QuicBrokerServer::bind(QuicBrokerConfig {
+            bind_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            ..QuicBrokerConfig::default()
+        })
+        .unwrap();
+        let broker_addr = server.local_addr().unwrap();
+        let server_cert = server.server_cert_der().to_vec();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let broker_task = tokio::spawn(server.run_until(async {
+            let _ = shutdown_rx.await;
+        }));
+
+        let stream_id = vec![0xc1; 32];
+        let start_event_id = MessageId::new(vec![0xc2; 32]);
+
+        // A subscriber attaches to the live preview before any records arrive.
+        let subscriber = tokio::spawn(subscribe_text_from_broker(SubscribeTextFromBroker {
+            broker_addr,
+            server_name: "localhost".to_owned(),
+            trust: BrokerServerTrust::CertificateDer(server_cert.clone()),
+            stream_id: stream_id.clone(),
+            start_event_id: start_event_id.clone(),
+            crypto: None,
+        }));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let open = OpenBrokerTextPublisher {
+            broker_addr,
+            server_name: "localhost".to_owned(),
+            trust: BrokerServerTrust::CertificateDer(server_cert),
+            stream_id: stream_id.clone(),
+            start_event_id,
+            crypto: None,
+        };
+        let report = test_stream_compose_report(&stream_id);
+        let (tx, rx) = mpsc::channel(4);
+        let (cancel_tx, cancel_rx) = mpsc::channel(1);
+        let session = tokio::spawn(run_stream_compose_session(open, 16, rx, cancel_rx, report));
+
+        // Let the broker connect land so the text delta is flushed live (rather
+        // than buffered as a pending record) before we append.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let (append_respond, append_response) = oneshot::channel();
+        tx.send(StreamComposeCommand::Append {
+            text: "partial answer".to_owned(),
+            respond: append_respond,
+        })
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_millis(500), append_response)
+            .await
+            .expect("append should complete")
+            .unwrap()
+            .unwrap();
+
+        // Cancel the preview. The session must publish a live Abort record and
+        // close the publisher cleanly so the subscriber observes the terminal
+        // cancellation instead of an open-ended preview.
+        cancel_tx.send(()).await.unwrap();
+
+        let received = tokio::time::timeout(Duration::from_secs(5), subscriber)
+            .await
+            .expect("subscriber should finish once the stream is aborted and closed")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(received.text, "partial answer");
+        assert!(
+            received
+                .chunks
+                .iter()
+                .any(|chunk| chunk.record_type == AGENT_TEXT_STREAM_RECORD_ABORT),
+            "subscriber must observe a live Abort record on cancel; got {:?}",
+            received
+                .chunks
+                .iter()
+                .map(|chunk| chunk.record_type)
+                .collect::<Vec<_>>()
+        );
+        let abort = received
+            .chunks
+            .iter()
+            .find(|chunk| chunk.record_type == AGENT_TEXT_STREAM_RECORD_ABORT)
+            .unwrap();
+        assert_eq!(abort.text, "");
+
+        session.await.unwrap();
+        let _ = shutdown_tx.send(());
+        broker_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn compose_session_cancel_completes_when_broker_unreachable() {
+        // Broker addr that never accepts a connection: cancel must still tear
+        // the session down promptly (bounded connect grace) rather than hang.
+        let stream_id = vec![0xd1; 32];
+        let start_event_id = MessageId::new(vec![0xd2; 32]);
+        let open = test_stream_compose_open(stream_id.clone(), start_event_id);
+        let report = test_stream_compose_report(&stream_id);
+        let (tx, rx) = mpsc::channel(4);
+        let (cancel_tx, cancel_rx) = mpsc::channel(1);
+        let session = tokio::spawn(run_stream_compose_session(open, 16, rx, cancel_rx, report));
+
+        // Append before any broker connection is established; this is buffered
+        // locally as a pending live record.
+        let (append_respond, append_response) = oneshot::channel();
+        tx.send(StreamComposeCommand::Append {
+            text: "buffered".to_owned(),
+            respond: append_respond,
+        })
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_millis(500), append_response)
+            .await
+            .expect("append should not wait on broker connect")
+            .unwrap()
+            .unwrap();
+
+        cancel_tx.send(()).await.unwrap();
+
+        // The session must terminate within the bounded cancel grace + slack,
+        // not stall on an unreachable broker connect.
+        tokio::time::timeout(Duration::from_secs(8), session)
+            .await
+            .expect("cancel must not hang when the broker is unreachable")
+            .unwrap();
+    }
+
+    /// Regression for the cancel-starvation bug: a full command queue must not
+    /// prevent cancellation from reaching the session. The dedicated cancel
+    /// signal is polled with `biased` priority on its own bounded channel, so
+    /// even when every `StreamComposeCommand` slot is occupied the session still
+    /// observes the cancel, emits a live `Abort`, and the subscriber sees it
+    /// instead of an open-ended preview.
+    #[tokio::test]
+    async fn compose_session_cancel_wins_even_with_full_command_queue() {
+        let server = QuicBrokerServer::bind(QuicBrokerConfig {
+            bind_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            ..QuicBrokerConfig::default()
+        })
+        .unwrap();
+        let broker_addr = server.local_addr().unwrap();
+        let server_cert = server.server_cert_der().to_vec();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let broker_task = tokio::spawn(server.run_until(async {
+            let _ = shutdown_rx.await;
+        }));
+
+        let stream_id = vec![0xe1; 32];
+        let start_event_id = MessageId::new(vec![0xe2; 32]);
+
+        let subscriber = tokio::spawn(subscribe_text_from_broker(SubscribeTextFromBroker {
+            broker_addr,
+            server_name: "localhost".to_owned(),
+            trust: BrokerServerTrust::CertificateDer(server_cert.clone()),
+            stream_id: stream_id.clone(),
+            start_event_id: start_event_id.clone(),
+            crypto: None,
+        }));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let open = OpenBrokerTextPublisher {
+            broker_addr,
+            server_name: "localhost".to_owned(),
+            trust: BrokerServerTrust::CertificateDer(server_cert),
+            stream_id: stream_id.clone(),
+            start_event_id,
+            crypto: None,
+        };
+        let report = test_stream_compose_report(&stream_id);
+        // Capacity-1 command channel keeps the queue trivially saturable.
+        let (tx, rx) = mpsc::channel(1);
+        let (cancel_tx, cancel_rx) = mpsc::channel(1);
+        let session = tokio::spawn(run_stream_compose_session(open, 16, rx, cancel_rx, report));
+
+        // Land at least one live record so the publisher is connected and the
+        // subscriber has an open preview to be aborted.
+        let (append_respond, append_response) = oneshot::channel();
+        tx.send(StreamComposeCommand::Append {
+            text: "partial answer".to_owned(),
+            respond: append_respond,
+        })
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_millis(500), append_response)
+            .await
+            .expect("first append should complete")
+            .unwrap()
+            .unwrap();
+
+        // Saturate the command queue: one in-flight (being processed) plus a
+        // full buffer. We never await these responses, so the command channel
+        // stays full and a Cancel command could never be `try_send`-ed onto it.
+        for _ in 0..8 {
+            let (respond, _ignored) = oneshot::channel();
+            if tx
+                .try_send(StreamComposeCommand::Append {
+                    text: "queued".to_owned(),
+                    respond,
+                })
+                .is_err()
+            {
+                // Channel is full — exactly the starvation condition we want.
+                break;
+            }
+        }
+        assert!(
+            tx.try_reserve().is_err(),
+            "command queue should be saturated for this regression"
+        );
+
+        // The dedicated cancel signal must still get through.
+        cancel_tx
+            .send(())
+            .await
+            .expect("cancel signal must not be starved by a full command queue");
+
+        let received = tokio::time::timeout(Duration::from_secs(5), subscriber)
+            .await
+            .expect("subscriber should finish once the stream is aborted and closed")
+            .unwrap()
+            .unwrap();
+
+        assert!(
+            received
+                .chunks
+                .iter()
+                .any(|chunk| chunk.record_type == AGENT_TEXT_STREAM_RECORD_ABORT),
+            "subscriber must observe a live Abort even when the command queue is full; got {:?}",
+            received
+                .chunks
+                .iter()
+                .map(|chunk| chunk.record_type)
+                .collect::<Vec<_>>()
+        );
+
+        tokio::time::timeout(Duration::from_secs(5), session)
+            .await
+            .expect("session must terminate after cancel")
+            .unwrap();
+        let _ = shutdown_tx.send(());
+        broker_task.await.unwrap().unwrap();
     }
 }

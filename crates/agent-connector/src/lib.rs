@@ -799,6 +799,10 @@ impl AgentConnector {
             .await?;
 
         let (tx, rx) = mpsc::channel(STREAM_COMPOSE_CHANNEL_DEPTH);
+        // Dedicated cancel signal: a separate, bounded channel that cannot be
+        // starved behind queued append/status/progress commands, so an explicit
+        // cancel always reaches the session and a live `Abort` is emitted.
+        let (cancel_tx, cancel_rx) = mpsc::channel(1);
         let report = StreamComposeReport {
             account: Some(account.account_id_hex.clone()),
             group_id: group_id_hex.clone(),
@@ -822,6 +826,7 @@ impl AgentConnector {
             },
             STREAM_COMPOSE_CHUNK_BYTES,
             rx,
+            cancel_rx,
             report,
         ));
         self.streams.insert(
@@ -832,6 +837,7 @@ impl AgentConnector {
                 stream_id,
                 start_message_id_hex: start_message_id_hex.clone(),
                 tx,
+                cancel_tx,
                 abort: handle.abort_handle(),
                 last_activity: Instant::now(),
             },
@@ -1079,8 +1085,18 @@ impl AgentConnector {
         stream_id_hex: &str,
     ) -> Result<AgentControlResponse, ConnectorError> {
         let session = self.streams.remove(stream_id_hex)?;
-        let _ = session.tx.try_send(StreamComposeCommand::Cancel);
-        session.abort.abort();
+        // Send a graceful cancel over the dedicated cancel signal and let the
+        // compose session drain it: the session emits a live `Abort` record (so
+        // online subscribers observe the cancellation) and shuts itself down.
+        // The cancel signal is its own bounded channel that cannot be starved by
+        // queued append/status/progress commands, so it always lands. Do NOT
+        // abort the task on a full *command* queue — only fall back to a forced
+        // abort if the dedicated cancel channel itself is gone (session not
+        // running), which is the only case where the session can no longer
+        // publish an Abort.
+        if session.cancel_tx.try_send(()).is_err() {
+            session.abort.abort();
+        }
         Ok(AgentControlResponse::Ack)
     }
 
@@ -2102,6 +2118,7 @@ struct ActiveStreamSession {
     stream_id: Vec<u8>,
     start_message_id_hex: String,
     tx: mpsc::Sender<StreamComposeCommand>,
+    cancel_tx: mpsc::Sender<()>,
     abort: tokio::task::AbortHandle,
     last_activity: Instant,
 }
@@ -2110,8 +2127,13 @@ impl StreamSessionStore {
     fn insert(&self, stream_id_hex: String, session: ActiveStreamSession) {
         let mut sessions = self.sessions.lock().expect("stream session lock poisoned");
         if let Some(previous) = sessions.insert(stream_id_hex, session) {
-            let _ = previous.tx.try_send(StreamComposeCommand::Cancel);
-            previous.abort.abort();
+            // Graceful cancel over the dedicated signal: let the replaced
+            // session emit its live Abort and self-terminate. The cancel signal
+            // can't be starved by a full command queue, so only force-abort if
+            // the cancel channel itself is gone.
+            if previous.cancel_tx.try_send(()).is_err() {
+                previous.abort.abort();
+            }
         }
     }
 
@@ -2154,8 +2176,14 @@ impl StreamSessionStore {
             .collect();
         for stream_id_hex in &stale {
             if let Some(session) = sessions.remove(stream_id_hex) {
-                let _ = session.tx.try_send(StreamComposeCommand::Cancel);
-                session.abort.abort();
+                // Graceful cancel over the dedicated signal so an abandoned
+                // session still emits a live `Abort`; only force-abort if the
+                // cancel channel is gone. The forced abort is intentionally NOT
+                // unconditional here: a successful cancel lets the session flush
+                // its Abort and shut itself down.
+                if session.cancel_tx.try_send(()).is_err() {
+                    session.abort.abort();
+                }
             }
         }
         stale.len()
@@ -2662,10 +2690,25 @@ mod tests {
 
         let store = StreamSessionStore::default();
 
-        // An idle session: last activity well beyond the timeout. Its compose task
-        // is a stand-in that blocks on rx, exactly like run_stream_compose_session.
+        // An idle session: last activity well beyond the timeout. Its compose
+        // task stands in for run_stream_compose_session: it exits when it
+        // observes the dedicated cancel signal (modeling the graceful Abort
+        // path), and otherwise blocks on the command channel.
         let (idle_tx, mut idle_rx) = tokio::sync::mpsc::channel::<StreamComposeCommand>(4);
-        let idle_handle = tokio::spawn(async move { while idle_rx.recv().await.is_some() {} });
+        let (idle_cancel_tx, mut idle_cancel_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let idle_handle = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = idle_cancel_rx.recv() => break,
+                    cmd = idle_rx.recv() => {
+                        if cmd.is_none() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
         store.insert(
             "aa".to_owned(),
             ActiveStreamSession {
@@ -2674,6 +2717,7 @@ mod tests {
                 stream_id: vec![0xaa],
                 start_message_id_hex: "00".to_owned(),
                 tx: idle_tx,
+                cancel_tx: idle_cancel_tx,
                 abort: idle_handle.abort_handle(),
                 last_activity: Instant::now() - Duration::from_secs(3600),
             },
@@ -2681,6 +2725,7 @@ mod tests {
 
         // A fresh session that must survive the sweep.
         let (active_tx, mut active_rx) = tokio::sync::mpsc::channel::<StreamComposeCommand>(4);
+        let (active_cancel_tx, _active_cancel_rx) = tokio::sync::mpsc::channel::<()>(1);
         let active_handle = tokio::spawn(async move { while active_rx.recv().await.is_some() {} });
         store.insert(
             "bb".to_owned(),
@@ -2690,6 +2735,7 @@ mod tests {
                 stream_id: vec![0xbb],
                 start_message_id_hex: "00".to_owned(),
                 tx: active_tx,
+                cancel_tx: active_cancel_tx,
                 abort: active_handle.abort_handle(),
                 last_activity: Instant::now(),
             },
@@ -2698,15 +2744,16 @@ mod tests {
         let swept = store.sweep_idle(Duration::from_secs(300));
         assert_eq!(swept, 1, "exactly the idle session should be swept");
 
-        // Idle session is gone and its compose task was aborted, dropping the
-        // mpsc Sender / transcript / quinn endpoint it was holding open.
+        // Idle session is gone and its compose task observed the graceful
+        // cancel, then finished — dropping the mpsc Sender / transcript / quinn
+        // endpoint it was holding open.
         assert!(
             store.remove("aa").is_err(),
             "idle session should be removed"
         );
         let _ = tokio::time::timeout(Duration::from_secs(5), idle_handle)
             .await
-            .expect("aborted compose task should finish promptly");
+            .expect("swept compose task should finish promptly");
 
         // Active session is untouched and still usable.
         assert!(store.get("bb").is_ok(), "active session should remain");
