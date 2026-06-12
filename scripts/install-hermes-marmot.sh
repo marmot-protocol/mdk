@@ -1,13 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+workspace_version_default="$(sed -n 's/^version = "\(.*\)"/\1/p' "$SCRIPT_DIR/../Cargo.toml" 2>/dev/null | head -n 1)"
+workspace_version_default="${workspace_version_default:-latest}"
+
 MARMOT_RELEASE_REPO="${MARMOT_RELEASE_REPO:-marmot-protocol/darkmatter}"
-MARMOT_RELEASE_TAG="${MARMOT_RELEASE_TAG:-dm-agent-beta}"
+DM_AGENT_VERSION_DEFAULT="${DM_AGENT_VERSION_DEFAULT:-$workspace_version_default}"
+DM_AGENT_VERSION="${DM_AGENT_VERSION:-${DM_AGENT_SHA:-$DM_AGENT_VERSION_DEFAULT}}"
+MARMOT_RELEASE_TAG_DEFAULT="${MARMOT_RELEASE_TAG_DEFAULT:-dm-agent-v${DM_AGENT_VERSION}}"
+MARMOT_RELEASE_TAG="${MARMOT_RELEASE_TAG:-$MARMOT_RELEASE_TAG_DEFAULT}"
 MARMOT_INSTALL_PREFIX="${MARMOT_INSTALL_PREFIX:-${HOME}/.local}"
 MARMOT_PLUGIN_DIR="${MARMOT_PLUGIN_DIR:-${HOME}/.hermes/plugins/marmot}"
 MARMOT_HOME="${MARMOT_HOME:-${HOME}/.marmot-agent}"
 MARMOT_RELAYS="${MARMOT_RELAYS:-wss://relay.eu.whitenoise.chat,wss://relay.us.whitenoise.chat}"
-DM_AGENT_SHA="${DM_AGENT_SHA:-latest}"
 INSTALL_BOOTSTRAP=0
 START_DM_AGENT=0
 DRY_RUN=0
@@ -18,8 +24,8 @@ usage() {
     cat <<'USAGE'
 Usage: install-hermes-marmot.sh [options]
 
-Install dm-agent and the Hermes Marmot plugin from the rolling dm-agent-beta
-GitHub release. Hermes itself must already be installed.
+Install dm-agent and the Hermes Marmot plugin from a DM Agent GitHub release.
+Hermes itself must already be installed.
 
 Options:
   --bootstrap           After install, start dm-agent and run dm-agent bootstrap --qr
@@ -31,17 +37,18 @@ Options:
 
 Environment:
   MARMOT_RELEASE_REPO   GitHub repo (default: marmot-protocol/darkmatter)
-  MARMOT_RELEASE_TAG    Release tag (default: dm-agent-beta)
-  DM_AGENT_SHA          Pinned build suffix or "latest" (default: latest)
+  MARMOT_RELEASE_TAG    Release tag (release assets default to their own tag)
+  DM_AGENT_VERSION      Asset version suffix (release assets default to their own version)
+  DM_AGENT_SHA          Legacy alias for DM_AGENT_VERSION
   MARMOT_INSTALL_PREFIX Install root for dm-agent (default: ~/.local)
   MARMOT_PLUGIN_DIR     Hermes plugin path (default: ~/.hermes/plugins/marmot)
   MARMOT_HOME           dm-agent home used by bootstrap (default: ~/.marmot-agent)
   MARMOT_RELAYS         Relay CSV used when --bootstrap starts dm-agent
 
 Example:
-  curl -fsSL https://github.com/marmot-protocol/darkmatter/releases/download/dm-agent-beta/install-hermes-marmot.sh | bash
+  curl -fsSL https://github.com/marmot-protocol/darkmatter/releases/download/dm-agent-v0.1.0/install-hermes-marmot.sh | bash
 
-  curl -fsSL .../install-hermes-marmot.sh | DM_AGENT_SHA=abc123def456 bash -s -- --bootstrap
+  curl -fsSL .../install-hermes-marmot.sh | bash -s -- --bootstrap
 USAGE
 }
 
@@ -122,7 +129,7 @@ verify_sha256() {
 install_dm_agent() {
     local platform="$1"
     local tmpdir="$2"
-    local suffix="$DM_AGENT_SHA"
+    local suffix="$DM_AGENT_VERSION"
     local archive="$tmpdir/dm-agent-$platform-$suffix.tar.gz"
     local checksum="$tmpdir/dm-agent-$platform-$suffix.tar.gz.sha256"
     local extract_dir="$tmpdir/dm-agent-extract"
@@ -153,7 +160,7 @@ install_dm_agent() {
 
 install_plugin() {
     local tmpdir="$1"
-    local suffix="$DM_AGENT_SHA"
+    local suffix="$DM_AGENT_VERSION"
     local archive="$tmpdir/hermes-marmot-plugin-$suffix.tar.gz"
     local checksum="$tmpdir/hermes-marmot-plugin-$suffix.tar.gz.sha256"
     local extract_dir="$tmpdir/plugin-extract"
@@ -264,7 +271,7 @@ Next steps:
   4. Start Hermes:
      hermes gateway run
 
-Build: ${MARMOT_RELEASE_REPO}@${MARMOT_RELEASE_TAG} (${DM_AGENT_SHA})
+Build: ${MARMOT_RELEASE_REPO}@${MARMOT_RELEASE_TAG} (${DM_AGENT_VERSION})
 EOF
 }
 
@@ -309,7 +316,7 @@ platform="$(detect_platform)"
 tmpdir="$(mktemp -d)"
 trap 'rm -rf "$tmpdir"' EXIT
 
-log "platform=$platform repo=$MARMOT_RELEASE_REPO tag=$MARMOT_RELEASE_TAG sha=$DM_AGENT_SHA"
+log "platform=$platform repo=$MARMOT_RELEASE_REPO tag=$MARMOT_RELEASE_TAG version=$DM_AGENT_VERSION"
 install_dm_agent "$platform" "$tmpdir"
 install_plugin "$tmpdir"
 enable_hermes_plugin

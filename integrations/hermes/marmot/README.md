@@ -14,11 +14,11 @@ The current Hermes plugin loader expects platform plugins as directories directl
 under `~/.hermes/plugins/<name>/` with `plugin.yaml`, `__init__.py`, and
 adapter implementation files.
 
-## Beta Install (Hermes Already Installed)
+## Release Install (Hermes Already Installed)
 
-Rolling `dm-agent` builds and the Hermes plugin are published on the
-[`dm-agent-beta`](https://github.com/marmot-protocol/darkmatter/releases/tag/dm-agent-beta)
-GitHub pre-release after each push to `master`.
+Versioned `dm-agent` builds and the Hermes plugin are published as
+[`dm-agent-v*`](https://github.com/marmot-protocol/darkmatter/releases) GitHub
+pre-releases.
 
 Prerequisites:
 
@@ -29,19 +29,21 @@ Prerequisites:
 One-line install:
 
 ```sh
-curl -fsSL https://github.com/marmot-protocol/darkmatter/releases/download/dm-agent-beta/install-hermes-marmot.sh | bash
+DM_AGENT_VERSION=0.1.0
+curl -fsSL "https://github.com/marmot-protocol/darkmatter/releases/download/dm-agent-v${DM_AGENT_VERSION}/install-hermes-marmot.sh" | bash
 ```
 
 Install and bootstrap in one step:
 
 ```sh
-curl -fsSL https://github.com/marmot-protocol/darkmatter/releases/download/dm-agent-beta/install-hermes-marmot.sh | bash -s -- --bootstrap
+DM_AGENT_VERSION=0.1.0
+curl -fsSL "https://github.com/marmot-protocol/darkmatter/releases/download/dm-agent-v${DM_AGENT_VERSION}/install-hermes-marmot.sh" | bash -s -- --bootstrap
 ```
 
-Pin a specific build when reporting bugs:
+Use the exact release version when reporting bugs:
 
 ```sh
-curl -fsSL https://github.com/marmot-protocol/darkmatter/releases/download/dm-agent-beta/install-hermes-marmot.sh | DM_AGENT_SHA=<12-char-sha> bash
+dm-agent --version
 ```
 
 The installer puts `dm-agent` in `~/.local/bin`, extracts the plugin to

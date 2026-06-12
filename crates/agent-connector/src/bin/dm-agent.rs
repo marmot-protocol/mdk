@@ -13,6 +13,7 @@ use clap::{Args, Parser, Subcommand};
 #[derive(Debug, Parser)]
 #[command(
     name = "dm-agent",
+    version,
     about = "Marmot local agent connector for Hermes and OpenClaw gateways"
 )]
 struct Cli {

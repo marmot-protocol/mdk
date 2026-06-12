@@ -1,22 +1,33 @@
 # Darkmatter Release Guide
 
-This file is the release checklist for Darkmatter itself and for generated MarmotKit bindings used by app repos.
+This file is the release checklist for Darkmatter itself, generated MarmotKit bindings used by app repos, and
+repository-built binaries such as DM Agent.
 
 ## Release Tracks
 
-Darkmatter currently has two versioned release tracks:
+Darkmatter uses one workspace version as the compatibility cohort and separate tag prefixes for each artifact track.
+That keeps tightly coupled crates, bindings, and binaries easy to reason about while still letting us publish only the
+artifact that changed.
+
+Current tracks:
 
 - Whole-workspace releases use tags like `v0.1.0`. These identify a versioned source snapshot of the protocol draft,
-  Rust workspace, CLI, daemon, TUI, app runtime, storage, transports, and binding source crate.
+  Rust workspace, CLI, daemon, TUI, app runtime, storage, transports, agent crates, and binding source crate.
+- DM Agent releases use tags like `dm-agent-v0.1.0`. These publish the `dm-agent` connector binary plus adapter
+  install assets, starting with the Hermes Marmot plugin and installer.
 - MarmotKit binding releases use tags like `marmotkit-v0.1.0`. These build generated app-consumable binding bundles
   from `crates/marmot-uniffi` and attach them to a GitHub Release.
 
-When a binding release corresponds to a whole-workspace release, create both tags on the same commit:
+Future binary or package tracks should follow the same shape, for example `quic-broker-v0.1.0` or `dm-cli-v0.1.0`, only
+when those artifacts become independently consumed release surfaces.
+
+When multiple tracks correspond to the same source snapshot, create the tags on the same commit:
 
 ```sh
 git tag -a v0.1.0 -m "darkmatter v0.1.0"
+git tag -a dm-agent-v0.1.0 -m "DM Agent v0.1.0"
 git tag -a marmotkit-v0.1.0 -m "MarmotKit v0.1.0"
-git push origin v0.1.0 marmotkit-v0.1.0
+git push origin v0.1.0 dm-agent-v0.1.0 marmotkit-v0.1.0
 ```
 
 The workspace is not published to crates.io today. The root `Cargo.toml` has `publish = false`, and the crates depend
@@ -24,8 +35,8 @@ on each other through workspace paths. Treat Git tags and GitHub Releases as the
 
 ## Version Rules
 
-Use the root `Cargo.toml` workspace version as the release version for the Rust workspace, CLI, daemon, TUI, app runtime,
-and bindings:
+Use the root `Cargo.toml` workspace version as the release version for the Rust workspace, DM Agent, CLI, daemon, TUI,
+app runtime, and generated bindings:
 
 ```toml
 [workspace.package]
@@ -35,15 +46,27 @@ version = "0.1.0"
 Use the same version number in:
 
 - `v<version>` for the whole workspace;
+- `dm-agent-v<version>` for DM Agent binary and adapter-install releases;
 - `marmotkit-v<version>` for generated app binding bundles;
 - `crates/cli/CHANGELOG.md` for CLI-visible changes.
+
+The tag prefix names the artifact track. The numeric version names the compatibility cohort. It is fine for one track to
+skip versions when it has no changed artifact to publish. Do not reuse the same track/version tag for a different commit.
 
 Use a new version when public behavior changes. That includes:
 
 - UniFFI records, enums, object methods, async methods, or error variants;
 - app runtime behavior that iOS or Android depends on;
-- CLI, daemon, or TUI commands and JSON output;
+- DM Agent, CLI, daemon, or TUI commands and JSON output;
+- agent-control protocol, adapter/plugin contract, installer, or config behavior;
 - protocol, transport, storage, or vector changes that downstream users need to pin.
+
+Before `1.0.0`, treat `0.<minor>.0` as the breaking-compatibility line and `0.<minor>.<patch>` as the compatible bugfix
+or packaging line. Avoid `0.0.x` releases unless every update is intentionally a breaking experiment.
+
+Each release artifact should include a manifest recording the source commit, workspace version, release tag, artifact
+version, `Cargo.lock` hash when relevant, toolchain version, and package contents. Add explicit protocol or ABI fields
+to manifests when downstream compatibility depends on more than the workspace version.
 
 ## Preflight For Any Release
 
@@ -117,6 +140,61 @@ Use this for a versioned Darkmatter source/library release.
 
 Until a dedicated whole-workspace release workflow exists, the whole-workspace GitHub Release is a source release. The
 GitHub-generated source archives are the downloadable artifacts.
+
+## DM Agent Release
+
+Use this for the Dark Matter agent connector entry point. The release publishes `dm-agent` binaries for supported
+platforms plus adapter install assets. Today that includes the Hermes Marmot plugin and `install-hermes-marmot.sh`; the
+same release track can grow OpenClaw or other agent-system assets later.
+
+The workflow lives at:
+
+```text
+.github/workflows/dm-agent-binaries.yml
+```
+
+Pull requests, master pushes, and manual workflow runs build validation artifacts only. Publishing happens only when a
+tag matching `dm-agent-v*` is pushed. The workflow validates version-like tags such as `dm-agent-v0.1.0` and requires
+the tag version to match the root workspace version in `Cargo.toml`.
+
+Before a DM Agent release, run the normal preflight plus:
+
+```sh
+cargo test -p agent-connector
+bash scripts/install-hermes-marmot.sh --dry-run
+```
+
+Cut the release tag from the current `origin/master` commit:
+
+```sh
+just release-dm-agent 0.1.0
+```
+
+For a dry run:
+
+```sh
+just release-dm-agent-dry-run 0.1.0
+```
+
+The helper checks that the workspace version matches, the working tree is clean, `HEAD` matches `origin/master`, and the
+`dm-agent-v<version>` tag does not already exist locally or remotely. Pushing the tag starts the GitHub release workflow.
+
+The release job creates these assets:
+
+- `dm-agent-linux-x86_64-<version>.tar.gz`
+- `dm-agent-linux-x86_64-<version>.tar.gz.sha256`
+- `dm-agent-darwin-aarch64-<version>.tar.gz`
+- `dm-agent-darwin-aarch64-<version>.tar.gz.sha256`
+- `hermes-marmot-plugin-<version>.tar.gz`
+- `hermes-marmot-plugin-<version>.tar.gz.sha256`
+- `install-hermes-marmot.sh`
+
+The installer asset is generated during the release and defaults to its own `dm-agent-v<version>` release tag and
+`<version>` asset suffix. A release install looks like:
+
+```sh
+curl -fsSL https://github.com/marmot-protocol/darkmatter/releases/download/dm-agent-v0.1.0/install-hermes-marmot.sh | bash
+```
 
 ## MarmotKit Binding Release
 
@@ -216,13 +294,14 @@ Use that checklist when updating `marmot-protocol/homebrew-tap`.
 
 ## Correcting A Release
 
-If a tag points at the wrong commit and nobody should consume it, delete and recreate the tag before app repos pin it:
+If a tag points at the wrong commit and nobody should consume it, delete and recreate the tag before downstream repos or
+testers pin it:
 
 ```sh
-git tag -d marmotkit-v0.1.0
-git push origin :refs/tags/marmotkit-v0.1.0
-git tag -a marmotkit-v0.1.0 -m "MarmotKit v0.1.0"
-git push origin marmotkit-v0.1.0
+git tag -d dm-agent-v0.1.0
+git push origin :refs/tags/dm-agent-v0.1.0
+git tag -a dm-agent-v0.1.0 -m "DM Agent v0.1.0"
+git push origin dm-agent-v0.1.0
 ```
 
 If a release has already been consumed, create a new patch version instead.
@@ -230,32 +309,6 @@ If a release has already been consumed, create a new patch version instead.
 If the workflow succeeds but an uploaded asset is wrong, rerun the workflow from the same tag only when the source commit
 is correct and the failure was packaging-only. The release job uploads assets with `--clobber`, so a rerun can replace
 assets on the same GitHub Release.
-
-## dm-agent Beta Release
-
-Use this for Hermes/Marmot connector beta testers who need prebuilt `dm-agent` binaries and the Hermes plugin bundle.
-
-The workflow lives at:
-
-```text
-.github/workflows/dm-agent-binaries.yml
-```
-
-It runs on pushes to `master` that touch the connector, plugin, or installer paths. Each successful run updates the
-rolling GitHub pre-release tag `dm-agent-beta` with:
-
-- `dm-agent-linux-x86_64-latest.tar.gz` and a matching `<sha>` bundle
-- `dm-agent-darwin-aarch64-latest.tar.gz` and a matching `<sha>` bundle
-- `hermes-marmot-plugin-latest.tar.gz` and a matching `<sha>` bundle
-- `install-hermes-marmot.sh`
-
-Beta install entry point:
-
-```sh
-curl -fsSL https://github.com/marmot-protocol/darkmatter/releases/download/dm-agent-beta/install-hermes-marmot.sh | bash
-```
-
-See `integrations/hermes/marmot/README.md` for bootstrap and Hermes setup steps after install.
 
 ## Current Limits
 

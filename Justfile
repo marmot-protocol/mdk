@@ -69,6 +69,12 @@ hermes-dev-teardown args="":
 hermes-dev-script-test:
     integrations/hermes/marmot/tests/test_dev_scripts.sh
 
+release-dm-agent version:
+    ./scripts/cut-dm-agent-release.sh {{version}}
+
+release-dm-agent-dry-run version:
+    ./scripts/cut-dm-agent-release.sh --dry-run {{version}}
+
 hermes-bootstrap-test:
     PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s integrations/hermes/marmot/tests -p 'test_bootstrap_agent.py'
 
