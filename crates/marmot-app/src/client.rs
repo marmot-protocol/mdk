@@ -42,7 +42,8 @@ use crate::{
     AppRuntime, AppTransportRouting, GroupInviteDeclineResult, MarmotApp, MarmotRelayPlane,
     MarmotRelayPlaneAccountAdapter, MediaAttachmentReference, MediaDownloadResult,
     MediaUploadRequest, MediaUploadResult, SDK_DRAIN_WAIT, SDK_FIRST_SYNC_WAIT, SendSummary,
-    SyncSummary, refresh_seen_lookup_if_needed, remember_seen_event, unix_now_seconds,
+    SyncSummary, TRANSPORT_CURSOR_MAX_FUTURE_SKEW, refresh_seen_lookup_if_needed,
+    remember_seen_event, unix_now_seconds,
 };
 pub struct AppClient {
     pub(crate) app: MarmotApp,
@@ -2428,13 +2429,23 @@ impl AppClient {
         Ok(())
     }
 
+    /// Advance the persisted transport cursor from an inbound message.
+    ///
+    /// `timestamp` is the sender-controlled Nostr `created_at` of the outer
+    /// kind-445 event and is never validated upstream. The cursor is a
+    /// monotonic-max, persisted value that becomes a relay-level `since` filter
+    /// on subscription rebuild and account open, so an unbounded far-future
+    /// value would push `since` into the future and silently halt all message
+    /// reception across restarts (darkmatter#182). Clamp the advance to local
+    /// wall-clock plus a bounded skew so a hostile or clock-skewed sender can
+    /// move the cursor no further than `now + TRANSPORT_CURSOR_MAX_FUTURE_SKEW`.
     fn remember_transport_cursor(&mut self, timestamp: u64) {
-        self.state.last_transport_timestamp = Some(
-            self.state
-                .last_transport_timestamp
-                .map(|current| current.max(timestamp))
-                .unwrap_or(timestamp),
-        );
+        self.state.last_transport_timestamp = Some(clamped_transport_cursor(
+            self.state.last_transport_timestamp,
+            timestamp,
+            unix_now_seconds(),
+            TRANSPORT_CURSOR_MAX_FUTURE_SKEW.as_secs(),
+        ));
     }
 
     fn remember_published_reports(&mut self, effects: &marmot_account::AccountDeviceEffects) {
@@ -2769,5 +2780,109 @@ fn notification_trigger_for_intent(
         | AppMessageIntent::GroupSystem { .. }
         | AppMessageIntent::PushTokenUpdate { .. }
         | AppMessageIntent::PushTokenRemoval { .. } => None,
+    }
+}
+
+/// Compute the next persisted transport cursor from a candidate inbound
+/// timestamp.
+///
+/// `candidate` is the sender-controlled Nostr `created_at` and is untrusted. It
+/// is first clamped to `now + max_future_skew_secs` so a far-future value
+/// cannot poison the cursor (which would push the relay `since` filter into the
+/// future and silently halt message reception — darkmatter#182), then folded
+/// into the existing monotonic-max cursor. The existing `current` is clamped
+/// the same way before the max, so a cursor that was already poisoned before
+/// this guard existed is *healed* back down to `now + max_future_skew_secs`
+/// here instead of being preserved forever by the monotonic max. A benign
+/// in-range timestamp is unaffected; the skew margin tolerates ordinary sender
+/// clock drift.
+fn clamped_transport_cursor(
+    current: Option<u64>,
+    candidate: u64,
+    now: u64,
+    max_future_skew_secs: u64,
+) -> u64 {
+    let max_allowed = now.saturating_add(max_future_skew_secs);
+    let clamped = candidate.min(max_allowed);
+    current
+        .map(|current| current.min(max_allowed).max(clamped))
+        .unwrap_or(clamped)
+}
+
+#[cfg(test)]
+mod transport_cursor_tests {
+    use super::clamped_transport_cursor;
+
+    const SKEW: u64 = 5 * 60;
+    const NOW: u64 = 1_800_000_000;
+
+    #[test]
+    fn in_range_timestamp_advances_cursor_unchanged() {
+        // A normal present-dated message advances the cursor to its own value.
+        assert_eq!(
+            clamped_transport_cursor(Some(NOW - 100), NOW, NOW, SKEW),
+            NOW
+        );
+        assert_eq!(clamped_transport_cursor(None, NOW, NOW, SKEW), NOW);
+    }
+
+    #[test]
+    fn far_future_timestamp_is_clamped_to_now_plus_skew() {
+        // A malicious far-future created_at must not move the cursor past
+        // now + skew, so the relay `since` filter can never jump into the
+        // future and halt reception (darkmatter#182).
+        let poisoned = NOW + 10 * 365 * 24 * 60 * 60; // ~10 years ahead
+        assert_eq!(
+            clamped_transport_cursor(Some(NOW - 100), poisoned, NOW, SKEW),
+            NOW + SKEW
+        );
+        assert_eq!(
+            clamped_transport_cursor(None, poisoned, NOW, SKEW),
+            NOW + SKEW
+        );
+    }
+
+    #[test]
+    fn cursor_stays_monotonic_against_older_timestamps() {
+        // An older message never rewinds the persisted cursor.
+        assert_eq!(
+            clamped_transport_cursor(Some(NOW), NOW - 500, NOW, SKEW),
+            NOW
+        );
+    }
+
+    #[test]
+    fn timestamp_just_inside_skew_window_is_accepted() {
+        let within = NOW + SKEW - 1;
+        assert_eq!(
+            clamped_transport_cursor(Some(NOW), within, NOW, SKEW),
+            within
+        );
+    }
+
+    #[test]
+    fn already_poisoned_cursor_is_healed_down_not_preserved() {
+        // A cursor poisoned before this guard existed (a far-future value
+        // persisted by a vulnerable version) must not be preserved forever by
+        // the monotonic max. When a present-dated message arrives, the stored
+        // cursor is clamped back to now + skew and then folded in, so the
+        // account recovers to wall-clock instead of staying degraded
+        // (darkmatter#182 — blocking adversarial finding).
+        let poisoned = NOW + 10 * 365 * 24 * 60 * 60; // ~10 years ahead
+        assert_eq!(
+            clamped_transport_cursor(Some(poisoned), NOW, NOW, SKEW),
+            NOW + SKEW,
+            "a present-dated message must heal a poisoned future cursor down to now + skew"
+        );
+        // Once wall-clock advances past the healed value, a present-dated
+        // message advances the cursor normally, proving the account is no
+        // longer stuck in the future.
+        let healed = clamped_transport_cursor(Some(poisoned), NOW, NOW, SKEW);
+        let later = healed + 1_000;
+        assert_eq!(
+            clamped_transport_cursor(Some(healed), later, later, SKEW),
+            later,
+            "after healing, the cursor tracks present-dated messages again"
+        );
     }
 }

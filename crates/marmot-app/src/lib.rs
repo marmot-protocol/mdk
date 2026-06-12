@@ -197,6 +197,14 @@ const SDK_DRAIN_WAIT: Duration = Duration::from_millis(250);
 const APP_RUNTIME_ACCOUNT_READY_WAIT: Duration = Duration::from_secs(45);
 const APP_RUNTIME_ACCOUNT_SHUTDOWN_WAIT: Duration = Duration::from_secs(5);
 const APP_RUNTIME_RELAY_REBUILD_LOOKBACK: Duration = Duration::from_secs(120);
+/// Maximum amount the persisted transport cursor may run ahead of local
+/// wall-clock. The cursor is advanced from the inbound message timestamp, which
+/// is the sender-controlled Nostr `created_at` of the outer kind-445 event and
+/// is never validated upstream. Clamping the advance to `now + skew` bounds how
+/// far a malicious or buggy far-future `created_at` can move the subscription
+/// `since` filter, preventing an account from silently halting message
+/// reception (darkmatter#182). The margin tolerates benign sender clock skew.
+const TRANSPORT_CURSOR_MAX_FUTURE_SKEW: Duration = Duration::from_secs(5 * 60);
 const ACCOUNT_WORKER_RECONNECT_BASE_DELAY: Duration = Duration::from_secs(2);
 const ACCOUNT_WORKER_RECONNECT_MAX_DELAY: Duration = Duration::from_secs(60);
 const ACCOUNT_WORKER_RECONNECT_JITTER_MAX_MS: u64 = 500;
