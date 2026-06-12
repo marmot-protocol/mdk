@@ -1790,6 +1790,75 @@ impl MarmotApp {
         Ok(status)
     }
 
+    pub async fn fetch_current_account_relay_list_status_for_account_id(
+        &self,
+        account_id_hex: &str,
+        bootstrap_relays: Vec<TransportEndpoint>,
+        required_list_kind: Option<&str>,
+    ) -> Result<Option<AccountRelayListStatus>, AppError> {
+        let public_key =
+            PublicKey::parse(account_id_hex).map_err(|_| AppError::InvalidPublicKey)?;
+        let account_id_hex = public_key.to_hex();
+        let required_list_kind = match required_list_kind {
+            Some("nip65") => Some(KIND_NIP65_RELAY_LIST),
+            Some("inbox") => Some(KIND_MARMOT_INBOX_RELAY_LIST),
+            Some(other) => {
+                return Err(AppError::RelayDirectory(format!(
+                    "unsupported relay list type: {other}"
+                )));
+            }
+            None => None,
+        };
+        let bootstrap_relays = self.directory_source_relays(&bootstrap_relays);
+        let freshness = self.directory_freshness();
+        let records = self
+            .relay_plane
+            .fetch_directory_events(
+                bootstrap_relays.clone(),
+                relay_list_queries(account_id_hex.clone()),
+            )
+            .await
+            .map_err(|e| AppError::RelayDirectory(format!("fetch relay lists: {e}")))?;
+        let observed_nip65 = records.iter().any(|record| {
+            record.event.pubkey == account_id_hex
+                && record.event.kind == KIND_NIP65_RELAY_LIST
+                && freshness.accepts(record)
+        });
+        let observed_inbox = records.iter().any(|record| {
+            record.event.pubkey == account_id_hex
+                && record.event.kind == KIND_MARMOT_INBOX_RELAY_LIST
+                && freshness.accepts(record)
+        });
+        let has_required_list = match required_list_kind {
+            Some(KIND_NIP65_RELAY_LIST) => observed_nip65,
+            Some(KIND_MARMOT_INBOX_RELAY_LIST) => observed_inbox,
+            Some(_) => false,
+            None => observed_nip65 || observed_inbox,
+        };
+        if !has_required_list {
+            return Ok(None);
+        }
+        let selection = fresh_relay_list_status_from_records(&account_id_hex, records, freshness);
+        let mut status = selection.value;
+        let cached = self.account_relay_list_status_for_account_id(&account_id_hex)?;
+        if !observed_nip65 {
+            status.nip65 = cached.nip65;
+        }
+        if !observed_inbox {
+            status.inbox = cached.inbox;
+        }
+        push_unique_strings(&mut status.bootstrap_relays, cached.bootstrap_relays);
+        if status.bootstrap_relays.is_empty() {
+            status.bootstrap_relays = bootstrap_relays
+                .iter()
+                .map(|endpoint| endpoint.0.clone())
+                .collect();
+        }
+        status.refresh();
+        self.remember_directory_relay_lists(&account_id_hex, &status)?;
+        Ok(Some(status))
+    }
+
     pub async fn fetch_latest_key_package_for_account_id(
         &self,
         account_id_hex: &str,
@@ -2483,6 +2552,29 @@ impl MarmotApp {
                 .map(|endpoint| endpoint.0.clone())
                 .collect(),
         })
+    }
+
+    pub async fn fetch_current_follow_list_for_account_id(
+        &self,
+        account_id_hex: &str,
+        source_relays: Vec<TransportEndpoint>,
+    ) -> Result<Option<Vec<String>>, AppError> {
+        let account_id_hex = parse_account_id_hex(account_id_hex)?;
+        let records = self
+            .fetch_events_for_account_ids(
+                std::slice::from_ref(&account_id_hex),
+                KIND_NOSTR_CONTACT_LIST,
+                &source_relays,
+            )
+            .await?;
+        let Some(follow_list) =
+            latest_follow_list_from_records(&account_id_hex, records, self.directory_freshness())
+                .value
+        else {
+            return Ok(None);
+        };
+        self.remember_directory_follow_list(&account_id_hex, &follow_list)?;
+        Ok(Some(follow_list.follows))
     }
 
     async fn refresh_directory_profiles(

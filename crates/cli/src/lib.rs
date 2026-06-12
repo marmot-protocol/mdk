@@ -1165,6 +1165,14 @@ pub(crate) enum DmError {
     },
     #[error("missing account relay lists: {0:?}")]
     MissingRelayLists(Vec<String>, Box<AccountRelayListStatus>),
+    #[error(
+        "cannot safely update {list} replaceable list for {account_id}: no current list event found on the selected relays"
+    )]
+    ReplaceableListInconclusive {
+        list: String,
+        account_id: String,
+        source_relays: Vec<String>,
+    },
 }
 
 pub async fn run_from<I, T>(args: I) -> CliOutput
@@ -3243,6 +3251,21 @@ pub(crate) async fn follows_command_with_runtime(
     }
 }
 
+fn replaceable_list_inconclusive(
+    list: &str,
+    account_id: &str,
+    source_relays: &[TransportEndpoint],
+) -> DmError {
+    DmError::ReplaceableListInconclusive {
+        list: list.to_owned(),
+        account_id: account_id.to_owned(),
+        source_relays: source_relays
+            .iter()
+            .map(|endpoint| endpoint.0.clone())
+            .collect(),
+    }
+}
+
 async fn update_follows_command(
     app: &MarmotApp,
     runtime: &MarmotAppRuntime,
@@ -3255,9 +3278,15 @@ async fn update_follows_command(
     let relay = relay.ok_or(DmError::MissingRelay)?;
     let endpoint = TransportEndpoint(validate_relay_url(&relay)?);
     let mut follows = app
-        .directory_entry_for_account_id(&account.account_id_hex)?
-        .map(|entry| entry.follows)
-        .unwrap_or_default();
+        .fetch_current_follow_list_for_account_id(&account.account_id_hex, vec![endpoint.clone()])
+        .await?
+        .ok_or_else(|| {
+            replaceable_list_inconclusive(
+                "follows",
+                &account.account_id_hex,
+                std::slice::from_ref(&endpoint),
+            )
+        })?;
     if add {
         if !follows.contains(&target) {
             follows.push(target);
@@ -3444,7 +3473,36 @@ async fn update_relay_list(
 ) -> Result<CommandOutput, DmError> {
     let relay_type = normalize_relay_type(&relay_type)?;
     let url = validate_relay_url(&url)?;
-    let status = app.account_relay_list_status(&account.label)?;
+    let explicit_bootstrap = relay.map(validate_relay_url).transpose()?;
+    let cached_status = app.account_relay_list_status(&account.label)?;
+    let source_relays = if let Some(relay) = explicit_bootstrap.as_ref() {
+        vec![TransportEndpoint(relay.clone())]
+    } else if !cached_status.bootstrap_relays.is_empty() {
+        relay_endpoints(cached_status.bootstrap_relays.clone())?
+    } else {
+        relay_endpoints(relays_for_type(&cached_status, None)?)?
+    };
+    if source_relays.is_empty() {
+        return Err(replaceable_list_inconclusive(
+            &format!("relays:{relay_type}"),
+            &account.account_id_hex,
+            &source_relays,
+        ));
+    }
+    let status = app
+        .fetch_current_account_relay_list_status_for_account_id(
+            &account.account_id_hex,
+            source_relays.clone(),
+            Some(&relay_type),
+        )
+        .await?
+        .ok_or_else(|| {
+            replaceable_list_inconclusive(
+                &format!("relays:{relay_type}"),
+                &account.account_id_hex,
+                &source_relays,
+            )
+        })?;
     let mut relays = relays_for_type(&status, Some(&relay_type))?;
     if add {
         if !relays.contains(&url) {
@@ -3456,9 +3514,8 @@ async fn update_relay_list(
     relays.sort();
     relays.dedup();
     let publish_relays = relay_endpoints(relays.clone())?;
-    let bootstrap = relay
-        .map(validate_relay_url)
-        .transpose()?
+    let bootstrap = explicit_bootstrap
+        .or_else(|| source_relays.first().map(|endpoint| endpoint.0.clone()))
         .or_else(|| relays.first().cloned())
         .ok_or(DmError::MissingRelay)?;
     let bootstrap_relays = vec![TransportEndpoint(bootstrap)];
@@ -5573,6 +5630,20 @@ fn dm_error_json(err: &DmError) -> Value {
             "repair": {
                 "requires": "--default-relays",
                 "publish_missing": "--publish-missing-relay-lists",
+            },
+        }),
+        DmError::ReplaceableListInconclusive {
+            list,
+            account_id,
+            source_relays,
+        } => json!({
+            "code": "replaceable_list_inconclusive",
+            "message": err.to_string(),
+            "list": list,
+            "account_id": account_id,
+            "source_relays": source_relays,
+            "repair": {
+                "retry_with_relay": "--relay <relay-that-has-the-current-list>",
             },
         }),
         DmError::AccountHome(err) => account_home_error_json(err),
