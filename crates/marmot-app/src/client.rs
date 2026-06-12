@@ -2150,6 +2150,45 @@ impl AppClient {
         );
     }
 
+    /// Flip a group's local `archived` flag on the worker-owned in-memory
+    /// `AccountState` and persist it. Routing archive toggles through here (and
+    /// the account worker) instead of a detached `MarmotApp::set_group_archived`
+    /// keeps the long-lived worker's snapshot authoritative: a later inbound
+    /// delivery that re-persists `self.state` will carry the updated flag rather
+    /// than silently reverting it to a stale `archived = false`.
+    pub fn set_group_archived(
+        &mut self,
+        group_id: &GroupId,
+        archived: bool,
+    ) -> Result<AppGroupRecord, AppError> {
+        let group_id_hex = hex::encode(group_id.as_slice());
+        let group = self
+            .state
+            .groups
+            .iter_mut()
+            .find(|group| group.group_id_hex == group_id_hex)
+            .ok_or_else(|| AppError::UnknownGroup(group_id_hex.clone()))?;
+        let previous = group.archived;
+        group.archived = archived;
+        let group = group.clone();
+        // Roll the in-memory flag back if persistence fails so the worker's
+        // authoritative snapshot stays consistent with what is on disk; a later
+        // unrelated `save_state` must not silently re-apply a toggle the caller
+        // was told had failed.
+        if let Err(err) = self.app.save_state(&self.state) {
+            if let Some(group) = self
+                .state
+                .groups
+                .iter_mut()
+                .find(|group| group.group_id_hex == group_id_hex)
+            {
+                group.archived = previous;
+            }
+            return Err(err);
+        }
+        Ok(group)
+    }
+
     fn set_group_invite_confirmation(
         &mut self,
         group_id: &GroupId,

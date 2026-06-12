@@ -2129,6 +2129,17 @@ async fn chats_command(
     command: ChatsCommand,
     account_flag: Option<String>,
 ) -> Result<CommandOutput, DmError> {
+    let runtime = app.runtime();
+    chats_command_with_runtime(account_home, app, &runtime, command, account_flag).await
+}
+
+pub(crate) async fn chats_command_with_runtime(
+    account_home: &AccountHome,
+    app: &MarmotApp,
+    runtime: &MarmotAppRuntime,
+    command: ChatsCommand,
+    account_flag: Option<String>,
+) -> Result<CommandOutput, DmError> {
     match command {
         ChatsCommand::List { include_archived } => {
             let account = resolve_account(account_home, account_flag)?;
@@ -2158,12 +2169,12 @@ async fn chats_command(
         ChatsCommand::Archive { group } => {
             let account = resolve_account(account_home, account_flag)?;
             ensure_local_signing(&account)?;
-            group_archive_output(app, account, group, true)
+            group_archive_output(runtime, account, group, true).await
         }
         ChatsCommand::Unarchive { group } => {
             let account = resolve_account(account_home, account_flag)?;
             ensure_local_signing(&account)?;
-            group_archive_output(app, account, group, false)
+            group_archive_output(runtime, account, group, false).await
         }
         ChatsCommand::ListArchived => {
             let account = resolve_account(account_home, account_flag)?;
@@ -2805,15 +2816,16 @@ fn group_show_output(
     Ok(CommandOutput { plain, json })
 }
 
-fn group_archive_output(
-    app: &MarmotApp,
+async fn group_archive_output(
+    runtime: &MarmotAppRuntime,
     account: marmot_account::AccountSummary,
     group: String,
     archived: bool,
 ) -> Result<CommandOutput, DmError> {
-    app.status(&account.label)?;
     let group_id = normalize_group_id_hex(&group)?;
-    let group = app.set_group_archived(&account.label, &group_id, archived)?;
+    let group = runtime
+        .set_group_archived(&account.label, &group_id, archived)
+        .await?;
     let verb = if archived { "archived" } else { "unarchived" };
     Ok(CommandOutput {
         plain: format!("{verb} group {group_id}"),

@@ -701,6 +701,11 @@ enum AccountWorkerCommand {
         group_id: GroupId,
         respond: oneshot::Sender<Result<GroupInviteDeclineResult, AppError>>,
     },
+    SetGroupArchived {
+        group_id: GroupId,
+        archived: bool,
+        respond: oneshot::Sender<Result<AppGroupRecord, AppError>>,
+    },
     PromoteAdmin {
         group_id: GroupId,
         member_ref: String,
@@ -2962,7 +2967,7 @@ impl MarmotAppRuntime {
             .chat_list(&account.label, include_archived)
     }
 
-    pub fn set_group_archived(
+    pub async fn set_group_archived(
         &self,
         account_ref: &str,
         group_id_hex: &str,
@@ -2971,10 +2976,15 @@ impl MarmotAppRuntime {
         let account = self.accounts.resolve(account_ref)?;
         let group_id_hex = normalize_group_id_hex_app(group_id_hex)?;
         let group_id = GroupId::new(hex::decode(&group_id_hex)?);
-        let group =
-            self.accounts
-                .app
-                .set_group_archived(&account.label, &group_id_hex, archived)?;
+        // Route the archive toggle through the account worker so the
+        // long-lived in-memory `AccountState` is updated in place. A direct
+        // `MarmotApp::set_group_archived` would only touch the database; the
+        // worker's stale snapshot (archived = false) would then silently revert
+        // it on the next inbound delivery's `save_state`. See darkmatter#178.
+        let group = self
+            .accounts
+            .set_group_archived(account_ref, &group_id, archived)
+            .await?;
         let chat_list_row = self
             .accounts
             .app
@@ -3633,6 +3643,46 @@ impl AccountManager {
         self.catch_up_accounts().await?;
         self.schedule_audit_log_tracker_update("decline_group_invite");
         Ok(result)
+    }
+
+    pub async fn set_group_archived(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        archived: bool,
+    ) -> Result<AppGroupRecord, AppError> {
+        // Prefer the account worker so its authoritative in-memory
+        // `AccountState` is updated in place; otherwise a later inbound
+        // delivery would re-persist the stale `archived = false` snapshot and
+        // silently un-archive the chat (darkmatter#178).
+        //
+        // Only a non-local-signing (public-only) account can never own a
+        // long-lived worker, so its direct persistence write is safe: there is
+        // no live in-memory snapshot to clobber it. For local-signing accounts
+        // we MUST route through the worker and propagate any worker error. A
+        // transient worker startup / `reconcile()` failure (e.g. an
+        // `APP_RUNTIME_ACCOUNT_READY_WAIT` timeout while the worker is still in
+        // startup sync) must NOT fall back to a direct write, because a freshly
+        // spawned worker may already hold the pre-archive snapshot and would
+        // later re-persist it, reverting the flag again.
+        let account = self.resolve(account_ref)?;
+        if !account.local_signing {
+            let group_id_hex = hex::encode(group_id.as_slice());
+            return self
+                .app
+                .set_group_archived(&account.label, &group_id_hex, archived);
+        }
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::SetGroupArchived {
+                group_id: group_id.clone(),
+                archived,
+                respond,
+            })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
     }
 
     pub async fn update_group_image(
@@ -4857,6 +4907,23 @@ async fn run_app_runtime_account_worker(
                                 &group_id,
                             );
                         }
+                        let _ = respond.send(result);
+                    }
+                    Some(AccountWorkerCommand::SetGroupArchived {
+                        group_id,
+                        archived,
+                        respond,
+                    }) => {
+                        // The archive projection events (ArchiveChanged chat-list
+                        // update + GroupStateUpdated) are published by the single
+                        // caller `MarmotAppRuntime::set_group_archived` after this
+                        // command returns. Emitting `GroupStateUpdated` here too
+                        // would race ahead of the ArchiveChanged trigger and get
+                        // fingerprint-deduped by `subscribe_chat_list`, so
+                        // subscribers would see a generic state change instead of
+                        // the archive-specific trigger. Keep this worker handler
+                        // limited to mutating the authoritative in-memory state.
+                        let result = client.set_group_archived(&group_id, archived);
                         let _ = respond.send(result);
                     }
                     Some(AccountWorkerCommand::PromoteAdmin {

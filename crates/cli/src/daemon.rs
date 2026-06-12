@@ -2614,6 +2614,16 @@ async fn handle_app_runtime_command_request(
             )
             .await
         }
+        crate::Command::Chats { command } => {
+            crate::chats_command_with_runtime(
+                &account_home,
+                &app,
+                runtime,
+                command,
+                cli.account.clone(),
+            )
+            .await
+        }
         crate::Command::Groups { command } => {
             crate::groups_command_with_runtime(
                 &account_home,
@@ -2706,6 +2716,10 @@ async fn handle_app_runtime_command_request(
 fn is_hosted_runtime_command(cli: &Cli) -> bool {
     match &cli.command {
         crate::Command::Group { .. } | crate::Command::Groups { .. } => true,
+        crate::Command::Chats { command } => !matches!(
+            command,
+            crate::ChatsCommand::Subscribe | crate::ChatsCommand::SubscribeArchived
+        ),
         crate::Command::Message { command } | crate::Command::Messages { command } => {
             !matches!(command, crate::MessageCommand::Subscribe { .. })
         }

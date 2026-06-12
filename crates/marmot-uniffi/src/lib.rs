@@ -932,7 +932,7 @@ impl Marmot {
     /// Flag a group archived (or restore it). Local-only projection state —
     /// it does not change membership or publish anything. The chats list
     /// filters archived groups unless `include_archived` is set.
-    pub fn set_group_archived(
+    pub async fn set_group_archived(
         &self,
         account_ref: String,
         group_id_hex: String,
@@ -942,7 +942,8 @@ impl Marmot {
         let group_id_hex = hex::encode(group_id.as_slice());
         let group = self
             .runtime
-            .set_group_archived(&account_ref, &group_id_hex, archived)?;
+            .set_group_archived(&account_ref, &group_id_hex, archived)
+            .await?;
         Ok(group.into())
     }
 
