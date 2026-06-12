@@ -189,6 +189,28 @@ async fn remove_account_updates_list_accounts() {
     ));
 }
 
+#[tokio::test]
+async fn login_existing_identity_returns_duplicate_identity_error() {
+    install_mock_keyring();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let nsec = "nsec1j4c6269y9w0q2er2xjw8sv2ehyrtfxq3jwgdlxj6qfn8z4gjsq5qfvfk99";
+    let existing = AccountHome::open(tmp.path())
+        .import_nostr_account(nsec)
+        .expect("seed existing account");
+    let kit = Marmot::new(
+        tmp.path().to_string_lossy().into_owned(),
+        vec!["wss://relay.invalid.test".to_string()],
+    )
+    .expect("open marmot kit");
+
+    assert!(matches!(
+        kit.login(nsec.to_string(), Vec::new(), Vec::new())
+            .await
+            .expect_err("duplicate login should fail"),
+        MarmotKitError::DuplicateIdentity { account } if account == existing.account_id_hex
+    ));
+}
+
 #[test]
 fn display_name_is_none_for_unknown_account() {
     install_mock_keyring();

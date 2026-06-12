@@ -56,6 +56,9 @@ impl From<AppError> for MarmotKitError {
             AppError::AccountHome(AccountHomeError::UnknownAccount(account_ref)) => {
                 Self::UnknownAccount { account_ref }
             }
+            AppError::AccountHome(AccountHomeError::AccountExists(account)) => {
+                Self::DuplicateIdentity { account }
+            }
             AppError::UnknownGroup(group_id_hex) => Self::UnknownGroup { group_id_hex },
             AppError::Hex(err) => Self::InvalidHex {
                 details: err.to_string(),
