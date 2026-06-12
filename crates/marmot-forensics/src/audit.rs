@@ -311,6 +311,13 @@ pub enum AuditEventKind {
         restored_epoch: u64,
         pending_kind: String,
     },
+    /// Session open found an OpenMLS staged commit persisted under the
+    /// publish-before-apply contract with no in-memory pending state to
+    /// resolve it (the process crashed between publish and
+    /// confirm/fail). Hydrate cleared it — treating it as publish-failed —
+    /// so the group is no longer wedged on `PendingCommit`. The group is
+    /// usable at `recovered_epoch` and the application should resync.
+    PendingCommitRecoveredOnOpen { recovered_epoch: u64 },
     /// Pre-commit snapshot created for fork recovery.
     SnapshotCreated {
         snapshot_name: String,
@@ -407,6 +414,9 @@ impl AuditEventKind {
             AuditEventKind::PublishFailure { .. } => "publish_failure",
             AuditEventKind::EpochConfirmed { .. } => "epoch_confirmed",
             AuditEventKind::EpochRolledBack { .. } => "epoch_rolled_back",
+            AuditEventKind::PendingCommitRecoveredOnOpen { .. } => {
+                "pending_commit_recovered_on_open"
+            }
             AuditEventKind::SnapshotCreated { .. } => "snapshot_created",
             AuditEventKind::ForkResolution { .. } => "fork_resolution",
             AuditEventKind::ConvergenceDecision { .. } => "convergence_decision",
@@ -1102,6 +1112,7 @@ mod tests {
                 restored_epoch: 0,
                 pending_kind: "group_evolution".into(),
             },
+            AuditEventKind::PendingCommitRecoveredOnOpen { recovered_epoch: 3 },
             AuditEventKind::SnapshotCreated {
                 snapshot_name: "fork-1-2-abc".into(),
                 source_epoch: 0,

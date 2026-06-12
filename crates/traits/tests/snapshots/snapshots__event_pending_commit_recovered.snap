@@ -1,0 +1,15 @@
+---
+source: crates/traits/tests/snapshots.rs
+expression: "GroupEvent::PendingCommitRecovered\n{ group_id: gid(), recovered_epoch: EpochId(1), }"
+---
+{
+  "PendingCommitRecovered": {
+    "group_id": [
+      170,
+      170,
+      170,
+      170
+    ],
+    "recovered_epoch": 1
+  }
+}

@@ -5791,7 +5791,8 @@ fn chat_list_trigger_from_event(event: &MarmotAppEvent) -> ChatListUpdateTrigger
             GroupEvent::GroupStateChanged { .. }
             | GroupEvent::EpochChanged { .. }
             | GroupEvent::ForkRecovered { .. }
-            | GroupEvent::GroupUnrecoverable { .. } => ChatListUpdateTrigger::MembershipChanged,
+            | GroupEvent::GroupUnrecoverable { .. }
+            | GroupEvent::PendingCommitRecovered { .. } => ChatListUpdateTrigger::MembershipChanged,
             GroupEvent::MessageReceived { .. } | GroupEvent::AppMessageInvalidated { .. } => {
                 ChatListUpdateTrigger::SnapshotRefresh
             }
@@ -5812,7 +5813,8 @@ fn group_id_from_event(event: &GroupEvent) -> &GroupId {
         | GroupEvent::GroupStateChanged { group_id, .. }
         | GroupEvent::EpochChanged { group_id, .. }
         | GroupEvent::ForkRecovered { group_id, .. }
-        | GroupEvent::GroupUnrecoverable { group_id } => group_id,
+        | GroupEvent::GroupUnrecoverable { group_id }
+        | GroupEvent::PendingCommitRecovered { group_id, .. } => group_id,
     }
 }
 

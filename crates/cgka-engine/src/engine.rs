@@ -382,11 +382,37 @@ impl<S: StorageProvider> Engine<S> {
     /// Restore stable epoch state for groups already present in storage.
     ///
     /// This is used by production session startup after opening durable
-    /// storage. Pending publish state is deliberately not reconstructed here:
-    /// v1 sessions require the application to resolve publish success/failure
-    /// before shutdown, and future resumable-pending support should persist a
-    /// dedicated pending-publish record instead of inferring one from group
-    /// rows.
+    /// storage. The application is expected to resolve publish success/failure
+    /// (`confirm_published` / `publish_failed`) before shutdown, but a *crash*
+    /// between transport publish and that resolution violates the
+    /// precondition: OpenMLS durably persists the staged commit
+    /// (`MlsGroupState::PendingCommit`) and `MlsGroup::load` restores it, while
+    /// the in-memory `PendingStateRef` that `confirm_published` /
+    /// `publish_failed` require is gone (the `EpochManager` starts empty on
+    /// every open). Left untouched, the group is stranded: every subsequent
+    /// commit-creating operation fails with a pending-commit error forever.
+    ///
+    /// So at hydrate time we detect a surviving pending commit and clear it,
+    /// treating an unresolved pending publish as publish-failed (the same
+    /// rewind `do_publish_failed` performs). The MLS group returns to its
+    /// pre-stage epoch, we re-derive the Marmot record from that cleared
+    /// state, and we surface a typed `PendingCommitRecovered` event so the
+    /// application can run a recovery / resync path — if relays accepted the
+    /// commit before the crash, this device is now behind and must catch up.
+    ///
+    /// **Member-removing commits are deliberately left untouched.** A surviving
+    /// pending commit is NOT a reliable crash signal on its own: a deferred
+    /// SelfRemove auto-commit (the MIP-03 leave path) legitimately persists a
+    /// staged commit across process boundaries — the proposer's device stages
+    /// the lowest-index commit, projects the departing member out of the Marmot
+    /// record *forward*, and a later run publishes + confirms it. Rolling that
+    /// back re-derives the record from the pre-stage MLS state and so re-adds a
+    /// member who already left, forking convergence (the remaining members
+    /// advance past the leave while this device silently rewinds it). Clearing
+    /// an additive (invite) commit is safe — it only drops an invitee who never
+    /// actually joined — but clearing a Remove/SelfRemove is not. We therefore
+    /// scope crash-recovery to staged commits that remove no members, matching
+    /// the prior (pre-recovery) behaviour for removal-bearing commits.
     pub fn hydrate_stable_groups_from_storage(&mut self) -> Result<(), EngineError> {
         for group_id in self.storage.list_groups()? {
             let provider = crate::provider::EngineOpenMlsProvider::<S>::new(
@@ -394,7 +420,7 @@ impl<S: StorageProvider> Engine<S> {
                 self.storage.mls_storage(),
             );
             let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
-            let mls_group = openmls::group::MlsGroup::load(
+            let mut mls_group = openmls::group::MlsGroup::load(
                 <crate::provider::EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(&provider),
                 &mls_gid,
             )
@@ -404,6 +430,57 @@ impl<S: StorageProvider> Engine<S> {
                 &mls_group,
                 self.ciphersuite,
             )?;
+
+            // A staged commit that survived process restart *may* mean the
+            // application crashed mid-publish. Clear it (treat as
+            // publish-failed) so the group is not permanently wedged, then
+            // re-derive the Marmot record from the post-clear MLS state.
+            //
+            // BUT a surviving pending commit is also the normal cross-process
+            // state of a deferred SelfRemove auto-commit, whose Marmot record
+            // is already projected forward past the leave. Rolling back a
+            // commit that removes a member would re-add the departed member and
+            // fork convergence, so we only recover commits that add no
+            // member-removal (no `Remove`, no `SelfRemove`). Removal-bearing
+            // staged commits are left exactly as they were before this recovery
+            // path existed.
+            let staged_removes_member = mls_group.pending_commit().is_some_and(|staged| {
+                staged.queued_proposals().any(|queued| {
+                    matches!(
+                        queued.proposal(),
+                        openmls::prelude::Proposal::Remove(_)
+                            | openmls::prelude::Proposal::SelfRemove
+                    )
+                })
+            });
+            if mls_group.pending_commit().is_some() && !staged_removes_member {
+                mls_group
+                    .clear_pending_commit(
+                        <crate::provider::EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(&provider),
+                    )
+                    .map_err(|e| EngineError::Backend(format!("clear_pending: {e:?}")))?;
+                let recovered_epoch = EpochId(mls_group.epoch().as_u64());
+                if let Ok(mut g) = self.storage.get_group(&group_id) {
+                    g.epoch = recovered_epoch;
+                    g.members = crate::group_lifecycle::marmot_members(&mls_group);
+                    g.required_capabilities =
+                        crate::capability_manager::required_capabilities_from_group(&mls_group);
+                    crate::group_lifecycle::mirror_app_components_into_record(&mls_group, &mut g);
+                    self.storage.put_group(&g)?;
+                }
+                self.audit_group(
+                    &group_id,
+                    AuditEventKind::PendingCommitRecoveredOnOpen {
+                        recovered_epoch: recovered_epoch.0,
+                    },
+                );
+                self.events_buf
+                    .push_back(GroupEvent::PendingCommitRecovered {
+                        group_id: group_id.clone(),
+                        recovered_epoch,
+                    });
+            }
+
             let group = self.storage.get_group(&group_id)?;
             self.epoch_manager.set_stable(group_id, group.epoch);
         }

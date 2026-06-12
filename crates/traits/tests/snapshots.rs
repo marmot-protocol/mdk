@@ -504,6 +504,13 @@ fn snapshot_group_events() {
             },
         }
     );
+    insta::assert_json_snapshot!(
+        "event_pending_commit_recovered",
+        GroupEvent::PendingCommitRecovered {
+            group_id: gid(),
+            recovered_epoch: EpochId(1),
+        }
+    );
 }
 
 #[test]

@@ -346,6 +346,23 @@ pub enum GroupEvent {
     GroupUnrecoverable {
         group_id: GroupId,
     },
+    /// A staged commit persisted by OpenMLS under the publish-before-apply
+    /// contract was found unresolved at session open. This happens when the
+    /// process crashed between transport publish and the matching
+    /// `confirm_published` / `publish_failed` call: the durable
+    /// `MlsGroupState::PendingCommit` survives, but the in-memory
+    /// `PendingStateRef` needed to resolve it does not. Hydrate cleared the
+    /// staged commit — treating it as publish-failed — so the group is usable
+    /// again at `recovered_epoch` and no longer wedged on `PendingCommit`.
+    ///
+    /// The application SHOULD trigger a resync for this group: if relays
+    /// accepted the commit before the crash, this device is now behind the
+    /// rest of the group and must catch up via normal inbound delivery /
+    /// fork recovery.
+    PendingCommitRecovered {
+        group_id: GroupId,
+        recovered_epoch: EpochId,
+    },
 }
 
 /// Request shape for [`CgkaEngine::create_group`]. Carries the intended
