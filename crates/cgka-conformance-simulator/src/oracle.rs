@@ -174,7 +174,7 @@ pub fn property_test_coverage_entries() -> Vec<CoverageMatrixEntry> {
             vec![OracleBehavior::IdempotentReplay],
         ),
         property_entry(
-            "prop_quiescence_gate_controls_stability",
+            "prop_quiescence_gate_controls_settlement",
             vec![ScenarioStimulus::QuiescenceGate],
             vec![OracleBehavior::QuiescenceState],
         ),

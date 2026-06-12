@@ -100,7 +100,7 @@ fn property_test_coverage_matrix_names_each_property_family() {
         "prop_candidate_graph_selection_is_order_invariant",
         "prop_canonicalization_dispositions_are_order_invariant",
         "prop_canonicalization_replay_is_already_seen",
-        "prop_quiescence_gate_controls_stability",
+        "prop_quiescence_gate_controls_settlement",
         "prop_capability_negotiation_matches_matrix",
         "prop_convergence_under_send_leave_sequence",
         "prop_convergence_under_varied_delivery",
