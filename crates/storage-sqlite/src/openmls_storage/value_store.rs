@@ -229,14 +229,22 @@ impl SqliteOpenMlsStorage {
         labels: &[&[u8]],
     ) -> Result<(), SqliteOpenMlsStorageError> {
         let group_key = Self::group_key(group_id)?;
-        let conn = self.lock()?;
+        let mut conn = self.lock()?;
+        // Wrap every label delete in a single transaction so the operation is
+        // atomic. clear_proposal_queue deletes QUEUED_PROPOSAL_LABEL and
+        // PROPOSAL_QUEUE_REFS_LABEL together; a crash (SIGKILL/OOM/power loss)
+        // between two separate autocommit deletes could otherwise leave queue
+        // refs whose entities are gone, which bricks MlsGroup::load for that
+        // group with no self-healing path (issue #148).
+        let tx = conn.transaction()?;
         for label in labels {
-            conn.execute(
+            tx.execute(
                 "DELETE FROM openmls_values
                  WHERE provider_version = ?1 AND group_key = ?2 AND label = ?3",
                 params![CURRENT_VERSION, group_key, *label],
             )?;
         }
+        tx.commit()?;
         Ok(())
     }
 }
@@ -261,5 +269,40 @@ mod tests {
             assert!(!body.contains("read_raw_list"), "{function}");
             assert!(!body.contains("self.write_value"), "{function}");
         }
+    }
+
+    #[test]
+    fn delete_group_labels_deletes_all_labels_under_one_transaction() {
+        // clear_proposal_queue deletes multiple labels (QueuedProposal entities
+        // and ProposalQueueRefs) in one call. Those deletes must be atomic: a
+        // crash between separate autocommit deletes could leave refs whose
+        // entities are gone, which bricks MlsGroup::load for that group with no
+        // self-healing path (issue #148). Enforce the single-transaction wrap
+        // by source inspection, mirroring the list-mutation guard above.
+        let source = include_str!("value_store.rs");
+        let body = source
+            .split("fn delete_group_labels")
+            .nth(1)
+            .expect("delete_group_labels body");
+        let body = body
+            .split("\n    fn ")
+            .next()
+            .unwrap_or(body)
+            .split("\n#[cfg(test)]")
+            .next()
+            .unwrap_or(body);
+
+        assert!(
+            body.contains("transaction()"),
+            "delete_group_labels must wrap its deletes in a single transaction"
+        );
+        assert!(
+            body.contains("tx.commit()"),
+            "delete_group_labels must commit its transaction"
+        );
+        assert!(
+            !body.contains("conn.execute"),
+            "delete_group_labels must execute through the transaction, not the bare connection"
+        );
     }
 }
