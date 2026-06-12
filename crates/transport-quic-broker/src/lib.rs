@@ -45,6 +45,9 @@ const LOCAL_SERVER_BIND: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCAL
 const MAX_FRAME_SIZE: usize = AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN as usize + 1024;
 const PUBLISH_SUBSCRIBER_GRACE: Duration = Duration::from_secs(5);
 const FINISHED_ROOM_TTL: Duration = Duration::from_secs(60);
+// Stale unfinished rooms are a defense-in-depth cleanup path for task
+// cancellation, so keep the same retention window as finished backlog rooms.
+const UNFINISHED_ROOM_TTL: Duration = FINISHED_ROOM_TTL;
 const SEND_STOP_WAIT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug)]
@@ -589,6 +592,7 @@ struct BrokerRoom {
     backlog_bytes: usize,
     subscriber_notify: Arc<Notify>,
     finished_at: Option<Instant>,
+    last_activity_at: Instant,
 }
 
 impl Default for BrokerRoom {
@@ -599,6 +603,7 @@ impl Default for BrokerRoom {
             backlog_bytes: 0,
             subscriber_notify: Arc::new(Notify::new()),
             finished_at: None,
+            last_activity_at: Instant::now(),
         }
     }
 }
@@ -644,7 +649,7 @@ impl BrokerState {
     > {
         let (tx, rx) = mpsc::channel(self.per_subscriber_queue);
         let mut inner = self.inner.lock().await;
-        self.purge_expired_finished_rooms(&mut inner);
+        self.purge_expired_rooms(&mut inner);
         if !inner.rooms.contains_key(&key) && inner.rooms.len() >= self.max_rooms {
             return Err(QuicBrokerError::RoomLimitExceeded {
                 limit: self.max_rooms,
@@ -653,6 +658,9 @@ impl BrokerState {
         let id = inner.next_subscriber_id;
         inner.next_subscriber_id += 1;
         let room = inner.rooms.entry(key).or_default();
+        if room.finished_at.is_none() {
+            room.last_activity_at = Instant::now();
+        }
         let backlog = room
             .backlog
             .iter()
@@ -669,10 +677,13 @@ impl BrokerState {
 
     async fn unsubscribe(&self, key: &BrokerStreamKey, id: u64) {
         let mut inner = self.inner.lock().await;
-        self.purge_expired_finished_rooms(&mut inner);
+        self.purge_expired_rooms(&mut inner);
         let mut should_remove = false;
         if let Some(room) = inner.rooms.get_mut(key) {
             room.subscribers.retain(|subscriber| subscriber.id != id);
+            if room.finished_at.is_none() {
+                room.last_activity_at = Instant::now();
+            }
             should_remove = room.subscribers.is_empty()
                 && room.backlog.is_empty()
                 && room.finished_at.is_none();
@@ -695,7 +706,7 @@ impl BrokerState {
             });
         }
         let mut inner = self.inner.lock().await;
-        self.purge_expired_finished_rooms(&mut inner);
+        self.purge_expired_rooms(&mut inner);
         if inner
             .rooms
             .get(key)
@@ -711,6 +722,7 @@ impl BrokerState {
         let mut delivered = 0;
         let mut total_backlog_bytes = inner.total_backlog_bytes;
         let room = inner.rooms.entry(key.clone()).or_default();
+        room.last_activity_at = Instant::now();
         room.backlog.push_back(BacklogRecord {
             record: record.clone(),
             bytes: record_bytes,
@@ -747,7 +759,7 @@ impl BrokerState {
             loop {
                 let notify = {
                     let mut inner = self.inner.lock().await;
-                    self.purge_expired_finished_rooms(&mut inner);
+                    self.purge_expired_rooms(&mut inner);
                     if !inner.rooms.contains_key(key) && inner.rooms.len() >= self.max_rooms {
                         return Err(QuicBrokerError::RoomLimitExceeded {
                             limit: self.max_rooms,
@@ -804,14 +816,16 @@ impl BrokerState {
 
     async fn mark_room_finished(&self, key: &BrokerStreamKey) -> bool {
         let mut inner = self.inner.lock().await;
-        self.purge_expired_finished_rooms(&mut inner);
+        self.purge_expired_rooms(&mut inner);
         let mut should_remove = false;
         let mut should_retain = false;
         if let Some(room) = inner.rooms.get_mut(key) {
             room.subscribers.clear();
             should_remove = room.backlog.is_empty();
             if !should_remove {
-                room.finished_at = Some(Instant::now());
+                let now = Instant::now();
+                room.finished_at = Some(now);
+                room.last_activity_at = now;
                 should_retain = true;
             }
         }
@@ -834,12 +848,17 @@ impl BrokerState {
         }
     }
 
-    fn purge_expired_finished_rooms(&self, inner: &mut BrokerStateInner) {
+    fn purge_expired_rooms(&self, inner: &mut BrokerStateInner) {
+        // Finished rooms get a one-shot timer in `finish_room`; unfinished-room
+        // cleanup is activity-driven and runs when the broker state is touched.
         let mut total_backlog_bytes = 0;
         inner.rooms.retain(|_, room| {
-            let retain = room
-                .finished_at
-                .is_none_or(|finished_at| finished_at.elapsed() < FINISHED_ROOM_TTL);
+            let retain = if let Some(finished_at) = room.finished_at {
+                finished_at.elapsed() < FINISHED_ROOM_TTL
+            } else {
+                !room.subscribers.is_empty()
+                    || room.last_activity_at.elapsed() < UNFINISHED_ROOM_TTL
+            };
             if retain {
                 total_backlog_bytes += room.backlog_bytes;
             }
@@ -863,6 +882,16 @@ impl BrokerState {
         let mut inner = self.inner.lock().await;
         if let Some(room) = inner.rooms.get_mut(key) {
             room.finished_at = Some(Instant::now().checked_sub(age).unwrap());
+        }
+    }
+
+    #[cfg(test)]
+    async fn age_unfinished_room_for_test(&self, key: &BrokerStreamKey, age: Duration) {
+        let mut inner = self.inner.lock().await;
+        if let Some(room) = inner.rooms.get_mut(key)
+            && room.finished_at.is_none()
+        {
+            room.last_activity_at = Instant::now().checked_sub(age).unwrap();
         }
     }
 }
@@ -939,16 +968,24 @@ async fn handle_publish_stream(
     // genuinely dead publisher, and the resource caps (max_connections /
     // max_rooms / backlog budgets) still bound an idle-but-alive one, so reads
     // here are intentionally unbounded by the application-level deadline.
-    while let Some(record) = read_record_frame(&mut recv, None).await? {
-        if record.stream_id != key.stream_id {
-            state.drop_room(&key).await;
-            return Err(QuicBrokerError::MixedStreamIds);
+    let result = async {
+        while let Some(record) = read_record_frame(&mut recv, None).await? {
+            if record.stream_id != key.stream_id {
+                return Err(QuicBrokerError::MixedStreamIds);
+            }
+            limit_state.observe(&record)?;
+            state.publish(&key, record).await?;
         }
-        limit_state.observe(&record)?;
-        state.publish(&key, record).await?;
+        Ok::<_, QuicBrokerError>(())
     }
-    state.finish_room(&key).await;
-    Ok(())
+    .await;
+
+    if matches!(&result, Err(QuicBrokerError::MixedStreamIds)) {
+        state.drop_room(&key).await;
+    } else {
+        state.finish_room(&key).await;
+    }
+    result
 }
 
 async fn handle_subscribe_stream(
@@ -1514,6 +1551,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn broker_closes_subscribers_when_publish_stream_errors_after_backlog() {
+        let stream_id = vec![0xac; 32];
+        let start_event_id = MessageId::new(vec![0x21; 32]);
+        let small_record =
+            AgentTextStreamRecordV1::text_delta(stream_id.clone(), 1, b"ok".to_vec());
+        let large_record = AgentTextStreamRecordV1::text_delta(
+            stream_id.clone(),
+            2,
+            b"this record is too large".to_vec(),
+        );
+        let max_backlog_bytes = small_record.encode().unwrap().len();
+        assert!(large_record.encode().unwrap().len() > max_backlog_bytes);
+
+        let server = QuicBrokerServer::bind(QuicBrokerConfig {
+            bind_addr: LOCAL_SERVER_BIND,
+            per_subscriber_queue: DEFAULT_SUBSCRIBER_QUEUE_DEPTH,
+            max_backlog_bytes,
+            ..QuicBrokerConfig::default()
+        })
+        .unwrap();
+        let broker_addr = server.local_addr().unwrap();
+        let server_cert = server.server_cert_der().to_vec();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let broker_task = tokio::spawn(server.run_until(async {
+            let _ = shutdown_rx.await;
+        }));
+
+        let subscriber = tokio::spawn(subscribe_text_from_broker(SubscribeTextFromBroker {
+            broker_addr,
+            server_name: "localhost".to_owned(),
+            trust: BrokerServerTrust::CertificateDer(server_cert.clone()),
+            stream_id: stream_id.clone(),
+            start_event_id: start_event_id.clone(),
+            crypto: None,
+        }));
+        sleep(Duration::from_millis(100)).await;
+
+        let mut publisher = BrokerTextPublisher::connect(OpenBrokerTextPublisher {
+            broker_addr,
+            server_name: "localhost".to_owned(),
+            trust: BrokerServerTrust::CertificateDer(server_cert),
+            stream_id: stream_id.clone(),
+            start_event_id,
+            crypto: None,
+        })
+        .await
+        .unwrap();
+        publisher
+            .append_text("ok", 32, Duration::ZERO)
+            .await
+            .unwrap();
+        publisher
+            .append_text("this record is too large", 32, Duration::ZERO)
+            .await
+            .unwrap();
+        let _ = publisher.finish().await;
+
+        let received = tokio::time::timeout(Duration::from_secs(2), subscriber)
+            .await
+            .expect("subscriber should not park forever after publish loop error")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(received.stream_id, stream_id);
+        assert_eq!(received.text, "ok");
+        assert_eq!(received.chunk_count, 1);
+
+        let _ = shutdown_tx.send(());
+        broker_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
     async fn broker_forwards_status_records_without_adding_to_text() {
         let server = QuicBrokerServer::bind(QuicBrokerConfig {
             bind_addr: LOCAL_SERVER_BIND,
@@ -1988,6 +2097,49 @@ mod tests {
             .await;
         state.drop_expired_finished_room(&key).await;
         assert_eq!(state.room_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn broker_purges_stale_unfinished_rooms_without_live_subscribers() {
+        let state = test_state(DEFAULT_BROKER_BACKLOG_DEPTH);
+        let stale_key = BrokerStreamKey::new(vec![0xab; 32], MessageId::new(vec![0x12; 32]));
+        let live_key = BrokerStreamKey::new(vec![0xcd; 32], MessageId::new(vec![0x34; 32]));
+
+        state
+            .publish(
+                &stale_key,
+                AgentTextStreamRecordV1::text_delta(vec![0xab; 32], 1, b"stale".to_vec()),
+            )
+            .await
+            .unwrap();
+        state
+            .publish(
+                &live_key,
+                AgentTextStreamRecordV1::text_delta(vec![0xcd; 32], 1, b"live".to_vec()),
+            )
+            .await
+            .unwrap();
+        let (_subscriber_id, _backlog, _rx) = state.subscribe(live_key.clone()).await.unwrap();
+        state
+            .age_unfinished_room_for_test(&stale_key, UNFINISHED_ROOM_TTL + Duration::from_secs(1))
+            .await;
+        state
+            .age_unfinished_room_for_test(&live_key, UNFINISHED_ROOM_TTL + Duration::from_secs(1))
+            .await;
+
+        state
+            .publish(
+                &BrokerStreamKey::new(vec![0xef; 32], MessageId::new(vec![0x56; 32])),
+                AgentTextStreamRecordV1::text_delta(vec![0xef; 32], 1, b"trigger".to_vec()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(state.room_count().await, 2);
+        let (_late_id, stale_backlog, _stale_rx) = state.subscribe(stale_key).await.unwrap();
+        assert!(stale_backlog.is_empty());
+        let (_live_id, live_backlog, _live_rx) = state.subscribe(live_key).await.unwrap();
+        assert_eq!(live_backlog.len(), 1);
     }
 
     #[tokio::test]
