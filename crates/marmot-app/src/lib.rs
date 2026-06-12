@@ -7089,7 +7089,7 @@ mod tests {
                 MediaAttachmentReference {
                     locators: vec![MediaLocator {
                         kind: "blossom-v1".to_owned(),
-                        value: "https://media.example/a.png".to_owned(),
+                        value: format!("https://media.example/{}.bin", hex::encode([0x33_u8; 32])),
                     }],
                     ciphertext_sha256: hex::encode([0x33_u8; 32]),
                     plaintext_sha256: hex::encode([0x11_u8; 32]),
@@ -7104,7 +7104,7 @@ mod tests {
                 MediaAttachmentReference {
                     locators: vec![MediaLocator {
                         kind: "blossom-v1".to_owned(),
-                        value: "https://media.example/b.mp4".to_owned(),
+                        value: format!("https://media.example/{}.bin", hex::encode([0x44_u8; 32])),
                     }],
                     ciphertext_sha256: hex::encode([0x44_u8; 32]),
                     plaintext_sha256: hex::encode([0x55_u8; 32]),
@@ -7127,11 +7127,11 @@ mod tests {
             .filter(|tag| tag.first().map(String::as_str) == Some("imeta"))
             .collect::<Vec<_>>();
         assert_eq!(imeta.len(), 2);
-        assert!(
-            imeta[0]
-                .iter()
-                .any(|field| field == "locator blossom-v1 https://media.example/a.png")
-        );
+        assert!(imeta[0].iter().any(|field| field
+            == &format!(
+                "locator blossom-v1 https://media.example/{}.bin",
+                hex::encode([0x33_u8; 32])
+            )));
         assert!(imeta[0].iter().any(|field| field == "m image/png"));
         assert!(imeta[0].iter().any(|field| field == "filename a.png"));
         assert!(
@@ -7141,11 +7141,11 @@ mod tests {
         );
         assert!(imeta[0].iter().any(|field| field == "v encrypted-media-v1"));
         assert!(imeta[0].iter().any(|field| field == "thumbhash thumb"));
-        assert!(
-            imeta[1]
-                .iter()
-                .any(|field| field == "locator blossom-v1 https://media.example/b.mp4")
-        );
+        assert!(imeta[1].iter().any(|field| field
+            == &format!(
+                "locator blossom-v1 https://media.example/{}.bin",
+                hex::encode([0x44_u8; 32])
+            )));
     }
 
     #[test]
