@@ -23,8 +23,9 @@ use cgka_engine::{
 };
 use cgka_session::{AccountDeviceSession, SessionConfig};
 use cgka_traits::agent_text_stream::{
-    AGENT_TEXT_STREAM_QUIC_FANOUT_FEATURE, AGENT_TEXT_STREAM_QUIC_RECEIVE_FEATURE,
-    AGENT_TEXT_STREAM_QUIC_SEND_FEATURE,
+    AGENT_TEXT_STREAM_QUIC_FANOUT_CAPABILITY, AGENT_TEXT_STREAM_QUIC_FANOUT_FEATURE,
+    AGENT_TEXT_STREAM_QUIC_RECEIVE_CAPABILITY, AGENT_TEXT_STREAM_QUIC_RECEIVE_FEATURE,
+    AGENT_TEXT_STREAM_QUIC_SEND_CAPABILITY, AGENT_TEXT_STREAM_QUIC_SEND_FEATURE,
 };
 pub use cgka_traits::app_components::{
     AGENT_TEXT_STREAM_QUIC_COMPONENT as AGENT_TEXT_STREAM_COMPONENT,
@@ -4392,24 +4393,34 @@ fn app_feature_registry() -> FeatureRegistry {
             description: "MIP-03 SelfRemove group departure",
         },
     );
-    for (feature, description) in [
+    // Each agent-text-stream-QUIC role maps to its own distinct backing
+    // capability (a private-use MLS extension type), so a member advertises
+    // `receive`/`send`/`fanout` independently and a group's
+    // `required_member_roles` mask is enforceable per role (#177,
+    // agent-text-stream-quic-v1.md). The capability/feature/bit mapping is the
+    // shared `AGENT_TEXT_STREAM_QUIC_ROLES` table so the engine enforcement and
+    // this registration cannot drift.
+    for (feature, capability, description) in [
         (
             AGENT_TEXT_STREAM_QUIC_RECEIVE_FEATURE.clone(),
+            AGENT_TEXT_STREAM_QUIC_RECEIVE_CAPABILITY,
             "receive QUIC-backed agent text stream previews",
         ),
         (
             AGENT_TEXT_STREAM_QUIC_SEND_FEATURE.clone(),
+            AGENT_TEXT_STREAM_QUIC_SEND_CAPABILITY,
             "send QUIC-backed agent text stream frames",
         ),
         (
             AGENT_TEXT_STREAM_QUIC_FANOUT_FEATURE.clone(),
+            AGENT_TEXT_STREAM_QUIC_FANOUT_CAPABILITY,
             "fan out QUIC-backed agent text stream frames",
         ),
     ] {
         registry.register(
             feature,
             CapabilityRequirement {
-                requires: Capability::AppComponent(AGENT_TEXT_STREAM_QUIC_COMPONENT_ID),
+                requires: capability,
                 level: RequirementLevel::Optional,
                 description,
             },

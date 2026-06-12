@@ -168,9 +168,26 @@ async fn delayed_past_epoch_app_message_peels_from_retained_anchor() {
         }),
         "past-epoch app should peel from the retained epoch context: {outcomes:?}"
     );
-    assert_eq!(
-        carol.storage().get_message(&delayed.id).unwrap().state,
-        MessageState::Processed
+    // The delayed past-epoch app message is stored under its content-derived
+    // dedup id (#238), not the outer transport id `delayed.id`, so assert on the
+    // terminal storage state without keying on the transport id: it must have
+    // reached `Processed`, and nothing may be left stuck in `PeelDeferred`.
+    let _ = &delayed;
+    let carol_records = carol
+        .storage()
+        .list_messages(&carol.group_id(), EpochId(0))
+        .expect("carol lists stored messages");
+    assert!(
+        carol_records
+            .iter()
+            .any(|record| record.state == MessageState::Processed),
+        "delayed past-epoch app should be Processed in storage: {carol_records:?}"
+    );
+    assert!(
+        carol_records
+            .iter()
+            .all(|record| record.state != MessageState::PeelDeferred),
+        "no message should remain stuck in PeelDeferred: {carol_records:?}"
     );
     let events = carol.drain_events();
     assert!(

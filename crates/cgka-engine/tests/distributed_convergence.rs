@@ -27,6 +27,7 @@ use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
+use sha2::{Digest, Sha256};
 use storage_sqlite::SqliteAccountStorage;
 
 mod support;
@@ -38,7 +39,6 @@ fn pad32(name: &[u8]) -> Vec<u8> {
     // from the ergonomic label so admin/member tracking stays stable across a
     // run while the engine accepts the identity.
     use k256::schnorr::SigningKey;
-    use sha2::{Digest, Sha256};
     let mut counter = 0u64;
     loop {
         let mut material = [0u8; 32];
@@ -270,7 +270,7 @@ async fn engine_converges_stored_openmls_messages_to_selected_branch() {
     );
     assert_eq!(
         result.accepted_commits,
-        vec![hex::encode(commit_messages[app_branch_index].id.as_slice())]
+        vec![content_hex(&commit_messages[app_branch_index])]
     );
     assert_message_state(
         &carol_storage,
@@ -501,15 +501,9 @@ async fn engine_materializes_multi_commit_path_from_stored_commits() {
     assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(3));
     assert_eq!(
         result.accepted_commits,
-        vec![
-            hex::encode(commit_david.id.as_slice()),
-            hex::encode(commit_eve.id.as_slice())
-        ]
+        vec![content_hex(&commit_david), content_hex(&commit_eve)]
     );
-    assert_eq!(
-        result.accepted_app_messages,
-        vec![hex::encode(app_msg.id.as_slice())]
-    );
+    assert_eq!(result.accepted_app_messages, vec![content_hex(&app_msg)]);
     assert_message_state(&carol_storage, &commit_david, MessageState::Processed);
     assert_message_state(&carol_storage, &commit_eve, MessageState::Processed);
     assert_message_state(&carol_storage, &app_msg, MessageState::Processed);
@@ -677,21 +671,18 @@ async fn engine_replays_late_same_epoch_commit_from_retained_anchor() {
 
     assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
     assert_ne!(
-        carol_storage.get_message(&bob_commit.id).unwrap().state,
+        carol_storage
+            .get_message(&content_id(&bob_commit))
+            .unwrap()
+            .state,
         MessageState::Created,
         "late commit should be resolved once the retained anchor is available"
     );
     if bob_wins {
-        assert_eq!(
-            result.accepted_commits,
-            vec![hex::encode(bob_commit.id.as_slice())]
-        );
+        assert_eq!(result.accepted_commits, vec![content_hex(&bob_commit)]);
         assert_message_state(&carol_storage, &bob_commit, MessageState::Processed);
     } else {
-        assert_eq!(
-            result.accepted_commits,
-            vec![hex::encode(alice_commit.id.as_slice())]
-        );
+        assert_eq!(result.accepted_commits, vec![content_hex(&alice_commit)]);
         assert_message_state(&carol_storage, &bob_commit, MessageState::EpochInvalidated);
     }
     let members = carol.members(&group_id).unwrap();
@@ -930,7 +921,10 @@ async fn rebuilt_engine_replays_late_same_epoch_commit_from_retained_anchor() {
 
     assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
     assert_ne!(
-        carol_storage.get_message(&bob_commit.id).unwrap().state,
+        carol_storage
+            .get_message(&content_id(&bob_commit))
+            .unwrap()
+            .state,
         MessageState::Created,
         "late commit should be resolved after engine rebuild"
     );
@@ -1266,7 +1260,7 @@ async fn engine_invalidates_commit_older_than_retained_anchor() {
         .expect("stale commit is resolved without historical replay");
 
     assert!(result.dropped_messages.iter().any(|dropped| {
-        dropped.message_id == hex::encode(stale_bob_commit.id.as_slice())
+        dropped.message_id == content_hex(&stale_bob_commit)
             && dropped.kind == MessageKind::Commit
             && dropped.reason == DroppedMessageReason::BeyondAnchor
     }));
@@ -1390,7 +1384,7 @@ async fn rebuilt_engine_invalidates_commit_older_than_retained_anchor() {
         .expect("rebuilt engine resolves stale commit without historical replay");
 
     assert!(result.dropped_messages.iter().any(|dropped| {
-        dropped.message_id == hex::encode(stale_bob_commit.id.as_slice())
+        dropped.message_id == content_hex(&stale_bob_commit)
             && dropped.kind == MessageKind::Commit
             && dropped.reason == DroppedMessageReason::BeyondAnchor
     }));
@@ -1472,10 +1466,7 @@ async fn engine_ingest_buffers_future_epoch_app_message_as_convergence_witness()
         .expect("future app witness applies after selected commit");
 
     assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
-    assert_eq!(
-        result.accepted_app_messages,
-        vec![hex::encode(app_msg.id.as_slice())]
-    );
+    assert_eq!(result.accepted_app_messages, vec![content_hex(&app_msg)]);
     assert_message_state(&carol_storage, &app_msg, MessageState::Processed);
 
     let events = carol.drain_events();
@@ -1571,10 +1562,10 @@ async fn engine_emits_only_canonical_branch_app_messages_after_convergence() {
     assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
     assert_eq!(
         result.accepted_app_messages,
-        vec![hex::encode(app_messages[selected_index].id.as_slice())]
+        vec![content_hex(&app_messages[selected_index])]
     );
     assert!(result.invalidated_app_messages.iter().any(|invalidated| {
-        invalidated.message_id == hex::encode(app_messages[losing_index].id.as_slice())
+        invalidated.message_id == content_hex(&app_messages[losing_index])
             && invalidated.reason == InvalidatedAppMessageReason::LosingBranch
     }));
     assert_message_state(
@@ -1614,7 +1605,7 @@ async fn engine_emits_only_canonical_branch_app_messages_after_convergence() {
                 reason: AppMessageInvalidationReason::LosingBranch,
                 decrypted_payload_ref: Some(_),
             } if *event_group == group_id
-                && *message_id == app_messages[losing_index].id
+                && *message_id == content_id(&app_messages[losing_index])
                 && *epoch == EpochId(2)
         )
     }));
@@ -1785,13 +1776,14 @@ async fn rebuilt_engine_emits_losing_branch_app_invalidation_after_convergence()
 
     assert_eq!(
         result.accepted_app_messages,
-        vec![hex::encode(app_messages[selected_index].id.as_slice())]
+        vec![content_hex(&app_messages[selected_index])]
     );
     assert_message_state(
         &carol_storage,
         &app_messages[losing_index],
         MessageState::EpochInvalidated,
     );
+    let losing_content_id = content_id(&app_messages[losing_index]);
     let events = restarted.drain_events();
     assert!(events.iter().any(|event| {
         matches!(
@@ -1801,7 +1793,7 @@ async fn rebuilt_engine_emits_losing_branch_app_invalidation_after_convergence()
                 message_id,
                 reason: AppMessageInvalidationReason::LosingBranch,
                 ..
-            } if *event_group == group_id && *message_id == app_messages[losing_index].id
+            } if *event_group == group_id && *message_id == losing_content_id
         )
     }));
     let received_payloads: Vec<Vec<u8>> = events
@@ -1894,10 +1886,7 @@ async fn engine_ingest_retains_proposal_until_canonical_commit_consumes_it() {
         .expect("proposal-consuming commit converges");
 
     assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
-    assert_eq!(
-        result.accepted_proposals,
-        vec![hex::encode(proposal.id.as_slice())]
-    );
+    assert_eq!(result.accepted_proposals, vec![content_hex(&proposal)]);
     assert_message_state(&carol_storage, &proposal, MessageState::Processed);
     assert_message_state(&carol_storage, &commit, MessageState::Processed);
     assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(2));
@@ -2559,13 +2548,27 @@ fn route(msg: TransportMessage, group_id: &GroupId) -> TransportMessage {
     }
 }
 
+/// Content-derived dedup id of a group message (#238). Inbound / buffered
+/// group messages are stored and reported under SHA-256 of the recovered MLS
+/// bytes, not the outer transport id. Under the pass-through `MockPeeler` the
+/// recovered MLS bytes are exactly `msg.payload`.
+fn content_id(msg: &TransportMessage) -> MessageId {
+    MessageId::new(Sha256::digest(&msg.payload).to_vec())
+}
+
+/// Hex form of [`content_id`], for comparing against canonicalization-result
+/// message ids.
+fn content_hex(msg: &TransportMessage) -> String {
+    hex::encode(content_id(msg).as_slice())
+}
+
 fn assert_message_state(
     storage: &SqliteAccountStorage,
     msg: &TransportMessage,
     expected: MessageState,
 ) {
     let record = storage
-        .get_message(&msg.id)
+        .get_message(&content_id(msg))
         .expect("message remains stored");
     assert_eq!(record.state, expected);
 }

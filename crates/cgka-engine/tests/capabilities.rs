@@ -208,6 +208,22 @@ fn build_engine_with_registry_and_components(
         .unwrap()
 }
 
+fn build_engine_on_storage_with_registry_and_components(
+    id: &[u8],
+    storage: SqliteAccountStorage,
+    registry: FeatureRegistry,
+    components: impl IntoIterator<Item = u16>,
+) -> Engine<SqliteAccountStorage> {
+    EngineBuilder::new(storage)
+        .identity(pad32(id))
+        .account_identity_proof_signer(proof_signer(id))
+        .feature_registry(registry)
+        .supported_app_components(components)
+        .peeler(Box::new(MockPeeler))
+        .build()
+        .unwrap()
+}
+
 #[tokio::test]
 async fn group_creation_negotiates_app_component_intersection() {
     let mut alice = build_engine_with_components(
@@ -1100,5 +1116,239 @@ async fn convergence_refreshes_recipient_required_capabilities_on_upgrade() {
     assert!(
         matches!(status, FeatureStatus::Available),
         "feature_status should report Available after convergence-applied upgrade, got: {status:?}"
+    );
+}
+
+// ── Agent-text-stream `required_member_roles` enforcement (#177) ──────────────
+
+use cgka_traits::agent_text_stream::{
+    AGENT_TEXT_STREAM_QUIC_COMPONENT_ID, AGENT_TEXT_STREAM_QUIC_FANOUT_CAPABILITY,
+    AGENT_TEXT_STREAM_QUIC_FANOUT_FEATURE, AGENT_TEXT_STREAM_QUIC_RECEIVE_CAPABILITY,
+    AGENT_TEXT_STREAM_QUIC_RECEIVE_FEATURE, AGENT_TEXT_STREAM_QUIC_SEND_CAPABILITY,
+    AGENT_TEXT_STREAM_QUIC_SEND_FEATURE, AgentTextStreamQuicPolicyV1,
+};
+
+/// Registry whose member advertises every agent-text-stream role capability, so
+/// a KeyPackage minted with it carries the `receive`/`send`/`fanout` backing
+/// extension types.
+fn registry_with_agent_stream_roles() -> FeatureRegistry {
+    let mut r = registry_selfremove_only();
+    for (feature, capability) in [
+        (
+            AGENT_TEXT_STREAM_QUIC_RECEIVE_FEATURE,
+            AGENT_TEXT_STREAM_QUIC_RECEIVE_CAPABILITY,
+        ),
+        (
+            AGENT_TEXT_STREAM_QUIC_SEND_FEATURE,
+            AGENT_TEXT_STREAM_QUIC_SEND_CAPABILITY,
+        ),
+        (
+            AGENT_TEXT_STREAM_QUIC_FANOUT_FEATURE,
+            AGENT_TEXT_STREAM_QUIC_FANOUT_CAPABILITY,
+        ),
+    ] {
+        r.register(
+            feature,
+            CapabilityRequirement {
+                requires: capability,
+                level: RequirementLevel::Optional,
+                description: "agent text stream role",
+            },
+        );
+    }
+    r
+}
+
+fn agent_stream_component() -> Vec<cgka_traits::app_components::AppComponentData> {
+    // user_to_agent_default has required_member_roles = receive.
+    vec![
+        AgentTextStreamQuicPolicyV1::user_to_agent_default()
+            .to_app_component_data()
+            .expect("default agent stream policy encodes"),
+    ]
+}
+
+/// Supported component ids for an agent-stream participant: the default group
+/// components (so admin-policy/profile work normally) plus `0x8006`. This
+/// isolates the role-capability check — every client here understands the
+/// component; the test varies only whether they advertise the role capability.
+fn agent_stream_supported_components() -> Vec<u16> {
+    let mut ids = default_group_components();
+    ids.insert(AGENT_TEXT_STREAM_QUIC_COMPONENT_ID);
+    ids.into_iter().collect()
+}
+
+/// A group carrying the agent-text-stream-QUIC component with
+/// `required_member_roles = receive` MUST reject an invitee whose KeyPackage
+/// supports the `0x8006` component but does NOT advertise the `receive` role
+/// capability, while accepting one that does (#177,
+/// agent-text-stream-quic-v1.md).
+#[tokio::test]
+async fn create_group_rejects_invitee_missing_required_role_capability() {
+    // Alice supports the component and advertises every role.
+    let mut alice = build_engine_with_registry_and_components(
+        b"alice",
+        registry_with_agent_stream_roles(),
+        agent_stream_supported_components(),
+    );
+    // Bob supports the component but does NOT advertise any role capability
+    // (registry without the role features), so his KeyPackage lacks `receive`.
+    let mut bob = build_engine_with_registry_and_components(
+        b"bob",
+        registry_selfremove_only(),
+        agent_stream_supported_components(),
+    );
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+
+    let err = alice
+        .create_group(CreateGroupRequest {
+            name: "agent-stream".into(),
+            description: "".into(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: agent_stream_component(),
+            initial_admins: vec![],
+        })
+        .await
+        .expect_err("bob lacks the required receive role capability");
+    assert!(
+        matches!(err, EngineError::MissingRequiredCapabilities { .. }),
+        "expected MissingRequiredCapabilities, got {err:?}"
+    );
+
+    // Carol supports the component AND advertises every role: accepted.
+    let mut carol = build_engine_with_registry_and_components(
+        b"carol",
+        registry_with_agent_stream_roles(),
+        agent_stream_supported_components(),
+    );
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let created = alice
+        .create_group(CreateGroupRequest {
+            name: "agent-stream".into(),
+            description: "".into(),
+            members: vec![carol_kp],
+            required_features: vec![],
+            app_components: agent_stream_component(),
+            initial_admins: vec![],
+        })
+        .await;
+    assert!(
+        created.is_ok(),
+        "carol advertises the receive role and must be accepted, got {created:?}"
+    );
+}
+
+/// Inviting into an existing group whose policy requires the `receive` role MUST
+/// reject an invitee KeyPackage that does not advertise it (#177).
+#[tokio::test]
+async fn invite_rejects_member_missing_required_role_capability() {
+    let mut alice = build_engine_with_registry_and_components(
+        b"alice",
+        registry_with_agent_stream_roles(),
+        agent_stream_supported_components(),
+    );
+    let mut carol = build_engine_with_registry_and_components(
+        b"carol",
+        registry_with_agent_stream_roles(),
+        agent_stream_supported_components(),
+    );
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+
+    // Create the group with the role-requiring component and one valid member.
+    let (group_id, created) = alice
+        .create_group(CreateGroupRequest {
+            name: "agent-stream".into(),
+            description: "".into(),
+            members: vec![carol_kp],
+            required_features: vec![],
+            app_components: agent_stream_component(),
+            initial_admins: vec![],
+        })
+        .await
+        .expect("group with valid initial member creates");
+    if let SendResult::GroupCreated { pending, .. } = created {
+        alice.confirm_published(pending).await.unwrap();
+    }
+
+    // Bob supports the component but advertises no role capability.
+    let mut bob = build_engine_with_registry_and_components(
+        b"bob",
+        registry_selfremove_only(),
+        agent_stream_supported_components(),
+    );
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+
+    let err = alice
+        .send(cgka_traits::engine::SendIntent::Invite {
+            group_id,
+            key_packages: vec![bob_kp],
+        })
+        .await
+        .expect_err("bob lacks the required receive role capability at invite");
+    assert!(
+        matches!(err, EngineError::MissingRequiredCapabilities { .. }),
+        "expected MissingRequiredCapabilities at invite, got {err:?}"
+    );
+}
+
+/// Join-time self-check (#177, agent-text-stream-quic-v1.md): a joiner that does
+/// not advertise every required role capability MUST NOT join, even if a welcome
+/// was produced for an (over-broad/stale) KeyPackage that did. Modeled by
+/// minting bob's KeyPackage with the role-advertising registry, then rebuilding
+/// bob on the same storage with a downgraded registry that no longer advertises
+/// the receive role before consuming the welcome.
+#[tokio::test]
+async fn join_welcome_self_check_rejects_local_member_missing_required_role() {
+    let mut alice = build_engine_with_registry_and_components(
+        b"alice",
+        registry_with_agent_stream_roles(),
+        agent_stream_supported_components(),
+    );
+    let bob_storage = SqliteAccountStorage::in_memory().unwrap();
+    let mut bob = build_engine_on_storage_with_registry_and_components(
+        b"bob",
+        bob_storage.clone(),
+        registry_with_agent_stream_roles(),
+        agent_stream_supported_components(),
+    );
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+
+    let (_group_id, created) = alice
+        .create_group(CreateGroupRequest {
+            name: "agent-stream".into(),
+            description: "".into(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: agent_stream_component(),
+            initial_admins: vec![],
+        })
+        .await
+        .expect("group with role-advertising bob creates");
+    let welcome = match created {
+        SendResult::GroupCreated { welcomes, pending } => {
+            alice.confirm_published(pending).await.unwrap();
+            welcomes.into_iter().next().unwrap()
+        }
+        _ => unreachable!(),
+    };
+    drop(bob);
+
+    // Rebuild bob on the same storage (same identity + KeyPackage key material)
+    // but with a registry that no longer advertises any agent-stream role, so
+    // his runtime support lacks the receive role the group requires.
+    let mut downgraded_bob = build_engine_on_storage_with_registry_and_components(
+        b"bob",
+        bob_storage,
+        registry_selfremove_only(),
+        agent_stream_supported_components(),
+    );
+    let err = downgraded_bob
+        .join_welcome(welcome)
+        .await
+        .expect_err("downgraded bob no longer advertises the required receive role");
+    assert!(
+        matches!(err, EngineError::MissingRequiredCapabilities { .. }),
+        "expected MissingRequiredCapabilities at join self-check, got {err:?}"
     );
 }

@@ -40,11 +40,19 @@ use openmls::messages::proposals::{AppDataUpdateOperation, AppDataUpdateProposal
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::RustCrypto;
 use openmls_traits::OpenMlsProvider as _;
+use sha2::{Digest, Sha256};
 use storage_sqlite::SqliteAccountStorage;
 use tls_codec::Serialize as _;
 
 mod support;
 use support::proof_signer;
+
+/// Content-derived dedup id of a group message (#238). Inbound group messages
+/// are stored and reported under SHA-256 of the recovered MLS bytes, which the
+/// pass-through `MockPeeler` makes equal to `msg.payload`.
+fn content_id(msg: &TransportMessage) -> MessageId {
+    MessageId::new(Sha256::digest(&msg.payload).to_vec())
+}
 
 fn pad32(name: &[u8]) -> Vec<u8> {
     // Marmot credential identities MUST be a valid 32-byte x-only secp256k1
@@ -52,7 +60,6 @@ fn pad32(name: &[u8]) -> Vec<u8> {
     // from the ergonomic label so admin/member tracking stays stable across a
     // run while the engine accepts the identity.
     use k256::schnorr::SigningKey;
-    use sha2::{Digest, Sha256};
     let mut counter = 0u64;
     loop {
         let mut material = [0u8; 32];
@@ -519,7 +526,9 @@ async fn convergence_rejects_non_admin_admin_policy_update() {
             data: encode_admin_policy_for_test(&[alice_id.clone(), bob_id]),
         }],
     );
-    let malicious_id = hex::encode(malicious.id.as_slice());
+    // The convergence layer keys the unauthorized commit on its content-derived
+    // dedup id (#238), not the outer transport id.
+    let malicious_id = hex::encode(content_id(&malicious).as_slice());
 
     alice
         .ingest(malicious.clone())
@@ -545,7 +554,7 @@ async fn convergence_rejects_non_admin_admin_policy_update() {
     assert_eq!(alice.admin_pubkeys(&gid).unwrap(), vec![alice_admin]);
     assert_eq!(
         alice_storage
-            .get_message(&malicious.id)
+            .get_message(&content_id(&malicious))
             .expect("malicious message was stored")
             .state,
         MessageState::EpochInvalidated

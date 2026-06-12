@@ -84,6 +84,17 @@ impl<S: StorageProvider> Engine<S> {
             });
         }
 
+        // Per-member role capabilities the agent-text-stream-QUIC component's
+        // `required_member_roles` mask demands (#177,
+        // agent-text-stream-quic-v1.md). These are enforced against every
+        // invitee KeyPackage but are NOT folded into the group's
+        // RequiredCapabilities — they are a component-driven per-member
+        // advertisement requirement, not an MLS-level group requirement.
+        let required_role_caps =
+            crate::capability_manager::required_role_capabilities_from_request_components(
+                &req.app_components,
+            );
+
         let mut parsed_kps = Vec::with_capacity(req.members.len());
         let mut negotiated_components =
             desired_components.intersection(&self.supported_app_components);
@@ -94,6 +105,13 @@ impl<S: StorageProvider> Engine<S> {
             if !missing.is_empty() {
                 return Err(EngineError::MissingRequiredCapabilities {
                     required: Box::new(required_caps.clone()),
+                    had: Box::new(had),
+                });
+            }
+            let role_missing = required_role_caps.missing_from(&had);
+            if !role_missing.is_empty() {
+                return Err(EngineError::MissingRequiredCapabilities {
+                    required: Box::new(required_role_caps.clone()),
                     had: Box::new(had),
                 });
             }
@@ -399,8 +417,18 @@ impl<S: StorageProvider> Engine<S> {
         // (feature registry + supported app components), so a group requiring
         // more than this client can process is rejected even if a stale or
         // over-broad KeyPackage was consumed.
-        let group_required =
+        //
+        // This also covers the agent-text-stream-QUIC join self-check (#177,
+        // agent-text-stream-quic-v1.md): the group's `required_member_roles`
+        // mask is translated into role-Feature capabilities and folded into
+        // `group_required`, so a joiner that does not advertise every required
+        // role capability is rejected here before it joins.
+        let mut group_required =
             crate::capability_manager::required_capabilities_from_group(&mls_group);
+        crate::message_processor::merge_capabilities(
+            &mut group_required,
+            &crate::capability_manager::required_role_capabilities_from_group(&mls_group),
+        );
         let had = crate::capabilities::self_supported_capabilities(
             &self.registry,
             self.ciphersuite,

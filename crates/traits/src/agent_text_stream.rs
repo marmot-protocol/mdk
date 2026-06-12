@@ -9,7 +9,7 @@ pub use crate::app_components::{
     AGENT_TEXT_STREAM_QUIC_COMPONENT, AGENT_TEXT_STREAM_QUIC_COMPONENT_ID,
 };
 use crate::app_components::{AppComponentData, decode_quic_varint, encode_quic_varint};
-use crate::capabilities::Feature;
+use crate::capabilities::{Capability, Feature, GroupCapabilities};
 use crate::types::{EpochId, GroupId, MemberId, MessageId};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -20,6 +20,52 @@ pub const AGENT_TEXT_STREAM_QUIC_SEND_FEATURE: Feature =
     Feature("marmot.feature.agent_text_stream_quic.send.v1");
 pub const AGENT_TEXT_STREAM_QUIC_FANOUT_FEATURE: Feature =
     Feature("marmot.feature.agent_text_stream_quic.fanout.v1");
+
+/// MLS leaf-capability backing each agent-text-stream-QUIC role
+/// (`agent-text-stream-quic-v1.md`). Each role capability advertised by a
+/// KeyPackage is a distinct private-use MLS extension type, so a member can
+/// advertise `receive` without advertising `send`/`fanout`. This is what makes
+/// `required_member_roles` enforceable per role rather than only at
+/// component-support granularity. The component id (`0x8006`) stays separate: it
+/// gates "understands the component", these gate "supports the role".
+pub const AGENT_TEXT_STREAM_QUIC_RECEIVE_CAPABILITY: Capability = Capability::Extension(0xF2D1);
+pub const AGENT_TEXT_STREAM_QUIC_SEND_CAPABILITY: Capability = Capability::Extension(0xF2D2);
+pub const AGENT_TEXT_STREAM_QUIC_FANOUT_CAPABILITY: Capability = Capability::Extension(0xF2D4);
+
+/// Map a role to its `(bit, Feature, Capability)` triple. The single source of
+/// truth for the role bit -> capability mapping in
+/// `agent-text-stream-quic-v1.md`, shared by the engine enforcement and the app
+/// feature registration so they cannot drift.
+pub const AGENT_TEXT_STREAM_QUIC_ROLES: [(u8, Feature, Capability); 3] = [
+    (
+        AGENT_TEXT_STREAM_ROLE_RECEIVE,
+        AGENT_TEXT_STREAM_QUIC_RECEIVE_FEATURE,
+        AGENT_TEXT_STREAM_QUIC_RECEIVE_CAPABILITY,
+    ),
+    (
+        AGENT_TEXT_STREAM_ROLE_SEND,
+        AGENT_TEXT_STREAM_QUIC_SEND_FEATURE,
+        AGENT_TEXT_STREAM_QUIC_SEND_CAPABILITY,
+    ),
+    (
+        AGENT_TEXT_STREAM_ROLE_FANOUT,
+        AGENT_TEXT_STREAM_QUIC_FANOUT_FEATURE,
+        AGENT_TEXT_STREAM_QUIC_FANOUT_CAPABILITY,
+    ),
+];
+
+/// Translate a `required_member_roles` mask into the set of role capabilities
+/// every member MUST advertise. Empty when the mask requires no roles. Unknown
+/// bits are ignored here; component validation rejects unknown bits separately.
+pub fn required_role_capabilities(required_member_roles: u8) -> GroupCapabilities {
+    let mut out = GroupCapabilities::default();
+    for (bit, _feature, capability) in AGENT_TEXT_STREAM_QUIC_ROLES {
+        if required_member_roles & bit != 0 {
+            out.insert(capability);
+        }
+    }
+    out
+}
 
 /// Lookup key for the agent-text-stream secret in the
 /// [`crate::group_context::GroupContextSnapshot`] secrets map (used by

@@ -92,7 +92,14 @@ impl<S: StorageProvider> Engine<S> {
         message: TransportMessage,
         now_ms: u64,
     ) -> Result<(), OpenMlsProjectionError> {
-        match self.storage.get_message(&message.id) {
+        // Key the convergence store on the content-derived dedup id (SHA-256 of
+        // the recovered MLS bytes), not the outer transport id (#238). This
+        // keeps the buffered-record identity consistent whether the message
+        // arrived through `ingest_group_message` (which already rebinds to the
+        // content id) or a direct caller, so a re-wrapped duplicate maps to the
+        // same convergence row.
+        let content_id = crate::message_processor::content_dedup_id(&message.payload);
+        match self.storage.get_message(&content_id) {
             Ok(record) if record.state == MessageState::PeelDeferred => {}
             Ok(_) => return Ok(()),
             Err(StorageError::NotFound) => {}
@@ -112,9 +119,17 @@ impl<S: StorageProvider> Engine<S> {
             return Ok(());
         }
 
+        // Rebind the inner stored message id to the content id too: the
+        // canonicalization layer reads the inner `TransportMessage.id` as the
+        // symbolic message id and feeds it back into `update_message_state` /
+        // `get_message`, so it MUST equal the record key.
+        let message = TransportMessage {
+            id: content_id.clone(),
+            ..message
+        };
         self.storage
             .put_message(&MessageRecord {
-                id: message.id.clone(),
+                id: content_id,
                 group_id: group_id.clone(),
                 epoch: EpochId(source_epoch),
                 state: MessageState::Created,

@@ -337,6 +337,41 @@ impl<S: StorageProvider> Engine<S> {
                     });
                 }
             };
+
+            // foundation/wire-envelopes.md + protocol-core/inbound-processing.md:
+            // the canonical dedup/replay id MUST be stable for the carried
+            // protocol bytes and MUST NOT depend on the transport event id. The
+            // transport id only acts as the cheap pre-filter at the top of
+            // `do_ingest`; the same MLS message re-wrapped in a fresh kind-445
+            // envelope (new ephemeral key + nonce -> new transport id, which any
+            // member can produce) MUST collapse to a single duplicate outcome.
+            // Rebind every downstream storage / convergence / fork-recovery row
+            // and the in-memory dedup sets to this content-derived id.
+            let content_id = content_dedup_id(&mls_bytes);
+            if let Some(outcome) = self.recorded_message_outcome(&content_id)? {
+                return Ok(outcome);
+            }
+            if self.seen_message_ids.contains(&content_id) {
+                return Ok(IngestOutcome::Stale {
+                    reason: StaleReason::AlreadySeen,
+                });
+            }
+            if self.sent_message_ids.contains(&content_id) {
+                return Ok(IngestOutcome::Stale {
+                    reason: StaleReason::OwnEcho,
+                });
+            }
+            let content_msg = TransportMessage {
+                id: content_id,
+                ..msg.clone()
+            };
+            // Shadow `msg` for the remainder of the loop body so every
+            // `persist_*`, `update_stored_message_state`, convergence buffer,
+            // and fork-recovery storage id keys on the content-derived id. The
+            // original transport `msg` is only read above the peel, before this
+            // shadow, so a fork-recovery `continue` still re-peels the real
+            // transport bytes.
+            let msg = &content_msg;
             let openmls_msg = TransportMessage {
                 payload: mls_bytes.clone(),
                 ..msg.clone()
@@ -559,6 +594,10 @@ impl<S: StorageProvider> Engine<S> {
                         payload,
                     });
                     self.update_stored_message_state(&msg.id, MessageState::Processed)?;
+                    // In-memory fast path mirrors the durable record, keyed on
+                    // the content-derived id so a re-wrapped duplicate is caught
+                    // before the durable lookup.
+                    self.seen_message_ids.insert(msg.id.clone());
                     Ok(IngestOutcome::Processed)
                 }
                 ProcessedMessageContent::StagedCommitMessage(staged) => {
@@ -748,6 +787,10 @@ impl<S: StorageProvider> Engine<S> {
                         self.push_group_state_change(&group_id, after, sender_id.clone(), change);
                     }
                     self.update_stored_message_state(&msg.id, MessageState::Processed)?;
+                    // In-memory fast path mirrors the durable record, keyed on
+                    // the content-derived id so a re-wrapped duplicate commit is
+                    // caught before the durable lookup.
+                    self.seen_message_ids.insert(msg.id.clone());
                     Ok(IngestOutcome::Processed)
                 }
                 ProcessedMessageContent::ProposalMessage(queued) => {
@@ -1289,9 +1332,18 @@ impl<S: StorageProvider> Engine<S> {
         crate::app_components::require_admin(&mls_group, &group_id, self.identity.self_id())?;
 
         // Validate capabilities (same rule as create_group — see Risk #1
-        // capability doc).
+        // capability doc). The group's required capabilities cover required MLS
+        // primitives and required app components; additionally fold in the
+        // per-member role capabilities the agent-text-stream-QUIC component's
+        // `required_member_roles` mask demands (#177,
+        // agent-text-stream-quic-v1.md): a client MUST NOT invite a member whose
+        // KeyPackage does not advertise every required role capability.
         let existing = self.storage.get_group(&group_id)?;
-        let required = existing.required_capabilities.clone();
+        let mut required = existing.required_capabilities.clone();
+        merge_capabilities(
+            &mut required,
+            &crate::capability_manager::required_role_capabilities_from_group(&mls_group),
+        );
         let mut parsed_kps = Vec::with_capacity(key_packages.len());
         for kp in &key_packages {
             let parsed = self.parse_key_package(kp)?;
@@ -1883,6 +1935,34 @@ fn record_group_id(msg: &TransportMessage) -> GroupId {
     }
 }
 
+/// Canonical, content-derived duplicate-detection / replay id for a recovered
+/// MLS message.
+///
+/// Per foundation/wire-envelopes.md and protocol-core/inbound-processing.md the
+/// dedup id MUST be stable for the carried protocol bytes and MUST NOT depend on
+/// the transport event id. This hashes the peeled MLS wire bytes with the same
+/// `SHA-256(mls_bytes)` convention `CommitOrderingKey::from_commit_bytes` uses
+/// for fork ordering, so the same MLS message re-wrapped in a fresh transport
+/// envelope maps to one id, independent of the outer ephemeral key / nonce.
+pub(crate) fn content_dedup_id(mls_bytes: &[u8]) -> MessageId {
+    MessageId::new(Sha256::digest(mls_bytes).to_vec())
+}
+
+/// Fold every capability in `extra` into `required` (set union). Used to add the
+/// agent-stream `required_member_roles` role capabilities to a group's required
+/// capability set before the per-KeyPackage invite check and the join-time
+/// self-check (#177).
+pub(crate) fn merge_capabilities(
+    required: &mut cgka_traits::capabilities::GroupCapabilities,
+    extra: &cgka_traits::capabilities::GroupCapabilities,
+) {
+    required.proposals.extend(extra.proposals.iter().copied());
+    required.extensions.extend(extra.extensions.iter().copied());
+    for id in &extra.app_components.ids {
+        required.app_components.insert(*id);
+    }
+}
+
 fn route_wrapped_group_message(
     msg: TransportMessage,
     ctx: &cgka_traits::group_context::GroupContextSnapshot,
@@ -2022,7 +2102,7 @@ impl<S: StorageProvider> Engine<S> {
     }
 
     fn recorded_message_outcome(
-        &mut self,
+        &self,
         id: &MessageId,
     ) -> Result<Option<IngestOutcome>, EngineError> {
         let record = match self.storage.get_message(id) {
@@ -2179,6 +2259,11 @@ impl<S: StorageProvider> Engine<S> {
         epoch: EpochId,
     ) -> Result<(), EngineError> {
         self.sent_message_ids.insert(msg.id.clone());
+        // Also remember the content-derived id so our own commit / app message
+        // echoed back inside a freshly re-wrapped transport envelope (different
+        // transport id) is still classified `OwnEcho` by the post-peel content
+        // check, not reprocessed.
+        self.sent_message_ids.insert(content_dedup_id(mls_bytes));
         let openmls_msg = TransportMessage {
             payload: mls_bytes.to_vec(),
             ..msg.clone()

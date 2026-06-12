@@ -640,3 +640,161 @@ async fn inbound_group_message_during_pending_publish_replays_after_rollback() {
         "expected buffered message after rollback; got {events:?}"
     );
 }
+
+// ── Content-derived dedup id (#238) ──────────────────────────────────────────
+
+/// Drive Alice + Bob into a shared group and return both engines plus the
+/// group id, ready for app-message ingest assertions.
+async fn alice_bob_in_group() -> (
+    Engine<SqliteAccountStorage>,
+    Engine<SqliteAccountStorage>,
+    cgka_traits::types::GroupId,
+) {
+    let mut alice = build_client(b"alice");
+    let mut bob = build_client(b"bob");
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+
+    let (group_id, result) = alice
+        .create_group(CreateGroupRequest {
+            name: "".into(),
+            description: "".into(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (pending, welcome) = match result {
+        SendResult::GroupCreated {
+            pending,
+            mut welcomes,
+        } => (pending, welcomes.remove(0)),
+        _ => unreachable!(),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(welcome).await.unwrap();
+    bob.drain_events();
+    (alice, bob, group_id)
+}
+
+/// The same MLS message re-wrapped in a fresh transport envelope (a different
+/// transport id, which any group member can produce by re-sealing the same
+/// bytes under a new ephemeral key + nonce) MUST collapse to a single applied
+/// outcome: the canonical dedup id is derived from the recovered MLS bytes, not
+/// the outer transport event id (foundation/wire-envelopes.md,
+/// protocol-core/inbound-processing.md "Message identity").
+#[tokio::test]
+async fn rewrapped_mls_message_with_new_transport_id_is_a_duplicate() {
+    let (mut alice, mut bob, group_id) = alice_bob_in_group().await;
+
+    let msg = match alice
+        .send(SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload: app_payload_for(&alice, b"only once"),
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::ApplicationMessage { msg } => msg,
+        _ => unreachable!(),
+    };
+
+    // First delivery: re-route so bob resolves the group. Applied once.
+    let first = TransportMessage {
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+        ..msg.clone()
+    };
+    assert!(matches!(
+        bob.ingest(first).await.unwrap(),
+        IngestOutcome::Processed
+    ));
+    let delivered = bob
+        .drain_events()
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                GroupEvent::MessageReceived { payload, .. } if app_content(payload) == b"only once"
+            )
+        })
+        .count();
+    assert_eq!(delivered, 1, "first delivery must be applied exactly once");
+
+    // Second delivery: identical MLS payload, but a brand-new transport id and
+    // a fresh nonce — exactly what a re-wrap into a new kind-445 envelope looks
+    // like. The transport-id pre-filter cannot catch this; the content-derived
+    // dedup id must.
+    let rewrapped = TransportMessage {
+        id: MessageId::new(b"a-completely-different-transport-event-id".to_vec()),
+        timestamp: Timestamp(msg.timestamp.0 + 999),
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+        ..msg
+    };
+    assert!(
+        matches!(
+            bob.ingest(rewrapped).await.unwrap(),
+            IngestOutcome::Stale {
+                reason: StaleReason::AlreadySeen
+            }
+        ),
+        "re-wrapped duplicate MLS message must be classified AlreadySeen"
+    );
+    let after = bob.drain_events();
+    assert!(
+        after.iter().all(
+            |e| !matches!(e, GroupEvent::MessageReceived { payload, .. } if app_content(payload) == b"only once")
+        ),
+        "re-wrapped duplicate must not be delivered a second time; got {after:?}"
+    );
+}
+
+/// Two genuinely different MLS messages (different inner bytes) MUST NOT be
+/// collapsed by content-derived dedup — only byte-identical re-wraps are
+/// duplicates.
+#[tokio::test]
+async fn distinct_mls_messages_are_not_collapsed_by_content_dedup() {
+    let (mut alice, mut bob, group_id) = alice_bob_in_group().await;
+
+    for body in [b"first distinct".as_slice(), b"second distinct".as_slice()] {
+        let msg = match alice
+            .send(SendIntent::AppMessage {
+                group_id: group_id.clone(),
+                payload: app_payload_for(&alice, body),
+            })
+            .await
+            .unwrap()
+        {
+            SendResult::ApplicationMessage { msg } => msg,
+            _ => unreachable!(),
+        };
+        let routed = TransportMessage {
+            envelope: TransportEnvelope::GroupMessage {
+                transport_group_id: group_id.as_slice().to_vec(),
+            },
+            ..msg
+        };
+        assert!(
+            matches!(bob.ingest(routed).await.unwrap(), IngestOutcome::Processed),
+            "distinct message {body:?} must be applied, not deduped",
+        );
+    }
+
+    let delivered: Vec<Vec<u8>> = bob
+        .drain_events()
+        .into_iter()
+        .filter_map(|e| match e {
+            GroupEvent::MessageReceived { payload, .. } => Some(app_content(&payload)),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        delivered.iter().any(|p| p == b"first distinct")
+            && delivered.iter().any(|p| p == b"second distinct"),
+        "both distinct messages must be delivered; got {delivered:?}"
+    );
+}

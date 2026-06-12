@@ -145,6 +145,56 @@ pub(crate) fn required_capabilities_from_group(mls_group: &MlsGroup) -> GroupCap
     out
 }
 
+/// Per-member role capabilities a group requires because it carries the
+/// agent-text-stream-QUIC (`0x8006`) component with a non-empty
+/// `required_member_roles` mask.
+///
+/// `spec/app-components/agent-text-stream-quic-v1.md` requires every member to
+/// advertise each role capability named by `required_member_roles`. This reads
+/// the component bytes from the live group and maps the mask to its role
+/// capabilities (`cgka_traits::agent_text_stream::required_role_capabilities`).
+/// Empty when the component is absent or the mask requires no roles. Returns
+/// `GroupCapabilities` so callers reuse the same `missing_from` check used for
+/// required components.
+pub(crate) fn required_role_capabilities_from_group(mls_group: &MlsGroup) -> GroupCapabilities {
+    let Some(bytes) = crate::app_components::app_component_data_of_group(
+        mls_group,
+        cgka_traits::app_components::AGENT_TEXT_STREAM_QUIC_COMPONENT_ID,
+    ) else {
+        return GroupCapabilities::default();
+    };
+    let Ok(policy) =
+        cgka_traits::agent_text_stream::AgentTextStreamQuicPolicyV1::decode_component_state(&bytes)
+    else {
+        // A malformed component is rejected elsewhere (component validation);
+        // surface no role requirement here rather than guessing a mask.
+        return GroupCapabilities::default();
+    };
+    cgka_traits::agent_text_stream::required_role_capabilities(policy.required_member_roles)
+}
+
+/// Per-member role capabilities demanded by an agent-text-stream-QUIC (`0x8006`)
+/// component supplied in a `create_group` request, before the group exists.
+/// Mirrors [`required_role_capabilities_from_group`] but reads the policy bytes
+/// from the request's component list (#177). Empty when the component is absent.
+pub(crate) fn required_role_capabilities_from_request_components(
+    components: &[cgka_traits::app_components::AppComponentData],
+) -> GroupCapabilities {
+    let Some(component) = components.iter().find(|component| {
+        component.component_id == cgka_traits::app_components::AGENT_TEXT_STREAM_QUIC_COMPONENT_ID
+    }) else {
+        return GroupCapabilities::default();
+    };
+    let Ok(policy) =
+        cgka_traits::agent_text_stream::AgentTextStreamQuicPolicyV1::decode_component_state(
+            &component.data,
+        )
+    else {
+        return GroupCapabilities::default();
+    };
+    cgka_traits::agent_text_stream::required_role_capabilities(policy.required_member_roles)
+}
+
 impl<S: StorageProvider> Engine<S> {
     pub(crate) fn do_feature_status(
         &self,
