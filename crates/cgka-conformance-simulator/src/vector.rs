@@ -6,7 +6,8 @@
 
 use crate::{HarnessClient, ScenarioSpec};
 use cgka_traits::engine::{
-    AppMessageInvalidationReason, CommitOrderingKey, GroupEvent, GroupStateChange,
+    AppMessageInvalidationReason, CommitOrderingKey, CommitOrderingPriority, GroupEvent,
+    GroupStateChange,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -546,9 +547,11 @@ pub struct ForkRecoveryObservation {
     pub invalidated: RecoveryOrderingKeyObservation,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct RecoveryOrderingKeyObservation {
     pub source_epoch: u64,
+    pub priority: CommitOrderingPriority,
+    pub committer: String,
     pub commit_digest: String,
 }
 
@@ -713,6 +716,8 @@ fn observe_app_invalidation_reason(reason: AppMessageInvalidationReason) -> Stri
 fn observe_key(key: &CommitOrderingKey) -> RecoveryOrderingKeyObservation {
     RecoveryOrderingKeyObservation {
         source_epoch: key.source_epoch.0,
+        priority: key.priority,
+        committer: hex::encode(key.committer.as_slice()),
         commit_digest: hex::encode(key.commit_digest),
     }
 }

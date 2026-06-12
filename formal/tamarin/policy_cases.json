@@ -166,6 +166,7 @@
         "id": "low_digest",
         "fork_epoch": 0,
         "tip_epoch": 2,
+        "tip_committer": "same",
         "tip_digest": "00",
         "app_witnesses": [
           { "epoch": 2, "sender": "alice" }
@@ -175,6 +176,7 @@
         "id": "high_digest",
         "fork_epoch": 0,
         "tip_epoch": 2,
+        "tip_committer": "same",
         "tip_digest": "ff",
         "app_witnesses": [
           { "epoch": 2, "sender": "alice" }

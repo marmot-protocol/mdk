@@ -7,6 +7,7 @@ use cgka_conformance_simulator::canonicalization::{
     PeeledMessageKind, canonicalize, canonicalize_with_materialized_candidates,
 };
 use cgka_conformance_simulator::convergence::{BranchCandidate, ConvergencePolicy};
+use cgka_traits::engine::CommitOrderingPriority;
 
 fn digest(byte: u8) -> [u8; 32] {
     [byte; 32]
@@ -17,6 +18,8 @@ fn branch(id: &str, fork_epoch: u64, tip_epoch: u64, digest_byte: u8) -> BranchC
         id: id.into(),
         fork_epoch,
         tip_epoch,
+        tip_priority: CommitOrderingPriority::Ordinary,
+        tip_committer: b"alice".to_vec(),
         tip_digest: digest(digest_byte),
         app_witnesses: vec![],
     }
@@ -100,6 +103,7 @@ fn commit_edge_with_proposals(
             parent_branch_id: parent_branch_id.map(str::to_owned),
             fork_epoch,
             resulting_epoch,
+            tip_priority: CommitOrderingPriority::Ordinary,
             tip_digest: digest(tip_digest),
             consumed_proposal_ids: consumed_proposal_ids
                 .iter()
@@ -156,6 +160,7 @@ fn child_commit_edge_with_proposals(
             parent_branch_id: Some(edge.parent_branch_id.into()),
             fork_epoch: edge.fork_epoch,
             resulting_epoch: edge.resulting_epoch,
+            tip_priority: CommitOrderingPriority::Ordinary,
             tip_digest: digest(edge.tip_digest),
             consumed_proposal_ids: consumed_proposal_ids
                 .iter()

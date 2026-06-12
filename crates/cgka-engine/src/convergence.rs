@@ -7,6 +7,7 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 
+use cgka_traits::engine::CommitOrderingPriority;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -66,6 +67,8 @@ pub struct BranchCandidate {
     pub id: String,
     pub fork_epoch: u64,
     pub tip_epoch: u64,
+    pub tip_priority: CommitOrderingPriority,
+    pub tip_committer: Vec<u8>,
     pub tip_digest: [u8; 32],
     pub app_witnesses: Vec<AppWitness>,
 }
@@ -80,6 +83,8 @@ impl BranchCandidate {
                 .saturating_add(witness_depth_boost(self, policy)),
             witness_quorum_met: witness_quorum_met(&self.app_witnesses, policy),
             app_witness_score: app_witness_score(&self.app_witnesses, policy),
+            tip_priority: self.tip_priority,
+            tip_committer: self.tip_committer.clone(),
             tip_digest: self.tip_digest,
         }
     }
@@ -97,6 +102,8 @@ pub struct BranchScore {
     pub effective_commit_depth: u64,
     pub witness_quorum_met: bool,
     pub app_witness_score: usize,
+    pub tip_priority: CommitOrderingPriority,
+    pub tip_committer: Vec<u8>,
     pub tip_digest: [u8; 32],
 }
 
@@ -125,6 +132,8 @@ fn compare_scores(a: &BranchScore, b: &BranchScore) -> Ordering {
         .then_with(|| a.witness_quorum_met.cmp(&b.witness_quorum_met))
         .then_with(|| a.valid_commit_depth.cmp(&b.valid_commit_depth))
         .then_with(|| a.app_witness_score.cmp(&b.app_witness_score))
+        .then_with(|| b.tip_priority.cmp(&a.tip_priority))
+        .then_with(|| b.tip_committer.cmp(&a.tip_committer))
         .then_with(|| b.tip_digest.cmp(&a.tip_digest))
 }
 

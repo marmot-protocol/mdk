@@ -1,4 +1,5 @@
 use cgka_engine::convergence::{AppWitness, BranchCandidate, BranchScore, ConvergencePolicy};
+use cgka_traits::engine::CommitOrderingPriority;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -41,6 +42,10 @@ pub struct PolicyCaseBranch {
     pub id: String,
     pub fork_epoch: u64,
     pub tip_epoch: u64,
+    #[serde(default)]
+    pub tip_priority: Option<String>,
+    #[serde(default)]
+    pub tip_committer: Option<String>,
     pub tip_digest: String,
     pub app_witnesses: Vec<PolicyCaseWitness>,
 }
@@ -51,6 +56,13 @@ impl PolicyCaseBranch {
             id: self.id.clone(),
             fork_epoch: self.fork_epoch,
             tip_epoch: self.tip_epoch,
+            tip_priority: priority_from_rank(self.tip_priority.as_deref()),
+            tip_committer: self
+                .tip_committer
+                .as_deref()
+                .unwrap_or(&self.id)
+                .as_bytes()
+                .to_vec(),
             tip_digest: digest_from_rank(&self.tip_digest),
             app_witnesses: self
                 .app_witnesses
@@ -107,6 +119,25 @@ pub fn reason_against(expected: &BranchScore, other: &BranchScore) -> &'static s
         && expected.witness_quorum_met == other.witness_quorum_met
         && expected.valid_commit_depth == other.valid_commit_depth
         && expected.app_witness_score == other.app_witness_score
+        && expected.tip_priority < other.tip_priority
+    {
+        return "priority_tie";
+    }
+    if expected.effective_commit_depth == other.effective_commit_depth
+        && expected.witness_quorum_met == other.witness_quorum_met
+        && expected.valid_commit_depth == other.valid_commit_depth
+        && expected.app_witness_score == other.app_witness_score
+        && expected.tip_priority == other.tip_priority
+        && expected.tip_committer < other.tip_committer
+    {
+        return "committer_tie";
+    }
+    if expected.effective_commit_depth == other.effective_commit_depth
+        && expected.witness_quorum_met == other.witness_quorum_met
+        && expected.valid_commit_depth == other.valid_commit_depth
+        && expected.app_witness_score == other.app_witness_score
+        && expected.tip_priority == other.tip_priority
+        && expected.tip_committer == other.tip_committer
         && expected.tip_digest < other.tip_digest
     {
         return "digest_tie";
@@ -129,5 +160,13 @@ fn digest_from_rank(rank: &str) -> [u8; 32] {
         "00" | "g00" => [0x00; 32],
         "ff" | "gff" => [0xff; 32],
         other => panic!("unsupported digest rank {other:?}"),
+    }
+}
+
+fn priority_from_rank(rank: Option<&str>) -> CommitOrderingPriority {
+    match rank.unwrap_or("ordinary") {
+        "privileged" | "admin" => CommitOrderingPriority::Privileged,
+        "ordinary" | "member" => CommitOrderingPriority::Ordinary,
+        other => panic!("unsupported priority rank {other:?}"),
     }
 }

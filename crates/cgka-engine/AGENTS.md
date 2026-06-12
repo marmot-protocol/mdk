@@ -277,9 +277,10 @@ OpenMLS 0.8.1 surface used: `MlsGroup::pending_commit() -> Option<&StagedCommit>
 ### Done — ForkRecoveryManager (2026-05-04)
 
 `crates/cgka-engine/src/fork_recovery.rs` owns deterministic same-epoch commit recovery. The ordering key is
-content-derived: `SHA-256(mls_bytes)` scoped by source epoch, with lexicographically lower digest winning. Local and
-inbound commits create pre-commit snapshots; a better late candidate rolls storage back and replays, while a losing
-candidate is marked stale. Successful rollback emits `GroupEvent::ForkRecovered` so harness vectors can compare recovery
+authenticated: source epoch, commit priority (`privileged` before `ordinary`), authenticated committer identity, then
+`SHA-256(mls_bytes)` as the same-committer fallback. Local and inbound commits create pre-commit snapshots; a better
+late candidate rolls storage back and replays, while a losing candidate is marked stale. Successful rollback emits
+`GroupEvent::ForkRecovered` so harness vectors can compare recovery
 trace, not just final state. `EngineError::ForkedEpoch` is now the fallback for missing snapshots or unrecoverable
 shapes. Tests: `tests/fork_detection.rs` plus the harness `deliberate_fork_via_harness`.
 

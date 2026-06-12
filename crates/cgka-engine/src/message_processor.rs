@@ -15,9 +15,11 @@ use crate::openmls_projection::{
     OpenMlsContentKind, project_mls_message, retained_anchor_epoch_from_snapshot_name,
 };
 use crate::provider::EngineOpenMlsProvider;
+use crate::snapshot_guard::SnapshotRollbackGuard;
 use cgka_traits::app_components::AppComponentData;
 use cgka_traits::engine::{
-    AutoPublish, CommitOrderingKey, GroupEvent, GroupStateChange, SendIntent, SendResult,
+    AutoPublish, CommitOrderingKey, CommitOrderingPriority, GroupEvent, GroupStateChange,
+    SendIntent, SendResult,
 };
 use cgka_traits::engine_state::EpochState;
 use cgka_traits::error::{EngineError, PeelerError};
@@ -422,9 +424,46 @@ impl<S: StorageProvider> Engine<S> {
                         && self.epoch_manager.we_committed_from(&group_id, msg_epoch)
                         && current > msg_epoch
                     {
+                        let Some(snapshot_name) =
+                            self.recovery_snapshot_name_for_fork(&group_id, msg_epoch)
+                        else {
+                            match self.resolve_fork_candidate(
+                                &group_id,
+                                msg_epoch,
+                                CommitOrderingPriority::Ordinary,
+                                MemberId::new(Vec::new()),
+                                mls_bytes.as_slice(),
+                            )? {
+                                ForkResolution::MissingSnapshot => {
+                                    self.epoch_manager.detect_fork(&group_id, vec![]);
+                                    self.update_stored_message_state(
+                                        &msg.id,
+                                        MessageState::EpochInvalidated,
+                                    )?;
+                                    return Err(EngineError::ForkedEpoch {
+                                        group_id: group_id.clone(),
+                                        last_stable: msg_epoch,
+                                        conflicting_epoch: current,
+                                    });
+                                }
+                                ForkResolution::IncumbentWins
+                                | ForkResolution::CandidateWins { .. } => {
+                                    unreachable!("missing snapshot cannot resolve a fork candidate")
+                                }
+                            }
+                        };
+                        let (candidate_priority, candidate_committer) = self
+                            .probe_commit_ordering_metadata_for_recovery(
+                                &group_id,
+                                msg_epoch,
+                                &snapshot_name,
+                                mls_bytes.as_slice(),
+                            )?;
                         match self.resolve_fork_candidate(
                             &group_id,
                             msg_epoch,
+                            candidate_priority,
+                            candidate_committer,
                             mls_bytes.as_slice(),
                         )? {
                             ForkResolution::CandidateWins {
@@ -533,6 +572,14 @@ impl<S: StorageProvider> Engine<S> {
                         self.update_stored_message_state(&msg.id, MessageState::Failed)?;
                         return Err(err);
                     }
+                    let Some(commit_committer) = sender_id.clone() else {
+                        self.update_stored_message_state(&msg.id, MessageState::Failed)?;
+                        return Err(EngineError::Backend(
+                            "commit has no authenticated member sender".into(),
+                        ));
+                    };
+                    let commit_priority =
+                        crate::app_components::commit_ordering_priority_for_staged(&staged);
                     // foundation/identity.md: reject an inbound commit that
                     // would add a member whose credential identity is not a
                     // valid x-only secp256k1 public key, before it mutates
@@ -616,7 +663,12 @@ impl<S: StorageProvider> Engine<S> {
                         group_id.clone(),
                         before,
                         msg.id.clone(),
-                        mls_bytes.as_slice(),
+                        CommitOrderingKey::from_commit_bytes(
+                            before,
+                            commit_priority,
+                            commit_committer,
+                            mls_bytes.as_slice(),
+                        ),
                         recovery_snapshot,
                     );
                     if let Ok(mut g) = self.storage.get_group(&group_id) {
@@ -801,12 +853,25 @@ impl<S: StorageProvider> Engine<S> {
                             crate::epoch_manager::PendingKind::GroupEvolution,
                             self.current_audit_context.clone(),
                         )?;
+                        let commit_priority = mls_group
+                            .pending_commit()
+                            .map(crate::app_components::commit_ordering_priority_for_staged)
+                            .ok_or_else(|| {
+                                EngineError::Backend(
+                                    "auto-commit produced no pending commit".into(),
+                                )
+                            })?;
                         self.track_pending_commit_for_recovery(
                             pending_ref,
                             group_id.clone(),
                             pre_commit_epoch,
                             wrapped.id.clone(),
-                            &commit_bytes,
+                            CommitOrderingKey::from_commit_bytes(
+                                pre_commit_epoch,
+                                commit_priority,
+                                self.identity.self_id().clone(),
+                                &commit_bytes,
+                            ),
                             recovery_snapshot,
                         );
                         let auto_changes = auto_removed
@@ -854,6 +919,73 @@ impl<S: StorageProvider> Engine<S> {
                 }
             };
         }
+    }
+
+    fn probe_commit_ordering_metadata_for_recovery(
+        &self,
+        group_id: &GroupId,
+        source_epoch: EpochId,
+        recovery_snapshot_name: &str,
+        mls_bytes: &[u8],
+    ) -> Result<(CommitOrderingPriority, MemberId), EngineError> {
+        let mut hasher = Sha256::new();
+        hasher.update(b"cgka-engine-fork-probe/v1");
+        hasher.update(group_id.as_slice());
+        hasher.update(source_epoch.0.to_be_bytes());
+        hasher.update(mls_bytes);
+        let digest = hasher.finalize();
+        let probe_snapshot = format!(
+            "fork-probe-{}-{}",
+            source_epoch.0,
+            hex::encode(&digest[..8])
+        );
+        let guard = SnapshotRollbackGuard::create(&self.storage, group_id.clone(), probe_snapshot)?;
+        self.storage
+            .rollback_group_to_snapshot(group_id, recovery_snapshot_name)?;
+
+        let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
+        let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
+        let mut probe_group = MlsGroup::load(
+            <EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(&provider),
+            &mls_gid,
+        )
+        .map_err(|e| EngineError::Backend(format!("load fork probe: {e:?}")))?
+        .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
+
+        let msg_in = MlsMessageIn::tls_deserialize_exact(mls_bytes)
+            .map_err(|e| EngineError::Serialize(format!("fork probe deserialize: {e:?}")))?;
+        let proto: ProtocolMessage = match msg_in.extract() {
+            MlsMessageBodyIn::PrivateMessage(p) => p.into(),
+            MlsMessageBodyIn::PublicMessage(p) => p.into(),
+            _ => {
+                return Err(EngineError::Serialize(
+                    "fork probe expected MLS protocol message".into(),
+                ));
+            }
+        };
+        let processed = process_commit_with_app_data_updates(&mut probe_group, &provider, proto)
+            .map_err(|e| EngineError::Backend(format!("fork probe process_message: {e:?}")))?;
+        let sender = member_id_of_sender(processed.sender(), &probe_group).ok_or_else(|| {
+            EngineError::Backend("fork candidate commit has no authenticated member sender".into())
+        })?;
+        let priority = match processed.into_content() {
+            ProcessedMessageContent::StagedCommitMessage(staged) => {
+                crate::app_components::require_admin_for_staged_commit(
+                    &probe_group,
+                    group_id,
+                    Some(&sender),
+                    staged.as_ref(),
+                )?;
+                crate::app_components::commit_ordering_priority_for_staged(staged.as_ref())
+            }
+            _ => {
+                return Err(EngineError::Backend(
+                    "fork probe expected staged commit".into(),
+                ));
+            }
+        };
+        guard.commit()?;
+        Ok((priority, sender))
     }
 
     pub(crate) async fn do_send(&mut self, intent: SendIntent) -> Result<SendResult, EngineError> {
@@ -1291,12 +1423,21 @@ impl<S: StorageProvider> Engine<S> {
             crate::epoch_manager::PendingKind::GroupEvolution,
             self.current_audit_context.clone(),
         )?;
+        let commit_priority = mls_group
+            .pending_commit()
+            .map(crate::app_components::commit_ordering_priority_for_staged)
+            .ok_or_else(|| EngineError::Backend("invite produced no pending commit".into()))?;
         self.track_pending_commit_for_recovery(
             pending_ref,
             group_id.clone(),
             prior_epoch,
             commit_msg.id.clone(),
-            &commit_bytes,
+            CommitOrderingKey::from_commit_bytes(
+                prior_epoch,
+                commit_priority,
+                self.identity.self_id().clone(),
+                &commit_bytes,
+            ),
             recovery_snapshot,
         );
         // Buffer the additions so confirm_published emits an attributed
@@ -1464,12 +1605,21 @@ impl<S: StorageProvider> Engine<S> {
             crate::epoch_manager::PendingKind::GroupEvolution,
             self.current_audit_context.clone(),
         )?;
+        let commit_priority = mls_group
+            .pending_commit()
+            .map(crate::app_components::commit_ordering_priority_for_staged)
+            .ok_or_else(|| EngineError::Backend("remove produced no pending commit".into()))?;
         self.track_pending_commit_for_recovery(
             pending_ref,
             group_id.clone(),
             prior_epoch,
             commit_msg.id.clone(),
-            &commit_bytes,
+            CommitOrderingKey::from_commit_bytes(
+                prior_epoch,
+                commit_priority,
+                self.identity.self_id().clone(),
+                &commit_bytes,
+            ),
             recovery_snapshot,
         );
         let removed_changes = unique_targets

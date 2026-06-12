@@ -53,13 +53,13 @@ use cgka_engine::account_identity_proof::{
     AccountIdentityProofRequest, AccountIdentityProofSigner,
 };
 use cgka_engine::feature_registry::FeatureRegistry;
-use cgka_traits::CgkaEngine;
 use cgka_traits::capabilities::{
     Capability, CapabilityRequirement, Feature, FeatureStatus, RequirementLevel, TransportKind,
 };
 use cgka_traits::engine::{SendIntent, SendResult};
 use cgka_traits::ingest::{IngestOutcome, StaleReason};
 use cgka_traits::storage::{GroupStorage, MessageStorage};
+use cgka_traits::{CgkaEngine, CommitOrderingPriority};
 use proptest::prelude::*;
 
 const REACTIONS_PROPOSAL: u16 = 0xF210;
@@ -309,6 +309,8 @@ fn selector_case() -> impl Strategy<Value = SelectorCase> {
                         id: format!("branch-{index}"),
                         fork_epoch,
                         tip_epoch: fork_epoch.saturating_add(shape.tip_delta),
+                        tip_priority: CommitOrderingPriority::Ordinary,
+                        tip_committer: vec![index as u8],
                         // The selector's final modeled tie-breaker is the
                         // branch digest; keep generated digests unique so the
                         // property targets candidate ordering, not hash
@@ -456,6 +458,8 @@ fn canonical_branch(
         id: id.into(),
         fork_epoch,
         tip_epoch,
+        tip_priority: CommitOrderingPriority::Ordinary,
+        tip_committer: id.as_bytes().to_vec(),
         tip_digest: digest_from_u64(digest_rank),
         app_witnesses: vec![],
     }
@@ -846,6 +850,7 @@ fn commit_message(
             parent_branch_id: None,
             fork_epoch,
             resulting_epoch,
+            tip_priority: CommitOrderingPriority::Ordinary,
             tip_digest: digest_from_u64(digest_rank),
             consumed_proposal_ids: vec![],
         },

@@ -56,6 +56,18 @@ fn pad32(name: &[u8]) -> Vec<u8> {
 
 struct MockPeeler;
 
+fn commit_tiebreak_winner_index(first: &MemberId, second: &MemberId) -> usize {
+    if first.as_slice() < second.as_slice() {
+        0
+    } else {
+        1
+    }
+}
+
+fn committer_wins(challenger: &MemberId, incumbent: &MemberId) -> bool {
+    challenger.as_slice() < incumbent.as_slice()
+}
+
 fn hash_id(bytes: &[u8]) -> MessageId {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
@@ -219,13 +231,10 @@ async fn engine_converges_stored_openmls_messages_to_selected_branch() {
         route(bob_commit.clone(), &group_id),
     ];
 
-    let first_digest = project_mls_message(&commit_messages[0].payload)
-        .expect("first commit projects")
-        .message_digest;
-    let second_digest = project_mls_message(&commit_messages[1].payload)
-        .expect("second commit projects")
-        .message_digest;
-    let app_branch_index = if first_digest > second_digest { 0 } else { 1 };
+    // Give the app witness to the branch that would otherwise lose the
+    // same-epoch authenticated committer tie-break, proving witnesses still
+    // override the final tie-breaker.
+    let app_branch_index = 1 - commit_tiebreak_winner_index(&alice.self_id(), &bob.self_id());
     let quiet_branch_index = 1 - app_branch_index;
 
     let app_msg = if app_branch_index == 0 {
@@ -660,13 +669,7 @@ async fn engine_replays_late_same_epoch_commit_from_retained_anchor() {
         .buffer_openmls_convergence_message(&group_id, bob_commit.clone(), 2_000)
         .expect("late bob commit buffered");
 
-    let alice_digest = project_mls_message(&alice_commit.payload)
-        .expect("alice commit projects")
-        .message_digest;
-    let bob_digest = project_mls_message(&bob_commit.payload)
-        .expect("bob commit projects")
-        .message_digest;
-    let bob_wins = bob_digest < alice_digest;
+    let bob_wins = committer_wins(&bob.self_id(), &alice.self_id());
 
     let result = carol
         .converge_stored_openmls_messages(&group_id, 3_000_000)
@@ -790,13 +793,7 @@ async fn engine_metrics_count_post_settle_reorg_from_late_same_epoch_commit() {
     let (bob_commit, _bob_pending) = evolution(bob_invite);
     let bob_commit = route(bob_commit, &group_id);
 
-    let alice_digest = project_mls_message(&alice_commit.payload)
-        .expect("alice commit projects")
-        .message_digest;
-    let bob_digest = project_mls_message(&bob_commit.payload)
-        .expect("bob commit projects")
-        .message_digest;
-    let bob_wins = bob_digest < alice_digest;
+    let bob_wins = committer_wins(&bob.self_id(), &alice.self_id());
 
     carol
         .buffer_openmls_convergence_message(&group_id, bob_commit.clone(), 3_100)
@@ -921,13 +918,7 @@ async fn rebuilt_engine_replays_late_same_epoch_commit_from_retained_anchor() {
         .unwrap();
     let (bob_commit, _bob_pending) = evolution(bob_invite);
     let bob_commit = route(bob_commit, &group_id);
-    let alice_digest = project_mls_message(&alice_commit.payload)
-        .expect("alice commit projects")
-        .message_digest;
-    let bob_digest = project_mls_message(&bob_commit.payload)
-        .expect("bob commit projects")
-        .message_digest;
-    let bob_wins = bob_digest < alice_digest;
+    let bob_wins = committer_wins(&bob.self_id(), &alice.self_id());
 
     let mut carol = build_client_with_storage(b"carol", carol_storage.clone());
     carol
@@ -1564,13 +1555,7 @@ async fn engine_emits_only_canonical_branch_app_messages_after_convergence() {
     let bob_app = send_app(&mut bob, &group_id, b"bob branch payload".to_vec()).await;
     let app_messages = [alice_app, bob_app];
 
-    let first_digest = project_mls_message(&commit_messages[0].payload)
-        .expect("first commit projects")
-        .message_digest;
-    let second_digest = project_mls_message(&commit_messages[1].payload)
-        .expect("second commit projects")
-        .message_digest;
-    let selected_index = if first_digest < second_digest { 0 } else { 1 };
+    let selected_index = commit_tiebreak_winner_index(&alice.self_id(), &bob.self_id());
     let losing_index = 1 - selected_index;
 
     for message in commit_messages.iter().chain(app_messages.iter()) {
@@ -1777,13 +1762,7 @@ async fn rebuilt_engine_emits_losing_branch_app_invalidation_after_convergence()
         send_app(&mut bob, &group_id, b"restart bob branch".to_vec()).await,
     ];
 
-    let first_digest = project_mls_message(&commit_messages[0].payload)
-        .expect("first commit projects")
-        .message_digest;
-    let second_digest = project_mls_message(&commit_messages[1].payload)
-        .expect("second commit projects")
-        .message_digest;
-    let selected_index = if first_digest < second_digest { 0 } else { 1 };
+    let selected_index = commit_tiebreak_winner_index(&alice.self_id(), &bob.self_id());
     let losing_index = 1 - selected_index;
 
     for message in commit_messages.iter().chain(app_messages.iter()) {

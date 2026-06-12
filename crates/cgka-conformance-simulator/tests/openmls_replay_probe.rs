@@ -275,21 +275,27 @@ async fn openmls_materializes_competing_commit_paths_from_same_anchor() {
             .map(|candidate| candidate.canonical_materialized_candidate())
             .collect(),
     );
-    let lower_digest_candidate = candidates
+    let selected_candidate = candidates
         .iter()
-        .min_by_key(|candidate| candidate.tip_digest)
+        .min_by_key(|candidate| {
+            (
+                candidate.tip_priority,
+                candidate.tip_committer.clone(),
+                candidate.tip_digest,
+            )
+        })
         .expect("candidate set is not empty");
     assert_eq!(
         canonicalized.selected_branch_id.as_deref(),
-        Some(lower_digest_candidate.branch_id.as_str())
+        Some(selected_candidate.branch_id.as_str())
     );
     assert_eq!(
         canonicalized.accepted_commits,
-        lower_digest_candidate.commit_message_ids
+        selected_candidate.commit_message_ids
     );
     let losing_commit_id = candidates
         .iter()
-        .find(|candidate| candidate.branch_id != lower_digest_candidate.branch_id)
+        .find(|candidate| candidate.branch_id != selected_candidate.branch_id)
         .and_then(|candidate| candidate.commit_message_ids.first())
         .expect("losing commit exists");
     assert!(canonicalized.dropped_messages.iter().any(|dropped| {

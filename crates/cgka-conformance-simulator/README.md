@@ -130,9 +130,10 @@ those raw records and emits only the payloads that decrypt on the selected branc
 
 ### Semantic fork-recovery vector
 
-`CommitOrderingKey` is now content-derived (`SHA-256(mls_bytes)` of the serialized MLS commit). This makes the engine
-fully transport-agnostic for fork-recovery decisions. Portable scenario fixtures do not assert exact winner digest
-bytes, because those bytes come from randomized MLS envelopes.
+`CommitOrderingKey` is derived from authenticated commit metadata first (source epoch, priority, committer) and uses
+`SHA-256(mls_bytes)` only as the same-committer fallback. This keeps fork-recovery decisions transport-agnostic without
+letting commit-byte grinding decide cross-member races. Portable scenario fixtures do not assert exact digest bytes,
+because those bytes come from randomized MLS envelopes.
 
 The first fork-recovery fixture is
 [`vectors/group-data-fork-recovery.v1.json`](vectors/group-data-fork-recovery.v1.json). It models a same-epoch

@@ -210,14 +210,19 @@ Commit rules:
   `MissingRetainedAnchor` without mutating group state or message state.
 - Candidate states outside the retention horizon MUST be dropped.
 
-Same-epoch commit recovery uses a content-derived ordering key:
+Same-epoch commit recovery uses an authenticated ordering key:
 
 ```text
 CommitOrderingKey {
   source_epoch,
+  priority,       // privileged < ordinary
+  committer,      // authenticated Marmot account id
   commit_digest = SHA-256(mls_bytes)
 }
 ```
+
+`commit_digest` is only the final same-committer fallback; cross-member races are decided by authenticated metadata, not
+by grindable commit bytes.
 
 Lower ordering keys win. Transport metadata MUST NOT affect this recovery rule.
 

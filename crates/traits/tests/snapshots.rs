@@ -13,8 +13,8 @@ use cgka_traits::capabilities::{
     TransportKind,
 };
 use cgka_traits::engine::{
-    AppMessageInvalidationReason, CommitOrderingKey, CreateGroupRequest, GroupEvent, KeyPackage,
-    SendIntent, SendResult,
+    AppMessageInvalidationReason, CommitOrderingKey, CommitOrderingPriority, CreateGroupRequest,
+    GroupEvent, KeyPackage, SendIntent, SendResult,
 };
 use cgka_traits::engine_state::PendingStateRef;
 use cgka_traits::group::{Group, Member};
@@ -37,6 +37,42 @@ fn mid() -> MessageId {
 }
 fn mem_id() -> MemberId {
     MemberId::new(b"alice".to_vec())
+}
+
+#[test]
+fn commit_ordering_key_prefers_privileged_commits_before_digest() {
+    let ordinary_low_digest = CommitOrderingKey {
+        source_epoch: EpochId(1),
+        priority: CommitOrderingPriority::Ordinary,
+        committer: MemberId::new(b"alice".to_vec()),
+        commit_digest: [0x00; 32],
+    };
+    let privileged_high_digest = CommitOrderingKey {
+        source_epoch: EpochId(1),
+        priority: CommitOrderingPriority::Privileged,
+        committer: MemberId::new(b"zara".to_vec()),
+        commit_digest: [0xff; 32],
+    };
+
+    assert!(privileged_high_digest < ordinary_low_digest);
+}
+
+#[test]
+fn commit_ordering_key_prefers_committer_before_same_committer_digest() {
+    let higher_committer_low_digest = CommitOrderingKey {
+        source_epoch: EpochId(1),
+        priority: CommitOrderingPriority::Ordinary,
+        committer: MemberId::new(b"zara".to_vec()),
+        commit_digest: [0x00; 32],
+    };
+    let lower_committer_high_digest = CommitOrderingKey {
+        source_epoch: EpochId(1),
+        priority: CommitOrderingPriority::Ordinary,
+        committer: MemberId::new(b"alice".to_vec()),
+        commit_digest: [0xff; 32],
+    };
+
+    assert!(lower_committer_high_digest < higher_committer_low_digest);
 }
 
 #[test]
@@ -456,10 +492,14 @@ fn snapshot_group_events() {
             recovered_epoch: EpochId(2),
             winner: CommitOrderingKey {
                 source_epoch: EpochId(1),
+                priority: CommitOrderingPriority::Privileged,
+                committer: MemberId::new(b"alice".to_vec()),
                 commit_digest: [0xAA; 32],
             },
             invalidated: CommitOrderingKey {
                 source_epoch: EpochId(1),
+                priority: CommitOrderingPriority::Ordinary,
+                committer: MemberId::new(b"bob".to_vec()),
                 commit_digest: [0xBB; 32],
             },
         }

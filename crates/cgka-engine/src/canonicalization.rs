@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::convergence::{
     AppWitness, BranchCandidate, ConvergencePolicy, is_branch_eligible, select_canonical_branch,
 };
+use cgka_traits::engine::CommitOrderingPriority;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -85,6 +86,7 @@ pub enum PeeledMessageKind {
         parent_branch_id: Option<String>,
         fork_epoch: u64,
         resulting_epoch: u64,
+        tip_priority: CommitOrderingPriority,
         tip_digest: [u8; 32],
         consumed_proposal_ids: Vec<String>,
     },
@@ -311,6 +313,7 @@ fn canonicalize_internal(
                 parent_branch_id: _,
                 fork_epoch,
                 resulting_epoch: _,
+                tip_priority: _,
                 tip_digest: _,
                 consumed_proposal_ids: _,
             } => handle_commit(
@@ -456,6 +459,7 @@ fn materialize_candidate_graph(
                 parent_branch_id,
                 fork_epoch,
                 resulting_epoch,
+                tip_priority,
                 tip_digest,
                 consumed_proposal_ids,
             } = &message.kind
@@ -504,6 +508,8 @@ fn materialize_candidate_graph(
                     id: branch_id.clone(),
                     fork_epoch: resolved_parent.fork_epoch,
                     tip_epoch: *resulting_epoch,
+                    tip_priority: *tip_priority,
+                    tip_committer: message.sender.clone(),
                     tip_digest: *tip_digest,
                     app_witnesses: vec![],
                 },

@@ -2,26 +2,27 @@
 //!
 //! The engine snapshots the local group before it applies any commit that
 //! advances epoch `N -> N + 1`. If a second commit later arrives for epoch
-//! `N`, this manager compares content-derived ordering keys
-//! (`SHA-256(mls_bytes)`). A better candidate rolls storage back to the
-//! pre-commit snapshot so the caller can process the candidate against the
-//! correct MLS epoch.
+//! `N`, this manager compares ordering keys built from authenticated commit
+//! metadata plus a same-committer digest fallback. A better candidate rolls
+//! storage back to the pre-commit snapshot so the caller can process the
+//! candidate against the correct MLS epoch.
 //!
 //! ## Storage row identity
 //!
-//! Tie-break is content-derived; the storage row identity for marking an
-//! invalidated commit is the transport-layer `MessageId`. The two are kept
-//! separate inside `CommitRecoveryRecord` so the ordering key remains
-//! transport-independent while the engine can still reach back to the
-//! storage record that needs `MessageState::EpochInvalidated`.
+//! The ordering key is derived from MLS-authenticated commit metadata plus the
+//! serialized MLS bytes; the storage row identity for marking an invalidated
+//! commit is the transport-layer `MessageId`. The two are kept separate inside
+//! `CommitRecoveryRecord` so the ordering key remains transport-independent
+//! while the engine can still reach back to the storage record that needs
+//! `MessageState::EpochInvalidated`.
 
 use crate::engine::Engine;
-use cgka_traits::engine::CommitOrderingKey;
+use cgka_traits::engine::{CommitOrderingKey, CommitOrderingPriority};
 use cgka_traits::engine_state::PendingStateRef;
 use cgka_traits::error::EngineError;
 use cgka_traits::message::MessageState;
 use cgka_traits::storage::{StorageError, StorageProvider};
-use cgka_traits::types::{EpochId, GroupId, MessageId};
+use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
 use marmot_forensics::{AuditEventKind, ForkWinner};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -96,7 +97,7 @@ impl ForkRecoveryManager {
         group_id: GroupId,
         source_epoch: EpochId,
         storage_id: MessageId,
-        mls_bytes: &[u8],
+        ordering_key: CommitOrderingKey,
         snapshot_name: String,
     ) {
         self.pending.insert(
@@ -104,7 +105,7 @@ impl ForkRecoveryManager {
             CommitRecoveryRecord {
                 group_id,
                 source_epoch,
-                ordering_key: CommitOrderingKey::from_commit_bytes(source_epoch, mls_bytes),
+                ordering_key,
                 storage_id,
                 snapshot_name,
             },
@@ -136,6 +137,8 @@ impl ForkRecoveryManager {
         storage: &S,
         group_id: &GroupId,
         source_epoch: EpochId,
+        candidate_priority: CommitOrderingPriority,
+        candidate_committer: MemberId,
         candidate_mls_bytes: &[u8],
     ) -> Result<ForkResolution, EngineError> {
         let key = (group_id.clone(), source_epoch);
@@ -143,7 +146,12 @@ impl ForkRecoveryManager {
             return Ok(ForkResolution::MissingSnapshot);
         };
 
-        let candidate_key = CommitOrderingKey::from_commit_bytes(source_epoch, candidate_mls_bytes);
+        let candidate_key = CommitOrderingKey::from_commit_bytes(
+            source_epoch,
+            candidate_priority,
+            candidate_committer,
+            candidate_mls_bytes,
+        );
         if candidate_key >= incumbent.ordering_key {
             return Ok(ForkResolution::IncumbentWins);
         }
@@ -162,6 +170,12 @@ impl ForkRecoveryManager {
         })
     }
 
+    fn recovery_snapshot_name(&self, group_id: &GroupId, source_epoch: EpochId) -> Option<String> {
+        self.incumbents
+            .get(&(group_id.clone(), source_epoch))
+            .map(|record| record.snapshot_name.clone())
+    }
+
     fn retained_snapshots(&self, group_id: &GroupId) -> Vec<(EpochId, String)> {
         self.incumbents
             .values()
@@ -178,7 +192,7 @@ impl<S: StorageProvider> Engine<S> {
         group_id: GroupId,
         source_epoch: EpochId,
         storage_id: MessageId,
-        mls_bytes: &[u8],
+        ordering_key: CommitOrderingKey,
         snapshot_name: String,
     ) {
         self.fork_recovery.record_pending(
@@ -186,7 +200,7 @@ impl<S: StorageProvider> Engine<S> {
             group_id,
             source_epoch,
             storage_id,
-            mls_bytes,
+            ordering_key,
             snapshot_name,
         );
     }
@@ -219,22 +233,33 @@ impl<S: StorageProvider> Engine<S> {
         group_id: GroupId,
         source_epoch: EpochId,
         storage_id: MessageId,
-        mls_bytes: &[u8],
+        ordering_key: CommitOrderingKey,
         snapshot_name: String,
     ) {
         self.fork_recovery.record_applied(CommitRecoveryRecord {
             group_id,
             source_epoch,
-            ordering_key: CommitOrderingKey::from_commit_bytes(source_epoch, mls_bytes),
+            ordering_key,
             storage_id,
             snapshot_name,
         });
+    }
+
+    pub(crate) fn recovery_snapshot_name_for_fork(
+        &self,
+        group_id: &GroupId,
+        source_epoch: EpochId,
+    ) -> Option<String> {
+        self.fork_recovery
+            .recovery_snapshot_name(group_id, source_epoch)
     }
 
     pub(crate) fn resolve_fork_candidate(
         &mut self,
         group_id: &GroupId,
         source_epoch: EpochId,
+        candidate_priority: CommitOrderingPriority,
+        candidate_committer: MemberId,
         candidate_mls_bytes: &[u8],
     ) -> Result<ForkResolution, EngineError> {
         let candidate_digest_hex = hex::encode(Sha256::digest(candidate_mls_bytes));
@@ -242,6 +267,8 @@ impl<S: StorageProvider> Engine<S> {
             &self.storage,
             group_id,
             source_epoch,
+            candidate_priority,
+            candidate_committer,
             candidate_mls_bytes,
         )?;
         let (winner, incumbent_digest_hex, invalidated_msg_id) = match &resolution {

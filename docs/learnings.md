@@ -69,10 +69,11 @@ responsibility map.
 
 ## 2026-05-04 — Fork recovery landed
 
-The first working `ForkRecoveryManager` is in `crates/cgka-engine/src/fork_recovery.rs`. Same-epoch competing commits
-now use a deterministic content-derived ordering key: `SHA-256(mls_bytes)`, scoped by source epoch, with the lower
-digest winning. If a late inbound commit beats the local incumbent, the engine rolls storage back to the pre-commit
-snapshot and replays the winning commit. If it loses, the message becomes stale with `AlreadyAtEpoch`.
+The `ForkRecoveryManager` is in `crates/cgka-engine/src/fork_recovery.rs`. Same-epoch competing commits now use
+a deterministic authenticated ordering key scoped by source epoch: privileged admin-required commits first, then
+authenticated committer identity, then `SHA-256(mls_bytes)` only as a same-committer fallback. If a late inbound commit
+beats the local incumbent, the engine rolls storage back to the pre-commit snapshot and replays the winning commit. If
+it loses, the message becomes stale with `AlreadyAtEpoch`.
 
 Storage snapshots are now part of engine correctness, not a dormant hook. The earlier in-memory backend snapshotted the
 full OpenMLS memory map as a pragmatic harness backend; `storage-sqlite` now snapshots group-scoped OpenMLS rows plus

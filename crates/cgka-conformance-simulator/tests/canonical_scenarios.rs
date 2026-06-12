@@ -870,15 +870,7 @@ async fn scenario_report_records_trace_log_recoveries_and_failures() {
     assert_eq!(recovery.source_epoch, 1);
     assert_eq!(recovery.recovered_epoch, 2);
     assert_ne!(recovery.winner, recovery.invalidated);
-    assert!(
-        (
-            recovery.winner.source_epoch,
-            recovery.winner.commit_digest.as_str(),
-        ) < (
-            recovery.invalidated.source_epoch,
-            recovery.invalidated.commit_digest.as_str(),
-        )
-    );
+    assert!(recovery.winner < recovery.invalidated);
     assert!(report.invariant_failures.is_empty());
 
     let json = serde_json::to_value(&report).expect("report serializes");
@@ -1324,15 +1316,7 @@ async fn deliberate_fork_via_harness() {
     assert_eq!(recoveries[0].source_epoch, 1);
     assert_eq!(recoveries[0].recovered_epoch, 2);
     assert_ne!(recoveries[0].winner, recoveries[0].invalidated);
-    assert!(
-        (
-            recoveries[0].winner.source_epoch,
-            recoveries[0].winner.commit_digest.as_str()
-        ) < (
-            recoveries[0].invalidated.source_epoch,
-            recoveries[0].invalidated.commit_digest.as_str()
-        )
-    );
+    assert!(recoveries[0].winner < recoveries[0].invalidated);
     let has_david = alice_members.iter().any(|m| m.id == david.member_id());
     let has_eve = alice_members.iter().any(|m| m.id == eve.member_id());
     assert_ne!(has_david, has_eve);
@@ -1405,13 +1389,9 @@ async fn convergence_e2e_from_peeler_ingest_to_group_events() {
         2,
         "expected exactly the two competing invite commits in the bus queue"
     );
-    let alice_commit_digest = project_mls_message(&commit_messages[0].payload)
-        .expect("alice commit projects")
-        .message_digest;
-    let bob_commit_digest = project_mls_message(&commit_messages[1].payload)
-        .expect("bob commit projects")
-        .message_digest;
-    let selected_index = if alice_commit_digest < bob_commit_digest {
+    // Both competing commits are privileged admin invites, so the authenticated
+    // committer identity selects the branch before the digest fallback.
+    let selected_index = if alice.member_id().as_slice() < bob.member_id().as_slice() {
         0
     } else {
         1

@@ -280,12 +280,23 @@ impl<S: StorageProvider> Engine<S> {
             crate::epoch_manager::PendingKind::GroupEvolution,
             self.current_audit_context.clone(),
         )?;
+        let commit_priority = mls_group
+            .pending_commit()
+            .map(crate::app_components::commit_ordering_priority_for_staged)
+            .ok_or_else(|| {
+                EngineError::Backend("group-data update produced no pending commit".into())
+            })?;
         self.track_pending_commit_for_recovery(
             pending_ref,
             group_id.clone(),
             pre_commit_epoch,
             wrapped.id.clone(),
-            &commit_bytes,
+            cgka_traits::engine::CommitOrderingKey::from_commit_bytes(
+                pre_commit_epoch,
+                commit_priority,
+                self.identity.self_id().clone(),
+                &commit_bytes,
+            ),
             recovery_snapshot,
         );
         if !staged_changes.is_empty() {

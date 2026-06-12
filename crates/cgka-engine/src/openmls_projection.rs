@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::provider::EngineOpenMlsProvider;
 use cgka_traits::app_components::AppComponentData;
+use cgka_traits::engine::CommitOrderingPriority;
 use cgka_traits::group::Member;
 use cgka_traits::message::{MessageRecord, MessageState, StoredMessagePayload};
 use cgka_traits::storage::{StorageError, StorageProvider};
@@ -62,6 +63,8 @@ pub struct OpenMlsMaterializedCandidate {
     pub branch_id: String,
     pub fork_epoch: u64,
     pub tip_epoch: u64,
+    pub tip_priority: CommitOrderingPriority,
+    pub tip_committer: Vec<u8>,
     pub tip_digest: [u8; 32],
     pub commit_message_ids: Vec<String>,
     pub consumed_proposal_refs: Vec<String>,
@@ -74,6 +77,8 @@ impl OpenMlsMaterializedCandidate {
             id: self.branch_id.clone(),
             fork_epoch: self.fork_epoch,
             tip_epoch: self.tip_epoch,
+            tip_priority: self.tip_priority,
+            tip_committer: self.tip_committer.clone(),
             tip_digest: self.tip_digest,
             app_witnesses: vec![],
         }
@@ -163,6 +168,8 @@ pub enum OpenMlsReplayObservation {
         message_id: String,
         source_epoch: u64,
         resulting_epoch: u64,
+        priority: CommitOrderingPriority,
+        committer: Vec<u8>,
         consumed_proposal_refs: Vec<String>,
     },
     ApplicationProcessed {
@@ -290,12 +297,16 @@ pub fn materialize_openmls_candidate_paths<S: StorageProvider>(
         let mut tip_digest: Option<[u8; 32]> = None;
         let mut commit_message_ids = Vec::new();
         let mut consumed_proposal_refs = Vec::new();
+        let mut tip_priority = None;
+        let mut tip_committer = None;
 
         for observation in &observations {
             let OpenMlsReplayObservation::CommitStaged {
                 message_id,
                 source_epoch,
                 resulting_epoch,
+                priority,
+                committer,
                 consumed_proposal_refs: commit_consumed_proposal_refs,
             } = observation
             else {
@@ -303,6 +314,8 @@ pub fn materialize_openmls_candidate_paths<S: StorageProvider>(
             };
             fork_epoch = Some(fork_epoch.map_or(*source_epoch, |epoch| epoch.min(*source_epoch)));
             tip_epoch = Some(*resulting_epoch);
+            tip_priority = Some(*priority);
+            tip_committer = Some(committer.clone());
             commit_message_ids.push(message_id.clone());
             consumed_proposal_refs.extend(commit_consumed_proposal_refs.iter().cloned());
             tip_digest = path
@@ -318,6 +331,8 @@ pub fn materialize_openmls_candidate_paths<S: StorageProvider>(
             ));
         };
         let tip_epoch = tip_epoch.expect("commit observation sets tip epoch");
+        let tip_priority = tip_priority.expect("commit observation came from path message");
+        let tip_committer = tip_committer.expect("commit observation came from path message");
         let tip_digest = tip_digest.expect("commit observation came from path message");
         consumed_proposal_refs.sort();
         consumed_proposal_refs.dedup();
@@ -326,6 +341,8 @@ pub fn materialize_openmls_candidate_paths<S: StorageProvider>(
             branch_id: path.branch_id.clone(),
             fork_epoch,
             tip_epoch,
+            tip_priority,
+            tip_committer,
             tip_digest,
             commit_message_ids,
             consumed_proposal_refs,
@@ -1317,6 +1334,13 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                         ))),
                     };
                 }
+                if sender_id.is_none() {
+                    return Err(OpenMlsProjectionError::Replay(
+                        "commit has no authenticated member sender".into(),
+                    ));
+                }
+                let priority = crate::app_components::commit_ordering_priority_for_staged(&staged);
+                let committer = sender.clone();
                 // foundation/identity.md: deferred commits replayed during
                 // convergence are an inbound credential ingress too. Reject a
                 // commit that would add a member with an invalid x-only
@@ -1346,6 +1370,8 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                     message_id,
                     source_epoch,
                     resulting_epoch,
+                    priority,
+                    committer,
                     consumed_proposal_refs,
                 });
                 mls_group

@@ -11,6 +11,7 @@ use cgka_traits::app_components::{
     decode_group_avatar_url_v1, decode_nostr_routing_v1, decode_quic_varint,
     encode_component_vectors, encode_components_list,
 };
+use cgka_traits::engine::CommitOrderingPriority;
 use cgka_traits::error::EngineError;
 use cgka_traits::types::{GroupId, MemberId};
 use openmls::extensions::{AppDataDictionary, AppDataDictionaryExtension, Extension};
@@ -257,6 +258,15 @@ fn member_id_of_sender(sender: &Sender, group: &MlsGroup) -> Option<MemberId> {
 /// directly; there is no production caller outside this crate.
 pub fn staged_commit_requires_admin(staged: &StagedCommit) -> bool {
     !is_allowed_non_admin_commit(staged)
+}
+
+/// Authorization-aware branch ordering class for same-epoch fork recovery.
+pub(crate) fn commit_ordering_priority_for_staged(staged: &StagedCommit) -> CommitOrderingPriority {
+    if staged_commit_requires_admin(staged) {
+        CommitOrderingPriority::Privileged
+    } else {
+        CommitOrderingPriority::Ordinary
+    }
 }
 
 /// Returns `true` iff `staged` is exactly one of the two commit shapes a

@@ -197,26 +197,50 @@ pub enum AppMessageInvalidationReason {
 
 /// Deterministic, content-derived ordering key used to resolve same-epoch
 /// commit races. Two replicas processing the same commit derive the same key
-/// from the same MLS wire bytes, independent of transport metadata. Lower keys
-/// win: first by `source_epoch`, then by `commit_digest` bytes.
+/// from authenticated commit metadata and the same MLS wire bytes, independent
+/// of transport metadata. Lower keys win: first by `source_epoch`, then by an
+/// authorization-aware `priority`, then by the authenticated `committer`, and
+/// only finally by `commit_digest` bytes.
 ///
 /// `commit_digest` is `SHA-256(mls_bytes)` — the hash of the serialized MLS
-/// message as it appears on the wire. This works for both `PublicMessage` and
-/// `PrivateMessage` framings because we hash the wire form, not the inner
-/// content; no decryption is required to compute it.
+/// message as it appears on the wire. It is intentionally the last
+/// same-committer tie-breaker only: the commit bytes include committer-chosen
+/// UpdatePath randomness, so digest order alone is grindable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommitOrderingPriority {
+    /// A commit shape requiring admin authorization, such as membership or
+    /// group-policy changes. This outranks ordinary member self-updates so an
+    /// authorized remove cannot be defeated by grinding a concurrent update.
+    Privileged,
+    /// A commit shape allowed for any member, such as a pure self-update or a
+    /// SelfRemove-only commit.
+    Ordinary,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommitOrderingKey {
     pub source_epoch: EpochId,
+    pub priority: CommitOrderingPriority,
+    pub committer: MemberId,
     pub commit_digest: [u8; 32],
 }
 
 impl CommitOrderingKey {
-    /// Build an ordering key from a commit's serialized MLS wire bytes.
-    pub fn from_commit_bytes(source_epoch: EpochId, mls_bytes: &[u8]) -> Self {
+    /// Build an ordering key from authenticated commit metadata and serialized
+    /// MLS wire bytes.
+    pub fn from_commit_bytes(
+        source_epoch: EpochId,
+        priority: CommitOrderingPriority,
+        committer: MemberId,
+        mls_bytes: &[u8],
+    ) -> Self {
         let mut hasher = Sha256::new();
         hasher.update(mls_bytes);
         Self {
             source_epoch,
+            priority,
+            committer,
             commit_digest: hasher.finalize().into(),
         }
     }
@@ -226,6 +250,8 @@ impl Ord for CommitOrderingKey {
     fn cmp(&self, other: &Self) -> Ordering {
         self.source_epoch
             .cmp(&other.source_epoch)
+            .then_with(|| self.priority.cmp(&other.priority))
+            .then_with(|| self.committer.as_slice().cmp(other.committer.as_slice()))
             .then_with(|| self.commit_digest.cmp(&other.commit_digest))
     }
 }

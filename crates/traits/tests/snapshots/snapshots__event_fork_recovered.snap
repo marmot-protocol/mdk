@@ -1,6 +1,7 @@
 ---
 source: crates/traits/tests/snapshots.rs
-expression: "GroupEvent::ForkRecovered\n{\n    group_id: gid(), source_epoch: EpochId(1), recovered_epoch: EpochId(2),\n    winner: CommitOrderingKey\n    { source_epoch: EpochId(1), commit_digest: [0xAA; 32], },\n    invalidated: CommitOrderingKey\n    { source_epoch: EpochId(1), commit_digest: [0xBB; 32], },\n}"
+assertion_line: 487
+expression: "GroupEvent::ForkRecovered\n{\n    group_id: gid(), source_epoch: EpochId(1), recovered_epoch: EpochId(2),\n    winner: CommitOrderingKey\n    {\n        source_epoch: EpochId(1), priority:\n        CommitOrderingPriority::Privileged, committer:\n        MemberId::new(b\"alice\".to_vec()), commit_digest: [0xAA; 32],\n    }, invalidated: CommitOrderingKey\n    {\n        source_epoch: EpochId(1), priority: CommitOrderingPriority::Ordinary,\n        committer: MemberId::new(b\"bob\".to_vec()), commit_digest: [0xBB; 32],\n    },\n}"
 ---
 {
   "ForkRecovered": {
@@ -14,6 +15,14 @@ expression: "GroupEvent::ForkRecovered\n{\n    group_id: gid(), source_epoch: Ep
     "recovered_epoch": 2,
     "winner": {
       "source_epoch": 1,
+      "priority": "privileged",
+      "committer": [
+        97,
+        108,
+        105,
+        99,
+        101
+      ],
       "commit_digest": [
         170,
         170,
@@ -51,6 +60,12 @@ expression: "GroupEvent::ForkRecovered\n{\n    group_id: gid(), source_epoch: Ep
     },
     "invalidated": {
       "source_epoch": 1,
+      "priority": "ordinary",
+      "committer": [
+        98,
+        111,
+        98
+      ],
       "commit_digest": [
         187,
         187,
